@@ -2,309 +2,136 @@
 
 This module provides code-level annotation of Stage 1's ``items_flagged``
 output.  The LLM has no memory of prior cycles, so the same (task_id,
-flag_type) pair can be emitted cycle after cycle.  For flags with a
-computable *signature* we check Mem0 for a prior ``stage1_flag_marker``
-memory.  On a hit, the flag is annotated with ``persisted_from_run`` and a
-replacement marker is written, then all prior markers are deleted (best-effort
-replacement).  Two concurrent dedup_flags calls for the same (task_id,
-flag_type) may both write replacements and both delete the shared prior,
-leaving up to N transient duplicate markers; the next cycle's HIT branch
-collapses them back to one.  On a miss, a new marker memory is written so
-future cycles can detect the repeat.
+flag_type) pair can be emitted cycle after cycle.  Dedup/suppression/
+acknowledge state is persisted in the ``recon_ledger`` SQLite-backed table
+(:mod:`fused_memory.reconciliation.recon_ledger`), reached through
+``memory_service.recon_ledger`` (task 2227).  The ledger is authoritative
+and the only thing this module reads back — a best-effort Mem0 mirror
+write accompanies every ledger write so legacy Mem0-based searchers keep
+working during the cutover, but Mem0 is never searched by this module.
 
-Note: this module does **not** suppress persistent flags before Stage 2 sees
-them; suppression logic lives in Stage 2's prompt instructions which direct
-the LLM to soft-handle annotated flags.
+Note: this module does not suppress persistent flags before Stage 2 sees
+them at the LLM level; suppression logic also lives in Stage 2's prompt
+instructions, which direct the LLM to soft-handle annotated flags.  This
+module enforces the suppression contract in code (see "Suppression"
+below), making it authoritative over the prompt directive.
 
-Authoritative suppression gate (task-1186)
-------------------------------------------
-``dedup_flags`` now calls ``filter_suppressed`` as its **first step**, before
-the existing signature-dedup loop.  ``filter_suppressed`` performs one
-project-scoped Mem0 search per ``dedup_flags`` call to retrieve all active
-``stage1_flag_suppression`` records.  Flags whose ``task_id`` matches a
-suppression record are dropped entirely; the remaining flags proceed through
-the signature-dedup loop unchanged.  This enforces the suppression contract
-in code, making it authoritative over the LLM-side prompt directive.
+Ledger-backed marker UPSERT (task 2227)
+----------------------------------------
+``dedup_flags`` is the entry point.  For each flag with a computable
+signature — ``(task_id, flag_type)`` via ``compute_flag_signature``,
+falling back to ``compute_content_fingerprint_signature`` for null-task_id
+flags lacking ``cited_tasks`` — the corresponding ``stage1_flag_marker``
+row is looked up via ``get_by_identity(project_id, 'stage1_flag_marker',
+task_id, flag_type, run_id='')``.  Note ``run_id=''`` in the identity: the
+dedup identity is ``(task_id, flag_type)`` only, so the *current*
+run_id/last_seen_run_id/deduped_against travel in ``payload_json``, not the
+primary key.  If a prior row exists, its stored ``run_id`` becomes the
+flag's ``persisted_from_run`` (the ``'unknown'`` sentinel is used on a
+falsy/absent stored value); the row is then ``upsert``-ed with a fresh
+payload and a self-refreshing 14-day ``expires_at`` TTL — every recurrence
+pushes the expiry back out, so a still-recurring marker never ages out;
+only a finding that stops recurring for 14 days is GC'd.
 
-Scoped (task_id, flag_type) suppression (task-1966)
------------------------------------------------------
-A suppression record MAY carry an optional ``metadata.flag_types`` allowlist
-(``build_suppression_payload(task_id, flag_types=[...])``).  When present and
-non-empty, the record suppresses ONLY those (task_id, flag_type) pairs,
-leaving other flag_types for the same task_id free to surface.  When absent
-(the legacy shape written by all pre-existing hand-authored records), the
-record blanket-suppresses ALL flag_types for that task_id, exactly as before.
-When both a scoped and a legacy/blanket record exist for the same task_id,
-the blanket record wins (union semantics) — see ``filter_suppressed``.
+Because the identity excludes run_id, ``ON CONFLICT`` on the full primary
+key guarantees **exactly one row survives** per (task_id, flag_type)
+regardless of how many times the signature has recurred — across cycles
+AND within a single ``dedup_flags`` call (a repeated signature later in
+the same call reads back the row the earlier occurrence just committed).
+This one primitive replaces the entire Mem0-era compensation chain
+(task-1146/1165/1400/1412/1978): no separate search+write+confirm+delete
+cycle, no post-write confirmation search, no confirmation circuit-breaker,
+no in-batch ``seen_signatures`` memo, and no bounded reclamation limit —
+the ledger's atomic UPSERT plus read-after-write consistency make all of
+them unnecessary.  See ``dedup_flags`` for the full per-flag algorithm.
 
-Best-effort replacement contract (task-1146, hardened in task-1165)
+Suppression (task-1186, task-1966; ledger-backed as of task 2227)
 --------------------------------------------------------------------
-On every HIT the dedup flow is:
-
-1. Find ALL prior markers for (task_id, flag_type) via ``find_prior_memories``
-   (plural); sort by id lex; annotation extracted from the lowest-id-lex
-   prior before any deletes.
-2. Write a new replacement marker with the current ``run_id``.
-3. Only if the write succeeds **and** Mem0 confirmed it (non-empty
-   ``memory_ids`` in the response): delete every prior marker (per-prior
-   try/except WARNING so one bad delete does not abort the batch).  The
-   empty-memory_ids guard prevents a silent Mem0 no-op from wiping priors
-   and leaving no dedup state for the next cycle.
-
-This is self-healing: even if past leakage produced N prior markers, the next
-dedup_flags call collapses them to a single row.  Write-first ordering with
-the empty-memory_ids guard provides best-effort at-least-one-marker: either
-the new marker exists (proceed to delete priors) or write failed/was a no-op
-(priors intact for next cycle).  Note that write+delete are two separate
-non-atomic steps; a crash between them leaves a transient duplicate, which
-the next cycle's HIT branch reclaims.
-
-Reclamation bound: ``find_prior_memories`` is called with ``limit=50``, so if
-past leakage produced more than 50 markers for one (task_id, flag_type) pair,
-each cycle reclaims at most 50 of them.  In practice leakage is bounded by
-the number of outage cycles (transient Mem0 failures) and is expected to
-remain far below 50; the self-healing property still holds over multiple
-cycles.
-
-Within a single ``dedup_flags`` call, this HIT/MISS flow runs **at most once**
-per (task_id, flag_type) signature — see "In-batch memoization (task-1978)"
-below for how a signature emitted more than once in the same call's ``flags``
-list is handled without repeating this flow.
-
-In-batch memoization (task-1978)
----------------------------------
-Root cause: a single ``items_flagged`` list passed to one ``dedup_flags`` call
-can contain MULTIPLE entries for the same (task_id, flag_type) signature — for
-example a task genuinely re-evaluated more than once within one Stage 1 run.
-The per-flag loop is strictly sequential (no ``asyncio.gather`` over flags), so
-concurrent/racing writes are NOT the mechanism; instead, each occurrence's
-pre-write ``find_prior_memories`` search is a SEPARATE, run_id-agnostic Mem0
-read.  Under Mem0 read-after-write (indexing/embedding) lag, a later
-occurrence's search can fail to see the marker written by an EARLIER
-occurrence in the SAME call — even though the earlier occurrence's own
-deletes of its priors ARE visible — making the signature appear to have zero
-markers.  That false MISS writes yet another marker, so duplicate markers
-accumulate WITHIN a single run faster than the next cycle's HIT-branch
-self-healing can collapse them (self-healing only reclaims duplicates on a
-*future* cycle, not within the run that created them).
-
-Fix: ``dedup_flags`` keeps a function-local ``seen_signatures`` memo (fresh on
-every invocation, mirroring the circuit-breaker counters), keyed on the full
-``(task_id, flag_type)`` tuple returned by the signature computation — checked
-only AFTER the None-signature pass-through and the ``_is_valid_marker_task_id``
-guard, so un-signable and invalid-tid flags are never collapsed together.  The
-FIRST occurrence of a signature in a call runs the full HIT/MISS flow above
-unchanged and records its resolved outcome in the memo.  Any LATER occurrence
-of that same signature in the same call skips ``find_prior_memories``,
-``_write_and_confirm_marker``, and prior deletion entirely (zero additional
-Mem0 I/O, and the confirmation circuit-breaker counter is untouched) and is
-instead annotated directly from the memo:
-
-- ``last_seen_run_id`` is always set to the current ``run_id``.
-- ``persisted_from_run`` is inherited from the first occurrence's resolved
-  value: the prior marker's run_id if the first occurrence was a HIT (the same
-  ``'unknown'`` fallback already applied there), or the current ``run_id`` if
-  the first occurrence was a MISS — a MISS-first repeat is itself a genuine
-  same-run duplicate, so the current run is the correct provenance.
-
-The memo is recorded UNCONDITIONALLY at the first occurrence — it is **not**
-gated on ``write_succeeded`` (the bool ``_write_and_confirm_marker`` returns
-on both the HIT and MISS branches).  Gating on ``write_succeeded`` looks
-appealing at first glance (a genuinely-failed ``add_memory`` would then let a
-later same-call occurrence retry instead of inheriting a never-written
-signature's provenance), but ``write_succeeded`` conflates two situations
-``_write_and_confirm_marker`` cannot distinguish through its bool-only
-return: (1) ``add_memory`` itself raised — nothing persisted — and (2)
-``add_memory`` succeeded but ``confirm_marker_persisted``'s own read-back
-search missed under the exact same Mem0 read-after-write lag this memo
-exists to route around.  Case (2) is the validated production mechanism (see
-"In-batch memoization" above); gating on ``write_succeeded`` would skip
-memoizing it, so a later same-call occurrence would retry the full cycle, hit
-the same lag on its own confirmation search, and also fail to be memoized —
-reopening the unbounded within-run duplicate accumulation this fix targets.
-Recording the memo unconditionally bounds every signature to exactly one
-write per call regardless of confirmation outcome. The trade-off this
-accepts: on the rarer genuine-failure case (1), a later same-call occurrence
-inherits provenance for a marker that was never written; the next
-``dedup_flags`` cycle's pre-write search then correctly finds no prior and
-re-MISSes, writing a fresh marker — a one-cycle-delayed self-heal, not a
-permanent loss.
-
-This bounds every signature to at most one search+write+confirm+delete cycle
-per ``dedup_flags`` call regardless of how many times it is emitted, which
-removes all dependence on Mem0 read-after-write consistency for the within-run
-case.  The memo is scoped to a single call (cross-call/cross-cycle dedup is
-still the existing HIT-path self-healing's job — see "Best-effort replacement
-contract" above); it does not change behavior for flags whose signature
-appears only once, so all pre-existing single-occurrence-per-call behavior is
-unchanged.
-
-Post-write confirmation (task-1400, corrected in task-1400 step-15)
---------------------------------------------------------------------
-``add_memory`` returns an id in ``memory_ids``, but Mem0 may store the content
-under a DIFFERENT canonical id.  ``confirm_marker_persisted`` performs a
-read-back search immediately after each write to verify the marker is
-*findable* (not just written).  It returns ``True`` iff at least one matching
-marker is findable; ``False`` after one retry-miss; never raises.  On a miss
-it logs a WARNING and retries the search exactly once; returns ``False``
-after a failed retry.  The HIT-branch prior-deletion gate and the MISS-branch
-no-op WARNING are both driven off this bool.
-
-Confirmation kind filter is intentionally ASYMMETRIC with the pre-write dedup
-search (design decision #6): it additionally includes ``run_id`` (the current
-run's id) so that surviving priors from earlier runs cannot masquerade as
-confirmation of the current write.  The two searches have different jobs:
-the pre-write dedup search asks "does ANY prior exist across all runs?"
-(must be run_id-agnostic); the confirmation search asks "did MY write for
-THIS run land?" (must be run_id-scoped).  Scoping confirmation by run_id is
-correct on both paths — HIT (new marker run_id=current matches; priors'
-older run_ids do not) and MISS (new marker still matches).
-
-Confirmation circuit-breaker (task-1412)
------------------------------------------
-During a sustained Mem0 brownout every flag in the batch incurs the worst-case
-confirmation cost (initial search miss + retry = 2 search calls per flag),
-compounding pressure on the already-failing backend.  To limit this, ``dedup_flags``
-maintains a **per-invocation** circuit-breaker:
-
-- ``consecutive_confirmation_misses`` counts strictly-consecutive ``confirm_marker_persisted``
-  misses (``False`` return).  The counter resets to 0 on any successful confirmation
-  (``True`` return) so sporadic misses during otherwise-healthy operation do **not**
-  accumulate toward the threshold.
-- ``confirmation_disabled`` starts ``False`` and is set ``True`` the first time
-  ``consecutive_confirmation_misses >= _CONFIRMATION_MISS_THRESHOLD``.
-- At the moment of trip, exactly **one** breaker WARNING is logged (format:
-  ``"flag_dedup: confirmation circuit-breaker tripped after N consecutive misses;
-  falling back to memory_ids gate for remainder of batch"``).  Subsequent flags
-  do **not** re-emit the WARNING even if they also miss.
-- Once tripped, both HIT and MISS branches skip ``confirm_marker_persisted``
-  entirely and fall back to the cheaper pre-task-1400 gate:
-
-  * **HIT branch**: ``write_succeeded = bool(response.memory_ids)``.  Deletion
-    of prior markers proceeds if ``True``; is skipped (with a per-flag
-    "skipping prior deletion" WARNING) if ``False``.
-  * **MISS branch**: the "will not be detected next cycle" WARNING fires only
-    if ``bool(miss_response.memory_ids) is False``; silent if ``True``.
-
-- Both branches share **one counter** (same local variable), so a HIT-branch
-  trip persists into MISS-branch flags later in the same batch and vice versa.
-- The counter and disabled flag are **function-local**, so a subsequent
-  ``dedup_flags`` invocation (next reconciliation cycle) gets a fresh budget.
-  This is intentional — a transient brownout should not permanently disable
-  confirmation for future healthy cycles.
-- **Write failures** (``add_memory`` exceptions) do **NOT** count toward the
-  threshold.  The circuit-breaker targets specifically the *confirmation* cost
-  — the extra search round-trip that ``confirm_marker_persisted`` performs
-  after a successful write.  When ``add_memory`` itself raises, the
-  confirmation call is never reached, so neither the counter nor the disabled
-  flag is touched; the except branch logs a WARNING and moves on.  A sustained
-  brownout that manifests as write failures therefore never trips the breaker —
-  this is intentional because there is no confirmation overhead to shed when
-  writes are failing outright.
-
-The breaker is an **internal load-shedding mechanism** operating entirely within
-``dedup_flags``.  It does not change the contract documented in the LLM-side
-``stage1.py`` prompt (which mirrors the confirmation contract under normal
-conditions).  No change to ``confirm_marker_persisted`` itself is required —
-only the call-site within ``dedup_flags`` is gated.
-
-WARNING wording disambiguation (task-1413): the per-flag WARNINGs use distinct
-templates for the ACTIVE-breaker miss path (a confirmation search was attempted
-and returned no result) versus the TRIPPED-breaker skip path (no search
-attempted because the breaker is open).  The ACTIVE wording is
-``'could not be confirmed findable'``; the TRIPPED wording is
-``'confirmation skipped (circuit-breaker open) and memory_ids gate failed'``.
-During a brownout this lets operators distinguish genuine confirmation misses
-from gate-only flags raised purely from the memory_ids check.
+``dedup_flags`` calls ``filter_suppressed`` as its first step, before the
+per-flag marker loop.  ``filter_suppressed`` reads
+``memory_service.recon_ledger.list_suppressions(project_id)`` — one
+indexed ``(project_id, record_kind, state)`` ledger query, no Mem0 search
+— and drops flags matched by an active ``stage1_flag_suppression`` row. A
+row with ``flag_type == ''`` is a WILDCARD (blanket-suppresses every
+flag_type for its task_id); a row with a non-empty ``flag_type`` is
+SCOPED to just that pair.  When both a wildcard and a scoped row exist for
+the same task_id, the wildcard wins (union semantics — a blanket
+suppression cannot be narrowed by a more specific record).
+``write_suppression_record`` upserts these rows: ``flag_types=None``
+writes a single blanket row; a non-empty list writes one scoped row per
+flag_type.  Suppression rows never expire (``expires_at=None``) — they are
+operator-managed and persist until explicitly cleared.  See
+``filter_suppressed`` and ``write_suppression_record`` for full semantics.
 
 Completion-marker same-cycle self-delete (task-2312)
 -----------------------------------------------------
-The MISS-branch orphan-growth caveat above assumes every flag_type recurs
-indefinitely or is eventually swept by a slower out-of-band GC. In practice
-some Stage 1 findings represent ONE-TIME completed or bookkeeping work (e.g.
-"duplicate flag marker cleaned up", "dependency-parity gap resolved", "mem0
-duplicate cluster consolidated") that will never recur — so the HIT-path
-collapse-to-one-row self-healing never fires for them, and their MISS marker
-orphans permanently (the existing sweeps are too slow/narrow to reliably
-catch it — see the "Orphan-growth caveat" comment in the MISS branch above).
+Some Stage 1 findings represent ONE-TIME completed/bookkeeping work (e.g.
+"duplicate flag marker cleaned up", "dependency-parity gap resolved") that
+will never recur, so persisting a marker for them would just orphan.  When
+a flag carries ``flag_for_stage2`` present-and-explicitly-false (checked by
+the pure helper ``_is_completion_flag`` — bool ``False`` or a
+case-insensitive ``'false'`` string; absence of the key does not count),
+``dedup_flags`` writes NO ``stage1_flag_marker`` row for it.  Instead it
+sweeps any pre-existing prior for that exact (task_id, flag_type) via
+``acknowledge_flag_marker(mode='delete')`` — now a ``mark_addressed`` call,
+see "Acknowledge" below — and annotates the flag
+``completion_marker_self_deleted=True`` (plus the usual
+``last_seen_run_id``).  Removing the old in-batch ``seen_signatures`` memo
+(see above) changes one accepted edge case: a duplicate completion
+signature appearing more than once within a single ``dedup_flags`` call now
+re-runs the sweep for each occurrence instead of memoizing after the
+first — harmless, since ``mark_addressed`` is idempotent.  See
+``dedup_flags`` and ``_is_completion_flag`` for the full branch.
 
-``dedup_flags`` closes this gap with an explicit, producer-driven signal:
-when a flag carries ``flag_for_stage2`` present-and-explicitly-false (checked
-by the pure helper ``_is_completion_flag`` — bool ``False`` or a
-case-insensitive ``'false'`` string; ABSENCE of the key does not count), the
-flag is treated as a completion marker instead of a recurring finding:
+Acknowledge (ledger-backed as of task 2227)
+----------------------------------------------
+``acknowledge_flag_marker`` flips a ``stage1_flag_marker`` row to
+``state='addressed'`` via ``memory_service.recon_ledger.mark_addressed``,
+returning ``1`` iff a matching row existed, else ``0`` — a no-op that can
+never resurrect an unknown/already-GC'd signature.  The ledger has no
+delete operation, so the Mem0-era ``mode='delete'`` vs ``mode='tag'``
+distinction is obsolete: both collapse to the same ``mark_addressed`` call
+(the ``mode`` parameter is retained only for call-site signature
+compatibility).  ``acknowledge_resolved_flags`` is the batch entry point:
+it computes and de-duplicates signatures, then fans out to
+``acknowledge_flag_marker`` via ``gather_collect``, summing the counts.
 
-1. NO new ``stage1_flag_marker`` is written for it — a completion marker
-   must never survive the cycle that reported it, so (unlike the MISS/HIT
-   paths below) there is nothing worth persisting in the first place.
-2. Any priors accumulated by earlier cycles for this exact (task_id,
-   flag_type) signature are swept via
-   ``acknowledge_flag_marker(mode='delete')`` (self-healing any pre-existing
-   orphan for that signature; a no-op — 0 acknowledged — when none exist).
-3. The flag is annotated ``completion_marker_self_deleted=True`` (plus the
-   usual ``last_seen_run_id``) and appended to the result — bypassing the
-   persist-for-dedup MISS/HIT path entirely. It carries no
-   ``persisted_from_run`` field since no marker survives for a future cycle
-   to find.
-4. The signature is recorded in the in-batch ``seen_signatures`` memo (see
-   "In-batch signature memoization" above) so a repeat of the SAME
-   completion signature later in this same ``dedup_flags`` call is annotated
-   from the memo instead of re-running the sweep.
-
-amend (task-2312 review): an earlier version of this branch emitted (wrote
-and confirmed) a marker via ``_write_and_confirm_marker`` and then
-immediately reclaimed it via ``acknowledge_flag_marker`` in the SAME call.
-``acknowledge_flag_marker`` runs its OWN independent ``find_prior_memories``
-search rather than consuming the id the write just returned, so under the
-same Mem0 read-after-write indexing lag documented in "Confirmation
-circuit-breaker" below, that search could race the just-written marker and
-miss it — leaving a fresh orphan. Because completion flags by definition
-never recur, that orphan would never later collapse the way the HIT path's
-collapse-to-one-row behavior does. Skipping the write removes the race
-outright: there is no new marker to lose track of, and any genuinely
-pre-existing prior is still found and deleted.
-
-Dedup-safety (why this cannot regress recurring-flag dedup): the MISS branch
-above never sets ``flag_for_stage2`` at all, and recurring-finding flags
-either omit the key or set it truthy — neither shape is ever accepted by
-``_is_completion_flag``. Gating on PRESENT-AND-FALSE (never on mere absence)
-means this branch only ever fires for flags the producer has positively
-identified as one-time completions, so every existing recurring-flag
-HIT/MISS/in-batch-memoization behavior above is completely unchanged. This
-branch is checked AFTER the in-batch ``seen_signatures`` memo, so a signature
-already resolved earlier in the same ``dedup_flags`` call (by any path) is
-annotated from the memo instead of re-running this sweep. Residual
-ordering-dependent edge case (accepted, producer-shouldn't-do-that): if the
-SAME signature appears as a recurring (non-completion) flag first and a
-completion flag second within one batch, the second is annotated from the
-memo (``persisted_from_run``) rather than ``completion_marker_self_deleted``;
-in the reverse order, the completion occurrence self-deletes and registers
-the memo, so the later recurring occurrence is itself annotated from the
-memo instead of MISS-writing a fresh marker. Neither ordering regresses
-cross-cycle dedup for a signature that is used consistently by its producer.
+Mem0 mirror (PRD decisions #4/#6: write-both, read-new)
+-----------------------------------------------------------
+Marker and suppression writes also perform a best-effort single
+``add_memory`` mirror to Mem0 (wrapped in try/except; never raises, no
+read-back, no confirmation search, no delete) so legacy Mem0-based
+searchers keep working during the cutover to the ledger.  Reads in this
+module NEVER consult Mem0 — the ledger is the sole read source.  When
+``memory_service.recon_ledger`` is unset/``None`` (ledger disabled or not
+yet wired), marker/suppression writes degrade to mirror-only and
+``filter_suppressed``/``acknowledge_flag_marker``/``acknowledge_resolved_flags``
+degrade to a conservative pass-through/no-op — this module never raises
+because the ledger is absent.
 
 Public API
 ----------
 - ``compute_flag_signature(flag)`` — cheap, sync, no I/O.
-- ``confirm_marker_persisted(memory_service, *, project_id, task_id, flag_type, run_id, log)``
-  — async, post-write confirmation search; returns True if findable, False otherwise.
+- ``compute_content_fingerprint_signature(flag)`` — cheap, sync, no I/O;
+  fallback signature for null-task_id flags lacking ``cited_tasks``.
 - ``filter_suppressed(memory_service, project_id, flags)`` — async, one
-  project-scoped Mem0 search; drops suppressed flags before signature dedup.
+  indexed ``recon_ledger`` query; drops suppressed flags before signature
+  dedup.
 - ``dedup_flags(memory_service, project_id, run_id, flags)`` — async, calls
-  ``filter_suppressed`` first then does Mem0 search + write + confirm + delete
-  per flag; best-effort (exceptions are logged, not raised).  Flags explicitly
-  marked ``flag_for_stage2=False`` are instead treated as one-time completion
-  markers: no marker is written for them; any priors are swept within the
-  same call (see "Completion-marker same-cycle self-delete" above) rather
-  than persisting a new marker for cross-cycle dedup.
-- ``acknowledge_flag_marker(memory_service, *, project_id, run_id, task_id, flag_type, mode, log)``
-  — async, best-effort delete or tag (write-replacement + delete-old) of the
-  prior ``stage1_flag_marker``(s) for one (task_id, flag_type) signature;
-  never raises; returns the count acknowledged.
-- ``acknowledge_resolved_flags(memory_service, project_id, run_id, resolved_flags, *, mode, log)``
-  — async, generic batch entry point; computes each flag's signature and
-  delegates to ``acknowledge_flag_marker`` per flag; best-effort (one flag
-  failing never aborts the batch); returns the summed count.
+  ``filter_suppressed`` first, then UPSERTs a ``stage1_flag_marker`` ledger
+  row per (task_id, flag_type) signature; best-effort (exceptions are
+  logged, not raised).  Flags explicitly marked ``flag_for_stage2=False``
+  are instead treated as one-time completion markers (see above).
+- ``write_suppression_record(memory_service, *, project_id, task_id,
+  flag_types=None, causation_id=None)`` — async, upserts
+  ``stage1_flag_suppression`` ledger row(s) for *task_id*.
+- ``acknowledge_flag_marker(memory_service, *, project_id, run_id, task_id,
+  flag_type, mode, log)`` — async, marks the ``stage1_flag_marker`` row for
+  one (task_id, flag_type) signature ``state='addressed'``; never raises;
+  returns the count acknowledged (0 or 1).
+- ``acknowledge_resolved_flags(memory_service, project_id, run_id,
+  resolved_flags, *, mode, log)`` — async, de-dupes signatures and fans out
+  to ``acknowledge_flag_marker``; best-effort; returns the summed count.
 - ``is_content_fingerprint_task_id(tid)`` — cheap, sync, no I/O; the fp:-only
   gate used to scope Gap 1/2 enrichment and sweep behaviour to fingerprint
   markers (task-2047).
@@ -320,15 +147,10 @@ from datetime import UTC, datetime, timedelta
 from typing import Any, Literal, NotRequired, TypedDict
 
 from fused_memory.models.memory import AddMemoryResponse
-from fused_memory.reconciliation.mem0_dedup import find_prior_memories
 from fused_memory.reconciliation.recon_ledger import ReconLedgerRecord
 from fused_memory.utils.async_utils import gather_collect
 
 logger = logging.getLogger(__name__)
-
-# Module-local sleep binding — allows tests to patch sleep without touching the
-# global asyncio namespace (same pattern as harness.py).
-_sleep = asyncio.sleep
 
 
 class _SuppressionMetadata(TypedDict):
@@ -362,181 +184,6 @@ class SuppressionPayload(TypedDict):
     content: str
     category: Literal['observations_and_summaries']
     metadata: _SuppressionMetadata
-
-
-# Number of *consecutive* confirm_marker_persisted misses within one dedup_flags
-# call that triggers the confirmation circuit-breaker.  Once tripped the
-# remaining flags in the batch skip confirm_marker_persisted and fall back to
-# bool(response.memory_ids) as the write-succeeded gate.  Counter is
-# function-local so each dedup_flags invocation starts with a fresh budget.
-# Tests monkeypatch this down to 2 (same idiom as test_durable_queue.py:635
-# with _DELETE_DEAD_BATCH_SIZE).  See "Confirmation circuit-breaker (task-1412)"
-# section in the module docstring for the full design rationale.
-#
-# Trade-off: resilience to single-flag flakiness (higher threshold) vs
-# brownout load-shedding latency (lower threshold).
-#
-# 3 was chosen as the default (task-1415, lowered from 5):
-# - confirm_marker_persisted already retries internally so each "miss" costs 2
-#   search round-trips.  At threshold 5 the worst-case batch pays up to
-#   5 × (1 write + 2 confirmation searches) ≈ 15 round-trips before the breaker
-#   activates; at 3 that drops to ≈ 9.
-# - Threshold 3 still tolerates a single spurious miss without tripping: a
-#   sporadic miss followed by a hit resets the counter to 0, so strictly-
-#   consecutive miss runs of 3 are rare under healthy-but-slow indexing.
-# - The whole point of the breaker is to shed load during real brownouts, so
-#   activating it sooner (lower threshold) is consistent with its purpose.
-# - Write failures (add_memory exceptions) do NOT count — the counter only
-#   advances on confirmation misses from successful writes; see the module
-#   docstring "Confirmation circuit-breaker" section for the "write failures do
-#   not count" design rationale.
-_CONFIRMATION_MISS_THRESHOLD: int = 3
-
-# Bounded delay (seconds) awaited between the first-search miss and the retry in
-# confirm_marker_persisted.  Default 0.0 = pure event-loop yield (asyncio.sleep(0)
-# semantics): yields control to the loop, costs nothing on happy paths, and preserves
-# the module docstring's "Mem0 writes assumed to be immediately visible" invariant.
-# Bump via monkeypatch in tests or via future config if production shows a Mem0
-# write-flush boundary — this is the knob the docstring "Mem0 read-after-write
-# consistency" paragraph anticipates ("If production evidence shows otherwise, add a
-# small bounded delay before the retry").
-_CONFIRM_RETRY_DELAY_SECS: float = 0.0
-
-
-def _marker_query(tid: str, ftype: str) -> str:
-    """Build the canonical Mem0 search query for a stage1_flag_marker.
-
-    Single source of truth used by BOTH:
-    - The pre-write dedup search in ``dedup_flags`` (asks "does any prior exist
-      across all runs?"; run_id-agnostic).
-    - The post-write confirmation search in ``confirm_marker_persisted``
-      (asks "did MY write for THIS run land?"; run_id-scoped via a separate
-      ``kind`` filter — see that helper for details).
-
-    The two callers differ in their ``kind`` filter but use the SAME query
-    string.  Tests rely on this equality to dispatch a single marker-search
-    stub from two call sites.
-    """
-    return f'stage1 flag marker task {tid} type {ftype}'
-
-
-async def confirm_marker_persisted(
-    memory_service: Any,
-    *,
-    project_id: str,
-    task_id: str,
-    flag_type: str,
-    run_id: str,
-    log: logging.Logger,
-) -> bool:
-    """Confirm a just-written ``stage1_flag_marker`` is findable by a subsequent search.
-
-    Performs a read-back search to confirm findability; returns ``True`` iff at
-    least one matching marker is returned (initial search or retry), ``False``
-    otherwise.
-
-    The confirmation kind filter includes ``run_id`` (the current run) so that
-    surviving priors from earlier runs cannot masquerade as confirmation of this
-    write.  This is intentionally ASYMMETRIC with the pre-write dedup search
-    (which omits ``run_id`` so it can find priors from any earlier run).
-    The two searches have different jobs:
-
-    - Pre-write dedup: "does ANY prior exist across all runs?" → run_id-agnostic.
-    - Confirmation:    "did MY write for THIS run land?"       → run_id-scoped.
-
-    Strategy:
-    1. Run a confirmation search via ``find_prior_memories`` with
-       ``kind={'source':'stage1_flag_marker','flag_type':flag_type,'run_id':run_id}``.
-    2. If matches are found, return ``True``.
-    3. On a miss, log a WARNING (task_id + flag_type), await
-       ``_sleep(_CONFIRM_RETRY_DELAY_SECS)`` (default 0.0 = pure event-loop yield),
-       then retry the search once.
-    4. Return ``True`` if the retry finds matches; otherwise log a final WARNING
-       and return ``False``.
-    5. Never raises — the whole body is wrapped in a best-effort try/except so
-       a non-search error path cannot abort ``dedup_flags``.
-
-    Mem0 read-after-write consistency:
-        Flag markers use ``category='observations_and_summaries'`` which routes
-        to Mem0 (not Graphiti).  The indexing-lag caveat in ``prompts/stage1.py``
-        (lines 189-196) is specific to Graphiti's async embedding pipeline and
-        does NOT apply here — Mem0 writes on this path are assumed to be
-        immediately visible to a subsequent ``search``.  The configurable
-        ``_CONFIRM_RETRY_DELAY_SECS`` constant (default 0.0) is awaited between
-        the first miss and the retry; bump it if production shows a write-flush
-        boundary that requires a bounded wait before the index catches up.
-
-    Args:
-        memory_service: Mem0 service with an async ``search`` method.
-        project_id: Project scope forwarded to ``find_prior_memories``.
-        task_id: Task identifier (str-coerced by ``find_prior_memories``).
-        flag_type: Flag type; used in both the ``kind`` filter and the WARNING.
-        run_id: Current run identifier; scoped into the kind filter so only
-             the marker written by THIS run is returned (not stale priors).
-        log: Logger to use (should be the ``flag_dedup`` module logger so
-             caplog-based tests can capture WARNINGs under the right namespace).
-
-    Returns:
-        ``True`` if at least one matching marker is findable (initial search or
-        retry); ``False`` if no match after retry or if an unexpected error
-        occurred.  Within ``dedup_flags`` this drives the HIT-branch
-        prior-deletion gate (skip if False) and the MISS-branch no-op WARNING.
-    """
-    try:
-        query = _marker_query(task_id, flag_type)
-        # run_id is included so that stale priors from earlier runs do NOT match.
-        # Intentionally asymmetric with the pre-write dedup search (which omits
-        # run_id to find priors from any earlier run).  The confirmation's job is
-        # 'did MY write for THIS run land?' — a prior from an older run must not
-        # masquerade as confirmation of the current write.
-        kind = {'source': 'stage1_flag_marker', 'flag_type': flag_type, 'run_id': run_id}
-
-        matches = await find_prior_memories(
-            memory_service,
-            project_id=project_id,
-            task_id=task_id,
-            kind=kind,
-            query=query,
-            categories=['observations_and_summaries'],
-            limit=50,
-            log=log,
-        )
-        if matches:
-            return True
-
-        # Miss on first attempt — log WARNING, wait the configured delay, then retry once.
-        log.warning(
-            'confirm_marker_persisted: marker not found after write for task %s'
-            ' flag_type %s run_id %s — retrying search',
-            task_id, flag_type, run_id,
-        )
-        await _sleep(_CONFIRM_RETRY_DELAY_SECS)
-        retry_matches = await find_prior_memories(
-            memory_service,
-            project_id=project_id,
-            task_id=task_id,
-            kind=kind,
-            query=query,
-            categories=['observations_and_summaries'],
-            limit=50,
-            log=log,
-        )
-        if retry_matches:
-            return True
-
-        # Retry also missed — log final WARNING and return False.
-        log.warning(
-            'confirm_marker_persisted: could not confirm flag marker for task %s'
-            ' flag_type %s run_id %s after retry — marker may be unfindable next cycle',
-            task_id, flag_type, run_id,
-        )
-        return False
-    except Exception as e:
-        log.warning(
-            'confirm_marker_persisted: unexpected error for task %s flag_type %s: %s',
-            task_id, flag_type, e,
-        )
-        return False
 
 
 async def filter_suppressed(
@@ -716,116 +363,6 @@ def _extract_deduped_against_uuids(flag: dict[str, Any]) -> list[str]:
     return sorted(collected)
 
 
-async def _write_and_confirm_marker(
-    memory_service: Any,
-    *,
-    project_id: str,
-    run_id: str,
-    tid: str,
-    ftype: str,
-    log: logging.Logger,
-    confirm_and_track,  # async callable: (response_memory_ids, active_miss_warning_msg, tripped_skip_warning_msg, *, tid, ftype) -> bool
-    active_miss_warning_template: str,
-    tripped_skip_warning_template: str,
-    deduped_against: list[str] | None = None,
-) -> bool:
-    """Write a stage1_flag_marker memory and confirm it is findable.
-
-    Single source of truth for the canonical marker payload contract:
-    - ``content``: ``f'Stage 1 flag marker: task={tid} type={ftype} from run={run_id}'``
-    - ``category='observations_and_summaries'``
-    - ``metadata={'source':'stage1_flag_marker', 'kind':'stage1_flag_marker',
-                  'task_id':tid, 'flag_type':ftype,
-                  'run_id':run_id, 'last_seen_run_id':run_id}``
-    - ``_source='stage1_flag_dedup'`` sentinel
-
-    ``deduped_against`` (task-2047 Gap 1) is an OPTIONAL additive field: when
-    a non-empty list of resolvable memory UUIDs is passed, it is included as
-    ``metadata['deduped_against']``.  When ``None`` or empty (the default),
-    no such key is added and the payload is byte-identical to the pre-2047
-    contract — this keeps the numeric-task_id marker path (and every
-    existing payload assertion) unchanged.
-
-    **Validation guard (defense-in-depth):** before calling ``add_memory``,
-    ``tid`` is checked by :func:`_is_valid_marker_task_id`.  Under normal
-    operation this guard is never tripped — the early guard in
-    :func:`dedup_flags` already validates ``tid`` before reaching this helper,
-    so all real signatures (numeric, comma-joined, or canonical ``fp:+32-hex``)
-    pass both guards.  This backstop exists for any future direct caller that
-    bypasses the early guard.  When tripped for a genuinely-invalid ``tid``
-    (e.g. ``'abc'``, malformed ``fp:`` variants, empty string) it logs a WARNING
-    and returns ``False`` — ``add_memory`` and ``_confirm_and_track`` are NOT
-    called.  Returning ``False`` (not raising) ensures:
-
-    - On the HIT path, priors are NOT deleted (best-effort-replacement invariant:
-      never delete priors when no replacement was written).
-    - The confirmation circuit-breaker counter is untouched — a guard-skip for
-      a genuinely-invalid ``tid`` is not a Mem0 brownout signal.
-
-    On add_memory exception: logs a unified WARNING and returns ``False``.
-
-    On success: delegates to ``confirm_and_track`` (the circuit-breaker-aware
-    inner closure from ``dedup_flags``) and propagates its bool verbatim.
-
-    The ``active_miss_warning_template`` is emitted by ``confirm_and_track``
-    when a confirmation search was attempted but returned no result (ACTIVE
-    breaker).  The ``tripped_skip_warning_template`` is emitted when
-    confirmation was skipped because the breaker was already tripped and
-    ``bool(response.memory_ids)`` was False (TRIPPED breaker).  Both templates
-    are forwarded verbatim to ``confirm_and_track``.
-    """
-    # Defense-in-depth guard: reject genuinely-invalid task_id keys before writing
-    # to Mem0.  Under normal operation the early guard in dedup_flags already validated
-    # tid (numeric, comma-joined, or canonical fp:+32-hex), so this branch is not
-    # reached for any real signature.  It stays cheap and silent for correct callers;
-    # logging at WARNING here is appropriate because reaching this branch means an
-    # unvalidated tid was passed directly to this helper — genuinely unexpected.
-    # Returning False (not raising) preserves the HIT-path best-effort-replacement
-    # invariant and keeps the circuit-breaker counter clean.
-    if not _is_valid_marker_task_id(tid):
-        log.warning(
-            'flag_dedup: skipping stage1_flag_marker write for invalid task_id %r'
-            ' flag_type %s — rejected by _is_valid_marker_task_id (defense-in-depth)',
-            tid, ftype,
-        )
-        return False
-    metadata: dict[str, Any] = {
-        'source': 'stage1_flag_marker',
-        'kind': 'stage1_flag_marker',
-        'task_id': tid,
-        'flag_type': ftype,
-        'run_id': run_id,
-        'last_seen_run_id': run_id,
-    }
-    if deduped_against:
-        metadata['deduped_against'] = list(deduped_against)
-    try:
-        response = await memory_service.add_memory(
-            content=f'Stage 1 flag marker: task={tid} type={ftype} from run={run_id}',
-            category='observations_and_summaries',
-            project_id=project_id,
-            metadata=metadata,
-            causation_id=run_id,
-            _source='stage1_flag_dedup',
-        )
-    except Exception as e:
-        log.warning(
-            'flag_dedup: failed to write marker for task %s flag_type %s: %s',
-            tid, ftype, e,
-        )
-        return False
-    # ``confirm_and_track`` is required to never raise (``confirm_marker_persisted``
-    # has its own internal try/except; the breaker counter mutations are non-raising).
-    # If that invariant is broken by a future refactor, the exception will propagate
-    # out of this helper and abort the ``dedup_flags`` for-loop iteration.
-    return await confirm_and_track(
-        response.memory_ids,
-        active_miss_warning_template,
-        tripped_skip_warning_template,
-        tid=tid, ftype=ftype,
-    )
-
-
 def _is_completion_flag(flag: dict[str, Any]) -> bool:
     """Return True iff *flag* explicitly marks itself as ONE-TIME completed work.
 
@@ -834,8 +371,8 @@ def _is_completion_flag(flag: dict[str, Any]) -> bool:
     case-insensitively (e.g. ``'false'``, ``'False'``, ``'FALSE'``).
 
     Absence of the key is DELIBERATELY excluded from this predicate — it must
-    NOT be treated as a completion marker. The dedup MISS-branch markers
-    ``_write_and_confirm_marker`` writes for recurring findings never set
+    NOT be treated as a completion marker. The ``stage1_flag_marker`` rows
+    ``dedup_flags`` upserts for recurring findings never set
     ``flag_for_stage2`` at all, and recurring-finding flags either omit the
     key or set it truthy. Treating absence as "false" would misclassify every
     ordinary recurring flag as a one-time completion, deleting the very
@@ -954,8 +491,8 @@ async def dedup_flags(
         # Gap-1 enrichment (task-2047): scoped to fp:-keyed markers only — numeric
         # and comma-joined tids are already resolvable anchors and must not change
         # payload (see design decision in plan.json). Computed once per occurrence,
-        # ahead of the in-batch memoization check below, so both the HIT and MISS
-        # _write_and_confirm_marker call sites share the identical value.
+        # ahead of the ledger UPSERT below, so the ledger payload and the Mem0
+        # mirror write share the identical value.
         deduped_against = (
             _extract_deduped_against_uuids(flag)
             if is_content_fingerprint_task_id(tid)
@@ -988,19 +525,19 @@ async def dedup_flags(
         # signature via acknowledge_flag_marker(mode='delete') — self-healing
         # any pre-existing orphan for that signature (a no-op when none exist).
         #
-        # amend (task-2312 review): an earlier version of this branch emitted a
-        # marker via _write_and_confirm_marker and then immediately reclaimed it
-        # via acknowledge_flag_marker in the SAME call. acknowledge_flag_marker
-        # runs its OWN independent find_prior_memories search rather than
-        # consuming the id the write just returned, so under the same Mem0
-        # read-after-write indexing lag this module documents elsewhere (see
-        # "Confirmation circuit-breaker" in the module docstring), that search
+        # amend (task-2312 review, revisited under the task-2227 ledger rewrite):
+        # an earlier Mem0-backed version of this branch emitted (wrote and
+        # confirmed) a marker and then immediately reclaimed it via
+        # acknowledge_flag_marker in the SAME call. That acknowledge ran its own
+        # independent Mem0 search rather than consuming the id the write just
+        # returned, so under Mem0's read-after-write indexing lag the search
         # could race the just-written marker and miss it — leaving a fresh
         # orphan that (unlike the HIT path's collapse-to-one-row self-heal)
         # would never later collapse, because completion flags by definition
         # never recur. Skipping the write removes the race outright: there is
         # no new marker to lose track of, and any genuinely pre-existing prior
-        # is still found and deleted below.
+        # is still found and deleted below via the ledger's read-after-write-
+        # consistent get_by_identity/mark_addressed.
         #
         # Dedup-safety: _is_completion_flag requires flag_for_stage2 to be
         # PRESENT and explicitly false. Absence (the shape every dedup
@@ -1302,7 +839,7 @@ def compute_flag_signature(flag: dict[str, Any]) -> tuple[str, str] | None:
 
 #: Sentinel flag_type used in the content-fingerprint (fp:…) signature when
 #: the flag's own flag_type is None.  A stable string avoids a None value
-#: breaking str-coercion in find_prior_memories / marker metadata writes.
+#: breaking str-coercion in ledger identity columns / marker metadata writes.
 #: Do NOT change without a marker migration — existing markers keyed by this
 #: sentinel must remain findable by the new value.
 _CONTENT_FP_FLAG_TYPE: str = '__content_fp__'
