@@ -26,6 +26,8 @@ from typing import Any
 
 from shared.safe_io import load_json_or_warn
 
+from orchestrator.unblock_types import BlockClass
+
 logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
