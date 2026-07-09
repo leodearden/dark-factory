@@ -13,6 +13,7 @@ test controls, with SSH=<shim> injected via the environment.
 from __future__ import annotations
 
 import os
+import re
 import stat
 import subprocess
 import sys
@@ -24,6 +25,7 @@ import yaml
 SCRIPT = Path(__file__).parent.parent / "deploy" / "enable_laptop_persistent_worktree.sh"
 KEY = "persistent_merge_worktree"
 SAFETY_VALVE_KEY = "persistent_merge_worktree_safety_valve_every_n"
+NOOP_MARKER = "already enabled (no-op)"
 
 
 # ---------------------------------------------------------------------------
@@ -121,6 +123,19 @@ def _parsed(config_path):
     return yaml.safe_load(_read_config(config_path))
 
 
+def _count_anchored_key(config_text, key):
+    """Count lines where `key` appears as the anchored YAML key -- mirrors
+    the script's `^[[:space:]]*key[[:space:]]*:` anchoring so a naive
+    substring count doesn't also match the prefix-colliding
+    persistent_merge_worktree_safety_valve_every_n sibling."""
+    pattern = re.compile(rf"^[ \t]*{re.escape(key)}[ \t]*:", re.MULTILINE)
+    return len(pattern.findall(config_text))
+
+
+def _backup_files(config_path):
+    return sorted(p.name for p in config_path.parent.glob(f"{config_path.name}.bak-*"))
+
+
 # ---------------------------------------------------------------------------
 # step-1: RED -- default (apply) mode flips the flag and validates readback
 # ---------------------------------------------------------------------------
@@ -146,4 +161,51 @@ def test_apply_flips_flag_to_true(tmp_path):
     parsed = _parsed(config_path)
     assert parsed.get("git", {}).get(KEY) is True, (
         f"Expected git.{KEY} to read back True via yaml.safe_load; parsed={parsed!r}"
+    )
+
+
+# ---------------------------------------------------------------------------
+# step-3: RED -- idempotency: a second apply is a clean no-op
+# ---------------------------------------------------------------------------
+
+def test_apply_twice_is_idempotent_noop_second_run(tmp_path):
+    """Running apply twice against the same config leaves exactly one
+    occurrence of persistent_merge_worktree (set to true), both runs exit
+    0, and the second run is a clean no-op: it emits an already-enabled
+    marker and creates no NEW backup file."""
+    config_path = tmp_path / "reify-laptop.yaml"
+    config_path.write_text(_fixture_laptop_config("unflipped"))
+
+    first = _run_script(config_path)
+    assert first.returncode == 0, (
+        f"Expected exit 0 on first apply; got {first.returncode}\n"
+        f"stdout={first.stdout!r} stderr={first.stderr!r}"
+    )
+
+    backups_before_second = _backup_files(config_path)
+
+    second = _run_script(config_path)
+    assert second.returncode == 0, (
+        f"Expected exit 0 on second (already-enabled) apply; got {second.returncode}\n"
+        f"stdout={second.stdout!r} stderr={second.stderr!r}"
+    )
+    assert NOOP_MARKER in second.stdout, (
+        f"Expected an already-enabled/no-op marker on the second run; "
+        f"got: {second.stdout!r}"
+    )
+
+    backups_after_second = _backup_files(config_path)
+    assert backups_after_second == backups_before_second, (
+        f"Expected no NEW backup file from the no-op second run; "
+        f"before={backups_before_second} after={backups_after_second}"
+    )
+
+    config_text = _read_config(config_path)
+    assert _count_anchored_key(config_text, KEY) == 1, (
+        f"Expected exactly one occurrence of {KEY}; got "
+        f"{_count_anchored_key(config_text, KEY)}\nconfig:\n{config_text}"
+    )
+    parsed = yaml.safe_load(config_text)
+    assert parsed.get("git", {}).get(KEY) is True, (
+        f"Expected git.{KEY} to still read back True; parsed={parsed!r}"
     )
