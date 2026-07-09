@@ -311,3 +311,98 @@ class TestShouldArchive:
         # auto-archive just because it ends with '_error'.
         from orchestrator.verify_categories import should_archive
         assert should_archive('made_up_error') is False
+
+
+# ---------------------------------------------------------------------------
+# step-9: verify.py single-sources categories from the table
+# ---------------------------------------------------------------------------
+
+
+class TestVerifyRegistriesSingleSourced:
+    """verify.py's four category registries must BE (identity, not just
+    value-equality) the verify_categories objects — the mechanism that
+    eliminates the hand-sync bug_history (task 2048: a single category
+    change required 4 registry edits + 2 inline sets).
+
+    RED today: verify.py still holds hand-written literals for
+    _CATEGORY_PRIORITY / _ARCHIVE_DENY_LIST / PREEXISTING_BREAK_SKIP_CATEGORIES,
+    and INFRA_TRANSIENT_CATEGORIES does not exist on verify.py yet.
+    """
+
+    def test_category_priority_is_the_derived_object(self):
+        from orchestrator import verify, verify_categories
+        assert verify._CATEGORY_PRIORITY is verify_categories.CATEGORY_PRIORITY
+
+    def test_archive_deny_list_is_the_derived_object(self):
+        from orchestrator import verify, verify_categories
+        assert verify._ARCHIVE_DENY_LIST is verify_categories.ARCHIVE_DENY_LIST
+
+    def test_preexisting_break_skip_categories_is_the_derived_object(self):
+        from orchestrator import verify, verify_categories
+        assert (
+            verify.PREEXISTING_BREAK_SKIP_CATEGORIES
+            is verify_categories.PREEXISTING_BREAK_SKIP_CATEGORIES
+        )
+
+    def test_infra_transient_categories_is_the_derived_object(self):
+        from orchestrator import verify, verify_categories
+        assert verify.INFRA_TRANSIENT_CATEGORIES is verify_categories.INFRA_TRANSIENT_CATEGORIES
+
+
+class TestShouldArchiveCategoryDelegatesToTable:
+    """verify._should_archive_category must delegate to
+    verify_categories.should_archive — no endswith('_error') heuristic.
+
+    RED today: the endswith heuristic makes an unrecognized '..._error'
+    string archive (True) instead of defaulting to False.
+    """
+
+    @pytest.mark.parametrize('category', sorted(_EXPECTED_CATEGORY_VALUES))
+    def test_matches_table_lookup_for_every_known_category(self, category):
+        from orchestrator import verify, verify_categories
+        assert verify._should_archive_category(category) == verify_categories.should_archive(category)
+
+    def test_unknown_error_suffixed_category_no_longer_auto_archives(self):
+        from orchestrator import verify
+        assert verify._should_archive_category('made_up_error') is False
+
+
+class TestClassifierByteIdentityGolden:
+    """Defensive golden: ``_classify_failure``/``_worst_category`` keep
+    returning plain ``str`` (not ``FailureCategory`` instances), with
+    byte-identical ``json.dumps`` output. The rewire touches only registries
+    and equality/membership comparisons — never the classifier's return
+    type — so no ``FailureCategory`` instance ever reaches a serialized
+    field (F2 / verify_runner canonical-JSON Invariant 1).
+    """
+
+    @pytest.mark.parametrize(
+        ('rc', 'output', 'timed_out', 'expected'),
+        [
+            (0, '', False, 'passed'),
+            (1, '', True, 'infra_timeout'),
+            (1, 'error[E0432]: unresolved import', False, 'compile_error'),
+            (1, 'error: --exclude can only be used together with --workspace', False, 'cargo_cli_error'),
+            (1, 'INTERNALERROR> Traceback', False, 'pytest_internalerror'),
+            (1, 'test_foo FAILED', False, 'test_failure'),
+            (1, 'npm ERR! code E404', False, 'npm_error'),
+            (1, 'flock: failed to get lock', False, 'flock_error'),
+            (1, 'tree-sitter generate failed', False, 'tree_sitter_generate_error'),
+            (1, 'nothing matched', False, 'unknown_test_failure'),
+        ],
+    )
+    def test_classify_failure_returns_legacy_str_with_byte_identical_json(
+        self, rc, output, timed_out, expected,
+    ):
+        from orchestrator.verify import _classify_failure
+        category = _classify_failure(output, rc, timed_out)
+        assert category == expected
+        assert type(category) is str
+        assert json.dumps({'category': category}) == json.dumps({'category': expected})
+
+    def test_worst_category_returns_legacy_str_with_byte_identical_json(self):
+        from orchestrator.verify import _worst_category
+        worst = _worst_category(['test_failure', 'infra_timeout', 'npm_error'])
+        assert worst == 'infra_timeout'
+        assert type(worst) is str
+        assert json.dumps({'category': worst}) == json.dumps({'category': 'infra_timeout'})
