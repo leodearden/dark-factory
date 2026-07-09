@@ -1950,6 +1950,18 @@ class TaskInterceptor:
                     status='deferred',
                     **kwargs,
                 )
+            except DuplicateCandidateKeyError as exc:
+                # The partial UNIQUE index rejected this insert — resolve as
+                # a combine pointing at the surviving row rather than
+                # reintroducing the duplicate via a generic error dict.
+                return {
+                    'task_id': (
+                        str(exc.existing_id) if exc.existing_id is not None else None
+                    ),
+                    'status': exc.existing_status,
+                    'combined': True,
+                    'planning_mode': True,
+                }
             except Exception as exc:
                 logger.exception(
                     'submit_task[planning_mode]: tm.add_task failed for project=%s',
