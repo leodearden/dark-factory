@@ -340,4 +340,6 @@ class TestPremiseLint:
         v = m.Violation(premise='x', invariant='y', detail='z')
         assert dataclasses.is_dataclass(v)
         with pytest.raises(dataclasses.FrozenInstanceError):
-            v.premise = 'mutated'
+            # setattr, not a direct attribute assignment, so this stays pyright-clean
+            # (a direct assignment on a frozen dataclass is reportAttributeAccessIssue).
+            setattr(v, 'premise', 'mutated')  # noqa: B010
