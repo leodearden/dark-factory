@@ -234,6 +234,23 @@ class EventType(StrEnum):
     # data keys: {cause, ticks, detail}.
     external_dep_gate_held = 'external_dep_gate_held'
 
+    # Dispatch-admission gate deferred a HEAVY (normal-kind) candidate this
+    # tick because host PSI pressure is saturated (config.psi_admission) and
+    # this orchestrator's own in-flight count (len(Scheduler._dispatched)) is
+    # at/above the configured floor (task 2328, DA3 of
+    # docs/prds/dispatch-admission-load-cap.md).  Deterministic-kind
+    # candidates are exempt (DA-D4) and never produce this event.  Emitted at
+    # most once per ``acquire_next`` tick — on the FIRST heavy candidate
+    # skipped, across both the pinned and scored dispatch loops.
+    # data keys: {metric, value, in_flight, floor}
+    #   metric:    the PSI field name that tripped saturation, chosen in
+    #              ranked order cpu_some_avg10 > mem_some_avg10 >
+    #              mem_full_avg10 > io_some_avg10 (DA-D1)
+    #   value:     that metric's sampled avg10 value (float)
+    #   in_flight: len(Scheduler._dispatched) at decision time (int)
+    #   floor:     config.psi_admission.min_inflight_floor (int)
+    dispatch_deferred = 'dispatch_deferred'
+
     # Paired (rebase → immediately-following verify) cost record.
     # Emitted once per real rebase (not short-circuit) in _verify_debugfix_loop.
     # Data payload: {

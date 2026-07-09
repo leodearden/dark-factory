@@ -24,6 +24,7 @@ from shared.locking import (
     strip_directory_locks,
 )
 from shared.mcp_envelope import parse_tool_result, resolver_failed
+from shared.psi import PsiSample, read_psi_sample
 from shared.task_metadata import parse_metadata
 
 from orchestrator.config import (
@@ -53,6 +54,12 @@ _GEOMETRIC_SKIP_EMIT_COUNTS: frozenset[int] = frozenset({1, 10, 100, 1000, 10000
 # (~2-4s observed) before giving up.
 _TRANSIENT_RETRIES: int = 3
 _TRANSIENT_BACKOFF_BASE: float = 1.5
+
+# Dispatch-admission gate (task 2328, DA3) rate-limit window for the
+# "deferring heavy dispatch" and "PSI unreadable" WARNING logs.  Mirrors
+# harness.py's _PAUSED_IDLE_LOG_SECS so sustained saturation doesn't flood
+# journald while the per-tick dispatch_deferred event still fires every tick.
+_DISPATCH_DEFERRED_LOG_SECS: float = 180.0
 
 logger = logging.getLogger(__name__)
 
@@ -1232,6 +1239,20 @@ class Scheduler:
         # this tick.  Default None so bare-Scheduler unit tests are
         # unaffected and the gate is a no-op until the Harness wires it up.
         self._landed_outbox_gate: Callable[[str], Any] | None = None
+        # Injected PSI reader for the dispatch-admission gate (task 2328,
+        # DA3 of PRD docs/prds/dispatch-admission-load-cap.md).  Defaults to
+        # the real /proc/pressure reader; tests reassign
+        # ``scheduler._read_psi_sample = lambda: PsiSample(...)`` — mirrors
+        # the ``_landed_outbox_gate`` seam above (instance attr, no new
+        # constructor kwarg).  Signature: () -> PsiSample.
+        self._read_psi_sample: Callable[[], PsiSample] = read_psi_sample
+        # Rate-limit timestamps (monotonic, via self._time_source) for the
+        # dispatch-admission gate's two WARNING streams — deliberately
+        # separate so "PSI unreadable" (fail-open, DA-D6) and "deferring
+        # heavy dispatch" (throttle, DA-D2) cannot rate-limit each other into
+        # silence.
+        self._last_dispatch_deferred_log: float = 0.0
+        self._last_psi_read_fail_log: float = 0.0
         # --- Snapshot write throttle (task 1332) ---
         # Monotonic timestamp of the last successful _write_snapshot_best_effort
         # disk write.  None before the first write; the first write always
@@ -3952,6 +3973,81 @@ class Scheduler:
         if not candidates:
             return None
 
+        # Dispatch-admission gate (task 2328, DA3 of PRD
+        # docs/prds/dispatch-admission-load-cap.md).  Computed ONCE per tick,
+        # before both the pinned and scored dispatch loops, so a single hold
+        # decision governs both (DA-D5 parity) and len(self._dispatched) is
+        # read before this tick's own dispatch can mutate it (stable floor
+        # comparison).  Placed after the empty-candidate short-circuit so an
+        # idle tick never pays for a PSI read.
+        cfg_psi = self.config.psi_admission
+        psi_sample: PsiSample | None = None
+        psi_hold = False
+        psi_in_flight = 0
+        if cfg_psi.enabled:
+            psi_sample = self._read_psi_sample()
+            if not psi_sample.read_ok:
+                # Fail-open (DA-D6): saturated() is False whenever read_ok is
+                # False, so psi_hold stays False and dispatch proceeds
+                # normally — this WARNING is only the loud operator signal.
+                _now = self._time_source()
+                if _now - self._last_psi_read_fail_log >= _DISPATCH_DEFERRED_LOG_SECS:
+                    logger.warning(
+                        'Dispatch-admission gate: PSI sample unreadable — '
+                        'failing open (heavy dispatch is NOT throttled this tick)'
+                    )
+                    self._last_psi_read_fail_log = _now
+            psi_in_flight = len(self._dispatched)
+            psi_hold = (
+                psi_sample.saturated(cfg_psi) and psi_in_flight >= cfg_psi.min_inflight_floor
+            )
+
+        _dispatch_deferred_emitted = False
+
+        def _note_heavy_deferral(deferred_task_id: str) -> None:
+            """Emit dispatch_deferred + a rate-limited WARNING for the FIRST
+            heavy candidate skipped this tick (per-tick dedup)."""
+            nonlocal _dispatch_deferred_emitted
+            if _dispatch_deferred_emitted:
+                return
+            _dispatch_deferred_emitted = True
+            # invariant: only reachable when psi_hold is True, which is only
+            # ever set True inside `if cfg_psi.enabled:` after psi_sample is
+            # assigned — so psi_sample is never None here.
+            assert psi_sample is not None
+            # DA-D1 ranked order: cpu > mem_some > mem_full > io.
+            if psi_sample.cpu_some10 >= cfg_psi.cpu_some_avg10:
+                metric, value = 'cpu_some_avg10', psi_sample.cpu_some10
+            elif psi_sample.mem_some10 >= cfg_psi.mem_some_avg10:
+                metric, value = 'mem_some_avg10', psi_sample.mem_some10
+            elif psi_sample.mem_full10 >= cfg_psi.mem_full_avg10:
+                metric, value = 'mem_full_avg10', psi_sample.mem_full10
+            else:
+                metric, value = 'io_some_avg10', psi_sample.io_some10
+            if self.event_store:
+                self.event_store.emit(
+                    EventType.dispatch_deferred,
+                    task_id=deferred_task_id,
+                    data={
+                        'metric': metric,
+                        'value': value,
+                        'in_flight': psi_in_flight,
+                        'floor': cfg_psi.min_inflight_floor,
+                    },
+                )
+            _now = self._time_source()
+            if _now - self._last_dispatch_deferred_log >= _DISPATCH_DEFERRED_LOG_SECS:
+                logger.warning(
+                    'Dispatch-admission gate: deferring heavy task %s — '
+                    'PSI %s=%.1f (in_flight=%d, floor=%d)',
+                    deferred_task_id,
+                    metric,
+                    value,
+                    psi_in_flight,
+                    cfg_psi.min_inflight_floor,
+                )
+                self._last_dispatch_deferred_log = _now
+
         # Pin-dispatch: try pinned tasks in pin_order ASC before scoring.
         # Pinned candidates bypass scoring entirely but still respect lock
         # availability and eligibility checks (status, deps, cooldown).
@@ -3985,6 +4081,15 @@ class Scheduler:
                     # task's merge already landed on main and is being driven
                     # to done inline — skip it here too so the pin loop and
                     # the scored loop share the one gated_ids source of truth.
+                    continue
+                if psi_hold and not self.is_deterministic(pin_task):
+                    # Dispatch-admission gate (task 2328, DA3/DA-D5): a pin
+                    # doesn't reduce host load, so a pinned HEAVY candidate is
+                    # deferred exactly like a scored one — deterministic pins
+                    # remain exempt.  psi_hold and _note_heavy_deferral are
+                    # the SAME once-per-tick decision/helper the scored loop
+                    # uses below, so both loops share one hold and one event.
+                    _note_heavy_deferral(pin_tid)
                     continue
                 # Eligible pinned candidate — try to acquire its modules.
                 pin_modules = self._get_modules(pin_task)
@@ -4057,6 +4162,13 @@ class Scheduler:
         top_had_parks = self.lock_table.has_parks(top_id)
 
         for _score, task_id, task, pri in scored:
+            if psi_hold and not self.is_deterministic(task):
+                # Dispatch-admission gate (DA3): defer this HEAVY candidate —
+                # deterministic candidates are exempt (DA-D4) and lower-
+                # ranked exempt/light candidates behind it still get a turn
+                # (per-candidate `continue`, not a top-level `return None`).
+                _note_heavy_deferral(task_id)
+                continue
             modules = self._get_modules(task)
             if self.lock_table.try_acquire(task_id, modules):
                 self._dispatched.add(task_id)
