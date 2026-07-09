@@ -174,6 +174,9 @@ class MemoryConsolidator(BaseStage):
         # verified_count stays None (not 0) until the full-cycle block below actually
         # runs the count check — None means "not checked this cycle", 0 means "checked
         # and confirmed absent"; this distinction is load-bearing (see that block).
+        # This stat is deliberately Optional[int] end-to-end (contract note at the
+        # full-cycle assignment site below), unlike Stage 2's sibling stat which
+        # coerces a trailing None to 0.
         report.stats['stage1_cycle_summary_verified_count'] = None
         report.stats['stage1_cycle_summary_reconstructed'] = 0
 
@@ -434,6 +437,15 @@ class MemoryConsolidator(BaseStage):
         # Gated on count == 0 specifically (not a falsy check) so a transient
         # count_memories_by_metadata failure (verified_count is None) never
         # fabricates a placeholder for a run whose real summary may already exist.
+        #
+        # Contract note (task 2366 amendment): unlike Stage 2's
+        # 'stage2_cycle_summary_verified_count' (task_knowledge_sync.py, which
+        # coerces a trailing None to 0 before storing — "this stat's contract
+        # (always an int) is preserved for downstream consumers"), this stat is
+        # deliberately left Optional[int]: None means "not confirmed absent, a
+        # transient count failure occurred" and is kept distinct from a
+        # confirmed 0. A consumer aggregating both stages' stats must treat
+        # this key as Optional[int] while stage2's is always int.
         count = await verify_cycle_summary_written(
             self.memory, self.project_id, run_id, stage='memory_consolidator',
         )

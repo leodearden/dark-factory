@@ -58,6 +58,18 @@ _STAGE_RECON_PARAMS = pytest.mark.parametrize(
     ids=['stage2', 'stage1'],
 )
 
+# Parametrize (stage, recon_pool, reconstruct_source, expected_nonce_prefix)
+# to prove the fallback-stub content's leading nonce label tracks `stage`
+# rather than being hardcoded to Stage 1's (task 2366 amendment).
+_STAGE_NONCE_PARAMS = pytest.mark.parametrize(
+    'stage,recon_pool,reconstruct_source,expected_nonce_prefix',
+    [
+        ('task_knowledge_sync', 'stage2_cycle_summary', 'stage2_summary_reconstruction', 'STAGE2'),
+        ('memory_consolidator', 'stage1_cycle_summary', 'stage1_summary_reconstruction', 'STAGE1'),
+    ],
+    ids=['stage2', 'stage1'],
+)
+
 
 class TestEnforceSummaryPoolCap:
     """enforce_summary_pool_cap trims oldest pool members to the passed cap."""
@@ -634,10 +646,14 @@ class TestReconstructCycleSummaryStub:
         warning_records = [r for r in caplog.records if r.levelno >= logging.WARNING]
         assert len(warning_records) >= 1
 
+    @_STAGE_NONCE_PARAMS
     @pytest.mark.asyncio
-    async def test_content_shape_leads_with_stage1_nonce_and_embeds_run_id(self):
-        """content leads with a STAGE1-prefixed nonce and embeds 'run_id: <run_id>'
-        so both the metadata triple-filter and Path-1 semantic search self-heal."""
+    async def test_content_shape_leads_with_stage_nonce_and_embeds_run_id(
+        self, stage, recon_pool, reconstruct_source, expected_nonce_prefix
+    ):
+        """content leads with a nonce prefixed for *this* stage (not hardcoded to
+        Stage 1's) and embeds 'run_id: <run_id>' so both the metadata
+        triple-filter and Path-1 semantic search self-heal."""
         memory_service = AsyncMock()
         memory_service.add_memory = AsyncMock(return_value={'memory_ids': ['m1']})
 
@@ -645,15 +661,16 @@ class TestReconstructCycleSummaryStub:
             memory_service,
             'dark_factory',
             'run-shape',
-            stage='memory_consolidator',
-            recon_pool='stage1_cycle_summary',
-            reconstruct_source='stage1_summary_reconstruction',
+            stage=stage,
+            recon_pool=recon_pool,
+            reconstruct_source=reconstruct_source,
         )
 
         content = memory_service.add_memory.call_args.kwargs.get('content')
         first_line = content.splitlines()[0]
-        assert first_line.startswith('STAGE1_'), (
-            f'expected content to lead with a STAGE1-prefixed nonce, got: {first_line!r}'
+        assert first_line.startswith(f'{expected_nonce_prefix}_'), (
+            f'expected content to lead with a {expected_nonce_prefix}-prefixed '
+            f'nonce, got: {first_line!r}'
         )
         assert 'run_id: run-shape' in content
 

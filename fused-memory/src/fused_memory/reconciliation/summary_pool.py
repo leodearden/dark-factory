@@ -196,6 +196,14 @@ async def pretrim_summary_pool(
     )
 
 
+# SYNC WARNING (task 2366): near-verbatim duplicated as
+# task_knowledge_sync._verify_stage2_summary_written (same triple filter,
+# hardcoded to stage='task_knowledge_sync'). That copy was deliberately left
+# in place — not refactored to delegate here — to avoid regression risk to a
+# proven production path (see this task's plan: "Stage 2 delegation to it is
+# a noted follow-up (not in scope, to avoid Stage 2 regression risk)").
+# Editing the verify logic here is a signal to check whether the Stage 2
+# copy needs the same fix, and vice versa.
 async def verify_cycle_summary_written(
     memory_service,
     project_id: str,
@@ -259,6 +267,14 @@ async def verify_cycle_summary_written(
     return count
 
 
+# SYNC WARNING (task 2366): _extract_response_memory_ids,
+# _build_fallback_summary_content, and reconstruct_cycle_summary_stub below
+# are near-verbatim duplicated by task_knowledge_sync._extract_response_memory_ids
+# / _build_stage2_reconstruction_content / _reconstruct_stage2_summary. Those
+# copies were deliberately left in place — not refactored to delegate here —
+# to avoid regression risk to a proven production path (see this task's
+# plan). Editing any of the three functions below is a signal to check
+# whether the Stage 2 copies need the same fix, and vice versa.
 def _extract_response_memory_ids(response) -> list:
     """Defensively read ``memory_ids`` from an ``add_memory`` response.
 
@@ -276,24 +292,42 @@ def _extract_response_memory_ids(response) -> list:
     return getattr(response, 'memory_ids', None) or []
 
 
+# Maps a `stage` metadata tag value to the nonce label generate_summary_nonce
+# expects (task 1590's 'STAGE1' / 'STAGE2' convention — see
+# cli_stage_runner.py). Keeps _build_fallback_summary_content's content
+# genuinely stage-agnostic: a Stage 2 stub must lead with a STAGE2_-prefixed
+# nonce, not a hardcoded STAGE1_ one, so the label stays an honest signal of
+# the stub's origin (task 2366 amendment). An unmapped stage falls back to
+# its own uppercased name rather than raising, matching this module's
+# best-effort posture.
+_NONCE_PREFIX_BY_STAGE = {
+    'memory_consolidator': 'STAGE1',
+    'task_knowledge_sync': 'STAGE2',
+}
+
+
+def _nonce_prefix_for_stage(stage: str) -> str:
+    """Return the ``generate_summary_nonce`` prefix label for *stage*."""
+    return _NONCE_PREFIX_BY_STAGE.get(stage, stage.upper())
+
+
 def _build_fallback_summary_content(run_id: str, stage: str, attempt: int) -> str:
     """Build the deterministic fallback-stub content for *run_id* / *stage*.
 
-    Leads with a fresh ``generate_summary_nonce('STAGE1')`` line — the same
+    Leads with a fresh ``generate_summary_nonce(<prefix>)`` line — the same
     CSPRNG dedup-defeat primitive the LLM per-cycle-summary path uses (task
     1572/1590) — so repeat calls (the one-shot retry in
     :func:`reconstruct_cycle_summary_stub`) never collide on Mem0's ~0.92
-    cosine-similarity dedup threshold. *attempt* does not otherwise affect
-    the content — distinctness between attempts comes entirely from the
-    fresh nonce — it is accepted purely for readability/parity with the
-    Stage 2 template this generalizes.
+    cosine-similarity dedup threshold. The prefix is derived from *stage* via
+    :func:`_nonce_prefix_for_stage` (task 2366 amendment), so the label
+    matches the stage the stub claims instead of being hardcoded to Stage 1's.
+    *attempt* does not otherwise affect the content — distinctness between
+    attempts comes entirely from the fresh nonce — it is accepted purely for
+    readability/parity with the Stage 2 template this generalizes.
 
     The body embeds ``run_id: <run_id>`` verbatim so a semantic search on the
     run_id also matches this stub (Path-1 self-heal), in addition to the
-    metadata triple-filter (Path-2). Only Stage 1 is wired to this function
-    today (task 2366) — the nonce prefix is hardcoded to ``'STAGE1'``
-    regardless of *stage*; a future Stage 2 delegation would need to
-    parametrize this too.
+    metadata triple-filter (Path-2).
 
     Args:
         run_id: Current reconciliation run identifier.
@@ -303,7 +337,7 @@ def _build_fallback_summary_content(run_id: str, stage: str, attempt: int) -> st
     Returns:
         Fallback stub content, always starting with a fresh nonce line.
     """
-    nonce = generate_summary_nonce('STAGE1')
+    nonce = generate_summary_nonce(_nonce_prefix_for_stage(stage))
     return (
         f'{nonce}\n'
         f'Stage {stage} cycle summary (deterministic harness fallback stub) for '
