@@ -720,3 +720,86 @@ def test_orchestrator_killed_mid_build_tree_killed_via_eof(tmp_path):
         if dispatcher.poll() is None:
             dispatcher.kill()
             dispatcher.wait(timeout=5)
+
+
+# ---------------------------------------------------------------------------
+# Task 2309 step-9/10 -- SS9 Row 2: ssh connection dropped mid-build (EOF
+# path, dispatcher ALIVE).  Distinct from Row 1 (whole dispatcher process
+# death): here the in-process dispatcher (this test) owns the child's
+# stdin=PIPE directly and closes ONLY the write end via
+# HeartbeatWriter.close_stdin(), while the dispatcher/test process itself
+# keeps running throughout -- modeling "the ssh transport dropped", not "the
+# orchestrator died".
+# ---------------------------------------------------------------------------
+
+
+def test_ssh_dropped_mid_build_tree_killed_via_eof_dispatcher_alive(tmp_path):
+    """SS9 Row 2: ssh channel closes but the dispatcher stays alive -> EOF tree-kill.
+
+    Spawns a real ``verify-merge --request-id`` with a live
+    :class:`HeartbeatWriter` driving its stdin (real heartbeats flow while
+    connected), waits for the sleeper subtree to appear, then calls
+    ``heartbeat.close_stdin()`` -- stopping heartbeats AND closing the
+    child's stdin write-end -- while this test process (the dispatcher
+    stand-in) keeps running.  The child sees the same fd-0 EOF signal as Row
+    1 and the same ``run_stdin_watchdog`` EOF branch fires; the difference
+    from Row 1 is that no dispatcher PROCESS dies here, only the transport.
+
+    Uses the step-2 env seam directly on the spawned verify-merge (already
+    an in-process dispatcher, so no extra remove is needed, unlike Row 1's
+    separate-process case) for a fast, deterministic assertion window.
+
+    Asserts within a bounded T: the full descendant subtree AND the pgid
+    leader are gone, and the verify-merge process itself self-exits non-zero
+    (the watchdog's controlled ``os._exit(1)``, not an external kill signal).
+    """
+    repo, head_sha = _setup_verify_repo(tmp_path)
+    cfg_file = tmp_path / 'config.yaml'
+    write_verify_config(cfg_file, repo, persistent_merge_worktree=False)
+    worktree_base = worktree_base_for(repo)
+
+    REQUEST_ID = 'row2-ssh-dropped'
+    pgf = pgid_file(worktree_base, REQUEST_ID)
+
+    child = spawn_verify_merge(
+        sha=head_sha,
+        spec=sleeper_spec(300.0),
+        cfg_file=cfg_file,
+        request_id=REQUEST_ID,
+        extra_env={
+            'ORCH_WATCHDOG_HEARTBEAT_TIMEOUT_SECS': '1.0',
+            'ORCH_WATCHDOG_KILL_GRACE_SECS': '0.5',
+        },
+    )
+    heartbeat = HeartbeatWriter(child, interval=0.2).start()
+    try:
+        pgid_val = wait_for_pgid_file(pgf)
+        wait_subtree_live(pgid_val)
+
+        heartbeat.close_stdin()
+
+        # Reap the leader (a DIRECT child of this test process, unlike Row
+        # 1's separate-dispatcher indirection or Row 4's cancel-verify path)
+        # BEFORE polling wait_subtree_gone: os.killpg(pgid, 0) succeeds
+        # against an unreaped zombie too, so checking liveness first would
+        # spuriously see the group as "alive" until something calls
+        # child.wait() -- confirmed by a manual repro that hung the full
+        # poll window with this ordering reversed.
+        try:
+            child.wait(timeout=10)
+        except subprocess.TimeoutExpired:
+            pytest.fail('verify-merge did not exit within 10s after stdin EOF')
+        assert child.returncode != 0, (
+            f'expected non-zero exit (watchdog self-kill), got {child.returncode}'
+        )
+
+        assert wait_subtree_gone(pgid_val, timeout=10.0), (
+            f'pgid {pgid_val}: subtree and/or leader still alive after the '
+            f'ssh channel EOF (dispatcher alive) -- watchdog tree-kill did '
+            f'not fire'
+        )
+    finally:
+        heartbeat.stop_heartbeats()
+        if child.poll() is None:
+            child.kill()
+            child.wait(timeout=5)
