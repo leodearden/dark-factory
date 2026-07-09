@@ -177,3 +177,54 @@ def _wire_recovery_scheduler(harness: Harness) -> None:
     harness.scheduler.get_tasks = AsyncMock(return_value=[])
     harness.scheduler.is_deterministic = MagicMock(return_value=False)
     harness.event_store = MagicMock()
+
+
+# ── B1 — writer->reader round-trip (adopt) ──────────────────────────────
+
+
+@pytest.mark.asyncio
+class TestB1WriterReaderRoundTrip:
+    """B1: acquire a lane for a task, crash (fresh in-memory pool cache,
+    durable record + git worktree persist), recover — the reader must adopt
+    the lane by reading the SAME durable record the REAL writer produced.
+    """
+
+    async def test_acquire_then_recover_adopts_lane(self, ig_git_repo: Path):
+        repo = ig_git_repo
+        await _add_warm_lane_scripts(repo)
+        harness = _build_harness(_make_orch_config(repo))
+        _wire_recovery_scheduler(harness)
+
+        # WRITER: real acquire_warm_lane — real `git worktree add`.
+        head = await _get_head(repo)
+        lane = await _acquire_lane(harness.git_ops, '42', head, expected_title='B1 task')
+        assert lane == harness.git_ops.worktree_base / '_lane-0'
+
+        # Write crashed progress under the sibling .task-meta root.
+        meta = TaskArtifacts.meta_root_for(harness.git_ops.worktree_base, lane.name)
+        ta = TaskArtifacts(lane, meta)
+        ta.init('42', 'B1 task', 'd')
+        ta.write_plan(_make_plan(3, 5, '42'))
+
+        # Simulate restart: fresh in-memory pool cache; durable record +
+        # git worktree persist on disk.
+        harness.git_ops.warm_lane_pool = WarmLanePool(
+            worktree_base=harness.git_ops.worktree_base,
+            size=harness.git_ops.warm_lane_pool.size,
+        )
+
+        # READER: real crash recovery.
+        await harness._recover_crashed_tasks()
+
+        pool = harness.git_ops.warm_lane_pool
+        assert pool.assignment_for('42') == lane
+        assert pool.state(lane) == LaneState.ASSIGNED
+
+        rec = harness.git_ops._lane_lifecycle.read(lane)
+        assert rec is not None
+        assert rec.state == DurableLaneState.ASSIGNED
+        assert rec.task_id == '42'
+
+        assert '42' in harness._recovered_plans
+        assert lane.exists()
+        assert rec.state != DurableLaneState.QUARANTINED
