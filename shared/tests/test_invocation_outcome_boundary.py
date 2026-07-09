@@ -749,6 +749,14 @@ class TestB7StewardWedgeGuardInherited:
 # ---------------------------------------------------------------------------
 
 
+def _cap_every_account(gate: UsageGate) -> None:
+    """B8 support: drive every account in *gate* to CAPPED via the real
+    AVAILABLE -> CAPPED legal edge, so the gate is fully closed before the
+    SIGHUP hard-reset is exercised."""
+    for acct in gate._accounts:
+        gate._transition(acct, AccountPhase.CAPPED)
+
+
 @pytest.mark.asyncio
 class TestB8SighupUncaps:
     """All accounts CAPPED, then _on_sighup_async() force-resets every
