@@ -4004,6 +4004,15 @@ class Scheduler:
         gated_ids = await self._consult_landed_outbox(
             [str(t.get('id', '')) for t in candidates]
         )
+        # Already-landed pre-dispatch gate (task 2313) — consulted immediately
+        # after the landed-outbox gate above and unioned into the SAME
+        # gated_ids set, so both the scored candidate filter below and the
+        # pin loop honor a single source of truth (mirrors the
+        # _consult_landed_outbox / gated_ids pattern verbatim). Catches
+        # out-of-band landings (ancestry / merge-marker / content-
+        # equivalence) that never passed through this orchestrator's own
+        # merge queue.
+        gated_ids |= await self._consult_already_landed(candidates)
         if gated_ids:
             candidates = [
                 t for t in candidates if str(t.get('id', '')) not in gated_ids
