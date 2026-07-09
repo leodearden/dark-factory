@@ -276,6 +276,43 @@ def _mock_merge_queue_verification(monkeypatch, request):
 
 
 @pytest.fixture(autouse=True)
+def _neutralize_verify_admission(monkeypatch, request):
+    """Patch verify._verify_admission_active to False for every test except
+    those marked ``real_verify_admission``.
+
+    Task 2390 (T2) wires ``shared.verify_admission``'s flock semaphore + role
+    nice prefix into every test-leg ``verify.py`` pytest spawn, DEFAULT ON
+    (``verify_admission_enabled=True``). Left unneutralized, the entire
+    existing verify suite would route through the ``nice ... /bin/bash -c
+    <shlex.quote(cmd)>`` wrap (mangling substring cmd assertions, e.g.
+    env-transient tests matching ``-o addopts=''``) and contend on the
+    shared ``/tmp/df-verify-slots-<uid>`` directory across xdist workers.
+    This fixture keeps every legacy test byte-identical by forcing the
+    module seam ``orchestrator.verify._verify_admission_active`` to return
+    False, so admission is inactive regardless of
+    ``config.verify_admission_enabled``.
+
+    **Opt-out via ``real_verify_admission`` marker**: tests that specifically
+    exercise the admission wiring (nice-wrap, acquire, fail-open, ...) mark
+    themselves with ``@pytest.mark.real_verify_admission`` to restore the
+    real seam, causing this fixture to return early (skip the monkeypatch).
+
+    Guarded on ``hasattr`` so this fixture is a safe no-op until task 2390's
+    verify.py wiring (step-6) actually defines ``_verify_admission_active`` —
+    every commit before that stays green without this fixture touching
+    anything.
+
+    Mirrors ``_mock_merge_queue_verification`` (conftest.py:231-275).
+    """
+    if request.node.get_closest_marker('real_verify_admission'):
+        return
+    from orchestrator import verify
+    if not hasattr(verify, '_verify_admission_active'):
+        return
+    monkeypatch.setattr('orchestrator.verify._verify_admission_active', lambda config: False)
+
+
+@pytest.fixture(autouse=True)
 def _drain_async_mock_coroutines():
     """Drain orphaned AsyncMock._execute_mock_call coroutines after every test.
 
