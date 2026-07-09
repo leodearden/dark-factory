@@ -918,8 +918,10 @@ def _spawn_merge_verify_dry_run(
     None-safe: no-ops when *handles* is ``None`` or ``handles.scheduler`` is
     ``None`` — the solo-reverify and train module-level
     ``_run_post_merge_verify`` callers pass no handles.  Also no-ops when
-    ``req.config.unblock_auto.enabled`` is falsy (mirrors
-    ``workflow._spawn_dry_run_unblock``'s enablement gate).
+    ``req.config.unblock_auto.enabled`` is falsy, or when a not-done
+    investigation task is already registered in ``handles.background_tasks``
+    under this task's name (mirrors ``workflow._spawn_dry_run_unblock``'s
+    enablement and in-flight-dedup guards).
 
     *event_store* is accepted but intentionally NOT yet forwarded to
     ``run_dry_run_unblock`` — wired in a later step.
@@ -931,6 +933,21 @@ def _spawn_merge_verify_dry_run(
     if not ua or not ua.enabled:
         return
     task_name = f'unblock-auto-{req.task_id}'
+    # Skip if an investigation for this task is already running (e.g. rapid
+    # re-blocks across successive merge-verify retries).  Duplicate proposals
+    # are unhelpful and would multiply budget spend up to the investigation's
+    # own timeout ceiling per re-block (mirrors
+    # workflow._spawn_dry_run_unblock's dedup guard).
+    if any(
+        t.get_name() == task_name and not t.done()
+        for t in handles.background_tasks
+    ):
+        logger.debug(
+            'Task %s: merge-verify dry-run investigation already in '
+            'progress, skipping duplicate spawn',
+            req.task_id,
+        )
+        return
     try:
         task = asyncio.create_task(
             run_dry_run_unblock(
