@@ -4190,6 +4190,45 @@ class TestBranchContentInMain:
 
         assert await git_ops.branch_content_in_main(branch) is False
 
+    async def test_true_despite_incomplete_work_when_touched_file_coincidentally_matches(
+        self, git_ops: GitOps, git_repo: Path,
+    ) -> None:
+        """Pins the accepted false-positive risk documented on this method
+        (task 2313 review): the primitive only compares files *branch* has
+        touched so far, not the task's full intended scope.  Here the branch
+        has only completed fileA — fileB is still pending, so the task is
+        genuinely NOT done — but fileA coincidentally matches main's
+        independent content for that path.  branch_content_in_main cannot
+        distinguish this from a real landing and must still return True;
+        this is the deliberate tradeoff, not a bug, and this test pins it so
+        it can't silently change.
+        """
+        branch = 'task/partial-1'
+        rc, _, err = await _run(['git', 'checkout', '-b', branch], cwd=git_repo)
+        assert rc == 0, f'checkout {branch} failed: {err}'
+        (git_repo / 'fileA.py').write_text('x = 1\n')
+        await _run(['git', 'add', 'fileA.py'], cwd=git_repo)
+        rc, _, err = await _run(
+            ['git', 'commit', '-m', 'Add fileA on branch (fileB still pending)'],
+            cwd=git_repo,
+        )
+        assert rc == 0, f'commit on {branch} failed: {err}'
+
+        rc, _, err = await _run(['git', 'checkout', 'main'], cwd=git_repo)
+        assert rc == 0, f'checkout main failed: {err}'
+        # main independently carries byte-identical fileA content for
+        # unrelated reasons — NOT because this task landed. fileB (the
+        # branch's remaining, un-landed work) never touched main at all.
+        (git_repo / 'fileA.py').write_text('x = 1\n')
+        await _run(['git', 'add', 'fileA.py'], cwd=git_repo)
+        rc, _, err = await _run(
+            ['git', 'commit', '-m', 'Add fileA independently on main'], cwd=git_repo,
+        )
+        assert rc == 0, f'commit on main failed: {err}'
+
+        assert await git_ops.is_ancestor(branch, 'main') is False
+        assert await git_ops.branch_content_in_main(branch) is True
+
 
 @pytest.mark.asyncio
 class TestMergeSubjectContract:

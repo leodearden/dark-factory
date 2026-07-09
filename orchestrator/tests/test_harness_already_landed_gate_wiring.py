@@ -62,6 +62,7 @@ class TestAlreadyLandedDispatchGateAncestryHappyPath:
 
         citation_sha = 'a' * 40
         h.git_ops = MagicMock()
+        h.git_ops.resolve_branch_sha = AsyncMock(return_value='f' * 40)
         h.git_ops.is_ancestor = AsyncMock(return_value=True)
         h.git_ops.find_task_citation_commit = AsyncMock(return_value=citation_sha)
         h.git_ops.config.branch_prefix = 'task/'
@@ -91,6 +92,7 @@ def _wired_ancestry_harness(mock_orch_config) -> Harness:
     """
     h = _build_harness(mock_orch_config)
     h.git_ops = MagicMock()
+    h.git_ops.resolve_branch_sha = AsyncMock(return_value='f' * 40)
     h.git_ops.is_ancestor = AsyncMock(return_value=True)
     h.git_ops.find_task_citation_commit = AsyncMock(return_value='a' * 40)
     h.git_ops.config.branch_prefix = 'task/'
@@ -167,9 +169,11 @@ def _wired_marker_harness(
     h.git_ops.config.branch_prefix = 'task/'
     h.git_ops.config.main_branch = 'main'
 
+    # Branch ref does not exist (deleted post-merge) — this is what routes
+    # the gate past the ancestry check and into the marker path at all.
+    h.git_ops.resolve_branch_sha = AsyncMock(return_value=None)
+
     async def _is_ancestor(a, b):
-        if a == 'task/42' and b == 'main':
-            return False
         if a == marker_sha and b == branch_base_sha:
             return marker_is_ancestor_of_base
         raise AssertionError(f'unexpected is_ancestor call: {a!r}, {b!r}')
@@ -191,8 +195,9 @@ def _wired_marker_harness(
 class TestAlreadyLandedDispatchGateMarkerPath:
     """Branch-deleted merge-marker path (RED until step-8).
 
-    is_ancestor(branch, main) is False in both sub-cases, so the ancestry
-    path never engages — only the marker path can produce a result.
+    resolve_branch_sha(branch) is None in both sub-cases (the branch ref is
+    gone), so the ancestry path never engages — only the marker path can
+    produce a result.
     """
 
     async def test_marker_found_and_not_stale_flips_to_done(
@@ -201,6 +206,10 @@ class TestAlreadyLandedDispatchGateMarkerPath:
         """A merge marker on main, not an ancestor of branch_base_sha (i.e.
         it postdates this incarnation's creation point) -> flips to done,
         anchored on the marker sha.
+
+        Also pins the citation-laziness fix (task 2313 review): the marker
+        path doesn't consume a citation, so find_task_citation_commit must
+        never be called here.
         """
         marker_sha = 'b' * 40
         branch_base_sha = 'e' * 40
@@ -220,6 +229,7 @@ class TestAlreadyLandedDispatchGateMarkerPath:
         assert call_args.args[0] == '42'
         assert call_args.args[1] == marker_sha
         assert call_args.args[3] == 'dispatch-gate-marker-found'
+        cast(AsyncMock, h.git_ops.find_task_citation_commit).assert_not_called()
 
     async def test_stale_marker_vetoes_flip(self, mock_orch_config) -> None:
         """A marker that IS an ancestor of branch_base_sha predates this
@@ -244,15 +254,21 @@ class TestAlreadyLandedDispatchGateMarkerPath:
 def _wired_content_harness(
     mock_orch_config, *, citation_sha, main_sha, content_in_main,
 ) -> Harness:
-    """Bare harness with is_ancestor False and find_merge_marker None, so
-    neither the ancestry path nor the marker path can produce a result —
-    only the content-equivalence fallback is under test.
+    """Bare harness with the branch existing but is_ancestor False and
+    find_merge_marker None, so neither the ancestry path nor the marker
+    path can produce a result — only the content-equivalence fallback is
+    under test.
+
+    The branch must "exist" (resolve_branch_sha truthy) for this fallback
+    to even be reached — the cheap pre-filter (task 2313 review) routes a
+    nonexistent branch straight to the marker path instead.
     """
     h = _build_harness(mock_orch_config)
     h.git_ops = MagicMock()
     h.git_ops.config.branch_prefix = 'task/'
     h.git_ops.config.main_branch = 'main'
 
+    h.git_ops.resolve_branch_sha = AsyncMock(return_value='f' * 40)
     h.git_ops.is_ancestor = AsyncMock(return_value=False)
     h.git_ops.find_merge_marker = AsyncMock(return_value=None)
     h.git_ops.find_task_citation_commit = AsyncMock(return_value=citation_sha)
@@ -340,6 +356,90 @@ class TestAlreadyLandedDispatchGateContentEquivalence:
         result = await h._already_landed_dispatch_gate('42')
 
         assert result is False
+        cast(AsyncMock, h._mark_in_progress_done).assert_not_awaited()
+
+
+def _wired_absent_branch_harness(mock_orch_config) -> Harness:
+    """Bare harness with resolve_branch_sha -> None (branch ref does not
+    exist, e.g. a fresh task never dispatched).  is_ancestor and
+    branch_content_in_main are wired but must NEVER be called — the cheap
+    pre-filter should route straight to (and stop at) the marker check.
+    """
+    h = _build_harness(mock_orch_config)
+    h.git_ops = MagicMock()
+    h.git_ops.config.branch_prefix = 'task/'
+    h.git_ops.config.main_branch = 'main'
+
+    h.git_ops.resolve_branch_sha = AsyncMock(return_value=None)
+    h.git_ops.is_ancestor = AsyncMock(return_value=False)
+    h.git_ops.branch_content_in_main = AsyncMock(return_value=False)
+    h.git_ops.find_merge_marker = AsyncMock(return_value=None)
+    h.git_ops.find_task_citation_commit = AsyncMock(return_value=None)
+
+    h.scheduler.get_task = AsyncMock(return_value={'id': '42', 'metadata': {}})
+    h._branch_is_degenerate = AsyncMock(return_value=False)
+    h._mark_in_progress_done = AsyncMock()
+    h._escalation_queue = None
+    return h
+
+
+@pytest.mark.asyncio
+class TestAlreadyLandedDispatchGateBranchExistencePreFilter:
+    """Cheap pre-filter (task 2313 review): resolve_branch_sha is resolved
+    ONCE up front instead of letting is_ancestor / branch_content_in_main
+    each spawn a subprocess that would only fail through to False.  These
+    tests pin the reduced-I/O shape of both the branch-absent and the
+    branch-exists-but-not-landed common cases.
+    """
+
+    async def test_missing_branch_skips_ancestor_and_content_checks(
+        self, mock_orch_config,
+    ) -> None:
+        """A branch that doesn't exist yet must never reach is_ancestor or
+        branch_content_in_main — both would just fail through to False at
+        the cost of a wasted subprocess.  Only the marker search (the one
+        check meaningful without a live ref) runs.
+        """
+        h = _wired_absent_branch_harness(mock_orch_config)
+
+        result = await h._already_landed_dispatch_gate('42')
+
+        assert result is False
+        cast(AsyncMock, h.git_ops.is_ancestor).assert_not_called()
+        cast(AsyncMock, h.git_ops.branch_content_in_main).assert_not_called()
+        cast(AsyncMock, h.git_ops.find_merge_marker).assert_awaited_once()
+        cast(AsyncMock, h._mark_in_progress_done).assert_not_awaited()
+
+    async def test_existing_not_landed_branch_skips_marker_and_citation(
+        self, mock_orch_config,
+    ) -> None:
+        """A branch that exists but isn't landed (not an ancestor, content
+        not equivalent) must never call find_merge_marker — its own
+        internal gate would just return None anyway since the branch ref
+        still exists — nor find_task_citation_commit, which only the
+        ancestry and content-equivalence paths consume.
+        """
+        h = _build_harness(mock_orch_config)
+        h.git_ops = MagicMock()
+        h.git_ops.config.branch_prefix = 'task/'
+        h.git_ops.config.main_branch = 'main'
+
+        h.git_ops.resolve_branch_sha = AsyncMock(return_value='f' * 40)
+        h.git_ops.is_ancestor = AsyncMock(return_value=False)
+        h.git_ops.branch_content_in_main = AsyncMock(return_value=False)
+        h.git_ops.find_merge_marker = AsyncMock(return_value=None)
+        h.git_ops.find_task_citation_commit = AsyncMock(return_value=None)
+
+        h.scheduler.get_task = AsyncMock(return_value={'id': '42', 'metadata': {}})
+        h._branch_is_degenerate = AsyncMock(return_value=False)
+        h._mark_in_progress_done = AsyncMock()
+        h._escalation_queue = None
+
+        result = await h._already_landed_dispatch_gate('42')
+
+        assert result is False
+        cast(AsyncMock, h.git_ops.find_merge_marker).assert_not_called()
+        cast(AsyncMock, h.git_ops.find_task_citation_commit).assert_not_called()
         cast(AsyncMock, h._mark_in_progress_done).assert_not_awaited()
 
 

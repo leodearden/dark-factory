@@ -7081,6 +7081,21 @@ Output JSON matching the schema. Every task must appear in the output.
         squash/rebase/manual landing.  Installed as
         ``self.scheduler._already_landed_gate``.
 
+        **Cheap pre-filter** (task 2313 review): ``resolve_branch_sha`` is
+        resolved ONCE up front — a single ``git rev-parse --verify`` — so
+        the common per-tick case (a branch that doesn't exist yet, or
+        doesn't exist any more) skips ``is_ancestor`` and
+        ``branch_content_in_main`` entirely instead of spawning subprocesses
+        that would only fail through to False.  When the branch is absent,
+        only the merge-marker search runs, since that's the one check that's
+        meaningful without a live ref; ``find_merge_marker``'s own internal
+        gate already returns None whenever the branch ref still exists, so
+        calling it in the branch-exists case would always be a wasted
+        no-op.  The task-citation lookup is likewise deferred into the two
+        branches that actually consume it (ancestry and content-equivalence)
+        rather than hoisted, so the common not-landed path never pays for
+        it.
+
         Ancestry-path guards mirror ``_reconcile_one_stranded``'s own guard
         sequence so this gate can never flip a false positive: an open L1
         escalation is a deliberate human handoff (never second-guessed); a
@@ -7100,10 +7115,16 @@ Output JSON matching the schema. Every task must appear in the output.
         ancestors of main (squashed/rebased/manually-applied) by comparing
         the branch's actual changed files against main
         (:meth:`~orchestrator.git_ops.GitOps.branch_content_in_main`).  It
-        anchors on the citation commit when one is present on main (the
-        same citation resolved for the ancestry path above — hoisted so
-        both paths share one lookup), falling back to main HEAD when a
-        content-equivalent landing carries no task-citing commit.
+        anchors on the citation commit when one is present on main, falling
+        back to main HEAD when a content-equivalent landing carries no
+        task-citing commit.  **Accepted risk**: this path can false-positive
+        on a branch whose completed-so-far files coincidentally match
+        main's independent content while the rest of the task's scope is
+        still unfinished — the primitive only sees the branch's own diff
+        footprint, not the task's intended full scope.  This is a
+        deliberate tradeoff to catch genuine squash/rebase/manual landings
+        (see :meth:`~orchestrator.git_ops.GitOps.branch_content_in_main`'s
+        docstring for the accepted-risk rationale).
         """
         if (
             self._escalation_queue is not None
@@ -7114,13 +7135,16 @@ Output JSON matching the schema. Every task must appear in the output.
         branch = f'{self.git_ops.config.branch_prefix}{task_id}'
         task = await self.scheduler.get_task(task_id)
         metadata = (task.get('metadata') or {}) if task else {}
-        citation = await self.git_ops.find_task_citation_commit(
-            task_id, pattern_template=self.git_ops.config.commit_citation_pattern,
-        )
+        branch_exists = await self.git_ops.resolve_branch_sha(branch) is not None
 
-        if await self.git_ops.is_ancestor(branch, self.git_ops.config.main_branch):
+        if branch_exists and await self.git_ops.is_ancestor(
+            branch, self.git_ops.config.main_branch,
+        ):
             if await self._branch_is_degenerate(branch, metadata):
                 return False
+            citation = await self.git_ops.find_task_citation_commit(
+                task_id, pattern_template=self.git_ops.config.commit_citation_pattern,
+            )
             if citation is None:
                 return False
             await self._mark_in_progress_done(
@@ -7130,21 +7154,28 @@ Output JSON matching the schema. Every task must appear in the output.
             )
             return True
 
-        marker = await self.git_ops.find_merge_marker(branch)
-        if marker:
-            branch_base_sha = metadata.get('branch_base_sha')
-            if _is_valid_sha_40(branch_base_sha) and await self.git_ops.is_ancestor(
-                marker, branch_base_sha,
-            ):
-                return False
-            await self._mark_in_progress_done(
-                task_id, marker,
-                'reconcile: pre-dispatch check found merge marker on main',
-                'dispatch-gate-marker-found',
+        if not branch_exists:
+            marker = await self.git_ops.find_merge_marker(
+                branch, gate_on_existing_ref=False,
             )
-            return True
+            if marker:
+                branch_base_sha = metadata.get('branch_base_sha')
+                if _is_valid_sha_40(
+                    branch_base_sha,
+                ) and await self.git_ops.is_ancestor(marker, branch_base_sha):
+                    return False
+                await self._mark_in_progress_done(
+                    task_id, marker,
+                    'reconcile: pre-dispatch check found merge marker on main',
+                    'dispatch-gate-marker-found',
+                )
+                return True
+            return False
 
         if await self.git_ops.branch_content_in_main(branch):
+            citation = await self.git_ops.find_task_citation_commit(
+                task_id, pattern_template=self.git_ops.config.commit_citation_pattern,
+            )
             anchor = citation or await self.git_ops.get_main_sha()
             if anchor:
                 await self._mark_in_progress_done(

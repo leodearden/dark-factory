@@ -5086,6 +5086,21 @@ class GitOps:
         Fail-safe by construction: only an rc==0 ``git diff --quiet`` counts
         as "content already landed" — any other git error also falls through
         to False, so this primitive never claims a landing on doubt.
+
+        **Accepted risk — coincidental match on incomplete work**: this
+        primitive only compares the files *branch* has touched so far
+        against its own merge-base, not the task's full intended scope.  A
+        branch that is genuinely mid-task (e.g. it has only gotten around to
+        one of several files it will eventually touch) can still return True
+        here if that one file happens to already match main's independent
+        content — main receiving the same change for unrelated reasons, or
+        the branch itself having reverted the file back to match main.  This
+        is a deliberate tradeoff so this primitive can catch real
+        squash/rebase/manually-applied landings that are NOT ancestors of
+        main; callers that need stronger evidence before treating a landing
+        as authoritative should additionally require a task-citing commit on
+        main (see ``Harness._already_landed_dispatch_gate``, which anchors on
+        such a citation when one is present).
         """
         rc, merge_base, _ = await _run(
             ['git', 'merge-base', self.config.main_branch, branch],
