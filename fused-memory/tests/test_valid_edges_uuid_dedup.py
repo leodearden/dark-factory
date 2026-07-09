@@ -68,3 +68,58 @@ class TestGetValidEdgesForNodeUuidDedup:
         result = await backend.get_valid_edges_for_node('u', group_id='test')
         assert result[0]['fact'] == ''
         assert result[0]['name'] == ''
+
+
+# ---------------------------------------------------------------------------
+# step-3: GraphitiBackend.get_all_valid_edges
+# ---------------------------------------------------------------------------
+
+
+class TestGetAllValidEdgesUuidDedup:
+    """GraphitiBackend.get_all_valid_edges(*, group_id) dedups by (n.uuid, e.uuid)."""
+
+    @pytest.mark.asyncio
+    async def test_cypher_has_no_with_distinct(self, mock_config, make_backend, make_graph_mock):
+        """Emitted Cypher no longer relies on WITH DISTINCT (B7); read path unchanged."""
+        backend = make_backend(mock_config)
+        graph = make_graph_mock(ro_rows=[])
+        backend._driver._get_graph = MagicMock(return_value=graph)
+        await backend.get_all_valid_edges(group_id='test')
+        cypher = extract_cypher(graph.ro_query.call_args)
+        assert 'WITH DISTINCT' not in cypher
+        assert 'RELATES_TO' in cypher
+        assert 'invalid_at IS NULL' in cypher
+        graph.ro_query.assert_awaited_once()
+        graph.query.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_double_attribution_preserved(self, mock_config, make_backend, make_graph_mock):
+        """A directed edge appears under BOTH endpoints: distinct n.uuid, same e.uuid → both kept."""
+        backend = make_backend(mock_config)
+        graph = make_graph_mock(ro_rows=[['A', 'e1', 'f', 'n'], ['B', 'e1', 'f', 'n']])
+        backend._driver._get_graph = MagicMock(return_value=graph)
+        result = await backend.get_all_valid_edges(group_id='test')
+        assert set(result.keys()) == {'A', 'B'}
+        assert result['A'] == [{'uuid': 'e1', 'fact': 'f', 'name': 'n'}]
+        assert result['B'] == [{'uuid': 'e1', 'fact': 'f', 'name': 'n'}]
+
+    @pytest.mark.asyncio
+    async def test_self_loop_collapsed_per_entity(self, mock_config, make_backend, make_graph_mock):
+        """Two identical (n.uuid, e.uuid) rows (self-loop double-match) collapse to one entry."""
+        backend = make_backend(mock_config)
+        graph = make_graph_mock(ro_rows=[['A', 'e1', 'f', 'n'], ['A', 'e1', 'f', 'n']])
+        backend._driver._get_graph = MagicMock(return_value=graph)
+        result = await backend.get_all_valid_edges(group_id='test')
+        assert result['A'] == [{'uuid': 'e1', 'fact': 'f', 'name': 'n'}]
+
+    @pytest.mark.asyncio
+    async def test_distinct_edges_same_entity_preserved(self, mock_config, make_backend, make_graph_mock):
+        """Two distinct edges under the same entity are both returned (no over-collapse)."""
+        backend = make_backend(mock_config)
+        graph = make_graph_mock(ro_rows=[['A', 'e1', 'f1', 'n1'], ['A', 'e2', 'f2', 'n2']])
+        backend._driver._get_graph = MagicMock(return_value=graph)
+        result = await backend.get_all_valid_edges(group_id='test')
+        assert result['A'] == [
+            {'uuid': 'e1', 'fact': 'f1', 'name': 'n1'},
+            {'uuid': 'e2', 'fact': 'f2', 'name': 'n2'},
+        ]
