@@ -802,3 +802,75 @@ class TestMapAdvanceFailurePopConflictAdvancedSha:
 
         assert outcome.status == 'done_wip_recovery'
         assert outcome.merge_sha == 'fallback-sha'
+
+
+@pytest.mark.asyncio
+class TestMapAdvanceFailureConflictMarkers:
+    """_map_advance_failure must map the 'conflict_markers' advance_main
+    result code (esc-2128-8 Layer-2 pre-merge gate, task 2282) to a
+    blocked, human-actionable MergeOutcome with a specific reason — not
+    the generic 'advance_main failed (conflict_markers)' catch-all text.
+    """
+
+    def _make_git_ops(self) -> MagicMock:
+        git_ops = MagicMock()
+        git_ops.push_main = AsyncMock(return_value='pushed')
+        return git_ops
+
+    async def test_conflict_markers_maps_to_blocked_with_specific_reason(self) -> None:
+        from orchestrator.merge_gates import _map_advance_failure
+
+        git_ops = self._make_git_ops()
+
+        outcome = await _map_advance_failure(
+            git_ops, 'conflict_markers',
+            task_id='task-map-adv-markers',
+            merge_commit_fallback='fallback-sha',
+            halt=MagicMock(),
+            unhalt=MagicMock(),
+            cas_retries={},
+        )
+
+        assert outcome.status == 'blocked'
+        assert outcome.reason is not None and 'conflict marker' in outcome.reason.lower(), (
+            f'Expected a specific conflict-marker reason, got {outcome.reason!r}'
+        )
+        assert outcome.reason != 'advance_main failed (conflict_markers) for task task-map-adv-markers', (
+            'Must not fall through to the generic catch-all reason text'
+        )
+
+    async def test_conflict_markers_pops_cas_retries(self) -> None:
+        from orchestrator.merge_gates import _map_advance_failure
+
+        git_ops = self._make_git_ops()
+        cas_retries = {'task-map-adv-markers-2': 2}
+
+        await _map_advance_failure(
+            git_ops, 'conflict_markers',
+            task_id='task-map-adv-markers-2',
+            merge_commit_fallback='fallback-sha',
+            halt=MagicMock(),
+            unhalt=MagicMock(),
+            cas_retries=cas_retries,
+        )
+
+        assert 'task-map-adv-markers-2' not in cas_retries
+
+    async def test_conflict_markers_does_not_halt_queue(self) -> None:
+        """Unlike unmerged_state/wip_overlap, conflict_markers is a
+        per-branch content problem, not a queue-wide condition — no halt."""
+        from orchestrator.merge_gates import _map_advance_failure
+
+        git_ops = self._make_git_ops()
+        halt = MagicMock()
+
+        await _map_advance_failure(
+            git_ops, 'conflict_markers',
+            task_id='task-map-adv-markers-3',
+            merge_commit_fallback='fallback-sha',
+            halt=halt,
+            unhalt=MagicMock(),
+            cas_retries={},
+        )
+
+        halt.assert_not_called()

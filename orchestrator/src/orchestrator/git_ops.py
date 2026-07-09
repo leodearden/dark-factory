@@ -58,7 +58,7 @@ AdvanceResult = Literal[
     'advanced', 'cas_failed', 'not_descendant', 'contaminated',
     'stash_failed', 'wip_overlap', 'pop_conflict',
     'unmerged_state', 'pop_conflict_no_advance',
-    'rebased_pending_reverify',
+    'rebased_pending_reverify', 'conflict_markers',
 ]
 
 
@@ -400,6 +400,63 @@ async def _assert_no_task_dir(sha: str, cwd: Path, context: str) -> None:
         )
 
 
+async def _assert_no_conflict_markers(sha: str, cwd: Path, context: str) -> None:
+    """Raise RuntimeError if the given commit SHA's tree has tracked files
+    carrying unresolved git conflict markers at column 0 (esc-2128-8).
+
+    Layer-2 defense-in-depth backstop: the primary guard lives in
+    :meth:`GitOps.commit` (unmerged-index detection, BEFORE the tree is
+    even staged); this is the last checkpoint before a marker-carrying
+    tree could reach main via :meth:`GitOps.advance_main`.
+
+    Matches ONLY the unambiguous opening/closing brackets — ``^<<<<<<< ``
+    and ``^>>>>>>> `` (exactly 7 chars + a trailing space, git's exact
+    marker format) — anchored at column 0.  Deliberately does NOT match a
+    bare ``^=======`` line: that would false-positive on reStructuredText /
+    Markdown heading underlines, which are common and legitimate.  Marker-
+    like text that isn't anchored at column 0 (e.g. inside a string
+    literal) is not matched either.  The trailing space is intentionally
+    required: it is git's canonical marker format (``<<<<<<< <label>`` /
+    ``>>>>>>> <label>``), so a label-less bare ``<<<<<<<``/``>>>>>>>`` with
+    no following text will not match — real git conflicts always emit the
+    trailing ref label, so this does not narrow real-world coverage.
+
+    Fail-open (no raise) when git reports no match (``git grep`` exits 1)
+    OR on a git error — mirrors :func:`_assert_no_task_dir`'s fail-open
+    semantics: a broken git invocation must not itself become a false
+    block.  Unlike the clean no-match case, a git-error fail-open is logged
+    at WARNING (with stderr) so operators can tell a genuinely clean tree
+    apart from one this gate failed to evaluate.
+    """
+    rc, out, err = await _run(
+        ['git', 'grep', '-lE', r'^(<{7}|>{7}) ', sha, '--', '.'],
+        cwd=cwd,
+    )
+    if rc == 0 and out.strip():
+        # `git grep <tree> -- <pathspec>` prefixes each hit with
+        # `<resolved-sha>:` — strip it down to the bare path.
+        files = [line.partition(':')[2] for line in out.strip().splitlines()]
+        raise RuntimeError(
+            f'CONFLICT MARKER GATE FAILED ({context}): commit {sha[:8]} '
+            f'contains {len(files)} file(s) with unresolved conflict '
+            f'marker(s): {", ".join(files[:5])}. Refusing to advance main. '
+            f'Resolve the conflict marker(s) (or abort the operation that '
+            f'left them) and re-run.'
+        )
+    elif rc not in (0, 1):
+        # A broken git invocation (rc >= 2) fails open just like a clean
+        # no-match (rc == 1) — but silently doing so here would let a
+        # genuinely-conflicted tree through undetected while looking
+        # identical to "confirmed clean". Log it so operators can tell the
+        # difference.
+        logger.warning(
+            'CONFLICT MARKER GATE (%s): git grep errored (rc=%d) scanning '
+            'commit %s — gate could NOT be evaluated; treating as '
+            'unevaluated (fail-open), NOT confirmed-clean: %s',
+            context, rc, sha[:8], err.strip()[:300],
+        )
+
+
 @dataclass
 class MergeResult:
     success: bool
@@ -683,6 +740,38 @@ class WarmLanePoolHardDown(WarmLaneRequeue):
     ``warm_lane_pool_hard_down`` block-reason annotation.  Run
     reify/scripts/ensure-warm-base.sh to rebuild the base.
     """
+
+
+class WorktreeConflictError(RuntimeError):
+    """Raised by :meth:`GitOps.commit` when the worktree has unresolved
+    (unmerged-index) conflicts at commit time (esc-2128-8).
+
+    All harness WIP-save auto-commits ('chore: save WIP before …') funnel
+    through :meth:`GitOps.commit`.  Without this guard, a prior unresolved
+    stash-pop (or any other operation that leaves ``UU``/``AA``/``DD``
+    index entries) would be silently snapshotted VERBATIM — including any
+    ``<<<<<<<``/``=======``/``>>>>>>>`` conflict markers left in the tree —
+    by the unconditional ``git add -A`` + ``git commit``.
+
+    Subclasses ``RuntimeError`` so existing ``RuntimeError``→blocked+L1
+    routing (e.g. the requeue reuse path in ``create_worktree``) handles it
+    for free without any change on that side; callers that need to
+    distinguish this specific condition (e.g. the inter-iteration rebase
+    path in ``workflow.run()``) can catch it explicitly.
+
+    ``conflicted_paths`` carries the sorted list of paths reported by
+    :meth:`GitOps._detect_unmerged_paths` at raise time.
+    """
+
+    def __init__(self, worktree: Path, conflicted_paths: list[str]):
+        self.worktree = worktree
+        self.conflicted_paths = conflicted_paths
+        super().__init__(
+            f'Refusing to commit in {worktree}: {len(conflicted_paths)} '
+            f'unresolved conflict(s) in the index: '
+            f'{", ".join(conflicted_paths[:10])}. Resolve the conflict(s) '
+            f'(or abort the operation that caused them) before committing.'
+        )
 
 
 async def _run(cmd: list[str], cwd: Path | None = None) -> tuple[int, str, str]:
@@ -4463,7 +4552,19 @@ class GitOps:
         The :!.task pathspec SHOULD prevent .task/ from being staged, but
         agents can (and have) staged .task/ files via direct git commands
         before this method runs.  The post-staging check catches that case.
+
+        Pre-staging conflict guard (esc-2128-8): if *worktree* has any
+        unresolved (unmerged-index) paths — e.g. a stash-pop that conflicted
+        just before this call — raise :class:`WorktreeConflictError` instead
+        of staging/committing.  This is checked BEFORE `git add -A` so a
+        conflicted tree (which may contain literal conflict markers) is
+        never snapshotted.  All WIP-save call sites funnel through this
+        method, so this single guard covers every one of them.
         """
+        conflicted = await self._detect_unmerged_paths(worktree)
+        if conflicted:
+            raise WorktreeConflictError(worktree, conflicted)
+
         # Stage all — :!.task excludes .task/ from staging
         await _run(['git', 'add', '-A', '--', '.', ':!.task', ':!.claude'], cwd=worktree)
 
@@ -6487,6 +6588,10 @@ class GitOps:
           of main after *max_attempts* (permanent; stop retrying).
         * ``'contaminated'`` — ``.task/`` contamination gate failed
           (permanent; stop retrying).
+        * ``'conflict_markers'`` — the merge tree contains tracked file(s)
+          with unresolved (column-0) conflict markers (permanent; stop
+          retrying).  esc-2128-8 Layer-2 backstop — see
+          :func:`_assert_no_conflict_markers`.
         * ``'stash_failed'`` — ``git stash push`` failed before the advance
           (permanent; halt merge to prevent code loss).
         * ``'pop_conflict_no_advance'`` — CAS ``update-ref`` failed AND the
@@ -6555,6 +6660,16 @@ class GitOps:
             except RuntimeError as e:
                 logger.error(str(e))
                 return AdvanceOutcome('contaminated')
+
+            # ── conflict-marker gate (FINAL DEFENSE, esc-2128-8 Layer-2) ──
+            try:
+                await _assert_no_conflict_markers(
+                    merge_sha, self.project_root,
+                    f'advance_main(attempt={attempt + 1})',
+                )
+            except RuntimeError as e:
+                logger.error(str(e))
+                return AdvanceOutcome('conflict_markers')
 
             rc, _, _ = await _run(
                 ['git', 'merge-base', '--is-ancestor',

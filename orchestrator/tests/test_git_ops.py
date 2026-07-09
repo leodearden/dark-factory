@@ -17,8 +17,10 @@ from orchestrator.git_ops import (
     ScrubOutcome,
     ScrubResult,
     TrainStackResult,
+    WorktreeConflictError,
     WorktreeInfo,
     WorktreeMissing,
+    _assert_no_conflict_markers,
     _merge_subject,
     _run,
     canonical_queued_branch_name,
@@ -714,6 +716,44 @@ class TestWorktreeLifecycle:
         worktree_info = await git_ops.create_worktree('feature-3')
         sha = await git_ops.commit(worktree_info.path, 'Nothing')
         assert sha is None
+
+    async def test_commit_refuses_unresolved_conflict(self, git_ops: GitOps):
+        """commit() must not snapshot a worktree with unresolved (UU) conflicts.
+
+        Guards the esc-2128-8 incident: a WIP-save commit blindly ran
+        `git add -A` + committed conflict markers left behind by an
+        unresolved stash-pop.  It must instead raise WorktreeConflictError
+        BEFORE staging and leave HEAD untouched — no 'chore: save WIP'
+        commit of the markers.
+        """
+        worktree_info = await git_ops.create_worktree('conflict-guard')
+        wt = worktree_info.path
+        _, sha_before, _ = await _run(['git', 'rev-parse', 'HEAD'], cwd=wt)
+        sha_before = sha_before.strip()
+
+        conflicted_path = 'foo.py'
+        await _inject_uu_state(wt, conflicted_path)
+        # Marker tokens built via runtime concat — see step-5/6 design note —
+        # so this test file itself carries no literal column-0 markers.
+        open_marker = '<' * 7
+        mid_marker = '=' * 7
+        close_marker = '>' * 7
+        (wt / conflicted_path).write_text(
+            f'{open_marker} HEAD\nours\n{mid_marker}\ntheirs\n{close_marker} branch\n',
+        )
+
+        with pytest.raises(WorktreeConflictError) as excinfo:
+            await git_ops.commit(
+                wt, 'chore: save WIP before inter-iteration rebase',
+            )
+
+        assert conflicted_path in str(excinfo.value)
+
+        _, sha_after, _ = await _run(['git', 'rev-parse', 'HEAD'], cwd=wt)
+        assert sha_after.strip() == sha_before, (
+            'commit() must not create a commit when the worktree has '
+            'unresolved conflicts'
+        )
 
     async def test_diff_from_main(self, git_ops: GitOps):
         worktree_info = await git_ops.create_worktree('feature-4')
@@ -2836,6 +2876,69 @@ class TestWorkingTreeSync:
 
 
 @pytest.mark.asyncio
+class TestAdvanceMainConflictMarkerGate:
+    """advance_main must refuse a merge commit whose tree carries unresolved
+    conflict markers (esc-2128-8 Layer-2 pre-merge backstop) — the last
+    checkpoint before a marker-carrying tree reaches main via update-ref.
+    """
+
+    async def test_advance_main_rejects_tree_with_conflict_markers(
+        self, git_ops: GitOps,
+    ):
+        """A merge commit whose tree contains a column-0 marker file is
+        refused with result == 'conflict_markers' and main does not move."""
+        wt = await git_ops.create_worktree('marker-gate-advance')
+        open_marker = '<' * 7
+        mid_marker = '=' * 7
+        close_marker = '>' * 7
+        (wt.path / 'marked.py').write_text(
+            f'{open_marker} HEAD\nours = 1\n{mid_marker}\ntheirs = 2\n{close_marker} branch\n',
+        )
+        await git_ops.commit(wt.path, 'Add file with conflict markers')
+        merge_result = await git_ops.merge_to_main(wt.path, 'marker-gate-advance')
+        assert merge_result.success
+        assert merge_result.merge_commit is not None
+        assert merge_result.merge_worktree is not None
+
+        _, main_before, _ = await _run(
+            ['git', 'rev-parse', 'main'], cwd=git_ops.project_root,
+        )
+
+        result = await git_ops.advance_main(merge_result.merge_commit)
+        await git_ops.cleanup_merge_worktree(merge_result.merge_worktree)
+
+        assert result.result == 'conflict_markers', (
+            f"Expected result='conflict_markers' for a marker-carrying tree, got {result!r}"
+        )
+
+        _, main_after, _ = await _run(
+            ['git', 'rev-parse', 'main'], cwd=git_ops.project_root,
+        )
+        assert main_before.strip() == main_after.strip(), (
+            'main must NOT advance when the merge tree carries conflict markers'
+        )
+
+    async def test_advance_main_still_advances_clean_merge(
+        self, git_ops: GitOps,
+    ):
+        """Companion case: a clean merge commit (no markers) still advances normally."""
+        wt = await git_ops.create_worktree('marker-gate-clean-advance')
+        (wt.path / 'clean.py').write_text('x = 1\n')
+        await git_ops.commit(wt.path, 'Add clean file')
+        merge_result = await git_ops.merge_to_main(wt.path, 'marker-gate-clean-advance')
+        assert merge_result.success
+        assert merge_result.merge_commit is not None
+
+        result = await git_ops.advance_main(merge_result.merge_commit)
+        if merge_result.merge_worktree:
+            await git_ops.cleanup_merge_worktree(merge_result.merge_worktree)
+
+        assert result.result == 'advanced', (
+            f'Expected a clean merge to still advance, got {result!r}'
+        )
+
+
+@pytest.mark.asyncio
 class TestUnmergedDetection:
     """Tests for the _detect_unmerged_paths helper."""
 
@@ -3391,6 +3494,88 @@ class TestScrubTaskDirFromTree:
         assert 'chore: remove .task/ contamination' in commit_msg, (
             f'Expected commit message to contain scrub marker, got: {commit_msg!r}'
         )
+
+
+@pytest.mark.asyncio
+class TestAssertNoConflictMarkers:
+    """Unit tests for the _assert_no_conflict_markers Layer-2 pre-merge gate
+    helper (esc-2128-8 defense-in-depth backstop for advance_main).
+
+    Marker tokens are built via runtime concatenation ('<' * 7, etc.) rather
+    than literal repeated characters, so this test file's own committed
+    source never carries a literal column-0 marker sequence that could trip
+    the very gate under test when this branch is merged.
+    """
+
+    async def test_raises_on_column_zero_conflict_markers(self, git_repo: Path):
+        """A tracked file whose content carries real (column-0) conflict
+        markers must be rejected, naming the offending file."""
+        open_marker = '<' * 7
+        mid_marker = '=' * 7
+        close_marker = '>' * 7
+        conflicted_path = 'marked.py'
+        (git_repo / conflicted_path).write_text(
+            f'{open_marker} HEAD\nours = 1\n{mid_marker}\ntheirs = 2\n{close_marker} branch\n',
+        )
+        await _run(['git', 'add', '-A'], cwd=git_repo)
+        await _run(['git', 'commit', '-m', 'introduce marker file'], cwd=git_repo)
+        _, sha, _ = await _run(['git', 'rev-parse', 'HEAD'], cwd=git_repo)
+        sha = sha.strip()
+
+        with pytest.raises(RuntimeError) as excinfo:
+            await _assert_no_conflict_markers(sha, git_repo, 'test')
+
+        msg = str(excinfo.value)
+        assert conflicted_path in msg
+        # `git grep <tree> -- <pathspec>` prefixes each hit with
+        # `<resolved-sha>:` — the helper strips it via
+        # `line.partition(':')[2]`. A bare substring check would still pass
+        # even if that stripping regressed (e.g. `git grep`'s resolved sha
+        # followed by ':marked.py' is also a substring match on
+        # 'marked.py'), so assert the sha-prefix is actually gone too.
+        assert f':{conflicted_path}' not in msg, (
+            f'expected the resolved-sha prefix to be stripped from the '
+            f'reported path, but found a ":{conflicted_path}" suffix — the '
+            f'sha-prefix stripping regressed: {msg!r}'
+        )
+
+    async def test_does_not_raise_on_clean_commit(self, git_repo: Path):
+        (git_repo / 'clean.py').write_text('x = 1\n')
+        await _run(['git', 'add', '-A'], cwd=git_repo)
+        await _run(['git', 'commit', '-m', 'clean file'], cwd=git_repo)
+        _, sha, _ = await _run(['git', 'rev-parse', 'HEAD'], cwd=git_repo)
+        sha = sha.strip()
+
+        await _assert_no_conflict_markers(sha, git_repo, 'test')  # must not raise
+
+    async def test_does_not_raise_on_bare_equals_separator(self, git_repo: Path):
+        """A bare column-0 '=======' line (e.g. a reStructuredText/Markdown
+        heading underline) must NOT be treated as a conflict marker — only
+        the unambiguous opening/closing brackets are unambiguous enough to
+        gate on."""
+        mid_marker = '=' * 7
+        (git_repo / 'heading.rst').write_text(f'Title\n{mid_marker}\n\nBody text.\n')
+        await _run(['git', 'add', '-A'], cwd=git_repo)
+        await _run(['git', 'commit', '-m', 'rst heading'], cwd=git_repo)
+        _, sha, _ = await _run(['git', 'rev-parse', 'HEAD'], cwd=git_repo)
+        sha = sha.strip()
+
+        await _assert_no_conflict_markers(sha, git_repo, 'test')  # must not raise
+
+    async def test_does_not_raise_on_indented_marker_like_text(self, git_repo: Path):
+        """Marker-like text that is NOT anchored at column 0 (e.g. a string
+        literal inside a fixture/doc file) must not false-positive."""
+        open_marker = '<' * 7
+        close_marker = '>' * 7
+        (git_repo / 'doc.py').write_text(
+            f'    example = "{open_marker} HEAD"\n    other = "{close_marker} branch"\n',
+        )
+        await _run(['git', 'add', '-A'], cwd=git_repo)
+        await _run(['git', 'commit', '-m', 'indented marker-like text'], cwd=git_repo)
+        _, sha, _ = await _run(['git', 'rev-parse', 'HEAD'], cwd=git_repo)
+        sha = sha.strip()
+
+        await _assert_no_conflict_markers(sha, git_repo, 'test')  # must not raise
 
 
 @pytest.mark.asyncio
@@ -4422,6 +4607,41 @@ class TestWorktreeReuseIdentityGuard:
 @pytest.mark.asyncio
 class TestOrphanWorktreeHelpers:
     """Fix B git_ops helpers: quarantine_worktree, worktree_has_unsaved_work."""
+
+    async def test_quarantine_preserves_conflicted_tree_when_commit_refuses(
+        self, git_ops: GitOps,
+    ):
+        """quarantine_worktree's WIP-commit is best-effort: it wraps
+        self.commit() in `except Exception` and continues (esc-2128-8 commit()
+        guard now raises WorktreeConflictError instead of snapshotting a
+        conflicted tree). Relocation must still happen and the unresolved
+        conflict state — including the literal markers on disk — must
+        survive the move, rather than being silently dropped or discarded.
+        """
+        info = await git_ops.create_worktree('q-conflict-task')
+        wt = info.path
+        conflicted_path = 'foo.py'
+        await _inject_uu_state(wt, conflicted_path)
+        open_marker = '<' * 7
+        mid_marker = '=' * 7
+        close_marker = '>' * 7
+        marker_content = (
+            f'{open_marker} HEAD\nours\n{mid_marker}\ntheirs\n{close_marker} branch\n'
+        )
+        (wt / conflicted_path).write_text(marker_content)
+
+        dest = await git_ops.quarantine_worktree(wt, 'q-conflict-task', 'unit-test')
+
+        assert dest is not None
+        assert dest.parent == git_ops.quarantine_base
+        assert not wt.exists()  # still relocated despite the refused commit
+        # The conflicted file (with its unresolved markers) is preserved
+        # verbatim on disk — never committed, but never lost either.
+        assert (dest / conflicted_path).read_text() == marker_content
+        # Still genuinely mid-conflict at the new location — quarantine
+        # must not have silently resolved or committed it.
+        unmerged = await git_ops._detect_unmerged_paths(dest)
+        assert conflicted_path in unmerged
 
     async def test_quarantine_moves_and_preserves_committed_work(self, git_ops: GitOps):
         info = await git_ops.create_worktree('q-task')
