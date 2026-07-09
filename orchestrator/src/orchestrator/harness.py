@@ -7082,8 +7082,14 @@ Output JSON matching the schema. Every task must appear in the output.
         main" signal; and a missing citation rejects the zero-commit-branch
         shape where no commit on main actually cites this task.
 
-        The merge-marker path and the content-equivalence fallback are
-        added in later steps.
+        The branch-deleted merge-marker path (also mirroring
+        ``_reconcile_one_stranded``) catches the case where the branch ref
+        itself is gone but a commit citing this task landed on main: a
+        marker that is an ancestor of ``branch_base_sha`` predates this
+        incarnation (branch deleted + re-created under the same task id)
+        and vetoes the flip.
+
+        The content-equivalence fallback is added in a later step.
         """
         if (
             self._escalation_queue is not None
@@ -7109,6 +7115,21 @@ Output JSON matching the schema. Every task must appear in the output.
                 'dispatch-gate-already-on-main',
             )
             return True
+
+        marker = await self.git_ops.find_merge_marker(branch)
+        if marker:
+            branch_base_sha = metadata.get('branch_base_sha')
+            if _is_valid_sha_40(branch_base_sha) and await self.git_ops.is_ancestor(
+                marker, branch_base_sha,
+            ):
+                return False
+            await self._mark_in_progress_done(
+                task_id, marker,
+                'reconcile: pre-dispatch check found merge marker on main',
+                'dispatch-gate-marker-found',
+            )
+            return True
+
         return False
 
     async def _stop_escalation_server(self) -> None:
