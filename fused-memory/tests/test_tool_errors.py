@@ -14,12 +14,10 @@ from __future__ import annotations
 import asyncio
 import inspect
 import logging
-from pathlib import Path
 from unittest.mock import AsyncMock
 
 import pytest
 
-import fused_memory.server.tools as tools_module
 from fused_memory.server.tool_errors import mcp_tool_errors
 from fused_memory.server.tools import create_mcp_server
 
@@ -260,17 +258,31 @@ def test_all_registered_tools_carry_mcp_tool_errors_marker():
         )
 
 
-def test_tools_module_has_no_hand_copied_cancellation_guards():
-    """Source-scan drift guard: tools.py must contain zero hand-copied
-    cancellation-guard tails. Once every handler is decorated with
-    @mcp_tool_errors(), the guard clause lives centrally in tool_errors.py —
-    any reappearance in tools.py means a handler was hand-written instead of
-    decorated.
+def test_registered_tool_handlers_have_no_hand_copied_cancellation_guards():
+    """Source-scan drift guard, scoped to registered tool handlers only.
+
+    Once a handler is decorated with @mcp_tool_errors(), the cancellation
+    guard clause lives centrally in tool_errors.py — any reappearance in a
+    handler's own source means it was hand-written instead of decorated.
+
+    Scoped to each tool.fn's source (inspect.getsource follows the
+    functools.wraps __wrapped__ chain back to the undecorated handler) rather
+    than a whole-module text scan, so a legitimate non-tool helper elsewhere
+    in tools.py that genuinely needs this guard — or the needle showing up in
+    an unrelated comment/docstring — can't fail this test. The behavioral
+    marker test above (test_all_registered_tools_carry_mcp_tool_errors_marker)
+    already enforces the primary invariant; this adds the narrower "and it
+    wasn't hand-rolled alongside the decorator" drift check.
     """
-    source = Path(tools_module.__file__).read_text()
+    mock_service = AsyncMock()
+    server = create_mcp_server(mock_service)
     needle = 'except (asyncio.CancelledError, KeyboardInterrupt, SystemExit):'
-    count = source.count(needle)
-    assert count == 0, (
-        f'found {count} hand-copied cancellation-guard tail(s) in '
-        f'{tools_module.__file__}; use @mcp_tool_errors() instead'
-    )
+
+    tools = server._tool_manager.list_tools()
+    assert tools, 'expected at least one registered tool'
+    for tool in tools:
+        handler_source = inspect.getsource(tool.fn)
+        assert needle not in handler_source, (
+            f'{tool.name} has a hand-copied cancellation-guard tail; '
+            f'use @mcp_tool_errors() instead'
+        )
