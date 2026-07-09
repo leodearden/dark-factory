@@ -703,8 +703,23 @@ async def _default_ssh_heartbeat_run(
     transport-failure handling (non-zero rc / unparseable stdout ->
     RunnerUnavailable) already covers the dead-channel outcome.  Swallowed so
     it never raises out of the writer nor alters the returned
-    ``(rc, stdout, stderr)``.  The writer task is cancelled once
-    ``communicate()`` completes.
+    ``(rc, stdout, stderr)``.  The writer task is cancelled once stdout/stderr
+    have been fully read and the child has exited.
+
+    Deliberately does NOT use ``proc.communicate()`` (task 2309 boundary gate,
+    SS9 Row 6): ``communicate()`` unconditionally calls its internal
+    ``_feed_stdin(input)`` helper whenever ``self.stdin is not None`` — true
+    here since this coroutine opens with ``stdin=PIPE`` — and ``_feed_stdin``
+    closes ``proc.stdin`` right after (a no-op) write/drain, even when
+    ``input`` is ``None``.  That closes the connection-death channel within
+    milliseconds of spawn, racing the heartbeat writer above so real
+    heartbeats never reach the child — confirmed via a real child that reports
+    back exactly what it read from stdin (a plain ``readline()``-based check
+    is fooled: EOF unblocks a blocking read the same as a real newline would,
+    so it can't tell "closed" from "heartbeat delivered").  Reading the
+    streams directly (mirroring ``communicate()``'s own
+    ``gather(...); await self.wait()`` shape, minus the stdin feed/close)
+    keeps ``proc.stdin`` open for the full duration instead.
     """
     proc = await asyncio.create_subprocess_exec(
         *argv,
@@ -726,11 +741,15 @@ async def _default_ssh_heartbeat_run(
 
     heartbeat_task = asyncio.ensure_future(_heartbeat())
     try:
-        stdout_b, stderr_b = await proc.communicate()
+        assert proc.stdout is not None and proc.stderr is not None  # stdout/stderr=PIPE above
+        stdout_b, stderr_b = await asyncio.gather(proc.stdout.read(), proc.stderr.read())
+        await proc.wait()
     finally:
         heartbeat_task.cancel()
         with contextlib.suppress(asyncio.CancelledError):
             await heartbeat_task
+        if proc.stdin is not None and not proc.stdin.is_closing():
+            proc.stdin.close()
 
     return (
         proc.returncode or 0,

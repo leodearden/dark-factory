@@ -24,6 +24,7 @@ ad-hoc process-tree parsing.
 
 from __future__ import annotations
 
+import asyncio
 import contextlib
 import fcntl
 import os
@@ -51,6 +52,8 @@ from orchestrator.verify_runner import (
     MergeVerifySpec,
     UnscopedTypecheckSpec,
     VerifyCommand,
+    _default_ssh_heartbeat_run,
+    is_flock_contention_failure,
     result_from_json,
     spec_to_json,
 )
@@ -166,6 +169,29 @@ def subprocess_env(extra: dict[str, str] | None = None) -> dict[str, str]:
     if extra:
         env.update(extra)
     return env
+
+
+def apply_dispatcher_env(monkeypatch) -> None:
+    """Patch THIS process's os.environ for a direct (in-process) real-dispatcher call.
+
+    :func:`~orchestrator.verify_runner._default_ssh_heartbeat_run` takes no
+    ``env=`` override -- it always spawns its child via
+    ``asyncio.create_subprocess_exec`` with the ambient ``os.environ``.  When
+    a test calls it directly (rather than through a wrapper subprocess with
+    its own explicit env dict, as :func:`spawn_verify_merge` uses), the
+    ambient environment must get the same treatment as :func:`subprocess_env`:
+    PYTHONPATH pointed at this worktree's ``src`` and ``ORCH_PROJECT_ROOT``
+    popped (the ``_isolate_orch_config`` autouse fixture sets it to the
+    *pytest* tmp_path, which would otherwise beat the ``--config`` YAML's
+    project_root -- see subprocess_env's docstring).  Uses the monkeypatch
+    fixture so the mutation reverts at test teardown regardless of outcome.
+    """
+    worktree_src = str(Path(__file__).parent.parent / 'src')
+    existing_pp = os.environ.get('PYTHONPATH', '')
+    monkeypatch.setenv(
+        'PYTHONPATH', f'{worktree_src}:{existing_pp}' if existing_pp else worktree_src
+    )
+    monkeypatch.delenv('ORCH_PROJECT_ROOT', raising=False)
 
 
 def spawn_verify_merge(
@@ -438,3 +464,99 @@ def test_watchdog_timeout_env_override_fires_fast_without_heartbeat(tmp_path):
     assert proc.returncode != 0, (
         f'expected non-zero exit (watchdog self-kill), got {proc.returncode}'
     )
+
+
+# ---------------------------------------------------------------------------
+# Task 2309 step-3/4 -- SS9 Row 6: normal warm path (also the harness smoke
+# test).  Real dispatcher (live heartbeat), run twice on the same
+# worktree_base.  Exercises SS8.1's happy-path invariant (heartbeat must not
+# alter VerifyResult) + PRD outcome #1 (retained target/ across merges).
+# ---------------------------------------------------------------------------
+
+
+def test_normal_warm_path_reuses_fixed_worktree_twice_no_escalation(tmp_path, monkeypatch):
+    """SS9 Row 6: two consecutive warm verify-merge runs, real live-heartbeat dispatcher.
+
+    A knob-on config + a --request-id'd verify-merge is driven by the REAL
+    dispatcher (verify_runner._default_ssh_heartbeat_run, called directly --
+    in-process asyncio, not a wrapper subprocess -- so its concurrent
+    heartbeat-writer task sends real heartbeats down the child's real stdin
+    pipe every 0.2s; see PRD SS8.1) run TWICE against the SAME worktree_base.
+
+    Asserts:
+
+    * both runs use the FIXED <worktree_base>/_merge-verify path -- no
+      ephemeral _merge-<uuid> dir is ever created (PRD SS8 eta);
+    * target/warm.marker (written by the first run's build) survives the
+      second run's reset_persistent_merge_worktree -- reap_build_artifact_dirs
+      retention (PRD SS10 invariant 1: source bit-identical to fresh checkout,
+      build-cache dirs retained for warmth);
+    * both VerifyResults are passed=True, category=='', contention is None --
+      structurally unchanged by the live heartbeat;
+    * is_flock_contention_failure(result) is False for both -- the REAL beta
+      discriminant predicate that gates _run_post_merge_verify's escalation
+      branch (task 2307 beta) never fires on this happy path, so nothing
+      downstream would file a born-at-L2 escalation.  (A CLI-only harness
+      has no merge_queue in the loop to observe an EscalationQueue directly
+      -- Row 5 (step-13/14) drives that consumer explicitly; this is the
+      producer-side proof that the happy path never emits the discriminant
+      the consumer keys on.)
+    * the watchdog never fires -- both runs exit 0 via normal completion,
+      not the watchdog's non-zero self-kill exit.
+    """
+    repo, head_sha = _setup_verify_repo(tmp_path)
+    worktree_base = worktree_base_for(repo)
+    cfg_file = tmp_path / 'config.yaml'
+    write_verify_config(cfg_file, repo, persistent_merge_worktree=True)
+
+    apply_dispatcher_env(monkeypatch)
+
+    def run_once(request_id: str):
+        argv = verify_merge_argv(
+            sha=head_sha, spec=fast_spec(), cfg_file=cfg_file, request_id=request_id,
+        )
+        rc, out, err = asyncio.run(
+            _default_ssh_heartbeat_run(argv, heartbeat_interval=0.2)
+        )
+        assert rc == 0, (
+            f'verify-merge (request_id={request_id!r}) exited {rc} (watchdog '
+            f'fired?) stderr={err[:2000]!r}'
+        )
+        return result_from_json(out)
+
+    result_1 = run_once('row6-run-1')
+    result_2 = run_once('row6-run-2')
+
+    persistent_wt = worktree_base / '_merge-verify'
+    assert persistent_wt.is_dir(), f'fixed warm worktree missing: {persistent_wt}'
+
+    leaked_ephemeral = sorted(
+        p.name for p in worktree_base.iterdir()
+        if p.name.startswith('_merge-') and p.name != '_merge-verify'
+    )
+    assert leaked_ephemeral == [], (
+        f'ephemeral _merge-<uuid> dir(s) leaked (warm path should never '
+        f'create one): {leaked_ephemeral}'
+    )
+
+    target_dir = persistent_wt / 'target'
+    marker = target_dir / 'warm.marker'
+    assert marker.exists(), (
+        f'target/warm.marker missing after both runs -- reap_build_artifact_dirs '
+        f'retention did not survive reset_persistent_merge_worktree: {marker}'
+    )
+    assert any(target_dir.iterdir()), f'target/ retained but empty: {target_dir}'
+
+    for n, result in ((1, result_1), (2, result_2)):
+        assert result.passed is True, f'run {n}: expected passed=True, got {result!r}'
+        assert result.category == '', (
+            f'run {n}: expected no category on a happy-path result, got '
+            f'{result.category!r}'
+        )
+        assert result.contention is None, (
+            f'run {n}: expected no contention payload, got {result.contention!r}'
+        )
+        assert is_flock_contention_failure(result) is False, (
+            f'run {n}: real beta discriminant fired on a happy-path result -- '
+            f'_run_post_merge_verify would wrongly escalate: {result!r}'
+        )
