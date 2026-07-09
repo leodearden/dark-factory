@@ -1,8 +1,8 @@
 """Multi-project path-scope guard.
 
-Generalises the dark-factory-only guard from task 1088 (now a re-export
-shim at :mod:`fused_memory.middleware.dark_factory_path_guard`) to a
-per-project prefix registry built from configured ``known_project_roots``.
+Generalises the original task-1088 dark-factory-only guard (its back-compat
+re-export shim module was retired in task 2208 / PRD D2) to a per-project
+prefix registry built from configured ``known_project_roots``.
 
 A candidate is rejected when its title / description / details / files
 mention a path prefix owned by a project other than the one being filed

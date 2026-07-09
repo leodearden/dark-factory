@@ -1,10 +1,12 @@
 """Tests for the multi-project path-scope guard.
 
-Covers behaviour beyond what the back-compat shim
-``test_dark_factory_path_guard.py`` exercises: per-project prefix
-registries, suggested_project derivation, multi-project mismatches,
+Covers behaviour beyond the dark_factory-only default registry: per-project
+prefix registries, suggested_project derivation, multi-project mismatches,
 empty-registry short-circuit, and the prompt-only ``check_text_for_scope``
-branch.
+branch. (The back-compat shim's own test module was retired alongside the
+shim in task 2208 / PRD D2 — see
+``test_project_prefix_registry.py::TestDefaultRegistry`` for the folded-in
+dark_factory constants coverage.)
 """
 
 from __future__ import annotations

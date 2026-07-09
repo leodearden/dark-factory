@@ -245,9 +245,9 @@ class TestRobustness:
 # ---------------------------------------------------------------------------
 # default() — built-in, filesystem-independent dark_factory registry.
 #
-# Folds in the retired dark_factory_path_guard shim's hard-coded constants
-# (task 2208 / PRD D2) so the guard always classifies dark-factory paths
-# even when no known_project_roots are configured.
+# Folds in the retired back-compat shim's hard-coded constants (task 2208 /
+# PRD D2) so the guard always classifies dark-factory paths even when no
+# known_project_roots are configured.
 # ---------------------------------------------------------------------------
 
 

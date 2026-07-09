@@ -521,9 +521,10 @@ async def run_server():
 
     # Multi-project path-scope guard: built from the configured project +
     # DASHBOARD_KNOWN_PROJECT_ROOTS env var so the same registry covers
-    # every project the dashboard already knows about.  Empty registry
-    # (no extra roots) leaves the TaskInterceptor in back-compat mode
-    # where the dark-factory-only guard runs.
+    # every project the dashboard already knows about.  No extra roots
+    # configured falls back to the built-in single-project dark_factory
+    # registry (ProjectPrefixRegistry.default(), task 2208) — the guard
+    # always runs, just against a smaller registry.
     _primary_root = (
         config.taskmaster.project_root if config.taskmaster else ''
     ) or ''
@@ -548,12 +549,12 @@ async def run_server():
             len(_known_projects_map),
         )
     else:
-        prefix_registry = None
+        prefix_registry = ProjectPrefixRegistry.default()
         scope_violation_escalator = None
         _multi_project_mode = False
         logger.info(
-            '  Path-scope guard: dark-factory-only back-compat mode '
-            '(set DASHBOARD_KNOWN_PROJECT_ROOTS to enable multi-project)',
+            '  Path-scope guard: single-project mode (dark_factory default registry; '
+            'set DASHBOARD_KNOWN_PROJECT_ROOTS to enable multi-project)',
         )
 
     # Curator UsageGate — independent instance reading the same shared
