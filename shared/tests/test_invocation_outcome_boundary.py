@@ -29,6 +29,7 @@ import asyncio
 import contextlib
 import json
 import os
+import random
 from datetime import UTC, datetime
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -280,3 +281,49 @@ class TestB1IllegalTransition:
         # the sibling AVAILABLE account is still leasable, and the DD-5 _open
         # invariant holds.
         await _assert_sibling_still_usable(gate, sibling.name)
+
+
+# ---------------------------------------------------------------------------
+# B2 -- the DD-5 _open invariant over seeded random legal-transition walks
+# (producer), plus the consumer-facing wait_for_open()/before_invoke()
+# observable tracking it (consumer).
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestB2OpenInvariantProperty:
+    """_open.is_set() <=> any account in {AVAILABLE, PROBING} holds after
+    every legal _transition edge over a long seeded random walk, and the
+    consumer-facing wait_for_open()/before_invoke() observable agrees."""
+
+    async def test_random_walk_two_accounts_preserves_invariant_and_consumer_tracks_it(self):
+        gate = make_boundary_gate(['a', 'b'])
+        rng = random.Random(20260709)
+        await _random_legal_walk(gate, rng, steps=300)
+        await _drain_bg(gate)
+
+    async def test_random_walk_three_accounts_preserves_invariant_and_consumer_tracks_it(self):
+        gate = make_boundary_gate(['a', 'b', 'c'])
+        rng = random.Random(975318642)
+        await _random_legal_walk(gate, rng, steps=300)
+        await _drain_bg(gate)
+
+    async def test_consumer_before_invoke_returns_promptly_when_open(self):
+        gate = make_boundary_gate(['a', 'b'])
+        assert gate._open.is_set()
+
+        lease = await asyncio.wait_for(gate.before_invoke(), timeout=1.0)
+
+        assert lease is not None
+        assert lease.name in {'a', 'b'}
+
+    async def test_consumer_wait_for_open_false_when_all_capped(self):
+        gate = make_boundary_gate(['a', 'b'])
+        for acct in gate._accounts:
+            gate._transition(acct, AccountPhase.CAPPED)
+        assert _open_invariant_holds(gate)
+
+        assert gate._open.is_set() is False
+        assert await gate.wait_for_open(timeout=0) is False
+
+        await _drain_bg(gate)
