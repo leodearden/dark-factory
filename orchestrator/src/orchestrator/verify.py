@@ -14,7 +14,7 @@ import uuid
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Literal, TypedDict
+from typing import Literal, TypedDict, cast
 
 from shared.proc_group import terminate_process_group
 
@@ -32,6 +32,16 @@ from orchestrator.verify_categories import (
     FailureCategory,
     should_archive,
 )
+
+# Re-typed list[str] (verify_categories.CATEGORY_PRIORITY is list[FailureCategory]):
+# every existing call site of this legacy re-export — here in verify.py and in the
+# pre-existing test_verify.py / test_verify_env_transient.py regression guards —
+# indexes/searches it with plain strings. FailureCategory is a StrEnum, so members
+# compare/hash/index equal to their str value at runtime; this cast is a
+# static-typing-only adjustment (still the exact same list object — see
+# verify_categories.CATEGORY_PRIORITY for the precisely FailureCategory-typed
+# source of truth).
+_CATEGORY_PRIORITY = cast('list[str]', _CATEGORY_PRIORITY)
 
 logger = logging.getLogger(__name__)
 
@@ -681,12 +691,7 @@ def _worst_category(categories: list[str]) -> str:
     """
     def _rank(cat: str) -> int:
         try:
-            # _CATEGORY_PRIORITY is list[FailureCategory] (re-exported from
-            # verify_categories); a plain str still finds its rank because
-            # StrEnum members compare equal to their str value at runtime
-            # (list.index uses ==), even though the static element type
-            # differs from *cat*'s.
-            return _CATEGORY_PRIORITY.index(cat)  # type: ignore[arg-type]
+            return _CATEGORY_PRIORITY.index(cat)
         except ValueError:
             return len(_CATEGORY_PRIORITY)  # unknown → lowest priority
 

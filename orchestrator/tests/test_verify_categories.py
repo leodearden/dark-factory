@@ -177,8 +177,6 @@ class TestValidateExhaustive:
 
         from orchestrator.verify_categories import (
             CATEGORY_POLICY,
-            CategoryPolicy,
-            FailureCategory,
         )
 
         class _Synth(StrEnum):
@@ -247,22 +245,22 @@ class TestDerivedRegistriesByteIdentity:
 
     def test_archive_deny_list_matches_legacy_set(self):
         from orchestrator.verify_categories import ARCHIVE_DENY_LIST
-        assert ARCHIVE_DENY_LIST == frozenset({
+        assert frozenset({
             'compile_error', 'test_failure', 'infra_timeout', 'passed', '',
             'pytest_internalerror', 'env_transient',
-        })
+        }) == ARCHIVE_DENY_LIST
 
     def test_preexisting_break_skip_categories_matches_legacy_set(self):
         from orchestrator.verify_categories import PREEXISTING_BREAK_SKIP_CATEGORIES
-        assert PREEXISTING_BREAK_SKIP_CATEGORIES == frozenset({
+        assert frozenset({
             'infra_timeout', 'flock_error', 'pytest_internalerror', 'env_transient',
-        })
+        }) == PREEXISTING_BREAK_SKIP_CATEGORIES
 
     def test_infra_transient_categories_matches_legacy_sweep_set(self):
         from orchestrator.verify_categories import INFRA_TRANSIENT_CATEGORIES
-        assert INFRA_TRANSIENT_CATEGORIES == frozenset({
+        assert frozenset({
             'pytest_internalerror', 'env_transient',
-        })
+        }) == INFRA_TRANSIENT_CATEGORIES
 
 
 # ---------------------------------------------------------------------------
