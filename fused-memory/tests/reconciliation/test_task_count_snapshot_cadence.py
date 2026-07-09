@@ -16,6 +16,7 @@ Covers (grown step-by-step per plan.json):
 Task 2325 follow-up (exempt never-snapshotted projects + make the Stage-2
 task_count_snapshot write structural):
 - TestBuildTaskCountSnapshotContent     (task 2325 step-3/4)
+- TestWriteTaskCountSnapshot            (task 2325 step-5/6)
 """
 
 from __future__ import annotations
@@ -37,6 +38,7 @@ from fused_memory.models.scope import ProjectId, ProjectRoot, ProjectScope
 from fused_memory.reconciliation.stages.task_knowledge_sync import (
     TaskKnowledgeSync,
     _verify_task_count_snapshot_written,
+    _write_task_count_snapshot,
 )
 from fused_memory.reconciliation.task_count_snapshot_cadence import (
     ESCALATION_CATEGORY,
@@ -451,6 +453,80 @@ class TestVerifyTaskCountSnapshotWritten:
         )
 
         assert result is True
+
+
+# ---------------------------------------------------------------------------
+# _write_task_count_snapshot (stages/task_knowledge_sync.py) -- task 2325 step-5/6
+# ---------------------------------------------------------------------------
+
+
+class TestWriteTaskCountSnapshot:
+    """_write_task_count_snapshot(memory_service, taskmaster, project_root,
+    project_id, run_id, run_window_start) -> bool | None.
+
+    Deterministic (non-LLM) write of the task_count_snapshot Mem0 record.
+    Best-effort: never raises, mirrors the module's other I/O helpers'
+    never-raises contract. Returns True (wrote) or None (skipped/failed),
+    never False -- a failed best-effort write must stay "inconclusive" so
+    callers fall back to the freshness read instead of recording a
+    confirmed miss.
+    """
+
+    def _taskmaster(self):
+        taskmaster = AsyncMock()
+        taskmaster.get_tasks.return_value = {
+            'tasks': [
+                {'id': 1, 'status': 'pending'},
+                {'id': 2, 'status': 'in-progress'},
+                {'id': 3, 'status': 'done'},
+                {'id': 4, 'status': 'cancelled'},
+            ],
+        }
+        return taskmaster
+
+    @pytest.mark.asyncio
+    async def test_success_writes_once_and_returns_true(self):
+        memory_service = AsyncMock()
+        memory_service.add_memory.return_value = {'memory_ids': ['m1']}
+        taskmaster = self._taskmaster()
+
+        result = await _write_task_count_snapshot(
+            memory_service, taskmaster, '/tmp/test', 'reify', 'run-1', None,
+        )
+
+        assert result is True
+        memory_service.add_memory.assert_awaited_once()
+        _, kwargs = memory_service.add_memory.await_args
+        assert kwargs['category'] == 'observations_and_summaries'
+        assert kwargs['metadata']['kind'] == 'task_count_snapshot'
+        assert kwargs['project_id'] == 'reify'
+        assert kwargs['causation_id'] == 'run-1'
+        assert isinstance(kwargs['content'], str)
+        assert kwargs['content']
+        assert 'reify' in kwargs['content']
+
+    @pytest.mark.asyncio
+    async def test_add_memory_failure_returns_none_not_raise(self):
+        memory_service = AsyncMock()
+        memory_service.add_memory.side_effect = RuntimeError('mem0 down')
+        taskmaster = self._taskmaster()
+
+        result = await _write_task_count_snapshot(
+            memory_service, taskmaster, '/tmp/test', 'reify', 'run-1', None,
+        )
+
+        assert result is None
+
+    @pytest.mark.asyncio
+    async def test_no_taskmaster_returns_none_without_writing(self):
+        memory_service = AsyncMock()
+
+        result = await _write_task_count_snapshot(
+            memory_service, None, '/tmp/test', 'reify', 'run-1', None,
+        )
+
+        assert result is None
+        memory_service.add_memory.assert_not_awaited()
 
 
 # ---------------------------------------------------------------------------
