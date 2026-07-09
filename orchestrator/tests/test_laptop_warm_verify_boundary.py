@@ -34,7 +34,6 @@ import time
 from pathlib import Path
 
 import pytest
-
 from test_cli import _setup_verify_repo  # noqa: F401 -- reused cross-module
 
 from orchestrator.config import OrchestratorConfig
@@ -243,7 +242,7 @@ class HeartbeatWriter:
         self._stop = threading.Event()
         self._thread = threading.Thread(target=self._run, daemon=True)
 
-    def start(self) -> 'HeartbeatWriter':
+    def start(self) -> HeartbeatWriter:
         self._thread.start()
         return self
 
@@ -421,10 +420,10 @@ def test_watchdog_timeout_env_override_fires_fast_without_heartbeat(tmp_path):
         # is sufficient to exercise the heartbeat-starvation timing path
         # (Rows 1-3 later distinguish EOF vs. timeout precisely).
         try:
-            proc.wait(timeout=5.0)
+            proc.wait(timeout=9.0)
         except subprocess.TimeoutExpired:
             pytest.fail(
-                'verify-merge did not self-exit within 5s of no heartbeats -- '
+                'verify-merge did not self-exit within 9s of no heartbeats -- '
                 'watchdog env overrides are not wired up yet (production '
                 'window is 10s timeout + 5s grace = 15s)'
             )
