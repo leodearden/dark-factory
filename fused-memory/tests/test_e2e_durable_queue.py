@@ -10,6 +10,7 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 import pytest_asyncio
+from _fm_helpers import poll_until
 
 from fused_memory.models.enums import SourceStore
 from fused_memory.services.memory_service import MemoryService
@@ -59,11 +60,14 @@ class TestIntegrationFlow:
         )
         assert SourceStore.graphiti in result.stores_written
 
-        # Wait for worker to process
-        await asyncio.sleep(1.0)
+        # Poll until the worker has processed the item, instead of a fixed
+        # sleep that can race under full-suite CPU load.
+        async def _completed():
+            s = await svc.durable_queue.get_stats()
+            return s if s['counts'].get('completed', 0) >= 1 else None
 
+        stats = await poll_until(_completed, message='timed out waiting for the item to be processed')
         svc.graphiti.add_episode.assert_called_once()
-        stats = await svc.durable_queue.get_stats()
         assert stats['counts'].get('completed', 0) == 1
 
     @pytest.mark.asyncio
@@ -101,9 +105,12 @@ class TestIntegrationFlow:
         )
         assert result.episode_id is not None
 
-        # Wait for worker to process
-        await asyncio.sleep(1.5)
-
+        # Poll until the worker has invoked graphiti.add_episode, instead of
+        # a fixed sleep that can race under full-suite CPU load.
+        await poll_until(
+            lambda: svc.graphiti.add_episode.called,
+            message='timed out waiting for graphiti.add_episode to be called',
+        )
         svc.graphiti.add_episode.assert_called_once()
         call_kwargs = svc.graphiti.add_episode.call_args[1]
         assert call_kwargs.get('uuid') == result.episode_id
@@ -126,14 +133,18 @@ class TestIntegrationFlow:
         )
         assert result.status == 'queued'
 
-        # Wait for worker + callback + mem0 classify_and_add processing
-        await asyncio.sleep(2.5)
+        # Poll until at least the episode item has completed (worker +
+        # callback + mem0 classify_and_add may enqueue further items),
+        # instead of a fixed sleep that can race under full-suite CPU load.
+        async def _completed():
+            s = await svc.durable_queue.get_stats()
+            return s if s['counts'].get('completed', 0) >= 1 else None
 
+        stats = await poll_until(_completed, message='timed out waiting for the episode item to complete')
         svc.graphiti.add_episode.assert_called_once()
         # The callback enqueues mem0_classify_and_add items which the queue processes.
         # The fact "Always format code with black" should classify as preferences_and_norms
         # (mem0 primary) and trigger a mem0.add call.
-        stats = await svc.durable_queue.get_stats()
         # At minimum the episode item completed; mem0 items may also be completed
         assert stats['counts'].get('completed', 0) >= 1
 
@@ -151,8 +162,12 @@ class TestIntegrationFlow:
         assert SourceStore.graphiti in result.stores_written
         assert SourceStore.mem0 in result.stores_written
 
-        # Wait for queue to process both writes
-        await asyncio.sleep(1.5)
+        # Poll until the queue has processed both writes, instead of a fixed
+        # sleep that can race under full-suite CPU load.
+        await poll_until(
+            lambda: svc.graphiti.add_episode.called and svc.mem0.add.called,
+            message='timed out waiting for both graphiti and mem0 writes to process',
+        )
         svc.graphiti.add_episode.assert_called_once()
         svc.mem0.add.assert_called_once()
 
