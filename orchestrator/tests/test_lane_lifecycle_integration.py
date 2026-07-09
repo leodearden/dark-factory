@@ -31,6 +31,7 @@ from __future__ import annotations
 import asyncio
 import json
 import shutil
+import sys
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -48,6 +49,20 @@ from orchestrator.lane_lifecycle import (
 )
 from orchestrator.lane_lifecycle import LaneState as DurableLaneState
 from orchestrator.warm_lane_pool import LaneState, WarmLanePool
+
+# B6 imports `dashboard.data.orchestrator` from inside the test bodies below
+# (deferred to avoid F401 — see module docstring). `orchestrator/tests/
+# conftest.py` puts orchestrator/shared/escalation `src/` dirs on sys.path
+# but deliberately not dashboard's, and the root conftest.py that *does* wire
+# up dashboard/src is never loaded here — verify.py (and pytest's own
+# confcutdir) roots the run at `orchestrator/`, above which pytest does not
+# ascend for conftest discovery. Mirror conftest.py's own sys.path.insert
+# idiom here, scoped to just this module, instead of editing
+# orchestrator/tests/conftest.py (which would trip verify.py's has_conftest
+# full-suite fallback per this task's design decisions).
+_DASHBOARD_SRC = Path(__file__).parent.parent.parent / 'dashboard' / 'src'
+if str(_DASHBOARD_SRC) not in sys.path:
+    sys.path.insert(0, str(_DASHBOARD_SRC))
 
 # ── Module-local fixtures + helpers ─────────────────────────────────────
 
@@ -454,7 +469,9 @@ class TestB6DashboardReaderNewPath:
     """
 
     async def test_reads_relocated_task_meta(self, ig_git_repo: Path):
-        from dashboard.data.orchestrator import read_task_artifacts
+        from dashboard.data.orchestrator import (  # pyright: ignore[reportMissingImports]
+            read_task_artifacts,
+        )
 
         repo = ig_git_repo
         await _add_warm_lane_scripts(repo)
@@ -483,7 +500,9 @@ class TestB6DashboardReaderLegacyPath:
     """
 
     def test_reads_legacy_task_dir(self, tmp_path: Path):
-        from dashboard.data.orchestrator import read_task_artifacts
+        from dashboard.data.orchestrator import (  # pyright: ignore[reportMissingImports]
+            read_task_artifacts,
+        )
 
         base = tmp_path / '.worktrees'
         legacy = base / '_legacy'
