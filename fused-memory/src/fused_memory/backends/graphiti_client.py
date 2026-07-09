@@ -1621,6 +1621,51 @@ class GraphitiBackend:
             for row in (result.result_set or [])
         ]
 
+    async def _scan_duplicate_entity_names(self, group_id: str) -> list[tuple[str, int]]:
+        """Detect exact-name duplicate Entity nodes in *group_id*'s graph — B5 dup-node alarm.
+
+        A safety net for the write-time identity gate (_resolve_or_create_entity,
+        task 2198/α + task 2202/β): that gate should prevent same-name duplicate
+        Entity nodes from ever being created, but this scan is a POSITIVE
+        DETECTION signal, not input rejection — if duplicates slip through
+        anyway (e.g. a gate bug, or data written before the gate existed), a
+        LOUD WARN surfaces them at startup instead of letting them silently
+        accumulate. It never mutates or rejects anything.
+
+        Scoped by an explicit `n.group_id = $group_id` property predicate
+        (2026-07-06 advisory), the same scoping task 2198 added to
+        get_nodes_by_exact_name / find_duplicate_entity_nodes above —
+        task-2115's active cross-graph leak can plant a misrouted foreign
+        node (group_id property of ANOTHER project) physically inside this
+        graph key, and that foreign-group clone is a 2115 artifact routed to
+        2115, not alarmed here — only SAME-group duplicates count.
+
+        Uses ro_query since no writes are performed.
+
+        Args:
+            group_id: Project graph to scan.
+
+        Returns:
+            List of (name, count) tuples for every duplicated name (count > 1).
+            Empty list when the graph has no exact-name duplicates.
+        """
+        graph = self._graph_for(group_id)
+        cypher = (
+            'MATCH (n:Entity) WHERE n.group_id = $group_id '
+            'WITH n.name AS name, count(*) AS cnt '
+            'WHERE cnt > 1 '
+            'RETURN name, cnt'
+        )
+        result = await graph.ro_query(cypher, {'group_id': group_id})
+        duplicates = [(row[0], row[1]) for row in (result.result_set or [])]
+        for name, cnt in duplicates:
+            logger.warning(
+                'startup identity scan: %d duplicate Entity nodes named %r in group %r '
+                '(exact-name identity gate should prevent this — investigate)',
+                cnt, name, group_id,
+            )
+        return duplicates
+
     async def _resolve_or_create_entity(self, name: str, *, group_id: str) -> str | None:
         """Exact-name write-time-identity chokepoint: resolve, or collapse duplicates.
 
