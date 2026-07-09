@@ -2562,6 +2562,92 @@ async def test_add_task_cancelled_row_allows_refile(backend, project_root):
     assert statuses_by_id == {'1': 'cancelled', '2': 'pending'}, statuses_by_id
 
 
+@pytest.mark.asyncio
+async def test_set_task_status_uncancel_collision_raises_duplicate_candidate_key_error(
+    backend, project_root,
+):
+    """Review amendment (fm-task-dedup W8 task A2): un-cancelling a row whose
+    candidate_key collides with an existing non-cancelled row must raise
+    DuplicateCandidateKeyError, not a raw sqlite3.IntegrityError.
+    Un-cancelling moves the row back into the partial UNIQUE index's
+    predicate (``status != 'cancelled'``); if the refiled duplicate (BT-A5)
+    already occupies that (tag, candidate_key), reactivating the original is
+    rejected. The rejected UPDATE must roll back — task 1 stays cancelled.
+    """
+    from fused_memory.backends.task_backend_errors import DuplicateCandidateKeyError
+
+    first = await backend.add_task(
+        project_root=project_root,
+        title='Fix parser',
+        metadata=json.dumps({'files': ['a.py', 'b.py']}),
+    )
+    await backend.set_task_status(first['id'], 'cancelled', project_root=project_root)
+    # BT-A5 refile: succeeds because the partial index excludes cancelled rows.
+    second = await backend.add_task(
+        project_root=project_root,
+        title='Fix parser',
+        metadata=json.dumps({'files': ['a.py', 'b.py']}),
+    )
+    assert second['id'] == '2'
+
+    with pytest.raises(DuplicateCandidateKeyError) as exc_info:
+        await backend.set_task_status(first['id'], 'pending', project_root=project_root)
+
+    exc = exc_info.value
+    assert exc.existing_id == 2, (
+        f'Expected the collision to name survivor id=2; got {exc.existing_id!r}'
+    )
+    assert exc.existing_status == 'pending', exc.existing_status
+
+    # The rejected UPDATE rolled back — task 1 is still cancelled.
+    listing = await backend.get_tasks(project_root=project_root)
+    statuses_by_id = {t['id']: t['status'] for t in listing['tasks']}
+    assert statuses_by_id == {'1': 'cancelled', '2': 'pending'}, statuses_by_id
+
+
+@pytest.mark.asyncio
+async def test_update_task_recompute_collision_raises_duplicate_candidate_key_error(
+    backend, project_root,
+):
+    """Review amendment (fm-task-dedup W8 task A2): update_task recomputes
+    candidate_key whenever title/metadata is touched; if the recomputed key
+    collides with another non-cancelled row, this must raise
+    DuplicateCandidateKeyError rather than a raw sqlite3.IntegrityError. The
+    rejected UPDATE must roll back — the row's title stays unchanged.
+    """
+    from fused_memory.backends.task_backend_errors import DuplicateCandidateKeyError
+
+    await backend.add_task(
+        project_root=project_root,
+        title='Fix parser',
+        metadata=json.dumps({'files': ['a.py', 'b.py']}),
+    )
+    other = await backend.add_task(
+        project_root=project_root,
+        title='Unrelated task',
+        metadata=json.dumps({'files': ['z.py']}),
+    )
+
+    with pytest.raises(DuplicateCandidateKeyError) as exc_info:
+        await backend.update_task(
+            other['id'],
+            project_root=project_root,
+            title='fix  parser',
+            metadata=json.dumps({'files': ['b.py', 'a.py']}),
+        )
+
+    exc = exc_info.value
+    assert exc.existing_id == 1, (
+        f'Expected the collision to name survivor id=1; got {exc.existing_id!r}'
+    )
+    assert exc.existing_status == 'pending', exc.existing_status
+
+    # The rejected UPDATE rolled back — task 2's title/candidate_key are unchanged.
+    two = await backend.get_task(other['id'], project_root=project_root)
+    assert two['title'] == 'Unrelated task', two['title']
+    assert two['candidate_key'] == compute_candidate_key('Unrelated task', ['z.py'])
+
+
 # ── Concurrency ────────────────────────────────────────────────────
 
 

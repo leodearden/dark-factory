@@ -1103,6 +1103,14 @@ class SqliteTaskBackend:
         plain status change must never wipe a live claimant. Fails safe
         (WARNING, status-only write, no error) when the claimant columns are
         absent from a not-yet-migrated connection.
+
+        Raises :class:`DuplicateCandidateKeyError` (fm-task-dedup W8 task A2
+        review amendment) instead of letting a raw ``sqlite3.IntegrityError``
+        escape on the narrow un-cancel collision case: moving a row's status
+        OFF ``'cancelled'`` makes it visible to the partial UNIQUE index on
+        ``(tag, candidate_key)``, and if another non-cancelled row already
+        holds the same key, this UPDATE is rejected rather than silently
+        reactivating a duplicate.
         """
         await self.ensure_connected()
         tag = tag or DEFAULT_TAG
@@ -1115,7 +1123,7 @@ class SqliteTaskBackend:
             )
         async with self._write_lock(project_root), self._txn(project_root) as conn:
             cursor = await conn.execute(
-                'SELECT status FROM tasks WHERE tag = ? AND id = ?',
+                'SELECT status, candidate_key FROM tasks WHERE tag = ? AND id = ?',
                 (tag, tid),
             )
             row = await cursor.fetchone()
@@ -1125,6 +1133,7 @@ class SqliteTaskBackend:
                     f'No tasks found for ID(s): {task_id}',
                 )
             old_status = row['status']
+            row_candidate_key = row['candidate_key']
 
             set_columns = ['status = ?', 'updated_at = ?']
             set_values: list[Any] = [status, _now()]
@@ -1145,11 +1154,36 @@ class SqliteTaskBackend:
                     )
 
             set_values.extend([tag, tid])
-            await conn.execute(
-                f'UPDATE tasks SET {", ".join(set_columns)} '
-                'WHERE tag = ? AND id = ?',
-                set_values,
-            )
+            try:
+                await conn.execute(
+                    f'UPDATE tasks SET {", ".join(set_columns)} '
+                    'WHERE tag = ? AND id = ?',
+                    set_values,
+                )
+            except sqlite3.IntegrityError as exc:
+                # Only the candidate_key partial UNIQUE index is mapped to a
+                # typed collision (mirrors add_task's collision mapping); any
+                # other integrity violation is unrelated and re-raised
+                # untouched. Reachable via the narrow un-cancel path (see the
+                # docstring above). Nothing in this transaction has been
+                # written yet — this is the first write statement — so this
+                # survivor lookup sees the same state a post-rollback read
+                # would (this row's own candidate_key/status are unaffected,
+                # having never been applied).
+                if row_candidate_key is None or 'candidate_key' not in str(exc):
+                    raise
+                survivor_cursor = await conn.execute(
+                    "SELECT id, status FROM tasks WHERE tag = ? AND candidate_key = ? "
+                    "AND status != 'cancelled' ORDER BY id LIMIT 1",
+                    (tag, row_candidate_key),
+                )
+                survivor = await survivor_cursor.fetchone()
+                raise DuplicateCandidateKeyError(
+                    existing_id=survivor['id'] if survivor is not None else None,
+                    existing_status=survivor['status'] if survivor is not None else None,
+                    tag=tag,
+                    candidate_key=row_candidate_key,
+                ) from exc
         return {
             'message': f'Successfully updated 1 task(s) to "{status}"',
             'tasks': [{
@@ -1513,13 +1547,15 @@ class SqliteTaskBackend:
             # title/files) would silently break the future A2 dedup index.
             # An update touching neither is left alone: the existing value
             # still correctly describes the unchanged row.
+            new_candidate_key: str | None = None
             if title is not None or metadata is not None:
                 final_title = title if title is not None else row['title']
                 final_metadata_raw = new_metadata if metadata is not None else row['metadata']
-                set_columns.append('candidate_key = ?')
-                set_values.append(
-                    compute_candidate_key(final_title, _files_for_key(final_metadata_raw)),
+                new_candidate_key = compute_candidate_key(
+                    final_title, _files_for_key(final_metadata_raw),
                 )
+                set_columns.append('candidate_key = ?')
+                set_values.append(new_candidate_key)
 
             # updated_at always advances, even on a no-op write — matches
             # the original behaviour and avoids surprising "stale" reads.
@@ -1528,11 +1564,37 @@ class SqliteTaskBackend:
 
             set_clause = ', '.join(set_columns)
             set_values.extend([tag, tid])
-            await conn.execute(
-                f'UPDATE tasks SET {set_clause} '
-                f'WHERE tag = ? AND id = ?',
-                set_values,
-            )
+            try:
+                await conn.execute(
+                    f'UPDATE tasks SET {set_clause} '
+                    f'WHERE tag = ? AND id = ?',
+                    set_values,
+                )
+            except sqlite3.IntegrityError as exc:
+                # Only the candidate_key partial UNIQUE index is mapped to a
+                # typed collision (mirrors add_task; fm-task-dedup W8 task A2
+                # review amendment); any other integrity violation is
+                # unrelated and re-raised untouched. Reachable only when this
+                # call recomputed candidate_key above (title/metadata
+                # touched) and the new key collides with another
+                # non-cancelled row of the same tag. Nothing in this
+                # transaction has been written yet — this is the first write
+                # statement — so this survivor lookup sees the same state a
+                # post-rollback read would.
+                if new_candidate_key is None or 'candidate_key' not in str(exc):
+                    raise
+                survivor_cursor = await conn.execute(
+                    "SELECT id, status FROM tasks WHERE tag = ? AND candidate_key = ? "
+                    "AND status != 'cancelled' ORDER BY id LIMIT 1",
+                    (tag, new_candidate_key),
+                )
+                survivor = await survivor_cursor.fetchone()
+                raise DuplicateCandidateKeyError(
+                    existing_id=survivor['id'] if survivor is not None else None,
+                    existing_status=survivor['status'] if survivor is not None else None,
+                    tag=tag,
+                    candidate_key=new_candidate_key,
+                ) from exc
 
             # Dependencies: replace-mode only. Empty list clears all deps.
             if dependencies is not None:
