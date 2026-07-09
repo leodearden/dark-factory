@@ -1770,6 +1770,16 @@ class OrchestratorConfig(BaseSettings):
     # module set is large (or accidentally polluted) so a fan-out can never spawn
     # an unbounded number of full builds into one worktree at once.
     max_concurrent_module_verifies: int = Field(default=4, ge=1)
+    # Dedicated merge-role internal-fanout cap (task 2393, T5). Merge-role
+    # pytests bypass the T2 counting admission slot (`_admission_slot` is a
+    # no-op for role='merge' — the anti-livelock/C-merge-priority guarantee),
+    # so the merge fan-out branch of `run_scoped_verification` needs its OWN
+    # bound, orthogonal to `verify_admission_task_slots`. Lowering the general
+    # `max_concurrent_module_verifies` to tame merge would also over-serialize
+    # task-role fan-outs, whose pytests are already bounded by the admission
+    # slot. Default 4 = the current merge fan-out bound, so default behaviour
+    # is preserved until an operator tunes this independently.
+    merge_verify_max_concurrent_pytests: int = Field(default=4, ge=1)
     # When True, each verify command is spawned inside a transient systemd
     # ``--scope`` (its own cgroup) so a timeout/cancel can kill the ENTIRE
     # subtree by cgroup, regardless of process-group escapes (e.g. an inner GNU
