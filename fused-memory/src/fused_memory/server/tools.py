@@ -961,6 +961,82 @@ def create_mcp_server(
             logger.exception(f'add_memory error: {e}')
             return {'error': str(e), 'error_type': type(e).__name__}
 
+    @mcp.tool()
+    async def add_system_record(
+        content: str,
+        project_id: str,
+        category: str,
+        agent_id: str | None = None,
+        session_id: str | None = None,
+        metadata: dict | None = None,
+        ctx: Context | None = None,
+    ) -> dict[str, Any]:
+        """Add a dedup-exempt system record. Recon-stage-only, server-enforced.
+
+        Writes directly to Mem0 through a dedicated backend method that pins
+        infer=False locally, independent of the general add()/add_memory
+        path — so this write is structurally exempt from Mem0's (any
+        future) dedup behaviour. Always Mem0-only: never routes to
+        Graphiti, regardless of category. Restricted server-side to
+        agent_id values starting with 'recon-stage-'; any other caller is
+        rejected with a DedupExemptNotPermitted error dict (returned, not
+        raised).
+
+        Args:
+            content: The system record content (e.g. a deterministic cycle summary).
+            project_id: Project scope (required)
+            category: One of: entities_and_relations, temporal_facts, decisions_and_rationale,
+                      preferences_and_norms, procedural_knowledge, observations_and_summaries.
+                      Stamped into metadata as a tag only — this tool is always Mem0-only,
+                      so category does not affect store routing.
+            agent_id: Which agent is writing. Must start with 'recon-stage-' or the
+                      write is rejected (optional, auto-derived from MCP context).
+            session_id: Session context (optional, auto-derived from MCP context)
+            metadata: Arbitrary key-value pairs (optional)
+        """
+        agent_id, session_id = _resolve_identity(agent_id, session_id, ctx)
+        project_id, err = _canonicalize_project_id_arg(project_id)
+        if err:
+            return err
+        if err := validate_project_id(project_id):
+            return err
+        if err := _known_project_gate(project_id):
+            return err
+        if err := await _backlog_gate(project_id):
+            return err
+        if category not in _VALID_CATEGORIES:
+            return {
+                'error': (
+                    f'Invalid category {category!r}. '
+                    f'Must be one of {sorted(_VALID_CATEGORIES)}.'
+                ),
+                'error_type': 'ValidationError',
+            }
+        if not (isinstance(agent_id, str) and agent_id.startswith('recon-stage-')):
+            return {
+                'error': 'dedup_exempt_write_not_permitted',
+                'error_type': 'DedupExemptNotPermitted',
+                'agent_id': agent_id,
+            }
+        try:
+            causation_id, source, cleaned_meta = _extract_causation(metadata, agent_id)
+            result = await memory_service.add_system_record(
+                content=content,
+                project_id=project_id,
+                agent_id=agent_id,
+                category=category,
+                session_id=session_id,
+                metadata=cleaned_meta,
+                causation_id=causation_id,
+                _source=source,
+            )
+            return result.model_dump()
+        except (asyncio.CancelledError, KeyboardInterrupt, SystemExit):
+            raise
+        except Exception as e:
+            logger.exception(f'add_system_record error: {e}')
+            return {'error': str(e), 'error_type': type(e).__name__}
+
     # ------------------------------------------------------------------
     # Read tools
     # ------------------------------------------------------------------
