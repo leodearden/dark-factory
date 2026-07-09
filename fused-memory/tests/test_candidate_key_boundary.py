@@ -202,3 +202,78 @@ async def test_bt_a2_planning_mode_reintroduction_guard(real_stack):
     assert non_cancelled == 1, (
         f'expected exactly one non-cancelled (deferred) row (no orphan); got {non_cancelled}'
     )
+
+
+# ── BT-A3: crash injected between INSERT and COMMIT ──────────────────────
+
+
+@pytest.mark.asyncio
+async def test_bt_a3_crash_between_insert_and_commit_leaves_no_orphan(tmp_path):
+    """A crash injected between the tasks INSERT and the txn commit must
+    roll back cleanly (zero orphan rows), and the on-disk partial UNIQUE
+    index must still be intact both immediately after and across a
+    reconnect.
+
+    RED until step-4 adds the ``_after_insert_fault_hook`` seam: without
+    it, add_task never invokes the hook, the INSERT commits, no exception
+    is raised, and the assertions below fail.
+    """
+    project_root = str(tmp_path)
+    cfg = TaskmasterConfig(project_root=project_root)
+    backend = SqliteTaskBackend(cfg)
+    await backend.start()
+    try:
+        before = await count_non_cancelled(backend, project_root)
+        assert before == 0
+
+        def _boom():
+            raise RuntimeError('injected crash between INSERT and COMMIT')
+
+        backend._after_insert_fault_hook = _boom
+        with pytest.raises(RuntimeError, match='injected crash between INSERT and COMMIT'):
+            await backend.add_task(
+                project_root=project_root,
+                title='Fix parser',
+                metadata=json.dumps({'files': ['a.py', 'b.py']}),
+            )
+        backend._after_insert_fault_hook = None
+
+        after_crash = await count_non_cancelled(backend, project_root)
+        assert after_crash == before, (
+            f'expected the failed INSERT to roll back with zero orphan rows; '
+            f'before={before}, after crash={after_crash}'
+        )
+
+        # No phantom row blocks a normal add — the rolled-back insert left no trace.
+        created = await backend.add_task(
+            project_root=project_root,
+            title='Fix parser',
+            metadata=json.dumps({'files': ['a.py', 'b.py']}),
+        )
+        assert created['id'] == '1', created
+
+        # The index invariant is intact — an immediate duplicate still collides.
+        with pytest.raises(DuplicateCandidateKeyError) as exc_info:
+            await backend.add_task(
+                project_root=project_root,
+                title='fix  parser',
+                metadata=json.dumps({'files': ['b.py', 'a.py']}),
+            )
+        assert exc_info.value.existing_id == 1, exc_info.value.existing_id
+    finally:
+        await backend.close()
+
+    # Reconnect: the on-disk partial UNIQUE index survives across a fresh
+    # backend instance on the same tmp_path.
+    reopened = SqliteTaskBackend(cfg)
+    await reopened.start()
+    try:
+        with pytest.raises(DuplicateCandidateKeyError) as exc_info:
+            await reopened.add_task(
+                project_root=project_root,
+                title='Fix parser',
+                metadata=json.dumps({'files': ['a.py', 'b.py']}),
+            )
+        assert exc_info.value.existing_id == 1, exc_info.value.existing_id
+    finally:
+        await reopened.close()
