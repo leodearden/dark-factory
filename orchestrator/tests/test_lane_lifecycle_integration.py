@@ -422,3 +422,63 @@ class TestB5SurvivesCleaning:
 
         assert (meta / 'plan.json').exists()
         assert TaskArtifacts(lane, meta).read_plan()['steps']
+
+
+# ── B6 — dashboard reader (new-then-old) ────────────────────────────────
+
+
+@pytest.mark.asyncio
+class TestB6DashboardReaderNewPath:
+    """B6 (new path): dashboard's read_task_artifacts resolves an acquired
+    lane's relocated .task-meta sidecar (worktree_path.parent / '.task-meta'
+    / worktree_path.name), exercising the same meta_root_for path shape the
+    real writer (GitOps/TaskArtifacts) uses.
+    """
+
+    async def test_reads_relocated_task_meta(self, ig_git_repo: Path):
+        from dashboard.data.orchestrator import read_task_artifacts
+
+        repo = ig_git_repo
+        await _add_warm_lane_scripts(repo)
+        harness = _build_harness(_make_orch_config(repo))
+        _wire_recovery_scheduler(harness)
+
+        base = harness.git_ops.worktree_base
+        lane = await _acquire_lane(harness.git_ops, '42', await _get_head(repo))
+        meta = TaskArtifacts.meta_root_for(base, lane.name)
+        ta = TaskArtifacts(lane, meta)
+        ta.init('42', 'B6 dash', 'd')
+        ta.write_plan(_make_plan(3, 5, '42'))
+        ta.append_iteration_log({'a': 1})
+        ta.append_iteration_log({'b': 2})
+
+        result = read_task_artifacts(lane)
+        assert result['phase'] == 'EXECUTE'
+        assert result['plan_progress'] == {'done': 3, 'total': 5}
+        assert result['iteration_count'] == 2
+        assert result['metadata']['task_id'] == '42'
+
+
+class TestB6DashboardReaderLegacyPath:
+    """B6 (old path, compat): read_task_artifacts still parses a legacy
+    `<worktree>/.task/` layout when no `.task-meta` sibling exists.
+    """
+
+    def test_reads_legacy_task_dir(self, tmp_path: Path):
+        from dashboard.data.orchestrator import read_task_artifacts
+
+        base = tmp_path / '.worktrees'
+        legacy = base / '_legacy'
+        (legacy / '.task').mkdir(parents=True)
+        (legacy / '.task' / 'metadata.json').write_text(json.dumps({'task_id': 'legacy'}))
+        (legacy / '.task' / 'plan.json').write_text(json.dumps({
+            'steps': [
+                {'id': 'step-1', 'status': 'done'},
+                {'id': 'step-2', 'status': 'pending'},
+            ],
+        }))
+
+        result = read_task_artifacts(legacy)
+        assert result['plan_progress']['total'] > 0
+        assert result['metadata'] is not None
+        assert result['metadata']['task_id'] == 'legacy'
