@@ -50,10 +50,11 @@ def _member(
 ) -> dict:
     """Build a scroll-shaped member dict.
 
-    Defaults to the production shape written by
-    ``flag_dedup._write_and_confirm_marker``: both ``kind`` and ``task_id``
-    present. Pass ``kind=None`` / ``task_id=None`` to omit either key and
-    isolate the corresponding orphan dimension.
+    Defaults to the production shape written by the Mem0 mirror write in
+    ``flag_dedup.dedup_flags`` (task 2227; formerly
+    ``_write_and_confirm_marker``): both ``kind`` and ``task_id`` present.
+    Pass ``kind=None`` / ``task_id=None`` to omit either key and isolate
+    the corresponding orphan dimension.
     """
     metadata: dict = {'source': 'stage1_flag_marker'}
     if kind is not None:
