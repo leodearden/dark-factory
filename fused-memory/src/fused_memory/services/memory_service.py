@@ -313,6 +313,52 @@ def _cycle_summary_run_id_backfill(meta: dict, causation_id: str | None) -> str 
     return None
 
 
+def _apply_cycle_summary_metadata_tagging(
+    meta: dict,
+    causation_id: str | None,
+    *,
+    project_id: str,
+) -> None:
+    """Apply server-side cycle_summary metadata tagging to ``meta`` in place.
+
+    Shared by add_memory and add_system_record (task 2222 amendment) so
+    every write path that can carry a cycle_summary payload gets the same
+    authoritative treatment: recon_pool auto-tag from metadata.stage (task
+    2077) — recon_pool is the only key the pool-cap trim and
+    prune_recon_cycle_summaries.py filter on; run_id auto-backfill from the
+    causation id (task 2109) — run_id drives the Path-2 triple-filter
+    verification pre-check; and a WARNING for whatever remains
+    missing/invalid after the backfill (task 2094/2109), so an untagged or
+    unverifiable cycle_summary write is observable instead of silently
+    piling up unbounded or dropping out of the Path-2 pre-check. No-op
+    (and no warning) for any meta['kind'] != 'cycle_summary'.
+    """
+    inferred_recon_pool = _infer_recon_pool(meta)
+    if inferred_recon_pool is not None:
+        meta['recon_pool'] = inferred_recon_pool
+
+    backfilled_run_id = _cycle_summary_run_id_backfill(meta, causation_id)
+    if backfilled_run_id is not None:
+        meta['run_id'] = backfilled_run_id
+
+    missing_keys = _missing_cycle_summary_keys(meta)
+    if missing_keys:
+        logger.warning(
+            'MemoryService: cycle_summary write missing required '
+            'metadata key(s) %s — stage drives recon_pool (pool-cap trim); '
+            'run_id drives the Path-2 triple-filter verification pre-check',
+            missing_keys,
+            extra={
+                'project_id': project_id,
+                'stage': meta.get('stage'),
+                'run_id': meta.get('run_id'),
+                'caller_recon_pool': meta.get('recon_pool'),
+                'causation_id': causation_id,
+                'missing_cycle_summary_keys': missing_keys,
+            },
+        )
+
+
 class MemoryNotFoundError(Exception):
     """Raised when a mem0 memory id is not found."""
 
@@ -1800,67 +1846,12 @@ class MemoryService:
         meta = dict(metadata or {})
         meta['category'] = resolved_category.value
 
-        # Server-side recon_pool auto-tag (task 2077): recon_pool is the only
-        # key the pool-cap trim and ops prune script filter on, and relying on
-        # LLM prompt compliance to set it has empirically failed (untagged
-        # cycle_summary piles regrow unbounded). Derive it authoritatively
-        # from metadata.stage when known; when stage is missing/unknown, leave
-        # any caller-supplied recon_pool untouched (cannot infer, must not
-        # clobber).
-        inferred_recon_pool = _infer_recon_pool(meta)
-        if inferred_recon_pool is not None:
-            meta['recon_pool'] = inferred_recon_pool
-
-        # Server-side cycle_summary run_id auto-backfill (task 2109,
-        # replacing the warn-only guard from task 2094): run_id is
-        # LLM-supplied (see the reconciliation stage1/stage2 prompts) and a
-        # dropped/empty value has been observed to recur every cycle.
-        # Repair it authoritatively from the causation id — mirroring the
-        # _infer_recon_pool precedent above — instead of only warning about
-        # it. Sourced from meta['_causation_id'] (direct in-process callers)
-        # or the causation_id parameter (the production MCP-boundary path,
-        # where server/tools.py::_extract_causation has already popped
-        # '_causation_id' out of metadata into that parameter).
-        # KNOWN LIMITATION: causation_id is never actually None on the MCP
-        # path — _extract_causation synthesizes a fresh UUID when
-        # '_causation_id' was absent, and that's indistinguishable here from
-        # a genuine run id. See _cycle_summary_run_id_backfill's docstring
-        # and TestCycleSummaryRunIdBackfillToolsBoundary for the tracked gap
-        # (fix requires a server/tools.py change outside this task's scope).
-        backfilled_run_id = _cycle_summary_run_id_backfill(meta, causation_id)
-        if backfilled_run_id is not None:
-            meta['run_id'] = backfilled_run_id
-
-        # Server-side cycle_summary metadata guard (task 2094, extending task
-        # 2077), now a FALLBACK for residual unrepairable cases (task 2109):
-        # metadata.stage and metadata.run_id are both LLM-supplied (see the
-        # reconciliation stage1/stage2 prompts). stage is not backfillable
-        # (no authoritative server-side source) and run_id can only be
-        # backfilled when a causation id is available, so this guard warns
-        # on whatever remains missing/invalid after the backfill above —
-        # observable rather than silently relying on the caller. This check
-        # is deliberately decoupled from the recon_pool inference above —
-        # previously it lived in an `elif` gated on `inferred_recon_pool is
-        # None`, so a valid stage short-circuited past any run_id check
-        # entirely and a dropped/empty run_id sailed through with zero
-        # warnings, invisible to the Path-2 triple-filter
-        # count_memories_by_metadata({kind, run_id, stage}) pre-check.
-        missing_keys = _missing_cycle_summary_keys(meta)
-        if missing_keys:
-            logger.warning(
-                'MemoryService.add_memory: cycle_summary write missing required '
-                'metadata key(s) %s — stage drives recon_pool (pool-cap trim); '
-                'run_id drives the Path-2 triple-filter verification pre-check',
-                missing_keys,
-                extra={
-                    'project_id': project_id,
-                    'stage': meta.get('stage'),
-                    'run_id': meta.get('run_id'),
-                    'caller_recon_pool': meta.get('recon_pool'),
-                    'causation_id': causation_id,
-                    'missing_cycle_summary_keys': missing_keys,
-                },
-            )
+        # Server-side cycle_summary metadata tagging (recon_pool auto-tag
+        # task 2077, run_id auto-backfill task 2109, missing-key warning
+        # task 2094/2109) — factored into a shared helper (task 2222
+        # amendment) so add_system_record gets the identical authoritative
+        # treatment. See _apply_cycle_summary_metadata_tagging's docstring.
+        _apply_cycle_summary_metadata_tagging(meta, causation_id, project_id=project_id)
 
         write_graphiti = (
             resolved_category in GRAPHITI_PRIMARY or dual_write
@@ -2014,6 +2005,14 @@ class MemoryService:
         meta = dict(metadata or {})
         meta['category'] = resolved_category.value
 
+        # Same authoritative cycle_summary tagging add_memory applies (task
+        # 2222 amendment): the tool docstring names the cycle-summary Mem0
+        # mirror as the intended caller, and recon_pool/run_id are the keys
+        # the pool-cap trim and Path-2 triple-filter pre-check rely on — a
+        # system-record cycle_summary must not go untagged just because it
+        # bypassed add_memory.
+        _apply_cycle_summary_metadata_tagging(meta, causation_id, project_id=project_id)
+
         mem0_result = await self._journaled_backend_call(
             write_op_id=write_op_id,
             causation_id=causation_id,
@@ -2027,6 +2026,28 @@ class MemoryService:
             for r in (mem0_result or {}).get('results', [])
             if isinstance(r, dict) and 'id' in r
         ]
+
+        # Mem0Backend.add_system_record pins infer=False LOCALLY and
+        # unconditionally (never inherited from the general add() pin — see
+        # its docstring; MUST NEVER pass infer=True), so a successful write
+        # always returns exactly one result with an id. An empty result is
+        # therefore always a silent-drop anomaly (mirrors the add_memory
+        # empty-result check, task 1974) — and silence is exactly what this
+        # guaranteed-persistence system-write path exists to rule out, so it
+        # must not be journaled as an unconditional success.
+        _empty_result = not mem0_ids
+        if _empty_result:
+            logger.warning(
+                'MemoryService.add_system_record: mem0 add_system_record '
+                'returned zero memory_ids (silent empty-result drop on the '
+                'dedup-exempt system-write path)',
+                extra={
+                    'project_id': project_id,
+                    'category': resolved_category.value,
+                    'causation_id': causation_id,
+                    'kind': meta.get('kind'),
+                },
+            )
 
         if self._write_journal:
             await self._write_journal.log_write_op(
@@ -2042,7 +2063,11 @@ class MemoryService:
                     'memory_ids': mem0_ids,
                     'stores': [SourceStore.mem0.value],
                 },
-                success=True,
+                success=not _empty_result,
+                error=(
+                    'empty_result: mem0 add_system_record returned zero memory_ids'
+                    if _empty_result else None
+                ),
             )
 
         await self._emit_event(ReconciliationEvent(

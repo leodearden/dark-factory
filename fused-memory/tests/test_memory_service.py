@@ -451,6 +451,134 @@ class TestAddSystemRecord:
 
         service.durable_queue.enqueue.assert_not_called()
 
+    # -- Amendment (task 2222 review): same cycle_summary tagging as add_memory --
+
+    @pytest.mark.asyncio
+    async def test_recon_pool_inferred_for_cycle_summary(self, service):
+        """A known stage must get the matching recon_pool auto-tagged (task 2077 parity)."""
+        service.mem0.add_system_record = AsyncMock(return_value={'results': [{'id': 'sys-1'}]})
+
+        await service.add_system_record(
+            content='cycle summary',
+            project_id='dark_factory',
+            agent_id='recon-stage-task_knowledge_sync',
+            category='observations_and_summaries',
+            metadata={'kind': 'cycle_summary', 'stage': 'task_knowledge_sync', 'run_id': 'r1'},
+            causation_id='c1',
+        )
+
+        call_kwargs = service.mem0.add_system_record.await_args.kwargs
+        assert call_kwargs['metadata']['recon_pool'] == 'stage2_cycle_summary'
+
+    @pytest.mark.asyncio
+    async def test_run_id_backfilled_from_causation_id(self, service):
+        """A dropped run_id must be backfilled from causation_id (task 2109 parity)."""
+        service.mem0.add_system_record = AsyncMock(return_value={'results': [{'id': 'sys-1'}]})
+
+        await service.add_system_record(
+            content='cycle summary',
+            project_id='dark_factory',
+            agent_id='recon-stage-task_knowledge_sync',
+            category='observations_and_summaries',
+            metadata={'kind': 'cycle_summary', 'stage': 'task_knowledge_sync'},
+            causation_id='c-xyz',
+        )
+
+        call_kwargs = service.mem0.add_system_record.await_args.kwargs
+        assert call_kwargs['metadata']['run_id'] == 'c-xyz'
+
+    @pytest.mark.asyncio
+    async def test_missing_stage_logs_warning(self, service, caplog):
+        """A cycle_summary write with no resolvable stage must still warn (task 2094/2109 parity)."""
+        service.mem0.add_system_record = AsyncMock(return_value={'results': [{'id': 'sys-1'}]})
+
+        with caplog.at_level(logging.WARNING, logger='fused_memory.services.memory_service'):
+            await service.add_system_record(
+                content='cycle summary',
+                project_id='dark_factory',
+                agent_id='recon-stage-task_knowledge_sync',
+                category='observations_and_summaries',
+                metadata={'kind': 'cycle_summary', 'run_id': 'r1'},
+                causation_id='c1',
+            )
+
+        warning_records = [r for r in caplog.records if r.levelno == logging.WARNING]
+        assert len(warning_records) == 1, (
+            f'Expected exactly 1 WARNING for a cycle_summary with missing stage, '
+            f'got {len(warning_records)}: {[r.message for r in warning_records]}'
+        )
+        message = warning_records[0].message.lower()
+        assert 'cycle_summary' in message and 'stage' in message
+
+    # -- Amendment (task 2222 review): empty mem0 result must not journal success=True --
+
+    @pytest.mark.asyncio
+    async def test_empty_result_logs_warning_and_journals_failure(self, service, caplog):
+        """An empty mem0 result is always a silent-drop anomaly under the hard-pinned
+        infer=False (never inherited from the general add() pin), so it must be
+        both logged as a WARNING and journaled as success=False — never a silent,
+        unconditional success on the guaranteed-persistence system-write path."""
+        service.mem0.add_system_record = AsyncMock(return_value={'results': []})
+        mock_journal = MagicMock()
+        mock_journal.log_write_op = AsyncMock()
+        mock_journal.log_backend_op = AsyncMock()
+        service._write_journal = mock_journal
+
+        with caplog.at_level(logging.WARNING, logger='fused_memory.services.memory_service'):
+            result = await service.add_system_record(
+                content='cycle summary',
+                project_id='dark_factory',
+                agent_id='recon-stage-task_knowledge_sync',
+                category='observations_and_summaries',
+                metadata={'kind': 'cycle_summary', 'stage': 'task_knowledge_sync', 'run_id': 'r1'},
+                causation_id='c1',
+            )
+
+        assert result.memory_ids == []
+
+        warning_records = [r for r in caplog.records if r.levelno == logging.WARNING]
+        assert len(warning_records) == 1, (
+            f'Expected exactly 1 WARNING for the silent empty-result drop, '
+            f'got {len(warning_records)}: {[r.message for r in warning_records]}'
+        )
+        message = warning_records[0].message.lower()
+        assert 'mem0' in message and ('empty' in message or 'zero' in message)
+
+        mock_journal.log_write_op.assert_called_once()
+        call_kwargs = mock_journal.log_write_op.call_args[1]
+        assert call_kwargs['success'] is False, (
+            f'Expected success=False when mem0 add_system_record returns zero ids, '
+            f'got success={call_kwargs["success"]}'
+        )
+        assert call_kwargs['error'], 'Expected a non-empty error diagnostic on the journal entry'
+
+    @pytest.mark.asyncio
+    async def test_nonempty_result_journals_success_no_warning(self, service, caplog):
+        """The happy path (non-empty mem0 result) must journal success=True with no warning."""
+        service.mem0.add_system_record = AsyncMock(return_value={'results': [{'id': 'sys-1'}]})
+        mock_journal = MagicMock()
+        mock_journal.log_write_op = AsyncMock()
+        mock_journal.log_backend_op = AsyncMock()
+        service._write_journal = mock_journal
+
+        with caplog.at_level(logging.WARNING, logger='fused_memory.services.memory_service'):
+            await service.add_system_record(
+                content='cycle summary',
+                project_id='dark_factory',
+                agent_id='recon-stage-task_knowledge_sync',
+                category='observations_and_summaries',
+                metadata={'kind': 'cycle_summary', 'stage': 'task_knowledge_sync', 'run_id': 'r1'},
+                causation_id='c1',
+            )
+
+        warning_records = [r for r in caplog.records if r.levelno == logging.WARNING]
+        assert warning_records == []
+
+        mock_journal.log_write_op.assert_called_once()
+        call_kwargs = mock_journal.log_write_op.call_args[1]
+        assert call_kwargs['success'] is True
+        assert call_kwargs['error'] is None
+
 
 class TestAddEpisode:
     @pytest.mark.asyncio
