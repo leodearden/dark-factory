@@ -211,3 +211,56 @@ def test_apply_twice_is_idempotent_noop_second_run(tmp_path):
     assert parsed.get("git", {}).get(KEY) is True, (
         f"Expected git.{KEY} to still read back True; parsed={parsed!r}"
     )
+
+
+# ---------------------------------------------------------------------------
+# step-5: RED -- --check / --dry-run mode
+# ---------------------------------------------------------------------------
+
+@pytest.mark.parametrize("flag", ["--check", "--dry-run"])
+def test_check_mode_prints_intended_diff_without_mutating(tmp_path, flag):
+    """--check (and its --dry-run alias) on an unflipped config prints the
+    intended change (naming persistent_merge_worktree + true, referencing
+    git:), exits 0, and leaves the config byte-identical with no backup."""
+    config_path = tmp_path / "reify-laptop.yaml"
+    before_text = _fixture_laptop_config("unflipped")
+    config_path.write_text(before_text)
+
+    result = _run_script(config_path, flag)
+
+    assert result.returncode == 0, (
+        f"Expected exit 0 for {flag}; got {result.returncode}\n"
+        f"stdout={result.stdout!r} stderr={result.stderr!r}"
+    )
+    assert KEY in result.stdout and "true" in result.stdout, (
+        f"Expected a line naming {KEY} + true in stdout; got: {result.stdout!r}"
+    )
+    assert "git" in result.stdout, (
+        f"Expected the intended diff to reference git:; got: {result.stdout!r}"
+    )
+
+    assert _read_config(config_path) == before_text, (
+        f"{flag} must not mutate the config"
+    )
+    assert _backup_files(config_path) == [], f"{flag} must not create a backup"
+
+
+def test_check_mode_on_already_enabled_reports_noop(tmp_path):
+    """--check on an ALREADY-enabled config reports the same
+    already-enabled/no-op state as apply, not a pending-diff line."""
+    config_path = tmp_path / "reify-laptop.yaml"
+    before_text = _fixture_laptop_config("flipped")
+    config_path.write_text(before_text)
+
+    result = _run_script(config_path, "--check")
+
+    assert result.returncode == 0, (
+        f"Expected exit 0; got {result.returncode}\n"
+        f"stdout={result.stdout!r} stderr={result.stderr!r}"
+    )
+    assert NOOP_MARKER in result.stdout, (
+        f"Expected --check on an already-enabled config to report the "
+        f"no-op state; got: {result.stdout!r}"
+    )
+    assert _read_config(config_path) == before_text, "--check must never mutate the config"
+    assert _backup_files(config_path) == [], "--check must never create a backup"
