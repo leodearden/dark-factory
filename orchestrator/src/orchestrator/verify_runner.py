@@ -2309,7 +2309,7 @@ class HostAllocator:
 
     async def cancel_and_release(
         self,
-        lease: HostLease,
+        lease: HostLease | None,
         *,
         sleep: Any | None = None,
         max_attempts: int = 10,
@@ -2335,17 +2335,57 @@ class HostAllocator:
         max_attempts: maximum number of probe polls before giving up (slot stays
                       PARKED on exhaustion).
 
+        Idempotency: a repeat call on a lease whose slot is already FREE
+        (i.e. a prior cancel_and_release/release already ran) is a no-op
+        that returns True WITHOUT re-issuing the remote cancel RPC. This
+        matters because several call sites in SpeculativeMergeWorker can
+        invoke cancel_and_release on the same lease (shutdown drain,
+        cascade abandon, resolve/release, finalize-inflight); without this
+        guard a second call would re-issue cancel_verify() on a host with
+        nothing left to cancel, and a non-zero rc from that redundant call
+        would PARK an already-healthy, released slot. A PARKED slot is NOT
+        short-circuited — re-invoking on a PARKED slot is a legitimate
+        recovery retry (re-cancel + re-probe). A ``None`` lease is also a
+        no-op returning True (defensive guard for already-cleared callers).
+
+        Known limitation (ABA): the guard keys on current slot STATE
+        (FREE/BUSY/PARKED), not on lease identity — ``HostLease`` is a frozen
+        dataclass with no generation/epoch token. If a lease's slot is
+        released (FREE) and then re-acquired (BUSY) by a *different*
+        in-flight verify before a stale ``cancel_and_release(old_lease)``
+        call arrives, the guard sees BUSY, falls through, and would cancel
+        the NEW occupant's verify instead of no-op'ing. This is pre-existing
+        (not introduced by this guard) and out of scope here: callers must
+        never invoke ``cancel_and_release`` with a lease after that lease's
+        slot may have already been released and re-acquired elsewhere.
+        Closing it fully would require tagging ``HostLease`` and the slot map
+        with a monotonically increasing generation counter and refusing to
+        cancel on a generation mismatch.
+
         Note: wired into production by tasks 1757 & 1762.  Called in
         ``stop()`` (shutdown drain of ``_inflight`` in-flight entries), in
         ``_verifier_loop()`` (head-failure cascade / operator-halt REQUEUED
         abandon path), and in ``_finalize_inflight()`` (finalize-head
         ``finally`` cancel-release path).  It is exercised by
-        :class:`TestHostAllocatorCancelRelease` and
-        :class:`TestHostAllocatorCancelFail` unit tests.
+        :class:`TestHostAllocatorCancelRelease`,
+        :class:`TestHostAllocatorCancelFail`, and
+        :class:`TestHostAllocatorCancelReleaseIdempotent` unit tests.
         """
+        if lease is None:
+            return True
+
         if sleep is None:
             import asyncio as _asyncio
             sleep = _asyncio.sleep
+
+        if self._slots.get(lease.name) == _SLOT_FREE:
+            # Already released — nothing to cancel. Short-circuit before any
+            # RPC so a double-release cannot re-issue cancel_verify() and
+            # PARK a healthy slot. This checks slot STATE only, not lease
+            # identity, so it does not cover the ABA case (slot re-acquired
+            # by a different lease between two calls) — see the docstring's
+            # "Known limitation (ABA)" note.
+            return True
 
         if lease.is_local:
             await self.release(lease)
