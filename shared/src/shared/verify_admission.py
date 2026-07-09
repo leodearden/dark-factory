@@ -91,6 +91,26 @@ def _try_once(slots_dir: Path, n: int) -> int | None:
     return None
 
 
+def _acquire(slots_dir: Path, n: int, wait: bool) -> int | None:
+    """Acquire a slot, honoring *wait*. May raise ``OSError``.
+
+    A missing directory or non-positive *n* fails open (returns ``None``)
+    WITHOUT creating the directory — slot-FILE creation (``O_CREAT``) inside
+    an already-existing directory is the only filesystem side effect this
+    module ever performs. When *wait* is True and no slot is free, polls
+    unboundedly (C-untimed-acquire) at ``_POLL_INTERVAL_SECS`` — the caller
+    acquires before starting the pytest timeout clock, so this wait never
+    counts toward it.
+    """
+    if n < 1 or not slots_dir.is_dir():
+        return None
+    fd = _try_once(slots_dir, n)
+    while fd is None and wait:
+        time.sleep(_POLL_INTERVAL_SECS)
+        fd = _try_once(slots_dir, n)
+    return fd
+
+
 @contextlib.contextmanager
 def acquire_task_slot(
     role: str,
@@ -108,18 +128,36 @@ def acquire_task_slot(
 
     Slot files live at ``slots_dir/slot-<i>`` for ``i`` in ``1..n``, opened
     non-inheritable (C-no-FD-inheritance) and locked with a non-blocking
-    ``flock``. The slot is released in a ``finally`` by closing the fd — the
-    kernel frees the flock automatically, including when the holder dies
-    without cleanup (C-daemonless self-heal; no canary/daemon/atexit
-    involved).
+    ``flock``, shuffled try-order. When ``wait`` is True and no slot is free,
+    polls unboundedly (C-untimed-acquire) rather than timing out.
+
+    Fails open to ``held=False`` (C-fail-open) — never blocks, never raises,
+    never creates ``slots_dir`` — when the directory is missing, ``n < 1``,
+    or acquisition raises an ``OSError``.
+
+    The slot is released in a ``finally`` by closing the fd — the kernel
+    frees the flock automatically, including when the holder dies without
+    cleanup (C-daemonless self-heal; no canary/daemon/atexit involved).
     """
     if role not in {'task', 'background'}:
         yield False
         return
 
-    fd = _try_once(Path(slots_dir), n)
+    slots_dir = Path(slots_dir)
     try:
-        yield fd is not None
+        fd = _acquire(slots_dir, n, wait)
+    except OSError:
+        logger.warning(
+            'verify_admission: acquire failed for slots_dir=%s n=%d; failing open',
+            slots_dir,
+            n,
+            exc_info=True,
+        )
+        fd = None
+
+    held = fd is not None
+    try:
+        yield held
     finally:
         if fd is not None:
             with contextlib.suppress(OSError):
