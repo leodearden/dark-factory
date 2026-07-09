@@ -5110,6 +5110,15 @@ class Scheduler:
                     },
                 )
 
+    # --- Public liveness accessors (task 2235, W10-α) ---
+    # Replace the Harness's direct reach-ins into Scheduler-private liveness
+    # state (``_dispatched``, ``lock_table._held``, ``_requeue_history``) with
+    # a stable public surface.  The Scheduler remains the single writer.
+
+    def is_dispatched(self, tid: str) -> bool:
+        """True iff *tid* is currently held in the in-flight dispatched set."""
+        return tid in self._dispatched
+
     # --- Retry cap (per-task REQUEUED counter) ---
 
     def record_requeue(
@@ -5159,6 +5168,14 @@ class Scheduler:
     def transient_requeue_count(self, task_id: str) -> int:
         """Return the number of transient API requeues recorded for *task_id*."""
         return self._transient_requeue_counts.get(task_id, 0)
+
+    def requeue_history(self, task_id: str) -> list[RequeueRecord]:
+        """Return a list copy of *task_id*'s ``RequeueRecord`` history.
+
+        ``[]`` when the task has no recorded requeues.  The returned list is
+        a copy — mutating it does not affect the scheduler's internal state.
+        """
+        return list(self._requeue_history.get(task_id, ()))
 
     def clear_requeue_count(self, task_id: str) -> None:
         """Clear the requeue counters and history for *task_id*.
