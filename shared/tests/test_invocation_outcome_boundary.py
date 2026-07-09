@@ -418,6 +418,41 @@ class TestB3ClassifierGoldenCorpus:
             )
 
 
+async def _drive_caphit_record_to_capped(record: dict) -> None:
+    """B3 consumer-side drive: replay *record* (a CapHit corpus record)
+    through invoke_with_cap_retry's fake-CLI harness and assert the
+    selected account transitions to AccountPhase.CAPPED end-to-end.
+
+    Uses a 2-account gate so the retry loop can complete: the first
+    (scripted) invocation delivers the corpus record's cap output on
+    account[0], which invoke_with_cap_retry detects (via the confirmed
+    detect_cap_hit path, or the zero-cost heuristic fallback when the
+    record's own strict_confirm regime doesn't match the loop's
+    hardcoded strict_confirm=True -- every corpus record defaults
+    duration_ms/turns/cost_usd to values that trip that heuristic net
+    regardless) and transitions to CAPPED; the loop then fails over to
+    account[1], whose scripted OK result ends the retry.
+    """
+    gate = make_boundary_gate(['acct-0', 'acct-1'])
+    capped_acct = gate._accounts[0]
+    cap_result = agent_result_from_record(record)
+    ok_result = AgentResult(success=True, output='done', cost_usd=0.01)
+
+    with patch('shared.cli_invoke.asyncio.sleep', new_callable=AsyncMock):
+        result = await invoke_with_cap_retry(
+            gate, f'B3[{record["id"]}]',
+            invoke_fn=scripted_cli(cap_result, ok_result),
+            backend=record.get('backend', 'claude'),
+            prompt='hi',
+        )
+
+    assert result.success is True, f'{record["id"]}: expected the loop to end in success'
+    assert capped_acct.phase == AccountPhase.CAPPED, (
+        f'{record["id"]}: expected acct-0 to be CAPPED after the cap-hit '
+        f'record, got {capped_acct.phase}'
+    )
+
+
 @pytest.mark.asyncio
 class TestB3CapHitDrivesAccountCapped:
     """Consumer side (two-way): every CapHit corpus record, replayed through
