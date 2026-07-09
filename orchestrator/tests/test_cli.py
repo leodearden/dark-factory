@@ -1151,6 +1151,13 @@ def test_verify_merge_request_id_pgid_lifecycle(tmp_path, monkeypatch):
 
     monkeypatch.setattr(cli_module, 'start_own_process_group', fake_sopg)
 
+    # --- Prevent the real stdin watchdog thread (task 2308 gamma) from
+    # arming: unmocked, it reads this test process's own real fd 0 (not a
+    # simulated ssh channel), which the pgid-lifecycle assertions below don't
+    # exercise -- same isolation used by the watchdog-spawn tests further
+    # down this file.
+    monkeypatch.setattr(cli_module, 'start_stdin_watchdog', lambda pgid, *a, **kw: MagicMock())
+
     # --- Mock verify_runner helpers; capture pgid file existence mid-run ---
     pgf = pgid_file(fake_worktree_base, FAKE_REQUEST_ID)
     file_existed_mid_run = []

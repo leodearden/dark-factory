@@ -17,8 +17,11 @@ from dotenv import load_dotenv
 
 from orchestrator.config import ConfigRequiredError, load_config
 from orchestrator.verify_cancel import (
+    WATCHDOG_HEARTBEAT_TIMEOUT_SECS,
+    WATCHDOG_KILL_GRACE_SECS,
     acquire_merge_verify_flock,
     cancel_request,
+    fire_watchdog_kill,
     merge_verify_lock_path,
     pgid_file,
     read_lock_holder_pgid,
@@ -48,6 +51,33 @@ SHUTDOWN_WATCHDOG_TIMEOUT_SECS = 30
 # distinguished contention VerifyResult instead of ever falling back to an
 # ephemeral worktree. Monkeypatchable so tests run the bounded wait fast.
 MERGE_VERIFY_FLOCK_WAIT_SECS = 10.0
+
+
+def _env_float(name: str, default: float) -> float:
+    """Read an optional env-var float override, falling back to *default*.
+
+    Task 2309 boundary gate (PRD §11 Q1/Q2 tunability): the remote-side
+    timing constants (flock wait, watchdog heartbeat timeout/grace) are
+    module-level and otherwise untunable from outside the spawned
+    ``verify-merge`` child, making an integration gate wall-clock-bound on
+    the 10-15s production windows. Unset, unparseable, or non-positive
+    values fall back to *default* so production behavior is byte-identical
+    when the env var is absent. The non-positive guard matters beyond
+    "byte-identical": every current caller feeds a timing window
+    (``select.select`` timeout / ``time.sleep`` duration) where <= 0 would
+    otherwise reach the watchdog's daemon thread as an invalid argument and
+    silently kill it instead of arming it.
+    """
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    try:
+        parsed = float(raw)
+    except ValueError:
+        return default
+    if parsed <= 0:
+        return default
+    return parsed
 
 
 class WatchdogHandle(NamedTuple):
@@ -409,8 +439,11 @@ def verify_merge(sha: str, spec_json: str, config_path: Path | None, request_id:
     fd: int | None = None
     contention_result = None
     if config.git.persistent_merge_worktree:
+        flock_wait_secs = _env_float(
+            'ORCH_MERGE_VERIFY_FLOCK_WAIT_SECS', MERGE_VERIFY_FLOCK_WAIT_SECS
+        )
         fd = acquire_merge_verify_flock(
-            merge_verify_lock_path(git_ops.worktree_base), MERGE_VERIFY_FLOCK_WAIT_SECS
+            merge_verify_lock_path(git_ops.worktree_base), flock_wait_secs
         )
         if fd is not None:
             write_lock_holder_pgid(git_ops.worktree_base, os.getpgrp())
@@ -441,8 +474,31 @@ def verify_merge(sha: str, spec_json: str, config_path: Path | None, request_id:
     # heartbeat starvation (hard partition), killing the build subtree and
     # self-exiting instead of surviving as a setsid orphan. Same pgid as the
     # pgid file, so a concurrent cancel-verify still tree-kills coherently.
+    #
+    # watchdog_fired is set as the FIRST action of the fire callback --
+    # strictly before any signal is sent -- so it always happens-before the
+    # kill that unblocks _run_cmd's awaited subprocess. Without this flag,
+    # a killed build command returns a normal (if failed) VerifyResult up
+    # through _run(), and the main thread can reach the click.echo/return
+    # below and exit 0 in a race against fire_watchdog_kill's own grace-period
+    # sleep + os._exit(1) -- observed as flaky exit codes on the same
+    # watchdog-fired outcome (task 2309 boundary gate).
+    watchdog_fired: threading.Event | None = None
+    watchdog_thread: threading.Thread | None = None
     if request_id is not None:
-        start_stdin_watchdog(pgid)
+        heartbeat_timeout = _env_float(
+            'ORCH_WATCHDOG_HEARTBEAT_TIMEOUT_SECS', WATCHDOG_HEARTBEAT_TIMEOUT_SECS
+        )
+        grace_secs = _env_float('ORCH_WATCHDOG_KILL_GRACE_SECS', WATCHDOG_KILL_GRACE_SECS)
+        watchdog_fired = threading.Event()
+
+        def _on_watchdog_fire() -> None:
+            watchdog_fired.set()
+            fire_watchdog_kill(pgid, grace_secs=grace_secs)
+
+        watchdog_thread = start_stdin_watchdog(
+            pgid, heartbeat_timeout=heartbeat_timeout, fire=_on_watchdog_fire
+        )
 
     try:
         result = asyncio.run(_run())
@@ -456,6 +512,23 @@ def verify_merge(sha: str, spec_json: str, config_path: Path | None, request_id:
         # Always remove the pgid file so cancel-verify knows this run is done.
         if pgf is not None:
             remove_pgid_file(pgf)
+
+    if watchdog_fired is not None and watchdog_fired.is_set():
+        # The watchdog already tree-killed the build and is mid-way through
+        # its own SIGTERM -> grace_secs sleep -> SIGKILL escalation (see
+        # fire_watchdog_kill) -- never print a (misleading) VerifyResult for
+        # a build we just killed out from under ourselves. Block on the
+        # watchdog thread itself here instead of exiting immediately: a bare
+        # sys.exit(1) begins interpreter shutdown right away, and since the
+        # watchdog thread is a daemon thread, shutdown does not wait for it --
+        # it can be torn down mid-sleep, before the SIGKILL escalation that
+        # exists specifically to reap start_new_session grandchildren
+        # (cargo/rustc) that survived SIGTERM. Joining lets
+        # fire_watchdog_kill's own unconditional os._exit(1) be the
+        # authoritative exit once the full escalation has run to completion.
+        if watchdog_thread is not None:
+            watchdog_thread.join()
+        sys.exit(1)  # pragma: no cover - fire_watchdog_kill os._exit()s first
 
     click.echo(result_to_json(result))
 
