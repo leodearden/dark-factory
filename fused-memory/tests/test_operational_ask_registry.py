@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import os
 import sys
+from pathlib import Path
 
 import pytest
 
@@ -315,3 +316,131 @@ class TestMatchCandidate:
         )
         result = match_candidate(candidate, [entry])
         assert result is entry
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# step-5 RED: TestSeedOperationalAskRegistry
+# ──────────────────────────────────────────────────────────────────────────────
+
+
+class TestSeedOperationalAskRegistry:
+    """Loads the SHIPPED fused-memory/config/operational_ask_registry.yaml and
+    asserts runtime matching behaviour (not YAML wording) against
+    representative fixtures for each recurring operational-ask signature.
+
+    Real recurring instances that motivated these entries: tasks 1945/2082
+    (prune_recon_cycle_summaries.py, esc-1942-5/esc-1942-10/esc-2082-12/13),
+    1946 (rebuild_entity_summaries project-wide, finding f92d7fb3), 1939
+    (knowlive namespace purge --apply, esc-1939-4), and 2081 (merge_entities
+    against a live FalkorDB graph). See task 2085's analysis for the full
+    precedent trail.
+    """
+
+    # tests/test_operational_ask_registry.py -> tests/ -> fused-memory/
+    SOURCE_ROOT = Path(__file__).resolve().parent.parent
+    REGISTRY_PATH = SOURCE_ROOT / "config" / "operational_ask_registry.yaml"
+
+    def _load_entries(self):
+        from fused_memory.middleware.operational_ask_registry import load_operational_registry
+        return load_operational_registry(self.REGISTRY_PATH)
+
+    def test_shipped_registry_has_at_least_four_well_formed_entries(self):
+        """(a) The seed registry has >= 4 entries, each with non-empty substrings."""
+        entries = self._load_entries()
+        assert len(entries) >= 4, (
+            f"Expected >= 4 seed entries, got {len(entries)}: {[e.name for e in entries]}"
+        )
+        for e in entries:
+            assert e.title_substrings, f"entry {e.name!r} has empty title_substrings"
+            assert e.description_substrings, f"entry {e.name!r} has empty description_substrings"
+
+    def test_prune_recon_cycle_summaries_matches(self):
+        """(b) A prune_recon_cycle_summaries.py --apply ask matches (tasks 1945/2082)."""
+        from fused_memory.middleware.operational_ask_registry import match_candidate
+
+        entries = self._load_entries()
+        candidate = CandidateTask(
+            title=(
+                "Operational: rerun prune_recon_cycle_summaries.py --project-id "
+                "know_live (dry-run then --apply)"
+            ),
+            description=(
+                "Collapse the pre-existing untagged Stage 1 cycle-summary pile: "
+                "dry-run first, review, then --apply against live Mem0/Qdrant."
+            ),
+        )
+        entry = match_candidate(candidate, entries)
+        assert entry is not None, (
+            f"Expected a match for prune_recon_cycle_summaries fixture, got None. "
+            f"Entries: {[e.name for e in entries]}"
+        )
+        assert entry.name == "prune_recon_cycle_summaries_apply"
+
+    def test_merge_entities_live_graph_matches(self):
+        """(b) A merge_entities-against-live-FalkorDB ask matches (task 2081)."""
+        from fused_memory.middleware.operational_ask_registry import match_candidate
+
+        entries = self._load_entries()
+        candidate = CandidateTask(
+            title="Merge duplicate Graphiti entity nodes via merge_entities against the live FalkorDB graph",
+            description=(
+                "Confirm the duplicate via direct query, then call merge_entities "
+                "against the production FalkorDB graph to collapse the nodes."
+            ),
+        )
+        entry = match_candidate(candidate, entries)
+        assert entry is not None, (
+            f"Expected a match for merge_entities fixture, got None. "
+            f"Entries: {[e.name for e in entries]}"
+        )
+        assert entry.name == "merge_entities_live_graph"
+
+    def test_rebuild_entity_summaries_project_wide_matches(self):
+        """(b) A project-wide rebuild_entity_summaries ask matches (task 1946)."""
+        from fused_memory.middleware.operational_ask_registry import match_candidate
+
+        entries = self._load_entries()
+        candidate = CandidateTask(
+            title="Operational: rebuild_entity_summaries project-wide for dark_factory and know_live",
+            description="Backfill post-invalidation stale entity summaries across all affected projects.",
+        )
+        entry = match_candidate(candidate, entries)
+        assert entry is not None, (
+            f"Expected a match for rebuild_entity_summaries fixture, got None. "
+            f"Entries: {[e.name for e in entries]}"
+        )
+        assert entry.name == "rebuild_entity_summaries_project_wide"
+
+    def test_knowlive_namespace_purge_apply_matches(self):
+        """(b) A knowlive namespace purge --apply ask matches (task 1939)."""
+        from fused_memory.middleware.operational_ask_registry import match_candidate
+
+        entries = self._load_entries()
+        candidate = CandidateTask(
+            title="Operator action: run knowlive namespace purge --apply against production",
+            description=(
+                "Purge and re-key the legacy knowlive namespace in FalkorDB and Mem0 "
+                "via purge_knowlive_namespace.py --apply."
+            ),
+        )
+        entry = match_candidate(candidate, entries)
+        assert entry is not None, (
+            f"Expected a match for knowlive namespace purge fixture, got None. "
+            f"Entries: {[e.name for e in entries]}"
+        )
+        assert entry.name == "knowlive_namespace_purge_apply"
+
+    def test_unrelated_code_fix_candidate_matches_nothing(self):
+        """(c) A clearly-unrelated normal code-fix candidate matches NOTHING."""
+        from fused_memory.middleware.operational_ask_registry import match_candidate
+
+        entries = self._load_entries()
+        candidate = CandidateTask(
+            title="Fix null pointer in task_curator batch dedup when candidates list is empty",
+            description=(
+                "Add a guard so curate_batch_prepared does not crash on an empty "
+                "candidates list; add a regression test."
+            ),
+        )
+        entry = match_candidate(candidate, entries)
+        assert entry is None, f"Expected no match for unrelated candidate, got {entry.name!r}"
