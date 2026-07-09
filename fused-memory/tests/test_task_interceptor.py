@@ -8022,3 +8022,161 @@ async def test_dispatch_ticket_decision_candidate_key_collision_resolves_combine
     assert result_dict.get('deduplicated') is True, result_dict
     assert result_dict.get('action') == 'candidate_key_collision', result_dict
     assert degrade is None, f'expected no curator_degrade_reason; got {degrade!r}'
+
+
+# ── task 2085 step-13 RED: route_deterministic -> deterministic PURE-GATE stamping ──
+
+
+@pytest.mark.asyncio
+async def test_dispatch_route_deterministic_creates_task_not_drop_or_combine(
+    interceptor, taskmaster,
+):
+    """(a) A route_deterministic decision CREATES the task — tm.add_task is
+    called exactly once and status=='created'. It never drops or combines,
+    even though a route decision carries no target_id (mirrors a fresh
+    'create' dispatch, not a dedup)."""
+    status, task_id, reason, result_dict, degrade = await interceptor._dispatch_ticket_decision(
+        ticket_id='t1',
+        project_root='/project',
+        project_id=resolve_project_id('/project'),
+        candidate=None,
+        decision=CuratorDecision(
+            action='route_deterministic',
+            justification='operational-ask-registry: x: y',
+        ),
+        kwargs={'title': 'Run prune_recon_cycle_summaries --apply'},
+        metadata=None,
+        curator=None,
+    )
+
+    assert status == 'created', f'expected created, got {status!r} (reason={reason!r})'
+    taskmaster.add_task.assert_awaited_once()
+    assert task_id == '2'
+
+
+@pytest.mark.asyncio
+async def test_dispatch_route_deterministic_stamps_valid_pure_gate_metadata(
+    interceptor, taskmaster,
+):
+    """(b)+(c) The metadata passed to add_task is a valid deterministic
+    PURE-GATE: task_kind='deterministic', always_escalates is True, no
+    before_done key — and deterministic_task_guard.deterministic_task_error
+    confirms it never rejects this as an ill-formed no-op (boundary test 6)."""
+    from fused_memory.middleware.deterministic_task_guard import deterministic_task_error
+
+    await interceptor._dispatch_ticket_decision(
+        ticket_id='t1',
+        project_root='/project',
+        project_id=resolve_project_id('/project'),
+        candidate=None,
+        decision=CuratorDecision(
+            action='route_deterministic',
+            justification='operational-ask-registry: x: y',
+        ),
+        kwargs={'title': 'Run prune_recon_cycle_summaries --apply'},
+        metadata=None,
+        curator=None,
+    )
+
+    taskmaster.add_task.assert_awaited_once()
+    _, call_kwargs = taskmaster.add_task.call_args
+    stamped_metadata = json.loads(call_kwargs['metadata'])
+
+    assert stamped_metadata.get('task_kind') == 'deterministic'
+    assert stamped_metadata.get('always_escalates') is True
+    assert 'before_done' not in stamped_metadata
+
+    # Boundary test 6: the stamped metadata is a VALID pure-gate — never an
+    # ill-formed deterministic no-op.
+    err = deterministic_task_error('deterministic', stamped_metadata, '/project')
+    assert err is None, f'expected a valid pure-gate, got validation error: {err!r}'
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    'incoming_metadata',
+    [
+        None,
+        {'task_kind': 'normal', 'foo': 'bar'},
+        json.dumps({'task_kind': 'normal', 'foo': 'bar'}),
+    ],
+    ids=['none', 'dict-with-prior-task-kind', 'json-string-with-prior-task-kind'],
+)
+async def test_dispatch_route_deterministic_overrides_incoming_metadata_variants(
+    interceptor, taskmaster, incoming_metadata,
+):
+    """(d) None / dict-with-prior-task_kind / JSON-string metadata all yield
+    the stamped deterministic pure-gate, overriding any prior task_kind."""
+    await interceptor._dispatch_ticket_decision(
+        ticket_id='t1',
+        project_root='/project',
+        project_id=resolve_project_id('/project'),
+        candidate=None,
+        decision=CuratorDecision(
+            action='route_deterministic',
+            justification='operational-ask-registry: x: y',
+        ),
+        kwargs={'title': 'Run prune_recon_cycle_summaries --apply'},
+        metadata=incoming_metadata,
+        curator=None,
+    )
+
+    taskmaster.add_task.assert_awaited_once()
+    _, call_kwargs = taskmaster.add_task.call_args
+    stamped_metadata = json.loads(call_kwargs['metadata'])
+
+    assert stamped_metadata.get('task_kind') == 'deterministic'
+    assert stamped_metadata.get('always_escalates') is True
+    assert 'before_done' not in stamped_metadata
+    if isinstance(incoming_metadata, dict):
+        assert stamped_metadata.get('foo') == 'bar', 'other keys must survive the stamp'
+
+
+@pytest.mark.asyncio
+async def test_dispatch_create_decision_unaffected_by_pure_gate_stamping(
+    interceptor, taskmaster,
+):
+    """(e) regression: a normal 'create' decision is unaffected — no
+    task_kind/always_escalates stamping."""
+    await interceptor._dispatch_ticket_decision(
+        ticket_id='t1',
+        project_root='/project',
+        project_id=resolve_project_id('/project'),
+        candidate=None,
+        decision=CuratorDecision(action='create', justification='genuinely new'),
+        kwargs={'title': 'Ordinary task'},
+        metadata={'foo': 'bar'},
+        curator=None,
+    )
+
+    taskmaster.add_task.assert_awaited_once()
+    _, call_kwargs = taskmaster.add_task.call_args
+    stamped_metadata = json.loads(call_kwargs['metadata'])
+
+    assert 'task_kind' not in stamped_metadata
+    assert 'always_escalates' not in stamped_metadata
+    assert stamped_metadata == {'foo': 'bar'}
+
+
+@pytest.mark.asyncio
+async def test_dispatch_drop_decision_unaffected_by_pure_gate_stamping(
+    interceptor, taskmaster,
+):
+    """(e) regression: a drop decision is unaffected — it never reaches the
+    create block at all, so no add_task call and no metadata stamping."""
+    from fused_memory.middleware.task_curator import CandidateTask
+
+    status, task_id, reason, result_dict, degrade = await interceptor._dispatch_ticket_decision(
+        ticket_id='t1',
+        project_root='/project',
+        project_id=resolve_project_id('/project'),
+        candidate=CandidateTask(title='dup'),
+        decision=CuratorDecision(action='drop', target_id='99', justification='dup of 99'),
+        kwargs={'title': 'dup'},
+        metadata={'foo': 'bar'},
+        curator=None,
+    )
+
+    assert status == 'combined'
+    assert task_id == '99'
+    taskmaster.add_task.assert_not_awaited()

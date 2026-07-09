@@ -107,7 +107,7 @@ class CuratorFailureError(RuntimeError):
         self.cost_usd = cost_usd
 
 
-Action = Literal['drop', 'combine', 'create']
+Action = Literal['drop', 'combine', 'create', 'route_deterministic']
 
 _STATUS_RANK = {
     'pending': 0,
@@ -511,6 +511,13 @@ class TaskCurator:
         # only the YAML load itself is cached for the instance lifetime.
         self._premise_registry: list | None = None
         self._premise_registry_load_attempted: bool = False
+        # Operational-ask registry (filing-policy gate) — lazy-loaded on first
+        # curate() call, same shape as _blocklist above. A match routes the
+        # candidate straight to a deterministic PURE-GATE instead of the LLM;
+        # unlike the blocklist, the resulting decision is deliberately NOT
+        # written to the idempotency cache (see _maybe_route_deterministic).
+        self._operational_registry: list | None = None
+        self._operational_registry_load_attempted: bool = False
         # Consecutive-ZOT circuit breaker (task 1743).
         # Counts CONSECUTIVE zero-output/full-timeout curator LLM failures;
         # reset to 0 on any real LLM success or non-ZOT failure.
@@ -897,6 +904,101 @@ class TaskCurator:
         )
         return decision
 
+    async def _maybe_route_deterministic(
+        self, candidate: CandidateTask, payload_hash: str,
+    ) -> CuratorDecision | None:
+        """Return a route_deterministic decision if the candidate matches the
+        operational-ask registry (the filing-policy gate).
+
+        Lazy-loads the registry from
+        ``self._config.curator.operational_ask_registry_path`` on the first
+        call and caches the parsed entries for the lifetime of this
+        :class:`TaskCurator` instance (no hot-reload; a server restart is
+        required to pick up YAML changes) — mirrors ``_maybe_blocklist_drop``.
+
+        Unlike ``_maybe_blocklist_drop``, the resulting decision is
+        deliberately NOT written to the idempotency cache
+        (``self._decision_cache``): once the first ask has materialised as a
+        deterministic PURE-GATE task, a cached route decision must never
+        resurface via ``_check_cache`` and spawn a SECOND gate for a re-filed
+        duplicate. A re-filed duplicate is instead caught by the exact-match /
+        idempotency-cache / LLM-combine checks that run before this one (see
+        ``curate`` / ``curate_batch_prepared`` ordering) — mirrors the
+        rationale of ``_maybe_premise_refuted_drop``. ``payload_hash`` is
+        accepted only for signature symmetry with the other two guards and is
+        unused here.
+
+        KNOWN LIMITATION (residual duplicate-gate risk): the exact-match /
+        idempotency-cache checks key off a payload fingerprint, so they only
+        catch byte-identical (or near-identical) re-proposals. A PARAPHRASED
+        re-proposal of the same operational ask — different wording, but
+        still containing the registry's title/description substrings — will
+        miss the fingerprint match, will not be cached, and will re-match
+        this registry, filing a SECOND born-at-L2 pure-gate for work that is
+        already gated. This is not auto-deduped against already-open gate
+        tasks (no task-search lookup is performed here). Operators should
+        expect this for paraphrased re-files and manually cancel/resolve the
+        duplicate gate — see the "paraphrased re-proposals" guidance in
+        config/operational_ask_registry.yaml's header.
+
+        Returns ``None`` when:
+        - The registry path is not configured (``None``).
+        - The registry file is missing, unreadable, or unparseable (one
+          WARNING logged by the loader).
+        - The registry is empty.
+        - No entry matches the candidate.
+
+        Never raises.
+        """
+        from fused_memory.middleware.operational_ask_registry import (
+            load_operational_registry,
+            match_candidate,
+        )
+
+        cfg_path = self._config.curator.operational_ask_registry_path
+        if cfg_path is None:
+            return None
+
+        # Lazy load — run at most once per TaskCurator instance.
+        if not self._operational_registry_load_attempted:
+            self._operational_registry_load_attempted = True
+            raw_path = Path(cfg_path)
+            if not raw_path.is_absolute():
+                if self._cwd is not None:
+                    raw_path = self._cwd / raw_path
+                else:
+                    logger.warning(
+                        'task_curator: operational_ask_registry_path %r is relative but '
+                        'TaskCurator was constructed without cwd — resolving against process '
+                        'CWD which may be incorrect; use an absolute path in CuratorConfig',
+                        cfg_path,
+                    )
+            self._operational_registry = load_operational_registry(raw_path)
+
+        entries = self._operational_registry
+        if not entries:
+            return None
+
+        entry = match_candidate(candidate, entries)
+        if entry is None:
+            return None
+
+        decision = CuratorDecision(
+            action='route_deterministic',
+            target_id=None,
+            target_fingerprint=None,
+            rewritten_task=None,
+            justification=f'operational-ask-registry: {entry.name}: {entry.reason}',
+            pool_sizes={'anchor': 0, 'module': 0, 'embedding': 0, 'dependency': 0},
+            latency_ms=0,
+        )
+        # Deliberately NOT self._store_cache(...)'d — see docstring.
+        logger.info(
+            'task_curator: operational-ask-registry route entry=%s candidate=%r',
+            entry.name, candidate.title,
+        )
+        return decision
+
     async def curate(
         self,
         candidate: CandidateTask,
@@ -942,6 +1044,17 @@ class TaskCurator:
         cached = self._check_cache(payload_hash)
         if cached is not None:
             return cached
+
+        # Operational-ask registry (filing-policy gate) short-circuit — runs AFTER
+        # the blocklist/premise drops, exact-match dedup, and idempotency cache so
+        # a re-filed DUPLICATE operational ask is caught by one of those and
+        # drops/combines into the existing gate instead of spawning a second one.
+        # Only a genuinely-new operational ask reaches here, and it short-circuits
+        # the ZOT breaker/corpus/LLM entirely. Deliberately not cached (see
+        # _maybe_route_deterministic).
+        route_decision = await self._maybe_route_deterministic(candidate, payload_hash)
+        if route_decision is not None:
+            return route_decision
 
         # Zero-output-timeout circuit breaker — gate BEFORE corpus build + LLM.
         # Only the 180s LLM call (and the corpus build that precedes it) is the
@@ -1240,6 +1353,29 @@ class TaskCurator:
             else:
                 llm_k_list.append(k)
 
+        # ── Operational-ask registry (filing-policy gate) check ────────────────
+        # Runs on the still-LLM-bound candidates only — AFTER the blocklist/
+        # premise drops AND the idempotency-cache split, so an already-cached
+        # decision for this exact payload_hash takes precedence over routing.
+        # Mirrors curate()'s precedence (blocklist -> premise -> exact-match ->
+        # cache -> route). Deliberately NOT stored in the idempotency cache
+        # (see _maybe_route_deterministic) so a re-filed duplicate is instead
+        # caught by the cache/blocklist/premise checks on a later call, rather
+        # than a stale cached route resurfacing here.
+        route_decisions: dict[int, CuratorDecision] = {}  # original-space i → decision
+        non_route_llm_k: list[int] = []
+        for k in llm_k_list:
+            original_i = unique_indices[k]
+            route_decision = await self._maybe_route_deterministic(
+                candidates[original_i], candidates[original_i].payload_hash(),
+            )
+            if route_decision is not None:
+                route_decisions[original_i] = route_decision
+            else:
+                non_route_llm_k.append(k)
+        llm_k_list = non_route_llm_k
+        # ── End operational-ask registry check ──────────────────────────────────
+
         # ── Zero-output-timeout circuit breaker gate (task 1743) ──────────────
         # Check the breaker BEFORE the expensive batch LLM round-trip (up to
         # batch_timeout_cap_seconds = 360s).  If open, resolve every LLM-bound
@@ -1341,6 +1477,7 @@ class TaskCurator:
         unique_decision_map: dict[int, CuratorDecision] = {
             unique_indices[k]: unique_decisions_by_k[k]
             for k in range(len(unique_indices))
+            if unique_indices[k] not in route_decisions
         }
 
         decisions = [
@@ -1350,6 +1487,8 @@ class TaskCurator:
             if i in blocklist_decisions
             else premise_decisions[i]
             if i in premise_decisions
+            else route_decisions[i]
+            if i in route_decisions
             else unique_decision_map[i]
             for i in range(len(candidates))
         ]

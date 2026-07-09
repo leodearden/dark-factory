@@ -1695,6 +1695,48 @@ class TaskInterceptor:
         return meta
 
     @staticmethod
+    def _inject_deterministic_pure_gate(metadata: Any) -> dict:
+        """Return a metadata dict stamped as a deterministic PURE-GATE.
+
+        Builds on :meth:`_extract_metadata_dict` to normalise the incoming
+        shape (None / JSON-string / dict / unparseable → fresh dict when None
+        or unparseable) before writing the keys, so the result is always a
+        plain dict ready for JSON serialisation — mirrors
+        :meth:`_inject_routing_override`.
+
+        Unconditionally sets ``task_kind='deterministic'`` and
+        ``always_escalates=True``, and DELETES any ``before_done`` key so the
+        result always satisfies the pure-gate invariant enforced by
+        :func:`deterministic_task_guard.deterministic_task_error` — a
+        deterministic task with no action must always escalate, never be an
+        ill-formed no-op. This holds regardless of what task_kind/before_done
+        the recon LLM originally supplied in metadata.
+        """
+        meta = TaskInterceptor._extract_metadata_dict(metadata)
+        if meta is None:
+            if metadata is not None:
+                # NOTE: _extract_metadata_dict() already emitted a WARNING
+                # (via _warn_metadata_discard) when it failed to parse this
+                # non-None metadata. This second WARNING is intentional, not
+                # a duplicate bug — it names *this* call site
+                # (deterministic-pure-gate stamping) so the discard is
+                # greppable by caller, mirroring the identical double-log in
+                # _inject_routing_override above. Two log lines, one failure.
+                logger.warning(
+                    'deterministic-pure-gate: non-dict metadata discarded (type=%s); '
+                    'using fresh dict. Original value: %r',
+                    type(metadata).__name__,
+                    metadata,
+                )
+            meta = {}
+        else:
+            meta = dict(meta)  # shallow copy — don't mutate the caller's dict
+        meta['task_kind'] = 'deterministic'
+        meta['always_escalates'] = True
+        meta.pop('before_done', None)
+        return meta
+
+    @staticmethod
     def _attach_possible_scope_mismatch(
         kwargs: dict[str, Any],
         verdict: PathGuardVerdict,
@@ -2618,6 +2660,14 @@ class TaskInterceptor:
                     None,
                 )
             # combine failed → fall through to create
+
+        if decision is not None and decision.action == 'route_deterministic':
+            # Operational-ask registry match (filing-policy gate): stamp
+            # metadata as a deterministic PURE-GATE and fall through to the
+            # ordinary create path below — this covers both the single
+            # (_process_add_ticket) and batch (_process_add_tickets_batch_prepared)
+            # dispatch callers, which both converge here.
+            metadata = self._inject_deterministic_pure_gate(metadata)
 
         # ── Create task ───────────────────────────────────────────────
         status: str = 'failed'

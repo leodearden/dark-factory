@@ -163,6 +163,14 @@ curator:
   # fused-memory/config/recon_code_fix_premise_registry.yaml for the schema.
   recon_code_fix_premise_registry_path: "config/recon_code_fix_premise_registry.yaml"
 
+  # Operational-ask registry: YAML file listing recurring operational
+  # live-data/live-mutation asks (already-built+unit-tested scripts whose
+  # remaining work is dry-run -> human-review -> apply against live external
+  # stores, modifying ZERO repo files). Matching candidates are routed before
+  # any LLM call to a deterministic PURE-GATE instead of the TDD architect.
+  # See fused-memory/config/operational_ask_registry.yaml for the schema.
+  operational_ask_registry_path: "config/operational_ask_registry.yaml"
+
   # Background ticket janitor — see middleware/ticket_janitor.py.
   # Replaces per-call resolve_ticket waits with a server-side sweep that
   # batches failed tickets into one info-severity ticket_failure escalation

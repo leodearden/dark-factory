@@ -1,0 +1,106 @@
+# Operational-Ask Registry
+# ============================================================
+# Each entry documents a RECURRING operational live-data/live-mutation ask:
+# its deliverable is an already-built+unit-tested script (or MCP tool), and
+# the remaining work is dry-run -> human-review -> apply against a LIVE
+# external store (FalkorDB, Mem0/Qdrant, ...), modifying ZERO repo files. The
+# TDD architect cannot author a RED->GREEN plan for that shape of work — it
+# reports the task "unactionable" and the task churns through L1/L2
+# escalation. The curator matches incoming candidates against this list
+# *before* any LLM call. A match returns action='route_deterministic', which
+# routes the task straight to a deterministic PURE-GATE (task_kind=
+# 'deterministic', always_escalates=true, before_done absent) — a born-at-L2
+# milestone gate that blocks until a human runs the operation out-of-band and
+# resolves it via resolve_issue. The architect is never invoked.
+#
+# Schema per entry:
+#   name                  : str  — stable identifier for the entry
+#   reason                : str  — human-readable explanation (cite the recurring task ids)
+#   title_substrings      : list[str]  — ALL must appear in candidate title (case-insensitive)
+#   description_substrings: list[str]  — AT LEAST ONE must appear in
+#                           candidate description+details (case-insensitive)
+#
+# Guidance for operators adding new entries:
+#   - Use a tight title anchor: prefer the specific script/tool/namespace name
+#     (e.g. "prune_recon_cycle_summaries", "merge_entities") over generic
+#     phrasing to minimize false positives. A title-only gate is never enough
+#     on its own — always pair it with specific description_substrings (the
+#     store name, "--apply", "live", "production").
+#   - Only add an entry once an operational ask of that shape has RECURRED —
+#     a one-off ask should go through the architect's normal
+#     unactionable-report path so a human can decide whether it deserves a
+#     standing registry entry.
+#   - When a re-proposed ask slips through by paraphrasing, add the new
+#     phrasing as an additional description_substrings entry here.
+#   - Safety net (2085 amendment): operational_ask_registry.py's
+#     match_candidate() unconditionally refuses to match ANY entry when the
+#     candidate title contains "fix", "bug", "crash", or "implement" — e.g.
+#     "Fix a bug in merge_entities against the live FalkorDB graph" would
+#     otherwise satisfy the merge_entities_live_graph entry below even
+#     though it is a code fix, not an operational ask. This is a backstop,
+#     not a substitute for tight anchors: still prefer a specific
+#     script/tool/namespace name over a bare, generic word as a title
+#     anchor, and never add an entry whose title plausibly implies a code
+#     change.
+# ============================================================
+
+- name: prune_recon_cycle_summaries_apply
+  reason: >
+    Operational run of the already-built+tested prune_recon_cycle_summaries.py
+    script (dry-run -> review -> --apply) to collapse pre-existing untagged
+    reconciliation cycle-summary piles in live Mem0/Qdrant. Recurred as tasks
+    1945 (esc-1942-5, esc-1942-10) and 2082 (esc-2082-12, esc-2082-13); both
+    were reported "unactionable" by the architect before being resolved
+    operationally. Route straight to a deterministic PURE-GATE.
+  title_substrings:
+    - "prune_recon_cycle_summaries"
+  description_substrings:
+    - "--apply"
+    - "cycle-summary"
+    - "cycle_summary"
+
+- name: merge_entities_live_graph
+  reason: >
+    Operational mcp__fused-memory__merge_entities(...) call against a live
+    FalkorDB/Graphiti graph to collapse a confirmed-duplicate entity pair.
+    Recurred as task 2081 (MergeWorker duplicate-node investigation), which
+    the architect reported "unactionable" — merge_entities is already fully
+    implemented/tested; the remaining work is a human-verified irreversible
+    mutation against production graph state. Route straight to a
+    deterministic PURE-GATE.
+  title_substrings:
+    - "merge_entities"
+    - "live"
+  description_substrings:
+    - "FalkorDB"
+    - "production graph"
+
+- name: rebuild_entity_summaries_project_wide
+  reason: >
+    Operational project-wide rebuild_entity_summaries backfill to refresh
+    stale entity summaries after an edge invalidation, across all entities in
+    one or more live projects. Recurred as task 1946 (Stage 2 finding
+    f92d7fb3, run fb4313a3) after the architect reported the original
+    code-fix premise false — the sole remaining scope was the operational
+    backfill itself. Route straight to a deterministic PURE-GATE.
+  title_substrings:
+    - "rebuild_entity_summaries"
+    - "project-wide"
+  description_substrings:
+    - "backfill"
+    - "stale"
+
+- name: knowlive_namespace_purge_apply
+  reason: >
+    Operational purge_knowlive_namespace.py --apply run against production
+    FalkorDB/Qdrant to re-key the legacy no-separator "knowlive" namespace.
+    Recurred as task 1939 (esc-1939-4, follow-up to task 1937), a
+    task_kind='deterministic' pure-gate whose --apply step is deliberately
+    not automated because it is a destructive, irreversible production data
+    operation. Route straight to a deterministic PURE-GATE.
+  title_substrings:
+    - "knowlive"
+    - "purge"
+  description_substrings:
+    - "--apply"
+    - "namespace"

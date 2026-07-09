@@ -3528,6 +3528,43 @@ class TestCuratorReconPremiseRegistryConfig:
 
 
 # ──────────────────────────────────────────────────────────────────────────────
+# task-2085 step-3 RED: TestCuratorOperationalAskRegistryConfig
+# ──────────────────────────────────────────────────────────────────────────────
+
+
+class TestCuratorOperationalAskRegistryConfig:
+    """Tests that CuratorConfig has operational_ask_registry_path field
+    and that FusedMemoryConfig round-trips it via YAML.
+
+    Mirrors TestCuratorConfigBlocklistPath / TestCuratorReconPremiseRegistryConfig
+    above — same shape, new field.
+    """
+
+    def test_curator_config_has_field_default_none(self):
+        """CuratorConfig has operational_ask_registry_path field, default None."""
+        cfg = CuratorConfig()
+        assert hasattr(cfg, "operational_ask_registry_path")
+        assert cfg.operational_ask_registry_path is None
+
+    def test_curator_config_accepts_string_path(self):
+        """CuratorConfig accepts a string path for operational_ask_registry_path."""
+        cfg = CuratorConfig(operational_ask_registry_path="/tmp/operational_ask_registry.yaml")
+        assert cfg.operational_ask_registry_path == "/tmp/operational_ask_registry.yaml"
+
+    def test_fused_memory_config_roundtrips_via_yaml(self, tmp_path, monkeypatch):
+        """FusedMemoryConfig round-trips operational_ask_registry_path via YAML."""
+        import yaml
+
+        raw = {"curator": {"operational_ask_registry_path": "config/operational_ask_registry.yaml"}}
+        yaml_path = tmp_path / "config.yaml"
+        yaml_path.write_text(yaml.dump(raw), encoding="utf-8")
+
+        monkeypatch.setenv("CONFIG_PATH", str(yaml_path))
+        cfg = FusedMemoryConfig()
+        assert cfg.curator.operational_ask_registry_path == "config/operational_ask_registry.yaml"
+
+
+# ──────────────────────────────────────────────────────────────────────────────
 # step-7 RED: TestCuratorBlocklistShortCircuit
 # ──────────────────────────────────────────────────────────────────────────────
 
@@ -4714,4 +4751,500 @@ class TestCuratorBatchPremiseRefutedDrop:
         assert any(c is c0 for c in llm_candidates_received)
         assert decisions2[0].action == "create"
         assert not decisions2[0].justification.startswith("recon-premise-refuted:")
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# task-2085 step-7 RED: TestCuratorMaybeRouteDeterministic
+# ──────────────────────────────────────────────────────────────────────────────
+
+
+def _make_operational_registry_yaml(
+    tmp_path, title_subs, desc_subs, name="test_operational_entry", reason="test operational reason",
+):
+    """Write a minimal operational-ask registry YAML and return its path."""
+    import yaml
+    content = [{
+        "name": name,
+        "reason": reason,
+        "title_substrings": title_subs,
+        "description_substrings": desc_subs,
+    }]
+    p = tmp_path / "operational_ask_registry.yaml"
+    p.write_text(yaml.dump(content), encoding="utf-8")
+    return p
+
+
+def _make_config_with_operational_registry(registry_path_str: str) -> FusedMemoryConfig:
+    cfg = FusedMemoryConfig()
+    cfg.curator = CuratorConfig(operational_ask_registry_path=registry_path_str)
+    return cfg
+
+
+@pytest.mark.asyncio
+class TestCuratorMaybeRouteDeterministic:
+    """Unit tests for TaskCurator._maybe_route_deterministic — mirrors the
+    _maybe_blocklist_drop / _maybe_premise_refuted_drop method shape (lazy-load
+    once, cwd-relative path resolution, never raises) but returns
+    action='route_deterministic' and is deliberately NOT cached.
+    """
+
+    async def test_matching_candidate_returns_route_decision(self, tmp_path):
+        """(a) A candidate matching a registry entry returns
+        action=='route_deterministic' with a justification naming the entry."""
+        registry = _make_operational_registry_yaml(
+            tmp_path,
+            title_subs=["prune_recon_cycle_summaries"],
+            desc_subs=["--apply"],
+        )
+        config = _make_config_with_operational_registry(str(registry))
+        curator = TaskCurator(config=config, taskmaster=None, cwd=tmp_path)
+
+        candidate = CandidateTask(
+            title="Run prune_recon_cycle_summaries --apply against live Mem0",
+            description="Operational --apply run to collapse pre-existing piles.",
+        )
+
+        decision = await curator._maybe_route_deterministic(
+            candidate, candidate.payload_hash(),
+        )
+
+        assert decision is not None
+        assert decision.action == "route_deterministic"
+        assert "test_operational_entry" in decision.justification
+
+    async def test_non_matching_candidate_returns_none(self, tmp_path):
+        """(b) A non-matching candidate returns None."""
+        registry = _make_operational_registry_yaml(
+            tmp_path,
+            title_subs=["prune_recon_cycle_summaries"],
+            desc_subs=["--apply"],
+        )
+        config = _make_config_with_operational_registry(str(registry))
+        curator = TaskCurator(config=config, taskmaster=None, cwd=tmp_path)
+
+        candidate = CandidateTask(
+            title="Fix a normal bug in the retry loop",
+            description="Nothing operational here.",
+        )
+
+        decision = await curator._maybe_route_deterministic(
+            candidate, candidate.payload_hash(),
+        )
+
+        assert decision is None
+
+    async def test_registry_path_none_returns_none(self, tmp_path):
+        """(c) operational_ask_registry_path=None returns None."""
+        config = _make_config()  # default CuratorConfig has path=None
+        curator = TaskCurator(config=config, taskmaster=None, cwd=tmp_path)
+
+        candidate = CandidateTask(
+            title="Run prune_recon_cycle_summaries --apply against live Mem0",
+            description="Operational --apply run to collapse pre-existing piles.",
+        )
+
+        decision = await curator._maybe_route_deterministic(
+            candidate, candidate.payload_hash(),
+        )
+
+        assert decision is None
+
+    async def test_missing_registry_file_returns_none(self, tmp_path):
+        """(d) A missing registry file degrades to None rather than raising."""
+        nonexistent = tmp_path / "does_not_exist.yaml"
+        config = _make_config_with_operational_registry(str(nonexistent))
+        curator = TaskCurator(config=config, taskmaster=None, cwd=tmp_path)
+
+        candidate = CandidateTask(
+            title="Run prune_recon_cycle_summaries --apply against live Mem0",
+            description="Operational --apply run to collapse pre-existing piles.",
+        )
+
+        decision = await curator._maybe_route_deterministic(
+            candidate, candidate.payload_hash(),
+        )
+
+        assert decision is None
+
+    async def test_malformed_registry_file_returns_none(self, tmp_path):
+        """(d) A malformed (non-list top-level) registry file degrades to None."""
+        bad_yaml = tmp_path / "bad_operational_ask_registry.yaml"
+        bad_yaml.write_text("just_a_key: just_a_value\n", encoding="utf-8")
+        config = _make_config_with_operational_registry(str(bad_yaml))
+        curator = TaskCurator(config=config, taskmaster=None, cwd=tmp_path)
+
+        candidate = CandidateTask(
+            title="Run prune_recon_cycle_summaries --apply against live Mem0",
+            description="Operational --apply run to collapse pre-existing piles.",
+        )
+
+        decision = await curator._maybe_route_deterministic(
+            candidate, candidate.payload_hash(),
+        )
+
+        assert decision is None
+
+    async def test_route_decision_not_stored_in_cache(self, tmp_path):
+        """(e) The route decision is NOT written to the idempotency cache —
+        mirrors the premise-refuted no-cache assertion. A route must never
+        pin a stale decision after the born-at-L2 gate task already exists."""
+        registry = _make_operational_registry_yaml(
+            tmp_path,
+            title_subs=["prune_recon_cycle_summaries"],
+            desc_subs=["--apply"],
+        )
+        config = _make_config_with_operational_registry(str(registry))
+        curator = TaskCurator(config=config, taskmaster=None, cwd=tmp_path)
+
+        candidate = CandidateTask(
+            title="Run prune_recon_cycle_summaries --apply against live Mem0",
+            description="Operational --apply run to collapse pre-existing piles.",
+        )
+        payload_hash = candidate.payload_hash()
+
+        decision = await curator._maybe_route_deterministic(candidate, payload_hash)
+
+        assert decision is not None
+        assert decision.action == "route_deterministic"
+        assert curator._check_cache(payload_hash) is None
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# task-2085 step-9 RED: TestCuratorCurateRouteDeterministicIntegration
+# ──────────────────────────────────────────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+class TestCuratorCurateRouteDeterministicIntegration:
+    """curate() integration tests for the operational-ask registry
+    filing-policy gate (G2 signal) — mirrors TestCuratorBlocklistShortCircuit /
+    TestCuratorPremiseRefutedDrop, plus precedence boundary tests against the
+    other pre-LLM short-circuits.
+    """
+
+    async def test_registry_match_short_circuits_before_corpus_and_llm(self, tmp_path):
+        """(1) A genuinely-new operational candidate short-circuits to
+        action=='route_deterministic' BEFORE corpus assembly or any LLM call."""
+        registry = _make_operational_registry_yaml(
+            tmp_path,
+            title_subs=["prune_recon_cycle_summaries"],
+            desc_subs=["--apply"],
+        )
+        config = _make_config_with_operational_registry(str(registry))
+        curator = TaskCurator(config=config, taskmaster=None, cwd=tmp_path)
+
+        candidate = CandidateTask(
+            title="Run prune_recon_cycle_summaries --apply against live Mem0",
+            description="Operational --apply run to collapse pre-existing piles.",
+        )
+
+        with patch.object(curator, "_build_corpus", new=AsyncMock(side_effect=AssertionError("_build_corpus must not be called"))) as mock_corpus, \
+             patch.object(curator, "_call_llm", new=AsyncMock(side_effect=AssertionError("_call_llm must not be called"))) as mock_llm:
+            decision = await curator.curate(candidate, project_id="p", project_root="/x")
+
+        assert decision.action == "route_deterministic"
+        assert decision.justification.startswith("operational-ask-registry:")
+        mock_corpus.assert_not_called()
+        mock_llm.assert_not_called()
+
+    async def test_registry_miss_flows_through_llm_unaffected(self, tmp_path):
+        """(2) A non-matching candidate is unaffected — normal LLM 'create' path."""
+        registry = _make_operational_registry_yaml(
+            tmp_path,
+            title_subs=["prune_recon_cycle_summaries"],
+            desc_subs=["--apply"],
+        )
+        config = _make_config_with_operational_registry(str(registry))
+        curator = TaskCurator(config=config, taskmaster=None, cwd=tmp_path)
+
+        candidate = CandidateTask(title="Fix a normal bug", description="Nothing operational here.")
+
+        fake_exact_match, fake_corpus, create_result = _make_create_mocks()
+
+        with patch.object(curator, "_pre_llm_exact_match", side_effect=fake_exact_match), \
+             patch.object(curator, "_build_corpus", side_effect=fake_corpus), \
+             patch("fused_memory.middleware.task_curator.invoke_with_cap_retry",
+                   new=AsyncMock(return_value=create_result)):
+            decision = await curator.curate(candidate, project_id="p", project_root="/x")
+
+        assert decision.action == "create"
+
+    async def test_blocklist_takes_precedence_over_route(self, tmp_path):
+        """(3) A candidate matching BOTH the cancelled-premise blocklist AND
+        the operational registry is dropped by the blocklist — route never
+        fires, so no gate is spawned for an already-cancelled premise."""
+        blocklist = _make_blocklist_yaml(
+            tmp_path,
+            title_subs=["prune_recon_cycle_summaries"],
+            desc_subs=["--apply"],
+            name="cancelled_dup_of_operational_ask",
+        )
+        operational_registry = _make_operational_registry_yaml(
+            tmp_path,
+            title_subs=["prune_recon_cycle_summaries"],
+            desc_subs=["--apply"],
+        )
+        config = FusedMemoryConfig()
+        config.curator = CuratorConfig(
+            cancelled_premise_blocklist_path=str(blocklist),
+            operational_ask_registry_path=str(operational_registry),
+        )
+        curator = TaskCurator(config=config, taskmaster=None, cwd=tmp_path)
+
+        candidate = CandidateTask(
+            title="Run prune_recon_cycle_summaries --apply against live Mem0",
+            description="Operational --apply run to collapse pre-existing piles.",
+        )
+
+        with patch.object(curator, "_build_corpus", new=AsyncMock(side_effect=AssertionError("_build_corpus must not be called"))), \
+             patch.object(curator, "_call_llm", new=AsyncMock(side_effect=AssertionError("_call_llm must not be called"))):
+            decision = await curator.curate(candidate, project_id="p", project_root="/x")
+
+        assert decision.action == "drop"
+        assert decision.justification.startswith("cancelled-premise-blocklist:")
+
+    async def test_exact_match_dedup_takes_precedence_over_route(self, tmp_path):
+        """(4) An operational candidate that duplicates a just-created task
+        (seeded via note_created) is dropped by the pre-LLM exact-match check
+        — NO second gate is routed for a re-filed duplicate."""
+        registry = _make_operational_registry_yaml(
+            tmp_path,
+            title_subs=["prune_recon_cycle_summaries"],
+            desc_subs=["--apply"],
+        )
+        config = _make_config_with_operational_registry(str(registry))
+        curator = TaskCurator(config=config, taskmaster=None, cwd=tmp_path)
+
+        candidate = CandidateTask(
+            title="Run prune_recon_cycle_summaries --apply against live Mem0",
+            description="Operational --apply run to collapse pre-existing piles.",
+        )
+        curator.note_created("p", candidate, "existing-gate-task-id")
+
+        with patch.object(curator, "_build_corpus", new=AsyncMock(side_effect=AssertionError("_build_corpus must not be called"))), \
+             patch.object(curator, "_call_llm", new=AsyncMock(side_effect=AssertionError("_call_llm must not be called"))):
+            decision = await curator.curate(candidate, project_id="p", project_root="/x")
+
+        assert decision.action == "drop"
+        assert decision.justification == "pre-llm-exact-match"
+        assert decision.target_id == "existing-gate-task-id"
+
+    async def test_missing_registry_degrades_to_normal_path(self, tmp_path):
+        """(5) A missing registry file degrades to the normal path: no route,
+        no crash."""
+        nonexistent = tmp_path / "does_not_exist.yaml"
+        config = _make_config_with_operational_registry(str(nonexistent))
+        curator = TaskCurator(config=config, taskmaster=None, cwd=tmp_path)
+
+        candidate = CandidateTask(
+            title="Run prune_recon_cycle_summaries --apply against live Mem0",
+            description="Operational --apply run to collapse pre-existing piles.",
+        )
+
+        fake_exact_match, fake_corpus, create_result = _make_create_mocks()
+
+        with patch.object(curator, "_pre_llm_exact_match", side_effect=fake_exact_match), \
+             patch.object(curator, "_build_corpus", side_effect=fake_corpus), \
+             patch("fused_memory.middleware.task_curator.invoke_with_cap_retry",
+                   new=AsyncMock(return_value=create_result)):
+            decision = await curator.curate(candidate, project_id="p", project_root="/x")
+
+        assert decision.action == "create"
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# task-2085 step-11 RED: TestCuratorBatchRouteDeterministic
+# ──────────────────────────────────────────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+class TestCuratorBatchRouteDeterministic:
+    """Batch path: operational-ask registry matches are removed from LLM
+    dispatch set. Mirrors TestCuratorBatchBlocklistShortCircuit /
+    TestCuratorBatchPremiseRefutedDrop.
+    """
+
+    async def test_batch_route_match_excluded_from_llm(self, tmp_path):
+        """(a) candidates[0] matches the operational registry -> excluded from
+        the batch LLM and resolves to action=='route_deterministic';
+        candidates[1] is a registry-miss and goes through the (mocked) LLM."""
+        from fused_memory.middleware.task_curator import PreparedCandidate
+
+        registry = _make_operational_registry_yaml(
+            tmp_path,
+            title_subs=["prune_recon_cycle_summaries"],
+            desc_subs=["--apply"],
+        )
+        config = _make_config_with_operational_registry(str(registry))
+        curator = TaskCurator(config=config, taskmaster=None, cwd=tmp_path)
+
+        c0 = CandidateTask(
+            title="Run prune_recon_cycle_summaries --apply against live Mem0",
+            description="Operational --apply run to collapse pre-existing piles.",
+        )
+        c1 = CandidateTask(title="Improve worker logging", description="Normal task")
+
+        empty_sizes = {"anchor": 0, "module": 0, "embedding": 0, "dependency": 0}
+        prepared = [
+            PreparedCandidate(candidate=c0, pool=[], pool_sizes=empty_sizes, prompt_tokens=10),
+            PreparedCandidate(candidate=c1, pool=[], pool_sizes=empty_sizes, prompt_tokens=10),
+        ]
+
+        llm_candidates_received: list[CandidateTask] = []
+
+        async def fake_llm_batch(cands, pools, ps_list, start, proj_id, proj_root):
+            # Mirrors the real batch LLM: one decision per candidate it
+            # actually receives. Its output schema has no 'route_deterministic'
+            # action, so anything reaching it can only ever come back 'create'.
+            llm_candidates_received.extend(cands)
+            return [
+                CuratorDecision(action="create", justification=f"new-{i}",
+                                pool_sizes=empty_sizes, latency_ms=0)
+                for i in range(len(cands))
+            ]
+
+        with patch.object(
+            curator, "_call_llm_batch_with_fallback", side_effect=fake_llm_batch
+        ):
+            decisions = await curator.curate_batch_prepared(
+                prepared, project_id="p", project_root="/x"
+            )
+
+        # (d) two decisions, one per prepared candidate
+        assert len(decisions) == 2
+
+        # LLM was called with only candidates[1], not [0] — proves candidates[0]
+        # never reached the batch LLM at all (not just that its result was
+        # discarded).
+        assert llm_candidates_received == [c1]
+
+        # (a) decisions[0] is a route decision — NOT a batch_target_index drop,
+        # and NOT the 'create' the (mocked) LLM would have returned had it
+        # been sent candidates[0].
+        assert decisions[0].action == "route_deterministic"
+        assert decisions[0].justification.startswith("operational-ask-registry:")
+        assert decisions[0].batch_target_index is None
+
+        assert decisions[1].action == "create"
+        assert decisions[1].justification == "new-0"
+
+    async def test_batch_blocklist_precedence_over_route(self, tmp_path):
+        """(b) Within a batch, a candidate matching BOTH the blocklist and the
+        operational registry resolves to the blocklist drop, not route."""
+        from fused_memory.middleware.task_curator import PreparedCandidate
+
+        blocklist = _make_blocklist_yaml(
+            tmp_path,
+            title_subs=["prune_recon_cycle_summaries"],
+            desc_subs=["--apply"],
+            name="cancelled_dup_of_operational_ask",
+        )
+        operational_registry = _make_operational_registry_yaml(
+            tmp_path,
+            title_subs=["prune_recon_cycle_summaries"],
+            desc_subs=["--apply"],
+        )
+        config = FusedMemoryConfig()
+        config.curator = CuratorConfig(
+            cancelled_premise_blocklist_path=str(blocklist),
+            operational_ask_registry_path=str(operational_registry),
+        )
+        curator = TaskCurator(config=config, taskmaster=None, cwd=tmp_path)
+
+        c0 = CandidateTask(
+            title="Run prune_recon_cycle_summaries --apply against live Mem0",
+            description="Operational --apply run to collapse pre-existing piles.",
+        )
+        c1 = CandidateTask(title="Improve worker logging", description="Normal task")
+
+        empty_sizes = {"anchor": 0, "module": 0, "embedding": 0, "dependency": 0}
+        prepared = [
+            PreparedCandidate(candidate=c0, pool=[], pool_sizes=empty_sizes, prompt_tokens=10),
+            PreparedCandidate(candidate=c1, pool=[], pool_sizes=empty_sizes, prompt_tokens=10),
+        ]
+
+        llm_decisions_returned = [
+            CuratorDecision(action="create", justification="new-1",
+                            pool_sizes=empty_sizes, latency_ms=0),
+        ]
+        llm_candidates_received: list[CandidateTask] = []
+
+        async def fake_llm_batch(cands, pools, ps_list, start, proj_id, proj_root):
+            llm_candidates_received.extend(cands)
+            return llm_decisions_returned
+
+        with patch.object(
+            curator, "_call_llm_batch_with_fallback", side_effect=fake_llm_batch
+        ):
+            decisions = await curator.curate_batch_prepared(
+                prepared, project_id="p", project_root="/x"
+            )
+
+        assert decisions[0].action == "drop"
+        assert decisions[0].justification.startswith("cancelled-premise-blocklist:")
+        assert len(llm_candidates_received) == 1
+        assert llm_candidates_received[0] is c1
+
+    async def test_batch_duplicate_operational_candidates_dedup_to_one_route(self, tmp_path):
+        """(c) Two identical operational candidates in the same batch: the
+        pre-batch payload-hash dedup means only the FIRST is evaluated (and
+        routed); the second gets a batch_target_index sibling-substitution
+        drop — no second gate is spawned."""
+        from fused_memory.middleware.task_curator import PreparedCandidate
+
+        registry = _make_operational_registry_yaml(
+            tmp_path,
+            title_subs=["prune_recon_cycle_summaries"],
+            desc_subs=["--apply"],
+        )
+        config = _make_config_with_operational_registry(str(registry))
+        curator = TaskCurator(config=config, taskmaster=None, cwd=tmp_path)
+
+        c0 = CandidateTask(
+            title="Run prune_recon_cycle_summaries --apply against live Mem0",
+            description="Operational --apply run to collapse pre-existing piles.",
+        )
+        c1 = CandidateTask(
+            title="Run prune_recon_cycle_summaries --apply against live Mem0",
+            description="Operational --apply run to collapse pre-existing piles.",
+        )
+        assert c0.payload_hash() == c1.payload_hash()
+
+        empty_sizes = {"anchor": 0, "module": 0, "embedding": 0, "dependency": 0}
+        prepared = [
+            PreparedCandidate(candidate=c0, pool=[], pool_sizes=empty_sizes, prompt_tokens=10),
+            PreparedCandidate(candidate=c1, pool=[], pool_sizes=empty_sizes, prompt_tokens=10),
+        ]
+
+        llm_candidates_received: list[CandidateTask] = []
+
+        async def fake_llm_batch(cands, pools, ps_list, start, proj_id, proj_root):
+            # Mirrors the real batch LLM: one decision per candidate it
+            # actually receives. If c0 reaches it, it can only come back
+            # 'create' — its output schema has no 'route_deterministic'.
+            llm_candidates_received.extend(cands)
+            return [
+                CuratorDecision(action="create", justification=f"new-{i}",
+                                pool_sizes=empty_sizes, latency_ms=0)
+                for i in range(len(cands))
+            ]
+
+        with patch.object(
+            curator, "_call_llm_batch_with_fallback", side_effect=fake_llm_batch
+        ):
+            decisions = await curator.curate_batch_prepared(
+                prepared, project_id="p", project_root="/x"
+            )
+
+        # (d) two decisions, one per prepared candidate
+        assert len(decisions) == 2
+        # The batch LLM must never be reached at all — the sole surviving
+        # unique candidate (c0; c1 is its pre-batch-dedup sibling) is routed
+        # before dispatch, not sent to the LLM and then discarded.
+        assert llm_candidates_received == []
+        # (c) exactly one route decision + one dedup drop; no second gate.
+        assert decisions[0].action == "route_deterministic"
+        assert decisions[1].action == "drop"
+        assert decisions[1].batch_target_index == 0
+        assert decisions[1].justification == "pre-batch-dedup: identical payload_hash"
 
