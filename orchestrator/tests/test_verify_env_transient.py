@@ -740,3 +740,48 @@ class TestRunVerificationXdistWorkerCrashRetry:
             result = await verify.run_verification(tmp_path, config, is_merge_verify=True)
 
         assert result.passed is False
+
+    @pytest.mark.asyncio
+    async def test_crash_with_concurrent_lint_failure_does_not_raise(self, tmp_path: Path):
+        """Co-occurrence guard: a bare worker crash on the test leg must not
+        divert a genuine, simultaneous lint failure onto the infra-retry path.
+
+        _is_bare_xdist_worker_crash only inspects test_out, so a real lint
+        regression happening at the same time as the crash would otherwise be
+        silently discarded by the raise (routing to infra_hold/retry instead
+        of being surfaced). The gate additionally requires lint_rc == 0 and
+        type_rc == 0 so it only fires when the crashed test leg is the ONLY
+        non-zero check.
+        """
+        config = self._make_config(tmp_path)
+
+        async def fake_cmd(cmd, cwd, timeout, env=None, log_path=None, **kwargs):
+            if 'pytest' in cmd:
+                return 1, _XDIST_WORKER_CRASH_OUTPUT, False
+            if 'lint' in cmd:
+                return 1, 'file.py:10:1: E501 line too long\n', False
+            return 0, '', False
+
+        with patch('orchestrator.verify._run_cmd', side_effect=fake_cmd):
+            result = await verify.run_verification(tmp_path, config)
+
+        assert result.passed is False
+        assert 'lint issues' in result.summary
+
+    @pytest.mark.asyncio
+    async def test_crash_with_concurrent_type_failure_does_not_raise(self, tmp_path: Path):
+        """Same co-occurrence guard as above, for the type-check leg."""
+        config = self._make_config(tmp_path)
+
+        async def fake_cmd(cmd, cwd, timeout, env=None, log_path=None, **kwargs):
+            if 'pytest' in cmd:
+                return 1, _XDIST_WORKER_CRASH_OUTPUT, False
+            if 'type' in cmd:
+                return 1, 'file.py:3: error: Incompatible return value type\n', False
+            return 0, '', False
+
+        with patch('orchestrator.verify._run_cmd', side_effect=fake_cmd):
+            result = await verify.run_verification(tmp_path, config)
+
+        assert result.passed is False
+        assert 'type errors' in result.summary
