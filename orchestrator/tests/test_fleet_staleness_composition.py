@@ -110,6 +110,11 @@ def harness(tmp_path: Path, mock_orch_config):
     mock_orch_config.orchestrator_restart_watch_prefixes = ['orchestrator/src/']
     mock_orch_config.orchestrator_restart_script = 'scripts/restart-orchestrator.sh'
     mock_orch_config.orchestrator_restart_on_active_secs = 10
+    # task 2371 added a min-interval rate-cap gate (`_min_interval_secs > 0`) in
+    # maybe_restart; the builder reads this field, so it must be a real number
+    # (not a MagicMock) or the comparison raises TypeError. 0.0 disables the cap
+    # so these fleet-composition fire tests aren't gated by it.
+    mock_orch_config.orchestrator_restart_min_interval_secs = 0.0
 
     with patch('orchestrator.harness.McpLifecycle'), \
          patch('orchestrator.harness.Scheduler'), \
