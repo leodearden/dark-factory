@@ -3494,6 +3494,11 @@ class Scheduler:
             return set()
         gated: set[str] = set()
         for t in candidates:
+            if self.is_deterministic(t):
+                # Deterministic tasks bypass the LLM pipeline entirely — no
+                # worktree, no task branch, no declared diff — so there is
+                # nothing for the ancestry/content check to resolve against.
+                continue
             tid = str(t.get('id', ''))
             try:
                 gated_now = await self._already_landed_gate(tid)
