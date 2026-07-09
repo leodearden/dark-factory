@@ -17,6 +17,7 @@ from orchestrator.git_ops import (
     ScrubOutcome,
     ScrubResult,
     TrainStackResult,
+    WorktreeConflictError,
     WorktreeInfo,
     WorktreeMissing,
     _merge_subject,
@@ -714,6 +715,44 @@ class TestWorktreeLifecycle:
         worktree_info = await git_ops.create_worktree('feature-3')
         sha = await git_ops.commit(worktree_info.path, 'Nothing')
         assert sha is None
+
+    async def test_commit_refuses_unresolved_conflict(self, git_ops: GitOps):
+        """commit() must not snapshot a worktree with unresolved (UU) conflicts.
+
+        Guards the esc-2128-8 incident: a WIP-save commit blindly ran
+        `git add -A` + committed conflict markers left behind by an
+        unresolved stash-pop.  It must instead raise WorktreeConflictError
+        BEFORE staging and leave HEAD untouched — no 'chore: save WIP'
+        commit of the markers.
+        """
+        worktree_info = await git_ops.create_worktree('conflict-guard')
+        wt = worktree_info.path
+        _, sha_before, _ = await _run(['git', 'rev-parse', 'HEAD'], cwd=wt)
+        sha_before = sha_before.strip()
+
+        conflicted_path = 'foo.py'
+        await _inject_uu_state(wt, conflicted_path)
+        # Marker tokens built via runtime concat — see step-5/6 design note —
+        # so this test file itself carries no literal column-0 markers.
+        open_marker = '<' * 7
+        mid_marker = '=' * 7
+        close_marker = '>' * 7
+        (wt / conflicted_path).write_text(
+            f'{open_marker} HEAD\nours\n{mid_marker}\ntheirs\n{close_marker} branch\n',
+        )
+
+        with pytest.raises(WorktreeConflictError) as excinfo:
+            await git_ops.commit(
+                wt, 'chore: save WIP before inter-iteration rebase',
+            )
+
+        assert conflicted_path in str(excinfo.value)
+
+        _, sha_after, _ = await _run(['git', 'rev-parse', 'HEAD'], cwd=wt)
+        assert sha_after.strip() == sha_before, (
+            'commit() must not create a commit when the worktree has '
+            'unresolved conflicts'
+        )
 
     async def test_diff_from_main(self, git_ops: GitOps):
         worktree_info = await git_ops.create_worktree('feature-4')
