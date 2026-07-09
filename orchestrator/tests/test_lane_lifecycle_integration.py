@@ -344,8 +344,13 @@ class TestB2CrashQuarantine:
         ), f'expected a quarantine warning naming task 42; got: {caplog.text!r}'
 
         # Next dispatch is clean: a different task can still acquire a lane.
-        result = await pool.acquire_for('task/99')
-        assert result is not None
+        # Unpack the tuple rather than a bare `is not None` smoke check —
+        # `acquire_for` always returns a (Path, bool) tuple when it succeeds,
+        # so `is not None` would pass even for a stale/reused lane; assert
+        # directly on a fresh (non-reused) FREE-lane acquisition instead.
+        lane_path, reused = await pool.acquire_for('task/99')
+        assert lane_path is not None
+        assert not reused
 
     async def test_identity_mismatch_quarantines_never_repins(
         self, ig_git_repo: Path, caplog,
@@ -419,8 +424,13 @@ class TestB2CrashQuarantine:
         ), f'expected an identity-mismatch warning naming task 42; got: {caplog.text!r}'
 
         # Next dispatch is clean: a different task can still acquire a lane.
-        result = await pool.acquire_for('task/99')
-        assert result is not None
+        # Unpack the tuple rather than a bare `is not None` smoke check —
+        # `acquire_for` always returns a (Path, bool) tuple when it succeeds,
+        # so `is not None` would pass even for a stale/reused lane; assert
+        # directly on a fresh (non-reused) FREE-lane acquisition instead.
+        lane_path, reused = await pool.acquire_for('task/99')
+        assert lane_path is not None
+        assert not reused
 
 
 # ── B3 — illegal transition escalates (real EscalationQueue) ───────────
