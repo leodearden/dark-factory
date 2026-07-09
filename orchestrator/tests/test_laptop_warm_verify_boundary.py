@@ -803,3 +803,86 @@ def test_ssh_dropped_mid_build_tree_killed_via_eof_dispatcher_alive(tmp_path):
         if child.poll() is None:
             child.kill()
             child.wait(timeout=5)
+
+
+# ---------------------------------------------------------------------------
+# Task 2309 step-11/12 -- SS9 Row 3: heartbeat starved / simulated hard
+# partition (heartbeat-TIMEOUT path).  Distinct from Rows 1/2 (both EOF-
+# triggered): stdin stays OPEN throughout, only heartbeats stop, exercising
+# run_stdin_watchdog's select-timeout branch (empty ready set) rather than
+# its EOF branch (readable, read() == b'').
+# ---------------------------------------------------------------------------
+
+
+def test_heartbeat_starved_hard_partition_tree_killed_via_timeout(tmp_path):
+    """SS9 Row 3: heartbeat starved, stdin stays OPEN -> select-timeout tree-kill.
+
+    Spawns a real ``verify-merge --request-id`` with a live
+    :class:`HeartbeatWriter`, waits for the sleeper subtree to appear, then
+    calls ``heartbeat.stop_heartbeats()`` -- which stops writing WITHOUT
+    closing stdin (contrast :func:`HeartbeatWriter.close_stdin`, Row 2) --
+    modeling a hard network partition where the channel is never cleanly
+    closed.  ``run_stdin_watchdog``'s ``select()`` call times out (empty
+    ready set) rather than seeing EOF, taking the branch that calls
+    ``on_fire`` directly without ever attempting a read.
+
+    Uses the step-2 env seam directly on the spawned verify-merge for a
+    fast, deterministic assertion window bounded by
+    ``~(heartbeat_timeout + grace_secs)``.
+
+    Asserts the leader self-exits non-zero and, after reaping it (same
+    zombie-avoidance ordering as Row 2 -- ``child`` is again a direct child
+    of this test process), that the full subtree and pgid leader are gone.
+    """
+    repo, head_sha = _setup_verify_repo(tmp_path)
+    cfg_file = tmp_path / 'config.yaml'
+    write_verify_config(cfg_file, repo, persistent_merge_worktree=False)
+    worktree_base = worktree_base_for(repo)
+
+    REQUEST_ID = 'row3-heartbeat-starved'
+    pgf = pgid_file(worktree_base, REQUEST_ID)
+
+    child = spawn_verify_merge(
+        sha=head_sha,
+        spec=sleeper_spec(300.0),
+        cfg_file=cfg_file,
+        request_id=REQUEST_ID,
+        extra_env={
+            'ORCH_WATCHDOG_HEARTBEAT_TIMEOUT_SECS': '1.0',
+            'ORCH_WATCHDOG_KILL_GRACE_SECS': '0.5',
+        },
+    )
+    heartbeat = HeartbeatWriter(child, interval=0.2).start()
+    try:
+        pgid_val = wait_for_pgid_file(pgf)
+        wait_subtree_live(pgid_val)
+
+        heartbeat.stop_heartbeats()
+        assert child.stdin is not None and not child.stdin.closed, (
+            'harness bug: stdin must stay OPEN for Row 3 (hard partition) -- '
+            'only heartbeats stop; this is what distinguishes it from Row 2'
+        )
+
+        try:
+            child.wait(timeout=10)
+        except subprocess.TimeoutExpired:
+            pytest.fail(
+                'verify-merge did not self-exit within 10s of heartbeat '
+                'starvation (select-timeout branch did not fire)'
+            )
+        assert child.returncode != 0, (
+            f'expected non-zero exit (watchdog self-kill), got {child.returncode}'
+        )
+
+        assert wait_subtree_gone(pgid_val, timeout=10.0), (
+            f'pgid {pgid_val}: subtree and/or leader still alive after '
+            f'heartbeat starvation -- watchdog tree-kill did not fire'
+        )
+    finally:
+        heartbeat.stop_heartbeats()
+        if child.poll() is None:
+            child.kill()
+            child.wait(timeout=5)
+        if child.stdin is not None:
+            with contextlib.suppress(OSError):
+                child.stdin.close()
