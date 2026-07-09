@@ -13,6 +13,7 @@ from typing import Any, NamedTuple, TypedDict, cast
 from urllib.parse import urlparse
 
 from graphiti_core import Graphiti
+from graphiti_core.cross_encoder.openai_reranker_client import OpenAIRerankerClient
 from graphiti_core.driver.driver import GraphDriver
 from graphiti_core.driver.falkordb_driver import FalkorDriver
 from graphiti_core.edges import EntityEdge
@@ -24,7 +25,7 @@ from graphiti_core.llm_client import OpenAIClient
 from graphiti_core.llm_client.config import LLMConfig as GraphitiLLMConfig
 from graphiti_core.nodes import EpisodeType, EpisodicNode
 
-from fused_memory.config.schema import FusedMemoryConfig
+from fused_memory.config.schema import FusedMemoryConfig, OpenAIProviderConfig
 from fused_memory.utils.async_utils import gather_or_raise
 
 logger = logging.getLogger(__name__)
@@ -232,6 +233,10 @@ class GraphitiBackend:
         self._indexed_graphs: set[str] = set()
         self._cloned_drivers: dict[str, GraphDriver] = {}
         self._identity_locks: dict[str, asyncio.Lock] = {}
+        self._llm_client = None
+        self._embedder = None
+        self._cross_encoder = None
+        self._group_clients: dict[str, Graphiti] = {}
 
     # --- Per-request driver routing ---
 
@@ -247,6 +252,59 @@ class GraphitiBackend:
         cloned = driver.clone(database=group_id)
         self._cloned_drivers[group_id] = cloned
         return cloned
+
+    def _client_for(self, group_id: str) -> Graphiti:
+        """Return a cached Graphiti client dedicated to *group_id*.
+
+        Each client is built with ``graph_driver=self._driver_for(group_id)``,
+        whose ``_database`` already equals *group_id*. Upstream
+        ``Graphiti.add_episode`` only mutates ``self.driver``/``self.clients.driver``
+        when ``group_id != self.driver._database`` (graphiti_core 0.28.2,
+        graphiti.py:889-890) — since that condition is never true for a
+        per-group client, the shared-driver mutation race that misroutes
+        concurrent cross-group writes is structurally unreachable here.
+        The llm_client/embedder/cross_encoder sub-clients are shared (hoisted
+        in ``initialize()``) across every per-group client and the base
+        ``self.client``.
+
+        ``_group_clients`` is unbounded and never evicted, mirroring
+        ``_cloned_drivers``/``_identity_locks`` above — safe because
+        *group_id* is always a project_id, so cardinality is bounded by the
+        (small, fixed) number of projects, not by request volume. If
+        *group_id* ever becomes an ephemeral/per-session value, this cache
+        would need a size bound or LRU eviction.
+
+        Each per-group client is constructed with its own
+        ``max_coroutines=self.config.queue.graphiti_max_coroutines``. This
+        does NOT raise the aggregate OpenAI concurrency ceiling versus the
+        prior single-shared-client design: graphiti_core's
+        ``semaphore_gather`` (graphiti_core/helpers.py) builds a brand-new
+        ``asyncio.Semaphore(max_coroutines)`` on every invocation rather than
+        reusing one stored on the client, so ``max_coroutines`` was always a
+        per-call fan-out bound (scoped to a single ``add_episode``/etc.
+        invocation's internal LLM/embedding sub-tasks), never a budget
+        shared across concurrent top-level calls — even under the old
+        shared-client design, two concurrent ``add_episode`` calls already
+        raced with two independent semaphores, not one. The real
+        cross-group aggregate ceiling is, and remains, governed one level up
+        by ``DurableWriteQueue``'s ``semaphore_limit`` (bounding how many
+        top-level ``add_episode`` calls run concurrently) multiplied by
+        ``graphiti_max_coroutines`` (each call's own internal fan-out) — by
+        default 3 × 5 = 15 concurrent OpenAI calls at most, unchanged by
+        this per-group cache.
+        """
+        cached = self._group_clients.get(group_id)
+        if cached is not None:
+            return cached
+        client = Graphiti(
+            graph_driver=self._driver_for(group_id),
+            llm_client=self._llm_client,
+            embedder=self._embedder,
+            cross_encoder=self._cross_encoder,
+            max_coroutines=self.config.queue.graphiti_max_coroutines,
+        )
+        self._group_clients[group_id] = client
+        return client
 
     def _graph_for(self, group_id: str) -> Any:
         """Return the FalkorGraph object for *group_id* (for direct Cypher)."""
@@ -368,10 +426,41 @@ class GraphitiBackend:
             password=falkor_cfg.password,
         )
 
+        self._llm_client = llm_client
+        self._embedder = embedder_client
+
+        # --- Cross-encoder (reranker) ---
+        # Shared across the base client and every per-group client (see
+        # _client_for). Mirror the llm_client/embedder_client guard so a
+        # configured api_key/base_url (e.g. a proxy endpoint) is honored
+        # instead of silently falling back to env-based defaults. The
+        # reranker always talks to the OpenAI API regardless of
+        # cfg.llm.provider, so it sources credentials from whichever
+        # provider block actually configures OpenAI: cfg.llm.providers.openai
+        # is preferred (the common case — cfg.llm.provider defaults to
+        # 'openai'), falling back to cfg.embedder.providers.openai (always
+        # OpenAI — EmbedderConfig.provider has no other option) when the llm
+        # block has no OpenAI api_key, e.g. cfg.llm.provider='anthropic' with
+        # OpenAI only configured for embeddings/reranking.
+        reranker_provider: OpenAIProviderConfig | None = None
+        if cfg.llm.providers.openai and cfg.llm.providers.openai.api_key:
+            reranker_provider = cfg.llm.providers.openai
+        elif cfg.embedder.providers.openai and cfg.embedder.providers.openai.api_key:
+            reranker_provider = cfg.embedder.providers.openai
+
+        reranker_config: GraphitiLLMConfig | None = None
+        if reranker_provider:
+            reranker_config = GraphitiLLMConfig(
+                api_key=reranker_provider.api_key,
+                base_url=reranker_provider.api_url,
+            )
+        self._cross_encoder = OpenAIRerankerClient(config=reranker_config)
+
         self.client = Graphiti(
             graph_driver=self._driver,
-            llm_client=llm_client,
-            embedder=embedder_client,
+            llm_client=self._llm_client,
+            embedder=self._embedder,
+            cross_encoder=self._cross_encoder,
             max_coroutines=cfg.queue.graphiti_max_coroutines,
         )
 
@@ -404,7 +493,7 @@ class GraphitiBackend:
         temporal_context: str | None = None,
     ) -> Any:
         """Add an episode to Graphiti and return the result."""
-        client = self._require_client()
+        client = self._client_for(group_id)
         ref_time = reference_time or datetime.now(UTC)
         if temporal_context is not None:
             source_description = f'[temporal:{temporal_context}] {source_description}'
@@ -643,12 +732,33 @@ class GraphitiBackend:
         }
 
     async def build_communities(self, group_ids: list[str] | None = None) -> None:
-        """Build community summaries."""
+        """Build community summaries.
+
+        FalkorDB's multi-tenant model gives each group_id its own physical
+        graph, reachable only through that group's own driver
+        (``_driver_for``) — a single upstream call can target just one
+        driver/graph. Forwarding the full *group_ids* list through against
+        only the first group's driver would silently scope (or entirely
+        skip) communities for the remaining groups, so when more than one
+        group_id is requested each is built via its own call against its
+        own driver. ``group_ids=None``/empty preserves the pre-existing
+        whole-graph fallback (no driver override — upstream falls back to
+        the shared client's current driver).
+        """
         client = self._require_client()
-        await asyncio.wait_for(
-            client.build_communities(group_ids=group_ids),
-            timeout=self._write_timeout,
-        )
+        if not group_ids:
+            await asyncio.wait_for(
+                client.build_communities(group_ids=group_ids, driver=None),
+                timeout=self._write_timeout,
+            )
+            return
+        for group_id in group_ids:
+            await asyncio.wait_for(
+                client.build_communities(
+                    group_ids=[group_id], driver=self._driver_for(group_id)
+                ),
+                timeout=self._write_timeout,
+            )
 
     async def query_stale_node_embeddings(
         self, expected_dim: int, *, group_id: str
@@ -2156,3 +2266,11 @@ class GraphitiBackend:
                 await self._driver.close()
         self.client = None
         self._driver = None
+        # Per-group clients each hold a driver that aliases an entry already
+        # closed above via the _cloned_drivers loop (or self._driver itself) —
+        # drop the references only; do NOT call .close() per-client, which
+        # would double-close the single shared FalkorDB connection.
+        self._group_clients.clear()
+        self._llm_client = None
+        self._embedder = None
+        self._cross_encoder = None
