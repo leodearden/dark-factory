@@ -458,6 +458,74 @@ class LaneLifecycle:
         self.transition(lane, LaneState.QUARANTINED)
         return dest
 
+    def note_assigned(
+        self,
+        lane: Path | str,
+        *,
+        task_id: str,
+        title: str | None = None,
+        branch: str | None = None,
+    ) -> LaneRecord:
+        """Idempotently bring *lane*'s durable record to ``ASSIGNED:task_id``.
+
+        The reader-side / cache-mirror analog of
+        :meth:`GitOps._note_assigned_via_route`: keeps the durable record
+        coherent when ``WarmLanePool.restore_assignment``/``note_assignment``
+        update the in-memory cache (crash recovery, lane-checkout
+        reconciliation), without hitting the illegal ``ASSIGNED -> ASSIGNED``
+        edge when the lane is already correctly pinned.
+
+        * Already ``ASSIGNED``/``IN_USE`` for the SAME ``task_id``: no-op —
+          returns the existing record UNCHANGED, with no write at all
+          (idempotent).
+        * Already ``ASSIGNED``/``IN_USE`` for a DIFFERENT ``task_id`` (or any
+          other state with no legal edge to ``ASSIGNED``, e.g.
+          ``QUARANTINED``): never steals, never mutates — the final
+          ``transition()`` call below raises ``IllegalLaneTransition``
+          (propagated to the caller, NOT swallowed — unlike the best-effort
+          ``GitOps`` writer methods this mirrors) and the durable record is
+          left untouched.
+        * Otherwise walks the legal seed-up ladder (mirrors
+          ``GitOps._note_assigned_via_route``): ``None -> SEED ->
+          REGISTERED(branch=branch) -> ASSIGNED``; ``SEED -> REGISTERED ->
+          ASSIGNED``; ``REGISTERED``/``RELEASED -> ASSIGNED`` directly.
+
+        ``title``/``branch`` are *carry-forward*, not clobber-on-omit: a
+        caller that does not supply them (e.g. the pool routing, which often
+        only has a bare task id on hand and no real branch string) leaves
+        whatever value is already on the durable record untouched rather
+        than overwriting it with ``None``. Only an explicitly-supplied
+        (non-``None``) value overwrites the carried-forward field.
+        """
+        task_id = str(task_id)
+        rec = self.read(lane)
+        state = rec.state if rec is not None else None
+
+        if (
+            rec is not None
+            and state in (LaneState.ASSIGNED, LaneState.IN_USE)
+            and rec.task_id == task_id
+        ):
+            return rec  # idempotent no-op; no I/O
+
+        registered_fields = {'branch': branch} if branch is not None else {}
+        if state is None:
+            self.transition(lane, LaneState.SEED)
+            self.transition(lane, LaneState.REGISTERED, **registered_fields)
+        elif state is LaneState.SEED:
+            self.transition(lane, LaneState.REGISTERED, **registered_fields)
+        # REGISTERED/RELEASED (and any other, e.g. QUARANTINED or a
+        # different-task ASSIGNED/IN_USE conflict) fall straight through to
+        # the terminal edge below — transition() itself is the single
+        # legality gate, so a conflicting/illegal origin raises there.
+
+        assigned_fields: dict[str, object] = {'task_id': task_id}
+        if title is not None:
+            assigned_fields['title'] = title
+        if branch is not None:
+            assigned_fields['branch'] = branch
+        return self.transition(lane, LaneState.ASSIGNED, **assigned_fields)
+
     def pool_storage_present(self) -> bool:
         """True iff worktree_base is backed by live pool storage (task 2099).
 
