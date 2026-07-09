@@ -2013,19 +2013,32 @@ class MemoryService:
         # bypassed add_memory.
         _apply_cycle_summary_metadata_tagging(meta, causation_id, project_id=project_id)
 
-        mem0_result = await self._journaled_backend_call(
-            write_op_id=write_op_id,
-            causation_id=causation_id,
-            backend='mem0',
-            operation='add',
-            payload={'content': content[:200]},
-            coro=self.mem0.add_system_record(content=content, scope=scope, metadata=meta),
-        )
-        mem0_ids = [
-            r['id']
-            for r in (mem0_result or {}).get('results', [])
-            if isinstance(r, dict) and 'id' in r
-        ]
+        mem0_result = None
+        mem0_ids: list[str] = []
+        _mem0_error: str | None = None
+        try:
+            mem0_result = await self._journaled_backend_call(
+                write_op_id=write_op_id,
+                causation_id=causation_id,
+                backend='mem0',
+                operation='add',
+                payload={'content': content[:200]},
+                coro=self.mem0.add_system_record(content=content, scope=scope, metadata=meta),
+            )
+            mem0_ids = [
+                r['id']
+                for r in (mem0_result or {}).get('results', [])
+                if isinstance(r, dict) and 'id' in r
+            ]
+        except Exception as e:
+            # Mirrors add_memory's try/except around its Mem0 branch (task
+            # 2222 amendment): without this, a raised exception would skip
+            # BOTH the Layer-1 write-journal entry and the memory_added
+            # event below, and propagate a bare error to the tool boundary
+            # with no audit trail — exactly what this guaranteed-persistence
+            # system-write path exists to rule out.
+            logger.error(f'Mem0 system-record write failed: {e}')
+            _mem0_error = str(e)
 
         # Mem0Backend.add_system_record pins infer=False LOCALLY and
         # unconditionally (never inherited from the general add() pin — see
@@ -2036,7 +2049,7 @@ class MemoryService:
         # guaranteed-persistence system-write path exists to rule out, so it
         # must not be journaled as an unconditional success.
         _empty_result = not mem0_ids
-        if _empty_result:
+        if _empty_result and not _mem0_error:
             logger.warning(
                 'MemoryService.add_system_record: mem0 add_system_record '
                 'returned zero memory_ids (silent empty-result drop on the '
@@ -2065,10 +2078,26 @@ class MemoryService:
                 },
                 success=not _empty_result,
                 error=(
-                    'empty_result: mem0 add_system_record returned zero memory_ids'
-                    if _empty_result else None
+                    _mem0_error if _mem0_error else
+                    ('empty_result: mem0 add_system_record returned zero memory_ids'
+                     if _empty_result else None)
                 ),
             )
+
+        # An empty result (whether from a caught exception above or a
+        # silent zero-id return) is tagged directly on the event payload —
+        # not just the Layer-1 journal — so a reconciliation consumer
+        # keying off memory_added alone can still distinguish a real write
+        # from a drop (task 2222 amendment).
+        _event_payload = {
+            'memory_ids': mem0_ids,
+            'category': resolved_category.value,
+            'content_preview': content[:200],
+        }
+        if _empty_result:
+            _event_payload['empty_result'] = True
+            if _mem0_error:
+                _event_payload['error'] = _mem0_error
 
         await self._emit_event(ReconciliationEvent(
             id=str(uuid_mod.uuid4()),
@@ -2076,19 +2105,19 @@ class MemoryService:
             source=EventSource.agent,
             project_id=project_id,
             timestamp=datetime.now(UTC),
-            payload={
-                'memory_ids': mem0_ids,
-                'category': resolved_category.value,
-                'content_preview': content[:200],
-            },
+            payload=_event_payload,
             agent_id=agent_id,
         ))
+
+        msg = f'Memory queued for {[SourceStore.mem0.value]}'
+        if _mem0_error:
+            msg += f' [mem0_error: {_mem0_error}]'
 
         return AddMemoryResponse(
             memory_ids=mem0_ids,
             stores_written=[SourceStore.mem0],
             category=resolved_category,
-            message=f'Memory queued for {[SourceStore.mem0.value]}',
+            message=msg,
         )
 
     # ------------------------------------------------------------------
