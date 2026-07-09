@@ -196,6 +196,7 @@ async def test_bt_a2_planning_mode_reintroduction_guard(real_stack):
     )
     assert second.get('combined') is True, second
     assert second.get('planning_mode') is True, second
+    assert second.get('status') == 'deferred', second
     assert second.get('task_id') == first['task_id'], (
         f'expected the collision to name survivor task_id={first["task_id"]!r}; got {second!r}'
     )
