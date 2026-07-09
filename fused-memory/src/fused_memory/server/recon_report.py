@@ -409,6 +409,13 @@ class ReconReportState:
         # reuses its existing cross-stage, run-quiescence-scoped lifetime
         # (task-2088), so inheritance works across stages and survives an
         # earlier stage's own entry being TTL-evicted, with no tick() change.
+        # Cost: this is an O(signatures-in-run) scan on every add_finding call
+        # that has a non-null task_id and a null flag_type — this sub-path is
+        # expected to be rare (an under-specified re-raise), so the scan is
+        # acceptable and not worth a 4th index today. If profiling ever shows
+        # bare-null re-raises are common on high-finding-count runs, add a
+        # per-run {task_id -> set(flag_type)} auxiliary index maintained
+        # alongside _run_sig_index for an O(1) lookup instead.
         if c_task_id is not None and c_flag_type is None:
             established = {
                 ft for (tid, ft) in self._run_sig_index.get(run_id, {}) if tid == c_task_id and ft is not None

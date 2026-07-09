@@ -2645,3 +2645,52 @@ class TestReconReportFlagTypeInheritance:
         assert 'finding_id' in second, f'second add_finding failed: {second}'
         assert second['finding_id'] != first['finding_id']
 
+    def test_null_flag_not_inherited_across_different_task_id(self):
+        """The inherit comprehension filters on ``tid == c_task_id``, so a
+        flag_type established on task A must never be inherited by a
+        bare-null re-raise filed for a DIFFERENT task B — cross-task bleed
+        would silently merge two unrelated findings onto one row.
+        """
+        state, _ = self._make_state()
+        state.start_report(run_id='r1', stage='memory_consolidator', project_id='dark_factory')
+
+        task_a = self._finding(state, task_id='5128', flag_type='blocked_task_pending_privileged_closure')
+        assert 'finding_id' in task_a, f'task A add_finding failed: {task_a}'
+
+        task_b = self._finding(
+            state,
+            task_id='9999',
+            flag_type=None,
+            description='a different task_id, bare null flag_type',
+        )
+        assert 'finding_id' in task_b, f'task B add_finding failed: {task_b}'
+        assert task_b['finding_id'] != task_a['finding_id']
+
+    def test_null_flag_not_inherited_across_different_run(self):
+        """The inherit lookup scans ``_run_sig_index.get(run_id, {})``, so a
+        flag_type established for a task_id in run r1 must never be
+        inherited by a bare-null re-raise for the SAME task_id filed under a
+        DIFFERENT run_id r2 — in-run dedup (and its inheritance extension)
+        must stay scoped per run_id.
+        """
+        state, _ = self._make_state()
+        state.start_report(run_id='r1', stage='memory_consolidator', project_id='dark_factory')
+        r1_finding = self._finding(
+            state,
+            run_id='r1',
+            task_id='5128',
+            flag_type='blocked_task_pending_privileged_closure',
+        )
+        assert 'finding_id' in r1_finding, f'r1 add_finding failed: {r1_finding}'
+
+        state.start_report(run_id='r2', stage='memory_consolidator', project_id='dark_factory')
+        r2_finding = self._finding(
+            state,
+            run_id='r2',
+            task_id='5128',
+            flag_type=None,
+            description='same task_id, different run_id, bare null flag_type',
+        )
+        assert 'finding_id' in r2_finding, f'r2 add_finding failed: {r2_finding}'
+        assert r2_finding['finding_id'] != r1_finding['finding_id']
+
