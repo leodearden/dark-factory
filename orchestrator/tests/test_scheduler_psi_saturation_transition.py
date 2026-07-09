@@ -36,7 +36,7 @@ from unittest.mock import AsyncMock
 import pytest
 from shared.psi import PsiSample
 
-from orchestrator.config import OrchestratorConfig
+from orchestrator.config import OrchestratorConfig, PsiAdmissionConfig
 from orchestrator.event_store import EventStore
 from orchestrator.scheduler import Scheduler
 
@@ -310,4 +310,79 @@ class TestPsiSaturationTransition:
         assert driver.dispatched_ids() == {'H1', 'H2', 'H3', 'H4', 'D1'}
         assert driver.deferred_events() == deferred_during_saturation, (
             'no NEW dispatch_deferred events may occur after the recovery flip'
+        )
+
+    # -----------------------------------------------------------------------
+    # Scenario 2 — deadlock-freedom at the PEAK of sustained saturation
+    #
+    # RED (step-3): drains an in-flight heavy via ``_Driver.complete()``,
+    # which does not exist yet — AttributeError is the RED failure; step-4
+    # builds exactly the completion capability this test exercises.
+    # -----------------------------------------------------------------------
+
+    async def test_floor_holds_under_sustained_saturation(self, tmp_path) -> None:
+        """Scenario 2: deadlock-freedom at the PEAK of sustained saturation.
+
+        PSI is saturated for the ENTIRE scenario (never flipped back to
+        idle).  With min_inflight_floor=2, completing ONE of the 2 in-flight
+        heavies drops in-flight below the floor -- psi_hold=(saturated AND
+        in_flight>=floor) makes "hold with < floor in flight" unreachable by
+        construction, so a fresh heavy is re-admitted immediately even though
+        PSI itself never recovered.  Repeated twice to show it is not a
+        one-off.  6 heavies leaves 2 untouched in the backlog so the final
+        deterministic dispatch also coincides with a live heavy deferral.
+        """
+        event_store = EventStore(db_path=tmp_path / 'psi.db', run_id='da4-s2')
+        clock = _FakeClock()
+        config = OrchestratorConfig(
+            max_per_module=1,
+            psi_admission=PsiAdmissionConfig(min_inflight_floor=2),
+        )
+
+        tasks = [
+            _heavy_task(f'H{i}', priority='high', files=[f'src/h{i}.py'])
+            for i in range(1, 7)
+        ]
+        tasks.append(_det_task('D1', files=['src/d1.py']))
+
+        feed = _PsiFeed()
+        feed.set_saturated(cpu_some10=90.0)  # saturated from tick 1, never recovers
+        driver = _Driver.build(
+            config, tasks, event_store=event_store, time_source=clock, psi_feed=feed,
+        )
+
+        # Ramp-up: in_flight starts at 0 (< floor), so the anti-deadlock floor
+        # lets dispatch proceed normally even though PSI is already saturated.
+        await driver.run_ticks(2)
+        assert driver.heavy_in_flight() == 2, 'floor reached: 2 heavies in flight'
+
+        # --- First drain -> re-admit cycle ---
+        drained_1 = next(iter(driver._heavy_in_flight))
+        await driver.complete(drained_1)
+        assert driver.heavy_in_flight() == 1, (
+            'draining one heavy must drop in-flight below the floor'
+        )
+
+        await driver.tick()
+        assert driver.heavy_in_flight() == 2, (
+            'a fresh heavy must be RE-ADMITTED even though PSI never recovered -- '
+            'hold with < floor in flight is unreachable by construction'
+        )
+
+        # --- Second drain -> re-admit cycle (not a one-off) ---
+        drained_2 = next(iter(driver._heavy_in_flight))
+        await driver.complete(drained_2)
+        assert driver.heavy_in_flight() == 1
+
+        await driver.tick()
+        assert driver.heavy_in_flight() == 2, 'the re-admit behaviour repeats on a second drain'
+
+        # --- Deterministic dispatch is never blocked by sustained saturation ---
+        await driver.run_ticks(2)
+        assert 'D1' in driver.dispatched_ids(), (
+            'the deterministic task must dispatch at some point despite sustained saturation'
+        )
+        assert driver.heavy_in_flight() >= config.psi_admission.min_inflight_floor, (
+            'in-flight heavy must never be left below the floor while heavy work '
+            'and a free slot remain'
         )
