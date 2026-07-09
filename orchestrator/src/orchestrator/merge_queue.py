@@ -5607,6 +5607,14 @@ class SpeculativeMergeWorker(_WipHaltMixin):
         # internal-deque access `snapshot()` uses for its 'awaiting_verify'
         # section — and cross-validates each RealMergeItem's cap_permit
         # against merge_ahead_ledger.live by identity.
+        #
+        # This reintroduces an O(n) _verifier_queue scan that
+        # _inflight_cap_count()'s ledger-derived len(live) collapse (above)
+        # was written to avoid — deliberately: this method is a diagnostic/
+        # audit path (heartbeat-driven, not per-item hot path), and (c) checks
+        # a property (c) alone can see, so the O(1) win on the common
+        # conservation check (b) still stands. Not gated behind a flag unless
+        # this call site becomes hot.
         try:
             for _vq_item in list(self._verifier_queue._queue):  # type: ignore[attr-defined]
                 if (
@@ -7827,6 +7835,7 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                     cap_permit: CapPermit | None = None
                     if counts_against_cap:
                         cap_permit = await self._merge_ahead_ledger.acquire()
+                    _real_item: RealMergeItem | None = None
                     try:
                         self._register_owned_merge_worktree(merge_result.merge_worktree)
                         _real_item = RealMergeItem(
@@ -7875,6 +7884,27 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                         # double-release tolerance above.
                         if cap_permit is not None:
                             self._merge_ahead_ledger.release(cap_permit)
+                            # Same race, a second symptom: if put() already
+                            # enqueued _real_item onto _verifier_queue before
+                            # the CancelledError propagated (the race above),
+                            # that item is still sitting in the queue holding
+                            # this now-released token —
+                            # speculation_accounting_violations' identity (c)
+                            # cross-checks every _verifier_queue item's
+                            # cap_permit against merge_ahead_ledger.live and
+                            # would report a transient false-positive "stale
+                            # or prematurely-released token" violation until
+                            # the verifier drains it. Clear it here so the
+                            # item's visible state matches "no live token",
+                            # exactly as an ordinary on-drain release is
+                            # immediately followed by
+                            # dataclasses.replace(item, cap_permit=None).
+                            # Harmless when _real_item was never enqueued (or
+                            # never constructed — the None-guard covers a
+                            # failure before its assignment above): it is
+                            # about to be discarded by the `raise` below.
+                            if _real_item is not None:
+                                _real_item.cap_permit = None
                         raise
                     # The put succeeded — verifier now owns the speculation
                     # permit for this item (released on drain if speculative).
