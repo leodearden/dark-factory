@@ -50,6 +50,7 @@ from typing import TYPE_CHECKING, Any, ClassVar, Protocol, runtime_checkable
 from orchestrator.config import ModuleConfig
 from orchestrator.verify import VerifyResult, _archive_merge_verify_logs
 from orchestrator.verify_cancel import HEARTBEAT_INTERVAL_SECS
+from orchestrator.verify_categories import FailureCategory, _assert_sentinels_disjoint
 
 if TYPE_CHECKING:
     from orchestrator.config import OrchestratorConfig
@@ -119,6 +120,12 @@ _UNSCOPED_SENTINEL_CATEGORIES = frozenset({
     UNSCOPED_TYPECHECK_FAILED_CATEGORY,
     UNSCOPED_TYPECHECK_TIMEOUT_CATEGORY,
 })
+
+# Fail-loud import-time guard (mirrors verify_categories._validate_exhaustive):
+# these sentinels are a deliberately separate, out-of-band gate namespace —
+# never produced by verify._classify_failure — so they must never collide
+# with a real FailureCategory value.  See plans/verify-plan-prd.md task α.
+_assert_sentinels_disjoint(_UNSCOPED_SENTINEL_CATEGORIES, FailureCategory)
 
 # Sentinel category for a laptop-side flock-contention outcome (task 2306 α,
 # PRD plans/laptop-warm-verify-flock-orphan-prd.md Change A).  Mirrors the

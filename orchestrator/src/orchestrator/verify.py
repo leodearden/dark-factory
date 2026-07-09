@@ -20,6 +20,18 @@ from shared.proc_group import terminate_process_group
 
 from orchestrator.cargo_scope import discover_workspace_crates, files_to_crates
 from orchestrator.config import ModuleConfig, OrchestratorConfig
+from orchestrator.verify_categories import (
+    ARCHIVE_DENY_LIST as _ARCHIVE_DENY_LIST,  # noqa: F401 — re-exported for external consumers
+)
+from orchestrator.verify_categories import (
+    CATEGORY_PRIORITY as _CATEGORY_PRIORITY,  # already list[str] — see verify_categories
+)
+from orchestrator.verify_categories import (
+    INFRA_TRANSIENT_CATEGORIES,
+    PREEXISTING_BREAK_SKIP_CATEGORIES,  # noqa: F401 — re-exported for external consumers
+    FailureCategory,
+    should_archive,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -616,6 +628,17 @@ def _classify_failure(output: str, rc: int, timed_out: bool) -> str:
 
     The ``timed_out`` flag wins over any output pattern because the root
     cause is the wall-clock limit, not the command output.
+
+    CLOSED DOMAIN: every string returned here must be a member of
+    ``orchestrator.verify_categories.FailureCategory`` — that enum, not this
+    function, is the authoritative closed 12-value output domain, and
+    ``_validate_exhaustive`` only enforces it at ``verify_categories`` import
+    time. Adding a new category literal here without also adding a matching
+    ``FailureCategory`` member (+ its ``CATEGORY_POLICY`` row) does NOT fail
+    loud: ``should_archive`` and every other table lookup silently treat an
+    unrecognized string as non-archival/lowest-priority rather than raising.
+    Add the enum member first — the import-time guard then forces the
+    matching policy row.
     """
     if rc == 0:
         return 'passed'
@@ -644,53 +667,14 @@ def _classify_failure(output: str, rc: int, timed_out: bool) -> str:
     return 'unknown_test_failure'
 
 
-# Categories that must NOT be auto-archived even though they end with '_error'.
-# compile_error is handled by the debugger (type annotations, missing imports);
-# the human triage criterion is "a human, not a debugger, has to look".
-# pytest_internalerror is an infra crash (xdist worker killed by os._exit); it is
-# non-deterministic and does NOT warrant human triage — the sweep already retries it.
-# test_failure is handled by the debugger (self-correcting); compile_error likewise.
-# env_transient is a shared-venv mutation transient (task 2048) — infra, not
-# human triage; run_verification already retries it via _force_serial_pytest.
-_ARCHIVE_DENY_LIST = frozenset({
-    'compile_error', 'test_failure', 'infra_timeout', 'passed', '',
-    'pytest_internalerror', 'env_transient',
-})
-
-# Ordered from highest to lowest severity; used by ``_worst_category``.
-# Categories absent from this list (e.g. custom ones) sort lower than all listed.
-_CATEGORY_PRIORITY: list[str] = [
-    'infra_timeout',
-    'cargo_cli_error',
-    'compile_error',
-    'tree_sitter_generate_error',
-    'flock_error',
-    'npm_error',
-    'pytest_internalerror',   # above test_failure: an infra crash, not a test drift
-    'env_transient',          # shared-venv mutation transient; also infra, not test drift
-    'test_failure',
-    'unknown_test_failure',
-    'passed',
-    '',
-]
-
-
-# Categories skipped by the preexisting-main-break probe.  Timeouts and
-# lock contention are non-deterministic to re-run, so probing main for them
-# is neither cheap nor a reliable signal.  All other genuine failure categories
-# (compile_error, test_failure, npm_error, unknown_test_failure, …) DO
-# reproduce with a stable (category, cause_hint) signature when inherited and
-# are safe to re-check.
-PREEXISTING_BREAK_SKIP_CATEGORIES: frozenset[str] = frozenset({
-    'infra_timeout',
-    'flock_error',
-    # pytest_internalerror: xdist worker was killed by os._exit — non-deterministic,
-    # so re-probing main is not a reliable signal.  The sweep already retries it.
-    'pytest_internalerror',
-    # env_transient: shared-venv mutation from a concurrent `uv sync` (task 2048) —
-    # non-deterministic to re-probe on main; the sweep already retries it.
-    'env_transient',
-})
+# _ARCHIVE_DENY_LIST, _CATEGORY_PRIORITY, and PREEXISTING_BREAK_SKIP_CATEGORIES
+# are re-exported (imported above) from orchestrator.verify_categories, the
+# single source of truth for the per-category policy (archive / priority /
+# preexisting-probe / infra-transient) — see CATEGORY_POLICY there for the
+# full table and the rationale behind each category's flags. Previously these
+# were three hand-written literals that had to be kept in sync by hand (see
+# bug_history: task 2048, one category change required 4 registry edits + 2
+# inline sets); deriving them from one table eliminates that hazard.
 
 # Process-wide cache for main-probe results: avoids redundant worktree-add +
 # full-build/test re-runs when the same task retries (helper returned False, debugger
@@ -722,17 +706,12 @@ def _should_archive_category(category: str) -> bool:
     human triage — categories where the debugger can self-correct (compile
     errors, known test failures, timeouts) are excluded.
 
-    Rule:
-    - ``'unknown_test_failure'`` → True  (no pattern matched; human must look)
-    - any category ending with ``'_error'`` AND not in deny-list → True
-      (cargo CLI bugs, npm install failures, flock contention — infra issues)
-    - everything else → False
+    Pure delegation to ``verify_categories.should_archive`` — a CATEGORY_POLICY
+    table lookup, no ``endswith('_error')`` heuristic.  An unrecognized
+    category (e.g. a verify_runner UNSCOPED_TYPECHECK_* sentinel) defaults to
+    False rather than auto-archiving on a bare '_error' suffix match.
     """
-    if category in _ARCHIVE_DENY_LIST:
-        return False
-    if category == 'unknown_test_failure':
-        return True
-    return category.endswith('_error')
+    return should_archive(category)
 
 
 # Matches a pytest invocation up to (but not including) the next shell chain
@@ -2911,7 +2890,7 @@ async def run_verification(
     # recovery still hitting env_transient means it stays environmental
     # (NOT misattributed to test_failure/unknown_test_failure); recovery
     # surfacing a different category means that real signal is reported.
-    if category == 'env_transient' and test_cmd is not None:
+    if category == FailureCategory.ENV_TRANSIENT and test_cmd is not None:
         logger.warning(
             'Verification hit an environmental shared-venv transient '
             '(vanished xdist/pip); retrying test command once, forced serial '
@@ -3743,7 +3722,7 @@ async def run_main_tip_sweep(
         # xdist/pip).  Both are infra failures, not drift — return the None sentinel
         # so the harness retries next tick and files no false-positive drift L1.
         # The finally block's worktree cleanup still runs.
-        if result.category in {'pytest_internalerror', 'env_transient'}:
+        if result.category in INFRA_TRANSIENT_CATEGORIES:
             logger.warning(
                 'run_main_tip_sweep: %s in first-pass sweep — '
                 'treating as infra crash, not drift (retrying next tick); '
@@ -3771,7 +3750,7 @@ async def run_main_tip_sweep(
             )
             retry = await run_full_verification(tmp_path, config)  # type: ignore[arg-type]
 
-            if retry.category in {'pytest_internalerror', 'env_transient'}:
+            if retry.category in INFRA_TRANSIENT_CATEGORIES:
                 logger.warning(
                     'run_main_tip_sweep: retry at %s hit %s — '
                     'treating as infra crash, not drift (retrying next tick); '

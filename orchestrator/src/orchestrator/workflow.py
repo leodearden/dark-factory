@@ -83,13 +83,13 @@ from orchestrator.task_status import (
 )
 from orchestrator.usage_gate import SessionBudgetExhausted as _SessionBudgetExhausted
 from orchestrator.verify import (
-    PREEXISTING_BREAK_SKIP_CATEGORIES,
     VerifyInfraError,
     VerifyResult,
     _is_infra_oserror,
     run_scoped_verification,
     verify_failure_is_preexisting_on_main,
 )
+from orchestrator.verify_categories import PREEXISTING_BREAK_SKIP_CATEGORIES, FailureCategory
 
 # Orchestrator package directory — used to resolve ``uv run --project`` for
 # the plan-tools stdio MCP server.
@@ -5061,7 +5061,7 @@ class TaskWorkflow:
             # persistent opaque timeouts indicate infrastructure the debugger
             # can't fix.
             if (
-                result.category == 'infra_timeout'
+                result.category == FailureCategory.INFRA_TIMEOUT
                 and _OPAQUE_TIMEOUT_CAUSE_RE.match(result.cause_hint or '')
                 and verify_attempt >= self.config.max_opaque_timeout_attempts
             ):
