@@ -18,6 +18,7 @@ COMPILE_ERROR_RESULT) to reach _run_post_merge_verify's blocked outcomes.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -545,6 +546,61 @@ class TestUnblockAutoDisabledSkipsSpawn:
                 )
                 await asyncio.sleep(0)
                 return outcome
+
+        outcome = asyncio.run(_run())
+
+        assert outcome is not None
+        assert outcome.status == 'blocked'
+        run_dry_run_mock.assert_not_awaited()
+
+
+class TestInflightDedupSkipsDuplicate:
+    """Step-9 (RED): a not-done investigation task already registered under
+    the same 'unblock-auto-<task_id>' name must suppress a second spawn."""
+
+    def test_inflight_dedup_skips_duplicate(self, tmp_path: Path) -> None:
+        config = _make_config(tmp_path)
+        git_ops = _make_git_ops(tmp_path)
+        merge_wt = tmp_path / 'merge-wt'
+        merge_wt.mkdir()
+        req = _make_req('99', tmp_path / 'task-wt', config)
+        (tmp_path / 'task-wt').mkdir()
+
+        handles = _make_handles()
+        run_dry_run_mock = AsyncMock(return_value=None)
+
+        async def _run() -> MergeOutcome | None:
+            async def _hang_forever() -> None:
+                await asyncio.Event().wait()
+
+            dummy_task = asyncio.create_task(
+                _hang_forever(), name=f'unblock-auto-{req.task_id}',
+            )
+            handles.background_tasks.add(dummy_task)
+            try:
+                with (
+                    patch(
+                        'orchestrator.merge_queue.run_scoped_verification',
+                        new=AsyncMock(return_value=COMPILE_ERROR_RESULT),
+                    ),
+                    patch(
+                        'orchestrator.merge_queue.verify_failure_is_preexisting_on_main',
+                        new=AsyncMock(return_value=(False, '')),
+                    ),
+                    patch(
+                        'orchestrator.merge_queue.run_dry_run_unblock',
+                        new=run_dry_run_mock,
+                    ),
+                ):
+                    outcome = await _drive_verify_with_handles(
+                        req, merge_wt, git_ops, dry_run_handles=handles,
+                    )
+                    await asyncio.sleep(0)
+                    return outcome
+            finally:
+                dummy_task.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await dummy_task
 
         outcome = asyncio.run(_run())
 
