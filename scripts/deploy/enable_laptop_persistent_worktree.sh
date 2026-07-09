@@ -54,7 +54,8 @@ done
 # `bash -s -- "$CONFIG" "$MODE" "$LABEL" "$PY"`, not locally. Positional args:
 #   $1 = CONFIG (path to the laptop's orchestrator config)
 #   $2 = MODE   (apply | check)
-#   $3 = LABEL  (backup-file label; unused until the apply edit lands)
+#   $3 = LABEL  (backup-file label; used to name the pre-edit backup
+#               <config>.bak-<label> written during a real apply edit)
 #   $4 = PY     (remote python interpreter)
 if ! $SSH "$LAPTOP_HOST" bash -s -- "$LAPTOP_CONFIG_PATH" "$MODE" "$BACKUP_LABEL" "$REMOTE_PYTHON" <<'REMOTE_PAYLOAD_EOF'
 set -euo pipefail
@@ -77,20 +78,25 @@ fi
 # NOTE (task 2310 step-13/14): this anchor is deliberate -- requiring the
 # colon (modulo whitespace) immediately after the key name excludes the
 # prefix-colliding sibling `persistent_merge_worktree_safety_valve_every_n`
-# (whose next character is `_`, not whitespace-or-colon). Every regex below
-# that targets this key (here, and the awk strip pattern further down)
-# MUST keep this exact `^[[:space:]]*persistent_merge_worktree[[:space:]]*:`
-# form -- do not loosen it to an unanchored/prefix match.
-key_present() {
-    grep -qE '^[[:space:]]*persistent_merge_worktree[[:space:]]*:' "$CONFIG"
-}
-
+# (whose next character is `_`, not whitespace-or-colon). The awk strip
+# pattern further down MUST keep this exact
+# `^[[:space:]]*persistent_merge_worktree[[:space:]]*:` form -- do not
+# loosen it to an unanchored/prefix match.
 git_anchor_present() {
     grep -qE '^git:' "$CONFIG"
 }
 
-if ! key_present && ! git_anchor_present; then
-    echo "ERROR: refusing blind edit: ${CONFIG} has neither a persistent_merge_worktree key nor a top-level git: anchor" >&2
+# Require the git: anchor unconditionally (task 2310 amendment): the edit
+# path can only normalize an existing key in place or insert a new one as
+# the first child immediately after `git:`, so without that anchor there is
+# nowhere safe to land the edit. Refusing here even when
+# persistent_merge_worktree is already present -- e.g. as a stray
+# top-level key outside any git: block -- prevents the awk pass below from
+# stripping that key with no git: anchor to reinsert it under, which would
+# silently delete it from the live config before the post-edit readback
+# check caught the corruption.
+if ! git_anchor_present; then
+    echo "ERROR: refusing blind edit: ${CONFIG} has no top-level git: anchor to edit persistent_merge_worktree under" >&2
     exit 1
 fi
 
@@ -119,8 +125,8 @@ fi
 cp -p "$CONFIG" "${CONFIG}.bak-${LABEL}"
 
 tmp="$(mktemp "${CONFIG}.XXXXXX")"
-# Same anchor as key_present() above -- see the NOTE there. This strip
-# pattern must never match persistent_merge_worktree_safety_valve_every_n.
+# Same anchor as the NOTE above git_anchor_present(). This strip pattern
+# must never match persistent_merge_worktree_safety_valve_every_n.
 awk '
     $0 ~ "^[[:space:]]*persistent_merge_worktree[[:space:]]*:" { next }
     { print }

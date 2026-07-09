@@ -52,6 +52,10 @@ def _fixture_laptop_config(state="unflipped"):
                         first-child case).
       "no_git_anchor" - neither the key nor any top-level git: block is
                         present at all (refuse-blind-edit case).
+      "key_no_git_anchor" - the persistent_merge_worktree key IS present,
+                        but as a stray top-level key with NO top-level
+                        git: block anywhere (refuse-blind-edit case where
+                        key_present alone must not be enough to proceed).
     """
     if state == "malformed":
         return (
@@ -69,6 +73,15 @@ def _fixture_laptop_config(state="unflipped"):
     if state == "no_git_anchor":
         return (
             "concurrent_verify: false\n"
+            "\n"
+            "other_top_level_key: true\n"
+        )
+
+    if state == "key_no_git_anchor":
+        return (
+            "concurrent_verify: false\n"
+            "\n"
+            f"{KEY}: false\n"
             "\n"
             "other_top_level_key: true\n"
         )
@@ -212,7 +225,15 @@ def test_apply_twice_is_idempotent_noop_second_run(tmp_path):
         f"stdout={first.stdout!r} stderr={first.stderr!r}"
     )
 
+    backup_path = config_path.parent / f"{config_path.name}.bak-fixed"
     backups_before_second = _backup_files(config_path)
+    # Capture bytes + mtime, not just the filename set: BACKUP_LABEL is
+    # fixed across both runs, so a regression where the second (already-
+    # enabled) run ALSO wrote a backup would reuse the identical filename
+    # and overwrite it -- the filename set alone would look unchanged even
+    # though the backup's content silently changed underneath it.
+    backup_bytes_before_second = backup_path.read_bytes()
+    backup_mtime_before_second = backup_path.stat().st_mtime_ns
 
     second = _run_script(config_path)
     assert second.returncode == 0, (
@@ -228,6 +249,15 @@ def test_apply_twice_is_idempotent_noop_second_run(tmp_path):
     assert backups_after_second == backups_before_second, (
         f"Expected no NEW backup file from the no-op second run; "
         f"before={backups_before_second} after={backups_after_second}"
+    )
+    assert backup_path.read_bytes() == backup_bytes_before_second, (
+        "Expected the existing backup's bytes to be unchanged by the "
+        "no-op second run (a same-named overwrite would leave the "
+        "filename set unchanged but silently replace its content)"
+    )
+    assert backup_path.stat().st_mtime_ns == backup_mtime_before_second, (
+        "Expected the existing backup's mtime to be unchanged by the "
+        "no-op second run"
     )
 
     config_text = _read_config(config_path)
@@ -352,6 +382,14 @@ def test_apply_creates_backup_with_preedit_contents(tmp_path):
     )
 
     backups_after_first = _backup_files(config_path)
+    # Capture bytes + mtime, not just the filename set: BACKUP_LABEL is
+    # fixed ("fixed") across both runs, so a regression where the second
+    # (already-enabled) run ALSO wrote a backup would reuse the identical
+    # filename and overwrite it in place -- the filename set alone would
+    # look unchanged even though the backup silently lost its original
+    # pre-edit content.
+    backup_bytes_after_first = backup_path.read_bytes()
+    backup_mtime_after_first = backup_path.stat().st_mtime_ns
 
     second = _run_script(config_path)
     assert second.returncode == 0, (
@@ -363,6 +401,14 @@ def test_apply_creates_backup_with_preedit_contents(tmp_path):
     assert backups_after_second == backups_after_first, (
         f"Expected no additional backup from the no-op second run; "
         f"before={backups_after_first} after={backups_after_second}"
+    )
+    assert backup_path.read_bytes() == backup_bytes_after_first, (
+        "Expected the backup's bytes to still hold the PRE-edit config "
+        "after the no-op second run (a same-named overwrite would leave "
+        "the filename set unchanged but silently replace its content)"
+    )
+    assert backup_path.stat().st_mtime_ns == backup_mtime_after_first, (
+        "Expected the backup's mtime to be unchanged by the no-op second run"
     )
 
 
@@ -429,6 +475,45 @@ def test_apply_refuses_blind_edit_when_no_git_anchor(tmp_path):
     )
     assert _read_config(config_path) == before_text, (
         "Refused blind edit must not mutate the config"
+    )
+    assert _backup_files(config_path) == [], (
+        "Refused blind edit must not create a backup"
+    )
+
+
+# ---------------------------------------------------------------------------
+# amendment (post step-16 review): the refuse-blind-edit guard must also
+# fire when persistent_merge_worktree is present as a stray top-level key
+# but no top-level git: anchor exists to normalize or insert it under --
+# key_present alone must never be sufficient to proceed, since the awk
+# strip pass would otherwise delete the key with nowhere safe to reinsert
+# it, corrupting the live config before the readback check catches it.
+# ---------------------------------------------------------------------------
+
+def test_apply_refuses_blind_edit_when_key_present_but_no_git_anchor(tmp_path):
+    """apply on a config where persistent_merge_worktree IS present but as
+    a stray top-level key with NO top-level git: anchor anywhere fails
+    loudly (non-zero exit, stderr error) rather than letting the awk strip
+    pass delete the key with no git: anchor to reinsert it under -- which
+    would silently corrupt the live config (mutate it into a state with
+    the key removed) before the post-edit readback check caught it."""
+    config_path = tmp_path / "reify-laptop.yaml"
+    before_text = _fixture_laptop_config("key_no_git_anchor")
+    config_path.write_text(before_text)
+
+    result = _run_script(config_path)
+
+    assert result.returncode != 0, (
+        f"Expected non-zero exit when the key is present but no git: "
+        f"anchor exists; got 0\n"
+        f"stdout={result.stdout!r} stderr={result.stderr!r}"
+    )
+    assert result.stderr.strip(), (
+        f"Expected an error message on stderr; got stderr={result.stderr!r}"
+    )
+    assert _read_config(config_path) == before_text, (
+        "Refused blind edit must not mutate the config, even partially "
+        "(e.g. stripping the key without reinserting it)"
     )
     assert _backup_files(config_path) == [], (
         "Refused blind edit must not create a backup"
