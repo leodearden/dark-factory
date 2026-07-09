@@ -4908,3 +4908,146 @@ class TestCuratorMaybeRouteDeterministic:
         assert decision.action == "route_deterministic"
         assert curator._check_cache(payload_hash) is None
 
+
+# ──────────────────────────────────────────────────────────────────────────────
+# task-2085 step-9 RED: TestCuratorCurateRouteDeterministicIntegration
+# ──────────────────────────────────────────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+class TestCuratorCurateRouteDeterministicIntegration:
+    """curate() integration tests for the operational-ask registry
+    filing-policy gate (G2 signal) — mirrors TestCuratorBlocklistShortCircuit /
+    TestCuratorPremiseRefutedDrop, plus precedence boundary tests against the
+    other pre-LLM short-circuits.
+    """
+
+    async def test_registry_match_short_circuits_before_corpus_and_llm(self, tmp_path):
+        """(1) A genuinely-new operational candidate short-circuits to
+        action=='route_deterministic' BEFORE corpus assembly or any LLM call."""
+        registry = _make_operational_registry_yaml(
+            tmp_path,
+            title_subs=["prune_recon_cycle_summaries"],
+            desc_subs=["--apply"],
+        )
+        config = _make_config_with_operational_registry(str(registry))
+        curator = TaskCurator(config=config, taskmaster=None, cwd=tmp_path)
+
+        candidate = CandidateTask(
+            title="Run prune_recon_cycle_summaries --apply against live Mem0",
+            description="Operational --apply run to collapse pre-existing piles.",
+        )
+
+        with patch.object(curator, "_build_corpus", new=AsyncMock(side_effect=AssertionError("_build_corpus must not be called"))) as mock_corpus, \
+             patch.object(curator, "_call_llm", new=AsyncMock(side_effect=AssertionError("_call_llm must not be called"))) as mock_llm:
+            decision = await curator.curate(candidate, project_id="p", project_root="/x")
+
+        assert decision.action == "route_deterministic"
+        assert decision.justification.startswith("operational-ask-registry:")
+        mock_corpus.assert_not_called()
+        mock_llm.assert_not_called()
+
+    async def test_registry_miss_flows_through_llm_unaffected(self, tmp_path):
+        """(2) A non-matching candidate is unaffected — normal LLM 'create' path."""
+        registry = _make_operational_registry_yaml(
+            tmp_path,
+            title_subs=["prune_recon_cycle_summaries"],
+            desc_subs=["--apply"],
+        )
+        config = _make_config_with_operational_registry(str(registry))
+        curator = TaskCurator(config=config, taskmaster=None, cwd=tmp_path)
+
+        candidate = CandidateTask(title="Fix a normal bug", description="Nothing operational here.")
+
+        fake_exact_match, fake_corpus, create_result = _make_create_mocks()
+
+        with patch.object(curator, "_pre_llm_exact_match", side_effect=fake_exact_match), \
+             patch.object(curator, "_build_corpus", side_effect=fake_corpus), \
+             patch("fused_memory.middleware.task_curator.invoke_with_cap_retry",
+                   new=AsyncMock(return_value=create_result)):
+            decision = await curator.curate(candidate, project_id="p", project_root="/x")
+
+        assert decision.action == "create"
+
+    async def test_blocklist_takes_precedence_over_route(self, tmp_path):
+        """(3) A candidate matching BOTH the cancelled-premise blocklist AND
+        the operational registry is dropped by the blocklist — route never
+        fires, so no gate is spawned for an already-cancelled premise."""
+        blocklist = _make_blocklist_yaml(
+            tmp_path,
+            title_subs=["prune_recon_cycle_summaries"],
+            desc_subs=["--apply"],
+            name="cancelled_dup_of_operational_ask",
+        )
+        operational_registry = _make_operational_registry_yaml(
+            tmp_path,
+            title_subs=["prune_recon_cycle_summaries"],
+            desc_subs=["--apply"],
+        )
+        config = FusedMemoryConfig()
+        config.curator = CuratorConfig(
+            cancelled_premise_blocklist_path=str(blocklist),
+            operational_ask_registry_path=str(operational_registry),
+        )
+        curator = TaskCurator(config=config, taskmaster=None, cwd=tmp_path)
+
+        candidate = CandidateTask(
+            title="Run prune_recon_cycle_summaries --apply against live Mem0",
+            description="Operational --apply run to collapse pre-existing piles.",
+        )
+
+        with patch.object(curator, "_build_corpus", new=AsyncMock(side_effect=AssertionError("_build_corpus must not be called"))), \
+             patch.object(curator, "_call_llm", new=AsyncMock(side_effect=AssertionError("_call_llm must not be called"))):
+            decision = await curator.curate(candidate, project_id="p", project_root="/x")
+
+        assert decision.action == "drop"
+        assert decision.justification.startswith("cancelled-premise-blocklist:")
+
+    async def test_exact_match_dedup_takes_precedence_over_route(self, tmp_path):
+        """(4) An operational candidate that duplicates a just-created task
+        (seeded via note_created) is dropped by the pre-LLM exact-match check
+        — NO second gate is routed for a re-filed duplicate."""
+        registry = _make_operational_registry_yaml(
+            tmp_path,
+            title_subs=["prune_recon_cycle_summaries"],
+            desc_subs=["--apply"],
+        )
+        config = _make_config_with_operational_registry(str(registry))
+        curator = TaskCurator(config=config, taskmaster=None, cwd=tmp_path)
+
+        candidate = CandidateTask(
+            title="Run prune_recon_cycle_summaries --apply against live Mem0",
+            description="Operational --apply run to collapse pre-existing piles.",
+        )
+        curator.note_created("p", candidate, "existing-gate-task-id")
+
+        with patch.object(curator, "_build_corpus", new=AsyncMock(side_effect=AssertionError("_build_corpus must not be called"))), \
+             patch.object(curator, "_call_llm", new=AsyncMock(side_effect=AssertionError("_call_llm must not be called"))):
+            decision = await curator.curate(candidate, project_id="p", project_root="/x")
+
+        assert decision.action == "drop"
+        assert decision.justification == "pre-llm-exact-match"
+        assert decision.target_id == "existing-gate-task-id"
+
+    async def test_missing_registry_degrades_to_normal_path(self, tmp_path):
+        """(5) A missing registry file degrades to the normal path: no route,
+        no crash."""
+        nonexistent = tmp_path / "does_not_exist.yaml"
+        config = _make_config_with_operational_registry(str(nonexistent))
+        curator = TaskCurator(config=config, taskmaster=None, cwd=tmp_path)
+
+        candidate = CandidateTask(
+            title="Run prune_recon_cycle_summaries --apply against live Mem0",
+            description="Operational --apply run to collapse pre-existing piles.",
+        )
+
+        fake_exact_match, fake_corpus, create_result = _make_create_mocks()
+
+        with patch.object(curator, "_pre_llm_exact_match", side_effect=fake_exact_match), \
+             patch.object(curator, "_build_corpus", side_effect=fake_corpus), \
+             patch("fused_memory.middleware.task_curator.invoke_with_cap_retry",
+                   new=AsyncMock(return_value=create_result)):
+            decision = await curator.curate(candidate, project_id="p", project_root="/x")
+
+        assert decision.action == "create"
+
