@@ -22,6 +22,7 @@ bare-harness construction helper exactly.
 
 from __future__ import annotations
 
+from typing import cast
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -76,8 +77,9 @@ class TestAlreadyLandedDispatchGateAncestryHappyPath:
         result = await h._already_landed_dispatch_gate('42')
 
         assert result is True
-        h._mark_in_progress_done.assert_awaited_once()
-        call_args = h._mark_in_progress_done.await_args
+        cast(AsyncMock, h._mark_in_progress_done).assert_awaited_once()
+        call_args = cast(AsyncMock, h._mark_in_progress_done).await_args
+        assert call_args is not None
         assert call_args.args[0] == '42'
         assert call_args.args[1] == citation_sha
         assert call_args.args[3] == 'dispatch-gate-already-on-main'
@@ -122,7 +124,7 @@ class TestAlreadyLandedDispatchGateAncestryGuards:
         result = await h._already_landed_dispatch_gate('42')
 
         assert result is False
-        h._mark_in_progress_done.assert_not_awaited()
+        cast(AsyncMock, h._mark_in_progress_done).assert_not_awaited()
 
     async def test_degenerate_branch_vetoes_flip(self, mock_orch_config) -> None:
         """A degenerate branch (tip == branch_base_sha) carries zero task
@@ -134,7 +136,7 @@ class TestAlreadyLandedDispatchGateAncestryGuards:
         result = await h._already_landed_dispatch_gate('42')
 
         assert result is False
-        h._mark_in_progress_done.assert_not_awaited()
+        cast(AsyncMock, h._mark_in_progress_done).assert_not_awaited()
 
     async def test_missing_citation_vetoes_flip(self, mock_orch_config) -> None:
         """No commit on main cites this task — reject the zero-commit-branch
@@ -146,7 +148,7 @@ class TestAlreadyLandedDispatchGateAncestryGuards:
         result = await h._already_landed_dispatch_gate('42')
 
         assert result is False
-        h._mark_in_progress_done.assert_not_awaited()
+        cast(AsyncMock, h._mark_in_progress_done).assert_not_awaited()
 
 
 def _wired_marker_harness(
@@ -212,8 +214,9 @@ class TestAlreadyLandedDispatchGateMarkerPath:
         result = await h._already_landed_dispatch_gate('42')
 
         assert result is True
-        h._mark_in_progress_done.assert_awaited_once()
-        call_args = h._mark_in_progress_done.await_args
+        cast(AsyncMock, h._mark_in_progress_done).assert_awaited_once()
+        call_args = cast(AsyncMock, h._mark_in_progress_done).await_args
+        assert call_args is not None
         assert call_args.args[0] == '42'
         assert call_args.args[1] == marker_sha
         assert call_args.args[3] == 'dispatch-gate-marker-found'
@@ -235,7 +238,7 @@ class TestAlreadyLandedDispatchGateMarkerPath:
         result = await h._already_landed_dispatch_gate('42')
 
         assert result is False
-        h._mark_in_progress_done.assert_not_awaited()
+        cast(AsyncMock, h._mark_in_progress_done).assert_not_awaited()
 
 
 def _wired_content_harness(
@@ -290,8 +293,9 @@ class TestAlreadyLandedDispatchGateContentEquivalence:
         result = await h._already_landed_dispatch_gate('42')
 
         assert result is True
-        h._mark_in_progress_done.assert_awaited_once()
-        call_args = h._mark_in_progress_done.await_args
+        cast(AsyncMock, h._mark_in_progress_done).assert_awaited_once()
+        call_args = cast(AsyncMock, h._mark_in_progress_done).await_args
+        assert call_args is not None
         assert call_args.args[0] == '42'
         assert call_args.args[1] == main_sha
         assert call_args.args[3] == 'dispatch-gate-content-equivalent'
@@ -313,8 +317,9 @@ class TestAlreadyLandedDispatchGateContentEquivalence:
         result = await h._already_landed_dispatch_gate('42')
 
         assert result is True
-        h._mark_in_progress_done.assert_awaited_once()
-        call_args = h._mark_in_progress_done.await_args
+        cast(AsyncMock, h._mark_in_progress_done).assert_awaited_once()
+        call_args = cast(AsyncMock, h._mark_in_progress_done).await_args
+        assert call_args is not None
         assert call_args.args[0] == '42'
         assert call_args.args[1] == citation_sha
         assert call_args.args[3] == 'dispatch-gate-content-equivalent'
@@ -335,7 +340,7 @@ class TestAlreadyLandedDispatchGateContentEquivalence:
         result = await h._already_landed_dispatch_gate('42')
 
         assert result is False
-        h._mark_in_progress_done.assert_not_awaited()
+        cast(AsyncMock, h._mark_in_progress_done).assert_not_awaited()
 
 
 @pytest.mark.asyncio
