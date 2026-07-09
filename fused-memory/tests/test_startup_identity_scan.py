@@ -298,3 +298,60 @@ class TestRunStartupIdentityScan:
         assert stats['graphs_scanned'] == 2
         assert stats['edges_repaired'] == 3  # only g2's 3 counted; g1 failed
         assert any(r.levelno >= logging.WARNING for r in caplog.records)
+
+
+# ---------------------------------------------------------------------------
+# step-7/step-8: GraphitiBackend.initialize() wiring
+# ---------------------------------------------------------------------------
+
+class TestInitializeRunsIdentityScan:
+    """initialize() must run the startup identity-integrity scan (task 2210).
+
+    Mirrors the preflight-wiring pattern in
+    test_openai_responses_preflight.py:132-158: monkeypatch
+    _MultiTenantFalkorDriver / Graphiti to mocks and disable the openai
+    api_key so initialize() never attempts a real FalkorDB/LLM connection.
+    """
+
+    @pytest.mark.asyncio
+    async def test_initialize_awaits_run_startup_identity_scan(
+        self, mock_config, monkeypatch,
+    ):
+        """initialize() must await _run_startup_identity_scan() during startup."""
+        import fused_memory.backends.graphiti_client as graphiti_client_module
+
+        mock_config.llm.providers.openai.api_key = ''  # skip the OpenAI preflight/client
+        monkeypatch.setattr(
+            graphiti_client_module, '_MultiTenantFalkorDriver', MagicMock(),
+        )
+        monkeypatch.setattr(
+            graphiti_client_module, 'Graphiti', MagicMock(return_value=AsyncMock()),
+        )
+
+        backend = GraphitiBackend(mock_config)
+        backend._run_startup_identity_scan = AsyncMock(return_value={})
+
+        await backend.initialize()
+
+        backend._run_startup_identity_scan.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_initialize_survives_scan_failure(
+        self, mock_config, monkeypatch,
+    ):
+        """A total scan failure must never break backend startup — the scan
+        is a safety net, not a startup gate."""
+        import fused_memory.backends.graphiti_client as graphiti_client_module
+
+        mock_config.llm.providers.openai.api_key = ''
+        monkeypatch.setattr(
+            graphiti_client_module, '_MultiTenantFalkorDriver', MagicMock(),
+        )
+        monkeypatch.setattr(
+            graphiti_client_module, 'Graphiti', MagicMock(return_value=AsyncMock()),
+        )
+
+        backend = GraphitiBackend(mock_config)
+        backend._run_startup_identity_scan = AsyncMock(side_effect=RuntimeError('boom'))
+
+        await backend.initialize()  # must not raise
