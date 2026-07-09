@@ -255,13 +255,17 @@ class TestBuildTaskCountSnapshotContent:
 
         assert isinstance(content, str)
         assert 'reify' in content
-        assert '42' in content
-        assert '18' in content
-        assert '3' in content
-        assert '20' in content
-        assert '1' in content
-        assert '99' in content
         assert '2026-07-08' in content
+        # Labeled substrings (not bare digits) so the assertion actually pins
+        # each count to its own label -- a swap of e.g. done/cancelled in the
+        # renderer, or an incidental digit match (e.g. '1' inside '18'),
+        # would fail here (reviewer finding, amendment round).
+        assert '42 total' in content
+        assert '18 done' in content
+        assert '3 cancelled' in content
+        assert '20 active' in content
+        assert '1 other' in content
+        assert 'highest task id 99' in content
 
     def test_content_without_as_of_is_non_empty_and_contains_counts(self):
         content = build_task_count_snapshot_content(
@@ -791,6 +795,49 @@ class TestRunDeterministicSnapshotWrite:
         assert report.stats['task_count_snapshot_written'] == 1
         mock_write.assert_awaited_once()
         mock_verify.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_non_blocked_project_write_none_falls_back_to_verify(self, mock_deps):
+        """project_id='reify' (non-blocked) but the deterministic write comes
+        back inconclusive (None -- transient failure or no taskmaster): run()
+        must still fall back to the freshness-read helper for the stat, the
+        same as the blocked-project path (reviewer finding, amendment round).
+
+        This pins the ``if task_count_snapshot_written is None:`` fallback
+        branch itself -- the two pre-existing tests in this class only cover
+        write-returns-True (verify skipped) and blocked (write skipped,
+        verify used); neither exercises attempted-write-then-fallback.
+        """
+        stage = TaskKnowledgeSync(
+            StageId.task_knowledge_sync,
+            scope=_scope('reify', '/tmp/test'),
+            **mock_deps,
+        )
+
+        with (
+            patch(
+                'fused_memory.reconciliation.stages.base.run_stage_via_cli',
+                new=AsyncMock(return_value=self._fake_cli_result()),
+            ),
+            patch(
+                'fused_memory.reconciliation.stages.task_knowledge_sync'
+                '._write_task_count_snapshot',
+                new=AsyncMock(return_value=None),
+            ) as mock_write,
+            patch(
+                'fused_memory.reconciliation.stages.task_knowledge_sync'
+                '._verify_task_count_snapshot_written',
+                new=AsyncMock(return_value=True),
+            ) as mock_verify,
+        ):
+            report = await stage.run(
+                events=[], watermark=Watermark(project_id='reify'),
+                prior_reports=[], run_id='run-det-write-fallback',
+            )
+
+        assert report.stats['task_count_snapshot_written'] == 1
+        mock_write.assert_awaited_once()
+        mock_verify.assert_awaited_once()
 
     @pytest.mark.asyncio
     async def test_blocked_project_skips_write_and_falls_back_to_verify(self, mock_deps):

@@ -14,6 +14,19 @@ Stage 3 findings asserting the edge is missing or stale are false positives.
 ``is_snapshot_write_blocked(project_id)`` is the public predicate; callers
 should use it rather than querying the set directly.
 
+Note on the shared name: membership in this registry is checked by two
+different callers for two different underlying reasons, but both resolve to
+the same caller-facing action -- "do not perform, and do not expect, a
+task_count_snapshot write". For autopilot_video/know_live the write PATH
+itself is rejected server-side (see ``ReconSnapshotWriteRejected``); for
+dark_factory/solar_challenge_platform the write path is unobstructed but the
+per-project census is simply not in use (see task 2325). The predicate
+intentionally does not distinguish the two -- the harness escalation guard
+and the deterministic writer (``stages/task_knowledge_sync.py``,
+``_write_task_count_snapshot``) both only need "skip/suppress", not "why".
+Consult each project's own policy sub-module docstring for its specific
+rationale before assuming a membership can be safely removed.
+
 To register a new project: add a ``<PROJECT>_SNAPSHOT_WRITES_BLOCKED: bool = True``
 constant to its policy sub-module, import it in the ``_PROJECT_SNAPSHOT_FLAGS``
 list below, and append ``(<PROJECT_ID>, <PROJECT>_SNAPSHOT_WRITES_BLOCKED)`` to
@@ -67,6 +80,11 @@ SNAPSHOT_WRITE_BLOCKED_PROJECTS: frozenset[str] = frozenset(
 
 def is_snapshot_write_blocked(project_id: str | None) -> bool:
     """Return True iff *project_id* is in :data:`SNAPSHOT_WRITE_BLOCKED_PROJECTS`.
+
+    ``True`` means "do not perform, and do not expect, a task_count_snapshot
+    write" for reasons that vary per project (server-side write rejection vs.
+    census simply not in use) -- see the module docstring's "Note on the
+    shared name" and each project's own policy sub-module for specifics.
 
     ``None`` and ``''`` safely return ``False`` (fail-open).
 
