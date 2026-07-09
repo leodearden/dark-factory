@@ -446,6 +446,49 @@ _PYTEST_PROGRESS_BARE_RE = re.compile(r'^[\.FsxXEPp]+(\s+\[\s*\d+%\])?$')
 _PYTEST_PROGRESS_FILE_RE = re.compile(r'^\S+\.py [\.FsxXEPp]+(\s+\[\s*\d+%\])?$')
 
 
+# Bare pytest-xdist worker-crash signature (task 2365). Grounded in
+# config.yaml's task-2361 comment: under host CPU oversubscription a starved
+# xdist worker crosses the per-test wall-clock ceiling, gets os._exit()'d by
+# pytest-timeout's thread method, and --max-worker-restart=0 (kept
+# intentionally at 0 — task 1907) turns that into a false-failing per-test
+# "node down" attributed to whatever test happens to be running, not a real
+# per-test defect. Not anchored to line-start/end (unlike the _PYTEST_* line
+# patterns above) since xdist's crash notices can be prefixed by pytest's own
+# progress/worker-id decoration.
+_XDIST_WORKER_CRASH_RE = re.compile(
+    r'node down: Not properly terminated|worker gw\d+ crashed|\[gw\d+\] node down',
+    re.MULTILINE,
+)
+
+
+def _is_bare_xdist_worker_crash(output: str) -> bool:
+    """Return True when *output* is a bare xdist worker crash with no real failure.
+
+    A hard ``os._exit()`` worker kill (task 2361) produces no assertion
+    traceback, so the presence of ANY genuine pytest failure marker —
+    ``_PYTEST_TRACEBACK_E_RE`` (``^E   ...``), ``_PYTEST_FAILED_LINE_RE``
+    (``^FAILED ...``), or ``_PYTEST_FAILURE_SUMMARY_RE`` (``=== N failed
+    ===``) — reliably indicates a genuine failure occurred alongside the
+    crash, and suppresses reclassification: never mask a real failure. The
+    fail-safe direction is to surface the failure unchanged (status quo)
+    whenever a real failure marker is also present.
+
+    Returns ``False`` for falsy *output* or when the crash signature itself
+    is absent.
+    """
+    if not output:
+        return False
+    if not _XDIST_WORKER_CRASH_RE.search(output):
+        return False
+    if _PYTEST_TRACEBACK_E_RE.search(output):
+        return False
+    if _PYTEST_FAILED_LINE_RE.search(output):
+        return False
+    if _PYTEST_FAILURE_SUMMARY_RE.search(output):
+        return False
+    return True
+
+
 def _extract_cause_hint(output: str) -> str:
     """Extract a one-line failure hint from command output.
 
