@@ -33,6 +33,9 @@ from fused_memory.backends.task_backend_types import (
 )
 from fused_memory.config.schema import TaskmasterConfig
 from fused_memory.middleware.candidate_key import compute_candidate_key
+from fused_memory.middleware.candidate_key_escalation import (
+    emit_residual_candidate_key_escalation,
+)
 from fused_memory.models.scope import resolve_project_id
 
 logger = logging.getLogger(__name__)
@@ -225,7 +228,12 @@ def _files_for_key(metadata_raw: str | None) -> list[Any]:
     return raw_files if isinstance(raw_files, list) else []
 
 
-async def _migrate(conn: aiosqlite.Connection) -> None:
+async def _migrate(
+    conn: aiosqlite.Connection,
+    *,
+    project_root: str | None = None,
+    residual_dup_escalation_cb: Any = None,
+) -> None:
     """Cumulative, idempotent, version-gated schema migration.
 
     Gated on ``PRAGMA user_version``; a no-op once it reaches
@@ -330,7 +338,11 @@ async def _migrate(conn: aiosqlite.Connection) -> None:
         version = 3
 
     if version < 4:
-        await _migrate_v3_to_v4(conn)
+        await _migrate_v3_to_v4(
+            conn,
+            project_root=project_root,
+            residual_dup_escalation_cb=residual_dup_escalation_cb,
+        )
 
 
 async def _migrate_v1_to_v2(conn: aiosqlite.Connection) -> None:
@@ -424,7 +436,12 @@ async def _migrate_v2_to_v3(conn: aiosqlite.Connection) -> None:
     await conn.commit()
 
 
-async def _migrate_v3_to_v4(conn: aiosqlite.Connection) -> None:
+async def _migrate_v3_to_v4(
+    conn: aiosqlite.Connection,
+    *,
+    project_root: str | None = None,
+    residual_dup_escalation_cb: Any = None,
+) -> None:
     """v3 -> v4 (fm-task-dedup W8 task A2): self-gating partial UNIQUE index.
 
     Re-runs the same residual non-cancelled duplicate ``candidate_key``
@@ -434,10 +451,13 @@ async def _migrate_v3_to_v4(conn: aiosqlite.Connection) -> None:
     * **Residuals found** — log a loud ERROR naming the groups (via the
       ``residual_group_count=`` token, deliberately distinct from v2->v3's
       ``duplicate_groups=`` token so the two audits' log-scraping assertions
-      never collide) and SKIP the index build. ``user_version`` is left at 3
-      (NOT stamped to 4): a later connection-open — after an operator cleans
-      up the residuals — re-runs this step and lands the index then (PRD
-      decision #4: "the next deploy lands the index").
+      never collide), invoke ``residual_dup_escalation_cb(project_root,
+      residual_groups)`` when provided (best-effort — a raising callback is
+      caught and logged, never propagated), and SKIP the index build.
+      ``user_version`` is left at 3 (NOT stamped to 4): a later
+      connection-open — after an operator cleans up the residuals — re-runs
+      this step and lands the index then (PRD decision #4: "the next deploy
+      lands the index").
     * **Clean** — build ``ux_tasks_candidate_key``, a PARTIAL UNIQUE index
       over ``(tag, candidate_key)`` excluding NULL keys and cancelled rows,
       then stamp ``user_version = 4``.
@@ -482,6 +502,29 @@ async def _migrate_v3_to_v4(conn: aiosqlite.Connection) -> None:
                 'will land the index. Groups: %s',
                 len(residual_rows), groups_desc,
             )
+
+            residual_groups = [
+                {
+                    'tag': row['tag'],
+                    'candidate_key': row['candidate_key'],
+                    'task_ids': row['ids'].split(','),
+                    'count': row['n'],
+                }
+                for row in residual_rows
+            ]
+            if residual_dup_escalation_cb is not None:
+                try:
+                    residual_dup_escalation_cb(project_root, residual_groups)
+                except Exception:
+                    # A broken/misbehaving callback must never crash
+                    # connection-open — the skip above has already happened;
+                    # escalation is purely additive.
+                    logger.exception(
+                        'sqlite_task_backend: residual_dup_escalation_cb '
+                        'raised while escalating %d residual duplicate '
+                        'candidate_key group(s) for project_root=%r',
+                        len(residual_groups), project_root,
+                    )
             return
 
         try:
@@ -668,6 +711,7 @@ class SqliteTaskBackend:
         config: TaskmasterConfig | None = None,
         *,
         task_metadata_enforce: bool = False,
+        residual_dup_escalation_cb: Any = None,
     ) -> None:
         self.config = config
         # RED-TIER / restart-only (task 2162, W3-β): False (default) is
@@ -676,6 +720,13 @@ class SqliteTaskBackend:
         # True is enforce-mode — the same violation raises and the write is
         # rolled back. See config.schema.TaskMetadataConfig.
         self._task_metadata_enforce = task_metadata_enforce
+        # Injectable escalation seam for the v3->v4 migration's residual-dup
+        # skip path (fm-task-dedup W8 task A2) — defaults to the production
+        # helper so escalations fire without any server wiring; tests inject
+        # a recording stub. See _migrate_v3_to_v4.
+        self._residual_dup_escalation_cb = (
+            residual_dup_escalation_cb or emit_residual_candidate_key_escalation
+        )
         self._connections: dict[str, aiosqlite.Connection] = {}
         # Guards the connection map AND each project's first-access bring-up
         # (schema + WAL pragmas). Held briefly during open; released before
@@ -833,7 +884,11 @@ class SqliteTaskBackend:
             await conn.execute('PRAGMA foreign_keys=OFF')
             await conn.executescript(_SCHEMA_SQL)
             await conn.commit()
-            await _migrate(conn)
+            await _migrate(
+                conn,
+                project_root=project_root,
+                residual_dup_escalation_cb=self._residual_dup_escalation_cb,
+            )
             # Cache once per project_root — see the field docstring in
             # __init__ for why this is safe to compute a single time here
             # rather than on every claimant write.
