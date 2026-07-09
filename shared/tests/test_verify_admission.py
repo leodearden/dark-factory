@@ -10,6 +10,12 @@ referenced throughout this suite.
 
 from __future__ import annotations
 
+import os
+import signal
+import subprocess
+import sys
+import time
+
 
 class TestNicePrefix:
     def test_merge_role(self):
@@ -60,3 +66,166 @@ class TestModuleExports:
         import shared.verify_admission as va
 
         assert set(va.__all__) == {'acquire_task_slot', 'nice_prefix'}
+
+
+class TestAcquireInProcess:
+    """In-process flock semaphore behavior (wait=False unless noted).
+
+    flock locks bind to the open FILE DESCRIPTION, not the process, so two
+    separate os.open() + flock() calls contend even within a single process
+    — mutual exclusion and N-slot counting are fully testable in-process.
+    """
+
+    def test_merge_role_never_holds_and_does_not_block_when_slot_saturated(self, tmp_path):
+        """(a) merge is the anti-livelock bypass: held=False, and it must not
+        block even when asked to wait against an already-saturated N=1 slot.
+        """
+        from shared.verify_admission import acquire_task_slot
+
+        with acquire_task_slot('task', slots_dir=tmp_path, n=1, wait=False) as task_held:
+            assert task_held is True
+            with acquire_task_slot('merge', slots_dir=tmp_path, n=1, wait=True) as merge_held:
+                assert merge_held is False
+
+    def test_offline_role_never_holds(self, tmp_path):
+        """(b) offline is un-gated like merge — always held=False."""
+        from shared.verify_admission import acquire_task_slot
+
+        with acquire_task_slot('offline', slots_dir=tmp_path, n=1, wait=False) as held:
+            assert held is False
+
+    def test_task_role_holds_when_slot_free(self, tmp_path):
+        """(c) task acquires when a slot is free."""
+        from shared.verify_admission import acquire_task_slot
+
+        with acquire_task_slot('task', slots_dir=tmp_path, n=1, wait=False) as held:
+            assert held is True
+
+    def test_background_role_holds_when_slot_free(self, tmp_path):
+        """(c) background acquires when a slot is free."""
+        from shared.verify_admission import acquire_task_slot
+
+        with acquire_task_slot('background', slots_dir=tmp_path, n=1, wait=False) as held:
+            assert held is True
+
+    def test_n1_nested_acquire_blocked_while_outer_holds(self, tmp_path):
+        """(d) N=1: a nested wait=False acquire finds no free slot while the
+        outer acquire still holds it.
+        """
+        from shared.verify_admission import acquire_task_slot
+
+        with acquire_task_slot('task', slots_dir=tmp_path, n=1, wait=False) as h1:
+            assert h1 is True
+            with acquire_task_slot('task', slots_dir=tmp_path, n=1, wait=False) as h2:
+                assert h2 is False
+
+    def test_release_frees_the_slot_for_a_fresh_acquire(self, tmp_path):
+        """(e) once the outer `with` exits, the slot is free again."""
+        from shared.verify_admission import acquire_task_slot
+
+        with acquire_task_slot('task', slots_dir=tmp_path, n=1, wait=False) as h1:
+            assert h1 is True
+
+        with acquire_task_slot('task', slots_dir=tmp_path, n=1, wait=False) as h2:
+            assert h2 is True
+
+    def test_n2_allows_two_concurrent_holders_then_saturates(self, tmp_path):
+        """(f) N=2: two nested acquires both succeed; a 3rd finds nothing free."""
+        from shared.verify_admission import acquire_task_slot
+
+        with acquire_task_slot('task', slots_dir=tmp_path, n=2, wait=False) as h1:
+            assert h1 is True
+            with acquire_task_slot('task', slots_dir=tmp_path, n=2, wait=False) as h2:
+                assert h2 is True
+                with acquire_task_slot('task', slots_dir=tmp_path, n=2, wait=False) as h3:
+                    assert h3 is False
+
+
+def _wait_for_marker(marker_path, timeout: float = 5.0) -> bool:
+    """Poll for *marker_path* to appear; return False on timeout.
+
+    Test-side synchronization only (bounded, unlike the production module's
+    untimed wait) so a child process that fails to start doesn't hang the
+    suite forever.
+    """
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if marker_path.exists():
+            return True
+        time.sleep(0.02)
+    return False
+
+
+# Inline stdlib child: flocks slots_dir/slot-1 (matching the N=1 slot-file
+# naming the module contract specifies), signals readiness via a marker
+# file, then sleeps so the parent can observe it holding the slot.
+_SELF_HEAL_CHILD_SRC = (
+    'import fcntl, os, sys, time\n'
+    "fd = os.open(sys.argv[1], os.O_RDWR | os.O_CREAT, 0o644)\n"
+    'fcntl.flock(fd, fcntl.LOCK_EX)\n'
+    "open(sys.argv[2], 'w').write('ready')\n"
+    'time.sleep(60)\n'
+)
+
+
+class TestRealProcessSignals:
+    """Signals that need actual subprocesses: flock self-heal is a kernel
+    behavior triggered by process death, and FD non-inheritance is only
+    observable across a real exec boundary.
+    """
+
+    def test_self_heal_slot_released_when_holder_is_sigkilled(self, tmp_path):
+        """(g) A holder that is SIGKILLed (no clean shutdown, no atexit)
+        still releases its slot — the kernel frees the flock on process
+        death. No canary/daemon is involved; this is self-heal via the OS.
+        """
+        from shared.verify_admission import acquire_task_slot
+
+        marker = tmp_path / 'ready.marker'
+        slot_path = tmp_path / 'slot-1'
+        proc = subprocess.Popen(
+            [sys.executable, '-c', _SELF_HEAL_CHILD_SRC, str(slot_path), str(marker)],
+        )
+        try:
+            assert _wait_for_marker(marker), 'child never signaled readiness'
+
+            with acquire_task_slot('task', slots_dir=tmp_path, n=1, wait=False) as held_while_alive:
+                assert held_while_alive is False
+
+            os.kill(proc.pid, signal.SIGKILL)
+            proc.wait(timeout=5)
+            proc = None
+
+            with acquire_task_slot('task', slots_dir=tmp_path, n=1, wait=False) as held_after_death:
+                assert held_after_death is True
+        finally:
+            if proc is not None:
+                proc.kill()
+                proc.wait(timeout=5)
+
+    def test_fd_non_inheritance_close_fds_false_child_does_not_pin_slot(self, tmp_path):
+        """(h) A close_fds=False descendant spawned while a slot is held must
+        not pin that slot after the holder releases — the slot FD is marked
+        non-inheritable (C-no-FD-inheritance), so it does not survive the
+        child's exec regardless of the parent's close_fds setting.
+        """
+        from shared.verify_admission import acquire_task_slot
+
+        sleeper = subprocess.Popen(
+            [sys.executable, '-c', 'import time; time.sleep(60)'],
+            close_fds=False,
+        )
+        try:
+            with acquire_task_slot('task', slots_dir=tmp_path, n=1, wait=False) as held:
+                assert held is True
+                # Give the child a moment to complete its exec (any
+                # CLOEXEC-marked fd is closed at exec time, not at fork time).
+                time.sleep(0.2)
+
+            # The outer `with` released the slot. If the slot fd had leaked
+            # into the still-running sleeper, this fresh acquire would fail.
+            with acquire_task_slot('task', slots_dir=tmp_path, n=1, wait=False) as held_after:
+                assert held_after is True
+        finally:
+            sleeper.kill()
+            sleeper.wait(timeout=5)
