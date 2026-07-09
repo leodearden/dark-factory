@@ -65,6 +65,11 @@ if [[ ! -f "$CONFIG" ]]; then
     exit 1
 fi
 
+if ! "$PY" -c "import sys, yaml; yaml.safe_load(open(sys.argv[1]))" "$CONFIG" 2>/dev/null; then
+    echo "ERROR: ${CONFIG} failed to parse as YAML" >&2
+    exit 1
+fi
+
 already_enabled() {
     "$PY" -c "
 import sys, yaml
