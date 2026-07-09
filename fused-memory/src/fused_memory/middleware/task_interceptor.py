@@ -268,6 +268,40 @@ class _PreparedTicket:
         return self.prepared.prompt_tokens if self.prepared is not None else 0
 
 
+@dataclasses.dataclass
+class _TicketLifecycle:
+    """Mutable per-ticket record threaded through one batch dispatch.
+
+    Wraps a ticket's :class:`_PreparedTicket` bundle together with the
+    curator decision and the resolved terminal, so a single object is the
+    source of truth for a ticket's entire journey through
+    :meth:`TaskInterceptor._process_add_tickets_batch_prepared`.  This
+    replaces that method's historical correlated parallel arrays
+    (``decisions``, ``curator_degrade_reasons``, ``resolved_task_ids``) and
+    the ``non_none-space`` <-> ``ticket_data-space`` index remapping those
+    arrays required.
+
+    ``target`` is a DIRECT reference to the sibling record a within-batch
+    ``drop`` decision points at (resolved once, at decision-attach time,
+    from the curator's ``batch_target_index`` position within the
+    curatable slice) — never an integer index, so there is no second index
+    space left to get wrong.
+    """
+
+    ticket: _PreparedTicket
+    decision: CuratorDecision | None = None
+    degrade_reason: str | None = None
+    # Self-referential — task_interceptor.py has no
+    # `from __future__ import annotations`, so this MUST stay a string
+    # forward-ref: a bare `_TicketLifecycle | None` annotation would
+    # NameError at class-definition time (the class doesn't exist yet
+    # while its own body is being evaluated).
+    target: '_TicketLifecycle | None' = None
+    status: str | None = None
+    task_id: str | None = None
+    dispatched: bool = False
+
+
 def _format_ticket_result(row: dict) -> dict:
     """Format a terminal ticket row as the public resolve_ticket response dict.
 
@@ -3077,36 +3111,44 @@ class TaskInterceptor:
             if not ticket_data:
                 return  # All tickets short-circuited by idempotency
 
-            # non_none-space slice that goes to the curator.  We pass the
-            # already-prepared bundles so the curator skips the second
-            # corpus build it would otherwise do inside curate_batch.
-            non_none_prepared: list[PreparedCandidate] = [
-                t.prepared
-                for t in ticket_data
-                if t.candidate is not None and t.prepared is not None
+            # Build one lifecycle record per active ticket — the single
+            # source of truth for that ticket's decision, degrade reason,
+            # within-batch-drop target, and resolved terminal.  Replaces the
+            # historical non_none-space / ticket_data-space parallel arrays
+            # entirely (see _TicketLifecycle docstring).
+            records: list[_TicketLifecycle] = [
+                _TicketLifecycle(ticket=t) for t in ticket_data
             ]
-            non_none_to_ticket_data = [
-                i
-                for i, t in enumerate(ticket_data)
-                if t.candidate is not None and t.prepared is not None
-            ]
-            # Tickets that have a candidate but no prepared bundle — usually
+
+            # Curatable slice: records whose ticket has both a candidate and
+            # a prepared bundle.  We pass the already-prepared bundles so
+            # the curator skips the second corpus build it would otherwise
+            # do inside curate_batch.  Built as one fused loop (rather than
+            # two separately-filtered comprehensions) so curatable_records
+            # and non_none_prepared are guaranteed index-aligned — the
+            # invariant curate_batch_prepared's positional response relies
+            # on — and so prepared's None-check narrows for the type
+            # checker at the point of use.
+            curatable_records: list[_TicketLifecycle] = []
+            non_none_prepared: list[PreparedCandidate] = []
+            for r in records:
+                if r.ticket.candidate is not None and r.ticket.prepared is not None:
+                    curatable_records.append(r)
+                    non_none_prepared.append(r.ticket.prepared)
+            # Records that have a candidate but no prepared bundle — usually
             # because :meth:`_prepare_ticket` could not invoke
             # ``prepare_candidate`` (transient error, or a mock without the
             # method during tests).  These are dispatched via single-item
             # ``curate()`` after the main batch so we still get the curator's
             # decision for them instead of falling straight through to
             # ``tm.add_task`` (the latter would silently bypass the gate).
-            unprepared_indices: list[int] = [
-                i
-                for i, t in enumerate(ticket_data)
-                if t.candidate is not None and t.prepared is None
+            unprepared_records: list[_TicketLifecycle] = [
+                r
+                for r in records
+                if r.ticket.candidate is not None and r.ticket.prepared is None
             ]
-            # Per-ticket curator degrade reason (populated on fallback path).
-            curator_degrade_reasons: list[str | None] = [None] * len(ticket_data)
 
             # Call curate_batch_prepared — one LLM round-trip for all candidates.
-            decisions: list[CuratorDecision | None]
             if curator is not None and non_none_prepared:
                 try:
                     batch_decisions = await curator.curate_batch_prepared(
@@ -3114,48 +3156,43 @@ class TaskInterceptor:
                         project_id,
                         project_root,
                     )
-                    # Map decisions back to ticket_data-space (some candidates
-                    # are None).  batch_target_index emitted by the curator is
-                    # in non_none-space (positions within non_none_prepared,
-                    # which is what the LLM saw).  Remap to ticket_data-space
-                    # so the topological dispatch loop can index
-                    # resolved_task_ids by ticket_data-space indices.
-                    batch_idx = 0
-                    decisions = []
-                    for _i, t in enumerate(ticket_data):
-                        if t.candidate is None or t.prepared is None:
-                            decisions.append(None)
-                            continue
+                    # Attach each returned decision to its record and resolve
+                    # batch_target_index — a position WITHIN curatable_records
+                    # (the slice the curator actually saw) — to a DIRECT
+                    # reference to that sibling record.  No arithmetic and no
+                    # second index space: the topological dispatch below
+                    # reads rec.target.task_id / rec.target.dispatched
+                    # straight off the object.
+                    for idx, rec in enumerate(curatable_records):
                         bd = (
-                            batch_decisions[batch_idx] if batch_idx < len(batch_decisions) else None
+                            batch_decisions[idx] if idx < len(batch_decisions) else None
                         )
-                        # Remap batch_target_index: non_none-space → ticket_data-space.
                         if bd is not None and bd.batch_target_index is not None:
                             local_bti = bd.batch_target_index
-                            if 0 <= local_bti < len(non_none_to_ticket_data):
-                                remapped_bti = non_none_to_ticket_data[local_bti]
-                                bd = dataclasses.replace(
-                                    bd,
-                                    batch_target_index=remapped_bti,
-                                )
+                            if 0 <= local_bti < len(curatable_records):
+                                rec.decision = bd
+                                rec.target = curatable_records[local_bti]
                             else:
-                                # Out-of-range in non_none-space: degrade to
-                                # create to avoid substituting a wrong task_id.
+                                # Out-of-range within the curatable slice:
+                                # degrade to create to avoid substituting a
+                                # wrong task_id.
                                 logger.warning(
                                     '_process_add_tickets_batch_prepared: '
-                                    'batch_target_index=%d out of non_none '
+                                    'batch_target_index=%d out of curatable '
                                     'range [0, %d) for ticket %s; degrading '
                                     'to create',
                                     local_bti,
-                                    len(non_none_to_ticket_data),
-                                    t.ticket_id,
+                                    len(curatable_records),
+                                    rec.ticket.ticket_id,
                                 )
-                                bd = CuratorDecision(
+                                rec.decision = CuratorDecision(
                                     action='create',
                                     justification=(f'batch-target-out-of-range: local={local_bti}'),
                                 )
-                        decisions.append(bd)
-                        batch_idx += 1
+                                rec.target = None
+                        else:
+                            rec.decision = bd
+                            rec.target = None
                 except AllAccountsCappedException:
                     # Cap exhaustion bubbles to the worker, which defers the
                     # whole batch and waits for cap reset.  Re-raising here
@@ -3170,8 +3207,8 @@ class TaskInterceptor:
                     # size-1, where curate() handles its own degrade).  But
                     # keep this catch as a defensive net for any escape — same
                     # legacy behaviour: degrade all candidates to a per-item
-                    # curate() call so per-ticket curator_degrade_reason is
-                    # still recorded in result_json.
+                    # curate() call so per-ticket degrade_reason is still
+                    # recorded in result_json.
                     logger.warning(
                         '_process_add_tickets_batch_prepared: '
                         'curate_batch_prepared raised CuratorFailureError '
@@ -3180,21 +3217,18 @@ class TaskInterceptor:
                         project_id,
                         len(non_none_prepared),
                     )
-                    decisions = []
-                    for i, t in enumerate(ticket_data):
-                        if t.candidate is None:
-                            decisions.append(None)
+                    for rec in records:
+                        if rec.ticket.candidate is None:
                             continue
                         try:
-                            d = await curator.curate(
-                                t.candidate,
+                            rec.decision = await curator.curate(
+                                rec.ticket.candidate,
                                 project_id,
                                 project_root,
                             )
-                            decisions.append(d)
                         except CuratorFailureError as e:
-                            decisions.append(CuratorDecision(action='create'))
-                            curator_degrade_reasons[i] = str(e)
+                            rec.decision = CuratorDecision(action='create')
+                            rec.degrade_reason = str(e)
                     # Refer to exc to satisfy linters; main signal logged above.
                     _ = exc
                 except Exception:  # pyright: ignore[reportUnusedExcept]
@@ -3205,9 +3239,8 @@ class TaskInterceptor:
                         project_id,
                         len(non_none_prepared),
                     )
-                    decisions = [None] * len(ticket_data)
-            else:
-                decisions = [None] * len(ticket_data)
+                    for rec in records:
+                        rec.decision = None
 
             # Backfill any unprepared candidates via single-item curate() so
             # we still get a curator decision instead of falling through to
@@ -3216,77 +3249,76 @@ class TaskInterceptor:
             # rarely hit.  In tests where the curator mock omits
             # prepare_candidate, this restores the legacy curate-then-dispatch
             # behaviour the tests rely on.
-            if curator is not None and unprepared_indices:
-                for i in unprepared_indices:
-                    t = ticket_data[i]
-                    if t.candidate is None:
+            if curator is not None and unprepared_records:
+                for rec in unprepared_records:
+                    if rec.ticket.candidate is None:
                         continue
                     try:
-                        decisions[i] = await curator.curate(
-                            t.candidate,
+                        rec.decision = await curator.curate(
+                            rec.ticket.candidate,
                             project_id,
                             project_root,
                         )
                     except CuratorFailureError as exc:
-                        decisions[i] = CuratorDecision(action='create')
-                        curator_degrade_reasons[i] = str(exc)
+                        rec.decision = CuratorDecision(action='create')
+                        rec.degrade_reason = str(exc)
 
             # ── Topologically-ordered dispatch ────────────────────────────────
-            # Items with batch_target_index wait for their target to be
-            # dispatched first so we can substitute the target's task_id into
-            # the dependent's mark_resolved.  We use an iterative pass that
-            # drains items that are ready (target already resolved or no
-            # batch_target_index).  After each full pass we check for progress;
-            # if none is made (all remaining items form a cycle), we coerce them
-            # to create and drain.  Cycles should not occur in practice because
-            # _parse_batch_decisions already degrades cycles, but we handle them
-            # defensively here too.
+            # Records with a target wait for that target to be dispatched
+            # first so we can substitute the target's task_id into the
+            # dependent's mark_resolved.  We use an iterative pass that
+            # drains records that are ready (target already dispatched or no
+            # target at all).  After each full pass we check for progress; if
+            # none is made (all remaining records form a cycle), we coerce
+            # them to create and drain.  Cycles should not occur in practice
+            # because _parse_batch_decisions already degrades cycles, but we
+            # handle them defensively here too.
+            pending: list[_TicketLifecycle] = list(records)
 
-            # resolved_task_ids[i] = task_id string (or None on failure) once item i is done.
-            resolved_task_ids: dict[int, str | None] = {}
-            pending_indices: list[int] = list(range(len(ticket_data)))
-
-            while pending_indices:
+            while pending:
                 made_progress = False
-                still_pending: list[int] = []
-                for i in pending_indices:
-                    dec = decisions[i] if i < len(decisions) else None
-                    batch_target = dec.batch_target_index if dec is not None else None
+                still_pending: list[_TicketLifecycle] = []
+                for rec in pending:
+                    dec = rec.decision
+                    target = rec.target
 
-                    # Can dispatch if: no batch_target_index, OR target already resolved.
-                    if batch_target is not None and batch_target not in resolved_task_ids:
-                        still_pending.append(i)
+                    # Can dispatch if: no target, OR target already dispatched.
+                    if target is not None and not target.dispatched:
+                        still_pending.append(rec)
                         continue
 
-                    # Resolve the decision: if this is a within-batch drop, substitute
-                    # the sibling's task_id (or degrade to create if sibling failed).
+                    # Resolve the decision: if this is a within-batch drop,
+                    # substitute the sibling's task_id (or degrade to create
+                    # if the sibling failed).
                     effective_decision = dec
-                    if dec is not None and dec.action == 'drop' and batch_target is not None:
-                        sibling_task_id = resolved_task_ids.get(batch_target)
+                    if dec is not None and dec.action == 'drop' and target is not None:
+                        sibling_task_id = target.task_id
                         if sibling_task_id:
                             # Sibling created or combined — use its task_id.
                             effective_decision = CuratorDecision(
                                 action='drop',
                                 target_id=sibling_task_id,
                                 justification=(
-                                    f'batch_target_index={batch_target}: {dec.justification}'
+                                    f'batch_target_index (ticket={target.ticket.ticket_id}): '
+                                    f'{dec.justification}'
                                 ),
                             )
                         else:
                             # Sibling failed — degrade this item to create.
                             logger.warning(
                                 '_process_add_tickets_batch_prepared: '
-                                'batch_target_index=%d for ticket %s had no '
-                                'task_id; degrading to create',
-                                batch_target,
-                                ticket_data[i].ticket_id,
+                                'batch_target_index for ticket %s pointed at '
+                                'ticket %s which had no task_id; degrading '
+                                'to create',
+                                rec.ticket.ticket_id,
+                                target.ticket.ticket_id,
                             )
                             effective_decision = CuratorDecision(
                                 action='create',
                                 justification='batch-sibling-failed: degraded to create',
                             )
 
-                    t = ticket_data[i]
+                    t = rec.ticket
                     status = 'failed'
                     task_id: str | None = None
                     reason: str | None = None
@@ -3308,11 +3340,7 @@ class TaskInterceptor:
                             kwargs=t.kwargs,
                             metadata=t.metadata,
                             curator=curator,
-                            curator_degrade_reason=(
-                                curator_degrade_reasons[i]
-                                if i < len(curator_degrade_reasons)
-                                else None
-                            ),
+                            curator_degrade_reason=rec.degrade_reason,
                         )
                     except asyncio.CancelledError:
                         raise
@@ -3347,29 +3375,31 @@ class TaskInterceptor:
 
                     self._signal_ticket_event(t.ticket_id)
 
-                    # Record this item's result for downstream sibling drops.
-                    resolved_task_ids[i] = task_id
+                    # Record this ticket's result for downstream sibling drops.
+                    rec.status = status
+                    rec.task_id = task_id
+                    rec.dispatched = True
                     made_progress = True
 
-                pending_indices = still_pending
+                pending = still_pending
 
-                if pending_indices and not made_progress:
-                    # Remaining items form a cycle (should not happen after parser
-                    # cycle detection, but handle defensively).
+                if pending and not made_progress:
+                    # Remaining records form a cycle (should not happen after
+                    # parser cycle detection, but handle defensively).
                     logger.warning(
                         '_process_add_tickets_batch_prepared: cycle in '
                         'batch_target_index graph for project %s; coercing '
                         '%d items to create',
                         project_id,
-                        len(pending_indices),
+                        len(pending),
                     )
-                    for i in pending_indices:
-                        dec = decisions[i] if i < len(decisions) else None
-                        decisions[i] = CuratorDecision(
+                    for rec in pending:
+                        rec.decision = CuratorDecision(
                             action='create',
                             justification='batch-cycle: coerced to create',
                         )
-                    # Don't update pending_indices — the next iteration will drain them.
+                        rec.target = None
+                    # Don't update pending — the next iteration will drain them.
 
     def _signal_ticket_event(self, ticket_id: str) -> None:
         """Wake all callers waiting on resolve_ticket for this ticket.
