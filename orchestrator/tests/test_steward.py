@@ -278,6 +278,53 @@ class TestStewardSessionPersistence:
 
 
 # ---------------------------------------------------------------------------
+# Live-continuation resume must deliver the real prompt (task W4-eta step-4)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestStewardResumeDeliversContinuationPrompt:
+    """A live-continuation resume must deliver `_handle_escalation`'s actual
+    continuation prompt to the agent, not `invoke_with_cap_retry`'s
+    crash-recovery placeholder (CRASH_RECOVERY_RESUME_PROMPT = 'continue').
+
+    Mirrors TestStewardSessionPersistence::test_second_invocation_uses_resume
+    but additionally asserts the delivered prompt CONTENT — the gap that let
+    the regression slip through review (that test only asserts
+    resume_session_id, never the prompt). Exercises the real
+    invoke_with_cap_retry via the no-gate fast path (steward.usage_gate
+    defaults to None).
+
+    FAILS RED: invoke_with_cap_retry unconditionally overwrites the prompt to
+    CRASH_RECOVERY_RESUME_PROMPT whenever the caller pre-sets
+    resume_session_id, so the steward's real continuation prompt (carrying
+    the new escalation's content) never reaches the agent on resume.
+    """
+
+    async def test_resumed_invocation_delivers_continuation_prompt(
+        self, steward, mock_briefing,
+    ):
+        from shared.cli_invoke import CRASH_RECOVERY_RESUME_PROMPT
+
+        steward._session_id = 'sess-first'
+        mock_briefing.build_steward_continuation_prompt.return_value = (
+            'New escalation details.'
+        )
+        esc = _make_escalation(id='esc-42-2')
+        steward.escalation_queue.get.return_value = _make_escalation(
+            id='esc-42-2', status='resolved', resolution='fixed',
+        )
+
+        with patch('orchestrator.steward.invoke_agent', new_callable=AsyncMock) as mock_invoke:
+            mock_invoke.return_value = _make_result(session_id='sess-second')
+            await steward._handle_escalation(esc)
+
+        assert mock_invoke.call_args.kwargs['resume_session_id'] == 'sess-first'
+        assert mock_invoke.call_args.kwargs['prompt'] == 'New escalation details.'
+        assert mock_invoke.call_args.kwargs['prompt'] != CRASH_RECOVERY_RESUME_PROMPT
+
+
+# ---------------------------------------------------------------------------
 # Wiring contract: _invoke_with_session routes through invoke_with_cap_retry
 # ---------------------------------------------------------------------------
 
