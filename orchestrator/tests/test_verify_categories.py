@@ -406,3 +406,91 @@ class TestClassifierByteIdentityGolden:
         assert worst == 'infra_timeout'
         assert type(worst) is str
         assert json.dumps({'category': worst}) == json.dumps({'category': 'infra_timeout'})
+
+
+# ---------------------------------------------------------------------------
+# step-11: cross-module single-source + sentinel-namespace separation
+#
+# NOTE on the F2 wire golden (json.dumps({'category': member}) ==
+# json.dumps({'category': member.value}) for every FailureCategory member):
+# already covered by TestFailureCategoryWireByteIdentity.
+# test_json_dumps_of_every_member_matches_plain_str (step-1) — not duplicated
+# here.
+# ---------------------------------------------------------------------------
+
+
+class TestAssertSentinelsDisjoint:
+    """_assert_sentinels_disjoint(sentinels, enum_cls) is the reusable,
+    unit-testable guard step-12 wires into verify_runner.py's import to keep
+    the UNSCOPED_TYPECHECK_* sentinel namespace provably separate from
+    FailureCategory (mirrors _validate_exhaustive's synthetic-input design).
+
+    RED today: the helper does not exist yet.
+    """
+
+    def test_colliding_sentinel_raises_and_names_it(self):
+        from enum import StrEnum
+
+        from orchestrator.verify_categories import _assert_sentinels_disjoint
+
+        class _Synth(StrEnum):
+            KNOWN = 'synthetic_known_value'
+
+        with pytest.raises(AssertionError, match='synthetic_known_value'):
+            _assert_sentinels_disjoint(
+                frozenset({'synthetic_known_value', 'totally_unrelated_sentinel'}), _Synth,
+            )
+
+    def test_disjoint_sentinels_do_not_raise(self):
+        from enum import StrEnum
+
+        from orchestrator.verify_categories import _assert_sentinels_disjoint
+
+        class _Synth(StrEnum):
+            KNOWN = 'synthetic_known_value'
+
+        _assert_sentinels_disjoint(frozenset({'totally_unrelated_sentinel'}), _Synth)
+
+    def test_real_unscoped_sentinels_are_disjoint_from_failure_category(self):
+        # Exercises the helper against verify_runner's real production
+        # sentinels — the exact call step-12 wires in at verify_runner's
+        # import time.
+        from orchestrator.verify_categories import FailureCategory, _assert_sentinels_disjoint
+        from orchestrator.verify_runner import _UNSCOPED_SENTINEL_CATEGORIES
+
+        _assert_sentinels_disjoint(_UNSCOPED_SENTINEL_CATEGORIES, FailureCategory)
+
+    def test_importing_verify_runner_does_not_raise(self):
+        # Defensive golden for step-12: once the guard is wired into
+        # verify_runner.py's module body, a real collision would raise at
+        # import time. Import succeeding here proves the production
+        # sentinel/category data stays disjoint.
+        import orchestrator.verify_runner  # noqa: F401
+
+
+class TestCrossModulePreexistingSingleSourced:
+    """merge_queue.py and workflow.py must single-source
+    PREEXISTING_BREAK_SKIP_CATEGORIES from verify_categories (identity, not
+    just equality) — step-12 switches both imports directly to
+    orchestrator.verify_categories instead of via orchestrator.verify.
+
+    Already GREEN as a side effect of step-10 (verify.py re-exports the
+    verify_categories object unchanged, and `from X import Y` binds by
+    reference — no copy happens across either import hop). Kept as a
+    regression guard that stays true once step-12 switches the import
+    source directly.
+    """
+
+    def test_merge_queue_preexisting_is_the_derived_object(self):
+        from orchestrator import merge_queue, verify_categories
+        assert (
+            merge_queue.PREEXISTING_BREAK_SKIP_CATEGORIES
+            is verify_categories.PREEXISTING_BREAK_SKIP_CATEGORIES
+        )
+
+    def test_workflow_preexisting_is_the_derived_object(self):
+        from orchestrator import verify_categories, workflow
+        assert (
+            workflow.PREEXISTING_BREAK_SKIP_CATEGORIES
+            is verify_categories.PREEXISTING_BREAK_SKIP_CATEGORIES
+        )
