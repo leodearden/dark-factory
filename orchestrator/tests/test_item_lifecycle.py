@@ -11,6 +11,16 @@ Steps covered:
   step-6 GREEN — add _LEGAL_TRANSITIONS + implement transition()
   step-7 RED   — illegal transitions raise IllegalLifecycleTransition
   step-8 GREEN — define IllegalLifecycleTransition + harden transition()
+  step-9/10    — GATE_REVERIFY -> MERGING cascade edge (see design_decisions)
+
+Amendments (post-verification reviewer_comprehensive pass):
+  * TestItemLifecycleStateOverlapWithLivePhaseStrings pins the
+    VERIFYING/GATE_REVERIFY/FINALIZING wire-value overlap against the real
+    pipeline call sites (test_coverage + architecture_documentation_accuracy
+    findings) instead of only comparing the enum against its own literals.
+  * TestItemLifecycleTransitionRedispatchParkedEntryEdges gives the
+    AWAITING_VERIFY -> REDISPATCH_PARKED and MERGING -> REDISPATCH_PARKED
+    edges dedicated standalone happy-path coverage (test_coverage finding).
 
 This module imports orchestrator.merge_queue.ItemLifecycle (and friends)
 LOCALLY inside each test that needs them — those symbols do not exist until
@@ -296,3 +306,85 @@ class TestItemLifecycleIllegalTransitions:
             )
 
         assert registry.current('mr-unknown0') is None
+
+
+# ---------------------------------------------------------------------------
+# Amendment (reviewer_comprehensive, post-verification): pin the live-phase-
+# string overlap and give the two previously-implicit REDISPATCH_PARKED
+# entry edges dedicated standalone coverage.
+# ---------------------------------------------------------------------------
+
+
+class TestItemLifecycleStateOverlapWithLivePhaseStrings:
+    """Only VERIFYING / GATE_REVERIFY / FINALIZING currently share a wire
+    value with a live ``InflightEntry.phase``/``_verify_phase`` string in the
+    real pipeline (task 2164 amendment; reviewer_comprehensive
+    architecture_documentation_accuracy + test_coverage findings).
+
+    Reads the ACTUAL call-site source via ``inspect.getsource`` rather than
+    comparing the enum against its own literals (the existing
+    ``test_members_are_str_instances_with_lowercase_wire_values`` is
+    circular for that purpose) — this test breaks if the pipeline's phase
+    strings and the enum wire values ever drift apart, which is exactly the
+    class of overstatement the review caught in the ``ItemLifecycleState``
+    docstring (it originally claimed ALL ten members matched existing phase
+    strings; only these three do).
+    """
+
+    def test_verifying_gate_reverify_finalizing_match_live_phase_strings(self) -> None:
+        import inspect
+
+        from orchestrator.merge_queue import ItemLifecycleState, SpeculativeMergeWorker
+
+        dispatch_source = inspect.getsource(SpeculativeMergeWorker._run_inflight_verify)
+        finalize_source = inspect.getsource(SpeculativeMergeWorker._finalize_inflight)
+
+        assert "_verify_phase = 'verifying'" in dispatch_source
+        assert ItemLifecycleState.VERIFYING == 'verifying'
+
+        assert "phase = 'gate_reverify'" in finalize_source
+        assert ItemLifecycleState.GATE_REVERIFY == 'gate_reverify'
+
+        assert "phase = 'finalizing'" in finalize_source
+        assert ItemLifecycleState.FINALIZING == 'finalizing'
+
+
+class TestItemLifecycleTransitionRedispatchParkedEntryEdges:
+    """Dedicated standalone happy-path coverage for the two
+    ``_LEGAL_TRANSITIONS`` edges into REDISPATCH_PARKED that were previously
+    only exercised incidentally as part of other tests (task 2164 amendment;
+    reviewer_comprehensive test_coverage finding).
+    """
+
+    def test_awaiting_verify_to_redispatch_parked_is_legal(self) -> None:
+        """An item parked back onto ``_redispatch`` before a verify runner
+        ever picks it up from ``_verifier_queue``."""
+        from orchestrator.merge_queue import ItemLifecycle, ItemLifecycleState
+
+        registry = ItemLifecycle()
+        rid = 'mr-dddddddd'
+        registry.register(rid, initial=ItemLifecycleState.AWAITING_VERIFY)
+
+        registry.transition(
+            rid, ItemLifecycleState.AWAITING_VERIFY, ItemLifecycleState.REDISPATCH_PARKED,
+        )
+
+        assert registry.current(rid) == ItemLifecycleState.REDISPATCH_PARKED
+
+    def test_merging_to_redispatch_parked_is_legal(self) -> None:
+        """The second hop of the cascade-remerge retry loop
+        (MERGING -> REDISPATCH_PARKED), previously only ever driven as part
+        of ``test_cascade_remerge_from_gate_reverify_is_a_legal_in_place_retry``
+        above -- exercised here standalone so this edge has its own explicit
+        regression signal."""
+        from orchestrator.merge_queue import ItemLifecycle, ItemLifecycleState
+
+        registry = ItemLifecycle()
+        rid = 'mr-eeeeeeee'
+        registry.register(rid, initial=ItemLifecycleState.MERGING)
+
+        registry.transition(
+            rid, ItemLifecycleState.MERGING, ItemLifecycleState.REDISPATCH_PARKED,
+        )
+
+        assert registry.current(rid) == ItemLifecycleState.REDISPATCH_PARKED
