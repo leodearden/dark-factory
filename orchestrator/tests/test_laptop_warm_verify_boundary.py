@@ -35,8 +35,11 @@ import time
 from pathlib import Path
 
 import pytest
+from click.testing import CliRunner
 from test_cli import _setup_verify_repo  # noqa: F401 -- reused cross-module
 
+import orchestrator.cli as cli_module
+from orchestrator.cli import main
 from orchestrator.config import OrchestratorConfig
 from orchestrator.git_ops import GitOps
 from orchestrator.verify_cancel import (  # noqa: F401 -- reused by row tests
@@ -562,3 +565,77 @@ def test_normal_warm_path_reuses_fixed_worktree_twice_no_escalation(tmp_path, mo
             f'run {n}: real beta discriminant fired on a happy-path result -- '
             f'_run_post_merge_verify would wrongly escalate: {result!r}'
         )
+
+
+# ---------------------------------------------------------------------------
+# Task 2309 step-5/6 -- SS9 Row 4: cancel-verify under a LIVE watchdog (B2
+# coexistence).  Extends test_cli.py:1656's real e2e cancel pattern with a
+# live HeartbeatWriter so the stdin watchdog stays armed throughout but never
+# self-fires, proving an explicit cancel-verify tree-kills cleanly anyway.
+# ---------------------------------------------------------------------------
+
+
+def test_cancel_verify_tree_kills_under_live_watchdog(tmp_path, monkeypatch):
+    """SS9 Row 4: cancel-verify leaves no orphan while the stdin watchdog is live.
+
+    Spawns a real ``verify-merge --request-id`` with a long-running sleeper
+    spec (the start_new_session escape) and a LIVE :class:`HeartbeatWriter`
+    driving its stdin, so :func:`verify_cancel.run_stdin_watchdog` stays armed
+    for the whole test but never times out or self-fires.  Waits for the
+    sleeper subtree to appear, then cancels via ``cancel-verify
+    --request-id`` through :class:`CliRunner` (the same in-process pattern as
+    test_cli.py's ``test_verify_merge_cancel_end_to_end``).
+
+    Asserts:
+
+    * cancel-verify exits 0 and removes the pgid file;
+    * the verify-merge subprocess exits promptly;
+    * the FULL descendant subtree (including the start_new_session sleeper
+      escape) AND the pgid leader itself are gone (``collect_descendants``
+      empty; ``os.killpg(pgid, 0)`` raises ``ProcessLookupError``) -- the live
+      watchdog and an explicit cancel coexist harmlessly and no orphan
+      survives.
+    """
+    repo, head_sha = _setup_verify_repo(tmp_path)
+    config_obj = OrchestratorConfig(project_root=repo)
+    worktree_base = GitOps(config_obj.git, repo).worktree_base
+    cfg_file = tmp_path / 'config.yaml'
+    write_verify_config(cfg_file, repo, persistent_merge_worktree=False)
+
+    REQUEST_ID = 'row4-cancel-under-watchdog'
+    pgf = pgid_file(worktree_base, REQUEST_ID)
+
+    child = spawn_verify_merge(
+        sha=head_sha, spec=sleeper_spec(300.0), cfg_file=cfg_file, request_id=REQUEST_ID,
+    )
+    heartbeat = HeartbeatWriter(child, interval=0.2).start()
+    try:
+        pgid_val = wait_for_pgid_file(pgf)
+        wait_subtree_live(pgid_val)
+
+        monkeypatch.setattr(cli_module, 'load_config', lambda _path: config_obj)
+        result = CliRunner().invoke(main, [
+            'cancel-verify', '--request-id', REQUEST_ID, '--config', str(cfg_file),
+        ])
+        assert result.exit_code == 0, (
+            f'cancel-verify expected exit 0, got {result.exit_code}; '
+            f'output={result.output!r}'
+        )
+        assert not pgf.exists(), 'pgid file must be removed by cancel-verify on success'
+
+        try:
+            child.wait(timeout=20)
+        except subprocess.TimeoutExpired:
+            pytest.fail(
+                'verify-merge subprocess did not exit within 20s after cancel-verify'
+            )
+
+        assert wait_subtree_gone(pgid_val, timeout=10.0), (
+            f'pgid {pgid_val}: subtree and/or leader still alive after '
+            f'cancel-verify (live-watchdog coexistence left an orphan)'
+        )
+    finally:
+        heartbeat.stop_heartbeats()
+        if child.poll() is None:
+            child.kill()
+            child.wait(timeout=5)
