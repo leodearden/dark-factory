@@ -13,6 +13,7 @@ import functools
 import inspect
 import json
 import re
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock
@@ -574,3 +575,70 @@ def qdrant_skipif(reason: str = 'Qdrant not reachable'):
     previous local copy.
     """
     return pytest.mark.skipif(not _qdrant_available(), reason=reason)
+
+
+# ---------------------------------------------------------------------------
+# Shared poll_until() helper (task 2377)
+# ---------------------------------------------------------------------------
+#
+# Generalizes the local poll-then-assert precedents in test_durable_queue.py
+# (_poll_until_dead and the inline deadline loop) into a single shared
+# helper. Converts fixed "sleep(N) then assert background work is done"
+# sites — fragile under host CPU oversubscription, since the hardcoded
+# window may elapse before the background drainer/worker/watchdog is even
+# scheduled — into a bounded poll on the same post-condition. A genuinely
+# stuck background task still surfaces as a clear AssertionError once the
+# (generous) deadline passes.
+# ---------------------------------------------------------------------------
+
+async def poll_until(
+    predicate: Callable[[], Any],
+    *,
+    timeout: float = 10.0,
+    interval: float = 0.02,
+    message: str | None = None,
+) -> Any:
+    """Poll *predicate* until it is truthy, returning its truthy result verbatim.
+
+    *predicate* may be a plain sync callable or an async/coroutine function —
+    either way it is called with no arguments on each iteration; if the
+    result is awaitable (``inspect.isawaitable``), it is awaited before the
+    truthiness check. This lets callers poll on state that itself requires an
+    await (e.g. ``lambda: queue.get_stats()``).
+
+    Checks *before* sleeping, so an already-true predicate returns on the
+    first call with no sleep at all. Uses the asyncio event-loop monotonic
+    clock (mirrors the ``_poll_until_dead`` precedent in
+    test_durable_queue.py) rather than wall-clock/perf_counter, to avoid the
+    same class of timing fragility this helper exists to remove.
+
+    Args:
+        predicate: Zero-arg sync or async callable evaluated each iteration.
+        timeout: Seconds to keep polling before giving up. Defaults to 10s —
+            generous enough to absorb host CPU oversubscription while still
+            catching a genuinely-stuck post-condition.
+        interval: Seconds to sleep between polls. Defaults to 0.02s.
+        message: Custom AssertionError message on timeout. When None, a
+            default message naming *timeout* is used.
+
+    Returns:
+        The predicate's truthy result, returned verbatim (not coerced to
+        ``True``) so callers can chain on it (e.g. a stats dict).
+
+    Raises:
+        AssertionError: *predicate* never became truthy within *timeout*
+            seconds — signals a genuinely-stuck background task, the same
+            failure class the fixed-sleep asserts this helper replaces used
+            to (accidentally) surface.
+    """
+    loop = asyncio.get_event_loop()
+    deadline = loop.time() + timeout
+    while True:
+        result = predicate()
+        if inspect.isawaitable(result):
+            result = await result
+        if result:
+            return result
+        if loop.time() >= deadline:
+            raise AssertionError(message or f'poll_until: condition not met within {timeout}s')
+        await asyncio.sleep(interval)
