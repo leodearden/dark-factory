@@ -175,6 +175,7 @@ class TestGenericMergeVerifyRedSpawnsDryRun:
         assert outcome is not None
         assert outcome.status == 'blocked'
         run_dry_run_mock.assert_awaited_once()
+        assert run_dry_run_mock.await_args is not None
         kwargs = run_dry_run_mock.await_args.kwargs
         assert kwargs['block_class'] == BlockClass.MERGE_VERIFY_RED, (
             f'Expected block_class=MERGE_VERIFY_RED; got {kwargs.get("block_class")!r}'
@@ -398,6 +399,7 @@ class TestUnscopedTypecheckFailedSpawns:
         assert outcome is not None
         assert outcome.status == 'blocked'
         run_dry_run_mock.assert_awaited_once()
+        assert run_dry_run_mock.await_args is not None
         kwargs = run_dry_run_mock.await_args.kwargs
         assert kwargs['block_class'] == BlockClass.MERGE_VERIFY_RED, (
             f'Expected block_class=MERGE_VERIFY_RED; got {kwargs.get("block_class")!r}'
