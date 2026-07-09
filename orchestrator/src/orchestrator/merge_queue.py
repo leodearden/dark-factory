@@ -4351,6 +4351,21 @@ class NoLandingsCircuitBreaker:
         )
 
 
+class IllegalLifecycleTransition(RuntimeError):
+    """Raised by :meth:`ItemLifecycle.transition` when a requested move is
+    not a legal edge in the module-level ``_LEGAL_TRANSITIONS`` table, the
+    caller's belief about the item's current state disagrees with the
+    registry, or *request_id* is unregistered (merge-queue-reliability PRD
+    scope-4 iota / task 2164, L-1).
+
+    A dedicated exception type — raised explicitly, never via a bare
+    ``assert`` (stripped under ``python -O``, the same hazard
+    :meth:`PermitLedger.release` documents) — so the L-1 single-source guard
+    survives optimized runs and callers/tests can catch precisely this
+    failure mode.
+    """
+
+
 class ItemLifecycle:
     """Single source of truth for every in-flight item's lifecycle state,
     keyed by :attr:`MergeRequest.request_id` (merge-queue-reliability PRD
@@ -4408,12 +4423,36 @@ class ItemLifecycle:
     ) -> None:
         """Move *request_id* from *from_state* to *to_state*.
 
-        Raises ``ValueError`` if ``(from_state, to_state)`` is not a legal
-        edge in the module-level ``_LEGAL_TRANSITIONS`` table (defined below
-        this class); updates the registry to *to_state* otherwise.
+        Raises :class:`IllegalLifecycleTransition` — an explicit ``raise``,
+        never a bare ``assert`` (stripped under ``python -O``, the same
+        hazard :meth:`PermitLedger.release` documents) — and leaves the
+        registry's stored state UNCHANGED when:
+
+          * *request_id* is not registered;
+          * the registry's actual current state disagrees with the caller's
+            *from_state* (defense-in-depth cross-check — a mis-wiring or a
+            race must never silently advance from the wrong base); or
+          * ``(from_state, to_state)`` is not a legal edge in the
+            module-level ``_LEGAL_TRANSITIONS`` table (defined below this
+            class) — covers both skip-stage moves and moves out of the
+            absorbing TERMINAL state.
+
+        Updates the registry to *to_state* only once all three checks pass.
         """
+        if request_id not in self._states:
+            raise IllegalLifecycleTransition(
+                f'ItemLifecycle.transition: request_id {request_id!r} is not '
+                f'registered (cannot transition {from_state!r} -> {to_state!r})'
+            )
+        current = self._states[request_id]
+        if current != from_state:
+            raise IllegalLifecycleTransition(
+                f'ItemLifecycle.transition: request_id {request_id!r} caller '
+                f'believes from_state={from_state!r} but registry has '
+                f'current={current!r} (single-source disagreement)'
+            )
         if to_state not in _LEGAL_TRANSITIONS[from_state]:
-            raise ValueError(
+            raise IllegalLifecycleTransition(
                 f'ItemLifecycle.transition: illegal edge {from_state!r} -> {to_state!r} '
                 f'for request_id {request_id!r}'
             )
