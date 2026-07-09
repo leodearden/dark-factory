@@ -348,7 +348,9 @@ class TestB2CrashQuarantine:
         # `acquire_for` always returns a (Path, bool) tuple when it succeeds,
         # so `is not None` would pass even for a stale/reused lane; assert
         # directly on a fresh (non-reused) FREE-lane acquisition instead.
-        lane_path, reused = await pool.acquire_for('task/99')
+        acquired = await pool.acquire_for('task/99')
+        assert acquired is not None
+        lane_path, reused = acquired
         assert lane_path is not None
         assert not reused
 
@@ -428,7 +430,9 @@ class TestB2CrashQuarantine:
         # `acquire_for` always returns a (Path, bool) tuple when it succeeds,
         # so `is not None` would pass even for a stale/reused lane; assert
         # directly on a fresh (non-reused) FREE-lane acquisition instead.
-        lane_path, reused = await pool.acquire_for('task/99')
+        acquired = await pool.acquire_for('task/99')
+        assert acquired is not None
+        lane_path, reused = acquired
         assert lane_path is not None
         assert not reused
 
