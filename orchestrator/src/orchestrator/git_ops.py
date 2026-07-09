@@ -685,6 +685,38 @@ class WarmLanePoolHardDown(WarmLaneRequeue):
     """
 
 
+class WorktreeConflictError(RuntimeError):
+    """Raised by :meth:`GitOps.commit` when the worktree has unresolved
+    (unmerged-index) conflicts at commit time (esc-2128-8).
+
+    All harness WIP-save auto-commits ('chore: save WIP before …') funnel
+    through :meth:`GitOps.commit`.  Without this guard, a prior unresolved
+    stash-pop (or any other operation that leaves ``UU``/``AA``/``DD``
+    index entries) would be silently snapshotted VERBATIM — including any
+    ``<<<<<<<``/``=======``/``>>>>>>>`` conflict markers left in the tree —
+    by the unconditional ``git add -A`` + ``git commit``.
+
+    Subclasses ``RuntimeError`` so existing ``RuntimeError``→blocked+L1
+    routing (e.g. the requeue reuse path in ``create_worktree``) handles it
+    for free without any change on that side; callers that need to
+    distinguish this specific condition (e.g. the inter-iteration rebase
+    path in ``workflow.run()``) can catch it explicitly.
+
+    ``conflicted_paths`` carries the sorted list of paths reported by
+    :meth:`GitOps._detect_unmerged_paths` at raise time.
+    """
+
+    def __init__(self, worktree: Path, conflicted_paths: list[str]):
+        self.worktree = worktree
+        self.conflicted_paths = conflicted_paths
+        super().__init__(
+            f'Refusing to commit in {worktree}: {len(conflicted_paths)} '
+            f'unresolved conflict(s) in the index: '
+            f'{", ".join(conflicted_paths[:10])}. Resolve the conflict(s) '
+            f'(or abort the operation that caused them) before committing.'
+        )
+
+
 async def _run(cmd: list[str], cwd: Path | None = None) -> tuple[int, str, str]:
     """Run an arbitrary subprocess command and return (returncode, stdout, stderr).
 
@@ -4463,7 +4495,19 @@ class GitOps:
         The :!.task pathspec SHOULD prevent .task/ from being staged, but
         agents can (and have) staged .task/ files via direct git commands
         before this method runs.  The post-staging check catches that case.
+
+        Pre-staging conflict guard (esc-2128-8): if *worktree* has any
+        unresolved (unmerged-index) paths — e.g. a stash-pop that conflicted
+        just before this call — raise :class:`WorktreeConflictError` instead
+        of staging/committing.  This is checked BEFORE `git add -A` so a
+        conflicted tree (which may contain literal conflict markers) is
+        never snapshotted.  All WIP-save call sites funnel through this
+        method, so this single guard covers every one of them.
         """
+        conflicted = await self._detect_unmerged_paths(worktree)
+        if conflicted:
+            raise WorktreeConflictError(worktree, conflicted)
+
         # Stage all — :!.task excludes .task/ from staging
         await _run(['git', 'add', '-A', '--', '.', ':!.task', ':!.claude'], cwd=worktree)
 
