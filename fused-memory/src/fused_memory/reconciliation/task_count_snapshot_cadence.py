@@ -17,6 +17,17 @@ building blocks for two structural guards:
    :func:`evaluate_snapshot_cadence` and :func:`build_stale_snapshot_finding`,
    wired into ``harness.py``'s ``_maybe_escalate_stale_task_count_snapshot``.
 
+Task 2325 follow-up hardens the write itself rather than only observing it:
+:func:`build_task_count_snapshot_content` is the pure renderer for a
+DETERMINISTIC Python ``add_memory`` write performed at the end of Stage 2's
+``run()`` (the ``_write_task_count_snapshot`` I/O helper in
+``stages/task_knowledge_sync.py``), so the write no longer depends on the
+Stage-2 LLM remembering the memory-stored "Snapshot Discipline" norm. Gated
+on ``not is_snapshot_write_blocked(project_id)`` (see
+``reconciliation/policies``) — projects that have never used the per-project
+census (currently dark_factory, solar_challenge_platform) are exempted
+rather than given a write nobody consumes.
+
 Structural template: mirrors :mod:`fused_memory.reconciliation.stage1_stall_detector`
 (threshold constant + pure compute helper + escalation), but per-project (not
 per-task) and journal-backed (not Mem0-marker-backed) — see design_decisions
@@ -49,6 +60,15 @@ ESCALATION_CATEGORY: str = 'recon_stale_task_count_snapshot'
 Registered in ``harness.py``'s ``_RECON_DEDUP_CONFIG.infra_dedupe_categories``
 and the 'info'-severity category tuple in ``_escalate`` — this is low-urgency
 process/tooling hardening, not an operator-blocking issue.
+"""
+
+TASK_COUNT_SNAPSHOT_CATEGORY: str = 'observations_and_summaries'
+"""Mem0 ``category`` for the task_count_snapshot write — task 2325.
+
+Used by the deterministic write helper (``_write_task_count_snapshot`` in
+``stages/task_knowledge_sync.py``) so the internal ``memory_service.add_memory``
+call lands in the same category the pre-existing (LLM-authored) snapshot
+writes already use.
 """
 
 
@@ -142,3 +162,45 @@ def build_stale_snapshot_finding(project_id: str) -> dict:
             'within the run window for multiple consecutive full reconciliation cycles'
         ),
     }
+
+
+def build_task_count_snapshot_content(
+    project_id: str,
+    *,
+    total: int,
+    done: int,
+    cancelled: int,
+    active: int,
+    other: int,
+    highest_task_id: int,
+    as_of: str | None = None,
+) -> str:
+    """Render the human-readable content string for a task_count_snapshot write.
+
+    Pure and dependency-free — no I/O, no imports from ``stages/`` or
+    ``harness``. Counts are the caller's responsibility (see
+    ``_write_task_count_snapshot`` in ``stages/task_knowledge_sync.py``,
+    which derives them from ``filter_task_tree``'s
+    ``FilteredTaskTree.{total_count,done_count,cancelled_count,other_count,
+    max_task_id}`` plus ``len(active_tasks)``).
+
+    Args:
+        project_id: Project the census is scoped to.
+        total: Total task count.
+        done: Count of done tasks.
+        cancelled: Count of cancelled tasks.
+        active: Count of active (non-terminal) tasks.
+        other: Count of tasks in an unrecognized/other status.
+        highest_task_id: Highest top-level task id observed.
+        as_of: ISO date string for the census, or ``None`` when unknown — the
+            leading "As of {as_of}:" clause is omitted in that case.
+
+    Returns:
+        A concise, non-empty human-readable census line.
+    """
+    prefix = f'As of {as_of}: ' if as_of else ''
+    return (
+        f'{prefix}project {project_id} task-count snapshot — '
+        f'{total} total, {done} done, {cancelled} cancelled, {active} active, '
+        f'{other} other, highest task id {highest_task_id}.'
+    )
