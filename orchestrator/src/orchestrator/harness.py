@@ -756,37 +756,45 @@ class Harness:
                 self._speculation_k if config.git.merge_spec_warm_lane_pool else 0
             ),
         )
+        # Constructor-injected callback bundle (task 2235, W10-α): all nine
+        # Harness↔Scheduler hooks are wired in ONE SchedulerCallbacks(...) at
+        # construction time — no post-construction install window where the
+        # Scheduler exists but a subset of its callbacks are still unset.
+        #   - on_park_stop_trip: Scheduler trips → Harness.pause_scheduler, the
+        #     full pause bundle (persistence + event + log).  Sibling tasks
+        #     (cost-ceiling 1323, EWA digest 1327) call pause_scheduler() directly.
+        #   - on_external_dep_block: an external dep is cancelled or persistently
+        #     unresolvable → Harness._block_and_escalate_external_dep (needs the
+        #     harness's EscalationQueue and set_task_status).
+        #   - on_starvation_warn / on_starvation_resolve (task 1880): a
+        #     deps-satisfied pending task starved past both thresholds files a
+        #     non-blocking INFO escalation; resolved when the task dispatches
+        #     (or is GC'd as terminal).
+        #   - warm_base_health_probe / on_warm_base_warn / on_warm_base_promote_l2 /
+        #     on_warm_base_resolve (task 2061): the scheduler probes base health
+        #     once per tick via the injected async probe and reacts with the
+        #     three injected callbacks.
+        #   - suppress_blocked_write: self._is_action_teardown_task, a bound-
+        #     method wrapper over ``_action_teardown_tasks`` (defined below). A
+        #     bound method is late-bound — valid to reference here even though
+        #     the Counter itself is created AFTER this Scheduler build, because
+        #     it resolves the Counter at CALL time, not at reference time.
         self.scheduler = Scheduler(
             config,
+            callbacks=SchedulerCallbacks(
+                on_park_stop_trip=self.pause_scheduler,
+                on_external_dep_block=self._block_and_escalate_external_dep,
+                on_starvation_warn=self._file_starvation_info,
+                on_starvation_resolve=self._resolve_starvation_info,
+                warm_base_health_probe=self._probe_warm_base_health,
+                on_warm_base_warn=self._file_warm_base_hard_down_notice,
+                on_warm_base_promote_l2=self._promote_warm_base_hard_down_l2,
+                on_warm_base_resolve=self._resolve_warm_base_hard_down,
+                suppress_blocked_write=self._is_action_teardown_task,
+            ),
             override_store=OverrideStore.from_config(config),
             park_eviction_store=ParkEvictionRequestStore.from_config(config),
         )
-        # Wire the park-stop trip callback: Scheduler trips → Harness.pause_scheduler.
-        # This connects in-memory trip detection to the full pause bundle
-        # (persistence + event + log) defined on the Harness.  Sibling tasks
-        # (cost-ceiling 1323, EWA digest 1327) call pause_scheduler() directly.
-        self.scheduler._on_park_stop_trip = self.pause_scheduler
-        # Wire the external-dep block callback: when an external dep is cancelled
-        # or persistently unresolvable, Scheduler trips → Harness._block_and_escalate.
-        # Mirrors the _on_park_stop_trip pattern (declared in scheduler.py, installed
-        # here so the harness EscalationQueue and set_task_status are available).
-        self.scheduler._on_external_dep_block = self._block_and_escalate_external_dep
-        # Wire the starvation-watchdog callbacks (task 1880): when a
-        # deps-satisfied pending task is starved past both thresholds, the
-        # scheduler calls _on_starvation_warn to file a non-blocking INFO
-        # escalation; it calls _on_starvation_resolve when the task dispatches
-        # (or is GC'd as terminal).  Same declare-in-scheduler / install-in-
-        # harness pattern as _on_park_stop_trip / _on_external_dep_block.
-        self.scheduler._on_starvation_warn = self._file_starvation_info
-        self.scheduler._on_starvation_resolve = self._resolve_starvation_info
-        # Wire the warm-base hard-down watchdog callbacks (task 2061): the
-        # scheduler probes base health once per tick via the injected async
-        # probe and reacts with the three injected callbacks.  Same declare-
-        # in-scheduler / install-in-harness pattern as the starvation watchdog.
-        self.scheduler._warm_base_health_probe = self._probe_warm_base_health
-        self.scheduler._on_warm_base_warn = self._file_warm_base_hard_down_notice
-        self.scheduler._on_warm_base_promote_l2 = self._promote_warm_base_hard_down_l2
-        self.scheduler._on_warm_base_resolve = self._resolve_warm_base_hard_down
         # --- Action-teardown suppression (task 1620, β Pair F / C3.2) ---
         # Counter of task_ids currently undergoing action-teardown (park/restart/abandon).
         # Stamped (incremented) before the status write + kill; decremented in the
@@ -795,25 +803,23 @@ class Harness:
         # with concurrent escalation resolutions — do not prematurely clear each other's
         # suppression window.  Mirrors _workflow_cancel_at's grace lifecycle so a
         # re-dispatched (restart→pending) workflow can write 'blocked' legitimately in
-        # its next incarnation rather than being permanently suppressed.
+        # its next incarnation rather than being permanently suppressed.  Consulted via
+        # self._is_action_teardown_task, wired above as the suppress_blocked_write hook.
         self._action_teardown_tasks: Counter[str] = Counter()
-        # Wire to the scheduler's suppression predicate so that 'blocked' writes emitted
-        # by a workflow being killed cannot clobber the action's target status
-        # (pending/deferred).  Declared in scheduler.py, installed here alongside the
-        # other callback installs — same pattern as _on_park_stop_trip / _on_external_dep_block.
-        self.scheduler._suppress_blocked_write = self._action_teardown_tasks.__contains__
         # Wire the landed-outbox consult-before-dispatch gate (task 2156, W1 δ
         # — SD-1/B5).  Declared in scheduler.py, installed here alongside the
-        # other callback installs — same declare-in-scheduler / install-in-
-        # harness pattern as _on_park_stop_trip / _on_external_dep_block /
-        # γ's own _reconcile_landed_outbox.
+        # SchedulerCallbacks bundle above — same declare-in-scheduler /
+        # install-in-harness pattern, but OUT OF SCOPE for task 2235's
+        # constructor-seam migration (see task 2156). γ's own
+        # _reconcile_landed_outbox is the sibling read path.
         self.scheduler._landed_outbox_gate = self._landed_dispatch_gate
         # Wire the already-landed pre-dispatch gate (task 2313) — catches
         # out-of-band landings (ancestry / merge-marker / content-equivalence)
         # that never passed through this orchestrator's own merge queue.
         # Declared in scheduler.py, installed here alongside the other
         # callback installs — same declare-in-scheduler / install-in-harness
-        # pattern as the adjacent _landed_outbox_gate / _suppress_blocked_write.
+        # pattern as the adjacent _landed_outbox_gate, but OUT OF SCOPE for
+        # task 2235's constructor-seam migration (see task 2313).
         self.scheduler._already_landed_gate = self._already_landed_dispatch_gate
         # Wire the reclaim-on-exhaustion safety valve callbacks (task 1933).
         # Declared on git_ops with default None (byte-identical when not wired);
@@ -1068,6 +1074,20 @@ class Harness:
 
         # Singleton lock — held for the duration of run()
         self._lock_file: IO | None = None
+
+    def _is_action_teardown_task(self, tid: str) -> bool:
+        """Bound-method wrapper wired as the ``suppress_blocked_write``
+        SchedulerCallbacks hook (task 2235).
+
+        ``_action_teardown_tasks`` (a ``Counter``) is created AFTER the
+        Scheduler is constructed in ``__init__``, so it cannot be passed
+        directly as ``self._action_teardown_tasks.__contains__`` at
+        Scheduler-build time. A bound method is late-bound — it resolves
+        the Counter at CALL time instead — so ``SchedulerCallbacks`` can be
+        built with all nine hooks in one shot at construction, with no
+        ``__init__`` reordering needed.
+        """
+        return tid in self._action_teardown_tasks
 
     @property
     def _speculation_k(self) -> int:
