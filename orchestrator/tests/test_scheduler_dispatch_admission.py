@@ -17,7 +17,7 @@ AsyncMock(return_value=[...])``, driving ``acquire_next()`` directly, and
 
 from __future__ import annotations
 
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, Mock
 
 import pytest
 
@@ -240,3 +240,132 @@ class TestDispatchAdmissionMetricRanking:
         deferred_events = [e for e in event_store.events if e[0] == 'dispatch_deferred']
         assert len(deferred_events) == 1
         assert deferred_events[0][1]['data']['metric'] == 'io_some_avg10'
+
+
+# ---------------------------------------------------------------------------
+# step-4 — Robustness: disabled gate, fail-open, once-per-tick/rate-limit
+# ---------------------------------------------------------------------------
+
+
+class _FakeClock:
+    """Minimal controllable monotonic-style clock for rate-limit tests."""
+
+    def __init__(self, start: float = 1000.0) -> None:
+        self._t = start
+
+    def __call__(self) -> float:
+        return self._t
+
+    def advance(self, secs: float) -> None:
+        self._t += secs
+
+
+@pytest.mark.asyncio
+class TestDispatchAdmissionDisabledGate:
+    """psi_admission.enabled=False short-circuits the gate entirely — no PSI
+    read (no per-tick reader cost), no hold, heavy dispatch proceeds exactly
+    as it did before DA3."""
+
+    async def test_disabled_gate_never_reads_psi_and_dispatches_normally(self) -> None:
+        event_store = _RecordingEventStore()
+        config = OrchestratorConfig(
+            max_per_module=1,
+            psi_admission=PsiAdmissionConfig(enabled=False),
+        )
+        scheduler = Scheduler(config, event_store=event_store)
+        reader = Mock(return_value=_psi(cpu_some10=99.0, read_ok=True))
+        scheduler._read_psi_sample = reader
+        scheduler._dispatched = {'inflight1'}
+
+        task_h = _heavy_task('H')
+        scheduler.get_tasks = AsyncMock(return_value=[task_h])
+
+        result = await scheduler.acquire_next()
+
+        assert result is not None
+        assert result.task_id == 'H'
+        assert 'H' in scheduler._dispatched
+        reader.assert_not_called()
+        assert [e for e in event_store.events if e[0] == 'dispatch_deferred'] == []
+
+
+@pytest.mark.asyncio
+class TestDispatchAdmissionFailOpen:
+    """DA-D6: an unreadable PSI sample must never wedge dispatch — the heavy
+    candidate dispatches normally, with a loud WARNING instead of a hold."""
+
+    async def test_unreadable_psi_dispatches_and_logs_warning(self, caplog) -> None:
+        caplog.set_level('WARNING')
+        event_store = _RecordingEventStore()
+        scheduler = Scheduler(OrchestratorConfig(max_per_module=1), event_store=event_store)
+        scheduler._read_psi_sample = lambda: _psi(cpu_some10=99.0, read_ok=False)
+        scheduler._dispatched = {'inflight1'}
+
+        task_h = _heavy_task('H')
+        scheduler.get_tasks = AsyncMock(return_value=[task_h])
+
+        result = await scheduler.acquire_next()
+
+        assert result is not None, 'saturated()==False when read_ok=False — must not hold'
+        assert result.task_id == 'H'
+        assert 'H' in scheduler._dispatched
+        assert [e for e in event_store.events if e[0] == 'dispatch_deferred'] == []
+        assert any(record.levelname == 'WARNING' for record in caplog.records), (
+            'an unreadable PSI sample should be logged, not silently swallowed'
+        )
+
+
+@pytest.mark.asyncio
+class TestDispatchAdmissionOnceDedupAndRateLimit:
+    """Exactly one dispatch_deferred event per tick's FIRST heavy skip, and
+    the deferral WARNING log stream is separately rate-limited across ticks
+    (the event stream is not — a dashboard needs one signal per tick)."""
+
+    async def test_single_tick_multiple_heavy_skips_emit_one_event(self) -> None:
+        event_store = _RecordingEventStore()
+        scheduler = Scheduler(OrchestratorConfig(max_per_module=1), event_store=event_store)
+        scheduler._read_psi_sample = lambda: _psi(cpu_some10=90.0, read_ok=True)
+        scheduler._dispatched = {'inflight1'}
+
+        tasks = [_heavy_task('H1', priority='high'), _heavy_task('H2', priority='medium')]
+        scheduler.get_tasks = AsyncMock(return_value=tasks)
+
+        result = await scheduler.acquire_next()
+
+        assert result is None, 'both candidates are heavy and held — nothing dispatches this tick'
+        assert 'H1' not in scheduler._dispatched
+        assert 'H2' not in scheduler._dispatched
+        deferred_events = [e for e in event_store.events if e[0] == 'dispatch_deferred']
+        assert len(deferred_events) == 1, 'only the FIRST heavy skip emits an event this tick'
+
+    async def test_two_saturated_ticks_within_window_emit_two_events_one_warning(
+        self, caplog
+    ) -> None:
+        caplog.set_level('WARNING')
+        event_store = _RecordingEventStore()
+        clock = _FakeClock()
+        scheduler = Scheduler(
+            OrchestratorConfig(max_per_module=1),
+            event_store=event_store,
+            time_source=clock,
+        )
+        scheduler._read_psi_sample = lambda: _psi(cpu_some10=90.0, read_ok=True)
+        scheduler._dispatched = {'inflight1'}
+
+        task_h = _heavy_task('H')
+        scheduler.get_tasks = AsyncMock(return_value=[task_h])
+
+        result1 = await scheduler.acquire_next()
+        assert result1 is None
+        clock.advance(10.0)  # well within the 180s rate-limit window
+        result2 = await scheduler.acquire_next()
+        assert result2 is None
+
+        deferred_events = [e for e in event_store.events if e[0] == 'dispatch_deferred']
+        assert len(deferred_events) == 2, 'one event per tick regardless of the log rate-limit'
+
+        deferral_warnings = [
+            r for r in caplog.records
+            if r.levelname == 'WARNING' and 'deferring heavy' in r.getMessage()
+        ]
+        assert len(deferral_warnings) == 1, 'the WARNING log stream is rate-limited across ticks'
