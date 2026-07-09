@@ -1208,6 +1208,55 @@ STAGE2_PERSISTENCE_MARKER_MAX_AGE_DAYS: int = 14
 _STAGE2_PERSISTENCE_MARKER_GC_SWEEP_SOURCE = 'stage2_persistence_marker_gc_sweep'
 
 
+async def _resolve_terminal_task_ids(
+    taskmaster,
+    scope: ProjectScope,
+    run_id: str,
+) -> list[str]:
+    """Resolve the terminal-status task ids for *scope* via ONE bulk status read.
+
+    Feeds :meth:`fused_memory.reconciliation.recon_ledger.ReconLedgerStore.gc`'s
+    ``terminal_task_ids`` argument (task 2228 W5-κ). Replaces the per-marker
+    ``taskmaster.get_task`` loop previously used by
+    :func:`_sweep_terminal_task_flag_markers`: a single bulk
+    ``taskmaster.get_statuses(project_root)`` call is strictly cheaper than N
+    individual lookups, and the ledger's ``task_id IN (...)`` clause does the
+    membership match itself.
+
+    **Fail-safe direction**: degrades to ``[]`` when ``taskmaster`` is falsy
+    or when ``get_statuses`` raises — never propagates. An empty result
+    feeds ``gc()``'s expiry-only branch, which keeps every task-referenced
+    marker, preserving the old sweeps' fail-safe KEEP direction (uncertain
+    => keep, never delete on partial/failed information).
+
+    Args:
+        taskmaster: Object with an async ``get_statuses(project_root) ->
+            dict[str, str]`` method. Falsy => no-op (returns ``[]``).
+        scope: ``ProjectScope`` supplying ``project_root`` for the bulk
+            status read.
+        run_id: Current reconciliation run identifier, logged on failure.
+
+    Returns:
+        Sorted list of task_id strings whose status is in
+        ``TERMINAL_STATUSES`` (``{'done', 'cancelled'}``); ``[]`` on any
+        failure or falsy taskmaster.
+    """
+    if not taskmaster:
+        return []
+
+    try:
+        statuses = await taskmaster.get_statuses(scope.project_root)
+    except Exception:
+        logger.warning(
+            'reconciliation._resolve_terminal_task_ids: get_statuses failed for project_id=%s',
+            scope.project_id,
+            extra={'project_id': scope.project_id, 'run_id': run_id},
+        )
+        return []
+
+    return sorted(str(tid) for tid, status in statuses.items() if status in TERMINAL_STATUSES)
+
+
 async def _sweep_stale_fixc_markers(
     memory_service,
     project_id: str,
