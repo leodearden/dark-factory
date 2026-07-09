@@ -898,7 +898,6 @@ class _DryRunInvestigationHandles:
 def _spawn_merge_verify_dry_run(
     handles: _DryRunInvestigationHandles | None,
     req: MergeRequest,
-    merge_wt: Path,
     reason: str,
     detail: str,
     *,
@@ -924,14 +923,15 @@ def _spawn_merge_verify_dry_run(
     enablement and in-flight-dedup guards), or when ``req.worktree`` is
     missing/nonexistent.
 
-    *merge_wt* is accepted for call-site signature stability but no longer
-    determines the investigation's cwd: it is the ephemeral merge worktree,
-    which ``_run_post_merge_verify`` has already handed to
-    ``cleanup_merge_worktree`` by the time this fire-and-forget task actually
-    runs (task 2141 step-17/18 — the no-op cleanup mock in the test suite hid
-    this). ``req.worktree`` is the task's OWN retained worktree — it survives
-    while the task stays blocked, and is what ``b3_gate`` re-checks at gate
-    time — so the investigation reads that instead.
+    The investigation always reads ``req.worktree`` — the task's OWN retained
+    worktree — rather than the ephemeral merge worktree: by the time this
+    fire-and-forget task actually runs, ``_run_post_merge_verify`` has already
+    handed the merge worktree to ``cleanup_merge_worktree`` (task 2141
+    step-17/18 — the no-op cleanup mock in the test suite hid this).
+    ``req.worktree`` survives while the task stays blocked, and is what
+    ``b3_gate`` re-checks at gate time. (The ephemeral merge worktree is no
+    longer accepted as a parameter here — task 2141 amendment pass, review
+    finding `dead_parameter`.)
 
     *event_store* is forwarded to ``run_dry_run_unblock`` so the
     investigation emits the same ``invocation_end``/``'blocked'`` telemetry
@@ -1219,7 +1219,7 @@ async def _run_post_merge_verify(
                     reason = f'{reason}\n\n{detail}'
             if verify.category != UNSCOPED_TYPECHECK_TIMEOUT_CATEGORY:
                 _spawn_merge_verify_dry_run(
-                    dry_run_handles, req, merge_wt, reason, detail,
+                    dry_run_handles, req, reason, detail,
                     event_store=event_store,
                 )
             return MergeOutcome('blocked', reason=reason)
@@ -1273,7 +1273,7 @@ async def _run_post_merge_verify(
                 )
         if not verify.timed_out:
             _spawn_merge_verify_dry_run(
-                dry_run_handles, req, merge_wt, reason, detail,
+                dry_run_handles, req, reason, detail,
                 event_store=event_store,
             )
         return MergeOutcome(
@@ -7227,6 +7227,21 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                 _dt.cancel()
                 with contextlib.suppress(BaseException):
                     await _dt
+
+        # η: cancel any still-in-flight merge-verify dry-run investigations
+        # (spawned by _spawn_merge_verify_dry_run and tracked in
+        # self._background_tasks) so a detached run_dry_run_unblock — which
+        # does git subprocess work and an LLM agent invocation — is not left
+        # running after shutdown has been requested (task 2141 amendment
+        # pass, review finding `resource_cleanup`). Mirrors the
+        # _drift_check_tasks drain immediately above and
+        # workflow.TaskWorkflow's own background_tasks cleanup. Take a
+        # snapshot before iterating: the done-callback mutates the set.
+        for _bt in list(self._background_tasks):
+            if not _bt.done():
+                _bt.cancel()
+                with contextlib.suppress(BaseException):
+                    await _bt
 
     # ------------------------------------------------------------------
     # Event helpers
