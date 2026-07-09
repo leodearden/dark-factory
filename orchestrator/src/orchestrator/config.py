@@ -232,6 +232,24 @@ class TimeoutsConfig(BaseModel):
             "per-role ceiling applies."
         ),
     )
+    working_idle_secs: float = Field(
+        default=1800.0,
+        description=(
+            "Post-turn-1 no-progress idle bound (seconds). Once the STARTUP "
+            "grace window has passed (≥1 assistant turn observed), the "
+            "working-regime watchdog no longer kills at a flat per-role "
+            "ceiling: it polls the transcript at a coarse cadence and kills "
+            "only after no NEW assistant turn has appeared for "
+            "max(working_idle_secs, the per-role ceiling) — the per-role "
+            "timeout becomes the FLOOR of the idle window (B6 long-tool-call "
+            "safety: a single legitimate synchronous tool call must never be "
+            "false-killed), not a hard wall on a productive run. Bounded "
+            "above by OrchestratorConfig.invocation_timeout, the absolute "
+            "cap. Only engages when the transcript is readable; an "
+            "unreadable transcript falls back to the old flat "
+            "per-role-ceiling kill (B7 conservative degrade)."
+        ),
+    )
 
 
 class BackendsConfig(BaseModel):
@@ -254,7 +272,7 @@ class UnblockAutoConfig(BaseModel):
 
     enabled: bool = Field(default=True)
     budget_usd: float = Field(default=5.0)
-    timeout_seconds: float = Field(default=600.0)
+    timeout_seconds: float = Field(default=1200.0)
     model: str = Field(default='sonnet')
     max_turns: int = Field(default=50)
     effort: str = Field(default='high')
