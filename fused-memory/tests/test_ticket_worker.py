@@ -1649,6 +1649,180 @@ class TestProcessAddTicketsBatch:
         # t1 + t2-fallback + t3 → 3 add_task calls; t4 combined → no additional call.
         assert taskmaster.add_task.call_count == 3
 
+    @pytest.mark.asyncio
+    async def test_batch_mixed_lifecycle_no_cross_substitution(
+        self, interceptor_with_store, ticket_store, taskmaster,
+    ):
+        """4-ticket batch mixing a within-batch drop, a titleless None-candidate,
+        and two independent creates: each ticket must resolve to ITS OWN
+        correct terminal — no id is ever borrowed from the wrong sibling.
+
+        Order: t1 (create), t2 (within-batch drop → target=t1), t3
+        (titleless, None-candidate → falls through to its own create), t4
+        (create).  curate_batch only sees the non-None candidates
+        [c1, c2, c4] (t3 is excluded), so its batch_target_index=0 for t2
+        refers to c1's position in THAT non-None list — which must resolve
+        to t1's id, never t3's or t4's (the anti-cross-substitution
+        guarantee this refactor is meant to make structurally impossible).
+        """
+        t1 = await ticket_store.submit('project', self._make_candidate_json('Task Alpha'))
+        t2 = await ticket_store.submit('project', self._make_candidate_json('Task Alpha dup'))
+        t3 = await ticket_store.submit('project', self._make_titleless_candidate_json())
+        t4 = await ticket_store.submit('project', self._make_candidate_json('Task Delta'))
+
+        mock_curator = MagicMock()
+        # non-None candidates seen by curate_batch: [c1 (t1), c2 (t2), c4 (t4)]
+        mock_curator.curate_batch = AsyncMock(return_value=[
+            CuratorDecision(action='create', justification='new1'),
+            CuratorDecision(
+                action='drop',
+                target_id=None,
+                batch_target_index=0,  # non-None-space: c1 (t1)
+                justification='dup of t1',
+            ),
+            CuratorDecision(action='create', justification='new4'),
+        ])
+        _stub_prepare_candidate(mock_curator)
+        mock_curator.note_created = MagicMock()
+        mock_curator.record_task = AsyncMock()
+
+        # add_task is called for t1, t3 (None-candidate fallback), and t4 —
+        # in that dispatch order.  t2 is a drop, no add_task call for it.
+        taskmaster.add_task = AsyncMock(side_effect=[
+            {'id': 'A', 'title': 'Task Alpha'},
+            {'id': 'T3', 'title': ''},
+            {'id': 'T4', 'title': 'Task Delta'},
+        ])
+
+        with patch.object(
+            type(interceptor_with_store), '_get_curator',
+            new=AsyncMock(return_value=mock_curator),
+        ), patch.object(
+            type(interceptor_with_store), '_ensure_taskmaster',
+            new=AsyncMock(return_value=taskmaster),
+        ):
+            await interceptor_with_store._process_add_tickets_batch([t1, t2, t3, t4])
+
+        r1 = await ticket_store.get(t1)
+        r2 = await ticket_store.get(t2)
+        r3 = await ticket_store.get(t3)
+        r4 = await ticket_store.get(t4)
+
+        assert r1 is not None and r1['status'] == 'created'
+        assert r1['task_id'] == 'A'
+
+        # t2 must be combined with t1's id — NOT t3's or t4's.
+        assert r2 is not None and r2['status'] == 'combined'
+        assert r2['task_id'] == 'A'
+        assert r2.get('reason') is not None and 'batch_target_index' in r2['reason']
+
+        # t3 (titleless) resolves on its own — a distinct id from t1's.
+        assert r3 is not None and r3['status'] in {'created', 'combined', 'failed'}
+        assert r3.get('task_id') != 'A'
+
+        # t4 is an independent create — its own id, distinct from t1's.
+        assert r4 is not None and r4['status'] == 'created'
+        assert r4['task_id'] != 'A'
+
+        assert taskmaster.add_task.call_count == 3
+
+    @pytest.mark.asyncio
+    async def test_batch_degrade_records_reason_in_result_json(
+        self, interceptor_with_store, ticket_store, taskmaster,
+    ):
+        """When curate_batch_prepared raises CuratorFailureError and the
+        per-item curate() fallback ALSO raises CuratorFailureError for a
+        ticket, that ticket degrades to 'created' and result_json carries
+        curator_degrade_reason (surfaced from the fallback's exception).
+        """
+        from fused_memory.middleware.task_curator import CuratorFailureError
+
+        t1 = await ticket_store.submit('project', self._make_candidate_json('Task Solo'))
+
+        mock_curator = MagicMock()
+        _curator_exc = CuratorFailureError('boom', timed_out=False, duration_ms=100)
+        mock_curator.curate = AsyncMock(side_effect=_curator_exc)
+        mock_curator.curate_batch = AsyncMock(side_effect=_curator_exc)
+        _stub_prepare_candidate(mock_curator)
+        mock_curator.note_created = MagicMock()
+        mock_curator.record_task = AsyncMock()
+
+        taskmaster.add_task = AsyncMock(return_value={'id': '77', 'title': 'Task Solo'})
+
+        with patch.object(
+            type(interceptor_with_store), '_get_curator',
+            new=AsyncMock(return_value=mock_curator),
+        ), patch.object(
+            type(interceptor_with_store), '_ensure_taskmaster',
+            new=AsyncMock(return_value=taskmaster),
+        ):
+            await interceptor_with_store._process_add_tickets_batch([t1])
+
+        r1 = await ticket_store.get(t1)
+        assert r1 is not None and r1['status'] == 'created'
+        assert r1['task_id'] == '77'
+
+        result_data = json.loads(r1['result_json'])
+        degrade_hint = result_data.get('curator_degrade_reason', '')
+        assert degrade_hint, (
+            f'result_json should record curator_degrade_reason: {result_data}'
+        )
+
+    @pytest.mark.asyncio
+    async def test_batch_within_batch_drop_sibling_failed_degrades_to_create(
+        self, interceptor_with_store, ticket_store, taskmaster,
+    ):
+        """When a within-batch drop's target sibling itself fails to
+        dispatch, the dependent ticket must degrade to 'created' with its
+        OWN new task_id — never 'combined' against a null/foreign id.
+        """
+        t1 = await ticket_store.submit('project', self._make_candidate_json('Task One'))
+        t2 = await ticket_store.submit('project', self._make_candidate_json('Task One dup'))
+
+        mock_curator = MagicMock()
+        mock_curator.curate_batch = AsyncMock(return_value=[
+            CuratorDecision(action='create', justification='new'),
+            CuratorDecision(
+                action='drop',
+                target_id=None,
+                batch_target_index=0,  # duplicate of item 0 (t1) in this batch
+                justification='dup of batch 0',
+            ),
+        ])
+        _stub_prepare_candidate(mock_curator)
+        mock_curator.note_created = MagicMock()
+        mock_curator.record_task = AsyncMock()
+
+        # t1's add_task fails outright; t2's degrade-to-create add_task succeeds.
+        taskmaster.add_task = AsyncMock(side_effect=[
+            RuntimeError('boom'),
+            {'id': '77', 'title': 'Task One dup'},
+        ])
+
+        with patch.object(
+            type(interceptor_with_store), '_get_curator',
+            new=AsyncMock(return_value=mock_curator),
+        ), patch.object(
+            type(interceptor_with_store), '_ensure_taskmaster',
+            new=AsyncMock(return_value=taskmaster),
+        ):
+            await interceptor_with_store._process_add_tickets_batch([t1, t2])
+
+        r1 = await ticket_store.get(t1)
+        r2 = await ticket_store.get(t2)
+
+        assert r1 is not None and r1['status'] == 'failed'
+        assert r1.get('task_id') is None
+
+        # t2 must NOT be 'combined' against a null/foreign id — it must
+        # degrade to its own fresh 'created' terminal.
+        assert r2 is not None and r2['status'] == 'created', (
+            f"Expected t2 to degrade to 'created', got: {r2!r}"
+        )
+        assert r2['task_id'] == '77'
+
+        assert taskmaster.add_task.call_count == 2
+
 
 # ---------------------------------------------------------------------------
 # TestCuratorWorkerBatchDrain — step-39 / step-41 / step-43 / step-45
