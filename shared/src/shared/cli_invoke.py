@@ -1084,13 +1084,18 @@ async def invoke_with_cap_retry(
                             await asyncio.sleep(cooldown)
                             continue
 
-                # Non-cap-hit failure while resuming → fall back to fresh invocation
+                # Non-cap-hit failure while resuming → fall back to fresh invocation.
+                # Rebuild via the caller's hook (no-op when rebuild_prompt is None):
+                # mirrors the two cap-hit fresh-fallback paths above, since a
+                # live-continuation caller's original_prompt (resume_delivers_prompt=True)
+                # is only valid inside the resumed session, not a brand-new one.
                 if not result.success and invoke_kwargs.get('resume_session_id'):
                     logger.warning(
                         f'{label}: resume failed (session_id={invoke_kwargs["resume_session_id"]}), '
                         f'retrying fresh',
                     )
                     _reset_for_fresh_retry(invoke_kwargs, original_prompt)
+                    await _rebuild_fresh_prompt()
                     continue  # __aexit__ releases probe slot
 
                 if not unattributed_cap:
