@@ -4099,6 +4099,99 @@ class TestFindMergeMarker:
 
 
 @pytest.mark.asyncio
+class TestBranchContentInMain:
+    """Real-git tests for GitOps.branch_content_in_main (task 2313).
+
+    The content-equivalence primitive that catches squashed/rebased/
+    manually-applied landings where the branch is NOT an ancestor of main:
+    (a) TRUE for a content-equivalent NON-ancestor landing.
+    (b) FALSE when the branch's changed file differs from what landed on main.
+    (c) FALSE for a degenerate branch with zero commits beyond its base (no
+        changed files) — the empty-pathspec case must not false-positive.
+    """
+
+    async def test_true_for_content_equivalent_non_ancestor_landing(
+        self, git_ops: GitOps, git_repo: Path,
+    ) -> None:
+        """Branch edits fileA; main independently commits byte-identical
+        fileA content (squash/rebase/manual-apply stand-in).  is_ancestor is
+        False (the branch commit is not reachable from main — they are
+        siblings off the same base) but branch_content_in_main must return
+        True because every file the branch touched is byte-identical on main.
+        """
+        branch = 'task/equiv-1'
+        rc, _, err = await _run(['git', 'checkout', '-b', branch], cwd=git_repo)
+        assert rc == 0, f'checkout {branch} failed: {err}'
+        (git_repo / 'fileA.py').write_text('x = 1\n')
+        await _run(['git', 'add', 'fileA.py'], cwd=git_repo)
+        rc, _, err = await _run(
+            ['git', 'commit', '-m', 'Add fileA on branch'], cwd=git_repo,
+        )
+        assert rc == 0, f'commit on {branch} failed: {err}'
+
+        rc, _, err = await _run(['git', 'checkout', 'main'], cwd=git_repo)
+        assert rc == 0, f'checkout main failed: {err}'
+        # Independently apply the IDENTICAL content directly on main — a
+        # distinct commit object (different parent/message/time), so the
+        # branch commit is NOT an ancestor of main even though content matches.
+        (git_repo / 'fileA.py').write_text('x = 1\n')
+        await _run(['git', 'add', 'fileA.py'], cwd=git_repo)
+        rc, _, err = await _run(
+            ['git', 'commit', '-m', 'Add fileA independently on main'], cwd=git_repo,
+        )
+        assert rc == 0, f'commit on main failed: {err}'
+
+        assert await git_ops.is_ancestor(branch, 'main') is False, (
+            'branch must NOT be an ancestor of main for this scenario'
+        )
+        assert await git_ops.branch_content_in_main(branch) is True
+
+    async def test_false_when_branch_file_differs_from_main(
+        self, git_ops: GitOps, git_repo: Path,
+    ) -> None:
+        """Main's independent commit carries DIFFERENT content for the file
+        the branch touched — main never received the branch's change (or
+        received a different version) — branch_content_in_main must be False.
+        """
+        branch = 'task/differs-1'
+        rc, _, err = await _run(['git', 'checkout', '-b', branch], cwd=git_repo)
+        assert rc == 0, f'checkout {branch} failed: {err}'
+        (git_repo / 'fileA.py').write_text('x = 1\n')
+        await _run(['git', 'add', 'fileA.py'], cwd=git_repo)
+        rc, _, err = await _run(
+            ['git', 'commit', '-m', 'Add fileA on branch'], cwd=git_repo,
+        )
+        assert rc == 0, f'commit on {branch} failed: {err}'
+
+        rc, _, err = await _run(['git', 'checkout', 'main'], cwd=git_repo)
+        assert rc == 0, f'checkout main failed: {err}'
+        (git_repo / 'fileA.py').write_text('x = 2\n')  # different content
+        await _run(['git', 'add', 'fileA.py'], cwd=git_repo)
+        rc, _, err = await _run(
+            ['git', 'commit', '-m', 'Add different fileA on main'], cwd=git_repo,
+        )
+        assert rc == 0, f'commit on main failed: {err}'
+
+        assert await git_ops.is_ancestor(branch, 'main') is False
+        assert await git_ops.branch_content_in_main(branch) is False
+
+    async def test_false_for_degenerate_branch_with_no_changed_files(
+        self, git_ops: GitOps, git_repo: Path,
+    ) -> None:
+        """A branch with zero commits beyond its base has an empty changed-
+        files set — the degenerate/no-work guard must return False rather
+        than trivially passing an empty pathspec diff.
+        """
+        branch = 'task/degenerate-1'
+        rc, _, err = await _run(['git', 'checkout', '-b', branch], cwd=git_repo)
+        assert rc == 0, f'checkout {branch} failed: {err}'
+        rc, _, err = await _run(['git', 'checkout', 'main'], cwd=git_repo)
+        assert rc == 0, f'checkout main failed: {err}'
+
+        assert await git_ops.branch_content_in_main(branch) is False
+
+
+@pytest.mark.asyncio
 class TestMergeSubjectContract:
     """End-to-end contract: the merge subject written to main by merge_to_main
     equals _merge_subject output, and find_merge_marker locates that commit.
