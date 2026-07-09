@@ -581,6 +581,163 @@ class TestShaStamping:
 
 
 # ---------------------------------------------------------------------------
+# task 2138 step-5: block_class stamping
+# ---------------------------------------------------------------------------
+
+class TestBlockClassStamping:
+    """block_class is stamped onto every entry shape, derived from `reason`
+    unless explicitly overridden; schema stays closed (task 2138, PRD:
+    plans/verify-plan-prd.md task ζ). Mirrors TestShaStamping — block_class
+    joins head_sha/main_sha as an orchestrator-stamped, non-forgeable field.
+    """
+
+    def test_schema_guard_no_block_class_in_agent_schema(self):
+        """DRY_RUN_PROPOSAL_SCHEMA must stay closed — agent cannot forge block_class."""
+        from orchestrator.dry_run_unblock import DRY_RUN_PROPOSAL_SCHEMA
+
+        assert DRY_RUN_PROPOSAL_SCHEMA['additionalProperties'] is False
+        props = DRY_RUN_PROPOSAL_SCHEMA.get('properties', {})
+        assert 'block_class' not in props, 'block_class must NOT be in agent output schema'
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize('shape', [
+        'success',
+        'investigation_failed',
+        'budget_exhausted',
+        'infra_failure',
+    ])
+    async def test_block_class_derived_from_reason_on_every_shape(self, shape, tmp_path):
+        from orchestrator.dry_run_unblock import run_dry_run_unblock
+        from orchestrator.unblock_types import classify_block_reason
+
+        reason = 'verify exhausted'
+
+        if shape == 'success':
+            structured = {
+                'proposal_text': 'Rebase on main and rerun verify',
+                'risk_label': 'low',
+                'files_referenced': [],
+            }
+            agent_result = _make_agent_result(structured_output=structured)
+            config = _make_config()
+        elif shape == 'investigation_failed':
+            agent_result = _make_agent_result(
+                success=False, subtype='error_max_turns',
+                output='Exceeded max turns', structured_output=None,
+            )
+            config = _make_config()
+        elif shape == 'budget_exhausted':
+            agent_result = _make_agent_result(
+                success=False, cost_usd=5.0, subtype='error_max_budget_usd',
+                output='', structured_output=None,
+            )
+            config = _make_config(budget_usd=5.0)
+        else:  # infra_failure
+            agent_result = _make_agent_result(
+                success=False, subtype='error_empty_output',
+                output='Agent produced no output', timed_out=True,
+                structured_output=None,
+            )
+            config = _make_config()
+
+        scheduler = MagicMock()
+        scheduler.update_task = AsyncMock(return_value=True)
+
+        with patch('orchestrator.dry_run_unblock.invoke_agent',
+                   new=AsyncMock(return_value=agent_result)):
+            await run_dry_run_unblock(
+                task_id='42',
+                worktree=str(tmp_path),
+                reason=reason,
+                detail='',
+                scheduler=scheduler,
+                mcp=MagicMock(),
+                config=config,
+            )
+
+        entry = scheduler.update_task.call_args.args[1]['dry_run_proposals'][0]
+        assert 'block_class' in entry, f'shape={shape}: block_class key missing'
+        assert entry['block_class'] == classify_block_reason(reason), (
+            f'shape={shape}: block_class {entry["block_class"]!r} != '
+            f'classify_block_reason({reason!r})={classify_block_reason(reason)!r}'
+        )
+        assert entry['block_class'] == 'agent_failure'
+
+    @pytest.mark.asyncio
+    async def test_block_class_reflects_post_merge_reason_on_success_shape(self, tmp_path):
+        """Proves the stamp reflects the *reason*, not just a hardcoded
+        default — a post-merge-red-main reason classifies accordingly even
+        on an ordinary success entry.
+        """
+        from orchestrator.dry_run_unblock import run_dry_run_unblock
+        from orchestrator.merge_gates import POST_MERGE_PYRIGHT_BROKEN_REASON_PREFIX
+
+        reason = POST_MERGE_PYRIGHT_BROKEN_REASON_PREFIX + ': type-check failed for orchestrator'
+        structured = {
+            'proposal_text': 'Fix the type error',
+            'risk_label': 'low',
+            'files_referenced': ['foo.py'],
+        }
+        agent_result = _make_agent_result(structured_output=structured)
+
+        scheduler = MagicMock()
+        scheduler.update_task = AsyncMock(return_value=True)
+
+        with patch('orchestrator.dry_run_unblock.invoke_agent',
+                   new=AsyncMock(return_value=agent_result)):
+            await run_dry_run_unblock(
+                task_id='43',
+                worktree=str(tmp_path),
+                reason=reason,
+                detail='',
+                scheduler=scheduler,
+                mcp=MagicMock(),
+                config=_make_config(),
+            )
+
+        entry = scheduler.update_task.call_args.args[1]['dry_run_proposals'][0]
+        assert entry['block_class'] == 'post_merge_red_main'
+
+    @pytest.mark.asyncio
+    async def test_explicit_block_class_param_wins_over_derived(self, tmp_path):
+        """An explicit block_class kwarg overrides the reason-derived default
+        (forward-compat with task η, which constructs BlockRecord(MERGE_VERIFY_RED)
+        for a generic un-constanted reason that classify_block_reason would
+        otherwise default to AGENT_FAILURE).
+        """
+        from orchestrator.dry_run_unblock import run_dry_run_unblock
+        from orchestrator.unblock_types import BlockClass
+
+        # A plain reason that classify_block_reason would map to AGENT_FAILURE.
+        reason = 'verify exhausted'
+        structured = {
+            'proposal_text': 'Fix it',
+            'risk_label': 'low',
+            'files_referenced': [],
+        }
+        agent_result = _make_agent_result(structured_output=structured)
+
+        scheduler = MagicMock()
+        scheduler.update_task = AsyncMock(return_value=True)
+
+        with patch('orchestrator.dry_run_unblock.invoke_agent',
+                   new=AsyncMock(return_value=agent_result)):
+            await run_dry_run_unblock(
+                task_id='44',
+                worktree=str(tmp_path),
+                reason=reason,
+                detail='',
+                scheduler=scheduler,
+                mcp=MagicMock(),
+                config=_make_config(),
+                block_class=BlockClass.MERGE_VERIFY_RED,
+            )
+
+        entry = scheduler.update_task.call_args.args[1]['dry_run_proposals'][0]
+        assert entry['block_class'] == 'merge_verify_red'
+
+
+# ---------------------------------------------------------------------------
 # step-5: keep-last-N trim tests
 # ---------------------------------------------------------------------------
 

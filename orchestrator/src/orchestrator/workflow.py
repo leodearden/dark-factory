@@ -81,6 +81,7 @@ from orchestrator.task_status import (
     TERMINAL_STATUSES,
     WORKFLOW_PRESERVE_STATUSES,
 )
+from orchestrator.unblock_types import classify_block_reason
 from orchestrator.usage_gate import SessionBudgetExhausted as _SessionBudgetExhausted
 from orchestrator.verify import (
     VerifyInfraError,
@@ -8514,6 +8515,7 @@ Update the plan to address the blocking issues. You may add new steps to the `st
                 self.task_id,
             )
             return
+        block_class = classify_block_reason(reason)
         try:
             _task = asyncio.create_task(
                 run_dry_run_unblock(
@@ -8527,6 +8529,7 @@ Update the plan to address the blocking issues. You may add new steps to the `st
                     event_store=getattr(self, 'event_store', None),
                     usage_gate=self.usage_gate,
                     cost_store=self.cost_store,
+                    block_class=block_class,
                 ),
                 name=_task_name,
             )

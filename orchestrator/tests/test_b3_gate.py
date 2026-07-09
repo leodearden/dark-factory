@@ -1331,3 +1331,109 @@ class TestPostMergeRedMainAbort:
         assert result['verdict'] == ABORT, (
             f'expected ABORT for production-format post-merge reason, got {result}'
         )
+
+
+# ---------------------------------------------------------------------------
+# step-3 (task 2138): typed block_class dual-read path
+# ---------------------------------------------------------------------------
+
+class TestCheckProposalBlockClass:
+    """check_proposal dual-reads a typed 'block_class' key when present,
+    falling back to the legacy block_reason-prefix/status-presence sniffs
+    only when block_class is absent (B3 legacy path — TestPostMergeRedMainAbort
+    and test_status_key_present_aborts above carry NO block_class and must
+    keep passing unchanged).
+
+    PRD: plans/verify-plan-prd.md task ζ, invariants B2/B3/B4.
+    """
+
+    _NOW = datetime(2026, 6, 4, 12, 0, 0, tzinfo=UTC)
+
+    def test_post_merge_red_main_block_class_aborts_without_git(self):
+        """B2: block_class=post_merge_red_main hard-aborts before risk/git —
+        even when block_reason carries NO post-merge prose (proves the typed
+        field alone drives the abort, not the prose prefix) — for both a
+        low-risk and a human-review-required entry.
+        """
+        from orchestrator.b3_gate import ABORT, check_proposal
+        for risk_label in ('low', 'human-review-required'):
+            entry = {
+                **_LOW_RISK_ENTRY,
+                'block_class': 'post_merge_red_main',
+                'block_reason': 'verify exhausted',
+                'risk_label': risk_label,
+            }
+            result = check_proposal(
+                entry, worktree='/tmp', category='task_failure',
+                run_git=_fake_git_never_called, now=self._NOW,
+            )
+            assert result['verdict'] == ABORT, (
+                f'risk_label={risk_label!r}: expected ABORT, got {result}'
+            )
+
+    def test_merge_verify_red_low_risk_is_gateable_not_auto_aborted(self):
+        """B4: block_class=merge_verify_red is NOT the highest-blast-radius
+        class — a low-risk entry reaches FRESH exactly like today, with
+        fresh git and category=None.
+        """
+        from orchestrator.b3_gate import FRESH, check_proposal
+        entry = {**_LOW_RISK_ENTRY, 'block_class': 'merge_verify_red'}
+        result = check_proposal(
+            entry, worktree='/tmp', category=None,
+            run_git=_fake_git_fresh, now=self._NOW,
+        )
+        assert result['verdict'] == FRESH, f'expected FRESH, got {result}'
+
+    def test_new_path_failure_entry_aborts_via_risk_label_not_status(self):
+        """New-path failure death: a real producer failure shape always sets
+        risk_label='human-review-required', so step 2 catches it — the
+        status-sniff is not what fires. Asserts the reason names risk_label.
+        """
+        from orchestrator.b3_gate import ABORT, check_proposal
+        entry = {
+            **_LOW_RISK_ENTRY,
+            'block_class': 'agent_failure',
+            'status': 'investigation_failed',
+            'risk_label': 'human-review-required',
+        }
+        result = check_proposal(
+            entry, worktree='/tmp', category=None,
+            run_git=_fake_git_never_called, now=self._NOW,
+        )
+        assert result['verdict'] == ABORT, f'expected ABORT, got {result}'
+        assert 'risk_label' in result['reason'], (
+            f'expected the risk_label check (step 2) to fire, not the '
+            f'status sniff: {result["reason"]!r}'
+        )
+
+    def test_status_presence_does_not_abort_typed_path(self):
+        """The 'status'-key presence sniff (legacy step 3) must NOT fire when
+        block_class is present — a stray/legacy 'status' key on an otherwise
+        low-risk, fresh, typed entry must not cause a false abort.
+        """
+        from orchestrator.b3_gate import FRESH, check_proposal
+        entry = {
+            **_LOW_RISK_ENTRY,
+            'block_class': 'merge_verify_red',
+            'status': 'x',
+            'risk_label': 'low',
+        }
+        result = check_proposal(
+            entry, worktree='/tmp', category=None,
+            run_git=_fake_git_fresh, now=self._NOW,
+        )
+        assert result['verdict'] == FRESH, (
+            f'status-key presence must not abort the typed path, got {result}'
+        )
+
+    def test_agent_failure_low_risk_fresh_entry_is_fresh(self):
+        """Regression: block_class=agent_failure (the common case) behaves
+        exactly like today's low-risk fresh entry.
+        """
+        from orchestrator.b3_gate import FRESH, check_proposal
+        entry = {**_LOW_RISK_ENTRY, 'block_class': 'agent_failure'}
+        result = check_proposal(
+            entry, worktree='/tmp', category=None,
+            run_git=_fake_git_fresh, now=self._NOW,
+        )
+        assert result['verdict'] == FRESH, f'expected FRESH, got {result}'
