@@ -58,7 +58,7 @@ AdvanceResult = Literal[
     'advanced', 'cas_failed', 'not_descendant', 'contaminated',
     'stash_failed', 'wip_overlap', 'pop_conflict',
     'unmerged_state', 'pop_conflict_no_advance',
-    'rebased_pending_reverify',
+    'rebased_pending_reverify', 'conflict_markers',
 ]
 
 
@@ -6570,6 +6570,10 @@ class GitOps:
           of main after *max_attempts* (permanent; stop retrying).
         * ``'contaminated'`` — ``.task/`` contamination gate failed
           (permanent; stop retrying).
+        * ``'conflict_markers'`` — the merge tree contains tracked file(s)
+          with unresolved (column-0) conflict markers (permanent; stop
+          retrying).  esc-2128-8 Layer-2 backstop — see
+          :func:`_assert_no_conflict_markers`.
         * ``'stash_failed'`` — ``git stash push`` failed before the advance
           (permanent; halt merge to prevent code loss).
         * ``'pop_conflict_no_advance'`` — CAS ``update-ref`` failed AND the
@@ -6638,6 +6642,16 @@ class GitOps:
             except RuntimeError as e:
                 logger.error(str(e))
                 return AdvanceOutcome('contaminated')
+
+            # ── conflict-marker gate (FINAL DEFENSE, esc-2128-8 Layer-2) ──
+            try:
+                await _assert_no_conflict_markers(
+                    merge_sha, self.project_root,
+                    f'advance_main(attempt={attempt + 1})',
+                )
+            except RuntimeError as e:
+                logger.error(str(e))
+                return AdvanceOutcome('conflict_markers')
 
             rc, _, _ = await _run(
                 ['git', 'merge-base', '--is-ancestor',
