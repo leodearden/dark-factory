@@ -1,8 +1,13 @@
 """Unit tests for Mem0Backend — filter construction and search delegation."""
 
+import contextlib
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+from _fm_helpers import QDRANT_URL, qdrant_skipif
+from qdrant_client import QdrantClient
+from qdrant_client.http.exceptions import ResponseHandlingException, UnexpectedResponse
+from qdrant_client.models import VectorParams
 
 from fused_memory.backends.mem0_client import Mem0Backend
 from fused_memory.models.scope import Scope
@@ -221,3 +226,163 @@ class TestMem0BackendScrollByMetadata:
             'Expected a truncation WARNING when len(points)==limit; '
             f'got warning messages: {warning_msgs}'
         )
+
+
+class TestMem0BackendAddSystemRecord:
+    """Unit tests for the dedup-exempt system-write path (task 2222 / W5-δ).
+
+    ``add_system_record`` must pin ``infer=False`` LOCALLY in this dedicated
+    method (not inherited from ``Mem0Backend.add``) — see the method's
+    docstring for the full rationale (task decision #2: a future
+    re-enabling of Mem0 dedup on the general ``add()`` must not silently
+    re-break recon's system writes).
+    """
+
+    @pytest.mark.asyncio
+    async def test_pins_infer_false_and_maps_scope_and_metadata(self, backend):
+        """instance.add must be awaited with infer=False and scope-mapped ids."""
+        mock_instance = MagicMock()
+        mock_instance.add = AsyncMock(return_value={'results': [{'id': 'sys-1'}]})
+        scope = Scope(project_id='p', agent_id='recon-stage-x', session_id='s')
+
+        with patch.object(backend, '_get_instance', AsyncMock(return_value=mock_instance)):
+            result = await backend.add_system_record(
+                content='sys',
+                scope=scope,
+                metadata={'kind': 'cycle_summary'},
+            )
+
+        call_kwargs = mock_instance.add.await_args.kwargs
+        assert call_kwargs.get('infer') is False, (
+            'add_system_record must pin infer=False (the dedup-exempt pin); '
+            f"got infer={call_kwargs.get('infer')!r}"
+        )
+        assert call_kwargs.get('user_id') == scope.mem0_user_id, (
+            f"expected user_id={scope.mem0_user_id!r}, got {call_kwargs.get('user_id')!r}"
+        )
+        assert call_kwargs.get('agent_id') == 'recon-stage-x', (
+            f"expected agent_id='recon-stage-x', got {call_kwargs.get('agent_id')!r}"
+        )
+        assert call_kwargs.get('run_id') == 's', (
+            f"expected run_id='s', got {call_kwargs.get('run_id')!r}"
+        )
+        assert call_kwargs.get('metadata') == {'kind': 'cycle_summary'}, (
+            f"expected metadata={{'kind': 'cycle_summary'}}, got {call_kwargs.get('metadata')!r}"
+        )
+        assert result == {'results': [{'id': 'sys-1'}]}, (
+            f'add_system_record must return the raw mem0 result dict, got {result!r}'
+        )
+
+
+# ---------------------------------------------------------------------------
+# Integration: add_system_record fresh-point-per-call (task 2222 / W5-δ, P4)
+# ---------------------------------------------------------------------------
+#
+# Mirrors tests/test_recon_dedup_premise.py's real-Qdrant harness (task 2221 /
+# W5-γ, which already empirically proved the underlying infer=False primitive
+# never dedup-drops), adapted to probe add_system_record instead of add().
+# This pins the SAME fresh-point-every-call guarantee for the new dedicated,
+# dedup-exempt method.
+
+
+@pytest.fixture
+def _asr_scope(worker_id) -> Scope:
+    """A recon-stage scope isolated per xdist worker for add_system_record tests."""
+    return Scope(
+        project_id=f'_test_add_system_record_{worker_id}',
+        agent_id='recon-stage-task_knowledge_sync',
+    )
+
+
+@pytest.fixture
+def _asr_clean_collection(_asr_scope, mock_config):
+    """Delete the scope's Qdrant collection before AND after the test."""
+    collection = _asr_scope.mem0_collection_name(mock_config.mem0.collection_prefix)
+    client = QdrantClient(url=QDRANT_URL, timeout=10)
+    with contextlib.suppress(ResponseHandlingException, UnexpectedResponse):
+        client.delete_collection(collection)
+    yield collection
+    with contextlib.suppress(Exception):
+        client.delete_collection(collection)
+    client.close()
+
+
+def _asr_collection_vector_size(collection: str) -> int:
+    """Read back the vector dimension Qdrant actually created for *collection*."""
+    client = QdrantClient(url=QDRANT_URL, timeout=10)
+    try:
+        info = client.get_collection(collection)
+        vectors = info.config.params.vectors
+        assert isinstance(vectors, VectorParams), (
+            f'expected an unnamed VectorParams config, got {vectors!r}'
+        )
+        return vectors.size
+    finally:
+        client.close()
+
+
+async def _build_asr_backend(mock_config, scope, monkeypatch) -> Mem0Backend:
+    """Construct a real Mem0Backend with a stubbed constant-vector embedder.
+
+    Mirrors test_recon_dedup_premise._build_recon_backend's hermetic
+    (non-real-embedder) path: cosine=1.0 is the strongest-possible duplicate
+    signal the infer=False path could ever see.
+    """
+    monkeypatch.setattr('mem0.memory.main.capture_event', lambda *a, **kw: None)
+
+    config = mock_config.model_copy(deep=True)
+    backend = Mem0Backend(config)
+    inst = await backend._get_instance(scope)
+    inst.db.add_history = lambda *a, **kw: None
+
+    collection = scope.mem0_collection_name(config.mem0.collection_prefix)
+    dim = _asr_collection_vector_size(collection)
+    stub_vector = [0.1] * dim
+    inst.embedding_model.embed = lambda *a, **kw: stub_vector
+
+    return backend
+
+
+class TestMem0BackendAddSystemRecordIntegration:
+    """P4 boundary signal: N identical add_system_record calls -> N distinct points.
+
+    Real Qdrant, isolated collection, stubbed constant-vector embedder (the
+    worst-case cosine=1.0 duplicate signal) — mirrors
+    test_recon_dedup_premise.py's harness for backend.add(), applied to the
+    new dedup-exempt backend.add_system_record method.
+    """
+
+    pytestmark = [qdrant_skipif(), pytest.mark.timeout(60)]
+
+    @pytest.mark.asyncio
+    async def test_identical_calls_all_land_distinct(
+        self, mock_config, _asr_scope, _asr_clean_collection, monkeypatch,
+    ):
+        backend = await _build_asr_backend(mock_config, _asr_scope, monkeypatch)
+        run_id = 'task-2222-add-system-record-probe'
+        metadata = {'kind': 'cycle_summary', 'run_id': run_id}
+        n = 6
+        try:
+            ids = []
+            for _ in range(n):
+                response = await backend.add_system_record(
+                    content=(
+                        'Stage 2 cycle summary fixture for task 2222 '
+                        'add_system_record fresh-point-per-call probe.'
+                    ),
+                    scope=_asr_scope,
+                    metadata=metadata,
+                )
+                results = response.get('results') or []
+                assert len(results) == 1, (
+                    f'expected exactly one result under infer=False, got {results!r}'
+                )
+                assert 'id' in results[0]
+                ids.append(results[0]['id'])
+
+            assert len(set(ids)) == n, (
+                f'expected {n} distinct ids (no dedup drop), got {len(set(ids))}: {ids!r}'
+            )
+            assert await backend.count_by_metadata(_asr_scope, {'run_id': run_id}) == n
+        finally:
+            await backend.close()
