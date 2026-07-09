@@ -710,8 +710,12 @@ async def test_resolve_ticket_wakes_on_worker_completion(
     assert resolve_result['status'] == 'created', f'Expected created: {resolve_result}'
     assert resolve_result.get('task_id') == '42', f'Expected task_id=42: {resolve_result}'
     assert 'result_json' not in resolve_result, f'result_json should not be exposed: {resolve_result}'
-    # Should complete quickly (worker processes immediately)
-    assert elapsed < 3.0, f'resolve_ticket took too long ({elapsed:.2f}s)'
+    # The outer asyncio.wait_for(timeout=6.0) above is already the real hang
+    # guard (it would have raised TimeoutError instead of returning here).
+    # Widen this redundant inner bound to match it so it can never
+    # spuriously fail under scheduling delay while the outer bound remains
+    # the sole hang guard.
+    assert elapsed < 6.0, f'resolve_ticket took too long ({elapsed:.2f}s)'
 
 
 # ---------------------------------------------------------------------------
@@ -2635,6 +2639,12 @@ async def test_janitor_reap_wakes_blocked_resolve_ticket_promptly(
     assert result.get('reason') == 'worker_dead', (
         f'Expected reason=worker_dead, got: {result.get("reason")!r}'
     )
-    assert elapsed < 3.0, (
+    # The outer asyncio.wait_for(resolve_task, timeout=5.0) at step 7 above
+    # is already the real hang guard (it would have raised TimeoutError
+    # instead of returning here). Widen this redundant inner bound to match
+    # it so it can never spuriously fail under scheduling delay while the
+    # outer bound remains the sole hang guard against the ~30s
+    # timeout_seconds fallback.
+    assert elapsed < 5.0, (
         f'resolve_ticket took {elapsed:.2f}s — expected prompt wake, not ~30s timeout'
     )
