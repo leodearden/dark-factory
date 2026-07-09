@@ -10,6 +10,7 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 import pytest_asyncio
+from _fm_helpers import poll_until
 
 from fused_memory.models.enums import SourceStore
 from fused_memory.services.memory_service import MemoryService
@@ -59,11 +60,14 @@ class TestIntegrationFlow:
         )
         assert SourceStore.graphiti in result.stores_written
 
-        # Wait for worker to process
-        await asyncio.sleep(1.0)
+        # Poll until the worker has processed the item, instead of a fixed
+        # sleep that can race under full-suite CPU load.
+        async def _completed():
+            s = await svc.durable_queue.get_stats()
+            return s if s['counts'].get('completed', 0) >= 1 else None
 
+        stats = await poll_until(_completed, message='timed out waiting for the item to be processed')
         svc.graphiti.add_episode.assert_called_once()
-        stats = await svc.durable_queue.get_stats()
         assert stats['counts'].get('completed', 0) == 1
 
     @pytest.mark.asyncio
@@ -101,9 +105,12 @@ class TestIntegrationFlow:
         )
         assert result.episode_id is not None
 
-        # Wait for worker to process
-        await asyncio.sleep(1.5)
-
+        # Poll until the worker has invoked graphiti.add_episode, instead of
+        # a fixed sleep that can race under full-suite CPU load.
+        await poll_until(
+            lambda: svc.graphiti.add_episode.called,
+            message='timed out waiting for graphiti.add_episode to be called',
+        )
         svc.graphiti.add_episode.assert_called_once()
         call_kwargs = svc.graphiti.add_episode.call_args[1]
         assert call_kwargs.get('uuid') == result.episode_id
@@ -126,14 +133,18 @@ class TestIntegrationFlow:
         )
         assert result.status == 'queued'
 
-        # Wait for worker + callback + mem0 classify_and_add processing
-        await asyncio.sleep(2.5)
+        # Poll until at least the episode item has completed (worker +
+        # callback + mem0 classify_and_add may enqueue further items),
+        # instead of a fixed sleep that can race under full-suite CPU load.
+        async def _completed():
+            s = await svc.durable_queue.get_stats()
+            return s if s['counts'].get('completed', 0) >= 1 else None
 
+        stats = await poll_until(_completed, message='timed out waiting for the episode item to complete')
         svc.graphiti.add_episode.assert_called_once()
         # The callback enqueues mem0_classify_and_add items which the queue processes.
         # The fact "Always format code with black" should classify as preferences_and_norms
         # (mem0 primary) and trigger a mem0.add call.
-        stats = await svc.durable_queue.get_stats()
         # At minimum the episode item completed; mem0 items may also be completed
         assert stats['counts'].get('completed', 0) >= 1
 
@@ -151,8 +162,12 @@ class TestIntegrationFlow:
         assert SourceStore.graphiti in result.stores_written
         assert SourceStore.mem0 in result.stores_written
 
-        # Wait for queue to process both writes
-        await asyncio.sleep(1.5)
+        # Poll until the queue has processed both writes, instead of a fixed
+        # sleep that can race under full-suite CPU load.
+        await poll_until(
+            lambda: svc.graphiti.add_episode.called and svc.mem0.add.called,
+            message='timed out waiting for both graphiti and mem0 writes to process',
+        )
         svc.graphiti.add_episode.assert_called_once()
         svc.mem0.add.assert_called_once()
 
@@ -172,11 +187,18 @@ class TestIntegrationFlow:
         count = await svc.replay_from_store(source_project_id='reify')
         assert count == 3
 
-        # Wait for workers to process all items
-        await asyncio.sleep(2.0)
+        # Poll until workers have processed all items, instead of a fixed
+        # sleep that can race under full-suite CPU load.
+        async def _all_completed():
+            s = await svc.durable_queue.get_stats()
+            return s if s['counts'].get('completed', 0) >= 3 else None
 
+        stats = await poll_until(
+            _all_completed,
+            timeout=20.0,
+            message='timed out waiting for all replayed items to complete',
+        )
         assert svc.graphiti.add_episode.call_count == 3
-        stats = await svc.durable_queue.get_stats()
         assert stats['counts'].get('completed', 0) == 3
 
 
@@ -207,11 +229,21 @@ class TestFailureRecovery:
             project_id='test',
         )
 
-        # Wait for retries (0.05s base * 2^n backoff + poll intervals)
-        await asyncio.sleep(3.0)
+        # Poll instead of a fixed sleep: retries involve the worker's own
+        # idle-poll floor on top of the backoff itself, so a generous
+        # timeout absorbs scheduling delay under full-suite CPU load.
+        async def _retried_and_completed():
+            s = await svc.durable_queue.get_stats()
+            if call_count >= 3 and s['counts'].get('completed', 0) >= 1:
+                return s
+            return None
 
+        stats = await poll_until(
+            _retried_and_completed,
+            timeout=20.0,
+            message='timed out waiting for retries to exhaust and the item to complete',
+        )
         assert call_count == 3
-        stats = await svc.durable_queue.get_stats()
         assert stats['counts'].get('completed', 0) == 1
 
     @pytest.mark.asyncio
@@ -226,10 +258,17 @@ class TestFailureRecovery:
             project_id='test',
         )
 
-        # max_attempts=3 in mock_config, wait for all attempts
-        await asyncio.sleep(3.0)
+        # max_attempts=3 in mock_config; poll until dead-lettered instead of
+        # a fixed sleep that can race under full-suite CPU load.
+        async def _dead_lettered():
+            s = await svc.durable_queue.get_stats()
+            return s if s['counts'].get('dead', 0) >= 1 else None
 
-        stats = await svc.durable_queue.get_stats()
+        stats = await poll_until(
+            _dead_lettered,
+            timeout=20.0,
+            message='timed out waiting for the item to be dead-lettered',
+        )
         assert stats['counts'].get('dead', 0) == 1
 
         dead = await svc.durable_queue.get_dead_items()
@@ -248,7 +287,15 @@ class TestFailureRecovery:
             project_id='test',
         )
 
-        await asyncio.sleep(3.0)
+        async def _dead_lettered():
+            s = await svc.durable_queue.get_stats()
+            return s if s['counts'].get('dead', 0) >= 1 else None
+
+        await poll_until(
+            _dead_lettered,
+            timeout=20.0,
+            message='timed out waiting for the item to be dead-lettered',
+        )
 
         dead = await svc.durable_queue.get_dead_items()
         assert len(dead) == 1
@@ -259,9 +306,15 @@ class TestFailureRecovery:
         count = await svc.durable_queue.replay_dead('test')
         assert count == 1
 
-        await asyncio.sleep(1.0)
+        async def _completed():
+            s = await svc.durable_queue.get_stats()
+            return s if s['counts'].get('completed', 0) >= 1 else None
 
-        stats = await svc.durable_queue.get_stats()
+        stats = await poll_until(
+            _completed,
+            timeout=20.0,
+            message='timed out waiting for the replayed item to complete',
+        )
         assert stats['counts'].get('completed', 0) == 1
 
     @pytest.mark.asyncio
@@ -299,11 +352,20 @@ class TestFailureRecovery:
         svc2.mem0.add = AsyncMock(return_value={'results': []})
 
         await svc2.initialize()
-        await asyncio.sleep(1.5)
+        assert svc2.durable_queue is not None
+
+        async def _completed():
+            assert svc2.durable_queue is not None
+            s = await svc2.durable_queue.get_stats()
+            return s if s['counts'].get('completed', 0) >= 1 else None
+
+        stats = await poll_until(
+            _completed,
+            timeout=20.0,
+            message='timed out waiting for the recovered item to be processed',
+        )
 
         # The recovered item should have been processed by svc2
-        assert svc2.durable_queue is not None
-        stats = await svc2.durable_queue.get_stats()
         assert stats['counts'].get('completed', 0) >= 1
         svc2.graphiti.add_episode.assert_called()
 
@@ -334,14 +396,20 @@ class TestConcurrencyStress:
         results = await asyncio.gather(*tasks)
         assert len(results) == 100
 
-        # Wait for all workers to complete
-        for _ in range(60):
-            stats = await svc.durable_queue.get_stats()
-            if stats['counts'].get('completed', 0) == 100:
-                break
-            await asyncio.sleep(0.5)
+        # Poll until all workers complete, delegating to the shared helper
+        # (task 2377) instead of a hand-rolled bounded loop. 25s leaves
+        # headroom under this test's own @pytest.mark.timeout(30) so a
+        # genuinely-stuck drainer raises a clean AssertionError here rather
+        # than racing the outer thread-kill timeout.
+        async def _all_completed():
+            s = await svc.durable_queue.get_stats()
+            return s if s['counts'].get('completed', 0) >= 100 else None
 
-        stats = await svc.durable_queue.get_stats()
+        stats = await poll_until(
+            _all_completed,
+            timeout=25.0,
+            message='timed out waiting for all 100 writes to complete',
+        )
         assert stats['counts'].get('completed', 0) == 100
         assert svc.graphiti.add_episode.call_count == 100
 
@@ -378,14 +446,17 @@ class TestConcurrencyStress:
         ]
         await asyncio.gather(*tasks)
 
-        # Wait for processing
-        for _ in range(40):
-            stats = await svc.durable_queue.get_stats()
-            if stats['counts'].get('completed', 0) == 30:
-                break
-            await asyncio.sleep(0.5)
+        # Poll until processing completes, delegating to the shared helper
+        # (task 2377) instead of a hand-rolled bounded loop.
+        async def _all_completed():
+            s = await svc.durable_queue.get_stats()
+            return s if s['counts'].get('completed', 0) >= 30 else None
 
-        stats = await svc.durable_queue.get_stats()
+        stats = await poll_until(
+            _all_completed,
+            timeout=25.0,
+            message='timed out waiting for all 30 writes to complete',
+        )
         assert stats['counts'].get('completed', 0) == 30
         # semaphore_limit is 5 in mock_config
         assert max_concurrent <= 5
@@ -410,13 +481,17 @@ class TestConcurrencyStress:
 
         await asyncio.gather(*tasks)
 
-        for _ in range(40):
-            stats = await svc.durable_queue.get_stats()
-            if stats['counts'].get('completed', 0) == 60:
-                break
-            await asyncio.sleep(0.5)
+        # Poll until all 3 projects' items complete, delegating to the
+        # shared helper (task 2377) instead of a hand-rolled bounded loop.
+        async def _all_completed():
+            s = await svc.durable_queue.get_stats()
+            return s if s['counts'].get('completed', 0) >= 60 else None
 
-        stats = await svc.durable_queue.get_stats()
+        stats = await poll_until(
+            _all_completed,
+            timeout=25.0,
+            message='timed out waiting for all 60 writes to complete',
+        )
         assert stats['counts'].get('completed', 0) == 60
         assert svc.graphiti.add_episode.call_count == 60
 
@@ -448,13 +523,17 @@ class TestConcurrencyStress:
         # At least some should be pending since 50 items * 100ms > instant
         # (This may be 0 if workers are very fast, so we just check eventual completion)
 
-        for _ in range(60):
-            stats = await svc.durable_queue.get_stats()
-            if stats['counts'].get('completed', 0) == 50:
-                break
-            await asyncio.sleep(0.5)
+        # Poll until all items complete, delegating to the shared helper
+        # (task 2377) instead of a hand-rolled bounded loop.
+        async def _all_completed():
+            s = await svc.durable_queue.get_stats()
+            return s if s['counts'].get('completed', 0) >= 50 else None
 
-        stats = await svc.durable_queue.get_stats()
+        stats = await poll_until(
+            _all_completed,
+            timeout=25.0,
+            message='timed out waiting for all 50 writes to complete',
+        )
         assert stats['counts'].get('completed', 0) == 50
 
     @pytest.mark.asyncio
@@ -498,16 +577,20 @@ class TestConcurrencyStress:
             )
         await asyncio.gather(*tasks)
 
-        # Wait for all to be processed
-        for _ in range(60):
-            stats = await svc.durable_queue.get_stats()
-            completed = stats['counts'].get('completed', 0)
-            dead = stats['counts'].get('dead', 0)
-            if completed + dead == 50:
-                break
-            await asyncio.sleep(0.5)
+        # Poll until all 50 items reach a terminal state (completed or dead),
+        # delegating to the shared helper (task 2377) instead of a
+        # hand-rolled bounded loop.
+        async def _all_terminal():
+            s = await svc.durable_queue.get_stats()
+            completed = s['counts'].get('completed', 0)
+            dead = s['counts'].get('dead', 0)
+            return s if completed + dead >= 50 else None
 
-        stats = await svc.durable_queue.get_stats()
+        stats = await poll_until(
+            _all_terminal,
+            timeout=25.0,
+            message='timed out waiting for all 50 items to reach a terminal state',
+        )
         assert stats['counts'].get('completed', 0) == 40
         assert stats['counts'].get('dead', 0) == 10
 
@@ -541,9 +624,28 @@ class TestQueueStats:
                 },
             )
 
-        # Check mid-flight
-        await asyncio.sleep(0.3)
-        stats = await svc.durable_queue.get_stats()
+        # Poll until processing has genuinely started (at least one item has
+        # left 'pending'), instead of a fixed sleep, so the mid-flight
+        # snapshot is meaningful under any host load. The conservation
+        # assertion below holds at any sampling point regardless of timing —
+        # every row is in exactly one status bucket — so this only needs to
+        # wait long enough to exercise a real mid-flight state. Note: the
+        # hard guarantee this test makes is conservation (total == 10); a
+        # genuinely mid-flight (non-terminal) snapshot is the overwhelmingly
+        # common case since each item's simulated 0.2s latency makes
+        # early completion of all 10 items unlikely, but it is not
+        # separately asserted here — doing so would risk reintroducing a
+        # load-sensitive flake (failing on an unusually fast/idle run)
+        # instead of the load-sensitive flake this task removes.
+        async def _processing_started():
+            s = await svc.durable_queue.get_stats()
+            return s if s['counts'].get('pending', 0) < 10 else None
+
+        stats = await poll_until(
+            _processing_started,
+            timeout=20.0,
+            message='timed out waiting for mid-flight processing to start',
+        )
         counts = stats['counts']
         total = sum(counts.values())
         assert total == 10  # pending + in_flight + completed = 10
@@ -566,12 +668,15 @@ class TestQueueStats:
                 },
             )
 
-        # Wait for all to complete
-        for _ in range(20):
-            stats = await svc.durable_queue.get_stats()
-            if stats['counts'].get('completed', 0) == 15:
-                break
-            await asyncio.sleep(0.5)
+        # Poll until all items complete, delegating to the shared helper
+        # (task 2377) instead of a hand-rolled bounded loop.
+        async def _all_completed():
+            s = await svc.durable_queue.get_stats()
+            return s if s['counts'].get('completed', 0) >= 15 else None
 
-        stats = await svc.durable_queue.get_stats()
+        stats = await poll_until(
+            _all_completed,
+            timeout=20.0,
+            message='timed out waiting for all 15 items to complete',
+        )
         assert stats['counts'].get('completed', 0) == 15

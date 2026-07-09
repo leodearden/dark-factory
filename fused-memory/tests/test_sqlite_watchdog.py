@@ -12,6 +12,7 @@ import logging
 import time
 
 import pytest
+from _fm_helpers import poll_until
 
 from fused_memory.reconciliation.sqlite_watchdog import SqliteWatchdog
 
@@ -79,9 +80,15 @@ async def test_wedge_fires_on_artificial_stall(caplog):
     caplog.set_level(logging.ERROR, logger='fused_memory.reconciliation.sqlite_watchdog')
     await watchdog.start()
     try:
-        # First tick happens after check_interval; stall_threshold is 1s so
-        # at ~0.05s we're healthy — give it 1.5s to cross the threshold.
-        await asyncio.sleep(1.3)
+        # Poll until the wedge fires, instead of a fixed sleep that can race
+        # under full-suite CPU load. The intrinsic stall_threshold_seconds=1.0
+        # is still respected — poll_until simply waits up to its generous
+        # deadline for the watchdog to cross it.
+        await poll_until(
+            lambda: bool(wedge_payloads),
+            timeout=10.0,
+            message='timed out waiting for the wedge to fire',
+        )
     finally:
         await watchdog.close()
 
@@ -201,7 +208,11 @@ async def test_wedge_fires_when_only_retry_in_flight(caplog):
     caplog.set_level(logging.ERROR, logger='fused_memory.reconciliation.sqlite_watchdog')
     await watchdog.start()
     try:
-        await asyncio.sleep(0.3)
+        await poll_until(
+            lambda: bool(wedge_payloads),
+            timeout=10.0,
+            message='timed out waiting for the retry-only wedge to fire',
+        )
     finally:
         await watchdog.close()
 
@@ -238,8 +249,20 @@ async def test_wedge_does_not_spam(caplog):
     caplog.set_level(logging.ERROR, logger='fused_memory.reconciliation.sqlite_watchdog')
     await watchdog.start()
     try:
-        # Many ticks across the stall threshold.
-        await asyncio.sleep(0.5)
+        # Poll until the first wedge fires, instead of a fixed sleep that can
+        # race under full-suite CPU load (zero ticks in the window would
+        # otherwise falsely fail the error_count==1 assert below). Then let
+        # several more check intervals pass to meaningfully exercise "one
+        # ERROR per rearm window, not one per tick" — error_count==1 holds
+        # regardless of how many extra ticks land, so this padding can never
+        # cause a false failure, only reduce (under extreme load) how many
+        # extra ticks it exercises.
+        await poll_until(
+            lambda: callback_calls >= 1,
+            timeout=10.0,
+            message='timed out waiting for the wedge to fire at least once',
+        )
+        await asyncio.sleep(0.3)
     finally:
         await watchdog.close()
 
@@ -278,14 +301,30 @@ async def test_wedge_rearms_after_recovery(caplog):
     await watchdog.start()
     try:
         # Let the first wedge fire.
-        await asyncio.sleep(0.2)
+        await poll_until(
+            lambda: callback_count >= 1,
+            timeout=10.0,
+            message='timed out waiting for the first wedge to fire',
+        )
         # Phase 2: recover — fresh commit, non-empty queue still fine because
-        # the recency anchor is last_commit_ts.
+        # the recency anchor is last_commit_ts. Poll until the watchdog has
+        # actually observed the recovery (cleared its internal _wedge_active
+        # latch, per sqlite_watchdog.py's _tick) before re-wedging below,
+        # instead of a fixed sleep — a skipped tick under full-suite CPU load
+        # would otherwise leave the latch set and suppress the second ERROR.
         fake.set_stats(queue_depth=0, last_commit_ts=time.time())
-        await asyncio.sleep(0.15)
+        await poll_until(
+            lambda: watchdog._wedge_active is False,
+            timeout=10.0,
+            message='timed out waiting for the watchdog to observe recovery',
+        )
         # Phase 3: wedge again.
         fake.set_stats(queue_depth=3, last_commit_ts=time.time() - 100.0)
-        await asyncio.sleep(0.2)
+        await poll_until(
+            lambda: callback_count >= 2,
+            timeout=10.0,
+            message='timed out waiting for the second wedge to fire',
+        )
     finally:
         await watchdog.close()
 
@@ -410,8 +449,15 @@ async def test_wedge_fires_with_real_event_queue(tmp_path, caplog):
         )
         queue.enqueue(event)
 
-        # stall_threshold=0.3s; give it ~1s to cross it.
-        await asyncio.sleep(1.0)
+        # Poll until the wedge fires, instead of a fixed sleep that can race
+        # under full-suite CPU load. The intrinsic stall_threshold_seconds=0.3
+        # is still respected — poll_until simply waits up to its generous
+        # deadline for the watchdog to cross it.
+        await poll_until(
+            lambda: bool(wedge_payloads),
+            timeout=15.0,
+            message='timed out waiting for the wedge to fire against the real EventQueue',
+        )
     finally:
         await watchdog.close()
         queue._shutdown_flush = 0.05

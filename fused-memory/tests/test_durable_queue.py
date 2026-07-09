@@ -10,6 +10,7 @@ from unittest.mock import AsyncMock
 import aiosqlite
 import pytest
 import pytest_asyncio
+from _fm_helpers import poll_until
 
 import fused_memory.services.durable_queue as dq_module
 from fused_memory.services.durable_queue import DurableWriteQueue
@@ -68,8 +69,16 @@ class TestWorkerProcessing:
             group_id='proj1', operation='add_episode',
             payload={'content': 'test', 'group_id': 'proj1', 'name': 'ep'},
         )
-        # Give worker time to pick up and process
-        await asyncio.sleep(0.3)
+
+        # Poll until the worker has picked up and completed the item, instead
+        # of a fixed sleep that can race under full-suite CPU load. Polling
+        # on the completed count (rather than just mock_execute.called)
+        # closes the gap between the mock resolving and the status commit.
+        async def _completed():
+            s = await queue.get_stats()
+            return s if s['counts'].get('completed', 0) >= 1 else None
+
+        await poll_until(_completed, message='timed out waiting for the item to be processed')
         mock_execute.assert_called_once()
         stats = await queue.get_stats()
         assert stats['counts'].get('completed', 0) == 1
@@ -84,7 +93,10 @@ class TestWorkerProcessing:
             payload={'content': 'test', 'group_id': 'proj1', 'name': 'ep'},
             callback_type='test_cb',
         )
-        await asyncio.sleep(0.3)
+        await poll_until(
+            lambda: callback.called,
+            message='timed out waiting for the callback to be invoked',
+        )
         callback.assert_called_once()
         # Check callback received (callback_type, result, payload)
         args = callback.call_args[0]
@@ -119,11 +131,24 @@ class TestRetry:
             group_id='proj1', operation='add_episode',
             payload={'content': 'test', 'group_id': 'proj1', 'name': 'ep'},
         )
-        # Wait enough for retries (0.5s poll + 0.01s/0.02s backoff)
-        await asyncio.sleep(3.0)
+
+        # Poll instead of a fixed sleep: retries involve the worker's own
+        # 0.5s idle-poll floor (see _worker_loop) on top of the backoff
+        # itself, so a generous 20s timeout absorbs scheduling delay under
+        # full-suite CPU load without weakening the assertions below.
+        async def _retried_and_completed():
+            s = await q.get_stats()
+            if call_count >= 3 and s['counts'].get('completed', 0) >= 1:
+                return s
+            return None
+
+        stats = await poll_until(
+            _retried_and_completed,
+            timeout=20.0,
+            message='timed out waiting for retries to exhaust and the item to complete',
+        )
 
         assert call_count == 3
-        stats = await q.get_stats()
         assert stats['counts'].get('completed', 0) == 1
         await q.close()
 
@@ -155,10 +180,20 @@ class TestTimeout:
             group_id='proj1', operation='add_episode',
             payload={'content': 'test', 'group_id': 'proj1', 'name': 'ep'},
         )
-        await asyncio.sleep(1.0)
+
+        async def _retried_after_timeout_and_completed():
+            s = await q.get_stats()
+            if call_count >= 2 and s['counts'].get('completed', 0) >= 1:
+                return s
+            return None
+
+        stats = await poll_until(
+            _retried_after_timeout_and_completed,
+            timeout=20.0,
+            message='timed out waiting for retry-after-timeout to complete',
+        )
 
         assert call_count >= 2  # at least one retry after timeout
-        stats = await q.get_stats()
         assert stats['counts'].get('completed', 0) == 1
         await q.close()
 
@@ -218,7 +253,7 @@ class TestDeadLetter:
                 group_id='proj1', operation='add_episode',
                 payload={'content': f'item {i}', 'group_id': 'proj1', 'name': f'ep{i}'},
             )
-        await asyncio.sleep(1.0)
+        await _poll_until_dead(q, group_id='proj1', expected_dead=4, timeout=20.0)
 
         # All 4 should be dead.
         all_dead = await q.get_dead_items()
@@ -270,7 +305,7 @@ class TestReplayDead:
             group_id='proj1', operation='add_episode',
             payload={'content': 'test', 'group_id': 'proj1', 'name': 'ep'},
         )
-        await asyncio.sleep(1.0)
+        await _poll_until_dead(q, group_id='proj1', expected_dead=1, timeout=20.0)
 
         # Should be dead-lettered
         dead = await q.get_dead_items()
@@ -280,10 +315,17 @@ class TestReplayDead:
         count = await q.replay_dead('proj1')
         assert count == 1
 
-        await asyncio.sleep(0.5)
+        async def _completed():
+            s = await q.get_stats()
+            return s if s['counts'].get('completed', 0) >= 1 else None
+
+        stats = await poll_until(
+            _completed,
+            timeout=20.0,
+            message='timed out waiting for the replayed item to complete',
+        )
 
         # Now should be completed (call_count was 2 from failures, 3rd succeeds)
-        stats = await q.get_stats()
         assert stats['counts'].get('completed', 0) == 1
         assert call_count == 3
         await q.close()
@@ -325,10 +367,17 @@ class TestConcurrency:
                 payload={'content': f'item {i}', 'group_id': 'proj1', 'name': f'ep{i}'},
             )
 
-        await asyncio.sleep(2.0)
+        async def _all_completed():
+            s = await q.get_stats()
+            return s if s['counts'].get('completed', 0) >= 10 else None
+
+        stats = await poll_until(
+            _all_completed,
+            timeout=20.0,
+            message='timed out waiting for all 10 items to complete',
+        )
 
         assert max_concurrent <= 2
-        stats = await q.get_stats()
         assert stats['counts'].get('completed', 0) == 10
         await q.close()
 
@@ -372,11 +421,19 @@ class TestRecovery:
             write_timeout_seconds=2.0,
         )
         await q2.initialize()
-        await asyncio.sleep(0.5)
+
+        async def _completed():
+            s = await q2.get_stats()
+            return s if s['counts'].get('completed', 0) >= 1 else None
+
+        stats = await poll_until(
+            _completed,
+            timeout=20.0,
+            message='timed out waiting for the recovered item to be processed',
+        )
 
         # The recovered item should have been processed
         execute.assert_called()
-        stats = await q2.get_stats()
         assert stats['counts'].get('completed', 0) >= 1
         await q2.close()
 
@@ -412,7 +469,14 @@ class TestMultipleGroups:
                     payload={'content': f'{group}-{i}', 'group_id': group, 'name': f'ep{i}'},
                 )
 
-        await asyncio.sleep(1.5)
+        def _all_groups_seen_thrice():
+            return all(groups_seen.get(g, 0) >= 3 for g in ('alpha', 'beta', 'gamma'))
+
+        await poll_until(
+            _all_groups_seen_thrice,
+            timeout=20.0,
+            message='timed out waiting for all 3 groups to process 3 items each',
+        )
 
         assert groups_seen.get('alpha', 0) == 3
         assert groups_seen.get('beta', 0) == 3
@@ -466,7 +530,7 @@ class TestCallbackFailure:
         )
 
         # Wait for all retries to exhaust (max_attempts=3 in fixture)
-        await asyncio.sleep(2.0)
+        await _poll_until_dead(queue, group_id='proj1', expected_dead=1, timeout=20.0)
 
         stats = await queue.get_stats()
         # Item should be dead-lettered, not completed — callback kept failing
@@ -484,9 +548,16 @@ class TestCallbackFailure:
             payload={'content': 'test', 'group_id': 'proj1', 'name': 'ep'},
             callback_type='ok_cb',
         )
-        await asyncio.sleep(0.3)
 
-        stats = await queue.get_stats()
+        async def _completed():
+            s = await queue.get_stats()
+            return s if s['counts'].get('completed', 0) >= 1 else None
+
+        stats = await poll_until(
+            _completed,
+            timeout=20.0,
+            message='timed out waiting for the callback-completed item to finish',
+        )
         assert stats['counts'].get('completed', 0) == 1
         ok_callback.assert_called_once()
 
@@ -1108,18 +1179,25 @@ class TestStats:
         # dead-letters. A fixed sleep raced under full-suite CPU load: the two
         # 'good' writes had not both drained yet, yielding completed==1 (see
         # _poll_until_dead's rationale — same fix, both terminal counts).
-        deadline = asyncio.get_event_loop().time() + 5.0
-        while True:
-            stats = await q.get_stats()
-            counts = stats['counts']
-            if counts.get('completed', 0) >= 2 and counts.get('dead', 0) >= 1:
-                break
-            if asyncio.get_event_loop().time() >= deadline:
-                raise AssertionError(
-                    f'Timed out waiting for completed>=2 and dead>=1; '
-                    f'last counts={counts}'
-                )
-            await asyncio.sleep(0.05)
+        # Delegates to the shared poll_until (task 2377); last_counts is a
+        # side-channel capture so the timeout message can still report the
+        # latest observed counts, since poll_until's message is static.
+        last_counts: dict = {}
+
+        async def _both_terminal():
+            s = await q.get_stats()
+            last_counts.update(s['counts'])
+            if s['counts'].get('completed', 0) >= 2 and s['counts'].get('dead', 0) >= 1:
+                return s
+            return None
+
+        try:
+            stats = await poll_until(_both_terminal, timeout=5.0, interval=0.05)
+        except AssertionError as exc:
+            raise AssertionError(
+                f'Timed out waiting for completed>=2 and dead>=1; '
+                f'last counts={last_counts}'
+            ) from exc
 
         assert stats['counts'].get('completed', 0) == 2
         assert stats['counts'].get('dead', 0) == 1
@@ -1135,22 +1213,27 @@ async def _poll_until_dead(
 ) -> None:
     """Poll queue stats until at least *expected_dead* items have status='dead'.
 
-    Replaces fixed ``asyncio.sleep`` calls in tests that wait for items to
-    dead-letter: avoids the 1.5 s floor on fast machines while still handling
-    slow CI runners via the *timeout* guard.
+    Thin wrapper over the shared poll_until (task 2377): replaces fixed
+    ``asyncio.sleep`` calls in tests that wait for items to dead-letter,
+    avoiding the 1.5 s floor on fast machines while still handling slow CI
+    runners via the *timeout* guard. last_counts is a side-channel capture
+    so the timeout message can still report the latest observed counts,
+    since poll_until's message is static.
     """
-    deadline = asyncio.get_event_loop().time() + timeout
-    while True:
+    last_counts: dict = {}
+
+    async def _dead_count_reached():
         stats = await q.get_stats(group_id=group_id)
-        if stats['counts'].get('dead', 0) >= expected_dead:
-            return
-        remaining = deadline - asyncio.get_event_loop().time()
-        if remaining <= 0:
-            raise AssertionError(
-                f'Timed out waiting for {expected_dead} dead item(s) '
-                f'(group_id={group_id!r}); last counts={stats["counts"]}'
-            )
-        await asyncio.sleep(0.05)
+        last_counts.update(stats['counts'])
+        return stats['counts'].get('dead', 0) >= expected_dead
+
+    try:
+        await poll_until(_dead_count_reached, timeout=timeout, interval=0.05)
+    except AssertionError as exc:
+        raise AssertionError(
+            f'Timed out waiting for {expected_dead} dead item(s) '
+            f'(group_id={group_id!r}); last counts={last_counts}'
+        ) from exc
 
 
 class TestGetStatsScopedByGroup:

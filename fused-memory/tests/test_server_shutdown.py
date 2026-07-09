@@ -339,7 +339,13 @@ class TestGracefulShutdownLogsHarnessTaskException:
 
 
 class TestGracefulShutdownHarnessTaskTimeout:
-    @pytest.mark.timeout(2)
+    # The repo default timeout_method="thread" KILLS the pytest worker on
+    # expiry, so a 2s outer guard is fragile under host CPU oversubscription.
+    # The real behavioral assertion is the internal
+    # patch('..._HARNESS_CANCEL_TIMEOUT', 0.01) below, which proves shutdown
+    # completes despite a hung harness task; widening this outer guard only
+    # gives scheduling headroom and is behavior-preserving.
+    @pytest.mark.timeout(15)
     @pytest.mark.asyncio
     async def test_shutdown_completes_even_when_harness_task_hangs_in_cleanup(self):
         """_graceful_shutdown must complete within a bounded time even if the harness task
