@@ -697,3 +697,16 @@ class TestHostAllocatorCancelReleaseIdempotent:
         assert second is True
         assert alloc.is_busy('remoteA') is False
         assert remote_a.probe_clean_called == 0
+
+    async def test_cancel_and_release_none_lease_is_noop(self):
+        """cancel_and_release(None) is a defensive no-op: returns True, raises
+        nothing, and never touches the RPC path.
+        """
+        from orchestrator.verify_runner import HostAllocator
+
+        remote_a = _FakeRemoteRunnerCancellable('remoteA', cancel_rc=0)
+        alloc = HostAllocator([remote_a], quarantine=set())
+
+        result = await alloc.cancel_and_release(None)
+        assert result is True
+        assert remote_a.cancel_verify_called == 0
