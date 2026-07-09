@@ -17,6 +17,7 @@ from pathlib import Path
 from typing import Literal, TypedDict
 
 from shared.proc_group import terminate_process_group
+from shared.verify_admission import acquire_task_slot, nice_prefix
 
 from orchestrator.cargo_scope import discover_workspace_crates, files_to_crates
 from orchestrator.config import ModuleConfig, OrchestratorConfig
@@ -2812,6 +2813,57 @@ def _maybe_govern_merge_cmd(
     return f'{shlex.quote(exec_abs)} --role merge -- /bin/bash -c {shlex.quote(cmd)}'
 
 
+def _verify_admission_active(config: OrchestratorConfig) -> bool:
+    """Whether the verify-admission gate (flock slot + nice tier) is active.
+
+    The single module seam the autouse ``_neutralize_verify_admission``
+    conftest fixture (task 2390 pre-1) patches to force every pre-existing
+    verify test to run ungated, regardless of ``config.verify_admission_enabled``.
+    """
+    return config.verify_admission_enabled
+
+
+@contextlib.asynccontextmanager
+async def _admission_slot(role: str, config: OrchestratorConfig):
+    """Async CM around T1's ``shared.verify_admission.acquire_task_slot``.
+
+    Gates only the test leg of a verify (callers decide that; this CM itself
+    is role-agnostic and always attempts acquisition uniformly — T1's
+    ``acquire_task_slot`` internally no-ops for ``role`` values other than
+    ``'task'``/``'background'`` and always yields ``held=False`` immediately
+    for them, so ``merge`` can never be starved by ``task`` — C-merge-priority
+    is owned entirely by T1, not re-implemented here).
+
+    T1 never creates ``slots_dir`` itself (fails open when absent), so this
+    CM mkdirs it first. The blocking, potentially-unbounded
+    ``acquire_task_slot(...).__enter__`` (a synchronous flock poll-loop) runs
+    via ``asyncio.to_thread`` so the wait never blocks the event loop —
+    otherwise a waiter would stall the holder's own subprocess-exit callback
+    from ever firing on this same loop, deadlocking cross-verify contention.
+    Release (``os.close`` under the hood) is synchronous and instant, so it
+    runs directly in ``finally`` without needing an executor thread.
+
+    Fails open (runs ungated) on any ``OSError`` — most commonly a
+    ``slots_dir`` that cannot be created (C-fail-open, mirroring T1's own
+    fail-open contract for acquisition itself).
+    """
+    slots_dir = Path(config.verify_admission_slots_dir)
+    n = config.verify_admission_task_slots
+    cm = None
+    try:
+        await asyncio.to_thread(slots_dir.mkdir, parents=True, exist_ok=True)
+        cm = acquire_task_slot(role, slots_dir=slots_dir, n=n, wait=True)
+        await asyncio.to_thread(cm.__enter__)
+    except OSError:
+        cm = None
+    try:
+        yield
+    finally:
+        if cm is not None:
+            with contextlib.suppress(OSError):
+                cm.__exit__(None, None, None)
+
+
 async def run_verification(
     worktree: Path,
     config: OrchestratorConfig,
@@ -2950,37 +3002,42 @@ async def run_verification(
         # so a misconfig never makes a verify spawn fail.
         cmd = _maybe_govern_merge_cmd(cmd, config, worktree, role)
         assert cmd is not None  # _maybe_govern_merge_cmd returns None only when cmd is None; guarded above
-        started_at = datetime.now(UTC).isoformat()
-        t0 = time.monotonic()
-        # Pass use_cgroup_scope only when enabled so the default-off call
-        # signature stays byte-identical (test doubles stub the legacy kwargs).
-        _scope_kw: _ScopeKw = (
-            {'use_cgroup_scope': True} if config.verify_use_cgroup_scope else {}
-        )
-        # Pass clock_stop only when enabled (mirrors _scope_kw pattern) so the
-        # default-off call signature stays byte-identical for existing test doubles.
-        _clock_kw: _ClockKw = (
-            {
-                'clock_stop': ClockStopConfig(
-                    marker_stop=config.verify_clock_stop_marker_stop,
-                    marker_heartbeat=config.verify_clock_stop_marker_heartbeat,
-                    marker_start=config.verify_clock_stop_marker_start,
-                    heartbeat_idle_max=config.verify_clock_stop_heartbeat_idle_max,
-                    max_total_secs=config.verify_clock_stop_max_total_secs,
-                ),
-            }
-            if config.verify_clock_stop_enabled
-            else {}
-        )
-        rc, out, timed_out_flag = await _run_cmd(
-            cmd,
-            worktree,
-            timeout,
-            env=verify_env or None,
-            log_path=_stream_log_path(label, current_attempt),
-            **_scope_kw,
-            **_clock_kw,
-        )
+        # Admission gate (task 2390 T2): only the pytest ('test') leg is
+        # gated by the shared.verify_admission flock semaphore + role nice
+        # tier; lint/type ride alongside within the same verify, ungated.
+        admission = _verify_admission_active(config) and label == 'test'
+        async with (_admission_slot(role, config) if admission else contextlib.nullcontext()):
+            started_at = datetime.now(UTC).isoformat()
+            t0 = time.monotonic()
+            # Pass use_cgroup_scope only when enabled so the default-off call
+            # signature stays byte-identical (test doubles stub the legacy kwargs).
+            _scope_kw: _ScopeKw = (
+                {'use_cgroup_scope': True} if config.verify_use_cgroup_scope else {}
+            )
+            # Pass clock_stop only when enabled (mirrors _scope_kw pattern) so the
+            # default-off call signature stays byte-identical for existing test doubles.
+            _clock_kw: _ClockKw = (
+                {
+                    'clock_stop': ClockStopConfig(
+                        marker_stop=config.verify_clock_stop_marker_stop,
+                        marker_heartbeat=config.verify_clock_stop_marker_heartbeat,
+                        marker_start=config.verify_clock_stop_marker_start,
+                        heartbeat_idle_max=config.verify_clock_stop_heartbeat_idle_max,
+                        max_total_secs=config.verify_clock_stop_max_total_secs,
+                    ),
+                }
+                if config.verify_clock_stop_enabled
+                else {}
+            )
+            rc, out, timed_out_flag = await _run_cmd(
+                cmd,
+                worktree,
+                timeout,
+                env=verify_env or None,
+                log_path=_stream_log_path(label, current_attempt),
+                **_scope_kw,
+                **_clock_kw,
+            )
         return rc, out, timed_out_flag, started_at, time.monotonic() - t0
 
     # Pre-loop initialisation satisfies static analysis: mypy cannot prove that
