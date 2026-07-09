@@ -789,3 +789,48 @@ class TestB8SighupUncaps:
         assert lease is not None
 
         await _drain_bg(gate)
+
+
+# ---------------------------------------------------------------------------
+# B9 -- per-(account,pid) probe config-dir isolation: every account gets its
+# own usage-gate-probe-<name>-<pid> dir (producer/isolation side, fully
+# deterministic), and _run_probe injects that account's own token as
+# CLAUDE_CODE_OAUTH_TOKEN into the probe subprocess env alongside its own
+# CLAUDE_CONFIG_DIR (consumer side, the precedence MECHANISM). The live
+# env-vs-config-dir precedence OBSERVATION itself is delegated to the
+# existing guarded MUST-OBSERVE test in test_usage_gate.py (task 2139),
+# which requires a real claude CLI + a live OAuth account and is therefore
+# not re-run here -- see this task's plan design_decisions.
+# ---------------------------------------------------------------------------
+
+
+class TestB9ProbeDirIsolationAndEnvPrecedence:
+    """Deterministic isolation (producer) + env-injection mechanism
+    (consumer) halves of B9; the live env-vs-config-dir precedence
+    observation is delegated to
+    test_usage_gate.TestProbeEnvTokenPrecedenceGuard (task 2139)."""
+
+    def test_probe_config_dirs_keyed_by_name_with_distinct_paths(self):
+        gate = make_boundary_gate(['acct-a', 'acct-b'])
+        pid = os.getpid()
+        acct_a, acct_b = gate._accounts
+
+        assert set(gate._probe_config_dirs.keys()) == {'acct-a', 'acct-b'}
+        dir_a, dir_b = gate._config_dir_for(acct_a), gate._config_dir_for(acct_b)
+        assert dir_a.path != dir_b.path
+        assert f'usage-gate-probe-acct-a-{pid}' in dir_a.path.name
+        assert f'usage-gate-probe-acct-b-{pid}' in dir_b.path.name
+
+    @pytest.mark.asyncio
+    async def test_run_probe_injects_oauth_token_and_per_account_config_dir(self):
+        gate = make_boundary_gate(['acct-a', 'acct-b'])
+        acct_a, acct_b = gate._accounts
+
+        envs = await _capture_probe_envs(gate, [acct_a, acct_b])
+
+        env_a, env_b = envs
+        assert env_a['CLAUDE_CODE_OAUTH_TOKEN'] == acct_a.token
+        assert env_b['CLAUDE_CODE_OAUTH_TOKEN'] == acct_b.token
+        assert env_a['CLAUDE_CONFIG_DIR'] == str(gate._config_dir_for(acct_a).path)
+        assert env_b['CLAUDE_CONFIG_DIR'] == str(gate._config_dir_for(acct_b).path)
+        assert env_a['CLAUDE_CONFIG_DIR'] != env_b['CLAUDE_CONFIG_DIR']
