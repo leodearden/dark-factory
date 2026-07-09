@@ -346,6 +346,15 @@ def wait_subtree_live(pgid: int, *, timeout: float = 20.0, interval: float = 0.0
 
     Raises AssertionError on timeout -- a live sleeper never appearing means
     the harness itself is broken, not a seam defect under test.
+
+    NOTE: "has a live descendant" fires on the FIRST child the CLI forks --
+    for a not-yet-materialised persistent worktree that is a transient ``git``
+    subprocess (``git worktree add`` / ``git reset`` / ``git clean`` inside
+    ``acquire_host_verify_worktree``), not necessarily the eventual build
+    shell.  Callers that need to observe a build-produced artifact (e.g. a
+    marker file the build's shell command touches) must poll for that
+    artifact directly -- see :func:`wait_for_marker` -- rather than treating
+    "subtree live" as a proxy for "build has started".
     """
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
@@ -354,6 +363,23 @@ def wait_subtree_live(pgid: int, *, timeout: float = 20.0, interval: float = 0.0
             return descendants
         time.sleep(interval)
     raise AssertionError(f'pgid {pgid}: no descendant appeared within {timeout}s')
+
+
+def wait_for_marker(path: Path, *, timeout: float = 20.0, interval: float = 0.05) -> None:
+    """Poll for a build-produced marker file to appear; raise AssertionError on timeout.
+
+    Unlike :func:`wait_subtree_live` (which only proves the CLI has forked
+    *some* child -- possibly a transient ``git`` setup subprocess), this
+    proves the build's shell command has actually executed its
+    ``touch <marker>`` step, which is the real precondition tests need before
+    reading the marker's mtime or asserting on its retention.
+    """
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if path.exists():
+            return
+        time.sleep(interval)
+    raise AssertionError(f'holder build did not materialize {path} within {timeout}s')
 
 
 def subtree_and_leader_gone(pgid: int) -> bool:
@@ -958,7 +984,7 @@ def test_flock_contention_full_two_way_seam_blocks_and_escalates(tmp_path):
 
         persistent_wt = worktree_base / '_merge-verify'
         marker = persistent_wt / 'target' / 'warm.marker'
-        assert marker.exists(), f'holder build did not materialize {marker}'
+        wait_for_marker(marker)
         marker_mtime_before = marker.stat().st_mtime_ns
 
         waiter = spawn_verify_merge(
