@@ -599,3 +599,64 @@ class TestClassifyFailureXdistUsageErrorPytestScoped:
             'pytest: error: unrecognized arguments: -n --dist --max-worker-restart=0\n'
         )
         assert self._classify(output, rc=4, timed_out=False) == 'env_transient'
+
+
+# task 2365: bare pytest-xdist worker-crash signature. Grounded in
+# config.yaml's task-2361 comment (under host CPU oversubscription a starved
+# xdist worker crosses the per-test wall-clock ceiling, gets os._exit()'d by
+# pytest-timeout's thread method, and --max-worker-restart=0 turns that into
+# a false-failing per-test "node down" on whatever test happens to be
+# running) and test_cli.py's grounded wording:
+# ``[gwN] node down: Not properly terminated``. NO ^E  /^FAILED /failed-summary
+# lines — a hard os._exit() worker kill produces no assertion traceback.
+_XDIST_WORKER_CRASH_OUTPUT = (
+    'orchestrator/tests/test_config.py ....\n'
+    '[gw3] node down: Not properly terminated\n'
+    "worker gw3 crashed while running 'orchestrator/tests/test_config.py::TestFoo::test_bar'\n"
+)
+
+# Same crash signature, but WITH a genuine failure alongside it (collateral
+# FAILED line from the dead worker's run) — the conservative discriminator
+# must treat this as a real failure and NOT reclassify it.
+_XDIST_CRASH_WITH_REAL_FAILURE_OUTPUT = (
+    _XDIST_WORKER_CRASH_OUTPUT
+    + 'E   AssertionError: expected 3, got 4\n'
+    + 'FAILED orchestrator/tests/test_x.py::test_real - AssertionError\n'
+    + '========== 1 failed, 2 passed in 5.00s ==========\n'
+)
+
+
+class TestBareXdistWorkerCrashDetector:
+    """task 2365 step-1: verify._is_bare_xdist_worker_crash(output) pure helper.
+
+    RED today: the helper does not exist yet (AttributeError).
+    """
+
+    def test_bare_worker_crash_is_true(self):
+        """A bare node-down/worker-crash signature with no real failure marker -> True."""
+        assert verify._is_bare_xdist_worker_crash(_XDIST_WORKER_CRASH_OUTPUT) is True
+
+    def test_crash_with_real_failure_markers_is_false(self):
+        """The same crash signature PLUS genuine E/FAILED/summary lines -> False.
+
+        Never mask a genuine failure: any real pytest failure marker alongside
+        the crash signature suppresses reclassification.
+        """
+        assert verify._is_bare_xdist_worker_crash(_XDIST_CRASH_WITH_REAL_FAILURE_OUTPUT) is False
+
+    def test_plain_failure_with_no_crash_signature_is_false(self):
+        """An ordinary FAILED line with no crash signature at all -> False."""
+        output = 'FAILED orchestrator/tests/test_y.py::test_y - AssertionError\n'
+        assert verify._is_bare_xdist_worker_crash(output) is False
+
+    def test_crash_signature_with_traceback_e_line_is_false(self):
+        """Crash signature plus a lone `E   ...` traceback line -> False.
+
+        Guards the narrower case where only the traceback E-line (not a
+        FAILED line or failure summary) accompanies the crash signature.
+        """
+        output = (
+            '[gw3] node down: Not properly terminated\n'
+            'E   TypeError: unexpected keyword argument\n'
+        )
+        assert verify._is_bare_xdist_worker_crash(output) is False
