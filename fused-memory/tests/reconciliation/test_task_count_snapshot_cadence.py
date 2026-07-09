@@ -509,6 +509,18 @@ class TestWriteTaskCountSnapshot:
         assert isinstance(kwargs['content'], str)
         assert kwargs['content']
         assert 'reify' in kwargs['content']
+        # Reviewer finding (amendment round, test_coverage): pin the
+        # fetch->filter_task_tree->render wiring end-to-end, not just the
+        # pure renderer (TestBuildTaskCountSnapshotContent already covers
+        # label mapping in isolation). The 4-task fixture above is
+        # 1 pending + 1 in-progress (both ACTIVE) + 1 done + 1 cancelled, so
+        # total=4, done=1, cancelled=1, active=2 -- a regression that swapped
+        # tree fields (e.g. passed done_count where active is expected) would
+        # fail one of these without failing the pure-renderer test.
+        assert '4 total' in kwargs['content']
+        assert '1 done' in kwargs['content']
+        assert '1 cancelled' in kwargs['content']
+        assert '2 active' in kwargs['content']
 
     @pytest.mark.asyncio
     async def test_add_memory_failure_returns_none_not_raise(self):
