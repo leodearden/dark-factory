@@ -1728,6 +1728,53 @@ class GraphitiBackend:
             )
         return duplicates
 
+    async def _run_startup_identity_scan(self) -> dict:
+        """Startup identity-integrity sweep — per-graph orchestrator (W6-ε).
+
+        Enumerates every project graph via list_graphs() and, for each, runs
+        both the dup-NODE alarm (_scan_duplicate_entity_names) and the
+        dup-uuid-EDGE repair (_repair_duplicate_edge_uuids). Each graph is
+        processed best-effort: a failure on one graph is caught and logged,
+        never aborting the sweep over the rest — mirrors the initialize()
+        index-setup loop idiom (graphiti_client.py:378-385, try/except
+        Exception: logger.warning).
+
+        Called from initialize() (itself wrapped in a try/except there) so a
+        total scan failure never breaks backend startup — this sweep is a
+        safety net, not a startup gate.
+
+        Returns:
+            Aggregate stats dict:
+            - graphs_scanned: graphs attempted (counted whether or not that
+              graph's scan/repair completed cleanly).
+            - dup_name_groups: total duplicated names found across all graphs
+              (sum of len(...) of each graph's _scan_duplicate_entity_names
+              result).
+            - edges_repaired: total dup-uuid edges re-minted across all
+              graphs (sum of each graph's _repair_duplicate_edge_uuids
+              result).
+        """
+        graphs = await self.list_graphs()
+        stats = {'graphs_scanned': 0, 'dup_name_groups': 0, 'edges_repaired': 0}
+        for graph_name in graphs:
+            stats['graphs_scanned'] += 1
+            try:
+                duplicates = await self._scan_duplicate_entity_names(graph_name)
+                stats['dup_name_groups'] += len(duplicates)
+                repaired = await self._repair_duplicate_edge_uuids(graph_name)
+                stats['edges_repaired'] += repaired
+            except Exception:
+                logger.warning(
+                    'Startup identity-integrity scan failed for graph %r',
+                    graph_name, exc_info=True,
+                )
+        logger.info(
+            'startup identity scan complete: graphs_scanned=%d dup_name_groups=%d '
+            'edges_repaired=%d',
+            stats['graphs_scanned'], stats['dup_name_groups'], stats['edges_repaired'],
+        )
+        return stats
+
     async def _resolve_or_create_entity(self, name: str, *, group_id: str) -> str | None:
         """Exact-name write-time-identity chokepoint: resolve, or collapse duplicates.
 
