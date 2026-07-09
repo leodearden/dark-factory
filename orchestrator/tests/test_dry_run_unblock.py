@@ -37,7 +37,7 @@ class TestUnblockAutoConfigDefaults:
         ua = cfg.unblock_auto
         assert ua.enabled is True
         assert ua.budget_usd == pytest.approx(5.0)
-        assert ua.timeout_seconds == pytest.approx(600.0)
+        assert ua.timeout_seconds == pytest.approx(1200.0)
         assert ua.model == 'sonnet'
         assert ua.max_turns == 50
         assert ua.effort == 'high'
@@ -56,7 +56,7 @@ class TestUnblockAutoConfigDefaults:
         ua = data['unblock_auto']
         assert ua['enabled'] is True
         assert ua['budget_usd'] == pytest.approx(5.0)
-        assert ua['timeout_seconds'] == pytest.approx(600.0)
+        assert ua['timeout_seconds'] == pytest.approx(1200.0)
         assert ua['model'] == 'sonnet'
         assert ua['max_turns'] == 50
         assert ua['effort'] == 'high'

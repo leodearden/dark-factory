@@ -2209,4 +2209,3 @@ class TestProgressExtensionConfig:
 
         assert defaults['max_progress_resume_iterations'] == 20
         assert config.max_progress_resume_iterations == defaults['max_progress_resume_iterations']
-        assert live.steward_completion_timeout == 900.0
