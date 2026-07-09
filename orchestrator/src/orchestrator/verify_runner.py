@@ -741,8 +741,16 @@ async def _default_ssh_heartbeat_run(
 
     heartbeat_task = asyncio.ensure_future(_heartbeat())
     try:
-        assert proc.stdout is not None and proc.stderr is not None  # stdout/stderr=PIPE above
-        stdout_b, stderr_b = await asyncio.gather(proc.stdout.read(), proc.stderr.read())
+        # stdout=PIPE/stderr=PIPE above guarantees these are populated; an
+        # explicit check (rather than a bare assert) keeps the guard live
+        # under `python -O`, which strips asserts.
+        stdout_r, stderr_r = proc.stdout, proc.stderr
+        if stdout_r is None or stderr_r is None:
+            raise RuntimeError(
+                'asyncio subprocess missing stdout/stderr pipes despite stdout=PIPE, '
+                'stderr=PIPE'
+            )
+        stdout_b, stderr_b = await asyncio.gather(stdout_r.read(), stderr_r.read())
         await proc.wait()
     finally:
         heartbeat_task.cancel()
