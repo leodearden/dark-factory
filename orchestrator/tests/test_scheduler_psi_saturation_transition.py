@@ -226,12 +226,6 @@ class _Driver:
         self._heavy_in_flight.discard(task_id)
         self._det_dispatched.discard(task_id)
 
-    async def drain_heavy_to(self, n: int) -> None:
-        """Complete in-flight heavy tasks (arbitrary order) until
-        heavy_in_flight() == n."""
-        while len(self._heavy_in_flight) > n:
-            await self.complete(next(iter(self._heavy_in_flight)))
-
     async def run_until_quiescent(self, max_in_flight: int) -> None:
         """Drive ticks until heavy in-flight fills ``max_in_flight`` or no
         further candidate is eligible to dispatch.
