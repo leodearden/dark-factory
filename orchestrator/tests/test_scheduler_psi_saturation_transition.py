@@ -344,6 +344,12 @@ class TestPsiSaturationTransition:
             'no NEW dispatch_deferred events may occur after the recovery flip'
         )
 
+        lock_events = driver.lock_acquired_events()
+        assert {e['task_id'] for e in lock_events} == {'H1', 'H2', 'H3', 'H4', 'D1'}, (
+            'the real ModuleLockTable must record a lock_acquired event for '
+            'every dispatched task, heavy and deterministic alike'
+        )
+
     # -----------------------------------------------------------------------
     # Scenario 2 — deadlock-freedom at the PEAK of sustained saturation
     #
@@ -467,6 +473,9 @@ class TestPsiSaturationTransition:
         await driver.run_ticks(3)
 
         assert driver.heavy_in_flight() == 1, 'saturation must hold all further heavy dispatch'
+        assert 'D1' in driver.dispatched_ids(), (
+            'the deterministic task must still dispatch while heavy dispatch is held'
+        )
         deferred_during_saturation = driver.deferred_events()
         assert len(deferred_during_saturation) >= 1, (
             'saturation must defer at least one heavy dispatch'
