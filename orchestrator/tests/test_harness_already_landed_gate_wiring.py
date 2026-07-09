@@ -10,6 +10,11 @@ orchestrator run, or a squash/rebase/manual landing.
 Covers:
   step-3  (RED)  Ancestry happy-path: is_ancestor True + citation present +
                  not degenerate -> flips to done, returns True.
+  step-5  (RED)  Ancestry-path false-positive guards: open-L1 veto,
+                 degenerate-branch veto, missing-citation veto.
+  step-7  (RED)  Branch-deleted merge-marker path: marker found (and not
+                 stale) -> flips to done; stale marker (ancestor of
+                 branch_base_sha) -> vetoes the flip.
 
 Mirrors test_harness_landed_dispatch_gate_wiring.py's ``_build_harness``
 bare-harness construction helper exactly.
@@ -137,6 +142,95 @@ class TestAlreadyLandedDispatchGateAncestryGuards:
         """
         h = _wired_ancestry_harness(mock_orch_config)
         h.git_ops.find_task_citation_commit = AsyncMock(return_value=None)
+
+        result = await h._already_landed_dispatch_gate('42')
+
+        assert result is False
+        h._mark_in_progress_done.assert_not_awaited()
+
+
+def _wired_marker_harness(
+    mock_orch_config, *, marker_sha, branch_base_sha, marker_is_ancestor_of_base,
+) -> Harness:
+    """Bare harness with is_ancestor(branch, main) False, so the ancestry
+    path never engages and the marker path is what's under test.
+
+    ``is_ancestor`` is mocked with a side_effect function because it is
+    called with two DIFFERENT argument pairs in this path: once for
+    ``(branch, main_branch)`` (must be False to reach the marker path) and
+    once for ``(marker_sha, branch_base_sha)`` (the stale-marker check).
+    """
+    h = _build_harness(mock_orch_config)
+    h.git_ops = MagicMock()
+    h.git_ops.config.branch_prefix = 'task/'
+    h.git_ops.config.main_branch = 'main'
+
+    async def _is_ancestor(a, b):
+        if a == 'task/42' and b == 'main':
+            return False
+        if a == marker_sha and b == branch_base_sha:
+            return marker_is_ancestor_of_base
+        raise AssertionError(f'unexpected is_ancestor call: {a!r}, {b!r}')
+
+    h.git_ops.is_ancestor = AsyncMock(side_effect=_is_ancestor)
+    h.git_ops.find_merge_marker = AsyncMock(return_value=marker_sha)
+    h.git_ops.find_task_citation_commit = AsyncMock(return_value=None)
+
+    h.scheduler.get_task = AsyncMock(
+        return_value={'id': '42', 'metadata': {'branch_base_sha': branch_base_sha}},
+    )
+    h._branch_is_degenerate = AsyncMock(return_value=False)
+    h._mark_in_progress_done = AsyncMock()
+    h._escalation_queue = None
+    return h
+
+
+@pytest.mark.asyncio
+class TestAlreadyLandedDispatchGateMarkerPath:
+    """Branch-deleted merge-marker path (RED until step-8).
+
+    is_ancestor(branch, main) is False in both sub-cases, so the ancestry
+    path never engages — only the marker path can produce a result.
+    """
+
+    async def test_marker_found_and_not_stale_flips_to_done(
+        self, mock_orch_config,
+    ) -> None:
+        """A merge marker on main, not an ancestor of branch_base_sha (i.e.
+        it postdates this incarnation's creation point) -> flips to done,
+        anchored on the marker sha.
+        """
+        marker_sha = 'b' * 40
+        branch_base_sha = 'e' * 40
+        h = _wired_marker_harness(
+            mock_orch_config,
+            marker_sha=marker_sha,
+            branch_base_sha=branch_base_sha,
+            marker_is_ancestor_of_base=False,
+        )
+
+        result = await h._already_landed_dispatch_gate('42')
+
+        assert result is True
+        h._mark_in_progress_done.assert_awaited_once()
+        call_args = h._mark_in_progress_done.await_args
+        assert call_args.args[0] == '42'
+        assert call_args.args[1] == marker_sha
+        assert call_args.args[3] == 'dispatch-gate-marker-found'
+
+    async def test_stale_marker_vetoes_flip(self, mock_orch_config) -> None:
+        """A marker that IS an ancestor of branch_base_sha predates this
+        incarnation (branch was deleted + re-created under the same task
+        id) -> vetoes the flip, no _mark_in_progress_done call.
+        """
+        marker_sha = 'b' * 40
+        branch_base_sha = 'e' * 40
+        h = _wired_marker_harness(
+            mock_orch_config,
+            marker_sha=marker_sha,
+            branch_base_sha=branch_base_sha,
+            marker_is_ancestor_of_base=True,
+        )
 
         result = await h._already_landed_dispatch_gate('42')
 
