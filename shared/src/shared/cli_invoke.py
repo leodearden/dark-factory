@@ -623,6 +623,8 @@ async def invoke_claude_agent(
     env_overrides: dict[str, str] | None = None,
     startup_grace_secs: float = 120.0,
     sandbox_wrap: Callable[[list[str]], list[str]] | None = None,
+    working_idle_secs: float | None = None,
+    absolute_cap_secs: float | None = None,
 ) -> AgentResult:
     """Invoke Claude Code CLI and return structured result.
 
@@ -648,6 +650,13 @@ async def invoke_claude_agent(
     Keeps ``shared`` policy-agnostic: callers supply the confinement closure;
     the subprocess sees the wrapped argv.  Default ``None`` → no wrap (today's
     behavior).
+
+    *working_idle_secs* / *absolute_cap_secs*, when BOTH set, extend the
+    working-regime watchdog past *timeout_seconds* while the transcript keeps
+    advancing: the subprocess is killed only after no new transcript turn for
+    ``max(working_idle_secs, timeout_seconds)``, or at *absolute_cap_secs*,
+    whichever comes first.  Default ``None`` for both → no extension,
+    *timeout_seconds* stays the hard wall (today's exact behavior).
     """
     return await _invoke_claude(
         prompt=prompt, system_prompt=system_prompt, cwd=cwd, model=model,
@@ -661,6 +670,8 @@ async def invoke_claude_agent(
         env_overrides=env_overrides,
         startup_grace_secs=startup_grace_secs,
         sandbox_wrap=sandbox_wrap,
+        working_idle_secs=working_idle_secs,
+        absolute_cap_secs=absolute_cap_secs,
     )
 
 
@@ -1158,6 +1169,8 @@ async def _invoke_claude(
     env_overrides: dict[str, str] | None = None,
     startup_grace_secs: float = 120.0,
     sandbox_wrap: Callable[[list[str]], list[str]] | None = None,
+    working_idle_secs: float | None = None,
+    absolute_cap_secs: float | None = None,
 ) -> AgentResult:
     """Invoke Claude Code CLI."""
     cmd = ['claude', '--print', '--output-format', 'json']
@@ -1265,6 +1278,8 @@ async def _invoke_claude(
             session_id=(resume_session_id or session_id),
             config_dir=config_dir,
             startup_grace_secs=startup_grace_secs,
+            working_idle_secs=working_idle_secs,
+            absolute_cap_secs=absolute_cap_secs,
         )
         return _parse_claude_output(result)
     finally:
@@ -1471,11 +1486,18 @@ async def _run_subprocess(
     session_id: str | None = None,
     config_dir: Path | None = None,
     startup_grace_secs: float = 120.0,
+    working_idle_secs: float | None = None,
+    absolute_cap_secs: float | None = None,
 ) -> _SubprocessResult:
     """Run a subprocess, log output.
 
     *stdin_data*, when set, is piped to the process's stdin.  This avoids
     passing large payloads as command-line arguments (which hit ARG_MAX).
+
+    *working_idle_secs* / *absolute_cap_secs*, when BOTH set, extend the
+    WORKING regime past *timeout_seconds* while the transcript keeps
+    advancing.  Default ``None`` for both → today's exact behavior:
+    *timeout_seconds* is the flat WORKING-regime ceiling.
     """
     logger.info(f'Invoking claude agent: model={model} cwd={cwd}')
     logger.info(f'Command: {" ".join(cmd[:15])}...')
