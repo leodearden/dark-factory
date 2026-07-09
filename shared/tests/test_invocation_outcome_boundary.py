@@ -613,6 +613,15 @@ class TestB5AttributionUnderProbeInFlightSkew:
 # ---------------------------------------------------------------------------
 
 
+async def _assert_probe_released_after_exception(gate: UsageGate, acct: AccountState) -> None:
+    """B6 support: after an exception aborts an invocation mid-flight --
+    before ``report()`` ever gets a chance to run -- the claimed probe slot
+    must still be released: the account is back to AVAILABLE (not stuck in
+    PROBE_IN_FLIGHT), and the gate's DD-5 ``_open`` invariant holds."""
+    assert acct.phase == AccountPhase.AVAILABLE
+    assert _open_invariant_holds(gate)
+
+
 @pytest.mark.asyncio
 class TestB6ReportAtomicity:
     """InvokeSlot.report() applies its matching gate transition and settles
