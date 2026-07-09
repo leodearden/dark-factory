@@ -22,9 +22,16 @@
 #   126    — no terminal emulator found
 #   127    — launcher itself failed (emulator exited before writing the sentinel)
 #   129    — terminal window closed while the session was alive (SIGHUP)
+#   144    — Claude never started within the started-grace window (registry marked failed-to-start)
 #   2      — bad usage
 
 set -u
+
+# Distinct exit code for the started-verification watchdog's failed-to-start
+# signal (Attention Rail T4) -- see the exit-codes comment above. 144-199 is
+# free (0-125 claude, 126 no-emulator, 127 launcher-fail, 129 window-closed,
+# 143 SIGTERM, 2 usage), so this is additive and backward-compatible.
+EXIT_FAILED_TO_START=144
 
 # Absolute path to the repo root, computed from this script's own location
 # (skills/spawn/spawn-claude.sh -> skills/spawn -> skills -> repo root) so the
@@ -42,6 +49,40 @@ cwd="$1"
 skip_perms="$2"
 title="$3"
 prompt="$4"
+
+# Started-verification watchdog (Attention Rail T4) state: a spawn-time
+# reference marker (mtime = spawn start, used by the step-4 transcript-
+# appearance probe to distinguish a fresh transcript from a stale one), a
+# failed-to-start marker path (NOT created here -- mktemp -u only reserves a
+# unique name; the watchdog creates the file itself when it flags), the
+# started-grace window, and the transcript-scan root. All independent of
+# SPAWN_LAUNCH_GRACE_SECS so genuine-launcher-failure (127) paths are
+# unaffected and existing tests (which only shrink the launch grace) never
+# trip the new code.
+spawn_ref="$(mktemp -t spawn-claude-ref-XXXXXX)"
+fts_marker="$(mktemp -u -t spawn-claude-XXXXXX.fts)"
+SPAWN_STARTED_GRACE_SECS="${SPAWN_STARTED_GRACE_SECS:-90}"
+CLAUDE_PROJECTS_DIR="${CLAUDE_PROJECTS_DIR:-$HOME/.claude/projects}"
+
+# Kill the started-watchdog on EVERY exit path -- MANDATORY. A backgrounded
+# child left running past this script's exit would hold the caller-captured
+# stdout/stderr pipe open (blocking /spawn's background task, and any test
+# harness's subprocess.wait()) until the full started-grace elapsed.
+# Installed here, immediately after the mktemp calls above and before ANY
+# possible exit path (including `exit 126` below if no terminal emulator is
+# found) -- otherwise spawn_ref would leak on that path. watchdog_pid stays
+# unset until right before the fork (further below); the `${watchdog_pid:-}`
+# guard makes an early exit's kill attempt a safe no-op. Empirically verified
+# that neither command substitutions (the registry-write subshell just below)
+# nor backgrounded function calls (the watchdog fork below) independently
+# re-fire an inherited EXIT trap in bash -- it fires exactly once, when this
+# top-level script itself exits -- so installing it this early cannot cause
+# spawn_ref to be removed prematurely.
+_cleanup() {
+  [ -n "${watchdog_pid:-}" ] && kill "$watchdog_pid" 2>/dev/null
+  rm -f "$spawn_ref" "$fts_marker"
+}
+trap _cleanup EXIT
 
 # Session-registry: record this spawn as LAUNCHING (task 2285, Attention Rail
 # T3). Best-effort and fully additive -- a missing python3 or any registry
@@ -101,7 +142,7 @@ cd $q_cwd && claude $flags $q_prompt; ec=\$?; exit \$ec"
 SPAWN_LAUNCH_GRACE_SECS="${SPAWN_LAUNCH_GRACE_SECS:-5}"
 
 await_sentinel() {
-  while [ ! -f "$sentinel" ]; do sleep 2; done
+  while [ ! -f "$sentinel" ] && [ ! -f "$fts_marker" ]; do sleep 1; done
 }
 
 # Wait up to SPAWN_LAUNCH_GRACE_SECS for the sentinel to appear.
@@ -129,6 +170,169 @@ finish() {
   exit "$rc"
 }
 
+# True when the started-watchdog has flagged failed-to-start AND no exit
+# sentinel has appeared since. A real exit sentinel (the session actually
+# ran) always wins over a late marker -- this is what lets await_sentinel/
+# resolve_* unblock on the marker while never overriding a genuine exit.
+_failed_to_start_pending() {
+  [ -f "$fts_marker" ] && [ ! -f "$sentinel" ]
+}
+
+# Exit via the distinct failed-to-start code. Deliberately does NOT call the
+# session-registry `exit` subcommand (unlike finish()) -- that would
+# overwrite the failed-to-start status the watchdog already wrote with
+# EXITED, destroying the signal this whole mechanism exists to produce.
+finish_failed_to_start() {
+  local code
+  code=$(cat "$fts_marker" 2>/dev/null || echo "$EXIT_FAILED_TO_START")
+  rm -f "$fts_marker" "$sentinel"
+  exit "$code"
+}
+
+# Mirror session_registry.transcript_path_for_cwd's encoding byte-for-byte:
+# every '/' then every '.' maps to '-' (empirically re-verified 2026-07-07,
+# e.g. /home/leo/src/dark-factory -> -home-leo-src-dark-factory). Used to
+# locate this spawn's transcript directory under $CLAUDE_PROJECTS_DIR.
+_encode_cwd() {
+  local e="${1//\//-}"
+  printf '%s' "${e//./-}"
+}
+
+# Best-effort: is any process named `claude` a descendant of this script's
+# own PID? Guarded end-to-end -- ps unavailable, or any parsing hiccup,
+# yields "no descendant found" (fail-soft) rather than a fault. Scoped to
+# $$'s ancestor chain so it only matches a foreground-launched claude
+# (detached emulators reparent claude away from this script, so it is
+# correctly empty there) and never a coincidental, unrelated claude process
+# elsewhere on a busy host.
+_claude_descendant_alive() {
+  command -v ps >/dev/null 2>&1 || return 1
+  # Associative arrays (bash 4+) are required below. Stock macOS ships
+  # /bin/bash 3.2 (this script explicitly supports macOS via the
+  # mac-terminal branch), where `local -A` is a hard parse/option error, not
+  # a soft failure -- and this function is polled every ~0.25s for up to
+  # SPAWN_STARTED_GRACE_SECS (default 90s) whenever no transcript is yet
+  # present, so an unguarded error here would spam the caller-captured
+  # stderr with hundreds of lines. Fail-soft: skip this best-effort probe on
+  # bash <4 and rely on the transcript probe (_started_evidence's other
+  # branch) instead.
+  [ "${BASH_VERSINFO[0]:-0}" -ge 4 ] || return 1
+
+  local -A ppid_of=()
+  local -a claude_pids=()
+  local pid ppid rest tok1 tok2 discard
+
+  while read -r pid ppid rest; do
+    [ -n "$pid" ] || continue
+    ppid_of["$pid"]="$ppid"
+    # A real `claude` CLI is commonly a shebang wrapper (e.g. node/bash), in
+    # which case `comm` reports the INTERPRETER, not "claude" -- the kernel
+    # rewrites the exec to run the interpreter with the script's own path as
+    # an argument (empirically verified: a `#!/usr/bin/env bash` script named
+    # `claude` reports comm=bash, args="bash /path/to/claude"). Match on the
+    # first two whitespace-separated tokens of the full command line instead,
+    # covering both a raw `claude` binary (tok1) and an interpreter+script
+    # pair (tok2), by comparing each token's basename.
+    read -r tok1 tok2 discard <<<"$rest"
+    if [ "${tok1##*/}" = "claude" ] || [ "${tok2##*/}" = "claude" ]; then
+      claude_pids+=("$pid")
+    fi
+  done < <(ps -eo pid=,ppid=,args= 2>/dev/null)
+
+  local cand anc hops
+  for cand in "${claude_pids[@]}"; do
+    anc="${ppid_of[$cand]:-}"
+    hops=0
+    while [ -n "$anc" ] && [ "$hops" -lt 100 ]; do
+      [ "$anc" = "$$" ] && return 0
+      anc="${ppid_of[$anc]:-}"
+      hops=$(( hops + 1 ))
+    done
+  done
+  return 1
+}
+
+# Positive start-evidence: either a transcript file appeared under this
+# spawn's $CLAUDE_PROJECTS_DIR/<encoded-cwd>/ newer than the spawn-time
+# reference marker, or a claude process is running as this script's
+# descendant. The transcript probe is the primary, deterministically-tested
+# signal (the motivating incident is "no transcript ever appeared"); the
+# process probe is a guarded best-effort secondary.
+#
+# KNOWN LIMITATION (concurrent same-cwd spawns): the transcript directory is
+# keyed on cwd, not on this session -- Claude Code writes every session for a
+# given cwd into the same $CLAUDE_PROJECTS_DIR/<encoded-cwd>/ directory. If a
+# second, genuinely healthy spawn for the SAME cwd writes its own new
+# transcript file while THIS spawn is failing to start, that sibling's file
+# is indistinguishable here from this spawn's own evidence -- _started_evidence
+# returns true and this spawn is never flagged (a false negative). This
+# detector is therefore best-effort under a concurrent same-cwd fleet; it
+# remains exact for the common single-spawn-per-cwd case, including the
+# motivating 2026-07-06 incident. See SKILL.md's Verification section for the
+# caller-facing note.
+_started_evidence() {
+  local d="$CLAUDE_PROJECTS_DIR/$(_encode_cwd "$cwd")"
+  if [ -d "$d" ] && [ -n "$(find "$d" -type f -newer "$spawn_ref" -print -quit 2>/dev/null)" ]; then
+    return 0
+  fi
+  _claude_descendant_alive && return 0
+  return 1
+}
+
+# Backgrounded started-verification watchdog (Attention Rail T4). Forked once
+# right before the emulator case dispatch so it is already running whether
+# the launcher turns out to be foreground (blocks until window-close) or
+# detached (returns immediately). Polls up to SPAWN_STARTED_GRACE_SECS for
+# start-evidence: the exit sentinel, a fresh transcript, or a live claude
+# descendant.
+#
+# On grace-expiry with no evidence, flags failed-to-start: best-effort marks
+# the session-registry record, emits a loud caller-visible stderr line, and
+# writes the fts_marker so await_sentinel/resolve_* can break out of what
+# would otherwise be an unbounded wait.
+#
+# KNOWN LIMITATION (detached slow-start false-failure): for a DETACHED
+# launcher (konsole, or a custom $CLAUDE_TERMINAL_CMD), _claude_descendant_alive
+# is always empty by construction (setsid reparents claude away from this
+# script), so the transcript probe is the ONLY positive evidence available. A
+# real claude that is merely slow to write its first transcript (heavy load,
+# cold cache) past SPAWN_STARTED_GRACE_SECS is flagged failed-to-start even
+# though it is alive and will keep running detached -- a wrong terminal
+# status (144 + registry failed-to-start), not merely a late one. There is no
+# way to retract the flag once the caller has observed it. Callers on slow or
+# loaded hosts should raise SPAWN_STARTED_GRACE_SECS accordingly; see
+# SKILL.md's Verification section for the caller-facing note.
+_started_watchdog() {
+  # Clear inherited traps in this backgrounded copy -- without this, the
+  # child would run the parent's _cleanup on its own return, which would be
+  # wrong (double cleanup / killing its own pid) and is never what we want
+  # for a background job.
+  trap - EXIT HUP TERM
+
+  local end
+  end=$(( $(date +%s) + SPAWN_STARTED_GRACE_SECS ))
+  while [ "$(date +%s)" -lt "$end" ]; do
+    [ -f "$sentinel" ] && return 0
+    _started_evidence && return 0
+    sleep 0.25
+  done
+  # Final check -- avoid flagging on a sentinel that landed right at the
+  # deadline boundary.
+  [ -f "$sentinel" ] && return 0
+
+  if [ -n "$SESSION_RECORD_DIR" ] && command -v python3 >/dev/null 2>&1; then
+    python3 "$SESSION_REGISTRY_PY" refresh --record "$SESSION_RECORD_DIR" --status failed-to-start || true
+  fi
+  # Deliberately do NOT assert a specific final exit code here: resolve_foreground
+  # and resolve_detached's launch_rc!=0 branch both prefer the more specific,
+  # pre-existing 127 launcher-failure verdict over this flag when both fire for
+  # the same underlying cause (see _reconcile_started_flag_with_launcher_failure
+  # below), so this process may ultimately exit 127, not EXIT_FAILED_TO_START.
+  echo "spawn-claude.sh: FAILED-TO-START — claude never started within ${SPAWN_STARTED_GRACE_SECS}s (no transcript, no claude process); registry marked failed-to-start (a more specific launcher-failure verdict may still override this)." >&2
+  echo "$EXIT_FAILED_TO_START" > "$fts_marker"
+  return 0
+}
+
 # resolve_foreground: called after a foreground emulator returns.
 # Sentinel present (or appears within a short grace) → session ran; its code
 # wins.  Absent → launcher never started the payload → 127.
@@ -136,6 +340,22 @@ resolve_foreground() {
   if [ -f "$sentinel" ] || _wait_sentinel_grace; then
     finish
   fi
+  # Deliberately do NOT consult _failed_to_start_pending here. By this point
+  # the foreground launcher has already returned AND _wait_sentinel_grace
+  # (bounded by SPAWN_LAUNCH_GRACE_SECS, checked every 0.1s) has exhausted
+  # its own full wait with the sentinel still absent -- $inner's EXIT trap
+  # installs before claude ever runs, so this unambiguously means the
+  # payload never started: a genuine launcher failure (127) under the
+  # pre-existing exit-code contract (task 2285/T3), independent of the
+  # started-watchdog's own verdict. Unlike resolve_detached's await_sentinel()
+  # (unbounded, so it genuinely needs the fts_marker as its own break
+  # condition), nothing here is waiting on the marker, so a pending flag at
+  # this exact instant only ever reflects a caller-misconfigured
+  # SPAWN_STARTED_GRACE_SECS <= SPAWN_LAUNCH_GRACE_SECS racing the
+  # started-watchdog ahead of this check -- not a real distinction from the
+  # 127 case. Preferring 127 unconditionally keeps the foreground exit code
+  # stable regardless of how the two independently-tunable grace windows
+  # happen to be set.
   exit 127
 }
 
@@ -155,6 +375,9 @@ resolve_detached() {
     exit 127
   else
     await_sentinel
+    if _failed_to_start_pending; then
+      finish_failed_to_start
+    fi
     finish
   fi
 }
@@ -185,6 +408,14 @@ fi
 # Dispatch by the first word of $emulator so $CLAUDE_TERMINAL_CMD="gnome-terminal --foo"
 # still hits the gnome-terminal branch.
 first_word="${emulator%% *}"
+
+# _cleanup + trap installed earlier (right after the mktemp calls near the
+# top of the script), so spawn_ref can never leak -- including on the
+# `exit 126` (no emulator found) path just above. Only the fork itself
+# happens here, immediately before the emulator case dispatch.
+watchdog_pid=""
+_started_watchdog &
+watchdog_pid=$!
 
 case "$first_word" in
   gnome-terminal)
@@ -228,6 +459,9 @@ case "$first_word" in
     open -a Terminal "$tmpscript" || { rm -f "$tmpscript" "$sentinel"; exit 127; }
     await_sentinel
     rm -f "$tmpscript"
+    if _failed_to_start_pending; then
+      finish_failed_to_start
+    fi
     finish
     ;;
   *)

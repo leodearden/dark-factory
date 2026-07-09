@@ -30,7 +30,7 @@ _ORCH_SRC = REPO_ROOT / "orchestrator" / "src"
 if str(_ORCH_SRC) not in sys.path:
     sys.path.insert(0, str(_ORCH_SRC))
 
-from orchestrator import session_registry  # noqa: E402
+from orchestrator import session_registry  # noqa: E402  # pyright: ignore[reportAttributeAccessIssue]
 
 # Branch routing: the script dispatches on the first word of $CLAUDE_TERMINAL_CMD.
 FOREGROUND_NAMES = ["gnome-terminal", "xterm", "kitty"]
@@ -198,6 +198,11 @@ def _base_env(bin_dir: pathlib.Path, terminal_name: str) -> dict[str, str]:
     # (task 2285) to a tmp dir sibling of bin_dir, so this suite never reads
     # or writes the real ~/.claude/fleet tree.
     env["CLAUDE_FLEET_ROOT"] = str(bin_dir.parent / "fleet")
+    # Isolate the started-watchdog's transcript-appearance probe (task 2286,
+    # Attention Rail T4) to a fresh, empty tmp dir sibling of bin_dir, so the
+    # watchdog never scans (or finds stray evidence in) the real
+    # ~/.claude/projects tree.
+    env["CLAUDE_PROJECTS_DIR"] = str(bin_dir.parent / "projects")
     return env
 
 
@@ -704,4 +709,290 @@ def test_registry_write_refresh_reap_two_way_boundary(tmp_path: pathlib.Path) ->
     assert not slug_dir.exists()
     assert absent_slug not in reaped_by_slug, (
         "the freshly-upserted record must not be reaped -- its heartbeat is new"
+    )
+
+
+# ===========================================================================
+# task-2286 (Attention Rail T4): failed-to-start detection
+# ===========================================================================
+# The 2026-07-06 incident: a detaching launcher reports success (exit 0) but
+# never actually starts claude -- no sentinel, no transcript, ever.
+# resolve_detached's launch_rc==0 branch then calls the UNBOUNDED
+# await_sentinel and hangs forever. A backgrounded started-watchdog must
+# detect this within a bounded grace (SPAWN_STARTED_GRACE_SECS) and surface a
+# distinct exit code + a loud stderr line + a failed-to-start session-registry
+# record, instead of hanging.
+
+
+def test_failed_to_start_detected_on_detached_exit0(tmp_path: pathlib.Path) -> None:
+    """A detaching launcher that exits 0 WITHOUT starting claude must be
+    flagged failed-to-start within SPAWN_STARTED_GRACE_SECS, not hang forever.
+
+    This is the exact incident shape: the launcher (routed to the `*)`
+    dispatch branch as "custom-term") exits 0 immediately without ever
+    exec'ing the `bash -c "$inner"` payload -- so no claude process ever
+    runs, no sentinel is ever written, and no transcript ever appears under
+    $CLAUDE_PROJECTS_DIR.
+
+    RED today: resolve_detached's launch_rc==0 (no sentinel) branch calls the
+    unbounded await_sentinel, which loops forever since the sentinel is never
+    written -> proc.wait(timeout=20) raises TimeoutExpired -> pytest.fail.
+    """
+    bin_dir = _make_bin_dir(tmp_path)
+
+    # Fake DETACHING terminal that never runs the payload at all: no claude,
+    # no sentinel, no transcript. Adapts the exit-0-without-payload idiom of
+    # test_genuine_launcher_failure_yields_127 (which uses exit 1 for a
+    # genuine launcher crash) to exit 0 -- the incident is a launcher that
+    # reports SUCCESS while silently never starting claude.
+    term = bin_dir / "custom-term"
+    term.write_text("#!/usr/bin/env bash\nexit 0\n")
+    term.chmod(0o755)
+
+    env = _base_env(bin_dir, "custom-term")
+    env["SPAWN_STARTED_GRACE_SECS"] = "2"
+
+    proc = subprocess.Popen(
+        [str(SPAWN_SCRIPT), str(tmp_path), "false", "", "test prompt"],
+        env=env,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        start_new_session=True,
+    )
+
+    # Must-not-hang guard, not a latency SLA -- mirrors
+    # test_window_close_yields_129_not_hang's Popen+wait(timeout) pattern.
+    # Pre-impl this hangs forever (unbounded await_sentinel), so a bounded
+    # wait cleanly separates pass/fail from an infinite hang.
+    try:
+        rc = proc.wait(timeout=20)
+    except subprocess.TimeoutExpired:
+        proc.kill()
+        pytest.fail(
+            "spawn-claude.sh hung after a detached launcher exited 0 without "
+            "starting claude (no started-watchdog / unbounded await_sentinel "
+            "not broken)"
+        )
+    else:
+        stderr = proc.stderr.read().decode()  # type: ignore[union-attr]
+        assert rc == 144, (
+            f"Expected exit 144 (EXIT_FAILED_TO_START), got {rc}\nstderr: {stderr}"
+        )
+        assert "failed-to-start" in stderr.lower(), (
+            f"expected a loud failed-to-start line on stderr, got:\n{stderr}"
+        )
+
+        fleet_root = pathlib.Path(env["CLAUDE_FLEET_ROOT"])
+        record_path = _find_one_record(fleet_root)
+        record = session_registry.SessionRecord.from_json(record_path.read_text())
+        assert record.status == session_registry.Status.FAILED_TO_START, (
+            f"expected registry status failed-to-start, got {record.status}"
+        )
+
+
+def test_transcript_appearance_suppresses_flag(tmp_path: pathlib.Path) -> None:
+    """A fresh transcript file must suppress the failed-to-start flag.
+
+    Proves the transcript detector is load-bearing. Uses a DETACHING launcher
+    (custom-term, routing through resolve_detached's launch_rc==0 branch --
+    the incident path) whose fake claude writes a transcript file under
+    $CLAUDE_PROJECTS_DIR/<enc>/ the moment it starts, then sleeps well past
+    the shrunk started-grace before exiting and letting $inner write the
+    sentinel. <enc> mirrors session_registry.transcript_path_for_cwd's
+    encoding: cwd with every '/' and '.' replaced by '-'.
+
+    Grace/sleep margins are deliberately generous, not tight: the watchdog's
+    deadline is computed from `date +%s` (whole-second resolution), so a
+    nominal N-second grace can grant anywhere from just-over-0 to just-under
+    (N+1) seconds of real time depending on where in the current second the
+    watchdog starts. A grace=1s/sleep=2s pairing is flaky under load for
+    exactly this reason (observed empirically); grace=3s/sleep=8s leaves
+    enough headroom to absorb that +/-1s truncation noise on a busy host.
+
+    RED today: step-2's watchdog only knows the exit sentinel, so with grace
+    shorter than the sentinel delay it flags failed-to-start well before the
+    sentinel appears -> rc 144, not 0. GREEN after step-4 wires the
+    transcript probe.
+    """
+    bin_dir = _make_bin_dir(tmp_path)
+
+    enc = str(tmp_path).replace("/", "-").replace(".", "-")
+
+    # Fake claude: write the transcript file immediately (mirroring a real
+    # Claude Code session creating ~/.claude/projects/<enc>/*.jsonl the moment
+    # it starts), then outlast the shrunk started-grace before exiting -- so
+    # only the transcript probe (not the sentinel) can suppress the flag.
+    claude = bin_dir / "claude"
+    claude.write_text(
+        "#!/usr/bin/env bash\n"
+        f'mkdir -p "$CLAUDE_PROJECTS_DIR/{enc}"\n'
+        f'touch "$CLAUDE_PROJECTS_DIR/{enc}/session.jsonl"\n'
+        "sleep 8\n"
+        "exit 0\n"
+    )
+    claude.chmod(0o755)
+
+    pidfile = tmp_path / "leader.pid"
+    _write_detaching_terminal(bin_dir, "custom-term", pidfile)
+
+    env = _base_env(bin_dir, "custom-term")
+    env["SPAWN_STARTED_GRACE_SECS"] = "3"
+
+    result = _run_spawn(env, tmp_path, timeout=20)
+
+    stderr = result.stderr.decode()
+    assert result.returncode == 0, (
+        f"Expected exit 0 (transcript evidence must suppress the flag), "
+        f"got {result.returncode}\nstderr: {stderr}"
+    )
+    assert result.returncode != 144, (
+        f"transcript evidence must suppress EXIT_FAILED_TO_START, got 144\n"
+        f"stderr: {stderr}"
+    )
+    assert "failed-to-start" not in stderr.lower(), (
+        f"transcript evidence must suppress the loud failed-to-start line, got:\n{stderr}"
+    )
+
+    fleet_root = pathlib.Path(env["CLAUDE_FLEET_ROOT"])
+    record_path = _find_one_record(fleet_root)
+    record = session_registry.SessionRecord.from_json(record_path.read_text())
+    assert record.status == session_registry.Status.EXITED, (
+        f"expected registry status exited, got {record.status}"
+    )
+
+
+def test_foreground_claude_descendant_suppresses_flag_without_transcript(
+    tmp_path: pathlib.Path,
+) -> None:
+    """A live foreground `claude` descendant with NO transcript must suppress
+    the flag -- exercises _claude_descendant_alive as the LOAD-BEARING
+    evidence (the only positive signal available on this path).
+
+    Uses a FOREGROUND launcher (xterm) whose fake claude writes no transcript
+    at all under $CLAUDE_PROJECTS_DIR, but stays alive (sleeping) well past
+    the shrunk started-grace before exiting. Since xterm's fake terminal
+    `exec`s into the payload bash (see _FOREGROUND_TERM_SCRIPT), claude runs
+    as a direct descendant of spawn-claude.sh's own $$ -- unlike a detached
+    launcher (setsid + background job, reparented once the launcher process
+    exits), where this probe is correctly always empty.
+
+    Grace/sleep margins mirror test_transcript_appearance_suppresses_flag's
+    documented rationale: the watchdog's deadline is computed from whole-second
+    `date +%s`, so a nominal N-second grace can grant anywhere from
+    just-over-0 to just-under (N+1) seconds of real time. grace=2s/sleep=6s
+    leaves ample headroom to absorb that truncation noise on a busy host.
+    """
+    bin_dir = _make_bin_dir(tmp_path)
+    _write_foreground_terminal(bin_dir, "xterm")
+
+    # Fake claude: writes NO transcript anywhere, just outlasts the shrunk
+    # started-grace before exiting -- so only _claude_descendant_alive (not
+    # the transcript probe) can suppress the flag.
+    claude = bin_dir / "claude"
+    claude.write_text("#!/usr/bin/env bash\nsleep 6\nexit 0\n")
+    claude.chmod(0o755)
+
+    env = _base_env(bin_dir, "xterm")
+    env["SPAWN_STARTED_GRACE_SECS"] = "2"
+
+    result = _run_spawn(env, tmp_path, timeout=20)
+
+    stderr = result.stderr.decode()
+    assert result.returncode == 0, (
+        f"Expected exit 0 (live claude descendant must suppress the flag), "
+        f"got {result.returncode}\nstderr: {stderr}"
+    )
+    assert result.returncode != 144, (
+        f"a live claude descendant (no transcript yet) must suppress "
+        f"EXIT_FAILED_TO_START, got 144\nstderr: {stderr}"
+    )
+    assert "failed-to-start" not in stderr.lower(), (
+        f"live claude descendant must suppress the loud failed-to-start "
+        f"line, got:\n{stderr}"
+    )
+
+    fleet_root = pathlib.Path(env["CLAUDE_FLEET_ROOT"])
+    record_path = _find_one_record(fleet_root)
+    record = session_registry.SessionRecord.from_json(record_path.read_text())
+    assert record.status == session_registry.Status.EXITED, (
+        f"expected registry status exited, got {record.status}"
+    )
+
+
+def test_foreground_launcher_failure_prefers_127_over_started_grace_race(
+    tmp_path: pathlib.Path,
+) -> None:
+    """A foreground genuine launcher failure must yield 127 even when the
+    caller has set SPAWN_STARTED_GRACE_SECS well below SPAWN_LAUNCH_GRACE_SECS.
+
+    Regression guard for the review finding on resolve_foreground: the
+    started-watchdog runs concurrently with _wait_sentinel_grace, and with a
+    started-grace shorter than the launch-grace it reliably flags
+    failed-to-start (writes fts_marker) well before _wait_sentinel_grace's
+    own deadline elapses -- both timers are driven by the exact same root
+    cause (the payload never ran), so this is deterministic, not a coin
+    flip. resolve_foreground must still report the pre-existing, more
+    specific 127 launcher-failure verdict in that case, not let a
+    same-cause 144 win a race it happens to reach first.
+
+    Uses a large gap (1s started-grace vs 5s launch-grace) so the watchdog's
+    worst-case flag time (just under 2s, per the whole-second `date +%s`
+    truncation noise documented elsewhere in this file) lands comfortably
+    before _wait_sentinel_grace's ~4-5s deadline -- eliminating scheduling
+    jitter as a source of flakiness.
+    """
+    bin_dir = _make_bin_dir(tmp_path)
+    _write_fake_claude(bin_dir, exit_code=0)
+
+    # Fake FOREGROUND terminal that exits immediately with rc=1, never running
+    # the payload (so no sentinel is ever written) -- the same
+    # genuine-launcher-failure shape as test_genuine_launcher_failure_yields_127,
+    # now deliberately racing a misconfigured started-grace.
+    fail_term = bin_dir / "xterm"
+    fail_term.write_text("#!/usr/bin/env bash\nexit 1\n")
+    fail_term.chmod(0o755)
+
+    env = _base_env(bin_dir, "xterm")
+    env["SPAWN_LAUNCH_GRACE_SECS"] = "5"
+    env["SPAWN_STARTED_GRACE_SECS"] = "1"
+
+    result = _run_spawn(env, tmp_path, timeout=20)
+    assert result.returncode == 127, (
+        f"Foreground launcher failure must yield 127 even when "
+        f"SPAWN_STARTED_GRACE_SECS <= SPAWN_LAUNCH_GRACE_SECS, "
+        f"got {result.returncode}\nstderr: {result.stderr.decode()}"
+    )
+
+
+def test_normal_spawn_exit0_not_flagged(tmp_path: pathlib.Path) -> None:
+    """A normal, fast-exiting spawn must never be flagged failed-to-start.
+
+    Regression guard (task's "a normal spawn is NOT flagged" requirement):
+    locks that the started-watchdog's sentinel short-circuit means an
+    ordinary fast session is never flagged, even while the started-grace
+    watchdog is running concurrently in the background. Already green after
+    step-2 (the sentinel check alone satisfies it) -- this pins the contract
+    before step-4 adds more evidence probes.
+    """
+    bin_dir = _make_bin_dir(tmp_path)
+    _write_fake_claude(bin_dir, exit_code=0)
+    _write_foreground_terminal(bin_dir, "xterm")
+    env = _base_env(bin_dir, "xterm")
+    env["SPAWN_STARTED_GRACE_SECS"] = "2"
+
+    result = _run_spawn(env, tmp_path)
+
+    stderr = result.stderr.decode()
+    assert result.returncode == 0, (
+        f"Expected exit 0 (normal spawn), got {result.returncode}\nstderr: {stderr}"
+    )
+    assert "failed-to-start" not in stderr.lower(), (
+        f"a normal spawn must never be flagged failed-to-start, got:\n{stderr}"
+    )
+
+    fleet_root = pathlib.Path(env["CLAUDE_FLEET_ROOT"])
+    record_path = _find_one_record(fleet_root)
+    record = session_registry.SessionRecord.from_json(record_path.read_text())
+    assert record.status == session_registry.Status.EXITED, (
+        f"expected registry status exited, got {record.status}"
     )
