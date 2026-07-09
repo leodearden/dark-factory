@@ -539,6 +539,14 @@ class GraphitiBackend:
         except Exception:
             logger.warning('Could not enumerate existing graphs for index setup', exc_info=True)
 
+        # Startup identity-integrity sweep (task 2210, W6-ε): dup-NODE alarm +
+        # one-shot dup-uuid-EDGE repair, per graph. A scan failure must never
+        # break backend startup — this is a safety net, not a startup gate.
+        try:
+            await self._run_startup_identity_scan()
+        except Exception:
+            logger.warning('Startup identity-integrity scan failed', exc_info=True)
+
         logger.info(f'GraphitiBackend initialized (FalkorDB {host}:{port})')
 
     def _require_client(self) -> Graphiti:
