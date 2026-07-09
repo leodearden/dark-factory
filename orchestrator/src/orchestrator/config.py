@@ -1779,6 +1779,30 @@ class OrchestratorConfig(BaseSettings):
     # `systemd-run --user` is available.
     verify_use_cgroup_scope: bool = Field(default=False)
 
+    # ── Verify admission control (task 2390 T2; PRD
+    # plans/verify-oversubscription-control-prd.md) ────────────────────────
+    # Master switch for the per-pytest flock admission gate + role nice
+    # prefix wired around the test leg of every verify spawn. Default True
+    # per spec; the existing test suite is kept byte-identical via the
+    # autouse `_neutralize_verify_admission` conftest fixture rather than by
+    # defaulting this off.
+    verify_admission_enabled: bool = Field(default=True)
+    # Number of concurrent 'task'-role pytest spawns admitted through the
+    # flock semaphore. 'merge' never acquires (T1 C-merge-priority no-op).
+    verify_admission_task_slots: int = Field(default=1, ge=1)
+    # Directory holding the flock slot files. Created lazily by verify.py's
+    # admission wiring (T1's acquire_task_slot never creates it itself, so
+    # a missing directory always fails open and never gates).
+    verify_admission_slots_dir: str = Field(
+        default_factory=lambda: f'/tmp/df-verify-slots-{os.getuid()}',
+    )
+    # Per-role nice/ionice argv override, shlex-split when non-empty. Empty
+    # (default) defers to shared.verify_admission.nice_prefix(role) — the
+    # canonical tier table — so these only need setting to deviate from it.
+    verify_admission_nice_merge: str = Field(default='')
+    verify_admission_nice_task: str = Field(default='')
+    verify_admission_nice_background: str = Field(default='')
+
     # Steward lifecycle
     steward_lifetime_budget: float = Field(default=12.0)
     steward_max_attempts: int = Field(default=1)
