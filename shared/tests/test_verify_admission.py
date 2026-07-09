@@ -205,20 +205,33 @@ class TestRealProcessSignals:
                 proc.wait(timeout=5)
 
     def test_fd_non_inheritance_close_fds_false_child_does_not_pin_slot(self, tmp_path):
-        """(h) A close_fds=False descendant spawned while a slot is held must
+        """(h) A close_fds=False descendant spawned WHILE a slot is held must
         not pin that slot after the holder releases — the slot FD is marked
         non-inheritable (C-no-FD-inheritance), so it does not survive the
-        child's exec regardless of the parent's close_fds setting.
+        child's fork+exec regardless of the parent's close_fds setting.
+
+        The child MUST be spawned after the slot fd is open in this process
+        (i.e. inside the `with`, before release) — a child can only ever
+        inherit fds that exist in the parent's table at its fork time, so
+        spawning it earlier could never observe a leak either way and would
+        make this test pass vacuously even without
+        ``os.set_inheritable(fd, False)``.
         """
         from shared.verify_admission import acquire_task_slot
 
-        sleeper = subprocess.Popen(
-            [sys.executable, '-c', 'import time; time.sleep(60)'],
-            close_fds=False,
-        )
+        sleeper = None
         try:
             with acquire_task_slot('task', slots_dir=tmp_path, n=1, wait=False) as held:
                 assert held is True
+                # Spawned while the slot fd is open in this process, so a
+                # fork would copy it into the child's fd table if it were
+                # inheritable; close_fds=False disables Python's own
+                # fd-closing safety net, isolating the assertion to the
+                # module's explicit os.set_inheritable(fd, False) call.
+                sleeper = subprocess.Popen(
+                    [sys.executable, '-c', 'import time; time.sleep(60)'],
+                    close_fds=False,
+                )
                 # Give the child a moment to complete its exec (any
                 # CLOEXEC-marked fd is closed at exec time, not at fork time).
                 time.sleep(0.2)
@@ -228,8 +241,9 @@ class TestRealProcessSignals:
             with acquire_task_slot('task', slots_dir=tmp_path, n=1, wait=False) as held_after:
                 assert held_after is True
         finally:
-            sleeper.kill()
-            sleeper.wait(timeout=5)
+            if sleeper is not None:
+                sleeper.kill()
+                sleeper.wait(timeout=5)
 
 
 class TestBlockingWait:
