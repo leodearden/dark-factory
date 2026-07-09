@@ -5090,15 +5090,18 @@ class TestCuratorBatchRouteDeterministic:
             PreparedCandidate(candidate=c1, pool=[], pool_sizes=empty_sizes, prompt_tokens=10),
         ]
 
-        llm_decisions_returned = [
-            CuratorDecision(action="create", justification="new-1",
-                            pool_sizes=empty_sizes, latency_ms=0),
-        ]
         llm_candidates_received: list[CandidateTask] = []
 
         async def fake_llm_batch(cands, pools, ps_list, start, proj_id, proj_root):
+            # Mirrors the real batch LLM: one decision per candidate it
+            # actually receives. Its output schema has no 'route_deterministic'
+            # action, so anything reaching it can only ever come back 'create'.
             llm_candidates_received.extend(cands)
-            return llm_decisions_returned
+            return [
+                CuratorDecision(action="create", justification=f"new-{i}",
+                                pool_sizes=empty_sizes, latency_ms=0)
+                for i in range(len(cands))
+            ]
 
         with patch.object(
             curator, "_call_llm_batch_with_fallback", side_effect=fake_llm_batch
@@ -5110,17 +5113,20 @@ class TestCuratorBatchRouteDeterministic:
         # (d) two decisions, one per prepared candidate
         assert len(decisions) == 2
 
-        # (a) decisions[0] is a route decision — NOT a batch_target_index drop
+        # LLM was called with only candidates[1], not [0] — proves candidates[0]
+        # never reached the batch LLM at all (not just that its result was
+        # discarded).
+        assert llm_candidates_received == [c1]
+
+        # (a) decisions[0] is a route decision — NOT a batch_target_index drop,
+        # and NOT the 'create' the (mocked) LLM would have returned had it
+        # been sent candidates[0].
         assert decisions[0].action == "route_deterministic"
         assert decisions[0].justification.startswith("operational-ask-registry:")
         assert decisions[0].batch_target_index is None
 
-        # LLM was called with only candidates[1], not [0]
-        assert len(llm_candidates_received) == 1
-        assert llm_candidates_received[0] is c1
-
         assert decisions[1].action == "create"
-        assert decisions[1].justification == "new-1"
+        assert decisions[1].justification == "new-0"
 
     async def test_batch_blocklist_precedence_over_route(self, tmp_path):
         """(b) Within a batch, a candidate matching BOTH the blocklist and the
@@ -5210,9 +5216,21 @@ class TestCuratorBatchRouteDeterministic:
             PreparedCandidate(candidate=c1, pool=[], pool_sizes=empty_sizes, prompt_tokens=10),
         ]
 
+        llm_candidates_received: list[CandidateTask] = []
+
+        async def fake_llm_batch(cands, pools, ps_list, start, proj_id, proj_root):
+            # Mirrors the real batch LLM: one decision per candidate it
+            # actually receives. If c0 reaches it, it can only come back
+            # 'create' — its output schema has no 'route_deterministic'.
+            llm_candidates_received.extend(cands)
+            return [
+                CuratorDecision(action="create", justification=f"new-{i}",
+                                pool_sizes=empty_sizes, latency_ms=0)
+                for i in range(len(cands))
+            ]
+
         with patch.object(
-            curator, "_call_llm_batch_with_fallback",
-            new=AsyncMock(side_effect=AssertionError("LLM must not be called")),
+            curator, "_call_llm_batch_with_fallback", side_effect=fake_llm_batch
         ):
             decisions = await curator.curate_batch_prepared(
                 prepared, project_id="p", project_root="/x"
@@ -5220,6 +5238,10 @@ class TestCuratorBatchRouteDeterministic:
 
         # (d) two decisions, one per prepared candidate
         assert len(decisions) == 2
+        # The batch LLM must never be reached at all — the sole surviving
+        # unique candidate (c0; c1 is its pre-batch-dedup sibling) is routed
+        # before dispatch, not sent to the LLM and then discarded.
+        assert llm_candidates_received == []
         # (c) exactly one route decision + one dedup drop; no second gate.
         assert decisions[0].action == "route_deterministic"
         assert decisions[1].action == "drop"
