@@ -289,3 +289,41 @@ class TestB2CrashQuarantine:
         # Next dispatch is clean: a different task can still acquire a lane.
         result = await pool.acquire_for('task/99')
         assert result is not None
+
+
+# ── B3 — illegal transition escalates (real EscalationQueue) ───────────
+
+
+class TestB3IllegalTransitionEscalates:
+    """B3: forcing RELEASED->IN_USE raises IllegalLaneTransition and files a
+    born-at-L2 escalation via a REAL EscalationQueue; the durable record is
+    left unchanged. Standalone — no Harness/GitOps needed.
+    """
+
+    def test_released_to_in_use_raises_and_escalates(self, tmp_path: Path):
+        from escalation.models import BORN_AT_L2_SEVERITIES
+        from escalation.queue import EscalationQueue
+
+        queue = EscalationQueue(tmp_path / 'esc')
+        lc = LaneLifecycle(tmp_path / '.worktrees', escalation_queue=queue)
+        lane = tmp_path / '.worktrees' / '_lane-0'
+
+        # Drive the legal ladder to RELEASED.
+        lc.transition(lane, DurableLaneState.SEED, seeded_from_sha='abc')
+        lc.transition(lane, DurableLaneState.REGISTERED, branch='task/42')
+        lc.transition(lane, DurableLaneState.ASSIGNED, task_id='42', branch='task/42')
+        lc.transition(lane, DurableLaneState.RELEASED)
+        assert lc.read(lane).state == DurableLaneState.RELEASED
+
+        with pytest.raises(IllegalLaneTransition):
+            lc.transition(lane, DurableLaneState.IN_USE)
+
+        # Record left unchanged (never silent-heal).
+        assert lc.read(lane).state == DurableLaneState.RELEASED
+
+        pending = queue.get_by_task(f'lane-lifecycle-{lane.name}', status='pending')
+        assert pending
+        esc = pending[0]
+        assert esc.agent_role == ESCALATION_SENTINEL_ROLE
+        assert esc.level == 2
+        assert esc.severity in BORN_AT_L2_SEVERITIES
