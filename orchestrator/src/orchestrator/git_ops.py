@@ -5064,6 +5064,50 @@ class GitOps:
         )
         return rc == 0
 
+    async def branch_content_in_main(self, branch: str) -> bool:
+        """Return True iff every file *branch* touched is byte-identical on main.
+
+        Companion check to :meth:`is_ancestor` for landings that are NOT
+        ancestors of main — squashed, rebased, or manually-applied commits
+        whose content nonetheless matches what *branch* set out to change.
+        Computes ``changed = git diff --name-only <merge-base> <branch>``
+        (the branch's own changed files vs its base) and returns whether
+        ``git diff --quiet <main> <branch> -- <changed...>`` reports no
+        difference — i.e. main already carries identical content for every
+        one of those paths.
+
+        Returns False (never raises) when:
+        - the merge-base cannot be resolved (git error);
+        - *branch* has zero commits beyond its base (``changed`` is empty —
+          the degenerate/no-work guard; an empty pathspec diff would
+          trivially report "no difference" and false-positive); or
+        - any changed file differs between main and *branch*.
+
+        Fail-safe by construction: only an rc==0 ``git diff --quiet`` counts
+        as "content already landed" — any other git error also falls through
+        to False, so this primitive never claims a landing on doubt.
+        """
+        rc, merge_base, _ = await _run(
+            ['git', 'merge-base', self.config.main_branch, branch],
+            cwd=self.project_root,
+        )
+        if rc != 0 or not merge_base:
+            return False
+        rc, changed_out, _ = await _run(
+            ['git', 'diff', '--name-only', merge_base, branch],
+            cwd=self.project_root,
+        )
+        if rc != 0:
+            return False
+        changed = [f for f in changed_out.strip().splitlines() if f.strip()]
+        if not changed:
+            return False
+        rc, _, _ = await _run(
+            ['git', 'diff', '--quiet', self.config.main_branch, branch, '--', *changed],
+            cwd=self.project_root,
+        )
+        return rc == 0
+
     async def worktree_head_beyond_main(self, worktree: Path) -> str | None:
         """Return the HEAD SHA when *worktree* carries commits beyond main, else None.
 
