@@ -43,6 +43,7 @@ from fused_memory.reconciliation.flag_dedup import (
     filter_blocked_snapshot_findings,
     is_content_fingerprint_task_id,
 )
+from fused_memory.reconciliation.policies import is_snapshot_write_blocked
 from fused_memory.reconciliation.prompts import (
     _STAGE2_PROJECT_ID_GUIDELINE,
     _STAGE3_PROJECT_ID_GUIDELINE,
@@ -2919,20 +2920,37 @@ class TaskKnowledgeSync(BaseStage):
             verified_count if verified_count is not None else 0
         )
 
-        # --- task_count_snapshot freshness stat (task 2278) ---
-        # Best-effort structural guard against the Mem0 task_count_snapshot
-        # write-cadence gap: written is None when the run window is unknown
+        # --- task_count_snapshot deterministic write + freshness stat (task 2325,
+        # follow-up to task 2278) ---
+        # Makes the Mem0 task_count_snapshot write structural rather than
+        # depending on the Stage-2 LLM remembering the memory-stored "Snapshot
+        # Discipline" norm: for a non-blocked project we WRITE the snapshot
+        # ourselves (deterministic Python, no LLM involved) and trust that
+        # write directly rather than re-querying Mem0 for it — Qdrant's scroll
+        # is point-id-ordered, so an immediate re-read can false-miss a write
+        # we just performed. Blocked projects (SNAPSHOT_WRITE_BLOCKED_PROJECTS
+        # — the per-project census is not in use there, so absence is
+        # correct-by-design) and any write failure fall back to the
+        # pre-existing best-effort freshness read below.
+        # run_window_start forwards whatever assemble_payload stashed on
+        # self._run_window_start this cycle, mirroring the
+        # _sweep_stale_flag_markers forwarding immediately below.
+        # written is None when blocked+unverified, the run window is unknown,
         # or the freshness query itself failed transiently, in which case the
         # stat key is left absent entirely so the harness
         # (_maybe_escalate_stale_task_count_snapshot) can distinguish a
         # CONFIRMED miss (0) from "unknown" (never miscounted as a miss).
-        # run_window_start forwards whatever assemble_payload stashed on
-        # self._run_window_start this cycle, mirroring the
-        # _sweep_stale_flag_markers forwarding immediately below.
-        task_count_snapshot_written = await _verify_task_count_snapshot_written(
-            self.memory, self.project_id,
-            getattr(self, '_run_window_start', None),
-        )
+        run_window_start = getattr(self, '_run_window_start', None)
+        task_count_snapshot_written: bool | None = None
+        if not is_snapshot_write_blocked(self.project_id):
+            task_count_snapshot_written = await _write_task_count_snapshot(
+                self.memory, self.taskmaster, self.project_root, self.project_id,
+                run_id, run_window_start,
+            )
+        if task_count_snapshot_written is None:
+            task_count_snapshot_written = await _verify_task_count_snapshot_written(
+                self.memory, self.project_id, run_window_start,
+            )
         if task_count_snapshot_written is not None:
             report.stats['task_count_snapshot_written'] = (
                 1 if task_count_snapshot_written else 0
