@@ -697,9 +697,11 @@ class TestRunVerificationXdistWorkerCrashRetry:
                 return 1, _XDIST_WORKER_CRASH_OUTPUT, False
             return 0, '', False
 
-        with patch('orchestrator.verify._run_cmd', side_effect=fake_cmd):
-            with pytest.raises(verify.VerifyInfraError) as exc_info:
-                await verify.run_verification(tmp_path, config)
+        with (
+            patch('orchestrator.verify._run_cmd', side_effect=fake_cmd),
+            pytest.raises(verify.VerifyInfraError) as exc_info,
+        ):
+            await verify.run_verification(tmp_path, config)
 
         assert exc_info.value.phase == 'xdist_worker_crash'
         assert exc_info.value.errno is None

@@ -480,13 +480,11 @@ def _is_bare_xdist_worker_crash(output: str) -> bool:
         return False
     if not _XDIST_WORKER_CRASH_RE.search(output):
         return False
-    if _PYTEST_TRACEBACK_E_RE.search(output):
-        return False
-    if _PYTEST_FAILED_LINE_RE.search(output):
-        return False
-    if _PYTEST_FAILURE_SUMMARY_RE.search(output):
-        return False
-    return True
+    return not (
+        _PYTEST_TRACEBACK_E_RE.search(output)
+        or _PYTEST_FAILED_LINE_RE.search(output)
+        or _PYTEST_FAILURE_SUMMARY_RE.search(output)
+    )
 
 
 def _extract_cause_hint(output: str) -> str:
