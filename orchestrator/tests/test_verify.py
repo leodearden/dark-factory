@@ -4782,18 +4782,107 @@ class TestBuildFallbackConfigSubprojectScoped:
             f'got: {[r.getMessage() for r in caplog.records]}'
         )
 
-    def test_mixed_root_and_subproject_files_uses_fleet_chain_verbatim(
+    def test_mixed_root_conftest_plus_subproject_scopes_to_subproject_and_root_owning_tests(
         self, tmp_path: Path,
     ) -> None:
-        """A diff mixing a repo-root file with a subproject file falls back to the fleet chain.
+        """A root-level conftest.py + a single subproject test file scopes TEST narrowly.
 
-        Regression guard: ``_single_subproject_prefix`` must not collapse
+        Regression fix for the residual mixed-diff gap (task 2368):
+        previously ``_single_subproject_prefix`` disqualified subproject
+        scoping for ANY mixed root+subproject diff, so this fell through to
+        ``config.test_command`` verbatim — the fleet-wide ~7400-test chain
+        (esc-2293-13/-26/-27 misattributed flakes from unrelated
+        subprojects). ``_root_plus_single_subproject_prefix`` now detects
+        this specific shape and TEST is scoped to the subproject's own
+        tests plus the root-owning ``tests/scripts/`` suite instead.
+        """
+        worktree = self._make_cockpit_worktree(tmp_path)
+        cfg = self._make_config(tmp_path)
+
+        result = _build_fallback_config(
+            ['cockpit/tests/test_c3.py', 'conftest.py'], cfg, worktree=worktree,
+        )
+
+        assert result is not None
+        assert result.test_command == (
+            'cd cockpit && uv run pytest tests/test_c3.py '
+            '&& cd .. && uv run --project shared pytest tests/scripts/'
+        )
+        # False-block guard: no OTHER fleet subproject's fanout segment may
+        # appear in the scoped command (the fleet chain must not be used).
+        assert 'cd ../escalation' not in result.test_command
+        assert 'cd ../fused-memory' not in result.test_command
+        assert 'cd ../dashboard' not in result.test_command
+        assert 'tests/scripts' in result.test_command
+
+    def test_mixed_root_file_plus_subproject_source_only_scopes_to_root_owning_tests_only(
+        self, tmp_path: Path,
+    ) -> None:
+        """A subproject source-only file + a root file yields only the root-owning suite.
+
+        No test file/conftest lives under the touched subproject, so there
+        is no subproject-scoped pytest target to derive — the mixed branch
+        falls back to the root-owning ``tests/scripts/`` suite alone.
+        lint/type are NOT rescoped into the subproject's narrow uv context
+        (only test_command gets this treatment — the mixed diff includes
+        root files that don't belong to the subproject's narrow env): they
+        must still cover BOTH touched files in the broad reprojected
+        context.
+        """
+        worktree = self._make_cockpit_worktree(tmp_path)
+        cfg = self._make_config(tmp_path)
+
+        result = _build_fallback_config(
+            ['cockpit/src/cockpit/c3.py', 'top_level.py'], cfg, worktree=worktree,
+        )
+
+        assert result is not None
+        assert result.test_command == 'uv run --project shared pytest tests/scripts/'
+        assert result.lint_command is not None
+        assert 'top_level.py' in result.lint_command
+        assert '--project cockpit' not in result.lint_command
+
+    def test_mixed_root_file_plus_two_subprojects_uses_fleet_chain_verbatim(
+        self, tmp_path: Path,
+    ) -> None:
+        """A root file plus TWO subprojects is ambiguous, so the fleet chain runs verbatim.
+
+        ``_root_plus_single_subproject_prefix`` returns None when more than
+        one subproject is touched (no single subproject to scope TEST to),
+        so this still falls through to the pre-existing
+        non-default-configured-command branch — the fleet chain, unchanged
+        from before this fix.
+        """
+        worktree = self._make_cockpit_worktree(tmp_path)
+        shared = tmp_path / 'shared'
+        shared.mkdir()
+        (shared / 'pyproject.toml').write_text('[project]\nname = "shared"\n')
+        cfg = self._make_config(tmp_path)
+
+        result = _build_fallback_config(
+            ['cockpit/tests/test_a.py', 'shared/tests/test_b.py', 'top_level.py'],
+            cfg, worktree=worktree,
+        )
+
+        assert result is not None
+        assert result.test_command == self._FLEET_TEST_COMMAND
+
+    def test_mixed_root_and_subproject_files_scopes_test_to_subproject_and_root_owning_tests(
+        self, tmp_path: Path,
+    ) -> None:
+        """A diff mixing a repo-root file with a subproject file scopes TEST narrowly.
+
+        Regression guard (updated contract — task 2368):
+        ``_single_subproject_prefix`` must not collapse
         ``['cockpit/tests/test_a.py', 'top_level.py']`` to 'cockpit' (which
-        would drop test validation of the root-level file). With subproject
-        detection correctly disqualified (mixed root+subproject), the
-        pre-existing non-default-configured-command branch takes over and
-        the verbatim fleet chain runs — still validating both files, just not
-        scoped as narrowly as a pure-subproject diff would be.
+        would drop test validation of the root-level file) — it still
+        correctly returns None for this mixed diff.  But
+        ``_root_plus_single_subproject_prefix`` now recognizes this
+        specific "root file(s) + exactly one subproject" shape and scopes
+        TEST to the subproject's own tests plus the root-owning
+        ``tests/scripts/`` suite, instead of falling through to the
+        fleet-wide chain verbatim (the former behavior this test used to
+        pin before task 2368).
         """
         worktree = self._make_cockpit_worktree(tmp_path)
         cfg = self._make_config(tmp_path)
@@ -4803,7 +4892,10 @@ class TestBuildFallbackConfigSubprojectScoped:
         )
 
         assert result is not None
-        assert result.test_command == self._FLEET_TEST_COMMAND
+        assert result.test_command == (
+            'cd cockpit && uv run pytest tests/test_a.py '
+            '&& cd .. && uv run --project shared pytest tests/scripts/'
+        )
 
 
 class TestRunScopedVerificationForwardsWorktreeToFallback:
