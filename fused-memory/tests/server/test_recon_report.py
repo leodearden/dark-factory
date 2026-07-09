@@ -11,6 +11,7 @@ Covers:
 - FastMCP server factory (TestCreateReconReportServer)
 - Main.py boot helper (TestReconReportBoot)
 - Reaper not started by _build_recon_report_components (TestReconReportReaperWiredAtBoot)
+- Null/missing flag_type re-raise inheritance (TestReconReportFlagTypeInheritance)
 """
 
 import pytest
@@ -2420,4 +2421,227 @@ class TestReconReportSignatureTypeCanonicalization:
         assert len(results) == 1
         assert results[0]['task_id'] == '1976'
         assert isinstance(results[0]['task_id'], str)
+
+
+# ---------------------------------------------------------------------------
+# task-2318: null/missing flag_type re-raise inherits the task's established
+# flag_type for in-run dedup
+# ---------------------------------------------------------------------------
+
+
+class TestReconReportFlagTypeInheritance:
+    """A finding with a non-null task_id and flag_type=None must inherit the
+    task's already-established (single, non-null) flag_type before the
+    signature dedup lookup runs, so an under-specified re-raise collapses
+    onto the canonical finding instead of allocating a distinct (task_id,
+    None) row.
+
+    Root cause (run 5128): Stage 1/Stage 2 agents re-raise the same
+    condition with inconsistent flag_type — one call omits it (None), one
+    call supplies the established string
+    ('blocked_task_pending_privileged_closure') — so
+    sig=(X, None) != (X, F) and add_finding correctly-by-design (pre-fix)
+    treats them as distinct findings. This is the 4th recurrence of this
+    root cause, following task-1652 (null-null desc-hash dedup) and
+    task-1979 ((task_id, flag_type) type canonicalization), neither of
+    which covers a *varying* flag_type for a *consistent* task_id.
+    """
+
+    def _make_state(self):
+        from fused_memory.server.recon_report import ReconReportState
+
+        t = [0.0]
+        return ReconReportState(ttl_seconds=300, clock=lambda: t[0]), t
+
+    def _finding(
+        self,
+        state,
+        run_id: str = 'r1',
+        task_id: object = '5128',
+        flag_type: str | None = 'blocked_task_pending_privileged_closure',
+        **kwargs,
+    ):
+        defaults = dict(
+            run_id=run_id,
+            severity='moderate',
+            category='task_blocked',
+            description='d',
+            suggested_action='a',
+            actionable=True,
+            task_id=task_id,
+            flag_type=flag_type,
+        )
+        defaults.update(kwargs)
+        return state.add_finding(**defaults)
+
+    def test_null_flag_reraise_inherits_established_same_stage(self):
+        state, _ = self._make_state()
+        state.start_report(run_id='r1', stage='memory_consolidator', project_id='dark_factory')
+
+        first = self._finding(state, task_id='5128', flag_type='blocked_task_pending_privileged_closure')
+        assert 'finding_id' in first, f'first add_finding failed: {first}'
+
+        second = self._finding(
+            state,
+            task_id='5128',
+            flag_type=None,
+            description='task 5128 still blocked on privileged closure',
+        )
+        assert second == {
+            'error': 'duplicate_finding',
+            'error_type': 'ReconReportDuplicateFinding',
+            'existing_finding_id': first['finding_id'],
+        }
+
+    def test_null_flag_reraise_inherits_established_cross_stage(self):
+        """Stage 1 establishes the flag_type; a later stage of the SAME run
+        re-raises the same task with flag_type=None — must dedup against
+        Stage 1's finding, not allocate a second row.
+        """
+        state, _ = self._make_state()
+        state.start_report(run_id='r1', stage='memory_consolidator', project_id='dark_factory')
+
+        stage1 = self._finding(state, task_id='5128', flag_type='blocked_task_pending_privileged_closure')
+        assert 'finding_id' in stage1, f'Stage 1 add_finding failed: {stage1}'
+
+        state.start_report(run_id='r1', stage='integrity_check', project_id='dark_factory')
+        stage2 = self._finding(
+            state,
+            task_id='5128',
+            flag_type=None,
+            description='integrity_check restates the same block',
+        )
+        assert stage2 == {
+            'error': 'duplicate_finding',
+            'error_type': 'ReconReportDuplicateFinding',
+            'existing_finding_id': stage1['finding_id'],
+        }
+
+    def test_null_flag_inherit_uses_canonical_task_id(self):
+        """The inherit lookup must key on the CANONICALIZED task_id, so an
+        int task_id on the typed finding and the equivalent str task_id on
+        the bare-null re-raise still match (mirrors task-1979).
+        """
+        state, _ = self._make_state()
+        state.start_report(run_id='r1', stage='memory_consolidator', project_id='dark_factory')
+
+        first = self._finding(state, task_id=5128, flag_type='blocked_task_pending_privileged_closure')
+        assert 'finding_id' in first, f'first add_finding failed: {first}'
+
+        second = self._finding(
+            state,
+            task_id='5128',
+            flag_type=None,
+            description='str task_id re-raise, still blocked',
+        )
+        assert second == {
+            'error': 'duplicate_finding',
+            'error_type': 'ReconReportDuplicateFinding',
+            'existing_finding_id': first['finding_id'],
+        }
+
+    def test_null_flag_inherit_survives_partial_eviction(self):
+        """The inherit lookup reads the run-quiescence-scoped _run_sig_index
+        (task-2088), so it must still find Stage 1's established flag_type
+        even after Stage 1's own _ReportEntry has been evicted by tick() —
+        as long as the run itself (Stage 2) is still live.
+        """
+        state, t = self._make_state()
+
+        state.start_report('r1', 'memory_consolidator', 'dark_factory')
+        first = self._finding(state, task_id='5128', flag_type='blocked_task_pending_privileged_closure')
+        assert 'finding_id' in first, f'Stage 1 add_finding failed: {first}'
+        state.complete('r1', 'stage 1 done')
+
+        # Stage 2 starts — keeps the run LIVE (this entry never completes).
+        state.start_report('r1', 'task_knowledge_sync', 'dark_factory')
+
+        # Advance past TTL and evict — only Stage 1 (completed) is eligible.
+        t[0] = 301.0
+        evicted = state.tick()
+        assert evicted == 1
+        assert state.get_assembled_report('r1', 'memory_consolidator') is None
+
+        # Stage 2 re-files the same task with a bare null flag_type — must
+        # inherit the Stage-1 established flag_type and dedup against it.
+        second = self._finding(
+            state,
+            task_id='5128',
+            flag_type=None,
+            description='stage 2 restates the same block, no flag_type given',
+        )
+        assert second == {
+            'error': 'duplicate_finding',
+            'error_type': 'ReconReportDuplicateFinding',
+            'existing_finding_id': first['finding_id'],
+        }
+
+    def test_null_flag_not_inherited_when_ambiguous(self):
+        """Two DISTINCT established flag_types for the same task_id give a
+        bare null re-raise no basis to choose — it must NOT guess, so it
+        allocates its own (task_id, None) row. A second bare-null re-raise
+        then dedups against that first null row via the existing (task_id,
+        None) signature path (unrelated to inheritance).
+        """
+        state, _ = self._make_state()
+        state.start_report(run_id='r1', stage='memory_consolidator', project_id='dark_factory')
+
+        first = self._finding(state, task_id='5128', flag_type='blocked_task_pending_privileged_closure')
+        assert 'finding_id' in first, f'first add_finding failed: {first}'
+
+        second = self._finding(
+            state,
+            task_id='5128',
+            flag_type='orphaned_knowledge',
+            description='a second, distinct condition on the same task',
+        )
+        assert 'finding_id' in second, f'second add_finding failed: {second}'
+        assert second['finding_id'] != first['finding_id']
+
+        third = self._finding(
+            state,
+            task_id='5128',
+            flag_type=None,
+            description='bare null re-raise, ambiguous task',
+        )
+        assert 'finding_id' in third, f'third add_finding failed: {third}'
+        assert third['finding_id'] not in (first['finding_id'], second['finding_id'])
+
+        fourth = self._finding(
+            state,
+            task_id='5128',
+            flag_type=None,
+            description='another bare null re-raise, still ambiguous',
+        )
+        assert fourth == {
+            'error': 'duplicate_finding',
+            'error_type': 'ReconReportDuplicateFinding',
+            'existing_finding_id': third['finding_id'],
+        }
+
+    def test_typed_finding_after_bare_null_still_allocates(self):
+        """Direction-1 (bare null filed strictly BEFORE any typed finding) is
+        intentionally out of scope: the later typed finding still allocates
+        its own row rather than being lossily collapsed into the null row,
+        preserving the flag_type downstream consumers key on.
+        """
+        state, _ = self._make_state()
+        state.start_report(run_id='r1', stage='memory_consolidator', project_id='dark_factory')
+
+        first = self._finding(
+            state,
+            task_id='5128',
+            flag_type=None,
+            description='bare null observation filed first, no established flag_type yet',
+        )
+        assert 'finding_id' in first, f'first add_finding failed: {first}'
+
+        second = self._finding(
+            state,
+            task_id='5128',
+            flag_type='blocked_task_pending_privileged_closure',
+            description='typed finding filed second',
+        )
+        assert 'finding_id' in second, f'second add_finding failed: {second}'
+        assert second['finding_id'] != first['finding_id']
 
