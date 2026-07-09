@@ -681,6 +681,14 @@ class TestB6ReportAtomicity:
 # ---------------------------------------------------------------------------
 
 
+async def _assert_gate_consistent_after_retry_sequence(gate: UsageGate) -> None:
+    """B7 support: after a scripted cap/resume/wedge/success sequence, the
+    gate must be left consistent -- no account stuck in PROBE_IN_FLIGHT, and
+    the DD-5 ``_open`` invariant holds."""
+    assert _open_invariant_holds(gate)
+    assert not any(a.phase == AccountPhase.PROBE_IN_FLIGHT for a in gate._accounts)
+
+
 @pytest.mark.asyncio
 class TestB7StewardWedgeGuardInherited:
     """Scripted cap-hit (with session_id) -> resume -> zero-output-wedge ->
