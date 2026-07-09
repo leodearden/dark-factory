@@ -171,10 +171,11 @@ class TestResolveAndReleaseContract:
     async def test_speculative_item_input_defaults_release_and_resolve(
         self, git_ops: GitOps, config: OrchestratorConfig,
     ) -> None:
-        """(a) SpeculativeItem input, defaults (release_resources=True,
-        cancel_lease=False), chain_failed=True: resolves req.result, cleans +
-        deregisters the owned merge worktree, releases the speculation slot
-        exactly once, and sets _n_failed=True.
+        """(a) SpeculativeItem input, defaults (cancel_lease=False),
+        chain_failed=True: resolves req.result, cleans + deregisters the
+        owned merge worktree, releases the speculation permit exactly once
+        (task 2160/η: through the ledger, keyed on item.permit), and sets
+        _n_failed=True.
         """
         q: asyncio.Queue[MergeRequest] = asyncio.Queue()
         worker = SpeculativeMergeWorker(git_ops, q)
@@ -184,6 +185,8 @@ class TestResolveAndReleaseContract:
         worker._register_owned_merge_worktree(item.merge_wt)
         assert item.merge_wt in worker._owned_merge_worktrees
         assert item.merge_wt is not None and item.merge_wt.exists()
+        permit = await worker._speculation_ledger.acquire()
+        item.permit = permit
 
         depth0 = worker._speculation_slot._value
         outcome = MergeOutcome('blocked', reason='x')
@@ -197,57 +200,50 @@ class TestResolveAndReleaseContract:
             'merge worktree must be deregistered from the owned ledger'
         )
         assert worker._speculation_slot._value == depth0 + 1, (
-            'speculation slot must be released exactly once for a speculative item'
+            'speculation permit must be released exactly once for a speculative item'
         )
+        assert permit.released is True
         assert worker._n_failed is True
 
-    async def test_inflight_entry_release_resources_false_is_a_noop_release(
-        self, git_ops: GitOps, config: OrchestratorConfig,
+    async def test_inflight_entry_with_permit_already_released_is_a_safe_noop(
+        self, git_ops: GitOps, git_repo: Path, config: OrchestratorConfig,
     ) -> None:
-        """(b) InflightEntry input with release_resources=False: resolves
-        req.result and sets _n_failed, but performs NO release of the slot,
-        worktree, or lease (they were already released by _finalize_inflight's
-        finally clause at the real post-finalize call sites).
+        """(b) InflightEntry input whose permit was ALREADY released
+        (mirrors _finalize_inflight's own finally having released it before
+        the chokepoint runs, at the real post-finalize call sites): still
+        resolves req.result and sets _n_failed, and does NOT double-release
+        the slot — PermitLedger.release checks permit.released first, so a
+        repeat release of the same token is a silent no-op. This replaces
+        the pre-η release_resources=False no-op path: task 2160/η deletes
+        that flag because every release it guarded is now independently
+        idempotent (see design_decisions).
         """
         q: asyncio.Queue[MergeRequest] = asyncio.Queue()
         worker = SpeculativeMergeWorker(git_ops, q)
-        req, item = await _make_real_merged_item(
-            git_ops, config, 'task/rr-b', 'rr_b.py', 'b = 1\n', speculative=True,
-        )
-        worker._register_owned_merge_worktree(item.merge_wt)
-        fake_lease = MagicMock()
-        entry = InflightEntry(
-            item=item,
-            lease=fake_lease,
-            verify_task=None,
-            merge_wt=item.merge_wt,
-            was_speculative=True,
-            phase='finalizing',
-        )
+        req = _make_request('rr-b', 'task/rr-b', git_repo, config)
+        _item, entry = _make_decided_item_and_entry(req, was_speculative=True)
+        permit = await worker._speculation_ledger.acquire()
+        entry.permit = permit
+        worker._speculation_ledger.release(permit)  # simulate already-released
         depth0 = worker._speculation_slot._value
         outcome = MergeOutcome('blocked', reason='y')
 
-        await worker._resolve_and_release(
-            entry, outcome, chain_failed=True, release_resources=False,
-        )
+        await worker._resolve_and_release(entry, outcome, chain_failed=True)
 
         assert req.result.done()
         assert req.result.result() is outcome
-        assert worker._speculation_slot._value == depth0, 'slot must be untouched'
-        assert item.merge_wt is not None and item.merge_wt.exists(), (
-            'worktree must be untouched on disk'
+        assert worker._speculation_slot._value == depth0, (
+            'slot must not be double-released for an already-released permit'
         )
-        assert item.merge_wt in worker._owned_merge_worktrees, (
-            'worktree ledger entry must be untouched'
-        )
+        assert permit.released is True
         assert worker._n_failed is True
 
-    async def test_release_resources_true_cancel_lease_true_uses_cancel_and_release(
+    async def test_cancel_lease_true_uses_cancel_and_release(
         self, git_ops: GitOps, config: OrchestratorConfig,
     ) -> None:
-        """(c) release_resources=True, cancel_lease=True on an InflightEntry
-        carrying a fake lease + a stubbed allocator: cancel_and_release(lease)
-        is awaited; release(lease) is NOT.
+        """(c) cancel_lease=True on an InflightEntry carrying a fake lease +
+        a stubbed allocator: cancel_and_release(lease) is awaited;
+        release(lease) is NOT.
         """
         q: asyncio.Queue[MergeRequest] = asyncio.Queue()
         worker = SpeculativeMergeWorker(git_ops, q)
@@ -271,8 +267,7 @@ class TestResolveAndReleaseContract:
         outcome = MergeOutcome('blocked', reason='z')
 
         await worker._resolve_and_release(
-            entry, outcome, chain_failed=True,
-            release_resources=True, cancel_lease=True,
+            entry, outcome, chain_failed=True, cancel_lease=True,
         )
 
         allocator.cancel_and_release.assert_awaited_once_with(fake_lease)
@@ -314,7 +309,7 @@ def _spy_on_resolve_and_release(
 
     Delegates to the real (bound) implementation so end-state assertions
     (Future resolution, releases) still hold; records (args, kwargs) per call
-    so tests can assert call count and inspect kwargs (e.g. release_resources).
+    so tests can assert call count and inspect kwargs (e.g. cancel_lease).
 
     Design note (reviewer_comprehensive test_coupling, task 1991 amendment):
     every test in this module that uses this spy pairs the call-count
@@ -409,6 +404,8 @@ class TestDispatchErrorChokepoint:
             speculative=True,
         )
         worker._register_owned_merge_worktree(item.merge_wt)
+        permit = await worker._speculation_ledger.acquire()
+        item.permit = permit
         calls = _spy_on_resolve_and_release(worker)
 
         async def _raising_dispatch(_item: Any) -> Any:
@@ -428,8 +425,9 @@ class TestDispatchErrorChokepoint:
         assert outcome.status == 'blocked'
         assert outcome.reason.startswith('Verifier error:'), outcome.reason
         assert worker._speculation_slot._value == depth0 + 1, (
-            'speculation slot must be released exactly once'
+            'speculation permit must be released exactly once'
         )
+        assert permit.released is True
         assert item.merge_wt is not None and not item.merge_wt.exists(), (
             'merge worktree must be removed from disk'
         )
@@ -473,9 +471,8 @@ class TestDispatchErrorChokepoint:
         the waiter) that then hits a dispatch error must be dropped
         silently by _resolve_or_drop_abandoned — no InvalidStateError from
         calling set_result on an already-cancelled Future — while resource
-        release (worktree cleanup + speculation slot) still proceeds
-        normally, since release_resources is independent of the Future's
-        abandonment state.
+        release (worktree cleanup + speculation permit) still proceeds
+        normally, independent of the Future's abandonment state.
         """
         q: asyncio.Queue[MergeRequest] = asyncio.Queue()
         worker = SpeculativeMergeWorker(git_ops, q)
@@ -484,6 +481,8 @@ class TestDispatchErrorChokepoint:
             speculative=True,
         )
         worker._register_owned_merge_worktree(item.merge_wt)
+        permit = await worker._speculation_ledger.acquire()
+        item.permit = permit
         calls = _spy_on_resolve_and_release(worker)
 
         async def _raising_dispatch(_item: Any) -> Any:
@@ -507,6 +506,7 @@ class TestDispatchErrorChokepoint:
         assert worker._speculation_slot._value == depth0 + 1, (
             'resource release must still proceed for an abandoned waiter (no leak)'
         )
+        assert permit.released is True
         assert item.merge_wt is not None and not item.merge_wt.exists(), (
             'merge worktree must still be cleaned up for an abandoned waiter'
         )
@@ -552,12 +552,11 @@ class TestPassthroughFinalizeErrorChokepoint:
     """PASSTHROUGH-FINALIZE path fault injection: _finalize_inflight raises
     while finalizing a passthrough (verify_task=None) entry.
 
-    RED until step-6 GREEN routes both passthrough-finalize except-handlers
-    through _resolve_and_release with release_resources=False (the real
-    _finalize_inflight's finally clause is what would normally have released
-    lease+slot; here it is replaced entirely by a raising stub, so NO release
-    should occur at all — matching the current inline handler, which never
-    touches the slot). RED marker: the chokepoint spy call count is 0.
+    Routes both passthrough-finalize except-handlers through
+    _resolve_and_release (task 2160/η: unconditional, idempotent release —
+    no release_resources flag needed anymore). A passthrough entry built by
+    _make_decided_item_and_entry has no lease/merge_wt and never carries a
+    permit, so the chokepoint has nothing to release here regardless.
     """
 
     @pytest.mark.parametrize(
@@ -591,17 +590,17 @@ class TestPassthroughFinalizeErrorChokepoint:
         assert len(calls) == 1, (
             f'Expected exactly one _resolve_and_release call, got {len(calls)}'
         )
-        assert calls[0]['kwargs'].get('release_resources') is False, (
-            f"Expected release_resources=False, got kwargs={calls[0]['kwargs']!r}"
-        )
         assert req.result.done()
         outcome = req.result.result()
         assert outcome.status == 'blocked'
         assert outcome.reason.startswith('Verifier error:'), outcome.reason
         assert worker._n_failed is True
+        assert entry.permit is None, (
+            'this passthrough entry never carried a permit (fixture invariant)'
+        )
         assert worker._speculation_slot._value == depth0, (
-            'the chokepoint must perform NO release when release_resources=False '
-            '— the raising _finalize_inflight stub never ran its real finally'
+            'no release: the entry has no lease/merge_wt/permit to release '
+            '(a real passthrough DecidedItem is never dispatched with these)'
         )
 
     @pytest.mark.parametrize(
@@ -656,15 +655,14 @@ class TestFinalizeHeadErrorChokepoint:
     entry carries a real verify_task, so it is appended to _inflight and
     finalized by the ``if self._inflight:`` block instead).
 
-    RED until step-8 GREEN routes the finalize-head except-handler through
-    _resolve_and_release with release_resources=False — mirrors the
-    passthrough-finalize handlers: _finalize_inflight's own finally clause
-    would normally have released lease+slot on every exit path including
-    exceptions, but here the real _finalize_inflight is replaced by a raising
-    stub so its finally never runs, and NO release should occur at all.
-    RED marker: the chokepoint spy call count is 0 (the handler still inlines
-    resolve logic via ``isinstance(exc, (CancelledError, KeyboardInterrupt))``
-    + ``req.result.set_result``).
+    Routes the finalize-head except-handler through _resolve_and_release
+    (task 2160/η: unconditional, idempotent release — no release_resources
+    flag). _finalize_inflight's own finally clause normally releases the
+    worktree + speculation permit on every exit path including exceptions;
+    here the real method is replaced by a raising stub whose own body
+    performs that same release before raising (simulating the real finally
+    faithfully), so the chokepoint's subsequent release attempt is a safe
+    no-op — idempotency (not a flag) is what makes the double-release safe.
     """
 
     async def test_finalize_head_error_routes_through_chokepoint(
@@ -677,6 +675,8 @@ class TestFinalizeHeadErrorChokepoint:
             speculative=True,
         )
         worker._register_owned_merge_worktree(item.merge_wt)
+        permit = await worker._speculation_ledger.acquire()
+        item.permit = permit
 
         async def _noop() -> None:
             return None
@@ -686,17 +686,27 @@ class TestFinalizeHeadErrorChokepoint:
 
         entry = InflightEntry(
             item=item,
-            lease=MagicMock(),  # fake lease; must stay untouched (release_resources=False)
+            lease=MagicMock(),  # fake lease; no allocator wired below, so never touched
             verify_task=verify_task,
             merge_wt=item.merge_wt,
             was_speculative=True,
             phase='finalizing',
+            permit=permit,
         )
 
         async def _dispatch_returns_entry(_item: Any) -> Any:
             return entry
 
         async def _raising_finalize(_entry: Any) -> Any:
+            # The REAL _finalize_inflight's own finally ALWAYS releases the
+            # worktree + speculation permit before an exception propagates.
+            # This stub must uphold that same invariant (task 2160/η: the
+            # chokepoint's own release is now unconditional + idempotent, so
+            # simulating the real finally here is what makes its later
+            # no-op release safe — there is no release_resources flag left
+            # to lean on).
+            await worker._cleanup_owned_merge_worktree(_entry.merge_wt)
+            worker._speculation_ledger.release(_entry.permit)
             raise Exception('boom')
 
         worker._dispatch_item = _dispatch_returns_entry  # type: ignore[method-assign]
@@ -726,23 +736,27 @@ class TestFinalizeHeadErrorChokepoint:
         assert len(calls) == 1, (
             f'Expected exactly one _resolve_and_release call, got {len(calls)}'
         )
-        assert calls[0]['kwargs'].get('release_resources') is False, (
-            f"Expected release_resources=False, got kwargs={calls[0]['kwargs']!r}"
+        assert 'release_resources' not in calls[0]['kwargs'], (
+            f"release_resources no longer exists (task 2160/η: always-release "
+            f"contract), got kwargs={calls[0]['kwargs']!r}"
         )
         assert req.result.done()
         outcome = req.result.result()
         assert outcome.status == 'blocked'
         assert outcome.reason.startswith('Verifier error:'), outcome.reason
         assert worker._n_failed is True
-        assert worker._speculation_slot._value == depth0, (
-            'the chokepoint must perform NO release when release_resources=False '
-            '— the raising _finalize_inflight stub never ran its real finally'
+        assert worker._speculation_slot._value == depth0 + 1, (
+            'the permit must be released exactly once total, despite two '
+            'release attempts (the simulated _finalize_inflight finally, '
+            'then the chokepoint) — PermitLedger.release is idempotent'
         )
-        assert item.merge_wt is not None and item.merge_wt.exists(), (
-            'worktree must be untouched on disk (release_resources=False → no cleanup)'
+        assert permit.released is True
+        assert item.merge_wt is not None and not item.merge_wt.exists(), (
+            'worktree was already cleaned by the (simulated real) '
+            '_finalize_inflight finally; the chokepoint call must not error'
         )
-        assert item.merge_wt in worker._owned_merge_worktrees, (
-            'worktree ledger entry must be untouched'
+        assert item.merge_wt not in worker._owned_merge_worktrees, (
+            'worktree ledger entry stays deregistered'
         )
         # Loop continues past the failed head: the only _inflight entry was
         # popped as head, so the cascade guard
@@ -836,12 +850,14 @@ class TestFinalizeHeadErrorChokepoint:
 class TestCascadeErrorChokepoint:
     """CASCADE path fault injection + release idempotency (~7326).
 
-    RED until step-10 GREEN routes the cascade except-handler through
-    _resolve_and_release(_entry, outcome, chain_failed=True,
-    release_resources=not _entry_released, cancel_lease=True).  RED marker
-    (scenarios A/B): the chokepoint spy call count is 0 — the handler still
-    inlines the not-_entry_released release logic instead of calling
-    _resolve_and_release.
+    Routes the cascade except-handler through _resolve_and_release(_entry,
+    outcome, chain_failed=True, cancel_lease=True). Task 2160/η removed the
+    release_resources=not _entry_released guard: the in-body release (lease
+    cancel_and_release + ledger.release(_entry.permit)) still runs before
+    _remerge is called, but the except handler now ALWAYS routes through
+    the chokepoint afterward — safe because every release it performs is
+    independently idempotent (permit.released flag, lease FREE-check), so a
+    repeat is a silent no-op rather than requiring the old boolean guard.
     """
 
     async def test_cascade_remerge_error_routes_through_chokepoint(
@@ -851,11 +867,11 @@ class TestCascadeErrorChokepoint:
         git_config: GitConfig,
         config: OrchestratorConfig,
     ) -> None:
-        """Scenario A: in-body release already ran (_entry_released=True)
-        BEFORE _remerge raises → chokepoint invoked with
-        release_resources=False (the in-body release already freed the
-        slot/lease/worktree; the chokepoint must not double-release them —
-        only resolve req_b and flag the chain failed).
+        """Scenario A: in-body release already ran BEFORE _remerge raises →
+        chokepoint invoked unconditionally (no release_resources flag
+        anymore); the in-body release already freed the permit/lease/
+        worktree, and the chokepoint's own release attempt is a safe,
+        idempotent no-op — only resolve req_b and flag the chain failed.
 
         Adapted from TestCascadeErrorContainment
         .test_cascade_remerge_error_does_not_kill_verifier_loop
@@ -1011,9 +1027,11 @@ class TestCascadeErrorChokepoint:
         assert len(calls) == 1, (
             f'Expected exactly one _resolve_and_release call, got {len(calls)}'
         )
-        assert calls[0]['kwargs'].get('release_resources') is False, (
-            f"Expected release_resources=False (in-body release already ran "
-            f"before _remerge raised), got kwargs={calls[0]['kwargs']!r}"
+        assert 'release_resources' not in calls[0]['kwargs'], (
+            f"release_resources no longer exists (task 2160/η: always-release "
+            f"contract; in-body release already ran before _remerge raised, so "
+            f"this call is a safe idempotent no-op), got "
+            f"kwargs={calls[0]['kwargs']!r}"
         )
         assert calls[0]['kwargs'].get('cancel_lease') is True, (
             f"Expected cancel_lease=True, got kwargs={calls[0]['kwargs']!r}"
@@ -1026,6 +1044,207 @@ class TestCascadeErrorChokepoint:
         )
         assert entry_arg.merge_wt not in worker._owned_merge_worktrees
 
+    async def test_cascade_remote_lease_double_cancel_does_not_park_healthy_slot(
+        self,
+        git_ops: GitOps,
+        git_repo: Path,
+        git_config: GitConfig,
+        config: OrchestratorConfig,
+    ) -> None:
+        """Regression (task 2160/η step-9): reproduces the remote-lease
+        cascade double-cancel that η step-8 reintroduced (reviewer_comprehensive
+        robustness_resource_leak).
+
+        The cascade's in-body release (~:8302-8303) already runs
+        ``await _allocator.cancel_and_release(_entry.lease)`` BEFORE
+        ``_remerge`` is called. ``HostAllocator.cancel_and_release`` is NOT
+        idempotent for a REMOTE lease: it unconditionally re-issues
+        ``lease.runner.cancel_verify()`` BEFORE any FREE-check
+        (verify_runner.py:2306) — only the nested ``release()`` FREE-checks,
+        and that runs AFTER the RPC. So when ``_remerge`` then raises and the
+        except handler routes through the chokepoint with
+        ``cancel_lease=True``, a naive unconditional chokepoint release
+        re-issues a SECOND ``cancel_and_release`` on the SAME
+        already-released lease — a redundant cancel on an already-cancelled
+        remote verify, which can return rc != 0 and PARK a healthy slot
+        (verify_runner.py:2312), a state mutation ``contextlib.suppress``
+        cannot catch.
+
+        Adapted from Scenario A
+        (test_cascade_remerge_error_routes_through_chokepoint) with
+        gated_remote.cancel_verify replaced by a call-counting side_effect:
+        rc=0 for the first two calls (the cascade's own _abort_remote_verify
+        pre-cancel + the in-body cancel_and_release) and rc=1 for any 3rd+
+        call. gated_remote.probe_clean keeps its `_gated_runner` default of
+        returning True, so a transient PARK (if the regression is present)
+        un-parks immediately instead of looping the ~9s default probe delay.
+        """
+        gate_a_release = asyncio.Event()
+        gate_a_entered = asyncio.Event()
+        _local_calls: list[int] = [0]
+
+        async def _gated_local(*args: Any, **kwargs: Any) -> MagicMock:
+            call = _local_calls[0]
+            _local_calls[0] += 1
+            if call == 0:
+                # N's verify: gate and fail.
+                gate_a_entered.set()
+                await gate_a_release.wait()
+                return MagicMock(
+                    passed=False, summary='test_failure', test_output='FAILED',
+                    lint_output='', type_output='', category='test_failure',
+                    timed_out=False, verify_skipped=False,
+                )
+            # Any subsequent call (req_c's local verify) passes immediately.
+            return MagicMock(
+                passed=True, summary='ok', test_output='ok',
+                lint_output='', type_output='', category='',
+                timed_out=False, verify_skipped=False,
+            )
+
+        gate_b_release = asyncio.Event()
+        gate_b_entered = asyncio.Event()
+        gated_remote = _gated_runner(
+            gate_b_release, gate_b_entered, passed=True, name='laptop',
+        )
+
+        # ── Call-counting cancel_verify: rc=0 for calls 1-2 (abort pre-cancel
+        # + in-body release), rc=1 (fail) for any 3rd+ call — modelling a
+        # redundant cancel on an already-cancelled remote verify.
+        _cancel_verify_call_count: list[int] = [0]
+
+        async def _counting_cancel_verify(*args: Any, **kwargs: Any) -> int:
+            _cancel_verify_call_count[0] += 1
+            return 0 if _cancel_verify_call_count[0] <= 2 else 1
+
+        gated_remote.cancel_verify = AsyncMock(side_effect=_counting_cancel_verify)
+
+        wt_a = await _make_branch_with_file(git_ops, 'task/rrcdc-a', 'rrcdc_a.py', 'a = 1\n')
+        wt_b = await _make_branch_with_file(git_ops, 'task/rrcdc-b', 'rrcdc_b.py', 'b = 2\n')
+
+        q: asyncio.Queue[MergeRequest] = asyncio.Queue()
+        worker = SpeculativeMergeWorker(git_ops, q)
+        _inject_two_host_allocator(worker, gated_remote)
+        calls = _spy_on_resolve_and_release(worker)
+
+        event_loop = asyncio.get_running_loop()
+        req_a = MergeRequest(
+            task_id='rrcdc-a', branch='task/rrcdc-a', worktree=wt_a,
+            pre_rebased=False, task_files=None, module_configs=[],
+            config=config, result=event_loop.create_future(), lane='normal',
+        )
+        req_b = MergeRequest(
+            task_id='rrcdc-b', branch='task/rrcdc-b', worktree=wt_b,
+            pre_rebased=False, task_files=None, module_configs=[],
+            config=config, result=event_loop.create_future(), lane='normal',
+        )
+
+        # ── Inject killer: _remerge raises RuntimeError for req_b's task_id ─
+        _original_remerge = worker._remerge
+
+        async def _killer_remerge(req: Any, started_mono: Any) -> Any:
+            if req.task_id == 'rrcdc-b':
+                raise RuntimeError(
+                    'Failed to create merge worktree: '
+                    '/repo/.worktrees/rrcdc-b No space left on device'
+                )
+            return await _original_remerge(req, started_mono)
+
+        worker._remerge = _killer_remerge  # type: ignore[method-assign]
+
+        outcome_b: MergeOutcome | None = None
+        outcome_c: MergeOutcome | None = None
+
+        with patch('orchestrator.merge_queue.run_scoped_verification', _gated_local):
+            worker_task = asyncio.create_task(worker.run())
+
+            await q.put(req_a)
+            await q.put(req_b)
+
+            # Wait for both verifies to enter (true concurrent overlap).
+            await asyncio.wait_for(gate_a_entered.wait(), timeout=15.0)
+            await asyncio.wait_for(gate_b_entered.wait(), timeout=15.0)
+
+            # N fails → head-failure cascade fires → _killer_remerge raises for N+1.
+            gate_a_release.set()
+
+            outcome_a = await asyncio.wait_for(req_a.result, timeout=15.0)
+            assert outcome_a.status not in ('done', 'already_merged'), (
+                f'Expected N to fail, got status={outcome_a.status!r}.'
+            )
+
+            # Unblock N+1's inner verify coroutine so it exits cleanly (the
+            # cascade already cancelled the outer verify_task).
+            gate_b_release.set()
+
+            with contextlib.suppress(TimeoutError):
+                outcome_b = await asyncio.wait_for(req_b.result, timeout=5.0)
+
+            # ── LOAD-BEARING RED assertion (task 2160/η step-9) ───────────────
+            # Only the cascade's own _abort_remote_verify pre-cancel (call 1)
+            # and the in-body cancel_and_release (call 2) may fire. A
+            # regression that re-runs cancel_and_release on the
+            # already-in-body-released lease from the chokepoint issues a
+            # 3rd call.
+            assert gated_remote.cancel_verify.call_count == 2, (
+                f'Expected exactly 2 cancel_verify calls (abort pre-cancel + '
+                f'in-body release only); the chokepoint must not re-issue a '
+                f'3rd cancel on the already-in-body-released remote lease, '
+                f'got {gated_remote.cancel_verify.call_count}.'
+            )
+            assert worker._host_allocator is not None
+            assert worker._host_allocator.is_busy('laptop') is False, (
+                'Expected the laptop slot to remain FREE (not PARKED) at '
+                'post-cascade quiescence; a redundant 3rd cancel_verify '
+                '(rc != 0) would have parked a healthy slot.'
+            )
+
+            # Loop-survival signal: a third request should dispatch on the
+            # local host and resolve "done".
+            wt_c = await _make_branch_with_file(
+                git_ops, 'task/rrcdc-c', 'rrcdc_c.py', 'c = 3\n'
+            )
+            req_c = MergeRequest(
+                task_id='rrcdc-c', branch='task/rrcdc-c', worktree=wt_c,
+                pre_rebased=False, task_files=None, module_configs=[],
+                config=config, result=event_loop.create_future(), lane='normal',
+            )
+            await q.put(req_c)
+
+            with contextlib.suppress(TimeoutError):
+                outcome_c = await asyncio.wait_for(req_c.result, timeout=10.0)
+
+            await worker.stop()
+
+        with contextlib.suppress(Exception):
+            await asyncio.wait_for(worker_task, timeout=5.0)
+
+        # ── Loop survives + offending req blocked (pre-existing 1856 guard) ──
+        assert outcome_c is not None and outcome_c.status == 'done', (
+            f'Expected req_c to resolve "done" (loop survived cascade error), '
+            f'got {outcome_c!r}.'
+        )
+        assert outcome_b is not None and outcome_b.status == 'blocked', (
+            f'Expected cascade error to resolve req_b as "blocked", got {outcome_b!r}.'
+        )
+        assert outcome_b.reason is not None and outcome_b.reason.startswith(
+            'Verifier cascade error:'
+        ), outcome_b.reason
+        assert worker_task.done(), 'Worker task should be done after stop() + await'
+        assert worker_task.exception() is None, (
+            f'Expected worker task to exit cleanly, got {worker_task.exception()!r}.'
+        )
+
+        # ── Chokepoint assertions (task 1991) ────────────────────────────────
+        assert len(calls) == 1, (
+            f'Expected exactly one _resolve_and_release call, got {len(calls)}'
+        )
+        assert calls[0]['kwargs'].get('cancel_lease') is True, (
+            f"Expected cancel_lease=True, got kwargs={calls[0]['kwargs']!r}"
+        )
+        entry_arg = calls[0]['args'][0]
+        assert entry_arg.item.request.task_id == 'rrcdc-b'
+
     async def test_cascade_cancel_and_release_raises_routes_through_chokepoint(
         self,
         git_ops: GitOps,
@@ -1034,10 +1253,11 @@ class TestCascadeErrorChokepoint:
         config: OrchestratorConfig,
     ) -> None:
         """Scenario B: in-body release raises on its FIRST statement
-        (cancel_and_release) so _entry_released stays False → chokepoint
-        invoked with release_resources=True AND cancel_lease=True; the
-        chokepoint itself must perform the (best-effort, exactly-once)
-        release of the lease, worktree, and speculation slot.
+        (cancel_and_release), so the in-body release never completed →
+        chokepoint invoked unconditionally (no release_resources flag
+        anymore) with cancel_lease=True; the chokepoint itself must perform
+        the (best-effort, exactly-once) release of the lease, worktree, and
+        speculation permit.
 
         Adapted from TestCascadeErrorContainment
         .test_cascade_cancel_and_release_raises_contained
@@ -1181,9 +1401,10 @@ class TestCascadeErrorChokepoint:
         assert len(calls) == 1, (
             f'Expected exactly one _resolve_and_release call, got {len(calls)}'
         )
-        assert calls[0]['kwargs'].get('release_resources') is True, (
-            f"Expected release_resources=True (in-body release never completed — "
-            f"_entry_released stayed False), got kwargs={calls[0]['kwargs']!r}"
+        assert 'release_resources' not in calls[0]['kwargs'], (
+            f"release_resources no longer exists (task 2160/η: always-release "
+            f"contract; in-body release never completed, so this call performs "
+            f"the real, first-and-only release), got kwargs={calls[0]['kwargs']!r}"
         )
         assert calls[0]['kwargs'].get('cancel_lease') is True, (
             f"Expected cancel_lease=True, got kwargs={calls[0]['kwargs']!r}"
@@ -1302,4 +1523,63 @@ class TestCascadeErrorChokepoint:
             f'Expected _resolve_and_release to never be called for a REQUEUED '
             f'cascade entry (it `continue`s on the normal path), but got '
             f'{len(calls)} call(s): {calls!r}'
+        )
+
+
+# ---------------------------------------------------------------------------
+# task 2160/η step-7 RED / step-8 GREEN: _resolve_and_release's OWN release
+# migrates to the ledger — idempotent on a double call, no release_resources
+# guard needed
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestResolveAndReleaseLedgerIdempotency:
+    """task 2160/η: _resolve_and_release's own speculation-slot release must
+    route through ``self._speculation_ledger.release(entry.permit)`` (keyed
+    on the ζ/η-threaded token) instead of the raw, ``was_speculative``-gated
+    ``self._speculation_slot.release()``.
+
+    RED until η step-8 GREEN migrates that release and removes the
+    ``release_resources``/``_entry_released`` double-release guards — now
+    redundant, since the ledger's own ``permit.released`` flag already makes
+    a second release of the SAME token a silent no-op (``PermitLedger.release``,
+    merge_speculation_controller.py). Calling the chokepoint TWICE on the same
+    entry with no ``release_resources`` kwarg (the new always-release
+    contract) must leave the conservation identity ``slot_available +
+    len(live) == depth`` intact.
+
+    RED today because the raw semaphore release is unconditional-per-call
+    (gated only on the immutable ``was_speculative`` flag, never marked
+    "already released"): the second call over-releases the wrapped
+    semaphore (``slot_available`` grows by 2, not 1) while ``live`` never
+    discards the still-registered permit (task eta hasn't migrated this
+    release site yet) — so the sum overshoots ``depth`` by 2.
+    """
+
+    async def test_double_call_releases_permit_exactly_once(
+        self, git_ops: GitOps, git_repo: Path, config: OrchestratorConfig,
+    ) -> None:
+        q: asyncio.Queue[MergeRequest] = asyncio.Queue()
+        worker = SpeculativeMergeWorker(git_ops, q)
+        permit = await worker._speculation_ledger.acquire()
+
+        req = _make_request('rr-idem', 'task/rr-idem', git_repo, config)
+        _item, entry = _make_decided_item_and_entry(req, was_speculative=True)
+        entry.permit = permit
+
+        outcome = MergeOutcome('blocked', reason='x')
+
+        await worker._resolve_and_release(entry, outcome, chain_failed=True)
+        await worker._resolve_and_release(entry, outcome, chain_failed=True)
+
+        assert req.result.done()
+        assert req.result.result() is outcome
+        assert (
+            worker._speculation_ledger.slot_available
+            + len(worker._speculation_ledger.live)
+            == worker._speculation_depth
+        ), (
+            'permit must be released exactly once across both '
+            '_resolve_and_release calls (idempotent second call)'
         )

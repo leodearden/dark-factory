@@ -4380,9 +4380,12 @@ class SpeculativeMergeWorker(_WipHaltMixin):
         # MQ-refactor zeta (task 2159): single owner of the semaphore above —
         # mediates every acquire/release through a SpecPermit token so
         # conservation (slot_available + len(live) == depth) holds by
-        # construction. The verifier-side releases (_resolve_and_release/
-        # _finalize_inflight/cascade) still target _speculation_slot directly
-        # (raw, not through the ledger) until task eta migrates them.
+        # construction. As of task eta (2160), the verifier-side releases
+        # (_resolve_and_release/_finalize_inflight/cascade/stop-drain) all
+        # route through self._speculation_ledger.release(item.permit) too,
+        # so conservation is structural pipeline-wide and len(live) is the
+        # authoritative outstanding-permit count (speculation_accounting_
+        # violations reads it directly).
         self._speculation_ledger = PermitLedger(
             self._speculation_slot, self._speculation_depth,
         )
@@ -4390,9 +4393,10 @@ class SpeculativeMergeWorker(_WipHaltMixin):
         # state machine (spec_base/prefetched/pending_spec_base/
         # pending_predecessor + the permit lifecycle) with EXPLICIT
         # ownership-transfer semantics. Holds a REFERENCE to the shared
-        # _speculation_ledger above (never its own) so the verifier-side
-        # releases (_resolve_and_release/_finalize_inflight/cascade) keep
-        # releasing the same underlying semaphore unchanged. See
+        # _speculation_ledger above (never its own). The verifier-side
+        # releases (_resolve_and_release/_finalize_inflight/cascade) now
+        # release THROUGH that shared ledger via item.permit (task eta,
+        # 2160) rather than raw-releasing the semaphore directly. See
         # merge_speculation_controller.py's module docstring for the full
         # lifecycle contract.
         self._speculation_controller = SpeculationController(
@@ -5454,79 +5458,29 @@ class SpeculativeMergeWorker(_WipHaltMixin):
 
         Single source of truth for the ``inflight_speculative`` term shared
         by :meth:`snapshot`'s ``'speculation'`` key and
-        :meth:`speculation_accounting_violations`. From the instant a
-        speculative item's permit transfers to the verifier
-        (``SpeculationController.on_transfer``/``on_transfer_terminal``, at
-        the ``_verifier_queue.put()`` call site) until the permit is
-        released, the item must be counted from exactly one of these
-        locations — the same CPython internal-deque read ``snapshot()``
-        already performs elsewhere (synchronous, no await, no lock; safe
-        under asyncio's single-loop model):
+        :meth:`speculation_accounting_violations`.
 
-          * ``self._inflight``      — entries with ``was_speculative`` (task θ/1993).
-          * ``self._verifier_queue`` — items with ``.speculative`` (task θ/1993).
-          * ``self._redispatch``    — items with ``.speculative`` (task 2063): a
-            speculative item parked here, still holding its permit, when
-            ``_dispatch_item`` returns ``None`` because ``free_host_count()
-            == 0`` (verify hosts < speculation_depth) — awaiting a host, not
-            abandoned. Omitting this deque undercounts by one for the whole
-            multi-heartbeat window the item spends parked.
-          * ``self._finalizing_head`` — ``was_speculative`` (task 2096): set at
-            the top of ``_finalize_inflight`` and held for the ENTIRE
-            ``await entry.verify_task`` — i.e. the full verify duration
-            (20-60 min observed on reify), *not* the "single-tick,
-            sub-heartbeat transient" task 2063 originally characterized this
-            window as. Before this term was added, a speculative head's
-            permit was invisible to this count for that whole duration,
-            producing a spurious ``speculation-slot conservation violated``
-            audit finding for the entire verify (confirmed via the reify
-            esc-__merge_resource_leak__-23/-24 incidents) — the dominant,
-            longest-lived instance of the under-count class task 2063 first
-            fixed the shorter ``_redispatch``-parked case of.
-          * ``self._dispatching_item`` — ``.speculative`` (task 2096): set in
-            ``_verifier_loop``'s DISPATCH-FILL immediately before ``await
-            self._dispatch_item(item)`` and cleared in a bulletproof
-            ``finally``. Covers the "dispatch-gap": the item is off
-            ``_redispatch``/``_verifier_queue`` but not yet appended to
-            ``self._inflight`` during that await (host-acquisition git
-            calls, in-dispatch speculative-remerge). A speculative item's
-            ``.speculative`` is stable across this await (Mechanism 2's
-            chain-remerge is skipped for speculative items), so the gap is
-            safely countable. This is census-only: unlike
-            ``_finalizing_head``/``_remerging_item``, ``_dispatching_item``
-            is NOT surfaced in ``snapshot()``'s ``'entries'`` section —
-            that observability parity is task 2068's scope.
-
-        With all five locations covered, every point from permit-transfer
-        (``on_transfer``/``on_transfer_terminal``) to the verifier-side
-        release is accounted for — no uncounted location remains.
+        Task 2160 (η): conservation is now structural rather than location-
+        audited. Every permit transfer (``SpeculationController.on_transfer``/
+        ``on_transfer_terminal``) stamps the detached :class:`SpecPermit`
+        token onto the pipeline item/entry's ``.permit`` field, and every
+        verifier-side release routes through
+        ``self._speculation_ledger.release(permit)``. So
+        ``self._speculation_ledger.live`` already contains exactly the set of
+        not-yet-released permits — both the one the merger currently holds
+        (``held_by_merger``) and the ones transferred to the verifier (this
+        method's return value). Subtracting the merger's own held permit from
+        ``len(live)`` yields the verifier-owned count directly, independent
+        of which of ``self._inflight``/``self._verifier_queue``/
+        ``self._redispatch``/``self._finalizing_head``/
+        ``self._dispatching_item`` the item currently sits in — the
+        five-location scan those fields used to require (tasks 2063/2096) is
+        no longer needed; the fields themselves remain for other consumers
+        (snapshot's ``'entries'`` section, dispatch/remerge logic).
         """
         return (
-            sum(1 for _ie in self._inflight if _ie.was_speculative)
-            + sum(
-                1 for _item in self._verifier_queue._queue  # type: ignore[attr-defined]
-                if _item is not None and _item.speculative
-            )
-            + sum(
-                # Unlike the _verifier_queue._queue scan above (which can
-                # hold a real ``None`` stop-sentinel), _redispatch never
-                # holds None — both parking sites only ever append a
-                # RealMergeItem. The `is not None` guard here is kept solely
-                # for scan-shape parity with that comprehension, not because
-                # _redispatch has a None case to handle.
-                1 for _item in self._redispatch
-                if _item is not None and _item.speculative
-            )
-            + (
-                1 if self._finalizing_head is not None
-                and self._finalizing_head.was_speculative
-                else 0
-            )
-            + (
-                1 if self._dispatching_item is not None
-                and self._dispatching_item.speculative
-                else 0
-            )
+            len(self._speculation_ledger.live)
+            - self._speculation_controller.held_by_merger
         )
 
     def _inflight_cap_count(self) -> int:
@@ -5550,11 +5504,16 @@ class SpeculativeMergeWorker(_WipHaltMixin):
 
         Empty list → both conservation identities hold. Checks:
 
-          (a) speculation-slot identity: ``slot_available + held_by_merger +
-              inflight_speculative == depth`` — the permit-conservation
-              identity task theta/1993 built ``SpeculationController`` to
-              make computable (its ``held_by_merger`` docstring names this
-              task explicitly).
+          (a) speculation-slot identity: ``slot_available + len(ledger.live)
+              == depth`` (task 2160/η, PRD DD6) — the ledger-derived
+              collapse of the permit-conservation identity task theta/1993
+              built ``SpeculationController`` to make computable. Equivalent
+              to the decomposed ``slot_available + held_by_merger +
+              inflight_speculative == depth`` form (still exposed via
+              :meth:`snapshot`'s ``'speculation'`` key for callers that want
+              the merger/verifier split) since ``len(ledger.live) ==
+              held_by_merger + inflight_speculative`` once every permit
+              release routes through the ledger.
           (b) merge-ahead-cap identity: ``merge_ahead_cap._value +
               inflight_cap_count == depth`` — the Mechanism-1 cap analogue.
 
@@ -5567,9 +5526,9 @@ class SpeculativeMergeWorker(_WipHaltMixin):
         check has its own try/except so an unexpected exception in one never
         suppresses the other, and is surfaced as a violation string rather
         than raised — mirrors :meth:`two_layer_invariants`'s idiom. Reads
-        ``self._speculation_controller.snapshot()`` and the two helpers
-        above; deliberately does NOT call ``self.snapshot()`` (that would
-        recurse via the ``resource_audit`` key).
+        ``self._speculation_ledger``/``self._speculation_controller.snapshot()``
+        and the cap helper below; deliberately does NOT call ``self.snapshot()``
+        (that would recurse via the ``resource_audit`` key).
         """
         if not self._running:
             return []
@@ -5581,15 +5540,13 @@ class SpeculativeMergeWorker(_WipHaltMixin):
             spec = self._speculation_controller.snapshot()
             depth = spec['depth']
             slot_available = spec['slot_available']
-            held_by_merger = spec['held_by_merger']
-            inflight_speculative = self._inflight_speculative_count()
-            total = slot_available + held_by_merger + inflight_speculative
+            live_permits = len(self._speculation_ledger.live)
+            total = slot_available + live_permits
             if total != depth:
                 violations.append(
                     f'speculation-slot conservation violated: slot_available'
-                    f'({slot_available}) + held_by_merger({held_by_merger}) + '
-                    f'inflight_speculative({inflight_speculative}) == {total}, '
-                    f'expected depth={depth}'
+                    f'({slot_available}) + live_permits({live_permits}) == '
+                    f'{total}, expected depth={depth}'
                 )
         except Exception as exc:  # pragma: no cover — defensive
             violations.append(
@@ -6261,17 +6218,16 @@ class SpeculativeMergeWorker(_WipHaltMixin):
             # θ=1993 additive key: merger-side speculation state (from
             # self._speculation_controller.snapshot()) plus
             # inflight_speculative — the count of speculative items now owned
-            # by the verifier (self._inflight entries with was_speculative +
-            # self._verifier_queue items with .speculative + self._redispatch
-            # items with .speculative — task 2063's fix for the parked-item
-            # under-count + self._finalizing_head was_speculative — task
-            # 2096's fix for the verify-duration finalize-head under-count;
-            # same CPython internal-deque read as the 'entries' section
-            # above). Together these make the permit-conservation identity
-            # slot_available + held_by_merger + inflight_speculative == depth
-            # fully computable from snapshot() (task iota's conservation
-            # audit). Pure synchronous read — no await, no git calls. No
-            # collision with existing keys.
+            # by the verifier. Task 2160 (η): derived structurally as
+            # len(self._speculation_ledger.live) - held_by_merger rather than
+            # scanning self._inflight/self._verifier_queue/self._redispatch/
+            # self._finalizing_head/self._dispatching_item (tasks 2063/2096's
+            # historical location-scanning fixes — see
+            # _inflight_speculative_count's docstring). Together these make
+            # the permit-conservation identity slot_available + held_by_merger
+            # + inflight_speculative == depth fully computable from
+            # snapshot() (task iota's conservation audit). Pure synchronous
+            # read — no await, no git calls. No collision with existing keys.
             'speculation': {
                 **self._speculation_controller.snapshot(),
                 'inflight_speculative': self._inflight_speculative_count(),
@@ -6950,8 +6906,11 @@ class SpeculativeMergeWorker(_WipHaltMixin):
             if _ie.lease is not None and self._host_allocator is not None:
                 with contextlib.suppress(BaseException):
                     await self._host_allocator.cancel_and_release(_ie.lease)
-            if _ie.was_speculative:
-                self._speculation_slot.release()
+            # η: release THROUGH the ledger (idempotent + discards the token
+            # from ledger.live), guarded by the threaded token rather than
+            # was_speculative — ledger.release(None) would AttributeError.
+            if _ie.permit is not None:
+                self._speculation_ledger.release(_ie.permit)
         # Intentionally mutates _inflight directly (not via _inflight_clear())
         # from the stop coroutine — a legitimate non-owner drain covered by
         # _assert_single_writer's not-self._running gate (task 1999 I7), not
@@ -7721,14 +7680,24 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                         )
                         _abandon = self._abandon_outcome(req.task_id, prior_timeouts)
                         _already = self._oob_deliver(req, _abandon, speculative=speculative)
-                        await self._verifier_queue.put(DecidedItem(
+                        _decided_item = DecidedItem(
                             request=req,
                             base_sha=actual_main, speculative=speculative,
                             immediate_outcome=_abandon,
                             already_delivered=_already,
                             started_monotonic=t0,
-                        ))
-                        self._speculation_controller.on_transfer_terminal()
+                        )
+                        await self._verifier_queue.put(_decided_item)
+                        # η: stamp the detached token onto the enqueued item so
+                        # the verifier can release this SAME token on drain.
+                        # INVARIANT — no `await` between put() and this line:
+                        # unbounded asyncio.Queue.put() never suspends, so the
+                        # verifier cannot drain _decided_item while .permit is
+                        # still None. An intervening await (or a future
+                        # bounded queue that can suspend here) would let the
+                        # verifier see permit=None and silently skip the
+                        # release, leaking the token in ledger.live forever.
+                        _decided_item.permit = self._speculation_controller.on_transfer_terminal()
                         self._inflight_req = None
                         continue
 
@@ -7763,15 +7732,25 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                         # _warn_if_verify_base_not_frozen_tip returns
                         # immediately when item.merge_result is None (:5228).
                         # So this divergence has no observable effect.
-                        await self._verifier_queue.put(DecidedItem(
+                        _decided_item = DecidedItem(
                             request=req,
                             base_sha=base_for_merge, speculative=speculative,
                             immediate_outcome=result.outcome,
                             already_delivered=_already,
                             failure_diagnostic=result.outcome.failure_diagnostic,
                             started_monotonic=t0,
-                        ))
-                        self._speculation_controller.on_transfer_terminal()
+                        )
+                        await self._verifier_queue.put(_decided_item)
+                        # η: stamp the detached token onto the enqueued item so
+                        # the verifier can release this SAME token on drain.
+                        # INVARIANT — no `await` between put() and this line:
+                        # unbounded asyncio.Queue.put() never suspends, so the
+                        # verifier cannot drain _decided_item while .permit is
+                        # still None. An intervening await (or a future
+                        # bounded queue that can suspend here) would let the
+                        # verifier see permit=None and silently skip the
+                        # release, leaking the token in ledger.live forever.
+                        _decided_item.permit = self._speculation_controller.on_transfer_terminal()
                         self._inflight_req = None
                         continue
 
@@ -7794,14 +7773,15 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                         await self._merge_ahead_cap.acquire()
                     try:
                         self._register_owned_merge_worktree(merge_result.merge_worktree)
-                        await self._verifier_queue.put(RealMergeItem(
+                        _real_item = RealMergeItem(
                             request=req, merge_result=merge_result,
                             merge_wt=merge_result.merge_worktree,
                             base_sha=base_for_merge, speculative=speculative,
                             started_monotonic=t0,
                             merged_branch_tip=branch_head,  # γ2: branch tip at merge time
                             counts_against_cap=counts_against_cap,
-                        ))
+                        )
+                        await self._verifier_queue.put(_real_item)
                     except BaseException:
                         # put() failed — the verifier will never drain this item
                         # and release the cap.  Release it here to prevent the
@@ -7817,14 +7797,24 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                         # Do NOT replace with asyncio.BoundedSemaphore, which
                         # raises ValueError on over-release and would crash here.
                         #
-                        # The same double-release tolerance applies to
-                        # _speculation_slot: if this is a speculative item and
-                        # CancelledError fires after the put succeeded, the
-                        # controller's held_by_merger remains True so the
-                        # outer finally's on_shutdown() releases the slot —
-                        # and the verifier also releases it on drain.  Both
-                        # are plain Semaphores so over-release is safe here
-                        # too.
+                        # The _speculation_slot / permit picture is DIFFERENT
+                        # from _merge_ahead_cap above — under the ledger (η)
+                        # this is NOT a double release.  On this same
+                        # CancelledError-after-put race, execution never
+                        # reaches the on_transfer() stamp below (it lives
+                        # after this except block, past the `raise`), so
+                        # `_real_item.permit` stays None.  The verifier later
+                        # drains this item and, per its `if entry.permit is
+                        # not None` release guard, skips releasing the
+                        # ledger for it.  Meanwhile on_transfer() was never
+                        # called, so the controller's held_by_merger stays
+                        # True and the outer finally's on_shutdown() (or an
+                        # enclosing except's on_abort()) performs the single
+                        # authoritative ledger release of the still-held
+                        # merger permit.  Net: released exactly once — the
+                        # "verifier also releases it on drain" / "over-release
+                        # safe" story above is specific to _merge_ahead_cap
+                        # and does not apply here.
                         if counts_against_cap:
                             self._merge_ahead_cap.release()
                         raise
@@ -7838,7 +7828,19 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                     # (on_lookahead_pending) leaves spec_base as-is (a
                     # pre-existing, harmless staleness window — never read
                     # again before the next on_dequeue overwrites it).
-                    self._speculation_controller.on_transfer()
+                    # η: stamp the detached token onto the enqueued item so
+                    # the verifier can release this SAME token on drain.
+                    # INVARIANT — no `await` between put() (above, in the
+                    # try block) and this line: everything in between is
+                    # synchronous comments plus an `except BaseException`
+                    # handler that always re-raises before reaching here, so
+                    # this line only runs when put() returned without
+                    # suspending.  An intervening await would let the
+                    # verifier drain _real_item while .permit is still None,
+                    # silently skipping the release and leaking the token in
+                    # ledger.live forever — same hazard as the
+                    # on_transfer_terminal() sites above.
+                    _real_item.permit = self._speculation_controller.on_transfer()
                     self._inflight_req = None  # item is now owned by verifier
 
                     # ── Speculative look-ahead (depth-K cap) ──────────────────
@@ -8212,7 +8214,7 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                         )
                         await self._resolve_and_release(
                             entry, MergeOutcome('blocked', reason=f'Verifier error: {exc}'),
-                            chain_failed=True, release_resources=False,
+                            chain_failed=True,
                         )
                     continue  # don't append to _inflight; fetch next item
 
@@ -8244,11 +8246,13 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                         'Task %s: unexpected finalize error', head.item.request.task_id
                     )
                     # _finalize_inflight's finally already released the lease
-                    # and speculation slot; the chokepoint just resolves the
-                    # future and marks the chain as failed.
+                    # and speculation permit; the chokepoint's own release is
+                    # a no-op here (idempotent lease FREE-check + permit
+                    # .released guard) — it just resolves the future and
+                    # marks the chain as failed.
                     await self._resolve_and_release(
                         head, MergeOutcome('blocked', reason=f'Verifier error: {exc}'),
-                        chain_failed=True, release_resources=False,
+                        chain_failed=True,
                     )
 
                 # HEAD-FAILURE CASCADE (γ step-20): when the head fails, abort
@@ -8295,14 +8299,24 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                     # resolves as MergeOutcome('blocked', reason='Verifier
                     # cascade error: ...') and the loop continues to the next
                     # downstream entry.
-                    # Release discipline: lease+slot are released in-body at
-                    # cancel_and_release / _speculation_slot.release() BEFORE
-                    # _remerge is called; the _entry_released flag prevents a
-                    # double-release in the except handler on the
-                    # _remerge-raises path (which is the primary failure mode).
+                    # Release discipline: lease+permit are released in-body
+                    # at cancel_and_release / speculation_ledger.release()
+                    # BEFORE _remerge is called. The permit release is
+                    # genuinely idempotent (PermitLedger.release checks
+                    # permit.released first), so the except handler below can
+                    # re-run it unconditionally: no guard needed. The LEASE
+                    # release is NOT idempotent for a REMOTE lease —
+                    # HostAllocator.cancel_and_release unconditionally
+                    # re-issues cancel_verify() before any FREE-check
+                    # (verify_runner.py:2306), and a redundant cancel can
+                    # return rc != 0 and PARK a healthy slot
+                    # (verify_runner.py:2312). So _entry.lease is set to
+                    # None immediately after a successful in-body
+                    # cancel_and_release, below, which makes the chokepoint's
+                    # own `lease is not None` guard skip the redundant cancel
+                    # (task 2160/η).
                     for _entry in _downstream:
                         _entry_status: str | None = None
-                        _entry_released = False
                         try:
                             if _entry.verify_task is not None:
                                 # Fire remote cancel BEFORE task.cancel() so the
@@ -8334,6 +8348,15 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                                         pass
                             if _entry.lease is not None and _allocator is not None:
                                 await _allocator.cancel_and_release(_entry.lease)
+                                # Successful in-body cancel: clear the lease
+                                # so the except handler's chokepoint call
+                                # below (cancel_lease=True) does not re-issue
+                                # a non-idempotent cancel_and_release on the
+                                # same remote lease (task 2160/η step-10). If
+                                # cancel_and_release itself raises, this line
+                                # is never reached and the lease stays set,
+                                # so the chokepoint still retries the cancel.
+                                _entry.lease = None
                             if _entry.merge_wt is not None:
                                 with contextlib.suppress(BaseException):
                                     await self._cleanup_owned_merge_worktree(
@@ -8342,18 +8365,17 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                             # LATE-ARRIVAL ATTACH SYMMETRY (task 1862 step-6):
                             # A late arrival B attached via pending_spec_base is
                             # dispatched with speculative=True and held_spec_permit
-                            # retained (step-2), so B's InflightEntry carries
-                            # was_speculative=True.  The release below fires here
-                            # (predecessor failed → B is a downstream entry), and
-                            # _remerge returns speculative=False → re-dispatched B
-                            # has item_was_speculative=False → no duplicate release.
+                            # retained (step-2), so B's InflightEntry carries a
+                            # permit. The release below fires here (predecessor
+                            # failed → B is a downstream entry), and _remerge
+                            # returns speculative=False → re-dispatched B carries
+                            # permit=None → no duplicate release.
                             # Slot symmetry is maintained on the late-arrival path
                             # identically to the standard prefetch path.
-                            if _entry.was_speculative:
-                                self._speculation_slot.release()
-                            # Past the in-body lease+slot release; the except
-                            # handler must not re-release on any path below.
-                            _entry_released = True
+                            # η: release THROUGH the ledger, guarded by the
+                            # threaded token rather than was_speculative.
+                            if _entry.permit is not None:
+                                self._speculation_ledger.release(_entry.permit)
                             # REQUEUED: abort-poll already put req on _queue → skip.
                             if _entry_status == InflightStatus.REQUEUED:
                                 continue
@@ -8387,18 +8409,26 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                                 'Task %s: unexpected cascade error',
                                 _entry.item.request.task_id,
                             )
-                            # In-body release already ran (_entry_released=True)
-                            # UNLESS it raised before completing (e.g.
-                            # cancel_and_release itself raised) — in which case
-                            # the chokepoint performs the best-effort release
-                            # (lease/slot/merge-worktree) to avoid a leak.
+                            # The in-body release above may have already run
+                            # (lease/permit/merge-worktree), or may not have
+                            # completed if it raised (e.g. cancel_and_release
+                            # itself raised). The permit/worktree releases
+                            # are genuinely idempotent, so the chokepoint's
+                            # release of those is safe either way. The lease
+                            # is handled differently: a successful in-body
+                            # cancel_and_release set _entry.lease to None
+                            # above, so the chokepoint's own `lease is not
+                            # None` guard skips a redundant (non-idempotent
+                            # for a REMOTE lease) cancel_and_release; if the
+                            # in-body cancel itself raised, _entry.lease is
+                            # still set and this is the first-and-only
+                            # release attempt (task 2160/η).
                             await self._resolve_and_release(
                                 _entry, MergeOutcome(
                                     'blocked',
                                     reason=f'Verifier cascade error: {_cascade_exc}',
                                 ),
                                 chain_failed=True,
-                                release_resources=not _entry_released,
                                 cancel_lease=True,
                             )
                             continue
@@ -8465,7 +8495,7 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                         )
                         await self._resolve_and_release(
                             entry, MergeOutcome('blocked', reason=f'Verifier error: {exc}'),
-                            chain_failed=True, release_resources=False,
+                            chain_failed=True,
                         )
                     continue  # restart outer loop → fill loop picks up next item
 
@@ -8710,7 +8740,6 @@ class SpeculativeMergeWorker(_WipHaltMixin):
         outcome: MergeOutcome,
         *,
         chain_failed: bool,
-        release_resources: bool = True,
         cancel_lease: bool = False,
     ) -> None:
         """Single resolve-and-release chokepoint for the _verifier_loop
@@ -8719,23 +8748,15 @@ class SpeculativeMergeWorker(_WipHaltMixin):
         Unifies the six near-identical except-handler bodies that used to
         inline: resolve the caller's Future, release the host lease (release
         vs cancel_and_release), clean up an owned merge worktree, release the
-        speculation slot, and flag the chain as failed.  Each call site keeps
-        its own ``logger.exception`` message and its own
+        speculation permit, and flag the chain as failed.  Each call site
+        keeps its own ``logger.exception`` message and its own
         ``except (CancelledError, KeyboardInterrupt): raise`` clause; only the
         resolve-and-release tail is centralised here.
 
-        *entry_or_item* is normalised to (req, lease, merge_wt, slot_held):
-        an ``InflightEntry`` carries ``lease``/``merge_wt``/``was_speculative``
+        *entry_or_item* is normalised to (req, lease, merge_wt, permit): an
+        ``InflightEntry`` carries ``lease``/``merge_wt``/``permit``
         (post-dispatch state); a bare ``SpeculativeItem`` has no lease yet
-        (pre-dispatch state) and uses ``merge_wt``/``speculative`` directly.
-
-        *release_resources* controls whether this call performs any release
-        at all.  It must be ``False`` for the POST-finalize handlers
-        (passthrough-finalize x2, finalize-head): ``_finalize_inflight``'s own
-        ``finally`` clause already released the lease and speculation slot on
-        every exit path including exceptions, so releasing again here would
-        double-release.  It defaults to ``True`` for the PRE-finalize dispatch
-        handlers, which own the item's resources outright.
+        (pre-dispatch state) and uses ``merge_wt``/``permit`` directly.
 
         *cancel_lease* selects ``cancel_and_release`` over plain ``release``
         (mirrors ``_finalize_inflight``'s own ``_cancel_release`` switch) —
@@ -8754,7 +8775,7 @@ class SpeculativeMergeWorker(_WipHaltMixin):
         detail (tracked only in ``_owned_merge_worktrees``) that is never
         exposed to the ``req.result`` waiter, so a waiter woken by the
         just-resolved Future cannot observe the not-yet-cleaned worktree or
-        not-yet-released lease/slot.  No consumer or test depends on
+        not-yet-released lease/permit.  No consumer or test depends on
         intra-handler await ordering between resolve and release.
 
         Abandoned-drop semantics: step 1 resolves via
@@ -8776,6 +8797,31 @@ class SpeculativeMergeWorker(_WipHaltMixin):
         equivalence is intentional and holds uniformly across all six call
         sites now unified behind this chokepoint.
 
+        Releases are unconditional and idempotent for every resource except a
+        ``cancel_lease=True`` release of a REMOTE lease (task 2160/η).
+        ``_cleanup_owned_merge_worktree`` pops from ``_owned_merge_worktrees``
+        and ``PermitLedger.release`` checks ``permit.released`` first, so
+        both silently no-op on a repeat call; plain ``HostAllocator.release``
+        also FREE-checks the lease slot before doing anything, so it too is
+        idempotent. ``HostAllocator.cancel_and_release`` is NOT: for a remote
+        lease it unconditionally re-issues ``cancel_verify()`` BEFORE any
+        FREE-check (verify_runner.py:2306), and a redundant cancel on an
+        already-cancelled remote verify can return a non-zero rc, which
+        PARKs the slot rather than raising (verify_runner.py:2312) — a state
+        mutation the surrounding ``contextlib.suppress`` does not undo. So a
+        caller whose own code path already released these resources
+        (``_finalize_inflight``'s ``finally``, which always uses plain
+        ``release``; or the cascade handler's in-body release, which uses
+        ``cancel_and_release`` and therefore also clears ``entry.lease`` to
+        ``None`` immediately after a successful release) can invoke this
+        chokepoint unconditionally, with no ``release_resources`` flag
+        needed — removed along with the cascade loop's now-redundant
+        ``_entry_released`` guard. The ordinary ``if lease is not None``
+        guard below does double duty: it skips the lease step for a
+        lease-less ``SpeculativeItem``/already-released ``InflightEntry``
+        input, AND it is what the cascade's lease-clearing relies on to skip
+        a redundant cancel.
+
         This is also the intended hook surface for task eta's liveness-ledger
         'resolved' transition: every _verifier_loop error-resolution path now
         funnels through this one coroutine.
@@ -8784,28 +8830,27 @@ class SpeculativeMergeWorker(_WipHaltMixin):
             item = entry_or_item.item
             lease: Any | None = entry_or_item.lease
             merge_wt = entry_or_item.merge_wt
-            slot_held = entry_or_item.was_speculative
+            permit = entry_or_item.permit
         else:
             item = entry_or_item
             lease = None
             merge_wt = item_merge_wt(entry_or_item)
-            slot_held = entry_or_item.speculative
+            permit = entry_or_item.permit
         req = item.request
 
         self._resolve_or_drop_abandoned(req, outcome)
 
-        if release_resources:
-            if lease is not None and self._host_allocator is not None:
-                with contextlib.suppress(BaseException):
-                    if cancel_lease:
-                        await self._host_allocator.cancel_and_release(lease)
-                    else:
-                        await self._host_allocator.release(lease)
-            if merge_wt is not None:
-                with contextlib.suppress(BaseException):
-                    await self._cleanup_owned_merge_worktree(merge_wt)
-            if slot_held:
-                self._speculation_slot.release()
+        if lease is not None and self._host_allocator is not None:
+            with contextlib.suppress(BaseException):
+                if cancel_lease:
+                    await self._host_allocator.cancel_and_release(lease)
+                else:
+                    await self._host_allocator.release(lease)
+        if merge_wt is not None:
+            with contextlib.suppress(BaseException):
+                await self._cleanup_owned_merge_worktree(merge_wt)
+        if permit is not None:
+            self._speculation_ledger.release(permit)
 
         if chain_failed:
             self._n_failed = True
@@ -9461,14 +9506,18 @@ class SpeculativeMergeWorker(_WipHaltMixin):
 
         finally:
             # Always: release the host lease (unless passthrough / already skipped),
-            # release the speculation slot iff speculative, and update _n_failed.
+            # release the speculation permit iff one was threaded, and update
+            # _n_failed.
             if not _skip_release and entry.lease is not None and self._host_allocator is not None:
                 if _cancel_release:
                     await self._host_allocator.cancel_and_release(entry.lease)
                 else:
                     await self._host_allocator.release(entry.lease)
-            if entry.was_speculative:
-                self._speculation_slot.release()
+            # η: release THROUGH the ledger, guarded by the threaded token
+            # rather than was_speculative — ledger.release(None) would
+            # AttributeError on `.released`.
+            if entry.permit is not None:
+                self._speculation_ledger.release(entry.permit)
             # _n_failed_val is set by non-PASS branches; None means use 'not advanced'
             # (the PASS-path semantics: True when CAS failed, False when advanced).
             self._n_failed = _n_failed_val if _n_failed_val is not None else not advanced
@@ -9539,6 +9588,7 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                 was_speculative=item.speculative,
                 phase='abandoned',
                 status=InflightStatus.ABANDONED_PREDISPATCH,
+                permit=item.permit,
             )
 
         # ── Pre-dispatch operator-halt ──────────────────────────────────────
@@ -9563,6 +9613,7 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                 was_speculative=item.speculative,
                 phase='halted',
                 status=InflightStatus.REQUEUED_PREDISPATCH,
+                permit=item.permit,
             )
 
         # ── Immediate outcome (conflict / already_merged / blocked) ────────
@@ -9576,6 +9627,7 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                 was_speculative=item.speculative,
                 phase='passthrough',
                 passthrough_outcome=item.immediate_outcome,
+                permit=item.permit,
             )
         # item: RealMergeItem from here on (DecidedItem always returns above; task ο).
 
@@ -9592,7 +9644,12 @@ class SpeculativeMergeWorker(_WipHaltMixin):
         # Capture the speculative flag BEFORE any _remerge reassignment so
         # the InflightEntry carries the ORIGINAL speculative state for slot
         # release (same pattern as old loop's item_was_speculative).
+        # item_permit travels alongside it (η) — _remerge always returns a
+        # non-speculative item (see the LATE-ARRIVAL ATTACH SYMMETRY note in
+        # the cascade handler above), so the ORIGINAL item's permit is the
+        # one this dispatch must release.
         item_was_speculative = item.speculative
+        item_permit = item.permit
         iteration_did_remerge = False
 
         # ── Chain re-merge (Mechanism 2 + chain-invalidation) ──────────────
@@ -9701,6 +9758,7 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                         phase='passthrough',
                         passthrough_outcome=item.immediate_outcome,
                         started_at=time.time(),
+                        permit=item_permit,
                     )
                 # item: RealMergeItem again (post-remerge fallthrough; task ο).
 
@@ -9763,6 +9821,7 @@ class SpeculativeMergeWorker(_WipHaltMixin):
             was_speculative=item_was_speculative,
             phase='verifying',
             started_at=time.time(),
+            permit=item_permit,
         )
 
     async def _verify_and_advance(self, item: RealMergeItem) -> bool:

@@ -967,11 +967,11 @@ class TestScenario234VerifierLifecycleFaults:
 
         # Simulate this item holding a speculation permit the way a real
         # speculative dispatch would — _run_inflight_verify/_finalize_inflight
-        # never ACQUIRE the semaphore themselves (only _finalize_inflight's
-        # finally block releases it, gated on entry.was_speculative), so the
-        # direct-call style needs to arm it manually to make the release
+        # never ACQUIRE the ledger themselves (only _finalize_inflight's
+        # finally block releases it, gated on entry.permit is not None), so
+        # the direct-call style needs to arm it manually to make the release
         # observable.
-        await worker._speculation_slot.acquire()
+        permit = await worker._speculation_ledger.acquire()
 
         gate_entered = asyncio.Event()
 
@@ -1002,6 +1002,7 @@ class TestScenario234VerifierLifecycleFaults:
         entry = InflightEntry(
             item=item, lease=lease, verify_task=_wrap_verify_result(result),
             merge_wt=None, was_speculative=True, phase='verifying',
+            permit=permit,
         )
         advanced = await worker._finalize_inflight(entry)
         assert advanced is False

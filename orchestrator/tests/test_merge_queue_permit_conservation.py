@@ -569,6 +569,125 @@ class TestShutdownRetainedPermitConservation:
 
 
 # ---------------------------------------------------------------------------
+# task eta step-3: threaded token carried on the item + ledger.live empties
+# once every transferred permit has been released THROUGH the ledger
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestLedgerLiveEmptiesAfterTransferRelease:
+    """task eta (2160) step-3: once a transferred permit's underlying item
+    lands, the token must be gone from ``worker._speculation_ledger.live`` —
+    not just have its semaphore slot restored (task zeta's interim state,
+    which drops the controller's own reference at transfer but never
+    discards the token from ``live``; see ``PermitLedger``'s "Known interim
+    cost" docstring).
+
+    RED until step-4 GREEN: (a) threads the merger's transfer token onto the
+    enqueued item's ``.permit`` field, and (b) migrates the verifier-side
+    per-item raw releases to ``ledger.release(item.permit)`` (which discards
+    the token from ``live``). Reuses the prefetch-lookahead + late-arrival
+    ATTACH scenario from ``TestPrefetchLookaheadAndAttachConservation``: a
+    speculative permit is acquired by the merger, retained across the
+    look-ahead, ATTACH-transferred to B, and drained when B lands.
+    """
+
+    async def test_transferred_item_carries_token_and_live_empties_post_shutdown(
+        self, git_ops: GitOps, git_config: GitConfig,
+    ) -> None:
+        from orchestrator.merge_queue import SpeculativeMergeWorker
+
+        K = 2
+        gate_a_release = asyncio.Event()
+        gate_a_entered = asyncio.Event()
+        _local_calls = [0]
+
+        async def _gated_local(*args: Any, **kwargs: Any) -> MagicMock:
+            call = _local_calls[0]
+            _local_calls[0] += 1
+            if call == 0:
+                gate_a_entered.set()
+                await gate_a_release.wait()
+            return MagicMock(
+                passed=True, summary='ok', test_output='ok',
+                lint_output='', type_output='', category='',
+                timed_out=False, verify_skipped=False,
+            )
+
+        gate_b_release = asyncio.Event()
+        gate_b_entered = asyncio.Event()
+        fake_remote = _gated_runner(
+            gate_b_release, gate_b_entered, passed=True, name='pc-live-empties-laptop',
+        )
+
+        config = OrchestratorConfig(project_root=git_ops.project_root, git=git_config)
+        wt_a = await _make_branch_with_file(
+            git_ops, 'task/pc-live-a', 'pc_live_a.py', 'a = 1\n',
+        )
+        wt_b = await _make_branch_with_file(
+            git_ops, 'task/pc-live-b', 'pc_live_b.py', 'b = 2\n',
+        )
+
+        queue: asyncio.Queue = asyncio.Queue()
+        worker = SpeculativeMergeWorker(git_ops, queue, speculation_depth=K)
+        _inject_two_host_allocator(worker, fake_remote)
+
+        req_a = _make_request('pc-live-a', 'task/pc-live-a', wt_a, config)
+        req_b = _make_request('pc-live-b', 'task/pc-live-b', wt_b, config)
+
+        with patch('orchestrator.merge_queue.run_scoped_verification', _gated_local):
+            worker_task = asyncio.create_task(worker.run())
+
+            await queue.put(req_a)
+            await asyncio.wait_for(gate_a_entered.wait(), timeout=15.0)
+
+            # (1) prefetch look-ahead: A merged, look-ahead peeked (found
+            # nothing), permit RETAINED for a possible late arrival.
+            await queue.put(req_b)
+            await asyncio.wait_for(gate_b_entered.wait(), timeout=15.0)
+
+            # (2) B is now dispatched (in-flight, verifying) — its
+            # InflightEntry must carry the SAME token still registered in
+            # ledger.live, proving the merger stamped item.permit at
+            # transfer time (step 4a) and _dispatch_item copied it onto the
+            # InflightEntry (step 4b).
+            entry_b = next(
+                e for e in worker._inflight
+                if e.item.request.task_id == req_b.task_id
+            )
+            assert entry_b.permit is not None, (
+                "B's InflightEntry.permit must be the transferred token, not "
+                'None (see SpeculationController.on_transfer/on_transfer_terminal '
+                'and the _dispatch_item InflightEntry constructions)'
+            )
+            assert entry_b.permit in worker._speculation_ledger.live
+
+            gate_a_release.set()
+            gate_b_release.set()
+
+            outcome_a = await asyncio.wait_for(req_a.result, timeout=15.0)
+            outcome_b = await asyncio.wait_for(req_b.result, timeout=15.0)
+            assert outcome_a.status == 'done', f'A must land; got {outcome_a!r}'
+            assert outcome_b.status == 'done', f'B must land; got {outcome_b!r}'
+
+            await worker.stop()
+
+        with contextlib.suppress(Exception):
+            await asyncio.wait_for(worker_task, timeout=5.0)
+
+        _assert_shutdown_quiescent(worker, where='post-shutdown', depth=K)
+
+        # Core step-3 assertion: every transferred permit has been released
+        # THROUGH the ledger by the time the worker is fully quiescent — not
+        # merely had its semaphore slot restored by a raw verifier release
+        # that never discarded the token (zeta's interim leak).
+        assert worker._speculation_ledger.live == frozenset(), (
+            'every transferred permit must be discarded from ledger.live by '
+            f'shutdown quiescence; still live: {worker._speculation_ledger.live!r}'
+        )
+
+
+# ---------------------------------------------------------------------------
 # Amendment (post-step-12 review): terminal (early-continue) transfer must
 # clear spec_base, not just held_by_merger
 # ---------------------------------------------------------------------------
@@ -707,3 +826,17 @@ class TestEarlyContinueTerminalTransferClearsSpecBase:
             await asyncio.wait_for(worker_task, timeout=5.0)
 
         _assert_shutdown_quiescent(worker, where='post-shutdown', depth=K)
+
+        # Amendment (post-η review): TestLedgerLiveEmptiesAfterTransferRelease's
+        # leak detector only covers the successful ATTACH+land path
+        # (on_transfer). B's terminal (early-continue) transfer above routes
+        # through on_transfer_terminal() instead — mirror that same direct
+        # ledger.live check on this path, so a missed ledger.release on any
+        # of the seven terminal early-continue sites would leak a permit
+        # into ledger.live undetected (the spec_base assertions above do not
+        # by themselves prove the permit was discarded from ``live``).
+        assert worker._speculation_ledger.live == frozenset(), (
+            "B's terminal-transfer permit must be discarded from "
+            f'ledger.live by shutdown quiescence; still live: '
+            f'{worker._speculation_ledger.live!r}'
+        )
