@@ -1107,7 +1107,16 @@ class TestFinalizeInflightPass:
     async def test_finalize_pass_does_not_release_slot_if_not_speculative(
         self, git_ops: GitOps, config: OrchestratorConfig,
     ) -> None:
-        """was_speculative=False → _speculation_slot NOT released."""
+        """was_speculative=False, permit=None → _speculation_slot NOT released.
+
+        η: the release gate is `entry.permit is not None`, not
+        `was_speculative`. This covers the common case where both fields
+        move together (permit-less, non-speculative entry); see
+        `test_finalize_pass_does_not_release_slot_when_speculative_flag_true_but_no_permit`
+        and `test_finalize_pass_releases_slot_when_permit_set_but_speculative_flag_false`
+        below for the divergent combinations that actually exercise the gate
+        being keyed on the permit rather than the flag.
+        """
         from orchestrator.verify_runner import HostLease
 
         req, item = await self._make_merged_item(
@@ -1131,6 +1140,77 @@ class TestFinalizeInflightPass:
 
         # Slot value unchanged (no release)
         assert worker._speculation_slot._value == slot_value_before
+
+    async def test_finalize_pass_does_not_release_slot_when_speculative_flag_true_but_no_permit(
+        self, git_ops: GitOps, config: OrchestratorConfig,
+    ) -> None:
+        """was_speculative=True but permit=None → _speculation_slot NOT released.
+
+        η: proves the release gate is genuinely keyed on `entry.permit`, not
+        `was_speculative` — a regression that gated on the flag again would
+        have nothing to distinguish this from the iff-speculative-true case,
+        but there is no token to release here.
+        """
+        from orchestrator.verify_runner import HostLease
+
+        req, item = await self._make_merged_item(
+            git_ops, config, 'fin-pass-g', 'fg.py', 'g=7\n',
+        )
+        q: asyncio.Queue[MergeRequest] = asyncio.Queue()
+        worker = SpeculativeMergeWorker(git_ops, q)
+        worker._host_allocator = self._make_mock_allocator()
+        worker._register_owned_merge_worktree(item.merge_wt)
+
+        slot_value_before = worker._speculation_slot._value
+
+        lease = HostLease(name='local', runner=MagicMock(), is_local=True)
+        entry = self._make_pass_entry(item, lease, was_speculative=True)
+        assert entry.permit is None
+
+        with patch(
+            'orchestrator.merge_queue.run_scoped_verification',
+            _mock_verify_pass(),
+        ):
+            await worker._finalize_inflight(entry)
+
+        # Slot value unchanged: was_speculative=True alone releases nothing.
+        assert worker._speculation_slot._value == slot_value_before
+
+    async def test_finalize_pass_releases_slot_when_permit_set_but_speculative_flag_false(
+        self, git_ops: GitOps, config: OrchestratorConfig,
+    ) -> None:
+        """was_speculative=False but permit set → release fires anyway.
+
+        η: the inverse divergence — proves a real ledger token is released
+        through `_finalize_inflight` regardless of the (now-informational)
+        was_speculative flag.
+        """
+        from orchestrator.verify_runner import HostLease
+
+        req, item = await self._make_merged_item(
+            git_ops, config, 'fin-pass-h', 'fh.py', 'h=8\n',
+        )
+        q: asyncio.Queue[MergeRequest] = asyncio.Queue()
+        worker = SpeculativeMergeWorker(git_ops, q)
+        worker._host_allocator = self._make_mock_allocator()
+        worker._register_owned_merge_worktree(item.merge_wt)
+
+        permit = await worker._speculation_ledger.acquire()
+        slot_value_before = worker._speculation_slot._value
+
+        lease = HostLease(name='local', runner=MagicMock(), is_local=True)
+        entry = self._make_pass_entry(item, lease, was_speculative=False)
+        entry.permit = permit
+
+        with patch(
+            'orchestrator.merge_queue.run_scoped_verification',
+            _mock_verify_pass(),
+        ):
+            await worker._finalize_inflight(entry)
+
+        # Slot released despite was_speculative=False, because a real token
+        # was threaded onto the entry.
+        assert worker._speculation_slot._value == slot_value_before + 1
 
 
 # ---------------------------------------------------------------------------
@@ -4475,11 +4555,14 @@ class TestFinalizeHeadSpeculativeAccountingThroughout:
     head, THROUGHOUT the real `await entry.verify_task` window (task 2096 →
     task 2160/η).
 
-    RED (pre-η GREEN): the entries below now carry real ledger-issued
-    tokens (``entry.permit``) instead of relying on structural location,
-    but _inflight_speculative_count() still scans the five old
-    ``was_speculative``/``.speculative`` locations rather than
-    ``ledger.live`` — see step-6 GREEN.
+    The entries below carry real ledger-issued tokens (``entry.permit``)
+    rather than relying on structural location, and
+    ``_inflight_speculative_count()`` derives its count from
+    ``len(ledger.live) - held_by_merger`` (η step-6) instead of scanning the
+    five old ``was_speculative``/``.speculative`` locations. This asserts
+    that identity holds — and the finalizing-head permit stays counted —
+    for the entire duration of the real `await entry.verify_task` window,
+    not just at entry/exit.
     """
 
     async def _make_merged_item(
@@ -4580,9 +4663,9 @@ class TestFinalizeHeadSpeculativeAccountingThroughout:
             f'speculation-slot identity must hold for the ENTIRE '
             f'`await entry.verify_task` window when the finalizing head is '
             f'itself speculative (task 2096); got {violations_mid_await!r}. '
-            f'RED: _inflight_speculative_count() does not yet scan '
-            f'_finalizing_head, so the drained-but-uncounted permit reads '
-            f'as a conservation violation for the whole verify duration.'
+            f'_inflight_speculative_count() derives from ledger.live, so the '
+            f'finalizing head permit stays counted (not drained-but-uncounted) '
+            f'for the whole verify duration.'
         )
         assert worker._inflight_speculative_count() == 2, (
             f'Expected both the finalizing head and the parked _inflight '
