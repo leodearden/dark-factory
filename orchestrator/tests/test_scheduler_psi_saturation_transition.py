@@ -217,6 +217,21 @@ class _Driver:
     async def run_ticks(self, n: int) -> list:
         return [await self.tick() for _ in range(n)]
 
+    async def complete(self, task_id: str) -> None:
+        """Model a task finishing: release its module lock via the REAL
+        scheduler.release(), then drop it from the active list so a fixed
+        get_tasks backlog never re-offers a finished task as a candidate."""
+        self.scheduler.release(task_id)
+        self._completed.add(task_id)
+        self._heavy_in_flight.discard(task_id)
+        self._det_dispatched.discard(task_id)
+
+    async def drain_heavy_to(self, n: int) -> None:
+        """Complete in-flight heavy tasks (arbitrary order) until
+        heavy_in_flight() == n."""
+        while len(self._heavy_in_flight) > n:
+            await self.complete(next(iter(self._heavy_in_flight)))
+
     def heavy_in_flight(self) -> int:
         return len(self._heavy_in_flight)
 
