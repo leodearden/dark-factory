@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import json
 import uuid as _uuid_mod
+from typing import Any
 from unittest.mock import AsyncMock
 
 import pytest
@@ -240,7 +241,7 @@ async def _seed_suppression(
     flag_type='' (default) seeds a blanket/wildcard row; a non-empty
     flag_type seeds a scoped row.
     """
-    payload = {'kind': 'stage1_flag_suppression', 'task_id': task_id}
+    payload: dict[str, Any] = {'kind': 'stage1_flag_suppression', 'task_id': task_id}
     if flag_type:
         payload['flag_types'] = [flag_type]
     await ledger.upsert(ReconLedgerRecord(
