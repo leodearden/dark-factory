@@ -38,7 +38,19 @@ from orchestrator.verify import run_verification
 _TEST_CMD = 'pytest tests/'
 _LINT_CMD = 'ruff'
 _TYPE_CMD = 'pyright'
-_LEG_BY_CMD = {_TEST_CMD: 'test', _LINT_CMD: 'lint', _TYPE_CMD: 'type'}
+def _leg_for_cmd(cmd: str) -> str:
+    """Label which leg *cmd* belongs to by substring, not exact match — an
+    active admission gate nice-wraps the test leg (``<nice argv> /bin/bash -c
+    <shlex.quote(cmd)>``), so its captured cmd still CONTAINS ``_TEST_CMD``
+    but is no longer equal to it. lint/type are never wrapped either way.
+    """
+    if _TEST_CMD in cmd:
+        return 'test'
+    if _LINT_CMD in cmd:
+        return 'lint'
+    if _TYPE_CMD in cmd:
+        return 'type'
+    return cmd
 
 
 def _module_config(**overrides) -> ModuleConfig:
@@ -69,7 +81,7 @@ class TestVerifyAdmissionAcquireWiring:
             yield True
 
         async def spy_run_cmd(cmd, cwd, timeout, env=None, log_path=None, **kwargs):
-            events.append(f'run:{_LEG_BY_CMD.get(cmd, cmd)}')
+            events.append(f'run:{_leg_for_cmd(cmd)}')
             return 0, '', False
 
         slots_dir = tmp_path / 'slots'
@@ -142,7 +154,7 @@ class TestVerifyAdmissionAcquireWiring:
             yield False  # T1 C-merge-priority: merge never actually holds a slot
 
         async def spy_run_cmd(cmd, cwd, timeout, env=None, log_path=None, **kwargs):
-            events.append(f'run:{_LEG_BY_CMD.get(cmd, cmd)}')
+            events.append(f'run:{_leg_for_cmd(cmd)}')
             return 0, '', False
 
         slots_dir = tmp_path / 'slots'
@@ -199,9 +211,15 @@ class TestVerifyAdmissionAcquireWiring:
                 attempt_id=None,
             )
 
-        assert run_cmd_calls == [_TEST_CMD, _LINT_CMD, _TYPE_CMD], (
-            'an unmkdir-able slots_dir must fail open (verify still runs), not raise'
+        assert [_leg_for_cmd(c) for c in run_cmd_calls] == ['test', 'lint', 'type'], (
+            'an unmkdir-able slots_dir must fail open (verify still runs), not raise; '
+            f'got {run_cmd_calls!r}'
         )
+        # The slot ACQUIRE fails open (no flock held), but the nice-prefix wrap is
+        # independent of acquisition and still applies to the test leg.
+        assert run_cmd_calls[0] == 'nice -n 15 ionice -c2 -n7 /bin/bash -c ' + shlex.quote(_TEST_CMD)
+        assert run_cmd_calls[1] == _LINT_CMD
+        assert run_cmd_calls[2] == _TYPE_CMD
 
     @pytest.mark.real_verify_admission
     @pytest.mark.asyncio
@@ -217,7 +235,7 @@ class TestVerifyAdmissionAcquireWiring:
 
         async def spy_run_cmd(cmd, cwd, timeout, env=None, log_path=None, **kwargs):
             nonlocal current, max_seen
-            if cmd != _TEST_CMD:
+            if _leg_for_cmd(cmd) != 'test':
                 return 0, '', False
             current += 1
             max_seen = max(max_seen, current)

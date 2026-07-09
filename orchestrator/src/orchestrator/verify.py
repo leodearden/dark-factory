@@ -2813,6 +2813,25 @@ def _maybe_govern_merge_cmd(
     return f'{shlex.quote(exec_abs)} --role merge -- /bin/bash -c {shlex.quote(cmd)}'
 
 
+def _resolve_nice_prefix(config: OrchestratorConfig, role: str) -> list[str]:
+    """Return the argv ``nice``/``ionice`` prefix to apply for *role*.
+
+    A non-empty per-role override knob (``verify_admission_nice_{merge,task,
+    background}``) wins, ``shlex.split``. Empty (default) defers to T1's
+    canonical ``shared.verify_admission.nice_prefix(role)`` tier table —
+    ``offline`` and any unrecognized role resolve to ``[]`` (no adjustment).
+    """
+    overrides = {
+        'merge': config.verify_admission_nice_merge,
+        'task': config.verify_admission_nice_task,
+        'background': config.verify_admission_nice_background,
+    }
+    override = overrides.get(role, '')
+    if override:
+        return shlex.split(override)
+    return nice_prefix(role)
+
+
 def _verify_admission_active(config: OrchestratorConfig) -> bool:
     """Whether the verify-admission gate (flock slot + nice tier) is active.
 
@@ -3006,6 +3025,10 @@ async def run_verification(
         # gated by the shared.verify_admission flock semaphore + role nice
         # tier; lint/type ride alongside within the same verify, ungated.
         admission = _verify_admission_active(config) and label == 'test'
+        if admission:
+            prefix = _resolve_nice_prefix(config, role)
+            if prefix:
+                cmd = f'{shlex.join(prefix)} /bin/bash -c {shlex.quote(cmd)}'
         async with (_admission_slot(role, config) if admission else contextlib.nullcontext()):
             started_at = datetime.now(UTC).isoformat()
             t0 = time.monotonic()
