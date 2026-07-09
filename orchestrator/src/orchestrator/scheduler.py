@@ -1737,8 +1737,8 @@ class Scheduler:
         # write reach fused-memory, defeating C3.2.)
         if (
             status == 'blocked'
-            and self._suppress_blocked_write is not None
-            and self._suppress_blocked_write(task_id)
+            and self._callbacks.suppress_blocked_write is not None
+            and self._callbacks.suppress_blocked_write(task_id)
         ):
             logger.info(
                 'set_task_status(%s, blocked): suppressed by action-teardown — skipping write',
@@ -2191,7 +2191,7 @@ class Scheduler:
                     # Pop so the next crossing (if it persists) fires again —
                     # mirrors the sentinel re-fire pattern.
                     self._streak_resolver_degraded.clear(task_id)
-                    if self._on_external_dep_block is not None:
+                    if self._callbacks.on_external_dep_block is not None:
                         summary = (
                             f'EXTERNAL_DEP_RESOLVER_DEGRADED: task {task_id} — '
                             f'external-dep resolver degraded for {count} consecutive ticks'
@@ -2206,7 +2206,7 @@ class Scheduler:
                             f'are not re-evaluated automatically.  '
                             f'(prefer-loud backstop, task 1855)'
                         )
-                        await self._on_external_dep_block(
+                        await self._callbacks.on_external_dep_block(
                             task_id,
                             summary=summary,
                             detail=detail,
@@ -2269,8 +2269,8 @@ class Scheduler:
                         f'cancelled.  Task {task_id} cannot proceed; it should '
                         f'be re-architected or cancelled itself.'
                     )
-                    if self._on_external_dep_block is not None:
-                        await self._on_external_dep_block(
+                    if self._callbacks.on_external_dep_block is not None:
+                        await self._callbacks.on_external_dep_block(
                             task_id,
                             summary=summary,
                             detail=detail,
@@ -2306,8 +2306,8 @@ class Scheduler:
                             f'task {task_id} back to pending to reopen it — '
                             f'blocked tasks are not re-evaluated automatically.'
                         )
-                        if self._on_external_dep_block is not None:
-                            await self._on_external_dep_block(
+                        if self._callbacks.on_external_dep_block is not None:
+                            await self._callbacks.on_external_dep_block(
                                 task_id,
                                 summary=summary,
                                 detail=detail,
@@ -2422,7 +2422,7 @@ class Scheduler:
                 skip >= cfg.skip_threshold
                 and idle_elapsed >= cfg.idle_secs
                 and not self._streak_starvation.is_escalated(tid)
-                and self._on_starvation_warn is not None
+                and self._callbacks.on_starvation_warn is not None
             ):
                 summary = (
                     f'STARVATION_WATCHDOG: task {tid} skip_count={skip} '
@@ -2442,7 +2442,7 @@ class Scheduler:
                     f'by the fairness parks.\n\n'
                     f'skip_threshold={cfg.skip_threshold}, idle_secs={cfg.idle_secs}'
                 )
-                await self._on_starvation_warn(tid, summary=summary, detail=detail)
+                await self._callbacks.on_starvation_warn(tid, summary=summary, detail=detail)
                 self._streak_starvation.mark_escalated(tid)
 
     async def _resolve_starvation_escalation(self, task_id: str) -> None:
@@ -2458,8 +2458,8 @@ class Scheduler:
         failure can NEVER abort a successful dispatch (PROPERTY 1).
         """
         in_escalated = self._streak_starvation.is_escalated(task_id)
-        if in_escalated and self._on_starvation_resolve is not None:
-            await self._on_starvation_resolve(task_id)
+        if in_escalated and self._callbacks.on_starvation_resolve is not None:
+            await self._callbacks.on_starvation_resolve(task_id)
         # Unconditionally clear both dicts so no stale residue survives.
         self._streak_starvation.clear(task_id)
 
@@ -2472,8 +2472,8 @@ class Scheduler:
         ``StreakRegistry.gc`` already wraps this call in try/except, so no
         additional fail-safety is needed here.
         """
-        if self._on_starvation_resolve is not None:
-            await self._on_starvation_resolve(tid)
+        if self._callbacks.on_starvation_resolve is not None:
+            await self._callbacks.on_starvation_resolve(tid)
 
     async def _apply_warm_base_hard_down_watchdog(self) -> None:
         """Host-scoped warm-lane CoW base health latch (task 2061).
@@ -2534,14 +2534,14 @@ class Scheduler:
         """
         cfg = self.config.warm_base_hard_down
 
-        if not cfg.enabled or self._warm_base_health_probe is None:
+        if not cfg.enabled or self._callbacks.warm_base_health_probe is None:
             if self._warm_base_hard_down:
                 self._warm_base_hard_down = False
                 self._warm_base_hard_down_since = None
                 self._warm_base_l2_promoted = False
-                if self._on_warm_base_resolve is not None:
+                if self._callbacks.on_warm_base_resolve is not None:
                     try:
-                        await self._on_warm_base_resolve()
+                        await self._callbacks.on_warm_base_resolve()
                     except Exception:
                         logger.warning(
                             'warm-base resolve on watchdog-disable raised',
@@ -2550,7 +2550,7 @@ class Scheduler:
             return
 
         try:
-            health = await self._warm_base_health_probe()
+            health = await self._callbacks.warm_base_health_probe()
         except Exception:
             logger.warning(
                 'warm-base hard-down probe raised — holding current latch state',
@@ -2569,9 +2569,9 @@ class Scheduler:
                 self._warm_base_hard_down = False
                 self._warm_base_hard_down_since = None
                 self._warm_base_l2_promoted = False
-                if self._on_warm_base_resolve is not None:
+                if self._callbacks.on_warm_base_resolve is not None:
                     try:
-                        await self._on_warm_base_resolve()
+                        await self._callbacks.on_warm_base_resolve()
                     except Exception:
                         logger.warning(
                             'warm-base resolve on probe-recovery raised',
@@ -2587,7 +2587,7 @@ class Scheduler:
             self._warm_base_hard_down = True
             self._warm_base_hard_down_since = now
             self._warm_base_l2_promoted = False
-            if self._on_warm_base_warn is not None:
+            if self._callbacks.on_warm_base_warn is not None:
                 summary = (
                     'WARM_BASE_HARD_DOWN: warm-lane CoW seed base is absent — '
                     'halting dispatch host-wide (fail-open) until it is restored'
@@ -2604,7 +2604,7 @@ class Scheduler:
                     f'escalation follows if still absent after '
                     f'{cfg.l2_window_secs:.0f}s.'
                 )
-                await self._on_warm_base_warn(summary=summary, detail=detail)
+                await self._callbacks.on_warm_base_warn(summary=summary, detail=detail)
             return
 
         # Already latched & absent — check for L2 promotion (stuck past window).
@@ -2614,7 +2614,7 @@ class Scheduler:
             and (now - self._warm_base_hard_down_since) >= cfg.l2_window_secs
         ):
             self._warm_base_l2_promoted = True
-            if self._on_warm_base_promote_l2 is not None:
+            if self._callbacks.on_warm_base_promote_l2 is not None:
                 summary = (
                     'WARM_BASE_HARD_DOWN: still absent after '
                     f'{cfg.l2_window_secs:.0f}s — remediation appears stuck'
@@ -2627,7 +2627,7 @@ class Scheduler:
                     'cleared this latch via refresh_warm_base already).  '
                     'Human investigation required.'
                 )
-                await self._on_warm_base_promote_l2(summary=summary, detail=detail)
+                await self._callbacks.on_warm_base_promote_l2(summary=summary, detail=detail)
 
     async def update_task(
         self,

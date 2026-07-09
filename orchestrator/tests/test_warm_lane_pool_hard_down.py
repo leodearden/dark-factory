@@ -17,6 +17,7 @@ attributes do not exist yet — every test below fails with AttributeError.
 
 from __future__ import annotations
 
+import dataclasses
 from unittest.mock import AsyncMock
 
 import pytest

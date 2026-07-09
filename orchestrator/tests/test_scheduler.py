@@ -2,6 +2,7 @@
 
 
 import asyncio
+import dataclasses
 import time
 from datetime import UTC, datetime, timedelta
 from unittest.mock import AsyncMock, patch
@@ -10567,7 +10568,7 @@ class TestExternalDepResolverDegradedEscalation:
         TestExternalDepGateHeld_ResolverDegraded tests.
         """
         # Leave _on_external_dep_block as None (default).
-        assert scheduler._on_external_dep_block is None
+        assert scheduler._callbacks.on_external_dep_block is None
         task = self._pending_task()
 
         # Wire an event_store to verify the gate_held event is still emitted.
