@@ -379,3 +379,46 @@ class TestB4Contamination:
 
         # The sidecar is untouched by the commit.
         assert (meta / 'plan.json').exists()
+
+
+# ── B5 — survives cleaning ──────────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+class TestB5SurvivesCleaning:
+    """B5: `git clean -xfd` + `git checkout -f` run INSIDE the lane must
+    not touch the durable .lane-state record or the .task-meta artifacts —
+    both live outside the worktree as siblings of it.
+    """
+
+    async def test_lane_state_and_task_meta_survive_clean_and_checkout(
+        self, ig_git_repo: Path,
+    ):
+        repo = ig_git_repo
+        await _add_warm_lane_scripts(repo)
+        harness = _build_harness(_make_orch_config(repo))
+        _wire_recovery_scheduler(harness)
+
+        base = harness.git_ops.worktree_base
+        lane = await _acquire_lane(harness.git_ops, '42', await _get_head(repo))
+        meta = TaskArtifacts.meta_root_for(base, lane.name)
+        ta = TaskArtifacts(lane, meta)
+        ta.init('42', 'B5', 'd')
+        ta.write_plan(_make_plan(1, 2, '42'))
+
+        record_path = base / '.lane-state' / f'{lane.name}.json'
+        assert record_path.exists()
+
+        # Hostile clean INSIDE the lane.
+        await _run(['git', 'clean', '-xfd'], cwd=lane)
+        await _run(['git', 'checkout', '-f'], cwd=lane)
+
+        # Both siblings survive — they live outside the worktree.
+        assert record_path.exists()
+        rec = harness.git_ops._lane_lifecycle.read(lane)
+        assert rec is not None
+        assert rec.state == DurableLaneState.ASSIGNED
+        assert rec.task_id == '42'
+
+        assert (meta / 'plan.json').exists()
+        assert TaskArtifacts(lane, meta).read_plan()['steps']
