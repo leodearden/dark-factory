@@ -162,6 +162,7 @@ class TestConstructorInjectedHooksFire:
         scheduler.lock_table.try_acquire('seed', ['backend'])
         scheduler._dispatched.add('seed')
         scheduler.get_tasks = AsyncMock(return_value=[task])
+        scheduler.finish_startup()
 
         # Drive 3 ticks to accumulate skip_count >= skip_threshold (3).
         for _ in range(3):
