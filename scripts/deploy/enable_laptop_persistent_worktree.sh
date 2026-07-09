@@ -70,6 +70,19 @@ if ! "$PY" -c "import sys, yaml; yaml.safe_load(open(sys.argv[1]))" "$CONFIG" 2>
     exit 1
 fi
 
+key_present() {
+    grep -qE '^[[:space:]]*persistent_merge_worktree[[:space:]]*:' "$CONFIG"
+}
+
+git_anchor_present() {
+    grep -qE '^git:' "$CONFIG"
+}
+
+if ! key_present && ! git_anchor_present; then
+    echo "ERROR: refusing blind edit: ${CONFIG} has neither a persistent_merge_worktree key nor a top-level git: anchor" >&2
+    exit 1
+fi
+
 already_enabled() {
     "$PY" -c "
 import sys, yaml
