@@ -835,7 +835,7 @@ class TestMapAdvanceFailureConflictMarkers:
         assert outcome.reason is not None and 'conflict marker' in outcome.reason.lower(), (
             f'Expected a specific conflict-marker reason, got {outcome.reason!r}'
         )
-        assert outcome.reason != f"advance_main failed (conflict_markers) for task task-map-adv-markers", (
+        assert outcome.reason != 'advance_main failed (conflict_markers) for task task-map-adv-markers', (
             'Must not fall through to the generic catch-all reason text'
         )
 
