@@ -511,11 +511,17 @@ class TaskSteward:
         as ``resume_session_id`` when a prior session exists, and captures
         the result's ``session_id`` for the next call.
 
+        The steward is always a LIVE continuation, never a crash-recovery
+        resume: ``prompt`` (built by ``_handle_escalation``) carries the new
+        escalation's content, which the resumed session has not seen yet.
+        This passes ``resume_delivers_prompt=True`` so the shared loop
+        delivers that real prompt to the agent on resume, instead of its
+        crash-recovery placeholder ('continue').
+
         On an unresumable cap hit (no session_id survives the capped call),
         the shared loop calls back into ``rebuild_prompt`` below to rebuild
         the full initial prompt with freshly-gathered pending escalations —
-        context is lost across account switches, same as before this
-        refactor.
+        context is lost across account switches.
         """
         async def rebuild_prompt(session_lost: bool) -> str:
             pending_dicts = [
@@ -554,6 +560,7 @@ class TaskSteward:
             backend=self.config.backends.steward,
             max_cap_retries=_MAX_CAP_RETRIES,
             rebuild_prompt=rebuild_prompt,
+            resume_delivers_prompt=True,
             **kwargs,
         )
 
