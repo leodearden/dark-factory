@@ -371,6 +371,7 @@ class GraphitiBackend:
         driver = self._require_driver()
         return driver._get_graph(group_id)
 
+    @_canonicalize_group_args
     def _identity_lock_for(self, group_id: str) -> asyncio.Lock:
         """Return the per-group_id write-time-identity lock, creating it lazily.
 

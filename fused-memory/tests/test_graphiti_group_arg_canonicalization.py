@@ -105,6 +105,11 @@ class TestAddEpisodePropertyAgreement:
         mock_client = MagicMock()
         mock_client.add_episode = AsyncMock(return_value=None)
         b.client = mock_client
+        # add_episode routes via _client_for(group_id) (per-group client cache,
+        # task 2266). Point _client_for at the same mock so assertions on
+        # backend.client.add_episode still observe the call — mirrors
+        # tests/test_temporal_context.py's backend fixture.
+        b._client_for = MagicMock(return_value=mock_client)
         return b
 
     @pytest.mark.asyncio
@@ -306,3 +311,24 @@ class TestCompletenessSweep:
             f'{method_name}: expected no client calls before rejection, '
             f'got: {backend.client.method_calls!r}'
         )
+
+
+class TestIdentityLockKeyAgreement:
+    """_identity_lock_for: the write-time-identity LOCK KEY must canonicalize
+    so a replayed raw-hyphen durable-queue write and a normal canonical
+    write for the same project — both now landing in the same 'know_live'
+    graph — serialize under the SAME asyncio.Lock instance, instead of
+    racing on entity-name resolution under two different locks guarding one
+    graph.
+    """
+
+    def test_hyphen_and_canonical_share_the_same_lock(self, mock_config, make_backend):
+        backend = make_backend(mock_config)
+
+        assert backend._identity_lock_for('know-live') is backend._identity_lock_for('know_live')
+
+    def test_rejects_path_shaped_group_id(self, mock_config, make_backend):
+        backend = make_backend(mock_config)
+
+        with pytest.raises(PathShapedProjectIdError):
+            backend._identity_lock_for(_PATH_SHAPED)
