@@ -1812,7 +1812,9 @@ class GraphitiBackend:
               in milliseconds.
         """
         graphs = await self.list_graphs()
-        stats = {'graphs_scanned': 0, 'dup_name_groups': 0, 'edges_repaired': 0}
+        stats: dict[str, int | float] = {
+            'graphs_scanned': 0, 'dup_name_groups': 0, 'edges_repaired': 0,
+        }
         start = time.monotonic()
         for graph_name in graphs:
             stats['graphs_scanned'] += 1
