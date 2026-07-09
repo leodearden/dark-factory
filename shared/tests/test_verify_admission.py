@@ -14,6 +14,7 @@ import os
 import signal
 import subprocess
 import sys
+import threading
 import time
 
 
@@ -229,3 +230,82 @@ class TestRealProcessSignals:
         finally:
             sleeper.kill()
             sleeper.wait(timeout=5)
+
+
+class TestBlockingWait:
+    """N=1 blocking handoff via real thread concurrency.
+
+    The untimed poll loop's ``time.sleep`` + syscalls release the GIL, so a
+    worker thread genuinely blocks behind the main thread's held slot until
+    it releases -- this is the wait=True serialize signal.
+    """
+
+    def test_second_acquirer_blocks_until_first_releases(self, tmp_path):
+        from shared.verify_admission import acquire_task_slot
+
+        acquired_event = threading.Event()
+
+        def worker():
+            with acquire_task_slot('task', slots_dir=tmp_path, n=1, wait=True) as held:
+                if held:
+                    acquired_event.set()
+
+        with acquire_task_slot('task', slots_dir=tmp_path, n=1, wait=False) as main_held:
+            assert main_held is True
+
+            t = threading.Thread(target=worker)
+            t.start()
+
+            # Worker should still be blocked while main holds the only slot.
+            assert not acquired_event.wait(timeout=0.3)
+
+        # Main released -> the worker's poll loop should now pick up the slot.
+        t.join(timeout=5)
+        assert not t.is_alive()
+        assert acquired_event.is_set()
+
+
+class TestFailOpen:
+    """C-fail-open: missing dir / n<1 / any OSError -> held=False, never
+    blocks, never raises, never creates the directory.
+    """
+
+    def test_missing_slots_dir_yields_false_immediately_and_does_not_create_it(self, tmp_path):
+        """(a) A missing slots_dir fails open even with wait=True (no block,
+        no mkdir).
+        """
+        from shared.verify_admission import acquire_task_slot
+
+        missing = tmp_path / 'does-not-exist'
+        assert not missing.exists()
+
+        with acquire_task_slot('task', slots_dir=missing, n=1, wait=True) as held:
+            assert held is False
+
+        assert not missing.exists()
+
+    def test_n_zero_yields_false(self, tmp_path):
+        """(b) n=0 -> no slots to acquire -> held=False."""
+        from shared.verify_admission import acquire_task_slot
+
+        with acquire_task_slot('task', slots_dir=tmp_path, n=0, wait=False) as held:
+            assert held is False
+
+    def test_n_negative_yields_false(self, tmp_path):
+        """(b) n<0 -> held=False."""
+        from shared.verify_admission import acquire_task_slot
+
+        with acquire_task_slot('task', slots_dir=tmp_path, n=-1, wait=False) as held:
+            assert held is False
+
+    def test_slots_dir_is_a_regular_file_yields_false_never_raises(self, tmp_path):
+        """(c) slots_dir pointing at a regular file (not a directory) fails
+        open rather than propagating an OSError out of the context manager.
+        """
+        from shared.verify_admission import acquire_task_slot
+
+        not_a_dir = tmp_path / 'i-am-a-file'
+        not_a_dir.write_text('not a directory')
+
+        with acquire_task_slot('task', slots_dir=not_a_dir, n=1, wait=True) as held:
+            assert held is False
