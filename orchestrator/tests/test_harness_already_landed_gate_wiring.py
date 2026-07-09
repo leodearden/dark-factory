@@ -336,3 +336,28 @@ class TestAlreadyLandedDispatchGateContentEquivalence:
 
         assert result is False
         h._mark_in_progress_done.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+class TestAlreadyLandedDispatchGateInstall:
+    """Harness.__init__ wires scheduler._already_landed_gate to the bound method."""
+
+    async def test_scheduler_attribute_wired_to_bound_method(
+        self, mock_orch_config,
+    ) -> None:
+        """RED until step-12 installs the wiring in Harness.__init__.
+
+        Same bound-method equality idiom as
+        TestHarnessLandedDispatchGateInstall (task 2156) — a freshly-accessed
+        bound method is a new wrapper object each time, so ``==`` (not
+        ``is``) is the correct comparison; MagicMock retains the exact
+        object assigned during __init__, so this is a genuine RED
+        (unset/auto-vivified Mock != bound method) before Harness.__init__
+        wires the callable.
+        """
+        h = _build_harness(mock_orch_config)
+
+        assert h.scheduler._already_landed_gate == h._already_landed_dispatch_gate, (
+            'Harness must wire scheduler._already_landed_gate = '
+            'harness._already_landed_dispatch_gate after construction'
+        )
