@@ -24,6 +24,14 @@ if TYPE_CHECKING:
 
 _log = logging.getLogger(__name__)
 
+# task 2376: generous merge-pipeline result-wait ceiling that tolerates host
+# oversubscription; never-narrow — only replaces literals <=15 across the
+# merge-pipeline test files (test_merge_queue.py, test_merge_speculation.py,
+# test_concurrent_verify_boundary.py, test_merge_queue_resolve_release.py,
+# test_merge_queue_permit_conservation.py,
+# test_merge_queue_invariant_integration_gate.py).
+MERGE_RESULT_TIMEOUT = 45
+
 # Constants for the process lifetime — lifted out of pydantic_spec (task 1426)
 # to avoid re-computing BaseModel reflection on every call.
 _BASEMODEL_PROPS: frozenset[str] = frozenset(
