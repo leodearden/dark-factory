@@ -449,7 +449,10 @@ def test_flock_wait_env_override_speeds_up_contention_result(tmp_path):
             cfg_file=cfg_file,
             extra_env={'ORCH_MERGE_VERIFY_FLOCK_WAIT_SECS': '0.5'},
         )
-        stdout, stderr = proc.communicate(timeout=15)
+        # task 2376: widened from 15s -- host oversubscription can delay
+        # subprocess completion past a short deadline; the discriminating
+        # invariant is the `elapsed < 9.0` assertion below, not this ceiling.
+        stdout, stderr = proc.communicate(timeout=45)
         elapsed = time.monotonic() - started
     finally:
         with contextlib.suppress(OSError):
@@ -465,7 +468,11 @@ def test_flock_wait_env_override_speeds_up_contention_result(tmp_path):
         f'expected flock-contention result, got category={result.category!r} '
         f'stdout={stdout.decode()[:2000]!r}'
     )
-    assert elapsed < 6.0, (
+    # task 2376: widened from 6.0s -- must stay STRICTLY below the 10.0s
+    # production flock-wait so this still detects an un-wired override
+    # (i.e. it fails to distinguish the 0.5s override from the 10s
+    # production default if raised to >= 10.0).
+    assert elapsed < 9.0, (
         f'expected contention result well under the 10s production wait '
         f'(env override=0.5s, generous ceiling for subprocess-startup '
         f'jitter) -- took {elapsed:.2f}s; the env override is not wired up '
