@@ -1104,6 +1104,15 @@ class Scheduler:
         self.event_store = event_store
         self._mcp_session = mcp_session
         self._dispatched: set[str] = set()
+        # --- Workflow-cancel grace stamp (task 2235, relocated from Harness) ---
+        # Written by cancel_workflow/hard_cancel_workflow so a mid-run
+        # reconcile sweep does not race a workflow's finally-block teardown
+        # (park→deferred / restart→pending) for _RECONCILE_CANCEL_GRACE_S
+        # seconds after cancellation.  Lives beside _dispatched/lock_table
+        # (their single writer = the Scheduler).  Semantics mirror the
+        # harness's former _workflow_cancel_recent exactly.
+        self._workflow_cancel_at: dict[str, float] = {}
+        self._RECONCILE_CANCEL_GRACE_S: float = 30.0
         self._memory_url = config.fused_memory.url
         self._project_root = str(config.project_root)
         self._module_cache: dict[str, list[str]] = {}  # task_id -> expanded modules
@@ -5118,6 +5127,46 @@ class Scheduler:
     def is_dispatched(self, tid: str) -> bool:
         """True iff *tid* is currently held in the in-flight dispatched set."""
         return tid in self._dispatched
+
+    def note_workflow_cancelled(self, tid: str) -> None:
+        """Stamp *tid* as just-cancelled, opening the reconcile grace window."""
+        self._workflow_cancel_at[tid] = time.monotonic()
+
+    def clear_workflow_cancel(self, tid: str) -> None:
+        """Clear *tid*'s cancel stamp, if any (no-op if absent)."""
+        self._workflow_cancel_at.pop(tid, None)
+
+    def workflow_cancel_recent(self, tid: str) -> bool:
+        """Return True if *tid* has a workflow-cancel stamp within the grace window.
+
+        Semantics (mirrors the former Harness._workflow_cancel_recent exactly):
+          - No stamp (never cancelled / already pruned) → False.
+          - Stamp exists AND now - stamp < _RECONCILE_CANCEL_GRACE_S → True
+            (workflow's finally-block may still be writing state; skip).
+          - Stamp exists AND now - stamp >= grace → False (stale; re-filing
+            is safe — the stamp is lazily pruned by the sweep loop's next
+            mid-run cycle via clear_workflow_cancel).
+        """
+        cancelled_at = self._workflow_cancel_at.get(tid)
+        return (
+            cancelled_at is not None
+            and time.monotonic() - cancelled_at < self._RECONCILE_CANCEL_GRACE_S
+        )
+
+    def is_actively_held(self, tid: str) -> bool:
+        """True if *tid* is dispatched, holds a module lock, or was recently
+        cancelled (still inside the reconcile grace window).
+
+        The single public liveness check a reconcile sweep should use before
+        acting on a task — folds together the three liveness signals the
+        Scheduler owns so callers no longer reach into ``_dispatched`` /
+        ``lock_table._held`` / the cancel-grace stamp individually.
+        """
+        return (
+            tid in self._dispatched
+            or self.lock_table.is_held(tid)
+            or self.workflow_cancel_recent(tid)
+        )
 
     # --- Retry cap (per-task REQUEUED counter) ---
 
