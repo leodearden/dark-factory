@@ -477,3 +477,38 @@ def test_apply_does_not_touch_safety_valve_sibling(tmp_path):
     assert parsed.get("git", {}).get(SAFETY_VALVE_KEY) == 5, (
         f"Expected git.{SAFETY_VALVE_KEY} to remain 5, untouched; parsed={parsed!r}"
     )
+
+
+# ---------------------------------------------------------------------------
+# step-15: RED -- unknown-argument rejection + executable-bit requirement
+# ---------------------------------------------------------------------------
+
+def test_rejects_unknown_argument(tmp_path):
+    """An unrecognized argument exits non-zero, writes an error to stderr,
+    and performs no mutation/backup -- guards against silently widening the
+    accepted-argument set."""
+    config_path = tmp_path / "reify-laptop.yaml"
+    before_text = _fixture_laptop_config("unflipped")
+    config_path.write_text(before_text)
+
+    result = _run_script(config_path, "--bogus")
+
+    assert result.returncode != 0, (
+        f"Expected non-zero exit on an unrecognized argument; got 0\n"
+        f"stdout={result.stdout!r} stderr={result.stderr!r}"
+    )
+    assert result.stderr.strip(), (
+        f"Expected an error message on stderr; got stderr={result.stderr!r}"
+    )
+    assert _read_config(config_path) == before_text, "unknown arg must not mutate the config"
+    assert _backup_files(config_path) == [], "unknown arg must not create a backup"
+
+
+def test_script_is_executable():
+    """The working-tree script must carry the executable bit (mode 100755)
+    -- pins the os.X_OK requirement enforced by delta2's fused-memory
+    deterministic_task_guard at submit_task time for before_done.script."""
+    assert os.access(SCRIPT, os.X_OK), (
+        f"Expected {SCRIPT} to be executable (os.X_OK); it is not. "
+        f"Run: chmod +x {SCRIPT}"
+    )
