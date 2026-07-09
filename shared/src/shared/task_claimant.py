@@ -30,7 +30,29 @@ from datetime import UTC, datetime, timedelta
 from shared.task_statuses import TaskStatus
 from shared.timestamps import parse_timestamp_or_warn
 
-__all__ = ['is_stranded']
+__all__ = ['compose_claimant_run_id', 'is_stranded']
+
+
+def compose_claimant_run_id(run_id: str, session_id: str, owner_pid: int) -> str:
+    """Compose the ``claimant_run_id`` identity stamped at dispatch (task 2188 / omega1).
+
+    PRD ``plans/task-status-authority-prd.md`` contract C4 / decision D4: the
+    dispatch-time claimant write embeds three components so the resulting
+    string is unique per process-run and per workflow-session:
+
+    - ``run_id``: the orchestrator process's run id (``Harness._run_id``).
+    - ``session_id``: the workflow's per-task session id (``TaskWorkflow.session_id``).
+    - ``owner_pid``: ``os.getpid()`` — deliberately the *same* value that
+      ``artifacts.py`` records as ``plan.lock`` owner_pid, so this durable DB
+      field mirrors the existing plan.lock/``_pid_alive`` liveness signal and
+      W10 can cross-consume both without this module ripping out the
+      plan.lock forensics.
+
+    The format is a stable, greppable, labeled string:
+    ``f'{run_id}/{session_id}/pid={owner_pid}'``. This is the identity
+    consumed by :func:`is_stranded` via the ``claimant_run_id`` column.
+    """
+    return f'{run_id}/{session_id}/pid={owner_pid}'
 
 
 def is_stranded(task: Mapping, now: datetime, ttl: timedelta) -> bool:

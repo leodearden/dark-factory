@@ -39,6 +39,9 @@ class _Scheduler:
     async def set_task_status(self, tid, status, **_kw):
         self.statuses.setdefault(tid, []).append(status)
 
+    async def set_task_claimant(self, tid, **_kw):
+        pass
+
     async def get_status(self, tid):
         hist = self.statuses.get(tid, [])
         return hist[-1] if hist else None

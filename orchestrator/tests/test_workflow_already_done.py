@@ -51,6 +51,7 @@ def _make(
     config.max_amendment_rounds = 1
     config.lock_depth = 2
     config.steward_completion_timeout = 300.0
+    config.claimant_heartbeat_interval_secs = 60.0
     config.project_root = project_root
 
     set_task_status = AsyncMock()

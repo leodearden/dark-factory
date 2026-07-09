@@ -141,6 +141,52 @@ async def test_set_task_status_without_claimant_kwargs_omits_them_from_backend_c
 
 
 @pytest.mark.asyncio
+async def test_set_task_claimant_forwards_string_kwargs(interceptor, taskmaster):
+    """A string claimant_run_id/heartbeat_at is forwarded verbatim to the backend's
+    dedicated set_task_claimant (task 2188 step-3).
+    """
+    await interceptor.set_task_claimant(
+        '1', '/project',
+        claimant_run_id='run-x/session-y/pid=123',
+        heartbeat_at='2026-07-07T00:00:00+00:00',
+    )
+    taskmaster.set_task_claimant.assert_called_once()
+    kwargs = taskmaster.set_task_claimant.call_args.kwargs
+    assert kwargs.get('task_id') == '1'
+    assert kwargs.get('project_root') == '/project'
+    assert kwargs.get('claimant_run_id') == 'run-x/session-y/pid=123'
+    assert kwargs.get('heartbeat_at') == '2026-07-07T00:00:00+00:00'
+
+
+@pytest.mark.asyncio
+async def test_set_task_claimant_without_kwargs_omits_them_from_backend_call(
+    interceptor, taskmaster,
+):
+    """No claimant args supplied -> backend call carries neither kwarg, leaving the
+    backend's own _UNSET default (untouched) (task 2188 step-3).
+    """
+    await interceptor.set_task_claimant('1', '/project')
+    taskmaster.set_task_claimant.assert_called_once()
+    kwargs = taskmaster.set_task_claimant.call_args.kwargs
+    assert 'claimant_run_id' not in kwargs
+    assert 'heartbeat_at' not in kwargs
+
+
+@pytest.mark.asyncio
+async def test_set_task_claimant_explicit_none_forwards_as_none(interceptor, taskmaster):
+    """Explicit None clears the claimant -- forwarded as None (release), not omitted
+    (task 2188 step-3).
+    """
+    await interceptor.set_task_claimant('1', '/project', claimant_run_id=None, heartbeat_at=None)
+    taskmaster.set_task_claimant.assert_called_once()
+    kwargs = taskmaster.set_task_claimant.call_args.kwargs
+    assert 'claimant_run_id' in kwargs
+    assert kwargs['claimant_run_id'] is None
+    assert 'heartbeat_at' in kwargs
+    assert kwargs['heartbeat_at'] is None
+
+
+@pytest.mark.asyncio
 async def test_set_task_status_done_triggers_async_reconciliation(
     interceptor, reconciler, event_buffer
 ):

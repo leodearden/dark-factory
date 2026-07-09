@@ -200,6 +200,18 @@ def _resolve_backend_label(taskmaster: Any) -> str:
 _UNSET = object()
 
 
+def _maybe_kwargs(sentinel: object, **pairs: object) -> dict:
+    """Return only the *pairs* entries whose value is not *sentinel*.
+
+    Small shared shape for the tri-state (untouched / clear / set)
+    kwarg-forwarding pattern repeated below for claimant_run_id/heartbeat_at
+    (task 2188) — kept local to this module rather than shared with the
+    MCP-tools/scheduler layers, since each layer needs its own sentinel
+    (JSON cannot carry Python's ``_UNSET`` object across the wire).
+    """
+    return {k: v for k, v in pairs.items() if v is not sentinel}
+
+
 def _is_ticket_id(value: object) -> bool:
     """Return True when *value* looks like a two-phase ticket id (``tkt_…``)."""
     return isinstance(value, str) and value.startswith('tkt_')
@@ -981,11 +993,9 @@ class TaskInterceptor:
             # claimant_kwargs carries claimant_run_id/heartbeat_at only when
             # explicitly supplied (task 2182) — _UNSET params are omitted so
             # the default call stays byte-identical to every existing caller.
-            claimant_kwargs: dict[str, Any] = {}
-            if claimant_run_id is not _UNSET:
-                claimant_kwargs['claimant_run_id'] = claimant_run_id
-            if heartbeat_at is not _UNSET:
-                claimant_kwargs['heartbeat_at'] = heartbeat_at
+            claimant_kwargs: dict[str, Any] = _maybe_kwargs(
+                _UNSET, claimant_run_id=claimant_run_id, heartbeat_at=heartbeat_at,
+            )
             result: dict[str, Any] = dict(
                 await self._journal_around(
                     'set_task_status',
@@ -1036,6 +1046,34 @@ class TaskInterceptor:
             result['reconciliation'] = {'status': 'async', 'task_id': task_id}
 
         return result
+
+    # ── Claimant-only writes (no status-FSM gate) ───────────────────────
+
+    async def set_task_claimant(
+        self,
+        task_id: str,
+        project_root: str,
+        *,
+        claimant_run_id: str | None = _UNSET,  # type: ignore[assignment]
+        heartbeat_at: str | None = _UNSET,  # type: ignore[assignment]
+        tag: str | None = None,
+    ) -> dict:
+        """Stamp/refresh/clear claimant_run_id/heartbeat_at without touching status.
+
+        Thin delegate to the backend's dedicated ``set_task_claimant`` (task 2182)
+        — mirrors ``get_statuses``: no write-lock, no event emission, no
+        reconciliation. Tri-state preserved across the boundary: a string
+        stamps the column, explicit ``None`` clears it to NULL (release), and
+        the default ``_UNSET`` is omitted from the backend call entirely so
+        its own default takes over and the column is left untouched.
+        """
+        tm = await self._ensure_taskmaster()
+        claimant_kwargs: dict[str, Any] = _maybe_kwargs(
+            _UNSET, claimant_run_id=claimant_run_id, heartbeat_at=heartbeat_at,
+        )
+        return await tm.set_task_claimant(
+            task_id=task_id, project_root=project_root, tag=tag, **claimant_kwargs,
+        )
 
     # ── Curator helpers ────────────────────────────────────────────────
 

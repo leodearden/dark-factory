@@ -558,6 +558,37 @@ def _truncate_payload(payload: Any) -> tuple[Any, bool]:
     }, True
 
 
+# ---------------------------------------------------------------------------
+# Claimant wire sentinel (task 2188, PRD task-status-authority C4/D4)
+# ---------------------------------------------------------------------------
+# MCP arguments are JSON — there is no wire-safe way to distinguish "argument
+# omitted" from "argument explicitly null" other than a real (non-None)
+# default. This string sentinel plays that role for claimant_run_id/
+# heartbeat_at: the wire default means "leave untouched" (mapped to the
+# interceptor's own _UNSET), while JSON null (Python None) means "clear".
+#
+# RESERVED VALUE: '__unset__' is reserved and can never be stamped — a
+# caller that passed it literally as claimant_run_id would be silently
+# treated as "omitted" rather than stamped. This cannot happen today because
+# claimant_run_id is always machine-composed by
+# shared.task_claimant.compose_claimant_run_id() (format 'run/session/pid=N'),
+# never freeform text, but keep the reservation in mind before relaxing that
+# producer or introducing a new one.
+_CLAIMANT_WIRE_UNSET = '__unset__'
+
+
+def _maybe_kwargs(sentinel: object, **pairs: object) -> dict:
+    """Return only the *pairs* entries whose value is not *sentinel*.
+
+    Small shared shape for the tri-state (untouched / clear / set)
+    kwarg-forwarding pattern repeated below for claimant_run_id/heartbeat_at
+    (task 2188) — kept local to this module rather than shared with the
+    interceptor/scheduler layers, since each layer needs its own sentinel
+    (JSON cannot carry Python's ``_UNSET`` object across the wire).
+    """
+    return {k: v for k, v in pairs.items() if v is not sentinel}
+
+
 def create_mcp_server(
     memory_service: MemoryService,
     task_interceptor: TaskInterceptor | None = None,
@@ -2832,6 +2863,8 @@ def create_mcp_server(
         tag: str | None = None,
         done_provenance: dict | None = None,
         reopen_reason: str | None = None,
+        claimant_run_id: str | None = _CLAIMANT_WIRE_UNSET,  # type: ignore[assignment]
+        heartbeat_at: str | None = _CLAIMANT_WIRE_UNSET,  # type: ignore[assignment]
         agent_id: str | None = None,
         ctx: Context | None = None,
     ) -> dict[str, Any]:
@@ -2890,6 +2923,13 @@ def create_mcp_server(
                 'manual re-scope', 'reconciliation: re-implementation required'.
                 Persisted on the task as metadata.reopen_reason for audit.
                 Ignored for non-terminal transitions.
+            claimant_run_id: Orchestrator claimant identity (task 2188, PRD
+                task-status-authority C4/D4) to stamp atomically with this
+                status write — e.g. the dispatch-time pending->in-progress
+                transition. Omit (default) to leave the column untouched;
+                pass ``null`` explicitly to clear it.
+            heartbeat_at: Companion liveness timestamp for claimant_run_id,
+                same tri-state contract (omit = untouched, null = clear).
             agent_id: Which agent is writing (optional, auto-derived from MCP
                 context). Threaded into the transition-legality gate so it can
                 classify an actor (task 2175/rho1b).
@@ -2909,6 +2949,9 @@ def create_mcp_server(
                 ),
                 'error_type': 'ValidationError',
             }
+        claimant_kwargs: dict[str, Any] = _maybe_kwargs(
+            _CLAIMANT_WIRE_UNSET, claimant_run_id=claimant_run_id, heartbeat_at=heartbeat_at,
+        )
         try:
             return await task_interceptor.set_task_status(
                 task_id=id,
@@ -2918,11 +2961,62 @@ def create_mcp_server(
                 done_provenance=done_provenance,
                 reopen_reason=reopen_reason,
                 agent_id=agent_id,
+                **claimant_kwargs,
             )
         except (asyncio.CancelledError, KeyboardInterrupt, SystemExit):
             raise
         except Exception as e:
             logger.exception(f'set_task_status error: {e}')
+            return {'error': str(e), 'error_type': type(e).__name__}
+
+    @mcp.tool()
+    async def set_task_claimant(
+        id: str,
+        project_root: str,
+        tag: str | None = None,
+        claimant_run_id: str | None = _CLAIMANT_WIRE_UNSET,  # type: ignore[assignment]
+        heartbeat_at: str | None = _CLAIMANT_WIRE_UNSET,  # type: ignore[assignment]
+    ) -> dict[str, Any]:
+        """Stamp/refresh/clear claimant_run_id/heartbeat_at without touching status.
+
+        Thin pass-through to ``interceptor.set_task_claimant`` (task 2188, PRD
+        task-status-authority C4/D4): no status-FSM gate, no event emission,
+        no reconciliation. This is the orchestrator's status-untouching
+        counterpart to ``set_task_status`` — used for the periodic heartbeat
+        refresh and for clearing the claimant at task release, where a
+        repeated/terminal ``set_task_status`` write would be unsafe or
+        rejected.
+
+        Args:
+            id: Task ID
+            project_root: Absolute path to project root
+            tag: Tag context (optional)
+            claimant_run_id: Orchestrator claimant identity. Omit (default) to
+                leave the column untouched (e.g. a heartbeat-only refresh);
+                pass ``null`` explicitly to clear it (release).
+            heartbeat_at: Companion liveness timestamp for claimant_run_id,
+                same tri-state contract (omit = untouched, null = clear).
+        """
+        if err := _reject_if_ticket_id('id', id):
+            return err
+        _normalized = _normalize_project_root(project_root)
+        if isinstance(_normalized, dict):
+            return _normalized
+        project_root = _normalized
+        claimant_kwargs: dict[str, Any] = _maybe_kwargs(
+            _CLAIMANT_WIRE_UNSET, claimant_run_id=claimant_run_id, heartbeat_at=heartbeat_at,
+        )
+        try:
+            return await task_interceptor.set_task_claimant(
+                task_id=id,
+                project_root=project_root,
+                tag=tag,
+                **claimant_kwargs,
+            )
+        except (asyncio.CancelledError, KeyboardInterrupt, SystemExit):
+            raise
+        except Exception as e:
+            logger.exception(f'set_task_claimant error: {e}')
             return {'error': str(e), 'error_type': type(e).__name__}
 
     @mcp.tool()

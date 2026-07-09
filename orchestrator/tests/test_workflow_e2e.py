@@ -6293,7 +6293,11 @@ class TestMarkBlockedBypassDetection:
         # original so the finally block etc. can run undisturbed.
         original_set = scheduler.set_task_status
 
-        async def raising_set(task_id, status, *, done_provenance=None, reopen_reason=None):
+        async def raising_set(
+            task_id, status, *,
+            done_provenance=None, reopen_reason=None,
+            claimant_run_id=None, heartbeat_at=None,
+        ):
             if status == 'in-progress':
                 raise TerminalExitRejection(
                     task_id=task_id, old_status='cancelled',
@@ -6303,6 +6307,8 @@ class TestMarkBlockedBypassDetection:
                 task_id, status,
                 done_provenance=done_provenance,
                 reopen_reason=reopen_reason,
+                claimant_run_id=claimant_run_id,
+                heartbeat_at=heartbeat_at,
             )
 
         scheduler.set_task_status = raising_set  # type: ignore[method-assign]

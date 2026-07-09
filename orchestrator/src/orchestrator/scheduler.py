@@ -60,6 +60,27 @@ _TRANSIENT_BACKOFF_BASE: float = 1.5
 # journald while the per-tick dispatch_deferred event still fires every tick.
 _DISPATCH_DEFERRED_LOG_SECS: float = 180.0
 
+# Sentinel distinguishing "caller omitted this claimant kwarg" (default,
+# leave the wire argument absent) from "caller explicitly passed None"
+# (clear) on Scheduler.set_task_claimant (task 2188, PRD
+# task-status-authority C4/D4). A bare ``None`` default could not
+# distinguish these two cases since ``None`` IS the clear value.
+_CLAIMANT_ABSENT = object()
+
+
+def _maybe_kwargs(sentinel: object, **pairs: object) -> dict:
+    """Return only the *pairs* entries whose value is not *sentinel*.
+
+    Small shared shape for the tri-state (untouched / clear / set)
+    kwarg-forwarding pattern used by both ``set_task_status`` (sentinel
+    ``None``) and ``set_task_claimant`` (sentinel ``_CLAIMANT_ABSENT``)
+    below (task 2188) — kept local to this module rather than shared with
+    the interceptor/MCP-tools layers, since each layer needs its own
+    sentinel (JSON cannot carry Python's ``_UNSET`` object across the wire).
+    """
+    return {k: v for k, v in pairs.items() if v is not sentinel}
+
+
 logger = logging.getLogger(__name__)
 
 __all__ = [
@@ -1645,6 +1666,8 @@ class Scheduler:
         *,
         done_provenance: dict | None = None,
         reopen_reason: str | None = None,
+        claimant_run_id: str | None = None,
+        heartbeat_at: str | None = None,
     ) -> None:
         """Update task status via fused-memory.
 
@@ -1668,6 +1691,13 @@ class Scheduler:
         with exponential back-off; raise on persistent transient failure
         so callers (notably ``handle_blast_radius_expansion``) can decide
         whether to release locks.
+
+        ``claimant_run_id``/``heartbeat_at`` (task 2188, PRD
+        task-status-authority C4/D4) are forwarded only when the caller
+        supplies them — e.g. the dispatch-time pending->in-progress stamp —
+        so every existing caller's wire payload is unaffected. Injected into
+        ``arguments`` before the retry loop so a transient retry resends the
+        same claimant stamp rather than silently dropping it.
         """
         arguments: dict = {
             'id': task_id,
@@ -1678,6 +1708,9 @@ class Scheduler:
             arguments['done_provenance'] = done_provenance
         if reopen_reason is not None:
             arguments['reopen_reason'] = reopen_reason
+        arguments.update(_maybe_kwargs(
+            None, claimant_run_id=claimant_run_id, heartbeat_at=heartbeat_at,
+        ))
 
         # C3.2 (task 1620, β Pair E): action-teardown suppression guard.
         # When the Harness stamps _action_teardown_tasks for a task being killed
@@ -1798,6 +1831,54 @@ class Scheduler:
             f'set_task_status({task_id}, {status}) failed after '
             f'{_TRANSIENT_RETRIES} transient retries: {last_rejection}'
         )
+
+    async def set_task_claimant(
+        self,
+        task_id: str,
+        *,
+        claimant_run_id: str | None = _CLAIMANT_ABSENT,  # type: ignore[assignment]
+        heartbeat_at: str | None = _CLAIMANT_ABSENT,  # type: ignore[assignment]
+    ) -> None:
+        """Stamp/refresh/clear claimant_run_id/heartbeat_at without touching status.
+
+        Dedicated status-untouching path (task 2188, PRD
+        task-status-authority C4/D4) for the two write shapes that must NOT
+        go through ``set_task_status``: the periodic heartbeat refresh (a
+        repeated in-progress write would needlessly re-run the status-FSM
+        gate) and the release-time clear (a terminal task's status write
+        would hit the terminal-exit gate). Dispatches the dedicated
+        ``set_task_claimant`` MCP tool, which never gates on status.
+
+        Each kwarg is independently tri-state: omitting it leaves the
+        argument out of the wire payload entirely (server-side untouched),
+        while an explicit ``None`` is sent as JSON ``null`` (clear).  A bare
+        default of ``None`` could not express this distinction since
+        ``None`` is itself the clear value — see ``_CLAIMANT_ABSENT``.
+
+        Best-effort: any exception (including a raised transient MCP error,
+        or a rejection embedded in the response) is logged and swallowed.
+        Unlike ``set_task_status``, a lost heartbeat/clear does not strand
+        the caller — a missed refresh self-corrects on the next cadence
+        tick, and a missed clear self-heals (next heartbeat, or W10's
+        stranded-task sweep).
+        """
+        arguments: dict = {'id': task_id, 'project_root': self._project_root}
+        arguments.update(_maybe_kwargs(
+            _CLAIMANT_ABSENT, claimant_run_id=claimant_run_id, heartbeat_at=heartbeat_at,
+        ))
+        try:
+            response = await self.dispatch_tool('set_task_claimant', arguments, timeout=15)
+            rejection = extract_rejection(response)
+            if rejection is not None:
+                logger.warning(
+                    'set_task_claimant(%s) rejected by fused-memory: %s',
+                    task_id, rejection,
+                )
+        except Exception as e:
+            logger.warning(
+                'set_task_claimant(%s) failed (non-fatal, best-effort): %s: %s',
+                task_id, type(e).__name__, e,
+            )
 
     async def mark_done(
         self,

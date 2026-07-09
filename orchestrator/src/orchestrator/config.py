@@ -1580,6 +1580,13 @@ class OrchestratorConfig(BaseSettings):
         ),
     )
     requeue_cooldown_secs: float = Field(default=30.0)
+    # PRD plans/task-status-authority-prd.md contract C4/D4 (task 2188, omega1):
+    # cadence for TaskWorkflow's background claimant-heartbeat loop, which
+    # refreshes claimant_run_id/heartbeat_at on the dispatched task so
+    # shared.task_claimant.is_stranded() does not treat a still-live workflow
+    # as abandoned mid-phase (e.g. during one long execute-agent call).  Must
+    # stay comfortably below the (separate, W10-owned) stranded-ttl.
+    claimant_heartbeat_interval_secs: float = Field(default=60.0)
     # Per-task settle window applied after a dispatch when reconciliation or
     # steward signals are present (recon_reset_count > 1, steward_clear_at,
     # recon_stage2_blocked_at, or reopen_reason containing 'steward').  The
