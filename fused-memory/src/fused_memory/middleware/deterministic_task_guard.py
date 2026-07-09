@@ -34,7 +34,6 @@ from pathlib import Path
 from typing import Any
 
 from pydantic import ValidationError
-
 from shared.task_metadata import Milestone, parse_metadata
 
 __all__ = [
