@@ -46,6 +46,19 @@ if [[ ! -f "$CONFIG" ]]; then
     exit 1
 fi
 
+already_enabled() {
+    "$PY" -c "
+import sys, yaml
+d = yaml.safe_load(open(sys.argv[1])) or {}
+sys.exit(0 if (d.get('git') or {}).get('persistent_merge_worktree') is True else 1)
+" "$CONFIG"
+}
+
+if already_enabled; then
+    echo "enable-laptop-persistent-worktree: already enabled (no-op)"
+    exit 0
+fi
+
 tmp="$(mktemp "${CONFIG}.XXXXXX")"
 awk '
     $0 ~ "^[[:space:]]*persistent_merge_worktree[[:space:]]*:" { next }
@@ -59,11 +72,7 @@ awk '
 chmod --reference="$CONFIG" "$tmp"
 mv "$tmp" "$CONFIG"
 
-"$PY" -c "
-import sys, yaml
-d = yaml.safe_load(open(sys.argv[1])) or {}
-sys.exit(0 if (d.get('git') or {}).get('persistent_merge_worktree') is True else 1)
-" "$CONFIG" || {
+already_enabled || {
     echo "ERROR: ${CONFIG} did not read back git.persistent_merge_worktree: true after edit" >&2
     exit 1
 }
