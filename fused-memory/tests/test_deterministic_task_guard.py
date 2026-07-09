@@ -460,3 +460,306 @@ class TestInjectTaskKind:
             f'empty-string metadata must not emit a WARNING; got '
             f'{[r.message for r in warns]!r}'
         )
+
+
+# ---------------------------------------------------------------------------
+# δ (task 2337, step-1): metadata.milestone validation (deterministic_task_error)
+# ---------------------------------------------------------------------------
+
+
+class TestDeterministicTaskErrorMilestone:
+    """metadata.milestone validation via deterministic_task_error (PRD §6.1).
+
+    milestone is orthogonal to task_kind — allowed (and validated) on BOTH
+    'normal' and 'deterministic' tasks. mode='dated' requires a
+    datetime.fromisoformat-parseable 'at' (and no after_secs); mode='delayed'
+    requires a positive int 'after_secs' (and no 'at'). Delegates to the
+    shared.task_metadata.Milestone pydantic model.
+    """
+
+    # -- rejections ----------------------------------------------------
+
+    def test_delayed_without_after_secs_rejects(self):
+        """mode='delayed' with no after_secs → reject."""
+        result = deterministic_task_error(
+            'normal', {'milestone': {'mode': 'delayed'}}, '/proj',
+        )
+        assert result is not None
+        assert result.get('error_type') == 'ValidationError'
+
+    def test_dated_with_unparseable_at_rejects(self):
+        """mode='dated' with an unparseable at ('not-a-date') → reject."""
+        result = deterministic_task_error(
+            'normal', {'milestone': {'mode': 'dated', 'at': 'not-a-date'}}, '/proj',
+        )
+        assert result is not None
+        assert result.get('error_type') == 'ValidationError'
+
+    def test_dated_without_at_rejects(self):
+        """mode='dated' with no at → reject."""
+        result = deterministic_task_error(
+            'normal', {'milestone': {'mode': 'dated'}}, '/proj',
+        )
+        assert result is not None
+        assert result.get('error_type') == 'ValidationError'
+
+    def test_bogus_mode_rejects(self):
+        """mode='bogus' (invalid enum) → reject."""
+        result = deterministic_task_error(
+            'normal', {'milestone': {'mode': 'bogus'}}, '/proj',
+        )
+        assert result is not None
+        assert result.get('error_type') == 'ValidationError'
+
+    def test_after_secs_zero_rejects(self):
+        """after_secs=0 (non-positive) → reject."""
+        result = deterministic_task_error(
+            'normal', {'milestone': {'mode': 'delayed', 'after_secs': 0}}, '/proj',
+        )
+        assert result is not None
+        assert result.get('error_type') == 'ValidationError'
+
+    def test_after_secs_negative_rejects(self):
+        """after_secs=-1 (non-positive) → reject."""
+        result = deterministic_task_error(
+            'normal', {'milestone': {'mode': 'delayed', 'after_secs': -1}}, '/proj',
+        )
+        assert result is not None
+        assert result.get('error_type') == 'ValidationError'
+
+    def test_after_secs_non_int_rejects(self):
+        """after_secs='7d' (non-int) → reject."""
+        result = deterministic_task_error(
+            'normal', {'milestone': {'mode': 'delayed', 'after_secs': '7d'}}, '/proj',
+        )
+        assert result is not None
+        assert result.get('error_type') == 'ValidationError'
+
+    def test_milestone_as_bare_string_rejects(self):
+        """milestone as a non-dict (bare string) → TypeError-wrapped rejection."""
+        result = deterministic_task_error(
+            'normal', {'milestone': 'not-a-dict'}, '/proj',
+        )
+        assert result is not None
+        assert result.get('error_type') == 'ValidationError'
+
+    def test_milestone_as_list_rejects(self):
+        """milestone as a non-dict (list) → TypeError-wrapped rejection."""
+        result = deterministic_task_error(
+            'normal', {'milestone': ['a', 'b']}, '/proj',
+        )
+        assert result is not None
+        assert result.get('error_type') == 'ValidationError'
+
+    def test_malformed_milestone_via_json_string_metadata_rejects(self):
+        """Malformed milestone supplied via a JSON-string metadata is also rejected."""
+        meta_str = json.dumps({'milestone': {'mode': 'delayed'}})
+        result = deterministic_task_error('normal', meta_str, '/proj')
+        assert result is not None
+        assert result.get('error_type') == 'ValidationError'
+
+    # -- acceptance / orthogonality guards ------------------------------
+
+    def test_dated_valid_at_on_normal_task_accepts(self):
+        """mode='dated' with a valid ISO at, on a NORMAL task → accept."""
+        result = deterministic_task_error(
+            'normal',
+            {'milestone': {'mode': 'dated', 'at': '2026-08-01T00:00:00+00:00'}},
+            '/proj',
+        )
+        assert result is None
+
+    def test_delayed_valid_after_secs_on_deterministic_task_accepts(self):
+        """mode='delayed' with after_secs=604800 on a DETERMINISTIC task carrying
+        always_escalates=True → accept (milestone validated on both task_kinds,
+        without breaking the deterministic accept path)."""
+        result = deterministic_task_error(
+            'deterministic',
+            {
+                'always_escalates': True,
+                'milestone': {'mode': 'delayed', 'after_secs': 604800},
+            },
+            '/proj',
+        )
+        assert result is None
+
+
+# ---------------------------------------------------------------------------
+# δ (task 2337, step-3): predicate before_done validation (_validate_before_done)
+# ---------------------------------------------------------------------------
+
+
+class TestDeterministicTaskErrorPredicateBeforeDone:
+    """before_done.kind='predicate' validation (PRD §5 dec 7,8).
+
+    A predicate before_done has no unit to verify, so it FORBIDS a set
+    target_unit and FORBIDS always_escalates=True (predicate escalation is
+    conditional on rc != 0, not unconditional). Predicate structural checks
+    (script exists + executable, positive timeout_secs) still apply.
+    kind='deploy' (the default) is left byte-identical.
+    """
+
+    @staticmethod
+    def _make_script(tmp_path, name='check.sh'):
+        """tmp_path executable-script fixture, mirroring the before_done-structural tests."""
+        script = tmp_path / name
+        script.write_text('#!/bin/sh\nexit 0\n')
+        os.chmod(script, 0o755)
+        return script.name
+
+    # -- rejections ----------------------------------------------------
+
+    def test_predicate_with_target_unit_rejects(self, tmp_path):
+        """kind='predicate' with a set target_unit → reject, msg mentions target_unit."""
+        script_name = self._make_script(tmp_path)
+        result = deterministic_task_error(
+            'deterministic',
+            {
+                'before_done': {
+                    'kind': 'predicate',
+                    'script': script_name,
+                    'timeout_secs': 60,
+                    'target_unit': 'merge.service',
+                },
+            },
+            str(tmp_path),
+        )
+        assert result is not None
+        assert result.get('error_type') == 'ValidationError'
+        assert 'target_unit' in result['error']
+
+    def test_predicate_with_always_escalates_true_rejects(self, tmp_path):
+        """kind='predicate' with top-level always_escalates=True → reject, msg mentions always_escalates."""
+        script_name = self._make_script(tmp_path)
+        result = deterministic_task_error(
+            'deterministic',
+            {
+                'always_escalates': True,
+                'before_done': {
+                    'kind': 'predicate',
+                    'script': script_name,
+                    'timeout_secs': 60,
+                },
+            },
+            str(tmp_path),
+        )
+        assert result is not None
+        assert result.get('error_type') == 'ValidationError'
+        assert 'always_escalates' in result['error']
+
+    def test_predicate_nonexistent_script_rejects(self, tmp_path):
+        """Predicate structural checks still apply: non-existent script → reject."""
+        result = deterministic_task_error(
+            'deterministic',
+            {
+                'before_done': {
+                    'kind': 'predicate',
+                    'script': 'does_not_exist.sh',
+                    'timeout_secs': 60,
+                },
+            },
+            str(tmp_path),
+        )
+        assert result is not None
+        assert result.get('error_type') == 'ValidationError'
+
+    def test_predicate_missing_timeout_rejects(self, tmp_path):
+        """Predicate structural checks still apply: no timeout_secs → reject."""
+        script_name = self._make_script(tmp_path)
+        result = deterministic_task_error(
+            'deterministic',
+            {'before_done': {'kind': 'predicate', 'script': script_name}},
+            str(tmp_path),
+        )
+        assert result is not None
+        assert result.get('error_type') == 'ValidationError'
+
+    # -- acceptance / deploy regression ---------------------------------
+
+    def test_well_formed_predicate_accepts(self, tmp_path):
+        """kind='predicate' with a valid script, timeout_secs, no target_unit,
+        no always_escalates → accept."""
+        script_name = self._make_script(tmp_path)
+        result = deterministic_task_error(
+            'deterministic',
+            {
+                'before_done': {
+                    'kind': 'predicate',
+                    'script': script_name,
+                    'timeout_secs': 120,
+                },
+            },
+            str(tmp_path),
+        )
+        assert result is None
+
+    def test_deploy_with_target_unit_still_accepts(self, tmp_path):
+        """DEPLOY regression: default-kind before_done WITH target_unit still accepted
+        (deploy allows target_unit — kind='deploy' behaviour stays byte-identical)."""
+        script_name = self._make_script(tmp_path)
+        result = deterministic_task_error(
+            'deterministic',
+            {
+                'before_done': {
+                    'script': script_name,
+                    'timeout_secs': 60,
+                    'target_unit': 'foo.service',
+                },
+            },
+            str(tmp_path),
+        )
+        assert result is None
+
+    def test_deploy_with_always_escalates_true_still_accepts(self, tmp_path):
+        """DEPLOY regression: deploy before_done + always_escalates=True
+        (existing act-then-ask preset) still accepted."""
+        script_name = self._make_script(tmp_path)
+        result = deterministic_task_error(
+            'deterministic',
+            {
+                'always_escalates': True,
+                'before_done': {'script': script_name, 'timeout_secs': 60},
+            },
+            str(tmp_path),
+        )
+        assert result is None
+
+    # -- kind enum validation --------------------------------------------
+
+    def test_unknown_kind_rejects(self, tmp_path):
+        """before_done.kind must be one of {'deploy', 'predicate'} — an
+        unrecognized value (e.g. a typo) is rejected at the guard boundary
+        rather than silently falling through as if it were 'deploy'."""
+        script_name = self._make_script(tmp_path)
+        result = deterministic_task_error(
+            'deterministic',
+            {
+                'before_done': {
+                    'kind': 'gate',
+                    'script': script_name,
+                    'timeout_secs': 60,
+                },
+            },
+            str(tmp_path),
+        )
+        assert result is not None
+        assert result.get('error_type') == 'ValidationError'
+        assert 'kind' in result['error']
+
+    def test_explicit_deploy_kind_accepts(self, tmp_path):
+        """kind='deploy' set explicitly (not just omitted) is still accepted,
+        including alongside target_unit (deploy allows it)."""
+        script_name = self._make_script(tmp_path)
+        result = deterministic_task_error(
+            'deterministic',
+            {
+                'before_done': {
+                    'kind': 'deploy',
+                    'script': script_name,
+                    'timeout_secs': 60,
+                    'target_unit': 'foo.service',
+                },
+            },
+            str(tmp_path),
+        )
+        assert result is None
