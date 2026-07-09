@@ -601,3 +601,58 @@ class TestB5AttributionUnderProbeInFlightSkew:
     async def test_probe_in_flight_skew_does_not_skew_lease_or_attribution(self):
         gate = make_boundary_gate(['acct-0', 'acct-1'])
         await _assert_probe_in_flight_skew_does_not_skew_attribution(gate)
+
+
+# ---------------------------------------------------------------------------
+# B6 -- InvokeSlot.report() applies its matching gate transition AND settles
+# the slot atomically (producer side), so invoke_slot()'s __aexit__ safety
+# net never double-releases/re-transitions once report() has already run.
+# When the invoked fn raises BEFORE report() ever gets a chance to run at
+# all, that SAME __aexit__ safety net still releases the claimed probe slot
+# on the exception exit path (consumer side).
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestB6ReportAtomicity:
+    """InvokeSlot.report() applies its matching gate transition and settles
+    the slot atomically -- so invoke_slot()'s __aexit__ safety net never
+    double-releases/re-transitions once report() has run, and still
+    releases the claimed probe slot when the invoked fn raises before
+    report() ever gets a chance to run at all."""
+
+    async def test_report_settles_and_transitions_atomically(self):
+        gate = make_boundary_gate(['acct-a'])
+        acct = gate._accounts[0]
+        gate._transition(acct, AccountPhase.CAPPED)
+        gate._transition(acct, AccountPhase.PROBING)
+
+        async with gate.invoke_slot() as slot:
+            assert acct.phase == AccountPhase.PROBE_IN_FLIGHT  # claimed on entry
+            slot.report(CapHit(resets_at=None, reason='x'))
+            assert slot._settled is True
+            assert acct.phase == AccountPhase.CAPPED
+
+        # Producer side: __aexit__ found the slot already settled and did
+        # NOT double-release/re-transition -- the CAPPED verdict from
+        # report() stands untouched.
+        assert acct.phase == AccountPhase.CAPPED
+
+    async def test_exception_before_report_still_releases_probe_slot(self):
+        gate = make_boundary_gate(['acct-0', 'acct-1'])
+        probing_acct = gate._accounts[0]
+        gate._transition(probing_acct, AccountPhase.CAPPED)
+        gate._transition(probing_acct, AccountPhase.PROBING)
+
+        with pytest.raises(RuntimeError, match='boom'):
+            with patch('shared.cli_invoke.asyncio.sleep', new_callable=AsyncMock):
+                await invoke_with_cap_retry(
+                    gate, 'B6[exception]',
+                    invoke_fn=scripted_cli(RuntimeError('boom')),
+                    backend='claude',
+                    prompt='hi',
+                )
+
+        # Consumer side: the exception propagated (not swallowed), and the
+        # account is not left stuck in PROBE_IN_FLIGHT.
+        await _assert_probe_released_after_exception(gate, probing_acct)
