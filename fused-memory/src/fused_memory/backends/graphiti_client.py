@@ -273,6 +273,25 @@ class GraphitiBackend:
         (small, fixed) number of projects, not by request volume. If
         *group_id* ever becomes an ephemeral/per-session value, this cache
         would need a size bound or LRU eviction.
+
+        Each per-group client is constructed with its own
+        ``max_coroutines=self.config.queue.graphiti_max_coroutines``. This
+        does NOT raise the aggregate OpenAI concurrency ceiling versus the
+        prior single-shared-client design: graphiti_core's
+        ``semaphore_gather`` (graphiti_core/helpers.py) builds a brand-new
+        ``asyncio.Semaphore(max_coroutines)`` on every invocation rather than
+        reusing one stored on the client, so ``max_coroutines`` was always a
+        per-call fan-out bound (scoped to a single ``add_episode``/etc.
+        invocation's internal LLM/embedding sub-tasks), never a budget
+        shared across concurrent top-level calls — even under the old
+        shared-client design, two concurrent ``add_episode`` calls already
+        raced with two independent semaphores, not one. The real
+        cross-group aggregate ceiling is, and remains, governed one level up
+        by ``DurableWriteQueue``'s ``semaphore_limit`` (bounding how many
+        top-level ``add_episode`` calls run concurrently) multiplied by
+        ``graphiti_max_coroutines`` (each call's own internal fan-out) — by
+        default 3 × 5 = 15 concurrent OpenAI calls at most, unchanged by
+        this per-group cache.
         """
         cached = self._group_clients.get(group_id)
         if cached is not None:
@@ -703,13 +722,33 @@ class GraphitiBackend:
         }
 
     async def build_communities(self, group_ids: list[str] | None = None) -> None:
-        """Build community summaries."""
+        """Build community summaries.
+
+        FalkorDB's multi-tenant model gives each group_id its own physical
+        graph, reachable only through that group's own driver
+        (``_driver_for``) — a single upstream call can target just one
+        driver/graph. Forwarding the full *group_ids* list through against
+        only the first group's driver would silently scope (or entirely
+        skip) communities for the remaining groups, so when more than one
+        group_id is requested each is built via its own call against its
+        own driver. ``group_ids=None``/empty preserves the pre-existing
+        whole-graph fallback (no driver override — upstream falls back to
+        the shared client's current driver).
+        """
         client = self._require_client()
-        driver = self._driver_for(group_ids[0]) if group_ids else None
-        await asyncio.wait_for(
-            client.build_communities(group_ids=group_ids, driver=driver),
-            timeout=self._write_timeout,
-        )
+        if not group_ids:
+            await asyncio.wait_for(
+                client.build_communities(group_ids=group_ids, driver=None),
+                timeout=self._write_timeout,
+            )
+            return
+        for group_id in group_ids:
+            await asyncio.wait_for(
+                client.build_communities(
+                    group_ids=[group_id], driver=self._driver_for(group_id)
+                ),
+                timeout=self._write_timeout,
+            )
 
     async def query_stale_node_embeddings(
         self, expected_dim: int, *, group_id: str

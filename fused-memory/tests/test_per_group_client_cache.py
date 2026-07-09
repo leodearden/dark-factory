@@ -12,8 +12,11 @@ equals group_id and the upstream mutation branch is never taken.
   to instance attrs (step-1/2).
 - GraphitiBackend._client_for(group_id): per-group cached Graphiti client (step-3/4).
 - GraphitiBackend.add_episode routing through _client_for + concurrency isolation (step-5/6).
-- GraphitiBackend.build_communities passing the per-group driver (step-7/8).
+- GraphitiBackend.build_communities passing the per-group driver (step-7/8),
+  including looping per group_id when more than one is requested (amendment).
 - GraphitiBackend.close() accounting for per-group clients (step-9/10).
+- GraphitiBackend.initialize()'s reranker config guard falling back to
+  config=None when providers.openai is absent/keyless (amendment).
 """
 from __future__ import annotations
 
@@ -221,6 +224,47 @@ class TestBuildCommunitiesPassesDriver:
         _, kwargs = backend.client.build_communities.await_args
         assert kwargs.get('group_ids') == ['A']
         assert kwargs.get('driver') is da
+
+    @pytest.mark.asyncio
+    async def test_build_communities_none_group_ids_uses_whole_graph_fallback(
+        self, mock_config, make_backend,
+    ):
+        """group_ids=None must preserve the pre-existing whole-graph
+        fallback: one call, no driver override."""
+        backend = make_backend(mock_config)
+        backend.client.build_communities = AsyncMock()
+
+        await backend.build_communities(group_ids=None)
+
+        backend.client.build_communities.assert_awaited_once_with(
+            group_ids=None, driver=None,
+        )
+
+    @pytest.mark.asyncio
+    async def test_build_communities_loops_per_group_with_own_driver(
+        self, mock_config, make_backend,
+    ):
+        """More than one group_id must NOT be forwarded as a single call
+        pinned to the first group's driver — each FalkorDB graph is a
+        distinct physical database reachable only through its own driver,
+        so a single call would silently scope (or skip) communities for
+        every group but the first."""
+        backend = make_backend(mock_config)
+        backend.client.build_communities = AsyncMock()
+
+        da = backend._driver_for('A')
+        db = backend._driver_for('B')
+        await backend.build_communities(group_ids=['A', 'B'])
+
+        assert backend.client.build_communities.await_count == 2
+        calls_by_group = {
+            call.kwargs['group_ids'][0]: call.kwargs
+            for call in backend.client.build_communities.await_args_list
+        }
+        assert calls_by_group == {
+            'A': {'group_ids': ['A'], 'driver': da},
+            'B': {'group_ids': ['B'], 'driver': db},
+        }
 
 
 # ---------------------------------------------------------------------------
