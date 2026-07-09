@@ -42,11 +42,16 @@ def _fixture_laptop_config(state="unflipped"):
     targeted key.
 
     state:
-      "unflipped" - git.persistent_merge_worktree: false present (default;
-                    mirrors defaults.yaml's shipped default).
-      "flipped"   - git.persistent_merge_worktree: true already present.
-      "malformed" - deliberately-malformed YAML (unterminated flow
-                    sequence under git:); must not parse.
+      "unflipped"     - git.persistent_merge_worktree: false present (default;
+                        mirrors defaults.yaml's shipped default).
+      "flipped"       - git.persistent_merge_worktree: true already present.
+      "malformed"     - deliberately-malformed YAML (unterminated flow
+                        sequence under git:); must not parse.
+      "no_key"        - git: block present with its usual siblings, but NO
+                        persistent_merge_worktree key at all (insert-as-
+                        first-child case).
+      "no_git_anchor" - neither the key nor any top-level git: block is
+                        present at all (refuse-blind-edit case).
     """
     if state == "malformed":
         return (
@@ -61,9 +66,17 @@ def _fixture_laptop_config(state="unflipped"):
             "other_top_level_key: true\n"
         )
 
+    if state == "no_git_anchor":
+        return (
+            "concurrent_verify: false\n"
+            "\n"
+            "other_top_level_key: true\n"
+        )
+
     key_line = {
         "unflipped": f"  {KEY}: false\n",
         "flipped": f"  {KEY}: true\n",
+        "no_key": "",
     }[state]
 
     return (
@@ -350,4 +363,73 @@ def test_apply_creates_backup_with_preedit_contents(tmp_path):
     assert backups_after_second == backups_after_first, (
         f"Expected no additional backup from the no-op second run; "
         f"before={backups_after_first} after={backups_after_second}"
+    )
+
+
+# ---------------------------------------------------------------------------
+# step-11: RED -- structural cases: insert-when-key-absent, and refuse a
+# blind edit when there is no git: anchor to insert under.
+# ---------------------------------------------------------------------------
+
+def test_apply_inserts_key_as_first_child_when_git_block_has_no_key(tmp_path):
+    """apply on a config whose git: block exists but has no
+    persistent_merge_worktree key inserts `persistent_merge_worktree: true`
+    as the first child of git: (immediately after the git: line), exits 0,
+    reads back True, and leaves the other git: children untouched."""
+    config_path = tmp_path / "reify-laptop.yaml"
+    config_path.write_text(_fixture_laptop_config("no_key"))
+
+    result = _run_script(config_path)
+
+    assert result.returncode == 0, (
+        f"Expected exit 0 inserting into a keyless git: block; got {result.returncode}\n"
+        f"stdout={result.stdout!r} stderr={result.stderr!r}"
+    )
+
+    config_text = _read_config(config_path)
+    lines = config_text.splitlines()
+    git_index = lines.index("git:")
+    assert lines[git_index + 1].strip() == f"{KEY}: true", (
+        f"Expected {KEY}: true as the first child immediately after git:; got:\n{config_text}"
+    )
+
+    for other in (
+        'main_branch: "main"',
+        'branch_prefix: "task/"',
+        'remote: "origin"',
+        'worktree_dir: ".worktrees"',
+        f"{SAFETY_VALVE_KEY}: 5",
+    ):
+        assert other in config_text, (
+            f"Expected untouched sibling {other!r} to survive the insert; got:\n{config_text}"
+        )
+
+    parsed = _parsed(config_path)
+    assert parsed.get("git", {}).get(KEY) is True, (
+        f"Expected git.{KEY} to read back True; parsed={parsed!r}"
+    )
+
+
+def test_apply_refuses_blind_edit_when_no_git_anchor(tmp_path):
+    """apply on a config with NEITHER the key NOR any top-level git: anchor
+    fails loudly (non-zero exit, stderr error) instead of silently
+    succeeding, and makes no mutation and creates no backup."""
+    config_path = tmp_path / "reify-laptop.yaml"
+    before_text = _fixture_laptop_config("no_git_anchor")
+    config_path.write_text(before_text)
+
+    result = _run_script(config_path)
+
+    assert result.returncode != 0, (
+        f"Expected non-zero exit when neither the key nor a git: anchor exists; got 0\n"
+        f"stdout={result.stdout!r} stderr={result.stderr!r}"
+    )
+    assert result.stderr.strip(), (
+        f"Expected an error message on stderr; got stderr={result.stderr!r}"
+    )
+    assert _read_config(config_path) == before_text, (
+        "Refused blind edit must not mutate the config"
+    )
+    assert _backup_files(config_path) == [], (
+        "Refused blind edit must not create a backup"
     )
