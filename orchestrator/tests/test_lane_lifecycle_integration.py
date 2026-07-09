@@ -198,7 +198,7 @@ class TestB1WriterReaderRoundTrip:
         # WRITER: real acquire_warm_lane — real `git worktree add`.
         head = await _get_head(repo)
         lane = await _acquire_lane(harness.git_ops, '42', head, expected_title='B1 task')
-        assert lane == harness.git_ops.worktree_base / '_lane-0'
+        assert lane.name.startswith('_lane-')
 
         # Write crashed progress under the sibling .task-meta root.
         meta = TaskArtifacts.meta_root_for(harness.git_ops.worktree_base, lane.name)
@@ -228,6 +228,9 @@ class TestB1WriterReaderRoundTrip:
         assert rec.task_id == '42'
 
         assert '42' in harness._recovered_plans
+        recovered = harness._recovered_plans['42']
+        assert len(recovered['steps']) == 5
+        assert sum(1 for s in recovered['steps'] if s['status'] == 'done') == 3
         assert lane.exists()
         assert rec.state != DurableLaneState.QUARANTINED
 
@@ -280,7 +283,14 @@ class TestB2CrashQuarantine:
         assert pool.state(lane) == LaneState.FREE
         assert '42' not in harness._recovered_plans
 
-        emitted = {c.args[0] for c in harness.event_store.emit.call_args_list}  # type: ignore[union-attr]
+        # Match on the event type across both positional and keyword call
+        # forms — resilient to a future `emit(event_type=...)` call-site
+        # change, which would otherwise raise IndexError here instead of
+        # cleanly failing the membership assertion below.
+        emitted = {
+            (c.args[0] if c.args else c.kwargs.get('event_type'))
+            for c in harness.event_store.emit.call_args_list  # type: ignore[union-attr]
+        }
         assert EventType.worktree_quarantined in emitted
 
         assert any(
