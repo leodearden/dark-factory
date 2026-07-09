@@ -8034,12 +8034,12 @@ Update the plan to address the blocking issues. You may add new steps to the `st
         human-judgement/infra cases and must NOT receive a proposal — leave
         their callers with spawn_dry_run=False (the default).
         """
-        if self.state == WorkflowState.DONE:
+        if self.machine.is_terminal():
             logger.warning(
-                'Task %s: already DONE, ignoring late blocked transition: %s',
-                self.task_id, reason,
+                'Task %s: already %s, ignoring late blocked transition: %s',
+                self.task_id, self.state.value, reason,
             )
-            return WorkflowOutcome.DONE
+            return WorkflowOutcome(self.state.value)
         # Capture the phase we were in before transitioning to BLOCKED so the
         # harness-level retry cap can report *which* phase looped.  _enter_phase
         # overwrites self.state, so stash first.

@@ -263,17 +263,19 @@ class TestTaskWorkflowStateMachineWiring:
 
 @pytest.mark.asyncio
 class TestMarkBlockedTerminalAbsorption:
-    """``_mark_blocked`` terminal-absorption guard (step-7/8): must be a
-    no-op for ANY terminal ``WorkflowState``, not just DONE.
+    """``_mark_blocked``'s terminal-absorption guard must be a no-op for
+    ANY terminal ``WorkflowState`` (sourced from ``machine.is_terminal()``),
+    not just DONE.
     """
 
     async def test_mark_blocked_after_cancelled_returns_cancelled(self):
         """New generalization — CANCELLED is absorbing too, not just DONE.
 
-        Currently RED: the pre-step-8 guard only checks
-        ``WorkflowState.DONE``, so this falls through to
-        ``_enter_phase(WorkflowState.BLOCKED)``, which raises
-        ``IllegalTransition`` (CANCELLED is absorbing per the machine).
+        Pre-step-8, the guard only checked ``WorkflowState.DONE``, so this
+        fell through to ``_enter_phase(WorkflowState.BLOCKED)``, which
+        raised ``IllegalTransition`` (CANCELLED is absorbing per the
+        machine). The guard now sources absorption from
+        ``machine.is_terminal()``, which covers both.
         """
         wf, scheduler = _make_workflow()
         wf.state = WorkflowState.CANCELLED
