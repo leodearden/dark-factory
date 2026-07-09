@@ -1032,6 +1032,17 @@ class TaskCurator:
         if cached is not None:
             return cached
 
+        # Operational-ask registry (filing-policy gate) short-circuit — runs AFTER
+        # the blocklist/premise drops, exact-match dedup, and idempotency cache so
+        # a re-filed DUPLICATE operational ask is caught by one of those and
+        # drops/combines into the existing gate instead of spawning a second one.
+        # Only a genuinely-new operational ask reaches here, and it short-circuits
+        # the ZOT breaker/corpus/LLM entirely. Deliberately not cached (see
+        # _maybe_route_deterministic).
+        route_decision = await self._maybe_route_deterministic(candidate, payload_hash)
+        if route_decision is not None:
+            return route_decision
+
         # Zero-output-timeout circuit breaker — gate BEFORE corpus build + LLM.
         # Only the 180s LLM call (and the corpus build that precedes it) is the
         # cost the breaker exists to avoid; cheap cache checks above run always.
