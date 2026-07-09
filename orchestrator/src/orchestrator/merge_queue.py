@@ -6818,13 +6818,14 @@ class SpeculativeMergeWorker(_WipHaltMixin):
         shutdown = MergeOutcome('blocked', reason=MERGE_WORKER_SHUTDOWN_REASON)
         # Release speculation-depth permits, all lane halts, and merge-ahead cap
         # so the merger doesn't hang waiting at any synchronisation point.
-        # Over-releasing a plain Semaphore is safe (it just increments the counter).
-        for _ in range(self._speculation_depth + 1):
-            self._speculation_slot.release()
+        # θ (task 2161): routed through each ledger's release_for_shutdown(),
+        # which over-releases the wrapped semaphore directly without touching
+        # `live` -- the same over-release-is-safe shutdown valve as before,
+        # now the sole acquire/release surface for both semaphores (P-2).
+        self._speculation_ledger.release_for_shutdown(self._speculation_depth + 1)
         for ln in MERGE_LANES:
             self._lane_halt[ln].set()
-        for _ in range(self._speculation_depth + 1):
-            self._merge_ahead_cap.release()
+        self._merge_ahead_ledger.release_for_shutdown(self._speculation_depth + 1)
 
         # Drain per-lane buffers (items already removed from _queue by the merger)
         # Intentionally mutates _lane_buffers directly (not via
