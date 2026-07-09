@@ -89,7 +89,8 @@ block.
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Any, Callable, Generic, Protocol, TypeVar
+from collections.abc import Callable
+from typing import TYPE_CHECKING, Any, Generic, Protocol, TypeVar
 
 from orchestrator.merge_types import SpecPermit
 
