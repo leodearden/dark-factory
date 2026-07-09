@@ -327,3 +327,55 @@ class TestB3IllegalTransitionEscalates:
         assert esc.agent_role == ESCALATION_SENTINEL_ROLE
         assert esc.level == 2
         assert esc.severity in BORN_AT_L2_SEVERITIES
+
+
+# ── B4 — hostile `git add -A` stages ZERO task-meta (STRUCTURAL) ───────
+
+
+@pytest.mark.asyncio
+class TestB4Contamination:
+    """B4 (load-bearing): a hostile agent runs raw `git add -A && git
+    commit` directly in the lane, deliberately bypassing GitOps.commit()
+    (and every scrub guard it runs). The commit must stage ZERO task-meta
+    paths — contamination prevention here is STRUCTURAL (the .task-meta
+    sidecar lives OUTSIDE the worktree), not guard-defended, so this must
+    keep passing after task theta later deletes the scrub guards.
+    """
+
+    async def test_hostile_add_all_stages_zero_task_meta(self, ig_git_repo: Path):
+        repo = ig_git_repo
+        await _add_warm_lane_scripts(repo)
+        harness = _build_harness(_make_orch_config(repo))
+        _wire_recovery_scheduler(harness)
+
+        lane = await _acquire_lane(harness.git_ops, '42', await _get_head(repo))
+        meta = TaskArtifacts.meta_root_for(harness.git_ops.worktree_base, lane.name)
+        ta = TaskArtifacts(lane, meta)
+        ta.init('42', 'B4', 'd')
+        ta.write_plan(_make_plan(1, 2, '42'))
+        ta.append_iteration_log({'k': 1})
+
+        # Metadata lives OUTSIDE the worktree. `<lane>/.task` itself may
+        # still exist (acquire's _ensure_task_gitignore defense-in-depth
+        # guard unconditionally drops a `.task/.gitignore` there — an
+        # unrelated, pre-relocation scrub guard) but must hold no metadata:
+        # TaskArtifacts was pointed at the sibling `meta` root, never at
+        # `<lane>/.task`.
+        assert (meta / 'plan.json').exists()
+        assert not (lane / '.task' / 'plan.json').exists()
+        assert not (lane / '.task-meta').exists()
+
+        # Hostile agent uses RAW git — deliberately bypasses GitOps.commit
+        # so NO scrub guard participates.
+        (lane / 'hello.py').write_text('print(1)\n')
+        await _run(['git', 'add', '-A'], cwd=lane)
+        await _run(['git', 'commit', '-m', 'hostile add -A'], cwd=lane)
+
+        rc, out, _ = await _run(['git', 'ls-tree', '-r', '--name-only', 'HEAD'], cwd=lane)
+        assert rc == 0
+        assert 'hello.py' in out
+        for forbidden in ('.task', '.task-meta', 'plan.json', 'metadata.json', 'iterations.jsonl'):
+            assert forbidden not in out, f'{forbidden!r} leaked into the hostile commit tree'
+
+        # The sidecar is untouched by the commit.
+        assert (meta / 'plan.json').exists()
