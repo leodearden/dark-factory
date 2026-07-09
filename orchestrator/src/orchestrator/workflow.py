@@ -826,7 +826,7 @@ class TaskWorkflow:
         self.event_store = event_store
         self.cost_store = cost_store
 
-        self.state = WorkflowState.PLAN
+        self.machine = WorkflowStateMachine(WorkflowState.PLAN)
         self._phase_cost_at_entry: float = 0.0
         self.task = assignment.task
         self.task_id = assignment.task_id
@@ -966,6 +966,21 @@ class TaskWorkflow:
         # right after session_id_val is determined; read by _capture_zero_output_evidence
         # so it can locate the transcript even when result.session_id is '' (hard SIGKILL).
         self._last_invoke_session_id: str | None = None
+
+    @property
+    def state(self) -> WorkflowState:
+        """Current workflow phase, delegated to :attr:`machine`.
+
+        The setter bypasses transition validation (``machine.force_set``) —
+        it exists because many tests stage a state directly (e.g.
+        ``wf.state = WorkflowState.DONE``). Only :meth:`_enter_phase` drives
+        a validated transition (``machine.transition``).
+        """
+        return self.machine.state
+
+    @state.setter
+    def state(self, value: WorkflowState) -> None:
+        self.machine.force_set(value)
 
     @property
     def _task_files(self) -> list[str] | None:
@@ -1602,9 +1617,17 @@ class TaskWorkflow:
         await self.scheduler.update_task(self.task_id, merged)
 
     def _enter_phase(self, new_state: WorkflowState) -> None:
-        """Transition to a new workflow phase, emitting events."""
+        """Transition to a new workflow phase, emitting events.
+
+        The machine transition happens BEFORE event emission so an illegal
+        move (e.g. a late phase change after a terminal state) raises
+        ``IllegalTransition`` and short-circuits before any phase_exit/
+        phase_enter event is emitted — no phantom events for a move that
+        never actually happened.
+        """
+        prev = self.state
+        self.machine.transition(new_state)
         if self.event_store:
-            prev = self.state
             if prev not in (WorkflowState.DONE, WorkflowState.BLOCKED):
                 cost_delta = self.metrics.total_cost_usd - self._phase_cost_at_entry
                 self.event_store.emit(
@@ -1617,7 +1640,6 @@ class TaskWorkflow:
                 task_id=self.task_id, phase=new_state.value,
             )
         self._phase_cost_at_entry = self.metrics.total_cost_usd
-        self.state = new_state
 
     async def _setup_worktree_and_artifacts(self, branch_name: str) -> None:
         """Set in-progress, create/inspect the worktree, init artifacts, scrub .task/.
