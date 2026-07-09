@@ -21,6 +21,8 @@ test_permit_ledger.py's convention).
 
 from __future__ import annotations
 
+import pytest
+
 # ---------------------------------------------------------------------------
 # step-1 RED / step-2 GREEN: ItemLifecycleState enum contract
 # ---------------------------------------------------------------------------
@@ -73,3 +75,54 @@ class TestItemLifecycleStateEnum:
         from orchestrator.merge_types import ItemLifecycleState as MTState
 
         assert MQState is MTState
+
+
+# ---------------------------------------------------------------------------
+# step-3 RED / step-4 GREEN: ItemLifecycle registry storage
+# ---------------------------------------------------------------------------
+
+
+class TestItemLifecycleRegistry:
+    """ItemLifecycle() is a request_id-keyed lifecycle-state registry
+    (task 2164 step-3).
+
+    RED until step-4 GREEN implements the ItemLifecycle registry class in
+    merge_queue.py.
+    """
+
+    def test_register_seeds_queued_state(self) -> None:
+        from orchestrator.merge_queue import ItemLifecycle, ItemLifecycleState
+
+        registry = ItemLifecycle()
+
+        registry.register('mr-aaaaaaaa')
+
+        assert registry.current('mr-aaaaaaaa') == ItemLifecycleState.QUEUED
+
+    def test_current_of_unknown_rid_is_none(self) -> None:
+        from orchestrator.merge_queue import ItemLifecycle
+
+        registry = ItemLifecycle()
+
+        assert registry.current('mr-unknown0') is None
+
+    def test_two_distinct_request_ids_are_tracked_independently(self) -> None:
+        from orchestrator.merge_queue import ItemLifecycle, ItemLifecycleState
+
+        registry = ItemLifecycle()
+        registry.register('mr-aaaaaaaa')
+        registry.register('mr-bbbbbbbb', initial=ItemLifecycleState.MERGING)
+
+        assert registry.current('mr-aaaaaaaa') == ItemLifecycleState.QUEUED
+        assert registry.current('mr-bbbbbbbb') == ItemLifecycleState.MERGING
+
+    def test_duplicate_register_raises_and_leaves_state_unchanged(self) -> None:
+        from orchestrator.merge_queue import ItemLifecycle, ItemLifecycleState
+
+        registry = ItemLifecycle()
+        registry.register('mr-aaaaaaaa')
+
+        with pytest.raises(ValueError):
+            registry.register('mr-aaaaaaaa', initial=ItemLifecycleState.MERGING)
+
+        assert registry.current('mr-aaaaaaaa') == ItemLifecycleState.QUEUED
