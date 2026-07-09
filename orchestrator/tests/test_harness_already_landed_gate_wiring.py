@@ -236,3 +236,103 @@ class TestAlreadyLandedDispatchGateMarkerPath:
 
         assert result is False
         h._mark_in_progress_done.assert_not_awaited()
+
+
+def _wired_content_harness(
+    mock_orch_config, *, citation_sha, main_sha, content_in_main,
+) -> Harness:
+    """Bare harness with is_ancestor False and find_merge_marker None, so
+    neither the ancestry path nor the marker path can produce a result —
+    only the content-equivalence fallback is under test.
+    """
+    h = _build_harness(mock_orch_config)
+    h.git_ops = MagicMock()
+    h.git_ops.config.branch_prefix = 'task/'
+    h.git_ops.config.main_branch = 'main'
+
+    h.git_ops.is_ancestor = AsyncMock(return_value=False)
+    h.git_ops.find_merge_marker = AsyncMock(return_value=None)
+    h.git_ops.find_task_citation_commit = AsyncMock(return_value=citation_sha)
+    h.git_ops.branch_content_in_main = AsyncMock(return_value=content_in_main)
+    h.git_ops.get_main_sha = AsyncMock(return_value=main_sha)
+
+    h.scheduler.get_task = AsyncMock(return_value={'id': '42', 'metadata': {}})
+    h._branch_is_degenerate = AsyncMock(return_value=False)
+    h._mark_in_progress_done = AsyncMock()
+    h._escalation_queue = None
+    return h
+
+
+@pytest.mark.asyncio
+class TestAlreadyLandedDispatchGateContentEquivalence:
+    """Content-equivalence fallback (RED until step-10).
+
+    is_ancestor(branch, main) is False and find_merge_marker returns None
+    in all three sub-cases, so only the content-equivalence fallback can
+    produce a result.
+    """
+
+    async def test_content_equivalent_no_citation_anchors_on_main_head(
+        self, mock_orch_config,
+    ) -> None:
+        """branch_content_in_main True, no citation on main -> flips to
+        done, anchored on main HEAD (get_main_sha) since there is no
+        citation commit to prefer.
+        """
+        main_sha = 'c' * 40
+        h = _wired_content_harness(
+            mock_orch_config,
+            citation_sha=None,
+            main_sha=main_sha,
+            content_in_main=True,
+        )
+
+        result = await h._already_landed_dispatch_gate('42')
+
+        assert result is True
+        h._mark_in_progress_done.assert_awaited_once()
+        call_args = h._mark_in_progress_done.await_args
+        assert call_args.args[0] == '42'
+        assert call_args.args[1] == main_sha
+        assert call_args.args[3] == 'dispatch-gate-content-equivalent'
+
+    async def test_content_equivalent_with_citation_prefers_citation_anchor(
+        self, mock_orch_config,
+    ) -> None:
+        """branch_content_in_main True AND a citation commit is present on
+        main -> the citation sha anchors the flip, not main HEAD.
+        """
+        citation_sha = 'd' * 40
+        h = _wired_content_harness(
+            mock_orch_config,
+            citation_sha=citation_sha,
+            main_sha='c' * 40,
+            content_in_main=True,
+        )
+
+        result = await h._already_landed_dispatch_gate('42')
+
+        assert result is True
+        h._mark_in_progress_done.assert_awaited_once()
+        call_args = h._mark_in_progress_done.await_args
+        assert call_args.args[0] == '42'
+        assert call_args.args[1] == citation_sha
+        assert call_args.args[3] == 'dispatch-gate-content-equivalent'
+
+    async def test_content_not_equivalent_dispatches_normally(
+        self, mock_orch_config,
+    ) -> None:
+        """branch_content_in_main False -> no evidence at all; the gate
+        returns False so the task dispatches normally this tick.
+        """
+        h = _wired_content_harness(
+            mock_orch_config,
+            citation_sha=None,
+            main_sha='c' * 40,
+            content_in_main=False,
+        )
+
+        result = await h._already_landed_dispatch_gate('42')
+
+        assert result is False
+        h._mark_in_progress_done.assert_not_awaited()
