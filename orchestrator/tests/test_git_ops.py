@@ -9,6 +9,7 @@ from unittest.mock import patch
 
 import pytest
 
+from orchestrator.artifacts import TaskArtifacts
 from orchestrator.config import GitConfig
 from orchestrator.git_ops import (
     PERSISTENT_OFFLINE_DEEP_WORKTREE_NAME,
@@ -1896,6 +1897,54 @@ class TestHasUncommittedWork:
         task_dir.mkdir(exist_ok=True)
         (task_dir / 'plan.json').write_text('{}')
         assert not await git_ops.has_uncommitted_work(wt_info.path)
+
+
+@pytest.mark.asyncio
+class TestStructuralContamination:
+    """This task's OWN copy of ω's B4 (test_lane_lifecycle_integration.py::
+    TestB4Contamination::test_hostile_add_all_stages_zero_task_meta, line
+    ~495): a hostile agent runs raw ``git add -A && git commit`` directly in
+    a lane, deliberately bypassing ``GitOps.commit()`` (and every scrub guard
+    it runs). The commit must stage ZERO task-meta paths — contamination
+    prevention here is STRUCTURAL (the ``.task-meta`` sidecar lives OUTSIDE
+    the worktree, see ``TaskArtifacts.meta_root_for``), not guard-defended,
+    so this must keep passing after this task deletes the scrub guards below.
+    """
+
+    async def test_hostile_add_all_stages_zero_task_meta(self, git_ops: GitOps):
+        wt_info = await git_ops.create_worktree('structural-contamination')
+        lane = wt_info.path
+
+        meta = TaskArtifacts.meta_root_for(git_ops.worktree_base, lane.name)
+        ta = TaskArtifacts(lane, meta)
+        ta.init('sc-1', 'Structural Contamination', 'test')
+        ta.write_plan({'task_id': 'sc-1', 'title': 'Structural Contamination', 'steps': []})
+        ta.append_iteration_log({'k': 1})
+
+        # Metadata lives OUTSIDE the worktree.  <lane>/.task itself may still
+        # exist (create_worktree's _ensure_task_gitignore defense-in-depth
+        # guard unconditionally drops a .task/.gitignore there — an
+        # unrelated, pre-relocation scrub guard) but must hold no metadata:
+        # TaskArtifacts was pointed at the sibling `meta` root, never at
+        # `lane/.task`.
+        assert (meta / 'plan.json').exists()
+        assert not (lane / '.task' / 'plan.json').exists()
+        assert not (lane / '.task-meta').exists()
+
+        # Hostile agent uses RAW git — deliberately bypasses GitOps.commit so
+        # NO scrub guard participates.
+        (lane / 'hello.py').write_text('print(1)\n')
+        await _run(['git', 'add', '-A'], cwd=lane)
+        await _run(['git', 'commit', '-m', 'hostile add -A'], cwd=lane)
+
+        rc, out, _ = await _run(['git', 'ls-tree', '-r', '--name-only', 'HEAD'], cwd=lane)
+        assert rc == 0
+        assert 'hello.py' in out
+        for forbidden in ('.task', '.task-meta', 'plan.json', 'metadata.json', 'iterations.jsonl'):
+            assert forbidden not in out, f'{forbidden!r} leaked into the hostile commit tree'
+
+        # The sidecar is untouched by the commit.
+        assert (meta / 'plan.json').exists()
 
 
 @pytest.mark.asyncio
