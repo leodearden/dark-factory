@@ -2335,17 +2335,36 @@ class HostAllocator:
         max_attempts: maximum number of probe polls before giving up (slot stays
                       PARKED on exhaustion).
 
+        Idempotency: a repeat call on a lease whose slot is already FREE
+        (i.e. a prior cancel_and_release/release already ran) is a no-op
+        that returns True WITHOUT re-issuing the remote cancel RPC. This
+        matters because several call sites in SpeculativeMergeWorker can
+        invoke cancel_and_release on the same lease (shutdown drain,
+        cascade abandon, resolve/release, finalize-inflight); without this
+        guard a second call would re-issue cancel_verify() on a host with
+        nothing left to cancel, and a non-zero rc from that redundant call
+        would PARK an already-healthy, released slot. A PARKED slot is NOT
+        short-circuited — re-invoking on a PARKED slot is a legitimate
+        recovery retry (re-cancel + re-probe).
+
         Note: wired into production by tasks 1757 & 1762.  Called in
         ``stop()`` (shutdown drain of ``_inflight`` in-flight entries), in
         ``_verifier_loop()`` (head-failure cascade / operator-halt REQUEUED
         abandon path), and in ``_finalize_inflight()`` (finalize-head
         ``finally`` cancel-release path).  It is exercised by
-        :class:`TestHostAllocatorCancelRelease` and
-        :class:`TestHostAllocatorCancelFail` unit tests.
+        :class:`TestHostAllocatorCancelRelease`,
+        :class:`TestHostAllocatorCancelFail`, and
+        :class:`TestHostAllocatorCancelReleaseIdempotent` unit tests.
         """
         if sleep is None:
             import asyncio as _asyncio
             sleep = _asyncio.sleep
+
+        if self._slots.get(lease.name) == _SLOT_FREE:
+            # Already released — nothing to cancel. Short-circuit before any
+            # RPC so a double-release cannot re-issue cancel_verify() and
+            # PARK a healthy slot.
+            return True
 
         if lease.is_local:
             await self.release(lease)
