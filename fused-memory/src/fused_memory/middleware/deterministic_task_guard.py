@@ -33,7 +33,9 @@ import os
 from pathlib import Path
 from typing import Any
 
-from shared.task_metadata import parse_metadata
+from pydantic import ValidationError
+
+from shared.task_metadata import Milestone, parse_metadata
 
 __all__ = [
     'deterministic_task_error',
@@ -107,6 +109,30 @@ def _validation_error(message: str, *, hint: str | None = None) -> dict[str, Any
     return err
 
 
+def _validate_milestone(milestone: Any) -> dict[str, Any] | None:
+    """Validate metadata.milestone by delegating to the shared Milestone model.
+
+    Returns a ValidationError dict on failure, or None when valid. Delegates
+    to :class:`shared.task_metadata.Milestone` (the single valid-shape
+    authority for milestone's mode='dated'/'delayed' iff rules) rather than
+    re-implementing its checks here, so guard and persistence-layer semantics
+    can never drift. ``TypeError`` is caught alongside ``ValidationError`` to
+    cover non-mapping milestone values (e.g. a bare string or list) that
+    can't be splatted into the model's keyword arguments.
+    """
+    try:
+        Milestone(**milestone)
+    except (ValidationError, TypeError) as exc:
+        return _validation_error(
+            f'metadata.milestone is invalid: {exc}',
+            hint=(
+                "A milestone must be {'mode': 'dated', 'at': '<ISO-8601 datetime>'} "
+                "or {'mode': 'delayed', 'after_secs': <positive int>}."
+            ),
+        )
+    return None
+
+
 # ---------------------------------------------------------------------------
 # Public guard functions
 # ---------------------------------------------------------------------------
@@ -147,6 +173,15 @@ def deterministic_task_error(
     # (e.g. always_escalates='false', always_escalates=1) do NOT satisfy the gate.
     # bool('false') == True, which would silently accept the opposite of the caller's intent.
     always_escalates = meta.get('always_escalates', False)
+
+    # metadata.milestone is orthogonal to task_kind (allowed on BOTH 'normal' and
+    # 'deterministic' tasks) — validated by presence alone, independent of the
+    # task_kind branches below (PRD §5 dec 1).
+    milestone = meta.get('milestone')
+    if milestone is not None:
+        err = _validate_milestone(milestone)
+        if err is not None:
+            return err
 
     # Invariant 2: deterministic no-op
     if task_kind == 'deterministic' and before_done is None and always_escalates is not True:
