@@ -239,3 +239,34 @@ async def _drain_bg(gate: UsageGate) -> None:
     for acct in gate._accounts:
         await _drain_task(acct.resume_task)
         await _drain_task(acct.auth_reprobe_task)
+
+
+# ---------------------------------------------------------------------------
+# B1 -- an illegal phase edge raises IllegalTransitionError without mutating
+# state (producer), and leaves the gate usable for a sibling account
+# (consumer): before_invoke() still leases the sibling, DD-5 _open holds.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestB1IllegalTransition:
+    """AUTH_FAILED -> PROBE_IN_FLIGHT is not in _LEGAL_TRANSITIONS."""
+
+    async def test_illegal_edge_raises_state_unchanged_and_gate_stays_usable(self):
+        gate = make_boundary_gate(['acct-a', 'acct-b'])
+        auth_failed_acct, sibling = gate._accounts
+
+        # Producer side: reach AUTH_FAILED via a legal edge, then attempt an
+        # illegal one.
+        gate._transition(auth_failed_acct, AccountPhase.AUTH_FAILED)
+        assert auth_failed_acct.phase == AccountPhase.AUTH_FAILED
+
+        with pytest.raises(IllegalTransitionError):
+            gate._transition(auth_failed_acct, AccountPhase.PROBE_IN_FLIGHT)
+
+        assert auth_failed_acct.phase == AccountPhase.AUTH_FAILED  # unchanged
+
+        # Consumer side: the gate is not corrupted by the failed transition --
+        # the sibling AVAILABLE account is still leasable, and the DD-5 _open
+        # invariant holds.
+        await _assert_sibling_still_usable(gate, sibling.name)
