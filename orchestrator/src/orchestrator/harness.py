@@ -7074,14 +7074,35 @@ Output JSON matching the schema. Every task must appear in the output.
         squash/rebase/manual landing.  Installed as
         ``self.scheduler._already_landed_gate``.
 
-        Minimal ancestry path only — guards, the merge-marker path, and the
-        content-equivalence fallback are added in later steps.
+        Ancestry-path guards mirror ``_reconcile_one_stranded``'s own guard
+        sequence so this gate can never flip a false positive: an open L1
+        escalation is a deliberate human handoff (never second-guessed); a
+        degenerate branch (tip == branch_base_sha) carries zero task work,
+        so ``is_ancestor`` returning True is a trivial false "already on
+        main" signal; and a missing citation rejects the zero-commit-branch
+        shape where no commit on main actually cites this task.
+
+        The merge-marker path and the content-equivalence fallback are
+        added in later steps.
         """
+        if (
+            self._escalation_queue is not None
+            and self._escalation_queue.has_open_l1(task_id)
+        ):
+            return False
+
         branch = f'{self.git_ops.config.branch_prefix}{task_id}'
+        task = await self.scheduler.get_task(task_id)
+        metadata = (task.get('metadata') or {}) if task else {}
+
         if await self.git_ops.is_ancestor(branch, self.git_ops.config.main_branch):
+            if await self._branch_is_degenerate(branch, metadata):
+                return False
             citation = await self.git_ops.find_task_citation_commit(
                 task_id, pattern_template=self.git_ops.config.commit_citation_pattern,
             )
+            if citation is None:
+                return False
             await self._mark_in_progress_done(
                 task_id, citation,
                 'reconcile: pre-dispatch check found branch already on main',
