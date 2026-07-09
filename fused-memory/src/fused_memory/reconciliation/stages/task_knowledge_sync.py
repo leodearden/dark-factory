@@ -1257,6 +1257,70 @@ async def _resolve_terminal_task_ids(
     return sorted(str(tid) for tid, status in statuses.items() if status in TERMINAL_STATUSES)
 
 
+async def _gc_recon_markers(
+    memory_service,
+    taskmaster,
+    scope: ProjectScope,
+    run_id: str,
+    *,
+    now: datetime | None = None,
+) -> int:
+    """Garbage-collect ``recon_ledger`` marker rows for *scope* in ONE DELETE pass.
+
+    Replaces the four Mem0 sweeps (:func:`_sweep_stale_fixc_markers`,
+    :func:`_sweep_stale_flag_markers`, :func:`_sweep_terminal_task_flag_markers`,
+    :func:`_sweep_stale_persistence_markers`) with a single
+    :meth:`~fused_memory.reconciliation.recon_ledger.ReconLedgerStore.gc` call
+    (task 2228 W5-κ): the ledger's ``expires_at < now`` clause replaces the
+    age-based sweeps and the fixc residue delete, and its
+    ``record_kind IN MARKER_KINDS AND task_id IN terminal_task_ids`` clause
+    replaces the terminal-task sweep.
+
+    Degrades to ``0`` — never raises — when ``memory_service`` has no ledger
+    wired (``recon_ledger`` is ``None``, e.g. mid write-both/read-new
+    cutover) or when ``ledger.gc`` itself fails. ``terminal_task_ids`` is
+    resolved via :func:`_resolve_terminal_task_ids`, which is itself
+    fail-safe to ``[]`` — an empty list makes ``gc()`` run its expiry-only
+    branch, preserving the old sweeps' fail-safe KEEP direction.
+
+    Args:
+        memory_service: Service that may expose a ``recon_ledger``
+            (:class:`~fused_memory.reconciliation.recon_ledger.ReconLedgerStore`)
+            attribute. Missing/``None`` => no-op (returns ``0``).
+        taskmaster: Forwarded to :func:`_resolve_terminal_task_ids`. Falsy => no-op there.
+        scope: ``ProjectScope`` supplying ``project_id`` (ledger scope) and
+            ``project_root`` (forwarded to ``taskmaster.get_statuses``).
+        run_id: Current reconciliation run identifier, logged on failure.
+        now: Reference "current time" for the ``expires_at`` comparison.
+            Defaults to ``datetime.now(UTC)``; tests inject a fixed value.
+            Normalized via :func:`_assume_utc` and rendered with
+            ``.isoformat()`` to match the writer format used by
+            ``flag_dedup._persist_flag_marker``, so the ledger's
+            lexicographic TEXT comparison against stored ``expires_at``
+            values is correct.
+
+    Returns:
+        Number of rows deleted by the ``gc()`` pass (``0`` on any failure or
+        when no ledger is wired).
+    """
+    ledger = getattr(memory_service, 'recon_ledger', None)
+    if ledger is None:
+        return 0
+
+    now_iso = _assume_utc(now or datetime.now(UTC)).isoformat()
+    terminal_task_ids = await _resolve_terminal_task_ids(taskmaster, scope, run_id)
+
+    try:
+        return await ledger.gc(scope.project_id, now_iso, terminal_task_ids)
+    except Exception:
+        logger.warning(
+            'reconciliation._gc_recon_markers: ledger.gc failed for project_id=%s',
+            scope.project_id,
+            extra={'project_id': scope.project_id, 'run_id': run_id},
+        )
+        return 0
+
+
 async def _sweep_stale_fixc_markers(
     memory_service,
     project_id: str,
