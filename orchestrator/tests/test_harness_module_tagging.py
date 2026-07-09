@@ -443,10 +443,10 @@ async def test_tag_task_modules_routes_through_seed_modules(tmp_path):
     directory_locks/files_to_modules block + direct _module_cache poke
     (task 2122 step-9/10).
 
-    seed_modules is replaced with a no-op Mock: if _tag_task_modules still
-    had a parallel direct-write code path (today's code does), the cache
-    would populate even with seed_modules doing nothing — proving there is
-    no other writer left once the migration lands.
+    seed_modules is replaced with a no-op Mock: post-migration,
+    _tag_task_modules has no parallel direct _module_cache write — it routes
+    solely through seed_modules — so mocking seed_modules to a no-op must
+    leave the cache untouched, proving there is no other writer left.
     """
     config = OrchestratorConfig(project_root=tmp_path, lock_depth=2)
     h = Harness(config)

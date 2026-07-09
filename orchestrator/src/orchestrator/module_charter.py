@@ -1,17 +1,28 @@
-"""Sole orchestrator-side composition of Lock-charter Contract 1.
+"""Sole orchestrator-side composition of Lock-charter Contract 1 for the
+scheduler/harness module-cache path.
 
 Contract 1: ``metadata.files`` is ALWAYS file-level; coarsening to depth-N
 module lock keys happens at READ time only. This module is the single place
 that composes the ``shared.locking`` primitives (``directory_locks``,
 ``strip_directory_locks``, ``files_to_modules``) into the two operations
-every call site needs:
+every ``scheduler.py`` / ``harness.py`` call site needs:
 
 - ``derive_modules``: files -> depth-coarsened module lock keys (READ path).
 - ``sanitize_files_for_persist``: files -> file-level-only files (WRITE path).
 
-Both scheduler.py and harness.py route through this module instead of
-re-implementing the strip -> coarsen pipeline inline (the pre-task-2122 state
-had 4+ divergent copies of this logic).
+``scheduler.py`` (``_get_modules``, ``seed_modules``, the blast-radius cache
+write, ``_persist_files_metadata``) and ``harness.py``
+(``_tag_task_modules``) route through this module instead of
+re-implementing the strip -> coarsen pipeline inline (the pre-task-2122
+state had 4+ divergent copies of this logic across those two files).
+
+NOTE — consolidation scope: ``workflow.py`` derives plan-scoped module lock
+keys via its own direct ``files_to_modules(plan_files, depth)`` calls (e.g.
+``_union_train_scope``, the plan-file blast-radius re-derivation sites) and
+does NOT route through ``derive_modules``, so those sites do not apply the
+α strip. That is a known gap, not an intentional design choice, and is out
+of this module's/task's scope (task 2122 locks scheduler.py/harness.py
+only) — tracked as follow-up work rather than fixed here.
 """
 
 from __future__ import annotations
