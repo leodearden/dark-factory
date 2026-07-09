@@ -11145,3 +11145,48 @@ class TestAcquireNextDirectoryCharterBoundary:
             'Directory charter must NOT block the sibling: both should be dispatchable. '
             f'First dispatched: {first.task_id}; second was None (blocked).'
         )
+
+
+# ---------------------------------------------------------------------------
+# Already-landed pre-dispatch gate (task 2313) — _consult_already_landed.
+#
+# Mirrors _consult_landed_outbox (task 2156): a TOTAL function that consults
+# an injected async hook per candidate, fails OPEN per-candidate on hook
+# error (PROPERTY 1), and defaults to a no-op empty set when no hook is
+# installed (bare-Scheduler unit tests unaffected).
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestConsultAlreadyLanded:
+    """Unit tests for Scheduler._consult_already_landed."""
+
+    async def test_default_gate_is_none_and_consult_is_noop(self):
+        """A fresh Scheduler has _already_landed_gate is None and the consult
+        returns the empty set without awaiting anything."""
+        scheduler = Scheduler(OrchestratorConfig(max_per_module=1))
+        assert scheduler._already_landed_gate is None
+
+        result = await scheduler._consult_already_landed([_pending_task('Z')])
+
+        assert result == set()
+
+    async def test_gate_true_gates_the_candidate(self):
+        scheduler = Scheduler(OrchestratorConfig(max_per_module=1))
+        scheduler._already_landed_gate = AsyncMock(return_value=True)
+
+        result = await scheduler._consult_already_landed([_pending_task('Z')])
+
+        assert result == {'Z'}
+
+    async def test_gate_raises_fails_open_and_logs_warning(self, caplog):
+        caplog.set_level('WARNING')
+        scheduler = Scheduler(OrchestratorConfig(max_per_module=1))
+        scheduler._already_landed_gate = AsyncMock(side_effect=RuntimeError('git hiccup'))
+
+        result = await scheduler._consult_already_landed([_pending_task('Z')])
+
+        assert result == set(), 'a raising hook must fail open (candidate treated as not-gated)'
+        assert any(record.levelname == 'WARNING' for record in caplog.records), (
+            'a raising gate hook should be logged, not silently swallowed'
+        )
