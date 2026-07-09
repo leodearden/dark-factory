@@ -52,6 +52,14 @@ _WATCHDOG_POLL_SECS = 5.0
 # time_to_grace and time_to_ceiling have already elapsed (would otherwise cause an
 # asyncio.wait(timeout=0) tight-spin hammering count_transcript_turns).
 _WATCHDOG_MIN_POLL_SECS = 0.01
+# Coarse poll cadence for the WORKING-regime progress extension (task 2360).
+# Once seen_turn latches AND working_idle_secs/absolute_cap_secs are both set,
+# the watchdog keeps polling count_transcript_turns — but at this much coarser
+# cadence than _WATCHDOG_POLL_SECS, since a healthy working session can run for
+# 20-40 minutes and there is no need to hammer the transcript file every 5s.
+# Still floored by _WATCHDOG_MIN_POLL_SECS and clamped by time-to-idle-kill /
+# time-to-absolute-cap so a kill boundary is never overshot by a full poll.
+_WATCHDOG_WORKING_POLL_SECS = 60.0
 # Per-caller cap-wait policy (post-1365 audit, task 1401)
 # ─────────────────────────────────────────────────────────────────────────────
 # _DEFAULT_CAP_WAIT_SANITY_SECS (14 days) is inherited by callers that do NOT
@@ -1552,6 +1560,12 @@ async def _run_subprocess(
             watchdog_start = time.monotonic()
             seen_turn = False  # latched True once ≥1 assistant turn observed
             live_turns: int | None = None  # last non-None turn count read
+            # WORKING-regime progress extension (task 2360): last observed
+            # turn count and the monotonic time it was observed increasing.
+            # Both are set together, the moment seen_turn first latches, and
+            # updated together whenever a later poll observes MORE turns.
+            last_progress_turns: int | None = None
+            last_progress_monotonic: float | None = None
 
             comm_task = asyncio.ensure_future(
                 proc.communicate(input=stdin_data)
@@ -1559,6 +1573,14 @@ async def _run_subprocess(
 
             while True:
                 elapsed = time.monotonic() - watchdog_start
+                # Extension engages once liveness is proven (seen_turn) AND the
+                # caller opted in (both params set).  Monotonic: seen_turn only
+                # ever goes False→True, so this can only turn on, never off.
+                extension_engaged = (
+                    seen_turn
+                    and working_idle_secs is not None
+                    and absolute_cap_secs is not None
+                )
                 # How long until the next mandatory check-point?
                 #
                 # time_to_grace: collapse to inf once the startup-grace kill can
@@ -1580,19 +1602,39 @@ async def _run_subprocess(
                     float('inf') if _grace_spent
                     else max(0.0, startup_grace_secs - elapsed)
                 )
-                time_to_ceiling = (
-                    max(0.0, timeout_seconds - elapsed)
-                    if timeout_seconds is not None
-                    else float('inf')
-                )
-                # Floor at _WATCHDOG_MIN_POLL_SECS so the poll never degenerates
-                # to 0.0 (which would make asyncio.wait return immediately and
-                # tight-spin, hammering count_transcript_turns and starving the
-                # event loop).
-                poll = max(
-                    min(_WATCHDOG_POLL_SECS, time_to_grace, time_to_ceiling),
-                    _WATCHDOG_MIN_POLL_SECS,
-                )
+                if extension_engaged:
+                    # idle_bound: the per-role ceiling is the FLOOR of the idle
+                    # window (B6 long-tool-call safety) — never smaller than
+                    # today's ceiling.
+                    idle_bound = (
+                        max(working_idle_secs, timeout_seconds)
+                        if timeout_seconds is not None
+                        else working_idle_secs
+                    )
+                    time_to_idle_kill = (
+                        max(0.0, idle_bound - (time.monotonic() - last_progress_monotonic))
+                        if last_progress_monotonic is not None
+                        else idle_bound
+                    )
+                    time_to_abs_cap = max(0.0, absolute_cap_secs - elapsed)
+                    poll = max(
+                        min(_WATCHDOG_WORKING_POLL_SECS, time_to_idle_kill, time_to_abs_cap),
+                        _WATCHDOG_MIN_POLL_SECS,
+                    )
+                else:
+                    time_to_ceiling = (
+                        max(0.0, timeout_seconds - elapsed)
+                        if timeout_seconds is not None
+                        else float('inf')
+                    )
+                    # Floor at _WATCHDOG_MIN_POLL_SECS so the poll never degenerates
+                    # to 0.0 (which would make asyncio.wait return immediately and
+                    # tight-spin, hammering count_transcript_turns and starving the
+                    # event loop).
+                    poll = max(
+                        min(_WATCHDOG_POLL_SECS, time_to_grace, time_to_ceiling),
+                        _WATCHDOG_MIN_POLL_SECS,
+                    )
 
                 done, _ = await asyncio.wait({comm_task}, timeout=poll)
 
@@ -1608,7 +1650,9 @@ async def _run_subprocess(
                 # guard requires `not seen_turn`, so live_turns is never consulted
                 # again in the working regime.  Skip the on-disk read to avoid
                 # redundant FS I/O for the (potentially 20-40 min) post-turn-1
-                # lifetime of a healthy long-running agent.
+                # lifetime of a healthy long-running agent — UNLESS the progress
+                # extension is engaged, in which case the read is the extension's
+                # own (coarse-cadence) liveness signal.
                 # The post-kill transcript_turns re-read in the except block is
                 # unaffected — it is a separate, one-shot read outside this loop.
                 if not seen_turn and config_dir and session_id:
@@ -1617,8 +1661,22 @@ async def _run_subprocess(
                         live_turns = n
                         if n >= 1:
                             seen_turn = True
+                            last_progress_turns = n
+                            last_progress_monotonic = time.monotonic()
+                elif extension_engaged and config_dir and session_id:
+                    n = count_transcript_turns(config_dir, session_id)
+                    if n is not None and (last_progress_turns is None or n > last_progress_turns):
+                        last_progress_turns = n
+                        last_progress_monotonic = time.monotonic()
 
                 elapsed = time.monotonic() - watchdog_start
+                # Re-derive fresh (not the top-of-loop value) so a seen_turn
+                # transition earlier in THIS iteration is reflected immediately.
+                extension_engaged = (
+                    seen_turn
+                    and working_idle_secs is not None
+                    and absolute_cap_secs is not None
+                )
 
                 # Startup-regime kill: explicit 0-turn read AND grace expired.
                 # NEVER kill on None (unreadable transcript) — conservative degrade.
@@ -1637,16 +1695,48 @@ async def _run_subprocess(
                         await comm_task
                     raise TimeoutError
 
-                # Absolute-ceiling kill.
-                if timeout_seconds is not None and elapsed >= timeout_seconds:
-                    logger.warning(
-                        f'Absolute ceiling reached after {elapsed:.1f}s '
-                        f'(ceiling={timeout_seconds}s): model={model} — killing'
+                if extension_engaged:
+                    idle_bound = (
+                        max(working_idle_secs, timeout_seconds)
+                        if timeout_seconds is not None
+                        else working_idle_secs
                     )
-                    comm_task.cancel()
-                    with contextlib.suppress(asyncio.CancelledError, Exception):
-                        await comm_task
-                    raise TimeoutError
+                    idle_elapsed = time.monotonic() - last_progress_monotonic
+                    if idle_elapsed >= idle_bound:
+                        logger.warning(
+                            f'Working-regime idle bound reached after {idle_elapsed:.1f}s '
+                            f'with no new transcript turn (idle_bound={idle_bound}s, '
+                            f'last progress at {last_progress_turns} turns): '
+                            f'model={model} — cancelling comm_task and killing'
+                        )
+                        comm_task.cancel()
+                        with contextlib.suppress(asyncio.CancelledError, Exception):
+                            await comm_task
+                        raise TimeoutError
+
+                    if elapsed >= absolute_cap_secs:
+                        logger.warning(
+                            f'Working-regime absolute cap reached after {elapsed:.1f}s '
+                            f'(cap={absolute_cap_secs}s): model={model} — killing'
+                        )
+                        comm_task.cancel()
+                        with contextlib.suppress(asyncio.CancelledError, Exception):
+                            await comm_task
+                        raise TimeoutError
+                else:
+                    # Absolute-ceiling kill — today's exact behavior.  Fires
+                    # only when the extension is not engaged: either param is
+                    # None, OR seen_turn hasn't latched, OR (transitively) the
+                    # transcript never proved readable (B7 conservative degrade).
+                    if timeout_seconds is not None and elapsed >= timeout_seconds:
+                        logger.warning(
+                            f'Absolute ceiling reached after {elapsed:.1f}s '
+                            f'(ceiling={timeout_seconds}s): model={model} — killing'
+                        )
+                        comm_task.cancel()
+                        with contextlib.suppress(asyncio.CancelledError, Exception):
+                            await comm_task
+                        raise TimeoutError
 
         except TimeoutError:
             # Snapshot the process group FIRST — before terminate() — while the
