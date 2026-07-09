@@ -800,6 +800,24 @@ class SpecPermit:
     released: bool = False
 
 
+@dataclass(eq=False)
+class CapPermit:
+    """Opaque merge-ahead-cap permit token (MQ-refactor theta / task 2161).
+
+    The ``_merge_ahead_cap`` analogue of :class:`SpecPermit`: returned by a
+    :class:`~orchestrator.merge_speculation_controller.PermitLedger`
+    constructed with ``token_factory=CapPermit`` and stored on the
+    :class:`RealMergeItem` that owns it (``.cap_permit``). Byte-for-byte
+    mirror of :class:`SpecPermit` -- same ``eq=False`` IDENTITY (not
+    field-value) comparison so a ledger's ``live`` set treats every acquired
+    token as a distinct member, and the same once-only ``released`` flip
+    that makes a second release of the same token a silent no-op rather than
+    an over-release or an assertion failure.
+    """
+
+    released: bool = False
+
+
 @dataclass
 class RealMergeItem:
     """Internal message passed from Merger coroutine to Verifier coroutine:
