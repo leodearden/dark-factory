@@ -14791,20 +14791,20 @@ class TestIntegrityCheckBlockedSnapshotWiring:
 
     @pytest.mark.asyncio
     async def test_both_findings_survive_for_non_blocked_project(self, mock_deps):
-        """For project_id='dark_factory' (not in blocked set), BOTH findings survive;
+        """For project_id='reify' (not in blocked set), BOTH findings survive;
         blocked_snapshot_findings_dropped == 0.
 
         RED: run() does not yet apply the filter or set the stat.
         """
         stage = IntegrityCheck(StageId.integrity_check, **mock_deps)
-        stage.scope = _scope('dark_factory', stage.scope.project_root)
+        stage.scope = _scope('reify', stage.scope.project_root)
         stage.filtered_task_tree = None
 
         snapshot_flag = {
             'task_id': None,
             'flag_type': 'missing_knowledge',
             'category': 'missing_knowledge',
-            'description': 'dark_factory has no task-count snapshot temporal_fact edge',
+            'description': 'reify has no task-count snapshot temporal_fact edge',
             'suggested_action': 'Add a count snapshot',
             'actionable': False,
         }
@@ -14828,13 +14828,13 @@ class TestIntegrityCheckBlockedSnapshotWiring:
         with patch.object(BaseStage, 'run', new=AsyncMock(return_value=base_report)):
             report = await stage.run(
                 events=[],
-                watermark=Watermark(project_id='dark_factory'),
+                watermark=Watermark(project_id='reify'),
                 prior_reports=[],
                 run_id='run-1840',
             )
 
         assert len(report.items_flagged) == 2, (
-            "Both findings must survive for non-blocked project 'dark_factory'; "
+            "Both findings must survive for non-blocked project 'reify'; "
             f"got items_flagged={report.items_flagged!r}"
         )
         assert report.stats.get('blocked_snapshot_findings_dropped') == 0, (

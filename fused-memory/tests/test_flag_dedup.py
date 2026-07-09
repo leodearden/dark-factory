@@ -7355,22 +7355,22 @@ class TestFilterBlockedSnapshotFindings:
     # -----------------------------------------------------------------------
 
     def test_snapshot_absence_finding_kept_for_non_blocked_project(self):
-        """For dark_factory (not in blocked set), same missing_knowledge absence finding is KEPT."""
+        """For reify (not in blocked set), same missing_knowledge absence finding is KEPT."""
         from fused_memory.reconciliation.flag_dedup import filter_blocked_snapshot_findings
 
         flag = self._make_flag(
             category='missing_knowledge',
-            description='dark_factory has no task-count snapshot temporal_fact edge',
-            suggested_action='Add a count snapshot temporal_fact for dark_factory',
+            description='reify has no task-count snapshot temporal_fact edge',
+            suggested_action='Add a count snapshot temporal_fact for reify',
         )
-        result = filter_blocked_snapshot_findings([flag], project_id='dark_factory')
+        result = filter_blocked_snapshot_findings([flag], project_id='reify')
         assert flag in result, (
-            "For non-blocked project 'dark_factory', missing_knowledge snapshot finding "
+            "For non-blocked project 'reify', missing_knowledge snapshot finding "
             f"must pass through unchanged (fail-open); got {result!r}"
         )
 
     def test_raw_count_finding_kept_for_non_blocked_project(self):
-        """For dark_factory, same memory_stale raw-count finding is KEPT (fail-open)."""
+        """For reify, same memory_stale raw-count finding is KEPT (fail-open)."""
         from fused_memory.reconciliation.flag_dedup import filter_blocked_snapshot_findings
 
         flag = self._make_flag(
@@ -7378,29 +7378,29 @@ class TestFilterBlockedSnapshotFindings:
             description='task-count snapshot edge records 607 done / 148 cancelled',
             suggested_action='Update the snapshot',
         )
-        result = filter_blocked_snapshot_findings([flag], project_id='dark_factory')
+        result = filter_blocked_snapshot_findings([flag], project_id='reify')
         assert flag in result, (
-            "For non-blocked project 'dark_factory', memory_stale count snapshot finding "
+            "For non-blocked project 'reify', memory_stale count snapshot finding "
             f"must pass through unchanged (fail-open); got {result!r}"
         )
 
     def test_both_snapshot_findings_survive_for_non_blocked_project(self):
-        """For dark_factory both the snapshot-absence and raw-count findings survive."""
+        """For reify both the snapshot-absence and raw-count findings survive."""
         from fused_memory.reconciliation.flag_dedup import filter_blocked_snapshot_findings
 
         absence_flag = self._make_flag(
             category='missing_knowledge',
-            description='dark_factory has no task-count snapshot temporal_fact edge',
+            description='reify has no task-count snapshot temporal_fact edge',
         )
         stale_flag = self._make_flag(
             category='memory_stale',
             description='count snapshot edge records 607 done / 148 cancelled',
         )
         result = filter_blocked_snapshot_findings(
-            [absence_flag, stale_flag], project_id='dark_factory'
+            [absence_flag, stale_flag], project_id='reify'
         )
         assert len(result) == 2, (
-            f"Both findings must survive for non-blocked 'dark_factory'; got {result!r}"
+            f"Both findings must survive for non-blocked 'reify'; got {result!r}"
         )
 
     # -----------------------------------------------------------------------
