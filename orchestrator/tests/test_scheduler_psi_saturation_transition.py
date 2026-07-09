@@ -98,3 +98,92 @@ def _psi(
         io_some10=io_some10,
         read_ok=read_ok,
     )
+
+
+# ---------------------------------------------------------------------------
+# Scenario 1 — full idle -> saturated -> idle transition end-to-end
+#
+# RED (step-1): drives ticks via ``_FakeClock`` / ``_PsiFeed`` / ``_Driver``,
+# none of which exist yet.  This is deliberate write-the-API-you-wish-you-had
+# TDD for the test-harness infrastructure itself (this task adds no
+# production module) — the NameError below IS the RED failure; step-2 builds
+# exactly the harness this test exercises.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestPsiSaturationTransition:
+    """DA4 integration gate: multi-tick PSI saturation transitions driven
+    against the REAL Scheduler.acquire_next() + ModuleLockTable + SQLite
+    EventStore (task 2329)."""
+
+    async def test_full_transition_idle_saturated_idle(self, tmp_path) -> None:
+        """Scenario 1: idle -> saturated -> idle, full transition.
+
+        Backlog: 4 heavy (H1..H4, distinct files/modules) + 1 deterministic
+        (D1).  Heavies outrank D1 (priority='high' vs D1's default 'medium')
+        so the idle phase dispatches heavies first, never D1 — isolating D1's
+        later dispatch as evidence of the deterministic exemption rather than
+        plain scoring luck.
+        """
+        event_store = EventStore(db_path=tmp_path / 'psi.db', run_id='da4-s1')
+        clock = _FakeClock()
+        config = OrchestratorConfig(max_per_module=1, max_concurrent_tasks=6)
+
+        tasks = [
+            _heavy_task('H1', priority='high', files=['src/h1.py']),
+            _heavy_task('H2', priority='high', files=['src/h2.py']),
+            _heavy_task('H3', priority='high', files=['src/h3.py']),
+            _heavy_task('H4', priority='high', files=['src/h4.py']),
+            _det_task('D1', files=['src/d1.py']),
+        ]
+
+        feed = _PsiFeed()  # starts idle
+        driver = _Driver.build(
+            config, tasks, event_store=event_store, time_source=clock, psi_feed=feed,
+        )
+
+        # --- (A) idle: heavies dispatch, zero dispatch_deferred ---
+        await driver.run_ticks(2)
+        assert driver.heavy_in_flight() == 2, (
+            'two heavy tasks should be in flight after 2 idle ticks'
+        )
+        assert driver.deferred_events() == [], 'an idle host must never defer dispatch'
+
+        # --- (B) saturated: heavies held, deterministic still dispatches ---
+        feed.set_saturated(cpu_some10=90.0)
+        await driver.run_ticks(4)
+
+        assert driver.heavy_in_flight() == 2, 'saturation must not admit new heavy dispatch'
+        assert 'D1' in driver.dispatched_ids(), (
+            'deterministic tasks are exempt from the PSI hold'
+        )
+
+        deferred_during_saturation = driver.deferred_events()
+        assert len(deferred_during_saturation) >= 1, (
+            'saturation must defer at least one heavy dispatch'
+        )
+        assert deferred_during_saturation[0]['data'] == {
+            'metric': 'cpu_some_avg10',
+            'value': 90.0,
+            'in_flight': 2,
+            'floor': 1,
+        }
+        assert all(
+            e['task_id'] in {'H1', 'H2', 'H3', 'H4'} for e in deferred_during_saturation
+        ), 'dispatch_deferred must only ever name a HEAVY candidate, never the deterministic task'
+        assert driver.heavy_in_flight() >= config.psi_admission.min_inflight_floor, (
+            'in-flight heavy must never fall below the anti-deadlock floor while held'
+        )
+
+        # --- (C) recovery: remaining heavies dispatch, no residual hold ---
+        feed.set_idle()
+        await driver.run_ticks(2)
+
+        assert driver.heavy_in_flight() == 4, (
+            'recovery must dispatch the remaining heavies (work-conserving)'
+        )
+        assert driver.dispatched_ids() == {'H1', 'H2', 'H3', 'H4', 'D1'}
+        assert driver.deferred_events() == deferred_during_saturation, (
+            'no NEW dispatch_deferred events may occur after the recovery flip'
+        )
