@@ -208,9 +208,11 @@ class TestB1WriterReaderRoundTrip:
 
         # Simulate restart: fresh in-memory pool cache; durable record +
         # git worktree persist on disk.
+        old_pool = harness.git_ops.warm_lane_pool
+        assert old_pool is not None
         harness.git_ops.warm_lane_pool = WarmLanePool(
             worktree_base=harness.git_ops.worktree_base,
-            size=harness.git_ops.warm_lane_pool.size,
+            size=old_pool.size,
         )
 
         # READER: real crash recovery.
@@ -254,9 +256,11 @@ class TestB2CrashQuarantine:
         lane = await _acquire_lane(harness.git_ops, '42', head)
         assert (repo / '.git' / 'worktrees' / lane.name).exists()
 
+        old_pool = harness.git_ops.warm_lane_pool
+        assert old_pool is not None
         harness.git_ops.warm_lane_pool = WarmLanePool(
             worktree_base=harness.git_ops.worktree_base,
-            size=harness.git_ops.warm_lane_pool.size,
+            size=old_pool.size,
         )
 
         # Simulate the 2097/2098 orphan: the admin entry is gone but the
@@ -276,7 +280,7 @@ class TestB2CrashQuarantine:
         assert pool.state(lane) == LaneState.FREE
         assert '42' not in harness._recovered_plans
 
-        emitted = {c.args[0] for c in harness.event_store.emit.call_args_list}
+        emitted = {c.args[0] for c in harness.event_store.emit.call_args_list}  # type: ignore[union-attr]
         assert EventType.worktree_quarantined in emitted
 
         assert any(
@@ -313,13 +317,17 @@ class TestB3IllegalTransitionEscalates:
         lc.transition(lane, DurableLaneState.REGISTERED, branch='task/42')
         lc.transition(lane, DurableLaneState.ASSIGNED, task_id='42', branch='task/42')
         lc.transition(lane, DurableLaneState.RELEASED)
-        assert lc.read(lane).state == DurableLaneState.RELEASED
+        released_rec = lc.read(lane)
+        assert released_rec is not None
+        assert released_rec.state == DurableLaneState.RELEASED
 
         with pytest.raises(IllegalLaneTransition):
             lc.transition(lane, DurableLaneState.IN_USE)
 
         # Record left unchanged (never silent-heal).
-        assert lc.read(lane).state == DurableLaneState.RELEASED
+        unchanged_rec = lc.read(lane)
+        assert unchanged_rec is not None
+        assert unchanged_rec.state == DurableLaneState.RELEASED
 
         pending = queue.get_by_task(f'lane-lifecycle-{lane.name}', status='pending')
         assert pending
