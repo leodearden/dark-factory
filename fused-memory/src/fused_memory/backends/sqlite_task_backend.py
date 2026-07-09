@@ -733,6 +733,12 @@ class SqliteTaskBackend:
         self._residual_dup_escalation_cb = (
             residual_dup_escalation_cb or emit_residual_candidate_key_escalation
         )
+        # Test-only fault-injection seam (fm-task-dedup W8 task A3, BT-A3):
+        # when set to a callable, add_task invokes it immediately after the
+        # tasks INSERT and before the txn commit, to simulate a crash
+        # between INSERT and COMMIT. NOT part of TaskBackendProtocol;
+        # production code paths never set this — it stays None.
+        self._after_insert_fault_hook: Any = None
         self._connections: dict[str, aiosqlite.Connection] = {}
         # Guards the connection map AND each project's first-access bring-up
         # (schema + WAL pragmas). Held briefly during open; released before
@@ -1378,6 +1384,13 @@ class SqliteTaskBackend:
                         candidate_key,
                     ),
                 )
+                if self._after_insert_fault_hook is not None:
+                    # BT-A3 crash seam: raises to simulate a crash between
+                    # INSERT and COMMIT; _txn rolls back on any BaseException
+                    # and re-raises, so this propagates untouched (it is not
+                    # a sqlite3.IntegrityError, so the except clause below
+                    # does not intercept it).
+                    self._after_insert_fault_hook()
                 for dep in deps_list:
                     await conn.execute(
                         'INSERT OR IGNORE INTO dependencies '
