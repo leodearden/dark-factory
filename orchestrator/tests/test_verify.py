@@ -1605,6 +1605,134 @@ class TestRunScopedVerificationSkipsUntouched:
         )
 
 
+class TestMergeFanoutCap:
+    """Task 2393 (T5): the merge-role internal pytest fan-out is bounded by
+    its own dedicated cap (``merge_verify_max_concurrent_pytests``),
+    decoupled from the general ``max_concurrent_module_verifies`` used by
+    task/background roles.
+
+    Merge-role pytests bypass the T2 counting admission slot
+    (``_admission_slot`` no-ops for role='merge'), so the merge internal
+    fan-out branch of ``run_scoped_verification`` needs its own bound.
+    """
+
+    @pytest.mark.asyncio
+    async def test_merge_fanout_bounded_by_dedicated_merge_cap(self, tmp_path: Path):
+        """role='merge' fan-out is bounded by merge_verify_max_concurrent_pytests,
+        not by the general max_concurrent_module_verifies.
+        """
+        (tmp_path / 'conftest.py').write_text('# root\n')  # source, fits no prefix
+        config = OrchestratorConfig(
+            project_root=tmp_path,
+            concurrent_verify=False,
+            max_concurrent_module_verifies=6,
+            merge_verify_max_concurrent_pytests=2,
+        )
+        module_configs = [
+            ModuleConfig(prefix=f'mod{i}', test_command=f'__cmd{i}__')
+            for i in range(6)
+        ]
+
+        state = {'current': 0, 'peak': 0}
+
+        async def fake_run_cmd(cmd, cwd, timeout, env=None, log_path=None, **kwargs):
+            state['current'] += 1
+            state['peak'] = max(state['peak'], state['current'])
+            await asyncio.sleep(0.02)  # hold the slot so overlap is observable
+            state['current'] -= 1
+            return 0, '', False
+
+        with patch('orchestrator.verify._run_cmd', side_effect=fake_run_cmd):
+            result = await run_scoped_verification(
+                tmp_path, config, module_configs,
+                task_files=['conftest.py'],
+                role='merge',
+            )
+
+        assert result.passed
+        assert state['peak'] == 2, (
+            f'expected the dedicated merge cap (2) to bound AND saturate the '
+            f'fan-out (6 modules); peak={state["peak"]}'
+        )
+
+    @pytest.mark.asyncio
+    async def test_task_fanout_uses_general_cap_not_merge_cap(self, tmp_path: Path):
+        """role='task' fan-out still uses max_concurrent_module_verifies; the
+        merge-only cap is ignored — proves the two knobs are decoupled.
+        """
+        (tmp_path / 'conftest.py').write_text('# root\n')
+        config = OrchestratorConfig(
+            project_root=tmp_path,
+            concurrent_verify=False,
+            max_concurrent_module_verifies=2,
+            merge_verify_max_concurrent_pytests=6,
+        )
+        module_configs = [
+            ModuleConfig(prefix=f'mod{i}', test_command=f'__cmd{i}__')
+            for i in range(6)
+        ]
+
+        state = {'current': 0, 'peak': 0}
+
+        async def fake_run_cmd(cmd, cwd, timeout, env=None, log_path=None, **kwargs):
+            state['current'] += 1
+            state['peak'] = max(state['peak'], state['current'])
+            await asyncio.sleep(0.02)
+            state['current'] -= 1
+            return 0, '', False
+
+        with patch('orchestrator.verify._run_cmd', side_effect=fake_run_cmd):
+            result = await run_scoped_verification(
+                tmp_path, config, module_configs,
+                task_files=['conftest.py'],
+                role='task',
+            )
+
+        assert result.passed
+        assert state['peak'] == 2, (
+            f'expected the general cap (2) to bound task-role fan-out '
+            f'regardless of merge_verify_max_concurrent_pytests; peak={state["peak"]}'
+        )
+
+    @pytest.mark.asyncio
+    async def test_scoped_single_subproject_merge_unaffected(self, tmp_path: Path):
+        """A scoped (single-subproject) merge verify never fans out, so it is
+        unaffected by the merge cap's value (even a cap of 1 is a no-op here).
+        """
+        (tmp_path / 'mod0').mkdir()
+        (tmp_path / 'mod0' / 'test_foo.py').write_text('# foo\n')
+        config = OrchestratorConfig(
+            project_root=tmp_path,
+            concurrent_verify=False,
+            merge_verify_max_concurrent_pytests=1,
+        )
+        module_configs = [
+            ModuleConfig(prefix='mod0', test_command='__cmd0__'),
+        ]
+
+        state = {'current': 0, 'peak': 0}
+
+        async def fake_run_cmd(cmd, cwd, timeout, env=None, log_path=None, **kwargs):
+            state['current'] += 1
+            state['peak'] = max(state['peak'], state['current'])
+            await asyncio.sleep(0.02)
+            state['current'] -= 1
+            return 0, '', False
+
+        with patch('orchestrator.verify._run_cmd', side_effect=fake_run_cmd):
+            result = await run_scoped_verification(
+                tmp_path, config, module_configs,
+                task_files=['mod0/test_foo.py'],
+                role='merge',
+            )
+
+        assert result.passed
+        assert state['peak'] == 1, (
+            f'scoped single-subproject merge verify should never fan out; '
+            f'peak={state["peak"]}'
+        )
+
+
 class TestApplyCargoScopePolyglotGuard:
     """_apply_cargo_scope polyglot-diff guard: whitelist safe non-.rs extensions.
 
