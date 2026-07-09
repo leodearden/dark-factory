@@ -35,6 +35,7 @@ from shared.task_metadata import DoneProvenance, SchemaWarning, parse_metadata
 from shared.task_statuses import TERMINAL as TERMINAL_STATUSES
 from shared.task_transitions import derive_actor_class, is_legal_transition
 
+from fused_memory.backends.task_backend_errors import DuplicateCandidateKeyError
 from fused_memory.backends.task_backend_protocol import TaskBackendProtocol
 from fused_memory.middleware.dark_factory_path_guard import (
     DARK_FACTORY_PROJECT_ID,
@@ -2595,6 +2596,28 @@ class TaskInterceptor:
                     **kwargs,
                 )
                 atomic_metadata_written = metadata_json is not None
+            except DuplicateCandidateKeyError as exc:
+                # The partial UNIQUE index on (tag, candidate_key) rejected
+                # this insert — resolve as a combine pointing at the
+                # surviving row rather than falling through to 'failed'
+                # (PRD decision #3: a collision is not a failure).
+                existing_id = (
+                    str(exc.existing_id) if exc.existing_id is not None else None
+                )
+                result_dict = {
+                    'id': existing_id,
+                    'title': candidate.title if candidate else '',
+                    'deduplicated': True,
+                    'action': 'candidate_key_collision',
+                    'justification': 'candidate_key_collision',
+                }
+                return (
+                    'combined',
+                    existing_id,
+                    'candidate_key_collision',
+                    result_dict,
+                    curator_degrade_reason,
+                )
             except TypeError:
                 result = await tm.add_task(project_root=project_root, **kwargs)
                 atomic_metadata_written = False
