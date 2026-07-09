@@ -92,6 +92,8 @@ if [[ "$MODE" == "check" ]]; then
     exit 0
 fi
 
+cp -p "$CONFIG" "${CONFIG}.bak-${LABEL}"
+
 tmp="$(mktemp "${CONFIG}.XXXXXX")"
 awk '
     $0 ~ "^[[:space:]]*persistent_merge_worktree[[:space:]]*:" { next }
