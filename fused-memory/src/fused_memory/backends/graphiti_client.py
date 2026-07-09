@@ -1286,6 +1286,68 @@ class GraphitiBackend:
             'inter_node_deleted': inter_node_deleted,
         }
 
+    async def _repair_duplicate_edge_uuids(self, group_id: str) -> int:
+        """One-shot idempotent repair: re-mint fresh uuids on legacy dup-uuid
+        RELATES_TO edges so per-uuid count(*) <= 1 — B6 dup-uuid-edge repair.
+
+        Reuses redirect_node_edges's (task 2207 W6-δ) fresh-uuid4 +
+        superseded_edge_uuid + ID(e)-keyed per-edge convention, but re-mints
+        IN PLACE via a property SET rather than δ's CREATE-new/DELETE-old
+        redirect: this repair never moves an edge to a different endpoint, so
+        an in-place SET preserves both endpoints and the vecf32
+        fact_embedding automatically (no CREATE/DELETE, no per-property
+        copy). Keying on the stable internal ID(e) — not e.uuid — is
+        mandatory precisely because the uuid is duplicated and cannot target
+        a single edge.
+
+        Within each dup-uuid group the first enumerated edge (eids[0]) keeps
+        its original uuid (the survivor); only eids[1:] are re-minted. This
+        is the minimal write set that restores per-uuid count(*) <= 1 while
+        preserving the full edge set (no edge created or deleted), and it
+        makes the repair idempotent: a re-run's detection query finds no
+        group with count(*) > 1 and performs zero writes.
+
+        GRAPH-KEY-scoped (NO group_id filter) — deliberately broader than the
+        dup-node alarm's `n.group_id = $group_id` scoping. ζ's forthcoming
+        uuid-keyed read dedup operates on the graph key regardless of an
+        edge's group_id property, so EVERY RELATES_TO edge in this graph key
+        must reach per-uuid uniqueness; a group_id filter here could leave a
+        dup-uuid pair unrepaired and silently break ζ's global
+        uuid-uniqueness premise.
+
+        Args:
+            group_id: Project graph to repair.
+
+        Returns:
+            Count of edges re-minted (0 on a clean graph — no-op).
+        """
+        graph = self._graph_for(group_id)
+        detect_cypher = (
+            'MATCH ()-[e:RELATES_TO]->() '
+            'WITH e.uuid AS u, count(*) AS c, collect(ID(e)) AS eids '
+            'WHERE c > 1 '
+            'RETURN u, eids'
+        )
+        detect_result = await graph.query(detect_cypher)
+        repaired = 0
+        for old_uuid, eids in (detect_result.result_set or []):
+            for eid in eids[1:]:
+                new_uuid = str(uuid.uuid4())
+                await graph.query(
+                    'MATCH ()-[e:RELATES_TO]->() '
+                    'WHERE ID(e) = $eid '
+                    'SET e.uuid = $new_uuid, e.superseded_edge_uuid = $old_uuid',
+                    {'eid': eid, 'new_uuid': new_uuid, 'old_uuid': old_uuid},
+                )
+                repaired += 1
+        if repaired:
+            logger.info(
+                'startup identity scan: re-minted %d duplicate-uuid RELATES_TO edge(s) '
+                'in graph %r',
+                repaired, group_id,
+            )
+        return repaired
+
     @_canonicalize_group_args
     async def merge_entities(
         self, deprecated_uuid: str, surviving_uuid: str, *, group_id: str
