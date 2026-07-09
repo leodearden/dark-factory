@@ -472,6 +472,44 @@ class TestB3CapHitDrivesAccountCapped:
 # ---------------------------------------------------------------------------
 
 
+async def _drive_non_cap_error_and_assert_bounded(result: AgentResult) -> None:
+    """B4 consumer-side drive: replay *result* (a NON_CAP_CLI_ERROR_MARKERS
+    failure) through invoke_with_cap_retry's fake-CLI harness and assert (a)
+    the selected account is NOT transitioned to CAPPED and (b) the retry
+    loop is bounded -- the fake CLI is invoked exactly once, never looped.
+
+    Uses a 2-account gate (mirrors _drive_caphit_record_to_capped) plus a
+    low max_cap_retries as a second, independent bound layered on top of
+    scripted_cli's own "exhausted" guard: if CliLocalError's precedence
+    over CapHit ever regressed (the zero-cost heuristic net in
+    invoke_with_cap_retry re-classifying this as a cap hit), either bound
+    turns what would be an infinite retry into a loud, immediate failure
+    instead of a hang.
+    """
+    gate = make_boundary_gate(['acct-0', 'acct-1'])
+    acct = gate._accounts[0]
+    cli = scripted_cli(result)
+
+    with patch('shared.cli_invoke.asyncio.sleep', new_callable=AsyncMock):
+        returned = await invoke_with_cap_retry(
+            gate, 'B4[non-cap-marker]',
+            invoke_fn=cli,
+            max_cap_retries=2,
+            backend='claude',
+            prompt='hi',
+        )
+
+    assert returned.success is False, 'expected the local-error result to be returned as-is'
+    assert len(cli.calls) == 1, (
+        f'expected exactly one invocation, the retry loop made {len(cli.calls)} -- '
+        'a NON_CAP marker must never trigger cap-retry'
+    )
+    assert acct.phase != AccountPhase.CAPPED, (
+        f'expected acct-0 to remain un-capped after a NON_CAP_CLI_ERROR_MARKERS '
+        f'failure, got {acct.phase}'
+    )
+
+
 @pytest.mark.asyncio
 class TestB4Reify3604NonCap:
     """A NON_CAP_CLI_ERROR_MARKERS string always classifies as CliLocalError,
