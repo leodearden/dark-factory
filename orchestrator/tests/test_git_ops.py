@@ -20,6 +20,7 @@ from orchestrator.git_ops import (
     WorktreeConflictError,
     WorktreeInfo,
     WorktreeMissing,
+    _assert_no_conflict_markers,
     _merge_subject,
     _run,
     canonical_queued_branch_name,
@@ -3430,6 +3431,76 @@ class TestScrubTaskDirFromTree:
         assert 'chore: remove .task/ contamination' in commit_msg, (
             f'Expected commit message to contain scrub marker, got: {commit_msg!r}'
         )
+
+
+@pytest.mark.asyncio
+class TestAssertNoConflictMarkers:
+    """Unit tests for the _assert_no_conflict_markers Layer-2 pre-merge gate
+    helper (esc-2128-8 defense-in-depth backstop for advance_main).
+
+    Marker tokens are built via runtime concatenation ('<' * 7, etc.) rather
+    than literal repeated characters, so this test file's own committed
+    source never carries a literal column-0 marker sequence that could trip
+    the very gate under test when this branch is merged.
+    """
+
+    async def test_raises_on_column_zero_conflict_markers(self, git_repo: Path):
+        """A tracked file whose content carries real (column-0) conflict
+        markers must be rejected, naming the offending file."""
+        open_marker = '<' * 7
+        mid_marker = '=' * 7
+        close_marker = '>' * 7
+        conflicted_path = 'marked.py'
+        (git_repo / conflicted_path).write_text(
+            f'{open_marker} HEAD\nours = 1\n{mid_marker}\ntheirs = 2\n{close_marker} branch\n',
+        )
+        await _run(['git', 'add', '-A'], cwd=git_repo)
+        await _run(['git', 'commit', '-m', 'introduce marker file'], cwd=git_repo)
+        _, sha, _ = await _run(['git', 'rev-parse', 'HEAD'], cwd=git_repo)
+        sha = sha.strip()
+
+        with pytest.raises(RuntimeError) as excinfo:
+            await _assert_no_conflict_markers(sha, git_repo, 'test')
+
+        assert conflicted_path in str(excinfo.value)
+
+    async def test_does_not_raise_on_clean_commit(self, git_repo: Path):
+        (git_repo / 'clean.py').write_text('x = 1\n')
+        await _run(['git', 'add', '-A'], cwd=git_repo)
+        await _run(['git', 'commit', '-m', 'clean file'], cwd=git_repo)
+        _, sha, _ = await _run(['git', 'rev-parse', 'HEAD'], cwd=git_repo)
+        sha = sha.strip()
+
+        await _assert_no_conflict_markers(sha, git_repo, 'test')  # must not raise
+
+    async def test_does_not_raise_on_bare_equals_separator(self, git_repo: Path):
+        """A bare column-0 '=======' line (e.g. a reStructuredText/Markdown
+        heading underline) must NOT be treated as a conflict marker — only
+        the unambiguous opening/closing brackets are unambiguous enough to
+        gate on."""
+        mid_marker = '=' * 7
+        (git_repo / 'heading.rst').write_text(f'Title\n{mid_marker}\n\nBody text.\n')
+        await _run(['git', 'add', '-A'], cwd=git_repo)
+        await _run(['git', 'commit', '-m', 'rst heading'], cwd=git_repo)
+        _, sha, _ = await _run(['git', 'rev-parse', 'HEAD'], cwd=git_repo)
+        sha = sha.strip()
+
+        await _assert_no_conflict_markers(sha, git_repo, 'test')  # must not raise
+
+    async def test_does_not_raise_on_indented_marker_like_text(self, git_repo: Path):
+        """Marker-like text that is NOT anchored at column 0 (e.g. a string
+        literal inside a fixture/doc file) must not false-positive."""
+        open_marker = '<' * 7
+        close_marker = '>' * 7
+        (git_repo / 'doc.py').write_text(
+            f'    example = "{open_marker} HEAD"\n    other = "{close_marker} branch"\n',
+        )
+        await _run(['git', 'add', '-A'], cwd=git_repo)
+        await _run(['git', 'commit', '-m', 'indented marker-like text'], cwd=git_repo)
+        _, sha, _ = await _run(['git', 'rev-parse', 'HEAD'], cwd=git_repo)
+        sha = sha.strip()
+
+        await _assert_no_conflict_markers(sha, git_repo, 'test')  # must not raise
 
 
 @pytest.mark.asyncio
