@@ -368,37 +368,6 @@ class TestWorktreeLifecycle:
         assert info.path.exists()
         assert (info.path / 'README.md').exists()
 
-    async def test_create_worktree_refuses_leftover_branch_with_commits(
-        self, git_ops: GitOps,
-    ):
-        """A leftover branch carrying a commit beyond main must NOT be deleted —
-        raise instead, preserving the branch and its orphan commit."""
-        full_branch = 'task/lo-commit'
-        # Build the branch with a real commit beyond main via a throwaway
-        # worktree, then remove the worktree so the branch is a dangling ref.
-        tmp_wt = git_ops.project_root.parent / 'tmp-lo-commit'
-        rc, _, err = await _run(
-            ['git', 'worktree', 'add', '-b', full_branch, str(tmp_wt), 'main'],
-            cwd=git_ops.project_root,
-        )
-        assert rc == 0, err
-        (tmp_wt / 'orphan_work.py').write_text('value = 42\n')
-        await _run(['git', 'add', '-A'], cwd=tmp_wt)
-        await _run(['git', 'commit', '-m', 'orphan WIP commit'], cwd=tmp_wt)
-        _, commit_sha, _ = await _run(['git', 'rev-parse', full_branch], cwd=git_ops.project_root)
-        commit_sha = commit_sha.strip()
-        # Detach the worktree, leaving a dangling branch with one commit.
-        await _run(['git', 'worktree', 'remove', '--force', str(tmp_wt)], cwd=git_ops.project_root)
-
-        with pytest.raises(RuntimeError) as excinfo:
-            await git_ops.create_worktree('lo-commit')
-
-        # The branch and its commit must be preserved (NOT deleted).
-        rc, sha_after, _ = await _run(['git', 'rev-parse', full_branch], cwd=git_ops.project_root)
-        assert rc == 0, 'leftover branch must still exist'
-        assert sha_after.strip() == commit_sha, 'orphan commit must be preserved'
-        assert full_branch in str(excinfo.value)
-
     async def test_create_worktree_refuses_leftover_branch_in_dirty_worktree(
         self, git_ops: GitOps,
     ):
@@ -426,6 +395,157 @@ class TestWorktreeLifecycle:
         assert dirty_file.read_text() == 'work_in_progress = True\n'
         rc, _, _ = await _run(['git', 'rev-parse', full_branch], cwd=git_ops.project_root)
         assert rc == 0, 'leftover branch must still exist'
+
+    # ── Fix: cold-path γ reattach — resume a reaped-but-retained WIP branch ──
+    # The stranded-in-progress reconciler's stale-lock path removes a
+    # worktree's directory via cleanup_worktree but RETAINS the task branch
+    # when it carries commits beyond main.  On re-dispatch, the cold path
+    # used to treat that leftover branch identically to any other leftover
+    # and raise via _cleanup_leftover_branch — wedging the task BLOCKED
+    # forever.  The γ reattach guard re-attaches the worktree to the
+    # surviving branch (no -b) and resumes, mirroring acquire_warm_lane's
+    # create-once γ reattach site.
+
+    async def test_create_worktree_reattaches_reaped_but_retained_wip_branch(
+        self, git_ops: GitOps,
+    ):
+        """A leftover branch carrying a commit beyond main, whose worktree dir
+        is gone (the reaped-but-retained shape), must be RE-ATTACHED and
+        RESUMED — not destroyed via the old raise-on-leftover-branch path."""
+        full_branch = 'task/lo-commit'
+        # Build the branch with a real commit beyond main via a throwaway
+        # worktree, then remove the worktree so the branch is a dangling ref
+        # (worktree_base/'lo-commit' never existed — the reaped-but-retained
+        # shape: dir gone, branch survives).
+        tmp_wt = git_ops.project_root.parent / 'tmp-lo-commit'
+        rc, _, err = await _run(
+            ['git', 'worktree', 'add', '-b', full_branch, str(tmp_wt), 'main'],
+            cwd=git_ops.project_root,
+        )
+        assert rc == 0, err
+        (tmp_wt / 'orphan_work.py').write_text('value = 42\n')
+        await _run(['git', 'add', '-A'], cwd=tmp_wt)
+        await _run(['git', 'commit', '-m', 'orphan WIP commit'], cwd=tmp_wt)
+        await _run(['git', 'worktree', 'remove', '--force', str(tmp_wt)], cwd=git_ops.project_root)
+
+        info = await git_ops.create_worktree('lo-commit')
+
+        # Re-attached and resumed — no raise, and the WIP is intact.
+        assert info.path.exists()
+        assert (info.path / 'README.md').exists(), 'must carry main content'
+        assert (info.path / 'orphan_work.py').exists(), 'WIP must be resumed, not destroyed'
+        assert (info.path / 'orphan_work.py').read_text() == 'value = 42\n'
+
+        # The branch must still carry commits beyond main — resumed, not
+        # reset (exact SHA is not asserted: rebase_onto_main +
+        # rebind_branch_to_head may re-parent the commit).
+        rc, count_out, _ = await _run(
+            ['git', 'rev-list', '--count', f'main..{full_branch}'],
+            cwd=git_ops.project_root,
+        )
+        assert rc == 0
+        assert int(count_out.strip()) > 0, 'branch must still carry commits beyond main'
+
+    async def test_create_worktree_reattach_refuses_when_branch_checked_out_elsewhere(
+        self, git_ops: GitOps,
+    ):
+        """When the γ reattach guard fires but the branch is still checked out
+        in another LIVE worktree, `git worktree add` (no -b) fails — the
+        helper must raise rather than fall through to any destructive
+        cleanup.  The branch, its commit, and the holding worktree's content
+        all survive intact."""
+        full_branch = 'task/lo-live'
+        holding = git_ops.project_root.parent / 'holding-lo-live'
+        rc, _, err = await _run(
+            ['git', 'worktree', 'add', '-b', full_branch, str(holding), 'main'],
+            cwd=git_ops.project_root,
+        )
+        assert rc == 0, err
+        (holding / 'live_work.py').write_text('value = 7\n')
+        await _run(['git', 'add', '-A'], cwd=holding)
+        await _run(['git', 'commit', '-m', 'live WIP commit'], cwd=holding)
+        _, commit_sha, _ = await _run(['git', 'rev-parse', full_branch], cwd=git_ops.project_root)
+        commit_sha = commit_sha.strip()
+        # `holding` is left checked out — worktree_base/'lo-live' (create_worktree's
+        # target) is a distinct, nonexistent path.
+
+        with pytest.raises(RuntimeError) as excinfo:
+            await git_ops.create_worktree('lo-live')
+
+        assert 'refus' in str(excinfo.value).lower()
+
+        # The branch and its commit must be preserved (NOT deleted).
+        rc, sha_after, _ = await _run(['git', 'rev-parse', full_branch], cwd=git_ops.project_root)
+        assert rc == 0, 'leftover branch must still exist'
+        assert sha_after.strip() == commit_sha, 'commit must be preserved'
+
+        # The holding worktree's committed file must survive.
+        assert (holding / 'live_work.py').exists()
+        assert (holding / 'live_work.py').read_text() == 'value = 7\n'
+
+    # ── Companion: retain-dir reuse preserves WIP + .task/ state ───────────
+    # The harness-side no-lock reconcile guard
+    # (harness._revert_in_progress_if_no_live_claimant) takes a DIFFERENT
+    # defense than the γ reattach tests above: instead of letting the dir
+    # get reaped and re-attaching a bare branch, it RETAINS the
+    # still-registered worktree directory when the branch carries WIP
+    # commits.  The next dispatch's create_worktree call then resumes it via
+    # the ordinary registered-worktree REUSE path (`if worktree_path.
+    # exists()`), NOT the γ reattach guard (which only fires once the dir is
+    # already gone).  This test covers that handoff: a registered worktree
+    # carrying both a WIP commit and a gitignored .task/plan.json survives a
+    # second create_worktree call intact — proving the two-defense design
+    # (retain-dir vs reaped-dir cold reattach) both resume correctly. A cold
+    # γ reattach could NOT have restored the .task/plan.json (a fresh `git
+    # worktree add` only restores the git tree; .task/ is gitignored and
+    # never part of it), so retain-and-reuse is a strict improvement where
+    # it applies.
+
+    async def test_create_worktree_reuse_preserves_wip_and_task_state(
+        self, git_ops: GitOps,
+    ):
+        """A registered worktree retained (not reaped) by the harness no-lock
+        guard — carrying a WIP commit AND a gitignored .task/plan.json — is
+        RESUMED by create_worktree's reuse path with both intact."""
+        info = await git_ops.create_worktree('lo-retain')
+        full_branch = 'task/lo-retain'
+
+        # Simulate the WIP an agent left behind before the worktree's lock
+        # was reaped (but the dir itself retained by the harness guard).
+        (info.path / 'wip_work.py').write_text('value = 99\n')
+        await _run(['git', 'add', '-A'], cwd=info.path)
+        await _run(['git', 'commit', '-m', 'agent WIP commit'], cwd=info.path)
+
+        # Simulate the harness/agent's gitignored .task/ state (plan.json) —
+        # written after create_worktree's _ensure_task_gitignore already
+        # ran, so it is untracked and excluded from commit()'s :!.task
+        # pathspec, exactly like a real retained worktree.
+        task_dir = info.path / '.task'
+        task_dir.mkdir(exist_ok=True)
+        (task_dir / 'plan.json').write_text('{"task_id": "lo-retain"}\n')
+
+        # Re-dispatch: create_worktree is called again against the RETAINED
+        # (still-registered) directory — the reuse path, not the γ reattach.
+        info2 = await git_ops.create_worktree('lo-retain')
+
+        assert info2.path == info.path
+        assert (info2.path / 'wip_work.py').exists(), 'WIP commit must survive reuse'
+        assert (info2.path / 'wip_work.py').read_text() == 'value = 99\n'
+        assert (info2.path / '.task' / 'plan.json').exists(), (
+            '.task/plan.json must survive reuse — a cold γ reattach could not '
+            'have restored it since .task/ is gitignored and untracked'
+        )
+        assert (
+            (info2.path / '.task' / 'plan.json').read_text()
+            == '{"task_id": "lo-retain"}\n'
+        )
+
+        rc, count_out, _ = await _run(
+            ['git', 'rev-list', '--count', f'main..{full_branch}'],
+            cwd=git_ops.project_root,
+        )
+        assert rc == 0
+        assert int(count_out.strip()) > 0, 'branch must still carry commits beyond main'
 
     # ── Fix: worktree-wipe race — canonical-path match + liveness gate ────
     # esc-4146-268: reify's `.worktrees` became a symlink → a 17 TB mount on
