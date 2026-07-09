@@ -1043,11 +1043,29 @@ class ItemLifecycleState(StrEnum):
     finalizing -> terminal.
 
     Members are ``str`` instances (mirrors :class:`InflightStatus` /
-    :class:`OutcomeKind` above), with lowercase wire values matching the
-    EXISTING ``InflightEntry.phase`` strings, so ``==``/``in`` comparisons
-    against those raw strings keep working unchanged and the downstream
-    repoint of ``snapshot()``/phase reads onto the registry (task kappa) is
-    a mechanical rename rather than a value remap.
+    :class:`OutcomeKind` above). Only THREE members share a wire value with
+    an existing live phase string today — ``VERIFYING`` ('verifying', set in
+    ``_run_inflight_verify``), ``GATE_REVERIFY`` ('gate_reverify'), and
+    ``FINALIZING`` ('finalizing') (the latter two set in
+    ``_finalize_inflight``) — so ``==``/``in`` comparisons against THOSE
+    THREE raw strings keep working unchanged. The other seven members are
+    new vocabulary replacing queue-membership / worker-side-field encodings
+    that never had a phase-string form, so there is no existing raw string
+    for them to stay compatible with.
+
+    The live pipeline (``_dispatch_item``) also sets phase values this enum
+    does NOT model, so task kappa's downstream repoint is a value REMAP for
+    these, not a mechanical rename:
+
+      * ``_verify_phase = 'remerging'`` (cascade-remerge window) is the live
+        string for the conceptual MERGING state used by the cascade-remerge
+        edges in ``_LEGAL_TRANSITIONS`` below — the wire VALUES differ
+        ('remerging' vs 'merging') even though the STATE is the same.
+      * ``entry.phase`` values ``'abandoned'``, ``'halted'``, and
+        ``'passthrough'`` (pre-dispatch abandon / operator-halt / decided-
+        item passthrough branches) have no member here at all — this
+        substrate intentionally does not model them; kappa decides how (or
+        whether) they map onto a state below.
 
     This is ONLY the state vocabulary — see
     ``orchestrator.merge_queue.ItemLifecycle`` for the request_id-keyed
