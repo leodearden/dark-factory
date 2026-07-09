@@ -14,6 +14,7 @@ core is generic and not accidentally hardcoded to the Stage 2 pool.
 """
 
 import logging
+from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
 import pytest
@@ -21,6 +22,7 @@ import pytest
 from fused_memory.reconciliation.summary_pool import (
     enforce_summary_pool_cap,
     pretrim_summary_pool,
+    reconstruct_cycle_summary_stub,
     verify_cycle_summary_written,
 )
 
@@ -43,6 +45,17 @@ _STAGE_PARAMS = pytest.mark.parametrize(
     'stage',
     ['memory_consolidator', 'task_knowledge_sync'],
     ids=['stage1', 'stage2'],
+)
+
+# Parametrize (stage, recon_pool, reconstruct_source) across both known
+# stages to prove reconstruct_cycle_summary_stub is generic.
+_STAGE_RECON_PARAMS = pytest.mark.parametrize(
+    'stage,recon_pool,reconstruct_source',
+    [
+        ('task_knowledge_sync', 'stage2_cycle_summary', 'stage2_summary_reconstruction'),
+        ('memory_consolidator', 'stage1_cycle_summary', 'stage1_summary_reconstruction'),
+    ],
+    ids=['stage2', 'stage1'],
 )
 
 
@@ -508,3 +521,159 @@ class TestVerifyCycleSummaryWritten:
             'run_id': 'run-xyz',
             'stage': stage,
         }
+
+
+class TestReconstructCycleSummaryStub:
+    """reconstruct_cycle_summary_stub: dedup-resilient fallback-stub write.
+
+    Generalizes task_knowledge_sync._reconstruct_stage2_summary (task 2366)
+    — parametrized over (stage, recon_pool, reconstruct_source) to prove the
+    core is generic, not hardcoded to either Stage 1 or Stage 2.
+    """
+
+    @_STAGE_RECON_PARAMS
+    @pytest.mark.asyncio
+    async def test_first_attempt_lands(self, stage, recon_pool, reconstruct_source):
+        memory_service = AsyncMock()
+        memory_service.add_memory = AsyncMock(return_value={'memory_ids': ['m1']})
+
+        result = await reconstruct_cycle_summary_stub(
+            memory_service,
+            'dark_factory',
+            'run-1',
+            stage=stage,
+            recon_pool=recon_pool,
+            reconstruct_source=reconstruct_source,
+        )
+
+        assert result == 1
+        memory_service.add_memory.assert_awaited_once()
+        kwargs = memory_service.add_memory.call_args.kwargs
+        assert kwargs.get('category') == 'observations_and_summaries'
+        assert kwargs.get('project_id') == 'dark_factory'
+        assert kwargs.get('causation_id') == 'run-1'
+        assert kwargs.get('_source') == reconstruct_source
+        assert kwargs.get('metadata') == {
+            'kind': 'cycle_summary',
+            'stage': stage,
+            'run_id': 'run-1',
+            'recon_pool': recon_pool,
+            'reconstructed': True,
+        }
+
+    @_STAGE_RECON_PARAMS
+    @pytest.mark.asyncio
+    async def test_dedup_noop_then_retry_lands(self, stage, recon_pool, reconstruct_source):
+        memory_service = AsyncMock()
+        memory_service.add_memory = AsyncMock(
+            side_effect=[{'memory_ids': []}, {'memory_ids': ['m2']}]
+        )
+
+        result = await reconstruct_cycle_summary_stub(
+            memory_service,
+            'dark_factory',
+            'run-2',
+            stage=stage,
+            recon_pool=recon_pool,
+            reconstruct_source=reconstruct_source,
+        )
+
+        assert result == 1
+        assert memory_service.add_memory.await_count == 2
+        contents = [
+            c.kwargs.get('content') for c in memory_service.add_memory.call_args_list
+        ]
+        assert contents[0] != contents[1], (
+            'retry must use a fresh nonce so the content differs from the first attempt'
+        )
+
+    @_STAGE_RECON_PARAMS
+    @pytest.mark.asyncio
+    async def test_dedup_noop_twice_returns_zero_and_logs_warning(
+        self, stage, recon_pool, reconstruct_source, caplog
+    ):
+        memory_service = AsyncMock()
+        memory_service.add_memory = AsyncMock(
+            side_effect=[{'memory_ids': []}, {'memory_ids': []}]
+        )
+
+        with caplog.at_level(logging.WARNING, logger=_LOGGER):
+            result = await reconstruct_cycle_summary_stub(
+                memory_service,
+                'dark_factory',
+                'run-3',
+                stage=stage,
+                recon_pool=recon_pool,
+                reconstruct_source=reconstruct_source,
+            )
+
+        assert result == 0
+        assert memory_service.add_memory.await_count == 2
+        warning_records = [r for r in caplog.records if r.levelno >= logging.WARNING]
+        assert len(warning_records) >= 1
+
+    @_STAGE_RECON_PARAMS
+    @pytest.mark.asyncio
+    async def test_add_memory_raises_returns_zero_and_logs_warning(
+        self, stage, recon_pool, reconstruct_source, caplog
+    ):
+        memory_service = AsyncMock()
+        memory_service.add_memory = AsyncMock(side_effect=RuntimeError('mem0 down'))
+
+        with caplog.at_level(logging.WARNING, logger=_LOGGER):
+            result = await reconstruct_cycle_summary_stub(
+                memory_service,
+                'dark_factory',
+                'run-4',
+                stage=stage,
+                recon_pool=recon_pool,
+                reconstruct_source=reconstruct_source,
+            )
+
+        assert result == 0
+        warning_records = [r for r in caplog.records if r.levelno >= logging.WARNING]
+        assert len(warning_records) >= 1
+
+    @pytest.mark.asyncio
+    async def test_content_shape_leads_with_stage1_nonce_and_embeds_run_id(self):
+        """content leads with a STAGE1-prefixed nonce and embeds 'run_id: <run_id>'
+        so both the metadata triple-filter and Path-1 semantic search self-heal."""
+        memory_service = AsyncMock()
+        memory_service.add_memory = AsyncMock(return_value={'memory_ids': ['m1']})
+
+        await reconstruct_cycle_summary_stub(
+            memory_service,
+            'dark_factory',
+            'run-shape',
+            stage='memory_consolidator',
+            recon_pool='stage1_cycle_summary',
+            reconstruct_source='stage1_summary_reconstruction',
+        )
+
+        content = memory_service.add_memory.call_args.kwargs.get('content')
+        first_line = content.splitlines()[0]
+        assert first_line.startswith('STAGE1_'), (
+            f'expected content to lead with a STAGE1-prefixed nonce, got: {first_line!r}'
+        )
+        assert 'run_id: run-shape' in content
+
+    @pytest.mark.asyncio
+    async def test_extract_response_memory_ids_handles_attr_response(self):
+        """The response-memory_ids extraction must accept an AddMemoryResponse-like
+        object (attribute access), not just a dict (mirrors production shape)."""
+        memory_service = AsyncMock()
+        memory_service.add_memory = AsyncMock(
+            return_value=SimpleNamespace(memory_ids=['m1'])
+        )
+
+        result = await reconstruct_cycle_summary_stub(
+            memory_service,
+            'dark_factory',
+            'run-attr',
+            stage='memory_consolidator',
+            recon_pool='stage1_cycle_summary',
+            reconstruct_source='stage1_summary_reconstruction',
+        )
+
+        assert result == 1
+        memory_service.add_memory.assert_awaited_once()
