@@ -958,14 +958,31 @@ class GraphitiBackend:
             'RETURN e.uuid, e.fact, e.name'
         )
         result = await graph.ro_query(cypher, {'uuid': node_uuid})
-        seen: set[str] = set()
+        seen: dict[str, EdgeDict] = {}
         edges: list[EdgeDict] = []
         for row in (result.result_set or []):
             edge_uuid = row[0]
             if edge_uuid in seen:
+                # Diagnostic only: the uuid-keyed dedup premise (task 2213 W6-zeta)
+                # is that RELATES_TO edge uuids are unique graph-wide post
+                # tasks 2207/2210. If that invariant is ever violated, two
+                # genuinely-distinct edges sharing a uuid would silently
+                # collapse to the first-seen row. Surface it at debug level
+                # rather than failing silently.
+                dup = self._edge_dict(row[0], row[1], row[2])
+                prior = seen[edge_uuid]
+                if dup['fact'] != prior['fact'] or dup['name'] != prior['name']:
+                    logger.debug(
+                        'get_valid_edges_for_node: edge uuid %s seen again with '
+                        'differing fact/name (kept fact=%r name=%r, saw fact=%r '
+                        'name=%r) — uuid-uniqueness invariant may be violated; '
+                        'keeping first-seen row',
+                        edge_uuid, prior['fact'], prior['name'], dup['fact'], dup['name'],
+                    )
                 continue
-            seen.add(edge_uuid)
-            edges.append(self._edge_dict(row[0], row[1], row[2]))
+            edge = self._edge_dict(row[0], row[1], row[2])
+            seen[edge_uuid] = edge
+            edges.append(edge)
         return edges
 
     @_canonicalize_group_args
@@ -1040,15 +1057,28 @@ class GraphitiBackend:
             'RETURN n.uuid, e.uuid, e.fact, e.name'
         )
         result = await graph.ro_query(cypher)
-        seen: set[tuple[str, str]] = set()
+        seen: dict[tuple[str, str], EdgeDict] = {}
         grouped: dict[str, list[EdgeDict]] = {}
         for row in (result.result_set or []):
             entity_uuid, edge_uuid = row[0], row[1]
             key = (entity_uuid, edge_uuid)
             if key in seen:
+                # Diagnostic only: see get_valid_edges_for_node — the same
+                # uuid-uniqueness invariant underpins this method's dedup key.
+                dup = self._edge_dict(row[1], row[2], row[3])
+                prior = seen[key]
+                if dup['fact'] != prior['fact'] or dup['name'] != prior['name']:
+                    logger.debug(
+                        'get_all_valid_edges: (entity, edge) pair %s seen again '
+                        'with differing fact/name (kept fact=%r name=%r, saw '
+                        'fact=%r name=%r) — uuid-uniqueness invariant may be '
+                        'violated; keeping first-seen row',
+                        key, prior['fact'], prior['name'], dup['fact'], dup['name'],
+                    )
                 continue
-            seen.add(key)
-            grouped.setdefault(entity_uuid, []).append(self._edge_dict(row[1], row[2], row[3]))
+            edge = self._edge_dict(row[1], row[2], row[3])
+            seen[key] = edge
+            grouped.setdefault(entity_uuid, []).append(edge)
         return grouped
 
     @_canonicalize_group_args

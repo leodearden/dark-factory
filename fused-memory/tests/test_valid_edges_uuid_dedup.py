@@ -10,10 +10,13 @@ that RELATES_TO edge uuids are unique graph-wide (post tasks 2207/2210).
 """
 from __future__ import annotations
 
+import logging
 from unittest.mock import MagicMock
 
 import pytest
 from _fm_helpers import extract_cypher, extract_params
+
+_LOGGER_NAME = 'fused_memory.backends.graphiti_client'
 
 # ---------------------------------------------------------------------------
 # step-1: GraphitiBackend.get_valid_edges_for_node
@@ -69,6 +72,38 @@ class TestGetValidEdgesForNodeUuidDedup:
         assert result[0]['fact'] == ''
         assert result[0]['name'] == ''
 
+    @pytest.mark.asyncio
+    async def test_shared_uuid_with_differing_content_logs_diagnostic(
+        self, mock_config, make_backend, make_graph_mock, caplog
+    ):
+        """A shared e.uuid with differing fact/name keeps the first row and logs a debug diagnostic.
+
+        The uuid-keyed dedup premise (task 2213) is that RELATES_TO edge uuids
+        are unique graph-wide post tasks 2207/2210. This can't happen through
+        the normal self-loop path (which repeats the identical row), so this
+        directly guards the "invariant silently violated" failure mode called
+        out in review: dedup must not silently undercount without a trace.
+        """
+        backend = make_backend(mock_config)
+        graph = make_graph_mock(ro_rows=[['e1', 'first-fact', 'first-name'], ['e1', 'second-fact', 'second-name']])
+        backend._driver._get_graph = MagicMock(return_value=graph)
+        with caplog.at_level(logging.DEBUG, logger=_LOGGER_NAME):
+            result = await backend.get_valid_edges_for_node('u', group_id='test')
+        assert result == [{'uuid': 'e1', 'fact': 'first-fact', 'name': 'first-name'}]
+        assert any('e1' in record.getMessage() for record in caplog.records)
+
+    @pytest.mark.asyncio
+    async def test_self_loop_identical_rows_do_not_log_diagnostic(
+        self, mock_config, make_backend, make_graph_mock, caplog
+    ):
+        """The ordinary self-loop double-match (identical rows) stays silent — no false-positive diagnostic."""
+        backend = make_backend(mock_config)
+        graph = make_graph_mock(ro_rows=[['e1', 'f', 'n'], ['e1', 'f', 'n']])
+        backend._driver._get_graph = MagicMock(return_value=graph)
+        with caplog.at_level(logging.DEBUG, logger=_LOGGER_NAME):
+            await backend.get_valid_edges_for_node('u', group_id='test')
+        assert caplog.records == []
+
 
 # ---------------------------------------------------------------------------
 # step-3: GraphitiBackend.get_all_valid_edges
@@ -123,3 +158,34 @@ class TestGetAllValidEdgesUuidDedup:
             {'uuid': 'e1', 'fact': 'f1', 'name': 'n1'},
             {'uuid': 'e2', 'fact': 'f2', 'name': 'n2'},
         ]
+
+    @pytest.mark.asyncio
+    async def test_shared_pair_with_differing_content_logs_diagnostic(
+        self, mock_config, make_backend, make_graph_mock, caplog
+    ):
+        """A shared (n.uuid, e.uuid) pair with differing fact/name keeps the first row and logs a diagnostic.
+
+        Guards the same "invariant silently violated" failure mode as
+        get_valid_edges_for_node, keyed on the (entity, edge) pair instead.
+        """
+        backend = make_backend(mock_config)
+        graph = make_graph_mock(
+            ro_rows=[['A', 'e1', 'first-fact', 'first-name'], ['A', 'e1', 'second-fact', 'second-name']]
+        )
+        backend._driver._get_graph = MagicMock(return_value=graph)
+        with caplog.at_level(logging.DEBUG, logger=_LOGGER_NAME):
+            result = await backend.get_all_valid_edges(group_id='test')
+        assert result['A'] == [{'uuid': 'e1', 'fact': 'first-fact', 'name': 'first-name'}]
+        assert any('e1' in record.getMessage() for record in caplog.records)
+
+    @pytest.mark.asyncio
+    async def test_self_loop_identical_rows_do_not_log_diagnostic(
+        self, mock_config, make_backend, make_graph_mock, caplog
+    ):
+        """The ordinary self-loop double-match (identical rows) stays silent — no false-positive diagnostic."""
+        backend = make_backend(mock_config)
+        graph = make_graph_mock(ro_rows=[['A', 'e1', 'f', 'n'], ['A', 'e1', 'f', 'n']])
+        backend._driver._get_graph = MagicMock(return_value=graph)
+        with caplog.at_level(logging.DEBUG, logger=_LOGGER_NAME):
+            await backend.get_all_valid_edges(group_id='test')
+        assert caplog.records == []
