@@ -995,6 +995,16 @@ def create_mcp_server(
             metadata: Arbitrary key-value pairs (optional)
         """
         agent_id, session_id = _resolve_identity(agent_id, session_id, ctx)
+        # Recon-stage authorization gate runs first — it is the whole point
+        # of this tool — so an unauthorized caller is rejected before any
+        # project/backlog/category validation work (or the diagnostics those
+        # gates return) happens on its behalf.
+        if not (isinstance(agent_id, str) and agent_id.startswith('recon-stage-')):
+            return {
+                'error': 'dedup_exempt_write_not_permitted',
+                'error_type': 'DedupExemptNotPermitted',
+                'agent_id': agent_id,
+            }
         project_id, err = _canonicalize_project_id_arg(project_id)
         if err:
             return err
@@ -1011,12 +1021,6 @@ def create_mcp_server(
                     f'Must be one of {sorted(_VALID_CATEGORIES)}.'
                 ),
                 'error_type': 'ValidationError',
-            }
-        if not (isinstance(agent_id, str) and agent_id.startswith('recon-stage-')):
-            return {
-                'error': 'dedup_exempt_write_not_permitted',
-                'error_type': 'DedupExemptNotPermitted',
-                'agent_id': agent_id,
             }
         try:
             causation_id, source, cleaned_meta = _extract_causation(metadata, agent_id)

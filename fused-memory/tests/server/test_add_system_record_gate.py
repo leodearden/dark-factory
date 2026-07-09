@@ -49,6 +49,35 @@ class TestAddSystemRecordGate:
         mock_service.add_system_record.assert_not_called()
 
     @pytest.mark.asyncio
+    async def test_rejects_non_recon_agent_before_category_validation(self):
+        """The access-control gate must fire before category validation.
+
+        A non-recon-stage caller with an invalid category must still get
+        DedupExemptNotPermitted, not a category ValidationError — otherwise
+        the gate ordering leaks (a rejected caller learns something about
+        argument validity) and does needless work for a caller that will be
+        denied regardless (task 2222 amendment).
+        """
+        mock_service = AsyncMock()
+        server = create_mcp_server(mock_service)
+
+        result = await server._tool_manager.call_tool(
+            'add_system_record',
+            {
+                'content': _CONTENT,
+                'project_id': _PROJECT_ID,
+                'category': 'not_a_real_category',
+                'agent_id': 'claude-interactive',
+            },
+        )
+
+        assert result.get('error_type') == 'DedupExemptNotPermitted', (
+            f'Expected the recon-stage gate to fire before category validation, '
+            f'got: {result!r}'
+        )
+        mock_service.add_system_record.assert_not_called()
+
+    @pytest.mark.asyncio
     async def test_allows_recon_stage_agent(self):
         """A recon-stage- caller must pass the gate and reach the service."""
         mock_service = AsyncMock()
