@@ -12,6 +12,7 @@ import contextlib
 import json
 import logging
 import sqlite3
+from collections.abc import Callable
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -738,7 +739,7 @@ class SqliteTaskBackend:
         # tasks INSERT and before the txn commit, to simulate a crash
         # between INSERT and COMMIT. NOT part of TaskBackendProtocol;
         # production code paths never set this — it stays None.
-        self._after_insert_fault_hook: Any = None
+        self._after_insert_fault_hook: Callable[[], None] | None = None
         self._connections: dict[str, aiosqlite.Connection] = {}
         # Guards the connection map AND each project's first-access bring-up
         # (schema + WAL pragmas). Held briefly during open; released before
