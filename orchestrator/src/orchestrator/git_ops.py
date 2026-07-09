@@ -1862,40 +1862,13 @@ class GitOps:
         # is defense-in-depth — the pre-commit hook is the primary guard.
         _ensure_task_gitignore(worktree_path)
 
-        # ── .task/ contamination guard ────────────────────────────────
-        # If main is contaminated (has .task/ tracked), this worktree
-        # inherits it.  Scrub it NOW before any agent code runs, so the
-        # task starts from a clean tree.  The scrub amends the initial
-        # commit on the new branch — harmless since nothing else has
-        # been committed yet.
-        # amend=False: HEAD is shared with main — must NOT amend the shared commit.
-        # Instead, create a new commit on the branch to remove .task/.
-        scrub_result = await scrub_task_dir_from_tree(
-            worktree_path, 'worktree-creation', amend=False,
-        )
-        if scrub_result.outcome == ScrubOutcome.SCRUBBED:
-            logger.warning(
-                'MAIN IS CONTAMINATED — .task/ was inherited by new worktree %s. '
-                'The contamination has been removed from this worktree, but main '
-                'still carries .task/.  Run: git rm -r --cached .task/ on main.',
-                worktree_path,
-            )
-        elif scrub_result.outcome == ScrubOutcome.FAILED:
-            logger.error(
-                '.task/ scrub FAILED during worktree-creation for %s — the index '
-                'may still be contaminated.  The hard gate at advance_main will '
-                'catch this if contamination reaches main.%s',
-                worktree_path,
-                scrub_result.format_error(prefix=' Error: '),
-            )
-
-        # Re-capture base from the worktree's own merge-base after positioning
-        # AND the scrub_task_dir_from_tree call above.  merge-base from inside
-        # the freshly-created worktree is race-immune to concurrent main
-        # advances between rev-parse and `git worktree add`: it is the fork
-        # point of HEAD with the freshened start_ref regardless of when main
-        # advanced.  We use start_ref (the ref the worktree was actually based
-        # on — may be origin/main when local main lags) rather than
+        # Re-capture base from the worktree's own merge-base after
+        # positioning.  merge-base from inside the freshly-created worktree
+        # is race-immune to concurrent main advances between rev-parse and
+        # `git worktree add`: it is the fork point of HEAD with the
+        # freshened start_ref regardless of when main advanced.  We use
+        # start_ref (the ref the worktree was actually based on — may be
+        # origin/main when local main lags) rather than
         # self.config.main_branch, so the freshen-from-remote semantic is
         # preserved (see test_create_worktree_freshens_from_remote).
         _, mb_out, _ = await _run(
@@ -3459,9 +3432,8 @@ class GitOps:
                     return recycle_result
                 route = AcquireRoute.RECYCLE
 
-            # ── Shared tail: gitignore, scrub, base, debug-port ──────────
+            # ── Shared tail: gitignore, base, debug-port ──────────────────
             _ensure_task_gitignore(lane)
-            await scrub_task_dir_from_tree(lane, 'warm-lane-acquire', amend=False)
 
             _, mb_out, _ = await _run(
                 ['git', 'merge-base', start_ref, 'HEAD'],
@@ -5501,9 +5473,10 @@ class GitOps:
             merge_wt, pre_merge_sha = await self._create_merge_worktree(base_sha)
 
             # Pre-merge cleanup: remove .task/ from filesystem if inherited
-            # from a contaminated main.  This is NOT sufficient on its own
-            # because `git merge` will re-introduce .task/ from the branch.
-            # The real fix is the post-merge scrub below.
+            # from a contaminated main.  Belt-and-braces only — .task/
+            # execution metadata now lives outside the worktree entirely
+            # (see module docstring), so nothing repopulates this directory
+            # from the branch being merged.
             task_dir = merge_wt / '.task'
             if task_dir.exists():
                 shutil.rmtree(task_dir)
@@ -5532,30 +5505,6 @@ class GitOps:
                 await self.cleanup_merge_worktree(merge_wt)
                 return MergeResult(
                     success=False, details=f'{out}\n{err}',
-                    pre_merge_sha=pre_merge_sha,
-                )
-
-            # ── Post-merge .task/ scrub (CRITICAL) ────────────────────
-            # The merge commit now exists.  If the task branch had .task/
-            # tracked (common — agents commit it despite safeguards), the
-            # merge commit contains those files.  We MUST remove them
-            # before this commit reaches main via advance_main().
-            #
-            # scrub_task_dir_from_tree() checks git ls-tree, runs
-            # git rm --cached, and amends the merge commit in-place.
-            # This is the single most important .task/ defense.
-            scrub_result = await scrub_task_dir_from_tree(merge_wt, f'post-merge({full_branch})')
-            if scrub_result.outcome == ScrubOutcome.FAILED:
-                logger.error(
-                    '.task/ scrub FAILED post-merge for %s — aborting merge; '
-                    'no advance_main will run.',
-                    full_branch,
-                )
-                await self.cleanup_merge_worktree(merge_wt)
-                _detail = f'.task/ scrub failed post-merge for {full_branch}{scrub_result.format_error(prefix=": ")}'
-                return MergeResult(
-                    success=False,
-                    details=_detail,
                     pre_merge_sha=pre_merge_sha,
                 )
 
@@ -6758,15 +6707,6 @@ class GitOps:
                 )
                 return AdvanceOutcome('not_descendant')
 
-            scrub_result = await scrub_task_dir_from_tree(
-                merge_worktree, f'advance_main-retry({attempt + 1})',
-            )
-            if scrub_result.outcome == ScrubOutcome.FAILED:
-                logger.error(
-                    '.task/ scrub FAILED during advance_main-retry(%d) — index may '
-                    'be contaminated; _assert_no_task_dir will catch it.%s',
-                    attempt + 1, scrub_result.format_error(prefix=' Error: '),
-                )
             _, new_sha, _ = await _run(
                 ['git', 'rev-parse', 'HEAD'], cwd=merge_worktree,
             )
