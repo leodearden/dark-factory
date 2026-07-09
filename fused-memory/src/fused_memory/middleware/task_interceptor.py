@@ -1179,11 +1179,14 @@ class TaskInterceptor:
         without a registry there is no per-project owner map to classify a
         file against.
         """
+        registry = self._prefix_registry
+        if registry is None:
+            return PathGuardVerdict(outcome='ok', project_id=project_id)
         files = (
             candidate.files_to_modify if candidate is not None
             else self._extract_meta_files(kwargs)
         )
-        return check_files_for_scope(files, project_id, self._prefix_registry)
+        return check_files_for_scope(files, project_id, registry)
 
     def _path_guard_check(
         self,

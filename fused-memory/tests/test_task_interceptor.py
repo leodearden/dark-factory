@@ -5382,7 +5382,7 @@ class TestPathGuardOrSkipProseAdvisory:
         fake_adjudicator.adjudicate = AsyncMock()
         interceptor._path_scope_adjudicator = fake_adjudicator
 
-        kwargs = {
+        kwargs: dict[str, Any] = {
             'title': 'Investigate fused-memory/harness deadlock',
             'description': 'See fused-memory/ for context',
         }
@@ -5732,7 +5732,7 @@ class TestMultiProjectRoutingWiring:
             lambda self, c, k, p: verdict,
         )
 
-        kwargs = {'title': 'Edit fused-memory/X'}
+        kwargs: dict[str, Any] = {'title': 'Edit fused-memory/X'}
         result = await interceptor._path_guard_or_skip(
             kwargs,
             str(tmp_path / 'reify'),
