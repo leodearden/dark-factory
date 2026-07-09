@@ -1671,6 +1671,49 @@ def _single_subproject_prefix(files: list[str], worktree: Path | None) -> str | 
     return prefix if (worktree / prefix / 'pyproject.toml').is_file() else None
 
 
+def _root_plus_single_subproject_prefix(files: list[str], worktree: Path | None) -> str | None:
+    """Return the sole subproject prefix when *files* mix root-owning file(s) with it, else ``None``.
+
+    Complements :func:`_single_subproject_prefix`, whose "any mixed
+    root+subproject diff → None" contract is deliberately pinned (used by the
+    pure-subproject fallback branch, which must not collapse a mixed diff to
+    the subproject alone). This helper instead detects the distinct "root
+    file(s) + exactly one real subproject" shape.
+
+    Each file is classified as either root-owning — a bare repo-root file (no
+    ``/``), or a file under a top-level directory that has no ``pyproject.toml``
+    of its own (e.g. ``tests/``) — or as belonging to a real subproject: a
+    top-level directory that DOES carry its own ``pyproject.toml`` (same
+    ``(worktree / prefix / 'pyproject.toml').is_file()`` discriminator as
+    :func:`_single_subproject_prefix`).
+
+    Returns the subproject's prefix only when at least one root-owning file
+    AND exactly one distinct subproject are both present in *files*.  Returns
+    ``None`` when *worktree* is ``None``, *files* is empty, no root-owning
+    file is present (pure subproject diff — :func:`_single_subproject_prefix`
+    already handles that case), no subproject is touched (pure root diff), or
+    more than one distinct subproject is touched (ambiguous — which
+    subproject would TEST be scoped to?).
+    """
+    if worktree is None or not files:
+        return None
+    subprojects: set[str] = set()
+    has_root = False
+    for f in files:
+        if '/' not in f:
+            has_root = True
+            continue
+        top = f.split('/', 1)[0]
+        if (worktree / top / 'pyproject.toml').is_file():
+            subprojects.add(top)
+        else:
+            has_root = True
+    if has_root and len(subprojects) == 1:
+        (prefix,) = subprojects
+        return prefix
+    return None
+
+
 def _build_fallback_config(
     task_files: list[str],
     config: OrchestratorConfig | None = None,
