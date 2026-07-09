@@ -22,6 +22,7 @@ import contextlib
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
+from test_dry_run_unblock import _init_git_repo, _make_agent_result, _RecordingScheduler
 from test_merge_queue_main_health import (
     COMPILE_ERROR_RESULT,
     INFRA_TIMEOUT_RESULT,
@@ -31,6 +32,8 @@ from test_merge_queue_main_health import (
     _make_req,
 )
 
+from orchestrator.b3_gate import ABORT, check_proposal
+from orchestrator.event_store import EventType
 from orchestrator.merge_queue import (
     MAIN_HEALTH_RED_REASON_PREFIX,
     TRANSIENT_INFRA_REASON_PREFIX,
@@ -794,3 +797,120 @@ class TestHarnessWiresDryRunHandlesIntoWorker:
         assert captured.get('cost_store') is sentinel_cost_store, (
             f'Expected cost_store=harness.cost_store; got captured={captured!r}'
         )
+
+
+class TestMergeVerifyRedProducesGateableProposal:
+    """Step-15 (RED — event_store not yet forwarded): the PRD test-9 capstone.
+
+    End-to-end: a merge-verify RED on a trivial scoped diff must, via the
+    REAL (unpatched) run_dry_run_unblock, write a dry_run_proposals[] entry
+    with block_class='merge_verify_red' that b3_gate.check_proposal accepts
+    as non-ABORT — AND the investigation must emit the same
+    invocation_end/'blocked' telemetry event the agent-block path emits
+    (observability parity).  Today _spawn_merge_verify_dry_run receives
+    event_store but discards it (`_ = event_store`), so the investigation's
+    emit never fires through this MagicMock — RED on the event assertion.
+
+    Reuses test_dry_run_unblock.py's real-git-repo/_make_agent_result/
+    _RecordingScheduler e2e pattern (only orchestrator.dry_run_unblock.
+    invoke_agent is mocked) so the proposal is genuinely produced and
+    genuinely gated, not merely spawn-mocked like the tests above.
+    """
+
+    def test_merge_verify_red_produces_gateable_proposal(self, tmp_path: Path) -> None:
+        config = _make_config(tmp_path)
+        git_ops = _make_git_ops(tmp_path)
+        merge_wt = tmp_path / 'merge-wt'
+        merge_wt.mkdir()
+        head_sha = _init_git_repo(merge_wt)
+        req = _make_req('99', tmp_path / 'task-wt', config)
+        (tmp_path / 'task-wt').mkdir()
+
+        scheduler = _RecordingScheduler({'dry_run_proposals': []})
+        handles = _DryRunInvestigationHandles(scheduler=scheduler)
+        event_store = MagicMock()
+
+        structured = {
+            'proposal_text': 'Fix the scoped lint failure',
+            'risk_label': 'low',
+            'files_referenced': ['orchestrator/src/orchestrator/foo.py'],
+        }
+        agent_result = _make_agent_result(structured_output=structured)
+
+        def _fake_run_git(args: list[str], cwd: str) -> tuple[int, str]:
+            """HEAD always matches the recorded sha; footprint diff is empty."""
+            if 'rev-parse' in args:
+                return (0, head_sha)
+            return (0, '')
+
+        async def _run() -> MergeOutcome | None:
+            with (
+                patch(
+                    'orchestrator.merge_queue.run_scoped_verification',
+                    new=AsyncMock(return_value=COMPILE_ERROR_RESULT),
+                ),
+                patch(
+                    'orchestrator.merge_queue.verify_failure_is_preexisting_on_main',
+                    new=AsyncMock(return_value=(False, '')),
+                ),
+                patch(
+                    'orchestrator.dry_run_unblock.invoke_agent',
+                    new=AsyncMock(return_value=agent_result),
+                ),
+            ):
+                outcome = await _run_post_merge_verify(
+                    git_ops, req, merge_wt,
+                    timeouts={},
+                    enospc_retries={},
+                    max_timeouts=3,
+                    max_enospc=1,
+                    dry_run_handles=handles,
+                    event_store=event_store,
+                )
+                # Drain the fire-and-forget investigation (real run_dry_run_unblock,
+                # real git subprocess calls against merge_wt, mocked invoke_agent)
+                # inside this same loop before asyncio.run() tears it down.
+                await asyncio.sleep(0)
+                if handles.background_tasks:
+                    await asyncio.gather(
+                        *handles.background_tasks, return_exceptions=True,
+                    )
+                return outcome
+
+        outcome = asyncio.run(_run())
+
+        assert outcome is not None
+        assert outcome.status == 'blocked'
+
+        proposals = scheduler._meta.get('dry_run_proposals', [])
+        assert proposals, 'Expected a dry_run_proposals entry to be written'
+        entry = proposals[-1]
+        assert entry['block_class'] == 'merge_verify_red', (
+            f"Expected block_class='merge_verify_red'; got {entry.get('block_class')!r}"
+        )
+        assert entry['risk_label'] == 'low', (
+            f"Expected risk_label='low'; got {entry.get('risk_label')!r}"
+        )
+
+        verdict = check_proposal(
+            entry, worktree=str(merge_wt), category='task_failure',
+            run_git=_fake_run_git,
+        )
+        assert verdict['verdict'] != ABORT, (
+            f'Expected a non-ABORT (gateable) verdict; got {verdict!r}'
+        )
+
+        # Observability parity: the investigation must emit the same
+        # invocation_end/'blocked' event the agent-block path emits (other
+        # emit calls — e.g. EventType.merge_verify from the verify pool —
+        # are expected and ignored here).
+        invocation_end_calls = [
+            c for c in event_store.emit.call_args_list
+            if c.args and c.args[0] == EventType.invocation_end
+        ]
+        assert invocation_end_calls, (
+            f'Expected an invocation_end event; got calls='
+            f'{event_store.emit.call_args_list!r}'
+        )
+        assert invocation_end_calls[-1].kwargs.get('phase') == 'blocked'
+        assert invocation_end_calls[-1].kwargs.get('role') == 'unblock_auto'
