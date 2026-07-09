@@ -4351,6 +4351,56 @@ class NoLandingsCircuitBreaker:
         )
 
 
+class ItemLifecycle:
+    """Single source of truth for every in-flight item's lifecycle state,
+    keyed by :attr:`MergeRequest.request_id` (merge-queue-reliability PRD
+    scope-4 iota / task 2164, L-1).
+
+    Replaces today's four redundant state encodings — container membership
+    across the five queues, free-form ``InflightEntry.phase: str`` values,
+    the :class:`InflightStatus` sentinel enum, and the four worker transient
+    side-fields (``_inflight_req``/``_remerging_item``/``_finalizing_head``/
+    ``_dispatching_item``) — with one :class:`ItemLifecycleState` per
+    request_id, guarded on mutation by :meth:`transition` against the
+    module-level ``_LEGAL_TRANSITIONS`` table.
+
+    Task iota (this task) delivers only this substrate — ``register``/
+    ``current``/``transition``. The sibling task kappa wires ``transition()``
+    at every put/pop call site across the five queues and repoints
+    ``snapshot()`` / the permit audit / liveness checks onto this registry.
+    """
+
+    def __init__(self) -> None:
+        self._states: dict[str, ItemLifecycleState] = {}
+
+    def register(
+        self,
+        request_id: str,
+        initial: ItemLifecycleState = ItemLifecycleState.QUEUED,
+    ) -> None:
+        """Seed *request_id* at *initial* (default QUEUED — every item enters
+        the pipeline via the external queue).
+
+        Raises ``ValueError`` if *request_id* is already registered — a
+        duplicate ``register()`` call is a programming error. The
+        request_id namespace is per-attempt: conflict auto-chain
+        regeneration mints a NEW request_id for a fresh attempt
+        (``_maybe_auto_chain_generation``) rather than re-registering an
+        existing one, so a genuine duplicate here means two callers raced
+        to register the same attempt.
+        """
+        if request_id in self._states:
+            raise ValueError(
+                f'ItemLifecycle.register: request_id {request_id!r} is already '
+                f'registered (current state: {self._states[request_id]!r})'
+            )
+        self._states[request_id] = initial
+
+    def current(self, request_id: str) -> ItemLifecycleState | None:
+        """The current state for *request_id*, or ``None`` if unregistered."""
+        return self._states.get(request_id)
+
+
 class SpeculativeMergeWorker(_WipHaltMixin):
     """Two-coroutine speculative merge-verify pipeline.
 
