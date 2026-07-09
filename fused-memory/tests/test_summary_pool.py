@@ -21,6 +21,7 @@ import pytest
 from fused_memory.reconciliation.summary_pool import (
     enforce_summary_pool_cap,
     pretrim_summary_pool,
+    verify_cycle_summary_written,
 )
 
 _LOGGER = 'fused_memory.reconciliation.summary_pool'
