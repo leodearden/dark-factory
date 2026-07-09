@@ -11,7 +11,23 @@ max_concurrent_tasks: 24
 # state pollution. With Fix 1's docs-only short-circuit + per-subproject
 # fan-out for non-prefixed source, this command rarely fires; when it does
 # (root conftest.py changes), the fan-out keeps it safe.
-test_command: "cd shared && uv run pytest tests/ && cd ../escalation && uv run pytest tests/ && cd ../orchestrator && uv run pytest tests/ && cd ../fused-memory && uv run pytest tests/ && cd ../dashboard && uv run pytest tests/"
+# task 2361: worker-kill de-flake + coverage. Every segment appends
+# --timeout=300 (CLI overrides each subproject's pyproject.toml timeout=60):
+# orchestrator/fused-memory run pytest-xdist with a 60s per-test timeout, and
+# under host CPU oversubscription a starved xdist worker crosses that ceiling,
+# gets os._exit()'d by pytest-timeout's thread method, and
+# --max-worker-restart=0 turns that into a false-failing per-test "node down"
+# on whatever test happens to be running. A uniform ``-n`` cap was rejected:
+# shared/escalation/dashboard declare no pytest-xdist, so ``-n`` would error
+# with "unrecognized arguments" on those segments. A 6th segment now also runs
+# the repo-root tests/scripts/ suite (not a workspace member, so never covered
+# by the 5 subprojects' own tests/ dirs) via ``--project shared``, mirroring
+# scripts/orchestrator.yaml, so a task scoped only to tests/scripts/ is no
+# longer gated on unrelated subprojects while its own tests never run.
+# NOTE: any pytest segment added to this chain in the future must also carry
+# --timeout>60 — enforced by
+# tests/scripts/test_fallback_verify_config.py::test_fallback_verify_raises_per_test_timeout.
+test_command: "cd shared && uv run pytest tests/ --timeout=300 && cd ../escalation && uv run pytest tests/ --timeout=300 && cd ../orchestrator && uv run pytest tests/ --timeout=300 && cd ../fused-memory && uv run pytest tests/ --timeout=300 && cd ../dashboard && uv run pytest tests/ --timeout=300 && cd .. && uv run --project shared pytest tests/scripts/ --timeout=300"
 # ``uv run`` prefix is load-bearing: ruff is not on PATH at the worktree root
 # (only inside each member venv). Without it the fallback scoper (which narrows
 # this to a single touched file for root-level changes) emits a bare ``ruff

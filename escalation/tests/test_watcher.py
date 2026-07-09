@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import contextlib
+import itertools
 import json
 import logging
 from datetime import UTC, datetime, timedelta
@@ -576,7 +577,11 @@ class TestTimeout:
         # Fixed monotonic sequence: start=0.0 sets deadline=2.0; loop check=0.0
         # so remaining_ms = max(0, int((2.0 - 0.0)*1000)) = 2000 -> read(timeout=2000)
         # read returns [] -> exit 124 (empty events with deadline set)
-        monotonic_values = iter([0.0, 0.0])
+        # Non-exhausting (task 2361): the tail repeats so deadline/remaining_ms
+        # stay stable (this test's read(timeout=2000) assertion holds) even if
+        # the loop were to poll more than the minimal happy path under host
+        # load, instead of raising StopIteration on an unplanned extra call.
+        monotonic_values = itertools.chain([0.0], itertools.repeat(0.0))
 
         with (
             patch('escalation.watcher.INotify') as MockINotify,
@@ -643,7 +648,11 @@ class TestTimeout:
 
         # monotonic sequence: first call sets deadline = 0.0 + 5.0 = 5.0;
         # second call in the loop -> remaining_ms = int((5.0 - 0.5) * 1000) = 4500
-        monotonic_values = iter([0.0, 0.5])
+        # Non-exhausting (task 2361): the tail repeats so deadline/remaining_ms
+        # stay stable (this test's read(timeout=4500) assertion holds) even if
+        # the loop were to poll more than the minimal happy path under host
+        # load, instead of raising StopIteration on an unplanned extra call.
+        monotonic_values = itertools.chain([0.0], itertools.repeat(0.5))
 
         with (
             patch('escalation.watcher.INotify') as MockINotify,
@@ -671,6 +680,73 @@ class TestTimeout:
         assert data['id'] == blocking_escalation.id
 
         # read was called with a positive timeout (not None)
+        assert mock_inotify.read.call_args.kwargs['timeout'] == 4500
+
+    def test_timeout_matching_event_after_nonmatching_survives_extra_polls(
+        self, tmp_path, blocking_escalation: Escalation, capsys
+    ):
+        """A non-matching event forces a 2nd loop iteration; the mock must not raise.
+
+        Regression guard for the esc-2286-class flake (task 2361): the sibling
+        tests above use a finite ``iter([0.0, 0.5])`` monotonic side_effect
+        sized to the happy path — exactly 2 calls (one to set the deadline,
+        one per loop iteration). Here the loop re-iterates once (a
+        non-matching event makes the inner ``for`` ``continue``, and the
+        ``while True`` polls again), which is a 3rd monotonic call; under the
+        sibling tests' finite-iterator idiom that 3rd call would raise
+        StopIteration under slow wall-clock. This test uses the non-exhausting
+        ``itertools.chain([prefix], itertools.repeat(tail))`` idiom (the fix
+        applied to the sibling tests in task 2361 step 4) and is the
+        executable proof that both the watcher's multi-iteration emit path
+        and the hardened mock pattern survive more polls than the minimal
+        happy path.
+        """
+        queue_dir = tmp_path / 'queue'
+        queue_dir.mkdir()
+
+        # Pre-create the escalation file so the 2nd loop iteration's event
+        # handler can read it from disk.
+        esc_path = queue_dir / f'{blocking_escalation.id}.json'
+        esc_path.write_text(blocking_escalation.to_json())
+
+        nonmatching = MagicMock()
+        nonmatching.name = 'unrelated.json'  # fails the esc-*/.json prefix gate -> continue
+        matching = MagicMock()
+        matching.name = f'{blocking_escalation.id}.json'
+
+        # Non-exhausting: call 1 -> 0.0 sets deadline=5.0; every later call ->
+        # 0.5 -> remaining_ms = int((5.0 - 0.5) * 1000) = 4500, stable no
+        # matter how many extra polls the loop takes.
+        monotonic_values = itertools.chain([0.0], itertools.repeat(0.5))
+
+        with (
+            patch('escalation.watcher.INotify') as MockINotify,
+            patch('escalation.watcher.sys.argv', [
+                'watcher', '--queue-dir', str(queue_dir), '--timeout', '5',
+            ]),
+            patch('escalation.watcher._initial_scan', return_value=None),
+            patch('escalation.watcher.time.monotonic', side_effect=monotonic_values),
+        ):
+            mock_inotify = MockINotify.return_value
+            # 1st read -> non-matching event (loop re-iterates); 2nd -> match.
+            mock_inotify.read.side_effect = [[nonmatching], [matching]]
+
+            from escalation.watcher import main
+
+            with pytest.raises(SystemExit) as exc_info:
+                main()
+
+            assert exc_info.value.code == 0
+
+        # stdout contains the escalation JSON
+        captured = capsys.readouterr()
+        assert blocking_escalation.id in captured.out
+        data = json.loads(captured.out)
+        assert data['id'] == blocking_escalation.id
+
+        # read was called exactly twice (nonmatching poll, then matching poll)
+        assert mock_inotify.read.call_count == 2
+        # last read used a positive timeout recomputed from the stable tail value
         assert mock_inotify.read.call_args.kwargs['timeout'] == 4500
 
 
