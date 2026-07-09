@@ -37,11 +37,6 @@ from shared.task_transitions import derive_actor_class, is_legal_transition
 
 from fused_memory.backends.task_backend_errors import DuplicateCandidateKeyError
 from fused_memory.backends.task_backend_protocol import TaskBackendProtocol
-from fused_memory.middleware.dark_factory_path_guard import (
-    DARK_FACTORY_PROJECT_ID,
-    check_candidate_for_dark_factory_paths,
-    check_text_for_dark_factory_paths,
-)
 from fused_memory.middleware.lock_charter_guard import (
     directory_locks,
     extract_files,
@@ -437,11 +432,15 @@ class TaskInterceptor:
         # so multiple concurrent waiters (e.g. reconnect/retry patterns) each
         # get their own event.  _signal_ticket_event sets and removes all of them.
         self._ticket_events: dict[str, list[asyncio.Event]] = {}
-        # Multi-project routing (optional, back-compat: None falls back to the
-        # dark-factory-only path guard with no escalation).  When both are set,
-        # _path_guard_or_skip uses the generalised guard against the registry
-        # and fires a scope_violation escalation alongside any rejection.
-        self._prefix_registry = prefix_registry
+        # Multi-project routing: None falls back to the built-in
+        # ProjectPrefixRegistry.default() (task 2208) so the registry is
+        # NEVER absent — the generalised multi-project guard is the only
+        # path, for every caller, single-project deployments included. When
+        # a scope-violation escalator is also configured, _path_guard_or_skip
+        # fires a scope_violation escalation alongside any rejection/advisory.
+        self._prefix_registry = (
+            prefix_registry if prefix_registry is not None else ProjectPrefixRegistry.default()
+        )
         self._scope_violation_escalator = scope_violation_escalator
         # Stage-2 LLM adjudicator (task 1822): runs only on Stage-1 heuristic hit
         # to distinguish real misroutes from incidental-mention false positives.
@@ -1206,14 +1205,15 @@ class TaskInterceptor:
         Thin wrapper around :meth:`_extract_meta_files_from_meta` that handles
         the ``kwargs → meta`` parsing step via :meth:`_parse_metadata`.
 
-        Used in two places to keep the title-bearing and prompt-only path-guard
-        branches in lockstep on which metadata keys feed the guard:
+        Used in two places to keep the title-bearing and prompt-only
+        FILES-certain branches in lockstep on which metadata keys feed
+        :meth:`_files_scope_check` (:func:`check_files_for_scope`):
           - ``_build_candidate`` (title-bearing branch, populates
             ``CandidateTask.files_to_modify``) — calls
             :meth:`_extract_meta_files_from_meta` directly when a pre-parsed
             ``meta`` dict is already in scope, avoiding a second parse.
-          - ``_path_guard_error`` prompt-only fallback branch (extends the
-            joined text passed to ``check_text_for_dark_factory_paths``)
+          - ``_files_scope_check`` prompt-only branch (no ``CandidateTask``
+            to read ``files_to_modify`` from, so it parses kwargs directly)
         """
         meta = TaskInterceptor._parse_metadata(kwargs)
         return TaskInterceptor._extract_meta_files_from_meta(meta)
@@ -1278,52 +1278,33 @@ class TaskInterceptor:
     ) -> PathGuardVerdict:
         """Run the PROSE-ONLY heuristic path-scope guard and return its verdict.
 
-        Uses the generalised multi-project guard against
-        :attr:`_prefix_registry` when one is configured; otherwise falls
-        back to the dark-factory-only guard for back-compat with
-        deployments that haven't yet supplied a registry.
+        Runs the generalised multi-project guard against
+        :attr:`_prefix_registry` — always configured (defaults to
+        ``ProjectPrefixRegistry.default()``, task 2208), so this is the only
+        path; there is no back-compat branch left to fall back to.
 
-        Multi-project (registry configured) — scans title / description /
-        details (candidate branch) or prompt / title / description / details
-        (prompt-only branch) ONLY.  Concrete ``metadata.files`` entries are
-        the FILES-certain check's job (:meth:`_files_scope_check` /
-        :func:`check_files_for_scope`) — this heuristic regex-over-prose
-        scanner must never re-scan them, or a file would be double-
-        classified by both the exact lookup and the heuristic (task 2206).
-        A rejection here is a non-rejecting advisory in
-        :meth:`_path_guard_or_skip`.
-
-        Back-compat (no registry configured) — UNCHANGED from before task
-        2206: the original task-1088 dark-factory-only guard, which also
-        scans ``files_to_modify`` / metadata files and hard-rejects on any
-        hit.  There is no registry for :func:`check_files_for_scope` to
-        certainly classify a file against in this mode, so demoting this
-        branch to advisory would be a silent gap rather than a loud one;
-        back-compat mode keeps its pre-task-2206 contract.
+        Scans title / description / details (candidate branch) or prompt /
+        title / description / details (prompt-only branch) ONLY.  Concrete
+        ``metadata.files`` entries are the FILES-certain check's job
+        (:meth:`_files_scope_check` / :func:`check_files_for_scope`) — this
+        heuristic regex-over-prose scanner must never re-scan them, or a
+        file would be double-classified by both the exact lookup and the
+        heuristic (task 2206).  A rejection here is always a non-rejecting
+        advisory in :meth:`_path_guard_or_skip` (task 2208 — the last
+        hard-reject-on-prose back-compat path has been retired).
         """
         registry = self._prefix_registry
-        if registry is not None and registry:
-            if candidate is not None:
-                text = '\n'.join([
-                    candidate.title or '',
-                    candidate.description or '',
-                    candidate.details or '',
-                ])
-            else:
-                text = '\n'.join(
-                    str(kwargs.get(k) or '') for k in ('prompt', 'title', 'description', 'details')
-                )
-            return check_text_for_scope(text, project_id, registry)
-        # Back-compat: no multi-project registry → original dark-factory-only guard.
         if candidate is not None:
-            return check_candidate_for_dark_factory_paths(candidate, project_id)
-        text = '\n'.join(
-            str(kwargs.get(k) or '') for k in ('prompt', 'title', 'description', 'details')
-        )
-        meta_files = self._extract_meta_files(kwargs)
-        if meta_files:
-            text = text + '\n' + '\n'.join(meta_files)
-        return check_text_for_dark_factory_paths(text, project_id)
+            text = '\n'.join([
+                candidate.title or '',
+                candidate.description or '',
+                candidate.details or '',
+            ])
+        else:
+            text = '\n'.join(
+                str(kwargs.get(k) or '') for k in ('prompt', 'title', 'description', 'details')
+            )
+        return check_text_for_scope(text, project_id, registry)
 
     def _path_guard_error(
         self,
@@ -1411,18 +1392,16 @@ class TaskInterceptor:
         * FILES-CERTAIN (:meth:`_files_scope_check`) — an exact
           ``metadata.files`` owner-mismatch is a hard reject.  No LLM
           adjudication: the file's owner is either known and different, or
-          it isn't, so there is nothing to adjudicate.  A no-op without a
-          registry configured.
+          it isn't, so there is nothing to adjudicate.
         * PROSE-ADVISORY (:meth:`_path_guard_check`) — a regex-over-prose
           heuristic hit in title/description/details, with no files-level
-          mismatch.  When a multi-project registry is configured, this no
-          longer rejects: the submission proceeds, but
+          mismatch.  This never rejects: the submission proceeds, but
           ``kwargs['metadata']['possible_scope_mismatch']`` is attached (via
           :meth:`_attach_possible_scope_mismatch`) and a ``scope_violation``
-          escalation still fires (loud, non-blocking).  Back-compat (no
-          registry configured) keeps the pre-task-2206 hard-reject contract
-          — there is no registry-backed certain check to fall back on, so
-          demoting this branch would be a silent gap rather than a loud one.
+          escalation still fires (loud, non-blocking).  The registry is
+          always present (defaults to ``ProjectPrefixRegistry.default()``,
+          task 2208), so this is the ONLY path — the pre-task-2208
+          hard-reject-on-prose back-compat branch has been retired.
 
         The inline Stage-2 LLM adjudicator (task 1822) is no longer
         consulted here: FILES-certain rejects have nothing to adjudicate,
@@ -1439,9 +1418,7 @@ class TaskInterceptor:
 
         The optional *candidate* parameter lets callers pass an already-built
         :class:`CandidateTask`; when ``None`` and the guard needs to scan a
-        candidate, this helper lazy-builds via ``_build_candidate`` so
-        ``submit_task``'s hot-path optimisation that skips the build
-        entirely for dark_factory still applies in back-compat mode.
+        candidate, this helper lazy-builds via ``_build_candidate``.
 
         Call-site pattern:
             ``if err := await self._path_guard_or_skip(kwargs, project_root, project_id): return err``
@@ -1458,16 +1435,12 @@ class TaskInterceptor:
             )
             return None
 
-        registry = self._prefix_registry
-        # Back-compat fast path: no registry + dark_factory → guard is a no-op.
-        if (registry is None or not registry) and project_id == DARK_FACTORY_PROJECT_ID:
-            return None
         if candidate is None:
             candidate = self._build_candidate(kwargs)
 
         # FILES-CERTAIN: an exact metadata.files owner-mismatch is a hard
         # reject, no LLM adjudication. Runs BEFORE the heuristic prose scan
-        # below. A no-op without a registry configured.
+        # below.
         files_verdict = self._files_scope_check(candidate, kwargs, project_id)
         if files_verdict.is_rejection:
             self._emit_scope_violation_escalation(
@@ -1480,19 +1453,14 @@ class TaskInterceptor:
         if not verdict.is_rejection:
             return None
 
+        # PROSE-ADVISORY: a heuristic hit never blocks creation — the
+        # escalation below preserves the signal loudly; the marker lets
+        # async triage see it too.
         self._emit_scope_violation_escalation(
             verdict, candidate, kwargs, project_root, project_id, llm_reason=None,
         )
-        if registry is not None and registry:
-            # PROSE-ADVISORY: a heuristic hit no longer blocks creation when
-            # a registry is configured — the escalation above preserves the
-            # signal loudly; the marker lets async triage see it too.
-            self._attach_possible_scope_mismatch(kwargs, verdict)
-            return None
-        # Back-compat (no registry): keep the pre-task-2206 hard-reject
-        # contract — there is no registry-backed certain check to fall back
-        # on, so demoting this to advisory would be a silent gap.
-        return verdict.to_error_dict()
+        self._attach_possible_scope_mismatch(kwargs, verdict)
+        return None
 
     async def _execute_combine(
         self,
@@ -1852,11 +1820,10 @@ class TaskInterceptor:
         ).strip()
 
         # Path-scope guard: reject before persisting if the candidate references
-        # paths owned by another project.  When a multi-project registry is
-        # configured the guard runs for every project (including dark_factory);
-        # otherwise it falls back to the dark-factory-only short-circuit so
-        # _build_candidate is skipped on the hot path.  Rejections also fire a
-        # scope_violation escalation when the escalator is configured.
+        # paths owned by another project.  The guard runs for every project
+        # (including dark_factory) against the always-present prefix registry
+        # (defaults to ProjectPrefixRegistry.default(), task 2208).  Rejections
+        # also fire a scope_violation escalation when the escalator is configured.
         # Must run before kwargs.pop('metadata') below so the helper can read metadata.
         if err := await self._path_guard_or_skip(
             kwargs, project_root, project_id,
