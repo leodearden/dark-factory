@@ -415,14 +415,20 @@ async def _assert_no_conflict_markers(sha: str, cwd: Path, context: str) -> None
     bare ``^=======`` line: that would false-positive on reStructuredText /
     Markdown heading underlines, which are common and legitimate.  Marker-
     like text that isn't anchored at column 0 (e.g. inside a string
-    literal) is not matched either.
+    literal) is not matched either.  The trailing space is intentionally
+    required: it is git's canonical marker format (``<<<<<<< <label>`` /
+    ``>>>>>>> <label>``), so a label-less bare ``<<<<<<<``/``>>>>>>>`` with
+    no following text will not match — real git conflicts always emit the
+    trailing ref label, so this does not narrow real-world coverage.
 
     Fail-open (no raise) when git reports no match (``git grep`` exits 1)
     OR on a git error — mirrors :func:`_assert_no_task_dir`'s fail-open
     semantics: a broken git invocation must not itself become a false
-    block.
+    block.  Unlike the clean no-match case, a git-error fail-open is logged
+    at WARNING (with stderr) so operators can tell a genuinely clean tree
+    apart from one this gate failed to evaluate.
     """
-    rc, out, _ = await _run(
+    rc, out, err = await _run(
         ['git', 'grep', '-lE', r'^(<{7}|>{7}) ', sha, '--', '.'],
         cwd=cwd,
     )
@@ -436,6 +442,18 @@ async def _assert_no_conflict_markers(sha: str, cwd: Path, context: str) -> None
             f'marker(s): {", ".join(files[:5])}. Refusing to advance main. '
             f'Resolve the conflict marker(s) (or abort the operation that '
             f'left them) and re-run.'
+        )
+    elif rc not in (0, 1):
+        # A broken git invocation (rc >= 2) fails open just like a clean
+        # no-match (rc == 1) — but silently doing so here would let a
+        # genuinely-conflicted tree through undetected while looking
+        # identical to "confirmed clean". Log it so operators can tell the
+        # difference.
+        logger.warning(
+            'CONFLICT MARKER GATE (%s): git grep errored (rc=%d) scanning '
+            'commit %s — gate could NOT be evaluated; treating as '
+            'unevaluated (fail-open), NOT confirmed-clean: %s',
+            context, rc, sha[:8], err.strip()[:300],
         )
 
 
