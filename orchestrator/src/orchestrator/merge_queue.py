@@ -124,6 +124,7 @@ from orchestrator.merge_types import (  # noqa: F401  re-export shim
     InFlightMergeRegistry,
     InflightStatus,
     InflightVerifyResult,
+    ItemLifecycleState,
     MainHealthAutoHealRegistry,
     MergeBounceRegistry,
     MergeDispatchResult,
@@ -4348,6 +4349,207 @@ class NoLandingsCircuitBreaker:
             free_end=free_bytes,
             reason=reason,
         )
+
+
+class IllegalLifecycleTransition(RuntimeError):
+    """Raised by :meth:`ItemLifecycle.transition` when a requested move is
+    not a legal edge in the module-level ``_LEGAL_TRANSITIONS`` table, the
+    caller's belief about the item's current state disagrees with the
+    registry, or *request_id* is unregistered (merge-queue-reliability PRD
+    scope-4 iota / task 2164, L-1).
+
+    A dedicated exception type — raised explicitly, never via a bare
+    ``assert`` (stripped under ``python -O``, the same hazard
+    :meth:`PermitLedger.release` documents) — so the L-1 single-source guard
+    survives optimized runs and callers/tests can catch precisely this
+    failure mode.
+    """
+
+
+class ItemLifecycle:
+    """Single source of truth for every in-flight item's lifecycle state,
+    keyed by :attr:`MergeRequest.request_id` (merge-queue-reliability PRD
+    scope-4 iota / task 2164, L-1).
+
+    Replaces today's four redundant state encodings — container membership
+    across the five queues, free-form ``InflightEntry.phase: str`` values,
+    the :class:`InflightStatus` sentinel enum, and the four worker transient
+    side-fields (``_inflight_req``/``_remerging_item``/``_finalizing_head``/
+    ``_dispatching_item``) — with one :class:`ItemLifecycleState` per
+    request_id, guarded on mutation by :meth:`transition` against the
+    module-level ``_LEGAL_TRANSITIONS`` table.
+
+    Task iota (this task) delivers only this substrate — ``register``/
+    ``current``/``transition``. The sibling task kappa wires ``transition()``
+    at every put/pop call site across the five queues and repoints
+    ``snapshot()`` / the permit audit / liveness checks onto this registry.
+
+    Concurrency model: storage is a plain ``dict`` with no locking. That is
+    safe only because ``register``/``current``/``transition`` contain no
+    ``await`` points, so each call runs atomically to completion under the
+    single merge-queue asyncio event loop before another coroutine can
+    interleave. This class is NOT thread-safe — the ``from_state``
+    cross-check in :meth:`transition` defends against mis-wiring/logic
+    races between coroutines sharing that one loop, not against concurrent
+    access from a thread pool or a second event loop.
+    """
+
+    def __init__(self) -> None:
+        self._states: dict[str, ItemLifecycleState] = {}
+
+    def register(
+        self,
+        request_id: str,
+        initial: ItemLifecycleState = ItemLifecycleState.QUEUED,
+    ) -> None:
+        """Seed *request_id* at *initial* (default QUEUED — every item enters
+        the pipeline via the external queue).
+
+        Raises ``ValueError`` if *request_id* is already registered — a
+        duplicate ``register()`` call is a programming error. The
+        request_id namespace is per-attempt: conflict auto-chain
+        regeneration mints a NEW request_id for a fresh attempt
+        (``_maybe_auto_chain_generation``) rather than re-registering an
+        existing one, so a genuine duplicate here means two callers raced
+        to register the same attempt.
+
+        Deliberately ``ValueError``, not :class:`IllegalLifecycleTransition`:
+        the latter models an illegal EDGE in ``_LEGAL_TRANSITIONS`` (or a
+        from_state/registry disagreement) for an item already tracked by the
+        registry, so kappa can catch it precisely at each wired transition
+        call site. A duplicate ``register()`` is not an edge violation at
+        all — there is no *from_state* and no row in the table to violate —
+        it is a registry-identity precondition failure, the same category
+        ``dict``/``set`` APIs signal with ``ValueError``/``KeyError`` rather
+        than a domain-specific exception. Keeping the two distinct lets a
+        caller that wants only L-1 edge violations ``except
+        IllegalLifecycleTransition`` without also swallowing an unrelated
+        double-registration bug.
+        """
+        if request_id in self._states:
+            raise ValueError(
+                f'ItemLifecycle.register: request_id {request_id!r} is already '
+                f'registered (current state: {self._states[request_id]!r})'
+            )
+        self._states[request_id] = initial
+
+    def current(self, request_id: str) -> ItemLifecycleState | None:
+        """The current state for *request_id*, or ``None`` if unregistered."""
+        return self._states.get(request_id)
+
+    def transition(
+        self,
+        request_id: str,
+        from_state: ItemLifecycleState,
+        to_state: ItemLifecycleState,
+    ) -> None:
+        """Move *request_id* from *from_state* to *to_state*.
+
+        Raises :class:`IllegalLifecycleTransition` — an explicit ``raise``,
+        never a bare ``assert`` (stripped under ``python -O``, the same
+        hazard :meth:`PermitLedger.release` documents) — and leaves the
+        registry's stored state UNCHANGED when:
+
+          * *request_id* is not registered;
+          * the registry's actual current state disagrees with the caller's
+            *from_state* (defense-in-depth cross-check — a mis-wiring or a
+            race must never silently advance from the wrong base); or
+          * ``(from_state, to_state)`` is not a legal edge in the
+            module-level ``_LEGAL_TRANSITIONS`` table (defined below this
+            class) — covers both skip-stage moves and moves out of the
+            absorbing TERMINAL state.
+
+        Updates the registry to *to_state* only once all three checks pass.
+        """
+        if request_id not in self._states:
+            raise IllegalLifecycleTransition(
+                f'ItemLifecycle.transition: request_id {request_id!r} is not '
+                f'registered (cannot transition {from_state!r} -> {to_state!r})'
+            )
+        current = self._states[request_id]
+        if current != from_state:
+            raise IllegalLifecycleTransition(
+                f'ItemLifecycle.transition: request_id {request_id!r} caller '
+                f'believes from_state={from_state!r} but registry has '
+                f'current={current!r} (single-source disagreement)'
+            )
+        if to_state not in _LEGAL_TRANSITIONS[from_state]:
+            raise IllegalLifecycleTransition(
+                f'ItemLifecycle.transition: illegal edge {from_state!r} -> {to_state!r} '
+                f'for request_id {request_id!r}'
+            )
+        self._states[request_id] = to_state
+
+
+_LEGAL_TRANSITIONS: dict[ItemLifecycleState, frozenset[ItemLifecycleState]] = {
+    ItemLifecycleState.QUEUED: frozenset({
+        ItemLifecycleState.LANE_BUFFERED,
+        ItemLifecycleState.MERGING,
+        ItemLifecycleState.TERMINAL,
+    }),
+    ItemLifecycleState.LANE_BUFFERED: frozenset({
+        ItemLifecycleState.MERGING,
+        ItemLifecycleState.TERMINAL,
+    }),
+    ItemLifecycleState.MERGING: frozenset({
+        ItemLifecycleState.AWAITING_VERIFY,
+        ItemLifecycleState.REDISPATCH_PARKED,
+        ItemLifecycleState.TERMINAL,
+    }),
+    ItemLifecycleState.AWAITING_VERIFY: frozenset({
+        ItemLifecycleState.DISPATCHING,
+        ItemLifecycleState.REDISPATCH_PARKED,
+        ItemLifecycleState.TERMINAL,
+    }),
+    ItemLifecycleState.REDISPATCH_PARKED: frozenset({
+        ItemLifecycleState.DISPATCHING,
+        ItemLifecycleState.TERMINAL,
+    }),
+    ItemLifecycleState.DISPATCHING: frozenset({
+        ItemLifecycleState.VERIFYING,
+        ItemLifecycleState.REDISPATCH_PARKED,
+        ItemLifecycleState.TERMINAL,
+    }),
+    ItemLifecycleState.VERIFYING: frozenset({
+        ItemLifecycleState.GATE_REVERIFY,
+        ItemLifecycleState.FINALIZING,
+        ItemLifecycleState.MERGING,
+        ItemLifecycleState.TERMINAL,
+    }),
+    ItemLifecycleState.GATE_REVERIFY: frozenset({
+        ItemLifecycleState.FINALIZING,
+        ItemLifecycleState.VERIFYING,
+        ItemLifecycleState.MERGING,
+        ItemLifecycleState.TERMINAL,
+    }),
+    ItemLifecycleState.FINALIZING: frozenset({
+        ItemLifecycleState.TERMINAL,
+        ItemLifecycleState.MERGING,
+    }),
+    ItemLifecycleState.TERMINAL: frozenset(),
+}
+"""Legal-edge table for :meth:`ItemLifecycle.transition` (merge-queue-
+reliability PRD scope-4 iota / task 2164, L-1). Defined after
+:class:`ItemLifecycle` and looked up at call time (mirrors
+:data:`_NON_TERMINAL_OUTCOMES` above, defined after :class:`OutcomeKind` for
+the same reason), so the class body never references it eagerly.
+
+Encodes the pipeline flow traced from snapshot construction and the
+phase-mutation call sites (``entry.phase = 'finalizing'``/``'gate_reverify'``,
+initial ``InflightEntry.phase = 'verifying'`` at dispatch): queued ->
+(lane_buffered ->) merging -> awaiting_verify -> (redispatch_parked <->)
+dispatching -> verifying -> gate_reverify -> finalizing -> terminal, plus two
+same-request_id in-place retry loops evidenced by ``_redispatch`` (the
+redispatch bounce, DISPATCHING<->REDISPATCH_PARKED) and ``_remerging_item``
+(the cascade remerge, VERIFYING/GATE_REVERIFY/FINALIZING -> MERGING ->
+REDISPATCH_PARKED).
+
+TERMINAL is absorbing (empty out-set): conflict auto-chain regeneration
+mints a NEW request_id for the regenerated attempt
+(``_maybe_auto_chain_generation``), so a request's lifecycle is always
+forward-to-TERMINAL under its OWN id — a "restart" is a different registry
+key entirely, never a backward edge on this one.
+"""
 
 
 class SpeculativeMergeWorker(_WipHaltMixin):

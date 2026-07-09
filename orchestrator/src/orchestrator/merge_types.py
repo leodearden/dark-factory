@@ -1027,6 +1027,67 @@ allowlist in the same change — see the pinning test in
 """
 
 
+class ItemLifecycleState(StrEnum):
+    """The single source of an item's merge-queue lifecycle state
+    (merge-queue-reliability PRD scope-4 iota / task 2164, L-1).
+
+    Normalizes today's FOUR redundant state encodings — container
+    membership across the five queues (``_queue``/``_lane_buffers``/
+    ``_verifier_queue``/``_redispatch``/``_dispatch_item``), free-form
+    ``InflightEntry.phase: str`` values, the :class:`InflightStatus`
+    sentinel enum above, and the four worker transient side-fields
+    (``_inflight_req``/``_remerging_item``/``_finalizing_head``/
+    ``_dispatching_item``) — into ten members tracing the pipeline flow:
+    queued -> (lane_buffered ->) merging -> awaiting_verify ->
+    (redispatch_parked <->) dispatching -> verifying -> gate_reverify ->
+    finalizing -> terminal.
+
+    Members are ``str`` instances (mirrors :class:`InflightStatus` /
+    :class:`OutcomeKind` above). Only THREE members share a wire value with
+    an existing live phase string today — ``VERIFYING`` ('verifying', set in
+    ``_run_inflight_verify``), ``GATE_REVERIFY`` ('gate_reverify'), and
+    ``FINALIZING`` ('finalizing') (the latter two set in
+    ``_finalize_inflight``) — so ``==``/``in`` comparisons against THOSE
+    THREE raw strings keep working unchanged. The other seven members are
+    new vocabulary replacing queue-membership / worker-side-field encodings
+    that never had a phase-string form, so there is no existing raw string
+    for them to stay compatible with.
+
+    The live pipeline (``_dispatch_item``) also sets phase values this enum
+    does NOT model, so task kappa's downstream repoint is a value REMAP for
+    these, not a mechanical rename:
+
+      * ``_verify_phase = 'remerging'`` (cascade-remerge window) is the live
+        string for the conceptual MERGING state used by the cascade-remerge
+        edges in ``_LEGAL_TRANSITIONS`` below — the wire VALUES differ
+        ('remerging' vs 'merging') even though the STATE is the same.
+      * ``entry.phase`` values ``'abandoned'``, ``'halted'``, and
+        ``'passthrough'`` (pre-dispatch abandon / operator-halt / decided-
+        item passthrough branches) have no member here at all — this
+        substrate intentionally does not model them; kappa decides how (or
+        whether) they map onto a state below.
+
+    This is ONLY the state vocabulary — see
+    ``orchestrator.merge_queue.ItemLifecycle`` for the request_id-keyed
+    registry, ``orchestrator.merge_queue._LEGAL_TRANSITIONS`` for the
+    legal-edge table, and ``ItemLifecycle.transition()`` for the guarded
+    mutator. Task iota delivers only this substrate; the sibling task kappa
+    wires ``transition()`` at every put/pop call site and repoints
+    ``snapshot()`` / the permit audit / liveness checks onto the registry.
+    """
+
+    QUEUED = 'queued'
+    LANE_BUFFERED = 'lane_buffered'
+    MERGING = 'merging'
+    AWAITING_VERIFY = 'awaiting_verify'
+    REDISPATCH_PARKED = 'redispatch_parked'
+    DISPATCHING = 'dispatching'
+    VERIFYING = 'verifying'
+    GATE_REVERIFY = 'gate_reverify'
+    FINALIZING = 'finalizing'
+    TERMINAL = 'terminal'
+
+
 @dataclass
 class InflightEntry:
     """An in-flight verify entry held in SpeculativeMergeWorker._inflight deque.
