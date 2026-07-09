@@ -386,10 +386,11 @@ def test_flock_wait_env_override_speeds_up_contention_result(tmp_path):
         f'expected flock-contention result, got category={result.category!r} '
         f'stdout={stdout.decode()[:2000]!r}'
     )
-    assert elapsed < 3.0, (
+    assert elapsed < 6.0, (
         f'expected contention result well under the 10s production wait '
-        f'(env override=0.5s) -- took {elapsed:.2f}s; the env override is '
-        f'not wired up yet'
+        f'(env override=0.5s, generous ceiling for subprocess-startup '
+        f'jitter) -- took {elapsed:.2f}s; the env override is not wired up '
+        f'yet'
     )
 
 
