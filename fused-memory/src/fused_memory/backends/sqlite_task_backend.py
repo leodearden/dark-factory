@@ -446,7 +446,10 @@ async def _migrate_v3_to_v4(
 
     Re-runs the same residual non-cancelled duplicate ``candidate_key``
     audit ``_migrate_v2_to_v3`` performed (report-only there), extended with
-    ``GROUP_CONCAT(id)`` to name the offending rows:
+    ``GROUP_CONCAT(id ORDER BY id)`` to name the offending rows in a
+    deterministic (ascending id) order — SQLite does not otherwise guarantee
+    ``GROUP_CONCAT`` row order, and both the ERROR log token and the
+    escalation payload's ``task_ids`` list depend on a stable order:
 
     * **Residuals found** — log a loud ERROR naming the groups (via the
       ``residual_group_count=`` token, deliberately distinct from v2->v3's
@@ -478,7 +481,8 @@ async def _migrate_v3_to_v4(
     try:
         dup_cursor = await conn.execute(
             """
-            SELECT tag, candidate_key, GROUP_CONCAT(id) AS ids, COUNT(*) AS n
+            SELECT tag, candidate_key, GROUP_CONCAT(id ORDER BY id) AS ids,
+                   COUNT(*) AS n
             FROM tasks
             WHERE candidate_key IS NOT NULL AND status != 'cancelled'
             GROUP BY tag, candidate_key

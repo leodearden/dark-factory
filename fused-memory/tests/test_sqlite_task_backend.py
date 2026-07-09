@@ -2428,6 +2428,71 @@ async def test_v3_to_v4_self_gating_skips_index_and_escalates_on_residual_duplic
     ], residual_groups
 
 
+@pytest.mark.asyncio
+async def test_v3_to_v4_raising_escalation_cb_is_caught_and_logged(tmp_path, caplog):
+    """A misbehaving ``residual_dup_escalation_cb`` (raises instead of just
+    recording) must be caught and logged, never propagated -- connection-open
+    stays fail-safe even when the injected escalation seam itself is broken,
+    and the residual-dup skip outcome (no index, user_version stays at 3) is
+    unaffected by the callback's failure.
+    """
+    import sqlite3
+
+    project_root = str(tmp_path / 'proj')
+    db_path = Path(project_root) / '.taskmaster' / 'tasks' / 'tasks.db'
+    _make_v1_schema_db_no_candidate_key(db_path)
+
+    def raising_cb(project_root_arg, residual_groups):
+        raise RuntimeError('escalation backend unreachable')
+
+    cfg = TaskmasterConfig(project_root=str(tmp_path))
+    b = SqliteTaskBackend(cfg, residual_dup_escalation_cb=raising_cb)
+    await b.start()
+    try:
+        with caplog.at_level(
+            logging.ERROR, logger='fused_memory.backends.sqlite_task_backend',
+        ):
+            # Must return normally despite the callback raising.
+            await b.get_tasks(project_root=project_root)
+    finally:
+        await b.close()
+
+    conn = sqlite3.connect(str(db_path))
+    try:
+        indexes = {row[1] for row in conn.execute('PRAGMA index_list(tasks)')}
+        user_version = conn.execute('PRAGMA user_version').fetchone()[0]
+    finally:
+        conn.close()
+
+    # The residual-dup skip outcome is unchanged by the callback failure.
+    assert not any('candidate_key' in idx for idx in indexes), (
+        f'No index should reference candidate_key when the residual audit '
+        f'found duplicates, regardless of the escalation callback outcome; '
+        f'got: {indexes}'
+    )
+    assert user_version == 3, (
+        f'Expected user_version to stay at 3 on residual-dup skip even when '
+        f'the escalation callback raises; got {user_version}'
+    )
+
+    # The callback's own exception was caught and logged (not swallowed
+    # silently, not propagated out of connection-open).
+    cb_failure_records = [
+        r for r in caplog.records
+        if r.levelno == logging.ERROR
+        and 'residual_dup_escalation_cb' in r.message
+        and 'raised while escalating' in r.message
+    ]
+    assert len(cb_failure_records) == 1, (
+        f'Expected exactly one ERROR record logging the raising callback; got '
+        f'{len(cb_failure_records)}: {[r.message for r in caplog.records]}'
+    )
+    assert cb_failure_records[0].exc_info is not None, (
+        'Expected the callback failure to be logged with exc_info (via '
+        'logger.exception) so the traceback is captured'
+    )
+
+
 # ── candidate_key collision (fm-task-dedup W8 task A2) ───────────────
 
 

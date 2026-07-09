@@ -2602,17 +2602,29 @@ class TaskInterceptor:
 
         async with self._write_lock(project_id):
             try:
-                result = await tm.add_task(
-                    project_root=project_root,
-                    metadata=metadata_json,
-                    **kwargs,
-                )
-                atomic_metadata_written = metadata_json is not None
+                try:
+                    result = await tm.add_task(
+                        project_root=project_root,
+                        metadata=metadata_json,
+                        **kwargs,
+                    )
+                    atomic_metadata_written = metadata_json is not None
+                except TypeError:
+                    # Legacy two-step fallback for a backend whose add_task()
+                    # doesn't accept metadata= (see
+                    # test_add_task_falls_back_to_two_step_on_typeerror).
+                    # Nested inside the outer try so a collision on THIS
+                    # retry also resolves as 'combined' below rather than
+                    # escaping this method uncaught.
+                    result = await tm.add_task(project_root=project_root, **kwargs)
+                    atomic_metadata_written = False
             except DuplicateCandidateKeyError as exc:
                 # The partial UNIQUE index on (tag, candidate_key) rejected
                 # this insert — resolve as a combine pointing at the
                 # surviving row rather than falling through to 'failed'
-                # (PRD decision #3: a collision is not a failure).
+                # (PRD decision #3: a collision is not a failure). Covers
+                # both the primary add_task() call and its TypeError
+                # fallback retry above.
                 existing_id = (
                     str(exc.existing_id) if exc.existing_id is not None else None
                 )
@@ -2630,9 +2642,6 @@ class TaskInterceptor:
                     result_dict,
                     curator_degrade_reason,
                 )
-            except TypeError:
-                result = await tm.add_task(project_root=project_root, **kwargs)
-                atomic_metadata_written = False
 
             # The task backend's add_task is contractually guaranteed to return
             # an AddTaskResult DTO with a non-empty `id` — anything else raises
