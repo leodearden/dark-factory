@@ -1,6 +1,7 @@
 """Test/lint/typecheck runner for verification stages."""
 
 import asyncio
+import concurrent.futures
 import contextlib
 import errno
 import json
@@ -2842,6 +2843,33 @@ def _verify_admission_active(config: OrchestratorConfig) -> bool:
     return config.verify_admission_enabled
 
 
+_ADMISSION_EXECUTOR_MAX_WORKERS = 64
+
+_admission_executor_singleton: concurrent.futures.ThreadPoolExecutor | None = None
+
+
+def _admission_executor() -> concurrent.futures.ThreadPoolExecutor:
+    """Dedicated thread pool for the admission mkdir + flock poll-wait.
+
+    Kept separate from asyncio's shared default executor (process-wide,
+    capped at ``min(32, cpu_count+4)`` and used by unrelated
+    ``asyncio.to_thread`` callers throughout the orchestrator) so a burst of
+    concurrent task-role verifies polling ``acquire_task_slot`` can never
+    starve that unrelated work — or each other's ``slots_dir.mkdir``. Workers
+    spend nearly all their time asleep in T1's 0.1s poll loop, so a fixed
+    size decoupled from the cpu-bound default-executor formula is cheap.
+    Lazily created, never torn down (matches the default executor's
+    process-lifetime scope).
+    """
+    global _admission_executor_singleton
+    if _admission_executor_singleton is None:
+        _admission_executor_singleton = concurrent.futures.ThreadPoolExecutor(
+            max_workers=_ADMISSION_EXECUTOR_MAX_WORKERS,
+            thread_name_prefix='df-verify-admission',
+        )
+    return _admission_executor_singleton
+
+
 @contextlib.asynccontextmanager
 async def _admission_slot(role: str, config: OrchestratorConfig):
     """Async CM around T1's ``shared.verify_admission.acquire_task_slot``.
@@ -2853,14 +2881,28 @@ async def _admission_slot(role: str, config: OrchestratorConfig):
     for them, so ``merge`` can never be starved by ``task`` — C-merge-priority
     is owned entirely by T1, not re-implemented here).
 
-    T1 never creates ``slots_dir`` itself (fails open when absent), so this
-    CM mkdirs it first. The blocking, potentially-unbounded
-    ``acquire_task_slot(...).__enter__`` (a synchronous flock poll-loop) runs
-    via ``asyncio.to_thread`` so the wait never blocks the event loop —
-    otherwise a waiter would stall the holder's own subprocess-exit callback
-    from ever firing on this same loop, deadlocking cross-verify contention.
-    Release (``os.close`` under the hood) is synchronous and instant, so it
-    runs directly in ``finally`` without needing an executor thread.
+    T1 never creates ``slots_dir`` itself (fails open when absent) and never
+    even inspects it for roles it can't acquire for (its own role check
+    short-circuits first), so this CM only mkdirs it for roles that actually
+    attempt acquisition (``task``/``background``) — leaving ``merge`` (and any
+    other role) with no filesystem side effect. The mkdir and the blocking,
+    potentially-unbounded ``acquire_task_slot(...).__enter__`` (a synchronous
+    flock poll-loop) both run on the dedicated ``_admission_executor`` so the
+    wait never blocks the event loop nor contends with unrelated
+    ``asyncio.to_thread`` work — a loop-blocking acquire would otherwise stall
+    the holder's own subprocess-exit callback from ever firing on this same
+    loop, deadlocking cross-verify contention.
+
+    The acquire await is shielded from cancellation (``asyncio.shield``): if
+    the awaiting coroutine is cancelled mid-wait (e.g. orchestrator shutdown,
+    or a sibling verify's failure cancelling this one via ``asyncio.gather``),
+    the worker thread's poll loop keeps running in the background regardless
+    — it cannot be interrupted mid-``time.sleep`` — so a bare cancellation
+    would otherwise leave a slot acquired-but-never-released if the thread
+    goes on to succeed after we stopped waiting. A done-callback releases it
+    in that case instead. Release on the normal path (``os.close`` under the
+    hood) is synchronous and instant, so it runs directly in ``finally``
+    without needing an executor thread.
 
     Fails open (runs ungated) on any ``OSError`` — most commonly a
     ``slots_dir`` that cannot be created (C-fail-open, mirroring T1's own
@@ -2868,11 +2910,26 @@ async def _admission_slot(role: str, config: OrchestratorConfig):
     """
     slots_dir = Path(config.verify_admission_slots_dir)
     n = config.verify_admission_task_slots
+    loop = asyncio.get_running_loop()
+    executor = _admission_executor()
     cm = None
     try:
-        await asyncio.to_thread(slots_dir.mkdir, parents=True, exist_ok=True)
+        if role in {'task', 'background'}:
+            await loop.run_in_executor(
+                executor, lambda: slots_dir.mkdir(parents=True, exist_ok=True),
+            )
         cm = acquire_task_slot(role, slots_dir=slots_dir, n=n, wait=True)
-        await asyncio.to_thread(cm.__enter__)
+        enter_future = loop.run_in_executor(executor, cm.__enter__)
+        try:
+            await asyncio.shield(enter_future)
+        except asyncio.CancelledError:
+            def _release_if_acquired(fut: 'asyncio.Future[bool]') -> None:
+                if cm is None or fut.cancelled() or fut.exception() is not None:
+                    return
+                with contextlib.suppress(OSError):
+                    cm.__exit__(None, None, None)
+            enter_future.add_done_callback(_release_if_acquired)
+            raise
     except OSError:
         cm = None
     try:

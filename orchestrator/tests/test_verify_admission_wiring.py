@@ -24,6 +24,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import shlex
+from typing import Any
 from unittest.mock import patch
 
 import pytest
@@ -53,8 +54,8 @@ def _leg_for_cmd(cmd: str) -> str:
     return cmd
 
 
-def _module_config(**overrides) -> ModuleConfig:
-    kwargs = dict(
+def _module_config(**overrides: Any) -> ModuleConfig:
+    kwargs: dict[str, Any] = dict(
         prefix='pkg',
         test_command=_TEST_CMD,
         lint_command=_LINT_CMD,

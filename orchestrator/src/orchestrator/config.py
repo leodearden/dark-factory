@@ -1792,7 +1792,9 @@ class OrchestratorConfig(BaseSettings):
     verify_admission_task_slots: int = Field(default=1, ge=1)
     # Directory holding the flock slot files. Created lazily by verify.py's
     # admission wiring (T1's acquire_task_slot never creates it itself, so
-    # a missing directory always fails open and never gates).
+    # a missing directory always fails open and never gates) — and only for
+    # roles that can actually hold a slot ('task'/'background'); 'merge'
+    # verifies never touch this directory (C-merge-priority).
     verify_admission_slots_dir: str = Field(
         default_factory=lambda: f'/tmp/df-verify-slots-{os.getuid()}',
     )
