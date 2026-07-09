@@ -26,6 +26,7 @@ from enum import Enum
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Literal, Protocol
 
+from orchestrator.dry_run_unblock import run_dry_run_unblock
 from orchestrator.event_store import EventStore, EventType
 from orchestrator.git_ops import (
     PERSISTENT_MERGE_WORKTREE_NAME,
@@ -158,6 +159,7 @@ from orchestrator.suffix_graph import (  # noqa: F401  re-export shim
     SuffixConflictTracker,
 )
 from orchestrator.task_status import WORKFLOW_PRESERVE_STATUSES
+from orchestrator.unblock_types import BlockClass
 from orchestrator.verify import (
     VerifyResult,
     _derive_task_files_from_git,
@@ -867,6 +869,127 @@ def _alarm_verify_worktree_contention(
     escalation_queue.submit(esc)
 
 
+@dataclasses.dataclass(frozen=True)
+class _DryRunInvestigationHandles:
+    """Opaque bundle of harness-owned handles for the merge-verify dry-run spawn.
+
+    SpeculativeMergeWorker holds none of scheduler/mcp/usage_gate/cost_store
+    itself (the harness owns all of them); this bundles them into one
+    optional, default-``None`` param so ``_run_post_merge_verify`` stays a
+    pure git engine (mirrors the ``train_callback_factory`` opaque-injection
+    pattern — the worker never imports the scheduler).  Only the production
+    ``SpeculativeMergeWorker._run_inflight_verify`` call site passes a live
+    instance; the solo-reverify and train module-level callers pass nothing,
+    so their spawns automatically no-op.
+
+    ``background_tasks`` is the SAME ``set`` instance the worker stores at
+    ``self._background_tasks`` — a spawned investigation task's strong ref
+    lives exactly as long as the worker, mirroring
+    ``workflow.TaskWorkflow._background_tasks``.
+    """
+
+    scheduler: Any
+    mcp: Any = None
+    usage_gate: Any = None
+    cost_store: Any = None
+    background_tasks: set[asyncio.Task] = dataclasses.field(default_factory=set)
+
+
+def _spawn_merge_verify_dry_run(
+    handles: _DryRunInvestigationHandles | None,
+    req: MergeRequest,
+    reason: str,
+    detail: str,
+    *,
+    event_store: EventStore | None = None,
+) -> None:
+    """Fire-and-forget: spawn an autonomous dry-run investigation for a
+    MERGE_VERIFY_RED post-merge-verify block.
+
+    Mirrors ``workflow._spawn_dry_run_unblock``'s fire-and-forget shape
+    (try/except-wrapped ``asyncio.create_task``, strong-ref registration into
+    a ``background_tasks`` set with a discard done-callback) so the
+    merge-verify and agent-block investigation spawns behave identically.
+    ``block_class=BlockClass.MERGE_VERIFY_RED`` is passed explicitly — the
+    generic post-merge reason is deliberately not mapped by
+    ``classify_block_reason`` (see ``unblock_types`` module docstring).
+
+    None-safe: no-ops when *handles* is ``None`` or ``handles.scheduler`` is
+    ``None`` — the solo-reverify and train module-level
+    ``_run_post_merge_verify`` callers pass no handles.  Also no-ops when
+    ``req.config.unblock_auto.enabled`` is falsy, when a not-done
+    investigation task is already registered in ``handles.background_tasks``
+    under this task's name (mirrors ``workflow._spawn_dry_run_unblock``'s
+    enablement and in-flight-dedup guards), or when ``req.worktree`` is
+    missing/nonexistent.
+
+    The investigation always reads ``req.worktree`` — the task's OWN retained
+    worktree — rather than the ephemeral merge worktree: by the time this
+    fire-and-forget task actually runs, ``_run_post_merge_verify`` has already
+    handed the merge worktree to ``cleanup_merge_worktree`` (task 2141
+    step-17/18 — the no-op cleanup mock in the test suite hid this).
+    ``req.worktree`` survives while the task stays blocked, and is what
+    ``b3_gate`` re-checks at gate time. (The ephemeral merge worktree is no
+    longer accepted as a parameter here — task 2141 amendment pass, review
+    finding `dead_parameter`.)
+
+    *event_store* is forwarded to ``run_dry_run_unblock`` so the
+    investigation emits the same ``invocation_end``/``'blocked'`` telemetry
+    event the agent-block path emits (observability parity).
+    """
+    if handles is None or handles.scheduler is None:
+        return
+    ua = getattr(req.config, 'unblock_auto', None)
+    if not ua or not ua.enabled:
+        return
+    task_name = f'unblock-auto-{req.task_id}'
+    # Skip if an investigation for this task is already running (e.g. rapid
+    # re-blocks across successive merge-verify retries).  Duplicate proposals
+    # are unhelpful and would multiply budget spend up to the investigation's
+    # own timeout ceiling per re-block (mirrors
+    # workflow._spawn_dry_run_unblock's dedup guard).
+    if any(
+        t.get_name() == task_name and not t.done()
+        for t in handles.background_tasks
+    ):
+        logger.debug(
+            'Task %s: merge-verify dry-run investigation already in '
+            'progress, skipping duplicate spawn',
+            req.task_id,
+        )
+        return
+    if req.worktree is None or not req.worktree.exists():
+        logger.debug(
+            'Task %s: skipping merge-verify dry-run — task worktree missing',
+            req.task_id,
+        )
+        return
+    try:
+        task = asyncio.create_task(
+            run_dry_run_unblock(
+                task_id=req.task_id,
+                worktree=str(req.worktree),
+                reason=reason,
+                detail=detail,
+                scheduler=handles.scheduler,
+                mcp=handles.mcp,
+                config=req.config,
+                event_store=event_store,
+                usage_gate=handles.usage_gate,
+                cost_store=handles.cost_store,
+                block_class=BlockClass.MERGE_VERIFY_RED,
+            ),
+            name=task_name,
+        )
+        handles.background_tasks.add(task)
+        task.add_done_callback(handles.background_tasks.discard)
+    except Exception as exc:
+        logger.warning(
+            'Task %s: failed to spawn merge-verify dry-run investigation: %s',
+            req.task_id, exc,
+        )
+
+
 async def _run_post_merge_verify(
     git_ops: GitOps,
     req: MergeRequest,
@@ -883,6 +1006,7 @@ async def _run_post_merge_verify(
     keep_worktrees: Collection[Path] | None = None,
     runner: VerifyRunner | None = None,
     escalation_queue: Any = None,
+    dry_run_handles: _DryRunInvestigationHandles | None = None,
 ) -> MergeOutcome | None:
     """Run post-merge verification for a single task.
 
@@ -925,6 +1049,14 @@ async def _run_post_merge_verify(
             (``is_flock_contention_failure``); has no effect on any other
             failure path.  None-safe — omitting it keeps every existing
             call site byte-identical.
+        dry_run_handles: Opaque bundle of scheduler/mcp/usage_gate/cost_store
+            (task η, AFK coverage gap).  ``None`` (default) keeps the
+            solo-reverify and train module-level callers byte-identical (no
+            spawn).  Only the production ``SpeculativeMergeWorker`` call site
+            passes a live bundle, at which point a MERGE_VERIFY_RED outcome
+            (generic task-fault or unscoped-typecheck-FAILED) fires a
+            fire-and-forget dry-run investigation via
+            :func:`_spawn_merge_verify_dry_run`.
     """
     # Pre-verify disk guard: if free space is low, prune stale merge
     # worktrees; if still low, skip the build and escalate as transient
@@ -1085,6 +1217,11 @@ async def _run_post_merge_verify(
                 detail = verify.type_output or ''
                 if detail:
                     reason = f'{reason}\n\n{detail}'
+            if verify.category != UNSCOPED_TYPECHECK_TIMEOUT_CATEGORY:
+                _spawn_merge_verify_dry_run(
+                    dry_run_handles, req, reason, detail,
+                    event_store=event_store,
+                )
             return MergeOutcome('blocked', reason=reason)
 
         # Persistent ENOSPC after the prune-and-retry → transient infra.
@@ -1134,6 +1271,11 @@ async def _run_post_merge_verify(
                     'row — next submission will be abandoned',
                     req.task_id, new_count,
                 )
+        if not verify.timed_out:
+            _spawn_merge_verify_dry_run(
+                dry_run_handles, req, reason, detail,
+                event_store=event_store,
+            )
         return MergeOutcome(
             'blocked', reason=reason,
             failure_category=verify.category,
@@ -4279,10 +4421,32 @@ class SpeculativeMergeWorker(_WipHaltMixin):
         train_callback_factory: TrainCallbackFactory | None = None,
         merge_ready_predicate: MergeReadyPredicate | None = None,
         merge_store: Any = None,
+        scheduler: Any = None,
+        mcp: Any = None,
+        usage_gate: Any = None,
+        cost_store: Any = None,
     ):
         self._git_ops = git_ops
         self._queue = queue
         self._event_store = event_store
+        # Task η (AFK coverage gap): harness-owned handles for the
+        # merge-verify dry-run investigation spawn.  The worker holds none of
+        # these itself in any other capacity — they exist solely to be
+        # bundled into self._dry_run_handles below and threaded opaquely into
+        # _run_post_merge_verify at the production _run_inflight_verify call
+        # site (mirrors the train_callback_factory opaque-injection pattern
+        # above: the worker never imports the scheduler).  All four default
+        # to None so every existing bare git_ops+queue test constructor stays
+        # byte-identical.
+        self._scheduler = scheduler
+        self._mcp = mcp
+        self._usage_gate = usage_gate
+        self._cost_store = cost_store
+        self._background_tasks: set[asyncio.Task] = set()
+        self._dry_run_handles = _DryRunInvestigationHandles(
+            scheduler=scheduler, mcp=mcp, usage_gate=usage_gate,
+            cost_store=cost_store, background_tasks=self._background_tasks,
+        )
         # Post-merge notification hook — called with (task_id, base_sha,
         # advanced_sha) after each 'done' merge.  Wrapped in try/except so a
         # coordinator bug never blocks or fails the merge.  See task 1592.
@@ -7064,6 +7228,21 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                 with contextlib.suppress(BaseException):
                     await _dt
 
+        # η: cancel any still-in-flight merge-verify dry-run investigations
+        # (spawned by _spawn_merge_verify_dry_run and tracked in
+        # self._background_tasks) so a detached run_dry_run_unblock — which
+        # does git subprocess work and an LLM agent invocation — is not left
+        # running after shutdown has been requested (task 2141 amendment
+        # pass, review finding `resource_cleanup`). Mirrors the
+        # _drift_check_tasks drain immediately above and
+        # workflow.TaskWorkflow's own background_tasks cleanup. Take a
+        # snapshot before iterating: the done-callback mutates the set.
+        for _bt in list(self._background_tasks):
+            if not _bt.done():
+                _bt.cancel()
+                with contextlib.suppress(BaseException):
+                    await _bt
+
     # ------------------------------------------------------------------
     # Event helpers
     # ------------------------------------------------------------------
@@ -9075,6 +9254,7 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                 keep_worktrees=set(self._owned_merge_worktrees),
                 runner=None if lease.is_local else lease.runner,
                 escalation_queue=self._escalation_queue,
+                dry_run_handles=self._dry_run_handles,
             ))
             while True:
                 done, _ = await asyncio.wait(

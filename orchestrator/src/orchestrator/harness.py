@@ -6499,6 +6499,10 @@ Output JSON matching the schema. Every task must appear in the output.
             escalation_queue=self._escalation_queue,
             train_callback_factory=train_callback_factory,
             merge_store=self._merge_store,
+            scheduler=self.scheduler,
+            mcp=self.mcp,
+            usage_gate=getattr(self, 'usage_gate', None),
+            cost_store=getattr(self, 'cost_store', None),
         )
         self._merge_worker_task = asyncio.create_task(
             self._merge_worker.run(), name='merge-worker',
