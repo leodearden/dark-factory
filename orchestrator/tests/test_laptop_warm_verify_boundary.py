@@ -28,20 +28,33 @@ import asyncio
 import contextlib
 import fcntl
 import os
+import socket
 import subprocess
 import sys
 import threading
 import time
 from pathlib import Path
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 from click.testing import CliRunner
+from escalation.queue import EscalationQueue
 from test_cli import _setup_verify_repo  # noqa: F401 -- reused cross-module
+from test_merge_queue_multihost_wiring import (  # noqa: F401 -- reused cross-module
+    _make_config as _mq_make_config,
+)
+from test_merge_queue_multihost_wiring import (
+    _make_git_ops_mock as _mq_make_git_ops_mock,
+)
+from test_merge_queue_multihost_wiring import (
+    _make_merge_request as _mq_make_merge_request,
+)
 
 import orchestrator.cli as cli_module
 from orchestrator.cli import main
 from orchestrator.config import OrchestratorConfig
 from orchestrator.git_ops import GitOps
+from orchestrator.merge_queue import _run_post_merge_verify, _verify_worktree_contention_sentinel
 from orchestrator.verify_cancel import (  # noqa: F401 -- reused by row tests
     collect_descendants,
     merge_verify_lock_path,
@@ -886,3 +899,144 @@ def test_heartbeat_starved_hard_partition_tree_killed_via_timeout(tmp_path):
         if child.stdin is not None:
             with contextlib.suppress(OSError):
                 child.stdin.close()
+
+
+# ---------------------------------------------------------------------------
+# Task 2309 step-13/14 -- SS9 Row 5: flock contention, FULL two-way seam
+# (producer + consumer).  The load-bearing SS8.2 seam assertion: a real
+# verify-merge #1 holds .merge_verify.lock mid-build; a real verify-merge #2
+# on the SAME worktree_base reports the FLOCK_CONTENTION_CATEGORY
+# discriminant on stdout WITHOUT ever touching the tree; #2's parsed stdout
+# is then fed through the REAL merge_queue consumer (_run_post_merge_verify +
+# a real EscalationQueue), asserting a born-at-L2 escalation is filed and the
+# MergeOutcome is 'blocked'.
+# ---------------------------------------------------------------------------
+
+
+def test_flock_contention_full_two_way_seam_blocks_and_escalates(tmp_path):
+    """SS9 Row 5: producer discriminant -> real consumer -> born-at-L2 + blocked.
+
+    Producer side: a real ``verify-merge #1`` (sleeper build, --request-id)
+    materialises the persistent ``_merge-verify`` worktree and holds the real
+    ``.merge_verify.lock`` flock for the full duration of its build (cli.py
+    acquires the flock BEFORE awaiting the build and releases it only in the
+    outer ``finally``).  A real ``verify-merge #2`` on the SAME worktree_base
+    with the step-2 env seam (small flock wait) then reports contention.
+
+    Asserts on #2: exits 0 with the FLOCK_CONTENTION_CATEGORY discriminant on
+    stdout, contention={host, holder_pgid, waiter_pgid} with holder_pgid
+    matching #1's own pgid; no ``_merge-<uuid>`` ephemeral dir is ever
+    created; #1's ``_merge-verify`` tree is never touched (marker file mtime
+    unchanged -- #2's code path returns before
+    ``acquire_host_verify_worktree`` is ever called on contention).
+
+    Consumer side: parses #2's stdout via ``result_from_json`` and feeds it
+    through the REAL ``_run_post_merge_verify`` (a stub runner returning that
+    exact parsed result -- the established pattern from
+    ``TestRunPostMergeVerifyFlockContention`` in
+    ``test_merge_queue_multihost_wiring.py``) with a REAL
+    ``EscalationQueue(tmp_path)``.  Asserts a born-at-L2 escalation is queued
+    (level=2, severity='critical',
+    agent_role='orchestrator-verify-host-monitor',
+    category='verify_worktree_contention', detail names both pgids) and the
+    returned ``MergeOutcome`` is 'blocked'.
+    """
+    repo, head_sha = _setup_verify_repo(tmp_path)
+    cfg_file = tmp_path / 'config.yaml'
+    write_verify_config(cfg_file, repo, persistent_merge_worktree=True)
+    worktree_base = worktree_base_for(repo)
+
+    HOLDER_REQUEST_ID = 'row5-holder'
+    pgf_holder = pgid_file(worktree_base, HOLDER_REQUEST_ID)
+
+    holder = spawn_verify_merge(
+        sha=head_sha, spec=sleeper_spec(300.0), cfg_file=cfg_file, request_id=HOLDER_REQUEST_ID,
+    )
+    try:
+        holder_pgid_val = wait_for_pgid_file(pgf_holder)
+        wait_subtree_live(holder_pgid_val)
+
+        persistent_wt = worktree_base / '_merge-verify'
+        marker = persistent_wt / 'target' / 'warm.marker'
+        assert marker.exists(), f'holder build did not materialize {marker}'
+        marker_mtime_before = marker.stat().st_mtime_ns
+
+        waiter = spawn_verify_merge(
+            sha=head_sha,
+            spec=fast_spec(),
+            cfg_file=cfg_file,
+            request_id='row5-waiter',
+            extra_env={'ORCH_MERGE_VERIFY_FLOCK_WAIT_SECS': '0.5'},
+        )
+        stdout, stderr = waiter.communicate(timeout=15)
+
+        assert waiter.returncode == 0, (
+            f'expected exit 0 (contention result on stdout), got '
+            f'{waiter.returncode}; stderr={stderr.decode()[:2000]!r}'
+        )
+        result = result_from_json(stdout.decode())
+        assert is_flock_contention_failure(result), (
+            f'expected the flock-contention discriminant, got {result!r}'
+        )
+        assert result.category == FLOCK_CONTENTION_CATEGORY
+        assert result.contention is not None
+        assert result.contention['host'] == socket.gethostname()
+        assert result.contention['holder_pgid'] == holder_pgid_val
+        waiter_pgid_val = result.contention['waiter_pgid']
+        assert waiter_pgid_val != holder_pgid_val
+
+        leaked_ephemeral = sorted(
+            p.name for p in worktree_base.iterdir()
+            if p.name.startswith('_merge-') and p.name != '_merge-verify'
+        )
+        assert leaked_ephemeral == [], (
+            f'waiter must never create an ephemeral _merge-<uuid> dir on '
+            f'contention: {leaked_ephemeral}'
+        )
+        assert marker.stat().st_mtime_ns == marker_mtime_before, (
+            "waiter mutated the holder's _merge-verify tree on contention "
+            "(marker mtime changed)"
+        )
+    finally:
+        if holder.poll() is None:
+            holder.kill()
+            holder.wait(timeout=5)
+
+    # --- Consumer side: feed #2's real discriminant through the real beta
+    # consumer (_run_post_merge_verify) with a real EscalationQueue. ---
+
+    stub_runner = MagicMock()
+    stub_runner.is_local = False
+    stub_runner.run_merge_verify = AsyncMock(return_value=result)
+
+    eq = EscalationQueue(tmp_path / 'escalations')
+
+    async def _drive_consumer():
+        config = _mq_make_config()
+        req = _mq_make_merge_request(config, task_files=['src/foo.py'], worktree=tmp_path)
+        git_ops = _mq_make_git_ops_mock()
+        return await _run_post_merge_verify(
+            git_ops, req, tmp_path,
+            timeouts={}, enospc_retries={},
+            max_timeouts=2, max_enospc=1,
+            merge_sha=head_sha,
+            runner=stub_runner,
+            escalation_queue=eq,
+        )
+
+    outcome = asyncio.run(_drive_consumer())
+
+    assert outcome is not None
+    assert outcome.status == 'blocked'
+    assert outcome.failure_category == FLOCK_CONTENTION_CATEGORY
+
+    sentinel = _verify_worktree_contention_sentinel(socket.gethostname())
+    matches = eq.get_by_task(sentinel, status='pending', level=2)
+    assert len(matches) == 1, f'expected exactly one born-at-L2 escalation, got {matches!r}'
+    esc = matches[0]
+    assert esc.level == 2
+    assert esc.severity == 'critical'
+    assert esc.agent_role == 'orchestrator-verify-host-monitor'
+    assert esc.category == 'verify_worktree_contention'
+    assert str(holder_pgid_val) in esc.detail
+    assert str(waiter_pgid_val) in esc.detail
