@@ -665,3 +665,69 @@ class TestB6ReportAtomicity:
         # Consumer side: the exception propagated (not swallowed), and the
         # account is not left stuck in PROBE_IN_FLIGHT.
         await _assert_probe_released_after_exception(gate, probing_acct)
+
+
+# ---------------------------------------------------------------------------
+# B7 -- the shared invoke_with_cap_retry loop's zero-output-wedge fresh-
+# fallback guard -- the exact mechanism the steward inherits via its
+# rebuild_prompt + max_cap_retries wiring (task W4-eta), tested at THIS
+# shared seam rather than by importing orchestrator.steward (shared/ must
+# not import orchestrator/ -- see this task's plan design_decisions). A
+# cap-hit resume that then wedges (zero-output timeout on the resumed
+# session) triggers the rebuild_prompt(True) fresh-session fallback and
+# clears the wedged resume_session_id rather than perpetuating it (consumer
+# side); the loop terminates bounded, and the gate is left consistent
+# afterward (producer side).
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestB7StewardWedgeGuardInherited:
+    """Scripted cap-hit (with session_id) -> resume -> zero-output-wedge ->
+    success. Tested at the SHARED invoke_with_cap_retry seam -- the exact
+    loop the steward routes every invocation through (task W4-eta)."""
+
+    async def test_cap_resume_then_wedge_triggers_fresh_fallback_and_terminates_bounded(self):
+        cap_result = AgentResult(
+            success=False,
+            output="You've hit your usage limit for Claude Pro. Your plan resets in 3 hours.",
+            session_id='sess-cap-123',
+        )
+        wedge_result = AgentResult(
+            success=False,
+            output='',
+            timed_out=True,
+            transcript_turns=0,
+        )
+        ok_result = AgentResult(success=True, output='done', cost_usd=0.02)
+
+        gate = make_boundary_gate(['acct-0', 'acct-1'])
+        cli = scripted_cli(cap_result, wedge_result, ok_result)
+        rebuild_calls: list[bool] = []
+
+        async def rebuild_prompt(session_lost: bool) -> str:
+            rebuild_calls.append(session_lost)
+            return 'rebuilt fresh prompt'
+
+        with patch('shared.cli_invoke.asyncio.sleep', new_callable=AsyncMock):
+            result = await invoke_with_cap_retry(
+                gate, 'B7[wedge-guard]',
+                invoke_fn=cli,
+                rebuild_prompt=rebuild_prompt,
+                max_cap_retries=16,
+                backend='claude',
+                prompt='original task prompt',
+            )
+
+        # Consumer side: the fresh-session fallback fired exactly once, the
+        # wedged session was never re-resumed, and the loop terminated
+        # bounded with the eventual success.
+        assert result.success is True
+        assert len(cli.calls) == 3
+        assert rebuild_calls == [True]
+        assert cli.calls[1].get('resume_session_id') == 'sess-cap-123'
+        assert cli.calls[2].get('resume_session_id') is None
+        assert cli.calls[2]['prompt'] == 'rebuilt fresh prompt'
+
+        # Producer side: the gate is left consistent afterward.
+        await _assert_gate_consistent_after_retry_sequence(gate)
