@@ -7064,6 +7064,32 @@ Output JSON matching the schema. Every task must appear in the output.
             outbox=self._merge_worker._landed_outbox,
         )
 
+    async def _already_landed_dispatch_gate(self, task_id: str) -> bool:
+        """Pre-dispatch gate for OUT-OF-BAND already-landed tasks (task 2313).
+
+        Architecturally parallel to :meth:`_landed_dispatch_gate` but
+        consults LIVE GIT STATE rather than the durable LandedOutbox, so it
+        also catches landings that never went through this orchestrator's
+        merge queue: a sibling direct-merge, a prior orchestrator run, or a
+        squash/rebase/manual landing.  Installed as
+        ``self.scheduler._already_landed_gate``.
+
+        Minimal ancestry path only — guards, the merge-marker path, and the
+        content-equivalence fallback are added in later steps.
+        """
+        branch = f'{self.git_ops.config.branch_prefix}{task_id}'
+        if await self.git_ops.is_ancestor(branch, self.git_ops.config.main_branch):
+            citation = await self.git_ops.find_task_citation_commit(
+                task_id, pattern_template=self.git_ops.config.commit_citation_pattern,
+            )
+            await self._mark_in_progress_done(
+                task_id, citation,
+                'reconcile: pre-dispatch check found branch already on main',
+                'dispatch-gate-already-on-main',
+            )
+            return True
+        return False
+
     async def _stop_escalation_server(self) -> None:
         """Stop the escalation server."""
         if self._escalation_task is not None:
