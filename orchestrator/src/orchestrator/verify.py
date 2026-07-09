@@ -446,6 +446,47 @@ _PYTEST_PROGRESS_BARE_RE = re.compile(r'^[\.FsxXEPp]+(\s+\[\s*\d+%\])?$')
 _PYTEST_PROGRESS_FILE_RE = re.compile(r'^\S+\.py [\.FsxXEPp]+(\s+\[\s*\d+%\])?$')
 
 
+# Bare pytest-xdist worker-crash signature (task 2365). Grounded in
+# config.yaml's task-2361 comment: under host CPU oversubscription a starved
+# xdist worker crosses the per-test wall-clock ceiling, gets os._exit()'d by
+# pytest-timeout's thread method, and --max-worker-restart=0 (kept
+# intentionally at 0 — task 1907) turns that into a false-failing per-test
+# "node down" attributed to whatever test happens to be running, not a real
+# per-test defect. Not anchored to line-start/end (unlike the _PYTEST_* line
+# patterns above) since xdist's crash notices can be prefixed by pytest's own
+# progress/worker-id decoration.
+_XDIST_WORKER_CRASH_RE = re.compile(
+    r'node down: Not properly terminated|worker gw\d+ crashed|\[gw\d+\] node down',
+    re.MULTILINE,
+)
+
+
+def _is_bare_xdist_worker_crash(output: str) -> bool:
+    """Return True when *output* is a bare xdist worker crash with no real failure.
+
+    A hard ``os._exit()`` worker kill (task 2361) produces no assertion
+    traceback, so the presence of ANY genuine pytest failure marker —
+    ``_PYTEST_TRACEBACK_E_RE`` (``^E   ...``), ``_PYTEST_FAILED_LINE_RE``
+    (``^FAILED ...``), or ``_PYTEST_FAILURE_SUMMARY_RE`` (``=== N failed
+    ===``) — reliably indicates a genuine failure occurred alongside the
+    crash, and suppresses reclassification: never mask a real failure. The
+    fail-safe direction is to surface the failure unchanged (status quo)
+    whenever a real failure marker is also present.
+
+    Returns ``False`` for falsy *output* or when the crash signature itself
+    is absent.
+    """
+    if not output:
+        return False
+    if not _XDIST_WORKER_CRASH_RE.search(output):
+        return False
+    return not (
+        _PYTEST_TRACEBACK_E_RE.search(output)
+        or _PYTEST_FAILED_LINE_RE.search(output)
+        or _PYTEST_FAILURE_SUMMARY_RE.search(output)
+    )
+
+
 def _extract_cause_hint(output: str) -> str:
     """Extract a one-line failure hint from command output.
 
@@ -2937,6 +2978,59 @@ async def run_verification(
             # the pure-timeout retry loop, so "after {max_retries} retries"
             # would misdescribe it.
             summary = 'Verification timed out during env-recovery retry'
+
+    # Bare pytest-xdist worker-crash retry (task 2365): under host overload a
+    # starved xdist worker is os._exit()'d by pytest-timeout's thread method,
+    # and --max-worker-restart=0 (task 1907, kept intentionally at 0) turns
+    # that into a bare "node down: Not properly terminated" / "worker gwN
+    # crashed" failure attributed to whatever test happened to be running —
+    # not a real code regression (esc-2286-21). _is_bare_xdist_worker_crash
+    # is the conservative discriminator: it returns False (no reclassify)
+    # whenever a genuine pytest failure marker is also present, so a real
+    # failure is never masked. The gate also requires lint_rc == 0 and
+    # type_rc == 0: the discriminator only inspects test_out for pytest
+    # failure markers, so without this a genuine, co-occurring lint/type
+    # regression would be silently diverted onto the infra-retry path
+    # instead of being surfaced as its own test_failure. Requiring both
+    # other legs to be clean means the reclassification only fires when the
+    # crashed test leg is the ONLY non-zero check. Gated on
+    # `not is_merge_verify` — mirrors the _mark_verify_warm precedent below
+    # — because the merge path (merge_queue.py) has no VerifyInfraError
+    # handler and an uncaught raise there would stall the merge queue.
+    # Raising here (rather than returning a failure category) routes
+    # through the EXISTING bounded exponential-backoff retry
+    # (_run_scoped_verification_with_infra_retry in workflow.py) instead of
+    # the debugfix loop's DEBUGGER invocation — the task-path's only
+    # auto-retry-without-debugging mechanism.
+    #
+    # Known accepted tradeoff: a genuine, deterministically-reproducible
+    # regression that hangs (e.g. an infinite loop) will, under xdist +
+    # pytest-timeout's thread-kill method, also os._exit() the worker and
+    # produce this identical bare "node down" signature with no FAILED/E/
+    # summary marker — indistinguishable from a host-overload crash by
+    # signature alone. Such a hang is routed to the bounded infra retry
+    # instead of straight to the debugger; unlike an overload flake it will
+    # recur on every retry (a hang doesn't self-heal), so it exhausts the
+    # retry window and lands in infra_hold + escalate_to_human rather than
+    # being auto-debugged immediately. That is a fail-safe outcome (a human
+    # sees it, nothing is silently greened), not a fail-fast one, and is
+    # judged acceptable against the status quo of burning debugger
+    # iterations on non-reproducible overload flakes.
+    if (
+        not is_merge_verify
+        and test_rc != 0
+        and lint_rc == 0
+        and type_rc == 0
+        and _is_bare_xdist_worker_crash(test_out)
+    ):
+        logger.warning(
+            'Task %s: bare pytest-xdist worker crash detected (module_prefix=%r) '
+            'with no real failure marker in test output — reclassifying as '
+            'transient infra (xdist_worker_crash) and raising VerifyInfraError '
+            'for the bounded whole-suite retry instead of invoking the debugger',
+            task_id, module_prefix,
+        )
+        raise VerifyInfraError(phase='xdist_worker_crash', errno=None)
 
     # Hoist runs list so both the merge-path and task-path branches can use it.
     runs = [
