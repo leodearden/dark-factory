@@ -36,6 +36,15 @@ _POOL_PARAMS = pytest.mark.parametrize(
     ids=['stage2', 'stage1'],
 )
 
+# Parametrize stage across both known stages to prove genericity of the
+# absence self-heal functions (verify_cycle_summary_written,
+# reconstruct_cycle_summary_stub).
+_STAGE_PARAMS = pytest.mark.parametrize(
+    'stage',
+    ['memory_consolidator', 'task_knowledge_sync'],
+    ids=['stage1', 'stage2'],
+)
+
 
 class TestEnforceSummaryPoolCap:
     """enforce_summary_pool_cap trims oldest pool members to the passed cap."""
@@ -414,3 +423,88 @@ class TestPretrimSummaryPool:
         )
 
         assert result == 1
+
+
+class TestVerifyCycleSummaryWritten:
+    """verify_cycle_summary_written: deterministic post-write count check.
+
+    Generalizes task_knowledge_sync.py's _verify_stage2_summary_written
+    (task 2366) — parametrized over `stage` to prove the core is generic,
+    not hardcoded to either Stage 1 or Stage 2.
+    """
+
+    @_STAGE_PARAMS
+    @pytest.mark.asyncio
+    async def test_returns_positive_count_when_present(self, stage):
+        memory_service = AsyncMock()
+        memory_service.count_memories_by_metadata = AsyncMock(return_value=1)
+
+        result = await verify_cycle_summary_written(
+            memory_service,
+            'dark_factory',
+            'run-present',
+            stage=stage,
+        )
+
+        assert result == 1
+
+    @_STAGE_PARAMS
+    @pytest.mark.asyncio
+    async def test_returns_zero_when_confirmed_absent(self, stage):
+        memory_service = AsyncMock()
+        memory_service.count_memories_by_metadata = AsyncMock(return_value=0)
+
+        result = await verify_cycle_summary_written(
+            memory_service,
+            'dark_factory',
+            'run-absent',
+            stage=stage,
+        )
+
+        assert result == 0
+
+    @_STAGE_PARAMS
+    @pytest.mark.asyncio
+    async def test_returns_none_and_logs_warning_on_transient_failure(self, stage, caplog):
+        """A count_memories_by_metadata failure returns None (NOT 0) — absence is
+        NOT confirmed on a transient error."""
+        memory_service = AsyncMock()
+        memory_service.count_memories_by_metadata = AsyncMock(
+            side_effect=RuntimeError('qdrant gone')
+        )
+
+        with caplog.at_level(logging.WARNING, logger=_LOGGER):
+            result = await verify_cycle_summary_written(
+                memory_service,
+                'dark_factory',
+                'run-transient',
+                stage=stage,
+            )
+
+        assert result is None
+        warning_records = [r for r in caplog.records if r.levelno >= logging.WARNING]
+        assert len(warning_records) >= 1
+
+    @_STAGE_PARAMS
+    @pytest.mark.asyncio
+    async def test_count_called_with_exact_triple_filter(self, stage):
+        """The count call must use the exact triple filter — no recon_pool key."""
+        memory_service = AsyncMock()
+        memory_service.count_memories_by_metadata = AsyncMock(return_value=1)
+
+        await verify_cycle_summary_written(
+            memory_service,
+            'my_project',
+            'run-xyz',
+            stage=stage,
+        )
+
+        memory_service.count_memories_by_metadata.assert_awaited_once()
+        call = memory_service.count_memories_by_metadata.call_args
+        kwargs = call.kwargs
+        assert kwargs.get('project_id') == 'my_project'
+        assert kwargs.get('filters') == {
+            'kind': 'cycle_summary',
+            'run_id': 'run-xyz',
+            'stage': stage,
+        }
