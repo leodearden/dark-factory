@@ -90,3 +90,64 @@ async def startup_scan_live_graph():
             await graph.delete()
         with contextlib.suppress(Exception):
             await client.aclose()
+
+
+# ---------------------------------------------------------------------------
+# step-1/step-2: GraphitiBackend._scan_duplicate_entity_names — B5 dup-node alarm
+# ---------------------------------------------------------------------------
+
+class TestScanDuplicateEntityNames:
+    """GraphitiBackend._scan_duplicate_entity_names(group_id) — dup-NODE alarm (B5)."""
+
+    @pytest.mark.asyncio
+    async def test_returns_duplicates_and_emits_warning(
+        self, mock_config, make_backend, make_graph_mock, caplog,
+    ):
+        """A duplicated name returns [(name, count)] and fires a WARN naming
+        both the group_id and the duplicated name."""
+        backend = make_backend(mock_config)
+        graph = make_graph_mock(ro_rows=[['Foo', 2]])
+        backend._driver._get_graph = MagicMock(return_value=graph)
+
+        with caplog.at_level(logging.WARNING, logger='fused_memory.backends.graphiti_client'):
+            result = await backend._scan_duplicate_entity_names(group_id='g1')
+
+        assert result == [('Foo', 2)]
+        warnings = [r for r in caplog.records if r.levelno >= logging.WARNING]
+        assert any('g1' in r.message and 'Foo' in r.message for r in warnings), (
+            f'expected a WARNING naming group_id and name, got: {[r.message for r in warnings]}'
+        )
+
+    @pytest.mark.asyncio
+    async def test_cypher_is_group_id_scoped(
+        self, mock_config, make_backend, make_graph_mock,
+    ):
+        """2115-advisory: the dup-name scan is scoped by an explicit
+        `n.group_id = $group_id` property predicate, not just the graph key
+        selected via _graph_for — a foreign-group_id clone must not alarm
+        here."""
+        backend = make_backend(mock_config)
+        graph = make_graph_mock(ro_rows=[])
+        backend._driver._get_graph = MagicMock(return_value=graph)
+
+        await backend._scan_duplicate_entity_names(group_id='g1')
+
+        graph.ro_query.assert_awaited_once()
+        call = graph.ro_query.call_args
+        assert 'n.group_id = $group_id' in extract_cypher(call)
+        assert extract_params(call).get('group_id') == 'g1'
+
+    @pytest.mark.asyncio
+    async def test_clean_graph_no_duplicates_no_warning(
+        self, mock_config, make_backend, make_graph_mock, caplog,
+    ):
+        """No duplicate names -> empty list and no WARNING emitted."""
+        backend = make_backend(mock_config)
+        graph = make_graph_mock(ro_rows=[])
+        backend._driver._get_graph = MagicMock(return_value=graph)
+
+        with caplog.at_level(logging.WARNING, logger='fused_memory.backends.graphiti_client'):
+            result = await backend._scan_duplicate_entity_names(group_id='g1')
+
+        assert result == []
+        assert not any(r.levelno >= logging.WARNING for r in caplog.records)
