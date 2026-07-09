@@ -25,7 +25,7 @@ from graphiti_core.llm_client import OpenAIClient
 from graphiti_core.llm_client.config import LLMConfig as GraphitiLLMConfig
 from graphiti_core.nodes import EpisodeType, EpisodicNode
 
-from fused_memory.config.schema import FusedMemoryConfig
+from fused_memory.config.schema import FusedMemoryConfig, OpenAIProviderConfig
 from fused_memory.utils.async_utils import gather_or_raise
 
 logger = logging.getLogger(__name__)
@@ -433,17 +433,27 @@ class GraphitiBackend:
         # Shared across the base client and every per-group client (see
         # _client_for). Mirror the llm_client/embedder_client guard so a
         # configured api_key/base_url (e.g. a proxy endpoint) is honored
-        # instead of silently falling back to env-based defaults — the
+        # instead of silently falling back to env-based defaults. The
         # reranker always talks to the OpenAI API regardless of
-        # cfg.llm.provider, so it keys off cfg.llm.providers.openai directly.
+        # cfg.llm.provider, so it sources credentials from whichever
+        # provider block actually configures OpenAI: cfg.llm.providers.openai
+        # is preferred (the common case — cfg.llm.provider defaults to
+        # 'openai'), falling back to cfg.embedder.providers.openai (always
+        # OpenAI — EmbedderConfig.provider has no other option) when the llm
+        # block has no OpenAI api_key, e.g. cfg.llm.provider='anthropic' with
+        # OpenAI only configured for embeddings/reranking.
+        reranker_provider: OpenAIProviderConfig | None = None
+        if cfg.llm.providers.openai and cfg.llm.providers.openai.api_key:
+            reranker_provider = cfg.llm.providers.openai
+        elif cfg.embedder.providers.openai and cfg.embedder.providers.openai.api_key:
+            reranker_provider = cfg.embedder.providers.openai
+
         reranker_config: GraphitiLLMConfig | None = None
-        if cfg.llm.providers.openai:
-            reranker_api_key = cfg.llm.providers.openai.api_key
-            if reranker_api_key:
-                reranker_config = GraphitiLLMConfig(
-                    api_key=reranker_api_key,
-                    base_url=cfg.llm.providers.openai.api_url,
-                )
+        if reranker_provider:
+            reranker_config = GraphitiLLMConfig(
+                api_key=reranker_provider.api_key,
+                base_url=reranker_provider.api_url,
+            )
         self._cross_encoder = OpenAIRerankerClient(config=reranker_config)
 
         self.client = Graphiti(
