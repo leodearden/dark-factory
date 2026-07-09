@@ -3490,6 +3490,324 @@ class TestRunSubprocessWatchdog:
         terminate_pg_mock.assert_called_once()
 
 
+class TestRunSubprocessWorkingRegimeProgressExtension:
+    """Working-regime progress-extension tests for _run_subprocess (task 2360).
+
+    When BOTH ``working_idle_secs`` and ``absolute_cap_secs`` are set, the
+    WORKING regime (post-turn-1) extends past the flat ``timeout_seconds``
+    ceiling: once ``seen_turn`` latches, the watchdog keeps polling
+    ``count_transcript_turns`` at a coarse cadence
+    (``_WATCHDOG_WORKING_POLL_SECS``) and kills only when either:
+
+      - no NEW assistant turn has appeared for
+        ``idle_bound = max(working_idle_secs, timeout_seconds)``  (idle-kill), or
+      - ``elapsed >= absolute_cap_secs``                          (cap-kill)
+
+    whichever comes first.  When the transcript never becomes readable (so
+    ``seen_turn`` never latches), the extension never engages and the old flat
+    ``timeout_seconds`` ceiling applies unchanged (B7 conservative degrade).
+
+    Fails today: the WORKING regime currently runs to a flat ``timeout_seconds``
+    wall regardless of ``working_idle_secs``/``absolute_cap_secs`` (accepted
+    since step-4 but not yet consulted by ``_run_subprocess``), and
+    ``_WATCHDOG_WORKING_POLL_SECS`` does not exist yet.
+    """
+
+    @staticmethod
+    def _make_delayed_success_proc(delay_secs, stdout_bytes):
+        """proc whose communicate() sleeps *delay_secs* then returns *stdout_bytes* once."""
+
+        async def communicate_side_effect(input=None):  # noqa: A002
+            await asyncio.sleep(delay_secs)
+            return (stdout_bytes, b'')
+
+        proc = MagicMock()
+        proc.communicate = communicate_side_effect
+        proc.terminate = MagicMock()
+        proc.kill = MagicMock()
+        proc.wait = AsyncMock()
+        proc.returncode = 0
+        proc.pid = 12345
+        return proc
+
+    @staticmethod
+    def _make_hanging_proc():
+        """proc whose communicate() hangs until cancelled, then raises TimeoutError
+        on the post-SIGTERM retry.  Mirrors TestRunSubprocessWatchdog._make_hanging_proc.
+        """
+        call_count = [0]
+
+        async def communicate_side_effect(input=None):  # noqa: A002
+            call_count[0] += 1
+            if call_count[0] == 1:
+                await asyncio.Event().wait()
+            raise TimeoutError
+
+        proc = MagicMock()
+        proc.communicate = communicate_side_effect
+        proc.terminate = MagicMock()
+        proc.kill = MagicMock()
+        proc.wait = AsyncMock()
+        proc.returncode = None
+        proc.pid = 12345
+        return proc, call_count
+
+    @staticmethod
+    def _always_growing_turns():
+        """count_transcript_turns side_effect: 1, 2, 3, ... on every call (never plateaus)."""
+        counter = [0]
+
+        def _side_effect(config_dir, session_id):
+            counter[0] += 1
+            return counter[0]
+
+        return _side_effect
+
+    @staticmethod
+    def _grow_then_plateau_turns(plateau_at):
+        """count_transcript_turns side_effect: grows 1..plateau_at then holds."""
+        counter = [0]
+
+        def _side_effect(config_dir, session_id):
+            counter[0] += 1
+            return min(counter[0], plateau_at)
+
+        return _side_effect
+
+    @staticmethod
+    def _flat_turns(value):
+        """count_transcript_turns side_effect: always returns *value*."""
+
+        def _side_effect(config_dir, session_id):
+            return value
+
+        return _side_effect
+
+    async def test_productive_run_survives_ceiling_and_completes_normally(self, tmp_path):
+        """(a) PRODUCTIVE-SURVIVES-CEILING: transcript turns keep growing across the
+        old timeout_seconds ceiling; the process eventually completes normally with
+        valid stdout.  Must NOT be killed at the old ceiling — timed_out stays False
+        and duration_ms exceeds the old ceiling.
+        """
+        import time as _time
+
+        sid = str(uuid.uuid4())
+        cfg_dir = tmp_path / 'cfg'
+        cfg_dir.mkdir()
+
+        valid_json = json.dumps({
+            'result': 'ok', 'subtype': 'success', 'cost_usd': 0.02,
+            'duration_ms': 300, 'num_turns': 8, 'session_id': sid,
+        }).encode()
+        proc = self._make_delayed_success_proc(0.3, valid_json)
+
+        async def fake_exec(*args, **kwargs):
+            return proc
+
+        with (
+            patch('shared.cli_invoke.asyncio.create_subprocess_exec', side_effect=fake_exec),
+            patch('shared.cli_invoke.count_transcript_turns', side_effect=self._always_growing_turns()),
+            patch('shared.cli_invoke._WATCHDOG_POLL_SECS', 0.02),
+            patch('shared.cli_invoke._WATCHDOG_WORKING_POLL_SECS', 0.02),
+        ):
+            t0 = _time.monotonic()
+            result = await _run_subprocess(
+                ['fake'], cwd=tmp_path, env={}, model='opus',
+                timeout_seconds=0.1, startup_grace_secs=0.02,
+                session_id=sid, config_dir=cfg_dir,
+                working_idle_secs=1.0, absolute_cap_secs=5.0,
+            )
+            wall = _time.monotonic() - t0
+
+        assert result.timed_out is False, (
+            'Expected the productive run to survive the old 0.1s ceiling and complete '
+            'normally — continuous transcript growth must extend the working regime.'
+        )
+        assert result.duration_ms >= 100, (
+            f'Expected duration_ms >= old ceiling (100ms), got {result.duration_ms}'
+        )
+        assert wall < 2.0, f'Expected normal completion well under the 5s cap, got {wall:.3f}s'
+
+    async def test_idle_kill_fires_after_progress_stops_not_at_old_ceiling(self, tmp_path):
+        """(b) IDLE-KILL: transcript turns grow then go static.  Kill fires after
+        idle_bound = max(working_idle_secs, timeout_seconds) of no NEW turns —
+        not at the old (smaller) timeout_seconds ceiling, and well before the
+        (larger) absolute_cap_secs.
+        """
+        import time as _time
+
+        sid = str(uuid.uuid4())
+        cfg_dir = tmp_path / 'cfg'
+        cfg_dir.mkdir()
+
+        proc, _ = self._make_hanging_proc()
+        terminate_pg_mock = AsyncMock()
+
+        async def fake_exec(*args, **kwargs):
+            return proc
+
+        with (
+            patch('shared.cli_invoke.asyncio.create_subprocess_exec', side_effect=fake_exec),
+            patch('shared.cli_invoke.terminate_process_group', terminate_pg_mock),
+            patch('shared.cli_invoke.count_transcript_turns', side_effect=self._grow_then_plateau_turns(3)),
+            patch('shared.cli_invoke._WATCHDOG_POLL_SECS', 0.02),
+            patch('shared.cli_invoke._WATCHDOG_WORKING_POLL_SECS', 0.02),
+        ):
+            t0 = _time.monotonic()
+            result = await _run_subprocess(
+                ['fake'], cwd=tmp_path, env={}, model='opus',
+                timeout_seconds=0.05, startup_grace_secs=0.02,
+                session_id=sid, config_dir=cfg_dir,
+                working_idle_secs=0.3, absolute_cap_secs=5.0,
+            )
+            wall = _time.monotonic() - t0
+
+        assert result.timed_out is True
+        terminate_pg_mock.assert_called_once()
+        # idle_bound = max(0.3, 0.05) = 0.3s of no-progress, on top of the ~0.06s
+        # growth phase → kill at ~0.36s.  Well past the old 0.05s ceiling (proves
+        # it wasn't killed there) and well under the 5s absolute cap (proves it
+        # wasn't killed there either).
+        assert wall >= 0.2, (
+            f'Expected idle-kill at ~0.36s (after progress stalls), '
+            f'killed too early at {wall:.3f}s — looks like the old ceiling fired'
+        )
+        assert wall < 2.0, (
+            f'Expected idle-kill well under the 5s absolute cap, got {wall:.3f}s'
+        )
+
+    async def test_b6_long_synchronous_tool_call_survives_between_ceiling_and_idle_bound(self, tmp_path):
+        """(c) B6 long-tool-call safety: after turn-1 the transcript stays silent
+        (no new turn) for a span between the old timeout_seconds ceiling and the
+        idle_bound, then the process completes normally.  Must NOT be false-killed
+        at the old ceiling — a single long synchronous tool call must survive up to
+        idle_bound.
+        """
+        import time as _time
+
+        sid = str(uuid.uuid4())
+        cfg_dir = tmp_path / 'cfg'
+        cfg_dir.mkdir()
+
+        valid_json = json.dumps({
+            'result': 'ok', 'subtype': 'success', 'cost_usd': 0.01,
+            'duration_ms': 200, 'num_turns': 1, 'session_id': sid,
+        }).encode()
+        proc = self._make_delayed_success_proc(0.2, valid_json)
+
+        async def fake_exec(*args, **kwargs):
+            return proc
+
+        with (
+            patch('shared.cli_invoke.asyncio.create_subprocess_exec', side_effect=fake_exec),
+            patch('shared.cli_invoke.count_transcript_turns', side_effect=self._flat_turns(1)),
+            patch('shared.cli_invoke._WATCHDOG_POLL_SECS', 0.02),
+            patch('shared.cli_invoke._WATCHDOG_WORKING_POLL_SECS', 0.02),
+        ):
+            t0 = _time.monotonic()
+            result = await _run_subprocess(
+                ['fake'], cwd=tmp_path, env={}, model='opus',
+                timeout_seconds=0.05, startup_grace_secs=0.02,
+                session_id=sid, config_dir=cfg_dir,
+                working_idle_secs=0.5, absolute_cap_secs=5.0,
+            )
+            wall = _time.monotonic() - t0
+
+        assert result.timed_out is False, (
+            'A single long synchronous tool call (flat turn count) between the old '
+            '0.05s ceiling and the 0.5s idle bound must survive, not be false-killed '
+            'at the old ceiling (B6 safety).'
+        )
+        assert result.duration_ms >= 50, (
+            f'Expected duration_ms >= old ceiling (50ms), got {result.duration_ms}'
+        )
+        assert wall < 2.0
+
+    async def test_absolute_cap_kills_continuously_productive_run(self, tmp_path):
+        """(d) ABSOLUTE-CAP: transcript turns always grow (never idle) but the run
+        never completes.  The absolute_cap_secs backstop fires even though the
+        idle-kill never would (progress never stalls).  absolute_cap_secs is set
+        below the idle_bound so the cap — not idle — is what fires.
+        """
+        import time as _time
+
+        sid = str(uuid.uuid4())
+        cfg_dir = tmp_path / 'cfg'
+        cfg_dir.mkdir()
+
+        proc, _ = self._make_hanging_proc()
+        terminate_pg_mock = AsyncMock()
+
+        async def fake_exec(*args, **kwargs):
+            return proc
+
+        with (
+            patch('shared.cli_invoke.asyncio.create_subprocess_exec', side_effect=fake_exec),
+            patch('shared.cli_invoke.terminate_process_group', terminate_pg_mock),
+            patch('shared.cli_invoke.count_transcript_turns', side_effect=self._always_growing_turns()),
+            patch('shared.cli_invoke._WATCHDOG_POLL_SECS', 0.02),
+            patch('shared.cli_invoke._WATCHDOG_WORKING_POLL_SECS', 0.02),
+        ):
+            t0 = _time.monotonic()
+            result = await _run_subprocess(
+                ['fake'], cwd=tmp_path, env={}, model='opus',
+                timeout_seconds=0.05, startup_grace_secs=0.02,
+                session_id=sid, config_dir=cfg_dir,
+                working_idle_secs=2.0, absolute_cap_secs=0.3,
+            )
+            wall = _time.monotonic() - t0
+
+        assert result.timed_out is True
+        terminate_pg_mock.assert_called_once()
+        # absolute_cap_secs=0.3 « idle_bound=max(2.0, 0.05)=2.0 — only the cap can fire.
+        assert wall >= 0.2, f'Expected cap-kill at ~0.3s, killed too early at {wall:.3f}s'
+        assert wall < 1.5, f'Expected cap-kill at ~0.3s, not at the 2.0s idle bound ({wall:.3f}s)'
+
+    async def test_unreadable_transcript_degrades_to_old_ceiling_even_with_extension_params_set(self, tmp_path):
+        """(e) UNREADABLE-DEGRADE: count_transcript_turns always returns None (B7
+        conservative degrade), so seen_turn never latches and the extension never
+        engages — even though working_idle_secs/absolute_cap_secs are both set (and
+        far larger than timeout_seconds).  The old flat timeout_seconds ceiling must
+        still fire.  Does not depend on _WATCHDOG_WORKING_POLL_SECS — the extension
+        never reaches the post-latch branch that would consult it.
+        """
+        import time as _time
+
+        sid = str(uuid.uuid4())
+        cfg_dir = tmp_path / 'cfg'
+        cfg_dir.mkdir()
+
+        proc, _ = self._make_hanging_proc()
+        terminate_pg_mock = AsyncMock()
+
+        async def fake_exec(*args, **kwargs):
+            return proc
+
+        with (
+            patch('shared.cli_invoke.asyncio.create_subprocess_exec', side_effect=fake_exec),
+            patch('shared.cli_invoke.terminate_process_group', terminate_pg_mock),
+            patch('shared.cli_invoke.count_transcript_turns', return_value=None),
+            patch('shared.cli_invoke._WATCHDOG_POLL_SECS', 0.02),
+        ):
+            t0 = _time.monotonic()
+            result = await _run_subprocess(
+                ['fake'], cwd=tmp_path, env={}, model='opus',
+                timeout_seconds=0.2, startup_grace_secs=0.02,
+                session_id=sid, config_dir=cfg_dir,
+                working_idle_secs=5.0, absolute_cap_secs=10.0,
+            )
+            wall = _time.monotonic() - t0
+
+        assert result.timed_out is True
+        assert result.transcript_turns is None
+        terminate_pg_mock.assert_called_once()
+        assert wall < 1.0, (
+            f'Expected kill at the old ~0.2s ceiling (extension never engages on an '
+            f'unreadable transcript), got {wall:.3f}s — looks like the huge idle/cap '
+            f'params leaked into the degrade path'
+        )
+
+
 # ── invoke_with_cap_retry kwarg-forwarding tests ─────────────────────────────
 
 @pytest.mark.asyncio
