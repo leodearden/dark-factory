@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import asyncio
 import dataclasses
+import time
 from unittest.mock import AsyncMock, Mock
 
 import pytest
@@ -244,3 +245,71 @@ class TestLivenessAccessors:
         history.clear()
 
         assert len(scheduler.requeue_history('T1')) == 1
+
+
+class TestWorkflowCancelGraceAndActivelyHeld:
+    """(step-5) Cancel-grace stamp + ``is_actively_held`` liveness accessor.
+
+    The cancel-grace stamp (``_workflow_cancel_at``), grace constant
+    (``_RECONCILE_CANCEL_GRACE_S``) and predicate move from the Harness to
+    the Scheduler (task 2235) — they sit beside ``_dispatched`` /
+    ``lock_table._held``, whose single writer is the Scheduler.  Semantics
+    mirror the harness's current ``_workflow_cancel_recent`` exactly.
+    """
+
+    def test_grace_constant_defaults_to_30(self):
+        scheduler = Scheduler(OrchestratorConfig())
+        assert scheduler._RECONCILE_CANCEL_GRACE_S == 30.0
+
+    def test_workflow_cancel_recent_false_when_never_cancelled(self):
+        scheduler = Scheduler(OrchestratorConfig())
+        assert scheduler.workflow_cancel_recent('T1') is False
+
+    def test_workflow_cancel_recent_true_within_grace_window(self):
+        scheduler = Scheduler(OrchestratorConfig())
+        scheduler.note_workflow_cancelled('T1')
+        assert scheduler.workflow_cancel_recent('T1') is True
+
+    def test_workflow_cancel_recent_false_after_grace_elapses(self):
+        scheduler = Scheduler(OrchestratorConfig())
+        # Tiny grace window so the test doesn't need to sleep 30s.
+        scheduler._RECONCILE_CANCEL_GRACE_S = 0.01
+        scheduler.note_workflow_cancelled('T1')
+        time.sleep(0.05)
+        assert scheduler.workflow_cancel_recent('T1') is False
+
+    def test_clear_workflow_cancel_makes_it_false_immediately(self):
+        scheduler = Scheduler(OrchestratorConfig())
+        scheduler.note_workflow_cancelled('T1')
+        assert scheduler.workflow_cancel_recent('T1') is True
+
+        scheduler.clear_workflow_cancel('T1')
+
+        assert scheduler.workflow_cancel_recent('T1') is False
+
+    def test_is_actively_held_false_by_default(self):
+        scheduler = Scheduler(OrchestratorConfig())
+        assert scheduler.is_actively_held('T1') is False
+
+    def test_is_actively_held_true_when_dispatched(self):
+        scheduler = Scheduler(OrchestratorConfig())
+        scheduler._dispatched.add('T1')
+        assert scheduler.is_actively_held('T1') is True
+
+    def test_is_actively_held_true_when_lock_held(self):
+        scheduler = Scheduler(OrchestratorConfig())
+        scheduler.lock_table.try_acquire('T1', ['backend'])
+        assert scheduler.is_actively_held('T1') is True
+
+    def test_is_actively_held_true_when_only_recent_cancel_stamp(self):
+        scheduler = Scheduler(OrchestratorConfig())
+        scheduler.note_workflow_cancelled('T1')
+        assert scheduler.is_actively_held('T1') is True
+
+    def test_is_actively_held_false_when_none_apply(self):
+        scheduler = Scheduler(OrchestratorConfig())
+        scheduler._dispatched.add('other-dispatched-task')
+        scheduler.lock_table.try_acquire('other-held-task', ['backend'])
+        scheduler.note_workflow_cancelled('other-cancelled-task')
+
+        assert scheduler.is_actively_held('T1') is False
