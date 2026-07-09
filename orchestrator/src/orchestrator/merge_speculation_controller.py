@@ -237,6 +237,25 @@ class PermitLedger(Generic[_PermitT]):
         self._live.discard(permit)
         self._slot.release()
 
+    def release_for_shutdown(self, count: int) -> None:
+        """Shutdown-only valve: release *count* slots on the wrapped
+        semaphore directly, WITHOUT touching ``live`` (task 2161 step-4).
+
+        Deliberately over-releases the plain (never Bounded) ``asyncio.
+        Semaphore`` to unblock any coroutine still parked at ``acquire()``
+        during shutdown -- mirrors the pre-ledger ``stop()`` over-release
+        loops this method replaces. This intentionally BREAKS the
+        ``slot_available + len(live) == depth`` conservation identity (the
+        semaphore's counter rises while ``live`` is untouched), which is
+        safe only because every caller gates this behind ``not
+        self._running``, under which ``speculation_accounting_violations``
+        already short-circuits to ``[]`` before it would ever read the now-
+        violated identity. Never raises -- a plain ``Semaphore.release()``
+        simply increments its internal counter past ``depth``.
+        """
+        for _ in range(count):
+            self._slot.release()
+
 
 class SpeculationController:
     """Owns the merger loop's speculation state + merger-side permit lifecycle.
