@@ -742,6 +742,7 @@ def create_mcp_server(
     )
 
     @mcp.tool()
+    @mcp_tool_errors()
     async def add_episode(
         content: str,
         project_id: str,
@@ -838,28 +839,23 @@ def create_mcp_server(
                     'conflicting_task_ids': sorted(conflicting_task_ids),
                     'hint': _CONFLICTING_TASK_STATUS_HINT,
                 }
-        try:
-            causation_id, op_source, _ = _extract_causation(metadata, agent_id)
-            result = await memory_service.add_episode(
-                content=content,
-                source=source,
-                project_id=project_id,
-                agent_id=agent_id,
-                session_id=session_id,
-                source_description=source_description,
-                causation_id=causation_id,
-                temporal_context=temporal_context,
-                reference_time=parsed_reference_time,
-                _source=op_source,
-            )
-            return result.model_dump()
-        except (asyncio.CancelledError, KeyboardInterrupt, SystemExit):
-            raise
-        except Exception as e:
-            logger.exception(f'add_episode error: {e}')
-            return {'error': str(e), 'error_type': type(e).__name__}
+        causation_id, op_source, _ = _extract_causation(metadata, agent_id)
+        result = await memory_service.add_episode(
+            content=content,
+            source=source,
+            project_id=project_id,
+            agent_id=agent_id,
+            session_id=session_id,
+            source_description=source_description,
+            causation_id=causation_id,
+            temporal_context=temporal_context,
+            reference_time=parsed_reference_time,
+            _source=op_source,
+        )
+        return result.model_dump()
 
     @mcp.tool()
+    @mcp_tool_errors()
     async def add_memory(
         content: str,
         project_id: str,
@@ -941,27 +937,22 @@ def create_mcp_server(
                     'conflicting_task_ids': sorted(conflicting_task_ids),
                     'hint': _CONFLICTING_TASK_STATUS_HINT,
                 }
-        try:
-            causation_id, source, cleaned_meta = _extract_causation(metadata, agent_id)
-            result = await memory_service.add_memory(
-                content=content,
-                category=category,
-                project_id=project_id,
-                agent_id=agent_id,
-                session_id=session_id,
-                metadata=cleaned_meta,
-                dual_write=dual_write,
-                causation_id=causation_id,
-                _source=source,
-            )
-            return result.model_dump()
-        except (asyncio.CancelledError, KeyboardInterrupt, SystemExit):
-            raise
-        except Exception as e:
-            logger.exception(f'add_memory error: {e}')
-            return {'error': str(e), 'error_type': type(e).__name__}
+        causation_id, source, cleaned_meta = _extract_causation(metadata, agent_id)
+        result = await memory_service.add_memory(
+            content=content,
+            category=category,
+            project_id=project_id,
+            agent_id=agent_id,
+            session_id=session_id,
+            metadata=cleaned_meta,
+            dual_write=dual_write,
+            causation_id=causation_id,
+            _source=source,
+        )
+        return result.model_dump()
 
     @mcp.tool()
+    @mcp_tool_errors()
     async def add_system_record(
         content: str,
         project_id: str,
@@ -1030,30 +1021,25 @@ def create_mcp_server(
                 ),
                 'error_type': 'ValidationError',
             }
-        try:
-            causation_id, source, cleaned_meta = _extract_causation(metadata, agent_id)
-            result = await memory_service.add_system_record(
-                content=content,
-                project_id=project_id,
-                agent_id=agent_id,
-                category=category,
-                session_id=session_id,
-                metadata=cleaned_meta,
-                causation_id=causation_id,
-                _source=source,
-            )
-            return result.model_dump()
-        except (asyncio.CancelledError, KeyboardInterrupt, SystemExit):
-            raise
-        except Exception as e:
-            logger.exception(f'add_system_record error: {e}')
-            return {'error': str(e), 'error_type': type(e).__name__}
+        causation_id, source, cleaned_meta = _extract_causation(metadata, agent_id)
+        result = await memory_service.add_system_record(
+            content=content,
+            project_id=project_id,
+            agent_id=agent_id,
+            category=category,
+            session_id=session_id,
+            metadata=cleaned_meta,
+            causation_id=causation_id,
+            _source=source,
+        )
+        return result.model_dump()
 
     # ------------------------------------------------------------------
     # Read tools
     # ------------------------------------------------------------------
 
     @mcp.tool()
+    @mcp_tool_errors()
     async def search(
         query: str,
         project_id: str,
@@ -1132,10 +1118,7 @@ def create_mcp_server(
                 result_summary={'count': len(results)},
             )
             return response
-        except (asyncio.CancelledError, KeyboardInterrupt, SystemExit):
-            raise
         except Exception as e:
-            logger.exception(f'search error: {e}')
             await _log_read(
                 operation='search',
                 project_id=project_id,
@@ -1145,9 +1128,12 @@ def create_mcp_server(
                 success=False,
                 error=str(e),
             )
-            return {'error': str(e), 'error_type': type(e).__name__}
+            # _log_read records the audit failure; @mcp_tool_errors converts
+            # this exception to the error dict.
+            raise
 
     @mcp.tool()
+    @mcp_tool_errors()
     async def count_memories_by_metadata(
         project_id: str,
         filters: dict,
@@ -1190,23 +1176,18 @@ def create_mcp_server(
             return err
         if err := validate_project_id(project_id):
             return err
-        try:
-            count = await memory_service.count_memories_by_metadata(
-                project_id=project_id,
-                filters=filters,
-            )
-            return {
-                'count': count,
-                'project_id': project_id,
-                'filters': filters,
-            }
-        except (asyncio.CancelledError, KeyboardInterrupt, SystemExit):
-            raise
-        except Exception as e:
-            logger.exception(f'count_memories_by_metadata error: {e}')
-            return {'error': str(e), 'error_type': type(e).__name__}
+        count = await memory_service.count_memories_by_metadata(
+            project_id=project_id,
+            filters=filters,
+        )
+        return {
+            'count': count,
+            'project_id': project_id,
+            'filters': filters,
+        }
 
     @mcp.tool()
+    @mcp_tool_errors()
     async def get_memories_by_metadata(
         project_id: str,
         filters: dict,
@@ -1259,25 +1240,20 @@ def create_mcp_server(
             return err
         if err := validate_project_id(project_id):
             return err
-        try:
-            memories = await memory_service.get_memories_by_metadata(
-                project_id=project_id,
-                filters=filters,
-                limit=limit,
-            )
-            return {
-                'memories': memories,
-                'project_id': project_id,
-                'filters': filters,
-                'limit': limit,
-            }
-        except (asyncio.CancelledError, KeyboardInterrupt, SystemExit):
-            raise
-        except Exception as e:
-            logger.exception(f'get_memories_by_metadata error: {e}')
-            return {'error': str(e), 'error_type': type(e).__name__}
+        memories = await memory_service.get_memories_by_metadata(
+            project_id=project_id,
+            filters=filters,
+            limit=limit,
+        )
+        return {
+            'memories': memories,
+            'project_id': project_id,
+            'filters': filters,
+            'limit': limit,
+        }
 
     @mcp.tool()
+    @mcp_tool_errors()
     async def get_entity(
         name: str,
         project_id: str,
@@ -1338,10 +1314,7 @@ def create_mcp_server(
                 },
             )
             return result
-        except (asyncio.CancelledError, KeyboardInterrupt, SystemExit):
-            raise
         except Exception as e:
-            logger.exception(f'get_entity error: {e}')
             await _log_read(
                 operation='get_entity',
                 project_id=project_id,
@@ -1351,9 +1324,12 @@ def create_mcp_server(
                 success=False,
                 error=str(e),
             )
-            return {'error': str(e), 'error_type': type(e).__name__}
+            # _log_read records the audit failure; @mcp_tool_errors converts
+            # this exception to the error dict.
+            raise
 
     @mcp.tool()
+    @mcp_tool_errors()
     async def get_entity_by_uuid(
         entity_uuid: str,
         project_id: str,
@@ -1399,8 +1375,6 @@ def create_mcp_server(
                 },
             )
             return result
-        except (asyncio.CancelledError, KeyboardInterrupt, SystemExit):
-            raise
         except NodeNotFoundError as e:
             # Expected diagnostic outcome, not a backend failure — this tool
             # exists specifically to confirm whether a node exists. Log it
@@ -1416,7 +1390,6 @@ def create_mcp_server(
             )
             return {'error': str(e), 'error_type': type(e).__name__}
         except Exception as e:
-            logger.exception(f'get_entity_by_uuid error: {e}')
             await _log_read(
                 operation='get_entity_by_uuid',
                 project_id=project_id,
@@ -1426,9 +1399,12 @@ def create_mcp_server(
                 success=False,
                 error=str(e),
             )
-            return {'error': str(e), 'error_type': type(e).__name__}
+            # _log_read records the audit failure; @mcp_tool_errors converts
+            # this exception to the error dict.
+            raise
 
     @mcp.tool()
+    @mcp_tool_errors()
     async def get_episodes(
         project_id: str,
         last_n: int = 10,
@@ -1471,10 +1447,7 @@ def create_mcp_server(
                 result_summary={'count': len(episodes)},
             )
             return {'episodes': episodes}
-        except (asyncio.CancelledError, KeyboardInterrupt, SystemExit):
-            raise
         except Exception as e:
-            logger.exception(f'get_episodes error: {e}')
             await _log_read(
                 operation='get_episodes',
                 project_id=project_id,
@@ -1484,13 +1457,16 @@ def create_mcp_server(
                 success=False,
                 error=str(e),
             )
-            return {'error': str(e), 'error_type': type(e).__name__}
+            # _log_read records the audit failure; @mcp_tool_errors converts
+            # this exception to the error dict.
+            raise
 
     # ------------------------------------------------------------------
     # Delete tools
     # ------------------------------------------------------------------
 
     @mcp.tool()
+    @mcp_tool_errors()
     async def delete_memory(
         memory_id: str,
         store: str,
@@ -1531,24 +1507,19 @@ def create_mcp_server(
                 'error': (f'Invalid store {store!r}. Must be one of {sorted(_VALID_STORES)}.'),
                 'error_type': 'ValidationError',
             }
-        try:
-            causation_id, source, _ = _extract_causation(metadata, agent_id)
-            return await memory_service.delete_memory(
-                memory_id=memory_id,
-                store=store,
-                project_id=project_id,
-                agent_id=agent_id,
-                session_id=session_id,
-                causation_id=causation_id,
-                _source=source,
-            )
-        except (asyncio.CancelledError, KeyboardInterrupt, SystemExit):
-            raise
-        except Exception as e:
-            logger.exception(f'delete_memory error: {e}')
-            return {'error': str(e), 'error_type': type(e).__name__}
+        causation_id, source, _ = _extract_causation(metadata, agent_id)
+        return await memory_service.delete_memory(
+            memory_id=memory_id,
+            store=store,
+            project_id=project_id,
+            agent_id=agent_id,
+            session_id=session_id,
+            causation_id=causation_id,
+            _source=source,
+        )
 
     @mcp.tool()
+    @mcp_tool_errors()
     async def delete_episode(
         episode_id: str,
         project_id: str,
@@ -1580,24 +1551,19 @@ def create_mcp_server(
             return err
         if err := _known_project_gate(project_id):
             return err
-        try:
-            causation_id, source, _ = _extract_causation(metadata, agent_id)
-            return await memory_service.delete_episode(
-                episode_id=episode_id,
-                project_id=project_id,
-                cascade=cascade,
-                agent_id=agent_id,
-                session_id=session_id,
-                causation_id=causation_id,
-                _source=source,
-            )
-        except (asyncio.CancelledError, KeyboardInterrupt, SystemExit):
-            raise
-        except Exception as e:
-            logger.exception(f'delete_episode error: {e}')
-            return {'error': str(e), 'error_type': type(e).__name__}
+        causation_id, source, _ = _extract_causation(metadata, agent_id)
+        return await memory_service.delete_episode(
+            episode_id=episode_id,
+            project_id=project_id,
+            cascade=cascade,
+            agent_id=agent_id,
+            session_id=session_id,
+            causation_id=causation_id,
+            _source=source,
+        )
 
     @mcp.tool()
+    @mcp_tool_errors()
     async def update_edge(
         edge_uuid: str,
         project_id: str,
@@ -1683,26 +1649,21 @@ def create_mcp_server(
                 'error': 'update_edge requires fact, invalid_at, or clear_invalid_at',
                 'error_type': 'ValidationError',
             }
-        try:
-            causation_id, source, _ = _extract_causation(metadata, agent_id)
-            return await memory_service.update_edge(
-                edge_uuid=edge_uuid,
-                fact=normalised_fact,
-                project_id=project_id,
-                agent_id=agent_id,
-                session_id=session_id,
-                causation_id=causation_id,
-                _source=source,
-                invalid_at=parsed_invalid_at,
-                clear_invalid_at=clear_invalid_at,
-            )
-        except (asyncio.CancelledError, KeyboardInterrupt, SystemExit):
-            raise
-        except Exception as e:
-            logger.exception(f'update_edge error: {e}')
-            return {'error': str(e), 'error_type': type(e).__name__}
+        causation_id, source, _ = _extract_causation(metadata, agent_id)
+        return await memory_service.update_edge(
+            edge_uuid=edge_uuid,
+            fact=normalised_fact,
+            project_id=project_id,
+            agent_id=agent_id,
+            session_id=session_id,
+            causation_id=causation_id,
+            _source=source,
+            invalid_at=parsed_invalid_at,
+            clear_invalid_at=clear_invalid_at,
+        )
 
     @mcp.tool()
+    @mcp_tool_errors()
     async def refresh_entity_summary(
         project_id: str,
         entity_uuid: str | None = None,
@@ -1747,24 +1708,19 @@ def create_mcp_server(
                 'error': 'Either entity_uuid or entity_name must be provided',
                 'error_type': 'ValidationError',
             }
-        try:
-            causation_id, source, _ = _extract_causation(metadata, agent_id)
-            return await memory_service.refresh_entity_summary(
-                entity_uuid=entity_uuid or None,
-                entity_name=entity_name or None,
-                project_id=project_id,
-                agent_id=agent_id,
-                session_id=session_id,
-                causation_id=causation_id,
-                _source=source,
-            )
-        except (asyncio.CancelledError, KeyboardInterrupt, SystemExit):
-            raise
-        except Exception as e:
-            logger.exception(f'refresh_entity_summary error: {e}')
-            return {'error': str(e), 'error_type': type(e).__name__}
+        causation_id, source, _ = _extract_causation(metadata, agent_id)
+        return await memory_service.refresh_entity_summary(
+            entity_uuid=entity_uuid or None,
+            entity_name=entity_name or None,
+            project_id=project_id,
+            agent_id=agent_id,
+            session_id=session_id,
+            causation_id=causation_id,
+            _source=source,
+        )
 
     @mcp.tool()
+    @mcp_tool_errors()
     async def set_entity_summary(
         project_id: str,
         summary: str | None = None,
@@ -1816,25 +1772,20 @@ def create_mcp_server(
                 'error': 'Either entity_uuid or entity_name must be provided',
                 'error_type': 'ValidationError',
             }
-        try:
-            causation_id, source, _ = _extract_causation(metadata, agent_id)
-            return await memory_service.set_entity_summary(
-                entity_uuid=entity_uuid or None,
-                entity_name=entity_name or None,
-                summary=summary,
-                project_id=project_id,
-                agent_id=agent_id,
-                session_id=session_id,
-                causation_id=causation_id,
-                _source=source,
-            )
-        except (asyncio.CancelledError, KeyboardInterrupt, SystemExit):
-            raise
-        except Exception as e:
-            logger.exception(f'set_entity_summary error: {e}')
-            return {'error': str(e), 'error_type': type(e).__name__}
+        causation_id, source, _ = _extract_causation(metadata, agent_id)
+        return await memory_service.set_entity_summary(
+            entity_uuid=entity_uuid or None,
+            entity_name=entity_name or None,
+            summary=summary,
+            project_id=project_id,
+            agent_id=agent_id,
+            session_id=session_id,
+            causation_id=causation_id,
+            _source=source,
+        )
 
     @mcp.tool()
+    @mcp_tool_errors()
     async def rename_entity(
         project_id: str,
         new_name: str | None = None,
@@ -1884,25 +1835,20 @@ def create_mcp_server(
                 'error': 'Either entity_uuid or entity_name must be provided',
                 'error_type': 'ValidationError',
             }
-        try:
-            causation_id, source, _ = _extract_causation(metadata, agent_id)
-            return await memory_service.rename_entity(
-                entity_uuid=entity_uuid or None,
-                entity_name=entity_name or None,
-                new_name=new_name,
-                project_id=project_id,
-                agent_id=agent_id,
-                session_id=session_id,
-                causation_id=causation_id,
-                _source=source,
-            )
-        except (asyncio.CancelledError, KeyboardInterrupt, SystemExit):
-            raise
-        except Exception as e:
-            logger.exception(f'rename_entity error: {e}')
-            return {'error': str(e), 'error_type': type(e).__name__}
+        causation_id, source, _ = _extract_causation(metadata, agent_id)
+        return await memory_service.rename_entity(
+            entity_uuid=entity_uuid or None,
+            entity_name=entity_name or None,
+            new_name=new_name,
+            project_id=project_id,
+            agent_id=agent_id,
+            session_id=session_id,
+            causation_id=causation_id,
+            _source=source,
+        )
 
     @mcp.tool()
+    @mcp_tool_errors()
     async def merge_entities(
         deprecated_uuid: str,
         surviving_uuid: str,
@@ -1951,24 +1897,19 @@ def create_mcp_server(
                 'error': 'deprecated_uuid and surviving_uuid must be different',
                 'error_type': 'ValidationError',
             }
-        try:
-            causation_id, source, _ = _extract_causation(metadata, agent_id)
-            return await memory_service.merge_entities(
-                deprecated_uuid=deprecated_uuid,
-                surviving_uuid=surviving_uuid,
-                project_id=project_id,
-                agent_id=agent_id,
-                session_id=session_id,
-                causation_id=causation_id,
-                _source=source,
-            )
-        except (asyncio.CancelledError, KeyboardInterrupt, SystemExit):
-            raise
-        except Exception as e:
-            logger.exception(f'merge_entities error: {e}')
-            return {'error': str(e), 'error_type': type(e).__name__}
+        causation_id, source, _ = _extract_causation(metadata, agent_id)
+        return await memory_service.merge_entities(
+            deprecated_uuid=deprecated_uuid,
+            surviving_uuid=surviving_uuid,
+            project_id=project_id,
+            agent_id=agent_id,
+            session_id=session_id,
+            causation_id=causation_id,
+            _source=source,
+        )
 
     @mcp.tool()
+    @mcp_tool_errors()
     async def delete_entity(
         entity_uuid: str,
         project_id: str,
@@ -2010,24 +1951,19 @@ def create_mcp_server(
                 'error': 'entity_uuid must be a non-empty string',
                 'error_type': 'ValidationError',
             }
-        try:
-            causation_id, source, _ = _extract_causation(metadata, agent_id)
-            return await memory_service.delete_entity(
-                entity_uuid=entity_uuid,
-                project_id=project_id,
-                force=force,
-                agent_id=agent_id,
-                session_id=session_id,
-                causation_id=causation_id,
-                _source=source,
-            )
-        except (asyncio.CancelledError, KeyboardInterrupt, SystemExit):
-            raise
-        except Exception as e:
-            logger.exception(f'delete_entity error: {e}')
-            return {'error': str(e), 'error_type': type(e).__name__}
+        causation_id, source, _ = _extract_causation(metadata, agent_id)
+        return await memory_service.delete_entity(
+            entity_uuid=entity_uuid,
+            project_id=project_id,
+            force=force,
+            agent_id=agent_id,
+            session_id=session_id,
+            causation_id=causation_id,
+            _source=source,
+        )
 
     @mcp.tool()
+    @mcp_tool_errors()
     async def rebuild_entity_summaries(
         project_id: str,
         force: bool = False,
@@ -2074,29 +2010,24 @@ def create_mcp_server(
             return err
         if err := validate_project_id(project_id):
             return err
-        try:
-            causation_id, source, _ = _extract_causation(metadata, agent_id)
-            return await memory_service.rebuild_entity_summaries(
-                project_id=project_id,
-                force=force,
-                dry_run=dry_run,
-                agent_id=agent_id,
-                session_id=session_id,
-                causation_id=causation_id,
-                _source=source,
-                entity_uuids=entity_uuids,
-            )
-        except (asyncio.CancelledError, KeyboardInterrupt, SystemExit):
-            raise
-        except Exception as e:
-            logger.exception(f'rebuild_entity_summaries error: {e}')
-            return {'error': str(e), 'error_type': type(e).__name__}
+        causation_id, source, _ = _extract_causation(metadata, agent_id)
+        return await memory_service.rebuild_entity_summaries(
+            project_id=project_id,
+            force=force,
+            dry_run=dry_run,
+            agent_id=agent_id,
+            session_id=session_id,
+            causation_id=causation_id,
+            _source=source,
+            entity_uuids=entity_uuids,
+        )
 
     # ------------------------------------------------------------------
     # Management tools
     # ------------------------------------------------------------------
 
     @mcp.tool()
+    @mcp_tool_errors()
     async def get_status(
         project_id: str | None = None,
     ) -> dict[str, Any]:
@@ -2105,61 +2036,56 @@ def create_mcp_server(
         Args:
             project_id: Get stats for a specific project (optional)
         """
-        try:
-            result = await memory_service.get_status(project_id=project_id)
+        result = await memory_service.get_status(project_id=project_id)
 
-            # Enrich the queue section with a dead_letters sub-dict that
-            # mirrors the shape returned by get_dead_letters, so Stage 1
-            # reconciliation can compare both values without false positives.
-            #
-            # durable_dead: already project-scoped by MemoryService (step-4).
-            # event_dead: read from the JSONL dead-letter file via to_thread
-            #   (same offload pattern as get_dead_letters) to avoid blocking
-            #   the event loop on large files.
-            queue_section = result.get('queue') if isinstance(result, dict) else None
-            if queue_section is None:
-                # No durable_queue configured — attach a zero dead_letters anyway
-                if isinstance(result, dict):
-                    result.setdefault('queue', {})
-                    result['queue']['dead_letters'] = {
-                        'durable_queue': 0,
-                        'event_queue': 0,
-                        'total': 0,
-                    }
-            elif 'error' not in queue_section:
-                # Skip enrichment for error queue sections (e.g. {'error': '...'}).
-                # Mutating an error dict with dead_letters stats would create a
-                # confusing mixed error/stats shape for consumers.
-                durable_dead: int = queue_section.get('counts', {}).get('dead', 0)
-
-                event_dead: int = 0
-                if event_queue is not None:
-                    # Use count_dead_letters (streaming line count) instead of
-                    # len(read_dead_letters(...)) — get_status is polled frequently by
-                    # Stage 1 reconciliation and we do not need to materialise records.
-                    event_dead = await asyncio.to_thread(
-                        event_queue.count_dead_letters,
-                        project_id=project_id,
-                    )
-
-                queue_section['dead_letters'] = {
-                    'durable_queue': durable_dead,
-                    'event_queue': event_dead,
-                    'total': durable_dead + event_dead,
+        # Enrich the queue section with a dead_letters sub-dict that
+        # mirrors the shape returned by get_dead_letters, so Stage 1
+        # reconciliation can compare both values without false positives.
+        #
+        # durable_dead: already project-scoped by MemoryService (step-4).
+        # event_dead: read from the JSONL dead-letter file via to_thread
+        #   (same offload pattern as get_dead_letters) to avoid blocking
+        #   the event loop on large files.
+        queue_section = result.get('queue') if isinstance(result, dict) else None
+        if queue_section is None:
+            # No durable_queue configured — attach a zero dead_letters anyway
+            if isinstance(result, dict):
+                result.setdefault('queue', {})
+                result['queue']['dead_letters'] = {
+                    'durable_queue': 0,
+                    'event_queue': 0,
+                    'total': 0,
                 }
+        elif 'error' not in queue_section:
+            # Skip enrichment for error queue sections (e.g. {'error': '...'}).
+            # Mutating an error dict with dead_letters stats would create a
+            # confusing mixed error/stats shape for consumers.
+            durable_dead: int = queue_section.get('counts', {}).get('dead', 0)
 
-            return result
-        except (asyncio.CancelledError, KeyboardInterrupt, SystemExit):
-            raise
-        except Exception as e:
-            logger.exception(f'get_status error: {e}')
-            return {'error': str(e), 'error_type': type(e).__name__}
+            event_dead: int = 0
+            if event_queue is not None:
+                # Use count_dead_letters (streaming line count) instead of
+                # len(read_dead_letters(...)) — get_status is polled frequently by
+                # Stage 1 reconciliation and we do not need to materialise records.
+                event_dead = await asyncio.to_thread(
+                    event_queue.count_dead_letters,
+                    project_id=project_id,
+                )
+
+            queue_section['dead_letters'] = {
+                'durable_queue': durable_dead,
+                'event_queue': event_dead,
+                'total': durable_dead + event_dead,
+            }
+
+        return result
 
     # ------------------------------------------------------------------
     # Queue management tools
     # ------------------------------------------------------------------
 
     @mcp.tool()
+    @mcp_tool_errors()
     async def replay_to_graphiti(
         project_id: str,
         source_store: str = 'mem0',
@@ -2181,19 +2107,14 @@ def create_mcp_server(
             return err
         if err := validate_project_id(project_id):
             return err
-        try:
-            count = await memory_service.replay_from_store(
-                source_project_id=project_id,
-                limit=limit,
-            )
-            return {'status': 'queued', 'items_queued': count, 'project_id': project_id}
-        except (asyncio.CancelledError, KeyboardInterrupt, SystemExit):
-            raise
-        except Exception as e:
-            logger.exception(f'replay_to_graphiti error: {e}')
-            return {'error': str(e), 'error_type': type(e).__name__}
+        count = await memory_service.replay_from_store(
+            source_project_id=project_id,
+            limit=limit,
+        )
+        return {'status': 'queued', 'items_queued': count, 'project_id': project_id}
 
     @mcp.tool()
+    @mcp_tool_errors()
     async def get_queue_stats(project_id: str | None = None) -> dict[str, Any]:
         """Get durable write queue statistics — pending, retry, dead, completed
         counts and oldest pending item age. Use to monitor queue health.
@@ -2220,17 +2141,12 @@ def create_mcp_server(
             project_id, err = _canonicalize_project_id_arg(project_id)
             if err:
                 return err
-        try:
-            if memory_service.durable_queue is None:
-                return {'error': 'Queue not initialized', 'error_type': 'ConfigurationError'}
-            return await memory_service.durable_queue.get_stats(group_id=project_id)
-        except (asyncio.CancelledError, KeyboardInterrupt, SystemExit):
-            raise
-        except Exception as e:
-            logger.exception(f'get_queue_stats error: {e}')
-            return {'error': str(e), 'error_type': type(e).__name__}
+        if memory_service.durable_queue is None:
+            return {'error': 'Queue not initialized', 'error_type': 'ConfigurationError'}
+        return await memory_service.durable_queue.get_stats(group_id=project_id)
 
     @mcp.tool()
+    @mcp_tool_errors()
     async def get_curator_state() -> dict[str, Any]:
         """Read-only snapshot of the curator UsageGate's current state.
 
@@ -2246,32 +2162,27 @@ def create_mcp_server(
         a state transition (e.g. ``_on_resume()`` flipping paused → unpaused) the
         snapshot may be momentarily inconsistent; refresh on the next poll.
         """
-        try:
-            if curator_usage_gate is None:
-                return {
-                    'paused': False,
-                    'paused_reason': None,
-                    'soonest_open_at': None,
-                    'account_count': 0,
-                }
-            gate = curator_usage_gate
-            paused = gate.is_paused
-            paused_reason = gate.paused_reason or None
-            resets_at = gate.soonest_resets_at
-            soonest_open_at = resets_at.isoformat() if resets_at is not None else None
+        if curator_usage_gate is None:
             return {
-                'paused': paused,
-                'paused_reason': paused_reason,
-                'soonest_open_at': soonest_open_at,
-                'account_count': gate.account_count,
+                'paused': False,
+                'paused_reason': None,
+                'soonest_open_at': None,
+                'account_count': 0,
             }
-        except (asyncio.CancelledError, KeyboardInterrupt, SystemExit):
-            raise
-        except Exception as e:
-            logger.exception(f'get_curator_state error: {e}')
-            return {'error': str(e), 'error_type': type(e).__name__}
+        gate = curator_usage_gate
+        paused = gate.is_paused
+        paused_reason = gate.paused_reason or None
+        resets_at = gate.soonest_resets_at
+        soonest_open_at = resets_at.isoformat() if resets_at is not None else None
+        return {
+            'paused': paused,
+            'paused_reason': paused_reason,
+            'soonest_open_at': soonest_open_at,
+            'account_count': gate.account_count,
+        }
 
     @mcp.tool()
+    @mcp_tool_errors()
     async def get_wal_status() -> dict[str, Any]:
         """Latest per-store WAL checkpoint status.
 
@@ -2299,6 +2210,7 @@ def create_mcp_server(
         return {'stores': {name: dict(row) for name, row in CHECKPOINT_STATUS.items()}}
 
     @mcp.tool()
+    @mcp_tool_errors()
     async def replay_dead_letters(
         project_id: str | None = None,
     ) -> dict[str, Any]:
@@ -2317,18 +2229,13 @@ def create_mcp_server(
         Args:
             project_id: Scope to a specific project (optional — all if omitted)
         """
-        try:
-            if memory_service.durable_queue is None:
-                return {'error': 'Queue not initialized', 'error_type': 'ConfigurationError'}
-            count = await memory_service.durable_queue.replay_dead(group_id=project_id)
-            return {'status': 'replayed', 'items_reset': count}
-        except (asyncio.CancelledError, KeyboardInterrupt, SystemExit):
-            raise
-        except Exception as e:
-            logger.exception(f'replay_dead_letters error: {e}')
-            return {'error': str(e), 'error_type': type(e).__name__}
+        if memory_service.durable_queue is None:
+            return {'error': 'Queue not initialized', 'error_type': 'ConfigurationError'}
+        count = await memory_service.durable_queue.replay_dead(group_id=project_id)
+        return {'status': 'replayed', 'items_reset': count}
 
     @mcp.tool()
+    @mcp_tool_errors()
     async def get_dead_letters(
         project_id: str | None = None,
         limit: int = 100,
@@ -2350,73 +2257,68 @@ def create_mcp_server(
             project_id: Filter to a specific project (optional — all if omitted)
             limit: Maximum total items to return (default 100)
         """
-        try:
-            items: list[dict[str, Any]] = []
+        items: list[dict[str, Any]] = []
 
-            # --- durable write queue ---
-            if memory_service.durable_queue is not None:
-                dead = await memory_service.durable_queue.get_dead_items(
-                    group_id=project_id,
-                    limit=limit,
+        # --- durable write queue ---
+        if memory_service.durable_queue is not None:
+            dead = await memory_service.durable_queue.get_dead_items(
+                group_id=project_id,
+                limit=limit,
+            )
+            for row in dead:
+                payload, truncated = _truncate_payload(row.get('payload'))
+                item: dict[str, Any] = {
+                    'source': 'durable_queue',
+                    'id': row.get('id'),
+                    'operation': row.get('operation'),
+                    'payload': payload,
+                    'error': row.get('error'),
+                    'timestamp': row.get('created_at'),
+                    'attempts': row.get('attempts'),
+                }
+                if truncated:
+                    item['payload_truncated'] = True
+                items.append(item)
+
+        # --- event queue dead-letter JSONL ---
+        eq_items: list[dict[str, Any]] = []
+        if event_queue is not None:
+            remaining = limit - len(items)
+            if remaining > 0:
+                # read_dead_letters does synchronous file I/O; offload to a
+                # thread so the event loop is not blocked on large files.
+                records = await asyncio.to_thread(
+                    event_queue.read_dead_letters,
+                    limit=remaining,
+                    project_id=project_id,
                 )
-                for row in dead:
-                    payload, truncated = _truncate_payload(row.get('payload'))
-                    item: dict[str, Any] = {
-                        'source': 'durable_queue',
-                        'id': row.get('id'),
-                        'operation': row.get('operation'),
+                for rec in records:
+                    ev = rec.get('event') or {}
+                    payload, truncated = _truncate_payload(ev.get('payload'))
+                    eq_item: dict[str, Any] = {
+                        'source': 'event_queue',
+                        'id': ev.get('id'),
+                        'type': ev.get('type'),
                         'payload': payload,
-                        'error': row.get('error'),
-                        'timestamp': row.get('created_at'),
-                        'attempts': row.get('attempts'),
+                        'reason': rec.get('reason'),
+                        'timestamp': rec.get('failed_at'),
+                        'attempts': rec.get('attempts'),
+                        'project_id': ev.get('project_id'),
                     }
                     if truncated:
-                        item['payload_truncated'] = True
-                    items.append(item)
+                        eq_item['payload_truncated'] = True
+                    eq_items.append(eq_item)
 
-            # --- event queue dead-letter JSONL ---
-            eq_items: list[dict[str, Any]] = []
-            if event_queue is not None:
-                remaining = limit - len(items)
-                if remaining > 0:
-                    # read_dead_letters does synchronous file I/O; offload to a
-                    # thread so the event loop is not blocked on large files.
-                    records = await asyncio.to_thread(
-                        event_queue.read_dead_letters,
-                        limit=remaining,
-                        project_id=project_id,
-                    )
-                    for rec in records:
-                        ev = rec.get('event') or {}
-                        payload, truncated = _truncate_payload(ev.get('payload'))
-                        eq_item: dict[str, Any] = {
-                            'source': 'event_queue',
-                            'id': ev.get('id'),
-                            'type': ev.get('type'),
-                            'payload': payload,
-                            'reason': rec.get('reason'),
-                            'timestamp': rec.get('failed_at'),
-                            'attempts': rec.get('attempts'),
-                            'project_id': ev.get('project_id'),
-                        }
-                        if truncated:
-                            eq_item['payload_truncated'] = True
-                        eq_items.append(eq_item)
+        all_items = items + eq_items
+        counts: dict[str, int] = {
+            'durable_queue': sum(1 for i in all_items if i['source'] == 'durable_queue'),
+            'event_queue': sum(1 for i in all_items if i['source'] == 'event_queue'),
+        }
 
-            all_items = items + eq_items
-            counts: dict[str, int] = {
-                'durable_queue': sum(1 for i in all_items if i['source'] == 'durable_queue'),
-                'event_queue': sum(1 for i in all_items if i['source'] == 'event_queue'),
-            }
-
-            return {'items': all_items[:limit], 'counts': counts}
-        except (asyncio.CancelledError, KeyboardInterrupt, SystemExit):
-            raise
-        except Exception as e:
-            logger.exception(f'get_dead_letters error: {e}')
-            return {'error': str(e), 'error_type': type(e).__name__}
+        return {'items': all_items[:limit], 'counts': counts}
 
     @mcp.tool()
+    @mcp_tool_errors()
     async def delete_dead_letters(
         project_id: str,
         ids: list[int],
@@ -2480,25 +2382,20 @@ def create_mcp_server(
             return err
         if err := validate_int_ids(ids):
             return err
-        try:
-            if memory_service.durable_queue is None:
-                return {'error': 'Queue not initialized', 'error_type': 'ConfigurationError'}
-            result = await memory_service.durable_queue.delete_dead(
-                group_id=project_id,
-                ids=ids,
-            )
-            return result
-        except (asyncio.CancelledError, KeyboardInterrupt, SystemExit):
-            raise
-        except Exception as e:
-            logger.exception(f'delete_dead_letters error: {e}')
-            return {'error': str(e), 'error_type': type(e).__name__}
+        if memory_service.durable_queue is None:
+            return {'error': 'Queue not initialized', 'error_type': 'ConfigurationError'}
+        result = await memory_service.durable_queue.delete_dead(
+            group_id=project_id,
+            ids=ids,
+        )
+        return result
 
     # ------------------------------------------------------------------
     # Reconciliation tools
     # ------------------------------------------------------------------
 
     @mcp.tool()
+    @mcp_tool_errors()
     async def trigger_reconciliation(project_id: str) -> dict[str, Any]:
         """Manually trigger a full reconciliation cycle for a project.
 
@@ -2515,20 +2412,15 @@ def create_mcp_server(
                 'error': 'Taskmaster is not configured. Cannot trigger reconciliation.',
                 'error_type': 'ConfigurationError',
             }
-        try:
-            await task_interceptor.buffer.request_trigger(project_id)  # type: ignore[union-attr]
-            return {
-                'status': 'requested',
-                'project_id': project_id,
-                'message': 'Reconciliation will trigger within ~5 seconds',
-            }
-        except (asyncio.CancelledError, KeyboardInterrupt, SystemExit):
-            raise
-        except Exception as e:
-            logger.exception(f'trigger_reconciliation error: {e}')
-            return {'error': str(e), 'error_type': type(e).__name__}
+        await task_interceptor.buffer.request_trigger(project_id)  # type: ignore[union-attr]
+        return {
+            'status': 'requested',
+            'project_id': project_id,
+            'message': 'Reconciliation will trigger within ~5 seconds',
+        }
 
     @mcp.tool()
+    @mcp_tool_errors()
     async def unhalt_reconciliation(project_id: str) -> dict[str, Any]:
         """Clear a judge-imposed halt on reconciliation for a project.
 
@@ -2697,6 +2589,7 @@ def create_mcp_server(
         return None
 
     @mcp.tool()
+    @mcp_tool_errors()
     async def get_tasks(
         project_root: str,
         tag: str | None = None,
@@ -2748,50 +2641,45 @@ def create_mcp_server(
         if isinstance(_normalized, dict):
             return _normalized
         project_root = _normalized
-        try:
-            result = await task_interceptor.get_tasks(project_root=project_root, tag=tag, statuses=statuses)
-            if isinstance(result, dict) and 'error' not in result:
-                pid = resolve_project_id(project_root)
-                # Shallow copy to avoid mutating a potentially shared/cached interceptor dict.
-                result = {**result, 'project_id': pid, 'project_root': project_root}
+        result = await task_interceptor.get_tasks(project_root=project_root, tag=tag, statuses=statuses)
+        if isinstance(result, dict) and 'error' not in result:
+            pid = resolve_project_id(project_root)
+            # Shallow copy to avoid mutating a potentially shared/cached interceptor dict.
+            result = {**result, 'project_id': pid, 'project_root': project_root}
 
-                # Opt-in pagination — only applied when page_size is explicitly provided.
-                # When page_size is None the response is the full untouched list (no
-                # ``pagination`` key), preserving backward compatibility for the scheduler.
-                if page_size is not None:
-                    all_tasks = result.get('tasks')
-                    # Only paginate when tasks is a proper list — a non-standard backend
-                    # could return None or a dict; in that case skip pagination and leave
-                    # the result untouched rather than masking the real failure with a
-                    # generic slicing error.
-                    if isinstance(all_tasks, list):
-                        total = len(all_tasks)
-                        page = all_tasks[offset:offset + page_size]
-                        result['tasks'] = page
-                        result['pagination'] = {
-                            'total': total,
-                            'offset': offset,
-                            'page_size': page_size,
-                            'returned': len(page),
-                            'has_more': offset + len(page) < total,
-                        }
+            # Opt-in pagination — only applied when page_size is explicitly provided.
+            # When page_size is None the response is the full untouched list (no
+            # ``pagination`` key), preserving backward compatibility for the scheduler.
+            if page_size is not None:
+                all_tasks = result.get('tasks')
+                # Only paginate when tasks is a proper list — a non-standard backend
+                # could return None or a dict; in that case skip pagination and leave
+                # the result untouched rather than masking the real failure with a
+                # generic slicing error.
+                if isinstance(all_tasks, list):
+                    total = len(all_tasks)
+                    page = all_tasks[offset:offset + page_size]
+                    result['tasks'] = page
+                    result['pagination'] = {
+                        'total': total,
+                        'offset': offset,
+                        'page_size': page_size,
+                        'returned': len(page),
+                        'has_more': offset + len(page) < total,
+                    }
 
-                await _log_read(
-                    'get_tasks',
-                    project_id=pid,
-                    result_summary={
-                        'project_id': pid,
-                        'count': len(result.get('tasks', [])),
-                    },
-                )
-            return result
-        except (asyncio.CancelledError, KeyboardInterrupt, SystemExit):
-            raise
-        except Exception as e:
-            logger.exception(f'get_tasks error: {e}')
-            return {'error': str(e), 'error_type': type(e).__name__}
+            await _log_read(
+                'get_tasks',
+                project_id=pid,
+                result_summary={
+                    'project_id': pid,
+                    'count': len(result.get('tasks', [])),
+                },
+            )
+        return result
 
     @mcp.tool()
+    @mcp_tool_errors()
     async def get_statuses(
         project_root: str,
         ids: list[str] | None = None,
@@ -2813,22 +2701,17 @@ def create_mcp_server(
         if isinstance(_normalized, dict):
             return _normalized
         project_root = _normalized
-        try:
-            result = await task_interceptor.get_statuses(
-                project_root=project_root, ids=ids, tag=tag
-            )
-            await _log_read(
-                'get_statuses',
-                result_summary={'count': len(result)},
-            )
-            return {'statuses': result}
-        except (asyncio.CancelledError, KeyboardInterrupt, SystemExit):
-            raise
-        except Exception as e:
-            logger.exception(f'get_statuses error: {e}')
-            return {'error': str(e), 'error_type': type(e).__name__}
+        result = await task_interceptor.get_statuses(
+            project_root=project_root, ids=ids, tag=tag
+        )
+        await _log_read(
+            'get_statuses',
+            result_summary={'count': len(result)},
+        )
+        return {'statuses': result}
 
     @mcp.tool()
+    @mcp_tool_errors()
     async def get_external_statuses(deps: list[str]) -> dict[str, str]:
         """Return cross-project task statuses keyed by the verbatim dep string.
 
@@ -2845,7 +2728,23 @@ def create_mcp_server(
         - ``"malformed"``       — dep cannot be parsed as ``<project_id>:<int>``
 
         Read-only: no reconciliation, no event emission, no task mutation.
-        Registry/DB unavailability raises (transient) — NOT mapped to a sentinel.
+
+        Registry/DB unavailability (transient) is still NOT mapped to a
+        per-dep sentinel: the code below still raises on that failure. This
+        tool carries ``@mcp_tool_errors()``, though, which catches that raise
+        at the MCP boundary and converts it into a structured
+        ``{'error': ..., 'error_type': ...}`` dict — the raise itself no
+        longer reaches the caller as a propagated exception. The two outcomes
+        stay distinguishable by shape: a real result is always
+        ``{dep: status}``, while a transient failure is a top-level
+        ``{'error', 'error_type'}`` dict, never a per-dep sentinel. Downstream,
+        the orchestrator scheduler's missing-dep-key guard
+        (``Scheduler.get_external_statuses``) treats that error dict as
+        "expected dep keys missing" and synthesises an
+        ``ExternalResolverError``, so ``_apply_external_dep_policy`` still
+        takes its fail-safe-wait path (no sentinel-counter increment) — the
+        externally-visible fail-safe behaviour is unchanged from before the
+        decorator was applied.
         """
         result: dict[str, str] = {}
         # Collect well-formed, known-project deps grouped by normalised project_id
@@ -2879,9 +2778,13 @@ def create_mcp_server(
             project_batches.setdefault(norm_project_id, []).append((dep, task_id))
 
         # Issue ONE get_statuses call per distinct foreign project (minimises reads).
-        # Intentionally NOT wrapped in try/except — transient errors (DB/registry
-        # unavailability) must propagate as exceptions, not be mapped to a sentinel.
-        # Sentinels = semantic "unresolvable"; exceptions = transient "couldn't answer".
+        # Intentionally NOT wrapped in a local try/except — a transient error here
+        # (DB/registry unavailability) still raises out of this loop rather than
+        # being mapped to a sentinel. @mcp_tool_errors() (applied above) is what
+        # catches that raise at the MCP boundary and turns it into a structured
+        # error dict — see the docstring for the shape contract this preserves.
+        # Sentinels = semantic "unresolvable"; the error dict = transient
+        # "couldn't answer".
         for norm_project_id, dep_pairs in project_batches.items():
             project_root = _kp[norm_project_id]
             # Redirect worktree roots to the main checkout, mirroring all other
@@ -2889,8 +2792,9 @@ def create_mcp_server(
             # from build_known_projects_map are expected to be canonical
             # main-checkout paths, but this guard prevents a silent divergence if
             # a registered root were ever a worktree path.
-            # Resolution failure raises (transient) — consistent with this tool's
-            # "no sentinel for transient failures" contract.
+            # Resolution failure raises (transient), never a sentinel.
+            # @mcp_tool_errors() converts that raise into a structured error
+            # dict at the MCP boundary — see the docstring for the contract.
             _norm = _normalize_project_root(project_root)
             if isinstance(_norm, dict):
                 raise RuntimeError(
@@ -2909,6 +2813,7 @@ def create_mcp_server(
         return result
 
     @mcp.tool()
+    @mcp_tool_errors()
     async def get_task(
         id: str,
         project_root: str,
@@ -2925,25 +2830,20 @@ def create_mcp_server(
         if isinstance(_normalized, dict):
             return _normalized
         project_root = _normalized
-        try:
-            result = await task_interceptor.get_task(task_id=id, project_root=project_root, tag=tag)
-            if isinstance(result, dict) and 'error' not in result:
-                pid = resolve_project_id(project_root)
-                # Shallow copy to avoid mutating a potentially shared/cached interceptor dict.
-                result = {**result, 'project_id': pid, 'project_root': project_root}
-                await _log_read(
-                    'get_task',
-                    project_id=pid,
-                    result_summary={'project_id': pid, 'task_id': id},
-                )
-            return result
-        except (asyncio.CancelledError, KeyboardInterrupt, SystemExit):
-            raise
-        except Exception as e:
-            logger.exception(f'get_task error: {e}')
-            return {'error': str(e), 'error_type': type(e).__name__}
+        result = await task_interceptor.get_task(task_id=id, project_root=project_root, tag=tag)
+        if isinstance(result, dict) and 'error' not in result:
+            pid = resolve_project_id(project_root)
+            # Shallow copy to avoid mutating a potentially shared/cached interceptor dict.
+            result = {**result, 'project_id': pid, 'project_root': project_root}
+            await _log_read(
+                'get_task',
+                project_id=pid,
+                result_summary={'project_id': pid, 'task_id': id},
+            )
+        return result
 
     @mcp.tool()
+    @mcp_tool_errors()
     async def set_task_status(
         id: str,
         status: str,
@@ -3040,24 +2940,19 @@ def create_mcp_server(
         claimant_kwargs: dict[str, Any] = _maybe_kwargs(
             _CLAIMANT_WIRE_UNSET, claimant_run_id=claimant_run_id, heartbeat_at=heartbeat_at,
         )
-        try:
-            return await task_interceptor.set_task_status(
-                task_id=id,
-                status=status,
-                project_root=project_root,
-                tag=tag,
-                done_provenance=done_provenance,
-                reopen_reason=reopen_reason,
-                agent_id=agent_id,
-                **claimant_kwargs,
-            )
-        except (asyncio.CancelledError, KeyboardInterrupt, SystemExit):
-            raise
-        except Exception as e:
-            logger.exception(f'set_task_status error: {e}')
-            return {'error': str(e), 'error_type': type(e).__name__}
+        return await task_interceptor.set_task_status(
+            task_id=id,
+            status=status,
+            project_root=project_root,
+            tag=tag,
+            done_provenance=done_provenance,
+            reopen_reason=reopen_reason,
+            agent_id=agent_id,
+            **claimant_kwargs,
+        )
 
     @mcp.tool()
+    @mcp_tool_errors()
     async def set_task_claimant(
         id: str,
         project_root: str,
@@ -3094,18 +2989,12 @@ def create_mcp_server(
         claimant_kwargs: dict[str, Any] = _maybe_kwargs(
             _CLAIMANT_WIRE_UNSET, claimant_run_id=claimant_run_id, heartbeat_at=heartbeat_at,
         )
-        try:
-            return await task_interceptor.set_task_claimant(
-                task_id=id,
-                project_root=project_root,
-                tag=tag,
-                **claimant_kwargs,
-            )
-        except (asyncio.CancelledError, KeyboardInterrupt, SystemExit):
-            raise
-        except Exception as e:
-            logger.exception(f'set_task_claimant error: {e}')
-            return {'error': str(e), 'error_type': type(e).__name__}
+        return await task_interceptor.set_task_claimant(
+            task_id=id,
+            project_root=project_root,
+            tag=tag,
+            **claimant_kwargs,
+        )
 
     @mcp.tool()
     @mcp_tool_errors()
@@ -3345,6 +3234,7 @@ def create_mcp_server(
         return result
 
     @mcp.tool()
+    @mcp_tool_errors()
     async def search_tasks(
         project_root: str,
         query: str,
@@ -3382,18 +3272,12 @@ def create_mcp_server(
             return {'error': 'limit must be positive', 'error_type': 'ValidationError'}
         if limit > 100:
             limit = 100
-        try:
-            return await task_interceptor.search_tasks(
-                project_root=project_root,
-                query=query,
-                limit=limit,
-                score_threshold=score_threshold,
-            )
-        except (asyncio.CancelledError, KeyboardInterrupt, SystemExit):
-            raise
-        except Exception as e:
-            logger.exception(f'search_tasks error: {e}')
-            return {'error': str(e), 'error_type': type(e).__name__}
+        return await task_interceptor.search_tasks(
+            project_root=project_root,
+            query=query,
+            limit=limit,
+            score_threshold=score_threshold,
+        )
 
     @mcp.tool()
     @mcp_tool_errors()
@@ -3422,6 +3306,7 @@ def create_mcp_server(
         return await task_interceptor.cancel_ticket(ticket_id=ticket_id)
 
     @mcp.tool()
+    @mcp_tool_errors()
     async def commit_planning(
         project_root: str,
         task_ids: str,
@@ -3488,39 +3373,34 @@ def create_mcp_server(
                     'error_type': 'ValidationError',
                 }
 
-        try:
-            # Lock-charter guard γ: batch-read all tasks concurrently, then
-            # scan for directory entries before flipping status.  asyncio.gather
-            # keeps latency proportional to the slowest single read rather than
-            # N × median.  Any TaskmasterError (e.g. unknown id) propagates
-            # through gather and is caught by the outer handler below, returning
-            # the standard structured error dict instead of raising.
-            # Rejects the WHOLE batch atomically on the first offending task,
-            # naming the task id + directory paths (mirrors the
-            # ticket-id-in-batch validation above: all-or-nothing commit gate).
-            # Non-dict / missing metadata → benign-absent ([] → ACCEPT); this
-            # also keeps the existing AsyncMock-fixture commit_planning tests green.
-            tasks_data = await asyncio.gather(
-                *[task_interceptor.get_task(tid, project_root) for tid in ids]
-            )
-            for tid, task in zip(ids, tasks_data, strict=False):
-                meta = task.get('metadata') if isinstance(task, dict) else None
-                dirs = directory_locks(extract_files(meta))
-                if dirs:
-                    return lock_charter_error(dirs, task_id=tid)
+        # Lock-charter guard γ: batch-read all tasks concurrently, then
+        # scan for directory entries before flipping status.  asyncio.gather
+        # keeps latency proportional to the slowest single read rather than
+        # N × median.  Any TaskmasterError (e.g. unknown id) propagates
+        # through gather and is caught by the outer handler below, returning
+        # the standard structured error dict instead of raising.
+        # Rejects the WHOLE batch atomically on the first offending task,
+        # naming the task id + directory paths (mirrors the
+        # ticket-id-in-batch validation above: all-or-nothing commit gate).
+        # Non-dict / missing metadata → benign-absent ([] → ACCEPT); this
+        # also keeps the existing AsyncMock-fixture commit_planning tests green.
+        tasks_data = await asyncio.gather(
+            *[task_interceptor.get_task(tid, project_root) for tid in ids]
+        )
+        for tid, task in zip(ids, tasks_data, strict=False):
+            meta = task.get('metadata') if isinstance(task, dict) else None
+            dirs = directory_locks(extract_files(meta))
+            if dirs:
+                return lock_charter_error(dirs, task_id=tid)
 
-            return await task_interceptor.set_task_status(
-                task_id=','.join(ids),
-                status=target_status,
-                project_root=project_root,
-            )
-        except (asyncio.CancelledError, KeyboardInterrupt, SystemExit):
-            raise
-        except Exception as e:
-            logger.exception(f'commit_planning error: {e}')
-            return {'error': str(e), 'error_type': type(e).__name__}
+        return await task_interceptor.set_task_status(
+            task_id=','.join(ids),
+            status=target_status,
+            project_root=project_root,
+        )
 
     @mcp.tool()
+    @mcp_tool_errors()
     async def update_task(
         id: str,
         project_root: str,
@@ -3599,31 +3479,26 @@ def create_mcp_server(
         _dirs = directory_locks(extract_files(metadata))
         if _dirs:
             return lock_charter_error(_dirs)
-        try:
-            if isinstance(metadata, dict):
-                metadata = json.dumps(metadata)
-            return await task_interceptor.update_task(
-                task_id=id,
-                project_root=project_root,
-                prompt=prompt,
-                metadata=metadata,
-                append=append,
-                metadata_mode=metadata_mode,
-                tag=tag,
-                title=title,
-                description=description,
-                details=details,
-                priority=priority,
-                status=status,
-                dependencies=dependencies,
-            )
-        except (asyncio.CancelledError, KeyboardInterrupt, SystemExit):
-            raise
-        except Exception as e:
-            logger.exception(f'update_task error: {e}')
-            return {'error': str(e), 'error_type': type(e).__name__}
+        if isinstance(metadata, dict):
+            metadata = json.dumps(metadata)
+        return await task_interceptor.update_task(
+            task_id=id,
+            project_root=project_root,
+            prompt=prompt,
+            metadata=metadata,
+            append=append,
+            metadata_mode=metadata_mode,
+            tag=tag,
+            title=title,
+            description=description,
+            details=details,
+            priority=priority,
+            status=status,
+            dependencies=dependencies,
+        )
 
     @mcp.tool()
+    @mcp_tool_errors()
     async def remove_task(
         id: str,
         project_root: str,
@@ -3679,15 +3554,10 @@ def create_mcp_server(
                 'removed_ids': [],
                 'message': 'no ids supplied',
             }
-        try:
-            return await task_interceptor.remove_tasks(ids=ids, project_root=project_root, tag=tag)
-        except (asyncio.CancelledError, KeyboardInterrupt, SystemExit):
-            raise
-        except Exception as e:
-            logger.exception(f'remove_task error: {e}')
-            return {'error': str(e), 'error_type': type(e).__name__}
+        return await task_interceptor.remove_tasks(ids=ids, project_root=project_root, tag=tag)
 
     @mcp.tool()
+    @mcp_tool_errors()
     async def add_dependency(
         id: str,
         depends_on: str,
@@ -3729,20 +3599,15 @@ def create_mcp_server(
         if isinstance(_normalized, dict):
             return _normalized
         project_root = _normalized
-        try:
-            return await task_interceptor.add_dependency(
-                task_id=id,
-                depends_on=depends_on,
-                project_root=project_root,
-                tag=tag,
-            )
-        except (asyncio.CancelledError, KeyboardInterrupt, SystemExit):
-            raise
-        except Exception as e:
-            logger.exception(f'add_dependency error: {e}')
-            return {'error': str(e), 'error_type': type(e).__name__}
+        return await task_interceptor.add_dependency(
+            task_id=id,
+            depends_on=depends_on,
+            project_root=project_root,
+            tag=tag,
+        )
 
     @mcp.tool()
+    @mcp_tool_errors()
     async def remove_dependency(
         id: str,
         depends_on: str,
@@ -3776,18 +3641,12 @@ def create_mcp_server(
         if isinstance(_normalized, dict):
             return _normalized
         project_root = _normalized
-        try:
-            return await task_interceptor.remove_dependency(
-                task_id=id,
-                depends_on=depends_on,
-                project_root=project_root,
-                tag=tag,
-            )
-        except (asyncio.CancelledError, KeyboardInterrupt, SystemExit):
-            raise
-        except Exception as e:
-            logger.exception(f'remove_dependency error: {e}')
-            return {'error': str(e), 'error_type': type(e).__name__}
+        return await task_interceptor.remove_dependency(
+            task_id=id,
+            depends_on=depends_on,
+            project_root=project_root,
+            tag=tag,
+        )
 
     # ------------------------------------------------------------------
     # Scheduler-override tools
@@ -3837,6 +3696,7 @@ def create_mcp_server(
             )
 
     @mcp.tool()
+    @mcp_tool_errors()
     async def set_task_priority_override(
         project_root: str,
         task_id: str,
@@ -3882,156 +3742,151 @@ def create_mcp_server(
                 'error_type': 'ValidationError',
             }
 
+        now_iso = datetime.now(UTC).isoformat()
+        ttl_until_iso: str | None = None
+        if ttl_secs is not None:
+            from datetime import timedelta
+
+            ttl_until_iso = (datetime.now(UTC) + timedelta(seconds=ttl_secs)).isoformat()
+
+        db = await _open_overrides_db(project_root, autocommit=True)
+        collision_response: dict[str, Any] | None = None
         try:
-            now_iso = datetime.now(UTC).isoformat()
-            ttl_until_iso: str | None = None
-            if ttl_secs is not None:
-                from datetime import timedelta
-
-                ttl_until_iso = (datetime.now(UTC) + timedelta(seconds=ttl_secs)).isoformat()
-
-            db = await _open_overrides_db(project_root, autocommit=True)
-            collision_response: dict[str, Any] | None = None
+            # Acquire a write lock up-front (IMMEDIATE) so the MAX(pin_order)
+            # read and the subsequent UPSERT are serialized against concurrent
+            # set_task_priority_override callers.  Without BEGIN IMMEDIATE
+            # two concurrent callers can both read MAX=N and both attempt
+            # to write N+1, producing a collision or silently duplicating
+            # pin_order values.  Mirrors source-of-truth at
+            # orchestrator/src/orchestrator/overrides.py:188-195.
+            await db.execute('BEGIN IMMEDIATE')
             try:
-                # Acquire a write lock up-front (IMMEDIATE) so the MAX(pin_order)
-                # read and the subsequent UPSERT are serialized against concurrent
-                # set_task_priority_override callers.  Without BEGIN IMMEDIATE
-                # two concurrent callers can both read MAX=N and both attempt
-                # to write N+1, producing a collision or silently duplicating
-                # pin_order values.  Mirrors source-of-truth at
-                # orchestrator/src/orchestrator/overrides.py:188-195.
-                await db.execute('BEGIN IMMEDIATE')
-                try:
-                    # Auto-assign or preserve pin_order when pinning without an
-                    # explicit order. Mirrors orchestrator/src/orchestrator/overrides.py:160-180.
-                    if pinned is True and pin_order is None:
-                        already = await (
-                            await db.execute(
-                                'SELECT pin_order FROM overrides '
-                                'WHERE project_root=? AND task_id=? AND pinned=1',
-                                (project_root, task_id),
-                            )
-                        ).fetchone()
-                        if already is not None:
-                            pin_order = already[0]
-                        else:
-                            row = await (
-                                await db.execute(
-                                    'SELECT COALESCE(MAX(pin_order), 0) + 1 '
-                                    'FROM overrides WHERE project_root=? AND pinned=1',
-                                    (project_root,),
-                                )
-                            ).fetchone()
-                            # Aggregate query always returns a row; assert for pyright.
-                            assert row is not None
-                            pin_order = row[0]
-
-                    # Collision check for explicit or auto-assigned pin_order.
-                    if pin_order is not None:
-                        existing = await (
-                            await db.execute(
-                                'SELECT task_id FROM overrides '
-                                'WHERE project_root=? AND pinned=1 AND pin_order=? AND task_id != ?',
-                                (project_root, pin_order, task_id),
-                            )
-                        ).fetchone()
-                        if existing:
-                            await db.execute('ROLLBACK')
-                            collision_response = {
-                                'error': 'pin_order_collision',
-                                'conflicting_task_id': existing[0],
-                                'pin_order': pin_order,
-                            }
-
-                    if collision_response is None:
-                        pinned_int = int(pinned) if pinned is not None else None
-                        reserve_now_int = int(reserve_now) if reserve_now is not None else None
-
-                        # CASE WHEN ?=0 THEN NULL ELSE COALESCE(?, pin_order) END
-                        # — passing pinned=False (pinned_int=0) zeroes pinned AND
-                        # nulls pin_order in one atomic write, preserving the
-                        # structural invariant `pinned=0 → pin_order IS NULL`.
-                        # Mirrors orchestrator/src/orchestrator/overrides.py:252-253.
+                # Auto-assign or preserve pin_order when pinning without an
+                # explicit order. Mirrors orchestrator/src/orchestrator/overrides.py:160-180.
+                if pinned is True and pin_order is None:
+                    already = await (
                         await db.execute(
-                            """
-                            INSERT INTO overrides
-                                (project_root, task_id, boost_tier, pinned, pin_order,
-                                 reserve_now, ttl_until, created_at, updated_at)
-                            VALUES (?, ?, ?, COALESCE(?, 0), ?, COALESCE(?, 0), ?, ?, ?)
-                            ON CONFLICT(project_root, task_id) DO UPDATE SET
-                                boost_tier  = COALESCE(?, boost_tier),
-                                pinned      = COALESCE(?, pinned),
-                                pin_order   = CASE WHEN ?=0 THEN NULL
-                                                   ELSE COALESCE(?, pin_order) END,
-                                reserve_now = COALESCE(?, reserve_now),
-                                ttl_until   = COALESCE(?, ttl_until),
-                                updated_at  = ?
-                            """,
-                            (
-                                # INSERT values
-                                project_root,
-                                task_id,
-                                boost_tier,
-                                pinned_int,
-                                pin_order,
-                                reserve_now_int,
-                                ttl_until_iso,
-                                now_iso,
-                                now_iso,
-                                # UPDATE SET values
-                                boost_tier,
-                                pinned_int,
-                                pinned_int,
-                                pin_order,
-                                reserve_now_int,
-                                ttl_until_iso,
-                                now_iso,
-                            ),
+                            'SELECT pin_order FROM overrides '
+                            'WHERE project_root=? AND task_id=? AND pinned=1',
+                            (project_root, task_id),
                         )
-                        await db.execute('COMMIT')
-                except Exception:
-                    with contextlib.suppress(Exception):
+                    ).fetchone()
+                    if already is not None:
+                        pin_order = already[0]
+                    else:
+                        row = await (
+                            await db.execute(
+                                'SELECT COALESCE(MAX(pin_order), 0) + 1 '
+                                'FROM overrides WHERE project_root=? AND pinned=1',
+                                (project_root,),
+                            )
+                        ).fetchone()
+                        # Aggregate query always returns a row; assert for pyright.
+                        assert row is not None
+                        pin_order = row[0]
+
+                # Collision check for explicit or auto-assigned pin_order.
+                if pin_order is not None:
+                    existing = await (
+                        await db.execute(
+                            'SELECT task_id FROM overrides '
+                            'WHERE project_root=? AND pinned=1 AND pin_order=? AND task_id != ?',
+                            (project_root, pin_order, task_id),
+                        )
+                    ).fetchone()
+                    if existing:
                         await db.execute('ROLLBACK')
-                    raise
-            finally:
-                await db.close()
+                        collision_response = {
+                            'error': 'pin_order_collision',
+                            'conflicting_task_id': existing[0],
+                            'pin_order': pin_order,
+                        }
 
-            if collision_response is not None:
-                return collision_response
+                if collision_response is None:
+                    pinned_int = int(pinned) if pinned is not None else None
+                    reserve_now_int = int(reserve_now) if reserve_now is not None else None
 
-            # Build changed_fields for audit (use original ttl_secs, not derived absolute).
-            changed_fields: dict[str, Any] = {}
-            if boost_tier is not None:
-                changed_fields['boost_tier'] = boost_tier
-            if pinned is not None:
-                changed_fields['pinned'] = pinned
-            if pin_order is not None:
-                # Intentionally the post-auto-assignment value — if pinned=True was
-                # supplied without an explicit pin_order, this records the integer
-                # that was actually written to the DB (auto-MAX+1 logic above).
-                # Contrast with ttl_secs below, which is intentionally the raw
-                # caller-supplied input rather than the derived ttl_until ISO string.
-                changed_fields['pin_order'] = pin_order
-            if reserve_now is not None:
-                changed_fields['reserve_now'] = reserve_now
-            if ttl_secs is not None:
-                changed_fields['ttl_secs'] = ttl_secs
+                    # CASE WHEN ?=0 THEN NULL ELSE COALESCE(?, pin_order) END
+                    # — passing pinned=False (pinned_int=0) zeroes pinned AND
+                    # nulls pin_order in one atomic write, preserving the
+                    # structural invariant `pinned=0 → pin_order IS NULL`.
+                    # Mirrors orchestrator/src/orchestrator/overrides.py:252-253.
+                    await db.execute(
+                        """
+                        INSERT INTO overrides
+                            (project_root, task_id, boost_tier, pinned, pin_order,
+                             reserve_now, ttl_until, created_at, updated_at)
+                        VALUES (?, ?, ?, COALESCE(?, 0), ?, COALESCE(?, 0), ?, ?, ?)
+                        ON CONFLICT(project_root, task_id) DO UPDATE SET
+                            boost_tier  = COALESCE(?, boost_tier),
+                            pinned      = COALESCE(?, pinned),
+                            pin_order   = CASE WHEN ?=0 THEN NULL
+                                               ELSE COALESCE(?, pin_order) END,
+                            reserve_now = COALESCE(?, reserve_now),
+                            ttl_until   = COALESCE(?, ttl_until),
+                            updated_at  = ?
+                        """,
+                        (
+                            # INSERT values
+                            project_root,
+                            task_id,
+                            boost_tier,
+                            pinned_int,
+                            pin_order,
+                            reserve_now_int,
+                            ttl_until_iso,
+                            now_iso,
+                            now_iso,
+                            # UPDATE SET values
+                            boost_tier,
+                            pinned_int,
+                            pinned_int,
+                            pin_order,
+                            reserve_now_int,
+                            ttl_until_iso,
+                            now_iso,
+                        ),
+                    )
+                    await db.execute('COMMIT')
+            except Exception:
+                with contextlib.suppress(Exception):
+                    await db.execute('ROLLBACK')
+                raise
+        finally:
+            await db.close()
 
-            await _emit_override_audit(
-                project_root,
-                'set_task_priority_override',
-                task_id,
-                f'Set priority override for task {task_id}: {changed_fields}',
-                {'task_id': task_id, 'fields': changed_fields},
-            )
-            return {'success': True, 'task_id': task_id}
-        except (asyncio.CancelledError, KeyboardInterrupt, SystemExit):
-            raise
-        except Exception as e:
-            logger.exception(f'set_task_priority_override error: {e}')
-            return {'error': str(e), 'error_type': type(e).__name__}
+        if collision_response is not None:
+            return collision_response
+
+        # Build changed_fields for audit (use original ttl_secs, not derived absolute).
+        changed_fields: dict[str, Any] = {}
+        if boost_tier is not None:
+            changed_fields['boost_tier'] = boost_tier
+        if pinned is not None:
+            changed_fields['pinned'] = pinned
+        if pin_order is not None:
+            # Intentionally the post-auto-assignment value — if pinned=True was
+            # supplied without an explicit pin_order, this records the integer
+            # that was actually written to the DB (auto-MAX+1 logic above).
+            # Contrast with ttl_secs below, which is intentionally the raw
+            # caller-supplied input rather than the derived ttl_until ISO string.
+            changed_fields['pin_order'] = pin_order
+        if reserve_now is not None:
+            changed_fields['reserve_now'] = reserve_now
+        if ttl_secs is not None:
+            changed_fields['ttl_secs'] = ttl_secs
+
+        await _emit_override_audit(
+            project_root,
+            'set_task_priority_override',
+            task_id,
+            f'Set priority override for task {task_id}: {changed_fields}',
+            {'task_id': task_id, 'fields': changed_fields},
+        )
+        return {'success': True, 'task_id': task_id}
 
     @mcp.tool()
+    @mcp_tool_errors()
     async def clear_task_priority_override(
         project_root: str,
         task_id: str,
@@ -4061,61 +3916,56 @@ def create_mcp_server(
                 'error_type': 'ValidationError',
             }
 
+        now_iso = datetime.now(UTC).isoformat()
+        db = await _open_overrides_db(project_root)
         try:
-            now_iso = datetime.now(UTC).isoformat()
-            db = await _open_overrides_db(project_root)
-            try:
-                if field is None:
-                    await db.execute(
-                        'DELETE FROM overrides WHERE project_root=? AND task_id=?',
-                        (project_root, task_id),
-                    )
-                elif field == 'boost_tier':
-                    await db.execute(
-                        'UPDATE overrides SET boost_tier=NULL, updated_at=? '
-                        'WHERE project_root=? AND task_id=?',
-                        (now_iso, project_root, task_id),
-                    )
-                elif field == 'pinned':
-                    # Clearing pinned also clears pin_order.
-                    # Mirrors orchestrator/src/orchestrator/overrides.py:267-271.
-                    await db.execute(
-                        'UPDATE overrides SET pinned=0, pin_order=NULL, updated_at=? '
-                        'WHERE project_root=? AND task_id=?',
-                        (now_iso, project_root, task_id),
-                    )
-                elif field == 'reserve_now':
-                    await db.execute(
-                        'UPDATE overrides SET reserve_now=0, updated_at=? '
-                        'WHERE project_root=? AND task_id=?',
-                        (now_iso, project_root, task_id),
-                    )
-                else:  # 'ttl'
-                    await db.execute(
-                        'UPDATE overrides SET ttl_until=NULL, updated_at=? '
-                        'WHERE project_root=? AND task_id=?',
-                        (now_iso, project_root, task_id),
-                    )
-                await db.commit()
-            finally:
-                await db.close()
+            if field is None:
+                await db.execute(
+                    'DELETE FROM overrides WHERE project_root=? AND task_id=?',
+                    (project_root, task_id),
+                )
+            elif field == 'boost_tier':
+                await db.execute(
+                    'UPDATE overrides SET boost_tier=NULL, updated_at=? '
+                    'WHERE project_root=? AND task_id=?',
+                    (now_iso, project_root, task_id),
+                )
+            elif field == 'pinned':
+                # Clearing pinned also clears pin_order.
+                # Mirrors orchestrator/src/orchestrator/overrides.py:267-271.
+                await db.execute(
+                    'UPDATE overrides SET pinned=0, pin_order=NULL, updated_at=? '
+                    'WHERE project_root=? AND task_id=?',
+                    (now_iso, project_root, task_id),
+                )
+            elif field == 'reserve_now':
+                await db.execute(
+                    'UPDATE overrides SET reserve_now=0, updated_at=? '
+                    'WHERE project_root=? AND task_id=?',
+                    (now_iso, project_root, task_id),
+                )
+            else:  # 'ttl'
+                await db.execute(
+                    'UPDATE overrides SET ttl_until=NULL, updated_at=? '
+                    'WHERE project_root=? AND task_id=?',
+                    (now_iso, project_root, task_id),
+                )
+            await db.commit()
+        finally:
+            await db.close()
 
-            label = 'all' if field is None else field
-            await _emit_override_audit(
-                project_root,
-                'clear_task_priority_override',
-                task_id,
-                f'Cleared {label} priority override(s) for task {task_id}',
-                {'task_id': task_id, 'field': field},
-            )
-            return {'success': True, 'task_id': task_id, 'field': field}
-        except (asyncio.CancelledError, KeyboardInterrupt, SystemExit):
-            raise
-        except Exception as e:
-            logger.exception(f'clear_task_priority_override error: {e}')
-            return {'error': str(e), 'error_type': type(e).__name__}
+        label = 'all' if field is None else field
+        await _emit_override_audit(
+            project_root,
+            'clear_task_priority_override',
+            task_id,
+            f'Cleared {label} priority override(s) for task {task_id}',
+            {'task_id': task_id, 'field': field},
+        )
+        return {'success': True, 'task_id': task_id, 'field': field}
 
     @mcp.tool()
+    @mcp_tool_errors()
     async def reorder_pin_queue(
         project_root: str,
         ordered_task_ids: list[str] | str,
@@ -4161,69 +4011,64 @@ def create_mcp_server(
                 'error_type': 'ValidationError',
             }
 
+        now_iso = datetime.now(UTC).isoformat()
+        # Use autocommit=True so we can issue BEGIN IMMEDIATE, making the
+        # set-equality SELECT and the rewrite loop a single atomic
+        # read-then-write under a write lock.  Without BEGIN IMMEDIATE a
+        # concurrent set_task_priority_override(pinned=True) call could pin
+        # a new task between the SELECT and the UPDATE loop, invalidating
+        # the set-equality invariant that was checked before the writes.
+        # Mirrors set_task_priority_override's concurrency pattern above.
+        db = await _open_overrides_db(project_root, autocommit=True)
         try:
-            now_iso = datetime.now(UTC).isoformat()
-            # Use autocommit=True so we can issue BEGIN IMMEDIATE, making the
-            # set-equality SELECT and the rewrite loop a single atomic
-            # read-then-write under a write lock.  Without BEGIN IMMEDIATE a
-            # concurrent set_task_priority_override(pinned=True) call could pin
-            # a new task between the SELECT and the UPDATE loop, invalidating
-            # the set-equality invariant that was checked before the writes.
-            # Mirrors set_task_priority_override's concurrency pattern above.
-            db = await _open_overrides_db(project_root, autocommit=True)
+            await db.execute('BEGIN IMMEDIATE')
             try:
-                await db.execute('BEGIN IMMEDIATE')
-                try:
-                    # Set-equality check before writing.
-                    # Mirrors orchestrator/src/orchestrator/overrides.py:303-312.
-                    cursor = await db.execute(
-                        'SELECT task_id FROM overrides WHERE project_root=? AND pinned=1',
-                        (project_root,),
+                # Set-equality check before writing.
+                # Mirrors orchestrator/src/orchestrator/overrides.py:303-312.
+                cursor = await db.execute(
+                    'SELECT task_id FROM overrides WHERE project_root=? AND pinned=1',
+                    (project_root,),
+                )
+                current_rows = await cursor.fetchall()
+                current_set = {r[0] for r in current_rows}
+                supplied_set = set(ordered_task_ids)
+                if supplied_set != current_set:
+                    await db.execute('ROLLBACK')
+                    return {
+                        'error': (
+                            f'reorder_pin_queue: ids do not match current pin queue. '
+                            f'supplied={sorted(supplied_set)!r}, '
+                            f'expected={sorted(current_set)!r}'
+                        ),
+                        'error_type': 'ValidationError',
+                    }
+
+                # Single-transaction rewrite. Mirrors overrides.py:318-326.
+                for idx, tid in enumerate(ordered_task_ids, start=1):
+                    await db.execute(
+                        'UPDATE overrides SET pin_order=?, updated_at=? '
+                        'WHERE project_root=? AND task_id=?',
+                        (idx, now_iso, project_root, tid),
                     )
-                    current_rows = await cursor.fetchall()
-                    current_set = {r[0] for r in current_rows}
-                    supplied_set = set(ordered_task_ids)
-                    if supplied_set != current_set:
-                        await db.execute('ROLLBACK')
-                        return {
-                            'error': (
-                                f'reorder_pin_queue: ids do not match current pin queue. '
-                                f'supplied={sorted(supplied_set)!r}, '
-                                f'expected={sorted(current_set)!r}'
-                            ),
-                            'error_type': 'ValidationError',
-                        }
+                await db.execute('COMMIT')
+            except Exception:
+                with contextlib.suppress(Exception):
+                    await db.execute('ROLLBACK')
+                raise
+        finally:
+            await db.close()
 
-                    # Single-transaction rewrite. Mirrors overrides.py:318-326.
-                    for idx, tid in enumerate(ordered_task_ids, start=1):
-                        await db.execute(
-                            'UPDATE overrides SET pin_order=?, updated_at=? '
-                            'WHERE project_root=? AND task_id=?',
-                            (idx, now_iso, project_root, tid),
-                        )
-                    await db.execute('COMMIT')
-                except Exception:
-                    with contextlib.suppress(Exception):
-                        await db.execute('ROLLBACK')
-                    raise
-            finally:
-                await db.close()
-
-            await _emit_override_audit(
-                project_root,
-                'reorder_pin_queue',
-                None,
-                f'Reordered pin queue: {ordered_task_ids}',
-                {'ordered_task_ids': list(ordered_task_ids)},
-            )
-            return {'success': True}
-        except (asyncio.CancelledError, KeyboardInterrupt, SystemExit):
-            raise
-        except Exception as e:
-            logger.exception(f'reorder_pin_queue error: {e}')
-            return {'error': str(e), 'error_type': type(e).__name__}
+        await _emit_override_audit(
+            project_root,
+            'reorder_pin_queue',
+            None,
+            f'Reordered pin queue: {ordered_task_ids}',
+            {'ordered_task_ids': list(ordered_task_ids)},
+        )
+        return {'success': True}
 
     @mcp.tool()
+    @mcp_tool_errors()
     async def get_pin_queue(
         project_root: str,
     ) -> dict[str, Any]:
@@ -4242,38 +4087,33 @@ def create_mcp_server(
         if isinstance(_normalized, dict):
             return _normalized
         project_root = _normalized
+        db = await _open_overrides_db(project_root)
         try:
-            db = await _open_overrides_db(project_root)
-            try:
-                cursor = await db.execute(
-                    'SELECT task_id, boost_tier, pinned, pin_order, reserve_now, ttl_until '
-                    'FROM overrides '
-                    'WHERE project_root=? AND pinned=1 '
-                    'ORDER BY pin_order ASC',
-                    (project_root,),
-                )
-                rows = await cursor.fetchall()
-                pin_queue = [
-                    {
-                        'task_id': r[0],
-                        'boost_tier': r[1],
-                        'pinned': bool(r[2]),
-                        'pin_order': r[3],
-                        'reserve_now': bool(r[4]),
-                        'ttl_until': r[5],
-                    }
-                    for r in rows
-                ]
-                return {'pin_queue': pin_queue}
-            finally:
-                await db.close()
-        except (asyncio.CancelledError, KeyboardInterrupt, SystemExit):
-            raise
-        except Exception as e:
-            logger.exception(f'get_pin_queue error: {e}')
-            return {'error': str(e), 'error_type': type(e).__name__}
+            cursor = await db.execute(
+                'SELECT task_id, boost_tier, pinned, pin_order, reserve_now, ttl_until '
+                'FROM overrides '
+                'WHERE project_root=? AND pinned=1 '
+                'ORDER BY pin_order ASC',
+                (project_root,),
+            )
+            rows = await cursor.fetchall()
+            pin_queue = [
+                {
+                    'task_id': r[0],
+                    'boost_tier': r[1],
+                    'pinned': bool(r[2]),
+                    'pin_order': r[3],
+                    'reserve_now': bool(r[4]),
+                    'ttl_until': r[5],
+                }
+                for r in rows
+            ]
+            return {'pin_queue': pin_queue}
+        finally:
+            await db.close()
 
     @mcp.tool()
+    @mcp_tool_errors()
     async def get_scheduler_state(
         project_root: str,
     ) -> dict[str, Any]:
@@ -4297,15 +4137,10 @@ def create_mcp_server(
         if isinstance(_normalized, dict):
             return _normalized
         project_root = _normalized
-        try:
-            return await asyncio.to_thread(read_scheduler_state, Path(project_root))
-        except (asyncio.CancelledError, KeyboardInterrupt, SystemExit):
-            raise
-        except Exception as e:
-            logger.exception(f'get_scheduler_state error: {e}')
-            return {'error': str(e), 'error_type': type(e).__name__}
+        return await asyncio.to_thread(read_scheduler_state, Path(project_root))
 
     @mcp.tool()
+    @mcp_tool_errors()
     async def get_scheduler_events(
         project_root: str,
         since: str | None = None,
@@ -4334,20 +4169,15 @@ def create_mcp_server(
         if isinstance(_normalized, dict):
             return _normalized
         project_root = _normalized
-        try:
-            return await read_scheduler_events(
-                Path(project_root),
-                since=since,
-                limit=limit,
-                event_types=event_types,
-            )
-        except (asyncio.CancelledError, KeyboardInterrupt, SystemExit):
-            raise
-        except Exception as e:
-            logger.exception(f'get_scheduler_events error: {e}')
-            return {'error': str(e), 'error_type': type(e).__name__}
+        return await read_scheduler_events(
+            Path(project_root),
+            since=since,
+            limit=limit,
+            event_types=event_types,
+        )
 
     @mcp.tool()
+    @mcp_tool_errors()
     async def request_park_eviction(
         task_id: str,
         project_root: str,
@@ -4404,11 +4234,6 @@ def create_mcp_server(
             )
             await db.commit()
             return {'requested': True, 'task_id': task_id}
-        except (asyncio.CancelledError, KeyboardInterrupt, SystemExit):
-            raise
-        except Exception as e:
-            logger.exception(f'request_park_eviction error: {e}')
-            return {'error': str(e), 'error_type': type(e).__name__}
         finally:
             if db is not None:
                 await db.close()

@@ -238,3 +238,51 @@ async def test_gap_handlers_return_shape_identical_error_on_failure(mcp_server):
         'cancel_ticket', {'ticket_id': 'tkt_X'},
     )
     assert cancel_result == expected
+
+
+def test_all_registered_tools_carry_mcp_tool_errors_marker():
+    """Every handler registered via @mcp.tool() carries the __mcp_tool_errors__
+    marker (task epsilon: uniform application across the whole of tools.py,
+    not just the 4 gap handlers task delta covered). Asserts the property on
+    each tool by name rather than a hardcoded count, so this keeps working as
+    tools are added or removed.
+    """
+    mock_service = AsyncMock()
+    server = create_mcp_server(mock_service)
+
+    tools = server._tool_manager.list_tools()
+    assert tools, 'expected at least one registered tool'
+    for tool in tools:
+        assert getattr(tool.fn, '__mcp_tool_errors__', False) is True, (
+            f'{tool.name} is not decorated with @mcp_tool_errors()'
+        )
+
+
+def test_registered_tool_handlers_have_no_hand_copied_cancellation_guards():
+    """Source-scan drift guard, scoped to registered tool handlers only.
+
+    Once a handler is decorated with @mcp_tool_errors(), the cancellation
+    guard clause lives centrally in tool_errors.py — any reappearance in a
+    handler's own source means it was hand-written instead of decorated.
+
+    Scoped to each tool.fn's source (inspect.getsource follows the
+    functools.wraps __wrapped__ chain back to the undecorated handler) rather
+    than a whole-module text scan, so a legitimate non-tool helper elsewhere
+    in tools.py that genuinely needs this guard — or the needle showing up in
+    an unrelated comment/docstring — can't fail this test. The behavioral
+    marker test above (test_all_registered_tools_carry_mcp_tool_errors_marker)
+    already enforces the primary invariant; this adds the narrower "and it
+    wasn't hand-rolled alongside the decorator" drift check.
+    """
+    mock_service = AsyncMock()
+    server = create_mcp_server(mock_service)
+    needle = 'except (asyncio.CancelledError, KeyboardInterrupt, SystemExit):'
+
+    tools = server._tool_manager.list_tools()
+    assert tools, 'expected at least one registered tool'
+    for tool in tools:
+        handler_source = inspect.getsource(tool.fn)
+        assert needle not in handler_source, (
+            f'{tool.name} has a hand-copied cancellation-guard tail; '
+            f'use @mcp_tool_errors() instead'
+        )
