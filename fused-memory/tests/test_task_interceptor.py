@@ -4636,6 +4636,119 @@ class TestSubmitTaskGuardrail:
 
 
 # ---------------------------------------------------------------------------
+# Task 2206: submit_task end-to-end with a real multi-project registry wired
+# ---------------------------------------------------------------------------
+
+
+class TestSubmitTaskGuardrailMultiProject:
+    """End-to-end coverage of the FILES-certain / PROSE-advisory split
+    through the real ``submit_task`` persistence path (not just
+    ``_path_guard_or_skip`` in isolation).
+    """
+
+    @staticmethod
+    def _two_project_registry(tmp_path):
+        from fused_memory.middleware.project_prefix_registry import (
+            ProjectPrefixRegistry,
+        )
+
+        (tmp_path / 'reify').mkdir()
+        (tmp_path / 'reify' / 'crates').mkdir()
+        (tmp_path / 'dark-factory').mkdir()
+        (tmp_path / 'dark-factory' / 'fused-memory').mkdir()
+        return ProjectPrefixRegistry.from_roots(
+            [str(tmp_path / 'reify'), str(tmp_path / 'dark-factory')]
+        )
+
+    @pytest.mark.asyncio
+    async def test_prose_hit_with_registry_persists_ticket_with_advisory_metadata(
+        self,
+        interceptor_with_store,
+        ticket_store,
+        taskmaster,
+        tmp_path,
+    ):
+        """PROSE mentions another project's dir; metadata.files are all
+        in-project. The hit is a non-rejecting advisory: the ticket is
+        still created, and the persisted blob's metadata carries
+        possible_scope_mismatch (matched_paths + suggested_project)."""
+        interceptor_with_store._prefix_registry = self._two_project_registry(tmp_path)
+
+        try:
+            result = await interceptor_with_store.submit_task(
+                project_root=str(tmp_path / 'reify'),
+                title='Investigate fused-memory/harness deadlock',
+                description='See fused-memory/ for context',
+                metadata={'files': ['crates/widget.rs']},
+            )
+        finally:
+            await _cancel_interceptor_workers(interceptor_with_store)
+
+        assert isinstance(result, dict)
+        assert 'error_type' not in result, f'Expected no error, got: {result}'
+        ticket_id = result.get('ticket', '')
+        assert ticket_id.startswith('tkt_'), f'Expected tkt_-prefixed ticket, got: {result}'
+
+        db = ticket_store._db
+        assert db is not None
+        cursor = await db.execute(
+            'SELECT candidate_json FROM tickets WHERE ticket_id = ?',
+            (ticket_id,),
+        )
+        row = await cursor.fetchone()
+        assert row is not None, f'Expected persisted row for {ticket_id!r}'
+
+        blob = json.loads(row['candidate_json'])
+        meta = blob.get('metadata') or {}
+        marker = meta.get('possible_scope_mismatch')
+        assert marker is not None, (
+            f'Expected possible_scope_mismatch in blob metadata: {blob!r}'
+        )
+        assert marker['matched_paths'] == ['fused-memory/']
+        assert marker['suggested_project'] == 'dark_factory'
+
+    @pytest.mark.asyncio
+    async def test_files_owner_mismatch_with_registry_rejects_and_persists_nothing(
+        self,
+        interceptor_with_store,
+        ticket_store,
+        taskmaster,
+        tmp_path,
+    ):
+        """metadata.files point at another project's tree — FILES-certain is
+        a hard reject even though the prose is clean: no ticket row is
+        persisted and taskmaster.add_task is never called."""
+        interceptor_with_store._prefix_registry = self._two_project_registry(tmp_path)
+
+        try:
+            result = await interceptor_with_store.submit_task(
+                project_root=str(tmp_path / 'reify'),
+                title='Generic title, no prose hit',
+                description='nothing project-specific here',
+                metadata={'files': ['fused-memory/src/x.py']},
+            )
+        finally:
+            await _cancel_interceptor_workers(interceptor_with_store)
+
+        assert isinstance(result, dict)
+        assert result.get('error_type') == 'DarkFactoryPathScopeViolation', (
+            f'Expected DarkFactoryPathScopeViolation, got: {result}'
+        )
+        assert 'fused-memory/src/x.py' in result.get('matched_paths', []), (
+            f'Expected the offending file in matched_paths: {result}'
+        )
+        assert result.get('suggested_project') == 'dark_factory'
+
+        db = ticket_store._db
+        assert db is not None
+        cursor = await db.execute('SELECT COUNT(*) FROM tickets')
+        row = await cursor.fetchone()
+        assert row[0] == 0, f'Expected 0 tickets (rejected), found {row[0]}'
+
+        taskmaster.add_task.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
 # Unit tests for TaskInterceptor._extract_meta_files
 # ---------------------------------------------------------------------------
 
@@ -4996,37 +5109,36 @@ class TestPathGuardOrSkip:
     async def test_path_guard_or_skip_propagates_rejection(
         self,
         interceptor,
-        monkeypatch,
+        tmp_path,
     ):
-        """When _path_guard_check returns a rejection verdict, the helper
-        returns its to_error_dict() output.
-        """
-        from fused_memory.middleware.path_scope_guard import PathGuardVerdict
+        """When the FILES-certain check finds a metadata.files owner-mismatch,
+        the helper returns its to_error_dict() output directly (hard reject,
+        no LLM).
 
-        verdict = PathGuardVerdict(
-            outcome='rejection',
-            project_id='some_other_project',
-            matched_paths=('orchestrator/',),
-            suggested_project='dark_factory',
+        Repointed (task 2206): a PROSE-only hit is now a non-rejecting
+        advisory, so only a metadata.files mismatch still triggers
+        propagation of a rejection verdict from _path_guard_or_skip.
+        """
+        from fused_memory.middleware.project_prefix_registry import (
+            ProjectPrefixRegistry,
         )
 
-        def fake_build(kwargs):
-            return None
-
-        def fake_check(self, candidate, kwargs, project_id):
-            return verdict
-
-        monkeypatch.setattr(TaskInterceptor, '_build_candidate', staticmethod(fake_build))
-        monkeypatch.setattr(TaskInterceptor, '_path_guard_check', fake_check)
+        (tmp_path / 'dark-factory').mkdir()
+        (tmp_path / 'dark-factory' / 'orchestrator').mkdir()
+        registry = ProjectPrefixRegistry.from_roots([str(tmp_path / 'dark-factory')])
+        interceptor._prefix_registry = registry
 
         result = await interceptor._path_guard_or_skip(
-            {'prompt': 'something'},
+            {
+                'prompt': 'something',
+                'metadata': {'files': ['orchestrator/harness.py']},
+            },
             '/some/project_root',
             'some_other_project',
         )
         assert result is not None
         assert result.get('error_type') == 'DarkFactoryPathScopeViolation'
-        assert result.get('matched_paths') == ['orchestrator/']
+        assert result.get('matched_paths') == ['orchestrator/harness.py']
         assert result.get('suggested_project') == 'dark_factory'
 
     # -- Case 5: routing override skips both guards -----------------------
@@ -5077,37 +5189,223 @@ class TestPathGuardOrSkip:
     async def test_empty_routing_override_reason_does_not_skip_guards(
         self,
         interceptor,
-        monkeypatch,
+        tmp_path,
     ):
-        """With routing_override_reason='' (default), a rejecting _path_guard_check
-        still returns the error dict — behavior is unchanged.
-        """
-        from fused_memory.middleware.path_scope_guard import PathGuardVerdict
+        """With routing_override_reason='' (default), a rejecting FILES-certain
+        check still returns the error dict — behavior is unchanged: only a
+        non-empty override reason skips the guard, not merely its absence.
 
-        verdict = PathGuardVerdict(
-            outcome='rejection',
-            project_id='some_other_project',
-            matched_paths=('orchestrator/',),
-            suggested_project='dark_factory',
+        Repointed (task 2206): drives the rejection via a metadata.files
+        owner-mismatch since a PROSE-only hit is now a non-rejecting advisory.
+        """
+        from fused_memory.middleware.project_prefix_registry import (
+            ProjectPrefixRegistry,
         )
 
-        def fake_build(kwargs):
-            return None
-
-        def fake_check(self, candidate, kwargs, project_id):
-            return verdict
-
-        monkeypatch.setattr(TaskInterceptor, '_build_candidate', staticmethod(fake_build))
-        monkeypatch.setattr(TaskInterceptor, '_path_guard_check', fake_check)
+        (tmp_path / 'dark-factory').mkdir()
+        (tmp_path / 'dark-factory' / 'orchestrator').mkdir()
+        registry = ProjectPrefixRegistry.from_roots([str(tmp_path / 'dark-factory')])
+        interceptor._prefix_registry = registry
 
         result = await interceptor._path_guard_or_skip(
-            {'prompt': 'something'},
+            {
+                'prompt': 'something',
+                'metadata': {'files': ['orchestrator/harness.py']},
+            },
             '/some/project_root',
             'some_other_project',
             routing_override_reason='',
         )
         assert result is not None, 'Empty override must NOT skip the guard'
         assert result.get('error_type') == 'DarkFactoryPathScopeViolation'
+
+
+# ---------------------------------------------------------------------------
+# FILES-certain scope check (task 2206) — exact registry lookup, hard reject
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestFilesCertainScopeCheck:
+    """Task 2206: a metadata.files owner-mismatch is a CERTAIN, hard reject —
+    no LLM adjudication, unlike the heuristic prose scan."""
+
+    async def test_files_owner_mismatch_hard_rejects_and_escalates(
+        self,
+        interceptor,
+        tmp_path,
+    ):
+        from fused_memory.middleware.project_prefix_registry import (
+            ProjectPrefixRegistry,
+        )
+
+        (tmp_path / 'reify').mkdir()
+        (tmp_path / 'reify' / 'crates').mkdir()
+        (tmp_path / 'dark-factory').mkdir()
+        (tmp_path / 'dark-factory' / 'fused-memory').mkdir()
+        registry = ProjectPrefixRegistry.from_roots(
+            [str(tmp_path / 'reify'), str(tmp_path / 'dark-factory')]
+        )
+        interceptor._prefix_registry = registry
+
+        escalator_calls: list = []
+
+        class SpyEscalator:
+            def report_rejection(self, **kwargs):
+                escalator_calls.append(kwargs)
+
+        interceptor._scope_violation_escalator = SpyEscalator()
+
+        result = await interceptor._path_guard_or_skip(
+            {
+                'title': 'Generic title, no prose hit',
+                'metadata': {'files': ['fused-memory/src/x.py']},
+            },
+            str(tmp_path / 'reify'),
+            'reify',
+        )
+
+        assert result is not None
+        assert result.get('error_type') == 'DarkFactoryPathScopeViolation'
+        assert 'fused-memory/src/x.py' in result.get('matched_paths', [])
+        assert result.get('suggested_project') == 'dark_factory'
+        assert len(escalator_calls) == 1, (
+            f'Expected escalator called exactly once, got {len(escalator_calls)}'
+        )
+
+
+# ---------------------------------------------------------------------------
+# _path_guard_check is PROSE-ONLY (task 2206) — files are the certain
+# check's job; the heuristic prose scanner must never re-scan them.
+# ---------------------------------------------------------------------------
+
+
+class TestPathGuardCheckProseOnly:
+    """Task 2206: _path_guard_check scans title/description/details ONLY.
+
+    Concrete metadata.files entries are the FILES-certain check's job
+    (_files_scope_check / check_files_for_scope) — the prose helper must
+    never re-scan files_to_modify, or a file would be double-classified by
+    both the exact lookup and the regex-over-prose heuristic.
+    """
+
+    def test_files_to_modify_not_scanned_by_prose_check(self, interceptor, tmp_path):
+        from fused_memory.middleware.project_prefix_registry import (
+            ProjectPrefixRegistry,
+        )
+        from fused_memory.middleware.task_curator import CandidateTask
+
+        (tmp_path / 'reify').mkdir()
+        (tmp_path / 'reify' / 'crates').mkdir()
+        (tmp_path / 'dark-factory').mkdir()
+        (tmp_path / 'dark-factory' / 'fused-memory').mkdir()
+        registry = ProjectPrefixRegistry.from_roots(
+            [str(tmp_path / 'reify'), str(tmp_path / 'dark-factory')]
+        )
+        interceptor._prefix_registry = registry
+
+        candidate = CandidateTask(
+            title='Generic refactor',
+            description='',
+            details='',
+            files_to_modify=['fused-memory/src/x.py'],
+            priority='medium',
+        )
+        verdict = interceptor._path_guard_check(candidate, {}, 'reify')
+        assert verdict.outcome == 'ok'
+
+    def test_title_mention_still_scanned_by_prose_check(self, interceptor, tmp_path):
+        from fused_memory.middleware.project_prefix_registry import (
+            ProjectPrefixRegistry,
+        )
+        from fused_memory.middleware.task_curator import CandidateTask
+
+        (tmp_path / 'reify').mkdir()
+        (tmp_path / 'reify' / 'crates').mkdir()
+        (tmp_path / 'dark-factory').mkdir()
+        (tmp_path / 'dark-factory' / 'fused-memory').mkdir()
+        registry = ProjectPrefixRegistry.from_roots(
+            [str(tmp_path / 'reify'), str(tmp_path / 'dark-factory')]
+        )
+        interceptor._prefix_registry = registry
+
+        candidate = CandidateTask(
+            title='Edit fused-memory/X',
+            description='',
+            details='',
+            files_to_modify=[],
+            priority='medium',
+        )
+        verdict = interceptor._path_guard_check(candidate, {}, 'reify')
+        assert verdict.outcome == 'rejection'
+
+
+# ---------------------------------------------------------------------------
+# PROSE-ADVISORY (task 2206) — a heuristic-only hit no longer rejects
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestPathGuardOrSkipProseAdvisory:
+    """Task 2206: a PROSE-only heuristic hit (no metadata.files mismatch) is
+    a non-rejecting advisory — the task is still created, but
+    kwargs['metadata']['possible_scope_mismatch'] is attached and a
+    scope_violation escalation still fires (loud, non-blocking)."""
+
+    async def test_prose_hit_is_advisory_not_rejection(
+        self,
+        interceptor,
+        tmp_path,
+    ):
+        from fused_memory.middleware.project_prefix_registry import (
+            ProjectPrefixRegistry,
+        )
+
+        (tmp_path / 'reify').mkdir()
+        (tmp_path / 'reify' / 'crates').mkdir()
+        (tmp_path / 'dark-factory').mkdir()
+        (tmp_path / 'dark-factory' / 'fused-memory').mkdir()
+        registry = ProjectPrefixRegistry.from_roots(
+            [str(tmp_path / 'reify'), str(tmp_path / 'dark-factory')]
+        )
+        interceptor._prefix_registry = registry
+
+        escalator_calls: list = []
+
+        class SpyEscalator:
+            def report_rejection(self, **kwargs):
+                escalator_calls.append(kwargs)
+
+        interceptor._scope_violation_escalator = SpyEscalator()
+
+        fake_adjudicator = AsyncMock()
+        fake_adjudicator.adjudicate = AsyncMock()
+        interceptor._path_scope_adjudicator = fake_adjudicator
+
+        kwargs: dict[str, Any] = {
+            'title': 'Investigate fused-memory/harness deadlock',
+            'description': 'See fused-memory/ for context',
+        }
+        result = await interceptor._path_guard_or_skip(
+            kwargs,
+            str(tmp_path / 'reify'),
+            'reify',
+        )
+
+        assert result is None, f'Expected advisory (None), got error: {result!r}'
+        assert len(escalator_calls) == 1, (
+            f'Expected escalator called exactly once, got {len(escalator_calls)}'
+        )
+        assert escalator_calls[0]['matched_paths'] == ('fused-memory/',)
+        assert escalator_calls[0]['suggested_project'] == 'dark_factory'
+
+        meta = kwargs.get('metadata') or {}
+        marker = meta.get('possible_scope_mismatch')
+        assert marker is not None, f'Expected possible_scope_mismatch in metadata: {kwargs!r}'
+        assert marker['matched_paths'] == ['fused-memory/']
+        assert marker['suggested_project'] == 'dark_factory'
+
+        fake_adjudicator.adjudicate.assert_not_called()
 
 
 # ---------------------------------------------------------------------------
@@ -5170,13 +5468,17 @@ class TestMultiProjectRoutingWiring:
     async def test_rejection_fires_scope_violation_escalator(
         self,
         interceptor,
-        monkeypatch,
         tmp_path,
     ):
-        """A path-guard rejection invokes scope_violation_escalator.report_rejection
-        with project_root, matched_paths, and suggested_project from the verdict.
+        """A FILES-certain path-guard rejection invokes
+        scope_violation_escalator.report_rejection with project_root,
+        matched_paths, and suggested_project from the verdict.
+
+        Repointed (task 2206) from a PROSE-mention rejection to a
+        metadata.files owner-mismatch — prose hits are now a non-rejecting
+        advisory, so only a FILES-certain mismatch still triggers a hard
+        reject + escalation.
         """
-        from fused_memory.middleware.path_scope_guard import PathGuardVerdict
         from fused_memory.middleware.project_prefix_registry import (
             ProjectPrefixRegistry,
         )
@@ -5204,21 +5506,11 @@ class TestMultiProjectRoutingWiring:
 
         interceptor._scope_violation_escalator = FakeEscalator()
 
-        # Force a rejection verdict from the check function.
-        verdict = PathGuardVerdict(
-            outcome='rejection',
-            project_id='reify',
-            matched_paths=('fused-memory/',),
-            suggested_project='dark_factory',
-        )
-        monkeypatch.setattr(
-            TaskInterceptor,
-            '_path_guard_check',
-            lambda self, c, k, p: verdict,
-        )
-
         result = await interceptor._path_guard_or_skip(
-            {'title': 'Edit fused-memory/X'},
+            {
+                'title': 'Generic title, no prose hit',
+                'metadata': {'files': ['fused-memory/x.py']},
+            },
             str(tmp_path / 'reify'),
             'reify',
         )
@@ -5230,7 +5522,7 @@ class TestMultiProjectRoutingWiring:
         call = escalator_calls[0]
         assert call['project_root'] == str(tmp_path / 'reify')
         assert call['project_id'] == 'reify'
-        assert call['matched_paths'] == ('fused-memory/',)
+        assert call['matched_paths'] == ('fused-memory/x.py',)
         assert call['suggested_project'] == 'dark_factory'
         # suggested_root resolved from registry.
         assert call['suggested_root'] == str((tmp_path / 'dark-factory').resolve())
@@ -5238,11 +5530,14 @@ class TestMultiProjectRoutingWiring:
     async def test_escalator_failure_swallowed(
         self,
         interceptor,
-        monkeypatch,
         tmp_path,
     ):
-        """An escalator that raises must NOT turn the rejection into an exception."""
-        from fused_memory.middleware.path_scope_guard import PathGuardVerdict
+        """An escalator that raises must NOT turn the rejection into an exception.
+
+        Repointed (task 2206) to drive the rejection via a metadata.files
+        owner-mismatch (FILES-certain, still a hard reject) rather than a
+        prose-only hit (now a non-rejecting advisory).
+        """
         from fused_memory.middleware.project_prefix_registry import (
             ProjectPrefixRegistry,
         )
@@ -5257,35 +5552,81 @@ class TestMultiProjectRoutingWiring:
                 raise RuntimeError('boom')
 
         interceptor._scope_violation_escalator = BoomEscalator()
-        verdict = PathGuardVerdict(
-            outcome='rejection',
-            project_id='other',
-            matched_paths=('crates/',),
-            suggested_project='reify',
-        )
-        monkeypatch.setattr(
-            TaskInterceptor,
-            '_path_guard_check',
-            lambda self, c, k, p: verdict,
-        )
 
         # Must not raise.
         result = await interceptor._path_guard_or_skip(
-            {'title': 'crates/widget'},
+            {
+                'title': 'generic title',
+                'metadata': {'files': ['crates/widget.rs']},
+            },
             '/foo',
             'other',
         )
         assert result is not None
         assert result['error_type'] == 'DarkFactoryPathScopeViolation'
 
+    async def test_routing_override_short_circuits_files_certain_reject(
+        self,
+        interceptor,
+        tmp_path,
+    ):
+        """Task 2206: routing_override_reason must skip BOTH the FILES-certain
+        reject and the PROSE advisory — it is checked first, before
+        ``_files_scope_check`` even runs.
+
+        Drives a genuine metadata.files owner-mismatch (the same shape that
+        rejects hard in test_escalator_failure_swallowed) but with a
+        non-empty override reason: the submission must be allowed, the
+        escalator must NOT fire, and no possible_scope_mismatch marker may
+        be attached — a silent files-certain reject would otherwise still
+        leak a loud advisory even though the caller asked to bypass it.
+        """
+        from fused_memory.middleware.project_prefix_registry import (
+            ProjectPrefixRegistry,
+        )
+
+        (tmp_path / 'reify').mkdir()
+        (tmp_path / 'reify' / 'crates').mkdir()
+        registry = ProjectPrefixRegistry.from_roots([str(tmp_path / 'reify')])
+        interceptor._prefix_registry = registry
+
+        escalator_calls: list = []
+
+        class SpyEscalator:
+            def report_rejection(self, **kwargs):
+                escalator_calls.append(kwargs)
+
+        interceptor._scope_violation_escalator = SpyEscalator()
+
+        kwargs = {
+            'title': 'generic title',
+            'metadata': {'files': ['crates/widget.rs']},
+        }
+        result = await interceptor._path_guard_or_skip(
+            kwargs,
+            '/foo',
+            'other',
+            routing_override_reason='deliberate cross-cutting change',
+        )
+
+        assert result is None, f'Expected override to skip the reject, got: {result!r}'
+        assert escalator_calls == [], (
+            f'Escalator must NOT fire on a routing override, got: {escalator_calls}'
+        )
+        assert 'possible_scope_mismatch' not in (kwargs.get('metadata') or {}), (
+            f"Override must not leave a possible_scope_mismatch marker: {kwargs['metadata']!r}"
+        )
+
     @pytest.mark.asyncio
-    async def test_stage2_no_hit_adjudicator_not_called(
+    async def test_no_hit_adjudicator_not_consulted(
         self,
         interceptor,
         monkeypatch,
         tmp_path,
     ):
-        """NO-HIT hot path: when Stage-1 returns OK, the adjudicator is never called."""
+        """NO-HIT path: when the PROSE check returns OK, a wired adjudicator
+        is never consulted (task 2206 retired the inline Stage-2 call
+        entirely; renamed from test_stage2_no_hit_adjudicator_not_called)."""
         from unittest.mock import AsyncMock
 
         from fused_memory.middleware.path_scope_guard import PathGuardVerdict
@@ -5321,14 +5662,30 @@ class TestMultiProjectRoutingWiring:
         fake_adj.adjudicate.assert_not_called()
 
     @pytest.mark.asyncio
-    async def test_stage2_hit_reject_returns_error_with_llm_reason(
+    async def test_hit_ignores_wired_adjudicator_and_is_advisory(
         self,
         interceptor,
         monkeypatch,
         tmp_path,
     ):
-        """HIT + REJECT: adjudicator confirms misroute → error dict returned,
-        escalator called once carrying the adjudicator's llm_reason."""
+        """Task 2206: the inline Stage-2 adjudicator is retired from this method.
+
+        Even when an adjudicator is wired and configured to return a
+        confident 'reject' verdict — which under the pre-2206 contract
+        would have produced a hard-reject error dict carrying the LLM's
+        reason — a PROSE-only hit is now a non-rejecting advisory: the
+        adjudicator is never consulted, ``_path_guard_or_skip`` returns
+        ``None``, the escalation still fires (with ``llm_reason=None``,
+        since no LLM ran), and ``possible_scope_mismatch`` is attached to
+        ``kwargs['metadata']``.
+
+        Replaces the old test_stage2_hit_reject_returns_error_with_llm_reason
+        / test_stage2_hit_failsafe_rejects_and_escalates_with_reason /
+        test_stage2_hit_allow_permits_creation_no_escalation trio, whose
+        shared premise — that the adjudicator's verdict gates the
+        reject/failsafe/allow decision — no longer holds now that PROSE
+        hits never reject in the first place.
+        """
         from unittest.mock import AsyncMock
 
         from fused_memory.middleware.path_scope_adjudicator import AdjudicationVerdict
@@ -5375,152 +5732,26 @@ class TestMultiProjectRoutingWiring:
             lambda self, c, k, p: verdict,
         )
 
+        kwargs: dict[str, Any] = {'title': 'Edit fused-memory/X'}
         result = await interceptor._path_guard_or_skip(
-            {'title': 'Edit fused-memory/X'},
+            kwargs,
             str(tmp_path / 'reify'),
             'reify',
         )
-        # Rejection error dict returned.
-        assert result is not None
-        assert result['error_type'] == 'DarkFactoryPathScopeViolation'
-        # Escalator called exactly once with the LLM reason.
+        # Advisory (None), not a rejection — the wired adjudicator is
+        # irrelevant to the outcome and must not be consulted.
+        assert result is None
+        fake_adj.adjudicate.assert_not_called()
+        # Escalator still fires exactly once, with no LLM reason (no LLM ran).
         assert len(escalator_calls) == 1
         call = escalator_calls[0]
-        assert call['llm_reason'] == 'genuine misroute — task edits orchestrator/harness.py'
-
-    @pytest.mark.asyncio
-    async def test_stage2_hit_failsafe_rejects_and_escalates_with_reason(
-        self,
-        interceptor,
-        monkeypatch,
-        tmp_path,
-    ):
-        """HIT + FAIL-SAFE (uncertain/failed): LLM outage never lets misroute through;
-        escalator is called with llm_reason from the fail-safe verdict."""
-        from unittest.mock import AsyncMock
-
-        from fused_memory.middleware.path_scope_adjudicator import AdjudicationVerdict
-        from fused_memory.middleware.path_scope_guard import PathGuardVerdict
-        from fused_memory.middleware.project_prefix_registry import (
-            ProjectPrefixRegistry,
-        )
-
-        (tmp_path / 'reify').mkdir()
-        (tmp_path / 'reify' / 'crates').mkdir()
-        registry = ProjectPrefixRegistry.from_roots([str(tmp_path / 'reify')])
-        interceptor._prefix_registry = registry
-
-        # Fail-safe verdict (uncertain + failed — simulates breaker-open / hang).
-        failsafe_verdict = AdjudicationVerdict(
-            verdict='uncertain',
-            reason='breaker-open',
-            failed=True,
-            llm_used=False,
-        )
-        fake_adj = AsyncMock()
-        fake_adj.adjudicate = AsyncMock(return_value=failsafe_verdict)
-        interceptor._path_scope_adjudicator = fake_adj
-
-        escalator_calls: list = []
-
-        class SpyEscalator:
-            def report_rejection(self, **kwargs):
-                escalator_calls.append(kwargs)
-
-        interceptor._scope_violation_escalator = SpyEscalator()
-
-        verdict = PathGuardVerdict(
-            outcome='rejection',
-            project_id='other',
-            matched_paths=('crates/',),
-            suggested_project='reify',
-        )
-        monkeypatch.setattr(
-            TaskInterceptor,
-            '_path_guard_check',
-            lambda self, c, k, p: verdict,
-        )
-
-        result = await interceptor._path_guard_or_skip(
-            {'title': 'crates/widget'},
-            '/foo',
-            'other',
-        )
-        # Guard preserved — misroute rejected even with LLM outage.
-        assert result is not None
-        assert result['error_type'] == 'DarkFactoryPathScopeViolation'
-        # Escalated once, carrying the fail-safe reason.
-        assert len(escalator_calls) == 1
-        assert escalator_calls[0]['llm_reason'] == 'breaker-open'
-
-    @pytest.mark.asyncio
-    async def test_stage2_hit_allow_permits_creation_no_escalation(
-        self,
-        interceptor,
-        monkeypatch,
-        tmp_path,
-    ):
-        """HIT + ALLOW: adjudicator confident allow → creation permitted, no escalation."""
-        from unittest.mock import AsyncMock
-
-        from fused_memory.middleware.path_scope_adjudicator import AdjudicationVerdict
-        from fused_memory.middleware.path_scope_guard import PathGuardVerdict
-        from fused_memory.middleware.project_prefix_registry import (
-            ProjectPrefixRegistry,
-        )
-
-        (tmp_path / 'reify').mkdir()
-        (tmp_path / 'reify' / 'crates').mkdir()
-        (tmp_path / 'dark-factory').mkdir()
-        (tmp_path / 'dark-factory' / 'fused-memory').mkdir()
-        registry = ProjectPrefixRegistry.from_roots(
-            [str(tmp_path / 'reify'), str(tmp_path / 'dark-factory')]
-        )
-        interceptor._prefix_registry = registry
-
-        # Adjudicator returns confident allow.
-        allow_verdict = AdjudicationVerdict(
-            verdict='allow',
-            reason='incidental example mention in description',
-            llm_used=True,
-        )
-        fake_adj = AsyncMock()
-        fake_adj.adjudicate = AsyncMock(return_value=allow_verdict)
-        interceptor._path_scope_adjudicator = fake_adj
-
-        # Spy escalator — must NOT be called on allow.
-        escalator_calls: list = []
-
-        class SpyEscalator:
-            def report_rejection(self, **kwargs):
-                escalator_calls.append(kwargs)
-
-        interceptor._scope_violation_escalator = SpyEscalator()
-
-        # Force Stage-1 rejection.
-        verdict = PathGuardVerdict(
-            outcome='rejection',
-            project_id='reify',
-            matched_paths=('fused-memory/',),
-            suggested_project='dark_factory',
-        )
-        monkeypatch.setattr(
-            TaskInterceptor,
-            '_path_guard_check',
-            lambda self, c, k, p: verdict,
-        )
-
-        result = await interceptor._path_guard_or_skip(
-            {'title': 'Task mentioning fused-memory/ as example'},
-            str(tmp_path / 'reify'),
-            'reify',
-        )
-        # Adjudicator downgraded heuristic hit → creation permitted.
-        assert result is None
-        # Adjudicator was called exactly once.
-        fake_adj.adjudicate.assert_called_once()
-        # Escalator must NOT be called when adjudicator allows.
-        assert escalator_calls == []
+        assert call['llm_reason'] is None
+        assert call['matched_paths'] == ('fused-memory/',)
+        assert call['suggested_project'] == 'dark_factory'
+        # The advisory marker is attached to kwargs['metadata'].
+        marker = kwargs['metadata']['possible_scope_mismatch']
+        assert marker['matched_paths'] == ['fused-memory/']
+        assert marker['suggested_project'] == 'dark_factory'
 
 
 # ─────────────────────────────────────────────────────────────────────

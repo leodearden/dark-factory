@@ -20,6 +20,7 @@ when one is configured.
 from __future__ import annotations
 
 import re
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Literal
 
@@ -159,6 +160,45 @@ class PathGuardVerdict:
 # ---------------------------------------------------------------------------
 
 
+def _aggregate_owner_mismatches(
+    items: list[str],
+    project_id: str,
+    owner_of: Callable[[str], str | None],
+) -> tuple[list[str], str | None]:
+    """Classify *items* via *owner_of* and collect those owned by another project.
+
+    Shared aggregation core for :func:`_resolve_mismatches` (matched
+    prefixes from the regex-over-prose heuristic, classified via
+    :meth:`ProjectPrefixRegistry.project_for_prefix`) and
+    :func:`check_files_for_scope` (concrete file paths, classified via
+    :meth:`ProjectPrefixRegistry.project_for_path`).  The two callers differ
+    only in *what* ``owner_of`` resolves, not in how mismatches are
+    aggregated into a suggested target — factored out here (task 2206
+    review) so that logic can't drift out of sync between them.
+
+    Returns ``(mismatched_items, suggested_project)``.  An item is
+    mismatched when ``owner_of(item)`` returns a project_id other than
+    *project_id*; items with no registered owner (``owner_of`` returns
+    ``None``) are dropped from the result — an unclassifiable item is never
+    grounds for rejection, keeping the guard conservative.
+    ``suggested_project`` is the single shared owner of every mismatch, or
+    ``None`` when mismatches span more than one project.
+    """
+    mismatched: list[str] = []
+    owners: set[str] = set()
+    first_owner: str | None = None
+    for item in items:
+        owner = owner_of(item)
+        if owner is None or owner == project_id:
+            continue
+        mismatched.append(item)
+        if first_owner is None:
+            first_owner = owner
+        owners.add(owner)
+    suggested = first_owner if len(owners) == 1 else None
+    return mismatched, suggested
+
+
 def _resolve_mismatches(
     matched: list[str], project_id: str, registry: ProjectPrefixRegistry,
 ) -> tuple[list[str], str | None]:
@@ -169,20 +209,11 @@ def _resolve_mismatches(
     ``None`` when they span multiple projects.  Prefixes with no registered
     owner are dropped from the rejection (the registry could not classify
     them — ignoring them keeps the guard conservative).
+
+    Thin wrapper around :func:`_aggregate_owner_mismatches` bound to the
+    prefix-string lookup :meth:`ProjectPrefixRegistry.project_for_prefix`.
     """
-    mismatched: list[str] = []
-    owners: set[str] = set()
-    first_owner: str | None = None
-    for prefix in matched:
-        owner = registry.project_for_prefix(prefix)
-        if owner is None or owner == project_id:
-            continue
-        mismatched.append(prefix)
-        if first_owner is None:
-            first_owner = owner
-        owners.add(owner)
-    suggested = first_owner if len(owners) == 1 else None
-    return mismatched, suggested
+    return _aggregate_owner_mismatches(matched, project_id, registry.project_for_prefix)
 
 
 def check_candidate_for_scope(
@@ -217,6 +248,55 @@ def check_candidate_for_scope(
             suggested_project=suggested,
         )
     return PathGuardVerdict(outcome='ok', project_id=project_id)
+
+
+def check_files_for_scope(
+    files: list[str] | None,
+    project_id: str,
+    registry: ProjectPrefixRegistry,
+) -> PathGuardVerdict:
+    """Reject when any of *files* is owned by a project other than *project_id*.
+
+    CERTAIN counterpart to :func:`check_candidate_for_scope` /
+    :func:`check_text_for_scope`: classifies each concrete file path via
+    :meth:`ProjectPrefixRegistry.project_for_path` (exact leading-path-
+    component match) instead of the heuristic regex-over-prose
+    :func:`find_paths`.  Used by the interceptor's FILES-certain check
+    (task 2206) to hard-reject a submission whose ``metadata.files`` name a
+    path under a KNOWN other project's tree — no LLM adjudication, since an
+    exact owner lookup leaves nothing to adjudicate.
+
+    Returns ``ok`` when the registry is empty/falsy, *files* is empty/falsy,
+    or every file is either unowned or owned by *project_id*.  On a
+    mismatch, ``matched_paths`` carries the offending file paths (not
+    prefixes) and ``suggested_project`` is the single owner when all
+    mismatches share one, else ``None``.
+    """
+    if not registry or not files:
+        return PathGuardVerdict(outcome='ok', project_id=project_id)
+
+    mismatched: list[str] = []
+    owners: set[str] = set()
+    first_owner: str | None = None
+    for f in files:
+        owner = registry.project_for_path(f)
+        if owner is None or owner == project_id:
+            continue
+        mismatched.append(f)
+        if first_owner is None:
+            first_owner = owner
+        owners.add(owner)
+
+    if not mismatched:
+        return PathGuardVerdict(outcome='ok', project_id=project_id)
+
+    suggested = first_owner if len(owners) == 1 else None
+    return PathGuardVerdict(
+        outcome='rejection',
+        project_id=project_id,
+        matched_paths=tuple(mismatched),
+        suggested_project=suggested,
+    )
 
 
 def is_routing_override(routing_override_reason: str | None) -> bool:

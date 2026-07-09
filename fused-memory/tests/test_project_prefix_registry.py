@@ -155,6 +155,73 @@ class TestRegistryLookups:
 
 
 # ---------------------------------------------------------------------------
+# project_for_path — exact leading-path-component ownership lookup
+# ---------------------------------------------------------------------------
+
+
+class TestProjectForPath:
+    """Tests for ProjectPrefixRegistry.project_for_path.
+
+    Unlike project_for_prefix (exact prefix-string lookup) or the guard's
+    find_paths (regex-over-prose), this resolves an arbitrary file path to
+    its owning project via leading-path-component matching — the CERTAIN
+    signal that check_files_for_scope (task 2206) relies on for rejection.
+    """
+
+    @pytest.fixture
+    def registry(self, tmp_path):
+        a = _mkproj(tmp_path, 'reify', ['crates'])
+        b = _mkproj(tmp_path, 'dark-factory', ['fused-memory', 'orchestrator'])
+        return ProjectPrefixRegistry.from_roots([str(a), str(b)])
+
+    def test_owning_project_for_simple_path(self, registry):
+        assert registry.project_for_path('orchestrator/foo.py') == 'dark_factory'
+
+    def test_hyphenated_prefix_and_underscore_alias_both_resolve(self, registry):
+        assert registry.project_for_path('fused-memory/src/x.py') == 'dark_factory'
+        assert registry.project_for_path('fused_memory/x.py') == 'dark_factory'
+
+    def test_exact_dir_with_no_trailing_content(self, registry):
+        assert registry.project_for_path('crates') == 'reify'
+
+    def test_unowned_leading_component_returns_none(self, registry):
+        assert registry.project_for_path('unknown_dir/x') is None
+
+    def test_empty_string_returns_none(self, registry):
+        assert registry.project_for_path('') is None
+
+    def test_none_ish_returns_none(self, registry):
+        """An actual None (defensive — callers should only pass str) is None-ish too."""
+        assert registry.project_for_path(None) is None
+
+    def test_startswith_but_different_component_returns_none(self, registry):
+        """'cratesfoo/x' merely starts with the string 'crates' but is a
+        DIFFERENT leading component — must not match the 'crates/' prefix."""
+        assert registry.project_for_path('cratesfoo/x') is None
+
+    def test_prefix_mid_path_returns_none(self, registry):
+        """A prefix appearing as a non-leading segment must not match —
+        leading-component only, not substring/regex."""
+        assert registry.project_for_path('vendor/crates/x') is None
+
+    def test_leading_dot_slash_is_stripped(self, registry):
+        assert registry.project_for_path('./orchestrator/x') == 'dark_factory'
+
+    def test_longest_prefix_wins(self):
+        """When more than one registered prefix leads file_path, the longest wins.
+
+        Hand-built (not via from_roots/_mkproj): real directory-derived
+        prefixes are always single path components, so two of them can never
+        both be a leading run of the same file_path — this exercises the
+        tie-break directly.
+        """
+        registry = ProjectPrefixRegistry(
+            prefix_to_project={'a/': 'short_owner', 'a/b/': 'long_owner'},
+        )
+        assert registry.project_for_path('a/b/c.py') == 'long_owner'
+
+
+# ---------------------------------------------------------------------------
 # Edge: non-existent root does not crash
 # ---------------------------------------------------------------------------
 

@@ -14,6 +14,7 @@ from pathlib import Path
 from fused_memory.middleware.path_scope_guard import (
     PathGuardVerdict,
     check_candidate_for_scope,
+    check_files_for_scope,
     check_text_for_scope,
     find_paths,
     is_routing_override,
@@ -284,6 +285,71 @@ class TestCheckTextForScope:
         empty = ProjectPrefixRegistry.from_roots([])
         v = check_text_for_scope('fused-memory/X', 'reify', empty)
         assert v.outcome == 'ok'
+
+
+# ---------------------------------------------------------------------------
+# check_files_for_scope — CERTAIN classifier for concrete metadata.files
+# ---------------------------------------------------------------------------
+
+
+class TestCheckFilesForScope:
+    """Unit tests for check_files_for_scope — the CERTAIN files classifier.
+
+    Unlike check_candidate_for_scope / check_text_for_scope (regex-over-prose,
+    heuristic), this classifies each concrete file via
+    ProjectPrefixRegistry.project_for_path (exact leading-path-component
+    match).  Used by the interceptor's FILES-certain check (task 2206) to
+    hard-reject a submission whose metadata.files name a path under a KNOWN
+    other project's tree.
+    """
+
+    def test_files_all_in_submitting_project_are_ok(self, tmp_path):
+        registry = _two_project_registry(tmp_path)
+        v = check_files_for_scope(['crates/foo.rs'], 'reify', registry)
+        assert v.outcome == 'ok'
+        assert v.matched_paths == ()
+
+    def test_file_under_another_project_is_rejected(self, tmp_path):
+        registry = _two_project_registry(tmp_path)
+        v = check_files_for_scope(['fused-memory/src/x.py'], 'reify', registry)
+        assert v.outcome == 'rejection'
+        assert v.matched_paths == ('fused-memory/src/x.py',)
+        assert v.suggested_project == 'dark_factory'
+
+    def test_empty_files_is_ok(self, tmp_path):
+        registry = _two_project_registry(tmp_path)
+        v = check_files_for_scope([], 'reify', registry)
+        assert v.outcome == 'ok'
+
+    def test_none_files_is_ok(self, tmp_path):
+        registry = _two_project_registry(tmp_path)
+        v = check_files_for_scope(None, 'reify', registry)
+        assert v.outcome == 'ok'
+
+    def test_empty_registry_is_ok(self):
+        empty = ProjectPrefixRegistry.from_roots([])
+        v = check_files_for_scope(['fused-memory/src/x.py'], 'reify', empty)
+        assert v.outcome == 'ok'
+
+    def test_unowned_leading_component_is_ok(self, tmp_path):
+        registry = _two_project_registry(tmp_path)
+        v = check_files_for_scope(['random/thing.py'], 'reify', registry)
+        assert v.outcome == 'ok'
+
+    def test_files_spanning_two_other_projects_no_single_suggestion(self, tmp_path):
+        """When mismatched files span >1 other project, suggested_project is None."""
+        c_root = _mkproj(tmp_path, 'cthird', ['cthird_dir'])
+        registry = ProjectPrefixRegistry.from_roots([
+            str(_mkproj(tmp_path, 'reify', ['crates'])),
+            str(_mkproj(tmp_path, 'dark-factory', ['fused-memory'])),
+            str(c_root),
+        ])
+        v = check_files_for_scope(
+            ['fused-memory/x.py', 'crates/y.rs'], 'cthird', registry,
+        )
+        assert v.outcome == 'rejection'
+        assert set(v.matched_paths) == {'fused-memory/x.py', 'crates/y.rs'}
+        assert v.suggested_project is None
 
 
 # ---------------------------------------------------------------------------
