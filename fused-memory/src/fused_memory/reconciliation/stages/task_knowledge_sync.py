@@ -25,6 +25,7 @@ from fused_memory.models.reconciliation import (
     StageReport,
     Watermark,
 )
+from fused_memory.models.scope import ProjectRoot, ProjectScope
 from fused_memory.reconciliation.cli_stage_runner import (
     STAGE2_DISALLOWED,
     STAGE3_DISALLOWED,
@@ -190,7 +191,7 @@ def _suppress_same_run_human_operator_dups(
 async def _resolve_live_status(
     op: dict,
     taskmaster,
-    project_root: str,
+    project_root: ProjectRoot,
     status_cache: dict[str, str] | None,
     op_name: str,
     *,
@@ -273,7 +274,7 @@ async def _resolve_live_status(
 async def _classify_terminal_state_violations(
     ops: list[dict],
     taskmaster,
-    project_root: str,
+    project_root: ProjectRoot,
     agent_id: str,
     status_cache: dict[str, str] | None = None,
 ) -> list[dict]:
@@ -343,7 +344,7 @@ async def _classify_terminal_state_violations(
 async def _verify_set_task_status_post_action(
     ops: list[dict],
     taskmaster,
-    project_root: str,
+    project_root: ProjectRoot,
     agent_id: str,
     status_cache: dict[str, str] | None = None,
 ) -> list[dict]:
@@ -428,7 +429,7 @@ _STAGE2_STALL_SNAPSHOT_KEYS: tuple[str, ...] = ('snapshot_status', 'observed_sta
 async def _check_stall_guard_freshness(
     ops: list[dict],
     taskmaster,
-    project_root: str,
+    project_root: ProjectRoot,
     agent_id: str,
     status_cache: dict[str, str] | None = None,
 ) -> list[dict]:
@@ -516,7 +517,7 @@ async def _check_stall_guard_freshness(
 
 async def _classify_live_workflow_status_writes(
     ops: list[dict],
-    project_root: str,
+    project_root: ProjectRoot,
     agent_id: str,
     *,
     now=None,
@@ -1438,8 +1439,7 @@ async def _sweep_stale_flag_markers(
 async def _sweep_terminal_task_flag_markers(
     memory_service,
     taskmaster,
-    project_root: str,
-    project_id: str,
+    scope: ProjectScope,
     run_id: str,
     *,
     scroll_limit: int = 1000,
@@ -1479,9 +1479,8 @@ async def _sweep_terminal_task_flag_markers(
     ``_resolve_live_status`` pattern — so markers sharing a task_id (the
     incident's 150x2/132x3 pattern) collapse to a single Taskmaster call.
 
-    Degrades to a no-op when ``taskmaster`` or ``project_root`` is falsy
-    (mirrors ``flag_dedup.filter_terminal_metadata_flags``'s degradation
-    posture).
+    Degrades to a no-op when ``taskmaster`` is falsy (mirrors
+    ``flag_dedup.filter_terminal_metadata_flags``'s degradation posture).
 
     Enumerates deterministically via ``memory_service.get_memories_by_metadata``
     (Qdrant payload-filter scroll) — NEVER semantic search, which silently
@@ -1496,9 +1495,10 @@ async def _sweep_terminal_task_flag_markers(
             ``delete_memory``.
         taskmaster: Object with an async ``get_task(task_id, project_root)``
             method. Falsy => no-op (returns 0).
-        project_root: Project root passed through to ``get_task``. Falsy =>
-            no-op (returns 0).
-        project_id: Project scope for enumeration and delete calls.
+        scope: ``ProjectScope`` supplying ``project_root`` (passed through
+            to ``get_task``) and ``project_id`` (used for enumeration and
+            delete calls). A constructed ``ProjectScope`` always carries a
+            validated, non-empty root.
         run_id: Current reconciliation run identifier used as
             ``causation_id`` in the audit journal.
         scroll_limit: Max records to enumerate in one scroll (default 1000).
@@ -1507,12 +1507,12 @@ async def _sweep_terminal_task_flag_markers(
         Number of memories successfully deleted (0 if nothing is stale, on
         enumeration failure, or when degraded to a no-op).
     """
-    if not taskmaster or not project_root:
+    if not taskmaster:
         return 0
 
     try:
         members = await memory_service.get_memories_by_metadata(
-            project_id=project_id,
+            project_id=scope.project_id,
             filters={'source': 'stage1_flag_marker'},
             limit=scroll_limit,
         )
@@ -1520,8 +1520,8 @@ async def _sweep_terminal_task_flag_markers(
         logger.warning(
             'reconciliation._sweep_terminal_task_flag_markers: '
             'get_memories_by_metadata failed for project_id=%s; skipping sweep',
-            project_id,
-            extra={'project_id': project_id, 'run_id': run_id},
+            scope.project_id,
+            extra={'project_id': scope.project_id, 'run_id': run_id},
         )
         return 0
 
@@ -1532,7 +1532,7 @@ async def _sweep_terminal_task_flag_markers(
             'older terminal-task markers may remain uncollected this cycle; '
             're-run with a higher scroll_limit.',
             len(members), scroll_limit,
-            extra={'project_id': project_id, 'run_id': run_id},
+            extra={'project_id': scope.project_id, 'run_id': run_id},
         )
 
     if not members:
@@ -1564,7 +1564,7 @@ async def _sweep_terminal_task_flag_markers(
 
     async def _safe_get_task(component: str):
         try:
-            return await taskmaster.get_task(component, project_root)
+            return await taskmaster.get_task(component, scope.project_root)
         except Exception as exc:
             # A TaskmasterError carrying the not-found phrase means the
             # referenced task_id no longer exists (e.g. hard-deleted) — an
@@ -1578,14 +1578,14 @@ async def _sweep_terminal_task_flag_markers(
                     'reconciliation._sweep_terminal_task_flag_markers: '
                     'task_id=%s not found (expected during GC sweep): %s',
                     component, exc,
-                    extra={'project_id': project_id, 'run_id': run_id},
+                    extra={'project_id': scope.project_id, 'run_id': run_id},
                 )
             else:
                 logger.warning(
                     'reconciliation._sweep_terminal_task_flag_markers: '
                     'get_task failed for task_id=%s: %s',
                     component, exc,
-                    extra={'project_id': project_id, 'run_id': run_id},
+                    extra={'project_id': scope.project_id, 'run_id': run_id},
                 )
             return None  # KEEP marker on error (fail-safe)
 
@@ -1618,7 +1618,7 @@ async def _sweep_terminal_task_flag_markers(
         memory_service.delete_memory(
             memory_id=mid,
             store='mem0',
-            project_id=project_id,
+            project_id=scope.project_id,
             causation_id=run_id,
             _source=_STAGE1_FLAG_MARKER_TERMINAL_GC_SWEEP_SOURCE,
         )
@@ -1631,7 +1631,7 @@ async def _sweep_terminal_task_flag_markers(
             logger.warning(
                 'reconciliation._sweep_terminal_task_flag_markers: delete failed for memory_id=%s; not counted',
                 mid,
-                extra={'project_id': project_id, 'memory_id': mid, 'run_id': run_id},
+                extra={'project_id': scope.project_id, 'memory_id': mid, 'run_id': run_id},
             )
         else:
             success_count += 1
@@ -2460,7 +2460,7 @@ async def _write_escalation_markers(
 
 def _render_live_workflow_section(
     tasks: list[dict],
-    project_root: str,
+    project_root: ProjectRoot,
     *,
     now: datetime | None = None,
 ) -> str:
@@ -2506,7 +2506,7 @@ def _render_live_workflow_section(
         A Markdown section string (e.g. ``'### Live-Workflow Signals\\n...\\n'``),
         or ``''`` when no tasks are live.
     """
-    if not project_root or not tasks:
+    if not tasks:
         return ''
 
     # Hoist the project-level orchestrator check: it is constant for this
@@ -2844,10 +2844,10 @@ class TaskKnowledgeSync(BaseStage):
         # confirmed root cause of the 2026-07-05 solar_challenge_platform
         # incident's 16-record manual bulk GC). Runs unconditionally on both
         # full and remediation paths; degrades to a no-op (0) when taskmaster
-        # or project_root is unset. Explicit zero so downstream consumers
-        # never need a .get(..., 0) fallback.
+        # is unset. Explicit zero so downstream consumers never need a
+        # .get(..., 0) fallback.
         terminal_gc_swept = await _sweep_terminal_task_flag_markers(
-            self.memory, self.taskmaster, self.project_root, self.project_id, run_id,
+            self.memory, self.taskmaster, self.scope, run_id,
         )
         report.stats['terminal_task_flag_markers_gc_swept'] = terminal_gc_swept
 
@@ -2914,7 +2914,7 @@ class TaskKnowledgeSync(BaseStage):
         # Pre-fetch all unique task_ids referenced by stage-2 ops concurrently,
         # building a shared status_cache so Guards 1-3 avoid N+1 get_task calls.
         status_cache: dict[str, str] | None = None
-        if ops and self.taskmaster and self.project_root:
+        if ops and self.taskmaster:
             task_ids: set[str] = set()
             for op in ops:
                 if op.get('agent_id') != _stage_agent_id:
@@ -2977,9 +2977,9 @@ class TaskKnowledgeSync(BaseStage):
                     status_cache[tid] = extracted
 
         # Guard 1 — terminal-state pre-check
-        if self.taskmaster and self.project_root:
+        if self.taskmaster:
             terminal_violations = await _classify_terminal_state_violations(
-                ops, self.taskmaster, self.project_root, _stage_agent_id, status_cache
+                ops, self.taskmaster, self.scope.project_root, _stage_agent_id, status_cache
             )
             if terminal_violations:
                 report.stats['not_applicable_count'] = report.stats.get(
@@ -3002,9 +3002,9 @@ class TaskKnowledgeSync(BaseStage):
                     )
 
         # Guard 2 — stall-guard freshness gate
-        if self.taskmaster and self.project_root:
+        if self.taskmaster:
             freshness_violations = await _check_stall_guard_freshness(
-                ops, self.taskmaster, self.project_root, _stage_agent_id, status_cache
+                ops, self.taskmaster, self.scope.project_root, _stage_agent_id, status_cache
             )
             if freshness_violations:
                 report.stats['stall_guard_freshness_violations'] = report.stats.get(
@@ -3023,9 +3023,9 @@ class TaskKnowledgeSync(BaseStage):
                     )
 
         # Guard 3 — post-action set_task_status verification
-        if self.taskmaster and self.project_root:
+        if self.taskmaster:
             sts_mismatches = await _verify_set_task_status_post_action(
-                ops, self.taskmaster, self.project_root, _stage_agent_id, status_cache
+                ops, self.taskmaster, self.scope.project_root, _stage_agent_id, status_cache
             )
             if sts_mismatches:
                 report.stats['set_task_status_post_action_mismatches'] = report.stats.get(
@@ -3108,43 +3108,42 @@ class TaskKnowledgeSync(BaseStage):
         # (registered worktree / recent branch commits / orchestrator live).
         # The LLM's write already landed; this guard post-hoc flags the churn
         # (stats + log) for observability.  Actual prevention is the Stage 2 prompt.
-        if self.project_root:
-            live_workflow_violations = await _classify_live_workflow_status_writes(
-                ops, self.project_root, _stage_agent_id
+        live_workflow_violations = await _classify_live_workflow_status_writes(
+            ops, self.scope.project_root, _stage_agent_id
+        )
+        if live_workflow_violations:
+            report.stats['live_workflow_status_writes'] = report.stats.get(
+                'live_workflow_status_writes', 0
+            ) + len(live_workflow_violations)
+            report.stats['tasks_modified'] = max(
+                0,
+                report.stats.get('tasks_modified', 0) - len(live_workflow_violations),
             )
-            if live_workflow_violations:
-                report.stats['live_workflow_status_writes'] = report.stats.get(
-                    'live_workflow_status_writes', 0
-                ) + len(live_workflow_violations)
-                report.stats['tasks_modified'] = max(
-                    0,
-                    report.stats.get('tasks_modified', 0) - len(live_workflow_violations),
+            for v in live_workflow_violations:
+                logger.info(
+                    'reconciliation.live_workflow_status_write_suppressed',
+                    extra={
+                        'run_id': run_id,
+                        'project_id': self.project_id,
+                        'task_id': v['task_id'],
+                        'op_id': v['op_id'],
+                    },
                 )
-                for v in live_workflow_violations:
-                    logger.info(
-                        'reconciliation.live_workflow_status_write_suppressed',
-                        extra={
-                            'run_id': run_id,
-                            'project_id': self.project_id,
-                            'task_id': v['task_id'],
-                            'op_id': v['op_id'],
-                        },
-                    )
 
     async def _maybe_queue_briefing_refresh_tasks(self, run_id: str = '') -> None:
         """Best-effort: queue 'Refresh briefing' tasks for each briefing-known-gaps mismatch.
 
-        Silently skips if project_root or taskmaster is absent, or if project_id
-        is not in ``_BRIEFING_REFRESH_PROJECT_ALLOWLIST`` (reify-specific feature).
-        Any exception is caught and logged as a WARNING so a broken script can
+        Silently skips if taskmaster is absent, or if project_id is not in
+        ``_BRIEFING_REFRESH_PROJECT_ALLOWLIST`` (reify-specific feature). Any
+        exception is caught and logged as a WARNING so a broken script can
         never abort Stage 2.
         """
-        if not self.project_root or not self.taskmaster:
+        if not self.taskmaster:
             return
         if self.project_id not in _BRIEFING_REFRESH_PROJECT_ALLOWLIST:
             return
         try:
-            mismatches = await _run_briefing_known_gaps_script(self.project_root)
+            mismatches = await _run_briefing_known_gaps_script(self.scope.project_root)
             if not mismatches:
                 return
             # Avoid a redundant get_tasks round-trip when the harness has
@@ -3160,7 +3159,7 @@ class TaskKnowledgeSync(BaseStage):
                 )
             summary = await _queue_briefing_refresh_tasks(
                 self.taskmaster,
-                self.project_root,
+                self.scope.project_root,
                 mismatches,
                 existing_tasks=existing_tasks,
                 run_id=run_id,
@@ -3257,7 +3256,7 @@ class TaskKnowledgeSync(BaseStage):
         # carry done_provenance (legacy tree, warn-only rollout).
         provenance_section = await _render_done_provenance_section(
             filtered.done_tasks,
-            self.project_root,
+            self.scope.project_root,
         )
 
         remediation_note = ''
@@ -3287,10 +3286,10 @@ class TaskKnowledgeSync(BaseStage):
         # Only active tasks are inspected (done/cancelled tasks cannot have live workflows).
         # Empty string when no active tasks are live (keeps the payload tight).
         live_workflow_section = ''
-        if self.project_root and filtered.active_tasks:
+        if filtered.active_tasks:
             live_workflow_section = _render_live_workflow_section(
                 filtered.active_tasks,
-                self.project_root,
+                self.scope.project_root,
             )
 
         # Call render_active_section once to get both the visible-task list (for
@@ -4009,7 +4008,7 @@ def _format_flagged(
 
 async def _render_done_provenance_section(
     done_tasks: list[dict],
-    project_root: str | None,
+    project_root: ProjectRoot | None,
     *,
     max_files_per_task: int = 50,
     max_chars_per_task: int = 2000,
@@ -4067,7 +4066,7 @@ async def _render_done_provenance_section(
 
 
 async def _git_show_name_only(
-    project_root: str,
+    project_root: ProjectRoot,
     commit: str,
     *,
     max_files: int,
@@ -4183,7 +4182,7 @@ def _needs_hint_conversion(task: dict) -> bool:
     return not task_hints
 
 
-async def _run_briefing_known_gaps_script(project_root: str) -> list[dict] | None:
+async def _run_briefing_known_gaps_script(project_root: ProjectRoot) -> list[dict] | None:
     """Run reify's refresh_briefing_known_gaps.py in --json mode.
 
     Returns a list of mismatch dicts when mismatches are present, an empty list
@@ -4262,7 +4261,7 @@ async def _run_briefing_known_gaps_script(project_root: str) -> list[dict] | Non
 
 async def _queue_briefing_refresh_tasks(
     taskmaster: TaskBackendProtocol,
-    project_root: str,
+    project_root: ProjectRoot,
     mismatches: list[dict],
     existing_tasks: list[dict] | None = None,
     run_id: str = '',

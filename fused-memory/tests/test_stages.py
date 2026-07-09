@@ -3594,7 +3594,7 @@ class TestBriefingKnownGapsRefresh:
         """No scripts/refresh_briefing_known_gaps.py → returns None without subprocess."""
         # tmp_path has neither the script nor the briefing file
         with patch('asyncio.create_subprocess_exec') as mock_subproc:
-            result = await _run_briefing_known_gaps_script(str(tmp_path))
+            result = await _run_briefing_known_gaps_script(ProjectRoot(str(tmp_path)))
 
         assert result is None
         mock_subproc.assert_not_called()
@@ -3609,7 +3609,7 @@ class TestBriefingKnownGapsRefresh:
         # review/briefing.yaml intentionally absent
 
         with patch('asyncio.create_subprocess_exec') as mock_subproc:
-            result = await _run_briefing_known_gaps_script(str(tmp_path))
+            result = await _run_briefing_known_gaps_script(ProjectRoot(str(tmp_path)))
 
         assert result is None
         mock_subproc.assert_not_called()
@@ -3635,7 +3635,7 @@ class TestBriefingKnownGapsRefresh:
         mock_proc.communicate = AsyncMock(return_value=(stdout_bytes, b''))
 
         with patch('asyncio.create_subprocess_exec', return_value=mock_proc) as mock_exec:
-            result = await _run_briefing_known_gaps_script(str(tmp_path))
+            result = await _run_briefing_known_gaps_script(ProjectRoot(str(tmp_path)))
 
         assert result == mismatch_data
 
@@ -3672,7 +3672,7 @@ class TestBriefingKnownGapsRefresh:
             logging.WARNING,
             logger='fused_memory.reconciliation.stages.task_knowledge_sync',
         ):
-            result = await _run_briefing_known_gaps_script(str(tmp_path))
+            result = await _run_briefing_known_gaps_script(ProjectRoot(str(tmp_path)))
 
         assert result is None
         warning_records = [
@@ -3701,7 +3701,7 @@ class TestBriefingKnownGapsRefresh:
             {'task_id': '1820', 'title': 'Other', 'subproject': 'orchestrator', 'what': 'Other gap'},
         ]
 
-        await _queue_briefing_refresh_tasks(taskmaster, '/tmp/p', mismatches)
+        await _queue_briefing_refresh_tasks(taskmaster, ProjectRoot('/tmp/p'), mismatches)
 
         assert taskmaster.add_task.call_count == 2
 
@@ -3727,7 +3727,7 @@ class TestBriefingKnownGapsRefresh:
 
         mismatches = [{'task_id': '1751', 'title': 'Foo', 'subproject': 'bar', 'what': 'gap'}]
 
-        result = await _queue_briefing_refresh_tasks(taskmaster, '/tmp/p', mismatches)
+        result = await _queue_briefing_refresh_tasks(taskmaster, ProjectRoot('/tmp/p'), mismatches)
 
         taskmaster.add_task.assert_not_called()
         assert '1751' in result['skipped']
@@ -3747,7 +3747,7 @@ class TestBriefingKnownGapsRefresh:
 
         mismatches = [{'task_id': '1751', 'title': 'Foo', 'subproject': 'bar', 'what': 'gap'}]
 
-        result = await _queue_briefing_refresh_tasks(taskmaster, '/tmp/p', mismatches)
+        result = await _queue_briefing_refresh_tasks(taskmaster, ProjectRoot('/tmp/p'), mismatches)
 
         taskmaster.add_task.assert_called_once()
         assert '1751' not in result['skipped']
@@ -3775,7 +3775,7 @@ class TestBriefingKnownGapsRefresh:
 
         mismatches = [{'task_id': '1751', 'title': 'Foo', 'subproject': 'bar', 'what': 'gap'}]
 
-        result = await _queue_briefing_refresh_tasks(taskmaster, '/tmp/p', mismatches)
+        result = await _queue_briefing_refresh_tasks(taskmaster, ProjectRoot('/tmp/p'), mismatches)
 
         # Neither near-miss deduped → add_task must be called exactly once
         taskmaster.add_task.assert_called_once()
@@ -4015,7 +4015,7 @@ class TestBriefingKnownGapsRefresh:
             logging.WARNING,
             logger='fused_memory.reconciliation.stages.task_knowledge_sync',
         ):
-            result = await _run_briefing_known_gaps_script(str(tmp_path))
+            result = await _run_briefing_known_gaps_script(ProjectRoot(str(tmp_path)))
 
         assert result is None
         mock_proc.kill.assert_called_once()
@@ -4052,7 +4052,7 @@ class TestBriefingKnownGapsRefresh:
             logging.WARNING,
             logger='fused_memory.reconciliation.stages.task_knowledge_sync',
         ):
-            result = await _run_briefing_known_gaps_script(str(tmp_path))
+            result = await _run_briefing_known_gaps_script(ProjectRoot(str(tmp_path)))
 
         assert result is None
         warning_records = [
@@ -4082,7 +4082,7 @@ class TestBriefingKnownGapsRefresh:
             logging.WARNING,
             logger='fused_memory.reconciliation.stages.task_knowledge_sync',
         ):
-            result = await _queue_briefing_refresh_tasks(taskmaster, '/tmp/p', mismatches)
+            result = await _queue_briefing_refresh_tasks(taskmaster, ProjectRoot('/tmp/p'), mismatches)
 
         assert result['failed'] == ['1751']
         assert result['created'] == []
@@ -4140,7 +4140,7 @@ class TestBriefingKnownGapsRefresh:
             logging.WARNING,
             logger='fused_memory.reconciliation.stages.task_knowledge_sync',
         ):
-            result = await _queue_briefing_refresh_tasks(taskmaster, '/tmp/p', mismatches)
+            result = await _queue_briefing_refresh_tasks(taskmaster, ProjectRoot('/tmp/p'), mismatches)
 
         assert result['created'] == [], (
             f'created should be [] when add_task returns {bogus_result!r}, got {result["created"]!r}'
@@ -4189,7 +4189,7 @@ class TestBriefingKnownGapsRefresh:
             logging.WARNING,
             logger='fused_memory.reconciliation.stages.task_knowledge_sync',
         ):
-            result = await _queue_briefing_refresh_tasks(taskmaster, '/tmp/p', mismatches)
+            result = await _queue_briefing_refresh_tasks(taskmaster, ProjectRoot('/tmp/p'), mismatches)
 
         assert result['created'] == ['100', '300'], (
             f'expected created=[100, 300], got {result["created"]!r}'
@@ -6534,7 +6534,7 @@ class TestSweepTerminalTaskFlagMarkers:
         taskmaster.get_task = AsyncMock(side_effect=_get_task)
 
         result = await _sweep_terminal_task_flag_markers(
-            memory_service, taskmaster, '/home/leo/src/reify', 'reify', 'r1',
+            memory_service, taskmaster, _scope('reify', '/home/leo/src/reify'), 'r1',
         )
 
         assert result == 2
@@ -6587,7 +6587,7 @@ class TestSweepTerminalTaskFlagMarkers:
         taskmaster.get_task = AsyncMock(side_effect=_get_task)
 
         result = await _sweep_terminal_task_flag_markers(
-            memory_service, taskmaster, '/home/leo/src/reify', 'reify', 'r1',
+            memory_service, taskmaster, _scope('reify', '/home/leo/src/reify'), 'r1',
         )
 
         assert result == 0
@@ -6628,7 +6628,7 @@ class TestSweepTerminalTaskFlagMarkers:
         taskmaster.get_task = AsyncMock(return_value={'status': 'done'})
 
         result = await _sweep_terminal_task_flag_markers(
-            memory_service, taskmaster, '/home/leo/src/reify', 'reify', 'r1',
+            memory_service, taskmaster, _scope('reify', '/home/leo/src/reify'), 'r1',
         )
 
         assert result == 0
@@ -6655,7 +6655,7 @@ class TestSweepTerminalTaskFlagMarkers:
         taskmaster.get_task = AsyncMock(side_effect=RuntimeError('taskmaster down'))
 
         result = await _sweep_terminal_task_flag_markers(
-            memory_service, taskmaster, '/home/leo/src/reify', 'reify', 'r1',
+            memory_service, taskmaster, _scope('reify', '/home/leo/src/reify'), 'r1',
         )
 
         assert result == 0
@@ -6699,7 +6699,7 @@ class TestSweepTerminalTaskFlagMarkers:
         taskmaster.get_task = AsyncMock(side_effect=_get_task)
 
         result = await _sweep_terminal_task_flag_markers(
-            memory_service, taskmaster, '/home/leo/src/reify', 'reify', 'r1',
+            memory_service, taskmaster, _scope('reify', '/home/leo/src/reify'), 'r1',
         )
 
         assert result == 0
@@ -6725,7 +6725,7 @@ class TestSweepTerminalTaskFlagMarkers:
             logger='fused_memory.reconciliation.stages.task_knowledge_sync',
         ):
             result = await _sweep_terminal_task_flag_markers(
-                memory_service, taskmaster, '/home/leo/src/reify', 'reify', 'r1',
+                memory_service, taskmaster, _scope('reify', '/home/leo/src/reify'), 'r1',
             )
 
         assert result == 0
@@ -6746,7 +6746,7 @@ class TestSweepTerminalTaskFlagMarkers:
         taskmaster.get_task = AsyncMock(return_value={'status': 'done'})
 
         result = await _sweep_terminal_task_flag_markers(
-            memory_service, taskmaster, '/home/leo/src/reify', 'reify', 'r1',
+            memory_service, taskmaster, _scope('reify', '/home/leo/src/reify'), 'r1',
         )
 
         assert result == 0
@@ -6787,7 +6787,7 @@ class TestSweepTerminalTaskFlagMarkers:
         taskmaster.get_task = AsyncMock(return_value={'status': 'done'})
 
         result = await _sweep_terminal_task_flag_markers(
-            memory_service, taskmaster, '/home/leo/src/reify', 'reify', 'r1',
+            memory_service, taskmaster, _scope('reify', '/home/leo/src/reify'), 'r1',
         )
 
         assert result == 1
@@ -6826,7 +6826,7 @@ class TestSweepTerminalTaskFlagMarkers:
             logger='fused_memory.reconciliation.stages.task_knowledge_sync',
         ):
             result = await _sweep_terminal_task_flag_markers(
-                memory_service, taskmaster, '/home/leo/src/reify', 'reify', 'r1',
+                memory_service, taskmaster, _scope('reify', '/home/leo/src/reify'), 'r1',
             )
 
         assert result == 1
@@ -6863,17 +6863,17 @@ class TestSweepTerminalTaskFlagMarkers:
             logger='fused_memory.reconciliation.stages.task_knowledge_sync',
         ):
             await _sweep_terminal_task_flag_markers(
-                memory_service, taskmaster, '/home/leo/src/reify', 'reify', 'r1', scroll_limit=3,
+                memory_service, taskmaster, _scope('reify', '/home/leo/src/reify'), 'r1', scroll_limit=3,
             )
 
         warning_records = [r for r in caplog.records if r.levelno >= logging.WARNING]
         assert len(warning_records) >= 1
 
     @pytest.mark.asyncio
-    async def test_degrades_to_noop_when_taskmaster_or_project_root_falsy(self):
-        """No taskmaster and no project_root => returns 0 with NO enumeration
-        and NO get_task call (mirrors flag_dedup.filter_terminal_metadata_flags'
-        degradation posture)."""
+    async def test_degrades_to_noop_when_taskmaster_none(self):
+        """No taskmaster => returns 0 with NO enumeration and NO get_task call
+        (mirrors flag_dedup.filter_terminal_metadata_flags' degradation
+        posture)."""
         from fused_memory.reconciliation.stages.task_knowledge_sync import (
             _sweep_terminal_task_flag_markers,
         )
@@ -6885,14 +6885,10 @@ class TestSweepTerminalTaskFlagMarkers:
         taskmaster.get_task = AsyncMock(return_value={'status': 'done'})
 
         result_no_taskmaster = await _sweep_terminal_task_flag_markers(
-            memory_service, None, '/home/leo/src/reify', 'reify', 'r1',
-        )
-        result_no_project_root = await _sweep_terminal_task_flag_markers(
-            memory_service, taskmaster, '', 'reify', 'r1',
+            memory_service, None, _scope('reify', '/home/leo/src/reify'), 'r1',
         )
 
         assert result_no_taskmaster == 0
-        assert result_no_project_root == 0
         memory_service.get_memories_by_metadata.assert_not_awaited()
         taskmaster.get_task.assert_not_awaited()
 
@@ -6925,7 +6921,7 @@ class TestSweepTerminalTaskFlagMarkers:
         taskmaster.get_task = AsyncMock(return_value={'status': 'done'})
 
         result = await _sweep_terminal_task_flag_markers(
-            memory_service, taskmaster, '/home/leo/src/reify', 'reify', 'r1',
+            memory_service, taskmaster, _scope('reify', '/home/leo/src/reify'), 'r1',
         )
 
         assert result == 2
@@ -6957,7 +6953,7 @@ class TestSweepTerminalTaskFlagMarkers:
         taskmaster.get_task = AsyncMock(side_effect=_get_task)
 
         result = await _sweep_terminal_task_flag_markers(
-            memory_service, taskmaster, '/home/leo/src/reify', 'reify', 'r1',
+            memory_service, taskmaster, _scope('reify', '/home/leo/src/reify'), 'r1',
         )
 
         assert result == 1
@@ -6992,7 +6988,7 @@ class TestSweepTerminalTaskFlagMarkers:
         taskmaster.get_task = AsyncMock(side_effect=_get_task)
 
         result = await _sweep_terminal_task_flag_markers(
-            memory_service, taskmaster, '/home/leo/src/reify', 'reify', 'r1',
+            memory_service, taskmaster, _scope('reify', '/home/leo/src/reify'), 'r1',
         )
 
         assert result == 0
@@ -7027,7 +7023,7 @@ class TestSweepTerminalTaskFlagMarkers:
         taskmaster.get_task = AsyncMock(side_effect=_get_task)
 
         result = await _sweep_terminal_task_flag_markers(
-            memory_service, taskmaster, '/home/leo/src/reify', 'reify', 'r1',
+            memory_service, taskmaster, _scope('reify', '/home/leo/src/reify'), 'r1',
         )
 
         assert result == 0
@@ -7058,7 +7054,7 @@ class TestSweepTerminalTaskFlagMarkers:
         taskmaster.get_task = AsyncMock(return_value={'status': 'done'})
 
         result = await _sweep_terminal_task_flag_markers(
-            memory_service, taskmaster, '/home/leo/src/reify', 'reify', 'r1',
+            memory_service, taskmaster, _scope('reify', '/home/leo/src/reify'), 'r1',
         )
 
         assert result == 0
@@ -7094,7 +7090,7 @@ class TestSweepTerminalTaskFlagMarkers:
         taskmaster.get_task = AsyncMock(return_value={'status': 'done'})
 
         result = await _sweep_terminal_task_flag_markers(
-            memory_service, taskmaster, '/home/leo/src/reify', 'reify', 'r1',
+            memory_service, taskmaster, _scope('reify', '/home/leo/src/reify'), 'r1',
         )
 
         assert result == 2
@@ -8560,8 +8556,7 @@ class TestTaskKnowledgeSyncTerminalTaskFlagMarkersGcSweptStat:
     @pytest.mark.asyncio
     async def test_terminal_task_flag_markers_gc_swept_stat_set_after_run(self, mock_deps):
         """run() calls _sweep_terminal_task_flag_markers(self.memory, self.taskmaster,
-        self.project_root, self.project_id, run_id) and injects its return value into
-        report.stats."""
+        self.scope, run_id) and injects its return value into report.stats."""
         from datetime import UTC, datetime
         from unittest.mock import AsyncMock as AM
         from unittest.mock import patch
@@ -8601,7 +8596,7 @@ class TestTaskKnowledgeSyncTerminalTaskFlagMarkersGcSweptStat:
         assert report.stats.get('terminal_task_flag_markers_gc_swept') == 2
         mock_sweep.assert_awaited_once_with(
             mock_deps['memory_service'], mock_deps['taskmaster'],
-            '/home/leo/src/reify', 'reify', 'test-run',
+            _scope('reify', '/home/leo/src/reify'), 'test-run',
         )
 
     @pytest.mark.asyncio
@@ -9534,6 +9529,54 @@ class TestStage3PayloadIncludesProjectRoot:
         )
 
 
+class TestMemoryConsolidatorPayloadIncludesProjectRoot:
+    """MemoryConsolidator.assemble_payload() emits an unconditional Use project_root="..." directive.
+
+    Characterization test for task 2150 step-5: pins the always-emit behavior
+    that survives step-6's deletion of _build_project_root_directive's dead
+    `if not self.project_root: return ''` branch. A stage is only constructible
+    with a validated ProjectScope, so project_root is always a non-empty
+    absolute path and the directive is always emitted — there is no remaining
+    '' case to pin (β/task 2146 already removed the 3 empty-root TestStage1
+    cases).
+    """
+
+    @pytest.fixture
+    def memory_mock(self):
+        m = AsyncMock()
+        m.get_episodes = AsyncMock(return_value=[])
+        m.mem0 = AsyncMock()
+        m.mem0.get_all = AsyncMock(return_value={'results': []})
+        m.get_status = AsyncMock(return_value={})
+        return m
+
+    @pytest.fixture
+    def mock_deps(self, memory_mock):
+        config = ReconciliationConfig(enabled=True, explore_codebase_root='/tmp/test')
+        return {
+            'memory_service': memory_mock,
+            'taskmaster': AsyncMock(),
+            'journal': AsyncMock(),
+            'config': config,
+            'scope': _scope('reify', '/home/leo/src/reify'),
+        }
+
+    @pytest.mark.asyncio
+    async def test_memory_consolidator_payload_emits_use_project_root_directive(self, mock_deps):
+        """assemble_payload() must contain Use project_root="/home/leo/src/reify"."""
+        stage = MemoryConsolidator(StageId.memory_consolidator, **mock_deps)
+        stage.episode_limit = 125
+        stage.memory_limit = 250
+
+        watermark = Watermark(project_id='reify')
+        payload = await stage.assemble_payload([], watermark, [])
+
+        assert 'Use project_root="/home/leo/src/reify"' in payload, (
+            f'Stage 1 payload must contain Use project_root="..." directive '
+            f'(task 2150 step-5). Got payload:\n{payload[-500:]}'
+        )
+
+
 # ---------------------------------------------------------------------------
 # Task 1154 — Stage 2 same-run Stage 1 human_operator_required suppression
 # ---------------------------------------------------------------------------
@@ -10049,7 +10092,7 @@ class TestTaskKnowledgeSyncStage2Guards:
             taskmaster = AsyncMock()
             op = self._make_op(operation='update_task', params={'task_id': '42'})
             result = await _resolve_live_status(
-                op, taskmaster, '/project', {'42': 'done'},
+                op, taskmaster, ProjectRoot('/project'), {'42': 'done'},
                 '_classify_terminal_state_violations',
             )
             assert result == ('42', 'done')
@@ -10064,7 +10107,7 @@ class TestTaskKnowledgeSyncStage2Guards:
                 params={'task_id': '7', 'status': 'done'},
             )
             result = await _resolve_live_status(
-                op, taskmaster, '/project', {'7': 'pending'},
+                op, taskmaster, ProjectRoot('/project'), {'7': 'pending'},
                 '_verify_set_task_status_post_action',
             )
             assert result == ('7', 'pending')
@@ -10079,7 +10122,7 @@ class TestTaskKnowledgeSyncStage2Guards:
                 params={'metadata': {'task_id': '11', 'snapshot_status': 'in-progress'}},
             )
             result = await _resolve_live_status(
-                op, taskmaster, '/project', {'11': 'done'},
+                op, taskmaster, ProjectRoot('/project'), {'11': 'done'},
                 '_check_stall_guard_freshness',
             )
             assert result == ('11', 'done')
@@ -10092,7 +10135,7 @@ class TestTaskKnowledgeSyncStage2Guards:
             taskmaster.get_task.return_value = {'status': 'in-progress'}
             op = self._make_op(operation='update_task', params={'task_id': '42'})
             result = await _resolve_live_status(
-                op, taskmaster, '/project', None,
+                op, taskmaster, ProjectRoot('/project'), None,
                 '_classify_terminal_state_violations',
             )
             assert result == ('42', 'in-progress')
@@ -10105,7 +10148,7 @@ class TestTaskKnowledgeSyncStage2Guards:
             taskmaster.get_task.return_value = 'oops'
             op = self._make_op(operation='update_task', params={'task_id': '42'})
             result = await _resolve_live_status(
-                op, taskmaster, '/project', None,
+                op, taskmaster, ProjectRoot('/project'), None,
                 '_classify_terminal_state_violations',
             )
             assert result == ('42', 'unknown')
@@ -10117,7 +10160,7 @@ class TestTaskKnowledgeSyncStage2Guards:
             taskmaster.get_task.return_value = {'id': '42'}  # dict, but no 'status' key
             op = self._make_op(operation='update_task', params={'task_id': '42'})
             result = await _resolve_live_status(
-                op, taskmaster, '/project', None,
+                op, taskmaster, ProjectRoot('/project'), None,
                 '_classify_terminal_state_violations',
             )
             assert result == ('42', 'unknown')
@@ -10134,7 +10177,7 @@ class TestTaskKnowledgeSyncStage2Guards:
                 logger='fused_memory.reconciliation.stages.task_knowledge_sync',
             ):
                 result = await _resolve_live_status(
-                    op, taskmaster, '/project', None,
+                    op, taskmaster, ProjectRoot('/project'), None,
                     '_classify_terminal_state_violations',
                 )
             assert result is None
@@ -10146,7 +10189,7 @@ class TestTaskKnowledgeSyncStage2Guards:
             taskmaster = AsyncMock()
             op = self._make_op(operation='update_task', params={})
             result = await _resolve_live_status(
-                op, taskmaster, '/project', None,
+                op, taskmaster, ProjectRoot('/project'), None,
                 '_classify_terminal_state_violations',
             )
             assert result is None
@@ -10158,7 +10201,7 @@ class TestTaskKnowledgeSyncStage2Guards:
             taskmaster = AsyncMock()
             op = self._make_op(operation='add_memory', params={'metadata': {}})
             result = await _resolve_live_status(
-                op, taskmaster, '/project', None,
+                op, taskmaster, ProjectRoot('/project'), None,
                 '_check_stall_guard_freshness',
             )
             assert result is None
@@ -10170,7 +10213,7 @@ class TestTaskKnowledgeSyncStage2Guards:
             taskmaster = AsyncMock()
             op = self._make_op(operation='add_memory', params={'metadata': 'oops'})
             result = await _resolve_live_status(
-                op, taskmaster, '/project', None,
+                op, taskmaster, ProjectRoot('/project'), None,
                 '_check_stall_guard_freshness',
             )
             assert result is None
@@ -10182,7 +10225,7 @@ class TestTaskKnowledgeSyncStage2Guards:
             taskmaster = AsyncMock()
             op = self._make_op(operation='update_task', params={'task_id': '42'})
             result = await _resolve_live_status(
-                op, taskmaster, '/project', {},
+                op, taskmaster, ProjectRoot('/project'), {},
                 '_classify_terminal_state_violations',
             )
             assert result is None
@@ -10199,7 +10242,7 @@ class TestTaskKnowledgeSyncStage2Guards:
                 logger='fused_memory.reconciliation.stages.task_knowledge_sync',
             ):
                 result = await _resolve_live_status(
-                    op, taskmaster, '/project', None,
+                    op, taskmaster, ProjectRoot('/project'), None,
                     '_classify_terminal_state_violations',
                 )
             assert result is None
@@ -10216,7 +10259,7 @@ class TestTaskKnowledgeSyncStage2Guards:
                 logger='fused_memory.reconciliation.stages.task_knowledge_sync',
             ):
                 result = await _resolve_live_status(
-                    op, taskmaster, '/project', {'42': 'done'},
+                    op, taskmaster, ProjectRoot('/project'), {'42': 'done'},
                     '_test_parsed_params_bypass',
                     _parsed_params={'task_id': '42'},
                 )
@@ -10254,7 +10297,7 @@ class TestTaskKnowledgeSyncStage2Guards:
 
             ops = [self._make_op(op_id='op-42', params={'task_id': '42'})]
             violations = await _classify_terminal_state_violations(
-                ops, taskmaster, '/project', 'recon-stage-task_knowledge_sync'
+                ops, taskmaster, ProjectRoot('/project'), 'recon-stage-task_knowledge_sync'
             )
 
             assert len(violations) == 1
@@ -10278,7 +10321,7 @@ class TestTaskKnowledgeSyncStage2Guards:
                 )
             ]
             violations = await _classify_terminal_state_violations(
-                ops, taskmaster, '/project', 'recon-stage-task_knowledge_sync'
+                ops, taskmaster, ProjectRoot('/project'), 'recon-stage-task_knowledge_sync'
             )
 
             assert violations == []
@@ -10292,7 +10335,7 @@ class TestTaskKnowledgeSyncStage2Guards:
 
             ops = [self._make_op(params={'task_id': '7'})]
             violations = await _classify_terminal_state_violations(
-                ops, taskmaster, '/project', 'recon-stage-task_knowledge_sync'
+                ops, taskmaster, ProjectRoot('/project'), 'recon-stage-task_knowledge_sync'
             )
 
             assert violations == []
@@ -10393,7 +10436,7 @@ class TestTaskKnowledgeSyncStage2Guards:
 
             ops = [self._make_op(op_id='op-sts-mismatch', params={'task_id': '7', 'status': 'done'})]
             mismatches = await _verify_set_task_status_post_action(
-                ops, taskmaster, '/project', 'recon-stage-task_knowledge_sync'
+                ops, taskmaster, ProjectRoot('/project'), 'recon-stage-task_knowledge_sync'
             )
 
             assert len(mismatches) == 1
@@ -10411,7 +10454,7 @@ class TestTaskKnowledgeSyncStage2Guards:
 
             ops = [self._make_op(params={'task_id': '7', 'status': 'done'})]
             mismatches = await _verify_set_task_status_post_action(
-                ops, taskmaster, '/project', 'recon-stage-task_knowledge_sync'
+                ops, taskmaster, ProjectRoot('/project'), 'recon-stage-task_knowledge_sync'
             )
 
             assert mismatches == []
@@ -10514,7 +10557,7 @@ class TestTaskKnowledgeSyncStage2Guards:
                 op_id='op-stall-1',
                 metadata={'task_id': '11', 'snapshot_status': 'in-progress'},
             )]
-            violations = await _check_stall_guard_freshness(ops, taskmaster, '/project', 'recon-stage-task_knowledge_sync')
+            violations = await _check_stall_guard_freshness(ops, taskmaster, ProjectRoot('/project'), 'recon-stage-task_knowledge_sync')
 
             assert len(violations) == 1
             v = violations[0]
@@ -10533,7 +10576,7 @@ class TestTaskKnowledgeSyncStage2Guards:
                 op_id='op-stall-alias',
                 metadata={'task_id': '11', 'observed_status': 'in-progress'},
             )]
-            violations = await _check_stall_guard_freshness(ops, taskmaster, '/project', 'recon-stage-task_knowledge_sync')
+            violations = await _check_stall_guard_freshness(ops, taskmaster, ProjectRoot('/project'), 'recon-stage-task_knowledge_sync')
 
             assert len(violations) == 1
             assert violations[0]['snapshot_status'] == 'in-progress'
@@ -10547,7 +10590,7 @@ class TestTaskKnowledgeSyncStage2Guards:
             ops = [self._make_add_memory_op(
                 metadata={'task_id': '11'},  # no snapshot_status key
             )]
-            violations = await _check_stall_guard_freshness(ops, taskmaster, '/project', 'recon-stage-task_knowledge_sync')
+            violations = await _check_stall_guard_freshness(ops, taskmaster, ProjectRoot('/project'), 'recon-stage-task_knowledge_sync')
 
             assert violations == []
             taskmaster.get_task.assert_not_called()
@@ -10561,7 +10604,7 @@ class TestTaskKnowledgeSyncStage2Guards:
             ops = [self._make_add_memory_op(
                 metadata={'task_id': '11', 'snapshot_status': 'in-progress'},
             )]
-            violations = await _check_stall_guard_freshness(ops, taskmaster, '/project', 'recon-stage-task_knowledge_sync')
+            violations = await _check_stall_guard_freshness(ops, taskmaster, ProjectRoot('/project'), 'recon-stage-task_knowledge_sync')
 
             assert violations == []
 
@@ -12282,7 +12325,7 @@ class TestStage2RecentlyCompletedAndProvenancePreserveIdTitlePairing:
             'fused_memory.reconciliation.stages.task_knowledge_sync._git_show_name_only',
             new=AsyncMock(return_value=''),
         ):
-            rendered = await _render_done_provenance_section(list(self._TASKS), project_root='/tmp')
+            rendered = await _render_done_provenance_section(list(self._TASKS), project_root=ProjectRoot('/tmp'))
 
         assert '### Done-task Provenance' in rendered, (
             f'Provenance section header missing:\n{rendered!r}'
@@ -12322,7 +12365,7 @@ class TestStage2RecentlyCompletedAndProvenancePreserveIdTitlePairing:
             'fused_memory.reconciliation.stages.task_knowledge_sync._git_show_name_only',
             new=AsyncMock(return_value=''),
         ):
-            rendered = await _render_done_provenance_section([task], project_root='/tmp')
+            rendered = await _render_done_provenance_section([task], project_root=ProjectRoot('/tmp'))
 
         assert f'[{task["id"]}]' in rendered, (
             f'Commit branch: id {task["id"]} missing:\n{rendered!r}'
@@ -12530,7 +12573,7 @@ class TestClassifyLiveWorkflowStatusWrites:
         ops = [_make_sts_op(op_id='op-live-1', agent_id=self._AGENT_ID, task_id=self._TASK_ID)]
 
         violations = await _classify_live_workflow_status_writes(
-            ops, '/project', self._AGENT_ID
+            ops, ProjectRoot('/project'), self._AGENT_ID
         )
 
         assert len(violations) == 1
@@ -12550,7 +12593,7 @@ class TestClassifyLiveWorkflowStatusWrites:
         ops = [_make_sts_op(agent_id=self._AGENT_ID, task_id=self._TASK_ID)]
 
         violations = await _classify_live_workflow_status_writes(
-            ops, '/project', self._AGENT_ID
+            ops, ProjectRoot('/project'), self._AGENT_ID
         )
 
         assert violations == []
@@ -12572,7 +12615,7 @@ class TestClassifyLiveWorkflowStatusWrites:
         ]
 
         violations = await _classify_live_workflow_status_writes(
-            ops, '/project', self._AGENT_ID
+            ops, ProjectRoot('/project'), self._AGENT_ID
         )
 
         assert violations == []
@@ -12596,7 +12639,7 @@ class TestClassifyLiveWorkflowStatusWrites:
             'created_at': '2026-06-05T10:00:00',
         }
         violations = await _classify_live_workflow_status_writes(
-            [update_op], '/project', self._AGENT_ID
+            [update_op], ProjectRoot('/project'), self._AGENT_ID
         )
 
         assert violations == []
@@ -12627,7 +12670,7 @@ class TestClassifyLiveWorkflowStatusWrites:
         ]
 
         violations = await _classify_live_workflow_status_writes(
-            ops, '/project', self._AGENT_ID
+            ops, ProjectRoot('/project'), self._AGENT_ID
         )
 
         assert len(violations) == 1
@@ -13154,6 +13197,59 @@ class TestAssemblePayloadLiveWorkflowSignalsSection:
             f"deterministic task never acquires a worktree/branch of its own; "
             f"got section:\n{section_body!r}"
         )
+
+
+class TestRenderLiveWorkflowSectionEmptyTasksNoOp:
+    """_render_live_workflow_section retains its empty-``tasks`` no-op (task
+    2150 step-3/4): the falsy-``project_root`` half of its guard is dead code
+    under a required ProjectScope and is deleted in step-4, but the
+    empty-``tasks`` half survives — this pins that surviving behavior so the
+    deletion has a characterization test to break if it regresses.
+    """
+
+    def test_empty_tasks_returns_empty_string(self):
+        from fused_memory.reconciliation.stages.task_knowledge_sync import (
+            _render_live_workflow_section,
+        )
+
+        result = _render_live_workflow_section(tasks=[], project_root=ProjectRoot('/p'))
+
+        assert result == ''
+
+
+class TestMaybeQueueBriefingRefreshTasksNoTaskmasterNoOp:
+    """TaskKnowledgeSync._maybe_queue_briefing_refresh_tasks retains its
+    taskmaster-None no-op (task 2150 step-3/4): the falsy-``project_root``
+    half of its guard is dead code under a required ProjectScope and is
+    deleted in step-4, but the taskmaster-None half survives (a stage
+    legitimately runs without a task backend) — this pins that surviving
+    behavior so the deletion has a characterization test to break if it
+    regresses.
+    """
+
+    @pytest.fixture
+    def mock_deps(self):
+        config = ReconciliationConfig(enabled=True, explore_codebase_root='/tmp/test')
+        return {
+            'memory_service': AsyncMock(),
+            'taskmaster': AsyncMock(),
+            'journal': AsyncMock(),
+            'config': config,
+            'scope': _scope('test_project', '/tmp/test'),
+        }
+
+    @pytest.mark.asyncio
+    async def test_no_taskmaster_no_ops_without_invoking_briefing_script(self, mock_deps):
+        stage = TaskKnowledgeSync(StageId.task_knowledge_sync, **mock_deps)
+        stage.taskmaster = None
+
+        with patch(
+            'fused_memory.reconciliation.stages.task_knowledge_sync'
+            '._run_briefing_known_gaps_script',
+        ) as mock_script:
+            await stage._maybe_queue_briefing_refresh_tasks(run_id='r1')
+
+        mock_script.assert_not_called()
 
 
 class TestEnforceStage2SummaryPoolCap:

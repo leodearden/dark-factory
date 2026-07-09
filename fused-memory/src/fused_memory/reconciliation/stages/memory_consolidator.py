@@ -650,16 +650,14 @@ Review the above data and perform memory consolidation:
 {_STAGE1_PROJECT_ID_GUIDELINE.format(project_id=self.project_id)}{self._build_project_root_directive()}"""
 
     def _build_project_root_directive(self) -> str:
-        """Return the project_root directive line for payload footers, or empty string.
+        """Return the project_root directive line for payload footers.
 
-        When ``self.project_root`` is falsy (the BaseStage default ``''``), returns
-        ``''`` so the payload ends immediately after the project_id guideline with no
-        trailing newline.  When set, returns ``'\\nUse project_root=...'`` (leading
-        newline keeps it on its own line after the preceding guideline).  Both payload
-        methods call this helper so the f-string fragment stays in a single place.
+        A stage is only constructible with a validated ``ProjectScope``, so
+        ``self.project_root`` is always a non-empty absolute path — this always
+        returns ``'\\nUse project_root=...'`` (leading newline keeps it on its own
+        line after the preceding guideline).  Both payload methods call this
+        helper so the f-string fragment stays in a single place.
         """
-        if not self.project_root:
-            return ''
         return f'\nUse project_root="{self.project_root}" for tasks scoped to this project.'
 
     def _build_task_tree_section(self) -> str:
@@ -676,8 +674,10 @@ Review the above data and perform memory consolidation:
         """Return the Live-Workflow Signals prompt section, or empty string if inapplicable.
 
         Mirrors Stage 2's guard/source exactly (task 1655): renders over
-        ``self.filtered_task_tree.active_tasks`` when ``self.project_root`` and
-        ``self.filtered_task_tree`` are set and ``active_tasks`` is non-empty.
+        ``self.filtered_task_tree.active_tasks`` when ``self.filtered_task_tree``
+        is set and ``active_tasks`` is non-empty. A stage is only constructible
+        with a validated ``ProjectScope``, so ``self.project_root`` is always a
+        non-empty absolute path and is not part of this guard (task 2150).
         Reuses Stage 2's ``_render_live_workflow_section`` renderer (imported from
         task_knowledge_sync.py) so both stages emit byte-identical section
         formatting for the same underlying live-workflow signals (task 1977).
@@ -685,15 +685,11 @@ Review the above data and perform memory consolidation:
         Returns '' when the guard fails or no active task is currently live —
         keeps the payload tight, matching _build_task_tree_section's pattern.
         """
-        if not (
-            self.project_root
-            and self.filtered_task_tree
-            and self.filtered_task_tree.active_tasks
-        ):
+        if not (self.filtered_task_tree and self.filtered_task_tree.active_tasks):
             return ''
         section = _render_live_workflow_section(
             self.filtered_task_tree.active_tasks,
-            self.project_root,
+            self.scope.project_root,
         )
         if not section:
             return ''
