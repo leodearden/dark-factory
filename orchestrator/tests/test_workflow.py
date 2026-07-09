@@ -2020,6 +2020,8 @@ class TestWorktreeConflictErrorRouting:
 
     async def test_worktree_conflict_error_routes_to_wip_conflict_block(self):
         wf = _make_wip_conflict_workflow()
+        worktree = wf.worktree
+        assert worktree is not None
 
         async def fake_setup(*args, **kwargs):
             pass
@@ -2032,7 +2034,7 @@ class TestWorktreeConflictErrorRouting:
                          new=AsyncMock(return_value=None)),
             patch.object(
                 wf, '_execute_verify_review_loop',
-                side_effect=WorktreeConflictError(wf.worktree, ['foo.py']),
+                side_effect=WorktreeConflictError(worktree, ['foo.py']),
             ),
         ):
             outcome = await wf.run()
@@ -2056,6 +2058,8 @@ class TestWorktreeConflictErrorRouting:
 
     async def test_worktree_conflict_error_reason_is_not_generic_workflow_error(self):
         wf = _make_wip_conflict_workflow()
+        worktree = wf.worktree
+        assert worktree is not None
 
         async def fake_setup(*args, **kwargs):
             pass
@@ -2068,7 +2072,7 @@ class TestWorktreeConflictErrorRouting:
                          new=AsyncMock(return_value=None)),
             patch.object(
                 wf, '_execute_verify_review_loop',
-                side_effect=WorktreeConflictError(wf.worktree, ['foo.py']),
+                side_effect=WorktreeConflictError(worktree, ['foo.py']),
             ),
         ):
             await wf.run()
