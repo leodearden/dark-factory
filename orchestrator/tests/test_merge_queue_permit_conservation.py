@@ -826,3 +826,17 @@ class TestEarlyContinueTerminalTransferClearsSpecBase:
             await asyncio.wait_for(worker_task, timeout=5.0)
 
         _assert_shutdown_quiescent(worker, where='post-shutdown', depth=K)
+
+        # Amendment (post-η review): TestLedgerLiveEmptiesAfterTransferRelease's
+        # leak detector only covers the successful ATTACH+land path
+        # (on_transfer). B's terminal (early-continue) transfer above routes
+        # through on_transfer_terminal() instead — mirror that same direct
+        # ledger.live check on this path, so a missed ledger.release on any
+        # of the seven terminal early-continue sites would leak a permit
+        # into ledger.live undetected (the spec_base assertions above do not
+        # by themselves prove the permit was discarded from ``live``).
+        assert worker._speculation_ledger.live == frozenset(), (
+            "B's terminal-transfer permit must be discarded from "
+            f'ledger.live by shutdown quiescence; still live: '
+            f'{worker._speculation_ledger.live!r}'
+        )
