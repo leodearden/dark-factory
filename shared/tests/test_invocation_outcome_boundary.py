@@ -859,3 +859,39 @@ class TestB9ProbeDirIsolationAndEnvPrecedence:
         assert env_a['CLAUDE_CONFIG_DIR'] == str(gate._config_dir_for(acct_a).path)
         assert env_b['CLAUDE_CONFIG_DIR'] == str(gate._config_dir_for(acct_b).path)
         assert env_a['CLAUDE_CONFIG_DIR'] != env_b['CLAUDE_CONFIG_DIR']
+
+
+# ---------------------------------------------------------------------------
+# B10 -- gate.shutdown() arms _shutting_down FIRST, before cancelling or
+# draining anything (its own docstring's ordering guarantee), so a CapHit
+# _transition racing -- or arriving after -- that teardown spawns no new
+# resume/probe task (producer side). The refusal lives inside the spawner
+# method itself (gate-internal): calling it is not something a caller must
+# additionally guard with its own cancel-before-shutdown discipline, and it
+# still refuses no matter which call path reaches it (consumer side).
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestB10ShutdownRefusesProbes:
+    """await gate.shutdown() then a CapHit transition spawns no resume
+    task -- the refusal is gate-internal, not caller-ordered."""
+
+    async def test_shutdown_then_caphit_spawns_no_resume_task(self):
+        gate = make_boundary_gate(['acct-a'], wait_for_reset=True)
+        acct = gate._accounts[0]
+        # B10 needs the REAL spawner to exercise the shutdown guard itself
+        # -- make_boundary_gate neutralizes it with a no-op MagicMock by
+        # default so every other scenario's transitions stay synchronous.
+        del gate._start_account_resume_probe
+        assert acct.phase == AccountPhase.AVAILABLE
+
+        await gate.shutdown()
+        assert gate._shutting_down is True
+
+        # Invoked directly, exactly as any caller/consumer would -- no
+        # cancel-before-shutdown discipline on our part.
+        gate._transition(acct, AccountPhase.CAPPED)
+        assert acct.phase == AccountPhase.CAPPED
+
+        await _assert_no_resume_task_spawned_via_any_path(gate, acct)
