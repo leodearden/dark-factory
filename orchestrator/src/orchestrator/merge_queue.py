@@ -4404,10 +4404,32 @@ class SpeculativeMergeWorker(_WipHaltMixin):
         train_callback_factory: TrainCallbackFactory | None = None,
         merge_ready_predicate: MergeReadyPredicate | None = None,
         merge_store: Any = None,
+        scheduler: Any = None,
+        mcp: Any = None,
+        usage_gate: Any = None,
+        cost_store: Any = None,
     ):
         self._git_ops = git_ops
         self._queue = queue
         self._event_store = event_store
+        # Task η (AFK coverage gap): harness-owned handles for the
+        # merge-verify dry-run investigation spawn.  The worker holds none of
+        # these itself in any other capacity — they exist solely to be
+        # bundled into self._dry_run_handles below and threaded opaquely into
+        # _run_post_merge_verify at the production _run_inflight_verify call
+        # site (mirrors the train_callback_factory opaque-injection pattern
+        # above: the worker never imports the scheduler).  All four default
+        # to None so every existing bare git_ops+queue test constructor stays
+        # byte-identical.
+        self._scheduler = scheduler
+        self._mcp = mcp
+        self._usage_gate = usage_gate
+        self._cost_store = cost_store
+        self._background_tasks: set[asyncio.Task] = set()
+        self._dry_run_handles = _DryRunInvestigationHandles(
+            scheduler=scheduler, mcp=mcp, usage_gate=usage_gate,
+            cost_store=cost_store, background_tasks=self._background_tasks,
+        )
         # Post-merge notification hook — called with (task_id, base_sha,
         # advanced_sha) after each 'done' merge.  Wrapped in try/except so a
         # coordinator bug never blocks or fails the merge.  See task 1592.
@@ -9200,6 +9222,7 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                 keep_worktrees=set(self._owned_merge_worktrees),
                 runner=None if lease.is_local else lease.runner,
                 escalation_queue=self._escalation_queue,
+                dry_run_handles=self._dry_run_handles,
             ))
             while True:
                 done, _ = await asyncio.wait(
