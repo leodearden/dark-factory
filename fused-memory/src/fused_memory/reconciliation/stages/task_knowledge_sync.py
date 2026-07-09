@@ -2632,17 +2632,29 @@ class TaskKnowledgeSync(BaseStage):
             )
 
         # --- recon_ledger marker GC: single DELETE pass (task 2228 W5-κ) ---
-        # Collapses what were three separate sweeps — stage1_flag_marker
-        # age-based + cross-cycle fp: GC (task 1944), stage1_flag_marker
-        # terminal-task-status GC (task 2103), and stage2_persistence_marker
-        # age-based GC (task 2095) — into one ReconLedgerStore.gc() call: its
-        # expires_at < now clause replaces both age-based sweeps, and its
+        # Collapses what were two separate stage1_flag_marker sweeps —
+        # age-based + cross-cycle fp: GC (task 1944) and terminal-task-status
+        # GC (task 2103) — into one ReconLedgerStore.gc() call: its
+        # expires_at < now clause replaces the age-based sweep, and its
         # record_kind/task_id membership clause replaces the terminal-task
         # sweep. Runs unconditionally on both full and remediation paths so
         # the pool is bounded every cycle. Explicit zero so downstream
         # consumers never need a .get(..., 0) fallback.
         report.stats['recon_markers_gc_swept'] = await _gc_recon_markers(
             self.memory, self.taskmaster, self.scope, run_id,
+        )
+
+        # stage2_persistence_marker (task 2095) is GC'd separately from Mem0,
+        # NOT folded into the ledger gc() pass above: its writer
+        # (_track_flag_persistence) still writes to — and counts from — Mem0,
+        # and no code path upserts a stage2_persistence_marker row into the
+        # recon_ledger, so ReconLedgerStore.gc() can never collect it
+        # (review finding regression-orphan-growth; migrating the writer to
+        # the ledger is deferred to a follow-up). Runs unconditionally every
+        # cycle alongside the ledger gc() pass; explicit zero for the same
+        # reason as above.
+        report.stats['stale_persistence_markers_gc_swept'] = await _sweep_stale_persistence_markers(
+            self.memory, self.project_id, run_id,
         )
 
         return report
