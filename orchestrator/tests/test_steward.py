@@ -549,6 +549,8 @@ class TestStewardCapHitBackoff:
 
     async def test_sleeps_before_retry_on_cap_hit(self, steward, mock_briefing):
         """Steward sleeps before retrying on cap hit (shared loop's cooldown)."""
+        from shared.cli_invoke import _CAP_HIT_COOLDOWN_SECS
+
         esc = _make_escalation()
         steward.escalation_queue.get.return_value = _make_escalation(
             status='resolved', resolution='fixed',
@@ -563,7 +565,12 @@ class TestStewardCapHitBackoff:
             mock_invoke.return_value = _make_result(session_id='sess-new')
             await steward._handle_escalation(esc)
 
-            mock_sleep.assert_awaited_once()
+            # Value-level check on the single cap hit's cooldown (first cycle,
+            # no backoff yet): pins the actual duration reaching asyncio.sleep,
+            # not just that a sleep happened. The cooldown's growth/cap
+            # behavior across repeated cycles is covered by
+            # shared/tests/test_cap_retry.py, which owns the backoff formula.
+            mock_sleep.assert_awaited_once_with(_CAP_HIT_COOLDOWN_SECS)
             assert mock_invoke.call_count == 2
             assert steward._session_id == 'sess-new'
 
