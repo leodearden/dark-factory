@@ -2993,3 +2993,57 @@ class TestCapRetryResumeDeliversPrompt:
         first = mock_inv.call_args_list[0]
         assert first.kwargs.get('prompt') == CRASH_RECOVERY_RESUME_PROMPT
         assert first.kwargs.get('resume_session_id') == 'sess-x'
+
+
+# ===================================================================
+# TestCapRetryResumeFailureRebuildsPrompt  (task W4-eta step-6)
+# ===================================================================
+
+
+@pytest.mark.asyncio
+class TestCapRetryResumeFailureRebuildsPrompt:
+    """When a live-continuation resume (resume_delivers_prompt=True) fails
+    with a non-cap error, the fresh-fallback retry must rebuild context via
+    the caller's rebuild_prompt hook rather than reusing the stale
+    continuation original_prompt.
+
+    With resume_delivers_prompt=True, original_prompt IS the continuation
+    prompt (valid only inside the resumed session) — handing it back
+    unchanged to a brand-new session is context-less. This mirrors the two
+    existing fresh-fallback rebuild call sites (TestCapRetryRebuildPrompt)
+    for the third, non-cap-hit resume-failure site.
+
+    FAILS RED: the non-cap resume-failure branch (cli_invoke.py ~1087-1094)
+    calls _reset_for_fresh_retry(invoke_kwargs, original_prompt) and never
+    awaits _rebuild_fresh_prompt(), so the second call's prompt is still
+    'continuation'.
+    """
+
+    async def test_non_cap_resume_failure_rebuilds_prompt(self):
+        gate = _mock_gate(
+            account_count=1,
+            before_invoke=AsyncMock(side_effect=['tok', 'tok']),
+            detect_cap_hit=MagicMock(side_effect=[False, False]),
+            active_account_name='acct',
+        )
+        # cost_usd defaults to 0.5 in make_result, so this does NOT trip the
+        # zero-cost heuristic — it routes through the non-cap resume-failure
+        # branch.
+        resume_fail = make_result(success=False, output='resume broke')
+        ok = make_result()
+        rebuild = AsyncMock(return_value='REBUILT-FULL-PROMPT')
+        with (
+            patch(_INVOKE_PATCH, new_callable=AsyncMock, side_effect=[resume_fail, ok]) as mock_inv,
+            patch(_SLEEP_PATCH, new_callable=AsyncMock),
+        ):
+            await invoke_with_cap_retry(
+                gate, 'lbl',
+                prompt='continuation',
+                resume_session_id='sess-1',
+                resume_delivers_prompt=True,
+                rebuild_prompt=rebuild,
+            )
+        rebuild.assert_awaited_once_with(True)
+        second = mock_inv.call_args_list[1]
+        assert second.kwargs.get('prompt') == 'REBUILT-FULL-PROMPT'
+        assert 'resume_session_id' not in second.kwargs
