@@ -1535,7 +1535,16 @@ class TestRemoteRunnerTransportVsTimeout:
         assert not any(a[0] == 'ssh' for a in runner._calls)
 
     async def test_raises_runner_unavailable_on_ssh_nonzero(self):
-        """ssh rc!=0 (e.g. 255 connection refused) → RunnerUnavailable."""
+        """ssh rc!=0 (e.g. 255 connection refused) → RunnerUnavailable.
+
+        task-2362 / incident 5111: this is also the recovery-path counterpart
+        of the ssh ServerAlive keepalive hardening — a keepalive-induced dead
+        peer detection makes ssh exit non-zero exactly like the connection-
+        refused case exercised here, which is what feeds the existing
+        RunnerUnavailable → re-dispatch/local-fallback path. See
+        TestRemoteRunnerSshKeepalive for the argv-construction side (that the
+        keepalive flags are actually present on every ssh site).
+        """
         from orchestrator.verify_runner import RunnerUnavailable
         runner = self._make_runner([(0, '', ''), (255, '', 'ssh: connect to host laptop.local port 22')])
         with pytest.raises(RunnerUnavailable):
@@ -3949,8 +3958,23 @@ class TestRemoteRunnerSshKeepalive:
         )
         return runner, calls
 
-    async def test_all_four_sites_carry_keepalive_flags(self):
-        from orchestrator.verify_runner import SSH_SERVER_ALIVE_COUNT_MAX, SSH_SERVER_ALIVE_INTERVAL
+    async def test_all_four_sites_carry_identical_keepalive_flags(self):
+        """Every ssh site carries the keepalive flags with their exact
+        configured values, and the option block is byte-identical across
+        sites (shared `_SSH_BASE_OPTS` const — regression guard against the
+        four sites drifting apart from each other).
+
+        This test only asserts the argv surface. The consequence side of the
+        change — a non-zero ssh rc (what a dead keepalive session ultimately
+        produces) raising RunnerUnavailable — is already covered by
+        `TestRemoteRunnerTransportVsTimeout.test_raises_runner_unavailable_on_ssh_nonzero`
+        and is deliberately not duplicated here (incident 5111).
+        """
+        from orchestrator.verify_runner import (
+            _SSH_BASE_OPTS,
+            SSH_SERVER_ALIVE_COUNT_MAX,
+            SSH_SERVER_ALIVE_INTERVAL,
+        )
 
         expected = VerifyResult(passed=True, test_output='', lint_output='', type_output='', summary='ok')
         runner, calls = self._make_runner(expected)
@@ -3970,35 +3994,18 @@ class TestRemoteRunnerSshKeepalive:
 
         alive_interval_opt = f'ServerAliveInterval={SSH_SERVER_ALIVE_INTERVAL}'
         alive_count_opt = f'ServerAliveCountMax={SSH_SERVER_ALIVE_COUNT_MAX}'
-        for argv in ssh_calls:
-            assert alive_interval_opt in argv, argv
-            assert alive_count_opt in argv, argv
-            # ConnectTimeout is still present (bounds initial connect; unrelated
-            # to the mid-session-stall gap keepalive closes).
-            assert 'ConnectTimeout=10' in argv, argv
-            assert 'BatchMode=yes' in argv, argv
-
-    async def test_ssh_option_prefix_identical_across_all_four_sites(self):
-        """Regression: the shared _SSH_BASE_OPTS const keeps the option block
-        byte-identical across sites so they cannot drift apart."""
-        from orchestrator.verify_runner import _SSH_BASE_OPTS
-
-        expected = VerifyResult(passed=True, test_output='', lint_output='', type_output='', summary='ok')
-        runner, calls = self._make_runner(expected)
-
-        await runner.health()
-        await runner.run_merge_verify('abc123', _make_spec())
-        runner._inflight_request_id = 'req-42'
-        await runner.cancel_verify()
-        await runner.probe_clean()
-
-        ssh_calls = [c for c in calls if c[0] == 'ssh']
-        assert len(ssh_calls) == 4
-
         expected_prefix = ['ssh', *_SSH_BASE_OPTS]
         for argv in ssh_calls:
-            # Every site's argv starts with 'ssh' + the shared option block,
-            # followed by <host> <remote_cmd_or_literal>.
+            # Per-flag checks: the keepalive options carry their exact
+            # configured values, alongside the still-needed ConnectTimeout
+            # (bounds only the initial connect, not a mid-session stall) and
+            # BatchMode.
+            assert alive_interval_opt in argv, argv
+            assert alive_count_opt in argv, argv
+            assert 'ConnectTimeout=10' in argv, argv
+            assert 'BatchMode=yes' in argv, argv
+            # Anti-drift: every site's argv starts with 'ssh' + the exact
+            # shared option block, followed by <host> <remote_cmd_or_literal>.
             assert argv[:len(expected_prefix)] == expected_prefix, argv
             assert argv[len(expected_prefix)] == 'laptop.local'
 
