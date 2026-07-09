@@ -407,6 +407,7 @@ class TestAddSystemRecord:
             causation_id='c1',
         )
 
+        assert service.mem0.add_system_record.await_args is not None
         call_kwargs = service.mem0.add_system_record.await_args.kwargs
         assert call_kwargs['content'] == 'cycle summary'
         assert call_kwargs['metadata']['category'] == 'observations_and_summaries'
