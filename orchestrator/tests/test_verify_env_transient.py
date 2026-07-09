@@ -660,3 +660,81 @@ class TestBareXdistWorkerCrashDetector:
             'E   TypeError: unexpected keyword argument\n'
         )
         assert verify._is_bare_xdist_worker_crash(output) is False
+
+
+class TestRunVerificationXdistWorkerCrashRetry:
+    """task 2365 step-3/4: run_verification raises VerifyInfraError on a bare
+    pytest-xdist worker crash so the task-path retry wrapper
+    (_run_scoped_verification_with_infra_retry) retries the whole scoped
+    verification with backoff instead of the debugfix loop invoking the
+    DEBUGGER on a non-reproducible infra flake (esc-2286-21).
+
+    Mirrors TestRunVerificationEnvRecovery's `_run_cmd` mocking pattern.
+    RED today (before step-4): case (a) returns a failed VerifyResult
+    (category='unknown_test_failure') instead of raising; cases (b)/(c) are
+    guards that must hold both before and after step-4.
+    """
+
+    def _make_config(self, tmp_path: Path) -> OrchestratorConfig:
+        # lint/type are non-Optional str fields on OrchestratorConfig (unlike
+        # ModuleConfig, which allows None to mean "skip") — use harmless
+        # always-succeeding placeholders so only the 'test' check is under
+        # test here.
+        return OrchestratorConfig(
+            project_root=tmp_path,
+            test_command='uv run pytest tests/',
+            lint_command='echo lint',
+            type_check_command='echo type',
+        )
+
+    @pytest.mark.asyncio
+    async def test_bare_worker_crash_raises_verify_infra_error(self, tmp_path: Path):
+        """Case (a): a bare worker crash raises VerifyInfraError(phase='xdist_worker_crash')."""
+        config = self._make_config(tmp_path)
+
+        async def fake_cmd(cmd, cwd, timeout, env=None, log_path=None, **kwargs):
+            if 'pytest' in cmd:
+                return 1, _XDIST_WORKER_CRASH_OUTPUT, False
+            return 0, '', False
+
+        with patch('orchestrator.verify._run_cmd', side_effect=fake_cmd):
+            with pytest.raises(verify.VerifyInfraError) as exc_info:
+                await verify.run_verification(tmp_path, config)
+
+        assert exc_info.value.phase == 'xdist_worker_crash'
+        assert exc_info.value.errno is None
+
+    @pytest.mark.asyncio
+    async def test_crash_with_real_failure_does_not_raise(self, tmp_path: Path):
+        """Case (b): a real failure alongside the crash signature must NOT be
+        masked — run_verification returns a failed VerifyResult instead of
+        raising."""
+        config = self._make_config(tmp_path)
+
+        async def fake_cmd(cmd, cwd, timeout, env=None, log_path=None, **kwargs):
+            if 'pytest' in cmd:
+                return 1, _XDIST_CRASH_WITH_REAL_FAILURE_OUTPUT, False
+            return 0, '', False
+
+        with patch('orchestrator.verify._run_cmd', side_effect=fake_cmd):
+            result = await verify.run_verification(tmp_path, config)
+
+        assert result.passed is False
+        assert result.category == 'test_failure'
+
+    @pytest.mark.asyncio
+    async def test_merge_verify_does_not_raise(self, tmp_path: Path):
+        """Case (c): the merge path (is_merge_verify=True) has no VerifyInfraError
+        handler — an uncaught raise there would stall the merge queue, so the
+        gate must not fire."""
+        config = self._make_config(tmp_path)
+
+        async def fake_cmd(cmd, cwd, timeout, env=None, log_path=None, **kwargs):
+            if 'pytest' in cmd:
+                return 1, _XDIST_WORKER_CRASH_OUTPUT, False
+            return 0, '', False
+
+        with patch('orchestrator.verify._run_cmd', side_effect=fake_cmd):
+            result = await verify.run_verification(tmp_path, config, is_merge_verify=True)
+
+        assert result.passed is False
