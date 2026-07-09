@@ -7,6 +7,7 @@ from datetime import UTC, datetime, timedelta
 from unittest.mock import ANY, AsyncMock, MagicMock, patch
 
 import pytest
+import pytest_asyncio
 from _fm_helpers import assert_id_title_pairing, make_8df8_scenario
 from shared.cli_invoke import AgentResult, AllAccountsCappedException
 
@@ -16068,3 +16069,128 @@ class TestResolveTerminalTaskIds:
         )
 
         assert result == []
+
+
+class TestGcReconMarkers:
+    """_gc_recon_markers wraps ReconLedgerStore.gc() with terminal-task-id
+    resolution and ledger-availability fail-safes (task 2228 W5-κ) — the
+    single call that replaces all four Mem0 marker GC sweeps.
+
+    The boundary test seeds a REAL initialized ReconLedgerStore (mirrors
+    tests/test_recon_ledger.py's `store` fixture pattern) so the
+    expiry/terminal DELETE semantics are exercised end-to-end, not mocked —
+    only taskmaster.get_statuses (the terminal-status source) is mocked.
+    """
+
+    @pytest_asyncio.fixture
+    async def ledger_store(self, tmp_path):
+        from fused_memory.reconciliation.recon_ledger import ReconLedgerStore
+
+        s = ReconLedgerStore(tmp_path / 'reconciliation.db')
+        await s.initialize()
+        yield s
+        await s.close()
+
+    @pytest.mark.asyncio
+    async def test_deletes_expired_and_terminal_referenced_keeps_live(self, ledger_store):
+        """gc() deletes (a) an expired marker and (b) a marker whose task is
+        terminal, and keeps (c) a live, unexpired marker sharing (a)'s
+        task_id under a different flag_type identity — proving the survivor
+        isn't kept merely because its sibling row was already deleted."""
+        from fused_memory.reconciliation.recon_ledger import ReconLedgerRecord
+        from fused_memory.reconciliation.stages.task_knowledge_sync import _gc_recon_markers
+
+        expired = ReconLedgerRecord(
+            project_id='reify',
+            record_kind='stage1_flag_marker',
+            payload_json='{}',
+            state='active',
+            created_at='2026-06-01T00:00:00+00:00',
+            task_id='T-live',
+            flag_type='flag_expired',
+            expires_at='2026-06-15T00:00:00+00:00',
+        )
+        terminal_referenced = ReconLedgerRecord(
+            project_id='reify',
+            record_kind='stage1_flag_marker',
+            payload_json='{}',
+            state='active',
+            created_at='2026-06-01T00:00:00+00:00',
+            task_id='T-done',
+            flag_type='flag_terminal',
+            expires_at='2026-12-01T00:00:00+00:00',
+        )
+        live = ReconLedgerRecord(
+            project_id='reify',
+            record_kind='stage1_flag_marker',
+            payload_json='{}',
+            state='active',
+            created_at='2026-06-01T00:00:00+00:00',
+            task_id='T-live',
+            flag_type='flag_live',
+            expires_at='2026-12-01T00:00:00+00:00',
+        )
+        await ledger_store.upsert(expired)
+        await ledger_store.upsert(terminal_referenced)
+        await ledger_store.upsert(live)
+
+        memory_service = AsyncMock()
+        memory_service.recon_ledger = ledger_store
+        taskmaster = AsyncMock()
+        taskmaster.get_statuses = AsyncMock(
+            return_value={'T-done': 'done', 'T-live': 'in-progress'},
+        )
+
+        deleted_count = await _gc_recon_markers(
+            memory_service, taskmaster, _scope('reify', '/home/leo/src/reify'), 'r1',
+            now=datetime(2026, 7, 9, 0, 0, 0, tzinfo=UTC),
+        )
+
+        assert deleted_count == 2
+        assert await ledger_store.get_by_identity(
+            'reify', 'stage1_flag_marker', task_id='T-live', flag_type='flag_expired',
+        ) is None
+        assert await ledger_store.get_by_identity(
+            'reify', 'stage1_flag_marker', task_id='T-done', flag_type='flag_terminal',
+        ) is None
+        assert await ledger_store.get_by_identity(
+            'reify', 'stage1_flag_marker', task_id='T-live', flag_type='flag_live',
+        ) is not None
+
+    @pytest.mark.asyncio
+    async def test_no_ledger_returns_zero_without_raising(self):
+        """memory_service with no recon_ledger wired (None) degrades to 0 —
+        no taskmaster I/O, no raise (ledger disabled/unwired is a steady-state
+        condition, e.g. mid write-both/read-new cutover)."""
+        from fused_memory.reconciliation.stages.task_knowledge_sync import _gc_recon_markers
+
+        memory_service = AsyncMock()
+        memory_service.recon_ledger = None
+        taskmaster = AsyncMock()
+
+        result = await _gc_recon_markers(
+            memory_service, taskmaster, _scope('reify', '/home/leo/src/reify'), 'r1',
+            now=datetime(2026, 7, 9, 0, 0, 0, tzinfo=UTC),
+        )
+
+        assert result == 0
+        taskmaster.get_statuses.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_ledger_gc_failure_is_fail_safe_zero(self):
+        """A raising ledger.gc() must not propagate — degrades to 0 (fail-safe)."""
+        from fused_memory.reconciliation.stages.task_knowledge_sync import _gc_recon_markers
+
+        memory_service = AsyncMock()
+        ledger = AsyncMock()
+        ledger.gc = AsyncMock(side_effect=RuntimeError('ledger db locked'))
+        memory_service.recon_ledger = ledger
+        taskmaster = AsyncMock()
+        taskmaster.get_statuses = AsyncMock(return_value={})
+
+        result = await _gc_recon_markers(
+            memory_service, taskmaster, _scope('reify', '/home/leo/src/reify'), 'r1',
+            now=datetime(2026, 7, 9, 0, 0, 0, tzinfo=UTC),
+        )
+
+        assert result == 0
