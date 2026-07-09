@@ -1,4 +1,5 @@
-"""Generic per-cycle summary pool-cap enforcement — shared core for Stage 1 and Stage 2.
+"""Generic per-cycle summary pool-cap enforcement and absence self-heal —
+shared core for Stage 1 and Stage 2.
 
 Extracted from ``reconciliation.stages.task_knowledge_sync``'s Stage-2-specific
 ``_enforce_stage2_summary_pool_cap`` / ``_pretrim_stage2_summary_pool``
@@ -8,6 +9,17 @@ and the ``_source`` used for the delete audit trail) differentiate one stage's
 pool from another's. Duplicating the ~90-line async GC logic into a second
 stage module would create a drift hazard (two copies to keep in sync), so it
 lives here once, parametrized, and both stages delegate to it (task 1942).
+
+Task 2366 extends this module with a second generic mechanism: per-cycle
+summary *absence* self-heal (verify a cycle_summary was written, and write a
+deterministic fallback stub when it was not). This generalizes Stage 2's
+``_verify_stage2_summary_written`` / ``_reconstruct_stage2_summary`` (the
+per-cycle summary is a PROMPT-DRIVEN final step of the LLM session, so a stage
+that exhausts its turn/token budget can exit before writing one — a code-side
+deterministic backstop closes that reliability gap without depending on LLM
+compliance). As with the pool-cap functions above, only a handful of
+identifiers (``stage``, ``recon_pool``, ``reconstruct_source``) differentiate
+one stage's self-heal from another's, so it lives here once, parametrized.
 """
 
 from __future__ import annotations
@@ -15,6 +27,7 @@ from __future__ import annotations
 import logging
 from datetime import UTC, datetime
 
+from fused_memory.reconciliation.cli_stage_runner import generate_summary_nonce
 from fused_memory.utils.async_utils import gather_collect
 
 logger = logging.getLogger(__name__)

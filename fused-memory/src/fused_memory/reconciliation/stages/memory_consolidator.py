@@ -46,7 +46,11 @@ from fused_memory.reconciliation.stages.base import BaseStage
 from fused_memory.reconciliation.stages.task_knowledge_sync import (
     _render_live_workflow_section,
 )
-from fused_memory.reconciliation.summary_pool import pretrim_summary_pool
+from fused_memory.reconciliation.summary_pool import (
+    pretrim_summary_pool,
+    reconstruct_cycle_summary_stub,
+    verify_cycle_summary_written,
+)
 from fused_memory.reconciliation.task_filter import (
     FilteredTaskTree,
     detect_census_inconsistency,
@@ -66,6 +70,12 @@ logger = logging.getLogger(__name__)
 # via the shared reconciliation.summary_pool core.
 STAGE1_CYCLE_SUMMARY_POOL_CAP: int = 2
 _STAGE1_CYCLE_SUMMARY_TRIM_SOURCE = 'stage1_cycle_summary_trim'
+
+# Audit tag for reconstruct_cycle_summary_stub's deterministic fallback-stub
+# write, invoked from run() when verify_cycle_summary_written CONFIRMS (count
+# == 0) that the LLM session exited without writing its per-cycle summary
+# (task 2366). Mirrors Stage 2's _STAGE2_SUMMARY_RECONSTRUCTION_SOURCE.
+_STAGE1_CYCLE_SUMMARY_RECONSTRUCTION_SOURCE = 'stage1_summary_reconstruction'
 
 
 class MemoryConsolidator(BaseStage):
