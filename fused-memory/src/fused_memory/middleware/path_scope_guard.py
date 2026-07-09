@@ -20,6 +20,7 @@ when one is configured.
 from __future__ import annotations
 
 import re
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Literal
 
@@ -159,6 +160,45 @@ class PathGuardVerdict:
 # ---------------------------------------------------------------------------
 
 
+def _aggregate_owner_mismatches(
+    items: list[str],
+    project_id: str,
+    owner_of: Callable[[str], str | None],
+) -> tuple[list[str], str | None]:
+    """Classify *items* via *owner_of* and collect those owned by another project.
+
+    Shared aggregation core for :func:`_resolve_mismatches` (matched
+    prefixes from the regex-over-prose heuristic, classified via
+    :meth:`ProjectPrefixRegistry.project_for_prefix`) and
+    :func:`check_files_for_scope` (concrete file paths, classified via
+    :meth:`ProjectPrefixRegistry.project_for_path`).  The two callers differ
+    only in *what* ``owner_of`` resolves, not in how mismatches are
+    aggregated into a suggested target — factored out here (task 2206
+    review) so that logic can't drift out of sync between them.
+
+    Returns ``(mismatched_items, suggested_project)``.  An item is
+    mismatched when ``owner_of(item)`` returns a project_id other than
+    *project_id*; items with no registered owner (``owner_of`` returns
+    ``None``) are dropped from the result — an unclassifiable item is never
+    grounds for rejection, keeping the guard conservative.
+    ``suggested_project`` is the single shared owner of every mismatch, or
+    ``None`` when mismatches span more than one project.
+    """
+    mismatched: list[str] = []
+    owners: set[str] = set()
+    first_owner: str | None = None
+    for item in items:
+        owner = owner_of(item)
+        if owner is None or owner == project_id:
+            continue
+        mismatched.append(item)
+        if first_owner is None:
+            first_owner = owner
+        owners.add(owner)
+    suggested = first_owner if len(owners) == 1 else None
+    return mismatched, suggested
+
+
 def _resolve_mismatches(
     matched: list[str], project_id: str, registry: ProjectPrefixRegistry,
 ) -> tuple[list[str], str | None]:
@@ -169,20 +209,11 @@ def _resolve_mismatches(
     ``None`` when they span multiple projects.  Prefixes with no registered
     owner are dropped from the rejection (the registry could not classify
     them — ignoring them keeps the guard conservative).
+
+    Thin wrapper around :func:`_aggregate_owner_mismatches` bound to the
+    prefix-string lookup :meth:`ProjectPrefixRegistry.project_for_prefix`.
     """
-    mismatched: list[str] = []
-    owners: set[str] = set()
-    first_owner: str | None = None
-    for prefix in matched:
-        owner = registry.project_for_prefix(prefix)
-        if owner is None or owner == project_id:
-            continue
-        mismatched.append(prefix)
-        if first_owner is None:
-            first_owner = owner
-        owners.add(owner)
-    suggested = first_owner if len(owners) == 1 else None
-    return mismatched, suggested
+    return _aggregate_owner_mismatches(matched, project_id, registry.project_for_prefix)
 
 
 def check_candidate_for_scope(
