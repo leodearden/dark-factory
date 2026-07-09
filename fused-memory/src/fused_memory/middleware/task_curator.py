@@ -1340,6 +1340,29 @@ class TaskCurator:
             else:
                 llm_k_list.append(k)
 
+        # ── Operational-ask registry (filing-policy gate) check ────────────────
+        # Runs on the still-LLM-bound candidates only — AFTER the blocklist/
+        # premise drops AND the idempotency-cache split, so an already-cached
+        # decision for this exact payload_hash takes precedence over routing.
+        # Mirrors curate()'s precedence (blocklist -> premise -> exact-match ->
+        # cache -> route). Deliberately NOT stored in the idempotency cache
+        # (see _maybe_route_deterministic) so a re-filed duplicate is instead
+        # caught by the cache/blocklist/premise checks on a later call, rather
+        # than a stale cached route resurfacing here.
+        route_decisions: dict[int, CuratorDecision] = {}  # original-space i → decision
+        non_route_llm_k: list[int] = []
+        for k in llm_k_list:
+            original_i = unique_indices[k]
+            route_decision = await self._maybe_route_deterministic(
+                candidates[original_i], candidates[original_i].payload_hash(),
+            )
+            if route_decision is not None:
+                route_decisions[original_i] = route_decision
+            else:
+                non_route_llm_k.append(k)
+        llm_k_list = non_route_llm_k
+        # ── End operational-ask registry check ──────────────────────────────────
+
         # ── Zero-output-timeout circuit breaker gate (task 1743) ──────────────
         # Check the breaker BEFORE the expensive batch LLM round-trip (up to
         # batch_timeout_cap_seconds = 360s).  If open, resolve every LLM-bound
@@ -1441,6 +1464,7 @@ class TaskCurator:
         unique_decision_map: dict[int, CuratorDecision] = {
             unique_indices[k]: unique_decisions_by_k[k]
             for k in range(len(unique_indices))
+            if unique_indices[k] not in route_decisions
         }
 
         decisions = [
@@ -1450,6 +1474,8 @@ class TaskCurator:
             if i in blocklist_decisions
             else premise_decisions[i]
             if i in premise_decisions
+            else route_decisions[i]
+            if i in route_decisions
             else unique_decision_map[i]
             for i in range(len(candidates))
         ]
