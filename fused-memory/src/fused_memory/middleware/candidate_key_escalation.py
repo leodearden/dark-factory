@@ -18,6 +18,11 @@ Mirrors the defensive import + never-raise submit pattern established by
 * ``submit`` is wrapped so a queue I/O failure never raises — the migration's
   self-gating skip has already happened by the time this is called;
   escalation is purely additive.
+* Dedups against an already-open escalation for the same anchor before
+  filing a new one (review amendment) — a connection (and therefore this
+  migration step) runs at most once per project_root per process, so a
+  residual-dup condition that outlives a single process restart would
+  otherwise mint a brand-new escalation on every restart.
 """
 
 from __future__ import annotations
@@ -64,10 +69,12 @@ def emit_residual_candidate_key_escalation(
     ``task_ids`` (list[str]), and ``count`` — the same shape the migration's
     ``GROUP_CONCAT``-based audit produces.
 
-    Returns the escalation id when one was filed, ``None`` otherwise (the
-    ``escalation`` package is unavailable, or the queue write failed).
-    NEVER raises: this is called from connection-open migration code, and a
-    raise here would defeat the self-gating step's own fail-safe guarantee.
+    Returns the escalation id — either a freshly filed one, or the id of an
+    already-open escalation for this condition when one exists (dedup, see
+    below) — or ``None`` when neither is possible (the ``escalation``
+    package is unavailable, or the queue write failed). NEVER raises: this
+    is called from connection-open migration code, and a raise here would
+    defeat the self-gating step's own fail-safe guarantee.
     """
     if not HAS_ESCALATION:
         logger.debug(
@@ -79,6 +86,34 @@ def emit_residual_candidate_key_escalation(
         return None
 
     queue = EscalationQueue(Path(project_root) / _QUEUE_DIRNAME)
+
+    # Dedup against an already-open escalation (review amendment): connections
+    # are cached per project_root, so this migration step runs at most once
+    # per project_root per process — but a residual-dup condition that
+    # outlives a single process restart would otherwise mint a brand-new
+    # esc-candidate-key-migration-N escalation on every restart, flooding the
+    # operator queue with near-identical entries. `_ANCHOR_TASK_ID` is a
+    # stable per-project anchor, so any still-pending (including
+    # parked-to-L2) escalation filed under it IS the open residual-duplicates
+    # escalation for this project — reuse its id instead of filing a
+    # duplicate. Best-effort: a read failure here just falls through to
+    # filing a new escalation rather than blocking the migration step.
+    try:
+        existing = queue.get_by_task(_ANCHOR_TASK_ID, status='pending')
+    except Exception:
+        logger.exception(
+            'candidate_key_escalation: failed to check for an existing open '
+            'escalation for project_root=%r; proceeding to file a new one',
+            project_root,
+        )
+        existing = []
+    if existing:
+        logger.info(
+            'candidate_key_escalation: %s already open for project_root=%r '
+            '(%d residual duplicate group(s) now); not filing a duplicate',
+            existing[0].id, project_root, len(residual_groups),
+        )
+        return existing[0].id
 
     groups_desc = '; '.join(
         f'tag={g.get("tag")!r} candidate_key={g.get("candidate_key")!r} '
