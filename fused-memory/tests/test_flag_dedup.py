@@ -462,6 +462,190 @@ async def test_dedup_flags_mirror_write_exception_does_not_raise_ledger_still_co
 
 
 # ---------------------------------------------------------------------------
+# Ledger read/write is ALSO best-effort, not just the Mem0 mirror (amendment
+# round — reviewer_comprehensive findings #1/#2). dedup_flags' own docstring
+# and public-API contract promise "best-effort (exceptions are logged, not
+# raised)"; these pin that the ledger get_by_identity/json.loads/upsert
+# sequence honors that contract, mirroring the mirror-write guard above.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_dedup_flags_ledger_get_by_identity_exception_does_not_raise(
+    ledger_memory_service, caplog
+):
+    """A raising recon_ledger.get_by_identity must not abort dedup_flags.
+
+    Amendment (reviewer_comprehensive finding #1/#2): the ledger read/write
+    path was unguarded, so any exception from it — not just the Mem0 mirror —
+    would propagate out of dedup_flags and fail the whole Stage-1 batch. This
+    pins the best-effort contract dedup_flags' own docstring promises.
+    """
+    import logging
+
+    from fused_memory.reconciliation.flag_dedup import dedup_flags
+
+    ledger_memory_service.recon_ledger.get_by_identity = AsyncMock(
+        side_effect=RuntimeError('get_by_identity boom')
+    )
+
+    flags = [{'task_id': '77', 'flag_type': 'missing_deliverable', 'description': 'test'}]
+
+    with caplog.at_level(logging.WARNING, logger='fused_memory.reconciliation.flag_dedup'):
+        result = await dedup_flags(
+            memory_service=ledger_memory_service,
+            project_id='p',
+            run_id='r1',
+            flags=flags,
+        )
+
+    # Does not raise; flag still returned with no ledger-derived annotation.
+    assert len(result) == 1
+    assert result[0]['task_id'] == '77'
+    assert 'persisted_from_run' not in result[0]
+
+    # WARNING log mentions the failure and task_id.
+    assert any(
+        '77' in record.message and record.levelno == logging.WARNING
+        for record in caplog.records
+    ), f'Expected a WARNING log mentioning task_id=77, got: {[r.message for r in caplog.records]}'
+
+
+@pytest.mark.asyncio
+async def test_dedup_flags_ledger_upsert_exception_does_not_raise(
+    ledger_memory_service, caplog
+):
+    """A raising recon_ledger.upsert must not abort dedup_flags — the flag
+    is still returned (without a persisted ledger row) and a WARNING logged.
+    """
+    import logging
+
+    from fused_memory.reconciliation.flag_dedup import dedup_flags
+
+    ledger_memory_service.recon_ledger.upsert = AsyncMock(side_effect=RuntimeError('upsert boom'))
+
+    flags = [{'task_id': '78', 'flag_type': 'missing_deliverable', 'description': 'test'}]
+
+    with caplog.at_level(logging.WARNING, logger='fused_memory.reconciliation.flag_dedup'):
+        result = await dedup_flags(
+            memory_service=ledger_memory_service,
+            project_id='p',
+            run_id='r1',
+            flags=flags,
+        )
+
+    assert len(result) == 1
+    assert result[0]['task_id'] == '78'
+
+    # No row was actually persisted, since the upsert raised.
+    row = await _get_marker(ledger_memory_service.recon_ledger, 'p', '78', 'missing_deliverable')
+    assert row is None
+
+    assert any(
+        '78' in record.message and record.levelno == logging.WARNING
+        for record in caplog.records
+    ), f'Expected a WARNING log mentioning task_id=78, got: {[r.message for r in caplog.records]}'
+
+
+@pytest.mark.asyncio
+async def test_dedup_flags_corrupt_prior_payload_json_does_not_raise(
+    ledger_memory_service, caplog
+):
+    """A prior stage1_flag_marker row with non-JSON payload_json (legacy row,
+    partial write, external corruption) must not poison dedup for its flag —
+    json.loads(prior.payload_json) is inside the same best-effort try/except
+    as the rest of the ledger read/write sequence.
+    """
+    import logging
+
+    from fused_memory.reconciliation.flag_dedup import dedup_flags
+
+    ledger = ledger_memory_service.recon_ledger
+    await ledger.upsert(ReconLedgerRecord(
+        project_id='p',
+        record_kind='stage1_flag_marker',
+        payload_json='{not valid json',
+        state='active',
+        created_at='2026-01-01T00:00:00+00:00',
+        task_id='79',
+        flag_type='missing_deliverable',
+        run_id='',
+        expires_at='2099-01-01T00:00:00+00:00',
+    ))
+
+    flags = [{'task_id': '79', 'flag_type': 'missing_deliverable', 'description': 'test'}]
+
+    with caplog.at_level(logging.WARNING, logger='fused_memory.reconciliation.flag_dedup'):
+        result = await dedup_flags(
+            memory_service=ledger_memory_service,
+            project_id='p',
+            run_id='r2',
+            flags=flags,
+        )
+
+    # Does not raise; flag returned without a persisted_from_run (the read
+    # failed, so no prior run_id could be extracted).
+    assert len(result) == 1
+    assert result[0]['task_id'] == '79'
+    assert 'persisted_from_run' not in result[0]
+
+    assert any(
+        '79' in record.message and record.levelno == logging.WARNING
+        for record in caplog.records
+    ), f'Expected a WARNING log mentioning task_id=79, got: {[r.message for r in caplog.records]}'
+
+
+@pytest.mark.asyncio
+async def test_dedup_flags_multiple_flags_one_ledger_failure_does_not_poison_batch(
+    ledger_memory_service, caplog
+):
+    """A single flag's ledger failure must not prevent OTHER flags in the same
+    batch from being processed normally — the try/except is per-flag, not
+    around the whole loop.
+    """
+    import logging
+
+    from fused_memory.reconciliation.flag_dedup import dedup_flags
+
+    ledger = ledger_memory_service.recon_ledger
+    real_get_by_identity = ledger.get_by_identity
+
+    async def _flaky_get_by_identity(project_id, record_kind, task_id, flag_type, run_id):
+        if task_id == '80':
+            raise RuntimeError('get_by_identity boom for 80')
+        return await real_get_by_identity(project_id, record_kind, task_id, flag_type, run_id)
+
+    ledger.get_by_identity = AsyncMock(side_effect=_flaky_get_by_identity)
+
+    flags = [
+        {'task_id': '80', 'flag_type': 'missing_deliverable', 'description': 'poisoned'},
+        {'task_id': '81', 'flag_type': 'missing_deliverable', 'description': 'healthy'},
+    ]
+
+    with caplog.at_level(logging.WARNING, logger='fused_memory.reconciliation.flag_dedup'):
+        result = await dedup_flags(
+            memory_service=ledger_memory_service,
+            project_id='p',
+            run_id='r1',
+            flags=flags,
+        )
+
+    # Restore the real method before reading back rows for assertions — the
+    # flaky wrapper above still raises for task_id '80'.
+    ledger.get_by_identity = real_get_by_identity
+
+    assert len(result) == 2
+
+    # Task 80's ledger op failed — no row persisted.
+    row_80 = await _get_marker(ledger_memory_service.recon_ledger, 'p', '80', 'missing_deliverable')
+    assert row_80 is None
+
+    # Task 81 was processed normally despite task 80's failure.
+    row_81 = await _get_marker(ledger_memory_service.recon_ledger, 'p', '81', 'missing_deliverable')
+    assert row_81 is not None
+
+
+# ---------------------------------------------------------------------------
 # TestFilterSuppressed (task-1186 step-1; rewritten onto the ledger at task
 # 2227 step-4) — filter_suppressed reads the ReconLedgerStore's indexed
 # list_suppressions(project_id) query; no Mem0 search.
@@ -506,6 +690,43 @@ class TestFilterSuppressed:
         await _seed_suppression(ledger_memory_service.recon_ledger, 'p', '42', '')
         await filter_suppressed(ledger_memory_service, 'p', [{'task_id': 42, 'flag_type': 'x'}])
         ledger_memory_service.search.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_list_suppressions_exception_returns_flags_unchanged(
+        self, ledger_memory_service, caplog
+    ):
+        """A raising recon_ledger.list_suppressions must not abort the caller.
+
+        Amendment (reviewer_comprehensive finding #1/#2): filter_suppressed's
+        docstring promises a conservative "no suppression in effect"
+        pass-through contract; a ledger read failure must degrade the same
+        way the old Mem0-search-exception path did, with a WARNING logged
+        instead of the exception propagating into dedup_flags' batch loop.
+        """
+        import logging
+
+        from fused_memory.reconciliation.flag_dedup import filter_suppressed
+
+        ledger_memory_service.recon_ledger.list_suppressions = AsyncMock(
+            side_effect=RuntimeError('list_suppressions boom')
+        )
+
+        flags = [
+            {'task_id': 42, 'flag_type': 'missing_deliverable'},
+            {'task_id': 99, 'flag_type': 'stale_metadata'},
+        ]
+
+        with caplog.at_level(logging.WARNING, logger='fused_memory.reconciliation.flag_dedup'):
+            result = await filter_suppressed(ledger_memory_service, 'p', flags)
+
+        assert result == flags
+        assert any(
+            'list_suppressions' in record.message and record.levelno == logging.WARNING
+            for record in caplog.records
+        ), (
+            f'Expected a WARNING log mentioning list_suppressions, got: '
+            f'{[r.message for r in caplog.records]}'
+        )
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize(

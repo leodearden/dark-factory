@@ -222,7 +222,9 @@ async def filter_suppressed(
     when *flags* is empty, or ``memory_service.recon_ledger`` is unset/
     ``None`` (ledger disabled or not yet wired), *flags* is returned
     unchanged -- the same "no suppression in effect" contract the old
-    Mem0-search-exception path provided.
+    Mem0-search-exception path provided. The same pass-through applies, with
+    a WARNING logged, when ``list_suppressions`` itself raises -- a ledger
+    read failure must never abort the caller's whole ``dedup_flags`` batch.
     """
     if not flags:
         return []
@@ -237,7 +239,19 @@ async def filter_suppressed(
         )
         return flags
 
-    rows = await ledger.list_suppressions(project_id)
+    try:
+        rows = await ledger.list_suppressions(project_id)
+    except Exception as e:
+        logger.warning(
+            'filter_suppressed: recon_ledger.list_suppressions failed for'
+            ' project %s: %s (best-effort — treating as no suppression in'
+            ' effect, passing %d flag(s) through unfiltered)',
+            project_id,
+            e,
+            len(flags),
+            exc_info=True,
+        )
+        return flags
 
     # task_id (str) -> None (wildcard/blanket) | set[str] (scoped flag_types
     # allowlist).  See docstring for wildcard-wins union semantics.
@@ -429,6 +443,11 @@ async def dedup_flags(
       regardless of how many times this signature has recurred, with no
       separate delete step and no dependence on read-after-write consistency
       across calls.
+      The ``get_by_identity``/``json.loads``/``upsert`` sequence is wrapped in
+      a single try/except: a ledger read/write failure (including a
+      malformed/non-JSON ``payload_json`` on a prior row) is logged at
+      WARNING and this flag simply gets no ledger annotation/persistence for
+      this cycle — it never aborts the batch or propagates to the caller.
     - A best-effort Mem0 mirror (single ``add_memory``, no read-back/confirm/
       delete) is attempted after the ledger write — wrapped in try/except so a
       mirror failure never raises or rolls back the ledger write.  When no
@@ -579,20 +598,6 @@ async def dedup_flags(
         ledger = getattr(memory_service, 'recon_ledger', None)
         flag = dict(flag)
         persisted_from_run: str | None = None
-        if ledger is not None:
-            prior = await ledger.get_by_identity(project_id, 'stage1_flag_marker', tid, ftype, '')
-            if prior is not None:
-                prior_payload = json.loads(prior.payload_json)
-                persisted_from_run = prior_payload.get('run_id') or 'unknown'
-                if persisted_from_run == 'unknown':
-                    logger.debug(
-                        'flag_dedup: prior marker for task=%s flag_type=%s has malformed run_id metadata',
-                        tid,
-                        ftype,
-                    )
-        if persisted_from_run is not None:
-            flag['persisted_from_run'] = persisted_from_run
-        flag['last_seen_run_id'] = run_id
 
         payload: dict[str, Any] = {
             'source': 'stage1_flag_marker',
@@ -605,19 +610,51 @@ async def dedup_flags(
         if deduped_against:
             payload['deduped_against'] = list(deduped_against)
 
+        # Best-effort (module docstring / public-API contract): a ledger read
+        # or write failure — including a malformed/non-JSON payload_json on a
+        # prior row (legacy row, partial write, external corruption) — must
+        # log and move on to the next flag rather than propagate and abort
+        # the whole dedup_flags batch (memory_consolidator.run() calls this
+        # with no surrounding try/except, so an unguarded raise here would
+        # fail the entire Stage-1 run over a single bad row).
         if ledger is not None:
-            now = datetime.now(UTC)
-            await ledger.upsert(ReconLedgerRecord(
-                project_id=project_id,
-                record_kind='stage1_flag_marker',
-                payload_json=json.dumps(payload),
-                state='active',
-                created_at=now.isoformat(),
-                task_id=tid,
-                flag_type=ftype,
-                run_id='',
-                expires_at=(now + timedelta(days=14)).isoformat(),
-            ))
+            try:
+                prior = await ledger.get_by_identity(project_id, 'stage1_flag_marker', tid, ftype, '')
+                if prior is not None:
+                    prior_payload = json.loads(prior.payload_json)
+                    persisted_from_run = prior_payload.get('run_id') or 'unknown'
+                    if persisted_from_run == 'unknown':
+                        logger.debug(
+                            'flag_dedup: prior marker for task=%s flag_type=%s has malformed run_id metadata',
+                            tid,
+                            ftype,
+                        )
+                now = datetime.now(UTC)
+                await ledger.upsert(ReconLedgerRecord(
+                    project_id=project_id,
+                    record_kind='stage1_flag_marker',
+                    payload_json=json.dumps(payload),
+                    state='active',
+                    created_at=now.isoformat(),
+                    task_id=tid,
+                    flag_type=ftype,
+                    run_id='',
+                    expires_at=(now + timedelta(days=14)).isoformat(),
+                ))
+            except Exception as e:
+                logger.warning(
+                    'flag_dedup: recon_ledger read/write failed for marker'
+                    ' task=%s flag_type=%s: %s (best-effort — flag still'
+                    ' returned, no ledger annotation/persistence this cycle)',
+                    tid,
+                    ftype,
+                    e,
+                    exc_info=True,
+                )
+
+        if persisted_from_run is not None:
+            flag['persisted_from_run'] = persisted_from_run
+        flag['last_seen_run_id'] = run_id
 
         # Best-effort Mem0 mirror (PRD decision #4/#6 write-both/read-new): a
         # single add_memory, no read-back/confirm/delete loop.  Never raises —
