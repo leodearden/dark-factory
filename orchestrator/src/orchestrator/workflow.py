@@ -89,7 +89,7 @@ from orchestrator.verify import (
     run_scoped_verification,
     verify_failure_is_preexisting_on_main,
 )
-from orchestrator.verify_categories import FailureCategory, PREEXISTING_BREAK_SKIP_CATEGORIES
+from orchestrator.verify_categories import PREEXISTING_BREAK_SKIP_CATEGORIES, FailureCategory
 
 # Orchestrator package directory — used to resolve ``uv run --project`` for
 # the plan-tools stdio MCP server.

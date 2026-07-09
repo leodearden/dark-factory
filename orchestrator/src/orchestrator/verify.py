@@ -24,9 +24,7 @@ from orchestrator.verify_categories import (
     ARCHIVE_DENY_LIST as _ARCHIVE_DENY_LIST,  # noqa: F401 — re-exported for external consumers
 )
 from orchestrator.verify_categories import (
-    CATEGORY_PRIORITY as _CATEGORY_PRIORITY,
-)
-from orchestrator.verify_categories import (
+    CATEGORY_PRIORITY,
     INFRA_TRANSIENT_CATEGORIES,
     PREEXISTING_BREAK_SKIP_CATEGORIES,  # noqa: F401 — re-exported for external consumers
     FailureCategory,
@@ -40,8 +38,13 @@ from orchestrator.verify_categories import (
 # compare/hash/index equal to their str value at runtime; this cast is a
 # static-typing-only adjustment (still the exact same list object — see
 # verify_categories.CATEGORY_PRIORITY for the precisely FailureCategory-typed
-# source of truth).
-_CATEGORY_PRIORITY = cast('list[str]', _CATEGORY_PRIORITY)
+# source of truth). Bound once, with an explicit annotation, rather than
+# reassigning the imported name in place: pyright infers a bare module-level
+# reassignment's cross-scope type as the union of every binding of that name
+# (list[FailureCategory] | list[str]), which still fails `.index()` calls made
+# from nested function scopes such as _worst_category._rank below. A single
+# annotated binding makes list[str] the one declared type everywhere.
+_CATEGORY_PRIORITY: list[str] = cast('list[str]', CATEGORY_PRIORITY)
 
 logger = logging.getLogger(__name__)
 
