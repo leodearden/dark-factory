@@ -293,11 +293,20 @@ def check_proposal(
 
     Precedence:
       1. entry falsy -> abort 'no proposal to gate'
-      1b. block_reason starts with POST_MERGE_RED_MAIN_REASON_PREFIX -> abort
-          (highest-blast-radius class; hard-aborted before risk_label/git checks —
-          defense-in-depth against a mislabeled-low investigator result; see task 1680)
+      1b. DUAL-READ highest-blast-radius check (task 2138 B2/B3): if a typed
+          'block_class' key is present, abort iff it equals
+          BlockClass.POST_MERGE_RED_MAIN; otherwise (legacy proposals written
+          before block_class existed) fall back to the prose-prefix sniff —
+          block_reason starts with POST_MERGE_RED_MAIN_REASON_PREFIX -> abort.
+          Hard-aborted before risk_label/git checks either way — defense-in-
+          depth against a mislabeled-low investigator result; see task 1680.
       2. risk_label != 'low' -> abort
-      3. 'status' key present (failure entry) -> abort
+      3. LEGACY-ONLY (B3): 'block_class' absent AND 'status' key present
+          (failure entry) -> abort. When 'block_class' is present, every
+          producer failure shape already sets risk_label='human-review-
+          required', so step 2 catches it — this sniff is redundant (and
+          would incorrectly fire on a legit low-risk MERGE_VERIFY_RED entry
+          that happens to carry a stray 'status' key) for the typed path.
       4. category not in B3_CATEGORIES (when not None) -> abort
       5. head_sha or main_sha missing/None -> drift 'no sha anchor'
       6. HEAD != head_sha -> abort (git-anchored; P1)
@@ -340,13 +349,18 @@ def check_proposal(
             'age_seconds': age,
         }
 
-    # --- (1b) Post-merge red-main fix-forward class ---
+    # --- (1b) Post-merge red-main fix-forward class (dual-read) ---
     # Hard-abort regardless of risk_label — fires before the git checks so it
     # consumes no git and cannot be bypassed by a mislabeled-low investigation
     # result (the 1643 failure mode).  Both consumers already route a non-fresh
     # verdict to abort-to-human with no code change.
-    block_reason = entry.get('block_reason') or ''
-    if block_reason.startswith(POST_MERGE_RED_MAIN_REASON_PREFIX):
+    block_class = entry.get('block_class')
+    if block_class is not None:
+        is_post_merge_red_main = block_class == BlockClass.POST_MERGE_RED_MAIN
+    else:
+        block_reason = entry.get('block_reason') or ''
+        is_post_merge_red_main = block_reason.startswith(POST_MERGE_RED_MAIN_REASON_PREFIX)
+    if is_post_merge_red_main:
         return _result(
             ABORT,
             'post-merge red-main fix-forward class — highest-blast-radius '
@@ -357,8 +371,8 @@ def check_proposal(
     if entry.get('risk_label') != 'low':
         return _result(ABORT, f'risk_label is not low: {entry.get("risk_label")!r}')
 
-    # --- (3) Status key (failure entry) ---
-    if 'status' in entry:
+    # --- (3) Status key (failure entry) — LEGACY path only (B3) ---
+    if block_class is None and 'status' in entry:
         return _result(ABORT, f'proposal is a failure entry (status={entry["status"]!r})')
 
     # --- (4) Category check ---
