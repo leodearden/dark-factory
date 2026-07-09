@@ -21,28 +21,12 @@ import orchestrator.workflow_types as workflow_types_mod
 from orchestrator.config import OrchestratorConfig
 from orchestrator.workflow import TaskWorkflow
 from orchestrator.workflow_types import (
+    STATE_TO_STATUS,
     IllegalTransition,
     WorkflowOutcome,
     WorkflowState,
     WorkflowStateMachine,
 )
-
-# Mirrors the WorkflowState -> TaskStatus projection WorkflowStateMachine.transition
-# consumes (step-4's ``_STATE_TO_STATUS``). Defined independently here so this
-# module's "iff" proof cross-checks the real implementation against the shared
-# table rather than against a copy of the implementation's own table.
-_STATE_TO_STATUS: dict[WorkflowState, TaskStatus] = {
-    WorkflowState.PLAN: TaskStatus.IN_PROGRESS,
-    WorkflowState.EXECUTE: TaskStatus.IN_PROGRESS,
-    WorkflowState.VERIFY: TaskStatus.IN_PROGRESS,
-    WorkflowState.REVIEW: TaskStatus.IN_PROGRESS,
-    WorkflowState.MERGE: TaskStatus.IN_PROGRESS,
-    WorkflowState.MERGE_DEFERRED: TaskStatus.MERGE_DEFERRED,
-    WorkflowState.DONE: TaskStatus.DONE,
-    WorkflowState.BLOCKED: TaskStatus.BLOCKED,
-    WorkflowState.ESCALATED: TaskStatus.BLOCKED,
-    WorkflowState.CANCELLED: TaskStatus.CANCELLED,
-}
 
 
 class TestEnumRelocationShim:
@@ -190,8 +174,18 @@ class TestNeverAFourthTable:
         (WorkflowState.MERGE_DEFERRED, WorkflowState.EXECUTE),
     ])
     def test_transition_raises_iff_shared_table_says_illegal(self, frm, to):
+        """Proves ``transition`` DELEGATES to ``is_legal_transition`` — i.e. it
+        computes no legality decision of its own once the ``WorkflowState``
+        pair is projected to a ``TaskStatus`` pair.
+
+        This imports the real ``STATE_TO_STATUS`` (the same object
+        ``WorkflowStateMachine.transition`` uses), so it cannot catch a wrong
+        *projection* entry — only a wrong *delegation*. ``TestStateToStatusProjection``
+        below pins each projection entry independently (hand-written, not
+        derived from this table) to close that gap.
+        """
         expected_legal = shared_is_legal_transition(
-            _STATE_TO_STATUS[frm], _STATE_TO_STATUS[to], ActorClass.ORCHESTRATOR,
+            STATE_TO_STATUS[frm], STATE_TO_STATUS[to], ActorClass.ORCHESTRATOR,
         )
         machine = WorkflowStateMachine(frm)
         if expected_legal:
@@ -203,13 +197,61 @@ class TestNeverAFourthTable:
             assert machine.state == frm
 
 
-def _make_workflow(*, task_id: str = '77') -> tuple[TaskWorkflow, MagicMock]:
+class TestStateToStatusProjection:
+    """Pins each ``STATE_TO_STATUS`` entry independently of ``WorkflowStateMachine``
+    behavior and of ``TestNeverAFourthTable`` (which imports the same table it is
+    checking, so it can only catch a wrong *delegation*, not a wrong *projection*
+    entry — e.g. it would not notice if ``ESCALATED`` were mapped to
+    ``IN_PROGRESS`` instead of ``BLOCKED``, since both sides of that check would
+    agree on the same wrong value). These assertions are hand-written against
+    the PRD's projection rule instead, so a regression in the map itself fails
+    loudly here.
+    """
+
+    @pytest.mark.parametrize('state', [
+        WorkflowState.PLAN,
+        WorkflowState.EXECUTE,
+        WorkflowState.VERIFY,
+        WorkflowState.REVIEW,
+        WorkflowState.MERGE,
+    ])
+    def test_working_phases_project_to_in_progress(self, state):
+        assert STATE_TO_STATUS[state] == TaskStatus.IN_PROGRESS
+
+    def test_escalated_projects_to_blocked(self):
+        assert STATE_TO_STATUS[WorkflowState.ESCALATED] == TaskStatus.BLOCKED
+
+    def test_merge_deferred_projects_to_itself(self):
+        assert STATE_TO_STATUS[WorkflowState.MERGE_DEFERRED] == TaskStatus.MERGE_DEFERRED
+
+    def test_done_projects_to_itself(self):
+        assert STATE_TO_STATUS[WorkflowState.DONE] == TaskStatus.DONE
+
+    def test_blocked_projects_to_itself(self):
+        assert STATE_TO_STATUS[WorkflowState.BLOCKED] == TaskStatus.BLOCKED
+
+    def test_cancelled_projects_to_itself(self):
+        assert STATE_TO_STATUS[WorkflowState.CANCELLED] == TaskStatus.CANCELLED
+
+    def test_every_workflow_state_has_a_projection_entry(self):
+        """Completeness guard: an unmapped new ``WorkflowState`` member would
+        otherwise surface as a bare ``KeyError`` inside
+        ``WorkflowStateMachine.transition`` rather than failing a targeted test.
+        """
+        assert set(STATE_TO_STATUS) == set(WorkflowState)
+
+
+def _make_workflow(
+    *, task_id: str = '77', event_store: MagicMock | None = None,
+) -> tuple[TaskWorkflow, MagicMock]:
     """Minimal ``TaskWorkflow`` construction, mirroring the ``_make`` builder in
     ``test_workflow_already_done.py`` but trimmed to the state-machine wiring
     surface — no worktree/artifacts are needed for these tests.
 
     Returns ``(workflow, scheduler)`` so callers can assert on scheduler calls
-    (e.g. the ``_mark_blocked`` terminal-absorption guard).
+    (e.g. the ``_mark_blocked`` terminal-absorption guard). Pass ``event_store``
+    (a ``MagicMock``) to additionally assert on ``event_store.emit`` calls
+    (e.g. the ``_enter_phase`` no-phantom-events-on-raise guarantee).
     """
     assignment = MagicMock()
     assignment.task_id = task_id
@@ -228,6 +270,7 @@ def _make_workflow(*, task_id: str = '77') -> tuple[TaskWorkflow, MagicMock]:
         scheduler=scheduler,
         briefing=MagicMock(),
         mcp=MagicMock(),
+        event_store=event_store,
     )
     return wf, scheduler
 
@@ -259,6 +302,19 @@ class TestTaskWorkflowStateMachineWiring:
         with pytest.raises(IllegalTransition):
             wf._enter_phase(WorkflowState.BLOCKED)
         assert wf.state == WorkflowState.DONE
+
+    def test_enter_phase_after_terminal_emits_no_events(self):
+        """The ``_enter_phase`` docstring's load-bearing claim: the machine
+        transition runs BEFORE event emission, so an ``IllegalTransition``
+        short-circuits before any phase_exit/phase_enter event reaches the
+        event store — no phantom events for a move that never happened.
+        """
+        event_store = MagicMock()
+        wf, _ = _make_workflow(event_store=event_store)
+        wf.state = WorkflowState.DONE
+        with pytest.raises(IllegalTransition):
+            wf._enter_phase(WorkflowState.BLOCKED)
+        event_store.emit.assert_not_called()
 
 
 @pytest.mark.asyncio

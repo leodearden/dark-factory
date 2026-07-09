@@ -14,7 +14,9 @@ transition as a THIN VALIDATOR over ``shared.task_transitions`` (W2, task
 escalation server, the fused-memory interceptor, and this machine all
 consume the SAME table). Since ``is_legal_transition`` is keyed on
 ``TaskStatus`` rather than ``WorkflowState``, ``transition`` projects both
-sides through ``_STATE_TO_STATUS`` before delegating.
+sides through ``STATE_TO_STATUS`` before delegating. ``STATE_TO_STATUS`` is
+public (re-exported via ``__all__``) so tests can import the real
+projection instead of maintaining an independent copy.
 """
 
 from __future__ import annotations
@@ -29,6 +31,7 @@ from shared.task_transitions import (
 )
 
 __all__ = [
+    "STATE_TO_STATUS",
     "IllegalTransition",
     "WorkflowOutcome",
     "WorkflowState",
@@ -71,7 +74,14 @@ class IllegalTransition(Exception):
 # phase collapses to IN_PROGRESS (phase order is not W2's authority to enforce);
 # ESCALATED collapses to BLOCKED (it is a blocked-shaped phase); MERGE_DEFERRED/DONE/
 # BLOCKED/CANCELLED project to themselves.
-_STATE_TO_STATUS: dict[WorkflowState, TaskStatus] = {
+#
+# Public (no leading underscore) and re-exported via __all__ so
+# test_workflow_state_machine.py can import this SAME object for its
+# delegation cross-check instead of maintaining an independent copy that
+# could silently drift from this table (see TestStateToStatusProjection in
+# that module for the hand-written per-member pins that keep the check
+# meaningful despite sharing this object).
+STATE_TO_STATUS: dict[WorkflowState, TaskStatus] = {
     WorkflowState.PLAN: TaskStatus.IN_PROGRESS,
     WorkflowState.EXECUTE: TaskStatus.IN_PROGRESS,
     WorkflowState.VERIFY: TaskStatus.IN_PROGRESS,
@@ -90,7 +100,7 @@ class WorkflowStateMachine:
 
     ``transition`` is a THIN VALIDATOR over ``shared.task_transitions`` (W2,
     task 2168): it projects the current and target ``WorkflowState`` through
-    ``_STATE_TO_STATUS`` into ``TaskStatus`` and delegates the legality
+    ``STATE_TO_STATUS`` into ``TaskStatus`` and delegates the legality
     decision to ``is_legal_transition`` — this class defines no transition
     table of its own (G4 decision #1: the escalation server, the
     fused-memory interceptor, and this machine all consume the SAME table).
@@ -129,8 +139,8 @@ class WorkflowStateMachine:
         (``ActorClass.ORCHESTRATOR``, ``reopen=False``). The state is left
         UNCHANGED when the move is illegal.
         """
-        frm_status = _STATE_TO_STATUS[self._state]
-        to_status = _STATE_TO_STATUS[to]
+        frm_status = STATE_TO_STATUS[self._state]
+        to_status = STATE_TO_STATUS[to]
         if not is_legal_transition(frm_status, to_status, ActorClass.ORCHESTRATOR):
             raise IllegalTransition(
                 f'Illegal workflow transition: {self._state.value} -> {to.value} '
