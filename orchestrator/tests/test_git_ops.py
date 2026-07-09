@@ -3525,7 +3525,19 @@ class TestAssertNoConflictMarkers:
         with pytest.raises(RuntimeError) as excinfo:
             await _assert_no_conflict_markers(sha, git_repo, 'test')
 
-        assert conflicted_path in str(excinfo.value)
+        msg = str(excinfo.value)
+        assert conflicted_path in msg
+        # `git grep <tree> -- <pathspec>` prefixes each hit with
+        # `<resolved-sha>:` — the helper strips it via
+        # `line.partition(':')[2]`. A bare substring check would still pass
+        # even if that stripping regressed (e.g. `git grep`'s resolved sha
+        # followed by ':marked.py' is also a substring match on
+        # 'marked.py'), so assert the sha-prefix is actually gone too.
+        assert f':{conflicted_path}' not in msg, (
+            f'expected the resolved-sha prefix to be stripped from the '
+            f'reported path, but found a ":{conflicted_path}" suffix — the '
+            f'sha-prefix stripping regressed: {msg!r}'
+        )
 
     async def test_does_not_raise_on_clean_commit(self, git_repo: Path):
         (git_repo / 'clean.py').write_text('x = 1\n')
@@ -4595,6 +4607,41 @@ class TestWorktreeReuseIdentityGuard:
 @pytest.mark.asyncio
 class TestOrphanWorktreeHelpers:
     """Fix B git_ops helpers: quarantine_worktree, worktree_has_unsaved_work."""
+
+    async def test_quarantine_preserves_conflicted_tree_when_commit_refuses(
+        self, git_ops: GitOps,
+    ):
+        """quarantine_worktree's WIP-commit is best-effort: it wraps
+        self.commit() in `except Exception` and continues (esc-2128-8 commit()
+        guard now raises WorktreeConflictError instead of snapshotting a
+        conflicted tree). Relocation must still happen and the unresolved
+        conflict state — including the literal markers on disk — must
+        survive the move, rather than being silently dropped or discarded.
+        """
+        info = await git_ops.create_worktree('q-conflict-task')
+        wt = info.path
+        conflicted_path = 'foo.py'
+        await _inject_uu_state(wt, conflicted_path)
+        open_marker = '<' * 7
+        mid_marker = '=' * 7
+        close_marker = '>' * 7
+        marker_content = (
+            f'{open_marker} HEAD\nours\n{mid_marker}\ntheirs\n{close_marker} branch\n'
+        )
+        (wt / conflicted_path).write_text(marker_content)
+
+        dest = await git_ops.quarantine_worktree(wt, 'q-conflict-task', 'unit-test')
+
+        assert dest is not None
+        assert dest.parent == git_ops.quarantine_base
+        assert not wt.exists()  # still relocated despite the refused commit
+        # The conflicted file (with its unresolved markers) is preserved
+        # verbatim on disk — never committed, but never lost either.
+        assert (dest / conflicted_path).read_text() == marker_content
+        # Still genuinely mid-conflict at the new location — quarantine
+        # must not have silently resolved or committed it.
+        unmerged = await git_ops._detect_unmerged_paths(dest)
+        assert conflicted_path in unmerged
 
     async def test_quarantine_moves_and_preserves_committed_work(self, git_ops: GitOps):
         info = await git_ops.create_worktree('q-task')
