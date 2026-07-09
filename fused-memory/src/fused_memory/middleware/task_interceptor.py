@@ -1310,22 +1310,6 @@ class TaskInterceptor:
             )
         return check_text_for_scope(text, project_id, registry)
 
-    def _path_guard_error(
-        self,
-        candidate: CandidateTask | None,
-        kwargs: dict,
-        project_id: str,
-    ) -> dict | None:
-        """Back-compat helper: run :meth:`_path_guard_check` and return its error dict.
-
-        Retained for any external callers / subclass overrides that still
-        invoke this method directly.  Production call sites should prefer
-        :meth:`_path_guard_or_skip`, which also fires the scope-violation
-        escalation on rejection.
-        """
-        v = self._path_guard_check(candidate, kwargs, project_id)
-        return v.to_error_dict() if v.is_rejection else None
-
     def _emit_scope_violation_escalation(
         self,
         verdict: PathGuardVerdict,
