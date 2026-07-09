@@ -1904,6 +1904,22 @@ class OrchestratorConfig(BaseSettings):
     # 0/negative value can't drop the settle window or produce an invalid
     # ``--on-active=`` argument.
     orchestrator_restart_on_active_secs: int = Field(default=10)
+    # Rate-cap on the orchestrator's own deploy-on-commit self-redeploy: the
+    # minimum wall-clock interval (seconds) enforced between successive fires.
+    # Unlike the debounce (which coalesces a *single* merge burst), this cap is
+    # restart-safe — persisted to disk — so a stream of orchestrator/src merges
+    # over hours can't churn the daemon through repeated redeploys. 0 disables
+    # the cap (restoring pure debounce behaviour). Deliberately NOT in
+    # RELOADABLE_FIELDS: red-tier / restart-only, matching its sibling
+    # orchestrator_restart_* fields.
+    orchestrator_restart_min_interval_secs: float = Field(
+        default=28800.0,
+        description=(
+            'Minimum wall-clock seconds between successive orchestrator '
+            'self-redeploys; 8h default caps deploy-on-commit churn. '
+            '0 disables.'
+        ),
+    )
 
     # Orphan L0 reaper — re-escalates level-0 escalations whose task has no
     # active workflow/steward (e.g. escalations emitted by the deep reviewer

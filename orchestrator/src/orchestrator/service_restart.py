@@ -27,9 +27,11 @@ Two instances are used in production:
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import time
 from collections.abc import Awaitable, Callable
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -228,6 +230,30 @@ class StaleServiceRestartCoordinator:
         reached, pending and trigger metadata are cleared and a loud ERROR is
         logged (a new ``note_merge`` will re-arm).  The counter resets to 0
         on a successful fire.  Default: 3.
+    min_interval_secs:
+        Minimum WALL-CLOCK seconds enforced between successive successful
+        fires — a restart-safe rate cap on top of the (monotonic, single-burst)
+        debounce.  ``0.0`` (the default) DISABLES the cap entirely, preserving
+        byte-identical behaviour for coordinators that don't need it
+        (fused-memory, dashboard).  When ``> 0`` and the last fire was less
+        than ``min_interval_secs`` ago, ``maybe_restart`` defers WITHOUT
+        clearing pending (it fires as soon as the window elapses).  Used by the
+        orchestrator's own self-redeploy coordinator to cap deploy-on-commit
+        churn to ~1 per 8 h.
+    wall_clock:
+        Injectable callable returning a WALL-CLOCK epoch float (default:
+        ``time.time``).  This is deliberately SEPARATE from ``clock`` (the
+        monotonic debounce source): the min-interval cap must survive process
+        restarts, and ``time.monotonic`` resets to ~0 on every boot, so it
+        cannot anchor a persisted last-fire timestamp.  Override in tests for
+        determinism.
+    state_path:
+        Optional path to a JSON file persisting the last successful fire's
+        wall-clock timestamp, so the min-interval cap survives an orchestrator
+        restart / redeploy.  ``None`` (default) → the cap is in-memory only
+        (no persistence).  At construction the file is read (fail-open: a
+        missing / corrupt / unreadable file → no seeded timestamp, never
+        raises); after each successful fire it is rewritten atomically.
     """
 
     def __init__(
@@ -247,6 +273,9 @@ class StaleServiceRestartCoordinator:
         script_args: list[str] | None = None,
         restart_precondition: Callable[[], bool] | None = None,
         max_executor_failures: int = 3,
+        min_interval_secs: float = 0.0,
+        wall_clock: Callable[[], float] = time.time,
+        state_path: Path | None = None,
     ) -> None:
         self._git_ops = git_ops
         self._event_store = event_store
@@ -274,6 +303,17 @@ class StaleServiceRestartCoordinator:
         self._restart_precondition = restart_precondition
         # Bound on consecutive TRANSIENT executor failures before giving up.
         self._max_executor_failures = max_executor_failures
+        # Restart-safe rate cap (wall-clock). 0.0 → disabled (byte-identical to
+        # the pre-cap behaviour). The wall_clock source is intentionally NOT
+        # self._clock (monotonic) because the cap must survive a process
+        # restart, and monotonic resets on every boot.
+        self._min_interval_secs = min_interval_secs
+        self._wall_clock = wall_clock
+        self._state_path = state_path
+        # Persisted epoch of the last successful fire (None → never fired, or
+        # no persisted state). Seeded fail-open from state_path at construction:
+        # a missing / corrupt / unreadable file must never raise here.
+        self._last_fire_wall: float | None = self._load_last_fire_wall()
 
         # State
         self._pending: bool = False
@@ -389,6 +429,24 @@ class StaleServiceRestartCoordinator:
                 )
                 return False
 
+        # Restart-safe minimum-interval rate cap (wall-clock). Enforced AFTER
+        # every other gate so it only ever gates an otherwise-ready fire. When
+        # the window hasn't elapsed we defer WITHOUT clearing pending, so the
+        # restart fires on the first idle tick after the window opens.
+        if (
+            self._min_interval_secs > 0
+            and self._last_fire_wall is not None
+        ):
+            elapsed = self._wall_clock() - self._last_fire_wall
+            if elapsed < self._min_interval_secs:
+                logger.info(
+                    f'{self._service_name} skip redeploy: %.0fs since last,'
+                    ' %.0fs cap (pending retained).',
+                    elapsed,
+                    self._min_interval_secs,
+                )
+                return False
+
         # Snapshot trigger metadata before clearing
         trigger_task_ids = list(self._trigger_task_ids)
         trigger_merge_shas = list(self._trigger_merge_shas)
@@ -476,6 +534,13 @@ class StaleServiceRestartCoordinator:
         # (note_merge re-arming does NOT reset it — only success/exhaustion do.)
         self._consecutive_executor_failures = 0
 
+        # Stamp the min-interval rate cap AFTER the fire succeeded, then persist
+        # it (restart-safe). Persist failures are non-fatal: the restart already
+        # happened, so a lost timestamp merely relaxes the cap once — never
+        # blocks the pipeline.
+        self._last_fire_wall = self._wall_clock()
+        self._persist_last_fire_wall(self._last_fire_wall)
+
         return True
 
     async def _default_restart_executor(self) -> None:
@@ -492,3 +557,60 @@ class StaleServiceRestartCoordinator:
         )
         # Intentionally NOT awaiting the process exit — the script runs
         # detached so its health-poll never blocks the orchestrator event loop.
+
+    # ------------------------------------------------------------------
+    # Min-interval rate-cap persistence (restart-safe)
+    # ------------------------------------------------------------------
+
+    def _load_last_fire_wall(self) -> float | None:
+        """Read the persisted last-fire epoch from ``state_path`` (fail-open).
+
+        Returns the stored ``ts`` float, or ``None`` when there is no
+        ``state_path``, the file is missing, or the file is corrupt /
+        unreadable / malformed.  MUST never raise — a broken state file simply
+        relaxes the cap (treated as "never fired") rather than crashing
+        construction.
+        """
+        if self._state_path is None:
+            return None
+        try:
+            raw = json.loads(self._state_path.read_text(encoding='utf-8'))
+            ts = raw['ts']
+            return float(ts)
+        except FileNotFoundError:
+            return None
+        except (OSError, ValueError, TypeError, KeyError) as exc:
+            logger.warning(
+                '%s restart: ignoring unreadable/corrupt rate-cap state at %s: %s',
+                self._service_name,
+                self._state_path,
+                exc,
+            )
+            return None
+
+    def _persist_last_fire_wall(self, ts: float) -> None:
+        """Atomically persist the last-fire epoch to ``state_path`` (non-fatal).
+
+        Mirrors ``MergeQueueStore._save_raw``: lazy ``mkdir(parents=True)`` +
+        tmp-file write + ``os.replace``.  A failure here is swallowed to a
+        WARNING — the restart already fired, so a lost timestamp must not block
+        anything.
+        """
+        if self._state_path is None:
+            return
+        try:
+            self._state_path.parent.mkdir(parents=True, exist_ok=True)
+            payload = {
+                'ts': ts,
+                'iso': datetime.fromtimestamp(ts, tz=UTC).isoformat(),
+            }
+            tmp = self._state_path.with_suffix('.json.tmp')
+            tmp.write_text(json.dumps(payload), encoding='utf-8')
+            tmp.replace(self._state_path)
+        except OSError as exc:
+            logger.warning(
+                '%s restart: failed to persist rate-cap state to %s: %s',
+                self._service_name,
+                self._state_path,
+                exc,
+            )

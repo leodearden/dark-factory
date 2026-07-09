@@ -6739,6 +6739,20 @@ Output JSON matching the schema. Every task must appear in the output.
                 on_active_secs=max(self.config.orchestrator_restart_on_active_secs, 5),
             )
 
+        # Restart-safe rate cap on the self-redeploy (task 2371). The last-fire
+        # timestamp is persisted next to the merge-queue journal
+        # (data/orchestrator/*.json); its parent dir is created lazily by the
+        # coordinator's atomic writer (mirroring MergeQueueStore._save_raw), so
+        # no eager mkdir is needed here. Only the orchestrator's OWN coordinator
+        # gets a non-zero cap — the fused-memory/dashboard builders keep the
+        # 0.0 default (no gating), so their behaviour is unchanged.
+        redeploy_state_path = (
+            Path(self.config.project_root)
+            / 'data'
+            / 'orchestrator'
+            / 'last_redeploy_orchestrator.json'
+        )
+
         return StaleServiceRestartCoordinator(
             git_ops=self.git_ops,
             event_store=self.event_store,
@@ -6752,6 +6766,8 @@ Output JSON matching the schema. Every task must appear in the output.
             script_args=[],
             restart_precondition=self._merge_pipeline_idle,
             restart_executor=_systemd_run_restart_executor,
+            min_interval_secs=self.config.orchestrator_restart_min_interval_secs,
+            state_path=redeploy_state_path,
         )
 
     async def _maybe_restart_stale_service(self, *, agents_idle: bool) -> bool:

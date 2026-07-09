@@ -51,6 +51,10 @@ def harness(tmp_path: Path, mock_orch_config):
     mock_orch_config.orchestrator_restart_watch_prefixes = ['orchestrator/src/']
     mock_orch_config.orchestrator_restart_script = 'scripts/restart-orchestrator.sh'
     mock_orch_config.orchestrator_restart_on_active_secs = 10
+    # Restart-safe self-redeploy rate cap (task 2371). Mirrors the real Config
+    # default (8h). Only the orchestrator's own coordinator receives this — the
+    # fused-memory/dashboard builders keep the 0.0 default (no gating).
+    mock_orch_config.orchestrator_restart_min_interval_secs = 28800.0
 
     with patch('orchestrator.harness.McpLifecycle'), \
          patch('orchestrator.harness.Scheduler'), \
@@ -619,6 +623,43 @@ class TestBuildOrchestratorRestartCoordinator:
 
         assert coord._project_root == Path(harness.config.project_root)
 
+    def test_min_interval_secs_matches_config_default(self, harness: Harness):
+        """The orchestrator coordinator gets the config's min-interval cap (28800.0)."""
+        coord = harness._build_orchestrator_restart_coordinator()
+
+        assert coord._min_interval_secs == 28800.0
+
+    def test_state_path_under_data_orchestrator(self, harness: Harness):
+        """The rate-cap state file lives beside the merge-queue journal.
+
+        Restart-safety of the cap depends on a persisted last-fire timestamp;
+        it must be anchored under <project_root>/data/orchestrator/ (durable),
+        NOT inside a worktree or a scratch dir.
+        """
+        coord = harness._build_orchestrator_restart_coordinator()
+
+        expected = (
+            Path(harness.config.project_root)
+            / 'data'
+            / 'orchestrator'
+            / 'last_redeploy_orchestrator.json'
+        )
+        assert coord._state_path == expected
+
+    def test_fused_memory_coordinator_has_no_rate_cap(self, harness: Harness):
+        """fused-memory keeps the 0.0 default → its behaviour is unchanged."""
+        coord = harness._build_service_restart_coordinator()
+
+        assert coord._min_interval_secs == 0.0
+        assert coord._state_path is None
+
+    def test_dashboard_coordinator_has_no_rate_cap(self, harness: Harness):
+        """dashboard keeps the 0.0 default → its behaviour is unchanged."""
+        coord = harness._build_dashboard_restart_coordinator()
+
+        assert coord._min_interval_secs == 0.0
+        assert coord._state_path is None
+
 
 # ---------------------------------------------------------------------------
 # U2 (task 1973): end-to-end — armed -> drain-gated -> systemd-run fire
@@ -645,6 +686,12 @@ class TestOrchestratorCoordinatorEndToEnd:
         """
         harness.config.orchestrator_restart_on_merge_enabled = True
         harness.config.orchestrator_restart_debounce_secs = 0.0
+        # Disable the self-redeploy rate cap (task 2371) for this test: it
+        # deliberately fires TWICE in one process lifetime to prove the
+        # transient-unit counter advances — a concern orthogonal to the cap,
+        # which has its own dedicated coverage. With the 8h default active the
+        # second fire would be (correctly) throttled, masking the counter check.
+        harness.config.orchestrator_restart_min_interval_secs = 0.0
 
         with patch('orchestrator.merge_queue.SpeculativeMergeWorker') as mock_smw, \
              patch('asyncio.create_task'), \
