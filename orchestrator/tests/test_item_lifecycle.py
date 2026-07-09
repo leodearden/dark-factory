@@ -14,10 +14,6 @@ Steps covered:
   step-9/10    — GATE_REVERIFY -> MERGING cascade edge (see design_decisions)
 
 Amendments (post-verification reviewer_comprehensive pass):
-  * TestItemLifecycleStateOverlapWithLivePhaseStrings pins the
-    VERIFYING/GATE_REVERIFY/FINALIZING wire-value overlap against the real
-    pipeline call sites (test_coverage + architecture_documentation_accuracy
-    findings) instead of only comparing the enum against its own literals.
   * TestItemLifecycleTransitionRedispatchParkedEntryEdges gives the
     AWAITING_VERIFY -> REDISPATCH_PARKED and MERGING -> REDISPATCH_PARKED
     edges dedicated standalone happy-path coverage (test_coverage finding).
