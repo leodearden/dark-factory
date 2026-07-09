@@ -222,7 +222,11 @@ def spawn_verify_merge(
 
 
 def spawn_ssh_heartbeat_dispatcher(
-    *, argv: list[str], cwd: str | None = None, heartbeat_interval: float = 0.2,
+    *,
+    argv: list[str],
+    cwd: str | None = None,
+    heartbeat_interval: float = 0.2,
+    extra_env: dict[str, str] | None = None,
 ) -> subprocess.Popen:
     """Spawn a SEPARATE process running the REAL verify_runner._default_ssh_heartbeat_run.
 
@@ -232,6 +236,14 @@ def spawn_ssh_heartbeat_dispatcher(
     grandchild (verify-merge) a clean EOF on fd 0 -- exactly the connection-
     death signal the stdin watchdog (verify_cancel.run_stdin_watchdog) reacts
     to, without needing any process-group trickery.
+
+    *extra_env* lands in the DISPATCHER's own environment.  Since
+    ``_default_ssh_heartbeat_run`` spawns *argv* via
+    ``asyncio.create_subprocess_exec`` with no explicit ``env=`` override, the
+    grandchild (verify-merge) ambiently inherits it too -- the same
+    one-more-remove mechanism :func:`apply_dispatcher_env` documents for the
+    in-process case.  Used to thread the step-2 watchdog env-seam overrides
+    through for a fast, deterministic Row 1 assertion window.
     """
     worktree_src = str(Path(__file__).parent.parent / 'src')
     script = (
@@ -244,7 +256,7 @@ def spawn_ssh_heartbeat_dispatcher(
     )
     return subprocess.Popen(
         [sys.executable, '-c', script],
-        env=subprocess_env(),
+        env=subprocess_env(extra_env),
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
     )
@@ -639,3 +651,72 @@ def test_cancel_verify_tree_kills_under_live_watchdog(tmp_path, monkeypatch):
         if child.poll() is None:
             child.kill()
             child.wait(timeout=5)
+
+
+# ---------------------------------------------------------------------------
+# Task 2309 step-7/8 -- SS9 Row 1: orchestrator (dispatcher) killed mid-build
+# (EOF path via whole-dispatcher death).  A SEPARATE killable process runs the
+# REAL verify_runner._default_ssh_heartbeat_run; SIGKILLing it closes its end
+# of the child's stdin pipe, delivering a clean EOF -- distinct from Row 3's
+# heartbeat-timeout (select-timeout) branch, which keeps stdin open but silent.
+# ---------------------------------------------------------------------------
+
+
+def test_orchestrator_killed_mid_build_tree_killed_via_eof(tmp_path):
+    """SS9 Row 1: dispatcher process killed -> child sees stdin EOF -> tree-killed.
+
+    Models "the orchestrator holding the ssh child died": spawns a SEPARATE
+    dispatcher process running the REAL ``_default_ssh_heartbeat_run`` against
+    a local ``verify-merge --request-id`` argv (small heartbeat_interval so
+    real heartbeats flow while the dispatcher is alive).  Waits for the
+    sleeper subtree to appear, then SIGKILLs the dispatcher process itself --
+    when the OS reclaims its file descriptors, ITS end of the child's stdin
+    pipe closes, giving the grandchild a clean EOF on fd 0.
+
+    The step-2 env seam is threaded through the dispatcher's own environment
+    (:func:`spawn_ssh_heartbeat_dispatcher`'s *extra_env*, ambiently inherited
+    by the grandchild verify-merge) so the assertion window is small and
+    deterministic rather than the 10s+5s production window.  Per
+    ``run_stdin_watchdog``, EOF fires on the very next ``select`` readiness
+    check regardless of *heartbeat_timeout* -- only ``grace_secs`` (the
+    SIGTERM->SIGKILL pause in ``fire_watchdog_kill``) materially bounds this
+    row's timing; both overrides are set for a documented, generous ceiling.
+
+    Asserts within a bounded T: the full descendant subtree (including the
+    start_new_session sleeper escape) AND the pgid leader are gone.
+    """
+    repo, head_sha = _setup_verify_repo(tmp_path)
+    cfg_file = tmp_path / 'config.yaml'
+    write_verify_config(cfg_file, repo, persistent_merge_worktree=False)
+    worktree_base = worktree_base_for(repo)
+
+    REQUEST_ID = 'row1-orchestrator-killed'
+    pgf = pgid_file(worktree_base, REQUEST_ID)
+
+    argv = verify_merge_argv(
+        sha=head_sha, spec=sleeper_spec(300.0), cfg_file=cfg_file, request_id=REQUEST_ID,
+    )
+    dispatcher = spawn_ssh_heartbeat_dispatcher(
+        argv=argv,
+        heartbeat_interval=0.2,
+        extra_env={
+            'ORCH_WATCHDOG_HEARTBEAT_TIMEOUT_SECS': '1.0',
+            'ORCH_WATCHDOG_KILL_GRACE_SECS': '0.5',
+        },
+    )
+    try:
+        pgid_val = wait_for_pgid_file(pgf)
+        wait_subtree_live(pgid_val)
+
+        dispatcher.kill()
+        dispatcher.wait(timeout=10)
+
+        assert wait_subtree_gone(pgid_val, timeout=10.0), (
+            f'pgid {pgid_val}: subtree and/or leader still alive after the '
+            f'dispatcher was killed (EOF-triggered watchdog tree-kill did '
+            f'not fire)'
+        )
+    finally:
+        if dispatcher.poll() is None:
+            dispatcher.kill()
+            dispatcher.wait(timeout=5)
