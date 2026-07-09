@@ -19,7 +19,12 @@ from typing import Any
 
 import aiosqlite
 from shared.async_sqlite_base import apply_full_durability_pragmas, connect_daemon
-from shared.task_metadata import SchemaWarning, apply_migrations, parse_metadata
+from shared.task_metadata import (
+    _WHOLE_METADATA_FIELD,
+    SchemaWarning,
+    apply_migrations,
+    parse_metadata,
+)
 from shared.task_statuses import TaskStatus
 
 from fused_memory.backends.task_backend_errors import DuplicateCandidateKeyError, TaskmasterError
@@ -1274,16 +1279,30 @@ class SqliteTaskBackend:
         project_root: str,
         tag: str,
         task_id: int,
+        incoming_keys: set[str] | None = None,
     ) -> None:
         """Validate a ``metadata`` JSON blob at the add_task/update_task write boundary.
 
-        Delegates to the shared ``parse_metadata`` (direction='write',
-        ``enforce=self._task_metadata_enforce``). In warn-mode (the default)
-        every returned :class:`SchemaWarning` is logged as one
-        ``task_metadata.schema_warning`` census line and the write proceeds
-        unchanged. In enforce-mode, a malformed blob's raise
-        (``ValidationError`` / ``ValueError`` / ``TypeError``) propagates
-        uncaught — the caller's ``_txn`` rolls back.
+        Always parses once in warn-mode (``enforce=False``) so every
+        :class:`SchemaWarning` the blob produces — including ones that would
+        otherwise raise — is logged as one ``task_metadata.schema_warning``
+        census line (unchanged census behaviour).
+
+        In enforce-mode, a second, authoritative pass decides whether to
+        raise. ``incoming_keys`` — the top-level keys the CURRENT write
+        actually supplied (``None`` means "unknown/whole-blob", e.g.
+        ``add_task``, which enforces every field) — scopes the raise to
+        findings the write is responsible for (task 2401): a warning whose
+        ``field`` is in ``incoming_keys``, or the whole-blob sentinel
+        (:data:`_WHOLE_METADATA_FIELD`, always fatal), re-triggers validation
+        with ``enforce=True`` so the authentic ``ValidationError`` /
+        ``ValueError`` / ``TypeError`` propagates uncaught — the caller's
+        ``_txn`` rolls back. This tolerates an untouched legacy field (e.g. a
+        pre-existing ``done_provenance`` missing the now-required ``kind``)
+        rather than blocking every future write to the row. The heuristic can
+        over-flag (e.g. an ``unknown_key`` warning, which ``parse_metadata``
+        never actually raises on) — the second call self-corrects since it
+        only raises for findings that are genuinely fatal in enforce-mode.
 
         ``project_root``/``tag`` are accepted but not yet read by this method
         — the census line only carries ``task_id``/field/error. They mirror
@@ -1292,11 +1311,19 @@ class SqliteTaskBackend:
         by project) can use them without changing either call site's
         signature.
         """
-        _, warnings = parse_metadata(
-            metadata, direction='write', enforce=self._task_metadata_enforce,
-        )
+        _, warnings = parse_metadata(metadata, direction='write', enforce=False)
         for warning in warnings:
             _emit_schema_warning(task_id, warning)
+        if self._task_metadata_enforce and warnings:
+            if incoming_keys is None:
+                should_reraise = True
+            else:
+                should_reraise = any(
+                    w.field == _WHOLE_METADATA_FIELD or w.field in incoming_keys
+                    for w in warnings
+                )
+            if should_reraise:
+                parse_metadata(metadata, direction='write', enforce=True)
 
     async def add_task(
         self,
@@ -1549,8 +1576,28 @@ class SqliteTaskBackend:
                 # on submit. Warn-mode logs the census line and proceeds;
                 # enforce-mode's raise propagates out of this `async with
                 # self._txn(...)`, rolling back the UPDATE below.
+                #
+                # incoming_keys (task 2401, fix b): the top-level keys of THIS
+                # write's own payload — not the post-merge blob — so enforce
+                # mode only blocks on findings this write is responsible for.
+                # An untouched legacy field (e.g. a pre-existing
+                # done_provenance missing the now-required kind) is tolerated
+                # rather than permanently blocking every future patch to the
+                # row. Falls back to None (enforce-all) when the payload
+                # isn't a JSON object — _merge_metadata already treats a
+                # non-dict incoming blob as last-write-wins, so there is no
+                # narrower "responsibility" to scope to here.
+                incoming_keys: set[str] | None = None
+                try:
+                    _loaded_incoming = json.loads(metadata)
+                except (TypeError, ValueError):
+                    pass
+                else:
+                    if isinstance(_loaded_incoming, dict):
+                        incoming_keys = set(_loaded_incoming.keys())
                 await self._validate_metadata_on_write(
                     new_metadata, project_root=project_root, tag=tag, task_id=tid,
+                    incoming_keys=incoming_keys,
                 )
                 set_columns.append('metadata = ?')
                 set_values.append(new_metadata)
