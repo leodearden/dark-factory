@@ -7520,6 +7520,175 @@ class TestFilterBlockedSnapshotFindings:
 
 
 # ---------------------------------------------------------------------------
+# TestAcknowledgeFlagMarkerLedger / TestAcknowledgeResolvedFlagsLedger
+# (task 2227 step-7) — acknowledge_flag_marker maps to
+# memory_service.recon_ledger.mark_addressed; RED until step-8 rewrites
+# acknowledge_flag_marker and acknowledge_resolved_flags onto the ledger, at
+# which point these classes fold into TestAcknowledgeFlagMarkerDelete/Tag/
+# ResolvedFlags below (replacing their Mem0 search+delete/tag bodies).
+# ---------------------------------------------------------------------------
+
+
+class TestAcknowledgeFlagMarkerLedger:
+    """acknowledge_flag_marker(memory_service, ...) maps to
+    memory_service.recon_ledger.mark_addressed — no Mem0 find_prior_memories
+    search, no delete_memory fan-out."""
+
+    @pytest.mark.asyncio
+    async def test_seeded_marker_acknowledged_flips_to_addressed(self, ledger_memory_service):
+        """A seeded stage1_flag_marker row is acknowledged: returns 1 and the
+        row's state flips to 'addressed' with addressed_by/addressed_run_id
+        stamped from run_id."""
+        from fused_memory.reconciliation.flag_dedup import acknowledge_flag_marker
+
+        await _seed_marker(ledger_memory_service.recon_ledger, 'p', '42', 'missing_deliverable')
+
+        result = await acknowledge_flag_marker(
+            ledger_memory_service,
+            project_id='p',
+            run_id='rk',
+            task_id='42',
+            flag_type='missing_deliverable',
+        )
+        assert result == 1
+
+        row = await ledger_memory_service.recon_ledger.get_by_identity(
+            'p', 'stage1_flag_marker', '42', 'missing_deliverable', ''
+        )
+        assert row is not None
+        assert row.state == 'addressed'
+        payload = json.loads(row.payload_json)
+        assert payload['addressed_by'] == 'rk'
+        assert payload['addressed_run_id'] == 'rk'
+
+        ledger_memory_service.search.assert_not_called()
+        ledger_memory_service.delete_memory.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_no_prior_row_returns_0_creates_nothing(self, ledger_memory_service):
+        """Acknowledging a signature with no ledger row returns 0 and creates
+        no row (mark_addressed no-op — no resurrection of a GC'd marker)."""
+        from fused_memory.reconciliation.flag_dedup import acknowledge_flag_marker
+
+        result = await acknowledge_flag_marker(
+            ledger_memory_service,
+            project_id='p',
+            run_id='rk',
+            task_id='99',
+            flag_type='missing_deliverable',
+        )
+        assert result == 0
+
+        row = await ledger_memory_service.recon_ledger.get_by_identity(
+            'p', 'stage1_flag_marker', '99', 'missing_deliverable', ''
+        )
+        assert row is None
+
+        ledger_memory_service.search.assert_not_called()
+        ledger_memory_service.delete_memory.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_invalid_task_id_returns_0_no_io(self, ledger_memory_service):
+        """An invalid task_id short-circuits to 0 with no Mem0 I/O."""
+        from fused_memory.reconciliation.flag_dedup import acknowledge_flag_marker
+
+        result = await acknowledge_flag_marker(
+            ledger_memory_service,
+            project_id='p',
+            run_id='rk',
+            task_id='not-a-number',
+            flag_type='missing_deliverable',
+        )
+        assert result == 0
+
+        ledger_memory_service.search.assert_not_called()
+        ledger_memory_service.delete_memory.assert_not_called()
+        ledger_memory_service.add_memory.assert_not_called()
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize('mode', ['delete', 'tag'])
+    async def test_delete_and_tag_modes_both_mark_addressed(self, ledger_memory_service, mode):
+        """mode='delete' and mode='tag' behave identically — both map to
+        ledger.mark_addressed (the ledger has no delete; 'addressed' state is
+        the durable acknowledgement)."""
+        from fused_memory.reconciliation.flag_dedup import acknowledge_flag_marker
+
+        await _seed_marker(ledger_memory_service.recon_ledger, 'p', '7', 'stale_metadata')
+
+        result = await acknowledge_flag_marker(
+            ledger_memory_service,
+            project_id='p',
+            run_id='rk',
+            task_id='7',
+            flag_type='stale_metadata',
+            mode=mode,
+        )
+        assert result == 1
+
+        row = await ledger_memory_service.recon_ledger.get_by_identity(
+            'p', 'stage1_flag_marker', '7', 'stale_metadata', ''
+        )
+        assert row.state == 'addressed'
+
+
+class TestAcknowledgeResolvedFlagsLedger:
+    """acknowledge_resolved_flags(memory_service, ...) de-dupes signatures and
+    fans out to the ledger-backed acknowledge_flag_marker — no Mem0
+    find_prior_memories search, no delete_memory fan-out."""
+
+    @pytest.mark.asyncio
+    async def test_duplicate_signature_acknowledged_once_and_summed(self, ledger_memory_service):
+        """Two flags reducing to the same (task_id, flag_type) signature
+        acknowledge exactly once; the single ack's count (1) is the total."""
+        from fused_memory.reconciliation.flag_dedup import acknowledge_resolved_flags
+
+        await _seed_marker(ledger_memory_service.recon_ledger, 'p', '42', 'missing_deliverable')
+
+        resolved_flags = [
+            {'task_id': 42, 'flag_type': 'missing_deliverable'},
+            {'task_id': 42, 'flag_type': 'missing_deliverable'},
+        ]
+        total = await acknowledge_resolved_flags(ledger_memory_service, 'p', 'rk', resolved_flags)
+
+        assert total == 1
+        ledger_memory_service.search.assert_not_called()
+        ledger_memory_service.delete_memory.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_distinct_signatures_summed(self, ledger_memory_service):
+        """Two distinct (task_id, flag_type) signatures each with a seeded row
+        acknowledge independently and the counts sum to 2."""
+        from fused_memory.reconciliation.flag_dedup import acknowledge_resolved_flags
+
+        await _seed_marker(ledger_memory_service.recon_ledger, 'p', '42', 'missing_deliverable')
+        await _seed_marker(ledger_memory_service.recon_ledger, 'p', '7', 'stale_metadata')
+
+        resolved_flags = [
+            {'task_id': 42, 'flag_type': 'missing_deliverable'},
+            {'task_id': 7, 'flag_type': 'stale_metadata'},
+        ]
+        total = await acknowledge_resolved_flags(ledger_memory_service, 'p', 'rk', resolved_flags)
+
+        assert total == 2
+
+    @pytest.mark.asyncio
+    async def test_unsignable_flags_skipped(self, ledger_memory_service):
+        """A flag with no computable signature is skipped (no crash, no
+        contribution to the total)."""
+        from fused_memory.reconciliation.flag_dedup import acknowledge_resolved_flags
+
+        await _seed_marker(ledger_memory_service.recon_ledger, 'p', '42', 'missing_deliverable')
+
+        resolved_flags = [
+            {'task_id': 42, 'flag_type': 'missing_deliverable'},
+            {},  # unsignable: no task_id, no flag_type, no cited_tasks/description
+        ]
+        total = await acknowledge_resolved_flags(ledger_memory_service, 'p', 'rk', resolved_flags)
+
+        assert total == 1
+
+
+# ---------------------------------------------------------------------------
 # Generic flag-acknowledgment mechanism (task-2029)
 #
 # acknowledge_flag_marker(mode='delete') — step-1 RED tests.
