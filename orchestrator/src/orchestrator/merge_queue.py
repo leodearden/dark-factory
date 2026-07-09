@@ -7690,6 +7690,13 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                         await self._verifier_queue.put(_decided_item)
                         # η: stamp the detached token onto the enqueued item so
                         # the verifier can release this SAME token on drain.
+                        # INVARIANT — no `await` between put() and this line:
+                        # unbounded asyncio.Queue.put() never suspends, so the
+                        # verifier cannot drain _decided_item while .permit is
+                        # still None. An intervening await (or a future
+                        # bounded queue that can suspend here) would let the
+                        # verifier see permit=None and silently skip the
+                        # release, leaking the token in ledger.live forever.
                         _decided_item.permit = self._speculation_controller.on_transfer_terminal()
                         self._inflight_req = None
                         continue
@@ -7736,6 +7743,13 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                         await self._verifier_queue.put(_decided_item)
                         # η: stamp the detached token onto the enqueued item so
                         # the verifier can release this SAME token on drain.
+                        # INVARIANT — no `await` between put() and this line:
+                        # unbounded asyncio.Queue.put() never suspends, so the
+                        # verifier cannot drain _decided_item while .permit is
+                        # still None. An intervening await (or a future
+                        # bounded queue that can suspend here) would let the
+                        # verifier see permit=None and silently skip the
+                        # release, leaking the token in ledger.live forever.
                         _decided_item.permit = self._speculation_controller.on_transfer_terminal()
                         self._inflight_req = None
                         continue
