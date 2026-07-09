@@ -739,3 +739,45 @@ class TestB7StewardWedgeGuardInherited:
 
         # Producer side: the gate is left consistent afterward.
         await _assert_gate_consistent_after_retry_sequence(gate)
+
+
+# ---------------------------------------------------------------------------
+# B8 -- with every account CAPPED, _on_sighup_async() force-resets each
+# account to AVAILABLE through one _transition(force=True) call apiece (the
+# operator-driven SIGHUP hard reset, DD-4) (producer side), reopening the
+# gate so before_invoke() returns immediately for callers (consumer side).
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestB8SighupUncaps:
+    """All accounts CAPPED, then _on_sighup_async() force-resets every
+    account to AVAILABLE via one _transition(force=True) call each (producer
+    side) and reopens the gate for callers immediately (consumer side)."""
+
+    async def test_sighup_forces_every_account_available_and_reopens_gate(self):
+        gate = make_boundary_gate(['a', 'b', 'c'], wait_for_reset=True)
+        _cap_every_account(gate)
+        assert gate._open.is_set() is False
+        assert _open_invariant_holds(gate)
+
+        gate._reprobe_account = AsyncMock(return_value=None)
+        with (
+            patch.object(gate, '_transition', wraps=gate._transition) as mock_transition,
+            patch('shared.usage_gate.load_dotenv'),
+        ):
+            await gate._on_sighup_async()
+
+        # Producer side: each account reached AVAILABLE through exactly one
+        # forced _transition call -- the SIGHUP hard-reset path (DD-4).
+        force_calls = [c for c in mock_transition.call_args_list if c.kwargs.get('force')]
+        assert len(force_calls) == len(gate._accounts)
+        for acct in gate._accounts:
+            assert acct.phase == AccountPhase.AVAILABLE
+
+        # Consumer side: the gate is reopened for callers immediately.
+        assert gate._open.is_set() is True
+        lease = await asyncio.wait_for(gate.before_invoke(), timeout=1.0)
+        assert lease is not None
+
+        await _drain_bg(gate)
