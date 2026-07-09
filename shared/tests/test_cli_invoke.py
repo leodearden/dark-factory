@@ -1744,6 +1744,42 @@ class TestInvokeClaudeAgentForwardsStartupGraceSecs:
         )
 
 
+class TestInvokeClaudeAgentForwardsProgressExtensionParams:
+    """invoke_claude_agent must forward working_idle_secs/absolute_cap_secs to _run_subprocess.
+
+    Task 2360 step-3 RED: fails until invoke_claude_agent (and _invoke_claude)
+    grow these params and thread them through to _run_subprocess (step-4 GREEN).
+    """
+
+    async def test_invoke_claude_agent_forwards_working_idle_secs_and_absolute_cap_secs(self, tmp_path):
+        """working_idle_secs/absolute_cap_secs passed to invoke_claude_agent reach _run_subprocess.
+
+        Fails today: invoke_claude_agent has no such params → TypeError.
+        """
+        captured: dict = {}
+        minimal_result = _SubprocessResult(
+            stdout='', stderr='', returncode=0, duration_ms=0,
+        )
+
+        async def capturing_run_subprocess(*args, **kwargs):
+            captured.update(kwargs)
+            return minimal_result
+
+        with patch('shared.cli_invoke._run_subprocess', side_effect=capturing_run_subprocess):
+            await invoke_claude_agent(
+                prompt='x', system_prompt='s', cwd=tmp_path,
+                working_idle_secs=1800.0,
+                absolute_cap_secs=7200.0,
+            )
+
+        assert captured.get('working_idle_secs') == 1800.0, (
+            f'working_idle_secs not forwarded to _run_subprocess; captured={captured!r}'
+        )
+        assert captured.get('absolute_cap_secs') == 7200.0, (
+            f'absolute_cap_secs not forwarded to _run_subprocess; captured={captured!r}'
+        )
+
+
 def _make_gate(
     *,
     account_count: int = 2,

@@ -582,6 +582,94 @@ class TestStartupGraceSecsForwarding:
         )
 
 
+@pytest.mark.asyncio
+class TestProgressExtensionParamsForwarding:
+    """invoke_agent and _invoke_claude_with_sandbox must forward
+    working_idle_secs/absolute_cap_secs (task 2360 step-3).
+
+    RED: fails until invoke.py is updated to thread both params through the
+    non-sandbox (invoke_claude_agent) and sandbox (_run_subprocess) paths,
+    mirroring TestStartupGraceSecsForwarding.
+    """
+
+    async def test_non_sandbox_path_forwards_progress_extension_params(self, tmp_path):
+        """Non-sandbox claude path: working_idle_secs/absolute_cap_secs reach invoke_claude_agent.
+
+        Fails today: invoke_agent has no such params → TypeError.
+        """
+        captured_kwargs: dict = {}
+
+        async def capturing_invoke_claude_agent(*args, **kwargs):
+            captured_kwargs.update(kwargs)
+            return AgentResult(success=True, output='')
+
+        with patch(
+            'orchestrator.agents.invoke.invoke_claude_agent',
+            side_effect=capturing_invoke_claude_agent,
+        ):
+            await invoke_agent(
+                prompt='hello', system_prompt='sys', cwd=tmp_path,
+                backend='claude', sandbox_modules=None,
+                working_idle_secs=1800.0,
+                absolute_cap_secs=7200.0,
+            )
+
+        assert captured_kwargs.get('working_idle_secs') == 1800.0, (
+            f'working_idle_secs not forwarded to invoke_claude_agent; captured={captured_kwargs!r}'
+        )
+        assert captured_kwargs.get('absolute_cap_secs') == 7200.0, (
+            f'absolute_cap_secs not forwarded to invoke_claude_agent; captured={captured_kwargs!r}'
+        )
+
+    async def test_sandbox_path_forwards_progress_extension_params(self, tmp_path):
+        """Sandbox-active branch: working_idle_secs/absolute_cap_secs reach _run_subprocess.
+
+        Mirrors TestStartupGraceSecsForwarding.test_sandbox_path_forwards_startup_grace_secs.
+
+        Fails today: _invoke_claude_with_sandbox has no such params → TypeError.
+        """
+        captured_kwargs: dict = {}
+
+        async def mock_run_subprocess(cmd, cwd, env, model, timeout_seconds, **kwargs):
+            captured_kwargs.update(kwargs)
+            return _SubprocessResult(
+                stdout='', stderr='', returncode=0, duration_ms=50, timed_out=False,
+            )
+
+        with (
+            patch(
+                'orchestrator.agents.sandbox_dispatch.resolve_active_backend',
+                return_value='bwrap',
+            ),
+            patch(
+                'orchestrator.agents.sandbox_dispatch.wrap_command',
+                side_effect=lambda cmd, cwd, mods: cmd,
+            ),
+            patch(
+                'orchestrator.agents.invoke._run_subprocess',
+                side_effect=mock_run_subprocess,
+            ),
+        ):
+            await _invoke_claude_with_sandbox(
+                prompt='hello', system_prompt='sys', cwd=tmp_path,
+                model='claude-sonnet-4-5', max_turns=5, max_budget_usd=1.0,
+                allowed_tools=None, disallowed_tools=None,
+                mcp_config=None, output_schema=None,
+                permission_mode='bypassPermissions',
+                sandbox_modules=['m'],
+                effort=None, timeout_seconds=30.0,
+                working_idle_secs=1800.0,
+                absolute_cap_secs=7200.0,
+            )
+
+        assert captured_kwargs.get('working_idle_secs') == 1800.0, (
+            f'working_idle_secs not forwarded to _run_subprocess; captured={captured_kwargs!r}'
+        )
+        assert captured_kwargs.get('absolute_cap_secs') == 7200.0, (
+            f'absolute_cap_secs not forwarded to _run_subprocess; captured={captured_kwargs!r}'
+        )
+
+
 # ===================================================================
 # TestReleaseProbeSlotOnException (orchestrator invoke_with_cap_retry)
 # ===================================================================
