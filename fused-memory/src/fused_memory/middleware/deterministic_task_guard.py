@@ -4,7 +4,8 @@ Validates and injects ``task_kind`` at the fused-memory ``submit_task``
 boundary, blocking ill-formed deterministic task submissions with a clear
 diagnostic before any persistence happens.
 
-## Contract (PRD §4 decisions 1-3, §11.1; boundary scenario B10)
+## Contract (PRD §4 decisions 1-3, §11.1; §5 decisions 1,7,8; boundary
+scenarios B10, B11)
 
 A ``submit_task`` call is rejected (returns a structured ``ValidationError``
 dict) when any of these invariants is violated:
@@ -18,7 +19,17 @@ dict) when any of these invariants is violated:
 4. When ``before_done`` is present on a deterministic task: must be a dict;
    ``script`` required string that resolves UNDER ``project_root``, exists,
    and is executable (``os.access X_OK``); ``timeout_secs`` required positive
-   int.
+   int; ``kind`` (when present) must be one of ``{'deploy', 'predicate'}``.
+5. ``metadata.milestone``, when present, must match the shared ``Milestone``
+   model (``mode='dated'`` with a parseable ``at``, or ``mode='delayed'``
+   with a positive int ``after_secs``). Checked by presence alone — this
+   invariant is orthogonal to ``task_kind`` and applies on both
+   ``'normal'`` and ``'deterministic'`` tasks.
+6. When ``before_done.kind == 'predicate'``: a set ``target_unit`` is
+   forbidden (a predicate has no unit to verify), and top-level
+   ``always_escalates=True`` is forbidden (predicate escalation is
+   conditional on the script's exit code, not unconditional).
+   ``kind='deploy'`` (the default) behaviour is unaffected by this rule.
 
 ``inject_task_kind`` normalises the metadata dict and sets
 ``metadata.task_kind`` so it is persisted alongside ``before_done`` /
@@ -44,6 +55,14 @@ __all__ = [
 logger = logging.getLogger(__name__)
 
 _VALID_KINDS: frozenset[str] = frozenset({'normal', 'deterministic'})
+
+# Mirrors shared.task_metadata.BeforeDone.kind's Literal['deploy', 'predicate']
+# (default 'deploy'). Validated here too so an unrecognized kind is rejected
+# at the submit_task boundary with a targeted diagnostic, rather than
+# silently falling through as deploy-like and only surfacing later — if at
+# all — as a less-targeted warning at the (enforce=False, warn-only) write
+# boundary.
+_VALID_BEFORE_DONE_KINDS: frozenset[str] = frozenset({'deploy', 'predicate'})
 
 # SchemaWarning codes (shared.task_metadata) that mean the WHOLE metadata
 # value was discarded — parse_metadata could not produce any dict at all.
@@ -248,6 +267,18 @@ def _validate_before_done(
             hint="Supply before_done as a JSON object: {'script': '<path>', 'timeout_secs': <n>}.",
         )
 
+    # kind: optional enum (absent -> 'deploy', mirroring the shared BeforeDone
+    # model's default). Checked early, like the task_kind enum check above,
+    # so a typo'd kind (e.g. 'gate') is rejected here instead of silently
+    # falling through as if it were 'deploy'.
+    kind = before_done.get('kind')
+    if kind is not None and kind not in _VALID_BEFORE_DONE_KINDS:
+        valid_list = ', '.join(repr(k) for k in sorted(_VALID_BEFORE_DONE_KINDS))
+        return _validation_error(
+            f"before_done.kind={kind!r} is not valid; must be one of {valid_list}.",
+            hint="Omit 'kind' (defaults to 'deploy'), or set it to 'deploy' or 'predicate'.",
+        )
+
     # script: required non-empty string
     script = before_done.get('script')
     if not isinstance(script, str) or not script.strip():
@@ -299,7 +330,7 @@ def _validate_before_done(
     # kind='predicate' prohibitions (PRD §5 dec 7,8). kind='deploy' (the
     # default, including an omitted 'kind' key) is left byte-identical —
     # these checks are additive and only fire for an explicit predicate.
-    if before_done.get('kind') == 'predicate':
+    if kind == 'predicate':
         if before_done.get('target_unit') is not None:
             return _validation_error(
                 "before_done.target_unit is forbidden when before_done.kind="

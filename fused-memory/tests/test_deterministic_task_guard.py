@@ -723,3 +723,43 @@ class TestDeterministicTaskErrorPredicateBeforeDone:
             str(tmp_path),
         )
         assert result is None
+
+    # -- kind enum validation --------------------------------------------
+
+    def test_unknown_kind_rejects(self, tmp_path):
+        """before_done.kind must be one of {'deploy', 'predicate'} — an
+        unrecognized value (e.g. a typo) is rejected at the guard boundary
+        rather than silently falling through as if it were 'deploy'."""
+        script_name = self._make_script(tmp_path)
+        result = deterministic_task_error(
+            'deterministic',
+            {
+                'before_done': {
+                    'kind': 'gate',
+                    'script': script_name,
+                    'timeout_secs': 60,
+                },
+            },
+            str(tmp_path),
+        )
+        assert result is not None
+        assert result.get('error_type') == 'ValidationError'
+        assert 'kind' in result['error']
+
+    def test_explicit_deploy_kind_accepts(self, tmp_path):
+        """kind='deploy' set explicitly (not just omitted) is still accepted,
+        including alongside target_unit (deploy allows it)."""
+        script_name = self._make_script(tmp_path)
+        result = deterministic_task_error(
+            'deterministic',
+            {
+                'before_done': {
+                    'kind': 'deploy',
+                    'script': script_name,
+                    'timeout_secs': 60,
+                    'target_unit': 'foo.service',
+                },
+            },
+            str(tmp_path),
+        )
+        assert result is None
