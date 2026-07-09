@@ -460,3 +460,125 @@ class TestInjectTaskKind:
             f'empty-string metadata must not emit a WARNING; got '
             f'{[r.message for r in warns]!r}'
         )
+
+
+# ---------------------------------------------------------------------------
+# δ (task 2337, step-1): metadata.milestone validation (deterministic_task_error)
+# ---------------------------------------------------------------------------
+
+
+class TestDeterministicTaskErrorMilestone:
+    """metadata.milestone validation via deterministic_task_error (PRD §6.1).
+
+    milestone is orthogonal to task_kind — allowed (and validated) on BOTH
+    'normal' and 'deterministic' tasks. mode='dated' requires a
+    datetime.fromisoformat-parseable 'at' (and no after_secs); mode='delayed'
+    requires a positive int 'after_secs' (and no 'at'). Delegates to the
+    shared.task_metadata.Milestone pydantic model.
+    """
+
+    # -- rejections ----------------------------------------------------
+
+    def test_delayed_without_after_secs_rejects(self):
+        """mode='delayed' with no after_secs → reject."""
+        result = deterministic_task_error(
+            'normal', {'milestone': {'mode': 'delayed'}}, '/proj',
+        )
+        assert result is not None
+        assert result.get('error_type') == 'ValidationError'
+
+    def test_dated_with_unparseable_at_rejects(self):
+        """mode='dated' with an unparseable at ('not-a-date') → reject."""
+        result = deterministic_task_error(
+            'normal', {'milestone': {'mode': 'dated', 'at': 'not-a-date'}}, '/proj',
+        )
+        assert result is not None
+        assert result.get('error_type') == 'ValidationError'
+
+    def test_dated_without_at_rejects(self):
+        """mode='dated' with no at → reject."""
+        result = deterministic_task_error(
+            'normal', {'milestone': {'mode': 'dated'}}, '/proj',
+        )
+        assert result is not None
+        assert result.get('error_type') == 'ValidationError'
+
+    def test_bogus_mode_rejects(self):
+        """mode='bogus' (invalid enum) → reject."""
+        result = deterministic_task_error(
+            'normal', {'milestone': {'mode': 'bogus'}}, '/proj',
+        )
+        assert result is not None
+        assert result.get('error_type') == 'ValidationError'
+
+    def test_after_secs_zero_rejects(self):
+        """after_secs=0 (non-positive) → reject."""
+        result = deterministic_task_error(
+            'normal', {'milestone': {'mode': 'delayed', 'after_secs': 0}}, '/proj',
+        )
+        assert result is not None
+        assert result.get('error_type') == 'ValidationError'
+
+    def test_after_secs_negative_rejects(self):
+        """after_secs=-1 (non-positive) → reject."""
+        result = deterministic_task_error(
+            'normal', {'milestone': {'mode': 'delayed', 'after_secs': -1}}, '/proj',
+        )
+        assert result is not None
+        assert result.get('error_type') == 'ValidationError'
+
+    def test_after_secs_non_int_rejects(self):
+        """after_secs='7d' (non-int) → reject."""
+        result = deterministic_task_error(
+            'normal', {'milestone': {'mode': 'delayed', 'after_secs': '7d'}}, '/proj',
+        )
+        assert result is not None
+        assert result.get('error_type') == 'ValidationError'
+
+    def test_milestone_as_bare_string_rejects(self):
+        """milestone as a non-dict (bare string) → TypeError-wrapped rejection."""
+        result = deterministic_task_error(
+            'normal', {'milestone': 'not-a-dict'}, '/proj',
+        )
+        assert result is not None
+        assert result.get('error_type') == 'ValidationError'
+
+    def test_milestone_as_list_rejects(self):
+        """milestone as a non-dict (list) → TypeError-wrapped rejection."""
+        result = deterministic_task_error(
+            'normal', {'milestone': ['a', 'b']}, '/proj',
+        )
+        assert result is not None
+        assert result.get('error_type') == 'ValidationError'
+
+    def test_malformed_milestone_via_json_string_metadata_rejects(self):
+        """Malformed milestone supplied via a JSON-string metadata is also rejected."""
+        meta_str = json.dumps({'milestone': {'mode': 'delayed'}})
+        result = deterministic_task_error('normal', meta_str, '/proj')
+        assert result is not None
+        assert result.get('error_type') == 'ValidationError'
+
+    # -- acceptance / orthogonality guards ------------------------------
+
+    def test_dated_valid_at_on_normal_task_accepts(self):
+        """mode='dated' with a valid ISO at, on a NORMAL task → accept."""
+        result = deterministic_task_error(
+            'normal',
+            {'milestone': {'mode': 'dated', 'at': '2026-08-01T00:00:00+00:00'}},
+            '/proj',
+        )
+        assert result is None
+
+    def test_delayed_valid_after_secs_on_deterministic_task_accepts(self):
+        """mode='delayed' with after_secs=604800 on a DETERMINISTIC task carrying
+        always_escalates=True → accept (milestone validated on both task_kinds,
+        without breaking the deterministic accept path)."""
+        result = deterministic_task_error(
+            'deterministic',
+            {
+                'always_escalates': True,
+                'milestone': {'mode': 'delayed', 'after_secs': 604800},
+            },
+            '/proj',
+        )
+        assert result is None
