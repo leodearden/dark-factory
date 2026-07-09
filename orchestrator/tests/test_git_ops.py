@@ -2876,6 +2876,69 @@ class TestWorkingTreeSync:
 
 
 @pytest.mark.asyncio
+class TestAdvanceMainConflictMarkerGate:
+    """advance_main must refuse a merge commit whose tree carries unresolved
+    conflict markers (esc-2128-8 Layer-2 pre-merge backstop) — the last
+    checkpoint before a marker-carrying tree reaches main via update-ref.
+    """
+
+    async def test_advance_main_rejects_tree_with_conflict_markers(
+        self, git_ops: GitOps,
+    ):
+        """A merge commit whose tree contains a column-0 marker file is
+        refused with result == 'conflict_markers' and main does not move."""
+        wt = await git_ops.create_worktree('marker-gate-advance')
+        open_marker = '<' * 7
+        mid_marker = '=' * 7
+        close_marker = '>' * 7
+        (wt.path / 'marked.py').write_text(
+            f'{open_marker} HEAD\nours = 1\n{mid_marker}\ntheirs = 2\n{close_marker} branch\n',
+        )
+        await git_ops.commit(wt.path, 'Add file with conflict markers')
+        merge_result = await git_ops.merge_to_main(wt.path, 'marker-gate-advance')
+        assert merge_result.success
+        assert merge_result.merge_commit is not None
+        assert merge_result.merge_worktree is not None
+
+        _, main_before, _ = await _run(
+            ['git', 'rev-parse', 'main'], cwd=git_ops.project_root,
+        )
+
+        result = await git_ops.advance_main(merge_result.merge_commit)
+        await git_ops.cleanup_merge_worktree(merge_result.merge_worktree)
+
+        assert result.result == 'conflict_markers', (
+            f"Expected result='conflict_markers' for a marker-carrying tree, got {result!r}"
+        )
+
+        _, main_after, _ = await _run(
+            ['git', 'rev-parse', 'main'], cwd=git_ops.project_root,
+        )
+        assert main_before.strip() == main_after.strip(), (
+            'main must NOT advance when the merge tree carries conflict markers'
+        )
+
+    async def test_advance_main_still_advances_clean_merge(
+        self, git_ops: GitOps,
+    ):
+        """Companion case: a clean merge commit (no markers) still advances normally."""
+        wt = await git_ops.create_worktree('marker-gate-clean-advance')
+        (wt.path / 'clean.py').write_text('x = 1\n')
+        await git_ops.commit(wt.path, 'Add clean file')
+        merge_result = await git_ops.merge_to_main(wt.path, 'marker-gate-clean-advance')
+        assert merge_result.success
+        assert merge_result.merge_commit is not None
+
+        result = await git_ops.advance_main(merge_result.merge_commit)
+        if merge_result.merge_worktree:
+            await git_ops.cleanup_merge_worktree(merge_result.merge_worktree)
+
+        assert result.result == 'advanced', (
+            f'Expected a clean merge to still advance, got {result!r}'
+        )
+
+
+@pytest.mark.asyncio
 class TestUnmergedDetection:
     """Tests for the _detect_unmerged_paths helper."""
 
