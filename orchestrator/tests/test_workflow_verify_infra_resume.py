@@ -627,3 +627,58 @@ class TestBoundaryVerifyInfraReproCases:
             f'Expected exactly 2 calls to run_scoped_verification '
             f'(1 failing + 1 succeeding), got {call_count}'
         )
+
+
+# ---------------------------------------------------------------------------
+# Task 2365: bare xdist worker-crash VerifyInfraError retries without ever
+# invoking the debugger.
+# ---------------------------------------------------------------------------
+
+class TestXdistWorkerCrashRetryNoDebugger:
+    """task 2365 step-5: VerifyInfraError(phase='xdist_worker_crash') on
+    attempt 1 -> DONE on retry, debugger never invoked.
+
+    Confirms the end-to-end contract the task requires: a bare pytest-xdist
+    worker crash (esc-2286-21, task 2361 root cause) retries the whole scoped
+    verification via the EXISTING phase-agnostic retry wrapper instead of
+    burning a debugfix iteration chasing a non-reproducible infra flake. No
+    new production code is required for this test to pass —
+    _run_scoped_verification_with_infra_retry already retries on ANY
+    VerifyInfraError regardless of `.phase`; the behaviour is delivered by
+    verify.run_verification's step-4 raise.
+    """
+
+    @pytest.mark.asyncio
+    async def test_xdist_worker_crash_retries_without_invoking_debugger(self):
+        wf = _make(verify_infra_retry_max_attempts=3)
+
+        call_count = 0
+
+        async def fake_run_scoped(*args, **kwargs):
+            nonlocal call_count
+            call_count += 1
+            if call_count == 1:
+                raise VerifyInfraError(phase='xdist_worker_crash', errno=None)
+            return _passed_result()
+
+        sleep_calls = []
+
+        async def fake_sleep(secs):
+            sleep_calls.append(secs)
+
+        with (
+            patch('orchestrator.workflow.run_scoped_verification', side_effect=fake_run_scoped),
+            patch('asyncio.sleep', side_effect=fake_sleep),
+            patch.object(wf, '_invoke', new=AsyncMock()) as mock_invoke,
+        ):
+            outcome = await wf._verify_debugfix_loop()
+
+        assert outcome == WorkflowOutcome.DONE
+        assert call_count == 2, f'Expected 2 calls to run_scoped_verification, got {call_count}'
+        assert len(sleep_calls) >= 1, 'Expected at least one backoff sleep'
+        mock_invoke.assert_not_awaited()
+        assert wf.metrics.verify_attempts == 0, (
+            'metrics.verify_attempts is only incremented immediately before a '
+            'DEBUGGER invocation — it must stay 0 when the failure is retried '
+            'via the infra path and the debugger is never reached'
+        )
