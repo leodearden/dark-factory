@@ -1227,10 +1227,11 @@ async def _run_post_merge_verify(
                     'row — next submission will be abandoned',
                     req.task_id, new_count,
                 )
-        _spawn_merge_verify_dry_run(
-            dry_run_handles, req, merge_wt, reason, detail,
-            event_store=event_store,
-        )
+        if not verify.timed_out:
+            _spawn_merge_verify_dry_run(
+                dry_run_handles, req, merge_wt, reason, detail,
+                event_store=event_store,
+            )
         return MergeOutcome(
             'blocked', reason=reason,
             failure_category=verify.category,
