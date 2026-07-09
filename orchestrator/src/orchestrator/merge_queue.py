@@ -8263,11 +8263,20 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                     # downstream entry.
                     # Release discipline: lease+permit are released in-body
                     # at cancel_and_release / speculation_ledger.release()
-                    # BEFORE _remerge is called. The except handler below
-                    # also runs the chokepoint's release unconditionally on
-                    # the _remerge-raises path (the primary failure mode) —
-                    # safe because both releases are idempotent (task
-                    # 2160/η): no _entry_released guard needed.
+                    # BEFORE _remerge is called. The permit release is
+                    # genuinely idempotent (PermitLedger.release checks
+                    # permit.released first), so the except handler below can
+                    # re-run it unconditionally: no guard needed. The LEASE
+                    # release is NOT idempotent for a REMOTE lease —
+                    # HostAllocator.cancel_and_release unconditionally
+                    # re-issues cancel_verify() before any FREE-check
+                    # (verify_runner.py:2306), and a redundant cancel can
+                    # return rc != 0 and PARK a healthy slot
+                    # (verify_runner.py:2312). So _entry.lease is set to
+                    # None immediately after a successful in-body
+                    # cancel_and_release, below, which makes the chokepoint's
+                    # own `lease is not None` guard skip the redundant cancel
+                    # (task 2160/η).
                     for _entry in _downstream:
                         _entry_status: str | None = None
                         try:
@@ -8301,6 +8310,15 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                                         pass
                             if _entry.lease is not None and _allocator is not None:
                                 await _allocator.cancel_and_release(_entry.lease)
+                                # Successful in-body cancel: clear the lease
+                                # so the except handler's chokepoint call
+                                # below (cancel_lease=True) does not re-issue
+                                # a non-idempotent cancel_and_release on the
+                                # same remote lease (task 2160/η step-10). If
+                                # cancel_and_release itself raises, this line
+                                # is never reached and the lease stays set,
+                                # so the chokepoint still retries the cancel.
+                                _entry.lease = None
                             if _entry.merge_wt is not None:
                                 with contextlib.suppress(BaseException):
                                     await self._cleanup_owned_merge_worktree(
@@ -8356,10 +8374,17 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                             # The in-body release above may have already run
                             # (lease/permit/merge-worktree), or may not have
                             # completed if it raised (e.g. cancel_and_release
-                            # itself raised) — the chokepoint's release is
-                            # unconditional and idempotent (task 2160/η), so
-                            # it is safe either way: a no-op if already
-                            # released, a best-effort release otherwise.
+                            # itself raised). The permit/worktree releases
+                            # are genuinely idempotent, so the chokepoint's
+                            # release of those is safe either way. The lease
+                            # is handled differently: a successful in-body
+                            # cancel_and_release set _entry.lease to None
+                            # above, so the chokepoint's own `lease is not
+                            # None` guard skips a redundant (non-idempotent
+                            # for a REMOTE lease) cancel_and_release; if the
+                            # in-body cancel itself raised, _entry.lease is
+                            # still set and this is the first-and-only
+                            # release attempt (task 2160/η).
                             await self._resolve_and_release(
                                 _entry, MergeOutcome(
                                     'blocked',
@@ -8734,17 +8759,30 @@ class SpeculativeMergeWorker(_WipHaltMixin):
         equivalence is intentional and holds uniformly across all six call
         sites now unified behind this chokepoint.
 
-        Releases are unconditional and idempotent (task 2160/η): every
-        resource this method touches tolerates a second release as a silent
-        no-op — ``HostAllocator.release``/``cancel_and_release`` FREE-check
-        the lease slot, ``_cleanup_owned_merge_worktree`` pops from
-        ``_owned_merge_worktrees``, and ``PermitLedger.release`` checks
-        ``permit.released`` first before touching the ledger. So a caller
-        whose own code path (``_finalize_inflight``'s ``finally``, or the
-        cascade handler's in-body release) already released these resources
-        can invoke this chokepoint unconditionally, with no
-        ``release_resources`` flag needed — removed along with the cascade
-        loop's now-redundant ``_entry_released`` guard.
+        Releases are unconditional and idempotent for every resource except a
+        ``cancel_lease=True`` release of a REMOTE lease (task 2160/η).
+        ``_cleanup_owned_merge_worktree`` pops from ``_owned_merge_worktrees``
+        and ``PermitLedger.release`` checks ``permit.released`` first, so
+        both silently no-op on a repeat call; plain ``HostAllocator.release``
+        also FREE-checks the lease slot before doing anything, so it too is
+        idempotent. ``HostAllocator.cancel_and_release`` is NOT: for a remote
+        lease it unconditionally re-issues ``cancel_verify()`` BEFORE any
+        FREE-check (verify_runner.py:2306), and a redundant cancel on an
+        already-cancelled remote verify can return a non-zero rc, which
+        PARKs the slot rather than raising (verify_runner.py:2312) — a state
+        mutation the surrounding ``contextlib.suppress`` does not undo. So a
+        caller whose own code path already released these resources
+        (``_finalize_inflight``'s ``finally``, which always uses plain
+        ``release``; or the cascade handler's in-body release, which uses
+        ``cancel_and_release`` and therefore also clears ``entry.lease`` to
+        ``None`` immediately after a successful release) can invoke this
+        chokepoint unconditionally, with no ``release_resources`` flag
+        needed — removed along with the cascade loop's now-redundant
+        ``_entry_released`` guard. The ordinary ``if lease is not None``
+        guard below does double duty: it skips the lease step for a
+        lease-less ``SpeculativeItem``/already-released ``InflightEntry``
+        input, AND it is what the cascade's lease-clearing relies on to skip
+        a redundant cancel.
 
         This is also the intended hook surface for task eta's liveness-ledger
         'resolved' transition: every _verifier_loop error-resolution path now
