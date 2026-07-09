@@ -491,10 +491,11 @@ class TestStewardWedgeGuardInheritance:
     """
 
     async def test_wedged_resume_retries_fresh_instead_of_one_shot_return(
-        self, steward, worktree,
+        self, steward, worktree, mock_briefing,
     ):
         steward._session_id = 'sess-wedged'
         steward.usage_gate = _make_pre_triage_gate()
+        mock_briefing.build_steward_initial_prompt.return_value = 'REBUILT-INITIAL'
 
         wedge_result = _make_result(
             success=False, cost=0, turns=0, duration_ms=1_800_000,
@@ -520,6 +521,11 @@ class TestStewardWedgeGuardInheritance:
         assert mock_invoke.call_count == 2
         second_call = mock_invoke.call_args_list[1]
         assert 'resume_session_id' not in second_call.kwargs
+        # The fresh retry must rebuild full context via the steward's
+        # rebuild_prompt closure — NOT reuse the stale continuation prompt
+        # ('handle this escalation') that is only valid inside the wedged
+        # session (reviewer_comprehensive: robustness_context_loss).
+        assert second_call.kwargs.get('prompt') == 'REBUILT-INITIAL'
         assert result is success_result
 
 

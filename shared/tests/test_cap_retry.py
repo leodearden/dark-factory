@@ -3047,3 +3047,85 @@ class TestCapRetryResumeFailureRebuildsPrompt:
         second = mock_inv.call_args_list[1]
         assert second.kwargs.get('prompt') == 'REBUILT-FULL-PROMPT'
         assert 'resume_session_id' not in second.kwargs
+
+
+# ===================================================================
+# TestCapRetryWedgeAndAuthRebuildPrompt  (task W4-eta step-8)
+# ===================================================================
+
+
+@pytest.mark.asyncio
+class TestCapRetryWedgeAndAuthRebuildPrompt:
+    """The two remaining reset-to-fresh branches — zero-output-wedge
+    (cli_invoke.py ~961) and auth-failure (~923) — must ALSO rebuild context
+    via the caller's ``rebuild_prompt`` hook, mirroring the fix step-7 applied
+    to the non-cap resume-failure branch (``TestCapRetryResumeFailureRebuildsPrompt``).
+
+    With ``resume_delivers_prompt=True`` (the steward), ``original_prompt`` IS
+    the per-escalation continuation prompt — valid only inside the resumed
+    session. A live-continuation resume that wedges or auth-fails must not
+    hand that context-less prompt to the fresh retry.
+
+    FAILS RED: neither branch calls ``_rebuild_fresh_prompt()`` today — both
+    call ``_reset_for_fresh_retry(invoke_kwargs, original_prompt)`` and
+    ``continue`` directly, so the second call's prompt is still 'continuation'
+    and ``rebuild`` is never awaited.
+    """
+
+    async def test_wedge_branch_rebuilds_prompt(self):
+        gate = _mock_gate(
+            account_count=1,
+            before_invoke=AsyncMock(side_effect=['tok', 'tok']),
+            detect_cap_hit=MagicMock(return_value=False),
+            active_account_name='acct',
+        )
+        wedge = AgentResult(
+            success=False, output='', cost_usd=0.0,
+            duration_ms=300_000, turns=0, session_id='sess-1',
+            timed_out=True,
+        )
+        ok = make_result()
+        rebuild = AsyncMock(return_value='REBUILT-FULL-PROMPT')
+        with (
+            patch(_INVOKE_PATCH, new_callable=AsyncMock, side_effect=[wedge, ok]) as mock_inv,
+            patch(_SLEEP_PATCH, new_callable=AsyncMock),
+        ):
+            await invoke_with_cap_retry(
+                gate, 'lbl',
+                prompt='continuation',
+                resume_session_id='sess-1',
+                resume_delivers_prompt=True,
+                rebuild_prompt=rebuild,
+            )
+        rebuild.assert_awaited_once_with(True)
+        second = mock_inv.call_args_list[1]
+        assert second.kwargs.get('prompt') == 'REBUILT-FULL-PROMPT'
+        assert 'resume_session_id' not in second.kwargs
+
+    async def test_auth_failure_branch_rebuilds_prompt(self):
+        gate = _mock_gate(
+            account_count=1,
+            before_invoke=AsyncMock(side_effect=['tok', 'tok']),
+            detect_cap_hit=MagicMock(return_value=False),
+            active_account_name='acct',
+        )
+        auth_fail = make_result(
+            success=False, output='', api_error_status=401, cost_usd=0.0,
+        )
+        ok = make_result()
+        rebuild = AsyncMock(return_value='REBUILT-FULL-PROMPT')
+        with (
+            patch(_INVOKE_PATCH, new_callable=AsyncMock, side_effect=[auth_fail, ok]) as mock_inv,
+            patch(_SLEEP_PATCH, new_callable=AsyncMock),
+        ):
+            await invoke_with_cap_retry(
+                gate, 'lbl',
+                prompt='continuation',
+                resume_session_id='sess-1',
+                resume_delivers_prompt=True,
+                rebuild_prompt=rebuild,
+            )
+        rebuild.assert_awaited_once_with(True)
+        second = mock_inv.call_args_list[1]
+        assert second.kwargs.get('prompt') == 'REBUILT-FULL-PROMPT'
+        assert 'resume_session_id' not in second.kwargs
