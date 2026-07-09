@@ -2733,7 +2733,23 @@ def create_mcp_server(
         - ``"malformed"``       — dep cannot be parsed as ``<project_id>:<int>``
 
         Read-only: no reconciliation, no event emission, no task mutation.
-        Registry/DB unavailability raises (transient) — NOT mapped to a sentinel.
+
+        Registry/DB unavailability (transient) is still NOT mapped to a
+        per-dep sentinel: the code below still raises on that failure. This
+        tool carries ``@mcp_tool_errors()``, though, which catches that raise
+        at the MCP boundary and converts it into a structured
+        ``{'error': ..., 'error_type': ...}`` dict — the raise itself no
+        longer reaches the caller as a propagated exception. The two outcomes
+        stay distinguishable by shape: a real result is always
+        ``{dep: status}``, while a transient failure is a top-level
+        ``{'error', 'error_type'}`` dict, never a per-dep sentinel. Downstream,
+        the orchestrator scheduler's missing-dep-key guard
+        (``Scheduler.get_external_statuses``) treats that error dict as
+        "expected dep keys missing" and synthesises an
+        ``ExternalResolverError``, so ``_apply_external_dep_policy`` still
+        takes its fail-safe-wait path (no sentinel-counter increment) — the
+        externally-visible fail-safe behaviour is unchanged from before the
+        decorator was applied.
         """
         result: dict[str, str] = {}
         # Collect well-formed, known-project deps grouped by normalised project_id
@@ -2767,9 +2783,13 @@ def create_mcp_server(
             project_batches.setdefault(norm_project_id, []).append((dep, task_id))
 
         # Issue ONE get_statuses call per distinct foreign project (minimises reads).
-        # Intentionally NOT wrapped in try/except — transient errors (DB/registry
-        # unavailability) must propagate as exceptions, not be mapped to a sentinel.
-        # Sentinels = semantic "unresolvable"; exceptions = transient "couldn't answer".
+        # Intentionally NOT wrapped in a local try/except — a transient error here
+        # (DB/registry unavailability) still raises out of this loop rather than
+        # being mapped to a sentinel. @mcp_tool_errors() (applied above) is what
+        # catches that raise at the MCP boundary and turns it into a structured
+        # error dict — see the docstring for the shape contract this preserves.
+        # Sentinels = semantic "unresolvable"; the error dict = transient
+        # "couldn't answer".
         for norm_project_id, dep_pairs in project_batches.items():
             project_root = _kp[norm_project_id]
             # Redirect worktree roots to the main checkout, mirroring all other
@@ -2777,8 +2797,9 @@ def create_mcp_server(
             # from build_known_projects_map are expected to be canonical
             # main-checkout paths, but this guard prevents a silent divergence if
             # a registered root were ever a worktree path.
-            # Resolution failure raises (transient) — consistent with this tool's
-            # "no sentinel for transient failures" contract.
+            # Resolution failure raises (transient), never a sentinel.
+            # @mcp_tool_errors() converts that raise into a structured error
+            # dict at the MCP boundary — see the docstring for the contract.
             _norm = _normalize_project_root(project_root)
             if isinstance(_norm, dict):
                 raise RuntimeError(
