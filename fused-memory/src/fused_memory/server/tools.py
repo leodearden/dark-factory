@@ -971,16 +971,23 @@ def create_mcp_server(
         metadata: dict | None = None,
         ctx: Context | None = None,
     ) -> dict[str, Any]:
-        """Add a dedup-exempt system record. Recon-stage-only, server-enforced.
+        """Add a dedup-exempt system record. Recon-stage-only by agent_id convention.
 
         Writes directly to Mem0 through a dedicated backend method that pins
         infer=False locally, independent of the general add()/add_memory
         path — so this write is structurally exempt from Mem0's (any
         future) dedup behaviour. Always Mem0-only: never routes to
-        Graphiti, regardless of category. Restricted server-side to
-        agent_id values starting with 'recon-stage-'; any other caller is
-        rejected with a DedupExemptNotPermitted error dict (returned, not
-        raised).
+        Graphiti, regardless of category. Gated server-side on the
+        caller-supplied (or MCP-context-derived) agent_id starting with
+        'recon-stage-'; any other value is rejected with a
+        DedupExemptNotPermitted error dict (returned, not raised).
+
+        Note: like the other recon-stage gates in this file, this checks
+        the agent_id *string* the caller provides — it is a naming
+        convention enforced server-side, not cryptographic authorization.
+        A caller that deliberately passes agent_id='recon-stage-*' can
+        still reach this path; the gate's purpose is to prevent accidental
+        use by ordinary callers, not to defend against a malicious one.
 
         Args:
             content: The system record content (e.g. a deterministic cycle summary).
@@ -991,6 +998,7 @@ def create_mcp_server(
                       so category does not affect store routing.
             agent_id: Which agent is writing. Must start with 'recon-stage-' or the
                       write is rejected (optional, auto-derived from MCP context).
+                      This is a naming-convention check, not authentication.
             session_id: Session context (optional, auto-derived from MCP context)
             metadata: Arbitrary key-value pairs (optional)
         """
