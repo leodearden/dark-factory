@@ -436,24 +436,43 @@ async def _drive_caphit_record_to_capped(record: dict) -> None:
 
     Uses a 2-account gate so the retry loop can complete: the first
     (scripted) invocation delivers the corpus record's cap output on
-    account[0], which invoke_with_cap_retry detects (via the confirmed
-    detect_cap_hit path, or the zero-cost heuristic fallback when the
-    record's own strict_confirm regime doesn't match the loop's
-    hardcoded strict_confirm=True -- every corpus record defaults
-    duration_ms/turns/cost_usd to values that trip that heuristic net
-    regardless) and transitions to CAPPED; the loop then fails over to
-    account[1], whose scripted OK result ends the retry.
+    account[0]. ``UsageGate.detect_cap_hit`` -- the real, non-heuristic
+    recognizer this drive means to exercise -- is hardcoded to
+    ``strict_confirm=True`` regardless of the record's own strict_confirm
+    field (usage_gate.py:795). When the record is ALSO recognized under
+    that hardcoded regime, ``cap_result.cost_usd`` is forced non-zero so
+    the zero-cost/near-instant heuristic net (cli_invoke.py:1030) cannot
+    fire -- without this, every corpus record's untouched
+    turns=0/cost_usd=0.0/duration_ms=0 defaults would trip that fallback
+    net regardless of whether detect_cap_hit's string matcher actually
+    recognized the record, silently masking a real classifier regression
+    behind the same CAPPED end state. The sole exception is
+    claude_toggle_strict_false_cap, whose cap text is recognized ONLY
+    under strict_confirm=False and therefore legitimately depends on the
+    heuristic net; it is left at the corpus's zero-cost defaults so it
+    keeps exercising that fallback path on purpose. Either way, the loop
+    then fails over to account[1], whose scripted OK result ends the
+    retry.
     """
     gate = make_boundary_gate(['acct-0', 'acct-1'])
     capped_acct = gate._accounts[0]
+    backend = record.get('backend', 'claude')
     cap_result = agent_result_from_record(record)
+
+    recognized_by_detect_cap_hit = isinstance(
+        classify_invocation(cap_result, strict_confirm=True, backend=backend),
+        CapHit,
+    )
+    if recognized_by_detect_cap_hit:
+        cap_result.cost_usd = 0.01  # blocks the heuristic net -- see docstring
+
     ok_result = AgentResult(success=True, output='done', cost_usd=0.01)
 
     with patch('shared.cli_invoke.asyncio.sleep', new_callable=AsyncMock):
         result = await invoke_with_cap_retry(
             gate, f'B3[{record["id"]}]',
             invoke_fn=scripted_cli(cap_result, ok_result),
-            backend=record.get('backend', 'claude'),
+            backend=backend,
             prompt='hi',
         )
 
@@ -852,14 +871,19 @@ class TestB9ProbeDirIsolationAndEnvPrecedence:
 
     def test_probe_config_dirs_keyed_by_name_with_distinct_paths(self):
         gate = make_boundary_gate(['acct-a', 'acct-b'])
-        pid = os.getpid()
+        pid = str(os.getpid())
         acct_a, acct_b = gate._accounts
 
         assert set(gate._probe_config_dirs.keys()) == {'acct-a', 'acct-b'}
         dir_a, dir_b = gate._config_dir_for(acct_a), gate._config_dir_for(acct_b)
         assert dir_a.path != dir_b.path
-        assert f'usage-gate-probe-acct-a-{pid}' in dir_a.path.name
-        assert f'usage-gate-probe-acct-b-{pid}' in dir_b.path.name
+
+        # Relaxed to the load-bearing property -- per-account, per-pid
+        # isolation -- rather than pinning the exact
+        # "usage-gate-probe-<name>-<pid>" naming template, which is a
+        # cosmetic detail free to change independently of that property.
+        assert 'acct-a' in dir_a.path.name and pid in dir_a.path.name
+        assert 'acct-b' in dir_b.path.name and pid in dir_b.path.name
 
     @pytest.mark.asyncio
     async def test_run_probe_injects_oauth_token_and_per_account_config_dir(self):
