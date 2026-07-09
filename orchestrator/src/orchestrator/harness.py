@@ -7089,7 +7089,14 @@ Output JSON matching the schema. Every task must appear in the output.
         incarnation (branch deleted + re-created under the same task id)
         and vetoes the flip.
 
-        The content-equivalence fallback is added in a later step.
+        The content-equivalence fallback catches landings that are NOT
+        ancestors of main (squashed/rebased/manually-applied) by comparing
+        the branch's actual changed files against main
+        (:meth:`~orchestrator.git_ops.GitOps.branch_content_in_main`).  It
+        anchors on the citation commit when one is present on main (the
+        same citation resolved for the ancestry path above — hoisted so
+        both paths share one lookup), falling back to main HEAD when a
+        content-equivalent landing carries no task-citing commit.
         """
         if (
             self._escalation_queue is not None
@@ -7100,13 +7107,13 @@ Output JSON matching the schema. Every task must appear in the output.
         branch = f'{self.git_ops.config.branch_prefix}{task_id}'
         task = await self.scheduler.get_task(task_id)
         metadata = (task.get('metadata') or {}) if task else {}
+        citation = await self.git_ops.find_task_citation_commit(
+            task_id, pattern_template=self.git_ops.config.commit_citation_pattern,
+        )
 
         if await self.git_ops.is_ancestor(branch, self.git_ops.config.main_branch):
             if await self._branch_is_degenerate(branch, metadata):
                 return False
-            citation = await self.git_ops.find_task_citation_commit(
-                task_id, pattern_template=self.git_ops.config.commit_citation_pattern,
-            )
             if citation is None:
                 return False
             await self._mark_in_progress_done(
@@ -7129,6 +7136,17 @@ Output JSON matching the schema. Every task must appear in the output.
                 'dispatch-gate-marker-found',
             )
             return True
+
+        if await self.git_ops.branch_content_in_main(branch):
+            anchor = citation or await self.git_ops.get_main_sha()
+            if anchor:
+                await self._mark_in_progress_done(
+                    task_id, anchor,
+                    'reconcile: pre-dispatch check found content-equivalent '
+                    'landing on main (squash/rebase/manual)',
+                    'dispatch-gate-content-equivalent',
+                )
+                return True
 
         return False
 
