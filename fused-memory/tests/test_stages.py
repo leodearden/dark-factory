@@ -9532,12 +9532,13 @@ class TestStage3PayloadIncludesProjectRoot:
 class TestMemoryConsolidatorPayloadIncludesProjectRoot:
     """MemoryConsolidator.assemble_payload() emits an unconditional Use project_root="..." directive.
 
-    Characterization test for task 2150 step-5: pins the contract that
-    _build_project_root_directive's dead `if not self.project_root: return ''`
-    branch (step-6) must preserve. A stage is only constructible with a validated
-    ProjectScope, so project_root is always a non-empty absolute path and the
-    directive is always emitted — there is no remaining '' case to pin (β/task
-    2146 already removed the 3 empty-root TestStage1 cases).
+    Characterization test for task 2150 step-5: pins the always-emit behavior
+    that survives step-6's deletion of _build_project_root_directive's dead
+    `if not self.project_root: return ''` branch. A stage is only constructible
+    with a validated ProjectScope, so project_root is always a non-empty
+    absolute path and the directive is always emitted — there is no remaining
+    '' case to pin (β/task 2146 already removed the 3 empty-root TestStage1
+    cases).
     """
 
     @pytest.fixture
