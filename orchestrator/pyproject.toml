@@ -103,6 +103,7 @@ markers = [
     "mocks_dry_run_unblock: opt the class into an AsyncMock(return_value=None) patch of orchestrator.workflow.run_dry_run_unblock so BLOCKED-driving e2e tests do not invoke the real fire-and-forget hook. Default in test_workflow_e2e.py: a fail-fast stub that records calls and asserts in teardown.",
     "guard_self_test: marks a test class as a self-test of _dry_run_unblock_e2e_guard; suppresses the fixture's teardown assertion so deliberate stub invocations inside pytest.raises do not produce a false-positive failure.",
     "exercise_merge_verify: opt a test OUT of the autouse `_mock_merge_queue_verification` patch so its post-merge verify gate runs the REAL orchestrator.merge_queue.run_scoped_verification (e.g. cargo) instead of the passed=True stub. Default: autouse mock installed in conftest.py.",
+    "real_verify_admission: opt a test OUT of the autouse `_neutralize_verify_admission` patch so it exercises the REAL orchestrator.verify admission wiring (nice-prefix wrap + shared.verify_admission.acquire_task_slot) instead of the force-inactive stub. Default: autouse neutralize installed in conftest.py (task 2390).",
 ]
 
 [dependency-groups]

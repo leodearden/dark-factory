@@ -1,6 +1,7 @@
 """Test/lint/typecheck runner for verification stages."""
 
 import asyncio
+import concurrent.futures
 import contextlib
 import errno
 import json
@@ -17,6 +18,7 @@ from pathlib import Path
 from typing import Literal, TypedDict
 
 from shared.proc_group import terminate_process_group
+from shared.verify_admission import acquire_task_slot, nice_prefix
 
 from orchestrator.cargo_scope import discover_workspace_crates, files_to_crates
 from orchestrator.config import ModuleConfig, OrchestratorConfig
@@ -2812,6 +2814,132 @@ def _maybe_govern_merge_cmd(
     return f'{shlex.quote(exec_abs)} --role merge -- /bin/bash -c {shlex.quote(cmd)}'
 
 
+def _resolve_nice_prefix(config: OrchestratorConfig, role: str) -> list[str]:
+    """Return the argv ``nice``/``ionice`` prefix to apply for *role*.
+
+    A non-empty per-role override knob (``verify_admission_nice_{merge,task,
+    background}``) wins, ``shlex.split``. Empty (default) defers to T1's
+    canonical ``shared.verify_admission.nice_prefix(role)`` tier table —
+    ``offline`` and any unrecognized role resolve to ``[]`` (no adjustment).
+    """
+    overrides = {
+        'merge': config.verify_admission_nice_merge,
+        'task': config.verify_admission_nice_task,
+        'background': config.verify_admission_nice_background,
+    }
+    override = overrides.get(role, '')
+    if override:
+        return shlex.split(override)
+    return nice_prefix(role)
+
+
+def _verify_admission_active(config: OrchestratorConfig) -> bool:
+    """Whether the verify-admission gate (flock slot + nice tier) is active.
+
+    The single module seam the autouse ``_neutralize_verify_admission``
+    conftest fixture (task 2390 pre-1) patches to force every pre-existing
+    verify test to run ungated, regardless of ``config.verify_admission_enabled``.
+    """
+    return config.verify_admission_enabled
+
+
+_ADMISSION_EXECUTOR_MAX_WORKERS = 64
+
+_admission_executor_singleton: concurrent.futures.ThreadPoolExecutor | None = None
+
+
+def _admission_executor() -> concurrent.futures.ThreadPoolExecutor:
+    """Dedicated thread pool for the admission mkdir + flock poll-wait.
+
+    Kept separate from asyncio's shared default executor (process-wide,
+    capped at ``min(32, cpu_count+4)`` and used by unrelated
+    ``asyncio.to_thread`` callers throughout the orchestrator) so a burst of
+    concurrent task-role verifies polling ``acquire_task_slot`` can never
+    starve that unrelated work — or each other's ``slots_dir.mkdir``. Workers
+    spend nearly all their time asleep in T1's 0.1s poll loop, so a fixed
+    size decoupled from the cpu-bound default-executor formula is cheap.
+    Lazily created, never torn down (matches the default executor's
+    process-lifetime scope).
+    """
+    global _admission_executor_singleton
+    if _admission_executor_singleton is None:
+        _admission_executor_singleton = concurrent.futures.ThreadPoolExecutor(
+            max_workers=_ADMISSION_EXECUTOR_MAX_WORKERS,
+            thread_name_prefix='df-verify-admission',
+        )
+    return _admission_executor_singleton
+
+
+@contextlib.asynccontextmanager
+async def _admission_slot(role: str, config: OrchestratorConfig):
+    """Async CM around T1's ``shared.verify_admission.acquire_task_slot``.
+
+    Gates only the test leg of a verify (callers decide that; this CM itself
+    is role-agnostic and always attempts acquisition uniformly — T1's
+    ``acquire_task_slot`` internally no-ops for ``role`` values other than
+    ``'task'``/``'background'`` and always yields ``held=False`` immediately
+    for them, so ``merge`` can never be starved by ``task`` — C-merge-priority
+    is owned entirely by T1, not re-implemented here).
+
+    T1 never creates ``slots_dir`` itself (fails open when absent) and never
+    even inspects it for roles it can't acquire for (its own role check
+    short-circuits first), so this CM only mkdirs it for roles that actually
+    attempt acquisition (``task``/``background``) — leaving ``merge`` (and any
+    other role) with no filesystem side effect. The mkdir and the blocking,
+    potentially-unbounded ``acquire_task_slot(...).__enter__`` (a synchronous
+    flock poll-loop) both run on the dedicated ``_admission_executor`` so the
+    wait never blocks the event loop nor contends with unrelated
+    ``asyncio.to_thread`` work — a loop-blocking acquire would otherwise stall
+    the holder's own subprocess-exit callback from ever firing on this same
+    loop, deadlocking cross-verify contention.
+
+    The acquire await is shielded from cancellation (``asyncio.shield``): if
+    the awaiting coroutine is cancelled mid-wait (e.g. orchestrator shutdown,
+    or a sibling verify's failure cancelling this one via ``asyncio.gather``),
+    the worker thread's poll loop keeps running in the background regardless
+    — it cannot be interrupted mid-``time.sleep`` — so a bare cancellation
+    would otherwise leave a slot acquired-but-never-released if the thread
+    goes on to succeed after we stopped waiting. A done-callback releases it
+    in that case instead. Release on the normal path (``os.close`` under the
+    hood) is synchronous and instant, so it runs directly in ``finally``
+    without needing an executor thread.
+
+    Fails open (runs ungated) on any ``OSError`` — most commonly a
+    ``slots_dir`` that cannot be created (C-fail-open, mirroring T1's own
+    fail-open contract for acquisition itself).
+    """
+    slots_dir = Path(config.verify_admission_slots_dir)
+    n = config.verify_admission_task_slots
+    loop = asyncio.get_running_loop()
+    executor = _admission_executor()
+    cm = None
+    try:
+        if role in {'task', 'background'}:
+            await loop.run_in_executor(
+                executor, lambda: slots_dir.mkdir(parents=True, exist_ok=True),
+            )
+        cm = acquire_task_slot(role, slots_dir=slots_dir, n=n, wait=True)
+        enter_future = loop.run_in_executor(executor, cm.__enter__)
+        try:
+            await asyncio.shield(enter_future)
+        except asyncio.CancelledError:
+            def _release_if_acquired(fut: 'asyncio.Future[bool]') -> None:
+                if cm is None or fut.cancelled() or fut.exception() is not None:
+                    return
+                with contextlib.suppress(OSError):
+                    cm.__exit__(None, None, None)
+            enter_future.add_done_callback(_release_if_acquired)
+            raise
+    except OSError:
+        cm = None
+    try:
+        yield
+    finally:
+        if cm is not None:
+            with contextlib.suppress(OSError):
+                cm.__exit__(None, None, None)
+
+
 async def run_verification(
     worktree: Path,
     config: OrchestratorConfig,
@@ -2950,37 +3078,46 @@ async def run_verification(
         # so a misconfig never makes a verify spawn fail.
         cmd = _maybe_govern_merge_cmd(cmd, config, worktree, role)
         assert cmd is not None  # _maybe_govern_merge_cmd returns None only when cmd is None; guarded above
-        started_at = datetime.now(UTC).isoformat()
-        t0 = time.monotonic()
-        # Pass use_cgroup_scope only when enabled so the default-off call
-        # signature stays byte-identical (test doubles stub the legacy kwargs).
-        _scope_kw: _ScopeKw = (
-            {'use_cgroup_scope': True} if config.verify_use_cgroup_scope else {}
-        )
-        # Pass clock_stop only when enabled (mirrors _scope_kw pattern) so the
-        # default-off call signature stays byte-identical for existing test doubles.
-        _clock_kw: _ClockKw = (
-            {
-                'clock_stop': ClockStopConfig(
-                    marker_stop=config.verify_clock_stop_marker_stop,
-                    marker_heartbeat=config.verify_clock_stop_marker_heartbeat,
-                    marker_start=config.verify_clock_stop_marker_start,
-                    heartbeat_idle_max=config.verify_clock_stop_heartbeat_idle_max,
-                    max_total_secs=config.verify_clock_stop_max_total_secs,
-                ),
-            }
-            if config.verify_clock_stop_enabled
-            else {}
-        )
-        rc, out, timed_out_flag = await _run_cmd(
-            cmd,
-            worktree,
-            timeout,
-            env=verify_env or None,
-            log_path=_stream_log_path(label, current_attempt),
-            **_scope_kw,
-            **_clock_kw,
-        )
+        # Admission gate (task 2390 T2): only the pytest ('test') leg is
+        # gated by the shared.verify_admission flock semaphore + role nice
+        # tier; lint/type ride alongside within the same verify, ungated.
+        admission = _verify_admission_active(config) and label == 'test'
+        if admission:
+            prefix = _resolve_nice_prefix(config, role)
+            if prefix:
+                cmd = f'{shlex.join(prefix)} /bin/bash -c {shlex.quote(cmd)}'
+        async with (_admission_slot(role, config) if admission else contextlib.nullcontext()):
+            started_at = datetime.now(UTC).isoformat()
+            t0 = time.monotonic()
+            # Pass use_cgroup_scope only when enabled so the default-off call
+            # signature stays byte-identical (test doubles stub the legacy kwargs).
+            _scope_kw: _ScopeKw = (
+                {'use_cgroup_scope': True} if config.verify_use_cgroup_scope else {}
+            )
+            # Pass clock_stop only when enabled (mirrors _scope_kw pattern) so the
+            # default-off call signature stays byte-identical for existing test doubles.
+            _clock_kw: _ClockKw = (
+                {
+                    'clock_stop': ClockStopConfig(
+                        marker_stop=config.verify_clock_stop_marker_stop,
+                        marker_heartbeat=config.verify_clock_stop_marker_heartbeat,
+                        marker_start=config.verify_clock_stop_marker_start,
+                        heartbeat_idle_max=config.verify_clock_stop_heartbeat_idle_max,
+                        max_total_secs=config.verify_clock_stop_max_total_secs,
+                    ),
+                }
+                if config.verify_clock_stop_enabled
+                else {}
+            )
+            rc, out, timed_out_flag = await _run_cmd(
+                cmd,
+                worktree,
+                timeout,
+                env=verify_env or None,
+                log_path=_stream_log_path(label, current_attempt),
+                **_scope_kw,
+                **_clock_kw,
+            )
         return rc, out, timed_out_flag, started_at, time.monotonic() - t0
 
     # Pre-loop initialisation satisfies static analysis: mypy cannot prove that
