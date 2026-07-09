@@ -1354,9 +1354,10 @@ class TestRemoteRunnerConstruction:
         )
         result = await runner.health()
         assert result is True
-        # health issues `ssh -o BatchMode=yes -o ConnectTimeout=10 <host> true`
+        # health issues `ssh <_SSH_BASE_OPTS> <host> true` (task 2362: keepalive flags included)
+        from orchestrator.verify_runner import _SSH_BASE_OPTS
         assert fake_run.calls == [
-            ['ssh', '-o', 'BatchMode=yes', '-o', 'ConnectTimeout=10', 'laptop.local', 'true']
+            ['ssh', *_SSH_BASE_OPTS, 'laptop.local', 'true']
         ]
 
     async def test_health_false_when_ssh_rc_nonzero(self):
@@ -1534,7 +1535,16 @@ class TestRemoteRunnerTransportVsTimeout:
         assert not any(a[0] == 'ssh' for a in runner._calls)
 
     async def test_raises_runner_unavailable_on_ssh_nonzero(self):
-        """ssh rc!=0 (e.g. 255 connection refused) → RunnerUnavailable."""
+        """ssh rc!=0 (e.g. 255 connection refused) → RunnerUnavailable.
+
+        task-2362 / incident 5111: this is also the recovery-path counterpart
+        of the ssh ServerAlive keepalive hardening — a keepalive-induced dead
+        peer detection makes ssh exit non-zero exactly like the connection-
+        refused case exercised here, which is what feeds the existing
+        RunnerUnavailable → re-dispatch/local-fallback path. See
+        TestRemoteRunnerSshKeepalive for the argv-construction side (that the
+        keepalive flags are actually present on every ssh site).
+        """
         from orchestrator.verify_runner import RunnerUnavailable
         runner = self._make_runner([(0, '', ''), (255, '', 'ssh: connect to host laptop.local port 22')])
         with pytest.raises(RunnerUnavailable):
@@ -3909,6 +3919,95 @@ class TestRemoteRunnerCancelVerify:
         )
         result = await runner.probe_clean()
         assert result is False
+
+
+# ---------------------------------------------------------------------------
+# task-2362: ssh ServerAliveInterval/ServerAliveCountMax keepalive hardening
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestRemoteRunnerSshKeepalive:
+    """All four ssh argv sites (health, run_merge_verify, cancel_verify,
+    probe_clean) must carry the ServerAlive keepalive options, and must stay
+    identical across sites (shared const, task 2362 / incident 5111)."""
+
+    def _make_runner(self, expected_result):
+        calls = []
+
+        async def fake_run(argv, *, cwd=None):
+            calls.append(argv[:])
+            if argv[0] == 'git':
+                return (0, '', '')
+            if argv[0] == 'ssh':
+                if 'pgrep' in argv[-1]:
+                    return (1, '', '')
+                if 'cancel-verify' in argv[-1]:
+                    return (0, '', '')
+                # ssh dispatch / health probe
+                return (0, result_to_json(expected_result), '')
+            return (0, '', '')
+
+        runner = RemoteRunner(
+            name='laptop',
+            ssh_host='laptop.local',
+            git_remote='origin',
+            cwd='/repo',
+            run=fake_run,
+            id_factory=lambda: 'fixed-id',
+        )
+        return runner, calls
+
+    async def test_all_four_sites_carry_identical_keepalive_flags(self):
+        """Every ssh site carries the keepalive flags with their exact
+        configured values, and the option block is byte-identical across
+        sites (shared `_SSH_BASE_OPTS` const — regression guard against the
+        four sites drifting apart from each other).
+
+        This test only asserts the argv surface. The consequence side of the
+        change — a non-zero ssh rc (what a dead keepalive session ultimately
+        produces) raising RunnerUnavailable — is already covered by
+        `TestRemoteRunnerTransportVsTimeout.test_raises_runner_unavailable_on_ssh_nonzero`
+        and is deliberately not duplicated here (incident 5111).
+        """
+        from orchestrator.verify_runner import (
+            _SSH_BASE_OPTS,
+            SSH_SERVER_ALIVE_COUNT_MAX,
+            SSH_SERVER_ALIVE_INTERVAL,
+        )
+
+        expected = VerifyResult(passed=True, test_output='', lint_output='', type_output='', summary='ok')
+        runner, calls = self._make_runner(expected)
+
+        # Site 1: health()
+        await runner.health()
+        # Site 2: run_merge_verify() dispatch
+        await runner.run_merge_verify('abc123', _make_spec())
+        # Site 3: cancel_verify()
+        runner._inflight_request_id = 'req-42'
+        await runner.cancel_verify()
+        # Site 4: probe_clean()
+        await runner.probe_clean()
+
+        ssh_calls = [c for c in calls if c[0] == 'ssh']
+        assert len(ssh_calls) == 4
+
+        alive_interval_opt = f'ServerAliveInterval={SSH_SERVER_ALIVE_INTERVAL}'
+        alive_count_opt = f'ServerAliveCountMax={SSH_SERVER_ALIVE_COUNT_MAX}'
+        expected_prefix = ['ssh', *_SSH_BASE_OPTS]
+        for argv in ssh_calls:
+            # Per-flag checks: the keepalive options carry their exact
+            # configured values, alongside the still-needed ConnectTimeout
+            # (bounds only the initial connect, not a mid-session stall) and
+            # BatchMode.
+            assert alive_interval_opt in argv, argv
+            assert alive_count_opt in argv, argv
+            assert 'ConnectTimeout=10' in argv, argv
+            assert 'BatchMode=yes' in argv, argv
+            # Anti-drift: every site's argv starts with 'ssh' + the exact
+            # shared option block, followed by <host> <remote_cmd_or_literal>.
+            assert argv[:len(expected_prefix)] == expected_prefix, argv
+            assert argv[len(expected_prefix)] == 'laptop.local'
 
 
 # ---------------------------------------------------------------------------
