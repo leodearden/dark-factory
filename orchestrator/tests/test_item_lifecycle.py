@@ -143,6 +143,8 @@ class TestItemLifecycleTransitionHappyPath:
     """
 
     def test_full_canonical_sequence_ends_at_terminal(self) -> None:
+        from itertools import pairwise
+
         from orchestrator.merge_queue import ItemLifecycle, ItemLifecycleState
 
         registry = ItemLifecycle()
@@ -161,7 +163,7 @@ class TestItemLifecycleTransitionHappyPath:
             ItemLifecycleState.TERMINAL,
         ]
 
-        for from_state, to_state in zip(sequence, sequence[1:], strict=True):
+        for from_state, to_state in pairwise(sequence):
             registry.transition(rid, from_state, to_state)
             assert registry.current(rid) == to_state  # registry is the single source
 

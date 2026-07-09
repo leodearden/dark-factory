@@ -4400,6 +4400,95 @@ class ItemLifecycle:
         """The current state for *request_id*, or ``None`` if unregistered."""
         return self._states.get(request_id)
 
+    def transition(
+        self,
+        request_id: str,
+        from_state: ItemLifecycleState,
+        to_state: ItemLifecycleState,
+    ) -> None:
+        """Move *request_id* from *from_state* to *to_state*.
+
+        Raises ``ValueError`` if ``(from_state, to_state)`` is not a legal
+        edge in the module-level ``_LEGAL_TRANSITIONS`` table (defined below
+        this class); updates the registry to *to_state* otherwise.
+        """
+        if to_state not in _LEGAL_TRANSITIONS[from_state]:
+            raise ValueError(
+                f'ItemLifecycle.transition: illegal edge {from_state!r} -> {to_state!r} '
+                f'for request_id {request_id!r}'
+            )
+        self._states[request_id] = to_state
+
+
+_LEGAL_TRANSITIONS: dict[ItemLifecycleState, frozenset[ItemLifecycleState]] = {
+    ItemLifecycleState.QUEUED: frozenset({
+        ItemLifecycleState.LANE_BUFFERED,
+        ItemLifecycleState.MERGING,
+        ItemLifecycleState.TERMINAL,
+    }),
+    ItemLifecycleState.LANE_BUFFERED: frozenset({
+        ItemLifecycleState.MERGING,
+        ItemLifecycleState.TERMINAL,
+    }),
+    ItemLifecycleState.MERGING: frozenset({
+        ItemLifecycleState.AWAITING_VERIFY,
+        ItemLifecycleState.REDISPATCH_PARKED,
+        ItemLifecycleState.TERMINAL,
+    }),
+    ItemLifecycleState.AWAITING_VERIFY: frozenset({
+        ItemLifecycleState.DISPATCHING,
+        ItemLifecycleState.REDISPATCH_PARKED,
+        ItemLifecycleState.TERMINAL,
+    }),
+    ItemLifecycleState.REDISPATCH_PARKED: frozenset({
+        ItemLifecycleState.DISPATCHING,
+        ItemLifecycleState.TERMINAL,
+    }),
+    ItemLifecycleState.DISPATCHING: frozenset({
+        ItemLifecycleState.VERIFYING,
+        ItemLifecycleState.REDISPATCH_PARKED,
+        ItemLifecycleState.TERMINAL,
+    }),
+    ItemLifecycleState.VERIFYING: frozenset({
+        ItemLifecycleState.GATE_REVERIFY,
+        ItemLifecycleState.FINALIZING,
+        ItemLifecycleState.MERGING,
+        ItemLifecycleState.TERMINAL,
+    }),
+    ItemLifecycleState.GATE_REVERIFY: frozenset({
+        ItemLifecycleState.FINALIZING,
+        ItemLifecycleState.VERIFYING,
+        ItemLifecycleState.TERMINAL,
+    }),
+    ItemLifecycleState.FINALIZING: frozenset({
+        ItemLifecycleState.TERMINAL,
+        ItemLifecycleState.MERGING,
+    }),
+    ItemLifecycleState.TERMINAL: frozenset(),
+}
+"""Legal-edge table for :meth:`ItemLifecycle.transition` (merge-queue-
+reliability PRD scope-4 iota / task 2164, L-1). Defined after
+:class:`ItemLifecycle` and looked up at call time (mirrors
+:data:`_NON_TERMINAL_OUTCOMES` above, defined after :class:`OutcomeKind` for
+the same reason), so the class body never references it eagerly.
+
+Encodes the pipeline flow traced from snapshot construction and the
+phase-mutation call sites (``entry.phase = 'finalizing'``/``'gate_reverify'``,
+initial ``InflightEntry.phase = 'verifying'`` at dispatch): queued ->
+(lane_buffered ->) merging -> awaiting_verify -> (redispatch_parked <->)
+dispatching -> verifying -> gate_reverify -> finalizing -> terminal, plus two
+same-request_id in-place retry loops evidenced by ``_redispatch`` (the
+redispatch bounce, DISPATCHING<->REDISPATCH_PARKED) and ``_remerging_item``
+(the cascade remerge, VERIFYING/GATE_REVERIFY/FINALIZING -> MERGING ->
+REDISPATCH_PARKED).
+
+TERMINAL is absorbing (empty out-set): conflict auto-chain regeneration
+mints a NEW request_id for the regenerated attempt
+(``_maybe_auto_chain_generation``), so a request's lifecycle is always
+forward-to-TERMINAL under its OWN id — a "restart" is a different registry
+key entirely, never a backward edge on this one.
+"""
+
 
 class SpeculativeMergeWorker(_WipHaltMixin):
     """Two-coroutine speculative merge-verify pipeline.
