@@ -2914,7 +2914,7 @@ class TaskKnowledgeSync(BaseStage):
         # Pre-fetch all unique task_ids referenced by stage-2 ops concurrently,
         # building a shared status_cache so Guards 1-3 avoid N+1 get_task calls.
         status_cache: dict[str, str] | None = None
-        if ops and self.taskmaster and self.project_root:
+        if ops and self.taskmaster:
             task_ids: set[str] = set()
             for op in ops:
                 if op.get('agent_id') != _stage_agent_id:
@@ -2977,7 +2977,7 @@ class TaskKnowledgeSync(BaseStage):
                     status_cache[tid] = extracted
 
         # Guard 1 — terminal-state pre-check
-        if self.taskmaster and self.project_root:
+        if self.taskmaster:
             terminal_violations = await _classify_terminal_state_violations(
                 ops, self.taskmaster, self.scope.project_root, _stage_agent_id, status_cache
             )
@@ -3002,7 +3002,7 @@ class TaskKnowledgeSync(BaseStage):
                     )
 
         # Guard 2 — stall-guard freshness gate
-        if self.taskmaster and self.project_root:
+        if self.taskmaster:
             freshness_violations = await _check_stall_guard_freshness(
                 ops, self.taskmaster, self.scope.project_root, _stage_agent_id, status_cache
             )
@@ -3023,7 +3023,7 @@ class TaskKnowledgeSync(BaseStage):
                     )
 
         # Guard 3 — post-action set_task_status verification
-        if self.taskmaster and self.project_root:
+        if self.taskmaster:
             sts_mismatches = await _verify_set_task_status_post_action(
                 ops, self.taskmaster, self.scope.project_root, _stage_agent_id, status_cache
             )
@@ -3108,28 +3108,27 @@ class TaskKnowledgeSync(BaseStage):
         # (registered worktree / recent branch commits / orchestrator live).
         # The LLM's write already landed; this guard post-hoc flags the churn
         # (stats + log) for observability.  Actual prevention is the Stage 2 prompt.
-        if self.project_root:
-            live_workflow_violations = await _classify_live_workflow_status_writes(
-                ops, self.scope.project_root, _stage_agent_id
+        live_workflow_violations = await _classify_live_workflow_status_writes(
+            ops, self.scope.project_root, _stage_agent_id
+        )
+        if live_workflow_violations:
+            report.stats['live_workflow_status_writes'] = report.stats.get(
+                'live_workflow_status_writes', 0
+            ) + len(live_workflow_violations)
+            report.stats['tasks_modified'] = max(
+                0,
+                report.stats.get('tasks_modified', 0) - len(live_workflow_violations),
             )
-            if live_workflow_violations:
-                report.stats['live_workflow_status_writes'] = report.stats.get(
-                    'live_workflow_status_writes', 0
-                ) + len(live_workflow_violations)
-                report.stats['tasks_modified'] = max(
-                    0,
-                    report.stats.get('tasks_modified', 0) - len(live_workflow_violations),
+            for v in live_workflow_violations:
+                logger.info(
+                    'reconciliation.live_workflow_status_write_suppressed',
+                    extra={
+                        'run_id': run_id,
+                        'project_id': self.project_id,
+                        'task_id': v['task_id'],
+                        'op_id': v['op_id'],
+                    },
                 )
-                for v in live_workflow_violations:
-                    logger.info(
-                        'reconciliation.live_workflow_status_write_suppressed',
-                        extra={
-                            'run_id': run_id,
-                            'project_id': self.project_id,
-                            'task_id': v['task_id'],
-                            'op_id': v['op_id'],
-                        },
-                    )
 
     async def _maybe_queue_briefing_refresh_tasks(self, run_id: str = '') -> None:
         """Best-effort: queue 'Refresh briefing' tasks for each briefing-known-gaps mismatch.
@@ -3287,7 +3286,7 @@ class TaskKnowledgeSync(BaseStage):
         # Only active tasks are inspected (done/cancelled tasks cannot have live workflows).
         # Empty string when no active tasks are live (keeps the payload tight).
         live_workflow_section = ''
-        if self.project_root and filtered.active_tasks:
+        if filtered.active_tasks:
             live_workflow_section = _render_live_workflow_section(
                 filtered.active_tasks,
                 self.scope.project_root,

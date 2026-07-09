@@ -674,8 +674,10 @@ Review the above data and perform memory consolidation:
         """Return the Live-Workflow Signals prompt section, or empty string if inapplicable.
 
         Mirrors Stage 2's guard/source exactly (task 1655): renders over
-        ``self.filtered_task_tree.active_tasks`` when ``self.project_root`` and
-        ``self.filtered_task_tree`` are set and ``active_tasks`` is non-empty.
+        ``self.filtered_task_tree.active_tasks`` when ``self.filtered_task_tree``
+        is set and ``active_tasks`` is non-empty. A stage is only constructible
+        with a validated ``ProjectScope``, so ``self.project_root`` is always a
+        non-empty absolute path and is not part of this guard (task 2150).
         Reuses Stage 2's ``_render_live_workflow_section`` renderer (imported from
         task_knowledge_sync.py) so both stages emit byte-identical section
         formatting for the same underlying live-workflow signals (task 1977).
@@ -683,11 +685,7 @@ Review the above data and perform memory consolidation:
         Returns '' when the guard fails or no active task is currently live —
         keeps the payload tight, matching _build_task_tree_section's pattern.
         """
-        if not (
-            self.project_root
-            and self.filtered_task_tree
-            and self.filtered_task_tree.active_tasks
-        ):
+        if not (self.filtered_task_tree and self.filtered_task_tree.active_tasks):
             return ''
         section = _render_live_workflow_section(
             self.filtered_task_tree.active_tasks,
