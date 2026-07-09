@@ -2821,6 +2821,92 @@ async def test_done_provenance_accepts_deterministic_deploy_scheduled_resume_sha
     assert persisted['unit'] == 'orchestrator-dark-factory.service'
 
 
+# ── Tests for same-status done_provenance repair (fix c, task 2401) ───────
+#
+# Legacy `done` tasks may carry `metadata.done_provenance` written before
+# `kind` became a required field (e.g. `{"commit": sha}` with no `kind`).
+# The same-status guard above (2. Same-status guard) used to return a bare
+# no-op *before* done_provenance was ever considered, so such tasks could
+# never be repaired via set_task_status (status is already 'done', so a
+# fresh done->done transition never reaches the normal persist). These
+# tests cover the sanctioned repair path: a done->done call that supplies
+# done_provenance validates + persists the correction in place, without
+# forwarding a status write, emitting an event, or triggering
+# reconciliation.
+
+
+@pytest.mark.asyncio
+async def test_set_task_status_done_to_done_repairs_done_provenance(
+    taskmaster, reconciler, event_buffer, tmp_path
+):
+    """done->done with done_provenance repairs a legacy (kind-less) blob in place."""
+    sha = _init_git_repo(tmp_path)
+    taskmaster.get_task = AsyncMock(
+        return_value={
+            'id': '1',
+            'status': 'done',
+            'title': 'T',
+            'metadata': json.dumps({'done_provenance': {'commit': sha}, 'files': ['x.py']}),
+        }
+    )
+    interceptor = TaskInterceptor(taskmaster, reconciler, event_buffer)
+    project_id = resolve_project_id(str(tmp_path))
+
+    result = await interceptor.set_task_status(
+        '1',
+        'done',
+        str(tmp_path),
+        done_provenance={'kind': 'merged', 'commit': sha},
+    )
+
+    # Repair persisted via update_task, with the sibling key preserved.
+    taskmaster.update_task.assert_called_once()
+    persisted = json.loads(taskmaster.update_task.call_args.kwargs['metadata'])
+    assert persisted['done_provenance']['kind'] == 'merged'
+    assert persisted['done_provenance']['commit'] == sha
+    assert persisted['files'] == ['x.py']
+    # Result reports success and a repair marker.
+    assert result.get('success') is True
+    assert result.get('done_provenance_repaired') is True
+    # Status is not forwarded, and no event/reconciliation side effects fire.
+    taskmaster.set_task_status.assert_not_called()
+    stats = await event_buffer.get_buffer_stats(project_id)
+    assert stats['size'] == 0
+    reconciler.reconcile_task.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_set_task_status_done_to_done_repair_rejects_invalid_provenance(
+    taskmaster, reconciler, event_buffer, tmp_path
+):
+    """A same-status repair attempt with an invalid payload errors, not a silent no-op.
+
+    done_provenance missing the required 'kind' field must surface
+    error == 'done_provenance_invalid' rather than being swallowed by the
+    same-status guard, and must not touch taskmaster.update_task.
+    """
+    sha = _init_git_repo(tmp_path)
+    taskmaster.get_task = AsyncMock(
+        return_value={
+            'id': '1',
+            'status': 'done',
+            'title': 'T',
+            'metadata': json.dumps({'done_provenance': {'commit': sha}, 'files': ['x.py']}),
+        }
+    )
+    interceptor = TaskInterceptor(taskmaster, reconciler, event_buffer)
+
+    result = await interceptor.set_task_status(
+        '1',
+        'done',
+        str(tmp_path),
+        done_provenance={'commit': sha},  # missing required 'kind'
+    )
+
+    assert result.get('error') == 'done_provenance_invalid'
+    taskmaster.update_task.assert_not_called()
+
+
 @pytest.mark.asyncio
 async def test_update_task_rejects_metadata_done_provenance(taskmaster, reconciler, event_buffer):
     """update_task must NOT be a side door for writing done_provenance.
