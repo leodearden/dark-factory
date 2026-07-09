@@ -34,14 +34,15 @@ end-to-end suite (test_cutover_end_to_end.py), not here.
 
 from __future__ import annotations
 
-from collections import deque
-from unittest.mock import AsyncMock, MagicMock
+import json
+from unittest.mock import AsyncMock
 
 import pytest
+import pytest_asyncio
 
 from fused_memory.models.memory import AddMemoryResponse
 from fused_memory.models.scope import ProjectId, ProjectRoot, ProjectScope
-from fused_memory.reconciliation.flag_dedup import _marker_query
+from fused_memory.reconciliation.recon_ledger import ReconLedgerRecord, ReconLedgerStore
 from fused_memory.server.recon_report import ReconReportState
 
 # ---------------------------------------------------------------------------
@@ -64,48 +65,24 @@ def _scope(project_id: str, project_root: str) -> ProjectScope:
     return ProjectScope(ProjectId(project_id), ProjectRoot(project_root))
 
 
-def _make_memory_result(metadata: dict | None) -> MagicMock:
-    """Build a minimal mock MemoryResult with the given metadata."""
-    r = MagicMock()
-    r.metadata = metadata
-    r.content = 'Stage 1 flag marker'
-    return r
+@pytest_asyncio.fixture
+async def ledger_memory_service(tmp_path):
+    """AsyncMock memory_service (.search/.add_memory mockable) with a REAL
+    initialized ReconLedgerStore attached as `.recon_ledger` (task 2227).
 
-
-def _make_search_stub(
-    *,
-    suppression: list[list] | None = None,
-    marker: dict[tuple[str, str], list[list]] | None = None,
-):
-    """Local search stub suitable for ``AsyncMock(side_effect=...)``.
-
-    Dispatches on query string:
-    - ``'stage1_flag_suppression'`` — pops from the suppression queue.
-    - ``_marker_query(tid, ftype)`` — pops from the matching marker queue.
-    - Anything else — returns [].
+    Self-contained local fixture — mirrors (but does not import) the
+    `ledger_memory_service` fixture in tests/test_flag_dedup.py and the
+    `store` fixture in tests/test_recon_ledger.py (tmp_path + init/close).
     """
-    suppression_queue: deque[list] = deque(suppression or [])
-    marker_queues: dict[tuple[str, str], deque[list]] = {
-        k: deque(v) for k, v in (marker or {}).items()
-    }
-    marker_query_to_key: dict[str, tuple[str, str]] = {
-        _marker_query(*k): k for k in marker_queues
-    }
-
-    async def _stub(**kwargs: object) -> list:
-        query: str = str(kwargs.get('query', ''))
-
-        if query == 'stage1_flag_suppression':
-            return suppression_queue.popleft() if suppression_queue else []
-
-        key = marker_query_to_key.get(query)
-        if key is not None:
-            q = marker_queues[key]
-            return q.popleft() if q else []
-
-        return []
-
-    return _stub
+    ledger = ReconLedgerStore(tmp_path / 'reconciliation.db')
+    await ledger.initialize()
+    service = AsyncMock()
+    service.recon_ledger = ledger
+    service.add_memory = AsyncMock(return_value=_STUB_ADD_MEMORY_RESPONSE)
+    try:
+        yield service
+    finally:
+        await ledger.close()
 
 
 def _build_state(register_reify: bool = True) -> ReconReportState:
@@ -233,12 +210,13 @@ class TestSignaturePathCrossCycleDedup:
     compute_flag_signature's cited_tasks fallback (introduced by task-1573)
     derives a deterministic (task_id, flag_type) tuple from cited_tasks when
     the top-level task_id is None.  dedup_flags uses this signature to key
-    the stage1_flag_marker in Mem0, so cycle 2 finds the prior marker and
-    annotates the flag with persisted_from_run instead of re-escalating.
+    the stage1_flag_marker row in the recon_ledger (task 2227), so cycle 2
+    finds the prior row and annotates the flag with persisted_from_run
+    instead of re-escalating.
 
     Existing dedup_flags tests only exercise flags with a non-None top-level
-    task_id.  These tests are the first to drive the full MISS→write and
-    HIT→annotate flow for a null-task_id flag whose signature comes from
+    task_id.  These tests are the first to drive the full no-prior-row and
+    prior-row-found flow for a null-task_id flag whose signature comes from
     cited_tasks.
     """
 
@@ -257,15 +235,13 @@ class TestSignaturePathCrossCycleDedup:
         )
 
     @pytest.mark.asyncio
-    async def test_dedup_flags_cycle1_miss_writes_marker_keyed_by_cited_task(self):
-        """Cycle 1 (no prior marker): MISS — flag not annotated; marker written with
-        cited-tasks-derived signature (task_id='3803', flag_type='cross_project')."""
+    async def test_dedup_flags_cycle1_miss_writes_marker_keyed_by_cited_task(
+        self, ledger_memory_service
+    ):
+        """Cycle 1 (no prior ledger row): flag not annotated; a stage1_flag_marker
+        ledger row is upserted keyed by the cited-tasks-derived signature
+        (task_id='3803', flag_type='cross_project')."""
         from fused_memory.reconciliation.flag_dedup import dedup_flags
-
-        memory_service = AsyncMock()
-        # All searches return empty: no suppression entries, no prior markers.
-        memory_service.search = AsyncMock(return_value=[])
-        memory_service.add_memory = AsyncMock(return_value=_STUB_ADD_MEMORY_RESPONSE)
 
         flag = {
             'task_id': None,
@@ -275,68 +251,68 @@ class TestSignaturePathCrossCycleDedup:
         }
 
         result = await dedup_flags(
-            memory_service=memory_service,
+            memory_service=ledger_memory_service,
             project_id='p',
             run_id='r1',
             flags=[flag],
         )
 
-        # Flag NOT annotated — fresh finding (MISS)
+        # Flag NOT annotated — fresh finding, no prior ledger row
         assert len(result) == 1
         assert 'persisted_from_run' not in result[0], (
             f'Fresh flag must not have persisted_from_run; got {result[0]}'
         )
 
-        # Marker was written (cycle-1 MISS always writes a new marker)
-        memory_service.add_memory.assert_called_once()
-        marker_kwargs = memory_service.add_memory.call_args.kwargs
-        meta = marker_kwargs.get('metadata', {})
-        assert meta.get('source') == 'stage1_flag_marker', (
-            f'Marker source must be "stage1_flag_marker"; got {meta.get("source")!r}'
+        # A stage1_flag_marker ledger row was upserted, keyed by the
+        # cited-tasks-derived signature (task_id='3803', flag_type='cross_project').
+        row = await ledger_memory_service.recon_ledger.get_by_identity(
+            'p', 'stage1_flag_marker', '3803', 'cross_project', ''
         )
-        assert meta.get('task_id') == '3803', (
-            f'Marker task_id must be "3803" (cited-tasks signature); got {meta.get("task_id")!r}'
+        assert row is not None, (
+            'Expected a stage1_flag_marker ledger row for (task_id=3803, '
+            'flag_type=cross_project)'
         )
-        assert meta.get('flag_type') == 'cross_project', (
-            f'Marker flag_type must be "cross_project"; got {meta.get("flag_type")!r}'
+        payload = json.loads(row.payload_json)
+        assert payload.get('source') == 'stage1_flag_marker', (
+            f'Marker source must be "stage1_flag_marker"; got {payload.get("source")!r}'
         )
-        assert meta.get('run_id') == 'r1', (
-            f'Marker run_id must be "r1"; got {meta.get("run_id")!r}'
+        assert payload.get('task_id') == '3803', (
+            f'Marker task_id must be "3803" (cited-tasks signature); got {payload.get("task_id")!r}'
+        )
+        assert payload.get('flag_type') == 'cross_project', (
+            f'Marker flag_type must be "cross_project"; got {payload.get("flag_type")!r}'
+        )
+        assert payload.get('run_id') == 'r1', (
+            f'Marker run_id must be "r1"; got {payload.get("run_id")!r}'
         )
 
     @pytest.mark.asyncio
-    async def test_dedup_flags_cycle2_hit_annotates_persisted_from_run(self):
-        """Cycle 2 (prior marker present): HIT — flag annotated with
+    async def test_dedup_flags_cycle2_hit_annotates_persisted_from_run(
+        self, ledger_memory_service
+    ):
+        """Cycle 2 (prior ledger row present): flag annotated with
         persisted_from_run='r0' and last_seen_run_id='r1'."""
         from fused_memory.reconciliation.flag_dedup import dedup_flags
 
-        prior_marker = _make_memory_result({
-            'source': 'stage1_flag_marker',
-            'task_id': '3803',
-            'flag_type': 'cross_project',
-            'run_id': 'r0',
-            'last_seen_run_id': 'r0',
-        })
-        prior_marker.id = 'prior-3803-r0'
-
-        # Confirmation search must find a marker with the CURRENT run_id='r1'
-        # (the prior has run_id='r0' and is excluded by the run_id-scoped filter).
-        new_marker_r1 = _make_memory_result({
-            'source': 'stage1_flag_marker',
-            'task_id': '3803',
-            'flag_type': 'cross_project',
-            'run_id': 'r1',
-            'last_seen_run_id': 'r1',
-        })
-        new_marker_r1.id = 'new-3803-r1'
-
-        memory_service = AsyncMock()
-        memory_service.search = AsyncMock(side_effect=_make_search_stub(
-            suppression=[[]],
-            marker={('3803', 'cross_project'): [[prior_marker], [new_marker_r1]]},
+        ledger = ledger_memory_service.recon_ledger
+        await ledger.upsert(ReconLedgerRecord(
+            project_id='p',
+            record_kind='stage1_flag_marker',
+            payload_json=json.dumps({
+                'source': 'stage1_flag_marker',
+                'kind': 'stage1_flag_marker',
+                'task_id': '3803',
+                'flag_type': 'cross_project',
+                'run_id': 'r0',
+                'last_seen_run_id': 'r0',
+            }),
+            state='active',
+            created_at='2026-01-01T00:00:00+00:00',
+            task_id='3803',
+            flag_type='cross_project',
+            run_id='',
+            expires_at='2099-01-01T00:00:00+00:00',
         ))
-        memory_service.add_memory = AsyncMock(return_value=_STUB_ADD_MEMORY_RESPONSE)
-        memory_service.delete_memory = AsyncMock(return_value=None)
 
         flag = {
             'task_id': None,
@@ -346,13 +322,13 @@ class TestSignaturePathCrossCycleDedup:
         }
 
         result = await dedup_flags(
-            memory_service=memory_service,
+            memory_service=ledger_memory_service,
             project_id='p',
             run_id='r1',
             flags=[flag],
         )
 
-        # Flag annotated with persisted_from_run (HIT)
+        # Flag annotated with persisted_from_run (prior ledger row found)
         assert len(result) == 1
         assert result[0].get('persisted_from_run') == 'r0', (
             f'Expected persisted_from_run="r0", got {result[0].get("persisted_from_run")!r}'
