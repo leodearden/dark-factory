@@ -2309,7 +2309,7 @@ class HostAllocator:
 
     async def cancel_and_release(
         self,
-        lease: HostLease,
+        lease: HostLease | None,
         *,
         sleep: Any | None = None,
         max_attempts: int = 10,
@@ -2345,7 +2345,8 @@ class HostAllocator:
         nothing left to cancel, and a non-zero rc from that redundant call
         would PARK an already-healthy, released slot. A PARKED slot is NOT
         short-circuited — re-invoking on a PARKED slot is a legitimate
-        recovery retry (re-cancel + re-probe).
+        recovery retry (re-cancel + re-probe). A ``None`` lease is also a
+        no-op returning True (defensive guard for already-cleared callers).
 
         Note: wired into production by tasks 1757 & 1762.  Called in
         ``stop()`` (shutdown drain of ``_inflight`` in-flight entries), in
@@ -2356,6 +2357,9 @@ class HostAllocator:
         :class:`TestHostAllocatorCancelFail`, and
         :class:`TestHostAllocatorCancelReleaseIdempotent` unit tests.
         """
+        if lease is None:
+            return True
+
         if sleep is None:
             import asyncio as _asyncio
             sleep = _asyncio.sleep
