@@ -6216,3 +6216,95 @@ class TestDedupFlagsLedgerMarkerPath:
             assert flag.get('last_seen_run_id') == 'r1'
             assert 'persisted_from_run' not in flag
 
+
+# ---------------------------------------------------------------------------
+# module-surface contract — dead compensation code removed (task 2227 step-11)
+#
+# RED until step-12 deletes confirm_marker_persisted, _write_and_confirm_marker,
+# _marker_query, _CONFIRMATION_MISS_THRESHOLD, _CONFIRM_RETRY_DELAY_SECS and
+# strips their now-dead references out of dedup_flags' source. _is_completion_flag
+# must survive the cleanup (task-2312 completion-marker self-delete stays).
+# ---------------------------------------------------------------------------
+
+
+class TestModuleSurfaceCompensationsRemoved:
+    """Pins that the Mem0 compensation chain is fully deleted from the module
+    surface while the task-2312 completion-marker predicate survives."""
+
+    def test_confirm_marker_persisted_removed(self):
+        import fused_memory.reconciliation.flag_dedup as fd
+
+        assert not hasattr(fd, 'confirm_marker_persisted'), (
+            'confirm_marker_persisted must be deleted — the ledger UPSERT '
+            'replaces the confirm-after-write compensation.'
+        )
+
+    def test_write_and_confirm_marker_removed(self):
+        import fused_memory.reconciliation.flag_dedup as fd
+
+        assert not hasattr(fd, '_write_and_confirm_marker'), (
+            '_write_and_confirm_marker must be deleted — dedup_flags now '
+            'performs a single ledger.upsert call.'
+        )
+
+    def test_marker_query_removed(self):
+        import fused_memory.reconciliation.flag_dedup as fd
+
+        assert not hasattr(fd, '_marker_query'), (
+            '_marker_query must be deleted — no Mem0 search is issued for '
+            'stage1_flag_marker rows anymore.'
+        )
+
+    def test_confirmation_miss_threshold_removed(self):
+        import fused_memory.reconciliation.flag_dedup as fd
+
+        assert not hasattr(fd, '_CONFIRMATION_MISS_THRESHOLD'), (
+            '_CONFIRMATION_MISS_THRESHOLD must be deleted — the per-invocation '
+            'circuit breaker has no ledger-backed equivalent (or need).'
+        )
+
+    def test_confirm_retry_delay_secs_removed(self):
+        import fused_memory.reconciliation.flag_dedup as fd
+
+        assert not hasattr(fd, '_CONFIRM_RETRY_DELAY_SECS'), (
+            '_CONFIRM_RETRY_DELAY_SECS must be deleted along with the '
+            'confirmation retry loop it configured.'
+        )
+
+    def test_is_completion_flag_preserved(self):
+        import fused_memory.reconciliation.flag_dedup as fd
+
+        assert hasattr(fd, '_is_completion_flag'), (
+            '_is_completion_flag (task-2312) must survive the compensation '
+            'cleanup — the completion-marker self-delete branch depends on it.'
+        )
+
+    def test_dedup_flags_source_free_of_compensation_machinery(self):
+        import inspect
+
+        import fused_memory.reconciliation.flag_dedup as fd
+
+        source = inspect.getsource(fd.dedup_flags)
+        for banned in (
+            'seen_signatures',
+            'confirmation_disabled',
+            'consecutive_confirmation_misses',
+            'confirm_marker_persisted',
+            'limit=50',
+        ):
+            assert banned not in source, (
+                f'dedup_flags source must not reference {banned!r} — the '
+                'ledger UPSERT replaced the compensation chain that used it.'
+            )
+
+    def test_dedup_flags_source_retains_completion_marker_annotation(self):
+        import inspect
+
+        import fused_memory.reconciliation.flag_dedup as fd
+
+        source = inspect.getsource(fd.dedup_flags)
+        assert 'completion_marker_self_deleted' in source, (
+            'dedup_flags source must still annotate completion_marker_self_deleted '
+            '— the task-2312 completion branch must survive the cleanup.'
+        )
+
