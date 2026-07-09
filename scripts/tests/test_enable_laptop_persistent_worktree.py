@@ -433,3 +433,47 @@ def test_apply_refuses_blind_edit_when_no_git_anchor(tmp_path):
     assert _backup_files(config_path) == [], (
         "Refused blind edit must not create a backup"
     )
+
+
+# ---------------------------------------------------------------------------
+# step-13: RED -- safety-valve sibling isolation (prefix-collision gotcha)
+# ---------------------------------------------------------------------------
+
+def test_apply_does_not_touch_safety_valve_sibling(tmp_path):
+    """apply on a config containing both persistent_merge_worktree: false
+    and the prefix-colliding persistent_merge_worktree_safety_valve_every_n:
+    5 flips only the boolean to true, leaves the safety-valve key's value
+    (5) byte-for-byte untouched, and results in exactly one occurrence of
+    each key. Pins the prefix-collision gotcha: an unanchored regex would
+    also match/strip/duplicate the safety-valve sibling."""
+    config_path = tmp_path / "reify-laptop.yaml"
+    config_path.write_text(_fixture_laptop_config("unflipped"))
+
+    result = _run_script(config_path)
+
+    assert result.returncode == 0, (
+        f"Expected exit 0; got {result.returncode}\n"
+        f"stdout={result.stdout!r} stderr={result.stderr!r}"
+    )
+
+    config_text = _read_config(config_path)
+
+    assert _count_anchored_key(config_text, KEY) == 1, (
+        f"Expected exactly one occurrence of {KEY}; got "
+        f"{_count_anchored_key(config_text, KEY)}\nconfig:\n{config_text}"
+    )
+    assert _count_anchored_key(config_text, SAFETY_VALVE_KEY) == 1, (
+        f"Expected exactly one occurrence of {SAFETY_VALVE_KEY}; got "
+        f"{_count_anchored_key(config_text, SAFETY_VALVE_KEY)}\nconfig:\n{config_text}"
+    )
+    assert f"{SAFETY_VALVE_KEY}: 5" in config_text, (
+        f"Expected the safety-valve sibling's value to remain untouched (5); got:\n{config_text}"
+    )
+
+    parsed = _parsed(config_path)
+    assert parsed.get("git", {}).get(KEY) is True, (
+        f"Expected git.{KEY} to read back True; parsed={parsed!r}"
+    )
+    assert parsed.get("git", {}).get(SAFETY_VALVE_KEY) == 5, (
+        f"Expected git.{SAFETY_VALVE_KEY} to remain 5, untouched; parsed={parsed!r}"
+    )
