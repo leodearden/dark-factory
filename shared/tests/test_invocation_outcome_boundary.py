@@ -248,6 +248,16 @@ async def _drain_bg(gate: UsageGate) -> None:
 # ---------------------------------------------------------------------------
 
 
+async def _assert_sibling_still_usable(gate: UsageGate, expected_name: str) -> None:
+    """B1 support: an IllegalTransitionError on one account must not corrupt
+    the gate -- a sibling account can still be leased, and the DD-5 _open
+    invariant holds."""
+    assert _open_invariant_holds(gate)
+    lease = await gate.before_invoke()
+    assert lease is not None
+    assert lease.name == expected_name
+
+
 @pytest.mark.asyncio
 class TestB1IllegalTransition:
     """AUTH_FAILED -> PROBE_IN_FLIGHT is not in _LEGAL_TRANSITIONS."""
