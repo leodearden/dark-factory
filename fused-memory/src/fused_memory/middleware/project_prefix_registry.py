@@ -50,6 +50,13 @@ _GENERIC_DIRS: frozenset[str] = frozenset({
 
 DARK_FACTORY_PROJECT_ID: str = 'dark_factory'
 
+# Assumes the canonical dark_factory checkout path. This is informational
+# only — it feeds `suggested_root` on scope_violation escalations (surfaced
+# to an operator) and is never used for queue placement or dispatch
+# decisions, so a deployment checked out elsewhere degrades to a stale
+# suggestion, not a functional break. If that ever needs to be exact,
+# override it by constructing a custom `ProjectPrefixRegistry` (e.g. via
+# `from_roots`) instead of `default()`, or update this constant.
 DARK_FACTORY_ROOT: str = '/home/leo/src/dark-factory'
 
 DARK_FACTORY_PATH_PREFIXES: tuple[str, ...] = (
