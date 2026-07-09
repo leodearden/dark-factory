@@ -7,7 +7,10 @@ W9-β (PRD ``plans/workflow-state-machine-prd.md`` §10 β; Contract §8.1/§8.2
 
 from __future__ import annotations
 
+from unittest.mock import AsyncMock, MagicMock
+
 import pytest
+from _orch_helpers import pydantic_spec
 from shared.task_statuses import TaskStatus
 from shared.task_transitions import ActorClass
 from shared.task_transitions import is_legal_transition as shared_is_legal_transition
@@ -15,6 +18,8 @@ from shared.task_transitions import outcome_allows_status as shared_outcome_allo
 
 import orchestrator.workflow as workflow_mod
 import orchestrator.workflow_types as workflow_types_mod
+from orchestrator.config import OrchestratorConfig
+from orchestrator.workflow import TaskWorkflow
 from orchestrator.workflow_types import (
     IllegalTransition,
     WorkflowOutcome,
@@ -196,3 +201,61 @@ class TestNeverAFourthTable:
             with pytest.raises(IllegalTransition):
                 machine.transition(to)
             assert machine.state == frm
+
+
+def _make_workflow(*, task_id: str = '77') -> tuple[TaskWorkflow, MagicMock]:
+    """Minimal ``TaskWorkflow`` construction, mirroring the ``_make`` builder in
+    ``test_workflow_already_done.py`` but trimmed to the state-machine wiring
+    surface — no worktree/artifacts are needed for these tests.
+
+    Returns ``(workflow, scheduler)`` so callers can assert on scheduler calls
+    (e.g. the ``_mark_blocked`` terminal-absorption guard).
+    """
+    assignment = MagicMock()
+    assignment.task_id = task_id
+    assignment.task = {'id': task_id, 'title': 'T', 'description': 'd'}
+    assignment.modules = []
+
+    config = MagicMock(spec_set=pydantic_spec(OrchestratorConfig))
+
+    scheduler = MagicMock()
+    scheduler.set_task_status = AsyncMock()
+
+    wf = TaskWorkflow(
+        assignment=assignment,
+        config=config,
+        git_ops=MagicMock(),
+        scheduler=scheduler,
+        briefing=MagicMock(),
+        mcp=MagicMock(),
+    )
+    return wf, scheduler
+
+
+class TestTaskWorkflowStateMachineWiring:
+    """Integration: ``TaskWorkflow.state``/``machine`` wiring (step-6)."""
+
+    def test_construction_starts_machine_at_plan(self):
+        wf, _ = _make_workflow()
+        assert isinstance(wf.machine, WorkflowStateMachine)
+        assert wf.machine.state == WorkflowState.PLAN
+        assert wf.state == WorkflowState.PLAN
+
+    def test_state_setter_delegates_to_machine_force_set(self):
+        wf, _ = _make_workflow()
+        wf.state = WorkflowState.MERGE
+        assert wf.machine.state == WorkflowState.MERGE
+        assert wf.state == WorkflowState.MERGE
+
+    def test_enter_phase_advances_both_state_and_machine(self):
+        wf, _ = _make_workflow()
+        wf._enter_phase(WorkflowState.EXECUTE)
+        assert wf.state == WorkflowState.EXECUTE
+        assert wf.machine.state == WorkflowState.EXECUTE
+
+    def test_enter_phase_after_terminal_raises_and_state_unchanged(self):
+        wf, _ = _make_workflow()
+        wf.state = WorkflowState.DONE
+        with pytest.raises(IllegalTransition):
+            wf._enter_phase(WorkflowState.BLOCKED)
+        assert wf.state == WorkflowState.DONE
