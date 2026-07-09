@@ -2348,6 +2348,20 @@ class HostAllocator:
         recovery retry (re-cancel + re-probe). A ``None`` lease is also a
         no-op returning True (defensive guard for already-cleared callers).
 
+        Known limitation (ABA): the guard keys on current slot STATE
+        (FREE/BUSY/PARKED), not on lease identity — ``HostLease`` is a frozen
+        dataclass with no generation/epoch token. If a lease's slot is
+        released (FREE) and then re-acquired (BUSY) by a *different*
+        in-flight verify before a stale ``cancel_and_release(old_lease)``
+        call arrives, the guard sees BUSY, falls through, and would cancel
+        the NEW occupant's verify instead of no-op'ing. This is pre-existing
+        (not introduced by this guard) and out of scope here: callers must
+        never invoke ``cancel_and_release`` with a lease after that lease's
+        slot may have already been released and re-acquired elsewhere.
+        Closing it fully would require tagging ``HostLease`` and the slot map
+        with a monotonically increasing generation counter and refusing to
+        cancel on a generation mismatch.
+
         Note: wired into production by tasks 1757 & 1762.  Called in
         ``stop()`` (shutdown drain of ``_inflight`` in-flight entries), in
         ``_verifier_loop()`` (head-failure cascade / operator-halt REQUEUED
@@ -2367,7 +2381,10 @@ class HostAllocator:
         if self._slots.get(lease.name) == _SLOT_FREE:
             # Already released — nothing to cancel. Short-circuit before any
             # RPC so a double-release cannot re-issue cancel_verify() and
-            # PARK a healthy slot.
+            # PARK a healthy slot. This checks slot STATE only, not lease
+            # identity, so it does not cover the ABA case (slot re-acquired
+            # by a different lease between two calls) — see the docstring's
+            # "Known limitation (ABA)" note.
             return True
 
         if lease.is_local:
