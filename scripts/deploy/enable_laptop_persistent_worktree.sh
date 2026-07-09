@@ -70,6 +70,13 @@ if ! "$PY" -c "import sys, yaml; yaml.safe_load(open(sys.argv[1]))" "$CONFIG" 2>
     exit 1
 fi
 
+# NOTE (task 2310 step-13/14): this anchor is deliberate -- requiring the
+# colon (modulo whitespace) immediately after the key name excludes the
+# prefix-colliding sibling `persistent_merge_worktree_safety_valve_every_n`
+# (whose next character is `_`, not whitespace-or-colon). Every regex below
+# that targets this key (here, and the awk strip pattern further down)
+# MUST keep this exact `^[[:space:]]*persistent_merge_worktree[[:space:]]*:`
+# form -- do not loosen it to an unanchored/prefix match.
 key_present() {
     grep -qE '^[[:space:]]*persistent_merge_worktree[[:space:]]*:' "$CONFIG"
 }
@@ -108,6 +115,8 @@ fi
 cp -p "$CONFIG" "${CONFIG}.bak-${LABEL}"
 
 tmp="$(mktemp "${CONFIG}.XXXXXX")"
+# Same anchor as key_present() above -- see the NOTE there. This strip
+# pattern must never match persistent_merge_worktree_safety_valve_every_n.
 awk '
     $0 ~ "^[[:space:]]*persistent_merge_worktree[[:space:]]*:" { next }
     { print }
