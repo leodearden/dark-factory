@@ -1905,3 +1905,43 @@ class TestGroupMergeUnionScope:
 
         # Member with no metadata.files (M) must not cause an error (skipped silently)
         assert len(captured) == 1, 'exactly one GroupMergeRequest must be enqueued'
+
+
+@pytest.mark.asyncio
+class TestSpawnDryRunUnblockBlockClass:
+    """_spawn_dry_run_unblock classifies `reason` and passes block_class to
+    run_dry_run_unblock (task 2138 step-7; PRD: plans/verify-plan-prd.md
+    task ζ)."""
+
+    async def test_classifies_reason_and_passes_block_class(
+        self, tmp_path: Path, monkeypatch,
+    ):
+        import asyncio
+
+        from orchestrator.merge_gates import POST_MERGE_PYRIGHT_BROKEN_REASON_PREFIX
+        from orchestrator.unblock_types import BlockClass
+
+        wf = _make_workflow(tmp_path=tmp_path)
+        wf.config.unblock_auto.enabled = True
+
+        calls: list[dict] = []
+
+        async def _spy(**kwargs):
+            calls.append(kwargs)
+
+        monkeypatch.setattr('orchestrator.workflow.run_dry_run_unblock', _spy)
+
+        wf._spawn_dry_run_unblock(
+            POST_MERGE_PYRIGHT_BROKEN_REASON_PREFIX + ': type-check failed', 'detail 1',
+        )
+        await asyncio.sleep(0)
+        wf._spawn_dry_run_unblock('Workflow error: boom', 'detail 2')
+        await asyncio.sleep(0)
+
+        assert len(calls) == 2, f'expected 2 spy invocations, got {len(calls)}: {calls}'
+        assert calls[0]['block_class'] == BlockClass.POST_MERGE_RED_MAIN, (
+            f'post-merge reason: expected POST_MERGE_RED_MAIN, got {calls[0].get("block_class")!r}'
+        )
+        assert calls[1]['block_class'] == BlockClass.AGENT_FAILURE, (
+            f'workflow-error reason: expected AGENT_FAILURE, got {calls[1].get("block_class")!r}'
+        )
