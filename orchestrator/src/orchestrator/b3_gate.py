@@ -312,6 +312,10 @@ def check_proposal(
           required', so step 2 catches it — this sniff is redundant (and
           would incorrectly fire on a legit low-risk MERGE_VERIFY_RED entry
           that happens to carry a stray 'status' key) for the typed path.
+          This cross-module invariant (failure shape -> risk_label != 'low')
+          is not enforced here; dry_run_unblock.run_dry_run_unblock logs an
+          error at its BlockRecord stamp site if a future producer shape
+          ever violates it.
       4. category not in B3_CATEGORIES (when not None) -> abort
       5. head_sha or main_sha missing/None -> drift 'no sha anchor'
       6. HEAD != head_sha -> abort (git-anchored; P1)

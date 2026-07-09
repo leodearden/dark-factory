@@ -414,6 +414,26 @@ async def run_dry_run_unblock(
         files_referenced=entry.get('files_referenced', []),
         investigated_at=entry.get('investigated_at', ''),
     )
+    if 'status' in entry and record.risk_label == 'low':
+        # Cross-module producer invariant that b3_gate.check_proposal's typed
+        # path depends on (see b3_gate.py check_proposal step 3 docstring):
+        # every failure shape ('status' key present) must set risk_label !=
+        # 'low', because on the typed path (block_class is not None) step 3's
+        # status-sniff is intentionally skipped in favor of step 2 (risk_label
+        # != 'low' -> abort). All current failure shapes here (_build_entry,
+        # _cap_exhausted_entry, the exception fallback above) hardcode
+        # risk_label=_HUMAN_REVIEW_REQUIRED, so this should be unreachable —
+        # log loudly (not raise/assert) if a future producer shape violates
+        # it, since this is a fire-and-forget background investigation that
+        # must not crash on its own bug, but a silent violation would let a
+        # failure entry slip past check_proposal straight to FRESH.
+        logger.error(
+            'dry_run_unblock: invariant violated for task %s — failure entry '
+            "(status=%r) has risk_label='low'; b3_gate.check_proposal's typed "
+            'dual-read path (step 3) relies on failure shapes never being '
+            'low-risk',
+            task_id, entry.get('status'),
+        )
     entry.update(record.to_dict())
 
     try:
