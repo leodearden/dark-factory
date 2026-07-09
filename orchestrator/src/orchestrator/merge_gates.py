@@ -770,6 +770,21 @@ async def _map_advance_failure(
             recovery_branch=recovery,
         )
 
+    if result == 'conflict_markers':
+        # esc-2128-8 Layer-2 backstop: the merge tree carries tracked
+        # file(s) with unresolved (column-0) conflict markers. A per-branch
+        # content problem, not a queue-wide condition — no halt (contrast
+        # unmerged_state/wip_overlap above, which halt the whole queue).
+        cas_retries.pop(task_id, None)
+        return MergeOutcome(
+            'blocked',
+            reason=(
+                f'advance_main refused to advance: branch contains git '
+                f'conflict marker(s) in tracked file(s); resolve the '
+                f'conflict marker(s) and re-run. (task {task_id})'
+            ),
+        )
+
     # not_descendant / contaminated / stash_failed — permanent failure
     cas_retries.pop(task_id, None)
     return MergeOutcome(
