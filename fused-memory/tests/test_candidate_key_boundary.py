@@ -182,7 +182,9 @@ async def test_bt_a2_planning_mode_reintroduction_guard(real_stack):
         title='Fix parser',
         metadata={'files': ['a.py', 'b.py']},
     )
-    assert first == {'task_id': '1', 'status': 'deferred', 'planning_mode': True}, first
+    assert first['task_id'] == '1', first
+    assert first['status'] == 'deferred', first
+    assert first['planning_mode'] is True, first
 
     # Case + extra internal whitespace on the title, file order swapped —
     # same normalized candidate_key as the first submission.
@@ -230,13 +232,19 @@ async def test_bt_a3_crash_between_insert_and_commit_leaves_no_orphan(tmp_path):
             raise RuntimeError('injected crash between INSERT and COMMIT')
 
         backend._after_insert_fault_hook = _boom
-        with pytest.raises(RuntimeError, match='injected crash between INSERT and COMMIT'):
-            await backend.add_task(
-                project_root=project_root,
-                title='Fix parser',
-                metadata=json.dumps({'files': ['a.py', 'b.py']}),
-            )
-        backend._after_insert_fault_hook = None
+        try:
+            with pytest.raises(RuntimeError, match='injected crash between INSERT and COMMIT'):
+                await backend.add_task(
+                    project_root=project_root,
+                    title='Fix parser',
+                    metadata=json.dumps({'files': ['a.py', 'b.py']}),
+                )
+        finally:
+            # Clear the hook unconditionally — even if add_task raised
+            # something other than the expected RuntimeError (e.g. a
+            # pytest.raises mismatch), the hook must not stay armed for
+            # the post-crash add_task calls below.
+            backend._after_insert_fault_hook = None
 
         after_crash = await count_non_cancelled(backend, project_root)
         assert after_crash == before, (
