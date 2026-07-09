@@ -218,17 +218,29 @@ def deterministic_task_error(
 
     # Invariant 4: before_done structural + filesystem checks (only when present)
     if before_done is not None:
-        err = _validate_before_done(before_done, project_root)
+        err = _validate_before_done(before_done, project_root, always_escalates=always_escalates)
         if err is not None:
             return err
 
     return None
 
 
-def _validate_before_done(before_done: Any, project_root: str) -> dict[str, Any] | None:
+def _validate_before_done(
+    before_done: Any,
+    project_root: str,
+    *,
+    always_escalates: bool = False,
+) -> dict[str, Any] | None:
     """Validate the before_done payload structurally and against the filesystem.
 
     Returns a ValidationError dict on failure, or None when valid.
+
+    Args:
+        before_done: The before_done payload to validate.
+        project_root: Absolute path to the project root.
+        always_escalates: The already-computed top-level metadata.always_escalates
+            value — needed here (rather than re-derived) to enforce the
+            kind='predicate' prohibition on always_escalates=True below.
     """
     # Must be a dict
     if not isinstance(before_done, dict):
@@ -284,6 +296,28 @@ def _validate_before_done(before_done: Any, project_root: str) -> dict[str, Any]
                 "The runner kills the script and escalates on timeout."
             ),
         )
+
+    # kind='predicate' prohibitions (PRD §5 dec 7,8). kind='deploy' (the
+    # default, including an omitted 'kind' key) is left byte-identical —
+    # these checks are additive and only fire for an explicit predicate.
+    if before_done.get('kind') == 'predicate':
+        if before_done.get('target_unit') is not None:
+            return _validation_error(
+                "before_done.target_unit is forbidden when before_done.kind="
+                "'predicate' — a predicate has no unit to verify.",
+                hint="Remove 'target_unit' from before_done, or use kind='deploy'.",
+            )
+        if always_escalates is True:
+            return _validation_error(
+                "always_escalates=True is forbidden when before_done.kind="
+                "'predicate' — predicate escalation is conditional on the "
+                "script's exit code, not unconditional.",
+                hint=(
+                    "Remove 'always_escalates' (or set it False) for a predicate "
+                    "before_done; the runner escalates only when the script exits "
+                    "non-zero."
+                ),
+            )
 
     return None
 
