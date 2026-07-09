@@ -1252,6 +1252,17 @@ class Scheduler:
         # silence.
         self._last_dispatch_deferred_log: float = 0.0
         self._last_psi_read_fail_log: float = 0.0
+        # Injected async hook installed by the Harness — the already-landed
+        # pre-dispatch gate (task 2313), architecturally parallel to
+        # _landed_outbox_gate above but sourced from live git state (ancestry
+        # / merge-marker / content-equivalence) rather than this
+        # orchestrator's own merge queue, so it also catches OUT-OF-BAND
+        # landings (sibling direct-merge, prior run, squash/rebase/manual).
+        # Signature: (task_id: str) -> bool (async). True means the task is
+        # already fully landed on main and has been driven to done inline by
+        # the hook's own routine, so acquire_next() must NOT dispatch it this
+        # tick. Default None so bare-Scheduler unit tests are unaffected.
+        self._already_landed_gate: Callable[[str], Any] | None = None
         # --- Snapshot write throttle (task 1332) ---
         # Monotonic timestamp of the last successful _write_snapshot_best_effort
         # disk write.  None before the first write; the first write always
@@ -3448,6 +3459,47 @@ class Scheduler:
             except Exception:
                 logger.warning(
                     'Landed-outbox dispatch gate raised for task_id=%s — '
+                    'failing open (task treated as not-gated, dispatch '
+                    'continues) so a git/MCP hiccup can NEVER abort the '
+                    'tick (PROPERTY 1)',
+                    tid,
+                    exc_info=True,
+                )
+                continue
+            if gated_now:
+                gated.add(tid)
+        return gated
+
+    async def _consult_already_landed(self, candidates: list[dict]) -> set[str]:
+        """Consult the injected already-landed dispatch gate for each candidate.
+
+        Returns the subset of ``candidates`` the hook gated (task 2313):
+        the task is already fully landed on ``main`` (ancestry / merge-marker
+        / content-equivalence) and is being driven to ``done`` inline by the
+        hook's own routine, so it must not be dispatched this tick. Returns
+        the empty set immediately without awaiting anything when no hook is
+        installed (default None), so bare-Scheduler unit tests are
+        unaffected — mirrors ``_consult_landed_outbox``.
+
+        This is a TOTAL function: it never raises. The hook performs
+        unguarded git I/O (``is_ancestor``/``branch_content_in_main``) and
+        scheduler writes (``mark_done``) via ``_mark_in_progress_done``, any
+        of which can transiently fail. Each candidate's consult is wrapped
+        individually, so one candidate's failure fails OPEN for that
+        candidate alone (treated as not-gated) and can neither abort the
+        tick nor stop the remaining candidates from being consulted
+        (PROPERTY 1).
+        """
+        if self._already_landed_gate is None:
+            return set()
+        gated: set[str] = set()
+        for t in candidates:
+            tid = str(t.get('id', ''))
+            try:
+                gated_now = await self._already_landed_gate(tid)
+            except Exception:
+                logger.warning(
+                    'Already-landed dispatch gate raised for task_id=%s — '
                     'failing open (task treated as not-gated, dispatch '
                     'continues) so a git/MCP hiccup can NEVER abort the '
                     'tick (PROPERTY 1)',
