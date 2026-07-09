@@ -4169,14 +4169,18 @@ class TestSubmitTaskGuardrail:
     """Integration tests: path-scope guard wired into submit_task."""
 
     @pytest.mark.asyncio
-    async def test_submit_task_rejects_dark_factory_paths_in_wrong_project(
+    async def test_submit_task_advises_dark_factory_paths_in_wrong_project(
         self,
         interceptor_with_store,
         ticket_store,
         taskmaster,
     ):
-        """Filing a task referencing orchestrator/ under a non-dark-factory project
-        returns a DarkFactoryPathScopeViolation error and does NOT persist a ticket.
+        """Filing a title-bearing task referencing orchestrator/ under a
+        non-dark-factory project is a non-rejecting PROSE-ADVISORY: the
+        ticket is still created, and the persisted blob's metadata carries
+        possible_scope_mismatch (task 2208 — the interceptor's default
+        registry makes the multi-project guard path universal, so a prose
+        hit alone never hard-rejects).
         """
         try:
             result = await interceptor_with_store.submit_task(
@@ -4189,24 +4193,25 @@ class TestSubmitTaskGuardrail:
             # fixture closes the DB, preventing "closed database" background errors.
             await _cancel_interceptor_workers(interceptor_with_store)
 
-        # Guard must return a structured error
         assert isinstance(result, dict)
-        assert result.get('error_type') == 'DarkFactoryPathScopeViolation', (
-            f'Expected DarkFactoryPathScopeViolation error, got: {result}'
-        )
-        assert 'orchestrator/' in result.get('matched_paths', []), (
-            f'Expected orchestrator/ in matched_paths: {result}'
-        )
+        assert 'error_type' not in result, f'Expected no error (advisory only), got: {result}'
+        ticket_id = result.get('ticket', '')
+        assert ticket_id.startswith('tkt_'), f'Expected tkt_-prefixed ticket, got: {result}'
 
-        # Ticket store must have zero rows (guard fires before persist)
         db = ticket_store._db
         assert db is not None
-        cursor = await db.execute('SELECT COUNT(*) FROM tickets')
+        cursor = await db.execute(
+            'SELECT candidate_json FROM tickets WHERE ticket_id = ?',
+            (ticket_id,),
+        )
         row = await cursor.fetchone()
-        assert row[0] == 0, f'Expected 0 tickets in store, found {row[0]}'
-
-        # Taskmaster backend must never have been called
-        taskmaster.add_task.assert_not_called()
+        assert row is not None, f'Expected persisted row for {ticket_id!r}'
+        blob = json.loads(row['candidate_json'])
+        meta = blob.get('metadata') or {}
+        marker = meta.get('possible_scope_mismatch')
+        assert marker is not None, f'Expected possible_scope_mismatch in blob metadata: {blob!r}'
+        assert marker['matched_paths'] == ['orchestrator/']
+        assert marker['suggested_project'] == 'dark_factory'
 
     @pytest.mark.asyncio
     async def test_submit_task_allows_dark_factory_paths_in_dark_factory_project(
@@ -4236,14 +4241,19 @@ class TestSubmitTaskGuardrail:
         )
 
     @pytest.mark.asyncio
-    async def test_submit_task_skips_build_candidate_for_dark_factory_project(
+    async def test_submit_task_builds_candidate_for_dark_factory_project(
         self,
         interceptor_with_store,
         taskmaster,
         monkeypatch,
     ):
-        """Hoist optimisation: _build_candidate is not invoked for the dark_factory
-        project_id, since the path guard short-circuits to 'ok' anyway.
+        """The dark_factory hoist optimisation is retired (task 2208): the
+        interceptor's ctor-default registry is always present, so the guard
+        runs the same for every project_id including dark_factory —
+        _build_candidate is invoked exactly once (the guard's lazy-build in
+        _path_guard_or_skip), not skipped. The submission still succeeds
+        with no error, since dark_factory owns orchestrator/ in the default
+        registry.
 
         Persistence-shape coverage (project_id column, candidate_json blob fields) is
         owned by ``test_submit_task_persists_canonical_blob`` — one place to update
@@ -4273,9 +4283,11 @@ class TestSubmitTaskGuardrail:
             # fixture closes the DB, preventing "closed database" background errors.
             await _cancel_interceptor_workers(interceptor_with_store)
 
+        assert 'error_type' not in result, f'Expected no error for dark_factory: {result}'
         assert result.get('ticket', '').startswith('tkt_')
-        assert calls_after_submit == 0, (
-            f'Expected _build_candidate to be skipped for dark_factory; got {calls_after_submit} calls'
+        assert calls_after_submit == 1, (
+            f'Expected _build_candidate to run once (guard lazy-build) for '
+            f'dark_factory; got {calls_after_submit} calls'
         )
 
     @pytest.mark.asyncio
@@ -4310,7 +4322,7 @@ class TestSubmitTaskGuardrail:
         # Direct _db access is intentional: we're pinning the storage-layer
         # serialisation contract, which has no public query path.  This mirrors
         # the pattern used by sibling tests in this class (e.g.
-        # test_submit_task_rejects_dark_factory_paths_in_wrong_project).
+        # test_submit_task_advises_dark_factory_paths_in_wrong_project).
         db = ticket_store._db
         assert db is not None
         cursor = await db.execute(
@@ -4362,15 +4374,58 @@ class TestSubmitTaskGuardrail:
         assert 'error_type' not in result
 
     @pytest.mark.asyncio
-    async def test_submit_task_rejects_prompt_only_dark_factory_paths_in_wrong_project(
+    async def test_submit_task_rejects_wrong_project_files_via_default_registry(
+        self,
+        interceptor_with_store,
+        ticket_store,
+        taskmaster,
+    ):
+        """BT-D3 / D2 signal: with no explicit registry override, the
+        interceptor's ctor-default ``ProjectPrefixRegistry.default()`` still
+        FILES-certain rejects a dark-factory file mis-filed into another
+        project — the multi-project guard path is the only path, even in
+        single-project (no ``known_project_roots``) deployments (task 2208).
+        """
+        try:
+            result = await interceptor_with_store.submit_task(
+                project_root='/some-other-project',
+                title='Generic title, no prose hit',
+                description='nothing project-specific here',
+                metadata={'files': ['fused-memory/src/x.py']},
+            )
+        finally:
+            await _cancel_interceptor_workers(interceptor_with_store)
+
+        assert isinstance(result, dict)
+        assert result.get('error_type') == 'DarkFactoryPathScopeViolation', (
+            f'Expected DarkFactoryPathScopeViolation, got: {result}'
+        )
+        assert 'fused-memory/src/x.py' in result.get('matched_paths', []), (
+            f'Expected the offending file in matched_paths: {result}'
+        )
+        assert result.get('suggested_project') == 'dark_factory'
+
+        db = ticket_store._db
+        assert db is not None
+        cursor = await db.execute('SELECT COUNT(*) FROM tickets')
+        row = await cursor.fetchone()
+        assert row[0] == 0, f'Expected 0 tickets (rejected), found {row[0]}'
+
+        taskmaster.add_task.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_submit_task_advises_prompt_only_dark_factory_paths_in_wrong_project(
         self,
         interceptor_with_store,
         ticket_store,
         taskmaster,
     ):
         """A prompt-only submit_task (no title) referencing orchestrator/ under a
-        non-dark-factory project returns a DarkFactoryPathScopeViolation error,
-        persists no ticket, and never calls taskmaster.add_task.
+        non-dark-factory project is a non-rejecting PROSE-ADVISORY: the ticket
+        is still created, and the persisted blob's metadata carries
+        possible_scope_mismatch (task 2208 — the interceptor's default
+        registry makes the multi-project guard path universal, so a prose
+        hit alone never hard-rejects).
         """
         try:
             result = await interceptor_with_store.submit_task(
@@ -4381,24 +4436,25 @@ class TestSubmitTaskGuardrail:
         finally:
             await _cancel_interceptor_workers(interceptor_with_store)
 
-        # Guard must return a structured error
         assert isinstance(result, dict)
-        assert result.get('error_type') == 'DarkFactoryPathScopeViolation', (
-            f'Expected DarkFactoryPathScopeViolation error, got: {result}'
-        )
-        assert 'orchestrator/' in result.get('matched_paths', []), (
-            f'Expected orchestrator/ in matched_paths: {result}'
-        )
+        assert 'error_type' not in result, f'Expected no error (advisory only), got: {result}'
+        ticket_id = result.get('ticket', '')
+        assert ticket_id.startswith('tkt_'), f'Expected tkt_-prefixed ticket, got: {result}'
 
-        # Ticket store must have zero rows (guard fires before persist)
         db = ticket_store._db
         assert db is not None
-        cursor = await db.execute('SELECT COUNT(*) FROM tickets')
+        cursor = await db.execute(
+            'SELECT candidate_json FROM tickets WHERE ticket_id = ?',
+            (ticket_id,),
+        )
         row = await cursor.fetchone()
-        assert row[0] == 0, f'Expected 0 tickets in store, found {row[0]}'
-
-        # Taskmaster backend must never have been called
-        taskmaster.add_task.assert_not_called()
+        assert row is not None, f'Expected persisted row for {ticket_id!r}'
+        blob = json.loads(row['candidate_json'])
+        meta = blob.get('metadata') or {}
+        marker = meta.get('possible_scope_mismatch')
+        assert marker is not None, f'Expected possible_scope_mismatch in blob metadata: {blob!r}'
+        assert marker['matched_paths'] == ['orchestrator/']
+        assert marker['suggested_project'] == 'dark_factory'
 
     @pytest.mark.asyncio
     async def test_submit_task_allows_prompt_only_dark_factory_paths_in_dark_factory_project(
@@ -4408,8 +4464,11 @@ class TestSubmitTaskGuardrail:
     ):
         """Prompt-only submit_task filed under /dark-factory is always allowed.
 
-        The dark_factory short-circuit in check_text_for_dark_factory_paths must fire
-        and the result must be a 'tkt_'-prefixed ticket with no error_type.
+        dark_factory OWNS orchestrator/ in the interceptor's default registry
+        (``ProjectPrefixRegistry.default()``, task 2208): ``check_text_for_scope``
+        treats an owner == project_id match as in-project, not a mismatch, so
+        no verdict is ever raised. The result must be a 'tkt_'-prefixed ticket
+        with no error_type.
         """
         try:
             result = await interceptor_with_store.submit_task(
@@ -4456,7 +4515,7 @@ class TestSubmitTaskGuardrail:
 
     @pytest.mark.parametrize('field', ['prompt', 'description', 'details'])
     @pytest.mark.asyncio
-    async def test_submit_task_rejects_dark_factory_path_in_any_fallback_field(
+    async def test_submit_task_advises_dark_factory_path_in_any_fallback_field(
         self,
         field,
         interceptor_with_store,
@@ -4468,8 +4527,9 @@ class TestSubmitTaskGuardrail:
 
         Each parametrised case passes a dark-factory path in ``field`` with no
         title kwarg, routing _build_candidate to return None and engaging the
-        fallback branch.  All three channels must trigger
-        DarkFactoryPathScopeViolation and persist no ticket.
+        fallback branch. All three channels are non-rejecting PROSE-ADVISORY
+        (task 2208): the ticket is created and the persisted blob carries
+        possible_scope_mismatch.
         """
         try:
             result = await interceptor_with_store.submit_task(
@@ -4481,21 +4541,30 @@ class TestSubmitTaskGuardrail:
             await _cancel_interceptor_workers(interceptor_with_store)
 
         assert isinstance(result, dict)
-        assert result.get('error_type') == 'DarkFactoryPathScopeViolation', (
-            f'Field {field!r}: expected DarkFactoryPathScopeViolation, got: {result}'
+        assert 'error_type' not in result, (
+            f'Field {field!r}: expected no error (advisory only), got: {result}'
         )
-        assert 'orchestrator/' in result.get('matched_paths', []), (
-            f'Field {field!r}: expected orchestrator/ in matched_paths: {result}'
+        ticket_id = result.get('ticket', '')
+        assert ticket_id.startswith('tkt_'), (
+            f'Field {field!r}: expected tkt_-prefixed ticket, got: {result}'
         )
 
-        # Ticket store must have zero rows (guard fires before persist)
         db = ticket_store._db
         assert db is not None
-        cursor = await db.execute('SELECT COUNT(*) FROM tickets')
+        cursor = await db.execute(
+            'SELECT candidate_json FROM tickets WHERE ticket_id = ?',
+            (ticket_id,),
+        )
         row = await cursor.fetchone()
-        assert row[0] == 0, f'Field {field!r}: expected 0 tickets, found {row[0]}'
-
-        taskmaster.add_task.assert_not_called()
+        assert row is not None, f'Field {field!r}: expected persisted row for {ticket_id!r}'
+        blob = json.loads(row['candidate_json'])
+        meta = blob.get('metadata') or {}
+        marker = meta.get('possible_scope_mismatch')
+        assert marker is not None, (
+            f'Field {field!r}: expected possible_scope_mismatch in blob metadata: {blob!r}'
+        )
+        assert marker['matched_paths'] == ['orchestrator/']
+        assert marker['suggested_project'] == 'dark_factory'
 
     @pytest.mark.asyncio
     async def test_submit_task_routing_override_bypasses_guard_and_records_reason(
@@ -4562,15 +4631,18 @@ class TestSubmitTaskGuardrail:
         )
 
     @pytest.mark.asyncio
-    async def test_submit_task_routing_override_absent_still_rejects(
+    async def test_submit_task_routing_override_absent_still_flags_advisory(
         self,
         interceptor_with_store,
         ticket_store,
         taskmaster,
     ):
         """Without routing_override_reason the guard still fires: the same task
-        content is rejected with DarkFactoryPathScopeViolation and persists
-        zero tickets (regression guard for the override path).
+        content still gets flagged with possible_scope_mismatch even though it
+        is no longer a hard reject — the override's job is to skip the guard
+        entirely (see test_submit_task_routing_override_bypasses_guard_and_
+        records_reason), not to suppress the now-universal PROSE-ADVISORY
+        outcome (regression guard for the override path, task 2208).
         """
         try:
             result = await interceptor_with_store.submit_task(
@@ -4582,15 +4654,26 @@ class TestSubmitTaskGuardrail:
         finally:
             await _cancel_interceptor_workers(interceptor_with_store)
 
-        assert result.get('error_type') == 'DarkFactoryPathScopeViolation', (
-            f'Expected rejection without override, got: {result}'
+        assert 'error_type' not in result, (
+            f'Expected advisory (not rejection) without override, got: {result}'
         )
+        ticket_id = result.get('ticket', '')
+        assert ticket_id.startswith('tkt_'), f'Expected tkt_-prefixed ticket, got: {result}'
 
         db = ticket_store._db
         assert db is not None
-        cursor = await db.execute('SELECT COUNT(*) FROM tickets')
+        cursor = await db.execute(
+            'SELECT candidate_json FROM tickets WHERE ticket_id = ?',
+            (ticket_id,),
+        )
         row = await cursor.fetchone()
-        assert row[0] == 0, f'Expected 0 tickets (rejected), found {row[0]}'
+        assert row is not None, f'Expected persisted row for {ticket_id!r}'
+        blob = json.loads(row['candidate_json'])
+        meta = blob.get('metadata') or {}
+        marker = meta.get('possible_scope_mismatch')
+        assert marker is not None, f'Expected possible_scope_mismatch in blob metadata: {blob!r}'
+        assert marker['matched_paths'] == ['orchestrator/']
+        assert marker['suggested_project'] == 'dark_factory'
 
     @pytest.mark.asyncio
     async def test_submit_task_routing_override_with_planning_mode_records_reason(
@@ -4887,6 +4970,11 @@ class TestPathGuardFallbackMetadataFiles:
     ):
         """prompt-only submit_task with dark-factory path ONLY in metadata[meta_key]
         must be rejected even though all free-text fields are clean.
+
+        This is the FILES-CERTAIN check (task 2206/2208): matched_paths carries
+        the exact offending file path, not a matched prefix (the heuristic
+        prose scanner's matched_paths shape, which no longer re-scans
+        metadata.files at all — see _path_guard_check).
         """
         try:
             result = await interceptor_with_store.submit_task(
@@ -4902,9 +4990,10 @@ class TestPathGuardFallbackMetadataFiles:
         assert result.get('error_type') == 'DarkFactoryPathScopeViolation', (
             f'meta_key={meta_key!r}: expected DarkFactoryPathScopeViolation, got: {result}'
         )
-        assert 'orchestrator/' in result.get('matched_paths', []), (
-            f'meta_key={meta_key!r}: expected orchestrator/ in matched_paths: {result}'
+        assert 'orchestrator/harness.py' in result.get('matched_paths', []), (
+            f'meta_key={meta_key!r}: expected orchestrator/harness.py in matched_paths: {result}'
         )
+        assert result.get('suggested_project') == 'dark_factory'
 
         # Ticket store must have zero rows (guard fires before persist)
         db = ticket_store._db
@@ -4972,13 +5061,16 @@ class TestPathGuardOrSkip:
     """
 
     # -- Case 1 -----------------------------------------------------------
-    async def test_path_guard_or_skip_returns_none_for_dark_factory_project(
+    async def test_path_guard_or_skip_runs_guard_for_dark_factory_project(
         self,
         interceptor,
         monkeypatch,
     ):
-        """dark_factory short-circuit (back-compat: no registry configured):
-        returns None without calling _build_candidate or _path_guard_check.
+        """The dark_factory short-circuit is retired (task 2208): the
+        ctor-default registry is always present, so _build_candidate and
+        _path_guard_check run for dark_factory exactly like any other
+        project_id. The call still returns None (no rejection) because the
+        (stubbed) verdict is 'ok'.
         """
         from fused_memory.middleware.path_scope_guard import PathGuardVerdict
 
@@ -5003,8 +5095,8 @@ class TestPathGuardOrSkip:
         )
 
         assert result is None
-        assert build_calls == [], '_build_candidate must NOT be called for dark_factory'
-        assert guard_calls == [], '_path_guard_check must NOT be called for dark_factory'
+        assert len(build_calls) == 1, '_build_candidate must be called for dark_factory too'
+        assert len(guard_calls) == 1, '_path_guard_check must be called for dark_factory too'
 
     # -- Case 2 -----------------------------------------------------------
     async def test_path_guard_or_skip_lazy_builds_candidate_when_unset(

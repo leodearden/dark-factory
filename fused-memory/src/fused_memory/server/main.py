@@ -521,9 +521,10 @@ async def run_server():
 
     # Multi-project path-scope guard: built from the configured project +
     # DASHBOARD_KNOWN_PROJECT_ROOTS env var so the same registry covers
-    # every project the dashboard already knows about.  Empty registry
-    # (no extra roots) leaves the TaskInterceptor in back-compat mode
-    # where the dark-factory-only guard runs.
+    # every project the dashboard already knows about.  No extra roots
+    # configured falls back to the built-in single-project dark_factory
+    # registry (ProjectPrefixRegistry.default(), task 2208) — the guard
+    # always runs, just against a smaller registry.
     _primary_root = (
         config.taskmaster.project_root if config.taskmaster else ''
     ) or ''
@@ -548,12 +549,21 @@ async def run_server():
             len(_known_projects_map),
         )
     else:
-        prefix_registry = None
-        scope_violation_escalator = None
+        prefix_registry = ProjectPrefixRegistry.default()
+        # Amendment (task 2208 review): construct a real escalator here too,
+        # not None. Since D2 made PROSE hits universally advisory (never a
+        # hard reject), single-project mode needs this so a prose misroute
+        # still surfaces on the operator queue instead of passing with only
+        # a `possible_scope_mismatch` metadata marker. Zero-arg construction
+        # — identical to the multi-project branch above — and a no-op when
+        # the optional `escalation` package isn't installed (see
+        # ScopeViolationEscalator's module docstring).
+        scope_violation_escalator = ScopeViolationEscalator()
         _multi_project_mode = False
         logger.info(
-            '  Path-scope guard: dark-factory-only back-compat mode '
-            '(set DASHBOARD_KNOWN_PROJECT_ROOTS to enable multi-project)',
+            '  Path-scope guard: single-project mode (dark_factory default registry; '
+            'scope-violation escalations still queued; '
+            'set DASHBOARD_KNOWN_PROJECT_ROOTS to enable multi-project)',
         )
 
     # Curator UsageGate — independent instance reading the same shared
