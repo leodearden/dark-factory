@@ -30,13 +30,11 @@ from __future__ import annotations
 from unittest.mock import AsyncMock, Mock
 
 import pytest
+from _recording_event_store import _RecordingEventStore
+from shared.psi import PsiSample
 
 from orchestrator.config import OrchestratorConfig, PsiAdmissionConfig
 from orchestrator.scheduler import Scheduler
-from shared.psi import PsiSample
-
-from _recording_event_store import _RecordingEventStore
-
 
 # ---------------------------------------------------------------------------
 # Minimal task-dict + PSI-sample helpers
@@ -107,7 +105,7 @@ class TestDispatchAdmissionThrottleDirection:
 
     async def test_heavy_deferred_deterministic_dispatches_same_tick(self) -> None:
         event_store = _RecordingEventStore()
-        scheduler = Scheduler(OrchestratorConfig(max_per_module=1), event_store=event_store)
+        scheduler = Scheduler(OrchestratorConfig(max_per_module=1), event_store=event_store)  # type: ignore[arg-type]
         # cpu_some10=90 is OVER the default cpu_some_avg10=85 threshold.
         scheduler._read_psi_sample = lambda: _psi(cpu_some10=90.0, read_ok=True)
         # >= default min_inflight_floor=1, so the floor does not suppress the hold.
@@ -150,7 +148,7 @@ class TestDispatchAdmissionWorkConserving:
 
     async def test_idle_psi_dispatches_all_heavy_candidates(self) -> None:
         event_store = _RecordingEventStore()
-        scheduler = Scheduler(OrchestratorConfig(max_per_module=1), event_store=event_store)
+        scheduler = Scheduler(OrchestratorConfig(max_per_module=1), event_store=event_store)  # type: ignore[arg-type]
         scheduler._read_psi_sample = lambda: _psi(read_ok=True)  # all metrics 0.0 — idle
         scheduler._dispatched = {'inflight1'}  # already >= default floor=1
 
@@ -180,7 +178,7 @@ class TestDispatchAdmissionFloorDeadlockFreedom:
 
     async def test_zero_in_flight_still_dispatches_under_saturation(self) -> None:
         event_store = _RecordingEventStore()
-        scheduler = Scheduler(OrchestratorConfig(max_per_module=1), event_store=event_store)
+        scheduler = Scheduler(OrchestratorConfig(max_per_module=1), event_store=event_store)  # type: ignore[arg-type]
         scheduler._read_psi_sample = lambda: _psi(cpu_some10=90.0, read_ok=True)
         # scheduler._dispatched left empty — in_flight=0 < default floor=1.
 
@@ -200,7 +198,7 @@ class TestDispatchAdmissionFloorDeadlockFreedom:
             max_per_module=1,
             psi_admission=PsiAdmissionConfig(min_inflight_floor=2),
         )
-        scheduler = Scheduler(config, event_store=event_store)
+        scheduler = Scheduler(config, event_store=event_store)  # type: ignore[arg-type]
         scheduler._read_psi_sample = lambda: _psi(cpu_some10=90.0, read_ok=True)
         scheduler._dispatched = {'inflight1'}  # 1 < configured floor=2
 
@@ -223,7 +221,7 @@ class TestDispatchAdmissionMetricRanking:
 
     async def test_cpu_and_io_both_saturated_reports_cpu(self) -> None:
         event_store = _RecordingEventStore()
-        scheduler = Scheduler(OrchestratorConfig(max_per_module=1), event_store=event_store)
+        scheduler = Scheduler(OrchestratorConfig(max_per_module=1), event_store=event_store)  # type: ignore[arg-type]
         scheduler._read_psi_sample = lambda: _psi(cpu_some10=90.0, io_some10=50.0, read_ok=True)
         scheduler._dispatched = {'inflight1'}
 
@@ -238,7 +236,7 @@ class TestDispatchAdmissionMetricRanking:
 
     async def test_io_only_saturated_reports_io(self) -> None:
         event_store = _RecordingEventStore()
-        scheduler = Scheduler(OrchestratorConfig(max_per_module=1), event_store=event_store)
+        scheduler = Scheduler(OrchestratorConfig(max_per_module=1), event_store=event_store)  # type: ignore[arg-type]
         scheduler._read_psi_sample = lambda: _psi(io_some10=50.0, read_ok=True)
         scheduler._dispatched = {'inflight1'}
 
@@ -282,7 +280,7 @@ class TestDispatchAdmissionDisabledGate:
             max_per_module=1,
             psi_admission=PsiAdmissionConfig(enabled=False),
         )
-        scheduler = Scheduler(config, event_store=event_store)
+        scheduler = Scheduler(config, event_store=event_store)  # type: ignore[arg-type]
         reader = Mock(return_value=_psi(cpu_some10=99.0, read_ok=True))
         scheduler._read_psi_sample = reader
         scheduler._dispatched = {'inflight1'}
@@ -307,7 +305,7 @@ class TestDispatchAdmissionFailOpen:
     async def test_unreadable_psi_dispatches_and_logs_warning(self, caplog) -> None:
         caplog.set_level('WARNING')
         event_store = _RecordingEventStore()
-        scheduler = Scheduler(OrchestratorConfig(max_per_module=1), event_store=event_store)
+        scheduler = Scheduler(OrchestratorConfig(max_per_module=1), event_store=event_store)  # type: ignore[arg-type]
         scheduler._read_psi_sample = lambda: _psi(cpu_some10=99.0, read_ok=False)
         scheduler._dispatched = {'inflight1'}
 
@@ -333,7 +331,7 @@ class TestDispatchAdmissionOnceDedupAndRateLimit:
 
     async def test_single_tick_multiple_heavy_skips_emit_one_event(self) -> None:
         event_store = _RecordingEventStore()
-        scheduler = Scheduler(OrchestratorConfig(max_per_module=1), event_store=event_store)
+        scheduler = Scheduler(OrchestratorConfig(max_per_module=1), event_store=event_store)  # type: ignore[arg-type]
         scheduler._read_psi_sample = lambda: _psi(cpu_some10=90.0, read_ok=True)
         scheduler._dispatched = {'inflight1'}
 
@@ -356,7 +354,7 @@ class TestDispatchAdmissionOnceDedupAndRateLimit:
         clock = _FakeClock()
         scheduler = Scheduler(
             OrchestratorConfig(max_per_module=1),
-            event_store=event_store,
+            event_store=event_store,  # type: ignore[arg-type]
             time_source=clock,
         )
         scheduler._read_psi_sample = lambda: _psi(cpu_some10=90.0, read_ok=True)
@@ -402,7 +400,7 @@ class TestDispatchAdmissionPinnedLoopParity:
         store = OverrideStore(tmp_path / 'o.db')
         store.set_override('/proj', 'Z', pinned=True)
 
-        scheduler = Scheduler(config, event_store=event_store, override_store=store)
+        scheduler = Scheduler(config, event_store=event_store, override_store=store)  # type: ignore[arg-type]
         scheduler._project_root = '/proj'
         scheduler._read_psi_sample = lambda: _psi(cpu_some10=90.0, read_ok=True)
         scheduler._dispatched = {'inflight1'}
@@ -430,7 +428,7 @@ class TestDispatchAdmissionPinnedLoopParity:
         store = OverrideStore(tmp_path / 'o.db')
         store.set_override('/proj', 'W', pinned=True)
 
-        scheduler = Scheduler(config, event_store=event_store, override_store=store)
+        scheduler = Scheduler(config, event_store=event_store, override_store=store)  # type: ignore[arg-type]
         scheduler._project_root = '/proj'
         scheduler._read_psi_sample = lambda: _psi(cpu_some10=90.0, read_ok=True)
         scheduler._dispatched = {'inflight1'}
