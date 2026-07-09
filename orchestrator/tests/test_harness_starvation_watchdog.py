@@ -223,12 +223,12 @@ class TestHarnessStarvationWatchdogWiring:
         """
         harness, queue = _make_harness_with_queue(tmp_path)
 
-        assert harness.scheduler._on_starvation_warn is not None, (
+        assert harness.scheduler._callbacks.on_starvation_warn is not None, (
             'Harness must wire scheduler._on_starvation_warn after construction'
         )
 
         # Invoke the callback directly — simulating what the scheduler does.
-        await harness.scheduler._on_starvation_warn(
+        await harness.scheduler._callbacks.on_starvation_warn(
             'T_wire',
             summary='STARVATION_WATCHDOG: T_wire skipped 55×',
             detail='idle 1900s',
@@ -251,19 +251,19 @@ class TestHarnessStarvationWatchdogWiring:
         """
         harness, queue = _make_harness_with_queue(tmp_path)
 
-        assert harness.scheduler._on_starvation_resolve is not None, (
+        assert harness.scheduler._callbacks.on_starvation_resolve is not None, (
             'Harness must wire scheduler._on_starvation_resolve after construction'
         )
-        assert harness.scheduler._on_starvation_warn is not None, (
+        assert harness.scheduler._callbacks.on_starvation_warn is not None, (
             'Harness must wire scheduler._on_starvation_warn after construction'
         )
 
-        await harness.scheduler._on_starvation_warn(
+        await harness.scheduler._callbacks.on_starvation_warn(
             'T_wire',
             summary='STARVATION_WATCHDOG: T_wire',
             detail='detail',
         )
-        await harness.scheduler._on_starvation_resolve('T_wire')
+        await harness.scheduler._callbacks.on_starvation_resolve('T_wire')
 
         pending = queue.get_by_task('T_wire', status='pending')
         assert len(pending) == 0, (

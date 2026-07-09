@@ -49,6 +49,7 @@ from orchestrator.review_checkpoint import ReviewCheckpoint
 from orchestrator.run_store import RunStore
 from orchestrator.scheduler import (
     Scheduler,
+    SchedulerCallbacks,
     SetTaskStatusRejected,
 )
 from orchestrator.service_restart import (
