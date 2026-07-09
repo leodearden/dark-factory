@@ -1723,6 +1723,74 @@ def _root_plus_single_subproject_prefix(files: list[str], worktree: Path | None)
     return None
 
 
+def _select_subproject_pytest_targets(files: list[str], prefix: str) -> list[str]:
+    """Return pytest targets, relative to *prefix*, for a subproject-scoped fallback TEST command.
+
+    Shared by :func:`_build_fallback_config`'s pure-subproject and mixed
+    root+subproject branches (task 2368 amendment — previously each branch
+    duplicated this selection logic inline): *files* is the list of touched
+    ``.py`` files that all live under top-level subproject directory
+    *prefix* (the pure-sub branch passes all of ``py_files``, guaranteed
+    single-prefix by :func:`_single_subproject_prefix`'s contract; the mixed
+    branch passes the subset already filtered to ``mixed_sub``).
+
+    Selects conftest parent-dirs plus collectable tests outside them when a
+    conftest is touched, else the collectable tests themselves, else no
+    targets at all — logging a task-1852 warning when an orphaned test-data
+    module has no anchor to derive a directory target from. Each selected
+    target is then mapped to a path relative to *prefix*: a target that sits
+    directly at the subproject root (e.g. ``'cockpit/conftest.py'``) maps to
+    ``'.'`` rather than being left as ``prefix`` itself, so the resulting
+    command is ``cd cockpit && uv run pytest .``, not the invalid ``pytest
+    cockpit`` (which pytest would resolve against cwd ``cockpit`` as the
+    nonexistent ``cockpit/cockpit``).
+
+    Returns an empty list when there is nothing to target (e.g. *files* is
+    source-only) — callers treat that as "no subproject test segment".
+    """
+    has_conftest = any(_is_conftest(f) for f in files)
+    collectable_tests = [f for f in files if _is_collectable_test_file(f)]
+    has_test_data = any(
+        _is_test_file(f) and not _is_collectable_test_file(f) for f in files
+    )
+    if has_conftest:
+        conftest_dirs = sorted({
+            f.rsplit('/', 1)[0] if '/' in f else '.'
+            for f in files
+            if _is_conftest(f)
+        })
+        if '.' not in conftest_dirs:
+            outside = [
+                t for t in collectable_tests
+                if not any(t.startswith(d + '/') for d in conftest_dirs)
+            ]
+        else:
+            outside = []
+        targets = conftest_dirs + outside
+    elif collectable_tests:
+        targets = collectable_tests
+    else:
+        targets = []
+        if has_test_data:
+            # No collectable tests and no conftest to anchor a directory
+            # target, so this data-module change ships unvalidated.  Warn
+            # rather than silently skipping (amendment to task 2344).
+            _data_files = [
+                f for f in files
+                if _is_test_file(f) and not _is_collectable_test_file(f)
+            ]
+            logger.warning(
+                '_build_fallback_config: test-tree data module(s) %s skipped '
+                '— no tests will run for this change; configure a non-default '
+                'test_command to validate data-module changes (task 1852)',
+                _data_files,
+            )
+    return [
+        '.' if t == prefix else (t[len(prefix) + 1:] if t.startswith(prefix + '/') else t)
+        for t in targets
+    ]
+
+
 def _build_fallback_config(
     task_files: list[str],
     config: OrchestratorConfig | None = None,
@@ -1810,55 +1878,14 @@ def _build_fallback_config(
     # scoped to the touched files, so only test_command needs this treatment.
     sub = _single_subproject_prefix(py_files, worktree)
     if sub is not None:
-        # Same conftest/collectable target-selection logic as the bare-pytest
-        # branch below (conftest parent-dirs + outside collectable tests,
-        # else collectable tests, else none) — duplicated rather than shared
-        # so the bare-pytest branch is left untouched for the
-        # worktree=None / non-subproject cases.
-        if has_conftest:
-            conftest_dirs = sorted({
-                f.rsplit('/', 1)[0] if '/' in f else '.'
-                for f in py_files
-                if _is_conftest(f)
-            })
-            if '.' not in conftest_dirs:
-                outside = [
-                    t for t in collectable_tests
-                    if not any(t.startswith(d + '/') for d in conftest_dirs)
-                ]
-            else:
-                outside = []
-            sub_targets = conftest_dirs + outside
-        elif collectable_tests:
-            sub_targets = collectable_tests
-        else:
-            sub_targets = []
-            if has_test_data:
-                # Same coverage gap the bare-pytest branch below already
-                # surfaces (task 1852): no collectable tests and no conftest
-                # to anchor a directory target, so this data-module change
-                # ships unvalidated.  Warn rather than silently skipping
-                # (amendment to task 2344).
-                _data_files = [
-                    f for f in py_files
-                    if _is_test_file(f) and not _is_collectable_test_file(f)
-                ]
-                logger.warning(
-                    '_build_fallback_config: test-tree data module(s) %s skipped '
-                    '— no tests will run for this change; configure a non-default '
-                    'test_command to validate data-module changes (task 1852)',
-                    _data_files,
-                )
-        # A conftest/collectable target that sits directly at the subproject
-        # root (e.g. 'cockpit/conftest.py') equals `sub` itself, not
-        # `sub + '/...'` — map it to '.' so the command becomes `cd cockpit &&
-        # uv run pytest .` rather than the invalid `pytest cockpit` (which
-        # pytest would resolve against cwd 'cockpit' as the nonexistent
-        # 'cockpit/cockpit').
-        rel_targets = [
-            '.' if t == sub else (t[len(sub) + 1:] if t.startswith(sub + '/') else t)
-            for t in sub_targets
-        ]
+        # Target selection (conftest parent-dirs + outside collectable tests,
+        # else collectable tests, else none) is shared with the mixed-sub
+        # branch below via _select_subproject_pytest_targets (task 2368
+        # amendment: previously duplicated inline in both branches, plus a
+        # third near-copy in the bare-pytest branch further below, which is
+        # left untouched since it also covers the worktree=None case that
+        # has no `prefix` to make relative).
+        rel_targets = _select_subproject_pytest_targets(py_files, sub)
         test_cmd = (
             'cd ' + sub + ' && uv run pytest ' + ' '.join(rel_targets)
             if rel_targets else None
@@ -1895,64 +1922,48 @@ def _build_fallback_config(
     # reprojected commands already computed above.
     mixed_sub = _root_plus_single_subproject_prefix(py_files, worktree)
     if mixed_sub is not None:
-        # Same conftest/collectable target-selection logic as the pure-sub
-        # branch above, restricted to sub_files (files under `mixed_sub`) so
-        # a root-level conftest/test file doesn't leak into the
+        # Target selection restricted to sub_files (files under `mixed_sub`)
+        # so a root-level conftest/test file doesn't leak into the
         # subproject-scoped target selection — it's covered by
-        # _ROOT_OWNING_TEST_COMMAND instead.
+        # _ROOT_OWNING_TEST_COMMAND instead. Shares its selection logic with
+        # the pure-sub branch above via _select_subproject_pytest_targets
+        # (task 2368 amendment — this was a third near-verbatim inline copy).
         sub_files = [f for f in py_files if f.startswith(mixed_sub + '/')]
-        sub_has_conftest = any(_is_conftest(f) for f in sub_files)
-        sub_collectable_tests = [f for f in sub_files if _is_collectable_test_file(f)]
-        sub_has_test_data = any(
-            _is_test_file(f) and not _is_collectable_test_file(f) for f in sub_files
-        )
-        if sub_has_conftest:
-            conftest_dirs = sorted({
-                f.rsplit('/', 1)[0] if '/' in f else '.'
-                for f in sub_files
-                if _is_conftest(f)
-            })
-            if '.' not in conftest_dirs:
-                outside = [
-                    t for t in sub_collectable_tests
-                    if not any(t.startswith(d + '/') for d in conftest_dirs)
-                ]
-            else:
-                outside = []
-            mixed_sub_targets = conftest_dirs + outside
-        elif sub_collectable_tests:
-            mixed_sub_targets = sub_collectable_tests
-        else:
-            mixed_sub_targets = []
-            if sub_has_test_data:
-                # Same coverage gap the bare-pytest branch below already
-                # surfaces (task 1852): no collectable tests and no conftest
-                # under the subproject to anchor a directory target.  Warn
-                # rather than silently skipping (amendment to task 2344).
-                _data_files = [
-                    f for f in sub_files
-                    if _is_test_file(f) and not _is_collectable_test_file(f)
-                ]
-                logger.warning(
-                    '_build_fallback_config: test-tree data module(s) %s skipped '
-                    '— no tests will run for this change; configure a non-default '
-                    'test_command to validate data-module changes (task 1852)',
-                    _data_files,
-                )
-        # Same '.'-mapping as the pure-sub branch above: a target directly at
-        # the subproject root (e.g. 'cockpit/conftest.py') equals `mixed_sub`
-        # itself, not `mixed_sub + '/...'`.
-        mixed_rel_targets = [
-            '.' if t == mixed_sub else (
-                t[len(mixed_sub) + 1:] if t.startswith(mixed_sub + '/') else t
-            )
-            for t in mixed_sub_targets
-        ]
+        mixed_rel_targets = _select_subproject_pytest_targets(sub_files, mixed_sub)
+        # Intentional coverage trade-off (task 2368; mirrors the pure-sub
+        # branch's task-2344 precedent of test_command=None for a
+        # source-only subproject diff): when the touched subproject's
+        # portion of a mixed diff is source-only, mixed_rel_targets is empty
+        # and TEST scopes to _ROOT_OWNING_TEST_COMMAND alone — the touched
+        # subproject's own suite does NOT run to validate the source change.
+        # This narrows gating versus the old fleet-chain-verbatim fallback
+        # (which ran the subproject's whole suite, at the cost of dragging
+        # in ~7400 unrelated tests). Scoping precision was chosen over
+        # broader gating for the same reason the pure-sub branch made this
+        # trade-off; revisit if source-only subproject regressions start
+        # slipping through to merge.
         test_cmd = (
             'cd ' + mixed_sub + ' && uv run pytest ' + ' '.join(mixed_rel_targets)
             + ' && cd .. && ' + _ROOT_OWNING_TEST_COMMAND
             if mixed_rel_targets else _ROOT_OWNING_TEST_COMMAND
         )
+        # Robustness (task 2368 amendment): _ROOT_OWNING_TEST_COMMAND only
+        # runs tests/scripts/, but the root-owning files of a mixed diff can
+        # include a collectable test file elsewhere (e.g. a touched
+        # tests/e2e/test_x.py) that will then silently never run — unlike
+        # the sub_has_test_data path above, this gap emitted no warning.
+        # Surface it so a real, uncovered root-level test file isn't silent.
+        root_files = [f for f in py_files if not f.startswith(mixed_sub + '/')]
+        uncovered_root_tests = [
+            f for f in root_files
+            if _is_collectable_test_file(f) and not f.startswith('tests/scripts/')
+        ]
+        if uncovered_root_tests:
+            logger.warning(
+                '_build_fallback_config: root-owning test file(s) %s will not run '
+                '— _ROOT_OWNING_TEST_COMMAND only covers tests/scripts/ (task 2368)',
+                uncovered_root_tests,
+            )
         return ModuleConfig(
             prefix=mixed_sub,
             lint_command=lint_cmd,

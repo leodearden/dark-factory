@@ -4897,6 +4897,68 @@ class TestBuildFallbackConfigSubprojectScoped:
             '&& cd .. && uv run --project shared pytest tests/scripts/'
         )
 
+    def test_mixed_root_test_file_outside_tests_scripts_emits_uncovered_warning(
+        self, tmp_path: Path, caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """A root-owning collectable test file outside tests/scripts/ warns that it won't run.
+
+        Robustness amendment (task 2368 review): ``_ROOT_OWNING_TEST_COMMAND``
+        only runs ``tests/scripts/``, but a mixed diff's root-owning files can
+        include a collectable test file elsewhere (e.g. ``tests/e2e/test_x.py``
+        — ``tests/`` has no ``pyproject.toml`` of its own, so it counts as
+        root-owning, not a subproject). That file is silently never executed
+        by the scoped fallback; this must now surface as a WARNING instead of
+        being silent, mirroring the existing task-1852 data-module warning.
+        The scoped test_command itself is unaffected — only tests/scripts/
+        and the touched subproject's own tests are ever wired into it.
+        """
+        worktree = self._make_cockpit_worktree(tmp_path)
+        cfg = self._make_config(tmp_path)
+
+        with caplog.at_level(logging.WARNING, logger='orchestrator.verify'):
+            result = _build_fallback_config(
+                ['cockpit/tests/test_c3.py', 'tests/e2e/test_x.py'], cfg, worktree=worktree,
+            )
+
+        assert result is not None
+        assert result.test_command == (
+            'cd cockpit && uv run pytest tests/test_c3.py '
+            '&& cd .. && uv run --project shared pytest tests/scripts/'
+        )
+        assert any(
+            'tests/e2e/test_x.py' in r.getMessage() and r.levelno >= logging.WARNING
+            for r in caplog.records
+        ), (
+            'Expected a WARNING about the uncovered root-owning test file; '
+            f'got: {[r.getMessage() for r in caplog.records]}'
+        )
+
+    def test_mixed_root_conftest_only_emits_no_uncovered_warning(
+        self, tmp_path: Path, caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """A root file that is NOT a collectable test (e.g. conftest.py) does not warn.
+
+        Guards against a false-positive warning: the uncovered-root-test
+        check must only fire for files ``_is_collectable_test_file`` accepts,
+        not every root-owning file.
+        """
+        worktree = self._make_cockpit_worktree(tmp_path)
+        cfg = self._make_config(tmp_path)
+
+        with caplog.at_level(logging.WARNING, logger='orchestrator.verify'):
+            result = _build_fallback_config(
+                ['cockpit/tests/test_c3.py', 'conftest.py'], cfg, worktree=worktree,
+            )
+
+        assert result is not None
+        assert not any(
+            'will not run' in r.getMessage() and r.levelno >= logging.WARNING
+            for r in caplog.records
+        ), (
+            'Did not expect an uncovered-root-test WARNING for a non-test root file; '
+            f'got: {[r.getMessage() for r in caplog.records]}'
+        )
+
 
 class TestRunScopedVerificationForwardsWorktreeToFallback:
     """`run_scoped_verification` forwards *worktree* into `_build_fallback_config` (task 2344).
