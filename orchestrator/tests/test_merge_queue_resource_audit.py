@@ -179,7 +179,7 @@ class TestSpeculationAccountingViolations:
         worker = SpeculativeMergeWorker(git_ops, asyncio.Queue(), speculation_depth=2)
 
         # Force a leak: a merge-ahead-cap permit vanished without a
-        # corresponding counts_against_cap=True item in the verifier queue —
+        # corresponding cap_permit-bearing item in the verifier queue —
         # breaks identity (b).
         worker._merge_ahead_cap._value -= 1
 

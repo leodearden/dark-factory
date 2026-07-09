@@ -51,6 +51,7 @@ from orchestrator.merge_queue import (
     TRAIN_REBASE_CONFLICT_REASON_PREFIX,
     TRANSIENT_INFRA_REASON_PREFIX,
     WORKTREE_MISSING_REASON_PREFIX,
+    CapPermit,
     DecidedItem,
     DropGuardResult,
     GroupMergeRequest,
@@ -10011,7 +10012,7 @@ class TestMergedBranchTipCarryThroughRebuild:
     # merged_branch_tip specifically — the one field task-1928's original
     # hand-fix had to add back. These lock the general dataclasses.replace
     # guarantee that motivated the I3 switch: EVERY other SpeculativeItem
-    # field survives the rebuild unchanged, including counts_against_cap,
+    # field survives the rebuild unchanged, including cap_permit,
     # which the pre-1990 hand-rebuild silently reset to its default (False).
     # ------------------------------------------------------------------
 
@@ -10049,7 +10050,7 @@ class TestMergedBranchTipCarryThroughRebuild:
         self, git_ops: GitOps, config: OrchestratorConfig,
     ) -> None:
         """(A2) The rebased_pending_reverify replace-only rebuild (~:8258) must
-        change ONLY base_sha — every other field, including counts_against_cap,
+        change ONLY base_sha — every other field, including cap_permit,
         survives unchanged. Complements test (A), which only checks
         merged_branch_tip.
         """
@@ -10073,7 +10074,7 @@ class TestMergedBranchTipCarryThroughRebuild:
             base_sha=base_main,
             speculative=False,
             merged_branch_tip=ORIGINAL_TIP,
-            counts_against_cap=True,
+            cap_permit=CapPermit(),
         )
 
         # Move main: edit line18 (non-adjacent) → rebase succeeds → rebased_onto
@@ -10131,7 +10132,7 @@ class TestMergedBranchTipCarryThroughRebuild:
         self, git_ops: GitOps, config: OrchestratorConfig,
     ) -> None:
         """(C2) The cas_failed replace-only rebuild (~:8322) must change ONLY
-        base_sha — every other field, including counts_against_cap, survives
+        base_sha — every other field, including cap_permit, survives
         unchanged. Complements test (C), which only checks merged_branch_tip.
         """
         branch = 'field-carry-cas'
@@ -10163,7 +10164,7 @@ class TestMergedBranchTipCarryThroughRebuild:
             base_sha=base_sha,
             speculative=False,
             merged_branch_tip=ORIGINAL_TIP,
-            counts_against_cap=True,
+            cap_permit=CapPermit(),
         )
 
         # Advance main for real (unrelated commit) so the CAS-retry's

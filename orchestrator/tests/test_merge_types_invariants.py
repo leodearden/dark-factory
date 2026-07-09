@@ -109,7 +109,7 @@ class TestDecidedItemUnrepresentability:
         assert not hasattr(item, 'merge_result')
         assert not hasattr(item, 'merge_wt')
         assert not hasattr(item, 'merged_branch_tip')
-        assert not hasattr(item, 'counts_against_cap')
+        assert not hasattr(item, 'cap_permit')
 
     def test_decided_shape_constructs(self) -> None:
         item = DecidedItem(**_decided_kwargs())
