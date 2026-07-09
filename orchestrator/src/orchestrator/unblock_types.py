@@ -41,6 +41,11 @@ class BlockClass(StrEnum):
     """
 
     AGENT_FAILURE = 'agent_failure'
+    # Reserved: no current producer stamps this and classify_block_reason(...)
+    # never returns it (it only yields AGENT_FAILURE/MERGE_VERIFY_RED/
+    # POST_MERGE_RED_MAIN). Intended to be set explicitly by a future
+    # review-issue producer (task η), mirroring how η passes MERGE_VERIFY_RED
+    # explicitly rather than deriving it. Inert today — not a live code path.
     REVIEW_ISSUES = 'review_issues'
     MERGE_VERIFY_RED = 'merge_verify_red'
     POST_MERGE_RED_MAIN = 'post_merge_red_main'

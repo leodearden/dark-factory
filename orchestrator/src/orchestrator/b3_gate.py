@@ -300,6 +300,11 @@ def check_proposal(
           block_reason starts with POST_MERGE_RED_MAIN_REASON_PREFIX -> abort.
           Hard-aborted before risk_label/git checks either way — defense-in-
           depth against a mislabeled-low investigator result; see task 1680.
+          An unrecognized 'block_class' value (not a valid BlockClass member)
+          logs a warning and is treated as non-post-merge by design — it
+          falls through to the checks below rather than re-enabling the
+          legacy prose/status sniffs (those stay gated on `block_class is
+          None`, not on validity).
       2. risk_label != 'low' -> abort
       3. LEGACY-ONLY (B3): 'block_class' absent AND 'status' key present
           (failure entry) -> abort. When 'block_class' is present, every
@@ -356,7 +361,16 @@ def check_proposal(
     # verdict to abort-to-human with no code change.
     block_class = entry.get('block_class')
     if block_class is not None:
-        is_post_merge_red_main = block_class == BlockClass.POST_MERGE_RED_MAIN
+        try:
+            is_post_merge_red_main = BlockClass(block_class) == BlockClass.POST_MERGE_RED_MAIN
+        except ValueError:
+            # Corrupted/forward-incompatible typed value: fail open to the
+            # risk_label/git gates below (same as any valid-but-non-post-
+            # merge class) rather than silently treating it as either
+            # abort or legacy — but log it, since a producer stamping an
+            # invalid block_class is a bug worth surfacing.
+            logger.warning('check_proposal: entry has unrecognized block_class %r', block_class)
+            is_post_merge_red_main = False
     else:
         block_reason = entry.get('block_reason') or ''
         is_post_merge_red_main = block_reason.startswith(POST_MERGE_RED_MAIN_REASON_PREFIX)
