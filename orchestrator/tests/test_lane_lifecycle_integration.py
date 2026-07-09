@@ -31,7 +31,6 @@ from __future__ import annotations
 import asyncio
 import json
 import shutil
-import sys
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -56,13 +55,24 @@ from orchestrator.warm_lane_pool import LaneState, WarmLanePool
 # but deliberately not dashboard's, and the root conftest.py that *does* wire
 # up dashboard/src is never loaded here — verify.py (and pytest's own
 # confcutdir) roots the run at `orchestrator/`, above which pytest does not
-# ascend for conftest discovery. Mirror conftest.py's own sys.path.insert
-# idiom here, scoped to just this module, instead of editing
-# orchestrator/tests/conftest.py (which would trip verify.py's has_conftest
-# full-suite fallback per this task's design decisions).
+# ascend for conftest discovery. Rather than mutate sys.path at
+# module-import/collection time (which would leak dashboard/src onto the
+# import path for the rest of the pytest session — every other orchestrator
+# test module collected in the same run — risking module-name shadowing or
+# cross-test contamination), the `_dashboard_on_path` fixture below scopes
+# the insertion to just the two B6 tests that need it via
+# `monkeypatch.syspath_prepend`, which reverts automatically at fixture
+# teardown. This still avoids editing orchestrator/tests/conftest.py (which
+# would trip verify.py's has_conftest full-suite fallback per this task's
+# design decisions).
 _DASHBOARD_SRC = Path(__file__).parent.parent.parent / 'dashboard' / 'src'
-if str(_DASHBOARD_SRC) not in sys.path:
-    sys.path.insert(0, str(_DASHBOARD_SRC))
+
+
+@pytest.fixture
+def _dashboard_on_path(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Put dashboard/src on sys.path for the duration of one B6 test only."""
+    monkeypatch.syspath_prepend(str(_DASHBOARD_SRC))
+
 
 # ── Module-local fixtures + helpers ─────────────────────────────────────
 
@@ -209,6 +219,13 @@ class TestB1WriterReaderRoundTrip:
         await _add_warm_lane_scripts(repo)
         harness = _build_harness(_make_orch_config(repo))
         _wire_recovery_scheduler(harness)
+        # Strengthen the round-trip claim: exercise the identity guard's
+        # genuine BOTH-present, equal branch (harness.py:2151-2190) rather
+        # than the fail-open default `_wire_recovery_scheduler` sets up —
+        # return the SAME title the writer stores below via `ta.init`, so
+        # `identities_match` actually compares 'B1 task' == 'B1 task'
+        # instead of short-circuiting on a title-less dict.
+        harness.scheduler.get_task = AsyncMock(return_value={'title': 'B1 task'})
 
         # WRITER: real acquire_warm_lane — real `git worktree add`.
         head = await _get_head(repo)
@@ -255,9 +272,20 @@ class TestB1WriterReaderRoundTrip:
 
 @pytest.mark.asyncio
 class TestB2CrashQuarantine:
-    """B2: the durable record says ASSIGNED:42, but the lane's git admin
-    entry (.git/worktrees/<lane>) is gone (the 2097/2098 orphaned-
-    registration divergence) — recovery must QUARANTINE, never re-pin.
+    """B2: crash-recovery divergence between the durable record and git
+    reality must QUARANTINE, never re-pin. Two distinct divergence shapes
+    share this class:
+
+    - ``test_orphaned_registration_quarantines_never_repins`` — the lane's
+      git admin entry (.git/worktrees/<lane>) is gone (the 2097/2098
+      orphaned-registration divergence).
+    - ``test_identity_mismatch_quarantines_never_repins`` — the admin entry
+      and checked-out branch are BOTH intact (the checks gating the
+      identity guard, harness.py:2140, both pass), but the live task's
+      title diverges from the lane's stored .task-meta title (a
+      recycled-id collision, reify 3770) — the identity-mismatch branch at
+      harness.py:2151-2190, otherwise only exercised via B1's positive
+      match / the shared helper's fail-open default.
     """
 
     async def test_orphaned_registration_quarantines_never_repins(
@@ -314,6 +342,81 @@ class TestB2CrashQuarantine:
             and 'quarantin' in log_rec.getMessage().lower()
             for log_rec in caplog.records
         ), f'expected a quarantine warning naming task 42; got: {caplog.text!r}'
+
+        # Next dispatch is clean: a different task can still acquire a lane.
+        result = await pool.acquire_for('task/99')
+        assert result is not None
+
+    async def test_identity_mismatch_quarantines_never_repins(
+        self, ig_git_repo: Path, caplog,
+    ):
+        """Boundary case for the identity-mismatch branch (harness.py
+        :2151-2190): the admin entry AND checked-out branch both still
+        match (unlike the orphan case above), but the live task's title
+        diverges from the lane's stored `.task-meta` title — a
+        recycled-id collision (reify 3770). Recovery must quarantine via
+        the identity guard itself, not the git-reality checks that gate it.
+        """
+        import logging
+
+        repo = ig_git_repo
+        await _add_warm_lane_scripts(repo)
+        harness = _build_harness(_make_orch_config(repo))
+        _wire_recovery_scheduler(harness)
+        # Diverging live title — the guard must catch this even though the
+        # admin-entry + branch checks that gate it (harness.py:2140) both
+        # pass below.
+        harness.scheduler.get_task = AsyncMock(
+            return_value={'title': 'Unrelated live task'},
+        )
+
+        head = await _get_head(repo)
+        lane = await _acquire_lane(harness.git_ops, '42', head, expected_title='B2 identity')
+        meta = TaskArtifacts.meta_root_for(harness.git_ops.worktree_base, lane.name)
+        ta = TaskArtifacts(lane, meta)
+        ta.init('42', 'B2 identity', 'd')
+        ta.write_plan(_make_plan(1, 2, '42'))
+
+        # Admin entry + branch stay intact — the divergence here is
+        # identity, not registration (contrast with the orphan case above).
+        assert (repo / '.git' / 'worktrees' / lane.name).exists()
+
+        old_pool = harness.git_ops.warm_lane_pool
+        assert old_pool is not None
+        harness.git_ops.warm_lane_pool = WarmLanePool(
+            worktree_base=harness.git_ops.worktree_base,
+            size=old_pool.size,
+        )
+
+        with caplog.at_level(logging.WARNING, logger='orchestrator.harness'):
+            await harness._recover_crashed_tasks()
+
+        rec = harness.git_ops._lane_lifecycle.read(lane)
+        assert rec is not None
+        assert rec.state == DurableLaneState.QUARANTINED
+
+        pool = harness.git_ops.warm_lane_pool
+        assert pool.assignment_for('42') is None
+        assert pool.state(lane) == LaneState.FREE
+        assert '42' not in harness._recovered_plans
+
+        # Match the SPECIFIC identity-mismatch reason, not just the event
+        # type, so this stays distinguishable from the orphan-registration
+        # quarantine above (`recovery-record-divergence`).
+        emitted_reasons = [
+            (c.kwargs.get('data') or {}).get('reason')
+            for c in harness.event_store.emit.call_args_list  # type: ignore[union-attr]
+            if (c.args[0] if c.args else c.kwargs.get('event_type'))
+            == EventType.worktree_quarantined
+        ]
+        assert 'recovery-identity-mismatch' in emitted_reasons
+
+        assert any(
+            log_rec.levelno == logging.WARNING
+            and '42' in log_rec.getMessage()
+            and 'identity' in log_rec.getMessage().lower()
+            for log_rec in caplog.records
+        ), f'expected an identity-mismatch warning naming task 42; got: {caplog.text!r}'
 
         # Next dispatch is clean: a different task can still acquire a lane.
         result = await pool.acquire_for('task/99')
@@ -468,7 +571,9 @@ class TestB6DashboardReaderNewPath:
     real writer (GitOps/TaskArtifacts) uses.
     """
 
-    async def test_reads_relocated_task_meta(self, ig_git_repo: Path):
+    async def test_reads_relocated_task_meta(
+        self, ig_git_repo: Path, _dashboard_on_path: None,
+    ):
         from dashboard.data.orchestrator import (  # pyright: ignore[reportMissingImports]
             read_task_artifacts,
         )
@@ -499,7 +604,7 @@ class TestB6DashboardReaderLegacyPath:
     `<worktree>/.task/` layout when no `.task-meta` sibling exists.
     """
 
-    def test_reads_legacy_task_dir(self, tmp_path: Path):
+    def test_reads_legacy_task_dir(self, tmp_path: Path, _dashboard_on_path: None):
         from dashboard.data.orchestrator import (  # pyright: ignore[reportMissingImports]
             read_task_artifacts,
         )
