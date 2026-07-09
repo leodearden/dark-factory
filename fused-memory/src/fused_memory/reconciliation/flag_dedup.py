@@ -316,7 +316,7 @@ import hashlib
 import json
 import logging
 import re
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from typing import Any, Literal, NotRequired, TypedDict
 
 from fused_memory.models.memory import AddMemoryResponse
@@ -860,7 +860,7 @@ async def dedup_flags(
     run_id: str,
     flags: list[dict[str, Any]],
 ) -> list[dict[str, Any]]:
-    """Annotate Stage 1 flagged items against prior ``stage1_flag_marker`` memories.
+    """Annotate Stage 1 flagged items against prior ``stage1_flag_marker`` ledger rows.
 
     For each flag in *flags*:
 
@@ -875,140 +875,51 @@ async def dedup_flags(
       keys, comma-joined integer lists, and canonical ``fp:+32-hex`` content-
       fingerprint keys (task-1670 Option A); it rejects only genuinely-invalid
       tids (empty string, malformed ``fp:`` variants, non-numeric strings, etc.).
-      When rejected the flag is returned unchanged and no Mem0 I/O is performed.
-    - For valid signatures (numeric, comma-joined, or canonical ``fp:``), Mem0
-      is searched for a prior marker memory with matching ``task_id`` and
-      ``flag_type``.  ``fp:``-keyed markers are a **Stage-1-internal dedup
-      artifact**: they are never consumed or swept by Stage 2's
-      ``_query_stage2_flags`` (which processes only ``flag_for_stage2=True``
-      records) and are therefore safe to persist without triggering a Stage 2
-      cleanup loop (task-1670 step-2 verification).
-      - On a HIT: annotate the flag with ``persisted_from_run`` and
-        ``last_seen_run_id``; write a new replacement marker; if the write
-        succeeds and Mem0 confirms it, delete the prior marker
-        (best-effort replacement pattern).
-      - On a MISS: write a new marker so future cycles detect the repeat.
-    - All search/write/delete exceptions are caught and logged at WARNING so
-      that a transient Mem0 outage does not abort the stage run.
+      When rejected the flag is returned unchanged and no ledger I/O is performed.
+    - A flag explicitly marked ``flag_for_stage2=False`` (per
+      :func:`_is_completion_flag`) is a ONE-TIME completion marker: see
+      "Completion-marker same-cycle self-delete" above — no
+      ``stage1_flag_marker`` row is written for it.
+    - Otherwise, ``memory_service.recon_ledger`` (when attached) is read via
+      ``get_by_identity(project_id, 'stage1_flag_marker', tid, ftype, run_id='')``
+      — the dedup identity excludes ``run_id`` so this is always at most one
+      row per ``(task_id, flag_type)``.  When a prior row exists, the flag is
+      annotated ``persisted_from_run`` from its payload (``'unknown'`` sentinel
+      on a falsy/absent stored ``run_id``).  ``last_seen_run_id`` is always set
+      to the current ``run_id``.  The row is then ``upsert``-ed with a fresh
+      payload/``created_at``/``expires_at`` (self-refreshing 14-day TTL) —
+      ``ON CONFLICT`` on the full identity guarantees exactly one row survives
+      regardless of how many times this signature has recurred, with no
+      separate delete step and no dependence on read-after-write consistency
+      across calls.
+    - A best-effort Mem0 mirror (single ``add_memory``, no read-back/confirm/
+      delete) is attempted after the ledger write — wrapped in try/except so a
+      mirror failure never raises or rolls back the ledger write.  When no
+      ledger is attached (``recon_ledger`` unset/``None``), this mirror write
+      is the ONLY effect (pass-through dedup — no ``persisted_from_run`` can
+      be computed without a ledger to read).
 
-    ``persisted_from_run`` is set to the ``run_id`` stored in the prior
-    marker's metadata.  If that metadata field is absent, ``None``, or an
-    empty string (i.e. any falsy value), the literal sentinel ``'unknown'``
-    is used instead.  Downstream consumers (Stage 2 prompt, observability
-    dashboards) can grep for ``'unknown'`` to detect malformed markers.
+    ``persisted_from_run`` is set to the ``run_id`` stored in the prior row's
+    payload.  If that field is absent, ``None``, or an empty string (i.e. any
+    falsy value), the literal sentinel ``'unknown'`` is used instead.
+    Downstream consumers (Stage 2 prompt, observability dashboards) can grep
+    for ``'unknown'`` to detect malformed markers.
 
     Deduped-against enrichment (task-2047 Gap 1): for ``fp:``-keyed markers
     ONLY (per :func:`is_content_fingerprint_task_id`), the resolvable memory
     UUID(s) the flag cites as duplicates are extracted via
-    :func:`_extract_deduped_against_uuids` and threaded into both the HIT and
-    MISS ``_write_and_confirm_marker`` calls as ``deduped_against``.  Numeric
-    and comma-joined markers always pass ``None`` — they are already
-    resolvable anchors and their payload is unchanged.
+    :func:`_extract_deduped_against_uuids` and threaded into the ledger
+    payload / Mem0 mirror metadata as ``deduped_against``.  Numeric and
+    comma-joined markers always omit it — they are already resolvable anchors
+    and their payload is unchanged.
 
     Returns the (possibly annotated) flag list.
     """
     # --- Authoritative suppression gate (task-1186) ---
     # Drop flags for tasks with active stage1_flag_suppression records BEFORE
     # the signature-dedup loop so suppressed flags never reach the per-flag
-    # prior-marker write path.
+    # marker path.
     flags = await filter_suppressed(memory_service, project_id, flags)
-
-    # --- Confirmation circuit-breaker (task-1412) ---
-    # Per-invocation counter: strictly consecutive miss count.  Reset to 0 on any
-    # successful confirmation (True return).  When the count reaches
-    # _CONFIRMATION_MISS_THRESHOLD, log ONE breaker WARNING and set
-    # confirmation_disabled = True so the remainder of the batch skips
-    # confirm_marker_persisted entirely and gates on bool(response.memory_ids).
-    # Being function-local, these reset automatically at each dedup_flags call.
-    # See: "Confirmation circuit-breaker (task-1412)" section in module docstring.
-    consecutive_confirmation_misses: int = 0
-    confirmation_disabled: bool = False
-
-    # In-batch signature memoization (task-1978): records, for each
-    # (task_id, flag_type) signature already processed in THIS call, the
-    # resolved persisted_from_run to use for any later occurrence of that same
-    # signature.  Function-local so each dedup_flags invocation starts with a
-    # fresh, empty memo (mirrors the circuit-breaker locals above).  This
-    # bounds each signature to at most ONE search+write+confirm+delete cycle
-    # per call, which is what prevents duplicate markers from accumulating
-    # when Mem0 read-after-write indexing lag causes a later occurrence's
-    # pre-write search to miss a marker written earlier in the SAME call.
-    seen_signatures: dict[tuple[str, str], str] = {}
-
-    async def _confirm_and_track(
-        response_memory_ids: list[str],
-        active_miss_warning_msg: str,
-        tripped_skip_warning_msg: str,
-        *,
-        tid: str,
-        ftype: str,
-    ) -> bool:
-        """Shared circuit-breaker helper for HIT and MISS branches.
-
-        When the breaker is ACTIVE (``confirmation_disabled`` is False):
-        - Calls ``confirm_marker_persisted``; on miss (``False`` return) emits
-          ``active_miss_warning_msg``, increments the consecutive miss counter,
-          and trips the breaker when the threshold is reached (one breaker WARNING
-          logged at trip-time only).
-        - On hit (``True`` return): resets the counter so sporadic misses don't
-          accumulate.
-        - Returns the bool from ``confirm_marker_persisted``.
-
-        When the breaker is TRIPPED (``confirmation_disabled`` is True):
-        - Skips ``confirm_marker_persisted``; gates on ``bool(response_memory_ids)``.
-        - Emits ``tripped_skip_warning_msg`` iff ``bool(response_memory_ids)`` is False.
-        - Returns ``bool(response_memory_ids)``.
-
-        The two templates MUST be distinct so brownout logs cleanly separate genuine
-        confirmation-miss flags (search attempted, returned no result) from gate-only
-        flags (search skipped because breaker open).  This is the disambiguation
-        contract operators rely on during a Mem0 brownout.
-
-        ``tid`` and ``ftype`` are explicit keyword-only parameters so this helper
-        is safe to schedule out-of-order (e.g. ``asyncio.gather``); the enclosing-
-        loop variables would otherwise be captured by free-variable lookup,
-        silently picking up the LAST iteration's values under concurrent scheduling.
-
-        Mutates nonlocal ``consecutive_confirmation_misses`` and
-        ``confirmation_disabled``; captures ``memory_service``, ``project_id``,
-        ``run_id``, and ``logger`` from the enclosing ``dedup_flags`` scope.
-        """
-        nonlocal consecutive_confirmation_misses, confirmation_disabled
-        if not confirmation_disabled:
-            is_found = await confirm_marker_persisted(
-                memory_service,
-                project_id=project_id,
-                task_id=tid,
-                flag_type=ftype,
-                run_id=run_id,
-                log=logger,
-            )
-            if not is_found:
-                # Both ``active_miss_warning_msg`` and ``tripped_skip_warning_msg``
-                # MUST be printf-style strings with exactly two %s placeholders in
-                # order: (task_id, flag_type).
-                logger.warning(active_miss_warning_msg, tid, ftype)
-                consecutive_confirmation_misses += 1
-                if consecutive_confirmation_misses >= _CONFIRMATION_MISS_THRESHOLD:
-                    logger.warning(
-                        'flag_dedup: confirmation circuit-breaker tripped after %d'
-                        ' consecutive misses; falling back to memory_ids gate for'
-                        ' remainder of batch',
-                        consecutive_confirmation_misses,
-                    )
-                    confirmation_disabled = True
-            else:
-                # Strictly consecutive: any successful confirmation resets the
-                # counter so sporadic misses don't accumulate toward threshold.
-                # Reset ONLY inside `if not confirmation_disabled` so a tripped
-                # breaker can't be un-tripped mid-batch.
-                consecutive_confirmation_misses = 0
-            return is_found
-        else:
-            write_succeeded = bool(response_memory_ids)
-            if not write_succeeded:
-                logger.warning(tripped_skip_warning_msg, tid, ftype)
-            return write_succeeded
 
     result: list[dict[str, Any]] = []
     for flag in flags:
@@ -1065,24 +976,6 @@ async def dedup_flags(
                 ' "deduped_against" field — verify producer output shape',
                 tid, ftype,
             )
-        # In-batch signature memoization (task-1978): the SAME (task_id, flag_type)
-        # signature can be emitted multiple times in ONE items_flagged list within a
-        # single dedup_flags call (e.g. a task genuinely re-evaluated multiple times
-        # in one Stage 1 run).  A later occurrence's pre-write search below is a
-        # SEPARATE Mem0 read that may not yet see a marker written by an EARLIER
-        # occurrence in this SAME call (Mem0 read-after-write indexing lag) — so
-        # without memoization, every occurrence independently MISSes/HITs and writes
-        # its own replacement, accumulating duplicate markers WITHIN a single run.
-        # On the 2nd+ occurrence of a signature in this call, skip the entire
-        # search/write/confirm/delete cycle and annotate deterministically from the
-        # first occurrence's resolved outcome instead.
-        if (tid, ftype) in seen_signatures:
-            flag = dict(flag)
-            flag['persisted_from_run'] = seen_signatures[(tid, ftype)]
-            flag['last_seen_run_id'] = run_id
-            result.append(flag)
-            continue
-
         # --- Completion-marker same-cycle self-delete (task-2312) ---
         # A flag the producer explicitly marks flag_for_stage2=False represents
         # ONE-TIME completed/bookkeeping work (e.g. a duplicate-marker cleanup or
@@ -1130,207 +1023,86 @@ async def dedup_flags(
             flag = dict(flag)
             flag['completion_marker_self_deleted'] = True
             flag['last_seen_run_id'] = run_id
-            # In-batch memoization (task-1978 parity; task-2312 review amendment):
-            # register this signature so a repeat of the SAME completion
-            # signature later in this batch hits the in-batch memo check above
-            # instead of re-running this sweep (mirrors the unconditional
-            # seen_signatures recording at the end of the HIT/MISS path below).
-            # Residual ordering-dependent asymmetry (accepted,
-            # producer-shouldn't-do-that edge case, same spirit as the
-            # HIT-first/MISS-first trade-off documented below): if the SAME
-            # signature appears as a recurring flag first and a completion flag
-            # second within one batch, the second is annotated from the memo
-            # (persisted_from_run) rather than completion_marker_self_deleted.
-            # Neither ordering regresses cross-cycle dedup.
-            seen_signatures[(tid, ftype)] = run_id
+            # Idempotency (task-2312 review amendment, revised under the ledger
+            # rewrite): a duplicate completion signature later in this same
+            # batch simply re-runs this sweep — acknowledge_flag_marker's
+            # ledger.mark_addressed is idempotent (re-addressing an
+            # already-addressed row, or no-op'ing on an already-swept/absent
+            # row), so no in-batch memo is needed to prevent it.
             result.append(flag)
             continue
 
-        # Delegate search+filter to the shared helper.  find_prior_memories logs a
-        # WARNING under logger on search failure and returns [] so the else
-        # branch below writes a fresh marker (best-effort on transient Mem0 outage).
-        priors = await find_prior_memories(
-            memory_service,
-            project_id=project_id,
-            task_id=tid,
-            kind={'source': 'stage1_flag_marker', 'flag_type': ftype},
-            query=_marker_query(tid, ftype),
-            categories=['observations_and_summaries'],
-            limit=50,
-            log=logger,
-        )
-        if priors:
-            # --- HIT: best-effort replacement ---
-            # (Reached only on the FIRST occurrence of (tid, ftype) in this
-            # call — see the in-batch memoization check above, task-1978.
-            # Later occurrences are annotated from seen_signatures instead of
-            # re-running this search+write+delete cycle.)
-            # (1) Sort priors by id lex so annotation source and deletion order
-            #     are deterministic across concurrent cycles.  MemoryResult.id
-            #     is always present (str); temporal fields are optional and may
-            #     be absent for Mem0 results, so lex sort is the only total order.
-            priors = sorted(priors, key=lambda p: p.id)
-            # Extract annotation from the first prior (lowest id lex) BEFORE
-            # deleting any.
-            first_prior = priors[0]
-            prior_run_id = (first_prior.metadata or {}).get('run_id') or 'unknown'
-            if prior_run_id == 'unknown':
-                logger.debug(
-                    'flag_dedup: prior marker for task=%s flag_type=%s has malformed run_id metadata',
-                    tid,
-                    ftype,
-                )
-            flag = dict(flag)
-            flag['persisted_from_run'] = prior_run_id
-            flag['last_seen_run_id'] = run_id
+        # --- Ledger-backed marker UPSERT (task 2227) ---
+        # Dedup identity is (task_id, flag_type) with run_id='' in the ledger's
+        # primary key, so a recurring signature always UPSERTs the SAME row —
+        # no separate search+write+confirm+delete cycle, no dependence on
+        # read-after-write consistency across calls or within one batch (a
+        # repeat of this signature later in the SAME call reads back the row
+        # just committed above).
+        ledger = getattr(memory_service, 'recon_ledger', None)
+        flag = dict(flag)
+        persisted_from_run: str | None = None
+        if ledger is not None:
+            prior = await ledger.get_by_identity(project_id, 'stage1_flag_marker', tid, ftype, '')
+            if prior is not None:
+                prior_payload = json.loads(prior.payload_json)
+                persisted_from_run = prior_payload.get('run_id') or 'unknown'
+                if persisted_from_run == 'unknown':
+                    logger.debug(
+                        'flag_dedup: prior marker for task=%s flag_type=%s has malformed run_id metadata',
+                        tid,
+                        ftype,
+                    )
+        if persisted_from_run is not None:
+            flag['persisted_from_run'] = persisted_from_run
+        flag['last_seen_run_id'] = run_id
 
-            # (2) Write replacement marker first.  If this fails, skip the
-            #     delete so all priors remain intact for next cycle.
-            #     After writing, confirm the marker is findable via a read-back
-            #     search (task-1400): add_memory may store content under a
-            #     different id than the one returned.  write_succeeded is True
-            #     only when the marker is confirmed findable by a subsequent search.
-            #     An unconfirmed write (write exception OR confirmation miss)
-            #     preserves priors for next cycle (best-effort at-least-one-marker).
-            #
-            #     _write_and_confirm_marker encapsulates the canonical payload,
-            #     the try/except, and the delegation to _confirm_and_track (which
-            #     encapsulates confirm_marker_persisted + circuit-breaker counter).
-            # See: _confirm_and_track docstring and "Confirmation circuit-breaker"
-            # section in the module docstring.
-            write_succeeded = await _write_and_confirm_marker(
-                memory_service,
-                project_id=project_id, run_id=run_id, tid=tid, ftype=ftype, log=logger,
-                confirm_and_track=_confirm_and_track,
-                active_miss_warning_template=(
-                    'flag_dedup: replacement marker for task %s flag_type %s could not'
-                    ' be confirmed findable — skipping prior deletion'
-                ),
-                tripped_skip_warning_template=(
-                    'flag_dedup: replacement marker for task %s flag_type %s —'
-                    ' confirmation skipped (circuit-breaker open) and'
-                    ' memory_ids gate failed —'
-                    ' skipping prior deletion'
-                ),
-                deduped_against=deduped_against,
+        payload: dict[str, Any] = {
+            'source': 'stage1_flag_marker',
+            'kind': 'stage1_flag_marker',
+            'task_id': tid,
+            'flag_type': ftype,
+            'run_id': run_id,
+            'last_seen_run_id': run_id,
+        }
+        if deduped_against:
+            payload['deduped_against'] = list(deduped_against)
+
+        if ledger is not None:
+            now = datetime.now(UTC)
+            await ledger.upsert(ReconLedgerRecord(
+                project_id=project_id,
+                record_kind='stage1_flag_marker',
+                payload_json=json.dumps(payload),
+                state='active',
+                created_at=now.isoformat(),
+                task_id=tid,
+                flag_type=ftype,
+                run_id='',
+                expires_at=(now + timedelta(days=14)).isoformat(),
+            ))
+
+        # Best-effort Mem0 mirror (PRD decision #4/#6 write-both/read-new): a
+        # single add_memory, no read-back/confirm/delete loop.  Never raises —
+        # a mirror failure must not roll back the ledger write above (or, when
+        # no ledger is attached, must not abort the batch either).
+        try:
+            await memory_service.add_memory(
+                content=f'Stage 1 flag marker: task={tid} type={ftype} from run={run_id}',
+                category='observations_and_summaries',
+                project_id=project_id,
+                metadata=payload,
+                causation_id=run_id,
+                _source='stage1_flag_dedup',
+            )
+        except Exception as e:
+            logger.debug(
+                'flag_dedup: Mem0 mirror write failed for marker task=%s flag_type=%s: %s'
+                ' (ledger write, if any, already committed)',
+                tid, ftype, e,
+                exc_info=True,
             )
 
-            # (3) Delete ALL priors only if the new marker was confirmed FINDABLE
-            #     (or, after circuit-breaker trip, if bool(response.memory_ids) is True).
-            #     Each delete is wrapped individually so one bad delete does not
-            #     abort the batch (self-healing: leftovers are retried next cycle).
-            if write_succeeded:
-                for prior in priors:
-                    try:
-                        await memory_service.delete_memory(
-                            memory_id=prior.id,
-                            store='mem0',
-                            project_id=project_id,
-                            causation_id=run_id,
-                            _source='stage1_flag_dedup',
-                        )
-                    except Exception as e:
-                        logger.warning(
-                            'flag_dedup: failed to delete prior marker %s for task %s flag_type %s: %s',
-                            prior.id, tid, ftype, e,
-                        )
-        else:
-            # MISS: novel flag (or search failed) — write a new marker for future
-            # dedup cycles.  _source='stage1_flag_dedup' distinguishes these
-            # from 'targeted_recon' writes in the audit journal.
-            #
-            # (Like the HIT branch above, reached only on the FIRST occurrence
-            # of (tid, ftype) in this call — see the in-batch memoization check
-            # above, task-1978.  A later occurrence of this same signature in
-            # this call is a genuine same-run duplicate; it is annotated from
-            # seen_signatures with persisted_from_run=run_id instead of writing
-            # another marker here.)
-            #
-            # Marker-growth caveat: when find_prior_memories returns [] due to
-            # a search failure (transient Mem0 outage) rather than a genuine
-            # miss, this branch still writes a new marker.  During a sustained
-            # outage every cycle will write a marker for recurring flags,
-            # causing monotonic marker-table growth beyond the normal one-row-
-            # per-(task_id, flag_type) bound.  The best-effort replacement
-            # pattern on the HIT path ensures that once search recovers, the
-            # next cycle collapses any accumulated duplicates back to a single row.
-            #
-            # Orphan-growth caveat (task-1670, Option-A trade-off): accepting
-            # fp: keys means a stage1_flag_marker row is written for every
-            # distinct normalized-description fingerprint.  These rows live in
-            # category 'observations_and_summaries' and are only ever collapsed
-            # back to one row on the HIT path for the *same* fingerprint.  A
-            # finding that stops recurring permanently leaves an orphaned marker
-            # that is never garbage-collected — Stage 2 never sweeps
-            # stage1_flag_marker records (flag_for_stage2-only filter), and
-            # sweep_orphan_flag_markers.py only purges rows missing
-            # kind='stage1_flag_marker' (so fp: markers with kind set survive).
-            # Because _query_stage2_flags uses a limit=100 top-N semantic search,
-            # an accumulating population of fp: markers competing for those 100
-            # slots can push genuine flag_for_stage2 records below the cutoff.
-            # Mitigation: a follow-up task should either (a) age out orphaned
-            # markers by last_seen_run_id staleness, or (b) migrate
-            # _query_stage2_flags off the limit=100 semantic search to
-            # scroll_by_metadata (already noted in its docstring).
-            #
-            # Post-write confirmation (task-1400): after writing, confirm the
-            # marker is findable via a read-back search.  The WARNING is driven
-            # off the bool return from _confirm_and_track (False = unfindable in
-            # ACTIVE branch, or bool(response.memory_ids)==False in TRIPPED branch).
-            #
-            # Circuit-breaker (task-1412): _write_and_confirm_marker delegates to
-            # _confirm_and_track (the same inner closure shared with the HIT branch),
-            # so both branches share the same counter / disabled flag.
-            # When the breaker is tripped, _confirm_and_track drives the "will not be
-            # detected next cycle" WARNING off bool(response.memory_ids) instead.
-            await _write_and_confirm_marker(
-                memory_service,
-                project_id=project_id, run_id=run_id, tid=tid, ftype=ftype, log=logger,
-                confirm_and_track=_confirm_and_track,
-                active_miss_warning_template=(
-                    'flag_dedup: MISS marker for task %s flag_type %s could not be'
-                    ' confirmed findable — recurring flag will not be detected next cycle'
-                ),
-                tripped_skip_warning_template=(
-                    'flag_dedup: MISS marker for task %s flag_type %s —'
-                    ' confirmation skipped (circuit-breaker open) and'
-                    ' memory_ids gate failed —'
-                    ' recurring flag will not be detected next cycle'
-                ),
-                deduped_against=deduped_against,
-            )
-        # Record this signature's resolved outcome (task-1978) so any later
-        # same-signature occurrence in this call hits the in-batch memo branch
-        # above instead of repeating the search/write/confirm/delete cycle.
-        # HIT-first: flag['persisted_from_run'] was just set above (the prior
-        # marker's run_id, with the 'unknown' fallback already applied) — reuse
-        # it verbatim.  MISS-first: flag carries no persisted_from_run key, so
-        # the get() default (the current run_id) is used — a MISS-first repeat
-        # is a genuine same-run duplicate, so run_id is the correct provenance.
-        #
-        # Deliberately UNCONDITIONAL — not gated on write_succeeded. Gating on
-        # write_succeeded looks appealing (a genuinely-failed add_memory would
-        # then let a later same-call occurrence retry instead of inheriting a
-        # never-written signature's provenance) but write_succeeded conflates
-        # two different situations that _write_and_confirm_marker cannot
-        # distinguish through its bool-only return: (1) add_memory itself
-        # raised — nothing persisted — and (2) add_memory succeeded but
-        # confirm_marker_persisted's OWN read-back search missed under the
-        # exact same Mem0 read-after-write lag this memo exists to route
-        # around. Case (2) is the validated production mechanism (see
-        # "In-batch memoization" above); gating on write_succeeded would skip
-        # memoizing it, so a later same-call occurrence would retry the full
-        # cycle, hit the same lag on ITS OWN confirmation search, and also not
-        # be memoized — reopening unbounded within-run duplicate accumulation
-        # for the very case this fix targets. Recording the memo unconditionally
-        # bounds every signature to exactly one write per call regardless of
-        # confirmation outcome. The trade-off this accepts: on the rarer
-        # genuine-failure case (1), a later same-call occurrence inherits
-        # provenance for a marker that was never written; the next dedup_flags
-        # cycle's pre-write search then correctly finds no prior and re-MISSes,
-        # writing a fresh marker — a one-cycle-delayed self-heal, not a
-        # permanent loss.
-        seen_signatures[(tid, ftype)] = flag.get('persisted_from_run', run_id)
         result.append(flag)
     return result
 
