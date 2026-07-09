@@ -188,3 +188,88 @@ class TestItemLifecycleTransitionHappyPath:
             rid, ItemLifecycleState.REDISPATCH_PARKED, ItemLifecycleState.DISPATCHING,
         )
         assert registry.current(rid) == ItemLifecycleState.DISPATCHING
+
+
+# ---------------------------------------------------------------------------
+# step-7 RED / step-8 GREEN: illegal transitions raise IllegalLifecycleTransition
+# ---------------------------------------------------------------------------
+
+
+class TestItemLifecycleIllegalTransitions:
+    """transition() rejects every illegal move with the dedicated
+    IllegalLifecycleTransition, leaving the registry's stored state
+    unchanged (task 2164 step-7, L-1 enforcement).
+
+    RED until step-8 GREEN defines IllegalLifecycleTransition and hardens
+    ItemLifecycle.transition() to raise it for all three guard classes.
+    """
+
+    def test_skip_stage_move_raises(self) -> None:
+        from orchestrator.merge_queue import (
+            IllegalLifecycleTransition,
+            ItemLifecycle,
+            ItemLifecycleState,
+        )
+
+        registry = ItemLifecycle()
+        rid = 'mr-aaaaaaaa'
+        registry.register(rid)
+
+        with pytest.raises(IllegalLifecycleTransition):
+            registry.transition(rid, ItemLifecycleState.QUEUED, ItemLifecycleState.FINALIZING)
+
+        assert registry.current(rid) == ItemLifecycleState.QUEUED
+
+    def test_move_out_of_terminal_raises(self) -> None:
+        from orchestrator.merge_queue import (
+            IllegalLifecycleTransition,
+            ItemLifecycle,
+            ItemLifecycleState,
+        )
+
+        registry = ItemLifecycle()
+        rid = 'mr-aaaaaaaa'
+        registry.register(rid, initial=ItemLifecycleState.TERMINAL)
+
+        with pytest.raises(IllegalLifecycleTransition):
+            registry.transition(rid, ItemLifecycleState.TERMINAL, ItemLifecycleState.QUEUED)
+
+        assert registry.current(rid) == ItemLifecycleState.TERMINAL
+
+    def test_from_state_mismatch_raises_and_leaves_state_unchanged(self) -> None:
+        """Registry's actual current state is QUEUED (from register()'s
+        default); the caller wrongly believes it is VERIFYING. Even though
+        VERIFYING -> GATE_REVERIFY is itself a legal edge, the mismatch
+        against the registry's real state must reject the call."""
+        from orchestrator.merge_queue import (
+            IllegalLifecycleTransition,
+            ItemLifecycle,
+            ItemLifecycleState,
+        )
+
+        registry = ItemLifecycle()
+        rid = 'mr-aaaaaaaa'
+        registry.register(rid)
+
+        with pytest.raises(IllegalLifecycleTransition):
+            registry.transition(
+                rid, ItemLifecycleState.VERIFYING, ItemLifecycleState.GATE_REVERIFY,
+            )
+
+        assert registry.current(rid) == ItemLifecycleState.QUEUED
+
+    def test_unregistered_rid_raises(self) -> None:
+        from orchestrator.merge_queue import (
+            IllegalLifecycleTransition,
+            ItemLifecycle,
+            ItemLifecycleState,
+        )
+
+        registry = ItemLifecycle()
+
+        with pytest.raises(IllegalLifecycleTransition):
+            registry.transition(
+                'mr-unknown0', ItemLifecycleState.QUEUED, ItemLifecycleState.MERGING,
+            )
+
+        assert registry.current('mr-unknown0') is None
