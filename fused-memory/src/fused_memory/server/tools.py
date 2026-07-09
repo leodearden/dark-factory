@@ -1133,6 +1133,8 @@ def create_mcp_server(
                 success=False,
                 error=str(e),
             )
+            # _log_read records the audit failure; @mcp_tool_errors converts
+            # this exception to the error dict.
             raise
 
     @mcp.tool()
@@ -1327,6 +1329,8 @@ def create_mcp_server(
                 success=False,
                 error=str(e),
             )
+            # _log_read records the audit failure; @mcp_tool_errors converts
+            # this exception to the error dict.
             raise
 
     @mcp.tool()
@@ -1400,6 +1404,8 @@ def create_mcp_server(
                 success=False,
                 error=str(e),
             )
+            # _log_read records the audit failure; @mcp_tool_errors converts
+            # this exception to the error dict.
             raise
 
     @mcp.tool()
@@ -1456,6 +1462,8 @@ def create_mcp_server(
                 success=False,
                 error=str(e),
             )
+            # _log_read records the audit failure; @mcp_tool_errors converts
+            # this exception to the error dict.
             raise
 
     # ------------------------------------------------------------------
