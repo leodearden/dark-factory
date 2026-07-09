@@ -240,3 +240,55 @@ class TestRobustness:
         f.write_text('not a dir')
         r = ProjectPrefixRegistry.from_roots([str(f)])
         assert r.project_to_prefixes['just_a_file'] == ()
+
+
+# ---------------------------------------------------------------------------
+# default() — built-in, filesystem-independent dark_factory registry.
+#
+# Folds in the retired dark_factory_path_guard shim's hard-coded constants
+# (task 2208 / PRD D2) so the guard always classifies dark-factory paths
+# even when no known_project_roots are configured.
+# ---------------------------------------------------------------------------
+
+
+class TestDefaultRegistry:
+    _EXPECTED_PREFIXES = (
+        'orchestrator/',
+        'fused-memory/',
+        'fused_memory/',
+        'mem0/',
+        'graphiti/',
+        'dashboard/',
+    )
+
+    def test_default_registry_is_truthy(self):
+        assert bool(ProjectPrefixRegistry.default()) is True
+
+    def test_default_registry_carries_dark_factory_prefixes(self):
+        r = ProjectPrefixRegistry.default()
+        assert r.project_to_prefixes['dark_factory'] == self._EXPECTED_PREFIXES
+        for prefix in self._EXPECTED_PREFIXES:
+            assert prefix in r.all_prefixes()
+
+    def test_project_for_prefix_resolves_dark_factory(self):
+        r = ProjectPrefixRegistry.default()
+        assert r.project_for_prefix('orchestrator/') == 'dark_factory'
+
+    def test_project_for_path_resolves_dark_factory(self):
+        r = ProjectPrefixRegistry.default()
+        assert r.project_for_path('fused-memory/src/x.py') == 'dark_factory'
+        assert r.project_for_path('mem0/foo.py') == 'dark_factory'
+
+    def test_root_for_project(self):
+        r = ProjectPrefixRegistry.default()
+        assert r.root_for_project('dark_factory') == '/home/leo/src/dark-factory'
+
+    def test_is_known(self):
+        assert ProjectPrefixRegistry.default().is_known('dark_factory')
+
+    def test_module_exposes_moved_constants(self):
+        from fused_memory.middleware import project_prefix_registry as mod
+
+        assert mod.DARK_FACTORY_PROJECT_ID == 'dark_factory'
+        assert mod.DARK_FACTORY_ROOT == '/home/leo/src/dark-factory'
+        assert mod.DARK_FACTORY_PATH_PREFIXES == self._EXPECTED_PREFIXES
