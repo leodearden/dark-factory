@@ -5304,7 +5304,15 @@ class TestSpeculativeMergeWorker:
             queue.put_nowait(req_n1)
             queue.put_nowait(req_n2)
 
-            deadline = time.monotonic() + 15
+            # 30 s (not the file's more common 15 s poll budget) to match this
+            # same test's own wait_for(..., timeout=30) calls below: under
+            # heavy host load the real git-subprocess merges backing N+1/N+2
+            # can occasionally exceed 15 s wall-clock with no logic fault
+            # (observed flake: attempt-1 timed out at 15 s while 667/668
+            # sibling tests passed; the identical scenario passed repeatedly
+            # in isolation and full-file reruns). The assertion itself —
+            # N+1 and N+2 must both reach the verifier queue — is unchanged.
+            deadline = time.monotonic() + 30
             while time.monotonic() < deadline:
                 if worker._verifier_queue.qsize() >= 2:
                     break
@@ -5312,7 +5320,7 @@ class TestSpeculativeMergeWorker:
             else:
                 pytest.fail(
                     'N+1 and N+2 did not both appear in the verifier queue within '
-                    '15 s.  N+2 must be speculatively prefetched after N+1 (K=2).'
+                    '30 s.  N+2 must be speculatively prefetched after N+1 (K=2).'
                 )
 
             gate_open.set()
