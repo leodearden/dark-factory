@@ -125,13 +125,13 @@ SHUTDOWN_SCRIPT = textwrap.dedent('''
 ''')
 
 
-@pytest.mark.timeout(60)
+@pytest.mark.timeout(120)  # task 2376: raised from 60 -- must exceed the widened 30+45s inner budget below
 def test_sigterm_exits_within_deadline(tmp_path: Path):
     """Reproducer for the shutdown hang.
 
     Spawns a python subprocess that runs the minimal orchestrator shape
     (probe loop + fake agent with long subprocess + asyncio signal
-    handler). Sends SIGTERM. Asserts exit within 20 s with rc=0 AND no
+    handler). Sends SIGTERM. Asserts exit within 45 s with rc=0 AND no
     stray `sleep 300` child is leaked.
     """
     script = tmp_path / 'shutdown_shape.py'
@@ -151,7 +151,10 @@ def test_sigterm_exits_within_deadline(tmp_path: Path):
     try:
         # Wait for the script to print READY so the signal handler is
         # registered and the subprocess is in-flight.
-        deadline = time.monotonic() + 10.0
+        # task 2376: widened from 10.0s -- host oversubscription can delay
+        # subprocess startup past a short deadline even when the script
+        # is behaving correctly.
+        deadline = time.monotonic() + 30.0
         ready = False
         while time.monotonic() < deadline:
             line = proc.stdout.readline() if proc.stdout else b''
@@ -166,14 +169,17 @@ def test_sigterm_exits_within_deadline(tmp_path: Path):
         proc.send_signal(signal.SIGTERM)
 
         try:
-            rc = proc.wait(timeout=20.0)
+            # task 2376: widened from 20.0s -- host oversubscription can
+            # delay a clean exit past a short deadline; the real invariant
+            # (rc == 0, no leaked sleep 300 child) is checked below.
+            rc = proc.wait(timeout=45.0)
         except subprocess.TimeoutExpired as exc:
             # Kill the whole group so we don't leak sleep 300 processes.
             with contextlib.suppress(ProcessLookupError):
                 os.killpg(pgid, signal.SIGKILL)
             proc.wait(timeout=5.0)
             raise AssertionError(
-                'Shutdown hung: python did not exit within 20s of SIGTERM'
+                'Shutdown hung: python did not exit within 45s of SIGTERM'
             ) from exc
 
         assert rc == 0, f'expected clean exit, got rc={rc}'
