@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
-import enum
 import json
 import logging
 import os
@@ -91,6 +90,12 @@ from orchestrator.verify import (
     verify_failure_is_preexisting_on_main,
 )
 from orchestrator.verify_categories import PREEXISTING_BREAK_SKIP_CATEGORIES, FailureCategory
+from orchestrator.workflow_types import (  # noqa: F401  re-export shim
+    IllegalTransition,
+    WorkflowOutcome,
+    WorkflowState,
+    WorkflowStateMachine,
+)
 
 # Orchestrator package directory — used to resolve ``uv run --project`` for
 # the plan-tools stdio MCP server.
@@ -341,30 +346,6 @@ logger = logging.getLogger(__name__)
 # Mirrors the _inherited_break_info pattern: set by _execute_iterations, consumed
 # at the BLOCKED route in _execute_verify_review_loop (task 1739).
 ZERO_OUTPUT_HANG_REASON = 'infra: zero-output CLI hang (consecutive fresh-invocation timeouts)'
-
-
-class WorkflowState(enum.Enum):
-    PLAN = 'plan'
-    EXECUTE = 'execute'
-    VERIFY = 'verify'
-    REVIEW = 'review'
-    MERGE = 'merge'
-    MERGE_DEFERRED = 'merge-deferred'
-    DONE = 'done'
-    BLOCKED = 'blocked'
-    ESCALATED = 'escalated'
-    CANCELLED = 'cancelled'
-
-
-class WorkflowOutcome(enum.Enum):
-    DONE = 'done'
-    PLANNED = 'planned'
-    BLOCKED = 'blocked'
-    REQUEUED = 'requeued'
-    ESCALATED = 'escalated'
-    CANCELLED = 'cancelled'
-    MERGE_DEFERRED = 'merge-deferred'
-    SOFT_CANCELLED = 'soft-cancelled'
 
 
 # Matches the wrapper string ``_run_cmd`` injects when its own asyncio.wait_for
@@ -845,7 +826,7 @@ class TaskWorkflow:
         self.event_store = event_store
         self.cost_store = cost_store
 
-        self.state = WorkflowState.PLAN
+        self.machine = WorkflowStateMachine(WorkflowState.PLAN)
         self._phase_cost_at_entry: float = 0.0
         self.task = assignment.task
         self.task_id = assignment.task_id
@@ -985,6 +966,21 @@ class TaskWorkflow:
         # right after session_id_val is determined; read by _capture_zero_output_evidence
         # so it can locate the transcript even when result.session_id is '' (hard SIGKILL).
         self._last_invoke_session_id: str | None = None
+
+    @property
+    def state(self) -> WorkflowState:
+        """Current workflow phase, delegated to :attr:`machine`.
+
+        The setter bypasses transition validation (``machine.force_set``) —
+        it exists because many tests stage a state directly (e.g.
+        ``wf.state = WorkflowState.DONE``). Only :meth:`_enter_phase` drives
+        a validated transition (``machine.transition``).
+        """
+        return self.machine.state
+
+    @state.setter
+    def state(self, value: WorkflowState) -> None:
+        self.machine.force_set(value)
 
     @property
     def _task_files(self) -> list[str] | None:
@@ -1621,9 +1617,17 @@ class TaskWorkflow:
         await self.scheduler.update_task(self.task_id, merged)
 
     def _enter_phase(self, new_state: WorkflowState) -> None:
-        """Transition to a new workflow phase, emitting events."""
+        """Transition to a new workflow phase, emitting events.
+
+        The machine transition happens BEFORE event emission so an illegal
+        move (e.g. a late phase change after a terminal state) raises
+        ``IllegalTransition`` and short-circuits before any phase_exit/
+        phase_enter event is emitted — no phantom events for a move that
+        never actually happened.
+        """
+        prev = self.state
+        self.machine.transition(new_state)
         if self.event_store:
-            prev = self.state
             if prev not in (WorkflowState.DONE, WorkflowState.BLOCKED):
                 cost_delta = self.metrics.total_cost_usd - self._phase_cost_at_entry
                 self.event_store.emit(
@@ -1636,7 +1640,6 @@ class TaskWorkflow:
                 task_id=self.task_id, phase=new_state.value,
             )
         self._phase_cost_at_entry = self.metrics.total_cost_usd
-        self.state = new_state
 
     async def _setup_worktree_and_artifacts(self, branch_name: str) -> None:
         """Set in-progress, create/inspect the worktree, init artifacts, scrub .task/.
@@ -8031,12 +8034,12 @@ Update the plan to address the blocking issues. You may add new steps to the `st
         human-judgement/infra cases and must NOT receive a proposal — leave
         their callers with spawn_dry_run=False (the default).
         """
-        if self.state == WorkflowState.DONE:
+        if self.machine.is_terminal():
             logger.warning(
-                'Task %s: already DONE, ignoring late blocked transition: %s',
-                self.task_id, reason,
+                'Task %s: already %s, ignoring late blocked transition: %s',
+                self.task_id, self.state.value, reason,
             )
-            return WorkflowOutcome.DONE
+            return WorkflowOutcome(self.state.value)
         # Capture the phase we were in before transitioning to BLOCKED so the
         # harness-level retry cap can report *which* phase looped.  _enter_phase
         # overwrites self.state, so stash first.
