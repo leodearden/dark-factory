@@ -7797,14 +7797,24 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                         # Do NOT replace with asyncio.BoundedSemaphore, which
                         # raises ValueError on over-release and would crash here.
                         #
-                        # The same double-release tolerance applies to
-                        # _speculation_slot: if this is a speculative item and
-                        # CancelledError fires after the put succeeded, the
-                        # controller's held_by_merger remains True so the
-                        # outer finally's on_shutdown() releases the slot —
-                        # and the verifier also releases it on drain.  Both
-                        # are plain Semaphores so over-release is safe here
-                        # too.
+                        # The _speculation_slot / permit picture is DIFFERENT
+                        # from _merge_ahead_cap above — under the ledger (η)
+                        # this is NOT a double release.  On this same
+                        # CancelledError-after-put race, execution never
+                        # reaches the on_transfer() stamp below (it lives
+                        # after this except block, past the `raise`), so
+                        # `_real_item.permit` stays None.  The verifier later
+                        # drains this item and, per its `if entry.permit is
+                        # not None` release guard, skips releasing the
+                        # ledger for it.  Meanwhile on_transfer() was never
+                        # called, so the controller's held_by_merger stays
+                        # True and the outer finally's on_shutdown() (or an
+                        # enclosing except's on_abort()) performs the single
+                        # authoritative ledger release of the still-held
+                        # merger permit.  Net: released exactly once — the
+                        # "verifier also releases it on drain" / "over-release
+                        # safe" story above is specific to _merge_ahead_cap
+                        # and does not apply here.
                         if counts_against_cap:
                             self._merge_ahead_cap.release()
                         raise
@@ -7820,6 +7830,16 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                     # again before the next on_dequeue overwrites it).
                     # η: stamp the detached token onto the enqueued item so
                     # the verifier can release this SAME token on drain.
+                    # INVARIANT — no `await` between put() (above, in the
+                    # try block) and this line: everything in between is
+                    # synchronous comments plus an `except BaseException`
+                    # handler that always re-raises before reaching here, so
+                    # this line only runs when put() returned without
+                    # suspending.  An intervening await would let the
+                    # verifier drain _real_item while .permit is still None,
+                    # silently skipping the release and leaking the token in
+                    # ledger.live forever — same hazard as the
+                    # on_transfer_terminal() sites above.
                     _real_item.permit = self._speculation_controller.on_transfer()
                     self._inflight_req = None  # item is now owned by verifier
 
