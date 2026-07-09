@@ -14,7 +14,7 @@ import uuid
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Literal, TypedDict, cast
+from typing import Literal, TypedDict
 
 from shared.proc_group import terminate_process_group
 
@@ -24,27 +24,14 @@ from orchestrator.verify_categories import (
     ARCHIVE_DENY_LIST as _ARCHIVE_DENY_LIST,  # noqa: F401 — re-exported for external consumers
 )
 from orchestrator.verify_categories import (
-    CATEGORY_PRIORITY,
+    CATEGORY_PRIORITY as _CATEGORY_PRIORITY,  # already list[str] — see verify_categories
+)
+from orchestrator.verify_categories import (
     INFRA_TRANSIENT_CATEGORIES,
     PREEXISTING_BREAK_SKIP_CATEGORIES,  # noqa: F401 — re-exported for external consumers
     FailureCategory,
     should_archive,
 )
-
-# Re-typed list[str] (verify_categories.CATEGORY_PRIORITY is list[FailureCategory]):
-# every existing call site of this legacy re-export — here in verify.py and in the
-# pre-existing test_verify.py / test_verify_env_transient.py regression guards —
-# indexes/searches it with plain strings. FailureCategory is a StrEnum, so members
-# compare/hash/index equal to their str value at runtime; this cast is a
-# static-typing-only adjustment (still the exact same list object — see
-# verify_categories.CATEGORY_PRIORITY for the precisely FailureCategory-typed
-# source of truth). Bound once, with an explicit annotation, rather than
-# reassigning the imported name in place: pyright infers a bare module-level
-# reassignment's cross-scope type as the union of every binding of that name
-# (list[FailureCategory] | list[str]), which still fails `.index()` calls made
-# from nested function scopes such as _worst_category._rank below. A single
-# annotated binding makes list[str] the one declared type everywhere.
-_CATEGORY_PRIORITY: list[str] = cast('list[str]', CATEGORY_PRIORITY)
 
 logger = logging.getLogger(__name__)
 

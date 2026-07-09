@@ -20,6 +20,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from enum import Enum, StrEnum
+from typing import cast
 
 
 class FailureCategory(StrEnum):
@@ -133,8 +134,17 @@ _validate_exhaustive(FailureCategory, CATEGORY_POLICY)
 # (not hand-written) so a new category can never drift out of sync with its
 # CATEGORY_POLICY row — see bug_history: task 2048 required 4 registry edits
 # + 2 inline sets for a single category change.
-CATEGORY_PRIORITY: list[FailureCategory] = sorted(
-    FailureCategory, key=lambda c: CATEGORY_POLICY[c].severity_rank,
+#
+# Declared/cast to list[str] rather than list[FailureCategory]: pyright's
+# list is invariant, so a precisely FailureCategory-typed list rejects the
+# plain-string .index()/`in` lookups every consumer (verify.py's
+# _worst_category included) legitimately makes — FailureCategory IS its str
+# value (StrEnum), so this is a static-typing-only relaxation, not a runtime
+# change. Casting once here — the single source of truth — means consumers
+# import CATEGORY_PRIORITY directly with no per-module re-cast.
+CATEGORY_PRIORITY: list[str] = cast(
+    'list[str]',
+    sorted(FailureCategory, key=lambda c: CATEGORY_POLICY[c].severity_rank),
 )
 
 # Categories that must NOT be auto-archived. Derived from CategoryPolicy.archive.
