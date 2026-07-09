@@ -26,6 +26,7 @@ from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+from _orch_helpers import MERGE_RESULT_TIMEOUT
 
 # Reuse the γ harness two-host fakes (established cross-test-module import
 # pattern — see test_concurrent_verify_boundary.py / test_merge_speculation.py).
@@ -959,7 +960,7 @@ class TestCascadeErrorChokepoint:
             # N fails → head-failure cascade fires → _killer_remerge raises for N+1.
             gate_a_release.set()
 
-            outcome_a = await asyncio.wait_for(req_a.result, timeout=15.0)
+            outcome_a = await asyncio.wait_for(req_a.result, timeout=MERGE_RESULT_TIMEOUT)
             assert outcome_a.status not in ('done', 'already_merged'), (
                 f'Expected N to fail, got status={outcome_a.status!r}.'
             )
@@ -969,7 +970,7 @@ class TestCascadeErrorChokepoint:
             gate_b_release.set()
 
             with contextlib.suppress(TimeoutError):
-                outcome_b = await asyncio.wait_for(req_b.result, timeout=5.0)
+                outcome_b = await asyncio.wait_for(req_b.result, timeout=MERGE_RESULT_TIMEOUT)
 
             # SLOT EXACT-ONCE (measured BEFORE stop(), which over-releases for
             # safety): see the MEASUREMENT NOTE in TestCascadeErrorContainment
@@ -997,7 +998,7 @@ class TestCascadeErrorChokepoint:
             await q.put(req_c)
 
             with contextlib.suppress(TimeoutError):
-                outcome_c = await asyncio.wait_for(req_c.result, timeout=10.0)
+                outcome_c = await asyncio.wait_for(req_c.result, timeout=MERGE_RESULT_TIMEOUT)
 
             await worker.stop()
 
@@ -1168,7 +1169,7 @@ class TestCascadeErrorChokepoint:
             # N fails → head-failure cascade fires → _killer_remerge raises for N+1.
             gate_a_release.set()
 
-            outcome_a = await asyncio.wait_for(req_a.result, timeout=15.0)
+            outcome_a = await asyncio.wait_for(req_a.result, timeout=MERGE_RESULT_TIMEOUT)
             assert outcome_a.status not in ('done', 'already_merged'), (
                 f'Expected N to fail, got status={outcome_a.status!r}.'
             )
@@ -1178,7 +1179,7 @@ class TestCascadeErrorChokepoint:
             gate_b_release.set()
 
             with contextlib.suppress(TimeoutError):
-                outcome_b = await asyncio.wait_for(req_b.result, timeout=5.0)
+                outcome_b = await asyncio.wait_for(req_b.result, timeout=MERGE_RESULT_TIMEOUT)
 
             # ── LOAD-BEARING RED assertion (task 2160/η step-9) ───────────────
             # Only the cascade's own _abort_remote_verify pre-cancel (call 1)
@@ -1212,7 +1213,7 @@ class TestCascadeErrorChokepoint:
             await q.put(req_c)
 
             with contextlib.suppress(TimeoutError):
-                outcome_c = await asyncio.wait_for(req_c.result, timeout=10.0)
+                outcome_c = await asyncio.wait_for(req_c.result, timeout=MERGE_RESULT_TIMEOUT)
 
             await worker.stop()
 
@@ -1339,7 +1340,7 @@ class TestCascadeErrorChokepoint:
             # N fails → head-failure cascade fires → in-body cancel_and_release raises.
             gate_a_release.set()
 
-            outcome_a = await asyncio.wait_for(req_a.result, timeout=15.0)
+            outcome_a = await asyncio.wait_for(req_a.result, timeout=MERGE_RESULT_TIMEOUT)
             assert outcome_a.status not in ('done', 'already_merged'), (
                 f'Expected N to fail, got status={outcome_a.status!r}.'
             )
@@ -1347,7 +1348,7 @@ class TestCascadeErrorChokepoint:
             gate_b_release.set()
 
             with contextlib.suppress(TimeoutError):
-                outcome_b = await asyncio.wait_for(req_b.result, timeout=5.0)
+                outcome_b = await asyncio.wait_for(req_b.result, timeout=MERGE_RESULT_TIMEOUT)
 
             # Loop-survival signal — see the NOTE in the sibling γ-harness
             # test: in this secondary-failure path set_result precedes the
@@ -1364,7 +1365,7 @@ class TestCascadeErrorChokepoint:
             await q.put(req_c)
 
             with contextlib.suppress(TimeoutError):
-                outcome_c = await asyncio.wait_for(req_c.result, timeout=10.0)
+                outcome_c = await asyncio.wait_for(req_c.result, timeout=MERGE_RESULT_TIMEOUT)
 
             expected_slot = depth0 - 1  # one permit held by the merger look-ahead
             assert worker._speculation_slot._value == expected_slot, (

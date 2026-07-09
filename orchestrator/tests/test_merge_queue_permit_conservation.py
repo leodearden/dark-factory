@@ -28,6 +28,7 @@ from typing import Any
 from unittest.mock import MagicMock, patch
 
 import pytest
+from _orch_helpers import MERGE_RESULT_TIMEOUT
 from test_merge_queue_concurrent_verify import (
     _gated_runner,
     _inject_two_host_allocator,
@@ -315,8 +316,8 @@ class TestPrefetchLookaheadAndAttachConservation:
             gate_a_release.set()
             gate_b_release.set()
 
-            outcome_a = await asyncio.wait_for(req_a.result, timeout=15.0)
-            outcome_b = await asyncio.wait_for(req_b.result, timeout=15.0)
+            outcome_a = await asyncio.wait_for(req_a.result, timeout=MERGE_RESULT_TIMEOUT)
+            outcome_b = await asyncio.wait_for(req_b.result, timeout=MERGE_RESULT_TIMEOUT)
             assert outcome_a.status == 'done', f'A must land; got {outcome_a!r}'
             assert outcome_b.status == 'done', f'B must land; got {outcome_b!r}'
 
@@ -376,7 +377,7 @@ class TestFallbackConservation:
             worker_task = asyncio.create_task(worker.run())
 
             await queue.put(req_a)
-            outcome_a = await asyncio.wait_for(req_a.result, timeout=15.0)
+            outcome_a = await asyncio.wait_for(req_a.result, timeout=MERGE_RESULT_TIMEOUT)
             assert outcome_a.status == 'done', f'A must land; got {outcome_a!r}'
 
             # A is fully done before B is even enqueued — the ATTACH
@@ -384,7 +385,7 @@ class TestFallbackConservation:
             _assert_conservation(worker, where='after A lands, before B enqueued')
 
             await queue.put(req_b)
-            outcome_b = await asyncio.wait_for(req_b.result, timeout=15.0)
+            outcome_b = await asyncio.wait_for(req_b.result, timeout=MERGE_RESULT_TIMEOUT)
             assert outcome_b.status == 'done', f'B must land; got {outcome_b!r}'
 
             _assert_conservation(worker, where='after FALLBACK, B lands')
@@ -481,7 +482,7 @@ class TestCascadeRemergeConservation:
             gate_a_release.set()
 
             outcome_b = await asyncio.wait_for(req_b.result, timeout=25.0)
-            outcome_a = await asyncio.wait_for(req_a.result, timeout=10.0)
+            outcome_a = await asyncio.wait_for(req_a.result, timeout=MERGE_RESULT_TIMEOUT)
 
             assert outcome_a.status != 'done', f'A must NOT land; got {outcome_a!r}'
             assert outcome_b.status == 'done', (
@@ -665,8 +666,8 @@ class TestLedgerLiveEmptiesAfterTransferRelease:
             gate_a_release.set()
             gate_b_release.set()
 
-            outcome_a = await asyncio.wait_for(req_a.result, timeout=15.0)
-            outcome_b = await asyncio.wait_for(req_b.result, timeout=15.0)
+            outcome_a = await asyncio.wait_for(req_a.result, timeout=MERGE_RESULT_TIMEOUT)
+            outcome_b = await asyncio.wait_for(req_b.result, timeout=MERGE_RESULT_TIMEOUT)
             assert outcome_a.status == 'done', f'A must land; got {outcome_a!r}'
             assert outcome_b.status == 'done', f'B must land; got {outcome_b!r}'
 
@@ -813,8 +814,8 @@ class TestEarlyContinueTerminalTransferClearsSpecBase:
             _assert_conservation(worker, where='after early-continue terminal transfer')
 
             gate_a_release.set()
-            outcome_a = await asyncio.wait_for(req_a.result, timeout=15.0)
-            outcome_b = await asyncio.wait_for(req_b.result, timeout=15.0)
+            outcome_a = await asyncio.wait_for(req_a.result, timeout=MERGE_RESULT_TIMEOUT)
+            outcome_b = await asyncio.wait_for(req_b.result, timeout=MERGE_RESULT_TIMEOUT)
             assert outcome_a.status == 'done', f'A must land; got {outcome_a!r}'
             assert outcome_b.status == 'blocked', f'B must be abandoned; got {outcome_b!r}'
 

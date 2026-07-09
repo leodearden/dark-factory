@@ -91,6 +91,7 @@ from typing import Any, Literal
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+from _orch_helpers import MERGE_RESULT_TIMEOUT
 from escalation.queue import EscalationQueue
 
 from orchestrator.artifacts import TaskArtifacts
@@ -717,9 +718,9 @@ class TestScenario1SpeculativeCascade:
             gate_b_release.set()
 
             with contextlib.suppress(TimeoutError):
-                outcome_a = await asyncio.wait_for(req_a.result, timeout=15.0)
+                outcome_a = await asyncio.wait_for(req_a.result, timeout=MERGE_RESULT_TIMEOUT)
             with contextlib.suppress(TimeoutError):
-                outcome_b = await asyncio.wait_for(req_b.result, timeout=15.0)
+                outcome_b = await asyncio.wait_for(req_b.result, timeout=MERGE_RESULT_TIMEOUT)
 
             # ── N (head): must FAIL permanently — a genuine VerifyResult
             # failure is a real chain failure, not a transient

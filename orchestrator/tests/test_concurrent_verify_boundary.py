@@ -27,6 +27,7 @@ from typing import Any, NamedTuple
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+from _orch_helpers import MERGE_RESULT_TIMEOUT
 
 # Reuse the γ harness fakes/fixtures (established cross-test-module import pattern).
 from test_merge_queue_concurrent_verify import (
@@ -262,8 +263,8 @@ class TestB1OverlapOrderedAdvance:
             gate_b_release.set()   # N+1 (remote) completes first
             gate_a_release.set()   # N (local) completes second
 
-            outcome_a = await asyncio.wait_for(req_a.result, timeout=15.0)
-            outcome_b = await asyncio.wait_for(req_b.result, timeout=15.0)
+            outcome_a = await asyncio.wait_for(req_a.result, timeout=MERGE_RESULT_TIMEOUT)
+            outcome_b = await asyncio.wait_for(req_b.result, timeout=MERGE_RESULT_TIMEOUT)
 
         await worker.stop()
         with contextlib.suppress(Exception):
@@ -373,13 +374,13 @@ class TestB2ChainInvalidationUnderOverlap:
 
             # N's verify fails
             gate_a_release.set()
-            outcome_a = await asyncio.wait_for(req_a.result, timeout=15.0)
+            outcome_a = await asyncio.wait_for(req_a.result, timeout=MERGE_RESULT_TIMEOUT)
 
             # Release N+1's gate so the cascaded inner task unblocks harmlessly
             gate_b_release.set()
 
             # N+1 re-merges and re-verifies → done
-            outcome_b = await asyncio.wait_for(req_b.result, timeout=15.0)
+            outcome_b = await asyncio.wait_for(req_b.result, timeout=MERGE_RESULT_TIMEOUT)
             await worker.stop()
 
         with contextlib.suppress(Exception):
@@ -497,8 +498,8 @@ class TestB3HostDownMidOverlap:
             gate_a_release.set()
 
             try:
-                outcome_a = await asyncio.wait_for(req_a.result, timeout=15.0)
-                outcome_b = await asyncio.wait_for(req_b.result, timeout=15.0)
+                outcome_a = await asyncio.wait_for(req_a.result, timeout=MERGE_RESULT_TIMEOUT)
+                outcome_b = await asyncio.wait_for(req_b.result, timeout=MERGE_RESULT_TIMEOUT)
             except TimeoutError:
                 outcome_a = None
                 outcome_b = None
@@ -600,10 +601,10 @@ class TestB4CancelBehavior:
             await asyncio.wait_for(gate_b_entered.wait(), timeout=15.0)
 
             gate_a_release.set()   # N fails
-            outcome_a = await asyncio.wait_for(req_a.result, timeout=15.0)
+            outcome_a = await asyncio.wait_for(req_a.result, timeout=MERGE_RESULT_TIMEOUT)
 
             gate_b_release.set()   # release leaked inner task
-            outcome_b = await asyncio.wait_for(req_b.result, timeout=15.0)
+            outcome_b = await asyncio.wait_for(req_b.result, timeout=MERGE_RESULT_TIMEOUT)
             await worker.stop()
 
         with contextlib.suppress(Exception):
@@ -711,10 +712,10 @@ class TestB4CancelBehavior:
             await asyncio.wait_for(gate_b_entered.wait(), timeout=15.0)
 
             gate_a_release.set()   # N fails → cascade
-            await asyncio.wait_for(req_a.result, timeout=15.0)
+            await asyncio.wait_for(req_a.result, timeout=MERGE_RESULT_TIMEOUT)
 
             gate_b_release.set()   # release leaked inner task
-            outcome_b = await asyncio.wait_for(req_b.result, timeout=15.0)
+            outcome_b = await asyncio.wait_for(req_b.result, timeout=MERGE_RESULT_TIMEOUT)
             await worker.stop()
 
         with contextlib.suppress(Exception):
