@@ -158,13 +158,13 @@ from orchestrator.suffix_graph import (  # noqa: F401  re-export shim
 )
 from orchestrator.task_status import WORKFLOW_PRESERVE_STATUSES
 from orchestrator.verify import (
-    PREEXISTING_BREAK_SKIP_CATEGORIES,
     VerifyResult,
     _derive_task_files_from_git,
     run_scoped_verification,
     run_verification,
     verify_failure_is_preexisting_on_main,
 )
+from orchestrator.verify_categories import PREEXISTING_BREAK_SKIP_CATEGORIES
 from orchestrator.verify_runner import (
     UNSCOPED_TYPECHECK_TIMEOUT_CATEGORY,
     HostAllocator,

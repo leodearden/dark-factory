@@ -167,3 +167,22 @@ def should_archive(category: str) -> bool:
     except ValueError:
         return False
     return CATEGORY_POLICY[member].archive
+
+
+def _assert_sentinels_disjoint(sentinels, enum_cls) -> None:
+    """Raise if any value in *sentinels* collides with an *enum_cls* member.
+
+    Reusable, unit-testable guard mirroring ``_validate_exhaustive``: proves
+    an out-of-band sentinel namespace (e.g. verify_runner's
+    UNSCOPED_TYPECHECK_* gate signals, injected into ``VerifyResult.category``
+    but never produced by ``_classify_failure``) is provably separate from
+    ``FailureCategory``'s closed 12-value output domain, so a future
+    accidental collision is caught fail-loud at import time instead of
+    silently conflating a gate signal with a real classifier category.
+    """
+    collisions = set(sentinels) & set(enum_cls)
+    if collisions:
+        raise AssertionError(
+            f'sentinel values collide with {enum_cls.__name__} members: '
+            f'{sorted(collisions)}'
+        )
