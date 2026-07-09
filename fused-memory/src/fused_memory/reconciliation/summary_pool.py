@@ -257,3 +257,162 @@ async def verify_cycle_summary_written(
             extra={'project_id': project_id, 'run_id': run_id, 'stage': stage},
         )
     return count
+
+
+def _extract_response_memory_ids(response) -> list:
+    """Defensively read ``memory_ids`` from an ``add_memory`` response.
+
+    Production calls return :class:`~fused_memory.models.memory.AddMemoryResponse`
+    (attribute access); tests commonly mock ``add_memory`` with a plain
+    ``{'memory_ids': [...]}`` dict. Supports both shapes so callers never need
+    to know which one they were handed. Mirrors
+    ``task_knowledge_sync._extract_response_memory_ids``.
+
+    Returns:
+        The ``memory_ids`` list, or ``[]`` if absent/falsy on either shape.
+    """
+    if isinstance(response, dict):
+        return response.get('memory_ids') or []
+    return getattr(response, 'memory_ids', None) or []
+
+
+def _build_fallback_summary_content(run_id: str, stage: str, attempt: int) -> str:
+    """Build the deterministic fallback-stub content for *run_id* / *stage*.
+
+    Leads with a fresh ``generate_summary_nonce('STAGE1')`` line — the same
+    CSPRNG dedup-defeat primitive the LLM per-cycle-summary path uses (task
+    1572/1590) — so repeat calls (the one-shot retry in
+    :func:`reconstruct_cycle_summary_stub`) never collide on Mem0's ~0.92
+    cosine-similarity dedup threshold. *attempt* does not otherwise affect
+    the content — distinctness between attempts comes entirely from the
+    fresh nonce — it is accepted purely for readability/parity with the
+    Stage 2 template this generalizes.
+
+    The body embeds ``run_id: <run_id>`` verbatim so a semantic search on the
+    run_id also matches this stub (Path-1 self-heal), in addition to the
+    metadata triple-filter (Path-2). Only Stage 1 is wired to this function
+    today (task 2366) — the nonce prefix is hardcoded to ``'STAGE1'``
+    regardless of *stage*; a future Stage 2 delegation would need to
+    parametrize this too.
+
+    Args:
+        run_id: Current reconciliation run identifier.
+        stage: The ``stage`` metadata tag value identifying this stage.
+        attempt: 1 for the first write, 2 for the dedup retry (informational).
+
+    Returns:
+        Fallback stub content, always starting with a fresh nonce line.
+    """
+    nonce = generate_summary_nonce('STAGE1')
+    return (
+        f'{nonce}\n'
+        f'Stage {stage} cycle summary (deterministic harness fallback stub) for '
+        f'run_id: {run_id} — attempt {attempt}. The LLM session exited without '
+        'writing its per-cycle summary; this stub was reconstructed by the '
+        'harness self-heal and reflects no substantive mutations.'
+    )
+
+
+async def reconstruct_cycle_summary_stub(
+    memory_service,
+    project_id: str,
+    run_id: str,
+    *,
+    stage: str,
+    recon_pool: str,
+    reconstruct_source: str,
+) -> int:
+    """Write ONE dedup-resilient fallback cycle_summary stub for *run_id*.
+
+    Generalizes ``task_knowledge_sync._reconstruct_stage2_summary`` (task
+    2366) to be stage-agnostic. Called when :func:`verify_cycle_summary_written`
+    has CONFIRMED (``verified_count == 0``) that no cycle_summary exists for
+    this run — closing the reliability gap left by a prompt-driven summary
+    write that a stage's LLM session can skip when it exhausts its
+    turn/token/context budget before reaching its final write.
+
+    Writes via ``add_memory`` tagged with the four canonical identity keys
+    (``kind='cycle_summary'``, ``stage``, ``run_id``, ``recon_pool``) plus
+    ``reconstructed=True``, and ``_source=reconstruct_source`` so the write is
+    auditable and distinguishable from a genuine agent write. The content
+    (:func:`_build_fallback_summary_content`) leads with a CSPRNG nonce to
+    defeat Mem0's dedup.
+
+    Because the root cause can itself be a dedup drop, the write is
+    dedup-resilient: the response's ``memory_ids`` is inspected
+    (:func:`_extract_response_memory_ids`), and if empty (a dedup no-op) the
+    write is retried exactly ONCE with a fresh nonce (metadata unchanged).
+    This mirrors the LLM prompt's own retry_nonce pattern without risking an
+    unbounded loop.
+
+    Best-effort: never raises. Any ``add_memory`` exception (first attempt or
+    retry) logs a WARNING and returns 0 — a memory-store outage degrades this
+    self-heal gracefully instead of failing the whole reconciliation cycle.
+
+    Args:
+        memory_service: Service with ``add_memory``.
+        project_id: Project scope for the write.
+        run_id: Current reconciliation run identifier — both the metadata
+            identity key and the ``causation_id`` for the write.
+        stage: The ``stage`` metadata tag value identifying this stage.
+        recon_pool: The ``recon_pool`` metadata tag value identifying this
+            stage's cycle-summary pool — so the stub participates in the
+            next cycle's pool-cap trim exactly like a real summary.
+        reconstruct_source: The ``_source`` value recorded on the write for
+            audit trail attribution.
+
+    Returns:
+        1 if a stub was successfully written (first attempt or retry — see
+        :func:`_extract_response_memory_ids`), else 0 (dedup-dropped twice,
+        or ``add_memory`` raised).
+    """
+    metadata = {
+        'kind': 'cycle_summary',
+        'stage': stage,
+        'run_id': run_id,
+        'recon_pool': recon_pool,
+        'reconstructed': True,
+    }
+    try:
+        response = await memory_service.add_memory(
+            content=_build_fallback_summary_content(run_id, stage, 1),
+            category='observations_and_summaries',
+            project_id=project_id,
+            metadata=metadata,
+            causation_id=run_id,
+            _source=reconstruct_source,
+        )
+        if _extract_response_memory_ids(response):
+            return 1
+
+        # Dedup no-op (Mem0 ~0.92 cosine similarity) — retry once with a fresh
+        # nonce so the leading content shifts past the threshold.
+        response = await memory_service.add_memory(
+            content=_build_fallback_summary_content(run_id, stage, 2),
+            category='observations_and_summaries',
+            project_id=project_id,
+            metadata=metadata,
+            causation_id=run_id,
+            _source=reconstruct_source,
+        )
+        if _extract_response_memory_ids(response):
+            return 1
+    except Exception:
+        logger.warning(
+            'reconciliation.reconstruct_cycle_summary_stub: '
+            'add_memory failed for run_id=%s stage=%s; skipping reconstruction',
+            run_id,
+            stage,
+            exc_info=True,
+            extra={'project_id': project_id, 'run_id': run_id, 'stage': stage},
+        )
+        return 0
+
+    logger.warning(
+        'reconciliation.reconstruct_cycle_summary_stub: '
+        'reconstruction write dedup-dropped twice for run_id=%s stage=%s; giving up',
+        run_id,
+        stage,
+        extra={'project_id': project_id, 'run_id': run_id, 'stage': stage},
+    )
+    return 0
