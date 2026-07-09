@@ -98,21 +98,13 @@ class TestIsSnapshotWriteBlocked:
 
         assert KNOW_LIVE_PROJECT_ID == 'know_live'
 
-    def test_dark_factory_project_id_constant_value(self):
-        """DARK_FACTORY_PROJECT_ID must equal 'dark_factory' (task 2325)."""
-        from fused_memory.reconciliation.policies.dark_factory import (
-            DARK_FACTORY_PROJECT_ID,
-        )
-
-        assert DARK_FACTORY_PROJECT_ID == 'dark_factory'
-
-    def test_solar_challenge_platform_project_id_constant_value(self):
-        """SOLAR_CHALLENGE_PLATFORM_PROJECT_ID must equal 'solar_challenge_platform' (task 2325)."""
-        from fused_memory.reconciliation.policies.solar_challenge_platform import (
-            SOLAR_CHALLENGE_PLATFORM_PROJECT_ID,
-        )
-
-        assert SOLAR_CHALLENGE_PLATFORM_PROJECT_ID == 'solar_challenge_platform'
+    # Note (reviewer finding, amendment round, test_quality): standalone
+    # constant-value tests for DARK_FACTORY_PROJECT_ID /
+    # SOLAR_CHALLENGE_PLATFORM_PROJECT_ID were dropped as near-tautological —
+    # they pinned a literal to its own value and added nothing beyond the
+    # registry-membership test immediately below plus the
+    # is_snapshot_write_blocked return-value tests above, which already cover
+    # the observable contract.
 
     def test_snapshot_write_blocked_projects_registry_includes_new_exemptions(self):
         """SNAPSHOT_WRITE_BLOCKED_PROJECTS must include both new exemptions (task 2325)."""
