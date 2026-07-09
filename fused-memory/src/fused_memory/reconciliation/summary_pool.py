@@ -194,3 +194,66 @@ async def pretrim_summary_pool(
         trim_source=trim_source,
         cap=max(cap - 1, 0),
     )
+
+
+async def verify_cycle_summary_written(
+    memory_service,
+    project_id: str,
+    run_id: str,
+    *,
+    stage: str,
+) -> int | None:
+    """Best-effort post-write check: count this run's cycle_summary in Mem0.
+
+    Generalizes ``task_knowledge_sync._verify_stage2_summary_written`` (task
+    2366) to be stage-agnostic. Counts memories matching the triple filter
+    ``{'kind':'cycle_summary','run_id':run_id,'stage':stage}`` via
+    ``count_memories_by_metadata`` (deterministic Qdrant count, NOT semantic
+    search). Logs a WARNING when count==0 or when the count call raises.
+
+    Best-effort: never raises, never retries. The LLM agent owns its own
+    count-verify-and-retry path; this is a redundant harness-side
+    observability/self-heal signal surfaced via a caller's
+    ``report.stats[...]``.
+
+    Args:
+        memory_service: Service with ``count_memories_by_metadata``.
+        project_id: Project scope for the count call.
+        run_id: Current reconciliation run identifier (used as filter key).
+        stage: The ``stage`` metadata tag value identifying this stage
+            (e.g. ``'memory_consolidator'``, ``'task_knowledge_sync'``).
+
+    Returns:
+        Count returned by ``count_memories_by_metadata`` when the call
+        succeeds — 0 means CONFIRMED absent (the count query ran cleanly and
+        found nothing). ``None`` when the count call itself raised — a
+        transient failure that does NOT confirm absence. This distinction is
+        load-bearing: callers must gate reconstruction on ``verified_count ==
+        0`` specifically, never on a falsy value, so a transient outage never
+        fabricates a reconstruction placeholder for a run whose real summary
+        may already exist.
+    """
+    try:
+        count = await memory_service.count_memories_by_metadata(
+            project_id=project_id,
+            filters={'kind': 'cycle_summary', 'run_id': run_id, 'stage': stage},
+        )
+    except Exception:
+        logger.warning(
+            'reconciliation.verify_cycle_summary_written: '
+            'count_memories_by_metadata failed for run_id=%s stage=%s; absence NOT '
+            'confirmed (transient failure, not treated as count==0)',
+            run_id,
+            stage,
+            extra={'project_id': project_id, 'run_id': run_id, 'stage': stage},
+        )
+        return None
+    if not count:
+        logger.warning(
+            'reconciliation.verify_cycle_summary_written: '
+            'no cycle_summary found for run_id=%s stage=%s after agent write',
+            run_id,
+            stage,
+            extra={'project_id': project_id, 'run_id': run_id, 'stage': stage},
+        )
+    return count
