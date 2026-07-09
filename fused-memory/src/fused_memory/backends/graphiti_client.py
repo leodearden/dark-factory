@@ -1008,19 +1008,15 @@ class GraphitiBackend:
         and from B's side (row: B.uuid, e.uuid) — two genuinely distinct rows because
         n.uuid differs.
 
-        Deduplicates by the (entity, edge-element) pair (WITH DISTINCT n, e), not
-        by the (uuid, fact, name) property tuple. FalkorDB does not enforce
-        property uniqueness, and redirect_node_edges (the merge path) copies
-        new.uuid = old.uuid onto redirected edges, so an entity can carry
-        multiple genuinely-distinct RELATES_TO relationships that share one
-        (uuid, fact, name) tuple — a property-tuple RETURN DISTINCT would
-        collapse those into a single row and undercount edge_count.
-        WITH DISTINCT n, e preserves the intended double-attribution (each
+        Deduplicates in Python, keyed on (n.uuid, e.uuid). RELATES_TO edge uuids
+        are unique graph-wide (task 2207 W6-delta stopped minting copied uuids in
+        redirect_node_edges; task 2210 W6-epsilon repaired legacy dup-uuid edges),
+        so keying on the (entity, edge-uuid) pair is equivalent to the prior
+        element-identity dedup: it preserves the intended double-attribution (each
         directed edge appears once under each endpoint entity, as distinct
-        (n, e) pairs) and still collapses the undirected self-loop
+        (n.uuid, e.uuid) pairs) and still collapses the undirected self-loop
         double-match (A→A edges, where both traversal directions yield the
-        identical (n, e) pair), while no longer collapsing distinct edges
-        that merely share copied properties.
+        identical (n.uuid, e.uuid) pair).
 
         Uses ro_query since no writes are performed.
 
@@ -1041,13 +1037,17 @@ class GraphitiBackend:
         cypher = (
             'MATCH (n:Entity)-[e:RELATES_TO]-() '
             'WHERE e.invalid_at IS NULL '
-            'WITH DISTINCT n, e '
             'RETURN n.uuid, e.uuid, e.fact, e.name'
         )
         result = await graph.ro_query(cypher)
+        seen: set[tuple[str, str]] = set()
         grouped: dict[str, list[EdgeDict]] = {}
         for row in (result.result_set or []):
-            entity_uuid = row[0]
+            entity_uuid, edge_uuid = row[0], row[1]
+            key = (entity_uuid, edge_uuid)
+            if key in seen:
+                continue
+            seen.add(key)
             grouped.setdefault(entity_uuid, []).append(self._edge_dict(row[1], row[2], row[3]))
         return grouped
 
