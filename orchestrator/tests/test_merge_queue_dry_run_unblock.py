@@ -36,6 +36,8 @@ from orchestrator.merge_queue import (
     TRANSIENT_INFRA_REASON_PREFIX,
     MergeOutcome,
     MergeRequest,
+    RealMergeItem,
+    SpeculativeMergeWorker,
     _DryRunInvestigationHandles,
     _run_post_merge_verify,
 )
@@ -45,6 +47,7 @@ from orchestrator.verify_runner import (
     FLOCK_CONTENTION_CATEGORY,
     UNSCOPED_TYPECHECK_FAILED_CATEGORY,
     UNSCOPED_TYPECHECK_TIMEOUT_CATEGORY,
+    HostLease,
 )
 
 PERSISTENT_ENOSPC_RESULT = VerifyResult(
@@ -607,3 +610,110 @@ class TestInflightDedupSkipsDuplicate:
         assert outcome is not None
         assert outcome.status == 'blocked'
         run_dry_run_mock.assert_not_awaited()
+
+
+class TestWorkerStoresAndThreadsHandles:
+    """Step-11 (RED): SpeculativeMergeWorker accepts optional
+    scheduler/mcp/usage_gate/cost_store handles (harness-owned; the worker
+    itself holds none of them today), stores them, and bundles them into a
+    single self._dry_run_handles so _run_post_merge_verify stays a pure git
+    engine (mirrors the train_callback_factory opaque-injection pattern at
+    harness.py:6468-6472 — the worker never imports the scheduler).
+    """
+
+    def test_worker_stores_handles_and_threads_them(self, tmp_path: Path) -> None:
+        git_ops = _make_git_ops(tmp_path)
+        scheduler = MagicMock()
+        mcp = MagicMock()
+        usage_gate = MagicMock()
+        cost_store = MagicMock()
+
+        worker = SpeculativeMergeWorker(
+            git_ops, asyncio.Queue(),
+            scheduler=scheduler, mcp=mcp,
+            usage_gate=usage_gate, cost_store=cost_store,
+        )
+
+        assert worker._scheduler is scheduler
+        assert worker._mcp is mcp
+        assert worker._usage_gate is usage_gate
+        assert worker._cost_store is cost_store
+        assert isinstance(worker._background_tasks, set)
+        assert worker._dry_run_handles.scheduler is scheduler
+        assert worker._dry_run_handles.mcp is mcp
+        assert worker._dry_run_handles.usage_gate is usage_gate
+        assert worker._dry_run_handles.cost_store is cost_store
+        assert worker._dry_run_handles.background_tasks is worker._background_tasks, (
+            'handles.background_tasks must be the SAME set instance as '
+            'worker._background_tasks — a spawned investigation task strong-ref '
+            'must live exactly as long as the worker'
+        )
+
+    def test_minimal_construction_still_works(self, tmp_path: Path) -> None:
+        """The existing git_ops+queue-only construction convention (used
+        throughout the test suite) must stay green — the four new handle
+        params default to None."""
+        git_ops = _make_git_ops(tmp_path)
+        worker = SpeculativeMergeWorker(git_ops, asyncio.Queue())
+
+        assert worker._scheduler is None
+        assert worker._mcp is None
+        assert worker._usage_gate is None
+        assert worker._cost_store is None
+        assert worker._dry_run_handles.scheduler is None
+        assert worker._dry_run_handles.mcp is None
+
+
+class TestRunInflightVerifyPassesHandles:
+    """Step-11 (RED): the production SpeculativeMergeWorker._run_inflight_verify
+    call site must pass dry_run_handles=self._dry_run_handles into
+    _run_post_merge_verify (mirrors
+    test_merge_queue_multihost_wiring.py's
+    TestRunInflightVerifyThreadsEscalationQueue, which pins the same
+    call-site-threading shape for self._escalation_queue).
+    """
+
+    def test_run_inflight_verify_passes_handles(self, tmp_path: Path) -> None:
+        git_ops = _make_git_ops(tmp_path)
+        config = _make_config(tmp_path)
+        scheduler = MagicMock()
+        worker = SpeculativeMergeWorker(
+            git_ops, asyncio.Queue(), scheduler=scheduler,
+        )
+
+        req = _make_req('99', tmp_path / 'task-wt', config)
+        (tmp_path / 'task-wt').mkdir()
+        merge_wt = tmp_path / 'merge-wt'
+        merge_wt.mkdir()
+        merge_result = MagicMock()
+        merge_result.merge_commit = 'abc123def456789abc1'
+        item = RealMergeItem(
+            request=req,
+            merge_result=merge_result,
+            merge_wt=merge_wt,
+            base_sha='base123',
+            speculative=False,
+        )
+
+        # REMOTE lease — bypasses the local warm-swap path, keeping this
+        # test focused on the dry_run_handles kwarg (mirrors
+        # test_merge_queue_multihost_wiring.py's REMOTE-lease builder).
+        fake_runner = MagicMock()
+        fake_runner.name = 'leo-laptop'
+        fake_runner.is_local = False
+        lease = HostLease(name='leo-laptop', runner=fake_runner, is_local=False)
+
+        spy = AsyncMock(return_value=None)
+
+        async def _run() -> None:
+            with patch('orchestrator.merge_queue._run_post_merge_verify', new=spy):
+                await worker._run_inflight_verify(item, lease)
+
+        asyncio.run(_run())
+
+        assert spy.await_args is not None, '_run_post_merge_verify was not called'
+        assert spy.await_args.kwargs.get('dry_run_handles') is worker._dry_run_handles, (
+            '_run_inflight_verify must pass dry_run_handles=self._dry_run_handles '
+            'into _run_post_merge_verify — the worker holds the bundled handles '
+            'but never threaded them through'
+        )
