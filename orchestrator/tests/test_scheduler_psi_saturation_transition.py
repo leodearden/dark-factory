@@ -103,14 +103,14 @@ def _psi(
 # ---------------------------------------------------------------------------
 # Multi-tick transition harness
 #
-# GREEN (step-2): the core of the reusable harness — a controllable clock, a
-# mutable PSI feed, and a driver that wraps one real Scheduler + real
-# EventStore and models just enough of the harness main loop (live in-flight
-# tracking via get_tasks) to drive multi-tick transitions.  Completion
-# (_Driver.complete) and max_concurrent enforcement
-# (_Driver.run_until_quiescent) are deliberately NOT here yet — they land in
-# step-4 and step-6 respectively, keeping Scenarios 2 and 3 genuinely RED
-# until their own impl steps.
+# A controllable clock, a mutable PSI feed, and a driver that wraps one real
+# Scheduler + real EventStore and models the pieces of the harness main loop
+# that acquire_next() deliberately does not own: live in-flight tracking via
+# get_tasks, scripted task completion (_Driver.complete, via the REAL
+# scheduler.release()), and a max_concurrent cap (_Driver.run_until_quiescent)
+# mirroring the harness asyncio.Semaphore. Every dispatch decision itself is
+# still made by the real scheduler/lock-table/event-store — the driver only
+# supplies the surrounding bookkeeping.
 # ---------------------------------------------------------------------------
 
 
@@ -171,9 +171,9 @@ class _Driver:
 
     Models the pieces of the harness main loop that ``acquire_next()``
     itself deliberately does not own: a live ``get_tasks`` view over an
-    active-task list, and (in later steps) completion + a max-concurrent
-    cap.  Every dispatch decision is made by the REAL scheduler/lock-table/
-    event-store — the driver only supplies the surrounding bookkeeping.
+    active-task list, scripted completion, and a max-concurrent cap.  Every
+    dispatch decision is made by the REAL scheduler/lock-table/event-store —
+    the driver only supplies the surrounding bookkeeping.
     """
 
     def __init__(self, scheduler: Scheduler, event_store: EventStore) -> None:
@@ -353,9 +353,10 @@ class TestPsiSaturationTransition:
     # -----------------------------------------------------------------------
     # Scenario 2 — deadlock-freedom at the PEAK of sustained saturation
     #
-    # RED (step-3): drains an in-flight heavy via ``_Driver.complete()``,
-    # which does not exist yet — AttributeError is the RED failure; step-4
-    # builds exactly the completion capability this test exercises.
+    # Drains an in-flight heavy via ``_Driver.complete()`` while PSI stays
+    # saturated throughout, proving the hold predicate
+    # (saturated AND in_flight>=floor) makes "held with < floor in flight"
+    # unreachable by construction.
     # -----------------------------------------------------------------------
 
     async def test_floor_holds_under_sustained_saturation(self, tmp_path) -> None:
@@ -428,11 +429,11 @@ class TestPsiSaturationTransition:
     # -----------------------------------------------------------------------
     # Scenario 3 — work-conserving restore up to max_concurrent_tasks
     #
-    # RED (step-5): recovers via ``_Driver.run_until_quiescent()`` and reads
-    # ``deferred_events_since()`` — neither exists yet.  AttributeError on
-    # run_until_quiescent is the RED failure; step-6 builds exactly the
-    # cap-enforcement + event-window-partition capabilities this test
-    # exercises.
+    # Recovers via ``_Driver.run_until_quiescent()`` (fills heavy in-flight up
+    # to the max_concurrent_tasks cap, since acquire_next itself enforces no
+    # such cap) and partitions the event stream with
+    # ``deferred_events_since()`` to prove no dispatch_deferred event occurs
+    # after the recovery flip (no residual hold).
     # -----------------------------------------------------------------------
 
     async def test_recovery_restores_full_dispatch_up_to_cap(self, tmp_path) -> None:
