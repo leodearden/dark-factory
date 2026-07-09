@@ -126,3 +126,63 @@ class TestItemLifecycleRegistry:
             registry.register('mr-aaaaaaaa', initial=ItemLifecycleState.MERGING)
 
         assert registry.current('mr-aaaaaaaa') == ItemLifecycleState.QUEUED
+
+
+# ---------------------------------------------------------------------------
+# step-5 RED / step-6 GREEN: transition() happy path + single-source
+# ---------------------------------------------------------------------------
+
+
+class TestItemLifecycleTransitionHappyPath:
+    """transition() drives the registry through the canonical legal
+    sequence, and the registry is the single source of truth after each
+    move (task 2164 step-5).
+
+    RED until step-6 GREEN adds the _LEGAL_TRANSITIONS table and implements
+    ItemLifecycle.transition().
+    """
+
+    def test_full_canonical_sequence_ends_at_terminal(self) -> None:
+        from orchestrator.merge_queue import ItemLifecycle, ItemLifecycleState
+
+        registry = ItemLifecycle()
+        rid = 'mr-aaaaaaaa'
+        registry.register(rid)
+
+        sequence = [
+            ItemLifecycleState.QUEUED,
+            ItemLifecycleState.LANE_BUFFERED,
+            ItemLifecycleState.MERGING,
+            ItemLifecycleState.AWAITING_VERIFY,
+            ItemLifecycleState.DISPATCHING,
+            ItemLifecycleState.VERIFYING,
+            ItemLifecycleState.GATE_REVERIFY,
+            ItemLifecycleState.FINALIZING,
+            ItemLifecycleState.TERMINAL,
+        ]
+
+        for from_state, to_state in zip(sequence, sequence[1:], strict=True):
+            registry.transition(rid, from_state, to_state)
+            assert registry.current(rid) == to_state  # registry is the single source
+
+        assert registry.current(rid) == ItemLifecycleState.TERMINAL
+
+    def test_redispatch_bounce_is_a_legal_in_place_retry(self) -> None:
+        """A representative in-place retry branch: DISPATCHING ->
+        REDISPATCH_PARKED -> DISPATCHING (the redispatch bounce evidenced
+        by ``_redispatch``)."""
+        from orchestrator.merge_queue import ItemLifecycle, ItemLifecycleState
+
+        registry = ItemLifecycle()
+        rid = 'mr-bbbbbbbb'
+        registry.register(rid, initial=ItemLifecycleState.DISPATCHING)
+
+        registry.transition(
+            rid, ItemLifecycleState.DISPATCHING, ItemLifecycleState.REDISPATCH_PARKED,
+        )
+        assert registry.current(rid) == ItemLifecycleState.REDISPATCH_PARKED
+
+        registry.transition(
+            rid, ItemLifecycleState.REDISPATCH_PARKED, ItemLifecycleState.DISPATCHING,
+        )
+        assert registry.current(rid) == ItemLifecycleState.DISPATCHING
