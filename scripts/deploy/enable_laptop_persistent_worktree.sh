@@ -11,6 +11,14 @@ set -euo pipefail
 # script does not flip the production flag as part of authoring it -- it is
 # exercised in tests only, against fake ssh targets.
 #
+# Usage:
+#   enable_laptop_persistent_worktree.sh [--check|--dry-run]
+#
+# --check / --dry-run: print the intended change and exit 0 without
+# mutating the remote config. If the flag is already enabled, --check
+# reports the same "already enabled (no-op)" state as apply, since applying
+# would change nothing.
+#
 # Env overrides:
 #   SSH                - ssh invocation prefix
 #                         (default: "ssh -o BatchMode=yes -o ConnectTimeout=10")
@@ -28,16 +36,27 @@ LAPTOP_CONFIG_PATH="${LAPTOP_CONFIG_PATH:-/home/leo/.config/orchestrator/reify-l
 REMOTE_PYTHON="${REMOTE_PYTHON:-python3}"
 BACKUP_LABEL="${BACKUP_LABEL:-$(date +%Y%m%d%H%M%S)}"
 
+MODE="apply"
+
+for arg in "$@"; do
+    case "$arg" in
+        --check|--dry-run)
+            MODE="check"
+            ;;
+    esac
+done
+
 # Single-quoted heredoc: everything inside is expanded on the REMOTE host by
-# `bash -s -- "$CONFIG" apply "$LABEL" "$PY"`, not locally. Positional args:
+# `bash -s -- "$CONFIG" "$MODE" "$LABEL" "$PY"`, not locally. Positional args:
 #   $1 = CONFIG (path to the laptop's orchestrator config)
-#   $2 = MODE   (apply path only for now)
+#   $2 = MODE   (apply | check)
 #   $3 = LABEL  (backup-file label; unused until the apply edit lands)
 #   $4 = PY     (remote python interpreter)
-if ! $SSH "$LAPTOP_HOST" bash -s -- "$LAPTOP_CONFIG_PATH" apply "$BACKUP_LABEL" "$REMOTE_PYTHON" <<'REMOTE_PAYLOAD_EOF'
+if ! $SSH "$LAPTOP_HOST" bash -s -- "$LAPTOP_CONFIG_PATH" "$MODE" "$BACKUP_LABEL" "$REMOTE_PYTHON" <<'REMOTE_PAYLOAD_EOF'
 set -euo pipefail
 
 CONFIG="$1"
+MODE="$2"
 LABEL="$3"
 PY="$4"
 
@@ -54,8 +73,17 @@ sys.exit(0 if (d.get('git') or {}).get('persistent_merge_worktree') is True else
 " "$CONFIG"
 }
 
+print_intended_diff() {
+    echo "+  persistent_merge_worktree: true   (under git: in ${CONFIG})"
+}
+
 if already_enabled; then
     echo "enable-laptop-persistent-worktree: already enabled (no-op)"
+    exit 0
+fi
+
+if [[ "$MODE" == "check" ]]; then
+    print_intended_diff
     exit 0
 fi
 
