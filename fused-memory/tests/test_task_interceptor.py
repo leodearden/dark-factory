@@ -4322,7 +4322,7 @@ class TestSubmitTaskGuardrail:
         # Direct _db access is intentional: we're pinning the storage-layer
         # serialisation contract, which has no public query path.  This mirrors
         # the pattern used by sibling tests in this class (e.g.
-        # test_submit_task_rejects_dark_factory_paths_in_wrong_project).
+        # test_submit_task_advises_dark_factory_paths_in_wrong_project).
         db = ticket_store._db
         assert db is not None
         cursor = await db.execute(

@@ -1259,7 +1259,11 @@ class TaskInterceptor:
 
         A no-op (``ok``) when no :attr:`_prefix_registry` is configured —
         without a registry there is no per-project owner map to classify a
-        file against.
+        file against.  Since task 2208 the constructor always defaults
+        :attr:`_prefix_registry` to ``ProjectPrefixRegistry.default()``, so
+        this branch is unreachable via normal construction; it is kept as a
+        defensive belt-and-suspenders guard for any caller that assigns
+        ``_prefix_registry = None`` directly (e.g. a test or subclass).
         """
         registry = self._prefix_registry
         if registry is None:
@@ -1348,6 +1352,9 @@ class TaskInterceptor:
             return
         registry = self._prefix_registry
         suggested_root: str | None = None
+        # `registry is not None` is defensive belt-and-suspenders here too
+        # (see :meth:`_files_scope_check`): the constructor guarantees a
+        # non-None :attr:`_prefix_registry` since task 2208.
         if verdict.suggested_project and registry is not None:
             suggested_root = registry.root_for_project(verdict.suggested_project)
         candidate_title = (candidate.title if candidate else '') or str(
