@@ -649,7 +649,7 @@ def test_cancel_verify_tree_kills_under_live_watchdog(tmp_path, monkeypatch):
     """
     repo, head_sha = _setup_verify_repo(tmp_path)
     config_obj = OrchestratorConfig(project_root=repo)
-    worktree_base = GitOps(config_obj.git, repo).worktree_base
+    worktree_base = worktree_base_for(repo)
     cfg_file = tmp_path / 'config.yaml'
     write_verify_config(cfg_file, repo, persistent_merge_worktree=False)
 
