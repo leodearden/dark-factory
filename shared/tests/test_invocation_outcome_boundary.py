@@ -372,3 +372,57 @@ class TestB2OpenInvariantProperty:
         assert await gate.wait_for_open(timeout=0) is False
 
         await _drain_bg(gate)
+
+
+# ---------------------------------------------------------------------------
+# B3 -- the checked-in golden corpus classifies as recorded (producer/
+# classifier side), and every CapHit record drives the selected account to
+# CAPPED end-to-end when replayed through invoke_with_cap_retry (consumer
+# side, the boundary value-add beyond test_invocation_outcome.py's B3).
+# ---------------------------------------------------------------------------
+
+_CORPUS = load_corpus()
+_CORPUS_IDS = [r['id'] for r in _CORPUS]
+_CAP_HIT_RECORDS = [r for r in _CORPUS if r['expected'] == 'CapHit']
+_CAP_HIT_IDS = [r['id'] for r in _CAP_HIT_RECORDS]
+
+
+class TestB3ClassifierGoldenCorpus:
+    """Producer/classifier side: every corpus record classifies as recorded."""
+
+    @pytest.mark.parametrize('record', _CORPUS, ids=_CORPUS_IDS)
+    def test_corpus_record_classifies_as_expected(self, record):
+        result = agent_result_from_record(record)
+        outcome = classify_invocation(
+            result,
+            strict_confirm=record['strict_confirm'],
+            backend=record.get('backend', 'claude'),
+        )
+
+        expected_cls = _VARIANT_CLASSES[record['expected']]
+        assert isinstance(outcome, expected_cls), (
+            f'{record["id"]}: expected {record["expected"]}, '
+            f'got {type(outcome).__name__} ({outcome!r})'
+        )
+
+        resets_at_expectation = record.get('resets_at')
+        if record['expected'] == 'CapHit' and resets_at_expectation == 'set':
+            assert isinstance(outcome, CapHit)
+            assert outcome.resets_at is not None, (
+                f'{record["id"]}: expected resets_at to be set, got None'
+            )
+        elif record['expected'] == 'CapHit' and resets_at_expectation == 'none':
+            assert isinstance(outcome, CapHit)
+            assert outcome.resets_at is None, (
+                f'{record["id"]}: expected resets_at to be None, got {outcome.resets_at!r}'
+            )
+
+
+@pytest.mark.asyncio
+class TestB3CapHitDrivesAccountCapped:
+    """Consumer side (two-way): every CapHit corpus record, replayed through
+    the fake-CLI harness, transitions the selected account to CAPPED."""
+
+    @pytest.mark.parametrize('record', _CAP_HIT_RECORDS, ids=_CAP_HIT_IDS)
+    async def test_cap_hit_record_drives_account_to_capped(self, record):
+        await _drive_caphit_record_to_capped(record)
