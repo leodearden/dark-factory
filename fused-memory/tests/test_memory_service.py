@@ -467,6 +467,7 @@ class TestAddSystemRecord:
             causation_id='c1',
         )
 
+        assert service.mem0.add_system_record.await_args is not None
         call_kwargs = service.mem0.add_system_record.await_args.kwargs
         assert call_kwargs['metadata']['recon_pool'] == 'stage2_cycle_summary'
 
@@ -484,6 +485,7 @@ class TestAddSystemRecord:
             causation_id='c-xyz',
         )
 
+        assert service.mem0.add_system_record.await_args is not None
         call_kwargs = service.mem0.add_system_record.await_args.kwargs
         assert call_kwargs['metadata']['run_id'] == 'c-xyz'
 
