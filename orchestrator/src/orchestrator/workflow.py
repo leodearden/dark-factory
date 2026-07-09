@@ -63,6 +63,7 @@ from orchestrator.git_ops import (
     WarmLanePoolExhausted,
     WarmLanePoolHardDown,
     WarmLaneRequeue,
+    WorktreeConflictError,
     _run,
     is_wip_safety_commit,
 )
@@ -2293,6 +2294,26 @@ class TaskWorkflow:
             # Non-infra OSError — treat the same as the broad except below.
             logger.exception(f'Task {self.task_id} workflow error: {e}')
             return await self._mark_blocked(f'Workflow error: {e}')
+
+        except WorktreeConflictError as e:
+            # esc-2128-8: a WIP-save commit() (inter-iteration rebase, or the
+            # requeue-rebase reuse path) hit a worktree with unresolved
+            # (unmerged-index) conflicts and refused to stage/commit rather
+            # than snapshotting conflict markers verbatim.  Route to a
+            # targeted per-task BLOCKED + human L1 — the steward corrective
+            # loop cannot resolve a conflicted worktree, so skip it entirely
+            # (mirrors the VerifyInfraError/infra_issue handling above, not
+            # _submit_halt_escalation_and_wait, which is merge-queue-halt
+            # ownership and irrelevant to a task-worktree rebase).
+            logger.warning(
+                'Task %s: WorktreeConflictError escaped run() — %s',
+                self.task_id, e,
+            )
+            return await self._mark_blocked(
+                f'WIP-save aborted: unresolved conflict in worktree ({e})',
+                category='wip_conflict',
+                escalate_to_human=True,
+            )
 
         except Exception as e:
             logger.exception(f'Task {self.task_id} workflow error: {e}')
