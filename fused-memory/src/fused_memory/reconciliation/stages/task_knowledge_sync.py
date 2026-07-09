@@ -1239,6 +1239,20 @@ async def _gc_recon_markers(
     fail-safe to ``[]`` — an empty list makes ``gc()`` run its expiry-only
     branch, preserving the old sweeps' fail-safe KEEP direction.
 
+    **Bounding (task 2228 W5-κ amendment)**: before being forwarded to
+    ``gc()``, a non-empty ``terminal_task_ids`` is intersected with
+    :meth:`~fused_memory.reconciliation.recon_ledger.ReconLedgerStore.marker_task_ids`
+    — the set of task ids that actually have a marker row in the ledger right
+    now. A terminal id with no marker row can never match ``gc()``'s
+    ``task_id IN (...)`` clause, so dropping it keeps the DELETE's
+    bind-parameter count tied to ledger occupancy instead of the project's
+    full (monotonically growing) terminal-task history, which could
+    otherwise approach SQLite's ``SQLITE_MAX_VARIABLE_NUMBER`` on a large,
+    mature project. A ``marker_task_ids`` failure is itself fail-safe: it
+    degrades ``terminal_task_ids`` to ``[]`` (logged WARNING) rather than
+    forwarding the unbounded list or aborting the whole GC pass, so ``gc()``
+    still performs its expiry-only DELETE that cycle.
+
     Args:
         memory_service: Service that may expose a ``recon_ledger``
             (:class:`~fused_memory.reconciliation.recon_ledger.ReconLedgerStore`)
@@ -1265,6 +1279,19 @@ async def _gc_recon_markers(
 
     now_iso = _assume_utc(now or datetime.now(UTC)).isoformat()
     terminal_task_ids = await _resolve_terminal_task_ids(taskmaster, scope, run_id)
+
+    if terminal_task_ids:
+        try:
+            resident_ids = await ledger.marker_task_ids(scope.project_id)
+            terminal_task_ids = [tid for tid in terminal_task_ids if tid in resident_ids]
+        except Exception:
+            logger.warning(
+                'reconciliation._gc_recon_markers: ledger.marker_task_ids failed for '
+                'project_id=%s — bounding terminal_task_ids to [] (expiry-only gc this cycle)',
+                scope.project_id,
+                extra={'project_id': scope.project_id, 'run_id': run_id},
+            )
+            terminal_task_ids = []
 
     try:
         return await ledger.gc(scope.project_id, now_iso, terminal_task_ids)

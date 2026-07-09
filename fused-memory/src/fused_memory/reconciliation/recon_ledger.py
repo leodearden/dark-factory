@@ -259,6 +259,39 @@ class ReconLedgerStore:
         row = await cursor.fetchone()
         return row is not None
 
+    async def marker_task_ids(self, project_id: str) -> set[str]:
+        """Return the distinct non-empty ``task_id`` values across
+        :data:`MARKER_KINDS` rows for *project_id*.
+
+        Callers (:func:`~fused_memory.reconciliation.stages.task_knowledge_sync._gc_recon_markers`,
+        task 2228 W5-κ amendment) use this to bound an otherwise
+        project-lifetime-sized terminal-task-id list down to only the ids
+        that could possibly match :meth:`gc`'s ``task_id IN (...)`` clause —
+        a terminal id with no marker row in the ledger contributes nothing to
+        that DELETE, so intersecting it away before the call keeps the
+        bind-parameter count tied to current ledger occupancy (bounded by
+        marker TTL and this GC pass itself) rather than to the project's
+        total terminal-task count, which only grows over the project's
+        lifetime and could otherwise approach SQLite's
+        ``SQLITE_MAX_VARIABLE_NUMBER`` on a large, mature project.
+
+        Uses ``SELECT DISTINCT`` scoped to ``project_id`` and
+        ``record_kind IN MARKER_KINDS``; rows with ``task_id = ''`` (e.g.
+        project-scoped ``cycle_summary`` records, which are not per-task
+        markers) are excluded.
+        """
+        db = self._require_db()
+        marker_placeholders = ','.join('?' * len(MARKER_KINDS))
+        cursor = await db.execute(
+            f"""
+            SELECT DISTINCT task_id FROM recon_ledger
+            WHERE project_id = ? AND record_kind IN ({marker_placeholders}) AND task_id != ''
+            """,
+            (project_id, *MARKER_KINDS),
+        )
+        rows = await cursor.fetchall()
+        return {row['task_id'] for row in rows}
+
     async def gc(
         self,
         project_id: str,
