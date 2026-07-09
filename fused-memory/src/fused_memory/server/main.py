@@ -550,10 +550,19 @@ async def run_server():
         )
     else:
         prefix_registry = ProjectPrefixRegistry.default()
-        scope_violation_escalator = None
+        # Amendment (task 2208 review): construct a real escalator here too,
+        # not None. Since D2 made PROSE hits universally advisory (never a
+        # hard reject), single-project mode needs this so a prose misroute
+        # still surfaces on the operator queue instead of passing with only
+        # a `possible_scope_mismatch` metadata marker. Zero-arg construction
+        # — identical to the multi-project branch above — and a no-op when
+        # the optional `escalation` package isn't installed (see
+        # ScopeViolationEscalator's module docstring).
+        scope_violation_escalator = ScopeViolationEscalator()
         _multi_project_mode = False
         logger.info(
             '  Path-scope guard: single-project mode (dark_factory default registry; '
+            'scope-violation escalations still queued; '
             'set DASHBOARD_KNOWN_PROJECT_ROOTS to enable multi-project)',
         )
 
