@@ -7,6 +7,7 @@ Steps covered in this file:
   step-7  RED  — cancel_and_release happy path
   step-9  RED  — cancel_and_release cancel-FAIL + PARK + probe
   1795/step-1  RED  — clear_quarantine + quarantined_remote_runners
+  2369/step-1  RED  — cancel_and_release idempotency (double-release, null-lease)
 """
 
 from __future__ import annotations
@@ -622,3 +623,77 @@ class TestHostAllocatorClearQuarantineAsync:
         re_acquired = alloc.acquire_remote()
         assert re_acquired is not None
         assert re_acquired.name == 'remoteA'
+
+
+# ---------------------------------------------------------------------------
+# 2369/step-1 RED: cancel_and_release idempotency — already-released (FREE) slot guard
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestHostAllocatorCancelReleaseIdempotent:
+    """cancel_and_release must be idempotent: a repeat call on an already-FREE slot
+    is a no-op that does NOT re-issue the remote cancel RPC (task 2369).
+    """
+
+    def _local_factory(self):
+        return _FakeLocalRunner()
+
+    async def test_double_release_does_not_reissue_cancel_rpc(self):
+        """A second cancel_and_release on an already-released remote lease must not
+        re-issue cancel_verify() — the slot is already FREE, so there is nothing to cancel.
+        """
+        from orchestrator.verify_runner import HostAllocator
+
+        remote_a = _FakeRemoteRunnerCancellable('remoteA', cancel_rc=0)
+        alloc = HostAllocator([remote_a], quarantine=set())
+
+        await alloc.acquire(self._local_factory)                  # local busy (force overflow)
+        remote_lease = await alloc.acquire(self._local_factory)   # remoteA
+        assert remote_lease is not None
+
+        first = await alloc.cancel_and_release(remote_lease)
+        assert first is True
+        assert remote_a.cancel_verify_called == 1
+        assert alloc.is_busy('remoteA') is False
+
+        # Second call on the same (now-stale) lease — slot is already FREE.
+        second = await alloc.cancel_and_release(remote_lease)
+        assert second is True
+        assert remote_a.cancel_verify_called == 1   # RPC NOT re-issued
+        assert alloc.is_busy('remoteA') is False
+
+    async def test_double_release_nonzero_recancel_does_not_park(self):
+        """Even if a re-issued cancel would fail (rc != 0), the already-FREE guard
+        must prevent the re-issue entirely so a healthy, released slot is never PARKed.
+        """
+        from orchestrator.verify_runner import HostAllocator
+
+        class _FirstCancelCleanThenFailing(_FakeRemoteRunnerCancellable):
+            """cancel_verify() returns 0 on the first call, 1 on every call thereafter."""
+
+            async def cancel_verify(self) -> int:
+                self.cancel_verify_called += 1
+                return 0 if self.cancel_verify_called == 1 else 1
+
+        remote_a = _FirstCancelCleanThenFailing('remoteA', probe_sequence=[False] * 20)
+        alloc = HostAllocator([remote_a], quarantine=set())
+
+        await alloc.acquire(self._local_factory)
+        remote_lease = await alloc.acquire(self._local_factory)   # remoteA
+        assert remote_lease is not None
+
+        async def noop_sleep(_: float) -> None:
+            pass
+
+        first = await alloc.cancel_and_release(remote_lease, sleep=noop_sleep)
+        assert first is True
+        assert alloc.is_busy('remoteA') is False
+
+        # A real re-issue here would return rc=1 and PARK the slot. The guard must
+        # short-circuit before the RPC, so the slot stays FREE and probe_clean is
+        # never invoked.
+        second = await alloc.cancel_and_release(remote_lease, sleep=noop_sleep)
+        assert second is True
+        assert alloc.is_busy('remoteA') is False
+        assert remote_a.probe_clean_called == 0
