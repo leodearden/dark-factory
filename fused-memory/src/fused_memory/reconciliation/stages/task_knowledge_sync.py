@@ -191,7 +191,7 @@ def _suppress_same_run_human_operator_dups(
 async def _resolve_live_status(
     op: dict,
     taskmaster,
-    project_root: str,
+    project_root: ProjectRoot,
     status_cache: dict[str, str] | None,
     op_name: str,
     *,
@@ -274,7 +274,7 @@ async def _resolve_live_status(
 async def _classify_terminal_state_violations(
     ops: list[dict],
     taskmaster,
-    project_root: str,
+    project_root: ProjectRoot,
     agent_id: str,
     status_cache: dict[str, str] | None = None,
 ) -> list[dict]:
@@ -344,7 +344,7 @@ async def _classify_terminal_state_violations(
 async def _verify_set_task_status_post_action(
     ops: list[dict],
     taskmaster,
-    project_root: str,
+    project_root: ProjectRoot,
     agent_id: str,
     status_cache: dict[str, str] | None = None,
 ) -> list[dict]:
@@ -429,7 +429,7 @@ _STAGE2_STALL_SNAPSHOT_KEYS: tuple[str, ...] = ('snapshot_status', 'observed_sta
 async def _check_stall_guard_freshness(
     ops: list[dict],
     taskmaster,
-    project_root: str,
+    project_root: ProjectRoot,
     agent_id: str,
     status_cache: dict[str, str] | None = None,
 ) -> list[dict]:
@@ -517,7 +517,7 @@ async def _check_stall_guard_freshness(
 
 async def _classify_live_workflow_status_writes(
     ops: list[dict],
-    project_root: str,
+    project_root: ProjectRoot,
     agent_id: str,
     *,
     now=None,
@@ -2460,7 +2460,7 @@ async def _write_escalation_markers(
 
 def _render_live_workflow_section(
     tasks: list[dict],
-    project_root: str,
+    project_root: ProjectRoot,
     *,
     now: datetime | None = None,
 ) -> str:
@@ -2979,7 +2979,7 @@ class TaskKnowledgeSync(BaseStage):
         # Guard 1 — terminal-state pre-check
         if self.taskmaster and self.project_root:
             terminal_violations = await _classify_terminal_state_violations(
-                ops, self.taskmaster, self.project_root, _stage_agent_id, status_cache
+                ops, self.taskmaster, self.scope.project_root, _stage_agent_id, status_cache
             )
             if terminal_violations:
                 report.stats['not_applicable_count'] = report.stats.get(
@@ -3004,7 +3004,7 @@ class TaskKnowledgeSync(BaseStage):
         # Guard 2 — stall-guard freshness gate
         if self.taskmaster and self.project_root:
             freshness_violations = await _check_stall_guard_freshness(
-                ops, self.taskmaster, self.project_root, _stage_agent_id, status_cache
+                ops, self.taskmaster, self.scope.project_root, _stage_agent_id, status_cache
             )
             if freshness_violations:
                 report.stats['stall_guard_freshness_violations'] = report.stats.get(
@@ -3025,7 +3025,7 @@ class TaskKnowledgeSync(BaseStage):
         # Guard 3 — post-action set_task_status verification
         if self.taskmaster and self.project_root:
             sts_mismatches = await _verify_set_task_status_post_action(
-                ops, self.taskmaster, self.project_root, _stage_agent_id, status_cache
+                ops, self.taskmaster, self.scope.project_root, _stage_agent_id, status_cache
             )
             if sts_mismatches:
                 report.stats['set_task_status_post_action_mismatches'] = report.stats.get(
@@ -3110,7 +3110,7 @@ class TaskKnowledgeSync(BaseStage):
         # (stats + log) for observability.  Actual prevention is the Stage 2 prompt.
         if self.project_root:
             live_workflow_violations = await _classify_live_workflow_status_writes(
-                ops, self.project_root, _stage_agent_id
+                ops, self.scope.project_root, _stage_agent_id
             )
             if live_workflow_violations:
                 report.stats['live_workflow_status_writes'] = report.stats.get(
@@ -3144,7 +3144,7 @@ class TaskKnowledgeSync(BaseStage):
         if self.project_id not in _BRIEFING_REFRESH_PROJECT_ALLOWLIST:
             return
         try:
-            mismatches = await _run_briefing_known_gaps_script(self.project_root)
+            mismatches = await _run_briefing_known_gaps_script(self.scope.project_root)
             if not mismatches:
                 return
             # Avoid a redundant get_tasks round-trip when the harness has
@@ -3160,7 +3160,7 @@ class TaskKnowledgeSync(BaseStage):
                 )
             summary = await _queue_briefing_refresh_tasks(
                 self.taskmaster,
-                self.project_root,
+                self.scope.project_root,
                 mismatches,
                 existing_tasks=existing_tasks,
                 run_id=run_id,
@@ -3257,7 +3257,7 @@ class TaskKnowledgeSync(BaseStage):
         # carry done_provenance (legacy tree, warn-only rollout).
         provenance_section = await _render_done_provenance_section(
             filtered.done_tasks,
-            self.project_root,
+            self.scope.project_root,
         )
 
         remediation_note = ''
@@ -3290,7 +3290,7 @@ class TaskKnowledgeSync(BaseStage):
         if self.project_root and filtered.active_tasks:
             live_workflow_section = _render_live_workflow_section(
                 filtered.active_tasks,
-                self.project_root,
+                self.scope.project_root,
             )
 
         # Call render_active_section once to get both the visible-task list (for
@@ -4009,7 +4009,7 @@ def _format_flagged(
 
 async def _render_done_provenance_section(
     done_tasks: list[dict],
-    project_root: str | None,
+    project_root: ProjectRoot | None,
     *,
     max_files_per_task: int = 50,
     max_chars_per_task: int = 2000,
@@ -4067,7 +4067,7 @@ async def _render_done_provenance_section(
 
 
 async def _git_show_name_only(
-    project_root: str,
+    project_root: ProjectRoot,
     commit: str,
     *,
     max_files: int,
@@ -4183,7 +4183,7 @@ def _needs_hint_conversion(task: dict) -> bool:
     return not task_hints
 
 
-async def _run_briefing_known_gaps_script(project_root: str) -> list[dict] | None:
+async def _run_briefing_known_gaps_script(project_root: ProjectRoot) -> list[dict] | None:
     """Run reify's refresh_briefing_known_gaps.py in --json mode.
 
     Returns a list of mismatch dicts when mismatches are present, an empty list
@@ -4262,7 +4262,7 @@ async def _run_briefing_known_gaps_script(project_root: str) -> list[dict] | Non
 
 async def _queue_briefing_refresh_tasks(
     taskmaster: TaskBackendProtocol,
-    project_root: str,
+    project_root: ProjectRoot,
     mismatches: list[dict],
     existing_tasks: list[dict] | None = None,
     run_id: str = '',

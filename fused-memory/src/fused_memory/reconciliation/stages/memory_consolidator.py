@@ -691,7 +691,7 @@ Review the above data and perform memory consolidation:
             return ''
         section = _render_live_workflow_section(
             self.filtered_task_tree.active_tasks,
-            self.project_root,
+            self.scope.project_root,
         )
         if not section:
             return ''

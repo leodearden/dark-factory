@@ -3594,7 +3594,7 @@ class TestBriefingKnownGapsRefresh:
         """No scripts/refresh_briefing_known_gaps.py → returns None without subprocess."""
         # tmp_path has neither the script nor the briefing file
         with patch('asyncio.create_subprocess_exec') as mock_subproc:
-            result = await _run_briefing_known_gaps_script(str(tmp_path))
+            result = await _run_briefing_known_gaps_script(ProjectRoot(str(tmp_path)))
 
         assert result is None
         mock_subproc.assert_not_called()
@@ -3609,7 +3609,7 @@ class TestBriefingKnownGapsRefresh:
         # review/briefing.yaml intentionally absent
 
         with patch('asyncio.create_subprocess_exec') as mock_subproc:
-            result = await _run_briefing_known_gaps_script(str(tmp_path))
+            result = await _run_briefing_known_gaps_script(ProjectRoot(str(tmp_path)))
 
         assert result is None
         mock_subproc.assert_not_called()
@@ -3635,7 +3635,7 @@ class TestBriefingKnownGapsRefresh:
         mock_proc.communicate = AsyncMock(return_value=(stdout_bytes, b''))
 
         with patch('asyncio.create_subprocess_exec', return_value=mock_proc) as mock_exec:
-            result = await _run_briefing_known_gaps_script(str(tmp_path))
+            result = await _run_briefing_known_gaps_script(ProjectRoot(str(tmp_path)))
 
         assert result == mismatch_data
 
@@ -3672,7 +3672,7 @@ class TestBriefingKnownGapsRefresh:
             logging.WARNING,
             logger='fused_memory.reconciliation.stages.task_knowledge_sync',
         ):
-            result = await _run_briefing_known_gaps_script(str(tmp_path))
+            result = await _run_briefing_known_gaps_script(ProjectRoot(str(tmp_path)))
 
         assert result is None
         warning_records = [
@@ -3701,7 +3701,7 @@ class TestBriefingKnownGapsRefresh:
             {'task_id': '1820', 'title': 'Other', 'subproject': 'orchestrator', 'what': 'Other gap'},
         ]
 
-        await _queue_briefing_refresh_tasks(taskmaster, '/tmp/p', mismatches)
+        await _queue_briefing_refresh_tasks(taskmaster, ProjectRoot('/tmp/p'), mismatches)
 
         assert taskmaster.add_task.call_count == 2
 
@@ -3727,7 +3727,7 @@ class TestBriefingKnownGapsRefresh:
 
         mismatches = [{'task_id': '1751', 'title': 'Foo', 'subproject': 'bar', 'what': 'gap'}]
 
-        result = await _queue_briefing_refresh_tasks(taskmaster, '/tmp/p', mismatches)
+        result = await _queue_briefing_refresh_tasks(taskmaster, ProjectRoot('/tmp/p'), mismatches)
 
         taskmaster.add_task.assert_not_called()
         assert '1751' in result['skipped']
@@ -3747,7 +3747,7 @@ class TestBriefingKnownGapsRefresh:
 
         mismatches = [{'task_id': '1751', 'title': 'Foo', 'subproject': 'bar', 'what': 'gap'}]
 
-        result = await _queue_briefing_refresh_tasks(taskmaster, '/tmp/p', mismatches)
+        result = await _queue_briefing_refresh_tasks(taskmaster, ProjectRoot('/tmp/p'), mismatches)
 
         taskmaster.add_task.assert_called_once()
         assert '1751' not in result['skipped']
@@ -3775,7 +3775,7 @@ class TestBriefingKnownGapsRefresh:
 
         mismatches = [{'task_id': '1751', 'title': 'Foo', 'subproject': 'bar', 'what': 'gap'}]
 
-        result = await _queue_briefing_refresh_tasks(taskmaster, '/tmp/p', mismatches)
+        result = await _queue_briefing_refresh_tasks(taskmaster, ProjectRoot('/tmp/p'), mismatches)
 
         # Neither near-miss deduped → add_task must be called exactly once
         taskmaster.add_task.assert_called_once()
@@ -4015,7 +4015,7 @@ class TestBriefingKnownGapsRefresh:
             logging.WARNING,
             logger='fused_memory.reconciliation.stages.task_knowledge_sync',
         ):
-            result = await _run_briefing_known_gaps_script(str(tmp_path))
+            result = await _run_briefing_known_gaps_script(ProjectRoot(str(tmp_path)))
 
         assert result is None
         mock_proc.kill.assert_called_once()
@@ -4052,7 +4052,7 @@ class TestBriefingKnownGapsRefresh:
             logging.WARNING,
             logger='fused_memory.reconciliation.stages.task_knowledge_sync',
         ):
-            result = await _run_briefing_known_gaps_script(str(tmp_path))
+            result = await _run_briefing_known_gaps_script(ProjectRoot(str(tmp_path)))
 
         assert result is None
         warning_records = [
@@ -4082,7 +4082,7 @@ class TestBriefingKnownGapsRefresh:
             logging.WARNING,
             logger='fused_memory.reconciliation.stages.task_knowledge_sync',
         ):
-            result = await _queue_briefing_refresh_tasks(taskmaster, '/tmp/p', mismatches)
+            result = await _queue_briefing_refresh_tasks(taskmaster, ProjectRoot('/tmp/p'), mismatches)
 
         assert result['failed'] == ['1751']
         assert result['created'] == []
@@ -4140,7 +4140,7 @@ class TestBriefingKnownGapsRefresh:
             logging.WARNING,
             logger='fused_memory.reconciliation.stages.task_knowledge_sync',
         ):
-            result = await _queue_briefing_refresh_tasks(taskmaster, '/tmp/p', mismatches)
+            result = await _queue_briefing_refresh_tasks(taskmaster, ProjectRoot('/tmp/p'), mismatches)
 
         assert result['created'] == [], (
             f'created should be [] when add_task returns {bogus_result!r}, got {result["created"]!r}'
@@ -4189,7 +4189,7 @@ class TestBriefingKnownGapsRefresh:
             logging.WARNING,
             logger='fused_memory.reconciliation.stages.task_knowledge_sync',
         ):
-            result = await _queue_briefing_refresh_tasks(taskmaster, '/tmp/p', mismatches)
+            result = await _queue_briefing_refresh_tasks(taskmaster, ProjectRoot('/tmp/p'), mismatches)
 
         assert result['created'] == ['100', '300'], (
             f'expected created=[100, 300], got {result["created"]!r}'
@@ -10091,7 +10091,7 @@ class TestTaskKnowledgeSyncStage2Guards:
             taskmaster = AsyncMock()
             op = self._make_op(operation='update_task', params={'task_id': '42'})
             result = await _resolve_live_status(
-                op, taskmaster, '/project', {'42': 'done'},
+                op, taskmaster, ProjectRoot('/project'), {'42': 'done'},
                 '_classify_terminal_state_violations',
             )
             assert result == ('42', 'done')
@@ -10106,7 +10106,7 @@ class TestTaskKnowledgeSyncStage2Guards:
                 params={'task_id': '7', 'status': 'done'},
             )
             result = await _resolve_live_status(
-                op, taskmaster, '/project', {'7': 'pending'},
+                op, taskmaster, ProjectRoot('/project'), {'7': 'pending'},
                 '_verify_set_task_status_post_action',
             )
             assert result == ('7', 'pending')
@@ -10121,7 +10121,7 @@ class TestTaskKnowledgeSyncStage2Guards:
                 params={'metadata': {'task_id': '11', 'snapshot_status': 'in-progress'}},
             )
             result = await _resolve_live_status(
-                op, taskmaster, '/project', {'11': 'done'},
+                op, taskmaster, ProjectRoot('/project'), {'11': 'done'},
                 '_check_stall_guard_freshness',
             )
             assert result == ('11', 'done')
@@ -10134,7 +10134,7 @@ class TestTaskKnowledgeSyncStage2Guards:
             taskmaster.get_task.return_value = {'status': 'in-progress'}
             op = self._make_op(operation='update_task', params={'task_id': '42'})
             result = await _resolve_live_status(
-                op, taskmaster, '/project', None,
+                op, taskmaster, ProjectRoot('/project'), None,
                 '_classify_terminal_state_violations',
             )
             assert result == ('42', 'in-progress')
@@ -10147,7 +10147,7 @@ class TestTaskKnowledgeSyncStage2Guards:
             taskmaster.get_task.return_value = 'oops'
             op = self._make_op(operation='update_task', params={'task_id': '42'})
             result = await _resolve_live_status(
-                op, taskmaster, '/project', None,
+                op, taskmaster, ProjectRoot('/project'), None,
                 '_classify_terminal_state_violations',
             )
             assert result == ('42', 'unknown')
@@ -10159,7 +10159,7 @@ class TestTaskKnowledgeSyncStage2Guards:
             taskmaster.get_task.return_value = {'id': '42'}  # dict, but no 'status' key
             op = self._make_op(operation='update_task', params={'task_id': '42'})
             result = await _resolve_live_status(
-                op, taskmaster, '/project', None,
+                op, taskmaster, ProjectRoot('/project'), None,
                 '_classify_terminal_state_violations',
             )
             assert result == ('42', 'unknown')
@@ -10176,7 +10176,7 @@ class TestTaskKnowledgeSyncStage2Guards:
                 logger='fused_memory.reconciliation.stages.task_knowledge_sync',
             ):
                 result = await _resolve_live_status(
-                    op, taskmaster, '/project', None,
+                    op, taskmaster, ProjectRoot('/project'), None,
                     '_classify_terminal_state_violations',
                 )
             assert result is None
@@ -10188,7 +10188,7 @@ class TestTaskKnowledgeSyncStage2Guards:
             taskmaster = AsyncMock()
             op = self._make_op(operation='update_task', params={})
             result = await _resolve_live_status(
-                op, taskmaster, '/project', None,
+                op, taskmaster, ProjectRoot('/project'), None,
                 '_classify_terminal_state_violations',
             )
             assert result is None
@@ -10200,7 +10200,7 @@ class TestTaskKnowledgeSyncStage2Guards:
             taskmaster = AsyncMock()
             op = self._make_op(operation='add_memory', params={'metadata': {}})
             result = await _resolve_live_status(
-                op, taskmaster, '/project', None,
+                op, taskmaster, ProjectRoot('/project'), None,
                 '_check_stall_guard_freshness',
             )
             assert result is None
@@ -10212,7 +10212,7 @@ class TestTaskKnowledgeSyncStage2Guards:
             taskmaster = AsyncMock()
             op = self._make_op(operation='add_memory', params={'metadata': 'oops'})
             result = await _resolve_live_status(
-                op, taskmaster, '/project', None,
+                op, taskmaster, ProjectRoot('/project'), None,
                 '_check_stall_guard_freshness',
             )
             assert result is None
@@ -10224,7 +10224,7 @@ class TestTaskKnowledgeSyncStage2Guards:
             taskmaster = AsyncMock()
             op = self._make_op(operation='update_task', params={'task_id': '42'})
             result = await _resolve_live_status(
-                op, taskmaster, '/project', {},
+                op, taskmaster, ProjectRoot('/project'), {},
                 '_classify_terminal_state_violations',
             )
             assert result is None
@@ -10241,7 +10241,7 @@ class TestTaskKnowledgeSyncStage2Guards:
                 logger='fused_memory.reconciliation.stages.task_knowledge_sync',
             ):
                 result = await _resolve_live_status(
-                    op, taskmaster, '/project', None,
+                    op, taskmaster, ProjectRoot('/project'), None,
                     '_classify_terminal_state_violations',
                 )
             assert result is None
@@ -10258,7 +10258,7 @@ class TestTaskKnowledgeSyncStage2Guards:
                 logger='fused_memory.reconciliation.stages.task_knowledge_sync',
             ):
                 result = await _resolve_live_status(
-                    op, taskmaster, '/project', {'42': 'done'},
+                    op, taskmaster, ProjectRoot('/project'), {'42': 'done'},
                     '_test_parsed_params_bypass',
                     _parsed_params={'task_id': '42'},
                 )
@@ -10296,7 +10296,7 @@ class TestTaskKnowledgeSyncStage2Guards:
 
             ops = [self._make_op(op_id='op-42', params={'task_id': '42'})]
             violations = await _classify_terminal_state_violations(
-                ops, taskmaster, '/project', 'recon-stage-task_knowledge_sync'
+                ops, taskmaster, ProjectRoot('/project'), 'recon-stage-task_knowledge_sync'
             )
 
             assert len(violations) == 1
@@ -10320,7 +10320,7 @@ class TestTaskKnowledgeSyncStage2Guards:
                 )
             ]
             violations = await _classify_terminal_state_violations(
-                ops, taskmaster, '/project', 'recon-stage-task_knowledge_sync'
+                ops, taskmaster, ProjectRoot('/project'), 'recon-stage-task_knowledge_sync'
             )
 
             assert violations == []
@@ -10334,7 +10334,7 @@ class TestTaskKnowledgeSyncStage2Guards:
 
             ops = [self._make_op(params={'task_id': '7'})]
             violations = await _classify_terminal_state_violations(
-                ops, taskmaster, '/project', 'recon-stage-task_knowledge_sync'
+                ops, taskmaster, ProjectRoot('/project'), 'recon-stage-task_knowledge_sync'
             )
 
             assert violations == []
@@ -10435,7 +10435,7 @@ class TestTaskKnowledgeSyncStage2Guards:
 
             ops = [self._make_op(op_id='op-sts-mismatch', params={'task_id': '7', 'status': 'done'})]
             mismatches = await _verify_set_task_status_post_action(
-                ops, taskmaster, '/project', 'recon-stage-task_knowledge_sync'
+                ops, taskmaster, ProjectRoot('/project'), 'recon-stage-task_knowledge_sync'
             )
 
             assert len(mismatches) == 1
@@ -10453,7 +10453,7 @@ class TestTaskKnowledgeSyncStage2Guards:
 
             ops = [self._make_op(params={'task_id': '7', 'status': 'done'})]
             mismatches = await _verify_set_task_status_post_action(
-                ops, taskmaster, '/project', 'recon-stage-task_knowledge_sync'
+                ops, taskmaster, ProjectRoot('/project'), 'recon-stage-task_knowledge_sync'
             )
 
             assert mismatches == []
@@ -10556,7 +10556,7 @@ class TestTaskKnowledgeSyncStage2Guards:
                 op_id='op-stall-1',
                 metadata={'task_id': '11', 'snapshot_status': 'in-progress'},
             )]
-            violations = await _check_stall_guard_freshness(ops, taskmaster, '/project', 'recon-stage-task_knowledge_sync')
+            violations = await _check_stall_guard_freshness(ops, taskmaster, ProjectRoot('/project'), 'recon-stage-task_knowledge_sync')
 
             assert len(violations) == 1
             v = violations[0]
@@ -10575,7 +10575,7 @@ class TestTaskKnowledgeSyncStage2Guards:
                 op_id='op-stall-alias',
                 metadata={'task_id': '11', 'observed_status': 'in-progress'},
             )]
-            violations = await _check_stall_guard_freshness(ops, taskmaster, '/project', 'recon-stage-task_knowledge_sync')
+            violations = await _check_stall_guard_freshness(ops, taskmaster, ProjectRoot('/project'), 'recon-stage-task_knowledge_sync')
 
             assert len(violations) == 1
             assert violations[0]['snapshot_status'] == 'in-progress'
@@ -10589,7 +10589,7 @@ class TestTaskKnowledgeSyncStage2Guards:
             ops = [self._make_add_memory_op(
                 metadata={'task_id': '11'},  # no snapshot_status key
             )]
-            violations = await _check_stall_guard_freshness(ops, taskmaster, '/project', 'recon-stage-task_knowledge_sync')
+            violations = await _check_stall_guard_freshness(ops, taskmaster, ProjectRoot('/project'), 'recon-stage-task_knowledge_sync')
 
             assert violations == []
             taskmaster.get_task.assert_not_called()
@@ -10603,7 +10603,7 @@ class TestTaskKnowledgeSyncStage2Guards:
             ops = [self._make_add_memory_op(
                 metadata={'task_id': '11', 'snapshot_status': 'in-progress'},
             )]
-            violations = await _check_stall_guard_freshness(ops, taskmaster, '/project', 'recon-stage-task_knowledge_sync')
+            violations = await _check_stall_guard_freshness(ops, taskmaster, ProjectRoot('/project'), 'recon-stage-task_knowledge_sync')
 
             assert violations == []
 
@@ -12324,7 +12324,7 @@ class TestStage2RecentlyCompletedAndProvenancePreserveIdTitlePairing:
             'fused_memory.reconciliation.stages.task_knowledge_sync._git_show_name_only',
             new=AsyncMock(return_value=''),
         ):
-            rendered = await _render_done_provenance_section(list(self._TASKS), project_root='/tmp')
+            rendered = await _render_done_provenance_section(list(self._TASKS), project_root=ProjectRoot('/tmp'))
 
         assert '### Done-task Provenance' in rendered, (
             f'Provenance section header missing:\n{rendered!r}'
@@ -12364,7 +12364,7 @@ class TestStage2RecentlyCompletedAndProvenancePreserveIdTitlePairing:
             'fused_memory.reconciliation.stages.task_knowledge_sync._git_show_name_only',
             new=AsyncMock(return_value=''),
         ):
-            rendered = await _render_done_provenance_section([task], project_root='/tmp')
+            rendered = await _render_done_provenance_section([task], project_root=ProjectRoot('/tmp'))
 
         assert f'[{task["id"]}]' in rendered, (
             f'Commit branch: id {task["id"]} missing:\n{rendered!r}'
@@ -12572,7 +12572,7 @@ class TestClassifyLiveWorkflowStatusWrites:
         ops = [_make_sts_op(op_id='op-live-1', agent_id=self._AGENT_ID, task_id=self._TASK_ID)]
 
         violations = await _classify_live_workflow_status_writes(
-            ops, '/project', self._AGENT_ID
+            ops, ProjectRoot('/project'), self._AGENT_ID
         )
 
         assert len(violations) == 1
@@ -12592,7 +12592,7 @@ class TestClassifyLiveWorkflowStatusWrites:
         ops = [_make_sts_op(agent_id=self._AGENT_ID, task_id=self._TASK_ID)]
 
         violations = await _classify_live_workflow_status_writes(
-            ops, '/project', self._AGENT_ID
+            ops, ProjectRoot('/project'), self._AGENT_ID
         )
 
         assert violations == []
@@ -12614,7 +12614,7 @@ class TestClassifyLiveWorkflowStatusWrites:
         ]
 
         violations = await _classify_live_workflow_status_writes(
-            ops, '/project', self._AGENT_ID
+            ops, ProjectRoot('/project'), self._AGENT_ID
         )
 
         assert violations == []
@@ -12638,7 +12638,7 @@ class TestClassifyLiveWorkflowStatusWrites:
             'created_at': '2026-06-05T10:00:00',
         }
         violations = await _classify_live_workflow_status_writes(
-            [update_op], '/project', self._AGENT_ID
+            [update_op], ProjectRoot('/project'), self._AGENT_ID
         )
 
         assert violations == []
@@ -12669,7 +12669,7 @@ class TestClassifyLiveWorkflowStatusWrites:
         ]
 
         violations = await _classify_live_workflow_status_writes(
-            ops, '/project', self._AGENT_ID
+            ops, ProjectRoot('/project'), self._AGENT_ID
         )
 
         assert len(violations) == 1
