@@ -552,6 +552,21 @@ class TaskSteward:
         if self._session_id is not None:
             kwargs['resume_session_id'] = self._session_id
 
+        # NOTE (reviewer_comprehensive, task W4-eta amendment): the `backend`
+        # kwarg below only feeds invoke_with_cap_retry's own
+        # classify_invocation / detect_cap_hit calls — it is never forwarded
+        # into `invoke_kwargs` before `invoke_fn` (invoke_agent) is called,
+        # so invoke_agent always runs with its own default (backend='claude')
+        # regardless of this value. This matches every other
+        # invoke_with_cap_retry caller (workflow._invoke,
+        # _pre_triage_suggestions below), and is a no-op today because the
+        # steward only ever runs backend='claude' in practice. If
+        # `config.backends.steward` is ever set to a non-claude backend, the
+        # steward would silently keep invoking Claude. The real fix
+        # (forwarding `backend` into `invoke_kwargs` inside
+        # shared/cli_invoke.py before it calls `invoke_fn`) touches a file
+        # outside this task's locked scope (steward.py / test_steward.py
+        # only) — left for a follow-up task rather than fixed here.
         result = await invoke_with_cap_retry(
             self.usage_gate,
             f'Steward for task {self.task_id}',
