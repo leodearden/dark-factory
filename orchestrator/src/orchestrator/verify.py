@@ -628,6 +628,17 @@ def _classify_failure(output: str, rc: int, timed_out: bool) -> str:
 
     The ``timed_out`` flag wins over any output pattern because the root
     cause is the wall-clock limit, not the command output.
+
+    CLOSED DOMAIN: every string returned here must be a member of
+    ``orchestrator.verify_categories.FailureCategory`` — that enum, not this
+    function, is the authoritative closed 12-value output domain, and
+    ``_validate_exhaustive`` only enforces it at ``verify_categories`` import
+    time. Adding a new category literal here without also adding a matching
+    ``FailureCategory`` member (+ its ``CATEGORY_POLICY`` row) does NOT fail
+    loud: ``should_archive`` and every other table lookup silently treat an
+    unrecognized string as non-archival/lowest-priority rather than raising.
+    Add the enum member first — the import-time guard then forces the
+    matching policy row.
     """
     if rc == 0:
         return 'passed'

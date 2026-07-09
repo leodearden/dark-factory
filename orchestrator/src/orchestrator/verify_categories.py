@@ -41,7 +41,23 @@ class FailureCategory(StrEnum):
 
 
 class RetryKind(Enum):
-    """How ``run_verification`` recovers from a given category, if at all."""
+    """How ``run_verification`` recovers from a given category, if at all.
+
+    Populated for all 12 ``CATEGORY_POLICY`` rows per the PRD contract
+    (plans/verify-plan-prd.md task α item 4: ``CategoryPolicy(severity_rank,
+    archive, preexisting_probe, is_infra_transient, retry_kind)``) but NOT
+    yet dispatched on. ``run_verification`` still decides retries via two
+    pre-existing, independent code paths: a pure-timeout while-loop gated on
+    raw per-check ``timed_out`` flags (before any category is even
+    classified), and a single bounded env-recovery retry gated on
+    ``category == FailureCategory.ENV_TRANSIENT``. Neither path is a second
+    hand-synced copy of this table's policy — both predate this module, and
+    collapsing them into one computation that dispatches on ``retry_kind``
+    is the PRD's task ε (``CheckRun``/``VerifyAttempt``), which lands after
+    this task in the linear verify.py spine. Wiring dispatch in here first
+    would mean touching the same retry-loop internals ε owns, ahead of the
+    ``VerifyAttempt`` abstraction that change depends on.
+    """
 
     NONE = 'none'
     TIMEOUT = 'timeout'
@@ -56,7 +72,7 @@ class CategoryPolicy:
     archive: bool
     preexisting_probe: bool
     is_infra_transient: bool
-    retry_kind: RetryKind
+    retry_kind: RetryKind  # see RetryKind's docstring: populated now, dispatched by task ε
 
 
 CATEGORY_POLICY: dict[FailureCategory, CategoryPolicy] = {
@@ -170,7 +186,9 @@ def should_archive(category: str) -> bool:
 
     Pure CATEGORY_POLICY table lookup — no ``endswith('_error')`` heuristic.
     A category outside the known 12 (e.g. a verify_runner UNSCOPED_TYPECHECK_*
-    sentinel, or any other unrecognized string) defaults to False.
+    sentinel, or any other unrecognized string) defaults to False. See
+    ``verify._classify_failure``'s docstring for the closed-domain contract
+    that keeps this default from silently misfiring on a future category.
     """
     try:
         member = FailureCategory(category)
