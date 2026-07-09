@@ -7,6 +7,7 @@ import importlib.util
 import inspect
 import logging
 import re
+import time
 import uuid
 from collections import Counter
 from collections.abc import Mapping, Sequence
@@ -1323,6 +1324,30 @@ class GraphitiBackend:
         dup-uuid pair unrepaired and silently break ζ's global
         uuid-uniqueness premise.
 
+        Performance note: the detection query aggregates over every
+        RELATES_TO edge in the graph, every time this runs (i.e. on every
+        backend startup, not just the first "one-shot" pass) — there is
+        deliberately no sentinel/version marker gating it, since a legacy
+        graph could always be mutated by an older code path between
+        restarts. On a large, long-clean graph this is startup-path DB CPU
+        spent to confirm a no-op. Per-graph duration and the detected
+        dup-uuid-group count are logged at DEBUG so this cost is observable;
+        see also _run_startup_identity_scan's aggregate elapsed_ms.
+
+        Concurrency note: repair writes are NOT serialized against another
+        process's concurrent initialize() (no cross-process lock is taken).
+        `_identity_lock_for` is an in-process asyncio.Lock keyed on this
+        instance's own `_identity_locks` dict — a second orchestrator process
+        has an entirely separate registry, so acquiring it here would not
+        actually prevent two processes from racing on the same dup-uuid
+        group. This is accepted as safe: each racing writer targets the same
+        ID(e) with its own fresh uuid4, so the last SET simply wins — the
+        per-uuid uniqueness postcondition still holds either way. The only
+        cost is harmless churn (an extra re-mint) and the possibility that
+        `superseded_edge_uuid` ends up recording whichever writer's original
+        `old_uuid` lost the race, which is acceptable for an audit-only
+        property.
+
         Args:
             group_id: Project graph to repair.
 
@@ -1336,9 +1361,11 @@ class GraphitiBackend:
             'WHERE c > 1 '
             'RETURN u, eids'
         )
+        start = time.monotonic()
         detect_result = await graph.query(detect_cypher)
+        dup_groups = detect_result.result_set or []
         repaired = 0
-        for old_uuid, eids in (detect_result.result_set or []):
+        for old_uuid, eids in dup_groups:
             for eid in eids[1:]:
                 new_uuid = str(uuid.uuid4())
                 await graph.query(
@@ -1348,6 +1375,12 @@ class GraphitiBackend:
                     {'eid': eid, 'new_uuid': new_uuid, 'old_uuid': old_uuid},
                 )
                 repaired += 1
+        elapsed_ms = (time.monotonic() - start) * 1000
+        logger.debug(
+            'startup identity scan: dup-uuid-edge repair for graph %r took %.1fms '
+            '(%d dup-uuid group(s) found, %d edge(s) re-minted)',
+            group_id, elapsed_ms, len(dup_groups), repaired,
+        )
         if repaired:
             logger.info(
                 'startup identity scan: re-minted %d duplicate-uuid RELATES_TO edge(s) '
@@ -1726,8 +1759,15 @@ class GraphitiBackend:
             'WHERE cnt > 1 '
             'RETURN name, cnt'
         )
+        start = time.monotonic()
         result = await graph.ro_query(cypher, {'group_id': group_id})
+        elapsed_ms = (time.monotonic() - start) * 1000
         duplicates = [(row[0], row[1]) for row in (result.result_set or [])]
+        logger.debug(
+            'startup identity scan: dup-node name scan for graph %r took %.1fms '
+            '(%d duplicated name(s) found)',
+            group_id, elapsed_ms, len(duplicates),
+        )
         for name, cnt in duplicates:
             logger.warning(
                 'startup identity scan: %d duplicate Entity nodes named %r in group %r '
@@ -1751,6 +1791,13 @@ class GraphitiBackend:
         total scan failure never breaks backend startup — this sweep is a
         safety net, not a startup gate.
 
+        This runs synchronously on the initialize() critical path on every
+        boot (not just once), scanning every RELATES_TO edge and every
+        Entity node grouping in every project graph — see the performance
+        note on _repair_duplicate_edge_uuids. The aggregate elapsed_ms below,
+        plus each sub-method's per-graph DEBUG timing log, make that cost
+        observable so a startup slowdown can be diagnosed without guessing.
+
         Returns:
             Aggregate stats dict:
             - graphs_scanned: graphs attempted (counted whether or not that
@@ -1761,9 +1808,12 @@ class GraphitiBackend:
             - edges_repaired: total dup-uuid edges re-minted across all
               graphs (sum of each graph's _repair_duplicate_edge_uuids
               result).
+            - elapsed_ms: wall-clock duration of the full sweep (all graphs),
+              in milliseconds.
         """
         graphs = await self.list_graphs()
         stats = {'graphs_scanned': 0, 'dup_name_groups': 0, 'edges_repaired': 0}
+        start = time.monotonic()
         for graph_name in graphs:
             stats['graphs_scanned'] += 1
             try:
@@ -1776,10 +1826,12 @@ class GraphitiBackend:
                     'Startup identity-integrity scan failed for graph %r',
                     graph_name, exc_info=True,
                 )
+        stats['elapsed_ms'] = (time.monotonic() - start) * 1000
         logger.info(
             'startup identity scan complete: graphs_scanned=%d dup_name_groups=%d '
-            'edges_repaired=%d',
+            'edges_repaired=%d elapsed_ms=%.1f',
             stats['graphs_scanned'], stats['dup_name_groups'], stats['edges_repaired'],
+            stats['elapsed_ms'],
         )
         return stats
 
