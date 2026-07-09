@@ -2777,6 +2777,110 @@ async def test_filter_suppressed_drops_flag_for_legacy_str_consumer_record():
 
 
 # ---------------------------------------------------------------------------
+# TestWriteSuppressionRecordLedger (task 2227 step-5) — write_suppression_record
+# upserts stage1_flag_suppression row(s) to the ReconLedgerStore; RED until
+# step-6 rewrites write_suppression_record onto the ledger, at which point
+# this class folds into TestWriteSuppressionRecord below (replacing its
+# Mem0-only body).
+# ---------------------------------------------------------------------------
+
+
+class TestWriteSuppressionRecordLedger:
+    """write_suppression_record(memory_service, project_id=..., task_id=...)
+    upserts stage1_flag_suppression row(s) to memory_service.recon_ledger —
+    not just a Mem0 write."""
+
+    @pytest.mark.asyncio
+    async def test_blanket_call_upserts_one_wildcard_row(self, ledger_memory_service):
+        """task_id-only call upserts exactly one row: task_id='42', flag_type='',
+        state='active', expires_at=None — readable via list_suppressions /
+        is_suppressed."""
+        from fused_memory.reconciliation.flag_dedup import write_suppression_record
+
+        await write_suppression_record(ledger_memory_service, project_id='p', task_id=42)
+
+        rows = await ledger_memory_service.recon_ledger.list_suppressions('p')
+        assert len(rows) == 1
+        row = rows[0]
+        assert row.task_id == '42'
+        assert row.flag_type == ''
+        assert row.state == 'active'
+        assert row.expires_at is None
+
+        assert (
+            await ledger_memory_service.recon_ledger.is_suppressed('p', '42', 'anything')
+            is True
+        )
+
+    @pytest.mark.asyncio
+    async def test_flag_types_upserts_one_row_per_flag_type(self, ledger_memory_service):
+        """flag_types=['a', 'b'] upserts one scoped row per flag_type."""
+        from fused_memory.reconciliation.flag_dedup import write_suppression_record
+
+        await write_suppression_record(
+            ledger_memory_service, project_id='p', task_id=7, flag_types=['a', 'b']
+        )
+
+        rows = await ledger_memory_service.recon_ledger.list_suppressions('p')
+        assert len(rows) == 2
+        assert {row.flag_type for row in rows} == {'a', 'b'}
+        assert all(row.task_id == '7' for row in rows)
+
+        assert await ledger_memory_service.recon_ledger.is_suppressed('p', '7', 'a') is True
+        assert await ledger_memory_service.recon_ledger.is_suppressed('p', '7', 'c') is False
+
+    @pytest.mark.asyncio
+    async def test_repeated_identical_call_is_idempotent(self, ledger_memory_service):
+        """A second identical call leaves the row count unchanged (UPSERT
+        idempotency) — no duplicate row per recurrence."""
+        from fused_memory.reconciliation.flag_dedup import write_suppression_record
+
+        await write_suppression_record(ledger_memory_service, project_id='p', task_id=42)
+        await write_suppression_record(ledger_memory_service, project_id='p', task_id=42)
+
+        rows = await ledger_memory_service.recon_ledger.list_suppressions('p')
+        assert len(rows) == 1
+
+    @pytest.mark.asyncio
+    async def test_written_rows_round_trip_through_filter_suppressed(
+        self, ledger_memory_service
+    ):
+        """Rows written by write_suppression_record are read back by the
+        ledger-backed filter_suppressed — end-to-end producer -> consumer
+        round-trip."""
+        from fused_memory.reconciliation.flag_dedup import (
+            filter_suppressed,
+            write_suppression_record,
+        )
+
+        await write_suppression_record(ledger_memory_service, project_id='p', task_id=42)
+
+        flags = [
+            {'task_id': 42, 'flag_type': 'missing_deliverable'},
+            {'task_id': 99, 'flag_type': 'missing_deliverable'},
+        ]
+        result = await filter_suppressed(ledger_memory_service, 'p', flags)
+
+        assert result == [{'task_id': 99, 'flag_type': 'missing_deliverable'}]
+
+    @pytest.mark.asyncio
+    async def test_invalid_task_id_raises_value_error_no_ledger_row(
+        self, ledger_memory_service
+    ):
+        """Invalid task_id still raises ValueError (build_suppression_payload's
+        guard is unchanged) and never writes a ledger row."""
+        from fused_memory.reconciliation.flag_dedup import write_suppression_record
+
+        with pytest.raises(ValueError):
+            await write_suppression_record(
+                ledger_memory_service, project_id='p', task_id='not-a-number'
+            )
+
+        rows = await ledger_memory_service.recon_ledger.list_suppressions('p')
+        assert rows == []
+
+
+# ---------------------------------------------------------------------------
 # write_suppression_record tests (task-1185 step-3)
 # ---------------------------------------------------------------------------
 
