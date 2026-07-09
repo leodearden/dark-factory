@@ -16201,6 +16201,29 @@ class TestResolveTerminalTaskIds:
 
         assert result == []
 
+    @pytest.mark.asyncio
+    async def test_non_mapping_statuses_result_is_fail_safe_empty(self):
+        """A get_statuses whose return value is not dict-like — e.g. an
+        unconfigured AsyncMock, as many pre-existing mock_deps fixtures across
+        this file use for taskmaster without stubbing get_statuses — must not
+        propagate out of run(). Degrades to [] exactly like an outright raise,
+        since this function's contract is to never propagate regardless of
+        the failure's shape."""
+        from fused_memory.reconciliation.stages.task_knowledge_sync import (
+            _resolve_terminal_task_ids,
+        )
+
+        taskmaster = AsyncMock()
+        # Deliberately left unconfigured: taskmaster.get_statuses(...) resolves
+        # to a plain AsyncMock, not a dict, so .items() is itself async-mocked
+        # and calling it raises TypeError rather than returning an iterable.
+
+        result = await _resolve_terminal_task_ids(
+            taskmaster, _scope('reify', '/home/leo/src/reify'), 'r1',
+        )
+
+        assert result == []
+
 
 class TestGcReconMarkers:
     """_gc_recon_markers wraps ReconLedgerStore.gc() with terminal-task-id
