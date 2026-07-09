@@ -582,3 +582,144 @@ class TestDeterministicTaskErrorMilestone:
             '/proj',
         )
         assert result is None
+
+
+# ---------------------------------------------------------------------------
+# δ (task 2337, step-3): predicate before_done validation (_validate_before_done)
+# ---------------------------------------------------------------------------
+
+
+class TestDeterministicTaskErrorPredicateBeforeDone:
+    """before_done.kind='predicate' validation (PRD §5 dec 7,8).
+
+    A predicate before_done has no unit to verify, so it FORBIDS a set
+    target_unit and FORBIDS always_escalates=True (predicate escalation is
+    conditional on rc != 0, not unconditional). Predicate structural checks
+    (script exists + executable, positive timeout_secs) still apply.
+    kind='deploy' (the default) is left byte-identical.
+    """
+
+    @staticmethod
+    def _make_script(tmp_path, name='check.sh'):
+        """tmp_path executable-script fixture, mirroring the before_done-structural tests."""
+        script = tmp_path / name
+        script.write_text('#!/bin/sh\nexit 0\n')
+        os.chmod(script, 0o755)
+        return script.name
+
+    # -- rejections ----------------------------------------------------
+
+    def test_predicate_with_target_unit_rejects(self, tmp_path):
+        """kind='predicate' with a set target_unit → reject, msg mentions target_unit."""
+        script_name = self._make_script(tmp_path)
+        result = deterministic_task_error(
+            'deterministic',
+            {
+                'before_done': {
+                    'kind': 'predicate',
+                    'script': script_name,
+                    'timeout_secs': 60,
+                    'target_unit': 'merge.service',
+                },
+            },
+            str(tmp_path),
+        )
+        assert result is not None
+        assert result.get('error_type') == 'ValidationError'
+        assert 'target_unit' in result['error']
+
+    def test_predicate_with_always_escalates_true_rejects(self, tmp_path):
+        """kind='predicate' with top-level always_escalates=True → reject, msg mentions always_escalates."""
+        script_name = self._make_script(tmp_path)
+        result = deterministic_task_error(
+            'deterministic',
+            {
+                'always_escalates': True,
+                'before_done': {
+                    'kind': 'predicate',
+                    'script': script_name,
+                    'timeout_secs': 60,
+                },
+            },
+            str(tmp_path),
+        )
+        assert result is not None
+        assert result.get('error_type') == 'ValidationError'
+        assert 'always_escalates' in result['error']
+
+    def test_predicate_nonexistent_script_rejects(self, tmp_path):
+        """Predicate structural checks still apply: non-existent script → reject."""
+        result = deterministic_task_error(
+            'deterministic',
+            {
+                'before_done': {
+                    'kind': 'predicate',
+                    'script': 'does_not_exist.sh',
+                    'timeout_secs': 60,
+                },
+            },
+            str(tmp_path),
+        )
+        assert result is not None
+        assert result.get('error_type') == 'ValidationError'
+
+    def test_predicate_missing_timeout_rejects(self, tmp_path):
+        """Predicate structural checks still apply: no timeout_secs → reject."""
+        script_name = self._make_script(tmp_path)
+        result = deterministic_task_error(
+            'deterministic',
+            {'before_done': {'kind': 'predicate', 'script': script_name}},
+            str(tmp_path),
+        )
+        assert result is not None
+        assert result.get('error_type') == 'ValidationError'
+
+    # -- acceptance / deploy regression ---------------------------------
+
+    def test_well_formed_predicate_accepts(self, tmp_path):
+        """kind='predicate' with a valid script, timeout_secs, no target_unit,
+        no always_escalates → accept."""
+        script_name = self._make_script(tmp_path)
+        result = deterministic_task_error(
+            'deterministic',
+            {
+                'before_done': {
+                    'kind': 'predicate',
+                    'script': script_name,
+                    'timeout_secs': 120,
+                },
+            },
+            str(tmp_path),
+        )
+        assert result is None
+
+    def test_deploy_with_target_unit_still_accepts(self, tmp_path):
+        """DEPLOY regression: default-kind before_done WITH target_unit still accepted
+        (deploy allows target_unit — kind='deploy' behaviour stays byte-identical)."""
+        script_name = self._make_script(tmp_path)
+        result = deterministic_task_error(
+            'deterministic',
+            {
+                'before_done': {
+                    'script': script_name,
+                    'timeout_secs': 60,
+                    'target_unit': 'foo.service',
+                },
+            },
+            str(tmp_path),
+        )
+        assert result is None
+
+    def test_deploy_with_always_escalates_true_still_accepts(self, tmp_path):
+        """DEPLOY regression: deploy before_done + always_escalates=True
+        (existing act-then-ask preset) still accepted."""
+        script_name = self._make_script(tmp_path)
+        result = deterministic_task_error(
+            'deterministic',
+            {
+                'always_escalates': True,
+                'before_done': {'script': script_name, 'timeout_secs': 60},
+            },
+            str(tmp_path),
+        )
+        assert result is None
