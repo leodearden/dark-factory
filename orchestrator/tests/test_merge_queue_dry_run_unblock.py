@@ -182,8 +182,10 @@ class TestGenericMergeVerifyRedSpawnsDryRun:
         assert kwargs['block_class'] == BlockClass.MERGE_VERIFY_RED, (
             f'Expected block_class=MERGE_VERIFY_RED; got {kwargs.get("block_class")!r}'
         )
-        assert kwargs['worktree'] == str(merge_wt), (
-            f'Expected worktree={str(merge_wt)!r}; got {kwargs.get("worktree")!r}'
+        assert kwargs['worktree'] == str(req.worktree), (
+            f'Expected worktree={str(req.worktree)!r} (the task\'s own '
+            f'retained worktree, not the ephemeral merge_wt); '
+            f'got {kwargs.get("worktree")!r}'
         )
         assert kwargs['task_id'] == req.task_id, (
             f'Expected task_id={req.task_id!r}; got {kwargs.get("task_id")!r}'
@@ -826,9 +828,11 @@ class TestMergeVerifyRedProducesGateableProposal:
         git_ops = _make_git_ops(tmp_path)
         merge_wt = tmp_path / 'merge-wt'
         merge_wt.mkdir()
-        head_sha = _init_git_repo(merge_wt)
         req = _make_req('99', tmp_path / 'task-wt', config)
-        (tmp_path / 'task-wt').mkdir()
+        # The investigation reads req.worktree (the task's OWN retained
+        # worktree), not the ephemeral merge_wt — git init creates the
+        # task-wt dir, so no separate mkdir is needed.
+        head_sha = _init_git_repo(req.worktree)
 
         scheduler = _RecordingScheduler({'dry_run_proposals': []})
         handles = _DryRunInvestigationHandles(scheduler=scheduler)
@@ -897,7 +901,7 @@ class TestMergeVerifyRedProducesGateableProposal:
         )
 
         verdict = check_proposal(
-            entry, worktree=str(merge_wt), category='task_failure',
+            entry, worktree=str(req.worktree), category='task_failure',
             run_git=_fake_run_git,
         )
         assert verdict['verdict'] != ABORT, (

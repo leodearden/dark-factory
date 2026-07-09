@@ -918,10 +918,20 @@ def _spawn_merge_verify_dry_run(
     None-safe: no-ops when *handles* is ``None`` or ``handles.scheduler`` is
     ``None`` — the solo-reverify and train module-level
     ``_run_post_merge_verify`` callers pass no handles.  Also no-ops when
-    ``req.config.unblock_auto.enabled`` is falsy, or when a not-done
+    ``req.config.unblock_auto.enabled`` is falsy, when a not-done
     investigation task is already registered in ``handles.background_tasks``
     under this task's name (mirrors ``workflow._spawn_dry_run_unblock``'s
-    enablement and in-flight-dedup guards).
+    enablement and in-flight-dedup guards), or when ``req.worktree`` is
+    missing/nonexistent.
+
+    *merge_wt* is accepted for call-site signature stability but no longer
+    determines the investigation's cwd: it is the ephemeral merge worktree,
+    which ``_run_post_merge_verify`` has already handed to
+    ``cleanup_merge_worktree`` by the time this fire-and-forget task actually
+    runs (task 2141 step-17/18 — the no-op cleanup mock in the test suite hid
+    this). ``req.worktree`` is the task's OWN retained worktree — it survives
+    while the task stays blocked, and is what ``b3_gate`` re-checks at gate
+    time — so the investigation reads that instead.
 
     *event_store* is forwarded to ``run_dry_run_unblock`` so the
     investigation emits the same ``invocation_end``/``'blocked'`` telemetry
@@ -948,11 +958,17 @@ def _spawn_merge_verify_dry_run(
             req.task_id,
         )
         return
+    if req.worktree is None or not req.worktree.exists():
+        logger.debug(
+            'Task %s: skipping merge-verify dry-run — task worktree missing',
+            req.task_id,
+        )
+        return
     try:
         task = asyncio.create_task(
             run_dry_run_unblock(
                 task_id=req.task_id,
-                worktree=str(merge_wt),
+                worktree=str(req.worktree),
                 reason=reason,
                 detail=detail,
                 scheduler=handles.scheduler,
