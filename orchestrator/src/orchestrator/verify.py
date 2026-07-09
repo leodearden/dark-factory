@@ -2987,15 +2987,42 @@ async def run_verification(
     # not a real code regression (esc-2286-21). _is_bare_xdist_worker_crash
     # is the conservative discriminator: it returns False (no reclassify)
     # whenever a genuine pytest failure marker is also present, so a real
-    # failure is never masked. Gated on `not is_merge_verify` — mirrors the
-    # _mark_verify_warm precedent below — because the merge path
-    # (merge_queue.py) has no VerifyInfraError handler and an uncaught raise
-    # there would stall the merge queue. Raising here (rather than returning
-    # a failure category) routes through the EXISTING bounded
-    # exponential-backoff retry (_run_scoped_verification_with_infra_retry in
-    # workflow.py) instead of the debugfix loop's DEBUGGER invocation — the
-    # task-path's only auto-retry-without-debugging mechanism.
-    if not is_merge_verify and test_rc != 0 and _is_bare_xdist_worker_crash(test_out):
+    # failure is never masked. The gate also requires lint_rc == 0 and
+    # type_rc == 0: the discriminator only inspects test_out for pytest
+    # failure markers, so without this a genuine, co-occurring lint/type
+    # regression would be silently diverted onto the infra-retry path
+    # instead of being surfaced as its own test_failure. Requiring both
+    # other legs to be clean means the reclassification only fires when the
+    # crashed test leg is the ONLY non-zero check. Gated on
+    # `not is_merge_verify` — mirrors the _mark_verify_warm precedent below
+    # — because the merge path (merge_queue.py) has no VerifyInfraError
+    # handler and an uncaught raise there would stall the merge queue.
+    # Raising here (rather than returning a failure category) routes
+    # through the EXISTING bounded exponential-backoff retry
+    # (_run_scoped_verification_with_infra_retry in workflow.py) instead of
+    # the debugfix loop's DEBUGGER invocation — the task-path's only
+    # auto-retry-without-debugging mechanism.
+    #
+    # Known accepted tradeoff: a genuine, deterministically-reproducible
+    # regression that hangs (e.g. an infinite loop) will, under xdist +
+    # pytest-timeout's thread-kill method, also os._exit() the worker and
+    # produce this identical bare "node down" signature with no FAILED/E/
+    # summary marker — indistinguishable from a host-overload crash by
+    # signature alone. Such a hang is routed to the bounded infra retry
+    # instead of straight to the debugger; unlike an overload flake it will
+    # recur on every retry (a hang doesn't self-heal), so it exhausts the
+    # retry window and lands in infra_hold + escalate_to_human rather than
+    # being auto-debugged immediately. That is a fail-safe outcome (a human
+    # sees it, nothing is silently greened), not a fail-fast one, and is
+    # judged acceptable against the status quo of burning debugger
+    # iterations on non-reproducible overload flakes.
+    if (
+        not is_merge_verify
+        and test_rc != 0
+        and lint_rc == 0
+        and type_rc == 0
+        and _is_bare_xdist_worker_crash(test_out)
+    ):
         logger.warning(
             'Task %s: bare pytest-xdist worker crash detected (module_prefix=%r) '
             'with no real failure marker in test output — reclassifying as '
