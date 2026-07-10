@@ -474,30 +474,39 @@ resolve_detached() {
 
 # --- emulator selection ----------------------------------------------------
 
-emulator=""
-if [ -n "${CLAUDE_TERMINAL_CMD:-}" ]; then
-  emulator="$CLAUDE_TERMINAL_CMD"
-elif [ -n "${ESCALATION_TERMINAL_CMD:-}" ]; then
-  emulator="$ESCALATION_TERMINAL_CMD"
-  echo "spawn-claude.sh: \$ESCALATION_TERMINAL_CMD is a legacy fallback — please migrate to \$CLAUDE_TERMINAL_CMD" >&2
-elif command -v gnome-terminal >/dev/null 2>&1; then
-  emulator="gnome-terminal"
-elif command -v kitty >/dev/null 2>&1; then
-  emulator="kitty"
-elif command -v konsole >/dev/null 2>&1; then
-  emulator="konsole"
-elif command -v xterm >/dev/null 2>&1; then
-  emulator="xterm"
-elif [ "$(uname)" = "Darwin" ]; then
-  emulator="mac-terminal"
+if [ "${CLAUDE_SPAWN_BACKEND:-}" = "tmux" ]; then
+  # Fleet Cockpit C6: the tmux lane is crash-survivable/reattachable and
+  # needs no terminal emulator at all -- bypass discovery entirely. (A
+  # tmux-availability guard mirroring the no-emulator exit 126 below lands
+  # separately.) first_word drives the case dispatch further down exactly
+  # like a discovered $emulator would.
+  first_word="tmux-lane"
 else
-  echo "spawn-claude.sh: no terminal emulator found — set \$CLAUDE_TERMINAL_CMD" >&2
-  exit 126
-fi
+  emulator=""
+  if [ -n "${CLAUDE_TERMINAL_CMD:-}" ]; then
+    emulator="$CLAUDE_TERMINAL_CMD"
+  elif [ -n "${ESCALATION_TERMINAL_CMD:-}" ]; then
+    emulator="$ESCALATION_TERMINAL_CMD"
+    echo "spawn-claude.sh: \$ESCALATION_TERMINAL_CMD is a legacy fallback — please migrate to \$CLAUDE_TERMINAL_CMD" >&2
+  elif command -v gnome-terminal >/dev/null 2>&1; then
+    emulator="gnome-terminal"
+  elif command -v kitty >/dev/null 2>&1; then
+    emulator="kitty"
+  elif command -v konsole >/dev/null 2>&1; then
+    emulator="konsole"
+  elif command -v xterm >/dev/null 2>&1; then
+    emulator="xterm"
+  elif [ "$(uname)" = "Darwin" ]; then
+    emulator="mac-terminal"
+  else
+    echo "spawn-claude.sh: no terminal emulator found — set \$CLAUDE_TERMINAL_CMD" >&2
+    exit 126
+  fi
 
-# Dispatch by the first word of $emulator so $CLAUDE_TERMINAL_CMD="gnome-terminal --foo"
-# still hits the gnome-terminal branch.
-first_word="${emulator%% *}"
+  # Dispatch by the first word of $emulator so $CLAUDE_TERMINAL_CMD="gnome-terminal --foo"
+  # still hits the gnome-terminal branch.
+  first_word="${emulator%% *}"
+fi
 
 # _cleanup + trap installed earlier (right after the mktemp calls near the
 # top of the script), so spawn_ref can never leak -- including on the
@@ -553,6 +562,34 @@ case "$first_word" in
       finish_failed_to_start
     fi
     finish
+    ;;
+  tmux-lane)
+    # Fleet Cockpit C6: crash-survivable, reattachable tmux lane. A window
+    # created via `tmux new-window`/`new-session` is owned by the tmux
+    # server, not this script -- it outlives spawn-claude.sh (and the
+    # launching claude session), can be reattached with
+    # `tmux attach -t $tmux_session`, and the on-disk session-registry
+    # record persists independently. `-P -F` prints the exact
+    # "<session>:<window>" target on stdout, captured below.
+    # `new-window`/`new-session` return immediately while the tmux server
+    # owns the payload -- DETACHED semantics, so resolve_detached already
+    # delivers the right sentinel/exit/failed-to-start lifecycle, identical
+    # to the konsole/custom branches above.
+    tmux_project="${CLAUDE_SPAWN_PROJECT:-}"
+    if [ -z "$tmux_project" ]; then
+      tmux_project="$(basename "${cwd%/}")"
+    fi
+    [ -z "$tmux_project" ] && tmux_project="fleet"
+    tmux_session="${CLAUDE_SPAWN_TMUX_SESSION:-fleet-$tmux_project}"
+    win_name="$title"
+    [ -z "$win_name" ] && win_name="${CLAUDE_SPAWN_ROLE:-session}"
+    if tmux has-session -t "$tmux_session" 2>/dev/null; then
+      tmux_target=$(tmux new-window -t "$tmux_session" -n "$win_name" -P -F '#{session_name}:#{window_index}' bash -c "$inner")
+    else
+      tmux_target=$(tmux new-session -d -s "$tmux_session" -n "$win_name" -P -F '#{session_name}:#{window_index}' bash -c "$inner")
+    fi
+    launch_rc=$?
+    resolve_detached "$launch_rc"
     ;;
   *)
     # User-supplied launcher via $CLAUDE_TERMINAL_CMD. Assume `<cmd> -- bash -c '<payload>'`
