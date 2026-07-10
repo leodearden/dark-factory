@@ -17,6 +17,7 @@ import json
 import logging
 from datetime import UTC, datetime
 from types import SimpleNamespace
+from typing import Any
 from unittest.mock import AsyncMock, patch
 
 import pytest
@@ -312,7 +313,7 @@ class TestWriteCycleSummaryLedgerWrite:
         await s.close()
 
     def _report(self, **overrides) -> StageReport:
-        defaults = dict(
+        defaults: dict[str, Any] = dict(
             stage=StageId.task_knowledge_sync,
             started_at=datetime(2026, 7, 10, 11, 0, 0, tzinfo=UTC),
             completed_at=datetime(2026, 7, 10, 11, 5, 0, tzinfo=UTC),
@@ -454,7 +455,7 @@ class TestWriteCycleSummaryMirrorAndTrim:
         await s.close()
 
     def _report(self, **overrides) -> StageReport:
-        defaults = dict(
+        defaults: dict[str, Any] = dict(
             stage=StageId.task_knowledge_sync,
             started_at=datetime(2026, 7, 10, 11, 0, 0, tzinfo=UTC),
             completed_at=datetime(2026, 7, 10, 11, 5, 0, tzinfo=UTC),
