@@ -568,22 +568,28 @@ class TestApplyPrune:
 def _cycle_summary_record(
     id: str, stage: str, created_at: str, content: str = 'ordinary cycle summary',
 ) -> dict:
-    """Build a mem0.get_all()-shaped record for a cycle_summary pool member."""
+    """Build a scroll_by_metadata()-shaped record for a cycle_summary pool member.
+
+    Mirrors the Mem0Backend.scroll_by_metadata return shape ``{id, created_at,
+    metadata}`` where ``metadata`` is the full Qdrant payload -- the summary
+    text lives in ``metadata['data']`` (Mem0's payload content key), not a
+    top-level ``memory`` field.
+    """
     return {
         'id': id,
-        'memory': content,
         'created_at': created_at,
-        'metadata': {'kind': 'cycle_summary', 'stage': stage, 'run_id': 'r1'},
+        'metadata': {'kind': 'cycle_summary', 'stage': stage, 'data': content, 'run_id': 'r1'},
     }
 
 
 def _unrelated_record(id: str, metadata: dict | None = None) -> dict:
-    """Build a mem0.get_all()-shaped record that must NOT enter either pool."""
+    """Build a scroll_by_metadata()-shaped record that must NOT enter either pool."""
     return {
         'id': id,
-        'memory': 'unrelated memory content',
         'created_at': '2026-01-01T00:00:00+00:00',
-        'metadata': metadata if metadata is not None else {'kind': 'observation'},
+        'metadata': metadata if metadata is not None else {
+            'kind': 'observation', 'data': 'unrelated memory content',
+        },
     }
 
 
@@ -626,16 +632,30 @@ class TestRun:
         ]
 
     def _make_memory(self, records: list[dict] | None = None) -> MagicMock:
+        """Build a mock memory whose mem0 backend exposes the scroll+count
+        contract. ``scroll_by_metadata`` returns only the kind=='cycle_summary'
+        records (the server-side metadata filter would never surface a
+        wrong-kind record like 'u1-wrong-kind'); ``count_by_metadata`` returns
+        the exact length of that same list, so the happy-path fixture never
+        trips the truncation guard. ``get_all`` is still mocked (as an
+        AsyncMock) purely so tests can assert it was never awaited.
+        """
         memory = MagicMock()
         mem0 = MagicMock()
-        mem0.get_all = AsyncMock(return_value={'results': records if records is not None else []})
+        all_records = records if records is not None else []
+        scroll_records = [
+            r for r in all_records if (r.get('metadata') or {}).get('kind') == 'cycle_summary'
+        ]
+        mem0.get_all = AsyncMock(return_value={'results': all_records})
+        mem0.scroll_by_metadata = AsyncMock(return_value=scroll_records)
+        mem0.count_by_metadata = AsyncMock(return_value=len(scroll_records))
         memory.mem0 = mem0
         memory.delete_memory = AsyncMock(return_value={'status': 'deleted'})
         return memory
 
     def _args(
         self, apply=False, project_id=None, keep_recent=2,
-        limit_per_project=1000, yes_i_am_sure=False,
+        limit_per_project=1000, yes_i_am_sure=False, scan_limit=10000,
     ) -> argparse.Namespace:
         return argparse.Namespace(
             apply=apply,
@@ -643,6 +663,7 @@ class TestRun:
             keep_recent=keep_recent,
             limit_per_project=limit_per_project,
             yes_i_am_sure=yes_i_am_sure,
+            scan_limit=scan_limit,
         )
 
     def _known_map(self, pid='dark_factory') -> dict:
@@ -706,19 +727,26 @@ class TestRun:
         assert 'u2-wrong-stage' not in all_deletion_ids
 
     @pytest.mark.asyncio
-    async def test_get_all_scoped_per_project_with_configured_limit(self):
-        """mem0.get_all is awaited once per selected project, scoped to that
-        project_id, with limit=args.limit_per_project (the scan/safety-cap value)."""
+    async def test_scan_uses_metadata_filtered_scroll(self):
+        """scroll_by_metadata (NOT get_all) is awaited once per selected
+        project, scoped to that project_id, filtered to
+        {'kind': 'cycle_summary'}, with limit=args.scan_limit. Content-based
+        classification still works end-to-end via metadata['data'] -- the
+        older remediation-bearing s1 summary is still preserved."""
         memory = self._make_memory(self._fixture_records())
-        args = self._args(apply=False, project_id='dark_factory', limit_per_project=500)
+        args = self._args(apply=False, project_id='dark_factory', scan_limit=10000)
 
-        await _mod.run(args, memory=memory, known_projects_map=self._known_map())
+        report = await _mod.run(args, memory=memory, known_projects_map=self._known_map())
 
-        memory.mem0.get_all.assert_awaited_once()
-        call = memory.mem0.get_all.call_args
-        scope_arg = call.args[0] if call.args else call.kwargs.get('scope')
-        assert scope_arg.project_id == 'dark_factory'
-        assert call.kwargs.get('limit') == 500
+        memory.mem0.scroll_by_metadata.assert_awaited_once()
+        call = memory.mem0.scroll_by_metadata.call_args
+        assert call.args[0].project_id == 'dark_factory'
+        assert call.args[1] == {'kind': 'cycle_summary'}
+        assert call.kwargs.get('limit') == 10000
+        memory.mem0.get_all.assert_not_awaited()
+
+        mc = report['projects']['dark_factory']['memory_consolidator']
+        assert mc['preserved_remediation'] == 1
 
     @pytest.mark.asyncio
     async def test_unknown_project_id_aborts_before_get_all(self):
@@ -729,4 +757,5 @@ class TestRun:
         result = await _mod.run(args, memory=memory, known_projects_map={'dark_factory': '/p'})
 
         assert result.get('aborted') is True
-        memory.mem0.get_all.assert_not_awaited()
+        memory.mem0.scroll_by_metadata.assert_not_awaited()
+        memory.mem0.count_by_metadata.assert_not_awaited()
