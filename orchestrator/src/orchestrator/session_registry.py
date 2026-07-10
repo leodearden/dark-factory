@@ -765,6 +765,88 @@ def release_lease(name: str, *, root: Path | str | None = None) -> bool:
     return existed
 
 
+@dataclass(frozen=True)
+class ReapedLease:
+    """One ``.lease`` file removed by reap_stale_leases.
+
+    path: the removed ``<name>.lease`` file.
+    lease_name: the lease's identity, derived from the filename itself
+        (the stem of *path*) -- never from the body, so a corrupt/missing
+        body is still reapable.
+    reason: why it was reaped -- ``'stale_pid'`` (holder pid dead and the
+        heartbeat is older than LEASE_HEARTBEAT_TTL) or ``'corrupt'`` (body
+        missing/unparseable and older than LEASE_HEARTBEAT_TTL).
+    """
+
+    path: Path
+    lease_name: str
+    reason: str
+
+
+def reap_stale_leases(
+    root: Path | str | None = None,
+    *,
+    now: datetime | None = None,
+) -> list[ReapedLease]:
+    """Sweep ``<root>/leases/*.lease`` and remove stale lease files.
+
+    Structural copy of reap_stale_records (PRD §4.8): identity (which file
+    to remove) is derived from the *path* -- the ``<name>.lease`` filename
+    stem -- never from the body, so a corrupt or unreadable lease body is
+    still reapable. Age is measured from the lease file's mtime, the same
+    heartbeat clock claim_lease/heartbeat_lease bump.
+
+    Rules (first match wins):
+    - lease body unreadable (missing or corrupt) and age >
+      LEASE_HEARTBEAT_TTL -> reaped, reason='corrupt'.
+    - holder pid is dead and age > LEASE_HEARTBEAT_TTL -> reaped,
+      reason='stale_pid'.
+    - otherwise -> kept -- in particular a LIVE holder is never reaped,
+      regardless of heartbeat age (mirrors reap_stale_records' non-terminal
+      live-pid rule).
+
+    *now* is injectable for deterministic tests; defaults to the real UTC
+    clock.
+    """
+    if now is None:
+        now = datetime.now(UTC)
+    base = leases_dir(root)
+    reaped: list[ReapedLease] = []
+    if not base.is_dir():
+        return reaped
+
+    for lease_path in sorted(base.glob('*.lease')):
+        if not lease_path.is_file():
+            continue
+        lease_name = lease_path.stem
+        try:
+            mtime = lease_path.stat().st_mtime
+        except OSError:
+            continue  # vanished mid-sweep (e.g. concurrent reap) -- skip it
+        age_secs = (now - datetime.fromtimestamp(mtime, tz=UTC)).total_seconds()
+        stale = age_secs > LEASE_HEARTBEAT_TTL.total_seconds()
+
+        try:
+            holder = LeaseHolder.from_json(lease_path.read_text())
+        except (OSError, json.JSONDecodeError, KeyError, TypeError, ValueError):
+            reason = 'corrupt' if stale else None
+        else:
+            reason = 'stale_pid' if (not _pid_alive(holder.pid)) and stale else None
+
+        if reason is not None:
+            try:
+                lease_path.unlink()
+            except OSError:
+                # A single unreapable lease (permission error, a concurrent
+                # reap/release race) must not abort the sweep -- log and
+                # move on to the next candidate.
+                logger.error('reap_stale_leases: failed to remove %s', lease_path, exc_info=True)
+                continue
+            reaped.append(ReapedLease(path=lease_path, lease_name=lease_name, reason=reason))
+
+    return reaped
+
+
 # ---------------------------------------------------------------------------
 # CLI + fail-soft (PRD: a registry fault must never change the spawn's exit code)
 # ---------------------------------------------------------------------------
