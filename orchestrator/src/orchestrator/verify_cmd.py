@@ -47,9 +47,10 @@ class VerifyCmd:
     reassembles the shell string from these fields.
 
     Raw-retained (``raw is not None``): either OPAQUE (genuinely unparseable
-    or unrecognised — every mutator no-ops, see P1) or a RECOGNISED-BUT-
-    UNSTRUCTURABLE multi-segment chain (a cargo or pytest ``&&``-chain that
-    ``parse_config_command`` couldn't safely split into one tool invocation).
+    or unrecognised — every mutator except ``govern_cpu`` no-ops, see P1) or
+    a RECOGNISED-BUT-UNSTRUCTURABLE multi-segment chain (a cargo or pytest
+    ``&&``-chain that ``parse_config_command`` couldn't safely split into
+    one tool invocation).
     For the latter, ``tool`` names the chain's dominant tool so the matching
     chain-aware mutator (``cargo_scope`` / ``serial_pytest``) can still act —
     via a localised regex rewrite of ``raw`` — while every other mutator
@@ -265,20 +266,26 @@ def render(cmd: VerifyCmd) -> str:
     computed above is wrapped as an outermost ``<exec> --role merge --
     /bin/bash -c <quoted-inner>``: the ``shlex.quote``d inner payload keeps
     any shell operators (``&&``, ``|``, ...) inside it intact, including for
-    a raw-retained chain (migrates ``_maybe_govern_merge_cmd``'s bash-wrap).
-    OPAQUE never carries a govern wrapper (P1 — ``govern_cpu`` no-ops on it).
+    a raw-retained chain OR an OPAQUE command (migrates
+    ``_maybe_govern_merge_cmd``'s bash-wrap, which unconditionally wrapped
+    ANY non-``None`` command for ``role=='merge'`` — see ``govern_cpu``'s
+    docstring for why OPAQUE is the one deliberate exemption from P1).
 
-    Invariant asserts (defensive — no mutator produces these states; they
-    catch a hand-constructed VerifyCmd that bypassed a no-op guard): **P1**
-    OPAQUE must never have been mutated — ``uv_project``/``cwd_rel``/
-    ``wrappers`` are empty and ``targets`` is empty. **P3** ANY raw-retained
-    command (OPAQUE or a recognised-but-unstructurable chain) carries no
-    meaningful ``cwd_rel``/``targets`` — neither field is legitimately
-    settable once ``raw`` is retained (``cargo_scope``/``serial_pytest``
-    rewrite ``raw`` itself instead), so render() never has a reason to
-    treat ``targets`` as worktree-root-relative there. ``wrappers`` is
-    exempt from the P3 check — a raw-retained chain legitimately carries a
-    ``govern_cpu`` wrapper (the "legitimate wrapper context").
+    Invariant asserts (defensive — no mutator other than ``govern_cpu``
+    produces these states; they catch a hand-constructed VerifyCmd that
+    bypassed a no-op guard): **P1** OPAQUE must never have been mutated
+    except via ``govern_cpu`` — ``uv_project``/``cwd_rel`` stay at their
+    parse-time defaults and ``targets`` stays empty; ``wrappers`` MAY
+    legitimately carry a ``govern_cpu`` entry (merge-role cpu governance
+    must still apply to an OPAQUE/arbitrary-shell command — see
+    ``govern_cpu``). **P3** ANY raw-retained command (OPAQUE or a
+    recognised-but-unstructurable chain) carries no meaningful
+    ``cwd_rel``/``targets`` — neither field is legitimately settable once
+    ``raw`` is retained (``cargo_scope``/``serial_pytest`` rewrite ``raw``
+    itself instead), so render() never has a reason to treat ``targets`` as
+    worktree-root-relative there. ``wrappers`` is exempt from the P3 check
+    too — a raw-retained command legitimately carries a ``govern_cpu``
+    wrapper (the "legitimate wrapper context").
     """
     if cmd.raw is not None:
         assert cmd.cwd_rel is None and not cmd.targets, (
@@ -286,8 +293,9 @@ def render(cmd: VerifyCmd) -> str:
             'chain) must not carry cwd_rel/targets (P3)'
         )
         if cmd.tool is ToolKind.OPAQUE:
-            assert cmd.uv_project is None and not cmd.wrappers, (
-                'render: OPAQUE VerifyCmd must never be mutated (P1)'
+            assert cmd.uv_project is None, (
+                'render: OPAQUE VerifyCmd must never be mutated other than '
+                'via govern_cpu (P1)'
             )
         inner = cmd.raw
     else:
@@ -491,15 +499,23 @@ def govern_cpu(cmd: VerifyCmd, exec_path: str | None) -> VerifyCmd:
 
     ``render`` recognises any ``wrappers`` entry other than the ``'npx'``
     sentinel as a resolved cpu-governed-exec path and wraps the *entire*
-    rendered command — structured or raw-retained chain alike — as an
-    outermost ``<exec> --role merge -- /bin/bash -c <quoted-inner>``
+    rendered command — structured, raw-retained chain, or OPAQUE alike — as
+    an outermost ``<exec> --role merge -- /bin/bash -c <quoted-inner>``
     (migrates ``_maybe_govern_merge_cmd``'s bash-wrap; the ``shlex.quote``d
     inner payload preserves shell operators like ``&&`` inside a
-    raw-retained chain intact).
+    raw-retained/OPAQUE command intact).
 
-    A no-op when *exec_path* is falsy (``''``/``None`` — governance not
-    configured/resolved) or ``cmd.tool is ToolKind.OPAQUE`` (P1).
+    A no-op only when *exec_path* is falsy (``''``/``None`` — governance not
+    configured/resolved). Unlike every other mutator, ``govern_cpu`` does
+    NOT no-op on ``cmd.tool is ToolKind.OPAQUE`` — this is the sole
+    deliberate exemption from P1. The historical ``_maybe_govern_merge_cmd``
+    bash-wrapped ANY non-``None`` command for ``role=='merge'`` regardless
+    of shape, and OPAQUE is exactly the "arbitrary/unparseable shell" case
+    that bash-wrap exists for (e.g. dark_factory's multi-clause
+    ``lint_command``/``type_check_command`` chains, which parse OPAQUE —
+    see ``_parse_chain`` — yet must still receive merge-weighted cgroup
+    scope like every other merge verify command).
     """
-    if cmd.tool is ToolKind.OPAQUE or not exec_path:
+    if not exec_path:
         return cmd
     return replace(cmd, wrappers=(*cmd.wrappers, exec_path))

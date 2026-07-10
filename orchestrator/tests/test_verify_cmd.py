@@ -634,11 +634,44 @@ class TestGovernCpu:
         assert govern_cpu(cmd, '') == cmd
         assert govern_cpu(cmd, None) == cmd
 
-    def test_noop_on_opaque(self):
-        """govern_cpu on OPAQUE is a no-op (P1); OPAQUE still renders to its raw."""
+    def test_opaque_command_still_wrapped(self):
+        """govern_cpu applies to OPAQUE too — the sole deliberate P1 exemption.
+
+        The historical _maybe_govern_merge_cmd bash-wrapped ANY non-None
+        command for role=='merge' regardless of shape; OPAQUE (arbitrary/
+        unparseable shell) is exactly the case that safe bash-wrap exists
+        for. Dropping merge cpu-governance for OPAQUE would silently starve
+        dark_factory's real lint_command/type_check_command chains (which
+        parse OPAQUE — see TestParseChain) of the merge-weighted cgroup
+        scope every other merge verify command gets.
+        """
         cmd = parse_config_command('mypy src/')
-        assert govern_cpu(cmd, self._EXEC) == cmd
-        assert render(cmd) == 'mypy src/'
+        assert cmd.tool is ToolKind.OPAQUE
+
+        result = render(govern_cpu(cmd, self._EXEC))
+        expected = f'{shlex.quote(self._EXEC)} --role merge -- /bin/bash -c {shlex.quote("mypy src/")}'
+        assert result == expected
+
+    def test_chained_non_pytest_non_cargo_merge_command_still_governed(self):
+        """A chained lint-style command (ruff-check && a follow-up script) is
+
+        the real dark_factory.orchestrator.config.yaml lint_command/
+        type_check_command shape: multi-clause, non-pytest/non-cargo, so
+        parse_config_command classifies it OPAQUE (_parse_chain only
+        recognises pytest/cargo chains). It must still be cpu-governed on
+        merge, matching the historical unconditional bash-wrap.
+        """
+        raw = (
+            'uv run ruff check shared escalation && '
+            'python3 fused-memory/scripts/check_bare_magicmock_config.py shared/tests'
+        )
+        cmd = parse_config_command(raw)
+        assert cmd.tool is ToolKind.OPAQUE
+        assert cmd.raw == raw
+
+        result = render(govern_cpu(cmd, self._EXEC))
+        expected = f'{shlex.quote(self._EXEC)} --role merge -- /bin/bash -c {shlex.quote(raw)}'
+        assert result == expected
 
 
 class TestRenderInvariantAsserts:
