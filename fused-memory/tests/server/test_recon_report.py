@@ -2704,8 +2704,9 @@ class TestReconReportFlagTypeInheritance:
 
 class TestReconReportOverlengthTruncation:
     """add_finding must gracefully truncate overlength description /
-    suggested_action fields rather than storing them unbounded, surfacing a
-    'warnings' entry on the response ONLY when truncation actually occurred.
+    suggested_action / category fields rather than storing them unbounded,
+    surfacing a 'warnings' entry on the response ONLY when truncation
+    actually occurred.
     """
 
     def _make_state(self):
@@ -2769,6 +2770,40 @@ class TestReconReportOverlengthTruncation:
         item = report['flagged_items'][0]
         assert item['suggested_action'] == 'y' * _MAX_FINDING_TEXT_CHARS + _TRUNCATION_MARKER
         assert item['description'] == 'd'
+
+    def test_overlength_category_is_truncated_with_warning(self):
+        """category is free text supplied by the calling agent (unlike
+        severity, which is a short enum-like label) and is surfaced verbatim
+        in the assembled report, so it is capped the same way as
+        description/suggested_action.
+        """
+        from fused_memory.server.recon_report import (
+            _MAX_FINDING_TEXT_CHARS,
+            _TRUNCATION_MARKER,
+        )
+
+        state, _ = self._make_state()
+        state.start_report(run_id='r1', stage='s1', project_id='dark_factory')
+
+        overlength = 'z' * (_MAX_FINDING_TEXT_CHARS + 500)
+        result = state.add_finding(
+            run_id='r1',
+            severity='low',
+            category=overlength,
+            description='d',
+            suggested_action='a',
+        )
+        assert 'finding_id' in result, f'add_finding failed: {result}'
+        assert 'warnings' in result
+        assert result['warnings']
+        assert any('category' in w for w in result['warnings'])
+
+        report = state.get_assembled_report('r1', 's1')
+        assert report is not None
+        item = report['flagged_items'][0]
+        assert item['category'] == 'z' * _MAX_FINDING_TEXT_CHARS + _TRUNCATION_MARKER
+        assert item['description'] == 'd'
+        assert item['suggested_action'] == 'a'
 
     def test_short_finding_has_no_warnings_key(self):
         state, _ = self._make_state()
@@ -3086,6 +3121,49 @@ class TestReconReportDeleteFinding:
             severity='low',
             category='informational',
             description='shared observation',
+            suggested_action='none',
+            actionable=False,
+        )
+        assert 'finding_id' in refiled, f'refile after delete failed: {refiled}'
+        assert refiled['finding_id'] != fid_a
+
+    def test_delete_blank_null_null_finding_then_refile_allocates_independently(self):
+        """A null-null finding whose description is blank/whitespace-only
+        normalizes to '' and is therefore never entered into the
+        description-hash dedup index in the first place (add_finding skips
+        indexing when _normalize_description(description) is falsy).
+        Deleting such a finding exercises the branch of delete_finding's
+        index cleanup where BOTH the signature and description-hash
+        cleanups are skipped (sig == (None, None) and the normalized
+        description is falsy) -- this must neither raise nor corrupt state,
+        and the finding must still be fully and independently removable.
+        """
+        state, _ = self._make_state()
+        state.start_report(run_id='r1', stage='s1', project_id='dark_factory')
+
+        added = state.add_finding(
+            run_id='r1',
+            severity='low',
+            category='informational',
+            description='   ',
+            suggested_action='none',
+            actionable=False,
+        )
+        fid_a = added['finding_id']
+
+        delete_result = state.delete_finding('r1', fid_a)
+        assert delete_result == {'status': 'deleted', 'finding_id': fid_a}
+        assert state._resolve_finding('r1', fid_a) is None
+
+        report = state.get_assembled_report('r1', 's1')
+        assert report is not None
+        assert report['flagged_items'] == []
+
+        refiled = state.add_finding(
+            run_id='r1',
+            severity='low',
+            category='informational',
+            description='   ',
             suggested_action='none',
             actionable=False,
         )

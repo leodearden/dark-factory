@@ -133,12 +133,16 @@ def _traces_exclusively_to_stage1(
 
 
 # ---------------------------------------------------------------------------
-# Fix 2 helpers — overlength description/suggested_action truncation (task-2410)
+# Fix 2 helpers — overlength description/suggested_action/category truncation
+# (task-2410)
 # ---------------------------------------------------------------------------
 
 # Generous cap: legitimate findings never come close to this; only
 # pathological input (e.g. a runaway agent dumping a huge blob into
-# description/suggested_action) is ever capped.
+# description/suggested_action/category) is ever capped.  severity is
+# intentionally NOT capped: it is expected to be a short enum-like label
+# (e.g. 'low'/'moderate'/'high'), not open-ended free text, so it does not
+# carry the same pathological-length risk as the three free-text fields.
 _MAX_FINDING_TEXT_CHARS = 10_000
 _TRUNCATION_MARKER = '…[truncated]'
 
@@ -231,8 +235,8 @@ def _duplicate_finding_error(
     """Build the duplicate_finding error dict, optionally carrying truncation
     warnings (task-2410).
 
-    add_finding truncates description/suggested_action BEFORE the dedup
-    check runs (see its docstring), so a caller whose overlength input turns
+    add_finding truncates description/suggested_action/category BEFORE the
+    dedup check runs (see its docstring), so a caller whose overlength input turns
     out to be a duplicate must still learn its text was capped — the
     truncated text itself is discarded (a duplicate is never stored), but
     the warning is not.  Mirrors the success-path contract: ``'warnings'``
@@ -411,7 +415,7 @@ class ReconReportState:
         collapses onto the canonical finding instead of allocating a distinct
         ``(task_id, None)`` row.
 
-        ``description``/``suggested_action`` are truncated to
+        ``description``/``suggested_action``/``category`` are truncated to
         ``_MAX_FINDING_TEXT_CHARS`` BEFORE dedup hashing (task-2410;
         see :func:`_truncate_field`).  One consequence for the null-null
         (no task_id/flag_type) path: the description-hash dedup key is
@@ -420,6 +424,11 @@ class ReconReportState:
         characters and differ only in the truncated-away tail collapse into
         a single finding. This is an accepted tradeoff at today's generous
         10_000-char cap — revisit only if the cap is ever tightened.
+        ``category`` is capped alongside description/suggested_action
+        because it is free text supplied by the calling agent and is
+        surfaced verbatim in the assembled report; ``severity`` is left
+        unbounded as it is expected to be a short enum-like label (see the
+        module-level comment above ``_MAX_FINDING_TEXT_CHARS``).
         """
         entry = self._resolve_entry(run_id)
         if entry is None:
@@ -439,7 +448,11 @@ class ReconReportState:
         # Fix 2 (task-2410): gracefully cap pathologically long text fields
         # BEFORE dedup hashing, so the stored text, the assembled-report
         # value, and the null-null description-hash dedup key all derive
-        # from the same (possibly-capped) string.
+        # from the same (possibly-capped) string.  category is capped here
+        # too (same free-text-from-a-runaway-agent risk as description/
+        # suggested_action); it does not participate in dedup hashing, so
+        # its ordering relative to the dedup check below is not load-bearing
+        # the way description's is.
         warnings: list[str] = []
         description, description_truncated = _truncate_field(description, _MAX_FINDING_TEXT_CHARS)
         if description_truncated:
@@ -449,6 +462,9 @@ class ReconReportState:
         )
         if suggested_action_truncated:
             warnings.append(f'suggested_action truncated to {_MAX_FINDING_TEXT_CHARS} chars')
+        category, category_truncated = _truncate_field(category, _MAX_FINDING_TEXT_CHARS)
+        if category_truncated:
+            warnings.append(f'category truncated to {_MAX_FINDING_TEXT_CHARS} chars')
 
         # In-run dedup: two separate namespaces.
         # (1) Signature path: (task_id, flag_type) != (None, None) — O(1) lookup in
@@ -579,7 +595,14 @@ class ReconReportState:
             )
             return _ERR_ALREADY_COMPLETED.copy()
 
-        owning_entry.findings.remove(finding)
+        # Identity-based removal (not list.remove(), which dispatches to
+        # _Finding's dataclass-generated __eq__): _resolve_finding returned
+        # this exact object by reference from owning_entry.findings, so
+        # filtering by `is` makes the "remove precisely the resolved
+        # object" invariant explicit rather than relying on field-by-field
+        # equality (harmless today since finding_id is unique and is one of
+        # the compared fields, but identity is the actual invariant).
+        owning_entry.findings[:] = [f for f in owning_entry.findings if f is not finding]
         self._run_finding_index.get(run_id, {}).pop(finding_id, None)
 
         sig = (finding.task_id, finding.flag_type)
