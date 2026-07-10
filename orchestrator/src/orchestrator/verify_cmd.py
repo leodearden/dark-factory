@@ -153,7 +153,10 @@ def _parse_single_segment(raw: str, tokens: list[str]) -> VerifyCmd:
         cwd_rel = tokens[idx + 1]
         idx += 3
 
-    # Peel a `uv run [--project X | --directory X]` wrapper. uv_project is
+    # Peel a `uv run [--project X] [--directory X]` wrapper — both flags may
+    # appear together (in either order; real per-subproject commands carry
+    # both: `uv run --project orchestrator --directory orchestrator pyright
+    # ...`), so this loops rather than peeling at most one. uv_project is
     # tri-state: None = no uv wrapper at all; '' = bare `uv run <tool>`
     # (uv-wrapped, no explicit project — see reproject()); non-empty = an
     # explicit --project was given.
@@ -161,12 +164,15 @@ def _parse_single_segment(raw: str, tokens: list[str]) -> VerifyCmd:
     if tokens[idx : idx + 2] == ['uv', 'run']:
         idx += 2
         uv_project = ''
-        if tokens[idx : idx + 1] == ['--project'] and len(tokens) > idx + 1:
-            uv_project = tokens[idx + 1]
-            idx += 2
-        elif tokens[idx : idx + 1] == ['--directory'] and len(tokens) > idx + 1:
-            cwd_rel = tokens[idx + 1]
-            idx += 2
+        while True:
+            if tokens[idx : idx + 1] == ['--project'] and len(tokens) > idx + 1:
+                uv_project = tokens[idx + 1]
+                idx += 2
+            elif tokens[idx : idx + 1] == ['--directory'] and len(tokens) > idx + 1:
+                cwd_rel = tokens[idx + 1]
+                idx += 2
+            else:
+                break
 
     rest = tokens[idx:]
 

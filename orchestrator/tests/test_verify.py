@@ -22,7 +22,6 @@ from orchestrator.verify import (
     _is_structural_python_file,
     _is_test_file,
     _maybe_prune_archive,
-    _reproject_bare_uv_run,
     _resolve_verify_env,
     _root_plus_single_subproject_prefix,
     _run_cmd,
@@ -4067,93 +4066,6 @@ class TestBuildFallbackConfigConftest:
         assert result is not None
         assert result.test_command == 'pytest a ab/test_x.py'
         assert 'conftest.py' not in result.test_command
-
-
-class TestReprojectBareUvRun:
-    """`_reproject_bare_uv_run` rewrites a bare ``uv run <tool>`` into a uv context that has the tool.
-
-    Task 2036: the repo-root ``pyproject.toml`` is a depless uv workspace
-    coordinator, so ``uv run ruff check <file>`` run from the workspace root
-    fails to spawn ruff (rc=2). ``uv run --project <member> ruff check <file>``
-    selects a ruff-bearing member's venv while leaving cwd (and therefore
-    root-relative path resolution) alone.
-    """
-
-    def test_reprojects_bare_uv_run_ruff_check(self):
-        """`uv run ruff check <file>` gains `--project shared` immediately after `uv run`."""
-        result = _reproject_bare_uv_run(
-            'uv run ruff check tests/scripts/foo.py', 'ruff check', 'shared'
-        )
-        assert result == 'uv run --project shared ruff check tests/scripts/foo.py'
-
-    def test_reprojects_bare_uv_run_pyright(self):
-        """`uv run pyright <file>` gains `--project shared` immediately after `uv run`."""
-        result = _reproject_bare_uv_run(
-            'uv run pyright tests/scripts/foo.py', 'pyright', 'shared'
-        )
-        assert result == 'uv run --project shared pyright tests/scripts/foo.py'
-
-    def test_command_with_existing_project_flag_unchanged(self):
-        """A command that already carries `--project` is left alone."""
-        cmd = 'uv run --project orchestrator ruff check x'
-        assert _reproject_bare_uv_run(cmd, 'ruff check', 'shared') == cmd
-
-    def test_command_with_existing_directory_flag_unchanged(self):
-        """A command that already carries `--directory` is left alone."""
-        cmd = 'uv run --directory foo ruff check x'
-        assert _reproject_bare_uv_run(cmd, 'ruff check', 'shared') == cmd
-
-    def test_npx_command_unchanged_no_uv_run(self):
-        """`npx pyright x` has no `uv run` prefix, so it is left alone."""
-        cmd = 'npx pyright x'
-        assert _reproject_bare_uv_run(cmd, 'pyright', 'shared') == cmd
-
-    def test_uv_run_without_tool_adjacency_unchanged(self):
-        """`uv run --extra dev mypy src` has no `uv run pyright` adjacency, so it is left alone."""
-        cmd = 'uv run --extra dev mypy src'
-        assert _reproject_bare_uv_run(cmd, 'pyright', 'shared') == cmd
-
-    def test_true_noop_command_unchanged(self):
-        """`true` has no `uv run`, so it is returned unchanged."""
-        assert _reproject_bare_uv_run('true', 'ruff check', 'shared') == 'true'
-
-    def test_none_command_returns_none(self):
-        """`None` is returned unchanged (propagates absent commands)."""
-        assert _reproject_bare_uv_run(None, 'ruff check', 'shared') is None
-
-    def test_idempotent_on_already_reprojected_command(self):
-        """Applying the helper twice yields the same string as applying it once."""
-        once = _reproject_bare_uv_run(
-            'uv run ruff check tests/scripts/foo.py', 'ruff check', 'shared'
-        )
-        twice = _reproject_bare_uv_run(once, 'ruff check', 'shared')
-        assert twice == once
-
-    def test_directory_flag_in_a_different_chained_clause_does_not_block_reprojection(self):
-        """A `--directory` in a *different* `&&` clause must not suppress reprojection.
-
-        Amendment (task 2036 review): the "already scoped" guard used to test
-        the whole command string for `--project`/`--directory`, so a chained
-        command whose *other* clause already carried `--directory` would bail
-        out entirely, leaving this clause's bare `uv run ruff check` unfixed.
-        This shape doesn't occur in current configs, but the guard must be
-        scoped to the matched clause, not the whole command.
-        """
-        cmd = 'uv run ruff check tests/scripts/foo.py && uv run --directory foo mypy bar'
-        result = _reproject_bare_uv_run(cmd, 'ruff check', 'shared')
-        assert result == (
-            'uv run --project shared ruff check tests/scripts/foo.py '
-            '&& uv run --directory foo mypy bar'
-        )
-
-    def test_project_flag_in_a_different_chained_clause_does_not_block_reprojection(self):
-        """A `--project` in a *preceding* `&&` clause must not suppress reprojection."""
-        cmd = 'uv run --project shared pytest tests/ && uv run ruff check tests/scripts/foo.py'
-        result = _reproject_bare_uv_run(cmd, 'ruff check', 'shared')
-        assert result == (
-            'uv run --project shared pytest tests/ '
-            '&& uv run --project shared ruff check tests/scripts/foo.py'
-        )
 
 
 class TestScopeFallbackToolToSubproject:

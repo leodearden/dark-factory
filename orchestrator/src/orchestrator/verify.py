@@ -12,7 +12,7 @@ import shlex
 import shutil
 import time
 import uuid
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Literal, TypedDict
@@ -33,6 +33,14 @@ from orchestrator.verify_categories import (
     PREEXISTING_BREAK_SKIP_CATEGORIES,  # noqa: F401 — re-exported for external consumers
     FailureCategory,
     should_archive,
+)
+from orchestrator.verify_cmd import (
+    ToolKind,
+    parse_config_command,
+    render,
+    reproject,
+    scope_to,
+    strip_cwd,
 )
 
 logger = logging.getLogger(__name__)
@@ -96,37 +104,60 @@ class VerifyInfraError(Exception):
         super().__init__(msg)
 
 
-def _scope_command(cmd: str | None, tool_keyword: str, files: list[str]) -> str | None:
-    """Narrow *cmd* to operate on *files* instead of whole directories.
+def _scope_to_keyword(cmd: str | None, keyword: str, files: list[str]) -> str | None:
+    """Narrow *cmd* to *files* by parsing the prefix through *keyword*, scoping, and rendering.
 
-    Finds *tool_keyword* in *cmd*, keeps everything up to and including it as
-    the prefix, extracts any dash-prefixed flags from the remainder, and
-    rebuilds the command as ``'{prefix} {files} {flags}'``.
+    Replaces the historical ``_scope_command`` + ``_strip_directory_flag`` /
+    ``_strip_leading_cd`` pairing: everything in *cmd* up to and including
+    the first occurrence of *keyword* is parsed as one tool invocation
+    (folding in any leading ``cd <dir> &&`` or uv ``--project``/
+    ``--directory`` context), its targets are replaced by *files*, any cwd
+    shift is cleared (the new targets are worktree-root-relative), and the
+    result is rendered back to a shell string. This eliminates the old
+    dash-token-harvesting mangling (verify.py's historical ``_scope_command``
+    regression): ``scope_to`` only ever replaces targets, never re-derives
+    flags from unparsed remainder text.
 
-    Returns:
-        ``None`` when *cmd* is ``None`` or *files* is empty.
-        The original *cmd* unchanged when *tool_keyword* is not found.
-        The scoped command otherwise.
+    Returns *cmd* unchanged (no scoping applied) when: *cmd* is ``None``;
+    *keyword* is not present in *cmd* (nothing recognisable to scope, e.g. a
+    no-op ``'true'`` or a ``mypy``-based command); or the *keyword*-prefix
+    does not parse into a single recognised, structured tool invocation
+    (P1 — an OPAQUE or raw-retained/unparseable prefix is left untouched
+    rather than truncated into a possibly-broken argv).
+
+    Content after the matched *keyword* occurrence — including any further
+    ``&&``-chained clause — is intentionally dropped: scoping to specific
+    files means running the tool once against them, not once per chained
+    segment (dark_factory's real per-subproject ``type_check_command`` /
+    ``lint_command`` chain multiple ``cd X && TOOL`` segments; scoping runs
+    only the first, matching the historical behaviour).
     """
     if cmd is None:
         return None
-    if not files:
-        return None
-
-    idx = cmd.find(tool_keyword)
+    idx = cmd.find(keyword)
     if idx == -1:
         return cmd
+    parsed = parse_config_command(cmd[: idx + len(keyword)])
+    if parsed.tool is ToolKind.OPAQUE or parsed.raw is not None:
+        return cmd
+    return render(strip_cwd(scope_to(parsed, files)))
 
-    prefix = cmd[: idx + len(tool_keyword)]
-    remainder = cmd[idx + len(tool_keyword):]
 
-    # Preserve any dash-prefixed flags from the original remainder
-    flags = [tok for tok in remainder.split() if tok.startswith('-')]
+def _reproject_str(cmd: str | None, project: str) -> str | None:
+    """Reproject a bare ``uv run <tool>`` command string into *project*'s uv context.
 
-    parts = [prefix] + files
-    if flags:
-        parts += flags
-    return ' '.join(parts)
+    Thin string-level wrapper around ``parse_config_command`` ->
+    ``reproject`` -> ``render`` (replaces ``_reproject_bare_uv_run``): a
+    no-op when *cmd* is ``None`` or does not parse into a structured,
+    non-OPAQUE VerifyCmd (covers ``'true'``/``mypy``-based commands, which
+    ``reproject`` would never touch anyway).
+    """
+    if cmd is None:
+        return None
+    parsed = parse_config_command(cmd)
+    if parsed.tool is ToolKind.OPAQUE or parsed.raw is not None:
+        return cmd
+    return render(reproject(parsed, project))
 
 
 def _is_test_file(path: str) -> bool:
@@ -215,50 +246,8 @@ def _is_structural_python_file(path: str, content: str) -> bool:
     return bool(_PROTOCOL_RE.search(content) or _TYPEDDICT_RE.search(content))
 
 
-def _strip_directory_flag(cmd: str | None, module_prefix: str) -> str | None:
-    """Remove ``--directory <module_prefix>`` from a ``uv run`` command.
-
-    When scoping to worktree-relative file paths, the ``--directory`` flag
-    would cause tools to resolve paths relative to the module subdirectory,
-    leading to double-prefixed paths that don't exist.  The ``--project``
-    flag is kept so ``uv`` still activates the correct venv.
-    """
-    if cmd is None:
-        return None
-    cmd = cmd.replace(f'--directory {module_prefix} ', '')
-    cmd = cmd.replace(f'--directory={module_prefix} ', '')
-    # Handle flag at end of string (no trailing space)
-    cmd = cmd.replace(f'--directory {module_prefix}', '')
-    cmd = cmd.replace(f'--directory={module_prefix}', '')
-    return ' '.join(cmd.split())
-
-
-def _strip_leading_cd(cmd: str | None) -> str | None:
-    """Strip a single leading ``cd <dir> &&`` segment from *cmd*.
-
-    The project's per-subproject lint/type commands begin with
-    ``cd <subproject> && <tool> …`` so each tool runs against that subproject's
-    config (e.g. ``cd fused-memory && npx pyright``).  In the fallback path
-    (:func:`_build_fallback_config`) the touched files live *outside* any
-    module — e.g. a root-level ``tests/scripts/test_spawn_claude.py`` — and the
-    scoped command targets a worktree-root-relative path.  A leading
-    ``cd <subproject> &&`` would then resolve that path inside the wrong
-    directory (``cd fused-memory && npx pyright tests/scripts/…`` → "File or
-    directory does not exist", rc 4).  Removing the leading ``cd … &&`` makes
-    the scoped command run from the worktree root where the path is valid.
-
-    Only the *leading* segment is stripped; any later ``cd`` in the original
-    chain has already been dropped by :func:`_scope_command`, which truncates
-    the command at the first tool keyword.  Commands without a leading ``cd``
-    (the common case) are returned unchanged.
-    """
-    if cmd is None:
-        return None
-    return re.sub(r'^\s*cd\s+\S+\s*&&\s*', '', cmd, count=1)
-
-
 # Workspace member whose venv declares ``ruff`` (shared/pyproject.toml: ``ruff>=0.4``).
-# Used by :func:`_reproject_bare_uv_run` to reproject a bare ``uv run <tool>`` fallback
+# Used by :func:`_reproject_str` to reproject a bare ``uv run <tool>`` fallback
 # command into a uv context that can actually spawn the tool.  Mirrors the proven
 # ``uv run --project shared pytest tests/scripts/`` pattern in scripts/orchestrator.yaml
 # for this exact repo-root directory.
@@ -274,56 +263,27 @@ _FALLBACK_UV_PROJECT = 'shared'
 _ROOT_OWNING_TEST_COMMAND = 'uv run --project shared pytest tests/scripts/'
 
 
-def _reproject_bare_uv_run(
-    cmd: str | None, tool_keyword: str, member: str = _FALLBACK_UV_PROJECT
-) -> str | None:
-    """Reproject a bare ``uv run <tool_keyword>`` command into a tool-bearing uv context.
+def _clause_containing(cmd: str, keyword: str) -> tuple[str, str, str] | None:
+    """Split *cmd* into ``(before, clause, after)`` around the segment containing *keyword*.
 
-    The repo-root ``pyproject.toml`` is a depless ``uv`` workspace *coordinator*
-    (``[tool.uv.workspace] members = [...]``, zero dependencies, no dev tooling).
-    Running ``uv run ruff check <file>`` (or any bare ``uv run <tool>``) from the
-    workspace root provisions a fresh env from that depless root project and fails
-    to spawn the tool (rc=2) — it only ever "works" interactively because a prior
-    ``uv sync`` happened to populate a member's ``.venv``.  Task 1647 prescribed the
-    fix — ``uv run --project <member> <tool> ...`` (``--project``, NOT
-    ``--directory``, so cwd stays at the worktree root and root-relative file paths
-    the scoper inserted still resolve) — but the fallback path (:func:`_build_fallback_config`,
-    task 2036) still emitted the bare form for repo-root files. This mirrors the
-    proven ``uv run --project shared pytest tests/scripts/`` pattern already used in
-    ``scripts/orchestrator.yaml`` for this same directory.
-
-    Returns *cmd* unchanged when:
-    - *cmd* is ``None``.
-    - ``uv run`` is not immediately followed by *tool_keyword* (e.g. ``npx pyright
-      ...``, ``uv run --extra dev mypy ...``, or ``true``).
-    - The matched ``&&``-delimited clause (the segment of *cmd* containing this
-      particular ``uv run <tool_keyword>`` occurrence, not the whole command)
-      already carries ``--project`` or ``--directory`` (an explicit uv context
-      is already set; don't second-guess it — this also protects already-scoped
-      per-module commands, though those never reach this helper). Scoping the
-      check to the matched clause means a *different* chained clause carrying
-      its own ``--project``/``--directory`` (e.g. an already-scoped
-      ``uv run --project shared pytest ... && uv run ruff check X``) does not
-      suppress reprojecting this clause's bare occurrence.
-
-    Otherwise, rewrites the single ``uv run `` occurrence immediately preceding
-    *tool_keyword* to ``uv run --project {member} ``.
+    *clause* is the ``&&``-delimited segment bounded by the nearest ``&&``
+    on either side of *keyword*'s position (or the start/end of *cmd*),
+    stripped of surrounding whitespace; *before*/*after* are the remaining
+    text verbatim (including the ``&&`` separator itself), so splicing
+    ``before + <rewritten clause> + after`` back together leaves every
+    other clause byte-identical. Returns ``None`` when *keyword* is absent.
     """
-    if cmd is None:
+    idx = cmd.find(keyword)
+    if idx == -1:
         return None
-    pattern = re.compile(r'\buv run\s+(?=' + re.escape(tool_keyword) + r'\b)')
-    match = pattern.search(cmd)
-    if not match:
-        return cmd
-    clause_start = cmd.rfind('&&', 0, match.start())
-    clause_start = clause_start + 2 if clause_start != -1 else 0
-    clause_end = cmd.find('&&', match.end())
-    if clause_end == -1:
-        clause_end = len(cmd)
-    clause = cmd[clause_start:clause_end]
-    if '--project' in clause or '--directory' in clause:
-        return cmd
-    return pattern.sub(f'uv run --project {member} ', cmd, count=1)
+    start = cmd.rfind('&&', 0, idx)
+    start = start + 2 if start != -1 else 0
+    while start < len(cmd) and cmd[start] == ' ':
+        start += 1
+    end = cmd.find('&&', idx)
+    if end == -1:
+        end = len(cmd)
+    return cmd[:start], cmd[start:end].rstrip(), cmd[end:]
 
 
 def _scope_fallback_tool_to_subproject(cmd: str | None, tool_keyword: str, sub: str) -> str | None:
@@ -336,9 +296,9 @@ def _scope_fallback_tool_to_subproject(cmd: str | None, tool_keyword: str, sub: 
     scoped to run *inside* that subpackage via ``uv run`` (task 2344), which
     syncs the subpackage's deps — including its dev group (e.g.
     ``hypothesis``) — as a side effect. TYPE and LINT, however, were left
-    running in the worktree-root uv context (``_reproject_bare_uv_run``'s
-    hardcoded ``_FALLBACK_UV_PROJECT``, or no uv context at all for a
-    non-uv-run runner like ``npx pyright``). Because verify runs test/lint/type
+    running in the worktree-root uv context (``_reproject_str``'s hardcoded
+    ``_FALLBACK_UV_PROJECT``, or no uv context at all for a non-uv-run
+    runner like ``npx pyright``). Because verify runs test/lint/type
     concurrently via one ``asyncio.gather``, TYPE/LINT would race the TEST
     command's sync and could deterministically fail to resolve a dev-only
     import (esc-2293-20). Rescoping TYPE/LINT to ``uv run --project <sub>``
@@ -346,62 +306,51 @@ def _scope_fallback_tool_to_subproject(cmd: str | None, tool_keyword: str, sub: 
     regardless of a warm or cold venv.
 
     *cmd* is expected to already be scoped to the touched files and stripped
-    of any leading ``cd`` (i.e. :func:`_scope_command` + :func:`_strip_leading_cd`
-    have already run) — this helper only adds/adjusts the uv context. In
-    practice that pipeline always yields a single ``&&``-clause (``_scope_command``
-    truncates at the first *tool_keyword* occurrence, dropping any trailing
-    clauses — see ``_build_fallback_config``). The "already scoped" check and
-    the insertion point below are nonetheless scoped to the single clause
-    containing *tool_keyword* — mirroring :func:`_reproject_bare_uv_run`'s own
-    clause-scoped guard (verify.py:295-302) rather than the whole command
-    string — so this helper stays correct if a multi-clause command ever
-    reaches it.
+    of any leading ``cd`` (i.e. :func:`_scope_to_keyword` has already run) —
+    this helper only adds/adjusts the uv context. In practice that pipeline
+    always yields a single ``&&``-clause; the guard below is nonetheless
+    scoped to the single clause containing *tool_keyword* (via
+    :func:`_clause_containing`) rather than the whole command string, so
+    this helper stays correct if a multi-clause command ever reaches it.
 
     Returns:
         ``None`` when *cmd* is ``None``.
         *cmd* unchanged when *tool_keyword* is not present (no-op ``true``,
-        an unrelated tool like ``mypy``).
-        The :func:`_reproject_bare_uv_run` result when it changed *cmd* (a
-        bare ``uv run <tool_keyword>`` is reprojected to
-        ``uv run --project <sub> <tool_keyword>``).
-        *cmd* unchanged when the clause containing *tool_keyword* already
-        carries ``--project`` or ``--directory`` (an explicit uv context is
-        already set for that clause; don't second-guess it — this
-        deliberately also covers a command explicitly pre-scoped to a
-        *different* member than *sub*, which is left alone rather than
-        re-targeted).
-        Otherwise, *cmd* with ``uv run --project <sub> `` inserted
-        immediately before that clause's content (a non-uv runner like
-        ``npx pyright``, or a bare tool invocation).
+        an unrelated tool like ``mypy``), or when the matched clause does
+        not parse into a single structured tool invocation (P1 — an
+        OPAQUE/unparseable clause is left untouched).
+        *cmd* with the matched clause reprojected (bare ``uv run
+        <tool_keyword>`` gains ``--project <sub>``, or — when the clause
+        carries no ``uv run`` wrapper at all, e.g. a bare ``npx pyright`` or
+        bare ``pyright`` invocation — with ``uv run --project <sub>``
+        prepended to it) when the clause carries no explicit
+        ``--project``/``--directory`` already.
+        *cmd* unchanged when the clause already carries ``--project`` or
+        ``--directory`` (an explicit uv context is already set for that
+        clause; don't second-guess it — this deliberately also covers a
+        command explicitly pre-scoped to a *different* member than *sub*,
+        which is left alone rather than re-targeted).
     """
     if cmd is None:
         return None
     if tool_keyword not in cmd:
         return cmd
-    reprojected = _reproject_bare_uv_run(cmd, tool_keyword, sub)
-    if reprojected != cmd:
-        return reprojected
-    # Clause-scope the guard (and the insertion point below) to the single
-    # `&&`-delimited clause containing *tool_keyword*, mirroring
-    # _reproject_bare_uv_run's own clause-scoped guard (verify.py:295-302)
-    # rather than testing/rewriting the whole command string. Every real
-    # caller today feeds a single-clause *cmd* (see docstring), so
-    # clause_start is always 0 in practice; scoping the logic keeps this
-    # helper correct — rather than silently skipping a needed rescope — if a
-    # multi-clause command with a foreign `--project`/`--directory` in an
-    # earlier clause ever reaches it (task 2355 review).
-    idx = cmd.find(tool_keyword)
-    clause_start = cmd.rfind('&&', 0, idx)
-    clause_start = clause_start + 2 if clause_start != -1 else 0
-    while clause_start < len(cmd) and cmd[clause_start] == ' ':
-        clause_start += 1
-    clause_end = cmd.find('&&', idx)
-    if clause_end == -1:
-        clause_end = len(cmd)
-    clause = cmd[clause_start:clause_end]
-    if '--project' in clause or '--directory' in clause:
+    split = _clause_containing(cmd, tool_keyword)
+    assert split is not None  # tool_keyword in cmd guarantees a match
+    before, clause, after = split
+    parsed = parse_config_command(clause)
+    if parsed.tool is ToolKind.OPAQUE or parsed.raw is not None:
         return cmd
-    return cmd[:clause_start] + f'uv run --project {sub} ' + cmd[clause_start:]
+    reprojected = reproject(parsed, sub)
+    if reprojected == parsed and parsed.uv_project is None:
+        # Not uv-wrapped at all — reproject() deliberately no-ops on this
+        # (it only reprojects an ALREADY-bare `uv run <tool>`), but this
+        # helper's own job additionally covers "no uv context whatsoever"
+        # by prepending one, closing the cold-verify dev-dep race above.
+        reprojected = replace(parsed, uv_project=sub)
+    if reprojected == parsed:
+        return cmd
+    return before + render(reprojected) + after
 
 
 # Cargo subcommands whose ``--workspace`` flag we know how to rewrite.  Other
@@ -1618,10 +1567,10 @@ def scope_module_config(
                     structural_trigger = f
                     break
 
-    # Build scoped commands with worktree-relative paths, then strip
-    # --directory so tools resolve paths from the worktree root
-    lint_cmd = _strip_directory_flag(
-        _scope_command(mc.lint_command, 'ruff check', scoped), mc.prefix)
+    # Build scoped commands with worktree-relative paths, then strip any cwd
+    # shift (leading `cd` or `--directory`) so tools resolve paths from the
+    # worktree root.
+    lint_cmd = _scope_to_keyword(mc.lint_command, 'ruff check', scoped)
     if has_structural:
         # Verbatim unscoped type check — mirrors the has_conftest test_cmd branch.
         # --directory is intentionally preserved so uv resolves src/ and tests/
@@ -1629,8 +1578,7 @@ def scope_module_config(
         type_cmd = mc.type_check_command
         logger.info('pyright unscoped: structural file %s in diff', structural_trigger)
     else:
-        type_cmd = _strip_directory_flag(
-            _scope_command(mc.type_check_command, 'pyright', scoped), mc.prefix)
+        type_cmd = _scope_to_keyword(mc.type_check_command, 'pyright', scoped)
     if has_conftest or has_test_data:
         # Full unscoped suite: conftest changes affect everything it shadows;
         # data-module changes (e.g. a σ-allowlist re-baseline) are consumed by
@@ -1638,8 +1586,7 @@ def scope_module_config(
         # the only safe scope.  Both branches mirror each other (task 1852).
         test_cmd = mc.test_command
     elif collectable_tests:
-        test_cmd = _strip_directory_flag(
-            _scope_command(mc.test_command, 'pytest', collectable_tests), mc.prefix)
+        test_cmd = _scope_to_keyword(mc.test_command, 'pytest', collectable_tests)
     else:
         test_cmd = None
 
@@ -1805,7 +1752,7 @@ def _build_fallback_config(
     ``uv run --extra dev --extra web pytest``), those are used directly so
     that tools not installed globally can still be reached.
 
-    For ``lint_command`` and ``type_check_command``, :func:`_scope_command`
+    For ``lint_command`` and ``type_check_command``, :func:`_scope_to_keyword`
     narrows the configured command to the touched files when the standard tool
     keyword appears (e.g. ``ruff check`` in ``uv run ruff check``), and
     returns the command unchanged when it doesn't (e.g. ``true`` or
@@ -1820,7 +1767,7 @@ def _build_fallback_config(
     guard for esc-2293-13 / task 2293).  Otherwise, the configured command is
     used as-is when it differs from the bare ``pytest`` default so that
     complex flag sequences like ``-m 'not slow' --ignore=tests/e2e`` are not
-    mangled by :func:`_scope_command`'s naive dash-token extraction.
+    mangled by :func:`_scope_to_keyword`'s prefix-then-parse approach.
 
     Returns ``None`` when no ``.py`` files are found.
     """
@@ -1851,23 +1798,19 @@ def _build_fallback_config(
     )
 
     # Lint and type commands: use configured commands when *config* is provided.
-    # _scope_command narrows to the touched files when the standard tool keyword
-    # appears in the command, and returns unchanged when it doesn't.
+    # _scope_to_keyword narrows to the touched files when the standard tool
+    # keyword appears in the command (folding in any leading `cd <subproject>
+    # &&`, since the fallback runs from the worktree root and a module-cd
+    # would misresolve the root-relative file path just scoped in), and
+    # returns the command unchanged when it doesn't. _reproject_str then
+    # reprojects a bare ``uv run <tool>`` into a tool-bearing member uv
+    # context (task 2036): the depless workspace-root project cannot spawn
+    # ruff/pyright.
     if config is not None:
-        # _strip_leading_cd drops a ``cd <subproject> &&`` prefix that the
-        # per-subproject lint/type commands carry: the fallback runs from the
-        # worktree root, so a module-cd would misresolve the root-relative file
-        # path the scoper just inserted. _reproject_bare_uv_run then reprojects
-        # a bare ``uv run <tool>`` into a tool-bearing member uv context (task
-        # 2036): the depless workspace-root project cannot spawn ruff/pyright.
-        lint_scoped = _strip_leading_cd(
-            _scope_command(config.lint_command, 'ruff check', py_files) or config.lint_command
-        )
-        lint_cmd = _reproject_bare_uv_run(lint_scoped, 'ruff check')
-        type_scoped = _strip_leading_cd(
-            _scope_command(config.type_check_command, 'pyright', py_files) or config.type_check_command
-        )
-        type_cmd = _reproject_bare_uv_run(type_scoped, 'pyright')
+        lint_scoped = _scope_to_keyword(config.lint_command, 'ruff check', py_files)
+        lint_cmd = _reproject_str(lint_scoped, _FALLBACK_UV_PROJECT)
+        type_scoped = _scope_to_keyword(config.type_check_command, 'pyright', py_files)
+        type_cmd = _reproject_str(type_scoped, _FALLBACK_UV_PROJECT)
     else:
         lint_scoped = lint_cmd = 'ruff check ' + ' '.join(py_files)
         type_scoped = type_cmd = 'pyright ' + ' '.join(py_files)
