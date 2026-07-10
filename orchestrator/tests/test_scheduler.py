@@ -6740,6 +6740,178 @@ class TestMilestoneEligibilityGate:
         )
 
 
+class TestStampMilestoneDepsSatisfied:
+    """Unit tests for the per-tick sweep
+    Scheduler._stamp_milestone_deps_satisfied (task 2335 β step-5/6).
+
+    Mirrors _gc_expired_cooldowns' shape: a side-effecting per-tick sweep
+    that keeps _eligible_for_dispatch / _milestone_time_gated pure. For each
+    pending 'delayed' milestone task without an anchor yet, it stamps the
+    frozen-once ``milestone_deps_satisfied_at`` wall-clock timestamp via
+    ``update_task(..., metadata_mode='merge')`` the instant the task's full
+    (local + external) deps become satisfied.
+    """
+
+    FIXED_DT = datetime(2026, 7, 10, 12, 0, 0, tzinfo=UTC)
+
+    @pytest.fixture
+    def scheduler(self) -> Scheduler:
+        config = OrchestratorConfig(max_per_module=1)
+        sched = Scheduler(config, wall_time_source=lambda: self.FIXED_DT)
+        sched.update_task = AsyncMock(return_value=True)
+        return sched
+
+    def _task(
+        self, task_id: str, metadata: dict, dependencies: list | None = None
+    ) -> dict:
+        return {
+            'id': task_id,
+            'status': 'pending',
+            'dependencies': dependencies or [],
+            'metadata': metadata,
+        }
+
+    @pytest.mark.asyncio
+    async def test_stamps_anchor_when_delayed_milestone_deps_satisfied(
+        self, scheduler: Scheduler
+    ):
+        """B2: dep X done -> exactly one update_task call stamping the
+        wall-clock anchor, with metadata_mode='merge'."""
+        task = self._task(
+            '5001',
+            {'milestone': {'mode': 'delayed', 'after_secs': 100}},
+            dependencies=[{'id': 'X'}],
+        )
+        tasks = [task]
+        status_map = {'X': 'done', '5001': 'pending'}
+        tasks_by_id = {'5001': task}
+
+        await scheduler._stamp_milestone_deps_satisfied(tasks, status_map, tasks_by_id)
+
+        scheduler.update_task.assert_awaited_once_with(
+            '5001',
+            {'milestone_deps_satisfied_at': self.FIXED_DT.isoformat()},
+            metadata_mode='merge',
+        )
+
+    @pytest.mark.asyncio
+    async def test_no_stamp_while_local_dep_unsatisfied(self, scheduler: Scheduler):
+        """No update_task while dep X is still pending."""
+        task = self._task(
+            '5002',
+            {'milestone': {'mode': 'delayed', 'after_secs': 100}},
+            dependencies=[{'id': 'X'}],
+        )
+        tasks = [task]
+        status_map = {'X': 'pending', '5002': 'pending'}
+        tasks_by_id = {'5002': task}
+
+        await scheduler._stamp_milestone_deps_satisfied(tasks, status_map, tasks_by_id)
+
+        scheduler.update_task.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_frozen_once_skips_task_with_existing_anchor(
+        self, scheduler: Scheduler
+    ):
+        """B4: a task that already carries milestone_deps_satisfied_at is
+        never re-stamped, even though its deps are (still) satisfied."""
+        existing_anchor = datetime(2026, 7, 1, tzinfo=UTC).isoformat()
+        task = self._task(
+            '5003',
+            {
+                'milestone': {'mode': 'delayed', 'after_secs': 100},
+                'milestone_deps_satisfied_at': existing_anchor,
+            },
+            dependencies=[{'id': 'X'}],
+        )
+        tasks = [task]
+        status_map = {'X': 'done', '5003': 'pending'}
+        tasks_by_id = {'5003': task}
+
+        await scheduler._stamp_milestone_deps_satisfied(tasks, status_map, tasks_by_id)
+
+        scheduler.update_task.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_dated_milestone_is_not_swept(self, scheduler: Scheduler):
+        """A 'dated' milestone has no deps-satisfied anchor concept — the
+        sweep must ignore it."""
+        task = self._task(
+            '5004', {'milestone': {'mode': 'dated', 'at': self.FIXED_DT.isoformat()}}
+        )
+        tasks = [task]
+        status_map = {'5004': 'pending'}
+        tasks_by_id = {'5004': task}
+
+        await scheduler._stamp_milestone_deps_satisfied(tasks, status_map, tasks_by_id)
+
+        scheduler.update_task.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_non_milestone_task_is_not_swept(self, scheduler: Scheduler):
+        """A plain pending task with no metadata.milestone is skipped."""
+        task = self._task('5005', {'files': ['backend']})
+        tasks = [task]
+        status_map = {'5005': 'pending'}
+        tasks_by_id = {'5005': task}
+
+        await scheduler._stamp_milestone_deps_satisfied(tasks, status_map, tasks_by_id)
+
+        scheduler.update_task.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_skips_when_external_dep_not_done(self, scheduler: Scheduler):
+        """The anchor must reflect BOTH local and external deps (PRD §2 gap
+        2): a not-done external dep withholds the stamp even with no local
+        deps at all."""
+        task = self._task(
+            '5006',
+            {
+                'milestone': {'mode': 'delayed', 'after_secs': 100},
+                'external_deps': ['other_project:99'],
+            },
+        )
+        tasks = [task]
+        status_map = {'5006': 'pending'}
+        tasks_by_id = {'5006': task}
+
+        await scheduler._stamp_milestone_deps_satisfied(
+            tasks, status_map, tasks_by_id,
+            external_status_cache={'other_project:99': 'pending'},
+            external_resolver_failed=False,
+        )
+
+        scheduler.update_task.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_stamps_when_external_dep_resolves_done(self, scheduler: Scheduler):
+        """Positive counterpart to the previous test: once the external dep
+        resolves to 'done', the anchor is stamped."""
+        task = self._task(
+            '5007',
+            {
+                'milestone': {'mode': 'delayed', 'after_secs': 100},
+                'external_deps': ['other_project:99'],
+            },
+        )
+        tasks = [task]
+        status_map = {'5007': 'pending'}
+        tasks_by_id = {'5007': task}
+
+        await scheduler._stamp_milestone_deps_satisfied(
+            tasks, status_map, tasks_by_id,
+            external_status_cache={'other_project:99': 'done'},
+            external_resolver_failed=False,
+        )
+
+        scheduler.update_task.assert_awaited_once_with(
+            '5007',
+            {'milestone_deps_satisfied_at': self.FIXED_DT.isoformat()},
+            metadata_mode='merge',
+        )
+
+
 # ---------------------------------------------------------------------------
 # Park-and-stop pause mechanism (task 1322)
 # ---------------------------------------------------------------------------
