@@ -16,7 +16,14 @@ import shlex
 
 import pytest
 
-from orchestrator.verify_cmd import ToolKind, VerifyCmd, parse_config_command, render, scope_to
+from orchestrator.verify_cmd import (
+    ToolKind,
+    VerifyCmd,
+    parse_config_command,
+    render,
+    scope_to,
+    strip_cwd,
+)
 
 
 class TestToolKind:
@@ -298,3 +305,42 @@ class TestScopeTo:
         cmd = parse_config_command('uv run --project fused-memory pyright fused-memory/')
         scoped = scope_to(cmd, ['fused-memory/tests/test_pyright_gate_probe.py'])
         assert render(scoped) == 'uv run --project fused-memory pyright fused-memory/tests/test_pyright_gate_probe.py'
+
+
+class TestStripCwd:
+    """strip_cwd(cmd) clears cwd_rel, unifying the leading-cd and --directory forms."""
+
+    def test_clears_cwd_rel_from_leading_cd(self):
+        cmd = parse_config_command('cd fused-memory && npx pyright')
+        assert cmd.cwd_rel == 'fused-memory'
+        assert strip_cwd(cmd).cwd_rel is None
+
+    def test_clears_cwd_rel_from_uv_directory_flag(self):
+        cmd = parse_config_command('uv run --directory fused-memory pytest tests/')
+        assert cmd.cwd_rel == 'fused-memory'
+        assert strip_cwd(cmd).cwd_rel is None
+
+    def test_strip_cwd_then_scope_to_root_relative_runs_from_worktree_root(self):
+        """Regression 4bb128496f: scoping a root-level file after stripping cwd
+
+        must not re-resolve the path inside the (now-stripped) subproject
+        directory — the rendered command must have no leading `cd` at all.
+        """
+        cmd = parse_config_command('cd fused-memory && uv run pytest tests/')
+        fixed = strip_cwd(cmd)
+        scoped = scope_to(fixed, ['tests/scripts/test_spawn_claude.py'])
+        assert render(scoped) == 'uv run pytest tests/scripts/test_spawn_claude.py'
+
+    def test_noop_on_opaque(self):
+        cmd = parse_config_command('mypy src/')
+        assert strip_cwd(cmd) == cmd
+
+    def test_noop_on_raw_retained_chain(self):
+        raw = 'cargo test --workspace && cargo test --workspace'
+        cmd = parse_config_command(raw)
+        assert strip_cwd(cmd) == cmd
+
+    def test_noop_when_no_cwd_set(self):
+        cmd = parse_config_command('pytest tests/x.py')
+        assert cmd.cwd_rel is None
+        assert strip_cwd(cmd) == cmd
