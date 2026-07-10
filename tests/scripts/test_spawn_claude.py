@@ -203,6 +203,36 @@ def _write_fake_claude_capturing_prompt(
     p.chmod(0o755)
 
 
+def _write_fake_claude_capturing_prompt_and_writing_result(
+    bin_dir: pathlib.Path, capture_file: pathlib.Path
+) -> None:
+    """Write a fake ``claude`` that captures its prompt argument (``$1``) to
+    *capture_file* AND writes an outcome-header result file to
+    ``$CLAUDE_SPAWN_RESULT_FILE`` (falling back to /dev/null when unset),
+    then exits 0.
+
+    Combines ``_write_fake_claude_capturing_prompt`` and
+    ``_write_fake_claude_writing_result`` so a single spawn can lock BOTH
+    halves of the result-handback protocol at once: whether a trailer was
+    appended to the prompt, and whether anything landed in a result.md.
+    """
+    p = bin_dir / "claude"
+    p.write_text(
+        f"#!/usr/bin/env bash\n"
+        f'printf %s "$1" > {capture_file!s}\n'
+        "cat > \"${CLAUDE_SPAWN_RESULT_FILE:-/dev/null}\" <<'EOF'\n"
+        "---\n"
+        "outcome: done\n"
+        "changed: none\n"
+        "action_needed: none\n"
+        "---\n"
+        "Test prose.\n"
+        "EOF\n"
+        "exit 0\n"
+    )
+    p.chmod(0o755)
+
+
 def _wait_for_path(path: pathlib.Path, timeout: float) -> None:
     """Poll until *path* exists, raising ``AssertionError`` on timeout."""
     deadline = time.monotonic() + timeout
@@ -1141,9 +1171,16 @@ def test_spawn_fail_soft_skips_result_handback_when_registry_faults(
     faults, so this should already pass without further implementation
     changes. Locks the fail-soft contract before any future change to the
     result-handback wiring.
+
+    Also captures the literal prompt claude received (via
+    _write_fake_claude_capturing_prompt_and_writing_result) and asserts it
+    is byte-identical to the bare original -- directly locking the "no
+    prompt trailer" half of the contract instead of leaving it implied by
+    the gating logic alone.
     """
     bin_dir = _make_bin_dir(tmp_path)
-    _write_fake_claude_writing_result(bin_dir)
+    capture_file = tmp_path / "captured_prompt.txt"
+    _write_fake_claude_capturing_prompt_and_writing_result(bin_dir, capture_file)
     _write_foreground_terminal(bin_dir, "xterm")
     env = _base_env(bin_dir, "xterm")
 
@@ -1174,4 +1211,15 @@ def test_spawn_fail_soft_skips_result_handback_when_registry_faults(
     )
     assert not list(tmp_path.rglob("result.md")), (
         "no result.md should be created anywhere when the registry write faults"
+    )
+
+    captured_prompt = capture_file.read_text()
+    assert captured_prompt == "test prompt", (
+        "expected NO result-handback trailer to be appended when the "
+        "registry write faults -- the captured prompt must equal the bare "
+        f"original with nothing appended, got:\n{captured_prompt!r}"
+    )
+    assert "result.md" not in captured_prompt, (
+        f"expected no 'result.md' substring anywhere in the prompt claude "
+        f"received, got:\n{captured_prompt!r}"
     )
