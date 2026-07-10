@@ -240,6 +240,76 @@ go `done`) and, only on a predicate check failure, `gate_escalated_at`
 (shared with "Deterministic task kind" above). A task author never sets
 either field.
 
+**Predicate exit-code contract (`before_done.kind`):** `before_done` gains a
+discriminator, `'deploy' | 'predicate'` (default `'deploy'` — every existing
+deterministic task is byte-identical). `kind='deploy'` is the existing
+act-then-done/ask behaviour above; `kind='predicate'` is check-then-done-or-
+escalate, new. In `kind='predicate'` mode the `DeterministicRunner` runs the
+script and decides by **exit code only** — it parses no output:
+
+| Exit code | Outcome |
+|---|---|
+| `0` | task `done`, `done_provenance.kind='deterministic-milestone'` (the script's stdout tail carried as `note`) |
+| non-`0` | born-at-L2 `milestone_check_failed` escalation (detail carries the exit code + stdout tail) + task `blocked` |
+| timeout | born-at-L2 `infra_issue` escalation (existing timeout path) + task `blocked`, **no** `gate_escalated_at` stamp |
+
+A predicate is **read-only**, so resolving the escalation (`resume`) safely
+**re-runs** the check rather than trusting the resolution blindly — it drives
+to `done` or re-files `milestone_check_failed` from whatever the check
+reports this time. `kind='predicate'` **forbids** `before_done.target_unit`
+(no unit to verify — no systemd inspect / PID-verify on a read-only check)
+and forbids top-level `always_escalates=True` (predicate escalation is
+already conditional on a non-zero exit); the `submit_task` guard enforces
+both. A predicate never stamps `before_done_ran_at` / `before_done_verified_at`
+— re-running a read-only check on crash-resume is harmless.
+
+**Frozen-once delayed-anchor semantics:** for `mode='delayed'`, the scheduler
+stamps `milestone_deps_satisfied_at` in a per-tick sweep the first tick ALL
+of the task's dependencies (local and external) are `done`; the timer then
+runs `after_secs` from that anchor. The anchor is a **persisted wall-clock
+UTC ISO string**, not an in-memory/monotonic timer, so a multi-day delay
+**survives orchestrator restarts** — it's recomputed each tick from the
+persisted value, with no in-memory timer to lose. It is frozen-once: a later
+dependency regression never rewrites the anchor or restarts the timer.
+Dispatch still re-checks *live* deps at eligibility, though — a milestone
+fires only when both the timer has elapsed **and** deps are currently
+satisfied, so a regressed dependency still withholds dispatch even after the
+timer elapses. A `delayed` milestone with no dependencies has them trivially
+satisfied at filing, so its timer starts immediately. `mode='dated'` simply
+withholds while `now < at`. A malformed or unrecognized `metadata.milestone`
+value fails safe — withhold dispatch indefinitely, with a one-time WARNING
+log — rather than dispatch early or crash the tick.
+
+**Exemplar** (autonomous — no human involvement unless the check fails):
+"one week after task X lands, check merge flakiness is under 5%, else
+escalate." A deterministic task depending on X, with:
+
+```
+{
+  "milestone": {"mode": "delayed", "after_secs": 604800},  # 7 days
+  "before_done": {
+    "kind": "predicate",
+    "script": "scripts/check_merge_flakiness.sh",
+    "args": ["--window-days", "7", "--threshold", "0.05", "--value", "0.03"],
+    "timeout_secs": 120
+  },
+  "always_escalates": false
+}
+```
+
+(`--value` is normally populated by a wrapper that computes the measured
+rate from CI logs — out of scope here; the script only owns the threshold
+comparison, per its header.) The anchor stamps when X reaches `done`;
+`after_secs` later the check runs. Exit `0` → `done`
+(`deterministic-milestone`); non-zero → `milestone_check_failed` at L2 (same
+`agent_role` / severity / level as "Born-at-L2 escalations" above).
+
+**Cross-refs:** predicate mode is a new `before_done.kind` alongside
+`deploy` and reuses the `DeterministicRunner` — see "Deterministic task
+kind" above. The delayed anchor waits on the same local +
+`metadata.external_deps` dependency gate described in "Cross-project task
+dependencies" above.
+
 ## Session Lifecycle
 
 ### Starting a session
