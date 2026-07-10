@@ -37,6 +37,7 @@ from shared.task_transitions import derive_actor_class, is_legal_transition
 
 from fused_memory.backends.task_backend_errors import DuplicateCandidateKeyError
 from fused_memory.backends.task_backend_protocol import TaskBackendProtocol
+from fused_memory.middleware import recon_write_policy
 from fused_memory.middleware.lock_charter_guard import (
     directory_locks,
     extract_files,
@@ -3547,6 +3548,22 @@ class TaskInterceptor:
             return err
         tm = await self._ensure_taskmaster()
         project_id = resolve_project_id(project_root)
+        # W5-ζ ReconWritePolicy: only consulted for recon-stage callers.
+        # snapshot_token stays None here — wired to extract_snapshot_token
+        # once metadata-carrying snapshot checks land (task 2224 step-16).
+        if isinstance(agent_id, str) and agent_id.startswith('recon-stage-'):
+            before = await tm.get_task(task_id, project_root)
+            verdict = recon_write_policy.check(
+                'update_task',
+                task_id=task_id,
+                project_root=project_root,
+                agent_id=agent_id,
+                target_status=None,
+                live_status=_extract_status(before),
+                snapshot_token=None,
+            )
+            if verdict.is_rejection:
+                return verdict.to_error_dict()
         # WP-E: serialise the write; re-embed below reads only and stays
         # outside the lock.
         async with self._write_lock(project_id):
