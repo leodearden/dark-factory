@@ -497,3 +497,49 @@ def test_adopt_never_clobbers_an_existing_record(tmp_path):
     assert lane7_path.read_bytes() == before_bytes
     assert lane7_path.stat().st_mtime_ns == before_mtime_ns
     assert _read_lane_record(worktree_base, "_lane-8") == rec8
+
+
+# ---------------------------------------------------------------------------
+# step-9: RED -- --check/--dry-run preview only, no mutation
+# ---------------------------------------------------------------------------
+
+@pytest.mark.parametrize("flag", ["--check", "--dry-run"])
+def test_check_and_dry_run_preview_without_mutating(tmp_path, flag):
+    """Against a base with an ASSIGNED-worthy lane, --check/--dry-run must
+    print an intended-record line naming the lane + state, create NO
+    .lane-state/ files, never invoke systemctl, and leave the base's
+    on-disk state completely unchanged."""
+    worktree_base = _build_worktree_base(tmp_path, [
+        {"name": "_lane-7", "branch": "task/1234", "plan": {"title": "T"}},
+    ])
+
+    before_listing = sorted(p.relative_to(worktree_base) for p in worktree_base.rglob("*"))
+
+    result = _run_script(worktree_base, flag)
+
+    assert result.returncode == 0, (
+        f"Expected {flag} to exit 0; got {result.returncode}\n"
+        f"stdout={result.stdout!r} stderr={result.stderr!r}"
+    )
+    assert "_lane-7" in result.stdout and "assigned" in result.stdout, (
+        f"Expected an intended-record line naming the lane + state in "
+        f"stdout; got: {result.stdout!r}"
+    )
+    assert "Traceback" not in result.stdout and "Traceback" not in result.stderr, (
+        f"Unexpected traceback: stdout={result.stdout!r} stderr={result.stderr!r}"
+    )
+
+    lane_state_dir = worktree_base / LANE_STATE_DIRNAME
+    assert not lane_state_dir.exists(), (
+        f"Expected no {LANE_STATE_DIRNAME}/ directory to be created by {flag}"
+    )
+    assert _systemctl_calls(worktree_base) == [], (
+        f"Expected {flag} to never invoke systemctl; got calls="
+        f"{_systemctl_calls(worktree_base)!r}"
+    )
+
+    after_listing = sorted(p.relative_to(worktree_base) for p in worktree_base.rglob("*"))
+    assert after_listing == before_listing, (
+        f"Expected the base's on-disk listing to be byte-for-byte unchanged; "
+        f"before={before_listing!r} after={after_listing!r}"
+    )
