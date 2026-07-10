@@ -1659,3 +1659,19 @@ def test_main_write_decision_files_open_record(
     assert rec.session_id == 'watcher-df-99'
     assert rec.state == sr.DecisionState.OPEN
     assert rec.filed_at != ''
+
+
+def test_main_write_decision_prints_filed_id(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """The verb echoes the filed decision id on stdout so a watcher can
+    cross-link it into its in-session note / afk-digest line.
+    """
+    monkeypatch.setenv('CLAUDE_FLEET_ROOT', str(tmp_path))
+
+    rc = sr.main(['write-decision', '--id', 'dec-park-2', '--project', 'df', '--text', 'q'])
+
+    assert rc == 0
+    assert 'dec-park-2' in capsys.readouterr().out
