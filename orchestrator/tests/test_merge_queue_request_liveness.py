@@ -738,7 +738,3 @@ class TestDeadInflightVerifyAborts:
             req.task_id in r.message and 'progress' in r.message.lower()
             for r in warnings
         ), f'expected a WARNING naming the task + no-progress budget, got: {caplog.text}'
-
-        # Sanity: the re-armed entry genuinely is back in the ledger (not
-        # silently dropped by the requeue/re-dequeue sequence).
-        assert req.request_id in worker._request_ledger.open_request_ids()

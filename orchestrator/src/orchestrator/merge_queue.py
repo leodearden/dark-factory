@@ -4600,6 +4600,25 @@ class SpeculativeMergeWorker(_WipHaltMixin):
     # = 0.01) for fast, deterministic abort-path coverage.  Mirrors the MAX_*
     # monkeypatch convention above.
     VERIFY_ABANDON_POLL_SECS: float = 10.0
+    # task 2420 (DEFECT 1, split from 2357; extends #1728): no-progress
+    # budget for the in-flight verify abort-poll loop.  The #1728 alpha
+    # owner-heartbeat keeps a LIVE worker's merge worktree ROOT mtime fresh
+    # every _HEARTBEAT_POLL_S seconds even while its verify subprocess is
+    # dead/hung, so the 3h root-mtime reaper
+    # (INFLIGHT_MERGE_WORKTREE_LIVENESS_SECS) never fires for that failure
+    # mode.  Kept small relative to the reaper window so a genuinely dead
+    # verify is caught promptly; kept as a class attribute so tests can
+    # monkeypatch it tiny (e.g. worker.INFLIGHT_VERIFY_PROGRESS_BUDGET_SECS
+    # = 0.2) for fast, deterministic abort-path coverage.  Mirrors the
+    # VERIFY_ABANDON_POLL_SECS monkeypatch convention above.
+    INFLIGHT_VERIFY_PROGRESS_BUDGET_SECS: float = 1800.0
+    # Throttle for the newest_content_mtime() worktree-subtree walk that
+    # drives the budget above — distinct from VERIFY_ABANDON_POLL_SECS so
+    # the walk cost is bounded independently of the 10s abort-poll cadence.
+    # Kept as a class attribute so tests can monkeypatch it tiny for fast,
+    # deterministic coverage.  Mirrors the VERIFY_ABANDON_POLL_SECS
+    # monkeypatch convention above.
+    INFLIGHT_VERIFY_PROGRESS_PROBE_SECS: float = 60.0
     # MQ-invariants iota (task 1994): grace window (seconds, wall-clock mtime)
     # before an unregistered on-disk `_merge-*` worktree is flagged by
     # worktree_ledger_violations().  Tactical default sits strictly between
@@ -9473,6 +9492,12 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                 escalation_queue=self._escalation_queue,
                 dry_run_handles=self._dry_run_handles,
             ))
+            # task 2420 (DEFECT 1): no-progress budget clock.  Elapsed-only
+            # for now (step-4); step-6 converts this into a LOCAL-only
+            # no-PROGRESS budget (content mtime under merge_wt resets the
+            # clock) so a genuinely long-running healthy cold verify is
+            # never false-killed.
+            _verify_progress_started_at = time.time()
             while True:
                 done, _ = await asyncio.wait(
                     {verify_task},
@@ -9513,6 +9538,36 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                     # MQ-invariants eta (task 1992): Future left deliberately
                     # pending — remove the ledger entry so this parked request
                     # never ages out; the next dequeue re-arms it fresh.
+                    self._request_ledger.on_requeued(req.request_id)
+                    return InflightVerifyResult(
+                        outcome=None,
+                        merge_wt=None,
+                        status=InflightStatus.REQUEUED,
+                    )
+                # Abort trigger 3 — no in-flight verify progress budget
+                # (task 2420 DEFECT 1, split from 2357; extends #1728):
+                # terminate a deterministically dead/hung verify and
+                # RE-QUEUE, mirroring the operator-halt branch above.
+                # Checked last so abandon/halt precedence (triggers 1/2) is
+                # preserved when they land on the same poll.  Elapsed-only
+                # for now (step-4); step-6 gates this to LOCAL leases only
+                # and converts it into a no-PROGRESS budget.
+                _no_progress_secs = time.time() - _verify_progress_started_at
+                if _no_progress_secs >= self.INFLIGHT_VERIFY_PROGRESS_BUDGET_SECS:
+                    logger.warning(
+                        'Task %s: no in-flight verify progress for %.0fs '
+                        '(budget=%.0fs) — aborting and re-queuing merge for '
+                        're-verify',
+                        req.task_id,
+                        _no_progress_secs,
+                        self.INFLIGHT_VERIFY_PROGRESS_BUDGET_SECS,
+                    )
+                    await self._abort_remote_verify(lease, req.task_id)
+                    verify_task.cancel()
+                    with contextlib.suppress(BaseException):
+                        await verify_task
+                    await self._release_or_cleanup(merge_wt, spec_warm=_spec_warm)
+                    self._queue.put_nowait(req)
                     self._request_ledger.on_requeued(req.request_id)
                     return InflightVerifyResult(
                         outcome=None,
