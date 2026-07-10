@@ -141,42 +141,28 @@ def test_legacy_blob_roundtrip_preserves_unknown_keys_and_upgrades_memory_hints(
 async def test_orchestrator_done_provenance_all_kinds_accepted_by_backend(
     make_backend, tmp_path, kind, fields,
 ):
-    """Every kind the orchestrator can construct is accepted by the validator.
+    """Every kind the orchestrator can construct is accepted by the backend.
 
     Builds ``done_provenance`` via the REAL orchestrator seam
     (``_build_done_provenance`` — task 2167 W3-δ SEAM B) for each of the four
-    ``DoneProvenance.kind`` values. Task 2201/C1 made ``update_task``
-    unconditionally reject ``metadata.done_provenance`` — the field is now
-    validated solely by the backend's write-boundary validator
-    (``SqliteTaskBackend._validate_metadata_on_write``, the exact seam
-    ``add_task``/``update_task`` call internally) and persisted solely
-    through the privileged, non-protocol ``stamp_audit_metadata`` seam. This
-    exercises both directly: the validator must accept every kind, and the
-    seam must persist it byte-for-value. I2: the orchestrator and
-    fused-memory share ONE valid-kinds enum, so nothing the producer can
-    legitimately build is ever rejected by the consumer (structurally
-    prevents the 1902/1976/1982 class of bug).
+    ``DoneProvenance.kind`` values, then writes it through the REAL public
+    ``add_task`` write boundary. Task 2201/C1's write-authority floor lives
+    on ``update_task`` only — ``add_task`` has no done_provenance floor — so
+    a fresh insert carrying ``metadata.done_provenance`` is validated
+    (whole-blob enforce, via ``_validate_metadata_on_write``) AND persisted
+    in the very same call, exactly as production's insert path would treat
+    it. I2: the orchestrator and fused-memory share ONE valid-kinds enum, so
+    nothing the producer can legitimately build is ever rejected by the
+    consumer (structurally prevents the 1902/1976/1982 class of bug).
     """
     backend = await make_backend(enforce=True)
     project_root = str(tmp_path / 'proj')
 
     built = _build_done_provenance(kind, **fields)
 
-    dto = await backend.add_task(project_root=project_root, title='t')
-    tid = int(dto['id'])
-
-    # Consumer-side acceptance: the same validator add_task/update_task run
-    # at the write boundary must accept everything the producer builds.
-    await backend._validate_metadata_on_write(
-        json.dumps({'done_provenance': built}),
-        project_root=project_root, tag='master', task_id=tid,
-    )
-
-    # Persist through the privileged stamp_audit_metadata seam — the sole
-    # sanctioned done_provenance writer now that update_task rejects the
-    # field unconditionally (task 2201/C1).
-    await backend.stamp_audit_metadata(
-        dto['id'], project_root, {'done_provenance': built},
+    dto = await backend.add_task(
+        project_root=project_root, title='t',
+        metadata=json.dumps({'done_provenance': built}),
     )
 
     task = await backend.get_task(dto['id'], project_root=project_root)
@@ -195,33 +181,34 @@ async def test_bogus_done_provenance_kind_rejected_symmetrically(make_backend, t
 
     Producer side: the orchestrator's ``_build_done_provenance`` refuses to
     construct a bogus kind (``DoneProvenance.kind`` is a closed Literal).
-    Consumer side: the backend's write-boundary validator
-    (``_validate_metadata_on_write``, in enforce mode — the exact seam
-    ``add_task``/``update_task`` call internally) refuses the same bogus
-    kind. This is the single-enum symmetry (I2) proven negatively. The
-    privileged ``stamp_audit_metadata`` seam itself performs no schema
-    validation of its own (task 2201/C1 made it a raw, trusted writer, since
-    ``update_task`` now rejects ``metadata.done_provenance`` unconditionally
-    before validation would ever run) — so this asserts the rejection at the
-    validator directly, and confirms the task's metadata was never touched
-    (nothing was ever staged for the privileged seam to persist).
+    Consumer side: the backend's REAL public ``add_task`` write boundary
+    refuses the same bogus kind (enforce-mode ``_validate_metadata_on_write``,
+    which ``add_task`` always calls whole-blob) and rolls back its INSERT.
+    This is the single-enum symmetry (I2) proven negatively, together with
+    the transactional-rollback guarantee. ``update_task`` is not usable for
+    this any more: task 2201/C1 made it reject ``metadata.done_provenance``
+    unconditionally as a write-authority floor, before any kind is ever
+    validated — so this exercises the bogus-kind rejection through
+    ``add_task``, the one public seam where a fresh done_provenance write
+    still reaches the validator, and confirms no row was left behind
+    (nothing was ever staged for the privileged ``stamp_audit_metadata``
+    seam, which performs no schema validation of its own, to persist).
     """
     with pytest.raises(ValidationError):
         _build_done_provenance('bogus')
 
     backend = await make_backend(enforce=True)
     project_root = str(tmp_path / 'proj')
-    dto = await backend.add_task(project_root=project_root, title='t')
-    tid = int(dto['id'])
 
     with pytest.raises(ValidationError):
-        await backend._validate_metadata_on_write(
-            json.dumps({'done_provenance': {'kind': 'bogus'}}),
-            project_root=project_root, tag='master', task_id=tid,
+        await backend.add_task(
+            project_root=project_root, title='t',
+            metadata=json.dumps({'done_provenance': {'kind': 'bogus'}}),
         )
 
-    task = await backend.get_task(dto['id'], project_root=project_root)
-    assert task['metadata'] == {}
+    # The rejected add_task's INSERT never landed — no row/metadata leaked.
+    tasks = (await backend.get_tasks(project_root=project_root))['tasks']
+    assert tasks == []
 
 
 # ── Row 4a — producer↔consumer ledger round-trip ──────────────────────
