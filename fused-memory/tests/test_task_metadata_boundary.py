@@ -195,9 +195,16 @@ async def test_bogus_done_provenance_kind_rejected_symmetrically(make_backend, t
 
     Producer side: the orchestrator's ``_build_done_provenance`` refuses to
     construct a bogus kind (``DoneProvenance.kind`` is a closed Literal).
-    Consumer side: an enforce-mode backend refuses to store the same bogus
-    kind, and the rolled-back txn leaves the task's metadata untouched. This
-    is the single-enum symmetry (I2) proven negatively.
+    Consumer side: the backend's write-boundary validator
+    (``_validate_metadata_on_write``, in enforce mode — the exact seam
+    ``add_task``/``update_task`` call internally) refuses the same bogus
+    kind. This is the single-enum symmetry (I2) proven negatively. The
+    privileged ``stamp_audit_metadata`` seam itself performs no schema
+    validation of its own (task 2201/C1 made it a raw, trusted writer, since
+    ``update_task`` now rejects ``metadata.done_provenance`` unconditionally
+    before validation would ever run) — so this asserts the rejection at the
+    validator directly, and confirms the task's metadata was never touched
+    (nothing was ever staged for the privileged seam to persist).
     """
     with pytest.raises(ValidationError):
         _build_done_provenance('bogus')
@@ -205,11 +212,12 @@ async def test_bogus_done_provenance_kind_rejected_symmetrically(make_backend, t
     backend = await make_backend(enforce=True)
     project_root = str(tmp_path / 'proj')
     dto = await backend.add_task(project_root=project_root, title='t')
+    tid = int(dto['id'])
 
     with pytest.raises(ValidationError):
-        await backend.update_task(
-            dto['id'], project_root=project_root,
-            metadata=json.dumps({'done_provenance': {'kind': 'bogus'}}),
+        await backend._validate_metadata_on_write(
+            json.dumps({'done_provenance': {'kind': 'bogus'}}),
+            project_root=project_root, tag='master', task_id=tid,
         )
 
     task = await backend.get_task(dto['id'], project_root=project_root)
