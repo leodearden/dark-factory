@@ -13,17 +13,23 @@ recon_pool/trim_source (stage1 vs stage2 pool names) specifically to prove the
 core is generic and not accidentally hardcoded to the Stage 2 pool.
 """
 
+import json
 import logging
+from datetime import UTC, datetime
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
 import pytest
+import pytest_asyncio
 
+from fused_memory.models.reconciliation import StageId, StageReport
+from fused_memory.reconciliation.recon_ledger import ReconLedgerStore
 from fused_memory.reconciliation.summary_pool import (
     enforce_summary_pool_cap,
     pretrim_summary_pool,
     reconstruct_cycle_summary_stub,
     verify_cycle_summary_written,
+    write_cycle_summary,
 )
 
 _LOGGER = 'fused_memory.reconciliation.summary_pool'
@@ -694,3 +700,145 @@ class TestReconstructCycleSummaryStub:
 
         assert result == 1
         memory_service.add_memory.assert_awaited_once()
+
+
+class TestWriteCycleSummaryLedgerWrite:
+    """write_cycle_summary (task 2229 W5-λ) writes exactly ONE authoritative
+    ``cycle_summary`` ledger row from a ``StageReport`` — the deterministic
+    Python replacement for the LLM-driven per-cycle summary write (PRD
+    plans/recon-reliability-prd.md §10, boundary test D1).
+
+    This class covers only the AUTHORITATIVE ledger write. The best-effort
+    Mem0 mirror + pool-cap trim are covered separately in
+    ``TestWriteCycleSummaryMirrorAndTrim`` (step-03/04).
+    """
+
+    @pytest_asyncio.fixture
+    async def ledger_store(self, tmp_path):
+        s = ReconLedgerStore(tmp_path / 'reconciliation.db')
+        await s.initialize()
+        yield s
+        await s.close()
+
+    def _report(self, **overrides) -> StageReport:
+        defaults = dict(
+            stage=StageId.task_knowledge_sync,
+            started_at=datetime(2026, 7, 10, 11, 0, 0, tzinfo=UTC),
+            completed_at=datetime(2026, 7, 10, 11, 5, 0, tzinfo=UTC),
+            items_flagged=[{'description': 'a'}, {'description': 'b'}],
+            stats={'stage2_stage1_dups_suppressed': 1},
+            llm_calls=4,
+            tokens_used=1234,
+        )
+        defaults.update(overrides)
+        return StageReport(**defaults)
+
+    @pytest.mark.asyncio
+    async def test_writes_one_authoritative_ledger_row_from_report(self, ledger_store):
+        memory_service = AsyncMock()
+        memory_service.recon_ledger = ledger_store
+        report = self._report()
+
+        result = await write_cycle_summary(
+            memory_service,
+            'dark_factory',
+            report,
+            'run-abc',
+            stage='task_knowledge_sync',
+            recon_pool='stage2_cycle_summary',
+            trim_source='stage2_cycle_summary_trim',
+            cap=2,
+        )
+
+        assert result is True
+
+        record = await ledger_store.get_by_identity(
+            'dark_factory', 'cycle_summary', flag_type='task_knowledge_sync', run_id='run-abc',
+        )
+        assert record is not None
+        assert record.record_kind == 'cycle_summary'
+        assert record.task_id == ''
+        assert record.flag_type == 'task_knowledge_sync'
+        assert record.run_id == 'run-abc'
+        assert record.state == 'active'
+
+        payload = json.loads(record.payload_json)
+        assert payload['stage'] == 'task_knowledge_sync'
+        assert payload['run_id'] == 'run-abc'
+        assert payload['stats'] == {'stage2_stage1_dups_suppressed': 1}
+        assert payload['items_flagged_count'] == 2
+        assert payload['llm_calls'] == 4
+        assert payload['tokens_used'] == 1234
+
+    @pytest.mark.asyncio
+    async def test_idempotent_repeat_call_same_identity_keeps_one_row_last_write_wins(
+        self, ledger_store,
+    ):
+        """Calling twice with the same (stage, run_id) leaves exactly one row
+        in the ledger (upsert PK semantics), carrying the second call's
+        payload."""
+        memory_service = AsyncMock()
+        memory_service.recon_ledger = ledger_store
+
+        await write_cycle_summary(
+            memory_service,
+            'dark_factory',
+            self._report(),
+            'run-dup',
+            stage='task_knowledge_sync',
+            recon_pool='stage2_cycle_summary',
+            trim_source='stage2_cycle_summary_trim',
+            cap=2,
+        )
+        result = await write_cycle_summary(
+            memory_service,
+            'dark_factory',
+            self._report(
+                items_flagged=[{'description': 'c'}],
+                stats={'different': True},
+                llm_calls=9,
+                tokens_used=999,
+            ),
+            'run-dup',
+            stage='task_knowledge_sync',
+            recon_pool='stage2_cycle_summary',
+            trim_source='stage2_cycle_summary_trim',
+            cap=2,
+        )
+
+        assert result is True
+
+        db = ledger_store._db
+        cursor = await db.execute(
+            "SELECT COUNT(*) FROM recon_ledger WHERE project_id = ? AND record_kind = 'cycle_summary' "
+            'AND run_id = ?',
+            ('dark_factory', 'run-dup'),
+        )
+        row = await cursor.fetchone()
+        assert row[0] == 1
+
+        record = await ledger_store.get_by_identity(
+            'dark_factory', 'cycle_summary', flag_type='task_knowledge_sync', run_id='run-dup',
+        )
+        payload = json.loads(record.payload_json)
+        assert payload['items_flagged_count'] == 1
+        assert payload['llm_calls'] == 9
+        assert payload['tokens_used'] == 999
+
+    @pytest.mark.asyncio
+    async def test_no_ledger_wired_is_noop_returns_false_does_not_raise(self):
+        memory_service = AsyncMock()
+        memory_service.recon_ledger = None
+
+        result = await write_cycle_summary(
+            memory_service,
+            'dark_factory',
+            self._report(),
+            'run-none',
+            stage='task_knowledge_sync',
+            recon_pool='stage2_cycle_summary',
+            trim_source='stage2_cycle_summary_trim',
+            cap=2,
+        )
+
+        assert result is False
