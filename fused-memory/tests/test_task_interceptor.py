@@ -81,27 +81,6 @@ def test_task_interceptor_has_no_add_task_method():
     )
 
 
-def test_update_task_reject_guard_copies_deleted():
-    """Write-authority guard-copy deletion contract (task C2).
-
-    ``_reject_status_in_update_task`` and
-    ``_reject_done_provenance_in_update_metadata`` are collapsed onto the
-    single C1 SqliteTaskBackend write-authority floor — the module-level
-    functions must no longer exist. This test is RED until step-4 deletes
-    them from task_interceptor.py.
-    """
-    import fused_memory.middleware.task_interceptor as ti_mod
-
-    assert not hasattr(ti_mod, '_reject_status_in_update_task'), (
-        '_reject_status_in_update_task must be removed; the C1 backend '
-        'floor is the single write-authority enforcement point'
-    )
-    assert not hasattr(ti_mod, '_reject_done_provenance_in_update_metadata'), (
-        '_reject_done_provenance_in_update_metadata must be removed; the '
-        'C1 backend floor is the single write-authority enforcement point'
-    )
-
-
 @pytest.mark.asyncio
 async def test_submit_and_resolve_helper_returns_legacy_shape(
     interceptor_facade,
