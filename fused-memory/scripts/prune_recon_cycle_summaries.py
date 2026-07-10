@@ -85,6 +85,13 @@ logger = logging.getLogger('prune_recon_cycle_summaries')
 # prompts/stage1.py and prompts/stage2.py).
 _POOL_STAGES: tuple[str, ...] = ('memory_consolidator', 'task_knowledge_sync')
 
+# Default per-project scan window for the metadata-filtered scroll (the
+# `--scan-limit` flag) -- decoupled from `--limit-per-project`, which remains
+# solely the deletion safety cap consumed by check_limit_cap. Wide headroom
+# over observed pool sizes (~251-265 across known projects); the ground-truth
+# truncation guard (check_scan_completeness) catches anything beyond.
+_DEFAULT_SCAN_LIMIT = 10000
+
 
 # ---------------------------------------------------------------------------
 # Pure core: carries_remediation_history
@@ -570,20 +577,23 @@ async def run(
 ) -> dict[str, Any]:
     """Main async logic: scan, classify, report, and optionally apply.
 
-    For each selected project, enumerates its Mem0 memories via
-    ``memory.mem0.get_all`` (a deterministic full scroll — content is
-    required for :func:`carries_remediation_history`, and
-    ``get_memories_by_metadata`` omits content), filters client-side to
-    ``metadata.kind == 'cycle_summary'`` records whose ``metadata.stage`` is
-    one of the two known pools (``memory_consolidator``,
-    ``task_knowledge_sync``), and classifies each pool independently via
+    For each selected project, enumerates its cycle-summary pools via
+    ``memory.mem0.scroll_by_metadata(scope, {'kind': 'cycle_summary'},
+    limit=args.scan_limit)`` — a deterministic Qdrant payload-filtered scroll
+    that queries ONLY cycle-summary records, so the scan window is bounded by
+    pool size rather than the project's total Mem0 collection size. Each
+    result's summary text (required for :func:`carries_remediation_history`)
+    is read from ``metadata['data']``, the Qdrant payload key Mem0 stores
+    memory content under. Results are filtered client-side to those whose
+    ``metadata.stage`` is one of the two known pools (``memory_consolidator``,
+    ``task_knowledge_sync``), and each pool is classified independently via
     :func:`classify_pool`.
 
     Parameters
     ----------
     args:
         Parsed ``argparse.Namespace`` (apply, project_id, keep_recent,
-        limit_per_project, yes_i_am_sure).
+        limit_per_project, yes_i_am_sure, scan_limit).
     memory:
         Live (or mock) MemoryService instance.
     known_projects_map:
@@ -632,23 +642,25 @@ async def run(
         return abort_payload
 
     keep_recent_n: int = args.keep_recent
+    scan_limit: int = getattr(args, 'scan_limit', _DEFAULT_SCAN_LIMIT)
 
     # Scan + classify every selected project's two pools.
     decisions: dict[tuple[str, str], PruneDecision] = {}
     for pid in project_ids:
         scope = Scope(project_id=pid)
-        raw = await memory.mem0.get_all(scope, limit=args.limit_per_project)
-        results = raw.get('results') if isinstance(raw, dict) else None
-        if not isinstance(results, list):
+        scrolled = await memory.mem0.scroll_by_metadata(
+            scope, {'kind': 'cycle_summary'}, limit=scan_limit,
+        )
+        if not isinstance(scrolled, list):
             logger.warning(
-                "prune_recon_cycle_summaries: mem0.get_all returned malformed/absent "
-                "'results' key for project %s; treating as empty. got: %s",
-                pid, repr(raw)[:200],
+                "prune_recon_cycle_summaries: mem0.scroll_by_metadata returned a "
+                "non-list result for project %s; treating as empty. got: %s",
+                pid, repr(scrolled)[:200],
             )
-            results = []
+            scrolled = []
 
         pool_items: dict[str, list[dict[str, Any]]] = {stage: [] for stage in _POOL_STAGES}
-        for m in results:
+        for m in scrolled:
             metadata = m.get('metadata') or {}
             if metadata.get('kind') != 'cycle_summary':
                 continue
@@ -658,7 +670,7 @@ async def run(
             pool_items[stage].append({
                 'id': m.get('id'),
                 'created_at': m.get('created_at'),
-                'content': m.get('memory') or '',
+                'content': metadata.get('data') or '',
                 'metadata': metadata,
             })
 
