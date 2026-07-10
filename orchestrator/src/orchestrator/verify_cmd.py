@@ -408,3 +408,36 @@ def _cargo_scope_structured(cmd: VerifyCmd, crates: list[str]) -> VerifyCmd:
             continue
         cleaned.append(tok)
     return replace(cmd, targets=tuple(cleaned))
+
+
+# Matches a pytest invocation up to (but not including) the next shell chain
+# operator (&&, ||, ;) or end of string — the span serial_pytest's raw-chain
+# path rewrites. Word-bounded so it doesn't match inside 'pytest_xdist' etc.
+# Moved from verify.py's _PYTEST_INVOCATION_RE / _force_serial_pytest.
+_PYTEST_INVOCATION_RE = re.compile(r'\bpytest\b[^&|;]*')
+
+
+def serial_pytest(cmd: VerifyCmd) -> VerifyCmd:
+    """Return *cmd* with the serial-recovery flags applied to every pytest invocation.
+
+    Appends ``-p no:xdist -o addopts=`` (clears any pyproject-level
+    ``addopts``, e.g. ``-n auto`` — the ``-o addopts=""`` workaround task
+    2045 proved recovers a shared-venv-mutation transient; ``-p no:xdist``
+    is belt-and-suspenders) to a structured command's ``base_flags``, or —
+    for a raw-retained pytest chain — to every ``pytest`` invocation's
+    arguments in ``raw`` via a localised regex rewrite (moved from
+    ``_force_serial_pytest``), so each chained invocation recovers
+    independently. No-ops unless ``cmd.tool is ToolKind.PYTEST`` (covers
+    OPAQUE and every other tool — P1).
+    """
+    if cmd.tool is not ToolKind.PYTEST:
+        return cmd
+    if cmd.raw is not None:
+        def _rewrite(match: re.Match[str]) -> str:
+            segment = match.group(0)
+            stripped = segment.rstrip()
+            trailing = segment[len(stripped) :]
+            return f"{stripped} -p no:xdist -o addopts=''{trailing}"
+
+        return replace(cmd, raw=_PYTEST_INVOCATION_RE.sub(_rewrite, cmd.raw))
+    return replace(cmd, base_flags=(*cmd.base_flags, '-p', 'no:xdist', '-o', 'addopts='))
