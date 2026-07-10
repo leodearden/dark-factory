@@ -35,7 +35,11 @@ from shared.task_metadata import DoneProvenance, SchemaWarning, parse_metadata
 from shared.task_statuses import TERMINAL as TERMINAL_STATUSES
 from shared.task_transitions import derive_actor_class, is_legal_transition
 
-from fused_memory.backends.task_backend_errors import DuplicateCandidateKeyError
+from fused_memory.backends.task_backend_errors import (
+    DoneProvenanceWriteAuthorityError,
+    DuplicateCandidateKeyError,
+    StatusWriteAuthorityError,
+)
 from fused_memory.backends.task_backend_protocol import TaskBackendProtocol
 from fused_memory.middleware import recon_write_policy
 from fused_memory.middleware.lock_charter_guard import (
@@ -3560,10 +3564,15 @@ class TaskInterceptor:
 
         Gates (run in order; each returns early with a structured error dict on rejection):
 
-        1. ``_reject_status_in_update_task`` — rejects ``status=`` writes; returns
-           ``{'success': False, 'error': 'status_via_update_task', 'task_id': …, …}``.
-        2. ``_reject_done_provenance_in_update_metadata`` — rejects ``metadata``
-           payloads containing ``done_provenance``; same ``{'success': False, …}`` shape.
+        1. The SqliteTaskBackend write-authority floor (task C1) — unconditionally
+           rejects non-None ``status`` and ``metadata.done_provenance`` writes by
+           raising :class:`~fused_memory.backends.task_backend_errors.StatusWriteAuthorityError`
+           / :class:`~fused_memory.backends.task_backend_errors.DoneProvenanceWriteAuthorityError`;
+           caught below and converted via ``.to_error_dict()`` into the canonical
+           ``{'success': False, 'error': 'status_via_update_task' | 'done_provenance_via_update_task',
+           'task_id': …, …}`` shape defined in ``task_backend_errors.py`` (task C2).
+        2. ``_reject_directory_locks_in_update_metadata`` — rejects ``metadata.files``
+           entries that name a directory; returns ``lock_charter_error(...)``.
         3. ``_backlog_gate`` — rejects when the reconciliation backlog exceeds the
            project threshold; returns ``BacklogVerdict.to_error_dict()`` which has the
            shape ``{'error': '<msg>', 'error_type': 'ReconciliationBacklogExceeded', …}``
@@ -3576,13 +3585,6 @@ class TaskInterceptor:
         the backend, which single-sources mode resolution via
         :func:`~fused_memory.backends.sqlite_task_backend._resolve_metadata_mode`.
         """
-        if err := _reject_status_in_update_task(task_id, kwargs.get('status')):
-            return err
-        if err := _reject_done_provenance_in_update_metadata(
-            task_id,
-            kwargs.get('metadata'),
-        ):
-            return err
         if err := _reject_directory_locks_in_update_metadata(
             task_id,
             kwargs.get('metadata'),
@@ -3620,18 +3622,28 @@ class TaskInterceptor:
                 )
                 if verdict.is_rejection:
                     return verdict.to_error_dict()
-            result: dict[str, Any] = dict(
-                await self._journal_around(
-                    'update_task',
-                    project_root,
-                    {'task_id': task_id, **{k: _journal_param_clip(v) for k, v in kwargs.items()}},
-                    tm.update_task(
-                        task_id=task_id,
-                        project_root=project_root,
-                        **kwargs,
-                    ),
+            try:
+                result: dict[str, Any] = dict(
+                    await self._journal_around(
+                        'update_task',
+                        project_root,
+                        {'task_id': task_id, **{k: _journal_param_clip(v) for k, v in kwargs.items()}},
+                        tm.update_task(
+                            task_id=task_id,
+                            project_root=project_root,
+                            **kwargs,
+                        ),
+                    )
                 )
-            )
+            except (StatusWriteAuthorityError, DoneProvenanceWriteAuthorityError) as e:
+                # SqliteTaskBackend write-authority floor (task C1): status /
+                # metadata.done_provenance writes are unconditionally rejected.
+                # _journal_around already logged the failing backend_op row and
+                # re-raised; convert to the canonical rejection dict here so
+                # this surface's long-standing contract — return a dict, never
+                # raise — holds for both tools.py (which delegates here) and
+                # direct interceptor callers (task C2).
+                return e.to_error_dict()
         event = self._make_event(
             EventType.task_modified,
             project_root,
@@ -4443,71 +4455,6 @@ async def _repair_done_provenance_same_status(
     }
 
 
-def _reject_status_in_update_task(
-    task_id: str,
-    status: object,
-) -> dict | None:
-    """Reject ``update_task(status=…)`` — defence-in-depth alongside ``server/tools.py``.
-
-    ``set_task_status`` is the only sanctioned writer for task status — it
-    enforces the terminal-exit, phantom-done, and done-provenance gates.
-    ``update_task(status=…)`` slipped through all three (2026-05-08 forensics:
-    9 historical ``done`` writes via this path in 36 h on dark-factory). Reject
-    the call before it reaches Taskmaster, regardless of which client called.
-    """
-    if status is None:
-        return None
-    return {
-        'success': False,
-        'error': 'status_via_update_task',
-        'task_id': task_id,
-        'status': status,
-        'hint': (
-            'update_task is metadata-only. Use '
-            'set_task_status(status=…, done_provenance={...} when '
-            'status="done") to change status — it enforces the '
-            'terminal-exit, phantom-done, and done-provenance gates.'
-        ),
-    }
-
-
-def _reject_done_provenance_in_update_metadata(
-    task_id: str,
-    metadata: object,
-) -> dict | None:
-    """Reject ``update_task`` calls that try to write ``metadata.done_provenance``.
-
-    ``set_task_status`` is the only sanctioned writer for ``done_provenance`` —
-    it validates the schema (kind/commit/note) and runs an ancestor backstop on
-    merge SHAs. ``update_task`` accepts a free-form metadata blob, so without
-    this gate any agent could stamp self-contradicting provenance and bypass
-    the role-allowlist enforcement. Defense-in-depth alongside the same check
-    in ``server/tools.py``.
-    """
-    parsed: dict | None = None
-    if isinstance(metadata, dict):
-        parsed = metadata
-    elif isinstance(metadata, str):
-        try:
-            loaded = json.loads(metadata)
-        except (ValueError, TypeError):
-            return None
-        parsed = loaded if isinstance(loaded, dict) else None
-    if parsed is None or 'done_provenance' not in parsed:
-        return None
-    return {
-        'success': False,
-        'error': 'done_provenance_via_update_task',
-        'task_id': task_id,
-        'hint': (
-            'update_task cannot write metadata.done_provenance. Use '
-            'set_task_status(status="done", done_provenance={...}) instead — '
-            'it validates the kind/commit/note schema and runs an ancestor '
-            'backstop on the merge sha.'
-        ),
-    }
-
-
 def _reject_directory_locks_in_update_metadata(
     task_id: str,
     metadata: str | dict[str, Any] | None,
@@ -4542,11 +4489,15 @@ def interceptor_write_succeeded(resp: object) -> bool:
 
     Rejection-dict shapes this helper recognises as failures:
 
-    * ``_reject_status_in_update_task`` →
-      ``{'success': False, 'error': 'status_via_update_task', 'task_id': …, …}``
-    * ``_reject_done_provenance_in_update_metadata`` →
-      ``{'success': False, 'error': 'done_provenance_via_update_task', 'task_id': …, …}``
-    * ``BacklogVerdict.to_error_dict()`` →
+    * The canonical write-authority rejection shape — defined once in
+      ``fused_memory.backends.task_backend_errors``
+      (``status_via_update_task_error`` / ``done_provenance_via_update_task_error``,
+      tasks C1/C2) and surfaced here via
+      ``StatusWriteAuthorityError`` / ``DoneProvenanceWriteAuthorityError
+      .to_error_dict()`` →
+      ``{'success': False, 'error': 'status_via_update_task' | 'done_provenance_via_update_task', 'task_id': …, …}``
+    * ``BacklogVerdict.to_error_dict()`` (and other no-``success``/has-``error``
+      shapes, e.g. lock-charter rejections) →
       ``{'error': '<rendered-msg>', 'error_type': 'ReconciliationBacklogExceeded', …}``
       (no ``success`` key — defeated by the ``not resp.get('error')`` clause)
 
