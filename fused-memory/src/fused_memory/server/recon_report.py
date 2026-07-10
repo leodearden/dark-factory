@@ -133,6 +133,28 @@ def _traces_exclusively_to_stage1(
 
 
 # ---------------------------------------------------------------------------
+# Fix 2 helpers — overlength description/suggested_action truncation (task-2410)
+# ---------------------------------------------------------------------------
+
+# Generous cap: legitimate findings never come close to this; only
+# pathological input (e.g. a runaway agent dumping a huge blob into
+# description/suggested_action) is ever capped.
+_MAX_FINDING_TEXT_CHARS = 10_000
+_TRUNCATION_MARKER = '…[truncated]'
+
+
+def _truncate_field(value: str, cap: int) -> tuple[str, bool]:
+    """Cap *value* to *cap* chars, appending ``_TRUNCATION_MARKER`` if truncated.
+
+    Returns ``(possibly-truncated value, was_truncated)``.  A *value* whose
+    length is ``<= cap`` is returned unchanged with ``False``.
+    """
+    if len(value) > cap:
+        return value[:cap] + _TRUNCATION_MARKER, True
+    return value, False
+
+
+# ---------------------------------------------------------------------------
 # Internal data model
 # ---------------------------------------------------------------------------
 
@@ -383,6 +405,20 @@ class ReconReportState:
             )
             return _ERR_ALREADY_COMPLETED.copy()
 
+        # Fix 2 (task-2410): gracefully cap pathologically long text fields
+        # BEFORE dedup hashing, so the stored text, the assembled-report
+        # value, and the null-null description-hash dedup key all derive
+        # from the same (possibly-capped) string.
+        warnings: list[str] = []
+        description, description_truncated = _truncate_field(description, _MAX_FINDING_TEXT_CHARS)
+        if description_truncated:
+            warnings.append(f'description truncated to {_MAX_FINDING_TEXT_CHARS} chars')
+        suggested_action, suggested_action_truncated = _truncate_field(
+            suggested_action, _MAX_FINDING_TEXT_CHARS
+        )
+        if suggested_action_truncated:
+            warnings.append(f'suggested_action truncated to {_MAX_FINDING_TEXT_CHARS} chars')
+
         # In-run dedup: two separate namespaces.
         # (1) Signature path: (task_id, flag_type) != (None, None) — O(1) lookup in
         #     _run_sig_index, scoped to this run_id across ALL stages.  Each field
@@ -461,7 +497,10 @@ class ReconReportState:
                 self._run_desc_index.setdefault(run_id, {})[desc_hash] = finding_id
         self._run_finding_index.setdefault(run_id, {})[finding_id] = entry
 
-        return {'finding_id': finding_id}
+        result: dict[str, Any] = {'finding_id': finding_id}
+        if warnings:
+            result['warnings'] = warnings
+        return result
 
     def set_stat(
         self,
