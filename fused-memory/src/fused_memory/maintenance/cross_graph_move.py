@@ -741,6 +741,260 @@ async def move_entity_across_graphs(
     )
 
 
+@dataclass
+class SubgraphEdgeResult:
+    """Result of a ``recreate_subgraph_relationships`` call (Phase B: batch
+    edge/mention recreate of the three-phase barrier-ordered apply).
+
+    Attributes:
+        edges_recreated: Count of RELATES_TO edges actually recreated across
+            the WHOLE batch -- verified via the target CREATE's own
+            ``relationships_created`` stat, same convention as
+            ``MoveResult.edges_moved``. Each distinct edge (keyed by edge
+            uuid) is counted at most once, however many specs it is incident
+            to (see the module's co-moving-pair fix).
+        edges_skipped: Count of RELATES_TO edges whose target CREATE
+            matched no endpoint (the edge's other endpoint not present in
+            the resolved target graph) and was therefore silently skipped by
+            FalkorDB -- same meaning as ``MoveResult.edges_skipped``. Does
+            NOT include an edge that was skipped because it was already
+            present in target (a genuine idempotent no-op, not a loss).
+        mentions_recreated: Count of Episodic MENTIONS links actually
+            recreated (same ``relationships_created`` verification).
+        mentions_skipped: Count of MENTIONS links silently skipped because
+            the episode node was not present in the resolved target graph.
+        dropped_cross_target: Records for edges whose two endpoints resolve
+            to two DIFFERENT target graphs (FalkorDB RELATES_TO edges are
+            single-graph, so such an edge cannot be recreated in EITHER
+            graph) -- each a dict carrying the edge uuid, both endpoint
+            uuids, both resolved targets, and a human-readable reason.
+            Reported for human review, never silently lost. Populated by
+            the cross-target detection extension (task 2415 step-8) --
+            always empty for a batch with no such edges.
+    """
+
+    edges_recreated: int = 0
+    edges_skipped: int = 0
+    mentions_recreated: int = 0
+    mentions_skipped: int = 0
+    dropped_cross_target: list = field(default_factory=list)
+
+
+async def _relates_to_edge_already_in_target(graph: Any, edge_uuid: str) -> bool:
+    """Read-only presence probe: True iff a RELATES_TO edge with *edge_uuid*
+    already exists in *graph* (either direction).
+
+    Unlike an Entity node's uuid (guarded by ``_create_entity_in_target``'s
+    unconditional target-presence probe), FalkorDB enforces no uniqueness
+    constraint on a relationship's ``uuid`` property -- a blind re-``CREATE``
+    on a crash-resumed or fully-idempotent re-run of
+    ``recreate_subgraph_relationships`` would duplicate an edge it already
+    recreated in a prior pass, rather than silently no-op the way the node
+    CREATE does. This probe is what lets a re-run skip an edge instead.
+    """
+    result = await graph.ro_query(
+        'MATCH ()-[e:RELATES_TO {uuid: $uuid}]-() RETURN e.uuid LIMIT 1',
+        {'uuid': edge_uuid},
+    )
+    return bool(result.result_set)
+
+
+async def recreate_subgraph_relationships(graphiti: Any, specs: list[dict]) -> SubgraphEdgeResult:
+    """Phase B of the three-phase barrier-ordered apply (CGL-η follow-up,
+    task 2415): recreate every RELATES_TO edge and Episodic MENTIONS link
+    incident to *specs*, deduped by uuid across the WHOLE batch.
+
+    *specs* is a list of manifest-node-shaped dicts (``uuid``,
+    ``disposition``, ``source_graph``, ``target_graph``) -- the same shape
+    ``run()``'s apply loop partitions manifest nodes into (move_specs +
+    merge_specs, task 2415 step-12). Called ONLY after ``create_moved_node``
+    (Phase A) has run for every MOVE spec in the batch, so every migrating
+    node already exists in its target graph before any edge is read here --
+    this is what lets a co-moving neighbour's shared RELATES_TO edge survive
+    (the old single-call ``move_entity_across_graphs`` loop would have
+    DETACH DELETEd the source before the second endpoint was ever
+    processed; see this module's "Residual hazard" note and
+    ``scripts/migrate_cross_graph_leak.py``'s ``run()``).
+
+    MOVE edges (this step): for every non-MERGE spec, every incident
+    RELATES_TO edge (full property row, read via the same
+    ``startNode``/``endNode`` SELECT ``move_entity_across_graphs`` uses) and
+    every incident Episodic MENTIONS link is read from the spec's
+    ``source_graph``. Edges are accumulated into a single dict keyed by edge
+    uuid -- so a co-moving edge incident to TWO specs in this batch (read
+    once per incident spec) is recreated only ONCE, not twice. For each
+    distinct edge, both endpoints' target graphs are looked up via a
+    ``target_of`` map built from every spec's own ``uuid``/``target_graph``
+    -- when both resolve to the SAME target graph T, the edge is recreated
+    in T (byte-exact ``fact_embedding`` via the raw ``--compact`` transport,
+    ``group_id`` rewritten to T -- mirroring ``create_moved_node``'s
+    ``rewrite_group_id=target_graph`` convention for Phase A), skipped as a
+    genuine idempotent no-op if an edge with that uuid already exists in T
+    (``_relates_to_edge_already_in_target``), or counted in
+    ``edges_skipped`` if the target CREATE's own ``relationships_created``
+    stat reports the other endpoint was silently unmatched. When the two
+    endpoints do NOT resolve to the same target (including an endpoint this
+    batch has no spec for at all), this step does not yet recreate or
+    record the edge -- cross-target detection and the ``dropped_
+    cross_target`` record are added by the step-8 extension. MENTIONS are
+    recreated the same way ``move_entity_across_graphs`` does (MATCH the
+    episode + entity in the entity's resolved target, ``relationships_
+    created`` distinguishes recreate from silent skip).
+
+    MERGE-fold handling (arrives in the step-10 extension): a MERGE spec's
+    unique wrong-copy edges are not yet folded into its home copy here.
+
+    Issues NO ``DETACH DELETE`` anywhere -- that is ``delete_source_node``'s
+    job (Phase C), which callers must run only after this function has
+    completed for the WHOLE batch (every edge recreated before any source is
+    deleted is the barrier ordering that closes the edge-loss bug).
+
+    Args:
+        graphiti: An initialized GraphitiBackend (or compatible object
+            exposing ``_graph_for`` / ``_require_falkor_client``).
+        specs: Manifest-node-shaped dicts for every MOVE/MERGE node in this
+            apply batch (``uuid``, ``disposition``, ``source_graph``,
+            ``target_graph``).
+
+    Returns:
+        SubgraphEdgeResult tallying edges/mentions recreated vs. skipped
+        (plus, from step-8 onward, any cross-target-dropped edges).
+    """
+    falkor_client = graphiti._require_falkor_client()
+    target_of: dict[str, str] = {spec['uuid']: spec['target_graph'] for spec in specs}
+
+    # MERGE specs' edges are folded separately (step-10) -- only MOVE specs'
+    # incident edges/mentions are read here. Compared against the literal
+    # 'MERGE' string (not scripts/migrate_cross_graph_leak.py's MERGE
+    # constant) -- this module must not import from its ζ-script consumer.
+    move_specs = [spec for spec in specs if spec.get('disposition') != 'MERGE']
+
+    edges_by_uuid: dict[str, tuple[list, str]] = {}
+    mentions_by_uuid: dict[str, tuple[list, str, str]] = {}
+    for spec in move_specs:
+        source = graphiti._graph_for(spec['source_graph'])
+
+        edges_result = await source.ro_query(
+            'MATCH (n:Entity {uuid: $uuid})-[e:RELATES_TO]-(m:Entity) '
+            'WITH DISTINCT e, startNode(e) AS s, endNode(e) AS t '
+            'RETURN e.uuid, e.name, e.fact, e.valid_at, e.invalid_at, e.created_at, '
+            '       e.group_id, e.episodes, s.uuid, t.uuid',
+            {'uuid': spec['uuid']},
+        )
+        for row in edges_result.result_set or []:
+            edges_by_uuid.setdefault(row[0], (row, spec['source_graph']))
+
+        mentions_result = await source.ro_query(
+            'MATCH (ep:Episodic)-[e:MENTIONS]->(n:Entity {uuid: $uuid}) '
+            'RETURN e.uuid, e.group_id, e.created_at, ep.uuid',
+            {'uuid': spec['uuid']},
+        )
+        for row in mentions_result.result_set or []:
+            mentions_by_uuid.setdefault(row[0], (row, spec['source_graph'], spec['uuid']))
+
+    result = SubgraphEdgeResult()
+
+    for edge_uuid, (row, source_graph) in edges_by_uuid.items():
+        (_edge_uuid, edge_name, fact, valid_at, invalid_at, edge_created_at,
+         _edge_group_id, episodes, src_uuid, dst_uuid) = row
+
+        src_target = target_of.get(src_uuid)
+        dst_target = target_of.get(dst_uuid)
+        if src_target is None or dst_target is None or src_target != dst_target:
+            # Cross-target / non-migrating-endpoint classification is added
+            # by the step-8 extension (dropped_cross_target) -- left
+            # unhandled here (step-6 scope: same-target edges only).
+            continue
+
+        target_graph_name = src_target
+        target = graphiti._graph_for(target_graph_name)
+
+        if await _relates_to_edge_already_in_target(target, edge_uuid):
+            # Genuine idempotent no-op (re-run after a prior completed/
+            # partial Phase B) -- not a loss, so neither counter is
+            # incremented.
+            continue
+
+        edge_embedding_cypher = (
+            f'MATCH ()-[e:RELATES_TO {{uuid: {_quote_cypher_string(edge_uuid)}}}]-() '
+            'RETURN e.fact_embedding'
+        )
+        edge_embedding_reply = await _read_compact_vector(
+            falkor_client, group_id=source_graph, cypher=edge_embedding_cypher,
+        )
+        edge_embedding_literal = format_vecf32_literal(
+            parse_compact_vector_reply(edge_embedding_reply)
+        )
+
+        edge_create_result = await target.query(
+            'MATCH (a:Entity {uuid: $src_uuid}), (b:Entity {uuid: $dst_uuid}) '
+            'CREATE (a)-[r:RELATES_TO]->(b) '
+            'SET r.uuid = $edge_uuid, '
+            '    r.name = $name, '
+            '    r.fact = $fact, '
+            '    r.valid_at = $valid_at, '
+            '    r.invalid_at = $invalid_at, '
+            '    r.created_at = $created_at, '
+            '    r.group_id = $group_id, '
+            '    r.episodes = $episodes, '
+            f'    r.fact_embedding = {edge_embedding_literal}',
+            {
+                'src_uuid': src_uuid,
+                'dst_uuid': dst_uuid,
+                'edge_uuid': edge_uuid,
+                'name': edge_name,
+                'fact': fact,
+                'valid_at': valid_at,
+                'invalid_at': invalid_at,
+                'created_at': edge_created_at,
+                'group_id': target_graph_name,
+                'episodes': episodes,
+            },
+        )
+        if edge_create_result.relationships_created:
+            result.edges_recreated += 1
+        else:
+            result.edges_skipped += 1
+            logger.warning(
+                'recreate_subgraph_relationships: RELATES_TO edge uuid=%s '
+                'silently skipped -- other endpoint (src=%s dst=%s) not '
+                'present in target_graph=%s',
+                edge_uuid, src_uuid, dst_uuid, target_graph_name,
+            )
+
+    for mention_uuid, (row, _source_graph, entity_uuid) in mentions_by_uuid.items():
+        _mention_uuid, _mention_group_id, mention_created_at, episode_uuid = row
+        target_graph_name = target_of[entity_uuid]
+        target = graphiti._graph_for(target_graph_name)
+
+        mention_create_result = await target.query(
+            'MATCH (ep:Episodic {uuid: $episode_uuid}), (n:Entity {uuid: $entity_uuid}) '
+            'CREATE (ep)-[e:MENTIONS]->(n) '
+            'SET e.uuid = $edge_uuid, '
+            '    e.group_id = $group_id, '
+            '    e.created_at = $created_at',
+            {
+                'episode_uuid': episode_uuid,
+                'entity_uuid': entity_uuid,
+                'edge_uuid': mention_uuid,
+                'group_id': target_graph_name,
+                'created_at': mention_created_at,
+            },
+        )
+        if mention_create_result.relationships_created:
+            result.mentions_recreated += 1
+        else:
+            result.mentions_skipped += 1
+            logger.warning(
+                'recreate_subgraph_relationships: MENTIONS link uuid=%s '
+                'silently skipped -- episode uuid=%s not present in '
+                'target_graph=%s (entity_uuid=%s)',
+                mention_uuid, episode_uuid, target_graph_name, entity_uuid,
+            )
+
+    return result
+
+
 async def delete_source_node(graphiti: Any, uuid: str, source_graph: str) -> None:
     """Phase C of the three-phase barrier-ordered apply (CGL-η follow-up,
     task 2415): ``DETACH DELETE`` *uuid*'s Entity node from *source_graph* --
