@@ -134,6 +134,7 @@ async def test_update_task_param_forwarding(
         'priority': None,
         'status': None,
         'dependencies': None,
+        'agent_id': None,
     }
     expected_kwargs = {**base_kwargs, **expected_overrides}
     task_interceptor.update_task.assert_called_once_with(**expected_kwargs)
@@ -712,12 +713,13 @@ async def test_set_task_status_forwards_agent_id_to_interceptor(
 
 
 # ------------------------------------------------------------------
-# submit_task / update_task accept ctx+agent_id (task 2175 step-11/step-12)
-#
-# Neither tool forwards agent_id to the interceptor: submit_task is a create
-# (no from->to transition for the gate to classify) and MCP update_task
-# rejects status= writes, so only set_task_status threads identity through
-# to the transition-legality gate.
+# submit_task / update_task forward ctx-resolved agent_id to the interceptor
+# (task 2175 step-11/step-12 added handler acceptance; task 2223/W5-ε completes
+# the plumbing by forwarding agent_id into interceptor.submit_task /
+# interceptor.update_task — the substrate W5-ζ ReconWritePolicy consults inside
+# interceptor.update_task, gated on a recon-stage agent_id. The interceptor
+# captures agent_id as an explicit keyword-only param so it never leaks into the
+# ticket blob / tm.update_task; see test_task_write_agent_id.py.)
 # ------------------------------------------------------------------
 
 
@@ -725,9 +727,8 @@ async def test_set_task_status_forwards_agent_id_to_interceptor(
 async def test_submit_task_accepts_agent_id_and_forwards_existing_kwargs_unchanged(
     mcp_server_with_tasks, task_interceptor,
 ):
-    """submit_task accepts agent_id (caller identity) without disturbing its
-    existing forwarding of prompt/priority/etc. to the interceptor, and does
-    NOT forward agent_id itself (submit_task has no status transition)."""
+    """submit_task forwards agent_id (caller identity) to the interceptor without
+    disturbing its existing forwarding of prompt/priority/etc."""
     task_interceptor.submit_task = AsyncMock(return_value={'ticket': 'tkt_x'})
     result = await mcp_server_with_tasks._tool_manager.call_tool(
         'submit_task',
@@ -743,8 +744,8 @@ async def test_submit_task_accepts_agent_id_and_forwards_existing_kwargs_unchang
     kwargs = task_interceptor.submit_task.call_args.kwargs
     assert kwargs.get('prompt') == 'Do the thing', f'Expected prompt forwarded; got {kwargs!r}'
     assert kwargs.get('priority') == 'high', f'Expected priority forwarded; got {kwargs!r}'
-    assert 'agent_id' not in kwargs, (
-        f'submit_task must not forward agent_id to the interceptor; got {kwargs!r}'
+    assert kwargs.get('agent_id') == 'recon-stage-7', (
+        f'submit_task must forward agent_id to the interceptor; got {kwargs!r}'
     )
 
 
@@ -752,10 +753,8 @@ async def test_submit_task_accepts_agent_id_and_forwards_existing_kwargs_unchang
 async def test_update_task_accepts_agent_id_and_forwards_existing_kwargs_unchanged(
     mcp_server_with_tasks, task_interceptor,
 ):
-    """update_task accepts agent_id (caller identity) without disturbing its
-    existing exact-kwarg forwarding to the interceptor, and does NOT forward
-    agent_id itself (MCP update_task rejects status= writes -- no transition
-    for the gate to classify)."""
+    """update_task forwards agent_id (caller identity) to the interceptor without
+    disturbing its existing exact-kwarg forwarding."""
     result = await mcp_server_with_tasks._tool_manager.call_tool(
         'update_task',
         {
@@ -781,6 +780,7 @@ async def test_update_task_accepts_agent_id_and_forwards_existing_kwargs_unchang
         priority='high',
         status=None,
         dependencies=None,
+        agent_id='recon-stage-7',
     )
 
 
