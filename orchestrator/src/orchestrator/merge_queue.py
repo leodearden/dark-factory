@@ -5707,9 +5707,21 @@ class SpeculativeMergeWorker(_WipHaltMixin):
 
         Fail-open: store errors are logged and never propagate so a broken
         journal never stalls the merge pipeline.
+
+        MQ-reliability kappa (task 2169): this is the worker's first sighting
+        of *item* — its three callers (``_drain_queue_into_lanes``,
+        ``_acquire_next_request``'s harvest branch, and the merger loop's
+        look-ahead harvest) all pull a FRESH item straight off the external
+        ``_queue``/``_pending_get``, never a re-buffer of an already-tracked
+        request — so registering here unconditionally is safe. Seeds the
+        ItemLifecycle registry at QUEUED then immediately transitions to
+        LANE_BUFFERED, matching this method's own postcondition (the item is
+        now sitting in a lane buffer).
         """
         lane = _normalize_lane(item.lane)
         self._assert_single_writer(self._merger_task, '_lane_buffers')
+        rid = self._register_item(item, initial=ItemLifecycleState.QUEUED)
+        self._note_transition(rid, ItemLifecycleState.QUEUED, ItemLifecycleState.LANE_BUFFERED)
         self._lane_buffers[lane].append(item)
 
         if self._merge_store is not None:
@@ -5810,6 +5822,18 @@ class SpeculativeMergeWorker(_WipHaltMixin):
 
         Returns None when every non-empty lane is halted or all buffers are
         empty.  Pure/synchronous so unit tests run without an event loop.
+
+        MQ-reliability kappa (task 2169): every item in ``_lane_buffers`` got
+        there via ``_buffer_owned_request`` (fresh drain) or the coalesce
+        QUEUE SURGERY (``_maybe_coalesce_waiting_singles``'s GroupMergeRequest,
+        registered directly at LANE_BUFFERED) — both leave the registry at
+        LANE_BUFFERED, so a pop here is always a LANE_BUFFERED->MERGING
+        transition. This is the ONLY place that pops ``_lane_buffers``
+        (``_acquire_next_request``'s regular pick and the merger loop's
+        speculative look-ahead both call this method), so wiring the
+        transition here — rather than at each caller — covers both paths in
+        one chokepoint; by the time either caller's ``_inflight_req = req``
+        assignment runs, the registry already reads MERGING for *req*.
         """
         graph = self._suffix_conflict_graph
         for lane in MERGE_LANES:  # high → normal
@@ -5834,11 +5858,20 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                            if item.request_id in neighbors):
                     self._assert_single_writer(self._merger_task, '_lane_buffers')
                     del buf[i]
+                    self._note_transition(
+                        x.request_id, ItemLifecycleState.LANE_BUFFERED, ItemLifecycleState.MERGING,
+                        live_obj=x,
+                    )
                     return x
             # Defensive fallback (unreachable: the aging-minimal item is always
             # minimal by the above criterion, so the loop always returns).
             self._assert_single_writer(self._merger_task, '_lane_buffers')
-            return buf.popleft()
+            popped = buf.popleft()
+            self._note_transition(
+                popped.request_id, ItemLifecycleState.LANE_BUFFERED, ItemLifecycleState.MERGING,
+                live_obj=popped,
+            )
+            return popped
         return None
 
     # ── ε=1890 frozen-prefix / verify-frontier partition ─────────────────────
@@ -8141,6 +8174,13 @@ class SpeculativeMergeWorker(_WipHaltMixin):
             mark_member_done=callbacks.mark_member_done,
             redrive_member=callbacks.redrive_member,
         )
+        # MQ-reliability kappa (task 2169): group_req is a brand-new
+        # request_id (GroupMergeRequest.request_id auto-generated at
+        # construction, merge_types.py) that never passed through the
+        # `_queue` drain, so it has no QUEUED registry entry to transition
+        # from — register it directly at LANE_BUFFERED, matching the QUEUE
+        # SURGERY below that places it straight into a lane buffer.
+        self._register_item(group_req, initial=ItemLifecycleState.LANE_BUFFERED)
 
         # QUEUE SURGERY: rebuild _lane_buffers['normal'] preserving FIFO order for
         # non-survivor + ejected solos, then append the new train at the tail.
@@ -8308,6 +8348,13 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                 self._request_ledger.on_dequeue(req, now=time.time())
 
                 self._inflight_req = req  # track for stop() race resolution
+                # MQ-reliability kappa (task 2169): no separate registry
+                # transition needed here — `req` always came from a
+                # `_pop_next_pickable()` pop (either just now via
+                # `_acquire_next_request()`, or on a prior iteration via the
+                # speculative look-ahead), which already transitioned it to
+                # MERGING and indexed it in `_live_items`. By construction
+                # the registry already agrees with this transient field.
                 # ι=1894: stash main_position for this request so
                 # _note_conflict_detected can compute drift later.
                 self._note_merge_started(req.request_id)
