@@ -910,3 +910,46 @@ def test_claim_lease_does_not_reap_a_dead_holder_within_ttl(tmp_path: Path) -> N
     assert claim.holder is not None
     assert claim.holder.session_slug == 'watcher-df-dead'
     assert sr.LeaseHolder.from_json(lease_path.read_text()) == stale_holder
+
+
+# --- heartbeat_lease / release_lease --------------------------------------
+
+
+def test_heartbeat_lease_advances_mtime(tmp_path: Path) -> None:
+    holder = sr.LeaseHolder(session_slug='watcher-df-100', pid=os.getpid(), start_ts=_NOW.isoformat())
+    sr.claim_lease('watcher-df', holder=holder, root=tmp_path, now=_NOW)
+    lease_path = sr.lease_path_for_name('watcher-df', root=tmp_path)
+    _set_mtime(lease_path, _NOW, timedelta(hours=1))
+    old_mtime = lease_path.stat().st_mtime
+
+    result = sr.heartbeat_lease('watcher-df', root=tmp_path)
+
+    assert result is True
+    assert lease_path.stat().st_mtime > old_mtime
+
+
+def test_heartbeat_lease_on_absent_lease_returns_false_without_raising(tmp_path: Path) -> None:
+    result = sr.heartbeat_lease('watcher-df', root=tmp_path)
+    assert result is False
+
+
+def test_release_lease_removes_the_lease_file(tmp_path: Path) -> None:
+    holder = sr.LeaseHolder(session_slug='watcher-df-100', pid=os.getpid(), start_ts=_NOW.isoformat())
+    sr.claim_lease('watcher-df', holder=holder, root=tmp_path, now=_NOW)
+    lease_path = sr.lease_path_for_name('watcher-df', root=tmp_path)
+
+    result = sr.release_lease('watcher-df', root=tmp_path)
+
+    assert result is True
+    assert not lease_path.exists()
+
+
+def test_release_lease_is_idempotent_on_a_second_call(tmp_path: Path) -> None:
+    holder = sr.LeaseHolder(session_slug='watcher-df-100', pid=os.getpid(), start_ts=_NOW.isoformat())
+    sr.claim_lease('watcher-df', holder=holder, root=tmp_path, now=_NOW)
+
+    first = sr.release_lease('watcher-df', root=tmp_path)
+    second = sr.release_lease('watcher-df', root=tmp_path)
+
+    assert first is True
+    assert second is False
