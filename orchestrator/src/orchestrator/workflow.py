@@ -799,6 +799,34 @@ class _PriorImplStatus(NamedTuple):
     """SHA read from metadata.json, or None if the file is absent."""
 
 
+def _iteration_entry_is_work(entry: dict) -> bool:
+    """Classify a single iterations.jsonl entry as genuine prior-implementation
+    work (task 2372, Layer A).
+
+    Excludes ONLY the narrow zero-work signature: an ``'implementer'`` entry
+    that is not an amendment pass and recorded no completed steps — the exact
+    shape behind the task 2125/2315/2340 false-DONE recurrences. Everything
+    else that represents real agent output still counts:
+
+    - ``'debugger'`` entries always count, even though they hard-code
+      ``steps_completed: []`` (workflow.py ~5222) — a debug pass is real work
+      regardless of plan-step bookkeeping.
+    - Amendment ``'implementer'`` entries (``source == 'amendment'``) always
+      count — they omit ``steps_completed`` entirely (workflow.py ~5443).
+    - ``'judge'`` ``early_exit`` entries count only when ``substantive_work``
+      is True (workflow.py ~4559) — a judge can legitimately declare a task
+      complete with zero plan-steps marked done.
+    """
+    agent = entry.get('agent')
+    if agent == 'debugger':
+        return True
+    if agent == 'implementer':
+        return entry.get('source') == 'amendment' or bool(entry.get('steps_completed'))
+    if agent == 'judge':
+        return entry.get('event') == 'early_exit' and bool(entry.get('substantive_work'))
+    return False
+
+
 class TaskWorkflow:
     """Per-task state machine."""
 
@@ -7483,6 +7511,20 @@ Update the plan to address the blocking issues. You may add new steps to the `st
         use the SHA-primary path, preventing false-DONE on inherited
         .task/iterations.jsonl contamination — see the comment there for
         the full trade-off analysis.
+
+        Per-entry classification (task 2372, Layer A): both the SHA-primary
+        and bare-fallback iteration-log scans use
+        :func:`_iteration_entry_is_work` rather than a bare ``agent in
+        ('implementer', 'debugger')`` check. That bare check false-positived
+        on a *zero-work* implementer entry (``steps_completed: []``) left
+        over from a prior dispatch onto the same worktree — the exact
+        signature behind the task 2125/2315/2340 false-DONE recurrences,
+        where a fresh/re-dispatched worktree (wt_head == base_commit) still
+        resolved has_work=True from a stale poison entry. The classifier
+        excludes that narrow signature while still counting debugger entries
+        (hard-code ``steps_completed: []``), amendment-implementer entries
+        (omit ``steps_completed`` entirely), and judge ``early_exit`` entries
+        with ``substantive_work=True`` — see that function's docstring.
         """
         if self.artifacts is None:
             return _PriorImplStatus(has_work=False, entries=[], base_commit=None)
@@ -7490,9 +7532,7 @@ Update the plan to address the blocking issues. You may add new steps to the `st
         entries, _ = self.artifacts.read_iteration_log()
         if wt_head is not None and base_commit is not None:
             sha_diverges = wt_head.strip() != base_commit
-            has_iter_log_work = any(
-                e.get('agent') in ('implementer', 'debugger') for e in entries
-            )
+            has_iter_log_work = any(_iteration_entry_is_work(e) for e in entries)
             # Defense in depth: SHA divergence alone is racy under
             # fused-memory's tasks.json auto-commit to main (the
             # pre-positioning rev-parse in create_worktree could lag
@@ -7518,7 +7558,7 @@ Update the plan to address the blocking issues. You may add new steps to the `st
             return _PriorImplStatus(has_work=False, entries=entries, base_commit=None)
         # Fallback (no wt_head): iteration-log scan for pre-EXECUTE / merge-phase guards
         return _PriorImplStatus(
-            has_work=any(e.get('agent') in ('implementer', 'debugger') for e in entries),
+            has_work=any(_iteration_entry_is_work(e) for e in entries),
             entries=entries,
             base_commit=base_commit,
         )
