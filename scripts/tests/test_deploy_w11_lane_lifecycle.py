@@ -311,3 +311,43 @@ def _run_script(worktree_base, *args, env=None):
         text=True,
         timeout=30,
     )
+
+
+# ---------------------------------------------------------------------------
+# step-1: RED -- executable bit + empty-base --check smoke
+# ---------------------------------------------------------------------------
+
+def test_script_is_executable():
+    """The working-tree script must carry the executable bit (mode 100755)
+    -- pins the os.X_OK requirement enforced by deterministic_task_guard at
+    submit_task time for before_done.script (CLAUDE.md "Deterministic task
+    kind": before_done.script "must exist & be executable")."""
+    assert os.access(SCRIPT, os.X_OK), (
+        f"Expected {SCRIPT} to be executable (os.X_OK); it is not. "
+        f"Run: chmod +x {SCRIPT}"
+    )
+
+
+def test_check_mode_on_empty_base_is_noop(tmp_path):
+    """`--check` against an EMPTY worktree_base (no `_lane-*` lanes -- the
+    dark_factory pool-less-host shape per the plan's final design decision)
+    exits 0, writes no `.lane-state/` records, and never invokes systemctl
+    (adopt-then-restart ordering means restart must not even be attempted
+    when --check short-circuits before it)."""
+    worktree_base = _build_worktree_base(tmp_path, [])
+
+    result = _run_script(worktree_base, "--check")
+
+    assert result.returncode == 0, (
+        f"Expected --check on an empty base to exit 0; got {result.returncode}\n"
+        f"stdout={result.stdout!r} stderr={result.stderr!r}"
+    )
+    lane_state_dir = worktree_base / LANE_STATE_DIRNAME
+    assert not lane_state_dir.exists(), (
+        f"Expected no {LANE_STATE_DIRNAME}/ directory to be created by "
+        f"--check; found contents={list(lane_state_dir.iterdir()) if lane_state_dir.exists() else None}"
+    )
+    assert _systemctl_calls(worktree_base) == [], (
+        f"Expected --check to never invoke systemctl; got calls="
+        f"{_systemctl_calls(worktree_base)!r}"
+    )
