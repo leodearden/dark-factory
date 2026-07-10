@@ -593,14 +593,27 @@ async def run(
     ``task_knowledge_sync``), and each pool is classified independently via
     :func:`classify_pool`.
 
-    Ground-truth truncation guard: for each project, the exact cycle-summary
-    total is also fetched via ``memory.mem0.count_by_metadata`` and compared
-    against the scroll's actual result count via
-    :func:`check_scan_completeness`. If any project's scan under-counted
-    (the scroll hit ``--scan-limit`` before enumerating the full pool), this
-    hard-aborts with a ``scan_truncated`` payload *before* the deletion-cap
-    check and before any ``--apply`` deletes — a truncated scan must never
-    silently reach a classification/deletion decision.
+    Ground-truth truncation guard: for each project, the scroll's actual
+    result count is compared against the exact cycle-summary total
+    (``memory.mem0.count_by_metadata``) via :func:`check_scan_completeness`.
+    As an efficiency optimisation, the ground-truth count is skipped when the
+    scroll already proves full enumeration by itself — a *non-empty* result
+    strictly below ``--scan-limit`` (Qdrant's scroll returns every matching
+    point up to the limit in one pass, so coming back short of it means
+    there was nothing left to enumerate). The ground truth is always
+    consulted when the scroll came back at/over the limit (ambiguous: a real
+    truncation, or the pool size happens to equal the limit exactly) OR came
+    back completely empty (ambiguous: a genuinely-empty pool, or
+    ``scroll_by_metadata`` swallowing a Qdrant timeout into a bare ``[]`` —
+    see its docstring — which must not be mistaken for "nothing to prune").
+    If any project's scan under-counted, this hard-aborts with a
+    ``scan_truncated`` payload *before* the deletion-cap check and before any
+    ``--apply`` deletes — a truncated scan must never silently reach a
+    classification/deletion decision. The abort separately flags any
+    scanned-zero project (``possible_timeout_projects``) as a probable
+    scroll timeout rather than an inadequate ``--scan-limit``, and notes that
+    on a live system a small overshoot can reflect a benign race between the
+    scroll and the ground-truth count rather than a real undercount.
 
     Parameters
     ----------
@@ -675,7 +688,22 @@ async def run(
             )
             scrolled = []
 
-        expected = await memory.mem0.count_by_metadata(scope, {'kind': 'cycle_summary'})
+        # Qdrant's scroll returns every matching point up to `limit` in one
+        # pass, so a *non-empty* result strictly below `scan_limit` already
+        # proves the pool was fully enumerated -- skip the extra
+        # count_by_metadata round-trip in that (common) case, halving Qdrant
+        # reads. A `scrolled` result of exactly zero is deliberately NOT
+        # short-circuited: scroll_by_metadata also returns `[]` (logging a
+        # WARNING, never raising) on a Qdrant timeout, which is
+        # indistinguishable from a genuinely-empty pool without cross-
+        # checking -- always consult the ground truth for that case so a
+        # timeout cannot masquerade as "nothing to prune". The ground truth
+        # is likewise always consulted when the scroll came back at/over
+        # `scan_limit` (the potential-truncation case).
+        if 0 < len(scrolled) < scan_limit:
+            expected = len(scrolled)
+        else:
+            expected = await memory.mem0.count_by_metadata(scope, {'kind': 'cycle_summary'})
         per_project_counts[pid] = (len(scrolled), expected)
 
         pool_items: dict[str, list[dict[str, Any]]] = {stage: [] for stage in _POOL_STAGES}
@@ -701,10 +729,19 @@ async def run(
     # cycle_summary total (see check_scan_completeness).
     truncated = check_scan_completeness(per_project_counts)
     if truncated:
+        # A truncated project that scanned exactly zero records is the
+        # signature of scroll_by_metadata swallowing a Qdrant timeout into a
+        # bare `[]` (see its docstring) rather than an actually-empty pool --
+        # raising --scan-limit would not fix that, so it is flagged
+        # separately from the generic remedy below.
+        possible_timeout_projects = sorted(
+            pid for pid in truncated if per_project_counts[pid][0] == 0
+        )
         truncation_payload: dict[str, Any] = {
             'aborted': True,
             'scan_truncated': True,
             'truncated_projects': truncated,
+            'possible_timeout_projects': possible_timeout_projects,
             'scan_limit': scan_limit,
             'dry_run': not args.apply,
             'generated_at': generated_at,
@@ -718,6 +755,22 @@ async def run(
             f'ABORT: scan truncated for projects {truncated}: scanned < '
             f'cycle_summary count; re-run with a higher --scan-limit '
             f'(current: {scan_limit}).',
+            file=sys.stderr,
+        )
+        if possible_timeout_projects:
+            print(
+                f'NOTE: {possible_timeout_projects} scanned 0 cycle_summary '
+                f'records despite a non-zero ground-truth count -- this is '
+                f'the signature of a Mem0/Qdrant scroll timeout (logged as a '
+                f'WARNING by scroll_by_metadata), not an inadequate '
+                f'--scan-limit; check logs for a timeout before raising it.',
+                file=sys.stderr,
+            )
+        print(
+            'NOTE: on a live system with concurrent writers, a small '
+            'truncated overshoot can reflect a benign race between the scan '
+            'and the ground-truth count rather than a real undercount -- '
+            're-running is safe and often clears it.',
             file=sys.stderr,
         )
         return truncation_payload

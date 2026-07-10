@@ -766,22 +766,67 @@ class TestRun:
         number of records scroll_by_metadata actually returned, the scan
         under-counted -- run() must hard-abort before any deletion (even
         under --apply), flag the project, and point the remedy at
-        --scan-limit."""
+        --scan-limit. scan_limit is set to exactly match the fixture's
+        scroll length (8) so the ground truth is consulted despite the
+        len(scrolled)<scan_limit short-circuit (see
+        test_scan_skips_ground_truth_when_scroll_below_limit) -- the scroll
+        mock does not itself honour `limit`, so this pins the ambiguous
+        at/over-limit branch that must still call count_by_metadata."""
         memory = self._make_memory(self._fixture_records())
         # Ground truth says there are far more cycle-summaries than the
         # scroll returned -- simulates a scan_limit too small for the pool.
         memory.mem0.count_by_metadata = AsyncMock(return_value=999)
-        args = self._args(apply=True, project_id='dark_factory')
+        args = self._args(apply=True, project_id='dark_factory', scan_limit=8)
 
         result = await _mod.run(args, memory=memory, known_projects_map=self._known_map())
 
         assert result.get('aborted') is True
         assert result.get('scan_truncated') is True
         assert result.get('truncated_projects') == ['dark_factory']
+        assert result.get('possible_timeout_projects') == []
         memory.delete_memory.assert_not_awaited()
 
         captured = capsys.readouterr()
         assert '--scan-limit' in captured.err
+        assert 'benign' in captured.err.lower()
+
+    @pytest.mark.asyncio
+    async def test_scan_truncation_flags_possible_timeout_when_scan_returns_zero(self, capsys):
+        """scroll_by_metadata returns `[]` both for a genuinely-empty pool and
+        for a swallowed Qdrant timeout (see its docstring) -- the two are
+        indistinguishable without cross-checking. When the ground truth says
+        the pool is NOT actually empty, the truncation guard must still fire
+        (the zero-scan case is never short-circuited), and the abort must
+        flag this as a probable scroll timeout rather than pointing solely at
+        --scan-limit, which would not fix a timeout."""
+        memory = self._make_memory([])  # scroll_by_metadata returns []
+        memory.mem0.count_by_metadata = AsyncMock(return_value=42)
+        args = self._args(apply=True, project_id='dark_factory')
+
+        result = await _mod.run(args, memory=memory, known_projects_map=self._known_map())
+
+        assert result.get('aborted') is True
+        assert result.get('scan_truncated') is True
+        assert result.get('possible_timeout_projects') == ['dark_factory']
+        memory.delete_memory.assert_not_awaited()
+
+        captured = capsys.readouterr()
+        assert 'timeout' in captured.err.lower()
+
+    @pytest.mark.asyncio
+    async def test_scan_skips_ground_truth_when_scroll_below_limit(self):
+        """Efficiency: when the scroll returns a non-empty result strictly
+        below --scan-limit, the pool is already provably fully enumerated
+        (Qdrant's scroll fills up to `limit` in one pass), so
+        count_by_metadata must NOT be consulted -- halves Qdrant reads in the
+        common untruncated path."""
+        memory = self._make_memory(self._fixture_records())
+        args = self._args(apply=False, project_id='dark_factory', scan_limit=10000)
+
+        report = await _mod.run(args, memory=memory, known_projects_map=self._known_map())
+
+        memory.mem0.count_by_metadata.assert_not_awaited()
+        assert not report.get('aborted')
 
     @pytest.mark.asyncio
     async def test_no_truncation_when_scan_complete(self):
