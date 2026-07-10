@@ -18,6 +18,7 @@ import asyncio
 import json
 import os
 import subprocess
+import time
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock
@@ -29,6 +30,8 @@ from orchestrator.config import OrchestratorConfig
 from orchestrator.deterministic_runner import DeterministicRunner
 from orchestrator.scheduler import Scheduler, TaskAssignment
 from orchestrator.workflow import WorkflowOutcome
+
+SCRIPT_REL = 'scripts/check_merge_flakiness.sh'
 
 # ---------------------------------------------------------------------------
 # Shared helpers — mirror the harness patterns established in
@@ -163,6 +166,29 @@ def _real_runner(tmp_path: Path, task: dict, unit_inspector) -> DeterministicRun
     )
 
 
+@pytest.fixture
+def exemplar_script(repo_root: Path | None) -> Path:
+    """Resolve the real exemplar predicate script, shared by every test that
+    executes the REAL scripts/check_merge_flakiness.sh subprocess
+    (TestExemplarCheckScript, TestExemplarPassLifecycle,
+    TestExemplarFailAndTimeout).
+
+    Skips when not running inside a git checkout (repo_root is None); fails
+    — does not skip — when the .git sentinel exists but the script itself is
+    absent (the repo_root fixture's documented contract), so a genuinely
+    missing file cannot silently hide behind a skip.
+    """
+    if repo_root is None:
+        pytest.skip('not running inside a git checkout')
+    script = repo_root / SCRIPT_REL
+    if not script.exists():
+        pytest.fail(
+            f'{SCRIPT_REL} does not exist at {script} — the ε exemplar '
+            f'predicate script has not been authored yet'
+        )
+    return script
+
+
 # ---------------------------------------------------------------------------
 # B... — exemplar check-script contract (self-authored: ε owns both the
 # script and this test — no external numeric premise).
@@ -178,31 +204,16 @@ class TestExemplarCheckScript:
     silently skip).
     """
 
-    SCRIPT_REL = 'scripts/check_merge_flakiness.sh'
-
-    def _script_path(self, repo_root: Path) -> Path:
-        script = repo_root / self.SCRIPT_REL
-        if not script.exists():
-            pytest.fail(
-                f'{self.SCRIPT_REL} does not exist at {script} — the ε exemplar '
-                f'predicate script has not been authored yet'
-            )
-        return script
-
-    def test_script_exists_and_is_executable(self, repo_root: Path | None):
-        if repo_root is None:
-            pytest.skip('not running inside a git checkout')
-        script = self._script_path(repo_root)
-        assert os.access(script, os.X_OK), f'{script} is not executable (missing +x bit)'
+    def test_script_exists_and_is_executable(self, exemplar_script: Path):
+        assert os.access(exemplar_script, os.X_OK), (
+            f'{exemplar_script} is not executable (missing +x bit)'
+        )
 
     def test_script_exits_0_and_reports_holds_when_value_below_threshold(
-        self, repo_root: Path | None,
+        self, exemplar_script: Path,
     ):
-        if repo_root is None:
-            pytest.skip('not running inside a git checkout')
-        script = self._script_path(repo_root)
         result = subprocess.run(
-            [str(script), '--window-days', '7', '--threshold', '0.05', '--value', '0.03'],
+            [str(exemplar_script), '--window-days', '7', '--threshold', '0.05', '--value', '0.03'],
             capture_output=True, text=True, timeout=10,
         )
         assert result.returncode == 0, (
@@ -213,13 +224,10 @@ class TestExemplarCheckScript:
         assert 'holds' in tail, f'expected "holds" in stdout tail; got {tail!r}'
 
     def test_script_exits_1_and_reports_violated_when_value_at_or_above_threshold(
-        self, repo_root: Path | None,
+        self, exemplar_script: Path,
     ):
-        if repo_root is None:
-            pytest.skip('not running inside a git checkout')
-        script = self._script_path(repo_root)
         result = subprocess.run(
-            [str(script), '--value', '0.08', '--threshold', '0.05'],
+            [str(exemplar_script), '--value', '0.08', '--threshold', '0.05'],
             capture_output=True, text=True, timeout=10,
         )
         assert result.returncode == 1, (
@@ -228,6 +236,60 @@ class TestExemplarCheckScript:
         )
         tail = result.stdout.strip()
         assert 'VIOLATED' in tail, f'expected "VIOLATED" in stdout tail; got {tail!r}'
+
+    def test_script_exits_2_when_flag_value_is_missing(self, exemplar_script: Path):
+        """A flag passed as the final argument with no value must be a
+        deterministic usage error (rc=2) — not a `shift`-induced rc=1 that
+        would be misread as the 'invariant VIOLATED' verdict."""
+        result = subprocess.run(
+            [str(exemplar_script), '--threshold', '0.05', '--value'],
+            capture_output=True, text=True, timeout=10,
+        )
+        assert result.returncode == 2, (
+            f'expected rc=2 (usage error) for a missing flag value; got '
+            f'rc={result.returncode}, stdout={result.stdout!r}, stderr={result.stderr!r}'
+        )
+
+    def test_script_exits_2_on_unknown_argument(self, exemplar_script: Path):
+        result = subprocess.run(
+            [str(exemplar_script), '--bogus-flag', '1'],
+            capture_output=True, text=True, timeout=10,
+        )
+        assert result.returncode == 2, (
+            f'expected rc=2 (usage error) for an unknown argument; got '
+            f'rc={result.returncode}, stdout={result.stdout!r}, stderr={result.stderr!r}'
+        )
+
+    def test_script_exits_2_on_non_numeric_value(self, exemplar_script: Path):
+        """Garbage --value must be rejected explicitly, not silently
+        coerced to 0 by awk (which would misreport 'invariant holds')."""
+        result = subprocess.run(
+            [str(exemplar_script), '--threshold', '0.05', '--value', 'garbage'],
+            capture_output=True, text=True, timeout=10,
+        )
+        assert result.returncode == 2, (
+            f'expected rc=2 (usage error) for a non-numeric --value; got '
+            f'rc={result.returncode}, stdout={result.stdout!r}, stderr={result.stderr!r}'
+        )
+
+    def test_script_sleep_secs_delays_execution(self, exemplar_script: Path):
+        """--sleep-secs is the knob that lets this SAME fixture drive a
+        check timeout under test; assert it actually delays the verdict."""
+        sleep_secs = 0.3
+        start = time.monotonic()
+        result = subprocess.run(
+            [
+                str(exemplar_script),
+                '--threshold', '0.05', '--value', '0.03', '--sleep-secs', str(sleep_secs),
+            ],
+            capture_output=True, text=True, timeout=10,
+        )
+        elapsed = time.monotonic() - start
+        assert result.returncode == 0
+        assert elapsed >= sleep_secs * 0.9, (
+            f'--sleep-secs {sleep_secs} should delay execution by roughly that '
+            f'long; elapsed={elapsed:.3f}s'
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -250,19 +312,13 @@ class TestExemplarPassLifecycle:
     TASK_ID = '9001'
 
     async def test_delayed_predicate_milestone_full_pass_lifecycle(
-        self, repo_root: Path | None, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+        self, exemplar_script: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
     ):
-        if repo_root is None:
-            pytest.skip('not running inside a git checkout')
-        script = repo_root / 'scripts' / 'check_merge_flakiness.sh'
-        if not script.exists():
-            pytest.fail(f'scripts/check_merge_flakiness.sh does not exist at {script}')
-
         anchor_base = datetime(2026, 7, 10, 12, 0, 0, tzinfo=UTC)
         clock = [anchor_base]
 
         milestone_task = _delayed_predicate_milestone_task(
-            self.TASK_ID, script, after_secs=self.AFTER_SECS,
+            self.TASK_ID, exemplar_script, after_secs=self.AFTER_SECS,
         )
         # 'in-progress', not 'pending': isolates the milestone task's gate
         # behaviour from the dep task's OWN dispatch eligibility (mirrors
@@ -363,16 +419,10 @@ class TestExemplarFailAndTimeout:
     TASK_ID_TIMEOUT = '9003'
 
     async def test_check_fails_files_milestone_check_failed_and_blocks(
-        self, repo_root: Path | None, tmp_path: Path,
+        self, exemplar_script: Path, tmp_path: Path,
     ):
-        if repo_root is None:
-            pytest.skip('not running inside a git checkout')
-        script = repo_root / 'scripts' / 'check_merge_flakiness.sh'
-        if not script.exists():
-            pytest.fail(f'scripts/check_merge_flakiness.sh does not exist at {script}')
-
         task = _delayed_predicate_milestone_task(
-            self.TASK_ID_FAIL, script,
+            self.TASK_ID_FAIL, exemplar_script,
             args=['--threshold', '0.05', '--value', '0.08'],
         )
         assignment = _make_assignment(task)
