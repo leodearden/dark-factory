@@ -24,6 +24,7 @@ convention.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import logging
 from pathlib import Path
 from typing import Any
@@ -645,3 +646,335 @@ class TestRequeueToQueuedSites:
         assert len(fake_eq.submitted) == 0, (
             f'unregistered requeue must stay silent: {fake_eq.submitted!r}'
         )
+
+
+# ---------------------------------------------------------------------------
+# step-7 RED / step-8 GREEN: verifier DISPATCH-FILL + blocking-get wiring —
+# AWAITING_VERIFY/REDISPATCH_PARKED -> DISPATCHING at BOTH _dispatch_item call
+# sites (DISPATCH-FILL's get_nowait/redispatch-popleft branch and the
+# blocking-get branch), DISPATCHING -> VERIFYING at _inflight_append,
+# DISPATCHING -> REDISPATCH_PARKED on the no-host appendleft (both call
+# sites), `_live_items` holding the SpeculativeItem during the DISPATCHING
+# window, and the dispatch-time staleness remerge window observed at MERGING.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestVerifierDispatchFillRegistersDispatching:
+    """Every path through the verifier's DISPATCH-FILL / blocking-get dispatch
+    call sites must transition the registry into DISPATCHING before calling
+    ``_dispatch_item``, then onward to VERIFYING (real dispatch),
+    REDISPATCH_PARKED (no host free), or MERGING (dispatch-time staleness
+    remerge) — not just the legacy ``_dispatching_item``/``_remerging_item``
+    census fields, which cover only a subset of these paths (task 2169
+    step-7).
+
+    RED until step-8 GREEN wires ``_note_transition`` at both
+    ``_dispatch_item`` call sites in ``_verifier_loop``, at
+    ``_inflight_append``, at the two no-host ``_redispatch.appendleft``
+    sites, and around the dispatch-time remerge inside ``_dispatch_item``.
+    """
+
+    async def test_single_item_progresses_through_dispatching_to_verifying(
+        self, git_ops: GitOps, config: OrchestratorConfig,
+    ) -> None:
+        """Happy path (single fresh request, idle worker): the item is
+        fetched by the BLOCKING-GET call site (the verifier loop is idle —
+        DISPATCH-FILL finds nothing and falls through to the blocking
+        ``_verifier_queue.get()`` — see this task's design notes), proving
+        that call site's DISPATCHING wiring as well as the normal
+        DISPATCHING -> VERIFYING transition at ``_inflight_append``.
+        """
+        from orchestrator.merge_queue import ItemLifecycleState, SpeculativeMergeWorker
+
+        wt = await _make_branch_with_file(
+            git_ops, 'kappa-dispatching-verifying', 'file_kappa_dv.py', 'v = 1\n',
+        )
+        queue: asyncio.Queue = asyncio.Queue()
+        worker = SpeculativeMergeWorker(git_ops, queue)
+        req = _make_request(
+            'kappa-dispatching-verifying', 'kappa-dispatching-verifying', wt, config,
+        )
+
+        observed: list[tuple[Any, Any]] = []
+        original_note_transition = worker._note_transition
+
+        def _spy_note_transition(rid: str, from_state: Any, to_state: Any, **kwargs: Any) -> None:
+            if rid == req.request_id:
+                observed.append((from_state, to_state))
+            return original_note_transition(rid, from_state, to_state, **kwargs)
+
+        worker._note_transition = _spy_note_transition  # type: ignore[method-assign]
+
+        worker_task = asyncio.create_task(worker.run())
+
+        with patch('orchestrator.merge_queue.run_scoped_verification', _mock_verify_pass()):
+            await queue.put(req)
+            outcome = await asyncio.wait_for(req.result, timeout=60)
+            assert outcome.status == 'done', f'{outcome}'
+
+        assert observed == [
+            (ItemLifecycleState.QUEUED, ItemLifecycleState.LANE_BUFFERED),
+            (ItemLifecycleState.LANE_BUFFERED, ItemLifecycleState.MERGING),
+            (ItemLifecycleState.MERGING, ItemLifecycleState.AWAITING_VERIFY),
+            (ItemLifecycleState.AWAITING_VERIFY, ItemLifecycleState.DISPATCHING),
+            (ItemLifecycleState.DISPATCHING, ItemLifecycleState.VERIFYING),
+        ], f'unexpected transition sequence for {req.request_id}: {observed!r}'
+
+        await worker.stop()
+        await worker_task
+
+    async def test_live_items_holds_item_during_dispatching_window(
+        self, git_ops: GitOps, config: OrchestratorConfig,
+    ) -> None:
+        """``_live_items`` must hold the SpeculativeItem, and the registry
+        must read DISPATCHING, WHILE the still-present ``_dispatching_item``
+        transient field is set to that same item — the two must agree
+        during the additive (fields-kept) phase of this task.
+        """
+        from orchestrator.merge_queue import (
+            ItemLifecycleState,
+            RealMergeItem,
+            SpeculativeMergeWorker,
+        )
+
+        wt = await _make_branch_with_file(
+            git_ops, 'kappa-dispatching-window', 'file_kappa_dw.py', 'd = 1\n',
+        )
+        queue: asyncio.Queue = asyncio.Queue()
+        worker = SpeculativeMergeWorker(git_ops, queue)
+        req = _make_request(
+            'kappa-dispatching-window', 'kappa-dispatching-window', wt, config,
+        )
+
+        captured: list[tuple[Any, Any, bool]] = []
+        original_get_main_sha = git_ops.get_main_sha
+        fired = False
+
+        async def _spying_get_main_sha() -> str:
+            nonlocal fired
+            if worker._dispatching_item is not None and not fired:
+                fired = True
+                captured.append((
+                    worker._lifecycle.current(req.request_id),
+                    worker._live_items.get(req.request_id),
+                    worker._dispatching_item is worker._live_items.get(req.request_id),
+                ))
+            return await original_get_main_sha()
+
+        worker_task = asyncio.create_task(worker.run())
+
+        with (
+            patch.object(git_ops, 'get_main_sha', new=_spying_get_main_sha),
+            patch('orchestrator.merge_queue.run_scoped_verification', _mock_verify_pass()),
+        ):
+            await queue.put(req)
+            outcome = await asyncio.wait_for(req.result, timeout=60)
+            assert outcome.status == 'done', f'{outcome}'
+
+        assert fired, 'expected the get_main_sha gate to fire while _dispatching_item was set'
+        observed_state, observed_live_obj, matches = captured[0]
+        assert observed_state == ItemLifecycleState.DISPATCHING
+        assert isinstance(observed_live_obj, RealMergeItem)
+        assert matches is True
+
+        await worker.stop()
+        await worker_task
+
+    async def test_dispatch_fill_call_site_no_host_bounces_to_redispatch_parked(
+        self, git_ops: GitOps, config: OrchestratorConfig, tmp_path: Path,
+    ) -> None:
+        """An item already sitting in ``_verifier_queue`` when the loop is
+        entered is fetched by DISPATCH-FILL's ``get_nowait()`` branch (the
+        FIRST ``_dispatch_item`` call site). With zero free hosts forced,
+        ``_dispatch_item`` returns None and the item bounces onto
+        ``_redispatch`` — this must transition
+        AWAITING_VERIFY -> DISPATCHING -> REDISPATCH_PARKED, not just set
+        the legacy ``_dispatching_item`` field.
+        """
+        from orchestrator.merge_queue import (
+            ItemLifecycleState,
+            RealMergeItem,
+            SpeculativeMergeWorker,
+        )
+
+        queue: asyncio.Queue = asyncio.Queue()
+        worker = SpeculativeMergeWorker(git_ops, queue)
+
+        fake_allocator = MagicMock()
+        fake_allocator.free_host_count.return_value = 0
+        worker._host_allocator = fake_allocator
+
+        req = _make_request(
+            'kappa-dispatch-fill-no-host', 'kappa-dispatch-fill-no-host', tmp_path, config,
+        )
+        item = RealMergeItem(
+            request=req, merge_result=MagicMock(), merge_wt=tmp_path / 'merge_wt',
+            base_sha='deadbeef', speculative=False,
+        )
+        worker._register_item(item, initial=ItemLifecycleState.AWAITING_VERIFY)
+
+        observed: list[tuple[Any, Any]] = []
+        original_note_transition = worker._note_transition
+
+        def _spy_note_transition(rid: str, from_state: Any, to_state: Any, **kwargs: Any) -> None:
+            if rid == req.request_id:
+                observed.append((from_state, to_state))
+            return original_note_transition(rid, from_state, to_state, **kwargs)
+
+        worker._note_transition = _spy_note_transition  # type: ignore[method-assign]
+
+        await worker._verifier_queue.put(item)
+        await worker._verifier_queue.put(None)  # type: ignore[arg-type]
+
+        await worker._verifier_loop()
+
+        assert observed == [
+            (ItemLifecycleState.AWAITING_VERIFY, ItemLifecycleState.DISPATCHING),
+            (ItemLifecycleState.DISPATCHING, ItemLifecycleState.REDISPATCH_PARKED),
+        ], f'unexpected transition sequence: {observed!r}'
+        assert len(worker._redispatch) == 1
+        # _live_items must track whatever object actually ended up in
+        # _redispatch (may be a dataclasses.replace()'d copy of `item` with
+        # cap_permit cleared, not `item` itself) — the lockstep invariant is
+        # membership-consistency, not object identity with the original.
+        assert worker._live_items[req.request_id] is worker._redispatch[0]
+
+    async def test_blocking_get_call_site_no_host_bounces_to_redispatch_parked(
+        self, git_ops: GitOps, config: OrchestratorConfig, tmp_path: Path,
+    ) -> None:
+        """An item that arrives AFTER the verifier loop is already blocked on
+        ``_verifier_queue.get()`` (DISPATCH-FILL found nothing and fell
+        through) is dispatched via the SECOND ``_dispatch_item`` call site.
+        With zero free hosts forced, this must also transition
+        AWAITING_VERIFY -> DISPATCHING -> REDISPATCH_PARKED — this call site
+        has no legacy ``_dispatching_item`` coverage at all today.
+        """
+        from orchestrator.merge_queue import (
+            ItemLifecycleState,
+            RealMergeItem,
+            SpeculativeMergeWorker,
+        )
+
+        queue: asyncio.Queue = asyncio.Queue()
+        worker = SpeculativeMergeWorker(git_ops, queue)
+
+        fake_allocator = MagicMock()
+        fake_allocator.free_host_count.return_value = 0
+        worker._host_allocator = fake_allocator
+
+        req = _make_request(
+            'kappa-blocking-get-no-host', 'kappa-blocking-get-no-host', tmp_path, config,
+        )
+        item = RealMergeItem(
+            request=req, merge_result=MagicMock(), merge_wt=tmp_path / 'merge_wt',
+            base_sha='deadbeef', speculative=False,
+        )
+        worker._register_item(item, initial=ItemLifecycleState.AWAITING_VERIFY)
+
+        observed: list[tuple[Any, Any]] = []
+        reached = asyncio.Event()
+        original_note_transition = worker._note_transition
+
+        def _spy_note_transition(rid: str, from_state: Any, to_state: Any, **kwargs: Any) -> None:
+            if rid == req.request_id:
+                observed.append((from_state, to_state))
+                if len(observed) >= 2:
+                    reached.set()
+            return original_note_transition(rid, from_state, to_state, **kwargs)
+
+        worker._note_transition = _spy_note_transition  # type: ignore[method-assign]
+
+        loop_task = asyncio.create_task(worker._verifier_loop())
+        try:
+            # Let the loop find _redispatch/_verifier_queue empty and fall
+            # through to the blocking get() BEFORE the item is put — proving
+            # this is genuinely the blocking-get call site, not DISPATCH-FILL's.
+            for _ in range(5):
+                await asyncio.sleep(0)
+            await worker._verifier_queue.put(item)
+            await asyncio.wait_for(reached.wait(), timeout=5.0)
+        finally:
+            loop_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await loop_task
+
+        assert observed[:2] == [
+            (ItemLifecycleState.AWAITING_VERIFY, ItemLifecycleState.DISPATCHING),
+            (ItemLifecycleState.DISPATCHING, ItemLifecycleState.REDISPATCH_PARKED),
+        ], f'unexpected transition sequence: {observed!r}'
+        assert worker._live_items[req.request_id] is worker._redispatch[0]
+
+    async def test_dispatch_time_staleness_remerge_observed_at_merging(
+        self, git_ops: GitOps, config: OrchestratorConfig,
+    ) -> None:
+        """The dispatch-time staleness remerge window (Mechanism 2, inside
+        ``_dispatch_item``) must be observed at MERGING, then transition
+        back to DISPATCHING before the (now fresh) item proceeds to a normal
+        dispatch — mirrors test_merge_queue.py's
+        test_verify_pickup_rebases_when_main_advanced's OOB-advance
+        interposition to force the ``main_advanced`` remerge deterministically.
+        """
+        from orchestrator.merge_queue import ItemLifecycleState, SpeculativeMergeWorker
+
+        wt = await _make_branch_with_file(
+            git_ops, 'kappa-stale-remerge', 'file_kappa_stale.py', 's = 1\n',
+        )
+        queue: asyncio.Queue = asyncio.Queue()
+        worker = SpeculativeMergeWorker(git_ops, queue)
+        req = _make_request('kappa-stale-remerge', 'kappa-stale-remerge', wt, config)
+
+        original_dispatch = worker._dispatch_item
+        advanced = {'done': False}
+
+        async def _dispatch_with_oob_advance(item: Any) -> Any:
+            if not advanced['done']:
+                advanced['done'] = True
+                (git_ops.project_root / 'oob_kappa.py').write_text('extra = 1\n')
+                await _run(['git', 'add', '-A'], cwd=git_ops.project_root)
+                await _run(
+                    ['git', 'commit', '-m', 'oob advance for kappa remerge test'],
+                    cwd=git_ops.project_root,
+                )
+            return await original_dispatch(item)
+
+        worker._dispatch_item = _dispatch_with_oob_advance  # type: ignore[method-assign]
+
+        captured: list[Any] = []
+        original_remerge = worker._remerge
+
+        async def _spying_remerge(req_: Any, started: Any) -> Any:
+            captured.append(worker._lifecycle.current(req.request_id))
+            return await original_remerge(req_, started)
+
+        worker._remerge = _spying_remerge  # type: ignore[method-assign]
+
+        observed: list[tuple[Any, Any]] = []
+        original_note_transition = worker._note_transition
+
+        def _spy_note_transition(rid: str, from_state: Any, to_state: Any, **kwargs: Any) -> None:
+            if rid == req.request_id:
+                observed.append((from_state, to_state))
+            return original_note_transition(rid, from_state, to_state, **kwargs)
+
+        worker._note_transition = _spy_note_transition  # type: ignore[method-assign]
+
+        worker_task = asyncio.create_task(worker.run())
+
+        with patch('orchestrator.merge_queue.run_scoped_verification', _mock_verify_pass()):
+            await queue.put(req)
+            outcome = await asyncio.wait_for(req.result, timeout=60)
+            assert outcome.status == 'done', f'{outcome}'
+
+        assert captured == [ItemLifecycleState.MERGING], (
+            f'expected the registry to read MERGING while _remerge() ran: {captured!r}'
+        )
+        assert (ItemLifecycleState.DISPATCHING, ItemLifecycleState.MERGING) in observed, (
+            f'missing DISPATCHING -> MERGING on remerge entry: {observed!r}'
+        )
+        assert (ItemLifecycleState.MERGING, ItemLifecycleState.DISPATCHING) in observed, (
+            f'missing MERGING -> DISPATCHING on remerge exit ("then back"): {observed!r}'
+        )
+
+        await worker.stop()
+        await worker_task
