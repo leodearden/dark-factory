@@ -934,7 +934,7 @@ class TestDispatchItemGuardWiring:
         async def _raise_on_get_main(*_args, **_kwargs):
             raise RuntimeError('simulated transient git error')
 
-        async def _noop_verify(_item, _lease):
+        async def _noop_verify(_item, _lease, **_kwargs):
             return None
 
         with (
@@ -996,7 +996,7 @@ class TestDispatchItemGuardWiring:
         async def _return_main(*_args, **_kwargs) -> str:
             return 'fake-main'
 
-        async def _noop_verify(_item, _lease):
+        async def _noop_verify(_item, _lease, **_kwargs):
             return None
 
         with (
