@@ -12,10 +12,9 @@ from __future__ import annotations
 
 from datetime import UTC, datetime
 
+from orchestrator.session_registry import TERMINAL_STATUSES, SessionRecord, Status
 from textual.widgets import DataTable
 from textual.widgets.data_table import RowDoesNotExist
-
-from orchestrator.session_registry import TERMINAL_STATUSES, SessionRecord, Status
 
 _GLYPHS: dict[Status, str] = {
     Status.AWAITING_INPUT: '⏸',

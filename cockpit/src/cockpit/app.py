@@ -7,9 +7,9 @@ spawn bar are C5b.
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Callable
 
 from textual.app import App, ComposeResult
 from textual.containers import Horizontal

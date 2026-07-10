@@ -13,9 +13,8 @@ import logging
 from datetime import datetime
 from pathlib import Path
 
-from textual.widgets import Static
-
 from orchestrator.session_registry import SessionRecord
+from textual.widgets import Static
 
 from cockpit.panes.session_table import format_age, format_title, state_glyph
 
