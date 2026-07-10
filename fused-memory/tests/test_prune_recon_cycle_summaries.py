@@ -759,3 +759,40 @@ class TestRun:
         assert result.get('aborted') is True
         memory.mem0.scroll_by_metadata.assert_not_awaited()
         memory.mem0.count_by_metadata.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_scan_truncation_aborts(self, capsys):
+        """If a project's ground-truth count_by_metadata total exceeds the
+        number of records scroll_by_metadata actually returned, the scan
+        under-counted -- run() must hard-abort before any deletion (even
+        under --apply), flag the project, and point the remedy at
+        --scan-limit."""
+        memory = self._make_memory(self._fixture_records())
+        # Ground truth says there are far more cycle-summaries than the
+        # scroll returned -- simulates a scan_limit too small for the pool.
+        memory.mem0.count_by_metadata = AsyncMock(return_value=999)
+        args = self._args(apply=True, project_id='dark_factory')
+
+        result = await _mod.run(args, memory=memory, known_projects_map=self._known_map())
+
+        assert result.get('aborted') is True
+        assert result.get('scan_truncated') is True
+        assert result.get('truncated_projects') == ['dark_factory']
+        memory.delete_memory.assert_not_awaited()
+
+        captured = capsys.readouterr()
+        assert '--scan-limit' in captured.err
+
+    @pytest.mark.asyncio
+    async def test_no_truncation_when_scan_complete(self):
+        """count_by_metadata == len(scroll) (the default fixture wiring) is
+        NOT a truncation -- run() proceeds to a normal report, not an abort.
+        Guards against a false-positive abort in the happy path."""
+        memory = self._make_memory(self._fixture_records())
+        args = self._args(apply=False, project_id='dark_factory')
+
+        report = await _mod.run(args, memory=memory, known_projects_map=self._known_map())
+
+        assert not report.get('aborted')
+        assert report['dry_run'] is True
+        assert 'totals' in report
