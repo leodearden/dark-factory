@@ -109,3 +109,34 @@ class TestCheckGate1Terminal:
         task must never surface ReconTerminalWriteRejected."""
         verdict = _check('set_task_status', target_status='pending', live_status='done')
         assert verdict.error_type != 'ReconTerminalWriteRejected'
+
+
+# ---------------------------------------------------------------------------
+# check() gate 2 — live workflow (set_task_status only)
+# ---------------------------------------------------------------------------
+
+
+class TestCheckGate2LiveWorkflow:
+    def test_set_task_status_with_live_workflow_rejects(self, monkeypatch):
+        monkeypatch.setattr(
+            recon_write_policy, 'is_workflow_live_for_task', lambda *a, **k: True,
+        )
+        verdict = _check('set_task_status', live_status='in-progress')
+        assert verdict.is_rejection is True
+        assert verdict.error_type == 'ReconLiveWorkflowWriteRejected'
+
+    def test_set_task_status_without_live_workflow_is_ok(self, monkeypatch):
+        monkeypatch.setattr(
+            recon_write_policy, 'is_workflow_live_for_task', lambda *a, **k: False,
+        )
+        verdict = _check('set_task_status', live_status='in-progress')
+        assert verdict.is_rejection is False
+
+    def test_update_task_op_is_not_scoped_by_gate_2(self, monkeypatch):
+        """Gate 2 is set_task_status-only: update_task must not surface
+        ReconLiveWorkflowWriteRejected even when the detector reports live."""
+        monkeypatch.setattr(
+            recon_write_policy, 'is_workflow_live_for_task', lambda *a, **k: True,
+        )
+        verdict = _check('update_task', live_status='in-progress')
+        assert verdict.error_type != 'ReconLiveWorkflowWriteRejected'
