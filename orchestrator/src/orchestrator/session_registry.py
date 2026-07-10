@@ -286,6 +286,93 @@ class SessionRecord:
         return cls.from_dict(json.loads(raw))
 
 
+class DecisionState(StrEnum):
+    """Wire-format lifecycle state for a DecisionRecord (Fleet Cockpit C1, PRD §6.1).
+
+    Modeled as a StrEnum contract for writers, but ``DecisionRecord.state``
+    itself is a plain ``str`` field with NO from_dict coercion through this
+    enum -- mirrors SpawnMode's additive-safe rationale: an unrecognized
+    value must still round-trip rather than raise.
+
+    OPEN: filed, awaiting a human decision.
+    ANSWERED: a decision has been recorded.
+    DROPPED: withdrawn/superseded without an answer.
+    """
+
+    OPEN = 'open'
+    ANSWERED = 'answered'
+    DROPPED = 'dropped'
+
+
+@dataclass
+class DecisionRecord:
+    """One decision-record — ``<fleet_root>/decisions/<id>.json`` (Fleet Cockpit C1 B2, PRD §6.1).
+
+    Only id/project/text/filed_at are mandatory; every other field has a
+    documented default so a minimally-filed decision is still well-formed.
+    Mirrors LeaseHolder's plain to_dict/from_dict/to_json/from_json shape.
+
+    id: this record's identity/filename key; see decision_path_for_id.
+    project: the project_id this decision concerns.
+    text: the decision/question text as filed.
+    filed_at: ISO-8601 timestamp of when this decision was filed.
+    session_id: the session that filed this decision, or None.
+    task_id: the task this decision is scoped to, or None.
+    escalation_id: the escalation this decision resolves, or None.
+    options: the candidate answers offered, or None.
+    manual_boost: an operator-assigned priority nudge; defaults to 0.
+    state: current lifecycle state; see DecisionState. Defaults to
+        ``DecisionState.OPEN``.
+    """
+
+    id: str
+    project: str
+    text: str
+    filed_at: str
+    session_id: str | None = field(default=None, kw_only=True)
+    task_id: str | None = field(default=None, kw_only=True)
+    escalation_id: str | None = field(default=None, kw_only=True)
+    options: list[str] | None = field(default=None, kw_only=True)
+    manual_boost: int = field(default=0, kw_only=True)
+    state: str = field(default=DecisionState.OPEN, kw_only=True)
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            'id': self.id,
+            'project': self.project,
+            'text': self.text,
+            'filed_at': self.filed_at,
+            'session_id': self.session_id,
+            'task_id': self.task_id,
+            'escalation_id': self.escalation_id,
+            'options': self.options,
+            'manual_boost': self.manual_boost,
+            'state': str(self.state),
+        }
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> DecisionRecord:
+        return cls(
+            id=data['id'],
+            project=data['project'],
+            text=data['text'],
+            filed_at=data['filed_at'],
+            session_id=data.get('session_id'),
+            task_id=data.get('task_id'),
+            escalation_id=data.get('escalation_id'),
+            options=data.get('options'),
+            manual_boost=data.get('manual_boost', 0),
+            state=data.get('state', DecisionState.OPEN),
+        )
+
+    def to_json(self) -> str:
+        return json.dumps(self.to_dict())
+
+    @classmethod
+    def from_json(cls, raw: str) -> DecisionRecord:
+        return cls.from_dict(json.loads(raw))
+
+
 # ---------------------------------------------------------------------------
 # Identity, paths, transcript encoding
 # ---------------------------------------------------------------------------
@@ -346,6 +433,27 @@ def transcript_path_for_cwd(cwd: str) -> str:
     """
     encoded = cwd.replace('/', '-').replace('.', '-')
     return f'~/.claude/projects/{encoded}'
+
+
+_DECISION_ID_SANITIZE_RE = re.compile(r'[^A-Za-z0-9._-]')
+"""Mirrors _SLUG_SANITIZE_RE: anything outside [A-Za-z0-9._-] maps to '-', so
+a malformed decision id can never escape decisions_dir via a path
+separator."""
+
+
+def decisions_dir(root: Path | str | None = None) -> Path:
+    return fleet_root(root) / 'decisions'
+
+
+def decision_path_for_id(decision_id: str, root: Path | str | None = None) -> Path:
+    """Resolve *decision_id* (see DecisionRecord.id) to its ``<decisions_dir>/<id>.json`` path.
+
+    *decision_id* is sanitized through _DECISION_ID_SANITIZE_RE first, so it
+    always resolves to a single file directly inside decisions_dir (mirrors
+    lease_path_for_name's path-escape guard).
+    """
+    stem = _DECISION_ID_SANITIZE_RE.sub('-', decision_id)
+    return decisions_dir(root) / f'{stem}.json'
 
 
 # ---------------------------------------------------------------------------
