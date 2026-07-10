@@ -802,6 +802,26 @@ async def test_update_task_rejects_done_provenance_in_metadata(backend, project_
 
 
 @pytest.mark.asyncio
+async def test_update_task_rejects_done_provenance_in_dict_metadata(backend, project_root):
+    """Defense-in-depth: a caller that bypasses the documented ``str | None``
+    signature and passes ``metadata`` as an already-parsed dict must still
+    trip the done_provenance floor. Mirrors the interceptor's
+    ``_reject_done_provenance_in_update_metadata``, which special-cases
+    ``isinstance(metadata, dict)`` before falling back to ``json.loads`` —
+    without that, ``json.loads(dict)`` raises ``TypeError``, is swallowed,
+    and the floor would silently permit the write."""
+    await backend.add_task(project_root=project_root, title='x')
+    with pytest.raises(DoneProvenanceWriteAuthorityError) as exc:
+        await backend.update_task(
+            '1', project_root=project_root,
+            metadata={'done_provenance': {'kind': 'merged', 'commit': 'abc'}},
+        )
+    assert exc.value.to_error_dict() == done_provenance_via_update_task_error('1')
+    task = await backend.get_task('1', project_root=project_root)
+    assert 'done_provenance' not in task['metadata']
+
+
+@pytest.mark.asyncio
 async def test_update_task_done_provenance_rejection_precedes_existence_check(backend, project_root):
     """done_provenance guard runs BEFORE the task SELECT, so rejection beats 'No tasks found'."""
     with pytest.raises(DoneProvenanceWriteAuthorityError) as exc:

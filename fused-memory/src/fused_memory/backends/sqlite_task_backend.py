@@ -1499,10 +1499,19 @@ class SqliteTaskBackend:
         if status is not None:
             raise StatusWriteAuthorityError(task_id, status)
         if metadata is not None:
-            try:
-                parsed_metadata = json.loads(metadata)
-            except (ValueError, TypeError):
-                parsed_metadata = None
+            # Mirror the interceptor's _reject_done_provenance_in_update_metadata:
+            # accept an already-parsed dict directly before falling back to
+            # json.loads. A caller that bypasses the documented ``str | None``
+            # signature and passes a dict would otherwise hit
+            # ``json.loads(dict)`` -> TypeError -> parsed_metadata=None,
+            # silently permitting a done_provenance write past this floor.
+            if isinstance(metadata, dict):
+                parsed_metadata: dict | None = metadata
+            else:
+                try:
+                    parsed_metadata = json.loads(metadata)
+                except (ValueError, TypeError):
+                    parsed_metadata = None
             if isinstance(parsed_metadata, dict) and 'done_provenance' in parsed_metadata:
                 raise DoneProvenanceWriteAuthorityError(task_id)
         # Structured fields (title/description/details/priority/dependencies)
