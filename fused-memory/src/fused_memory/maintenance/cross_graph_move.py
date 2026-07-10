@@ -868,8 +868,23 @@ async def recreate_subgraph_relationships(graphiti: Any, specs: list[dict]) -> S
     entity's resolved target, ``relationships_created`` distinguishes
     recreate from silent skip).
 
-    MERGE-fold handling (arrives in the step-10 extension): a MERGE spec's
-    unique wrong-copy edges are not yet folded into its home copy here.
+    MERGE fold: run AFTER the MOVE-edge/mentions passes above have fully
+    completed for the batch. For every MERGE spec, every RELATES_TO edge
+    incident to its wrong-copy (``source_graph``) is read (full property
+    rows, same SELECT as above) and compared -- via
+    ``classify_unique_wrong_edges`` over uuid sets -- against the home
+    copy's (``target_graph``) OWN current incident edge-uuid set (``_read_
+    relates_to_edge_uuids``, S6's uuid-only reader). Only the edges unique
+    to the wrong copy (absent from home) are recreated on the home copy,
+    preserving the wrong copy's OWN ``group_id`` verbatim (no rewrite -- S6
+    has no ``rewrite_group_id`` analogue, mirroring
+    ``merge_foreign_duplicate``); an edge already shared with home is left
+    untouched. Because this pass re-reads home's edge-uuid set fresh for
+    EACH merge spec, an edge the MOVE-edge pass (or an earlier merge spec in
+    this same batch) already landed on that home graph is correctly
+    excluded here too -- no double-create for a MOVE<->MERGE or
+    MERGE<->MERGE shared edge. MERGE has no MENTIONS-fold analogue (mirrors
+    ``merge_foreign_duplicate``, which never touches MENTIONS either).
 
     Issues NO ``DETACH DELETE`` anywhere -- that is ``delete_source_node``'s
     job (Phase C), which callers must run only after this function has
@@ -938,9 +953,11 @@ async def recreate_subgraph_relationships(graphiti: Any, specs: list[dict]) -> S
         if src_target is None and dst_target is not None:
             if await _entity_present_in_graph(graphiti._graph_for(dst_target), src_uuid):
                 src_target = dst_target
-        elif dst_target is None and src_target is not None:
-            if await _entity_present_in_graph(graphiti._graph_for(src_target), dst_uuid):
-                dst_target = src_target
+        elif (
+            dst_target is None and src_target is not None
+            and await _entity_present_in_graph(graphiti._graph_for(src_target), dst_uuid)
+        ):
+            dst_target = src_target
 
         if src_target is None or dst_target is None or src_target != dst_target:
             # The two endpoints do not share one destination graph --
@@ -1048,6 +1065,92 @@ async def recreate_subgraph_relationships(graphiti: Any, specs: list[dict]) -> S
                 'target_graph=%s (entity_uuid=%s)',
                 mention_uuid, episode_uuid, target_graph_name, entity_uuid,
             )
+
+    # --- MERGE fold ---
+    # Run AFTER the MOVE-edge pass above has fully completed (sequential
+    # awaits, so this is guaranteed): if a MOVE-pass edge already landed on
+    # this MERGE spec's home copy (e.g. a shared MOVE<->MERGE edge whose
+    # MOVE endpoint was processed first), _read_relates_to_edge_uuids below
+    # observes it in home_edge_uuids and classify_unique_wrong_edges
+    # correctly excludes it here -- no double-create.
+    merge_specs = [spec for spec in specs if spec.get('disposition') == 'MERGE']
+    for spec in merge_specs:
+        uuid = spec['uuid']
+        wrong_graph = spec['source_graph']
+        home_graph = spec['target_graph']
+        wrong = graphiti._graph_for(wrong_graph)
+        home = graphiti._graph_for(home_graph)
+
+        wrong_edges_result = await wrong.ro_query(
+            'MATCH (n:Entity {uuid: $uuid})-[e:RELATES_TO]-(m:Entity) '
+            'WITH DISTINCT e, startNode(e) AS s, endNode(e) AS t '
+            'RETURN e.uuid, e.name, e.fact, e.valid_at, e.invalid_at, e.created_at, '
+            '       e.group_id, e.episodes, s.uuid, t.uuid',
+            {'uuid': uuid},
+        )
+        wrong_rows_by_uuid = {row[0]: row for row in (wrong_edges_result.result_set or [])}
+        wrong_edge_uuids = set(wrong_rows_by_uuid)
+
+        home_edge_uuids = await _read_relates_to_edge_uuids(home, uuid)
+        unique_wrong_edge_uuids = classify_unique_wrong_edges(home_edge_uuids, wrong_edge_uuids)
+
+        for edge_uuid in unique_wrong_edge_uuids:
+            (_edge_uuid, edge_name, fact, valid_at, invalid_at, edge_created_at,
+             edge_group_id, episodes, src_uuid, dst_uuid) = wrong_rows_by_uuid[edge_uuid]
+
+            edge_embedding_cypher = (
+                f'MATCH ()-[e:RELATES_TO {{uuid: {_quote_cypher_string(edge_uuid)}}}]-() '
+                'RETURN e.fact_embedding'
+            )
+            edge_embedding_reply = await _read_compact_vector(
+                falkor_client, group_id=wrong_graph, cypher=edge_embedding_cypher,
+            )
+            edge_embedding_literal = format_vecf32_literal(
+                parse_compact_vector_reply(edge_embedding_reply)
+            )
+
+            # Both endpoints are MATCHed (never CREATEd): the home copy of
+            # this MERGE node and the edge's other endpoint must already
+            # exist in home_graph, or this MATCH yields no rows and the
+            # edge is silently skipped -- same convention as the MOVE-edge
+            # pass above / merge_foreign_duplicate. group_id is preserved
+            # from the wrong copy verbatim -- MERGE has no rewrite_group_id
+            # analogue (mirrors merge_foreign_duplicate).
+            edge_create_result = await home.query(
+                'MATCH (a:Entity {uuid: $src_uuid}), (b:Entity {uuid: $dst_uuid}) '
+                'CREATE (a)-[r:RELATES_TO]->(b) '
+                'SET r.uuid = $edge_uuid, '
+                '    r.name = $name, '
+                '    r.fact = $fact, '
+                '    r.valid_at = $valid_at, '
+                '    r.invalid_at = $invalid_at, '
+                '    r.created_at = $created_at, '
+                '    r.group_id = $group_id, '
+                '    r.episodes = $episodes, '
+                f'    r.fact_embedding = {edge_embedding_literal}',
+                {
+                    'src_uuid': src_uuid,
+                    'dst_uuid': dst_uuid,
+                    'edge_uuid': edge_uuid,
+                    'name': edge_name,
+                    'fact': fact,
+                    'valid_at': valid_at,
+                    'invalid_at': invalid_at,
+                    'created_at': edge_created_at,
+                    'group_id': edge_group_id,
+                    'episodes': episodes,
+                },
+            )
+            if edge_create_result.relationships_created:
+                result.edges_recreated += 1
+            else:
+                result.edges_skipped += 1
+                logger.warning(
+                    'recreate_subgraph_relationships: MERGE-fold RELATES_TO '
+                    'edge uuid=%s silently skipped -- other endpoint '
+                    '(src=%s dst=%s) not present in home_graph=%s',
+                    edge_uuid, src_uuid, dst_uuid, home_graph,
+                )
 
     return result
 
