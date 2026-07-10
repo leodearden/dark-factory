@@ -597,6 +597,29 @@ Maintain awareness of escalations waiting for human input. When the human return
 
 Remind about unresolved items roughly every 3-5 escalation handling cycles — enough to keep them visible without being noisy.
 
+### Joining a completed spawn: read `result.md`, don't explore
+
+When a `/spawn`-launched `/unblock` background task completes, that's the **join** step of the
+fan-out/join pattern (fan-out was the spawn; the background task's completion is your join signal).
+Exit codes are **liveness-only** — present-vs-died-silent, not a semantic outcome signal, including
+the observed 129-on-clean-exit race (see `skills/spawn/SKILL.md`'s Verification section) — so never
+infer success, failure, or completeness from the background task's exit code.
+
+Instead, **read the session's result file** for the structured outcome:
+1. Locate the session-registry record for the spawn (the slug you launched it under, or the
+   matching record under `~/.claude/fleet/sessions/` for the task/title you spawned).
+2. Read `record.result_file` — equivalently `~/.claude/fleet/sessions/<slug>/result.md` — for the
+   `outcome` (`done|blocked|abandoned|handed-off`), `changed` (commits/branches/task ids touched),
+   and `action_needed` fields the spawned session wrote before ending.
+3. Use that structured outcome to decide your next step (resolve the escalation, follow up, escalate
+   further) — `result.md` is the authoritative outcome source, so this replaces exploring the
+   task/worktree yourself to reconstruct what happened.
+
+**Fail-soft:** the write is best-effort — if `result.md` is absent, empty, or unparsable (the
+spawned session ended without writing it, or the registry write itself faulted so the record never
+got a `result_file`), fall back to the existing exploration (task/escalation state via MCP, the
+worktree itself) rather than blocking on the file.
+
 ## Resolving Escalations
 
 **Via MCP (always prefer this):**
