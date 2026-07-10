@@ -1797,7 +1797,7 @@ class TestBuildMemoryService:
 
     @pytest.mark.asyncio
     async def test_dry_run_builds_lean_graphiti_backend_with_skip_maintenance(
-        self, monkeypatch,
+        self, mock_config, monkeypatch,
     ):
         """Dry-run (args.apply=False): construct a lean GraphitiBackend,
         await its initialize(skip_maintenance=True), and never construct a
@@ -1814,7 +1814,7 @@ class TestBuildMemoryService:
         )
 
         args = _args(apply=False)
-        config = MagicMock()
+        config = mock_config
 
         result = await _mod.build_memory_service(args, config)
 
@@ -1828,7 +1828,7 @@ class TestBuildMemoryService:
 
     @pytest.mark.asyncio
     async def test_apply_builds_full_memory_service_without_skip(
-        self, monkeypatch,
+        self, mock_config, monkeypatch,
     ):
         """--apply (args.apply=True): construct the full MemoryService and
         await its initialize() with no skip_maintenance override (the real
@@ -1845,7 +1845,7 @@ class TestBuildMemoryService:
         )
 
         args = _args(apply=True, manifest='m.json')
-        config = MagicMock()
+        config = mock_config
 
         result = await _mod.build_memory_service(args, config)
 
