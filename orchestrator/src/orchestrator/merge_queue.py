@@ -9539,8 +9539,41 @@ class SpeculativeMergeWorker(_WipHaltMixin):
             # own root inode, so the #1728 alpha owner-heartbeat's
             # os.utime(merge_wt) can never mask a dead verify here.
             _last_content_mtime = newest_content_mtime(merge_wt) if lease.is_local else None
-            _last_progress_at = time.time()
+            # task 2420 amend (reviewer finding, robustness): time.monotonic(),
+            # not time.time(), for _last_progress_at/_last_probe_at/_now below
+            # — all three are pure duration references (never persisted or
+            # compared against a stored wall-clock value), so they must be
+            # immune to NTP/manual clock steps. A backward step would delay a
+            # real dead-verify abort; a forward step could prematurely trip
+            # the budget and, after MAX_INFLIGHT_DEAD_VERIFY_ABORTS repeats,
+            # false-'block' a healthy task. Matches the time.monotonic()
+            # convention used elsewhere in this file (e.g. _elapsed_ms,
+            # per-attempt t0 at the top of the dequeue loop).
+            _last_progress_at = time.monotonic()
             _last_probe_at = _last_progress_at
+            # task 2420 amend (reviewer finding, correctness): guard against
+            # INFLIGHT_VERIFY_PROGRESS_PROBE_SECS not being comfortably
+            # smaller than INFLIGHT_VERIFY_PROGRESS_BUDGET_SECS. If the probe
+            # interval were >= the budget, the very first eligible content
+            # probe would land at/after the budget deadline, so the abort
+            # would trip before a single progress probe ever ran — false-
+            # aborting every LOCAL verify regardless of health. Clamp the
+            # EFFECTIVE probe interval (local var; never mutates the class/
+            # instance attribute) to a safe fraction of the budget and warn,
+            # so a misconfigured or hot-reloaded pair cannot silently wedge
+            # every local verify.
+            _progress_probe_secs = self.INFLIGHT_VERIFY_PROGRESS_PROBE_SECS
+            if lease.is_local and _progress_probe_secs >= self.INFLIGHT_VERIFY_PROGRESS_BUDGET_SECS:
+                logger.warning(
+                    'Task %s: INFLIGHT_VERIFY_PROGRESS_PROBE_SECS (%.3fs) >= '
+                    'INFLIGHT_VERIFY_PROGRESS_BUDGET_SECS (%.3fs) -- would '
+                    'false-abort every local verify before a single progress '
+                    'probe could run; clamping the effective probe interval '
+                    'to budget/2 for this verify',
+                    req.task_id, _progress_probe_secs,
+                    self.INFLIGHT_VERIFY_PROGRESS_BUDGET_SECS,
+                )
+                _progress_probe_secs = self.INFLIGHT_VERIFY_PROGRESS_BUDGET_SECS / 2
             while True:
                 done, _ = await asyncio.wait(
                     {verify_task},
@@ -9599,8 +9632,8 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                 # progress under merge_wt resets the clock, so a genuinely
                 # long-running healthy cold verify is never false-killed.
                 if lease.is_local:
-                    _now = time.time()
-                    if _now - _last_probe_at >= self.INFLIGHT_VERIFY_PROGRESS_PROBE_SECS:
+                    _now = time.monotonic()
+                    if _now - _last_probe_at >= _progress_probe_secs:
                         _last_probe_at = _now
                         _cur_content_mtime = newest_content_mtime(merge_wt)
                         if _cur_content_mtime is not None and (
