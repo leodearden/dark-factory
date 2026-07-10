@@ -730,6 +730,41 @@ def claim_lease(
     )
 
 
+def heartbeat_lease(name: str, *, root: Path | str | None = None) -> bool:
+    """Bump the *name* lease file's mtime to now -- the reaper's heartbeat clock.
+
+    Returns False (fail-soft, no raise) when the lease is absent or the
+    ``os.utime`` call itself faults; a lease-substrate error must never
+    interrupt a watcher's main loop.
+    """
+    path = lease_path_for_name(name, root=root)
+    if not path.exists():
+        return False
+    try:
+        os.utime(path, None)
+    except OSError:
+        logger.error('heartbeat_lease: failed to touch %s', path, exc_info=True)
+        return False
+    return True
+
+
+def release_lease(name: str, *, root: Path | str | None = None) -> bool:
+    """Remove the *name* lease file. Idempotent: a second call returns False.
+
+    Returns whether the lease existed before this call removed it; fail-soft
+    (logs loudly at ERROR, returns False) on an OSError from the removal
+    itself.
+    """
+    path = lease_path_for_name(name, root=root)
+    existed = path.exists()
+    try:
+        path.unlink(missing_ok=True)
+    except OSError:
+        logger.error('release_lease: failed to remove %s', path, exc_info=True)
+        return False
+    return existed
+
+
 # ---------------------------------------------------------------------------
 # CLI + fail-soft (PRD: a registry fault must never change the spawn's exit code)
 # ---------------------------------------------------------------------------
