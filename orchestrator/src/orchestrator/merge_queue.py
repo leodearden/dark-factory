@@ -9591,6 +9591,13 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                     with contextlib.suppress(BaseException):
                         await verify_task
                     await self._release_or_cleanup(merge_wt, spec_warm=_spec_warm)
+                    # task 2420 amend (reviewer finding, resource_cleanup): this
+                    # request is DROPPED (sole waiter gave up) — the per-task
+                    # dead-verify-abort counter has no further purpose for it,
+                    # so pop it here too (not just on the busy-loop-capped and
+                    # normal-completion exit paths) to keep the dict scoped to
+                    # genuinely live/in-flight task_ids on every exit path.
+                    self._inflight_dead_verify_aborts.pop(req.task_id, None)
                     return InflightVerifyResult(
                         outcome=None,
                         merge_wt=None,
@@ -9724,6 +9731,12 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                 f'(merge={merge_commit[:8]}, error)'
             )
             await self._release_or_cleanup(merge_wt, spec_warm=_spec_warm)
+            # task 2420 amend (reviewer finding, resource_cleanup): this is a
+            # terminal 'blocked' resolution via a generic exception — pop the
+            # per-task dead-verify-abort counter here too so a stale count
+            # cannot linger for a task_id that exits via this path (mirrors
+            # the abandoned/DROPPED and busy-loop-capped exit paths).
+            self._inflight_dead_verify_aborts.pop(req.task_id, None)
             err_outcome = MergeOutcome('blocked', reason=f'Verification error: {exc}')
             if not req.result.done():
                 req.result.set_result(err_outcome)
