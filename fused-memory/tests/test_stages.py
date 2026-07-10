@@ -9848,6 +9848,186 @@ class TestTaskKnowledgeSyncStage2Guards:
 
 
 # ---------------------------------------------------------------------------
+# Task 2230 (W5-mu) step-1 — _apply_post_flight_guards no longer post-hoc
+# reclassifies terminal/stale/sts-mismatch/live-workflow recon writes; that
+# class of write is now rejected pre-write by ReconWritePolicy (task 2224).
+# ---------------------------------------------------------------------------
+
+
+class TestPostFlightGuardsNoForensicReclassification:
+    """_apply_post_flight_guards no longer reclassifies forensic write classes.
+
+    Each scenario reproduces one of the four TestComposition::
+    test_all_four_guards_fire_together cases, but asserts the guard did NOT
+    fire — the corresponding stat is absent and no counter was decremented.
+    """
+
+    @pytest.mark.asyncio
+    async def test_terminal_state_write_not_reclassified(self, stage2_guard_mock_deps):
+        """update_task on a task whose live status is 'done' is left alone."""
+        stage = TaskKnowledgeSync(StageId.task_knowledge_sync, **stage2_guard_mock_deps)
+        stage.scope = _scope('dark_factory', stage.scope.project_root)
+        stage.scope = _scope(stage.scope.project_id, '/project')
+
+        ops = [{
+            'id': 'op-term-42',
+            'agent_id': 'recon-stage-task_knowledge_sync',
+            'operation': 'update_task',
+            'params': json.dumps({'task_id': '42'}),
+            'layer': 'write_op',
+            'causation_id': 'test-run-no-reclass-1',
+            'created_at': '2026-01-01T00:00:00',
+        }]
+        stage2_guard_mock_deps['journal'].write_journal.get_ops_by_causation.return_value = ops
+        stage2_guard_mock_deps['taskmaster'].get_task.return_value = {'status': 'done'}
+
+        with (
+            patch.object(stage, 'assemble_payload', new=AsyncMock(return_value='payload')),
+            patch(
+                'fused_memory.reconciliation.stages.base.run_stage_via_cli',
+                new=AsyncMock(return_value=_make_stage2_guard_cli_result(
+                    [], stats={'tasks_modified': 5},
+                )),
+            ),
+        ):
+            report = await stage.run(
+                events=[],
+                watermark=Watermark(project_id='dark_factory'),
+                prior_reports=[],
+                run_id='test-run-no-reclass-1',
+            )
+
+        assert report.stats.get('tasks_modified') == 5
+        assert 'not_applicable_count' not in report.stats
+
+    @pytest.mark.asyncio
+    async def test_set_task_status_post_action_mismatch_not_reclassified(
+        self, stage2_guard_mock_deps
+    ):
+        """set_task_status(target=done) on a task whose live status is 'pending' is left alone."""
+        stage = TaskKnowledgeSync(StageId.task_knowledge_sync, **stage2_guard_mock_deps)
+        stage.scope = _scope('dark_factory', stage.scope.project_root)
+        stage.scope = _scope(stage.scope.project_id, '/project')
+
+        ops = [{
+            'id': 'op-sts-7',
+            'agent_id': 'recon-stage-task_knowledge_sync',
+            'operation': 'set_task_status',
+            'params': json.dumps({'task_id': '7', 'status': 'done'}),
+            'layer': 'write_op',
+            'causation_id': 'test-run-no-reclass-2',
+            'created_at': '2026-01-01T00:00:00',
+        }]
+        stage2_guard_mock_deps['journal'].write_journal.get_ops_by_causation.return_value = ops
+        stage2_guard_mock_deps['taskmaster'].get_task.return_value = {'status': 'pending'}
+
+        with (
+            patch.object(stage, 'assemble_payload', new=AsyncMock(return_value='payload')),
+            patch(
+                'fused_memory.reconciliation.stages.base.run_stage_via_cli',
+                new=AsyncMock(return_value=_make_stage2_guard_cli_result(
+                    [], stats={'tasks_modified': 5},
+                )),
+            ),
+        ):
+            report = await stage.run(
+                events=[],
+                watermark=Watermark(project_id='dark_factory'),
+                prior_reports=[],
+                run_id='test-run-no-reclass-2',
+            )
+
+        assert report.stats.get('tasks_modified') == 5
+        assert 'set_task_status_post_action_mismatches' not in report.stats
+
+    @pytest.mark.asyncio
+    async def test_stall_guard_freshness_not_reclassified(self, stage2_guard_mock_deps):
+        """add_memory with a stale snapshot_status metadata field is left alone."""
+        stage = TaskKnowledgeSync(StageId.task_knowledge_sync, **stage2_guard_mock_deps)
+        stage.scope = _scope('dark_factory', stage.scope.project_root)
+        stage.scope = _scope(stage.scope.project_id, '/project')
+
+        ops = [{
+            'id': 'op-mem-11',
+            'agent_id': 'recon-stage-task_knowledge_sync',
+            'operation': 'add_memory',
+            'params': json.dumps({
+                'content': 'task 11 is stalled',
+                'metadata': {'task_id': '11', 'snapshot_status': 'in-progress'},
+            }),
+            'layer': 'write_op',
+            'causation_id': 'test-run-no-reclass-3',
+            'created_at': '2026-01-01T00:00:00',
+        }]
+        stage2_guard_mock_deps['journal'].write_journal.get_ops_by_causation.return_value = ops
+        stage2_guard_mock_deps['taskmaster'].get_task.return_value = {'status': 'done'}
+
+        with (
+            patch.object(stage, 'assemble_payload', new=AsyncMock(return_value='payload')),
+            patch(
+                'fused_memory.reconciliation.stages.base.run_stage_via_cli',
+                new=AsyncMock(return_value=_make_stage2_guard_cli_result(
+                    [], stats={'tasks_modified': 5},
+                )),
+            ),
+        ):
+            report = await stage.run(
+                events=[],
+                watermark=Watermark(project_id='dark_factory'),
+                prior_reports=[],
+                run_id='test-run-no-reclass-3',
+            )
+
+        assert 'stall_guard_freshness_violations' not in report.stats
+
+    @pytest.mark.asyncio
+    async def test_live_workflow_status_write_not_reclassified(
+        self, stage2_guard_mock_deps, monkeypatch
+    ):
+        """set_task_status on a task with a live workflow is left alone."""
+        import fused_memory.reconciliation.stages.task_knowledge_sync as tks_module
+
+        monkeypatch.setattr(
+            tks_module, 'is_workflow_live_for_task', lambda _tid, _pr, **kw: True
+        )
+
+        stage = TaskKnowledgeSync(StageId.task_knowledge_sync, **stage2_guard_mock_deps)
+        stage.scope = _scope('dark_factory', stage.scope.project_root)
+        stage.scope = _scope(stage.scope.project_id, '/project')
+
+        ops = [{
+            'id': 'op-live-sts',
+            'agent_id': 'recon-stage-task_knowledge_sync',
+            'operation': 'set_task_status',
+            'params': json.dumps({'task_id': '4321', 'status': 'in-progress'}),
+            'layer': 'write_op',
+            'causation_id': 'test-run-no-reclass-4',
+            'created_at': '2026-01-01T00:00:00',
+        }]
+        stage2_guard_mock_deps['journal'].write_journal.get_ops_by_causation.return_value = ops
+        stage2_guard_mock_deps['taskmaster'].get_task.return_value = {'status': 'in-progress'}
+
+        with (
+            patch.object(stage, 'assemble_payload', new=AsyncMock(return_value='payload')),
+            patch(
+                'fused_memory.reconciliation.stages.base.run_stage_via_cli',
+                new=AsyncMock(return_value=_make_stage2_guard_cli_result(
+                    [], stats={'tasks_modified': 2},
+                )),
+            ),
+        ):
+            report = await stage.run(
+                events=[],
+                watermark=Watermark(project_id='dark_factory'),
+                prior_reports=[],
+                run_id='test-run-no-reclass-4',
+            )
+
+        assert report.stats.get('tasks_modified') == 2
+        assert 'live_workflow_status_writes' not in report.stats
+
+
+# ---------------------------------------------------------------------------
 # Task 1201 — BaseStage._escalation_queue attribute + harness wiring
 # ---------------------------------------------------------------------------
 
