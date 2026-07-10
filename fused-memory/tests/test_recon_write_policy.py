@@ -175,3 +175,37 @@ class TestCheckGate3StaleSnapshot:
             'update_task', live_status='done', snapshot_token='pending',
         )
         assert verdict.error_type == 'ReconTerminalWriteRejected'
+
+
+# ---------------------------------------------------------------------------
+# SNAPSHOT_TOKEN_KEYS / extract_snapshot_token
+# ---------------------------------------------------------------------------
+
+
+class TestExtractSnapshotToken:
+    def test_snapshot_token_keys(self):
+        assert recon_write_policy.SNAPSHOT_TOKEN_KEYS == ('snapshot_status', 'observed_status')
+
+    def test_extract_from_dict_snapshot_status(self):
+        assert recon_write_policy.extract_snapshot_token(
+            {'snapshot_status': 'pending'},
+        ) == 'pending'
+
+    def test_extract_from_dict_observed_status_alias(self):
+        assert recon_write_policy.extract_snapshot_token(
+            {'observed_status': 'done'},
+        ) == 'done'
+
+    def test_extract_from_json_string(self):
+        assert recon_write_policy.extract_snapshot_token(
+            '{"snapshot_status":"pending"}',
+        ) == 'pending'
+
+    def test_extract_from_none_is_none(self):
+        assert recon_write_policy.extract_snapshot_token(None) is None
+
+    def test_extract_from_non_dict_is_none(self):
+        assert recon_write_policy.extract_snapshot_token(42) is None
+
+    def test_extract_from_dict_without_either_key_is_none(self):
+        assert recon_write_policy.extract_snapshot_token({'other': 'x'}) is None
