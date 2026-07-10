@@ -1358,8 +1358,12 @@ def _render_live_workflow_section(
     worktree/branch of its own — it is routed to ``DeterministicRunner``
     instead — so the project-wide orchestrator_live signal is dropped for it
     too, the same way it is for never-dispatched statuses.  A normal blocked
-    task (``task_kind`` absent or not ``'deterministic'``) is unaffected and
-    keeps the signal, since it may legitimately auto-unblock mid-pipeline.
+    task (``task_kind`` absent or not ``'deterministic'``) keeps the signal
+    ONLY when it carries genuine per-task evidence (a registered worktree or a
+    recent commit), since it may legitimately auto-unblock mid-pipeline; a
+    blocked normal task whose ONLY evidence is the bare project-wide
+    orchestrator lock also has the signal dropped (task 2409 — closes the
+    repeated re-deferral loop this caused for tasks 2335/2196).
 
     Args:
         tasks: Task dicts from the active/proactive-sample pool.  Only tasks

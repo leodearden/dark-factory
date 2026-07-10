@@ -2757,6 +2757,14 @@ class ReconciliationHarness:
                         # acquires a worktree/branch of its own, so the bare
                         # orchestrator lock is not task-specific evidence for it
                         # either, and a stranded deterministic deploy still escalates.
+                        # Task 2409: extends this further to a BLOCKED cited task
+                        # that is normal (task_kind absent or 'normal') with no
+                        # registered worktree and no recent commit — the bare
+                        # project-wide orchestrator lock is dropped for it too, so
+                        # a stranded normal task (the tasks 2335/2196 re-deferral
+                        # loop) still escalates instead of being suppressed
+                        # indefinitely. A blocked normal task WITH genuine
+                        # per-task evidence is unaffected and still suppresses.
                         affected_ids = _derive_affected_ids(finding)
                         # For liveness, iterate only cited task ids.
                         # _derive_affected_ids mixes in entity canonical_names,

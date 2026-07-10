@@ -431,10 +431,19 @@ class TestStatusScopedOrchestratorSignal:
         assert result.is_live is False
 
     @pytest.mark.parametrize(
-        'status', ['pending', 'in-progress', 'blocked', 'review', 'merge-deferred']
+        'status', ['pending', 'in-progress', 'review', 'merge-deferred']
     )
     def test_non_ineligible_status_preserves_orchestrator_signal(self, tmp_path, status):
-        """Non-ineligible statuses leave the project-wide orchestrator_live signal intact."""
+        """Non-ineligible statuses leave the project-wide orchestrator_live signal intact.
+
+        'blocked' is deliberately EXCLUDED from this parametrize list (unlike prior to
+        task 2409): with no task_kind passed (defaults to None) and no git evidence,
+        'blocked' now depends on rule 3 (see _orchestrator_signal_ineligible) rather
+        than being unconditionally preserved. See
+        TestBlockedNormalOrchestratorSuppression (bare case: suppressed) and
+        TestBlockedDeterministicOrchestratorSuppression for 'blocked''s task_kind-aware
+        coverage.
+        """
         with patch('subprocess.run', side_effect=self._no_worktree_no_commit_side_effect()):
             result = detect_live_workflow(
                 _TASK_ID, str(tmp_path), status=status, _orchestrator_live=True
