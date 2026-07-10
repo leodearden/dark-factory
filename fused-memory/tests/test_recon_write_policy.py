@@ -140,3 +140,38 @@ class TestCheckGate2LiveWorkflow:
         )
         verdict = _check('update_task', live_status='in-progress')
         assert verdict.error_type != 'ReconLiveWorkflowWriteRejected'
+
+
+# ---------------------------------------------------------------------------
+# check() gate 3 — stale snapshot (op-agnostic) + precedence
+# ---------------------------------------------------------------------------
+
+
+class TestCheckGate3StaleSnapshot:
+    def test_stale_snapshot_rejects(self):
+        verdict = _check(
+            'update_task', live_status='in-progress', snapshot_token='pending',
+        )
+        assert verdict.is_rejection is True
+        assert verdict.error_type == 'ReconStaleSnapshotRejected'
+
+    def test_fresh_snapshot_matching_live_status_is_ok(self):
+        verdict = _check(
+            'update_task', live_status='in-progress', snapshot_token='in-progress',
+        )
+        assert verdict.is_rejection is False
+
+    def test_no_snapshot_token_skips_gate(self):
+        verdict = _check(
+            'update_task', live_status='in-progress', snapshot_token=None,
+        )
+        assert verdict.is_rejection is False
+
+    def test_terminal_gate_takes_precedence_over_stale_snapshot(self):
+        """Gate 1 (terminal) is checked before gate 3 (stale snapshot): a
+        done task with a stale snapshot reports the more fundamental
+        ReconTerminalWriteRejected, not ReconStaleSnapshotRejected."""
+        verdict = _check(
+            'update_task', live_status='done', snapshot_token='pending',
+        )
+        assert verdict.error_type == 'ReconTerminalWriteRejected'
