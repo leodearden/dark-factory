@@ -154,6 +154,11 @@ def check(
 
     Gate 2 (live workflow): ``op == 'set_task_status'`` AND a live workflow
     is detected for ``task_id`` -> ``ReconLiveWorkflowWriteRejected``.
+
+    Gate 3 (stale snapshot, op-agnostic, checked last): ``snapshot_token is
+    not None`` AND it disagrees with ``live_status`` ->
+    ``ReconStaleSnapshotRejected``. Checked last so a terminal/live-workflow
+    rejection takes precedence over a stale-snapshot one.
     """
     if op == 'update_task' and live_status in TERMINAL_STATUSES:
         return _reject(
@@ -193,6 +198,29 @@ def check(
                 'project-level lock) is active for this task. Recon-stage '
                 'status writes would race the pipeline and are rejected; '
                 'wait for the workflow to complete.'
+            ),
+            live_status=live_status,
+            target_status=target_status,
+            snapshot_token=snapshot_token,
+        )
+
+    if snapshot_token is not None and snapshot_token != live_status:
+        return _reject(
+            op=op,
+            task_id=task_id,
+            agent_id=agent_id,
+            error_type='ReconStaleSnapshotRejected',
+            reason=(
+                f'recon-stage write blocked: task {task_id} snapshot_token '
+                f'{snapshot_token!r} does not match live_status '
+                f'{live_status!r}; the snapshot this write was based on is '
+                'stale.'
+            ),
+            hint=(
+                'The task status changed after this recon-stage write was '
+                'computed. Re-observe the live status and retry, or drop '
+                'the snapshot_status/observed_status metadata key if '
+                'freshness is not required.'
             ),
             live_status=live_status,
             target_status=target_status,
