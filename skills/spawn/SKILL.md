@@ -66,24 +66,36 @@ If `$CLAUDE_TERMINAL_CMD` (preferred) or `$ESCALATION_TERMINAL_CMD` (legacy) is 
 
 ## Verification
 
-The background task's completion is a reliable signal that the spawned session has exited; its exit code is claude's own exit code. Script-level exit codes the caller should distinguish:
+The background task's completion is a reliable **liveness** signal: it tells you the spawned session's process is gone, present vs. died-silent. As of Attention Rail T5, exit codes are documented as **liveness-only** — they are not, and should not be treated as, the semantic outcome channel. That channel is an explicit file the session writes: see [Result-handback (result.md)](#result-handback-resultmd) below. All codes below are still returned unchanged (nothing here is a breaking change); only their meaning narrows to "was the process alive, and how did it stop," not "did the work succeed." Script-level exit codes the caller should distinguish:
 
 | Exit code | Meaning |
 |-----------|---------|
-| `0..125`  | The spawned `claude` session's own exit code |
+| `0..125`  | The spawned `claude` session's own exit code. Liveness only — a `0` means the process exited cleanly, not that the work succeeded or is complete; check `result.md` for the outcome. |
 | `126`     | No terminal emulator found — prompt the user for `$CLAUDE_TERMINAL_CMD` and retry. Suggest they export it in their shell profile for future sessions. |
 | `127`     | Launcher failed to start the session (the emulator binary errored before running the payload — no sentinel was ever written). Surface the error to the caller. |
-| `129`     | Terminal window closed while the session was still alive (SIGHUP reached the running session). The session may or may not have completed its work; treat as inconclusive, not as a launcher failure. |
+| `129`     | Terminal window closed while the session was still alive (SIGHUP reached the running session) — **or** a session that had *already finished cleanly* raced its own window teardown and still surfaced as 129 (see "The 129-on-clean-exit race" below). Inconclusive by construction: never read `129` as "the session failed" or "the work was lost" — read `result.md`. |
 | `144`     | Claude never started — no new transcript appeared under `~/.claude/projects/<encoded-cwd>/` and no `claude` process was detected within the started-grace window; the background started-watchdog marked the session-registry record `failed-to-start` and emitted a loud caller-visible line on the spawn's stderr. This is the silent-no-transcript hang (2026-07-06 incident), now surfaced within grace instead of hanging. Additive; all existing codes retain their meaning. |
 | `2`       | Bad usage — caller bug, not user-recoverable. |
 
 The transcript path used by the `144` check encodes the session's `cwd` by replacing every `/` and `.` with `-`, matching `session_registry.transcript_path_for_cwd` byte-for-byte — e.g. `/home/leo/src/dark-factory` → `~/.claude/projects/-home-leo-src-dark-factory/`. The started-grace window defaults to ~90s and is tunable via `$SPAWN_STARTED_GRACE_SECS`.
+
+**The 129-on-clean-exit race.** `129` is not a reliable "killed mid-session, work possibly lost" signal, even though that's what it originally meant. `spawn-claude.sh`'s payload arms an `EXIT` trap (captures `claude`'s real exit code via `${ec:-$?}`) and a `HUP` trap (converts a window-close SIGHUP into `exit 129`) before invoking `claude`. A **clean** exit — e.g. the user hits Ctrl-C (or the session simply finishes) at almost the same moment the terminal window is torn down (the emulator closing the window right as the payload shell is unwinding) — can still race the HUP trap: it wins the race and overwrites the EXIT trap's capture of the real, already-successful exit code, so a session that completed its work cleanly surfaces as `129` at the parent anyway. This has been observed in practice, not just theorized. The fix is not to chase a tighter race window; it's to stop reading exit codes for outcome at all — that's exactly what `result.md` exists for.
 
 **Known limitations of the `144` check:**
 - **Concurrent same-cwd spawns.** The transcript directory is keyed on `cwd`, not on the individual session — Claude Code writes every session for a given `cwd` into the same directory. If a second, genuinely healthy spawn for the same `cwd` writes its own new transcript while a sibling spawn is truly failing to start, the healthy sibling's file is indistinguishable from the failing spawn's own evidence, so the failing spawn is never flagged (a false negative). The detector is exact for the common single-spawn-per-cwd case, including the motivating 2026-07-06 incident, but treat coverage as reduced for a concurrent same-cwd fleet.
 - **Detached launchers can false-flag a live-but-slow session.** For a detached launcher (`konsole`, or a custom `$CLAUDE_TERMINAL_CMD`), the transcript probe is the *only* positive evidence — a live `claude` process can't be observed once its launcher detaches. A real session that is merely slow to write its first transcript (heavy load, cold cache) can still be flagged `144` even though it is alive and keeps running detached. Treat a `144` on a detached launcher as "no evidence seen within grace," not as confirmation the session is dead, and raise `$SPAWN_STARTED_GRACE_SECS` for callers on slow or loaded hosts.
 
 If you want to confirm the spawned session is alive mid-run, `ps -ef | grep claude` works. The background task itself is the canonical liveness signal — don't poll it via `TaskGet` in tight loops; just wait for its completion notification.
+
+## Result-handback (result.md)
+
+Exit codes (above) only tell you the process is gone and roughly how it stopped — never what happened. The semantic outcome channel is an explicit file the spawned session writes before it ends:
+
+- `spawn-claude.sh` allocates `<record-dir>/result.md` — the same session-registry record directory captured as `SESSION_RECORD_DIR` — and exports its path into the spawned session's own environment as `$CLAUDE_SPAWN_RESULT_FILE`. The identical path is stored in the session-registry record's `result_file` field, so a parent reading the record never has to recompute or guess the path.
+- The prompt handed to the spawned session gets a standard trailer appended, asking it to write — before ending, whether it finishes, hands off, or gets blocked — an `outcome` (`done|blocked|abandoned|handed-off`), `changed` (commits/branches/task ids touched), and `action_needed` (what a human or parent should do next) as a small structured markdown header, followed by a few sentences of prose context.
+- This is **best-effort**: nothing in `spawn-claude.sh`, and nothing the trailer asks for, blocks the session's own exit. A parent joining a completed spawn (e.g. escalation-watcher on a `/spawn` background task's completion) should read `record.result_file` (equivalently `<record-dir>/result.md`) for the authoritative outcome, and fall back to exploring the worktree/task only when the file is absent, empty, or unparsable.
+- **Fail-soft, matching the registry's own fail-soft contract:** if the session-registry `launching` write itself faults (missing `python3`, an unwritable fleet root, etc.), `SESSION_RECORD_DIR` is empty and both the env export and the prompt trailer are cleanly skipped — no bogus `/result.md` path is ever exported, referenced, or created. The exit-code contract above is unaffected either way.
+- A future `Stop`/`SessionEnd` hook (Attention Rail T6) may add a fallback stub-write for a session that skips the trailer's instruction, but this protocol does not depend on T6 landing — the prompt trailer plus the session's own best-effort write is already a complete signal, if occasionally missed.
 
 ## When NOT to use
 
