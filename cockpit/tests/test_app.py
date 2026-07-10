@@ -12,6 +12,8 @@ test_ui_config.py.
 
 from __future__ import annotations
 
+from pathlib import Path
+
 import pytest
 from orchestrator import session_registry as sr
 from textual.coordinate import Coordinate
@@ -30,6 +32,23 @@ def _make_record(**overrides):
     }
     fields.update(overrides)
     return sr.SessionRecord(**fields)
+
+
+def _snapshot_tree(base: Path) -> dict[str, tuple[int, bytes]]:
+    """Map every file under *base* (relative path -> (mtime_ns, bytes)).
+
+    Used to prove the cockpit's write discipline by diffing this snapshot
+    across an app run: an absent path is not a KeyError, it's just missing
+    from the mapping, so a deleted-or-never-written file shows up as a plain
+    dict-equality mismatch rather than needing special-casing.
+    """
+    if not base.is_dir():
+        return {}
+    return {
+        str(path.relative_to(base)): (path.stat().st_mtime_ns, path.read_bytes())
+        for path in base.rglob('*')
+        if path.is_file()
+    }
 
 
 class TestInitialRender:
@@ -138,3 +157,52 @@ class TestRowSelectionDetail:
             assert 'Which port?' in detail.rendered_text
             assert '2085' in detail.rendered_text
             assert 'esc-99' in detail.rendered_text
+
+
+class TestWriteDiscipline:
+    @pytest.mark.timeout(10)
+    async def test_cockpit_writes_only_its_own_ui_config(self, tmp_path):
+        """PRD §2/§5 hard invariant: C5a is a pure consumer of the session and
+        decision registries. It may create/update its OWN cockpit-ui.json, but
+        running the app end-to-end (mount, a poll tick, a row selection) must
+        never create, modify, or delete a sessions/ or decisions/ file --
+        those belong to spawn-claude.sh/T4-T7/C8/C5b, never the C5a view."""
+        from cockpit.app import CockpitApp
+        from cockpit.panes.session_table import SessionTable
+
+        record = _make_record(session_slug='write-disc-1', status=sr.Status.RUNNING)
+        sr.write_record(record, root=tmp_path)
+
+        decision = sr.DecisionRecord(
+            id='dec-1',
+            project='df',
+            text='Which port?',
+            filed_at='2026-07-07T00:00:00+00:00',
+        )
+        assert sr.write_decision(decision, root=tmp_path)
+
+        before = _snapshot_tree(tmp_path)
+        # sanity: prove the snapshot actually captured the seeded files, so a
+        # later "unchanged" assertion isn't vacuously true over an empty dict.
+        assert any(path.startswith('sessions/') for path in before)
+        assert any(path.startswith('decisions/') for path in before)
+
+        app = CockpitApp(fleet_root=tmp_path, poll_interval=0.05)
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            table = app.query_one(SessionTable)
+
+            await pilot.pause(0.2)  # let at least one poll tick land
+
+            table.move_cursor(row=table.get_row_index('write-disc-1'))
+            await pilot.pause()
+
+        after = _snapshot_tree(tmp_path)
+
+        for path, value in before.items():
+            assert after.get(path) == value, f'{path} was created/modified/removed by the cockpit'
+
+        new_or_modified = set(after) - set(before)
+        assert new_or_modified == {'cockpit-ui.json'}, (
+            f'expected only cockpit-ui.json as a new path, got {new_or_modified}'
+        )
