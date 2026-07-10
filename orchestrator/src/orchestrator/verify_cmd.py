@@ -238,25 +238,39 @@ def render(cmd: VerifyCmd) -> str:
     The single shell-string producer — the inverse of ``parse_config_command``
     for well-formed, non-OPAQUE, non-chained commands (P2).
 
-    OPAQUE commands, and RECOGNISED-BUT-UNSTRUCTURABLE multi-segment chains
-    (``cmd.raw is not None`` in both cases), return ``raw`` verbatim: there is
-    no structured state to reassemble, and for a chain any mutation happens
-    as a localised in-place rewrite of ``raw`` itself (``cargo_scope`` /
-    ``serial_pytest``), not through the fields rendered below.
-
-    Otherwise emits, in canonical order: a leading ``cd <cwd_rel> &&`` (if
-    set), a ``uv run [--project <uv_project>]`` wrapper (if uv-wrapped), the
-    ``npx`` sentinel (if present in ``wrappers``), the tool's canonical head,
-    then ``base_flags`` and ``targets`` — each value token ``shlex.quote``d
-    for shell safety. ``strip_cwd``/``reproject`` normalise both
+    Computes an *inner* command first: OPAQUE commands and RECOGNISED-BUT-
+    UNSTRUCTURABLE multi-segment chains (``cmd.raw is not None`` in both
+    cases) use ``raw`` verbatim — there is no structured state to reassemble,
+    and for a chain any mutation happens as a localised in-place rewrite of
+    ``raw`` itself (``cargo_scope`` / ``serial_pytest``), not through the
+    fields rendered below. Otherwise the inner command is assembled, in
+    canonical order: a leading ``cd <cwd_rel> &&`` (if set), a ``uv run
+    [--project <uv_project>]`` wrapper (if uv-wrapped), the ``npx`` sentinel
+    (if present in ``wrappers``), the tool's canonical head, then
+    ``base_flags`` and ``targets`` — each value token ``shlex.quote``d for
+    shell safety. ``strip_cwd``/``reproject`` normalise both
     ``--directory``/``--project`` and a leading ``cd`` into ``cwd_rel``/
     ``uv_project``; rendering ``cwd_rel`` as a leading ``cd`` unconditionally
     is a documented normalisation (argv-equivalent, not always byte-identical
     to a ``--directory``-form input).
-    """
-    if cmd.raw is not None:
-        return cmd.raw
 
+    Finally, if ``wrappers`` carries a non-``'npx'`` entry (set by
+    ``govern_cpu`` — a resolved cpu-governed-exec path), the inner command
+    computed above is wrapped as an outermost ``<exec> --role merge --
+    /bin/bash -c <quoted-inner>``: the ``shlex.quote``d inner payload keeps
+    any shell operators (``&&``, ``|``, ...) inside it intact, including for
+    a raw-retained chain (migrates ``_maybe_govern_merge_cmd``'s bash-wrap).
+    OPAQUE never carries a govern wrapper (P1 — ``govern_cpu`` no-ops on it).
+    """
+    inner = cmd.raw if cmd.raw is not None else _render_structured(cmd)
+    govern_exec = next((w for w in cmd.wrappers if w != 'npx'), None)
+    if govern_exec is None:
+        return inner
+    return f'{shlex.quote(govern_exec)} --role merge -- /bin/bash -c {shlex.quote(inner)}'
+
+
+def _render_structured(cmd: VerifyCmd) -> str:
+    """Assemble the shell string for a non-raw-retained (structured) VerifyCmd."""
     segments: list[str] = []
     if cmd.cwd_rel is not None:
         segments.append(f'cd {shlex.quote(cmd.cwd_rel)} &&')
@@ -441,3 +455,22 @@ def serial_pytest(cmd: VerifyCmd) -> VerifyCmd:
 
         return replace(cmd, raw=_PYTEST_INVOCATION_RE.sub(_rewrite, cmd.raw))
     return replace(cmd, base_flags=(*cmd.base_flags, '-p', 'no:xdist', '-o', 'addopts='))
+
+
+def govern_cpu(cmd: VerifyCmd, exec_path: str | None) -> VerifyCmd:
+    """Return *cmd* with a cpu-governed-exec wrapper appended to ``wrappers``.
+
+    ``render`` recognises any ``wrappers`` entry other than the ``'npx'``
+    sentinel as a resolved cpu-governed-exec path and wraps the *entire*
+    rendered command — structured or raw-retained chain alike — as an
+    outermost ``<exec> --role merge -- /bin/bash -c <quoted-inner>``
+    (migrates ``_maybe_govern_merge_cmd``'s bash-wrap; the ``shlex.quote``d
+    inner payload preserves shell operators like ``&&`` inside a
+    raw-retained chain intact).
+
+    A no-op when *exec_path* is falsy (``''``/``None`` — governance not
+    configured/resolved) or ``cmd.tool is ToolKind.OPAQUE`` (P1).
+    """
+    if cmd.tool is ToolKind.OPAQUE or not exec_path:
+        return cmd
+    return replace(cmd, wrappers=(*cmd.wrappers, exec_path))
