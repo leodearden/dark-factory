@@ -351,3 +351,31 @@ class TestStartupGate:
         scheduler.finish_startup()
         scheduler.finish_startup()
         assert scheduler.started is True
+
+
+class TestSchedulerFacadeProtocol:
+    """(step-13) ``SchedulerFacade`` -- task 2235's public, ``runtime_checkable``
+    relocation of ``workflow._SchedulerLike`` onto the Scheduler itself (the
+    module that actually implements the seam it describes).
+
+    ``workflow.py`` retypes its ``TaskWorkflow.__init__(scheduler=...)``
+    parameter against this Protocol instead of declaring its own private one
+    (step-14). Each test imports ``SchedulerFacade`` locally so a missing
+    symbol fails only that test (ImportError), not collection of the whole
+    module.
+    """
+
+    def test_import_succeeds(self):
+        from orchestrator.scheduler import SchedulerFacade  # noqa: F401
+
+    def test_fake_scheduler_conforms(self):
+        from _workflow_helpers import FakeScheduler
+
+        from orchestrator.scheduler import SchedulerFacade
+
+        assert isinstance(FakeScheduler(), SchedulerFacade)
+
+    def test_real_scheduler_conforms(self):
+        from orchestrator.scheduler import SchedulerFacade
+
+        assert isinstance(Scheduler(OrchestratorConfig()), SchedulerFacade)
