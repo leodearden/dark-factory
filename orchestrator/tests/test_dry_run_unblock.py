@@ -98,7 +98,8 @@ class TestProposalSchemaShape:
 def _make_config(*, enabled=True, budget_usd=5.0, timeout_seconds=600.0,
                  model='sonnet', max_turns=50, effort='high', backend='claude',
                  attended_b3_enabled=False, b3_merge_cap_per_24h=6,
-                 b3_proposal_keep_last=5):
+                 b3_proposal_keep_last=5, working_idle_secs=1800.0,
+                 invocation_timeout=7200.0):
     cfg = MagicMock(spec_set=pydantic_spec(OrchestratorConfig))
     cfg.unblock_auto.enabled = enabled
     cfg.unblock_auto.budget_usd = budget_usd
@@ -110,6 +111,10 @@ def _make_config(*, enabled=True, budget_usd=5.0, timeout_seconds=600.0,
     cfg.unblock_auto.attended_b3_enabled = attended_b3_enabled
     cfg.unblock_auto.b3_merge_cap_per_24h = b3_merge_cap_per_24h
     cfg.unblock_auto.b3_proposal_keep_last = b3_proposal_keep_last
+    # task 2360: working-regime progress-extension params threaded into
+    # dry_run_unblock's _one_attempt invoke_with_cap_retry call.
+    cfg.timeouts.working_idle_secs = working_idle_secs
+    cfg.invocation_timeout = invocation_timeout
     return cfg
 
 
@@ -1390,6 +1395,75 @@ class TestDryRunResilienceScaffolding:
         assert call_kwargs.get('invoke_fn') is real_invoke_agent
         session_id_arg = call_kwargs.get('session_id')
         assert isinstance(session_id_arg, str) and session_id_arg
+
+
+# ---------------------------------------------------------------------------
+# task 2360 step-19: unblock_auto progress-extension wiring
+# ---------------------------------------------------------------------------
+
+class TestUnblockAutoProgressExtensionWiring:
+    """_one_attempt threads the working-regime progress-extension params into
+    invoke_with_cap_retry, giving the block-time investigator the same
+    progress extension as the implementer (task 2360, reify-4827) — so a
+    long-running investigation is no longer ceiling-killed and reproduces the
+    very failure it is meant to diagnose.
+    """
+
+    @pytest.mark.asyncio
+    async def test_one_attempt_forwards_progress_extension_params(self, tmp_path):
+        """invoke_with_cap_retry receives timeout_seconds == ua_cfg.timeout_seconds
+        (now 1200), working_idle_secs == config.timeouts.working_idle_secs, and
+        absolute_cap_secs == config.invocation_timeout.
+
+        Fails RED: _one_attempt passes neither working_idle_secs nor
+        absolute_cap_secs today.
+        """
+        from orchestrator.dry_run_unblock import run_dry_run_unblock
+
+        structured = {
+            'proposal_text': 'Rebase on main and rerun verify',
+            'risk_label': 'low',
+            'files_referenced': [],
+        }
+        agent_result = _make_agent_result(structured_output=structured)
+
+        scheduler = MagicMock()
+        scheduler.update_task = AsyncMock(return_value=True)
+
+        config = _make_config(
+            timeout_seconds=1200.0,
+            working_idle_secs=1800.0,
+            invocation_timeout=7200.0,
+        )
+
+        with patch(
+            'orchestrator.dry_run_unblock.invoke_with_cap_retry',
+            new=AsyncMock(return_value=agent_result),
+        ) as mock_cap_retry:
+            await run_dry_run_unblock(
+                task_id='2360',
+                worktree=str(tmp_path),
+                reason='verify exhausted',
+                detail='',
+                scheduler=scheduler,
+                mcp=MagicMock(),
+                config=config,
+            )
+
+        mock_cap_retry.assert_awaited_once()
+        call_kwargs = mock_cap_retry.call_args.kwargs
+        assert call_kwargs.get('timeout_seconds') == pytest.approx(1200.0), (
+            f"Expected timeout_seconds=1200.0 (ua_cfg.timeout_seconds), "
+            f"got {call_kwargs.get('timeout_seconds')!r}"
+        )
+        assert call_kwargs.get('working_idle_secs') == pytest.approx(1800.0), (
+            f"Expected working_idle_secs=1800.0 (config.timeouts.working_idle_secs), "
+            f"got {call_kwargs.get('working_idle_secs')!r}"
+        )
+        assert call_kwargs.get('absolute_cap_secs') == pytest.approx(7200.0), (
+            f"Expected absolute_cap_secs=7200.0 (config.invocation_timeout), "
+            f"got {call_kwargs.get('absolute_cap_secs')!r}"
+        )
 
 
 # ---------------------------------------------------------------------------
