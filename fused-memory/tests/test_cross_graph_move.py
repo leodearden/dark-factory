@@ -1651,3 +1651,71 @@ class TestRecreateSubgraphRelationships:
         assert dropped['dst_uuid'] == OTHER_NODE_UUID_FIXTURE
         assert dropped['src_target'] == TARGET_GRAPH_FIXTURE
         assert dropped['dst_target'] is None
+
+    @pytest.mark.asyncio
+    async def test_merge_fold_recreates_only_wrong_copys_unique_edge(
+        self, mock_config, make_backend, make_graph_mock, monkeypatch,
+    ):
+        """A MERGE spec (uuid present as a wrong-copy in source_graph=
+        wrong_graph, home copy already in target_graph=home_graph): only the
+        wrong-copy's edge that is UNIQUE to it (absent from the home copy)
+        is folded into the home copy -- the edge already shared with home
+        (SHARED_EDGE_ROW_FIXTURE) is left untouched, never recreated a
+        second time (classify_unique_wrong_edges' dedup). No DETACH DELETE
+        of the wrong copy happens in this phase -- that's delete_source_node
+        (Phase C), run only after Phase B completes for the whole batch.
+        """
+        backend = make_backend(mock_config)
+
+        wrong_mock = make_graph_mock()
+        wrong_mock.ro_query = AsyncMock(
+            return_value=MagicMock(
+                result_set=[SHARED_EDGE_ROW_FIXTURE, UNIQUE_WRONG_EDGE_ROW_FIXTURE]
+            )
+        )
+
+        home_mock = make_graph_mock()
+        # home's CURRENT incident edge-uuid set: only the shared edge -- the
+        # unique-wrong edge is NOT yet there.
+        home_mock.ro_query = AsyncMock(
+            return_value=MagicMock(result_set=[[SHARED_EDGE_UUID_FIXTURE]])
+        )
+        home_mock.query = AsyncMock(return_value=MagicMock(relationships_created=1))
+
+        backend._driver._get_graph = _route_graphs({
+            WRONG_GRAPH_FIXTURE: wrong_mock,
+            HOME_GRAPH_FIXTURE: home_mock,
+        })
+
+        fake_read_compact = AsyncMock(return_value=COMPACT_VECTOR_REPLY_FIXTURE)
+        monkeypatch.setattr(cross_graph_move, '_read_compact_vector', fake_read_compact)
+
+        specs = [_merge_spec(NODE_UUID_FIXTURE, WRONG_GRAPH_FIXTURE, HOME_GRAPH_FIXTURE)]
+
+        result = await recreate_subgraph_relationships(backend, specs)
+
+        # only the unique wrong edge is recreated on home -- exactly one
+        # mutating call, not two.
+        assert home_mock.query.await_count == 1
+        cypher = extract_cypher(home_mock.query.call_args)
+        params = extract_params(home_mock.query.call_args)
+        assert 'CREATE' in cypher
+        assert EXPECTED_VECF32_LITERAL_FIXTURE in cypher
+        assert params.get('edge_uuid') == UNIQUE_WRONG_EDGE_UUID_FIXTURE
+        assert params.get('src_uuid') == NODE_UUID_FIXTURE
+        assert params.get('dst_uuid') == OTHER_NODE_UUID_FIXTURE
+        assert params.get('fact') == 'Alice is related to Carol.'
+        # preserves the wrong-copy's OWN group_id -- MERGE has no
+        # rewrite_group_id analogue (mirrors merge_foreign_duplicate).
+        assert params.get('group_id') == WRONG_GRAPH_FIXTURE
+
+        fake_read_compact.assert_awaited_once()
+        assert fake_read_compact.call_args.kwargs.get('group_id') == WRONG_GRAPH_FIXTURE
+        assert UNIQUE_WRONG_EDGE_UUID_FIXTURE in fake_read_compact.call_args.kwargs.get('cypher', '')
+
+        # no DETACH DELETE of the wrong copy in this phase.
+        wrong_mock.query.assert_not_awaited()
+
+        assert result.edges_recreated == 1
+        assert result.edges_skipped == 0
+        assert result.dropped_cross_target == []
