@@ -12,7 +12,7 @@ import shlex
 import shutil
 import time
 import uuid
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Literal, TypedDict
@@ -33,6 +33,17 @@ from orchestrator.verify_categories import (
     PREEXISTING_BREAK_SKIP_CATEGORIES,  # noqa: F401 — re-exported for external consumers
     FailureCategory,
     should_archive,
+)
+from orchestrator.verify_cmd import (
+    ToolKind,
+    cargo_scope,
+    govern_cpu,
+    parse_config_command,
+    render,
+    reproject,
+    scope_to,
+    serial_pytest,
+    strip_cwd,
 )
 
 logger = logging.getLogger(__name__)
@@ -96,37 +107,92 @@ class VerifyInfraError(Exception):
         super().__init__(msg)
 
 
-def _scope_command(cmd: str | None, tool_keyword: str, files: list[str]) -> str | None:
-    """Narrow *cmd* to operate on *files* instead of whole directories.
+def _scope_to_keyword(cmd: str | None, keyword: str, files: list[str]) -> str | None:
+    """Narrow *cmd* to *files* by parsing the prefix through *keyword*, scoping, and rendering.
 
-    Finds *tool_keyword* in *cmd*, keeps everything up to and including it as
-    the prefix, extracts any dash-prefixed flags from the remainder, and
-    rebuilds the command as ``'{prefix} {files} {flags}'``.
+    Replaces the historical ``_scope_command`` + ``_strip_directory_flag`` /
+    ``_strip_leading_cd`` pairing: everything in *cmd* up to and including
+    the first occurrence of *keyword* is parsed as one tool invocation
+    (folding in any leading ``cd <dir> &&`` or uv ``--project``/
+    ``--directory`` context), its targets are replaced by *files*, any cwd
+    shift is cleared (the new targets are worktree-root-relative), and the
+    result is rendered back to a shell string. This eliminates the old
+    dash-token-harvesting mangling (verify.py's historical ``_scope_command``
+    regression): ``scope_to`` only ever replaces targets, never re-derives
+    flags from unparsed remainder text.
 
-    Returns:
-        ``None`` when *cmd* is ``None`` or *files* is empty.
-        The original *cmd* unchanged when *tool_keyword* is not found.
-        The scoped command otherwise.
+    Returns *cmd* unchanged (no scoping applied) when: *cmd* is ``None``;
+    *keyword* is not present in *cmd* (nothing recognisable to scope, e.g. a
+    no-op ``'true'`` or a ``mypy``-based command); or the *keyword*-prefix
+    does not parse into a single recognised, structured tool invocation
+    (P1 — an OPAQUE or raw-retained/unparseable prefix is left untouched
+    rather than truncated into a possibly-broken argv).
+
+    Content after the matched *keyword* occurrence — including any further
+    ``&&``-chained clause — is intentionally dropped: scoping to specific
+    files means running the tool once against them, not once per chained
+    segment (dark_factory's real per-subproject ``type_check_command`` /
+    ``lint_command`` chain multiple ``cd X && TOOL`` segments; scoping runs
+    only the first, matching the historical behaviour).
     """
     if cmd is None:
         return None
-    if not files:
-        return None
-
-    idx = cmd.find(tool_keyword)
+    idx = cmd.find(keyword)
     if idx == -1:
         return cmd
+    parsed = parse_config_command(cmd[: idx + len(keyword)])
+    if parsed.tool is ToolKind.OPAQUE or parsed.raw is not None:
+        return cmd
+    return render(strip_cwd(scope_to(parsed, files)))
 
-    prefix = cmd[: idx + len(tool_keyword)]
-    remainder = cmd[idx + len(tool_keyword):]
 
-    # Preserve any dash-prefixed flags from the original remainder
-    flags = [tok for tok in remainder.split() if tok.startswith('-')]
+def _reproject_str(cmd: str | None, project: str) -> str | None:
+    """Reproject a bare ``uv run <tool>`` command string into *project*'s uv context.
 
-    parts = [prefix] + files
-    if flags:
-        parts += flags
-    return ' '.join(parts)
+    Thin string-level wrapper around ``parse_config_command`` ->
+    ``reproject`` -> ``render`` (replaces ``_reproject_bare_uv_run``): a
+    no-op when *cmd* is ``None`` or does not parse into a structured,
+    non-OPAQUE VerifyCmd (covers ``'true'``/``mypy``-based commands, which
+    ``reproject`` would never touch anyway).
+    """
+    if cmd is None:
+        return None
+    parsed = parse_config_command(cmd)
+    if parsed.tool is ToolKind.OPAQUE or parsed.raw is not None:
+        return cmd
+    return render(reproject(parsed, project))
+
+
+def _cargo_scope_str(cmd: str | None, crates: list[str]) -> str | None:
+    """Rewrite a cargo ``--workspace`` command to per-crate ``-p`` scoping via VerifyCmd.
+
+    Thin string-level wrapper around ``parse_config_command`` ->
+    ``cargo_scope`` -> ``render`` (replaces ``_scope_cargo_workspace``).
+    Mirrors ``_scope_to_keyword``/``_reproject_str``'s guard style: a cheap
+    ``'--workspace'`` substring pre-check (identical to the old helper's)
+    skips parsing entirely for a command with plainly nothing for
+    ``cargo_scope`` to act on, and an identity check after mutating skips
+    rendering when ``cargo_scope`` legitimately no-ops (a non-cargo
+    ToolKind, including OPAQUE — P1) — so such commands come back
+    byte-identical rather than reformatted (``render``'s canonical
+    flags-then-targets ordering is not guaranteed byte-identical to
+    arbitrary input token ordering). This is also what keeps an
+    unparseable-but-``--workspace``-bearing command from being mangled: it
+    parses OPAQUE, ``cargo_scope`` no-ops on it, and the identity check
+    short-circuits before ``render`` is ever called.
+
+    Returns *cmd* unchanged when: *cmd* is ``None``; *crates* is empty;
+    ``'--workspace'`` is not a substring of *cmd*; or ``cargo_scope``
+    no-ops (non-cargo ToolKind/OPAQUE, or a raw-retained chain with no
+    ``--workspace`` in it).
+    """
+    if cmd is None or not crates or '--workspace' not in cmd:
+        return cmd
+    parsed = parse_config_command(cmd)
+    scoped = cargo_scope(parsed, crates)
+    if scoped is parsed:
+        return cmd
+    return render(scoped)
 
 
 def _is_test_file(path: str) -> bool:
@@ -215,50 +281,8 @@ def _is_structural_python_file(path: str, content: str) -> bool:
     return bool(_PROTOCOL_RE.search(content) or _TYPEDDICT_RE.search(content))
 
 
-def _strip_directory_flag(cmd: str | None, module_prefix: str) -> str | None:
-    """Remove ``--directory <module_prefix>`` from a ``uv run`` command.
-
-    When scoping to worktree-relative file paths, the ``--directory`` flag
-    would cause tools to resolve paths relative to the module subdirectory,
-    leading to double-prefixed paths that don't exist.  The ``--project``
-    flag is kept so ``uv`` still activates the correct venv.
-    """
-    if cmd is None:
-        return None
-    cmd = cmd.replace(f'--directory {module_prefix} ', '')
-    cmd = cmd.replace(f'--directory={module_prefix} ', '')
-    # Handle flag at end of string (no trailing space)
-    cmd = cmd.replace(f'--directory {module_prefix}', '')
-    cmd = cmd.replace(f'--directory={module_prefix}', '')
-    return ' '.join(cmd.split())
-
-
-def _strip_leading_cd(cmd: str | None) -> str | None:
-    """Strip a single leading ``cd <dir> &&`` segment from *cmd*.
-
-    The project's per-subproject lint/type commands begin with
-    ``cd <subproject> && <tool> …`` so each tool runs against that subproject's
-    config (e.g. ``cd fused-memory && npx pyright``).  In the fallback path
-    (:func:`_build_fallback_config`) the touched files live *outside* any
-    module — e.g. a root-level ``tests/scripts/test_spawn_claude.py`` — and the
-    scoped command targets a worktree-root-relative path.  A leading
-    ``cd <subproject> &&`` would then resolve that path inside the wrong
-    directory (``cd fused-memory && npx pyright tests/scripts/…`` → "File or
-    directory does not exist", rc 4).  Removing the leading ``cd … &&`` makes
-    the scoped command run from the worktree root where the path is valid.
-
-    Only the *leading* segment is stripped; any later ``cd`` in the original
-    chain has already been dropped by :func:`_scope_command`, which truncates
-    the command at the first tool keyword.  Commands without a leading ``cd``
-    (the common case) are returned unchanged.
-    """
-    if cmd is None:
-        return None
-    return re.sub(r'^\s*cd\s+\S+\s*&&\s*', '', cmd, count=1)
-
-
 # Workspace member whose venv declares ``ruff`` (shared/pyproject.toml: ``ruff>=0.4``).
-# Used by :func:`_reproject_bare_uv_run` to reproject a bare ``uv run <tool>`` fallback
+# Used by :func:`_reproject_str` to reproject a bare ``uv run <tool>`` fallback
 # command into a uv context that can actually spawn the tool.  Mirrors the proven
 # ``uv run --project shared pytest tests/scripts/`` pattern in scripts/orchestrator.yaml
 # for this exact repo-root directory.
@@ -274,56 +298,27 @@ _FALLBACK_UV_PROJECT = 'shared'
 _ROOT_OWNING_TEST_COMMAND = 'uv run --project shared pytest tests/scripts/'
 
 
-def _reproject_bare_uv_run(
-    cmd: str | None, tool_keyword: str, member: str = _FALLBACK_UV_PROJECT
-) -> str | None:
-    """Reproject a bare ``uv run <tool_keyword>`` command into a tool-bearing uv context.
+def _clause_containing(cmd: str, keyword: str) -> tuple[str, str, str] | None:
+    """Split *cmd* into ``(before, clause, after)`` around the segment containing *keyword*.
 
-    The repo-root ``pyproject.toml`` is a depless ``uv`` workspace *coordinator*
-    (``[tool.uv.workspace] members = [...]``, zero dependencies, no dev tooling).
-    Running ``uv run ruff check <file>`` (or any bare ``uv run <tool>``) from the
-    workspace root provisions a fresh env from that depless root project and fails
-    to spawn the tool (rc=2) — it only ever "works" interactively because a prior
-    ``uv sync`` happened to populate a member's ``.venv``.  Task 1647 prescribed the
-    fix — ``uv run --project <member> <tool> ...`` (``--project``, NOT
-    ``--directory``, so cwd stays at the worktree root and root-relative file paths
-    the scoper inserted still resolve) — but the fallback path (:func:`_build_fallback_config`,
-    task 2036) still emitted the bare form for repo-root files. This mirrors the
-    proven ``uv run --project shared pytest tests/scripts/`` pattern already used in
-    ``scripts/orchestrator.yaml`` for this same directory.
-
-    Returns *cmd* unchanged when:
-    - *cmd* is ``None``.
-    - ``uv run`` is not immediately followed by *tool_keyword* (e.g. ``npx pyright
-      ...``, ``uv run --extra dev mypy ...``, or ``true``).
-    - The matched ``&&``-delimited clause (the segment of *cmd* containing this
-      particular ``uv run <tool_keyword>`` occurrence, not the whole command)
-      already carries ``--project`` or ``--directory`` (an explicit uv context
-      is already set; don't second-guess it — this also protects already-scoped
-      per-module commands, though those never reach this helper). Scoping the
-      check to the matched clause means a *different* chained clause carrying
-      its own ``--project``/``--directory`` (e.g. an already-scoped
-      ``uv run --project shared pytest ... && uv run ruff check X``) does not
-      suppress reprojecting this clause's bare occurrence.
-
-    Otherwise, rewrites the single ``uv run `` occurrence immediately preceding
-    *tool_keyword* to ``uv run --project {member} ``.
+    *clause* is the ``&&``-delimited segment bounded by the nearest ``&&``
+    on either side of *keyword*'s position (or the start/end of *cmd*),
+    stripped of surrounding whitespace; *before*/*after* are the remaining
+    text verbatim (including the ``&&`` separator itself), so splicing
+    ``before + <rewritten clause> + after`` back together leaves every
+    other clause byte-identical. Returns ``None`` when *keyword* is absent.
     """
-    if cmd is None:
+    idx = cmd.find(keyword)
+    if idx == -1:
         return None
-    pattern = re.compile(r'\buv run\s+(?=' + re.escape(tool_keyword) + r'\b)')
-    match = pattern.search(cmd)
-    if not match:
-        return cmd
-    clause_start = cmd.rfind('&&', 0, match.start())
-    clause_start = clause_start + 2 if clause_start != -1 else 0
-    clause_end = cmd.find('&&', match.end())
-    if clause_end == -1:
-        clause_end = len(cmd)
-    clause = cmd[clause_start:clause_end]
-    if '--project' in clause or '--directory' in clause:
-        return cmd
-    return pattern.sub(f'uv run --project {member} ', cmd, count=1)
+    start = cmd.rfind('&&', 0, idx)
+    start = start + 2 if start != -1 else 0
+    while start < len(cmd) and cmd[start] == ' ':
+        start += 1
+    end = cmd.find('&&', idx)
+    if end == -1:
+        end = len(cmd)
+    return cmd[:start], cmd[start:end].rstrip(), cmd[end:]
 
 
 def _scope_fallback_tool_to_subproject(cmd: str | None, tool_keyword: str, sub: str) -> str | None:
@@ -336,9 +331,9 @@ def _scope_fallback_tool_to_subproject(cmd: str | None, tool_keyword: str, sub: 
     scoped to run *inside* that subpackage via ``uv run`` (task 2344), which
     syncs the subpackage's deps — including its dev group (e.g.
     ``hypothesis``) — as a side effect. TYPE and LINT, however, were left
-    running in the worktree-root uv context (``_reproject_bare_uv_run``'s
-    hardcoded ``_FALLBACK_UV_PROJECT``, or no uv context at all for a
-    non-uv-run runner like ``npx pyright``). Because verify runs test/lint/type
+    running in the worktree-root uv context (``_reproject_str``'s hardcoded
+    ``_FALLBACK_UV_PROJECT``, or no uv context at all for a non-uv-run
+    runner like ``npx pyright``). Because verify runs test/lint/type
     concurrently via one ``asyncio.gather``, TYPE/LINT would race the TEST
     command's sync and could deterministically fail to resolve a dev-only
     import (esc-2293-20). Rescoping TYPE/LINT to ``uv run --project <sub>``
@@ -346,67 +341,52 @@ def _scope_fallback_tool_to_subproject(cmd: str | None, tool_keyword: str, sub: 
     regardless of a warm or cold venv.
 
     *cmd* is expected to already be scoped to the touched files and stripped
-    of any leading ``cd`` (i.e. :func:`_scope_command` + :func:`_strip_leading_cd`
-    have already run) — this helper only adds/adjusts the uv context. In
-    practice that pipeline always yields a single ``&&``-clause (``_scope_command``
-    truncates at the first *tool_keyword* occurrence, dropping any trailing
-    clauses — see ``_build_fallback_config``). The "already scoped" check and
-    the insertion point below are nonetheless scoped to the single clause
-    containing *tool_keyword* — mirroring :func:`_reproject_bare_uv_run`'s own
-    clause-scoped guard (verify.py:295-302) rather than the whole command
-    string — so this helper stays correct if a multi-clause command ever
-    reaches it.
+    of any leading ``cd`` (i.e. :func:`_scope_to_keyword` has already run) —
+    this helper only adds/adjusts the uv context. In practice that pipeline
+    always yields a single ``&&``-clause; the guard below is nonetheless
+    scoped to the single clause containing *tool_keyword* (via
+    :func:`_clause_containing`) rather than the whole command string, so
+    this helper stays correct if a multi-clause command ever reaches it.
 
     Returns:
         ``None`` when *cmd* is ``None``.
         *cmd* unchanged when *tool_keyword* is not present (no-op ``true``,
-        an unrelated tool like ``mypy``).
-        The :func:`_reproject_bare_uv_run` result when it changed *cmd* (a
-        bare ``uv run <tool_keyword>`` is reprojected to
-        ``uv run --project <sub> <tool_keyword>``).
-        *cmd* unchanged when the clause containing *tool_keyword* already
-        carries ``--project`` or ``--directory`` (an explicit uv context is
-        already set for that clause; don't second-guess it — this
-        deliberately also covers a command explicitly pre-scoped to a
-        *different* member than *sub*, which is left alone rather than
-        re-targeted).
-        Otherwise, *cmd* with ``uv run --project <sub> `` inserted
-        immediately before that clause's content (a non-uv runner like
-        ``npx pyright``, or a bare tool invocation).
+        an unrelated tool like ``mypy``), or when the matched clause does
+        not parse into a single structured tool invocation (P1 — an
+        OPAQUE/unparseable clause is left untouched).
+        *cmd* with the matched clause reprojected (bare ``uv run
+        <tool_keyword>`` gains ``--project <sub>``, or — when the clause
+        carries no ``uv run`` wrapper at all, e.g. a bare ``npx pyright`` or
+        bare ``pyright`` invocation — with ``uv run --project <sub>``
+        prepended to it) when the clause carries no explicit
+        ``--project``/``--directory`` already.
+        *cmd* unchanged when the clause already carries ``--project`` or
+        ``--directory`` (an explicit uv context is already set for that
+        clause; don't second-guess it — this deliberately also covers a
+        command explicitly pre-scoped to a *different* member than *sub*,
+        which is left alone rather than re-targeted).
     """
     if cmd is None:
         return None
     if tool_keyword not in cmd:
         return cmd
-    reprojected = _reproject_bare_uv_run(cmd, tool_keyword, sub)
-    if reprojected != cmd:
-        return reprojected
-    # Clause-scope the guard (and the insertion point below) to the single
-    # `&&`-delimited clause containing *tool_keyword*, mirroring
-    # _reproject_bare_uv_run's own clause-scoped guard (verify.py:295-302)
-    # rather than testing/rewriting the whole command string. Every real
-    # caller today feeds a single-clause *cmd* (see docstring), so
-    # clause_start is always 0 in practice; scoping the logic keeps this
-    # helper correct — rather than silently skipping a needed rescope — if a
-    # multi-clause command with a foreign `--project`/`--directory` in an
-    # earlier clause ever reaches it (task 2355 review).
-    idx = cmd.find(tool_keyword)
-    clause_start = cmd.rfind('&&', 0, idx)
-    clause_start = clause_start + 2 if clause_start != -1 else 0
-    while clause_start < len(cmd) and cmd[clause_start] == ' ':
-        clause_start += 1
-    clause_end = cmd.find('&&', idx)
-    if clause_end == -1:
-        clause_end = len(cmd)
-    clause = cmd[clause_start:clause_end]
-    if '--project' in clause or '--directory' in clause:
+    split = _clause_containing(cmd, tool_keyword)
+    assert split is not None  # tool_keyword in cmd guarantees a match
+    before, clause, after = split
+    parsed = parse_config_command(clause)
+    if parsed.tool is ToolKind.OPAQUE or parsed.raw is not None:
         return cmd
-    return cmd[:clause_start] + f'uv run --project {sub} ' + cmd[clause_start:]
+    reprojected = reproject(parsed, sub)
+    if reprojected == parsed and parsed.uv_project is None:
+        # Not uv-wrapped at all — reproject() deliberately no-ops on this
+        # (it only reprojects an ALREADY-bare `uv run <tool>`), but this
+        # helper's own job additionally covers "no uv context whatsoever"
+        # by prepending one, closing the cold-verify dev-dep race above.
+        reprojected = replace(parsed, uv_project=sub)
+    if reprojected == parsed:
+        return cmd
+    return before + render(reprojected) + after
 
-
-# Cargo subcommands whose ``--workspace`` flag we know how to rewrite.  Other
-# cargo subcommands (doc, bench, ...) are left alone to avoid semantic drift.
-_CARGO_SUBCMDS = ('test', 'clippy', 'check', 'build', 'run')
 
 # Non-.rs file extensions that are safe to ignore when deciding whether to scope
 # cargo commands to individual crates.  These are pure config/data files that
@@ -425,24 +405,6 @@ _CARGO_SCOPE_SAFE_NON_RS_EXTS = frozenset({'.toml', '.yaml', '.yml', '.json', '.
 # ``rust-toolchain`` is a rustup toolchain pin file with no extension (unlike
 # ``rust-toolchain.toml``, which is already handled by the ``.toml`` whitelist).
 _CARGO_SCOPE_SAFE_NON_RS_NAMES = frozenset({'Cargo.lock', 'rust-toolchain'})
-
-# Pre-compiled regex that matches ``cargo <subcmd> ...--workspace`` where
-# ``...`` does not cross a shell delimiter (``&&``, ``||``, ``;``, ``|``),
-# so chained non-cargo commands (like ``cd gui && npm test``) are left alone.
-_CARGO_WORKSPACE_RE = re.compile(
-    r'(cargo\s+(?:' + '|'.join(_CARGO_SUBCMDS) + r')\b[^&|;]*?)'
-    r'\s--workspace\b',
-)
-
-# Matches ``--exclude <name>`` inside the same cargo subcommand segment.
-# After ``--workspace`` is replaced with ``-p <crate>``, any lingering
-# ``--exclude`` flags become invalid (cargo rejects them with "--exclude
-# can only be used together with --workspace"), so they must be stripped
-# from the rewritten segment.
-_CARGO_EXCLUDE_RE = re.compile(
-    r'(cargo\s+(?:' + '|'.join(_CARGO_SUBCMDS) + r')\b[^&|;]*?)'
-    r'\s--exclude(?:\s+|=)\S+',
-)
 
 
 # Pytest-aware cause-hint patterns. Anchored to whole lines so they don't
@@ -766,27 +728,24 @@ def _should_archive_category(category: str) -> bool:
     return should_archive(category)
 
 
-# Matches a pytest invocation up to (but not including) the next shell chain
-# operator (&&, ||, ;) or end of string — the span _force_serial_pytest
-# rewrites.  Word-bounded so it doesn't match inside 'pytest_xdist' etc.
-_PYTEST_INVOCATION_RE = re.compile(r'\bpytest\b[^&|;]*')
+def _serial_pytest_str(cmd: str | None) -> str | None:
+    """Rewrite every ``pytest`` invocation in *cmd* to run serially, via VerifyCmd.
 
+    Thin string-level wrapper around ``parse_config_command`` ->
+    ``serial_pytest`` -> ``render`` (replaces ``_force_serial_pytest``):
+    appends `` -p no:xdist -o addopts=`` to a structured PYTEST command's
+    flags, or — for a raw-retained ``&&``-chain — to every ``pytest``
+    invocation's arguments via ``serial_pytest``'s localised regex rewrite.
+    ``-o addopts=`` clears any pyproject-level ``addopts`` (e.g. ``-n auto``)
+    — this is the exact ``-o addopts=""`` workaround that task 2045 proved
+    recovers a shared-venv-mutation transient, applied structurally rather
+    than by gambling on the concurrent ``uv sync`` window having closed.
+    ``-p no:xdist`` is belt-and-suspenders: it disables the xdist plugin
+    outright and is safe even when xdist is already absent from the venv.
 
-def _force_serial_pytest(cmd: str | None) -> str | None:
-    """Rewrite every ``pytest`` invocation in *cmd* to run serially.
-
-    Appends `` -p no:xdist -o addopts=''`` immediately after each ``pytest``
-    invocation's arguments (before the next ``&&``/``||``/``;`` or end of
-    string).  ``-o addopts=''`` clears any pyproject-level ``addopts`` (e.g.
-    ``-n auto``) — this is the exact ``-o addopts=""`` workaround that task
-    2045 proved recovers a shared-venv-mutation transient, reproduced here
-    programmatically rather than gambling on the concurrent ``uv sync``
-    window having closed.  ``-p no:xdist`` is belt-and-suspenders: it
-    disables the xdist plugin outright and is safe even when xdist is
-    already absent from the venv.
-
-    Returns *cmd* unchanged when it is ``None`` or contains no ``pytest``
-    token (e.g. a ``cargo test --workspace`` command).
+    Returns *cmd* unchanged when it is ``None`` or does not parse/chain into
+    a PYTEST ToolKind (e.g. a ``cargo test --workspace`` command — covers
+    OPAQUE too, P1).
 
     Tradeoff: clearing ``addopts`` also drops any per-subproject marker
     filters baked into pyproject (e.g. ``-m 'not integration'``).  Accepted
@@ -796,17 +755,12 @@ def _force_serial_pytest(cmd: str | None) -> str | None:
     contents aren't visible to this string rewrite.
     """
     if cmd is None:
+        return None
+    parsed = parse_config_command(cmd)
+    rewritten = serial_pytest(parsed)
+    if rewritten is parsed:
         return cmd
-    if not _PYTEST_INVOCATION_RE.search(cmd):
-        return cmd
-
-    def _rewrite(m: re.Match[str]) -> str:
-        segment = m.group(0)
-        stripped = segment.rstrip()
-        trailing = segment[len(stripped):]
-        return f"{stripped} -p no:xdist -o addopts=''{trailing}"
-
-    return _PYTEST_INVOCATION_RE.sub(_rewrite, cmd)
+    return render(rewritten)
 
 
 def _summarize_checks(
@@ -1352,42 +1306,6 @@ async def _derive_task_files_from_git(
     return None
 
 
-def _scope_cargo_workspace(cmd: str | None, crates: list[str]) -> str | None:
-    """Rewrite ``cargo ... --workspace`` → ``cargo ... -p c1 -p c2 ...``.
-
-    Returns *cmd* unchanged when:
-    - *cmd* is ``None``
-    - *crates* is empty
-    - ``--workspace`` is not present
-    - no cargo subcommand we recognise precedes ``--workspace``
-
-    Supported cargo subcommands: test, clippy, check, build, run.
-
-    Flags present between ``cargo <subcmd>`` and ``--workspace`` (e.g.,
-    ``--all-targets``, ``--tests``, ``--lib``, ``-F <feature>``) and trailing
-    args (``-- --test-threads=1``) are preserved verbatim — the helper only
-    substitutes the ``--workspace`` token.  Chained shell commands after
-    ``&&``/``||``/``;``/``|`` are untouched.
-    """
-    if cmd is None or not crates:
-        return cmd
-    if '--workspace' not in cmd:
-        return cmd
-
-    p_flags = ' '.join(f'-p {c}' for c in crates)
-    new_cmd = _CARGO_WORKSPACE_RE.sub(
-        lambda m: f'{m.group(1)} {p_flags}', cmd,
-    )
-    # Strip any ``--exclude <name>`` pairs from the rewritten cargo segment;
-    # they are only valid with ``--workspace`` and cargo errors out otherwise.
-    # Loop until stable to handle multiple ``--exclude`` flags on one cmd.
-    prev = None
-    while prev != new_cmd:
-        prev = new_cmd
-        new_cmd = _CARGO_EXCLUDE_RE.sub(lambda m: m.group(1), new_cmd)
-    return new_cmd
-
-
 def _apply_cargo_scope(
     mc: ModuleConfig,
     task_files: list[str],
@@ -1440,9 +1358,9 @@ def _apply_cargo_scope(
     if not matched:
         return mc
 
-    new_test = _scope_cargo_workspace(mc.test_command, matched)
-    new_lint = _scope_cargo_workspace(mc.lint_command, matched)
-    new_type = _scope_cargo_workspace(mc.type_check_command, matched)
+    new_test = _cargo_scope_str(mc.test_command, matched)
+    new_lint = _cargo_scope_str(mc.lint_command, matched)
+    new_type = _cargo_scope_str(mc.type_check_command, matched)
 
     if (new_test, new_lint, new_type) == (
         mc.test_command, mc.lint_command, mc.type_check_command,
@@ -1618,10 +1536,10 @@ def scope_module_config(
                     structural_trigger = f
                     break
 
-    # Build scoped commands with worktree-relative paths, then strip
-    # --directory so tools resolve paths from the worktree root
-    lint_cmd = _strip_directory_flag(
-        _scope_command(mc.lint_command, 'ruff check', scoped), mc.prefix)
+    # Build scoped commands with worktree-relative paths, then strip any cwd
+    # shift (leading `cd` or `--directory`) so tools resolve paths from the
+    # worktree root.
+    lint_cmd = _scope_to_keyword(mc.lint_command, 'ruff check', scoped)
     if has_structural:
         # Verbatim unscoped type check — mirrors the has_conftest test_cmd branch.
         # --directory is intentionally preserved so uv resolves src/ and tests/
@@ -1629,8 +1547,7 @@ def scope_module_config(
         type_cmd = mc.type_check_command
         logger.info('pyright unscoped: structural file %s in diff', structural_trigger)
     else:
-        type_cmd = _strip_directory_flag(
-            _scope_command(mc.type_check_command, 'pyright', scoped), mc.prefix)
+        type_cmd = _scope_to_keyword(mc.type_check_command, 'pyright', scoped)
     if has_conftest or has_test_data:
         # Full unscoped suite: conftest changes affect everything it shadows;
         # data-module changes (e.g. a σ-allowlist re-baseline) are consumed by
@@ -1638,8 +1555,7 @@ def scope_module_config(
         # the only safe scope.  Both branches mirror each other (task 1852).
         test_cmd = mc.test_command
     elif collectable_tests:
-        test_cmd = _strip_directory_flag(
-            _scope_command(mc.test_command, 'pytest', collectable_tests), mc.prefix)
+        test_cmd = _scope_to_keyword(mc.test_command, 'pytest', collectable_tests)
     else:
         test_cmd = None
 
@@ -1805,7 +1721,7 @@ def _build_fallback_config(
     ``uv run --extra dev --extra web pytest``), those are used directly so
     that tools not installed globally can still be reached.
 
-    For ``lint_command`` and ``type_check_command``, :func:`_scope_command`
+    For ``lint_command`` and ``type_check_command``, :func:`_scope_to_keyword`
     narrows the configured command to the touched files when the standard tool
     keyword appears (e.g. ``ruff check`` in ``uv run ruff check``), and
     returns the command unchanged when it doesn't (e.g. ``true`` or
@@ -1820,7 +1736,7 @@ def _build_fallback_config(
     guard for esc-2293-13 / task 2293).  Otherwise, the configured command is
     used as-is when it differs from the bare ``pytest`` default so that
     complex flag sequences like ``-m 'not slow' --ignore=tests/e2e`` are not
-    mangled by :func:`_scope_command`'s naive dash-token extraction.
+    mangled by :func:`_scope_to_keyword`'s prefix-then-parse approach.
 
     Returns ``None`` when no ``.py`` files are found.
     """
@@ -1851,23 +1767,19 @@ def _build_fallback_config(
     )
 
     # Lint and type commands: use configured commands when *config* is provided.
-    # _scope_command narrows to the touched files when the standard tool keyword
-    # appears in the command, and returns unchanged when it doesn't.
+    # _scope_to_keyword narrows to the touched files when the standard tool
+    # keyword appears in the command (folding in any leading `cd <subproject>
+    # &&`, since the fallback runs from the worktree root and a module-cd
+    # would misresolve the root-relative file path just scoped in), and
+    # returns the command unchanged when it doesn't. _reproject_str then
+    # reprojects a bare ``uv run <tool>`` into a tool-bearing member uv
+    # context (task 2036): the depless workspace-root project cannot spawn
+    # ruff/pyright.
     if config is not None:
-        # _strip_leading_cd drops a ``cd <subproject> &&`` prefix that the
-        # per-subproject lint/type commands carry: the fallback runs from the
-        # worktree root, so a module-cd would misresolve the root-relative file
-        # path the scoper just inserted. _reproject_bare_uv_run then reprojects
-        # a bare ``uv run <tool>`` into a tool-bearing member uv context (task
-        # 2036): the depless workspace-root project cannot spawn ruff/pyright.
-        lint_scoped = _strip_leading_cd(
-            _scope_command(config.lint_command, 'ruff check', py_files) or config.lint_command
-        )
-        lint_cmd = _reproject_bare_uv_run(lint_scoped, 'ruff check')
-        type_scoped = _strip_leading_cd(
-            _scope_command(config.type_check_command, 'pyright', py_files) or config.type_check_command
-        )
-        type_cmd = _reproject_bare_uv_run(type_scoped, 'pyright')
+        lint_scoped = _scope_to_keyword(config.lint_command, 'ruff check', py_files)
+        lint_cmd = _reproject_str(lint_scoped, _FALLBACK_UV_PROJECT)
+        type_scoped = _scope_to_keyword(config.type_check_command, 'pyright', py_files)
+        type_cmd = _reproject_str(type_scoped, _FALLBACK_UV_PROJECT)
     else:
         lint_scoped = lint_cmd = 'ruff check ' + ' '.join(py_files)
         type_scoped = type_cmd = 'pyright ' + ' '.join(py_files)
@@ -2758,30 +2670,44 @@ def _resolve_verify_env(
     return merged
 
 
-def _maybe_govern_merge_cmd(
-    cmd: 'str | None',
+def _resolve_governed_exec_path(
     config: OrchestratorConfig,
     worktree: 'Path | None',
     role: str,
 ) -> 'str | None':
-    """Wrap *cmd* in a cpu-governed-exec.sh invocation when role=='merge' and governance is enabled.
+    """Return the resolved cpu-governed-exec path to apply for *role*, or ``None``.
 
-    Returns *cmd* unchanged when:
+    Only ``role == 'merge'`` uses the merge-weighted cgroup scope. Returns
+    ``None`` (fail-open) when ``config.cpu_governance`` is absent/disabled or
+    ``resolved_exec_path`` cannot resolve an executable path (non-executable,
+    missing, or *worktree* is ``None``) — the caller (``_govern_cpu_str``)
+    then no-ops on a falsy *exec_path*.
+    """
+    if role != 'merge':
+        return None
+    gov = getattr(config, 'cpu_governance', None)
+    if gov is None or not gov.enabled:
+        return None
+    return gov.resolved_exec_path(worktree)
 
-    * *cmd* is ``None`` (skip-guard — caller's ``if cmd is None: return`` fires first)
-    * *role* is not ``'merge'`` (only merge-verify uses the merge-weighted cgroup scope)
-    * ``config.cpu_governance`` is disabled (default; fail-open)
-    * ``config.cpu_governance.resolved_exec_path(worktree)`` returns ``None``
-      (non-executable, missing, or worktree=None; fail-open)
 
-    Otherwise wraps as::
+def _govern_cpu_str(cmd: 'str | None', exec_path: 'str | None') -> 'str | None':
+    """Wrap *cmd* in a cpu-governed-exec.sh invocation via VerifyCmd, when *exec_path* resolves.
 
-        <shlex.quote(exec_abs)> --role merge -- /bin/bash -c <shlex.quote(cmd)>
+    Thin string-level wrapper around ``parse_config_command`` -> ``govern_cpu``
+    -> ``render`` (replaces ``_maybe_govern_merge_cmd``'s bash-wrap). Renders as::
+
+        <shlex.quote(exec_path)> --role merge -- /bin/bash -c <shlex.quote(rendered_cmd)>
 
     so that shell operators (``&&``, ``|``, leading env assignments) in *cmd*
     survive intact inside the merge-weighted cgroup scope.  The inner
-    ``/bin/bash -c <quoted>`` makes the whole original command a single argv
+    ``/bin/bash -c <quoted>`` makes the whole rendered command a single argv
     payload for ``cpu-governed-exec.sh``.
+
+    Returns *cmd* unchanged when: *cmd* is ``None``; *exec_path* is falsy
+    (governance disabled/unresolved — see ``_resolve_governed_exec_path``,
+    fail-open); or *cmd* parses OPAQUE (P1 — ``govern_cpu`` no-ops on an
+    unparseable command rather than blindly bash-wrapping it).
 
     Does NOT alter ``_run_cmd``'s signature, the ``use_cgroup_scope`` path, or
     any merge PSI/semaphore bypass.
@@ -2803,15 +2729,13 @@ def _maybe_govern_merge_cmd(
     also has a runtime probe + fail-open, so a nested-scope failure degrades
     gracefully.
     """
-    if cmd is None or role != 'merge':
+    if cmd is None or not exec_path:
         return cmd
-    gov = getattr(config, 'cpu_governance', None)
-    if gov is None or not gov.enabled:
+    parsed = parse_config_command(cmd)
+    governed = govern_cpu(parsed, exec_path)
+    if governed is parsed:
         return cmd
-    exec_abs = gov.resolved_exec_path(worktree)
-    if not exec_abs:
-        return cmd
-    return f'{shlex.quote(exec_abs)} --role merge -- /bin/bash -c {shlex.quote(cmd)}'
+    return render(governed)
 
 
 def _resolve_nice_prefix(config: OrchestratorConfig, role: str) -> list[str]:
@@ -3076,8 +3000,8 @@ async def run_verification(
         # cpu_governance is enabled + exec resolves.  Fail-open: returns cmd
         # unchanged when governance is disabled or the path is non-executable,
         # so a misconfig never makes a verify spawn fail.
-        cmd = _maybe_govern_merge_cmd(cmd, config, worktree, role)
-        assert cmd is not None  # _maybe_govern_merge_cmd returns None only when cmd is None; guarded above
+        cmd = _govern_cpu_str(cmd, _resolve_governed_exec_path(config, worktree, role))
+        assert cmd is not None  # _govern_cpu_str returns None only when cmd is None; guarded above
         # Admission gate (task 2390 T2): only the pytest ('test') leg is
         # gated by the shared.verify_admission flock semaphore + role nice
         # tier; lint/type ride alongside within the same verify, ungated.
@@ -3219,9 +3143,9 @@ async def run_verification(
             'Verification hit an environmental shared-venv transient '
             '(vanished xdist/pip); retrying test command once, forced serial '
             '(this clears all pyproject addopts, including any marker '
-            'filters, for the recovery run — see _force_serial_pytest)'
+            'filters, for the recovery run — see serial_pytest)'
         )
-        recovered_test_cmd = _force_serial_pytest(test_cmd)
+        recovered_test_cmd = _serial_pytest_str(test_cmd)
         (
             test_rc, test_out, test_timed_out, test_started_at, test_duration,
         ) = await _run_or_skip_timed(

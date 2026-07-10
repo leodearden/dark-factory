@@ -22,11 +22,9 @@ from orchestrator.verify import (
     _is_structural_python_file,
     _is_test_file,
     _maybe_prune_archive,
-    _reproject_bare_uv_run,
     _resolve_verify_env,
     _root_plus_single_subproject_prefix,
     _run_cmd,
-    _scope_cargo_workspace,
     _scope_fallback_tool_to_subproject,
     _single_subproject_prefix,
     run_full_verification,
@@ -1204,6 +1202,39 @@ class TestScopeModuleConfigReturnsNone:
         assert '--directory orchestrator' not in (result.type_check_command or '')
 
 
+class TestScopeModuleConfigOpaqueCommand:
+    """An unparseable/OPAQUE lint_command flows through UNSCOPED, not mangled.
+
+    Historical bug: the old string-surgery scoper (_scope_command) did a raw
+    substring search + prefix slice regardless of whether the result was
+    valid shell syntax, so a config command shlex can't even split got
+    silently mangled into an equally- (or more-) broken argv, with the
+    caller's scoped files blindly appended to the wreckage. The new model
+    classifies an unparseable prefix OPAQUE (P1) and leaves the ORIGINAL
+    command untouched — argv-equivalent to the raw input, no stranded
+    scoped-file tokens appended to a broken string.
+    """
+
+    #: Unbalanced quote (the `"` before `shared` never closes) makes this
+    #: unparseable by shlex — realistic as a typo'd `--directory` value.
+    _UNPARSEABLE_LINT_CMD = 'uv run --directory "shared ruff check src/'
+
+    def test_unparseable_lint_command_left_untouched(self):
+        mc = ModuleConfig(prefix='shared', lint_command=self._UNPARSEABLE_LINT_CMD)
+        result = scope_module_config(mc, ['shared/src/y.py'])
+        assert result is not None
+        assert result.lint_command == self._UNPARSEABLE_LINT_CMD, (
+            f'expected untouched passthrough, got {result.lint_command!r}'
+        )
+
+    def test_unrecognised_head_type_command_left_untouched(self):
+        """A type_check_command using an unrecognised tool (no 'pyright' keyword) is untouched."""
+        mc = ModuleConfig(prefix='shared', type_check_command='uv run --extra dev mypy src/')
+        result = scope_module_config(mc, ['shared/src/y.py'])
+        assert result is not None
+        assert result.type_check_command == 'uv run --extra dev mypy src/'
+
+
 class TestScopeModuleConfigDataModuleFallback:
     """scope_module_config falls back to the full suite for non-test data modules under tests/.
 
@@ -1772,66 +1803,45 @@ class TestApplyCargoScopePolyglotGuard:
         assert result.lint_command == 'cargo clippy --workspace'
 
 
-class TestScopeCargoWorkspaceRewrite:
-    """Regression guards for `_scope_cargo_workspace` — the --workspace rewriter.
+class TestApplyCargoScopeRoutesThroughVerifyCmd:
+    """`_apply_cargo_scope` routes ``--workspace`` rewriting through
+    ``VerifyCmd.cargo_scope`` (task 2125 steps 23/24) instead of the
+    standalone ``_scope_cargo_workspace`` regex helper.
 
-    The fix that strips ``--exclude`` flags after rewriting ``--workspace`` →
-    ``-p <crate>`` landed in commit fd4758fcff.  These tests keep it from
-    regressing.  They invoke `_scope_cargo_workspace` directly (pure function,
-    no mocks needed).
+    The golden reify-chain and no-op cases mirror
+    ``TestScopeCargoWorkspaceRewrite``'s A4/A6/A7 (migrated to this
+    integration level once ``_scope_cargo_workspace`` is deleted — the
+    mutator itself stays pinned at the unit level by
+    ``test_verify_cmd.TestCargoScopeStructured`` /
+    ``TestCargoScopeRawRetainedChain``). The OPAQUE case is new: it pins the
+    fix for the historical "regex rewrites --workspace regardless of overall
+    shell-parseability" bug — ``_scope_cargo_workspace`` happily mangled a
+    ``--workspace``-bearing command even when the rest of it was unparseable
+    (e.g. an unbalanced quote), producing a broken argv. Routing through
+    ``parse_config_command`` classifies such a command OPAQUE, and every
+    VerifyCmd mutator (including ``cargo_scope``) no-ops on OPAQUE (P1), so
+    the rewired ``_apply_cargo_scope`` must leave it byte-identical instead.
     """
 
-    # A1: single --exclude stripped
-    def test_single_exclude_stripped(self):
-        """A single ``--exclude foo`` is stripped after ``--workspace`` rewrite."""
-        cmd = 'cargo test --workspace --exclude foo -- --test-threads=1'
-        result = _scope_cargo_workspace(cmd, ['bar'])
-        assert result is not None
-        assert '-p bar' in result
-        assert '--workspace' not in result
-        assert '--exclude' not in result
-        assert 'foo' not in result  # the excluded crate name is gone too
-        assert '-- --test-threads=1' in result
+    @staticmethod
+    def _call_scoped(test_command: str, crate: str = 'reify-compiler') -> ModuleConfig:
+        mc = ModuleConfig(prefix='crates', test_command=test_command)
+        with (
+            patch(
+                'orchestrator.verify.discover_workspace_crates',
+                return_value={'crates/foo': crate},
+            ),
+            patch('orchestrator.verify.files_to_crates', return_value=[crate]),
+        ):
+            return _apply_cargo_scope(
+                mc,
+                task_files=['crates/foo/src/lib.rs'],
+                project_root=Path('/fake/root'),
+                scope_cargo_enabled=True,
+            )
 
-    # A2: three chained --exclude flags all stripped via the while-loop
-    def test_multiple_excludes_all_stripped(self):
-        """Three consecutive ``--exclude`` flags are all removed by the while-loop."""
-        cmd = (
-            'cargo test --workspace '
-            '--exclude alpha --exclude beta --exclude gamma '
-            '-- --test-threads=1'
-        )
-        result = _scope_cargo_workspace(cmd, ['delta'])
-        assert result is not None
-        assert '-p delta' in result
-        assert '--workspace' not in result
-        assert '--exclude' not in result
-        assert 'alpha' not in result
-        assert 'beta' not in result
-        assert 'gamma' not in result
-
-    # A3: --exclude=foo equals-form stripped
-    def test_exclude_equals_form_stripped(self):
-        """``--exclude=foo`` (equals-sign form) is also stripped."""
-        cmd = 'cargo test --workspace --exclude=foo -- --test-threads=1'
-        result = _scope_cargo_workspace(cmd, ['bar'])
-        assert result is not None
-        assert '-p bar' in result
-        assert '--workspace' not in result
-        assert '--exclude' not in result
-
-    # A4: full reify orchestrator.yaml 4-segment command
-    def test_reify_chained_command_rewrites_ungated_segments_only(self):
-        """Four-segment command: gated wrappers untouched, ungated segments rewritten.
-
-        This mirrors the real-world ``orchestrator.yaml`` test_command from the
-        reify project: two gated wrapper segments (no ``--workspace``) followed
-        by two ungated segments (with ``--workspace --exclude ...``).
-        Rewriting for ``crates=['reify-compiler']`` must:
-          - leave the gated segments byte-identical
-          - rewrite both ungated segments to ``-p reify-compiler``
-          - strip ALL ``--exclude`` flags from the ungated segments
-        """
+    def test_reify_chained_command_scopes_ungated_segments(self):
+        """Golden case migrated from TestScopeCargoWorkspaceRewrite A4/A7."""
         gated_1 = (
             './scripts/cargo-test-occt-gated.sh cargo test '
             '-p reify-kernel-occt -p reify-eval -p reify-cli'
@@ -1848,72 +1858,41 @@ class TestScopeCargoWorkspaceRewrite:
         ungated_2 = f'cargo test --workspace {ungated_excludes} -- --test-threads=1'
         cmd = f'{gated_1} && {gated_2} && {ungated_1} && {ungated_2}'
 
-        result = _scope_cargo_workspace(cmd, ['reify-compiler'])
+        result = self._call_scoped(cmd)
 
-        assert result is not None
-        # Gated segments must be present verbatim
-        assert gated_1 in result, f'gated_1 missing from result: {result!r}'
-        assert gated_2 in result, f'gated_2 missing from result: {result!r}'
-        # Ungated segments must have been rewritten
-        assert '--workspace' not in result, f'--workspace still present: {result!r}'
-        assert '-p reify-compiler' in result
-        # Trailing args preserved in the rewritten segments
-        assert '-- --test-threads=1' in result
-
-    # A5: non-cargo --exclude in a chained command is NOT stripped
-    def test_non_cargo_exclude_not_stripped(self):
-        """A trailing ``npm test --exclude foo`` must not have its ``--exclude`` removed.
-
-        ``_CARGO_EXCLUDE_RE`` is anchored to ``cargo <subcmd>`` so it must not
-        bleed into adjacent non-cargo shell segments.
-        """
-        cmd = (
-            'cargo test --workspace --exclude some-crate -- --test-threads=1'
-            ' && npm test --exclude foo'
-        )
-        result = _scope_cargo_workspace(cmd, ['my-crate'])
-        assert result is not None
-        # The npm segment must be intact
-        assert 'npm test --exclude foo' in result, (
-            f'npm --exclude was incorrectly removed: {result!r}'
-        )
-        # But the cargo --exclude must be gone
-        # (the cargo segment is the only one _CARGO_EXCLUDE_RE touches)
-        # Split on '&&' to isolate the cargo part
-        cargo_part = result.split('&&')[0]
-        assert '--exclude' not in cargo_part, (
-            f'cargo --exclude not stripped from: {cargo_part!r}'
+        assert result.test_command is not None
+        assert gated_1 in result.test_command, f'gated_1 missing: {result.test_command!r}'
+        assert gated_2 in result.test_command, f'gated_2 missing: {result.test_command!r}'
+        assert '--workspace' not in result.test_command
+        assert '-p reify-compiler' in result.test_command
+        assert '-- --test-threads=1' in result.test_command
+        # Neither --exclude nor an excluded crate name survives the rewrite.
+        rewritten_segment = result.test_command.split('&&')[-1]
+        assert '--exclude' not in rewritten_segment, (
+            f'--exclude token found in rewritten segment: {rewritten_segment!r}'
         )
 
-    # A6: idempotency — already -p-scoped command returns byte-identical
-    def test_idempotent_on_already_scoped_command(self):
-        """Rewriting a command that is already ``-p``-scoped (no ``--workspace``) is a no-op."""
+    def test_no_workspace_command_returned_unchanged(self):
+        """An already -p-scoped cargo command (no --workspace) is untouched."""
         cmd = 'cargo test -p my-crate -- --test-threads=1'
-        result = _scope_cargo_workspace(cmd, ['my-crate'])
-        assert result == cmd, f'Expected unchanged cmd, got {result!r}'
+        result = self._call_scoped(cmd)
+        assert result.test_command == cmd
 
-    # A7: no --exclude substring in the rewritten A4 cargo segments
-    def test_no_exclude_token_in_rewritten_ungated_segments(self):
-        """After rewrite, neither ``--exclude`` nor any excluded crate name appears in the ungated cargo segments."""
-        gated = (
-            './scripts/cargo-test-occt-gated.sh cargo test '
-            '-p reify-kernel-occt -p reify-eval -p reify-cli'
-        )
-        ungated = (
-            'cargo test --workspace '
-            '--exclude reify-kernel-occt --exclude reify-eval --exclude reify-cli '
-            '-- --test-threads=1'
-        )
-        cmd = f'{gated} && {ungated}'
-        result = _scope_cargo_workspace(cmd, ['reify-compiler'])
+    def test_non_cargo_command_returned_unchanged(self):
+        """A non-cargo command carrying a literal '--workspace' token is untouched."""
+        cmd = 'npx sometool --workspace foo'
+        result = self._call_scoped(cmd)
+        assert result.test_command == cmd
 
-        assert result is not None
-        # Split on && to isolate the rewritten cargo segment
-        segments = [s.strip() for s in result.split('&&')]
-        # The last segment is the rewritten ungated cargo test
-        rewritten = segments[-1]
-        assert '--exclude' not in rewritten, (
-            f'--exclude token found in rewritten segment: {rewritten!r}'
+    def test_opaque_command_left_untouched(self):
+        """A --workspace-bearing but unparseable (unbalanced-quote) command must
+        NOT be regex-mangled — regression for the string-surgery bug the
+        VerifyCmd rewire (task 2125) fixes.
+        """
+        cmd = 'cargo test --workspace "unterminated'
+        result = self._call_scoped(cmd)
+        assert result.test_command == cmd, (
+            f'expected OPAQUE command untouched, got {result.test_command!r}'
         )
 
 
@@ -4036,93 +4015,6 @@ class TestBuildFallbackConfigConftest:
         assert 'conftest.py' not in result.test_command
 
 
-class TestReprojectBareUvRun:
-    """`_reproject_bare_uv_run` rewrites a bare ``uv run <tool>`` into a uv context that has the tool.
-
-    Task 2036: the repo-root ``pyproject.toml`` is a depless uv workspace
-    coordinator, so ``uv run ruff check <file>`` run from the workspace root
-    fails to spawn ruff (rc=2). ``uv run --project <member> ruff check <file>``
-    selects a ruff-bearing member's venv while leaving cwd (and therefore
-    root-relative path resolution) alone.
-    """
-
-    def test_reprojects_bare_uv_run_ruff_check(self):
-        """`uv run ruff check <file>` gains `--project shared` immediately after `uv run`."""
-        result = _reproject_bare_uv_run(
-            'uv run ruff check tests/scripts/foo.py', 'ruff check', 'shared'
-        )
-        assert result == 'uv run --project shared ruff check tests/scripts/foo.py'
-
-    def test_reprojects_bare_uv_run_pyright(self):
-        """`uv run pyright <file>` gains `--project shared` immediately after `uv run`."""
-        result = _reproject_bare_uv_run(
-            'uv run pyright tests/scripts/foo.py', 'pyright', 'shared'
-        )
-        assert result == 'uv run --project shared pyright tests/scripts/foo.py'
-
-    def test_command_with_existing_project_flag_unchanged(self):
-        """A command that already carries `--project` is left alone."""
-        cmd = 'uv run --project orchestrator ruff check x'
-        assert _reproject_bare_uv_run(cmd, 'ruff check', 'shared') == cmd
-
-    def test_command_with_existing_directory_flag_unchanged(self):
-        """A command that already carries `--directory` is left alone."""
-        cmd = 'uv run --directory foo ruff check x'
-        assert _reproject_bare_uv_run(cmd, 'ruff check', 'shared') == cmd
-
-    def test_npx_command_unchanged_no_uv_run(self):
-        """`npx pyright x` has no `uv run` prefix, so it is left alone."""
-        cmd = 'npx pyright x'
-        assert _reproject_bare_uv_run(cmd, 'pyright', 'shared') == cmd
-
-    def test_uv_run_without_tool_adjacency_unchanged(self):
-        """`uv run --extra dev mypy src` has no `uv run pyright` adjacency, so it is left alone."""
-        cmd = 'uv run --extra dev mypy src'
-        assert _reproject_bare_uv_run(cmd, 'pyright', 'shared') == cmd
-
-    def test_true_noop_command_unchanged(self):
-        """`true` has no `uv run`, so it is returned unchanged."""
-        assert _reproject_bare_uv_run('true', 'ruff check', 'shared') == 'true'
-
-    def test_none_command_returns_none(self):
-        """`None` is returned unchanged (propagates absent commands)."""
-        assert _reproject_bare_uv_run(None, 'ruff check', 'shared') is None
-
-    def test_idempotent_on_already_reprojected_command(self):
-        """Applying the helper twice yields the same string as applying it once."""
-        once = _reproject_bare_uv_run(
-            'uv run ruff check tests/scripts/foo.py', 'ruff check', 'shared'
-        )
-        twice = _reproject_bare_uv_run(once, 'ruff check', 'shared')
-        assert twice == once
-
-    def test_directory_flag_in_a_different_chained_clause_does_not_block_reprojection(self):
-        """A `--directory` in a *different* `&&` clause must not suppress reprojection.
-
-        Amendment (task 2036 review): the "already scoped" guard used to test
-        the whole command string for `--project`/`--directory`, so a chained
-        command whose *other* clause already carried `--directory` would bail
-        out entirely, leaving this clause's bare `uv run ruff check` unfixed.
-        This shape doesn't occur in current configs, but the guard must be
-        scoped to the matched clause, not the whole command.
-        """
-        cmd = 'uv run ruff check tests/scripts/foo.py && uv run --directory foo mypy bar'
-        result = _reproject_bare_uv_run(cmd, 'ruff check', 'shared')
-        assert result == (
-            'uv run --project shared ruff check tests/scripts/foo.py '
-            '&& uv run --directory foo mypy bar'
-        )
-
-    def test_project_flag_in_a_different_chained_clause_does_not_block_reprojection(self):
-        """A `--project` in a *preceding* `&&` clause must not suppress reprojection."""
-        cmd = 'uv run --project shared pytest tests/ && uv run ruff check tests/scripts/foo.py'
-        result = _reproject_bare_uv_run(cmd, 'ruff check', 'shared')
-        assert result == (
-            'uv run --project shared pytest tests/ '
-            '&& uv run --project shared ruff check tests/scripts/foo.py'
-        )
-
-
 class TestScopeFallbackToolToSubproject:
     """`_scope_fallback_tool_to_subproject` rescopes a fallback TYPE/LINT command
     into the touched subpackage's own uv context (task 2355).
@@ -4426,6 +4318,22 @@ class TestBuildFallbackConfigWithNonDefaultCommands:
         result = _build_fallback_config(['tests/unit/test_foo.py'], cfg)
         assert result is not None
         assert result.type_check_command == 'uv run --extra dev mypy src/my_pkg'
+
+    def test_unparseable_lint_command_left_untouched(self, tmp_path: Path) -> None:
+        """An unparseable (shlex-unsplittable) lint_command flows through UNSCOPED.
+
+        Historical bug: the old string-surgery scoper (_scope_command) sliced
+        a prefix and appended the touched files regardless of whether the
+        result was valid shell syntax — a config command shlex can't even
+        split got silently mangled further. The new model classifies an
+        unparseable prefix OPAQUE (P1) and leaves the ORIGINAL command
+        untouched rather than truncating/appending to it.
+        """
+        broken = 'uv run --directory "shared ruff check src/'
+        cfg = self._make_config(tmp_path, lint_command=broken, test_command="uv run --extra dev pytest")
+        result = _build_fallback_config(['tests/unit/test_foo.py'], cfg)
+        assert result is not None
+        assert result.lint_command == broken, f'expected untouched passthrough, got {result.lint_command!r}'
 
     def test_no_test_command_when_no_test_files(self, tmp_path: Path) -> None:
         """Non-default test_command is suppressed when no test files changed."""
@@ -6740,8 +6648,22 @@ class TestMergeGuardModuleConfigs:
 
 
 @pytest.mark.asyncio
-class TestMaybeGovernMergeCmd:
-    """Unit tests for _maybe_govern_merge_cmd and its integration into merge-verify path."""
+class TestRunVerificationGovernRouting:
+    """Integration tests for the merge-role cpu-governance wiring in
+    ``_run_or_skip_timed`` (task 2125 step-26): a command is parsed once via
+    ``parse_config_command``, wrapped via ``govern_cpu(resolved_exec)`` when
+    ``role=='merge'`` and cpu_governance resolves, and rendered at the
+    ``_run_cmd`` call site — replacing ``_maybe_govern_merge_cmd``'s bare
+    bash-wrap.
+
+    The ``govern_cpu`` mutator itself (wrap format, shell-operator survival,
+    OPAQUE/falsy-``exec_path`` no-ops) is unit-tested directly in
+    ``test_verify_cmd.TestGovernCpu``. These tests instead pin the
+    verify.py-local resolution wiring (``_resolve_governed_exec_path``'s role
+    gate and enabled/executable fail-open) end-to-end through
+    ``run_verification``, since that resolution logic has no VerifyCmd-model
+    equivalent to be covered by.
+    """
 
     def _make_govern_config(self, tmp_path, enabled=True, create_exec=True):
         """Build an OrchestratorConfig with cpu_governance wired to a tmp executable."""
@@ -6759,86 +6681,15 @@ class TestMaybeGovernMergeCmd:
         )
         return config, exec_file
 
-    async def test_merge_role_enabled_exec_wraps_cmd(self, tmp_path):
-        """role='merge' + enabled + executable -> cmd wrapped in govern invocation."""
-        import shlex
-
-        from orchestrator.verify import _maybe_govern_merge_cmd
-        config, exec_file = self._make_govern_config(tmp_path)
-        cmd = 'cargo test --workspace'
-        result = _maybe_govern_merge_cmd(cmd, config, tmp_path, role='merge')
-        abs_exec = str(exec_file.resolve())
-        expected = f'{shlex.quote(abs_exec)} --role merge -- /bin/bash -c {shlex.quote(cmd)}'
-        assert result == expected
-
-    async def test_task_role_returns_cmd_unchanged(self, tmp_path):
-        """role='task' -> cmd unchanged (only merge-verify uses governance)."""
-        from orchestrator.verify import _maybe_govern_merge_cmd
-        config, _ = self._make_govern_config(tmp_path)
-        cmd = 'cargo test --workspace'
-        result = _maybe_govern_merge_cmd(cmd, config, tmp_path, role='task')
-        assert result == cmd
-
-    async def test_disabled_governance_returns_cmd_unchanged(self, tmp_path):
-        """cpu_governance disabled -> cmd unchanged (fail-open)."""
-        from orchestrator.verify import _maybe_govern_merge_cmd
-        config, _ = self._make_govern_config(tmp_path, enabled=False)
-        cmd = 'cargo test --workspace'
-        result = _maybe_govern_merge_cmd(cmd, config, tmp_path, role='merge')
-        assert result == cmd
-
-    async def test_non_executable_exec_returns_cmd_unchanged(self, tmp_path):
-        """enabled + non-executable exec -> cmd unchanged (fail-open)."""
-        from orchestrator.config import CpuGovernConfig
-        from orchestrator.verify import _maybe_govern_merge_cmd
-        scripts = tmp_path / 'scripts'
-        scripts.mkdir()
-        exec_file = scripts / 'cpu-governed-exec.sh'
-        exec_file.write_text('#!/bin/sh\n')
-        exec_file.chmod(0o644)  # not executable
-        config = OrchestratorConfig()
-        config.cpu_governance = CpuGovernConfig(
-            enabled=True,
-            exec_path='scripts/cpu-governed-exec.sh',
-        )
-        cmd = 'cargo test --workspace'
-        result = _maybe_govern_merge_cmd(cmd, config, tmp_path, role='merge')
-        assert result == cmd
-
-    async def test_none_cmd_returned_unchanged(self, tmp_path):
-        """cmd=None is returned as None (skip-guard)."""
-        from orchestrator.verify import _maybe_govern_merge_cmd
-        config, _ = self._make_govern_config(tmp_path)
-        result = _maybe_govern_merge_cmd(None, config, tmp_path, role='merge')
-        assert result is None
-
-    async def test_shell_operators_in_cmd_survive(self, tmp_path):
-        """Commands with shell operators are quoted so they run intact inside the govern scope."""
-        import shlex
-
-        from orchestrator.verify import _maybe_govern_merge_cmd
-        config, exec_file = self._make_govern_config(tmp_path)
-        cmd = 'cargo test && cargo clippy --all -- -D warnings'
-        result = _maybe_govern_merge_cmd(cmd, config, tmp_path, role='merge')
-        abs_exec = str(exec_file.resolve())
-        expected = f'{shlex.quote(abs_exec)} --role merge -- /bin/bash -c {shlex.quote(cmd)}'
-        assert result == expected
-
-    # -----------------------------------------------------------------------
-    # Integration tests: wiring of _maybe_govern_merge_cmd into run_verification
-    # (suggestion: test that the cmd= line in _run_or_skip_timed actually routes
-    # wrapped commands through _run_cmd, not just _maybe_govern_merge_cmd in isolation)
-    # -----------------------------------------------------------------------
-
     @pytest.mark.asyncio
     async def test_run_verification_merge_role_wraps_commands(self, tmp_path):
         """run_verification with role='merge' + governance enabled routes wrapped cmds to _run_cmd.
 
-        Verifies the wiring at verify.py:_run_or_skip_timed — that the
-        ``cmd = _maybe_govern_merge_cmd(cmd, config, worktree, role)`` line
+        Verifies the wiring at verify.py:_run_or_skip_timed — that
+        ``cmd = _govern_cpu_str(cmd, _resolve_governed_exec_path(config, worktree, role))``
         actually fires and transforms the command before _run_cmd sees it.
         Without this integration test, removing that line leaves the unit
-        tests of _maybe_govern_merge_cmd in isolation still passing.
+        tests of ``govern_cpu`` in isolation still passing.
         """
         import shlex
 
@@ -6903,11 +6754,136 @@ class TestMaybeGovernMergeCmd:
         )
 
     @pytest.mark.asyncio
+    async def test_run_verification_disabled_governance_no_wrap(self, tmp_path):
+        """cpu_governance disabled -> commands reach _run_cmd unwrapped, even for role='merge'.
+
+        Migrated from the old ``_maybe_govern_merge_cmd`` unit test
+        (``test_disabled_governance_returns_cmd_unchanged``) to the
+        run_verification integration level (task 2125 step-26): the
+        disabled/fail-open check now lives in ``_resolve_governed_exec_path``,
+        which is verify.py-local (not part of the VerifyCmd model), so it has
+        no ``test_verify_cmd.py`` equivalent to rely on instead.
+        """
+        from orchestrator.config import ModuleConfig
+        config, _ = self._make_govern_config(tmp_path, enabled=False)
+        module_config = ModuleConfig(
+            prefix='pkg',
+            test_command='cargo test --workspace',
+            lint_command=None,
+            type_check_command=None,
+        )
+
+        captured_cmds: list[str] = []
+
+        async def fake_run_cmd(cmd, cwd, timeout, env=None, log_path=None, **_kwargs):
+            captured_cmds.append(cmd)
+            return 0, '', False
+
+        with patch('orchestrator.verify._run_cmd', side_effect=fake_run_cmd):
+            await run_verification(
+                tmp_path, config, module_config=module_config, max_retries=0, role='merge',
+            )
+
+        assert len(captured_cmds) == 1
+        assert captured_cmds[0] == 'cargo test --workspace', (
+            f'Expected bare command when governance is disabled; got {captured_cmds[0]!r}'
+        )
+
+    @pytest.mark.asyncio
+    async def test_run_verification_non_executable_exec_no_wrap(self, tmp_path):
+        """Enabled governance + non-executable exec -> commands reach _run_cmd unwrapped (fail-open).
+
+        Migrated from the old ``_maybe_govern_merge_cmd`` unit test
+        (``test_non_executable_exec_returns_cmd_unchanged``); see
+        ``test_run_verification_disabled_governance_no_wrap`` for why this now
+        lives at the integration level.
+        """
+        from orchestrator.config import CpuGovernConfig, ModuleConfig
+        scripts = tmp_path / 'scripts'
+        scripts.mkdir()
+        exec_file = scripts / 'cpu-governed-exec.sh'
+        exec_file.write_text('#!/bin/sh\n')
+        exec_file.chmod(0o644)  # not executable
+        config = OrchestratorConfig()
+        config.cpu_governance = CpuGovernConfig(
+            enabled=True,
+            exec_path='scripts/cpu-governed-exec.sh',
+        )
+        module_config = ModuleConfig(
+            prefix='pkg',
+            test_command='cargo test --workspace',
+            lint_command=None,
+            type_check_command=None,
+        )
+
+        captured_cmds: list[str] = []
+
+        async def fake_run_cmd(cmd, cwd, timeout, env=None, log_path=None, **_kwargs):
+            captured_cmds.append(cmd)
+            return 0, '', False
+
+        with patch('orchestrator.verify._run_cmd', side_effect=fake_run_cmd):
+            await run_verification(
+                tmp_path, config, module_config=module_config, max_retries=0, role='merge',
+            )
+
+        assert len(captured_cmds) == 1
+        assert captured_cmds[0] == 'cargo test --workspace', (
+            f'Expected bare command when exec is non-executable (fail-open); got {captured_cmds[0]!r}'
+        )
+
+    @pytest.mark.asyncio
+    async def test_run_verification_merge_role_wraps_parsed_inner_command(self, tmp_path):
+        """The inner (pre-govern-wrap) payload is the VerifyCmd-rendered form
+        of test_command, not a verbatim copy of the config string (task 2125
+        step-25/26: govern routes through parse_config_command -> govern_cpu
+        -> render instead of _maybe_govern_merge_cmd's bare string wrap).
+
+        A flag positioned after a target in the config string (``pytest
+        tests/x.py -v``) is canonicalised to flags-before-targets
+        (``pytest -v tests/x.py``) by the structured render path — so the
+        quoted inner payload inside the govern wrap must reflect that
+        canonical form. Fails today: _maybe_govern_merge_cmd wraps the
+        ORIGINAL string verbatim with no parsing, so the inner payload keeps
+        the flag-after-target order from the config.
+        """
+        import shlex
+
+        from orchestrator.config import ModuleConfig
+        config, exec_file = self._make_govern_config(tmp_path)
+        module_config = ModuleConfig(
+            prefix='pkg',
+            test_command='pytest tests/x.py -v',
+            lint_command=None,
+            type_check_command=None,
+        )
+
+        abs_exec = str(exec_file.resolve())
+        captured_cmds: list[str] = []
+
+        async def fake_run_cmd(cmd, cwd, timeout, env=None, log_path=None, **_kwargs):
+            captured_cmds.append(cmd)
+            return 0, '', False
+
+        with patch('orchestrator.verify._run_cmd', side_effect=fake_run_cmd):
+            await run_verification(
+                tmp_path, config, module_config=module_config, max_retries=0, role='merge',
+            )
+
+        assert len(captured_cmds) == 1
+        expected_inner = 'pytest -v tests/x.py'  # canonical: flags before targets
+        expected = f'{shlex.quote(abs_exec)} --role merge -- /bin/bash -c {shlex.quote(expected_inner)}'
+        assert captured_cmds[0] == expected, (
+            f'Expected govern wrap around the canonically-rendered inner command '
+            f'{expected_inner!r}; got {captured_cmds[0]!r}'
+        )
+
+    @pytest.mark.asyncio
     async def test_run_verification_governance_and_cgroup_scope_coexist(self, tmp_path):
         """Governance + verify_use_cgroup_scope both enabled: commands are govern-wrapped and no crash.
 
         When both flags are active, _run_or_skip_timed first wraps the command
-        via _maybe_govern_merge_cmd (so cpu-governed-exec.sh becomes argv[0])
+        via _govern_cpu_str (so cpu-governed-exec.sh becomes argv[0])
         and then passes use_cgroup_scope=True to _run_cmd, which would launch
         the wrapped command inside a systemd --user --scope (if systemd-run is
         present).  This creates a potential nested scope: the outer df-verify

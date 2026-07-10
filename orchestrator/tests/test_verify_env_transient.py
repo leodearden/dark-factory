@@ -20,7 +20,8 @@ Test coverage:
   step-1: _classify_failure grounded env_transient signatures + negative guards
   step-3: non-misattribution wiring (_worst_category, PREEXISTING_BREAK_SKIP_CATEGORIES,
           _should_archive_category, _CATEGORY_PRIORITY)
-  step-5: _force_serial_pytest pure helper
+  step-5: _force_serial_pytest pure helper (migrated to
+          test_verify_cmd.TestSerialPytest, task 2125 step-26)
   step-7: run_verification env-recovery retry (integration, mocked _run_cmd)
   step-9: run_main_tip_sweep env_transient infra sentinel (mocked run_full_verification)
   step-11: pip-absence word-boundary regression guard (negative + positive preservation)
@@ -154,53 +155,6 @@ class TestEnvTransientNonMisattributionWiring:
         )
 
 
-class TestForceSerialPytest:
-    """step-5: _force_serial_pytest(cmd) is a pure string-rewrite helper.
-
-    Appends ` -p no:xdist -o addopts=''` to every `pytest` invocation in a
-    `&&`-chain — reproducing task 2045's proven `-o addopts=""` serial
-    workaround (clears the pyproject `-n auto`/xdist addopts) plus a
-    belt-and-suspenders `-p no:xdist` plugin disable. Non-pytest commands and
-    None pass through unchanged. RED today: _force_serial_pytest does not exist.
-    """
-
-    # The real multi-module test_command from orchestrator/config.yaml —
-    # five chained `cd <module> && uv run pytest tests/` invocations.
-    REAL_CONFIG_TEST_COMMAND = (
-        'cd shared && uv run pytest tests/ && '
-        'cd ../escalation && uv run pytest tests/ && '
-        'cd ../orchestrator && uv run pytest tests/ && '
-        'cd ../fused-memory && uv run pytest tests/ && '
-        'cd ../dashboard && uv run pytest tests/'
-    )
-
-    def test_rewrites_every_pytest_invocation_in_chained_command(self):
-        """Each of the 5 chained `uv run pytest tests/` segments gains the flags."""
-        result = verify._force_serial_pytest(self.REAL_CONFIG_TEST_COMMAND)
-
-        expected = (
-            "cd shared && uv run pytest tests/ -p no:xdist -o addopts='' && "
-            "cd ../escalation && uv run pytest tests/ -p no:xdist -o addopts='' && "
-            "cd ../orchestrator && uv run pytest tests/ -p no:xdist -o addopts='' && "
-            "cd ../fused-memory && uv run pytest tests/ -p no:xdist -o addopts='' && "
-            "cd ../dashboard && uv run pytest tests/ -p no:xdist -o addopts=''"
-        )
-        assert result == expected
-
-        # Number of rewrites equals the number of pytest invocations (5).
-        assert self.REAL_CONFIG_TEST_COMMAND.count('pytest') == 5
-        assert result.count("-p no:xdist -o addopts=''") == 5
-
-    def test_non_pytest_command_returned_unchanged(self):
-        """A command with no `pytest` token (e.g. cargo) passes through unchanged."""
-        cmd = 'cargo test --workspace'
-        assert verify._force_serial_pytest(cmd) == cmd
-
-    def test_none_returns_none(self):
-        """A None command (skipped check) stays None."""
-        assert verify._force_serial_pytest(None) is None
-
-
 _XDIST_VANISHED_OUTPUT = (
     'usage: pytest [options] [file_or_dir] [file_or_dir] [...]\n'
     'pytest: error: unrecognized arguments: -n --dist --max-worker-restart=0\n'
@@ -209,14 +163,28 @@ _XDIST_VANISHED_OUTPUT = (
 
 class TestRunVerificationEnvRecovery:
     """step-7: run_verification auto-recovers from a shared-venv-mutation
-    transient via a single bounded serial retry (_force_serial_pytest)
+    transient via a single bounded serial retry (serial_pytest, task 2125
+    step-25/26 — the VerifyCmd mutator that replaced _force_serial_pytest)
     instead of misattributing it as test drift.
 
     Mirrors TestRunVerificationColdFirstUse's `_run_cmd` mocking pattern.
-    RED today: no env-recovery retry exists, so the rewritten (recovery)
-    command is never invoked and a still-transient retry can't be
-    distinguished from "no retry happened at all".
+    RED today: the env-recovery retry still renders through the deleted
+    _force_serial_pytest's format (flags appended after targets, quoted
+    ``addopts=''``); the VerifyCmd model's structured render puts flags
+    before targets and does not quote a bare-safe ``addopts=`` — see
+    RECOVERED_TEST_COMMAND, computed the same way
+    test_verify_cmd.TestSerialPytest.test_structured_single_invocation_appends_flags
+    pins it for the mutator in isolation.
     """
+
+    # The exact recovery command for `_make_config`'s test_command
+    # ('uv run pytest tests/'), rendered via
+    # render(serial_pytest(parse_config_command(test_command))): the
+    # structured (non-chained) render path puts base_flags before targets
+    # and shlex.quote leaves the safe 'addopts=' token unquoted — distinct
+    # from the deleted _force_serial_pytest's append-at-end, quoted
+    # ``addopts=''`` form.
+    RECOVERED_TEST_COMMAND = 'uv run pytest -p no:xdist -o addopts= tests/'
 
     def _make_config(self, tmp_path: Path) -> OrchestratorConfig:
         # lint/type are non-Optional str fields on OrchestratorConfig (unlike
@@ -233,13 +201,13 @@ class TestRunVerificationEnvRecovery:
     @pytest.mark.asyncio
     async def test_env_transient_recovers_on_serial_retry(self, tmp_path: Path):
         """Case A: the original run hits the xdist usage-error; the serial
-        (_force_serial_pytest-rewritten) retry passes -> GREEN, env recovered."""
+        (serial_pytest-rewritten) retry passes -> GREEN, env recovered."""
         config = self._make_config(tmp_path)
         invoked_cmds: list[str] = []
 
         async def fake_cmd(cmd, cwd, timeout, env=None, log_path=None, **kwargs):
             invoked_cmds.append(cmd)
-            if 'pytest' in cmd and "-o addopts=''" not in cmd:
+            if 'pytest' in cmd and '-o addopts=' not in cmd:
                 return 4, _XDIST_VANISHED_OUTPUT, False
             return 0, '', False
 
@@ -253,9 +221,9 @@ class TestRunVerificationEnvRecovery:
             f'Expected exactly 2 pytest invocations (original + one bounded '
             f'recovery retry), got {len(pytest_invocations)}: {pytest_invocations!r}'
         )
-        assert any("-o addopts=''" in c for c in pytest_invocations), (
-            f"Expected a recovery command containing -o addopts='' to be "
-            f'invoked, got {pytest_invocations!r}'
+        assert any(c == self.RECOVERED_TEST_COMMAND for c in pytest_invocations), (
+            f'Expected the serial_pytest()-rendered recovery command '
+            f'{self.RECOVERED_TEST_COMMAND!r} to be invoked, got {pytest_invocations!r}'
         )
 
     @pytest.mark.asyncio
@@ -288,9 +256,10 @@ class TestRunVerificationEnvRecovery:
             f'the first-pass category untouched), got {len(pytest_invocations)}: '
             f'{pytest_invocations!r}'
         )
-        assert any("-o addopts=''" in c for c in pytest_invocations), (
-            f"Expected the bounded recovery retry to invoke a command "
-            f"containing -o addopts='', got {pytest_invocations!r}"
+        assert any(c == self.RECOVERED_TEST_COMMAND for c in pytest_invocations), (
+            f'Expected the bounded recovery retry to invoke the '
+            f'serial_pytest()-rendered command {self.RECOVERED_TEST_COMMAND!r}, '
+            f'got {pytest_invocations!r}'
         )
 
     @pytest.mark.asyncio
@@ -298,7 +267,7 @@ class TestRunVerificationEnvRecovery:
         self, tmp_path: Path, caplog: pytest.LogCaptureFixture,
     ):
         """Amendment regression (reviewer_comprehensive robustness_false_signal,
-        verify.py:637): _force_serial_pytest's `-o addopts=''` clears ALL
+        verify.py:637): serial_pytest's `-o addopts=` clears ALL
         pyproject addopts, not just `-n auto` — including any marker filters
         (e.g. `-m 'not integration'`) — so the single recovery run can
         exercise a materially different test selection than the original.
@@ -311,7 +280,7 @@ class TestRunVerificationEnvRecovery:
         config = self._make_config(tmp_path)
 
         async def fake_cmd(cmd, cwd, timeout, env=None, log_path=None, **kwargs):
-            if 'pytest' in cmd and "-o addopts=''" not in cmd:
+            if 'pytest' in cmd and '-o addopts=' not in cmd:
                 return 4, _XDIST_VANISHED_OUTPUT, False
             return 0, '', False
 
@@ -354,7 +323,7 @@ class TestRunVerificationEnvRecovery:
 
         async def fake_cmd(cmd, cwd, timeout, env=None, log_path=None, **kwargs):
             invoked_cmds.append(cmd)
-            if "-o addopts=''" in cmd:
+            if '-o addopts=' in cmd:
                 return 1, f'Command timed out after {timeout}s: {cmd}', True
             if 'pytest' in cmd:
                 return 4, _XDIST_VANISHED_OUTPUT, False
