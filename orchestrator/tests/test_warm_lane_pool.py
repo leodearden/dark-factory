@@ -14,6 +14,7 @@ from unittest.mock import AsyncMock
 
 import pytest
 
+from orchestrator.artifacts import TaskArtifacts
 from orchestrator.config import GitConfig
 from orchestrator.git_ops import GitOps, WarmLaneUnavailable, WorktreeInfo, _run
 from orchestrator.lane_lifecycle import LaneLifecycle
@@ -2215,7 +2216,11 @@ class TestAcquireWarmLaneOnDiskBackstop:
         assert isinstance(info1, WorktreeInfo)
 
         # Simulate agent writing plan.json + tracked WIP
-        plan_file = info1.path / '.task' / 'plan.json'
+        plan_file = (
+            TaskArtifacts.meta_root_for(info1.path.parent, info1.path.name)
+            / 'plan.json'
+        )
+        plan_file.parent.mkdir(parents=True, exist_ok=True)
         plan_file.write_text('{"task_id": "task-A", "title": "task A work"}')
         (info1.path / 'task_work.txt').write_text('WIP after restart\n')
 
@@ -2248,7 +2253,11 @@ class TestAcquireWarmLaneOnDiskBackstop:
         git_ops1 = GitOps(wl_git_config_on, wl_git_repo, warm_lane_pool_size=1)
         info1 = await git_ops1.acquire_warm_lane('task-A', sha_a)
         assert isinstance(info1, WorktreeInfo)
-        plan_file = info1.path / '.task' / 'plan.json'
+        plan_file = (
+            TaskArtifacts.meta_root_for(info1.path.parent, info1.path.name)
+            / 'plan.json'
+        )
+        plan_file.parent.mkdir(parents=True, exist_ok=True)
         plan_file.write_text('{"task_id": "task-A"}')
         (info1.path / 'task_work.txt').write_text('WIP work\n')
 
@@ -2274,7 +2283,11 @@ class TestAcquireWarmLaneOnDiskBackstop:
         git_ops1 = GitOps(wl_git_config_on, wl_git_repo, warm_lane_pool_size=1)
         info1 = await git_ops1.acquire_warm_lane('task-A', sha_a)
         assert isinstance(info1, WorktreeInfo)
-        plan_file = info1.path / '.task' / 'plan.json'
+        plan_file = (
+            TaskArtifacts.meta_root_for(info1.path.parent, info1.path.name)
+            / 'plan.json'
+        )
+        plan_file.parent.mkdir(parents=True, exist_ok=True)
         plan_file.write_text('{"task_id": "task-A"}')
 
         # Release so pool marks the lane FREE (different task can acquire it)
@@ -2308,7 +2321,11 @@ class TestAcquireWarmLaneOnDiskBackstop:
         git_ops1 = GitOps(wl_git_config_on, wl_git_repo, warm_lane_pool_size=1)
         info1 = await git_ops1.acquire_warm_lane('task-A', sha_a)
         assert isinstance(info1, WorktreeInfo)
-        plan_file = info1.path / '.task' / 'plan.json'
+        plan_file = (
+            TaskArtifacts.meta_root_for(info1.path.parent, info1.path.name)
+            / 'plan.json'
+        )
+        plan_file.parent.mkdir(parents=True, exist_ok=True)
         plan_file.write_text('{"task_id": "task-A"}')
         calls_after_first = (
             seed_marker.read_text() if seed_marker.exists() else ''

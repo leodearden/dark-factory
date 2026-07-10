@@ -108,7 +108,9 @@ def _make_workflow(
         mcp=MagicMock(),  # type: ignore[arg-type]
     )
     workflow.worktree = worktree
-    artifacts = TaskArtifacts(worktree)
+    artifacts = TaskArtifacts(
+        worktree, TaskArtifacts.meta_root_for(worktree.parent, worktree.name)
+    )
     artifacts.init('42', 'X', 'desc', base_commit='base-sha-old')
     workflow.artifacts = artifacts
     workflow.plan = {'task_id': '42', 'steps': []}
