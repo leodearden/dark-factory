@@ -159,8 +159,37 @@ always_escalates, stream, the exact 9-dep set) rather than re-filing, which
 would have duplicated a live self-restart side effect against an
 already-satisfied spine.
 
-Dispatch note: the orchestrator has already restarted (or is restarting)
-onto `LaneLifecycle`-backed acquire with the `.task-meta` relocation live,
-per the self-restart path's own fresh `MainPID`/`ActiveEnterTimestamp`
-verify (`restart-orchestrator.sh`'s blocking verify loop, delegated to by
-the committed script). No further action is required for κ.
+Verification artifact: the field-for-field match is not merely asserted here
+— it is recorded in escalation **esc-2422-1** (`task_id=2422`,
+`agent_role=implementer`, `severity=info`, `category=risk_identified`, filed
+`2026-07-10T20:56:18Z`; fetch via `mcp__escalation__get_escalation` /
+`get_pending_escalations(task_id="2422")`). Its `detail` field carries the
+full reconstructed timeline (esc-2263-1 → 2422 created by the steward
+19:49:57Z → 2263 merges ~20:34:34Z → 2422's plan finalized 20:41:17Z with the
+not-yet-filed premise confirmed true at that instant → #2424 already
+`status='done'` by 20:48:15Z → 2422's own worktree only created 20:50:14Z)
+plus the exact `get_task('2424', ...)` payload it was diffed against. Any
+reader can independently reproduce the same comparison by re-running
+`get_task('2424', project_root='/home/leo/src/dark-factory')` — as of this
+writing it returns `task_kind='deterministic'`,
+`dependencies=[2254,2255,2256,2257,2258,2259,2260,2261,2262]`,
+`metadata.before_done` matching the payload in "Filing" above verbatim,
+`metadata.always_escalates=false`, `metadata.stream='W11'`, `status='done'`.
+
+Dispatch note: **confirmed**, not merely scheduled — the orchestrator has
+restarted onto `LaneLifecycle`-backed acquire with the `.task-meta`
+relocation live. Post-restart verification observed directly (not inferred):
+`journalctl --user -u orch-redeploy-restart-2424.service` shows the
+committed script's own blocking verify loop running to completion —
+`Restarting orchestrator-dark-factory.service (baseline MainPID=298912)...`
+→ `Verifying fresh MainPID... OK` →
+`orchestrator-dark-factory restarted successfully (new MainPID=470803)` —
+and the transient unit itself exited `Result=success`, `ExecMainStatus=0`.
+Cross-checked independently via `systemctl --user show
+orchestrator-dark-factory.service`: `MainPID=470803`,
+`ActiveState=active`/`SubState=running`,
+`ActiveEnterTimestamp=Fri 2026-07-10 21:49:16 BST`
+(`2026-07-10T20:49:16Z`) — ~61s after `before_done_scheduled_at`'s
+`20:48:14.94Z` plus the `fire_delay_secs=60` delay, i.e. exactly the
+scheduled fire, not an unrelated restart. No further action is required
+for κ.
