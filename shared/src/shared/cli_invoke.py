@@ -1113,6 +1113,33 @@ async def invoke_with_cap_retry(
                             await asyncio.sleep(cooldown)
                             continue
 
+                # Progress-timeout guard (reify-4827, task 2360 fix #2): a
+                # RESUMED invocation that hit the working-regime ceiling but
+                # made real agentic progress (transcript_turns > 0) must be
+                # returned to the caller, not silently discarded into the
+                # generic non-cap-hit resume-failure branch below — that
+                # branch restarts from the ORIGINAL prompt, throwing away the
+                # transcript and all agent progress. The workflow gamma
+                # branch (is_timed_out_with_progress) owns re-resuming this
+                # session with its own continuation prompt. Mutually
+                # exclusive with the ZeroOutputWedge guard above
+                # (transcript_turns 0 vs >0), so zero-output wedges are
+                # unaffected and still take the existing fresh-fallback path.
+                if (
+                    invoke_kwargs.get('resume_session_id')
+                    and is_timed_out_with_progress(result)
+                ):
+                    logger.warning(
+                        f'{label}: resumed invocation timed out WITH progress '
+                        f'(transcript_turns={result.transcript_turns}, '
+                        f'duration_ms={result.duration_ms}) — returning to '
+                        f'caller for γ re-resume instead of discarding into '
+                        f'a fresh retry',
+                    )
+                    if not unattributed_cap:
+                        slot.confirm(result.cost_usd)
+                    break
+
                 # Non-cap-hit failure while resuming → fall back to fresh invocation.
                 # Rebuild via the caller's hook (no-op when rebuild_prompt is None):
                 # mirrors the two cap-hit fresh-fallback paths above, since a
