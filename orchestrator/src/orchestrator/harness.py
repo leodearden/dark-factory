@@ -1015,11 +1015,15 @@ class Harness:
         self._reconcile_skip_counts: dict[str, int] = {}
         # Wall-clock of the most recent _workflow_cancel_events.set() call,
         # keyed by task_id.  R3-race-guard window — the sweep skips a task
-        # whose workflow was cancelled within the last
-        # ``_RECONCILE_CANCEL_GRACE_S`` seconds, since the workflow's
-        # finally: block may still be writing state.
-        self._workflow_cancel_at: dict[str, float] = {}
-        self._RECONCILE_CANCEL_GRACE_S: float = 30.0
+        # whose workflow was cancelled within the last grace period, since
+        # the workflow's finally: block may still be writing state.  Task
+        # 2235 (W10-alpha): this stamp, its grace constant, and the
+        # membership predicate now live on the Scheduler (beside
+        # ``_dispatched`` / ``lock_table``, their single writer) — see
+        # ``scheduler.note_workflow_cancelled`` / ``.clear_workflow_cancel`` /
+        # ``.workflow_cancel_recent``.  The ``_workflow_cancel_at`` property
+        # and ``_workflow_cancel_recent`` method below are thin back-compat
+        # shims that forward to the Scheduler.
 
         # Merge queue — single worker owns all main-branch advancement
         self._merge_queue: asyncio.Queue = asyncio.Queue()
@@ -1446,9 +1450,9 @@ class Harness:
 
             # 2c2. Reconcile stale branch checkouts left behind by recovery's
             # skip branches (identity-guard defer, no-plan/corrupt-plan
-            # release) — runs while scheduler._dispatched is still empty, so
-            # it only repairs what _recover_crashed_tasks skipped and never
-            # races a live dispatch.
+            # release) — runs while no task is yet dispatched, so it only
+            # repairs what _recover_crashed_tasks skipped and never races a
+            # live dispatch.
             await self._reconcile_lane_checkouts()
 
             # 2d. Reconcile stranded in-progress tasks (live-claimant-aware)
@@ -1456,13 +1460,21 @@ class Harness:
 
             # 2e. Reap/quarantine orphan worktrees (Fix B).  Runs here — after
             # recovery + stranded-reconcile and before the first acquire_next —
-            # so scheduler._dispatched is empty and no live workflow can race
-            # the sweep.  Self-gates on worktree_orphan_reaper_enabled.
+            # so no task is yet dispatched and no live workflow can race the
+            # sweep.  Self-gates on worktree_orphan_reaper_enabled.
             await self._reap_orphan_worktrees()
             # Diff 7: startup terminal-lane sweep (layer A backstop).
-            # Runs after the orphan reaper so scheduler._dispatched is still
-            # empty — no live workflow can race the release.
+            # Runs after the orphan reaper so no task is yet dispatched — no
+            # live workflow can race the release.
             await self._reconcile_terminal_lanes()
+
+            # Startup reconcile sweeps above have all run; mark the Scheduler
+            # started so acquire_next() may now proceed (task 2235's runtime
+            # enforcement of the "sweeps run before the first tick" invariant
+            # the comments above describe).  Set even under dry_run, which
+            # never reaches acquire_next but should still leave the Scheduler
+            # in a consistent post-startup state.
+            self.scheduler.finish_startup()
 
             statuses, _ = await self.scheduler.get_statuses()
             self.report.total_tasks = sum(1 for s in statuses.values() if s == 'pending')
@@ -2596,8 +2608,8 @@ Output JSON matching the schema. Every task must appear in the output.
         authoritative worktree admin (:meth:`GitOps.lane_branch_checkouts`)
         rather than trusting the in-memory assignment map alone.  Called from
         :meth:`run` immediately after ``_recover_crashed_tasks`` — same
-        startup envelope as the orphan reaper (``scheduler._dispatched`` is
-        still empty, single asyncio loop), so ``restore_assignment`` /
+        startup envelope as the orphan reaper (no task is yet
+        ``scheduler.is_dispatched()``, single asyncio loop), so ``restore_assignment`` /
         ``assignments_snapshot`` (both synchronous, no ``await``) cannot race
         a live dispatch.
 
@@ -2756,8 +2768,8 @@ Output JSON matching the schema. Every task must appear in the output.
         adopted for an unrelated (recycled-id) task (Fix B closes that gap).
 
         Run ONCE at startup, AFTER ``_reconcile_stranded_in_progress`` and
-        BEFORE the first ``acquire_next`` — at that point
-        ``scheduler._dispatched`` is empty so no live workflow can race the
+        BEFORE the first ``acquire_next`` — at that point no task is yet
+        ``scheduler.is_dispatched()`` so no live workflow can race the
         sweep.
 
         Policy: **quarantine** anything with commits OR uncommitted WIP
@@ -2848,7 +2860,7 @@ Output JSON matching the schema. Every task must appear in the output.
                 or name in self._recovered_plans
                 or name in self._preserved_worktrees
                 or name in self._recovered_sessions
-                or name in self.scheduler._dispatched
+                or self.scheduler.is_dispatched(name)
             ):
                 continue
 
@@ -2894,22 +2906,28 @@ Output JSON matching the schema. Every task must appear in the output.
     def _workflow_cancel_recent(self, tid: str) -> bool:
         """Return True if *tid* has a workflow-cancel stamp within the grace window.
 
-        Replaces the membership check ``tid not in _workflow_cancel_at`` in the
-        Fix #1b re-file gate and in the sweep loop's R3 race guard.
-
-        Semantics:
-          - No stamp (never cancelled / already pruned) → False.
-          - Stamp exists AND now - stamp < _RECONCILE_CANCEL_GRACE_S → True
-            (workflow's finally-block may still be writing state; skip).
-          - Stamp exists AND now - stamp >= grace → False (stale; re-filing
-            is safe — the stamp will be lazily pruned by the sweep loop on the
-            next mid-run cycle via the existing pop() call).
+        Task 2235 (W10-alpha): back-compat shim — the cancel-grace stamp,
+        grace constant, and this predicate now live on the Scheduler (beside
+        ``_dispatched`` / ``lock_table``, their single writer). Production
+        call sites read ``self.scheduler.workflow_cancel_recent`` directly;
+        this method forwards for the handful of tests still calling it on
+        the Harness.
         """
-        cancelled_at = self._workflow_cancel_at.get(tid)
-        return (
-            cancelled_at is not None
-            and time.monotonic() - cancelled_at < self._RECONCILE_CANCEL_GRACE_S
-        )
+        return self.scheduler.workflow_cancel_recent(tid)
+
+    @property
+    def _workflow_cancel_at(self) -> dict[str, float]:
+        """Back-compat read/write shim (task 2235) over the Scheduler's own
+        cancel-grace stamp dict — the Scheduler is the single owner (see
+        ``Scheduler.note_workflow_cancelled`` / ``.clear_workflow_cancel``).
+        Returns the live dict (not a copy): ``.clear()`` / item-assignment
+        mutate the Scheduler's own state.
+        """
+        return self.scheduler._workflow_cancel_at
+
+    @_workflow_cancel_at.setter
+    def _workflow_cancel_at(self, value: dict[str, float]) -> None:
+        self.scheduler._workflow_cancel_at = value
 
     def _register_escalation_event(self, task_id: str) -> asyncio.Event | None:
         """Register an escalation wake-event for *task_id* at dispatch time.
@@ -2961,10 +2979,10 @@ Output JSON matching the schema. Every task must appear in the output.
 
         **Single-orchestrator-ownership invariant:** The warm-lane pool is
         exclusively owned by this orchestrator process.  A non-terminal task
-        that is NOT in ``scheduler._dispatched`` (checked synchronously under
-        the pool lock by :meth:`WarmLanePool.reclaim_victim`) implies it is
-        stale or stranded — not actively executing — because any live task is
-        guaranteed to be in ``_dispatched``.  This invariant holds because
+        for which ``scheduler.is_dispatched()`` is False (checked
+        synchronously under the pool lock by :meth:`WarmLanePool.reclaim_victim`)
+        implies it is stale or stranded — not actively executing — because any
+        live task is guaranteed to be dispatched.  This invariant holds because
         :meth:`_reconcile_stranded_in_progress` reverts genuinely stranded
         ``in-progress`` tasks before the safety valve fires.  Do **not** reuse
         this logic in a shared-pool context where non-dispatched does not imply
@@ -3005,14 +3023,14 @@ Output JSON matching the schema. Every task must appear in the output.
         where a candidate is re-dispatched during the async ``get_statuses``
         await in :meth:`_warm_lane_reclaim_candidates`.
         """
-        return branch in self.scheduler._dispatched
+        return self.scheduler.is_dispatched(branch)
 
     async def _reconcile_terminal_lanes(self) -> None:
         """Release warm lanes whose assigned tasks are terminal and not live.
 
         Layer A (invariant backstop): sweeps every ASSIGNED lane, checks the
         task status via ``scheduler.get_statuses``, and releases lanes whose
-        task is done/cancelled and not in ``scheduler._dispatched`` (the
+        task is done/cancelled and not ``scheduler.is_dispatched()`` (the
         live-acquire guard prevents racing a fresh ``acquire_for``).
 
         Fail-safe MIRRORS ``_reap_orphan_worktrees``: an empty or errored
@@ -3058,7 +3076,7 @@ Output JSON matching the schema. Every task must appear in the output.
             status = statuses.get(branch)
             if status not in TERMINAL_STATUSES:
                 continue
-            if branch in self.scheduler._dispatched:
+            if self.scheduler.is_dispatched(branch):
                 # Live-acquire guard: a workflow may have just acquired this
                 # branch; skip to avoid racing the fresh dispatch.
                 continue
@@ -3093,7 +3111,7 @@ Output JSON matching the schema. Every task must appear in the output.
         At startup (``mid_run=False``) this is called AFTER
         ``_recover_crashed_tasks()`` (which may unlink plan.lock for recovered
         worktrees) and BEFORE the first ``scheduler.acquire_next()`` call, so
-        ``self.scheduler._dispatched`` is always empty.
+        no task is yet ``scheduler.is_dispatched()``.
 
         When ``mid_run=True`` the harness has dispatched tasks during this
         run; those are NOT stranded — they are actively held by the scheduler
@@ -3169,25 +3187,20 @@ Output JSON matching the schema. Every task must appear in the output.
         for tid, status in statuses.items():
             if status not in _RECONCILE_SWEEP_STATUSES:
                 continue
-            if mid_run and (
-                tid in self.scheduler._dispatched
-                or tid in self.scheduler.lock_table._held
-            ):
+            # is_actively_held folds three liveness signals (dispatched,
+            # module-lock held, recent workflow-cancel stamp — task 2235's
+            # R3 race guard: a workflow soft-cancel set very recently may
+            # still have its finally: block writing state, so skip until the
+            # grace period elapses) into one Scheduler-owned check.
+            if mid_run and self.scheduler.is_actively_held(tid):
                 # Actively held by this run's scheduler — not stranded.
                 continue
 
-            # R3 race guard: when a workflow soft-cancel was set very
-            # recently, the workflow's finally: block may still be writing
-            # state (release_workflow + cleanup window).  Skip until the
-            # grace period elapses so we don't revert work the workflow
-            # is still finishing.
             if mid_run:
-                if self._workflow_cancel_recent(tid):
-                    continue
                 # Grace window elapsed (or never set) — lazily prune so the
                 # dict stays bounded for tasks that exit terminal and are never
                 # re-dispatched (re-dispatch otherwise clears the stamp).
-                self._workflow_cancel_at.pop(tid, None)
+                self.scheduler.clear_workflow_cancel(tid)
 
             try:
                 outcome = await self._reconcile_one_stranded(
@@ -3628,7 +3641,7 @@ Output JSON matching the schema. Every task must appear in the output.
                 self.config.stranded_blocked_escalate_enabled
                 and self._escalation_queue is not None
                 and tid not in self._escalation_events       # no active workflow
-                and not self._workflow_cancel_recent(tid)     # not a recent cancel/park
+                and not self.scheduler.workflow_cancel_recent(tid)  # not a recent cancel/park
                 and not self._escalation_queue.get_by_task(tid, status='pending')
                 and metadata.get('task_kind') != 'deterministic'
             ):
@@ -5517,7 +5530,7 @@ Output JSON matching the schema. Every task must appear in the output.
             # Clear any stale soft-cancel grace stamp from a prior incarnation
             # of this task so a freshly re-dispatched run starts clean (the
             # stamp is no longer popped in the finally — see note there).
-            self._workflow_cancel_at.pop(assignment.task_id, None)
+            self.scheduler.clear_workflow_cancel(assignment.task_id)
 
             # Register the asyncio.Task handle for this slot so hard_cancel_workflow
             # can request a hard cancel if the workflow ignores the soft event.
@@ -6302,9 +6315,7 @@ Output JSON matching the schema. Every task must appear in the output.
                     if genuine_exhausted
                     else self.config.transient_requeue_cap
                 )
-                history = list(
-                    self.scheduler._requeue_history.get(task_id, ())
-                )
+                history = self.scheduler.requeue_history(task_id)
                 cumulative_cost = sum(r.cost_usd for r in history)
                 try:
                     await self.scheduler.trigger_retry_cap_exhausted(
@@ -7520,7 +7531,7 @@ Output JSON matching the schema. Every task must appear in the output.
         # Stamp wall-clock so the reconcile sweep can grace-skip this task
         # for the next _RECONCILE_CANCEL_GRACE_S seconds — the workflow's
         # finally: block may still be writing state (R3 race guard).
-        self._workflow_cancel_at[task_id] = time.monotonic()
+        self.scheduler.note_workflow_cancelled(task_id)
         return True
 
     def is_workflow_active(self, task_id: str) -> bool:
@@ -7556,7 +7567,7 @@ Output JSON matching the schema. Every task must appear in the output.
             # Stamp wall-clock so the reconcile sweep respects the R3 grace
             # window.  Only stamp at the threshold-crossing call; subsequent
             # polls pass restamp=False to keep the window anchored.
-            self._workflow_cancel_at[task_id] = time.monotonic()
+            self.scheduler.note_workflow_cancelled(task_id)
         task.cancel()
         return True
 
