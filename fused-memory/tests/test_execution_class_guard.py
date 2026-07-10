@@ -73,3 +73,60 @@ class TestExecutionClassErrorInvariantMatrix:
         """agent_id=None + no execution_class → accept (no enforcement)."""
         result = execution_class_error({}, None, '/proj')
         assert result is None
+
+
+# ---------------------------------------------------------------------------
+# Step-3: inject_execution_class normalization tests
+#
+# inject_execution_class does not exist until step-4 — each test below
+# imports it locally (inside the test body) rather than at module level, so
+# only these new tests fail at RED while the already-GREEN
+# TestExecutionClassErrorInvariantMatrix tests above keep collecting and
+# passing.
+# ---------------------------------------------------------------------------
+
+
+class TestInjectExecutionClass:
+    """Normalization contract for inject_execution_class(metadata) -> dict."""
+
+    def test_metadata_none_returns_dict_with_execution_class_absent(self):
+        """metadata=None → returns a dict (no crash); execution_class stays absent."""
+        from fused_memory.middleware.execution_class_guard import inject_execution_class
+
+        result = inject_execution_class(None)
+        assert isinstance(result, dict)
+        assert 'execution_class' not in result
+
+    def test_preserves_execution_class_and_other_keys(self):
+        """metadata={'execution_class': 'operational', 'foo': 'bar'} → result preserves both keys."""
+        from fused_memory.middleware.execution_class_guard import inject_execution_class
+
+        result = inject_execution_class({'execution_class': 'operational', 'foo': 'bar'})
+        assert isinstance(result, dict)
+        assert result.get('execution_class') == 'operational'
+        assert result.get('foo') == 'bar'
+
+    def test_metadata_json_string_parsed(self):
+        """metadata as a JSON string is parsed into a dict, preserving execution_class."""
+        from fused_memory.middleware.execution_class_guard import inject_execution_class
+
+        result = inject_execution_class(json.dumps({'execution_class': 'decision'}))
+        assert isinstance(result, dict)
+        assert result.get('execution_class') == 'decision'
+
+    def test_caller_dict_not_mutated(self):
+        """Passing a dict does not mutate the caller's object; the result is a distinct object."""
+        from fused_memory.middleware.execution_class_guard import inject_execution_class
+
+        original = {'execution_class': 'code_tdd'}
+        original_copy = dict(original)
+        result = inject_execution_class(original)
+        assert original == original_copy, 'caller dict must not be mutated'
+        assert result is not original, 'result must be a distinct object'
+
+    def test_unparseable_string_returns_dict_without_raising(self):
+        """An unparseable JSON string returns a dict rather than raising."""
+        from fused_memory.middleware.execution_class_guard import inject_execution_class
+
+        result = inject_execution_class('not json!!!')
+        assert isinstance(result, dict)
