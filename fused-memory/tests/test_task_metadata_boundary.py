@@ -141,23 +141,27 @@ def test_legacy_blob_roundtrip_preserves_unknown_keys_and_upgrades_memory_hints(
 async def test_orchestrator_done_provenance_all_kinds_accepted_by_backend(
     make_backend, tmp_path, kind, fields,
 ):
-    """Every kind the orchestrator can construct is accepted by the validator.
+    """Every kind the orchestrator can construct is accepted by the backend.
 
     Builds ``done_provenance`` via the REAL orchestrator seam
     (``_build_done_provenance`` — task 2167 W3-δ SEAM B) for each of the four
-    ``DoneProvenance.kind`` values, then writes it through an enforce-mode
-    backend. I2: the orchestrator and fused-memory share ONE valid-kinds
-    enum, so nothing the producer can legitimately build is ever rejected by
-    the consumer (structurally prevents the 1902/1976/1982 class of bug).
+    ``DoneProvenance.kind`` values, then writes it through the REAL public
+    ``add_task`` write boundary. Task 2201/C1's write-authority floor lives
+    on ``update_task`` only — ``add_task`` has no done_provenance floor — so
+    a fresh insert carrying ``metadata.done_provenance`` is validated
+    (whole-blob enforce, via ``_validate_metadata_on_write``) AND persisted
+    in the very same call, exactly as production's insert path would treat
+    it. I2: the orchestrator and fused-memory share ONE valid-kinds enum, so
+    nothing the producer can legitimately build is ever rejected by the
+    consumer (structurally prevents the 1902/1976/1982 class of bug).
     """
     backend = await make_backend(enforce=True)
     project_root = str(tmp_path / 'proj')
 
     built = _build_done_provenance(kind, **fields)
 
-    dto = await backend.add_task(project_root=project_root, title='t')
-    await backend.update_task(
-        dto['id'], project_root=project_root,
+    dto = await backend.add_task(
+        project_root=project_root, title='t',
         metadata=json.dumps({'done_provenance': built}),
     )
 
@@ -177,25 +181,34 @@ async def test_bogus_done_provenance_kind_rejected_symmetrically(make_backend, t
 
     Producer side: the orchestrator's ``_build_done_provenance`` refuses to
     construct a bogus kind (``DoneProvenance.kind`` is a closed Literal).
-    Consumer side: an enforce-mode backend refuses to store the same bogus
-    kind, and the rolled-back txn leaves the task's metadata untouched. This
-    is the single-enum symmetry (I2) proven negatively.
+    Consumer side: the backend's REAL public ``add_task`` write boundary
+    refuses the same bogus kind (enforce-mode ``_validate_metadata_on_write``,
+    which ``add_task`` always calls whole-blob) and rolls back its INSERT.
+    This is the single-enum symmetry (I2) proven negatively, together with
+    the transactional-rollback guarantee. ``update_task`` is not usable for
+    this any more: task 2201/C1 made it reject ``metadata.done_provenance``
+    unconditionally as a write-authority floor, before any kind is ever
+    validated — so this exercises the bogus-kind rejection through
+    ``add_task``, the one public seam where a fresh done_provenance write
+    still reaches the validator, and confirms no row was left behind
+    (nothing was ever staged for the privileged ``stamp_audit_metadata``
+    seam, which performs no schema validation of its own, to persist).
     """
     with pytest.raises(ValidationError):
         _build_done_provenance('bogus')
 
     backend = await make_backend(enforce=True)
     project_root = str(tmp_path / 'proj')
-    dto = await backend.add_task(project_root=project_root, title='t')
 
     with pytest.raises(ValidationError):
-        await backend.update_task(
-            dto['id'], project_root=project_root,
+        await backend.add_task(
+            project_root=project_root, title='t',
             metadata=json.dumps({'done_provenance': {'kind': 'bogus'}}),
         )
 
-    task = await backend.get_task(dto['id'], project_root=project_root)
-    assert task['metadata'] == {}
+    # The rejected add_task's INSERT never landed — no row/metadata leaked.
+    tasks = (await backend.get_tasks(project_root=project_root))['tasks']
+    assert tasks == []
 
 
 # ── Row 4a — producer↔consumer ledger round-trip ──────────────────────
@@ -325,41 +338,56 @@ async def test_done_provenance_malformed_write_warn_vs_enforce_staged_rollout(
     """The warn->enforce staged-rollout contract that the θ2 gate flips.
 
     ONE malformed blob (``done_provenance.kind='bogus'``, a known field with
-    an invalid value) written through both backend modes: warn-mode does not
-    raise — the write proceeds and exactly one
-    ``task_metadata.schema_warning`` census line is emitted (``done_provenance``
-    is a known field, so no additional ``unknown_key`` warning) — while
-    enforce-mode raises ValidationError and rolls back.
+    an invalid value) run through the backend's write-boundary validator
+    (``_validate_metadata_on_write`` — the exact seam ``add_task``/
+    ``update_task`` call internally) in both modes: warn-mode does not raise
+    — exactly one ``task_metadata.schema_warning`` census line is emitted
+    (``done_provenance`` is a known field, so no additional ``unknown_key``
+    warning) — while enforce-mode raises ValidationError. Task 2201/C1 made
+    ``update_task`` reject ``metadata.done_provenance`` unconditionally
+    before validation would ever run, and made the privileged
+    ``stamp_audit_metadata`` seam (the sole sanctioned done_provenance
+    writer) a raw, trusted writer with no validation of its own — so the
+    warn-mode write-proceeds half of this contract is now demonstrated by
+    persisting through that seam directly, mirroring the pre-2201 behaviour
+    where a warn-mode ``update_task`` write landed the malformed blob.
     """
     malformed = {'done_provenance': {'kind': 'bogus'}}
 
-    # (a) Warn-mode: does not raise; write proceeds; exactly one census line.
+    # (a) Warn-mode: validator does not raise; exactly one census line; the
+    # write proceeds via the privileged seam.
     warn_backend = await make_backend(enforce=False)
     warn_root = str(tmp_path / 'warn')
     dto = await warn_backend.add_task(project_root=warn_root, title='t')
+    tid = int(dto['id'])
 
     with caplog.at_level(logging.WARNING, logger='fused_memory.backends.sqlite_task_backend'):
-        # Scope the census to exactly this write, not whatever the prior
-        # add_task calls in this test happened to (not) log.
+        # Scope the census to exactly this validation call, not whatever the
+        # prior add_task call in this test happened to (not) log.
         caplog.clear()
-        await warn_backend.update_task(
-            dto['id'], project_root=warn_root, metadata=json.dumps(malformed),
+        await warn_backend._validate_metadata_on_write(
+            json.dumps(malformed),
+            project_root=warn_root, tag='master', task_id=tid,
         )
 
     census = _schema_warning_messages(caplog)
     assert len(census) == 1, f'Expected exactly one census line; got {census}'
 
+    await warn_backend.stamp_audit_metadata(dto['id'], warn_root, malformed)
     task = await warn_backend.get_task(dto['id'], project_root=warn_root)
     assert task['metadata'] == malformed
 
-    # (b) Enforce-mode: raises; write rolled back.
+    # (b) Enforce-mode: validator raises; nothing is staged for the
+    # privileged seam to persist.
     enforce_backend = await make_backend(enforce=True)
     enforce_root = str(tmp_path / 'enforce')
     dto2 = await enforce_backend.add_task(project_root=enforce_root, title='t')
+    tid2 = int(dto2['id'])
 
     with pytest.raises(ValidationError):
-        await enforce_backend.update_task(
-            dto2['id'], project_root=enforce_root, metadata=json.dumps(malformed),
+        await enforce_backend._validate_metadata_on_write(
+            json.dumps(malformed),
+            project_root=enforce_root, tag='master', task_id=tid2,
         )
 
 
