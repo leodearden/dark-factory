@@ -444,6 +444,43 @@ class TestFormatSummaryTable:
 
 
 # ===========================================================================
+# Tests: check_scan_completeness (pure helper)
+# ===========================================================================
+
+class TestCheckScanCompleteness:
+    """check_scan_completeness(per_project_counts) -> list[str] flags every
+    project whose scanned cycle-summary count fell short of the ground-truth
+    count_by_metadata total -- i.e. the metadata-filtered scroll under-counted
+    and the scan cannot be trusted for a prune decision."""
+
+    def test_all_scanned_equals_expected_returns_empty(self):
+        per_project_counts = {'p1': (5, 5), 'p2': (0, 0)}
+        assert _mod.check_scan_completeness(per_project_counts) == []
+
+    def test_single_undercounting_project_flagged(self):
+        per_project_counts = {'p': (3, 8)}
+        assert _mod.check_scan_completeness(per_project_counts) == ['p']
+
+    def test_mixed_only_undercounting_ids_returned_sorted(self):
+        per_project_counts = {
+            'zeta': (2, 10),
+            'alpha': (5, 5),
+            'beta': (1, 4),
+        }
+        assert _mod.check_scan_completeness(per_project_counts) == ['beta', 'zeta']
+
+    def test_empty_input_returns_empty(self):
+        assert _mod.check_scan_completeness({}) == []
+
+    def test_scanned_greater_than_expected_not_flagged(self):
+        """Defensive: scanned > expected (e.g. a new cycle-summary landing
+        between the scroll and the count call) is not a truncation -- only a
+        strict undercount is flagged."""
+        per_project_counts = {'p': (9, 8)}
+        assert _mod.check_scan_completeness(per_project_counts) == []
+
+
+# ===========================================================================
 # Tests: apply_prune (async, live shell)
 # ===========================================================================
 
