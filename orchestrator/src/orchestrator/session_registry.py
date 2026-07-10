@@ -658,8 +658,19 @@ def _read_lease_holder_state(
     treat that as "held by an unknown holder" (fail toward held, not free)
     rather than raising; *holder_alive* is then False, so a corrupt body
     older than LEASE_HEARTBEAT_TTL is still stale-reapable.
+
+    If *path* itself vanishes before it can be stat'd (e.g. a concurrent
+    release/reap in the narrow window between our failed O_EXCL create and
+    this read), reports a synthetic age just past LEASE_HEARTBEAT_TTL
+    instead of raising -- mirrors the guarded stat() in reap_stale_leases,
+    and makes the caller's existing is_stale check reclaim it exactly as it
+    would a dead-and-expired holder rather than propagating an uncaught
+    FileNotFoundError.
     """
-    mtime = path.stat().st_mtime
+    try:
+        mtime = path.stat().st_mtime
+    except OSError:
+        return None, False, LEASE_HEARTBEAT_TTL.total_seconds() + 1.0
     age_secs = (now - datetime.fromtimestamp(mtime, tz=UTC)).total_seconds()
     try:
         holder = LeaseHolder.from_json(path.read_text())
@@ -703,6 +714,17 @@ def claim_lease(
 
     existing_holder, holder_alive, age_secs = _read_lease_holder_state(path, now=now)
     is_stale = (not holder_alive) and age_secs > LEASE_HEARTBEAT_TTL.total_seconds()
+
+    if is_stale:
+        # Re-verify staleness immediately before unlinking: a competitor
+        # could have reaped-and-reclaimed this same stale lease in the gap
+        # since the read above (their O_EXCL create winning the race). This
+        # narrows -- POSIX has no atomic compare-and-unlink, so it cannot
+        # fully eliminate -- that window: if the lease is no longer stale,
+        # it must NOT be unlinked, or we would clobber the competitor's
+        # brand-new, live lease and silently violate single-owner-per-role.
+        existing_holder, holder_alive, age_secs = _read_lease_holder_state(path, now=now)
+        is_stale = (not holder_alive) and age_secs > LEASE_HEARTBEAT_TTL.total_seconds()
 
     if is_stale:
         path.unlink(missing_ok=True)

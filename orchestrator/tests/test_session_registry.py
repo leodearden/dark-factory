@@ -912,6 +912,71 @@ def test_claim_lease_does_not_reap_a_dead_holder_within_ttl(tmp_path: Path) -> N
     assert sr.LeaseHolder.from_json(lease_path.read_text()) == stale_holder
 
 
+def test_claim_lease_survives_lease_vanishing_between_create_and_stat(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Simulates a concurrent release/reap landing in the narrow window
+    # between our failed O_EXCL create and _read_lease_holder_state's
+    # path.stat() -- this must reclaim the (now-free) lease rather than
+    # propagate an uncaught FileNotFoundError.
+    original = sr.LeaseHolder(session_slug='watcher-df-100', pid=os.getpid(), start_ts=_NOW.isoformat())
+    sr.claim_lease('watcher-df', holder=original, root=tmp_path, now=_NOW)
+    lease_path = sr.lease_path_for_name('watcher-df', root=tmp_path)
+
+    real_stat = Path.stat
+
+    def _vanished_stat(self: Path, *args: Any, **kwargs: Any) -> os.stat_result:
+        if self == lease_path:
+            raise FileNotFoundError('simulated concurrent release')
+        return real_stat(self, *args, **kwargs)
+
+    monkeypatch.setattr(Path, 'stat', _vanished_stat)
+
+    new_holder = sr.LeaseHolder(session_slug='watcher-df-new', pid=os.getpid(), start_ts=_NOW.isoformat())
+    claim = sr.claim_lease('watcher-df', holder=new_holder, root=tmp_path, now=_NOW)
+
+    assert claim.acquired is True
+    assert claim.decision == sr.LeaseDecision.ACQUIRED
+    assert claim.holder == new_holder
+
+
+def test_claim_lease_does_not_clobber_a_lease_reclaimed_between_stale_check_and_unlink(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Simulates a competitor's reap-and-reclaim landing in the gap between
+    # claim_lease's first staleness read and its re-verify read immediately
+    # before unlinking: the re-verify must see the competitor's fresh, live
+    # holder and skip the unlink rather than clobbering it.
+    stale_holder = sr.LeaseHolder(session_slug='watcher-df-dead', pid=_DEAD_PID, start_ts=_NOW.isoformat())
+    sr.claim_lease('watcher-df', holder=stale_holder, root=tmp_path, now=_NOW)
+    lease_path = sr.lease_path_for_name('watcher-df', root=tmp_path)
+    _set_mtime(lease_path, _NOW, sr.LEASE_HEARTBEAT_TTL + timedelta(minutes=1))
+
+    competitor_holder = sr.LeaseHolder(
+        session_slug='watcher-df-competitor', pid=os.getpid(), start_ts=_NOW.isoformat()
+    )
+    # First read (top of claim_lease) observes the true, stale state; the
+    # re-verify read (immediately before unlinking) reports that a
+    # competitor has already reaped-and-reclaimed it in the gap.
+    responses = iter(
+        [
+            (stale_holder, False, sr.LEASE_HEARTBEAT_TTL.total_seconds() + 60),
+            (competitor_holder, True, 1.0),
+        ]
+    )
+    monkeypatch.setattr(sr, '_read_lease_holder_state', lambda path, *, now: next(responses))
+
+    new_holder = sr.LeaseHolder(session_slug='watcher-df-new', pid=os.getpid(), start_ts=_NOW.isoformat())
+    claim = sr.claim_lease('watcher-df', holder=new_holder, root=tmp_path, now=_NOW)
+
+    assert claim.acquired is False
+    assert claim.holder == competitor_holder
+    # unlink() must never have been called: the on-disk body (still the
+    # pre-mock stale_holder written at setup) is untouched, proving the
+    # competitor's (simulated) fresh lease was not clobbered.
+    assert sr.LeaseHolder.from_json(lease_path.read_text()) == stale_holder
+
+
 # --- heartbeat_lease / release_lease --------------------------------------
 
 
