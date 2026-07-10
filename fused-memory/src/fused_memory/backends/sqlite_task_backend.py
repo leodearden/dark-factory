@@ -27,7 +27,12 @@ from shared.task_metadata import (
 )
 from shared.task_statuses import TaskStatus
 
-from fused_memory.backends.task_backend_errors import DuplicateCandidateKeyError, TaskmasterError
+from fused_memory.backends.task_backend_errors import (
+    DoneProvenanceWriteAuthorityError,
+    DuplicateCandidateKeyError,
+    StatusWriteAuthorityError,
+    TaskmasterError,
+)
 from fused_memory.backends.task_backend_types import (
     AddTaskResult,
     DependencyResult,
@@ -1484,19 +1489,31 @@ class SqliteTaskBackend:
         status: str | None = None,
         dependencies: list[str] | None = None,
     ) -> UpdateTaskResult:
-        # Backend floor mirroring the server/tools.py + interceptor ceiling
-        # (2026-05-08 forensics). set_task_status is the only sanctioned status
-        # writer — it enforces the terminal-exit, phantom-done, and
-        # done-provenance gates. Reject unconditionally, before ensure_connected()
-        # and the task SELECT, so status rejection takes precedence over any
-        # existence or connection error.
+        # Write-authority floors mirroring the server/tools.py + interceptor
+        # ceiling (2026-05-08 forensics). set_task_status is the only
+        # sanctioned writer for status AND metadata.done_provenance — it
+        # enforces the terminal-exit, phantom-done, and done-provenance
+        # gates. Both floors reject unconditionally, before ensure_connected()
+        # and the task SELECT, so a write-authority rejection takes
+        # precedence over any existence or connection error.
         if status is not None:
-            raise TaskmasterError(
-                'TASKMASTER_TOOL_ERROR',
-                'update_task is metadata-only and cannot write status. '
-                'Use set_task_status(status=…) instead — it enforces the '
-                'terminal-exit, phantom-done, and done-provenance gates.',
-            )
+            raise StatusWriteAuthorityError(task_id, status)
+        if metadata is not None:
+            # Mirror the interceptor's _reject_done_provenance_in_update_metadata:
+            # accept an already-parsed dict directly before falling back to
+            # json.loads. A caller that bypasses the documented ``str | None``
+            # signature and passes a dict would otherwise hit
+            # ``json.loads(dict)`` -> TypeError -> parsed_metadata=None,
+            # silently permitting a done_provenance write past this floor.
+            if isinstance(metadata, dict):
+                parsed_metadata: dict | None = metadata
+            else:
+                try:
+                    parsed_metadata = json.loads(metadata)
+                except (ValueError, TypeError):
+                    parsed_metadata = None
+            if isinstance(parsed_metadata, dict) and 'done_provenance' in parsed_metadata:
+                raise DoneProvenanceWriteAuthorityError(task_id)
         # Structured fields (title/description/details/priority/dependencies)
         # land deterministically — any non-None value overrides the current row.
         # ``prompt`` is kept for backward compatibility: when no explicit
@@ -1690,6 +1707,55 @@ class SqliteTaskBackend:
             'message': f'Task {task_id} updated',
             'updated': True,
             'updated_task': updated_task,
+        }
+
+    async def stamp_audit_metadata(
+        self,
+        task_id: str,
+        project_root: str,
+        fields: dict,
+        tag: str | None = None,
+    ) -> dict:
+        """Privileged, non-protocol writer of done_provenance/reopen_* audit fields.
+
+        Reachable only from :class:`TaskInterceptor` (PRD C-C) — ``update_task``
+        remains the sole PUBLIC metadata writer and unconditionally rejects
+        ``metadata.done_provenance`` (see the floor above). Performs a
+        read-modify-write merge under the same write-lock + txn pattern as
+        ``update_task``/``set_task_claimant``: last-write-wins on the supplied
+        keys, preserving every omitted sibling key (``memory_hints``, ``files``,
+        ``external_deps``, ...) via ``_merge_metadata(mode='merge')``.
+
+        Deliberately NOT declared on :class:`TaskBackendProtocol` — keeping it
+        off the 12-method contract prevents other callers from treating it as
+        sanctioned public surface.
+        """
+        await self.ensure_connected()
+        tag = tag or DEFAULT_TAG
+        tid = _parse_task_id(task_id)
+        async with self._write_lock(project_root), self._txn(project_root) as conn:
+            cursor = await conn.execute(
+                'SELECT metadata FROM tasks WHERE tag = ? AND id = ?',
+                (tag, tid),
+            )
+            row = await cursor.fetchone()
+            if row is None:
+                raise TaskmasterError(
+                    'TASKMASTER_TOOL_ERROR',
+                    f'No tasks found for ID(s): {task_id}',
+                )
+            new_metadata = _merge_metadata(
+                row['metadata'], json.dumps(fields),
+                mode='merge',
+                project_root=project_root, tag=tag, task_id=tid,
+            )
+            await conn.execute(
+                'UPDATE tasks SET metadata = ?, updated_at = ? WHERE tag = ? AND id = ?',
+                (new_metadata, _now(), tag, tid),
+            )
+        return {
+            'id': task_id,
+            'message': f'Stamped audit metadata for task {task_id}',
         }
 
     async def remove_tasks(

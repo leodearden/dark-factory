@@ -2284,9 +2284,9 @@ async def test_done_provenance_resolves_short_sha_and_persists(
     )
 
     assert 'error' not in result
-    taskmaster.update_task.assert_called_once()
-    kwargs = taskmaster.update_task.call_args.kwargs
-    persisted = json.loads(kwargs['metadata'])
+    taskmaster.stamp_audit_metadata.assert_called_once()
+    kwargs = taskmaster.stamp_audit_metadata.call_args.kwargs
+    persisted = kwargs['fields']
     assert persisted['done_provenance']['kind'] == 'merged'
     assert persisted['done_provenance']['commit'] == sha
     assert persisted['done_provenance']['commit_input'] == sha[:7]
@@ -2312,7 +2312,7 @@ async def test_done_provenance_commit_plus_note_both_persisted(
     )
 
     assert 'error' not in result
-    persisted = json.loads(taskmaster.update_task.call_args.kwargs['metadata'])
+    persisted = taskmaster.stamp_audit_metadata.call_args.kwargs['fields']
     assert persisted['done_provenance']['kind'] == 'merged'
     assert persisted['done_provenance']['commit'] == sha
     assert persisted['done_provenance']['note'] == 'ff-merged after review'
@@ -2613,8 +2613,8 @@ async def test_done_provenance_found_on_main_with_on_main_commit_passes(
     )
 
     assert 'error' not in result
-    taskmaster.update_task.assert_called_once()
-    persisted = json.loads(taskmaster.update_task.call_args.kwargs['metadata'])
+    taskmaster.stamp_audit_metadata.assert_called_once()
+    persisted = taskmaster.stamp_audit_metadata.call_args.kwargs['fields']
     dp = persisted['done_provenance']
     assert dp['kind'] == 'found_on_main'
     assert dp['commit'] == sha
@@ -2643,7 +2643,7 @@ async def test_done_provenance_found_on_main_short_sha_resolved(
     )
 
     assert 'error' not in result
-    persisted = json.loads(taskmaster.update_task.call_args.kwargs['metadata'])
+    persisted = taskmaster.stamp_audit_metadata.call_args.kwargs['fields']
     dp = persisted['done_provenance']
     assert dp['commit'] == sha  # resolved to full SHA
     assert dp['commit_input'] == sha[:7]  # original short ref preserved
@@ -2677,8 +2677,8 @@ async def test_done_provenance_accepts_deterministic_deploy_with_pid(
 
     assert 'error' not in result, f'expected acceptance but got: {result}'
     taskmaster.set_task_status.assert_called_once()
-    taskmaster.update_task.assert_called_once()
-    persisted = json.loads(taskmaster.update_task.call_args.kwargs['metadata'])['done_provenance']
+    taskmaster.stamp_audit_metadata.assert_called_once()
+    persisted = taskmaster.stamp_audit_metadata.call_args.kwargs['fields']['done_provenance']
     assert persisted['kind'] == 'deterministic-deploy'
     assert persisted['pid'] == 4242
     assert persisted['unit'] == 'orchestrator-reify.service'
@@ -2709,8 +2709,8 @@ async def test_done_provenance_accepts_deterministic_deploy_resume_shape(
 
     assert 'error' not in result, f'expected acceptance but got: {result}'
     taskmaster.set_task_status.assert_called_once()
-    taskmaster.update_task.assert_called_once()
-    persisted = json.loads(taskmaster.update_task.call_args.kwargs['metadata'])['done_provenance']
+    taskmaster.stamp_audit_metadata.assert_called_once()
+    persisted = taskmaster.stamp_audit_metadata.call_args.kwargs['fields']['done_provenance']
     assert persisted['kind'] == 'deterministic-deploy'
     assert persisted['note'] == 'resumed after human resolution'
     assert persisted['unit'] == 'orchestrator-reify.service'
@@ -2742,8 +2742,11 @@ async def test_done_provenance_accepts_deterministic_gate(
 
     assert 'error' not in result, f'expected acceptance but got: {result}'
     taskmaster.set_task_status.assert_called_once()
-    taskmaster.update_task.assert_called_once()
-    persisted = json.loads(taskmaster.update_task.call_args.kwargs['metadata'])['done_provenance']
+    # done_provenance is persisted through the privileged stamp_audit_metadata
+    # seam (task 2201 floor: update_task now rejects metadata.done_provenance).
+    taskmaster.update_task.assert_not_called()
+    taskmaster.stamp_audit_metadata.assert_called_once()
+    persisted = taskmaster.stamp_audit_metadata.call_args.kwargs['fields']['done_provenance']
     assert persisted['kind'] == 'deterministic-gate'
     assert persisted['note'] == 'pure gate resolved'
 
@@ -2779,8 +2782,8 @@ async def test_done_provenance_accepts_deterministic_deploy_scheduled(
 
     assert 'error' not in result, f'expected acceptance but got: {result}'
     taskmaster.set_task_status.assert_called_once()
-    taskmaster.update_task.assert_called_once()
-    persisted = json.loads(taskmaster.update_task.call_args.kwargs['metadata'])['done_provenance']
+    taskmaster.stamp_audit_metadata.assert_called_once()
+    persisted = taskmaster.stamp_audit_metadata.call_args.kwargs['fields']['done_provenance']
     assert persisted['kind'] == 'deterministic-deploy-scheduled'
     assert persisted['unit'] == 'orchestrator-dark-factory.service'
     assert persisted['transient_unit'] == 'orch-redeploy-restart-1.service'
@@ -2814,8 +2817,8 @@ async def test_done_provenance_accepts_deterministic_deploy_scheduled_resume_sha
 
     assert 'error' not in result, f'expected acceptance but got: {result}'
     taskmaster.set_task_status.assert_called_once()
-    taskmaster.update_task.assert_called_once()
-    persisted = json.loads(taskmaster.update_task.call_args.kwargs['metadata'])['done_provenance']
+    taskmaster.stamp_audit_metadata.assert_called_once()
+    persisted = taskmaster.stamp_audit_metadata.call_args.kwargs['fields']['done_provenance']
     assert persisted['kind'] == 'deterministic-deploy-scheduled'
     assert persisted['note'] == 'resumed after self-restart scheduled (crash before done write)'
     assert persisted['unit'] == 'orchestrator-dark-factory.service'
@@ -2859,12 +2862,15 @@ async def test_set_task_status_done_to_done_repairs_done_provenance(
         done_provenance={'kind': 'merged', 'commit': sha},
     )
 
-    # Repair persisted via update_task, with the sibling key preserved.
-    taskmaster.update_task.assert_called_once()
-    persisted = json.loads(taskmaster.update_task.call_args.kwargs['metadata'])
-    assert persisted['done_provenance']['kind'] == 'merged'
-    assert persisted['done_provenance']['commit'] == sha
-    assert persisted['files'] == ['x.py']
+    # Repair persisted via the privileged stamp_audit_metadata seam — NOT
+    # update_task, which the SqliteTaskBackend floor (task C1) now rejects for
+    # any metadata.done_provenance. The seam preserves sibling keys itself, so
+    # only the repaired field is passed.
+    taskmaster.update_task.assert_not_called()
+    taskmaster.stamp_audit_metadata.assert_called_once()
+    persisted = taskmaster.stamp_audit_metadata.call_args.kwargs['fields']['done_provenance']
+    assert persisted['kind'] == 'merged'
+    assert persisted['commit'] == sha
     # Result reports success and a repair marker.
     assert result.get('success') is True
     assert result.get('done_provenance_repaired') is True
@@ -2883,7 +2889,9 @@ async def test_set_task_status_done_to_done_repair_rejects_invalid_provenance(
 
     done_provenance missing the required 'kind' field must surface
     error == 'done_provenance_invalid' rather than being swallowed by the
-    same-status guard, and must not touch taskmaster.update_task.
+    same-status guard, and must not touch taskmaster.update_task or
+    taskmaster.stamp_audit_metadata — validation runs before either writer
+    is ever reached.
     """
     sha = _init_git_repo(tmp_path)
     taskmaster.get_task = AsyncMock(
@@ -2905,6 +2913,60 @@ async def test_set_task_status_done_to_done_repair_rejects_invalid_provenance(
 
     assert result.get('error') == 'done_provenance_invalid'
     taskmaster.update_task.assert_not_called()
+    taskmaster.stamp_audit_metadata.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_set_task_status_done_to_done_repair_persists_against_real_backend(
+    tmp_path, event_buffer,
+):
+    """End-to-end: the done->done legacy-blob repair survives the real
+    SqliteTaskBackend done_provenance floor (task C1).
+
+    A bare AsyncMock backend cannot enforce the floor added to
+    ``SqliteTaskBackend.update_task``, so the mock-based repair tests above
+    would stay green even if the repair helper still called ``update_task``
+    directly. This test wraps a real backend so the floor actually fires,
+    proving ``_repair_done_provenance_same_status`` persists through the
+    privileged ``stamp_audit_metadata`` seam and that sibling metadata keys
+    survive the seam's read-modify-write merge.
+    """
+    from fused_memory.backends.sqlite_task_backend import SqliteTaskBackend
+    from fused_memory.config.schema import TaskmasterConfig
+
+    sha = _init_git_repo(tmp_path)
+    backend = SqliteTaskBackend(TaskmasterConfig(project_root=str(tmp_path)))
+    await backend.start()
+    try:
+        await backend.add_task(
+            project_root=str(tmp_path),
+            title='T',
+            metadata=json.dumps({'files': ['x.py'], 'memory_hints': {'queries': ['q']}}),
+        )
+        # Legacy kind-less blob, written via the sanctioned seam.
+        await backend.stamp_audit_metadata(
+            '1', str(tmp_path), {'done_provenance': {'commit': sha}},
+        )
+        await backend.set_task_status('1', 'done', str(tmp_path))
+
+        interceptor = TaskInterceptor(backend, None, event_buffer)
+        result = await interceptor.set_task_status(
+            '1',
+            'done',
+            str(tmp_path),
+            done_provenance={'kind': 'merged', 'commit': sha},
+        )
+
+        assert 'error' not in result
+        assert result.get('success') is True
+        assert result.get('done_provenance_repaired') is True
+
+        md = (await backend.get_task('1', project_root=str(tmp_path)))['metadata']
+        assert md['done_provenance'] == {'kind': 'merged', 'commit': sha}
+        assert md['files'] == ['x.py']
+        assert md['memory_hints'] == {'queries': ['q']}
+    finally:
+        await backend.close()
 
 
 @pytest.mark.asyncio
@@ -4037,19 +4099,17 @@ async def test_terminal_exit_accepts_with_reopen_reason(
     )
     assert result.get('success') or 'error' not in result, result
     taskmaster.set_task_status.assert_called_once()
-    # update_task called with metadata containing reopen_reason.
-    assert taskmaster.update_task.called, 'reopen_reason must be persisted'
-    persisted_metadata = None
-    for call in taskmaster.update_task.call_args_list:
-        md = call.kwargs.get('metadata')
-        if md and 'reopen_reason' in md:
-            persisted_metadata = md
-            break
-    assert persisted_metadata is not None
-    parsed = json.loads(persisted_metadata)
-    assert parsed['reopen_reason'] == 'un-defer script'
-    assert parsed['reopen_from'] == 'done'
-    assert 'reopen_at' in parsed
+    # reopen_* audit fields are persisted through the privileged
+    # stamp_audit_metadata seam, NOT update_task: a task reopened out of a
+    # terminal status may carry a metadata.done_provenance stamped when it was
+    # marked done, and update_task now UNCONDITIONALLY rejects
+    # metadata.done_provenance (task 2201 backend floor).
+    taskmaster.update_task.assert_not_called()
+    assert taskmaster.stamp_audit_metadata.called, 'reopen_reason must be persisted'
+    persisted = taskmaster.stamp_audit_metadata.call_args.kwargs['fields']
+    assert persisted['reopen_reason'] == 'un-defer script'
+    assert persisted['reopen_from'] == 'done'
+    assert 'reopen_at' in persisted
 
 
 @pytest.mark.asyncio
@@ -6491,12 +6551,17 @@ async def test_set_task_status_with_reopen_reason_preserves_metadata(
     reconciler,
     event_buffer,
 ):
-    """Reopening a done task must NOT clobber existing metadata (files, memory_hints).
+    """Reopening a done task persists reopen_* via the privileged stamp seam.
 
-    Bug: the audit-metadata write at task_interceptor.py:681-694 used
-    update_task(metadata=json.dumps({reopen_reason, …}), append=False) — that
-    overwrites the entire metadata blob, dropping memory_hints and files.
-    Fix: read-modify-write so audit fields merge with existing metadata.
+    The reopen audit write is WRITE-AUTHORITY: a task reopened out of a
+    terminal status may carry a metadata.done_provenance stamped when it was
+    marked done, and update_task now UNCONDITIONALLY rejects
+    metadata.done_provenance (task C1 floor). The interceptor therefore routes
+    the reopen_* write through the privileged stamp_audit_metadata seam,
+    passing ONLY the reopen_* fields — preservation of sibling keys
+    (files / memory_hints / done_provenance / …) is the seam's own fresh-read
+    RMW merge, exercised end-to-end against a real backend in
+    test_set_task_status_reopen_from_done_preserves_provenance_real_backend.
     """
     taskmaster.get_task = AsyncMock(
         return_value={
@@ -6507,6 +6572,7 @@ async def test_set_task_status_with_reopen_reason_preserves_metadata(
                 'files': ['a.py', 'b.py'],
                 'memory_hints': {'queries': ['ctx']},
                 'spawned_from': '5',
+                'done_provenance': {'kind': 'merged', 'commit': 'abc123'},
             },
         }
     )
@@ -6520,16 +6586,16 @@ async def test_set_task_status_with_reopen_reason_preserves_metadata(
     )
 
     assert 'error' not in result
-    taskmaster.update_task.assert_called_once()
-    persisted = json.loads(taskmaster.update_task.call_args.kwargs['metadata'])
-    # Audit fields are written.
+    # Routed through the privileged seam, NOT update_task (the pre-merged
+    # `before` blob would carry done_provenance, which update_task rejects).
+    taskmaster.update_task.assert_not_called()
+    taskmaster.stamp_audit_metadata.assert_called_once()
+    persisted = taskmaster.stamp_audit_metadata.call_args.kwargs['fields']
+    # Only the reopen_* audit fields are passed to the seam.
     assert persisted['reopen_reason'] == 'manual reopen'
     assert persisted['reopen_from'] == 'done'
     assert 'reopen_at' in persisted
-    # Prior metadata is preserved.
-    assert persisted['files'] == ['a.py', 'b.py']
-    assert persisted['memory_hints'] == {'queries': ['ctx']}
-    assert persisted['spawned_from'] == '5'
+    assert 'done_provenance' not in persisted
 
 
 @pytest.mark.asyncio
@@ -6564,13 +6630,17 @@ async def test_set_task_status_done_with_provenance_preserves_metadata(
     )
 
     assert 'error' not in result
-    taskmaster.update_task.assert_called_once()
-    persisted = json.loads(taskmaster.update_task.call_args.kwargs['metadata'])
+    # done_provenance is persisted through the privileged stamp_audit_metadata
+    # seam (task C1 floor: update_task now rejects metadata.done_provenance).
+    # The interceptor passes ONLY the field being stamped — preservation of
+    # sibling keys (files / memory_hints / …) is the seam's own fresh-read RMW
+    # merge, exercised end-to-end in
+    # test_set_task_status_done_provenance_persists_against_real_backend.
+    taskmaster.update_task.assert_not_called()
+    taskmaster.stamp_audit_metadata.assert_called_once()
+    persisted = taskmaster.stamp_audit_metadata.call_args.kwargs['fields']
     assert persisted['done_provenance']['kind'] == 'merged'
     assert persisted['done_provenance']['commit'] == sha
-    # Prior metadata is preserved.
-    assert persisted['files'] == ['x.py']
-    assert persisted['memory_hints'] == {'queries': ['hint']}
 
 
 # ── task-1184: interceptor_write_succeeded helper contract ──

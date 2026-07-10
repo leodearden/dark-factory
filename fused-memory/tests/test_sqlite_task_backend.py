@@ -20,7 +20,14 @@ from fused_memory.backends.sqlite_task_backend import (
     _parse_task_id,
     _resolve_metadata_mode,
 )
-from fused_memory.backends.task_backend_errors import TaskmasterError
+from fused_memory.backends.task_backend_errors import (
+    DoneProvenanceWriteAuthorityError,
+    StatusWriteAuthorityError,
+    TaskmasterError,
+    done_provenance_via_update_task_error,
+    status_via_update_task_error,
+)
+from fused_memory.backends.task_backend_protocol import TaskBackendProtocol
 from fused_memory.config.schema import TaskmasterConfig
 from fused_memory.middleware.candidate_key import compute_candidate_key
 
@@ -727,16 +734,18 @@ async def test_add_task_accepts_infra_hold(backend, project_root):
 @pytest.mark.asyncio
 @pytest.mark.parametrize('status', ['done', 'pending', 'cancelled', 'in-progress', 'blocked', ''])
 async def test_update_task_rejects_non_none_status(backend, project_root, status):
-    """Backend floor: update_task must raise TaskmasterError for any non-None status.
+    """Backend floor: update_task must raise StatusWriteAuthorityError for any non-None status.
 
     (a) Seeded-task rejection — the write is blocked and the task stays 'pending'.
     (b) Empty-string '' pins is-not-None semantics over truthiness.
+    (c) The subclass IS-A TaskmasterError, so the code/message assertions stay valid.
     """
     await backend.add_task(project_root=project_root, title='x')
-    with pytest.raises(TaskmasterError) as exc:
+    with pytest.raises(StatusWriteAuthorityError) as exc:
         await backend.update_task('1', project_root=project_root, status=status)
     assert exc.value.code == 'TASKMASTER_TOOL_ERROR'
     assert 'set_task_status' in exc.value.message
+    assert exc.value.to_error_dict() == status_via_update_task_error('1', status)
     # Confirm the write was blocked — status must still be 'pending'
     task = await backend.get_task('1', project_root=project_root)
     assert task['status'] == 'pending'
@@ -745,10 +754,11 @@ async def test_update_task_rejects_non_none_status(backend, project_root, status
 @pytest.mark.asyncio
 async def test_update_task_status_rejection_precedes_existence_check(backend, project_root):
     """Status guard runs BEFORE the task SELECT, so rejection beats 'No tasks found'."""
-    with pytest.raises(TaskmasterError) as exc:
+    with pytest.raises(StatusWriteAuthorityError) as exc:
         await backend.update_task('999', project_root=project_root, status='done')
     assert exc.value.code == 'TASKMASTER_TOOL_ERROR'
     assert 'set_task_status' in exc.value.message
+    assert exc.value.to_error_dict() == status_via_update_task_error('999', 'done')
     assert 'No tasks found' not in exc.value.message
 
 
@@ -765,10 +775,88 @@ async def test_update_task_status_rejection_precedes_connection_error(tmp_path, 
     await closed_backend.start()
     await closed_backend.close()  # ensure_connected() now raises RuntimeError
 
-    with pytest.raises(TaskmasterError) as exc:
+    with pytest.raises(StatusWriteAuthorityError) as exc:
         await closed_backend.update_task('1', project_root=project_root, status='done')
     assert exc.value.code == 'TASKMASTER_TOOL_ERROR'
     assert 'set_task_status' in exc.value.message
+    assert exc.value.to_error_dict() == status_via_update_task_error('1', 'done')
+
+
+# ── update_task: done_provenance write-authority floor ─────────────
+
+
+@pytest.mark.asyncio
+async def test_update_task_rejects_done_provenance_in_metadata(backend, project_root):
+    """Backend floor: update_task must raise DoneProvenanceWriteAuthorityError
+    when metadata parses to a dict containing 'done_provenance', and the
+    write must be blocked entirely."""
+    await backend.add_task(project_root=project_root, title='x')
+    with pytest.raises(DoneProvenanceWriteAuthorityError) as exc:
+        await backend.update_task(
+            '1', project_root=project_root,
+            metadata=json.dumps({'done_provenance': {'kind': 'merged', 'commit': 'abc'}}),
+        )
+    assert exc.value.to_error_dict() == done_provenance_via_update_task_error('1')
+    task = await backend.get_task('1', project_root=project_root)
+    assert 'done_provenance' not in task['metadata']
+
+
+@pytest.mark.asyncio
+async def test_update_task_rejects_done_provenance_in_dict_metadata(backend, project_root):
+    """Defense-in-depth: a caller that bypasses the documented ``str | None``
+    signature and passes ``metadata`` as an already-parsed dict must still
+    trip the done_provenance floor. Mirrors the interceptor's
+    ``_reject_done_provenance_in_update_metadata``, which special-cases
+    ``isinstance(metadata, dict)`` before falling back to ``json.loads`` —
+    without that, ``json.loads(dict)`` raises ``TypeError``, is swallowed,
+    and the floor would silently permit the write."""
+    await backend.add_task(project_root=project_root, title='x')
+    with pytest.raises(DoneProvenanceWriteAuthorityError) as exc:
+        await backend.update_task(
+            '1', project_root=project_root,
+            metadata={'done_provenance': {'kind': 'merged', 'commit': 'abc'}},
+        )
+    assert exc.value.to_error_dict() == done_provenance_via_update_task_error('1')
+    task = await backend.get_task('1', project_root=project_root)
+    assert 'done_provenance' not in task['metadata']
+
+
+@pytest.mark.asyncio
+async def test_update_task_done_provenance_rejection_precedes_existence_check(backend, project_root):
+    """done_provenance guard runs BEFORE the task SELECT, so rejection beats 'No tasks found'."""
+    with pytest.raises(DoneProvenanceWriteAuthorityError) as exc:
+        await backend.update_task(
+            '999', project_root=project_root,
+            metadata=json.dumps({'done_provenance': {'kind': 'merged', 'commit': 'abc'}}),
+        )
+    assert exc.value.to_error_dict() == done_provenance_via_update_task_error('999')
+    assert 'No tasks found' not in exc.value.message
+
+
+@pytest.mark.asyncio
+async def test_update_task_allows_metadata_without_done_provenance(backend, project_root):
+    """Regression guard: metadata lacking the 'done_provenance' key merges normally."""
+    await backend.add_task(project_root=project_root, title='x')
+    await backend.update_task(
+        '1', project_root=project_root,
+        metadata=json.dumps({'files': ['src']}),
+    )
+    task = await backend.get_task('1', project_root=project_root)
+    assert task['metadata']['files'] == ['src']
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('bad_metadata', ['not json{', json.dumps(['a', 'list'])])
+async def test_update_task_done_provenance_floor_skips_unparseable_metadata(
+    backend, project_root, bad_metadata,
+):
+    """Parse-safety guard: unparseable or non-dict metadata does not trip the
+    done_provenance floor — mirrors the interceptor's
+    _reject_done_provenance_in_update_metadata, which returns None (no
+    reject) on a JSON error or non-dict payload."""
+    await backend.add_task(project_root=project_root, title='x')
+    # Must not raise DoneProvenanceWriteAuthorityError.
+    await backend.update_task('1', project_root=project_root, metadata=bad_metadata)
 
 
 @pytest.mark.asyncio
@@ -853,6 +941,83 @@ async def test_update_task_candidate_key_unchanged_when_neither_title_nor_metada
     after = await backend.get_task('1', project_root=project_root)
     assert after['candidate_key'] == before['candidate_key']
     assert after['candidate_key'] == compute_candidate_key('Fix parser', ['a.py'])
+
+
+# ── stamp_audit_metadata: privileged, non-protocol audit-field seam ─
+
+
+@pytest.mark.asyncio
+async def test_stamp_audit_metadata_persists_and_preserves_sibling_keys(backend, project_root):
+    """Direct call (NOT via set_task_status — the interceptor rewire is task C2)
+    persists done_provenance and leaves untouched sibling metadata keys intact —
+    the read-modify-write 'preserve omitted keys' contract."""
+    await backend.add_task(
+        project_root=project_root, title='x',
+        metadata=json.dumps({
+            'memory_hints': {'entities': ['A'], 'queries': ['q1']},
+            'files': ['src/a.py'],
+            'external_deps': ['dark_factory:42'],
+        }),
+    )
+    await backend.stamp_audit_metadata(
+        '1', project_root,
+        {'done_provenance': {'kind': 'merged', 'commit': 'abc123'}},
+    )
+    task = await backend.get_task('1', project_root=project_root)
+    assert task['metadata']['done_provenance'] == {'kind': 'merged', 'commit': 'abc123'}
+    assert task['metadata']['memory_hints'] == {'entities': ['A'], 'queries': ['q1']}
+    assert task['metadata']['files'] == ['src/a.py']
+    assert task['metadata']['external_deps'] == ['dark_factory:42']
+
+
+@pytest.mark.asyncio
+async def test_stamp_audit_metadata_second_stamp_merges_without_dropping_earlier(backend, project_root):
+    """A second stamp (e.g. reopen_* fields) merges in without erasing the
+    done_provenance a prior stamp wrote."""
+    await backend.add_task(project_root=project_root, title='x')
+    await backend.stamp_audit_metadata(
+        '1', project_root,
+        {'done_provenance': {'kind': 'merged', 'commit': 'abc123'}},
+    )
+    await backend.stamp_audit_metadata(
+        '1', project_root,
+        {
+            'reopen_reason': 'regression found',
+            'reopen_from': 'done',
+            'reopen_at': '2026-07-09T00:00:00+00:00',
+        },
+    )
+    task = await backend.get_task('1', project_root=project_root)
+    assert task['metadata']['done_provenance'] == {'kind': 'merged', 'commit': 'abc123'}
+    assert task['metadata']['reopen_reason'] == 'regression found'
+    assert task['metadata']['reopen_from'] == 'done'
+    assert task['metadata']['reopen_at'] == '2026-07-09T00:00:00+00:00'
+
+
+@pytest.mark.asyncio
+async def test_stamp_audit_metadata_missing_task_id_raises(backend, project_root):
+    """A missing task_id raises the same 'No tasks found for ID(s): …' shape
+    used by update_task/set_task_claimant."""
+    with pytest.raises(TaskmasterError) as exc:
+        await backend.stamp_audit_metadata(
+            '999', project_root,
+            {'done_provenance': {'kind': 'merged', 'commit': 'abc123'}},
+        )
+    assert exc.value.code == 'TASKMASTER_TOOL_ERROR'
+    assert 'No tasks found for ID(s): 999' in exc.value.message
+
+
+def test_stamp_audit_metadata_is_privileged_non_protocol_seam():
+    """API-surface contract: stamp_audit_metadata is a privileged seam on
+    SqliteTaskBackend that must NOT be declared on TaskBackendProtocol — only
+    TaskInterceptor may hold a reference to it (PRD C-C)."""
+    assert hasattr(SqliteTaskBackend, 'stamp_audit_metadata'), (
+        'SqliteTaskBackend.stamp_audit_metadata must exist.'
+    )
+    assert not hasattr(TaskBackendProtocol, 'stamp_audit_metadata'), (
+        'stamp_audit_metadata must NOT be part of TaskBackendProtocol — '
+        'it is a privileged seam reachable only from TaskInterceptor.'
+    )
 
 
 # ── _merge_metadata: new additive-merge semantics ─────────────────
@@ -3057,6 +3222,64 @@ async def test_update_task_refuses_to_clobber_corrupt_metadata(
 
 
 @pytest.mark.asyncio
+async def test_stamp_audit_metadata_refuses_to_clobber_corrupt_metadata(
+    backend, project_root, caplog,
+):
+    """stamp_audit_metadata is the sole done_provenance writer gating the
+    done-flow — its corrupt-existing-blob contract must match update_task's:
+    it reuses _merge_metadata(mode='merge'), which raises TaskmasterError
+    and refuses to overwrite a corrupt existing blob rather than silently
+    succeeding or best-effort stamping the audit fields. Exactly one deduped
+    malformed-metadata WARNING is emitted and the blob survives byte-for-byte.
+
+    Setup deliberately avoids a read-path access before the write so the
+    dedup slot is not pre-consumed by _row_to_task.
+    """
+    await backend.add_task(project_root=project_root, title='t')
+
+    # Directly inject a corrupt blob WITHOUT reading the row first.
+    conn = await backend._get_connection(project_root)
+    await conn.execute(
+        'UPDATE tasks SET metadata = ? WHERE id = 1', (_CORRUPT_BLOB,),
+    )
+    await conn.commit()
+
+    with caplog.at_level(
+        logging.WARNING, logger='fused_memory.backends.sqlite_task_backend',
+    ), pytest.raises(TaskmasterError) as exc:
+        await backend.stamp_audit_metadata(
+            '1', project_root,
+            {'done_provenance': {'kind': 'merged', 'commit': 'abc123'}},
+        )
+    assert exc.value.code == 'TASKMASTER_TOOL_ERROR'
+    assert 'corrupt metadata blob' in exc.value.message
+
+    # Exactly one deduped malformed-metadata WARNING must have been emitted.
+    warn_records = [
+        r for r in caplog.records
+        if r.levelno >= logging.WARNING and 'malformed metadata' in r.message
+    ]
+    assert len(warn_records) == 1, (
+        f'Expected exactly one malformed-metadata WARNING; got {len(warn_records)}: '
+        f'{[r.message for r in warn_records]}'
+    )
+
+    # The original corrupt blob must be byte-for-byte unchanged — the audit
+    # stamp did NOT silently succeed nor clobber the row.
+    raw_conn = await backend._get_connection(project_root)
+    cursor = await raw_conn.execute(
+        'SELECT metadata FROM tasks WHERE id = 1',
+    )
+    row = await cursor.fetchone()
+    assert row['metadata'] == _CORRUPT_BLOB, (
+        f'Expected metadata unchanged (corrupt blob preserved); got: {row["metadata"]!r}'
+    )
+    assert 'dark_factory:42' in row['metadata'], (
+        f'Expected external_deps substring in preserved metadata; got: {row["metadata"]!r}'
+    )
+
+
+@pytest.mark.asyncio
 async def test_add_dependency_qualified_refuses_corrupt_metadata(
     backend, project_root, caplog,
 ):
@@ -3611,8 +3834,16 @@ async def test_update_task_tolerates_untouched_invalid_done_provenance(tmp_path,
     proves the write-boundary gate only blocks writes that are themselves
     responsible for the invalid field (or a whole-blob invariant); an
     untouched legacy ``done_provenance`` is tolerated and preserved as-is,
-    while a patch that touches ``done_provenance`` with a still-invalid value
-    is still rejected.
+    while a patch that itself TOUCHES ``done_provenance`` is still rejected.
+
+    Note (task 2201): update_task now carries an UNCONDITIONAL
+    write-authority floor that rejects any incoming metadata containing a
+    ``done_provenance`` key with :class:`DoneProvenanceWriteAuthorityError`,
+    raised BEFORE schema validation. So a patch that touches
+    ``done_provenance`` — valid or invalid — is rejected by the stricter
+    write-authority floor rather than the schema ``ValidationError``. The
+    untouched-legacy tolerance in (a) is unaffected: the floor inspects only
+    the incoming patch, not the post-merge blob.
     """
     cfg = TaskmasterConfig(project_root=str(tmp_path))
     backend = SqliteTaskBackend(cfg, task_metadata_enforce=True)
@@ -3642,9 +3873,12 @@ async def test_update_task_tolerates_untouched_invalid_done_provenance(tmp_path,
             f'got: {task["metadata"].get("done_provenance")!r}'
         )
 
-        # (b) Guard rail: a patch that itself TOUCHES done_provenance with a
-        # still-invalid value (missing 'kind') is still rejected.
-        with pytest.raises(ValidationError):
+        # (b) Guard rail: a patch that itself TOUCHES done_provenance is
+        # rejected. Under task 2201's unconditional write-authority floor this
+        # is a DoneProvenanceWriteAuthorityError raised before schema
+        # validation ever runs (previously a ValidationError on the invalid
+        # blob).
+        with pytest.raises(DoneProvenanceWriteAuthorityError):
             await backend.update_task(
                 dto['id'], project_root=project_root,
                 metadata=json.dumps({'done_provenance': {'commit': 'x'}}),

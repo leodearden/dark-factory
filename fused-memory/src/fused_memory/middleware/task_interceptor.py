@@ -843,7 +843,6 @@ class TaskInterceptor:
                         done_provenance,
                         project_root,
                         tag,
-                        before,
                     )
                 return {'success': True, 'no_op': True, 'task_id': task_id}
 
@@ -907,21 +906,26 @@ class TaskInterceptor:
                     return _terminal_exit_error(task_id, old_status, status)
                 resolved_reopen_reason = reason
                 try:
-                    # Read-modify-write so the audit fields don't clobber the
-                    # row's pre-existing metadata (memory_hints, files, …).
-                    # `before` was fetched at the top of this method.
-                    merged_meta = _merged_audit_metadata(
-                        before,
-                        {
+                    # reopen_* are WRITE-AUTHORITY audit fields. Persist through
+                    # the privileged, non-protocol stamp_audit_metadata seam
+                    # rather than update_task: when a task is reopened out of a
+                    # TERMINAL_STATUS it may carry a metadata.done_provenance
+                    # stamped when it was marked done, and update_task now
+                    # UNCONDITIONALLY rejects any metadata.done_provenance
+                    # (SqliteTaskBackend floor, task C1) — a pre-merged blob
+                    # keyed off `before` would be rejected and the reopen audit
+                    # trail silently dropped. The seam does its own fresh-read
+                    # read-modify-write merge under the write-lock, preserving
+                    # every sibling key (memory_hints / files / external_deps /
+                    # done_provenance), so we pass only the reopen_* fields.
+                    await tm.stamp_audit_metadata(  # type: ignore[attr-defined]
+                        task_id=task_id,
+                        project_root=project_root,
+                        fields={
                             'reopen_reason': reason,
                             'reopen_from': old_status,
                             'reopen_at': datetime.now(UTC).isoformat(),
                         },
-                    )
-                    await tm.update_task(
-                        task_id=task_id,
-                        metadata=json.dumps(merged_meta),
-                        project_root=project_root,
                         tag=tag,
                     )
                 except Exception as e:
@@ -975,16 +979,21 @@ class TaskInterceptor:
 
                 if resolved_provenance is not None:
                     try:
-                        # Read-modify-write: preserve memory_hints / files /
-                        # spawned_from instead of replacing the whole blob.
-                        merged_meta = _merged_audit_metadata(
-                            before,
-                            {'done_provenance': resolved_provenance},
-                        )
-                        await tm.update_task(
+                        # done_provenance is a WRITE-AUTHORITY field: update_task
+                        # now UNCONDITIONALLY rejects metadata.done_provenance
+                        # (SqliteTaskBackend floor, task C1). Persist through the
+                        # privileged, non-protocol stamp_audit_metadata seam —
+                        # the sole sanctioned done_provenance writer. The seam
+                        # does its own fresh-read read-modify-write merge under
+                        # the write-lock, preserving every sibling key
+                        # (memory_hints / files / external_deps / reopen_*), so
+                        # we pass only the field being stamped rather than a
+                        # pre-merged blob keyed off the (possibly stale)
+                        # ``before`` snapshot.
+                        await tm.stamp_audit_metadata(  # type: ignore[attr-defined]
                             task_id=task_id,
-                            metadata=json.dumps(merged_meta),
                             project_root=project_root,
+                            fields={'done_provenance': resolved_provenance},
                             tag=tag,
                         )
                     except Exception as e:
@@ -4373,7 +4382,6 @@ async def _repair_done_provenance_same_status(
     done_provenance: dict,
     project_root: str,
     tag: str | None,
-    before: dict,
 ) -> dict:
     """Sanctioned done->done repair path for a legacy ``done_provenance`` blob.
 
@@ -4386,9 +4394,11 @@ async def _repair_done_provenance_same_status(
     exactly like a fresh done transition
     (:func:`_validate_done_provenance`, ``require=False`` — a same-status
     repair must never itself demand provenance) and, on success, persist the
-    correction via the same read-modify-write ``update_task`` call used by
-    the normal persist (:func:`_merged_audit_metadata` preserves sibling
-    keys), still inside the caller's write lock.
+    correction through the privileged, non-protocol ``stamp_audit_metadata``
+    seam (the sole sanctioned ``done_provenance`` writer, since ``update_task``
+    now unconditionally rejects ``metadata.done_provenance`` — SqliteTaskBackend
+    floor, task C1), still inside the caller's write lock. The seam's own
+    fresh-read read-modify-write merge preserves sibling keys.
 
     No status write, no event, no reconciliation — the status is unchanged,
     so those side effects do not apply; this is a pure metadata correction.
@@ -4409,11 +4419,19 @@ async def _repair_done_provenance_same_status(
     if resolved is None:
         return {'success': True, 'no_op': True, 'task_id': task_id}
 
-    merged_meta = _merged_audit_metadata(before, {'done_provenance': resolved})
-    await tm.update_task(
+    # done_provenance is a WRITE-AUTHORITY field: update_task now
+    # UNCONDITIONALLY rejects metadata.done_provenance (SqliteTaskBackend
+    # floor, task C1), so this legacy done->done repair must persist through
+    # the privileged, non-protocol stamp_audit_metadata seam — the sole
+    # sanctioned done_provenance writer. The seam does its own fresh-read
+    # read-modify-write merge under the write-lock, preserving every sibling
+    # key (memory_hints / files / external_deps / reopen_*), so we pass only
+    # the field being repaired rather than a pre-merged blob keyed off the
+    # (possibly stale) ``before`` snapshot.
+    await tm.stamp_audit_metadata(  # type: ignore[attr-defined]
         task_id=task_id,
-        metadata=json.dumps(merged_meta),
         project_root=project_root,
+        fields={'done_provenance': resolved},
         tag=tag,
     )
     return {
