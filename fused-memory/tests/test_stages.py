@@ -8845,6 +8845,130 @@ class TestPostFlightGuardsNoForensicReclassification:
 
 
 # ---------------------------------------------------------------------------
+# Task 2230 (W5-mu) step-3 — _apply_post_flight_guards must not clamp Stage 2's
+# self-reported flag-processing counters against ground truth; that
+# reconciliation now happens via derive_stage_stats + stats_verifier
+# (task 2229), not here.
+# ---------------------------------------------------------------------------
+
+
+class TestPostFlightGuardsNoFlagCounterClamp:
+    """_apply_post_flight_guards no longer clamps the two stage1 flag counters.
+
+    (a)/(b) mirror the TestFlagCounterCompleteness / TestMem0FlagCounterCompleteness
+    mismatch-clamp integration tests, but assert the guard did NOT clamp — the
+    agent-reported value survives untouched even when it disagrees with the
+    ground-truth count.
+
+    (c) is a companion assertion, green both before and after step-4: the
+    surviving normalize setdefault remainder must still guarantee both
+    counters are present (defaulting to 0) when the agent reports neither.
+    """
+
+    @pytest.mark.asyncio
+    async def test_analytical_counter_not_clamped_to_prior_report_truth(
+        self, stage2_guard_mock_deps
+    ):
+        """stage1_analytical_findings_processed=1 (agent) survives even though
+        prior_reports[0] (Stage 1) flagged 4 items (ground truth)."""
+        stage = TaskKnowledgeSync(StageId.task_knowledge_sync, **stage2_guard_mock_deps)
+        stage.scope = _scope('dark_factory', stage.scope.project_root)
+        stage.scope = _scope(stage.scope.project_id, '/project')
+
+        _now = datetime.now(tz=UTC)
+        stage1_prior = StageReport(
+            stage=StageId.memory_consolidator,
+            started_at=_now,
+            completed_at=_now,
+            items_flagged=[{'id': str(i)} for i in range(4)],
+        )
+
+        with (
+            patch.object(stage, 'assemble_payload', new=AsyncMock(return_value='payload')),
+            patch(
+                'fused_memory.reconciliation.stages.base.run_stage_via_cli',
+                new=AsyncMock(return_value=_make_stage2_guard_cli_result(
+                    [], stats={'stage1_analytical_findings_processed': 1},
+                )),
+            ),
+        ):
+            report = await stage.run(
+                events=[],
+                watermark=Watermark(project_id='dark_factory'),
+                prior_reports=[stage1_prior],
+                run_id='test-run-no-clamp-1',
+            )
+
+        assert report.stats.get('stage1_analytical_findings_processed') == 1
+
+    @pytest.mark.asyncio
+    async def test_mem0_counter_not_clamped_to_flag_deleted_records_truth(
+        self, stage2_guard_mock_deps
+    ):
+        """stage1_mem0_flags_processed=5 (agent) survives even though only 2
+        flag_deleted records were emitted (ground truth)."""
+        stage = TaskKnowledgeSync(StageId.task_knowledge_sync, **stage2_guard_mock_deps)
+        stage.scope = _scope('dark_factory', stage.scope.project_root)
+        stage.scope = _scope(stage.scope.project_id, '/project')
+
+        flag_records = [
+            {'action': 'flag_deleted', 'flag_id': f'flag-{i}', 'reason': 'processed'}
+            for i in range(2)
+        ]
+
+        with (
+            patch.object(stage, 'assemble_payload', new=AsyncMock(return_value='payload')),
+            patch(
+                'fused_memory.reconciliation.stages.base.run_stage_via_cli',
+                new=AsyncMock(return_value=_make_stage2_guard_cli_result(
+                    [], stats={
+                        'stage1_mem0_flags_processed': 5,
+                        'flag_deleted_records': flag_records,
+                    },
+                )),
+            ),
+        ):
+            report = await stage.run(
+                events=[],
+                watermark=Watermark(project_id='dark_factory'),
+                prior_reports=[],
+                run_id='test-run-no-clamp-2',
+            )
+
+        assert report.stats.get('stage1_mem0_flags_processed') == 5
+
+    @pytest.mark.asyncio
+    async def test_both_counters_still_normalized_to_zero_when_absent(
+        self, stage2_guard_mock_deps
+    ):
+        """Companion: the surviving normalize setdefault remainder still
+        guarantees both stage1 counters are present (defaulting to 0) when
+        the agent reports neither. Green both before and after step-4."""
+        stage = TaskKnowledgeSync(StageId.task_knowledge_sync, **stage2_guard_mock_deps)
+        stage.scope = _scope('dark_factory', stage.scope.project_root)
+        stage.scope = _scope(stage.scope.project_id, '/project')
+
+        with (
+            patch.object(stage, 'assemble_payload', new=AsyncMock(return_value='payload')),
+            patch(
+                'fused_memory.reconciliation.stages.base.run_stage_via_cli',
+                new=AsyncMock(return_value=_make_stage2_guard_cli_result(
+                    [], stats={},
+                )),
+            ),
+        ):
+            report = await stage.run(
+                events=[],
+                watermark=Watermark(project_id='dark_factory'),
+                prior_reports=[],
+                run_id='test-run-no-clamp-3',
+            )
+
+        assert report.stats.get('stage1_analytical_findings_processed') == 0
+        assert report.stats.get('stage1_mem0_flags_processed') == 0
+
+
+# ---------------------------------------------------------------------------
 # Task 1201 — BaseStage._escalation_queue attribute + harness wiring
 # ---------------------------------------------------------------------------
 
