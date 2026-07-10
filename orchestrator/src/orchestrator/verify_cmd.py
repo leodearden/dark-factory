@@ -21,7 +21,7 @@ from __future__ import annotations
 
 import shlex
 from collections.abc import Mapping
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from enum import StrEnum
 
 
@@ -270,3 +270,21 @@ def render(cmd: VerifyCmd) -> str:
     segments.extend(shlex.quote(flag) for flag in cmd.base_flags)
     segments.extend(shlex.quote(target) for target in cmd.targets)
     return ' '.join(segments)
+
+
+def scope_to(cmd: VerifyCmd, files: list[str]) -> VerifyCmd:
+    """Return *cmd* with ``targets`` replaced by *files* (worktree-root-relative).
+
+    ``tool``/``base_flags``/``uv_project``/``cwd_rel``/``wrappers`` are left
+    untouched — only ``targets`` is replaced, so dash-prefixed flags parsed
+    into ``base_flags`` never leak into (or out of) the new target list
+    (migrates the historical ``_scope_command`` dash-token regression).
+
+    A no-op (returns *cmd* unchanged) when *files* is empty, when
+    ``cmd.tool is ToolKind.OPAQUE`` (P1), or when ``cmd.raw is not None`` (a
+    recognised-but-unstructurable chain — ``targets`` has no meaning there;
+    ``cargo_scope``/``serial_pytest`` rewrite ``raw`` directly instead).
+    """
+    if cmd.tool is ToolKind.OPAQUE or cmd.raw is not None or not files:
+        return cmd
+    return replace(cmd, targets=tuple(files))
