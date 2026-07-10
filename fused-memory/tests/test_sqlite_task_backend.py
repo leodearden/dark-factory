@@ -3246,12 +3246,11 @@ async def test_stamp_audit_metadata_refuses_to_clobber_corrupt_metadata(
 
     with caplog.at_level(
         logging.WARNING, logger='fused_memory.backends.sqlite_task_backend',
-    ):
-        with pytest.raises(TaskmasterError) as exc:
-            await backend.stamp_audit_metadata(
-                '1', project_root,
-                {'done_provenance': {'kind': 'merged', 'commit': 'abc123'}},
-            )
+    ), pytest.raises(TaskmasterError) as exc:
+        await backend.stamp_audit_metadata(
+            '1', project_root,
+            {'done_provenance': {'kind': 'merged', 'commit': 'abc123'}},
+        )
     assert exc.value.code == 'TASKMASTER_TOOL_ERROR'
     assert 'corrupt metadata blob' in exc.value.message
 
