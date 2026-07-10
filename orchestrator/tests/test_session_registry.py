@@ -1616,3 +1616,46 @@ def test_main_lease_claim_is_fail_open_never_stand_down_on_a_fault(
     out = capsys.readouterr().out
     assert out.splitlines()[0] == 'decision=proceed'
     assert any(r.levelno >= logging.ERROR for r in caplog.records)
+
+
+# ---------------------------------------------------------------------------
+# CLI write-decision verb (Fleet Cockpit C8: park-to-registry for watchers)
+# ---------------------------------------------------------------------------
+
+
+def test_main_write_decision_files_open_record(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    monkeypatch.setenv('CLAUDE_FLEET_ROOT', str(tmp_path))
+
+    rc = sr.main(
+        [
+            'write-decision',
+            '--id',
+            'dec-park-1',
+            '--project',
+            'df',
+            '--text',
+            'Approve risky merge?',
+            '--task-id',
+            '2085',
+            '--escalation-id',
+            'esc-1',
+            '--session-id',
+            'watcher-df-99',
+        ]
+    )
+
+    assert rc == 0
+    listed = sr.list_decisions(root=tmp_path)
+    assert len(listed) == 1
+    rec = listed[0]
+    assert rec.id == 'dec-park-1'
+    assert rec.project == 'df'
+    assert rec.text == 'Approve risky merge?'
+    assert rec.task_id == '2085'
+    assert rec.escalation_id == 'esc-1'
+    assert rec.session_id == 'watcher-df-99'
+    assert rec.state == sr.DecisionState.OPEN
+    assert rec.filed_at != ''
