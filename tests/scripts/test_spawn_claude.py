@@ -1373,3 +1373,159 @@ def test_spawn_id_exports_fail_soft_when_registry_faults(tmp_path: pathlib.Path)
     captured = _parse_captured_env(capture_file)
     assert captured.get("SESSION") == "", f"expected a clean no-op export, got {captured!r}"
     assert captured.get("PARENT") == "", f"expected a clean no-op export, got {captured!r}"
+
+
+# ===========================================================================
+# task-2297 (Fleet Cockpit C6): tmux lane for long-runner watcher sessions
+# ===========================================================================
+# CLAUDE_SPAWN_BACKEND=tmux opts into a crash-survivable, reattachable tmux
+# window instead of any terminal emulator -- bypassing emulator discovery
+# entirely so no display/emulator is needed at all. `tmux new-window`/
+# `new-session` return immediately while the tmux server owns the payload --
+# exactly the DETACHED semantics the konsole/custom-launcher branches already
+# get via resolve_detached -- so the window (and its registry record)
+# outlives spawn-claude.sh itself, which is what makes the lane reattachable.
+
+
+def _write_fake_tmux(
+    bin_dir: pathlib.Path, marker: pathlib.Path, target: str = "fleet-proj:0"
+) -> None:
+    """Write a fake ``tmux`` binary (Fleet Cockpit C6 tmux lane).
+
+    ``has-session`` always reports absent (exit 1), forcing spawn-claude.sh's
+    tmux-lane branch down the ``new-session`` path (never ``new-window``) --
+    these tests don't care which of the two creates the window, only that
+    ONE of them does. ``new-session``/``new-window`` touch *marker* (proves
+    the tmux lane -- not an emulator -- ran), locate ``bash`` in argv
+    (mirrors ``_DETACHING_TERM_TEMPLATE``), run the payload detached via
+    ``setsid env --default-signal=HUP,TERM`` (the same signal-disposition
+    reset a real terminal gives its child shell), print a synthetic
+    ``"<session>:<window>"`` *target* (mirrors tmux's own ``-P -F`` output),
+    and exit 0 -- so the command substitution ``$(tmux ...)`` in
+    spawn-claude.sh returns almost immediately while the payload keeps
+    running in the background, matching a real `tmux new-window` call.
+    """
+    script = textwrap.dedent(f"""\
+        #!/usr/bin/env bash
+        case "$1" in
+          has-session)
+            exit 1
+            ;;
+          new-session|new-window)
+            touch {marker!s}
+            while [[ $# -gt 0 ]]; do
+              if [[ "$1" == "bash" ]]; then
+                break
+              fi
+              shift
+            done
+            setsid env --default-signal=HUP,TERM "$@" >/dev/null 2>&1 &
+            echo "{target}"
+            exit 0
+            ;;
+          *)
+            exit 1
+            ;;
+        esac
+    """)
+    p = bin_dir / "tmux"
+    p.write_text(script)
+    p.chmod(0o755)
+
+
+def _write_marker_only_failing_terminal(
+    bin_dir: pathlib.Path, name: str, marker: pathlib.Path
+) -> None:
+    """Write a fake foreground emulator that touches *marker* then exits 1
+    WITHOUT running the payload (no sentinel is ever written).
+
+    Used to prove the tmux lane bypasses emulator discovery entirely --
+    CLAUDE_TERMINAL_CMD is set to *name* alongside CLAUDE_SPAWN_BACKEND=tmux,
+    so if the tmux branch ever fell through to emulator discovery this
+    binary would run and leave *marker* behind.
+    """
+    p = bin_dir / name
+    p.write_text(f"#!/usr/bin/env bash\ntouch {marker!s}\nexit 1\n")
+    p.chmod(0o755)
+
+
+def _write_fake_claude_writing_result_with_exit_code(
+    bin_dir: pathlib.Path, exit_code: int
+) -> None:
+    """Like ``_write_fake_claude_writing_result``, but exits *exit_code*
+    instead of the hardcoded 0 -- lets a test lock the tmux lane's exit-code
+    contract (the session's own code) and its result-handback delivery
+    together in one spawn.
+    """
+    p = bin_dir / "claude"
+    p.write_text(
+        "#!/usr/bin/env bash\n"
+        "cat > \"${CLAUDE_SPAWN_RESULT_FILE:-/dev/null}\" <<'EOF'\n"
+        "---\n"
+        "outcome: done\n"
+        "changed: none\n"
+        "action_needed: none\n"
+        "---\n"
+        "Test prose.\n"
+        "EOF\n"
+        f"exit {exit_code}\n"
+    )
+    p.chmod(0o755)
+
+
+@pytest.mark.parametrize("exit_code", [0, 3])
+def test_tmux_backend_routes_and_runs_session(
+    tmp_path: pathlib.Path, exit_code: int,
+) -> None:
+    """CLAUDE_SPAWN_BACKEND=tmux must route to the tmux lane -- bypassing
+    the configured emulator entirely -- and still deliver the full
+    exit-code + session-record + result-handback contract.
+
+    RED today: without a tmux branch, CLAUDE_SPAWN_BACKEND is silently
+    ignored and ordinary emulator discovery picks CLAUDE_TERMINAL_CMD=xterm.
+    The fake xterm below touches emulator_used and exits 1 WITHOUT running
+    the payload (no sentinel is ever written), so resolve_foreground's
+    genuine-launcher-failure path fires -> exit 127, not exit_code; no
+    EXITED record is ever written. GREEN after step-4.
+    """
+    bin_dir = _make_bin_dir(tmp_path)
+    _write_fake_claude_writing_result_with_exit_code(bin_dir, exit_code)
+
+    tmux_marker = tmp_path / "tmux_used"
+    emulator_marker = tmp_path / "emulator_used"
+    _write_fake_tmux(bin_dir, tmux_marker)
+    _write_marker_only_failing_terminal(bin_dir, "xterm", emulator_marker)
+
+    env = _base_env(bin_dir, "xterm")
+    env["CLAUDE_SPAWN_BACKEND"] = "tmux"
+    env["CLAUDE_SPAWN_PROJECT"] = "proj"
+
+    result = _run_spawn(env, tmp_path)
+
+    assert result.returncode == exit_code, (
+        f"expected the session's own exit code {exit_code} via the tmux "
+        f"lane, got {result.returncode}\nstderr: {result.stderr.decode()}"
+    )
+    assert not emulator_marker.exists(), (
+        "CLAUDE_SPAWN_BACKEND=tmux must bypass emulator discovery entirely "
+        "-- the configured CLAUDE_TERMINAL_CMD=xterm must never run"
+    )
+    assert tmux_marker.exists(), (
+        "expected the tmux lane (new-session/new-window) to have run"
+    )
+
+    fleet_root = pathlib.Path(env["CLAUDE_FLEET_ROOT"])
+    record_path = _find_one_record(fleet_root)
+    assert record_path.exists(), "the session record must persist after exit"
+    record = session_registry.SessionRecord.from_json(record_path.read_text())
+    assert record.status == session_registry.Status.EXITED, (
+        f"expected registry status exited, got {record.status}"
+    )
+    assert record.exit_code == exit_code
+
+    assert record.result_file is not None
+    result_file = pathlib.Path(record.result_file)
+    assert result_file.is_file(), (
+        f"expected a result.md written to {result_file} by the session"
+    )
+    assert "outcome:" in result_file.read_text()
