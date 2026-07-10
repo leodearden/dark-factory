@@ -106,8 +106,9 @@ from pathlib import Path
 from typing import Any
 
 from fused_memory.maintenance.cross_graph_move import (
-    merge_foreign_duplicate,
-    move_entity_across_graphs,
+    create_moved_node,
+    delete_source_node,
+    recreate_subgraph_relationships,
 )
 
 logger = logging.getLogger('migrate_cross_graph_leak')
@@ -582,7 +583,16 @@ async def run(args: Any, memory_service: Any) -> dict:
 
     manifest = load_reviewed_manifest(args.manifest)
 
+    # Partition manifest['nodes'] by disposition, preserving every existing
+    # guard from the old single-pass loop (malformed record, MOVE/MERGE
+    # source==target refusal, EPISODIC_SKIP, UNRESOLVED) -- each guard
+    # decides the SAME way it always did. Only MOVE/MERGE nodes that clear
+    # every guard are deferred into move_specs/merge_specs for the
+    # three-phase barrier below, instead of being dispatched immediately.
     apply_results: list[dict] = []
+    move_specs: list[dict] = []
+    merge_specs: list[dict] = []
+
     for node in manifest['nodes']:
         missing_keys = missing_required_node_keys(node)
         if missing_keys:
@@ -590,7 +600,7 @@ async def run(args: Any, memory_service: Any) -> dict:
             # field blocks THIS node only -- indexing node['uuid'] etc.
             # below unguarded would raise a bare KeyError that escapes run()
             # entirely, aborting every node after it (including ones
-            # already mutated by an earlier iteration). See
+            # already mutated by an earlier phase). See
             # missing_required_node_keys.
             apply_results.append({
                 'uuid': node.get('uuid', '<missing-uuid>'),
@@ -612,9 +622,9 @@ async def run(args: Any, memory_service: Any) -> dict:
             # REKEY, never MOVE/MERGE (see classify_node) -- a MOVE/MERGE
             # reaching here with source_graph == target_graph can only come
             # from a malformed/hand-edited manifest. Dispatching it would
-            # make move_entity_across_graphs / merge_foreign_duplicate
-            # DETACH DELETE the node's only copy (wrong==home). Refuse it:
-            # block this node only, never call the primitive.
+            # make create_moved_node / delete_source_node treat the node's
+            # only copy as both source AND target (wrong==home). Refuse it:
+            # block this node only, never add it to move_specs/merge_specs.
             apply_results.append({
                 'uuid': uuid, 'disposition': disposition, 'applied': False, 'blocked': True,
                 'error': (
@@ -626,49 +636,15 @@ async def run(args: Any, memory_service: Any) -> dict:
             continue
 
         if disposition == MOVE:
-            # rewrite_group_id re-keys the moved node (and, via epsilon's
-            # uniform new_group_id, its edges/mentions) to the canonical
-            # home-graph name, so it is no longer foreign after the move --
-            # a safe no-op for displaced-only moves where target_graph
-            # already equals the node's group_id.
-            #
-            # The dispatch is isolated in a try/except: a hand-edited
-            # manifest mislabeling an Episodic node as MOVE (escaping the
-            # classify-time EPISODIC_SKIP gate), a ForeignDuplicateSuspected-
-            # Error, or a transient FalkorDB error must not abort the whole
-            # batch mid-run after earlier nodes were already mutated -- the
-            # failure is recorded against THIS node only and the loop moves
-            # on to the next one.
-            try:
-                move_result = await move_entity_across_graphs(
-                    graphiti, uuid, node['source_graph'], node['target_graph'],
-                    rewrite_group_id=node['target_graph'],
-                )
-            except Exception as exc:
-                apply_results.append({
-                    'uuid': uuid, 'disposition': disposition, 'applied': False, 'blocked': True,
-                    'error': str(exc),
-                })
-            else:
-                apply_results.append(
-                    _move_result_entry(uuid, disposition, move_result, node['target_graph']),
-                )
+            move_specs.append(node)
         elif disposition == MERGE:
-            try:
-                merge_result = await merge_foreign_duplicate(
-                    graphiti, uuid,
-                    wrong_graph=node['source_graph'], home_graph=node['target_graph'],
-                )
-            except Exception as exc:
-                apply_results.append({
-                    'uuid': uuid, 'disposition': disposition, 'applied': False, 'blocked': True,
-                    'error': str(exc),
-                })
-            else:
-                apply_results.append(
-                    _merge_result_entry(uuid, disposition, merge_result, node['target_graph']),
-                )
+            merge_specs.append(node)
         elif disposition == REKEY:
+            # A REKEY node already physically lives in its home graph --
+            # an in-place group_id SET, never a create/delete, so it carries
+            # none of the barrier-ordering constraints the MOVE/MERGE phases
+            # below exist for. Applied immediately; isolated in its own
+            # try/except so one bad REKEY node cannot abort the batch.
             try:
                 await rekey_node_in_place(
                     graphiti._graph_for(node['source_graph']), uuid, node['target_graph'],
@@ -684,7 +660,7 @@ async def run(args: Any, memory_service: Any) -> dict:
                 )
         elif disposition == EPISODIC_SKIP:
             # Non-:Entity foreign node (Episodic/Community/unlabeled): the
-            # epsilon primitives and rekey_node_in_place are all :Entity-
+            # phase primitives and rekey_node_in_place are all :Entity-
             # scoped, so this node is never dispatched to any of them.
             # Blocks this node only; its live relocation is eta's concern.
             apply_results.append({
@@ -701,6 +677,114 @@ async def run(args: Any, memory_service: Any) -> dict:
             # by the post-verify step) surfaces it to the operator.
             apply_results.append(
                 {'uuid': uuid, 'disposition': disposition, 'applied': False, 'blocked': True},
+            )
+
+    # --- Three-phase barrier-ordered apply (CGL-eta follow-up, task 2415) ---
+    #
+    # The old single-call-per-node loop dispatched each MOVE/MERGE node's
+    # create + edge-recreate + DETACH DELETE as one atomic unit, one node at
+    # a time. When the migrating set contained a co-moving SUBGRAPH (two
+    # migrating nodes joined by a shared RELATES_TO edge), the first-
+    # processed endpoint would find its neighbour not yet in target (the
+    # neighbour's own turn hadn't come yet), silently skip recreating the
+    # shared edge, and then unconditionally DETACH DELETE its own source
+    # copy -- destroying the edge's only remaining reference before the
+    # second endpoint was ever processed. See cross_graph_move.py's
+    # "Residual hazard" note and this task's analysis.
+    #
+    # Restructuring into three barrier-ordered PASSES over the WHOLE batch
+    # closes this: every migrating node is created in its target (Phase A)
+    # before ANY edge is recreated (Phase B), and no source node is deleted
+    # (Phase C) until every edge/mention has been recreated. A co-moving
+    # edge's two endpoints are therefore both already present in target by
+    # the time Phase B reads/recreates it.
+
+    # Phase A: CREATE every MOVE node's target-graph copy. Isolated per-node
+    # -- a single node's create failure (a hand-edited manifest mislabeling
+    # an Episodic node as MOVE, a ForeignDuplicateSuspectedError, a
+    # transient FalkorDB error, ...) must not abort the whole batch; it is
+    # recorded blocked and excluded from Phase B/C below (its edges cannot
+    # be safely recreated, and its non-existent target copy must not have
+    # its source deleted out from under it).
+    create_failed: dict[str, Exception] = {}
+    for spec in move_specs:
+        try:
+            await create_moved_node(
+                graphiti, spec['uuid'], spec['source_graph'], spec['target_graph'],
+                rewrite_group_id=spec['target_graph'],
+            )
+        except Exception as exc:
+            create_failed[spec['uuid']] = exc
+
+    # Phase B: recreate every RELATES_TO edge / Episodic MENTIONS link
+    # incident to the batch, in ONE call spanning every MOVE spec that
+    # survived Phase A plus every MERGE spec (a MERGE node's home copy
+    # already exists -- no Phase-A create needed). A single batched call --
+    # not one per node -- is what lets a co-moving edge shared between two
+    # specs in THIS batch be deduped and recreated exactly once (see
+    # recreate_subgraph_relationships). If the call itself raises, every
+    # spec offered to it is blocked below (none of their edges are
+    # known-safe to skip past into Phase C) -- but nodes already resolved
+    # above (REKEY/EPISODIC_SKIP/UNRESOLVED/malformed/refused) are
+    # unaffected, and post-verify below still runs.
+    phase_b_specs = [spec for spec in move_specs if spec['uuid'] not in create_failed]
+    phase_b_specs += merge_specs
+    phase_b_error: Exception | None = None
+    if phase_b_specs:
+        try:
+            await recreate_subgraph_relationships(graphiti, phase_b_specs)
+        except Exception as exc:
+            phase_b_error = exc
+
+    # Phase C: DETACH DELETE every MOVE/MERGE source node whose earlier
+    # phases succeeded -- deleting a source before its edges are known-
+    # recreated is exactly the bug this task fixes, so a node whose Phase-A
+    # create failed, or whose batch's Phase-B call failed, is left in place
+    # (blocked, with the underlying error) rather than deleted.
+    for spec in move_specs:
+        uuid = spec['uuid']
+        if uuid in create_failed:
+            apply_results.append({
+                'uuid': uuid, 'disposition': MOVE, 'applied': False, 'blocked': True,
+                'error': str(create_failed[uuid]),
+            })
+            continue
+        if phase_b_error is not None:
+            apply_results.append({
+                'uuid': uuid, 'disposition': MOVE, 'applied': False, 'blocked': True,
+                'error': f'Phase B (recreate_subgraph_relationships) failed: {phase_b_error}',
+            })
+            continue
+        try:
+            await delete_source_node(graphiti, uuid, spec['source_graph'])
+        except Exception as exc:
+            apply_results.append({
+                'uuid': uuid, 'disposition': MOVE, 'applied': False, 'blocked': True,
+                'error': str(exc),
+            })
+        else:
+            apply_results.append(
+                {'uuid': uuid, 'disposition': MOVE, 'applied': True, 'blocked': False},
+            )
+
+    for spec in merge_specs:
+        uuid = spec['uuid']
+        if phase_b_error is not None:
+            apply_results.append({
+                'uuid': uuid, 'disposition': MERGE, 'applied': False, 'blocked': True,
+                'error': f'Phase B (recreate_subgraph_relationships) failed: {phase_b_error}',
+            })
+            continue
+        try:
+            await delete_source_node(graphiti, uuid, spec['source_graph'])
+        except Exception as exc:
+            apply_results.append({
+                'uuid': uuid, 'disposition': MERGE, 'applied': False, 'blocked': True,
+                'error': str(exc),
+            })
+        else:
+            apply_results.append(
+                {'uuid': uuid, 'disposition': MERGE, 'applied': True, 'blocked': False},
             )
 
     # POST-VERIFY: re-census foreign counts per graph and compare to the
