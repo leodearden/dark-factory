@@ -6,6 +6,20 @@ from fused_memory.reconciliation.prompts import (
     _STAGE3_PROJECT_ID_GUIDELINE,
 )
 
+# Known gap (reviewer finding architecture-coherence, task 2229 W5-λ): since
+# write_cycle_summary() (reconciliation/summary_pool.py) made the
+# ReconLedgerStore row the *authoritative* cycle_summary record, the
+# "Cycle-Summary Verification" section below still checks presence only via
+# the best-effort Mem0 mirror (semantic search + count_memories_by_metadata),
+# never the ledger. That is tolerated, not silently assumed away: this stage
+# is read-only over MCP tools, and no MCP tool currently exposes a
+# ReconLedgerStore.get_by_identity-style read to it, so adding a ledger-backed
+# third path would mean introducing a new server-side MCP tool — out of
+# scope for task 2229's module locks (fused_memory/server is not in this
+# task's scope). Practical risk is low: the mirror write is dedup-exempt, and
+# a full Mem0 outage makes count_memories_by_metadata inconclusive (Stage 3
+# then does not report missing) rather than false-positive. Tracked as a
+# follow-up, not fixed here.
 STAGE3_SYSTEM_PROMPT = f"""\
 You are an Integrity Check agent operating in sleep mode. Your role is to verify consistency \
 across all three systems (Graphiti, Mem0, Taskmaster) after Stage 1 and Stage 2 have made \
