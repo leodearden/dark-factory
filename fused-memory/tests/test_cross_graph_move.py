@@ -27,6 +27,7 @@ from fused_memory.maintenance.cross_graph_move import (
     ForeignDuplicateSuspectedError,
     MergeResult,
     MoveResult,
+    SubgraphEdgeResult,
     classify_unique_wrong_edges,
     create_moved_node,
     delete_source_node,
@@ -34,6 +35,7 @@ from fused_memory.maintenance.cross_graph_move import (
     merge_foreign_duplicate,
     move_entity_across_graphs,
     parse_compact_vector_reply,
+    recreate_subgraph_relationships,
 )
 
 # ---------------------------------------------------------------------------
@@ -1392,3 +1394,142 @@ class TestDeleteSourceNode:
         assert source_mock.query.await_count == 1
         cypher = extract_cypher(source_mock.query.call_args)
         assert 'DETACH DELETE' in cypher
+
+
+# ---------------------------------------------------------------------------
+# step-5: recreate_subgraph_relationships (Phase B core) -- co-moving pair
+# ---------------------------------------------------------------------------
+
+def _move_spec(uuid: str, source_graph: str, target_graph: str) -> dict:
+    """A minimal MOVE-dispositioned manifest-node-shaped spec for Phase B tests.
+
+    recreate_subgraph_relationships consumes manifest node records (uuid,
+    disposition, source_graph, target_graph) directly -- the same shape
+    run()'s apply loop partitions into move_specs/merge_specs (task 2415
+    step-12) -- so tests build specs with this same shape rather than a
+    bespoke test-only type.
+    """
+    return {
+        'uuid': uuid, 'disposition': 'MOVE',
+        'source_graph': source_graph, 'target_graph': target_graph,
+    }
+
+
+def _merge_spec(uuid: str, wrong_graph: str, home_graph: str) -> dict:
+    """A minimal MERGE-dispositioned manifest-node-shaped spec for Phase B tests."""
+    return {
+        'uuid': uuid, 'disposition': 'MERGE',
+        'source_graph': wrong_graph, 'target_graph': home_graph,
+    }
+
+
+class TestRecreateSubgraphRelationships:
+    """recreate_subgraph_relationships(graphiti, specs) -- Phase B core.
+
+    Given a batch of MOVE/MERGE specs (manifest-node-shaped dicts: uuid,
+    disposition, source_graph, target_graph), recreates every RELATES_TO
+    edge and Episodic MENTIONS link incident to the batch -- deduped by
+    uuid across the WHOLE batch, so a co-moving neighbour's shared edge
+    (silently skipped then destroyed by the old single-call move_entity_
+    across_graphs loop) survives. Issues NO DETACH DELETE -- that is
+    delete_source_node's job (Phase C), called only after this phase
+    completes for the WHOLE batch.
+    """
+
+    @pytest.mark.asyncio
+    async def test_co_moving_pair_shared_edge_recreated_exactly_once(
+        self, mock_config, make_backend, make_graph_mock, monkeypatch,
+    ):
+        """Two MOVE specs (A, B), both -> the SAME target T, whose shared
+        source graph holds ONE RELATES_TO edge between them. Reading each
+        spec's incident edges returns that SAME edge row twice (once as A's
+        neighbour, once as B's) -- recreate_subgraph_relationships must
+        dedupe by edge uuid and recreate it EXACTLY ONCE in T, never
+        duplicating it -- proving the co-moving-edge-loss bug is closed by
+        the barrier (both A and B already exist in T by the time this runs,
+        via create_moved_node in Phase A). Also recreates the incident
+        MENTIONS link, and issues NO DETACH DELETE anywhere.
+        """
+        backend = make_backend(mock_config)
+
+        source_mock = make_graph_mock()
+
+        async def _source_ro_query(cypher, params=None):
+            params = params or {}
+            if 'RELATES_TO' in cypher:
+                return MagicMock(result_set=[EDGE_ROW_FIXTURE])
+            if 'MENTIONS' in cypher:
+                if params.get('uuid') == NODE_UUID_FIXTURE:
+                    return MagicMock(result_set=[MENTION_ROW_FIXTURE])
+                return MagicMock(result_set=[])
+            return MagicMock(result_set=[])
+
+        source_mock.ro_query = AsyncMock(side_effect=_source_ro_query)
+
+        target_mock = make_graph_mock()
+        # Presence probes against T (the edge-already-recreated idempotency
+        # check) report "not yet present" -- a first-time apply.
+        target_mock.ro_query = AsyncMock(return_value=MagicMock(result_set=[]))
+        target_mock.query = AsyncMock(return_value=MagicMock(relationships_created=1))
+
+        backend._driver._get_graph = _route_graphs({
+            SOURCE_GRAPH_FIXTURE: source_mock,
+            TARGET_GRAPH_FIXTURE: target_mock,
+        })
+
+        fake_read_compact = AsyncMock(return_value=COMPACT_VECTOR_REPLY_FIXTURE)
+        monkeypatch.setattr(cross_graph_move, '_read_compact_vector', fake_read_compact)
+
+        specs = [
+            _move_spec(NODE_UUID_FIXTURE, SOURCE_GRAPH_FIXTURE, TARGET_GRAPH_FIXTURE),
+            _move_spec(OTHER_NODE_UUID_FIXTURE, SOURCE_GRAPH_FIXTURE, TARGET_GRAPH_FIXTURE),
+        ]
+
+        result = await recreate_subgraph_relationships(backend, specs)
+
+        # the shared edge is recreated EXACTLY ONCE in T, deduped by edge
+        # uuid -- not once per incident spec (which would double-create it).
+        edge_create_calls = [
+            call for call in target_mock.query.call_args_list
+            if 'RELATES_TO' in extract_cypher(call)
+        ]
+        assert len(edge_create_calls) == 1
+        cypher = extract_cypher(edge_create_calls[0])
+        params = extract_params(edge_create_calls[0])
+        assert 'CREATE' in cypher
+        assert EXPECTED_VECF32_LITERAL_FIXTURE in cypher
+        assert params.get('edge_uuid') == EDGE_UUID_FIXTURE
+        assert params.get('src_uuid') == NODE_UUID_FIXTURE
+        assert params.get('dst_uuid') == OTHER_NODE_UUID_FIXTURE
+        assert params.get('fact') == 'Alice is related to Bob.'
+        assert params.get('group_id') == TARGET_GRAPH_FIXTURE
+
+        # the fact_embedding is read via the raw transport, from the shared
+        # SOURCE graph (never from either endpoint's target).
+        embed_calls = [
+            c for c in fake_read_compact.call_args_list
+            if EDGE_UUID_FIXTURE in c.kwargs.get('cypher', '')
+        ]
+        assert len(embed_calls) == 1
+        assert embed_calls[0].kwargs.get('group_id') == SOURCE_GRAPH_FIXTURE
+
+        # the incident MENTIONS link is also recreated.
+        mention_create_calls = [
+            call for call in target_mock.query.call_args_list
+            if 'MENTIONS' in extract_cypher(call)
+        ]
+        assert len(mention_create_calls) == 1
+        mention_params = extract_params(mention_create_calls[0])
+        assert mention_params.get('entity_uuid') == NODE_UUID_FIXTURE
+        assert mention_params.get('episode_uuid') == EPISODE_UUID_FIXTURE
+
+        # NO DETACH DELETE anywhere -- that's delete_source_node's job
+        # (Phase C), run only after this phase completes for the batch.
+        for call in target_mock.query.call_args_list + source_mock.query.call_args_list:
+            assert 'DETACH DELETE' not in extract_cypher(call)
+        source_mock.query.assert_not_awaited()
+
+        assert isinstance(result, SubgraphEdgeResult)
+        assert result.edges_recreated == 1
+        assert result.edges_skipped == 0
+        assert result.dropped_cross_target == []
