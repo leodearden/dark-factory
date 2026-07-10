@@ -1033,3 +1033,134 @@ def test_reap_stale_leases_continues_sweep_when_one_removal_fails(
     assert {r.lease_name for r in reaped} == {'victim'}
     assert poison_path.is_file()  # left behind, not silently claimed as reaped
     assert any(r.levelno >= logging.ERROR for r in caplog.records)
+
+
+# ---------------------------------------------------------------------------
+# CLI lease-* verbs + fail-open fail-soft
+# ---------------------------------------------------------------------------
+
+
+def test_main_lease_claim_on_free_name_acquires_and_prints_decision_token(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    monkeypatch.setenv('CLAUDE_FLEET_ROOT', str(tmp_path))
+
+    rc = sr.main(
+        ['lease-claim', '--name', 'watcher-df', '--slug', 'watcher-df-100', '--pid', str(os.getpid())]
+    )
+
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert out.splitlines()[0] == 'decision=acquired'
+    assert sr.lease_path_for_name('watcher-df', root=tmp_path).is_file()
+
+
+def test_main_lease_claim_when_held_by_live_holder_stands_down(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    monkeypatch.setenv('CLAUDE_FLEET_ROOT', str(tmp_path))
+    sr.main(
+        ['lease-claim', '--name', 'watcher-df', '--slug', 'watcher-df-100', '--pid', str(os.getpid())]
+    )
+    capsys.readouterr()  # discard the first claim's output
+
+    rc = sr.main(
+        [
+            'lease-claim',
+            '--name',
+            'watcher-df',
+            '--slug',
+            'watcher-df-200',
+            '--pid',
+            str(os.getpid()),
+            '--policy',
+            'stand-down',
+        ]
+    )
+
+    assert rc == 0
+    out = capsys.readouterr().out
+    lines = out.splitlines()
+    assert lines[0] == 'decision=stand-down'
+    assert re.search(r'lease held by \S+ \(alive, heartbeat \d+s ago\) — standing down', lines[1])
+    # the on-disk holder must still be the ORIGINAL claimant (no clobber).
+    body = sr.lease_path_for_name('watcher-df', root=tmp_path).read_text()
+    assert 'watcher-df-100' in body
+    assert 'watcher-df-200' not in body
+
+
+def test_main_lease_heartbeat_bumps_mtime(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    monkeypatch.setenv('CLAUDE_FLEET_ROOT', str(tmp_path))
+    sr.main(['lease-claim', '--name', 'watcher-df', '--slug', 'watcher-df-100', '--pid', str(os.getpid())])
+    lease_path = sr.lease_path_for_name('watcher-df', root=tmp_path)
+    _set_mtime(lease_path, _NOW, timedelta(hours=1))
+    backdated_mtime = lease_path.stat().st_mtime
+
+    rc = sr.main(['lease-heartbeat', '--name', 'watcher-df'])
+
+    assert rc == 0
+    assert lease_path.stat().st_mtime > backdated_mtime
+
+
+def test_main_lease_release_removes_the_file(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    monkeypatch.setenv('CLAUDE_FLEET_ROOT', str(tmp_path))
+    sr.main(['lease-claim', '--name', 'watcher-df', '--slug', 'watcher-df-100', '--pid', str(os.getpid())])
+    lease_path = sr.lease_path_for_name('watcher-df', root=tmp_path)
+    assert lease_path.is_file()
+
+    rc = sr.main(['lease-release', '--name', 'watcher-df'])
+
+    assert rc == 0
+    assert not lease_path.exists()
+
+
+def test_main_lease_reap_removes_a_stale_lease(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    monkeypatch.setenv('CLAUDE_FLEET_ROOT', str(tmp_path))
+    sr.main(['lease-claim', '--name', 'watcher-df', '--slug', 'watcher-df-100', '--pid', str(_DEAD_PID)])
+    lease_path = sr.lease_path_for_name('watcher-df', root=tmp_path)
+    _set_mtime(lease_path, _NOW, sr.LEASE_HEARTBEAT_TTL + timedelta(minutes=1))
+
+    rc = sr.main(['lease-reap'])
+
+    assert rc == 0
+    assert not lease_path.exists()
+
+
+def test_main_lease_claim_is_fail_open_never_stand_down_on_a_fault(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    monkeypatch.setenv('CLAUDE_FLEET_ROOT', str(tmp_path))
+
+    def _boom(*_args: object, **_kwargs: object) -> sr.LeaseClaim:
+        raise OSError('lease substrate on fire')
+
+    monkeypatch.setattr(sr, 'claim_lease', _boom)
+
+    with caplog.at_level(logging.ERROR):
+        rc = sr.main(
+            ['lease-claim', '--name', 'watcher-df', '--slug', 'watcher-df-100', '--pid', str(os.getpid())]
+        )
+
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert out.splitlines()[0] == 'decision=proceed'
+    assert any(r.levelno >= logging.ERROR for r in caplog.records)
