@@ -125,6 +125,7 @@ def _make_workflow(
     task_id: str = '1781',
     max_execute_iterations: int = 10,
     max_consecutive_zero_output_timeouts: int = 2,
+    max_progress_resume_iterations: int = 20,
 ) -> TaskWorkflow:
     """Minimal TaskWorkflow harness for liveness boundary gate tests.
 
@@ -149,6 +150,7 @@ def _make_workflow(
     config.merge_train_max_members = 3
     config.max_execute_iterations = max_execute_iterations
     config.max_consecutive_zero_output_timeouts = max_consecutive_zero_output_timeouts
+    config.max_progress_resume_iterations = max_progress_resume_iterations
     config.recycle_config_dir_on_zero_output = False
     config.judge_after_each_iteration = False
     config.inter_iteration_rebase = False

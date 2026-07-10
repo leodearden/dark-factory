@@ -359,6 +359,19 @@ logger = logging.getLogger(__name__)
 # at the BLOCKED route in _execute_verify_review_loop (task 1739).
 ZERO_OUTPUT_HANG_REASON = 'infra: zero-output CLI hang (consecutive fresh-invocation timeouts)'
 
+# Reason string used when the progress-resume churn circuit breaker trips:
+# config.max_progress_resume_iterations ceiling-kill+resume cycles of a
+# productive (transcript_turns>0) session accumulated without the task ever
+# converging.  Distinct from ZERO_OUTPUT_HANG_REASON (no progress at all) and
+# from the generic 'Execution iterations exhausted' path (progress-resumes
+# are excluded from that cap — see _execute_iterations).  Mirrors the
+# _zero_output_hang_info stash idiom: set by _execute_iterations, consumed at
+# the BLOCKED route in _execute_verify_review_loop (task 2360, reify-4827).
+PROGRESS_RESUME_CHURN_REASON = (
+    'infra: progress-resume churn (repeated ceiling-kill+resume of a '
+    'productive session without convergence)'
+)
+
 
 # Matches the wrapper string ``_run_cmd`` injects when its own asyncio.wait_for
 # fires.  When this is the only cause hint there is no actionable signal for
@@ -942,6 +955,12 @@ class TaskWorkflow:
         # _mark_blocked with the distinct infra_issue reason instead of the
         # generic 'Execution iterations exhausted' (task 1739).
         self._zero_output_hang_info: dict | None = None
+        # Set by the progress-resume churn circuit breaker in
+        # _execute_iterations when config.max_progress_resume_iterations
+        # ceiling-kill+resume cycles accumulate without convergence.  Read by
+        # _execute_verify_review_loop to route _mark_blocked with the
+        # distinct infra_issue reason (task 2360, reify-4827).
+        self._progress_resume_churn_info: dict | None = None
         # When True, the finally-block config-dir cleanup is skipped so the
         # preserved dir can be used for forensic analysis.  Set alongside
         # _zero_output_hang_info when the circuit breaker trips (task 1739).
@@ -4247,6 +4266,20 @@ class TaskWorkflow:
                         detail=info['detail'],
                         category='infra_issue',
                     )
+                # Progress-resume churn: mutually exclusive with the
+                # zero-output hang above (at most one info dict is set per
+                # _execute_iterations call — see its reset-at-entry comment).
+                # Distinct infra_issue reason so ops can tell "repeatedly
+                # killed a productive, converging-too-slowly session" apart
+                # from both the zero-output wedge and a genuine task-failure
+                # exhaustion (task 2360, reify-4827).
+                if self._progress_resume_churn_info is not None:
+                    info = self._progress_resume_churn_info
+                    return await self._mark_blocked(
+                        info['reason'],
+                        detail=info['detail'],
+                        category='infra_issue',
+                    )
                 return await self._mark_blocked('Execution iterations exhausted')
 
             # VERIFY + DEBUGFIX loop
@@ -4389,19 +4422,35 @@ class TaskWorkflow:
         consecutive_zero_output = 0
         self._zero_output_hang_info = None
         # Counts CONSECUTIVE progress-timeouts (is_timed_out_with_progress);
-        # reset by any successful (non-timeout) result.  No separate cap —
-        # max_execute_iterations is the only bound (PRD §9 Q4 design decision).
-        # Surfaced in logs at the iteration cap so exhausted-via-resume tasks
-        # are diagnosable without a new instance variable or escalation path.
+        # reset by any successful (non-timeout) result.  Purely diagnostic —
+        # progress_resume_total (below) is what the cap check and the churn
+        # circuit breaker actually consult.
         consecutive_progress_timeouts = 0
+        # Cumulative (NOT consecutive — never reset mid-loop) count of
+        # progress-timeouts across this _execute_iterations call.  Task 2360
+        # fix #4 (reify-4827): a ceiling-kill+resume pair of a productive
+        # session is excluded from max_execute_iterations via the cap-check
+        # subtraction below, so it no longer erodes the budget meant for
+        # genuine implementer attempts — but an endless non-converging
+        # kill/resume stream must still terminate, so it is bounded
+        # independently by config.max_progress_resume_iterations (checked in
+        # the γ branch below). Supersedes the old PRD §9 Q4 design decision
+        # that max_execute_iterations was the only bound.
+        progress_resume_total = 0
+        self._progress_resume_churn_info = None
         self._preserve_config_dir = False
         while self.artifacts.get_pending_steps():
-            if self.metrics.execute_iterations >= self.config.max_execute_iterations:
-                # Iteration cap reached.  If the most-recent batch of iterations
-                # were all zero-output timeouts (consecutive_zero_output > 0),
-                # classify this as infra_issue rather than the generic
-                # 'Execution iterations exhausted' — this handles the edge case
-                # where max_consecutive_zero_output_timeouts > max_execute_iterations
+            if (
+                self.metrics.execute_iterations - progress_resume_total
+                >= self.config.max_execute_iterations
+            ):
+                # Iteration cap reached (progress-resumes excluded from the
+                # count — see progress_resume_total above).  If the most-recent
+                # batch of iterations were all zero-output timeouts
+                # (consecutive_zero_output > 0), classify this as infra_issue
+                # rather than the generic 'Execution iterations exhausted' —
+                # this handles the edge case where
+                # max_consecutive_zero_output_timeouts > max_execute_iterations
                 # so the circuit-breaker threshold is never reached inside the loop
                 # but the pattern is still clearly an infra hang.
                 if consecutive_zero_output > 0:
@@ -4415,18 +4464,24 @@ class TaskWorkflow:
                         ),
                     }
                 elif consecutive_progress_timeouts > 0:
-                    # Diagnosable signal: the task exhausted its iteration budget
-                    # while resuming a progress-killed session.  The only cap on
-                    # progress-resume loops is max_execute_iterations (PRD §9 Q4).
-                    # Log so ops can distinguish 'stuck-resuming-slow-session'
-                    # from a genuine task complexity exhaustion.
+                    # Defensive fallback, not expected to be reachable: a
+                    # progress-timeout iteration leaves
+                    # (execute_iterations - progress_resume_total) unchanged
+                    # (both increment together — see progress_resume_total
+                    # above), so it cannot itself push the adjusted count to
+                    # this cap; a non-converging stream instead trips the
+                    # independent max_progress_resume_iterations churn
+                    # breaker in the γ branch first. Kept as a diagnostic in
+                    # case that invariant is ever broken by a future change.
                     logger.warning(
                         'Task %s: exhausted max_execute_iterations with '
-                        'consecutive_progress_timeouts=%s — session may be slow '
-                        'or looping; each resume consumed one iteration. '
-                        'Bound: max_execute_iterations=%s (PRD §9 Q4).',
+                        'consecutive_progress_timeouts=%s (progress_resume_total=%s) '
+                        '— session may be slow or looping. '
+                        'Bound: max_execute_iterations=%s, '
+                        'max_progress_resume_iterations=%s.',
                         self.task_id, consecutive_progress_timeouts,
-                        self.config.max_execute_iterations,
+                        progress_resume_total, self.config.max_execute_iterations,
+                        self.config.max_progress_resume_iterations,
                     )
                 return WorkflowOutcome.BLOCKED
 
@@ -4589,6 +4644,30 @@ class TaskWorkflow:
                 # (Preserves the reset the old `else` branch provided before γ.)
                 consecutive_zero_output = 0
                 consecutive_progress_timeouts += 1
+                progress_resume_total += 1
+                if progress_resume_total >= self.config.max_progress_resume_iterations:
+                    # Independent churn circuit breaker (task 2360 fix #4,
+                    # reify-4827): this kill+resume pair is excluded from
+                    # max_execute_iterations (see the cap check above), so an
+                    # endless non-converging progress-timeout stream would
+                    # otherwise never terminate.  Bounded here instead.
+                    self._progress_resume_churn_info = {
+                        'reason': PROGRESS_RESUME_CHURN_REASON,
+                        'detail': (
+                            f'progress_resume_total={progress_resume_total} '
+                            f'consecutive_progress_timeouts={consecutive_progress_timeouts} '
+                            f'iteration={self.metrics.execute_iterations} '
+                            f'last_transcript_turns={result.transcript_turns}'
+                        ),
+                    }
+                    logger.error(
+                        'Task %s: progress-resume churn circuit breaker tripped '
+                        'after %d ceiling-kill+resume cycles of a productive '
+                        'session — blocking (session may be too slow to '
+                        'converge, or looping)',
+                        self.task_id, progress_resume_total,
+                    )
+                    return WorkflowOutcome.BLOCKED
                 self._pending_resume_session_id = self._last_invoke_session_id
                 self._pending_resume_role = IMPLEMENTER.name
                 logger.info(
