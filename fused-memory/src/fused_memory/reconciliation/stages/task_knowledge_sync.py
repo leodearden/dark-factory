@@ -70,23 +70,6 @@ from fused_memory.utils.async_utils import gather_collect
 logger = logging.getLogger(__name__)
 
 
-def _extract_status(task_data: dict) -> str:
-    """Extract status from a Taskmaster get_task response dict.
-
-    **Sibling copies** — keep in sync if the get_task response shape ever changes:
-
-    * ``middleware/task_interceptor._extract_status`` (~line 3292) — canonical source
-    * ``reconciliation/flag_dedup._extract_terminal_status`` — same logic with an
-      additional non-dict guard (returns ``'unknown'`` for non-dict input)
-    """
-    if 'status' in task_data:
-        return task_data['status']
-    data = task_data.get('data', {})
-    if isinstance(data, dict):
-        return data.get('status', 'unknown')
-    return 'unknown'
-
-
 # Projects allowed to use the briefing-refresh hook.  This is a reify-specific
 # feature; gating on project_id prevents accidental triggering by other projects
 # that happen to have the same file layout.  Extend when needed.

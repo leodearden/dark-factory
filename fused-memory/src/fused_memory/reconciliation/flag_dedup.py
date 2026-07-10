@@ -1319,8 +1319,6 @@ def _extract_terminal_status(result: object) -> str:
     **Sibling copies** — keep in sync if the get_task response shape ever changes:
 
     * ``middleware/task_interceptor._extract_status`` (~line 3292) — canonical source
-    * ``reconciliation/stages/task_knowledge_sync._extract_status`` (~line 57) —
-      same logic but assumes a dict input (no non-dict guard)
     """
     if not isinstance(result, dict):
         return 'unknown'
