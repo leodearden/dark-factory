@@ -1804,6 +1804,99 @@ class TestApplyCargoScopePolyglotGuard:
         assert result.lint_command == 'cargo clippy --workspace'
 
 
+class TestApplyCargoScopeRoutesThroughVerifyCmd:
+    """`_apply_cargo_scope` routes ``--workspace`` rewriting through
+    ``VerifyCmd.cargo_scope`` (task 2125 steps 23/24) instead of the
+    standalone ``_scope_cargo_workspace`` regex helper.
+
+    The golden reify-chain and no-op cases mirror
+    ``TestScopeCargoWorkspaceRewrite``'s A4/A6/A7 (migrated to this
+    integration level once ``_scope_cargo_workspace`` is deleted — the
+    mutator itself stays pinned at the unit level by
+    ``test_verify_cmd.TestCargoScopeStructured`` /
+    ``TestCargoScopeRawRetainedChain``). The OPAQUE case is new: it pins the
+    fix for the historical "regex rewrites --workspace regardless of overall
+    shell-parseability" bug — ``_scope_cargo_workspace`` happily mangled a
+    ``--workspace``-bearing command even when the rest of it was unparseable
+    (e.g. an unbalanced quote), producing a broken argv. Routing through
+    ``parse_config_command`` classifies such a command OPAQUE, and every
+    VerifyCmd mutator (including ``cargo_scope``) no-ops on OPAQUE (P1), so
+    the rewired ``_apply_cargo_scope`` must leave it byte-identical instead.
+    """
+
+    @staticmethod
+    def _call_scoped(test_command: str, crate: str = 'reify-compiler') -> ModuleConfig:
+        mc = ModuleConfig(prefix='crates', test_command=test_command)
+        with (
+            patch(
+                'orchestrator.verify.discover_workspace_crates',
+                return_value={'crates/foo': crate},
+            ),
+            patch('orchestrator.verify.files_to_crates', return_value=[crate]),
+        ):
+            return _apply_cargo_scope(
+                mc,
+                task_files=['crates/foo/src/lib.rs'],
+                project_root=Path('/fake/root'),
+                scope_cargo_enabled=True,
+            )
+
+    def test_reify_chained_command_scopes_ungated_segments(self):
+        """Golden case migrated from TestScopeCargoWorkspaceRewrite A4/A7."""
+        gated_1 = (
+            './scripts/cargo-test-occt-gated.sh cargo test '
+            '-p reify-kernel-occt -p reify-eval -p reify-cli'
+        )
+        gated_2 = (
+            './scripts/cargo-test-occt-gated.sh cargo test '
+            '-p reify-kernel-occt-extra'
+        )
+        ungated_excludes = (
+            '--exclude reify-kernel-occt --exclude reify-eval '
+            '--exclude reify-cli --exclude reify-kernel-occt-extra'
+        )
+        ungated_1 = f'cargo test --workspace {ungated_excludes} -- --test-threads=1'
+        ungated_2 = f'cargo test --workspace {ungated_excludes} -- --test-threads=1'
+        cmd = f'{gated_1} && {gated_2} && {ungated_1} && {ungated_2}'
+
+        result = self._call_scoped(cmd)
+
+        assert result.test_command is not None
+        assert gated_1 in result.test_command, f'gated_1 missing: {result.test_command!r}'
+        assert gated_2 in result.test_command, f'gated_2 missing: {result.test_command!r}'
+        assert '--workspace' not in result.test_command
+        assert '-p reify-compiler' in result.test_command
+        assert '-- --test-threads=1' in result.test_command
+        # Neither --exclude nor an excluded crate name survives the rewrite.
+        rewritten_segment = result.test_command.split('&&')[-1]
+        assert '--exclude' not in rewritten_segment, (
+            f'--exclude token found in rewritten segment: {rewritten_segment!r}'
+        )
+
+    def test_no_workspace_command_returned_unchanged(self):
+        """An already -p-scoped cargo command (no --workspace) is untouched."""
+        cmd = 'cargo test -p my-crate -- --test-threads=1'
+        result = self._call_scoped(cmd)
+        assert result.test_command == cmd
+
+    def test_non_cargo_command_returned_unchanged(self):
+        """A non-cargo command carrying a literal '--workspace' token is untouched."""
+        cmd = 'npx sometool --workspace foo'
+        result = self._call_scoped(cmd)
+        assert result.test_command == cmd
+
+    def test_opaque_command_left_untouched(self):
+        """A --workspace-bearing but unparseable (unbalanced-quote) command must
+        NOT be regex-mangled — regression for the string-surgery bug the
+        VerifyCmd rewire (task 2125) fixes.
+        """
+        cmd = 'cargo test --workspace "unterminated'
+        result = self._call_scoped(cmd)
+        assert result.test_command == cmd, (
+            f'expected OPAQUE command untouched, got {result.test_command!r}'
+        )
+
+
 class TestScopeCargoWorkspaceRewrite:
     """Regression guards for `_scope_cargo_workspace` — the --workspace rewriter.
 
