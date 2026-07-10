@@ -562,3 +562,136 @@ class TestMilestoneSchedulerGate:
         result = await scheduler.acquire_next()
 
         assert result is None, 'must withhold: dep X regressed despite the elapsed timer'
+
+
+# ---------------------------------------------------------------------------
+# B12+B6 — normal-agent routing orthogonality and restart survival.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestNormalAgentRoutingAndRestartSurvival:
+    """B12: the milestone gate is orthogonal to ``task_kind`` — a plain
+    ``task_kind='normal'`` milestone task is held/released identically and,
+    once released, routes to the NORMAL agent path (``Scheduler.is_deterministic``
+    is False), not ``DeterministicRunner``.
+
+    B6: a persisted delayed-milestone anchor survives an orchestrator
+    restart — a FRESH ``Scheduler`` instance (no prior in-memory state,
+    modelling a new process) recomputes the gate purely from the task's
+    persisted ``milestone_deps_satisfied_at`` + ``after_secs``, withheld
+    while ``wall_now < anchor + after_secs`` and eligible once
+    ``wall_now >= anchor + after_secs`` — the timer is not reset by the
+    restart.
+    """
+
+    TASK_ID_NORMAL = '9201'
+    TASK_ID_RESTART = '9202'
+
+    async def test_normal_task_kind_milestone_gated_then_routes_to_normal_agent(
+        self, monkeypatch,
+    ):
+        at = datetime(2026, 8, 1, tzinfo=UTC)
+        clock = [at - timedelta(seconds=1)]
+        task = _dated_milestone_task(self.TASK_ID_NORMAL, at, task_kind='normal')
+
+        mock_call = AsyncMock(return_value=_task_response([task]))
+        monkeypatch.setattr('orchestrator.scheduler.mcp_call', mock_call)
+        scheduler = _build_scheduler(clock)
+
+        result_before = await scheduler.acquire_next()
+        assert result_before is None, 'must withhold while now_wall < at, same as any milestone task'
+
+        clock[0] = at
+        assignment = await scheduler.acquire_next()
+        assert assignment is not None and assignment.task_id == self.TASK_ID_NORMAL
+
+        assert Scheduler.is_deterministic(assignment.task) is False, (
+            "a task_kind='normal' milestone task must route to the normal "
+            'agent path, not DeterministicRunner'
+        )
+
+    async def test_restart_survival_fresh_scheduler_recomputes_gate_from_persisted_anchor(
+        self, monkeypatch,
+    ):
+        anchor_base = datetime(2026, 7, 10, 12, 0, 0, tzinfo=UTC)
+        after_secs = 100
+        clock_a = [anchor_base]
+
+        milestone_task = _delayed_predicate_milestone_task(
+            self.TASK_ID_RESTART, Path('/unused/for-this-test.sh'),
+            after_secs=after_secs,
+        )
+        dep_task = _dep_task('X', status='done')
+
+        mock_call = AsyncMock(return_value=_task_response([dep_task, milestone_task]))
+        monkeypatch.setattr('orchestrator.scheduler.mcp_call', mock_call)
+
+        # Scheduler A stamps the anchor via its acquire_next sweep.
+        scheduler_a = _build_scheduler(clock_a)
+        result = await scheduler_a.acquire_next()
+        assert result is None
+        scheduler_a.update_task.assert_awaited_once()  # type: ignore[attr-defined]
+        anchor_iso = (
+            scheduler_a.update_task.call_args.args[1]['milestone_deps_satisfied_at']  # type: ignore[attr-defined]
+        )
+
+        # Persist the anchor into the task dict — the SAME mock_call is
+        # reused, so this is what any orchestrator process (old or new)
+        # reads back on its next get_tasks.
+        milestone_task['metadata']['milestone_deps_satisfied_at'] = anchor_iso
+        mock_call.return_value = _task_response([dep_task, milestone_task])
+
+        # Simulate a restart: a BRAND-NEW Scheduler instance — no prior
+        # in-memory state — with its own injected wall clock, reading the
+        # SAME persisted task dict.
+        clock_b = [anchor_base + timedelta(seconds=after_secs - 1)]
+        scheduler_b = _build_scheduler(clock_b)
+
+        result_before = await scheduler_b.acquire_next()
+        assert result_before is None, (
+            'the fresh scheduler must still withhold before anchor + after_secs — '
+            'the timer is not reset by the restart'
+        )
+
+        clock_b[0] = anchor_base + timedelta(seconds=after_secs)
+        result_after = await scheduler_b.acquire_next()
+        assert result_after is not None and result_after.task_id == self.TASK_ID_RESTART, (
+            'the fresh scheduler must dispatch once wall_now >= anchor + after_secs, '
+            'computed purely from the persisted anchor'
+        )
+
+
+# ---------------------------------------------------------------------------
+# B11 (importable slice) — shared.task_metadata.Milestone schema rejection.
+# ---------------------------------------------------------------------------
+
+
+class TestMilestoneSchemaRejection:
+    """The importable schema-rejection slice of B11.
+
+    ``orchestrator``'s dependency closure is escalation + dark-factory-shared
+    only — ``fused_memory`` (where ``deterministic_task_guard._validate_milestone``
+    lives) is not importable here.  That guard delegates milestone validation
+    to this SAME shared ``Milestone`` model
+    (``deterministic_task_guard._validate_milestone`` calls
+    ``Milestone(**milestone)``), so asserting that this shared authority
+    rejects malformed specs is the honest, importable slice of B11 available
+    to ε.  The full guard-rejection path (predicate ``target_unit``/
+    ``always_escalates`` prohibitions) is δ's fused-memory unit test — a
+    documented boundary, not a gap.
+    """
+
+    def test_delayed_without_after_secs_raises(self):
+        from pydantic import ValidationError
+        from shared.task_metadata import Milestone
+
+        with pytest.raises(ValidationError):
+            Milestone(mode='delayed')
+
+    def test_dated_with_unparseable_at_raises(self):
+        from pydantic import ValidationError
+        from shared.task_metadata import Milestone
+
+        with pytest.raises(ValidationError):
+            Milestone(mode='dated', at='not-a-date')
