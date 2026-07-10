@@ -120,10 +120,47 @@ set: it is off this deploy path and needs only a routine restart later
 (independently `done` as of this writing, via its own separate path — see
 PRD "η (mechanism 3) is filed DEFERRED and held off the flip").
 
-## Status at time of writing
+## Filed (step 16 executed)
 
-**NOT YET FILED.** Task #2263 (this task) has committed and tested the
-script (steps 1-14) but has not yet merged to main, so step 16's
-`submit_task` call has not run. This document records the exact intended
-payload; update it with the actual filed task ID, dispatch outcome, and any
-deviations once step 16 executes.
+Filed as task **#2424** — "W11-κ deploy: adopt .lane-state + self-restart
+orchestrator onto LaneLifecycle/.task-meta" — recorded by task 2422 (this
+deferred-filer follow-up). `task_kind='deterministic'`; `metadata.before_done`
+matches the payload above exactly (script, args, env, cwd, timeout_secs,
+target_unit); `metadata.always_escalates=false` (auto-deploy preset);
+`metadata.stream='W11'`. Dependencies wired: exactly the 9 mechanism-1+2
+spine tasks **2254, 2255, 2256, 2257, 2258, 2259, 2260, 2261, 2262** —
+explicitly NOT 2264 (η / mechanism-3, off this deploy path), matching
+"Consumer" above.
+
+By the time task 2422 verified it, #2424 was already `status='done'`: all 9
+spine deps were already `done` at filing time, so the task became
+dispatch-eligible immediately on the pending flip and the DeterministicRunner
+ran it straight through — no window where it sat `pending`. `target_unit=
+'orchestrator-dark-factory.service'` (the orchestrator's own unit) routed it
+through the detached `systemd-run --user` **self-restart** path, exactly per
+the "target_unit rationale" section above: `metadata.before_done_ran_at` is
+stamped, `metadata.done_provenance = {kind: 'deterministic-deploy-scheduled',
+unit: 'orchestrator-dark-factory.service', transient_unit:
+'orch-redeploy-restart-2424.service', fire_delay_secs: 60}` — the task went
+`done` (scheduled) immediately, without the dispatching orchestrator being
+killed by the restart it scheduled. The restart itself fires out-of-cgroup
+~60s after scheduling (`before_done_scheduled_at`), independent of task
+2422's own session.
+
+Provenance note: #2424 was discovered already filed and already `done` when
+task 2422 checked — it was not filed by task 2422's own `submit_task` call.
+Some other process filed it in the window between the 2422 plan being
+finalized (premise confirmed not-yet-filed at that point) and task 2422's
+implementer session starting; that causal path is unaccounted for by any
+agent/steward record found and has been flagged for audit (escalation
+esc-2422-1), non-blocking. Task 2422 verified the existing filing
+field-for-field against the full acceptance contract (task_kind, before_done,
+always_escalates, stream, the exact 9-dep set) rather than re-filing, which
+would have duplicated a live self-restart side effect against an
+already-satisfied spine.
+
+Dispatch note: the orchestrator has already restarted (or is restarting)
+onto `LaneLifecycle`-backed acquire with the `.task-meta` relocation live,
+per the self-restart path's own fresh `MainPID`/`ActiveEnterTimestamp`
+verify (`restart-orchestrator.sh`'s blocking verify loop, delegated to by
+the committed script). No further action is required for κ.
