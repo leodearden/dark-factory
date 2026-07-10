@@ -2884,3 +2884,96 @@ class TestReconReportDeleteFinding:
         assert len(report['flagged_items']) == 1
         assert report['flagged_items'][0]['finding_id'] == fid
 
+    # -- task-2410 step-5: dedup-index cleanup + cross-stage — RED until
+    #    step-6 pops the signature/description dedup indices on delete. --
+
+    def test_delete_then_refile_same_signature_allocates_fresh(self):
+        """After deleting A filed under (task_id='42', flag_type='f'), a
+        re-filed finding with the SAME signature must allocate a fresh
+        finding_id, not bounce off a stale duplicate_finding pointer.
+        """
+        state, _ = self._make_state()
+        state.start_report(run_id='r1', stage='s1', project_id='dark_factory')
+        added = state.add_finding(
+            run_id='r1',
+            severity='low',
+            category='c',
+            description='d',
+            suggested_action='a',
+            task_id='42',
+            flag_type='f',
+        )
+        fid_a = added['finding_id']
+
+        delete_result = state.delete_finding('r1', fid_a)
+        assert delete_result == {'status': 'deleted', 'finding_id': fid_a}
+
+        refiled = state.add_finding(
+            run_id='r1',
+            severity='low',
+            category='c',
+            description='corrected description',
+            suggested_action='corrected action',
+            task_id='42',
+            flag_type='f',
+        )
+        assert 'finding_id' in refiled, f'refile after delete failed: {refiled}'
+        assert refiled['finding_id'] != fid_a
+
+    def test_delete_then_refile_same_null_null_description_allocates_fresh(self):
+        """Same as above but for the null-null (description-hash) dedup path."""
+        state, _ = self._make_state()
+        state.start_report(run_id='r1', stage='s1', project_id='dark_factory')
+        added = state.add_finding(
+            run_id='r1',
+            severity='low',
+            category='informational',
+            description='shared observation',
+            suggested_action='none',
+            actionable=False,
+        )
+        fid_a = added['finding_id']
+
+        delete_result = state.delete_finding('r1', fid_a)
+        assert delete_result == {'status': 'deleted', 'finding_id': fid_a}
+
+        refiled = state.add_finding(
+            run_id='r1',
+            severity='low',
+            category='informational',
+            description='shared observation',
+            suggested_action='none',
+            actionable=False,
+        )
+        assert 'finding_id' in refiled, f'refile after delete failed: {refiled}'
+        assert refiled['finding_id'] != fid_a
+
+    def test_delete_from_later_active_stage_removes_from_owning_stage_report(self):
+        """Stage 1 files A; Stage 2 of the SAME run becomes active;
+        delete_finding(run_id, A) must still resolve A cross-stage and
+        remove it from Stage 1's assembled report.
+        """
+        state, _ = self._make_state()
+
+        state.start_report(run_id='r1', stage='memory_consolidator', project_id='dark_factory')
+        added = state.add_finding(
+            run_id='r1',
+            severity='low',
+            category='c',
+            description='d',
+            suggested_action='a',
+            task_id='42',
+            flag_type='f',
+        )
+        fid_a = added['finding_id']
+
+        # Stage 2 becomes the active stage for this run_id.
+        state.start_report(run_id='r1', stage='task_knowledge_sync', project_id='dark_factory')
+
+        result = state.delete_finding('r1', fid_a)
+        assert result == {'status': 'deleted', 'finding_id': fid_a}
+
+        s1_report = state.get_assembled_report('r1', 'memory_consolidator')
+        assert s1_report is not None
+        assert s1_report['flagged_items'] == []
+
