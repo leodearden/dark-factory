@@ -123,6 +123,36 @@ if [ -n "$CLAUDE_SPAWN_RESULT_FILE" ]; then
   result_export="export CLAUDE_SPAWN_RESULT_FILE=$q_result_file; "
 fi
 
+# Result-handback trailer (Attention Rail T5): appended to the prompt itself
+# so the spawned session is told, in-band, to write its outcome before
+# ending. Gated on the same non-empty check as result_export above -- a
+# fail-soft empty record dir means no trailer is appended either, so a
+# session is never pointed at a bogus path. This is purely additive text;
+# `q_prompt=$(printf %q "$prompt")` below safely quotes the now-multi-line
+# prompt through `bash -c "$inner"` unchanged. Best-effort by design: the
+# trailer only asks the session to write the file, nothing here blocks exit
+# on it, and a parent that finds no result.md simply falls back to its own
+# exploration.
+if [ -n "$CLAUDE_SPAWN_RESULT_FILE" ]; then
+  prompt="${prompt}
+
+---
+Before you end this session (whether you finish, hand off, or get
+blocked), write your outcome to: $CLAUDE_SPAWN_RESULT_FILE
+
+Format (markdown with a small structured header -- parent readers are
+LLMs, so keep it concise and scannable):
+
+---
+outcome: done|blocked|abandoned|handed-off
+changed: (commits/branches/task ids touched, or none)
+action_needed: (what a human or parent should do next, or none)
+---
+A few sentences of prose context.
+
+This is best-effort: writing this file must never block your normal exit."
+fi
+
 flags=""
 [ "$skip_perms" = "true" ] && flags="--dangerously-skip-permissions"
 
