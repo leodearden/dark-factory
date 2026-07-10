@@ -19,6 +19,10 @@ F2: F1 + a never-landed task D.
 """
 from __future__ import annotations
 
+import json
+import sqlite3
+from datetime import UTC, datetime, timedelta
+
 import analyze_speculation_depth as mod
 
 
@@ -120,3 +124,114 @@ class TestComputeCalibrationF2:
     def test_p_good_bracket(self):
         cal = mod.compute_calibration(F2_MERGE_VERIFY, F2_MERGE_ATTEMPT)
         assert cal['p_good_bracket'] == (0.75, 0.75)
+
+
+# ---------------------------------------------------------------------------
+# format_report — NO-depth calibration falls back to a runner-split section
+# explicitly labelled CONFOUNDED, with a warning (no real depth signal).
+# ---------------------------------------------------------------------------
+
+class TestFormatReportNoDepth:
+    """format_report(calibration, per_depth=None) on F2 (no event carries a
+    depth field, so per_depth is None/empty — the fallback trigger)."""
+
+    @classmethod
+    def setup_class(cls):
+        cls.cal = mod.compute_calibration(F2_MERGE_VERIFY, F2_MERGE_ATTEMPT)
+        cls.report = mod.format_report(cls.cal, None)
+
+    def test_contains_per_attempt_rate(self):
+        assert '0.5' in self.report  # per_attempt_pass_rate == 0.5
+
+    def test_contains_both_p_flake_numbers(self):
+        # method 1 (per-attempt == 0.5) and method 2 (attempts-to-first-pass
+        # among landed == 0.75) must BOTH be surfaced so an operator can
+        # confirm the two independent computations agree (or flag a
+        # divergence, as here — F2 has a never-landed task).
+        assert '0.5' in self.report
+        assert '0.75' in self.report
+
+    def test_contains_p_good_bracket(self):
+        assert '0.75' in self.report  # bracket == (0.75, 0.75)
+
+    def test_contains_retry_histogram(self):
+        assert '1x:2' in self.report
+        assert '2x:1' in self.report
+
+    def test_contains_terminal_tally(self):
+        assert 'done=3' in self.report
+        assert 'conflict=1' in self.report
+
+    def test_contains_confounded_runner_split_with_warning(self):
+        assert 'CONFOUNDED' in self.report
+        assert 'runner' in self.report.lower()
+        assert 'WARNING' in self.report
+
+
+# ---------------------------------------------------------------------------
+# main(argv) — end-to-end CLI smoke test against a tmp sqlite runs.db
+# ---------------------------------------------------------------------------
+
+_EVENTS_SCHEMA = """
+CREATE TABLE events (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    timestamp   TEXT    NOT NULL,
+    run_id      TEXT    NOT NULL,
+    task_id     TEXT,
+    event_type  TEXT    NOT NULL,
+    phase       TEXT,
+    role        TEXT,
+    data        TEXT    DEFAULT '{}',
+    cost_usd    REAL
+);
+"""
+
+
+def _seed_events_db(path, *, merge_verify_events, merge_attempt_events):
+    """Write a tiny events table (mirrors event_store.py's real schema).
+
+    Rows are timestamped within the last day so a --since window of 30 (or
+    even 1) days includes them.
+    """
+    conn = sqlite3.connect(path)
+    conn.executescript(_EVENTS_SCHEMA)
+    now = datetime.now(UTC)
+    rows = []
+    for i, ev in enumerate(merge_verify_events):
+        ts = (now - timedelta(minutes=i)).isoformat()
+        rows.append(
+            (ts, 'run-1', ev['task_id'], 'merge_verify', None, None,
+             json.dumps(ev['data']), None)
+        )
+    for i, ev in enumerate(merge_attempt_events):
+        ts = (now - timedelta(minutes=i)).isoformat()
+        rows.append(
+            (ts, 'run-1', ev['task_id'], 'merge_attempt', None, None,
+             json.dumps(ev['data']), None)
+        )
+    conn.executemany(
+        'INSERT INTO events '
+        '(timestamp, run_id, task_id, event_type, phase, role, data, cost_usd) '
+        'VALUES (?, ?, ?, ?, ?, ?, ?, ?)',
+        rows,
+    )
+    conn.commit()
+    conn.close()
+
+
+class TestMainCLI:
+    """main([db_path, '--since', '30']) end-to-end against a tmp sqlite DB."""
+
+    def test_main_smoke_reports_per_attempt_rate(self, tmp_path, capsys):
+        db_path = str(tmp_path / 'runs.db')
+        _seed_events_db(
+            db_path,
+            merge_verify_events=F2_MERGE_VERIFY,
+            merge_attempt_events=F2_MERGE_ATTEMPT,
+        )
+
+        ret = mod.main([db_path, '--since', '30'])
+
+        captured = capsys.readouterr()
+        assert ret == 0
+        assert '0.5' in captured.out  # F2 per-attempt pass rate == 3/6 == 0.5
