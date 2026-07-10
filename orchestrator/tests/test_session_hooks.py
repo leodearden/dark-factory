@@ -17,6 +17,7 @@ import os
 import re
 import subprocess
 from collections.abc import Mapping
+from datetime import datetime
 from pathlib import Path
 
 import pytest  # pyright: ignore[reportMissingImports]
@@ -319,6 +320,155 @@ def test_run_notification_prefers_persisted_record_title(tmp_path: Path) -> None
     osc = sh.run_notification(hook_input, env, root=tmp_path)
 
     assert osc == '\033]0;⏸ AWAITING unblock:df#2085 routing-mechanism\007'
+
+
+# ---------------------------------------------------------------------------
+# Task 2292 step-1: Notification question capture (Fleet Cockpit C2)
+# ---------------------------------------------------------------------------
+
+
+def test_run_notification_stamps_question_from_message(tmp_path: Path) -> None:
+    hook_input = {
+        'session_id': 'sess-q1',
+        'cwd': '/home/leo/src/dark-factory',
+        'message': 'Claude needs your permission to run Bash',
+    }
+    env: dict[str, str] = {}
+    slug = sh.hook_session_slug(hook_input, env)
+    existing = sr.SessionRecord(
+        session_slug=slug,
+        status=sr.Status.RUNNING,
+        role='session',
+        project='dark-factory',
+        cwd='/home/leo/src/dark-factory',
+    )
+    sr.write_record(existing, root=tmp_path)
+
+    sh.run_notification(hook_input, env, root=tmp_path)
+
+    record = sr.read_record(slug, root=tmp_path)
+    assert record.status == sr.Status.AWAITING_INPUT
+    assert record.question is not None
+    assert record.question.text == 'Claude needs your permission to run Bash'
+    # asked_at is a non-empty, genuinely parseable ISO-8601 timestamp.
+    assert record.question.asked_at
+    datetime.fromisoformat(record.question.asked_at)
+
+
+def test_run_notification_question_stamp_preserves_other_fields(tmp_path: Path) -> None:
+    # merge-not-clobber, record-level: previously-populated fields (title/
+    # role/project/task_id) survive the question-stamping write.
+    hook_input = {
+        'session_id': 'sess-q2',
+        'cwd': '/home/leo/src/dark-factory',
+        'message': 'Allow file write?',
+    }
+    env: dict[str, str] = {}
+    slug = sh.hook_session_slug(hook_input, env)
+    existing = sr.SessionRecord(
+        session_slug=slug,
+        status=sr.Status.RUNNING,
+        title='unblock:df#2085 routing-mechanism',
+        role='unblock',
+        project='df',
+        task_id='2085',
+        cwd='/home/leo/src/dark-factory',
+    )
+    sr.write_record(existing, root=tmp_path)
+
+    sh.run_notification(hook_input, env, root=tmp_path)
+
+    record = sr.read_record(slug, root=tmp_path)
+    assert record.title == 'unblock:df#2085 routing-mechanism'
+    assert record.role == 'unblock'
+    assert record.project == 'df'
+    assert record.task_id == '2085'
+    assert record.question is not None
+    assert record.question.text == 'Allow file write?'
+
+
+@pytest.mark.parametrize(
+    'hook_input_extra',
+    [
+        {},
+        {'message': ''},
+        {'message': '   '},
+    ],
+    ids=['absent', 'blank', 'whitespace'],
+)
+def test_run_notification_no_question_when_message_absent_or_blank(
+    tmp_path: Path,
+    hook_input_extra: dict[str, str],
+) -> None:
+    hook_input = {'session_id': 'sess-q3', 'cwd': '/home/leo/src/dark-factory', **hook_input_extra}
+    env: dict[str, str] = {}
+    slug = sh.hook_session_slug(hook_input, env)
+    existing = sr.SessionRecord(
+        session_slug=slug,
+        status=sr.Status.RUNNING,
+        role='session',
+        project='dark-factory',
+        cwd='/home/leo/src/dark-factory',
+    )
+    sr.write_record(existing, root=tmp_path)
+
+    osc = sh.run_notification(hook_input, env, root=tmp_path)
+
+    record = sr.read_record(slug, root=tmp_path)
+    assert record.status == sr.Status.AWAITING_INPUT
+    assert record.question is None
+    assert osc == '\033]0;⏸ AWAITING session:dark-factory\007'
+
+
+def test_run_stop_does_not_stamp_question_even_with_message(tmp_path: Path) -> None:
+    # Stop (idle) never captures a question, even if the hook's stdin JSON
+    # happens to carry a 'message' key.
+    hook_input = {
+        'session_id': 'sess-q4',
+        'cwd': '/home/leo/src/dark-factory',
+        'message': 'Should not be captured by Stop',
+    }
+    env: dict[str, str] = {}
+    slug = sh.hook_session_slug(hook_input, env)
+    existing = sr.SessionRecord(
+        session_slug=slug,
+        status=sr.Status.RUNNING,
+        role='session',
+        project='dark-factory',
+        cwd='/home/leo/src/dark-factory',
+    )
+    sr.write_record(existing, root=tmp_path)
+
+    sh.run_stop(hook_input, env, root=tmp_path)
+
+    record = sr.read_record(slug, root=tmp_path)
+    assert record.status == sr.Status.IDLE
+    assert record.question is None
+
+
+def test_main_notification_stamps_question_via_stdin(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    # stdin -> question plumbing: the hooks/notification.sh entrypoint passes
+    # the Notification event's stdin JSON straight through to session_hooks
+    # via command substitution, so main() itself must thread 'message' into
+    # the stamped question with no .sh changes required.
+    monkeypatch.setenv('CLAUDE_FLEET_ROOT', str(tmp_path))
+    hook_input = {
+        'session_id': 'sess-main-q',
+        'cwd': '/home/leo/src/dark-factory',
+        'message': 'Claude needs your permission to run Bash',
+    }
+    _stdin_json(monkeypatch, hook_input)
+
+    rc = sh.main(['notification'])
+
+    assert rc == 0
+    slug = sh.hook_session_slug(hook_input, env={})
+    record = sr.read_record(slug, root=tmp_path)
+    assert record.question is not None
+    assert record.question.text == 'Claude needs your permission to run Bash'
 
 
 # ---------------------------------------------------------------------------
