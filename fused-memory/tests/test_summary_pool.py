@@ -1010,3 +1010,104 @@ class TestWriteCycleSummaryMirrorAndTrim:
             )
 
         assert result is True
+
+
+# ---------------------------------------------------------------------------
+# Task 2229 (W5-λ) step-09/step-10: shared-symbol removal contract.
+#
+# Runtime-checkable D1 grep signal — the LLM nonce machinery and the
+# verify/reconstruct self-heal chain it powered must be fully deleted now
+# that both stages write their per-cycle summary deterministically via
+# write_cycle_summary. These are import/attribute assertions on live
+# runtime symbols, not docstring/prose checks.
+#
+# RED until step-10 deletes generate_summary_nonce/build_summary_nonce_section
+# from cli_stage_runner.py and pretrim_summary_pool/verify_cycle_summary_written/
+# reconstruct_cycle_summary_stub/_build_fallback_summary_content/
+# _nonce_prefix_for_stage/_extract_response_memory_ids from summary_pool.py.
+# ---------------------------------------------------------------------------
+
+
+class TestNonceAndSelfHealSymbolsRemoved:
+    """The nonce generator + its self-heal consumers must no longer exist."""
+
+    def test_cli_stage_runner_has_no_generate_summary_nonce(self):
+        from fused_memory.reconciliation import cli_stage_runner
+
+        assert not hasattr(cli_stage_runner, 'generate_summary_nonce'), (
+            'cli_stage_runner.generate_summary_nonce is retired LLM nonce '
+            'machinery (task 2229 W5-λ) and must be deleted.'
+        )
+
+    def test_cli_stage_runner_has_no_build_summary_nonce_section(self):
+        from fused_memory.reconciliation import cli_stage_runner
+
+        assert not hasattr(cli_stage_runner, 'build_summary_nonce_section'), (
+            'cli_stage_runner.build_summary_nonce_section is retired LLM nonce '
+            'machinery (task 2229 W5-λ) and must be deleted.'
+        )
+
+    def test_summary_pool_has_no_pretrim_summary_pool(self):
+        from fused_memory.reconciliation import summary_pool
+
+        assert not hasattr(summary_pool, 'pretrim_summary_pool'), (
+            'summary_pool.pretrim_summary_pool is retired trim-then-write '
+            'wiring (task 2229 W5-λ); write_cycle_summary owns its own '
+            'best-effort post-write trim now.'
+        )
+
+    def test_summary_pool_has_no_verify_cycle_summary_written(self):
+        from fused_memory.reconciliation import summary_pool
+
+        assert not hasattr(summary_pool, 'verify_cycle_summary_written'), (
+            'summary_pool.verify_cycle_summary_written is retired LLM-write '
+            'self-heal (task 2229 W5-λ); there is nothing left for it to verify.'
+        )
+
+    def test_summary_pool_has_no_reconstruct_cycle_summary_stub(self):
+        from fused_memory.reconciliation import summary_pool
+
+        assert not hasattr(summary_pool, 'reconstruct_cycle_summary_stub'), (
+            'summary_pool.reconstruct_cycle_summary_stub is retired LLM-write '
+            'self-heal (task 2229 W5-λ); there is nothing left for it to reconstruct.'
+        )
+
+    def test_summary_pool_has_no_build_fallback_summary_content(self):
+        from fused_memory.reconciliation import summary_pool
+
+        assert not hasattr(summary_pool, '_build_fallback_summary_content'), (
+            'summary_pool._build_fallback_summary_content backed the retired '
+            'reconstruct_cycle_summary_stub (task 2229 W5-λ) and must go with it.'
+        )
+
+    def test_summary_pool_has_no_nonce_prefix_for_stage(self):
+        from fused_memory.reconciliation import summary_pool
+
+        assert not hasattr(summary_pool, '_nonce_prefix_for_stage'), (
+            'summary_pool._nonce_prefix_for_stage backed the retired nonce '
+            'fallback-stub content (task 2229 W5-λ) and must go with it.'
+        )
+
+    def test_summary_pool_has_no_extract_response_memory_ids(self):
+        from fused_memory.reconciliation import summary_pool
+
+        assert not hasattr(summary_pool, '_extract_response_memory_ids'), (
+            'summary_pool._extract_response_memory_ids backed the retired '
+            'verify/reconstruct self-heal chain (task 2229 W5-λ) and must go with it.'
+        )
+
+    def test_summary_pool_still_has_enforce_summary_pool_cap(self):
+        from fused_memory.reconciliation import summary_pool
+
+        assert hasattr(summary_pool, 'enforce_summary_pool_cap'), (
+            'enforce_summary_pool_cap is still needed — write_cycle_summary '
+            "calls it directly to bound the Mem0 mirror pool."
+        )
+
+    def test_summary_pool_still_has_write_cycle_summary(self):
+        from fused_memory.reconciliation import summary_pool
+
+        assert hasattr(summary_pool, 'write_cycle_summary'), (
+            'write_cycle_summary is the deterministic replacement (task 2229 '
+            'W5-λ) and must remain.'
+        )
