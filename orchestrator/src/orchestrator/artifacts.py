@@ -170,13 +170,11 @@ class TaskArtifacts:
                 When omitted (``None``), ``self.root`` falls back to the
                 legacy ``<worktree>/.task`` path and this class behaves
                 byte-identically to before this argument existed. When
-                supplied, all writes target ``meta_root`` and reads fall
-                back to the legacy path only when the new path is absent
-                (see ``_read_path``).
+                supplied, all reads and writes target ``meta_root`` only —
+                the legacy path is never consulted.
         """
         self.worktree = worktree
-        self._legacy_root = worktree / '.task'
-        self.root = meta_root if meta_root is not None else self._legacy_root
+        self.root = meta_root if meta_root is not None else worktree / '.task'
 
     @staticmethod
     def meta_root_for(worktree_base: Path, worktree_name: str) -> Path:
@@ -196,9 +194,8 @@ class TaskArtifacts:
         would wipe a legacy ``<worktree>/.task``. With a pooled/reused lane
         (e.g. the ``_lane-0``-style names used in this module's tests), a new
         task assigned a previously-used lane name could otherwise see the
-        PRIOR task's leftover ``.task-meta/<name>`` artifacts — either
-        directly, or resurrected via ``_read_path``'s new-then-old fallback
-        (a stale ``blocking_dependency``/``already_done``/``false_premise``
+        PRIOR task's leftover ``.task-meta/<name>`` artifacts directly (a
+        stale ``blocking_dependency``/``already_done``/``false_premise``
         report). Nothing in β triggers this today (no caller passes
         ``meta_root`` yet); the first caller that does so for a pooled lane
         is responsible for clearing/re-initializing ``.task-meta/<name>`` on
@@ -213,34 +210,13 @@ class TaskArtifacts:
         task_description: str,
         base_commit: str | None = None,
     ) -> None:
-        """Create .task/ with initial metadata.json and .gitignore.
+        """Create .task/ with initial metadata.json.
 
         IMPORTANT: This method is safe to call when .task/ already exists
-        (e.g. inherited from a contaminated main).  It unconditionally
-        writes .task/.gitignore to ensure git ignores the contents even
-        if the directory was pre-existing and tracked.
+        (e.g. inherited from a contaminated main).
         """
         self.root.mkdir(parents=True, exist_ok=True)
         (self.root / 'reviews').mkdir(exist_ok=True)
-
-        # ── .task/.gitignore — always written unconditionally ─────────
-        # This file tells git to ignore everything inside .task/.
-        # We write it every time init() is called, not just on first
-        # creation, because:
-        # 1. If .task/ was inherited from a contaminated main, the
-        #    .gitignore may be missing or have different contents.
-        # 2. An agent may have deleted or modified it.
-        # 3. It's idempotent and cheap.
-        #
-        # This is ONE layer of defense.  See git_ops.py module docstring
-        # for the full list of .task/ contamination safeguards.
-        (self.root / '.gitignore').write_text(
-            '# Ignore ALL orchestrator scratch files.\n'
-            '# DO NOT remove or modify this file.  .task/ must never be\n'
-            '# committed to any branch that will be merged to main.\n'
-            '# See git_ops.py module docstring for why this matters.\n'
-            '*\n'
-        )
 
         metadata = {
             'task_id': task_id,
@@ -253,7 +229,7 @@ class TaskArtifacts:
         self._write_json(self.root / 'metadata.json', metadata)
 
     def read_base_commit(self) -> str | None:
-        """Read the base commit SHA stored at init time (new-path-then-old)."""
+        """Read the base commit SHA stored at init time."""
         meta_path = self._read_path('metadata.json')
         if not meta_path.exists():
             return None
@@ -261,13 +237,7 @@ class TaskArtifacts:
         return metadata.get('base_commit')
 
     def update_base_commit(self, new_base: str) -> None:
-        """Update the base_commit in metadata.json after a rebase.
-
-        Reads new-path-then-old but always writes back to the new path
-        only (migrate-on-write) — the legacy metadata.json is left in
-        place, stale, for the rest of the compat window; see
-        ``_read_path`` for why that's safe and when it gets cleaned up.
-        """
+        """Update the base_commit in metadata.json after a rebase."""
         meta_path = self._read_path('metadata.json')
         if not meta_path.exists():
             return
@@ -304,7 +274,7 @@ class TaskArtifacts:
 
     def read_blocking_dependency(self) -> dict | None:
         """Return the parsed ``.task/blocking_dependency.json`` artifact if
-        present (new-path-then-old), else ``None``.
+        present, else ``None``.
         """
         path = self._read_path('blocking_dependency.json')
         if not path.exists():
@@ -312,8 +282,7 @@ class TaskArtifacts:
         return json.loads(path.read_text())
 
     def clear_blocking_dependency(self) -> None:
-        """Remove ``.task/blocking_dependency.json`` if present (both the new
-        and legacy paths — see ``_clear_path``).
+        """Remove ``.task/blocking_dependency.json`` if present.
 
         Called by the workflow after the dependency has been registered (or
         determined to be a no-op due to an advance-past-report race) so a
@@ -345,8 +314,8 @@ class TaskArtifacts:
         self._write_json(self.root / 'already_done.json', data)
 
     def read_already_done(self) -> dict | None:
-        """Return the parsed ``.task/already_done.json`` artifact if present
-        (new-path-then-old).
+        """Return the parsed ``.task/already_done.json`` artifact if present,
+        else ``None``.
         """
         path = self._read_path('already_done.json')
         if not path.exists():
@@ -354,7 +323,7 @@ class TaskArtifacts:
         return json.loads(path.read_text())
 
     def clear_already_done(self) -> None:
-        """Remove ``.task/already_done.json`` if present (both roots)."""
+        """Remove ``.task/already_done.json`` if present."""
         self._clear_path('already_done.json')
 
     def write_unactionable_task(self, reason: str, evidence: str) -> None:
@@ -374,7 +343,7 @@ class TaskArtifacts:
 
     def read_unactionable_task(self) -> dict | None:
         """Return the parsed ``.task/unactionable_task.json`` artifact if
-        present (new-path-then-old).
+        present, else ``None``.
         """
         path = self._read_path('unactionable_task.json')
         if not path.exists():
@@ -382,7 +351,7 @@ class TaskArtifacts:
         return json.loads(path.read_text())
 
     def clear_unactionable_task(self) -> None:
-        """Remove ``.task/unactionable_task.json`` if present (both roots)."""
+        """Remove ``.task/unactionable_task.json`` if present."""
         self._clear_path('unactionable_task.json')
 
     def write_false_premise(
@@ -408,8 +377,8 @@ class TaskArtifacts:
         self._write_json(self.root / 'false_premise.json', data)
 
     def read_false_premise(self) -> dict | None:
-        """Return the parsed ``.task/false_premise.json`` artifact if present
-        (new-path-then-old).
+        """Return the parsed ``.task/false_premise.json`` artifact if present,
+        else ``None``.
         """
         path = self._read_path('false_premise.json')
         if not path.exists():
@@ -417,60 +386,19 @@ class TaskArtifacts:
         return json.loads(path.read_text())
 
     def clear_false_premise(self) -> None:
-        """Remove ``.task/false_premise.json`` if present (both roots)."""
+        """Remove ``.task/false_premise.json`` if present."""
         self._clear_path('false_premise.json')
 
     def _read_path(self, name: str) -> Path:
-        """Resolve *name* new-path-then-old (compat window).
-
-        Returns ``self.root / name`` if it exists, else ``self._legacy_root
-        / name`` if THAT exists, else ``self.root / name`` as the canonical
-        (non-existent) path. When ``meta_root`` was not supplied to the
-        constructor, ``self.root == self._legacy_root`` so this is a no-op.
-
-        Migrate-on-write callers (``update_base_commit``, ``read_plan``'s
-        normalization write-back, ``update_step_status``,
-        ``bump_revalidation_stamp``, ``stamp_plan_provenance``) copy the
-        consolidated artifact to the new path but deliberately leave the
-        legacy copy in place — untouched and increasingly stale — for the
-        rest of the compat window. That's safe as long as every read keeps
-        resolving new-then-old through this helper (the new copy always
-        wins once it exists). It would NOT be safe to re-instantiate
-        ``TaskArtifacts`` for the same worktree with ``meta_root=None``
-        after a partial migration, since that flips resolution to
-        legacy-only and would silently surface the stale copy — but nothing
-        in the codebase does that (``meta_root`` is derived once from
-        config, not toggled per-instantiation). Deleting the legacy copies
-        (and retiring this fallback entirely) is task ι in
-        ``plans/worktree-lane-lifecycle-prd.md``, gated on a full green
-        cycle after θ.
-        """
-        new = self.root / name
-        if new.exists():
-            return new
-        legacy = self._legacy_root / name
-        if legacy.exists():
-            return legacy
-        return new
+        """Resolve *name* under ``self.root``."""
+        return self.root / name
 
     def _clear_path(self, name: str) -> None:
-        """Remove *name* from BOTH the new and legacy roots (compat window).
-
-        The write-side mirror of ``_read_path``. Because paired ``read_*``
-        methods fall back to the legacy path via ``_read_path``, a clear that
-        only unlinks the new path is a no-op on a legacy-only artifact — the
-        next read then resurrects it through the fallback. Removing from both
-        roots closes that window. When ``meta_root`` was not supplied,
-        ``self.root == self._legacy_root`` so both calls target the same
-        path (idempotent, byte-identical).
-        """
+        """Remove *name* from ``self.root`` if present."""
         (self.root / name).unlink(missing_ok=True)
-        (self._legacy_root / name).unlink(missing_ok=True)
 
     def read_plan(self) -> dict:
-        """Read current plan state (new-path-then-old), auto-normalizing
-        malformed shapes.
-        """
+        """Read current plan state, auto-normalizing malformed shapes."""
         plan_path = self._read_path('plan.json')
         if not plan_path.exists():
             return {}
@@ -524,33 +452,14 @@ class TaskArtifacts:
         return completed
 
     def append_iteration_log(self, entry: dict) -> None:
-        """Append to .task/iterations.jsonl — one JSON object per line.
-
-        Migrate-on-first-append: if the new path's log does not exist yet
-        but a legacy log does, the legacy history is copied into the new
-        path BEFORE the new entry is appended. This consolidates all
-        history under the new path so `read_iteration_log` (via
-        `_read_path`) does not silently drop legacy entries once the new
-        file exists (split-brain). When `meta_root` was not supplied,
-        `self.root == self._legacy_root` so this branch is skipped
-        (byte-identical).
-        """
+        """Append to .task/iterations.jsonl — one JSON object per line."""
         entry['timestamp'] = datetime.now(UTC).isoformat()
         log_path = self.root / 'iterations.jsonl'
-        legacy_log_path = self._legacy_root / 'iterations.jsonl'
-        if (
-            log_path != legacy_log_path
-            and not log_path.exists()
-            and legacy_log_path.exists()
-        ):
-            log_path.parent.mkdir(parents=True, exist_ok=True)
-            log_path.write_text(legacy_log_path.read_text())
         with open(log_path, 'a') as f:
             f.write(json.dumps(entry) + '\n')
 
     def read_iteration_log(self) -> tuple[list[dict], list[str]]:
-        """Read all iteration log entries (new-path-then-old), skipping
-        corrupted lines.
+        """Read all iteration log entries, skipping corrupted lines.
 
         Returns (entries, corrupted) where corrupted contains raw lines that
         failed JSON parsing.
@@ -576,17 +485,10 @@ class TaskArtifacts:
 
         Best-effort: if the artifacts root has been removed (worktree gone
         out-of-band), skip the write rather than raising — the review JSON
-        is a debugging aid, not load-bearing for workflow correctness.
-
-        The existence check below is against ``self.root`` (the new path)
-        only, by design — the compat contract is "writes new-path only"
-        (see ``_read_path``), so falling back to the legacy ``reviews/``
-        dir here would violate it. That means this method assumes
-        ``init()`` has already created ``self.root``: reviews are a
-        post-implementation workflow phase, so init() has always run by
-        the time a reviewer's output is written. If ``self.root`` doesn't
-        exist for some other reason, the write is silently skipped rather
-        than resurrected under the legacy dir.
+        is a debugging aid, not load-bearing for workflow correctness. This
+        method assumes ``init()`` has already created ``self.root``:
+        reviews are a post-implementation workflow phase, so init() has
+        always run by the time a reviewer's output is written.
         """
         if not self.root.is_dir():
             logger.info(
@@ -598,33 +500,11 @@ class TaskArtifacts:
         self._write_json(review_path, review)
 
     def read_reviews(self) -> dict[str, dict]:
-        """Read all reviews, MERGING the legacy and new reviews/ directories
-        during the compat window (new wins on stem collision).
-
-        Unlike other artifacts, reviews/ is a multi-writer directory (one
-        file per reviewer), so a whole-dir `_read_path` resolution would
-        pick exactly one directory — once any new reviewer writes, the new
-        dir exists and every legacy reviewer would vanish, silently
-        dropping their findings (including blocking issues) from
-        `aggregate_reviews`. Merging keeps every reviewer visible. When
-        `meta_root` was not supplied, both dirs are the same path, so the
-        second loop below is skipped (not merely redundant) and this
-        yields the identical result (byte-identical) without re-globbing
-        or re-parsing every reviewer file a second time.
-        """
+        """Read all reviews from the reviews/ directory."""
         reviews: dict[str, dict] = {}
-        legacy_reviews_dir = self._legacy_root / 'reviews'
-        if legacy_reviews_dir.is_dir():
-            for path in legacy_reviews_dir.glob('*.json'):
-                reviews[path.stem] = json.loads(path.read_text())
-        new_reviews_dir = self.root / 'reviews'
-        # Guard against re-reading the SAME directory twice: when meta_root
-        # was not supplied (still true for every caller today), new_reviews_dir
-        # == legacy_reviews_dir, and without this check every reviewer file
-        # would be globbed and json.loads'd a second time on the hot
-        # review-aggregation path for no benefit.
-        if new_reviews_dir != legacy_reviews_dir and new_reviews_dir.is_dir():
-            for path in new_reviews_dir.glob('*.json'):
+        reviews_dir = self.root / 'reviews'
+        if reviews_dir.is_dir():
+            for path in reviews_dir.glob('*.json'):
                 reviews[path.stem] = json.loads(path.read_text())
         return reviews
 
@@ -807,14 +687,12 @@ class TaskArtifacts:
         self._write_json(self.root / 'agent_session.json', data)
 
     def clear_agent_session(self) -> None:
-        """Remove ``.task/agent_session.json`` if present (idempotent, both
-        the new and legacy roots).
-        """
+        """Remove ``.task/agent_session.json`` if present (idempotent)."""
         self._clear_path('agent_session.json')
 
     def read_agent_session(self) -> dict | None:
-        """Return parsed ``.task/agent_session.json`` (new-path-then-old),
-        or ``None`` if missing/corrupt.
+        """Return parsed ``.task/agent_session.json``, or ``None`` if
+        missing/corrupt.
         """
         path = self._read_path('agent_session.json')
         if not path.exists():

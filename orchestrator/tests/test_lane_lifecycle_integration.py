@@ -505,12 +505,11 @@ class TestB4Contamination:
         ta.write_plan(_make_plan(1, 2, '42'))
         ta.append_iteration_log({'k': 1})
 
-        # Metadata lives OUTSIDE the worktree. `<lane>/.task` itself may
-        # still exist (acquire's _ensure_task_gitignore defense-in-depth
-        # guard unconditionally drops a `.task/.gitignore` there — an
-        # unrelated, pre-relocation scrub guard) but must hold no metadata:
-        # TaskArtifacts was pointed at the sibling `meta` root, never at
-        # `<lane>/.task`.
+        # Metadata lives OUTSIDE the worktree: TaskArtifacts was pointed at
+        # the sibling `meta` root, never at `<lane>/.task`.  Nothing writes
+        # `<lane>/.task` any more, either — acquire's _ensure_task_gitignore
+        # defense-in-depth guard, the last thing that unconditionally
+        # created it, is gone.
         assert (meta / 'plan.json').exists()
         assert not (lane / '.task' / 'plan.json').exists()
         assert not (lane / '.task-meta').exists()

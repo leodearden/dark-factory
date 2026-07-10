@@ -1,6 +1,6 @@
 """Git worktree and merge operations.
 
-.task/ contamination — now structural, not guard-defended (W11 θ)
+.task/ contamination — now structural, not guard-defended (W11 θ/ι)
 ===================================================================
 The .task/ directory is an ephemeral scratch space for orchestrator agents.
 It used to leak onto main via worktree inheritance, `git add -A`, and merge
@@ -15,15 +15,27 @@ OUTSIDE the git worktree entirely, at <worktree_base>/.task-meta/<name>
 tree is structurally impossible rather than merely guarded against:
 nothing ever writes task metadata into a path git tracks.
 
-Two lightweight safeguards remain for the migration window:
+Both migration-window safeguards have since been dropped too (W11 ι):
 
-- _assert_no_task_dir() — a cheap tripwire that hard-asserts a given commit
-  SHA carries no .task/ entries.  Called before advance_main().  Retained
-  here; dropped in W11 ι once the relocation has proven itself.
-- _ensure_task_gitignore() — writes .task/.gitignore so any leftover
-  <worktree>/.task/ scratch directory self-ignores under `git add -A` /
-  `git status`.  Retained as defense-in-depth; deferred (not dropped) in
-  W11 ι.
+- _assert_no_task_dir() — the cheap tripwire that hard-asserted a given
+  commit SHA carried no .task/ entries before advance_main() — is gone.
+  Contamination is structural, so the tripwire had nothing left to catch.
+  This removes the last commit-time checkpoint before main; that is an
+  intentional defense-in-depth trade-off (not an oversight) now that
+  relocation makes contamination structurally impossible rather than
+  merely guarded against — see task 2262 (W11 ι) design decisions.
+- _ensure_task_gitignore() — which used to write .task/.gitignore so any
+  leftover <worktree>/.task/ scratch directory self-ignored under `git add
+  -A` / `git status` — is gone too: the orchestrator hot path no longer
+  writes task metadata under <worktree>/.task (it lives under .task-meta
+  instead, see TaskArtifacts.meta_root_for()), so there was nothing left
+  for a nested .gitignore to defend. A few non-hot-path callers still
+  construct TaskArtifacts with meta_root=None (e.g. cli.py's eval flow)
+  and do write under <worktree>/.task; that residual directory remains
+  untracked via this repo's root .gitignore .task/ entry, independently
+  of the removed nested one.
+
+No .task-specific guards remain in this module.
 """
 
 import asyncio
@@ -223,49 +235,8 @@ PROTECTED_PREFIXES: dict[str, str] = {
 
 
 # ---------------------------------------------------------------------------
-# .task/ contamination helpers
+# Final-defense gate helpers (advance_main)
 # ---------------------------------------------------------------------------
-
-def _ensure_task_gitignore(worktree: Path) -> None:
-    """Create .task/.gitignore with '*' if it doesn't exist.
-
-    This is a defense-in-depth measure.  When an agent does ``git add .``
-    or ``git add -A``, the nested .gitignore prevents .task/ contents from
-    being staged — UNLESS files were previously explicitly added (tracked
-    files override .gitignore).  The pre-commit hook is the primary guard;
-    this is supplementary.
-    """
-    task_dir = worktree / '.task'
-    task_dir.mkdir(exist_ok=True)
-    gi = task_dir / '.gitignore'
-    if not gi.exists():
-        gi.write_text('# Auto-generated — prevents .task/ from being staged.\n*\n')
-
-
-async def _assert_no_task_dir(sha: str, cwd: Path, context: str) -> None:
-    """Raise RuntimeError if the given commit SHA contains any .task/ entries.
-
-    This is a hard gate — if this fires, something upstream failed to scrub
-    .task/ and we must NOT advance main.
-
-    DO NOT CATCH THIS EXCEPTION to "work around" it.  Fix the root cause:
-    find where .task/ was committed and add a scrub there.
-    """
-    rc, tracked, _ = await _run(
-        ['git', 'ls-tree', '-r', '--name-only', sha, '--', '.task/'],
-        cwd=cwd,
-    )
-    if rc == 0 and tracked.strip():
-        files = tracked.strip().splitlines()
-        raise RuntimeError(
-            f'.task/ CONTAMINATION GATE FAILED ({context}): commit {sha[:8]} '
-            f'contains {len(files)} .task/ file(s): {", ".join(files[:5])}. '
-            f'Refusing to advance main.  This is a bug — .task/ execution '
-            f'metadata is supposed to live outside the worktree entirely '
-            f'(see TaskArtifacts.meta_root_for); it should never have '
-            f'reached this commit.'
-        )
-
 
 async def _assert_no_conflict_markers(sha: str, cwd: Path, context: str) -> None:
     """Raise RuntimeError if the given commit SHA's tree has tracked files
@@ -289,11 +260,10 @@ async def _assert_no_conflict_markers(sha: str, cwd: Path, context: str) -> None
     trailing ref label, so this does not narrow real-world coverage.
 
     Fail-open (no raise) when git reports no match (``git grep`` exits 1)
-    OR on a git error — mirrors :func:`_assert_no_task_dir`'s fail-open
-    semantics: a broken git invocation must not itself become a false
-    block.  Unlike the clean no-match case, a git-error fail-open is logged
-    at WARNING (with stderr) so operators can tell a genuinely clean tree
-    apart from one this gate failed to evaluate.
+    OR on a git error: a broken git invocation must not itself become a
+    false block.  Unlike the clean no-match case, a git-error fail-open is
+    logged at WARNING (with stderr) so operators can tell a genuinely clean
+    tree apart from one this gate failed to evaluate.
     """
     rc, out, err = await _run(
         ['git', 'grep', '-lE', r'^(<{7}|>{7}) ', sha, '--', '.'],
@@ -1599,7 +1569,6 @@ class GitOps:
                             worktree_path, actual_base[:8],
                         )
 
-                _ensure_task_gitignore(worktree_path)
                 # Re-run on reuse so the requeued agent re-acquires a free
                 # port and re-patches its .mcp.json.  The script must be
                 # idempotent (return the same port for the same worktree dir)
@@ -1722,12 +1691,6 @@ class GitOps:
             'Created worktree at %s on branch %s (base=%s, stale_commits=%s)',
             worktree_path, full_branch, base_sha[:8], stale_commits,
         )
-
-        # ── .task/.gitignore defense layer ────────────────────────────
-        # Create .task/.gitignore with "*" so that broad "git add ."
-        # commands in the worktree don't pick up .task/ contents.  This
-        # is defense-in-depth — the pre-commit hook is the primary guard.
-        _ensure_task_gitignore(worktree_path)
 
         # Re-capture base from the worktree's own merge-base after
         # positioning.  merge-base from inside the freshly-created worktree
@@ -1990,11 +1953,6 @@ class GitOps:
         # gamma relocation; PRD `.task-meta` path-derivation contract: writes
         # new-path-only) — a worktree_base sibling of the worktree, so
         # `git add -A` in the lane can never stage it.
-        # _ensure_task_gitignore writes .task/.gitignore('*') first (and
-        # creates the legacy .task/ dir) — kept as-is (guard-layer deletion
-        # is θ/ι scope, out of scope here) even though the stamp itself no
-        # longer lands under it.
-        _ensure_task_gitignore(path)
         stamp = {
             'owner': slug,
             'created_at': datetime.now(UTC).isoformat(),
@@ -2621,10 +2579,11 @@ class GitOps:
         *tracked* WIP onto the victim's still-checked-out branch so 1912
         branch-retention preserves it via the retained branch ref for future
         ``reattach`` recovery.  ``.task/plan.json`` is intentionally excluded
-        (task metadata lives outside the worktree; any leftover ``.task/`` is
-        self-ignored via its own ``.task/.gitignore``) and is **not** preserved
-        across the reclaim; the resumed victim takes the orphan-commits reattach
-        path, not disk-backstop reuse.
+        (task metadata lives outside the worktree for the orchestrator hot
+        path; any leftover ``.task/`` is covered by this repo's root
+        ``.gitignore`` ``.task/`` entry) and is **not** preserved across the
+        reclaim; the resumed victim takes the orphan-commits reattach path,
+        not disk-backstop reuse.
 
         Emits a WARNING on every steal as an ops signal that pool pressure
         required the safety valve.
@@ -3300,9 +3259,7 @@ class GitOps:
                     return recycle_result
                 route = AcquireRoute.RECYCLE
 
-            # ── Shared tail: gitignore, base, debug-port ──────────────────
-            _ensure_task_gitignore(lane)
-
+            # ── Shared tail: base, debug-port ──────────────────────────────
             _, mb_out, _ = await _run(
                 ['git', 'merge-base', start_ref, 'HEAD'],
                 cwd=lane,
@@ -3415,14 +3372,14 @@ class GitOps:
         Mirrors the cold-requeue reuse block (git_ops.py ~806-858):
         1. Commit any uncommitted WIP so it is preserved across the rebase.
         2. Rebase onto main (best-effort; log failure and continue on old base).
-        3. Re-ensure the task .gitignore.
         4. Recompute ``base_commit`` as ``merge-base main HEAD``.
         5. Re-provision the debug port (inv.7).
 
         ``.task/plan.json`` is NOT committed by ``commit()`` (task metadata
-        lives outside the worktree; any leftover ``.task/`` is self-ignored
-        via its own ``.task/.gitignore``) and survives the rebase intact
-        because git rebase only touches tracked files.
+        lives outside the worktree for the orchestrator hot path; any
+        leftover ``.task/`` is covered by this repo's root ``.gitignore``
+        ``.task/`` entry) and survives the rebase intact because git rebase
+        only touches tracked files.
 
         Returns:
             WorktreeInfo for the reused lane.  Never raises — exceptions
@@ -3459,9 +3416,6 @@ class GitOps:
         #     Route 3 (γ reattach) already re-attaches before this call, so
         #     the rebind is a harmless reset-to-self there.
         await self.rebind_branch_to_head(lane_dir, full_branch)
-
-        # 3. Re-ensure task .gitignore (idempotent)
-        _ensure_task_gitignore(lane_dir)
 
         # 4. Recompute base: merge-base between main_branch and HEAD
         _, mb_out, _ = await _run(
@@ -4391,11 +4345,14 @@ class GitOps:
         """Stage all changes and commit. Returns sha or None if nothing to commit.
 
         .task/ execution metadata now lives outside the worktree entirely
-        (see module docstring / TaskArtifacts.meta_root_for), so no pathspec
-        exclusion or post-staging unstage is needed here: a leftover
-        <worktree>/.task/ (if anything still creates one) is self-ignored by
-        its own .task/.gitignore (_ensure_task_gitignore), so `git add -A`
-        never stages it.
+        for the orchestrator hot path (see module docstring /
+        TaskArtifacts.meta_root_for), so no pathspec exclusion or
+        post-staging unstage is needed here for that path: `git add -A`
+        has nothing under .task/ to stage. A few callers still construct
+        TaskArtifacts with meta_root=None (e.g. cli.py's eval flow) and do
+        write under <worktree>/.task; that residual directory is covered
+        by this repo's root .gitignore `.task/` entry, so `git add -A`
+        never stages anything under it either way.
 
         Pre-staging conflict guard (esc-2128-8): if *worktree* has any
         unresolved (unmerged-index) paths — e.g. a stash-pop that conflicted
@@ -5088,9 +5045,10 @@ class GitOps:
     async def has_uncommitted_work(self, worktree: Path) -> bool:
         """Return True if worktree has staged or unstaged changes.
 
-        The leftover ``.task/`` (if any) is self-ignored via its own
-        ``.task/.gitignore``, so it never surfaces in ``git status`` output —
-        no pathspec exclusion is needed here.
+        A leftover ``.task/`` (if any) is covered by this repo's root
+        ``.gitignore`` (a tracked ``.task/`` entry every worktree inherits),
+        so it never surfaces in ``git status`` output — no pathspec
+        exclusion is needed here.
         """
         rc, output, _ = await _run(
             ['git', 'status', '--porcelain', '--', '.'],
@@ -6393,8 +6351,16 @@ class GitOps:
           can re-enqueue).
         * ``'not_descendant'`` — merge commit couldn't become a descendant
           of main after *max_attempts* (permanent; stop retrying).
-        * ``'contaminated'`` — ``.task/`` contamination gate failed
-          (permanent; stop retrying).
+        * ``'contaminated'`` — retained in :data:`AdvanceResult` /
+          :class:`AdvanceOutcome` for typing and merge_queue.py
+          compatibility only; this method no longer produces it. The
+          ``.task/`` contamination gate (``_assert_no_task_dir``) that used
+          to return this outcome was retired in W11 ι: contamination
+          prevention now rests entirely on structural relocation of task
+          metadata to ``.task-meta`` (for the orchestrator hot path) plus
+          this repo's root ``.gitignore`` ``.task/`` entry — an intentional
+          defense-in-depth trade-off, not an oversight (see module
+          docstring).
         * ``'conflict_markers'`` — the merge tree contains tracked file(s)
           with unresolved (column-0) conflict markers (permanent; stop
           retrying).  esc-2128-8 Layer-2 backstop — see
@@ -6422,7 +6388,7 @@ class GitOps:
 
         IMPORTANT: This method is the LAST checkpoint before code reaches
         main.  update-ref bypasses most git hooks (including pre-commit),
-        so the .task/ contamination gate here is the final defense.
+        so the conflict-marker gate here is the final defense.
         Exception: git's ``reference-transaction`` hook (git>=2.28) DOES
         fire on update-ref — advance_main's main_gate mark (task 1678)
         sanctions that hook by writing a sentinel immediately before the
@@ -6458,16 +6424,6 @@ class GitOps:
             verified_branch_tip = _vbt_sha.strip()
 
         for attempt in range(max_attempts):
-            # ── .task/ contamination gate (FINAL DEFENSE) ─────────────
-            try:
-                await _assert_no_task_dir(
-                    merge_sha, self.project_root,
-                    f'advance_main(attempt={attempt + 1})',
-                )
-            except RuntimeError as e:
-                logger.error(str(e))
-                return AdvanceOutcome('contaminated')
-
             # ── conflict-marker gate (FINAL DEFENSE, esc-2128-8 Layer-2) ──
             try:
                 await _assert_no_conflict_markers(
@@ -6650,8 +6606,9 @@ class GitOps:
                 # Use git diff to get tracked dirty filenames reliably.
                 # Porcelain parsing is fragile because _run strips stdout,
                 # which eats the leading space from " M filename" status.
-                # Exclude the worktree dir (managed by git); the leftover
-                # .task/ is self-ignored via its own .task/.gitignore.
+                # Exclude the worktree dir (managed by git); any leftover
+                # .task/ is covered by this repo's root .gitignore .task/
+                # entry.
                 wt_dir = self.config.worktree_dir
                 _, unstaged_files, _ = await _run(
                     ['git', 'diff', '--name-only', '--',
@@ -7076,8 +7033,8 @@ class GitOps:
         """Return names of tracked dirty files, or empty string if clean.
 
         Excludes untracked files.  The leftover ``.task/`` (if any) is
-        self-ignored via its own ``.task/.gitignore``, so it never appears
-        here without a pathspec exclusion.
+        covered by this repo's root ``.gitignore`` ``.task/`` entry, so it
+        never appears here without a pathspec exclusion.
         """
         _, unstaged, _ = await _run(
             ['git', 'diff', '--name-only', '--', '.'],

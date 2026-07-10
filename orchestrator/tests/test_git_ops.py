@@ -516,10 +516,11 @@ class TestWorktreeLifecycle:
         await _run(['git', 'add', '-A'], cwd=info.path)
         await _run(['git', 'commit', '-m', 'agent WIP commit'], cwd=info.path)
 
-        # Simulate the harness/agent's gitignored .task/ state (plan.json) —
-        # written after create_worktree's _ensure_task_gitignore already
-        # ran, so it is untracked and excluded from commit()'s :!.task
-        # pathspec, exactly like a real retained worktree.
+        # Simulate leftover .task/ state (plan.json) written directly into
+        # the worktree — untracked, so it plays no part in the WIP commit
+        # above and simply persists as a stray file, exactly like a real
+        # retained worktree carrying scratch files across a reused
+        # dispatch.
         task_dir = info.path / '.task'
         task_dir.mkdir(exist_ok=True)
         (task_dir / 'plan.json').write_text('{"task_id": "lo-retain"}\n')
@@ -1901,6 +1902,17 @@ class TestHasUncommittedWork:
         assert await git_ops.has_uncommitted_work(wt_info.path)
 
     async def test_file_only_in_task_dir_returns_false(self, git_ops: GitOps):
+        """Production's repo-root .gitignore carries a tracked `.task/`
+        entry (independent of the since-removed `_ensure_task_gitignore`
+        nested gitignore) that every worktree inherits.  `_setup_repo`
+        builds a bare synthetic repo with no .gitignore at all, so commit
+        one here first to exercise the same real-world condition
+        `has_uncommitted_work` relies on.
+        """
+        (git_ops.project_root / '.gitignore').write_text('.task/\n')
+        await _run(['git', 'add', '-A'], cwd=git_ops.project_root)
+        await _run(['git', 'commit', '-m', 'add .gitignore'], cwd=git_ops.project_root)
+
         wt_info = await git_ops.create_worktree('taskdir-wt')
         task_dir = wt_info.path / '.task'
         task_dir.mkdir(exist_ok=True)
@@ -1930,14 +1942,14 @@ class TestStructuralContamination:
         ta.write_plan({'task_id': 'sc-1', 'title': 'Structural Contamination', 'steps': []})
         ta.append_iteration_log({'k': 1})
 
-        # Metadata lives OUTSIDE the worktree.  <lane>/.task itself may still
-        # exist (create_worktree's _ensure_task_gitignore defense-in-depth
-        # guard unconditionally drops a .task/.gitignore there — an
-        # unrelated, pre-relocation scrub guard) but must hold no metadata:
-        # TaskArtifacts was pointed at the sibling `meta` root, never at
-        # `lane/.task`.
+        # Metadata lives OUTSIDE the worktree: TaskArtifacts was pointed at
+        # the sibling `meta` root, never at `lane/.task`.  Nothing writes
+        # `<lane>/.task` any more — create_worktree's _ensure_task_gitignore
+        # defense-in-depth guard, the last thing that unconditionally
+        # created it, is gone — so the lane must carry no `.task/`
+        # directory at all.
         assert (meta / 'plan.json').exists()
-        assert not (lane / '.task' / 'plan.json').exists()
+        assert not (lane / '.task').exists()
         assert not (lane / '.task-meta').exists()
 
         # Hostile agent uses RAW git — deliberately bypasses GitOps.commit so
@@ -1957,11 +1969,11 @@ class TestStructuralContamination:
 
     async def test_commit_stays_clean_under_relocated_metadata(self, git_ops: GitOps):
         """GitOps.commit() must produce a clean tree under the relocated-
-        metadata regime WITHOUT relying on the `:!.task` staging exclusion
-        or the post-staging unstage net (both removed later in this task) —
-        the retained `.task/.gitignore` (written by `_ensure_task_gitignore`
-        during `create_worktree`) self-ignores the leftover `<lane>/.task/`,
-        so a plain `git add -A` inside commit() stages nothing from it.
+        metadata regime WITHOUT relying on the `:!.task` staging exclusion,
+        the post-staging unstage net, or a `.task/.gitignore` self-ignore
+        (all removed) — contamination prevention here is STRUCTURAL: nothing
+        writes into `<lane>/.task` at all, so a plain `git add -A` inside
+        commit() has nothing under `.task/` to stage in the first place.
         """
         wt_info = await git_ops.create_worktree('commit-relocated-metadata')
         lane = wt_info.path
@@ -3022,6 +3034,63 @@ class TestAdvanceMainConflictMarkerGate:
 
         assert result.result == 'advanced', (
             f'Expected a clean merge to still advance, got {result!r}'
+        )
+
+    async def test_advance_main_no_longer_blocks_on_task_dir(
+        self, git_ops: GitOps,
+    ):
+        """W11 ι retires the _assert_no_task_dir tripwire: contamination
+        prevention is now structural (task metadata lives outside the
+        worktree entirely, see TaskArtifacts.meta_root_for), not guard-
+        defended.  A merge commit whose tree carries a `.task/` entry —
+        forced in via RAW git, deliberately bypassing GitOps.commit() so no
+        filtering participates — must still advance normally instead of
+        being refused with result == 'contaminated'.
+        """
+        wt = await git_ops.create_worktree('task-dir-no-longer-blocks')
+        lane = wt.path
+
+        # Force a `.task/` entry into the branch tree with RAW git.
+        task_dir = lane / '.task'
+        task_dir.mkdir(exist_ok=True)
+        (task_dir / 'plan.json').write_text('{}')
+        await _run(['git', 'add', '-A'], cwd=lane)
+        await _run(['git', 'commit', '-m', 'hostile add -A carrying .task/'], cwd=lane)
+
+        # Guard the RED premise: the file really did land in the branch tip
+        # tree (post-θ, nothing scrubs it — this must hold before AND after
+        # this task removes the gate).
+        rc, out, _ = await _run(
+            ['git', 'ls-tree', '-r', '--name-only', 'HEAD'], cwd=lane,
+        )
+        assert rc == 0
+        assert '.task/plan.json' in out, (
+            f'.task/plan.json must be present in the branch tip tree for '
+            f'this test to exercise the gate; tree: {out!r}'
+        )
+
+        merge_result = await git_ops.merge_to_main(lane, 'task-dir-no-longer-blocks')
+        assert merge_result.success
+        assert merge_result.merge_commit is not None
+
+        _, main_before, _ = await _run(
+            ['git', 'rev-parse', 'main'], cwd=git_ops.project_root,
+        )
+
+        result = await git_ops.advance_main(merge_result.merge_commit)
+        if merge_result.merge_worktree:
+            await git_ops.cleanup_merge_worktree(merge_result.merge_worktree)
+
+        assert result.result == 'advanced', (
+            f"Expected 'advanced' now that _assert_no_task_dir is retired, "
+            f"got {result!r}"
+        )
+
+        _, main_after, _ = await _run(
+            ['git', 'rev-parse', 'main'], cwd=git_ops.project_root,
+        )
+        assert main_before.strip() != main_after.strip(), (
+            'main must advance past the .task/-carrying merge commit'
         )
 
 
