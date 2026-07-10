@@ -59,6 +59,14 @@ skip_perms="$2"
 title="$3"
 prompt="$4"
 
+# Fleet Cockpit C7 (plans/fleet-cockpit-prd.md §6.1): spawn_mode selects
+# which identity the child inherits as its own CLAUDE_SPAWN_PARENT_ID (see
+# the identity-export block below) and, later, whether this launch is
+# fire-and-forget (see resolve_sibling). Read once, up front, alongside the
+# positional-arg parse -- 'child' (the default) preserves every existing
+# caller's behavior byte-for-byte.
+spawn_mode="${CLAUDE_SPAWN_MODE:-child}"
+
 # Started-verification watchdog (Attention Rail T4) state: a spawn-time
 # reference marker (mtime = spawn start, used by the step-4 transcript-
 # appearance probe to distinguish a fresh transcript from a stale one), a
@@ -136,12 +144,13 @@ fi
 # the spawned child its OWN new session-registry slug, plus its parent
 # linkage. Default 'child' spawn_mode -- the child's parent-of-record is the
 # DIRECT spawner, i.e. THIS script's own inherited CLAUDE_SPAWN_SESSION_ID
-# (empty when this is a human-launched root with nothing to inherit). C7
-# later overrides parent_id_export for spawn_mode=sibling (parent = the
-# spawner's own inherited CLAUDE_SPAWN_PARENT_ID -- the shared ancestor, not
-# the direct spawner); this establishes the child-default baseline C7 builds
-# on. Both are nested under the same SESSION_RECORD_DIR check as
-# CLAUDE_SPAWN_RESULT_FILE above, so a registry fault (empty
+# (empty when this is a human-launched root with nothing to inherit).
+# Fleet Cockpit C7: spawn_mode=sibling instead parents the child at THIS
+# script's own inherited CLAUDE_SPAWN_PARENT_ID -- the shared ancestor, not
+# the direct spawner -- so a sibling handoff (e.g. /prd author->decompose)
+# renders under the same ancestor as the spawner itself, rather than nesting
+# one level deeper. Both branches are nested under the same SESSION_RECORD_DIR
+# check as CLAUDE_SPAWN_RESULT_FILE above, so a registry fault (empty
 # SESSION_RECORD_DIR) cleanly no-ops BOTH exports together -- it would be
 # incoherent to hand the child a parent link with no session identity of its
 # own. child_session_id is derived from SESSION_RECORD_DIR's basename,
@@ -155,7 +164,11 @@ if [ -n "$SESSION_RECORD_DIR" ]; then
   q_child=$(printf %q "$child_session_id")
   spawn_id_export="export CLAUDE_SPAWN_SESSION_ID=$q_child; "
 
-  parent_of_child="${CLAUDE_SPAWN_SESSION_ID:-}"
+  if [ "$spawn_mode" = "sibling" ]; then
+    parent_of_child="${CLAUDE_SPAWN_PARENT_ID:-}"
+  else
+    parent_of_child="${CLAUDE_SPAWN_SESSION_ID:-}"
+  fi
   if [ -n "$parent_of_child" ]; then
     q_parent=$(printf %q "$parent_of_child")
     parent_id_export="export CLAUDE_SPAWN_PARENT_ID=$q_parent; "
