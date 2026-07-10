@@ -37,10 +37,12 @@ from orchestrator.verify_categories import (
 from orchestrator.verify_cmd import (
     ToolKind,
     cargo_scope,
+    govern_cpu,
     parse_config_command,
     render,
     reproject,
     scope_to,
+    serial_pytest,
     strip_cwd,
 )
 
@@ -726,27 +728,24 @@ def _should_archive_category(category: str) -> bool:
     return should_archive(category)
 
 
-# Matches a pytest invocation up to (but not including) the next shell chain
-# operator (&&, ||, ;) or end of string — the span _force_serial_pytest
-# rewrites.  Word-bounded so it doesn't match inside 'pytest_xdist' etc.
-_PYTEST_INVOCATION_RE = re.compile(r'\bpytest\b[^&|;]*')
+def _serial_pytest_str(cmd: str | None) -> str | None:
+    """Rewrite every ``pytest`` invocation in *cmd* to run serially, via VerifyCmd.
 
+    Thin string-level wrapper around ``parse_config_command`` ->
+    ``serial_pytest`` -> ``render`` (replaces ``_force_serial_pytest``):
+    appends `` -p no:xdist -o addopts=`` to a structured PYTEST command's
+    flags, or — for a raw-retained ``&&``-chain — to every ``pytest``
+    invocation's arguments via ``serial_pytest``'s localised regex rewrite.
+    ``-o addopts=`` clears any pyproject-level ``addopts`` (e.g. ``-n auto``)
+    — this is the exact ``-o addopts=""`` workaround that task 2045 proved
+    recovers a shared-venv-mutation transient, applied structurally rather
+    than by gambling on the concurrent ``uv sync`` window having closed.
+    ``-p no:xdist`` is belt-and-suspenders: it disables the xdist plugin
+    outright and is safe even when xdist is already absent from the venv.
 
-def _force_serial_pytest(cmd: str | None) -> str | None:
-    """Rewrite every ``pytest`` invocation in *cmd* to run serially.
-
-    Appends `` -p no:xdist -o addopts=''`` immediately after each ``pytest``
-    invocation's arguments (before the next ``&&``/``||``/``;`` or end of
-    string).  ``-o addopts=''`` clears any pyproject-level ``addopts`` (e.g.
-    ``-n auto``) — this is the exact ``-o addopts=""`` workaround that task
-    2045 proved recovers a shared-venv-mutation transient, reproduced here
-    programmatically rather than gambling on the concurrent ``uv sync``
-    window having closed.  ``-p no:xdist`` is belt-and-suspenders: it
-    disables the xdist plugin outright and is safe even when xdist is
-    already absent from the venv.
-
-    Returns *cmd* unchanged when it is ``None`` or contains no ``pytest``
-    token (e.g. a ``cargo test --workspace`` command).
+    Returns *cmd* unchanged when it is ``None`` or does not parse/chain into
+    a PYTEST ToolKind (e.g. a ``cargo test --workspace`` command — covers
+    OPAQUE too, P1).
 
     Tradeoff: clearing ``addopts`` also drops any per-subproject marker
     filters baked into pyproject (e.g. ``-m 'not integration'``).  Accepted
@@ -756,17 +755,12 @@ def _force_serial_pytest(cmd: str | None) -> str | None:
     contents aren't visible to this string rewrite.
     """
     if cmd is None:
+        return None
+    parsed = parse_config_command(cmd)
+    rewritten = serial_pytest(parsed)
+    if rewritten is parsed:
         return cmd
-    if not _PYTEST_INVOCATION_RE.search(cmd):
-        return cmd
-
-    def _rewrite(m: re.Match[str]) -> str:
-        segment = m.group(0)
-        stripped = segment.rstrip()
-        trailing = segment[len(stripped):]
-        return f"{stripped} -p no:xdist -o addopts=''{trailing}"
-
-    return _PYTEST_INVOCATION_RE.sub(_rewrite, cmd)
+    return render(rewritten)
 
 
 def _summarize_checks(
@@ -2676,30 +2670,44 @@ def _resolve_verify_env(
     return merged
 
 
-def _maybe_govern_merge_cmd(
-    cmd: 'str | None',
+def _resolve_governed_exec_path(
     config: OrchestratorConfig,
     worktree: 'Path | None',
     role: str,
 ) -> 'str | None':
-    """Wrap *cmd* in a cpu-governed-exec.sh invocation when role=='merge' and governance is enabled.
+    """Return the resolved cpu-governed-exec path to apply for *role*, or ``None``.
 
-    Returns *cmd* unchanged when:
+    Only ``role == 'merge'`` uses the merge-weighted cgroup scope. Returns
+    ``None`` (fail-open) when ``config.cpu_governance`` is absent/disabled or
+    ``resolved_exec_path`` cannot resolve an executable path (non-executable,
+    missing, or *worktree* is ``None``) — the caller (``_govern_cpu_str``)
+    then no-ops on a falsy *exec_path*.
+    """
+    if role != 'merge':
+        return None
+    gov = getattr(config, 'cpu_governance', None)
+    if gov is None or not gov.enabled:
+        return None
+    return gov.resolved_exec_path(worktree)
 
-    * *cmd* is ``None`` (skip-guard — caller's ``if cmd is None: return`` fires first)
-    * *role* is not ``'merge'`` (only merge-verify uses the merge-weighted cgroup scope)
-    * ``config.cpu_governance`` is disabled (default; fail-open)
-    * ``config.cpu_governance.resolved_exec_path(worktree)`` returns ``None``
-      (non-executable, missing, or worktree=None; fail-open)
 
-    Otherwise wraps as::
+def _govern_cpu_str(cmd: 'str | None', exec_path: 'str | None') -> 'str | None':
+    """Wrap *cmd* in a cpu-governed-exec.sh invocation via VerifyCmd, when *exec_path* resolves.
 
-        <shlex.quote(exec_abs)> --role merge -- /bin/bash -c <shlex.quote(cmd)>
+    Thin string-level wrapper around ``parse_config_command`` -> ``govern_cpu``
+    -> ``render`` (replaces ``_maybe_govern_merge_cmd``'s bash-wrap). Renders as::
+
+        <shlex.quote(exec_path)> --role merge -- /bin/bash -c <shlex.quote(rendered_cmd)>
 
     so that shell operators (``&&``, ``|``, leading env assignments) in *cmd*
     survive intact inside the merge-weighted cgroup scope.  The inner
-    ``/bin/bash -c <quoted>`` makes the whole original command a single argv
+    ``/bin/bash -c <quoted>`` makes the whole rendered command a single argv
     payload for ``cpu-governed-exec.sh``.
+
+    Returns *cmd* unchanged when: *cmd* is ``None``; *exec_path* is falsy
+    (governance disabled/unresolved — see ``_resolve_governed_exec_path``,
+    fail-open); or *cmd* parses OPAQUE (P1 — ``govern_cpu`` no-ops on an
+    unparseable command rather than blindly bash-wrapping it).
 
     Does NOT alter ``_run_cmd``'s signature, the ``use_cgroup_scope`` path, or
     any merge PSI/semaphore bypass.
@@ -2721,15 +2729,13 @@ def _maybe_govern_merge_cmd(
     also has a runtime probe + fail-open, so a nested-scope failure degrades
     gracefully.
     """
-    if cmd is None or role != 'merge':
+    if cmd is None or not exec_path:
         return cmd
-    gov = getattr(config, 'cpu_governance', None)
-    if gov is None or not gov.enabled:
+    parsed = parse_config_command(cmd)
+    governed = govern_cpu(parsed, exec_path)
+    if governed is parsed:
         return cmd
-    exec_abs = gov.resolved_exec_path(worktree)
-    if not exec_abs:
-        return cmd
-    return f'{shlex.quote(exec_abs)} --role merge -- /bin/bash -c {shlex.quote(cmd)}'
+    return render(governed)
 
 
 def _resolve_nice_prefix(config: OrchestratorConfig, role: str) -> list[str]:
@@ -2994,8 +3000,8 @@ async def run_verification(
         # cpu_governance is enabled + exec resolves.  Fail-open: returns cmd
         # unchanged when governance is disabled or the path is non-executable,
         # so a misconfig never makes a verify spawn fail.
-        cmd = _maybe_govern_merge_cmd(cmd, config, worktree, role)
-        assert cmd is not None  # _maybe_govern_merge_cmd returns None only when cmd is None; guarded above
+        cmd = _govern_cpu_str(cmd, _resolve_governed_exec_path(config, worktree, role))
+        assert cmd is not None  # _govern_cpu_str returns None only when cmd is None; guarded above
         # Admission gate (task 2390 T2): only the pytest ('test') leg is
         # gated by the shared.verify_admission flock semaphore + role nice
         # tier; lint/type ride alongside within the same verify, ungated.
@@ -3137,9 +3143,9 @@ async def run_verification(
             'Verification hit an environmental shared-venv transient '
             '(vanished xdist/pip); retrying test command once, forced serial '
             '(this clears all pyproject addopts, including any marker '
-            'filters, for the recovery run — see _force_serial_pytest)'
+            'filters, for the recovery run — see serial_pytest)'
         )
-        recovered_test_cmd = _force_serial_pytest(test_cmd)
+        recovered_test_cmd = _serial_pytest_str(test_cmd)
         (
             test_rc, test_out, test_timed_out, test_started_at, test_duration,
         ) = await _run_or_skip_timed(

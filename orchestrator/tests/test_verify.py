@@ -6648,8 +6648,22 @@ class TestMergeGuardModuleConfigs:
 
 
 @pytest.mark.asyncio
-class TestMaybeGovernMergeCmd:
-    """Unit tests for _maybe_govern_merge_cmd and its integration into merge-verify path."""
+class TestRunVerificationGovernRouting:
+    """Integration tests for the merge-role cpu-governance wiring in
+    ``_run_or_skip_timed`` (task 2125 step-26): a command is parsed once via
+    ``parse_config_command``, wrapped via ``govern_cpu(resolved_exec)`` when
+    ``role=='merge'`` and cpu_governance resolves, and rendered at the
+    ``_run_cmd`` call site — replacing ``_maybe_govern_merge_cmd``'s bare
+    bash-wrap.
+
+    The ``govern_cpu`` mutator itself (wrap format, shell-operator survival,
+    OPAQUE/falsy-``exec_path`` no-ops) is unit-tested directly in
+    ``test_verify_cmd.TestGovernCpu``. These tests instead pin the
+    verify.py-local resolution wiring (``_resolve_governed_exec_path``'s role
+    gate and enabled/executable fail-open) end-to-end through
+    ``run_verification``, since that resolution logic has no VerifyCmd-model
+    equivalent to be covered by.
+    """
 
     def _make_govern_config(self, tmp_path, enabled=True, create_exec=True):
         """Build an OrchestratorConfig with cpu_governance wired to a tmp executable."""
@@ -6667,86 +6681,15 @@ class TestMaybeGovernMergeCmd:
         )
         return config, exec_file
 
-    async def test_merge_role_enabled_exec_wraps_cmd(self, tmp_path):
-        """role='merge' + enabled + executable -> cmd wrapped in govern invocation."""
-        import shlex
-
-        from orchestrator.verify import _maybe_govern_merge_cmd
-        config, exec_file = self._make_govern_config(tmp_path)
-        cmd = 'cargo test --workspace'
-        result = _maybe_govern_merge_cmd(cmd, config, tmp_path, role='merge')
-        abs_exec = str(exec_file.resolve())
-        expected = f'{shlex.quote(abs_exec)} --role merge -- /bin/bash -c {shlex.quote(cmd)}'
-        assert result == expected
-
-    async def test_task_role_returns_cmd_unchanged(self, tmp_path):
-        """role='task' -> cmd unchanged (only merge-verify uses governance)."""
-        from orchestrator.verify import _maybe_govern_merge_cmd
-        config, _ = self._make_govern_config(tmp_path)
-        cmd = 'cargo test --workspace'
-        result = _maybe_govern_merge_cmd(cmd, config, tmp_path, role='task')
-        assert result == cmd
-
-    async def test_disabled_governance_returns_cmd_unchanged(self, tmp_path):
-        """cpu_governance disabled -> cmd unchanged (fail-open)."""
-        from orchestrator.verify import _maybe_govern_merge_cmd
-        config, _ = self._make_govern_config(tmp_path, enabled=False)
-        cmd = 'cargo test --workspace'
-        result = _maybe_govern_merge_cmd(cmd, config, tmp_path, role='merge')
-        assert result == cmd
-
-    async def test_non_executable_exec_returns_cmd_unchanged(self, tmp_path):
-        """enabled + non-executable exec -> cmd unchanged (fail-open)."""
-        from orchestrator.config import CpuGovernConfig
-        from orchestrator.verify import _maybe_govern_merge_cmd
-        scripts = tmp_path / 'scripts'
-        scripts.mkdir()
-        exec_file = scripts / 'cpu-governed-exec.sh'
-        exec_file.write_text('#!/bin/sh\n')
-        exec_file.chmod(0o644)  # not executable
-        config = OrchestratorConfig()
-        config.cpu_governance = CpuGovernConfig(
-            enabled=True,
-            exec_path='scripts/cpu-governed-exec.sh',
-        )
-        cmd = 'cargo test --workspace'
-        result = _maybe_govern_merge_cmd(cmd, config, tmp_path, role='merge')
-        assert result == cmd
-
-    async def test_none_cmd_returned_unchanged(self, tmp_path):
-        """cmd=None is returned as None (skip-guard)."""
-        from orchestrator.verify import _maybe_govern_merge_cmd
-        config, _ = self._make_govern_config(tmp_path)
-        result = _maybe_govern_merge_cmd(None, config, tmp_path, role='merge')
-        assert result is None
-
-    async def test_shell_operators_in_cmd_survive(self, tmp_path):
-        """Commands with shell operators are quoted so they run intact inside the govern scope."""
-        import shlex
-
-        from orchestrator.verify import _maybe_govern_merge_cmd
-        config, exec_file = self._make_govern_config(tmp_path)
-        cmd = 'cargo test && cargo clippy --all -- -D warnings'
-        result = _maybe_govern_merge_cmd(cmd, config, tmp_path, role='merge')
-        abs_exec = str(exec_file.resolve())
-        expected = f'{shlex.quote(abs_exec)} --role merge -- /bin/bash -c {shlex.quote(cmd)}'
-        assert result == expected
-
-    # -----------------------------------------------------------------------
-    # Integration tests: wiring of _maybe_govern_merge_cmd into run_verification
-    # (suggestion: test that the cmd= line in _run_or_skip_timed actually routes
-    # wrapped commands through _run_cmd, not just _maybe_govern_merge_cmd in isolation)
-    # -----------------------------------------------------------------------
-
     @pytest.mark.asyncio
     async def test_run_verification_merge_role_wraps_commands(self, tmp_path):
         """run_verification with role='merge' + governance enabled routes wrapped cmds to _run_cmd.
 
-        Verifies the wiring at verify.py:_run_or_skip_timed — that the
-        ``cmd = _maybe_govern_merge_cmd(cmd, config, worktree, role)`` line
+        Verifies the wiring at verify.py:_run_or_skip_timed — that
+        ``cmd = _govern_cpu_str(cmd, _resolve_governed_exec_path(config, worktree, role))``
         actually fires and transforms the command before _run_cmd sees it.
         Without this integration test, removing that line leaves the unit
-        tests of _maybe_govern_merge_cmd in isolation still passing.
+        tests of ``govern_cpu`` in isolation still passing.
         """
         import shlex
 
@@ -6811,6 +6754,85 @@ class TestMaybeGovernMergeCmd:
         )
 
     @pytest.mark.asyncio
+    async def test_run_verification_disabled_governance_no_wrap(self, tmp_path):
+        """cpu_governance disabled -> commands reach _run_cmd unwrapped, even for role='merge'.
+
+        Migrated from the old ``_maybe_govern_merge_cmd`` unit test
+        (``test_disabled_governance_returns_cmd_unchanged``) to the
+        run_verification integration level (task 2125 step-26): the
+        disabled/fail-open check now lives in ``_resolve_governed_exec_path``,
+        which is verify.py-local (not part of the VerifyCmd model), so it has
+        no ``test_verify_cmd.py`` equivalent to rely on instead.
+        """
+        from orchestrator.config import ModuleConfig
+        config, _ = self._make_govern_config(tmp_path, enabled=False)
+        module_config = ModuleConfig(
+            prefix='pkg',
+            test_command='cargo test --workspace',
+            lint_command=None,
+            type_check_command=None,
+        )
+
+        captured_cmds: list[str] = []
+
+        async def fake_run_cmd(cmd, cwd, timeout, env=None, log_path=None, **_kwargs):
+            captured_cmds.append(cmd)
+            return 0, '', False
+
+        with patch('orchestrator.verify._run_cmd', side_effect=fake_run_cmd):
+            await run_verification(
+                tmp_path, config, module_config=module_config, max_retries=0, role='merge',
+            )
+
+        assert len(captured_cmds) == 1
+        assert captured_cmds[0] == 'cargo test --workspace', (
+            f'Expected bare command when governance is disabled; got {captured_cmds[0]!r}'
+        )
+
+    @pytest.mark.asyncio
+    async def test_run_verification_non_executable_exec_no_wrap(self, tmp_path):
+        """Enabled governance + non-executable exec -> commands reach _run_cmd unwrapped (fail-open).
+
+        Migrated from the old ``_maybe_govern_merge_cmd`` unit test
+        (``test_non_executable_exec_returns_cmd_unchanged``); see
+        ``test_run_verification_disabled_governance_no_wrap`` for why this now
+        lives at the integration level.
+        """
+        from orchestrator.config import CpuGovernConfig, ModuleConfig
+        scripts = tmp_path / 'scripts'
+        scripts.mkdir()
+        exec_file = scripts / 'cpu-governed-exec.sh'
+        exec_file.write_text('#!/bin/sh\n')
+        exec_file.chmod(0o644)  # not executable
+        config = OrchestratorConfig()
+        config.cpu_governance = CpuGovernConfig(
+            enabled=True,
+            exec_path='scripts/cpu-governed-exec.sh',
+        )
+        module_config = ModuleConfig(
+            prefix='pkg',
+            test_command='cargo test --workspace',
+            lint_command=None,
+            type_check_command=None,
+        )
+
+        captured_cmds: list[str] = []
+
+        async def fake_run_cmd(cmd, cwd, timeout, env=None, log_path=None, **_kwargs):
+            captured_cmds.append(cmd)
+            return 0, '', False
+
+        with patch('orchestrator.verify._run_cmd', side_effect=fake_run_cmd):
+            await run_verification(
+                tmp_path, config, module_config=module_config, max_retries=0, role='merge',
+            )
+
+        assert len(captured_cmds) == 1
+        assert captured_cmds[0] == 'cargo test --workspace', (
+            f'Expected bare command when exec is non-executable (fail-open); got {captured_cmds[0]!r}'
+        )
+
+    @pytest.mark.asyncio
     async def test_run_verification_merge_role_wraps_parsed_inner_command(self, tmp_path):
         """The inner (pre-govern-wrap) payload is the VerifyCmd-rendered form
         of test_command, not a verbatim copy of the config string (task 2125
@@ -6861,7 +6883,7 @@ class TestMaybeGovernMergeCmd:
         """Governance + verify_use_cgroup_scope both enabled: commands are govern-wrapped and no crash.
 
         When both flags are active, _run_or_skip_timed first wraps the command
-        via _maybe_govern_merge_cmd (so cpu-governed-exec.sh becomes argv[0])
+        via _govern_cpu_str (so cpu-governed-exec.sh becomes argv[0])
         and then passes use_cgroup_scope=True to _run_cmd, which would launch
         the wrapped command inside a systemd --user --scope (if systemd-run is
         present).  This creates a potential nested scope: the outer df-verify
