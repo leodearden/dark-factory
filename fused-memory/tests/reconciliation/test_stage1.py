@@ -256,10 +256,15 @@ class TestMemoryConsolidatorDeterministicCycleSummaryWrite:
         assert record.state == 'active'
 
     @pytest.mark.asyncio
-    async def test_run_sets_cycle_summary_written_stat(self, ledger_store):
+    async def test_run_sets_cycle_summary_ledger_written_stat(self, ledger_store):
         report = await self._run_stage(ledger_store, 'run-d1-stat')
 
-        assert report.stats.get('stage1_cycle_summary_written') == 1
+        # Renamed from 'stage1_cycle_summary_written' (reviewer finding
+        # observability, task 2229 amendment pass round 2) — the key now
+        # makes explicit that it tracks the authoritative ledger write only,
+        # not the best-effort Mem0 mirror (see write_cycle_summary's
+        # docstring "Returns" section).
+        assert report.stats.get('stage1_cycle_summary_ledger_written') == 1
 
     @pytest.mark.asyncio
     async def test_retired_verify_reconstruct_stats_absent(self, ledger_store):

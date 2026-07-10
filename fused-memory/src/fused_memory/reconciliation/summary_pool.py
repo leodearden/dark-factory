@@ -235,7 +235,14 @@ async def write_cycle_summary(
 
     Returns:
         ``True`` when the authoritative ledger upsert succeeded, ``False``
-        otherwise (no ledger wired, or the upsert raised).
+        otherwise (no ledger wired, or the upsert raised). This reflects
+        ONLY the ledger upsert — the Mem0 mirror can succeed even when this
+        is ``False`` (e.g. ``recon_ledger_enabled=False``). Callers naming a
+        stat off this return value should include "ledger" in the name
+        (e.g. ``stageN_cycle_summary_ledger_written``, not a bare
+        ``stageN_cycle_summary_written``) so the stat cannot be misread as
+        "no summary was written at all" (reviewer finding observability,
+        task 2229 amendment pass round 2).
     """
     ledger = getattr(memory_service, 'recon_ledger', None)
     now_dt = _assume_utc(now or datetime.now(UTC))

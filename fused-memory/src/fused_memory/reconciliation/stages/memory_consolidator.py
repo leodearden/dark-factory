@@ -149,13 +149,22 @@ class MemoryConsolidator(BaseStage):
         # Always present (task 2229 amendment, mirrors the task-2312 pattern
         # above): set BEFORE the remediation early-return so this key is
         # never conditionally absent. Stage 2's equivalent
-        # stage2_cycle_summary_written (task_knowledge_sync.py) is set
+        # stage2_cycle_summary_ledger_written (task_knowledge_sync.py) is set
         # unconditionally, so a consumer aggregating both stages' stats
         # should not need a .get(..., 0) fallback for Stage 1's key.
         # Overwritten below on a full (non-remediation) cycle once
         # write_cycle_summary actually runs; stays 0 on remediation passes,
         # which intentionally skip the write (see that call site below).
-        report.stats['stage1_cycle_summary_written'] = 0
+        #
+        # Named "..._ledger_written", not "..._written" (reviewer finding
+        # observability, task 2229 amendment pass round 2): this reflects
+        # ONLY the authoritative ReconLedgerStore upsert. write_cycle_summary
+        # also attempts a best-effort Mem0 mirror write regardless of ledger
+        # outcome (see its docstring), so a deployment running with
+        # recon_ledger_enabled=False can have this stat at 0 while the
+        # mirror was in fact written — the "_ledger_" qualifier makes that
+        # distinction explicit instead of implying "no summary at all".
+        report.stats['stage1_cycle_summary_ledger_written'] = 0
 
         # Skip dedup for remediation passes
         if self.remediation_findings is not None:
@@ -412,7 +421,7 @@ class MemoryConsolidator(BaseStage):
         # fabricate a spurious summary every remediation pass. The stat set
         # below overwrites the `= 0` default assigned before the
         # remediation early-return above.
-        cycle_summary_written = await write_cycle_summary(
+        ledger_written = await write_cycle_summary(
             self.memory,
             self.project_id,
             report,
@@ -422,7 +431,9 @@ class MemoryConsolidator(BaseStage):
             trim_source=_STAGE1_CYCLE_SUMMARY_TRIM_SOURCE,
             cap=STAGE1_CYCLE_SUMMARY_POOL_CAP,
         )
-        report.stats['stage1_cycle_summary_written'] = 1 if cycle_summary_written else 0
+        # Reflects the ledger upsert only — see the "_ledger_written" naming
+        # note above the `= 0` default earlier in this method.
+        report.stats['stage1_cycle_summary_ledger_written'] = 1 if ledger_written else 0
 
         return report
 
