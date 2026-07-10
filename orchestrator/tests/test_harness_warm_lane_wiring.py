@@ -1751,43 +1751,51 @@ def _make_warm_base_harness(
 
 class TestHarnessWarmBaseHardDownWiring:
     """After Harness construction, the probe + all three callbacks must be
-    wired onto the scheduler (task 2061, step-9).
+    wired into the scheduler's SchedulerCallbacks bundle (task 2061, step-9;
+    migrated to the constructor-injected seam by task 2235).
 
-    _build_harness patches ``Scheduler`` with a MagicMock, so an ``is not
-    None`` check on an unset attribute would be vacuously true (MagicMock
-    auto-vivifies child attributes on access).  Equality against the
-    harness-bound method is used instead — the same idiom already used by
-    TestReclaimOnExhaustionKnobWiring in this file — so this is a genuine
-    RED (unset/auto-vivified Mock != bound method) before Harness.__init__
-    wires the callables, and GREEN only once it does.
+    _build_harness patches ``Scheduler`` with a MagicMock, so a post-hoc
+    ``harness.scheduler._callbacks`` read would just auto-vivify a Mock
+    attribute (vacuously unequal to the harness-bound method, but not for
+    the right reason). Instead this test patches ``Scheduler`` itself and
+    inspects the ``callbacks=SchedulerCallbacks(...)`` kwarg it was
+    constructed with — the only way to observe what Harness.__init__ wired
+    when the Scheduler class itself is a test double.
     """
 
     def test_wires_probe_and_all_callbacks(self, tmp_path: Path):
-        harness, _queue = _make_warm_base_harness(tmp_path)
+        config = _make_config(max_concurrent_tasks=2, warm_lane_pool=True, tmp_path=tmp_path)
+        with patch('orchestrator.harness.McpLifecycle'), \
+             patch('orchestrator.harness.Scheduler') as mock_scheduler_cls, \
+             patch('orchestrator.harness.BriefingAssembler'):
+            harness = Harness(config)
+        harness._escalation_queue = EscalationQueue(tmp_path / 'esc')
 
-        assert harness.scheduler._warm_base_health_probe == (
+        callbacks = mock_scheduler_cls.call_args.kwargs['callbacks']
+
+        assert callbacks.warm_base_health_probe == (
             harness._probe_warm_base_health
         ), (
-            'Harness must wire scheduler._warm_base_health_probe = '
-            'harness._probe_warm_base_health after construction'
+            'Harness must wire callbacks.warm_base_health_probe = '
+            'harness._probe_warm_base_health at Scheduler construction'
         )
-        assert harness.scheduler._on_warm_base_warn == (
+        assert callbacks.on_warm_base_warn == (
             harness._file_warm_base_hard_down_notice
         ), (
-            'Harness must wire scheduler._on_warm_base_warn = '
-            'harness._file_warm_base_hard_down_notice after construction'
+            'Harness must wire callbacks.on_warm_base_warn = '
+            'harness._file_warm_base_hard_down_notice at Scheduler construction'
         )
-        assert harness.scheduler._on_warm_base_promote_l2 == (
+        assert callbacks.on_warm_base_promote_l2 == (
             harness._promote_warm_base_hard_down_l2
         ), (
-            'Harness must wire scheduler._on_warm_base_promote_l2 = '
-            'harness._promote_warm_base_hard_down_l2 after construction'
+            'Harness must wire callbacks.on_warm_base_promote_l2 = '
+            'harness._promote_warm_base_hard_down_l2 at Scheduler construction'
         )
-        assert harness.scheduler._on_warm_base_resolve == (
+        assert callbacks.on_warm_base_resolve == (
             harness._resolve_warm_base_hard_down
         ), (
-            'Harness must wire scheduler._on_warm_base_resolve = '
-            'harness._resolve_warm_base_hard_down after construction'
+            'Harness must wire callbacks.on_warm_base_resolve = '
+            'harness._resolve_warm_base_hard_down at Scheduler construction'
         )
 
 

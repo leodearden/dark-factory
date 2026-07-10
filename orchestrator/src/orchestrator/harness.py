@@ -4227,8 +4227,8 @@ Output JSON matching the schema. Every task must appear in the output.
     ) -> None:
         """Block a task and file an L1 escalation for a cross-project dep failure.
 
-        Installed on ``self.scheduler._on_external_dep_block`` right after
-        Scheduler construction, mirroring the ``_on_park_stop_trip`` pattern.
+        Wired as ``on_external_dep_block`` in the ``SchedulerCallbacks`` bundle
+        passed to the Scheduler constructor, alongside ``on_park_stop_trip``.
 
         Sets the task to ``blocked`` via ``scheduler.set_task_status`` and
         submits a level-1 ``Escalation`` to the queue.  Deduped by
@@ -4299,8 +4299,8 @@ Output JSON matching the schema. Every task must appear in the output.
     ) -> None:
         """File a non-blocking INFO escalation for a scheduler-starved task.
 
-        Installed on ``self.scheduler._on_starvation_warn`` right after
-        Scheduler construction, mirroring the ``_on_external_dep_block`` pattern.
+        Wired as ``on_starvation_warn`` in the ``SchedulerCallbacks`` bundle
+        passed to the Scheduler constructor, alongside ``on_external_dep_block``.
 
         Deliberately does NOT call ``set_task_status`` — this is a pure
         observation signal (PROPERTY 1: must never gate/halt the scheduler or
@@ -4357,8 +4357,9 @@ Output JSON matching the schema. Every task must appear in the output.
     async def _resolve_starvation_info(self, task_id: str) -> None:
         """Resolve an open starvation-watchdog INFO escalation for a task.
 
-        Installed on ``self.scheduler._on_starvation_resolve``.  Called at both
-        dispatch sites and from the GC backstop when the task is terminal.
+        Wired as ``on_starvation_resolve`` in the ``SchedulerCallbacks`` bundle.
+        Called at both dispatch sites and from the GC backstop when the task
+        is terminal.
 
         Uses ``EscalationQueue.resolve`` which is idempotent (no-op if already
         resolved), so double-resolve from the dispatch site and the GC backstop
@@ -4388,9 +4389,10 @@ Output JSON matching the schema. Every task must appear in the output.
         """Bridge GitOps._warm_lane_base_resolvable to the scheduler's
         injected-callback string contract (task 2061).
 
-        Installed on ``self.scheduler._warm_base_health_probe``.  Returns
-        ``'ok'`` when the warm-lane pool is disabled (``git_ops.warm_lane_pool
-        is None``) — a disabled pool is never "hard-down".  Otherwise
+        Wired as ``warm_base_health_probe`` in the ``SchedulerCallbacks``
+        bundle.  Returns ``'ok'`` when the warm-lane pool is disabled
+        (``git_ops.warm_lane_pool is None``) — a disabled pool is never
+        "hard-down".  Otherwise
         delegates to the synchronous ``GitOps._warm_lane_base_resolvable()``
         (pure filesystem check, no await inside) and returns its
         ``WarmBaseHealth`` member's ``.value``.
@@ -4405,8 +4407,8 @@ Output JSON matching the schema. Every task must appear in the output.
         """File a non-blocking INFO escalation for the warm-base hard-down
         watchdog (task 2061).
 
-        Installed on ``self.scheduler._on_warm_base_warn``.  Mirrors
-        ``_file_no_landings_info_escalation`` (global sentinel task_id, one
+        Wired as ``on_warm_base_warn`` in the ``SchedulerCallbacks`` bundle.
+        Mirrors ``_file_no_landings_info_escalation`` (global sentinel task_id, one
         open INFO at a time, best-effort).
 
         Deliberately does NOT call ``set_task_status`` or halt anything
@@ -4460,8 +4462,8 @@ Output JSON matching the schema. Every task must appear in the output.
         """Promote the ONE born-at-L2 escalation for a warm base stuck ABSENT
         past the configured remediation window (task 2061).
 
-        Installed on ``self.scheduler._on_warm_base_promote_l2``.  Filed
-        ``severity='critical'`` (∈ ``BORN_AT_L2_SEVERITIES``) and ``level=2``
+        Wired as ``on_warm_base_promote_l2`` in the ``SchedulerCallbacks``
+        bundle.  Filed ``severity='critical'`` (∈ ``BORN_AT_L2_SEVERITIES``) and ``level=2``
         so it routes straight to a human/L2-watcher, bypassing the auto-
         watcher — the reify reseed ladder is presumed stuck (a healthy ladder
         would have cleared the notice via ``_resolve_warm_base_hard_down``
@@ -4508,8 +4510,8 @@ Output JSON matching the schema. Every task must appear in the output.
         """Resolve both the notice and any promoted L2 for the warm-base
         hard-down watchdog (task 2061).
 
-        Installed on ``self.scheduler._on_warm_base_resolve``, called when the
-        probe reports the base healthy again.  Mirrors
+        Wired as ``on_warm_base_resolve`` in the ``SchedulerCallbacks`` bundle,
+        called when the probe reports the base healthy again.  Mirrors
         ``_resolve_no_landings_info_escalation`` — resolves ALL pending
         escalations for the sentinel+role (both the level-0 notice and any
         level-2 promotion), idempotent (``EscalationQueue.resolve`` is a

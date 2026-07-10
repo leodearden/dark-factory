@@ -812,13 +812,16 @@ class TestActionTeardownTasksSet:
     def test_scheduler_suppress_hook_wired_to_teardown_counter(
         self, tmp_path: Path, mock_orch_config
     ):
-        """(a.2) scheduler._suppress_blocked_write is wired to _action_teardown_tasks.__contains__:
-        returns True for stamped tids, False otherwise.
+        """(a.2) callbacks.suppress_blocked_write is wired to
+        harness._is_action_teardown_task (a bound-method wrapper over
+        _action_teardown_tasks.__contains__, task 2235): returns True for
+        stamped tids, False otherwise.
 
-        Uses the real-Scheduler construction path (Scheduler NOT patched) so that the
-        hook install ``scheduler._suppress_blocked_write = _action_teardown_tasks.__contains__``
-        survives on the actual Scheduler instance — the harness fixture replaces the
-        scheduler after construction, which would discard the hook.
+        Uses the real-Scheduler construction path (Scheduler NOT patched) so that
+        the constructor-injected SchedulerCallbacks bundle — built with
+        ``suppress_blocked_write=self._is_action_teardown_task`` — survives on the
+        actual Scheduler instance; the harness fixture replaces the scheduler
+        after construction, which would discard the hook.
 
         Counter.__contains__ returns True for keys with positive count and False otherwise
         (as long as zero-count keys are deleted on decrement, which _action_teardown_and_set_status
@@ -831,8 +834,8 @@ class TestActionTeardownTasksSet:
         ):
             h = Harness(mock_orch_config)
         # h.scheduler is a real Scheduler here (not replaced by the fixture).
-        hook = h.scheduler._suppress_blocked_write
-        assert hook is not None, '_suppress_blocked_write must be wired (None before step-12)'
+        hook = h.scheduler._callbacks.suppress_blocked_write
+        assert hook is not None, 'suppress_blocked_write must be wired (None before step-12)'
         h._action_teardown_tasks['task-X'] += 1  # Counter increment (was set.add — amend)
         assert hook('task-X') is True, 'hook must return True for stamped task_id'
         assert hook('task-Y') is False, 'hook must return False for unstamped task_id'

@@ -168,11 +168,12 @@ class TestHarnessPauseScheduler:
 
 
 class TestHarnessSchedulerParkStopWiring:
-    """Tests that Harness wires scheduler._on_park_stop_trip → Harness.pause_scheduler."""
+    """Tests that Harness wires on_park_stop_trip → Harness.pause_scheduler via
+    the constructor-injected SchedulerCallbacks bundle (task 2235)."""
 
     @pytest.mark.asyncio
     async def test_harness_wires_scheduler_park_stop_callback(self, tmp_path: Path) -> None:
-        """After Harness construction, scheduler._on_park_stop_trip must be set.
+        """After Harness construction, scheduler._callbacks.on_park_stop_trip must be set.
 
         Calling the callback directly with a reason string must cause the
         scheduler to become paused with that reason — proving that the callback
@@ -181,12 +182,13 @@ class TestHarnessSchedulerParkStopWiring:
         config = OrchestratorConfig(project_root=tmp_path)
         harness = Harness(config)
 
-        assert harness.scheduler._on_park_stop_trip is not None, (
-            'Harness must wire scheduler._on_park_stop_trip after construction'
+        assert harness.scheduler._callbacks.on_park_stop_trip is not None, (
+            'Harness must wire on_park_stop_trip into the SchedulerCallbacks '
+            'bundle at Scheduler construction time'
         )
 
         # Call the callback directly (simulating a trip event fired by the scheduler).
-        await harness.scheduler._on_park_stop_trip('integration-reason')
+        await harness.scheduler._callbacks.on_park_stop_trip('integration-reason')
 
         assert harness.scheduler.is_paused is True, (
             'Scheduler must be paused after the trip callback is invoked'
@@ -349,7 +351,11 @@ class TestParkStopE2E:
         run_store1 = RunStore(db_path)
         harness1._run_store = run_store1
         harness1._run_id = 'run-e2e-0001'
-        # _on_park_stop_trip is already wired to harness1.pause_scheduler by __init__.
+        # on_park_stop_trip is already wired to harness1.pause_scheduler by __init__
+        # via the constructor-injected SchedulerCallbacks bundle (task 2235).
+        # This test drives acquire_next() directly (bypassing Harness.run()'s
+        # startup sweeps), so it must call finish_startup() itself.
+        harness1.scheduler.finish_startup()
 
         # Act: mark 5 tasks blocked — trip fires on the 5th.
         for i in range(1, 6):
@@ -1032,6 +1038,7 @@ class TestHarnessCostCeiling:
             orch_daily_cost_ceiling_usd=1000.0,
         )
         harness = Harness(config)
+        harness.scheduler.finish_startup()
         mock_run_store = MagicMock(spec=RunStore)
         harness._run_store = mock_run_store
         harness._run_id = 'run-test-under-0001'
@@ -1165,6 +1172,7 @@ class TestHarnessCostCeiling:
             orch_daily_cost_ceiling_usd=1000.0,
         )
         harness = Harness(config)
+        harness.scheduler.finish_startup()
         mock_run_store = MagicMock(spec=RunStore)
         harness._run_store = mock_run_store
         harness._run_id = 'run-test-e2e-ceil-0001'
