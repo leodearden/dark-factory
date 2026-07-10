@@ -2889,7 +2889,9 @@ async def test_set_task_status_done_to_done_repair_rejects_invalid_provenance(
 
     done_provenance missing the required 'kind' field must surface
     error == 'done_provenance_invalid' rather than being swallowed by the
-    same-status guard, and must not touch taskmaster.update_task.
+    same-status guard, and must not touch taskmaster.update_task or
+    taskmaster.stamp_audit_metadata — validation runs before either writer
+    is ever reached.
     """
     sha = _init_git_repo(tmp_path)
     taskmaster.get_task = AsyncMock(
@@ -2911,6 +2913,60 @@ async def test_set_task_status_done_to_done_repair_rejects_invalid_provenance(
 
     assert result.get('error') == 'done_provenance_invalid'
     taskmaster.update_task.assert_not_called()
+    taskmaster.stamp_audit_metadata.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_set_task_status_done_to_done_repair_persists_against_real_backend(
+    tmp_path, event_buffer,
+):
+    """End-to-end: the done->done legacy-blob repair survives the real
+    SqliteTaskBackend done_provenance floor (task C1).
+
+    A bare AsyncMock backend cannot enforce the floor added to
+    ``SqliteTaskBackend.update_task``, so the mock-based repair tests above
+    would stay green even if the repair helper still called ``update_task``
+    directly. This test wraps a real backend so the floor actually fires,
+    proving ``_repair_done_provenance_same_status`` persists through the
+    privileged ``stamp_audit_metadata`` seam and that sibling metadata keys
+    survive the seam's read-modify-write merge.
+    """
+    from fused_memory.backends.sqlite_task_backend import SqliteTaskBackend
+    from fused_memory.config.schema import TaskmasterConfig
+
+    sha = _init_git_repo(tmp_path)
+    backend = SqliteTaskBackend(TaskmasterConfig(project_root=str(tmp_path)))
+    await backend.start()
+    try:
+        await backend.add_task(
+            project_root=str(tmp_path),
+            title='T',
+            metadata=json.dumps({'files': ['x.py'], 'memory_hints': {'queries': ['q']}}),
+        )
+        # Legacy kind-less blob, written via the sanctioned seam.
+        await backend.stamp_audit_metadata(
+            '1', str(tmp_path), {'done_provenance': {'commit': sha}},
+        )
+        await backend.set_task_status('1', 'done', str(tmp_path))
+
+        interceptor = TaskInterceptor(backend, None, event_buffer)
+        result = await interceptor.set_task_status(
+            '1',
+            'done',
+            str(tmp_path),
+            done_provenance={'kind': 'merged', 'commit': sha},
+        )
+
+        assert 'error' not in result
+        assert result.get('success') is True
+        assert result.get('done_provenance_repaired') is True
+
+        md = (await backend.get_task('1', project_root=str(tmp_path)))['metadata']
+        assert md['done_provenance'] == {'kind': 'merged', 'commit': sha}
+        assert md['files'] == ['x.py']
+        assert md['memory_hints'] == {'queries': ['q']}
+    finally:
+        await backend.close()
 
 
 @pytest.mark.asyncio

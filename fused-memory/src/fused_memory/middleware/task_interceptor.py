@@ -843,7 +843,6 @@ class TaskInterceptor:
                         done_provenance,
                         project_root,
                         tag,
-                        before,
                     )
                 return {'success': True, 'no_op': True, 'task_id': task_id}
 
@@ -4383,7 +4382,6 @@ async def _repair_done_provenance_same_status(
     done_provenance: dict,
     project_root: str,
     tag: str | None,
-    before: dict,
 ) -> dict:
     """Sanctioned done->done repair path for a legacy ``done_provenance`` blob.
 
