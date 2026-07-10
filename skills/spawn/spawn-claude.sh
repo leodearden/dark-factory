@@ -133,6 +133,15 @@ fi
 # trailer only asks the session to write the file, nothing here blocks exit
 # on it, and a parent that finds no result.md simply falls back to its own
 # exploration.
+#
+# DELIBERATE ORDERING: the session-registry `launching` write further above
+# (CLAUDE_SPAWN_PROMPT="$prompt") already ran and persisted `prompt` BEFORE
+# this trailer is appended, so record.prompt intentionally holds the
+# caller's original prompt, not this machine-appended boilerplate --
+# record.prompt is "what the caller asked for", not "the literal argv
+# claude received". Do NOT reorder the registry call to run after this
+# block to make them match; a reader who needs the exact text claude saw
+# should reconstruct it from record.prompt plus this trailer template.
 if [ -n "$CLAUDE_SPAWN_RESULT_FILE" ]; then
   prompt="${prompt}
 
