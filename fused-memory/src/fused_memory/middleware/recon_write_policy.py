@@ -31,12 +31,19 @@ function that always runs its gates when called.
 
 from __future__ import annotations
 
+import json
 from dataclasses import dataclass
 from typing import Literal
 
 from shared.task_statuses import TERMINAL as TERMINAL_STATUSES
 
 from fused_memory.services.live_workflow_detector import is_workflow_live_for_task
+
+# Metadata keys carrying the snapshot status a recon-stage caller observed
+# before writing. Promoted (Open Q3) from
+# reconciliation/stages/task_knowledge_sync.py's _STAGE2_STALL_SNAPSHOT_KEYS
+# so the server enforces the same keys the post-hoc guard checked.
+SNAPSHOT_TOKEN_KEYS: tuple[str, ...] = ('snapshot_status', 'observed_status')
 
 # ---------------------------------------------------------------------------
 # Verdict
@@ -236,3 +243,35 @@ def check(
         target_status=target_status,
         snapshot_token=snapshot_token,
     )
+
+
+# ---------------------------------------------------------------------------
+# extract_snapshot_token()
+# ---------------------------------------------------------------------------
+
+
+def extract_snapshot_token(metadata: object) -> str | None:
+    """Extract the snapshot status token from ``update_task``'s ``metadata`` kwarg.
+
+    Coerces *metadata* via dict/``json.loads`` — mirroring
+    ``_reject_done_provenance_in_update_metadata``'s inline coercion idiom
+    in ``task_interceptor.py``. Returns the value of the first
+    :data:`SNAPSHOT_TOKEN_KEYS` entry present, coerced to ``str``, or
+    ``None`` when *metadata* is not a dict / JSON-object string, or
+    contains neither key.
+    """
+    parsed: dict | None = None
+    if isinstance(metadata, dict):
+        parsed = metadata
+    elif isinstance(metadata, str):
+        try:
+            loaded = json.loads(metadata)
+        except (ValueError, TypeError):
+            return None
+        parsed = loaded if isinstance(loaded, dict) else None
+    if parsed is None:
+        return None
+    for key in SNAPSHOT_TOKEN_KEYS:
+        if key in parsed:
+            return str(parsed[key])
+    return None
