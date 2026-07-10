@@ -1860,8 +1860,16 @@ class TaskInterceptor:
             )
         return (None, False)
 
-    async def submit_task(self, project_root: str, **kwargs: Any) -> dict:
+    async def submit_task(
+        self, project_root: str, *, agent_id: str | None = None, **kwargs: Any
+    ) -> dict:
         """Phase-1 of the two-phase add: persist a ticket and return its id immediately.
+
+        ``agent_id`` identifies the caller that initiated this write (derived
+        from the MCP context by the tool handler). It is captured as an
+        explicit keyword-only parameter — out of ``**kwargs`` — so it is never
+        serialized into the ticket blob nor forwarded to ``tm.add_task``; it is
+        a read accessor for downstream consumers (W5-ζ ReconWritePolicy, W5-η).
 
         The curator decision (drop / combine / create) is deferred to the
         single-worker queue so concurrent callers never contend on a long LLM
@@ -3492,9 +3500,18 @@ class TaskInterceptor:
         self,
         task_id: str,
         project_root: str,
+        *,
+        agent_id: str | None = None,
         **kwargs: Any,
     ) -> dict:
         """Write task metadata through all interceptor gates.
+
+        ``agent_id`` identifies the caller that initiated this write (derived
+        from the MCP context by the tool handler). It is captured as an
+        explicit keyword-only parameter — out of ``**kwargs`` — so it is never
+        forwarded to the Taskmaster backend nor journalled alongside the other
+        kwargs; it is a read accessor for downstream consumers (W5-ζ
+        ReconWritePolicy, W5-η).
 
         Gates (run in order; each returns early with a structured error dict on rejection):
 

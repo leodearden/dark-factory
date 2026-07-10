@@ -3118,6 +3118,7 @@ def create_mcp_server(
             tag=tag,
             planning_mode=planning_mode,
             routing_override_reason=routing_override_reason,
+            agent_id=agent_id,
         )
 
     @mcp.tool()
@@ -3495,6 +3496,7 @@ def create_mcp_server(
             priority=priority,
             status=status,
             dependencies=dependencies,
+            agent_id=agent_id,
         )
 
     @mcp.tool()
