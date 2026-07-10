@@ -977,6 +977,47 @@ def test_claim_lease_does_not_clobber_a_lease_reclaimed_between_stale_check_and_
     assert sr.LeaseHolder.from_json(lease_path.read_text()) == stale_holder
 
 
+# --- claim_lease: corrupt/unreadable lease body ---------------------------
+
+
+def test_claim_lease_reaps_and_reclaims_a_corrupt_and_aged_lease(tmp_path: Path) -> None:
+    corrupt_path = sr.lease_path_for_name('watcher-df', root=tmp_path)
+    corrupt_path.parent.mkdir(parents=True, exist_ok=True)
+    corrupt_path.write_text('{not valid json')
+    _set_mtime(corrupt_path, _NOW, sr.LEASE_HEARTBEAT_TTL + timedelta(minutes=1))
+
+    new_holder = sr.LeaseHolder(session_slug='watcher-df-new', pid=os.getpid(), start_ts=_NOW.isoformat())
+    claim = sr.claim_lease('watcher-df', holder=new_holder, root=tmp_path, now=_NOW)
+
+    assert claim.acquired is True
+    assert claim.decision == sr.LeaseDecision.ACQUIRED
+    assert claim.holder == new_holder
+    assert sr.LeaseHolder.from_json(corrupt_path.read_text()) == new_holder
+
+
+def test_claim_lease_contention_on_corrupt_body_within_ttl_reports_unknown_holder(
+    tmp_path: Path,
+) -> None:
+    corrupt_path = sr.lease_path_for_name('watcher-df', root=tmp_path)
+    corrupt_path.parent.mkdir(parents=True, exist_ok=True)
+    corrupt_path.write_text('{not valid json')
+    _set_mtime(corrupt_path, _NOW, sr.LEASE_HEARTBEAT_TTL - timedelta(minutes=1))
+
+    contender = sr.LeaseHolder(session_slug='watcher-df-200', pid=os.getpid(), start_ts=_NOW.isoformat())
+    claim = sr.claim_lease(
+        'watcher-df', holder=contender, policy=sr.LeasePolicy.STAND_DOWN, root=tmp_path, now=_NOW
+    )
+
+    assert claim.acquired is False
+    assert claim.decision == sr.LeaseDecision.STAND_DOWN
+    assert claim.holder is None
+    assert claim.holder_alive is False
+    assert '<unknown>' in claim.message
+    assert 'standing down' in claim.message
+    # Not reaped (within TTL): the corrupt body is left exactly as-is.
+    assert corrupt_path.read_text() == '{not valid json'
+
+
 # --- heartbeat_lease / release_lease --------------------------------------
 
 
