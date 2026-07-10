@@ -2886,6 +2886,7 @@ async def classify_and_merge(
     if speculative and isinstance(worker, SpeculativeMergeWorker):
         worker._emit_speculative(
             EventType.speculative_merge, req.task_id, base_sha=base_sha,
+            depth=worker._verify_frontier_depth(),
         )
     merge_result = await git_ops.merge_to_main(
         req.worktree, req.branch, base_sha=base_sha if speculative else None,
