@@ -67,6 +67,18 @@ F2_MERGE_ATTEMPT = [
     _ma('D', 'conflict'),
 ]
 
+# ---------------------------------------------------------------------------
+# Fixture F3: real depth signal — depth0/depth1/depth2 buckets.
+# ---------------------------------------------------------------------------
+
+F3_MERGE_VERIFY = [
+    _mv('d0-1', True, depth=0),
+    _mv('d0-2', True, depth=0),
+    _mv('d1-1', True, depth=1),
+    _mv('d1-2', False, depth=1),
+    _mv('d2-1', False, depth=2),
+]
+
 
 class TestComputeCalibrationF1:
     """F1: 3/4 attempts pass, all 3 tasks eventually land."""
@@ -124,6 +136,54 @@ class TestComputeCalibrationF2:
     def test_p_good_bracket(self):
         cal = mod.compute_calibration(F2_MERGE_VERIFY, F2_MERGE_ATTEMPT)
         assert cal['p_good_bracket'] == (0.75, 0.75)
+
+
+# ---------------------------------------------------------------------------
+# compute_per_depth — buckets merge_verify events by a None-safe int()
+# coercion of data['depth']; absent/None/unparseable depths are skipped.
+# ---------------------------------------------------------------------------
+
+class TestComputePerDepth:
+    def test_pass_total_per_depth(self):
+        per_depth = mod.compute_per_depth(F3_MERGE_VERIFY)
+        counts = {d: (v['pass'], v['total']) for d, v in per_depth.items()}
+        assert counts == {0: (2, 2), 1: (1, 2), 2: (0, 1)}
+
+    def test_rate_per_depth(self):
+        per_depth = mod.compute_per_depth(F3_MERGE_VERIFY)
+        rates = {d: v['rate'] for d, v in per_depth.items()}
+        assert rates == {0: 1.0, 1: 0.5, 2: 0.0}
+
+    def test_string_depth_coerced_to_int(self):
+        # speculative_merge's _emit_speculative str-converts every value,
+        # so a real event can carry depth as the string "1".
+        events = [_mv('s', True, depth='1')]
+        per_depth = mod.compute_per_depth(events)
+        assert set(per_depth) == {1}
+        assert per_depth[1]['pass'] == 1
+        assert per_depth[1]['total'] == 1
+
+    def test_none_depth_excluded(self):
+        events = [_mv('n', True, depth=None), _mv('z', True, depth=0)]
+        per_depth = mod.compute_per_depth(events)
+        assert set(per_depth) == {0}
+
+    def test_missing_depth_key_excluded(self):
+        # historical (pre-2340) events carry no 'depth' key at all.
+        events = [{'task_id': 'm', 'data': {'passed': True}}]
+        per_depth = mod.compute_per_depth(events)
+        assert not per_depth
+
+    def test_unparseable_depth_excluded(self):
+        events = [_mv('u', True, depth='not-a-number')]
+        per_depth = mod.compute_per_depth(events)
+        assert not per_depth
+
+    def test_no_depth_anywhere_yields_empty_result(self):
+        # F2: every event has an explicit depth=None — no real signal.
+        # This is the fallback trigger for format_report's CONFOUNDED path.
+        per_depth = mod.compute_per_depth(F2_MERGE_VERIFY)
+        assert not per_depth
 
 
 # ---------------------------------------------------------------------------
