@@ -419,6 +419,11 @@ class TestWriteCycleSummaryLedgerWrite:
 
     @pytest.mark.asyncio
     async def test_no_ledger_wired_is_noop_returns_false_does_not_raise(self):
+        """Scoped to the AUTHORITATIVE ledger write only: no ledger means no
+        ledger row and a ``False`` return. This does NOT mean the whole
+        function is a no-op — the best-effort Mem0 mirror and pool-cap trim
+        still run in this scenario; see
+        ``TestWriteCycleSummaryMirrorAndTrim.test_mirror_and_trim_still_run_when_no_ledger_wired``."""
         memory_service = AsyncMock()
         memory_service.recon_ledger = None
 
@@ -440,8 +445,10 @@ class TestWriteCycleSummaryMirrorAndTrim:
     """write_cycle_summary's best-effort Mem0 mirror (``add_system_record``)
     and pool-cap trim (``enforce_summary_pool_cap``) — task 2229 W5-λ step-03.
 
-    Both are best-effort: they run whenever a ledger is wired, regardless of
-    whether the authoritative ledger upsert itself succeeded, and neither can
+    Both are best-effort: they run UNCONDITIONALLY — regardless of whether a
+    ledger is wired at all (see ``test_mirror_and_trim_still_run_when_no_ledger_wired``,
+    reviewer finding robustness, amendment pass) and regardless of whether
+    the authoritative ledger upsert itself succeeded — and neither can
     change the return value or propagate an exception out of
     ``write_cycle_summary`` (which reflects only the authoritative ledger
     write's own outcome).
@@ -602,3 +609,50 @@ class TestWriteCycleSummaryMirrorAndTrim:
             )
 
         assert result is True
+
+    @pytest.mark.asyncio
+    async def test_mirror_and_trim_still_run_when_no_ledger_wired(self):
+        """A disabled/absent ledger (``recon_ledger_enabled=False``, a
+        supported non-default config — server/main.py) must not silence the
+        Mem0 mirror too. Stage 3's cycle-summary presence check
+        (prompts/stage3.py) reads only the mirror, never the ledger, so if
+        the mirror also went dark whenever the ledger was absent, Stage 3
+        would false-report "summary missing" every cycle with no fallback
+        signal (reviewer finding robustness, task 2229 amendment pass).
+
+        The authoritative ledger upsert is still correctly skipped (``False``)
+        — this only proves the best-effort mirror/trim are no longer gated
+        behind ledger availability.
+        """
+        memory_service = AsyncMock()
+        memory_service.recon_ledger = None
+        memory_service.add_system_record = AsyncMock(
+            return_value=SimpleNamespace(memory_ids=['m1']),
+        )
+
+        with patch(
+            'fused_memory.reconciliation.summary_pool.enforce_summary_pool_cap',
+            AsyncMock(return_value=0),
+        ) as mock_trim:
+            result = await write_cycle_summary(
+                memory_service,
+                'dark_factory',
+                self._report(),
+                'run-no-ledger',
+                stage='task_knowledge_sync',
+                recon_pool='stage2_cycle_summary',
+                trim_source='stage2_cycle_summary_trim',
+                cap=2,
+            )
+
+        assert result is False  # no ledger => authoritative write correctly skipped
+
+        memory_service.add_system_record.assert_awaited_once()
+        kwargs = memory_service.add_system_record.call_args.kwargs
+        assert kwargs.get('agent_id') == 'recon-stage-task_knowledge_sync'
+        metadata = kwargs.get('metadata') or {}
+        assert metadata.get('kind') == 'cycle_summary'
+        assert metadata.get('run_id') == 'run-no-ledger'
+        assert 'run-no-ledger' in kwargs.get('content', '')
+
+        mock_trim.assert_awaited_once()

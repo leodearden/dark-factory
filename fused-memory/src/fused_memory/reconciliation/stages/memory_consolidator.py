@@ -146,6 +146,17 @@ class MemoryConsolidator(BaseStage):
         # items_flagged; stays 0 otherwise.
         report.stats['stage1_completion_markers_self_deleted'] = 0
 
+        # Always present (task 2229 amendment, mirrors the task-2312 pattern
+        # above): set BEFORE the remediation early-return so this key is
+        # never conditionally absent. Stage 2's equivalent
+        # stage2_cycle_summary_written (task_knowledge_sync.py) is set
+        # unconditionally, so a consumer aggregating both stages' stats
+        # should not need a .get(..., 0) fallback for Stage 1's key.
+        # Overwritten below on a full (non-remediation) cycle once
+        # write_cycle_summary actually runs; stays 0 on remediation passes,
+        # which intentionally skip the write (see that call site below).
+        report.stats['stage1_cycle_summary_written'] = 0
+
         # Skip dedup for remediation passes
         if self.remediation_findings is not None:
             return report
@@ -398,7 +409,9 @@ class MemoryConsolidator(BaseStage):
         # (non-remediation) cycles — the remediation payload
         # (_assemble_remediation_payload) never asked for a cycle_summary
         # under the old LLM-driven mechanism either, so writing one here would
-        # fabricate a spurious summary every remediation pass.
+        # fabricate a spurious summary every remediation pass. The stat set
+        # below overwrites the `= 0` default assigned before the
+        # remediation early-return above.
         cycle_summary_written = await write_cycle_summary(
             self.memory,
             self.project_id,

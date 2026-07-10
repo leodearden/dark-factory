@@ -187,25 +187,33 @@ async def write_cycle_summary(
     the same ``(stage, run_id)`` idempotent — last write wins, row count stays
     1 (boundary test D1).
 
-    Fail-safe no-op when *memory_service* has no ``recon_ledger`` wired
-    (mirrors :func:`~fused_memory.reconciliation.stages.task_knowledge_sync._gc_recon_markers`'s
-    ``getattr(memory_service, 'recon_ledger', None)`` precedent) — in that
-    case neither the mirror nor the trim below run either.
+    The authoritative ledger write is a no-op when *memory_service* has no
+    ``recon_ledger`` wired (mirrors :func:`~fused_memory.reconciliation.stages.task_knowledge_sync._gc_recon_markers`'s
+    ``getattr(memory_service, 'recon_ledger', None)`` precedent): the ledger
+    upsert is skipped and this function returns ``False``.
 
-    Once a ledger IS wired, two further best-effort steps run — a Mem0
-    mirror (``add_system_record``, human/LLM-searchable) and a pool-cap trim
-    (:func:`enforce_summary_pool_cap`, bounds the mirror pool) —
-    UNCONDITIONALLY, regardless of whether the authoritative ledger upsert
-    itself succeeded: each is independently wrapped in its own try/except
-    that logs a WARNING and swallows the failure, so a Mem0 outage can never
-    mask (or be masked by) the ledger write's own outcome, and neither can
-    ever raise out of this function. The return value reflects ONLY the
-    authoritative ledger upsert.
+    The Mem0 mirror (``add_system_record``, human/LLM-searchable) and the
+    pool-cap trim (:func:`enforce_summary_pool_cap`, bounds the mirror pool)
+    run UNCONDITIONALLY — regardless of whether a ledger is wired at all, and
+    regardless of whether the authoritative ledger upsert itself succeeded.
+    Each is independently wrapped in its own try/except that logs a WARNING
+    and swallows the failure, so neither a missing ledger nor a Mem0 outage
+    can mask (or be masked by) the other's outcome, and neither can ever
+    raise out of this function. This matters in practice: Stage 3's
+    cycle-summary presence check (``prompts/stage3.py``) reads only the Mem0
+    mirror, never the ledger (see the "Known gap" comment there) — if the
+    mirror also went dark whenever the ledger was absent (e.g. a
+    deliberately-disabled ``recon_ledger_enabled=False``, a supported
+    non-default config), Stage 3 would false-report "summary missing" every
+    cycle with no fallback signal. (Reviewer finding robustness, task 2229
+    amendment pass.) The return value reflects ONLY the authoritative ledger
+    upsert.
 
     Args:
         memory_service: Service that may expose a ``recon_ledger``
             (:class:`~fused_memory.reconciliation.recon_ledger.ReconLedgerStore`)
-            attribute. Missing/``None`` => no-op (returns ``False``).
+            attribute. Missing/``None`` => the ledger upsert is skipped
+            (returns ``False``); the Mem0 mirror and pool-cap trim still run.
         project_id: Project scope for the ledger row.
         report: The stage's own ``StageReport`` — ``started_at``,
             ``completed_at``, ``items_flagged``, ``stats``, ``llm_calls``, and
@@ -230,18 +238,17 @@ async def write_cycle_summary(
         otherwise (no ledger wired, or the upsert raised).
     """
     ledger = getattr(memory_service, 'recon_ledger', None)
-    if ledger is None:
-        return False
-
     now_dt = _assume_utc(now or datetime.now(UTC))
-    written = True
+    written = False
     payload: dict | None = None
     try:
-        # Payload/record construction lives inside this try (not just the
-        # upsert call) so a malformed report — e.g. a stray None
+        # Payload construction lives inside this try (not just the upsert
+        # call) so a malformed report — e.g. a stray None
         # started_at/completed_at — degrades to written=False + WARNING
         # like any other ledger-write failure, rather than raising an
-        # unhandled AttributeError out of this fail-safe function.
+        # unhandled AttributeError out of this fail-safe function. Built
+        # even when `ledger` is None: the best-effort mirror below needs it
+        # regardless of ledger availability (see the docstring above).
         payload = {
             'stage': stage,
             'run_id': run_id,
@@ -252,18 +259,20 @@ async def write_cycle_summary(
             'llm_calls': report.llm_calls,
             'tokens_used': report.tokens_used,
         }
-        record = ReconLedgerRecord(
-            project_id=project_id,
-            record_kind='cycle_summary',
-            task_id='',
-            flag_type=stage,
-            run_id=run_id,
-            payload_json=json.dumps(payload, default=str),
-            state='active',
-            created_at=now_dt.isoformat(),
-            expires_at=(now_dt + timedelta(days=CYCLE_SUMMARY_TTL_DAYS)).isoformat(),
-        )
-        await ledger.upsert(record)
+        if ledger is not None:
+            record = ReconLedgerRecord(
+                project_id=project_id,
+                record_kind='cycle_summary',
+                task_id='',
+                flag_type=stage,
+                run_id=run_id,
+                payload_json=json.dumps(payload, default=str),
+                state='active',
+                created_at=now_dt.isoformat(),
+                expires_at=(now_dt + timedelta(days=CYCLE_SUMMARY_TTL_DAYS)).isoformat(),
+            )
+            await ledger.upsert(record)
+            written = True
     except Exception:
         logger.warning(
             'reconciliation.write_cycle_summary: '
