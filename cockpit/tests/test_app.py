@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import pytest
 from orchestrator import session_registry as sr
+from textual.coordinate import Coordinate
 
 
 def _make_record(**overrides):
@@ -51,3 +52,53 @@ class TestInitialRender:
 
             row = table.get_row('a-1')
             assert 'unblock:df#2085' in row
+
+
+class TestPollRefresh:
+    @pytest.mark.timeout(10)
+    async def test_new_record_appears_and_orders_blocked_first(self, tmp_path):
+        """A record written to disk after mount appears within one poll window,
+        and a newly-blocked record is ordered first (blocked-first, timer-driven)."""
+        from cockpit.app import CockpitApp
+        from cockpit.panes.session_table import SessionTable
+
+        running = _make_record(session_slug='running-1', status=sr.Status.RUNNING)
+        sr.write_record(running, root=tmp_path)
+
+        app = CockpitApp(fleet_root=tmp_path, poll_interval=0.05)
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            table = app.query_one(SessionTable)
+            assert table.row_count == 1
+
+            blocked = _make_record(session_slug='blocked-1', status=sr.Status.AWAITING_INPUT)
+            sr.write_record(blocked, root=tmp_path)
+
+            await pilot.pause(0.2)
+
+            assert table.row_count == 2
+            first_row_key = table.coordinate_to_cell_key(Coordinate(0, 0)).row_key
+            assert first_row_key.value == 'blocked-1'
+
+    @pytest.mark.timeout(10)
+    async def test_mutated_status_reflected_after_poll(self, tmp_path):
+        """An existing record's status change on disk is picked up by the next poll tick."""
+        from cockpit.app import CockpitApp
+        from cockpit.panes.session_table import SessionTable, state_glyph
+
+        running = _make_record(session_slug='running-1', status=sr.Status.RUNNING)
+        sr.write_record(running, root=tmp_path)
+
+        app = CockpitApp(fleet_root=tmp_path, poll_interval=0.05)
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            table = app.query_one(SessionTable)
+            assert state_glyph(sr.Status.RUNNING) in table.get_row('running-1')
+
+            sr.update_status('running-1', root=tmp_path, status=sr.Status.IDLE)
+
+            await pilot.pause(0.2)
+
+            row = table.get_row('running-1')
+            assert state_glyph(sr.Status.IDLE) in row
+            assert state_glyph(sr.Status.RUNNING) not in row
