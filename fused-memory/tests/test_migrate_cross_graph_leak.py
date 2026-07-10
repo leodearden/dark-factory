@@ -1496,6 +1496,76 @@ class TestRunApplyPhaseBarrier:
 
 
 # ===========================================================================
+# Tests: run() apply preserves a co-moving pair's shared edge
+# (task 2415, step-13/14)
+# ===========================================================================
+
+class TestRunApplyCoMovingPreserved:
+    """Proves the three-phase barrier-ordered apply preserves a co-moving
+    pair's shared RELATES_TO edge -- the whole point of task 2415 -- by
+    folding recreate_subgraph_relationships's SubgraphEdgeResult into the
+    report instead of discarding it.
+    """
+
+    def _write_manifest(self, tmp_path, nodes, census) -> Path:
+        manifest = _mod.build_manifest(nodes, census, dry_run=True)
+        manifest_path = tmp_path / 'manifest.json'
+        manifest_path.write_text(json.dumps(manifest))
+        return manifest_path
+
+    @pytest.mark.asyncio
+    async def test_co_moving_pair_edge_recreated_count_folded_into_report(
+        self, tmp_path, monkeypatch,
+    ):
+        """Two MOVE nodes (u-A, u-B) sharing a RELATES_TO edge, both moving
+        reify -> dark_factory: run() passes BOTH specs to a single
+        recreate_subgraph_relationships call, folds its edges_recreated
+        count into report['edges_recreated'], records both nodes applied
+        (not blocked for edge loss), and -- with a clean post-verify
+        re-census -- yields exit_code 0. Proves the co-moving edge is
+        preserved, not lost."""
+        move_a = _classified_node(
+            'u-A', source_graph='reify', target_graph='dark_factory', disposition=_mod.MOVE,
+        )
+        move_b = _classified_node(
+            'u-B', source_graph='reify', target_graph='dark_factory', disposition=_mod.MOVE,
+        )
+        manifest_path = self._write_manifest(
+            tmp_path, [move_a, move_b], {'reify': 2, 'dark_factory': 0},
+        )
+
+        monkeypatch.setattr(_mod, 'create_moved_node', AsyncMock(return_value=None))
+        monkeypatch.setattr(_mod, 'delete_source_node', AsyncMock(return_value=None))
+        recreate_mock = AsyncMock(return_value=SubgraphEdgeResult(
+            edges_recreated=1, edges_skipped=0, dropped_cross_target=[],
+        ))
+        monkeypatch.setattr(_mod, 'recreate_subgraph_relationships', recreate_mock)
+
+        memory_service = _make_memory_service({
+            'reify': _make_graph_mock(ro_pages=[[]]),
+            'dark_factory': _make_graph_mock(ro_pages=[[]]),
+        })
+        args = _args(apply=True, manifest=str(manifest_path))
+
+        report = await _mod.run(args, memory_service)
+
+        recreate_mock.assert_awaited_once()
+        specs_arg = recreate_mock.await_args.args[1]
+        assert {spec['uuid'] for spec in specs_arg} == {'u-A', 'u-B'}
+
+        assert report['edges_recreated'] == 1
+
+        applied = {r['uuid']: r for r in report['apply_results']}
+        assert applied['u-A']['applied'] is True
+        assert applied['u-A']['blocked'] is False
+        assert applied['u-B']['applied'] is True
+        assert applied['u-B']['blocked'] is False
+
+        assert report['post_verify']['matched'] is True
+        assert report['exit_code'] == 0
+
+
+# ===========================================================================
 # Tests: build_arg_parser (step-21/22)
 # ===========================================================================
 
