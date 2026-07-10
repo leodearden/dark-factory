@@ -37,7 +37,7 @@ import contextlib
 import logging
 import time
 from pathlib import Path
-from unittest.mock import MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
@@ -660,6 +660,18 @@ async def _make_merged_item(
     return req, item
 
 
+def _pass_result() -> MagicMock:
+    """Return a MagicMock verify-pass result.
+
+    Mirrors test_merge_queue_concurrent_verify.py's _mock_verify_pass()
+    (per-file duplication convention) — LocalRunner.run_merge_verify only
+    reads .passed off the scoped result on the pass path, so a bare
+    MagicMock(passed=True, ...) is sufficient (proven by the existing
+    TestRunInflightVerifyHappyPath local-lease tests in that file).
+    """
+    return MagicMock(passed=True, summary='')
+
+
 @pytest.mark.asyncio
 class TestDeadInflightVerifyAborts:
     """SpeculativeMergeWorker._run_inflight_verify LOCAL no-progress abort
@@ -674,6 +686,12 @@ class TestDeadInflightVerifyAborts:
     dead/hung verify with zero content progress.
 
     RED until step-4 GREEN adds abort trigger 3 (elapsed-only to start).
+
+    step-5 RED / step-6 GREEN adds two guards that step-4's elapsed-only,
+    lease-agnostic trigger fails: a healthy LOCAL verify that keeps writing
+    under merge_wt must NOT be aborted (progress resets the clock), and a
+    REMOTE lease must NEVER be progress-aborted (scope fence — remote
+    verify-hang is owned by task 2362's ssh keepalive).
     """
 
     async def test_dead_local_verify_is_aborted_and_requeued_within_budget(
@@ -738,3 +756,124 @@ class TestDeadInflightVerifyAborts:
             req.task_id in r.message and 'progress' in r.message.lower()
             for r in warnings
         ), f'expected a WARNING naming the task + no-progress budget, got: {caplog.text}'
+
+    async def test_healthy_writing_local_verify_is_not_aborted(
+        self,
+        git_ops: GitOps,
+        config: OrchestratorConfig,
+    ) -> None:
+        """A LOCAL verify that keeps writing under merge_wt must never be
+        progress-aborted — content progress resets the no-progress clock.
+
+        RED (step-5) until step-6 GREEN converts trigger 3 from elapsed-only
+        to a genuine no-PROGRESS budget: step-4's elapsed-only trigger aborts
+        this healthy, actively-writing verify exactly like a dead one, since
+        it never looks at worktree content at all.
+        """
+        from orchestrator.merge_queue import SpeculativeMergeWorker
+        from orchestrator.verify_runner import HostLease
+
+        release_event = asyncio.Event()
+
+        req, item = await _make_merged_item(
+            git_ops, config, 'healthy-verify-a', 'ha.py', 'x=1\n',
+        )
+        q: asyncio.Queue[MergeRequest] = asyncio.Queue()
+        worker = SpeculativeMergeWorker(git_ops, q)
+        worker._register_owned_merge_worktree(item.merge_wt)
+
+        worker.VERIFY_ABANDON_POLL_SECS = 0.02
+        worker.INFLIGHT_VERIFY_PROGRESS_PROBE_SECS = 0.02
+        worker.INFLIGHT_VERIFY_PROGRESS_BUDGET_SECS = 0.2
+
+        async def _healthy_writing_gate(*args: object, **kwargs: object) -> MagicMock:
+            merge_wt_arg = Path(args[0])
+            target = merge_wt_arg / 'target'
+            target.mkdir(exist_ok=True)
+            i = 0
+            # Keep writing fresh content well past several budget windows so
+            # a working no-progress budget's clock is repeatedly reset.
+            while not release_event.is_set():
+                (target / f'{i}.tmp').write_text('progress')
+                i += 1
+                await asyncio.sleep(worker.INFLIGHT_VERIFY_PROGRESS_PROBE_SECS)
+            return _pass_result()
+
+        fake_local = MagicMock()
+        fake_local.name = 'local'
+        fake_local.is_local = True
+        lease = HostLease(name='local', runner=fake_local, is_local=True)
+
+        with patch('orchestrator.merge_queue.run_scoped_verification', _healthy_writing_gate):
+            verify_future = asyncio.ensure_future(worker._run_inflight_verify(item, lease))
+            # Let several budget windows elapse while content keeps writing.
+            await asyncio.sleep(worker.INFLIGHT_VERIFY_PROGRESS_BUDGET_SECS * 4)
+            release_event.set()
+            result = await asyncio.wait_for(verify_future, timeout=5.0)
+
+        assert result.status is None, (
+            f'a healthy, progressing local verify must NOT be progress-aborted; '
+            f'got status={result.status!r}'
+        )
+        assert q.empty(), 'healthy verify must not be re-dispatched'
+
+    async def test_remote_lease_is_never_progress_aborted(
+        self,
+        git_ops: GitOps,
+        config: OrchestratorConfig,
+    ) -> None:
+        """A REMOTE lease must never be progress-aborted (scope fence): the
+        remote verify-hang facet is owned by task 2362's ssh keepalive, and a
+        remote verify writes to the REMOTE host's worktree, not the local
+        merge_wt — so a local content-mtime budget would false-abort a
+        healthy remote verify.
+
+        RED (step-5) until step-6 GREEN gates trigger 3 on lease.is_local:
+        step-4's elapsed-only trigger is lease-agnostic and aborts this dead
+        REMOTE verify exactly like a LOCAL one.
+        """
+        from orchestrator.merge_queue import SpeculativeMergeWorker
+        from orchestrator.verify_runner import HostLease
+
+        never_release = asyncio.Event()
+        gate_entered = asyncio.Event()
+
+        async def _dead_remote_verify(*args: object, **kwargs: object) -> MagicMock:
+            gate_entered.set()
+            await never_release.wait()
+            return _pass_result()  # pragma: no cover — never reached in this test
+
+        req, item = await _make_merged_item(
+            git_ops, config, 'remote-dead-verify-a', 'ra.py', 'x=1\n',
+        )
+        q: asyncio.Queue[MergeRequest] = asyncio.Queue()
+        worker = SpeculativeMergeWorker(git_ops, q)
+        worker._register_owned_merge_worktree(item.merge_wt)
+
+        worker.VERIFY_ABANDON_POLL_SECS = 0.02
+        worker.INFLIGHT_VERIFY_PROGRESS_PROBE_SECS = 0.02
+        worker.INFLIGHT_VERIFY_PROGRESS_BUDGET_SECS = 0.2
+
+        fake_remote = MagicMock()
+        fake_remote.name = 'remote-host'
+        fake_remote.is_local = False
+        fake_remote.run_merge_verify = AsyncMock(side_effect=_dead_remote_verify)
+        fake_remote.cancel_verify = AsyncMock(return_value=0)
+        lease = HostLease(name='remote-host', runner=fake_remote, is_local=False)
+
+        verify_future = asyncio.ensure_future(worker._run_inflight_verify(item, lease))
+        await asyncio.wait_for(gate_entered.wait(), timeout=15.0)
+
+        # Wall-clock comfortably exceeds the (tiny) budget several times over
+        # — a LOCAL lease would already have been progress-aborted by now.
+        await asyncio.sleep(worker.INFLIGHT_VERIFY_PROGRESS_BUDGET_SECS * 5)
+
+        assert not verify_future.done(), (
+            'a REMOTE lease must never be progress-aborted (scope fence: remote '
+            'verify-hang is owned by task 2362 ssh keepalive)'
+        )
+        assert q.empty(), 'remote lease must not be re-dispatched by the progress budget'
+
+        verify_future.cancel()
+        with contextlib.suppress(BaseException):
+            await verify_future
