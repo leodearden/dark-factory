@@ -436,3 +436,64 @@ def test_adopt_writes_registered_record_for_free_lanes(tmp_path):
     assert rec9["task_id"] is None, f"record={rec9!r}"
     assert not rec9["branch"], f"Expected a null/empty branch for a detached lane; record={rec9!r}"
     assert rec9["seeded_from_sha"], f"Expected a non-empty seeded_from_sha; record={rec9!r}"
+
+
+# ---------------------------------------------------------------------------
+# step-7: RED -- idempotency (adopt never clobbers an existing record)
+# ---------------------------------------------------------------------------
+
+def test_adopt_never_clobbers_an_existing_record(tmp_path):
+    """adopt only SEEDS absent records -- the restarted new-code orchestrator
+    is the authoritative writer, so an existing `.lane-state/<lane>.json`
+    must survive byte-for-byte and mtime-for-mtime, while a lane with no
+    record yet still gets one. A second full apply is then a total no-op on
+    records."""
+    worktree_base = _build_worktree_base(tmp_path, [
+        {"name": "_lane-7", "branch": "task/1234", "plan": {"title": "T"}},
+        {"name": "_lane-8", "branch": "task/999", "plan": None},
+    ])
+
+    lane_state_dir = worktree_base / LANE_STATE_DIRNAME
+    lane_state_dir.mkdir(parents=True)
+    hand_crafted = {
+        "state": "in_use",
+        "task_id": "1234",
+        "title": "hand-crafted, must survive",
+        "branch": "task/1234",
+        "seeded_from_sha": "0" * 40,
+        "updated_at": "2020-01-01T00:00:00+00:00",
+    }
+    lane7_path = _lane_state_path(worktree_base, "_lane-7")
+    lane7_path.write_text(json.dumps(hand_crafted, indent=2))
+    before_bytes = lane7_path.read_bytes()
+    before_mtime_ns = lane7_path.stat().st_mtime_ns
+
+    result = _run_script(worktree_base)
+    assert result.returncode == 0, (
+        f"Expected apply to exit 0; got {result.returncode}\n"
+        f"stdout={result.stdout!r} stderr={result.stderr!r}"
+    )
+
+    assert lane7_path.read_bytes() == before_bytes, (
+        "adopt must not touch an existing record's bytes"
+    )
+    assert lane7_path.stat().st_mtime_ns == before_mtime_ns, (
+        "adopt must not touch an existing record's mtime"
+    )
+
+    rec8 = _read_lane_record(worktree_base, "_lane-8")
+    assert rec8 is not None, (
+        f"Expected a NEW _lane-8 record to be written; "
+        f"stdout={result.stdout!r} stderr={result.stderr!r}"
+    )
+    assert rec8["state"] == "registered", f"record={rec8!r}"
+
+    # A second full apply is a total no-op on records.
+    result2 = _run_script(worktree_base)
+    assert result2.returncode == 0, (
+        f"Expected the second apply to exit 0; got {result2.returncode}\n"
+        f"stdout={result2.stdout!r} stderr={result2.stderr!r}"
+    )
+    assert lane7_path.read_bytes() == before_bytes
+    assert lane7_path.stat().st_mtime_ns == before_mtime_ns
+    assert _read_lane_record(worktree_base, "_lane-8") == rec8
