@@ -1583,3 +1583,53 @@ def test_tmux_backend_stamps_display_record(tmp_path: pathlib.Path) -> None:
         f"expected the display's wm_title to match the title passed to "
         f"spawn-claude.sh ({title!r}), got {record.display.wm_title!r}"
     )
+
+
+@pytest.mark.skipif(
+    __import__("platform").system() == "Darwin",
+    reason="exit-126 path requires non-Darwin host",
+)
+def test_tmux_backend_missing_tmux_yields_126(tmp_path: pathlib.Path) -> None:
+    """CLAUDE_SPAWN_BACKEND=tmux with no `tmux` binary on PATH must exit 126
+    with a loud stderr line mentioning tmux -- mirroring the no-emulator 126
+    path (test_no_emulator_found_yields_126) rather than a bare
+    command-not-found 127.
+
+    RED today: step-4's tmux-lane case has no availability guard, so
+    `tmux has-session ...`/`tmux new-session ...` are themselves
+    command-not-found (bash exit 127) -> resolve_detached's launch_rc!=0
+    branch -> exit 127, not 126. GREEN after step-8.
+    """
+    import shutil as _shutil
+
+    bin_dir = _make_bin_dir(tmp_path)
+    _write_fake_claude(bin_dir, exit_code=0)
+
+    # Minimal system-bin with only the utilities the script needs -- NO
+    # tmux, NO terminal emulator (mirrors test_no_emulator_found_yields_126's
+    # sys_bin exactly, including the deliberate exclusion of python3, which
+    # makes the session-registry `launching` write no-op so this test needs
+    # no CLAUDE_FLEET_ROOT isolation).
+    sys_bin = tmp_path / "sys_bin"
+    sys_bin.mkdir()
+    for util in ["bash", "mktemp", "sleep", "cat", "rm", "uname"]:
+        src = _shutil.which(util)
+        if src:
+            (sys_bin / util).symlink_to(src)
+
+    env = dict(os.environ)
+    env["PATH"] = str(bin_dir) + ":" + str(sys_bin)
+    env["CLAUDE_SPAWN_BACKEND"] = "tmux"
+    env["SPAWN_LAUNCH_GRACE_SECS"] = "2"
+    env.pop("CLAUDE_TERMINAL_CMD", None)
+    env.pop("ESCALATION_TERMINAL_CMD", None)
+
+    result = _run_spawn(env, tmp_path, timeout=10)
+    assert result.returncode == 126, (
+        f"missing tmux in tmux-backend mode must yield 126, got "
+        f"{result.returncode}\nstderr: {result.stderr.decode()}"
+    )
+    stderr = result.stderr.decode()
+    assert "tmux" in stderr.lower(), (
+        f"expected a loud stderr line mentioning tmux, got:\n{stderr}"
+    )
