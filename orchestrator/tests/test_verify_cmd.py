@@ -24,6 +24,7 @@ from orchestrator.verify_cmd import (
     render,
     reproject,
     scope_to,
+    serial_pytest,
     strip_cwd,
 )
 
@@ -526,3 +527,43 @@ class TestCargoScopeRawRetainedChain:
         raw = 'cargo test -p already-scoped && cargo test -p other'
         cmd = parse_config_command(raw)
         assert cargo_scope(cmd, ['bar']) == cmd
+
+
+class TestSerialPytest:
+    """serial_pytest() appends the `-p no:xdist -o addopts=` serial-recovery flags.
+
+    Migrates test_verify_env_transient.py::TestForceSerialPytest (step-5).
+    """
+
+    # The real multi-module test_command from orchestrator/config.yaml — six
+    # chained `cd <module> && uv run pytest tests/` invocations.
+    REAL_CONFIG_TEST_COMMAND = (
+        'cd shared && uv run pytest tests/ && '
+        'cd ../escalation && uv run pytest tests/ && '
+        'cd ../orchestrator && uv run pytest tests/ && '
+        'cd ../fused-memory && uv run pytest tests/ && '
+        'cd ../dashboard && uv run pytest tests/'
+    )
+
+    def test_structured_single_invocation_appends_flags(self):
+        cmd = parse_config_command('pytest tests/x.py')
+        result = render(serial_pytest(cmd))
+        assert result == 'pytest -p no:xdist -o addopts= tests/x.py'
+
+    def test_rewrites_every_pytest_invocation_in_chained_command(self):
+        """Each of the 5 chained `uv run pytest tests/` segments gains the flags."""
+        cmd = parse_config_command(self.REAL_CONFIG_TEST_COMMAND)
+        assert cmd.tool is ToolKind.PYTEST
+        assert cmd.raw == self.REAL_CONFIG_TEST_COMMAND
+
+        result = render(serial_pytest(cmd))
+        assert result.count('pytest') == 5
+        assert result.count("-p no:xdist -o addopts=''") == 5
+
+    def test_non_pytest_command_returned_unchanged(self):
+        cmd = parse_config_command('cargo test --workspace')
+        assert serial_pytest(cmd) == cmd
+
+    def test_noop_on_opaque(self):
+        cmd = parse_config_command('mypy src/')
+        assert serial_pytest(cmd) == cmd
