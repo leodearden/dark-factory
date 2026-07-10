@@ -153,6 +153,25 @@ class TestCheckGate2LiveWorkflow:
         verdict = _check('update_task', live_status='in-progress')
         assert verdict.error_type != 'ReconLiveWorkflowWriteRejected'
 
+    def test_gate_2_forwards_live_status_as_status_kwarg(self, monkeypatch):
+        """is_workflow_live_for_task must receive the caller's live_status as
+        its `status` kwarg so it can suppress the project-wide
+        orchestrator_live signal for done/cancelled/deferred tasks (see
+        live_workflow_detector.ORCH_LIVE_INELIGIBLE_STATUSES) — otherwise a
+        live orchestrator elsewhere in the project would falsely flag a
+        terminal/deferred task's set_task_status write as gate-2-live."""
+        captured = {}
+
+        def _spy(*args, **kwargs):
+            captured['args'] = args
+            captured['kwargs'] = kwargs
+            return False
+
+        monkeypatch.setattr(recon_write_policy, 'is_workflow_live_for_task', _spy)
+        _check('set_task_status', task_id='7', live_status='deferred')
+
+        assert captured['kwargs'].get('status') == 'deferred'
+
 
 # ---------------------------------------------------------------------------
 # check() gate 3 — stale snapshot (op-agnostic) + precedence
@@ -221,6 +240,21 @@ class TestExtractSnapshotToken:
 
     def test_extract_from_dict_without_either_key_is_none(self):
         assert recon_write_policy.extract_snapshot_token({'other': 'x'}) is None
+
+    def test_extract_from_dict_with_none_value_is_none(self):
+        """A None snapshot value must not be coerced to the string 'None',
+        which could never equal a real live_status and would spuriously
+        trigger ReconStaleSnapshotRejected."""
+        assert recon_write_policy.extract_snapshot_token({'snapshot_status': None}) is None
+
+    def test_extract_from_dict_with_int_value_is_none(self):
+        assert recon_write_policy.extract_snapshot_token({'snapshot_status': 42}) is None
+
+    def test_extract_from_dict_with_bool_value_is_none(self):
+        assert recon_write_policy.extract_snapshot_token({'snapshot_status': True}) is None
+
+    def test_extract_from_dict_with_empty_string_value_is_none(self):
+        assert recon_write_policy.extract_snapshot_token({'snapshot_status': ''}) is None
 
 
 # ---------------------------------------------------------------------------

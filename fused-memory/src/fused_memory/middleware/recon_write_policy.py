@@ -160,7 +160,12 @@ def check(
     terminal (done/cancelled) -> ``ReconTerminalWriteRejected``.
 
     Gate 2 (live workflow): ``op == 'set_task_status'`` AND a live workflow
-    is detected for ``task_id`` -> ``ReconLiveWorkflowWriteRejected``.
+    is detected for ``task_id`` -> ``ReconLiveWorkflowWriteRejected``. The
+    caller's ``live_status`` is forwarded as ``is_workflow_live_for_task``'s
+    ``status`` kwarg so the project-wide orchestrator-lock signal is
+    suppressed for tasks in a status the orchestrator never actively
+    dispatches (done/cancelled/deferred) — see
+    ``live_workflow_detector.ORCH_LIVE_INELIGIBLE_STATUSES``.
 
     Gate 3 (stale snapshot, op-agnostic, checked last): ``snapshot_token is
     not None`` AND it disagrees with ``live_status`` ->
@@ -188,7 +193,9 @@ def check(
             snapshot_token=snapshot_token,
         )
 
-    if op == 'set_task_status' and is_workflow_live_for_task(task_id, project_root):
+    if op == 'set_task_status' and is_workflow_live_for_task(
+        task_id, project_root, status=live_status,
+    ):
         return _reject(
             op=op,
             task_id=task_id,
@@ -256,9 +263,12 @@ def extract_snapshot_token(metadata: object) -> str | None:
     Coerces *metadata* via dict/``json.loads`` — mirroring
     ``_reject_done_provenance_in_update_metadata``'s inline coercion idiom
     in ``task_interceptor.py``. Returns the value of the first
-    :data:`SNAPSHOT_TOKEN_KEYS` entry present, coerced to ``str``, or
-    ``None`` when *metadata* is not a dict / JSON-object string, or
-    contains neither key.
+    :data:`SNAPSHOT_TOKEN_KEYS` entry present, when that value is itself a
+    non-empty ``str``. Returns ``None`` when *metadata* is not a dict /
+    JSON-object string, contains neither key, or the first present key's
+    value is not a non-empty string (e.g. ``None``, a number, or a bool) —
+    such values are treated as an absent token rather than coerced via
+    ``str()``, so they can never spuriously disagree with a live status.
     """
     parsed: dict | None = None
     if isinstance(metadata, dict):
@@ -273,5 +283,6 @@ def extract_snapshot_token(metadata: object) -> str | None:
         return None
     for key in SNAPSHOT_TOKEN_KEYS:
         if key in parsed:
-            return str(parsed[key])
+            val = parsed[key]
+            return val if isinstance(val, str) and val else None
     return None
