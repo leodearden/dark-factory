@@ -2351,6 +2351,58 @@ class TestClassifyAgentFailure:
         assert cls.kind is AgentFailureKind.TIMED_OUT
         assert '1800000ms' in cls.summary
 
+    def test_classify_agent_failure_timed_out_diagnostic_has_transcript_turns(self):
+        """diagnostic_detail always includes a transcript_turns= line (task
+        2360 fix #3) so the raw signal is never lost even when the summary
+        wording changes."""
+        result = AgentResult(
+            success=False, output='', subtype='error_timeout_killed_with_progress',
+            duration_ms=1_200_000, timed_out=True, transcript_turns=13,
+        )
+        cls = classify_agent_failure(result)
+        assert 'transcript_turns=13' in cls.diagnostic_detail
+
+    def test_classify_agent_failure_timed_out_with_progress_summary_is_truthful(self):
+        """TIMED_OUT summary for a PRODUCTIVE timeout (transcript_turns>0)
+        states the turn count and calls out that real work was done —
+        truthful reporting instead of a fabricated 'no work done' (reify-4827).
+        """
+        result = AgentResult(
+            success=False, output='', subtype='error_timeout_killed_with_progress',
+            duration_ms=1_200_000, timed_out=True, transcript_turns=13,
+        )
+        cls = classify_agent_failure(result)
+        assert '1200000ms' in cls.summary
+        assert '13' in cls.summary
+        assert 'transcript turns' in cls.summary
+        assert 'productive' in cls.summary.lower()
+        assert 'not a wedge' in cls.summary.lower()
+
+    def test_classify_agent_failure_timed_out_zero_turns_summary_is_wedge(self):
+        """TIMED_OUT summary with transcript_turns==0 uses wedge phrasing —
+        distinct from the productive case, never claims productivity."""
+        result = AgentResult(
+            success=False, output='', subtype='error_empty_output',
+            duration_ms=300_000, timed_out=True, transcript_turns=0,
+        )
+        cls = classify_agent_failure(result)
+        assert '300000ms' in cls.summary
+        assert 'wedge' in cls.summary.lower()
+        assert 'productive' not in cls.summary.lower()
+
+    def test_classify_agent_failure_timed_out_none_turns_summary_is_wedge(self):
+        """TIMED_OUT summary with transcript_turns=None (transcript unreadable)
+        also uses wedge phrasing — conservative degrade, never fabricates
+        'productive' without evidence."""
+        result = AgentResult(
+            success=False, output='', subtype='error_empty_output',
+            duration_ms=300_000, timed_out=True, transcript_turns=None,
+        )
+        cls = classify_agent_failure(result)
+        assert '300000ms' in cls.summary
+        assert 'wedge' in cls.summary.lower()
+        assert 'productive' not in cls.summary.lower()
+
 
 class TestClassifyAgentFailureOutcomeProjection:
     """Pin the DD-3 projection: classify_agent_failure derives its verdict
