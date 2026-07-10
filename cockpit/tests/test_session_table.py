@@ -135,3 +135,51 @@ class TestFormatAge:
         now = datetime(2026, 7, 7, 12, 0, 0, tzinfo=UTC)
 
         assert format_age('not-a-timestamp', now) == '?'
+
+
+class TestCountOutstandingChildren:
+    def test_counts_only_non_terminal_children(self):
+        from cockpit.panes.session_table import count_outstanding_children
+
+        parent = _make_record(session_slug='parent-1')
+        running_child = _make_record(
+            session_slug='child-running', parent_session_id='parent-1', status=sr.Status.RUNNING
+        )
+        awaiting_child = _make_record(
+            session_slug='child-awaiting',
+            parent_session_id='parent-1',
+            status=sr.Status.AWAITING_INPUT,
+        )
+        exited_child = _make_record(
+            session_slug='child-exited', parent_session_id='parent-1', status=sr.Status.EXITED
+        )
+        failed_child = _make_record(
+            session_slug='child-failed',
+            parent_session_id='parent-1',
+            status=sr.Status.FAILED_TO_START,
+        )
+        all_records = [parent, running_child, awaiting_child, exited_child, failed_child]
+
+        assert count_outstanding_children('parent-1', all_records) == 2
+
+    def test_no_children_is_zero(self):
+        from cockpit.panes.session_table import count_outstanding_children
+
+        parent = _make_record(session_slug='lonely-parent')
+
+        assert count_outstanding_children('lonely-parent', [parent]) == 0
+
+    def test_children_of_a_different_parent_not_counted(self):
+        from cockpit.panes.session_table import count_outstanding_children
+
+        parent = _make_record(session_slug='parent-1')
+        other_parent = _make_record(session_slug='parent-2')
+        unrelated_child = _make_record(
+            session_slug='child-of-other',
+            parent_session_id='parent-2',
+            status=sr.Status.RUNNING,
+        )
+
+        all_records = [parent, other_parent, unrelated_child]
+
+        assert count_outstanding_children('parent-1', all_records) == 0
