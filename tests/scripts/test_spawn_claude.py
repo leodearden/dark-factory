@@ -161,6 +161,27 @@ def _write_fake_claude_with_readiness(
     p.chmod(0o755)
 
 
+def _write_fake_claude_writing_result(bin_dir: pathlib.Path) -> None:
+    """Write a fake ``claude`` that writes an outcome-header result file to
+    ``$CLAUDE_SPAWN_RESULT_FILE`` (falling back to /dev/null when unset —
+    the pre-T5 / fail-soft shape), then exits 0.
+    """
+    p = bin_dir / "claude"
+    p.write_text(
+        "#!/usr/bin/env bash\n"
+        "cat > \"${CLAUDE_SPAWN_RESULT_FILE:-/dev/null}\" <<'EOF'\n"
+        "---\n"
+        "outcome: done\n"
+        "changed: none\n"
+        "action_needed: none\n"
+        "---\n"
+        "Test prose.\n"
+        "EOF\n"
+        "exit 0\n"
+    )
+    p.chmod(0o755)
+
+
 def _wait_for_path(path: pathlib.Path, timeout: float) -> None:
     """Poll until *path* exists, raising ``AssertionError`` on timeout."""
     deadline = time.monotonic() + timeout
@@ -996,3 +1017,49 @@ def test_normal_spawn_exit0_not_flagged(tmp_path: pathlib.Path) -> None:
     assert record.status == session_registry.Status.EXITED, (
         f"expected registry status exited, got {record.status}"
     )
+
+
+# ===========================================================================
+# task-2287 (Attention Rail T5): spawn result-handback protocol
+# ===========================================================================
+# Exit codes are demoted to liveness-only; the semantic outcome channel is an
+# explicit result.md written by the spawned session into its own session-
+# registry record dir. spawn-claude.sh exports CLAUDE_SPAWN_RESULT_FILE
+# (derived from SESSION_RECORD_DIR, byte-identical to the record's own
+# result_file) and appends a prompt trailer pointing the session at it.
+
+
+def test_spawn_exports_result_file_and_session_writes_it(
+    tmp_path: pathlib.Path,
+) -> None:
+    """The spawned session must be able to write its outcome to
+    $CLAUDE_SPAWN_RESULT_FILE, landing exactly at the session record's own
+    result_file path.
+
+    RED today: CLAUDE_SPAWN_RESULT_FILE is not exported into $inner, so the
+    fake claude's write falls through to /dev/null and no file lands at the
+    record's result_file path.
+    """
+    bin_dir = _make_bin_dir(tmp_path)
+    _write_fake_claude_writing_result(bin_dir)
+    _write_foreground_terminal(bin_dir, "xterm")
+    env = _base_env(bin_dir, "xterm")
+
+    result = _run_spawn(env, tmp_path)
+    assert result.returncode == 0, f"stderr: {result.stderr.decode()}"
+
+    fleet_root = pathlib.Path(env["CLAUDE_FLEET_ROOT"])
+    record_path = _find_one_record(fleet_root)
+    record = session_registry.SessionRecord.from_json(record_path.read_text())
+
+    expected_result_file = str(record_path.parent / "result.md")
+    assert record.result_file == expected_result_file, (
+        f"expected record.result_file == {expected_result_file}, "
+        f"got {record.result_file}"
+    )
+
+    result_file = pathlib.Path(record.result_file)
+    assert result_file.is_file(), (
+        f"expected a result.md written to {result_file} by the session"
+    )
+    assert "outcome: done" in result_file.read_text()
