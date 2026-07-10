@@ -572,6 +572,77 @@ class LeaseHolder:
         return cls.from_dict(json.loads(raw))
 
 
+@dataclass(frozen=True)
+class LeaseClaim:
+    """The outcome of a claim_lease call.
+
+    name: the lease name claimed (see build_lease_name).
+    decision: ACQUIRED / STAND_DOWN / PROCEED.
+    acquired: True iff this call became the lease's holder (decision is
+        ACQUIRED); False if the lease was already held by someone else.
+    holder: the lease's holder after this call -- the caller's own *holder*
+        argument when acquired, otherwise the pre-existing holder found on
+        disk (or None if that body was missing/unreadable).
+    holder_alive: whether `holder`'s pid is currently alive (_pid_alive).
+    heartbeat_age_secs: seconds since the lease file's mtime; 0.0 for a
+        freshly-acquired lease.
+    message: fully-formatted, user-observable line -- callers print this
+        verbatim rather than re-deriving it from the other fields.
+    """
+
+    name: str
+    decision: LeaseDecision
+    acquired: bool
+    holder: LeaseHolder | None
+    holder_alive: bool
+    heartbeat_age_secs: float
+    message: str
+
+
+def claim_lease(
+    name: str,
+    *,
+    holder: LeaseHolder,
+    policy: LeasePolicy = LeasePolicy.STAND_DOWN,
+    root: Path | str | None = None,
+    now: datetime | None = None,
+) -> LeaseClaim:
+    """Atomically claim the *name* lease for *holder* (PRD T7 single-owner-per-role).
+
+    Uses ``os.open(O_CREAT|O_EXCL|O_WRONLY)`` -- the identical atomic
+    exclusive-create idiom as ``ArtifactStore.lock_plan`` (artifacts.py) --
+    so the first caller to create the ``.lease`` file wins outright. *now*
+    is injectable for deterministic tests; defaults to the real UTC clock.
+    """
+    if now is None:
+        now = datetime.now(UTC)
+    path = lease_path_for_name(name, root=root)
+    path.parent.mkdir(parents=True, exist_ok=True)
+
+    fd = os.open(str(path), os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+    try:
+        os.write(fd, holder.to_json().encode())
+    except Exception:
+        # Clean up the empty file created by O_CREAT|O_EXCL so a subsequent
+        # claim_lease call is not falsely blocked by a poison-pill empty file
+        # (mirrors ArtifactStore.lock_plan).
+        with contextlib.suppress(OSError):
+            path.unlink(missing_ok=True)
+        raise
+    finally:
+        os.close(fd)
+
+    return LeaseClaim(
+        name=name,
+        decision=LeaseDecision.ACQUIRED,
+        acquired=True,
+        holder=holder,
+        holder_alive=True,
+        heartbeat_age_secs=0.0,
+        message=f'lease {name} acquired by {holder.session_slug}',
+    )
+
+
 # ---------------------------------------------------------------------------
 # CLI + fail-soft (PRD: a registry fault must never change the spawn's exit code)
 # ---------------------------------------------------------------------------
