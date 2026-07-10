@@ -1,6 +1,6 @@
 """Git worktree and merge operations.
 
-.task/ contamination — now structural, not guard-defended (W11 θ)
+.task/ contamination — now structural, not guard-defended (W11 θ/ι)
 ===================================================================
 The .task/ directory is an ephemeral scratch space for orchestrator agents.
 It used to leak onto main via worktree inheritance, `git add -A`, and merge
@@ -15,17 +15,18 @@ OUTSIDE the git worktree entirely, at <worktree_base>/.task-meta/<name>
 tree is structurally impossible rather than merely guarded against:
 nothing ever writes task metadata into a path git tracks.
 
-One lightweight safeguard remains for the migration window:
+Both migration-window safeguards have since been dropped too (W11 ι):
 
-- _assert_no_task_dir() — a cheap tripwire that hard-asserts a given commit
-  SHA carries no .task/ entries.  Called before advance_main().  Retained
-  here; dropped in W11 ι once the relocation has proven itself.
+- _assert_no_task_dir() — the cheap tripwire that hard-asserted a given
+  commit SHA carried no .task/ entries before advance_main() — is gone.
+  Contamination is structural, so the tripwire had nothing left to catch.
+- _ensure_task_gitignore() — which used to write .task/.gitignore so any
+  leftover <worktree>/.task/ scratch directory self-ignored under `git add
+  -A` / `git status` — is gone too: nothing writes task metadata under
+  <worktree>/.task any more, so there was nothing left for a nested
+  .gitignore to defend.
 
-_ensure_task_gitignore() — which used to write .task/.gitignore so any
-leftover <worktree>/.task/ scratch directory self-ignored under `git add
--A` / `git status` — has been dropped (W11 ι): nothing writes task
-metadata under <worktree>/.task any more, so there is nothing left for a
-nested .gitignore to defend.
+No .task-specific guards remain in this module.
 """
 
 import asyncio
@@ -225,33 +226,8 @@ PROTECTED_PREFIXES: dict[str, str] = {
 
 
 # ---------------------------------------------------------------------------
-# .task/ contamination helpers
+# Final-defense gate helpers (advance_main)
 # ---------------------------------------------------------------------------
-
-async def _assert_no_task_dir(sha: str, cwd: Path, context: str) -> None:
-    """Raise RuntimeError if the given commit SHA contains any .task/ entries.
-
-    This is a hard gate — if this fires, something upstream failed to scrub
-    .task/ and we must NOT advance main.
-
-    DO NOT CATCH THIS EXCEPTION to "work around" it.  Fix the root cause:
-    find where .task/ was committed and add a scrub there.
-    """
-    rc, tracked, _ = await _run(
-        ['git', 'ls-tree', '-r', '--name-only', sha, '--', '.task/'],
-        cwd=cwd,
-    )
-    if rc == 0 and tracked.strip():
-        files = tracked.strip().splitlines()
-        raise RuntimeError(
-            f'.task/ CONTAMINATION GATE FAILED ({context}): commit {sha[:8]} '
-            f'contains {len(files)} .task/ file(s): {", ".join(files[:5])}. '
-            f'Refusing to advance main.  This is a bug — .task/ execution '
-            f'metadata is supposed to live outside the worktree entirely '
-            f'(see TaskArtifacts.meta_root_for); it should never have '
-            f'reached this commit.'
-        )
-
 
 async def _assert_no_conflict_markers(sha: str, cwd: Path, context: str) -> None:
     """Raise RuntimeError if the given commit SHA's tree has tracked files
@@ -275,11 +251,10 @@ async def _assert_no_conflict_markers(sha: str, cwd: Path, context: str) -> None
     trailing ref label, so this does not narrow real-world coverage.
 
     Fail-open (no raise) when git reports no match (``git grep`` exits 1)
-    OR on a git error — mirrors :func:`_assert_no_task_dir`'s fail-open
-    semantics: a broken git invocation must not itself become a false
-    block.  Unlike the clean no-match case, a git-error fail-open is logged
-    at WARNING (with stderr) so operators can tell a genuinely clean tree
-    apart from one this gate failed to evaluate.
+    OR on a git error: a broken git invocation must not itself become a
+    false block.  Unlike the clean no-match case, a git-error fail-open is
+    logged at WARNING (with stderr) so operators can tell a genuinely clean
+    tree apart from one this gate failed to evaluate.
     """
     rc, out, err = await _run(
         ['git', 'grep', '-lE', r'^(<{7}|>{7}) ', sha, '--', '.'],
@@ -6391,7 +6366,7 @@ class GitOps:
 
         IMPORTANT: This method is the LAST checkpoint before code reaches
         main.  update-ref bypasses most git hooks (including pre-commit),
-        so the .task/ contamination gate here is the final defense.
+        so the conflict-marker gate here is the final defense.
         Exception: git's ``reference-transaction`` hook (git>=2.28) DOES
         fire on update-ref — advance_main's main_gate mark (task 1678)
         sanctions that hook by writing a sentinel immediately before the
@@ -6427,16 +6402,6 @@ class GitOps:
             verified_branch_tip = _vbt_sha.strip()
 
         for attempt in range(max_attempts):
-            # ── .task/ contamination gate (FINAL DEFENSE) ─────────────
-            try:
-                await _assert_no_task_dir(
-                    merge_sha, self.project_root,
-                    f'advance_main(attempt={attempt + 1})',
-                )
-            except RuntimeError as e:
-                logger.error(str(e))
-                return AdvanceOutcome('contaminated')
-
             # ── conflict-marker gate (FINAL DEFENSE, esc-2128-8 Layer-2) ──
             try:
                 await _assert_no_conflict_markers(
