@@ -123,6 +123,42 @@ def compute_calibration(
     }
 
 
+def compute_per_depth(
+    merge_verify_events: list[dict[str, Any]],
+) -> dict[int, dict[str, Any]] | None:
+    """Bucket merge_verify events by depth and compute real P(pass|depth).
+
+    Coerces each event's ``data['depth']`` with a None-safe ``int()``:
+    absent, ``None``, or unparseable depths are skipped rather than
+    raising — merge_verify emits a native int, ``_emit_speculative``
+    str-converts (speculative_merge stores depth as e.g. ``"1"``), and all
+    historical (pre-task-2340) events carry no depth field at all.
+
+    Returns ``None`` when no event contributes a usable depth (the trigger
+    for :func:`format_report`'s CONFOUNDED runner-split fallback), else a
+    dict ``{depth: {'pass': int, 'total': int, 'rate': float}}``.
+    """
+    buckets: dict[int, list[int]] = defaultdict(lambda: [0, 0])  # depth -> [pass, total]
+    for e in merge_verify_events:
+        raw_depth = e['data'].get('depth')
+        if raw_depth is None:
+            continue
+        try:
+            depth = int(raw_depth)
+        except (TypeError, ValueError):
+            continue
+        buckets[depth][1] += 1
+        buckets[depth][0] += bool(e['data'].get('passed'))
+
+    if not buckets:
+        return None
+
+    return {
+        depth: {'pass': p, 'total': t, 'rate': p / t}
+        for depth, (p, t) in buckets.items()
+    }
+
+
 def format_report(
     calibration: dict[str, Any], per_depth: dict[int, dict[str, Any]] | None,
 ) -> str:
@@ -243,7 +279,7 @@ def main(argv: Sequence[str]) -> int:
         conn.close()
 
     calibration = compute_calibration(merge_verify_events, merge_attempt_events)
-    per_depth = None  # wired to compute_per_depth() once it exists (task 2340 step-6)
+    per_depth = compute_per_depth(merge_verify_events)
     print(format_report(calibration, per_depth))
     return 0
 
