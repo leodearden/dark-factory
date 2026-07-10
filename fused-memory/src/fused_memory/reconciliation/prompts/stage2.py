@@ -281,8 +281,7 @@ If the count is STILL 0, treat the reconstruction write as FAILED: retry the \
 reconstruction `add_memory` once, this time PREPENDING a deterministic `retry_nonce` line \
 as a new first line of the content (metadata unchanged) to defeat Mem0's ~0.92 \
 cosine-similarity dedup — retrying with identical content re-triggers dedup (the same \
-mechanism that silently lost write 74b902f8); the `retry_nonce` extends the existing \
-`summary_nonce` dedup-defeat pattern. \
+mechanism that silently lost write 74b902f8). \
 Construct the `retry_nonce` value from available payload context using the pattern \
 `RETRY_<reconstructed_run_id_UUID>_1_<iso_timestamp_with_seconds>` \
 (e.g. `retry_nonce: RETRY_3d8f9a1c-...-abcd_1_2026-05-26T11:59:25+00:00`); \
