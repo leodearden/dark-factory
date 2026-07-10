@@ -2788,6 +2788,10 @@ RELOADABLE_FIELDS: frozenset[str] = frozenset().union(
         'verify_admission_nice_merge',
         'verify_admission_nice_task',
         'verify_admission_nice_background',
+        # Merge-role internal-fanout cap (task 2393, T5) — same knob family:
+        # read fresh per run_scoped_verification call, so a live reload
+        # lowers the merge fan-out without a restart.
+        'merge_verify_max_concurrent_pytests',
     },
 )
 
