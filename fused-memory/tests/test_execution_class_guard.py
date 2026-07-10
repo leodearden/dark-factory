@@ -33,7 +33,9 @@ class TestExecutionClassErrorInvariantMatrix:
     def test_recon_stage_unknown_execution_class_rejects(self):
         """recon-stage agent_id + metadata.execution_class='bogus' (unknown) → reject."""
         result = execution_class_error(
-            {'execution_class': 'bogus'}, 'recon-stage-task_knowledge_sync', '/proj',
+            {'execution_class': 'bogus'},
+            'recon-stage-task_knowledge_sync',
+            '/proj',
         )
         assert result is not None
         assert result.get('error_type') == 'ValidationError'
@@ -43,7 +45,9 @@ class TestExecutionClassErrorInvariantMatrix:
     def test_recon_stage_valid_execution_class_accepts(self, valid_class):
         """recon-stage agent_id + each valid class (code_tdd/operational/decision) → accept (None)."""
         result = execution_class_error(
-            {'execution_class': valid_class}, 'recon-stage-task_knowledge_sync', '/proj',
+            {'execution_class': valid_class},
+            'recon-stage-task_knowledge_sync',
+            '/proj',
         )
         assert result is None
 
