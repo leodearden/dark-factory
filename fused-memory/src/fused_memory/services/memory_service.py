@@ -2479,6 +2479,30 @@ class MemoryService:
         search() call. The exact-match branch does NOT use edge_limit: its
         get_valid_edges_for_node traversal returns every valid edge for the
         resolved node uuid(s), uncapped.
+
+        EXACT vs. FUZZY edge sets are fundamentally different — TOPOLOGICAL
+        vs. SEMANTIC — and comparing them across branches will produce
+        false-positive "missing edges" findings. The exact branch's
+        get_valid_edges_for_node (graphiti_client.py) runs a plain, uncached
+        Cypher MATCH — `MATCH (n:Entity {uuid: $uuid})-[e:RELATES_TO]-()
+        WHERE e.invalid_at IS NULL` — with no LIMIT and no ranking: it
+        returns every RELATES_TO edge that is graph-connected to the
+        resolved node uuid(s), full stop. The fuzzy branch's graphiti.search()
+        instead does a semantic/relevance search over edge fact TEXT, which
+        can surface edges whose fact merely mentions the entity's name (or is
+        contextually related) without that edge being RELATES_TO-incident on
+        this node at all. So an edge that appears in a search() result for
+        this entity's name but is ABSENT from get_entity's exact-branch
+        `edges` is not necessarily an omission bug — it may simply not be
+        topologically connected to the resolved node. Before flagging
+        get_entity as "silently omitting valid edges," confirm which branch
+        was actually compared: the topological get_valid_edges_for_node set,
+        or a semantic search() set. (This exact confusion produced a
+        cross-project false positive: solar_challenge_platform's Stage-1
+        reconciliation flagged get_entity for `review/briefing.yaml` as
+        omitting edges found via search(); it became dark_factory task 2404,
+        cancelled 2026-07-09 once the architect confirmed it was expected
+        topological-vs-semantic divergence, not a bug.)
         """
         # See "Performance trade-off" above: this call is intentionally serial —
         # its 0/1/many result decides whether the fuzzy gather runs at all.

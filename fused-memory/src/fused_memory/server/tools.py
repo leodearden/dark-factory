@@ -1275,6 +1275,22 @@ def create_mcp_server(
         relevance-ranked order, so an entity with more than edge_limit valid edges
         will silently omit the lowest-ranked ones. Raise edge_limit to fetch more
         edges, or cross-check completeness with search() when keeping the default.
+        Note: this edge_limit cap applies ONLY on the fuzzy/semantic fallback path
+        above — the exact-match path (when the name resolves directly) returns
+        every graph-connected edge for the resolved node, uncapped.
+
+        EXACT vs. FUZZY edge sets are topological vs. semantic, and are NOT
+        directly comparable. On an exact name match, edges come from a
+        topological graph traversal (every RELATES_TO edge actually connected
+        to the resolved node — unranked, unlimited). On the fuzzy fallback,
+        edges come from search()'s semantic ranking over fact text, which can
+        surface edges that merely mention this entity's name without being
+        graph-connected to it. So an edge you see via search() but not in
+        get_entity's result is not automatically a bug — it may not be
+        topologically connected to the resolved entity at all. Don't treat a
+        search()-vs-get_entity edge-set diff as evidence of a missing-edge
+        bug without checking which branch (exact/topological vs.
+        fuzzy/semantic) actually produced each edge set.
 
         Args:
             name: Entity name (exact match tried first; falls back to fuzzy/approximate
