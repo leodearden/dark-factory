@@ -6912,6 +6912,112 @@ class TestStampMilestoneDepsSatisfied:
         )
 
 
+class TestMilestoneSweepDrivenByAcquireNext:
+    """acquire_next() drives Scheduler._stamp_milestone_deps_satisfied once
+    per tick (task 2335 β step-7/8).
+
+    An integration-altitude counterpart to TestStampMilestoneDepsSatisfied's
+    direct unit tests: here the sweep is exercised only through the public
+    acquire_next() entry point, with mocked mcp_call (for get_tasks) and a
+    spied update_task — mirroring TestMilestoneEligibilityGate's
+    test_acquire_next_withholds_dated_milestone_until_fired.
+    """
+
+    FIXED_DT = datetime(2026, 7, 10, 12, 0, 0, tzinfo=UTC)
+
+    def _task_response(self, tasks: list[dict]) -> dict:
+        import json as _json
+        return {
+            'result': {
+                'content': [
+                    {'type': 'text', 'text': _json.dumps({'tasks': tasks})}
+                ]
+            }
+        }
+
+    @pytest.mark.asyncio
+    async def test_acquire_next_stamps_anchor_when_deps_satisfied(self, monkeypatch):
+        """B2 via acquire_next: a pending 'delayed' milestone task whose dep
+        is already 'done' (and carries no anchor yet) gets
+        milestone_deps_satisfied_at stamped via update_task during a single
+        acquire_next() tick. RED until the sweep is wired into acquire_next
+        (step-8) — pre-wiring, update_task is never called."""
+        dep_task = {
+            'id': 'X',
+            'title': 'Dependency (done)',
+            'status': 'done',
+            'dependencies': [],
+            'metadata': {},
+        }
+        milestone_task = {
+            'id': '4006',
+            'title': 'Delayed milestone task (deps satisfied)',
+            'status': 'pending',
+            'dependencies': [{'id': 'X'}],
+            'metadata': {'milestone': {'mode': 'delayed', 'after_secs': 100}},
+        }
+
+        config = OrchestratorConfig(max_per_module=1)
+        scheduler = Scheduler(config, wall_time_source=lambda: self.FIXED_DT)
+        scheduler.update_task = AsyncMock(return_value=True)
+
+        monkeypatch.setattr(
+            'orchestrator.scheduler.mcp_call',
+            AsyncMock(return_value=self._task_response([dep_task, milestone_task])),
+        )
+
+        result = await scheduler.acquire_next()
+
+        assert result is None, (
+            'The milestone gate still withholds dispatch this tick — the '
+            'anchor just stamped is only visible on the next tick\'s get_tasks'
+        )
+        scheduler.update_task.assert_awaited_once_with(
+            '4006',
+            {'milestone_deps_satisfied_at': self.FIXED_DT.isoformat()},
+            metadata_mode='merge',
+        )
+
+    @pytest.mark.asyncio
+    async def test_acquire_next_does_not_stamp_when_dep_still_pending(self, monkeypatch):
+        """The sweep must NOT stamp the anchor while the dep is still
+        pending — across a tick, no update_task call is made.
+
+        The dep task itself is 'in-progress' (not done) rather than
+        'pending' so that it is not itself a dispatch candidate — this test
+        isolates the milestone task's stamp behaviour from the dep task's
+        own eligibility.
+        """
+        dep_task = {
+            'id': 'X',
+            'title': 'Dependency (still in progress)',
+            'status': 'in-progress',
+            'dependencies': [],
+            'metadata': {},
+        }
+        milestone_task = {
+            'id': '4007',
+            'title': 'Delayed milestone task (deps unsatisfied)',
+            'status': 'pending',
+            'dependencies': [{'id': 'X'}],
+            'metadata': {'milestone': {'mode': 'delayed', 'after_secs': 100}},
+        }
+
+        config = OrchestratorConfig(max_per_module=1)
+        scheduler = Scheduler(config, wall_time_source=lambda: self.FIXED_DT)
+        scheduler.update_task = AsyncMock(return_value=True)
+
+        monkeypatch.setattr(
+            'orchestrator.scheduler.mcp_call',
+            AsyncMock(return_value=self._task_response([dep_task, milestone_task])),
+        )
+
+        result = await scheduler.acquire_next()
+
+        assert result is None
+        scheduler.update_task.assert_not_awaited()
+
+
 # ---------------------------------------------------------------------------
 # Park-and-stop pause mechanism (task 1322)
 # ---------------------------------------------------------------------------
