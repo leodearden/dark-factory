@@ -21,6 +21,7 @@ from orchestrator.verify_cmd import (
     VerifyCmd,
     parse_config_command,
     render,
+    reproject,
     scope_to,
     strip_cwd,
 )
@@ -344,3 +345,51 @@ class TestStripCwd:
         cmd = parse_config_command('pytest tests/x.py')
         assert cmd.cwd_rel is None
         assert strip_cwd(cmd) == cmd
+
+
+class TestReproject:
+    """reproject(cmd, project) sets uv_project on a bare `uv run <tool>`."""
+
+    def test_bare_uv_run_reprojects(self):
+        """Regression ef68777a17: a bare `uv run ruff check X` gains --project."""
+        cmd = parse_config_command('uv run ruff check x')
+        assert cmd.uv_project == ''
+        reprojected = reproject(cmd, 'shared')
+        assert reprojected.uv_project == 'shared'
+        assert render(reprojected) == 'uv run --project shared ruff check x'
+
+    def test_noop_when_project_already_set(self):
+        """Structural equivalent of 05c2d87a72's clause-scoped guard: an
+
+        explicit --project already present means don't second-guess it.
+        """
+        cmd = parse_config_command('uv run --project orchestrator ruff check x')
+        assert reproject(cmd, 'shared') == cmd
+
+    def test_noop_when_directory_already_set(self):
+        """An explicit --directory already present is also an explicit uv
+
+        context — don't second-guess it either.
+        """
+        cmd = parse_config_command('uv run --directory foo ruff check x')
+        assert reproject(cmd, 'shared') == cmd
+
+    def test_idempotent(self):
+        cmd = parse_config_command('uv run ruff check x')
+        once = reproject(cmd, 'shared')
+        twice = reproject(once, 'shared')
+        assert twice == once
+
+    def test_noop_on_non_uv_command(self):
+        cmd = parse_config_command('ruff check x')
+        assert cmd.uv_project is None
+        assert reproject(cmd, 'shared') == cmd
+
+    def test_noop_on_opaque(self):
+        cmd = parse_config_command('mypy src/')
+        assert reproject(cmd, 'shared') == cmd
+
+    def test_noop_on_raw_retained_chain(self):
+        raw = 'cargo test --workspace && cargo test --workspace'
+        cmd = parse_config_command(raw)
+        assert reproject(cmd, 'shared') == cmd
