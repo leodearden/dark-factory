@@ -4388,9 +4388,12 @@ class GitOps:
     async def commit(self, worktree: Path, message: str) -> str | None:
         """Stage all changes and commit. Returns sha or None if nothing to commit.
 
-        The :!.task pathspec SHOULD prevent .task/ from being staged, but
-        agents can (and have) staged .task/ files via direct git commands
-        before this method runs.  The post-staging check catches that case.
+        .task/ execution metadata now lives outside the worktree entirely
+        (see module docstring / TaskArtifacts.meta_root_for), so no pathspec
+        exclusion or post-staging unstage is needed here: a leftover
+        <worktree>/.task/ (if anything still creates one) is self-ignored by
+        its own .task/.gitignore (_ensure_task_gitignore), so `git add -A`
+        never stages it.
 
         Pre-staging conflict guard (esc-2128-8): if *worktree* has any
         unresolved (unmerged-index) paths — e.g. a stash-pop that conflicted
@@ -4404,26 +4407,7 @@ class GitOps:
         if conflicted:
             raise WorktreeConflictError(worktree, conflicted)
 
-        # Stage all — :!.task excludes .task/ from staging
-        await _run(['git', 'add', '-A', '--', '.', ':!.task', ':!.claude'], cwd=worktree)
-
-        # ── Post-staging .task/ safety net ────────────────────────────
-        # If .task/ files are staged (e.g. an agent ran "git add .task/"
-        # before we got here), unstage them.  This is a belt-and-braces
-        # check — the pathspec above should handle it, but agents bypass it.
-        rc, staged_task, _ = await _run(
-            ['git', 'diff', '--cached', '--name-only', '--', '.task/'],
-            cwd=worktree,
-        )
-        if rc == 0 and staged_task.strip():
-            logger.warning(
-                '.task/ CONTAMINATION caught in commit() — %d file(s) were staged '
-                'despite :!.task pathspec (an agent likely ran "git add .task/" directly). '
-                'Unstaging now: %s',
-                len(staged_task.strip().splitlines()),
-                staged_task.strip()[:200],
-            )
-            await _run(['git', 'reset', 'HEAD', '--', '.task/'], cwd=worktree)
+        await _run(['git', 'add', '-A', '--', '.', ':!.claude'], cwd=worktree)
 
         # Check for changes
         rc, _, _ = await _run(['git', 'diff', '--cached', '--quiet'], cwd=worktree)
