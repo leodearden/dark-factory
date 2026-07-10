@@ -21,6 +21,7 @@ for the underlying frozen-prefix model this helper reuses.
 from __future__ import annotations
 
 import asyncio
+import time
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -28,8 +29,14 @@ import pytest
 
 from orchestrator.config import GitConfig, OrchestratorConfig
 from orchestrator.event_store import EventStore, EventType
-from orchestrator.git_ops import MergeResult
-from orchestrator.merge_queue import MergeRequest, RealMergeItem, SpeculativeMergeWorker
+from orchestrator.git_ops import GitOps, MergeResult, _run
+from orchestrator.merge_queue import (
+    MergedOk,
+    MergeRequest,
+    RealMergeItem,
+    SpeculativeMergeWorker,
+    classify_and_merge,
+)
 from orchestrator.verify import VerifyResult
 
 
@@ -254,3 +261,112 @@ class TestRunInflightVerifyDepthWiring:
 
         assert captured.get('depth') == 2
         assert captured.get('speculative') is True
+
+
+# ---------------------------------------------------------------------------
+# step-13 RED / step-14 GREEN: speculative_merge event carries depth
+#
+# classify_and_merge drives real git operations (branch-presence guard,
+# already-merged check, merge_to_main), so this needs a real GitOps against a
+# tmp git repo rather than the MagicMock git_ops used by the plumbing tests
+# above.  Fixture quartet (git_repo/git_config/git_ops/config) + the
+# _make_branch_with_file helper are copied from test_merge_guard_pipeline.py
+# — there is no shared conftest git_ops fixture; per-file duplication is the
+# established convention (see test_merge_queue_resource_audit.py's module
+# docstring).
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+def git_repo(tmp_path: Path) -> Path:
+    """Create a temporary git repository with an initial commit."""
+    repo = tmp_path / 'repo'
+    repo.mkdir()
+    asyncio.run(_setup_repo(repo))
+    return repo
+
+
+async def _setup_repo(repo: Path) -> None:
+    await _run(['git', 'init', '-b', 'main'], cwd=repo)
+    await _run(['git', 'config', 'user.email', 'test@test.com'], cwd=repo)
+    await _run(['git', 'config', 'user.name', 'Test'], cwd=repo)
+    (repo / 'README.md').write_text('# Test\n')
+    await _run(['git', 'add', '-A'], cwd=repo)
+    await _run(['git', 'commit', '-m', 'Initial commit'], cwd=repo)
+
+
+@pytest.fixture
+def git_config() -> GitConfig:
+    return GitConfig(
+        main_branch='main',
+        branch_prefix='task/',
+        remote='origin',
+        worktree_dir='.worktrees',
+        # Tests use a tmp repo with no real remote; disabling the push avoids
+        # per-test subprocess noise.
+        push_after_advance=False,
+    )
+
+
+@pytest.fixture
+def git_ops(git_config: GitConfig, git_repo: Path) -> GitOps:
+    return GitOps(git_config, git_repo)
+
+
+@pytest.fixture
+def config(git_repo: Path, git_config: GitConfig) -> OrchestratorConfig:
+    return OrchestratorConfig(project_root=git_repo, git=git_config)
+
+
+async def _make_branch_with_file(
+    git_ops: GitOps,
+    branch_name: str,
+    filename: str,
+    content: str,
+) -> Path:
+    """Create a worktree branch with one committed file and return its path."""
+    worktree = (await git_ops.create_worktree(branch_name)).path
+    (worktree / filename).write_text(content)
+    await git_ops.commit(worktree, f'Add {filename}')
+    return worktree
+
+
+@pytest.mark.asyncio
+class TestSpeculativeMergeEventDepth:
+    """classify_and_merge's speculative_merge event carries depth (task 2340).
+
+    RED until step-14 GREEN adds depth=worker._verify_frontier_depth() to the
+    _emit_speculative(EventType.speculative_merge, ...) call in
+    classify_and_merge (merge_queue.py, inside the
+    `if speculative and isinstance(worker, SpeculativeMergeWorker):` guard).
+    """
+
+    async def test_speculative_merge_event_carries_depth(
+        self, git_ops: GitOps, config: OrchestratorConfig, tmp_path: Path,
+    ) -> None:
+        worktree = await _make_branch_with_file(
+            git_ops, 'spec-depth-1', 'f.py', 'x = 1\n',
+        )
+        es = _CapturingEventStore()
+        queue: asyncio.Queue[MergeRequest] = asyncio.Queue()
+        worker = SpeculativeMergeWorker(git_ops, queue, event_store=es)
+        # Two speculated items already frozen/verifying ahead of this one
+        # joining the frontier -> depth 2 (see _verify_frontier_depth()).
+        worker._frozen_inflight_entries = lambda: [object(), object()]
+
+        req = _make_request('spec-depth-1', 'spec-depth-1', worktree, config)
+        main_sha = await git_ops.get_main_sha()
+
+        result = await classify_and_merge(
+            worker, req, main_sha, speculative=True, started_monotonic=time.monotonic(),
+        )
+
+        assert isinstance(result, MergedOk)
+        events = es.events_of(EventType.speculative_merge)
+        assert len(events) == 1
+        # _emit_speculative str-converts every data value.
+        assert events[0]['data']['depth'] == '2'
+        assert events[0]['data']['base_sha'] == main_sha
+
+        if result.merge_wt:
+            await git_ops.cleanup_merge_worktree(result.merge_wt)
