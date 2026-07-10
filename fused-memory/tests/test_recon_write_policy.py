@@ -323,3 +323,38 @@ class TestInterceptorSetTaskStatusLiveWorkflowBoundary:
         await interceptor.set_task_status('1', 'in-progress', '/project', agent_id=None)
 
         taskmaster.set_task_status.assert_awaited_once()
+
+
+# ---------------------------------------------------------------------------
+# P3 — interceptor.update_task stale-snapshot boundary
+# ---------------------------------------------------------------------------
+
+
+class TestInterceptorUpdateTaskStaleSnapshotBoundary:
+    @pytest.mark.asyncio
+    async def test_recon_stage_update_task_with_stale_snapshot_rejects(
+        self, interceptor, taskmaster,
+    ):
+        """live_status='in-progress' is non-terminal, so gate 1 does not fire."""
+        taskmaster.get_task = AsyncMock(
+            return_value={'id': '1', 'status': 'in-progress', 'title': 'T'},
+        )
+
+        result = await interceptor.update_task(
+            '1', '/project', metadata={'snapshot_status': 'pending'}, agent_id=AGENT_ID,
+        )
+
+        assert result.get('error_type') == 'ReconStaleSnapshotRejected'
+        taskmaster.update_task.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_fresh_snapshot_matching_live_status_proceeds(self, interceptor, taskmaster):
+        taskmaster.get_task = AsyncMock(
+            return_value={'id': '1', 'status': 'in-progress', 'title': 'T'},
+        )
+
+        await interceptor.update_task(
+            '1', '/project', metadata={'snapshot_status': 'in-progress'}, agent_id=AGENT_ID,
+        )
+
+        taskmaster.update_task.assert_awaited_once()
