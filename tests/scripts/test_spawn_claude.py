@@ -1772,3 +1772,88 @@ def test_sibling_parentage_two_way_into_hook_record(tmp_path: pathlib.Path) -> N
         "record.parent_session_id must not be the direct spawner's own "
         "session id in sibling mode"
     )
+
+
+# ===========================================================================
+# task-2298 step-3: Fleet Cockpit C7 sibling mode is fire-and-forget
+# ===========================================================================
+# The /prd author->decompose handoff needs to spawn its sibling and exit
+# cleanly, not babysit it -- so sibling mode must return once the child is
+# LAUNCHED, without blocking on the sentinel until it exits. Proven by
+# marker presence (started) + absence (done) rather than a wall-clock
+# tolerance: sleep_secs is chosen generously large relative to how long
+# _run_spawn itself takes to return, not tuned to any specific latency
+# budget.
+
+
+def _write_fake_claude_slow_with_markers(
+    bin_dir: pathlib.Path, started: pathlib.Path, done: pathlib.Path, sleep_secs: float = 5,
+) -> None:
+    """Write a fake ``claude`` that touches *started* immediately, sleeps
+    *sleep_secs*, then touches *done* and exits 0.
+
+    Used to prove fire-and-forget: the spawner returns after the child is
+    launched (started exists) but WITHOUT waiting for it to finish (done
+    does not exist yet) -- a marker-presence check, not a timing tolerance.
+    """
+    p = bin_dir / "claude"
+    p.write_text(
+        f"#!/usr/bin/env bash\n"
+        f"touch {started!s}\n"
+        f"sleep {sleep_secs}\n"
+        f"touch {done!s}\n"
+        f"exit 0\n"
+    )
+    p.chmod(0o755)
+
+
+def test_sibling_mode_is_fire_and_forget(tmp_path: pathlib.Path) -> None:
+    """Sibling mode must return from spawn-claude.sh once the child is
+    LAUNCHED, without blocking on the sentinel until it exits.
+
+    Premise-free: the done-marker absence is checked as a snapshot taken
+    immediately after ``_run_spawn`` returns (before any further polling
+    delay), and the started-marker's eventual presence is confirmed via
+    ``_wait_for_path`` (robust to scheduling jitter, not a race against the
+    assertion above it).
+
+    RED today: sibling mode still falls through to
+    resolve_detached->await_sentinel, so _run_spawn blocks until the child
+    exits and touches done -- done.exists() is True by the time _run_spawn
+    returns, failing the "must be absent" assertion below. GREEN after
+    step-4.
+    """
+    bin_dir = _make_bin_dir(tmp_path)
+    started = tmp_path / "started"
+    done = tmp_path / "done"
+    _write_fake_claude_slow_with_markers(bin_dir, started, done, sleep_secs=5)
+
+    tmux_marker = tmp_path / "tmux_used"
+    _write_fake_tmux(bin_dir, tmux_marker)
+
+    env = _base_env(bin_dir, "xterm")
+    env["CLAUDE_SPAWN_BACKEND"] = "tmux"
+    env["CLAUDE_SPAWN_PROJECT"] = "proj"
+    env["CLAUDE_SPAWN_MODE"] = "sibling"
+
+    result = _run_spawn(env, tmp_path)
+
+    assert result.returncode == 0, f"stderr: {result.stderr.decode()}"
+
+    # Snapshot immediately -- must reflect the state at the moment
+    # spawn-claude.sh returned, not after the started-marker poll below.
+    done_existed_at_return = done.exists()
+    assert not done_existed_at_return, (
+        "sibling mode must return WITHOUT waiting for the child to finish "
+        "-- the done-marker must not exist yet at the moment "
+        "spawn-claude.sh returns"
+    )
+
+    _wait_for_path(started, timeout=5.0)
+
+    fleet_root = pathlib.Path(env["CLAUDE_FLEET_ROOT"])
+    record_path = _find_one_record(fleet_root)
+    record = session_registry.SessionRecord.from_json(record_path.read_text())
+    assert record.status == session_registry.Status.RUNNING, (
+        f"expected a best-effort refresh to RUNNING, got {record.status}"
+    )
