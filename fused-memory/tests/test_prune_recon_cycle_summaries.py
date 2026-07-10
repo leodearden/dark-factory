@@ -444,6 +444,43 @@ class TestFormatSummaryTable:
 
 
 # ===========================================================================
+# Tests: check_scan_completeness (pure helper)
+# ===========================================================================
+
+class TestCheckScanCompleteness:
+    """check_scan_completeness(per_project_counts) -> list[str] flags every
+    project whose scanned cycle-summary count fell short of the ground-truth
+    count_by_metadata total -- i.e. the metadata-filtered scroll under-counted
+    and the scan cannot be trusted for a prune decision."""
+
+    def test_all_scanned_equals_expected_returns_empty(self):
+        per_project_counts = {'p1': (5, 5), 'p2': (0, 0)}
+        assert _mod.check_scan_completeness(per_project_counts) == []
+
+    def test_single_undercounting_project_flagged(self):
+        per_project_counts = {'p': (3, 8)}
+        assert _mod.check_scan_completeness(per_project_counts) == ['p']
+
+    def test_mixed_only_undercounting_ids_returned_sorted(self):
+        per_project_counts = {
+            'zeta': (2, 10),
+            'alpha': (5, 5),
+            'beta': (1, 4),
+        }
+        assert _mod.check_scan_completeness(per_project_counts) == ['beta', 'zeta']
+
+    def test_empty_input_returns_empty(self):
+        assert _mod.check_scan_completeness({}) == []
+
+    def test_scanned_greater_than_expected_not_flagged(self):
+        """Defensive: scanned > expected (e.g. a new cycle-summary landing
+        between the scroll and the count call) is not a truncation -- only a
+        strict undercount is flagged."""
+        per_project_counts = {'p': (9, 8)}
+        assert _mod.check_scan_completeness(per_project_counts) == []
+
+
+# ===========================================================================
 # Tests: apply_prune (async, live shell)
 # ===========================================================================
 
@@ -531,22 +568,28 @@ class TestApplyPrune:
 def _cycle_summary_record(
     id: str, stage: str, created_at: str, content: str = 'ordinary cycle summary',
 ) -> dict:
-    """Build a mem0.get_all()-shaped record for a cycle_summary pool member."""
+    """Build a scroll_by_metadata()-shaped record for a cycle_summary pool member.
+
+    Mirrors the Mem0Backend.scroll_by_metadata return shape ``{id, created_at,
+    metadata}`` where ``metadata`` is the full Qdrant payload -- the summary
+    text lives in ``metadata['data']`` (Mem0's payload content key), not a
+    top-level ``memory`` field.
+    """
     return {
         'id': id,
-        'memory': content,
         'created_at': created_at,
-        'metadata': {'kind': 'cycle_summary', 'stage': stage, 'run_id': 'r1'},
+        'metadata': {'kind': 'cycle_summary', 'stage': stage, 'data': content, 'run_id': 'r1'},
     }
 
 
 def _unrelated_record(id: str, metadata: dict | None = None) -> dict:
-    """Build a mem0.get_all()-shaped record that must NOT enter either pool."""
+    """Build a scroll_by_metadata()-shaped record that must NOT enter either pool."""
     return {
         'id': id,
-        'memory': 'unrelated memory content',
         'created_at': '2026-01-01T00:00:00+00:00',
-        'metadata': metadata if metadata is not None else {'kind': 'observation'},
+        'metadata': metadata if metadata is not None else {
+            'kind': 'observation', 'data': 'unrelated memory content',
+        },
     }
 
 
@@ -589,16 +632,30 @@ class TestRun:
         ]
 
     def _make_memory(self, records: list[dict] | None = None) -> MagicMock:
+        """Build a mock memory whose mem0 backend exposes the scroll+count
+        contract. ``scroll_by_metadata`` returns only the kind=='cycle_summary'
+        records (the server-side metadata filter would never surface a
+        wrong-kind record like 'u1-wrong-kind'); ``count_by_metadata`` returns
+        the exact length of that same list, so the happy-path fixture never
+        trips the truncation guard. ``get_all`` is still mocked (as an
+        AsyncMock) purely so tests can assert it was never awaited.
+        """
         memory = MagicMock()
         mem0 = MagicMock()
-        mem0.get_all = AsyncMock(return_value={'results': records if records is not None else []})
+        all_records = records if records is not None else []
+        scroll_records = [
+            r for r in all_records if (r.get('metadata') or {}).get('kind') == 'cycle_summary'
+        ]
+        mem0.get_all = AsyncMock(return_value={'results': all_records})
+        mem0.scroll_by_metadata = AsyncMock(return_value=scroll_records)
+        mem0.count_by_metadata = AsyncMock(return_value=len(scroll_records))
         memory.mem0 = mem0
         memory.delete_memory = AsyncMock(return_value={'status': 'deleted'})
         return memory
 
     def _args(
         self, apply=False, project_id=None, keep_recent=2,
-        limit_per_project=1000, yes_i_am_sure=False,
+        limit_per_project=1000, yes_i_am_sure=False, scan_limit=10000,
     ) -> argparse.Namespace:
         return argparse.Namespace(
             apply=apply,
@@ -606,6 +663,7 @@ class TestRun:
             keep_recent=keep_recent,
             limit_per_project=limit_per_project,
             yes_i_am_sure=yes_i_am_sure,
+            scan_limit=scan_limit,
         )
 
     def _known_map(self, pid='dark_factory') -> dict:
@@ -669,19 +727,26 @@ class TestRun:
         assert 'u2-wrong-stage' not in all_deletion_ids
 
     @pytest.mark.asyncio
-    async def test_get_all_scoped_per_project_with_configured_limit(self):
-        """mem0.get_all is awaited once per selected project, scoped to that
-        project_id, with limit=args.limit_per_project (the scan/safety-cap value)."""
+    async def test_scan_uses_metadata_filtered_scroll(self):
+        """scroll_by_metadata (NOT get_all) is awaited once per selected
+        project, scoped to that project_id, filtered to
+        {'kind': 'cycle_summary'}, with limit=args.scan_limit. Content-based
+        classification still works end-to-end via metadata['data'] -- the
+        older remediation-bearing s1 summary is still preserved."""
         memory = self._make_memory(self._fixture_records())
-        args = self._args(apply=False, project_id='dark_factory', limit_per_project=500)
+        args = self._args(apply=False, project_id='dark_factory', scan_limit=10000)
 
-        await _mod.run(args, memory=memory, known_projects_map=self._known_map())
+        report = await _mod.run(args, memory=memory, known_projects_map=self._known_map())
 
-        memory.mem0.get_all.assert_awaited_once()
-        call = memory.mem0.get_all.call_args
-        scope_arg = call.args[0] if call.args else call.kwargs.get('scope')
-        assert scope_arg.project_id == 'dark_factory'
-        assert call.kwargs.get('limit') == 500
+        memory.mem0.scroll_by_metadata.assert_awaited_once()
+        call = memory.mem0.scroll_by_metadata.call_args
+        assert call.args[0].project_id == 'dark_factory'
+        assert call.args[1] == {'kind': 'cycle_summary'}
+        assert call.kwargs.get('limit') == 10000
+        memory.mem0.get_all.assert_not_awaited()
+
+        mc = report['projects']['dark_factory']['memory_consolidator']
+        assert mc['preserved_remediation'] == 1
 
     @pytest.mark.asyncio
     async def test_unknown_project_id_aborts_before_get_all(self):
@@ -692,4 +757,131 @@ class TestRun:
         result = await _mod.run(args, memory=memory, known_projects_map={'dark_factory': '/p'})
 
         assert result.get('aborted') is True
-        memory.mem0.get_all.assert_not_awaited()
+        memory.mem0.scroll_by_metadata.assert_not_awaited()
+        memory.mem0.count_by_metadata.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_scan_truncation_aborts(self, capsys):
+        """If a project's ground-truth count_by_metadata total exceeds the
+        number of records scroll_by_metadata actually returned, the scan
+        under-counted -- run() must hard-abort before any deletion (even
+        under --apply), flag the project, and point the remedy at
+        --scan-limit. scan_limit is set to exactly match the fixture's
+        scroll length (8) so the ground truth is consulted despite the
+        len(scrolled)<scan_limit short-circuit (see
+        test_scan_skips_ground_truth_when_scroll_below_limit) -- the scroll
+        mock does not itself honour `limit`, so this pins the ambiguous
+        at/over-limit branch that must still call count_by_metadata."""
+        memory = self._make_memory(self._fixture_records())
+        # Ground truth says there are far more cycle-summaries than the
+        # scroll returned -- simulates a scan_limit too small for the pool.
+        memory.mem0.count_by_metadata = AsyncMock(return_value=999)
+        args = self._args(apply=True, project_id='dark_factory', scan_limit=8)
+
+        result = await _mod.run(args, memory=memory, known_projects_map=self._known_map())
+
+        assert result.get('aborted') is True
+        assert result.get('scan_truncated') is True
+        assert result.get('truncated_projects') == ['dark_factory']
+        assert result.get('possible_timeout_projects') == []
+        memory.delete_memory.assert_not_awaited()
+
+        captured = capsys.readouterr()
+        assert '--scan-limit' in captured.err
+        assert 'benign' in captured.err.lower()
+
+    @pytest.mark.asyncio
+    async def test_scan_truncation_flags_possible_timeout_when_scan_returns_zero(self, capsys):
+        """scroll_by_metadata returns `[]` both for a genuinely-empty pool and
+        for a swallowed Qdrant timeout (see its docstring) -- the two are
+        indistinguishable without cross-checking. When the ground truth says
+        the pool is NOT actually empty, the truncation guard must still fire
+        (the zero-scan case is never short-circuited), and the abort must
+        flag this as a probable scroll timeout rather than pointing solely at
+        --scan-limit, which would not fix a timeout."""
+        memory = self._make_memory([])  # scroll_by_metadata returns []
+        memory.mem0.count_by_metadata = AsyncMock(return_value=42)
+        args = self._args(apply=True, project_id='dark_factory')
+
+        result = await _mod.run(args, memory=memory, known_projects_map=self._known_map())
+
+        assert result.get('aborted') is True
+        assert result.get('scan_truncated') is True
+        assert result.get('possible_timeout_projects') == ['dark_factory']
+        memory.delete_memory.assert_not_awaited()
+
+        captured = capsys.readouterr()
+        assert 'timeout' in captured.err.lower()
+
+    @pytest.mark.asyncio
+    async def test_scan_skips_ground_truth_when_scroll_below_limit(self):
+        """Efficiency: when the scroll returns a non-empty result strictly
+        below --scan-limit, the pool is already provably fully enumerated
+        (Qdrant's scroll fills up to `limit` in one pass), so
+        count_by_metadata must NOT be consulted -- halves Qdrant reads in the
+        common untruncated path."""
+        memory = self._make_memory(self._fixture_records())
+        args = self._args(apply=False, project_id='dark_factory', scan_limit=10000)
+
+        report = await _mod.run(args, memory=memory, known_projects_map=self._known_map())
+
+        memory.mem0.count_by_metadata.assert_not_awaited()
+        assert not report.get('aborted')
+
+    @pytest.mark.asyncio
+    async def test_no_truncation_when_scan_complete(self):
+        """count_by_metadata == len(scroll) (the default fixture wiring) is
+        NOT a truncation -- run() proceeds to a normal report, not an abort.
+        Guards against a false-positive abort in the happy path."""
+        memory = self._make_memory(self._fixture_records())
+        args = self._args(apply=False, project_id='dark_factory')
+
+        report = await _mod.run(args, memory=memory, known_projects_map=self._known_map())
+
+        assert not report.get('aborted')
+        assert report['dry_run'] is True
+        assert 'totals' in report
+
+    @pytest.mark.asyncio
+    async def test_scan_limit_decoupled_from_deletion_cap(self):
+        """--scan-limit governs ONLY the scroll window; --limit-per-project
+        governs ONLY the deletion safety cap. A large scan_limit alongside a
+        small limit_per_project still aborts on the deletion cap (not the
+        scan), proving the two knobs are independent."""
+        memory = self._make_memory(self._fixture_records())
+        args = self._args(
+            apply=False, project_id='dark_factory',
+            limit_per_project=1, scan_limit=5000,
+        )
+
+        result = await _mod.run(args, memory=memory, known_projects_map=self._known_map())
+
+        memory.mem0.scroll_by_metadata.assert_awaited_once()
+        call = memory.mem0.scroll_by_metadata.call_args
+        assert call.kwargs.get('limit') == 5000
+
+        assert result.get('aborted') is True
+        assert result.get('exceeding_projects') == ['dark_factory']
+        assert 'scan_truncated' not in result
+
+
+# ===========================================================================
+# Tests: build_parser (argparse) -- --scan-limit / --limit-per-project
+# ===========================================================================
+
+class TestArgparse:
+    """build_parser() constructs the CLI parser used by main(). --scan-limit
+    (the scroll window) and --limit-per-project (the deletion safety cap)
+    are independent flags with independent defaults."""
+
+    def test_scan_limit_default(self):
+        args = _mod.build_parser().parse_args([])
+        assert args.scan_limit == _mod._DEFAULT_SCAN_LIMIT
+        assert args.limit_per_project == 1000
+
+    def test_scan_limit_and_cap_are_independent(self):
+        args = _mod.build_parser().parse_args(
+            ['--scan-limit', '2000', '--limit-per-project', '50'],
+        )
+        assert args.scan_limit == 2000
+        assert args.limit_per_project == 50

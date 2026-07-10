@@ -57,10 +57,14 @@ Usage
   # Keep more than the default 2 most-recent summaries per project x pool.
   python scripts/prune_recon_cycle_summaries.py --apply --keep-recent 5
 
-  # Override the per-project scan limit (safety cap).
+  # Widen the scan window (a project has more than the default 10000
+  # cycle-summary points) -- this raises the scan only, not the deletion cap.
+  python scripts/prune_recon_cycle_summaries.py --apply --scan-limit 20000
+
+  # Override the per-project deletion safety cap (irreversible-delete guard).
   python scripts/prune_recon_cycle_summaries.py --apply --limit-per-project 2000
 
-  # Bypass the safety cap (required when a project has > limit entries).
+  # Bypass the safety cap (required when a project has > limit deletions).
   python scripts/prune_recon_cycle_summaries.py --apply --yes-i-am-sure
 """
 
@@ -84,6 +88,13 @@ logger = logging.getLogger('prune_recon_cycle_summaries')
 # each stage's prompt writes into per-cycle-summary metadata (see
 # prompts/stage1.py and prompts/stage2.py).
 _POOL_STAGES: tuple[str, ...] = ('memory_consolidator', 'task_knowledge_sync')
+
+# Default per-project scan window for the metadata-filtered scroll (the
+# `--scan-limit` flag) -- decoupled from `--limit-per-project`, which remains
+# solely the deletion safety cap consumed by check_limit_cap. Wide headroom
+# over observed pool sizes (~251-265 across known projects); the ground-truth
+# truncation guard (check_scan_completeness) catches anything beyond.
+_DEFAULT_SCAN_LIMIT = 10000
 
 
 # ---------------------------------------------------------------------------
@@ -463,6 +474,38 @@ def check_limit_cap(
     return exceeding, abort
 
 
+def check_scan_completeness(
+    per_project_counts: dict[str, tuple[int, int]],
+) -> list[str]:
+    """Check whether any project's metadata-filtered scroll under-counted.
+
+    The scroll used to enumerate a project's cycle-summary pool
+    (``memory.mem0.scroll_by_metadata``) is bounded by ``--scan-limit`` and
+    can silently truncate if a project's true cycle-summary count exceeds
+    that window. This flags any project where the scanned count fell short
+    of the ground-truth count (``memory.mem0.count_by_metadata``), so the
+    caller can abort before treating a truncated scan's classification as
+    trustworthy.
+
+    Parameters
+    ----------
+    per_project_counts:
+        ``{project_id: (scanned_count, expected_count)}`` where
+        ``scanned_count`` is the number of records returned by the scroll and
+        ``expected_count`` is the ground-truth ``count_by_metadata`` total.
+
+    Returns
+    -------
+    Sorted list of project_ids whose ``scanned_count < expected_count``
+    (strict undercount only; ``scanned_count >= expected_count`` is not
+    flagged).
+    """
+    return sorted(
+        pid for pid, (scanned, expected) in per_project_counts.items()
+        if scanned < expected
+    )
+
+
 # ---------------------------------------------------------------------------
 # Live shell: apply + run
 # ---------------------------------------------------------------------------
@@ -538,20 +581,45 @@ async def run(
 ) -> dict[str, Any]:
     """Main async logic: scan, classify, report, and optionally apply.
 
-    For each selected project, enumerates its Mem0 memories via
-    ``memory.mem0.get_all`` (a deterministic full scroll — content is
-    required for :func:`carries_remediation_history`, and
-    ``get_memories_by_metadata`` omits content), filters client-side to
-    ``metadata.kind == 'cycle_summary'`` records whose ``metadata.stage`` is
-    one of the two known pools (``memory_consolidator``,
-    ``task_knowledge_sync``), and classifies each pool independently via
+    For each selected project, enumerates its cycle-summary pools via
+    ``memory.mem0.scroll_by_metadata(scope, {'kind': 'cycle_summary'},
+    limit=args.scan_limit)`` — a deterministic Qdrant payload-filtered scroll
+    that queries ONLY cycle-summary records, so the scan window is bounded by
+    pool size rather than the project's total Mem0 collection size. Each
+    result's summary text (required for :func:`carries_remediation_history`)
+    is read from ``metadata['data']``, the Qdrant payload key Mem0 stores
+    memory content under. Results are filtered client-side to those whose
+    ``metadata.stage`` is one of the two known pools (``memory_consolidator``,
+    ``task_knowledge_sync``), and each pool is classified independently via
     :func:`classify_pool`.
+
+    Ground-truth truncation guard: for each project, the scroll's actual
+    result count is compared against the exact cycle-summary total
+    (``memory.mem0.count_by_metadata``) via :func:`check_scan_completeness`.
+    As an efficiency optimisation, the ground-truth count is skipped when the
+    scroll already proves full enumeration by itself — a *non-empty* result
+    strictly below ``--scan-limit`` (Qdrant's scroll returns every matching
+    point up to the limit in one pass, so coming back short of it means
+    there was nothing left to enumerate). The ground truth is always
+    consulted when the scroll came back at/over the limit (ambiguous: a real
+    truncation, or the pool size happens to equal the limit exactly) OR came
+    back completely empty (ambiguous: a genuinely-empty pool, or
+    ``scroll_by_metadata`` swallowing a Qdrant timeout into a bare ``[]`` —
+    see its docstring — which must not be mistaken for "nothing to prune").
+    If any project's scan under-counted, this hard-aborts with a
+    ``scan_truncated`` payload *before* the deletion-cap check and before any
+    ``--apply`` deletes — a truncated scan must never silently reach a
+    classification/deletion decision. The abort separately flags any
+    scanned-zero project (``possible_timeout_projects``) as a probable
+    scroll timeout rather than an inadequate ``--scan-limit``, and notes that
+    on a live system a small overshoot can reflect a benign race between the
+    scroll and the ground-truth count rather than a real undercount.
 
     Parameters
     ----------
     args:
         Parsed ``argparse.Namespace`` (apply, project_id, keep_recent,
-        limit_per_project, yes_i_am_sure).
+        limit_per_project, yes_i_am_sure, scan_limit).
     memory:
         Live (or mock) MemoryService instance.
     known_projects_map:
@@ -562,7 +630,9 @@ async def run(
     -------
     The prune report dict (see :func:`build_prune_report`), or an abort
     payload (``{'aborted': True, ...}``) if an unknown ``--project-id`` was
-    given or a project's deletable count exceeds the safety cap.
+    given, a project's scan under-counted its true cycle-summary total
+    (``scan_truncated``), or a project's deletable count exceeds the safety
+    cap.
     """
     generated_at = datetime.now(UTC).isoformat()
 
@@ -600,23 +670,44 @@ async def run(
         return abort_payload
 
     keep_recent_n: int = args.keep_recent
+    scan_limit: int = getattr(args, 'scan_limit', _DEFAULT_SCAN_LIMIT)
 
     # Scan + classify every selected project's two pools.
     decisions: dict[tuple[str, str], PruneDecision] = {}
+    per_project_counts: dict[str, tuple[int, int]] = {}
     for pid in project_ids:
         scope = Scope(project_id=pid)
-        raw = await memory.mem0.get_all(scope, limit=args.limit_per_project)
-        results = raw.get('results') if isinstance(raw, dict) else None
-        if not isinstance(results, list):
+        scrolled = await memory.mem0.scroll_by_metadata(
+            scope, {'kind': 'cycle_summary'}, limit=scan_limit,
+        )
+        if not isinstance(scrolled, list):
             logger.warning(
-                "prune_recon_cycle_summaries: mem0.get_all returned malformed/absent "
-                "'results' key for project %s; treating as empty. got: %s",
-                pid, repr(raw)[:200],
+                "prune_recon_cycle_summaries: mem0.scroll_by_metadata returned a "
+                "non-list result for project %s; treating as empty. got: %s",
+                pid, repr(scrolled)[:200],
             )
-            results = []
+            scrolled = []
+
+        # Qdrant's scroll returns every matching point up to `limit` in one
+        # pass, so a *non-empty* result strictly below `scan_limit` already
+        # proves the pool was fully enumerated -- skip the extra
+        # count_by_metadata round-trip in that (common) case, halving Qdrant
+        # reads. A `scrolled` result of exactly zero is deliberately NOT
+        # short-circuited: scroll_by_metadata also returns `[]` (logging a
+        # WARNING, never raising) on a Qdrant timeout, which is
+        # indistinguishable from a genuinely-empty pool without cross-
+        # checking -- always consult the ground truth for that case so a
+        # timeout cannot masquerade as "nothing to prune". The ground truth
+        # is likewise always consulted when the scroll came back at/over
+        # `scan_limit` (the potential-truncation case).
+        if 0 < len(scrolled) < scan_limit:
+            expected = len(scrolled)
+        else:
+            expected = await memory.mem0.count_by_metadata(scope, {'kind': 'cycle_summary'})
+        per_project_counts[pid] = (len(scrolled), expected)
 
         pool_items: dict[str, list[dict[str, Any]]] = {stage: [] for stage in _POOL_STAGES}
-        for m in results:
+        for m in scrolled:
             metadata = m.get('metadata') or {}
             if metadata.get('kind') != 'cycle_summary':
                 continue
@@ -626,12 +717,63 @@ async def run(
             pool_items[stage].append({
                 'id': m.get('id'),
                 'created_at': m.get('created_at'),
-                'content': m.get('memory') or '',
+                'content': metadata.get('data') or '',
                 'metadata': metadata,
             })
 
         for stage, items in pool_items.items():
             decisions[(pid, stage)] = classify_pool(items, keep_recent_n)
+
+    # Ground-truth truncation guard: abort before the deletion-cap check and
+    # before any apply if any project's scroll under-counted its true
+    # cycle_summary total (see check_scan_completeness).
+    truncated = check_scan_completeness(per_project_counts)
+    if truncated:
+        # A truncated project that scanned exactly zero records is the
+        # signature of scroll_by_metadata swallowing a Qdrant timeout into a
+        # bare `[]` (see its docstring) rather than an actually-empty pool --
+        # raising --scan-limit would not fix that, so it is flagged
+        # separately from the generic remedy below.
+        possible_timeout_projects = sorted(
+            pid for pid in truncated if per_project_counts[pid][0] == 0
+        )
+        truncation_payload: dict[str, Any] = {
+            'aborted': True,
+            'scan_truncated': True,
+            'truncated_projects': truncated,
+            'possible_timeout_projects': possible_timeout_projects,
+            'scan_limit': scan_limit,
+            'dry_run': not args.apply,
+            'generated_at': generated_at,
+            'scan_counts': {
+                pid: {'scanned': scanned, 'expected': expected}
+                for pid, (scanned, expected) in per_project_counts.items()
+            },
+        }
+        print(json.dumps(truncation_payload, indent=2, default=str))
+        print(
+            f'ABORT: scan truncated for projects {truncated}: scanned < '
+            f'cycle_summary count; re-run with a higher --scan-limit '
+            f'(current: {scan_limit}).',
+            file=sys.stderr,
+        )
+        if possible_timeout_projects:
+            print(
+                f'NOTE: {possible_timeout_projects} scanned 0 cycle_summary '
+                f'records despite a non-zero ground-truth count -- this is '
+                f'the signature of a Mem0/Qdrant scroll timeout (logged as a '
+                f'WARNING by scroll_by_metadata), not an inadequate '
+                f'--scan-limit; check logs for a timeout before raising it.',
+                file=sys.stderr,
+            )
+        print(
+            'NOTE: on a live system with concurrent writers, a small '
+            'truncated overshoot can reflect a benign race between the scan '
+            'and the ground-truth count rather than a real undercount -- '
+            're-running is safe and often clears it.',
+            file=sys.stderr,
+        )
+        return truncation_payload
 
     # Safety cap on deletable counts (irreversible), across both pools per project.
     per_project_delete_counts: dict[str, int] = {
@@ -689,12 +831,13 @@ async def run(
     return report
 
 
-def main() -> int:
-    """CLI entry point."""
-    logging.basicConfig(
-        level=logging.INFO, format='%(asctime)s %(levelname)s %(message)s',
-    )
+def build_parser() -> argparse.ArgumentParser:
+    """Construct the CLI argument parser for this script.
 
+    Extracted from ``main()`` so tests can assert flag defaults and the
+    independence of ``--scan-limit`` from ``--limit-per-project`` without
+    invoking the live ``main()`` entry point.
+    """
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
         '--apply', action='store_true',
@@ -710,14 +853,31 @@ def main() -> int:
              '(default: 2)',
     )
     parser.add_argument(
+        '--scan-limit', dest='scan_limit', type=int, default=_DEFAULT_SCAN_LIMIT,
+        help='Per-project Mem0 scan window: max cycle-summary points enumerated '
+             'via the metadata-filtered scroll (default: 10000). Decoupled from '
+             'the deletion safety cap.',
+    )
+    parser.add_argument(
         '--limit-per-project', dest='limit_per_project', type=int, default=1000,
-        help='Per-project Mem0 scan limit, and safety cap on deletable count '
-             'before aborting (default: 1000)',
+        help='Safety cap on the per-project classified deletable count before '
+             'aborting (default: 1000). Irreversible-deletion guard only -- '
+             'does not affect the scan window (see --scan-limit).',
     )
     parser.add_argument(
         '--yes-i-am-sure', dest='yes_i_am_sure', action='store_true',
         help='Override the per-project deletable-count safety cap',
     )
+    return parser
+
+
+def main() -> int:
+    """CLI entry point."""
+    logging.basicConfig(
+        level=logging.INFO, format='%(asctime)s %(levelname)s %(message)s',
+    )
+
+    parser = build_parser()
     args = parser.parse_args()
 
     async def _run_live() -> int:
