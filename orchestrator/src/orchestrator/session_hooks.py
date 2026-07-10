@@ -254,16 +254,35 @@ def run_session_start(
 # ---------------------------------------------------------------------------
 
 
+def _extract_question(hook_input: Mapping[str, Any]) -> session_registry.Question | None:
+    """Extract a pending Question from a Notification hook's ``message``.
+
+    Returns None -- leaving any prior ``record.question`` untouched by the
+    caller -- when ``message`` is absent or blank/whitespace-only. Latest-
+    question semantics: an empty Notification must never clobber a real
+    question stamped by an earlier one.
+    """
+    message = hook_input.get('message')
+    if not message or not str(message).strip():
+        return None
+    return session_registry.Question(text=str(message), asked_at=datetime.now(UTC).isoformat())
+
+
 def _run_status_refresh_and_retitle(
     hook_input: Mapping[str, Any],
     env: Mapping[str, str],
     root: Path | str | None,
     status: session_registry.Status,
+    *,
+    question: session_registry.Question | None = None,
 ) -> str:
     """Shared refresh-then-retitle body for run_notification/run_stop."""
     identity = resolve_hook_identity(hook_input, env)
     slug = hook_session_slug(hook_input, env)
     record = session_registry.refresh_record(slug, root=root, status=status)
+    if question is not None:
+        record.question = question
+        session_registry.write_record(record, root=root)
     title = hook_display_title(identity, env, record)
     return osc_retitle_sequence(status, title)
 
@@ -273,9 +292,13 @@ def run_notification(
     env: Mapping[str, str],
     root: Path | str | None = None,
 ) -> str:
-    """Notification hook handler: status -> AWAITING_INPUT, return its OSC retitle."""
+    """Notification hook handler: status -> AWAITING_INPUT, stamp any question, return its OSC retitle."""
     return _run_status_refresh_and_retitle(
-        hook_input, env, root, session_registry.Status.AWAITING_INPUT
+        hook_input,
+        env,
+        root,
+        session_registry.Status.AWAITING_INPUT,
+        question=_extract_question(hook_input),
     )
 
 
