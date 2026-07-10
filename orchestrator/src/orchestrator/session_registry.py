@@ -599,6 +599,26 @@ class LeaseClaim:
     message: str
 
 
+def _render_contention_message(
+    holder: LeaseHolder | None,
+    *,
+    holder_alive: bool,
+    age_secs: float,
+    policy: LeasePolicy,
+) -> str:
+    """Build the exact user-observable contention line callers print verbatim.
+
+    Centralizing this here (rather than in each skill) guarantees the signal
+    string is identical everywhere it appears and is unit-testable with an
+    injected clock. *holder* may be None (an unreadable/corrupt lease body);
+    that is rendered as an explicit placeholder rather than raising.
+    """
+    slug = holder.session_slug if holder is not None else '<unknown>'
+    alive_word = 'alive' if holder_alive else 'dead'
+    action = 'standing down' if policy is LeasePolicy.STAND_DOWN else 'proceeding anyway'
+    return f'lease held by {slug} ({alive_word}, heartbeat {int(age_secs)}s ago) — {action}'
+
+
 def claim_lease(
     name: str,
     *,
@@ -611,15 +631,38 @@ def claim_lease(
 
     Uses ``os.open(O_CREAT|O_EXCL|O_WRONLY)`` -- the identical atomic
     exclusive-create idiom as ``ArtifactStore.lock_plan`` (artifacts.py) --
-    so the first caller to create the ``.lease`` file wins outright. *now*
-    is injectable for deterministic tests; defaults to the real UTC clock.
+    so the first caller to create the ``.lease`` file wins outright. When the
+    lease is already held, the existing holder + its liveness/heartbeat-age
+    are reported under *policy* and the on-disk body is never touched (no
+    clobbering). *now* is injectable for deterministic tests; defaults to
+    the real UTC clock.
     """
     if now is None:
         now = datetime.now(UTC)
     path = lease_path_for_name(name, root=root)
     path.parent.mkdir(parents=True, exist_ok=True)
 
-    fd = os.open(str(path), os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+    try:
+        fd = os.open(str(path), os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+    except FileExistsError:
+        existing_mtime = path.stat().st_mtime
+        age_secs = (now - datetime.fromtimestamp(existing_mtime, tz=UTC)).total_seconds()
+        existing_holder = LeaseHolder.from_json(path.read_text())
+        holder_alive = _pid_alive(existing_holder.pid)
+
+        decision = LeaseDecision.STAND_DOWN if policy is LeasePolicy.STAND_DOWN else LeaseDecision.PROCEED
+        return LeaseClaim(
+            name=name,
+            decision=decision,
+            acquired=False,
+            holder=existing_holder,
+            holder_alive=holder_alive,
+            heartbeat_age_secs=age_secs,
+            message=_render_contention_message(
+                existing_holder, holder_alive=holder_alive, age_secs=age_secs, policy=policy
+            ),
+        )
+
     try:
         os.write(fd, holder.to_json().encode())
     except Exception:
