@@ -1638,3 +1638,137 @@ def test_tmux_backend_missing_tmux_yields_126(tmp_path: pathlib.Path) -> None:
     assert "tmux" in stderr.lower(), (
         f"expected a loud stderr line mentioning tmux, got:\n{stderr}"
     )
+
+
+# ===========================================================================
+# task-2298 step-1: Fleet Cockpit C7 sibling spawn mode (parent-of-record)
+# ===========================================================================
+# CLAUDE_SPAWN_MODE=sibling changes which identity the child inherits as its
+# own CLAUDE_SPAWN_PARENT_ID: not the direct spawner (this spawn-claude.sh
+# invocation's own CLAUDE_SPAWN_SESSION_ID -- the 'child' default exercised
+# by the C1 tests above), but the spawner's OWN inherited
+# CLAUDE_SPAWN_PARENT_ID -- the shared ancestor. All three tests below route
+# through CLAUDE_SPAWN_BACKEND=tmux (Fleet Cockpit C6, see _write_fake_tmux
+# above) rather than a foreground emulator, and poll for captured_env.txt via
+# _wait_for_path rather than assuming it is present the instant _run_spawn
+# returns: the eventual GREEN state (step-4, fire-and-forget) returns from
+# spawn-claude.sh before the detached child has necessarily finished writing
+# it, so these tests must not depend on the pre-step-4 blocking-wait timing
+# they'd otherwise get for free.
+
+
+def _run_sibling_capture_spawn(
+    tmp_path: pathlib.Path,
+    *,
+    spawner_session_id: str | None,
+    spawner_parent_id: str | None,
+) -> tuple[subprocess.CompletedProcess[bytes], dict[str, str], pathlib.Path]:
+    """Run a CLAUDE_SPAWN_MODE=sibling spawn behind the tmux backend and
+    return ``(result, parsed captured env, fleet_root)``.
+
+    Shared setup for the three sibling parent-of-record tests below.
+    """
+    bin_dir = _make_bin_dir(tmp_path)
+    capture_file = tmp_path / "captured_env.txt"
+    _write_fake_claude_capturing_env(bin_dir, capture_file)
+    tmux_marker = tmp_path / "tmux_used"
+    _write_fake_tmux(bin_dir, tmux_marker)
+
+    env = _base_env(bin_dir, "xterm")
+    env["CLAUDE_SPAWN_BACKEND"] = "tmux"
+    env["CLAUDE_SPAWN_PROJECT"] = "proj"
+    env["CLAUDE_SPAWN_MODE"] = "sibling"
+    if spawner_session_id is None:
+        env.pop("CLAUDE_SPAWN_SESSION_ID", None)
+    else:
+        env["CLAUDE_SPAWN_SESSION_ID"] = spawner_session_id
+    if spawner_parent_id is None:
+        env.pop("CLAUDE_SPAWN_PARENT_ID", None)
+    else:
+        env["CLAUDE_SPAWN_PARENT_ID"] = spawner_parent_id
+
+    result = _run_spawn(env, tmp_path)
+    _wait_for_path(capture_file, timeout=5.0)
+    captured = _parse_captured_env(capture_file)
+    fleet_root = pathlib.Path(env["CLAUDE_FLEET_ROOT"])
+    return result, captured, fleet_root
+
+
+def test_sibling_mode_parents_at_shared_ancestor(tmp_path: pathlib.Path) -> None:
+    """Sibling mode: the child's CLAUDE_SPAWN_PARENT_ID must be the
+    spawner's OWN inherited parent ("A", the shared ancestor) -- NOT the
+    spawner's own session id ("P", the direct spawner). The child still
+    gets its own freshly-minted CLAUDE_SPAWN_SESSION_ID either way.
+
+    RED today: CLAUDE_SPAWN_MODE is ignored (default 'child' behavior), so
+    parent_id_export always resolves to the spawner's own
+    CLAUDE_SPAWN_SESSION_ID ("P") regardless of spawn_mode. GREEN after
+    step-2.
+    """
+    result, captured, fleet_root = _run_sibling_capture_spawn(
+        tmp_path, spawner_session_id="P", spawner_parent_id="A",
+    )
+    assert result.returncode == 0, f"stderr: {result.stderr.decode()}"
+
+    record_path = _find_one_record(fleet_root)
+    record = session_registry.SessionRecord.from_json(record_path.read_text())
+
+    assert captured.get("SESSION") == record.session_slug, (
+        f"expected the child's own new session_slug, got {captured!r}"
+    )
+    assert captured.get("PARENT") == "A", (
+        f"sibling mode must parent the child at the spawner's OWN parent "
+        f"(shared ancestor 'A'), not the direct spawner 'P', got {captured!r}"
+    )
+
+
+def test_sibling_mode_null_parent_becomes_root(tmp_path: pathlib.Path) -> None:
+    """Sibling mode with no CLAUDE_SPAWN_PARENT_ID of its own (the spawner
+    is itself root, or was hand-launched) -- the child's
+    CLAUDE_SPAWN_PARENT_ID must be empty (null -> root), not silently fall
+    back to the spawner's own session id.
+
+    RED today: same root cause as test_sibling_mode_parents_at_shared_ancestor
+    -- CLAUDE_SPAWN_MODE is ignored, so parent_id_export uses the spawner's
+    own CLAUDE_SPAWN_SESSION_ID ("P") instead of staying empty.
+    """
+    result, captured, _fleet_root = _run_sibling_capture_spawn(
+        tmp_path, spawner_session_id="P", spawner_parent_id=None,
+    )
+    assert result.returncode == 0, f"stderr: {result.stderr.decode()}"
+
+    assert captured.get("PARENT") == "", (
+        f"a spawner with no parent of its own must yield an empty (root) "
+        f"parent for a sibling child, got {captured!r}"
+    )
+
+
+def test_sibling_parentage_two_way_into_hook_record(tmp_path: pathlib.Path) -> None:
+    """B7 boundary (C7 spawn-side export <-> C1/C2 hook-side schema): the
+    CLAUDE_SPAWN_PARENT_ID a sibling spawn actually exports must, when fed
+    to the already-landed SessionStart hook
+    (orchestrator.session_hooks.run_session_start), land as
+    record.parent_session_id -- proving the two sides of the seam compose
+    end-to-end, not just independently.
+
+    RED today: the sibling spawn exports "P" (the direct spawner) instead of
+    "A" (the shared ancestor), so the fed-through value fails both the
+    equals-"A" and not-equals-"P" assertions below.
+    """
+    result, captured, fleet_root = _run_sibling_capture_spawn(
+        tmp_path, spawner_session_id="P", spawner_parent_id="A",
+    )
+    assert result.returncode == 0, f"stderr: {result.stderr.decode()}"
+
+    hook_input = {"session_id": "child-hook-boundary", "cwd": str(tmp_path)}
+    hook_env = {"CLAUDE_SPAWN_PARENT_ID": captured.get("PARENT", "")}
+    record = session_hooks.run_session_start(hook_input, hook_env, root=fleet_root)
+
+    assert record.parent_session_id == "A", (
+        f"expected the sibling-exported parent id to land as "
+        f"record.parent_session_id, got {record.parent_session_id!r}"
+    )
+    assert record.parent_session_id != "P", (
+        "record.parent_session_id must not be the direct spawner's own "
+        "session id in sibling mode"
+    )
