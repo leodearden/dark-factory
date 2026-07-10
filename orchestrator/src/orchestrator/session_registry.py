@@ -619,6 +619,55 @@ def _render_contention_message(
     return f'lease held by {slug} ({alive_word}, heartbeat {int(age_secs)}s ago) — {action}'
 
 
+def _create_and_write_lease(path: Path, holder: LeaseHolder) -> None:
+    """``os.open(O_CREAT|O_EXCL)`` + write *holder*'s body (mirrors ArtifactStore.lock_plan).
+
+    Raises ``FileExistsError`` if the lease already exists (lost the race).
+    On a write failure, cleans up the empty file it just created so a
+    subsequent claim is not falsely blocked by a poison-pill empty file.
+    """
+    fd = os.open(str(path), os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+    try:
+        os.write(fd, holder.to_json().encode())
+    except Exception:
+        with contextlib.suppress(OSError):
+            path.unlink(missing_ok=True)
+        raise
+    finally:
+        os.close(fd)
+
+
+def _acquired_claim(name: str, holder: LeaseHolder) -> LeaseClaim:
+    return LeaseClaim(
+        name=name,
+        decision=LeaseDecision.ACQUIRED,
+        acquired=True,
+        holder=holder,
+        holder_alive=True,
+        heartbeat_age_secs=0.0,
+        message=f'lease {name} acquired by {holder.session_slug}',
+    )
+
+
+def _read_lease_holder_state(
+    path: Path, *, now: datetime
+) -> tuple[LeaseHolder | None, bool, float]:
+    """Read an existing lease file's ``(holder, holder_alive, heartbeat_age_secs)``.
+
+    *holder* is None when the body is missing/corrupt/unparseable -- callers
+    treat that as "held by an unknown holder" (fail toward held, not free)
+    rather than raising; *holder_alive* is then False, so a corrupt body
+    older than LEASE_HEARTBEAT_TTL is still stale-reapable.
+    """
+    mtime = path.stat().st_mtime
+    age_secs = (now - datetime.fromtimestamp(mtime, tz=UTC)).total_seconds()
+    try:
+        holder = LeaseHolder.from_json(path.read_text())
+    except (OSError, json.JSONDecodeError, KeyError, TypeError, ValueError):
+        return None, False, age_secs
+    return holder, _pid_alive(holder.pid), age_secs
+
+
 def claim_lease(
     name: str,
     *,
@@ -632,10 +681,13 @@ def claim_lease(
     Uses ``os.open(O_CREAT|O_EXCL|O_WRONLY)`` -- the identical atomic
     exclusive-create idiom as ``ArtifactStore.lock_plan`` (artifacts.py) --
     so the first caller to create the ``.lease`` file wins outright. When the
-    lease is already held, the existing holder + its liveness/heartbeat-age
-    are reported under *policy* and the on-disk body is never touched (no
-    clobbering). *now* is injectable for deterministic tests; defaults to
-    the real UTC clock.
+    lease is already held, the existing holder's liveness (_pid_alive) and
+    heartbeat age (file mtime) are checked: if BOTH the holder is dead AND
+    the heartbeat is older than LEASE_HEARTBEAT_TTL, the stale lease is
+    reaped and the claim retried once; otherwise the existing holder is
+    reported under *policy* (STAND_DOWN/WARN_AND_PROCEED) and the on-disk
+    body is never touched (no clobbering). *now* is injectable for
+    deterministic tests; defaults to the real UTC clock.
     """
     if now is None:
         now = datetime.now(UTC)
@@ -643,46 +695,38 @@ def claim_lease(
     path.parent.mkdir(parents=True, exist_ok=True)
 
     try:
-        fd = os.open(str(path), os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+        _create_and_write_lease(path, holder)
     except FileExistsError:
-        existing_mtime = path.stat().st_mtime
-        age_secs = (now - datetime.fromtimestamp(existing_mtime, tz=UTC)).total_seconds()
-        existing_holder = LeaseHolder.from_json(path.read_text())
-        holder_alive = _pid_alive(existing_holder.pid)
+        pass
+    else:
+        return _acquired_claim(name, holder)
 
-        decision = LeaseDecision.STAND_DOWN if policy is LeasePolicy.STAND_DOWN else LeaseDecision.PROCEED
-        return LeaseClaim(
-            name=name,
-            decision=decision,
-            acquired=False,
-            holder=existing_holder,
-            holder_alive=holder_alive,
-            heartbeat_age_secs=age_secs,
-            message=_render_contention_message(
-                existing_holder, holder_alive=holder_alive, age_secs=age_secs, policy=policy
-            ),
-        )
+    existing_holder, holder_alive, age_secs = _read_lease_holder_state(path, now=now)
+    is_stale = (not holder_alive) and age_secs > LEASE_HEARTBEAT_TTL.total_seconds()
 
-    try:
-        os.write(fd, holder.to_json().encode())
-    except Exception:
-        # Clean up the empty file created by O_CREAT|O_EXCL so a subsequent
-        # claim_lease call is not falsely blocked by a poison-pill empty file
-        # (mirrors ArtifactStore.lock_plan).
-        with contextlib.suppress(OSError):
-            path.unlink(missing_ok=True)
-        raise
-    finally:
-        os.close(fd)
+    if is_stale:
+        path.unlink(missing_ok=True)
+        try:
+            _create_and_write_lease(path, holder)
+        except FileExistsError:
+            # Lost the retry race to a new competitor: report THEIR holder
+            # under the normal held/policy path below (retry is attempted
+            # at most once -- we do not loop).
+            existing_holder, holder_alive, age_secs = _read_lease_holder_state(path, now=now)
+        else:
+            return _acquired_claim(name, holder)
 
+    decision = LeaseDecision.STAND_DOWN if policy is LeasePolicy.STAND_DOWN else LeaseDecision.PROCEED
     return LeaseClaim(
         name=name,
-        decision=LeaseDecision.ACQUIRED,
-        acquired=True,
-        holder=holder,
-        holder_alive=True,
-        heartbeat_age_secs=0.0,
-        message=f'lease {name} acquired by {holder.session_slug}',
+        decision=decision,
+        acquired=False,
+        holder=existing_holder,
+        holder_alive=holder_alive,
+        heartbeat_age_secs=age_secs,
+        message=_render_contention_message(
+            existing_holder, holder_alive=holder_alive, age_secs=age_secs, policy=policy
+        ),
     )
 
 
