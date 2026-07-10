@@ -52,6 +52,15 @@ claude --strict-mcp-config --mcp-config "$DARK_FACTORY_ROOT/recon-watch/mcp.json
   "/recon-escalation-watcher"
 ```
 
+**Default lane: tmux.** This is a long-running loop session (PRD
+`plans/fleet-cockpit-prd.md` §3 fork 1) — run it in the crash-survivable, reattachable tmux lane
+by default: wrap the invocation above via `skills/spawn/spawn-claude.sh` with
+`CLAUDE_SPAWN_BACKEND=tmux` (see that script's header) so the session gets a `display.kind=tmux`
+session-registry record and a `tmux attach`-reattachable window. A killed watcher is reattachable
+with `tmux attach`, and its record persists across the crash. Interactive one-offs are unaffected
+— this watcher never spawns interactive sessions of its own (see the table above: no `/unblock`,
+no worktree).
+
 `recon-watch/mcp.json` (created by the setup; both servers required):
 
 ```json
