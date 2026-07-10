@@ -123,6 +123,36 @@ if [ -n "$CLAUDE_SPAWN_RESULT_FILE" ]; then
   result_export="export CLAUDE_SPAWN_RESULT_FILE=$q_result_file; "
 fi
 
+# Fleet Cockpit C1 (plans/fleet-cockpit-prd.md §6.1) identity exports: give
+# the spawned child its OWN new session-registry slug, plus its parent
+# linkage. Default 'child' spawn_mode -- the child's parent-of-record is the
+# DIRECT spawner, i.e. THIS script's own inherited CLAUDE_SPAWN_SESSION_ID
+# (empty when this is a human-launched root with nothing to inherit). C7
+# later overrides parent_id_export for spawn_mode=sibling (parent = the
+# spawner's own inherited CLAUDE_SPAWN_PARENT_ID -- the shared ancestor, not
+# the direct spawner); this establishes the child-default baseline C7 builds
+# on. Both are nested under the same SESSION_RECORD_DIR check as
+# CLAUDE_SPAWN_RESULT_FILE above, so a registry fault (empty
+# SESSION_RECORD_DIR) cleanly no-ops BOTH exports together -- it would be
+# incoherent to hand the child a parent link with no session identity of its
+# own. child_session_id is derived from SESSION_RECORD_DIR's basename,
+# byte-identical to record.session_slug (_run_launching prints
+# <root>/sessions/<slug>), exactly how CLAUDE_SPAWN_RESULT_FILE is derived
+# above.
+spawn_id_export=""
+parent_id_export=""
+if [ -n "$SESSION_RECORD_DIR" ]; then
+  child_session_id="${SESSION_RECORD_DIR##*/}"
+  q_child=$(printf %q "$child_session_id")
+  spawn_id_export="export CLAUDE_SPAWN_SESSION_ID=$q_child; "
+
+  parent_of_child="${CLAUDE_SPAWN_SESSION_ID:-}"
+  if [ -n "$parent_of_child" ]; then
+    q_parent=$(printf %q "$parent_of_child")
+    parent_id_export="export CLAUDE_SPAWN_PARENT_ID=$q_parent; "
+  fi
+fi
+
 # Result-handback trailer (Attention Rail T5): appended to the prompt itself
 # so the spawned session is told, in-band, to write its outcome before
 # ending. Gated on the same non-empty check as result_export above -- a
