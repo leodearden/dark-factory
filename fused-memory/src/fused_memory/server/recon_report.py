@@ -148,6 +148,12 @@ def _truncate_field(value: str, cap: int) -> tuple[str, bool]:
 
     Returns ``(possibly-truncated value, was_truncated)``.  A *value* whose
     length is ``<= cap`` is returned unchanged with ``False``.
+
+    Note: the marker is appended AFTER slicing to *cap*, so a truncated
+    result is ``cap + len(_TRUNCATION_MARKER)`` chars long, not exactly
+    *cap* — harmless given today's generous ``_MAX_FINDING_TEXT_CHARS``
+    bound, but relevant if *cap* is ever tightened to a hard byte/char
+    budget.
     """
     if len(value) > cap:
         return value[:cap] + _TRUNCATION_MARKER, True
