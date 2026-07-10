@@ -1772,3 +1772,84 @@ class TestBuildArgParser:
         assert args.manifest == 'm.json'
         assert args.page_size == 500
         assert args.config == 'c.yaml'
+
+
+# ===========================================================================
+# Tests: build_memory_service (step-23/24)
+# ===========================================================================
+
+class TestBuildMemoryService:
+    """Tests for build_memory_service(args, config) -- task 2415 step-23/24.
+
+    The dry-run/census path only needs a driver/client-wired
+    GraphitiBackend for reads; building a full MemoryService -- whose
+    initialize() runs the W6-ε startup identity scan (a dup-uuid-edge
+    REPAIR, i.e. a write) and the index-build loop -- mutates on the
+    default `python migrate_cross_graph_leak.py > manifest.json` invocation
+    and contends with a running service. --apply legitimately mutates, so
+    it keeps the full MemoryService, unskipped.
+
+    GraphitiBackend/MemoryService are lazily imported inside
+    build_memory_service (mirroring main()'s existing _run_live lazy-import
+    idiom), so the classes are monkeypatched at their ORIGIN modules
+    (not on `_mod`, which never binds these names at module scope).
+    """
+
+    @pytest.mark.asyncio
+    async def test_dry_run_builds_lean_graphiti_backend_with_skip_maintenance(
+        self, monkeypatch,
+    ):
+        """Dry-run (args.apply=False): construct a lean GraphitiBackend,
+        await its initialize(skip_maintenance=True), and never construct a
+        full MemoryService. The returned object exposes .graphiti (the
+        backend) and an awaitable close()."""
+        backend_instance = AsyncMock()
+        backend_cls = MagicMock(return_value=backend_instance)
+        memory_service_cls = MagicMock()
+        monkeypatch.setattr(
+            'fused_memory.backends.graphiti_client.GraphitiBackend', backend_cls,
+        )
+        monkeypatch.setattr(
+            'fused_memory.services.memory_service.MemoryService', memory_service_cls,
+        )
+
+        args = _args(apply=False)
+        config = MagicMock()
+
+        result = await _mod.build_memory_service(args, config)
+
+        backend_cls.assert_called_once_with(config)
+        backend_instance.initialize.assert_awaited_once_with(skip_maintenance=True)
+        memory_service_cls.assert_not_called()
+        assert result.graphiti is backend_instance
+
+        await result.close()
+        backend_instance.close.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_apply_builds_full_memory_service_without_skip(
+        self, monkeypatch,
+    ):
+        """--apply (args.apply=True): construct the full MemoryService and
+        await its initialize() with no skip_maintenance override (the real
+        MemoryService.initialize() takes no arguments at all), never
+        constructing a lean GraphitiBackend directly."""
+        memory_instance = AsyncMock()
+        memory_service_cls = MagicMock(return_value=memory_instance)
+        backend_cls = MagicMock()
+        monkeypatch.setattr(
+            'fused_memory.backends.graphiti_client.GraphitiBackend', backend_cls,
+        )
+        monkeypatch.setattr(
+            'fused_memory.services.memory_service.MemoryService', memory_service_cls,
+        )
+
+        args = _args(apply=True, manifest='m.json')
+        config = MagicMock()
+
+        result = await _mod.build_memory_service(args, config)
+
+        memory_service_cls.assert_called_once_with(config)
+        memory_instance.initialize.assert_awaited_once_with()
+        backend_cls.assert_not_called()
+        assert result is memory_instance
