@@ -800,6 +800,23 @@ class TaskInterceptor:
             # `done`, since a fresh done transition never reaches the normal
             # done-provenance persist (2b, below) when old_status == status.
             old_status = _extract_status(before)
+
+            # W5-ζ ReconWritePolicy: only consulted for recon-stage callers.
+            # Reuses old_status (already read above under the lock) rather
+            # than issuing a second get_task.
+            if isinstance(agent_id, str) and agent_id.startswith('recon-stage-'):
+                verdict = recon_write_policy.check(
+                    'set_task_status',
+                    task_id=task_id,
+                    project_root=project_root,
+                    agent_id=agent_id,
+                    target_status=status,
+                    live_status=old_status,
+                    snapshot_token=None,
+                )
+                if verdict.is_rejection:
+                    return verdict.to_error_dict()
+
             if status == old_status:
                 if status == 'done' and done_provenance:
                     return await _repair_done_provenance_same_status(
