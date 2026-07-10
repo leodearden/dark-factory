@@ -9,7 +9,27 @@ role/project must degrade gracefully, never raise.
 
 from __future__ import annotations
 
+from datetime import UTC, datetime
+
 from orchestrator import session_registry as sr
+
+
+def _make_record(**overrides):
+    """Build a SessionRecord with sane defaults; overrides tweak individual fields.
+
+    Mirrors test_registry_reader.py's _make_record convention.
+    """
+    fields: dict = {
+        'session_slug': 'unblock-df-2085-4242',
+        'status': sr.Status.RUNNING,
+        'title': 'unblock:df#2085 slug',
+        'role': 'unblock',
+        'project': 'df',
+        'task_id': '2085',
+        'start_ts': '2026-07-07T00:00:00+00:00',
+    }
+    fields.update(overrides)
+    return sr.SessionRecord(**fields)
 
 
 class TestStateGlyph:
@@ -44,3 +64,74 @@ class TestStateGlyph:
         from cockpit.panes.session_table import state_glyph
 
         assert state_glyph('some-foreign-status') == '?'
+
+
+class TestFormatTitle:
+    def test_role_project_and_task_id(self):
+        from cockpit.panes.session_table import format_title
+
+        record = _make_record(role='unblock', project='df', task_id='2085')
+
+        assert format_title(record) == 'unblock:df#2085'
+
+    def test_no_task_id_omits_hash_segment(self):
+        from cockpit.panes.session_table import format_title
+
+        record = _make_record(role='unblock', project='df', task_id=None)
+
+        assert format_title(record) == 'unblock:df'
+
+    def test_empty_role_and_project_do_not_raise(self):
+        from cockpit.panes.session_table import format_title
+
+        record = _make_record(role='', project='', task_id=None)
+
+        assert isinstance(format_title(record), str)
+
+
+class TestFormatAge:
+    def test_seconds(self):
+        from cockpit.panes.session_table import format_age
+
+        start_ts = datetime(2026, 7, 7, 12, 0, 0, tzinfo=UTC).isoformat()
+        now = datetime(2026, 7, 7, 12, 0, 45, tzinfo=UTC)
+
+        assert format_age(start_ts, now) == '45s'
+
+    def test_minutes(self):
+        from cockpit.panes.session_table import format_age
+
+        start_ts = datetime(2026, 7, 7, 12, 0, 0, tzinfo=UTC).isoformat()
+        now = datetime(2026, 7, 7, 12, 5, 0, tzinfo=UTC)
+
+        assert format_age(start_ts, now) == '5m'
+
+    def test_hours(self):
+        from cockpit.panes.session_table import format_age
+
+        start_ts = datetime(2026, 7, 7, 12, 0, 0, tzinfo=UTC).isoformat()
+        now = datetime(2026, 7, 7, 15, 0, 0, tzinfo=UTC)
+
+        assert format_age(start_ts, now) == '3h'
+
+    def test_days(self):
+        from cockpit.panes.session_table import format_age
+
+        start_ts = datetime(2026, 7, 7, 12, 0, 0, tzinfo=UTC).isoformat()
+        now = datetime(2026, 7, 9, 12, 0, 0, tzinfo=UTC)
+
+        assert format_age(start_ts, now) == '2d'
+
+    def test_empty_start_ts_is_placeholder(self):
+        from cockpit.panes.session_table import format_age
+
+        now = datetime(2026, 7, 7, 12, 0, 0, tzinfo=UTC)
+
+        assert format_age('', now) == '?'
+
+    def test_unparseable_start_ts_is_placeholder(self):
+        from cockpit.panes.session_table import format_age
+
+        now = datetime(2026, 7, 7, 12, 0, 0, tzinfo=UTC)
+
+        assert format_age('not-a-timestamp', now) == '?'
