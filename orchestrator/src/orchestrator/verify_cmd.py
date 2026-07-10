@@ -229,3 +229,44 @@ def _parse_single_segment(raw: str, tokens: list[str]) -> VerifyCmd:
         wrappers=wrappers,
         raw=None,
     )
+
+
+def render(cmd: VerifyCmd) -> str:
+    """Render a VerifyCmd back into a shell command string.
+
+    The single shell-string producer — the inverse of ``parse_config_command``
+    for well-formed, non-OPAQUE, non-chained commands (P2).
+
+    OPAQUE commands, and RECOGNISED-BUT-UNSTRUCTURABLE multi-segment chains
+    (``cmd.raw is not None`` in both cases), return ``raw`` verbatim: there is
+    no structured state to reassemble, and for a chain any mutation happens
+    as a localised in-place rewrite of ``raw`` itself (``cargo_scope`` /
+    ``serial_pytest``), not through the fields rendered below.
+
+    Otherwise emits, in canonical order: a leading ``cd <cwd_rel> &&`` (if
+    set), a ``uv run [--project <uv_project>]`` wrapper (if uv-wrapped), the
+    ``npx`` sentinel (if present in ``wrappers``), the tool's canonical head,
+    then ``base_flags`` and ``targets`` — each value token ``shlex.quote``d
+    for shell safety. ``strip_cwd``/``reproject`` normalise both
+    ``--directory``/``--project`` and a leading ``cd`` into ``cwd_rel``/
+    ``uv_project``; rendering ``cwd_rel`` as a leading ``cd`` unconditionally
+    is a documented normalisation (argv-equivalent, not always byte-identical
+    to a ``--directory``-form input).
+    """
+    if cmd.raw is not None:
+        return cmd.raw
+
+    segments: list[str] = []
+    if cmd.cwd_rel is not None:
+        segments.append(f'cd {shlex.quote(cmd.cwd_rel)} &&')
+    if cmd.uv_project is not None:
+        if cmd.uv_project:
+            segments.append(f'uv run --project {shlex.quote(cmd.uv_project)}')
+        else:
+            segments.append('uv run')
+    if 'npx' in cmd.wrappers:
+        segments.append('npx')
+    segments.append(_TOOL_HEAD[cmd.tool])
+    segments.extend(shlex.quote(flag) for flag in cmd.base_flags)
+    segments.extend(shlex.quote(target) for target in cmd.targets)
+    return ' '.join(segments)
