@@ -29,10 +29,12 @@ prerequisite-2's read-only confirm.
 """
 from __future__ import annotations
 
+import importlib.util
 import json
 import os
 import re
 import subprocess
+from datetime import datetime
 from pathlib import Path
 
 import pytest
@@ -627,3 +629,54 @@ def test_unknown_argument_is_rejected_without_restarting(tmp_path):
         f"Expected no systemctl invocation when an unknown arg is rejected; "
         f"got calls={_systemctl_calls(worktree_base)!r}"
     )
+
+
+# ---------------------------------------------------------------------------
+# step-13: RED -- schema-coherence (drift guard vs LaneRecord)
+# ---------------------------------------------------------------------------
+
+def test_written_record_matches_lane_record_schema_exactly(tmp_path):
+    """A written record's JSON keys must be EXACTLY LANE_RECORD_FIELDS (no
+    extra/missing keys), `state` must be one of the lowercase LaneState
+    values, and `updated_at` must parse as an ISO-8601 timestamp -- guards
+    the adopt emitter's hand-encoded schema against drifting away from
+    orchestrator/src/orchestrator/lane_lifecycle.py's LaneRecord (the
+    embedded python3 heredoc re-encodes this schema rather than importing
+    it -- see the plan's design decision -- so this test is the drift
+    guard). When orchestrator IS importable (not the case under this
+    suite's `--project shared` run, but defensive for any environment
+    where it is), the record is additionally round-tripped through
+    LaneRecord.from_json/to_dict for an exact match."""
+    worktree_base = _build_worktree_base(tmp_path, [
+        {"name": "_lane-7", "branch": "task/1234", "plan": {"title": "T"}},
+    ])
+
+    result = _run_script(worktree_base)
+    assert result.returncode == 0, (
+        f"Expected apply to exit 0; got {result.returncode}\n"
+        f"stdout={result.stdout!r} stderr={result.stderr!r}"
+    )
+
+    raw = _lane_state_path(worktree_base, "_lane-7").read_text()
+    record = json.loads(raw)
+
+    assert set(record.keys()) == LANE_RECORD_FIELDS, (
+        f"Expected exactly {sorted(LANE_RECORD_FIELDS)!r} keys; "
+        f"got {sorted(record.keys())!r}"
+    )
+    assert record["state"] in LANE_STATE_VALUES, (
+        f"Expected state to be one of {sorted(LANE_STATE_VALUES)!r}; "
+        f"got {record['state']!r}"
+    )
+    # Must parse as an ISO-8601 timestamp (raises ValueError otherwise).
+    datetime.fromisoformat(record["updated_at"])
+
+    if importlib.util.find_spec("orchestrator.lane_lifecycle") is not None:
+        from orchestrator.lane_lifecycle import LaneRecord
+
+        round_tripped = LaneRecord.from_json(raw)
+        assert round_tripped.to_dict() == record, (
+            f"Expected a lossless LaneRecord round-trip; "
+            f"round_tripped.to_dict()={round_tripped.to_dict()!r} "
+            f"record={record!r}"
+        )
