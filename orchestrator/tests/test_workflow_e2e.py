@@ -358,18 +358,29 @@ class AgentStub:
         return 'unknown'
 
     async def _architect(self, cwd: Path) -> AgentResult:
-        """Write plan.json to .task/ directory."""
-        task_dir = cwd / '.task'
-        task_dir.mkdir(parents=True, exist_ok=True)
+        """Write plan.json to the task's meta_root.
+
+        The workflow constructs its TaskArtifacts with the relocated
+        ``.task-meta`` sibling root (task 2258 W11-ε1) and reads plan.json from
+        there — NOT the legacy ``<worktree>/.task``. The real agent-side
+        plan-tools MCP writes to the same root via ``--meta-root``; this stub
+        must mirror that or the workflow sees "no plan.json produced".
+        """
+        artifacts = TaskArtifacts(
+            cwd, TaskArtifacts.meta_root_for(cwd.parent, cwd.name)
+        )
+        artifacts.root.mkdir(parents=True, exist_ok=True)
         plan = dict(PLAN)
         plan['_schema_version'] = 1
-        (task_dir / 'plan.json').write_text(json.dumps(plan, indent=2) + '\n')
+        (artifacts.root / 'plan.json').write_text(json.dumps(plan, indent=2) + '\n')
         return AgentResult(success=True, output='Plan created', cost_usd=0.50)
 
     async def _implementer(self, cwd: Path) -> AgentResult:
         """Create code files and update plan.json step statuses."""
         self._impl_iteration += 1
-        artifacts = TaskArtifacts(cwd)
+        artifacts = TaskArtifacts(
+            cwd, TaskArtifacts.meta_root_for(cwd.parent, cwd.name)
+        )
         pending = artifacts.get_pending_steps()
 
         if not pending:
@@ -1111,7 +1122,7 @@ class TestReviewLoop:
             async def _architect(self, cwd: Path) -> AgentResult:
                 """On re-plan, add a new step to address the review feedback."""
                 nonlocal review_round
-                task_dir = cwd / '.task'
+                task_dir = TaskArtifacts(cwd).root
                 plan_path = task_dir / 'plan.json'
 
                 if plan_path.exists():
@@ -1351,7 +1362,7 @@ class TestBlastRadiusExpansion:
                 plan = dict(PLAN)
                 plan['files'] = ['lib.py', 'test_lib.py']  # wider than assigned ['lib']
                 plan['_schema_version'] = 1
-                task_dir = cwd / '.task'
+                task_dir = TaskArtifacts(cwd).root
                 task_dir.mkdir(parents=True, exist_ok=True)
                 (task_dir / 'plan.json').write_text(json.dumps(plan, indent=2) + '\n')
                 return AgentResult(success=True, output='Plan created', cost_usd=0.50)
@@ -1383,7 +1394,7 @@ class TestBlastRadiusExpansion:
                 plan = dict(PLAN)
                 plan['files'] = ['lib.py', 'locked_module.py']
                 plan['_schema_version'] = 1
-                task_dir = cwd / '.task'
+                task_dir = TaskArtifacts(cwd).root
                 task_dir.mkdir(parents=True, exist_ok=True)
                 (task_dir / 'plan.json').write_text(json.dumps(plan, indent=2) + '\n')
                 return AgentResult(success=True, output='Plan created', cost_usd=0.50)
@@ -2148,7 +2159,7 @@ class TestCorruptedIterationLogEscalation:
                 result = await super()._architect(cwd)
                 # Inject a corrupted iteration log line so the orchestrator
                 # finds it when it reads the log before the first implementer call
-                log_path = cwd / '.task' / 'iterations.jsonl'
+                log_path = TaskArtifacts(cwd).root / 'iterations.jsonl'
                 log_path.write_text(r'{"bad\!escape": true}' + '\n')
                 return result
 
@@ -2470,7 +2481,7 @@ class TestGhostLoopGuard:
         # 1. Create worktree and simulate prior implementation
         wt_info = await git_ops.create_worktree(task_assignment.task_id)
         wt = wt_info.path
-        task_dir = wt / '.task'
+        task_dir = TaskArtifacts(wt).root
         task_dir.mkdir(parents=True, exist_ok=True)
         (task_dir / 'plan.json').write_text(json.dumps(PLAN, indent=2) + '\n')
 
@@ -2698,7 +2709,7 @@ class StringPrereqsArchitectStub(AgentStub):
     """AgentStub subclass that writes a plan with plain-string prerequisites."""
 
     async def _architect(self, cwd: Path) -> AgentResult:
-        task_dir = cwd / '.task'
+        task_dir = TaskArtifacts(cwd).root
         task_dir.mkdir(parents=True, exist_ok=True)
         bad_plan = {
             'task_id': '42',
@@ -2796,7 +2807,7 @@ class TestPlanFinalizeMarker:
 
         class CappedAfterFinalizeStub(AgentStub):
             async def _architect(self, cwd: Path) -> AgentResult:
-                task_dir = cwd / '.task'
+                task_dir = TaskArtifacts(cwd).root
                 task_dir.mkdir(parents=True, exist_ok=True)
                 plan = dict(PLAN)  # PLAN carries _finalized_at
                 plan['_schema_version'] = 1
@@ -2840,7 +2851,7 @@ class TestPlanFinalizeMarker:
 
         class CappedBeforeFinalizeStub(AgentStub):
             async def _architect(self, cwd: Path) -> AgentResult:
-                task_dir = cwd / '.task'
+                task_dir = TaskArtifacts(cwd).root
                 task_dir.mkdir(parents=True, exist_ok=True)
                 plan = {k: v for k, v in PLAN.items() if k != '_finalized_at'}
                 plan['_schema_version'] = 1
@@ -2883,7 +2894,7 @@ class TestPlanFinalizeMarker:
 
         class SuccessNoFinalizeStub(AgentStub):
             async def _architect(self, cwd: Path) -> AgentResult:
-                task_dir = cwd / '.task'
+                task_dir = TaskArtifacts(cwd).root
                 task_dir.mkdir(parents=True, exist_ok=True)
                 plan = {k: v for k, v in PLAN.items() if k != '_finalized_at'}
                 plan['_schema_version'] = 1
@@ -3755,7 +3766,7 @@ class TestRecoverIfAlreadyMerged:
         # 1. Create worktree and write an implementer iteration entry
         wt_info = await git_ops.create_worktree(task_assignment.task_id)
         wt = wt_info.path
-        task_dir = wt / '.task'
+        task_dir = TaskArtifacts(wt).root
         task_dir.mkdir(parents=True, exist_ok=True)
 
         # 1a. Capture base_commit BEFORE making the implementation commit and
@@ -4441,7 +4452,7 @@ class TestRecoverIfAlreadyMerged:
         # 1. Create worktree, stamp implementer entry, commit + merge to main
         wt_info = await git_ops.create_worktree(task_assignment.task_id)
         wt = wt_info.path
-        task_dir = wt / '.task'
+        task_dir = TaskArtifacts(wt).root
         task_dir.mkdir(parents=True, exist_ok=True)
 
         # Capture base_commit BEFORE the implementation commit and stamp metadata.json
@@ -4570,7 +4581,7 @@ class TestRunPrePlanRecovery:
         # 1. Create worktree, stamp implementer entry, commit + merge to main
         wt_info = await git_ops.create_worktree(task_assignment.task_id)
         wt = wt_info.path
-        task_dir = wt / '.task'
+        task_dir = TaskArtifacts(wt).root
         task_dir.mkdir(parents=True, exist_ok=True)
         (task_dir / 'plan.json').write_text(json.dumps(PLAN, indent=2) + '\n')
         (task_dir / 'iterations.jsonl').write_text(
