@@ -106,6 +106,7 @@ from pathlib import Path
 from typing import Any
 
 from fused_memory.maintenance.cross_graph_move import (
+    SubgraphEdgeResult,
     create_moved_node,
     delete_source_node,
     recreate_subgraph_relationships,
@@ -729,10 +730,11 @@ async def run(args: Any, memory_service: Any) -> dict:
     # unaffected, and post-verify below still runs.
     phase_b_specs = [spec for spec in move_specs if spec['uuid'] not in create_failed]
     phase_b_specs += merge_specs
+    edge_result = SubgraphEdgeResult()
     phase_b_error: Exception | None = None
     if phase_b_specs:
         try:
-            await recreate_subgraph_relationships(graphiti, phase_b_specs)
+            edge_result = await recreate_subgraph_relationships(graphiti, phase_b_specs)
         except Exception as exc:
             phase_b_error = exc
 
@@ -815,16 +817,33 @@ async def run(args: Any, memory_service: Any) -> dict:
     matched = after_counts == expected_residual
     has_unresolved = bool(manifest.get('unresolved_uuids'))
     has_blocked = any(r['blocked'] for r in apply_results)
+    # A SubgraphEdgeResult.edges_skipped/mentions_skipped > 0 means Phase B
+    # found an edge/mention whose other endpoint was genuinely absent from
+    # the resolved target (never recreated) -- the same silent-topology-loss
+    # signal the old per-node MoveResult.edges_skipped/mentions_skipped
+    # surfaced via _move_result_entry, now read off the WHOLE batch's single
+    # SubgraphEdgeResult instead of one node's own result. Folded into
+    # exit_code the same way has_unresolved/has_blocked are: it forces a
+    # non-zero, blocking exit even when the post-verify count re-census
+    # otherwise reconciles (a lost edge leaves no foreign-node residual of
+    # its own to be caught by the count comparison above).
+    has_edge_loss = bool(edge_result.edges_skipped or edge_result.mentions_skipped)
 
     report = dict(manifest)
     report['dry_run'] = False
     report['apply_results'] = apply_results
+    report['edges_recreated'] = edge_result.edges_recreated
+    report['edges_skipped'] = edge_result.edges_skipped
+    report['mentions_recreated'] = edge_result.mentions_recreated
+    report['mentions_skipped'] = edge_result.mentions_skipped
     report['post_verify'] = {
         'matched': matched,
         'expected': expected_residual,
         'actual': after_counts,
     }
-    report['exit_code'] = 0 if (matched and not has_unresolved and not has_blocked) else 1
+    report['exit_code'] = (
+        0 if (matched and not has_unresolved and not has_blocked and not has_edge_loss) else 1
+    )
     return report
 
 
