@@ -358,6 +358,80 @@ class TestInitializeRunsIdentityScan:
 
 
 # ---------------------------------------------------------------------------
+# step-21/step-22: GraphitiBackend.initialize(skip_maintenance=...) — task 2415
+# ---------------------------------------------------------------------------
+
+class TestInitializeSkipMaintenance:
+    """GraphitiBackend.initialize(skip_maintenance=...) — task 2415.
+
+    The ζ dry-run/census (migrate_cross_graph_leak.py) only needs a
+    driver/client-wired backend for reads; the two startup maintenance
+    blocks (the index-build loop and the W6-ε startup identity scan, which
+    REPAIRS dup-uuid edges — a write) are needless mutation on a read-only
+    path and contend with a running service. skip_maintenance=True guards
+    BOTH blocks; the default (False) must keep running both.
+    """
+
+    @pytest.mark.asyncio
+    async def test_skip_maintenance_true_skips_both_blocks(
+        self, mock_config, monkeypatch,
+    ):
+        """skip_maintenance=True must skip BOTH the index-build loop and
+        _run_startup_identity_scan, while driver/client wiring still
+        completes."""
+        import fused_memory.backends.graphiti_client as graphiti_client_module
+
+        mock_config.llm.providers.openai.api_key = ''  # skip the OpenAI preflight/client
+        monkeypatch.setattr(
+            graphiti_client_module, '_MultiTenantFalkorDriver', MagicMock(),
+        )
+        monkeypatch.setattr(
+            graphiti_client_module, 'Graphiti', MagicMock(return_value=AsyncMock()),
+        )
+
+        backend = GraphitiBackend(mock_config)
+        backend._ensure_indices = AsyncMock()
+        backend._run_startup_identity_scan = AsyncMock(return_value={})
+
+        await backend.initialize(skip_maintenance=True)
+
+        backend._ensure_indices.assert_not_awaited()
+        backend._run_startup_identity_scan.assert_not_awaited()
+        assert backend.client is not None
+        assert backend._driver is not None
+
+    @pytest.mark.asyncio
+    async def test_skip_maintenance_false_default_still_awaits_both(
+        self, mock_config, monkeypatch,
+    ):
+        """Regression: the default initialize() (skip_maintenance=False)
+        must still await both maintenance blocks — the flag is opt-in and
+        must never silently drop maintenance on the normal service startup
+        path."""
+        import fused_memory.backends.graphiti_client as graphiti_client_module
+
+        mock_config.llm.providers.openai.api_key = ''
+        monkeypatch.setattr(
+            graphiti_client_module, '_MultiTenantFalkorDriver', MagicMock(),
+        )
+        monkeypatch.setattr(
+            graphiti_client_module, 'Graphiti', MagicMock(return_value=AsyncMock()),
+        )
+
+        backend = GraphitiBackend(mock_config)
+        falkor_client_stub = MagicMock()
+        falkor_client_stub.list_graphs = AsyncMock(return_value=['g1'])
+        backend._require_falkor_client = MagicMock(return_value=falkor_client_stub)
+        backend._ensure_indices = AsyncMock()
+        backend._run_startup_identity_scan = AsyncMock(return_value={})
+
+        await backend.initialize()
+
+        backend._ensure_indices.assert_awaited_once_with('g1')
+        backend._run_startup_identity_scan.assert_awaited_once()
+
+
+# ---------------------------------------------------------------------------
 # step-9: live-FalkorDB semantic pins — authoritative B5+B6 signal
 # ---------------------------------------------------------------------------
 #
