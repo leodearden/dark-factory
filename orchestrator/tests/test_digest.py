@@ -424,6 +424,34 @@ class TestMergeDispositionCounts:
         assert counts == {}, f"Expected {{}} for missing DB; got {counts}"
         assert not db_path.exists(), "merge_disposition_counts must not create a stub DB file"
 
+    def test_schema_missing_returns_empty_dict(
+        self, tmp_path: Path, caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """DB file exists but has no 'events' table — returns {} (fail-open) with WARNING.
+
+        This is the corrupt/unreadable-DB branch of the fail-open contract
+        (digest.py's `_query_events_ro` except-clause, WARNING path) — the one
+        most worth asserting since the whole point of fail-open stats
+        collection is that it never raises even when the DB is present but
+        unreadable in the expected shape. Mirrors
+        TestCountDoneInWindow.test_schema_missing_returns_zero.
+        """
+        db_path = tmp_path / 'schema-less.db'
+        # Create a real but schema-less SQLite file (no EventStore setup).
+        conn = sqlite3.connect(str(db_path))
+        conn.close()
+        assert db_path.exists(), "pre-condition: file must exist"
+
+        with caplog.at_level(logging.WARNING, logger='orchestrator.digest'):
+            counts = digest.merge_disposition_counts(
+                db_path,
+                '2026-05-10T00:00:00+00:00',
+                '2026-05-10T23:59:59+00:00',
+            )
+        assert counts == {}, f"Expected {{}} for schema-less DB; got {counts}"
+        warnings = [r for r in caplog.records if r.levelno >= logging.WARNING and r.name == 'orchestrator.digest']
+        assert len(warnings) == 1, f"Schema-missing must WARNING exactly once; got {len(warnings)}: {[r.message for r in warnings]}"
+
 
 # ---------------------------------------------------------------------------
 # Fixtures for async CostStore tests
