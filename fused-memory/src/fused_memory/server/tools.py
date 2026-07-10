@@ -14,7 +14,6 @@ from typing import TYPE_CHECKING, Any
 import aiosqlite
 from mcp.server.fastmcp import Context, FastMCP
 from shared.async_sqlite_base import CheckpointResult, apply_full_durability_pragmas, connect_daemon
-from shared.task_metadata import parse_metadata
 
 from fused_memory.backends.graphiti_client import NodeNotFoundError
 from fused_memory.mcp_tools.scheduler_state import (
@@ -66,14 +65,6 @@ if TYPE_CHECKING:
     from fused_memory.services.write_journal import WriteJournal
 
 logger = logging.getLogger(__name__)
-
-# SchemaWarning codes (shared.task_metadata) that mean the WHOLE metadata
-# value was discarded — parse_metadata could not resolve any dict at all.
-# Only these are loud from the done-provenance rejection check below;
-# 'unknown_key' / 'invalid_field' / 'invalid_submodel' etc. are expected on
-# legitimate metadata shapes and belong to the write boundary (W3-β's
-# _emit_schema_warning census), not this read-path guard.
-_METADATA_DISCARD_CODES = frozenset({'unparseable_json', 'not_an_object'})
 
 # ---------------------------------------------------------------------------
 # Scheduler-override constants
@@ -2520,90 +2511,6 @@ def create_mcp_server(
             }
         return None
 
-    def _reject_status_in_update_task(
-        task_id: str,
-        status: str | None,
-    ) -> dict | None:
-        """Return a rejection dict if ``update_task`` was called with ``status``.
-
-        ``set_task_status`` is the only sanctioned writer for task status — it
-        enforces the terminal-exit gate, the phantom-done gate, and the
-        done-provenance gate. ``update_task(status=…)`` slipped through all
-        three and was used to mark reify tasks done with the implementing
-        commit only on the task branch (2026-05-08 forensics: 9 historical
-        ``done`` writes via this path in 36 h). Lock the door.
-        """
-        if status is None:
-            return None
-        return {
-            'success': False,
-            'error': 'status_via_update_task',
-            'task_id': task_id,
-            'status': status,
-            'hint': (
-                'update_task is metadata-only. Use '
-                'set_task_status(status=…, done_provenance={...} when '
-                'status="done") to change status — it enforces the '
-                'terminal-exit, phantom-done, and done-provenance gates.'
-            ),
-        }
-
-    def _reject_done_provenance_in_metadata(
-        metadata: str | dict | None,
-    ) -> dict | None:
-        """Return a ValidationError dict if ``metadata`` carries done_provenance.
-
-        ``set_task_status`` is the only sanctioned writer for
-        ``metadata.done_provenance`` — it validates the schema (kind, commit,
-        note) and runs an ancestor backstop on merge SHAs. Allowing
-        ``update_task`` to write the field bypasses that gate, which is how
-        a workflow agent stamped a self-contradicting "done" record on
-        2026-04-27. Reject the call before it reaches the interceptor.
-
-        The ``str`` branch delegates its malformed-input policy to
-        :func:`shared.task_metadata.parse_metadata` (``direction='read'``)
-        and emits a ``task_metadata.schema_warning`` WARNING when *metadata*
-        cannot be resolved to a JSON object at all (unparseable JSON /
-        non-object) — I4: this replaces a silent discard. The
-        done_provenance gate and the dict-passthrough branch are unchanged.
-        """
-        parsed: dict | None = None
-        if isinstance(metadata, dict):
-            parsed = metadata
-        elif isinstance(metadata, str) and not metadata:
-            # Empty string is benign-absent, not a discard — mirrors the
-            # pre-collapse `isinstance(raw, str) and raw` guard.
-            parsed = None
-        elif isinstance(metadata, str):
-            _, warnings = parse_metadata(metadata, direction='read')
-            discard = [w for w in warnings if w.code in _METADATA_DISCARD_CODES]
-            if discard:
-                reason = '; '.join(w.message for w in discard) or 'unrecognised shape'
-                logger.warning(
-                    'task_metadata.schema_warning source=%s error=%s (type=%s); '
-                    'metadata discarded',
-                    '_reject_done_provenance_in_metadata',
-                    reason,
-                    type(metadata).__name__,
-                )
-                return None
-            # parse_metadata already confirmed this parses to a JSON object —
-            # reparse independently for the raw dict (never model_dump(), so
-            # this stays consistent with the other collapsed parsers).
-            loaded = json.loads(metadata)
-            parsed = loaded if isinstance(loaded, dict) else None
-        if parsed is not None and 'done_provenance' in parsed:
-            return {
-                'error': (
-                    'update_task cannot write metadata.done_provenance. Use '
-                    'set_task_status(status="done", done_provenance={...}) '
-                    'instead — it validates the schema and runs an ancestor '
-                    'backstop on the merge sha.'
-                ),
-                'error_type': 'ValidationError',
-            }
-        return None
-
     @mcp.tool()
     @mcp_tool_errors()
     async def get_tasks(
@@ -3478,9 +3385,11 @@ def create_mcp_server(
             dependencies: Replacement list of dependency task ids (top-level only)
             agent_id: Which agent is writing (optional, auto-derived from MCP
                 context). Resolved here for uniform caller-identity attribution
-                across the task write path (task 2175/rho1b); MCP update_task
-                rejects status= writes, so there is no transition to forward
-                it to on the interceptor.
+                across the task write path (task 2175/rho1b); status= writes
+                are rejected by the SqliteTaskBackend write-authority floor
+                (task C1), surfaced through the interceptor as a rejection
+                dict (task C2), so there is no transition to forward it to
+                on the interceptor.
         """
         agent_id, _ = _resolve_identity(agent_id, None, ctx)
         if err := _reject_if_ticket_id('id', id):
@@ -3489,10 +3398,6 @@ def create_mcp_server(
         if isinstance(_normalized, dict):
             return _normalized
         project_root = _normalized
-        if err := _reject_status_in_update_task(id, status):
-            return err
-        if err := _reject_done_provenance_in_metadata(metadata):
-            return err
         _dirs = directory_locks(extract_files(metadata))
         if _dirs:
             return lock_charter_error(_dirs)

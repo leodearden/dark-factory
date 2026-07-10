@@ -2970,26 +2970,37 @@ async def test_set_task_status_done_to_done_repair_persists_against_real_backend
 
 
 @pytest.mark.asyncio
-async def test_update_task_rejects_metadata_done_provenance(taskmaster, reconciler, event_buffer):
+async def test_update_task_rejects_metadata_done_provenance(event_buffer, tmp_path):
     """update_task must NOT be a side door for writing done_provenance.
 
     The 2026-04-27 incident had a workflow agent stamp self-contradicting
     provenance via update_task; the role allowlist is layer 2, this schema
-    block is layer 1.
+    block is layer 1. Enforcement now lives at the SqliteTaskBackend
+    write-authority floor (task C1); a bare AsyncMock backend can't enforce
+    it, so this drives a live backend + interceptor stack and asserts the
+    canonical rejection dict (task C2's catch+convert). No git repo /
+    created task needed — the floor raises before the row SELECT.
     """
-    interceptor = TaskInterceptor(taskmaster, reconciler, event_buffer)
+    from fused_memory.backends.sqlite_task_backend import SqliteTaskBackend
+    from fused_memory.backends.task_backend_errors import done_provenance_via_update_task_error
+    from fused_memory.config.schema import TaskmasterConfig
 
-    result = await interceptor.update_task(
-        '1',
-        '/project',
-        metadata=json.dumps(
-            {'done_provenance': {'kind': 'merged', 'commit': 'abc123'}},
-        ),
-    )
+    backend = SqliteTaskBackend(TaskmasterConfig(project_root=str(tmp_path)))
+    await backend.start()
+    try:
+        interceptor = TaskInterceptor(backend, None, event_buffer)
 
-    assert result['success'] is False
-    assert result['error'] == 'done_provenance_via_update_task'
-    taskmaster.update_task.assert_not_called()
+        result = await interceptor.update_task(
+            '1',
+            str(tmp_path),
+            metadata=json.dumps(
+                {'done_provenance': {'kind': 'merged', 'commit': 'abc123'}},
+            ),
+        )
+
+        assert result == done_provenance_via_update_task_error('1')
+    finally:
+        await backend.close()
 
 
 @pytest.mark.asyncio
@@ -6508,26 +6519,38 @@ async def test_journaled_write_logs_failure_row(
 @pytest.mark.asyncio
 @pytest.mark.parametrize('bad_status', ['done', 'pending', 'cancelled', 'in-progress', 'blocked'])
 async def test_update_task_rejects_status_kwarg(
-    interceptor,
-    taskmaster,
+    event_buffer,
+    tmp_path,
     bad_status,
 ):
     """The interceptor's update_task path also rejects status=…
 
-    Defence-in-depth alongside the same gate at the MCP tool surface.
     Closes the bypass route used to mark reify tasks done without going
     through the terminal-exit, phantom-done, and done-provenance gates.
+    Enforcement now lives at the SqliteTaskBackend write-authority floor
+    (task C1); a bare AsyncMock backend can't enforce it, so this drives a
+    live backend + interceptor stack. Also guards that task C2's
+    catch+convert surfaces the canonical rejection dict rather than letting
+    the typed error propagate.
     """
-    result = await interceptor.update_task(
-        task_id='1',
-        project_root='/project',
-        status=bad_status,
-    )
-    assert isinstance(result, dict)
-    assert result.get('error') == 'status_via_update_task'
-    assert result.get('status') == bad_status
-    assert 'set_task_status' in result.get('hint', '')
-    taskmaster.update_task.assert_not_called()
+    from fused_memory.backends.sqlite_task_backend import SqliteTaskBackend
+    from fused_memory.backends.task_backend_errors import status_via_update_task_error
+    from fused_memory.config.schema import TaskmasterConfig
+
+    backend = SqliteTaskBackend(TaskmasterConfig(project_root=str(tmp_path)))
+    await backend.start()
+    try:
+        interceptor = TaskInterceptor(backend, None, event_buffer)
+
+        result = await interceptor.update_task(
+            task_id='1',
+            project_root=str(tmp_path),
+            status=bad_status,
+        )
+
+        assert result == status_via_update_task_error('1', bad_status)
+    finally:
+        await backend.close()
 
 
 @pytest.mark.asyncio
@@ -6643,18 +6666,75 @@ async def test_set_task_status_done_with_provenance_preserves_metadata(
     assert persisted['done_provenance']['commit'] == sha
 
 
+@pytest.mark.asyncio
+async def test_set_task_status_done_provenance_persists_against_real_backend(
+    tmp_path, event_buffer,
+):
+    """End-to-end: marking done with done_provenance survives the real
+    SqliteTaskBackend write-authority floor (task C1).
+
+    A bare AsyncMock backend cannot enforce the floor added to
+    ``SqliteTaskBackend.update_task``, so
+    ``test_set_task_status_done_with_provenance_preserves_metadata`` above
+    would stay green even if the Part-1 persist path regressed back to
+    calling ``update_task`` directly. This test wraps a real backend so the
+    floor actually fires, proving the done_provenance stamp persists
+    through the privileged ``stamp_audit_metadata`` seam and that sibling
+    metadata keys survive the seam's read-modify-write merge — guarding
+    that task C2's collapse (deleting the update_task guard copies) does
+    not regress the Part-1 persist path.
+    """
+    from fused_memory.backends.sqlite_task_backend import SqliteTaskBackend
+    from fused_memory.config.schema import TaskmasterConfig
+
+    sha = _init_git_repo(tmp_path)
+    # Create the declared file so the phantom-done gate doesn't trip on it.
+    (tmp_path / 'x.py').write_text('# shipped\n')
+    backend = SqliteTaskBackend(TaskmasterConfig(project_root=str(tmp_path)))
+    await backend.start()
+    try:
+        await backend.add_task(
+            project_root=str(tmp_path),
+            title='T',
+            metadata=json.dumps({'files': ['x.py'], 'memory_hints': {'queries': ['hint']}}),
+        )
+
+        interceptor = TaskInterceptor(backend, None, event_buffer)
+        result = await interceptor.set_task_status(
+            '1',
+            'done',
+            str(tmp_path),
+            done_provenance={'kind': 'merged', 'commit': sha},
+        )
+
+        assert 'error' not in result
+
+        md = (await backend.get_task('1', project_root=str(tmp_path)))['metadata']
+        assert md['done_provenance'] == {'kind': 'merged', 'commit': sha}
+        assert md['files'] == ['x.py']
+        assert md['memory_hints'] == {'queries': ['hint']}
+    finally:
+        await backend.close()
+
+
 # ── task-1184: interceptor_write_succeeded helper contract ──
 
 
 class TestInterceptorWriteSucceeded:
     """Unit tests for the module-level ``interceptor_write_succeeded(resp)`` helper.
 
-    The helper centralises the success/failure contract for all three rejection-dict
-    shapes produced by TaskInterceptor gates:
-      • ``_reject_status_in_update_task`` → ``{'success': False, 'error': '<code>', …}``
-      • ``_reject_done_provenance_in_update_metadata`` → same shape
-      • ``BacklogVerdict.to_error_dict()`` → ``{'error': '<msg>', 'error_type': '<code>', …}``
-        (no ``success`` key)
+    The helper centralises the success/failure contract for TaskInterceptor
+    gate rejections. The canonical write-authority rejection shape (status /
+    done_provenance) is now defined once, in
+    ``fused_memory.backends.task_backend_errors``
+    (``status_via_update_task_error`` / ``done_provenance_via_update_task_error``,
+    tasks C1/C2) and reaches the interceptor via
+    ``StatusWriteAuthorityError`` / ``DoneProvenanceWriteAuthorityError
+    .to_error_dict()``. The helper must also keep classifying the generic
+    no-``success``/has-``error`` failure shape (e.g.
+    ``BacklogVerdict.to_error_dict()``, lock-charter rejections) as a
+    failure — it stays a generic dict-shape classifier, not a check against
+    a fixed set of error codes.
     """
 
     def _fn(self):
@@ -6697,6 +6777,26 @@ class TestInterceptorWriteSucceeded:
             'hint': 'use set_task_status',
         }
         assert self._fn()(resp) is False
+
+    def test_reject_status_via_update_task_canonical_source(self):
+        """The actual status_via_update_task_error(...) dict (task_backend_errors.py) → False.
+
+        Ties the classifier to the single canonical source rather than a
+        hand-written literal, guarding the collapse in task C2.
+        """
+        from fused_memory.backends.task_backend_errors import status_via_update_task_error
+
+        assert self._fn()(status_via_update_task_error('7', 'done')) is False
+
+    def test_reject_done_provenance_via_update_task_canonical_source(self):
+        """The actual done_provenance_via_update_task_error(...) dict (task_backend_errors.py) → False.
+
+        Ties the classifier to the single canonical source rather than a
+        hand-written literal, guarding the collapse in task C2.
+        """
+        from fused_memory.backends.task_backend_errors import done_provenance_via_update_task_error
+
+        assert self._fn()(done_provenance_via_update_task_error('7')) is False
 
     def test_backlog_verdict_error_dict(self):
         """BacklogVerdict.to_error_dict() shape → False (no 'success' key, has 'error')."""
