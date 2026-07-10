@@ -17,7 +17,7 @@ import json
 import logging
 from datetime import UTC, datetime
 from types import SimpleNamespace
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, patch
 
 import pytest
 import pytest_asyncio
@@ -842,3 +842,171 @@ class TestWriteCycleSummaryLedgerWrite:
         )
 
         assert result is False
+
+
+class TestWriteCycleSummaryMirrorAndTrim:
+    """write_cycle_summary's best-effort Mem0 mirror (``add_system_record``)
+    and pool-cap trim (``enforce_summary_pool_cap``) — task 2229 W5-λ step-03.
+
+    Both are best-effort: they run whenever a ledger is wired, regardless of
+    whether the authoritative ledger upsert itself succeeded, and neither can
+    change the return value or propagate an exception out of
+    ``write_cycle_summary`` (which reflects only the authoritative ledger
+    write's own outcome).
+    """
+
+    @pytest_asyncio.fixture
+    async def ledger_store(self, tmp_path):
+        s = ReconLedgerStore(tmp_path / 'reconciliation.db')
+        await s.initialize()
+        yield s
+        await s.close()
+
+    def _report(self, **overrides) -> StageReport:
+        defaults = dict(
+            stage=StageId.task_knowledge_sync,
+            started_at=datetime(2026, 7, 10, 11, 0, 0, tzinfo=UTC),
+            completed_at=datetime(2026, 7, 10, 11, 5, 0, tzinfo=UTC),
+            items_flagged=[{'description': 'a'}],
+            stats={},
+            llm_calls=1,
+            tokens_used=10,
+        )
+        defaults.update(overrides)
+        return StageReport(**defaults)
+
+    @pytest.mark.asyncio
+    async def test_mirror_write_called_once_with_expected_shape(self, ledger_store):
+        memory_service = AsyncMock()
+        memory_service.recon_ledger = ledger_store
+        memory_service.add_system_record = AsyncMock(
+            return_value=SimpleNamespace(memory_ids=['m1']),
+        )
+
+        await write_cycle_summary(
+            memory_service,
+            'dark_factory',
+            self._report(),
+            'run-mirror',
+            stage='task_knowledge_sync',
+            recon_pool='stage2_cycle_summary',
+            trim_source='stage2_cycle_summary_trim',
+            cap=2,
+        )
+
+        memory_service.add_system_record.assert_awaited_once()
+        kwargs = memory_service.add_system_record.call_args.kwargs
+        assert kwargs.get('agent_id') == 'recon-stage-task_knowledge_sync'
+        assert kwargs.get('category') == 'observations_and_summaries'
+        assert kwargs.get('causation_id') == 'run-mirror'
+        metadata = kwargs.get('metadata') or {}
+        assert metadata.get('kind') == 'cycle_summary'
+        assert metadata.get('stage') == 'task_knowledge_sync'
+        assert metadata.get('run_id') == 'run-mirror'
+        assert 'recon_pool' not in metadata
+        assert 'run-mirror' in kwargs.get('content', '')
+
+    @pytest.mark.asyncio
+    async def test_pool_trim_invoked_with_recon_pool_trim_source_cap(self, ledger_store):
+        memory_service = AsyncMock()
+        memory_service.recon_ledger = ledger_store
+        memory_service.add_system_record = AsyncMock(
+            return_value=SimpleNamespace(memory_ids=['m1']),
+        )
+
+        with patch(
+            'fused_memory.reconciliation.summary_pool.enforce_summary_pool_cap',
+            AsyncMock(return_value=0),
+        ) as mock_trim:
+            await write_cycle_summary(
+                memory_service,
+                'dark_factory',
+                self._report(),
+                'run-trim',
+                stage='task_knowledge_sync',
+                recon_pool='stage2_cycle_summary',
+                trim_source='stage2_cycle_summary_trim',
+                cap=2,
+            )
+
+        mock_trim.assert_awaited_once()
+        kwargs = mock_trim.call_args.kwargs
+        assert kwargs.get('recon_pool') == 'stage2_cycle_summary'
+        assert kwargs.get('trim_source') == 'stage2_cycle_summary_trim'
+        assert kwargs.get('cap') == 2
+
+    @pytest.mark.asyncio
+    async def test_mirror_failure_swallowed_ledger_write_still_returns_true(self, ledger_store):
+        memory_service = AsyncMock()
+        memory_service.recon_ledger = ledger_store
+        memory_service.add_system_record = AsyncMock(side_effect=RuntimeError('mem0 down'))
+
+        result = await write_cycle_summary(
+            memory_service,
+            'dark_factory',
+            self._report(),
+            'run-mirror-fail',
+            stage='task_knowledge_sync',
+            recon_pool='stage2_cycle_summary',
+            trim_source='stage2_cycle_summary_trim',
+            cap=2,
+        )
+
+        assert result is True
+        record = await ledger_store.get_by_identity(
+            'dark_factory', 'cycle_summary', flag_type='task_knowledge_sync', run_id='run-mirror-fail',
+        )
+        assert record is not None
+
+    @pytest.mark.asyncio
+    async def test_trim_failure_swallowed_ledger_write_still_returns_true(self, ledger_store):
+        memory_service = AsyncMock()
+        memory_service.recon_ledger = ledger_store
+        memory_service.add_system_record = AsyncMock(
+            return_value=SimpleNamespace(memory_ids=['m1']),
+        )
+
+        with patch(
+            'fused_memory.reconciliation.summary_pool.enforce_summary_pool_cap',
+            AsyncMock(side_effect=RuntimeError('trim exploded')),
+        ):
+            result = await write_cycle_summary(
+                memory_service,
+                'dark_factory',
+                self._report(),
+                'run-trim-fail',
+                stage='task_knowledge_sync',
+                recon_pool='stage2_cycle_summary',
+                trim_source='stage2_cycle_summary_trim',
+                cap=2,
+            )
+
+        assert result is True
+        record = await ledger_store.get_by_identity(
+            'dark_factory', 'cycle_summary', flag_type='task_knowledge_sync', run_id='run-trim-fail',
+        )
+        assert record is not None
+
+    @pytest.mark.asyncio
+    async def test_both_mirror_and_trim_failures_swallowed_together(self, ledger_store):
+        """Neither best-effort failure ever propagates — even simultaneously."""
+        memory_service = AsyncMock()
+        memory_service.recon_ledger = ledger_store
+        memory_service.add_system_record = AsyncMock(side_effect=RuntimeError('mem0 down'))
+
+        with patch(
+            'fused_memory.reconciliation.summary_pool.enforce_summary_pool_cap',
+            AsyncMock(side_effect=RuntimeError('trim exploded')),
+        ):
+            result = await write_cycle_summary(
+                memory_service,
+                'dark_factory',
+                self._report(),
+                'run-both-fail',
+                stage='task_knowledge_sync',
+                recon_pool='stage2_cycle_summary',
+                trim_source='stage2_cycle_summary_trim',
+                cap=2,
+            )
+
+        assert result is True
