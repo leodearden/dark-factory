@@ -2118,7 +2118,30 @@ class TaskKnowledgeSync(BaseStage):
         # Stage 2's prompt mandated a summary write on every pass, whereas
         # Stage 1's remediation payload never asked for one. Do not "fix" this
         # to mirror Stage 1's full-cycle-only gating.
-        cycle_summary_written = await write_cycle_summary(
+        #
+        # Data-fidelity consequence, confirmed intentional (reviewer finding
+        # robustness-data-fidelity, task 2229 amendment pass round 2): the
+        # ledger upsert's primary key is (project_id, 'cycle_summary',
+        # flag_type=stage, run_id) — it does not distinguish a full cycle
+        # from its own remediation pass(es), which share that one run_id. So
+        # a remediation pass's write REPLACES the ledger row's payload
+        # (items_flagged_count, stats, llm_calls, tokens_used) with that
+        # pass's own — typically smaller — numbers; the full cycle's numbers
+        # are not retained in the ledger once a remediation pass has run.
+        # This is intentional, not a bug: the ledger row is a single
+        # current-state control-plane record for (stage, run_id), not a
+        # per-pass audit log, so "last write wins" (see
+        # ReconLedgerStore.upsert's own docstring) is the correct semantics
+        # here. A downstream consumer that needs the full cycle's own
+        # numbers specifically — not "whatever the latest pass produced" —
+        # must not rely on the ledger row alone: the best-effort Mem0 mirror
+        # (`add_system_record` is a fresh unkeyed insert per call, unlike the
+        # ledger's upsert) retains a short per-pass history up to
+        # STAGE2_CYCLE_SUMMARY_POOL_CAP entries, oldest evicted first — but
+        # that pool is itself best-effort and bounded, not a durable audit
+        # trail either. See test_remediation_pass_overwrites_full_cycle_ledger_payload
+        # (tests/test_stages.py) for the behavior this confirms.
+        ledger_written = await write_cycle_summary(
             self.memory,
             self.project_id,
             report,
@@ -2128,7 +2151,15 @@ class TaskKnowledgeSync(BaseStage):
             trim_source=_STAGE2_CYCLE_SUMMARY_TRIM_SOURCE,
             cap=STAGE2_CYCLE_SUMMARY_POOL_CAP,
         )
-        report.stats['stage2_cycle_summary_written'] = 1 if cycle_summary_written else 0
+        # Named "..._ledger_written", not "..._written" (reviewer finding
+        # observability, task 2229 amendment pass round 2): this reflects
+        # ONLY the authoritative ReconLedgerStore upsert. write_cycle_summary
+        # also attempts a best-effort Mem0 mirror write regardless of the
+        # ledger outcome (see its docstring), so a deployment running with
+        # recon_ledger_enabled=False can have this stat at 0 while the
+        # mirror was in fact written — the "_ledger_" qualifier makes that
+        # distinction explicit instead of implying "no summary at all".
+        report.stats['stage2_cycle_summary_ledger_written'] = 1 if ledger_written else 0
 
         # --- task_count_snapshot deterministic write + freshness stat (task 2325,
         # follow-up to task 2278) ---

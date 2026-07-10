@@ -856,8 +856,10 @@ class TestProjectIdValidation(BaseStageValidationTest):
             # ledger row. This test's mock_deps memory_service is an unconfigured
             # AsyncMock, so getattr(memory_service, 'recon_ledger', None) resolves
             # to an auto-created child mock (not None) and the ledger upsert
-            # succeeds against it.
-            'stage1_cycle_summary_written': 1,
+            # succeeds against it. Renamed from 'stage1_cycle_summary_written'
+            # (reviewer finding observability, task 2229 amendment pass round 2)
+            # — the key now makes explicit that it tracks the ledger write only.
+            'stage1_cycle_summary_ledger_written': 1,
         }
         assert result.started_at is not None
         assert result.started_at <= result.completed_at
@@ -959,8 +961,10 @@ class TestProjectIdValidation(BaseStageValidationTest):
             # ledger row. This test's mock_deps memory_service is an unconfigured
             # AsyncMock, so getattr(memory_service, 'recon_ledger', None) resolves
             # to an auto-created child mock (not None) and the ledger upsert
-            # succeeds against it.
-            'stage1_cycle_summary_written': 1,
+            # succeeds against it. Renamed from 'stage1_cycle_summary_written'
+            # (reviewer finding observability, task 2229 amendment pass round 2)
+            # — the key now makes explicit that it tracks the ledger write only.
+            'stage1_cycle_summary_ledger_written': 1,
         }
         assert result.started_at is not None
         assert result.started_at <= result.completed_at
@@ -11841,10 +11845,70 @@ class TestTaskKnowledgeSyncDeterministicCycleSummaryWrite:
         assert record.state == 'active'
 
     @pytest.mark.asyncio
-    async def test_run_sets_cycle_summary_written_stat(self, mock_deps):
+    async def test_remediation_pass_overwrites_full_cycle_ledger_payload(
+        self, mock_deps, ledger_store,
+    ):
+        """Confirmed intentional (reviewer finding robustness-data-fidelity,
+        task 2229 amendment pass round 2): a remediation pass shares its full
+        cycle's run_id, and write_cycle_summary's ledger upsert is keyed on
+        (project_id, 'cycle_summary', flag_type=stage, run_id) with no pass
+        discriminator — so the remediation pass's own (smaller) report
+        REPLACES the full cycle's payload in the ledger row; last write
+        wins. See the cross-reference comment above the write_cycle_summary()
+        call site in task_knowledge_sync.py for the full rationale."""
+        run_id = 'run-d1-remediation-overwrite'
+        full_report = StageReport(
+            stage=StageId.task_knowledge_sync,
+            started_at=datetime(2026, 7, 10, 11, 0, 0, tzinfo=UTC),
+            completed_at=datetime(2026, 7, 10, 11, 5, 0, tzinfo=UTC),
+            items_flagged=[{'task_id': '1', 'description': 'full-cycle flag'}],
+            stats={'pass': 'full'},
+            llm_calls=9,
+            tokens_used=9000,
+        )
+        remediation_report = StageReport(
+            stage=StageId.task_knowledge_sync,
+            started_at=datetime(2026, 7, 10, 12, 0, 0, tzinfo=UTC),
+            completed_at=datetime(2026, 7, 10, 12, 1, 0, tzinfo=UTC),
+            items_flagged=[],
+            stats={'pass': 'remediation'},
+            llm_calls=1,
+            tokens_used=100,
+        )
+
+        mock_deps['taskmaster'].get_tasks.return_value = {'tasks': []}
+        stage = TaskKnowledgeSync(StageId.task_knowledge_sync, **mock_deps)
+        stage.scope = _scope('reify', stage.scope.project_root)
+        stage.scope = _scope(stage.scope.project_id, '/home/leo/src/reify')
+        watermark = Watermark(project_id='reify')
+
+        with patch.object(BaseStage, 'run', new=AsyncMock(return_value=full_report)):
+            await stage.run(events=[], watermark=watermark, prior_reports=[], run_id=run_id)
+        with patch.object(BaseStage, 'run', new=AsyncMock(return_value=remediation_report)):
+            await stage.run(events=[], watermark=watermark, prior_reports=[], run_id=run_id)
+
+        record = await ledger_store.get_by_identity(
+            'reify', 'cycle_summary', flag_type='task_knowledge_sync', run_id=run_id,
+        )
+        assert record is not None
+        payload = json.loads(record.payload_json)
+        # run() mutates report.stats in place with its own keys as it goes
+        # (e.g. stage2_flag_markers_acknowledged), so the persisted 'stats'
+        # dict is a superset of what either report started with — the 'pass'
+        # marker is what distinguishes which call's payload survived.
+        assert payload['stats'].get('pass') == 'remediation', (
+            'the remediation pass must overwrite (not merge with) the full '
+            "cycle's ledger payload — confirmed intentional last-write-wins"
+        )
+        assert payload['llm_calls'] == 1
+        assert payload['tokens_used'] == 100
+        assert payload['items_flagged_count'] == 0
+
+    @pytest.mark.asyncio
+    async def test_run_sets_cycle_summary_ledger_written_stat(self, mock_deps):
         report = await self._run_stage(mock_deps, 'run-d1-stat')
 
-        assert report.stats.get('stage2_cycle_summary_written') == 1
+        assert report.stats.get('stage2_cycle_summary_ledger_written') == 1
 
     @pytest.mark.asyncio
     async def test_retired_verify_repair_reconstruct_stats_absent(self, mock_deps):
