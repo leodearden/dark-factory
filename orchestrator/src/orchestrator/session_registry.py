@@ -43,6 +43,15 @@ logger = logging.getLogger(__name__)
 
 SCHEMA_VERSION = 1
 
+RESULT_FILENAME = 'result.md'
+"""Basename of the result-handback file inside each record dir (Attention
+Rail T5): ``<record_dir>/result.md``. Kept in sync BY CONVENTION (not
+cross-checked at runtime) with skills/spawn/spawn-claude.sh's own
+``CLAUDE_SPAWN_RESULT_FILE`` literal -- ``_run_launching`` returns
+``str(record_dir)`` (== spawn-claude.sh's ``SESSION_RECORD_DIR``), so bash's
+``$SESSION_RECORD_DIR/result.md`` and this module's
+``str(record_dir / RESULT_FILENAME)`` are byte-identical paths."""
+
 
 class Status(StrEnum):
     """Wire-format session-lifecycle status (PRD §4 decision 4).
@@ -92,7 +101,9 @@ class SessionRecord:
     start_ts: ISO-8601 timestamp of when this record was first written.
     status: current lifecycle status; see Status.
     exit_code: claude's exit code, populated once status is terminal.
-    result_file: path to this session's result.md (T5), once allocated.
+    result_file: path to this session's result.md (T5); allocated by
+        `_run_launching` at launch time (``<record_dir>/RESULT_FILENAME``)
+        and preserved unchanged by every later read-modify-write.
     transcript_path: best-effort ``~/.claude/projects/<encoded-cwd>`` path.
     """
 
@@ -536,6 +547,7 @@ def _run_launching(env: Mapping[str, str]) -> str:
 
     identity = parse_spawn_identity(env, title, prompt, cwd)
     slug = build_session_slug(identity.role, identity.project, identity.task_id, launcher_pid)
+    record_dir = record_path_for_slug(slug).parent
 
     record = SessionRecord(
         session_slug=slug,
@@ -549,10 +561,11 @@ def _run_launching(env: Mapping[str, str]) -> str:
         cwd=cwd,
         launcher_pid=launcher_pid,
         start_ts=datetime.now(UTC).isoformat(),
+        result_file=str(record_dir / RESULT_FILENAME),
         transcript_path=transcript_path_for_cwd(cwd),
     )
     write_record(record)
-    return str(record_path_for_slug(slug).parent)
+    return str(record_dir)
 
 
 def _slug_root_from_record_dir(record_dir: str) -> tuple[str, Path]:

@@ -161,6 +161,78 @@ def _write_fake_claude_with_readiness(
     p.chmod(0o755)
 
 
+def _write_fake_claude_writing_result(bin_dir: pathlib.Path) -> None:
+    """Write a fake ``claude`` that writes an outcome-header result file to
+    ``$CLAUDE_SPAWN_RESULT_FILE`` (falling back to /dev/null when unset —
+    the pre-T5 / fail-soft shape), then exits 0.
+    """
+    p = bin_dir / "claude"
+    p.write_text(
+        "#!/usr/bin/env bash\n"
+        "cat > \"${CLAUDE_SPAWN_RESULT_FILE:-/dev/null}\" <<'EOF'\n"
+        "---\n"
+        "outcome: done\n"
+        "changed: none\n"
+        "action_needed: none\n"
+        "---\n"
+        "Test prose.\n"
+        "EOF\n"
+        "exit 0\n"
+    )
+    p.chmod(0o755)
+
+
+def _write_fake_claude_capturing_prompt(
+    bin_dir: pathlib.Path, capture_file: pathlib.Path
+) -> None:
+    """Write a fake ``claude`` that captures its prompt argument (``$1``) to
+    *capture_file*, then exits 0.
+
+    With ``skip_perms="false"`` (the default baked into ``_run_spawn``),
+    ``$flags`` is empty, so ``$1`` is exactly the prompt string
+    spawn-claude.sh assembled into ``$inner`` -- letting a test inspect
+    whatever transformation (e.g. a result-handback trailer) the script
+    applied before invoking claude.
+    """
+    p = bin_dir / "claude"
+    p.write_text(
+        f"#!/usr/bin/env bash\n"
+        f'printf %s "$1" > {capture_file!s}\n'
+        f"exit 0\n"
+    )
+    p.chmod(0o755)
+
+
+def _write_fake_claude_capturing_prompt_and_writing_result(
+    bin_dir: pathlib.Path, capture_file: pathlib.Path
+) -> None:
+    """Write a fake ``claude`` that captures its prompt argument (``$1``) to
+    *capture_file* AND writes an outcome-header result file to
+    ``$CLAUDE_SPAWN_RESULT_FILE`` (falling back to /dev/null when unset),
+    then exits 0.
+
+    Combines ``_write_fake_claude_capturing_prompt`` and
+    ``_write_fake_claude_writing_result`` so a single spawn can lock BOTH
+    halves of the result-handback protocol at once: whether a trailer was
+    appended to the prompt, and whether anything landed in a result.md.
+    """
+    p = bin_dir / "claude"
+    p.write_text(
+        f"#!/usr/bin/env bash\n"
+        f'printf %s "$1" > {capture_file!s}\n'
+        "cat > \"${CLAUDE_SPAWN_RESULT_FILE:-/dev/null}\" <<'EOF'\n"
+        "---\n"
+        "outcome: done\n"
+        "changed: none\n"
+        "action_needed: none\n"
+        "---\n"
+        "Test prose.\n"
+        "EOF\n"
+        "exit 0\n"
+    )
+    p.chmod(0o755)
+
+
 def _wait_for_path(path: pathlib.Path, timeout: float) -> None:
     """Poll until *path* exists, raising ``AssertionError`` on timeout."""
     deadline = time.monotonic() + timeout
@@ -995,4 +1067,159 @@ def test_normal_spawn_exit0_not_flagged(tmp_path: pathlib.Path) -> None:
     record = session_registry.SessionRecord.from_json(record_path.read_text())
     assert record.status == session_registry.Status.EXITED, (
         f"expected registry status exited, got {record.status}"
+    )
+
+
+# ===========================================================================
+# task-2287 (Attention Rail T5): spawn result-handback protocol
+# ===========================================================================
+# Exit codes are demoted to liveness-only; the semantic outcome channel is an
+# explicit result.md written by the spawned session into its own session-
+# registry record dir. spawn-claude.sh exports CLAUDE_SPAWN_RESULT_FILE
+# (derived from SESSION_RECORD_DIR, byte-identical to the record's own
+# result_file) and appends a prompt trailer pointing the session at it.
+
+
+def test_spawn_exports_result_file_and_session_writes_it(
+    tmp_path: pathlib.Path,
+) -> None:
+    """The spawned session must be able to write its outcome to
+    $CLAUDE_SPAWN_RESULT_FILE, landing exactly at the session record's own
+    result_file path.
+
+    RED today: CLAUDE_SPAWN_RESULT_FILE is not exported into $inner, so the
+    fake claude's write falls through to /dev/null and no file lands at the
+    record's result_file path.
+    """
+    bin_dir = _make_bin_dir(tmp_path)
+    _write_fake_claude_writing_result(bin_dir)
+    _write_foreground_terminal(bin_dir, "xterm")
+    env = _base_env(bin_dir, "xterm")
+
+    result = _run_spawn(env, tmp_path)
+    assert result.returncode == 0, f"stderr: {result.stderr.decode()}"
+
+    fleet_root = pathlib.Path(env["CLAUDE_FLEET_ROOT"])
+    record_path = _find_one_record(fleet_root)
+    record = session_registry.SessionRecord.from_json(record_path.read_text())
+
+    expected_result_file = str(record_path.parent / "result.md")
+    assert record.result_file == expected_result_file, (
+        f"expected record.result_file == {expected_result_file}, "
+        f"got {record.result_file}"
+    )
+    assert record.result_file is not None  # narrows str | None for the type checker
+
+    result_file = pathlib.Path(record.result_file)
+    assert result_file.is_file(), (
+        f"expected a result.md written to {result_file} by the session"
+    )
+    assert "outcome: done" in result_file.read_text()
+
+
+def test_spawn_appends_result_handback_trailer_to_prompt(
+    tmp_path: pathlib.Path,
+) -> None:
+    """spawn-claude.sh must append a result-handback trailer to the prompt,
+    pointing the spawned session at its own session record's result_file.
+
+    Uses skip_perms="false" (the default baked into _run_spawn) so $flags is
+    empty and $1 is exactly the prompt string spawn-claude.sh assembled --
+    letting this test inspect the literal string claude received.
+
+    RED today: no trailer is appended, so the captured prompt equals the
+    bare original ("test prompt") with no result_file path anywhere in it.
+    """
+    bin_dir = _make_bin_dir(tmp_path)
+    capture_file = tmp_path / "captured_prompt.txt"
+    _write_fake_claude_capturing_prompt(bin_dir, capture_file)
+    _write_foreground_terminal(bin_dir, "xterm")
+    env = _base_env(bin_dir, "xterm")
+
+    result = _run_spawn(env, tmp_path)
+    assert result.returncode == 0, f"stderr: {result.stderr.decode()}"
+
+    fleet_root = pathlib.Path(env["CLAUDE_FLEET_ROOT"])
+    record_path = _find_one_record(fleet_root)
+    record = session_registry.SessionRecord.from_json(record_path.read_text())
+    assert record.result_file, "expected a populated result_file on the record"
+
+    captured_prompt = capture_file.read_text()
+    assert "test prompt" in captured_prompt, (
+        f"expected the original prompt to survive in the captured prompt, "
+        f"got:\n{captured_prompt}"
+    )
+    assert record.result_file in captured_prompt, (
+        f"expected a result-handback trailer referencing "
+        f"{record.result_file!r} to be appended to the prompt, "
+        f"got:\n{captured_prompt}"
+    )
+
+
+def test_spawn_fail_soft_skips_result_handback_when_registry_faults(
+    tmp_path: pathlib.Path,
+) -> None:
+    """A forced registry-write failure must cleanly skip the ENTIRE
+    result-handback protocol -- no env export, no prompt trailer, no bogus
+    result.md anywhere -- while leaving the pre-existing exit-code contract
+    and the loud registry-fault stderr line untouched.
+
+    Green-on-arrival guard (matches test_spawn_fail_soft_on_unwritable_fleet_root's
+    precedent): steps 2/4/6 already gate the result_file, the env export, and
+    the prompt trailer on a non-empty CLAUDE_SPAWN_RESULT_FILE, and
+    SESSION_RECORD_DIR is empty whenever the registry `launching` write
+    faults, so this should already pass without further implementation
+    changes. Locks the fail-soft contract before any future change to the
+    result-handback wiring.
+
+    Also captures the literal prompt claude received (via
+    _write_fake_claude_capturing_prompt_and_writing_result) and asserts it
+    is byte-identical to the bare original -- directly locking the "no
+    prompt trailer" half of the contract instead of leaving it implied by
+    the gating logic alone.
+    """
+    bin_dir = _make_bin_dir(tmp_path)
+    capture_file = tmp_path / "captured_prompt.txt"
+    _write_fake_claude_capturing_prompt_and_writing_result(bin_dir, capture_file)
+    _write_foreground_terminal(bin_dir, "xterm")
+    env = _base_env(bin_dir, "xterm")
+
+    # Shadow _base_env's CLAUDE_FLEET_ROOT with one that can never be created:
+    # a path nested UNDER a pre-existing regular file (same trick as
+    # test_spawn_fail_soft_on_unwritable_fleet_root).
+    blocker = tmp_path / "not_a_dir"
+    blocker.write_text("i am a regular file, not a directory\n")
+    env["CLAUDE_FLEET_ROOT"] = str(blocker / "fleet")
+
+    result = _run_spawn(env, tmp_path)
+
+    assert result.returncode == 0, (
+        f"a result-file allocation failure must never change the exit-code "
+        f"contract: expected 0 (the session's own code), got "
+        f"{result.returncode}\nstderr: {result.stderr.decode()}"
+    )
+
+    stderr = result.stderr.decode()
+    assert "session_registry" in stderr and "failed" in stderr, (
+        f"expected a loud registry-fault line on the spawn's stderr, got:\n{stderr}"
+    )
+
+    fleet_root = pathlib.Path(env["CLAUDE_FLEET_ROOT"])
+    assert not fleet_root.exists(), (
+        f"no record dir should have been created under an unwritable fleet "
+        f"root, but {fleet_root} exists"
+    )
+    assert not list(tmp_path.rglob("result.md")), (
+        "no result.md should be created anywhere when the registry write faults"
+    )
+
+    captured_prompt = capture_file.read_text()
+    assert captured_prompt == "test prompt", (
+        "expected NO result-handback trailer to be appended when the "
+        "registry write faults -- the captured prompt must equal the bare "
+        f"original with nothing appended, got:\n{captured_prompt!r}"
+    )
+    assert "result.md" not in captured_prompt, (
+        f"expected no 'result.md' substring anywhere in the prompt claude "
+        f"received, got:\n{captured_prompt!r}"
     )

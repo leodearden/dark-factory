@@ -102,6 +102,66 @@ if command -v python3 >/dev/null 2>&1; then
   ) || true
 fi
 
+# Result-handback (Attention Rail T5): the record dir just captured above
+# deterministically owns a result.md alongside record.json -- this literal
+# 'result.md' MUST stay in sync with session_registry.RESULT_FILENAME (the
+# two are never cross-checked at runtime, only by convention; see that
+# module's docstring). Empty when SESSION_RECORD_DIR is empty (a registry
+# fault already handled above via fail-soft), so both the env-export below
+# and the prompt trailer (further down) cleanly no-op instead of pointing at
+# a bogus path.
+CLAUDE_SPAWN_RESULT_FILE=""
+[ -n "$SESSION_RECORD_DIR" ] && CLAUDE_SPAWN_RESULT_FILE="$SESSION_RECORD_DIR/result.md"
+
+# Exported into $inner (below) so the spawned session can write its outcome
+# there. Built unconditionally (empty when CLAUDE_SPAWN_RESULT_FILE is
+# empty) so `${result_export}` is always safe to splice into `inner` as a
+# no-op empty-string prefix.
+result_export=""
+if [ -n "$CLAUDE_SPAWN_RESULT_FILE" ]; then
+  q_result_file=$(printf %q "$CLAUDE_SPAWN_RESULT_FILE")
+  result_export="export CLAUDE_SPAWN_RESULT_FILE=$q_result_file; "
+fi
+
+# Result-handback trailer (Attention Rail T5): appended to the prompt itself
+# so the spawned session is told, in-band, to write its outcome before
+# ending. Gated on the same non-empty check as result_export above -- a
+# fail-soft empty record dir means no trailer is appended either, so a
+# session is never pointed at a bogus path. This is purely additive text;
+# `q_prompt=$(printf %q "$prompt")` below safely quotes the now-multi-line
+# prompt through `bash -c "$inner"` unchanged. Best-effort by design: the
+# trailer only asks the session to write the file, nothing here blocks exit
+# on it, and a parent that finds no result.md simply falls back to its own
+# exploration.
+#
+# DELIBERATE ORDERING: the session-registry `launching` write further above
+# (CLAUDE_SPAWN_PROMPT="$prompt") already ran and persisted `prompt` BEFORE
+# this trailer is appended, so record.prompt intentionally holds the
+# caller's original prompt, not this machine-appended boilerplate --
+# record.prompt is "what the caller asked for", not "the literal argv
+# claude received". Do NOT reorder the registry call to run after this
+# block to make them match; a reader who needs the exact text claude saw
+# should reconstruct it from record.prompt plus this trailer template.
+if [ -n "$CLAUDE_SPAWN_RESULT_FILE" ]; then
+  prompt="${prompt}
+
+---
+Before you end this session (whether you finish, hand off, or get
+blocked), write your outcome to: $CLAUDE_SPAWN_RESULT_FILE
+
+Format (markdown with a small structured header -- parent readers are
+LLMs, so keep it concise and scannable):
+
+---
+outcome: done|blocked|abandoned|handed-off
+changed: (commits/branches/task ids touched, or none)
+action_needed: (what a human or parent should do next, or none)
+---
+A few sentences of prose context.
+
+This is best-effort: writing this file must never block your normal exit."
+fi
+
 flags=""
 [ "$skip_perms" = "true" ] && flags="--dangerously-skip-permissions"
 
@@ -135,7 +195,7 @@ q_sentinel=$(printf %q "$sentinel")
 inner="trap 'echo \"\${ec:-\$?}\" > $q_sentinel' EXIT; \
 trap 'exit 129' HUP; \
 trap 'exit 143' TERM; \
-cd $q_cwd && claude $flags $q_prompt; ec=\$?; exit \$ec"
+${result_export}cd $q_cwd && claude $flags $q_prompt; ec=\$?; exit \$ec"
 
 # How long to wait for the sentinel to appear after the launcher returns
 # (covers a hair-late write or a very fast emulator).  Tests can shrink this.
