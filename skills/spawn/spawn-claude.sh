@@ -102,6 +102,27 @@ if command -v python3 >/dev/null 2>&1; then
   ) || true
 fi
 
+# Result-handback (Attention Rail T5): the record dir just captured above
+# deterministically owns a result.md alongside record.json -- this literal
+# 'result.md' MUST stay in sync with session_registry.RESULT_FILENAME (the
+# two are never cross-checked at runtime, only by convention; see that
+# module's docstring). Empty when SESSION_RECORD_DIR is empty (a registry
+# fault already handled above via fail-soft), so both the env-export below
+# and the prompt trailer (further down) cleanly no-op instead of pointing at
+# a bogus path.
+CLAUDE_SPAWN_RESULT_FILE=""
+[ -n "$SESSION_RECORD_DIR" ] && CLAUDE_SPAWN_RESULT_FILE="$SESSION_RECORD_DIR/result.md"
+
+# Exported into $inner (below) so the spawned session can write its outcome
+# there. Built unconditionally (empty when CLAUDE_SPAWN_RESULT_FILE is
+# empty) so `${result_export}` is always safe to splice into `inner` as a
+# no-op empty-string prefix.
+result_export=""
+if [ -n "$CLAUDE_SPAWN_RESULT_FILE" ]; then
+  q_result_file=$(printf %q "$CLAUDE_SPAWN_RESULT_FILE")
+  result_export="export CLAUDE_SPAWN_RESULT_FILE=$q_result_file; "
+fi
+
 flags=""
 [ "$skip_perms" = "true" ] && flags="--dangerously-skip-permissions"
 
@@ -135,7 +156,7 @@ q_sentinel=$(printf %q "$sentinel")
 inner="trap 'echo \"\${ec:-\$?}\" > $q_sentinel' EXIT; \
 trap 'exit 129' HUP; \
 trap 'exit 143' TERM; \
-cd $q_cwd && claude $flags $q_prompt; ec=\$?; exit \$ec"
+${result_export}cd $q_cwd && claude $flags $q_prompt; ec=\$?; exit \$ec"
 
 # How long to wait for the sentinel to appear after the launcher returns
 # (covers a hair-late write or a very fast emulator).  Tests can shrink this.
