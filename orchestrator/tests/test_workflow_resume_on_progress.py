@@ -415,6 +415,91 @@ class TestProgressResumeIterationAccounting:
 
 
 # ---------------------------------------------------------------------------
+# reify comprehensive review (task 2360): progress_resume_total must be
+# cumulative across _execute_iterations re-entries
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestProgressResumeTotalSurvivesReentry:
+    """progress_resume_total (the max_execute_iterations cap-exclusion
+    counter) must be cumulative across separate _execute_iterations calls,
+    mirroring self.metrics.execute_iterations' own never-reset lifetime.
+
+    _execute_verify_review_loop re-enters _execute_iterations after a review
+    cycle (_replan) or an amendment round (_amend) — see the `continue`
+    statements in that loop. If progress_resume_total resets to 0 at the top
+    of _execute_iterations instead of living on self.metrics, a second (or
+    later) execute phase loses the exclusion earned by progress-resumes in
+    earlier phases: the cap check then compares the FULL cumulative
+    execute_iterations against a freshly-zeroed exclusion, so a task that
+    passed through review/amendment cycles can trip max_execute_iterations
+    immediately on re-entry even though every phase individually stayed well
+    under budget (reviewer_comprehensive.json finding #1).
+    """
+
+    async def test_progress_resume_total_survives_execute_phase_reentry(self, tmp_path):
+        """Phase 1: 4 progress-timeouts (excluded) + 1 success -> DONE.
+        Phase 2 (re-entry, as if from a replan/amend `continue`): 1 more
+        success should be enough to finish -- the phase-1 exclusion must
+        still hold so the cap isn't seen as already exhausted.
+
+        Fails RED: today progress_resume_total resets to 0 on re-entry, so
+        phase 2's cap check sees (execute_iterations=5 - 0 >= 5) and returns
+        BLOCKED before running a single phase-2 iteration.
+        """
+        wf = _make_workflow(
+            tmp_path=tmp_path,
+            max_execute_iterations=5,
+            max_progress_resume_iterations=100,
+        )
+        mock_invoke = _stub_iteration_helpers(wf, _progress_timeout_agent_result())
+        wf._last_invoke_session_id = 'killed-sid'  # type: ignore[attr-defined]
+
+        # Phase 1: 4 progress-timeouts then a success that clears pending steps.
+        wf.artifacts.get_pending_steps.side_effect = [  # type: ignore[attr-defined]
+            [{'id': 'step-1'}],
+            [{'id': 'step-1'}],
+            [{'id': 'step-1'}],
+            [{'id': 'step-1'}],
+            [{'id': 'step-1'}],
+            [],
+        ]
+        mock_invoke.side_effect = [
+            _progress_timeout_agent_result(),
+            _progress_timeout_agent_result(),
+            _progress_timeout_agent_result(),
+            _progress_timeout_agent_result(),
+            _success_agent_result(),
+        ]
+
+        phase1_outcome = await wf._execute_iterations()
+
+        assert phase1_outcome == WorkflowOutcome.DONE
+        assert mock_invoke.call_count == 5
+
+        # Phase 2 (re-entry): as if a review/amendment cycle just added more
+        # pending steps and looped back to EXECUTE. One more success should
+        # be enough -- the phase-1 exclusion must still hold.
+        wf.artifacts.get_pending_steps.side_effect = [  # type: ignore[attr-defined]
+            [{'id': 'step-2'}],
+            [],
+        ]
+        mock_invoke.side_effect = [_success_agent_result()]
+
+        phase2_outcome = await wf._execute_iterations()
+
+        assert phase2_outcome == WorkflowOutcome.DONE, (
+            f'Expected DONE (phase-1 progress-resume exclusion must survive '
+            f're-entry), got {phase2_outcome!r}'
+        )
+        assert mock_invoke.call_count == 6, (
+            f'Expected phase 2 to actually run its 1 iteration, '
+            f'got {mock_invoke.call_count} total calls'
+        )
+
+
+# ---------------------------------------------------------------------------
 # Amendment: test that _invoke actually consumes the pending-resume fields
 # ---------------------------------------------------------------------------
 

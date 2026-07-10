@@ -775,6 +775,14 @@ class WorkflowMetrics:
     total_duration_ms: int = 0
     agent_invocations: int = 0
     execute_iterations: int = 0
+    # Cumulative count of progress-timeout+resume pairs across the WHOLE task
+    # run (never reset mid-run — mirrors execute_iterations' own lifetime).
+    # Lives on metrics rather than as a local in _execute_iterations so the
+    # max_execute_iterations cap exclusion survives re-entry into
+    # _execute_iterations after a review cycle (_replan) or amendment round
+    # (_amend) — see _execute_verify_review_loop's `continue` statements
+    # (task 2360, reify comprehensive review finding #1).
+    progress_resume_total: int = 0
     verify_attempts: int = 0
     review_cycles: int = 0
     amendment_rounds: int = 0
@@ -4426,22 +4434,25 @@ class TaskWorkflow:
         # progress_resume_total (below) is what the cap check and the churn
         # circuit breaker actually consult.
         consecutive_progress_timeouts = 0
-        # Cumulative (NOT consecutive — never reset mid-loop) count of
-        # progress-timeouts across this _execute_iterations call.  Task 2360
-        # fix #4 (reify-4827): a ceiling-kill+resume pair of a productive
-        # session is excluded from max_execute_iterations via the cap-check
-        # subtraction below, so it no longer erodes the budget meant for
-        # genuine implementer attempts — but an endless non-converging
-        # kill/resume stream must still terminate, so it is bounded
-        # independently by config.max_progress_resume_iterations (checked in
-        # the γ branch below). Supersedes the old PRD §9 Q4 design decision
-        # that max_execute_iterations was the only bound.
-        progress_resume_total = 0
+        # Cumulative (NOT consecutive, NOT reset here) count of progress-
+        # timeouts across the WHOLE task run — self.metrics.progress_resume_total,
+        # not a local.  Task 2360 fix #4 (reify-4827): a ceiling-kill+resume
+        # pair of a productive session is excluded from max_execute_iterations
+        # via the cap-check subtraction below, so it no longer erodes the
+        # budget meant for genuine implementer attempts — but an endless
+        # non-converging kill/resume stream must still terminate, so it is
+        # bounded independently by config.max_progress_resume_iterations
+        # (checked in the γ branch below). Supersedes the old PRD §9 Q4
+        # design decision that max_execute_iterations was the only bound.
+        # MUST live on self.metrics (not a local reset to 0 here): this
+        # method is re-entered by _execute_verify_review_loop after a review
+        # cycle (_replan) or amendment round (_amend), and a local would lose
+        # the exclusion earned by earlier execute phases on re-entry.
         self._progress_resume_churn_info = None
         self._preserve_config_dir = False
         while self.artifacts.get_pending_steps():
             if (
-                self.metrics.execute_iterations - progress_resume_total
+                self.metrics.execute_iterations - self.metrics.progress_resume_total
                 >= self.config.max_execute_iterations
             ):
                 # Iteration cap reached (progress-resumes excluded from the
@@ -4480,7 +4491,7 @@ class TaskWorkflow:
                         'Bound: max_execute_iterations=%s, '
                         'max_progress_resume_iterations=%s.',
                         self.task_id, consecutive_progress_timeouts,
-                        progress_resume_total, self.config.max_execute_iterations,
+                        self.metrics.progress_resume_total, self.config.max_execute_iterations,
                         self.config.max_progress_resume_iterations,
                     )
                 return WorkflowOutcome.BLOCKED
@@ -4644,17 +4655,21 @@ class TaskWorkflow:
                 # (Preserves the reset the old `else` branch provided before γ.)
                 consecutive_zero_output = 0
                 consecutive_progress_timeouts += 1
-                progress_resume_total += 1
-                if progress_resume_total >= self.config.max_progress_resume_iterations:
+                self.metrics.progress_resume_total += 1
+                if self.metrics.progress_resume_total >= self.config.max_progress_resume_iterations:
                     # Independent churn circuit breaker (task 2360 fix #4,
                     # reify-4827): this kill+resume pair is excluded from
                     # max_execute_iterations (see the cap check above), so an
                     # endless non-converging progress-timeout stream would
-                    # otherwise never terminate.  Bounded here instead.
+                    # otherwise never terminate.  Bounded here instead — and,
+                    # like the cap exclusion, cumulative across the WHOLE task
+                    # run (not per execute-phase), consistent with the design
+                    # decision's "cumulative progress-resume count" bounding
+                    # what a normal task run is expected to need.
                     self._progress_resume_churn_info = {
                         'reason': PROGRESS_RESUME_CHURN_REASON,
                         'detail': (
-                            f'progress_resume_total={progress_resume_total} '
+                            f'progress_resume_total={self.metrics.progress_resume_total} '
                             f'consecutive_progress_timeouts={consecutive_progress_timeouts} '
                             f'iteration={self.metrics.execute_iterations} '
                             f'last_transcript_turns={result.transcript_turns}'
@@ -4665,7 +4680,7 @@ class TaskWorkflow:
                         'after %d ceiling-kill+resume cycles of a productive '
                         'session — blocking (session may be too slow to '
                         'converge, or looping)',
-                        self.task_id, progress_resume_total,
+                        self.task_id, self.metrics.progress_resume_total,
                     )
                     return WorkflowOutcome.BLOCKED
                 self._pending_resume_session_id = self._last_invoke_session_id
