@@ -8841,8 +8841,18 @@ Output JSON matching the schema. Every task must appear in the output.
         # park → 'blocked' (version-a): quiescence rests on the open L2 escalation
         # suppressing Fix #1b stranded_blocked re-filing, not on the 'deferred' status.
         # effect.target_status is Table B's target for `action`; every entry
-        # reaching this point (disposition not NONE/RESUME) carries a str target.
-        assert effect.target_status is not None
+        # reaching this point (disposition not NONE/RESUME) carries a str target
+        # today. Guarded explicitly rather than via a bare `assert` — `python -O`
+        # strips assertions, which would otherwise let a future Table B edit that
+        # mapped a teardown action to a None target flow straight into
+        # scheduler.set_task_status.
+        if effect.target_status is None:
+            logger.warning(
+                'escalation %s: action %r resolved to a teardown disposition '
+                'but Table B has no target_status for task %s — ignored',
+                escalation.id, action, escalation.task_id,
+            )
+            return
         self._schedule_coro_threadsafe(
             self._action_teardown_and_set_status(
                 escalation.task_id, effect.target_status, action,
@@ -9270,14 +9280,19 @@ Output JSON matching the schema. Every task must appear in the output.
         from escalation.action_effects import effect_for  # noqa: PLC0415
 
         _resume_effect = effect_for('resume', escalation.level, escalation.category)
-        _resume_target = (
-            _resume_effect.target_status if _resume_effect is not None else 'pending'
-        )  # 'pending' today; defensive fallback only, 'resume' is always in the table
-        # TaskEffect.target_status is typed `str | None` (None encodes
-        # close_only's no-op); 'resume' always maps to a str in ACTION_EFFECTS,
-        # the same invariant _on_escalation_resolved asserts above for its
-        # restart/park/abandon branch.
-        assert _resume_target is not None
+        if _resume_effect is not None and _resume_effect.target_status is not None:
+            _resume_target = _resume_effect.target_status
+        else:
+            # Defensive only: 'resume' is always a key in ACTION_EFFECTS and its
+            # target_status is never None, so this branch does not execute today.
+            # An explicit guard (not a bare `assert`, which `python -O` strips) so
+            # a future Table B drift degrades to the historical default instead
+            # of forwarding None into scheduler.set_task_status.
+            logger.warning(
+                "cascade-unblock: ACTION_EFFECTS has no resume target for task "
+                "%s — defaulting to 'pending'", task_id,
+            )
+            _resume_target = 'pending'
         try:
             await self.scheduler.set_task_status(task_id, _resume_target)
             logger.info(
