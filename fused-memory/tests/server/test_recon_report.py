@@ -2831,6 +2831,109 @@ class TestReconReportOverlengthTruncation:
         assert report is not None
         assert len(report['flagged_items']) == 1
 
+    def test_duplicate_signature_path_still_surfaces_truncation_warning(self):
+        """An overlength description that ALSO collides on (task_id,
+        flag_type) must still surface a 'warnings' entry on the
+        duplicate_finding response -- the caller's input was truncated even
+        though no new row is stored, so the truncate+warn contract must not
+        go silent on the duplicate short-circuit path.
+        """
+        from fused_memory.server.recon_report import _MAX_FINDING_TEXT_CHARS
+
+        state, _ = self._make_state()
+        state.start_report(run_id='r1', stage='s1', project_id='dark_factory')
+
+        first = state.add_finding(
+            run_id='r1',
+            severity='low',
+            category='c',
+            description='d',
+            suggested_action='a',
+            task_id='42',
+            flag_type='f',
+        )
+        assert 'finding_id' in first, f'first add_finding failed: {first}'
+
+        overlength = 'z' * (_MAX_FINDING_TEXT_CHARS + 500)
+        dup = state.add_finding(
+            run_id='r1',
+            severity='low',
+            category='c',
+            description=overlength,
+            suggested_action='a',
+            task_id='42',
+            flag_type='f',
+        )
+        assert dup.get('error') == 'duplicate_finding', f'expected duplicate_finding, got: {dup}'
+        assert dup['existing_finding_id'] == first['finding_id']
+        assert 'warnings' in dup
+        assert any('description' in w for w in dup['warnings'])
+
+    def test_duplicate_null_null_path_still_surfaces_truncation_warning(self):
+        """Same contract as above but for the null-null (description-hash)
+        dedup path: an overlength duplicate must still surface 'warnings'
+        even though no new finding is stored.
+        """
+        from fused_memory.server.recon_report import _MAX_FINDING_TEXT_CHARS
+
+        state, _ = self._make_state()
+        state.start_report(run_id='r1', stage='s1', project_id='dark_factory')
+
+        shared = 'q' * (_MAX_FINDING_TEXT_CHARS + 500)
+        first = state.add_finding(
+            run_id='r1',
+            severity='low',
+            category='informational',
+            description=shared,
+            suggested_action='none',
+            actionable=False,
+        )
+        assert 'finding_id' in first, f'first add_finding failed: {first}'
+
+        dup = state.add_finding(
+            run_id='r1',
+            severity='low',
+            category='informational',
+            description=shared,
+            suggested_action='none',
+            actionable=False,
+        )
+        assert dup.get('error') == 'duplicate_finding', f'expected duplicate_finding, got: {dup}'
+        assert dup['existing_finding_id'] == first['finding_id']
+        assert 'warnings' in dup
+        assert any('description' in w for w in dup['warnings'])
+
+    def test_short_duplicate_has_no_warnings_key(self):
+        """A duplicate_finding response for SHORT (non-truncated) input must
+        NOT gain a 'warnings' key -- only actual truncation should surface
+        one, mirroring the success-path contract.
+        """
+        state, _ = self._make_state()
+        state.start_report(run_id='r1', stage='s1', project_id='dark_factory')
+
+        first = state.add_finding(
+            run_id='r1',
+            severity='low',
+            category='c',
+            description='d',
+            suggested_action='a',
+            task_id='42',
+            flag_type='f',
+        )
+        assert 'finding_id' in first, f'first add_finding failed: {first}'
+
+        dup = state.add_finding(
+            run_id='r1',
+            severity='low',
+            category='c',
+            description='different but same sig',
+            suggested_action='a',
+            task_id='42',
+            flag_type='f',
+        )
+        assert dup.get('error') == 'duplicate_finding', f'expected duplicate_finding, got: {dup}'
+        assert 'warnings' not in dup
+
 
 # ---------------------------------------------------------------------------
 # task-2410 step-3: delete_finding basic behavior — RED until step-4 adds
@@ -3017,6 +3120,85 @@ class TestReconReportDeleteFinding:
         s1_report = state.get_assembled_report('r1', 'memory_consolidator')
         assert s1_report is not None
         assert s1_report['flagged_items'] == []
+
+    def test_delete_finding_reached_via_flag_type_inheritance_cleans_correct_sig(self):
+        """A is filed with (task_id='42', flag_type='f1').  A bare-null
+        re-raise (task_id='42', flag_type=None) inherits 'f1' (task-2318,
+        the ONLY established flag_type for '42' at that point) and resolves
+        as a duplicate_finding pointer to A rather than allocating a new
+        row -- so a caller holding that returned finding_id is really
+        holding A's id, whose STORED flag_type ('f1') differs from what the
+        caller itself submitted (None).  B is then filed under a distinct,
+        unambiguous signature (task_id='42', flag_type='f2').
+
+        delete_finding's index cleanup recomputes the signature from the
+        STORED finding.task_id/flag_type (never from a caller-submitted
+        None) -- deleting via the id obtained through the inheriting
+        re-raise must pop ONLY ('42', 'f1') from _run_sig_index, leave B's
+        ('42', 'f2') entry untouched, and allow a fresh (42, 'f1') finding
+        to be filed afterwards instead of bouncing off a stale
+        duplicate_finding pointer.
+        """
+        state, _ = self._make_state()
+        state.start_report(run_id='r1', stage='s1', project_id='dark_factory')
+
+        a = state.add_finding(
+            run_id='r1',
+            severity='moderate',
+            category='task_blocked',
+            description='d-a',
+            suggested_action='a-a',
+            task_id='42',
+            flag_type='f1',
+        )
+        assert 'finding_id' in a, f'add_finding A failed: {a}'
+        fid_a = a['finding_id']
+
+        reraise = state.add_finding(
+            run_id='r1',
+            severity='moderate',
+            category='task_blocked',
+            description='re-raise, still blocked',
+            suggested_action='a-a',
+            task_id='42',
+            flag_type=None,
+        )
+        assert reraise == {
+            'error': 'duplicate_finding',
+            'error_type': 'ReconReportDuplicateFinding',
+            'existing_finding_id': fid_a,
+        }
+
+        b = state.add_finding(
+            run_id='r1',
+            severity='moderate',
+            category='task_blocked',
+            description='d-b',
+            suggested_action='a-b',
+            task_id='42',
+            flag_type='f2',
+        )
+        assert 'finding_id' in b, f'add_finding B failed: {b}'
+        fid_b = b['finding_id']
+
+        # Delete using the id obtained via the inheriting re-raise (== A's id).
+        delete_result = state.delete_finding('r1', reraise['existing_finding_id'])
+        assert delete_result == {'status': 'deleted', 'finding_id': fid_a}
+
+        assert state._run_sig_index.get('r1', {}).get(('42', 'f1')) is None
+        assert state._run_sig_index.get('r1', {}).get(('42', 'f2')) == fid_b
+
+        refiled = state.add_finding(
+            run_id='r1',
+            severity='moderate',
+            category='task_blocked',
+            description='corrected',
+            suggested_action='corrected',
+            task_id='42',
+            flag_type='f1',
+        )
+        assert 'finding_id' in refiled, f'refile after delete failed: {refiled}'
+        assert refiled['finding_id'] != fid_a
 
     @pytest.mark.asyncio
     async def test_cite_after_delete_of_cross_stage_duplicate_returns_finding_unknown(self):
