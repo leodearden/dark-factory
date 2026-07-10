@@ -31,7 +31,9 @@ def _make_record(**overrides: object) -> sr.SessionRecord:
 
     Every field is given a concrete, distinguishable value so a round-trip
     test can catch a field being dropped/mis-typed; ``overrides`` lets a
-    test tweak just the field(s) it cares about.
+    test tweak just the field(s) it cares about. Includes the C1 schema
+    extensions (parent_session_id/spawn_mode/display/question) alongside the
+    original rail fields.
     """
     # Declared as a bare `dict` (not `dict[str, object]`) so pyright treats it
     # as dict[Unknown, Unknown] at the **fields unpack below -- mirrors
@@ -53,6 +55,12 @@ def _make_record(**overrides: object) -> sr.SessionRecord:
         'exit_code': None,
         'result_file': None,
         'transcript_path': '~/.claude/projects/-home-leo-src-dark-factory',
+        'parent_session_id': 'root-df-1-1',
+        'spawn_mode': 'sibling',
+        'display': sr.Display(
+            kind='wm', wm_title='unblock:df#2085 slug', wm_window_id='0x1a', tmux_target=None
+        ),
+        'question': sr.Question(text='approve rollout?', asked_at='2026-07-07T00:00:00+00:00'),
     }
     fields.update(overrides)
     return sr.SessionRecord(**fields)
@@ -130,6 +138,106 @@ def test_session_record_json_round_trip_with_null_fields() -> None:
         transcript_path=None,
     )
     assert sr.SessionRecord.from_json(r.to_json()) == r
+
+
+# ---------------------------------------------------------------------------
+# Step-1: SessionRecord C1 schema extensions (B1) -- Fleet Cockpit
+# parent_session_id/spawn_mode/display/question, SCHEMA_MINOR, SpawnMode,
+# DisplayKind, Display, Question. Additive + migration-free: a rail-vintage
+# dict (no C1 keys) must still parse, defaulting the new fields.
+# ---------------------------------------------------------------------------
+
+
+def test_session_record_round_trip_includes_new_c1_fields() -> None:
+    r = _make_record()
+    assert sr.SessionRecord.from_dict(r.to_dict()) == r
+    assert sr.SessionRecord.from_json(r.to_json()) == r
+
+    # A display whose optional wm_window_id/tmux_target are both None must
+    # also round-trip losslessly (None-safe nested (dis)assembly).
+    r_none_optionals = _make_record(
+        display=sr.Display(
+            kind='wm', wm_title='unblock:df#2085 slug', wm_window_id=None, tmux_target=None
+        ),
+    )
+    assert sr.SessionRecord.from_dict(r_none_optionals.to_dict()) == r_none_optionals
+    assert sr.SessionRecord.from_json(r_none_optionals.to_json()) == r_none_optionals
+
+    # A record with no parent/display/question at all (the common
+    # human-launched-root shape) must also round-trip losslessly.
+    r_all_none = _make_record(parent_session_id=None, display=None, question=None)
+    assert sr.SessionRecord.from_dict(r_all_none.to_dict()) == r_all_none
+    assert sr.SessionRecord.from_json(r_all_none.to_json()) == r_all_none
+
+
+def test_session_record_parses_rail_vintage_dict_migration_free() -> None:
+    """A dict written by the pre-C1 (rail) module -- containing only the
+    original schema keys, no parent_session_id/spawn_mode/display/question --
+    must still parse via from_dict without raising, defaulting the new C1
+    fields to None/'child'/None/None (migration-free additive contract).
+    """
+    rail_vintage = {
+        'schema_version': 1,
+        'session_slug': 'unblock-df-2085-4242',
+        'title': 'unblock:df#2085 routing-mechanism',
+        'role': 'unblock',
+        'project': 'df',
+        'task_id': '2085',
+        'escalation_id': 'esc-1',
+        'prompt': '/unblock 2085',
+        'cwd': '/home/leo/src/dark-factory',
+        'launcher_pid': 4242,
+        'start_ts': '2026-07-07T00:00:00+00:00',
+        'status': 'launching',
+        'exit_code': None,
+        'result_file': None,
+        'transcript_path': '~/.claude/projects/-home-leo-src-dark-factory',
+    }
+    record = sr.SessionRecord.from_dict(rail_vintage)
+    assert record.parent_session_id is None
+    assert record.spawn_mode == sr.SpawnMode.CHILD
+    assert record.display is None
+    assert record.question is None
+
+
+def test_schema_minor_is_int_bumped() -> None:
+    assert isinstance(sr.SCHEMA_MINOR, int)
+    assert sr.SCHEMA_MINOR >= 1
+    # The PERSISTED major must stay migration-free: bumping it would make
+    # rail-vintage and C1 records version-distinguishable on disk.
+    assert sr.SCHEMA_VERSION == 1
+
+
+def test_spawn_mode_enum_values() -> None:
+    assert issubclass(sr.SpawnMode, str)
+    assert {m.value for m in sr.SpawnMode} == {'child', 'sibling', 'detached'}
+    assert sr.SpawnMode.CHILD.value == 'child'
+    assert sr.SpawnMode.SIBLING.value == 'sibling'
+    assert sr.SpawnMode.DETACHED.value == 'detached'
+
+
+def test_display_kind_enum_values() -> None:
+    assert issubclass(sr.DisplayKind, str)
+    assert {m.value for m in sr.DisplayKind} == {'wm', 'tmux'}
+    assert sr.DisplayKind.WM.value == 'wm'
+    assert sr.DisplayKind.TMUX.value == 'tmux'
+
+
+def test_display_round_trip() -> None:
+    with_optionals = sr.Display(
+        kind='wm', wm_title='unblock:df#2085 slug', wm_window_id='0x1a', tmux_target=None
+    )
+    assert sr.Display.from_dict(with_optionals.to_dict()) == with_optionals
+
+    without_optionals = sr.Display(
+        kind='tmux', wm_title='', wm_window_id=None, tmux_target='session:0.1'
+    )
+    assert sr.Display.from_dict(without_optionals.to_dict()) == without_optionals
+
+
+def test_question_round_trip() -> None:
+    q = sr.Question(text='approve rollout?', asked_at='2026-07-07T00:00:00+00:00')
+    assert sr.Question.from_dict(q.to_dict()) == q
 
 
 # ---------------------------------------------------------------------------
