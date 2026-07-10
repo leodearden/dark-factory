@@ -825,3 +825,53 @@ def test_claim_lease_acquires_a_free_lease(tmp_path: Path) -> None:
     lease_path = sr.lease_path_for_name('watcher-df', root=tmp_path)
     assert lease_path.is_file()
     assert sr.LeaseHolder.from_json(lease_path.read_text()) == holder
+
+
+# --- claim_lease: held by a live holder ----------------------------------
+
+
+def test_claim_lease_held_by_live_holder_stand_down_policy(tmp_path: Path) -> None:
+    original = sr.LeaseHolder(session_slug='watcher-df-100', pid=os.getpid(), start_ts=_NOW.isoformat())
+    sr.claim_lease('watcher-df', holder=original, root=tmp_path, now=_NOW)
+    lease_path = sr.lease_path_for_name('watcher-df', root=tmp_path)
+    _set_mtime(lease_path, _NOW, timedelta(seconds=42))
+
+    contender = sr.LeaseHolder(session_slug='watcher-df-200', pid=os.getpid(), start_ts=_NOW.isoformat())
+    claim = sr.claim_lease(
+        'watcher-df', holder=contender, policy=sr.LeasePolicy.STAND_DOWN, root=tmp_path, now=_NOW
+    )
+
+    assert claim.acquired is False
+    assert claim.decision == sr.LeaseDecision.STAND_DOWN
+    assert claim.holder is not None
+    assert claim.holder.session_slug == 'watcher-df-100'
+    assert claim.holder_alive is True
+    assert claim.heartbeat_age_secs == 42
+    assert claim.message == 'lease held by watcher-df-100 (alive, heartbeat 42s ago) — standing down'
+    # No clobber: the on-disk body still names the ORIGINAL holder.
+    assert sr.LeaseHolder.from_json(lease_path.read_text()) == original
+
+
+def test_claim_lease_held_by_live_holder_warn_and_proceed_policy(tmp_path: Path) -> None:
+    original = sr.LeaseHolder(session_slug='watcher-df-100', pid=os.getpid(), start_ts=_NOW.isoformat())
+    sr.claim_lease('unblock-df#2085', holder=original, root=tmp_path, now=_NOW)
+    lease_path = sr.lease_path_for_name('unblock-df#2085', root=tmp_path)
+    _set_mtime(lease_path, _NOW, timedelta(seconds=42))
+
+    contender = sr.LeaseHolder(session_slug='unblock-df-200', pid=os.getpid(), start_ts=_NOW.isoformat())
+    claim = sr.claim_lease(
+        'unblock-df#2085',
+        holder=contender,
+        policy=sr.LeasePolicy.WARN_AND_PROCEED,
+        root=tmp_path,
+        now=_NOW,
+    )
+
+    assert claim.acquired is False
+    assert claim.decision == sr.LeaseDecision.PROCEED
+    assert claim.holder is not None
+    assert claim.holder.session_slug == 'watcher-df-100'
+    assert 'lease held by watcher-df-100' in claim.message
+    assert 'proceeding' in claim.message
+    # No clobber: the on-disk body still names the ORIGINAL holder.
+    assert sr.LeaseHolder.from_json(lease_path.read_text()) == original
