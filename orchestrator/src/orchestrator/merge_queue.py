@@ -4586,6 +4586,120 @@ key entirely, never a backward edge on this one.
 """
 
 
+def _request_id_of(obj: MergeRequest | SpeculativeItem | InflightEntry) -> str:
+    """Return the stable request_id for *obj* (merge-queue-reliability PRD
+    scope-4 kappa / task 2169).
+
+    ``SpeculativeMergeWorker._live_items`` holds three different shapes
+    across a request's pipeline lifetime — a :class:`MergeRequest`
+    pre-merge, a :class:`SpeculativeItem` (``RealMergeItem | DecidedItem``)
+    in-flight to the verifier, an :class:`InflightEntry` once dispatched —
+    all keyed by the SAME request_id, so ``_register_item``/``_note_transition``
+    callers can pass whichever shape they are currently holding without a
+    per-call-site type check.
+    """
+    if isinstance(obj, InflightEntry):
+        return obj.item.request.request_id
+    if isinstance(obj, MergeRequest):
+        return obj.request_id
+    return obj.request.request_id
+
+
+_LIFECYCLE_TRANSITION_REJECTED_SENTINEL_PREFIX = '__merge_lifecycle_transition_rejected__'
+
+
+def _lifecycle_transition_rejected_sentinel(request_id: str) -> str:
+    """Return the per-request dedup sentinel task_id for rejected-transition alarms."""
+    return f'{_LIFECYCLE_TRANSITION_REJECTED_SENTINEL_PREFIX}{request_id}'
+
+
+def _alarm_illegal_lifecycle_transition(
+    escalation_queue: Any,
+    request_id: str,
+    from_state: ItemLifecycleState,
+    to_state: ItemLifecycleState,
+    exc: IllegalLifecycleTransition,
+    *,
+    event_store: Any = None,
+) -> None:
+    """Submit a dedup'd L1 escalation for a rejected :class:`ItemLifecycle`
+    transition (merge-queue-reliability PRD scope-4 kappa / task 2169).
+
+    Modeled verbatim on
+    :func:`orchestrator.merge_request_ledger._alarm_merge_request_stuck`.
+    Fires at most ONCE per open episode per request_id (dedup'd via
+    ``has_open_l1``). Called by :meth:`SpeculativeMergeWorker._note_transition`
+    when a wired put/pop call site's belief about an item's lifecycle state
+    disagrees with the registry — a wiring-bug signal, not itself a merge
+    failure. OBSERVATION + ESCALATION only: never mutates queue/inflight
+    state or halts the pipeline (PRD design decision 4: invariants escalate
+    loudly, degrade never).
+
+    * ``level=1`` (L1 blocking).
+    * ``category='merge_lifecycle_transition_rejected'``
+    * ``task_id=_lifecycle_transition_rejected_sentinel(request_id)``
+
+    None-safe: returns immediately when *escalation_queue* is None.
+    Dedup: returns immediately when an open L1 already exists for the sentinel.
+    """
+    if escalation_queue is None:
+        return
+
+    sentinel = _lifecycle_transition_rejected_sentinel(request_id)
+
+    # Dedup: don't re-alarm while an open L1 already exists for this request.
+    if escalation_queue.has_open_l1(sentinel):
+        return
+
+    from escalation.models import Escalation  # local import — escalation optional dep
+
+    summary = (
+        f'ItemLifecycle rejected a transition for request_id {request_id!r}: '
+        f'{from_state!r} -> {to_state!r}'
+    )
+    detail = (
+        f'request_id: {request_id}\n'
+        f'attempted transition: {from_state!r} -> {to_state!r}\n'
+        f'ItemLifecycle.transition() error: {exc}\n'
+        '\n'
+        'A wired put/pop call site disagreed with the ItemLifecycle registry '
+        '(unregistered request_id, an edge outside _LEGAL_TRANSITIONS, or a '
+        'stale from_state belief). The registry state was left UNCHANGED and '
+        'no pipeline state was mutated (PRD design decision 4: invariants '
+        'escalate loudly, degrade never) — this is a wiring-bug signal, not '
+        'itself a merge failure.'
+    )
+
+    esc = Escalation(
+        id=escalation_queue.make_id(sentinel),
+        task_id=sentinel,
+        agent_role='orchestrator-merge-lifecycle-monitor',
+        severity='blocking',
+        level=1,
+        category='merge_lifecycle_transition_rejected',
+        summary=summary,
+        detail=detail,
+        suggested_action=(
+            f'Inspect the ItemLifecycle wiring for request_id {request_id!r} '
+            f'around the {from_state!r} -> {to_state!r} call site; the '
+            'registry and the actual pipeline state have diverged.'
+        ),
+    )
+    escalation_queue.submit(esc)
+
+    if event_store is not None:
+        from orchestrator.event_store import EventType
+
+        event_store.emit(
+            EventType.escalation_created,
+            data={
+                'request_id': request_id,
+                'from_state': str(from_state),
+                'to_state': str(to_state),
+            },
+        )
+
+
 class SpeculativeMergeWorker(_WipHaltMixin):
     """Two-coroutine speculative merge-verify pipeline.
 
@@ -4909,6 +5023,18 @@ class SpeculativeMergeWorker(_WipHaltMixin):
         self._verifier_task: asyncio.Task | None = None
         self._heartbeat_task: asyncio.Task | None = None
         self._reprobe_task: asyncio.Task | None = None
+        # MQ-reliability kappa (task 2169): single source of truth for every
+        # in-flight item's lifecycle state, keyed by request_id (see
+        # ItemLifecycle's docstring above). Wired at every put/pop chokepoint
+        # by _register_item/_note_transition/_retire_item below. Lockstep
+        # `_live_items` holds the actual rich object (MergeRequest |
+        # SpeculativeItem | InflightEntry) for each non-terminal request_id —
+        # the registry alone only stores request_id -> ItemLifecycleState, but
+        # snapshot()/occupancy/verify_in_progress need the rich object, so the
+        # two are mutated together at the same chokepoints and can never
+        # disagree on membership.
+        self._lifecycle = ItemLifecycle()
+        self._live_items: dict[str, MergeRequest | SpeculativeItem | InflightEntry] = {}
         # In-flight request being processed by the merger loop. Set after
         # dequeue, cleared after the SpeculativeItem is pushed to the verifier
         # queue. Used by stop() to resolve Futures for requests that were
@@ -5157,6 +5283,90 @@ class SpeculativeMergeWorker(_WipHaltMixin):
         # dedup'd L1 escalation (_alarm_resource_audit) fires. See
         # _check_resource_audit for the full contract.
         self._resource_audit_violation_streak: int = 0
+
+    # ── MQ-reliability kappa (task 2169): ItemLifecycle chokepoint helpers ──
+    # register/transition/retire an item's lifecycle state + the lockstep
+    # `_live_items` object index in ONE place each, so every put/pop wiring
+    # site below calls one of these three rather than touching
+    # self._lifecycle/self._live_items directly.
+
+    def _register_item(
+        self,
+        obj: MergeRequest | SpeculativeItem | InflightEntry,
+        initial: ItemLifecycleState = ItemLifecycleState.QUEUED,
+    ) -> str:
+        """Register *obj* in the lifecycle registry at *initial* and index it
+        in ``_live_items`` by request_id.
+
+        Returns the request_id for convenience at call sites that need it
+        right after registering. Raises ``ValueError`` if *obj*'s request_id
+        is already registered — a genuine duplicate-register programming
+        error (see :meth:`ItemLifecycle.register`'s docstring), NOT wrapped
+        in the best-effort-loud handling :meth:`_note_transition` uses for
+        edge violations: there is no legal way to recover from registering
+        the same in-flight attempt twice.
+        """
+        rid = _request_id_of(obj)
+        self._lifecycle.register(rid, initial=initial)
+        self._live_items[rid] = obj
+        return rid
+
+    def _note_transition(
+        self,
+        request_id: str,
+        from_state: ItemLifecycleState,
+        to_state: ItemLifecycleState,
+        *,
+        live_obj: MergeRequest | SpeculativeItem | InflightEntry | None = None,
+    ) -> None:
+        """Best-effort-loud wrapper around :meth:`ItemLifecycle.transition`.
+
+        NEVER raises — merge_queue.py is the #1-reliability file, and a
+        mis-wired call site must never wedge the merger/verifier hot path
+        (PRD design decision 4: invariants escalate loudly, degrade never).
+        ``IllegalLifecycleTransition`` (unregistered request_id, an edge
+        outside ``_LEGAL_TRANSITIONS``, or a stale *from_state* belief) is
+        caught, logged at WARNING, and reported via a dedup'd L1 escalation
+        (:func:`_alarm_illegal_lifecycle_transition`) instead of propagating.
+        The registry state is left UNCHANGED on rejection (same contract as
+        the wrapped ``transition()`` call).
+
+        *live_obj*, when given, replaces ``_live_items[request_id]`` — used
+        by call sites where the transition also changes the item's shape
+        (e.g. a ``MergeRequest`` becoming a ``SpeculativeItem`` at merge
+        time). Only applied on a SUCCESSFUL transition; omitted (``None``,
+        the default) when the caller's existing ``_live_items`` entry is
+        still the correct object (e.g. an in-place ``InflightEntry.phase``
+        mutation) or the object isn't tracked yet.
+        """
+        try:
+            self._lifecycle.transition(request_id, from_state, to_state)
+        except IllegalLifecycleTransition as exc:
+            logger.warning(
+                'ItemLifecycle: rejected transition for request_id=%s (%s -> %s): %s',
+                request_id, from_state, to_state, exc,
+            )
+            _alarm_illegal_lifecycle_transition(
+                self._escalation_queue, request_id, from_state, to_state, exc,
+                event_store=self._event_store,
+            )
+            return
+        if live_obj is not None:
+            self._live_items[request_id] = live_obj
+
+    def _retire_item(self, request_id: str) -> None:
+        """Best-effort transition *request_id* to TERMINAL then drop it from
+        ``_live_items``.
+
+        Safe to call on an already-TERMINAL or unregistered request_id —
+        both are treated as nothing-left-to-retire (no :meth:`_note_transition`
+        call) and the ``_live_items`` pop always runs so a stale reference is
+        never leaked either way.
+        """
+        current = self._lifecycle.current(request_id)
+        if current is not None and current != ItemLifecycleState.TERMINAL:
+            self._note_transition(request_id, current, ItemLifecycleState.TERMINAL)
+        self._live_items.pop(request_id, None)
 
     # ── δ=1988 SuffixConflictTracker delegation ─────────────────────────────
     # Data-descriptor properties forwarding the original attribute names to
