@@ -80,6 +80,15 @@ class DetailPane(Static):
     rendered widget.
     """
 
+    DEFAULT_CSS = """
+    DetailPane {
+        width: 1fr;
+        height: 1fr;
+        overflow-y: auto;
+        padding: 1 2;
+    }
+    """
+
     def __init__(self, *args, **kwargs) -> None:
         super().__init__(*args, **kwargs)
         self.rendered_text = _NO_SELECTION_PLACEHOLDER
@@ -92,6 +101,8 @@ class DetailPane(Static):
     ) -> None:
         """Render *record*'s detail, or a placeholder when *record* is None (no selection)."""
         self.rendered_text = (
-            render_detail(record, all_records, now) if record is not None else _NO_SELECTION_PLACEHOLDER
+            render_detail(record, all_records, now)
+            if record is not None
+            else _NO_SELECTION_PLACEHOLDER
         )
         self.update(self.rendered_text)

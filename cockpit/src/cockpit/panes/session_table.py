@@ -160,6 +160,13 @@ class SessionTable(DataTable):
     from the row an operator is looking at.
     """
 
+    DEFAULT_CSS = """
+    SessionTable {
+        width: 1fr;
+        height: 1fr;
+    }
+    """
+
     def __init__(self, *args, **kwargs) -> None:
         kwargs.setdefault('cursor_type', 'row')
         super().__init__(*args, **kwargs)
