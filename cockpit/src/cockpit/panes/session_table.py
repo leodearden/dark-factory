@@ -12,6 +12,9 @@ from __future__ import annotations
 
 from datetime import UTC, datetime
 
+from textual.widgets import DataTable
+from textual.widgets.data_table import RowDoesNotExist
+
 from orchestrator.session_registry import TERMINAL_STATUSES, SessionRecord, Status
 
 _GLYPHS: dict[Status, str] = {
@@ -147,3 +150,52 @@ def order_sessions(records: list[SessionRecord]) -> list[SessionRecord]:
         records,
         key=lambda record: (_state_rank(record.status), _start_ts_sort_key(record.start_ts)),
     )
+
+
+class SessionTable(DataTable):
+    """The session-registry table: one row per session, keyed by session_slug.
+
+    Columns: state glyph / title / age / project / outstanding children.
+    Selection-preserving: replace_rows re-locates the previously highlighted
+    session_slug after a rebuild, so a poll tick never yanks the cursor away
+    from the row an operator is looking at.
+    """
+
+    def __init__(self, *args, **kwargs) -> None:
+        kwargs.setdefault('cursor_type', 'row')
+        super().__init__(*args, **kwargs)
+
+    def on_mount(self) -> None:
+        self.add_columns('', 'title', 'age', 'project', 'children')
+
+    def highlighted_slug(self) -> str | None:
+        """Return the session_slug of the currently-highlighted row, or None if empty."""
+        if self.row_count == 0:
+            return None
+        row_key = self.coordinate_to_cell_key(self.cursor_coordinate).row_key
+        return row_key.value
+
+    def replace_rows(self, records: list[SessionRecord], now: datetime) -> None:
+        """Rebuild rows from *records* (already ordered), preserving the cursor by slug.
+
+        *records* is the FULL record set (ordered) -- outstanding-children
+        counts are computed against it, not a filtered subset.
+        """
+        previous_slug = self.highlighted_slug()
+        self.clear()
+        for record in records:
+            self.add_row(
+                state_glyph(record.status),
+                format_title(record),
+                format_age(record.start_ts, now),
+                record.project,
+                str(count_outstanding_children(record.session_slug, records)),
+                key=record.session_slug,
+            )
+        if not self.row_count:
+            return
+        if previous_slug is not None:
+            try:
+                self.move_cursor(row=self.get_row_index(previous_slug))
+            except RowDoesNotExist:
+                self.move_cursor(row=0)

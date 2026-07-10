@@ -13,6 +13,8 @@ import logging
 from datetime import datetime
 from pathlib import Path
 
+from textual.widgets import Static
+
 from orchestrator.session_registry import SessionRecord
 
 from cockpit.panes.session_table import format_age, format_title, state_glyph
@@ -64,3 +66,7 @@ def render_detail(record: SessionRecord, all_records: list[SessionRecord], now: 
     lines.append('--- result ---')
     lines.append(result_file_tail(record.result_file))
     return '\n'.join(lines)
+
+
+class DetailPane(Static):
+    """Renders a single session's full detail (render_detail's plain text)."""
