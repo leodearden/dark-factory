@@ -7683,13 +7683,24 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                 req = self._lane_buffers[lane].popleft()
                 if not req.result.done():
                     req.result.set_result(shutdown)
+                # MQ-reliability kappa (task 2169): stop() is a genuine last-
+                # container exit for this request_id — retire unconditionally
+                # (even if the Future was already done) or it leaks forever.
+                self._retire_item(req.request_id)
 
         # Drain main queue (items not yet drained into lane buffers)
         while not self._queue.empty():
             try:
                 req = self._queue.get_nowait()
-                if req is not None and not req.result.done():
-                    req.result.set_result(shutdown)
+                # MQ-reliability kappa (task 2169): req may be the shutdown
+                # sentinel itself (None) — guard before touching request_id.
+                # A raw-queue item may also be genuinely pre-registry (never
+                # drained); _retire_item is a documented no-op for an
+                # unregistered request_id either way.
+                if req is not None:
+                    if not req.result.done():
+                        req.result.set_result(shutdown)
+                    self._retire_item(req.request_id)
             except asyncio.QueueEmpty:
                 break
 
@@ -7720,6 +7731,9 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                             )
                     if not _harvested.request.result.done():
                         _harvested.request.result.set_result(shutdown)
+                    # MQ-reliability kappa (task 2169): last sighting of this
+                    # request_id — retire it.
+                    self._retire_item(_harvested.request.request_id)
             elif not _pvg.done():
                 _pvg.cancel()
 
@@ -7738,6 +7752,9 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                             await self._cleanup_owned_merge_worktree(_item_wt)
                     if not item.request.result.done():
                         item.request.result.set_result(shutdown)
+                    # MQ-reliability kappa (task 2169): retire — this item
+                    # never proceeds past AWAITING_VERIFY once drained here.
+                    self._retire_item(item.request.request_id)
             except asyncio.QueueEmpty:
                 break
 
@@ -7751,6 +7768,10 @@ class SpeculativeMergeWorker(_WipHaltMixin):
             _ie_req = _ie.item.request
             if not _ie_req.result.done():
                 _ie_req.result.set_result(shutdown)
+            # MQ-reliability kappa (task 2169): retire — this entry never
+            # reaches its own FINALIZING/TERMINAL transition once stop()
+            # short-circuits it here.
+            self._retire_item(_ie_req.request_id)
             if _ie.verify_task is not None and not _ie.verify_task.done():
                 # Fire remote cancel BEFORE task.cancel() so the remote
                 # verify-merge process is signalled while _inflight_request_id
@@ -7786,6 +7807,9 @@ class SpeculativeMergeWorker(_WipHaltMixin):
             _rd = self._redispatch.popleft()
             if not _rd.request.result.done():
                 _rd.request.result.set_result(shutdown)
+            # MQ-reliability kappa (task 2169): retire — parked awaiting
+            # re-dispatch, never reaches DISPATCHING again once dropped here.
+            self._retire_item(_rd.request.request_id)
             _rd_wt = item_merge_wt(_rd)
             if _rd_wt is not None:
                 with contextlib.suppress(BaseException):
@@ -7821,6 +7845,8 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                             await self._cleanup_owned_merge_worktree(_item_wt)
                     if not item.request.result.done():
                         item.request.result.set_result(shutdown)
+                    # MQ-reliability kappa (task 2169): retire.
+                    self._retire_item(item.request.request_id)
             except asyncio.QueueEmpty:
                 break
 
@@ -7832,8 +7858,13 @@ class SpeculativeMergeWorker(_WipHaltMixin):
         while not self._queue.empty():
             try:
                 req_post = self._queue.get_nowait()
-                if req_post is not None and not req_post.result.done():
-                    req_post.result.set_result(shutdown)
+                # MQ-reliability kappa (task 2169): guard against the None
+                # shutdown sentinel (already put on _queue above) before
+                # touching request_id — mirrors the first-pass drain's guard.
+                if req_post is not None:
+                    if not req_post.result.done():
+                        req_post.result.set_result(shutdown)
+                    self._retire_item(req_post.request_id)
             except asyncio.QueueEmpty:
                 break
 
@@ -8285,6 +8316,13 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                 s_req.result.set_result(
                     MergeOutcome('superseded', superseded_by=train_id)
                 )
+            # MQ-reliability kappa (task 2169): each absorbed single's OWN
+            # request_id is a genuine terminal exit here — it never proceeds
+            # past coalescing under its own id (the new GroupMergeRequest is
+            # a separate, already-registered request_id) — so retire it
+            # unconditionally, mirroring _resolve_or_drop_abandoned's
+            # always-retire semantics.
+            self._retire_item(s_req.request_id)
 
         # EMIT train_coalesced lifecycle event.
         _emit_train_event(
@@ -8449,6 +8487,11 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                     # ι=1894 amend: drop stashed drift base — request retired without
                     # landing or conflict detection, so it would otherwise leak forever.
                     self._drift_base.pop(req.request_id, None)
+                    # MQ-reliability kappa (task 2169): this request never
+                    # proceeds past MERGING — retire it here or it leaks in
+                    # the registry forever (no Future is ever resolved on
+                    # this path; the waiter already cancelled it).
+                    self._retire_item(req.request_id)
                     continue
                 if self._event_store is not None:
                     self._event_store.emit(
@@ -10805,6 +10848,12 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                 with contextlib.suppress(BaseException):
                     await self._cleanup_owned_merge_worktree(_abandon_wt)
             self._remerge_occurred = False  # abandon → reset chain flag
+            # MQ-reliability kappa (task 2169): retire at this, the item's
+            # own return site (mirrors the REQUEUED_PREDISPATCH branch's
+            # own _note_requeue call below) — no Future is ever resolved on
+            # this path (the waiter already cancelled it), so retirement is
+            # the only observable exit for this request_id.
+            self._retire_item(req.request_id)
             return InflightEntry(
                 item=item,
                 lease=None,
