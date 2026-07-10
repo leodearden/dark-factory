@@ -796,3 +796,47 @@ class TestRun:
         assert not report.get('aborted')
         assert report['dry_run'] is True
         assert 'totals' in report
+
+    @pytest.mark.asyncio
+    async def test_scan_limit_decoupled_from_deletion_cap(self):
+        """--scan-limit governs ONLY the scroll window; --limit-per-project
+        governs ONLY the deletion safety cap. A large scan_limit alongside a
+        small limit_per_project still aborts on the deletion cap (not the
+        scan), proving the two knobs are independent."""
+        memory = self._make_memory(self._fixture_records())
+        args = self._args(
+            apply=False, project_id='dark_factory',
+            limit_per_project=1, scan_limit=5000,
+        )
+
+        result = await _mod.run(args, memory=memory, known_projects_map=self._known_map())
+
+        memory.mem0.scroll_by_metadata.assert_awaited_once()
+        call = memory.mem0.scroll_by_metadata.call_args
+        assert call.kwargs.get('limit') == 5000
+
+        assert result.get('aborted') is True
+        assert result.get('exceeding_projects') == ['dark_factory']
+        assert 'scan_truncated' not in result
+
+
+# ===========================================================================
+# Tests: build_parser (argparse) -- --scan-limit / --limit-per-project
+# ===========================================================================
+
+class TestArgparse:
+    """build_parser() constructs the CLI parser used by main(). --scan-limit
+    (the scroll window) and --limit-per-project (the deletion safety cap)
+    are independent flags with independent defaults."""
+
+    def test_scan_limit_default(self):
+        args = _mod.build_parser().parse_args([])
+        assert args.scan_limit == _mod._DEFAULT_SCAN_LIMIT
+        assert args.limit_per_project == 1000
+
+    def test_scan_limit_and_cap_are_independent(self):
+        args = _mod.build_parser().parse_args(
+            ['--scan-limit', '2000', '--limit-per-project', '50'],
+        )
+        assert args.scan_limit == 2000
+        assert args.limit_per_project == 50
