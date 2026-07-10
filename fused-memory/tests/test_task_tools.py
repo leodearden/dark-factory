@@ -560,22 +560,25 @@ async def test_update_task_accepts_empty_files_list(
 @pytest.mark.asyncio
 @pytest.mark.parametrize('bad_status', ['done', 'pending', 'cancelled', 'in-progress', 'blocked'])
 async def test_update_task_rejects_status_kwarg(
-    mcp_server_with_tasks, task_interceptor, bad_status,
+    real_task_stack, tmp_path, bad_status,
 ):
     """update_task with status= is rejected — agents must use set_task_status.
 
     Closes the bypass route used to mark reify tasks done without going through
-    the terminal-exit, phantom-done, and done-provenance gates.
+    the terminal-exit, phantom-done, and done-provenance gates. The
+    enforcement point is the SqliteTaskBackend write-authority floor (task
+    C1), surfaced through the interceptor as the canonical
+    status_via_update_task rejection dict (task C2) — drive through the real
+    stack rather than asserting on a mocked interceptor.
     """
-    result = await mcp_server_with_tasks._tool_manager.call_tool(
+    from fused_memory.backends.task_backend_errors import status_via_update_task_error
+
+    server, _interceptor = real_task_stack
+    result = await server._tool_manager.call_tool(
         'update_task',
-        {'id': '1', 'project_root': '/project', 'status': bad_status},
+        {'id': '1', 'project_root': str(tmp_path), 'status': bad_status},
     )
-    assert isinstance(result, dict)
-    assert result.get('error') == 'status_via_update_task'
-    assert result.get('status') == bad_status
-    assert 'set_task_status' in result.get('hint', '')
-    task_interceptor.update_task.assert_not_called()
+    assert result == status_via_update_task_error('1', bad_status)
 
 
 @pytest.mark.asyncio
