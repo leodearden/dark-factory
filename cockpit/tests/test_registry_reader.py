@@ -83,3 +83,81 @@ class TestScanSessions:
         result = scan_sessions(tmp_path)
 
         assert result == []
+
+
+class TestBuildSnapshot:
+    def test_keyed_by_session_slug(self):
+        from cockpit.registry_reader import build_snapshot
+
+        records = [
+            _make_record(session_slug='a-1', status=sr.Status.RUNNING),
+            _make_record(session_slug='b-2', status=sr.Status.IDLE),
+        ]
+
+        snapshot = build_snapshot(records)
+
+        assert set(snapshot.keys()) == {'a-1', 'b-2'}
+
+    def test_excludes_start_ts_and_age(self):
+        """Two records identical except start_ts must snapshot identically."""
+        from cockpit.registry_reader import build_snapshot
+
+        early = _make_record(session_slug='a-1', start_ts='2026-07-01T00:00:00+00:00')
+        late = _make_record(session_slug='a-1', start_ts='2026-07-07T00:00:00+00:00')
+
+        assert build_snapshot([early]) == build_snapshot([late])
+
+
+class TestSnapshotChanged:
+    def test_identical_record_sets_are_unchanged(self):
+        from cockpit.registry_reader import build_snapshot, snapshot_changed
+
+        records = [
+            _make_record(session_slug='a-1', status=sr.Status.RUNNING),
+            _make_record(session_slug='b-2', status=sr.Status.AWAITING_INPUT),
+        ]
+
+        old = build_snapshot(records)
+        new = build_snapshot(records)
+
+        assert snapshot_changed(old, new) is False
+
+    def test_only_wall_clock_age_differing_is_unchanged(self):
+        """Same records, only start_ts differs -> still no-change (age-independent)."""
+        from cockpit.registry_reader import build_snapshot, snapshot_changed
+
+        old = build_snapshot([_make_record(start_ts='2026-07-01T00:00:00+00:00')])
+        new = build_snapshot([_make_record(start_ts='2026-07-07T00:00:00+00:00')])
+
+        assert snapshot_changed(old, new) is False
+
+    def test_added_record_is_changed(self):
+        from cockpit.registry_reader import build_snapshot, snapshot_changed
+
+        old = build_snapshot([_make_record(session_slug='a-1')])
+        new = build_snapshot(
+            [_make_record(session_slug='a-1'), _make_record(session_slug='b-2')]
+        )
+
+        assert snapshot_changed(old, new) is True
+
+    def test_removed_record_is_changed(self):
+        from cockpit.registry_reader import build_snapshot, snapshot_changed
+
+        old = build_snapshot(
+            [_make_record(session_slug='a-1'), _make_record(session_slug='b-2')]
+        )
+        new = build_snapshot([_make_record(session_slug='a-1')])
+
+        assert snapshot_changed(old, new) is True
+
+    def test_substantive_field_change_is_changed(self):
+        """status running -> awaiting-input on the same slug must diff as changed."""
+        from cockpit.registry_reader import build_snapshot, snapshot_changed
+
+        old = build_snapshot([_make_record(session_slug='a-1', status=sr.Status.RUNNING)])
+        new = build_snapshot(
+            [_make_record(session_slug='a-1', status=sr.Status.AWAITING_INPUT)]
+        )
+
+        assert snapshot_changed(old, new) is True
