@@ -1329,12 +1329,22 @@ class VerifyRunnerPool:
         spec: MergeVerifySpec,
         *,
         attempt: int = 0,
+        depth: int | None = None,
+        speculative: bool | None = None,
     ) -> VerifyResult:
         """Run the verify bundle and emit a merge_verify event.
 
         ``attempt`` is 0 for the first dispatch and incremented for each
         ENOSPC-retry re-dispatch.  Included in the event data so consumers
         can deduplicate multiple events for the same logical merge-verify.
+
+        ``depth``/``speculative`` (task 2340) default to ``None`` and are
+        always included in the emitted event data (never omitted), so the
+        offline calibration reader can treat ``depth is None`` as "no depth
+        signal" via a plain ``data.get('depth')`` — no KeyError, no
+        per-event schema branching.  Bare/legacy callers that omit both
+        kwargs get ``None`` for each, which is byte-identical to pre-2340
+        behaviour aside from the two extra always-present keys.
 
         Fail-safe (PRD §A Invariant 2 / D5): if the selected runner raises
         RunnerUnavailable, dispatch falls back to the local runner (if
@@ -1391,6 +1401,8 @@ class VerifyRunnerPool:
                     'passed': result.passed,
                     'duration_ms': duration_ms,
                     'attempt': attempt,
+                    'depth': depth,
+                    'speculative': speculative,
                 },
             )
 
