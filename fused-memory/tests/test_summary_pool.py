@@ -13,17 +13,21 @@ recon_pool/trim_source (stage1 vs stage2 pool names) specifically to prove the
 core is generic and not accidentally hardcoded to the Stage 2 pool.
 """
 
+import json
 import logging
+from datetime import UTC, datetime
 from types import SimpleNamespace
-from unittest.mock import AsyncMock
+from typing import Any
+from unittest.mock import AsyncMock, patch
 
 import pytest
+import pytest_asyncio
 
+from fused_memory.models.reconciliation import StageId, StageReport
+from fused_memory.reconciliation.recon_ledger import ReconLedgerStore
 from fused_memory.reconciliation.summary_pool import (
     enforce_summary_pool_cap,
-    pretrim_summary_pool,
-    reconstruct_cycle_summary_stub,
-    verify_cycle_summary_written,
+    write_cycle_summary,
 )
 
 _LOGGER = 'fused_memory.reconciliation.summary_pool'
@@ -37,39 +41,6 @@ _POOL_PARAMS = pytest.mark.parametrize(
     ],
     ids=['stage2', 'stage1'],
 )
-
-# Parametrize stage across both known stages to prove genericity of the
-# absence self-heal functions (verify_cycle_summary_written,
-# reconstruct_cycle_summary_stub).
-_STAGE_PARAMS = pytest.mark.parametrize(
-    'stage',
-    ['memory_consolidator', 'task_knowledge_sync'],
-    ids=['stage1', 'stage2'],
-)
-
-# Parametrize (stage, recon_pool, reconstruct_source) across both known
-# stages to prove reconstruct_cycle_summary_stub is generic.
-_STAGE_RECON_PARAMS = pytest.mark.parametrize(
-    'stage,recon_pool,reconstruct_source',
-    [
-        ('task_knowledge_sync', 'stage2_cycle_summary', 'stage2_summary_reconstruction'),
-        ('memory_consolidator', 'stage1_cycle_summary', 'stage1_summary_reconstruction'),
-    ],
-    ids=['stage2', 'stage1'],
-)
-
-# Parametrize (stage, recon_pool, reconstruct_source, expected_nonce_prefix)
-# to prove the fallback-stub content's leading nonce label tracks `stage`
-# rather than being hardcoded to Stage 1's (task 2366 amendment).
-_STAGE_NONCE_PARAMS = pytest.mark.parametrize(
-    'stage,recon_pool,reconstruct_source,expected_nonce_prefix',
-    [
-        ('task_knowledge_sync', 'stage2_cycle_summary', 'stage2_summary_reconstruction', 'STAGE2'),
-        ('memory_consolidator', 'stage1_cycle_summary', 'stage1_summary_reconstruction', 'STAGE1'),
-    ],
-    ids=['stage2', 'stage1'],
-)
-
 
 class TestEnforceSummaryPoolCap:
     """enforce_summary_pool_cap trims oldest pool members to the passed cap."""
@@ -323,374 +294,365 @@ class TestEnforceSummaryPoolCapResilience:
         assert 'bad-date-2' not in deleted_ids
 
 
-class TestPretrimSummaryPool:
-    """pretrim_summary_pool delegates to enforce_summary_pool_cap with
-    cap=max(cap-1, 0), reserving one slot for the imminent agent write."""
+class TestWriteCycleSummaryLedgerWrite:
+    """write_cycle_summary (task 2229 W5-λ) writes exactly ONE authoritative
+    ``cycle_summary`` ledger row from a ``StageReport`` — the deterministic
+    Python replacement for the LLM-driven per-cycle summary write (PRD
+    plans/recon-reliability-prd.md §10, boundary test D1).
 
-    def _pool_members(self, count: int, recon_pool: str) -> list:
-        return [
-            {
-                'id': f'summary-{i}',
-                'created_at': f'2026-0{i+1}-01T00:00:00+00:00',
-                'metadata': {'recon_pool': recon_pool},
-            }
-            for i in range(count)
-        ]
-
-    @_POOL_PARAMS
-    @pytest.mark.asyncio
-    async def test_two_members_deletes_one_oldest_returns_one(self, recon_pool, trim_source):
-        """2 pool members → trim to cap-1=1 → delete 1 oldest, returns 1."""
-        memory_service = AsyncMock()
-        memory_service.get_memories_by_metadata = AsyncMock(
-            return_value=self._pool_members(2, recon_pool)
-        )
-        memory_service.delete_memory = AsyncMock(return_value=None)
-
-        result = await pretrim_summary_pool(
-            memory_service,
-            project_id='dark_factory',
-            run_id='run-pre',
-            recon_pool=recon_pool,
-            trim_source=trim_source,
-            cap=2,
-        )
-
-        assert result == 1
-        deleted_ids = {c.kwargs['memory_id'] for c in memory_service.delete_memory.call_args_list}
-        assert deleted_ids == {'summary-0'}
-
-    @_POOL_PARAMS
-    @pytest.mark.asyncio
-    async def test_three_members_deletes_two_oldest_returns_two(self, recon_pool, trim_source):
-        """3 pool members → trim to cap-1=1 → delete 2 oldest, returns 2."""
-        memory_service = AsyncMock()
-        memory_service.get_memories_by_metadata = AsyncMock(
-            return_value=self._pool_members(3, recon_pool)
-        )
-        memory_service.delete_memory = AsyncMock(return_value=None)
-
-        result = await pretrim_summary_pool(
-            memory_service,
-            project_id='dark_factory',
-            run_id='run-pre',
-            recon_pool=recon_pool,
-            trim_source=trim_source,
-            cap=2,
-        )
-
-        assert result == 2
-        deleted_ids = {c.kwargs['memory_id'] for c in memory_service.delete_memory.call_args_list}
-        assert deleted_ids == {'summary-0', 'summary-1'}
-
-    @_POOL_PARAMS
-    @pytest.mark.asyncio
-    async def test_one_member_deletes_nothing_returns_zero(self, recon_pool, trim_source):
-        """1 pool member (already at cap-1=1) → deletes nothing, returns 0."""
-        memory_service = AsyncMock()
-        memory_service.get_memories_by_metadata = AsyncMock(
-            return_value=self._pool_members(1, recon_pool)
-        )
-        memory_service.delete_memory = AsyncMock(return_value=None)
-
-        result = await pretrim_summary_pool(
-            memory_service,
-            project_id='dark_factory',
-            run_id='run-pre',
-            recon_pool=recon_pool,
-            trim_source=trim_source,
-            cap=2,
-        )
-
-        assert result == 0
-        memory_service.delete_memory.assert_not_awaited()
-
-    @pytest.mark.asyncio
-    async def test_delete_called_with_correct_audit_kwargs(self):
-        """delete_memory called with store='mem0', causation_id=run_id, _source=<trim_source>."""
-        memory_service = AsyncMock()
-        memory_service.get_memories_by_metadata = AsyncMock(
-            return_value=self._pool_members(2, 'stage1_cycle_summary')
-        )
-        memory_service.delete_memory = AsyncMock(return_value=None)
-
-        await pretrim_summary_pool(
-            memory_service,
-            project_id='dark_factory',
-            run_id='run-check',
-            recon_pool='stage1_cycle_summary',
-            trim_source='stage1_cycle_summary_trim',
-            cap=2,
-        )
-
-        call_kwargs = memory_service.delete_memory.call_args.kwargs
-        assert call_kwargs['store'] == 'mem0'
-        assert call_kwargs['causation_id'] == 'run-check'
-        assert call_kwargs['_source'] == 'stage1_cycle_summary_trim'
-
-    @pytest.mark.asyncio
-    async def test_cap_zero_does_not_go_negative(self):
-        """cap=0 → pretrim target max(0-1, 0)==0, not -1 (would over-delete via slicing)."""
-        # 1 member, cap=0 -> pretrim target 0 -> the single member is over cap(0) -> deleted.
-        memory_service = AsyncMock()
-        memory_service.get_memories_by_metadata = AsyncMock(
-            return_value=self._pool_members(1, 'stage1_cycle_summary')
-        )
-        memory_service.delete_memory = AsyncMock(return_value=None)
-
-        result = await pretrim_summary_pool(
-            memory_service,
-            project_id='dark_factory',
-            run_id='run-zero',
-            recon_pool='stage1_cycle_summary',
-            trim_source='stage1_cycle_summary_trim',
-            cap=0,
-        )
-
-        assert result == 1
-
-
-class TestVerifyCycleSummaryWritten:
-    """verify_cycle_summary_written: deterministic post-write count check.
-
-    Generalizes task_knowledge_sync.py's _verify_stage2_summary_written
-    (task 2366) — parametrized over `stage` to prove the core is generic,
-    not hardcoded to either Stage 1 or Stage 2.
+    This class covers only the AUTHORITATIVE ledger write. The best-effort
+    Mem0 mirror + pool-cap trim are covered separately in
+    ``TestWriteCycleSummaryMirrorAndTrim`` (step-03/04).
     """
 
-    @_STAGE_PARAMS
-    @pytest.mark.asyncio
-    async def test_returns_positive_count_when_present(self, stage):
-        memory_service = AsyncMock()
-        memory_service.count_memories_by_metadata = AsyncMock(return_value=1)
+    @pytest_asyncio.fixture
+    async def ledger_store(self, tmp_path):
+        s = ReconLedgerStore(tmp_path / 'reconciliation.db')
+        await s.initialize()
+        yield s
+        await s.close()
 
-        result = await verify_cycle_summary_written(
+    def _report(self, **overrides) -> StageReport:
+        defaults: dict[str, Any] = dict(
+            stage=StageId.task_knowledge_sync,
+            started_at=datetime(2026, 7, 10, 11, 0, 0, tzinfo=UTC),
+            completed_at=datetime(2026, 7, 10, 11, 5, 0, tzinfo=UTC),
+            items_flagged=[{'description': 'a'}, {'description': 'b'}],
+            stats={'stage2_stage1_dups_suppressed': 1},
+            llm_calls=4,
+            tokens_used=1234,
+        )
+        defaults.update(overrides)
+        return StageReport(**defaults)
+
+    @pytest.mark.asyncio
+    async def test_writes_one_authoritative_ledger_row_from_report(self, ledger_store):
+        memory_service = AsyncMock()
+        memory_service.recon_ledger = ledger_store
+        report = self._report()
+
+        result = await write_cycle_summary(
             memory_service,
             'dark_factory',
-            'run-present',
-            stage=stage,
+            report,
+            'run-abc',
+            stage='task_knowledge_sync',
+            recon_pool='stage2_cycle_summary',
+            trim_source='stage2_cycle_summary_trim',
+            cap=2,
         )
 
-        assert result == 1
+        assert result is True
 
-    @_STAGE_PARAMS
+        record = await ledger_store.get_by_identity(
+            'dark_factory', 'cycle_summary', flag_type='task_knowledge_sync', run_id='run-abc',
+        )
+        assert record is not None
+        assert record.record_kind == 'cycle_summary'
+        assert record.task_id == ''
+        assert record.flag_type == 'task_knowledge_sync'
+        assert record.run_id == 'run-abc'
+        assert record.state == 'active'
+
+        payload = json.loads(record.payload_json)
+        assert payload['stage'] == 'task_knowledge_sync'
+        assert payload['run_id'] == 'run-abc'
+        assert payload['stats'] == {'stage2_stage1_dups_suppressed': 1}
+        assert payload['items_flagged_count'] == 2
+        assert payload['llm_calls'] == 4
+        assert payload['tokens_used'] == 1234
+
     @pytest.mark.asyncio
-    async def test_returns_zero_when_confirmed_absent(self, stage):
+    async def test_idempotent_repeat_call_same_identity_keeps_one_row_last_write_wins(
+        self, ledger_store,
+    ):
+        """Calling twice with the same (stage, run_id) leaves exactly one row
+        in the ledger (upsert PK semantics), carrying the second call's
+        payload."""
         memory_service = AsyncMock()
-        memory_service.count_memories_by_metadata = AsyncMock(return_value=0)
+        memory_service.recon_ledger = ledger_store
 
-        result = await verify_cycle_summary_written(
+        await write_cycle_summary(
             memory_service,
             'dark_factory',
-            'run-absent',
-            stage=stage,
+            self._report(),
+            'run-dup',
+            stage='task_knowledge_sync',
+            recon_pool='stage2_cycle_summary',
+            trim_source='stage2_cycle_summary_trim',
+            cap=2,
         )
-
-        assert result == 0
-
-    @_STAGE_PARAMS
-    @pytest.mark.asyncio
-    async def test_returns_none_and_logs_warning_on_transient_failure(self, stage, caplog):
-        """A count_memories_by_metadata failure returns None (NOT 0) — absence is
-        NOT confirmed on a transient error."""
-        memory_service = AsyncMock()
-        memory_service.count_memories_by_metadata = AsyncMock(
-            side_effect=RuntimeError('qdrant gone')
-        )
-
-        with caplog.at_level(logging.WARNING, logger=_LOGGER):
-            result = await verify_cycle_summary_written(
-                memory_service,
-                'dark_factory',
-                'run-transient',
-                stage=stage,
-            )
-
-        assert result is None
-        warning_records = [r for r in caplog.records if r.levelno >= logging.WARNING]
-        assert len(warning_records) >= 1
-
-    @_STAGE_PARAMS
-    @pytest.mark.asyncio
-    async def test_count_called_with_exact_triple_filter(self, stage):
-        """The count call must use the exact triple filter — no recon_pool key."""
-        memory_service = AsyncMock()
-        memory_service.count_memories_by_metadata = AsyncMock(return_value=1)
-
-        await verify_cycle_summary_written(
+        result = await write_cycle_summary(
             memory_service,
-            'my_project',
-            'run-xyz',
-            stage=stage,
+            'dark_factory',
+            self._report(
+                items_flagged=[{'description': 'c'}],
+                stats={'different': True},
+                llm_calls=9,
+                tokens_used=999,
+            ),
+            'run-dup',
+            stage='task_knowledge_sync',
+            recon_pool='stage2_cycle_summary',
+            trim_source='stage2_cycle_summary_trim',
+            cap=2,
         )
 
-        memory_service.count_memories_by_metadata.assert_awaited_once()
-        call = memory_service.count_memories_by_metadata.call_args
-        kwargs = call.kwargs
-        assert kwargs.get('project_id') == 'my_project'
-        assert kwargs.get('filters') == {
-            'kind': 'cycle_summary',
-            'run_id': 'run-xyz',
-            'stage': stage,
-        }
+        assert result is True
+
+        db = ledger_store._db
+        cursor = await db.execute(
+            "SELECT COUNT(*) FROM recon_ledger WHERE project_id = ? AND record_kind = 'cycle_summary' "
+            'AND run_id = ?',
+            ('dark_factory', 'run-dup'),
+        )
+        row = await cursor.fetchone()
+        assert row[0] == 1
+
+        record = await ledger_store.get_by_identity(
+            'dark_factory', 'cycle_summary', flag_type='task_knowledge_sync', run_id='run-dup',
+        )
+        payload = json.loads(record.payload_json)
+        assert payload['items_flagged_count'] == 1
+        assert payload['llm_calls'] == 9
+        assert payload['tokens_used'] == 999
+
+    @pytest.mark.asyncio
+    async def test_no_ledger_wired_is_noop_returns_false_does_not_raise(self):
+        """Scoped to the AUTHORITATIVE ledger write only: no ledger means no
+        ledger row and a ``False`` return. This does NOT mean the whole
+        function is a no-op — the best-effort Mem0 mirror and pool-cap trim
+        still run in this scenario; see
+        ``TestWriteCycleSummaryMirrorAndTrim.test_mirror_and_trim_still_run_when_no_ledger_wired``."""
+        memory_service = AsyncMock()
+        memory_service.recon_ledger = None
+
+        result = await write_cycle_summary(
+            memory_service,
+            'dark_factory',
+            self._report(),
+            'run-none',
+            stage='task_knowledge_sync',
+            recon_pool='stage2_cycle_summary',
+            trim_source='stage2_cycle_summary_trim',
+            cap=2,
+        )
+
+        assert result is False
 
 
-class TestReconstructCycleSummaryStub:
-    """reconstruct_cycle_summary_stub: dedup-resilient fallback-stub write.
+class TestWriteCycleSummaryMirrorAndTrim:
+    """write_cycle_summary's best-effort Mem0 mirror (``add_system_record``)
+    and pool-cap trim (``enforce_summary_pool_cap``) — task 2229 W5-λ step-03.
 
-    Generalizes task_knowledge_sync._reconstruct_stage2_summary (task 2366)
-    — parametrized over (stage, recon_pool, reconstruct_source) to prove the
-    core is generic, not hardcoded to either Stage 1 or Stage 2.
+    Both are best-effort: they run UNCONDITIONALLY — regardless of whether a
+    ledger is wired at all (see ``test_mirror_and_trim_still_run_when_no_ledger_wired``,
+    reviewer finding robustness, amendment pass) and regardless of whether
+    the authoritative ledger upsert itself succeeded — and neither can
+    change the return value or propagate an exception out of
+    ``write_cycle_summary`` (which reflects only the authoritative ledger
+    write's own outcome).
     """
 
-    @_STAGE_RECON_PARAMS
-    @pytest.mark.asyncio
-    async def test_first_attempt_lands(self, stage, recon_pool, reconstruct_source):
-        memory_service = AsyncMock()
-        memory_service.add_memory = AsyncMock(return_value={'memory_ids': ['m1']})
+    @pytest_asyncio.fixture
+    async def ledger_store(self, tmp_path):
+        s = ReconLedgerStore(tmp_path / 'reconciliation.db')
+        await s.initialize()
+        yield s
+        await s.close()
 
-        result = await reconstruct_cycle_summary_stub(
-            memory_service,
-            'dark_factory',
-            'run-1',
-            stage=stage,
-            recon_pool=recon_pool,
-            reconstruct_source=reconstruct_source,
+    def _report(self, **overrides) -> StageReport:
+        defaults: dict[str, Any] = dict(
+            stage=StageId.task_knowledge_sync,
+            started_at=datetime(2026, 7, 10, 11, 0, 0, tzinfo=UTC),
+            completed_at=datetime(2026, 7, 10, 11, 5, 0, tzinfo=UTC),
+            items_flagged=[{'description': 'a'}],
+            stats={},
+            llm_calls=1,
+            tokens_used=10,
+        )
+        defaults.update(overrides)
+        return StageReport(**defaults)
+
+    @pytest.mark.asyncio
+    async def test_mirror_write_called_once_with_expected_shape(self, ledger_store):
+        memory_service = AsyncMock()
+        memory_service.recon_ledger = ledger_store
+        memory_service.add_system_record = AsyncMock(
+            return_value=SimpleNamespace(memory_ids=['m1']),
         )
 
-        assert result == 1
-        memory_service.add_memory.assert_awaited_once()
-        kwargs = memory_service.add_memory.call_args.kwargs
+        await write_cycle_summary(
+            memory_service,
+            'dark_factory',
+            self._report(),
+            'run-mirror',
+            stage='task_knowledge_sync',
+            recon_pool='stage2_cycle_summary',
+            trim_source='stage2_cycle_summary_trim',
+            cap=2,
+        )
+
+        memory_service.add_system_record.assert_awaited_once()
+        kwargs = memory_service.add_system_record.call_args.kwargs
+        assert kwargs.get('agent_id') == 'recon-stage-task_knowledge_sync'
         assert kwargs.get('category') == 'observations_and_summaries'
-        assert kwargs.get('project_id') == 'dark_factory'
-        assert kwargs.get('causation_id') == 'run-1'
-        assert kwargs.get('_source') == reconstruct_source
-        assert kwargs.get('metadata') == {
-            'kind': 'cycle_summary',
-            'stage': stage,
-            'run_id': 'run-1',
-            'recon_pool': recon_pool,
-            'reconstructed': True,
-        }
+        assert kwargs.get('causation_id') == 'run-mirror'
+        metadata = kwargs.get('metadata') or {}
+        assert metadata.get('kind') == 'cycle_summary'
+        assert metadata.get('stage') == 'task_knowledge_sync'
+        assert metadata.get('run_id') == 'run-mirror'
+        assert 'recon_pool' not in metadata
+        assert 'run-mirror' in kwargs.get('content', '')
 
-    @_STAGE_RECON_PARAMS
     @pytest.mark.asyncio
-    async def test_dedup_noop_then_retry_lands(self, stage, recon_pool, reconstruct_source):
+    async def test_pool_trim_invoked_with_recon_pool_trim_source_cap(self, ledger_store):
         memory_service = AsyncMock()
-        memory_service.add_memory = AsyncMock(
-            side_effect=[{'memory_ids': []}, {'memory_ids': ['m2']}]
+        memory_service.recon_ledger = ledger_store
+        memory_service.add_system_record = AsyncMock(
+            return_value=SimpleNamespace(memory_ids=['m1']),
         )
 
-        result = await reconstruct_cycle_summary_stub(
-            memory_service,
-            'dark_factory',
-            'run-2',
-            stage=stage,
-            recon_pool=recon_pool,
-            reconstruct_source=reconstruct_source,
-        )
-
-        assert result == 1
-        assert memory_service.add_memory.await_count == 2
-        contents = [
-            c.kwargs.get('content') for c in memory_service.add_memory.call_args_list
-        ]
-        assert contents[0] != contents[1], (
-            'retry must use a fresh nonce so the content differs from the first attempt'
-        )
-
-    @_STAGE_RECON_PARAMS
-    @pytest.mark.asyncio
-    async def test_dedup_noop_twice_returns_zero_and_logs_warning(
-        self, stage, recon_pool, reconstruct_source, caplog
-    ):
-        memory_service = AsyncMock()
-        memory_service.add_memory = AsyncMock(
-            side_effect=[{'memory_ids': []}, {'memory_ids': []}]
-        )
-
-        with caplog.at_level(logging.WARNING, logger=_LOGGER):
-            result = await reconstruct_cycle_summary_stub(
+        with patch(
+            'fused_memory.reconciliation.summary_pool.enforce_summary_pool_cap',
+            AsyncMock(return_value=0),
+        ) as mock_trim:
+            await write_cycle_summary(
                 memory_service,
                 'dark_factory',
-                'run-3',
-                stage=stage,
-                recon_pool=recon_pool,
-                reconstruct_source=reconstruct_source,
+                self._report(),
+                'run-trim',
+                stage='task_knowledge_sync',
+                recon_pool='stage2_cycle_summary',
+                trim_source='stage2_cycle_summary_trim',
+                cap=2,
             )
 
-        assert result == 0
-        assert memory_service.add_memory.await_count == 2
-        warning_records = [r for r in caplog.records if r.levelno >= logging.WARNING]
-        assert len(warning_records) >= 1
+        mock_trim.assert_awaited_once()
+        kwargs = mock_trim.call_args.kwargs
+        assert kwargs.get('recon_pool') == 'stage2_cycle_summary'
+        assert kwargs.get('trim_source') == 'stage2_cycle_summary_trim'
+        assert kwargs.get('cap') == 2
 
-    @_STAGE_RECON_PARAMS
     @pytest.mark.asyncio
-    async def test_add_memory_raises_returns_zero_and_logs_warning(
-        self, stage, recon_pool, reconstruct_source, caplog
-    ):
+    async def test_mirror_failure_swallowed_ledger_write_still_returns_true(self, ledger_store):
         memory_service = AsyncMock()
-        memory_service.add_memory = AsyncMock(side_effect=RuntimeError('mem0 down'))
+        memory_service.recon_ledger = ledger_store
+        memory_service.add_system_record = AsyncMock(side_effect=RuntimeError('mem0 down'))
 
-        with caplog.at_level(logging.WARNING, logger=_LOGGER):
-            result = await reconstruct_cycle_summary_stub(
+        result = await write_cycle_summary(
+            memory_service,
+            'dark_factory',
+            self._report(),
+            'run-mirror-fail',
+            stage='task_knowledge_sync',
+            recon_pool='stage2_cycle_summary',
+            trim_source='stage2_cycle_summary_trim',
+            cap=2,
+        )
+
+        assert result is True
+        record = await ledger_store.get_by_identity(
+            'dark_factory', 'cycle_summary', flag_type='task_knowledge_sync', run_id='run-mirror-fail',
+        )
+        assert record is not None
+
+    @pytest.mark.asyncio
+    async def test_trim_failure_swallowed_ledger_write_still_returns_true(self, ledger_store):
+        memory_service = AsyncMock()
+        memory_service.recon_ledger = ledger_store
+        memory_service.add_system_record = AsyncMock(
+            return_value=SimpleNamespace(memory_ids=['m1']),
+        )
+
+        with patch(
+            'fused_memory.reconciliation.summary_pool.enforce_summary_pool_cap',
+            AsyncMock(side_effect=RuntimeError('trim exploded')),
+        ):
+            result = await write_cycle_summary(
                 memory_service,
                 'dark_factory',
-                'run-4',
-                stage=stage,
-                recon_pool=recon_pool,
-                reconstruct_source=reconstruct_source,
+                self._report(),
+                'run-trim-fail',
+                stage='task_knowledge_sync',
+                recon_pool='stage2_cycle_summary',
+                trim_source='stage2_cycle_summary_trim',
+                cap=2,
             )
 
-        assert result == 0
-        warning_records = [r for r in caplog.records if r.levelno >= logging.WARNING]
-        assert len(warning_records) >= 1
-
-    @_STAGE_NONCE_PARAMS
-    @pytest.mark.asyncio
-    async def test_content_shape_leads_with_stage_nonce_and_embeds_run_id(
-        self, stage, recon_pool, reconstruct_source, expected_nonce_prefix
-    ):
-        """content leads with a nonce prefixed for *this* stage (not hardcoded to
-        Stage 1's) and embeds 'run_id: <run_id>' so both the metadata
-        triple-filter and Path-1 semantic search self-heal."""
-        memory_service = AsyncMock()
-        memory_service.add_memory = AsyncMock(return_value={'memory_ids': ['m1']})
-
-        await reconstruct_cycle_summary_stub(
-            memory_service,
-            'dark_factory',
-            'run-shape',
-            stage=stage,
-            recon_pool=recon_pool,
-            reconstruct_source=reconstruct_source,
+        assert result is True
+        record = await ledger_store.get_by_identity(
+            'dark_factory', 'cycle_summary', flag_type='task_knowledge_sync', run_id='run-trim-fail',
         )
-
-        content = memory_service.add_memory.call_args.kwargs.get('content')
-        first_line = content.splitlines()[0]
-        assert first_line.startswith(f'{expected_nonce_prefix}_'), (
-            f'expected content to lead with a {expected_nonce_prefix}-prefixed '
-            f'nonce, got: {first_line!r}'
-        )
-        assert 'run_id: run-shape' in content
+        assert record is not None
 
     @pytest.mark.asyncio
-    async def test_extract_response_memory_ids_handles_attr_response(self):
-        """The response-memory_ids extraction must accept an AddMemoryResponse-like
-        object (attribute access), not just a dict (mirrors production shape)."""
+    async def test_both_mirror_and_trim_failures_swallowed_together(self, ledger_store):
+        """Neither best-effort failure ever propagates — even simultaneously."""
         memory_service = AsyncMock()
-        memory_service.add_memory = AsyncMock(
-            return_value=SimpleNamespace(memory_ids=['m1'])
+        memory_service.recon_ledger = ledger_store
+        memory_service.add_system_record = AsyncMock(side_effect=RuntimeError('mem0 down'))
+
+        with patch(
+            'fused_memory.reconciliation.summary_pool.enforce_summary_pool_cap',
+            AsyncMock(side_effect=RuntimeError('trim exploded')),
+        ):
+            result = await write_cycle_summary(
+                memory_service,
+                'dark_factory',
+                self._report(),
+                'run-both-fail',
+                stage='task_knowledge_sync',
+                recon_pool='stage2_cycle_summary',
+                trim_source='stage2_cycle_summary_trim',
+                cap=2,
+            )
+
+        assert result is True
+
+    @pytest.mark.asyncio
+    async def test_mirror_and_trim_still_run_when_no_ledger_wired(self):
+        """A disabled/absent ledger (``recon_ledger_enabled=False``, a
+        supported non-default config — server/main.py) must not silence the
+        Mem0 mirror too. Stage 3's cycle-summary presence check
+        (prompts/stage3.py) reads only the mirror, never the ledger, so if
+        the mirror also went dark whenever the ledger was absent, Stage 3
+        would false-report "summary missing" every cycle with no fallback
+        signal (reviewer finding robustness, task 2229 amendment pass).
+
+        The authoritative ledger upsert is still correctly skipped (``False``)
+        — this only proves the best-effort mirror/trim are no longer gated
+        behind ledger availability.
+        """
+        memory_service = AsyncMock()
+        memory_service.recon_ledger = None
+        memory_service.add_system_record = AsyncMock(
+            return_value=SimpleNamespace(memory_ids=['m1']),
         )
 
-        result = await reconstruct_cycle_summary_stub(
-            memory_service,
-            'dark_factory',
-            'run-attr',
-            stage='memory_consolidator',
-            recon_pool='stage1_cycle_summary',
-            reconstruct_source='stage1_summary_reconstruction',
-        )
+        with patch(
+            'fused_memory.reconciliation.summary_pool.enforce_summary_pool_cap',
+            AsyncMock(return_value=0),
+        ) as mock_trim:
+            result = await write_cycle_summary(
+                memory_service,
+                'dark_factory',
+                self._report(),
+                'run-no-ledger',
+                stage='task_knowledge_sync',
+                recon_pool='stage2_cycle_summary',
+                trim_source='stage2_cycle_summary_trim',
+                cap=2,
+            )
 
-        assert result == 1
-        memory_service.add_memory.assert_awaited_once()
+        assert result is False  # no ledger => authoritative write correctly skipped
+
+        memory_service.add_system_record.assert_awaited_once()
+        kwargs = memory_service.add_system_record.call_args.kwargs
+        assert kwargs.get('agent_id') == 'recon-stage-task_knowledge_sync'
+        metadata = kwargs.get('metadata') or {}
+        assert metadata.get('kind') == 'cycle_summary'
+        assert metadata.get('run_id') == 'run-no-ledger'
+        assert 'run-no-ledger' in kwargs.get('content', '')
+
+        mock_trim.assert_awaited_once()

@@ -8,10 +8,10 @@ Covers:
 - STAGE2_SYSTEM_PROMPT uniqueness_token mechanism exists (task 1473): minimal existence
   check via build_stage2_system_prompt to guard against the section being dropped
   (TestStage2PromptMandatesUniquenessToken)
-- CSPRNG summary_nonce injection in per-cycle payloads (task 1574):
-  both legacy assemble_payload and assembled _format_assembled_payload paths must inject
-  '### Per-Cycle Summary Nonce' with a fresh 8-hex nonce per call
-  (TestStage1PayloadSummaryNonce)
+- Task 2229 (W5-λ): deterministic Python cycle-summary write to the recon ledger
+  (PRD plans/recon-reliability-prd.md §10, boundary test D1) — supersedes the
+  former task-1574/1590 CSPRNG summary_nonce injection mechanism
+  (TestMemoryConsolidatorDeterministicCycleSummaryWrite)
 - A7b: harness._escalate fingerprint stamping and dedup routing
   (TestReconEscalationDedup)
 - Step-11: MemoryConsolidator.run() wiring — deletion guard (filter_false_absence_flags)
@@ -25,12 +25,12 @@ Covers:
 from __future__ import annotations
 
 import json
-import re
 from datetime import UTC, datetime
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+import pytest_asyncio
 
 from fused_memory.backends.task_backend_errors import TaskmasterError
 from fused_memory.config.schema import ReconciliationConfig
@@ -176,123 +176,155 @@ class TestStage1PayloadThreadsProjectRootAssembled:
 
 
 # ---------------------------------------------------------------------------
-# task-1574: CSPRNG summary_nonce injection in Stage 1 per-cycle payloads
+# Task 2229 (W5-λ): deterministic Python cycle-summary write to the recon
+# ledger (PRD plans/recon-reliability-prd.md §10, boundary test D1).
+#
+# Supersedes the former task-1574/1590 CSPRNG summary_nonce injection tests
+# (TestStage1PayloadSummaryNonce, deleted here): MemoryConsolidator.run() now
+# calls write_cycle_summary in place of the old pretrim_summary_pool call
+# plus the verify_cycle_summary_written / reconstruct_cycle_summary_stub
+# self-heal chain, and assemble_payload() / _format_assembled_payload() no
+# longer inject a nonce section for the LLM to prepend.
 # ---------------------------------------------------------------------------
 
 
-class TestStage1PayloadSummaryNonce:
-    """assemble_payload / _format_assembled_payload inject '### Per-Cycle Summary Nonce'
-    with a fresh STAGE1-prefixed CSPRNG nonce per call (task 1590).
+class TestMemoryConsolidatorDeterministicCycleSummaryWrite:
+    """MemoryConsolidator.run() writes the authoritative per-cycle
+    ``cycle_summary`` directly via the deterministic ``write_cycle_summary``
+    helper (task 2229 W5-λ, PRD plans/recon-reliability-prd.md §10, boundary
+    test D1) — no LLM turn, no nonce, no verify/reconstruct self-heal.
 
-    Task 1590: nonce format updated from bare '<8-hex>' to 'STAGE1_<8-hex>' so
-    Stage 1 and Stage 2 summaries always lead with structurally distinct tokens.
+    RED until step-08 rewires ``run()`` to call ``write_cycle_summary`` in
+    place of the ``pretrim_summary_pool`` call plus the
+    ``verify_cycle_summary_written`` / ``reconstruct_cycle_summary_stub``
+    self-heal chain, and strips the nonce injection from
+    ``assemble_payload()`` / ``_format_assembled_payload()`` and the Stage 1
+    system prompt.
     """
 
-    @pytest.mark.asyncio
-    async def test_legacy_path_contains_nonce_section(self):
-        """Legacy assemble_payload (time-windowed path) includes '### Per-Cycle Summary Nonce'
-        and a summary_nonce: STAGE1_<8-hex> line.
+    @pytest_asyncio.fixture
+    async def ledger_store(self, tmp_path):
+        from fused_memory.reconciliation.recon_ledger import ReconLedgerStore
 
-        Task 1590: regex updated from bare '[0-9a-f]{8}' to 'STAGE1_[0-9a-f]{8}'.
-        RED until step-6 impl changes _build_summary_nonce_section() to pass 'STAGE1'.
-        """
-        stage = _make_consolidator()
+        s = ReconLedgerStore(tmp_path / 'reconciliation.db')
+        await s.initialize()
+        yield s
+        await s.close()
+
+    def _base_report(self) -> StageReport:
+        return StageReport(
+            stage=StageId.memory_consolidator,
+            started_at=datetime(2026, 7, 10, 11, 0, 0, tzinfo=UTC),
+            completed_at=datetime(2026, 7, 10, 11, 5, 0, tzinfo=UTC),
+            items_flagged=[],
+            stats={},
+            llm_calls=2,
+            tokens_used=500,
+        )
+
+    async def _run_stage(
+        self, ledger_store, run_id: str, *, remediation: bool = False,
+    ) -> StageReport:
+        stage = _make_consolidator(project_root='/tmp/reify')
+        stage.memory.recon_ledger = ledger_store
+        if remediation:
+            stage.remediation_findings = [{'description': 'fix this'}]
+
         watermark = Watermark(project_id='test_project')
-
-        payload = await stage.assemble_payload(
-            events=[], watermark=watermark, prior_reports=[]
-        )
-
-        assert '### Per-Cycle Summary Nonce' in payload, (
-            "assemble_payload must inject '### Per-Cycle Summary Nonce' section "
-            "(needed to defeat Mem0 cosine-similarity dedup; task 1574)"
-        )
-        m = re.search(r'summary_nonce: (STAGE1_[0-9a-f]{8})', payload)
-        assert m is not None, (
-            "assemble_payload must include 'summary_nonce: STAGE1_<8-hex>' in the payload "
-            f"(regex r'summary_nonce: STAGE1_[0-9a-f]{{8}}' found no match); payload excerpt:\n"
-            f"{payload[:500]}"
-        )
-        assert m.group(1).startswith('STAGE1_'), (
-            f"summary_nonce must begin with 'STAGE1_'; got {m.group(1)!r}"
-        )
-
-    @pytest.mark.asyncio
-    async def test_legacy_path_nonce_is_fresh_per_call(self):
-        """Two consecutive assemble_payload calls produce distinct STAGE1-prefixed nonces.
-
-        Proves each call generates a fresh CSPRNG nonce rather than caching one value.
-        Task 1590: regex updated to match 'STAGE1_<8-hex>' form.
-        RED until step-6 impl changes _build_summary_nonce_section() to pass 'STAGE1'.
-        """
-        stage = _make_consolidator()
-        watermark = Watermark(project_id='test_project')
-
-        payload1 = await stage.assemble_payload(
-            events=[], watermark=watermark, prior_reports=[]
-        )
-        payload2 = await stage.assemble_payload(
-            events=[], watermark=watermark, prior_reports=[]
-        )
-
-        m1 = re.search(r'summary_nonce: (STAGE1_[0-9a-f]{8})', payload1)
-        m2 = re.search(r'summary_nonce: (STAGE1_[0-9a-f]{8})', payload2)
-        assert m1 is not None and m2 is not None, (
-            "Both assemble_payload calls must emit a 'summary_nonce: STAGE1_<8-hex>'; "
-            "one or both were missing."
-        )
-        assert m1.group(1) != m2.group(1), (
-            f"Consecutive assemble_payload calls must produce DISTINCT nonces "
-            f"(got {m1.group(1)!r} both times — nonce is not fresh per call)"
-        )
+        with patch.object(BaseStage, 'run', new=AsyncMock(return_value=self._base_report())):
+            return await stage.run(
+                events=[], watermark=watermark, prior_reports=[], run_id=run_id,
+            )
 
     @pytest.mark.asyncio
-    async def test_assembled_path_contains_nonce_section(self):
-        """_format_assembled_payload (ContextAssembler path) includes STAGE1-prefixed nonce.
+    async def test_run_writes_one_authoritative_ledger_row(self, ledger_store):
+        """Exactly one cycle_summary ledger row exists for (stage=
+        'memory_consolidator', run_id) after run(), written from the report
+        Python derives — not an LLM-authored Mem0 write."""
+        run_id = 'run-d1-stage1'
 
-        Task 1590: regex updated from bare '[0-9a-f]{8}' to 'STAGE1_[0-9a-f]{8}'.
-        RED until step-6 impl changes _build_summary_nonce_section() to pass 'STAGE1'.
-        """
-        stage = _make_consolidator()
-        stage.assembled_payload = AssembledPayload(events=[], context_items={})
+        await self._run_stage(ledger_store, run_id)
+
+        record = await ledger_store.get_by_identity(
+            'test_project', 'cycle_summary', flag_type='memory_consolidator', run_id=run_id,
+        )
+        assert record is not None
+        assert record.record_kind == 'cycle_summary'
+        assert record.task_id == ''
+        assert record.flag_type == 'memory_consolidator'
+        assert record.run_id == run_id
+        assert record.state == 'active'
+
+    @pytest.mark.asyncio
+    async def test_run_sets_cycle_summary_ledger_written_stat(self, ledger_store):
+        report = await self._run_stage(ledger_store, 'run-d1-stat')
+
+        # Renamed from 'stage1_cycle_summary_written' (reviewer finding
+        # observability, task 2229 amendment pass round 2) — the key now
+        # makes explicit that it tracks the authoritative ledger write only,
+        # not the best-effort Mem0 mirror (see write_cycle_summary's
+        # docstring "Returns" section).
+        assert report.stats.get('stage1_cycle_summary_ledger_written') == 1
+
+    @pytest.mark.asyncio
+    async def test_retired_verify_reconstruct_stats_absent(self, ledger_store):
+        report = await self._run_stage(ledger_store, 'run-d1-retired-stats')
+
+        for retired_key in (
+            'stage1_cycle_summary_verified_count',
+            'stage1_cycle_summary_reconstructed',
+            'stage1_cycle_summary_pool_trimmed',
+        ):
+            assert retired_key not in report.stats, (
+                f'{retired_key!r} is retired LLM self-heal telemetry (task 2229 '
+                'W5-λ) and must no longer be set by run().'
+            )
+
+    @pytest.mark.asyncio
+    async def test_remediation_run_writes_no_cycle_summary_row(self, ledger_store):
+        """Remediation passes never asked for a cycle_summary before this
+        task, and must continue not writing one — self-healing there would
+        fabricate a spurious cycle_summary every remediation pass (the
+        remediation payload never asks the LLM for one either)."""
+        run_id = 'run-d1-remediation'
+
+        await self._run_stage(ledger_store, run_id, remediation=True)
+
+        record = await ledger_store.get_by_identity(
+            'test_project', 'cycle_summary', flag_type='memory_consolidator', run_id=run_id,
+        )
+        assert record is None, (
+            'Remediation-pass run() must not write a cycle_summary ledger row.'
+        )
+
+    @pytest.mark.asyncio
+    async def test_payload_has_no_nonce_text(self):
+        """assemble_payload() no longer injects the '### Per-Cycle Summary
+        Nonce' section or a 'summary_nonce'/'retry_nonce' line — Python owns
+        the per-cycle summary write now, so there is nothing for the LLM to
+        prepend a dedup-defeating nonce to."""
+        stage = _make_consolidator(project_root='/tmp/reify')
         watermark = Watermark(project_id='test_project')
 
-        payload = await stage.assemble_payload(
-            events=[], watermark=watermark, prior_reports=[]
+        payload = await stage.assemble_payload([], watermark, [])
+
+        for forbidden in ('### Per-Cycle Summary Nonce', 'summary_nonce', 'retry_nonce'):
+            assert forbidden not in payload, (
+                f'assemble_payload() must not contain {forbidden!r} (task 2229 W5-λ).'
+            )
+
+    def test_system_prompt_uniqueness_directive_removed(self):
+        """The Stage 1 system prompt no longer instructs the LLM to write a
+        nonce'd per-cycle summary — the directive block is fully deleted, not
+        merely made optional."""
+        from fused_memory.reconciliation.prompts.stage1 import STAGE1_SYSTEM_PROMPT
+
+        assert '**Per-Cycle Summary Uniqueness**' not in STAGE1_SYSTEM_PROMPT, (
+            "The 'Per-Cycle Summary Uniqueness' directive must be deleted "
+            '(task 2229 W5-λ) — Python writes the per-cycle summary '
+            'deterministically now.'
         )
-
-        assert '### Per-Cycle Summary Nonce' in payload, (
-            "_format_assembled_payload must inject '### Per-Cycle Summary Nonce' section "
-            "(needed to defeat Mem0 cosine-similarity dedup; task 1574)"
-        )
-        m = re.search(r'summary_nonce: (STAGE1_[0-9a-f]{8})', payload)
-        assert m is not None, (
-            "_format_assembled_payload must include 'summary_nonce: STAGE1_<8-hex>' in the payload "
-            f"(regex r'summary_nonce: STAGE1_[0-9a-f]{{8}}' found no match); payload excerpt:\n"
-            f"{payload[:500]}"
-        )
-        assert m.group(1).startswith('STAGE1_'), (
-            f"summary_nonce must begin with 'STAGE1_'; got {m.group(1)!r}"
-        )
-
-
-# ---------------------------------------------------------------------------
-# Step 1 (task-1473): STAGE2 prompt mandates uniqueness_token in cycle summaries
-# ---------------------------------------------------------------------------
-
-
-class TestStage2PromptMandatesUniquenessToken:
-    """Minimal existence check: build_stage2_system_prompt exposes the uniqueness_token mechanism."""
-
-    def test_build_stage2_system_prompt_exposes_uniqueness_token(self):
-        """build_stage2_system_prompt('dark_factory') must expose uniqueness_token."""
-        from fused_memory.reconciliation.prompts.stage2 import build_stage2_system_prompt
-
-        result = build_stage2_system_prompt('dark_factory')
-        assert 'uniqueness_token' in result, (
-            "build_stage2_system_prompt('dark_factory') must expose uniqueness_token "
-            "(guards against the per-cycle summary uniqueness section being dropped)."
-        )
+        assert '### Per-Cycle Summary Nonce' not in STAGE1_SYSTEM_PROMPT
 
 
 # ---------------------------------------------------------------------------
@@ -2477,232 +2509,11 @@ class TestDegenerateTaskNodeSweepGuards:
             'A raised sweep must not leave a partial/incorrect degenerate_task_nodes_swept stat'
         )
 
-
 # ---------------------------------------------------------------------------
-# task 2366 step-5 (RED) / step-6 (GREEN): Stage 1 cycle_summary absence
-# self-heal wiring (verify_cycle_summary_written / reconstruct_cycle_summary_stub)
+# The former class TestMemoryConsolidatorCycleSummaryFallback (task 2366)
+# tested the LLM-era verify_cycle_summary_written / reconstruct_cycle_summary_stub
+# self-heal chain. Task 2229 (W5-λ) retired that chain in favor of the
+# deterministic write_cycle_summary helper — see
+# TestMemoryConsolidatorDeterministicCycleSummaryWrite above, which covers the
+# replacement behavior (including the remediation-skip case).
 # ---------------------------------------------------------------------------
-
-
-class TestMemoryConsolidatorCycleSummaryFallback:
-    """MemoryConsolidator.run() must self-heal a missing per-cycle summary (task 2366).
-
-    The per-cycle cycle_summary memory is a PROMPT-DRIVEN final step of the LLM
-    session (prompts/stage1.py) — a session that exhausts its turn/token/context
-    budget can exit before writing one. On a full (non-remediation) cycle, run()
-    must call verify_cycle_summary_written after the agent write and, when it
-    CONFIRMS absence (count == 0), call reconstruct_cycle_summary_stub to write a
-    deterministic fallback stub — mirroring Stage 2's already-proven self-heal.
-
-    Every case mocks get_memories_by_metadata to return [] so the unconditional
-    pretrim_summary_pool call at the top of run() no-ops cleanly and never
-    interferes with these assertions.
-
-    RED until step-6 wires verify_cycle_summary_written / reconstruct_cycle_summary_stub
-    into MemoryConsolidator.run().
-    """
-
-    @staticmethod
-    def _reconstruction_calls(add_memory_mock) -> list:
-        """Return add_memory calls that look like a cycle_summary reconstruction write."""
-        return [
-            call
-            for call in add_memory_mock.await_args_list
-            if (call.kwargs.get('metadata') or {}).get('kind') == 'cycle_summary'
-            and (call.kwargs.get('metadata') or {}).get('reconstructed') is True
-        ]
-
-    @pytest.mark.asyncio
-    async def test_emits_reconstruction_when_summary_confirmed_absent(self):
-        """count_memories_by_metadata==0 (CONFIRMED absent) -> reconstruct_cycle_summary_stub fires."""
-        stage = _make_consolidator(project_root='/tmp/reify')
-        stage.memory.get_memories_by_metadata = AsyncMock(return_value=[])
-        stage.memory.count_memories_by_metadata = AsyncMock(return_value=0)
-        stage.memory.add_memory = AsyncMock(return_value={'memory_ids': ['stub-1']})
-
-        base_report = StageReport(
-            stage=StageId.memory_consolidator,
-            started_at=datetime.now(UTC),
-            completed_at=datetime.now(UTC),
-            items_flagged=[],
-            stats={},
-        )
-        dedup_mock = AsyncMock(return_value=[])
-
-        with (
-            patch.object(BaseStage, 'run', new=AsyncMock(return_value=base_report)),
-            patch(
-                'fused_memory.reconciliation.stages.memory_consolidator.dedup_flags',
-                new=dedup_mock,
-            ),
-        ):
-            report = await stage.run(
-                events=[],
-                watermark=Watermark(project_id='test_project'),
-                prior_reports=[],
-                run_id='r-absent',
-            )
-
-        recon_calls = self._reconstruction_calls(stage.memory.add_memory)
-        assert len(recon_calls) == 1, (
-            'reconstruct_cycle_summary_stub must call add_memory exactly once when the '
-            f'summary is CONFIRMED absent; got add_memory calls={stage.memory.add_memory.await_args_list!r}. '
-            'RED: verify_cycle_summary_written/reconstruct_cycle_summary_stub not yet wired into run().'
-        )
-        metadata = recon_calls[0].kwargs['metadata']
-        assert metadata['kind'] == 'cycle_summary'
-        assert metadata['stage'] == 'memory_consolidator'
-        assert metadata['run_id'] == 'r-absent'
-        assert metadata['recon_pool'] == 'stage1_cycle_summary'
-        assert metadata['reconstructed'] is True
-
-        assert report.stats.get('stage1_cycle_summary_verified_count') == 0, (
-            f"Expected report.stats['stage1_cycle_summary_verified_count'] == 0; got stats={report.stats!r}"
-        )
-        assert report.stats.get('stage1_cycle_summary_reconstructed') == 1, (
-            f"Expected report.stats['stage1_cycle_summary_reconstructed'] == 1; got stats={report.stats!r}"
-        )
-
-    @pytest.mark.asyncio
-    async def test_skips_reconstruction_when_summary_present(self):
-        """count_memories_by_metadata==1 (present) -> no reconstruction write."""
-        stage = _make_consolidator(project_root='/tmp/reify')
-        stage.memory.get_memories_by_metadata = AsyncMock(return_value=[])
-        stage.memory.count_memories_by_metadata = AsyncMock(return_value=1)
-        stage.memory.add_memory = AsyncMock(return_value={'memory_ids': ['real-1']})
-
-        base_report = StageReport(
-            stage=StageId.memory_consolidator,
-            started_at=datetime.now(UTC),
-            completed_at=datetime.now(UTC),
-            items_flagged=[],
-            stats={},
-        )
-        dedup_mock = AsyncMock(return_value=[])
-
-        with (
-            patch.object(BaseStage, 'run', new=AsyncMock(return_value=base_report)),
-            patch(
-                'fused_memory.reconciliation.stages.memory_consolidator.dedup_flags',
-                new=dedup_mock,
-            ),
-        ):
-            report = await stage.run(
-                events=[],
-                watermark=Watermark(project_id='test_project'),
-                prior_reports=[],
-                run_id='r-present',
-            )
-
-        recon_calls = self._reconstruction_calls(stage.memory.add_memory)
-        assert recon_calls == [], (
-            'reconstruct_cycle_summary_stub must NOT write when the summary is already '
-            f'present (count==1); got reconstruction add_memory calls={recon_calls!r}'
-        )
-        assert report.stats.get('stage1_cycle_summary_verified_count') == 1, (
-            f"Expected report.stats['stage1_cycle_summary_verified_count'] == 1; got stats={report.stats!r}"
-        )
-        assert report.stats.get('stage1_cycle_summary_reconstructed') == 0, (
-            f"Expected report.stats['stage1_cycle_summary_reconstructed'] == 0; got stats={report.stats!r}"
-        )
-
-    @pytest.mark.asyncio
-    async def test_skips_reconstruction_on_transient_verify_failure(self):
-        """count_memories_by_metadata raising -> None (NOT confirmed absent) -> no reconstruction."""
-        stage = _make_consolidator(project_root='/tmp/reify')
-        stage.memory.get_memories_by_metadata = AsyncMock(return_value=[])
-        stage.memory.count_memories_by_metadata = AsyncMock(
-            side_effect=RuntimeError('qdrant down')
-        )
-        stage.memory.add_memory = AsyncMock(return_value={'memory_ids': ['real-1']})
-
-        base_report = StageReport(
-            stage=StageId.memory_consolidator,
-            started_at=datetime.now(UTC),
-            completed_at=datetime.now(UTC),
-            items_flagged=[],
-            stats={},
-        )
-        dedup_mock = AsyncMock(return_value=[])
-
-        with (
-            patch.object(BaseStage, 'run', new=AsyncMock(return_value=base_report)),
-            patch(
-                'fused_memory.reconciliation.stages.memory_consolidator.dedup_flags',
-                new=dedup_mock,
-            ),
-        ):
-            report = await stage.run(
-                events=[],
-                watermark=Watermark(project_id='test_project'),
-                prior_reports=[],
-                run_id='r-transient',
-            )
-
-        recon_calls = self._reconstruction_calls(stage.memory.add_memory)
-        assert recon_calls == [], (
-            'A transient verify failure (count_memories_by_metadata raises) must NOT be '
-            f'treated as confirmed absence; got reconstruction add_memory calls={recon_calls!r}'
-        )
-        assert report.stats.get('stage1_cycle_summary_verified_count') is None, (
-            "Expected report.stats['stage1_cycle_summary_verified_count'] is None (transient, "
-            f'not confirmed absent); got stats={report.stats!r}'
-        )
-        assert report.stats.get('stage1_cycle_summary_reconstructed') == 0, (
-            f"Expected report.stats['stage1_cycle_summary_reconstructed'] == 0; got stats={report.stats!r}"
-        )
-
-    @pytest.mark.asyncio
-    async def test_remediation_run_skips_verify_and_reconstruction(self):
-        """remediation_findings set -> run() returns before the verify/reconstruct block,
-        but the two stats keys are still present with their always-present defaults.
-
-        Uses plain (no side_effect) AsyncMocks + assert_not_awaited() rather than an
-        AssertionError side-effect canary: verify_cycle_summary_written and
-        reconstruct_cycle_summary_stub both catch broad Exception internally (their
-        transient-failure handling), so a raised AssertionError would be silently
-        swallowed and masked as a false pass if the wiring incorrectly invoked them
-        during a remediation run. Configuring real return values instead means an
-        incorrect invocation surfaces as a genuine, unambiguous assertion failure.
-        """
-        stage = _make_consolidator(project_root='/tmp/reify')
-        stage.remediation_findings = [{'description': 'fix this'}]
-        stage.memory.get_memories_by_metadata = AsyncMock(return_value=[])
-        stage.memory.count_memories_by_metadata = AsyncMock(return_value=0)
-        stage.memory.add_memory = AsyncMock(return_value={'memory_ids': ['stub-1']})
-
-        base_report = StageReport(
-            stage=StageId.memory_consolidator,
-            started_at=datetime.now(UTC),
-            completed_at=datetime.now(UTC),
-            items_flagged=[],
-            stats={},
-        )
-        dedup_mock = AsyncMock(return_value=[])
-
-        with (
-            patch.object(BaseStage, 'run', new=AsyncMock(return_value=base_report)),
-            patch(
-                'fused_memory.reconciliation.stages.memory_consolidator.dedup_flags',
-                new=dedup_mock,
-            ),
-        ):
-            report = await stage.run(
-                events=[],
-                watermark=Watermark(project_id='test_project'),
-                prior_reports=[],
-                run_id='r-remediation',
-            )
-
-        stage.memory.count_memories_by_metadata.assert_not_awaited()
-        recon_calls = self._reconstruction_calls(stage.memory.add_memory)
-        assert recon_calls == [], (
-            f'A remediation run must never reconstruct a cycle summary; got calls={recon_calls!r}'
-        )
-        assert 'stage1_cycle_summary_verified_count' in report.stats, (
-            "report.stats['stage1_cycle_summary_verified_count'] must be present (always-present "
-            f'default) even on a remediation run; got stats={report.stats!r}'
-        )
-        assert report.stats.get('stage1_cycle_summary_reconstructed') == 0, (
-            f"Expected report.stats['stage1_cycle_summary_reconstructed'] == 0; got stats={report.stats!r}"
-        )

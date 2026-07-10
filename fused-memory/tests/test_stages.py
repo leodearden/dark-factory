@@ -500,61 +500,6 @@ class TestTaskKnowledgeSyncPayload:
         # The project_id should appear in the memory tools instruction (line 98)
         assert 'project_id="reify"' in payload
 
-    @pytest.mark.asyncio
-    async def test_payload_contains_per_cycle_summary_nonce_section(self, mock_deps, watermark):
-        """assemble_payload() must include a '### Per-Cycle Summary Nonce' section
-        with a 'summary_nonce: STAGE2_<8-hex>' line.
-
-        Task 1572: the nonce is generated Python-side (CSPRNG) and injected into
-        the payload so the Stage 2 agent can prepend it to its per-cycle summary,
-        defeating Mem0 cosine-similarity dedup (~0.92 threshold).
-        Task 1590: nonce now carries 'STAGE2_' prefix for structural distinction
-        from Stage 1 nonces.
-        RED until step-8 impl changes the assemble_payload call site to pass 'STAGE2'.
-        """
-        import re
-
-        stage = make_configured_task_knowledge_sync_stage(mock_deps, project_id='reify', project_root='/home/leo/src/reify')
-        mock_deps['taskmaster'].get_tasks.return_value = {'tasks': []}
-
-        payload = await stage.assemble_payload([], watermark, [])
-
-        assert '### Per-Cycle Summary Nonce' in payload, (
-            "assemble_payload() must include a '### Per-Cycle Summary Nonce' section "
-            "so the Stage 2 agent receives the CSPRNG nonce (task 1572)."
-        )
-        assert re.search(r'summary_nonce: STAGE2_[0-9a-f]{8}', payload), (
-            "assemble_payload() must include a 'summary_nonce: STAGE2_<8-hex>' line "
-            f"in the payload — got payload snippet: {payload[-200:]!r}"
-        )
-
-    @pytest.mark.asyncio
-    async def test_successive_assemble_payload_calls_yield_different_nonces(self, mock_deps, watermark):
-        """Two assemble_payload calls on a freshly-configured stage yield different
-        STAGE2-prefixed summary_nonce values.
-
-        High-probability property of a 32-bit CSPRNG (P(collision) ~= 2.3e-10).
-        Task 1572: verifies the nonce is re-generated each call, not cached.
-        Task 1590: regex updated to match 'STAGE2_<8-hex>' form.
-        RED until step-8 impl changes the assemble_payload call site to pass 'STAGE2'.
-        """
-        import re
-
-        stage = make_configured_task_knowledge_sync_stage(mock_deps, project_id='reify', project_root='/home/leo/src/reify')
-        mock_deps['taskmaster'].get_tasks.return_value = {'tasks': []}
-
-        payload1 = await stage.assemble_payload([], watermark, [])
-        payload2 = await stage.assemble_payload([], watermark, [])
-
-        match1 = re.search(r'summary_nonce: (STAGE2_[0-9a-f]{8})', payload1)
-        match2 = re.search(r'summary_nonce: (STAGE2_[0-9a-f]{8})', payload2)
-        assert match1, f"No 'summary_nonce: STAGE2_<8-hex>' in first payload; got: {payload1[-200:]!r}"
-        assert match2, f"No 'summary_nonce: STAGE2_<8-hex>' in second payload; got: {payload2[-200:]!r}"
-        assert match1.group(1) != match2.group(1), (
-            f"Expected different summary_nonce values across successive assemble_payload() calls, "
-            f"but both returned {match1.group(1)!r} — nonce must be regenerated each call."
-        )
-
 
 class TestTaskKnowledgeSyncKnownProjectsSection:
     """Stage 2 surfaces a "Known Projects" section so the LLM can re-route findings."""
@@ -901,19 +846,20 @@ class TestProjectIdValidation(BaseStageValidationTest):
         assert result.stats == {
             'entity_summary_snapshot_lines_stripped': 0,
             'stage1_fetch_degraded': [],
-            'stage1_cycle_summary_pool_trimmed': 0,
             # Always present (task-2312), set before the remediation early-return.
             'stage1_completion_markers_self_deleted': 0,
             # Always present (task-2029 amendment), even when nothing was flagged —
             # symmetric with stats['stage2_flag_markers_acknowledged'].
             'stage1_flag_markers_acknowledged': 0,
-            # Always present (task-2366), set before the remediation early-return.
-            # verified_count is whatever this test's unconfigured memory_service
-            # AsyncMock returns from count_memories_by_metadata (opaque — matched via
-            # ANY); reconstructed stays 0 because that Mock object never compares
-            # equal to the int 0 gate in run(), so reconstruction never fires here.
-            'stage1_cycle_summary_verified_count': ANY,
-            'stage1_cycle_summary_reconstructed': 0,
+            # Always present on the full-cycle path (task 2229 W5-λ): 1 when the
+            # deterministic write_cycle_summary helper upserted the authoritative
+            # ledger row. This test's mock_deps memory_service is an unconfigured
+            # AsyncMock, so getattr(memory_service, 'recon_ledger', None) resolves
+            # to an auto-created child mock (not None) and the ledger upsert
+            # succeeds against it. Renamed from 'stage1_cycle_summary_written'
+            # (reviewer finding observability, task 2229 amendment pass round 2)
+            # — the key now makes explicit that it tracks the ledger write only.
+            'stage1_cycle_summary_ledger_written': 1,
         }
         assert result.started_at is not None
         assert result.started_at <= result.completed_at
@@ -1005,19 +951,20 @@ class TestProjectIdValidation(BaseStageValidationTest):
         assert result.stats == {
             'entity_summary_snapshot_lines_stripped': 0,
             'stage1_fetch_degraded': [],
-            'stage1_cycle_summary_pool_trimmed': 0,
             # Always present (task-2312), set before the remediation early-return.
             'stage1_completion_markers_self_deleted': 0,
             # Always present (task-2029 amendment), even when nothing was flagged —
             # symmetric with stats['stage2_flag_markers_acknowledged'].
             'stage1_flag_markers_acknowledged': 0,
-            # Always present (task-2366), set before the remediation early-return.
-            # verified_count is whatever this test's unconfigured memory_service
-            # AsyncMock returns from count_memories_by_metadata (opaque — matched via
-            # ANY); reconstructed stays 0 because that Mock object never compares
-            # equal to the int 0 gate in run(), so reconstruction never fires here.
-            'stage1_cycle_summary_verified_count': ANY,
-            'stage1_cycle_summary_reconstructed': 0,
+            # Always present on the full-cycle path (task 2229 W5-λ): 1 when the
+            # deterministic write_cycle_summary helper upserted the authoritative
+            # ledger row. This test's mock_deps memory_service is an unconfigured
+            # AsyncMock, so getattr(memory_service, 'recon_ledger', None) resolves
+            # to an auto-created child mock (not None) and the ledger upsert
+            # succeeds against it. Renamed from 'stage1_cycle_summary_written'
+            # (reviewer finding observability, task 2229 amendment pass round 2)
+            # — the key now makes explicit that it tracks the ledger write only.
+            'stage1_cycle_summary_ledger_written': 1,
         }
         assert result.started_at is not None
         assert result.started_at <= result.completed_at
@@ -1674,69 +1621,6 @@ class TestStage2GuardrailProjectIdGating:
         )
 
 
-class TestStage2PromptNonceMechanism:
-    """Minimal existence checks: build_stage2_system_prompt wires the nonce mechanism.
-
-    Task 1572: the Stage 2 system prompt must instruct the agent to use the
-    summary_nonce injected via the payload so that the nonce generated by steps
-    1-4 is not silently inert (the LLM must be told to prepend it).
-
-    Mirrors the sanctioned precedent:
-      test_stage1.py::TestStage2PromptMandatesUniquenessToken
-    Single-token existence checks only — no prose-phrase assertions (the
-    task-1570 norm deleted multi-assertion prose-pin tests as 'brittle...
-    freeze cosmetic prose with no behavioral enforcement').
-    """
-
-    def test_stage2_prompt_contains_summary_nonce_token(self):
-        """build_stage2_system_prompt('dark_factory') must include 'summary_nonce'.
-
-        This guards that the nonce injected into the payload (step-4) is referenced
-        in the guidance — without it, the LLM never sees the instruction to prepend
-        the nonce and the mechanism is silently inert.
-        """
-        from fused_memory.reconciliation.prompts.stage2 import build_stage2_system_prompt
-
-        result = build_stage2_system_prompt('dark_factory')
-        assert 'summary_nonce' in result, (
-            "build_stage2_system_prompt('dark_factory') must reference 'summary_nonce' "
-            "in the guidance so the Stage 2 agent is instructed to use the payload nonce "
-            "(task 1572 — without this the CSPRNG nonce is inert)."
-        )
-
-    def test_stage2_prompt_retains_uniqueness_token(self):
-        """build_stage2_system_prompt('dark_factory') must still include 'uniqueness_token'.
-
-        Regression guard: the nonce is ADDITIVE — the ISO 8601 uniqueness_token
-        from tasks 1473/1488 must be retained alongside the new nonce.
-        Mirrors test_stage1.py::TestStage2PromptMandatesUniquenessToken.
-        """
-        from fused_memory.reconciliation.prompts.stage2 import build_stage2_system_prompt
-
-        result = build_stage2_system_prompt('dark_factory')
-        assert 'uniqueness_token' in result, (
-            "build_stage2_system_prompt('dark_factory') must retain 'uniqueness_token' "
-            "— the nonce is additive, not a replacement (task 1572 NOTE)."
-        )
-
-    def test_stage2_prompt_contains_retry_nonce_token(self):
-        """build_stage2_system_prompt('dark_factory') must include 'retry_nonce'.
-
-        Guards that the count=0 retry path (both per-cycle and reconstruction sections)
-        references the retry_nonce dedup-defeat mechanism. Without this, a future edit
-        could accidentally drop the nonce-retry guidance, reverting to identical-content
-        retry that re-triggers Mem0's ~0.92 cosine dedup (task 1796).
-        """
-        from fused_memory.reconciliation.prompts.stage2 import build_stage2_system_prompt
-
-        result = build_stage2_system_prompt('dark_factory')
-        assert 'retry_nonce' in result, (
-            "build_stage2_system_prompt('dark_factory') must reference 'retry_nonce' "
-            "in the count=0 retry guidance so the Stage 2 agent uses a deterministic "
-            "nonce on retry (extends summary_nonce dedup-defeat pattern; task 1796)."
-        )
-
-
 class TestStage2NoTaskIdCeiling:
     """Task IDs above the old 606 ceiling must NOT block task writes.
 
@@ -1954,7 +1838,6 @@ class TestProjectIdGuidelineConstants:
         assert 'add_task' not in _STAGE3_PROJECT_ID_GUIDELINE
         assert 'submit_task' not in _STAGE3_PROJECT_ID_GUIDELINE
         assert 'resolve_ticket' not in _STAGE3_PROJECT_ID_GUIDELINE
-
 
 
 class TestStagePayloadProjectIdGuideline:
@@ -10667,121 +10550,6 @@ class TestStage2RecentlyCompletedAndProvenancePreserveIdTitlePairing:
             )
 
 
-class TestSummaryNonce:
-    """generate_summary_nonce() produces a correctly-formatted per-cycle uniqueness token.
-
-    Task 1572: Python-side CSPRNG nonce to defeat Mem0 cosine-similarity dedup of
-    Stage 2 per-cycle summaries.  Generated outside the LLM to guarantee entropy.
-    Successive ISO timestamps (tasks 1473/1488) embed nearly identically and failed
-    to provide sufficient cosine distance — 8+ confirmed dedup recurrences.
-    """
-
-    def test_nonce_format_is_8_lowercase_hex_chars(self):
-        """generate_summary_nonce() returns a str matching ^[0-9a-f]{8}$.
-
-        Backward-compatibility anchor (task 1590): the no-arg call must always
-        return a bare 8-char hex token — untouched by the prefix feature.
-        """
-        import re
-
-        from fused_memory.reconciliation.cli_stage_runner import generate_summary_nonce
-
-        nonce = generate_summary_nonce()
-        assert isinstance(nonce, str), f'Expected str, got {type(nonce)!r}'
-        assert re.fullmatch(r'[0-9a-f]{8}', nonce), (
-            f'Expected 8 lowercase hex chars matching ^[0-9a-f]{{8}}$, got {nonce!r}'
-        )
-
-    def test_prefixed_nonce_stage1_format(self):
-        """generate_summary_nonce('STAGE1') returns a str matching ^STAGE1_[0-9a-f]{8}$.
-
-        Task 1590: stage-prefixed nonces structurally distinguish Stage 1 and Stage 2
-        summaries so their leading tokens differ, further separating them in Mem0's
-        embedding space.  RED until step-2 impl adds the prefix parameter.
-        """
-        import re
-
-        from fused_memory.reconciliation.cli_stage_runner import generate_summary_nonce
-
-        nonce = generate_summary_nonce('STAGE1')
-        assert isinstance(nonce, str), f'Expected str, got {type(nonce)!r}'
-        assert re.fullmatch(r'STAGE1_[0-9a-f]{8}', nonce), (
-            f"Expected 'STAGE1_<8-hex>' matching ^STAGE1_[0-9a-f]{{8}}$, got {nonce!r}"
-        )
-
-    def test_prefixed_nonce_stage2_format(self):
-        """generate_summary_nonce('STAGE2') returns a str matching ^STAGE2_[0-9a-f]{8}$.
-
-        Task 1590: mirrors stage1 test; ensures Stage 2 nonces always lead with 'STAGE2_'.
-        RED until step-2 impl adds the prefix parameter.
-        """
-        import re
-
-        from fused_memory.reconciliation.cli_stage_runner import generate_summary_nonce
-
-        nonce = generate_summary_nonce('STAGE2')
-        assert isinstance(nonce, str), f'Expected str, got {type(nonce)!r}'
-        assert re.fullmatch(r'STAGE2_[0-9a-f]{8}', nonce), (
-            f"Expected 'STAGE2_<8-hex>' matching ^STAGE2_[0-9a-f]{{8}}$, got {nonce!r}"
-        )
-
-class TestBuildSummaryNonceSectionPrefix:
-    """build_summary_nonce_section() prefix forwarding tests (task 1590).
-
-    Verifies that the helper accepts an optional stage prefix and produces
-    a section line in the form 'summary_nonce: STAGE1_<8-hex>' or
-    'summary_nonce: STAGE2_<8-hex>', while keeping no-arg calls backward-compatible.
-    RED until step-4 impl adds the prefix parameter to build_summary_nonce_section.
-    """
-
-    def test_no_arg_backward_compat(self):
-        """No-arg build_summary_nonce_section() still matches 'summary_nonce: [0-9a-f]{8}'.
-
-        Backward-compat anchor: must stay GREEN across step-4 impl.
-        """
-        import re
-
-        from fused_memory.reconciliation.cli_stage_runner import build_summary_nonce_section
-
-        section = build_summary_nonce_section()
-        assert re.search(r'summary_nonce: [0-9a-f]{8}', section), (
-            f"No-arg build_summary_nonce_section() must include 'summary_nonce: <8-hex>'; "
-            f"got: {section!r}"
-        )
-
-    def test_stage1_prefix_produces_prefixed_nonce(self):
-        """build_summary_nonce_section('STAGE1') must contain 'summary_nonce: STAGE1_<8-hex>'.
-
-        Task 1590: verifies the helper forwards the prefix to generate_summary_nonce.
-        RED until step-4 impl adds prefix parameter.
-        """
-        import re
-
-        from fused_memory.reconciliation.cli_stage_runner import build_summary_nonce_section
-
-        section = build_summary_nonce_section('STAGE1')
-        assert re.search(r'summary_nonce: STAGE1_[0-9a-f]{8}', section), (
-            f"build_summary_nonce_section('STAGE1') must contain "
-            f"'summary_nonce: STAGE1_<8-hex>'; got: {section!r}"
-        )
-
-    def test_stage2_prefix_produces_prefixed_nonce(self):
-        """build_summary_nonce_section('STAGE2') must contain 'summary_nonce: STAGE2_<8-hex>'.
-
-        Task 1590: mirrors stage1 test for Stage 2.
-        RED until step-4 impl adds prefix parameter.
-        """
-        import re
-
-        from fused_memory.reconciliation.cli_stage_runner import build_summary_nonce_section
-
-        section = build_summary_nonce_section('STAGE2')
-        assert re.search(r'summary_nonce: STAGE2_[0-9a-f]{8}', section), (
-            f"build_summary_nonce_section('STAGE2') must contain "
-            f"'summary_nonce: STAGE2_<8-hex>'; got: {section!r}"
-        )
-
-
 # ── Tests for Task 1655 step-7: _classify_live_workflow_status_writes ─────────────────────
 
 
@@ -11502,675 +11270,6 @@ class TestMaybeQueueBriefingRefreshTasksNoTaskmasterNoOp:
         mock_script.assert_not_called()
 
 
-class TestEnforceStage2SummaryPoolCap:
-    """_enforce_stage2_summary_pool_cap trims oldest pool members to cap=2."""
-
-    @pytest.mark.asyncio
-    async def test_deletes_two_oldest_when_four_members_exist(self):
-        from fused_memory.reconciliation.stages.task_knowledge_sync import (
-            _enforce_stage2_summary_pool_cap,
-        )
-
-        members = [
-            {'id': 'oldest', 'created_at': '2026-01-01T00:00:00+00:00', 'metadata': {}},
-            {'id': 'second', 'created_at': '2026-02-01T00:00:00+00:00', 'metadata': {}},
-            {'id': 'third',  'created_at': '2026-03-01T00:00:00+00:00', 'metadata': {}},
-            {'id': 'newest', 'created_at': '2026-04-01T00:00:00+00:00', 'metadata': {}},
-        ]
-        memory_service = AsyncMock()
-        memory_service.get_memories_by_metadata = AsyncMock(return_value=members)
-        memory_service.delete_memory = AsyncMock(return_value=None)
-
-        result = await _enforce_stage2_summary_pool_cap(
-            memory_service,
-            project_id='dark_factory',
-            run_id='run-123',
-        )
-
-        # Two oldest deleted
-        assert result == 2
-        assert memory_service.delete_memory.await_count == 2
-
-        deleted_ids = {c.kwargs['memory_id'] for c in memory_service.delete_memory.call_args_list}
-        assert deleted_ids == {'oldest', 'second'}
-        # Two newest kept
-        assert 'third' not in deleted_ids
-        assert 'newest' not in deleted_ids
-
-    @pytest.mark.asyncio
-    async def test_delete_memory_called_with_correct_kwargs(self):
-        from fused_memory.reconciliation.stages.task_knowledge_sync import (
-            _enforce_stage2_summary_pool_cap,
-        )
-
-        members = [
-            {'id': 'm1', 'created_at': '2026-01-01T00:00:00+00:00', 'metadata': {}},
-            {'id': 'm2', 'created_at': '2026-02-01T00:00:00+00:00', 'metadata': {}},
-            {'id': 'm3', 'created_at': '2026-03-01T00:00:00+00:00', 'metadata': {}},
-        ]
-        memory_service = AsyncMock()
-        memory_service.get_memories_by_metadata = AsyncMock(return_value=members)
-        memory_service.delete_memory = AsyncMock(return_value=None)
-
-        await _enforce_stage2_summary_pool_cap(
-            memory_service,
-            project_id='dark_factory',
-            run_id='run-xyz',
-        )
-
-        for call in memory_service.delete_memory.call_args_list:
-            kwargs = call.kwargs
-            assert kwargs.get('store') == 'mem0'
-            assert kwargs.get('project_id') == 'dark_factory'
-            assert kwargs.get('causation_id') == 'run-xyz'
-            assert kwargs.get('_source') == 'stage2_cycle_summary_trim'
-
-    @pytest.mark.asyncio
-    async def test_get_memories_called_with_correct_filter_and_project(self):
-        from fused_memory.reconciliation.stages.task_knowledge_sync import (
-            _enforce_stage2_summary_pool_cap,
-        )
-
-        memory_service = AsyncMock()
-        memory_service.get_memories_by_metadata = AsyncMock(return_value=[])
-        memory_service.delete_memory = AsyncMock(return_value=None)
-
-        await _enforce_stage2_summary_pool_cap(
-            memory_service,
-            project_id='my_project',
-            run_id='run-abc',
-        )
-
-        memory_service.get_memories_by_metadata.assert_awaited_once()
-        call = memory_service.get_memories_by_metadata.call_args
-        kwargs = call.kwargs
-        assert kwargs.get('project_id') == 'my_project'
-        filters = kwargs.get('filters') or {}
-        assert filters.get('recon_pool') == 'stage2_cycle_summary'
-
-    @pytest.mark.asyncio
-    async def test_at_cap_deletes_nothing_returns_zero(self):
-        from fused_memory.reconciliation.stages.task_knowledge_sync import (
-            _enforce_stage2_summary_pool_cap,
-        )
-
-        # Exactly 2 members (== default cap)
-        members = [
-            {'id': 'a', 'created_at': '2026-01-01T00:00:00+00:00', 'metadata': {}},
-            {'id': 'b', 'created_at': '2026-02-01T00:00:00+00:00', 'metadata': {}},
-        ]
-        memory_service = AsyncMock()
-        memory_service.get_memories_by_metadata = AsyncMock(return_value=members)
-        memory_service.delete_memory = AsyncMock(return_value=None)
-
-        result = await _enforce_stage2_summary_pool_cap(
-            memory_service,
-            project_id='dark_factory',
-            run_id='run-abc',
-        )
-
-        assert result == 0
-        memory_service.delete_memory.assert_not_awaited()
-
-    @pytest.mark.asyncio
-    async def test_below_cap_deletes_nothing_returns_zero(self):
-        from fused_memory.reconciliation.stages.task_knowledge_sync import (
-            _enforce_stage2_summary_pool_cap,
-        )
-
-        members = [
-            {'id': 'only', 'created_at': '2026-01-01T00:00:00+00:00', 'metadata': {}},
-        ]
-        memory_service = AsyncMock()
-        memory_service.get_memories_by_metadata = AsyncMock(return_value=members)
-        memory_service.delete_memory = AsyncMock(return_value=None)
-
-        result = await _enforce_stage2_summary_pool_cap(
-            memory_service,
-            project_id='dark_factory',
-            run_id='run-abc',
-        )
-
-        assert result == 0
-        memory_service.delete_memory.assert_not_awaited()
-
-    def test_stage2_cycle_summary_pool_cap_constant_equals_2(self):
-        from fused_memory.reconciliation.stages.task_knowledge_sync import (
-            STAGE2_CYCLE_SUMMARY_POOL_CAP,
-        )
-
-        assert STAGE2_CYCLE_SUMMARY_POOL_CAP == 2
-
-
-class TestEnforceStage2SummaryPoolCapResilience:
-    """_enforce_stage2_summary_pool_cap resilience: enumeration failure, partial delete failure,
-    and created_at ordering edge cases."""
-
-    @pytest.mark.asyncio
-    async def test_enumeration_failure_returns_zero_and_logs_warning(self, caplog):
-        """When get_memories_by_metadata raises, returns 0, does NOT raise, logs WARNING."""
-        import logging
-
-        from fused_memory.reconciliation.stages.task_knowledge_sync import (
-            _enforce_stage2_summary_pool_cap,
-        )
-
-        memory_service = AsyncMock()
-        memory_service.get_memories_by_metadata = AsyncMock(
-            side_effect=RuntimeError('qdrant gone')
-        )
-        memory_service.delete_memory = AsyncMock(return_value=None)
-
-        with caplog.at_level(
-            logging.WARNING,
-            logger='fused_memory.reconciliation.stages.task_knowledge_sync',
-        ):
-            result = await _enforce_stage2_summary_pool_cap(
-                memory_service,
-                project_id='dark_factory',
-                run_id='run-fail',
-            )
-
-        assert result == 0
-        memory_service.delete_memory.assert_not_awaited()
-        warning_records = [r for r in caplog.records if r.levelno >= logging.WARNING]
-        assert len(warning_records) >= 1
-
-    @pytest.mark.asyncio
-    async def test_partial_delete_failure_excluded_from_count_logs_warning(self, caplog):
-        """If one delete raises, that delete is excluded from count; others counted; logs WARNING."""
-        import logging
-
-        from fused_memory.reconciliation.stages.task_knowledge_sync import (
-            _enforce_stage2_summary_pool_cap,
-        )
-
-        # 4 members → 2 to delete (oldest two)
-        members = [
-            {'id': 'oldest', 'created_at': '2026-01-01T00:00:00+00:00', 'metadata': {}},
-            {'id': 'second', 'created_at': '2026-02-01T00:00:00+00:00', 'metadata': {}},
-            {'id': 'third',  'created_at': '2026-03-01T00:00:00+00:00', 'metadata': {}},
-            {'id': 'newest', 'created_at': '2026-04-01T00:00:00+00:00', 'metadata': {}},
-        ]
-        memory_service = AsyncMock()
-        memory_service.get_memories_by_metadata = AsyncMock(return_value=members)
-        # First delete (oldest) succeeds; second delete (second) fails
-        memory_service.delete_memory = AsyncMock(
-            side_effect=[None, RuntimeError('delete failed')]
-        )
-
-        with caplog.at_level(
-            logging.WARNING,
-            logger='fused_memory.reconciliation.stages.task_knowledge_sync',
-        ):
-            result = await _enforce_stage2_summary_pool_cap(
-                memory_service,
-                project_id='dark_factory',
-                run_id='run-partial',
-            )
-
-        # Does not raise; only 1 success counted
-        assert result == 1
-        warning_records = [r for r in caplog.records if r.levelno >= logging.WARNING]
-        assert len(warning_records) >= 1
-
-    @pytest.mark.asyncio
-    async def test_missing_created_at_sorted_last_and_kept(self):
-        """Members with None/missing created_at sort LAST (treated as newest) and are kept."""
-        from fused_memory.reconciliation.stages.task_knowledge_sync import (
-            _enforce_stage2_summary_pool_cap,
-        )
-
-        # 4 members: 2 datable + 2 undatable; cap=2 → delete 2 oldest
-        # The 2 undatable should be kept; the 2 datable should be the ones deleted
-        members = [
-            {'id': 'datable-old',  'created_at': '2026-01-01T00:00:00+00:00', 'metadata': {}},
-            {'id': 'datable-new',  'created_at': '2026-02-01T00:00:00+00:00', 'metadata': {}},
-            {'id': 'no-date-1',    'created_at': None,                          'metadata': {}},
-            {'id': 'no-date-2',    'created_at': None,                          'metadata': {}},
-        ]
-        memory_service = AsyncMock()
-        memory_service.get_memories_by_metadata = AsyncMock(return_value=members)
-        memory_service.delete_memory = AsyncMock(return_value=None)
-
-        result = await _enforce_stage2_summary_pool_cap(
-            memory_service,
-            project_id='dark_factory',
-            run_id='run-order',
-        )
-
-        assert result == 2
-        deleted_ids = {c.kwargs['memory_id'] for c in memory_service.delete_memory.call_args_list}
-        assert deleted_ids == {'datable-old', 'datable-new'}
-        assert 'no-date-1' not in deleted_ids
-        assert 'no-date-2' not in deleted_ids
-
-    @pytest.mark.asyncio
-    async def test_unparseable_created_at_sorted_last_and_kept(self):
-        """Members with unparseable created_at sort LAST (treated as newest) and are kept."""
-        from fused_memory.reconciliation.stages.task_knowledge_sync import (
-            _enforce_stage2_summary_pool_cap,
-        )
-
-        members = [
-            {'id': 'datable',      'created_at': '2026-01-01T00:00:00+00:00', 'metadata': {}},
-            {'id': 'also-datable', 'created_at': '2026-02-01T00:00:00+00:00', 'metadata': {}},
-            {'id': 'bad-date-1',   'created_at': 'not-a-date',                'metadata': {}},
-            {'id': 'bad-date-2',   'created_at': 12345,                       'metadata': {}},
-        ]
-        memory_service = AsyncMock()
-        memory_service.get_memories_by_metadata = AsyncMock(return_value=members)
-        memory_service.delete_memory = AsyncMock(return_value=None)
-
-        result = await _enforce_stage2_summary_pool_cap(
-            memory_service,
-            project_id='dark_factory',
-            run_id='run-order2',
-        )
-
-        assert result == 2
-        deleted_ids = {c.kwargs['memory_id'] for c in memory_service.delete_memory.call_args_list}
-        assert deleted_ids == {'datable', 'also-datable'}
-        assert 'bad-date-1' not in deleted_ids
-        assert 'bad-date-2' not in deleted_ids
-
-
-class TestTaskKnowledgeSyncCycleSummaryPoolCap:
-    """TaskKnowledgeSync.run() pre-trims the pool to cap-1 BEFORE super().run()
-    (trim-then-write ordering, task 1831) and sets report.stats for both
-    'stage2_cycle_summary_pool_trimmed' (pre-trim count) and
-    'stage2_cycle_summary_verified_count' (post-write verify)."""
-
-    _LOGGER = 'fused_memory.reconciliation.stages.task_knowledge_sync'
-
-    @pytest.fixture
-    def mock_deps(self):
-        from fused_memory.config.schema import ReconciliationConfig
-        config = ReconciliationConfig(enabled=True, explore_codebase_root='/tmp/test')
-        memory_service = AsyncMock()
-        memory_service.count_memories_by_metadata.return_value = 0
-        memory_service.delete_memory = AsyncMock(return_value=None)
-        memory_service.get_memories_by_metadata = AsyncMock(return_value=[])
-        return {
-            'memory_service': memory_service,
-            'taskmaster': AsyncMock(),
-            'journal': AsyncMock(),
-            'config': config,
-            'scope': _scope('test_project', '/tmp/test'),
-        }
-
-    def _pool_members(self, count: int) -> list:
-        """Create count pool members with distinct created_at strings."""
-        return [
-            {
-                'id': f'summary-{i}',
-                'created_at': f'2026-0{i+1}-01T00:00:00+00:00',
-                'metadata': {'recon_pool': 'stage2_cycle_summary'},
-            }
-            for i in range(count)
-        ]
-
-    def _base_report(self):
-        from datetime import UTC, datetime
-
-        from fused_memory.models.reconciliation import StageId, StageReport
-        return StageReport(
-            stage=StageId.task_knowledge_sync,
-            started_at=datetime.now(UTC),
-            completed_at=datetime.now(UTC),
-            items_flagged=[],
-            stats={},
-            llm_calls=0,
-            tokens_used=0,
-        )
-
-    @pytest.mark.asyncio
-    async def test_stat_set_to_trimmed_count_when_pool_over_cap(self, mock_deps):
-        """Pre-trim with 3 pool members trims to cap-1=1 → pool_trimmed==2.
-
-        Updated for trim-then-write semantics (task 1831): pre-trim targets
-        cap-1 not cap, so 3 members → 2 deleted (was 1 under post-write trim).
-        """
-        from fused_memory.models.reconciliation import StageId
-        from fused_memory.reconciliation.stages.base import BaseStage
-
-        stage = TaskKnowledgeSync(StageId.task_knowledge_sync, **mock_deps)
-        stage.scope = _scope('dark_factory', stage.scope.project_root)
-        stage.scope = _scope(stage.scope.project_id, '/tmp/test')
-
-        mock_deps['memory_service'].get_memories_by_metadata = AsyncMock(
-            return_value=self._pool_members(3)
-        )
-
-        with patch.object(BaseStage, 'run', new=AsyncMock(return_value=self._base_report())):
-            report = await stage.run(
-                events=[], watermark=Watermark(project_id='dark_factory'),
-                prior_reports=[], run_id='run-cap',
-            )
-
-        assert 'stage2_cycle_summary_pool_trimmed' in report.stats
-        assert report.stats['stage2_cycle_summary_pool_trimmed'] == 2
-
-    @pytest.mark.asyncio
-    async def test_stat_is_zero_when_pool_at_cap_minus_one(self, mock_deps):
-        """1 member (already at cap-1=1) → no trim, pool_trimmed==0.
-
-        Updated for trim-then-write semantics: the at-or-below threshold is
-        cap-1=1 (not cap=2).
-        """
-        from fused_memory.models.reconciliation import StageId
-        from fused_memory.reconciliation.stages.base import BaseStage
-
-        stage = TaskKnowledgeSync(StageId.task_knowledge_sync, **mock_deps)
-        stage.scope = _scope('dark_factory', stage.scope.project_root)
-        stage.scope = _scope(stage.scope.project_id, '/tmp/test')
-
-        mock_deps['memory_service'].get_memories_by_metadata = AsyncMock(
-            return_value=self._pool_members(1)
-        )
-
-        with patch.object(BaseStage, 'run', new=AsyncMock(return_value=self._base_report())):
-            report = await stage.run(
-                events=[], watermark=Watermark(project_id='dark_factory'),
-                prior_reports=[], run_id='run-at-cap',
-            )
-
-        assert 'stage2_cycle_summary_pool_trimmed' in report.stats
-        assert report.stats['stage2_cycle_summary_pool_trimmed'] == 0
-
-    @pytest.mark.asyncio
-    async def test_stat_is_one_when_pool_has_two_prior_members(self, mock_deps):
-        """2 prior members → pre-trim to cap-1=1 → pool_trimmed==1."""
-        from fused_memory.models.reconciliation import StageId
-        from fused_memory.reconciliation.stages.base import BaseStage
-
-        stage = TaskKnowledgeSync(StageId.task_knowledge_sync, **mock_deps)
-        stage.scope = _scope('dark_factory', stage.scope.project_root)
-        stage.scope = _scope(stage.scope.project_id, '/tmp/test')
-
-        mock_deps['memory_service'].get_memories_by_metadata = AsyncMock(
-            return_value=self._pool_members(2)
-        )
-
-        with patch.object(BaseStage, 'run', new=AsyncMock(return_value=self._base_report())):
-            report = await stage.run(
-                events=[], watermark=Watermark(project_id='dark_factory'),
-                prior_reports=[], run_id='run-two',
-            )
-
-        assert report.stats['stage2_cycle_summary_pool_trimmed'] == 1
-
-    @pytest.mark.asyncio
-    async def test_trim_runs_in_remediation_mode(self, mock_deps):
-        """Pre-trim runs and stat is set even when remediation_mode=True.
-
-        Updated: 3 members → trimmed==2 (pre-trim to cap-1, not cap).
-        """
-        from fused_memory.models.reconciliation import StageId
-        from fused_memory.reconciliation.stages.base import BaseStage
-
-        stage = TaskKnowledgeSync(StageId.task_knowledge_sync, **mock_deps)
-        stage.scope = _scope('dark_factory', stage.scope.project_root)
-        stage.scope = _scope(stage.scope.project_id, '/tmp/test')
-        stage.remediation_mode = True
-
-        mock_deps['memory_service'].get_memories_by_metadata = AsyncMock(
-            return_value=self._pool_members(3)
-        )
-
-        with patch.object(BaseStage, 'run', new=AsyncMock(return_value=self._base_report())):
-            report = await stage.run(
-                events=[], watermark=Watermark(project_id='dark_factory'),
-                prior_reports=[], run_id='run-remediation',
-            )
-
-        assert 'stage2_cycle_summary_pool_trimmed' in report.stats
-        assert report.stats['stage2_cycle_summary_pool_trimmed'] == 2
-        mock_deps['memory_service'].delete_memory.assert_awaited()
-
-    @pytest.mark.asyncio
-    async def test_trim_precedes_agent_write_ordering(self, mock_deps):
-        """Pre-trim (get_memories_by_metadata) fires BEFORE super().run() (agent write).
-
-        Only records calls filtered on 'recon_pool' (the stage2_cycle_summary
-        pretrim this test targets) — run() also calls get_memories_by_metadata
-        post-write for the unrelated stage1_flag_marker GC sweep (task 1944),
-        which must NOT be mistaken for a (misordered) pretrim call.
-        """
-        from fused_memory.models.reconciliation import StageId
-        from fused_memory.reconciliation.stages.base import BaseStage
-
-        order = []
-
-        async def record_trim(*args, **kwargs):
-            if 'recon_pool' in (kwargs.get('filters') or {}):
-                order.append('trim')
-            return []
-
-        async def record_agent(*args, **kwargs):
-            order.append('agent_run')
-            return self._base_report()
-
-        mock_deps['memory_service'].get_memories_by_metadata = AsyncMock(
-            side_effect=record_trim
-        )
-        # Non-zero verify count keeps the task-1963 stage-metadata repair
-        # gated off — this test targets pretrim ordering only, and repair's
-        # own {'recon_pool','run_id'}-filtered enumeration would otherwise
-        # register as a spurious post-agent_run 'trim' entry.
-        mock_deps['memory_service'].count_memories_by_metadata.return_value = 1
-
-        stage = TaskKnowledgeSync(StageId.task_knowledge_sync, **mock_deps)
-        stage.scope = _scope('dark_factory', stage.scope.project_root)
-        stage.scope = _scope(stage.scope.project_id, '/tmp/test')
-
-        with patch.object(BaseStage, 'run', new=AsyncMock(side_effect=record_agent)):
-            await stage.run(
-                events=[], watermark=Watermark(project_id='dark_factory'),
-                prior_reports=[], run_id='run-order',
-            )
-
-        trim_indices = [i for i, x in enumerate(order) if x == 'trim']
-        agent_indices = [i for i, x in enumerate(order) if x == 'agent_run']
-        assert trim_indices, 'pre-trim must call get_memories_by_metadata'
-        assert agent_indices, 'super().run() must be called'
-        assert max(trim_indices) < min(agent_indices), (
-            'all trim calls must precede agent_run; '
-            f'got order={order!r}'
-        )
-
-    @pytest.mark.asyncio
-    async def test_new_summary_not_evicted_by_pretrim(self, mock_deps):
-        """Pre-trim keeps the newest pool member; oldest two are deleted.
-
-        Simulates the edge case where new_summary_id is already present in the
-        enumerated pool (e.g. a reconstruction write from a prior step) and
-        verifies that trim-then-write ordering preserves it because it has the
-        newest created_at.  Cap=2, pre-trim to cap-1=1: 3 members → delete 2
-        oldest (summary-0, summary-1); new_summary_id (newest) survives.
-        """
-        from fused_memory.models.reconciliation import StageId
-        from fused_memory.reconciliation.stages.base import BaseStage
-
-        new_run_id = 'run-new'
-        new_summary_id = f'new-summary-{new_run_id}'
-
-        # Pool contains 2 prior members + new_summary_id with newest created_at.
-        # This makes the assertion non-trivial: if sort/trim logic were reversed,
-        # new_summary_id would be the one deleted.
-        prior_members = self._pool_members(2)  # summary-0 (2026-01), summary-1 (2026-02)
-        new_member = {
-            'id': new_summary_id,
-            'created_at': '2026-12-01T00:00:00+00:00',
-            'metadata': {'recon_pool': 'stage2_cycle_summary'},
-        }
-        mock_deps['memory_service'].get_memories_by_metadata = AsyncMock(
-            return_value=prior_members + [new_member]
-        )
-        # Non-zero verify count keeps the task-1963 stage-metadata repair
-        # gated off — this test targets pretrim eviction ordering only; since
-        # new_member's metadata lacks kind/stage, an active repair pass would
-        # treat it as broken and (correctly, but irrelevantly to this test)
-        # delete+re-add it, tripping the "newest survives" assertion below.
-        mock_deps['memory_service'].count_memories_by_metadata.return_value = 1
-
-        stage = TaskKnowledgeSync(StageId.task_knowledge_sync, **mock_deps)
-        stage.scope = _scope('dark_factory', stage.scope.project_root)
-        stage.scope = _scope(stage.scope.project_id, '/tmp/test')
-
-        with patch.object(BaseStage, 'run', new=AsyncMock(return_value=self._base_report())):
-            await stage.run(
-                events=[], watermark=Watermark(project_id='dark_factory'),
-                prior_reports=[], run_id=new_run_id,
-            )
-
-        deleted_ids = {
-            c.kwargs['memory_id']
-            for c in mock_deps['memory_service'].delete_memory.call_args_list
-        }
-        assert new_summary_id not in deleted_ids, (
-            f'the newest member {new_summary_id!r} must survive pre-trim; '
-            f'deleted={deleted_ids!r}'
-        )
-        # Both older prior members were deleted (trim to 1 from 3)
-        assert 'summary-0' in deleted_ids, f'oldest member must be deleted; deleted={deleted_ids!r}'
-        assert 'summary-1' in deleted_ids, f'second member must be deleted; deleted={deleted_ids!r}'
-
-    @pytest.mark.asyncio
-    async def test_verified_count_stat_set_when_summary_found(self, mock_deps):
-        """stage2_cycle_summary_verified_count==1 when count_memories_by_metadata returns 1."""
-        from fused_memory.models.reconciliation import StageId
-        from fused_memory.reconciliation.stages.base import BaseStage
-
-        mock_deps['memory_service'].count_memories_by_metadata.return_value = 1
-
-        stage = TaskKnowledgeSync(StageId.task_knowledge_sync, **mock_deps)
-        stage.scope = _scope('dark_factory', stage.scope.project_root)
-        stage.scope = _scope(stage.scope.project_id, '/tmp/test')
-
-        with patch.object(BaseStage, 'run', new=AsyncMock(return_value=self._base_report())):
-            report = await stage.run(
-                events=[], watermark=Watermark(project_id='dark_factory'),
-                prior_reports=[], run_id='run-verify',
-            )
-
-        assert report.stats['stage2_cycle_summary_verified_count'] == 1
-
-    @pytest.mark.asyncio
-    async def test_verified_count_zero_and_warns_when_no_summary(self, mock_deps, caplog):
-        """stage2_cycle_summary_verified_count==0 and WARNING when count returns 0."""
-        from fused_memory.models.reconciliation import StageId
-        from fused_memory.reconciliation.stages.base import BaseStage
-
-        mock_deps['memory_service'].count_memories_by_metadata.return_value = 0
-
-        stage = TaskKnowledgeSync(StageId.task_knowledge_sync, **mock_deps)
-        stage.scope = _scope('dark_factory', stage.scope.project_root)
-        stage.scope = _scope(stage.scope.project_id, '/tmp/test')
-
-        with patch.object(BaseStage, 'run', new=AsyncMock(return_value=self._base_report())), \
-             caplog.at_level(logging.WARNING, logger=self._LOGGER):
-            report = await stage.run(
-                events=[], watermark=Watermark(project_id='dark_factory'),
-                prior_reports=[], run_id='run-verify-miss',
-            )
-
-        assert report.stats['stage2_cycle_summary_verified_count'] == 0
-        assert [r for r in caplog.records if r.levelno >= logging.WARNING]
-
-    @pytest.mark.asyncio
-    async def test_repair_path_sets_repaired_and_post_repair_verified_count(self, mock_deps):
-        """When the first verify finds 0, run() repairs the stage-less summary
-        and re-verifies: stage2_cycle_summary_stage_repaired==1 and
-        stage2_cycle_summary_verified_count==1 (the POST-repair count).
-
-        Discriminates get_memories_by_metadata calls by filter shape: only the
-        repair's enumeration filters on {'recon_pool', 'run_id'} together —
-        the pre-trim filters on 'recon_pool' alone and the stage1_flag_marker
-        GC sweep filters on 'source' alone — so both must keep returning their
-        own (empty) results, unaffected by the repair fixture below.
-        """
-        from fused_memory.models.reconciliation import StageId
-        from fused_memory.reconciliation.stages.base import BaseStage
-
-        run_id = 'run-repair-wiring'
-        broken_member = {
-            'id': 'broken-wiring-1',
-            'created_at': '2026-07-01T00:00:00+00:00',
-            'metadata': {
-                'kind': 'cycle_summary',
-                'run_id': run_id,
-                'recon_pool': 'stage2_cycle_summary',
-                'data': 'Cycle summary text',
-            },
-        }
-
-        async def dispatch_get_memories(*args, **kwargs):
-            filters = kwargs.get('filters') or {}
-            if 'run_id' in filters:
-                return [broken_member]
-            return []
-
-        mock_deps['memory_service'].get_memories_by_metadata = AsyncMock(
-            side_effect=dispatch_get_memories
-        )
-        mock_deps['memory_service'].count_memories_by_metadata = AsyncMock(
-            side_effect=[0, 1]
-        )
-
-        stage = TaskKnowledgeSync(StageId.task_knowledge_sync, **mock_deps)
-        stage.scope = _scope('dark_factory', stage.scope.project_root)
-        stage.scope = _scope(stage.scope.project_id, '/tmp/test')
-
-        with patch.object(BaseStage, 'run', new=AsyncMock(return_value=self._base_report())):
-            report = await stage.run(
-                events=[], watermark=Watermark(project_id='dark_factory'),
-                prior_reports=[], run_id=run_id,
-            )
-
-        assert report.stats['stage2_cycle_summary_stage_repaired'] == 1
-        assert report.stats['stage2_cycle_summary_verified_count'] == 1
-        mock_deps['memory_service'].add_memory.assert_awaited()
-        mock_deps['memory_service'].delete_memory.assert_any_await(
-            memory_id='broken-wiring-1',
-            store='mem0',
-            project_id='dark_factory',
-            causation_id=run_id,
-            _source='stage2_summary_stage_repair',
-        )
-
-    @pytest.mark.asyncio
-    async def test_happy_path_skips_repair_and_no_enumeration(self, mock_deps):
-        """When the first verify already finds a summary, run() records
-        stage2_cycle_summary_stage_repaired==0 and never enumerates for
-        repair (no {'recon_pool','run_id'}-filtered call) — zero extra Mem0
-        calls and zero duplicate-write risk on the happy path.
-        """
-        from fused_memory.models.reconciliation import StageId
-        from fused_memory.reconciliation.stages.base import BaseStage
-
-        mock_deps['memory_service'].count_memories_by_metadata.return_value = 1
-
-        stage = TaskKnowledgeSync(StageId.task_knowledge_sync, **mock_deps)
-        stage.scope = _scope('dark_factory', stage.scope.project_root)
-        stage.scope = _scope(stage.scope.project_id, '/tmp/test')
-
-        with patch.object(BaseStage, 'run', new=AsyncMock(return_value=self._base_report())):
-            report = await stage.run(
-                events=[], watermark=Watermark(project_id='dark_factory'),
-                prior_reports=[], run_id='run-happy-wiring',
-            )
-
-        assert report.stats['stage2_cycle_summary_stage_repaired'] == 0
-        assert report.stats['stage2_cycle_summary_verified_count'] == 1
-        repair_calls = [
-            c for c in mock_deps['memory_service'].get_memories_by_metadata.call_args_list
-            if 'run_id' in (c.kwargs.get('filters') or {})
-        ]
-        assert repair_calls == [], f'repair must not enumerate on the happy path; got {repair_calls!r}'
-        mock_deps['memory_service'].add_memory.assert_not_awaited()
-
-
 class TestStage2PromptCycleSummaryPoolTag:
     """Stage 2 prompt must instruct the agent to tag per-cycle summaries with
     recon_pool='stage2_cycle_summary' so the deterministic Python trim can
@@ -12247,253 +11346,18 @@ class TestStage2PromptCycleSummaryPoolTag:
         )
 
 
-class TestStage1PromptCycleSummaryPoolTag:
-    """Stage 1 prompt must instruct the agent to tag per-cycle summaries with
-    recon_pool='stage1_cycle_summary' so the deterministic Python trim
-    (pretrim_summary_pool, wired into MemoryConsolidator.run()) can enumerate
-    the pool by metadata key.
-
-    Task 1942: minimal key-value-fragment presence assertion only (no prose-
-    wording pins).  Mirrors TestStage2PromptCycleSummaryPoolTag.
-
-    This is the producer-contract guard: the Python trim filters pool members
-    by exactly {'recon_pool': 'stage1_cycle_summary'}.  If the prompt omits
-    the tag instruction the producer never sets the key and the consumer
-    (trim) finds an empty pool — silently leaving the pool invisible/uncapped.
-    """
-
-    def test_stage1_prompt_contains_literal_recon_pool_metadata_fragment(self):
-        """STAGE1_SYSTEM_PROMPT must contain the literal key=value metadata
-        fragment 'recon_pool': 'stage1_cycle_summary'.
-
-        Stronger than a bare token check: verifies the key and value co-occur
-        as the exact add_memory metadata fragment the producer must emit, not
-        just anywhere in unrelated prose.  If the producer instruction is
-        removed or the value changes, this test catches it immediately.
-
-        The consumer (pretrim_summary_pool, via MemoryConsolidator.run())
-        filters by exactly {'recon_pool': 'stage1_cycle_summary'} — so the
-        prompt must instruct the agent to write that exact key-value pair in
-        the per-cycle-summary add_memory metadata dict.
-        """
-        from fused_memory.reconciliation.prompts.stage1 import STAGE1_SYSTEM_PROMPT
-
-        # The literal metadata fragment the producer must emit.  This ties the
-        # test to the actual contract rather than token presence anywhere.
-        fragment = "recon_pool': 'stage1_cycle_summary'"
-        assert fragment in STAGE1_SYSTEM_PROMPT, (
-            f"STAGE1_SYSTEM_PROMPT must contain the literal metadata fragment "
-            f"{fragment!r} so the Stage 1 agent writes the exact key-value pair "
-            f"that pretrim_summary_pool filters on (task 1942 — producer/consumer "
-            f"contract, mirrors Stage 2's task 1657)."
-        )
-
-
-class TestStage1CycleSummaryPoolTrim:
-    """MemoryConsolidator.run() pre-trims the stage1_cycle_summary pool to
-    cap-1 BEFORE super().run() (trim-then-write ordering, mirrors Stage 2's
-    task 1831 wiring) and sets report.stats['stage1_cycle_summary_pool_trimmed']
-    (task 1942)."""
-
-    @pytest.fixture
-    def mock_deps(self):
-        config = ReconciliationConfig(enabled=True, explore_codebase_root='/tmp/test')
-        memory_service = AsyncMock()
-        memory_service.delete_memory = AsyncMock(return_value=None)
-        memory_service.get_memories_by_metadata = AsyncMock(return_value=[])
-        return {
-            'memory_service': memory_service,
-            'taskmaster': AsyncMock(),
-            'journal': AsyncMock(),
-            'config': config,
-            'scope': _scope('test_project', '/tmp/test'),
-        }
-
-    def _pool_members(self, count: int) -> list:
-        """Create count pool members with distinct created_at strings."""
-        return [
-            {
-                'id': f'summary-{i}',
-                'created_at': f'2026-0{i+1}-01T00:00:00+00:00',
-                'metadata': {'recon_pool': 'stage1_cycle_summary'},
-            }
-            for i in range(count)
-        ]
-
-    def _base_report(self):
-        return StageReport(
-            stage=StageId.memory_consolidator,
-            started_at=datetime.now(UTC),
-            completed_at=datetime.now(UTC),
-            items_flagged=[],
-            stats={},
-            llm_calls=0,
-            tokens_used=0,
-        )
-
-    def test_stage1_cycle_summary_pool_cap_constant_equals_2(self):
-        from fused_memory.reconciliation.stages.memory_consolidator import (
-            STAGE1_CYCLE_SUMMARY_POOL_CAP,
-        )
-
-        assert STAGE1_CYCLE_SUMMARY_POOL_CAP == 2
-
-    def test_stage1_cycle_summary_recon_pool_constant(self):
-        from fused_memory.reconciliation.recon_pool_map import (
-            STAGE1_CYCLE_SUMMARY_RECON_POOL,
-        )
-        from fused_memory.reconciliation.stages.memory_consolidator import (
-            _STAGE1_CYCLE_SUMMARY_RECON_POOL,
-        )
-
-        assert _STAGE1_CYCLE_SUMMARY_RECON_POOL == 'stage1_cycle_summary'
-        # Identity, not just equality: the stage constant is an alias of the
-        # shared leaf-module constant, not a re-defined duplicate (task 2140).
-        assert _STAGE1_CYCLE_SUMMARY_RECON_POOL is STAGE1_CYCLE_SUMMARY_RECON_POOL
-
-    @pytest.mark.asyncio
-    async def test_stat_set_to_trimmed_count_when_pool_over_cap(self, mock_deps):
-        """3 pool members → pre-trim to cap-1=1 → pool_trimmed==2."""
-        stage = MemoryConsolidator(StageId.memory_consolidator, **mock_deps)
-        stage.scope = _scope('dark_factory', stage.scope.project_root)
-        stage.scope = _scope(stage.scope.project_id, '/tmp/test')
-
-        mock_deps['memory_service'].get_memories_by_metadata = AsyncMock(
-            return_value=self._pool_members(3)
-        )
-
-        with patch.object(BaseStage, 'run', new=AsyncMock(return_value=self._base_report())):
-            report = await stage.run(
-                events=[], watermark=Watermark(project_id='dark_factory'),
-                prior_reports=[], run_id='run-cap',
-            )
-
-        assert 'stage1_cycle_summary_pool_trimmed' in report.stats
-        assert report.stats['stage1_cycle_summary_pool_trimmed'] == 2
-
-    @pytest.mark.asyncio
-    async def test_stat_is_zero_when_pool_at_cap_minus_one(self, mock_deps):
-        """1 member (already at cap-1=1) → no trim, pool_trimmed==0."""
-        stage = MemoryConsolidator(StageId.memory_consolidator, **mock_deps)
-        stage.scope = _scope('dark_factory', stage.scope.project_root)
-        stage.scope = _scope(stage.scope.project_id, '/tmp/test')
-
-        mock_deps['memory_service'].get_memories_by_metadata = AsyncMock(
-            return_value=self._pool_members(1)
-        )
-
-        with patch.object(BaseStage, 'run', new=AsyncMock(return_value=self._base_report())):
-            report = await stage.run(
-                events=[], watermark=Watermark(project_id='dark_factory'),
-                prior_reports=[], run_id='run-at-cap',
-            )
-
-        assert 'stage1_cycle_summary_pool_trimmed' in report.stats
-        assert report.stats['stage1_cycle_summary_pool_trimmed'] == 0
-
-    @pytest.mark.asyncio
-    async def test_stat_is_one_when_pool_has_two_prior_members(self, mock_deps):
-        """2 prior members → pre-trim to cap-1=1 → pool_trimmed==1."""
-        stage = MemoryConsolidator(StageId.memory_consolidator, **mock_deps)
-        stage.scope = _scope('dark_factory', stage.scope.project_root)
-        stage.scope = _scope(stage.scope.project_id, '/tmp/test')
-
-        mock_deps['memory_service'].get_memories_by_metadata = AsyncMock(
-            return_value=self._pool_members(2)
-        )
-
-        with patch.object(BaseStage, 'run', new=AsyncMock(return_value=self._base_report())):
-            report = await stage.run(
-                events=[], watermark=Watermark(project_id='dark_factory'),
-                prior_reports=[], run_id='run-two',
-            )
-
-        assert report.stats['stage1_cycle_summary_pool_trimmed'] == 1
-
-    @pytest.mark.asyncio
-    async def test_trim_runs_in_remediation_mode(self, mock_deps):
-        """Pre-trim runs and stat is set even when remediation_findings is set
-        (remediation passes still need the pool bounded every cycle)."""
-        stage = MemoryConsolidator(StageId.memory_consolidator, **mock_deps)
-        stage.scope = _scope('dark_factory', stage.scope.project_root)
-        stage.scope = _scope(stage.scope.project_id, '/tmp/test')
-        stage.remediation_findings = []
-
-        mock_deps['memory_service'].get_memories_by_metadata = AsyncMock(
-            return_value=self._pool_members(3)
-        )
-
-        with patch.object(BaseStage, 'run', new=AsyncMock(return_value=self._base_report())):
-            report = await stage.run(
-                events=[], watermark=Watermark(project_id='dark_factory'),
-                prior_reports=[], run_id='run-remediation',
-            )
-
-        assert 'stage1_cycle_summary_pool_trimmed' in report.stats
-        assert report.stats['stage1_cycle_summary_pool_trimmed'] == 2
-        mock_deps['memory_service'].delete_memory.assert_awaited()
-
-    @pytest.mark.asyncio
-    async def test_trim_precedes_agent_write_ordering(self, mock_deps):
-        """Pre-trim (get_memories_by_metadata) fires BEFORE super().run() (agent write)."""
-        order = []
-
-        async def record_trim(*args, **kwargs):
-            order.append('trim')
-            return []
-
-        async def record_agent(*args, **kwargs):
-            order.append('agent_run')
-            return self._base_report()
-
-        mock_deps['memory_service'].get_memories_by_metadata = AsyncMock(
-            side_effect=record_trim
-        )
-
-        stage = MemoryConsolidator(StageId.memory_consolidator, **mock_deps)
-        stage.scope = _scope('dark_factory', stage.scope.project_root)
-        stage.scope = _scope(stage.scope.project_id, '/tmp/test')
-
-        with patch.object(BaseStage, 'run', new=AsyncMock(side_effect=record_agent)):
-            await stage.run(
-                events=[], watermark=Watermark(project_id='dark_factory'),
-                prior_reports=[], run_id='run-order',
-            )
-
-        trim_indices = [i for i, x in enumerate(order) if x == 'trim']
-        agent_indices = [i for i, x in enumerate(order) if x == 'agent_run']
-        assert trim_indices, 'pre-trim must call get_memories_by_metadata'
-        assert agent_indices, 'super().run() must be called'
-        assert max(trim_indices) < min(agent_indices), (
-            'all trim calls must precede agent_run; '
-            f'got order={order!r}'
-        )
-
-    @pytest.mark.asyncio
-    async def test_pretrim_uses_stage1_recon_pool_filter_and_trim_source(self, mock_deps):
-        """Pretrim filters by recon_pool='stage1_cycle_summary' and deletes with
-        _source='stage1_cycle_summary_trim' (producer/consumer contract with
-        the Stage 1 prompt's add_memory metadata)."""
-        stage = MemoryConsolidator(StageId.memory_consolidator, **mock_deps)
-        stage.scope = _scope('dark_factory', stage.scope.project_root)
-        stage.scope = _scope(stage.scope.project_id, '/tmp/test')
-
-        mock_deps['memory_service'].get_memories_by_metadata = AsyncMock(
-            return_value=self._pool_members(2)
-        )
-
-        with patch.object(BaseStage, 'run', new=AsyncMock(return_value=self._base_report())):
-            await stage.run(
-                events=[], watermark=Watermark(project_id='dark_factory'),
-                prior_reports=[], run_id='run-filter',
-            )
-
-        call = mock_deps['memory_service'].get_memories_by_metadata.call_args
-        filters = call.kwargs.get('filters') or {}
-        assert filters.get('recon_pool') == 'stage1_cycle_summary'
-
-        delete_call = mock_deps['memory_service'].delete_memory.call_args
-        assert delete_call.kwargs.get('_source') == 'stage1_cycle_summary_trim'
+# ---------------------------------------------------------------------------
+# The former classes TestStage1PromptCycleSummaryPoolTag and
+# TestStage1CycleSummaryPoolTrim (task 1942) tested the LLM-driven
+# pretrim_summary_pool trim-then-write wiring and the STAGE1_SYSTEM_PROMPT
+# recon_pool tag directive that fed it. Task 2229 (W5-λ) retired
+# pretrim_summary_pool and the prompt directive entirely — the deterministic
+# write_cycle_summary helper now owns the per-cycle summary write and its
+# own best-effort pool trim (enforce_summary_pool_cap) directly, with no
+# prompt-side producer contract left to test. See
+# TestMemoryConsolidatorDeterministicCycleSummaryWrite in
+# tests/reconciliation/test_stage1.py for the replacement coverage.
+# ---------------------------------------------------------------------------
 
 
 class TestInjectFlagId:
@@ -12756,190 +11620,6 @@ class TestMemoryConsolidatorMem0ResultsKeyWarns:
         )
 
 
-class TestVerifyStage2SummaryWritten:
-    """_verify_stage2_summary_written: calls count_memories_by_metadata with
-    {'kind':'cycle_summary','stage':'task_knowledge_sync','run_id':run_id},
-    returns the count (0 means CONFIRMED absent) on success, returns None
-    (transient failure, absence NOT confirmed) on exception, logs WARNING on
-    count==0 or exception, never raises. The int-vs-None distinction (task
-    1964 amendment) lets run()'s repair/reconstruct chain gate strictly on a
-    confirmed 0 rather than treating a transient error the same as absence.
-    """
-
-    _LOGGER = 'fused_memory.reconciliation.stages.task_knowledge_sync'
-
-    @pytest.mark.asyncio
-    async def test_calls_count_with_correct_filter(self):
-        """Calls count_memories_by_metadata once with project_id and correct triple filter."""
-        from fused_memory.reconciliation.stages.task_knowledge_sync import (
-            _verify_stage2_summary_written,
-        )
-
-        memory_service = AsyncMock()
-        memory_service.count_memories_by_metadata.return_value = 1
-
-        await _verify_stage2_summary_written(memory_service, 'dark_factory', 'run-abc')
-
-        memory_service.count_memories_by_metadata.assert_awaited_once_with(
-            project_id='dark_factory',
-            filters={
-                'kind': 'cycle_summary',
-                'stage': 'task_knowledge_sync',
-                'run_id': 'run-abc',
-            },
-        )
-
-    @pytest.mark.asyncio
-    async def test_returns_count_when_positive_no_warning(self, caplog):
-        """Returns count when >0 and logs no WARNING."""
-        from fused_memory.reconciliation.stages.task_knowledge_sync import (
-            _verify_stage2_summary_written,
-        )
-
-        memory_service = AsyncMock()
-        memory_service.count_memories_by_metadata.return_value = 2
-
-        with caplog.at_level(logging.WARNING, logger=self._LOGGER):
-            result = await _verify_stage2_summary_written(
-                memory_service, 'dark_factory', 'run-found'
-            )
-
-        assert result == 2
-        assert not [r for r in caplog.records if r.levelno >= logging.WARNING]
-
-    @pytest.mark.asyncio
-    async def test_returns_zero_and_logs_warning_when_count_is_zero(self, caplog):
-        """When count==0 returns 0 and logs a WARNING."""
-        from fused_memory.reconciliation.stages.task_knowledge_sync import (
-            _verify_stage2_summary_written,
-        )
-
-        memory_service = AsyncMock()
-        memory_service.count_memories_by_metadata.return_value = 0
-
-        with caplog.at_level(logging.WARNING, logger=self._LOGGER):
-            result = await _verify_stage2_summary_written(
-                memory_service, 'dark_factory', 'run-missing'
-            )
-
-        assert result == 0
-        assert [r for r in caplog.records if r.levelno >= logging.WARNING]
-
-    @pytest.mark.asyncio
-    async def test_returns_none_and_logs_warning_on_exception(self, caplog):
-        """When count_memories_by_metadata raises, returns None (transient
-        failure — absence NOT confirmed, distinct from a confirmed count==0),
-        does NOT raise, logs WARNING. (task 1964 amendment: run()'s
-        repair/reconstruct chain relies on this None-vs-0 distinction to
-        avoid fabricating a reconstruction when the pool's real state is
-        unknown.)"""
-        from fused_memory.reconciliation.stages.task_knowledge_sync import (
-            _verify_stage2_summary_written,
-        )
-
-        memory_service = AsyncMock()
-        memory_service.count_memories_by_metadata = AsyncMock(
-            side_effect=RuntimeError('qdrant gone')
-        )
-
-        with caplog.at_level(logging.WARNING, logger=self._LOGGER):
-            result = await _verify_stage2_summary_written(
-                memory_service, 'dark_factory', 'run-error'
-            )
-
-        assert result is None
-        assert [r for r in caplog.records if r.levelno >= logging.WARNING]
-
-
-class TestPretrimStage2SummaryPool:
-    """_pretrim_stage2_summary_pool delegates to _enforce_stage2_summary_pool_cap
-    with cap=max(STAGE2_CYCLE_SUMMARY_POOL_CAP-1, 0) == 1, reserving one slot
-    for the imminent agent write."""
-
-    def _pool_members(self, count: int) -> list:
-        return [
-            {
-                'id': f'summary-{i}',
-                'created_at': f'2026-0{i+1}-01T00:00:00+00:00',
-                'metadata': {'recon_pool': 'stage2_cycle_summary'},
-            }
-            for i in range(count)
-        ]
-
-    @pytest.mark.asyncio
-    async def test_two_members_deletes_one_oldest_returns_one(self):
-        """2 pool members → trim to cap-1=1 → delete 1 oldest, returns 1."""
-        from fused_memory.reconciliation.stages.task_knowledge_sync import (
-            _pretrim_stage2_summary_pool,
-        )
-
-        memory_service = AsyncMock()
-        memory_service.get_memories_by_metadata = AsyncMock(return_value=self._pool_members(2))
-        memory_service.delete_memory = AsyncMock(return_value=None)
-
-        result = await _pretrim_stage2_summary_pool(memory_service, 'dark_factory', 'run-pre')
-
-        assert result == 1
-        deleted_ids = {c.kwargs['memory_id'] for c in memory_service.delete_memory.call_args_list}
-        assert deleted_ids == {'summary-0'}
-
-    @pytest.mark.asyncio
-    async def test_three_members_deletes_two_oldest_returns_two(self):
-        """3 pool members → trim to cap-1=1 → delete 2 oldest, returns 2."""
-        from fused_memory.reconciliation.stages.task_knowledge_sync import (
-            _pretrim_stage2_summary_pool,
-        )
-
-        memory_service = AsyncMock()
-        memory_service.get_memories_by_metadata = AsyncMock(return_value=self._pool_members(3))
-        memory_service.delete_memory = AsyncMock(return_value=None)
-
-        result = await _pretrim_stage2_summary_pool(memory_service, 'dark_factory', 'run-pre')
-
-        assert result == 2
-        deleted_ids = {c.kwargs['memory_id'] for c in memory_service.delete_memory.call_args_list}
-        assert deleted_ids == {'summary-0', 'summary-1'}
-
-    @pytest.mark.asyncio
-    async def test_one_member_deletes_nothing_returns_zero(self):
-        """1 pool member (already at cap-1=1) → deletes nothing, returns 0."""
-        from fused_memory.reconciliation.stages.task_knowledge_sync import (
-            _pretrim_stage2_summary_pool,
-        )
-
-        memory_service = AsyncMock()
-        memory_service.get_memories_by_metadata = AsyncMock(return_value=self._pool_members(1))
-        memory_service.delete_memory = AsyncMock(return_value=None)
-
-        result = await _pretrim_stage2_summary_pool(memory_service, 'dark_factory', 'run-pre')
-
-        assert result == 0
-        memory_service.delete_memory.assert_not_awaited()
-
-    @pytest.mark.asyncio
-    async def test_delete_called_with_correct_audit_kwargs(self):
-        """delete_memory called with store='mem0', causation_id=run_id, _source='stage2_cycle_summary_trim'."""
-        from fused_memory.reconciliation.stages.task_knowledge_sync import (
-            _pretrim_stage2_summary_pool,
-        )
-
-        memory_service = AsyncMock()
-        memory_service.get_memories_by_metadata = AsyncMock(return_value=self._pool_members(2))
-        memory_service.delete_memory = AsyncMock(return_value=None)
-
-        await _pretrim_stage2_summary_pool(memory_service, 'dark_factory', 'run-check')
-
-        call_kwargs = memory_service.delete_memory.call_args.kwargs
-        assert call_kwargs['store'] == 'mem0'
-        assert call_kwargs['causation_id'] == 'run-check'
-        assert call_kwargs['_source'] == 'stage2_cycle_summary_trim'
-
-
-# ---------------------------------------------------------------------------
-# step-5 (RED) / step-6 (GREEN): IntegrityCheck.run() blocked-snapshot wiring
-# ---------------------------------------------------------------------------
-
-
 class TestIntegrityCheckBlockedSnapshotWiring:
     """IntegrityCheck.run() must apply filter_blocked_snapshot_findings and
     surface report.stats['blocked_snapshot_findings_dropped'].
@@ -13085,822 +11765,217 @@ class TestIntegrityCheckBlockedSnapshotWiring:
 # ---------------------------------------------------------------------------
 
 
-class TestRepairStage2SummaryStageMetadata:
-    """_repair_stage2_summary_stage_metadata (task 1963): heals the
-    intermittent LLM-compliance failure where the Stage 2 per-cycle summary
-    is written to Mem0 without metadata.stage='task_knowledge_sync' (2026-07-01
-    incident — run_id and recon_pool present, only stage missing), which makes
-    the downstream triple-filter count_memories_by_metadata check falsely
-    report 0 (see _verify_stage2_summary_written).
+class TestTaskKnowledgeSyncDeterministicCycleSummaryWrite:
+    """TaskKnowledgeSync.run() writes the authoritative per-cycle
+    ``cycle_summary`` directly via the deterministic ``write_cycle_summary``
+    helper (task 2229 W5-λ, PRD plans/recon-reliability-prd.md §10, boundary
+    test D1) — no LLM turn, no nonce, no verify/repair/reconstruct self-heal.
 
-    There is no in-place metadata-mutation primitive (mem0_client.update()
-    rewrites TEXT only), so the repair is delete + re-add under corrected
-    metadata: enumerate this run's stage2_cycle_summary pool deterministically
-    via get_memories_by_metadata (never semantic search), and for any member
-    not already satisfying the full identity, recover its content and re-add
-    it under the four canonical metadata keys BEFORE deleting the broken
-    original (add-before-delete: a crash mid-repair must leave a superset,
-    never a gap that re-triggers the false "missing" diagnosis).
+    RED until step-06 rewires ``run()`` to call ``write_cycle_summary`` in
+    place of the ``_pretrim_stage2_summary_pool`` call plus the
+    verify/repair/reconstruct chain, and strips the nonce injection from
+    ``assemble_payload()`` and the Stage 2 system prompt.
     """
 
-    _LOGGER = 'fused_memory.reconciliation.stages.task_knowledge_sync'
-
-    @pytest.mark.asyncio
-    async def test_repairs_summary_missing_stage_key(self):
-        """Happy path: one member missing 'stage' is re-added under corrected
-        metadata, the broken original is deleted, and the helper returns 1.
-        Enumeration is deterministic — memory_service.search is never awaited.
-        """
-        from fused_memory.reconciliation.stages.task_knowledge_sync import (
-            _repair_stage2_summary_stage_metadata,
-        )
-
-        run_id = 'run-repair-1'
-        broken_member = {
-            'id': 'broken-1',
-            'created_at': '2026-07-01T00:00:00+00:00',
-            'metadata': {
-                'kind': 'cycle_summary',
-                'run_id': run_id,
-                'recon_pool': 'stage2_cycle_summary',
-                'data': 'Cycle summary text',
-            },
-        }
-        memory_service = AsyncMock()
-        memory_service.get_memories_by_metadata = AsyncMock(return_value=[broken_member])
-        memory_service.add_memory = AsyncMock(return_value=None)
-        memory_service.delete_memory = AsyncMock(return_value=None)
-
-        result = await _repair_stage2_summary_stage_metadata(
-            memory_service, project_id='dark_factory', run_id=run_id,
-        )
-
-        # (a) deterministic enumeration scoped to this run's summary pool
-        memory_service.get_memories_by_metadata.assert_awaited_once()
-        get_kwargs = memory_service.get_memories_by_metadata.call_args.kwargs
-        assert get_kwargs.get('project_id') == 'dark_factory'
-        assert get_kwargs.get('filters') == {
-            'recon_pool': 'stage2_cycle_summary',
-            'run_id': run_id,
-        }
-
-        # (b) re-add under corrected metadata, recovering content from payload['data']
-        memory_service.add_memory.assert_awaited_once()
-        add_kwargs = memory_service.add_memory.call_args.kwargs
-        assert add_kwargs.get('content') == 'Cycle summary text'
-        assert add_kwargs.get('category') == 'observations_and_summaries'
-        assert add_kwargs.get('project_id') == 'dark_factory'
-        assert add_kwargs.get('causation_id') == run_id
-        assert add_kwargs.get('_source') == 'stage2_summary_stage_repair'
-        metadata = add_kwargs.get('metadata') or {}
-        assert metadata.get('kind') == 'cycle_summary'
-        assert metadata.get('stage') == 'task_knowledge_sync'
-        assert metadata.get('run_id') == run_id
-        assert metadata.get('recon_pool') == 'stage2_cycle_summary'
-
-        # (c) broken original deleted
-        memory_service.delete_memory.assert_awaited_once()
-        del_kwargs = memory_service.delete_memory.call_args.kwargs
-        assert del_kwargs.get('memory_id') == 'broken-1'
-        assert del_kwargs.get('store') == 'mem0'
-        assert del_kwargs.get('project_id') == 'dark_factory'
-        assert del_kwargs.get('causation_id') == run_id
-        assert del_kwargs.get('_source') == 'stage2_summary_stage_repair'
-
-        # (d) return value
-        assert result == 1
-
-        # (e) never falls back to semantic search
-        memory_service.search.assert_not_awaited()
-
-    @pytest.mark.asyncio
-    async def test_already_correct_summary_not_repaired(self):
-        """A member already satisfying kind=='cycle_summary' AND
-        stage=='task_knowledge_sync' is a no-op: returns 0, no writes."""
-        from fused_memory.reconciliation.stages.task_knowledge_sync import (
-            _repair_stage2_summary_stage_metadata,
-        )
-
-        run_id = 'run-already-correct'
-        correct_member = {
-            'id': 'correct-1',
-            'created_at': '2026-07-01T00:00:00+00:00',
-            'metadata': {
-                'kind': 'cycle_summary',
-                'stage': 'task_knowledge_sync',
-                'run_id': run_id,
-                'recon_pool': 'stage2_cycle_summary',
-                'data': 'Cycle summary text',
-            },
-        }
-        memory_service = AsyncMock()
-        memory_service.get_memories_by_metadata = AsyncMock(return_value=[correct_member])
-        memory_service.add_memory = AsyncMock(return_value=None)
-        memory_service.delete_memory = AsyncMock(return_value=None)
-
-        result = await _repair_stage2_summary_stage_metadata(
-            memory_service, project_id='dark_factory', run_id=run_id,
-        )
-
-        assert result == 0
-        memory_service.add_memory.assert_not_awaited()
-        memory_service.delete_memory.assert_not_awaited()
-
-    @pytest.mark.asyncio
-    async def test_no_summary_found_returns_zero(self):
-        """Empty enumeration → returns 0, no add/delete calls issued."""
-        from fused_memory.reconciliation.stages.task_knowledge_sync import (
-            _repair_stage2_summary_stage_metadata,
-        )
-
-        memory_service = AsyncMock()
-        memory_service.get_memories_by_metadata = AsyncMock(return_value=[])
-        memory_service.add_memory = AsyncMock(return_value=None)
-        memory_service.delete_memory = AsyncMock(return_value=None)
-
-        result = await _repair_stage2_summary_stage_metadata(
-            memory_service, project_id='dark_factory', run_id='run-empty',
-        )
-
-        assert result == 0
-        memory_service.add_memory.assert_not_awaited()
-        memory_service.delete_memory.assert_not_awaited()
-
-    @pytest.mark.asyncio
-    async def test_content_fallback_when_data_key_absent(self):
-        """Broken member with no 'data' key still gets re-added, using a
-        synthesized placeholder content string that references the run_id."""
-        from fused_memory.reconciliation.stages.task_knowledge_sync import (
-            _repair_stage2_summary_stage_metadata,
-        )
-
-        run_id = 'run-no-data'
-        broken_member = {
-            'id': 'broken-no-data',
-            'created_at': '2026-07-01T00:00:00+00:00',
-            'metadata': {
-                'kind': 'cycle_summary',
-                'run_id': run_id,
-                'recon_pool': 'stage2_cycle_summary',
-                # no 'data' key
-            },
-        }
-        memory_service = AsyncMock()
-        memory_service.get_memories_by_metadata = AsyncMock(return_value=[broken_member])
-        memory_service.add_memory = AsyncMock(return_value=None)
-        memory_service.delete_memory = AsyncMock(return_value=None)
-
-        result = await _repair_stage2_summary_stage_metadata(
-            memory_service, project_id='dark_factory', run_id=run_id,
-        )
-
-        assert result == 1
-        memory_service.add_memory.assert_awaited_once()
-        add_kwargs = memory_service.add_memory.call_args.kwargs
-        content = add_kwargs.get('content')
-        assert content, 'content must be a non-empty synthesized placeholder'
-        assert run_id in content
-        assert add_kwargs.get('metadata', {}).get('stage') == 'task_knowledge_sync'
-
-    @pytest.mark.asyncio
-    async def test_repairs_multiple_broken_members(self):
-        """Two members both missing 'stage' → both repaired; returns 2."""
-        from fused_memory.reconciliation.stages.task_knowledge_sync import (
-            _repair_stage2_summary_stage_metadata,
-        )
-
-        run_id = 'run-multi'
-        broken_members = [
-            {
-                'id': 'broken-a',
-                'created_at': '2026-07-01T00:00:00+00:00',
-                'metadata': {
-                    'kind': 'cycle_summary',
-                    'run_id': run_id,
-                    'recon_pool': 'stage2_cycle_summary',
-                    'data': 'Summary A',
-                },
-            },
-            {
-                'id': 'broken-b',
-                'created_at': '2026-07-01T00:01:00+00:00',
-                'metadata': {
-                    'kind': 'cycle_summary',
-                    'run_id': run_id,
-                    'recon_pool': 'stage2_cycle_summary',
-                    'data': 'Summary B',
-                },
-            },
-        ]
-        memory_service = AsyncMock()
-        memory_service.get_memories_by_metadata = AsyncMock(return_value=broken_members)
-        memory_service.add_memory = AsyncMock(return_value=None)
-        memory_service.delete_memory = AsyncMock(return_value=None)
-
-        result = await _repair_stage2_summary_stage_metadata(
-            memory_service, project_id='dark_factory', run_id=run_id,
-        )
-
-        assert result == 2
-        assert memory_service.add_memory.await_count == 2
-        assert memory_service.delete_memory.await_count == 2
-        deleted_ids = {c.kwargs.get('memory_id') for c in memory_service.delete_memory.call_args_list}
-        assert deleted_ids == {'broken-a', 'broken-b'}
-
-    @pytest.mark.asyncio
-    async def test_enumeration_failure_returns_zero_no_raise(self, caplog):
-        """When get_memories_by_metadata raises, returns 0, does NOT raise,
-        logs a WARNING, and issues no add/delete calls."""
-        from fused_memory.reconciliation.stages.task_knowledge_sync import (
-            _repair_stage2_summary_stage_metadata,
-        )
-
-        memory_service = AsyncMock()
-        memory_service.get_memories_by_metadata = AsyncMock(
-            side_effect=RuntimeError('qdrant gone')
-        )
-        memory_service.add_memory = AsyncMock(return_value=None)
-        memory_service.delete_memory = AsyncMock(return_value=None)
-
-        with caplog.at_level(logging.WARNING, logger=self._LOGGER):
-            result = await _repair_stage2_summary_stage_metadata(
-                memory_service, project_id='dark_factory', run_id='run-enum-fail',
-            )
-
-        assert result == 0
-        memory_service.add_memory.assert_not_awaited()
-        memory_service.delete_memory.assert_not_awaited()
-        assert [r for r in caplog.records if r.levelno >= logging.WARNING]
-
-    @pytest.mark.asyncio
-    async def test_per_member_write_failure_isolated(self, caplog):
-        """Two broken members; add_memory raises for the first only → the
-        first is not counted (and its delete is never attempted — add-before
-        -delete), the second is still repaired; returns 1; does NOT raise."""
-        from fused_memory.reconciliation.stages.task_knowledge_sync import (
-            _repair_stage2_summary_stage_metadata,
-        )
-
-        run_id = 'run-partial-fail'
-        broken_members = [
-            {
-                'id': 'broken-fail',
-                'created_at': '2026-07-01T00:00:00+00:00',
-                'metadata': {
-                    'kind': 'cycle_summary',
-                    'run_id': run_id,
-                    'recon_pool': 'stage2_cycle_summary',
-                    'data': 'Summary fail',
-                },
-            },
-            {
-                'id': 'broken-ok',
-                'created_at': '2026-07-01T00:01:00+00:00',
-                'metadata': {
-                    'kind': 'cycle_summary',
-                    'run_id': run_id,
-                    'recon_pool': 'stage2_cycle_summary',
-                    'data': 'Summary ok',
-                },
-            },
-        ]
-        memory_service = AsyncMock()
-        memory_service.get_memories_by_metadata = AsyncMock(return_value=broken_members)
-        memory_service.add_memory = AsyncMock(side_effect=[RuntimeError('add failed'), None])
-        memory_service.delete_memory = AsyncMock(return_value=None)
-
-        with caplog.at_level(logging.WARNING, logger=self._LOGGER):
-            result = await _repair_stage2_summary_stage_metadata(
-                memory_service, project_id='dark_factory', run_id=run_id,
-            )
-
-        assert result == 1
-        memory_service.delete_memory.assert_awaited_once()
-        assert memory_service.delete_memory.call_args.kwargs.get('memory_id') == 'broken-ok'
-        assert [r for r in caplog.records if r.levelno >= logging.WARNING]
-
-    @pytest.mark.asyncio
-    async def test_add_happens_before_delete(self):
-        """For a given member, add_memory is awaited strictly before
-        delete_memory (add-before-delete safety ordering)."""
-        from fused_memory.reconciliation.stages.task_knowledge_sync import (
-            _repair_stage2_summary_stage_metadata,
-        )
-
-        run_id = 'run-order'
-        broken_member = {
-            'id': 'broken-order',
-            'created_at': '2026-07-01T00:00:00+00:00',
-            'metadata': {
-                'kind': 'cycle_summary',
-                'run_id': run_id,
-                'recon_pool': 'stage2_cycle_summary',
-                'data': 'Summary order',
-            },
-        }
-        memory_service = AsyncMock()
-        memory_service.get_memories_by_metadata = AsyncMock(return_value=[broken_member])
-
-        manager = MagicMock()
-        manager.attach_mock(memory_service.add_memory, 'add_memory')
-        manager.attach_mock(memory_service.delete_memory, 'delete_memory')
-
-        await _repair_stage2_summary_stage_metadata(
-            memory_service, project_id='dark_factory', run_id=run_id,
-        )
-
-        call_names = [c[0] for c in manager.mock_calls]
-        assert 'add_memory' in call_names and 'delete_memory' in call_names
-        assert call_names.index('add_memory') < call_names.index('delete_memory')
-
-
-class TestReconstructStage2Summary:
-    """_reconstruct_stage2_summary (task 1964): closes the FULLY-ABSENT gap left
-    by _verify_stage2_summary_written (task 1796, observe-only — logs a
-    WARNING but takes no corrective action) and
-    _repair_stage2_summary_stage_metadata (task 1963, heals a summary that
-    EXISTS but is mislabeled — its enumeration returns [] when the pool has
-    ZERO members for this run_id, so it repairs nothing).
-
-    When the summary is FULLY ABSENT — LLM crash/timeout before the write was
-    ever sent, or the write was silently dedup-dropped by Mem0 (memory_ids=[]),
-    or it was written with a wrong/absent run_id — neither of the above two
-    helpers writes a discoverable summary. This helper closes that gap: it
-    writes ONE dedup-resilient retroactive reconstruction placeholder,
-    automating the manual reconstruction Stage 1 performed for run 6467daca
-    (mem0 memory 4a3a42d1, an explicitly-labeled reconstruction).
-    """
-
-    _LOGGER = 'fused_memory.reconciliation.stages.task_knowledge_sync'
-
-    @pytest.mark.asyncio
-    async def test_happy_path_writes_reconstruction_once(self):
-        """First add_memory call returns a non-empty memory_ids: no retry,
-        return 1, and the write shape matches the canonical reconstruction
-        contract (content, category, project_id, metadata, causation_id,
-        _source). Enumeration is never used — this is a deterministic write,
-        not a semantic-search path.
-        """
-        from fused_memory.reconciliation.stages.task_knowledge_sync import (
-            _reconstruct_stage2_summary,
-        )
-
-        run_id = 'run-recon-1'
-        memory_service = AsyncMock()
-        memory_service.add_memory = AsyncMock(return_value={'memory_ids': ['recon-1']})
-
-        result = await _reconstruct_stage2_summary(
-            memory_service, project_id='dark_factory', run_id=run_id,
-        )
-
-        memory_service.add_memory.assert_awaited_once()
-        kwargs = memory_service.add_memory.call_args.kwargs
-        assert kwargs.get('category') == 'observations_and_summaries'
-        assert kwargs.get('project_id') == 'dark_factory'
-        assert kwargs.get('causation_id') == run_id
-        assert kwargs.get('_source') == 'stage2_summary_reconstruction'
-
-        metadata = kwargs.get('metadata') or {}
-        assert metadata.get('kind') == 'cycle_summary'
-        assert metadata.get('stage') == 'task_knowledge_sync'
-        assert metadata.get('run_id') == run_id
-        assert metadata.get('recon_pool') == 'stage2_cycle_summary'
-        assert metadata.get('reconstructed') is True
-
-        content = kwargs.get('content')
-        assert content, 'content must be a non-empty string'
-        assert run_id in content, 'content must reference the run_id'
-        # Human-labeling (that this is a reconstruction) is asserted via the
-        # `reconstructed=True` metadata flag above, not via a wording pin on
-        # the body prose — that would couple this test to cosmetic copy in
-        # _build_stage2_reconstruction_content and break on a harmless
-        # rewording without catching a real regression.
-
-        assert result == 1
-        memory_service.search.assert_not_awaited()
-
-    @pytest.mark.asyncio
-    async def test_dedup_drop_retries_once_with_fresh_content(self):
-        """First add_memory returns empty memory_ids (Mem0 cosine dedup
-        no-op) — retried exactly once with different content (fresh nonce)
-        and unchanged metadata; the retry succeeds and the helper returns 1.
-        """
-        from fused_memory.reconciliation.stages.task_knowledge_sync import (
-            _reconstruct_stage2_summary,
-        )
-
-        run_id = 'run-recon-retry'
-        memory_service = AsyncMock()
-        memory_service.add_memory = AsyncMock(
-            side_effect=[{'memory_ids': []}, {'memory_ids': ['recon-2']}]
-        )
-
-        result = await _reconstruct_stage2_summary(
-            memory_service, project_id='dark_factory', run_id=run_id,
-        )
-
-        assert memory_service.add_memory.await_count == 2
-        first_kwargs = memory_service.add_memory.call_args_list[0].kwargs
-        second_kwargs = memory_service.add_memory.call_args_list[1].kwargs
-        assert first_kwargs.get('content') != second_kwargs.get('content'), (
-            'retry must use fresh content (new nonce) so the embedding shifts '
-            'past Mem0\'s dedup threshold'
-        )
-        assert first_kwargs.get('metadata') == second_kwargs.get('metadata'), (
-            'metadata must be unchanged between the first attempt and the retry'
-        )
-        assert result == 1
-
-    @pytest.mark.asyncio
-    async def test_dedup_drop_twice_returns_zero_and_warns(self, caplog):
-        """Both the first attempt and the retry return empty memory_ids —
-        exactly two awaits, return value 0, and a WARNING is logged."""
-        from fused_memory.reconciliation.stages.task_knowledge_sync import (
-            _reconstruct_stage2_summary,
-        )
-
-        memory_service = AsyncMock()
-        memory_service.add_memory = AsyncMock(
-            side_effect=[{'memory_ids': []}, {'memory_ids': []}]
-        )
-
-        with caplog.at_level(logging.WARNING, logger=self._LOGGER):
-            result = await _reconstruct_stage2_summary(
-                memory_service, project_id='dark_factory', run_id='run-recon-double-drop',
-            )
-
-        assert memory_service.add_memory.await_count == 2
-        assert result == 0
-        assert [r for r in caplog.records if r.levelno >= logging.WARNING]
-
-    @pytest.mark.asyncio
-    async def test_add_memory_exception_does_not_raise(self, caplog):
-        """When add_memory raises, _reconstruct_stage2_summary does NOT
-        propagate the exception: returns 0 and logs a WARNING. Mirrors the
-        best-effort contract of _repair_stage2_summary_stage_metadata /
-        _sweep_stale_fixc_markers.
-        """
-        from fused_memory.reconciliation.stages.task_knowledge_sync import (
-            _reconstruct_stage2_summary,
-        )
-
-        memory_service = AsyncMock()
-        memory_service.add_memory = AsyncMock(side_effect=RuntimeError('mem0 down'))
-
-        with caplog.at_level(logging.WARNING, logger=self._LOGGER):
-            result = await _reconstruct_stage2_summary(
-                memory_service, project_id='dark_factory', run_id='run-recon-exc',
-            )
-
-        assert result == 0
-        assert [r for r in caplog.records if r.levelno >= logging.WARNING]
-
-    @pytest.mark.asyncio
-    async def test_add_memory_exception_warning_carries_exc_info(self, caplog):
-        """task 1974 (Fix B): the exception-path WARNING must carry exc_info
-        so a raised nonce-retry (first attempt OR retry) is diagnosable in
-        the act, rather than swallowed to a generic 'add_memory failed'
-        message with no traceback. Distinct from the dedup-dropped-twice
-        WARNING covered by test_dedup_drop_twice_returns_zero_and_warns.
-        """
-        from fused_memory.reconciliation.stages.task_knowledge_sync import (
-            _reconstruct_stage2_summary,
-        )
-
-        memory_service = AsyncMock()
-        memory_service.add_memory = AsyncMock(side_effect=RuntimeError('mem0 down'))
-
-        with caplog.at_level(logging.WARNING, logger=self._LOGGER):
-            result = await _reconstruct_stage2_summary(
-                memory_service, project_id='dark_factory', run_id='run-recon-exc-detail',
-            )
-
-        assert result == 0
-
-        warning_records = [r for r in caplog.records if r.levelno >= logging.WARNING]
-        exc_records = [r for r in warning_records if 'add_memory failed' in r.message]
-        assert len(exc_records) == 1, (
-            f'Expected exactly 1 "add_memory failed" WARNING, got {len(exc_records)}: '
-            f'{[r.message for r in warning_records]}'
-        )
-        assert exc_records[0].exc_info is not None, (
-            'Expected the WARNING to carry exc_info so the raised exception '
-            '(first attempt or nonce-retry) is diagnosable, not swallowed'
-        )
-
-
-class TestRunStage2SummaryReconstructionWiring:
-    """TaskKnowledgeSync.run() wires _reconstruct_stage2_summary (task 1964)
-    as the final fallback in the verify -> repair -> reconstruct chain: when
-    verified_count is STILL 0 after the task-1963 repair — whether because
-    repair found nothing to enumerate (the FULLY-ABSENT class) or because a
-    "successful" repair's own re-add was itself dedup-dropped — run() invokes
-    _reconstruct_stage2_summary and, on success, re-verifies.
-
-    Mirrors the TestAssemblePayloadRunWindowStart harness: super().run()
-    executes for real (via a patched run_stage_via_cli) while the
-    module-level verify/repair/reconstruct helpers are patched directly, so
-    these tests target only the run()-level orchestration — not the
-    helpers' own internals, which are covered by
-    TestVerifyStage2SummaryWritten / TestRepairStage2SummaryStageMetadata /
-    TestReconstructStage2Summary.
-    """
+    @pytest_asyncio.fixture
+    async def ledger_store(self, tmp_path):
+        from fused_memory.reconciliation.recon_ledger import ReconLedgerStore
+
+        s = ReconLedgerStore(tmp_path / 'reconciliation.db')
+        await s.initialize()
+        yield s
+        await s.close()
 
     @pytest.fixture
-    def mock_deps(self):
+    def mock_deps(self, ledger_store):
         from fused_memory.config.schema import ReconciliationConfig
+
         config = ReconciliationConfig(enabled=True, explore_codebase_root='/tmp/test')
         memory_service = AsyncMock()
-        memory_service.count_memories_by_metadata.return_value = 0
-        memory_service.delete_memory = AsyncMock(return_value=None)
+        memory_service.recon_ledger = ledger_store
         memory_service.search.return_value = []
-        memory_service.add_memory.return_value = {'memory_ids': []}
         return {
             'memory_service': memory_service,
             'taskmaster': AsyncMock(),
             'journal': AsyncMock(),
             'config': config,
-            'scope': _scope('test_project', '/tmp/test'),
+            'scope': _scope('reify', '/home/leo/src/reify'),
         }
 
-    def _fake_cli_result(self):
-        return MagicMock(
-            success=True,
-            report={'flagged_items': [], 'summary': 'ok', 'stats': {}},
-            llm_calls=1, tokens_used=0, cost_usd=0.0,
-            model='test-model', error=None,
+    def _base_report(self, run_id: str) -> StageReport:
+        return StageReport(
+            stage=StageId.task_knowledge_sync,
+            started_at=datetime(2026, 7, 10, 11, 0, 0, tzinfo=UTC),
+            completed_at=datetime(2026, 7, 10, 11, 5, 0, tzinfo=UTC),
+            items_flagged=[],
+            stats={},
+            llm_calls=2,
+            tokens_used=500,
         )
 
+    async def _run_stage(self, mock_deps, run_id: str) -> StageReport:
+        mock_deps['taskmaster'].get_tasks.return_value = {'tasks': []}
+        stage = TaskKnowledgeSync(StageId.task_knowledge_sync, **mock_deps)
+        stage.scope = _scope('reify', stage.scope.project_root)
+        stage.scope = _scope(stage.scope.project_id, '/home/leo/src/reify')
+
+        watermark = Watermark(project_id='reify')
+        with patch.object(BaseStage, 'run', new=AsyncMock(return_value=self._base_report(run_id))):
+            return await stage.run(
+                events=[], watermark=watermark, prior_reports=[], run_id=run_id,
+            )
+
     @pytest.mark.asyncio
-    async def test_fully_absent_triggers_reconstruction_and_reverify(self, mock_deps):
-        """verify=[0, 1], repair=0 (nothing to enumerate) -> reconstruct is
-        awaited once with (self.memory, project_id, run_id); verify is
-        re-awaited after a successful reconstruction; report.stats reflects
-        both the reconstruction outcome and the post-reconstruction verified
-        count.
+    async def test_run_writes_one_authoritative_ledger_row(self, mock_deps, ledger_store):
+        """Exactly one cycle_summary ledger row exists for (stage=
+        'task_knowledge_sync', run_id) after run(), written from the report
+        Python derives — not an LLM-authored Mem0 write."""
+        run_id = 'run-d1-stage2'
+
+        await self._run_stage(mock_deps, run_id)
+
+        record = await ledger_store.get_by_identity(
+            'reify', 'cycle_summary', flag_type='task_knowledge_sync', run_id=run_id,
+        )
+        assert record is not None
+        assert record.record_kind == 'cycle_summary'
+        assert record.task_id == ''
+        assert record.flag_type == 'task_knowledge_sync'
+        assert record.run_id == run_id
+        assert record.state == 'active'
+
+    @pytest.mark.asyncio
+    async def test_remediation_pass_overwrites_full_cycle_ledger_payload(
+        self, mock_deps, ledger_store,
+    ):
+        """Confirmed intentional (reviewer finding robustness-data-fidelity,
+        task 2229 amendment pass round 2): a remediation pass shares its full
+        cycle's run_id, and write_cycle_summary's ledger upsert is keyed on
+        (project_id, 'cycle_summary', flag_type=stage, run_id) with no pass
+        discriminator — so the remediation pass's own (smaller) report
+        REPLACES the full cycle's payload in the ledger row; last write
+        wins. See the cross-reference comment above the write_cycle_summary()
+        call site in task_knowledge_sync.py for the full rationale."""
+        run_id = 'run-d1-remediation-overwrite'
+        full_report = StageReport(
+            stage=StageId.task_knowledge_sync,
+            started_at=datetime(2026, 7, 10, 11, 0, 0, tzinfo=UTC),
+            completed_at=datetime(2026, 7, 10, 11, 5, 0, tzinfo=UTC),
+            items_flagged=[{'task_id': '1', 'description': 'full-cycle flag'}],
+            stats={'pass': 'full'},
+            llm_calls=9,
+            tokens_used=9000,
+        )
+        remediation_report = StageReport(
+            stage=StageId.task_knowledge_sync,
+            started_at=datetime(2026, 7, 10, 12, 0, 0, tzinfo=UTC),
+            completed_at=datetime(2026, 7, 10, 12, 1, 0, tzinfo=UTC),
+            items_flagged=[],
+            stats={'pass': 'remediation'},
+            llm_calls=1,
+            tokens_used=100,
+        )
+
+        mock_deps['taskmaster'].get_tasks.return_value = {'tasks': []}
+        stage = TaskKnowledgeSync(StageId.task_knowledge_sync, **mock_deps)
+        stage.scope = _scope('reify', stage.scope.project_root)
+        stage.scope = _scope(stage.scope.project_id, '/home/leo/src/reify')
+        watermark = Watermark(project_id='reify')
+
+        with patch.object(BaseStage, 'run', new=AsyncMock(return_value=full_report)):
+            await stage.run(events=[], watermark=watermark, prior_reports=[], run_id=run_id)
+        with patch.object(BaseStage, 'run', new=AsyncMock(return_value=remediation_report)):
+            await stage.run(events=[], watermark=watermark, prior_reports=[], run_id=run_id)
+
+        record = await ledger_store.get_by_identity(
+            'reify', 'cycle_summary', flag_type='task_knowledge_sync', run_id=run_id,
+        )
+        assert record is not None
+        payload = json.loads(record.payload_json)
+        # run() mutates report.stats in place with its own keys as it goes
+        # (e.g. stage2_flag_markers_acknowledged), so the persisted 'stats'
+        # dict is a superset of what either report started with — the 'pass'
+        # marker is what distinguishes which call's payload survived.
+        assert payload['stats'].get('pass') == 'remediation', (
+            'the remediation pass must overwrite (not merge with) the full '
+            "cycle's ledger payload — confirmed intentional last-write-wins"
+        )
+        assert payload['llm_calls'] == 1
+        assert payload['tokens_used'] == 100
+        assert payload['items_flagged_count'] == 0
+
+    @pytest.mark.asyncio
+    async def test_run_sets_cycle_summary_ledger_written_stat(self, mock_deps):
+        report = await self._run_stage(mock_deps, 'run-d1-stat')
+
+        assert report.stats.get('stage2_cycle_summary_ledger_written') == 1
+
+    @pytest.mark.asyncio
+    async def test_retired_verify_repair_reconstruct_stats_absent(self, mock_deps):
+        report = await self._run_stage(mock_deps, 'run-d1-retired-stats')
+
+        for retired_key in (
+            'stage2_cycle_summary_pool_trimmed',
+            'stage2_cycle_summary_stage_repaired',
+            'stage2_cycle_summary_reconstructed',
+            'stage2_cycle_summary_verified_count',
+        ):
+            assert retired_key not in report.stats, (
+                f'{retired_key!r} is retired LLM self-heal telemetry (task 2229 '
+                'W5-λ) and must no longer be set by run().'
+            )
+
+    @pytest.mark.asyncio
+    async def test_payload_has_no_nonce_text(self):
+        """assemble_payload() no longer injects the '### Per-Cycle Summary
+        Nonce' section or a 'summary_nonce'/'retry_nonce' line — Python owns
+        the per-cycle summary write now, so there is nothing for the LLM to
+        prepend a dedup-defeating nonce to."""
+        from fused_memory.config.schema import ReconciliationConfig
+
+        config = ReconciliationConfig(enabled=True, explore_codebase_root='/tmp/test')
+        deps = {
+            'memory_service': AsyncMock(),
+            'taskmaster': AsyncMock(),
+            'journal': AsyncMock(),
+            'config': config,
+            'scope': _scope('reify', '/home/leo/src/reify'),
+        }
+        deps['taskmaster'].get_tasks.return_value = {'tasks': []}
+        stage = make_configured_task_knowledge_sync_stage(
+            deps, project_id='reify', project_root='/home/leo/src/reify',
+        )
+        watermark = Watermark(project_id='reify')
+
+        payload = await stage.assemble_payload([], watermark, [])
+
+        for forbidden in ('### Per-Cycle Summary Nonce', 'summary_nonce', 'retry_nonce'):
+            assert forbidden not in payload, (
+                f'assemble_payload() must not contain {forbidden!r} (task 2229 W5-λ).'
+            )
+
+    def test_system_prompt_uniqueness_directive_removed(self):
+        """The Stage 2 system prompt no longer instructs the LLM to write a
+        nonce'd per-cycle summary — the directive block (and its
+        payload-section pointer) is fully deleted, not merely made optional.
+
+        Scoped to the exact bolded heading (rather than a blanket
+        'summary_nonce'/'retry_nonce' substring search across the whole
+        prompt) because the unrelated '## Re-Verify Reconstruction Writes
+        Before Carry-Forward' section — a distinct LLM-driven mechanism for
+        carry-forward findings about OTHER runs' summaries, out of this
+        task's scope — still mentions those words in prose.
         """
-        from fused_memory.reconciliation.stages.task_knowledge_sync import (
-            TaskKnowledgeSync,
+        from fused_memory.reconciliation.prompts.stage2 import build_stage2_system_prompt
+
+        prompt = build_stage2_system_prompt('dark_factory')
+
+        assert '**Per-Cycle Summary Uniqueness**' not in prompt, (
+            "The 'Per-Cycle Summary Uniqueness' directive must be deleted "
+            '(task 2229 W5-λ) — Python writes the per-cycle summary '
+            'deterministically now.'
         )
-
-        run_id = 'run-fully-absent'
-        mock_deps['taskmaster'].get_tasks.return_value = {'tasks': []}
-
-        stage = TaskKnowledgeSync(StageId.task_knowledge_sync, **mock_deps)
-        stage.scope = _scope('dark_factory', stage.scope.project_root)
-        stage.scope = _scope(stage.scope.project_id, '/tmp/test')
-
-        verify_mock = AsyncMock(side_effect=[0, 1])
-        repair_mock = AsyncMock(return_value=0)
-        reconstruct_mock = AsyncMock(return_value=1)
-
-        with (
-            patch(
-                'fused_memory.reconciliation.stages.base.run_stage_via_cli',
-                new=AsyncMock(return_value=self._fake_cli_result()),
-            ),
-            patch(
-                'fused_memory.reconciliation.stages.task_knowledge_sync'
-                '._verify_stage2_summary_written',
-                new=verify_mock,
-            ),
-            patch(
-                'fused_memory.reconciliation.stages.task_knowledge_sync'
-                '._repair_stage2_summary_stage_metadata',
-                new=repair_mock,
-            ),
-            patch(
-                'fused_memory.reconciliation.stages.task_knowledge_sync'
-                '._reconstruct_stage2_summary',
-                new=reconstruct_mock,
-            ),
-        ):
-            report = await stage.run(
-                events=[], watermark=Watermark(project_id='dark_factory'),
-                prior_reports=[], run_id=run_id,
-            )
-
-        reconstruct_mock.assert_awaited_once_with(stage.memory, 'dark_factory', run_id)
-        assert verify_mock.await_count == 2
-        assert report.stats['stage2_cycle_summary_reconstructed'] == 1
-        assert report.stats['stage2_cycle_summary_verified_count'] == 1
-
-    @pytest.mark.asyncio
-    async def test_happy_path_skips_reconstruction(self, mock_deps):
-        """verify==1 on the first call -> repair and reconstruct are never
-        awaited; stage2_cycle_summary_reconstructed==0 (explicit, not
-        absent)."""
-        from fused_memory.reconciliation.stages.task_knowledge_sync import (
-            TaskKnowledgeSync,
-        )
-
-        mock_deps['taskmaster'].get_tasks.return_value = {'tasks': []}
-
-        stage = TaskKnowledgeSync(StageId.task_knowledge_sync, **mock_deps)
-        stage.scope = _scope('dark_factory', stage.scope.project_root)
-        stage.scope = _scope(stage.scope.project_id, '/tmp/test')
-
-        verify_mock = AsyncMock(return_value=1)
-        repair_mock = AsyncMock(return_value=0)
-        reconstruct_mock = AsyncMock(return_value=0)
-
-        with (
-            patch(
-                'fused_memory.reconciliation.stages.base.run_stage_via_cli',
-                new=AsyncMock(return_value=self._fake_cli_result()),
-            ),
-            patch(
-                'fused_memory.reconciliation.stages.task_knowledge_sync'
-                '._verify_stage2_summary_written',
-                new=verify_mock,
-            ),
-            patch(
-                'fused_memory.reconciliation.stages.task_knowledge_sync'
-                '._repair_stage2_summary_stage_metadata',
-                new=repair_mock,
-            ),
-            patch(
-                'fused_memory.reconciliation.stages.task_knowledge_sync'
-                '._reconstruct_stage2_summary',
-                new=reconstruct_mock,
-            ),
-        ):
-            report = await stage.run(
-                events=[], watermark=Watermark(project_id='dark_factory'),
-                prior_reports=[], run_id='run-happy-recon',
-            )
-
-        reconstruct_mock.assert_not_awaited()
-        repair_mock.assert_not_awaited()
-        assert report.stats['stage2_cycle_summary_reconstructed'] == 0
-        assert report.stats['stage2_cycle_summary_verified_count'] == 1
-
-    @pytest.mark.asyncio
-    async def test_repair_fixed_skips_reconstruction(self, mock_deps):
-        """verify=[0, 1], repair=1 (repair fixed it, re-verify confirms) ->
-        reconstruct is never awaited; stage2_cycle_summary_reconstructed==0.
-        """
-        from fused_memory.reconciliation.stages.task_knowledge_sync import (
-            TaskKnowledgeSync,
-        )
-
-        run_id = 'run-repair-fixed'
-        mock_deps['taskmaster'].get_tasks.return_value = {'tasks': []}
-
-        stage = TaskKnowledgeSync(StageId.task_knowledge_sync, **mock_deps)
-        stage.scope = _scope('dark_factory', stage.scope.project_root)
-        stage.scope = _scope(stage.scope.project_id, '/tmp/test')
-
-        verify_mock = AsyncMock(side_effect=[0, 1])
-        repair_mock = AsyncMock(return_value=1)
-        reconstruct_mock = AsyncMock(return_value=0)
-
-        with (
-            patch(
-                'fused_memory.reconciliation.stages.base.run_stage_via_cli',
-                new=AsyncMock(return_value=self._fake_cli_result()),
-            ),
-            patch(
-                'fused_memory.reconciliation.stages.task_knowledge_sync'
-                '._verify_stage2_summary_written',
-                new=verify_mock,
-            ),
-            patch(
-                'fused_memory.reconciliation.stages.task_knowledge_sync'
-                '._repair_stage2_summary_stage_metadata',
-                new=repair_mock,
-            ),
-            patch(
-                'fused_memory.reconciliation.stages.task_knowledge_sync'
-                '._reconstruct_stage2_summary',
-                new=reconstruct_mock,
-            ),
-        ):
-            report = await stage.run(
-                events=[], watermark=Watermark(project_id='dark_factory'),
-                prior_reports=[], run_id=run_id,
-            )
-
-        reconstruct_mock.assert_not_awaited()
-        assert report.stats['stage2_cycle_summary_reconstructed'] == 0
-        assert report.stats['stage2_cycle_summary_verified_count'] == 1
-
-    @pytest.mark.asyncio
-    async def test_transient_verify_error_skips_repair_and_reconstruction(self, mock_deps):
-        """verify returns None (count_memories_by_metadata raised — a
-        transient failure, NOT a confirmed-empty pool) -> neither repair nor
-        reconstruct is awaited, and every stat reads as its safe default.
-
-        Guards the task-1964 amendment: a transient count failure must never
-        be treated the same as a confirmed count==0, which would otherwise
-        risk a false repair or fabricate a reconstruction placeholder for a
-        run whose real per-cycle summary may already exist.
-        """
-        from fused_memory.reconciliation.stages.task_knowledge_sync import (
-            TaskKnowledgeSync,
-        )
-
-        run_id = 'run-verify-errored'
-        mock_deps['taskmaster'].get_tasks.return_value = {'tasks': []}
-
-        stage = TaskKnowledgeSync(StageId.task_knowledge_sync, **mock_deps)
-        stage.scope = _scope('dark_factory', stage.scope.project_root)
-        stage.scope = _scope(stage.scope.project_id, '/tmp/test')
-
-        verify_mock = AsyncMock(return_value=None)
-        repair_mock = AsyncMock(return_value=0)
-        reconstruct_mock = AsyncMock(return_value=0)
-
-        with (
-            patch(
-                'fused_memory.reconciliation.stages.base.run_stage_via_cli',
-                new=AsyncMock(return_value=self._fake_cli_result()),
-            ),
-            patch(
-                'fused_memory.reconciliation.stages.task_knowledge_sync'
-                '._verify_stage2_summary_written',
-                new=verify_mock,
-            ),
-            patch(
-                'fused_memory.reconciliation.stages.task_knowledge_sync'
-                '._repair_stage2_summary_stage_metadata',
-                new=repair_mock,
-            ),
-            patch(
-                'fused_memory.reconciliation.stages.task_knowledge_sync'
-                '._reconstruct_stage2_summary',
-                new=reconstruct_mock,
-            ),
-        ):
-            report = await stage.run(
-                events=[], watermark=Watermark(project_id='dark_factory'),
-                prior_reports=[], run_id=run_id,
-            )
-
-        repair_mock.assert_not_awaited()
-        reconstruct_mock.assert_not_awaited()
-        assert verify_mock.await_count == 1
-        assert report.stats['stage2_cycle_summary_stage_repaired'] == 0
-        assert report.stats['stage2_cycle_summary_reconstructed'] == 0
-        assert report.stats['stage2_cycle_summary_verified_count'] == 0
-
-    @pytest.mark.asyncio
-    async def test_reconstruction_succeeds_but_reverify_still_zero(self, mock_deps):
-        """verify=[0, 0] (the post-reconstruction re-verify still reports 0 —
-        e.g. the reconstruction write landed under a metadata shape the
-        triple-filter count doesn't match, or another transient count
-        failure), repair=0, reconstruct=1 -> reconstructed==1 is still
-        recorded even though verified_count stays 0.
-
-        Locks down the reconstruction-metadata-vs-verify-filter contract: a
-        successful reconstruction write must never be silently misreported
-        as a successful verify.
-        """
-        from fused_memory.reconciliation.stages.task_knowledge_sync import (
-            TaskKnowledgeSync,
-        )
-
-        run_id = 'run-recon-verify-mismatch'
-        mock_deps['taskmaster'].get_tasks.return_value = {'tasks': []}
-
-        stage = TaskKnowledgeSync(StageId.task_knowledge_sync, **mock_deps)
-        stage.scope = _scope('dark_factory', stage.scope.project_root)
-        stage.scope = _scope(stage.scope.project_id, '/tmp/test')
-
-        verify_mock = AsyncMock(side_effect=[0, 0])
-        repair_mock = AsyncMock(return_value=0)
-        reconstruct_mock = AsyncMock(return_value=1)
-
-        with (
-            patch(
-                'fused_memory.reconciliation.stages.base.run_stage_via_cli',
-                new=AsyncMock(return_value=self._fake_cli_result()),
-            ),
-            patch(
-                'fused_memory.reconciliation.stages.task_knowledge_sync'
-                '._verify_stage2_summary_written',
-                new=verify_mock,
-            ),
-            patch(
-                'fused_memory.reconciliation.stages.task_knowledge_sync'
-                '._repair_stage2_summary_stage_metadata',
-                new=repair_mock,
-            ),
-            patch(
-                'fused_memory.reconciliation.stages.task_knowledge_sync'
-                '._reconstruct_stage2_summary',
-                new=reconstruct_mock,
-            ),
-        ):
-            report = await stage.run(
-                events=[], watermark=Watermark(project_id='dark_factory'),
-                prior_reports=[], run_id=run_id,
-            )
-
-        reconstruct_mock.assert_awaited_once_with(stage.memory, 'dark_factory', run_id)
-        assert verify_mock.await_count == 2
-        assert report.stats['stage2_cycle_summary_reconstructed'] == 1
-        assert report.stats['stage2_cycle_summary_verified_count'] == 0
+        assert '### Per-Cycle Summary Nonce' not in prompt
 
 
 # ---------------------------------------------------------------------------

@@ -29,8 +29,6 @@ from fused_memory.reconciliation.cli_stage_runner import (
     STAGE2_DISALLOWED,
     STAGE3_DISALLOWED,
     STAGE3_REPORT_SCHEMA,
-    build_summary_nonce_section,
-    generate_summary_nonce,
 )
 from fused_memory.reconciliation.flag_dedup import (
     _content_fingerprint,
@@ -50,8 +48,7 @@ from fused_memory.reconciliation.recon_pool_map import (
 )
 from fused_memory.reconciliation.stages.base import BaseStage
 from fused_memory.reconciliation.summary_pool import (
-    enforce_summary_pool_cap,
-    pretrim_summary_pool,
+    write_cycle_summary,
 )
 from fused_memory.reconciliation.task_count_snapshot_cadence import (
     TASK_COUNT_SNAPSHOT_CATEGORY,
@@ -1132,39 +1129,20 @@ _STAGE2_PERSISTENCE_MARKER_SOURCE = 'stage2_persistence_marker'
 _STAGE2_ESCALATION_MARKER_SOURCE = 'stage2_escalation_marker'
 
 # Stage 2 per-cycle summary pool cap and related constants.
-# Every per-cycle summary add_memory call is tagged recon_pool='stage2_cycle_summary'
-# (producer contract: Stage 2 prompt) — _STAGE2_CYCLE_SUMMARY_RECON_POOL is
+# The deterministic Mem0 mirror write (write_cycle_summary, task 2229) tags
+# recon_pool='stage2_cycle_summary' — _STAGE2_CYCLE_SUMMARY_RECON_POOL is
 # imported above from the shared leaf module recon_pool_map.py (task 2140),
-# not redefined here.  After the LLM writes its summary,
-# _enforce_stage2_summary_pool_cap trims the pool to at most this many members by
+# not redefined here.  After each write, write_cycle_summary's internal
+# enforce_summary_pool_cap call trims the pool to at most this many members by
 # deleting the OLDEST entries — deterministically via Qdrant scroll, NOT semantic search.
 STAGE2_CYCLE_SUMMARY_POOL_CAP: int = 2
 _STAGE2_CYCLE_SUMMARY_TRIM_SOURCE = 'stage2_cycle_summary_trim'
-
-# Audit tag for _repair_stage2_summary_stage_metadata's delete+re-add repair
-# (task 1963) — heals the intermittent LLM-compliance failure where the Stage
-# 2 cycle_summary write omits metadata.stage='task_knowledge_sync' (or, more
-# broadly, kind='cycle_summary'), which makes the downstream triple-filter
-# count_memories_by_metadata check in _verify_stage2_summary_written falsely
-# report 0.
-_STAGE2_SUMMARY_STAGE_REPAIR_SOURCE = 'stage2_summary_stage_repair'
-
-# Audit tag for _reconstruct_stage2_summary's retroactive reconstruction write
-# (task 1964) — closes the FULLY-ABSENT gap: when the Stage 2 per-cycle
-# summary pool has ZERO members for a run_id (LLM crash before write, a
-# silent Mem0 dedup drop, or a wrong/absent run_id), neither
-# _verify_stage2_summary_written (observe-only) nor
-# _repair_stage2_summary_stage_metadata (heals mislabeled-but-present
-# summaries; its enumeration returns [] when nothing exists) writes a
-# discoverable summary. This helper writes ONE dedup-resilient placeholder,
-# automating the manual reconstruction performed for run 6467daca.
-_STAGE2_SUMMARY_RECONSTRUCTION_SOURCE = 'stage2_summary_reconstruction'
 
 # Audit tag for _write_task_count_snapshot's deterministic write (task 2325)
 # — makes the Mem0 task_count_snapshot write structural (a plain Python
 # add_memory call at the end of run()) instead of depending on the Stage-2
 # LLM remembering the memory-stored Snapshot Discipline norm. Mirrors
-# _STAGE2_SUMMARY_STAGE_REPAIR_SOURCE's internal-service idiom above.
+# write_cycle_summary's internal-service idiom (task 2229).
 _TASK_COUNT_SNAPSHOT_WRITE_SOURCE = 'stage2_task_count_snapshot_write'
 
 # Age-based GC for the stage2_persistence_marker Channel-3 persistence-counter
@@ -1470,157 +1448,6 @@ async def _sweep_stale_persistence_markers(
     return success_count
 
 
-async def _enforce_stage2_summary_pool_cap(
-    memory_service,
-    project_id: str,
-    run_id: str,
-    cap: int = STAGE2_CYCLE_SUMMARY_POOL_CAP,
-) -> int:
-    """Trim the stage2_cycle_summary pool to at most *cap* members (default 2).
-
-    Thin delegator to the generic ``reconciliation.summary_pool.enforce_summary_pool_cap``
-    core (task 1942 extraction) — behavior is unchanged from the original
-    Stage-2-only implementation. Kept as a distinct public name/signature so
-    the ~30 existing Stage 2 pool-cap tests (and any other callers) are
-    unaffected by the extraction.
-
-    Args:
-        memory_service: Service with ``get_memories_by_metadata`` and
-            ``delete_memory``.
-        project_id: Project scope for enumeration and delete calls.
-        run_id: Current reconciliation run identifier used as ``causation_id``
-            in the audit journal.
-        cap: Maximum pool size to enforce (default
-            ``STAGE2_CYCLE_SUMMARY_POOL_CAP == 2``).
-
-    Returns:
-        Number of memories successfully deleted (0 if pool <= cap or on
-        enumeration failure).
-    """
-    return await enforce_summary_pool_cap(
-        memory_service,
-        project_id,
-        run_id,
-        recon_pool=_STAGE2_CYCLE_SUMMARY_RECON_POOL,
-        trim_source=_STAGE2_CYCLE_SUMMARY_TRIM_SOURCE,
-        cap=cap,
-    )
-
-
-async def _pretrim_stage2_summary_pool(
-    memory_service,
-    project_id: str,
-    run_id: str,
-    cap: int = STAGE2_CYCLE_SUMMARY_POOL_CAP,
-) -> int:
-    """Pre-trim the stage2_cycle_summary pool to cap-1, reserving one slot.
-
-    Thin delegator to the generic ``reconciliation.summary_pool.pretrim_summary_pool``
-    core (task 1942 extraction) — behavior is unchanged from the original
-    Stage-2-only implementation: delegates with ``cap=max(cap - 1, 0)`` so the
-    imminent agent write lands as the cap-th member and can never be a trim
-    candidate (trim-then-write ordering, task 1831).
-
-    Must be called BEFORE ``super().run()`` (the agent write).  Post-write
-    pool size transiently reaches cap; it is bounded back to cap on the next
-    cycle's pre-trim — no post-write trim is needed.
-
-    Args:
-        memory_service: Forwarded to :func:`_enforce_stage2_summary_pool_cap`.
-        project_id: Project scope.
-        run_id: Current reconciliation run identifier (audit journal).
-        cap: Logical pool cap (default ``STAGE2_CYCLE_SUMMARY_POOL_CAP``).
-            Actual trim target is ``max(cap - 1, 0)``.
-
-    Returns:
-        Number of memories successfully deleted (0 if pool is already at
-        or below cap-1, or on enumeration failure).
-    """
-    return await pretrim_summary_pool(
-        memory_service,
-        project_id,
-        run_id,
-        recon_pool=_STAGE2_CYCLE_SUMMARY_RECON_POOL,
-        trim_source=_STAGE2_CYCLE_SUMMARY_TRIM_SOURCE,
-        cap=cap,
-    )
-
-
-# SYNC WARNING (task 2366): this function is near-verbatim duplicated as the
-# generic fused_memory.reconciliation.summary_pool.verify_cycle_summary_written
-# (stage='task_knowledge_sync' reproduces this exact triple filter). Stage 1
-# (memory_consolidator.py) already delegates to that shared core; Stage 2 was
-# deliberately left calling this private copy to avoid regression risk to a
-# proven production path (see task 2366's plan: "Stage 2 delegation to it is
-# a noted follow-up (not in scope, to avoid Stage 2 regression risk)").
-# Editing the verify logic here is a signal to check whether the shared core
-# needs the same fix, and vice versa. A future task should refactor this to
-# delegate to the shared core and retire this copy.
-async def _verify_stage2_summary_written(
-    memory_service,
-    project_id: str,
-    run_id: str,
-) -> int | None:
-    """Best-effort post-write check: count this run's cycle_summary in Mem0.
-
-    Counts memories matching the triple filter
-    ``{'kind':'cycle_summary','stage':'task_knowledge_sync','run_id':run_id}``
-    via ``count_memories_by_metadata`` (deterministic Qdrant count, NOT semantic
-    search).  Logs a WARNING when count==0 or when the count call raises.
-
-    The Stage 2 prompt mandates the cycle_summary write unconditionally on every
-    cycle path (full and remediation); there is no legitimate skip path.
-    count==0 is always unexpected and indicates a genuine agent failure or
-    write loss — the WARNING is intentional and not a false-positive alarm.
-
-    Best-effort: never raises, never retries.  The LLM agent owns its own
-    count-verify-and-retry path; Python's verify is a redundant observability
-    signal surfaced via ``report.stats['stage2_cycle_summary_verified_count']``.
-
-    Args:
-        memory_service: Service with ``count_memories_by_metadata``.
-        project_id: Project scope for the count call.
-        run_id: Current reconciliation run identifier (used as filter key).
-
-    Returns:
-        Count returned by ``count_memories_by_metadata`` when the call
-        succeeds — 0 means CONFIRMED absent (the count query ran cleanly and
-        found nothing).  ``None`` when the count call itself raised — a
-        transient failure that does NOT confirm absence.  This distinction
-        matters to callers (task 1964 amendment): the repair/reconstruct
-        chain in ``run()`` gates on ``verified_count == 0`` specifically so
-        that a transient ``None`` is never treated as a confirmed-empty pool
-        — a transient outage must never fabricate a reconstruction
-        placeholder for a run whose real summary may already exist.
-    """
-    try:
-        count = await memory_service.count_memories_by_metadata(
-            project_id=project_id,
-            filters={
-                'kind': 'cycle_summary',
-                'stage': 'task_knowledge_sync',
-                'run_id': run_id,
-            },
-        )
-    except Exception:
-        logger.warning(
-            'reconciliation._verify_stage2_summary_written: '
-            'count_memories_by_metadata failed for run_id=%s; absence NOT '
-            'confirmed (transient failure, not treated as count==0)',
-            run_id,
-            extra={'project_id': project_id, 'run_id': run_id},
-        )
-        return None
-    if not count:
-        logger.warning(
-            'reconciliation._verify_stage2_summary_written: '
-            'no cycle_summary found for run_id=%s after agent write',
-            run_id,
-            extra={'project_id': project_id, 'run_id': run_id},
-        )
-    return count
-
-
 async def _verify_task_count_snapshot_written(
     memory_service,
     project_id: str,
@@ -1639,8 +1466,8 @@ async def _verify_task_count_snapshot_written(
     so this checks the write's *timestamp* against the run window rather than
     matching on run_id (which would read 0 forever).
 
-    Mirrors :func:`_verify_stage2_summary_written`'s never-raises, best-effort,
-    WARNING-on-failure contract, including the crucial distinction between a
+    Follows this module's never-raises, best-effort, WARNING-on-failure
+    contract, including the crucial distinction between a
     CONFIRMED miss (``False``) and an inconclusive check (``None``).
 
     Unlike that helper, this one passes an explicit ``limit`` (mirroring
@@ -1732,9 +1559,9 @@ async def _write_task_count_snapshot(
     reusing any tree stashed by ``assemble_payload``, which can be
     short-circuited or skipped and would then be stale.
 
-    Uses the internal ``memory_service.add_memory`` idiom (like
-    :func:`_repair_stage2_summary_stage_metadata`), NOT the MCP layer, so the
-    ``ReconSnapshotWriteRejected`` temporal_facts guard never applies here.
+    Uses the internal ``memory_service.add_memory`` idiom directly, NOT the
+    MCP layer, so the ``ReconSnapshotWriteRejected`` temporal_facts guard
+    never applies here.
 
     Best-effort: never raises. Returns ``True`` (wrote) or ``None``
     (skipped — no taskmaster — or failed); NEVER ``False``, so a failed
@@ -1797,268 +1624,6 @@ async def _write_task_count_snapshot(
         )
         return None
     return True
-
-
-async def _repair_stage2_summary_stage_metadata(
-    memory_service,
-    project_id: str,
-    run_id: str,
-) -> int:
-    """Repair Stage 2 cycle_summary writes missing the required stage identity.
-
-    The Stage 2 per-cycle summary is written by the LLM agent inside
-    ``super().run()`` via ``add_memory`` with metadata
-    ``{kind:'cycle_summary', stage:'task_knowledge_sync', run_id, recon_pool:
-    'stage2_cycle_summary'}``.  Intermittently the LLM omits one of the
-    identity keys — the confirmed 2026-07-01 incident showed ``run_id`` and
-    ``recon_pool`` present with only ``stage`` missing — which makes the
-    downstream triple-filter ``count_memories_by_metadata({kind, stage,
-    run_id})`` check in :func:`_verify_stage2_summary_written` falsely report
-    0 ("Stage 2 summary missing").
-
-    There is no in-place metadata-mutation primitive available: Mem0's
-    ``update()`` rewrites the memory's TEXT only, not its payload metadata.
-    The repair is therefore delete + re-add under corrected metadata — the
-    same idiom used for this incident's data-level repair.
-
-    Enumerates this run's ``stage2_cycle_summary`` pool members
-    deterministically via ``memory_service.get_memories_by_metadata`` filtered
-    on ``{recon_pool, run_id}`` (never semantic search — ``recon_pool`` and
-    ``run_id`` are reliably present per the incident, so this scopes exactly
-    to the current run's summary/summaries). For each member that does not
-    already satisfy the full identity (``kind == 'cycle_summary'`` AND
-    ``stage == 'task_knowledge_sync'``), its content is recovered from the
-    Mem0 scroll payload's ``data`` key (the verbatim content under
-    ``infer=False``) — falling back to a synthesized placeholder when absent
-    — and re-added under the four canonical metadata keys.  The corrected
-    copy is added BEFORE the broken original is deleted (add-before-delete):
-    a crash between the two writes must never leave the run with zero
-    correctly-tagged summaries, which is precisely the false-missing state
-    this helper exists to eliminate.
-
-    Best-effort: never raises. Enumeration failure logs a WARNING and returns
-    0. A per-member add/delete failure logs a WARNING, excludes that member
-    from the returned count, and does not abort the remaining members —
-    both mirror :func:`_sweep_stale_persistence_markers`'s enumeration-failure
-    and per-item isolation posture.
-
-    Args:
-        memory_service: Service with ``get_memories_by_metadata``,
-            ``add_memory``, and ``delete_memory``.
-        project_id: Project scope for enumeration and write calls.
-        run_id: Current reconciliation run identifier — both the enumeration
-            filter key and the ``causation_id`` for the repair writes.
-
-    Returns:
-        Number of members successfully repaired (0 if none are broken, none
-        are found, or on enumeration failure).
-    """
-    try:
-        members = await memory_service.get_memories_by_metadata(
-            project_id=project_id,
-            filters={
-                'recon_pool': _STAGE2_CYCLE_SUMMARY_RECON_POOL,
-                'run_id': run_id,
-            },
-        )
-    except Exception:
-        logger.warning(
-            'reconciliation._repair_stage2_summary_stage_metadata: '
-            'get_memories_by_metadata failed for run_id=%s; skipping repair',
-            run_id,
-            extra={'project_id': project_id, 'run_id': run_id},
-        )
-        return 0
-
-    repaired = 0
-    for member in members:
-        metadata = member.get('metadata') or {}
-        if metadata.get('stage') != 'task_knowledge_sync' or metadata.get('kind') != 'cycle_summary':
-            mid = member.get('id')
-            content = metadata.get('data') or (
-                f'Stage 2 cycle summary (metadata-repaired) for run {run_id}'
-            )
-            corrected_metadata = {
-                'kind': 'cycle_summary',
-                'stage': 'task_knowledge_sync',
-                'run_id': run_id,
-                'recon_pool': _STAGE2_CYCLE_SUMMARY_RECON_POOL,
-            }
-            try:
-                await memory_service.add_memory(
-                    content=content,
-                    category='observations_and_summaries',
-                    project_id=project_id,
-                    metadata=corrected_metadata,
-                    causation_id=run_id,
-                    _source=_STAGE2_SUMMARY_STAGE_REPAIR_SOURCE,
-                )
-                await memory_service.delete_memory(
-                    memory_id=mid,
-                    store='mem0',
-                    project_id=project_id,
-                    causation_id=run_id,
-                    _source=_STAGE2_SUMMARY_STAGE_REPAIR_SOURCE,
-                )
-            except Exception:
-                logger.warning(
-                    'reconciliation._repair_stage2_summary_stage_metadata: '
-                    'repair failed for memory_id=%s run_id=%s; not counted',
-                    mid, run_id,
-                    extra={'project_id': project_id, 'memory_id': mid, 'run_id': run_id},
-                )
-                continue
-            repaired += 1
-
-    return repaired
-
-
-# SYNC WARNING (task 2366): _extract_response_memory_ids,
-# _build_stage2_reconstruction_content, and _reconstruct_stage2_summary below
-# are near-verbatim duplicated as the generic
-# fused_memory.reconciliation.summary_pool._extract_response_memory_ids /
-# _build_fallback_summary_content / reconstruct_cycle_summary_stub. Stage 1
-# already delegates to that shared core; these Stage-2-private copies were
-# deliberately left in place to avoid regression risk to a proven production
-# path (see task 2366's plan). Editing any of the three functions below is a
-# signal to check whether the shared core needs the same fix, and vice versa.
-# A future task should refactor Stage 2 to delegate to the shared core
-# (keeping only _repair_stage2_summary_stage_metadata, which has no
-# shared-core analog) and retire these copies.
-def _extract_response_memory_ids(response) -> list:
-    """Defensively read ``memory_ids`` from an ``add_memory`` response.
-
-    Production calls return :class:`~fused_memory.models.memory.AddMemoryResponse`
-    (attribute access); tests in this module commonly mock ``add_memory`` with a
-    plain ``{'memory_ids': [...]}`` dict. Supports both shapes so callers never
-    need to know which one they were handed.
-
-    Returns:
-        The ``memory_ids`` list, or ``[]`` if absent/falsy on either shape.
-    """
-    if isinstance(response, dict):
-        return response.get('memory_ids') or []
-    return getattr(response, 'memory_ids', None) or []
-
-
-def _build_stage2_reconstruction_content(run_id: str) -> str:
-    """Build the retroactive-reconstruction placeholder content for *run_id*.
-
-    Leads with a fresh ``generate_summary_nonce('STAGE2')`` line — the same
-    CSPRNG dedup-defeat primitive the LLM per-cycle-summary path uses (task
-    1572/1590) — so repeat calls (the one-shot retry in
-    :func:`_reconstruct_stage2_summary`) never collide on Mem0's ~0.92
-    cosine-similarity dedup threshold. The body is explicitly labeled a
-    harness reconstruction and references *run_id* so a human (or another
-    repair pass) can immediately identify it as synthetic, non-agent content.
-    """
-    nonce = generate_summary_nonce('STAGE2')
-    return (
-        f'{nonce}\n'
-        f'Stage 2 cycle summary (retroactive reconstruction) for run {run_id} — '
-        'original per-cycle summary absent after LLM write and metadata repair; '
-        'reconstructed by harness self-heal.'
-    )
-
-
-async def _reconstruct_stage2_summary(
-    memory_service,
-    project_id: str,
-    run_id: str,
-) -> int:
-    """Retroactively reconstruct a FULLY-ABSENT Stage 2 per-cycle summary.
-
-    Closes the residual gap left by the existing verify/repair chain: when
-    the ``stage2_cycle_summary`` pool has ZERO members for *run_id* —
-    LLM crash/timeout before the write was ever sent, a silent Mem0 dedup
-    no-op (``memory_ids=[]``), or a wrong/absent ``run_id`` — the task-1796
-    verify (:func:`_verify_stage2_summary_written`) only logs a WARNING, and
-    the task-1963 repair (:func:`_repair_stage2_summary_stage_metadata`)
-    enumerates ``get_memories_by_metadata({recon_pool, run_id})``, finds
-    nothing, and repairs nothing. Neither writes a discoverable summary.
-    This helper is the automated form of the manual retroactive placeholder
-    Stage 1 wrote for run 6467daca (mem0 memory 4a3a42d1).
-
-    Writes ONE placeholder via ``add_memory`` tagged with the four canonical
-    identity keys (``kind='cycle_summary'``, ``stage='task_knowledge_sync'``,
-    ``run_id``, ``recon_pool='stage2_cycle_summary'``) plus
-    ``reconstructed=True``, and ``_source=_STAGE2_SUMMARY_RECONSTRUCTION_SOURCE``
-    so the write is auditable and distinguishable from both agent writes and
-    task-1963 repairs. The content leads with a CSPRNG nonce (see
-    :func:`_build_stage2_reconstruction_content`) to defeat Mem0's dedup.
-
-    Because the root cause can itself be a dedup drop, the write is dedup-
-    resilient: the response's ``memory_ids`` is inspected
-    (:func:`_extract_response_memory_ids`), and if empty (a dedup no-op) the
-    write is retried exactly ONCE with a fresh nonce (metadata unchanged).
-    This mirrors the LLM prompt's own retry_nonce pattern without risking an
-    unbounded loop.
-
-    Best-effort: never raises. Any ``add_memory`` exception (first attempt or
-    retry) logs a WARNING and returns 0 — mirrors
-    :func:`_repair_stage2_summary_stage_metadata`'s best-effort contract, so a
-    Mem0 outage degrades this self-heal gracefully instead of failing the
-    whole reconciliation cycle.
-
-    Args:
-        memory_service: Service with ``add_memory``.
-        project_id: Project scope for the write.
-        run_id: Current reconciliation run identifier — both the metadata
-            identity key and the ``causation_id`` for the write.
-
-    Returns:
-        1 if a reconstruction placeholder was successfully written (first
-        attempt or retry — see :func:`_extract_response_memory_ids`), else 0
-        (dedup-dropped twice, or ``add_memory`` raised).
-    """
-    metadata = {
-        'kind': 'cycle_summary',
-        'stage': 'task_knowledge_sync',
-        'run_id': run_id,
-        'recon_pool': _STAGE2_CYCLE_SUMMARY_RECON_POOL,
-        'reconstructed': True,
-    }
-    try:
-        response = await memory_service.add_memory(
-            content=_build_stage2_reconstruction_content(run_id),
-            category='observations_and_summaries',
-            project_id=project_id,
-            metadata=metadata,
-            causation_id=run_id,
-            _source=_STAGE2_SUMMARY_RECONSTRUCTION_SOURCE,
-        )
-        if _extract_response_memory_ids(response):
-            return 1
-
-        # Dedup no-op (Mem0 ~0.92 cosine similarity) — retry once with a fresh
-        # nonce so the leading content shifts past the threshold.
-        response = await memory_service.add_memory(
-            content=_build_stage2_reconstruction_content(run_id),
-            category='observations_and_summaries',
-            project_id=project_id,
-            metadata=metadata,
-            causation_id=run_id,
-            _source=_STAGE2_SUMMARY_RECONSTRUCTION_SOURCE,
-        )
-        if _extract_response_memory_ids(response):
-            return 1
-    except Exception:
-        logger.warning(
-            'reconciliation._reconstruct_stage2_summary: '
-            'add_memory failed for run_id=%s; skipping reconstruction',
-            run_id,
-            exc_info=True,
-            extra={'project_id': project_id, 'run_id': run_id},
-        )
-        return 0
-
-    logger.warning(
-        'reconciliation._reconstruct_stage2_summary: '
-        'reconstruction write dedup-dropped twice for run_id=%s; giving up',
-        run_id,
-        extra={'project_id': project_id, 'run_id': run_id},
-    )
-    return 0
 
 
 async def _track_flag_persistence(
@@ -2495,11 +2060,6 @@ class TaskKnowledgeSync(BaseStage):
         # to the post-flight guard's flag_deleted_records join.
         self._stage2_combined_flags = []
         await self._maybe_queue_briefing_refresh_tasks(run_id=run_id)
-        # --- trim-then-write: pre-trim pool to cap-1 BEFORE agent writes (task 1831) ---
-        # Runs unconditionally (full + remediation) so the pool is bounded every cycle.
-        # Trim target is cap-1, reserving one slot for the imminent agent write so a
-        # newly-written summary can never be the "oldest" trim candidate.  Best-effort.
-        pretrimmed = await _pretrim_stage2_summary_pool(self.memory, self.project_id, run_id)
         report = await super().run(events, watermark, prior_reports, run_id, model=model)
 
         # --- missing-run_id marker stat (task 1257) ---
@@ -2546,62 +2106,60 @@ class TaskKnowledgeSync(BaseStage):
         # --- post-flight guards (task 1137) ---
         await self._apply_post_flight_guards(report, prior_reports, run_id)
 
-        # --- cycle-summary stats (task 1831 trim-then-write) ---
-        # pre-trim count was captured before super().run(); record it now alongside
-        # the post-write verification count so both land in the same report.stats.
-        report.stats['stage2_cycle_summary_pool_trimmed'] = pretrimmed
-        verified_count = await _verify_stage2_summary_written(self.memory, self.project_id, run_id)
-
-        # --- cycle-summary stage-metadata repair (task 1963) ---
-        # verified_count==0 means the triple-filter CONFIRMED no cycle_summary
-        # for this run — either the LLM genuinely failed to write one, or it
-        # wrote one but omitted (part of) the identity metadata (the confirmed
-        # 2026-07-01 incident: stage missing while kind/run_id/recon_pool were
-        # present). verified_count is None — not 0 — when
-        # count_memories_by_metadata itself raised (task 1964 amendment): a
-        # transient failure does NOT confirm absence, so the `== 0` checks
-        # below deliberately exclude None and the repair/reconstruct chain is
-        # skipped rather than risking a false repair or a fabricated
-        # reconstruction for a run whose real summary may already exist.
-        # Gate the repair on count==0 so the happy path (LLM complied) costs
-        # zero extra Mem0 calls and carries zero duplicate-write risk; when
-        # the summary is genuinely absent, enumeration returns [] and
-        # repaired stays 0 (no false repair).
-        # report.stats['stage2_cycle_summary_verified_count'] is set to the
-        # POST-repair (and, below, POST-reconstruction) count so downstream
-        # consumers see the corrected value.
-        repaired = 0
-        reconstructed = 0
-        if verified_count == 0:
-            repaired = await _repair_stage2_summary_stage_metadata(self.memory, self.project_id, run_id)
-            if repaired:
-                verified_count = await _verify_stage2_summary_written(self.memory, self.project_id, run_id)
-            # --- fully-absent retroactive reconstruction self-heal (task 1964) ---
-            # verified_count can still be 0 here for either of two reasons:
-            # (1) repair found nothing to enumerate (repaired==0) because the
-            # pool has ZERO members for this run_id — the FULLY-ABSENT class
-            # confirmed by run 6467daca, which the 1963 repair cannot heal
-            # since there is nothing to repair; or (2) repair fixed a member
-            # (repaired>0) but its own verbatim re-add was itself silently
-            # dedup-dropped, so the re-verify above still reports 0. Both
-            # converge here: write ONE dedup-resilient reconstruction
-            # placeholder and re-verify. If either verify call instead
-            # returned None (transient count_memories_by_metadata failure)
-            # rather than a confirmed 0, this comparison is False and
-            # reconstruction is skipped: absence must be CONFIRMED before we
-            # fabricate new content, never merely inferred from an error.
-            if verified_count == 0:
-                reconstructed = await _reconstruct_stage2_summary(self.memory, self.project_id, run_id)
-                if reconstructed:
-                    verified_count = await _verify_stage2_summary_written(self.memory, self.project_id, run_id)
-        report.stats['stage2_cycle_summary_stage_repaired'] = repaired
-        report.stats['stage2_cycle_summary_reconstructed'] = reconstructed
-        # verified_count is None only if the last verify call made above
-        # itself errored transiently; coerce to 0 so this stat's contract
-        # (always an int) is preserved for downstream consumers.
-        report.stats['stage2_cycle_summary_verified_count'] = (
-            verified_count if verified_count is not None else 0
+        # --- deterministic per-cycle summary write (task 2229 W5-λ) ---
+        # Python writes the authoritative cycle_summary ledger row directly
+        # from `report` — no LLM turn, no nonce, no verify/repair/reconstruct
+        # self-heal (all retired by this task; see
+        # summary_pool.write_cycle_summary).
+        # Cross-reference (reviewer finding design-consistency): unlike Stage 1
+        # (memory_consolidator.py), this call is unconditional — it also fires
+        # on remediation passes, not just full cycles. That is intentional,
+        # not a missed guard: it preserves the pre-refactor contract, where
+        # Stage 2's prompt mandated a summary write on every pass, whereas
+        # Stage 1's remediation payload never asked for one. Do not "fix" this
+        # to mirror Stage 1's full-cycle-only gating.
+        #
+        # Data-fidelity consequence, confirmed intentional (reviewer finding
+        # robustness-data-fidelity, task 2229 amendment pass round 2): the
+        # ledger upsert's primary key is (project_id, 'cycle_summary',
+        # flag_type=stage, run_id) — it does not distinguish a full cycle
+        # from its own remediation pass(es), which share that one run_id. So
+        # a remediation pass's write REPLACES the ledger row's payload
+        # (items_flagged_count, stats, llm_calls, tokens_used) with that
+        # pass's own — typically smaller — numbers; the full cycle's numbers
+        # are not retained in the ledger once a remediation pass has run.
+        # This is intentional, not a bug: the ledger row is a single
+        # current-state control-plane record for (stage, run_id), not a
+        # per-pass audit log, so "last write wins" (see
+        # ReconLedgerStore.upsert's own docstring) is the correct semantics
+        # here. A downstream consumer that needs the full cycle's own
+        # numbers specifically — not "whatever the latest pass produced" —
+        # must not rely on the ledger row alone: the best-effort Mem0 mirror
+        # (`add_system_record` is a fresh unkeyed insert per call, unlike the
+        # ledger's upsert) retains a short per-pass history up to
+        # STAGE2_CYCLE_SUMMARY_POOL_CAP entries, oldest evicted first — but
+        # that pool is itself best-effort and bounded, not a durable audit
+        # trail either. See test_remediation_pass_overwrites_full_cycle_ledger_payload
+        # (tests/test_stages.py) for the behavior this confirms.
+        ledger_written = await write_cycle_summary(
+            self.memory,
+            self.project_id,
+            report,
+            run_id,
+            stage='task_knowledge_sync',
+            recon_pool=_STAGE2_CYCLE_SUMMARY_RECON_POOL,
+            trim_source=_STAGE2_CYCLE_SUMMARY_TRIM_SOURCE,
+            cap=STAGE2_CYCLE_SUMMARY_POOL_CAP,
         )
+        # Named "..._ledger_written", not "..._written" (reviewer finding
+        # observability, task 2229 amendment pass round 2): this reflects
+        # ONLY the authoritative ReconLedgerStore upsert. write_cycle_summary
+        # also attempts a best-effort Mem0 mirror write regardless of the
+        # ledger outcome (see its docstring), so a deployment running with
+        # recon_ledger_enabled=False can have this stat at 0 while the
+        # mirror was in fact written — the "_ledger_" qualifier makes that
+        # distinction explicit instead of implying "no summary at all".
+        report.stats['stage2_cycle_summary_ledger_written'] = 1 if ledger_written else 0
 
         # --- task_count_snapshot deterministic write + freshness stat (task 2325,
         # follow-up to task 2278) ---
@@ -3387,22 +2945,6 @@ class TaskKnowledgeSync(BaseStage):
 
         known_projects_section = self._format_known_projects_section()
 
-        # Task 1572: generate a fresh CSPRNG nonce each cycle to supply structural
-        # entropy that the monotonic ISO timestamp (tasks 1473/1488) failed to provide.
-        # The nonce is generated Python-side (not by the LLM) and injected here so
-        # the Stage 2 agent can prepend it as the FIRST line of its per-cycle summary.
-        # Prepending shifts the leading content, defeating Mem0 cosine-similarity dedup
-        # (~0.92 threshold) that silently dropped structurally-uniform summaries in 8+
-        # confirmed recurrences.  The nonce is additive: run_id, flag_id UUIDs, task IDs,
-        # and uniqueness_token all remain in the prompt guidance.
-        # Task 1574: delegated to build_summary_nonce_section() so Stage 1 and Stage 2
-        # share identical section wording and cannot silently drift.
-        # Task 1590: passes 'STAGE2' prefix so Stage 2 nonces always lead with 'STAGE2_',
-        # which can never collide with Stage 1's 'STAGE1_'-prefixed nonces — making stage
-        # origin explicit and further separating the two stages' summaries in Mem0's embedding
-        # space.
-        summary_nonce_section = build_summary_nonce_section('STAGE2')
-
         # Step 5 in the Your Task block below ("append=False for hint conversion")
         # is grounded in Mem0 memory 0b0eeb8d (old-wins semantics for list-format
         # hints under append=True).  The memory id is kept here rather than in
@@ -3421,7 +2963,7 @@ class TaskKnowledgeSync(BaseStage):
 
 ### Recently Completed Tasks
 {recently_completed_text}
-{provenance_section}{proactive_sample_section}{hint_conversion_section}{live_workflow_section}{summary_nonce_section}
+{provenance_section}{proactive_sample_section}{hint_conversion_section}{live_workflow_section}
 
 ## Your Task
 Reconcile task state against memory:

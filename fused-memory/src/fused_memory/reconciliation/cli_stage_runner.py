@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import json
 import logging
-import secrets
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -235,74 +234,6 @@ STAGE3_REPORT_SCHEMA: dict[str, Any] = {
     },
     'required': ['summary'],
 }
-
-
-def generate_summary_nonce(prefix: str = '') -> str:
-    """Return a CSPRNG nonce for per-cycle summary uniqueness.
-
-    Generated from Python's CSPRNG (secrets module) OUTSIDE the LLM so the
-    token carries genuine entropy regardless of the LLM's output distribution.
-    Injected into the Stage 1 and Stage 2 payloads once per cycle so each
-    stage agent can prepend it to its per-cycle summary content.
-
-    Rationale (task 1572): ISO 8601 uniqueness_token alone (tasks 1473/1488)
-    produced insufficient cosine-distance separation — consecutive timestamps
-    embed nearly identically in Mem0's embedding space, causing per-cycle
-    summaries to be silently deduplicated (memory_ids=[]) in 8+ confirmed
-    recurrences.  A 32-bit random hex prefix shifts the leading content far
-    enough to defeat the ~0.92 cosine-similarity dedup threshold.
-
-    Task 1590: each stage now passes its own prefix label ('STAGE1' / 'STAGE2')
-    so their nonces always lead with different tokens, making stage origin
-    explicit and auditable in the leading token (the 32-bit hex suffix still
-    supplies the structural entropy that defeats cosine-similarity dedup).
-
-    Args:
-        prefix: Optional stage label to prepend (e.g. 'STAGE1', 'STAGE2').
-            When empty (default), returns a bare 8-char hex token, e.g.
-            'a3f7c21b'.  When non-empty, returns '{prefix}_{hex}', e.g.
-            'STAGE1_a3f7c21b'.
-
-    Returns:
-        When prefix is empty: 8-character lowercase hex string (e.g. 'a3f7c21b').
-        When prefix is non-empty: '{prefix}_{8-hex}' (e.g. 'STAGE1_a3f7c21b').
-    """
-    raw = secrets.token_hex(4)
-    if prefix:
-        return f'{prefix}_{raw}'
-    return raw
-
-
-def build_summary_nonce_section(prefix: str = '') -> str:
-    """Return the full '### Per-Cycle Summary Nonce' payload section string.
-
-    Shared by Stage 1 (memory_consolidator) and Stage 2 (task_knowledge_sync)
-    so both stages produce identical section wording and cannot silently drift
-    (task 1574 single-source-of-truth design).
-
-    Task 1590: Stage 1 passes 'STAGE1' and Stage 2 passes 'STAGE2' so their
-    summaries always lead with a stage-labeled nonce, making stage origin
-    explicit and auditable in the leading token (the 32-bit hex suffix still
-    supplies the structural entropy that defeats cosine-similarity dedup).
-
-    Generates a fresh CSPRNG nonce on each call via generate_summary_nonce(prefix).
-
-    Args:
-        prefix: Optional stage label forwarded to generate_summary_nonce()
-            (e.g. 'STAGE1', 'STAGE2').  Defaults to '' for backward compat.
-
-    Returns:
-        Multi-line string ready to embed in a payload f-string, e.g.::
-
-            \\n### Per-Cycle Summary Nonce\\n
-            summary_nonce: STAGE1_a3f7c21b\\n
-            (Prepend this nonce as the FIRST line of your per-cycle summary content.)\\n
-    """
-    return (
-        f'\n### Per-Cycle Summary Nonce\n'
-        f'summary_nonce: {generate_summary_nonce(prefix)}\n'
-        f'(Prepend this nonce as the FIRST line of your per-cycle summary content.)\n'
-    )
 
 
 @dataclass
