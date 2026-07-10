@@ -25,11 +25,16 @@ SPAWN_SCRIPT = REPO_ROOT / "skills" / "spawn" / "spawn-claude.sh"
 # editable install pointing at a different checkout) so `import
 # orchestrator.session_registry` resolves to the module spawn-claude.sh
 # itself invokes by absolute path (task 2285) -- letting this file assert
-# in-process against the exact same record/reap contract.
+# in-process against the exact same record/reap contract. Also gives the
+# task-2298 (Fleet Cockpit C7) two-way boundary test direct, in-process
+# access to session_hooks.run_session_start -- the already-landed C1/C2
+# consumer of the CLAUDE_SPAWN_PARENT_ID this file's sibling-mode tests
+# export.
 _ORCH_SRC = REPO_ROOT / "orchestrator" / "src"
 if str(_ORCH_SRC) not in sys.path:
     sys.path.insert(0, str(_ORCH_SRC))
 
+from orchestrator import session_hooks  # noqa: E402  # pyright: ignore[reportAttributeAccessIssue]
 from orchestrator import session_registry  # noqa: E402  # pyright: ignore[reportAttributeAccessIssue]
 
 # Branch routing: the script dispatches on the first word of $CLAUDE_TERMINAL_CMD.
