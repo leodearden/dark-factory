@@ -2977,3 +2977,60 @@ class TestReconReportDeleteFinding:
         assert s1_report is not None
         assert s1_report['flagged_items'] == []
 
+
+# ---------------------------------------------------------------------------
+# task-2410 step-7: delete_finding registered via FastMCP — RED until
+# step-8 registers the @mcp.tool() delegate.
+# ---------------------------------------------------------------------------
+
+
+class TestDeleteFindingViaFastMCP:
+    """delete_finding must be registered on the FastMCP server and callable
+    end-to-end through mcp._tool_manager.call_tool, mirroring the existing
+    tools' registration + call_tool pattern (TestCreateReconReportServer).
+    """
+
+    def _make(self):
+        from fused_memory.server.recon_report import ReconReportState, create_recon_report_server
+
+        t = [0.0]
+        state = ReconReportState(ttl_seconds=300, clock=lambda: t[0])
+        mcp = create_recon_report_server(state)
+        return state, mcp
+
+    def test_delete_finding_registered(self):
+        _, mcp = self._make()
+        tools = set(mcp._tool_manager._tools.keys())
+        assert 'delete_finding' in tools
+
+    @pytest.mark.asyncio
+    async def test_end_to_end_via_call_tool(self):
+        """Drive start_report -> add_finding -> delete_finding through
+        mcp._tool_manager.call_tool and confirm the finding is gone."""
+        state, mcp = self._make()
+        tm = mcp._tool_manager
+
+        await tm.call_tool('start_report', {
+            'run_id': 'r1', 'stage': 's1', 'project_id': 'dark_factory',
+        })
+        added = await tm.call_tool('add_finding', {
+            'run_id': 'r1',
+            'severity': 'low',
+            'category': 'cat',
+            'description': 'd',
+            'suggested_action': 'a',
+            'task_id': '42',
+            'flag_type': 'f',
+        })
+        assert 'finding_id' in added, f'add_finding failed: {added}'
+        finding_id = added['finding_id']
+
+        result = await tm.call_tool('delete_finding', {
+            'run_id': 'r1', 'finding_id': finding_id,
+        })
+        assert result == {'status': 'deleted', 'finding_id': finding_id}
+
+        report = state.get_assembled_report('r1', 's1')
+        assert report is not None
+        assert report['flagged_items'] == []
+
