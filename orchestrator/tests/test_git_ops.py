@@ -516,10 +516,11 @@ class TestWorktreeLifecycle:
         await _run(['git', 'add', '-A'], cwd=info.path)
         await _run(['git', 'commit', '-m', 'agent WIP commit'], cwd=info.path)
 
-        # Simulate the harness/agent's gitignored .task/ state (plan.json) —
-        # written after create_worktree's _ensure_task_gitignore already
-        # ran, so it is untracked and excluded from commit()'s :!.task
-        # pathspec, exactly like a real retained worktree.
+        # Simulate leftover .task/ state (plan.json) written directly into
+        # the worktree — untracked, so it plays no part in the WIP commit
+        # above and simply persists as a stray file, exactly like a real
+        # retained worktree carrying scratch files across a reused
+        # dispatch.
         task_dir = info.path / '.task'
         task_dir.mkdir(exist_ok=True)
         (task_dir / 'plan.json').write_text('{"task_id": "lo-retain"}\n')
@@ -1930,14 +1931,14 @@ class TestStructuralContamination:
         ta.write_plan({'task_id': 'sc-1', 'title': 'Structural Contamination', 'steps': []})
         ta.append_iteration_log({'k': 1})
 
-        # Metadata lives OUTSIDE the worktree.  <lane>/.task itself may still
-        # exist (create_worktree's _ensure_task_gitignore defense-in-depth
-        # guard unconditionally drops a .task/.gitignore there — an
-        # unrelated, pre-relocation scrub guard) but must hold no metadata:
-        # TaskArtifacts was pointed at the sibling `meta` root, never at
-        # `lane/.task`.
+        # Metadata lives OUTSIDE the worktree: TaskArtifacts was pointed at
+        # the sibling `meta` root, never at `lane/.task`.  Nothing writes
+        # `<lane>/.task` any more — create_worktree's _ensure_task_gitignore
+        # defense-in-depth guard, the last thing that unconditionally
+        # created it, is gone — so the lane must carry no `.task/`
+        # directory at all.
         assert (meta / 'plan.json').exists()
-        assert not (lane / '.task' / 'plan.json').exists()
+        assert not (lane / '.task').exists()
         assert not (lane / '.task-meta').exists()
 
         # Hostile agent uses RAW git — deliberately bypasses GitOps.commit so
@@ -1957,11 +1958,11 @@ class TestStructuralContamination:
 
     async def test_commit_stays_clean_under_relocated_metadata(self, git_ops: GitOps):
         """GitOps.commit() must produce a clean tree under the relocated-
-        metadata regime WITHOUT relying on the `:!.task` staging exclusion
-        or the post-staging unstage net (both removed later in this task) —
-        the retained `.task/.gitignore` (written by `_ensure_task_gitignore`
-        during `create_worktree`) self-ignores the leftover `<lane>/.task/`,
-        so a plain `git add -A` inside commit() stages nothing from it.
+        metadata regime WITHOUT relying on the `:!.task` staging exclusion,
+        the post-staging unstage net, or a `.task/.gitignore` self-ignore
+        (all removed) — contamination prevention here is STRUCTURAL: nothing
+        writes into `<lane>/.task` at all, so a plain `git add -A` inside
+        commit() has nothing under `.task/` to stage in the first place.
         """
         wt_info = await git_ops.create_worktree('commit-relocated-metadata')
         lane = wt_info.path
