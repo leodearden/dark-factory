@@ -473,15 +473,14 @@ class TestRecoverBeforeExecute:
     async def test_journal_miss_on_main_with_prior_work_falls_back_to_found_on_main(
         self, tmp_path: Path,
     ):
-        """Journal miss + on-main + prior implementation work (iteration-log
-        fallback, no wt_head) → fallback DONE."""
+        """Journal miss + on-main + non-empty branch-content diff (Layer C,
+        task 2372: the ground-truth `git diff base..wt_head` gate) → fallback
+        DONE."""
         f = _make(worktree=tmp_path / 'wt', project_root=tmp_path / 'proj')
         f.wf._check_branch_on_main = AsyncMock(  # type: ignore[method-assign]
             return_value=('wthead123', 'mainsha123'),
         )
-        f.wf._has_prior_implementation = MagicMock(  # type: ignore[method-assign]
-            return_value=_PriorImplStatus(has_work=True, entries=[], base_commit=None),
-        )
+        f.wf.git_ops.get_merge_diff_files = AsyncMock(return_value=(['a.py'], None))
 
         outcome = await f.wf._recover_before_execute()
 
@@ -491,28 +490,56 @@ class TestRecoverBeforeExecute:
             f.wf.task_id, kind='found_on_main', sha='mainsha123',
             note='branch already on main at workflow start (pre-EXECUTE recovery)',
         )
-        # WT_HEAD INTENTIONALLY OMITTED for this guard (see
-        # _has_prior_implementation docstring) — called with no arguments.
-        f.wf._has_prior_implementation.assert_called_once_with()
 
     async def test_journal_miss_on_main_with_no_prior_work_returns_none(
         self, tmp_path: Path,
     ):
-        """Journal miss + on-main + no prior work → no recovery, proceed
-        normally (stale branch point, not a real ghost loop)."""
+        """Journal miss + on-main + EMPTY branch-content diff (Layer C, task
+        2372) → no recovery, proceed normally — a fresh/re-dispatched
+        worktree (wt_head trivially an ancestor of main) or a stale branch
+        point must never false-DONE regardless of iteration-log contents."""
         f = _make(worktree=tmp_path / 'wt', project_root=tmp_path / 'proj')
         f.wf._check_branch_on_main = AsyncMock(  # type: ignore[method-assign]
             return_value=('wthead123', 'mainsha123'),
         )
-        f.wf._has_prior_implementation = MagicMock(  # type: ignore[method-assign]
-            return_value=_PriorImplStatus(has_work=False, entries=[], base_commit=None),
-        )
+        f.wf.git_ops.get_merge_diff_files = AsyncMock(return_value=([], None))
 
         outcome = await f.wf._recover_before_execute()
 
         assert outcome is None
         assert f.wf._merge_recovery_basis is None
         f.mark_done.assert_not_awaited()
+
+    async def test_found_on_main_recovery_stamps_nonempty_metadata_files(
+        self, tmp_path: Path,
+    ):
+        """ACTION #2: a pre-EXECUTE found_on_main recovery-DONE must stamp
+        metadata.files with the real branch-diff files, never an empty list.
+
+        Task 2125's phantom-done stamped ``metadata.files=[]`` — precisely
+        what let it slip the reconciliation gate undetected.  Deriving files
+        from the same branch-diff gate that authorizes the recovery (Layer
+        C) closes that hole structurally: an empty diff now means NO
+        recovery at all (see the prior test), so a found_on_main DONE from
+        this guard always carries non-empty, real evidence.
+        """
+        f = _make(worktree=tmp_path / 'wt', project_root=tmp_path / 'proj')
+        f.wf._check_branch_on_main = AsyncMock(  # type: ignore[method-assign]
+            return_value=('wthead123', 'mainsha123'),
+        )
+        f.wf.git_ops.get_merge_diff_files = AsyncMock(
+            return_value=(['pkg/a.py', 'pkg/b.py'], None),
+        )
+
+        outcome = await f.wf._recover_before_execute()
+
+        assert outcome == WorkflowOutcome.DONE
+        f.update_task.assert_awaited_once()
+        args, _kwargs = f.update_task.await_args
+        assert args[0] == f.wf.task_id
+        metadata = args[1]
+        assert metadata['files'], f'Expected non-empty files, got {metadata["files"]!r}'
+        assert set(metadata['files']) == {'pkg/a.py', 'pkg/b.py'}
 
     async def test_journal_miss_not_on_main_returns_none(self, tmp_path: Path):
         """Journal miss + branch not on main → no recovery, no fallback probe."""

@@ -4522,6 +4522,204 @@ class TestRecoverIfAlreadyMerged:
 
 
 # ---------------------------------------------------------------------------
+# Tests: TaskWorkflow._recover_before_execute — Layer C branch-diff gate
+# (task 2372, recurrence class 2125/2315/2340)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestRecoverBeforeExecuteGhostLoop:
+    """e2e regression tests for the pre-EXECUTE ghost-loop guard's Layer C
+    branch-content-diff gate (task 2372).
+
+    Each test exercises ``_recover_before_execute()`` directly against a real
+    worktree/git_ops, mirroring ``TestRecoverIfAlreadyMerged``'s direct-call
+    style — no full ``workflow.run()`` cycle, no architect invocation.
+    """
+
+    async def test_recover_before_execute_returns_none_for_fresh_worktree_zero_work_poison(
+        self, config, git_ops, task_assignment, tmp_path,
+    ):
+        """A fresh/re-dispatched worktree (wt_head == base_commit == main_sha)
+        carrying the EXACT task-2125 poison iteration-log entry (zero-work
+        implementer, no 'source' key, left over from a prior dispatch) must
+        NOT recover to DONE.
+
+        Fails on unmodified code: the pre-EXECUTE guard's bare iteration-log
+        fallback counts this entry as prior work even though the branch has
+        zero commits and zero diff against its own base — the exact
+        signature behind the task 2125 false-DONE recurrence.
+
+        Seeding goes through the real ``TaskArtifacts`` object (``.init()`` /
+        ``.append_iteration_log()``) rather than hand-written files under
+        ``wt/.task`` — this file's autouse ``_derive_meta_root_like_production``
+        fixture redirects ``TaskArtifacts(wt)`` to the sibling
+        ``.task-meta/<name>`` root, so hand-written legacy-path files would be
+        invisible to ``workflow.artifacts``.
+        """
+        # 1. Fresh worktree — wt_head == base_commit == main_sha (never advanced).
+        wt_info = await git_ops.create_worktree(task_assignment.task_id)
+        wt = wt_info.path
+        base_sha = wt_info.base_commit
+
+        # 2. Build workflow, wire up worktree and artifacts, stamp metadata.
+        stub = AgentStub()
+        workflow, scheduler, _queue = _build_workflow_no_merge_worker(
+            config, git_ops, task_assignment, stub, tmp_path,
+        )
+        workflow.worktree = wt
+        workflow.artifacts = TaskArtifacts(wt)
+        workflow.artifacts.init(
+            task_assignment.task_id, task_assignment.task['title'],
+            task_assignment.task['description'], base_commit=base_sha,
+        )
+
+        # 3. Seed the EXACT task-2125 poison entry: zero-work implementer,
+        #    no 'source' key.
+        workflow.artifacts.append_iteration_log({
+            'iteration': 1, 'agent': 'implementer',
+            'steps_attempted': [], 'steps_completed': [],
+            'commit': base_sha, 'summary': 'No new steps completed',
+        })
+
+        # 4. Call _recover_before_execute directly.
+        outcome = await workflow._recover_before_execute()
+
+        # 5. Assertions: poison entry on a fresh worktree must NOT false-DONE.
+        assert outcome is None, (
+            f'Expected None for fresh worktree with task-2125 poison entry '
+            f'but got {outcome!r} — the branch-diff gate must reject a '
+            f'zero-commit branch regardless of iteration-log contents'
+        )
+        statuses = scheduler.statuses.get(task_assignment.task_id, [])
+        assert 'done' not in statuses, (
+            f"'done' must not appear in scheduler statuses: {statuses}"
+        )
+        assert workflow.state != WorkflowState.DONE, (
+            f'workflow.state must not be DONE: {workflow.state!r}'
+        )
+
+    async def test_recover_before_execute_returns_none_for_fresh_worktree_with_genuine_looking_stale_entry(
+        self, config, git_ops, task_assignment, tmp_path,
+    ):
+        """A fresh/re-dispatched worktree carrying a GENUINE-looking stale
+        iteration-log entry (real non-empty steps_completed, surviving from
+        an orphaned prior worktree for the same task id) must still NOT
+        recover to DONE — the task-2315/2340 signature that Layer A's
+        per-entry classifier alone cannot catch, because the entry IS
+        legitimately classified as work.  Only the branch-content-diff gate
+        (empty base..wt_head on THIS fresh worktree) closes this hole.
+        """
+        # 1. Fresh worktree — wt_head == base_commit == main_sha (never advanced).
+        wt_info = await git_ops.create_worktree(task_assignment.task_id)
+        wt = wt_info.path
+        base_sha = wt_info.base_commit
+
+        # 2. Build workflow, wire up worktree and artifacts, stamp metadata.
+        stub = AgentStub()
+        workflow, scheduler, _queue = _build_workflow_no_merge_worker(
+            config, git_ops, task_assignment, stub, tmp_path,
+        )
+        workflow.worktree = wt
+        workflow.artifacts = TaskArtifacts(wt)
+        workflow.artifacts.init(
+            task_assignment.task_id, task_assignment.task['title'],
+            task_assignment.task['description'], base_commit=base_sha,
+        )
+
+        # 3. Seed a GENUINE-work-shaped entry (non-empty steps_completed) —
+        #    survives from a prior, orphaned worktree for this same task id.
+        #    This entry legitimately classifies as work under Layer A; only
+        #    the branch-diff gate can catch it on THIS fresh worktree.
+        workflow.artifacts.append_iteration_log({
+            'iteration': 3, 'agent': 'implementer', 'source': 'orchestrator',
+            'steps_attempted': ['s1'], 'steps_completed': ['s1'],
+            'commit': 'orphaned-worktree-sha', 'summary': 'Implemented step 1',
+        })
+
+        # 4. Call _recover_before_execute directly.
+        outcome = await workflow._recover_before_execute()
+
+        # 5. Assertions: genuine-looking stale entry on a fresh worktree must
+        #    NOT false-DONE — the branch-diff gate is the sole signal that
+        #    catches this, since Layer A alone would classify the entry as work.
+        assert outcome is None, (
+            f'Expected None for fresh worktree with a genuine-looking stale '
+            f'iteration-log entry but got {outcome!r} — the branch-diff gate '
+            f'must reject a zero-commit branch even when the iteration log '
+            f'contains a legitimately-classified-as-work entry from an '
+            f'orphaned prior worktree'
+        )
+        statuses = scheduler.statuses.get(task_assignment.task_id, [])
+        assert 'done' not in statuses, (
+            f"'done' must not appear in scheduler statuses: {statuses}"
+        )
+        assert workflow.state != WorkflowState.DONE, (
+            f'workflow.state must not be DONE: {workflow.state!r}'
+        )
+
+    async def test_recover_before_execute_genuine_found_on_main_stamps_files(
+        self, config, git_ops, task_assignment, tmp_path,
+    ):
+        """A genuinely-merged branch (real commit, merged + advanced to
+        main, no journal binding) must recover to DONE with provenance
+        pointing at the real main SHA — the positive-path complement to the
+        two regression tests above.
+        """
+        # 1. Create worktree; capture base_commit BEFORE the implementation
+        #    commit — the branch-diff gate reads base_commit from
+        #    metadata.json to compute base..wt_head.
+        wt_info = await git_ops.create_worktree(task_assignment.task_id)
+        wt = wt_info.path
+        base_sha = wt_info.base_commit
+
+        # 2. Build workflow, wire up worktree and artifacts, stamp metadata
+        #    with the PRE-implementation base_commit.
+        stub = AgentStub()
+        workflow, scheduler, _queue = _build_workflow_no_merge_worker(
+            config, git_ops, task_assignment, stub, tmp_path,
+        )
+        workflow.worktree = wt
+        workflow.artifacts = TaskArtifacts(wt)
+        workflow.artifacts.init(
+            task_assignment.task_id, task_assignment.task['title'],
+            task_assignment.task['description'], base_commit=base_sha,
+        )
+
+        # 3. Make a real implementation commit, merge + advance main — wt_head
+        #    becomes an ancestor of main and base..wt_head is non-empty.
+        #    Deliberately NO iterations.jsonl seeding and NO journal binding,
+        #    so the ONLY signal available is the real branch-content diff.
+        (wt / 'genuinely_merged.py').write_text('def impl():\n    return 7\n')
+        await git_ops.commit(wt, 'Implement feature (genuine found_on_main)')
+        result = await git_ops.merge_to_main(wt, task_assignment.task_id)
+        assert result.success
+        await git_ops.advance_main(result.merge_commit)
+        if result.merge_worktree:
+            await git_ops.cleanup_merge_worktree(result.merge_worktree)
+
+        expected_main_sha = await git_ops.get_main_sha()
+
+        # 4. Call _recover_before_execute directly.
+        outcome = await workflow._recover_before_execute()
+
+        # 5. Assertions: genuine merge must recover to DONE with real provenance.
+        assert outcome == WorkflowOutcome.DONE, (
+            f'Expected DONE for genuinely-merged branch but got {outcome!r}'
+        )
+        prov = scheduler.provenance.get(task_assignment.task_id)
+        assert prov is not None, (
+            f'Expected provenance entry for task {task_assignment.task_id!r}, got None'
+        )
+        assert prov['kind'] == 'found_on_main', (
+            f"Unexpected provenance kind: {prov['kind']!r}"
+        )
+        assert prov['commit'] == expected_main_sha, (
+            f"Provenance commit {prov['commit']!r} != expected main_sha {expected_main_sha!r}"
+        )
+
+
+# ---------------------------------------------------------------------------
 # Tests: pre-PLAN recovery in workflow.run
 # ---------------------------------------------------------------------------
 
