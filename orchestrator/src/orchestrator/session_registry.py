@@ -1426,6 +1426,36 @@ def _run_lease_reap() -> list[ReapedLease]:
     return reap_stale_leases()
 
 
+def _run_write_decision(
+    decision_id: str,
+    project: str,
+    text: str,
+    task_id: str | None,
+    escalation_id: str | None,
+    session_id: str | None,
+) -> None:
+    """Run the ``write-decision`` verb (Fleet Cockpit C8: park-to-registry).
+
+    Files an OPEN DecisionRecord from a watcher's park / tell-the-human
+    moment, IN ADDITION to its in-session note / afk-digest line, so the
+    cockpit decision queue (C5b) becomes the primary return-triage surface.
+    ``state`` is left at its DecisionState.OPEN default (a watcher only ever
+    files open decisions; state transitions are the cockpit's job via
+    update_decision_state). Root resolves via $CLAUDE_FLEET_ROOT, same as
+    every other verb.
+    """
+    record = DecisionRecord(
+        id=decision_id,
+        project=project,
+        text=text,
+        filed_at=datetime.now(UTC).isoformat(),
+        task_id=task_id,
+        escalation_id=escalation_id,
+        session_id=session_id,
+    )
+    write_decision(record)
+
+
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog='session_registry')
     sub = parser.add_subparsers(dest='verb', required=True)
@@ -1472,6 +1502,17 @@ def _build_parser() -> argparse.ArgumentParser:
 
     sub.add_parser('lease-reap', help='sweep and remove stale leases')
 
+    write_decision_p = sub.add_parser(
+        'write-decision',
+        help='file an OPEN DecisionRecord (Fleet Cockpit C8: park-to-registry)',
+    )
+    write_decision_p.add_argument('--id', required=True, help="this decision's id")
+    write_decision_p.add_argument('--project', required=True)
+    write_decision_p.add_argument('--text', required=True, help='the decision/question text')
+    write_decision_p.add_argument('--task-id', default=None)
+    write_decision_p.add_argument('--escalation-id', default=None)
+    write_decision_p.add_argument('--session-id', default=None)
+
     return parser
 
 
@@ -1505,6 +1546,10 @@ def main(argv: list[str] | None = None) -> int:
             _run_lease_release(args.name)
         elif args.verb == 'lease-reap':
             _run_lease_reap()
+        elif args.verb == 'write-decision':
+            _run_write_decision(
+                args.id, args.project, args.text, args.task_id, args.escalation_id, args.session_id
+            )
     except Exception:
         logger.error('session_registry %s failed', args.verb, exc_info=True)
         return 0
