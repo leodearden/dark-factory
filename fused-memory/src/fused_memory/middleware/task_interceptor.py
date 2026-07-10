@@ -907,21 +907,26 @@ class TaskInterceptor:
                     return _terminal_exit_error(task_id, old_status, status)
                 resolved_reopen_reason = reason
                 try:
-                    # Read-modify-write so the audit fields don't clobber the
-                    # row's pre-existing metadata (memory_hints, files, …).
-                    # `before` was fetched at the top of this method.
-                    merged_meta = _merged_audit_metadata(
-                        before,
-                        {
+                    # reopen_* are WRITE-AUTHORITY audit fields. Persist through
+                    # the privileged, non-protocol stamp_audit_metadata seam
+                    # rather than update_task: when a task is reopened out of a
+                    # TERMINAL_STATUS it may carry a metadata.done_provenance
+                    # stamped when it was marked done, and update_task now
+                    # UNCONDITIONALLY rejects any metadata.done_provenance
+                    # (SqliteTaskBackend floor, task C1) — a pre-merged blob
+                    # keyed off `before` would be rejected and the reopen audit
+                    # trail silently dropped. The seam does its own fresh-read
+                    # read-modify-write merge under the write-lock, preserving
+                    # every sibling key (memory_hints / files / external_deps /
+                    # done_provenance), so we pass only the reopen_* fields.
+                    await tm.stamp_audit_metadata(  # type: ignore[attr-defined]
+                        task_id=task_id,
+                        project_root=project_root,
+                        fields={
                             'reopen_reason': reason,
                             'reopen_from': old_status,
                             'reopen_at': datetime.now(UTC).isoformat(),
                         },
-                    )
-                    await tm.update_task(
-                        task_id=task_id,
-                        metadata=json.dumps(merged_meta),
-                        project_root=project_root,
                         tag=tag,
                     )
                 except Exception as e:

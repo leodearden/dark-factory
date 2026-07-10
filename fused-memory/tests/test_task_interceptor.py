@@ -6491,12 +6491,17 @@ async def test_set_task_status_with_reopen_reason_preserves_metadata(
     reconciler,
     event_buffer,
 ):
-    """Reopening a done task must NOT clobber existing metadata (files, memory_hints).
+    """Reopening a done task persists reopen_* via the privileged stamp seam.
 
-    Bug: the audit-metadata write at task_interceptor.py:681-694 used
-    update_task(metadata=json.dumps({reopen_reason, …}), append=False) — that
-    overwrites the entire metadata blob, dropping memory_hints and files.
-    Fix: read-modify-write so audit fields merge with existing metadata.
+    The reopen audit write is WRITE-AUTHORITY: a task reopened out of a
+    terminal status may carry a metadata.done_provenance stamped when it was
+    marked done, and update_task now UNCONDITIONALLY rejects
+    metadata.done_provenance (task C1 floor). The interceptor therefore routes
+    the reopen_* write through the privileged stamp_audit_metadata seam,
+    passing ONLY the reopen_* fields — preservation of sibling keys
+    (files / memory_hints / done_provenance / …) is the seam's own fresh-read
+    RMW merge, exercised end-to-end against a real backend in
+    test_set_task_status_reopen_from_done_preserves_provenance_real_backend.
     """
     taskmaster.get_task = AsyncMock(
         return_value={
@@ -6507,6 +6512,7 @@ async def test_set_task_status_with_reopen_reason_preserves_metadata(
                 'files': ['a.py', 'b.py'],
                 'memory_hints': {'queries': ['ctx']},
                 'spawned_from': '5',
+                'done_provenance': {'kind': 'merged', 'commit': 'abc123'},
             },
         }
     )
@@ -6520,16 +6526,16 @@ async def test_set_task_status_with_reopen_reason_preserves_metadata(
     )
 
     assert 'error' not in result
-    taskmaster.update_task.assert_called_once()
-    persisted = json.loads(taskmaster.update_task.call_args.kwargs['metadata'])
-    # Audit fields are written.
+    # Routed through the privileged seam, NOT update_task (the pre-merged
+    # `before` blob would carry done_provenance, which update_task rejects).
+    taskmaster.update_task.assert_not_called()
+    taskmaster.stamp_audit_metadata.assert_called_once()
+    persisted = taskmaster.stamp_audit_metadata.call_args.kwargs['fields']
+    # Only the reopen_* audit fields are passed to the seam.
     assert persisted['reopen_reason'] == 'manual reopen'
     assert persisted['reopen_from'] == 'done'
     assert 'reopen_at' in persisted
-    # Prior metadata is preserved.
-    assert persisted['files'] == ['a.py', 'b.py']
-    assert persisted['memory_hints'] == {'queries': ['ctx']}
-    assert persisted['spawned_from'] == '5'
+    assert 'done_provenance' not in persisted
 
 
 @pytest.mark.asyncio
