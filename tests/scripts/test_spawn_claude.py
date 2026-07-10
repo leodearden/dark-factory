@@ -1078,6 +1078,7 @@ def test_spawn_exports_result_file_and_session_writes_it(
         f"expected record.result_file == {expected_result_file}, "
         f"got {record.result_file}"
     )
+    assert record.result_file is not None  # narrows str | None for the type checker
 
     result_file = pathlib.Path(record.result_file)
     assert result_file.is_file(), (
