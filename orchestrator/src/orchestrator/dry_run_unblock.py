@@ -23,6 +23,7 @@ from shared.cli_invoke import (
     AllAccountsCappedException,
     classify_agent_failure,
     invoke_with_cap_retry,
+    is_timed_out_with_progress,
     is_zero_output_timeout,
 )
 from shared.config_dir import TaskConfigDir
@@ -528,12 +529,24 @@ def _build_entry(result: Any, *, reason: str, budget_usd: float) -> dict[str, An
             }
         failure_cls = classify_agent_failure(result)
         if failure_cls.kind in _INFRA_FAILURE_KINDS:
+            proposal_text = (
+                f'Infra wedge (retryable, not a human-review conclusion): '
+                f'{failure_cls.summary}; subtype={result.subtype}'
+            )
+            if is_timed_out_with_progress(result):
+                # Truthful reporting (task 2360 fix #3/reify-4827): the bare
+                # "Infra wedge (retryable...)" framing above reads as a
+                # contradiction next to a many-turn productive run — append
+                # an explicit marker that routes the reader toward "raise
+                # the wall / task is slow" rather than "retryable infra".
+                proposal_text += (
+                    f' (timed_out=True, transcript_turns={result.transcript_turns} '
+                    f'— productive wall-clock kill, not a wedge; raise the '
+                    f'wall / task is slow)'
+                )
             return {
                 'status': 'infra_failure',
-                'proposal_text': (
-                    f'Infra wedge (retryable, not a human-review conclusion): '
-                    f'{failure_cls.summary}; subtype={result.subtype}'
-                ),
+                'proposal_text': proposal_text,
                 'risk_label': _HUMAN_REVIEW_REQUIRED,
                 'files_referenced': [],
                 'block_reason': reason,
