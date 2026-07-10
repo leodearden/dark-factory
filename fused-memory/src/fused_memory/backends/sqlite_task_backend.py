@@ -1700,6 +1700,55 @@ class SqliteTaskBackend:
             'updated_task': updated_task,
         }
 
+    async def stamp_audit_metadata(
+        self,
+        task_id: str,
+        project_root: str,
+        fields: dict,
+        tag: str | None = None,
+    ) -> dict:
+        """Privileged, non-protocol writer of done_provenance/reopen_* audit fields.
+
+        Reachable only from :class:`TaskInterceptor` (PRD C-C) — ``update_task``
+        remains the sole PUBLIC metadata writer and unconditionally rejects
+        ``metadata.done_provenance`` (see the floor above). Performs a
+        read-modify-write merge under the same write-lock + txn pattern as
+        ``update_task``/``set_task_claimant``: last-write-wins on the supplied
+        keys, preserving every omitted sibling key (``memory_hints``, ``files``,
+        ``external_deps``, ...) via ``_merge_metadata(mode='merge')``.
+
+        Deliberately NOT declared on :class:`TaskBackendProtocol` — keeping it
+        off the 12-method contract prevents other callers from treating it as
+        sanctioned public surface.
+        """
+        await self.ensure_connected()
+        tag = tag or DEFAULT_TAG
+        tid = _parse_task_id(task_id)
+        async with self._write_lock(project_root), self._txn(project_root) as conn:
+            cursor = await conn.execute(
+                'SELECT metadata FROM tasks WHERE tag = ? AND id = ?',
+                (tag, tid),
+            )
+            row = await cursor.fetchone()
+            if row is None:
+                raise TaskmasterError(
+                    'TASKMASTER_TOOL_ERROR',
+                    f'No tasks found for ID(s): {task_id}',
+                )
+            new_metadata = _merge_metadata(
+                row['metadata'], json.dumps(fields),
+                mode='merge',
+                project_root=project_root, tag=tag, task_id=tid,
+            )
+            await conn.execute(
+                'UPDATE tasks SET metadata = ?, updated_at = ? WHERE tag = ? AND id = ?',
+                (new_metadata, _now(), tag, tid),
+            )
+        return {
+            'id': task_id,
+            'message': f'Stamped audit metadata for task {task_id}',
+        }
+
     async def remove_tasks(
         self,
         ids: list[str],
