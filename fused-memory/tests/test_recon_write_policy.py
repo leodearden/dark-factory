@@ -18,7 +18,19 @@ fixtures from ``test_task_write_agent_id.py`` and live further down this file.
 
 from __future__ import annotations
 
+from unittest.mock import AsyncMock
+
+import pytest
+import pytest_asyncio
+
 from fused_memory.middleware import recon_write_policy
+from fused_memory.middleware.task_interceptor import TaskInterceptor
+from fused_memory.reconciliation.event_buffer import EventBuffer
+
+# Recon-stage agent_id used by the interceptor boundary tests (P1/P2/P3) —
+# matches test_task_write_agent_id.py's AGENT_ID so the recon-stage
+# task-write setup is identical to the epsilon task's.
+AGENT_ID = 'recon-stage-task_knowledge_sync'
 
 # ---------------------------------------------------------------------------
 # Verdict dataclass
@@ -209,3 +221,70 @@ class TestExtractSnapshotToken:
 
     def test_extract_from_dict_without_either_key_is_none(self):
         assert recon_write_policy.extract_snapshot_token({'other': 'x'}) is None
+
+
+# ---------------------------------------------------------------------------
+# Interceptor boundary fixtures (mirrors test_task_write_agent_id.py)
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+def taskmaster():
+    tm = AsyncMock()
+    tm.get_task = AsyncMock(return_value={'id': '1', 'status': 'pending', 'title': 'Test Task'})
+    tm.set_task_status = AsyncMock(return_value={'success': True})
+    tm.get_tasks = AsyncMock(return_value={'tasks': []})
+    tm.add_task = AsyncMock(return_value={'id': '2', 'title': 'New Task'})
+    tm.update_task = AsyncMock(return_value={'success': True})
+    tm.remove_tasks = AsyncMock(return_value={'success': True})
+    tm.add_dependency = AsyncMock(return_value={'success': True})
+    tm.remove_dependency = AsyncMock(return_value={'success': True})
+    return tm
+
+
+@pytest.fixture
+def reconciler():
+    r = AsyncMock()
+    r.reconcile_task = AsyncMock(return_value={'actions': [{'type': 'knowledge_captured'}]})
+    return r
+
+
+@pytest_asyncio.fixture
+async def event_buffer(tmp_path):
+    buf = EventBuffer(db_path=tmp_path / 'interceptor_eb.db', buffer_size_threshold=100)
+    await buf.initialize()
+    yield buf
+    await buf.close()
+
+
+@pytest.fixture
+def interceptor(taskmaster, reconciler, event_buffer):
+    return TaskInterceptor(taskmaster, reconciler, event_buffer)
+
+
+# ---------------------------------------------------------------------------
+# P1 — interceptor.update_task terminal-write boundary
+# ---------------------------------------------------------------------------
+
+
+class TestInterceptorUpdateTaskTerminalBoundary:
+    @pytest.mark.asyncio
+    async def test_recon_stage_update_task_on_done_task_rejects(self, interceptor, taskmaster):
+        taskmaster.get_task = AsyncMock(return_value={'id': '1', 'status': 'done', 'title': 'T'})
+
+        result = await interceptor.update_task(
+            '1', '/project', title='x', agent_id=AGENT_ID,
+        )
+
+        assert result.get('error_type') == 'ReconTerminalWriteRejected'
+        taskmaster.update_task.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_non_recon_agent_id_is_not_gated(self, interceptor, taskmaster):
+        """Recon-scoping negative: a non-recon-stage agent_id on the same
+        done task is never gated — the write proceeds normally."""
+        taskmaster.get_task = AsyncMock(return_value={'id': '1', 'status': 'done', 'title': 'T'})
+
+        await interceptor.update_task('1', '/project', title='x', agent_id=None)
+
+        taskmaster.update_task.assert_awaited_once()
