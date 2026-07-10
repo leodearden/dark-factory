@@ -1594,6 +1594,66 @@ class TestParseClaudeOutputPropagatesTimedOut:
         assert agent.duration_ms == 240_003
 
 
+class TestParseClaudeOutputDistinctTimeoutSubtype:
+    """Task 2360 fix #3: the empty-stdout branch must distinguish a
+    PRODUCTIVE timeout (transcript_turns>0 — the wall killed real work) from
+    a genuine pre-turn wedge (transcript_turns==0/None) via ``subtype``, so
+    downstream telemetry/steward/dry_run consumers can tell them apart
+    instead of a fabricated 'error_empty_output' hiding real progress
+    (reify-4827).
+    """
+
+    def test_timed_out_with_progress_gets_distinct_subtype(self):
+        """timed_out=True + transcript_turns>0 → error_timeout_killed_with_progress."""
+        sub = _SubprocessResult(
+            stdout='', stderr='terminated', returncode=-15,
+            duration_ms=1_200_000, timed_out=True, transcript_turns=13,
+        )
+        agent = _parse_claude_output(sub)
+        assert agent.subtype == 'error_timeout_killed_with_progress'
+        assert agent.success is False
+        assert agent.timed_out is True
+        assert agent.transcript_turns == 13
+
+    def test_timed_out_zero_turns_keeps_empty_output_subtype(self):
+        """timed_out=True + transcript_turns==0 → stays error_empty_output (wedge)."""
+        sub = _SubprocessResult(
+            stdout='', stderr='terminated', returncode=-15,
+            duration_ms=300_000, timed_out=True, transcript_turns=0,
+        )
+        agent = _parse_claude_output(sub)
+        assert agent.subtype == 'error_empty_output'
+        assert agent.success is False
+        assert agent.timed_out is True
+        assert agent.transcript_turns == 0
+
+    def test_timed_out_none_turns_keeps_empty_output_subtype(self):
+        """timed_out=True + transcript_turns=None (unreadable) → stays error_empty_output."""
+        sub = _SubprocessResult(
+            stdout='', stderr='terminated', returncode=-15,
+            duration_ms=300_000, timed_out=True, transcript_turns=None,
+        )
+        agent = _parse_claude_output(sub)
+        assert agent.subtype == 'error_empty_output'
+        assert agent.success is False
+        assert agent.timed_out is True
+        assert agent.transcript_turns is None
+
+    def test_not_timed_out_stays_empty_output_regardless_of_turns(self):
+        """timed_out=False (no kill) → always error_empty_output, even with a
+        stray positive transcript_turns reading — the distinct subtype is
+        reserved for an actual wall-clock TIMEOUT kill, not any progress
+        reading in isolation.
+        """
+        sub = _SubprocessResult(
+            stdout='', stderr='', returncode=1,
+            duration_ms=100, timed_out=False, transcript_turns=5,
+        )
+        agent = _parse_claude_output(sub)
+        assert agent.subtype == 'error_empty_output'
+        assert agent.success is False
+
+
 # ── transcript_turns field + propagation ─────────────────────────────────────
 
 
