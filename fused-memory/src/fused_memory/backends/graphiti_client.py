@@ -423,8 +423,17 @@ class GraphitiBackend:
         self._indexed_graphs.add(group_id)
         logger.debug('Ensured indices on graph %r', group_id)
 
-    async def initialize(self) -> None:
-        """Create FalkorDriver + Graphiti client from unified config."""
+    async def initialize(self, *, skip_maintenance: bool = False) -> None:
+        """Create FalkorDriver + Graphiti client from unified config.
+
+        skip_maintenance: when True, skip both startup maintenance blocks
+        (the index-build loop and the W6-ε startup identity scan, which
+        REPAIRS dup-uuid edges — a write). Default False preserves current
+        behavior. Intended for lean, read-only callers (e.g. the ζ
+        migrate_cross_graph_leak.py dry-run/census) that need a
+        driver/client-wired backend without mutating on init or contending
+        with a running service's maintenance sweep.
+        """
         cfg = self.config
 
         # --- LLM client ---
@@ -532,21 +541,23 @@ class GraphitiBackend:
         )
 
         # Build indices on all existing project graphs (lazy set avoids repeats).
-        try:
-            existing = await self._require_falkor_client().list_graphs()
-            for graph_name in existing:
-                if graph_name != 'default_db' and not graph_name.endswith('_db'):
-                    await self._ensure_indices(graph_name)
-        except Exception:
-            logger.warning('Could not enumerate existing graphs for index setup', exc_info=True)
+        if not skip_maintenance:
+            try:
+                existing = await self._require_falkor_client().list_graphs()
+                for graph_name in existing:
+                    if graph_name != 'default_db' and not graph_name.endswith('_db'):
+                        await self._ensure_indices(graph_name)
+            except Exception:
+                logger.warning('Could not enumerate existing graphs for index setup', exc_info=True)
 
         # Startup identity-integrity sweep (task 2210, W6-ε): dup-NODE alarm +
         # one-shot dup-uuid-EDGE repair, per graph. A scan failure must never
         # break backend startup — this is a safety net, not a startup gate.
-        try:
-            await self._run_startup_identity_scan()
-        except Exception:
-            logger.warning('Startup identity-integrity scan failed', exc_info=True)
+        if not skip_maintenance:
+            try:
+                await self._run_startup_identity_scan()
+            except Exception:
+                logger.warning('Startup identity-integrity scan failed', exc_info=True)
 
         logger.info(f'GraphitiBackend initialized (FalkorDB {host}:{port})')
 
