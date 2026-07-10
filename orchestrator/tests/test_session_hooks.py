@@ -269,6 +269,69 @@ def test_run_session_start_spawned_still_prefers_explicit_launcher_pid_env(
 
 
 # ---------------------------------------------------------------------------
+# Task 2292 step-3: SessionStart parent_session_id stamping (Fleet Cockpit C2)
+# ---------------------------------------------------------------------------
+
+
+def test_run_session_start_create_path_stamps_parent_session_id(tmp_path: Path) -> None:
+    hook_input = {'session_id': 'sess-p1', 'cwd': '/home/leo/src/dark-factory'}
+    env = {'CLAUDE_SPAWN_PARENT_ID': 'unblock-df-2085-4242'}
+
+    sh.run_session_start(hook_input, env, root=tmp_path)
+
+    slug = sh.hook_session_slug(hook_input, env)
+    record = sr.read_record(slug, root=tmp_path)
+    assert record.status == sr.Status.RUNNING
+    assert record.parent_session_id == 'unblock-df-2085-4242'
+
+
+def test_run_session_start_refresh_path_stamps_parent_session_id_preserving_fields(
+    tmp_path: Path,
+) -> None:
+    hook_input = {'session_id': 'sess-p2', 'cwd': '/home/leo/src/dark-factory'}
+    env = {'CLAUDE_SPAWN_PARENT_ID': 'unblock-df-2085-4242'}
+    slug = sh.hook_session_slug(hook_input, env)
+    existing = sr.SessionRecord(
+        session_slug=slug,
+        status=sr.Status.LAUNCHING,
+        role='unblock',
+        project='df',
+        task_id='2085',
+        cwd='/home/leo/src/dark-factory',
+        prompt='/unblock 2085',
+    )
+    sr.write_record(existing, root=tmp_path)
+    record_path = sr.record_path_for_slug(slug, root=tmp_path)
+    old_ts = record_path.stat().st_mtime - 10
+    os.utime(record_path, (old_ts, old_ts))
+
+    sh.run_session_start(hook_input, env, root=tmp_path)
+
+    record = sr.read_record(slug, root=tmp_path)
+    assert record.status == sr.Status.RUNNING
+    assert record.parent_session_id == 'unblock-df-2085-4242'
+    # Previously-populated fields survive the enrichment write.
+    assert record.role == 'unblock'
+    assert record.project == 'df'
+    assert record.task_id == '2085'
+    assert record.prompt == '/unblock 2085'
+    # mtime heartbeat bumped by the refresh write.
+    assert record_path.stat().st_mtime > old_ts
+
+
+def test_run_session_start_no_parent_id_env_leaves_parent_session_id_none(tmp_path: Path) -> None:
+    # Hand-launched root: no CLAUDE_SPAWN_PARENT_ID -> stays None.
+    hook_input = {'session_id': 'sess-p3', 'cwd': '/home/leo/src/dark-factory'}
+    env: dict[str, str] = {}
+
+    sh.run_session_start(hook_input, env, root=tmp_path)
+
+    slug = sh.hook_session_slug(hook_input, env)
+    record = sr.read_record(slug, root=tmp_path)
+    assert record.parent_session_id is None
+
+
+# ---------------------------------------------------------------------------
 # Step-7: run_notification / run_stop (status flip + OSC return)
 # ---------------------------------------------------------------------------
 
