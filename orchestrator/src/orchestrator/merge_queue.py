@@ -4528,6 +4528,7 @@ _LEGAL_TRANSITIONS: dict[ItemLifecycleState, frozenset[ItemLifecycleState]] = {
     ItemLifecycleState.MERGING: frozenset({
         ItemLifecycleState.AWAITING_VERIFY,
         ItemLifecycleState.REDISPATCH_PARKED,
+        ItemLifecycleState.DISPATCHING,
         ItemLifecycleState.TERMINAL,
     }),
     ItemLifecycleState.AWAITING_VERIFY: frozenset({
@@ -4543,6 +4544,7 @@ _LEGAL_TRANSITIONS: dict[ItemLifecycleState, frozenset[ItemLifecycleState]] = {
         ItemLifecycleState.VERIFYING,
         ItemLifecycleState.REDISPATCH_PARKED,
         ItemLifecycleState.QUEUED,
+        ItemLifecycleState.MERGING,
         ItemLifecycleState.TERMINAL,
     }),
     ItemLifecycleState.VERIFYING: frozenset({
@@ -4591,6 +4593,19 @@ cascade's downstream self-requeue in the verifier loop) — see
 above, these three sites are wired via the dynamic-current-state helper
 rather than a hardcoded *from_state*, so a registered item legally lands
 back at QUEUED regardless of which of the two states it was requeued from.
+
+kappa also adds the DISPATCHING <-> MERGING pair for the dispatch-time
+staleness/chain-invalidation remerge inside ``_dispatch_item`` (Mechanism 2):
+an item already transitioned to DISPATCHING at the verifier's dispatch call
+site discovers its base is stale, is recorded at MERGING for the duration of
+the (pre-existing, ``_remerging_item``-tracked) ``_remerge()`` call, then
+moves back to DISPATCHING once ``_remerge()`` returns — either to fall
+through to a passthrough outcome (-> TERMINAL, wired by a later step) or to
+proceed to a normal host-acquire + verify dispatch (-> VERIFYING via
+``_inflight_append``). This is a DIFFERENT remerge window than the
+VERIFYING/GATE_REVERIFY/FINALIZING -> MERGING head-failure cascade documented
+above — that one never revisits DISPATCHING, it re-enters via
+``_redispatch`` (-> REDISPATCH_PARKED) for a fresh dispatch attempt instead.
 
 TERMINAL is absorbing (empty out-set): conflict auto-chain regeneration
 mints a NEW request_id for the regenerated attempt
@@ -8906,8 +8921,21 @@ class SpeculativeMergeWorker(_WipHaltMixin):
         via ``self._verifier_task`` before mutating — the single choke point
         every ``_verifier_loop`` append site routes through, mirroring
         ``_buffer_owned_request`` on the merger side.
+
+        MQ-reliability kappa (task 2169): both append call sites only reach
+        here for a REAL dispatch (``entry.verify_task`` is not None —
+        passthrough entries finalize inline instead, never appending), and
+        both call sites already transitioned the item to DISPATCHING right
+        before calling ``_dispatch_item``, so this is always a
+        DISPATCHING -> VERIFYING move. Single chokepoint covers both the
+        DISPATCH-FILL and blocking-get call sites, mirroring
+        ``_buffer_owned_request``'s single-chokepoint precedent.
         """
         self._assert_single_writer(self._verifier_task, '_inflight')
+        self._note_transition(
+            entry.item.request.request_id, ItemLifecycleState.DISPATCHING,
+            ItemLifecycleState.VERIFYING, live_obj=entry,
+        )
         self._inflight.append(entry)
 
     def _inflight_popleft(self) -> InflightEntry:
@@ -9064,7 +9092,21 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                 # inside _dispatch_item can never leave it stale.  This closes the
                 # I4 speculation-permit census for the whole dispatch-gap window
                 # (the item is off the queue but not yet in self._inflight).
+                #
+                # MQ-reliability kappa (task 2169): the registry mirrors this same
+                # window — AWAITING_VERIFY -> DISPATCHING when `item` came from
+                # `_verifier_queue` (is_from_verifier_queue), REDISPATCH_PARKED ->
+                # DISPATCHING when it came from `_redispatch` — but, unlike the
+                # census-only `_dispatching_item` field, covers BOTH
+                # `_dispatch_item` call sites (this one and the blocking-get one
+                # below), not just this one.
                 try:
+                    self._note_transition(
+                        item.request.request_id,
+                        ItemLifecycleState.AWAITING_VERIFY if is_from_verifier_queue
+                        else ItemLifecycleState.REDISPATCH_PARKED,
+                        ItemLifecycleState.DISPATCHING, live_obj=item,
+                    )
                     self._dispatching_item = item
                     try:
                         entry = await self._dispatch_item(item)
@@ -9092,6 +9134,10 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                     # it to prevent a double-release on re-dispatch.
                     assert isinstance(item, RealMergeItem)
                     item_back = dataclasses.replace(item, cap_permit=None)
+                    self._note_transition(
+                        item_back.request.request_id, ItemLifecycleState.DISPATCHING,
+                        ItemLifecycleState.REDISPATCH_PARKED, live_obj=item_back,
+                    )
                     self._redispatch.appendleft(item_back)
                     fill_done = True
                     break
@@ -9366,8 +9412,31 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                     # Shutdown sentinel with an already-empty queue.
                     return
 
+                # MQ-reliability kappa (task 2169): this branch's `item` is
+                # ALWAYS sourced from `_verifier_queue` (the persistent-getter
+                # harvest above or the direct get() here) — never from
+                # `_redispatch` (checked first, and only reached, in
+                # DISPATCH-FILL above) — so the registry's from_state is
+                # unconditionally AWAITING_VERIFY, unlike the DISPATCH-FILL
+                # call site. This call site previously had no `_dispatching_item`
+                # (census-only field) coverage at all; kappa extends the field
+                # here too (mirroring DISPATCH-FILL) so the legacy census and
+                # the registry/`_live_items` agree on EVERY dispatch, not just
+                # the DISPATCH-FILL one — a single fresh item on an otherwise
+                # idle worker is dispatched from exactly this call site (the
+                # verifier loop is already blocked on the queue get before the
+                # merger's item arrives), so this is the common case, not an
+                # edge case.
                 try:
-                    entry = await self._dispatch_item(item)
+                    self._note_transition(
+                        item.request.request_id, ItemLifecycleState.AWAITING_VERIFY,
+                        ItemLifecycleState.DISPATCHING, live_obj=item,
+                    )
+                    self._dispatching_item = item
+                    try:
+                        entry = await self._dispatch_item(item)
+                    finally:
+                        self._dispatching_item = None
                 except (asyncio.CancelledError, KeyboardInterrupt):
                     raise
                 except BaseException as exc:
@@ -9388,6 +9457,10 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                     # RealMergeItem here (see the DISPATCH-FILL branch above).
                     assert isinstance(item, RealMergeItem)
                     item_back = dataclasses.replace(item, cap_permit=None)
+                    self._note_transition(
+                        item_back.request.request_id, ItemLifecycleState.DISPATCHING,
+                        ItemLifecycleState.REDISPATCH_PARKED, live_obj=item_back,
+                    )
                     self._redispatch.appendleft(item_back)
                     continue
 
@@ -10797,6 +10870,15 @@ class SpeculativeMergeWorker(_WipHaltMixin):
 
             if remerge_reason is not None:
                 iteration_did_remerge = True
+                # MQ-reliability kappa (task 2169): DISPATCHING -> MERGING for
+                # the duration of this dispatch-time remerge (Mechanism 2) —
+                # see the kappa addendum to _LEGAL_TRANSITIONS' docstring above
+                # this class for why this is a DIFFERENT remerge window than
+                # the VERIFYING/GATE_REVERIFY/FINALIZING head-failure cascade.
+                self._note_transition(
+                    req.request_id, ItemLifecycleState.DISPATCHING,
+                    ItemLifecycleState.MERGING, live_obj=req,
+                )
                 # Set _remerging_item so snapshot() surfaces this request during
                 # the remerge window (item is popped from queue but not yet in
                 # _inflight, so without this it is invisible to all observability).
@@ -10818,6 +10900,16 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                 item = await self._remerge(req, item.started_monotonic)
                 self._remerging_item = None
                 self._verify_item = item
+                # MQ-reliability kappa (task 2169): "then back" — regardless of
+                # whether the re-merged item now falls through to a passthrough
+                # outcome (-> TERMINAL, wired by a later step) or proceeds to a
+                # normal host-acquire + verify dispatch (-> VERIFYING via
+                # _inflight_append below), the remerge itself is over, so the
+                # registry moves back to DISPATCHING immediately.
+                self._note_transition(
+                    req.request_id, ItemLifecycleState.MERGING,
+                    ItemLifecycleState.DISPATCHING, live_obj=item,
+                )
 
                 # After remerge the new item may itself carry an immediate_outcome
                 # (e.g. conflict during remerge, or a train slot).  Return it as a

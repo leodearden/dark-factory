@@ -455,12 +455,24 @@ class TestMergerVerifierHandoffRegistersAwaitingVerify:
         req = _make_request('kappa-awaiting-verify', 'kappa-awaiting-verify', wt, config)
 
         observed: list[tuple[Any, Any]] = []
+        live_item_at_awaiting_verify: list[Any] = []
         original_note_transition = worker._note_transition
 
         def _spy_note_transition(rid: str, from_state: Any, to_state: Any, **kwargs: Any) -> None:
             if rid == req.request_id:
                 observed.append((from_state, to_state))
-            return original_note_transition(rid, from_state, to_state, **kwargs)
+            original_note_transition(rid, from_state, to_state, **kwargs)
+            # Capture _live_items' object AT the AWAITING_VERIFY transition
+            # itself (not post-completion): step-8 wires DISPATCHING/VERIFYING
+            # onward from here, and this single-item run awaits FULL pipeline
+            # completion, so by the time `req.result` resolves `_live_items`
+            # has already moved on to whatever the LATEST chokepoint (e.g.
+            # `_inflight_append`) set it to. `_note_transition` applies the
+            # live_obj update synchronously before returning, so this capture
+            # (right after the real call, still within this single-threaded
+            # transition) reflects exactly the state this test cares about.
+            if rid == req.request_id and to_state == ItemLifecycleState.AWAITING_VERIFY:
+                live_item_at_awaiting_verify.append(worker._live_items.get(rid))
 
         worker._note_transition = _spy_note_transition  # type: ignore[method-assign]
 
@@ -471,12 +483,24 @@ class TestMergerVerifierHandoffRegistersAwaitingVerify:
             outcome = await asyncio.wait_for(req.result, timeout=60)
             assert outcome.status == 'done', f'{outcome}'
 
+        # NOTE: this test awaits FULL pipeline completion (`req.result`), which
+        # for a successful RealMergeItem only resolves once verify+finalize
+        # has run to completion — i.e. strictly AFTER the DISPATCHING/VERIFYING
+        # transitions step-8 wires at the verifier's dispatch call sites and
+        # `_inflight_append`. Unlike the loop-breaker/passthrough test below
+        # (whose Future resolves early via `_oob_deliver`, racing ahead of the
+        # background verifier-side dispatch), this path's assertion window
+        # necessarily includes those two additional entries.
         assert observed == [
             (ItemLifecycleState.QUEUED, ItemLifecycleState.LANE_BUFFERED),
             (ItemLifecycleState.LANE_BUFFERED, ItemLifecycleState.MERGING),
             (ItemLifecycleState.MERGING, ItemLifecycleState.AWAITING_VERIFY),
+            (ItemLifecycleState.AWAITING_VERIFY, ItemLifecycleState.DISPATCHING),
+            (ItemLifecycleState.DISPATCHING, ItemLifecycleState.VERIFYING),
         ], f'unexpected transition sequence for {req.request_id}: {observed!r}'
-        assert isinstance(worker._live_items[req.request_id], RealMergeItem), (
+        assert live_item_at_awaiting_verify and isinstance(
+            live_item_at_awaiting_verify[0], RealMergeItem,
+        ), (
             '_live_items must hold the RealMergeItem (not the stale MergeRequest) '
             'once the item becomes verifier-owned'
         )
