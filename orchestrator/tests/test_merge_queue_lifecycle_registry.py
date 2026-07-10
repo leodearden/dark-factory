@@ -487,16 +487,20 @@ class TestMergerVerifierHandoffRegistersAwaitingVerify:
         # for a successful RealMergeItem only resolves once verify+finalize
         # has run to completion — i.e. strictly AFTER the DISPATCHING/VERIFYING
         # transitions step-8 wires at the verifier's dispatch call sites and
-        # `_inflight_append`. Unlike the loop-breaker/passthrough test below
-        # (whose Future resolves early via `_oob_deliver`, racing ahead of the
-        # background verifier-side dispatch), this path's assertion window
-        # necessarily includes those two additional entries.
+        # `_inflight_append`, and (since step-10) the FINALIZING/TERMINAL
+        # transitions wired into `_finalize_inflight`/`_resolve_or_drop_abandoned`.
+        # Unlike the loop-breaker/passthrough test below (whose Future resolves
+        # early via `_oob_deliver`, racing ahead of the background verifier-side
+        # dispatch), this path's assertion window necessarily includes the full
+        # tail.
         assert observed == [
             (ItemLifecycleState.QUEUED, ItemLifecycleState.LANE_BUFFERED),
             (ItemLifecycleState.LANE_BUFFERED, ItemLifecycleState.MERGING),
             (ItemLifecycleState.MERGING, ItemLifecycleState.AWAITING_VERIFY),
             (ItemLifecycleState.AWAITING_VERIFY, ItemLifecycleState.DISPATCHING),
             (ItemLifecycleState.DISPATCHING, ItemLifecycleState.VERIFYING),
+            (ItemLifecycleState.VERIFYING, ItemLifecycleState.FINALIZING),
+            (ItemLifecycleState.FINALIZING, ItemLifecycleState.TERMINAL),
         ], f'unexpected transition sequence for {req.request_id}: {observed!r}'
         assert live_item_at_awaiting_verify and isinstance(
             live_item_at_awaiting_verify[0], RealMergeItem,
@@ -707,7 +711,9 @@ class TestVerifierDispatchFillRegistersDispatching:
         DISPATCH-FILL finds nothing and falls through to the blocking
         ``_verifier_queue.get()`` — see this task's design notes), proving
         that call site's DISPATCHING wiring as well as the normal
-        DISPATCHING -> VERIFYING transition at ``_inflight_append``.
+        DISPATCHING -> VERIFYING transition at ``_inflight_append``. This
+        test awaits FULL pipeline completion (`req.result`), so (since
+        step-10) the tail also covers the FINALIZING/TERMINAL transitions.
         """
         from orchestrator.merge_queue import ItemLifecycleState, SpeculativeMergeWorker
 
@@ -743,6 +749,8 @@ class TestVerifierDispatchFillRegistersDispatching:
             (ItemLifecycleState.MERGING, ItemLifecycleState.AWAITING_VERIFY),
             (ItemLifecycleState.AWAITING_VERIFY, ItemLifecycleState.DISPATCHING),
             (ItemLifecycleState.DISPATCHING, ItemLifecycleState.VERIFYING),
+            (ItemLifecycleState.VERIFYING, ItemLifecycleState.FINALIZING),
+            (ItemLifecycleState.FINALIZING, ItemLifecycleState.TERMINAL),
         ], f'unexpected transition sequence for {req.request_id}: {observed!r}'
 
         await worker.stop()

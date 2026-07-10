@@ -268,6 +268,7 @@ ALLOWLIST: frozenset[tuple[str, str]] = frozenset({
     ('test_merge_queue_invariant_integration_gate.py', '_check_post_merge_equivalence'),
     ('test_merge_queue_invariant_integration_gate.py', '_check_post_merge_pyright'),
     ('test_merge_queue_invariant_integration_gate.py', '_reverify_rebased_tree'),
+    ('test_merge_queue_lifecycle_registry.py', '_reverify_rebased_tree'),
     ('test_merge_queue_multihost_wiring.py', '_maybe_run_drift_check'),
     ('test_merge_queue_multihost_wiring.py', '_maybe_schedule_shadow_compare'),
     ('test_merge_queue_multihost_wiring.py', '_run_drift_check'),

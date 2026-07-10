@@ -1652,13 +1652,23 @@ class TestFinalizeInflightRunnerUnavailableEscalation:
         return worker, eq, fake_alloc
 
     def _make_ru_entry(self, worker, host_name, reason='ssh timeout'):
-        """Build an InflightEntry whose verify_task yields RUNNER_UNAVAILABLE."""
+        """Build an InflightEntry whose verify_task yields RUNNER_UNAVAILABLE.
+
+        Registers the item in ``worker._lifecycle`` at VERIFYING first (task
+        2169 kappa): production always reaches ``_finalize_inflight`` via the
+        registered DISPATCHING -> VERIFYING dispatch path, so an unregistered
+        entry here would spuriously fire the best-effort-loud
+        "rejected transition" escalation on every kappa-wired
+        ``_note_transition`` call inside the RUNNER_UNAVAILABLE branch,
+        polluting ``eq.submitted`` for tests that count escalations.
+        """
         import asyncio
 
         from orchestrator.merge_queue import (
             InflightEntry,
             InflightStatus,
             InflightVerifyResult,
+            ItemLifecycleState,
             MergeRequest,
             RealMergeItem,
         )
@@ -1691,6 +1701,7 @@ class TestFinalizeInflightRunnerUnavailableEscalation:
             base_sha='base123',
             speculative=False,
         )
+        worker._register_item(item, initial=ItemLifecycleState.VERIFYING)
 
         async def _fake_ru_verify():
             return InflightVerifyResult(

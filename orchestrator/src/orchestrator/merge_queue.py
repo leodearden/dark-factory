@@ -4563,6 +4563,7 @@ _LEGAL_TRANSITIONS: dict[ItemLifecycleState, frozenset[ItemLifecycleState]] = {
     ItemLifecycleState.FINALIZING: frozenset({
         ItemLifecycleState.TERMINAL,
         ItemLifecycleState.MERGING,
+        ItemLifecycleState.GATE_REVERIFY,
     }),
     ItemLifecycleState.TERMINAL: frozenset(),
 }
@@ -4606,6 +4607,18 @@ proceed to a normal host-acquire + verify dispatch (-> VERIFYING via
 VERIFYING/GATE_REVERIFY/FINALIZING -> MERGING head-failure cascade documented
 above — that one never revisits DISPATCHING, it re-enters via
 ``_redispatch`` (-> REDISPATCH_PARKED) for a fresh dispatch attempt instead.
+
+kappa also adds FINALIZING -> GATE_REVERIFY. ``_finalize_inflight`` sets the
+registry to FINALIZING unconditionally at entry (mirroring its own
+``entry.phase = 'finalizing'`` set BEFORE the CAS loop's first
+``advance_main`` attempt), so a same-call ``rebased_pending_reverify`` result
+moves the registry FINALIZING -> GATE_REVERIFY, not VERIFYING ->
+GATE_REVERIFY (the latter edge, above, models a *fresh* dispatch that lands
+directly on a gate re-verify with no intervening finalize attempt — not
+exercised by current wiring, but kept for symmetry / future call sites).
+Both edges coexist without conflict since ``ItemLifecycle.transition``
+validates the caller's *from_state* against the registry's actual current
+state independently of which edge licenses the move.
 
 TERMINAL is absorbing (empty out-set): conflict auto-chain regeneration
 mints a NEW request_id for the regenerated attempt
@@ -9711,11 +9724,20 @@ class SpeculativeMergeWorker(_WipHaltMixin):
         Synchronous — no ``await`` between the abandonment check and
         ``set_result``, preserving the detach resolution-race guard invariant
         documented at merge_queue.py:2105-2119.
+
+        MQ-reliability kappa (task 2169): this is one of the two unified
+        terminal chokepoints (the other, :meth:`_resolve_and_release`, itself
+        calls this one) — every call site here is delivering a FINAL outcome
+        or recognizing the request was already abandoned, so *req*'s
+        request_id is retired (best-effort TERMINAL + drop from
+        ``_live_items``) unconditionally, covering both branches below.
         """
         if self._request_abandoned(req):
+            self._retire_item(req.request_id)
             return
         if not req.result.done():
             req.result.set_result(outcome)
+        self._retire_item(req.request_id)
 
     async def _resolve_and_release(
         self,
@@ -9808,6 +9830,11 @@ class SpeculativeMergeWorker(_WipHaltMixin):
         This is also the intended hook surface for task eta's liveness-ledger
         'resolved' transition: every _verifier_loop error-resolution path now
         funnels through this one coroutine.
+
+        MQ-reliability kappa (task 2169): retirement (best-effort TERMINAL +
+        drop from ``_live_items``) is NOT duplicated here — it is inherited
+        from the internal :meth:`_resolve_or_drop_abandoned` call below,
+        which every call site of THIS coroutine routes through.
         """
         if isinstance(entry_or_item, InflightEntry):
             item = entry_or_item.item
@@ -10280,6 +10307,29 @@ class SpeculativeMergeWorker(_WipHaltMixin):
             # Set/clear are structurally symmetric (both inside this try/finally), so a
             # future edit adding a throwing statement before the try cannot leave
             # _finalizing_head permanently stale.
+            #
+            # MQ-reliability kappa (task 2169): mirror the same window onto the
+            # registry — VERIFYING -> FINALIZING — but ONLY for an entry that
+            # actually reaches real finalize work below.  A passthrough entry
+            # (entry.passthrough_outcome is not None) never awaits a verify_task
+            # or runs the CAS loop, and a pre-dispatch sentinel entry
+            # (ABANDONED_PREDISPATCH still sits at DISPATCHING; REQUEUED_PREDISPATCH
+            # was already moved to QUEUED by _dispatch_item's own _note_requeue
+            # call) is likewise never really "finalizing" — transitioning either
+            # to FINALIZING here would be a spurious hop (DISPATCHING/QUEUED ->
+            # FINALIZING is not even a legal edge). Both retire/requeue from
+            # whichever state they actually hold at their own return sites below.
+            if (
+                entry.passthrough_outcome is None
+                and entry.status not in (
+                    InflightStatus.ABANDONED_PREDISPATCH,
+                    InflightStatus.REQUEUED_PREDISPATCH,
+                )
+            ):
+                self._note_transition(
+                    req.request_id, ItemLifecycleState.VERIFYING,
+                    ItemLifecycleState.FINALIZING, live_obj=entry,
+                )
             self._finalizing_head = entry
 
             # ── Pre-dispatch sentinels (abandon / operator-halt) ─────────────────────
@@ -10306,6 +10356,10 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                     entry.passthrough_outcome.status not in ('done', 'already_merged')
                 )
                 _skip_release = True  # passthrough entries have no lease
+                # MQ-reliability kappa (task 2169): passthrough never reaches
+                # FINALIZING (see the guard above) — retire straight from
+                # whatever state it currently holds (DISPATCHING).
+                self._retire_item(req.request_id)
                 return entry.passthrough_outcome.status in ('done', 'already_merged')
 
             # ── Await verify task (if any) ───────────────────────────────────
@@ -10375,8 +10429,24 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                 # so the item is retried before any newer queue arrivals.
                 # The head-failure cascade (fired because this returns False) will
                 # handle any downstream entries still in _inflight.
+                #
+                # MQ-reliability kappa (task 2169): the registry observes
+                # MERGING for the duration of the _remerge() call, then the
+                # re-merged item lands at REDISPATCH_PARKED — it re-enters the
+                # pipeline via _redispatch for a fresh dispatch attempt rather
+                # than returning to FINALIZING/DISPATCHING, mirroring the
+                # downstream head-failure cascade's own remerge-then-redispatch
+                # shape.
+                self._note_transition(
+                    req.request_id, ItemLifecycleState.FINALIZING,
+                    ItemLifecycleState.MERGING, live_obj=entry,
+                )
                 _remerged_ru = await self._remerge(
                     entry.item.request, entry.item.started_monotonic,
+                )
+                self._note_transition(
+                    req.request_id, ItemLifecycleState.MERGING,
+                    ItemLifecycleState.REDISPATCH_PARKED, live_obj=_remerged_ru,
                 )
                 self._redispatch.appendleft(_remerged_ru)
                 return False
@@ -10526,6 +10596,10 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                             f'without SHA fields (task {req.task_id})'
                         )
 
+                    self._note_transition(
+                        req.request_id, ItemLifecycleState.FINALIZING,
+                        ItemLifecycleState.GATE_REVERIFY, live_obj=entry,
+                    )
                     self._verify_phase = 'gate_reverify'
                     entry.phase = 'gate_reverify'
                     gate = await _reverify_rebased_tree(
@@ -10588,6 +10662,10 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                         self._event_store, req.task_id, OutcomeKind.gate_retry,
                         attempt=gate_total,
                         duration_ms=_elapsed_ms(item.started_monotonic),
+                    )
+                    self._note_transition(
+                        req.request_id, ItemLifecycleState.GATE_REVERIFY,
+                        ItemLifecycleState.FINALIZING, live_obj=entry,
                     )
                     self._verify_phase = 'finalizing'
                     entry.phase = 'finalizing'
