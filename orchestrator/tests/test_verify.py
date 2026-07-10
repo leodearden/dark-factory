@@ -1,6 +1,7 @@
 """Tests for orchestrator/verify.py, specifically _run_cmd bash executable handling."""
 
 import asyncio
+import contextlib
 import logging
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, call, patch
@@ -1616,6 +1617,42 @@ class TestMergeFanoutCap:
     fan-out branch of ``run_scoped_verification`` needs its own bound.
     """
 
+    @staticmethod
+    def _make_peak_tracker(expected_peak: int, *, wait_timeout: float = 2.0):
+        """Build a fake ``_run_cmd`` that observes concurrency deterministically.
+
+        Each call increments ``state['current']`` and records ``state['peak']``
+        the instant it's entered — a synchronous update with no intervening
+        await, so it can never race another call's own entry (asyncio is
+        single-threaded/cooperative here; there is no true parallelism to
+        race). It then blocks on an ``asyncio.Event`` that fires once
+        ``expected_peak`` concurrent calls have been observed, releasing all
+        of them together.
+
+        This replaces a fixed ``asyncio.sleep`` used just to "hold the slot":
+        under a slow/loaded event loop a fixed sleep could in theory elapse
+        before the next call is even scheduled, letting a held slot release
+        early and silently under-report the peak. Gating on the actual
+        condition being measured removes that race. ``wait_timeout`` is only
+        a hang-safety net — if a regression means concurrency never reaches
+        ``expected_peak``, each blocked call proceeds anyway once it elapses
+        so the test fails fast on the peak assertion instead of hanging.
+        """
+        state = {'current': 0, 'peak': 0}
+        reached = asyncio.Event()
+
+        async def fake_run_cmd(cmd, cwd, timeout, env=None, log_path=None, **kwargs):
+            state['current'] += 1
+            state['peak'] = max(state['peak'], state['current'])
+            if state['current'] >= expected_peak:
+                reached.set()
+            with contextlib.suppress(TimeoutError):
+                await asyncio.wait_for(reached.wait(), timeout=wait_timeout)
+            state['current'] -= 1
+            return 0, '', False
+
+        return fake_run_cmd, state
+
     @pytest.mark.asyncio
     async def test_merge_fanout_bounded_by_dedicated_merge_cap(self, tmp_path: Path):
         """role='merge' fan-out is bounded by merge_verify_max_concurrent_pytests,
@@ -1633,14 +1670,7 @@ class TestMergeFanoutCap:
             for i in range(6)
         ]
 
-        state = {'current': 0, 'peak': 0}
-
-        async def fake_run_cmd(cmd, cwd, timeout, env=None, log_path=None, **kwargs):
-            state['current'] += 1
-            state['peak'] = max(state['peak'], state['current'])
-            await asyncio.sleep(0.02)  # hold the slot so overlap is observable
-            state['current'] -= 1
-            return 0, '', False
+        fake_run_cmd, state = self._make_peak_tracker(expected_peak=2)
 
         with patch('orchestrator.verify._run_cmd', side_effect=fake_run_cmd):
             result = await run_scoped_verification(
@@ -1672,14 +1702,7 @@ class TestMergeFanoutCap:
             for i in range(6)
         ]
 
-        state = {'current': 0, 'peak': 0}
-
-        async def fake_run_cmd(cmd, cwd, timeout, env=None, log_path=None, **kwargs):
-            state['current'] += 1
-            state['peak'] = max(state['peak'], state['current'])
-            await asyncio.sleep(0.02)
-            state['current'] -= 1
-            return 0, '', False
+        fake_run_cmd, state = self._make_peak_tracker(expected_peak=2)
 
         with patch('orchestrator.verify._run_cmd', side_effect=fake_run_cmd):
             result = await run_scoped_verification(
@@ -1710,14 +1733,7 @@ class TestMergeFanoutCap:
             ModuleConfig(prefix='mod0', test_command='__cmd0__'),
         ]
 
-        state = {'current': 0, 'peak': 0}
-
-        async def fake_run_cmd(cmd, cwd, timeout, env=None, log_path=None, **kwargs):
-            state['current'] += 1
-            state['peak'] = max(state['peak'], state['current'])
-            await asyncio.sleep(0.02)
-            state['current'] -= 1
-            return 0, '', False
+        fake_run_cmd, state = self._make_peak_tracker(expected_peak=1)
 
         with patch('orchestrator.verify._run_cmd', side_effect=fake_run_cmd):
             result = await run_scoped_verification(

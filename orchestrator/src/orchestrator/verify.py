@@ -3544,10 +3544,11 @@ async def run_scoped_verification(
     # counting admission slot (`_admission_slot` no-ops for role='merge' — the
     # anti-livelock/C-merge-priority guarantee), so merge's internal fan-out
     # needs its OWN bound (`merge_verify_max_concurrent_pytests`), orthogonal
-    # to `verify_admission_task_slots`. Task/background roles keep the
-    # general `max_concurrent_module_verifies` — their pytests are
+    # to `verify_admission_task_slots`. The 'task' role (this function's only
+    # other role — see the `Literal['merge', 'task']` signature above) keeps
+    # the general `max_concurrent_module_verifies` — its pytests are
     # additionally bounded by the admission slot, so the general knob mostly
-    # just caps burst concurrency for them.
+    # just caps burst concurrency for it.
     _fanout_cap = (
         config.merge_verify_max_concurrent_pytests
         if role == 'merge'
