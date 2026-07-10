@@ -96,7 +96,12 @@ class MarkerLifecycle:
 
 # One entry per MARKER_KINDS value. The GC-on-terminal subset (deleter ==
 # DELETER_GC) is exactly recon_ledger.MARKER_KINDS — the per-task marker
-# kinds ReconLedgerStore.gc() deletes once their task_id goes terminal.
+# kinds ReconLedgerStore.gc() is *eligible* to delete once their task_id goes
+# terminal (its record_kind IN (...) clause matches on these three kinds).
+# That eligibility is not the same as "is currently collected that way in
+# practice" for every kind — see the stage2_persistence_marker entry below,
+# where task 2228 W5-κ (review finding model_drift) found those two things
+# have diverged.
 # stage1_flag_suppression and cycle_summary are NOT per-task markers, so
 # they expire via TTL / pool-cap trim instead (see recon_ledger.py:62-66 and
 # recon_pool_map.py's docstring for the corresponding cycle_summary pool-cap
@@ -119,6 +124,21 @@ MARKER_LIFECYCLE: dict[str, MarkerLifecycle] = {
     ),
     'stage2_persistence_marker': MarkerLifecycle(
         writer='Stage 2 / TaskKnowledgeSync post-processor',
+        # Classified DELETER_GC because this record_kind is one of the three
+        # recon_ledger.MARKER_KINDS ReconLedgerStore.gc() is eligible to
+        # match — kept exactly DELETER_GC (not a distinct sentinel) so this
+        # entry keeps cross-checking against recon_ledger.MARKER_KINDS via
+        # test_recon_self_model.py's DELETER_GC-subset assertion. In current
+        # practice, though, gc() never actually collects a stage2_persistence_marker
+        # row: this kind's writer (task_knowledge_sync._track_flag_persistence)
+        # still only writes/reads it in Mem0 and no code path upserts a
+        # stage2_persistence_marker row into the ledger (task 2228 W5-κ,
+        # review finding model_drift). The live collector is the separate
+        # Mem0 age-based sweep task_knowledge_sync._sweep_stale_persistence_markers
+        # (task 2095), which task 2228 restored alongside the ledger gc()
+        # collapse specifically because gc() cannot reach this pool. Migrating
+        # the writer onto the ledger — so DELETER_GC becomes true in practice
+        # and not just in eligibility — is a follow-up.
         deleter=DELETER_GC,
     ),
     'stage1_flag_suppression': MarkerLifecycle(

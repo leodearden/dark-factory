@@ -259,6 +259,39 @@ class ReconLedgerStore:
         row = await cursor.fetchone()
         return row is not None
 
+    async def marker_task_ids(self, project_id: str) -> set[str]:
+        """Return the distinct non-empty ``task_id`` values across
+        :data:`MARKER_KINDS` rows for *project_id*.
+
+        Callers (:func:`~fused_memory.reconciliation.stages.task_knowledge_sync._gc_recon_markers`,
+        task 2228 W5-κ amendment) use this to bound an otherwise
+        project-lifetime-sized terminal-task-id list down to only the ids
+        that could possibly match :meth:`gc`'s ``task_id IN (...)`` clause —
+        a terminal id with no marker row in the ledger contributes nothing to
+        that DELETE, so intersecting it away before the call keeps the
+        bind-parameter count tied to current ledger occupancy (bounded by
+        marker TTL and this GC pass itself) rather than to the project's
+        total terminal-task count, which only grows over the project's
+        lifetime and could otherwise approach SQLite's
+        ``SQLITE_MAX_VARIABLE_NUMBER`` on a large, mature project.
+
+        Uses ``SELECT DISTINCT`` scoped to ``project_id`` and
+        ``record_kind IN MARKER_KINDS``; rows with ``task_id = ''`` (e.g.
+        project-scoped ``cycle_summary`` records, which are not per-task
+        markers) are excluded.
+        """
+        db = self._require_db()
+        marker_placeholders = ','.join('?' * len(MARKER_KINDS))
+        cursor = await db.execute(
+            f"""
+            SELECT DISTINCT task_id FROM recon_ledger
+            WHERE project_id = ? AND record_kind IN ({marker_placeholders}) AND task_id != ''
+            """,
+            (project_id, *MARKER_KINDS),
+        )
+        rows = await cursor.fetchall()
+        return {row['task_id'] for row in rows}
+
     async def gc(
         self,
         project_id: str,
@@ -272,6 +305,23 @@ class ReconLedgerStore:
         means ``NULL < ?`` evaluates to NULL, not true) OR its ``record_kind``
         is one of :data:`MARKER_KINDS` and its ``task_id`` is in
         ``terminal_task_ids``. Returns the number of rows deleted.
+
+        **Multi-task (comma-joined) markers are intentionally NOT decomposed
+        here** (task 2228 W5-κ, review finding robustness_regression): the
+        terminal-referenced clause is an EXACT string match against the
+        stored ``task_id`` column, so a marker written with a comma-joined
+        multi-task ``task_id`` (e.g. ``'12,15'``, produced by
+        ``flag_dedup.compute_flag_signature``'s ``cited_tasks`` fallback) can
+        never equal a single id in ``terminal_task_ids`` — even when every
+        cited task has gone terminal. Such markers are not lost; they are
+        instead reaped later by the ``expires_at < now`` clause once their TTL
+        elapses, rather than promptly on the referenced tasks' terminal
+        transition (the retired ``_sweep_terminal_task_flag_markers`` split
+        comma-joined ids and deleted when every component was terminal — this
+        early-collection path is narrowed to single-task markers, the
+        dominant/incident-driving shape, by this collapse). Fail-safe
+        direction is preserved either way: uncertain/unmatched => keep, never
+        delete on partial information.
 
         When ``terminal_task_ids`` is empty, the terminal-referenced clause is
         omitted entirely and an expiry-only DELETE runs instead — an explicit

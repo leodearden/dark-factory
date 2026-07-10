@@ -424,6 +424,96 @@ async def test_gc_keeps_marker_kind_row_with_null_expires_when_task_not_terminal
 
 
 @pytest.mark.asyncio
+async def test_marker_task_ids_returns_distinct_nonempty_marker_ids_scoped_to_kind_and_project(store):
+    """marker_task_ids(project_id) returns the DISTINCT non-empty task_ids
+    across MARKER_KINDS rows for that project (task 2228 W5-κ amendment).
+
+    Exercises three predicates independently: (1) record_kind scoping — a
+    non-marker-kind row (stage1_flag_suppression) is excluded even though its
+    task_id is non-empty; (2) the task_id != '' exclusion — a MARKER_KINDS
+    row with an empty task_id is excluded, proving the filter isn't merely
+    incidental to the non-marker-kind rows also having empty ids; and (3)
+    project scoping — a marker row in another project is excluded. It also
+    confirms DISTINCT collapses a task_id shared by two different marker
+    kinds (stage1_flag_marker and flag_for_stage2) to a single entry.
+    """
+    marker_a = ReconLedgerRecord(
+        project_id='proj-a',
+        record_kind='stage1_flag_marker',
+        payload_json='{}',
+        state='active',
+        created_at='2026-06-01T00:00:00+00:00',
+        task_id='task-1',
+        flag_type='f1',
+    )
+    marker_b = ReconLedgerRecord(
+        project_id='proj-a',
+        record_kind='stage2_persistence_marker',
+        payload_json='{}',
+        state='active',
+        created_at='2026-06-01T00:00:00+00:00',
+        task_id='task-2',
+        flag_type='f2',
+    )
+    marker_shared_task_id = ReconLedgerRecord(
+        project_id='proj-a',
+        record_kind='flag_for_stage2',
+        payload_json='{}',
+        state='active',
+        created_at='2026-06-01T00:00:00+00:00',
+        task_id='task-1',
+        flag_type='f3',
+    )
+    non_marker_kind = ReconLedgerRecord(
+        project_id='proj-a',
+        record_kind='stage1_flag_suppression',
+        payload_json='{}',
+        state='active',
+        created_at='2026-06-01T00:00:00+00:00',
+        task_id='task-4',
+        flag_type='f4',
+    )
+    non_marker_kind_empty_task_id = ReconLedgerRecord(
+        project_id='proj-a',
+        record_kind='cycle_summary',
+        payload_json='{}',
+        state='active',
+        created_at='2026-06-01T00:00:00+00:00',
+    )
+    marker_kind_empty_task_id = ReconLedgerRecord(
+        project_id='proj-a',
+        record_kind='stage1_flag_marker',
+        payload_json='{}',
+        state='active',
+        created_at='2026-06-01T00:00:00+00:00',
+        flag_type='f6',
+    )
+    other_project_marker = ReconLedgerRecord(
+        project_id='proj-other',
+        record_kind='stage1_flag_marker',
+        payload_json='{}',
+        state='active',
+        created_at='2026-06-01T00:00:00+00:00',
+        task_id='task-x',
+        flag_type='f7',
+    )
+    for record in (
+        marker_a,
+        marker_b,
+        marker_shared_task_id,
+        non_marker_kind,
+        non_marker_kind_empty_task_id,
+        marker_kind_empty_task_id,
+        other_project_marker,
+    ):
+        await store.upsert(record)
+
+    result = await store.marker_task_ids('proj-a')
+
+    assert result == {'task-1', 'task-2'}
+
+
+@pytest.mark.asyncio
 async def test_checkpoint_returns_three_int_tuple(store):
     """checkpoint() runs PRAGMA wal_checkpoint(TRUNCATE) directly and returns
     a (busy, log, checkpointed) tuple of three ints — locks the return

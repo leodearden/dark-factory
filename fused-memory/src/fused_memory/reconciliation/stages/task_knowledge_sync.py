@@ -17,7 +17,6 @@ from typing import TYPE_CHECKING, Any, NamedTuple
 if TYPE_CHECKING:
     from fused_memory.backends.task_backend_protocol import TaskBackendProtocol
 
-from fused_memory.backends.task_backend_errors import TaskmasterError
 from fused_memory.middleware.task_interceptor import TERMINAL_STATUSES
 from fused_memory.models.reconciliation import (
     ReconciliationEvent,
@@ -34,14 +33,11 @@ from fused_memory.reconciliation.cli_stage_runner import (
     generate_summary_nonce,
 )
 from fused_memory.reconciliation.flag_dedup import (
-    _NOT_FOUND_PHRASE,
     _content_fingerprint,
-    _is_valid_marker_task_id,
     _normalize_content_description,
     acknowledge_resolved_flags,
     compute_flag_signature,
     filter_blocked_snapshot_findings,
-    is_content_fingerprint_task_id,
 )
 from fused_memory.reconciliation.policies import is_snapshot_write_blocked
 from fused_memory.reconciliation.prompts import (
@@ -839,13 +835,17 @@ class Stage2FlagPartition(NamedTuple):
             indicate Stage 1 producer drift from a prior cycle — the LLM wrote
             a flag without the required ``run_id`` field (see
             prompts/stage1.py).  A WARNING is logged by
-            :func:`_query_stage2_flags` when this bucket is non-empty.  Caller
-            sweeps these via :func:`_sweep_stale_fixc_markers`.
+            :func:`_query_stage2_flags` when this bucket is non-empty.  These
+            are excluded from what is rendered to the Stage 2 LLM; residue is
+            reaped by the recon_ledger's TTL/terminal-task GC pass
+            (:func:`_gc_recon_markers`) rather than an immediate per-cycle
+            delete (task 2228 W5-κ).
         stale_mismatched_run_id_ids: ``id`` strings for records whose
             ``metadata.run_id`` is present and truthy but does not match the
             current ``run_id`` AND whose ``created_at`` is out of the run
-            window.  These are normal prior-cycle residue.  Caller sweeps these
-            via :func:`_sweep_stale_fixc_markers`.
+            window.  These are normal prior-cycle residue, excluded from what
+            is rendered to the Stage 2 LLM and reaped the same way (see
+            ``stale_missing_run_id_ids`` above).
         rescued_ids: ``id`` strings for markers rescued by the run-window guard
             (a subset of ``current``).  Non-empty indicates Stage 1 producer
             drift within the CURRENT cycle — the LLM omitted or mis-stamped
@@ -903,8 +903,10 @@ async def _query_stage2_flags(
       full semantics.  This is the single source of truth for the rescued
       count (task-1381).
 
-    Both stale buckets must be swept by the caller via
-    :func:`_sweep_stale_fixc_markers`.
+    Both stale buckets are excluded from what is rendered to the Stage 2 LLM;
+    residue is reaped by the recon_ledger's TTL/terminal-task GC pass
+    (:func:`_gc_recon_markers`, task 2228 W5-κ) rather than an immediate
+    per-cycle delete by the caller.
 
     The *run_window_start* parameter is optional and defaults to ``None``
     (backward-compatible: window guard dormant, pure run_id partition applies).
@@ -1128,7 +1130,6 @@ def _compute_stale_flags(
 # semantic search, which can silently rank matches off the bottom of top-N).
 _STAGE2_PERSISTENCE_MARKER_SOURCE = 'stage2_persistence_marker'
 _STAGE2_ESCALATION_MARKER_SOURCE = 'stage2_escalation_marker'
-_STAGE2_STALE_FIXC_SWEEP_SOURCE = 'stage2_stale_fixc_sweep'
 
 # Stage 2 per-cycle summary pool cap and related constants.
 # Every per-cycle summary add_memory call is tagged recon_pool='stage2_cycle_summary'
@@ -1166,34 +1167,6 @@ _STAGE2_SUMMARY_RECONSTRUCTION_SOURCE = 'stage2_summary_reconstruction'
 # _STAGE2_SUMMARY_STAGE_REPAIR_SOURCE's internal-service idiom above.
 _TASK_COUNT_SNAPSHOT_WRITE_SOURCE = 'stage2_task_count_snapshot_write'
 
-# Age-based GC for orphaned stage1_flag_marker records (task 1944).
-# flag_dedup._write_and_confirm_marker rewrites a stage1_flag_marker with a
-# fresh created_at on every dedup HIT (a finding that keeps recurring); a
-# finding that stops recurring leaves its marker orphaned with no other
-# collector (documented as the "orphan-growth caveat" in flag_dedup.py,
-# task-1670).  14 days is a config default, not a numeric tolerance asserted
-# against live data: reify recon runs multiple cycles/day, so 14 days
-# untouched means the finding has been dead across dozens of cycles.  The
-# cost of a false GC is bounded to exactly one re-escalation — the next
-# occurrence is simply a MISS that writes a fresh marker — within the
-# existing best-effort-replacement tolerance already documented there.
-STAGE1_FLAG_MARKER_MAX_AGE_DAYS: int = 14
-_STAGE1_FLAG_MARKER_GC_SWEEP_SOURCE = 'stage1_flag_marker_gc_sweep'
-
-# Terminal-task-status GC for stage1_flag_marker records (task 2103).
-# _sweep_stale_flag_markers above is keyed ONLY on marker age / cross-cycle
-# fp: predicates — it has no predicate on the REFERENCED TASK's own status. A
-# finding that stops recurring right after its task goes done/cancelled is
-# recent (<14 days) and typically has a bare-numeric task_id (not fp:), so
-# both existing predicates evaluate False and the marker is never swept. This
-# sweep closes that gap by resolving each marker's referenced task(s) via
-# taskmaster.get_task and deleting only when every referenced task is
-# confirmed terminal (fail-safe KEEP otherwise). Kept as a separate helper
-# (not folded into _sweep_stale_flag_markers) to preserve that function's
-# age-only unit tests and isolate the Taskmaster-I/O failure mode — mirrors
-# the separate _sweep_stale_persistence_markers helper (task 2095).
-_STAGE1_FLAG_MARKER_TERMINAL_GC_SWEEP_SOURCE = 'stage1_flag_marker_terminal_gc_sweep'
-
 # Age-based GC for the stage2_persistence_marker Channel-3 persistence-counter
 # family (task 2095), mirroring the stage1_flag_marker age-GC above (task 1944).
 # _track_flag_persistence writes one stage2_persistence_marker per surviving
@@ -1208,444 +1181,163 @@ STAGE2_PERSISTENCE_MARKER_MAX_AGE_DAYS: int = 14
 _STAGE2_PERSISTENCE_MARKER_GC_SWEEP_SOURCE = 'stage2_persistence_marker_gc_sweep'
 
 
-async def _sweep_stale_fixc_markers(
-    memory_service,
-    project_id: str,
-    stale_ids: list[str],
+async def _resolve_terminal_task_ids(
+    taskmaster,
+    scope: ProjectScope,
     run_id: str,
-) -> int:
-    """Delete stale fixc markers in parallel and return the count of successful deletes.
+) -> list[str]:
+    """Resolve the terminal-status task ids for *scope* via ONE bulk status read.
 
-    Issues parallel ``delete_memory`` calls via ``asyncio.gather`` with
-    ``return_exceptions=True`` (mirrors :func:`_track_flag_persistence` /
-    :func:`_write_escalation_markers`).  Individual delete failures log WARNING
-    and are excluded from the returned count — best-effort contract.
+    Feeds :meth:`fused_memory.reconciliation.recon_ledger.ReconLedgerStore.gc`'s
+    ``terminal_task_ids`` argument (task 2228 W5-κ). Replaces the per-marker
+    ``taskmaster.get_task`` loop previously used by the now-deleted
+    ``_sweep_terminal_task_flag_markers``: a single bulk
+    ``taskmaster.get_statuses(project_root)`` call is strictly cheaper than N
+    individual lookups, and the ledger's ``task_id IN (...)`` clause does the
+    membership match itself.
+
+    **Fail-safe direction**: degrades to ``[]`` when ``taskmaster`` is falsy,
+    when ``get_statuses`` raises, or when its result is anything other than
+    the documented ``dict[str, str]`` shape (e.g. an unconfigured test double)
+    — never propagates. An empty result feeds ``gc()``'s expiry-only branch,
+    which keeps every task-referenced marker, preserving the old sweeps'
+    fail-safe KEEP direction (uncertain => keep, never delete on
+    partial/failed information). This runs unconditionally on every
+    ``TaskKnowledgeSync.run()`` call, so it must never be the reason a
+    reconciliation cycle crashes.
 
     Args:
-        memory_service: The fused-memory service (must support ``delete_memory``).
-        project_id: Project scope for the delete calls.
-        stale_ids: List of Mem0 memory IDs to delete.  Empty list → returns 0
-            immediately without issuing any calls.
-        run_id: Current reconciliation run identifier used as ``causation_id``
-            so the audit journal traces each delete back to the responsible cycle.
+        taskmaster: Object with an async ``get_statuses(project_root) ->
+            dict[str, str]`` method. Falsy => no-op (returns ``[]``).
+        scope: ``ProjectScope`` supplying ``project_root`` for the bulk
+            status read.
+        run_id: Current reconciliation run identifier, logged on failure.
 
     Returns:
-        Number of deletes that completed without raising (0 if *stale_ids* is empty).
+        Sorted list of task_id strings whose status is in
+        ``TERMINAL_STATUSES`` (``{'done', 'cancelled'}``); ``[]`` on any
+        failure or falsy taskmaster.
     """
-    if not stale_ids:
-        return 0
+    if not taskmaster:
+        return []
 
-    # Two-tier check via gather_collect (fused_memory.utils.async_utils).
-    # Pass 1 (inside gather_collect): re-raises structured-cancellation
-    # signals — this preserves the structured-cancellation contract and
-    # prevents this delete sweep from silently converting a shutdown
-    # signal into an under-counted deletion tally.
-    # Pass 2 (below): per-item degrade-to-warning on ordinary Exceptions.
-    results = await gather_collect(
-        memory_service.delete_memory(
-            memory_id=mid,
-            store='mem0',
-            project_id=project_id,
-            causation_id=run_id,
-            _source=_STAGE2_STALE_FIXC_SWEEP_SOURCE,
-        )
-        for mid in stale_ids
-    )
-
-    success_count = 0
-    for mid, result in zip(stale_ids, results, strict=True):
-        if isinstance(result, Exception):
-            logger.warning(
-                'reconciliation._sweep_stale_fixc_markers: delete failed for memory_id=%s; not counted',
-                mid,
-                extra={'project_id': project_id, 'memory_id': mid, 'run_id': run_id},
-            )
-        else:
-            success_count += 1
-    return success_count
-
-
-async def _sweep_stale_flag_markers(
-    memory_service,
-    project_id: str,
-    run_id: str,
-    *,
-    max_age_days: int = STAGE1_FLAG_MARKER_MAX_AGE_DAYS,
-    now: datetime | None = None,
-    scroll_limit: int = 1000,
-    run_window_start: datetime | None = None,
-) -> int:
-    """Age-GC orphaned ``stage1_flag_marker`` Mem0 records (task 1944).
-
-    ``stage1_flag_marker`` records are only garbage-collected today on the
-    dedup HIT path (``flag_dedup._write_and_confirm_marker`` deletes priors
-    when the SAME signature re-flags).  A finding that stops recurring leaves
-    its marker orphaned — Stage 2's flag sweeps only touch records carrying
-    ``metadata.flag_for_stage2=true``, which stage1_flag_markers never do, and
-    ``scripts/sweep_orphan_flag_markers.py`` only deletes markers *missing*
-    ``kind='stage1_flag_marker'`` (a disjoint, legacy-orphan concern). This
-    helper closes that gap by enumerating the whole pool and deleting members
-    whose ``created_at`` is strictly older than ``now - max_age_days``.
-
-    Enumerates deterministically via ``memory_service.get_memories_by_metadata``
-    (Qdrant payload-filter scroll) — NEVER semantic search, which silently
-    drops low-similarity rows and is unsuitable for exhaustive GC.  Members
-    with a missing or unparseable ``created_at`` are KEPT (never deleted),
-    mirroring ``summary_pool._sort_key``'s sort-last / prefer-keep posture.
-
-    Cross-cycle fingerprint sweep (task-2047 Gap 2): a member is stale if
-    EITHER of two independent predicates holds:
-
-    - ``aged_out`` — the existing ``created_at < now - max_age_days`` check,
-      applied to every marker regardless of ``task_id`` shape.
-    - ``predates_cycle`` — ``run_window_start`` is not ``None`` AND the
-      marker's ``metadata.task_id`` is a canonical ``fp:`` content-fingerprint
-      key (:func:`~fused_memory.reconciliation.flag_dedup.is_content_fingerprint_task_id`)
-      AND it is NOT within the current run window
-      (:func:`_marker_is_within_run_window`). Scoped to ``fp:`` markers only:
-      numeric/comma-joined task_ids are already resolvable anchors and their
-      task-1654 cross-cycle dedup must not regress by being swept after a
-      single skipped cycle.
-
-    ``predates_cycle`` is OR'd with ``aged_out``, not substituted for it, so
-    the 14-day age path is unchanged for every marker shape and is still the
-    only path taken when ``run_window_start`` is ``None`` (e.g. the journal
-    lookup in ``assemble_payload`` failed this cycle) — this is the
-    backward-compatible fallback the Gap-2 design requires.
-
-    A separate INFO log reports the count of markers swept *specifically* by
-    ``predates_cycle`` where ``aged_out`` did NOT already apply (i.e. the
-    incremental effect of the new predicate, distinct from ordinary age-outs)
-    for operator observability.
-
-    Deletes are issued best-effort in parallel via ``asyncio.gather`` with
-    ``return_exceptions=True`` (mirrors :func:`_sweep_stale_fixc_markers`):
-    individual failures log WARNING and are excluded from the returned count.
-
-    Args:
-        memory_service: Service with ``get_memories_by_metadata`` and
-            ``delete_memory``.
-        project_id: Project scope for enumeration and delete calls.
-        run_id: Current reconciliation run identifier used as ``causation_id``
-            in the audit journal.
-        max_age_days: Staleness cutoff in days (default
-            ``STAGE1_FLAG_MARKER_MAX_AGE_DAYS`` == 14).
-        now: Reference "current time" for the cutoff calculation. Defaults to
-            ``datetime.now(UTC)``; tests inject a fixed value.
-        scroll_limit: Max records to enumerate in one scroll (default 1000).
-        run_window_start: Start of the current reconciliation run's window
-            (journal ``started_at``), used ONLY to evaluate ``predates_cycle``
-            for ``fp:``-keyed markers. ``None`` (the default) disables the
-            cross-cycle predicate entirely — age-only sweep, unchanged from
-            the pre-task-2047 contract.
-
-    Returns:
-        Number of memories successfully deleted (0 if nothing is stale, or
-        on enumeration failure).
-    """
     try:
-        members = await memory_service.get_memories_by_metadata(
-            project_id=project_id,
-            filters={'source': 'stage1_flag_marker'},
-            limit=scroll_limit,
-        )
+        statuses = await taskmaster.get_statuses(scope.project_root)
+        return sorted(str(tid) for tid, status in statuses.items() if status in TERMINAL_STATUSES)
     except Exception:
         logger.warning(
-            'reconciliation._sweep_stale_flag_markers: '
-            'get_memories_by_metadata failed for project_id=%s; skipping sweep',
-            project_id,
-            extra={'project_id': project_id, 'run_id': run_id},
+            'reconciliation._resolve_terminal_task_ids: get_statuses failed for project_id=%s',
+            scope.project_id,
+            extra={'project_id': scope.project_id, 'run_id': run_id},
         )
-        return 0
-
-    if len(members) >= scroll_limit:
-        logger.warning(
-            'reconciliation._sweep_stale_flag_markers: enumerated %d of scroll_limit=%d '
-            'stage1_flag_marker records — scroll cap reached; older stale markers may '
-            'remain uncollected this cycle; re-run with a higher scroll_limit.',
-            len(members), scroll_limit,
-            extra={'project_id': project_id, 'run_id': run_id},
-        )
-
-    if not members:
-        return 0
-
-    cutoff = _assume_utc(now or datetime.now(UTC)) - timedelta(days=max_age_days)
-
-    stale_ids: list[str] = []
-    cross_cycle_fp_swept = 0
-    for member in members:
-        mid = member.get('id')
-        if not mid:
-            continue
-        raw = member.get('created_at')
-        if raw is None:
-            continue
-        try:
-            created_at = _assume_utc(datetime.fromisoformat(raw))
-        except (ValueError, TypeError):
-            continue
-
-        aged_out = created_at < cutoff
-
-        # Cross-cycle fp: predicate (task-2047 Gap 2) — see docstring. Scoped to
-        # fp:-keyed markers only; numeric/comma-joined markers always evaluate
-        # predates_cycle=False regardless of run_window_start.
-        predates_cycle = False
-        if run_window_start is not None:
-            metadata = member.get('metadata') or {}
-            task_id = str(metadata.get('task_id') or '')
-            if is_content_fingerprint_task_id(task_id) and not _marker_is_within_run_window(
-                raw, run_window_start
-            ):
-                predates_cycle = True
-
-        if aged_out or predates_cycle:
-            stale_ids.append(mid)
-            if predates_cycle and not aged_out:
-                cross_cycle_fp_swept += 1
-
-    if not stale_ids:
-        return 0
-
-    if cross_cycle_fp_swept:
-        logger.info(
-            'reconciliation._sweep_stale_flag_markers: swept %d cross-cycle fp: marker(s) '
-            '(predates run_window_start=%s), distinct from age-based GC',
-            cross_cycle_fp_swept, run_window_start,
-            extra={'project_id': project_id, 'run_id': run_id},
-        )
-
-    # Two-tier check via gather_collect (fused_memory.utils.async_utils).
-    # Pass 1 (inside gather_collect): re-raises structured-cancellation
-    # signals — this preserves the structured-cancellation contract and
-    # prevents this delete sweep from silently converting a shutdown
-    # signal into an under-counted deletion tally.
-    # Pass 2 (below): per-item degrade-to-warning on ordinary Exceptions.
-    results = await gather_collect(
-        memory_service.delete_memory(
-            memory_id=mid,
-            store='mem0',
-            project_id=project_id,
-            causation_id=run_id,
-            _source=_STAGE1_FLAG_MARKER_GC_SWEEP_SOURCE,
-        )
-        for mid in stale_ids
-    )
-
-    success_count = 0
-    for mid, result in zip(stale_ids, results, strict=True):
-        if isinstance(result, Exception):
-            logger.warning(
-                'reconciliation._sweep_stale_flag_markers: delete failed for memory_id=%s; not counted',
-                mid,
-                extra={'project_id': project_id, 'memory_id': mid, 'run_id': run_id},
-            )
-        else:
-            success_count += 1
-    return success_count
+        return []
 
 
-async def _sweep_terminal_task_flag_markers(
+async def _gc_recon_markers(
     memory_service,
     taskmaster,
     scope: ProjectScope,
     run_id: str,
     *,
-    scroll_limit: int = 1000,
+    now: datetime | None = None,
 ) -> int:
-    """Terminal-task-status GC for ``stage1_flag_marker`` records (task 2103).
+    """Garbage-collect ``recon_ledger`` marker rows for *scope* in ONE DELETE pass.
 
-    :func:`_sweep_stale_flag_markers` above sweeps ``stage1_flag_marker``
-    records on marker AGE and cross-cycle ``fp:`` predicates only — it has no
-    predicate keyed on the REFERENCED TASK's own live status. A finding that
-    stops recurring right after its task reaches a terminal state is
-    typically recent (<14 days) and has a bare-numeric ``task_id`` (not
-    ``fp:``), so both existing predicates evaluate False and the marker is
-    never swept (the confirmed root cause of the 2026-07-05
-    solar_challenge_platform incident, which required a manual 16-record bulk
-    GC).
+    Replaces three of the original four Mem0 sweeps — the now-deleted
+    ``_sweep_stale_fixc_markers``, ``_sweep_stale_flag_markers``, and
+    ``_sweep_terminal_task_flag_markers`` — with a single
+    :meth:`~fused_memory.reconciliation.recon_ledger.ReconLedgerStore.gc` call
+    (task 2228 W5-κ): the ledger's ``expires_at < now`` clause replaces the
+    age-based sweeps and the fixc residue delete, and its
+    ``record_kind IN MARKER_KINDS AND task_id IN terminal_task_ids`` clause
+    replaces the terminal-task sweep. The fourth original sweep,
+    :func:`_sweep_stale_persistence_markers`, was restored as a separate
+    Mem0-resident pass — its writer (:func:`_track_flag_persistence`) was
+    never migrated to the ledger, so this function's ``gc()`` call cannot
+    collect its markers — and is NOT replaced here; see the GC block in
+    ``TaskKnowledgeSync.run()`` for both passes running side by side.
 
-    This sweep closes that gap: it enumerates the same ``stage1_flag_marker``
-    pool, resolves each marker's referenced task_id(s) — numeric or
-    comma-joined (e.g. ``'12,15'``) — via ``taskmaster.get_task``, and
-    deletes the marker only when EVERY referenced component task is
-    confirmed to be in ``TERMINAL_STATUSES`` (``{'done', 'cancelled'}``).
-    ``fp:`` content-fingerprint keys and invalid task_ids are skipped
-    entirely (no ``get_task`` call) — they are not references to real tasks
-    and remain the responsibility of :func:`_sweep_stale_flag_markers`'s
-    existing age/fp: GC.
+    Degrades to ``0`` — never raises — when ``memory_service`` has no ledger
+    wired (``recon_ledger`` is ``None``, e.g. mid write-both/read-new
+    cutover) or when ``ledger.gc`` itself fails. ``terminal_task_ids`` is
+    resolved via :func:`_resolve_terminal_task_ids`, which is itself
+    fail-safe to ``[]`` — an empty list makes ``gc()`` run its expiry-only
+    branch, preserving the old sweeps' fail-safe KEEP direction.
 
-    **Fail-safe direction**: deletion is the irreversible direction, so a
-    marker is deleted ONLY on positively-confirmed terminal status for every
-    referenced component. A ``get_task`` error, non-dict result,
-    ``'unknown'``/absent status, or any non-terminal component status =>
-    KEEP. A transient Taskmaster outage then costs at most one skipped GC
-    cycle — the marker is self-healing (rewritten on the next dedup MISS)
-    and will be swept next cycle once ``get_task`` recovers.
+    **Bounding (task 2228 W5-κ amendment)**: before being forwarded to
+    ``gc()``, a non-empty ``terminal_task_ids`` is intersected with
+    :meth:`~fused_memory.reconciliation.recon_ledger.ReconLedgerStore.marker_task_ids`
+    — the set of task ids that actually have a marker row in the ledger right
+    now. A terminal id with no marker row can never match ``gc()``'s
+    ``task_id IN (...)`` clause, so dropping it keeps the DELETE's
+    bind-parameter count tied to ledger occupancy instead of the project's
+    full (monotonically growing) terminal-task history, which could
+    otherwise approach SQLite's ``SQLITE_MAX_VARIABLE_NUMBER`` on a large,
+    mature project. A ``marker_task_ids`` failure is itself fail-safe: it
+    degrades ``terminal_task_ids`` to ``[]`` (logged WARNING) rather than
+    forwarding the unbounded list or aborting the whole GC pass, so ``gc()``
+    still performs its expiry-only DELETE that cycle.
 
-    Each DISTINCT component task_id is resolved via ``get_task`` exactly
-    once (status-cache dedup) — mirroring the post-flight
-    ``_resolve_live_status`` pattern — so markers sharing a task_id (the
-    incident's 150x2/132x3 pattern) collapse to a single Taskmaster call.
-
-    Degrades to a no-op when ``taskmaster`` is falsy (mirrors
-    ``flag_dedup.filter_terminal_metadata_flags``'s degradation posture).
-
-    Enumerates deterministically via ``memory_service.get_memories_by_metadata``
-    (Qdrant payload-filter scroll) — NEVER semantic search, which silently
-    drops low-similarity rows and is unsuitable for exhaustive GC. Deletes
-    are issued best-effort in parallel via ``asyncio.gather`` with
-    ``return_exceptions=True`` (mirrors :func:`_sweep_stale_flag_markers`):
-    individual failures log WARNING and are excluded from the returned
-    count.
+    **Comma-joined markers are TTL-only (task 2228 W5-κ, review finding
+    robustness_regression)**: ``terminal_task_ids`` holds only individual ids
+    (as returned by ``taskmaster.get_statuses``), and ``ledger.gc()``'s
+    terminal-referenced match is an exact string comparison — so a marker
+    whose stored ``task_id`` is a comma-joined multi-task list (e.g.
+    ``'12,15'``) never matches even when every cited task is terminal. This is
+    an intentional, fail-safe simplification: such markers are reaped via the
+    ``expires_at`` TTL path instead of promptly on terminal transition. See
+    :meth:`~fused_memory.reconciliation.recon_ledger.ReconLedgerStore.gc` for
+    the full rationale.
 
     Args:
-        memory_service: Service with ``get_memories_by_metadata`` and
-            ``delete_memory``.
-        taskmaster: Object with an async ``get_task(task_id, project_root)``
-            method. Falsy => no-op (returns 0).
-        scope: ``ProjectScope`` supplying ``project_root`` (passed through
-            to ``get_task``) and ``project_id`` (used for enumeration and
-            delete calls). A constructed ``ProjectScope`` always carries a
-            validated, non-empty root.
-        run_id: Current reconciliation run identifier used as
-            ``causation_id`` in the audit journal.
-        scroll_limit: Max records to enumerate in one scroll (default 1000).
+        memory_service: Service that may expose a ``recon_ledger``
+            (:class:`~fused_memory.reconciliation.recon_ledger.ReconLedgerStore`)
+            attribute. Missing/``None`` => no-op (returns ``0``).
+        taskmaster: Forwarded to :func:`_resolve_terminal_task_ids`. Falsy => no-op there.
+        scope: ``ProjectScope`` supplying ``project_id`` (ledger scope) and
+            ``project_root`` (forwarded to ``taskmaster.get_statuses``).
+        run_id: Current reconciliation run identifier, logged on failure.
+        now: Reference "current time" for the ``expires_at`` comparison.
+            Defaults to ``datetime.now(UTC)``; tests inject a fixed value.
+            Normalized via :func:`_assume_utc` and rendered with
+            ``.isoformat()`` to match the writer format used by
+            ``flag_dedup._persist_flag_marker``, so the ledger's
+            lexicographic TEXT comparison against stored ``expires_at``
+            values is correct.
 
     Returns:
-        Number of memories successfully deleted (0 if nothing is stale, on
-        enumeration failure, or when degraded to a no-op).
+        Number of rows deleted by the ``gc()`` pass (``0`` on any failure or
+        when no ledger is wired).
     """
-    if not taskmaster:
+    ledger = getattr(memory_service, 'recon_ledger', None)
+    if ledger is None:
         return 0
 
+    now_iso = _assume_utc(now or datetime.now(UTC)).isoformat()
+    terminal_task_ids = await _resolve_terminal_task_ids(taskmaster, scope, run_id)
+
+    if terminal_task_ids:
+        try:
+            resident_ids = await ledger.marker_task_ids(scope.project_id)
+            terminal_task_ids = [tid for tid in terminal_task_ids if tid in resident_ids]
+        except Exception:
+            logger.warning(
+                'reconciliation._gc_recon_markers: ledger.marker_task_ids failed for '
+                'project_id=%s — bounding terminal_task_ids to [] (expiry-only gc this cycle)',
+                scope.project_id,
+                extra={'project_id': scope.project_id, 'run_id': run_id},
+            )
+            terminal_task_ids = []
+
     try:
-        members = await memory_service.get_memories_by_metadata(
-            project_id=scope.project_id,
-            filters={'source': 'stage1_flag_marker'},
-            limit=scroll_limit,
-        )
+        return await ledger.gc(scope.project_id, now_iso, terminal_task_ids)
     except Exception:
         logger.warning(
-            'reconciliation._sweep_terminal_task_flag_markers: '
-            'get_memories_by_metadata failed for project_id=%s; skipping sweep',
+            'reconciliation._gc_recon_markers: ledger.gc failed for project_id=%s',
             scope.project_id,
             extra={'project_id': scope.project_id, 'run_id': run_id},
         )
         return 0
-
-    if len(members) >= scroll_limit:
-        logger.warning(
-            'reconciliation._sweep_terminal_task_flag_markers: enumerated %d of '
-            'scroll_limit=%d stage1_flag_marker records — scroll cap reached; '
-            'older terminal-task markers may remain uncollected this cycle; '
-            're-run with a higher scroll_limit.',
-            len(members), scroll_limit,
-            extra={'project_id': scope.project_id, 'run_id': run_id},
-        )
-
-    if not members:
-        return 0
-
-    # First pass: select candidate markers (numeric / comma-joined task_id
-    # references only — fp: fingerprints and invalid ids are left to
-    # _sweep_stale_flag_markers's existing age/fp: GC) and record each
-    # candidate's component task_ids.
-    candidates: dict[str, list[str]] = {}
-    for member in members:
-        mid = member.get('id')
-        if not mid:
-            continue
-        tid = str((member.get('metadata') or {}).get('task_id') or '')
-        if not _is_valid_marker_task_id(tid) or is_content_fingerprint_task_id(tid):
-            continue
-        components = [c.strip() for c in tid.split(',') if c.strip()]
-        if not components:
-            continue
-        candidates[mid] = components
-
-    if not candidates:
-        return 0
-
-    # Resolve each DISTINCT component task_id exactly once (status-cache
-    # dedup), mirroring the post-flight _resolve_live_status pattern.
-    distinct_components = list({c for components in candidates.values() for c in components})
-
-    async def _safe_get_task(component: str):
-        try:
-            return await taskmaster.get_task(component, scope.project_root)
-        except Exception as exc:
-            # A TaskmasterError carrying the not-found phrase means the
-            # referenced task_id no longer exists (e.g. hard-deleted) — an
-            # expected, benign steady-state condition for this GC sweep, not
-            # an infrastructure failure, so it's logged at debug to avoid
-            # recurring per-cycle noise. Any other exception (timeout,
-            # connection error, unexpected shape, ...) is unanticipated and
-            # is logged at warning so it surfaces.
-            if isinstance(exc, TaskmasterError) and _NOT_FOUND_PHRASE in str(exc).lower():
-                logger.debug(
-                    'reconciliation._sweep_terminal_task_flag_markers: '
-                    'task_id=%s not found (expected during GC sweep): %s',
-                    component, exc,
-                    extra={'project_id': scope.project_id, 'run_id': run_id},
-                )
-            else:
-                logger.warning(
-                    'reconciliation._sweep_terminal_task_flag_markers: '
-                    'get_task failed for task_id=%s: %s',
-                    component, exc,
-                    extra={'project_id': scope.project_id, 'run_id': run_id},
-                )
-            return None  # KEEP marker on error (fail-safe)
-
-    task_results = await asyncio.gather(*(_safe_get_task(c) for c in distinct_components))
-    status_cache: dict[str, str] = {
-        component: (_extract_status(result) if isinstance(result, dict) else 'unknown')
-        for component, result in zip(distinct_components, task_results, strict=True)
-    }
-
-    # Conservative: delete only when EVERY referenced component task is
-    # confirmed terminal — a still-live component means the finding may
-    # remain relevant, so any 'unknown'/errored/non-terminal component keeps
-    # the marker.
-    stale_ids = [
-        mid
-        for mid, components in candidates.items()
-        if all(status_cache.get(c, 'unknown') in TERMINAL_STATUSES for c in components)
-    ]
-
-    if not stale_ids:
-        return 0
-
-    # Two-tier check via gather_collect (fused_memory.utils.async_utils).
-    # Pass 1 (inside gather_collect): re-raises structured-cancellation
-    # signals — this preserves the structured-cancellation contract and
-    # prevents this delete sweep from silently converting a shutdown
-    # signal into an under-counted deletion tally.
-    # Pass 2 (below): per-item degrade-to-warning on ordinary Exceptions.
-    results = await gather_collect(
-        memory_service.delete_memory(
-            memory_id=mid,
-            store='mem0',
-            project_id=scope.project_id,
-            causation_id=run_id,
-            _source=_STAGE1_FLAG_MARKER_TERMINAL_GC_SWEEP_SOURCE,
-        )
-        for mid in stale_ids
-    )
-
-    success_count = 0
-    for mid, result in zip(stale_ids, results, strict=True):
-        if isinstance(result, Exception):
-            logger.warning(
-                'reconciliation._sweep_terminal_task_flag_markers: delete failed for memory_id=%s; not counted',
-                mid,
-                extra={'project_id': scope.project_id, 'memory_id': mid, 'run_id': run_id},
-            )
-        else:
-            success_count += 1
-    return success_count
 
 
 async def _sweep_stale_persistence_markers(
@@ -1666,21 +1358,23 @@ async def _sweep_stale_persistence_markers(
     whole pool and deleting members whose ``created_at`` is strictly older
     than ``now - max_age_days``.
 
-    AGE-ONLY mirror of :func:`_sweep_stale_flag_markers` (task 1944): this
-    helper does NOT implement that function's cross-cycle ``fp:``
-    content-fingerprint predicate. ``stage2_persistence_marker`` metadata is
-    ``{source, flag_id, run_id}`` with no ``task_id``/``fp:`` key, so that
-    predicate has no applicable input here.
+    This is an AGE-ONLY sweep (task 1944 precedent, since retired for
+    ``stage1_flag_marker`` by the recon_ledger ``gc()`` pass — task 2228
+    W5-κ): it implements no cross-cycle ``fp:`` content-fingerprint
+    predicate. ``stage2_persistence_marker`` metadata is ``{source, flag_id,
+    run_id}`` with no ``task_id``/``fp:`` key, so that predicate has no
+    applicable input here.
 
     Enumerates deterministically via ``memory_service.get_memories_by_metadata``
     (Qdrant payload-filter scroll) — NEVER semantic search, which silently
     drops low-similarity rows and is unsuitable for exhaustive GC. Members
-    with a missing or unparseable ``created_at`` are KEPT (never deleted),
-    mirroring :func:`_sweep_stale_flag_markers`'s safety posture.
+    with a missing or unparseable ``created_at`` are KEPT (never deleted) — a
+    fail-safe KEEP-on-uncertainty posture shared with :func:`_gc_recon_markers`'s
+    expiry/terminal-task GC.
 
     Deletes are issued best-effort in parallel via ``asyncio.gather`` with
-    ``return_exceptions=True`` (mirrors :func:`_sweep_stale_fixc_markers`):
-    individual failures log WARNING and are excluded from the returned count.
+    ``return_exceptions=True``: individual failures log WARNING and are
+    excluded from the returned count.
 
     Args:
         memory_service: Service with ``get_memories_by_metadata`` and
@@ -1950,8 +1644,9 @@ async def _verify_task_count_snapshot_written(
     CONFIRMED miss (``False``) and an inconclusive check (``None``).
 
     Unlike that helper, this one passes an explicit ``limit`` (mirroring
-    ``_sweep_stale_flag_markers`` et al. — task_count_snapshot has no GC or
-    pool-cap, so its record count grows unbounded over cycles) and treats a
+    :func:`_sweep_stale_persistence_markers`'s ``scroll_limit`` idiom —
+    task_count_snapshot has no GC or pool-cap, so its record count grows
+    unbounded over cycles) and treats a
     saturated page as INCONCLUSIVE rather than a confirmed miss: Qdrant's
     scroll orders by point id, not ``created_at``, so once matches exceed
     *scroll_limit* the freshest record can fall outside the returned page —
@@ -2142,10 +1837,10 @@ async def _repair_stage2_summary_stage_metadata(
     this helper exists to eliminate.
 
     Best-effort: never raises. Enumeration failure logs a WARNING and returns
-    0 (mirrors :func:`_sweep_stale_flag_markers`). A per-member add/delete
-    failure logs a WARNING, excludes that member from the returned count, and
-    does not abort the remaining members (mirrors :func:`_sweep_stale_fixc_markers`'s
-    per-item isolation).
+    0. A per-member add/delete failure logs a WARNING, excludes that member
+    from the returned count, and does not abort the remaining members —
+    both mirror :func:`_sweep_stale_persistence_markers`'s enumeration-failure
+    and per-item isolation posture.
 
     Args:
         memory_service: Service with ``get_memories_by_metadata``,
@@ -2301,10 +1996,9 @@ async def _reconstruct_stage2_summary(
 
     Best-effort: never raises. Any ``add_memory`` exception (first attempt or
     retry) logs a WARNING and returns 0 — mirrors
-    :func:`_repair_stage2_summary_stage_metadata` /
-    :func:`_sweep_stale_fixc_markers`'s best-effort contract, so a Mem0 outage
-    degrades this self-heal gracefully instead of failing the whole
-    reconciliation cycle.
+    :func:`_repair_stage2_summary_stage_metadata`'s best-effort contract, so a
+    Mem0 outage degrades this self-heal gracefully instead of failing the
+    whole reconciliation cycle.
 
     Args:
         memory_service: Service with ``add_memory``.
@@ -2405,12 +2099,15 @@ async def _track_flag_persistence(
     which deletes markers older than ``STAGE2_PERSISTENCE_MARKER_MAX_AGE_DAYS``
     (task 2095).
 
-    Note (task 1256): this function receives only *surviving_ids* — flags whose
-    ``metadata.run_id`` differs from the active run are partitioned out by
-    :func:`_query_stage2_flags` upstream; :func:`_sweep_stale_fixc_markers` then
-    deletes them from Mem0 (independently of this call).  The counter therefore
-    no longer observes Stage 2 delete failures from previous cycles; it only
-    counts Stage 1 re-flags that survive within the current cycle's ``run_id``.
+    Note (task 1256, updated task 2228 W5-κ): this function receives only
+    *surviving_ids* — flags whose ``metadata.run_id`` differs from the active
+    run are partitioned out by :func:`_query_stage2_flags` upstream and never
+    reach this call; that residue is reaped separately by the recon_ledger's
+    single GC pass (:func:`_gc_recon_markers`, called from ``run()``) on its
+    TTL/terminal-task schedule, not by an immediate per-cycle delete.  The
+    counter therefore no longer observes Stage 2 delete failures from
+    previous cycles; it only counts Stage 1 re-flags that survive within the
+    current cycle's ``run_id``.
     """
     if not flag_ids:
         return {}
@@ -2703,28 +2400,19 @@ class TaskKnowledgeSync(BaseStage):
     _current_run_id: str | None = None
 
     # Start of the current run's window (journal started_at) — stashed by
-    # assemble_payload() (task-2047 Gap 2) so run() can forward it to
-    # _sweep_stale_flag_markers's cross-cycle fp: marker predicate. Mirrors the
-    # _current_run_id stash pattern. Reset to None at the top of run() so a
-    # prior run's value can never leak into a cycle whose assemble_payload call
-    # is skipped or short-circuited (age-only sweep fallback in that case).
+    # assemble_payload() (task-2047 Gap 2) so run() can forward it, after
+    # super().run() returns, to _write_task_count_snapshot's freshness check.
+    # Mirrors the _current_run_id stash pattern. Reset to None at the top of
+    # run() so a prior run's value can never leak into a cycle whose
+    # assemble_payload call is skipped or short-circuited.
     _run_window_start: datetime | None = None
-
-    # Count of stale fixc markers swept by _sweep_stale_fixc_markers in the
-    # current assemble_payload() call (task 1224).  Reset to 0 at the top of
-    # run() so cross-invocation contamination is impossible.  Written to
-    # report.stats['stale_fixc_markers_swept'] after super().run() returns.
-    # Note (task-1369): same-run in-window markers with absent/mismatched run_id
-    # are rescued to partition.current by the run-window guard in
-    # _query_stage2_flags and therefore NEVER enter the stale buckets — this
-    # counter reflects only genuine prior-cycle residue.
-    _stale_fixc_markers_swept: int = 0
 
     # Count of Stage 2 markers with absent/empty metadata.run_id that were routed
     # to the stale_missing_run_id bucket in the current assemble_payload() call
     # (task 1257).  Non-zero indicates Stage 1 producer drift from a PRIOR cycle —
-    # the LLM omitted the required run_id field.  Reset and injected via the same
-    # four-touchpoint pattern as _stale_fixc_markers_swept.
+    # the LLM omitted the required run_id field.  Reset to 0 at the top of run()
+    # and injected into report.stats after super().run() returns (same per-run
+    # counter reset-then-inject pattern used throughout this class).
     # Note (task-1369): same-cycle markers with absent run_id whose Mem0 created_at
     # is within the current run window are rescued to partition.current by
     # _query_stage2_flags and are NOT counted here.
@@ -2735,7 +2423,9 @@ class TaskKnowledgeSync(BaseStage):
     # within the CURRENT cycle — the LLM omitted or mis-stamped metadata.run_id on a
     # flag it wrote during this run.  The marker was still surfaced to the Stage 2 LLM
     # (not swept), but the drift is recorded here for operator observability.  Reset
-    # and injected via the same four-touchpoint pattern as _stale_fixc_markers_swept.
+    # to 0 at the top of run() and injected into report.stats after super().run()
+    # returns (same per-run counter reset-then-inject pattern used throughout this
+    # class).
     _rescued_in_window_markers: int = 0
 
     # Count of systemic_pattern findings polled from the recon_report channel
@@ -2743,9 +2433,10 @@ class TaskKnowledgeSync(BaseStage):
     # assemble_payload() call — i.e. survived compute_flag_signature dedup
     # against the Mem0/Stage-1 channel.  A finding whose signature already
     # exists in combined_flags is deduped and does NOT increment this counter.
-    # Reset and injected via the same four-touchpoint pattern as
-    # _stale_fixc_markers_swept.  Written to
-    # report.stats['stage2_recon_report_systemic_polled'] after super().run().
+    # Reset to 0 at the top of run() and injected into
+    # report.stats['stage2_recon_report_systemic_polled'] after super().run()
+    # returns (same per-run counter reset-then-inject pattern used throughout
+    # this class).
     _recon_report_systemic_polled: int = 0
 
     # Combined Stage 2 flags (Stage 1 items + surviving Mem0 active-query flags)
@@ -2790,7 +2481,6 @@ class TaskKnowledgeSync(BaseStage):
         self._current_run_id = run_id
         # Reset per-run counters so cross-invocation contamination is impossible
         # (mirrors _current_run_id overwrite pattern).
-        self._stale_fixc_markers_swept = 0
         self._stale_missing_run_id_markers = 0
         self._rescued_in_window_markers = 0
         self._recon_report_systemic_polled = 0
@@ -2812,15 +2502,9 @@ class TaskKnowledgeSync(BaseStage):
         pretrimmed = await _pretrim_stage2_summary_pool(self.memory, self.project_id, run_id)
         report = await super().run(events, watermark, prior_reports, run_id, model=model)
 
-        # --- stale fixc marker sweep stat (task 1224) ---
-        # _stale_fixc_markers_swept is set by assemble_payload() during the
-        # super().run() call above.  Inject it into the report here so
-        # downstream consumers (Stage 3 prompt, observability) can see how
-        # many prior-cycle markers were swept (mirrors stage2_stage1_dups_suppressed).
-        report.stats['stale_fixc_markers_swept'] = self._stale_fixc_markers_swept
         # --- missing-run_id marker stat (task 1257) ---
-        # Mirrors _stale_fixc_markers_swept; explicit zero is required so
-        # downstream consumers never need .get(..., 0) fallbacks.
+        # Explicit zero is required so downstream consumers never need
+        # .get(..., 0) fallbacks.
         report.stats['stale_missing_run_id_markers'] = self._stale_missing_run_id_markers
         # --- rescued-in-window marker stat (task-1369 amendment) ---
         # Non-zero when the run-window guard rescued same-cycle Stage-1 markers
@@ -2829,8 +2513,7 @@ class TaskKnowledgeSync(BaseStage):
         # Explicit zero so downstream consumers never need .get(..., 0) fallbacks.
         report.stats['rescued_in_window_markers'] = self._rescued_in_window_markers
         # --- recon_report systemic_pattern channel poll stat (task-1966) ---
-        # Mirrors _stale_fixc_markers_swept; explicit zero so downstream
-        # consumers never need .get(..., 0) fallbacks.
+        # Explicit zero so downstream consumers never need .get(..., 0) fallbacks.
         report.stats['stage2_recon_report_systemic_polled'] = self._recon_report_systemic_polled
 
         # --- same-run Stage 1 human_operator_required dedup (task 1154) ---
@@ -2933,8 +2616,7 @@ class TaskKnowledgeSync(BaseStage):
         # correct-by-design) and any write failure fall back to the
         # pre-existing best-effort freshness read below.
         # run_window_start forwards whatever assemble_payload stashed on
-        # self._run_window_start this cycle, mirroring the
-        # _sweep_stale_flag_markers forwarding immediately below.
+        # self._run_window_start this cycle.
         # written is None when blocked+unverified, the run window is unknown,
         # or the freshness query itself failed transiently, in which case the
         # stat key is left absent entirely so the harness
@@ -2976,51 +2658,31 @@ class TaskKnowledgeSync(BaseStage):
                 1 if task_count_snapshot_written else 0
             )
 
-        # --- stage1_flag_marker age-based + cross-cycle fp: GC (task 1944, task-2047 Gap 2) ---
-        # The stage1_flag_marker pool is written by Stage 1, not by this stage's
-        # agent write, so post-write placement is correct (unlike the pre-write
-        # summary pool trim above). Runs unconditionally on both full and
-        # remediation paths so the pool is bounded every cycle. Explicit zero
-        # so downstream consumers never need a .get(..., 0) fallback.
-        # run_window_start forwards whatever assemble_payload stashed on
-        # self._run_window_start this cycle (None if assemble_payload was
-        # skipped/short-circuited or never reached the journal lookup) — the
-        # getattr default covers instances where run() itself was never called.
-        gc_swept = await _sweep_stale_flag_markers(
-            self.memory, self.project_id, run_id,
-            run_window_start=getattr(self, '_run_window_start', None),
-        )
-        report.stats['stale_flag_markers_gc_swept'] = gc_swept
-
-        # --- stage1_flag_marker terminal-task-status GC (task 2103) ---
-        # Complements the age-only/fp: sweep immediately above: that sweep has
-        # no predicate on the REFERENCED TASK's own status, so a finding whose
-        # task goes done/cancelled soon after being flagged is both recent
-        # (<14 days) and typically bare-numeric (not fp:) — both existing
-        # predicates evaluate False and the marker is never collected (the
-        # confirmed root cause of the 2026-07-05 solar_challenge_platform
-        # incident's 16-record manual bulk GC). Runs unconditionally on both
-        # full and remediation paths; degrades to a no-op (0) when taskmaster
-        # is unset. Explicit zero so downstream consumers never need a
-        # .get(..., 0) fallback.
-        terminal_gc_swept = await _sweep_terminal_task_flag_markers(
+        # --- recon_ledger marker GC: single DELETE pass (task 2228 W5-κ) ---
+        # Collapses what were two separate stage1_flag_marker sweeps —
+        # age-based + cross-cycle fp: GC (task 1944) and terminal-task-status
+        # GC (task 2103) — into one ReconLedgerStore.gc() call: its
+        # expires_at < now clause replaces the age-based sweep, and its
+        # record_kind/task_id membership clause replaces the terminal-task
+        # sweep. Runs unconditionally on both full and remediation paths so
+        # the pool is bounded every cycle. Explicit zero so downstream
+        # consumers never need a .get(..., 0) fallback.
+        report.stats['recon_markers_gc_swept'] = await _gc_recon_markers(
             self.memory, self.taskmaster, self.scope, run_id,
         )
-        report.stats['terminal_task_flag_markers_gc_swept'] = terminal_gc_swept
 
-        # --- stage2_persistence_marker age-based GC (task 2095) ---
-        # The stage2_persistence_marker pool is written by _track_flag_persistence
-        # (Channel 3: persistence-counter markers, distinct from stage1_flag_marker
-        # above and from the flag_for_stage2 relay swept elsewhere). Runs
-        # unconditionally on both full and remediation paths so the pool is
-        # bounded every cycle. Explicit zero so downstream consumers never need
-        # a .get(..., 0) fallback. No run_window_start is forwarded: unlike
-        # _sweep_stale_flag_markers, this sweep is age-only and has no
-        # cross-cycle fp: content-fingerprint predicate to gate (task 2095 design).
-        persistence_gc_swept = await _sweep_stale_persistence_markers(
+        # stage2_persistence_marker (task 2095) is GC'd separately from Mem0,
+        # NOT folded into the ledger gc() pass above: its writer
+        # (_track_flag_persistence) still writes to — and counts from — Mem0,
+        # and no code path upserts a stage2_persistence_marker row into the
+        # recon_ledger, so ReconLedgerStore.gc() can never collect it
+        # (review finding regression-orphan-growth; migrating the writer to
+        # the ledger is deferred to a follow-up). Runs unconditionally every
+        # cycle alongside the ledger gc() pass; explicit zero for the same
+        # reason as above.
+        report.stats['stale_persistence_markers_gc_swept'] = await _sweep_stale_persistence_markers(
             self.memory, self.project_id, run_id,
         )
-        report.stats['stale_persistence_markers_gc_swept'] = persistence_gc_swept
 
         return report
 
@@ -3359,12 +3021,10 @@ class TaskKnowledgeSync(BaseStage):
         # Guard: reject calls without a run_id before any I/O.  With an empty
         # run_id, _query_stage2_flags would classify ALL existing Mem0 markers
         # as stale (the partition treats an empty-string run_id as absent — see
-        # its docstring), so stale_marker_ids becomes non-empty even when no
-        # flags are active.  _sweep_stale_fixc_markers (called unconditionally
-        # whenever stale_marker_ids is non-empty) would then mass-delete all
-        # fixc markers, corrupting the marker store with causation_id=''.
-        # Raising here short-circuits before any filter_task_tree / Mem0 /
-        # Taskmaster I/O, ensuring _track_flag_persistence and
+        # its docstring), so every marker would be excluded from what's shown
+        # to the Stage 2 LLM even though no flags are actually stale this
+        # cycle.  Raising here short-circuits before any filter_task_tree /
+        # Mem0 / Taskmaster I/O, ensuring _track_flag_persistence and
         # _write_escalation_markers never write records stamped with an empty
         # run_id.
         if not self._current_run_id:
@@ -3488,8 +3148,11 @@ class TaskKnowledgeSync(BaseStage):
         #                       .current); single source of truth for the rescued count
         #                       (task-1381, replaces the re-derivation over active_flags)
         # Both stale buckets contain only genuine prior-cycle residue (in-window same-
-        # cycle markers are rescued to .current by the run-window guard) and are swept
-        # below so they are never rendered to the LLM.
+        # cycle markers are rescued to .current by the run-window guard) and are simply
+        # excluded from `current` below, so they are never rendered to the LLM. They are
+        # NOT deleted here — that residue is reaped separately by the recon_ledger's
+        # single GC pass (_gc_recon_markers, called from run()) on its TTL/terminal-task
+        # schedule (task 2228 W5-κ), not by an immediate delete inside this method.
         #
         # Run-window guard (task-1369): fetch the run's started_at from the journal so
         # same-cycle Stage-1 markers whose run_id was omitted/mis-stamped by the LLM
@@ -3517,18 +3180,18 @@ class TaskKnowledgeSync(BaseStage):
                 extra={'project_id': self.project_id, 'run_id': self._current_run_id},
             )
         # Stash on the instance (task-2047 Gap 2) so run() can forward this cycle's
-        # run_window_start into _sweep_stale_flag_markers's cross-cycle fp: marker
-        # predicate after super().run() returns — mirrors the _current_run_id stash
-        # pattern. Stays None (set at the top of run()) when the journal lookup above
-        # failed or returned a non-datetime started_at, which disables the run-window
-        # guard here AND falls the sweep back to age-only (backward compatible).
+        # run_window_start into the task_count_snapshot write/verify helpers
+        # (_write_task_count_snapshot / _verify_task_count_snapshot_written) after
+        # super().run() returns — mirrors the _current_run_id stash pattern. Stays
+        # None (set at the top of run()) when the journal lookup above failed or
+        # returned a non-datetime started_at, which disables the run-window guard
+        # and falls those helpers back to their window-agnostic behaviour.
         self._run_window_start = run_window_start
         partition = await _query_stage2_flags(
             self.memory, self.project_id, run_id_for_markers,
             run_window_start=run_window_start,
         )
         active_flags = partition.current
-        stale_marker_ids = partition.stale_all_ids
         self._stale_missing_run_id_markers = len(partition.stale_missing_run_id_ids)
         # Single source of truth for the rescued count: read directly from
         # partition.rescued_ids, which is populated exclusively by the run-window
@@ -3542,19 +3205,16 @@ class TaskKnowledgeSync(BaseStage):
         # FIX D — stale-flag persistence tracking.
         # Track how many cycles each surviving flag has survived without being
         # deleted.  Best-effort: _track_flag_persistence degrades gracefully.
-        # Note (task 1256): :func:`_query_stage2_flags` partitions flags by
-        # metadata.run_id, routing prior-cycle residue to stale_marker_ids
-        # (not active_flags); :func:`_sweep_stale_fixc_markers` (called below)
-        # then deletes them from Mem0.  FIX D therefore only fires on Stage 1
-        # re-flags surviving within the current run_id.
+        # Note (task 1256, updated task 2228 W5-κ): :func:`_query_stage2_flags`
+        # partitions flags by metadata.run_id, routing prior-cycle residue to
+        # partition.stale_all_ids (not active_flags) so it is never rendered
+        # to the LLM; that residue is reaped separately by the recon_ledger's
+        # single GC pass (:func:`_gc_recon_markers`, called from run()) on its
+        # TTL/terminal-task schedule rather than an immediate same-cycle
+        # delete.  FIX D therefore only fires on Stage 1 re-flags surviving
+        # within the current run_id.
         surviving_ids = [f['id'] for f in surviving]
 
-        # Sweep stale markers (prior-cycle residue) in parallel.  Best-effort:
-        # individual failures log WARNING but are not re-raised.  The count is
-        # stored on the instance for reporting in run() via stats dict.
-        self._stale_fixc_markers_swept = await _sweep_stale_fixc_markers(
-            self.memory, self.project_id, stale_marker_ids, run_id_for_markers
-        )
         persistence_counts = await _track_flag_persistence(
             self.memory,
             self.project_id,

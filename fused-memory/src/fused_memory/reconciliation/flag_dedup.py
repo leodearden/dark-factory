@@ -660,6 +660,24 @@ async def dedup_flags(
         # single add_memory, no read-back/confirm/delete loop.  Never raises —
         # a mirror failure must not roll back the ledger write above (or, when
         # no ledger is attached, must not abort the batch either).
+        #
+        # GC gap (task 2228 W5-κ, review finding robustness_unbounded_growth):
+        # this Mem0-resident mirror (metadata.source='stage1_flag_marker') has
+        # NO periodic collector. Task 2228 retired _sweep_stale_flag_markers —
+        # its sole sweep — when marker GC collapsed onto
+        # recon_ledger.ReconLedgerStore.gc() (see _gc_recon_markers above in
+        # task_knowledge_sync.py), which deletes only ledger rows, never Mem0
+        # memories. scripts/sweep_orphan_flag_markers.py still reads this same
+        # source tag, but only as a manual, one-shot sweep for a disjoint
+        # legacy-orphan concern (missing kind/task_id) — it does not collect
+        # ordinary, well-formed, aging markers. No read path re-derives an
+        # escalation count/threshold from this Mem0 pool (unlike
+        # stage2_persistence_marker's _track_flag_persistence), so unbounded
+        # growth here is a storage/latency cost, not a correctness regression
+        # — the ledger row (above) is the read-of-record and IS reaped by
+        # gc(). Accepted for the write-both/read-new cutover window; tracked
+        # by follow-up task 2406 (retire this mirror write, or restore a
+        # lightweight age sweep, once the cutover is confirmed complete).
         try:
             await memory_service.add_memory(
                 content=f'Stage 1 flag marker: task={tid} type={ftype} from run={run_id}',
