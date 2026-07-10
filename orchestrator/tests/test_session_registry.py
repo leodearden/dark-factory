@@ -319,6 +319,10 @@ def test_decision_path_for_id_sanitizes_unsafe_id(tmp_path: Path) -> None:
     # no traversal) -- mirrors lease_path_for_name's path-escape guard.
     path = sr.decision_path_for_id('../../etc/passwd', root=tmp_path)
     assert path.parent == sr.decisions_dir(root=tmp_path)
+    # Lock the actual sanitized stem, not just "has the right parent": every
+    # '/' maps to '-' via _DECISION_ID_SANITIZE_RE while '.' is preserved.
+    assert path.name == '..-..-etc-passwd.json'
+    assert '/' not in path.name
 
 
 # ---------------------------------------------------------------------------
