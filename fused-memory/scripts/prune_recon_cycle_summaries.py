@@ -589,6 +589,15 @@ async def run(
     ``task_knowledge_sync``), and each pool is classified independently via
     :func:`classify_pool`.
 
+    Ground-truth truncation guard: for each project, the exact cycle-summary
+    total is also fetched via ``memory.mem0.count_by_metadata`` and compared
+    against the scroll's actual result count via
+    :func:`check_scan_completeness`. If any project's scan under-counted
+    (the scroll hit ``--scan-limit`` before enumerating the full pool), this
+    hard-aborts with a ``scan_truncated`` payload *before* the deletion-cap
+    check and before any ``--apply`` deletes — a truncated scan must never
+    silently reach a classification/deletion decision.
+
     Parameters
     ----------
     args:
@@ -604,7 +613,9 @@ async def run(
     -------
     The prune report dict (see :func:`build_prune_report`), or an abort
     payload (``{'aborted': True, ...}``) if an unknown ``--project-id`` was
-    given or a project's deletable count exceeds the safety cap.
+    given, a project's scan under-counted its true cycle-summary total
+    (``scan_truncated``), or a project's deletable count exceeds the safety
+    cap.
     """
     generated_at = datetime.now(UTC).isoformat()
 
@@ -646,6 +657,7 @@ async def run(
 
     # Scan + classify every selected project's two pools.
     decisions: dict[tuple[str, str], PruneDecision] = {}
+    per_project_counts: dict[str, tuple[int, int]] = {}
     for pid in project_ids:
         scope = Scope(project_id=pid)
         scrolled = await memory.mem0.scroll_by_metadata(
@@ -658,6 +670,9 @@ async def run(
                 pid, repr(scrolled)[:200],
             )
             scrolled = []
+
+        expected = await memory.mem0.count_by_metadata(scope, {'kind': 'cycle_summary'})
+        per_project_counts[pid] = (len(scrolled), expected)
 
         pool_items: dict[str, list[dict[str, Any]]] = {stage: [] for stage in _POOL_STAGES}
         for m in scrolled:
@@ -676,6 +691,32 @@ async def run(
 
         for stage, items in pool_items.items():
             decisions[(pid, stage)] = classify_pool(items, keep_recent_n)
+
+    # Ground-truth truncation guard: abort before the deletion-cap check and
+    # before any apply if any project's scroll under-counted its true
+    # cycle_summary total (see check_scan_completeness).
+    truncated = check_scan_completeness(per_project_counts)
+    if truncated:
+        truncation_payload: dict[str, Any] = {
+            'aborted': True,
+            'scan_truncated': True,
+            'truncated_projects': truncated,
+            'scan_limit': scan_limit,
+            'dry_run': not args.apply,
+            'generated_at': generated_at,
+            'scan_counts': {
+                pid: {'scanned': scanned, 'expected': expected}
+                for pid, (scanned, expected) in per_project_counts.items()
+            },
+        }
+        print(json.dumps(truncation_payload, indent=2, default=str))
+        print(
+            f'ABORT: scan truncated for projects {truncated}: scanned < '
+            f'cycle_summary count; re-run with a higher --scan-limit '
+            f'(current: {scan_limit}).',
+            file=sys.stderr,
+        )
+        return truncation_payload
 
     # Safety cap on deletable counts (irreversible), across both pools per project.
     per_project_delete_counts: dict[str, int] = {
