@@ -3036,6 +3036,63 @@ class TestAdvanceMainConflictMarkerGate:
             f'Expected a clean merge to still advance, got {result!r}'
         )
 
+    async def test_advance_main_no_longer_blocks_on_task_dir(
+        self, git_ops: GitOps,
+    ):
+        """W11 ι retires the _assert_no_task_dir tripwire: contamination
+        prevention is now structural (task metadata lives outside the
+        worktree entirely, see TaskArtifacts.meta_root_for), not guard-
+        defended.  A merge commit whose tree carries a `.task/` entry —
+        forced in via RAW git, deliberately bypassing GitOps.commit() so no
+        filtering participates — must still advance normally instead of
+        being refused with result == 'contaminated'.
+        """
+        wt = await git_ops.create_worktree('task-dir-no-longer-blocks')
+        lane = wt.path
+
+        # Force a `.task/` entry into the branch tree with RAW git.
+        task_dir = lane / '.task'
+        task_dir.mkdir(exist_ok=True)
+        (task_dir / 'plan.json').write_text('{}')
+        await _run(['git', 'add', '-A'], cwd=lane)
+        await _run(['git', 'commit', '-m', 'hostile add -A carrying .task/'], cwd=lane)
+
+        # Guard the RED premise: the file really did land in the branch tip
+        # tree (post-θ, nothing scrubs it — this must hold before AND after
+        # this task removes the gate).
+        rc, out, _ = await _run(
+            ['git', 'ls-tree', '-r', '--name-only', 'HEAD'], cwd=lane,
+        )
+        assert rc == 0
+        assert '.task/plan.json' in out, (
+            f'.task/plan.json must be present in the branch tip tree for '
+            f'this test to exercise the gate; tree: {out!r}'
+        )
+
+        merge_result = await git_ops.merge_to_main(lane, 'task-dir-no-longer-blocks')
+        assert merge_result.success
+        assert merge_result.merge_commit is not None
+
+        _, main_before, _ = await _run(
+            ['git', 'rev-parse', 'main'], cwd=git_ops.project_root,
+        )
+
+        result = await git_ops.advance_main(merge_result.merge_commit)
+        if merge_result.merge_worktree:
+            await git_ops.cleanup_merge_worktree(merge_result.merge_worktree)
+
+        assert result.result == 'advanced', (
+            f"Expected 'advanced' now that _assert_no_task_dir is retired, "
+            f"got {result!r}"
+        )
+
+        _, main_after, _ = await _run(
+            ['git', 'rev-parse', 'main'], cwd=git_ops.project_root,
+        )
+        assert main_before.strip() != main_after.strip(), (
+            'main must advance past the .task/-carrying merge commit'
+        )
+
 
 @pytest.mark.asyncio
 class TestUnmergedDetection:
