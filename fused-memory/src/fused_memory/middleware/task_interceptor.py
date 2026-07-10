@@ -975,16 +975,21 @@ class TaskInterceptor:
 
                 if resolved_provenance is not None:
                     try:
-                        # Read-modify-write: preserve memory_hints / files /
-                        # spawned_from instead of replacing the whole blob.
-                        merged_meta = _merged_audit_metadata(
-                            before,
-                            {'done_provenance': resolved_provenance},
-                        )
-                        await tm.update_task(
+                        # done_provenance is a WRITE-AUTHORITY field: update_task
+                        # now UNCONDITIONALLY rejects metadata.done_provenance
+                        # (SqliteTaskBackend floor, task C1). Persist through the
+                        # privileged, non-protocol stamp_audit_metadata seam —
+                        # the sole sanctioned done_provenance writer. The seam
+                        # does its own fresh-read read-modify-write merge under
+                        # the write-lock, preserving every sibling key
+                        # (memory_hints / files / external_deps / reopen_*), so
+                        # we pass only the field being stamped rather than a
+                        # pre-merged blob keyed off the (possibly stale)
+                        # ``before`` snapshot.
+                        await tm.stamp_audit_metadata(  # type: ignore[attr-defined]
                             task_id=task_id,
-                            metadata=json.dumps(merged_meta),
                             project_root=project_root,
+                            fields={'done_provenance': resolved_provenance},
                             tag=tag,
                         )
                     except Exception as e:

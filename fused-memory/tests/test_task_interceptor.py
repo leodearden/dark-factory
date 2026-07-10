@@ -2284,9 +2284,9 @@ async def test_done_provenance_resolves_short_sha_and_persists(
     )
 
     assert 'error' not in result
-    taskmaster.update_task.assert_called_once()
-    kwargs = taskmaster.update_task.call_args.kwargs
-    persisted = json.loads(kwargs['metadata'])
+    taskmaster.stamp_audit_metadata.assert_called_once()
+    kwargs = taskmaster.stamp_audit_metadata.call_args.kwargs
+    persisted = kwargs['fields']
     assert persisted['done_provenance']['kind'] == 'merged'
     assert persisted['done_provenance']['commit'] == sha
     assert persisted['done_provenance']['commit_input'] == sha[:7]
@@ -2312,7 +2312,7 @@ async def test_done_provenance_commit_plus_note_both_persisted(
     )
 
     assert 'error' not in result
-    persisted = json.loads(taskmaster.update_task.call_args.kwargs['metadata'])
+    persisted = taskmaster.stamp_audit_metadata.call_args.kwargs['fields']
     assert persisted['done_provenance']['kind'] == 'merged'
     assert persisted['done_provenance']['commit'] == sha
     assert persisted['done_provenance']['note'] == 'ff-merged after review'
@@ -2613,8 +2613,8 @@ async def test_done_provenance_found_on_main_with_on_main_commit_passes(
     )
 
     assert 'error' not in result
-    taskmaster.update_task.assert_called_once()
-    persisted = json.loads(taskmaster.update_task.call_args.kwargs['metadata'])
+    taskmaster.stamp_audit_metadata.assert_called_once()
+    persisted = taskmaster.stamp_audit_metadata.call_args.kwargs['fields']
     dp = persisted['done_provenance']
     assert dp['kind'] == 'found_on_main'
     assert dp['commit'] == sha
@@ -2643,7 +2643,7 @@ async def test_done_provenance_found_on_main_short_sha_resolved(
     )
 
     assert 'error' not in result
-    persisted = json.loads(taskmaster.update_task.call_args.kwargs['metadata'])
+    persisted = taskmaster.stamp_audit_metadata.call_args.kwargs['fields']
     dp = persisted['done_provenance']
     assert dp['commit'] == sha  # resolved to full SHA
     assert dp['commit_input'] == sha[:7]  # original short ref preserved
@@ -2677,8 +2677,8 @@ async def test_done_provenance_accepts_deterministic_deploy_with_pid(
 
     assert 'error' not in result, f'expected acceptance but got: {result}'
     taskmaster.set_task_status.assert_called_once()
-    taskmaster.update_task.assert_called_once()
-    persisted = json.loads(taskmaster.update_task.call_args.kwargs['metadata'])['done_provenance']
+    taskmaster.stamp_audit_metadata.assert_called_once()
+    persisted = taskmaster.stamp_audit_metadata.call_args.kwargs['fields']['done_provenance']
     assert persisted['kind'] == 'deterministic-deploy'
     assert persisted['pid'] == 4242
     assert persisted['unit'] == 'orchestrator-reify.service'
@@ -2709,8 +2709,8 @@ async def test_done_provenance_accepts_deterministic_deploy_resume_shape(
 
     assert 'error' not in result, f'expected acceptance but got: {result}'
     taskmaster.set_task_status.assert_called_once()
-    taskmaster.update_task.assert_called_once()
-    persisted = json.loads(taskmaster.update_task.call_args.kwargs['metadata'])['done_provenance']
+    taskmaster.stamp_audit_metadata.assert_called_once()
+    persisted = taskmaster.stamp_audit_metadata.call_args.kwargs['fields']['done_provenance']
     assert persisted['kind'] == 'deterministic-deploy'
     assert persisted['note'] == 'resumed after human resolution'
     assert persisted['unit'] == 'orchestrator-reify.service'
@@ -2779,8 +2779,8 @@ async def test_done_provenance_accepts_deterministic_deploy_scheduled(
 
     assert 'error' not in result, f'expected acceptance but got: {result}'
     taskmaster.set_task_status.assert_called_once()
-    taskmaster.update_task.assert_called_once()
-    persisted = json.loads(taskmaster.update_task.call_args.kwargs['metadata'])['done_provenance']
+    taskmaster.stamp_audit_metadata.assert_called_once()
+    persisted = taskmaster.stamp_audit_metadata.call_args.kwargs['fields']['done_provenance']
     assert persisted['kind'] == 'deterministic-deploy-scheduled'
     assert persisted['unit'] == 'orchestrator-dark-factory.service'
     assert persisted['transient_unit'] == 'orch-redeploy-restart-1.service'
@@ -2814,8 +2814,8 @@ async def test_done_provenance_accepts_deterministic_deploy_scheduled_resume_sha
 
     assert 'error' not in result, f'expected acceptance but got: {result}'
     taskmaster.set_task_status.assert_called_once()
-    taskmaster.update_task.assert_called_once()
-    persisted = json.loads(taskmaster.update_task.call_args.kwargs['metadata'])['done_provenance']
+    taskmaster.stamp_audit_metadata.assert_called_once()
+    persisted = taskmaster.stamp_audit_metadata.call_args.kwargs['fields']['done_provenance']
     assert persisted['kind'] == 'deterministic-deploy-scheduled'
     assert persisted['note'] == 'resumed after self-restart scheduled (crash before done write)'
     assert persisted['unit'] == 'orchestrator-dark-factory.service'
@@ -6564,13 +6564,17 @@ async def test_set_task_status_done_with_provenance_preserves_metadata(
     )
 
     assert 'error' not in result
-    taskmaster.update_task.assert_called_once()
-    persisted = json.loads(taskmaster.update_task.call_args.kwargs['metadata'])
+    # done_provenance is persisted through the privileged stamp_audit_metadata
+    # seam (task C1 floor: update_task now rejects metadata.done_provenance).
+    # The interceptor passes ONLY the field being stamped — preservation of
+    # sibling keys (files / memory_hints / …) is the seam's own fresh-read RMW
+    # merge, exercised end-to-end in
+    # test_set_task_status_done_provenance_persists_against_real_backend.
+    taskmaster.update_task.assert_not_called()
+    taskmaster.stamp_audit_metadata.assert_called_once()
+    persisted = taskmaster.stamp_audit_metadata.call_args.kwargs['fields']
     assert persisted['done_provenance']['kind'] == 'merged'
     assert persisted['done_provenance']['commit'] == sha
-    # Prior metadata is preserved.
-    assert persisted['files'] == ['x.py']
-    assert persisted['memory_hints'] == {'queries': ['hint']}
 
 
 # ── task-1184: interceptor_write_succeeded helper contract ──
