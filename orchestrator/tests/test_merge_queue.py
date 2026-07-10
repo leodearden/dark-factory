@@ -15620,13 +15620,17 @@ class TestRebaseDeltaTouchedOverlap:
         await git_ops.cleanup_merge_worktree(wt)
 
     async def test_task_dir_changes_excluded(self, git_ops: GitOps) -> None:
-        """(c) .task/ changes are excluded from both the branch-touched set
-        and the intervening-delta set.
+        """(c) Overlap stays empty even without a .task/ pathspec exclusion.
 
-        The branch adds .task/plan.json and branch_only.py; main adds
-        .task/state.json (via its own commit) and main_only.py.  Only the
-        non-.task/ files appear in the respective sets; the intersection
-        of {branch_only.py} and {main_only.py} is still empty.
+        The `:!.task/` exclusion was removed from
+        `_rebase_delta_touched_overlap` (task 2261 step-8 — .task/ execution
+        metadata now lives outside the git tree entirely, so the exclusion
+        was dead weight). The branch adds .task/plan.json and
+        branch_file.py; main adds .task/state.json (via its own commit) and
+        main_file.py. Both .task/ paths now appear in their respective
+        touched sets, but the intersection is still empty: branch_file.py
+        != main_file.py and .task/plan.json != .task/state.json, so every
+        pair is disjoint.
         """
         from orchestrator.merge_queue import _rebase_delta_touched_overlap
 
