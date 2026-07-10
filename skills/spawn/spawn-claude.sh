@@ -10,7 +10,16 @@
 # Usage:
 #   spawn-claude.sh <cwd> <skip_permissions:true|false> <title|""> <prompt>
 #
-# Emulator discovery order:
+# Backend selection:
+#   $CLAUDE_SPAWN_BACKEND=tmux — bypass terminal-emulator discovery entirely
+#     and launch in a crash-survivable, reattachable tmux window instead
+#     (Fleet Cockpit C6). Per-project session `fleet-<project>` (project from
+#     $CLAUDE_SPAWN_PROJECT, else basename(cwd), else "fleet"), one window
+#     per runner; override the session name via $CLAUDE_SPAWN_TMUX_SESSION.
+#     Reattach with `tmux attach -t <session>`. Requires `tmux` on $PATH —
+#     see exit code 126 below.
+#
+# Emulator discovery order (when $CLAUDE_SPAWN_BACKEND != tmux):
 #   1. $CLAUDE_TERMINAL_CMD             (preferred env override)
 #   2. $ESCALATION_TERMINAL_CMD         (legacy fallback)
 #   3. gnome-terminal / kitty / konsole / xterm in $PATH
@@ -19,7 +28,7 @@
 #
 # Exit codes:
 #   0..125 — claude's own exit code (recovered from sentinel)
-#   126    — no terminal emulator found
+#   126    — no usable launcher (no terminal emulator found / tmux missing in tmux mode)
 #   127    — launcher itself failed (emulator exited before writing the sentinel)
 #   129    — terminal window closed while the session was alive (SIGHUP)
 #   144    — Claude never started within the started-grace window (registry marked failed-to-start)
@@ -474,30 +483,44 @@ resolve_detached() {
 
 # --- emulator selection ----------------------------------------------------
 
-emulator=""
-if [ -n "${CLAUDE_TERMINAL_CMD:-}" ]; then
-  emulator="$CLAUDE_TERMINAL_CMD"
-elif [ -n "${ESCALATION_TERMINAL_CMD:-}" ]; then
-  emulator="$ESCALATION_TERMINAL_CMD"
-  echo "spawn-claude.sh: \$ESCALATION_TERMINAL_CMD is a legacy fallback — please migrate to \$CLAUDE_TERMINAL_CMD" >&2
-elif command -v gnome-terminal >/dev/null 2>&1; then
-  emulator="gnome-terminal"
-elif command -v kitty >/dev/null 2>&1; then
-  emulator="kitty"
-elif command -v konsole >/dev/null 2>&1; then
-  emulator="konsole"
-elif command -v xterm >/dev/null 2>&1; then
-  emulator="xterm"
-elif [ "$(uname)" = "Darwin" ]; then
-  emulator="mac-terminal"
+if [ "${CLAUDE_SPAWN_BACKEND:-}" = "tmux" ]; then
+  # Fleet Cockpit C6: the tmux lane is crash-survivable/reattachable and
+  # needs no terminal emulator at all -- bypass discovery entirely.
+  # first_word drives the case dispatch further down exactly like a
+  # discovered $emulator would. Mirrors the no-emulator exit 126 below:
+  # fail fast, before the watchdog fork, if the one thing this lane
+  # actually needs is missing.
+  if ! command -v tmux >/dev/null 2>&1; then
+    echo "spawn-claude.sh: CLAUDE_SPAWN_BACKEND=tmux but tmux not found — install tmux or unset CLAUDE_SPAWN_BACKEND" >&2
+    exit 126
+  fi
+  first_word="tmux-lane"
 else
-  echo "spawn-claude.sh: no terminal emulator found — set \$CLAUDE_TERMINAL_CMD" >&2
-  exit 126
-fi
+  emulator=""
+  if [ -n "${CLAUDE_TERMINAL_CMD:-}" ]; then
+    emulator="$CLAUDE_TERMINAL_CMD"
+  elif [ -n "${ESCALATION_TERMINAL_CMD:-}" ]; then
+    emulator="$ESCALATION_TERMINAL_CMD"
+    echo "spawn-claude.sh: \$ESCALATION_TERMINAL_CMD is a legacy fallback — please migrate to \$CLAUDE_TERMINAL_CMD" >&2
+  elif command -v gnome-terminal >/dev/null 2>&1; then
+    emulator="gnome-terminal"
+  elif command -v kitty >/dev/null 2>&1; then
+    emulator="kitty"
+  elif command -v konsole >/dev/null 2>&1; then
+    emulator="konsole"
+  elif command -v xterm >/dev/null 2>&1; then
+    emulator="xterm"
+  elif [ "$(uname)" = "Darwin" ]; then
+    emulator="mac-terminal"
+  else
+    echo "spawn-claude.sh: no terminal emulator found — set \$CLAUDE_TERMINAL_CMD" >&2
+    exit 126
+  fi
 
-# Dispatch by the first word of $emulator so $CLAUDE_TERMINAL_CMD="gnome-terminal --foo"
-# still hits the gnome-terminal branch.
-first_word="${emulator%% *}"
+  # Dispatch by the first word of $emulator so $CLAUDE_TERMINAL_CMD="gnome-terminal --foo"
+  # still hits the gnome-terminal branch.
+  first_word="${emulator%% *}"
+fi
 
 # _cleanup + trap installed earlier (right after the mktemp calls near the
 # top of the script), so spawn_ref can never leak -- including on the
@@ -553,6 +576,49 @@ case "$first_word" in
       finish_failed_to_start
     fi
     finish
+    ;;
+  tmux-lane)
+    # Fleet Cockpit C6: crash-survivable, reattachable tmux lane. A window
+    # created via `tmux new-window`/`new-session` is owned by the tmux
+    # server, not this script -- it outlives spawn-claude.sh (and the
+    # launching claude session), can be reattached with
+    # `tmux attach -t $tmux_session`, and the on-disk session-registry
+    # record persists independently. `-P -F` prints the exact
+    # "<session>:<window>" target on stdout, captured below.
+    # `new-window`/`new-session` return immediately while the tmux server
+    # owns the payload -- DETACHED semantics, so resolve_detached already
+    # delivers the right sentinel/exit/failed-to-start lifecycle, identical
+    # to the konsole/custom branches above.
+    tmux_project="${CLAUDE_SPAWN_PROJECT:-}"
+    if [ -z "$tmux_project" ]; then
+      tmux_project="$(basename "${cwd%/}")"
+    fi
+    [ -z "$tmux_project" ] && tmux_project="fleet"
+    tmux_session="${CLAUDE_SPAWN_TMUX_SESSION:-fleet-$tmux_project}"
+    win_name="$title"
+    [ -z "$win_name" ] && win_name="${CLAUDE_SPAWN_ROLE:-session}"
+    if tmux has-session -t "$tmux_session" 2>/dev/null; then
+      tmux_target=$(tmux new-window -t "$tmux_session" -n "$win_name" -P -F '#{session_name}:#{window_index}' bash -c "$inner")
+    else
+      tmux_target=$(tmux new-session -d -s "$tmux_session" -n "$win_name" -P -F '#{session_name}:#{window_index}' bash -c "$inner")
+    fi
+    launch_rc=$?
+    # Stamp the display best-effort once the window actually exists.
+    # Purely additive/fail-soft (mirrors the launching/exit registry calls
+    # above): must never alter launch_rc or this script's exit-code
+    # contract, so faults are swallowed with `|| true` exactly like those
+    # calls. Depends on step-2's `set-display` CLI verb.
+    if [ "$launch_rc" -eq 0 ] && [ -n "$SESSION_RECORD_DIR" ] && command -v python3 >/dev/null 2>&1; then
+      if [ -n "$tmux_target" ]; then
+        python3 "$SESSION_REGISTRY_PY" set-display --record "$SESSION_RECORD_DIR" --kind tmux --tmux-target "$tmux_target" --wm-title "$win_name" || true
+      else
+        # `-P -F` returned no output despite launch_rc==0 (unexpected on
+        # supported tmux versions). Skip the stamp rather than persist an
+        # empty tmux_target, which would leave the record unreattachable.
+        echo "spawn-claude.sh: warning: tmux reported no window target — skipping display stamp" >&2
+      fi
+    fi
+    resolve_detached "$launch_rc"
     ;;
   *)
     # User-supplied launcher via $CLAUDE_TERMINAL_CMD. Assume `<cmd> -- bash -c '<payload>'`

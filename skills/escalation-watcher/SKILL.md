@@ -24,6 +24,15 @@ Before starting, verify these are in place. If anything is missing, ask the user
 
 Terminal discovery for spawned `/unblock` sessions is handled lazily by the `/spawn` skill — no setup is required here.
 
+## Launching this watcher (default lane: tmux)
+
+This is a long-running loop session (PRD `plans/fleet-cockpit-prd.md` §3 fork 1) — launch it in
+the crash-survivable, reattachable **tmux lane** by default: spawn with `CLAUDE_SPAWN_BACKEND=tmux`
+(see `skills/spawn/spawn-claude.sh`'s header) so the session gets a `display.kind=tmux`
+session-registry record and a `tmux attach`-reattachable window whose record persists across a
+crash. Interactive one-off skills this watcher spawns (e.g. `/unblock` sessions) stay as ordinary
+WM terminal windows, unchanged.
+
 ## Claiming the Watcher Lease (single-owner-per-role)
 
 **Before entering the Main Loop for the first time**, claim the `watcher-<project>` lease (Attention

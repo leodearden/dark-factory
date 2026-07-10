@@ -881,6 +881,54 @@ def test_main_refresh_sets_status(
     assert record.status == sr.Status.RUNNING
 
 
+def test_main_set_display_stamps_and_is_preserved(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Fleet Cockpit C6: the `set-display` verb stamps display post-hoc (the
+    tmux target is only known after `tmux new-window` runs, well after
+    `launching` allocated the record), and a later `exit` read-modify-write
+    must preserve it (both re-read the whole record and re-write it).
+    """
+    _set_env(monkeypatch, _launching_env(tmp_path))
+    sr.main(['launching'])
+    record_dir = capsys.readouterr().out.strip()
+
+    rc = sr.main(
+        [
+            'set-display',
+            '--record',
+            record_dir,
+            '--kind',
+            'tmux',
+            '--tmux-target',
+            'fleet-df:2',
+            '--wm-title',
+            'watcher:df#2085',
+        ]
+    )
+
+    assert rc == 0
+    slug = sr.build_session_slug('unblock', 'df', '2085', 4242)
+    record = sr.read_record(slug, root=tmp_path)
+    assert record.display is not None
+    assert record.display.kind == 'tmux'
+    assert record.display.tmux_target == 'fleet-df:2'
+    assert record.display.wm_title == 'watcher:df#2085'
+    assert record.status == sr.Status.LAUNCHING
+    assert record.session_slug == slug
+
+    rc = sr.main(['exit', '--record', record_dir, '--code', '0'])
+
+    assert rc == 0
+    exited_record = sr.read_record(slug, root=tmp_path)
+    assert exited_record.status == sr.Status.EXITED
+    assert exited_record.display is not None
+    assert exited_record.display.kind == 'tmux'
+    assert exited_record.display.tmux_target == 'fleet-df:2'
+
+
 # --- identity fallback (parse_spawn_identity) -------------------------------
 
 
