@@ -18,6 +18,7 @@ from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+from _orch_helpers import wire_scheduler_liveness_mock
 from escalation.queue import EscalationQueue
 
 from orchestrator.config import GitConfig, OrchestratorConfig, VerifyRunnerConfig
@@ -35,7 +36,15 @@ def _build_harness(config: OrchestratorConfig) -> Harness:
     with patch('orchestrator.harness.McpLifecycle'), \
          patch('orchestrator.harness.Scheduler'), \
          patch('orchestrator.harness.BriefingAssembler'):
-        return Harness(config)
+        harness = Harness(config)
+    # `Scheduler` is patched to a bare MagicMock; wire real (non-auto-mock)
+    # liveness-accessor behaviour (task 2235: harness.py now calls
+    # scheduler.is_dispatched()/.is_actively_held()/.workflow_cancel_recent()
+    # instead of reaching into _dispatched/lock_table._held directly) so
+    # tests below that set harness.scheduler._dispatched (or .lock_table)
+    # exercise real semantics instead of an auto-mocked (always-truthy) stub.
+    wire_scheduler_liveness_mock(harness.scheduler)
+    return harness
 
 
 def _make_config(

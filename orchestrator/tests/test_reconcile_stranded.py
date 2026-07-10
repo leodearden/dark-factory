@@ -12,7 +12,7 @@ from pathlib import Path
 from unittest.mock import ANY, AsyncMock, MagicMock, patch
 
 import pytest
-from _orch_helpers import pydantic_spec
+from _orch_helpers import mock_lock_table, pydantic_spec, wire_scheduler_liveness_mock
 from escalation.models import Escalation
 from escalation.queue import EscalationQueue
 
@@ -92,6 +92,13 @@ def harness(tmp_path: Path, mock_orch_config):
 
     # Replace scheduler with async mocks
     h.scheduler = MagicMock()
+    # Wire real (non-auto-mock) liveness-accessor behaviour (task 2235:
+    # harness.py now calls scheduler.is_dispatched/.is_actively_held/
+    # .workflow_cancel_recent/.note_workflow_cancelled/.clear_workflow_cancel
+    # instead of reaching into _dispatched/lock_table._held/_workflow_cancel_at
+    # directly) so the mid-run sweep and stranded-blocked gate tests below
+    # exercise real semantics instead of an auto-mocked (always-truthy) stub.
+    wire_scheduler_liveness_mock(h.scheduler)
     h.scheduler.get_tasks = AsyncMock(return_value=[])
     h.scheduler.get_statuses = AsyncMock(return_value=({}, None))
     h.scheduler.set_task_status = AsyncMock()
@@ -2241,8 +2248,7 @@ async def test_mid_run_skips_dispatched_tasks(harness: Harness):
     # Replace the scheduler MagicMock attrs with real containers so the
     # mid-run guard can inspect membership.
     harness.scheduler._dispatched = {'40'}  # type: ignore[attr-defined]
-    harness.scheduler.lock_table = MagicMock()  # type: ignore[attr-defined]
-    harness.scheduler.lock_table._held = {}  # type: ignore[attr-defined]
+    harness.scheduler.lock_table = mock_lock_table()  # type: ignore[attr-defined]
 
     harness.scheduler.get_statuses.return_value = (  # type: ignore[attr-defined]
         {'40': 'in-progress'}, None,
@@ -2259,8 +2265,7 @@ async def test_mid_run_skips_dispatched_tasks(harness: Harness):
 async def test_mid_run_skips_lock_held_tasks(harness: Harness):
     """Task with active lock_table membership is not stranded — left untouched."""
     harness.scheduler._dispatched = set()  # type: ignore[attr-defined]
-    harness.scheduler.lock_table = MagicMock()  # type: ignore[attr-defined]
-    harness.scheduler.lock_table._held = {'41': {'mod_a'}}  # type: ignore[attr-defined]
+    harness.scheduler.lock_table = mock_lock_table({'41': {'mod_a'}})  # type: ignore[attr-defined]
 
     harness.scheduler.get_statuses.return_value = (  # type: ignore[attr-defined]
         {'41': 'in-progress'}, None,
@@ -2276,8 +2281,7 @@ async def test_mid_run_skips_lock_held_tasks(harness: Harness):
 async def test_mid_run_reverts_genuine_strand(harness: Harness):
     """Task NOT in _dispatched / _held but in-progress → genuinely stranded."""
     harness.scheduler._dispatched = set()  # type: ignore[attr-defined]
-    harness.scheduler.lock_table = MagicMock()  # type: ignore[attr-defined]
-    harness.scheduler.lock_table._held = {}  # type: ignore[attr-defined]
+    harness.scheduler.lock_table = mock_lock_table()  # type: ignore[attr-defined]
 
     harness.scheduler.get_statuses.return_value = (  # type: ignore[attr-defined]
         {'42': 'in-progress'}, None,
@@ -2293,8 +2297,7 @@ async def test_mid_run_reverts_genuine_strand(harness: Harness):
 async def test_returns_change_count(harness: Harness):
     """Reconcile returns int count (revert + marked-done) for main-loop hook."""
     harness.scheduler._dispatched = set()  # type: ignore[attr-defined]
-    harness.scheduler.lock_table = MagicMock()  # type: ignore[attr-defined]
-    harness.scheduler.lock_table._held = {}  # type: ignore[attr-defined]
+    harness.scheduler.lock_table = mock_lock_table()  # type: ignore[attr-defined]
 
     # No in-progress tasks → nothing to do.
     harness.scheduler.get_statuses.return_value = ({'10': 'pending'}, None)  # type: ignore[attr-defined]
@@ -2834,8 +2837,7 @@ async def test_mid_run_alive_owner_pid_not_in_dispatch_recovers(
     because harness.pid (this PID) is alive throughout the run.
     """
     harness.scheduler._dispatched = set()  # type: ignore[attr-defined]
-    harness.scheduler.lock_table = MagicMock()  # type: ignore[attr-defined]
-    harness.scheduler.lock_table._held = {}  # type: ignore[attr-defined]
+    harness.scheduler.lock_table = mock_lock_table()  # type: ignore[attr-defined]
 
     harness.scheduler.get_statuses.return_value = (  # type: ignore[attr-defined]
         {'400': 'in-progress'}, None,
@@ -2888,8 +2890,7 @@ async def test_mid_run_cancel_window_grace(harness: Harness, tmp_path: Path):
     Outside the window the sweep proceeds.
     """
     harness.scheduler._dispatched = set()  # type: ignore[attr-defined]
-    harness.scheduler.lock_table = MagicMock()  # type: ignore[attr-defined]
-    harness.scheduler.lock_table._held = {}  # type: ignore[attr-defined]
+    harness.scheduler.lock_table = mock_lock_table()  # type: ignore[attr-defined]
 
     harness.scheduler.get_statuses.return_value = (  # type: ignore[attr-defined]
         {'500': 'in-progress'}, None,
@@ -2905,7 +2906,7 @@ async def test_mid_run_cancel_window_grace(harness: Harness, tmp_path: Path):
 
     # Stamp cancel-time well in the past → proceed.
     harness._workflow_cancel_at['500'] = (
-        _time.monotonic() - harness._RECONCILE_CANCEL_GRACE_S - 1
+        _time.monotonic() - harness.scheduler._RECONCILE_CANCEL_GRACE_S - 1
     )
     changed = await harness._reconcile_stranded_in_progress(mid_run=True)
     # Task has no worktree → orphan revert.

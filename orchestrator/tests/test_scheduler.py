@@ -6906,6 +6906,7 @@ class TestMilestoneEligibilityGate:
 
         config = OrchestratorConfig(max_per_module=1)
         scheduler = Scheduler(config, wall_time_source=lambda: fake_now[0])
+        scheduler.finish_startup()
 
         mock = AsyncMock(return_value=task_response)
         monkeypatch.setattr('orchestrator.scheduler.mcp_call', mock)
@@ -7178,6 +7179,7 @@ class TestMilestoneSweepDrivenByAcquireNext:
 
         config = OrchestratorConfig(max_per_module=1)
         scheduler = Scheduler(config, wall_time_source=lambda: self.FIXED_DT)
+        scheduler.finish_startup()
         scheduler.update_task = AsyncMock(return_value=True)
 
         monkeypatch.setattr(
@@ -7224,6 +7226,7 @@ class TestMilestoneSweepDrivenByAcquireNext:
 
         config = OrchestratorConfig(max_per_module=1)
         scheduler = Scheduler(config, wall_time_source=lambda: self.FIXED_DT)
+        scheduler.finish_startup()
         scheduler.update_task = AsyncMock(return_value=True)
 
         monkeypatch.setattr(
