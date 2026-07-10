@@ -1204,6 +1204,39 @@ class TestScopeModuleConfigReturnsNone:
         assert '--directory orchestrator' not in (result.type_check_command or '')
 
 
+class TestScopeModuleConfigOpaqueCommand:
+    """An unparseable/OPAQUE lint_command flows through UNSCOPED, not mangled.
+
+    Historical bug: the old string-surgery scoper (_scope_command) did a raw
+    substring search + prefix slice regardless of whether the result was
+    valid shell syntax, so a config command shlex can't even split got
+    silently mangled into an equally- (or more-) broken argv, with the
+    caller's scoped files blindly appended to the wreckage. The new model
+    classifies an unparseable prefix OPAQUE (P1) and leaves the ORIGINAL
+    command untouched — argv-equivalent to the raw input, no stranded
+    scoped-file tokens appended to a broken string.
+    """
+
+    #: Unbalanced quote (the `"` before `shared` never closes) makes this
+    #: unparseable by shlex — realistic as a typo'd `--directory` value.
+    _UNPARSEABLE_LINT_CMD = 'uv run --directory "shared ruff check src/'
+
+    def test_unparseable_lint_command_left_untouched(self):
+        mc = ModuleConfig(prefix='shared', lint_command=self._UNPARSEABLE_LINT_CMD)
+        result = scope_module_config(mc, ['shared/src/y.py'])
+        assert result is not None
+        assert result.lint_command == self._UNPARSEABLE_LINT_CMD, (
+            f'expected untouched passthrough, got {result.lint_command!r}'
+        )
+
+    def test_unrecognised_head_type_command_left_untouched(self):
+        """A type_check_command using an unrecognised tool (no 'pyright' keyword) is untouched."""
+        mc = ModuleConfig(prefix='shared', type_check_command='uv run --extra dev mypy src/')
+        result = scope_module_config(mc, ['shared/src/y.py'])
+        assert result is not None
+        assert result.type_check_command == 'uv run --extra dev mypy src/'
+
+
 class TestScopeModuleConfigDataModuleFallback:
     """scope_module_config falls back to the full suite for non-test data modules under tests/.
 
@@ -4426,6 +4459,22 @@ class TestBuildFallbackConfigWithNonDefaultCommands:
         result = _build_fallback_config(['tests/unit/test_foo.py'], cfg)
         assert result is not None
         assert result.type_check_command == 'uv run --extra dev mypy src/my_pkg'
+
+    def test_unparseable_lint_command_left_untouched(self, tmp_path: Path) -> None:
+        """An unparseable (shlex-unsplittable) lint_command flows through UNSCOPED.
+
+        Historical bug: the old string-surgery scoper (_scope_command) sliced
+        a prefix and appended the touched files regardless of whether the
+        result was valid shell syntax — a config command shlex can't even
+        split got silently mangled further. The new model classifies an
+        unparseable prefix OPAQUE (P1) and leaves the ORIGINAL command
+        untouched rather than truncating/appending to it.
+        """
+        broken = 'uv run --directory "shared ruff check src/'
+        cfg = self._make_config(tmp_path, lint_command=broken, test_command="uv run --extra dev pytest")
+        result = _build_fallback_config(['tests/unit/test_foo.py'], cfg)
+        assert result is not None
+        assert result.lint_command == broken, f'expected untouched passthrough, got {result.lint_command!r}'
 
     def test_no_test_command_when_no_test_files(self, tmp_path: Path) -> None:
         """Non-default test_command is suppressed when no test files changed."""

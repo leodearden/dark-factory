@@ -152,6 +152,32 @@ class TestParseConfigCommandUvWrapper:
         cmd = parse_config_command('pytest tests/x.py')
         assert cmd.uv_project is None
 
+    def test_uv_run_with_project_and_directory_sets_both(self):
+        """--project and --directory can both appear on one `uv run` wrapper.
+
+        Real per-subproject commands (orchestrator.yaml) carry both flags
+        together, e.g. `uv run --project orchestrator --directory
+        orchestrator pyright src/ tests/` — --project selects the venv,
+        --directory shifts cwd. Both must be captured, not just the first
+        one peeled.
+        """
+        cmd = parse_config_command(
+            'uv run --project orchestrator --directory orchestrator pyright src/ tests/'
+        )
+        assert cmd.tool is ToolKind.PYRIGHT
+        assert cmd.uv_project == 'orchestrator'
+        assert cmd.cwd_rel == 'orchestrator'
+        assert cmd.targets == ('src/', 'tests/')
+
+    def test_uv_run_with_directory_and_project_reversed_order_sets_both(self):
+        """The two flags are also recognised in the opposite order."""
+        cmd = parse_config_command(
+            'uv run --directory orchestrator --project orchestrator pyright src/'
+        )
+        assert cmd.uv_project == 'orchestrator'
+        assert cmd.cwd_rel == 'orchestrator'
+        assert cmd.targets == ('src/',)
+
 
 class TestParseConfigCommandLeadingCd:
     """parse_config_command recognises a leading `cd <dir> &&` segment."""
