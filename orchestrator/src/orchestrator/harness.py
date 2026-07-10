@@ -9273,6 +9273,11 @@ Output JSON matching the schema. Every task must appear in the output.
         _resume_target = (
             _resume_effect.target_status if _resume_effect is not None else 'pending'
         )  # 'pending' today; defensive fallback only, 'resume' is always in the table
+        # TaskEffect.target_status is typed `str | None` (None encodes
+        # close_only's no-op); 'resume' always maps to a str in ACTION_EFFECTS,
+        # the same invariant _on_escalation_resolved asserts above for its
+        # restart/park/abandon branch.
+        assert _resume_target is not None
         try:
             await self.scheduler.set_task_status(task_id, _resume_target)
             logger.info(
