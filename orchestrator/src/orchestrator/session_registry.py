@@ -465,16 +465,17 @@ class CorruptSessionRecord(Exception):
     """Raised by read_record when a record.json exists but fails to parse."""
 
 
-def write_record(record: SessionRecord, root: Path | str | None = None) -> None:
-    """Atomically write *record* (tmp file in the same dir, then os.replace).
+def _atomic_write_text(path: Path, text: str) -> None:
+    """Atomically write *text* to *path* (tmp file in the same dir, then os.replace).
 
     Mirrors ``LaneStore._write`` (lane_lifecycle.py:279-298): the tmp file is
     created in the target's own parent dir so the replace stays within one
-    filesystem, and is cleaned up on any failure. Every successful write
-    bumps record.json's mtime, which reap_stale_records() reads as this
-    record's heartbeat.
+    filesystem, and is cleaned up on any failure. Shared atomic-write core:
+    write_record calls this and lets a failure propagate (its sole caller,
+    the CLI main(), provides the outer fail-soft boundary); write_decision
+    calls this too but swallows a failure itself (it is called directly by
+    watchers/cockpit code with no such boundary).
     """
-    path = record_path_for_slug(record.session_slug, root=root)
     path.parent.mkdir(parents=True, exist_ok=True)
     fd, tmp_path_str = tempfile.mkstemp(
         suffix='.tmp',
@@ -483,12 +484,22 @@ def write_record(record: SessionRecord, root: Path | str | None = None) -> None:
     )
     try:
         with os.fdopen(fd, 'w') as f:
-            f.write(record.to_json())
+            f.write(text)
         os.replace(tmp_path_str, str(path))
     except Exception:
         with contextlib.suppress(OSError):
             os.unlink(tmp_path_str)
         raise
+
+
+def write_record(record: SessionRecord, root: Path | str | None = None) -> None:
+    """Atomically write *record* (tmp file in the same dir, then os.replace).
+
+    Every successful write bumps record.json's mtime, which
+    reap_stale_records() reads as this record's heartbeat.
+    """
+    path = record_path_for_slug(record.session_slug, root=root)
+    _atomic_write_text(path, record.to_json())
 
 
 def read_record(slug: str, root: Path | str | None = None) -> SessionRecord:
@@ -565,6 +576,91 @@ def refresh_record(
     if status is not None:
         record.status = status
     write_record(record, root=root)
+    return record
+
+
+def write_decision(record: DecisionRecord, root: Path | str | None = None) -> bool:
+    """Atomically write *record* to its own ``<decisions_dir>/<id>.json`` file.
+
+    Self-guarding FAIL-SOFT: unlike write_record (whose sole caller, the CLI
+    main(), supplies its own outer try/except), this is called directly by
+    C8 watchers and the C5 cockpit, so a write fault must log and return
+    rather than raise into them. Returns True on success, False on any
+    fault.
+    """
+    path = decision_path_for_id(record.id, root=root)
+    try:
+        _atomic_write_text(path, record.to_json())
+    except Exception:
+        logger.error('write_decision: failed to write %s', path, exc_info=True)
+        return False
+    return True
+
+
+def list_decisions(root: Path | str | None = None) -> list[DecisionRecord]:
+    """Read every decision under decisions_dir. Missing dir -> [] (no raise).
+
+    A single corrupt or foreign ``*.json`` file is skipped (logged at ERROR)
+    rather than aborting the whole read -- mirrors reap_stale_records'
+    corrupt-body handling, so one bad file never breaks the cockpit's
+    whole-queue read.
+    """
+    base = decisions_dir(root)
+    if not base.is_dir():
+        return []
+    decisions: list[DecisionRecord] = []
+    for path in sorted(base.glob('*.json')):
+        try:
+            decisions.append(DecisionRecord.from_json(path.read_text()))
+        except (OSError, json.JSONDecodeError, KeyError, TypeError, ValueError):
+            logger.error('list_decisions: skipping unreadable %s', path, exc_info=True)
+            continue
+    return decisions
+
+
+def update_decision_state(
+    decision_id: str,
+    state: str,
+    root: Path | str | None = None,
+) -> DecisionRecord | None:
+    """Read-modify-write *decision_id*'s state field.
+
+    Self-guarding FAIL-SOFT: returns None (logs ERROR) on any fault -- a
+    missing file, a corrupt body, or a write failure -- rather than raising,
+    matching write_decision's contract for its direct C8/cockpit callers.
+    """
+    path = decision_path_for_id(decision_id, root=root)
+    try:
+        record = DecisionRecord.from_json(path.read_text())
+    except (OSError, json.JSONDecodeError, KeyError, TypeError, ValueError):
+        logger.error('update_decision_state: failed to read %s', path, exc_info=True)
+        return None
+    record.state = state
+    if not write_decision(record, root=root):
+        return None
+    return record
+
+
+def set_manual_boost(
+    decision_id: str,
+    boost: int,
+    root: Path | str | None = None,
+) -> DecisionRecord | None:
+    """Read-modify-write *decision_id*'s manual_boost field.
+
+    Self-guarding FAIL-SOFT: returns None (logs ERROR) on any fault -- a
+    missing file, a corrupt body, or a write failure -- rather than raising,
+    matching write_decision's contract for its direct C8/cockpit callers.
+    """
+    path = decision_path_for_id(decision_id, root=root)
+    try:
+        record = DecisionRecord.from_json(path.read_text())
+    except (OSError, json.JSONDecodeError, KeyError, TypeError, ValueError):
+        logger.error('set_manual_boost: failed to read %s', path, exc_info=True)
+        return None
+    record.manual_boost = boost
+    if not write_decision(record, root=root):
+        return None
     return record
 
 
