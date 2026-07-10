@@ -3060,6 +3060,75 @@ class Scheduler:
             )
             return True
 
+    async def _stamp_milestone_deps_satisfied(
+        self,
+        tasks: list[dict],
+        status_map: dict[str, str],
+        tasks_by_id: dict[str, dict] | None = None,
+        *,
+        external_status_cache: dict[str, str] | None = None,
+        external_resolver_failed: bool = False,
+    ) -> None:
+        """Per-tick sweep: stamp the frozen-once ``milestone_deps_satisfied_at``
+        wall-clock anchor for pending 'delayed' milestone tasks (task 2335 β).
+
+        Mirrors :meth:`_gc_expired_cooldowns` — a side-effecting per-tick sweep
+        called once from :meth:`acquire_next` so that :meth:`_milestone_time_gated`
+        / :meth:`_eligible_for_dispatch` remain pure, side-effect-free predicates.
+
+        For every task with ``status == 'pending'`` and a dict
+        ``metadata.milestone`` whose ``mode == 'delayed'`` that does NOT
+        already carry a truthy ``metadata.milestone_deps_satisfied_at``: if
+        :meth:`_deps_satisfied` holds — forwarding *external_status_cache* /
+        *external_resolver_failed* so the anchor reflects the SAME complete
+        local+external dependency evaluation dispatch uses (PRD § 2 gap 2) —
+        stamp ``self._wall_now().isoformat()`` via
+        ``update_task(..., metadata_mode='merge')`` so sibling metadata keys
+        are preserved.
+
+        Frozen-once: a task that already has the anchor is never revisited.
+        Persists only via ``update_task`` — the in-tick *tasks* / *tasks_by_id*
+        snapshot is never mutated, so the anchor only becomes visible on the
+        next tick's ``get_tasks``. This is safe because a delayed milestone
+        with ``after_secs > 0`` can never fire the same tick its anchor is
+        stamped (:meth:`_milestone_time_gated` would still return ``True``
+        for ``now_wall < anchor + after_secs``).
+
+        Defensive: each task's stamp attempt is wrapped so a single failure
+        (a malformed milestone, an ``update_task`` exception) never aborts
+        the sweep for the remaining tasks.
+        """
+        for task in tasks:
+            try:
+                if task.get('status') != 'pending':
+                    continue
+                metadata = task.get('metadata') or {}
+                milestone = metadata.get('milestone')
+                if not isinstance(milestone, dict) or milestone.get('mode') != 'delayed':
+                    continue
+                if metadata.get('milestone_deps_satisfied_at'):
+                    continue
+                tid = str(task.get('id', ''))
+                if not tid:
+                    continue
+                if not self._deps_satisfied(
+                    task, status_map, tasks_by_id,
+                    external_status_cache=external_status_cache,
+                    external_resolver_failed=external_resolver_failed,
+                ):
+                    continue
+                await self.update_task(
+                    tid,
+                    {'milestone_deps_satisfied_at': self._wall_now().isoformat()},
+                    metadata_mode='merge',
+                )
+            except Exception:
+                logger.warning(
+                    'Task %s: milestone deps-satisfied stamp sweep failed',
+                    task.get('id', '?'),
+                    exc_info=True,
+                )
+
     def _eligible_for_dispatch(
         self,
         task: dict,
