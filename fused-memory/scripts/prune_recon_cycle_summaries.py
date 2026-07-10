@@ -57,10 +57,14 @@ Usage
   # Keep more than the default 2 most-recent summaries per project x pool.
   python scripts/prune_recon_cycle_summaries.py --apply --keep-recent 5
 
-  # Override the per-project scan limit (safety cap).
+  # Widen the scan window (a project has more than the default 10000
+  # cycle-summary points) -- this raises the scan only, not the deletion cap.
+  python scripts/prune_recon_cycle_summaries.py --apply --scan-limit 20000
+
+  # Override the per-project deletion safety cap (irreversible-delete guard).
   python scripts/prune_recon_cycle_summaries.py --apply --limit-per-project 2000
 
-  # Bypass the safety cap (required when a project has > limit entries).
+  # Bypass the safety cap (required when a project has > limit deletions).
   python scripts/prune_recon_cycle_summaries.py --apply --yes-i-am-sure
 """
 
@@ -774,12 +778,13 @@ async def run(
     return report
 
 
-def main() -> int:
-    """CLI entry point."""
-    logging.basicConfig(
-        level=logging.INFO, format='%(asctime)s %(levelname)s %(message)s',
-    )
+def build_parser() -> argparse.ArgumentParser:
+    """Construct the CLI argument parser for this script.
 
+    Extracted from ``main()`` so tests can assert flag defaults and the
+    independence of ``--scan-limit`` from ``--limit-per-project`` without
+    invoking the live ``main()`` entry point.
+    """
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
         '--apply', action='store_true',
@@ -795,14 +800,31 @@ def main() -> int:
              '(default: 2)',
     )
     parser.add_argument(
+        '--scan-limit', dest='scan_limit', type=int, default=_DEFAULT_SCAN_LIMIT,
+        help='Per-project Mem0 scan window: max cycle-summary points enumerated '
+             'via the metadata-filtered scroll (default: 10000). Decoupled from '
+             'the deletion safety cap.',
+    )
+    parser.add_argument(
         '--limit-per-project', dest='limit_per_project', type=int, default=1000,
-        help='Per-project Mem0 scan limit, and safety cap on deletable count '
-             'before aborting (default: 1000)',
+        help='Safety cap on the per-project classified deletable count before '
+             'aborting (default: 1000). Irreversible-deletion guard only -- '
+             'does not affect the scan window (see --scan-limit).',
     )
     parser.add_argument(
         '--yes-i-am-sure', dest='yes_i_am_sure', action='store_true',
         help='Override the per-project deletable-count safety cap',
     )
+    return parser
+
+
+def main() -> int:
+    """CLI entry point."""
+    logging.basicConfig(
+        level=logging.INFO, format='%(asctime)s %(levelname)s %(message)s',
+    )
+
+    parser = build_parser()
     args = parser.parse_args()
 
     async def _run_live() -> int:
