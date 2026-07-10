@@ -20,7 +20,6 @@ from __future__ import annotations
 
 from fused_memory.middleware import recon_write_policy
 
-
 # ---------------------------------------------------------------------------
 # Verdict dataclass
 # ---------------------------------------------------------------------------
