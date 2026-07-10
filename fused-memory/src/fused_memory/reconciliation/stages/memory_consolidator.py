@@ -16,7 +16,6 @@ from fused_memory.models.reconciliation import (
 )
 from fused_memory.reconciliation.cli_stage_runner import (
     STAGE1_DISALLOWED,
-    build_summary_nonce_section,
 )
 from fused_memory.reconciliation.degenerate_task_node_sweep import (
     extract_terminal_task_ids,
@@ -47,9 +46,7 @@ from fused_memory.reconciliation.stages.task_knowledge_sync import (
     _render_live_workflow_section,
 )
 from fused_memory.reconciliation.summary_pool import (
-    pretrim_summary_pool,
-    reconstruct_cycle_summary_stub,
-    verify_cycle_summary_written,
+    write_cycle_summary,
 )
 from fused_memory.reconciliation.task_filter import (
     FilteredTaskTree,
@@ -60,22 +57,15 @@ from fused_memory.reconciliation.task_filter import (
 
 logger = logging.getLogger(__name__)
 
-# Stage 1 per-cycle summary pool cap and related constants (task 1942).
-# Mirrors Stage 2's cycle-summary pool cap (task 1657 + trim-then-write, task
-# 1831): every per-cycle summary add_memory call is tagged
-# recon_pool='stage1_cycle_summary' (producer contract: Stage 1 prompt) —
-# _STAGE1_CYCLE_SUMMARY_RECON_POOL is imported above from the shared leaf
-# module recon_pool_map.py (task 2140), not redefined here.
-# MemoryConsolidator.run() pre-trims the pool to cap-1 BEFORE the agent write
-# via the shared reconciliation.summary_pool core.
+# Stage 1 per-cycle summary pool cap and related constants.
+# The deterministic Mem0 mirror write (write_cycle_summary, task 2229) tags
+# recon_pool='stage1_cycle_summary' — _STAGE1_CYCLE_SUMMARY_RECON_POOL is
+# imported above from the shared leaf module recon_pool_map.py (task 2140),
+# not redefined here. After each write, write_cycle_summary's internal
+# enforce_summary_pool_cap call trims the pool to at most this many members by
+# deleting the OLDEST entries — deterministically via Qdrant scroll, NOT semantic search.
 STAGE1_CYCLE_SUMMARY_POOL_CAP: int = 2
 _STAGE1_CYCLE_SUMMARY_TRIM_SOURCE = 'stage1_cycle_summary_trim'
-
-# Audit tag for reconstruct_cycle_summary_stub's deterministic fallback-stub
-# write, invoked from run() when verify_cycle_summary_written CONFIRMS (count
-# == 0) that the LLM session exited without writing its per-cycle summary
-# (task 2366). Mirrors Stage 2's _STAGE2_SUMMARY_RECONSTRUCTION_SOURCE.
-_STAGE1_CYCLE_SUMMARY_RECONSTRUCTION_SOURCE = 'stage1_summary_reconstruction'
 
 
 class MemoryConsolidator(BaseStage):
@@ -143,23 +133,11 @@ class MemoryConsolidator(BaseStage):
         point of a remediation pass is to re-emit a curated list, and running
         dedup on those flags would defeat the remediation contract.
         """
-        # --- trim-then-write: pre-trim pool to cap-1 BEFORE agent writes (task 1942) ---
-        # Mirrors Stage 2's task-1831 wiring. Runs unconditionally (full +
-        # remediation) so the pool is bounded every cycle. Best-effort.
-        pretrimmed = await pretrim_summary_pool(
-            self.memory,
-            self.project_id,
-            run_id,
-            recon_pool=_STAGE1_CYCLE_SUMMARY_RECON_POOL,
-            trim_source=_STAGE1_CYCLE_SUMMARY_TRIM_SOURCE,
-            cap=STAGE1_CYCLE_SUMMARY_POOL_CAP,
-        )
         report = await super().run(events, watermark, prior_reports, run_id, model=model)
         report.stats['entity_summary_snapshot_lines_stripped'] = (
             self._entity_summary_snapshot_lines_stripped
         )
         report.stats['stage1_fetch_degraded'] = self._fetch_degraded_sources or []
-        report.stats['stage1_cycle_summary_pool_trimmed'] = pretrimmed
 
         # Always present (task-2312): set BEFORE the remediation early-return below
         # so downstream consumers see this key on every run, including remediation
@@ -167,18 +145,6 @@ class MemoryConsolidator(BaseStage):
         # below). Overwritten after dedup_flags on a full (non-remediation) run with
         # items_flagged; stays 0 otherwise.
         report.stats['stage1_completion_markers_self_deleted'] = 0
-
-        # Always present (task-2366): set BEFORE the remediation early-return below so
-        # downstream consumers see these keys on every run, including remediation passes
-        # (which never reach the full-cycle self-heal block near the end of run()).
-        # verified_count stays None (not 0) until the full-cycle block below actually
-        # runs the count check — None means "not checked this cycle", 0 means "checked
-        # and confirmed absent"; this distinction is load-bearing (see that block).
-        # This stat is deliberately Optional[int] end-to-end (contract note at the
-        # full-cycle assignment site below), unlike Stage 2's sibling stat which
-        # coerces a trailing None to 0.
-        report.stats['stage1_cycle_summary_verified_count'] = None
-        report.stats['stage1_cycle_summary_reconstructed'] = 0
 
         # Skip dedup for remediation passes
         if self.remediation_findings is not None:
@@ -423,44 +389,27 @@ class MemoryConsolidator(BaseStage):
                 report.stats['degenerate_task_nodes_swept'] = sweep_stats['deleted']
                 report.stats['degenerate_task_nodes_scanned'] = sweep_stats['scanned']
 
-        # ── Cycle-summary absence self-heal (task 2366) ────────────────────────
-        # The per-cycle cycle_summary memory is a PROMPT-DRIVEN final step of the
-        # LLM session (prompts/stage1.py) — a session that exhausts its
-        # turn/token/context budget can exit before writing one, leaving the
-        # summary absent from both Stage 3's metadata triple-filter and semantic
-        # search. Mirrors Stage 2's already-proven
-        # _verify_stage2_summary_written / _reconstruct_stage2_summary self-heal
-        # chain via the shared reconciliation.summary_pool core. Only reached on
-        # full (non-remediation) cycles — the remediation payload
-        # (_assemble_remediation_payload) never asks for a cycle_summary, so
-        # self-healing there would fabricate a spurious one every remediation pass.
-        # Gated on count == 0 specifically (not a falsy check) so a transient
-        # count_memories_by_metadata failure (verified_count is None) never
-        # fabricates a placeholder for a run whose real summary may already exist.
-        #
-        # Contract note (task 2366 amendment): unlike Stage 2's
-        # 'stage2_cycle_summary_verified_count' (task_knowledge_sync.py, which
-        # coerces a trailing None to 0 before storing — "this stat's contract
-        # (always an int) is preserved for downstream consumers"), this stat is
-        # deliberately left Optional[int]: None means "not confirmed absent, a
-        # transient count failure occurred" and is kept distinct from a
-        # confirmed 0. A consumer aggregating both stages' stats must treat
-        # this key as Optional[int] while stage2's is always int.
-        count = await verify_cycle_summary_written(
-            self.memory, self.project_id, run_id, stage='memory_consolidator',
+        # ── Deterministic per-cycle summary write (task 2229 W5-λ) ────────────
+        # Python writes the authoritative cycle_summary ledger row directly
+        # from `report` — no LLM turn, no nonce, no verify/reconstruct
+        # self-heal (all retired by this task; see
+        # summary_pool.write_cycle_summary). Mirrors Stage 2's identical
+        # wiring in task_knowledge_sync.py. Only reached on full
+        # (non-remediation) cycles — the remediation payload
+        # (_assemble_remediation_payload) never asked for a cycle_summary
+        # under the old LLM-driven mechanism either, so writing one here would
+        # fabricate a spurious summary every remediation pass.
+        cycle_summary_written = await write_cycle_summary(
+            self.memory,
+            self.project_id,
+            report,
+            run_id,
+            stage='memory_consolidator',
+            recon_pool=_STAGE1_CYCLE_SUMMARY_RECON_POOL,
+            trim_source=_STAGE1_CYCLE_SUMMARY_TRIM_SOURCE,
+            cap=STAGE1_CYCLE_SUMMARY_POOL_CAP,
         )
-        report.stats['stage1_cycle_summary_verified_count'] = count
-        if count == 0:
-            report.stats['stage1_cycle_summary_reconstructed'] = (
-                await reconstruct_cycle_summary_stub(
-                    self.memory,
-                    self.project_id,
-                    run_id,
-                    stage='memory_consolidator',
-                    recon_pool=_STAGE1_CYCLE_SUMMARY_RECON_POOL,
-                    reconstruct_source=_STAGE1_CYCLE_SUMMARY_RECONSTRUCTION_SOURCE,
-                )
-            )
+        report.stats['stage1_cycle_summary_written'] = 1 if cycle_summary_written else 0
 
         return report
 
@@ -586,9 +535,6 @@ class MemoryConsolidator(BaseStage):
         memories_str, mem_n = _format_memories(new_memories)
         self._entity_summary_snapshot_lines_stripped = ep_n + mem_n
 
-        # 9. Per-cycle summary nonce (task 1574)
-        summary_nonce_section = self._build_summary_nonce_section()
-
         return f"""## Reconciliation Run — Stage 1: Memory Consolidation
 ## Project: {self.project_id}
 
@@ -606,7 +552,7 @@ class MemoryConsolidator(BaseStage):
 
 ### Previous Reconciliation
 {_format_watermark(watermark)}
-{prior_s3_section}{cycle_fence_section}{task_tree_section}{task_count_census_section}{live_workflow_section}{summary_nonce_section}
+{prior_s3_section}{cycle_fence_section}{task_tree_section}{task_count_census_section}{live_workflow_section}
 ## Your Task
 Review the above data and perform memory consolidation:
 1. Within Mem0: identify duplicates, contradictions, stale entries. Merge/delete as needed.
@@ -679,9 +625,6 @@ Review the above data and perform memory consolidation:
         # Live-Workflow Signals (task 1977 — mirrors Stage 2's task 1655)
         live_workflow_section = self._build_live_workflow_section()
 
-        # Per-cycle summary nonce (task 1574)
-        summary_nonce_section = self._build_summary_nonce_section()
-
         ctx_str, ctx_n = _format_context_items(ap.context_items)
         self._entity_summary_snapshot_lines_stripped = ctx_n
 
@@ -699,7 +642,7 @@ Review the above data and perform memory consolidation:
 
 ### Previous Reconciliation
 {_format_watermark(watermark)}
-{prior_s3_section}{cycle_fence_section}{task_tree_section}{task_count_census_section}{live_workflow_section}{summary_nonce_section}
+{prior_s3_section}{cycle_fence_section}{task_tree_section}{task_count_census_section}{live_workflow_section}
 ## Your Task
 Review the above data and perform memory consolidation:
 1. Within Mem0: identify duplicates, contradictions, stale entries. Merge/delete as needed.
@@ -786,22 +729,6 @@ Review the above data and perform memory consolidation:
             f'\n### Task Count Census (authoritative — from get_statuses)\n'
             f'Total: {auth_total}, Done: {auth_done}{divergence_note}\n'
         )
-
-    def _build_summary_nonce_section(self) -> str:
-        """Return the Per-Cycle Summary Nonce payload section with a fresh STAGE1-prefixed nonce.
-
-        Delegates to the shared cli_stage_runner.build_summary_nonce_section() helper
-        so Stage 1 and Stage 2 produce identical section wording and cannot drift
-        (task 1574 single-source-of-truth design).
-
-        Task 1590: passes 'STAGE1' prefix so Stage 1 nonces always lead with 'STAGE1_',
-        making stage origin explicit and ensuring Stage 1 and Stage 2 summaries can never
-        share a leading nonce token, further separating them in Mem0's embedding space.
-
-        This single method feeds BOTH the legacy _format_payload (line ~263) and the
-        event-driven _format_assembled_payload (line ~331) paths.
-        """
-        return build_summary_nonce_section('STAGE1')
 
     def _assemble_remediation_payload(self) -> str:
         """Focused payload for remediation runs — findings only, no full data."""
