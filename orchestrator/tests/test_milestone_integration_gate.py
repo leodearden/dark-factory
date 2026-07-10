@@ -14,11 +14,131 @@ orchestrator parses nothing).
 
 from __future__ import annotations
 
+import json
 import os
 import subprocess
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
+from escalation.queue import EscalationQueue
+
+from orchestrator.config import OrchestratorConfig
+from orchestrator.deterministic_runner import DeterministicRunner
+from orchestrator.scheduler import Scheduler
+from orchestrator.workflow import WorkflowOutcome
+
+# ---------------------------------------------------------------------------
+# Shared helpers — mirror the harness patterns established in
+# test_scheduler.py (TestMilestoneEligibilityGate/TestMilestoneSweepDriven­
+# ByAcquireNext: injected wall clock + mocked mcp_call) and
+# test_deterministic_runner.py (_predicate_task/_mock_scheduler/real
+# DeterministicRunner construction), stitched into ONE end-to-end thread.
+# ---------------------------------------------------------------------------
+
+
+def _task_response(tasks: list[dict]) -> dict:
+    """Build the JSON-RPC-shaped get_tasks envelope mcp_call is mocked to return."""
+    return {
+        'result': {
+            'content': [
+                {'type': 'text', 'text': json.dumps({'tasks': tasks})}
+            ]
+        }
+    }
+
+
+def _dep_task(dep_id: str = 'X', status: str = 'pending') -> dict:
+    return {
+        'id': dep_id,
+        'title': 'Dependency',
+        'status': status,
+        'dependencies': [],
+        'metadata': {},
+    }
+
+
+def _delayed_predicate_milestone_task(
+    task_id: str,
+    script_path: Path,
+    *,
+    after_secs: int = 100,
+    args: list[str] | None = None,
+    timeout_secs: int | float = 30,
+    milestone_deps_satisfied_at: str | None = None,
+    dep_id: str = 'X',
+) -> dict:
+    """Build a pending, deterministic, delayed-milestone predicate task dict.
+
+    ``before_done`` points at the REAL exemplar script (absolute path,
+    kind='predicate', target_unit=None — a predicate is never a systemd
+    deploy).  ``metadata.milestone`` is a 'delayed' spec whose anchor is
+    stamped by the real β sweep (``Scheduler._stamp_milestone_deps_satisfied``)
+    once ``dep_id`` is done.
+    """
+    before_done: dict = {
+        'script': str(script_path),
+        'args': args if args is not None else [
+            '--window-days', '7', '--threshold', '0.05', '--value', '0.03',
+        ],
+        'env': {},
+        'cwd': None,
+        'timeout_secs': timeout_secs,
+        'target_unit': None,
+        'kind': 'predicate',
+    }
+    metadata: dict = {
+        'task_kind': 'deterministic',
+        'always_escalates': False,
+        'before_done': before_done,
+        'milestone': {'mode': 'delayed', 'after_secs': after_secs},
+    }
+    if milestone_deps_satisfied_at is not None:
+        metadata['milestone_deps_satisfied_at'] = milestone_deps_satisfied_at
+    return {
+        'id': task_id,
+        'title': 'Merge-flakiness milestone check',
+        'description': 'Predicate that verifies the merge-flakiness invariant',
+        'status': 'pending',
+        'dependencies': [{'id': dep_id}],
+        'metadata': metadata,
+    }
+
+
+def _build_scheduler(clock: list[datetime]) -> Scheduler:
+    """A real Scheduler with an injected, mutable wall clock and a spied update_task.
+
+    Mirrors TestMilestoneSweepDrivenByAcquireNext: update_task is replaced
+    outright (not routed through mcp_call) so the sweep's stamp call can be
+    asserted directly, exactly like every β sweep unit test.
+    """
+    config = OrchestratorConfig(max_per_module=1)
+    scheduler = Scheduler(config, wall_time_source=lambda: clock[0])
+    scheduler.update_task = AsyncMock(return_value=True)
+    return scheduler
+
+
+def _mock_scheduler(task: dict) -> MagicMock:
+    """A MagicMock scheduler — the runner's status SINK (mirrors every γ unit test)."""
+    scheduler = MagicMock()
+    scheduler.set_task_status = AsyncMock()
+    scheduler.update_task = AsyncMock(return_value=True)
+    scheduler.get_task = AsyncMock(return_value=task)
+    return scheduler
+
+
+def _real_runner(tmp_path: Path, task: dict, unit_inspector) -> DeterministicRunner:
+    """A real DeterministicRunner: script_runner=None -> the REAL subprocess path."""
+    queue = EscalationQueue(tmp_path)
+    scheduler = _mock_scheduler(task)
+    return DeterministicRunner(
+        scheduler=scheduler,
+        escalation_queue=queue,
+        unit_inspector=unit_inspector,
+        script_runner=None,
+    )
+
 
 # ---------------------------------------------------------------------------
 # B... — exemplar check-script contract (self-authored: ε owns both the
@@ -85,3 +205,105 @@ class TestExemplarCheckScript:
         )
         tail = result.stdout.strip()
         assert 'VIOLATED' in tail, f'expected "VIOLATED" in stdout tail; got {tail!r}'
+
+
+# ---------------------------------------------------------------------------
+# B2+B3+B7+B10 — exemplar PASS lifecycle, end-to-end.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestExemplarPassLifecycle:
+    """A real Scheduler (injected wall clock) drives the GATE half via
+    acquire_next() across multiple ticks — withhold (dep unsatisfied) ->
+    stamp the deps-satisfied anchor (B2) -> withhold (timer not yet elapsed,
+    B3) -> release — then hands the released TaskAssignment to a real
+    DeterministicRunner (script_runner=None) running the REAL
+    scripts/check_merge_flakiness.sh, asserting the done-provenance verdict
+    (B7) and that no systemd unit_inspector call is ever made (B10).
+    """
+
+    AFTER_SECS = 100
+    TASK_ID = '9001'
+
+    async def test_delayed_predicate_milestone_full_pass_lifecycle(
+        self, repo_root: Path | None, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ):
+        if repo_root is None:
+            pytest.skip('not running inside a git checkout')
+        script = repo_root / 'scripts' / 'check_merge_flakiness.sh'
+        if not script.exists():
+            pytest.fail(f'scripts/check_merge_flakiness.sh does not exist at {script}')
+
+        anchor_base = datetime(2026, 7, 10, 12, 0, 0, tzinfo=UTC)
+        clock = [anchor_base]
+
+        milestone_task = _delayed_predicate_milestone_task(
+            self.TASK_ID, script, after_secs=self.AFTER_SECS,
+        )
+        # 'in-progress', not 'pending': isolates the milestone task's gate
+        # behaviour from the dep task's OWN dispatch eligibility (mirrors
+        # TestMilestoneSweepDrivenByAcquireNext's dep_task convention).
+        dep_task = _dep_task('X', status='in-progress')
+
+        mock_call = AsyncMock(return_value=_task_response([dep_task, milestone_task]))
+        monkeypatch.setattr('orchestrator.scheduler.mcp_call', mock_call)
+
+        scheduler = _build_scheduler(clock)
+
+        # Tick 1: dep X still pending -> withheld, no anchor stamped.
+        result_1 = await scheduler.acquire_next()
+        assert result_1 is None, 'must withhold while dep X is unsatisfied'
+        scheduler.update_task.assert_not_awaited()
+
+        # Flip dep X -> done; tick 2 stamps the anchor exactly once (B2) but
+        # STILL withholds this tick — the stamp is only visible on the NEXT
+        # tick's get_tasks (mirrors TestMilestoneSweepDrivenByAcquireNext).
+        dep_task['status'] = 'done'
+        mock_call.return_value = _task_response([dep_task, milestone_task])
+        result_2 = await scheduler.acquire_next()
+        assert result_2 is None, 'anchor just stamped is not visible until next tick'
+        scheduler.update_task.assert_awaited_once()
+        stamp_call = scheduler.update_task.call_args
+        assert stamp_call.args[0] == self.TASK_ID
+        anchor_iso = stamp_call.args[1]['milestone_deps_satisfied_at']
+        assert stamp_call.kwargs.get('metadata_mode') == 'merge'
+        assert anchor_iso == clock[0].isoformat()
+
+        # Write the stamped anchor back into the task dict for later ticks.
+        milestone_task['metadata']['milestone_deps_satisfied_at'] = anchor_iso
+        mock_call.return_value = _task_response([dep_task, milestone_task])
+
+        # Tick 3: timer not yet elapsed -> withheld (B3).
+        clock[0] = anchor_base + timedelta(seconds=self.AFTER_SECS - 1)
+        result_3 = await scheduler.acquire_next()
+        assert result_3 is None, 'must withhold before anchor + after_secs elapses'
+
+        # Tick 4: timer elapsed, dep still done -> dispatched.
+        clock[0] = anchor_base + timedelta(seconds=self.AFTER_SECS)
+        assignment = await scheduler.acquire_next()
+        assert assignment is not None, 'must dispatch once the delayed timer elapses'
+        assert assignment.task_id == self.TASK_ID
+        assert assignment.modules == [], 'deterministic tasks hold no module lock (I4/B12)'
+
+        # Hand the released assignment to a REAL DeterministicRunner running
+        # the REAL exemplar script (script_runner=None).
+        unit_inspector = AsyncMock()
+        runner = _real_runner(tmp_path, assignment.task, unit_inspector)
+
+        outcome = await runner.run(assignment)
+
+        assert outcome == WorkflowOutcome.DONE
+
+        runner.scheduler.set_task_status.assert_awaited_once()
+        done_call = runner.scheduler.set_task_status.call_args
+        assert done_call.args[0] == self.TASK_ID
+        assert done_call.args[1] == 'done'
+        provenance = done_call.kwargs.get('done_provenance')
+        assert provenance is not None, 'done_provenance must be passed as a kwarg'
+        assert provenance['kind'] == 'deterministic-milestone'
+        assert 'invariant holds' in provenance.get('note', ''), (
+            f'stdout tail must appear in provenance note: {provenance!r}'
+        )
+
+        unit_inspector.assert_not_awaited()
