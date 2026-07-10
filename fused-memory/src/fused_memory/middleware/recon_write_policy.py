@@ -34,6 +34,8 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Literal
 
+from shared.task_statuses import TERMINAL as TERMINAL_STATUSES
+
 # ---------------------------------------------------------------------------
 # Verdict
 # ---------------------------------------------------------------------------
@@ -118,6 +120,62 @@ def _reject(
         error_type=error_type,
         reason=reason,
         hint=hint,
+        live_status=live_status,
+        target_status=target_status,
+        snapshot_token=snapshot_token,
+    )
+
+
+# ---------------------------------------------------------------------------
+# check()
+# ---------------------------------------------------------------------------
+
+
+def check(
+    op: str,
+    *,
+    task_id: str,
+    project_root: str,
+    agent_id: str,
+    target_status: str | None,
+    live_status: str,
+    snapshot_token: str | None,
+) -> Verdict:
+    """Decide whether a recon-stage caller may perform *op* on *task_id*.
+
+    Pure function — always runs its gates; the recon-stage scoping
+    (``agent_id.startswith('recon-stage-')``) lives at the call site in
+    ``task_interceptor.py``, not here.
+
+    Gate 1 (terminal): ``op == 'update_task'`` AND ``live_status`` is
+    terminal (done/cancelled) -> ``ReconTerminalWriteRejected``.
+    """
+    if op == 'update_task' and live_status in TERMINAL_STATUSES:
+        return _reject(
+            op=op,
+            task_id=task_id,
+            agent_id=agent_id,
+            error_type='ReconTerminalWriteRejected',
+            reason=(
+                f'recon-stage write blocked: task {task_id} is {live_status!r} '
+                '(terminal); recon-stage agents may not write to terminal tasks.'
+            ),
+            hint=(
+                'Terminal tasks (done, cancelled) are frozen against '
+                'recon-stage writes. If this task genuinely needs updating, '
+                'use a non-recon-stage agent_id or route through '
+                'set_task_status with a reopen_reason.'
+            ),
+            live_status=live_status,
+            target_status=target_status,
+            snapshot_token=snapshot_token,
+        )
+
+    return Verdict(
+        outcome='ok',
+        op=op,
+        task_id=task_id,
+        agent_id=agent_id,
         live_status=live_status,
         target_status=target_status,
         snapshot_token=snapshot_token,
