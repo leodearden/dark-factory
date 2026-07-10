@@ -806,3 +806,22 @@ def test_lease_holder_dict_round_trip_is_lossless() -> None:
         session_slug='watcher-df-100', pid=4242, start_ts='2026-07-07T12:00:00+00:00'
     )
     assert sr.LeaseHolder.from_dict(holder.to_dict()) == holder
+
+
+# --- claim_lease: free lease --------------------------------------------
+
+
+def test_claim_lease_acquires_a_free_lease(tmp_path: Path) -> None:
+    holder = sr.LeaseHolder(session_slug='watcher-df-100', pid=os.getpid(), start_ts=_NOW.isoformat())
+
+    claim = sr.claim_lease('watcher-df', holder=holder, root=tmp_path, now=_NOW)
+
+    assert claim.decision == sr.LeaseDecision.ACQUIRED
+    assert claim.acquired is True
+    assert claim.holder is not None
+    assert claim.holder.session_slug == 'watcher-df-100'
+
+    assert sr.leases_dir(root=tmp_path).is_dir()
+    lease_path = sr.lease_path_for_name('watcher-df', root=tmp_path)
+    assert lease_path.is_file()
+    assert sr.LeaseHolder.from_json(lease_path.read_text()) == holder
