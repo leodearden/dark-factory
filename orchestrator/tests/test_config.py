@@ -1846,6 +1846,7 @@ class TestConfigReload:
         'verify_env',
         'git.offline_lane_test_threads',
         'git.offline_lane_red_advances_before_blocker',
+        'merge_verify_max_concurrent_pytests',
     ])
     def test_representative_reloadable_members_present(self, path):
         assert path in RELOADABLE_FIELDS, (
@@ -1892,6 +1893,20 @@ class TestDiffConfig:
         diff = diff_config(live, fresh)
         assert diff.applied_candidates == {
             'models.architect': {'old': 'opus', 'new': 'sonnet'},
+        }
+        assert diff.restart_required == {}
+
+    def test_merge_fanout_cap_change_is_green_tier(self, monkeypatch, tmp_path):
+        """merge_verify_max_concurrent_pytests (task 2393, T5) is green-tier:
+        a change lands in applied_candidates, not restart_required.
+        """
+        monkeypatch.chdir(tmp_path)
+        monkeypatch.setenv('ORCH_CONFIG_PATH', '')
+        live = OrchestratorConfig(merge_verify_max_concurrent_pytests=4)
+        fresh = OrchestratorConfig(merge_verify_max_concurrent_pytests=2)
+        diff = diff_config(live, fresh)
+        assert diff.applied_candidates == {
+            'merge_verify_max_concurrent_pytests': {'old': 4, 'new': 2},
         }
         assert diff.restart_required == {}
 
