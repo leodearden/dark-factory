@@ -563,6 +563,33 @@ def update_status(
     return record
 
 
+def update_display(
+    slug: str,
+    root: Path | str | None = None,
+    *,
+    kind: str,
+    wm_title: str = '',
+    wm_window_id: str | None = None,
+    tmux_target: str | None = None,
+) -> SessionRecord:
+    """Strict read-modify-write of *display* (mirrors update_status).
+
+    Used by the ``set-display`` CLI subcommand (spawn-claude.sh's tmux lane,
+    Fleet Cockpit C6), which only learns the tmux target after `tmux
+    new-window` runs -- well after ``launching`` allocated the record with
+    display=None. Raises if no record exists for *slug*, matching
+    update_status's contract; preserves every other field (incl.
+    status/exit_code/result_file), so a later `exit`/`refresh`
+    read-modify-write sees the stamped display unchanged.
+    """
+    record = read_record(slug, root=root)
+    record.display = Display(
+        kind=kind, wm_title=wm_title, wm_window_id=wm_window_id, tmux_target=tmux_target
+    )
+    write_record(record, root=root)
+    return record
+
+
 def refresh_record(
     slug: str,
     root: Path | str | None = None,
@@ -1342,6 +1369,24 @@ def _run_refresh(record_dir: str, status_value: str) -> None:
     refresh_record(slug, root=root, status=Status(status_value))
 
 
+def _run_set_display(
+    record_dir: str,
+    kind: str,
+    wm_title: str,
+    wm_window_id: str | None,
+    tmux_target: str | None,
+) -> None:
+    slug, root = _slug_root_from_record_dir(record_dir)
+    update_display(
+        slug,
+        root=root,
+        kind=kind,
+        wm_title=wm_title,
+        wm_window_id=wm_window_id,
+        tmux_target=tmux_target,
+    )
+
+
 def _run_reap() -> list[ReapedSessionRecord]:
     return reap_stale_records()
 
@@ -1395,6 +1440,15 @@ def _build_parser() -> argparse.ArgumentParser:
     refresh_p.add_argument('--record', required=True, help='record dir')
     refresh_p.add_argument('--status', required=True, choices=[s.value for s in Status])
 
+    set_display_p = sub.add_parser(
+        'set-display', help='stamp display (kind/title/target) on a record'
+    )
+    set_display_p.add_argument('--record', required=True, help='record dir, as printed by `launching`')
+    set_display_p.add_argument('--kind', required=True, choices=[k.value for k in DisplayKind])
+    set_display_p.add_argument('--tmux-target', default=None)
+    set_display_p.add_argument('--wm-title', default='')
+    set_display_p.add_argument('--wm-window-id', default=None)
+
     sub.add_parser('reap', help='sweep and remove stale session records')
 
     lease_claim_p = sub.add_parser('lease-claim', help='claim a single-owner-per-role lease (T7)')
@@ -1439,6 +1493,8 @@ def main(argv: list[str] | None = None) -> int:
             _run_exit(args.record, args.code)
         elif args.verb == 'refresh':
             _run_refresh(args.record, args.status)
+        elif args.verb == 'set-display':
+            _run_set_display(args.record, args.kind, args.wm_title, args.wm_window_id, args.tmux_target)
         elif args.verb == 'reap':
             _run_reap()
         elif args.verb == 'lease-claim':
