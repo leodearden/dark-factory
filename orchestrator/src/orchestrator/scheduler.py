@@ -12,7 +12,7 @@ import time
 from collections import deque
 from collections.abc import Callable, Iterable, Iterator
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any, Protocol
 
@@ -458,6 +458,20 @@ def _resolve_time_source(ts: Callable[[], float] | None) -> Callable[[], float]:
     ``Scheduler`` don't each inline a redundant lambda.
     """
     return ts if ts is not None else (lambda: time.monotonic())
+
+
+def _resolve_wall_time_source(
+    ts: Callable[[], datetime] | None,
+) -> Callable[[], datetime]:
+    """Return *ts* if provided, else a real wall-clock ``datetime.now(UTC)``.
+
+    Distinct from :func:`_resolve_time_source` (``time.monotonic``, which
+    resets across process restarts): milestone anchors (task 2335 β) are
+    persisted wall-clock timestamps that must survive a restart, so callers
+    that need restart-safe, human-meaningful timestamps inject/resolve a
+    wall clock here instead.
+    """
+    return ts if ts is not None else (lambda: datetime.now(UTC))  # clock-exempt: single-capture writer
 
 
 class ModuleLockTable:
@@ -1036,9 +1050,16 @@ class Scheduler:
         override_store: OverrideStore | None = None,
         monotonic_clock_source: Callable[[], float] | None = None,
         park_eviction_store: ParkEvictionRequestStore | None = None,
+        wall_time_source: Callable[[], datetime] | None = None,
     ):
         self.config = config
         self._time_source: Callable[[], float] = _resolve_time_source(time_source)
+        # Wall-clock source (task 2335 β) for the milestone time-gate: unlike
+        # self._time_source (monotonic, resets across restarts), milestone
+        # anchors/deadlines are persisted wall-clock timestamps that must
+        # compare correctly after a process restart. Injectable so tests can
+        # drive deterministic dated/delayed milestone scenarios.
+        self._wall_now: Callable[[], datetime] = _resolve_wall_time_source(wall_time_source)
         # Monotonic clock source for the park-stop rolling-window transition
         # recorder.  time.monotonic avoids false-trip / stale-entry artefacts
         # from non-monotonic wall-clock skew (NTP steps, VM clock drift).
@@ -1156,6 +1177,15 @@ class Scheduler:
         self._streak_registry.register(
             'starvation', self._streak_starvation, on_gc=self._starvation_gc_resolve
         )
+        # Cause-change-reset counter backing the malformed-milestone log dedup
+        # (task 2335 β amendment: reviewer_comprehensive observability
+        # finding).  Keyed by task_id; touch(cause=<malformed signature>) is
+        # called from _milestone_time_gated's fail-safe branches so a
+        # permanently-broken metadata.milestone warns once instead of every
+        # tick/candidate-loop forever.  GC'd for free by the existing
+        # per-tick _streak_registry sweep like every other streak counter.
+        self._streak_milestone_malformed = StreakCounter()
+        self._streak_registry.register('milestone_malformed', self._streak_milestone_malformed)
 
         # Per-(task_id, dep_string) count of consecutive ticks where the dep
         # resolved to a sentinel (unknown_project/unknown_task/malformed).
@@ -2966,6 +2996,216 @@ class Scheduler:
         metadata = task.get('metadata') or {}
         return bool(metadata.get('deferred_watch')) and not metadata.get('trigger_met')
 
+    def _note_milestone_malformed(
+        self, task_id: str, cause: str, msg: str, *args: Any, **kwargs: Any
+    ) -> None:
+        """Emit a fail-safe-withhold WARNING for a malformed milestone at
+        most once per (task_id, cause) — suppress repeats of the SAME cause
+        on every subsequent call (task 2335 β amendment: reviewer_comprehensive
+        observability finding).
+
+        :meth:`_milestone_time_gated` is invoked from :meth:`_eligible_for_dispatch`
+        for every candidate, every tick, in both the scored and pin dispatch
+        loops, for as long as the task stays pending — so a permanently
+        broken ``metadata.milestone`` would otherwise log the identical
+        WARNING forever, burying the one-time signal in noise.
+
+        Backed by :class:`~orchestrator.streaks.StreakCounter`'s
+        cause-change-reset ``touch()`` (mirrors :meth:`_note_external_hold`):
+        the streak resets to 1 — and this logs again — the moment *cause*
+        changes, e.g. an operator edits ``metadata.milestone`` to a new
+        (still malformed) value.  Registered with ``self._streak_registry``
+        so it is GC'd for free alongside every other streak counter; no
+        unbounded growth from tasks that are fixed or go terminal.
+
+        This helper is the ONLY place :meth:`_milestone_time_gated` mutates
+        instance state; its own return value stays a pure, deterministic
+        function of ``(task, now_wall)`` — the dedup here is an
+        observability side-channel, not a dispatch-affecting side effect.
+        """
+        if self._streak_milestone_malformed.touch(task_id, cause=cause) == 1:
+            logger.warning(msg, *args, **kwargs)
+
+    def _milestone_time_gated(self, task: dict, now_wall: datetime) -> bool:
+        """Return True when *task* must be withheld from dispatch by its
+        ``metadata.milestone`` time gate (task 2335 β).
+
+        Pure predicate — sibling to :meth:`_deferred_watch_gated`.  Reads the
+        RAW ``metadata.milestone`` dict directly, NOT the heavier
+        :func:`~shared.task_metadata.parse_metadata` pipeline used by
+        :func:`_task_external_deps`: the α ``Milestone`` model-validator and
+        δ's submit guard already validate at write time, so this gate is
+        defense-in-depth, not the primary validation path.
+
+        Modes (``metadata.milestone['mode']``):
+        - ``'dated'``: withhold while ``now_wall < milestone['at']``.
+        - ``'delayed'``: withhold while
+          ``metadata.milestone_deps_satisfied_at`` is unset, OR while
+          ``now_wall < anchor + after_secs``.  The anchor is stamped once,
+          frozen-once, by :meth:`_stamp_milestone_deps_satisfied`.
+
+        No ``metadata.milestone`` (missing/falsy) → not gated (``False``).
+        Any malformed or unrecognised value — a non-dict milestone, an
+        unknown mode, an unparseable ``at``/anchor timestamp, or an
+        ``after_secs`` that can't combine with a timestamp — fails safe:
+        withhold (``True``) plus a WARNING log, rather than crash the
+        dispatch tick or let a broken milestone spec dispatch early.  The
+        WARNING is deduped per (task_id, malformed value) by
+        :meth:`_note_milestone_malformed` so a permanently-broken spec logs
+        once instead of spamming every tick; it re-fires if the malformed
+        value actually changes.  A task that fails safe here has no other
+        path to human attention (no automatic escalation) — this is a
+        known, deliberately deferred gap (task 2335 β amendment: reviewer_
+        comprehensive robustness finding; see commit message for rationale).
+
+        ``at``/anchor timestamps that parse as tz-naive are normalized to
+        UTC (``.replace(tzinfo=UTC)``): the α model only requires
+        ``datetime.fromisoformat``-parseable, not tz-aware, but comparing a
+        tz-naive and tz-aware datetime directly raises ``TypeError`` — left
+        unhandled that would otherwise fall into the fail-safe branch and
+        withhold the task forever.
+        """
+        metadata = task.get('metadata') or {}
+        milestone = metadata.get('milestone')
+        if not milestone:
+            return False
+        task_id = str(task.get('id', '?'))
+        if not isinstance(milestone, dict):
+            self._note_milestone_malformed(
+                task_id, f'not-a-dict:{milestone!r}',
+                'Task %s: metadata.milestone is not a dict (%r) — fail-safe '
+                'withhold (this task will remain pending indefinitely until '
+                'metadata.milestone is corrected)',
+                task_id, milestone,
+            )
+            return True
+
+        mode = milestone.get('mode')
+        try:
+            if mode == 'dated':
+                at_raw = milestone.get('at')
+                if not isinstance(at_raw, str):
+                    raise ValueError(f'milestone.at must be a string, got {at_raw!r}')
+                at_dt = datetime.fromisoformat(at_raw)
+                if at_dt.tzinfo is None:
+                    at_dt = at_dt.replace(tzinfo=UTC)
+                return now_wall < at_dt
+            elif mode == 'delayed':
+                anchor_raw = metadata.get('milestone_deps_satisfied_at')
+                if not anchor_raw:
+                    return True
+                if not isinstance(anchor_raw, str):
+                    raise ValueError(
+                        f'milestone_deps_satisfied_at must be a string, got {anchor_raw!r}'
+                    )
+                anchor_dt = datetime.fromisoformat(anchor_raw)
+                if anchor_dt.tzinfo is None:
+                    anchor_dt = anchor_dt.replace(tzinfo=UTC)
+                after_secs = milestone.get('after_secs')
+                if not isinstance(after_secs, int):
+                    raise ValueError(f'milestone.after_secs must be an int, got {after_secs!r}')
+                fire_at = anchor_dt + timedelta(seconds=after_secs)
+                return now_wall < fire_at
+            else:
+                self._note_milestone_malformed(
+                    task_id, f'unknown-mode:{mode!r}',
+                    'Task %s: metadata.milestone has unknown mode %r — fail-safe '
+                    'withhold (this task will remain pending indefinitely until '
+                    'metadata.milestone is corrected)',
+                    task_id, mode,
+                )
+                return True
+        except Exception:
+            self._note_milestone_malformed(
+                task_id, f'exception:{milestone!r}',
+                'Task %s: malformed metadata.milestone %r — fail-safe withhold '
+                '(this task will remain pending indefinitely until '
+                'metadata.milestone is corrected)',
+                task_id, milestone,
+                exc_info=True,
+            )
+            return True
+
+    async def _stamp_milestone_deps_satisfied(
+        self,
+        tasks: list[dict],
+        status_map: dict[str, str],
+        tasks_by_id: dict[str, dict] | None = None,
+        *,
+        external_status_cache: dict[str, str] | None = None,
+        external_resolver_failed: bool = False,
+    ) -> None:
+        """Per-tick sweep: stamp the frozen-once ``milestone_deps_satisfied_at``
+        wall-clock anchor for pending 'delayed' milestone tasks (task 2335 β).
+
+        Mirrors :meth:`_gc_expired_cooldowns` — a side-effecting per-tick sweep
+        called once from :meth:`acquire_next` so that :meth:`_milestone_time_gated`
+        / :meth:`_eligible_for_dispatch` remain pure, side-effect-free predicates.
+
+        For every task with ``status == 'pending'`` and a dict
+        ``metadata.milestone`` whose ``mode == 'delayed'`` that does NOT
+        already carry a truthy ``metadata.milestone_deps_satisfied_at``: if
+        :meth:`_deps_satisfied` holds — forwarding *external_status_cache* /
+        *external_resolver_failed* so the anchor reflects the SAME complete
+        local+external dependency evaluation dispatch uses (PRD § 2 gap 2) —
+        stamp ``self._wall_now().isoformat()`` via
+        ``update_task(..., metadata_mode='merge')`` so sibling metadata keys
+        are preserved.
+
+        Frozen-once: a task that already has the anchor is never revisited.
+        Persists only via ``update_task`` — the in-tick *tasks* / *tasks_by_id*
+        snapshot is never mutated, so the anchor only becomes visible on the
+        next tick's ``get_tasks``. This is safe because a delayed milestone
+        with ``after_secs > 0`` can never fire the same tick its anchor is
+        stamped (:meth:`_milestone_time_gated` would still return ``True``
+        for ``now_wall < anchor + after_secs``).
+
+        Defensive: each task's stamp attempt is wrapped so a single failure
+        (a malformed milestone, an ``update_task`` exception) never aborts
+        the sweep for the remaining tasks.
+
+        Efficiency note (task 2335 β amendment: reviewer_comprehensive
+        efficiency finding): ``update_task`` is awaited sequentially inside
+        this loop, one MCP round-trip per newly-satisfied delayed-milestone
+        task. In the common case at most one task transitions per tick, so
+        this is negligible. If milestone task volume ever makes this hot,
+        the eligible task ids could be collected first and their
+        ``update_task`` stamps issued concurrently (e.g. ``asyncio.gather``
+        with the same per-task exception isolation preserved) — not done
+        here since it is speculative optimization with no current evidence
+        of a hot path.
+        """
+        for task in tasks:
+            try:
+                if task.get('status') != 'pending':
+                    continue
+                metadata = task.get('metadata') or {}
+                milestone = metadata.get('milestone')
+                if not isinstance(milestone, dict) or milestone.get('mode') != 'delayed':
+                    continue
+                if metadata.get('milestone_deps_satisfied_at'):
+                    continue
+                tid = str(task.get('id', ''))
+                if not tid:
+                    continue
+                if not self._deps_satisfied(
+                    task, status_map, tasks_by_id,
+                    external_status_cache=external_status_cache,
+                    external_resolver_failed=external_resolver_failed,
+                ):
+                    continue
+                await self.update_task(
+                    tid,
+                    {'milestone_deps_satisfied_at': self._wall_now().isoformat()},
+                    metadata_mode='merge',
+                )
+            except Exception:
+                logger.warning(
+                    'Task %s: milestone deps-satisfied stamp sweep failed',
+                    task.get('id', '?'),
+                    exc_info=True,
+                )
+
     def _eligible_for_dispatch(
         self,
         task: dict,
@@ -3012,6 +3252,8 @@ class Scheduler:
         if tid in self._dispatched:
             return False, None
         if self._deferred_watch_gated(task):
+            return False, None
+        if self._milestone_time_gated(task, self._wall_now()):
             return False, None
         cooldown_deadline = self._requeue_until.get(tid)
         if cooldown_deadline is not None and self._time_source() < cooldown_deadline:
@@ -3900,6 +4142,20 @@ class Scheduler:
                 exc_info=True,
             )
         _external_resolver_failed = external_err is not None
+
+        # Per-tick sweep: stamp the frozen-once milestone_deps_satisfied_at
+        # wall-clock anchor for pending 'delayed' milestone tasks whose full
+        # (local + external) deps just became satisfied (task 2335 β).
+        # Placed after the external-dep cache above so the anchor reflects
+        # the SAME complete dep evaluation the candidate loops below use —
+        # and before those loops so a task's gate state this tick is still
+        # governed by its pre-sweep snapshot (the stamp only becomes visible
+        # on the next tick's get_tasks; see _stamp_milestone_deps_satisfied).
+        await self._stamp_milestone_deps_satisfied(
+            tasks, status_map, tasks_by_id,
+            external_status_cache=external_cache,
+            external_resolver_failed=_external_resolver_failed,
+        )
 
         # Load priority-override snapshot for this tick.
         current_overrides: dict[str, OverrideRow] = (

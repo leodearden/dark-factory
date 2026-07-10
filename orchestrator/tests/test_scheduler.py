@@ -3,7 +3,7 @@
 
 import asyncio
 import time
-from datetime import UTC
+from datetime import UTC, datetime, timedelta
 from unittest.mock import AsyncMock, patch
 
 import pytest
@@ -6487,6 +6487,630 @@ class TestDeferredWatchDispatchGate:
             f'2217 (it never enters the candidate pool, so it must file no '
             f'dispatch/lock/starvation event); got: {events_for_deferred_task}'
         )
+
+
+# ---------------------------------------------------------------------------
+# Milestone time-gate (task 2335 β — docs/prds/milestone-tasks.md §6.2)
+# ---------------------------------------------------------------------------
+
+class TestMilestoneTimeGate:
+    """Unit tests for the pure predicate Scheduler._milestone_time_gated.
+
+    Mirrors TestDeferredWatchDispatchGate: _milestone_time_gated takes
+    now_wall as an explicit argument, so these tests pass datetime values
+    directly — no clock injection is needed to exercise the predicate.
+    """
+
+    def _task_with(self, metadata: dict) -> dict:
+        return {
+            'id': '3001',
+            'status': 'pending',
+            'dependencies': [],
+            'metadata': metadata,
+        }
+
+    def test_no_milestone_is_not_gated(self):
+        config = OrchestratorConfig(max_per_module=1)
+        scheduler = Scheduler(config)
+        task = self._task_with({'files': ['backend']})
+
+        assert scheduler._milestone_time_gated(task, datetime.now(UTC)) is False
+
+    def test_dated_withheld_before_at_and_released_at_or_after(self):
+        """B1: withhold while now_wall < at; release once now_wall >= at."""
+        config = OrchestratorConfig(max_per_module=1)
+        scheduler = Scheduler(config)
+        at = datetime(2026, 8, 1, tzinfo=UTC)
+        task = self._task_with(
+            {'milestone': {'mode': 'dated', 'at': at.isoformat()}}
+        )
+
+        assert scheduler._milestone_time_gated(task, at - timedelta(seconds=1)) is True
+        assert scheduler._milestone_time_gated(task, at) is False
+        assert scheduler._milestone_time_gated(task, at + timedelta(seconds=1)) is False
+
+    def test_delayed_without_anchor_is_withheld(self):
+        config = OrchestratorConfig(max_per_module=1)
+        scheduler = Scheduler(config)
+        task = self._task_with(
+            {'milestone': {'mode': 'delayed', 'after_secs': 604800}}
+        )
+
+        assert scheduler._milestone_time_gated(task, datetime.now(UTC)) is True
+
+    def test_delayed_timer_from_anchor(self):
+        """B3: withheld while now_wall < anchor+after_secs; released at/after."""
+        config = OrchestratorConfig(max_per_module=1)
+        scheduler = Scheduler(config)
+        anchor = datetime(2026, 7, 25, 9, 14, 3, tzinfo=UTC)
+        after_secs = 604800
+        task = self._task_with({
+            'milestone': {'mode': 'delayed', 'after_secs': after_secs},
+            'milestone_deps_satisfied_at': anchor.isoformat(),
+        })
+        fire_at = anchor + timedelta(seconds=after_secs)
+
+        assert scheduler._milestone_time_gated(task, fire_at - timedelta(seconds=1)) is True
+        assert scheduler._milestone_time_gated(task, fire_at) is False
+
+    def test_restart_survival_fresh_scheduler_gates_identically(self):
+        """B6: a FRESH Scheduler (no prior in-memory state) evaluating the same
+        persisted-anchor task dict gates identically — the predicate carries no
+        state of its own; only the passed-in task dict and now_wall matter."""
+        anchor = datetime(2026, 7, 25, 9, 14, 3, tzinfo=UTC)
+        after_secs = 604800
+        task = self._task_with({
+            'milestone': {'mode': 'delayed', 'after_secs': after_secs},
+            'milestone_deps_satisfied_at': anchor.isoformat(),
+        })
+        fire_at = anchor + timedelta(seconds=after_secs)
+
+        pre_restart = Scheduler(OrchestratorConfig(max_per_module=1))
+        assert pre_restart._milestone_time_gated(
+            task, fire_at - timedelta(seconds=1)
+        ) is True
+
+        # Simulate a process restart: a brand-new Scheduler instance, never
+        # having seen this task before, evaluating the SAME persisted dict.
+        fresh_scheduler = Scheduler(OrchestratorConfig(max_per_module=1))
+        assert fresh_scheduler._milestone_time_gated(task, fire_at) is False
+
+    @pytest.mark.parametrize('milestone,description', [
+        ('not-a-dict', 'non-dict milestone'),
+        ({'mode': 'unknown-mode'}, 'unknown mode'),
+        ({'mode': 'dated', 'at': 'not-a-timestamp'}, 'unparseable at'),
+        ({'mode': 'delayed', 'after_secs': 'a-week'}, 'non-int after_secs'),
+    ])
+    def test_malformed_milestone_fails_safe_withheld(self, milestone, description):
+        config = OrchestratorConfig(max_per_module=1)
+        scheduler = Scheduler(config)
+        metadata: dict = {'milestone': milestone}
+        if isinstance(milestone, dict) and milestone.get('mode') == 'delayed':
+            # Give it a valid-looking anchor so the malformed after_secs check
+            # itself is under test, not the "anchor unset" branch.
+            metadata['milestone_deps_satisfied_at'] = datetime.now(UTC).isoformat()
+        task = self._task_with(metadata)
+
+        assert scheduler._milestone_time_gated(task, datetime.now(UTC)) is True, (
+            f'Expected fail-safe withhold for {description}: {milestone!r}'
+        )
+
+    def test_tz_naive_at_is_treated_as_utc_not_permanent_withhold(self):
+        """A tz-naive `at` (the α Milestone model only requires
+        fromisoformat-parseable, not tz-aware) must be normalized to UTC and
+        eventually release the gate — not crash, and not withhold forever."""
+        config = OrchestratorConfig(max_per_module=1)
+        scheduler = Scheduler(config)
+        naive_at = datetime(2026, 8, 1)  # no tzinfo
+        task = self._task_with(
+            {'milestone': {'mode': 'dated', 'at': naive_at.isoformat()}}
+        )
+
+        assert scheduler._milestone_time_gated(
+            task, datetime(2026, 7, 1, tzinfo=UTC)
+        ) is True
+        assert scheduler._milestone_time_gated(
+            task, datetime(2026, 9, 1, tzinfo=UTC)
+        ) is False
+
+    def test_malformed_milestone_warning_deduped_per_task_and_cause(self, caplog):
+        """reviewer_comprehensive observability finding (task 2335 β
+        amendment): _milestone_time_gated is invoked once per candidate loop
+        (scored + pin), every tick, for as long as a task stays pending —
+        without dedup a permanently-malformed milestone would log the
+        identical WARNING forever. Assert it logs exactly once across
+        repeated calls with the SAME malformed value, and logs again if the
+        malformed value actually changes (state change)."""
+        import logging
+
+        config = OrchestratorConfig(max_per_module=1)
+        scheduler = Scheduler(config)
+        task = self._task_with({'milestone': 'not-a-dict'})
+
+        with caplog.at_level(logging.WARNING, logger='orchestrator.scheduler'):
+            for _ in range(3):
+                assert scheduler._milestone_time_gated(task, datetime.now(UTC)) is True
+
+        not_a_dict_warnings = [
+            r for r in caplog.records if 'metadata.milestone is not a dict' in r.getMessage()
+        ]
+        assert len(not_a_dict_warnings) == 1, (
+            f'Expected exactly one WARNING for 3 calls with the same malformed '
+            f'value; got {len(not_a_dict_warnings)} '
+            f'records={[r.getMessage() for r in caplog.records]!r}'
+        )
+
+        # A different malformed value for the SAME task (state change) warns again.
+        task_changed = self._task_with({'milestone': {'mode': 'still-unknown'}})
+        with caplog.at_level(logging.WARNING, logger='orchestrator.scheduler'):
+            assert scheduler._milestone_time_gated(task_changed, datetime.now(UTC)) is True
+
+        unknown_mode_warnings = [
+            r for r in caplog.records if 'unknown mode' in r.getMessage()
+        ]
+        assert len(unknown_mode_warnings) == 1, (
+            f'Expected a fresh WARNING when the malformed cause changes; '
+            f'got records={[r.getMessage() for r in caplog.records]!r}'
+        )
+
+    def test_malformed_milestone_warning_deduped_across_two_tasks_independently(self):
+        """The dedup key includes task_id — a second, independently
+        malformed task must still warn (its own streak starts fresh),
+        proving the dedup does not cross task boundaries."""
+        config = OrchestratorConfig(max_per_module=1)
+        scheduler = Scheduler(config)
+        task_a = {**self._task_with({'milestone': 'not-a-dict'}), 'id': '3001'}
+        task_b = {**self._task_with({'milestone': 'not-a-dict'}), 'id': '3002'}
+
+        assert scheduler._milestone_time_gated(task_a, datetime.now(UTC)) is True
+        assert scheduler._streak_milestone_malformed.value('3001') == 1
+        assert scheduler._streak_milestone_malformed.value('3002') == 0
+
+        assert scheduler._milestone_time_gated(task_b, datetime.now(UTC)) is True
+        assert scheduler._streak_milestone_malformed.value('3002') == 1
+
+
+class TestMilestoneEligibilityGate:
+    """The milestone time-gate wired into Scheduler._eligible_for_dispatch,
+    plus the injectable ``wall_time_source`` DI (task 2335 β step-3/4).
+
+    Mirrors TestDeferredWatchDispatchGate's eligibility-altitude tests and
+    TestDispatchCooldownGate's injected-clock acquire_next() observable.
+    """
+
+    def _pending_task_with(
+        self, task_id: str, metadata: dict, dependencies: list | None = None
+    ) -> dict:
+        return {
+            'id': task_id,
+            'status': 'pending',
+            'dependencies': dependencies or [],
+            'metadata': metadata,
+        }
+
+    def test_dated_milestone_gates_eligibility_until_fired(self):
+        """B1 via eligibility: ineligible while fake_now < at; eligible once
+        fake_now >= at."""
+        at = datetime(2026, 8, 1, tzinfo=UTC)
+        fake_now = [at - timedelta(seconds=1)]
+        config = OrchestratorConfig(max_per_module=1)
+        scheduler = Scheduler(config, wall_time_source=lambda: fake_now[0])
+
+        task = self._pending_task_with(
+            '4001', {'milestone': {'mode': 'dated', 'at': at.isoformat()}}
+        )
+        status_map: dict[str, str] = {}
+
+        assert scheduler._eligible_for_dispatch(task, '4001', status_map) == (False, None)
+
+        fake_now[0] = at
+        assert scheduler._eligible_for_dispatch(task, '4001', status_map) == (True, None)
+
+    def test_dated_milestone_gates_normal_task_kind_too(self):
+        """B12: the milestone gate is orthogonal to task_kind — a
+        task_kind='normal' milestone task is held/released identically."""
+        at = datetime(2026, 8, 1, tzinfo=UTC)
+        fake_now = [at - timedelta(seconds=1)]
+        config = OrchestratorConfig(max_per_module=1)
+        scheduler = Scheduler(config, wall_time_source=lambda: fake_now[0])
+
+        task = self._pending_task_with('4002', {
+            'task_kind': 'normal',
+            'milestone': {'mode': 'dated', 'at': at.isoformat()},
+        })
+        status_map: dict[str, str] = {}
+
+        assert scheduler._eligible_for_dispatch(task, '4002', status_map) == (False, None)
+
+        fake_now[0] = at
+        assert scheduler._eligible_for_dispatch(task, '4002', status_map) == (True, None)
+
+    def test_delayed_milestone_dep_regression_still_withholds_after_elapse(self):
+        """B5: even after the delayed timer has elapsed, a live unsatisfied
+        dependency still blocks dispatch — _deps_satisfied is re-checked live
+        at eligibility time, not just the frozen-once anchor."""
+        anchor = datetime(2026, 7, 25, tzinfo=UTC)
+        after_secs = 100
+        fake_now = [anchor + timedelta(seconds=after_secs + 1)]  # timer elapsed
+        config = OrchestratorConfig(max_per_module=1)
+        scheduler = Scheduler(config, wall_time_source=lambda: fake_now[0])
+
+        task = self._pending_task_with(
+            '4003',
+            {
+                'milestone': {'mode': 'delayed', 'after_secs': after_secs},
+                'milestone_deps_satisfied_at': anchor.isoformat(),
+            },
+            dependencies=[{'id': 'X'}],
+        )
+        status_map = {'X': 'pending'}  # dep regressed back to pending
+
+        assert scheduler._eligible_for_dispatch(task, '4003', status_map) == (False, None)
+
+    def test_non_milestone_pending_task_is_unaffected(self):
+        config = OrchestratorConfig(max_per_module=1)
+        scheduler = Scheduler(config, wall_time_source=lambda: datetime.now(UTC))
+
+        task = self._pending_task_with('4004', {'files': ['backend']})
+        status_map: dict[str, str] = {}
+
+        assert scheduler._eligible_for_dispatch(task, '4004', status_map) == (True, None)
+
+    @pytest.mark.asyncio
+    async def test_acquire_next_withholds_dated_milestone_until_fired(self, monkeypatch):
+        """acquire_next()-level observable: returns None while fake_now < at,
+        returns the task once fake_now >= at."""
+        import json as _json
+
+        at = datetime(2026, 8, 1, tzinfo=UTC)
+        fake_now = [at - timedelta(seconds=1)]
+
+        task = {
+            'id': '4005',
+            'title': 'Dated milestone task',
+            'status': 'pending',
+            'dependencies': [],
+            'metadata': {'milestone': {'mode': 'dated', 'at': at.isoformat()}},
+        }
+        task_response = {
+            'result': {
+                'content': [
+                    {'type': 'text', 'text': _json.dumps({'tasks': [task]})}
+                ]
+            }
+        }
+
+        config = OrchestratorConfig(max_per_module=1)
+        scheduler = Scheduler(config, wall_time_source=lambda: fake_now[0])
+
+        mock = AsyncMock(return_value=task_response)
+        monkeypatch.setattr('orchestrator.scheduler.mcp_call', mock)
+
+        result_before = await scheduler.acquire_next()
+        assert result_before is None, 'Milestone must withhold dispatch before `at`'
+
+        fake_now[0] = at
+        result_after = await scheduler.acquire_next()
+        assert result_after is not None and result_after.task_id == '4005', (
+            'Milestone must dispatch once now_wall >= at'
+        )
+
+
+class TestStampMilestoneDepsSatisfied:
+    """Unit tests for the per-tick sweep
+    Scheduler._stamp_milestone_deps_satisfied (task 2335 β step-5/6).
+
+    Mirrors _gc_expired_cooldowns' shape: a side-effecting per-tick sweep
+    that keeps _eligible_for_dispatch / _milestone_time_gated pure. For each
+    pending 'delayed' milestone task without an anchor yet, it stamps the
+    frozen-once ``milestone_deps_satisfied_at`` wall-clock timestamp via
+    ``update_task(..., metadata_mode='merge')`` the instant the task's full
+    (local + external) deps become satisfied.
+    """
+
+    FIXED_DT = datetime(2026, 7, 10, 12, 0, 0, tzinfo=UTC)
+
+    @pytest.fixture
+    def scheduler(self) -> Scheduler:
+        config = OrchestratorConfig(max_per_module=1)
+        sched = Scheduler(config, wall_time_source=lambda: self.FIXED_DT)
+        sched.update_task = AsyncMock(return_value=True)
+        return sched
+
+    def _task(
+        self, task_id: str, metadata: dict, dependencies: list | None = None
+    ) -> dict:
+        return {
+            'id': task_id,
+            'status': 'pending',
+            'dependencies': dependencies or [],
+            'metadata': metadata,
+        }
+
+    @pytest.mark.asyncio
+    async def test_stamps_anchor_when_delayed_milestone_deps_satisfied(
+        self, scheduler: Scheduler
+    ):
+        """B2: dep X done -> exactly one update_task call stamping the
+        wall-clock anchor, with metadata_mode='merge'."""
+        task = self._task(
+            '5001',
+            {'milestone': {'mode': 'delayed', 'after_secs': 100}},
+            dependencies=[{'id': 'X'}],
+        )
+        tasks = [task]
+        status_map = {'X': 'done', '5001': 'pending'}
+        tasks_by_id = {'5001': task}
+
+        await scheduler._stamp_milestone_deps_satisfied(tasks, status_map, tasks_by_id)
+
+        scheduler.update_task.assert_awaited_once_with(  # type: ignore[attr-defined]
+            '5001',
+            {'milestone_deps_satisfied_at': self.FIXED_DT.isoformat()},
+            metadata_mode='merge',
+        )
+
+    @pytest.mark.asyncio
+    async def test_no_stamp_while_local_dep_unsatisfied(self, scheduler: Scheduler):
+        """No update_task while dep X is still pending."""
+        task = self._task(
+            '5002',
+            {'milestone': {'mode': 'delayed', 'after_secs': 100}},
+            dependencies=[{'id': 'X'}],
+        )
+        tasks = [task]
+        status_map = {'X': 'pending', '5002': 'pending'}
+        tasks_by_id = {'5002': task}
+
+        await scheduler._stamp_milestone_deps_satisfied(tasks, status_map, tasks_by_id)
+
+        scheduler.update_task.assert_not_awaited()  # type: ignore[attr-defined]
+
+    @pytest.mark.asyncio
+    async def test_frozen_once_skips_task_with_existing_anchor(
+        self, scheduler: Scheduler
+    ):
+        """B4: a task that already carries milestone_deps_satisfied_at is
+        never re-stamped, even though its deps are (still) satisfied."""
+        existing_anchor = datetime(2026, 7, 1, tzinfo=UTC).isoformat()
+        task = self._task(
+            '5003',
+            {
+                'milestone': {'mode': 'delayed', 'after_secs': 100},
+                'milestone_deps_satisfied_at': existing_anchor,
+            },
+            dependencies=[{'id': 'X'}],
+        )
+        tasks = [task]
+        status_map = {'X': 'done', '5003': 'pending'}
+        tasks_by_id = {'5003': task}
+
+        await scheduler._stamp_milestone_deps_satisfied(tasks, status_map, tasks_by_id)
+
+        scheduler.update_task.assert_not_awaited()  # type: ignore[attr-defined]
+
+    @pytest.mark.asyncio
+    async def test_dated_milestone_is_not_swept(self, scheduler: Scheduler):
+        """A 'dated' milestone has no deps-satisfied anchor concept — the
+        sweep must ignore it."""
+        task = self._task(
+            '5004', {'milestone': {'mode': 'dated', 'at': self.FIXED_DT.isoformat()}}
+        )
+        tasks = [task]
+        status_map = {'5004': 'pending'}
+        tasks_by_id = {'5004': task}
+
+        await scheduler._stamp_milestone_deps_satisfied(tasks, status_map, tasks_by_id)
+
+        scheduler.update_task.assert_not_awaited()  # type: ignore[attr-defined]
+
+    @pytest.mark.asyncio
+    async def test_non_milestone_task_is_not_swept(self, scheduler: Scheduler):
+        """A plain pending task with no metadata.milestone is skipped."""
+        task = self._task('5005', {'files': ['backend']})
+        tasks = [task]
+        status_map = {'5005': 'pending'}
+        tasks_by_id = {'5005': task}
+
+        await scheduler._stamp_milestone_deps_satisfied(tasks, status_map, tasks_by_id)
+
+        scheduler.update_task.assert_not_awaited()  # type: ignore[attr-defined]
+
+    @pytest.mark.asyncio
+    async def test_skips_when_external_dep_not_done(self, scheduler: Scheduler):
+        """The anchor must reflect BOTH local and external deps (PRD §2 gap
+        2): a not-done external dep withholds the stamp even with no local
+        deps at all."""
+        task = self._task(
+            '5006',
+            {
+                'milestone': {'mode': 'delayed', 'after_secs': 100},
+                'external_deps': ['other_project:99'],
+            },
+        )
+        tasks = [task]
+        status_map = {'5006': 'pending'}
+        tasks_by_id = {'5006': task}
+
+        await scheduler._stamp_milestone_deps_satisfied(
+            tasks, status_map, tasks_by_id,
+            external_status_cache={'other_project:99': 'pending'},
+            external_resolver_failed=False,
+        )
+
+        scheduler.update_task.assert_not_awaited()  # type: ignore[attr-defined]
+
+    @pytest.mark.asyncio
+    async def test_stamps_when_external_dep_resolves_done(self, scheduler: Scheduler):
+        """Positive counterpart to the previous test: once the external dep
+        resolves to 'done', the anchor is stamped."""
+        task = self._task(
+            '5007',
+            {
+                'milestone': {'mode': 'delayed', 'after_secs': 100},
+                'external_deps': ['other_project:99'],
+            },
+        )
+        tasks = [task]
+        status_map = {'5007': 'pending'}
+        tasks_by_id = {'5007': task}
+
+        await scheduler._stamp_milestone_deps_satisfied(
+            tasks, status_map, tasks_by_id,
+            external_status_cache={'other_project:99': 'done'},
+            external_resolver_failed=False,
+        )
+
+        scheduler.update_task.assert_awaited_once_with(  # type: ignore[attr-defined]
+            '5007',
+            {'milestone_deps_satisfied_at': self.FIXED_DT.isoformat()},
+            metadata_mode='merge',
+        )
+
+    @pytest.mark.asyncio
+    async def test_one_task_failure_does_not_abort_sweep_for_remaining_tasks(
+        self, scheduler: Scheduler
+    ):
+        """reviewer_comprehensive test-coverage finding (task 2335 β
+        amendment): the docstring claims each task's stamp attempt is
+        wrapped so a single failure never aborts the sweep for the
+        remaining tasks. Exercise it directly — update_task raises for the
+        first of two eligible tasks — and assert the second is still
+        stamped (update_task awaited for both ids, second call succeeds)."""
+        task_a = self._task(
+            '5008',
+            {'milestone': {'mode': 'delayed', 'after_secs': 100}},
+            dependencies=[{'id': 'X'}],
+        )
+        task_b = self._task(
+            '5009',
+            {'milestone': {'mode': 'delayed', 'after_secs': 100}},
+            dependencies=[{'id': 'Y'}],
+        )
+        tasks = [task_a, task_b]
+        status_map = {'X': 'done', 'Y': 'done', '5008': 'pending', '5009': 'pending'}
+        tasks_by_id = {'5008': task_a, '5009': task_b}
+        scheduler.update_task = AsyncMock(side_effect=[Exception('boom'), True])
+
+        await scheduler._stamp_milestone_deps_satisfied(tasks, status_map, tasks_by_id)
+
+        assert scheduler.update_task.await_count == 2  # type: ignore[attr-defined]
+        scheduler.update_task.assert_any_await(  # type: ignore[attr-defined]
+            '5008',
+            {'milestone_deps_satisfied_at': self.FIXED_DT.isoformat()},
+            metadata_mode='merge',
+        )
+        scheduler.update_task.assert_any_await(  # type: ignore[attr-defined]
+            '5009',
+            {'milestone_deps_satisfied_at': self.FIXED_DT.isoformat()},
+            metadata_mode='merge',
+        )
+
+
+class TestMilestoneSweepDrivenByAcquireNext:
+    """acquire_next() drives Scheduler._stamp_milestone_deps_satisfied once
+    per tick (task 2335 β step-7/8).
+
+    An integration-altitude counterpart to TestStampMilestoneDepsSatisfied's
+    direct unit tests: here the sweep is exercised only through the public
+    acquire_next() entry point, with mocked mcp_call (for get_tasks) and a
+    spied update_task — mirroring TestMilestoneEligibilityGate's
+    test_acquire_next_withholds_dated_milestone_until_fired.
+    """
+
+    FIXED_DT = datetime(2026, 7, 10, 12, 0, 0, tzinfo=UTC)
+
+    def _task_response(self, tasks: list[dict]) -> dict:
+        import json as _json
+        return {
+            'result': {
+                'content': [
+                    {'type': 'text', 'text': _json.dumps({'tasks': tasks})}
+                ]
+            }
+        }
+
+    @pytest.mark.asyncio
+    async def test_acquire_next_stamps_anchor_when_deps_satisfied(self, monkeypatch):
+        """B2 via acquire_next: a pending 'delayed' milestone task whose dep
+        is already 'done' (and carries no anchor yet) gets
+        milestone_deps_satisfied_at stamped via update_task during a single
+        acquire_next() tick. RED until the sweep is wired into acquire_next
+        (step-8) — pre-wiring, update_task is never called."""
+        dep_task = {
+            'id': 'X',
+            'title': 'Dependency (done)',
+            'status': 'done',
+            'dependencies': [],
+            'metadata': {},
+        }
+        milestone_task = {
+            'id': '4006',
+            'title': 'Delayed milestone task (deps satisfied)',
+            'status': 'pending',
+            'dependencies': [{'id': 'X'}],
+            'metadata': {'milestone': {'mode': 'delayed', 'after_secs': 100}},
+        }
+
+        config = OrchestratorConfig(max_per_module=1)
+        scheduler = Scheduler(config, wall_time_source=lambda: self.FIXED_DT)
+        scheduler.update_task = AsyncMock(return_value=True)
+
+        monkeypatch.setattr(
+            'orchestrator.scheduler.mcp_call',
+            AsyncMock(return_value=self._task_response([dep_task, milestone_task])),
+        )
+
+        result = await scheduler.acquire_next()
+
+        assert result is None, (
+            'The milestone gate still withholds dispatch this tick — the '
+            'anchor just stamped is only visible on the next tick\'s get_tasks'
+        )
+        scheduler.update_task.assert_awaited_once_with(
+            '4006',
+            {'milestone_deps_satisfied_at': self.FIXED_DT.isoformat()},
+            metadata_mode='merge',
+        )
+
+    @pytest.mark.asyncio
+    async def test_acquire_next_does_not_stamp_when_dep_still_pending(self, monkeypatch):
+        """The sweep must NOT stamp the anchor while the dep is still
+        pending — across a tick, no update_task call is made.
+
+        The dep task itself is 'in-progress' (not done) rather than
+        'pending' so that it is not itself a dispatch candidate — this test
+        isolates the milestone task's stamp behaviour from the dep task's
+        own eligibility.
+        """
+        dep_task = {
+            'id': 'X',
+            'title': 'Dependency (still in progress)',
+            'status': 'in-progress',
+            'dependencies': [],
+            'metadata': {},
+        }
+        milestone_task = {
+            'id': '4007',
+            'title': 'Delayed milestone task (deps unsatisfied)',
+            'status': 'pending',
+            'dependencies': [{'id': 'X'}],
+            'metadata': {'milestone': {'mode': 'delayed', 'after_secs': 100}},
+        }
+
+        config = OrchestratorConfig(max_per_module=1)
+        scheduler = Scheduler(config, wall_time_source=lambda: self.FIXED_DT)
+        scheduler.update_task = AsyncMock(return_value=True)
+
+        monkeypatch.setattr(
+            'orchestrator.scheduler.mcp_call',
+            AsyncMock(return_value=self._task_response([dep_task, milestone_task])),
+        )
+
+        result = await scheduler.acquire_next()
+
+        assert result is None
+        scheduler.update_task.assert_not_awaited()
 
 
 # ---------------------------------------------------------------------------
