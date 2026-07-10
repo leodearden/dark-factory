@@ -959,6 +959,7 @@ class TestRunApplyDispatch:
             rewrite_group_id='dark_factory',
         )
         recreate_mock.assert_awaited_once()
+        assert recreate_mock.await_args is not None
         specs_arg = recreate_mock.await_args.args[1]
         assert {spec['uuid'] for spec in specs_arg} == {'u-move', 'u-merge'}
         delete_calls = {call.args[1]: call.args[2] for call in delete_mock.await_args_list}
@@ -1268,6 +1269,7 @@ class TestRunApplyExceptionIsolation:
         # The failed MOVE's spec is excluded from the Phase-B batch -- only
         # the surviving MERGE spec is offered to recreate_subgraph_relationships.
         recreate_mock.assert_awaited_once()
+        assert recreate_mock.await_args is not None
         specs_arg = recreate_mock.await_args.args[1]
         assert {spec['uuid'] for spec in specs_arg} == {'u-merge'}
 
@@ -1564,6 +1566,7 @@ class TestRunApplyCoMovingPreserved:
         report = await _mod.run(args, memory_service)
 
         recreate_mock.assert_awaited_once()
+        assert recreate_mock.await_args is not None
         specs_arg = recreate_mock.await_args.args[1]
         assert {spec['uuid'] for spec in specs_arg} == {'u-A', 'u-B'}
 
