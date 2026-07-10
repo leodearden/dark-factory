@@ -21,6 +21,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any, Literal, TypeAlias, assert_never
 
 from orchestrator.git_ops import MergeResult
+from orchestrator.merge_disposition import MergeFailureDisposition
 from orchestrator.verify import VerifyResult
 
 if TYPE_CHECKING:
@@ -753,6 +754,12 @@ class MergeOutcome:
     """Carries the preexisting-main-break dedupe fingerprint so the workflow
     can fold N concurrent failing merges into one parent escalation via
     ``submit_or_dedupe``.  Empty for all non-main-health outcomes."""
+    disposition: MergeFailureDisposition = MergeFailureDisposition.INDETERMINATE
+    """Merge-skew attribution verdict from ``classify_merge_failure_disposition``
+    (task 2381 α, mechanism M1 of plans/merge-skew-attribution-prd.md).
+    Defaults to INDETERMINATE, preserving today's behaviour for callers that
+    do not yet populate it (β routing/surfacing + γ runs.db event depend on
+    this field, keying off α alone — no dependency inversion)."""
 
 
 @dataclass

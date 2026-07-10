@@ -70,6 +70,18 @@ class EventType(StrEnum):
     set_to_plan = 'set_to_plan'
     merge_attempt = 'merge_attempt'
     merge_verify = 'merge_verify'
+    # The branch's OWN pre-merge verify verdict, recorded by the orchestrator
+    # workflow VERIFY phase (branch-vs-its-merge-base) — distinct from
+    # merge_verify, which is the merge worker's POST-rebase verify (branch
+    # already merged onto CURRENT main).  task_id-keyed; data carries at least
+    # {passed: bool, base_sha: str, branch: str}.  Consumed by the merge-skew
+    # attribution classifier's I5 branch-green fact (merge_disposition.
+    # _branch_pre_merge_verify_green).  Task 2381 α adds this member + the
+    # reader; task 2383 β emits it at the workflow VERIFY-pass site.  Its
+    # ABSENCE is honest, not a bug: non-orchestrator paths (/merge-queue,
+    # /unblock, /do) submit branches without emitting it -> classifier
+    # degrades to INDETERMINATE by design.
+    workflow_verify = 'workflow_verify'
     verdict_parity_ok = 'verdict_parity_ok'
     # data.queue_depth = depth-at-enqueue INCLUDING the newly-queued item
     # (CAS-retry: qsize()+len(urgent)+1; plain enqueue: qsize() after put)
