@@ -1379,7 +1379,7 @@ class TestRunPostVerify:
 
     @pytest.mark.asyncio
     async def test_any_unresolved_node_forces_nonzero_exit_even_if_counts_reconcile(
-        self, tmp_path, monkeypatch,
+        self, tmp_path,
     ):
         """An UNRESOLVED node blocks --apply's success regardless of whether
         the post-apply re-census otherwise reconciles: the residual foreign
@@ -1393,20 +1393,8 @@ class TestRunPostVerify:
             tmp_path, [unresolved_node], {'reify': 1, 'dark_factory': 0},
         )
 
-        # return_value is a real, zero-loss MoveResult/MergeResult (not a
-        # bare AsyncMock()) -- run() now reads edges_skipped/mentions_skipped/
-        # home_edge_count_after off the result (see _move_result_entry/
-        # _merge_result_entry), and an unconfigured MagicMock's truthy
-        # attributes and non-identical `+` result would otherwise be
-        # misread as a lossy outcome, spuriously flipping 'blocked' to True.
-        monkeypatch.setattr(
-            _mod, 'move_entity_across_graphs',
-            AsyncMock(return_value=MoveResult(uuid='u', source_graph='s', target_graph='t')),
-        )
-        monkeypatch.setattr(
-            _mod, 'merge_foreign_duplicate',
-            AsyncMock(return_value=MergeResult(uuid='u', wrong_graph='s', home_graph='t')),
-        )
+        # No MOVE/MERGE node is present in this manifest, so none of the
+        # three phase primitives are ever invoked -- nothing to monkeypatch.
 
         memory_service = _make_memory_service({
             'reify': _make_graph_mock(
