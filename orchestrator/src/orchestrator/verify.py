@@ -36,6 +36,7 @@ from orchestrator.verify_categories import (
 )
 from orchestrator.verify_cmd import (
     ToolKind,
+    cargo_scope,
     parse_config_command,
     render,
     reproject,
@@ -158,6 +159,38 @@ def _reproject_str(cmd: str | None, project: str) -> str | None:
     if parsed.tool is ToolKind.OPAQUE or parsed.raw is not None:
         return cmd
     return render(reproject(parsed, project))
+
+
+def _cargo_scope_str(cmd: str | None, crates: list[str]) -> str | None:
+    """Rewrite a cargo ``--workspace`` command to per-crate ``-p`` scoping via VerifyCmd.
+
+    Thin string-level wrapper around ``parse_config_command`` ->
+    ``cargo_scope`` -> ``render`` (replaces ``_scope_cargo_workspace``).
+    Mirrors ``_scope_to_keyword``/``_reproject_str``'s guard style: a cheap
+    ``'--workspace'`` substring pre-check (identical to the old helper's)
+    skips parsing entirely for a command with plainly nothing for
+    ``cargo_scope`` to act on, and an identity check after mutating skips
+    rendering when ``cargo_scope`` legitimately no-ops (a non-cargo
+    ToolKind, including OPAQUE — P1) — so such commands come back
+    byte-identical rather than reformatted (``render``'s canonical
+    flags-then-targets ordering is not guaranteed byte-identical to
+    arbitrary input token ordering). This is also what keeps an
+    unparseable-but-``--workspace``-bearing command from being mangled: it
+    parses OPAQUE, ``cargo_scope`` no-ops on it, and the identity check
+    short-circuits before ``render`` is ever called.
+
+    Returns *cmd* unchanged when: *cmd* is ``None``; *crates* is empty;
+    ``'--workspace'`` is not a substring of *cmd*; or ``cargo_scope``
+    no-ops (non-cargo ToolKind/OPAQUE, or a raw-retained chain with no
+    ``--workspace`` in it).
+    """
+    if cmd is None or not crates or '--workspace' not in cmd:
+        return cmd
+    parsed = parse_config_command(cmd)
+    scoped = cargo_scope(parsed, crates)
+    if scoped is parsed:
+        return cmd
+    return render(scoped)
 
 
 def _is_test_file(path: str) -> bool:
@@ -353,10 +386,6 @@ def _scope_fallback_tool_to_subproject(cmd: str | None, tool_keyword: str, sub: 
     return before + render(reprojected) + after
 
 
-# Cargo subcommands whose ``--workspace`` flag we know how to rewrite.  Other
-# cargo subcommands (doc, bench, ...) are left alone to avoid semantic drift.
-_CARGO_SUBCMDS = ('test', 'clippy', 'check', 'build', 'run')
-
 # Non-.rs file extensions that are safe to ignore when deciding whether to scope
 # cargo commands to individual crates.  These are pure config/data files that
 # do not contain executable source code and therefore don't require running a
@@ -374,24 +403,6 @@ _CARGO_SCOPE_SAFE_NON_RS_EXTS = frozenset({'.toml', '.yaml', '.yml', '.json', '.
 # ``rust-toolchain`` is a rustup toolchain pin file with no extension (unlike
 # ``rust-toolchain.toml``, which is already handled by the ``.toml`` whitelist).
 _CARGO_SCOPE_SAFE_NON_RS_NAMES = frozenset({'Cargo.lock', 'rust-toolchain'})
-
-# Pre-compiled regex that matches ``cargo <subcmd> ...--workspace`` where
-# ``...`` does not cross a shell delimiter (``&&``, ``||``, ``;``, ``|``),
-# so chained non-cargo commands (like ``cd gui && npm test``) are left alone.
-_CARGO_WORKSPACE_RE = re.compile(
-    r'(cargo\s+(?:' + '|'.join(_CARGO_SUBCMDS) + r')\b[^&|;]*?)'
-    r'\s--workspace\b',
-)
-
-# Matches ``--exclude <name>`` inside the same cargo subcommand segment.
-# After ``--workspace`` is replaced with ``-p <crate>``, any lingering
-# ``--exclude`` flags become invalid (cargo rejects them with "--exclude
-# can only be used together with --workspace"), so they must be stripped
-# from the rewritten segment.
-_CARGO_EXCLUDE_RE = re.compile(
-    r'(cargo\s+(?:' + '|'.join(_CARGO_SUBCMDS) + r')\b[^&|;]*?)'
-    r'\s--exclude(?:\s+|=)\S+',
-)
 
 
 # Pytest-aware cause-hint patterns. Anchored to whole lines so they don't
@@ -1301,42 +1312,6 @@ async def _derive_task_files_from_git(
     return None
 
 
-def _scope_cargo_workspace(cmd: str | None, crates: list[str]) -> str | None:
-    """Rewrite ``cargo ... --workspace`` → ``cargo ... -p c1 -p c2 ...``.
-
-    Returns *cmd* unchanged when:
-    - *cmd* is ``None``
-    - *crates* is empty
-    - ``--workspace`` is not present
-    - no cargo subcommand we recognise precedes ``--workspace``
-
-    Supported cargo subcommands: test, clippy, check, build, run.
-
-    Flags present between ``cargo <subcmd>`` and ``--workspace`` (e.g.,
-    ``--all-targets``, ``--tests``, ``--lib``, ``-F <feature>``) and trailing
-    args (``-- --test-threads=1``) are preserved verbatim — the helper only
-    substitutes the ``--workspace`` token.  Chained shell commands after
-    ``&&``/``||``/``;``/``|`` are untouched.
-    """
-    if cmd is None or not crates:
-        return cmd
-    if '--workspace' not in cmd:
-        return cmd
-
-    p_flags = ' '.join(f'-p {c}' for c in crates)
-    new_cmd = _CARGO_WORKSPACE_RE.sub(
-        lambda m: f'{m.group(1)} {p_flags}', cmd,
-    )
-    # Strip any ``--exclude <name>`` pairs from the rewritten cargo segment;
-    # they are only valid with ``--workspace`` and cargo errors out otherwise.
-    # Loop until stable to handle multiple ``--exclude`` flags on one cmd.
-    prev = None
-    while prev != new_cmd:
-        prev = new_cmd
-        new_cmd = _CARGO_EXCLUDE_RE.sub(lambda m: m.group(1), new_cmd)
-    return new_cmd
-
-
 def _apply_cargo_scope(
     mc: ModuleConfig,
     task_files: list[str],
@@ -1389,9 +1364,9 @@ def _apply_cargo_scope(
     if not matched:
         return mc
 
-    new_test = _scope_cargo_workspace(mc.test_command, matched)
-    new_lint = _scope_cargo_workspace(mc.lint_command, matched)
-    new_type = _scope_cargo_workspace(mc.type_check_command, matched)
+    new_test = _cargo_scope_str(mc.test_command, matched)
+    new_lint = _cargo_scope_str(mc.lint_command, matched)
+    new_type = _cargo_scope_str(mc.type_check_command, matched)
 
     if (new_test, new_lint, new_type) == (
         mc.test_command, mc.lint_command, mc.type_check_command,
