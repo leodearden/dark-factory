@@ -288,3 +288,20 @@ def scope_to(cmd: VerifyCmd, files: list[str]) -> VerifyCmd:
     if cmd.tool is ToolKind.OPAQUE or cmd.raw is not None or not files:
         return cmd
     return replace(cmd, targets=tuple(files))
+
+
+def strip_cwd(cmd: VerifyCmd) -> VerifyCmd:
+    """Return *cmd* with ``cwd_rel`` cleared to ``None``.
+
+    Unifies the two historical cwd-shifting forms — a leading ``cd <dir> &&``
+    (old ``_strip_leading_cd``) and a uv ``--directory <dir>`` flag (old
+    ``_strip_directory_flag``) — since ``parse_config_command`` already
+    folds both into the single ``cwd_rel`` field. ``uv_project`` (``--project``)
+    is left untouched: it selects the venv, independent of cwd.
+
+    A no-op on ``cmd.tool is ToolKind.OPAQUE`` (P1) or a raw-retained chain
+    (``cmd.raw is not None``) — neither carries a meaningful ``cwd_rel``.
+    """
+    if cmd.tool is ToolKind.OPAQUE or cmd.raw is not None:
+        return cmd
+    return replace(cmd, cwd_rel=None)
