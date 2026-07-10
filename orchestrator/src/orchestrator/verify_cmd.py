@@ -19,6 +19,7 @@ Replaces verify.py's raw-shell-string find/replace-surgery command model
 
 from __future__ import annotations
 
+import re
 import shlex
 from collections.abc import Mapping
 from dataclasses import dataclass, field, replace
@@ -325,3 +326,85 @@ def reproject(cmd: VerifyCmd, project: str) -> VerifyCmd:
     if cmd.uv_project != '' or cmd.cwd_rel is not None:
         return cmd
     return replace(cmd, uv_project=project)
+
+
+# Cargo subcommands whose --workspace flag we know how to rewrite. Other
+# cargo subcommands (doc, bench, ...) are left alone to avoid semantic drift.
+# Moved from verify.py's _scope_cargo_workspace / _CARGO_SUBCMDS.
+_CARGO_SUBCMDS = ('test', 'clippy', 'check', 'build', 'run')
+
+# Matches `cargo <subcmd> ...--workspace` where `...` does not cross a shell
+# delimiter (&&, ||, ;, |), so a chained non-cargo command is left alone.
+_CARGO_WORKSPACE_RE = re.compile(
+    r'(cargo\s+(?:' + '|'.join(_CARGO_SUBCMDS) + r')\b[^&|;]*?)' r'\s--workspace\b',
+)
+
+# Matches `--exclude <name>` (or `--exclude=name`) inside the same cargo
+# subcommand segment — invalid once --workspace is replaced with -p <crate>
+# (cargo rejects "--exclude can only be used together with --workspace").
+_CARGO_EXCLUDE_RE = re.compile(
+    r'(cargo\s+(?:' + '|'.join(_CARGO_SUBCMDS) + r')\b[^&|;]*?)' r'\s--exclude(?:\s+|=)\S+',
+)
+
+
+def cargo_scope(cmd: VerifyCmd, crates: list[str]) -> VerifyCmd:
+    """Return *cmd* with ``cargo ... --workspace`` rewritten to ``-p <crate>`` per crate.
+
+    No-ops when *cmd* isn't a cargo ToolKind (covers OPAQUE — P1) or *crates*
+    is empty. For a structured cargo command (``cmd.raw is None``), rewrites
+    ``targets`` in place: ``--workspace`` is replaced (at its own position)
+    by ``-p c1 -p c2 ...`` and every ``--exclude``/``--exclude=value`` pair
+    is dropped, preserving any trailing ``-- <passthrough>`` after the
+    inserted crate flags (regression fd4758fcff). For a raw-retained cargo
+    chain (e.g. the reify 4-segment ``gated.sh cargo test ... && ...
+    --workspace --exclude ...``), applies the same rewrite as a localised
+    regex substitution on ``raw`` — gated segments with no ``--workspace``
+    are left byte-identical (regression: reify test A4).
+    """
+    if cmd.tool not in (ToolKind.CARGO_TEST, ToolKind.CARGO_CLIPPY):
+        return cmd
+    if not crates:
+        return cmd
+    if cmd.raw is not None:
+        return _cargo_scope_raw(cmd, crates)
+    return _cargo_scope_structured(cmd, crates)
+
+
+def _cargo_scope_raw(cmd: VerifyCmd, crates: list[str]) -> VerifyCmd:
+    raw = cmd.raw
+    assert raw is not None
+    if '--workspace' not in raw:
+        return cmd
+    p_flags = ' '.join(f'-p {c}' for c in crates)
+    new_raw = _CARGO_WORKSPACE_RE.sub(lambda m: f'{m.group(1)} {p_flags}', raw)
+    # Loop until stable to handle multiple --exclude flags on one command.
+    prev = None
+    while prev != new_raw:
+        prev = new_raw
+        new_raw = _CARGO_EXCLUDE_RE.sub(lambda m: m.group(1), new_raw)
+    return replace(cmd, raw=new_raw)
+
+
+def _cargo_scope_structured(cmd: VerifyCmd, crates: list[str]) -> VerifyCmd:
+    tokens = list(cmd.targets)
+    if '--workspace' not in tokens:
+        return cmd
+    ws_idx = tokens.index('--workspace')
+    p_flags: list[str] = []
+    for crate in crates:
+        p_flags.extend(('-p', crate))
+    spliced = tokens[:ws_idx] + p_flags + tokens[ws_idx + 1 :]
+
+    cleaned: list[str] = []
+    skip_next = False
+    for tok in spliced:
+        if skip_next:
+            skip_next = False
+            continue
+        if tok == '--exclude':
+            skip_next = True
+            continue
+        if tok.startswith('--exclude='):
+            continue
+        cleaned.append(tok)
+    return replace(cmd, targets=tuple(cleaned))
