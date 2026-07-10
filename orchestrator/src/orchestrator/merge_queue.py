@@ -37,6 +37,7 @@ from orchestrator.git_ops import (
     _run,
 )
 from orchestrator.landed_outbox import LandedOutbox, LandedRow, MergeProvenance
+from orchestrator.merge_disposition import MergeFailureDisposition
 from orchestrator.merge_drift import (  # noqa: F401  re-export shim
     _maybe_run_drift_check,
     _run_drift_check,
@@ -1644,6 +1645,7 @@ def _emit_merge_attempt(
     duration_ms: int | None = None,
     train_id: str | None = None,
     member_task_ids: list[str] | None = None,
+    disposition: MergeFailureDisposition | None = None,
 ) -> None:
     """Emit a ``merge_attempt`` event for the given outcome.
 
@@ -1662,6 +1664,16 @@ def _emit_merge_attempt(
     When called from ``_do_train_merge``, *train_id* and *member_task_ids* are
     set so downstream reconciliation can correlate ``merge_attempt`` rows with
     the specific train — not just the tip task_id.
+
+    *disposition* is the optional merge-skew attribution verdict (task 2381 α
+    ``MergeFailureDisposition``, e.g. ``INTEGRATION_SKEW``/``BRANCH_BUG``).
+    When supplied, its ``.value`` is stored under the ``'disposition'`` payload
+    key so ``digest.merge_disposition_counts`` can separate integration-skew
+    failures from branch bugs/indeterminate in runs.db stats (task 2384 γ,
+    mechanism M2). When omitted (the default), no ``'disposition'`` key is
+    added — existing callers' payloads stay byte-identical. Production
+    call sites are threaded by task 2383 β; this parameter's mechanism is
+    proven independently by a direct-emit unit test.
     """
     if event_store is not None:
         data: dict = {'outcome': outcome}
@@ -1671,6 +1683,8 @@ def _emit_merge_attempt(
             data['train_id'] = train_id
         if member_task_ids is not None:
             data['member_task_ids'] = member_task_ids
+        if disposition is not None:
+            data['disposition'] = disposition.value
         event_store.emit(
             EventType.merge_attempt, task_id=task_id, phase='merge',
             data=data, duration_ms=duration_ms,
