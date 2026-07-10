@@ -4396,9 +4396,11 @@ async def _repair_done_provenance_same_status(
     exactly like a fresh done transition
     (:func:`_validate_done_provenance`, ``require=False`` — a same-status
     repair must never itself demand provenance) and, on success, persist the
-    correction via the same read-modify-write ``update_task`` call used by
-    the normal persist (:func:`_merged_audit_metadata` preserves sibling
-    keys), still inside the caller's write lock.
+    correction through the privileged, non-protocol ``stamp_audit_metadata``
+    seam (the sole sanctioned ``done_provenance`` writer, since ``update_task``
+    now unconditionally rejects ``metadata.done_provenance`` — SqliteTaskBackend
+    floor, task C1), still inside the caller's write lock. The seam's own
+    fresh-read read-modify-write merge preserves sibling keys.
 
     No status write, no event, no reconciliation — the status is unchanged,
     so those side effects do not apply; this is a pure metadata correction.
@@ -4419,11 +4421,19 @@ async def _repair_done_provenance_same_status(
     if resolved is None:
         return {'success': True, 'no_op': True, 'task_id': task_id}
 
-    merged_meta = _merged_audit_metadata(before, {'done_provenance': resolved})
-    await tm.update_task(
+    # done_provenance is a WRITE-AUTHORITY field: update_task now
+    # UNCONDITIONALLY rejects metadata.done_provenance (SqliteTaskBackend
+    # floor, task C1), so this legacy done->done repair must persist through
+    # the privileged, non-protocol stamp_audit_metadata seam — the sole
+    # sanctioned done_provenance writer. The seam does its own fresh-read
+    # read-modify-write merge under the write-lock, preserving every sibling
+    # key (memory_hints / files / external_deps / reopen_*), so we pass only
+    # the field being repaired rather than a pre-merged blob keyed off the
+    # (possibly stale) ``before`` snapshot.
+    await tm.stamp_audit_metadata(  # type: ignore[attr-defined]
         task_id=task_id,
-        metadata=json.dumps(merged_meta),
         project_root=project_root,
+        fields={'done_provenance': resolved},
         tag=tag,
     )
     return {

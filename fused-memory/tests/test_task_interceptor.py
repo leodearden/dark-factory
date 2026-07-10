@@ -2862,12 +2862,15 @@ async def test_set_task_status_done_to_done_repairs_done_provenance(
         done_provenance={'kind': 'merged', 'commit': sha},
     )
 
-    # Repair persisted via update_task, with the sibling key preserved.
-    taskmaster.update_task.assert_called_once()
-    persisted = json.loads(taskmaster.update_task.call_args.kwargs['metadata'])
-    assert persisted['done_provenance']['kind'] == 'merged'
-    assert persisted['done_provenance']['commit'] == sha
-    assert persisted['files'] == ['x.py']
+    # Repair persisted via the privileged stamp_audit_metadata seam — NOT
+    # update_task, which the SqliteTaskBackend floor (task C1) now rejects for
+    # any metadata.done_provenance. The seam preserves sibling keys itself, so
+    # only the repaired field is passed.
+    taskmaster.update_task.assert_not_called()
+    taskmaster.stamp_audit_metadata.assert_called_once()
+    persisted = taskmaster.stamp_audit_metadata.call_args.kwargs['fields']['done_provenance']
+    assert persisted['kind'] == 'merged'
+    assert persisted['commit'] == sha
     # Result reports success and a repair marker.
     assert result.get('success') is True
     assert result.get('done_provenance_repaired') is True
