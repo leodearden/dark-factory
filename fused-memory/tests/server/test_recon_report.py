@@ -2694,3 +2694,708 @@ class TestReconReportFlagTypeInheritance:
         assert 'finding_id' in r2_finding, f'r2 add_finding failed: {r2_finding}'
         assert r2_finding['finding_id'] != r1_finding['finding_id']
 
+
+# ---------------------------------------------------------------------------
+# task-2410 step-1: Overlength description/suggested_action truncation —
+# RED until step-2 adds _MAX_FINDING_TEXT_CHARS / _TRUNCATION_MARKER and
+# wires truncate+warn into ReconReportState.add_finding.
+# ---------------------------------------------------------------------------
+
+
+class TestReconReportOverlengthTruncation:
+    """add_finding must gracefully truncate overlength description /
+    suggested_action / category fields rather than storing them unbounded,
+    surfacing a 'warnings' entry on the response ONLY when truncation
+    actually occurred.
+    """
+
+    def _make_state(self):
+        from fused_memory.server.recon_report import ReconReportState
+
+        t = [0.0]
+        return ReconReportState(ttl_seconds=300, clock=lambda: t[0]), t
+
+    def test_overlength_description_is_truncated_with_warning(self):
+        from fused_memory.server.recon_report import (
+            _MAX_FINDING_TEXT_CHARS,
+            _TRUNCATION_MARKER,
+        )
+
+        state, _ = self._make_state()
+        state.start_report(run_id='r1', stage='s1', project_id='dark_factory')
+
+        overlength = 'x' * (_MAX_FINDING_TEXT_CHARS + 500)
+        result = state.add_finding(
+            run_id='r1',
+            severity='low',
+            category='c',
+            description=overlength,
+            suggested_action='a',
+        )
+        assert 'finding_id' in result, f'add_finding failed: {result}'
+        assert 'warnings' in result
+        assert result['warnings']
+        assert any('description' in w for w in result['warnings'])
+
+        report = state.get_assembled_report('r1', 's1')
+        assert report is not None
+        item = report['flagged_items'][0]
+        assert item['description'] == 'x' * _MAX_FINDING_TEXT_CHARS + _TRUNCATION_MARKER
+        assert item['suggested_action'] == 'a'
+
+    def test_overlength_suggested_action_is_truncated_with_warning(self):
+        from fused_memory.server.recon_report import (
+            _MAX_FINDING_TEXT_CHARS,
+            _TRUNCATION_MARKER,
+        )
+
+        state, _ = self._make_state()
+        state.start_report(run_id='r1', stage='s1', project_id='dark_factory')
+
+        overlength = 'y' * (_MAX_FINDING_TEXT_CHARS + 500)
+        result = state.add_finding(
+            run_id='r1',
+            severity='low',
+            category='c',
+            description='d',
+            suggested_action=overlength,
+        )
+        assert 'finding_id' in result, f'add_finding failed: {result}'
+        assert 'warnings' in result
+        assert result['warnings']
+        assert any('suggested_action' in w for w in result['warnings'])
+
+        report = state.get_assembled_report('r1', 's1')
+        assert report is not None
+        item = report['flagged_items'][0]
+        assert item['suggested_action'] == 'y' * _MAX_FINDING_TEXT_CHARS + _TRUNCATION_MARKER
+        assert item['description'] == 'd'
+
+    def test_overlength_category_is_truncated_with_warning(self):
+        """category is free text supplied by the calling agent (unlike
+        severity, which is a short enum-like label) and is surfaced verbatim
+        in the assembled report, so it is capped the same way as
+        description/suggested_action.
+        """
+        from fused_memory.server.recon_report import (
+            _MAX_FINDING_TEXT_CHARS,
+            _TRUNCATION_MARKER,
+        )
+
+        state, _ = self._make_state()
+        state.start_report(run_id='r1', stage='s1', project_id='dark_factory')
+
+        overlength = 'z' * (_MAX_FINDING_TEXT_CHARS + 500)
+        result = state.add_finding(
+            run_id='r1',
+            severity='low',
+            category=overlength,
+            description='d',
+            suggested_action='a',
+        )
+        assert 'finding_id' in result, f'add_finding failed: {result}'
+        assert 'warnings' in result
+        assert result['warnings']
+        assert any('category' in w for w in result['warnings'])
+
+        report = state.get_assembled_report('r1', 's1')
+        assert report is not None
+        item = report['flagged_items'][0]
+        assert item['category'] == 'z' * _MAX_FINDING_TEXT_CHARS + _TRUNCATION_MARKER
+        assert item['description'] == 'd'
+        assert item['suggested_action'] == 'a'
+
+    def test_short_finding_has_no_warnings_key(self):
+        state, _ = self._make_state()
+        state.start_report(run_id='r1', stage='s1', project_id='dark_factory')
+
+        result = state.add_finding(
+            run_id='r1',
+            severity='low',
+            category='c',
+            description='d',
+            suggested_action='a',
+        )
+        assert 'finding_id' in result, f'add_finding failed: {result}'
+        assert 'warnings' not in result
+
+        report = state.get_assembled_report('r1', 's1')
+        assert report is not None
+        item = report['flagged_items'][0]
+        assert item['description'] == 'd'
+        assert item['suggested_action'] == 'a'
+
+    def test_overlength_null_null_findings_dedup_on_truncated_text(self):
+        """Two null-null findings whose descriptions are identical for the
+        first _MAX_FINDING_TEXT_CHARS chars but differ only in the
+        (truncated-away) tail must collapse to ONE finding — pins the
+        add_finding ordering guarantee that dedup hashes the POST-truncation
+        string, not the raw input (truncation runs BEFORE dedup hashing).
+        """
+        from fused_memory.server.recon_report import _MAX_FINDING_TEXT_CHARS
+
+        state, _ = self._make_state()
+        state.start_report(run_id='r1', stage='s1', project_id='dark_factory')
+
+        shared_prefix = 'x' * _MAX_FINDING_TEXT_CHARS
+        first = state.add_finding(
+            run_id='r1',
+            severity='low',
+            category='informational',
+            description=shared_prefix + ' tail one',
+            suggested_action='none',
+            actionable=False,
+        )
+        assert 'finding_id' in first, f'First add_finding failed: {first}'
+
+        second = state.add_finding(
+            run_id='r1',
+            severity='low',
+            category='informational',
+            description=shared_prefix + ' tail two',
+            suggested_action='none',
+            actionable=False,
+        )
+        assert second.get('error') == 'duplicate_finding', (
+            'Expected duplicate_finding (dedup must key off the '
+            f'post-truncation string), got: {second}'
+        )
+        assert second['existing_finding_id'] == first['finding_id']
+
+        report = state.get_assembled_report('r1', 's1')
+        assert report is not None
+        assert len(report['flagged_items']) == 1
+
+    def test_duplicate_signature_path_still_surfaces_truncation_warning(self):
+        """An overlength description that ALSO collides on (task_id,
+        flag_type) must still surface a 'warnings' entry on the
+        duplicate_finding response -- the caller's input was truncated even
+        though no new row is stored, so the truncate+warn contract must not
+        go silent on the duplicate short-circuit path.
+        """
+        from fused_memory.server.recon_report import _MAX_FINDING_TEXT_CHARS
+
+        state, _ = self._make_state()
+        state.start_report(run_id='r1', stage='s1', project_id='dark_factory')
+
+        first = state.add_finding(
+            run_id='r1',
+            severity='low',
+            category='c',
+            description='d',
+            suggested_action='a',
+            task_id='42',
+            flag_type='f',
+        )
+        assert 'finding_id' in first, f'first add_finding failed: {first}'
+
+        overlength = 'z' * (_MAX_FINDING_TEXT_CHARS + 500)
+        dup = state.add_finding(
+            run_id='r1',
+            severity='low',
+            category='c',
+            description=overlength,
+            suggested_action='a',
+            task_id='42',
+            flag_type='f',
+        )
+        assert dup.get('error') == 'duplicate_finding', f'expected duplicate_finding, got: {dup}'
+        assert dup['existing_finding_id'] == first['finding_id']
+        assert 'warnings' in dup
+        assert any('description' in w for w in dup['warnings'])
+
+    def test_duplicate_null_null_path_still_surfaces_truncation_warning(self):
+        """Same contract as above but for the null-null (description-hash)
+        dedup path: an overlength duplicate must still surface 'warnings'
+        even though no new finding is stored.
+        """
+        from fused_memory.server.recon_report import _MAX_FINDING_TEXT_CHARS
+
+        state, _ = self._make_state()
+        state.start_report(run_id='r1', stage='s1', project_id='dark_factory')
+
+        shared = 'q' * (_MAX_FINDING_TEXT_CHARS + 500)
+        first = state.add_finding(
+            run_id='r1',
+            severity='low',
+            category='informational',
+            description=shared,
+            suggested_action='none',
+            actionable=False,
+        )
+        assert 'finding_id' in first, f'first add_finding failed: {first}'
+
+        dup = state.add_finding(
+            run_id='r1',
+            severity='low',
+            category='informational',
+            description=shared,
+            suggested_action='none',
+            actionable=False,
+        )
+        assert dup.get('error') == 'duplicate_finding', f'expected duplicate_finding, got: {dup}'
+        assert dup['existing_finding_id'] == first['finding_id']
+        assert 'warnings' in dup
+        assert any('description' in w for w in dup['warnings'])
+
+    def test_short_duplicate_has_no_warnings_key(self):
+        """A duplicate_finding response for SHORT (non-truncated) input must
+        NOT gain a 'warnings' key -- only actual truncation should surface
+        one, mirroring the success-path contract.
+        """
+        state, _ = self._make_state()
+        state.start_report(run_id='r1', stage='s1', project_id='dark_factory')
+
+        first = state.add_finding(
+            run_id='r1',
+            severity='low',
+            category='c',
+            description='d',
+            suggested_action='a',
+            task_id='42',
+            flag_type='f',
+        )
+        assert 'finding_id' in first, f'first add_finding failed: {first}'
+
+        dup = state.add_finding(
+            run_id='r1',
+            severity='low',
+            category='c',
+            description='different but same sig',
+            suggested_action='a',
+            task_id='42',
+            flag_type='f',
+        )
+        assert dup.get('error') == 'duplicate_finding', f'expected duplicate_finding, got: {dup}'
+        assert 'warnings' not in dup
+
+
+# ---------------------------------------------------------------------------
+# task-2410 step-3: delete_finding basic behavior — RED until step-4 adds
+# ReconReportState.delete_finding.
+# ---------------------------------------------------------------------------
+
+
+class TestReconReportDeleteFinding:
+    """ReconReportState.delete_finding mirrors delete_memory's semantics:
+    validate -> structured {'status': 'deleted', 'finding_id': ...} dict,
+    IRREVERSIBLE, scoped by run_id + finding_id.
+    """
+
+    def _make_state(self):
+        from fused_memory.server.recon_report import ReconReportState
+
+        t = [0.0]
+        return ReconReportState(ttl_seconds=300, clock=lambda: t[0]), t
+
+    def test_delete_finding_removes_it_from_assembled_report(self):
+        state, _ = self._make_state()
+        state.start_report(run_id='r1', stage='s1', project_id='dark_factory')
+        added = state.add_finding(
+            run_id='r1',
+            severity='low',
+            category='c',
+            description='d',
+            suggested_action='a',
+            task_id='42',
+            flag_type='f',
+        )
+        fid = added['finding_id']
+
+        result = state.delete_finding('r1', fid)
+        assert result == {'status': 'deleted', 'finding_id': fid}
+
+        report = state.get_assembled_report('r1', 's1')
+        assert report is not None
+        assert report['flagged_items'] == []
+
+    def test_delete_finding_unknown_run_id(self):
+        state, _ = self._make_state()
+        result = state.delete_finding('ghost', 'some-finding-id')
+        assert result['error'] == 'run_id_unknown'
+        assert result['error_type'] == 'ReconReportRunUnknown'
+
+    def test_delete_finding_unknown_finding_id(self):
+        state, _ = self._make_state()
+        state.start_report(run_id='r1', stage='s1', project_id='dark_factory')
+        result = state.delete_finding('r1', 'bogus-finding-id')
+        assert result['error'] == 'finding_unknown'
+        assert result['error_type'] == 'ReconReportFindingUnknown'
+
+    def test_deleted_finding_no_longer_resolvable(self):
+        state, _ = self._make_state()
+        state.start_report(run_id='r1', stage='s1', project_id='dark_factory')
+        added = state.add_finding(
+            run_id='r1',
+            severity='low',
+            category='c',
+            description='d',
+            suggested_action='a',
+            task_id='42',
+            flag_type='f',
+        )
+        fid = added['finding_id']
+
+        state.delete_finding('r1', fid)
+        assert state._resolve_finding('r1', fid) is None
+
+    def test_delete_finding_after_complete_is_rejected(self):
+        state, _ = self._make_state()
+        state.start_report(run_id='r1', stage='s1', project_id='dark_factory')
+        added = state.add_finding(
+            run_id='r1',
+            severity='low',
+            category='c',
+            description='d',
+            suggested_action='a',
+            task_id='42',
+            flag_type='f',
+        )
+        fid = added['finding_id']
+        state.complete('r1', 'summary')
+
+        result = state.delete_finding('r1', fid)
+        assert result['error'] == 'report_already_completed'
+        assert result['error_type'] == 'ReconReportAlreadyCompleted'
+
+        report = state.get_assembled_report('r1', 's1')
+        assert report is not None
+        assert len(report['flagged_items']) == 1
+        assert report['flagged_items'][0]['finding_id'] == fid
+
+    # -- task-2410 step-5: dedup-index cleanup + cross-stage — RED until
+    #    step-6 pops the signature/description dedup indices on delete. --
+
+    def test_delete_then_refile_same_signature_allocates_fresh(self):
+        """After deleting A filed under (task_id='42', flag_type='f'), a
+        re-filed finding with the SAME signature must allocate a fresh
+        finding_id, not bounce off a stale duplicate_finding pointer.
+        """
+        state, _ = self._make_state()
+        state.start_report(run_id='r1', stage='s1', project_id='dark_factory')
+        added = state.add_finding(
+            run_id='r1',
+            severity='low',
+            category='c',
+            description='d',
+            suggested_action='a',
+            task_id='42',
+            flag_type='f',
+        )
+        fid_a = added['finding_id']
+
+        delete_result = state.delete_finding('r1', fid_a)
+        assert delete_result == {'status': 'deleted', 'finding_id': fid_a}
+
+        refiled = state.add_finding(
+            run_id='r1',
+            severity='low',
+            category='c',
+            description='corrected description',
+            suggested_action='corrected action',
+            task_id='42',
+            flag_type='f',
+        )
+        assert 'finding_id' in refiled, f'refile after delete failed: {refiled}'
+        assert refiled['finding_id'] != fid_a
+
+    def test_delete_then_refile_same_null_null_description_allocates_fresh(self):
+        """Same as above but for the null-null (description-hash) dedup path."""
+        state, _ = self._make_state()
+        state.start_report(run_id='r1', stage='s1', project_id='dark_factory')
+        added = state.add_finding(
+            run_id='r1',
+            severity='low',
+            category='informational',
+            description='shared observation',
+            suggested_action='none',
+            actionable=False,
+        )
+        fid_a = added['finding_id']
+
+        delete_result = state.delete_finding('r1', fid_a)
+        assert delete_result == {'status': 'deleted', 'finding_id': fid_a}
+
+        refiled = state.add_finding(
+            run_id='r1',
+            severity='low',
+            category='informational',
+            description='shared observation',
+            suggested_action='none',
+            actionable=False,
+        )
+        assert 'finding_id' in refiled, f'refile after delete failed: {refiled}'
+        assert refiled['finding_id'] != fid_a
+
+    def test_delete_blank_null_null_finding_then_refile_allocates_independently(self):
+        """A null-null finding whose description is blank/whitespace-only
+        normalizes to '' and is therefore never entered into the
+        description-hash dedup index in the first place (add_finding skips
+        indexing when _normalize_description(description) is falsy).
+        Deleting such a finding exercises the branch of delete_finding's
+        index cleanup where BOTH the signature and description-hash
+        cleanups are skipped (sig == (None, None) and the normalized
+        description is falsy) -- this must neither raise nor corrupt state,
+        and the finding must still be fully and independently removable.
+        """
+        state, _ = self._make_state()
+        state.start_report(run_id='r1', stage='s1', project_id='dark_factory')
+
+        added = state.add_finding(
+            run_id='r1',
+            severity='low',
+            category='informational',
+            description='   ',
+            suggested_action='none',
+            actionable=False,
+        )
+        fid_a = added['finding_id']
+
+        delete_result = state.delete_finding('r1', fid_a)
+        assert delete_result == {'status': 'deleted', 'finding_id': fid_a}
+        assert state._resolve_finding('r1', fid_a) is None
+
+        report = state.get_assembled_report('r1', 's1')
+        assert report is not None
+        assert report['flagged_items'] == []
+
+        refiled = state.add_finding(
+            run_id='r1',
+            severity='low',
+            category='informational',
+            description='   ',
+            suggested_action='none',
+            actionable=False,
+        )
+        assert 'finding_id' in refiled, f'refile after delete failed: {refiled}'
+        assert refiled['finding_id'] != fid_a
+
+    def test_delete_from_later_active_stage_removes_from_owning_stage_report(self):
+        """Stage 1 files A; Stage 2 of the SAME run becomes active;
+        delete_finding(run_id, A) must still resolve A cross-stage and
+        remove it from Stage 1's assembled report.
+        """
+        state, _ = self._make_state()
+
+        state.start_report(run_id='r1', stage='memory_consolidator', project_id='dark_factory')
+        added = state.add_finding(
+            run_id='r1',
+            severity='low',
+            category='c',
+            description='d',
+            suggested_action='a',
+            task_id='42',
+            flag_type='f',
+        )
+        fid_a = added['finding_id']
+
+        # Stage 2 becomes the active stage for this run_id.
+        state.start_report(run_id='r1', stage='task_knowledge_sync', project_id='dark_factory')
+
+        result = state.delete_finding('r1', fid_a)
+        assert result == {'status': 'deleted', 'finding_id': fid_a}
+
+        s1_report = state.get_assembled_report('r1', 'memory_consolidator')
+        assert s1_report is not None
+        assert s1_report['flagged_items'] == []
+
+    def test_delete_finding_reached_via_flag_type_inheritance_cleans_correct_sig(self):
+        """A is filed with (task_id='42', flag_type='f1').  A bare-null
+        re-raise (task_id='42', flag_type=None) inherits 'f1' (task-2318,
+        the ONLY established flag_type for '42' at that point) and resolves
+        as a duplicate_finding pointer to A rather than allocating a new
+        row -- so a caller holding that returned finding_id is really
+        holding A's id, whose STORED flag_type ('f1') differs from what the
+        caller itself submitted (None).  B is then filed under a distinct,
+        unambiguous signature (task_id='42', flag_type='f2').
+
+        delete_finding's index cleanup recomputes the signature from the
+        STORED finding.task_id/flag_type (never from a caller-submitted
+        None) -- deleting via the id obtained through the inheriting
+        re-raise must pop ONLY ('42', 'f1') from _run_sig_index, leave B's
+        ('42', 'f2') entry untouched, and allow a fresh (42, 'f1') finding
+        to be filed afterwards instead of bouncing off a stale
+        duplicate_finding pointer.
+        """
+        state, _ = self._make_state()
+        state.start_report(run_id='r1', stage='s1', project_id='dark_factory')
+
+        a = state.add_finding(
+            run_id='r1',
+            severity='moderate',
+            category='task_blocked',
+            description='d-a',
+            suggested_action='a-a',
+            task_id='42',
+            flag_type='f1',
+        )
+        assert 'finding_id' in a, f'add_finding A failed: {a}'
+        fid_a = a['finding_id']
+
+        reraise = state.add_finding(
+            run_id='r1',
+            severity='moderate',
+            category='task_blocked',
+            description='re-raise, still blocked',
+            suggested_action='a-a',
+            task_id='42',
+            flag_type=None,
+        )
+        assert reraise == {
+            'error': 'duplicate_finding',
+            'error_type': 'ReconReportDuplicateFinding',
+            'existing_finding_id': fid_a,
+        }
+
+        b = state.add_finding(
+            run_id='r1',
+            severity='moderate',
+            category='task_blocked',
+            description='d-b',
+            suggested_action='a-b',
+            task_id='42',
+            flag_type='f2',
+        )
+        assert 'finding_id' in b, f'add_finding B failed: {b}'
+        fid_b = b['finding_id']
+
+        # Delete using the id obtained via the inheriting re-raise (== A's id).
+        delete_result = state.delete_finding('r1', reraise['existing_finding_id'])
+        assert delete_result == {'status': 'deleted', 'finding_id': fid_a}
+
+        assert state._run_sig_index.get('r1', {}).get(('42', 'f1')) is None
+        assert state._run_sig_index.get('r1', {}).get(('42', 'f2')) == fid_b
+
+        refiled = state.add_finding(
+            run_id='r1',
+            severity='moderate',
+            category='task_blocked',
+            description='corrected',
+            suggested_action='corrected',
+            task_id='42',
+            flag_type='f1',
+        )
+        assert 'finding_id' in refiled, f'refile after delete failed: {refiled}'
+        assert refiled['finding_id'] != fid_a
+
+    @pytest.mark.asyncio
+    async def test_cite_after_delete_of_cross_stage_duplicate_returns_finding_unknown(self):
+        """Stage 1 files A; Stage 2 re-raises the same signature and receives
+        duplicate_finding pointing at A (so Stage 2 now holds finding_id A);
+        A is deleted; Stage 2's later cite_* call using that now-dangling
+        finding_id must return finding_unknown, not resurrect A or silently
+        no-op.  Pins the post-delete resolution contract so cite_* never
+        operates on a retracted finding.
+        """
+        from fused_memory.server.recon_report import ReconReportState
+
+        class _FakeMemSvc:
+            async def get_entity(self, name: str, project_id: str) -> dict:
+                return {'nodes': [{'uuid': 'aaaa-bbbb', 'name': name}]}
+
+        t = [0.0]
+        state = ReconReportState(
+            ttl_seconds=300, clock=lambda: t[0], memory_service=_FakeMemSvc()
+        )
+
+        # Stage 1 files A.
+        state.start_report(run_id='r1', stage='memory_consolidator', project_id='dark_factory')
+        res1 = state.add_finding(
+            run_id='r1',
+            severity='high',
+            category='stuck_task',
+            description='task is stuck',
+            suggested_action='investigate',
+            task_id='3803',
+            flag_type='task_stuck_pending_merge',
+        )
+        assert 'finding_id' in res1, f'Stage 1 add_finding failed: {res1}'
+        finding_id_a = res1['finding_id']
+
+        # Stage 2 re-raises the same signature -> duplicate_finding -> A.
+        state.start_report(run_id='r1', stage='task_knowledge_sync', project_id='dark_factory')
+        dup = state.add_finding(
+            run_id='r1',
+            severity='high',
+            category='stuck_task',
+            description='same task (Stage 2 view)',
+            suggested_action='investigate',
+            task_id='3803',
+            flag_type='task_stuck_pending_merge',
+        )
+        assert dup.get('error') == 'duplicate_finding'
+        assert dup['existing_finding_id'] == finding_id_a
+
+        # A is retracted.
+        delete_result = state.delete_finding('r1', finding_id_a)
+        assert delete_result == {'status': 'deleted', 'finding_id': finding_id_a}
+
+        # Stage 2 still holds finding_id_a from the duplicate_finding pointer
+        # and tries to cite onto it -- must return finding_unknown.
+        cite_result = await state.cite_entity(
+            run_id='r1',
+            finding_id=finding_id_a,
+            name='SomeEntity',
+        )
+        assert cite_result.get('error') == 'finding_unknown', (
+            f'Expected finding_unknown for a cite_* call on a deleted finding, got: {cite_result}'
+        )
+        assert cite_result['error_type'] == 'ReconReportFindingUnknown'
+
+
+# ---------------------------------------------------------------------------
+# task-2410 step-7: delete_finding registered via FastMCP — RED until
+# step-8 registers the @mcp.tool() delegate.
+# ---------------------------------------------------------------------------
+
+
+class TestDeleteFindingViaFastMCP:
+    """delete_finding must be registered on the FastMCP server and callable
+    end-to-end through mcp._tool_manager.call_tool, mirroring the existing
+    tools' registration + call_tool pattern (TestCreateReconReportServer).
+    """
+
+    def _make(self):
+        from fused_memory.server.recon_report import ReconReportState, create_recon_report_server
+
+        t = [0.0]
+        state = ReconReportState(ttl_seconds=300, clock=lambda: t[0])
+        mcp = create_recon_report_server(state)
+        return state, mcp
+
+    def test_delete_finding_registered(self):
+        _, mcp = self._make()
+        tools = set(mcp._tool_manager._tools.keys())
+        assert 'delete_finding' in tools
+
+    @pytest.mark.asyncio
+    async def test_end_to_end_via_call_tool(self):
+        """Drive start_report -> add_finding -> delete_finding through
+        mcp._tool_manager.call_tool and confirm the finding is gone."""
+        state, mcp = self._make()
+        tm = mcp._tool_manager
+
+        await tm.call_tool('start_report', {
+            'run_id': 'r1', 'stage': 's1', 'project_id': 'dark_factory',
+        })
+        added = await tm.call_tool('add_finding', {
+            'run_id': 'r1',
+            'severity': 'low',
+            'category': 'cat',
+            'description': 'd',
+            'suggested_action': 'a',
+            'task_id': '42',
+            'flag_type': 'f',
+        })
+        assert 'finding_id' in added, f'add_finding failed: {added}'
+        finding_id = added['finding_id']
+
+        result = await tm.call_tool('delete_finding', {
+            'run_id': 'r1', 'finding_id': finding_id,
+        })
+        assert result == {'status': 'deleted', 'finding_id': finding_id}
+
+        report = state.get_assembled_report('r1', 's1')
+        assert report is not None
+        assert report['flagged_items'] == []
+

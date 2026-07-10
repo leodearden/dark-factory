@@ -1,7 +1,7 @@
 """recon_report MCP namespace — in-process state + tool scaffold (task α/β).
 
-Provides nine tools: start_report / add_finding / set_stat / inc_stat / complete /
-cite_entity / cite_edge / cite_task / cite_memory.
+Provides ten tools: start_report / add_finding / set_stat / inc_stat / complete /
+delete_finding / cite_entity / cite_edge / cite_task / cite_memory.
 State is owned by :class:`ReconReportState`; tools are thin delegates registered
 by :func:`create_recon_report_server`.  This split lets unit tests drive the state
 directly without spinning up FastMCP.
@@ -133,6 +133,38 @@ def _traces_exclusively_to_stage1(
 
 
 # ---------------------------------------------------------------------------
+# Fix 2 helpers — overlength description/suggested_action/category truncation
+# (task-2410)
+# ---------------------------------------------------------------------------
+
+# Generous cap: legitimate findings never come close to this; only
+# pathological input (e.g. a runaway agent dumping a huge blob into
+# description/suggested_action/category) is ever capped.  severity is
+# intentionally NOT capped: it is expected to be a short enum-like label
+# (e.g. 'low'/'moderate'/'high'), not open-ended free text, so it does not
+# carry the same pathological-length risk as the three free-text fields.
+_MAX_FINDING_TEXT_CHARS = 10_000
+_TRUNCATION_MARKER = '…[truncated]'
+
+
+def _truncate_field(value: str, cap: int) -> tuple[str, bool]:
+    """Cap *value* to *cap* chars, appending ``_TRUNCATION_MARKER`` if truncated.
+
+    Returns ``(possibly-truncated value, was_truncated)``.  A *value* whose
+    length is ``<= cap`` is returned unchanged with ``False``.
+
+    Note: the marker is appended AFTER slicing to *cap*, so a truncated
+    result is ``cap + len(_TRUNCATION_MARKER)`` chars long, not exactly
+    *cap* — harmless given today's generous ``_MAX_FINDING_TEXT_CHARS``
+    bound, but relevant if *cap* is ever tightened to a hard byte/char
+    budget.
+    """
+    if len(value) > cap:
+        return value[:cap] + _TRUNCATION_MARKER, True
+    return value, False
+
+
+# ---------------------------------------------------------------------------
 # Internal data model
 # ---------------------------------------------------------------------------
 
@@ -197,12 +229,27 @@ _ERR_ALREADY_COMPLETED: dict[str, str] = {
 }
 
 
-def _duplicate_finding_error(existing_id: str) -> dict[str, str]:
-    return {
+def _duplicate_finding_error(
+    existing_id: str, warnings: list[str] | None = None
+) -> dict[str, Any]:
+    """Build the duplicate_finding error dict, optionally carrying truncation
+    warnings (task-2410).
+
+    add_finding truncates description/suggested_action/category BEFORE the
+    dedup check runs (see its docstring), so a caller whose overlength input turns
+    out to be a duplicate must still learn its text was capped — the
+    truncated text itself is discarded (a duplicate is never stored), but
+    the warning is not.  Mirrors the success-path contract: ``'warnings'``
+    is present only when *warnings* is non-empty.
+    """
+    error: dict[str, Any] = {
         'error': 'duplicate_finding',
         'error_type': 'ReconReportDuplicateFinding',
         'existing_finding_id': existing_id,
     }
+    if warnings:
+        error['warnings'] = warnings
+    return error
 
 
 def _stat_type_mismatch_error(key: str) -> dict[str, str]:
@@ -367,6 +414,21 @@ class ReconReportState:
         the signature lookup runs (task-2318), so an under-specified re-raise
         collapses onto the canonical finding instead of allocating a distinct
         ``(task_id, None)`` row.
+
+        ``description``/``suggested_action``/``category`` are truncated to
+        ``_MAX_FINDING_TEXT_CHARS`` BEFORE dedup hashing (task-2410;
+        see :func:`_truncate_field`).  One consequence for the null-null
+        (no task_id/flag_type) path: the description-hash dedup key is
+        computed from the POST-truncation string, so two null-null findings
+        that are identical for the first ``_MAX_FINDING_TEXT_CHARS``
+        characters and differ only in the truncated-away tail collapse into
+        a single finding. This is an accepted tradeoff at today's generous
+        10_000-char cap — revisit only if the cap is ever tightened.
+        ``category`` is capped alongside description/suggested_action
+        because it is free text supplied by the calling agent and is
+        surfaced verbatim in the assembled report; ``severity`` is left
+        unbounded as it is expected to be a short enum-like label (see the
+        module-level comment above ``_MAX_FINDING_TEXT_CHARS``).
         """
         entry = self._resolve_entry(run_id)
         if entry is None:
@@ -382,6 +444,27 @@ class ReconReportState:
                 entry.stage,
             )
             return _ERR_ALREADY_COMPLETED.copy()
+
+        # Fix 2 (task-2410): gracefully cap pathologically long text fields
+        # BEFORE dedup hashing, so the stored text, the assembled-report
+        # value, and the null-null description-hash dedup key all derive
+        # from the same (possibly-capped) string.  category is capped here
+        # too (same free-text-from-a-runaway-agent risk as description/
+        # suggested_action); it does not participate in dedup hashing, so
+        # its ordering relative to the dedup check below is not load-bearing
+        # the way description's is.
+        warnings: list[str] = []
+        description, description_truncated = _truncate_field(description, _MAX_FINDING_TEXT_CHARS)
+        if description_truncated:
+            warnings.append(f'description truncated to {_MAX_FINDING_TEXT_CHARS} chars')
+        suggested_action, suggested_action_truncated = _truncate_field(
+            suggested_action, _MAX_FINDING_TEXT_CHARS
+        )
+        if suggested_action_truncated:
+            warnings.append(f'suggested_action truncated to {_MAX_FINDING_TEXT_CHARS} chars')
+        category, category_truncated = _truncate_field(category, _MAX_FINDING_TEXT_CHARS)
+        if category_truncated:
+            warnings.append(f'category truncated to {_MAX_FINDING_TEXT_CHARS} chars')
 
         # In-run dedup: two separate namespaces.
         # (1) Signature path: (task_id, flag_type) != (None, None) — O(1) lookup in
@@ -428,7 +511,7 @@ class ReconReportState:
         if sig != (None, None):
             existing_id = self._run_sig_index.get(run_id, {}).get(sig)
             if existing_id is not None:
-                return _duplicate_finding_error(existing_id)
+                return _duplicate_finding_error(existing_id, warnings)
         else:
             # Blank/whitespace-only descriptions normalize to '' — skip dedup so
             # each blank informational finding allocates independently.  The empty
@@ -438,7 +521,7 @@ class ReconReportState:
                 desc_hash = _description_hash(description)
                 existing_id = self._run_desc_index.get(run_id, {}).get(desc_hash)
                 if existing_id is not None:
-                    return _duplicate_finding_error(existing_id)
+                    return _duplicate_finding_error(existing_id, warnings)
 
         finding_id = str(uuid.uuid4())
         finding = _Finding(
@@ -461,7 +544,77 @@ class ReconReportState:
                 self._run_desc_index.setdefault(run_id, {})[desc_hash] = finding_id
         self._run_finding_index.setdefault(run_id, {})[finding_id] = entry
 
-        return {'finding_id': finding_id}
+        result: dict[str, Any] = {'finding_id': finding_id}
+        if warnings:
+            result['warnings'] = warnings
+        return result
+
+    def delete_finding(self, run_id: str, finding_id: str) -> dict[str, Any]:
+        """Permanently remove a finding.  IRREVERSIBLE.
+
+        Mirrors ``delete_memory``'s semantics (server/tools.py): validate,
+        then perform an irreversible removal and return a structured
+        ``{'status': 'deleted', 'finding_id': ...}`` dict.  Scoped by
+        ``run_id`` + ``finding_id``.
+
+        The finding is resolved cross-stage via :meth:`_resolve_finding`
+        (same as the ``cite_*`` tools), so a finding filed by an earlier
+        stage of this run can still be deleted from a later stage.
+
+        Rejected with ``report_already_completed`` when the finding's
+        OWNING entry has already been completed — consistent with the
+        add_finding/set_stat/inc_stat post-completion guard, and protects
+        complete()'s cached ``flagged_count``/``stats`` from silent
+        corruption.  Retraction is intended for in-progress stages.
+
+        Removes the finding from ``entry.findings`` and
+        ``_run_finding_index``, and also cleans whichever dedup index it
+        was filed under (``_run_sig_index`` / ``_run_desc_index`` and
+        their per-entry mirrors) — recomputed from the finding's own
+        already-canonicalized ``task_id``/``flag_type``/``description`` —
+        so a corrected finding can be re-filed under the same
+        signature/description after retraction instead of bouncing off a
+        stale ``duplicate_finding`` pointer.
+        """
+        entry = self._resolve_entry(run_id)
+        if entry is None:
+            return _ERR_RUN_UNKNOWN.copy()
+
+        resolved = self._resolve_finding(run_id, finding_id)
+        if resolved is None:
+            return _ERR_FINDING_UNKNOWN.copy()
+        owning_entry, finding = resolved
+
+        if owning_entry.completed_at is not None:
+            logger.warning(
+                'recon_report: delete_finding called after complete() for '
+                'run_id=%r stage=%r finding_id=%r; rejected',
+                run_id,
+                owning_entry.stage,
+                finding_id,
+            )
+            return _ERR_ALREADY_COMPLETED.copy()
+
+        # Identity-based removal (not list.remove(), which dispatches to
+        # _Finding's dataclass-generated __eq__): _resolve_finding returned
+        # this exact object by reference from owning_entry.findings, so
+        # filtering by `is` makes the "remove precisely the resolved
+        # object" invariant explicit rather than relying on field-by-field
+        # equality (harmless today since finding_id is unique and is one of
+        # the compared fields, but identity is the actual invariant).
+        owning_entry.findings[:] = [f for f in owning_entry.findings if f is not finding]
+        self._run_finding_index.get(run_id, {}).pop(finding_id, None)
+
+        sig = (finding.task_id, finding.flag_type)
+        if sig != (None, None):
+            self._run_sig_index.get(run_id, {}).pop(sig, None)
+            owning_entry._signature_to_finding.pop(sig, None)
+        elif _normalize_description(finding.description):
+            desc_hash = _description_hash(finding.description)
+            self._run_desc_index.get(run_id, {}).pop(desc_hash, None)
+            owning_entry._deschash_to_finding.pop(desc_hash, None)
+
+        return {'status': 'deleted', 'finding_id': finding_id}
 
     def set_stat(
         self,
@@ -1010,21 +1163,26 @@ RECON_REPORT_INSTRUCTIONS = """\
 This server provides the recon_report MCP namespace for the Dark Factory
 reconciliation pipeline.
 
-Tools: start_report, add_finding, set_stat, inc_stat, complete,
+Tools: start_report, add_finding, set_stat, inc_stat, complete, delete_finding,
        cite_entity, cite_edge, cite_task, cite_memory.
 
 Usage pattern (per PRD §9.2):
 1. start_report — open a new report at the start of a stage run.
 2. add_finding — append a diagnostic finding (deduplicated by task_id + flag_type
-                  across ALL stages of the same run_id).
+                  across ALL stages of the same run_id).  Overlength
+                  description/suggested_action are truncated with a
+                  'warnings' entry on the response, never rejected.
 3. set_stat / inc_stat — track numeric metrics during the run.
 4. complete — stamp the summary and close the report; idempotent.
+5. delete_finding(run_id, finding_id) — IRREVERSIBLE retraction of a
+                  finding filed earlier in this run (any stage); rejected
+                  once that finding's owning stage has been completed.
 
 Citation tools (call after add_finding, before or after complete):
-5. cite_entity(run_id, finding_id, name) — resolve entity by name and attach.
-6. cite_edge(run_id, finding_id, edge_uuid) — validate UUID and attach edge.
-7. cite_task(run_id, finding_id, project_id, task_id) — look up task and attach.
-8. cite_memory(run_id, finding_id, memory_id, store) — look up memory and attach.
+6. cite_entity(run_id, finding_id, name) — resolve entity by name and attach.
+7. cite_edge(run_id, finding_id, edge_uuid) — validate UUID and attach edge.
+8. cite_task(run_id, finding_id, project_id, task_id) — look up task and attach.
+9. cite_memory(run_id, finding_id, memory_id, store) — look up memory and attach.
 """
 
 
@@ -1107,6 +1265,18 @@ def create_recon_report_server(state: ReconReportState):  # -> FastMCP
         summary appends a warning but does NOT overwrite the original.
         """
         return state.complete(run_id=run_id, summary=summary)
+
+    @mcp.tool()
+    async def delete_finding(run_id: str, finding_id: str) -> dict:
+        """Permanently remove a finding.  IRREVERSIBLE.
+
+        Scoped by run_id + finding_id; mirrors delete_memory's semantics.
+        Returns {status: 'deleted', finding_id} on success, or a structured
+        error dict (run_id_unknown / finding_unknown / report_already_completed).
+        Rejected once the finding's owning stage entry has been completed —
+        retraction is for in-progress stages only.
+        """
+        return state.delete_finding(run_id=run_id, finding_id=finding_id)
 
     @mcp.tool()
     async def cite_entity(run_id: str, finding_id: str, name: str) -> dict:
