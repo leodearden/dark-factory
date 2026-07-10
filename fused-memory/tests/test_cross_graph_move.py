@@ -1423,6 +1423,12 @@ def _merge_spec(uuid: str, wrong_graph: str, home_graph: str) -> dict:
     }
 
 
+# A third graph, distinct from SOURCE_GRAPH_FIXTURE/TARGET_GRAPH_FIXTURE, used
+# only by the cross-target scenarios below (two migrating specs resolving to
+# two DIFFERENT destination graphs).
+SECOND_TARGET_GRAPH_FIXTURE = 'reify'
+
+
 class TestRecreateSubgraphRelationships:
     """recreate_subgraph_relationships(graphiti, specs) -- Phase B core.
 
@@ -1533,3 +1539,115 @@ class TestRecreateSubgraphRelationships:
         assert result.edges_recreated == 1
         assert result.edges_skipped == 0
         assert result.dropped_cross_target == []
+
+    @pytest.mark.asyncio
+    async def test_edge_between_two_different_targets_is_dropped_not_created_in_either(
+        self, mock_config, make_backend, make_graph_mock, monkeypatch,
+    ):
+        """Two MOVE specs sharing an edge but resolving to DIFFERENT target
+        graphs (A -> T1, B -> T2): FalkorDB RELATES_TO edges are single-graph,
+        so the edge cannot be recreated in EITHER T1 or T2. It must be
+        reported in dropped_cross_target (edge uuid, both endpoint uuids,
+        both resolved targets, a reason) -- never silently lost, and no
+        CREATE is issued against either graph.
+        """
+        backend = make_backend(mock_config)
+
+        source_mock = make_graph_mock()
+
+        async def _source_ro_query(cypher, params=None):
+            if 'RELATES_TO' in cypher:
+                return MagicMock(result_set=[EDGE_ROW_FIXTURE])
+            return MagicMock(result_set=[])  # no MENTIONS in this scenario
+
+        source_mock.ro_query = AsyncMock(side_effect=_source_ro_query)
+
+        t1_mock = make_graph_mock()
+        t2_mock = make_graph_mock()
+        backend._driver._get_graph = _route_graphs({
+            SOURCE_GRAPH_FIXTURE: source_mock,
+            TARGET_GRAPH_FIXTURE: t1_mock,
+            SECOND_TARGET_GRAPH_FIXTURE: t2_mock,
+        })
+
+        fake_read_compact = AsyncMock(return_value=COMPACT_VECTOR_REPLY_FIXTURE)
+        monkeypatch.setattr(cross_graph_move, '_read_compact_vector', fake_read_compact)
+
+        specs = [
+            _move_spec(NODE_UUID_FIXTURE, SOURCE_GRAPH_FIXTURE, TARGET_GRAPH_FIXTURE),
+            _move_spec(OTHER_NODE_UUID_FIXTURE, SOURCE_GRAPH_FIXTURE, SECOND_TARGET_GRAPH_FIXTURE),
+        ]
+
+        result = await recreate_subgraph_relationships(backend, specs)
+
+        # no CREATE issued on EITHER graph for this edge.
+        t1_mock.query.assert_not_awaited()
+        t2_mock.query.assert_not_awaited()
+        fake_read_compact.assert_not_awaited()
+
+        assert result.edges_recreated == 0
+        assert result.edges_skipped == 0
+        assert len(result.dropped_cross_target) == 1
+        dropped = result.dropped_cross_target[0]
+        assert dropped['edge_uuid'] == EDGE_UUID_FIXTURE
+        assert dropped['src_uuid'] == NODE_UUID_FIXTURE
+        assert dropped['dst_uuid'] == OTHER_NODE_UUID_FIXTURE
+        assert dropped['src_target'] == TARGET_GRAPH_FIXTURE
+        assert dropped['dst_target'] == SECOND_TARGET_GRAPH_FIXTURE
+        reason = dropped['reason'].lower()
+        assert 'cross-graph' in reason or 'cross graph' in reason
+        assert 'manual review' in reason or 'review' in reason
+
+    @pytest.mark.asyncio
+    async def test_non_migrating_endpoint_absent_from_target_is_dropped_not_lost(
+        self, mock_config, make_backend, make_graph_mock, monkeypatch,
+    ):
+        """One MOVE spec (A -> T) has an edge to a node NOT in this batch at
+        all (a non-migrating home-resident, B) -- deliverability is decided
+        by whether B is already present in T. Here it is NOT present (an
+        undeliverable mixed case), so the edge must be dropped (recorded in
+        dropped_cross_target) rather than silently skipped-and-lost the way
+        the old move_entity_across_graphs' edges_skipped would have (visible
+        only as a count, with no record of WHY).
+        """
+        backend = make_backend(mock_config)
+
+        source_mock = make_graph_mock()
+
+        async def _source_ro_query(cypher, params=None):
+            if 'RELATES_TO' in cypher:
+                return MagicMock(result_set=[EDGE_ROW_FIXTURE])
+            return MagicMock(result_set=[])  # no MENTIONS in this scenario
+
+        source_mock.ro_query = AsyncMock(side_effect=_source_ro_query)
+
+        target_mock = make_graph_mock()
+        # presence-probe fallback for the non-migrating endpoint (B): absent
+        # from T.
+        target_mock.ro_query = AsyncMock(return_value=MagicMock(result_set=[]))
+        backend._driver._get_graph = _route_graphs({
+            SOURCE_GRAPH_FIXTURE: source_mock,
+            TARGET_GRAPH_FIXTURE: target_mock,
+        })
+
+        fake_read_compact = AsyncMock(return_value=COMPACT_VECTOR_REPLY_FIXTURE)
+        monkeypatch.setattr(cross_graph_move, '_read_compact_vector', fake_read_compact)
+
+        # Only A is in this batch -- B (OTHER_NODE_UUID_FIXTURE) is a
+        # non-migrating home-resident absent from T.
+        specs = [_move_spec(NODE_UUID_FIXTURE, SOURCE_GRAPH_FIXTURE, TARGET_GRAPH_FIXTURE)]
+
+        result = await recreate_subgraph_relationships(backend, specs)
+
+        target_mock.query.assert_not_awaited()
+        fake_read_compact.assert_not_awaited()
+
+        assert result.edges_recreated == 0
+        assert result.edges_skipped == 0
+        assert len(result.dropped_cross_target) == 1
+        dropped = result.dropped_cross_target[0]
+        assert dropped['edge_uuid'] == EDGE_UUID_FIXTURE
+        assert dropped['src_uuid'] == NODE_UUID_FIXTURE
+        assert dropped['dst_uuid'] == OTHER_NODE_UUID_FIXTURE
+        assert dropped['src_target'] == TARGET_GRAPH_FIXTURE
+        assert dropped['dst_target'] is None
