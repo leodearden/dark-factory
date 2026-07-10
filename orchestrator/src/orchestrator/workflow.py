@@ -1608,7 +1608,9 @@ class TaskWorkflow:
         )
         return WorkflowOutcome.DONE
 
-    async def _reconcile_metadata_files_for_done(self) -> None:
+    async def _reconcile_metadata_files_for_done(
+        self, *, override_files: list[str] | None = None,
+    ) -> None:
         """Set ``metadata.files`` to the merge-diff files before set_task_status('done').
 
         Truth source: ``git diff --name-only --no-renames <_merge_sha>^1..<_merge_sha>``
@@ -1635,6 +1637,18 @@ class TaskWorkflow:
         gate-skip-when-verified-provenance branch handles the missing-files
         case from there.
 
+        ``override_files`` (task 2372, Layer C): when provided (not ``None``),
+        it REPLACES the ``_merge_sha``-derived computation entirely — used by
+        the pre-EXECUTE found_on_main recovery path, which has already computed
+        the real ``base_commit..wt_head`` branch-content diff as the very
+        evidence that authorized the recovery (see ``_recover_before_execute``).
+        Stamping that diff here means a found_on_main DONE from that guard
+        always carries real, non-empty files (ACTION #2) instead of the
+        ``_merge_sha is None -> []`` blank that let task 2125's phantom-done
+        slip the reconciliation gate undetected.  An empty list is a valid
+        override (though the pre-EXECUTE guard never passes one — it returns
+        None instead of recovering when the diff is empty).
+
         Sibling keys such as ``memory_hints`` and ``_causation_id`` (added by
         Stage-2 reconciliation after the workflow loaded ``self.task``) are
         preserved via the ``_merge_fresh_metadata`` read-modify-write; a
@@ -1649,7 +1663,9 @@ class TaskWorkflow:
         The strip can only shrink the declared set (a file-level subset of what
         landed), which keeps the phantom-done gate honest.
         """
-        if self._merge_sha:
+        if override_files is not None:
+            files = override_files
+        elif self._merge_sha:
             files, err = await self.git_ops.get_merge_commit_diff_files(
                 self._merge_sha,
             )
@@ -7565,6 +7581,7 @@ Update the plan to address the blocking issues. You may add new steps to the `st
 
     async def _finalise_recovery_done(
         self, *, basis: str, sha: str, kind: str, note: str,
+        files: list[str] | None = None,
     ) -> WorkflowOutcome:
         """Shared DONE-finalisation for all already-merged guards (PRD α, MP-2).
 
@@ -7575,6 +7592,14 @@ Update the plan to address the blocking issues. You may add new steps to the `st
         :class:`~orchestrator.landed_outbox.LandedRow`) or ``'fallback'`` (the
         legacy :meth:`_has_prior_implementation` heuristic). Extracted and
         generalized from the pre-PLAN guard's original DONE tail.
+
+        ``files`` (task 2372, Layer C): optional pre-computed evidence
+        (typically a real ``git diff`` of the branch's own content) threaded
+        straight through to :meth:`_reconcile_metadata_files_for_done` as
+        ``override_files`` — see that method for why this beats the
+        ``_merge_sha``-derived default for a recovery guard that has already
+        computed a more precise diff itself.  ``None`` (the default) leaves
+        the existing ``_merge_sha``-derived behaviour unchanged.
 
         Returns ``WorkflowOutcome.DONE`` on success. If the persistence layer
         rejects the write, routes to ``_mark_blocked(escalate_to_human=True)``
@@ -7597,7 +7622,7 @@ Update the plan to address the blocking issues. You may add new steps to the `st
             )
         self._merge_recovery_basis = basis
         self._enter_phase(WorkflowState.DONE)
-        await self._reconcile_metadata_files_for_done()
+        await self._reconcile_metadata_files_for_done(override_files=files)
         try:
             await self.scheduler.mark_done(
                 self.task_id, kind=kind, sha=sha, note=note,
@@ -7749,18 +7774,43 @@ Update the plan to address the blocking issues. You may add new steps to the `st
 
         Journal-first (MP-1): a :meth:`MergeProvenance.lookup` hit is
         authoritative and short-circuits before the git-layer probe or the
-        legacy heuristic are ever consulted.  A miss falls back to
-        :meth:`_check_branch_on_main` + :meth:`_has_prior_implementation`
-        (called WITHOUT ``wt_head`` — this caller is reached after a genuine
-        rebase, so wt_head may equal the new base_commit even on a
-        genuinely-implemented branch; the iteration-log fallback is the
-        correct signal here).
+        branch-content-diff gate are ever consulted.  A miss falls back to
+        :meth:`_check_branch_on_main` + a REAL branch-content diff (task
+        2372, Layer C): ``git diff base_commit..wt_head`` (via
+        :meth:`~orchestrator.git_ops.GitOps.get_merge_diff_files`) must be
+        non-empty.  This REPLACES the previous iteration-log heuristic
+        (:meth:`_has_prior_implementation` called WITHOUT ``wt_head``), which
+        was spoofable by a stale ``iterations.jsonl`` entry surviving in
+        ``.task-meta/<name>/`` across a re-dispatch: a fresh/re-dispatched
+        worktree has ``wt_head == base_commit``, which is TRIVIALLY an
+        ancestor of main, so ``_check_branch_on_main`` alone was never
+        sufficient — only a non-empty content diff proves the branch
+        actually produced committed, merged work.  The diff doubles as the
+        ``metadata.files`` evidence stamped on the recovery-DONE (ACTION #2;
+        see :meth:`_finalise_recovery_done`'s ``files`` parameter), so a
+        found_on_main DONE from this guard can no longer carry
+        ``metadata.files=[]`` — the exact shape that let task 2125's
+        phantom-done slip the reconciliation gate undetected.
+
+        Accepted trade-off: a genuinely-merged-then-rebased branch (where
+        ``create_worktree`` rebased a reused worktree so ``wt_head``
+        regressed to the new ``base_commit``) that ALSO misses the journal
+        now re-executes instead of recovering, because
+        ``base_commit..wt_head`` is empty even though the branch was once
+        genuinely implemented.  This is deliberately preferred over the
+        false-positive it replaces: genuine merges are journal-covered
+        (:meth:`MergeProvenance.lookup` runs first, above), and a spurious
+        re-execute is self-correcting (the merge-phase guard finalises it
+        properly), whereas a phantom-DONE is not self-correcting and
+        requires an out-of-band reconciliation sweep to detect — the
+        asymmetry that makes this the right trade.
 
         Returns ``WorkflowOutcome.DONE`` (via the shared
         :meth:`_finalise_recovery_done` chokepoint, MP-2) when the branch is
-        already merged AND there is prior implementation work.  Returns
-        ``None`` in all other cases (external worktree, not on main, on main
-        but no prior work — a stale branch point) so the caller proceeds with
+        already merged AND ``base_commit..wt_head`` is a non-empty diff.
+        Returns ``None`` in all other cases (external worktree, not on main,
+        on main but a zero-diff branch — a fresh, re-dispatched, or
+        otherwise stale/unadvanced branch point) so the caller proceeds with
         the normal execute/verify/review loop.
         """
         if self._worktree_external:
@@ -7778,22 +7828,30 @@ Update the plan to address the blocking issues. You may add new steps to the `st
             return None
         wt_head, main_sha = _branch_check
 
-        has_work = self._has_prior_implementation().has_work
-        if has_work:
+        base_commit = self.artifacts.read_base_commit() if self.artifacts else None
+        branch_files: list[str] = []
+        if base_commit:
+            branch_files, _err = await self.git_ops.get_merge_diff_files(
+                base_commit, wt_head,
+            )
+        if not branch_files:
             logger.info(
                 f'Task {self.task_id}: worktree HEAD {wt_head[:8]} '
-                f'already on main — skipping to DONE (prior merge survived)'
+                f'is ancestor of main but base..wt_head diff is empty '
+                f'— fresh/unadvanced branch point, proceeding normally'
             )
-            return await self._finalise_recovery_done(
-                basis='fallback', sha=main_sha, kind='found_on_main',
-                note='branch already on main at workflow start (pre-EXECUTE recovery)',
-            )
+            return None
+
         logger.info(
             f'Task {self.task_id}: worktree HEAD {wt_head[:8]} '
-            f'is ancestor of main but no prior implementation '
-            f'— stale branch point, proceeding normally'
+            f'already on main with {len(branch_files)} changed file(s) '
+            f'— skipping to DONE (prior merge survived)'
         )
-        return None
+        return await self._finalise_recovery_done(
+            basis='fallback', sha=main_sha, kind='found_on_main',
+            note='branch already on main at workflow start (pre-EXECUTE recovery)',
+            files=branch_files,
+        )
 
     async def _recover_before_merge(
         self, branch_head: str, main_sha: str,
