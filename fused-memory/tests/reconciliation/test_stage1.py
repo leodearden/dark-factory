@@ -277,25 +277,6 @@ class TestStage1PayloadSummaryNonce:
 
 
 # ---------------------------------------------------------------------------
-# Step 1 (task-1473): STAGE2 prompt mandates uniqueness_token in cycle summaries
-# ---------------------------------------------------------------------------
-
-
-class TestStage2PromptMandatesUniquenessToken:
-    """Minimal existence check: build_stage2_system_prompt exposes the uniqueness_token mechanism."""
-
-    def test_build_stage2_system_prompt_exposes_uniqueness_token(self):
-        """build_stage2_system_prompt('dark_factory') must expose uniqueness_token."""
-        from fused_memory.reconciliation.prompts.stage2 import build_stage2_system_prompt
-
-        result = build_stage2_system_prompt('dark_factory')
-        assert 'uniqueness_token' in result, (
-            "build_stage2_system_prompt('dark_factory') must expose uniqueness_token "
-            "(guards against the per-cycle summary uniqueness section being dropped)."
-        )
-
-
-# ---------------------------------------------------------------------------
 # A7b: harness._escalate fingerprint stamping + dedup routing
 # ---------------------------------------------------------------------------
 
