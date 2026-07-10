@@ -1529,3 +1529,57 @@ def test_tmux_backend_routes_and_runs_session(
         f"expected a result.md written to {result_file} by the session"
     )
     assert "outcome:" in result_file.read_text()
+
+
+def test_tmux_backend_stamps_display_record(tmp_path: pathlib.Path) -> None:
+    """A successful tmux-lane spawn must stamp the record's display: kind
+    'tmux', tmux_target matching the tmux `-P -F` output, and wm_title
+    matching the title argument passed to spawn-claude.sh.
+
+    RED today: step-4 runs the tmux lane but never calls the session-registry
+    `set-display` verb, so record.display stays None -- the record `launching`
+    creates never populates it, and nothing else writes it. GREEN after
+    step-6 wires the post-window-creation stamp (built on step-2's
+    `set-display` CLI verb, already landed).
+    """
+    bin_dir = _make_bin_dir(tmp_path)
+    _write_fake_claude_writing_result_with_exit_code(bin_dir, 0)
+
+    tmux_marker = tmp_path / "tmux_used"
+    emulator_marker = tmp_path / "emulator_used"
+    target = "fleet-proj:0"
+    _write_fake_tmux(bin_dir, tmux_marker, target=target)
+    _write_marker_only_failing_terminal(bin_dir, "xterm", emulator_marker)
+
+    env = _base_env(bin_dir, "xterm")
+    env["CLAUDE_SPAWN_BACKEND"] = "tmux"
+    env["CLAUDE_SPAWN_PROJECT"] = "proj"
+
+    # Use a distinctive, non-empty title (unlike _run_spawn's hardcoded "")
+    # so the wm_title assertion below actually exercises the wiring instead
+    # of trivially matching an empty default.
+    title = "tmux-lane-display-test"
+    result = subprocess.run(
+        [str(SPAWN_SCRIPT), str(tmp_path), "false", title, "test prompt"],
+        env=env,
+        capture_output=True,
+        timeout=30,
+    )
+    assert result.returncode == 0, f"stderr: {result.stderr.decode()}"
+
+    fleet_root = pathlib.Path(env["CLAUDE_FLEET_ROOT"])
+    record_path = _find_one_record(fleet_root)
+    record = session_registry.SessionRecord.from_json(record_path.read_text())
+
+    assert record.display is not None, (
+        "expected a stamped display on a successful tmux-lane spawn"
+    )
+    assert record.display.kind == "tmux"
+    assert record.display.tmux_target == target, (
+        f"expected the display's tmux_target to match the tmux -P -F "
+        f"output {target!r}, got {record.display.tmux_target!r}"
+    )
+    assert record.display.wm_title == title, (
+        f"expected the display's wm_title to match the title passed to "
+        f"spawn-claude.sh ({title!r}), got {record.display.wm_title!r}"
+    )
