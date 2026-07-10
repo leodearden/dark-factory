@@ -1123,3 +1123,54 @@ def test_spawn_appends_result_handback_trailer_to_prompt(
         f"{record.result_file!r} to be appended to the prompt, "
         f"got:\n{captured_prompt}"
     )
+
+
+def test_spawn_fail_soft_skips_result_handback_when_registry_faults(
+    tmp_path: pathlib.Path,
+) -> None:
+    """A forced registry-write failure must cleanly skip the ENTIRE
+    result-handback protocol -- no env export, no prompt trailer, no bogus
+    result.md anywhere -- while leaving the pre-existing exit-code contract
+    and the loud registry-fault stderr line untouched.
+
+    Green-on-arrival guard (matches test_spawn_fail_soft_on_unwritable_fleet_root's
+    precedent): steps 2/4/6 already gate the result_file, the env export, and
+    the prompt trailer on a non-empty CLAUDE_SPAWN_RESULT_FILE, and
+    SESSION_RECORD_DIR is empty whenever the registry `launching` write
+    faults, so this should already pass without further implementation
+    changes. Locks the fail-soft contract before any future change to the
+    result-handback wiring.
+    """
+    bin_dir = _make_bin_dir(tmp_path)
+    _write_fake_claude_writing_result(bin_dir)
+    _write_foreground_terminal(bin_dir, "xterm")
+    env = _base_env(bin_dir, "xterm")
+
+    # Shadow _base_env's CLAUDE_FLEET_ROOT with one that can never be created:
+    # a path nested UNDER a pre-existing regular file (same trick as
+    # test_spawn_fail_soft_on_unwritable_fleet_root).
+    blocker = tmp_path / "not_a_dir"
+    blocker.write_text("i am a regular file, not a directory\n")
+    env["CLAUDE_FLEET_ROOT"] = str(blocker / "fleet")
+
+    result = _run_spawn(env, tmp_path)
+
+    assert result.returncode == 0, (
+        f"a result-file allocation failure must never change the exit-code "
+        f"contract: expected 0 (the session's own code), got "
+        f"{result.returncode}\nstderr: {result.stderr.decode()}"
+    )
+
+    stderr = result.stderr.decode()
+    assert "session_registry" in stderr and "failed" in stderr, (
+        f"expected a loud registry-fault line on the spawn's stderr, got:\n{stderr}"
+    )
+
+    fleet_root = pathlib.Path(env["CLAUDE_FLEET_ROOT"])
+    assert not fleet_root.exists(), (
+        f"no record dir should have been created under an unwritable fleet "
+        f"root, but {fleet_root} exists"
+    )
+    assert not list(tmp_path.rglob("result.md")), (
+        "no result.md should be created anywhere when the registry write faults"
+    )
