@@ -3,6 +3,14 @@
 Fleet Cockpit C5a (plans/fleet-cockpit-prd.md §9). Scope: session table +
 detail pane + poll refresh only -- the decision queue, keybindings, and
 spawn bar are C5b.
+
+Pure-consumer discipline (PRD §2/§5 hard invariant): every refresh/scan/
+select code path here is strictly READ-ONLY over the session and decision
+registries -- nothing in this module calls write_record/write_decision/
+update_decision_state/set_manual_boost. The cockpit's ONLY write target is
+its own cockpit-ui.json (via cockpit.ui_config), used solely to remember
+the last-selected session across restarts. See test_app.py's
+TestWriteDiscipline for the end-to-end proof.
 """
 
 from __future__ import annotations
@@ -18,6 +26,7 @@ from textual.containers import Horizontal
 from cockpit.panes.detail_pane import DetailPane
 from cockpit.panes.session_table import SessionTable, order_sessions
 from cockpit.registry_reader import build_snapshot, scan_sessions, snapshot_changed
+from cockpit.ui_config import CockpitUIConfig, load_ui_config, save_ui_config
 
 
 class CockpitApp(App):
@@ -38,6 +47,7 @@ class CockpitApp(App):
         self._records: list[SessionRecord] = []
         self._snapshot: dict[str, tuple] = {}
         self._has_scanned = False
+        self._selected_slug: str | None = None
 
     def compose(self) -> ComposeResult:
         yield Horizontal(
@@ -46,8 +56,14 @@ class CockpitApp(App):
         )
 
     def on_mount(self) -> None:
+        selected_slug = load_ui_config(self.fleet_root).selected_slug
         self.refresh_registry()
+        if selected_slug is not None:
+            self.query_one('#session-table', SessionTable).select_slug(selected_slug)
         self.set_interval(self.poll_interval, self.refresh_registry)
+
+    def on_unmount(self) -> None:
+        self._persist_ui_config()
 
     def refresh_registry(self) -> None:
         """Scan the registry and rebuild the SessionTable only when something changed.
@@ -74,8 +90,11 @@ class CockpitApp(App):
 
         Looked up against self._records -- the ordered set from the most
         recent scan -- so this always reflects current data, not whatever
-        object identity a stale event might carry.
+        object identity a stale event might carry. Also remembers *slug* for
+        _persist_ui_config, since on_unmount runs after the DataTable itself
+        has already been torn down and can no longer be queried.
         """
+        self._selected_slug = slug
         record = next((r for r in self._records if r.session_slug == slug), None)
         detail = self.query_one('#detail', DetailPane)
         detail.show_record(record, self._records, self._now_fn())
@@ -90,3 +109,16 @@ class CockpitApp(App):
         same-row-different-content rebuild needs its own explicit sync.
         """
         self._sync_detail_pane(event.row_key.value)
+        self._persist_ui_config()
+
+    def _persist_ui_config(self) -> None:
+        """Write the cockpit's own UI state -- its ONLY write target (PRD §2/§5).
+
+        Persists just enough to restore the operator's place across a
+        restart (selected_slug) plus the poll_interval currently in effect.
+        Never touches sessions/ or decisions/. Reads self._selected_slug
+        (not the DataTable) so this is safe to call from on_unmount, after
+        the table has already been torn down.
+        """
+        cfg = CockpitUIConfig(selected_slug=self._selected_slug, poll_interval=self.poll_interval)
+        save_ui_config(cfg, self.fleet_root)

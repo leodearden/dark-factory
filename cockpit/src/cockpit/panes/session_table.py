@@ -198,3 +198,11 @@ class SessionTable(DataTable):
                 self.move_cursor(row=self.get_row_index(previous_slug))
             except RowDoesNotExist:
                 self.move_cursor(row=0)
+
+    def select_slug(self, slug: str) -> bool:
+        """Move the cursor to *slug*'s row if present. Returns whether it was found."""
+        try:
+            self.move_cursor(row=self.get_row_index(slug))
+        except RowDoesNotExist:
+            return False
+        return True
