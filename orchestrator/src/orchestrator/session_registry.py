@@ -43,6 +43,15 @@ logger = logging.getLogger(__name__)
 
 SCHEMA_VERSION = 1
 
+SCHEMA_MINOR = 1
+"""Additive-extension counter for this module's contract (Fleet Cockpit C1,
+plans/fleet-cockpit-prd.md §6.1). A CODE-LEVEL signal only -- never persisted
+per-record. Bump this when a new backward-compatible (optional/defaulted)
+field is added; SCHEMA_VERSION (the PERSISTED major) stays unchanged so
+rail-vintage and post-extension records remain version-indistinguishable on
+disk, and any consumer gating on ``record.schema_version == 1`` keeps
+working unmodified."""
+
 RESULT_FILENAME = 'result.md'
 """Basename of the result-handback file inside each record dir (Attention
 Rail T5): ``<record_dir>/result.md``. Kept in sync BY CONVENTION (not
@@ -79,6 +88,90 @@ TERMINAL_STATUSES: frozenset[Status] = frozenset({Status.EXITED, Status.FAILED_T
 """Statuses past which a record is eligible for the terminal-TTL reap rule."""
 
 
+class SpawnMode(StrEnum):
+    """How a session relates to its parent (Fleet Cockpit C1, PRD §6.1).
+
+    Modeled as a StrEnum contract for writers, but ``SessionRecord.spawn_mode``
+    itself is a plain ``str`` field with NO from_dict coercion through this
+    enum -- an unrecognized/foreign value must still round-trip rather than
+    raise ``CorruptSessionRecord`` (additive-safe, unlike the closed-set
+    ``Status`` contract).
+
+    CHILD: spawned directly by a parent session; parent_session_id names the
+        direct spawner. The default -- see spawn-claude.sh's env-export
+        baseline.
+    SIBLING: spawned to run alongside a parent under a shared ancestor (C7);
+        parent_session_id names that shared ancestor, not the direct spawner.
+    DETACHED: spawned with no tracked parent linkage.
+    """
+
+    CHILD = 'child'
+    SIBLING = 'sibling'
+    DETACHED = 'detached'
+
+
+class DisplayKind(StrEnum):
+    """Where a session's terminal/pane lives, for focus-arrange (C4)."""
+
+    WM = 'wm'
+    TMUX = 'tmux'
+
+
+@dataclass
+class Display:
+    """Where to find/focus this session's terminal (Fleet Cockpit C1, PRD §6.1).
+
+    kind: DisplayKind's wire value ('wm' or 'tmux'); stored as a plain
+        ``str`` (no from_dict coercion -- see SpawnMode's docstring for why).
+    wm_title: the spawned terminal's window title, for a 'wm' kind's
+        window-manager lookup.
+    wm_window_id: the window-manager's own window id, when known.
+    tmux_target: a tmux target spec (e.g. ``'session:window.pane'``), for a
+        'tmux' kind.
+    """
+
+    kind: str
+    wm_title: str = ''
+    wm_window_id: str | None = None
+    tmux_target: str | None = None
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            'kind': self.kind,
+            'wm_title': self.wm_title,
+            'wm_window_id': self.wm_window_id,
+            'tmux_target': self.tmux_target,
+        }
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> Display:
+        return cls(
+            kind=data['kind'],
+            wm_title=data.get('wm_title', ''),
+            wm_window_id=data.get('wm_window_id'),
+            tmux_target=data.get('tmux_target'),
+        )
+
+
+@dataclass
+class Question:
+    """A pending question queued against this session (Fleet Cockpit C1, PRD §6.1).
+
+    text: the question text.
+    asked_at: ISO-8601 timestamp of when it was queued.
+    """
+
+    text: str
+    asked_at: str
+
+    def to_dict(self) -> dict[str, Any]:
+        return {'text': self.text, 'asked_at': self.asked_at}
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> Question:
+        return cls(text=data['text'], asked_at=data['asked_at'])
+
+
 @dataclass
 class SessionRecord:
     """One session-registry record — ``<fleet_root>/sessions/<slug>/record.json``.
@@ -105,6 +198,14 @@ class SessionRecord:
         `_run_launching` at launch time (``<record_dir>/RESULT_FILENAME``)
         and preserved unchanged by every later read-modify-write.
     transcript_path: best-effort ``~/.claude/projects/<encoded-cwd>`` path.
+    parent_session_id: the spawning session's own session_slug, or None for
+        a human-launched root (Fleet Cockpit C1, PRD §6.1).
+    spawn_mode: how this session relates to its parent; see SpawnMode.
+        Defaults to ``SpawnMode.CHILD``.
+    display: where to find/focus this session's terminal, or None if
+        unknown; see Display.
+    question: a pending question queued against this session, or None; see
+        Question.
     """
 
     session_slug: str
@@ -122,6 +223,10 @@ class SessionRecord:
     exit_code: int | None = field(default=None, kw_only=True)
     result_file: str | None = field(default=None, kw_only=True)
     transcript_path: str | None = field(default=None, kw_only=True)
+    parent_session_id: str | None = field(default=None, kw_only=True)
+    spawn_mode: str = field(default=SpawnMode.CHILD, kw_only=True)
+    display: Display | None = field(default=None, kw_only=True)
+    question: Question | None = field(default=None, kw_only=True)
 
     def to_dict(self) -> dict[str, Any]:
         """Return a plain, JSON-scalar-only dict (status as its wire string)."""
@@ -141,10 +246,16 @@ class SessionRecord:
             'exit_code': self.exit_code,
             'result_file': self.result_file,
             'transcript_path': self.transcript_path,
+            'parent_session_id': self.parent_session_id,
+            'spawn_mode': str(self.spawn_mode),
+            'display': self.display.to_dict() if self.display is not None else None,
+            'question': self.question.to_dict() if self.question is not None else None,
         }
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> SessionRecord:
+        display_data = data.get('display')
+        question_data = data.get('question')
         return cls(
             session_slug=data['session_slug'],
             status=Status(data['status']),
@@ -161,6 +272,10 @@ class SessionRecord:
             exit_code=data.get('exit_code'),
             result_file=data.get('result_file'),
             transcript_path=data.get('transcript_path'),
+            parent_session_id=data.get('parent_session_id'),
+            spawn_mode=data.get('spawn_mode', SpawnMode.CHILD),
+            display=Display.from_dict(display_data) if isinstance(display_data, dict) else None,
+            question=Question.from_dict(question_data) if isinstance(question_data, dict) else None,
         )
 
     def to_json(self) -> str:
