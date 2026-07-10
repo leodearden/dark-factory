@@ -3222,6 +3222,65 @@ async def test_update_task_refuses_to_clobber_corrupt_metadata(
 
 
 @pytest.mark.asyncio
+async def test_stamp_audit_metadata_refuses_to_clobber_corrupt_metadata(
+    backend, project_root, caplog,
+):
+    """stamp_audit_metadata is the sole done_provenance writer gating the
+    done-flow — its corrupt-existing-blob contract must match update_task's:
+    it reuses _merge_metadata(mode='merge'), which raises TaskmasterError
+    and refuses to overwrite a corrupt existing blob rather than silently
+    succeeding or best-effort stamping the audit fields. Exactly one deduped
+    malformed-metadata WARNING is emitted and the blob survives byte-for-byte.
+
+    Setup deliberately avoids a read-path access before the write so the
+    dedup slot is not pre-consumed by _row_to_task.
+    """
+    await backend.add_task(project_root=project_root, title='t')
+
+    # Directly inject a corrupt blob WITHOUT reading the row first.
+    conn = await backend._get_connection(project_root)
+    await conn.execute(
+        'UPDATE tasks SET metadata = ? WHERE id = 1', (_CORRUPT_BLOB,),
+    )
+    await conn.commit()
+
+    with caplog.at_level(
+        logging.WARNING, logger='fused_memory.backends.sqlite_task_backend',
+    ):
+        with pytest.raises(TaskmasterError) as exc:
+            await backend.stamp_audit_metadata(
+                '1', project_root,
+                {'done_provenance': {'kind': 'merged', 'commit': 'abc123'}},
+            )
+    assert exc.value.code == 'TASKMASTER_TOOL_ERROR'
+    assert 'corrupt metadata blob' in exc.value.message
+
+    # Exactly one deduped malformed-metadata WARNING must have been emitted.
+    warn_records = [
+        r for r in caplog.records
+        if r.levelno >= logging.WARNING and 'malformed metadata' in r.message
+    ]
+    assert len(warn_records) == 1, (
+        f'Expected exactly one malformed-metadata WARNING; got {len(warn_records)}: '
+        f'{[r.message for r in warn_records]}'
+    )
+
+    # The original corrupt blob must be byte-for-byte unchanged — the audit
+    # stamp did NOT silently succeed nor clobber the row.
+    raw_conn = await backend._get_connection(project_root)
+    cursor = await raw_conn.execute(
+        'SELECT metadata FROM tasks WHERE id = 1',
+    )
+    row = await cursor.fetchone()
+    assert row['metadata'] == _CORRUPT_BLOB, (
+        f'Expected metadata unchanged (corrupt blob preserved); got: {row["metadata"]!r}'
+    )
+    assert 'dark_factory:42' in row['metadata'], (
+        f'Expected external_deps substring in preserved metadata; got: {row["metadata"]!r}'
+    )
+
+
+@pytest.mark.asyncio
 async def test_add_dependency_qualified_refuses_corrupt_metadata(
     backend, project_root, caplog,
 ):
