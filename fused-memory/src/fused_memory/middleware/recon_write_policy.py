@@ -36,6 +36,8 @@ from typing import Literal
 
 from shared.task_statuses import TERMINAL as TERMINAL_STATUSES
 
+from fused_memory.services.live_workflow_detector import is_workflow_live_for_task
+
 # ---------------------------------------------------------------------------
 # Verdict
 # ---------------------------------------------------------------------------
@@ -149,6 +151,9 @@ def check(
 
     Gate 1 (terminal): ``op == 'update_task'`` AND ``live_status`` is
     terminal (done/cancelled) -> ``ReconTerminalWriteRejected``.
+
+    Gate 2 (live workflow): ``op == 'set_task_status'`` AND a live workflow
+    is detected for ``task_id`` -> ``ReconLiveWorkflowWriteRejected``.
     """
     if op == 'update_task' and live_status in TERMINAL_STATUSES:
         return _reject(
@@ -165,6 +170,29 @@ def check(
                 'recon-stage writes. If this task genuinely needs updating, '
                 'use a non-recon-stage agent_id or route through '
                 'set_task_status with a reopen_reason.'
+            ),
+            live_status=live_status,
+            target_status=target_status,
+            snapshot_token=snapshot_token,
+        )
+
+    if op == 'set_task_status' and is_workflow_live_for_task(task_id, project_root):
+        return _reject(
+            op=op,
+            task_id=task_id,
+            agent_id=agent_id,
+            error_type='ReconLiveWorkflowWriteRejected',
+            reason=(
+                f'recon-stage write blocked: task {task_id} has a live '
+                'workflow (worktree/branch or orchestrator lock active); '
+                'recon-stage agents may not write status while a workflow '
+                'is live.'
+            ),
+            hint=(
+                'A live orchestrator workflow (worktree, recent commit, or '
+                'project-level lock) is active for this task. Recon-stage '
+                'status writes would race the pipeline and are rejected; '
+                'wait for the workflow to complete.'
             ),
             live_status=live_status,
             target_status=target_status,
