@@ -22,7 +22,12 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 from _fm_helpers import extract_cypher, extract_params
 
-from fused_memory.maintenance.cross_graph_move import MergeResult, MoveResult
+from fused_memory.maintenance.cross_graph_move import (
+    CreateResult,
+    MergeResult,
+    MoveResult,
+    SubgraphEdgeResult,
+)
 
 SCRIPT_PATH = Path(__file__).parent.parent / 'scripts' / 'migrate_cross_graph_leak.py'
 
@@ -1389,6 +1394,105 @@ class TestRunPostVerify:
 
         assert report['post_verify']['matched'] is True
         assert report['exit_code'] != 0
+
+
+# ===========================================================================
+# Tests: run() apply three-phase barrier ordering (task 2415, step-11/12)
+# ===========================================================================
+
+class TestRunApplyPhaseBarrier:
+    """Pins the barrier-ordering invariant of the three-phase apply (CGL-eta
+    follow-up, task 2415): run() must drive Phase A (create_moved_node, once
+    per MOVE node) to completion for the WHOLE batch before Phase B
+    (recreate_subgraph_relationships, a single batched call), and Phase B to
+    completion before Phase C (delete_source_node, once per MOVE/MERGE
+    node). This ordering is what prevents a co-moving neighbour's shared
+    RELATES_TO edge from being silently skipped and then destroyed before it
+    is ever recreated -- see the module docstring and cross_graph_move.py's
+    "Residual hazard" note on the old single-call move_entity_across_graphs.
+    """
+
+    def _write_manifest(self, tmp_path, nodes, census) -> Path:
+        manifest = _mod.build_manifest(nodes, census, dry_run=True)
+        manifest_path = tmp_path / 'manifest.json'
+        manifest_path.write_text(json.dumps(manifest))
+        return manifest_path
+
+    @pytest.mark.asyncio
+    async def test_all_phase_a_creates_precede_phase_b_which_precedes_all_phase_c_deletes(
+        self, tmp_path, monkeypatch,
+    ):
+        """A manifest with two MOVE nodes and one MERGE node: every Phase-A
+        create_moved_node call is logged before the single, batched Phase-B
+        recreate_subgraph_relationships call, which is logged before every
+        Phase-C delete_source_node call."""
+        move_a = _classified_node(
+            'u-move-a', source_graph='reify', target_graph='dark_factory', disposition=_mod.MOVE,
+        )
+        move_b = _classified_node(
+            'u-move-b', source_graph='reify', target_graph='dark_factory', disposition=_mod.MOVE,
+        )
+        merge_c = _classified_node(
+            'u-merge-c', source_graph='reify', target_graph='know_live', disposition=_mod.MERGE,
+        )
+        manifest_path = self._write_manifest(
+            tmp_path, [move_a, move_b, merge_c], {'reify': 3},
+        )
+
+        call_log: list[tuple] = []
+
+        async def _fake_create(graphiti, uuid, source_graph, target_graph, **kwargs):
+            call_log.append(('create', uuid))
+            return CreateResult(uuid=uuid, source_graph=source_graph, target_graph=target_graph)
+
+        async def _fake_recreate(graphiti, specs):
+            call_log.append(('recreate', tuple(sorted(spec['uuid'] for spec in specs))))
+            return SubgraphEdgeResult()
+
+        async def _fake_delete(graphiti, uuid, source_graph):
+            call_log.append(('delete', uuid))
+
+        monkeypatch.setattr(_mod, 'create_moved_node', AsyncMock(side_effect=_fake_create))
+        monkeypatch.setattr(
+            _mod, 'recreate_subgraph_relationships', AsyncMock(side_effect=_fake_recreate),
+        )
+        monkeypatch.setattr(_mod, 'delete_source_node', AsyncMock(side_effect=_fake_delete))
+
+        memory_service = _make_memory_service({
+            'reify': _make_graph_mock(ro_pages=[[]]),
+            'dark_factory': _make_graph_mock(ro_pages=[[]]),
+            'know_live': _make_graph_mock(ro_pages=[[]]),
+        })
+        args = _args(apply=True, manifest=str(manifest_path))
+
+        await _mod.run(args, memory_service)
+
+        kinds = [entry[0] for entry in call_log]
+        create_positions = [i for i, kind in enumerate(kinds) if kind == 'create']
+        recreate_positions = [i for i, kind in enumerate(kinds) if kind == 'recreate']
+        delete_positions = [i for i, kind in enumerate(kinds) if kind == 'delete']
+
+        # MOVE nodes each get a Phase-A create; the MERGE node does not (its
+        # home copy already exists -- see create_moved_node's docstring).
+        assert len(create_positions) == 2
+        assert {call_log[i][1] for i in create_positions} == {'u-move-a', 'u-move-b'}
+        # A single, batched Phase-B call over the WHOLE batch (MOVE + MERGE).
+        assert len(recreate_positions) == 1
+        assert set(call_log[recreate_positions[0]][1]) == {
+            'u-move-a', 'u-move-b', 'u-merge-c',
+        }
+        # Every MOVE/MERGE node gets a Phase-C delete.
+        assert len(delete_positions) == 3
+        assert {call_log[i][1] for i in delete_positions} == {
+            'u-move-a', 'u-move-b', 'u-merge-c',
+        }
+
+        assert max(create_positions) < min(recreate_positions), (
+            'every Phase-A create must precede the Phase-B recreate call'
+        )
+        assert max(recreate_positions) < min(delete_positions), (
+            'the Phase-B recreate call must precede every Phase-C delete'
+        )
 
 
 # ===========================================================================
