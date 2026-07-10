@@ -67,3 +67,26 @@ class CockpitApp(App):
         self._records = order_sessions(records)
         table = self.query_one('#session-table', SessionTable)
         table.replace_rows(self._records, self._now_fn())
+        self._sync_detail_pane(table.highlighted_slug())
+
+    def _sync_detail_pane(self, slug: str | None) -> None:
+        """Render *slug*'s record (or the empty placeholder) into the detail pane.
+
+        Looked up against self._records -- the ordered set from the most
+        recent scan -- so this always reflects current data, not whatever
+        object identity a stale event might carry.
+        """
+        record = next((r for r in self._records if r.session_slug == slug), None)
+        detail = self.query_one('#detail', DetailPane)
+        detail.show_record(record, self._records, self._now_fn())
+
+    def on_data_table_row_highlighted(self, event: SessionTable.RowHighlighted) -> None:
+        """Keep the detail pane in sync with the DataTable's highlighted row.
+
+        Covers interactive cursor moves (e.g. arrow keys, or a test/caller
+        calling move_cursor directly). The complementary rebuild-time sync
+        lives in refresh_registry -- clear()'s cursor reset only reposts
+        this message when the highlighted row index actually changes, so a
+        same-row-different-content rebuild needs its own explicit sync.
+        """
+        self._sync_detail_pane(event.row_key.value)

@@ -67,5 +67,31 @@ def render_detail(record: SessionRecord, all_records: list[SessionRecord], now: 
     return '\n'.join(lines)
 
 
+_NO_SELECTION_PLACEHOLDER = '(no session selected)'
+
+
 class DetailPane(Static):
-    """Renders a single session's full detail (render_detail's plain text)."""
+    """Renders a single session's full detail (render_detail's plain text).
+
+    show_record() is the sole mutator: it renders *record* via
+    render_detail() (or a placeholder when nothing is selected) into both
+    the widget's display and the plain-text `rendered_text` attribute, so
+    callers/tests can read back what's currently shown without parsing the
+    rendered widget.
+    """
+
+    def __init__(self, *args, **kwargs) -> None:
+        super().__init__(*args, **kwargs)
+        self.rendered_text = _NO_SELECTION_PLACEHOLDER
+
+    def show_record(
+        self,
+        record: SessionRecord | None,
+        all_records: list[SessionRecord],
+        now: datetime,
+    ) -> None:
+        """Render *record*'s detail, or a placeholder when *record* is None (no selection)."""
+        self.rendered_text = (
+            render_detail(record, all_records, now) if record is not None else _NO_SELECTION_PLACEHOLDER
+        )
+        self.update(self.rendered_text)
