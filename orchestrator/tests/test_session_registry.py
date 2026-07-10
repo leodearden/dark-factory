@@ -953,3 +953,83 @@ def test_release_lease_is_idempotent_on_a_second_call(tmp_path: Path) -> None:
 
     assert first is True
     assert second is False
+
+
+# ---------------------------------------------------------------------------
+# reap_stale_leases matrix
+# ---------------------------------------------------------------------------
+
+
+def test_reap_stale_leases_matrix(tmp_path: Path) -> None:
+    live_holder = sr.LeaseHolder(session_slug='kept-live', pid=os.getpid(), start_ts=_NOW.isoformat())
+    sr.claim_lease('kept-live', holder=live_holder, root=tmp_path, now=_NOW)
+    _set_mtime(sr.lease_path_for_name('kept-live', root=tmp_path), _NOW, timedelta(days=30))
+
+    dead_within_ttl = sr.LeaseHolder(
+        session_slug='kept-dead-fresh', pid=_DEAD_PID, start_ts=_NOW.isoformat()
+    )
+    sr.claim_lease('kept-dead-fresh', holder=dead_within_ttl, root=tmp_path, now=_NOW)
+    _set_mtime(
+        sr.lease_path_for_name('kept-dead-fresh', root=tmp_path),
+        _NOW,
+        sr.LEASE_HEARTBEAT_TTL - timedelta(minutes=1),
+    )
+
+    dead_past_ttl = sr.LeaseHolder(
+        session_slug='reap-dead-stale', pid=_DEAD_PID, start_ts=_NOW.isoformat()
+    )
+    sr.claim_lease('reap-dead-stale', holder=dead_past_ttl, root=tmp_path, now=_NOW)
+    _set_mtime(
+        sr.lease_path_for_name('reap-dead-stale', root=tmp_path),
+        _NOW,
+        sr.LEASE_HEARTBEAT_TTL + timedelta(minutes=1),
+    )
+
+    corrupt_path = sr.lease_path_for_name('reap-corrupt', root=tmp_path)
+    corrupt_path.parent.mkdir(parents=True, exist_ok=True)
+    corrupt_path.write_text('{not valid json')
+    _set_mtime(corrupt_path, _NOW, sr.LEASE_HEARTBEAT_TTL + timedelta(minutes=1))
+
+    reaped = sr.reap_stale_leases(root=tmp_path, now=_NOW)
+
+    reaped_by_name = {r.lease_name: r.reason for r in reaped}
+    assert reaped_by_name == {
+        'reap-dead-stale': 'stale_pid',
+        'reap-corrupt': 'corrupt',
+    }
+    remaining = {p.stem for p in sr.leases_dir(root=tmp_path).iterdir()}
+    assert remaining == {'kept-live', 'kept-dead-fresh'}
+
+
+def test_reap_stale_leases_continues_sweep_when_one_removal_fails(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    poison_holder = sr.LeaseHolder(session_slug='poison', pid=_DEAD_PID, start_ts=_NOW.isoformat())
+    sr.claim_lease('poison', holder=poison_holder, root=tmp_path, now=_NOW)
+    victim_holder = sr.LeaseHolder(session_slug='victim', pid=_DEAD_PID, start_ts=_NOW.isoformat())
+    sr.claim_lease('victim', holder=victim_holder, root=tmp_path, now=_NOW)
+    for lease_name in ('poison', 'victim'):
+        _set_mtime(
+            sr.lease_path_for_name(lease_name, root=tmp_path),
+            _NOW,
+            sr.LEASE_HEARTBEAT_TTL + timedelta(minutes=1),
+        )
+
+    poison_path = sr.lease_path_for_name('poison', root=tmp_path)
+    real_unlink = Path.unlink
+
+    def _flaky_unlink(self: Path, *args: Any, **kwargs: Any) -> None:
+        if self == poison_path:
+            raise OSError('simulated permission error')
+        real_unlink(self, *args, **kwargs)
+
+    monkeypatch.setattr(Path, 'unlink', _flaky_unlink)
+
+    with caplog.at_level(logging.ERROR):
+        reaped = sr.reap_stale_leases(root=tmp_path, now=_NOW)
+
+    assert {r.lease_name for r in reaped} == {'victim'}
+    assert poison_path.is_file()  # left behind, not silently claimed as reaped
+    assert any(r.levelno >= logging.ERROR for r in caplog.records)
