@@ -30,6 +30,38 @@ Extract the task number from the user's message. Set these for the rest of the w
 
 and stop. There's nothing to unblock without a worktree.
 
+**Claim the unblock lease.** Before gathering context (Step 1), claim the
+`unblock-<project>#<TASK_ID>` lease (Attention Rail T7,
+`orchestrator/src/orchestrator/session_registry.py`) with `warn-and-proceed` policy — unlike the
+escalation-watcher's stand-down lease, a second `/unblock` on the same task is allowed to proceed,
+just made visible:
+
+```bash
+python3 $DARK_FACTORY_ROOT/orchestrator/src/orchestrator/session_registry.py lease-claim \
+  --name "unblock-<project>#<TASK_ID>" --slug "unblock-<project>-<TASK_ID>-$$" --pid $$ \
+  --policy warn-and-proceed
+```
+
+(`<project>` is the same short project token used elsewhere for this task, e.g. the basename of
+`PROJECT_ROOT`.) Parse the two printed lines (`decision=<acquired|proceed>` + message):
+
+- **`decision=proceed` with a holder reported in the message**: surface that line verbatim to the
+  user (`lease held by <session> (alive|dead, heartbeat Ns ago) — proceeding anyway`) — this is
+  exactly the near-duplicate second-`/unblock`-on-the-same-task case (reify 06-28) — then continue
+  normally into Step 1. Never stand down or exit; `warn-and-proceed` never blocks this session.
+- **`decision=acquired`**: no prior holder; continue normally.
+
+**Fail-soft.** A lease-substrate fault also reports `decision=proceed` (fail-open), just with no
+holder to report — note it in passing and continue; a lease fault must never block an `/unblock`
+session.
+
+**Release on exit.** When this `/unblock` session ends (Step 4.5 reflect, or an early stop), release
+the lease so it doesn't linger and falsely report a holder to the next `/unblock` on this task:
+
+```bash
+python3 $DARK_FACTORY_ROOT/orchestrator/src/orchestrator/session_registry.py lease-release --name "unblock-<project>#<TASK_ID>"
+```
+
 ---
 
 ## Step 1: Gather context

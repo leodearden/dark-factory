@@ -476,6 +476,400 @@ def reap_stale_records(
 
 
 # ---------------------------------------------------------------------------
+# Role leases: single-owner-per-role (Attention Rail T7; PRD T7 §4.1-4.2, §6 G5)
+# ---------------------------------------------------------------------------
+
+LEASE_NAME_SANITIZE_RE = re.compile(r'[^A-Za-z0-9._#-]')
+"""Unlike _SLUG_SANITIZE_RE, this PRESERVES '#': task-scoped lease names
+(build_lease_name('unblock', project, task_id)) encode their task with a
+literal '#', which must survive into the .lease filename. Everything else
+outside [A-Za-z0-9._#-] (notably '/') maps to '-', so a malformed name can
+never escape leases_dir via a path separator."""
+
+
+def leases_dir(root: Path | str | None = None) -> Path:
+    return fleet_root(root) / 'leases'
+
+
+def lease_path_for_name(name: str, root: Path | str | None = None) -> Path:
+    """Resolve *name* (see build_lease_name) to its ``<leases_dir>/<name>.lease`` path.
+
+    *name* is sanitized through LEASE_NAME_SANITIZE_RE first, so it always
+    resolves to a single file directly inside leases_dir.
+    """
+    safe_name = LEASE_NAME_SANITIZE_RE.sub('-', name)
+    return leases_dir(root) / f'{safe_name}.lease'
+
+
+def build_lease_name(role: str, project: str, task_id: str | None = None) -> str:
+    """Build the canonical lease name for *role* (PRD T7): ``<role>-<project>[#<task_id>]``.
+
+    task_id is optional; when supplied, the lease is scoped to a single task
+    (e.g. ``unblock-df#2085``), so two concurrent /unblock sessions on
+    DIFFERENT tasks in the same project never contend the same lease.
+    """
+    name = f'{role}-{project}'
+    if task_id:
+        name = f'{name}#{task_id}'
+    return name
+
+
+LEASE_HEARTBEAT_TTL = timedelta(minutes=5)
+"""How long a lease survives with a dead holder pid and no fresh heartbeat
+(mtime touch) before it is stale-reapable. Mirrors NON_TERMINAL_HEARTBEAT_TTL's
+role for session records: staleness requires BOTH a dead holder pid AND an
+aged heartbeat (see claim_lease/reap_stale_leases) -- a live holder is never
+reaped regardless of heartbeat age."""
+
+
+class LeasePolicy(StrEnum):
+    """How claim_lease should respond when the lease is already held live.
+
+    STAND_DOWN: the caller (e.g. a duplicate escalation-watcher) must exit.
+    WARN_AND_PROCEED: the caller (e.g. a second /unblock on the same task)
+        surfaces the current holder to the user but continues.
+    """
+
+    STAND_DOWN = 'stand-down'
+    WARN_AND_PROCEED = 'warn-and-proceed'
+
+
+class LeaseDecision(StrEnum):
+    """The outcome of a claim_lease call."""
+
+    ACQUIRED = 'acquired'
+    STAND_DOWN = 'stand-down'
+    PROCEED = 'proceed'
+
+
+@dataclass(frozen=True)
+class LeaseHolder:
+    """Serialized identity of a lease's current holder -- the exact ``.lease`` file body.
+
+    session_slug: the holder's own session-registry slug (see
+        build_session_slug), letting a contended claim point back at the
+        current owner's session_registry record.
+    pid: the holder process's pid; liveness is checked via _pid_alive.
+    start_ts: ISO-8601 timestamp of when this holder claimed the lease.
+    """
+
+    session_slug: str
+    pid: int
+    start_ts: str
+
+    def to_dict(self) -> dict[str, Any]:
+        return {'session_slug': self.session_slug, 'pid': self.pid, 'start_ts': self.start_ts}
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> LeaseHolder:
+        return cls(session_slug=data['session_slug'], pid=data['pid'], start_ts=data['start_ts'])
+
+    def to_json(self) -> str:
+        return json.dumps(self.to_dict())
+
+    @classmethod
+    def from_json(cls, raw: str) -> LeaseHolder:
+        return cls.from_dict(json.loads(raw))
+
+
+@dataclass(frozen=True)
+class LeaseClaim:
+    """The outcome of a claim_lease call.
+
+    name: the lease name claimed (see build_lease_name).
+    decision: ACQUIRED / STAND_DOWN / PROCEED.
+    acquired: True iff this call became the lease's holder (decision is
+        ACQUIRED); False if the lease was already held by someone else.
+    holder: the lease's holder after this call -- the caller's own *holder*
+        argument when acquired, otherwise the pre-existing holder found on
+        disk (or None if that body was missing/unreadable).
+    holder_alive: whether `holder`'s pid is currently alive (_pid_alive).
+    heartbeat_age_secs: seconds since the lease file's mtime; 0.0 for a
+        freshly-acquired lease.
+    message: fully-formatted, user-observable line -- callers print this
+        verbatim rather than re-deriving it from the other fields.
+    """
+
+    name: str
+    decision: LeaseDecision
+    acquired: bool
+    holder: LeaseHolder | None
+    holder_alive: bool
+    heartbeat_age_secs: float
+    message: str
+
+
+def _render_contention_message(
+    holder: LeaseHolder | None,
+    *,
+    holder_alive: bool,
+    age_secs: float,
+    policy: LeasePolicy,
+) -> str:
+    """Build the exact user-observable contention line callers print verbatim.
+
+    Centralizing this here (rather than in each skill) guarantees the signal
+    string is identical everywhere it appears and is unit-testable with an
+    injected clock. *holder* may be None (an unreadable/corrupt lease body);
+    that is rendered as an explicit placeholder rather than raising.
+    """
+    slug = holder.session_slug if holder is not None else '<unknown>'
+    alive_word = 'alive' if holder_alive else 'dead'
+    action = 'standing down' if policy is LeasePolicy.STAND_DOWN else 'proceeding anyway'
+    return f'lease held by {slug} ({alive_word}, heartbeat {int(age_secs)}s ago) — {action}'
+
+
+def _create_and_write_lease(path: Path, holder: LeaseHolder) -> None:
+    """``os.open(O_CREAT|O_EXCL)`` + write *holder*'s body (mirrors ArtifactStore.lock_plan).
+
+    Raises ``FileExistsError`` if the lease already exists (lost the race).
+    On a write failure, cleans up the empty file it just created so a
+    subsequent claim is not falsely blocked by a poison-pill empty file.
+    """
+    fd = os.open(str(path), os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+    try:
+        os.write(fd, holder.to_json().encode())
+    except Exception:
+        with contextlib.suppress(OSError):
+            path.unlink(missing_ok=True)
+        raise
+    finally:
+        os.close(fd)
+
+
+def _acquired_claim(name: str, holder: LeaseHolder) -> LeaseClaim:
+    return LeaseClaim(
+        name=name,
+        decision=LeaseDecision.ACQUIRED,
+        acquired=True,
+        holder=holder,
+        holder_alive=True,
+        heartbeat_age_secs=0.0,
+        message=f'lease {name} acquired by {holder.session_slug}',
+    )
+
+
+def _read_lease_holder_state(
+    path: Path, *, now: datetime
+) -> tuple[LeaseHolder | None, bool, float]:
+    """Read an existing lease file's ``(holder, holder_alive, heartbeat_age_secs)``.
+
+    *holder* is None when the body is missing/corrupt/unparseable -- callers
+    treat that as "held by an unknown holder" (fail toward held, not free)
+    rather than raising; *holder_alive* is then False, so a corrupt body
+    older than LEASE_HEARTBEAT_TTL is still stale-reapable.
+
+    If *path* itself vanishes before it can be stat'd (e.g. a concurrent
+    release/reap in the narrow window between our failed O_EXCL create and
+    this read), reports a synthetic age just past LEASE_HEARTBEAT_TTL
+    instead of raising -- mirrors the guarded stat() in reap_stale_leases,
+    and makes the caller's existing is_stale check reclaim it exactly as it
+    would a dead-and-expired holder rather than propagating an uncaught
+    FileNotFoundError.
+    """
+    try:
+        mtime = path.stat().st_mtime
+    except OSError:
+        return None, False, LEASE_HEARTBEAT_TTL.total_seconds() + 1.0
+    age_secs = (now - datetime.fromtimestamp(mtime, tz=UTC)).total_seconds()
+    try:
+        holder = LeaseHolder.from_json(path.read_text())
+    except (OSError, json.JSONDecodeError, KeyError, TypeError, ValueError):
+        return None, False, age_secs
+    return holder, _pid_alive(holder.pid), age_secs
+
+
+def claim_lease(
+    name: str,
+    *,
+    holder: LeaseHolder,
+    policy: LeasePolicy = LeasePolicy.STAND_DOWN,
+    root: Path | str | None = None,
+    now: datetime | None = None,
+) -> LeaseClaim:
+    """Atomically claim the *name* lease for *holder* (PRD T7 single-owner-per-role).
+
+    Uses ``os.open(O_CREAT|O_EXCL|O_WRONLY)`` -- the identical atomic
+    exclusive-create idiom as ``ArtifactStore.lock_plan`` (artifacts.py) --
+    so the first caller to create the ``.lease`` file wins outright. When the
+    lease is already held, the existing holder's liveness (_pid_alive) and
+    heartbeat age (file mtime) are checked: if BOTH the holder is dead AND
+    the heartbeat is older than LEASE_HEARTBEAT_TTL, the stale lease is
+    reaped and the claim retried once; otherwise the existing holder is
+    reported under *policy* (STAND_DOWN/WARN_AND_PROCEED) and the on-disk
+    body is never touched (no clobbering). *now* is injectable for
+    deterministic tests; defaults to the real UTC clock.
+    """
+    if now is None:
+        now = datetime.now(UTC)
+    path = lease_path_for_name(name, root=root)
+    path.parent.mkdir(parents=True, exist_ok=True)
+
+    try:
+        _create_and_write_lease(path, holder)
+    except FileExistsError:
+        pass
+    else:
+        return _acquired_claim(name, holder)
+
+    existing_holder, holder_alive, age_secs = _read_lease_holder_state(path, now=now)
+    is_stale = (not holder_alive) and age_secs > LEASE_HEARTBEAT_TTL.total_seconds()
+
+    if is_stale:
+        # Re-verify staleness immediately before unlinking: a competitor
+        # could have reaped-and-reclaimed this same stale lease in the gap
+        # since the read above (their O_EXCL create winning the race). This
+        # narrows -- POSIX has no atomic compare-and-unlink, so it cannot
+        # fully eliminate -- that window: if the lease is no longer stale,
+        # it must NOT be unlinked, or we would clobber the competitor's
+        # brand-new, live lease and silently violate single-owner-per-role.
+        existing_holder, holder_alive, age_secs = _read_lease_holder_state(path, now=now)
+        is_stale = (not holder_alive) and age_secs > LEASE_HEARTBEAT_TTL.total_seconds()
+
+    if is_stale:
+        path.unlink(missing_ok=True)
+        try:
+            _create_and_write_lease(path, holder)
+        except FileExistsError:
+            # Lost the retry race to a new competitor: report THEIR holder
+            # under the normal held/policy path below (retry is attempted
+            # at most once -- we do not loop).
+            existing_holder, holder_alive, age_secs = _read_lease_holder_state(path, now=now)
+        else:
+            return _acquired_claim(name, holder)
+
+    decision = LeaseDecision.STAND_DOWN if policy is LeasePolicy.STAND_DOWN else LeaseDecision.PROCEED
+    return LeaseClaim(
+        name=name,
+        decision=decision,
+        acquired=False,
+        holder=existing_holder,
+        holder_alive=holder_alive,
+        heartbeat_age_secs=age_secs,
+        message=_render_contention_message(
+            existing_holder, holder_alive=holder_alive, age_secs=age_secs, policy=policy
+        ),
+    )
+
+
+def heartbeat_lease(name: str, *, root: Path | str | None = None) -> bool:
+    """Bump the *name* lease file's mtime to now -- the reaper's heartbeat clock.
+
+    Returns False (fail-soft, no raise) when the lease is absent or the
+    ``os.utime`` call itself faults; a lease-substrate error must never
+    interrupt a watcher's main loop.
+    """
+    path = lease_path_for_name(name, root=root)
+    if not path.exists():
+        return False
+    try:
+        os.utime(path, None)
+    except OSError:
+        logger.error('heartbeat_lease: failed to touch %s', path, exc_info=True)
+        return False
+    return True
+
+
+def release_lease(name: str, *, root: Path | str | None = None) -> bool:
+    """Remove the *name* lease file. Idempotent: a second call returns False.
+
+    Returns whether the lease existed before this call removed it; fail-soft
+    (logs loudly at ERROR, returns False) on an OSError from the removal
+    itself.
+    """
+    path = lease_path_for_name(name, root=root)
+    existed = path.exists()
+    try:
+        path.unlink(missing_ok=True)
+    except OSError:
+        logger.error('release_lease: failed to remove %s', path, exc_info=True)
+        return False
+    return existed
+
+
+@dataclass(frozen=True)
+class ReapedLease:
+    """One ``.lease`` file removed by reap_stale_leases.
+
+    path: the removed ``<name>.lease`` file.
+    lease_name: the lease's identity, derived from the filename itself
+        (the stem of *path*) -- never from the body, so a corrupt/missing
+        body is still reapable.
+    reason: why it was reaped -- ``'stale_pid'`` (holder pid dead and the
+        heartbeat is older than LEASE_HEARTBEAT_TTL) or ``'corrupt'`` (body
+        missing/unparseable and older than LEASE_HEARTBEAT_TTL).
+    """
+
+    path: Path
+    lease_name: str
+    reason: str
+
+
+def reap_stale_leases(
+    root: Path | str | None = None,
+    *,
+    now: datetime | None = None,
+) -> list[ReapedLease]:
+    """Sweep ``<root>/leases/*.lease`` and remove stale lease files.
+
+    Structural copy of reap_stale_records (PRD §4.8): identity (which file
+    to remove) is derived from the *path* -- the ``<name>.lease`` filename
+    stem -- never from the body, so a corrupt or unreadable lease body is
+    still reapable. Age is measured from the lease file's mtime, the same
+    heartbeat clock claim_lease/heartbeat_lease bump.
+
+    Rules (first match wins):
+    - lease body unreadable (missing or corrupt) and age >
+      LEASE_HEARTBEAT_TTL -> reaped, reason='corrupt'.
+    - holder pid is dead and age > LEASE_HEARTBEAT_TTL -> reaped,
+      reason='stale_pid'.
+    - otherwise -> kept -- in particular a LIVE holder is never reaped,
+      regardless of heartbeat age (mirrors reap_stale_records' non-terminal
+      live-pid rule).
+
+    *now* is injectable for deterministic tests; defaults to the real UTC
+    clock.
+    """
+    if now is None:
+        now = datetime.now(UTC)
+    base = leases_dir(root)
+    reaped: list[ReapedLease] = []
+    if not base.is_dir():
+        return reaped
+
+    for lease_path in sorted(base.glob('*.lease')):
+        if not lease_path.is_file():
+            continue
+        lease_name = lease_path.stem
+        try:
+            mtime = lease_path.stat().st_mtime
+        except OSError:
+            continue  # vanished mid-sweep (e.g. concurrent reap) -- skip it
+        age_secs = (now - datetime.fromtimestamp(mtime, tz=UTC)).total_seconds()
+        stale = age_secs > LEASE_HEARTBEAT_TTL.total_seconds()
+
+        try:
+            holder = LeaseHolder.from_json(lease_path.read_text())
+        except (OSError, json.JSONDecodeError, KeyError, TypeError, ValueError):
+            reason = 'corrupt' if stale else None
+        else:
+            reason = 'stale_pid' if (not _pid_alive(holder.pid)) and stale else None
+
+        if reason is not None:
+            try:
+                lease_path.unlink()
+            except OSError:
+                # A single unreapable lease (permission error, a concurrent
+                # reap/release race) must not abort the sweep -- log and
+                # move on to the next candidate.
+                logger.error('reap_stale_leases: failed to remove %s', lease_path, exc_info=True)
+                continue
+            reaped.append(ReapedLease(path=lease_path, lease_name=lease_name, reason=reason))
+
+    return reaped
+
+
+# ---------------------------------------------------------------------------
 # CLI + fail-soft (PRD: a registry fault must never change the spawn's exit code)
 # ---------------------------------------------------------------------------
 
@@ -594,6 +988,41 @@ def _run_reap() -> list[ReapedSessionRecord]:
     return reap_stale_records()
 
 
+def _run_lease_claim(name: str, slug: str, pid: int, policy_value: str) -> None:
+    """Run the ``lease-claim`` verb: ALWAYS prints a ``decision=<value>`` line + message.
+
+    This carries its OWN fail-open guard, independent of main()'s outer
+    try/except: a fault raised by claim_lease itself (a corrupt lease body,
+    an unwritable leases_dir, ...) must never surface as a silent failure or
+    -- worse -- a false stand-down. On any exception here, the caller is
+    still told to PROCEED (fail-open), exactly as if the lease were free,
+    because a lease-substrate fault must never block a watcher cycle or a
+    /unblock session.
+    """
+    try:
+        holder = LeaseHolder(session_slug=slug, pid=pid, start_ts=datetime.now(UTC).isoformat())
+        claim = claim_lease(name, holder=holder, policy=LeasePolicy(policy_value))
+    except Exception:
+        logger.error('lease-claim %s failed', name, exc_info=True)
+        print(f'decision={LeaseDecision.PROCEED.value}')
+        print(f'lease-claim {name} faulted; proceeding (fail-open)')
+        return
+    print(f'decision={claim.decision.value}')
+    print(claim.message)
+
+
+def _run_lease_heartbeat(name: str) -> None:
+    heartbeat_lease(name)
+
+
+def _run_lease_release(name: str) -> None:
+    release_lease(name)
+
+
+def _run_lease_reap() -> list[ReapedLease]:
+    return reap_stale_leases()
+
+
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog='session_registry')
     sub = parser.add_subparsers(dest='verb', required=True)
@@ -609,6 +1038,27 @@ def _build_parser() -> argparse.ArgumentParser:
     refresh_p.add_argument('--status', required=True, choices=[s.value for s in Status])
 
     sub.add_parser('reap', help='sweep and remove stale session records')
+
+    lease_claim_p = sub.add_parser('lease-claim', help='claim a single-owner-per-role lease (T7)')
+    lease_claim_p.add_argument('--name', required=True, help='lease name, see build_lease_name')
+    lease_claim_p.add_argument('--slug', required=True, help="this claimant's own session_slug")
+    lease_claim_p.add_argument(
+        '--pid', type=int, default=os.getpid(), help="this claimant's own pid"
+    )
+    lease_claim_p.add_argument(
+        '--policy',
+        choices=[p.value for p in LeasePolicy],
+        default=LeasePolicy.STAND_DOWN.value,
+        help='how to respond when the lease is already held live',
+    )
+
+    lease_heartbeat_p = sub.add_parser('lease-heartbeat', help='touch a held lease (heartbeat)')
+    lease_heartbeat_p.add_argument('--name', required=True)
+
+    lease_release_p = sub.add_parser('lease-release', help='release a held lease')
+    lease_release_p.add_argument('--name', required=True)
+
+    sub.add_parser('lease-reap', help='sweep and remove stale leases')
 
     return parser
 
@@ -633,6 +1083,14 @@ def main(argv: list[str] | None = None) -> int:
             _run_refresh(args.record, args.status)
         elif args.verb == 'reap':
             _run_reap()
+        elif args.verb == 'lease-claim':
+            _run_lease_claim(args.name, args.slug, args.pid, args.policy)
+        elif args.verb == 'lease-heartbeat':
+            _run_lease_heartbeat(args.name)
+        elif args.verb == 'lease-release':
+            _run_lease_release(args.name)
+        elif args.verb == 'lease-reap':
+            _run_lease_reap()
     except Exception:
         logger.error('session_registry %s failed', args.verb, exc_info=True)
         return 0

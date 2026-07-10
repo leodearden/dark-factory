@@ -24,6 +24,48 @@ Before starting, verify these are in place. If anything is missing, ask the user
 
 Terminal discovery for spawned `/unblock` sessions is handled lazily by the `/spawn` skill — no setup is required here.
 
+## Claiming the Watcher Lease (single-owner-per-role)
+
+**Before entering the Main Loop for the first time**, claim the `watcher-<project>` lease (Attention
+Rail T7, `orchestrator/src/orchestrator/session_registry.py`). This is a deterministic,
+single-owner-per-role replacement for any pgrep/ps-tree archaeology to detect a duplicate watcher —
+run once, at session startup, not on every loop iteration:
+
+```bash
+# Reap anything stale first so a genuinely-dead prior holder never blocks this claim.
+python3 $DARK_FACTORY_ROOT/orchestrator/src/orchestrator/session_registry.py lease-reap
+
+# Claim watcher-<project> (e.g. watcher-df) — STAND_DOWN policy: a live duplicate wins the lease
+# and this session must exit rather than run a second watch loop against the same project.
+python3 $DARK_FACTORY_ROOT/orchestrator/src/orchestrator/session_registry.py lease-claim \
+  --name watcher-<project> --slug watcher-<project>-$$ --pid $$ --policy stand-down
+```
+
+Parse the two printed lines: `decision=<acquired|stand-down|proceed>` followed by a human-readable
+message.
+- **`decision=stand-down`**: print the message verbatim (`lease held by <session> (alive, heartbeat
+  Ns ago) — standing down`) and **exit immediately** — do not start the watcher, do not drain.
+- **`decision=acquired` or `decision=proceed`**: continue into the Main Loop below. `proceed` is the
+  fail-open outcome (see below) and is handled identically to `acquired`.
+
+**INTERACTIVE-ONLY.** This lease claim belongs to the interactive L2 watcher (this skill) only. The
+headless `escalation-watcher-auto` rotation (L1) never claims or contends this lease — it has no
+`lease-claim` call site at all, by design (it is a supervised, always-on rotation, not a
+single-owner-per-session actor). If you are running as `escalation-watcher-auto`, skip this section
+entirely.
+
+**Fail-soft (fail-open).** A lease-substrate fault (disk error, unwritable `~/.claude/fleet/`, …) is
+logged loudly by `session_registry` and reported back as `decision=proceed` — never a false
+`stand-down`. A lease fault must never block a watch session from starting.
+
+**Heartbeat + release.** Once claimed, touch the lease every Main Loop cycle (see "Starting the
+watcher" below) so it never appears stale to another session's claim attempt, and release it when
+the watch session ends (clean exit, or the human stops it):
+
+```bash
+python3 $DARK_FACTORY_ROOT/orchestrator/src/orchestrator/session_registry.py lease-release --name watcher-<project>
+```
+
 ## The Main Loop
 
 ```
@@ -87,6 +129,17 @@ Run as a **background task** (Bash with `run_in_background`). The `--level 2` fl
 **Re-arming over deliberately-pending items:** any L2 item you deliberately left pending (Priority 3b, `design_concern`, `risk_identified`, `infra_issue`, AFK leave-pending paths) sits in the queue and causes every subsequent watcher start to instantly re-fire on it — degenerating into a busy-loop. Pass `--exclude-id <esc-id>` (repeatable) for each such item so the initial scan and event loop skip it. `--exclude-id` also suppresses event-loop wakes from dedupe rewrites of those files (MOVED_TO events on the excluded file are silently ignored). Both the bare id form (`esc-42-1`) and the `.json`-suffixed form are accepted.
 
 **Process safety**: only stop watcher processes you started via background task controls. Never `pkill` by pattern — other orchestrators, the user, or other sessions may have their own watchers.
+
+**Lease heartbeat (each cycle):** each time you (re)start this watcher subprocess (Main Loop steps 1
+and 6), also touch the `watcher-<project>` lease claimed at session startup (see "Claiming the
+Watcher Lease" above):
+
+```bash
+python3 $DARK_FACTORY_ROOT/orchestrator/src/orchestrator/session_registry.py lease-heartbeat --name watcher-<project>
+```
+
+This is what makes a second session's `lease-claim` observe this session as "alive" and stand down —
+there is no need to separately pgrep/ps-tree for other watcher processes.
 
 ### When the watcher fires
 

@@ -731,3 +731,542 @@ def test_main_launching_fail_soft_when_launcher_pid_not_numeric(
     assert capsys.readouterr().out.strip() == ''
     assert any(r.levelno >= logging.ERROR for r in caplog.records)
     assert not sr.sessions_dir(root=tmp_path).exists()
+
+
+# ---------------------------------------------------------------------------
+# Step-10: role leases (Attention Rail T7)
+# ---------------------------------------------------------------------------
+
+# --- paths / names / contract types -----------------------------------------
+
+
+def test_leases_dir_is_fleet_root_slash_leases(tmp_path: Path) -> None:
+    assert sr.leases_dir(root=tmp_path) == tmp_path / 'leases'
+
+
+def test_lease_path_for_name_joins_leases_dir_and_lease_suffix(tmp_path: Path) -> None:
+    path = sr.lease_path_for_name('watcher-df', root=tmp_path)
+    assert path == tmp_path / 'leases' / 'watcher-df.lease'
+
+
+def test_lease_path_for_name_preserves_hash_for_task_scoped_names(tmp_path: Path) -> None:
+    path = sr.lease_path_for_name('unblock-df#2085', root=tmp_path)
+    assert path == tmp_path / 'leases' / 'unblock-df#2085.lease'
+
+
+def test_lease_path_for_name_sanitizes_path_separators(tmp_path: Path) -> None:
+    # A name containing '/' must not escape leases_dir: it still resolves to
+    # a single file directly inside leases_dir (no nested directory, no
+    # traversal), unlike _SLUG_SANITIZE_RE this sanitizer PRESERVES '#'.
+    path = sr.lease_path_for_name('../../etc/passwd', root=tmp_path)
+    assert path.parent == sr.leases_dir(root=tmp_path)
+    assert '/' not in path.name
+
+
+def test_build_lease_name_watcher() -> None:
+    assert sr.build_lease_name('watcher', 'df') == 'watcher-df'
+
+
+def test_build_lease_name_recon_watcher() -> None:
+    assert sr.build_lease_name('recon-watcher', 'df') == 'recon-watcher-df'
+
+
+def test_build_lease_name_unblock_is_task_scoped_with_hash() -> None:
+    assert sr.build_lease_name('unblock', 'df', '2085') == 'unblock-df#2085'
+
+
+def test_lease_policy_has_exactly_stand_down_and_warn_and_proceed() -> None:
+    values = {member.value for member in sr.LeasePolicy}
+    assert values == {'stand-down', 'warn-and-proceed'}
+    assert sr.LeasePolicy.STAND_DOWN.value == 'stand-down'
+    assert sr.LeasePolicy.WARN_AND_PROCEED.value == 'warn-and-proceed'
+
+
+def test_lease_decision_has_exactly_acquired_stand_down_proceed() -> None:
+    values = {member.value for member in sr.LeaseDecision}
+    assert values == {'acquired', 'stand-down', 'proceed'}
+    assert sr.LeaseDecision.ACQUIRED.value == 'acquired'
+    assert sr.LeaseDecision.STAND_DOWN.value == 'stand-down'
+    assert sr.LeaseDecision.PROCEED.value == 'proceed'
+
+
+def test_lease_heartbeat_ttl_is_a_timedelta() -> None:
+    assert isinstance(sr.LEASE_HEARTBEAT_TTL, timedelta)
+
+
+def test_lease_holder_json_round_trip_is_lossless() -> None:
+    holder = sr.LeaseHolder(
+        session_slug='watcher-df-100', pid=4242, start_ts='2026-07-07T12:00:00+00:00'
+    )
+    assert sr.LeaseHolder.from_json(holder.to_json()) == holder
+
+
+def test_lease_holder_dict_round_trip_is_lossless() -> None:
+    holder = sr.LeaseHolder(
+        session_slug='watcher-df-100', pid=4242, start_ts='2026-07-07T12:00:00+00:00'
+    )
+    assert sr.LeaseHolder.from_dict(holder.to_dict()) == holder
+
+
+# --- claim_lease: free lease --------------------------------------------
+
+
+def test_claim_lease_acquires_a_free_lease(tmp_path: Path) -> None:
+    holder = sr.LeaseHolder(session_slug='watcher-df-100', pid=os.getpid(), start_ts=_NOW.isoformat())
+
+    claim = sr.claim_lease('watcher-df', holder=holder, root=tmp_path, now=_NOW)
+
+    assert claim.decision == sr.LeaseDecision.ACQUIRED
+    assert claim.acquired is True
+    assert claim.holder is not None
+    assert claim.holder.session_slug == 'watcher-df-100'
+
+    assert sr.leases_dir(root=tmp_path).is_dir()
+    lease_path = sr.lease_path_for_name('watcher-df', root=tmp_path)
+    assert lease_path.is_file()
+    assert sr.LeaseHolder.from_json(lease_path.read_text()) == holder
+
+
+# --- claim_lease: held by a live holder ----------------------------------
+
+
+def test_claim_lease_held_by_live_holder_stand_down_policy(tmp_path: Path) -> None:
+    original = sr.LeaseHolder(session_slug='watcher-df-100', pid=os.getpid(), start_ts=_NOW.isoformat())
+    sr.claim_lease('watcher-df', holder=original, root=tmp_path, now=_NOW)
+    lease_path = sr.lease_path_for_name('watcher-df', root=tmp_path)
+    _set_mtime(lease_path, _NOW, timedelta(seconds=42))
+
+    contender = sr.LeaseHolder(session_slug='watcher-df-200', pid=os.getpid(), start_ts=_NOW.isoformat())
+    claim = sr.claim_lease(
+        'watcher-df', holder=contender, policy=sr.LeasePolicy.STAND_DOWN, root=tmp_path, now=_NOW
+    )
+
+    assert claim.acquired is False
+    assert claim.decision == sr.LeaseDecision.STAND_DOWN
+    assert claim.holder is not None
+    assert claim.holder.session_slug == 'watcher-df-100'
+    assert claim.holder_alive is True
+    assert claim.heartbeat_age_secs == 42
+    assert claim.message == 'lease held by watcher-df-100 (alive, heartbeat 42s ago) — standing down'
+    # No clobber: the on-disk body still names the ORIGINAL holder.
+    assert sr.LeaseHolder.from_json(lease_path.read_text()) == original
+
+
+def test_claim_lease_held_by_live_holder_warn_and_proceed_policy(tmp_path: Path) -> None:
+    original = sr.LeaseHolder(session_slug='watcher-df-100', pid=os.getpid(), start_ts=_NOW.isoformat())
+    sr.claim_lease('unblock-df#2085', holder=original, root=tmp_path, now=_NOW)
+    lease_path = sr.lease_path_for_name('unblock-df#2085', root=tmp_path)
+    _set_mtime(lease_path, _NOW, timedelta(seconds=42))
+
+    contender = sr.LeaseHolder(session_slug='unblock-df-200', pid=os.getpid(), start_ts=_NOW.isoformat())
+    claim = sr.claim_lease(
+        'unblock-df#2085',
+        holder=contender,
+        policy=sr.LeasePolicy.WARN_AND_PROCEED,
+        root=tmp_path,
+        now=_NOW,
+    )
+
+    assert claim.acquired is False
+    assert claim.decision == sr.LeaseDecision.PROCEED
+    assert claim.holder is not None
+    assert claim.holder.session_slug == 'watcher-df-100'
+    assert 'lease held by watcher-df-100' in claim.message
+    assert 'proceeding' in claim.message
+    # No clobber: the on-disk body still names the ORIGINAL holder.
+    assert sr.LeaseHolder.from_json(lease_path.read_text()) == original
+
+
+# --- claim_lease: stale-lease reap-and-reclaim + the AND boundary --------
+
+
+def test_claim_lease_reaps_and_reclaims_a_stale_lease(tmp_path: Path) -> None:
+    stale_holder = sr.LeaseHolder(session_slug='watcher-df-dead', pid=_DEAD_PID, start_ts=_NOW.isoformat())
+    sr.claim_lease('watcher-df', holder=stale_holder, root=tmp_path, now=_NOW)
+    lease_path = sr.lease_path_for_name('watcher-df', root=tmp_path)
+    _set_mtime(lease_path, _NOW, sr.LEASE_HEARTBEAT_TTL + timedelta(minutes=1))
+
+    new_holder = sr.LeaseHolder(session_slug='watcher-df-new', pid=os.getpid(), start_ts=_NOW.isoformat())
+    claim = sr.claim_lease('watcher-df', holder=new_holder, root=tmp_path, now=_NOW)
+
+    assert claim.acquired is True
+    assert claim.decision == sr.LeaseDecision.ACQUIRED
+    assert claim.holder == new_holder
+    assert sr.LeaseHolder.from_json(lease_path.read_text()) == new_holder
+
+
+def test_claim_lease_does_not_reap_a_dead_holder_within_ttl(tmp_path: Path) -> None:
+    # Proves the reap rule is (age > TTL) AND (pid dead), not either alone:
+    # a dead-pid holder with a still-fresh heartbeat is NOT reaped.
+    stale_holder = sr.LeaseHolder(session_slug='watcher-df-dead', pid=_DEAD_PID, start_ts=_NOW.isoformat())
+    sr.claim_lease('watcher-df', holder=stale_holder, root=tmp_path, now=_NOW)
+    lease_path = sr.lease_path_for_name('watcher-df', root=tmp_path)
+    _set_mtime(lease_path, _NOW, sr.LEASE_HEARTBEAT_TTL - timedelta(minutes=1))
+
+    new_holder = sr.LeaseHolder(session_slug='watcher-df-new', pid=os.getpid(), start_ts=_NOW.isoformat())
+    claim = sr.claim_lease('watcher-df', holder=new_holder, root=tmp_path, now=_NOW)
+
+    assert claim.acquired is False
+    assert claim.holder is not None
+    assert claim.holder.session_slug == 'watcher-df-dead'
+    assert sr.LeaseHolder.from_json(lease_path.read_text()) == stale_holder
+
+
+def test_claim_lease_survives_lease_vanishing_between_create_and_stat(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Simulates a concurrent release/reap landing in the narrow window
+    # between our failed O_EXCL create and _read_lease_holder_state's
+    # path.stat() -- this must reclaim the (now-free) lease rather than
+    # propagate an uncaught FileNotFoundError.
+    original = sr.LeaseHolder(session_slug='watcher-df-100', pid=os.getpid(), start_ts=_NOW.isoformat())
+    sr.claim_lease('watcher-df', holder=original, root=tmp_path, now=_NOW)
+    lease_path = sr.lease_path_for_name('watcher-df', root=tmp_path)
+
+    real_stat = Path.stat
+
+    def _vanished_stat(self: Path, *args: Any, **kwargs: Any) -> os.stat_result:
+        if self == lease_path:
+            raise FileNotFoundError('simulated concurrent release')
+        return real_stat(self, *args, **kwargs)
+
+    monkeypatch.setattr(Path, 'stat', _vanished_stat)
+
+    new_holder = sr.LeaseHolder(session_slug='watcher-df-new', pid=os.getpid(), start_ts=_NOW.isoformat())
+    claim = sr.claim_lease('watcher-df', holder=new_holder, root=tmp_path, now=_NOW)
+
+    assert claim.acquired is True
+    assert claim.decision == sr.LeaseDecision.ACQUIRED
+    assert claim.holder == new_holder
+
+
+def test_claim_lease_does_not_clobber_a_lease_reclaimed_between_stale_check_and_unlink(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Simulates a competitor's reap-and-reclaim landing in the gap between
+    # claim_lease's first staleness read and its re-verify read immediately
+    # before unlinking: the re-verify must see the competitor's fresh, live
+    # holder and skip the unlink rather than clobbering it.
+    stale_holder = sr.LeaseHolder(session_slug='watcher-df-dead', pid=_DEAD_PID, start_ts=_NOW.isoformat())
+    sr.claim_lease('watcher-df', holder=stale_holder, root=tmp_path, now=_NOW)
+    lease_path = sr.lease_path_for_name('watcher-df', root=tmp_path)
+    _set_mtime(lease_path, _NOW, sr.LEASE_HEARTBEAT_TTL + timedelta(minutes=1))
+
+    competitor_holder = sr.LeaseHolder(
+        session_slug='watcher-df-competitor', pid=os.getpid(), start_ts=_NOW.isoformat()
+    )
+    # First read (top of claim_lease) observes the true, stale state; the
+    # re-verify read (immediately before unlinking) reports that a
+    # competitor has already reaped-and-reclaimed it in the gap.
+    responses = iter(
+        [
+            (stale_holder, False, sr.LEASE_HEARTBEAT_TTL.total_seconds() + 60),
+            (competitor_holder, True, 1.0),
+        ]
+    )
+    monkeypatch.setattr(sr, '_read_lease_holder_state', lambda path, *, now: next(responses))
+
+    new_holder = sr.LeaseHolder(session_slug='watcher-df-new', pid=os.getpid(), start_ts=_NOW.isoformat())
+    claim = sr.claim_lease('watcher-df', holder=new_holder, root=tmp_path, now=_NOW)
+
+    assert claim.acquired is False
+    assert claim.holder == competitor_holder
+    # unlink() must never have been called: the on-disk body (still the
+    # pre-mock stale_holder written at setup) is untouched, proving the
+    # competitor's (simulated) fresh lease was not clobbered.
+    assert sr.LeaseHolder.from_json(lease_path.read_text()) == stale_holder
+
+
+# --- claim_lease: corrupt/unreadable lease body ---------------------------
+
+
+def test_claim_lease_reaps_and_reclaims_a_corrupt_and_aged_lease(tmp_path: Path) -> None:
+    corrupt_path = sr.lease_path_for_name('watcher-df', root=tmp_path)
+    corrupt_path.parent.mkdir(parents=True, exist_ok=True)
+    corrupt_path.write_text('{not valid json')
+    _set_mtime(corrupt_path, _NOW, sr.LEASE_HEARTBEAT_TTL + timedelta(minutes=1))
+
+    new_holder = sr.LeaseHolder(session_slug='watcher-df-new', pid=os.getpid(), start_ts=_NOW.isoformat())
+    claim = sr.claim_lease('watcher-df', holder=new_holder, root=tmp_path, now=_NOW)
+
+    assert claim.acquired is True
+    assert claim.decision == sr.LeaseDecision.ACQUIRED
+    assert claim.holder == new_holder
+    assert sr.LeaseHolder.from_json(corrupt_path.read_text()) == new_holder
+
+
+def test_claim_lease_contention_on_corrupt_body_within_ttl_reports_unknown_holder(
+    tmp_path: Path,
+) -> None:
+    corrupt_path = sr.lease_path_for_name('watcher-df', root=tmp_path)
+    corrupt_path.parent.mkdir(parents=True, exist_ok=True)
+    corrupt_path.write_text('{not valid json')
+    _set_mtime(corrupt_path, _NOW, sr.LEASE_HEARTBEAT_TTL - timedelta(minutes=1))
+
+    contender = sr.LeaseHolder(session_slug='watcher-df-200', pid=os.getpid(), start_ts=_NOW.isoformat())
+    claim = sr.claim_lease(
+        'watcher-df', holder=contender, policy=sr.LeasePolicy.STAND_DOWN, root=tmp_path, now=_NOW
+    )
+
+    assert claim.acquired is False
+    assert claim.decision == sr.LeaseDecision.STAND_DOWN
+    assert claim.holder is None
+    assert claim.holder_alive is False
+    assert '<unknown>' in claim.message
+    assert 'standing down' in claim.message
+    # Not reaped (within TTL): the corrupt body is left exactly as-is.
+    assert corrupt_path.read_text() == '{not valid json'
+
+
+# --- heartbeat_lease / release_lease --------------------------------------
+
+
+def test_heartbeat_lease_advances_mtime(tmp_path: Path) -> None:
+    holder = sr.LeaseHolder(session_slug='watcher-df-100', pid=os.getpid(), start_ts=_NOW.isoformat())
+    sr.claim_lease('watcher-df', holder=holder, root=tmp_path, now=_NOW)
+    lease_path = sr.lease_path_for_name('watcher-df', root=tmp_path)
+    _set_mtime(lease_path, _NOW, timedelta(hours=1))
+    old_mtime = lease_path.stat().st_mtime
+
+    result = sr.heartbeat_lease('watcher-df', root=tmp_path)
+
+    assert result is True
+    assert lease_path.stat().st_mtime > old_mtime
+
+
+def test_heartbeat_lease_on_absent_lease_returns_false_without_raising(tmp_path: Path) -> None:
+    result = sr.heartbeat_lease('watcher-df', root=tmp_path)
+    assert result is False
+
+
+def test_release_lease_removes_the_lease_file(tmp_path: Path) -> None:
+    holder = sr.LeaseHolder(session_slug='watcher-df-100', pid=os.getpid(), start_ts=_NOW.isoformat())
+    sr.claim_lease('watcher-df', holder=holder, root=tmp_path, now=_NOW)
+    lease_path = sr.lease_path_for_name('watcher-df', root=tmp_path)
+
+    result = sr.release_lease('watcher-df', root=tmp_path)
+
+    assert result is True
+    assert not lease_path.exists()
+
+
+def test_release_lease_is_idempotent_on_a_second_call(tmp_path: Path) -> None:
+    holder = sr.LeaseHolder(session_slug='watcher-df-100', pid=os.getpid(), start_ts=_NOW.isoformat())
+    sr.claim_lease('watcher-df', holder=holder, root=tmp_path, now=_NOW)
+
+    first = sr.release_lease('watcher-df', root=tmp_path)
+    second = sr.release_lease('watcher-df', root=tmp_path)
+
+    assert first is True
+    assert second is False
+
+
+# ---------------------------------------------------------------------------
+# reap_stale_leases matrix
+# ---------------------------------------------------------------------------
+
+
+def test_reap_stale_leases_matrix(tmp_path: Path) -> None:
+    live_holder = sr.LeaseHolder(session_slug='kept-live', pid=os.getpid(), start_ts=_NOW.isoformat())
+    sr.claim_lease('kept-live', holder=live_holder, root=tmp_path, now=_NOW)
+    _set_mtime(sr.lease_path_for_name('kept-live', root=tmp_path), _NOW, timedelta(days=30))
+
+    dead_within_ttl = sr.LeaseHolder(
+        session_slug='kept-dead-fresh', pid=_DEAD_PID, start_ts=_NOW.isoformat()
+    )
+    sr.claim_lease('kept-dead-fresh', holder=dead_within_ttl, root=tmp_path, now=_NOW)
+    _set_mtime(
+        sr.lease_path_for_name('kept-dead-fresh', root=tmp_path),
+        _NOW,
+        sr.LEASE_HEARTBEAT_TTL - timedelta(minutes=1),
+    )
+
+    dead_past_ttl = sr.LeaseHolder(
+        session_slug='reap-dead-stale', pid=_DEAD_PID, start_ts=_NOW.isoformat()
+    )
+    sr.claim_lease('reap-dead-stale', holder=dead_past_ttl, root=tmp_path, now=_NOW)
+    _set_mtime(
+        sr.lease_path_for_name('reap-dead-stale', root=tmp_path),
+        _NOW,
+        sr.LEASE_HEARTBEAT_TTL + timedelta(minutes=1),
+    )
+
+    corrupt_path = sr.lease_path_for_name('reap-corrupt', root=tmp_path)
+    corrupt_path.parent.mkdir(parents=True, exist_ok=True)
+    corrupt_path.write_text('{not valid json')
+    _set_mtime(corrupt_path, _NOW, sr.LEASE_HEARTBEAT_TTL + timedelta(minutes=1))
+
+    reaped = sr.reap_stale_leases(root=tmp_path, now=_NOW)
+
+    reaped_by_name = {r.lease_name: r.reason for r in reaped}
+    assert reaped_by_name == {
+        'reap-dead-stale': 'stale_pid',
+        'reap-corrupt': 'corrupt',
+    }
+    remaining = {p.stem for p in sr.leases_dir(root=tmp_path).iterdir()}
+    assert remaining == {'kept-live', 'kept-dead-fresh'}
+
+
+def test_reap_stale_leases_continues_sweep_when_one_removal_fails(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    poison_holder = sr.LeaseHolder(session_slug='poison', pid=_DEAD_PID, start_ts=_NOW.isoformat())
+    sr.claim_lease('poison', holder=poison_holder, root=tmp_path, now=_NOW)
+    victim_holder = sr.LeaseHolder(session_slug='victim', pid=_DEAD_PID, start_ts=_NOW.isoformat())
+    sr.claim_lease('victim', holder=victim_holder, root=tmp_path, now=_NOW)
+    for lease_name in ('poison', 'victim'):
+        _set_mtime(
+            sr.lease_path_for_name(lease_name, root=tmp_path),
+            _NOW,
+            sr.LEASE_HEARTBEAT_TTL + timedelta(minutes=1),
+        )
+
+    poison_path = sr.lease_path_for_name('poison', root=tmp_path)
+    real_unlink = Path.unlink
+
+    def _flaky_unlink(self: Path, *args: Any, **kwargs: Any) -> None:
+        if self == poison_path:
+            raise OSError('simulated permission error')
+        real_unlink(self, *args, **kwargs)
+
+    monkeypatch.setattr(Path, 'unlink', _flaky_unlink)
+
+    with caplog.at_level(logging.ERROR):
+        reaped = sr.reap_stale_leases(root=tmp_path, now=_NOW)
+
+    assert {r.lease_name for r in reaped} == {'victim'}
+    assert poison_path.is_file()  # left behind, not silently claimed as reaped
+    assert any(r.levelno >= logging.ERROR for r in caplog.records)
+
+
+# ---------------------------------------------------------------------------
+# CLI lease-* verbs + fail-open fail-soft
+# ---------------------------------------------------------------------------
+
+
+def test_main_lease_claim_on_free_name_acquires_and_prints_decision_token(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    monkeypatch.setenv('CLAUDE_FLEET_ROOT', str(tmp_path))
+
+    rc = sr.main(
+        ['lease-claim', '--name', 'watcher-df', '--slug', 'watcher-df-100', '--pid', str(os.getpid())]
+    )
+
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert out.splitlines()[0] == 'decision=acquired'
+    assert sr.lease_path_for_name('watcher-df', root=tmp_path).is_file()
+
+
+def test_main_lease_claim_when_held_by_live_holder_stands_down(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    monkeypatch.setenv('CLAUDE_FLEET_ROOT', str(tmp_path))
+    sr.main(
+        ['lease-claim', '--name', 'watcher-df', '--slug', 'watcher-df-100', '--pid', str(os.getpid())]
+    )
+    capsys.readouterr()  # discard the first claim's output
+
+    rc = sr.main(
+        [
+            'lease-claim',
+            '--name',
+            'watcher-df',
+            '--slug',
+            'watcher-df-200',
+            '--pid',
+            str(os.getpid()),
+            '--policy',
+            'stand-down',
+        ]
+    )
+
+    assert rc == 0
+    out = capsys.readouterr().out
+    lines = out.splitlines()
+    assert lines[0] == 'decision=stand-down'
+    assert re.search(r'lease held by \S+ \(alive, heartbeat \d+s ago\) — standing down', lines[1])
+    # the on-disk holder must still be the ORIGINAL claimant (no clobber).
+    body = sr.lease_path_for_name('watcher-df', root=tmp_path).read_text()
+    assert 'watcher-df-100' in body
+    assert 'watcher-df-200' not in body
+
+
+def test_main_lease_heartbeat_bumps_mtime(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    monkeypatch.setenv('CLAUDE_FLEET_ROOT', str(tmp_path))
+    sr.main(['lease-claim', '--name', 'watcher-df', '--slug', 'watcher-df-100', '--pid', str(os.getpid())])
+    lease_path = sr.lease_path_for_name('watcher-df', root=tmp_path)
+    _set_mtime(lease_path, _NOW, timedelta(hours=1))
+    backdated_mtime = lease_path.stat().st_mtime
+
+    rc = sr.main(['lease-heartbeat', '--name', 'watcher-df'])
+
+    assert rc == 0
+    assert lease_path.stat().st_mtime > backdated_mtime
+
+
+def test_main_lease_release_removes_the_file(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    monkeypatch.setenv('CLAUDE_FLEET_ROOT', str(tmp_path))
+    sr.main(['lease-claim', '--name', 'watcher-df', '--slug', 'watcher-df-100', '--pid', str(os.getpid())])
+    lease_path = sr.lease_path_for_name('watcher-df', root=tmp_path)
+    assert lease_path.is_file()
+
+    rc = sr.main(['lease-release', '--name', 'watcher-df'])
+
+    assert rc == 0
+    assert not lease_path.exists()
+
+
+def test_main_lease_reap_removes_a_stale_lease(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    monkeypatch.setenv('CLAUDE_FLEET_ROOT', str(tmp_path))
+    sr.main(['lease-claim', '--name', 'watcher-df', '--slug', 'watcher-df-100', '--pid', str(_DEAD_PID)])
+    lease_path = sr.lease_path_for_name('watcher-df', root=tmp_path)
+    _set_mtime(lease_path, _NOW, sr.LEASE_HEARTBEAT_TTL + timedelta(minutes=1))
+
+    rc = sr.main(['lease-reap'])
+
+    assert rc == 0
+    assert not lease_path.exists()
+
+
+def test_main_lease_claim_is_fail_open_never_stand_down_on_a_fault(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    monkeypatch.setenv('CLAUDE_FLEET_ROOT', str(tmp_path))
+
+    def _boom(*_args: object, **_kwargs: object) -> sr.LeaseClaim:
+        raise OSError('lease substrate on fire')
+
+    monkeypatch.setattr(sr, 'claim_lease', _boom)
+
+    with caplog.at_level(logging.ERROR):
+        rc = sr.main(
+            ['lease-claim', '--name', 'watcher-df', '--slug', 'watcher-df-100', '--pid', str(os.getpid())]
+        )
+
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert out.splitlines()[0] == 'decision=proceed'
+    assert any(r.levelno >= logging.ERROR for r in caplog.records)
