@@ -24,7 +24,8 @@
 # Exit codes:
 #   0  invariant holds    (value < threshold)
 #   1  invariant VIOLATED (value >= threshold)
-#   2  usage error (unknown/missing argument, or non-numeric --threshold/--value)
+#   2  usage error (unknown/missing argument, non-numeric --threshold/--value,
+#      or the awk comparison itself failing to execute)
 set -euo pipefail
 
 WINDOW_DAYS=""
@@ -67,8 +68,11 @@ if [ -z "$THRESHOLD" ] || [ -z "$VALUE" ]; then
 fi
 
 # Reject non-numeric input explicitly rather than letting awk silently
-# coerce garbage to 0 (which would misreport "invariant holds").
-NUMERIC_RE='^-?[0-9]+([.][0-9]+)?$'
+# coerce garbage to 0 (which would misreport "invariant holds"). Accepts the
+# canonical 0.NN form plus leading-dot (.05) and trailing-dot (5.) decimal
+# forms. Scientific notation (1e-3) is intentionally NOT accepted — out of
+# scope for this exemplar's --value/--threshold inputs.
+NUMERIC_RE='^-?([0-9]+([.][0-9]*)?|[.][0-9]+)$'
 if ! [[ "$VALUE" =~ $NUMERIC_RE ]]; then
     echo "check_merge_flakiness.sh: --value must be numeric, got: ${VALUE}" >&2
     exit 2
@@ -82,10 +86,20 @@ if [ "$SLEEP_SECS" != "0" ]; then
     sleep "$SLEEP_SECS"
 fi
 
-if awk -v v="$VALUE" -v t="$THRESHOLD" 'BEGIN { exit !(v < t) }'; then
+# Capture awk's exit status explicitly rather than branching on it inline:
+# a clean 0/1 is a real verdict, but any OTHER status (missing binary,
+# syntax error, crash) is an infra/usage fault and must not masquerade as
+# the "invariant VIOLATED" verdict (exit 1) under the orchestrator's
+# exit-code-only contract (PRD §5.5).
+awk -v v="$VALUE" -v t="$THRESHOLD" 'BEGIN { exit !(v < t) }' && AWK_RC=0 || AWK_RC=$?
+
+if [ "$AWK_RC" -eq 0 ]; then
     echo "check_merge_flakiness: value=${VALUE} threshold=${THRESHOLD} window_days=${WINDOW_DAYS} -- invariant holds"
     exit 0
-else
+elif [ "$AWK_RC" -eq 1 ]; then
     echo "check_merge_flakiness: value=${VALUE} threshold=${THRESHOLD} window_days=${WINDOW_DAYS} -- invariant VIOLATED"
     exit 1
+else
+    echo "check_merge_flakiness.sh: awk comparison failed unexpectedly (rc=${AWK_RC})" >&2
+    exit 2
 fi

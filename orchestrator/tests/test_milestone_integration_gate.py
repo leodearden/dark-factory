@@ -272,6 +272,61 @@ class TestExemplarCheckScript:
             f'rc={result.returncode}, stdout={result.stdout!r}, stderr={result.stderr!r}'
         )
 
+    def test_script_accepts_leading_and_trailing_dot_numeric_values(
+        self, exemplar_script: Path,
+    ):
+        """NUMERIC_RE accepts leading-dot (.03) and trailing-dot (5.) decimal
+        forms in addition to the canonical 0.NN form."""
+        result = subprocess.run(
+            [str(exemplar_script), '--value', '.03', '--threshold', '5.'],
+            capture_output=True, text=True, timeout=10,
+        )
+        assert result.returncode == 0, (
+            f'leading-dot --value and trailing-dot --threshold must both be '
+            f'accepted as numeric; got rc={result.returncode}, '
+            f'stdout={result.stdout!r}, stderr={result.stderr!r}'
+        )
+        assert 'holds' in result.stdout.strip()
+
+    def test_script_rejects_scientific_notation_value(self, exemplar_script: Path):
+        """Scientific notation (1e-3) is intentionally NOT accepted by
+        NUMERIC_RE — documents the boundary rather than silently mishandling
+        it, in case this exemplar is ever fed a real deployment's output."""
+        result = subprocess.run(
+            [str(exemplar_script), '--value', '1e-3', '--threshold', '0.05'],
+            capture_output=True, text=True, timeout=10,
+        )
+        assert result.returncode == 2, (
+            f'scientific notation must be rejected as non-numeric (rc=2); got '
+            f'rc={result.returncode}, stdout={result.stdout!r}, stderr={result.stderr!r}'
+        )
+
+    def test_script_reports_usage_error_when_awk_itself_fails(
+        self, exemplar_script: Path, tmp_path: Path,
+    ):
+        """An awk that fails to execute at all (missing binary, crash, syntax
+        error) must not be silently misread as the 'invariant VIOLATED'
+        verdict (exit 1) — only a CLEAN awk exit of 0 or 1 is a real verdict;
+        any other awk exit status is a usage/infra error (rc=2). Shadow the
+        real awk on PATH with a fake one that exits 3 to exercise this
+        deterministically, without touching the real awk binary."""
+        fake_awk = tmp_path / 'awk'
+        fake_awk.write_text('#!/usr/bin/env bash\nexit 3\n')
+        fake_awk.chmod(0o755)
+
+        env = dict(os.environ)
+        env['PATH'] = f'{tmp_path}{os.pathsep}{env.get("PATH", "")}'
+
+        result = subprocess.run(
+            [str(exemplar_script), '--threshold', '0.05', '--value', '0.03'],
+            capture_output=True, text=True, timeout=10, env=env,
+        )
+        assert result.returncode == 2, (
+            f'an awk that exits neither 0 nor 1 must be treated as a usage/infra '
+            f'error, never misread as a verdict; got rc={result.returncode}, '
+            f'stdout={result.stdout!r}, stderr={result.stderr!r}'
+        )
+
     def test_script_sleep_secs_delays_execution(self, exemplar_script: Path):
         """--sleep-secs is the knob that lets this SAME fixture drive a
         check timeout under test; assert it actually delays the verdict."""
