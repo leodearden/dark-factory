@@ -1,27 +1,29 @@
 """Git worktree and merge operations.
 
-IMPORTANT — .task/ contamination prevention
-============================================
+.task/ contamination — now structural, not guard-defended (W11 θ)
+===================================================================
 The .task/ directory is an ephemeral scratch space for orchestrator agents.
-It must NEVER reach the main branch.  If it does, every future worktree
-inherits it, agents treat it as state, and cross-task contamination follows.
+It used to leak onto main via worktree inheritance, `git add -A`, and merge
+commits, so this module carried a "belts and braces" scrub layer on top of
+it: scrub_task_dir_from_tree(), called from create_worktree(), acquire(),
+merge_to_main(), and advance_main()'s retry loop, plus a post-staging
+unstage net in commit().
 
-This module contains multiple redundant safeguards ("belts and braces"):
+That scrub layer has been removed.  .task/ execution metadata now lives
+OUTSIDE the git worktree entirely, at <worktree_base>/.task-meta/<name>
+(see TaskArtifacts.meta_root_for()) — so .task/ contamination of the git
+tree is structurally impossible rather than merely guarded against:
+nothing ever writes task metadata into a path git tracks.
 
-1. scrub_task_dir_from_tree() — removes .task/ from the git index in any
-   worktree, amending the current commit.  Called after merges and during
-   worktree creation.
-2. _assert_no_task_dir() — hard assertion that a given commit SHA contains
-   no .task/ entries.  Called before advance_main().
-3. create_worktree() — scrubs inherited .task/ when main is contaminated.
-4. commit() — post-staging safety net: unstages .task/ even if the pathspec
-   exclusion (:!.task) was somehow bypassed.
-5. merge_to_main() — scrubs .task/ after the merge commit is created.
+Two lightweight safeguards remain for the migration window:
 
-If you are an AI agent reading this: DO NOT remove or weaken these guards.
-They exist because .task/ contamination has happened repeatedly and caused
-cascading bugs across all concurrent tasks.  The pre-commit hook, .gitignore,
-and .task/.gitignore are NOT sufficient — agents bypass them routinely.
+- _assert_no_task_dir() — a cheap tripwire that hard-asserts a given commit
+  SHA carries no .task/ entries.  Called before advance_main().  Retained
+  here; dropped in W11 ι once the relocation has proven itself.
+- _ensure_task_gitignore() — writes .task/.gitignore so any leftover
+  <worktree>/.task/ scratch directory self-ignores under `git add -A` /
+  `git status`.  Retained as defense-in-depth; deferred (not dropped) in
+  W11 ι.
 """
 
 import asyncio
@@ -34,7 +36,7 @@ import subprocess
 from collections.abc import Awaitable, Callable, Collection
 from dataclasses import dataclass
 from datetime import UTC, datetime
-from enum import Enum, auto
+from enum import Enum
 from pathlib import Path
 from typing import Any, Literal, NamedTuple, TypedDict
 
@@ -220,146 +222,9 @@ PROTECTED_PREFIXES: dict[str, str] = {
 }
 
 
-class ScrubOutcome(Enum):
-    """Outcome discriminant for :class:`ScrubResult`.
-
-    Kept as a separate Enum so callers get IDE autocomplete and type-checking
-    while the :class:`ScrubResult` dataclass carries the optional error payload.
-    """
-    CLEAN = auto()
-    SCRUBBED = auto()
-    FAILED = auto()
-
-
-@dataclass(frozen=True)
-class ScrubResult:
-    """Result of a ``scrub_task_dir_from_tree`` call.
-
-    Distinguishes three outcomes so callers can react precisely:
-
-    - ``ScrubOutcome.CLEAN``   — ``.task/`` was not present in the tree.
-    - ``ScrubOutcome.SCRUBBED``— ``.task/`` was found and successfully removed.
-    - ``ScrubOutcome.FAILED``  — ``.task/`` was found but removal failed.
-                                  The ``error`` field contains the raw git stderr
-                                  for operator diagnostics.
-    """
-    outcome: ScrubOutcome
-    error: str | None = None
-
-    def __post_init__(self) -> None:
-        if self.error is not None and self.outcome is not ScrubOutcome.FAILED:
-            raise ValueError(
-                f'ScrubResult.error must only be set when outcome is FAILED, '
-                f'got outcome={self.outcome!r} with error={self.error!r}'
-            )
-        if isinstance(self.error, str) and not self.error.strip():
-            raise ValueError(
-                'ScrubResult.error must not be an empty or whitespace-only string; '
-                'use None instead'
-            )
-
-    def format_error(self, prefix: str = '') -> str:
-        """Return prefix+error when error is set, otherwise empty string.
-
-        Designed for safe interpolation into log messages and f-strings:
-        - When error is set: returns ``f'{prefix}{self.error}'``
-        - When error is None: returns ``''`` (nothing to show)
-
-        Args:
-            prefix: Optional string prepended to the error (e.g. ' Error: ', ': ').
-        """
-        if self.error is not None:
-            return f'{prefix}{self.error}'
-        return ''
-
-
 # ---------------------------------------------------------------------------
 # .task/ contamination helpers
 # ---------------------------------------------------------------------------
-
-async def scrub_task_dir_from_tree(
-    cwd: Path, context: str, *, amend: bool = True,
-) -> ScrubResult:
-    """Remove .task/ from the git index if present.
-
-    This is the primary defense against .task/ reaching main.  It checks
-    whether any .task/ entries exist in the current HEAD's tree and, if so,
-    removes them from the index.
-
-    Args:
-        cwd: Working directory (a worktree or the project root).
-        context: Human-readable label for log messages (e.g. "post-merge",
-                 "worktree-creation").
-        amend: If True (default), amend the current commit to exclude .task/.
-               If False, create a NEW commit for the removal.  Use amend=False
-               when the current HEAD is shared with another branch (e.g. right
-               after create_worktree where HEAD == main's tip).
-
-    Returns:
-        ``ScrubResult.CLEAN``    if ``.task/`` was not present in the tree.
-        ``ScrubResult.SCRUBBED`` if ``.task/`` was found and successfully removed.
-        ``ScrubResult.FAILED``   if ``.task/`` was found but removal failed
-                                  (git rm or git commit returned non-zero).
-
-    DO NOT REMOVE THIS FUNCTION.  It is the last reliable defense before
-    .task/ reaches main via update-ref.  Note: git's ``reference-transaction``
-    hook (git>=2.28) is the exception — it DOES fire on update-ref — and
-    advance_main's main_gate mark (added in task 1678) sanctions that hook.
-    All other git hooks (pre-commit, etc.) are still bypassed by update-ref.
-    See also task 7 for the same stale "bypasses ALL hooks" assumption.
-    """
-    rc, tracked, _ = await _run(
-        ['git', 'ls-tree', '-r', '--name-only', 'HEAD', '--', '.task/'],
-        cwd=cwd,
-    )
-    if rc != 0 or not tracked.strip():
-        return ScrubResult(outcome=ScrubOutcome.CLEAN)
-
-    files = [f for f in tracked.strip().splitlines() if f.strip()]
-    if not files:
-        return ScrubResult(outcome=ScrubOutcome.CLEAN)
-
-    logger.warning(
-        '.task/ CONTAMINATION detected during %s — removing %d tracked file(s): %s',
-        context, len(files), ', '.join(files[:10]),
-    )
-
-    # Remove from index (not filesystem — .task/ may still be needed as scratch)
-    rc, _, err = await _run(['git', 'rm', '-r', '--cached', '--', '.task/'], cwd=cwd)
-    if rc != 0:
-        logger.error('.task/ scrub failed during %s: git rm --cached failed: %s', context, err)
-        return ScrubResult(outcome=ScrubOutcome.FAILED, error=err.strip() or None)
-
-    # Also remove from filesystem if present (cleanup inherited contamination)
-    task_dir = cwd / '.task'
-    if task_dir.exists():
-        shutil.rmtree(task_dir)
-
-    if amend:
-        # Amend the current commit to exclude .task/ (used post-merge where
-        # we own the merge commit and want a clean tree).
-        rc, _, err = await _run(
-            ['git', 'commit', '--amend', '--no-edit', '--allow-empty'],
-            cwd=cwd,
-        )
-    else:
-        # Create a new commit (used in create_worktree where HEAD is shared
-        # with main — amending would rewrite main's history).
-        rc, _, err = await _run(
-            ['git', 'commit', '-m',
-             'chore: remove .task/ contamination inherited from main\n\n'
-             '.task/ is the orchestrator scratch directory and must never\n'
-             'be on main.  This commit removes it from the branch tree.'],
-            cwd=cwd,
-        )
-
-    if rc != 0:
-        logger.error('.task/ scrub failed during %s: could not commit removal: %s', context, err)
-        return ScrubResult(outcome=ScrubOutcome.FAILED, error=err.strip() or None)
-
-    logger.info('.task/ scrub completed during %s — %d file(s) removed from tree', context, len(files))
-    return ScrubResult(outcome=ScrubOutcome.SCRUBBED)
-
 
 def _ensure_task_gitignore(worktree: Path) -> None:
     """Create .task/.gitignore with '*' if it doesn't exist.
@@ -395,8 +260,10 @@ async def _assert_no_task_dir(sha: str, cwd: Path, context: str) -> None:
         raise RuntimeError(
             f'.task/ CONTAMINATION GATE FAILED ({context}): commit {sha[:8]} '
             f'contains {len(files)} .task/ file(s): {", ".join(files[:5])}. '
-            f'Refusing to advance main.  This is a bug — .task/ should have '
-            f'been scrubbed before reaching this point.'
+            f'Refusing to advance main.  This is a bug — .task/ execution '
+            f'metadata is supposed to live outside the worktree entirely '
+            f'(see TaskArtifacts.meta_root_for); it should never have '
+            f'reached this commit.'
         )
 
 
@@ -1862,40 +1729,13 @@ class GitOps:
         # is defense-in-depth — the pre-commit hook is the primary guard.
         _ensure_task_gitignore(worktree_path)
 
-        # ── .task/ contamination guard ────────────────────────────────
-        # If main is contaminated (has .task/ tracked), this worktree
-        # inherits it.  Scrub it NOW before any agent code runs, so the
-        # task starts from a clean tree.  The scrub amends the initial
-        # commit on the new branch — harmless since nothing else has
-        # been committed yet.
-        # amend=False: HEAD is shared with main — must NOT amend the shared commit.
-        # Instead, create a new commit on the branch to remove .task/.
-        scrub_result = await scrub_task_dir_from_tree(
-            worktree_path, 'worktree-creation', amend=False,
-        )
-        if scrub_result.outcome == ScrubOutcome.SCRUBBED:
-            logger.warning(
-                'MAIN IS CONTAMINATED — .task/ was inherited by new worktree %s. '
-                'The contamination has been removed from this worktree, but main '
-                'still carries .task/.  Run: git rm -r --cached .task/ on main.',
-                worktree_path,
-            )
-        elif scrub_result.outcome == ScrubOutcome.FAILED:
-            logger.error(
-                '.task/ scrub FAILED during worktree-creation for %s — the index '
-                'may still be contaminated.  The hard gate at advance_main will '
-                'catch this if contamination reaches main.%s',
-                worktree_path,
-                scrub_result.format_error(prefix=' Error: '),
-            )
-
-        # Re-capture base from the worktree's own merge-base after positioning
-        # AND the scrub_task_dir_from_tree call above.  merge-base from inside
-        # the freshly-created worktree is race-immune to concurrent main
-        # advances between rev-parse and `git worktree add`: it is the fork
-        # point of HEAD with the freshened start_ref regardless of when main
-        # advanced.  We use start_ref (the ref the worktree was actually based
-        # on — may be origin/main when local main lags) rather than
+        # Re-capture base from the worktree's own merge-base after
+        # positioning.  merge-base from inside the freshly-created worktree
+        # is race-immune to concurrent main advances between rev-parse and
+        # `git worktree add`: it is the fork point of HEAD with the
+        # freshened start_ref regardless of when main advanced.  We use
+        # start_ref (the ref the worktree was actually based on — may be
+        # origin/main when local main lags) rather than
         # self.config.main_branch, so the freshen-from-remote semantic is
         # preserved (see test_create_worktree_freshens_from_remote).
         _, mb_out, _ = await _run(
@@ -2781,7 +2621,8 @@ class GitOps:
         *tracked* WIP onto the victim's still-checked-out branch so 1912
         branch-retention preserves it via the retained branch ref for future
         ``reattach`` recovery.  ``.task/plan.json`` is intentionally excluded
-        (the commit uses the ``:!.task`` pathspec) and is **not** preserved
+        (task metadata lives outside the worktree; any leftover ``.task/`` is
+        self-ignored via its own ``.task/.gitignore``) and is **not** preserved
         across the reclaim; the resumed victim takes the orphan-commits reattach
         path, not disk-backstop reuse.
 
@@ -3459,9 +3300,8 @@ class GitOps:
                     return recycle_result
                 route = AcquireRoute.RECYCLE
 
-            # ── Shared tail: gitignore, scrub, base, debug-port ──────────
+            # ── Shared tail: gitignore, base, debug-port ──────────────────
             _ensure_task_gitignore(lane)
-            await scrub_task_dir_from_tree(lane, 'warm-lane-acquire', amend=False)
 
             _, mb_out, _ = await _run(
                 ['git', 'merge-base', start_ref, 'HEAD'],
@@ -3579,8 +3419,9 @@ class GitOps:
         4. Recompute ``base_commit`` as ``merge-base main HEAD``.
         5. Re-provision the debug port (inv.7).
 
-        ``.task/plan.json`` is NOT committed by ``commit()`` (the
-        ``:!.task`` pathspec excludes it) and survives the rebase intact
+        ``.task/plan.json`` is NOT committed by ``commit()`` (task metadata
+        lives outside the worktree; any leftover ``.task/`` is self-ignored
+        via its own ``.task/.gitignore``) and survives the rebase intact
         because git rebase only touches tracked files.
 
         Returns:
@@ -4549,9 +4390,12 @@ class GitOps:
     async def commit(self, worktree: Path, message: str) -> str | None:
         """Stage all changes and commit. Returns sha or None if nothing to commit.
 
-        The :!.task pathspec SHOULD prevent .task/ from being staged, but
-        agents can (and have) staged .task/ files via direct git commands
-        before this method runs.  The post-staging check catches that case.
+        .task/ execution metadata now lives outside the worktree entirely
+        (see module docstring / TaskArtifacts.meta_root_for), so no pathspec
+        exclusion or post-staging unstage is needed here: a leftover
+        <worktree>/.task/ (if anything still creates one) is self-ignored by
+        its own .task/.gitignore (_ensure_task_gitignore), so `git add -A`
+        never stages it.
 
         Pre-staging conflict guard (esc-2128-8): if *worktree* has any
         unresolved (unmerged-index) paths — e.g. a stash-pop that conflicted
@@ -4565,26 +4409,7 @@ class GitOps:
         if conflicted:
             raise WorktreeConflictError(worktree, conflicted)
 
-        # Stage all — :!.task excludes .task/ from staging
-        await _run(['git', 'add', '-A', '--', '.', ':!.task', ':!.claude'], cwd=worktree)
-
-        # ── Post-staging .task/ safety net ────────────────────────────
-        # If .task/ files are staged (e.g. an agent ran "git add .task/"
-        # before we got here), unstage them.  This is a belt-and-braces
-        # check — the pathspec above should handle it, but agents bypass it.
-        rc, staged_task, _ = await _run(
-            ['git', 'diff', '--cached', '--name-only', '--', '.task/'],
-            cwd=worktree,
-        )
-        if rc == 0 and staged_task.strip():
-            logger.warning(
-                '.task/ CONTAMINATION caught in commit() — %d file(s) were staged '
-                'despite :!.task pathspec (an agent likely ran "git add .task/" directly). '
-                'Unstaging now: %s',
-                len(staged_task.strip().splitlines()),
-                staged_task.strip()[:200],
-            )
-            await _run(['git', 'reset', 'HEAD', '--', '.task/'], cwd=worktree)
+        await _run(['git', 'add', '-A', '--', '.', ':!.claude'], cwd=worktree)
 
         # Check for changes
         rc, _, _ = await _run(['git', 'diff', '--cached', '--quiet'], cwd=worktree)
@@ -5261,9 +5086,14 @@ class GitOps:
         return None
 
     async def has_uncommitted_work(self, worktree: Path) -> bool:
-        """Return True if worktree has staged or unstaged changes outside .task/."""
+        """Return True if worktree has staged or unstaged changes.
+
+        The leftover ``.task/`` (if any) is self-ignored via its own
+        ``.task/.gitignore``, so it never surfaces in ``git status`` output —
+        no pathspec exclusion is needed here.
+        """
         rc, output, _ = await _run(
-            ['git', 'status', '--porcelain', '--', '.', ':!.task'],
+            ['git', 'status', '--porcelain', '--', '.'],
             cwd=worktree,
         )
         return rc == 0 and bool(output.strip())
@@ -5501,9 +5331,10 @@ class GitOps:
             merge_wt, pre_merge_sha = await self._create_merge_worktree(base_sha)
 
             # Pre-merge cleanup: remove .task/ from filesystem if inherited
-            # from a contaminated main.  This is NOT sufficient on its own
-            # because `git merge` will re-introduce .task/ from the branch.
-            # The real fix is the post-merge scrub below.
+            # from a contaminated main.  Belt-and-braces only — .task/
+            # execution metadata now lives outside the worktree entirely
+            # (see module docstring), so nothing repopulates this directory
+            # from the branch being merged.
             task_dir = merge_wt / '.task'
             if task_dir.exists():
                 shutil.rmtree(task_dir)
@@ -5532,30 +5363,6 @@ class GitOps:
                 await self.cleanup_merge_worktree(merge_wt)
                 return MergeResult(
                     success=False, details=f'{out}\n{err}',
-                    pre_merge_sha=pre_merge_sha,
-                )
-
-            # ── Post-merge .task/ scrub (CRITICAL) ────────────────────
-            # The merge commit now exists.  If the task branch had .task/
-            # tracked (common — agents commit it despite safeguards), the
-            # merge commit contains those files.  We MUST remove them
-            # before this commit reaches main via advance_main().
-            #
-            # scrub_task_dir_from_tree() checks git ls-tree, runs
-            # git rm --cached, and amends the merge commit in-place.
-            # This is the single most important .task/ defense.
-            scrub_result = await scrub_task_dir_from_tree(merge_wt, f'post-merge({full_branch})')
-            if scrub_result.outcome == ScrubOutcome.FAILED:
-                logger.error(
-                    '.task/ scrub FAILED post-merge for %s — aborting merge; '
-                    'no advance_main will run.',
-                    full_branch,
-                )
-                await self.cleanup_merge_worktree(merge_wt)
-                _detail = f'.task/ scrub failed post-merge for {full_branch}{scrub_result.format_error(prefix=": ")}'
-                return MergeResult(
-                    success=False,
-                    details=_detail,
                     pre_merge_sha=pre_merge_sha,
                 )
 
@@ -6758,15 +6565,6 @@ class GitOps:
                 )
                 return AdvanceOutcome('not_descendant')
 
-            scrub_result = await scrub_task_dir_from_tree(
-                merge_worktree, f'advance_main-retry({attempt + 1})',
-            )
-            if scrub_result.outcome == ScrubOutcome.FAILED:
-                logger.error(
-                    '.task/ scrub FAILED during advance_main-retry(%d) — index may '
-                    'be contaminated; _assert_no_task_dir will catch it.%s',
-                    attempt + 1, scrub_result.format_error(prefix=' Error: '),
-                )
             _, new_sha, _ = await _run(
                 ['git', 'rev-parse', 'HEAD'], cwd=merge_worktree,
             )
@@ -6852,16 +6650,17 @@ class GitOps:
                 # Use git diff to get tracked dirty filenames reliably.
                 # Porcelain parsing is fragile because _run strips stdout,
                 # which eats the leading space from " M filename" status.
-                # Exclude .task/ (ephemeral) and the worktree dir (managed by git).
+                # Exclude the worktree dir (managed by git); the leftover
+                # .task/ is self-ignored via its own .task/.gitignore.
                 wt_dir = self.config.worktree_dir
                 _, unstaged_files, _ = await _run(
                     ['git', 'diff', '--name-only', '--',
-                     '.', ':!.task', f':!{wt_dir}'],
+                     '.', f':!{wt_dir}'],
                     cwd=self.project_root,
                 )
                 _, staged_files, _ = await _run(
                     ['git', 'diff', '--name-only', '--cached', '--',
-                     '.', ':!.task', f':!{wt_dir}'],
+                     '.', f':!{wt_dir}'],
                     cwd=self.project_root,
                 )
                 dirty_tracked = {
@@ -7276,14 +7075,16 @@ class GitOps:
     async def has_dirty_working_tree(self) -> str:
         """Return names of tracked dirty files, or empty string if clean.
 
-        Excludes .task/ (ephemeral scratch) and untracked files.
+        Excludes untracked files.  The leftover ``.task/`` (if any) is
+        self-ignored via its own ``.task/.gitignore``, so it never appears
+        here without a pathspec exclusion.
         """
         _, unstaged, _ = await _run(
-            ['git', 'diff', '--name-only', '--', '.', ':!.task'],
+            ['git', 'diff', '--name-only', '--', '.'],
             cwd=self.project_root,
         )
         _, staged, _ = await _run(
-            ['git', 'diff', '--name-only', '--cached', '--', '.', ':!.task'],
+            ['git', 'diff', '--name-only', '--cached', '--', '.'],
             cwd=self.project_root,
         )
         files = {f.strip() for f in (unstaged + '\n' + staged).splitlines() if f.strip()}

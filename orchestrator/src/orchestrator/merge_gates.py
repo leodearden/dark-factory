@@ -1104,7 +1104,7 @@ async def _check_post_merge_equivalence(
     rc, touched_out, touched_err = await _run(
         [
             'git', 'diff', '--name-only', '--no-renames',
-            base_sha, branch_head, '--', ':!.task/',
+            base_sha, branch_head,
         ],
         cwd=git_ops.project_root,
     )
@@ -1134,7 +1134,7 @@ async def _check_post_merge_equivalence(
     rc, main_touched_out, main_touched_err = await _run(
         [
             'git', 'diff', '--name-only', '--no-renames',
-            base_sha, main_sha, '--', ':!.task/',
+            base_sha, main_sha,
         ],
         cwd=git_ops.project_root,
     )
@@ -1199,8 +1199,8 @@ async def _rebase_delta_touched_overlap(
     1. Resolve ``branch_head`` from ``task_worktree`` HEAD.
     2. Compute ``base = merge-base(branch_head, rebased_from)`` — the common
        ancestor of the branch and the pre-churn main.
-    3. ``branch_touched = diff(base..branch_head) --no-renames :!.task/``
-    4. ``intervening   = diff(rebased_from..rebased_onto) --no-renames :!.task/``
+    3. ``branch_touched = diff(base..branch_head) --no-renames``
+    4. ``intervening   = diff(rebased_from..rebased_onto) --no-renames``
     5. Return ``sorted(set(branch_touched) & set(intervening))``.
 
     Fail-CLOSED policy
@@ -1278,7 +1278,7 @@ async def _rebase_delta_touched_overlap(
     rc, bt_out, bt_err = await _run(
         [
             'git', 'diff', '--name-only', '--no-renames',
-            base, branch_head, '--', ':!.task/',
+            base, branch_head,
         ],
         cwd=git_ops.project_root,
     )
@@ -1292,14 +1292,14 @@ async def _rebase_delta_touched_overlap(
     branch_touched = {ln.strip() for ln in bt_out.splitlines() if ln.strip()}
 
     if not branch_touched:
-        # Branch touched nothing (e.g. pure .task/ commit) — no overlap possible.
+        # Branch touched nothing — no overlap possible.
         return []
 
     # 4. intervening: files changed on main from rebased_from to rebased_onto
     rc, iv_out, iv_err = await _run(
         [
             'git', 'diff', '--name-only', '--no-renames',
-            rebased_from, rebased_onto, '--', ':!.task/',
+            rebased_from, rebased_onto,
         ],
         cwd=git_ops.project_root,
     )
