@@ -31,8 +31,11 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import subprocess
 from pathlib import Path
+
+import pytest
 
 SCRIPT = Path(__file__).parent.parent / "deploy-w11-lane-lifecycle.sh"
 UNIT = "orchestrator-dark-factory.service"
@@ -351,3 +354,45 @@ def test_check_mode_on_empty_base_is_noop(tmp_path):
         f"Expected --check to never invoke systemctl; got calls="
         f"{_systemctl_calls(worktree_base)!r}"
     )
+
+
+# ---------------------------------------------------------------------------
+# step-3: RED -- ADOPT writes an ASSIGNED record for a bound lane
+# ---------------------------------------------------------------------------
+
+@pytest.mark.parametrize("plan_location", ["new", "legacy"])
+def test_adopt_writes_assigned_record_for_bound_lane(tmp_path, plan_location):
+    """A lane on a `task/<id>` branch WITH a plan.json (checked at either the
+    new `.task-meta/<lane>/` path or the legacy `<lane>/.task/` path) is
+    ASSIGNED -- adopt must seed the durable record so LaneLifecycle's
+    record-driven recovery only engages the new path (state in
+    {assigned,in_use}) for genuinely-bound lanes."""
+    worktree_base = _build_worktree_base(tmp_path, [
+        {
+            "name": "_lane-7",
+            "branch": "task/1234",
+            "plan": {"title": "Some task title"},
+            "plan_location": plan_location,
+        },
+    ])
+
+    result = _run_script(worktree_base)
+
+    assert result.returncode == 0, (
+        f"Expected apply to exit 0; got {result.returncode}\n"
+        f"stdout={result.stdout!r} stderr={result.stderr!r}"
+    )
+    record = _read_lane_record(worktree_base, "_lane-7")
+    assert record is not None, (
+        f"Expected a .lane-state/_lane-7.json record to be written; "
+        f"stdout={result.stdout!r} stderr={result.stderr!r}"
+    )
+    assert record["state"] == "assigned", f"record={record!r}"
+    assert record["task_id"] == "1234", f"record={record!r}"
+    assert record["branch"] == "task/1234", f"record={record!r}"
+    sha = record["seeded_from_sha"]
+    assert sha and re.fullmatch(r"[0-9a-f]{40}", sha), (
+        f"Expected a non-empty 40-hex seeded_from_sha; got {sha!r}"
+    )
+    assert record["title"] == "Some task title", f"record={record!r}"
+    assert record["updated_at"], f"Expected a non-empty updated_at; record={record!r}"
