@@ -183,3 +183,75 @@ class TestCountOutstandingChildren:
         all_records = [parent, other_parent, unrelated_child]
 
         assert count_outstanding_children('parent-1', all_records) == 0
+
+
+class TestOrderSessions:
+    def test_blocked_sorts_above_all_else_regardless_of_age(self):
+        from cockpit.panes.session_table import order_sessions
+
+        old_running = _make_record(
+            session_slug='old-running',
+            status=sr.Status.RUNNING,
+            start_ts=datetime(2020, 1, 1, tzinfo=UTC).isoformat(),
+        )
+        young_awaiting = _make_record(
+            session_slug='young-awaiting',
+            status=sr.Status.AWAITING_INPUT,
+            start_ts=datetime(2026, 7, 7, tzinfo=UTC).isoformat(),
+        )
+
+        ordered = order_sessions([old_running, young_awaiting])
+
+        assert [r.session_slug for r in ordered] == ['young-awaiting', 'old-running']
+
+    def test_state_rank_ordering(self):
+        from cockpit.panes.session_table import order_sessions
+
+        awaiting = _make_record(session_slug='s-awaiting', status=sr.Status.AWAITING_INPUT)
+        running = _make_record(session_slug='s-running', status=sr.Status.RUNNING)
+        launching = _make_record(session_slug='s-launching', status=sr.Status.LAUNCHING)
+        idle = _make_record(session_slug='s-idle', status=sr.Status.IDLE)
+        exited = _make_record(session_slug='s-exited', status=sr.Status.EXITED)
+        failed = _make_record(session_slug='s-failed', status=sr.Status.FAILED_TO_START)
+
+        ordered = order_sessions([failed, exited, idle, launching, running, awaiting])
+        ranks = [r.session_slug for r in ordered]
+
+        assert ranks.index('s-awaiting') < ranks.index('s-running')
+        assert ranks.index('s-awaiting') < ranks.index('s-launching')
+        assert ranks.index('s-running') < ranks.index('s-idle')
+        assert ranks.index('s-launching') < ranks.index('s-idle')
+        assert ranks.index('s-idle') < ranks.index('s-exited')
+        assert ranks.index('s-idle') < ranks.index('s-failed')
+
+    def test_within_rank_oldest_start_ts_sorts_first(self):
+        from cockpit.panes.session_table import order_sessions
+
+        newer = _make_record(
+            session_slug='newer',
+            status=sr.Status.RUNNING,
+            start_ts=datetime(2026, 7, 7, tzinfo=UTC).isoformat(),
+        )
+        older = _make_record(
+            session_slug='older',
+            status=sr.Status.RUNNING,
+            start_ts=datetime(2026, 7, 1, tzinfo=UTC).isoformat(),
+        )
+
+        ordered = order_sessions([newer, older])
+
+        assert [r.session_slug for r in ordered] == ['older', 'newer']
+
+    def test_empty_start_ts_does_not_raise_and_sorts_last_within_rank(self):
+        from cockpit.panes.session_table import order_sessions
+
+        has_ts = _make_record(
+            session_slug='has-ts',
+            status=sr.Status.RUNNING,
+            start_ts=datetime(2026, 7, 7, tzinfo=UTC).isoformat(),
+        )
+        no_ts = _make_record(session_slug='no-ts', status=sr.Status.RUNNING, start_ts='')
+
+        ordered = order_sessions([no_ts, has_ts])
+
+        assert [r.session_slug for r in ordered] == ['has-ts', 'no-ts']
