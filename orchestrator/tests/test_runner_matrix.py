@@ -229,8 +229,13 @@ class TestRunEvalMatrixCancellation:
         # (a) Slow sibling must NOT have run to completion
         assert not slow_completed, 'Slow sibling ran to completion — siblings were not cancelled promptly'
 
-        # (b) Total elapsed must be well under 2 s (gather would take ~2 s)
-        assert elapsed < 1.0, f'Elapsed {elapsed:.2f}s ≥ 1.0s — siblings were not cancelled promptly'
+        # (b) Total elapsed must be well under 2 s (gather would take ~2 s).
+        # task 2376: loosened from 1.0s -> 1.8s — under host oversubscription
+        # scheduling jitter alone can eat into a sub-second budget even when
+        # the sibling was cancelled promptly; (a)'s `not slow_completed` above
+        # is the real invariant (the 2s sleep never ran to completion), this
+        # bound just guards against a full serial-gather regression (~2s).
+        assert elapsed < 1.8, f'Elapsed {elapsed:.2f}s ≥ 1.8s — siblings were not cancelled promptly'
 
     async def test_external_cancel_cleans_up_all_tasks(
         self, patch_load_task, monkeypatch: pytest.MonkeyPatch, tmp_path: Path

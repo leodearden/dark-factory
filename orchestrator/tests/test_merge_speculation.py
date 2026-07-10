@@ -50,7 +50,7 @@ from typing import Any, cast
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
-from _orch_helpers import make_placeholder_future, pydantic_spec  # noqa: F401
+from _orch_helpers import MERGE_RESULT_TIMEOUT, make_placeholder_future, pydantic_spec  # noqa: F401
 from test_merge_queue_concurrent_verify import (  # noqa: F401
     _gated_runner,
     _id_liveness_fake_runner,
@@ -2085,9 +2085,9 @@ class TestLateArrivalAttaches:
             gate_a_release.set()
 
             with contextlib.suppress(TimeoutError):
-                await asyncio.wait_for(req_a.result, timeout=10.0)
+                await asyncio.wait_for(req_a.result, timeout=MERGE_RESULT_TIMEOUT)
             with contextlib.suppress(TimeoutError):
-                await asyncio.wait_for(req_b.result, timeout=10.0)
+                await asyncio.wait_for(req_b.result, timeout=MERGE_RESULT_TIMEOUT)
 
             await worker.stop()
 
@@ -2226,12 +2226,12 @@ class TestLateArrivalCleanCAS:
 
             # Release A → A's verify completes, A's advance_main fires, A lands.
             gate_a_release.set()
-            outcome_a = await asyncio.wait_for(req_a.result, timeout=15.0)
+            outcome_a = await asyncio.wait_for(req_a.result, timeout=MERGE_RESULT_TIMEOUT)
             assert outcome_a.status == 'done', f'A must land cleanly; got {outcome_a!r}'
 
             # A has landed → main == A's merge commit.  Now release B.
             gate_b_release.set()
-            outcome_b = await asyncio.wait_for(req_b.result, timeout=15.0)
+            outcome_b = await asyncio.wait_for(req_b.result, timeout=MERGE_RESULT_TIMEOUT)
 
             await worker.stop()
 
@@ -2408,7 +2408,7 @@ class TestLateArrivalFailCascade:
             outcome_b = await asyncio.wait_for(req_b.result, timeout=25.0)
 
             # Await A's result too (should be set to a failed outcome).
-            outcome_a = await asyncio.wait_for(req_a.result, timeout=10.0)
+            outcome_a = await asyncio.wait_for(req_a.result, timeout=MERGE_RESULT_TIMEOUT)
 
             await worker.stop()
 
@@ -2567,14 +2567,14 @@ class TestLateArrivalGuards:
 
             # Enqueue A; let it run and land fully (no gate).
             await worker._queue.put(req_a)
-            outcome_a = await asyncio.wait_for(req_a.result, timeout=15.0)
+            outcome_a = await asyncio.wait_for(req_a.result, timeout=MERGE_RESULT_TIMEOUT)
             assert outcome_a.status == 'done', f'A must land; got {outcome_a!r}'
 
             # Now enqueue B — pending_predecessor (A) is done → FALLBACK.
             # The merger is blocked in _acquire_next_request(); the decision
             # code fires with pending_predecessor.result.done() == True.
             await worker._queue.put(req_b)
-            outcome_b = await asyncio.wait_for(req_b.result, timeout=15.0)
+            outcome_b = await asyncio.wait_for(req_b.result, timeout=MERGE_RESULT_TIMEOUT)
 
             await worker.stop()
 
@@ -2675,10 +2675,10 @@ class TestLateArrivalGuards:
 
             # Release A's gate → A lands.
             gate_a_release.set()
-            outcome_a = await asyncio.wait_for(req_a.result, timeout=15.0)
+            outcome_a = await asyncio.wait_for(req_a.result, timeout=MERGE_RESULT_TIMEOUT)
             assert outcome_a.status == 'done'
 
-            outcome_b = await asyncio.wait_for(req_b.result, timeout=15.0)
+            outcome_b = await asyncio.wait_for(req_b.result, timeout=MERGE_RESULT_TIMEOUT)
             await worker.stop()
 
         with contextlib.suppress(Exception):
@@ -2768,8 +2768,8 @@ class TestLateArrivalGuards:
             await worker._queue.put(req_b)
 
             gate_a_release.set()
-            await asyncio.wait_for(req_a.result, timeout=15.0)
-            await asyncio.wait_for(req_b.result, timeout=15.0)
+            await asyncio.wait_for(req_a.result, timeout=MERGE_RESULT_TIMEOUT)
+            await asyncio.wait_for(req_b.result, timeout=MERGE_RESULT_TIMEOUT)
             await worker.stop()
 
         with contextlib.suppress(Exception):
@@ -2873,10 +2873,10 @@ class TestLateArrivalGuards:
             await worker._queue.put(req_b)
 
             gate_a_release.set()
-            outcome_a = await asyncio.wait_for(req_a.result, timeout=15.0)
+            outcome_a = await asyncio.wait_for(req_a.result, timeout=MERGE_RESULT_TIMEOUT)
             assert outcome_a.status == 'done'
 
-            outcome_b = await asyncio.wait_for(req_b.result, timeout=15.0)
+            outcome_b = await asyncio.wait_for(req_b.result, timeout=MERGE_RESULT_TIMEOUT)
             await worker.stop()
 
         with contextlib.suppress(Exception):
@@ -3172,11 +3172,11 @@ class TestLateArrivalSubmissionOrderCAS:
 
             # Release A → A lands; then release B → B advances.
             gate_a_release.set()
-            outcome_a = await asyncio.wait_for(req_a.result, timeout=15.0)
+            outcome_a = await asyncio.wait_for(req_a.result, timeout=MERGE_RESULT_TIMEOUT)
             assert outcome_a.status == 'done', f'A must land; got {outcome_a!r}'
 
             gate_b_release.set()
-            outcome_b = await asyncio.wait_for(req_b.result, timeout=15.0)
+            outcome_b = await asyncio.wait_for(req_b.result, timeout=MERGE_RESULT_TIMEOUT)
 
             await worker.stop()
 

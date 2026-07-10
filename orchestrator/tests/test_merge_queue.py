@@ -27,7 +27,7 @@ from typing import Any, Literal
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
-from _orch_helpers import make_placeholder_future, pydantic_spec
+from _orch_helpers import MERGE_RESULT_TIMEOUT, make_placeholder_future, pydantic_spec
 from _serial_merge_worker import MergeWorker
 
 from orchestrator.artifacts import TaskArtifacts
@@ -1456,7 +1456,7 @@ class TestMergeWorker:
         req = _make_request('2', 'already-merged', worktree, config)
         await queue.put(req)
 
-        outcome = await asyncio.wait_for(req.result, timeout=10)
+        outcome = await asyncio.wait_for(req.result, timeout=MERGE_RESULT_TIMEOUT)
         assert outcome.status == 'already_merged'
 
         await worker.stop()
@@ -1527,7 +1527,7 @@ class TestMergeWorker:
         )
         await queue.put(req)
 
-        outcome = await asyncio.wait_for(req.result, timeout=15)
+        outcome = await asyncio.wait_for(req.result, timeout=MERGE_RESULT_TIMEOUT)
         # RED until step-12: currently uses worktree HEAD D (non-ancestor) →
         # proceeds to merge instead of 'already_merged'.
         assert outcome.status == 'already_merged', (
@@ -1575,7 +1575,7 @@ class TestMergeWorker:
                 snapshot_tip=None,  # falls back to worktree HEAD
             )
             await queue.put(req)
-            outcome = await asyncio.wait_for(req.result, timeout=15)
+            outcome = await asyncio.wait_for(req.result, timeout=MERGE_RESULT_TIMEOUT)
 
         # Must NOT be already_merged — worktree HEAD is not on main yet
         assert outcome.status != 'already_merged', (
@@ -1606,7 +1606,7 @@ class TestMergeWorker:
             'ghost-4011', 'ghost-4011', tmp_path / 'no-such-wt', config,
         )
         await queue.put(req)
-        outcome = await asyncio.wait_for(req.result, timeout=10)
+        outcome = await asyncio.wait_for(req.result, timeout=MERGE_RESULT_TIMEOUT)
 
         assert outcome.status == 'unknown_branch', f'got {outcome}'
         assert 'task/ghost-4011' in outcome.reason
@@ -1653,7 +1653,7 @@ class TestMergeWorker:
         req = _make_request('3', 'conflict-task', worktree, config)
         await queue.put(req)
 
-        outcome = await asyncio.wait_for(req.result, timeout=10)
+        outcome = await asyncio.wait_for(req.result, timeout=MERGE_RESULT_TIMEOUT)
         assert outcome.status == 'conflict'
         assert outcome.conflict_details  # non-empty
 
@@ -1806,7 +1806,7 @@ class TestMergeWorker:
         ):
             req = _make_request('8', 'perm-fail', worktree, config)
             await queue.put(req)
-            outcome = await asyncio.wait_for(req.result, timeout=10)
+            outcome = await asyncio.wait_for(req.result, timeout=MERGE_RESULT_TIMEOUT)
 
         assert outcome.status == 'blocked'
         assert 'not_descendant' in outcome.reason
@@ -4265,7 +4265,7 @@ class TestSpeculativeMergeWorker:
             await queue.put(req_m)
 
             # M must resolve before N's verify finishes
-            outcome_m = await asyncio.wait_for(req_m.result, timeout=5)
+            outcome_m = await asyncio.wait_for(req_m.result, timeout=MERGE_RESULT_TIMEOUT)
             # task-1892: conflict surfaces as a 'blocked' rebase-conflict escalation.
             assert outcome_m.status == 'blocked', (
                 f'M must resolve to blocked while N verify is blocked; '
@@ -6158,7 +6158,7 @@ class TestSpeculativeBackwardCompat:
 
         req = _make_request('compat-am', 'compat-am', worktree, config)
         await queue.put(req)
-        outcome = await asyncio.wait_for(req.result, timeout=10)
+        outcome = await asyncio.wait_for(req.result, timeout=MERGE_RESULT_TIMEOUT)
         assert outcome.status == 'already_merged'
 
         await worker.stop()
@@ -6369,7 +6369,7 @@ class TestMergeVerifyTimeoutLoopBreaker:
                     'lb-task', 'loop-break-mw', wt, config,
                 )
                 await queue.put(req_final)
-                final = await asyncio.wait_for(req_final.result, timeout=10)
+                final = await asyncio.wait_for(req_final.result, timeout=MERGE_RESULT_TIMEOUT)
 
             assert final.status == 'blocked'
             assert final.reason.startswith(ABANDONED_REASON_PREFIX), (
@@ -6430,7 +6430,7 @@ class TestMergeVerifyTimeoutLoopBreaker:
                     'lbs-task', 'loop-break-spec', wt, config,
                 )
                 await queue.put(req_final)
-                final = await asyncio.wait_for(req_final.result, timeout=10)
+                final = await asyncio.wait_for(req_final.result, timeout=MERGE_RESULT_TIMEOUT)
 
             assert final.status == 'blocked'
             assert final.reason.startswith(ABANDONED_REASON_PREFIX)
@@ -8052,7 +8052,7 @@ class TestMergeWorkerDequeueEvent:
         worker_task = asyncio.create_task(worker.run())
         with patch.object(worker, '_do_merge', side_effect=_fast_done):
             await enqueue_merge_request(queue, req, event_store)
-            outcome = await asyncio.wait_for(req.result, timeout=10)
+            outcome = await asyncio.wait_for(req.result, timeout=MERGE_RESULT_TIMEOUT)
 
         assert outcome.status == 'done'
 
@@ -8120,7 +8120,7 @@ class TestSpeculativeMergeWorkerDequeueEvent:
         with patch.object(git_ops, 'merge_to_main', return_value=conflict_result):
             req = _make_request('spec-deq', 'spec-deq', wt, config)
             await enqueue_merge_request(queue, req, event_store)
-            outcome = await asyncio.wait_for(req.result, timeout=10)
+            outcome = await asyncio.wait_for(req.result, timeout=MERGE_RESULT_TIMEOUT)
 
         assert outcome.status == 'conflict'
 
@@ -8570,7 +8570,7 @@ class TestWorktreeMissingHandling:
         try:
             req = _make_request('worktree-missing', 'worktree-missing', worktree, config)
             await queue.put(req)
-            outcome = await asyncio.wait_for(req.result, timeout=15)
+            outcome = await asyncio.wait_for(req.result, timeout=MERGE_RESULT_TIMEOUT)
         finally:
             await worker.stop()
             worker_task.cancel()
@@ -9231,7 +9231,7 @@ async def test_speculative_merger_surfaces_worktree_missing_after_plan_touched_c
             'spec-worktree-missing', 'spec-worktree-missing', worktree, config,
         )
         await queue.put(req)
-        outcome = await asyncio.wait_for(req.result, timeout=15)
+        outcome = await asyncio.wait_for(req.result, timeout=MERGE_RESULT_TIMEOUT)
     finally:
         await worker.stop()
         worker_task.cancel()
@@ -18506,7 +18506,7 @@ class TestSpeculativeWorkerDequeueDepth:
         with patch.object(git_ops, 'merge_to_main', return_value=conflict_result):
             req = _make_request('spec-depth', 'spec-depth', wt, config)
             await enqueue_merge_request(queue, req, event_store)
-            outcome = await asyncio.wait_for(req.result, timeout=10)
+            outcome = await asyncio.wait_for(req.result, timeout=MERGE_RESULT_TIMEOUT)
 
         assert outcome.status == 'conflict'
 
@@ -18563,7 +18563,7 @@ class TestMergeWorkerDequeueDepth:
         worker_task = asyncio.create_task(worker.run())
         with patch.object(worker, '_do_merge', side_effect=_fast_done):
             await enqueue_merge_request(queue, req, event_store)
-            outcome = await asyncio.wait_for(req.result, timeout=10)
+            outcome = await asyncio.wait_for(req.result, timeout=MERGE_RESULT_TIMEOUT)
 
         assert outcome.status == 'done'
 
@@ -18893,7 +18893,7 @@ class TestHeartbeatTaskLifecycle:
         with patch.object(git_ops, 'merge_to_main', return_value=conflict_result):
             req = _make_request('hb-lc', 'hb-lc', wt, config)
             await enqueue_merge_request(queue, req, None)
-            await asyncio.wait_for(req.result, timeout=10)
+            await asyncio.wait_for(req.result, timeout=MERGE_RESULT_TIMEOUT)
 
         await worker.stop()
         with contextlib.suppress(asyncio.CancelledError):

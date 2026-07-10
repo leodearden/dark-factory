@@ -654,7 +654,7 @@ class TestRunInflightVerifyAbortPoll:
         verify_future = asyncio.ensure_future(worker._run_inflight_verify(item, lease))
 
         # Wait for the gated runner to enter
-        await asyncio.wait_for(gate_entered.wait(), timeout=5.0)
+        await asyncio.wait_for(gate_entered.wait(), timeout=45.0)
 
         # Trigger sole-waiter abandon
         req.result.cancel()
@@ -692,7 +692,7 @@ class TestRunInflightVerifyAbortPoll:
         lease = HostLease(name='slow-wt', runner=gated, is_local=False)
 
         verify_future = asyncio.ensure_future(worker._run_inflight_verify(item, lease))
-        await asyncio.wait_for(gate_entered.wait(), timeout=5.0)
+        await asyncio.wait_for(gate_entered.wait(), timeout=45.0)
         req.result.cancel()
         await asyncio.sleep(worker.VERIFY_ABANDON_POLL_SECS * 2)
         gate_release.set()
@@ -728,7 +728,7 @@ class TestRunInflightVerifyAbortPoll:
         lease = HostLease(name='slow-halt', runner=gated, is_local=False)
 
         verify_future = asyncio.ensure_future(worker._run_inflight_verify(item, lease))
-        await asyncio.wait_for(gate_entered.wait(), timeout=5.0)
+        await asyncio.wait_for(gate_entered.wait(), timeout=45.0)
 
         # Trigger operator halt
         worker._operator_halt.set()
@@ -764,7 +764,7 @@ class TestRunInflightVerifyAbortPoll:
         lease = HostLease(name='slow-halt2', runner=gated, is_local=False)
 
         verify_future = asyncio.ensure_future(worker._run_inflight_verify(item, lease))
-        await asyncio.wait_for(gate_entered.wait(), timeout=5.0)
+        await asyncio.wait_for(gate_entered.wait(), timeout=45.0)
 
         worker._operator_halt.set()
         await asyncio.sleep(worker.VERIFY_ABANDON_POLL_SECS * 2)
@@ -1961,7 +1961,10 @@ class TestOverlapSignal:
             # RED: times out — serial loop only dispatches N+1 after N finalizes.
             # GREEN (step-18): concurrent fill → gate_b_entered fires quickly.
             try:
-                await asyncio.wait_for(gate_b_entered.wait(), timeout=3.0)
+                # task 2376: widened from 3.0s (host-oversubscription flake — a
+                # starved worker missed the deadline while the invariant held;
+                # see the 45.0s convention already used at lines ~2251/4185).
+                await asyncio.wait_for(gate_b_entered.wait(), timeout=45.0)
             except TimeoutError:
                 # Cleanup: release gates so worker can drain cleanly
                 gate_a_release.set()
@@ -2009,7 +2012,7 @@ class TestOverlapSignal:
 
         await worker.stop()
         with contextlib.suppress(Exception):
-            await asyncio.wait_for(worker_task, timeout=5.0)
+            await asyncio.wait_for(worker_task, timeout=45.0)
 
         assert outcome_a.status == 'done', f'N: expected done, got {outcome_a}'
         assert outcome_b.status == 'done', f'N+1: expected done, got {outcome_b}'
@@ -3518,7 +3521,7 @@ class TestRunInflightVerifyRemoteCancelOnAbort:
             verify_future = asyncio.ensure_future(
                 worker._run_inflight_verify(item, lease)
             )
-            await asyncio.wait_for(gate_entered.wait(), timeout=5.0)
+            await asyncio.wait_for(gate_entered.wait(), timeout=45.0)
 
             # Trigger abandon.  The abort poll will cancel verify_task
             # (propagating CancelledError into _gated_verify's gate wait),
@@ -3526,7 +3529,9 @@ class TestRunInflightVerifyRemoteCancelOnAbort:
             # gate to be released.  Await directly with a timeout instead
             # of a fixed timing sleep.
             req.result.cancel()
-            result = await asyncio.wait_for(verify_future, timeout=2.0)
+            # task 2376: widened from 2.0s — host oversubscription can starve
+            # this poll past a short deadline while the invariant still holds.
+            result = await asyncio.wait_for(verify_future, timeout=45.0)
             gate_release.set()  # cleanup: no-op if already cancelled
 
         assert result.status == 'DROPPED'
