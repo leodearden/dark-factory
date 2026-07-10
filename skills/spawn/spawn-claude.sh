@@ -609,7 +609,7 @@ case "$first_word" in
     # contract, so faults are swallowed with `|| true` exactly like those
     # calls. Depends on step-2's `set-display` CLI verb.
     if [ "$launch_rc" -eq 0 ] && [ -n "$SESSION_RECORD_DIR" ] && command -v python3 >/dev/null 2>&1; then
-      python3 "$SESSION_REGISTRY_PY" set-display --record "$SESSION_RECORD_DIR" --kind tmux --tmux-target "$tmux_target" --wm-title "$title" || true
+      python3 "$SESSION_REGISTRY_PY" set-display --record "$SESSION_RECORD_DIR" --kind tmux --tmux-target "$tmux_target" --wm-title "$win_name" || true
     fi
     resolve_detached "$launch_rc"
     ;;
