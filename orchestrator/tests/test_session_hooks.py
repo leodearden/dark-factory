@@ -332,6 +332,99 @@ def test_run_session_start_no_parent_id_env_leaves_parent_session_id_none(tmp_pa
 
 
 # ---------------------------------------------------------------------------
+# Task 2292 step-5: SessionStart best-effort display stamping (Fleet Cockpit C2)
+# ---------------------------------------------------------------------------
+
+
+def test_run_session_start_tmux_env_stamps_tmux_display(tmp_path: Path) -> None:
+    hook_input = {'session_id': 'sess-d1', 'cwd': '/home/leo/src/dark-factory'}
+    env = {'TMUX': '/tmp/tmux-1000/default,123,0', 'TMUX_PANE': '%3'}
+
+    sh.run_session_start(hook_input, env, root=tmp_path)
+
+    slug = sh.hook_session_slug(hook_input, env)
+    record = sr.read_record(slug, root=tmp_path)
+    assert record.display is not None
+    # Assert on the wire value directly -- a StrEnum-vs-str choice can't drift.
+    assert record.display.kind == 'tmux'
+    assert record.display.tmux_target == '%3'
+
+
+def test_run_session_start_windowid_env_stamps_wm_display(tmp_path: Path) -> None:
+    hook_input = {'session_id': 'sess-d2', 'cwd': '/home/leo/src/dark-factory'}
+    env = {'WINDOWID': '0x3200007'}
+
+    sh.run_session_start(hook_input, env, root=tmp_path)
+
+    slug = sh.hook_session_slug(hook_input, env)
+    record = sr.read_record(slug, root=tmp_path)
+    assert record.display is not None
+    assert record.display.kind == 'wm'
+    assert record.display.wm_window_id == '0x3200007'
+    assert record.display.wm_title == 'session:dark-factory'
+
+
+def test_run_session_start_tmux_takes_precedence_over_windowid(tmp_path: Path) -> None:
+    hook_input = {'session_id': 'sess-d3', 'cwd': '/home/leo/src/dark-factory'}
+    env = {
+        'TMUX': '/tmp/tmux-1000/default,123,0',
+        'TMUX_PANE': '%3',
+        'WINDOWID': '0x3200007',
+    }
+
+    sh.run_session_start(hook_input, env, root=tmp_path)
+
+    slug = sh.hook_session_slug(hook_input, env)
+    record = sr.read_record(slug, root=tmp_path)
+    assert record.display is not None
+    assert record.display.kind == 'tmux'
+
+
+def test_run_session_start_no_tmux_or_windowid_leaves_display_none(tmp_path: Path) -> None:
+    hook_input = {'session_id': 'sess-d4', 'cwd': '/home/leo/src/dark-factory'}
+    env: dict[str, str] = {}
+
+    sh.run_session_start(hook_input, env, root=tmp_path)
+
+    slug = sh.hook_session_slug(hook_input, env)
+    record = sr.read_record(slug, root=tmp_path)
+    assert record.display is None
+
+
+def test_run_session_start_display_stamping_applies_on_refresh_path(tmp_path: Path) -> None:
+    hook_input = {'session_id': 'sess-d5', 'cwd': '/home/leo/src/dark-factory'}
+    env = {'WINDOWID': '0x3200007'}
+    slug = sh.hook_session_slug(hook_input, env)
+    existing = sr.SessionRecord(
+        session_slug=slug,
+        status=sr.Status.LAUNCHING,
+        title='unblock:df#2085 routing-mechanism',
+        role='unblock',
+        project='df',
+        task_id='2085',
+        cwd='/home/leo/src/dark-factory',
+        prompt='/unblock 2085',
+    )
+    sr.write_record(existing, root=tmp_path)
+
+    sh.run_session_start(hook_input, env, root=tmp_path)
+
+    record = sr.read_record(slug, root=tmp_path)
+    assert record.status == sr.Status.RUNNING
+    assert record.display is not None
+    assert record.display.kind == 'wm'
+    assert record.display.wm_window_id == '0x3200007'
+    # wm_title resolves from the persisted record title (hook_display_title's
+    # existing precedence), not a freshly-derived role:project fallback.
+    assert record.display.wm_title == 'unblock:df#2085 routing-mechanism'
+    # Previously-populated fields survive.
+    assert record.role == 'unblock'
+    assert record.project == 'df'
+    assert record.task_id == '2085'
+    assert record.prompt == '/unblock 2085'
+
+
+# ---------------------------------------------------------------------------
 # Step-7: run_notification / run_stop (status flip + OSC return)
 # ---------------------------------------------------------------------------
 
