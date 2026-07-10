@@ -92,3 +92,58 @@ def count_outstanding_children(slug: str, all_records: list[SessionRecord]) -> i
         for record in all_records
         if record.parent_session_id == slug and Status(record.status) not in TERMINAL_STATUSES
     )
+
+
+# Documented state ranking for order_sessions: blocked-on-you first, then
+# working, then idle, then dead. launching folds into "working" (rank 1)
+# and both terminal statuses fold into "dead" (rank 3), mirroring _GLYPHS'
+# four-bucket grouping. A foreign/unrecognized status sorts last of all.
+_STATE_RANK: dict[Status, int] = {
+    Status.AWAITING_INPUT: 0,
+    Status.RUNNING: 1,
+    Status.LAUNCHING: 1,
+    Status.IDLE: 2,
+    Status.EXITED: 3,
+    Status.FAILED_TO_START: 3,
+}
+
+_UNKNOWN_STATE_RANK = 4
+
+
+def _state_rank(status: Status | str) -> int:
+    try:
+        resolved = Status(status)
+    except ValueError:
+        return _UNKNOWN_STATE_RANK
+    return _STATE_RANK.get(resolved, _UNKNOWN_STATE_RANK)
+
+
+def _start_ts_sort_key(start_ts: str) -> tuple[int, str]:
+    """Sort ascending by *start_ts* (oldest first); empty/unparseable sorts last.
+
+    (0, start_ts) sorts before (1, '') for any parseable start_ts, so a
+    record whose timestamp we can't make sense of never raises and never
+    jumps the queue ahead of a record we can actually order.
+    """
+    if start_ts:
+        try:
+            datetime.fromisoformat(start_ts)
+        except ValueError:
+            pass
+        else:
+            return (0, start_ts)
+    return (1, '')
+
+
+def order_sessions(records: list[SessionRecord]) -> list[SessionRecord]:
+    """Order *records* blocked-first, then by state rank, then oldest start_ts first.
+
+    A deterministic, dependency-free stand-in for the C5b priority score
+    (this task's dependency surface is C1 only -- see design_decisions).
+    Pure and total: no clock read, and an empty/unparseable start_ts sorts
+    last within its rank rather than raising.
+    """
+    return sorted(
+        records,
+        key=lambda record: (_state_rank(record.status), _start_ts_sort_key(record.start_ts)),
+    )
