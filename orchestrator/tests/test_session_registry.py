@@ -1675,3 +1675,48 @@ def test_main_write_decision_prints_filed_id(
 
     assert rc == 0
     assert 'dec-park-2' in capsys.readouterr().out
+
+
+def test_main_write_decision_fail_soft_when_fleet_root_under_a_file(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Mirrors test_write_decision_fail_soft_on_unwritable_root, at the CLI
+    boundary: write_decision's own fail-soft guard (not main()'s outer
+    try/except) must absorb the fault, so _run_write_decision must not print
+    a false confirmation when the underlying write never happened.
+    """
+    blocker = tmp_path / 'blocker'
+    blocker.write_text('not a directory')
+    monkeypatch.setenv('CLAUDE_FLEET_ROOT', str(blocker / 'fleet'))
+
+    with caplog.at_level(logging.ERROR):
+        rc = sr.main(['write-decision', '--id', 'dec-park-3', '--project', 'df', '--text', 'q'])
+
+    assert rc == 0
+    assert 'dec-park-3' not in capsys.readouterr().out
+    assert any(r.levelno >= logging.ERROR for r in caplog.records)
+    assert not (blocker / 'fleet').exists()
+
+
+def test_main_write_decision_refiling_same_id_overwrites_not_duplicates(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """SKILL.md promises watchers can safely re-file the same stable id
+    across restarts: the second write must overwrite the first record in
+    place rather than accumulating a duplicate.
+    """
+    monkeypatch.setenv('CLAUDE_FLEET_ROOT', str(tmp_path))
+
+    rc1 = sr.main(['write-decision', '--id', 'dec-park-4', '--project', 'df', '--text', 'first?'])
+    rc2 = sr.main(['write-decision', '--id', 'dec-park-4', '--project', 'df', '--text', 'second?'])
+
+    assert rc1 == 0
+    assert rc2 == 0
+    listed = sr.list_decisions(root=tmp_path)
+    assert len(listed) == 1
+    assert listed[0].id == 'dec-park-4'
+    assert listed[0].text == 'second?'
