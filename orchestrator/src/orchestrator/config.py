@@ -1769,17 +1769,34 @@ class OrchestratorConfig(BaseSettings):
     # a single ``run_scoped_verification`` fan-out.  Caps the blast radius if the
     # module set is large (or accidentally polluted) so a fan-out can never spawn
     # an unbounded number of full builds into one worktree at once.
+    # Deliberately NOT in RELOADABLE_FIELDS, even though it is read fresh on
+    # every ``run_scoped_verification`` call (same read-fresh mechanism as its
+    # merge-role sibling below): this is the general task/background-role cap,
+    # and retiering it is outside task 2393's declared scope, which only added
+    # the merge-only knob below. Promoting it to green-tier is a candidate
+    # follow-up, not bundled here to avoid an unreviewed behaviour change to a
+    # pre-existing knob.
     max_concurrent_module_verifies: int = Field(default=4, ge=1)
     # Dedicated merge-role internal-fanout cap (task 2393, T5). Merge-role
-    # pytests bypass the T2 counting admission slot (`_admission_slot` is a
+    # verifies bypass the T2 counting admission slot (`_admission_slot` is a
     # no-op for role='merge' — the anti-livelock/C-merge-priority guarantee),
     # so the merge fan-out branch of `run_scoped_verification` needs its OWN
     # bound, orthogonal to `verify_admission_task_slots`. Lowering the general
     # `max_concurrent_module_verifies` to tame merge would also over-serialize
     # task-role fan-outs, whose pytests are already bounded by the admission
-    # slot. Default 4 = the current merge fan-out bound, so default behaviour
-    # is preserved until an operator tunes this independently.
-    merge_verify_max_concurrent_pytests: int = Field(default=4, ge=1)
+    # slot. Bounds concurrent ``run_verification`` calls for ANY module,
+    # regardless of language/test runner (cargo, pytest, ...) — it is the same
+    # kind of fan-out guard as `max_concurrent_module_verifies` above (root
+    # cause: a polluted module set once produced 226 concurrent `cargo`
+    # pipelines in one merge worktree), just scoped to role='merge'; despite
+    # the name, it is not pytest-specific. Default 4 matches
+    # `max_concurrent_module_verifies`'s default, so untuned installs are
+    # byte-preserved. Note this is a NEW, independent knob: an operator who
+    # had previously retuned `max_concurrent_module_verifies` specifically to
+    # bound merge fan-out will silently revert to this field's default of 4
+    # post-upgrade — it does not inherit the old tuned value — and must retune
+    # this knob explicitly.
+    merge_verify_max_concurrent_modules: int = Field(default=4, ge=1)
     # When True, each verify command is spawned inside a transient systemd
     # ``--scope`` (its own cgroup) so a timeout/cancel can kill the ENTIRE
     # subtree by cgroup, regardless of process-group escapes (e.g. an inner GNU
@@ -2791,7 +2808,7 @@ RELOADABLE_FIELDS: frozenset[str] = frozenset().union(
         # Merge-role internal-fanout cap (task 2393, T5) — same knob family:
         # read fresh per run_scoped_verification call, so a live reload
         # lowers the merge fan-out without a restart.
-        'merge_verify_max_concurrent_pytests',
+        'merge_verify_max_concurrent_modules',
     },
 )
 

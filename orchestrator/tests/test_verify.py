@@ -1608,7 +1608,7 @@ class TestRunScopedVerificationSkipsUntouched:
 
 class TestMergeFanoutCap:
     """Task 2393 (T5): the merge-role internal pytest fan-out is bounded by
-    its own dedicated cap (``merge_verify_max_concurrent_pytests``),
+    its own dedicated cap (``merge_verify_max_concurrent_modules``),
     decoupled from the general ``max_concurrent_module_verifies`` used by
     task/background roles.
 
@@ -1655,7 +1655,7 @@ class TestMergeFanoutCap:
 
     @pytest.mark.asyncio
     async def test_merge_fanout_bounded_by_dedicated_merge_cap(self, tmp_path: Path):
-        """role='merge' fan-out is bounded by merge_verify_max_concurrent_pytests,
+        """role='merge' fan-out is bounded by merge_verify_max_concurrent_modules,
         not by the general max_concurrent_module_verifies.
         """
         (tmp_path / 'conftest.py').write_text('# root\n')  # source, fits no prefix
@@ -1663,7 +1663,7 @@ class TestMergeFanoutCap:
             project_root=tmp_path,
             concurrent_verify=False,
             max_concurrent_module_verifies=6,
-            merge_verify_max_concurrent_pytests=2,
+            merge_verify_max_concurrent_modules=2,
         )
         module_configs = [
             ModuleConfig(prefix=f'mod{i}', test_command=f'__cmd{i}__')
@@ -1695,7 +1695,7 @@ class TestMergeFanoutCap:
             project_root=tmp_path,
             concurrent_verify=False,
             max_concurrent_module_verifies=2,
-            merge_verify_max_concurrent_pytests=6,
+            merge_verify_max_concurrent_modules=6,
         )
         module_configs = [
             ModuleConfig(prefix=f'mod{i}', test_command=f'__cmd{i}__')
@@ -1714,7 +1714,7 @@ class TestMergeFanoutCap:
         assert result.passed
         assert state['peak'] == 2, (
             f'expected the general cap (2) to bound task-role fan-out '
-            f'regardless of merge_verify_max_concurrent_pytests; peak={state["peak"]}'
+            f'regardless of merge_verify_max_concurrent_modules; peak={state["peak"]}'
         )
 
     @pytest.mark.asyncio
@@ -1727,7 +1727,7 @@ class TestMergeFanoutCap:
         config = OrchestratorConfig(
             project_root=tmp_path,
             concurrent_verify=False,
-            merge_verify_max_concurrent_pytests=1,
+            merge_verify_max_concurrent_modules=1,
         )
         module_configs = [
             ModuleConfig(prefix='mod0', test_command='__cmd0__'),
