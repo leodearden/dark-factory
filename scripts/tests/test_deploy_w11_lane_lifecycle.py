@@ -584,14 +584,14 @@ def test_apply_restarts_and_verifies_after_adopt(tmp_path):
         f"stdout={result.stdout!r} stderr={result.stderr!r}"
     )
 
+    # Calls are recorded as the raw argv (including the constant `--user`
+    # flag) -- matching test_restart_orchestrator.py's own assertion
+    # convention (e.g. test_invokes_systemctl_restart_on_correct_unit),
+    # which this suite's fake systemctl mirrors.
     calls = _systemctl_calls(worktree_base)
-    restart_calls = [c for c in calls if c and c[0] == "restart"]
-    assert restart_calls, (
-        f"Expected apply to invoke `systemctl restart`; calls={calls!r}\n"
+    assert ["--user", "restart", UNIT] in calls, (
+        f"Expected a `systemctl --user restart {UNIT}` call; calls={calls!r}\n"
         f"stdout={result.stdout!r} stderr={result.stderr!r}"
-    )
-    assert restart_calls[0] == ["restart", UNIT], (
-        f"Expected `restart {UNIT}`; got {restart_calls[0]!r}"
     )
 
     state = json.loads(_systemctl_state_path(worktree_base.parent).read_text())

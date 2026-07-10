@@ -196,3 +196,10 @@ adopt
 if [[ "$MODE" == "check" ]]; then
     exit 0
 fi
+
+# RESTART (apply mode only, AFTER adopt -- PRD migration caution: read
+# reality -> write .lane-state records -> THEN flip). Delegate to the
+# existing restart-orchestrator.sh rather than duplicating its blocking
+# `systemctl --user restart` + fresh-ActiveEnterTimestampMonotonic verify
+# loop (DRY). It already targets orchestrator-dark-factory.service.
+exec "$PROJECT_ROOT/scripts/restart-orchestrator.sh"
