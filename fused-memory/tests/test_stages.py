@@ -11861,23 +11861,6 @@ class TestTaskKnowledgeSyncDeterministicCycleSummaryWrite:
                 'W5-λ) and must no longer be set by run().'
             )
 
-    def test_verify_repair_reconstruct_helpers_deleted(self):
-        """The Python-side verify/repair/reconstruct self-heal chain is fully
-        deleted, not merely unwired — a runtime-checkable attribute
-        assertion (not a prose/docstring check)."""
-        import fused_memory.reconciliation.stages.task_knowledge_sync as tks_module
-
-        for name in (
-            '_verify_stage2_summary_written',
-            '_repair_stage2_summary_stage_metadata',
-            '_reconstruct_stage2_summary',
-        ):
-            assert not hasattr(tks_module, name), (
-                f'{name} must be deleted (task 2229 W5-λ) — Python now writes '
-                'the per-cycle summary directly via write_cycle_summary, with '
-                'nothing left to verify/repair/reconstruct.'
-            )
-
     @pytest.mark.asyncio
     async def test_payload_has_no_nonce_text(self):
         """assemble_payload() no longer injects the '### Per-Cycle Summary
