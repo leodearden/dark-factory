@@ -15,15 +15,17 @@ OUTSIDE the git worktree entirely, at <worktree_base>/.task-meta/<name>
 tree is structurally impossible rather than merely guarded against:
 nothing ever writes task metadata into a path git tracks.
 
-Two lightweight safeguards remain for the migration window:
+One lightweight safeguard remains for the migration window:
 
 - _assert_no_task_dir() — a cheap tripwire that hard-asserts a given commit
   SHA carries no .task/ entries.  Called before advance_main().  Retained
   here; dropped in W11 ι once the relocation has proven itself.
-- _ensure_task_gitignore() — writes .task/.gitignore so any leftover
-  <worktree>/.task/ scratch directory self-ignores under `git add -A` /
-  `git status`.  Retained as defense-in-depth; deferred (not dropped) in
-  W11 ι.
+
+_ensure_task_gitignore() — which used to write .task/.gitignore so any
+leftover <worktree>/.task/ scratch directory self-ignored under `git add
+-A` / `git status` — has been dropped (W11 ι): nothing writes task
+metadata under <worktree>/.task any more, so there is nothing left for a
+nested .gitignore to defend.
 """
 
 import asyncio
@@ -225,22 +227,6 @@ PROTECTED_PREFIXES: dict[str, str] = {
 # ---------------------------------------------------------------------------
 # .task/ contamination helpers
 # ---------------------------------------------------------------------------
-
-def _ensure_task_gitignore(worktree: Path) -> None:
-    """Create .task/.gitignore with '*' if it doesn't exist.
-
-    This is a defense-in-depth measure.  When an agent does ``git add .``
-    or ``git add -A``, the nested .gitignore prevents .task/ contents from
-    being staged — UNLESS files were previously explicitly added (tracked
-    files override .gitignore).  The pre-commit hook is the primary guard;
-    this is supplementary.
-    """
-    task_dir = worktree / '.task'
-    task_dir.mkdir(exist_ok=True)
-    gi = task_dir / '.gitignore'
-    if not gi.exists():
-        gi.write_text('# Auto-generated — prevents .task/ from being staged.\n*\n')
-
 
 async def _assert_no_task_dir(sha: str, cwd: Path, context: str) -> None:
     """Raise RuntimeError if the given commit SHA contains any .task/ entries.
@@ -1599,7 +1585,6 @@ class GitOps:
                             worktree_path, actual_base[:8],
                         )
 
-                _ensure_task_gitignore(worktree_path)
                 # Re-run on reuse so the requeued agent re-acquires a free
                 # port and re-patches its .mcp.json.  The script must be
                 # idempotent (return the same port for the same worktree dir)
@@ -1722,12 +1707,6 @@ class GitOps:
             'Created worktree at %s on branch %s (base=%s, stale_commits=%s)',
             worktree_path, full_branch, base_sha[:8], stale_commits,
         )
-
-        # ── .task/.gitignore defense layer ────────────────────────────
-        # Create .task/.gitignore with "*" so that broad "git add ."
-        # commands in the worktree don't pick up .task/ contents.  This
-        # is defense-in-depth — the pre-commit hook is the primary guard.
-        _ensure_task_gitignore(worktree_path)
 
         # Re-capture base from the worktree's own merge-base after
         # positioning.  merge-base from inside the freshly-created worktree
@@ -1990,11 +1969,6 @@ class GitOps:
         # gamma relocation; PRD `.task-meta` path-derivation contract: writes
         # new-path-only) — a worktree_base sibling of the worktree, so
         # `git add -A` in the lane can never stage it.
-        # _ensure_task_gitignore writes .task/.gitignore('*') first (and
-        # creates the legacy .task/ dir) — kept as-is (guard-layer deletion
-        # is θ/ι scope, out of scope here) even though the stamp itself no
-        # longer lands under it.
-        _ensure_task_gitignore(path)
         stamp = {
             'owner': slug,
             'created_at': datetime.now(UTC).isoformat(),
@@ -3300,9 +3274,7 @@ class GitOps:
                     return recycle_result
                 route = AcquireRoute.RECYCLE
 
-            # ── Shared tail: gitignore, base, debug-port ──────────────────
-            _ensure_task_gitignore(lane)
-
+            # ── Shared tail: base, debug-port ──────────────────────────────
             _, mb_out, _ = await _run(
                 ['git', 'merge-base', start_ref, 'HEAD'],
                 cwd=lane,
@@ -3459,9 +3431,6 @@ class GitOps:
         #     Route 3 (γ reattach) already re-attaches before this call, so
         #     the rebind is a harmless reset-to-self there.
         await self.rebind_branch_to_head(lane_dir, full_branch)
-
-        # 3. Re-ensure task .gitignore (idempotent)
-        _ensure_task_gitignore(lane_dir)
 
         # 4. Recompute base: merge-base between main_branch and HEAD
         _, mb_out, _ = await _run(
@@ -4392,10 +4361,9 @@ class GitOps:
 
         .task/ execution metadata now lives outside the worktree entirely
         (see module docstring / TaskArtifacts.meta_root_for), so no pathspec
-        exclusion or post-staging unstage is needed here: a leftover
-        <worktree>/.task/ (if anything still creates one) is self-ignored by
-        its own .task/.gitignore (_ensure_task_gitignore), so `git add -A`
-        never stages it.
+        exclusion or post-staging unstage is needed here: nothing writes
+        <worktree>/.task in the first place, so `git add -A` has nothing
+        under .task/ to stage.
 
         Pre-staging conflict guard (esc-2128-8): if *worktree* has any
         unresolved (unmerged-index) paths — e.g. a stash-pop that conflicted
@@ -5088,9 +5056,10 @@ class GitOps:
     async def has_uncommitted_work(self, worktree: Path) -> bool:
         """Return True if worktree has staged or unstaged changes.
 
-        The leftover ``.task/`` (if any) is self-ignored via its own
-        ``.task/.gitignore``, so it never surfaces in ``git status`` output —
-        no pathspec exclusion is needed here.
+        A leftover ``.task/`` (if any) is covered by this repo's root
+        ``.gitignore`` (a tracked ``.task/`` entry every worktree inherits),
+        so it never surfaces in ``git status`` output — no pathspec
+        exclusion is needed here.
         """
         rc, output, _ = await _run(
             ['git', 'status', '--porcelain', '--', '.'],

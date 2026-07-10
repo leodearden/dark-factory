@@ -1902,6 +1902,17 @@ class TestHasUncommittedWork:
         assert await git_ops.has_uncommitted_work(wt_info.path)
 
     async def test_file_only_in_task_dir_returns_false(self, git_ops: GitOps):
+        """Production's repo-root .gitignore carries a tracked `.task/`
+        entry (independent of the since-removed `_ensure_task_gitignore`
+        nested gitignore) that every worktree inherits.  `_setup_repo`
+        builds a bare synthetic repo with no .gitignore at all, so commit
+        one here first to exercise the same real-world condition
+        `has_uncommitted_work` relies on.
+        """
+        (git_ops.project_root / '.gitignore').write_text('.task/\n')
+        await _run(['git', 'add', '-A'], cwd=git_ops.project_root)
+        await _run(['git', 'commit', '-m', 'add .gitignore'], cwd=git_ops.project_root)
+
         wt_info = await git_ops.create_worktree('taskdir-wt')
         task_dir = wt_info.path / '.task'
         task_dir.mkdir(exist_ok=True)
