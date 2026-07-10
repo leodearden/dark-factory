@@ -441,6 +441,111 @@ def test_refresh_record_updates_existing_record_under_same_key(tmp_path: Path) -
 
 
 # ---------------------------------------------------------------------------
+# Step-5: decision helpers (B2) -- Fleet Cockpit
+# ---------------------------------------------------------------------------
+
+
+def test_write_then_list_decision(tmp_path: Path) -> None:
+    rec = _make_decision()
+
+    assert sr.write_decision(rec, root=tmp_path) is True
+
+    listed = sr.list_decisions(root=tmp_path)
+    assert len(listed) == 1
+    assert listed[0] == rec
+
+
+def test_update_decision_state_persists(tmp_path: Path) -> None:
+    rec = _make_decision(state=sr.DecisionState.OPEN)
+    sr.write_decision(rec, root=tmp_path)
+
+    updated = sr.update_decision_state(rec.id, sr.DecisionState.ANSWERED, root=tmp_path)
+
+    assert updated is not None
+    assert updated.state == sr.DecisionState.ANSWERED
+    [reread] = [d for d in sr.list_decisions(root=tmp_path) if d.id == rec.id]
+    assert reread.state == sr.DecisionState.ANSWERED
+
+
+def test_set_manual_boost_persists(tmp_path: Path) -> None:
+    rec = _make_decision(manual_boost=0)
+    sr.write_decision(rec, root=tmp_path)
+
+    updated = sr.set_manual_boost(rec.id, 3, root=tmp_path)
+
+    assert updated is not None
+    assert updated.manual_boost == 3
+    [reread] = [d for d in sr.list_decisions(root=tmp_path) if d.id == rec.id]
+    assert reread.manual_boost == 3
+
+
+def test_decisions_are_per_file_isolated(tmp_path: Path) -> None:
+    """Distinct <id>.json paths are the whole isolation guarantee: writing or
+    updating one decision must never touch another's file (no global index,
+    no shared body -- mirrors each session record's own directory).
+    """
+    rec_a = _make_decision(id='dec-a')
+    rec_b = _make_decision(id='dec-b')
+    sr.write_decision(rec_a, root=tmp_path)
+    sr.write_decision(rec_b, root=tmp_path)
+
+    path_a = sr.decision_path_for_id('dec-a', root=tmp_path)
+    path_b = sr.decision_path_for_id('dec-b', root=tmp_path)
+    assert path_a.is_file()
+    assert path_b.is_file()
+    assert path_a != path_b
+    assert {d.id for d in sr.list_decisions(root=tmp_path)} == {'dec-a', 'dec-b'}
+
+    bytes_b_before = path_b.read_bytes()
+    sr.set_manual_boost('dec-a', 9, root=tmp_path)
+    assert path_b.read_bytes() == bytes_b_before
+
+
+def test_list_decisions_missing_dir_returns_empty(tmp_path: Path) -> None:
+    assert sr.list_decisions(root=tmp_path) == []
+
+
+def test_list_decisions_skips_corrupt_file(
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    rec = _make_decision()
+    sr.write_decision(rec, root=tmp_path)
+    corrupt_path = sr.decisions_dir(root=tmp_path) / 'bogus.json'
+    corrupt_path.write_text('{not valid json')
+
+    with caplog.at_level(logging.ERROR):
+        listed = sr.list_decisions(root=tmp_path)
+
+    assert [d.id for d in listed] == [rec.id]
+    assert any(r.levelno >= logging.ERROR for r in caplog.records)
+
+
+def test_write_decision_fail_soft_on_unwritable_root(
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    # Mirrors test_main_launching_fail_soft_when_fleet_root_under_a_file: a
+    # root rooted under a pre-created regular file makes the write's
+    # mkdir(parents=True) raise NotADirectoryError deterministically.
+    blocker = tmp_path / 'blocker'
+    blocker.write_text('not a directory')
+    bad_root = blocker / 'fleet'
+
+    with caplog.at_level(logging.ERROR):
+        result = sr.write_decision(_make_decision(), root=bad_root)
+
+    assert result is False
+    assert any(r.levelno >= logging.ERROR for r in caplog.records)
+    assert not (blocker / 'fleet').exists()
+
+
+def test_update_and_set_boost_fail_soft_when_absent(tmp_path: Path) -> None:
+    assert sr.update_decision_state('no-such-id', sr.DecisionState.ANSWERED, root=tmp_path) is None
+    assert sr.set_manual_boost('no-such-id', 5, root=tmp_path) is None
+
+
+# ---------------------------------------------------------------------------
 # Step-7: TTL / pid stale-record reaper matrix
 # ---------------------------------------------------------------------------
 
