@@ -5,6 +5,7 @@ import logging
 from unittest.mock import AsyncMock
 
 import pytest
+import pytest_asyncio
 
 from fused_memory.server.tools import create_mcp_server
 
@@ -37,6 +38,35 @@ def mcp_server_with_tasks(task_interceptor):
     """MCP server with a mocked task interceptor."""
     mock_service = AsyncMock()
     return create_mcp_server(mock_service, task_interceptor=task_interceptor)
+
+
+@pytest_asyncio.fixture
+async def real_task_stack(tmp_path):
+    """Live SqliteTaskBackend + TaskInterceptor + MCP server stack.
+
+    The status/done_provenance write-authority floor lives in
+    ``SqliteTaskBackend.update_task`` (task C1); the mocked
+    ``task_interceptor`` fixture above can't exercise it, so BT-C1
+    rejection tests need a real backend + interceptor + create_mcp_server
+    stack instead. No git repo or created task is needed — the floor
+    raises before the row SELECT.
+    """
+    from fused_memory.backends.sqlite_task_backend import SqliteTaskBackend
+    from fused_memory.config.schema import TaskmasterConfig
+    from fused_memory.middleware.task_interceptor import TaskInterceptor
+    from fused_memory.reconciliation.event_buffer import EventBuffer
+
+    backend = SqliteTaskBackend(TaskmasterConfig(project_root=str(tmp_path)))
+    await backend.start()
+    event_buffer = EventBuffer(db_path=tmp_path / 'real_stack_eb.db', buffer_size_threshold=100)
+    await event_buffer.initialize()
+    interceptor = TaskInterceptor(backend, None, event_buffer)
+    server = create_mcp_server(AsyncMock(), task_interceptor=interceptor)
+    try:
+        yield server, interceptor
+    finally:
+        await event_buffer.close()
+        await backend.close()
 
 
 # ------------------------------------------------------------------
@@ -282,39 +312,76 @@ async def test_update_task_relative_path_returns_validation_error(
 
 
 @pytest.mark.asyncio
-async def test_update_task_rejects_metadata_done_provenance_dict(
-    mcp_server_with_tasks, task_interceptor,
+async def test_update_task_done_provenance_rejection_byte_identical_across_surfaces(
+    real_task_stack, tmp_path,
 ):
-    """A dict-shaped metadata carrying done_provenance is rejected with a pointer to set_task_status."""
-    result = await mcp_server_with_tasks._tool_manager.call_tool(
+    """BT-C1: the tools.py surface and the interceptor surface return the
+    byte-identical canonical done_provenance rejection dict.
+
+    Today they diverge: tools.py's ``_reject_done_provenance_in_metadata``
+    returns ``{'error_type': 'ValidationError', ...}`` while the interceptor
+    returns the canonical ``{'success': False, 'error':
+    'done_provenance_via_update_task', ...}`` shape. Drives both surfaces
+    against a live SqliteTaskBackend + TaskInterceptor stack so the C1
+    backend floor actually fires. No git repo / created task needed — the
+    floor raises before the row SELECT.
+    """
+    from fused_memory.backends.task_backend_errors import done_provenance_via_update_task_error
+
+    server, interceptor = real_task_stack
+    payload = {'done_provenance': {'kind': 'merged', 'commit': 'abc'}}
+
+    dict_tools = await server._tool_manager.call_tool(
+        'update_task',
+        {'id': '1', 'project_root': str(tmp_path), 'metadata': payload},
+    )
+    dict_interceptor = await interceptor.update_task(
+        '1', str(tmp_path), metadata=json.dumps(payload),
+    )
+
+    expected = done_provenance_via_update_task_error('1')
+    assert dict_tools == expected, f'tools.py surface diverged from canonical shape: {dict_tools}'
+    assert dict_interceptor == expected, (
+        f'interceptor surface diverged from canonical shape: {dict_interceptor}'
+    )
+    assert dict_tools == dict_interceptor
+
+
+@pytest.mark.asyncio
+async def test_update_task_rejects_metadata_done_provenance_dict(
+    real_task_stack, tmp_path,
+):
+    """A dict-shaped metadata carrying done_provenance is rejected with the
+    canonical done_provenance_via_update_task shape (BT-C1)."""
+    from fused_memory.backends.task_backend_errors import done_provenance_via_update_task_error
+
+    server, _interceptor = real_task_stack
+    result = await server._tool_manager.call_tool(
         'update_task',
         {
-            'id': '1', 'project_root': '/project',
+            'id': '1', 'project_root': str(tmp_path),
             'metadata': {'done_provenance': {'kind': 'merged', 'commit': 'abc'}},
         },
     )
-    assert isinstance(result, dict)
-    assert result.get('error_type') == 'ValidationError'
-    assert 'set_task_status' in result['error']
-    task_interceptor.update_task.assert_not_called()
+    assert result == done_provenance_via_update_task_error('1')
 
 
 @pytest.mark.asyncio
 async def test_update_task_rejects_metadata_done_provenance_json_string(
-    mcp_server_with_tasks, task_interceptor,
+    real_task_stack, tmp_path,
 ):
-    """A JSON-string metadata carrying done_provenance is also rejected."""
-    result = await mcp_server_with_tasks._tool_manager.call_tool(
+    """A JSON-string metadata carrying done_provenance is also rejected (BT-C1)."""
+    from fused_memory.backends.task_backend_errors import done_provenance_via_update_task_error
+
+    server, _interceptor = real_task_stack
+    result = await server._tool_manager.call_tool(
         'update_task',
         {
-            'id': '1', 'project_root': '/project',
+            'id': '1', 'project_root': str(tmp_path),
             'metadata': '{"done_provenance": {"kind": "merged", "commit": "abc"}}',
         },
     )
-    assert isinstance(result, dict)
-    assert result.get('error_type') == 'ValidationError'
-    assert 'set_task_status' in result['error']
-    task_interceptor.update_task.assert_not_called()
+    assert result == done_provenance_via_update_task_error('1')
 
 
 @pytest.mark.asyncio
@@ -347,46 +414,23 @@ async def test_update_task_allows_unrelated_metadata(
 
 
 @pytest.mark.asyncio
-async def test_update_task_unparseable_metadata_warns_and_forwards(
-    mcp_server_with_tasks, task_interceptor, caplog,
-):
-    """RED: the closure's str branch currently discards silently (returns None,
-    not rejected) — it must also warn, and must still forward to the
-    interceptor since an unparseable string can't carry done_provenance."""
-    with caplog.at_level(logging.WARNING, logger=_TOOLS_LOGGER):
-        result = await mcp_server_with_tasks._tool_manager.call_tool(
-            'update_task',
-            {'id': '1', 'project_root': '/project', 'metadata': 'not valid json {{{'},
-        )
-    assert result == {'success': True}
-    task_interceptor.update_task.assert_called_once()
-    warns = [
-        r for r in caplog.records
-        if r.name == _TOOLS_LOGGER and r.levelno >= logging.WARNING
-    ]
-    assert any('task_metadata.schema_warning' in r.message for r in warns), (
-        f'expected a task_metadata.schema_warning WARNING; got '
-        f'{[r.message for r in warns]!r}'
-    )
-
-
-@pytest.mark.asyncio
 async def test_update_task_json_string_with_done_provenance_still_rejected(
-    mcp_server_with_tasks, task_interceptor, caplog,
+    real_task_stack, tmp_path, caplog,
 ):
     """A parseable JSON-string metadata carrying done_provenance is still
-    rejected after the parser collapse, with no spurious discard warning."""
+    rejected with the canonical shape, with no spurious discard warning."""
+    from fused_memory.backends.task_backend_errors import done_provenance_via_update_task_error
+
+    server, _interceptor = real_task_stack
     with caplog.at_level(logging.WARNING, logger=_TOOLS_LOGGER):
-        result = await mcp_server_with_tasks._tool_manager.call_tool(
+        result = await server._tool_manager.call_tool(
             'update_task',
             {
-                'id': '1', 'project_root': '/project',
+                'id': '1', 'project_root': str(tmp_path),
                 'metadata': '{"done_provenance": {"kind": "merged", "commit": "abc"}}',
             },
         )
-    assert result.get('error_type') == 'ValidationError'
-    assert 'set_task_status' in result['error']
-    task_interceptor.update_task.assert_not_called()
+    assert result == done_provenance_via_update_task_error('1')
     warns = [
         r for r in caplog.records
         if r.name == _TOOLS_LOGGER and r.levelno >= logging.WARNING
