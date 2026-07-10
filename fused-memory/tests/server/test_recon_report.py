@@ -2790,3 +2790,97 @@ class TestReconReportOverlengthTruncation:
         assert item['description'] == 'd'
         assert item['suggested_action'] == 'a'
 
+
+# ---------------------------------------------------------------------------
+# task-2410 step-3: delete_finding basic behavior — RED until step-4 adds
+# ReconReportState.delete_finding.
+# ---------------------------------------------------------------------------
+
+
+class TestReconReportDeleteFinding:
+    """ReconReportState.delete_finding mirrors delete_memory's semantics:
+    validate -> structured {'status': 'deleted', 'finding_id': ...} dict,
+    IRREVERSIBLE, scoped by run_id + finding_id.
+    """
+
+    def _make_state(self):
+        from fused_memory.server.recon_report import ReconReportState
+
+        t = [0.0]
+        return ReconReportState(ttl_seconds=300, clock=lambda: t[0]), t
+
+    def test_delete_finding_removes_it_from_assembled_report(self):
+        state, _ = self._make_state()
+        state.start_report(run_id='r1', stage='s1', project_id='dark_factory')
+        added = state.add_finding(
+            run_id='r1',
+            severity='low',
+            category='c',
+            description='d',
+            suggested_action='a',
+            task_id='42',
+            flag_type='f',
+        )
+        fid = added['finding_id']
+
+        result = state.delete_finding('r1', fid)
+        assert result == {'status': 'deleted', 'finding_id': fid}
+
+        report = state.get_assembled_report('r1', 's1')
+        assert report is not None
+        assert report['flagged_items'] == []
+
+    def test_delete_finding_unknown_run_id(self):
+        state, _ = self._make_state()
+        result = state.delete_finding('ghost', 'some-finding-id')
+        assert result['error'] == 'run_id_unknown'
+        assert result['error_type'] == 'ReconReportRunUnknown'
+
+    def test_delete_finding_unknown_finding_id(self):
+        state, _ = self._make_state()
+        state.start_report(run_id='r1', stage='s1', project_id='dark_factory')
+        result = state.delete_finding('r1', 'bogus-finding-id')
+        assert result['error'] == 'finding_unknown'
+        assert result['error_type'] == 'ReconReportFindingUnknown'
+
+    def test_deleted_finding_no_longer_resolvable(self):
+        state, _ = self._make_state()
+        state.start_report(run_id='r1', stage='s1', project_id='dark_factory')
+        added = state.add_finding(
+            run_id='r1',
+            severity='low',
+            category='c',
+            description='d',
+            suggested_action='a',
+            task_id='42',
+            flag_type='f',
+        )
+        fid = added['finding_id']
+
+        state.delete_finding('r1', fid)
+        assert state._resolve_finding('r1', fid) is None
+
+    def test_delete_finding_after_complete_is_rejected(self):
+        state, _ = self._make_state()
+        state.start_report(run_id='r1', stage='s1', project_id='dark_factory')
+        added = state.add_finding(
+            run_id='r1',
+            severity='low',
+            category='c',
+            description='d',
+            suggested_action='a',
+            task_id='42',
+            flag_type='f',
+        )
+        fid = added['finding_id']
+        state.complete('r1', 'summary')
+
+        result = state.delete_finding('r1', fid)
+        assert result['error'] == 'report_already_completed'
+        assert result['error_type'] == 'ReconReportAlreadyCompleted'
+
+        report = state.get_assembled_report('r1', 's1')
+        assert report is not None
+        assert len(report['flagged_items']) == 1
+        assert report['flagged_items'][0]['finding_id'] == fid
+
