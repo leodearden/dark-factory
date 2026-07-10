@@ -29,6 +29,7 @@ from fused_memory.maintenance.cross_graph_move import (
     MoveResult,
     classify_unique_wrong_edges,
     create_moved_node,
+    delete_source_node,
     format_vecf32_literal,
     merge_foreign_duplicate,
     move_entity_across_graphs,
@@ -1335,3 +1336,59 @@ class TestCreateMovedNode:
         target_mock.query.assert_not_awaited()
         source_mock.query.assert_not_awaited()
         fake_read_compact.assert_not_awaited()
+
+
+# ---------------------------------------------------------------------------
+# step-3: delete_source_node (Phase C) -- DETACH DELETE only, no CREATE
+# ---------------------------------------------------------------------------
+
+class TestDeleteSourceNode:
+    """delete_source_node(graphiti, uuid, source_graph) -- Phase C of the
+    three-phase apply. Issued only after Phase A (create_moved_node) and
+    Phase B (recreate_subgraph_relationships) have both completed for the
+    WHOLE batch, so every edge is guaranteed recreated before any source is
+    deleted -- this is what closes the co-moving-edge-loss bug.
+    """
+
+    @pytest.mark.asyncio
+    async def test_issues_single_detach_delete_against_source_only(
+        self, mock_config, make_backend, make_graph_mock,
+    ):
+        """Issues exactly one DETACH DELETE against _graph_for(source_graph)
+        with the uuid param, and touches NO other graph. Only source_graph is
+        registered in the routing map, so a call resolving any other graph
+        (e.g. target_graph) raises KeyError instead of silently succeeding.
+        """
+        backend = make_backend(mock_config)
+        source_mock = make_graph_mock()
+        backend._driver._get_graph = _route_graphs({SOURCE_GRAPH_FIXTURE: source_mock})
+
+        await delete_source_node(backend, NODE_UUID_FIXTURE, SOURCE_GRAPH_FIXTURE)
+
+        assert source_mock.query.await_count == 1
+        cypher = extract_cypher(source_mock.query.call_args)
+        params = extract_params(source_mock.query.call_args)
+        assert 'DETACH DELETE' in cypher
+        assert 'CREATE' not in cypher
+        assert params.get('uuid') == NODE_UUID_FIXTURE
+
+    @pytest.mark.asyncio
+    async def test_missing_source_node_is_idempotent_noop(
+        self, mock_config, make_backend, make_graph_mock,
+    ):
+        """A source node already gone (e.g. a re-run after a completed
+        apply) is a safe no-op -- deleting a non-existent uuid does not
+        raise, even when the underlying MATCH...DETACH DELETE matches
+        nothing (simulated here via a zero-nodes-deleted stat).
+        """
+        backend = make_backend(mock_config)
+        source_mock = make_graph_mock()
+        source_mock.query = AsyncMock(return_value=MagicMock(nodes_deleted=0))
+        backend._driver._get_graph = _route_graphs({SOURCE_GRAPH_FIXTURE: source_mock})
+
+        # Must not raise.
+        await delete_source_node(backend, NODE_UUID_FIXTURE, SOURCE_GRAPH_FIXTURE)
+
+        assert source_mock.query.await_count == 1
+        cypher = extract_cypher(source_mock.query.call_args)
+        assert 'DETACH DELETE' in cypher
