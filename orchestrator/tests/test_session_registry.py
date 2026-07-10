@@ -731,3 +731,78 @@ def test_main_launching_fail_soft_when_launcher_pid_not_numeric(
     assert capsys.readouterr().out.strip() == ''
     assert any(r.levelno >= logging.ERROR for r in caplog.records)
     assert not sr.sessions_dir(root=tmp_path).exists()
+
+
+# ---------------------------------------------------------------------------
+# Step-10: role leases (Attention Rail T7)
+# ---------------------------------------------------------------------------
+
+# --- paths / names / contract types -----------------------------------------
+
+
+def test_leases_dir_is_fleet_root_slash_leases(tmp_path: Path) -> None:
+    assert sr.leases_dir(root=tmp_path) == tmp_path / 'leases'
+
+
+def test_lease_path_for_name_joins_leases_dir_and_lease_suffix(tmp_path: Path) -> None:
+    path = sr.lease_path_for_name('watcher-df', root=tmp_path)
+    assert path == tmp_path / 'leases' / 'watcher-df.lease'
+
+
+def test_lease_path_for_name_preserves_hash_for_task_scoped_names(tmp_path: Path) -> None:
+    path = sr.lease_path_for_name('unblock-df#2085', root=tmp_path)
+    assert path == tmp_path / 'leases' / 'unblock-df#2085.lease'
+
+
+def test_lease_path_for_name_sanitizes_path_separators(tmp_path: Path) -> None:
+    # A name containing '/' must not escape leases_dir: it still resolves to
+    # a single file directly inside leases_dir (no nested directory, no
+    # traversal), unlike _SLUG_SANITIZE_RE this sanitizer PRESERVES '#'.
+    path = sr.lease_path_for_name('../../etc/passwd', root=tmp_path)
+    assert path.parent == sr.leases_dir(root=tmp_path)
+    assert '/' not in path.name
+
+
+def test_build_lease_name_watcher() -> None:
+    assert sr.build_lease_name('watcher', 'df') == 'watcher-df'
+
+
+def test_build_lease_name_recon_watcher() -> None:
+    assert sr.build_lease_name('recon-watcher', 'df') == 'recon-watcher-df'
+
+
+def test_build_lease_name_unblock_is_task_scoped_with_hash() -> None:
+    assert sr.build_lease_name('unblock', 'df', '2085') == 'unblock-df#2085'
+
+
+def test_lease_policy_has_exactly_stand_down_and_warn_and_proceed() -> None:
+    values = {member.value for member in sr.LeasePolicy}
+    assert values == {'stand-down', 'warn-and-proceed'}
+    assert sr.LeasePolicy.STAND_DOWN.value == 'stand-down'
+    assert sr.LeasePolicy.WARN_AND_PROCEED.value == 'warn-and-proceed'
+
+
+def test_lease_decision_has_exactly_acquired_stand_down_proceed() -> None:
+    values = {member.value for member in sr.LeaseDecision}
+    assert values == {'acquired', 'stand-down', 'proceed'}
+    assert sr.LeaseDecision.ACQUIRED.value == 'acquired'
+    assert sr.LeaseDecision.STAND_DOWN.value == 'stand-down'
+    assert sr.LeaseDecision.PROCEED.value == 'proceed'
+
+
+def test_lease_heartbeat_ttl_is_a_timedelta() -> None:
+    assert isinstance(sr.LEASE_HEARTBEAT_TTL, timedelta)
+
+
+def test_lease_holder_json_round_trip_is_lossless() -> None:
+    holder = sr.LeaseHolder(
+        session_slug='watcher-df-100', pid=4242, start_ts='2026-07-07T12:00:00+00:00'
+    )
+    assert sr.LeaseHolder.from_json(holder.to_json()) == holder
+
+
+def test_lease_holder_dict_round_trip_is_lossless() -> None:
+    holder = sr.LeaseHolder(
+        session_slug='watcher-df-100', pid=4242, start_ts='2026-07-07T12:00:00+00:00'
+    )
+    assert sr.LeaseHolder.from_dict(holder.to_dict()) == holder
