@@ -16,7 +16,7 @@ import shlex
 
 import pytest
 
-from orchestrator.verify_cmd import ToolKind, VerifyCmd, parse_config_command, render
+from orchestrator.verify_cmd import ToolKind, VerifyCmd, parse_config_command, render, scope_to
 
 
 class TestToolKind:
@@ -235,3 +235,66 @@ class TestRenderCanonicalFieldOrder:
             targets=('tests/test_x.py',),
         )
         assert render(cmd) == 'cd fused-memory && uv run --project shared pytest -v tests/test_x.py'
+
+
+class TestScopeTo:
+    """scope_to(cmd, files) replaces targets with *files*, worktree-root-relative."""
+
+    def test_replaces_targets_preserving_tool_flags_uv_project(self):
+        cmd = VerifyCmd(
+            tool=ToolKind.PYTEST,
+            uv_project='shared',
+            base_flags=('-v',),
+            targets=('tests/old.py',),
+        )
+        scoped = scope_to(cmd, ['tests/new_a.py', 'tests/new_b.py'])
+        assert scoped.tool is ToolKind.PYTEST
+        assert scoped.uv_project == 'shared'
+        assert scoped.base_flags == ('-v',)
+        assert scoped.targets == ('tests/new_a.py', 'tests/new_b.py')
+
+    def test_dash_prefixed_flags_not_harvested_into_targets(self):
+        """Migrates the _scope_command dash-token regression (verify.py's
+
+        pre-VerifyCmd scoper harvested any dash-prefixed remainder token as a
+        stray flag rather than leaving it out of the new target list; the
+        structural equivalent here is that base_flags parsed from the
+        original command must survive scope_to's targets-only replacement
+        untouched — no flag ever leaks into (or out of) `targets`.
+        """
+        cmd = parse_config_command('pytest -v tests/old.py')
+        assert cmd.base_flags == ('-v',)  # parsed once, not re-derived by scope_to
+        scoped = scope_to(cmd, ['tests/new.py'])
+        assert scoped.base_flags == ('-v',)
+        assert scoped.targets == ('tests/new.py',)
+
+    def test_noop_on_opaque(self):
+        """scope_to on an OPAQUE VerifyCmd is a no-op returning the same OPAQUE (P1)."""
+        cmd = parse_config_command('mypy src/')
+        assert cmd.tool is ToolKind.OPAQUE
+        assert scope_to(cmd, ['tests/new.py']) == cmd
+
+    def test_noop_on_raw_retained_chain(self):
+        """scope_to also no-ops on a recognised-but-unstructurable raw chain —
+
+        targets is repurposed by cargo_scope for crate flags on such chains,
+        so scope_to must not touch it.
+        """
+        raw = 'cargo test --workspace && cargo test --workspace'
+        cmd = parse_config_command(raw)
+        assert cmd.raw == raw
+        assert scope_to(cmd, ['tests/new.py']) == cmd
+
+    def test_empty_files_is_noop(self):
+        cmd = parse_config_command('pytest tests/old.py')
+        assert scope_to(cmd, []) == cmd
+
+    def test_pyright_merge_gate_scoping(self):
+        """Mirrors test_pyright_merge_gate.py: scoping a subproject's pyright
+
+        command to the changed test file(s) alone must produce a runnable
+        `pyright <changed files>` invocation.
+        """
+        cmd = parse_config_command('uv run --project fused-memory pyright fused-memory/')
+        scoped = scope_to(cmd, ['fused-memory/tests/test_pyright_gate_probe.py'])
+        assert render(scoped) == 'uv run --project fused-memory pyright fused-memory/tests/test_pyright_gate_probe.py'
