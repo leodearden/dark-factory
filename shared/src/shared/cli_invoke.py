@@ -1656,6 +1656,10 @@ async def _run_subprocess(
                     else max(0.0, startup_grace_secs - elapsed)
                 )
                 if extension_engaged:
+                    # extension_engaged's own definition requires both params to
+                    # be set (see derivation above/below) — narrow for the type
+                    # checker, which cannot infer that from the bool flag alone.
+                    assert working_idle_secs is not None and absolute_cap_secs is not None
                     # idle_bound: the per-role ceiling is the FLOOR of the idle
                     # window (B6 long-tool-call safety) — never smaller than
                     # today's ceiling.
@@ -1749,6 +1753,16 @@ async def _run_subprocess(
                     raise TimeoutError
 
                 if extension_engaged:
+                    # extension_engaged ⟹ seen_turn ⟹ last_progress_turns/
+                    # last_progress_monotonic were set atomically with seen_turn
+                    # (above) and are never reset to None; working_idle_secs/
+                    # absolute_cap_secs are part of extension_engaged's own
+                    # definition — narrow all three for the type checker.
+                    assert (
+                        working_idle_secs is not None
+                        and absolute_cap_secs is not None
+                        and last_progress_monotonic is not None
+                    )
                     idle_bound = (
                         max(working_idle_secs, timeout_seconds)
                         if timeout_seconds is not None

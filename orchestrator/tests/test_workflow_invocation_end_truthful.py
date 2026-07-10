@@ -69,7 +69,7 @@ def _make_workflow(*, event_store: _RecordingEventStore) -> TaskWorkflow:
         scheduler=MagicMock(),
         briefing=MagicMock(),
         mcp=MagicMock(),
-        event_store=event_store,
+        event_store=event_store,  # type: ignore[arg-type]
     )
 
 
