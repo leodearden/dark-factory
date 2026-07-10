@@ -741,6 +741,45 @@ async def move_entity_across_graphs(
     )
 
 
+async def delete_source_node(graphiti: Any, uuid: str, source_graph: str) -> None:
+    """Phase C of the three-phase barrier-ordered apply (CGL-η follow-up,
+    task 2415): ``DETACH DELETE`` *uuid*'s Entity node from *source_graph* --
+    and ONLY that.
+
+    Reuses the exact DETACH DELETE Cypher ``move_entity_across_graphs``
+    issues as its final mutation. Callers driving the three-phase apply must
+    call this ONLY after every ``create_moved_node`` (Phase A) and
+    ``recreate_subgraph_relationships`` (Phase B) call for the WHOLE batch
+    has completed -- deleting a source before its edges are recreated
+    elsewhere is exactly the bug this task fixes (a co-moving neighbour's
+    shared edge silently skipped by the OTHER endpoint's target CREATE, then
+    destroyed here before it is ever recreated).
+
+    Touches ONLY source_graph -- never resolves or queries target_graph.
+    Idempotent: FalkorDB's ``MATCH ... DETACH DELETE`` matches (and deletes)
+    nothing when the node is already gone, so a re-run after a completed
+    apply -- or a retry after Phase C partially completed -- is a safe
+    no-op; this function performs no existence pre-check of its own.
+
+    Args:
+        graphiti: An initialized GraphitiBackend (or compatible object
+            exposing ``_graph_for``).
+        uuid: UUID of the Entity node to delete from source_graph.
+        source_graph: Graph to delete the node from.
+
+    Returns:
+        None.
+    """
+    source = graphiti._graph_for(source_graph)
+    await source.query(
+        'MATCH (n:Entity {uuid: $uuid}) DETACH DELETE n',
+        {'uuid': uuid},
+    )
+    logger.info(
+        'delete_source_node: deleted uuid=%s source=%s', uuid, source_graph,
+    )
+
+
 # ---------------------------------------------------------------------------
 # merge_foreign_duplicate (S6)
 # ---------------------------------------------------------------------------
