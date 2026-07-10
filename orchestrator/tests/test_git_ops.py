@@ -1955,6 +1955,35 @@ class TestStructuralContamination:
         # The sidecar is untouched by the commit.
         assert (meta / 'plan.json').exists()
 
+    async def test_commit_stays_clean_under_relocated_metadata(self, git_ops: GitOps):
+        """GitOps.commit() must produce a clean tree under the relocated-
+        metadata regime WITHOUT relying on the `:!.task` staging exclusion
+        or the post-staging unstage net (both removed later in this task) —
+        the retained `.task/.gitignore` (written by `_ensure_task_gitignore`
+        during `create_worktree`) self-ignores the leftover `<lane>/.task/`,
+        so a plain `git add -A` inside commit() stages nothing from it.
+        """
+        wt_info = await git_ops.create_worktree('commit-relocated-metadata')
+        lane = wt_info.path
+
+        meta = TaskArtifacts.meta_root_for(git_ops.worktree_base, lane.name)
+        ta = TaskArtifacts(lane, meta)
+        ta.init('crm-1', 'Commit Relocated Metadata', 'test')
+        ta.write_plan({'task_id': 'crm-1', 'title': 'Commit Relocated Metadata', 'steps': []})
+
+        (lane / 'hello.py').write_text('print(1)\n')
+        sha = await git_ops.commit(lane, 'Add hello.py')
+        assert sha is not None
+
+        rc, out, _ = await _run(['git', 'ls-tree', '-r', '--name-only', sha], cwd=lane)
+        assert rc == 0
+        assert 'hello.py' in out
+        for forbidden in ('.task', '.task-meta', 'plan.json', 'metadata.json', 'iterations.jsonl'):
+            assert forbidden not in out, f'{forbidden!r} leaked into the commit() tree'
+
+        # The sidecar is untouched by the commit.
+        assert (meta / 'plan.json').exists()
+
 
 @pytest.mark.asyncio
 class TestWorkingTreeSync:
