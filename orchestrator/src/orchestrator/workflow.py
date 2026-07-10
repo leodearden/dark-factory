@@ -7296,6 +7296,15 @@ Update the plan to address the blocking issues. You may add new steps to the `st
                 backend=backend_val,
                 timeout_seconds=timeout_val,
                 startup_grace_secs=timeouts_cfg.startup_grace_secs,
+                # Working-regime progress extension (task 2360 fix #1): once the
+                # transcript proves liveness (≥1 turn), the watchdog no longer
+                # kills at the flat per-role timeout_val ceiling — it extends to
+                # max(working_idle_secs, timeout_val), bounded above by the
+                # absolute cap.  _invoke is the SHARED chokepoint for every role,
+                # so this engages uniformly; safe by construction since the
+                # extended idle bound is always >= the old per-role ceiling.
+                working_idle_secs=timeouts_cfg.working_idle_secs,
+                absolute_cap_secs=self.config.invocation_timeout,
                 session_id=session_id_val,
                 resume_session_id=resume_session_id,
                 # Judge always hits Claude API — propagating ANTHROPIC_BASE_URL
