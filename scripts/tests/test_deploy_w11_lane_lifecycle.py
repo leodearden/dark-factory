@@ -118,6 +118,16 @@ def main(argv):
     state.setdefault("calls", []).append(argv[1:])
 
     if verb == "restart":
+        # Ordering witness for the PRD "adopt-then-restart" migration
+        # caution (task 2263 step-11): snapshot -- AT THE MOMENT of this
+        # restart call -- whether the adopt step already populated
+        # .lane-state/, so a test can prove adopt ran BEFORE restart
+        # rather than merely that both happened somewhere in the run.
+        lane_state_dir = os.environ.get("FAKE_SYSTEMCTL_LANE_STATE_DIR")
+        if lane_state_dir:
+            state["lane_state_populated_at_restart"] = bool(
+                os.path.isdir(lane_state_dir) and os.listdir(lane_state_dir)
+            )
         state["MainPID"] = state.get("MainPID", 1000) + 1
         state["ActiveState"] = "active"
         state["ActiveEnterTimestampMonotonic"] = (
@@ -292,7 +302,9 @@ def _run_script(worktree_base, *args, env=None):
     defaults to a short 5s -- irrelevant to a successful restart, which the
     fake answers on its very first poll, but keeps a regression bounded
     instead of hanging up to restart-orchestrator.sh's 30s production
-    default.
+    default. FAKE_SYSTEMCTL_LANE_STATE_DIR points at this worktree_base's
+    own `.lane-state/` dir, so the fake's `restart` verb can witness
+    whether adopt already populated it (the step-11 ordering proof).
 
     Systemctl invocations are inspectable afterward via
     `_systemctl_calls(worktree_base)`.
@@ -304,6 +316,7 @@ def _run_script(worktree_base, *args, env=None):
     full_env["PATH"] = f"{bin_dir}{os.pathsep}{full_env['PATH']}"
     full_env["FAKE_SYSTEMCTL_STATE"] = str(state_path)
     full_env["WORKTREE_DIR"] = str(worktree_base)
+    full_env["FAKE_SYSTEMCTL_LANE_STATE_DIR"] = str(worktree_base / LANE_STATE_DIRNAME)
     full_env.setdefault("RESTART_VERIFY_TIMEOUT", "5")
     if env:
         full_env.update(env)
@@ -542,4 +555,75 @@ def test_check_and_dry_run_preview_without_mutating(tmp_path, flag):
     assert after_listing == before_listing, (
         f"Expected the base's on-disk listing to be byte-for-byte unchanged; "
         f"before={before_listing!r} after={after_listing!r}"
+    )
+
+
+# ---------------------------------------------------------------------------
+# step-11: RED -- apply performs restart+verify (adopt BEFORE restart), and
+# unknown-arg rejection
+# ---------------------------------------------------------------------------
+
+def test_apply_restarts_and_verifies_after_adopt(tmp_path):
+    """A full apply run (no flags) against a bound lane must, after writing
+    that lane's `.lane-state/` record, delegate to restart-orchestrator.sh's
+    blocking `systemctl --user restart <unit>` (verified fresh via the fake's
+    always-succeeds ActiveEnterTimestampMonotonic bump). The fake's ordering
+    witness (`lane_state_populated_at_restart`, set at the moment `restart`
+    is invoked) must be True -- proving the PRD "adopt-then-restart"
+    ordering (migration caution / decomposition kappa): read reality -> write
+    records -> THEN flip, not merely that both steps happened somewhere in
+    the run."""
+    worktree_base = _build_worktree_base(tmp_path, [
+        {"name": "_lane-7", "branch": "task/1234", "plan": {"title": "T"}},
+    ])
+
+    result = _run_script(worktree_base)
+
+    assert result.returncode == 0, (
+        f"Expected apply to exit 0; got {result.returncode}\n"
+        f"stdout={result.stdout!r} stderr={result.stderr!r}"
+    )
+
+    calls = _systemctl_calls(worktree_base)
+    restart_calls = [c for c in calls if c and c[0] == "restart"]
+    assert restart_calls, (
+        f"Expected apply to invoke `systemctl restart`; calls={calls!r}\n"
+        f"stdout={result.stdout!r} stderr={result.stderr!r}"
+    )
+    assert restart_calls[0] == ["restart", UNIT], (
+        f"Expected `restart {UNIT}`; got {restart_calls[0]!r}"
+    )
+
+    state = json.loads(_systemctl_state_path(worktree_base.parent).read_text())
+    assert state.get("lane_state_populated_at_restart") is True, (
+        f"Expected .lane-state/ to already be populated at the moment "
+        f"systemctl restart was invoked (adopt must run BEFORE restart); "
+        f"state={state!r}"
+    )
+    assert _read_lane_record(worktree_base, "_lane-7") is not None, (
+        "Expected the lane's record to exist after a successful apply"
+    )
+
+
+def test_unknown_argument_is_rejected_without_restarting(tmp_path):
+    """An unrecognized argument (e.g. --bogus) exits non-zero with a stderr
+    message and performs no restart -- arg-parsing must reject before adopt
+    or restart run at all."""
+    worktree_base = _build_worktree_base(tmp_path, [
+        {"name": "_lane-7", "branch": "task/1234", "plan": {"title": "T"}},
+    ])
+
+    result = _run_script(worktree_base, "--bogus")
+
+    assert result.returncode != 0, (
+        f"Expected --bogus to be rejected with a non-zero exit; got 0\n"
+        f"stdout={result.stdout!r} stderr={result.stderr!r}"
+    )
+    assert result.stderr.strip(), (
+        f"Expected a non-empty stderr message for the rejected argument; "
+        f"stdout={result.stdout!r} stderr={result.stderr!r}"
+    )
+    assert _systemctl_calls(worktree_base) == [], (
+        f"Expected no systemctl invocation when an unknown arg is rejected; "
+        f"got calls={_systemctl_calls(worktree_base)!r}"
     )
