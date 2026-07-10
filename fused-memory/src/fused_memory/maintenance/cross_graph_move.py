@@ -780,6 +780,26 @@ class SubgraphEdgeResult:
     dropped_cross_target: list = field(default_factory=list)
 
 
+async def _entity_present_in_graph(graph: Any, uuid: str) -> bool:
+    """Read-only presence probe: True iff an ``:Entity`` node with *uuid*
+    exists in *graph*.
+
+    Used by ``recreate_subgraph_relationships`` to decide whether a
+    RELATES_TO edge's non-migrating endpoint (one with no spec of its own in
+    this batch, so it has no ``target_of`` entry) is deliverable into the
+    OTHER, migrating endpoint's resolved target -- i.e. whether it is
+    already a home-resident there. Scoped to ``:Entity`` (unlike
+    ``scripts/migrate_cross_graph_leak.py``'s broader, any-label
+    ``node_present_in_graph``) because RELATES_TO only ever connects
+    Entity<->Entity, matching this module's Entity-only scope.
+    """
+    result = await graph.ro_query(
+        'MATCH (n:Entity {uuid: $uuid}) RETURN n.uuid LIMIT 1',
+        {'uuid': uuid},
+    )
+    return bool(result.result_set)
+
+
 async def _relates_to_edge_already_in_target(graph: Any, edge_uuid: str) -> bool:
     """Read-only presence probe: True iff a RELATES_TO edge with *edge_uuid*
     already exists in *graph* (either direction).
@@ -816,30 +836,37 @@ async def recreate_subgraph_relationships(graphiti: Any, specs: list[dict]) -> S
     processed; see this module's "Residual hazard" note and
     ``scripts/migrate_cross_graph_leak.py``'s ``run()``).
 
-    MOVE edges (this step): for every non-MERGE spec, every incident
-    RELATES_TO edge (full property row, read via the same
-    ``startNode``/``endNode`` SELECT ``move_entity_across_graphs`` uses) and
-    every incident Episodic MENTIONS link is read from the spec's
-    ``source_graph``. Edges are accumulated into a single dict keyed by edge
-    uuid -- so a co-moving edge incident to TWO specs in this batch (read
-    once per incident spec) is recreated only ONCE, not twice. For each
-    distinct edge, both endpoints' target graphs are looked up via a
-    ``target_of`` map built from every spec's own ``uuid``/``target_graph``
-    -- when both resolve to the SAME target graph T, the edge is recreated
-    in T (byte-exact ``fact_embedding`` via the raw ``--compact`` transport,
-    ``group_id`` rewritten to T -- mirroring ``create_moved_node``'s
+    MOVE edges: for every non-MERGE spec, every incident RELATES_TO edge
+    (full property row, read via the same ``startNode``/``endNode`` SELECT
+    ``move_entity_across_graphs`` uses) and every incident Episodic MENTIONS
+    link is read from the spec's ``source_graph``. Edges are accumulated
+    into a single dict keyed by edge uuid -- so a co-moving edge incident to
+    TWO specs in this batch (read once per incident spec) is recreated only
+    ONCE, not twice. For each distinct edge, both endpoints' target graphs
+    are looked up via a ``target_of`` map built from every spec's own
+    ``uuid``/``target_graph``; when an endpoint has no spec of its own (a
+    non-migrating home-resident), its deliverability is decided by a
+    presence probe (``_entity_present_in_graph``) against the OTHER,
+    migrating endpoint's resolved target. When both endpoints resolve to the
+    SAME target graph T, the edge is recreated in T (byte-exact
+    ``fact_embedding`` via the raw ``--compact`` transport, ``group_id``
+    rewritten to T -- mirroring ``create_moved_node``'s
     ``rewrite_group_id=target_graph`` convention for Phase A), skipped as a
     genuine idempotent no-op if an edge with that uuid already exists in T
     (``_relates_to_edge_already_in_target``), or counted in
     ``edges_skipped`` if the target CREATE's own ``relationships_created``
     stat reports the other endpoint was silently unmatched. When the two
-    endpoints do NOT resolve to the same target (including an endpoint this
-    batch has no spec for at all), this step does not yet recreate or
-    record the edge -- cross-target detection and the ``dropped_
-    cross_target`` record are added by the step-8 extension. MENTIONS are
-    recreated the same way ``move_entity_across_graphs`` does (MATCH the
-    episode + entity in the entity's resolved target, ``relationships_
-    created`` distinguishes recreate from silent skip).
+    endpoints do NOT resolve to one shared target graph (differing targets,
+    or an endpoint that is neither migrating nor already present in the
+    other's target) -- cross-graph RELATES_TO edges are unsupported -- the
+    edge is recreated in NEITHER graph and a dropped-with-reason record
+    (edge uuid, both endpoint uuids, both resolved targets, a reason) is
+    appended to ``dropped_cross_target`` instead, so it is surfaced for
+    human review rather than silently lost the way a bare ``edges_skipped``
+    count would be. MENTIONS are recreated the same way
+    ``move_entity_across_graphs`` does (MATCH the episode + entity in the
+    entity's resolved target, ``relationships_created`` distinguishes
+    recreate from silent skip).
 
     MERGE-fold handling (arrives in the step-10 extension): a MERGE spec's
     unique wrong-copy edges are not yet folded into its home copy here.
@@ -900,10 +927,40 @@ async def recreate_subgraph_relationships(graphiti: Any, specs: list[dict]) -> S
 
         src_target = target_of.get(src_uuid)
         dst_target = target_of.get(dst_uuid)
+
+        # A non-migrating endpoint (no spec of its own -- absent from
+        # target_of) is deliverable only if it is already a home-resident in
+        # the OTHER (migrating) endpoint's resolved target -- a presence
+        # probe decides it. At least one of src_target/dst_target is always
+        # resolved here, since every edge in edges_by_uuid was read via a
+        # MOVE spec's own incident-edge query (so that spec's uuid is always
+        # one of the two endpoints).
+        if src_target is None and dst_target is not None:
+            if await _entity_present_in_graph(graphiti._graph_for(dst_target), src_uuid):
+                src_target = dst_target
+        elif dst_target is None and src_target is not None:
+            if await _entity_present_in_graph(graphiti._graph_for(src_target), dst_uuid):
+                dst_target = src_target
+
         if src_target is None or dst_target is None or src_target != dst_target:
-            # Cross-target / non-migrating-endpoint classification is added
-            # by the step-8 extension (dropped_cross_target) -- left
-            # unhandled here (step-6 scope: same-target edges only).
+            # The two endpoints do not share one destination graph --
+            # cross-graph RELATES_TO edges are unsupported (FalkorDB edges
+            # are single-graph), so this edge cannot be recreated in EITHER
+            # graph. Reported for human review, never silently lost (unlike
+            # the old move_entity_across_graphs' edges_skipped, which only
+            # ever surfaced a bare count with no record of why).
+            result.dropped_cross_target.append({
+                'edge_uuid': edge_uuid,
+                'src_uuid': src_uuid,
+                'dst_uuid': dst_uuid,
+                'src_target': src_target,
+                'dst_target': dst_target,
+                'reason': (
+                    'edge endpoints resolve to different target graphs (or '
+                    'an undeliverable non-migrating endpoint) -- cross-graph '
+                    'RELATES_TO edges are unsupported; needs manual review'
+                ),
+            })
             continue
 
         target_graph_name = src_target
