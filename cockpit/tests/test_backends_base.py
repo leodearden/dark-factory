@@ -33,7 +33,7 @@ class TestDisplayTarget:
         target = DisplayTarget(kind='tmux', tmux_target='session:0')
 
         with pytest.raises(dataclasses.FrozenInstanceError):
-            target.kind = 'wm'
+            target.kind = 'wm'  # type: ignore[misc]
 
     def test_duck_typed_object_exposes_same_attribute_surface(self):
         """Backends read attrs off any target-shaped object, not isinstance — see module docstring."""
@@ -79,7 +79,7 @@ class TestZone:
         zone = Zone(x=0, y=0, width=100, height=100)
 
         with pytest.raises(dataclasses.FrozenInstanceError):
-            zone.x = 1
+            zone.x = 1  # type: ignore[misc]
 
 
 class TestFocusResult:
@@ -105,7 +105,7 @@ class TestFocusResult:
         result = FocusResult(ok=True)
 
         with pytest.raises(dataclasses.FrozenInstanceError):
-            result.ok = False
+            result.ok = False  # type: ignore[misc]
 
 
 class TestCommandResult:
@@ -133,7 +133,7 @@ class TestCommandResult:
         result = CommandResult(returncode=0)
 
         with pytest.raises(dataclasses.FrozenInstanceError):
-            result.returncode = 1
+            result.returncode = 1  # type: ignore[misc]
 
 
 class TestFocusArrangeBackendProtocol:
