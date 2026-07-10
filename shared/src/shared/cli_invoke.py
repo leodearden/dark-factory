@@ -1331,10 +1331,22 @@ def _parse_claude_output(result: _SubprocessResult) -> AgentResult:
     return path.
     """
     if not result.stdout.strip():
+        # Distinct subtype (task 2360 fix #3): a wall-clock timeout that DID
+        # make real agentic progress (transcript_turns>0) is not the same
+        # failure as a genuine pre-turn wedge (transcript_turns==0/None) —
+        # conflating them under 'error_empty_output' fabricates "no real work
+        # done" for a productive run (reify-4827). Mirrors
+        # is_timed_out_with_progress's condition inline since that predicate
+        # takes an AgentResult, not this _SubprocessResult.
+        empty_output_subtype = (
+            'error_timeout_killed_with_progress'
+            if result.timed_out and (result.transcript_turns or 0) > 0
+            else 'error_empty_output'
+        )
         return AgentResult(
             success=False,
             output='Agent produced no output',
-            subtype='error_empty_output',
+            subtype=empty_output_subtype,
             stderr=result.stderr,
             timed_out=result.timed_out,
             duration_ms=result.duration_ms,

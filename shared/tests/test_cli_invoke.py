@@ -1676,13 +1676,20 @@ class TestTranscriptTurnsFieldAndPropagation:
         assert r.transcript_turns is None
 
     def test_propagation_empty_stdout_path(self):
-        """Empty stdout path: _SubprocessResult(transcript_turns=7) → AgentResult.transcript_turns==7."""
+        """Empty stdout path: _SubprocessResult(transcript_turns=7) → AgentResult.transcript_turns==7.
+
+        subtype is 'error_timeout_killed_with_progress' (not
+        'error_empty_output') because timed_out=True with transcript_turns=7
+        is a productive run killed at the wall, not a wedge (task 2360 fix
+        #3) — see TestParseClaudeOutputDistinctTimeoutSubtype for the
+        dedicated coverage of this branch.
+        """
         sub = _SubprocessResult(
             stdout='', stderr='', returncode=1,
             duration_ms=100, timed_out=True, transcript_turns=7,
         )
         agent = _parse_claude_output(sub)
-        assert agent.subtype == 'error_empty_output'
+        assert agent.subtype == 'error_timeout_killed_with_progress'
         assert agent.transcript_turns == 7
 
     def test_propagation_json_decode_error_path(self):
