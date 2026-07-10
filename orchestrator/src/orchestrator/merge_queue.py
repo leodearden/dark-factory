@@ -5642,6 +5642,15 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                 entries.append(e)
         return entries
 
+    def _verify_frontier_depth(self) -> int:
+        """Return the verify-frontier stack height (task 2340, reuses ε=1890).
+
+        depth 0 = a head verify against real main; depth d = d speculated
+        items already frozen/verifying ahead of the item joining the
+        frontier.  Pure/synchronous (no await) — mirrors frozen_prefix().
+        """
+        return len(self._frozen_inflight_entries())
+
     def frozen_prefix(self) -> tuple[str, ...]:
         """Return request_ids of the frozen prefix in submission order (ε=1890).
 
