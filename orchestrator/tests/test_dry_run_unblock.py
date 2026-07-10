@@ -1131,6 +1131,114 @@ class TestInfraFailureClassification:
 
 
 # ---------------------------------------------------------------------------
+# task 2360 step-15: truthful proposal_text for a productive wall-clock kill
+# ---------------------------------------------------------------------------
+
+class TestTruthfulInfraFailureProposalText:
+    """A timed-out-with-progress investigation (reify-4827: the watchdog
+    killed a productive, many-turn run at the wall-clock ceiling) still
+    lands on 'infra_failure' — TestInfraFailureClassification's behavior is
+    unchanged by this step — but proposal_text must say so truthfully:
+    surfacing the transcript_turns count and routing the reader toward
+    "raise the wall / task is slow" rather than the bare "retryable infra"
+    framing, which reads as a contradiction next to a productive, many-turn
+    run (reify-4827 was killed and resumed into exhaustion precisely because
+    nothing distinguished it from a genuine no-progress wedge).
+    """
+
+    @pytest.mark.asyncio
+    async def test_timed_out_with_progress_proposal_text_mentions_turns_and_wall_clock(
+        self, tmp_path,
+    ):
+        from orchestrator.dry_run_unblock import run_dry_run_unblock
+
+        agent_result = _make_agent_result(
+            success=False,
+            subtype='error_timeout_killed_with_progress',
+            output='',
+            timed_out=True,
+            duration_ms=1200000,
+            transcript_turns=42,
+            session_id='sess-productive',
+            stderr='...Absolute ceiling reached after 1200.0s...',
+            structured_output=None,
+        )
+
+        scheduler = MagicMock()
+        scheduler.update_task = AsyncMock(return_value=True)
+
+        with patch('orchestrator.dry_run_unblock.invoke_agent',
+                   new=AsyncMock(return_value=agent_result)):
+            await run_dry_run_unblock(
+                task_id='705',
+                worktree=str(tmp_path),
+                reason='verify exhausted',
+                detail='',
+                scheduler=scheduler,
+                mcp=MagicMock(),
+                config=_make_config(),
+            )
+
+        scheduler.update_task.assert_awaited_once()
+        entry = scheduler.update_task.call_args.args[1]['dry_run_proposals'][0]
+
+        # Still classified infra_failure — TestInfraFailureClassification's
+        # behavior is unchanged by this step.
+        assert entry['status'] == 'infra_failure'
+        assert entry['transcript_turns'] == 42
+
+        proposal_text = entry['proposal_text']
+        # Truthful: surfaces the transcript_turns count...
+        assert 'transcript_turns=42' in proposal_text
+        # ...distinguishes a productive wall-clock kill from a wedge...
+        assert 'not a wedge' in proposal_text
+        # ...and routes the reader toward "raise the wall / task is slow"
+        # rather than the generic "retryable infra" framing alone.
+        assert 'raise the wall' in proposal_text or 'task is slow' in proposal_text
+
+    @pytest.mark.asyncio
+    async def test_zero_turn_wedge_proposal_text_unchanged(self, tmp_path):
+        """Regression guard: a genuine zero-turn wedge (no progress made)
+        must NOT gain the productive-wall-clock-kill wording — only a
+        timed-out-with-progress result does.
+        """
+        from orchestrator.dry_run_unblock import run_dry_run_unblock
+
+        agent_result = _make_agent_result(
+            success=False,
+            subtype='error_empty_output',
+            output='Agent produced no output',
+            timed_out=True,
+            duration_ms=1200000,
+            transcript_turns=0,
+            session_id='sess-wedge',
+            stderr='...Absolute ceiling reached after 1200.0s...',
+            structured_output=None,
+        )
+
+        scheduler = MagicMock()
+        scheduler.update_task = AsyncMock(return_value=True)
+
+        with patch('orchestrator.dry_run_unblock.invoke_agent',
+                   new=AsyncMock(return_value=agent_result)):
+            await run_dry_run_unblock(
+                task_id='706',
+                worktree=str(tmp_path),
+                reason='verify exhausted',
+                detail='',
+                scheduler=scheduler,
+                mcp=MagicMock(),
+                config=_make_config(),
+            )
+
+        entry = scheduler.update_task.call_args.args[1]['dry_run_proposals'][0]
+        assert entry['status'] == 'infra_failure'
+        proposal_text = entry['proposal_text']
+        assert 'raise the wall' not in proposal_text
+        assert 'task is slow' not in proposal_text
+
+
+# ---------------------------------------------------------------------------
 # task 2020 step-7: exception fallback carries None-safe diagnostic keys
 # ---------------------------------------------------------------------------
 
