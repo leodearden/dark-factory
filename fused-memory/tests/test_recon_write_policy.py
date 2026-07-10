@@ -63,3 +63,49 @@ class TestVerdict:
         assert error_dict['task_id'] == '1'
         assert error_dict['op'] == 'update_task'
         assert error_dict['live_status'] == 'done'
+
+
+# ---------------------------------------------------------------------------
+# check() helper
+# ---------------------------------------------------------------------------
+
+
+def _check(op: str, **overrides) -> recon_write_policy.Verdict:
+    """Call check() with sensible defaults; override any kwarg via overrides."""
+    kwargs = {
+        'task_id': '1',
+        'project_root': '/p',
+        'agent_id': 'recon-stage-x',
+        'target_status': None,
+        'live_status': 'pending',
+        'snapshot_token': None,
+    }
+    kwargs.update(overrides)
+    return recon_write_policy.check(op, **kwargs)
+
+
+# ---------------------------------------------------------------------------
+# check() gate 1 — terminal (update_task only)
+# ---------------------------------------------------------------------------
+
+
+class TestCheckGate1Terminal:
+    def test_update_task_on_done_task_rejects(self):
+        verdict = _check('update_task', live_status='done')
+        assert verdict.is_rejection is True
+        assert verdict.error_type == 'ReconTerminalWriteRejected'
+
+    def test_update_task_on_cancelled_task_rejects(self):
+        verdict = _check('update_task', live_status='cancelled')
+        assert verdict.is_rejection is True
+        assert verdict.error_type == 'ReconTerminalWriteRejected'
+
+    def test_update_task_on_in_progress_task_is_ok(self):
+        verdict = _check('update_task', live_status='in-progress')
+        assert verdict.is_rejection is False
+
+    def test_set_task_status_op_is_not_scoped_by_gate_1(self):
+        """Gate 1 is update_task-only: a set_task_status call against a done
+        task must never surface ReconTerminalWriteRejected."""
+        verdict = _check('set_task_status', target_status='pending', live_status='done')
+        assert verdict.error_type != 'ReconTerminalWriteRejected'
