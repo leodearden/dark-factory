@@ -27,6 +27,7 @@ from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+from _orch_helpers import mock_lock_table, wire_scheduler_liveness_mock
 from escalation.models import Escalation
 from escalation.queue import EscalationQueue
 from escalation.server import create_server
@@ -79,6 +80,13 @@ def harness(tmp_path: Path, mock_orch_config) -> Harness:
         h = Harness(mock_orch_config)
 
     h.scheduler = MagicMock()
+    # Wire real (non-auto-mock) liveness-accessor behaviour (task 2235:
+    # harness.py now calls scheduler.is_dispatched()/.is_actively_held()/
+    # .workflow_cancel_recent() instead of reaching into _dispatched/
+    # lock_table._held/_workflow_cancel_at directly) so the stranded-sweep
+    # and cluster-action tests below exercise real semantics instead of an
+    # auto-mocked (always-truthy) stub.
+    wire_scheduler_liveness_mock(h.scheduler)
     h.scheduler.get_status = AsyncMock(return_value='blocked')
     h.scheduler.set_task_status = AsyncMock()
     h.scheduler.get_task = AsyncMock(return_value={'id': '42', 'metadata': {}})
@@ -531,8 +539,7 @@ class TestClusterActionsB4B5:
         harness.git_ops.is_ancestor = AsyncMock(return_value=False)
         harness.git_ops.find_merge_marker = AsyncMock(return_value=None)
         harness.scheduler._dispatched = set()
-        harness.scheduler.lock_table = MagicMock()
-        harness.scheduler.lock_table._held = set()
+        harness.scheduler.lock_table = mock_lock_table()
 
         # Positive control: a 'blocked' task with NO open escalation → sweep DOES file.
         # Proves the sweep actually ran and members were skipped by Fix #1b (open escalation),
@@ -614,8 +621,7 @@ class TestClusterActionsB4B5:
         harness.git_ops.is_ancestor = AsyncMock(return_value=False)
         harness.git_ops.find_merge_marker = AsyncMock(return_value=None)
         harness.scheduler._dispatched = set()
-        harness.scheduler.lock_table = MagicMock()
-        harness.scheduler.lock_table._held = set()
+        harness.scheduler.lock_table = mock_lock_table()
         harness.scheduler.get_task = AsyncMock(return_value=None)
         harness.scheduler.set_task_status = AsyncMock()
 
@@ -961,8 +967,7 @@ class TestStrandedSweepB10B15:
         harness.git_ops.is_ancestor = AsyncMock(return_value=False)
         harness.git_ops.find_merge_marker = AsyncMock(return_value=None)
         harness.scheduler._dispatched = set()
-        harness.scheduler.lock_table = MagicMock()
-        harness.scheduler.lock_table._held = set()
+        harness.scheduler.lock_table = mock_lock_table()
         harness.scheduler.get_task = AsyncMock(return_value=None)
         harness.scheduler.get_statuses = AsyncMock(
             return_value=({task_id: 'blocked'}, None)
@@ -1010,8 +1015,7 @@ class TestStrandedSweepB10B15:
         harness.git_ops.is_ancestor = AsyncMock(return_value=False)
         harness.git_ops.find_merge_marker = AsyncMock(return_value=None)
         harness.scheduler._dispatched = set()
-        harness.scheduler.lock_table = MagicMock()
-        harness.scheduler.lock_table._held = set()
+        harness.scheduler.lock_table = mock_lock_table()
         harness.scheduler.get_task = AsyncMock(return_value=None)
         harness.scheduler.get_statuses = AsyncMock(
             return_value=({task_id: 'blocked'}, None)

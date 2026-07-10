@@ -27,6 +27,7 @@ from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+from _orch_helpers import wire_scheduler_liveness_mock
 from _serial_merge_worker import MergeWorker
 
 from orchestrator.config import GitConfig, OrchestratorConfig
@@ -1112,6 +1113,12 @@ class TestScenario6ParkPrefixDerail:
 
         # α/β are live (in get_statuses) with merge-deferred status.
         harness.scheduler = MagicMock()
+        # Wire real (non-auto-mock) liveness-accessor behaviour (task 2235:
+        # harness.py now calls scheduler.is_dispatched() instead of reaching
+        # into _dispatched directly) so the reaper's live/orphan routing
+        # below exercises real semantics instead of an auto-mocked
+        # (always-truthy) stub.
+        wire_scheduler_liveness_mock(harness.scheduler)
         harness.scheduler._dispatched = set()
         harness.scheduler.get_tasks = AsyncMock(return_value=[
             {"id": "alpha6", "status": "merge-deferred"},
