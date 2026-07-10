@@ -25,6 +25,9 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
+    from collections.abc import Callable
+    from typing import Any
+
     from shared.cost_store import CostStore
 
 from escalation.models import Escalation
@@ -215,6 +218,59 @@ def aggregate_escalations(
 
 
 # ---------------------------------------------------------------------------
+# Shared read-only-events-DB scaffold (used by count_done_in_window and
+# merge_disposition_counts below — factored out so the fail-open contract
+# lives in exactly one place instead of being stamped out per query).
+# ---------------------------------------------------------------------------
+
+
+def _query_events_ro(
+    events_db: Path,
+    log_prefix: str,
+    default: Any,
+    query_fn: Callable[[sqlite3.Connection], Any],
+) -> Any:
+    """Run `query_fn` against a read-only connection to the events DB.
+
+    Owns the boilerplate common to every events.db stats reader: the
+    missing-DB existence check, the read-only URI construction, connection
+    lifecycle, and the TOCTOU-aware fail-open exception handler. `query_fn`
+    receives the open connection and returns the caller's desired result
+    shape (a scalar count, a dict, ...); `default` is returned verbatim on
+    a missing DB or any other failure, so each caller's fail-open value
+    stays caller-specified rather than baked into this helper.
+
+    Missing DB logs at DEBUG; other failures log at WARNING — both under
+    `log_prefix` so log lines stay attributable to the calling function.
+    """
+    try:
+        if not Path(events_db).exists():
+            logger.debug('%s: DB not found (fail-open): %s', log_prefix, events_db)
+            return default
+        # Use Path.resolve().as_uri() so the path is always absolute (as_uri()
+        # requires an absolute path) and special characters are percent-encoded
+        # before appending the ?mode=ro query string.  resolve() follows symlinks;
+        # this is intentional — the resolved target is what SQLite will open and
+        # callers that need symlink-identity preservation should pass an absolute
+        # path directly.
+        db_uri = Path(events_db).resolve().as_uri() + "?mode=ro"
+        conn = sqlite3.connect(db_uri, uri=True)
+        try:
+            return query_fn(conn)
+        finally:
+            conn.close()
+    except Exception:
+        # TOCTOU guard: if the file disappeared between the structural check
+        # above and sqlite3.connect(), re-detect that as a missing-DB (DEBUG)
+        # rather than an unexpected failure (WARNING).
+        if not Path(events_db).exists():
+            logger.debug('%s: DB not found (fail-open): %s', log_prefix, events_db)
+        else:
+            logger.warning('%s: failed (fail-open)', log_prefix, exc_info=True)
+        return default
+
+
+# ---------------------------------------------------------------------------
 # Done count from EventStore
 # ---------------------------------------------------------------------------
 
@@ -229,38 +285,17 @@ def count_done_in_window(
     Uses sqlite3 directly (read-only).  Fail-open: any exception returns 0.
     Missing DB returns 0 (DEBUG); other failures return 0 (WARNING).
     """
-    try:
-        if not Path(events_db).exists():
-            logger.debug('count_done_in_window: DB not found (fail-open): %s', events_db)
-            return 0
-        # Use Path.resolve().as_uri() so the path is always absolute (as_uri()
-        # requires an absolute path) and special characters are percent-encoded
-        # before appending the ?mode=ro query string.  resolve() follows symlinks;
-        # this is intentional — the resolved target is what SQLite will open and
-        # callers that need symlink-identity preservation should pass an absolute
-        # path directly.
-        db_uri = Path(events_db).resolve().as_uri() + "?mode=ro"
-        conn = sqlite3.connect(db_uri, uri=True)
-        try:
-            (count,) = conn.execute(
-                "SELECT COUNT(*) FROM events "
-                "WHERE event_type = 'task_completed' "
-                "  AND timestamp BETWEEN ? AND ? "
-                "  AND json_extract(data, '$.outcome') = ?",
-                (window_start_iso, window_end_iso, _DONE_OUTCOME),
-            ).fetchone()
-            return int(count)
-        finally:
-            conn.close()
-    except Exception:
-        # TOCTOU guard: if the file disappeared between the structural check
-        # above and sqlite3.connect(), re-detect that as a missing-DB (DEBUG)
-        # rather than an unexpected failure (WARNING).
-        if not Path(events_db).exists():
-            logger.debug('count_done_in_window: DB not found (fail-open): %s', events_db)
-        else:
-            logger.warning('count_done_in_window: failed (fail-open)', exc_info=True)
-        return 0
+    def _query(conn: sqlite3.Connection) -> int:
+        (count,) = conn.execute(
+            "SELECT COUNT(*) FROM events "
+            "WHERE event_type = 'task_completed' "
+            "  AND timestamp BETWEEN ? AND ? "
+            "  AND json_extract(data, '$.outcome') = ?",
+            (window_start_iso, window_end_iso, _DONE_OUTCOME),
+        ).fetchone()
+        return int(count)
+
+    return _query_events_ro(events_db, 'count_done_in_window', 0, _query)
 
 
 # ---------------------------------------------------------------------------
@@ -270,8 +305,12 @@ def count_done_in_window(
 # GROUPs merge_attempt events by their optional 'disposition' payload key
 # (task 2381 α's MergeFailureDisposition, persisted by
 # merge_queue._emit_merge_attempt) so operator stats can separate
-# integration_skew from branch_bug/indeterminate/flakes instead of lumping
-# every merge failure into one undifferentiated bucket.
+# integration_skew from branch_bug/indeterminate instead of lumping every
+# merge-time verify failure into one undifferentiated bucket. The counted
+# keys are exactly MergeFailureDisposition's values — main_red,
+# integration_skew, branch_bug, indeterminate (there is no 'flakes' member;
+# indeterminate is the closest bucket for inconclusive/flake-shaped
+# evidence) — see merge_disposition.py for what each means.
 # ---------------------------------------------------------------------------
 
 
@@ -283,40 +322,28 @@ def merge_disposition_counts(
     """Count merge_attempt events inside the window, grouped by disposition.
 
     Rows with no ``'disposition'`` key (pre-α/β emitters, or non-orchestrator
-    submit paths) are excluded — the map only covers actually-attributed
-    merge failures.
+    submit paths) are excluded from the map. Every row that DOES carry a
+    disposition is counted verbatim, including ``'main_red'`` — those are
+    preexisting-on-main failures (caught by α's ``preexisting`` refinement),
+    not merge/integration failures, so callers that want a merge-caused-only
+    view should exclude that key rather than assume this map is pre-filtered
+    to it.
 
     Uses sqlite3 directly (read-only).  Fail-open: any exception returns {}.
     Missing DB returns {} (DEBUG); other failures return {} (WARNING).
     """
-    try:
-        if not Path(events_db).exists():
-            logger.debug('merge_disposition_counts: DB not found (fail-open): %s', events_db)
-            return {}
-        # See count_done_in_window above for the resolve().as_uri()+?mode=ro rationale.
-        db_uri = Path(events_db).resolve().as_uri() + "?mode=ro"
-        conn = sqlite3.connect(db_uri, uri=True)
-        try:
-            rows = conn.execute(
-                "SELECT json_extract(data, '$.disposition') AS disp, COUNT(*) FROM events "
-                "WHERE event_type = 'merge_attempt' "
-                "  AND timestamp BETWEEN ? AND ? "
-                "  AND json_extract(data, '$.disposition') IS NOT NULL "
-                "GROUP BY disp",
-                (window_start_iso, window_end_iso),
-            ).fetchall()
-            return {disp: int(count) for disp, count in rows}
-        finally:
-            conn.close()
-    except Exception:
-        # TOCTOU guard: if the file disappeared between the structural check
-        # above and sqlite3.connect(), re-detect that as a missing-DB (DEBUG)
-        # rather than an unexpected failure (WARNING).
-        if not Path(events_db).exists():
-            logger.debug('merge_disposition_counts: DB not found (fail-open): %s', events_db)
-        else:
-            logger.warning('merge_disposition_counts: failed (fail-open)', exc_info=True)
-        return {}
+    def _query(conn: sqlite3.Connection) -> dict[str, int]:
+        rows = conn.execute(
+            "SELECT json_extract(data, '$.disposition') AS disp, COUNT(*) FROM events "
+            "WHERE event_type = 'merge_attempt' "
+            "  AND timestamp BETWEEN ? AND ? "
+            "  AND json_extract(data, '$.disposition') IS NOT NULL "
+            "GROUP BY disp",
+            (window_start_iso, window_end_iso),
+        ).fetchall()
+        return {disp: int(count) for disp, count in rows}
+
+    return _query_events_ro(events_db, 'merge_disposition_counts', {}, _query)
 
 
 # ---------------------------------------------------------------------------
