@@ -20,17 +20,35 @@ deterministic backstop closes that reliability gap without depending on LLM
 compliance). As with the pool-cap functions above, only a handful of
 identifiers (``stage``, ``recon_pool``, ``reconstruct_source``) differentiate
 one stage's self-heal from another's, so it lives here once, parametrized.
+
+Task 2229 (W5-λ) adds a THIRD mechanism, :func:`write_cycle_summary`, that
+supersedes the nonce/verify/reconstruct self-heal chain above rather than
+extending it: Python now writes the authoritative per-cycle summary directly
+to the :class:`~fused_memory.reconciliation.recon_ledger.ReconLedgerStore`
+from the stage's own ``StageReport`` — no LLM turn, no nonce, no absence to
+self-heal. The prior mechanisms remain in this module only until their last
+call sites (Stage 1 and Stage 2 ``run()``) are cut over.
 """
 
 from __future__ import annotations
 
+import json
 import logging
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 
 from fused_memory.reconciliation.cli_stage_runner import generate_summary_nonce
+from fused_memory.reconciliation.recon_ledger import ReconLedgerRecord
 from fused_memory.utils.async_utils import gather_collect
 
 logger = logging.getLogger(__name__)
+
+# Retention window for authoritative cycle_summary ledger rows (task 2229).
+# The ledger is a control-plane store, not a permanent audit log, and Stage 3
+# only ever consumes recent summaries — so rows are given a bounded TTL and
+# reaped by the existing ReconLedgerStore.gc() expires_at pass (already run
+# each cycle by _gc_recon_markers) rather than kept forever or given bespoke
+# cleanup code.
+CYCLE_SUMMARY_TTL_DAYS: int = 30
 
 
 def _assume_utc(dt: datetime) -> datetime:
@@ -153,6 +171,105 @@ async def enforce_summary_pool_cap(
         else:
             success_count += 1
     return success_count
+
+
+async def write_cycle_summary(
+    memory_service,
+    project_id: str,
+    report,
+    run_id: str,
+    *,
+    stage: str,
+    recon_pool: str,
+    trim_source: str,
+    cap: int,
+    now: datetime | None = None,
+) -> bool:
+    """Write the authoritative per-cycle ``cycle_summary`` ledger row (task 2229 W5-λ).
+
+    Replaces the LLM-driven per-cycle summary write (nonce + verify/repair/
+    reconstruct self-heal, task 2366 and predecessors): Python derives the
+    summary directly from *report* — no LLM turn, no dedup race, nothing to
+    self-heal — and upserts ONE row into the
+    :class:`~fused_memory.reconciliation.recon_ledger.ReconLedgerStore` keyed
+    by ``(project_id, 'cycle_summary', task_id='', flag_type=stage, run_id)``.
+    The upsert's ``ON CONFLICT`` on that primary key makes a repeat call for
+    the same ``(stage, run_id)`` idempotent — last write wins, row count stays
+    1 (boundary test D1).
+
+    Fail-safe no-op when *memory_service* has no ``recon_ledger`` wired
+    (mirrors :func:`~fused_memory.reconciliation.stages.task_knowledge_sync._gc_recon_markers`'s
+    ``getattr(memory_service, 'recon_ledger', None)`` precedent) and
+    best-effort on the upsert itself: a failure logs a WARNING and returns
+    ``False`` rather than raising, so a ledger outage never fails the whole
+    reconciliation cycle.
+
+    Args:
+        memory_service: Service that may expose a ``recon_ledger``
+            (:class:`~fused_memory.reconciliation.recon_ledger.ReconLedgerStore`)
+            attribute. Missing/``None`` => no-op (returns ``False``).
+        project_id: Project scope for the ledger row.
+        report: The stage's own ``StageReport`` — ``started_at``,
+            ``completed_at``, ``items_flagged``, ``stats``, ``llm_calls``, and
+            ``tokens_used`` are serialized into ``payload_json`` verbatim (the
+            authoritative copy of what this cycle did).
+        run_id: Current reconciliation run identifier (identity key).
+        stage: The ``stage`` metadata tag value identifying this stage (e.g.
+            ``'memory_consolidator'``, ``'task_knowledge_sync'``) — stored as
+            the ledger row's ``flag_type`` (the discriminator that keeps Stage
+            1 and Stage 2 rows for the same ``run_id`` from colliding).
+        recon_pool: Forwarded to the best-effort Mem0 mirror pool-cap trim.
+        trim_source: Forwarded to the best-effort Mem0 mirror pool-cap trim.
+        cap: Forwarded to the best-effort Mem0 mirror pool-cap trim.
+        now: Reference "current time" for ``created_at``/``expires_at``.
+            Defaults to ``datetime.now(UTC)``; tests inject a fixed value.
+            Normalized via :func:`_assume_utc` and rendered with
+            ``.isoformat()`` so the ledger's lexicographic TEXT ``gc()``
+            comparison against ``expires_at`` stays correct.
+
+    Returns:
+        ``True`` when the authoritative ledger upsert succeeded, ``False``
+        otherwise (no ledger wired, or the upsert raised).
+    """
+    ledger = getattr(memory_service, 'recon_ledger', None)
+    if ledger is None:
+        return False
+
+    now_dt = _assume_utc(now or datetime.now(UTC))
+    payload = {
+        'stage': stage,
+        'run_id': run_id,
+        'started_at': report.started_at.isoformat(),
+        'completed_at': report.completed_at.isoformat(),
+        'items_flagged_count': len(report.items_flagged),
+        'stats': report.stats,
+        'llm_calls': report.llm_calls,
+        'tokens_used': report.tokens_used,
+    }
+    record = ReconLedgerRecord(
+        project_id=project_id,
+        record_kind='cycle_summary',
+        task_id='',
+        flag_type=stage,
+        run_id=run_id,
+        payload_json=json.dumps(payload, default=str),
+        state='active',
+        created_at=now_dt.isoformat(),
+        expires_at=(now_dt + timedelta(days=CYCLE_SUMMARY_TTL_DAYS)).isoformat(),
+    )
+    try:
+        await ledger.upsert(record)
+    except Exception:
+        logger.warning(
+            'reconciliation.write_cycle_summary: '
+            'ledger upsert failed for run_id=%s stage=%s',
+            run_id,
+            stage,
+            exc_info=True,
+            extra={'project_id': project_id, 'run_id': run_id, 'stage': stage},
+        )
+        return False
+    return True
 
 
 async def pretrim_summary_pool(
