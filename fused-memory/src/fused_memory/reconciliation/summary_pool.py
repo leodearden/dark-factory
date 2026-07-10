@@ -234,29 +234,35 @@ async def write_cycle_summary(
         return False
 
     now_dt = _assume_utc(now or datetime.now(UTC))
-    payload = {
-        'stage': stage,
-        'run_id': run_id,
-        'started_at': report.started_at.isoformat(),
-        'completed_at': report.completed_at.isoformat(),
-        'items_flagged_count': len(report.items_flagged),
-        'stats': report.stats,
-        'llm_calls': report.llm_calls,
-        'tokens_used': report.tokens_used,
-    }
-    record = ReconLedgerRecord(
-        project_id=project_id,
-        record_kind='cycle_summary',
-        task_id='',
-        flag_type=stage,
-        run_id=run_id,
-        payload_json=json.dumps(payload, default=str),
-        state='active',
-        created_at=now_dt.isoformat(),
-        expires_at=(now_dt + timedelta(days=CYCLE_SUMMARY_TTL_DAYS)).isoformat(),
-    )
     written = True
+    payload: dict | None = None
     try:
+        # Payload/record construction lives inside this try (not just the
+        # upsert call) so a malformed report — e.g. a stray None
+        # started_at/completed_at — degrades to written=False + WARNING
+        # like any other ledger-write failure, rather than raising an
+        # unhandled AttributeError out of this fail-safe function.
+        payload = {
+            'stage': stage,
+            'run_id': run_id,
+            'started_at': report.started_at.isoformat(),
+            'completed_at': report.completed_at.isoformat(),
+            'items_flagged_count': len(report.items_flagged),
+            'stats': report.stats,
+            'llm_calls': report.llm_calls,
+            'tokens_used': report.tokens_used,
+        }
+        record = ReconLedgerRecord(
+            project_id=project_id,
+            record_kind='cycle_summary',
+            task_id='',
+            flag_type=stage,
+            run_id=run_id,
+            payload_json=json.dumps(payload, default=str),
+            state='active',
+            created_at=now_dt.isoformat(),
+            expires_at=(now_dt + timedelta(days=CYCLE_SUMMARY_TTL_DAYS)).isoformat(),
+        )
         await ledger.upsert(record)
     except Exception:
         logger.warning(
@@ -270,15 +276,18 @@ async def write_cycle_summary(
         written = False
 
     try:
-        await memory_service.add_system_record(
-            content=_build_cycle_summary_mirror_content(run_id, stage, payload),
-            project_id=project_id,
-            agent_id=f'recon-stage-{stage}',
-            category='observations_and_summaries',
-            metadata={'kind': 'cycle_summary', 'stage': stage, 'run_id': run_id},
-            causation_id=run_id,
-            _source='cycle_summary_mirror',
-        )
+        # payload is None only when construction itself failed above (already
+        # logged as a ledger-upsert WARNING) — nothing meaningful to mirror.
+        if payload is not None:
+            await memory_service.add_system_record(
+                content=_build_cycle_summary_mirror_content(run_id, stage, payload),
+                project_id=project_id,
+                agent_id=f'recon-stage-{stage}',
+                category='observations_and_summaries',
+                metadata={'kind': 'cycle_summary', 'stage': stage, 'run_id': run_id},
+                causation_id=run_id,
+                _source='cycle_summary_mirror',
+            )
     except Exception:
         logger.warning(
             'reconciliation.write_cycle_summary: '
