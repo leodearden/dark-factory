@@ -6811,6 +6811,52 @@ class TestMaybeGovernMergeCmd:
         )
 
     @pytest.mark.asyncio
+    async def test_run_verification_merge_role_wraps_parsed_inner_command(self, tmp_path):
+        """The inner (pre-govern-wrap) payload is the VerifyCmd-rendered form
+        of test_command, not a verbatim copy of the config string (task 2125
+        step-25/26: govern routes through parse_config_command -> govern_cpu
+        -> render instead of _maybe_govern_merge_cmd's bare string wrap).
+
+        A flag positioned after a target in the config string (``pytest
+        tests/x.py -v``) is canonicalised to flags-before-targets
+        (``pytest -v tests/x.py``) by the structured render path — so the
+        quoted inner payload inside the govern wrap must reflect that
+        canonical form. Fails today: _maybe_govern_merge_cmd wraps the
+        ORIGINAL string verbatim with no parsing, so the inner payload keeps
+        the flag-after-target order from the config.
+        """
+        import shlex
+
+        from orchestrator.config import ModuleConfig
+        config, exec_file = self._make_govern_config(tmp_path)
+        module_config = ModuleConfig(
+            prefix='pkg',
+            test_command='pytest tests/x.py -v',
+            lint_command=None,
+            type_check_command=None,
+        )
+
+        abs_exec = str(exec_file.resolve())
+        captured_cmds: list[str] = []
+
+        async def fake_run_cmd(cmd, cwd, timeout, env=None, log_path=None, **_kwargs):
+            captured_cmds.append(cmd)
+            return 0, '', False
+
+        with patch('orchestrator.verify._run_cmd', side_effect=fake_run_cmd):
+            await run_verification(
+                tmp_path, config, module_config=module_config, max_retries=0, role='merge',
+            )
+
+        assert len(captured_cmds) == 1
+        expected_inner = 'pytest -v tests/x.py'  # canonical: flags before targets
+        expected = f'{shlex.quote(abs_exec)} --role merge -- /bin/bash -c {shlex.quote(expected_inner)}'
+        assert captured_cmds[0] == expected, (
+            f'Expected govern wrap around the canonically-rendered inner command '
+            f'{expected_inner!r}; got {captured_cmds[0]!r}'
+        )
+
+    @pytest.mark.asyncio
     async def test_run_verification_governance_and_cgroup_scope_coexist(self, tmp_path):
         """Governance + verify_use_cgroup_scope both enabled: commands are govern-wrapped and no crash.
 
