@@ -199,10 +199,18 @@ async def write_cycle_summary(
 
     Fail-safe no-op when *memory_service* has no ``recon_ledger`` wired
     (mirrors :func:`~fused_memory.reconciliation.stages.task_knowledge_sync._gc_recon_markers`'s
-    ``getattr(memory_service, 'recon_ledger', None)`` precedent) and
-    best-effort on the upsert itself: a failure logs a WARNING and returns
-    ``False`` rather than raising, so a ledger outage never fails the whole
-    reconciliation cycle.
+    ``getattr(memory_service, 'recon_ledger', None)`` precedent) — in that
+    case neither the mirror nor the trim below run either.
+
+    Once a ledger IS wired, two further best-effort steps run — a Mem0
+    mirror (``add_system_record``, human/LLM-searchable) and a pool-cap trim
+    (:func:`enforce_summary_pool_cap`, bounds the mirror pool) —
+    UNCONDITIONALLY, regardless of whether the authoritative ledger upsert
+    itself succeeded: each is independently wrapped in its own try/except
+    that logs a WARNING and swallows the failure, so a Mem0 outage can never
+    mask (or be masked by) the ledger write's own outcome, and neither can
+    ever raise out of this function. The return value reflects ONLY the
+    authoritative ledger upsert.
 
     Args:
         memory_service: Service that may expose a ``recon_ledger``
@@ -257,6 +265,7 @@ async def write_cycle_summary(
         created_at=now_dt.isoformat(),
         expires_at=(now_dt + timedelta(days=CYCLE_SUMMARY_TTL_DAYS)).isoformat(),
     )
+    written = True
     try:
         await ledger.upsert(record)
     except Exception:
@@ -268,8 +277,71 @@ async def write_cycle_summary(
             exc_info=True,
             extra={'project_id': project_id, 'run_id': run_id, 'stage': stage},
         )
-        return False
-    return True
+        written = False
+
+    try:
+        await memory_service.add_system_record(
+            content=_build_cycle_summary_mirror_content(run_id, stage, payload),
+            project_id=project_id,
+            agent_id=f'recon-stage-{stage}',
+            category='observations_and_summaries',
+            metadata={'kind': 'cycle_summary', 'stage': stage, 'run_id': run_id},
+            causation_id=run_id,
+            _source='cycle_summary_mirror',
+        )
+    except Exception:
+        logger.warning(
+            'reconciliation.write_cycle_summary: '
+            'add_system_record mirror failed for run_id=%s stage=%s',
+            run_id,
+            stage,
+            exc_info=True,
+            extra={'project_id': project_id, 'run_id': run_id, 'stage': stage},
+        )
+
+    try:
+        await enforce_summary_pool_cap(
+            memory_service,
+            project_id,
+            run_id,
+            recon_pool=recon_pool,
+            trim_source=trim_source,
+            cap=cap,
+        )
+    except Exception:
+        logger.warning(
+            'reconciliation.write_cycle_summary: '
+            'enforce_summary_pool_cap failed for run_id=%s stage=%s recon_pool=%s',
+            run_id,
+            stage,
+            recon_pool,
+            exc_info=True,
+            extra={
+                'project_id': project_id,
+                'run_id': run_id,
+                'stage': stage,
+                'recon_pool': recon_pool,
+            },
+        )
+
+    return written
+
+
+def _build_cycle_summary_mirror_content(run_id: str, stage: str, payload: dict) -> str:
+    """Build the deterministic Mem0 mirror content for *run_id* / *stage*.
+
+    Deterministic — no CSPRNG nonce, no LLM turn, nothing to dedup-defeat
+    (unlike the retired :func:`_build_fallback_summary_content`): the mirror
+    is a best-effort searchable copy of the ledger's authoritative payload,
+    not itself a source of truth, so an occasional Mem0 dedup drop of this
+    write is harmless. Embeds ``run_id`` and *stage* verbatim so a semantic
+    or metadata-filtered search on either surfaces this record.
+    """
+    return (
+        f'Stage {stage} cycle summary for run_id: {run_id} — '
+        f'{payload["items_flagged_count"]} item(s) flagged, '
+        f'{payload["llm_calls"]} llm_call(s), {payload["tokens_used"]} token(s) used.'
+    )
 
 
 async def pretrim_summary_pool(
