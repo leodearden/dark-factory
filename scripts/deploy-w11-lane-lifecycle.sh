@@ -151,17 +151,28 @@ for lane_dir in lane_dirs:
     m = TASK_BRANCH_RE.match(branch) if branch else None
     plan_path = _plan_json_path(lane_dir, lane_name) if m else None
 
-    if m is None or plan_path is None:
-        continue  # REGISTERED else-branch lands in step-6
-
-    record = {
-        "state": "assigned",
-        "task_id": m.group(1),
-        "title": _title_from_plan(plan_path),
-        "branch": branch,
-        "seeded_from_sha": sha or None,
-        "updated_at": datetime.now(UTC).isoformat(),
-    }
+    if m is not None and plan_path is not None:
+        record = {
+            "state": "assigned",
+            "task_id": m.group(1),
+            "title": _title_from_plan(plan_path),
+            "branch": branch,
+            "seeded_from_sha": sha or None,
+            "updated_at": datetime.now(UTC).isoformat(),
+        }
+    else:
+        # Free/detached lane -- including a lane that RETAINS a task/<id>
+        # branch (branch-retention 1912/1914) but has no plan.json, which
+        # must NOT be mis-marked ASSIGNED (dodges the 2098 re-poisoning
+        # class: only the plan.json discriminant makes a lane ASSIGNED).
+        record = {
+            "state": "registered",
+            "task_id": None,
+            "title": None,
+            "branch": branch or None,
+            "seeded_from_sha": sha or None,
+            "updated_at": datetime.now(UTC).isoformat(),
+        }
 
     if mode == "check":
         print(f"{lane_name}: {json.dumps(record)}")
