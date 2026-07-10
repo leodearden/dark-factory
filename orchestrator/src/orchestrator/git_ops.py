@@ -20,11 +20,20 @@ Both migration-window safeguards have since been dropped too (W11 ι):
 - _assert_no_task_dir() — the cheap tripwire that hard-asserted a given
   commit SHA carried no .task/ entries before advance_main() — is gone.
   Contamination is structural, so the tripwire had nothing left to catch.
+  This removes the last commit-time checkpoint before main; that is an
+  intentional defense-in-depth trade-off (not an oversight) now that
+  relocation makes contamination structurally impossible rather than
+  merely guarded against — see task 2262 (W11 ι) design decisions.
 - _ensure_task_gitignore() — which used to write .task/.gitignore so any
   leftover <worktree>/.task/ scratch directory self-ignored under `git add
-  -A` / `git status` — is gone too: nothing writes task metadata under
-  <worktree>/.task any more, so there was nothing left for a nested
-  .gitignore to defend.
+  -A` / `git status` — is gone too: the orchestrator hot path no longer
+  writes task metadata under <worktree>/.task (it lives under .task-meta
+  instead, see TaskArtifacts.meta_root_for()), so there was nothing left
+  for a nested .gitignore to defend. A few non-hot-path callers still
+  construct TaskArtifacts with meta_root=None (e.g. cli.py's eval flow)
+  and do write under <worktree>/.task; that residual directory remains
+  untracked via this repo's root .gitignore .task/ entry, independently
+  of the removed nested one.
 
 No .task-specific guards remain in this module.
 """
@@ -2570,10 +2579,11 @@ class GitOps:
         *tracked* WIP onto the victim's still-checked-out branch so 1912
         branch-retention preserves it via the retained branch ref for future
         ``reattach`` recovery.  ``.task/plan.json`` is intentionally excluded
-        (task metadata lives outside the worktree; any leftover ``.task/`` is
-        self-ignored via its own ``.task/.gitignore``) and is **not** preserved
-        across the reclaim; the resumed victim takes the orphan-commits reattach
-        path, not disk-backstop reuse.
+        (task metadata lives outside the worktree for the orchestrator hot
+        path; any leftover ``.task/`` is covered by this repo's root
+        ``.gitignore`` ``.task/`` entry) and is **not** preserved across the
+        reclaim; the resumed victim takes the orphan-commits reattach path,
+        not disk-backstop reuse.
 
         Emits a WARNING on every steal as an ops signal that pool pressure
         required the safety valve.
@@ -3362,14 +3372,14 @@ class GitOps:
         Mirrors the cold-requeue reuse block (git_ops.py ~806-858):
         1. Commit any uncommitted WIP so it is preserved across the rebase.
         2. Rebase onto main (best-effort; log failure and continue on old base).
-        3. Re-ensure the task .gitignore.
         4. Recompute ``base_commit`` as ``merge-base main HEAD``.
         5. Re-provision the debug port (inv.7).
 
         ``.task/plan.json`` is NOT committed by ``commit()`` (task metadata
-        lives outside the worktree; any leftover ``.task/`` is self-ignored
-        via its own ``.task/.gitignore``) and survives the rebase intact
-        because git rebase only touches tracked files.
+        lives outside the worktree for the orchestrator hot path; any
+        leftover ``.task/`` is covered by this repo's root ``.gitignore``
+        ``.task/`` entry) and survives the rebase intact because git rebase
+        only touches tracked files.
 
         Returns:
             WorktreeInfo for the reused lane.  Never raises — exceptions
@@ -4335,10 +4345,14 @@ class GitOps:
         """Stage all changes and commit. Returns sha or None if nothing to commit.
 
         .task/ execution metadata now lives outside the worktree entirely
-        (see module docstring / TaskArtifacts.meta_root_for), so no pathspec
-        exclusion or post-staging unstage is needed here: nothing writes
-        <worktree>/.task in the first place, so `git add -A` has nothing
-        under .task/ to stage.
+        for the orchestrator hot path (see module docstring /
+        TaskArtifacts.meta_root_for), so no pathspec exclusion or
+        post-staging unstage is needed here for that path: `git add -A`
+        has nothing under .task/ to stage. A few callers still construct
+        TaskArtifacts with meta_root=None (e.g. cli.py's eval flow) and do
+        write under <worktree>/.task; that residual directory is covered
+        by this repo's root .gitignore `.task/` entry, so `git add -A`
+        never stages anything under it either way.
 
         Pre-staging conflict guard (esc-2128-8): if *worktree* has any
         unresolved (unmerged-index) paths — e.g. a stash-pop that conflicted
@@ -6337,8 +6351,16 @@ class GitOps:
           can re-enqueue).
         * ``'not_descendant'`` — merge commit couldn't become a descendant
           of main after *max_attempts* (permanent; stop retrying).
-        * ``'contaminated'`` — ``.task/`` contamination gate failed
-          (permanent; stop retrying).
+        * ``'contaminated'`` — retained in :data:`AdvanceResult` /
+          :class:`AdvanceOutcome` for typing and merge_queue.py
+          compatibility only; this method no longer produces it. The
+          ``.task/`` contamination gate (``_assert_no_task_dir``) that used
+          to return this outcome was retired in W11 ι: contamination
+          prevention now rests entirely on structural relocation of task
+          metadata to ``.task-meta`` (for the orchestrator hot path) plus
+          this repo's root ``.gitignore`` ``.task/`` entry — an intentional
+          defense-in-depth trade-off, not an oversight (see module
+          docstring).
         * ``'conflict_markers'`` — the merge tree contains tracked file(s)
           with unresolved (column-0) conflict markers (permanent; stop
           retrying).  esc-2128-8 Layer-2 backstop — see
@@ -6584,8 +6606,9 @@ class GitOps:
                 # Use git diff to get tracked dirty filenames reliably.
                 # Porcelain parsing is fragile because _run strips stdout,
                 # which eats the leading space from " M filename" status.
-                # Exclude the worktree dir (managed by git); the leftover
-                # .task/ is self-ignored via its own .task/.gitignore.
+                # Exclude the worktree dir (managed by git); any leftover
+                # .task/ is covered by this repo's root .gitignore .task/
+                # entry.
                 wt_dir = self.config.worktree_dir
                 _, unstaged_files, _ = await _run(
                     ['git', 'diff', '--name-only', '--',
@@ -7010,8 +7033,8 @@ class GitOps:
         """Return names of tracked dirty files, or empty string if clean.
 
         Excludes untracked files.  The leftover ``.task/`` (if any) is
-        self-ignored via its own ``.task/.gitignore``, so it never appears
-        here without a pathspec exclusion.
+        covered by this repo's root ``.gitignore`` ``.task/`` entry, so it
+        never appears here without a pathspec exclusion.
         """
         _, unstaged, _ = await _run(
             ['git', 'diff', '--name-only', '--', '.'],
