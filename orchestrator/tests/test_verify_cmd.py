@@ -15,7 +15,7 @@ import dataclasses
 
 import pytest
 
-from orchestrator.verify_cmd import ToolKind, VerifyCmd
+from orchestrator.verify_cmd import ToolKind, VerifyCmd, parse_config_command
 
 
 class TestToolKind:
@@ -76,3 +76,110 @@ class TestVerifyCmdConstruction:
         a = VerifyCmd(tool=ToolKind.PYTEST, targets=('x',))
         b = VerifyCmd(tool=ToolKind.PYTEST, targets=('x',))
         assert a == b
+
+
+class TestParseConfigCommandHeadClassification:
+    """parse_config_command classifies a single-segment command's head token."""
+
+    def test_pytest(self):
+        cmd = parse_config_command('pytest tests/test_x.py')
+        assert cmd.tool is ToolKind.PYTEST
+        assert cmd.targets == ('tests/test_x.py',)
+        assert cmd.raw is None
+
+    def test_ruff_check(self):
+        cmd = parse_config_command('ruff check src/foo.py')
+        assert cmd.tool is ToolKind.RUFF
+        assert cmd.targets == ('src/foo.py',)
+
+    def test_pyright(self):
+        cmd = parse_config_command('pyright src/foo.py')
+        assert cmd.tool is ToolKind.PYRIGHT
+        assert cmd.targets == ('src/foo.py',)
+
+    def test_cargo_test(self):
+        cmd = parse_config_command('cargo test --workspace')
+        assert cmd.tool is ToolKind.CARGO_TEST
+
+    def test_cargo_clippy(self):
+        cmd = parse_config_command('cargo clippy --workspace')
+        assert cmd.tool is ToolKind.CARGO_CLIPPY
+
+    def test_npx_bare(self):
+        """A non-pyright npx subcommand classifies as the catch-all NPX kind."""
+        cmd = parse_config_command('npx --version')
+        assert cmd.tool is ToolKind.NPX
+
+
+class TestParseConfigCommandUvWrapper:
+    """parse_config_command recognises a `uv run [--project X|--directory X] <tool>` wrapper."""
+
+    def test_uv_run_with_project_sets_uv_project(self):
+        cmd = parse_config_command('uv run --project shared pytest tests/x.py')
+        assert cmd.tool is ToolKind.PYTEST
+        assert cmd.uv_project == 'shared'
+        assert cmd.cwd_rel is None
+        assert cmd.targets == ('tests/x.py',)
+
+    def test_uv_run_with_directory_sets_cwd_rel(self):
+        cmd = parse_config_command('uv run --directory foo ruff check x')
+        assert cmd.tool is ToolKind.RUFF
+        assert cmd.cwd_rel == 'foo'
+        assert cmd.targets == ('x',)
+
+    def test_bare_uv_run_sets_empty_string_uv_project(self):
+        """A bare `uv run <tool>` (no --project/--directory) is uv-wrapped but
+        projectless — tri-state uv_project='' (uv-wrapped, no project) is
+        distinct from None (not uv-wrapped at all); see reproject()."""
+        cmd = parse_config_command('uv run ruff check x')
+        assert cmd.tool is ToolKind.RUFF
+        assert cmd.uv_project == ''
+        assert cmd.cwd_rel is None
+
+    def test_no_uv_wrapper_leaves_uv_project_none(self):
+        cmd = parse_config_command('pytest tests/x.py')
+        assert cmd.uv_project is None
+
+
+class TestParseConfigCommandLeadingCd:
+    """parse_config_command recognises a leading `cd <dir> &&` segment."""
+
+    def test_leading_cd_sets_cwd_rel(self):
+        cmd = parse_config_command('cd fused-memory && npx pyright')
+        assert cmd.tool is ToolKind.PYRIGHT
+        assert cmd.cwd_rel == 'fused-memory'
+
+    def test_no_leading_cd_leaves_cwd_rel_none(self):
+        cmd = parse_config_command('pytest tests/x.py')
+        assert cmd.cwd_rel is None
+
+
+class TestParseConfigCommandOpaque:
+    """Unparseable / empty / unrecognised-head commands classify OPAQUE, raw retained."""
+
+    def test_unbalanced_quote_is_opaque(self):
+        cmd = parse_config_command('pytest "unterminated')
+        assert cmd.tool is ToolKind.OPAQUE
+        assert cmd.raw == 'pytest "unterminated'
+
+    def test_empty_command_is_opaque(self):
+        cmd = parse_config_command('')
+        assert cmd.tool is ToolKind.OPAQUE
+        assert cmd.raw == ''
+
+    def test_unrecognised_head_is_opaque(self):
+        raw = 'mypy src/'
+        cmd = parse_config_command(raw)
+        assert cmd.tool is ToolKind.OPAQUE
+        assert cmd.raw == raw
+
+    def test_opaque_retains_raw_and_no_structured_fields(self):
+        """raw == input verbatim; every structured field stays at its default (P1)."""
+        raw = 'true'
+        cmd = parse_config_command(raw)
+        assert cmd.raw == raw
+        assert cmd.uv_project is None
+        assert cmd.cwd_rel is None
+        assert cmd.base_flags == ()
+        assert cmd.targets == ()
+        assert cmd.wrappers == ()
