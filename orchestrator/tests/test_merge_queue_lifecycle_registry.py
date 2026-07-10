@@ -27,11 +27,13 @@ import asyncio
 import logging
 from pathlib import Path
 from typing import Any
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
 from orchestrator.config import GitConfig, OrchestratorConfig
 from orchestrator.git_ops import GitOps, _run
+from orchestrator.merge_types import MergeRequest
 
 # ---------------------------------------------------------------------------
 # Fixtures + helpers (per-file duplication convention — see
@@ -114,6 +116,54 @@ def _make_worker(git_ops: GitOps, *, escalation_queue: Any = None):
     from orchestrator.merge_queue import SpeculativeMergeWorker
 
     return SpeculativeMergeWorker(git_ops, asyncio.Queue(), escalation_queue=escalation_queue)
+
+
+def _make_request(
+    task_id: str,
+    branch: str,
+    worktree: Path,
+    config: OrchestratorConfig,
+) -> MergeRequest:
+    """Build a MergeRequest with a fresh Future for the running event loop.
+
+    Duplicated from test_merge_queue_request_liveness.py (per-file
+    duplication convention — see this file's module docstring).
+    """
+    return MergeRequest(
+        task_id=task_id,
+        branch=branch,
+        worktree=worktree,
+        pre_rebased=False,
+        task_files=None,
+        module_configs=[],
+        config=config,
+        result=asyncio.get_running_loop().create_future(),
+        lane='normal',
+    )
+
+
+async def _make_branch_with_file(
+    git_ops: GitOps,
+    branch_name: str,
+    filename: str,
+    content: str,
+) -> Path:
+    """Create a worktree branch with one committed file and return its path.
+
+    Duplicated from test_merge_queue.py (per-file duplication convention).
+    """
+    worktree = (await git_ops.create_worktree(branch_name)).path
+    (worktree / filename).write_text(content)
+    await git_ops.commit(worktree, f'Add {filename}')
+    return worktree
+
+
+def _mock_verify_pass() -> AsyncMock:
+    """Return a mock that makes run_scoped_verification always pass.
+
+    Duplicated from test_merge_queue.py (per-file duplication convention).
+    """
+    return AsyncMock(return_value=MagicMock(passed=True, summary=''))
 
 
 # ---------------------------------------------------------------------------
@@ -219,3 +269,151 @@ class TestNoteTransitionBestEffort:
 
         warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
         assert len(warnings) == 1, f'expected exactly one WARNING, got: {caplog.text}'
+
+
+# ---------------------------------------------------------------------------
+# step-3 RED / step-4 GREEN: merger-drain wiring — register QUEUED at the
+# `_queue` drain chokepoint, transition to LANE_BUFFERED there, then to
+# MERGING at the `_pop_next_pickable` pop feeding `_inflight_req`.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestMergerDrainRegistersAndTransitions:
+    """Driving one request through the merger drain (Style-A:
+    ``worker.run()`` + ``q.put(req)``) must register it at QUEUED, observe
+    LANE_BUFFERED, then MERGING via ``worker._lifecycle.current(...)`` — in
+    step with the still-present transient fields (task 2169 step-3).
+
+    RED until step-4 GREEN wires ``_register_item``/``_note_transition``
+    into ``_buffer_owned_request`` (QUEUED -> LANE_BUFFERED at the drain)
+    and ``_pop_next_pickable`` (-> MERGING at the pop).
+    """
+
+    async def test_item_in_external_queue_before_drain_is_pre_registry(
+        self, git_ops: GitOps, config: OrchestratorConfig,
+    ) -> None:
+        """An item still sitting in the external ``_queue`` — never yet
+        drained by the worker — has no registry entry at all.
+
+        Documents the producer-boundary asymmetry recorded in this task's
+        design decisions: register() happens at the worker's first sighting
+        of a request (the `_queue` DRAIN chokepoint), NOT at the external
+        producer's put() — the module-level enqueue helpers have no
+        reference to the worker/registry.
+        """
+        worker = _make_worker(git_ops)
+        req = _make_request('pre-registry', 'pre-registry', git_ops.project_root, config)
+
+        assert worker._lifecycle.current(req.request_id) is None
+
+        await worker._queue.put(req)
+
+        # Still sitting in _queue, undrained — still pre-registry.
+        assert worker._lifecycle.current(req.request_id) is None
+        assert req.request_id not in worker._live_items
+
+    async def test_request_progresses_queued_lane_buffered_merging(
+        self, git_ops: GitOps, config: OrchestratorConfig,
+    ) -> None:
+        from orchestrator.merge_queue import ItemLifecycleState, SpeculativeMergeWorker
+
+        wt = await _make_branch_with_file(
+            git_ops, 'kappa-seq', 'file_kappa_seq.py', 'x = 1\n',
+        )
+        queue: asyncio.Queue = asyncio.Queue()
+        worker = SpeculativeMergeWorker(git_ops, queue)
+        req = _make_request('kappa-seq', 'kappa-seq', wt, config)
+
+        # Producer-boundary asymmetry (see test above): unseen by the
+        # worker before the first drain, so pre-registry.
+        assert worker._lifecycle.current(req.request_id) is None
+
+        observed: list[tuple[Any, Any]] = []
+        original_note_transition = worker._note_transition
+
+        def _spy_note_transition(rid: str, from_state: Any, to_state: Any, **kwargs: Any) -> None:
+            if rid == req.request_id:
+                observed.append((from_state, to_state))
+            return original_note_transition(rid, from_state, to_state, **kwargs)
+
+        worker._note_transition = _spy_note_transition  # type: ignore[method-assign]
+
+        worker_task = asyncio.create_task(worker.run())
+
+        with patch('orchestrator.merge_queue.run_scoped_verification', _mock_verify_pass()):
+            await queue.put(req)
+
+            # worker.run() has been scheduled but the loop has not yet
+            # switched to it: asyncio.Queue.put() on a non-full unbounded
+            # queue never actually suspends (mirrors test_merge_queue.py's
+            # test_speculative_basic_throughput "Submit ... before the
+            # worker processes them" comment) — still pre-registry.
+            assert worker._lifecycle.current(req.request_id) is None
+
+            outcome = await asyncio.wait_for(req.result, timeout=60)
+            assert outcome.status == 'done', f'{outcome}'
+
+        assert observed[:2] == [
+            (ItemLifecycleState.QUEUED, ItemLifecycleState.LANE_BUFFERED),
+            (ItemLifecycleState.LANE_BUFFERED, ItemLifecycleState.MERGING),
+        ], f'unexpected transition sequence for {req.request_id}: {observed!r}'
+
+        await worker.stop()
+        await worker_task
+
+    async def test_live_items_holds_request_during_merging_window(
+        self, git_ops: GitOps, config: OrchestratorConfig,
+    ) -> None:
+        """``_live_items`` must hold the MergeRequest, and the registry must
+        read MERGING, WHILE the still-present ``_inflight_req`` transient
+        field is set to that same request — the two must agree during the
+        additive (fields-kept) phase of this task.
+        """
+        from orchestrator.merge_queue import ItemLifecycleState, SpeculativeMergeWorker
+
+        wt = await _make_branch_with_file(
+            git_ops, 'kappa-merging', 'file_kappa_merging.py', 'y = 1\n',
+        )
+        queue: asyncio.Queue = asyncio.Queue()
+        worker = SpeculativeMergeWorker(git_ops, queue)
+        req = _make_request('kappa-merging', 'kappa-merging', wt, config)
+
+        captured: list[tuple[Any, Any, bool]] = []
+        original_get_main_sha = git_ops.get_main_sha
+        fired = False
+
+        async def _spying_get_main_sha() -> str:
+            nonlocal fired
+            # Gate on worker._inflight_req (mirrors
+            # test_merge_queue.py::test_merger_exception_resolves_inflight_future's
+            # fault-injection rationale): recompute_suffix_conflict_graph()
+            # also calls get_main_sha() before dequeue, when _inflight_req
+            # is still None — skip those, and fire only once.
+            if worker._inflight_req is not None and not fired:
+                fired = True
+                captured.append((
+                    worker._lifecycle.current(req.request_id),
+                    worker._live_items.get(req.request_id),
+                    worker._inflight_req is req,
+                ))
+            return await original_get_main_sha()
+
+        worker_task = asyncio.create_task(worker.run())
+
+        with (
+            patch.object(git_ops, 'get_main_sha', new=_spying_get_main_sha),
+            patch('orchestrator.merge_queue.run_scoped_verification', _mock_verify_pass()),
+        ):
+            await queue.put(req)
+            outcome = await asyncio.wait_for(req.result, timeout=60)
+            assert outcome.status == 'done', f'{outcome}'
+
+        assert fired, 'expected the get_main_sha gate to fire while _inflight_req was set'
+        observed_state, observed_live_obj, inflight_matches = captured[0]
+        assert observed_state == ItemLifecycleState.MERGING
+        assert observed_live_obj is req
+        assert inflight_matches is True
+
+        await worker.stop()
+        await worker_task
