@@ -241,6 +241,87 @@ def test_question_round_trip() -> None:
 
 
 # ---------------------------------------------------------------------------
+# Step-3: DecisionRecord type + paths (B2) -- Fleet Cockpit
+# ---------------------------------------------------------------------------
+
+
+def _make_decision(**overrides: object) -> sr.DecisionRecord:
+    """Build a fully-populated DecisionRecord for round-trip/identity tests.
+
+    Mirrors _make_record's kwargs-builder idiom: every field is given a
+    concrete, distinguishable value so a round-trip test can catch a field
+    being dropped/mis-typed; ``overrides`` lets a test tweak just the
+    field(s) it cares about.
+    """
+    fields: dict = {
+        'id': 'dec-1',
+        'project': 'df',
+        'text': 'approve?',
+        'filed_at': '2026-07-07T00:00:00+00:00',
+        'session_id': 'unblock-df-2085-4242',
+        'task_id': '2085',
+        'escalation_id': 'esc-1',
+        'options': ['yes', 'no'],
+        'manual_boost': 2,
+        'state': 'answered',
+    }
+    fields.update(overrides)
+    return sr.DecisionRecord(**fields)
+
+
+def test_decision_state_enum_values() -> None:
+    assert issubclass(sr.DecisionState, str)
+    assert {m.value for m in sr.DecisionState} == {'open', 'answered', 'dropped'}
+    assert sr.DecisionState.OPEN.value == 'open'
+    assert sr.DecisionState.ANSWERED.value == 'answered'
+    assert sr.DecisionState.DROPPED.value == 'dropped'
+
+
+def test_decision_record_dict_round_trip_is_lossless() -> None:
+    d = _make_decision()
+    assert sr.DecisionRecord.from_dict(d.to_dict()) == d
+
+
+def test_decision_record_json_round_trip_is_lossless() -> None:
+    d = _make_decision()
+    assert sr.DecisionRecord.from_json(d.to_json()) == d
+
+
+def test_decision_record_round_trip_with_null_fields() -> None:
+    """session_id/task_id/escalation_id/options may legitimately be None (a
+    project-level decision with no session/task/escalation context yet);
+    the round trip must preserve that, not coerce it or drop the key.
+    """
+    d = _make_decision(session_id=None, task_id=None, escalation_id=None, options=None)
+    round_tripped = sr.DecisionRecord.from_dict(d.to_dict())
+    assert round_tripped == d
+    assert round_tripped.session_id is None
+    assert round_tripped.task_id is None
+    assert round_tripped.escalation_id is None
+    assert round_tripped.options is None
+
+
+def test_decision_record_defaults() -> None:
+    d = sr.DecisionRecord(
+        id='dec-1', project='df', text='approve?', filed_at='2026-07-07T00:00:00+00:00'
+    )
+    assert d.manual_boost == 0
+    assert d.state == sr.DecisionState.OPEN
+
+
+def test_decision_path_for_id_under_decisions_dir(tmp_path: Path) -> None:
+    assert sr.decision_path_for_id('dec-1', root=tmp_path) == tmp_path / 'decisions' / 'dec-1.json'
+
+
+def test_decision_path_for_id_sanitizes_unsafe_id(tmp_path: Path) -> None:
+    # An id containing '/' must not escape decisions_dir: it still resolves
+    # to a single file directly inside decisions_dir (no nested directory,
+    # no traversal) -- mirrors lease_path_for_name's path-escape guard.
+    path = sr.decision_path_for_id('../../etc/passwd', root=tmp_path)
+    assert path.parent == sr.decisions_dir(root=tmp_path)
+
+
+# ---------------------------------------------------------------------------
 # Step-3: identity, paths, transcript encoding
 # ---------------------------------------------------------------------------
 
