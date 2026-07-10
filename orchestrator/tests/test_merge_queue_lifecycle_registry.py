@@ -1002,3 +1002,359 @@ class TestVerifierDispatchFillRegistersDispatching:
 
         await worker.stop()
         await worker_task
+
+
+# ---------------------------------------------------------------------------
+# step-9 RED / step-10 GREEN: verify -> finalize wiring — VERIFYING ->
+# FINALIZING at the _finalizing_head-set (excluding passthrough / pre-dispatch
+# sentinel entries, which never reach real finalize work), entry.phase
+# FINALIZING <-> GATE_REVERIFY sub-transitions, FINALIZING -> TERMINAL on
+# land, passthrough entries retiring directly (DISPATCHING -> TERMINAL, no
+# FINALIZING hop), the RUNNER_UNAVAILABLE FINALIZING -> MERGING ->
+# REDISPATCH_PARKED cascade, `_live_items` holding the InflightEntry during
+# the FINALIZING window (parallel to `_finalizing_head`), and rid retirement
+# (current()==TERMINAL, dropped from `_live_items`) at land.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestFinalizeInflightRegistersFinalizingAndTerminal:
+    """Driving verify -> finalize must observe VERIFYING -> FINALIZING ->
+    TERMINAL via ``worker._lifecycle``, hold the InflightEntry in
+    ``worker._live_items`` during the FINALIZING window (parallel to the
+    still-present ``_finalizing_head``), and retire the request_id
+    (``current()==TERMINAL``, dropped from ``_live_items``) once the request
+    lands (task 2169 step-9).
+
+    RED until step-10 GREEN wires ``_note_transition``/``_retire_item`` into
+    ``_finalize_inflight`` and ``_resolve_or_drop_abandoned``.
+    """
+
+    async def test_full_pipeline_land_observes_finalizing_then_terminal(
+        self, git_ops: GitOps, config: OrchestratorConfig,
+    ) -> None:
+        """Happy-path full-pipeline drive: the registry must show
+        VERIFYING -> FINALIZING -> TERMINAL as the tail of the transition
+        sequence, and the rid must be retired once the request lands.
+        """
+        from orchestrator.merge_queue import ItemLifecycleState, SpeculativeMergeWorker
+
+        wt = await _make_branch_with_file(
+            git_ops, 'kappa-finalize-land', 'file_kappa_fl.py', 'f = 1\n',
+        )
+        queue: asyncio.Queue = asyncio.Queue()
+        worker = SpeculativeMergeWorker(git_ops, queue)
+        req = _make_request('kappa-finalize-land', 'kappa-finalize-land', wt, config)
+
+        observed: list[tuple[Any, Any]] = []
+        original_note_transition = worker._note_transition
+
+        def _spy_note_transition(rid: str, from_state: Any, to_state: Any, **kwargs: Any) -> None:
+            if rid == req.request_id:
+                observed.append((from_state, to_state))
+            return original_note_transition(rid, from_state, to_state, **kwargs)
+
+        worker._note_transition = _spy_note_transition  # type: ignore[method-assign]
+
+        worker_task = asyncio.create_task(worker.run())
+
+        with patch('orchestrator.merge_queue.run_scoped_verification', _mock_verify_pass()):
+            await queue.put(req)
+            outcome = await asyncio.wait_for(req.result, timeout=60)
+            assert outcome.status == 'done', f'{outcome}'
+
+        assert observed == [
+            (ItemLifecycleState.QUEUED, ItemLifecycleState.LANE_BUFFERED),
+            (ItemLifecycleState.LANE_BUFFERED, ItemLifecycleState.MERGING),
+            (ItemLifecycleState.MERGING, ItemLifecycleState.AWAITING_VERIFY),
+            (ItemLifecycleState.AWAITING_VERIFY, ItemLifecycleState.DISPATCHING),
+            (ItemLifecycleState.DISPATCHING, ItemLifecycleState.VERIFYING),
+            (ItemLifecycleState.VERIFYING, ItemLifecycleState.FINALIZING),
+            (ItemLifecycleState.FINALIZING, ItemLifecycleState.TERMINAL),
+        ], f'unexpected transition sequence for {req.request_id}: {observed!r}'
+
+        assert worker._lifecycle.current(req.request_id) == ItemLifecycleState.TERMINAL
+        assert req.request_id not in worker._live_items
+
+        await worker.stop()
+        await worker_task
+
+    async def test_live_items_holds_entry_during_finalizing_window(
+        self, git_ops: GitOps, config: OrchestratorConfig,
+    ) -> None:
+        """``_live_items`` must hold the InflightEntry, and the registry must
+        read FINALIZING, WHILE the still-present ``_finalizing_head``
+        transient field is set to that same entry — the two must agree
+        during the additive (fields-kept) phase of this task.
+
+        Mirrors test_merge_queue.py::TestEntryPhaseDuringFinalize's direct
+        ``_finalize_inflight()`` drive (compat-shim entry, verify_task=None,
+        pre-established PASS) to gate on ``git_ops.advance_main``.
+        """
+        from orchestrator.merge_queue import (
+            InflightEntry,
+            ItemLifecycleState,
+            RealMergeItem,
+            SpeculativeMergeWorker,
+        )
+        from orchestrator.verify_runner import HostLease
+
+        branch = 'kappa-finalize-window'
+        wt = await _make_branch_with_file(git_ops, branch, 'kappa_fw.py', 'x = 1\n')
+        req = _make_request(branch, branch, wt, config)
+        merge_result = await git_ops.merge_to_main(wt, branch)
+        assert merge_result.success and merge_result.merge_commit
+        assert merge_result.merge_worktree is not None
+
+        base_sha = await git_ops.get_main_sha()
+        item = RealMergeItem(
+            request=req, merge_result=merge_result, merge_wt=merge_result.merge_worktree,
+            base_sha=base_sha, speculative=False,
+        )
+
+        queue: asyncio.Queue = asyncio.Queue()
+        worker = SpeculativeMergeWorker(git_ops, queue)
+        mock_allocator = MagicMock()
+        mock_allocator.release = AsyncMock()
+        mock_allocator.cancel_and_release = AsyncMock()
+        worker._host_allocator = mock_allocator
+        worker._register_owned_merge_worktree(item.merge_wt)
+        worker._register_item(item, initial=ItemLifecycleState.VERIFYING)
+
+        lease = HostLease(name='local', runner=MagicMock(), is_local=True)
+        entry = InflightEntry(
+            item=item, lease=lease, verify_task=None,
+            merge_wt=item.merge_wt, was_speculative=False, phase='verifying',
+        )
+
+        captured: list[tuple[Any, Any, bool]] = []
+        original_advance = git_ops.advance_main
+
+        async def _capturing_advance(*args: Any, **kwargs: Any) -> Any:
+            captured.append((
+                worker._lifecycle.current(req.request_id),
+                worker._live_items.get(req.request_id),
+                worker._finalizing_head is worker._live_items.get(req.request_id),
+            ))
+            return await original_advance(*args, **kwargs)
+
+        git_ops.advance_main = _capturing_advance  # type: ignore[method-assign]
+        try:
+            with patch('orchestrator.merge_queue.run_scoped_verification', _mock_verify_pass()):
+                advanced = await worker._finalize_inflight(entry)
+        finally:
+            git_ops.advance_main = original_advance  # type: ignore[method-assign]
+
+        assert advanced is True, f'Expected True (advanced); got: {advanced}'
+        assert len(captured) >= 1, 'advance_main must have been called at least once'
+        observed_state, observed_live_obj, matches = captured[0]
+        assert observed_state == ItemLifecycleState.FINALIZING, (
+            f'expected the registry to read FINALIZING while advance_main ran: {observed_state!r}'
+        )
+        assert observed_live_obj is entry
+        assert matches is True, '_finalizing_head and _live_items must agree during the window'
+
+        assert worker._lifecycle.current(req.request_id) == ItemLifecycleState.TERMINAL
+        assert req.request_id not in worker._live_items
+
+    async def test_passthrough_entry_retires_directly_without_finalizing(
+        self, git_ops: GitOps, config: OrchestratorConfig, tmp_path: Path,
+    ) -> None:
+        """A passthrough (immediate_outcome) InflightEntry never awaits a
+        verify_task and never runs the CAS loop — it must retire straight
+        from DISPATCHING to TERMINAL, WITHOUT an intermediate FINALIZING hop
+        (DISPATCHING -> FINALIZING is not a legal edge; only
+        VERIFYING -> FINALIZING is).
+        """
+        from orchestrator.merge_queue import (
+            DecidedItem,
+            InflightEntry,
+            ItemLifecycleState,
+            MergeOutcome,
+            SpeculativeMergeWorker,
+        )
+
+        queue: asyncio.Queue = asyncio.Queue()
+        worker = SpeculativeMergeWorker(git_ops, queue)
+
+        req = _make_request('kappa-passthrough', 'kappa-passthrough', tmp_path, config)
+        outcome = MergeOutcome('conflict', reason='merge conflict')
+        decided = DecidedItem(
+            request=req, base_sha='deadbeef', speculative=False, immediate_outcome=outcome,
+        )
+        worker._register_item(decided, initial=ItemLifecycleState.DISPATCHING)
+
+        entry = InflightEntry(
+            item=decided, lease=None, verify_task=None, merge_wt=None,
+            was_speculative=False, phase='decided', passthrough_outcome=outcome,
+        )
+
+        observed: list[tuple[Any, Any]] = []
+        original_note_transition = worker._note_transition
+
+        def _spy_note_transition(rid: str, from_state: Any, to_state: Any, **kwargs: Any) -> None:
+            if rid == req.request_id:
+                observed.append((from_state, to_state))
+            return original_note_transition(rid, from_state, to_state, **kwargs)
+
+        worker._note_transition = _spy_note_transition  # type: ignore[method-assign]
+
+        result = await worker._finalize_inflight(entry)
+
+        assert result is False  # conflict -> not advanced
+        assert observed == [
+            (ItemLifecycleState.DISPATCHING, ItemLifecycleState.TERMINAL),
+        ], f'unexpected transition sequence: {observed!r}'
+        assert worker._lifecycle.current(req.request_id) == ItemLifecycleState.TERMINAL
+        assert req.request_id not in worker._live_items
+
+    async def test_runner_unavailable_cascade_finalizing_merging_redispatch_parked(
+        self, git_ops: GitOps, config: OrchestratorConfig, tmp_path: Path,
+    ) -> None:
+        """RUNNER_UNAVAILABLE re-merges the entry and front-queues it on
+        ``_redispatch`` — the registry must observe
+        FINALIZING -> MERGING (for the duration of the ``_remerge()`` call)
+        -> REDISPATCH_PARKED (once landed on ``_redispatch``), mirroring the
+        dispatch-time staleness remerge window's "then back" shape.
+        """
+        from orchestrator.merge_queue import (
+            InflightEntry,
+            InflightStatus,
+            InflightVerifyResult,
+            ItemLifecycleState,
+            RealMergeItem,
+            SpeculativeItem,
+            SpeculativeMergeWorker,
+        )
+        from orchestrator.verify_runner import HostLease
+
+        queue: asyncio.Queue = asyncio.Queue()
+        worker = SpeculativeMergeWorker(git_ops, queue)
+        fake_allocator = MagicMock()
+        fake_allocator.quarantine_and_release = AsyncMock()
+        worker._host_allocator = fake_allocator
+
+        req = _make_request('kappa-ru-cascade', 'kappa-ru-cascade', tmp_path, config)
+        item = RealMergeItem(
+            request=req, merge_result=MagicMock(), merge_wt=tmp_path / 'merge_wt',
+            base_sha='deadbeef', speculative=False,
+        )
+        worker._register_item(item, initial=ItemLifecycleState.VERIFYING)
+
+        fake_runner = MagicMock()
+        fake_runner.name = 'laptop'
+        fake_runner.is_local = False
+        lease = HostLease(name='laptop', runner=fake_runner, is_local=False)
+
+        async def _fake_ru_verify() -> InflightVerifyResult:
+            return InflightVerifyResult(
+                outcome=None, merge_wt=item.merge_wt,
+                status=InflightStatus.RUNNER_UNAVAILABLE, reason='ssh timeout',
+            )
+
+        entry = InflightEntry(
+            item=item, lease=lease, verify_task=asyncio.ensure_future(_fake_ru_verify()),
+            merge_wt=item.merge_wt, was_speculative=False, phase='verifying',
+        )
+
+        remerged = MagicMock(spec=SpeculativeItem)
+        captured_mid_remerge: list[Any] = []
+
+        async def _spying_remerge(req_: Any, started: Any) -> Any:
+            captured_mid_remerge.append(worker._lifecycle.current(req.request_id))
+            return remerged
+
+        worker._remerge = _spying_remerge  # type: ignore[method-assign]
+
+        observed: list[tuple[Any, Any]] = []
+        original_note_transition = worker._note_transition
+
+        def _spy_note_transition(rid: str, from_state: Any, to_state: Any, **kwargs: Any) -> None:
+            if rid == req.request_id:
+                observed.append((from_state, to_state))
+            return original_note_transition(rid, from_state, to_state, **kwargs)
+
+        worker._note_transition = _spy_note_transition  # type: ignore[method-assign]
+
+        result = await worker._finalize_inflight(entry)
+
+        assert result is False
+        assert captured_mid_remerge == [ItemLifecycleState.MERGING], (
+            f'expected the registry to read MERGING while _remerge() ran: {captured_mid_remerge!r}'
+        )
+        assert observed == [
+            (ItemLifecycleState.VERIFYING, ItemLifecycleState.FINALIZING),
+            (ItemLifecycleState.FINALIZING, ItemLifecycleState.MERGING),
+            (ItemLifecycleState.MERGING, ItemLifecycleState.REDISPATCH_PARKED),
+        ], f'unexpected transition sequence: {observed!r}'
+        assert worker._live_items[req.request_id] is remerged
+        assert worker._redispatch[0] is remerged
+
+    async def test_gate_reverify_sub_transitions_finalizing_gate_reverify_finalizing(
+        self, git_ops: GitOps, config: OrchestratorConfig,
+    ) -> None:
+        """A ``rebased_pending_reverify`` retry must be observed at
+        GATE_REVERIFY, then transition back to FINALIZING once the gate
+        clears and the CAS loop continues — mirrors test_merge_queue.py::
+        TestSpeculativeGateReverifyConsumesAdvanceOutcome's ``advance_main``
+        side_effect technique to force the branch deterministically.
+        """
+        from orchestrator.git_ops import AdvanceOutcome
+        from orchestrator.merge_queue import ItemLifecycleState, SpeculativeMergeWorker
+
+        wt = await _make_branch_with_file(
+            git_ops, 'kappa-gate-reverify', 'file_kappa_gr.py', 'g = 1\n',
+        )
+        queue: asyncio.Queue = asyncio.Queue()
+        worker = SpeculativeMergeWorker(git_ops, queue)
+        req = _make_request('kappa-gate-reverify', 'kappa-gate-reverify', wt, config)
+
+        advance_calls: list[Any] = []
+
+        async def _advance_side_effect(*args: Any, **kwargs: Any) -> Any:
+            advance_calls.append((args, kwargs))
+            if len(advance_calls) == 1:
+                return AdvanceOutcome(
+                    'rebased_pending_reverify',
+                    advanced_sha='ab' * 20, rebased_from='ba' * 20, rebased_onto='cd' * 20,
+                )
+            # Second call (post-rebuild): terminal failure — sidesteps the
+            # success-path gate machinery, which is not this test's concern.
+            return AdvanceOutcome('not_descendant')
+
+        async def _fake_reverify_rebased_tree(*args: Any, **kwargs: Any) -> Any:
+            return None  # gate clears — disjoint/green re-verify
+
+        observed: list[tuple[Any, Any]] = []
+        original_note_transition = worker._note_transition
+
+        def _spy_note_transition(rid: str, from_state: Any, to_state: Any, **kwargs: Any) -> None:
+            if rid == req.request_id:
+                observed.append((from_state, to_state))
+            return original_note_transition(rid, from_state, to_state, **kwargs)
+
+        worker._note_transition = _spy_note_transition  # type: ignore[method-assign]
+
+        worker_task = asyncio.create_task(worker.run())
+
+        with (
+            patch.object(git_ops, 'advance_main', side_effect=_advance_side_effect),
+            patch('orchestrator.merge_queue.run_scoped_verification', _mock_verify_pass()),
+            patch(
+                'orchestrator.merge_queue._reverify_rebased_tree',
+                new=_fake_reverify_rebased_tree,
+            ),
+        ):
+            await queue.put(req)
+            outcome = await asyncio.wait_for(req.result, timeout=30)
+
+        assert outcome.status == 'blocked', f'expected blocked; got {outcome!r}'
+        assert (ItemLifecycleState.FINALIZING, ItemLifecycleState.GATE_REVERIFY) in observed, (
+            f'missing FINALIZING -> GATE_REVERIFY: {observed!r}'
+        )
+        assert (ItemLifecycleState.GATE_REVERIFY, ItemLifecycleState.FINALIZING) in observed, (
+            f'missing GATE_REVERIFY -> FINALIZING (gate cleared, loop continues): {observed!r}'
+        )
+
+        await worker.stop()
+        await worker_task
