@@ -875,3 +875,38 @@ def test_claim_lease_held_by_live_holder_warn_and_proceed_policy(tmp_path: Path)
     assert 'proceeding' in claim.message
     # No clobber: the on-disk body still names the ORIGINAL holder.
     assert sr.LeaseHolder.from_json(lease_path.read_text()) == original
+
+
+# --- claim_lease: stale-lease reap-and-reclaim + the AND boundary --------
+
+
+def test_claim_lease_reaps_and_reclaims_a_stale_lease(tmp_path: Path) -> None:
+    stale_holder = sr.LeaseHolder(session_slug='watcher-df-dead', pid=_DEAD_PID, start_ts=_NOW.isoformat())
+    sr.claim_lease('watcher-df', holder=stale_holder, root=tmp_path, now=_NOW)
+    lease_path = sr.lease_path_for_name('watcher-df', root=tmp_path)
+    _set_mtime(lease_path, _NOW, sr.LEASE_HEARTBEAT_TTL + timedelta(minutes=1))
+
+    new_holder = sr.LeaseHolder(session_slug='watcher-df-new', pid=os.getpid(), start_ts=_NOW.isoformat())
+    claim = sr.claim_lease('watcher-df', holder=new_holder, root=tmp_path, now=_NOW)
+
+    assert claim.acquired is True
+    assert claim.decision == sr.LeaseDecision.ACQUIRED
+    assert claim.holder == new_holder
+    assert sr.LeaseHolder.from_json(lease_path.read_text()) == new_holder
+
+
+def test_claim_lease_does_not_reap_a_dead_holder_within_ttl(tmp_path: Path) -> None:
+    # Proves the reap rule is (age > TTL) AND (pid dead), not either alone:
+    # a dead-pid holder with a still-fresh heartbeat is NOT reaped.
+    stale_holder = sr.LeaseHolder(session_slug='watcher-df-dead', pid=_DEAD_PID, start_ts=_NOW.isoformat())
+    sr.claim_lease('watcher-df', holder=stale_holder, root=tmp_path, now=_NOW)
+    lease_path = sr.lease_path_for_name('watcher-df', root=tmp_path)
+    _set_mtime(lease_path, _NOW, sr.LEASE_HEARTBEAT_TTL - timedelta(minutes=1))
+
+    new_holder = sr.LeaseHolder(session_slug='watcher-df-new', pid=os.getpid(), start_ts=_NOW.isoformat())
+    claim = sr.claim_lease('watcher-df', holder=new_holder, root=tmp_path, now=_NOW)
+
+    assert claim.acquired is False
+    assert claim.holder is not None
+    assert claim.holder.session_slug == 'watcher-df-dead'
+    assert sr.LeaseHolder.from_json(lease_path.read_text()) == stale_holder
