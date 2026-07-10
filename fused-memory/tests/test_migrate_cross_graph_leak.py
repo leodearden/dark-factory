@@ -1566,6 +1566,76 @@ class TestRunApplyCoMovingPreserved:
 
 
 # ===========================================================================
+# Tests: run() apply surfaces cross-target-dropped edges
+# (task 2415, step-15/16)
+# ===========================================================================
+
+class TestRunApplyCrossTargetDropped:
+    """Proves a cross-target-dropped edge (Phase B's dropped_cross_target --
+    two endpoints resolving to DIFFERENT target graphs, which FalkorDB
+    cannot recreate in either) is surfaced verbatim for human review, never
+    silently omitted, and forces a blocking exit even when the post-verify
+    count re-census otherwise reconciles.
+    """
+
+    def _write_manifest(self, tmp_path, nodes, census) -> Path:
+        manifest = _mod.build_manifest(nodes, census, dry_run=True)
+        manifest_path = tmp_path / 'manifest.json'
+        manifest_path.write_text(json.dumps(manifest))
+        return manifest_path
+
+    @pytest.mark.asyncio
+    async def test_dropped_cross_target_edges_surfaced_and_forces_blocking_exit(
+        self, tmp_path, monkeypatch,
+    ):
+        """recreate_subgraph_relationships (monkeypatched) returns one
+        dropped_cross_target record; run()'s report carries it verbatim
+        under report['dropped_cross_target_edges'] (with its reason), and
+        the non-empty list forces a non-zero/blocking exit_code even though
+        the post-verify re-census otherwise reconciles cleanly."""
+        move_node = _classified_node(
+            'u-X', source_graph='reify', target_graph='dark_factory', disposition=_mod.MOVE,
+        )
+        manifest_path = self._write_manifest(tmp_path, [move_node], {'reify': 1, 'dark_factory': 0})
+
+        dropped_record = {
+            'edge_uuid': 'e-1',
+            'src_uuid': 'u-X',
+            'dst_uuid': 'u-Y',
+            'src_target': 'dark_factory',
+            'dst_target': 'know_live',
+            'reason': (
+                'edge endpoints resolve to different target graphs (or an '
+                'undeliverable non-migrating endpoint) -- cross-graph '
+                'RELATES_TO edges are unsupported; needs manual review'
+            ),
+        }
+
+        monkeypatch.setattr(_mod, 'create_moved_node', AsyncMock(return_value=None))
+        monkeypatch.setattr(_mod, 'delete_source_node', AsyncMock(return_value=None))
+        monkeypatch.setattr(
+            _mod, 'recreate_subgraph_relationships',
+            AsyncMock(return_value=SubgraphEdgeResult(
+                edges_recreated=0, edges_skipped=0, dropped_cross_target=[dropped_record],
+            )),
+        )
+
+        memory_service = _make_memory_service({
+            'reify': _make_graph_mock(ro_pages=[[]]),
+            'dark_factory': _make_graph_mock(ro_pages=[[]]),
+        })
+        args = _args(apply=True, manifest=str(manifest_path))
+
+        report = await _mod.run(args, memory_service)
+
+        assert report['dropped_cross_target_edges'] == [dropped_record]
+        assert 'needs manual review' in report['dropped_cross_target_edges'][0]['reason']
+
+        assert report['post_verify']['matched'] is True
+        assert report['exit_code'] != 0
+
+
+# ===========================================================================
 # Tests: build_arg_parser (step-21/22)
 # ===========================================================================
 
