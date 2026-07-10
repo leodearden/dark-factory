@@ -13903,6 +13903,176 @@ class TestRunStage2SummaryReconstructionWiring:
         assert report.stats['stage2_cycle_summary_verified_count'] == 0
 
 
+class TestTaskKnowledgeSyncDeterministicCycleSummaryWrite:
+    """TaskKnowledgeSync.run() writes the authoritative per-cycle
+    ``cycle_summary`` directly via the deterministic ``write_cycle_summary``
+    helper (task 2229 W5-λ, PRD plans/recon-reliability-prd.md §10, boundary
+    test D1) — no LLM turn, no nonce, no verify/repair/reconstruct self-heal.
+
+    RED until step-06 rewires ``run()`` to call ``write_cycle_summary`` in
+    place of the ``_pretrim_stage2_summary_pool`` call plus the
+    verify/repair/reconstruct chain, and strips the nonce injection from
+    ``assemble_payload()`` and the Stage 2 system prompt.
+    """
+
+    @pytest_asyncio.fixture
+    async def ledger_store(self, tmp_path):
+        from fused_memory.reconciliation.recon_ledger import ReconLedgerStore
+
+        s = ReconLedgerStore(tmp_path / 'reconciliation.db')
+        await s.initialize()
+        yield s
+        await s.close()
+
+    @pytest.fixture
+    def mock_deps(self, ledger_store):
+        from fused_memory.config.schema import ReconciliationConfig
+
+        config = ReconciliationConfig(enabled=True, explore_codebase_root='/tmp/test')
+        memory_service = AsyncMock()
+        memory_service.recon_ledger = ledger_store
+        memory_service.search.return_value = []
+        return {
+            'memory_service': memory_service,
+            'taskmaster': AsyncMock(),
+            'journal': AsyncMock(),
+            'config': config,
+            'scope': _scope('reify', '/home/leo/src/reify'),
+        }
+
+    def _base_report(self, run_id: str) -> StageReport:
+        return StageReport(
+            stage=StageId.task_knowledge_sync,
+            started_at=datetime(2026, 7, 10, 11, 0, 0, tzinfo=UTC),
+            completed_at=datetime(2026, 7, 10, 11, 5, 0, tzinfo=UTC),
+            items_flagged=[],
+            stats={},
+            llm_calls=2,
+            tokens_used=500,
+        )
+
+    async def _run_stage(self, mock_deps, run_id: str) -> StageReport:
+        mock_deps['taskmaster'].get_tasks.return_value = {'tasks': []}
+        stage = TaskKnowledgeSync(StageId.task_knowledge_sync, **mock_deps)
+        stage.scope = _scope('reify', stage.scope.project_root)
+        stage.scope = _scope(stage.scope.project_id, '/home/leo/src/reify')
+
+        watermark = Watermark(project_id='reify')
+        with patch.object(BaseStage, 'run', new=AsyncMock(return_value=self._base_report(run_id))):
+            return await stage.run(
+                events=[], watermark=watermark, prior_reports=[], run_id=run_id,
+            )
+
+    @pytest.mark.asyncio
+    async def test_run_writes_one_authoritative_ledger_row(self, mock_deps, ledger_store):
+        """Exactly one cycle_summary ledger row exists for (stage=
+        'task_knowledge_sync', run_id) after run(), written from the report
+        Python derives — not an LLM-authored Mem0 write."""
+        run_id = 'run-d1-stage2'
+
+        await self._run_stage(mock_deps, run_id)
+
+        record = await ledger_store.get_by_identity(
+            'reify', 'cycle_summary', flag_type='task_knowledge_sync', run_id=run_id,
+        )
+        assert record is not None
+        assert record.record_kind == 'cycle_summary'
+        assert record.task_id == ''
+        assert record.flag_type == 'task_knowledge_sync'
+        assert record.run_id == run_id
+        assert record.state == 'active'
+
+    @pytest.mark.asyncio
+    async def test_run_sets_cycle_summary_written_stat(self, mock_deps):
+        report = await self._run_stage(mock_deps, 'run-d1-stat')
+
+        assert report.stats.get('stage2_cycle_summary_written') == 1
+
+    @pytest.mark.asyncio
+    async def test_retired_verify_repair_reconstruct_stats_absent(self, mock_deps):
+        report = await self._run_stage(mock_deps, 'run-d1-retired-stats')
+
+        for retired_key in (
+            'stage2_cycle_summary_pool_trimmed',
+            'stage2_cycle_summary_stage_repaired',
+            'stage2_cycle_summary_reconstructed',
+            'stage2_cycle_summary_verified_count',
+        ):
+            assert retired_key not in report.stats, (
+                f'{retired_key!r} is retired LLM self-heal telemetry (task 2229 '
+                'W5-λ) and must no longer be set by run().'
+            )
+
+    def test_verify_repair_reconstruct_helpers_deleted(self):
+        """The Python-side verify/repair/reconstruct self-heal chain is fully
+        deleted, not merely unwired — a runtime-checkable attribute
+        assertion (not a prose/docstring check)."""
+        import fused_memory.reconciliation.stages.task_knowledge_sync as tks_module
+
+        for name in (
+            '_verify_stage2_summary_written',
+            '_repair_stage2_summary_stage_metadata',
+            '_reconstruct_stage2_summary',
+        ):
+            assert not hasattr(tks_module, name), (
+                f'{name} must be deleted (task 2229 W5-λ) — Python now writes '
+                'the per-cycle summary directly via write_cycle_summary, with '
+                'nothing left to verify/repair/reconstruct.'
+            )
+
+    @pytest.mark.asyncio
+    async def test_payload_has_no_nonce_text(self):
+        """assemble_payload() no longer injects the '### Per-Cycle Summary
+        Nonce' section or a 'summary_nonce'/'retry_nonce' line — Python owns
+        the per-cycle summary write now, so there is nothing for the LLM to
+        prepend a dedup-defeating nonce to."""
+        from fused_memory.config.schema import ReconciliationConfig
+
+        config = ReconciliationConfig(enabled=True, explore_codebase_root='/tmp/test')
+        deps = {
+            'memory_service': AsyncMock(),
+            'taskmaster': AsyncMock(),
+            'journal': AsyncMock(),
+            'config': config,
+            'scope': _scope('reify', '/home/leo/src/reify'),
+        }
+        deps['taskmaster'].get_tasks.return_value = {'tasks': []}
+        stage = make_configured_task_knowledge_sync_stage(
+            deps, project_id='reify', project_root='/home/leo/src/reify',
+        )
+        watermark = Watermark(project_id='reify')
+
+        payload = await stage.assemble_payload([], watermark, [])
+
+        for forbidden in ('### Per-Cycle Summary Nonce', 'summary_nonce', 'retry_nonce'):
+            assert forbidden not in payload, (
+                f'assemble_payload() must not contain {forbidden!r} (task 2229 W5-λ).'
+            )
+
+    def test_system_prompt_uniqueness_directive_removed(self):
+        """The Stage 2 system prompt no longer instructs the LLM to write a
+        nonce'd per-cycle summary — the directive block (and its
+        payload-section pointer) is fully deleted, not merely made optional.
+
+        Scoped to the exact bolded heading (rather than a blanket
+        'summary_nonce'/'retry_nonce' substring search across the whole
+        prompt) because the unrelated '## Re-Verify Reconstruction Writes
+        Before Carry-Forward' section — a distinct LLM-driven mechanism for
+        carry-forward findings about OTHER runs' summaries, out of this
+        task's scope — still mentions those words in prose.
+        """
+        from fused_memory.reconciliation.prompts.stage2 import build_stage2_system_prompt
+
+        prompt = build_stage2_system_prompt('dark_factory')
+
+        assert '**Per-Cycle Summary Uniqueness**' not in prompt, (
+            "The 'Per-Cycle Summary Uniqueness' directive must be deleted "
+            '(task 2229 W5-λ) — Python writes the per-cycle summary '
+            'deterministically now.'
+        )
+        assert '### Per-Cycle Summary Nonce' not in prompt
+
+
 # ---------------------------------------------------------------------------
 # Task 2029 scenario (b) — TaskKnowledgeSync acknowledges Stage-1
 # stage1_flag_marker records for flags Stage 2 resolved via FIX C deletion,
