@@ -4542,12 +4542,14 @@ _LEGAL_TRANSITIONS: dict[ItemLifecycleState, frozenset[ItemLifecycleState]] = {
     ItemLifecycleState.DISPATCHING: frozenset({
         ItemLifecycleState.VERIFYING,
         ItemLifecycleState.REDISPATCH_PARKED,
+        ItemLifecycleState.QUEUED,
         ItemLifecycleState.TERMINAL,
     }),
     ItemLifecycleState.VERIFYING: frozenset({
         ItemLifecycleState.GATE_REVERIFY,
         ItemLifecycleState.FINALIZING,
         ItemLifecycleState.MERGING,
+        ItemLifecycleState.QUEUED,
         ItemLifecycleState.TERMINAL,
     }),
     ItemLifecycleState.GATE_REVERIFY: frozenset({
@@ -4577,6 +4579,18 @@ same-request_id in-place retry loops evidenced by ``_redispatch`` (the
 redispatch bounce, DISPATCHING<->REDISPATCH_PARKED) and ``_remerging_item``
 (the cascade remerge, VERIFYING/GATE_REVERIFY/FINALIZING -> MERGING ->
 REDISPATCH_PARKED).
+
+MQ-reliability kappa (task 2169) adds two further backward edges,
+DISPATCHING -> QUEUED and VERIFYING -> QUEUED, for the three
+``_queue.put_nowait(req)`` re-arm sites that put an in-flight request BACK
+on the external input queue with its request_id and result Future intact
+(operator-halt pre-dispatch requeue in ``_dispatch_item``, operator-halt
+mid-verify requeue in ``_run_inflight_verify``, and the head-failure
+cascade's downstream self-requeue in the verifier loop) — see
+:meth:`SpeculativeMergeWorker._note_requeue`. Unlike the forward edges
+above, these three sites are wired via the dynamic-current-state helper
+rather than a hardcoded *from_state*, so a registered item legally lands
+back at QUEUED regardless of which of the two states it was requeued from.
 
 TERMINAL is absorbing (empty out-set): conflict auto-chain regeneration
 mints a NEW request_id for the regenerated attempt
@@ -5368,6 +5382,34 @@ class SpeculativeMergeWorker(_WipHaltMixin):
             self._note_transition(request_id, current, ItemLifecycleState.TERMINAL)
         self._live_items.pop(request_id, None)
 
+    def _note_requeue(
+        self,
+        request_id: str,
+        live_obj: MergeRequest | SpeculativeItem | InflightEntry | None = None,
+    ) -> None:
+        """Best-effort transition *request_id* back to QUEUED at a requeue site
+        (operator-halt abort-poll, pre-dispatch operator-halt, cascade
+        downstream self-requeue — MQ-reliability kappa / task 2169).
+
+        Reads the CURRENT registry state dynamically rather than a
+        hardcoded *from_state*: these three sites sit downstream of the
+        VERIFYING/DISPATCHING wiring landed by kappa's later steps, so
+        during the additive rollout window the true current state may
+        still be an earlier stage (e.g. AWAITING_VERIFY). No-ops silently
+        (no :meth:`_note_transition` call, hence no WARNING/escalation)
+        when *request_id* is unregistered — unlike the drain/pop
+        chokepoints, an unregistered rid here is NOT itself a wiring-bug
+        signal: several existing narrow unit tests exercise these requeue
+        branches by constructing an item directly (bypassing the normal
+        drain chokepoint), e.g.
+        test_merge_queue_request_liveness.py::TestOperatorHaltRequeueNoFalseAlarm,
+        which asserts zero escalations for exactly this call pattern.
+        """
+        current = self._lifecycle.current(request_id)
+        if current is None:
+            return
+        self._note_transition(request_id, current, ItemLifecycleState.QUEUED, live_obj=live_obj)
+
     # ── δ=1988 SuffixConflictTracker delegation ─────────────────────────────
     # Data-descriptor properties forwarding the original attribute names to
     # self._suffix_tracker's fields, so existing read/write call sites (incl.
@@ -5709,19 +5751,31 @@ class SpeculativeMergeWorker(_WipHaltMixin):
         journal never stalls the merge pipeline.
 
         MQ-reliability kappa (task 2169): this is the worker's first sighting
-        of *item* — its three callers (``_drain_queue_into_lanes``,
-        ``_acquire_next_request``'s harvest branch, and the merger loop's
-        look-ahead harvest) all pull a FRESH item straight off the external
-        ``_queue``/``_pending_get``, never a re-buffer of an already-tracked
-        request — so registering here unconditionally is safe. Seeds the
-        ItemLifecycle registry at QUEUED then immediately transitions to
-        LANE_BUFFERED, matching this method's own postcondition (the item is
-        now sitting in a lane buffer).
+        of *item* for a FRESH request — its three callers
+        (``_drain_queue_into_lanes``, ``_acquire_next_request``'s harvest
+        branch, and the merger loop's look-ahead harvest) all pull an item
+        straight off the external ``_queue``/``_pending_get``. That item is
+        USUALLY a brand-new request_id, but it may also be a request
+        previously put back on ``_queue`` by a requeue site
+        (:meth:`_note_requeue` — operator-halt / cascade self-requeue),
+        which leaves it registered at QUEUED rather than removing it
+        (:class:`ItemLifecycle` has no deregister op). Registers only when
+        the request_id is not already tracked; an already-tracked rid skips
+        straight to the QUEUED -> LANE_BUFFERED transition below instead of
+        re-``register()``-ing, which would raise ``ValueError`` on the live
+        duplicate (:meth:`ItemLifecycle.register`'s precondition). Either
+        way, the item ends up seeded/confirmed at QUEUED then immediately
+        transitioned to LANE_BUFFERED, matching this method's own
+        postcondition (the item is now sitting in a lane buffer).
         """
         lane = _normalize_lane(item.lane)
         self._assert_single_writer(self._merger_task, '_lane_buffers')
-        rid = self._register_item(item, initial=ItemLifecycleState.QUEUED)
-        self._note_transition(rid, ItemLifecycleState.QUEUED, ItemLifecycleState.LANE_BUFFERED)
+        rid = item.request_id
+        if self._lifecycle.current(rid) is None:
+            self._register_item(item, initial=ItemLifecycleState.QUEUED)
+        self._note_transition(
+            rid, ItemLifecycleState.QUEUED, ItemLifecycleState.LANE_BUFFERED, live_obj=item,
+        )
         self._lane_buffers[lane].append(item)
 
         if self._merge_store is not None:
@@ -8456,16 +8510,21 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                                         'raised unexpectedly — members may remain stranded',
                                         req.train_id,
                                     )
-                        await self._verifier_queue.put(DecidedItem(
+                        _train_decided_item = DecidedItem(
                             request=req,
                             base_sha=actual_main, speculative=False,
                             immediate_outcome=outcome,
                             started_monotonic=t0,
-                        ))
+                        )
+                        await self._verifier_queue.put(_train_decided_item)
                         # Train is put with speculative=False so the verifier
                         # will NOT release the slot on drain.  Release explicitly
                         # if the train was prefetched as a speculative item.
                         self._speculation_controller.on_abort()
+                        self._note_transition(
+                            req.request_id, ItemLifecycleState.MERGING,
+                            ItemLifecycleState.AWAITING_VERIFY, live_obj=_train_decided_item,
+                        )
                         self._inflight_req = None
                         continue
 
@@ -8509,6 +8568,10 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                         # verifier see permit=None and silently skip the
                         # release, leaking the token in ledger.live forever.
                         _decided_item.permit = self._speculation_controller.on_transfer_terminal()
+                        self._note_transition(
+                            req.request_id, ItemLifecycleState.MERGING,
+                            ItemLifecycleState.AWAITING_VERIFY, live_obj=_decided_item,
+                        )
                         self._inflight_req = None
                         continue
 
@@ -8562,6 +8625,10 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                         # verifier see permit=None and silently skip the
                         # release, leaking the token in ledger.live forever.
                         _decided_item.permit = self._speculation_controller.on_transfer_terminal()
+                        self._note_transition(
+                            req.request_id, ItemLifecycleState.MERGING,
+                            ItemLifecycleState.AWAITING_VERIFY, live_obj=_decided_item,
+                        )
                         self._inflight_req = None
                         continue
 
@@ -8677,6 +8744,10 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                     # ledger.live forever — same hazard as the
                     # on_transfer_terminal() sites above.
                     _real_item.permit = self._speculation_controller.on_transfer()
+                    self._note_transition(
+                        req.request_id, ItemLifecycleState.MERGING,
+                        ItemLifecycleState.AWAITING_VERIFY, live_obj=_real_item,
+                    )
                     self._inflight_req = None  # item is now owned by verifier
 
                     # ── Speculative look-ahead (depth-K cap) ──────────────────
@@ -9232,6 +9303,9 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                                     # entry so this parked request never ages
                                     # out; the next dequeue re-arms it fresh.
                                     self._request_ledger.on_requeued(_entry_req.request_id)
+                                    # MQ-reliability kappa (task 2169): mirror
+                                    # the re-arm onto the lifecycle registry.
+                                    self._note_requeue(_entry_req.request_id, live_obj=_entry_req)
                                 continue
                             _remerged = await self._remerge(
                                 _entry.item.request,
@@ -9926,6 +10000,9 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                     # pending — remove the ledger entry so this parked request
                     # never ages out; the next dequeue re-arms it fresh.
                     self._request_ledger.on_requeued(req.request_id)
+                    # MQ-reliability kappa (task 2169): mirror the re-arm onto
+                    # the lifecycle registry.
+                    self._note_requeue(req.request_id, live_obj=req)
                     return InflightVerifyResult(
                         outcome=None,
                         merge_wt=None,
@@ -10601,6 +10678,9 @@ class SpeculativeMergeWorker(_WipHaltMixin):
             # remove the ledger entry so this parked request never ages out;
             # the next dequeue re-arms it fresh.
             self._request_ledger.on_requeued(req.request_id)
+            # MQ-reliability kappa (task 2169): mirror the re-arm onto the
+            # lifecycle registry.
+            self._note_requeue(req.request_id, live_obj=req)
             self._remerge_occurred = False  # halt → reset chain flag
             return InflightEntry(
                 item=item,
