@@ -3539,7 +3539,22 @@ async def run_scoped_verification(
     # (Root cause of the 226-way merge-verify storm: a polluted module set
     # turned the no-match fan-out into 226 concurrent `cargo` pipelines in one
     # `_merge-*` worktree.)
-    _fanout_sem = asyncio.Semaphore(max(1, config.max_concurrent_module_verifies))
+    #
+    # The cap is role-aware (task 2393, T5): merge-role pytests bypass the T2
+    # counting admission slot (`_admission_slot` no-ops for role='merge' — the
+    # anti-livelock/C-merge-priority guarantee), so merge's internal fan-out
+    # needs its OWN bound (`merge_verify_max_concurrent_modules`), orthogonal
+    # to `verify_admission_task_slots`. The 'task' role (this function's only
+    # other role — see the `Literal['merge', 'task']` signature above) keeps
+    # the general `max_concurrent_module_verifies` — its pytests are
+    # additionally bounded by the admission slot, so the general knob mostly
+    # just caps burst concurrency for it.
+    _fanout_cap = (
+        config.merge_verify_max_concurrent_modules
+        if role == 'merge'
+        else config.max_concurrent_module_verifies
+    )
+    _fanout_sem = asyncio.Semaphore(max(1, _fanout_cap))
 
     async def _verify_module(mc: ModuleConfig) -> 'VerifyResult':
         async with _fanout_sem:

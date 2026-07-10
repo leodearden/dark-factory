@@ -1,6 +1,7 @@
 """Tests for orchestrator/verify.py, specifically _run_cmd bash executable handling."""
 
 import asyncio
+import contextlib
 import logging
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, call, patch
@@ -1602,6 +1603,200 @@ class TestRunScopedVerificationSkipsUntouched:
         # 1 initial + 2 retries = 3 invocations.
         assert test_calls == 3, (
             f'default should retry per config; got {test_calls} invocations'
+        )
+
+
+class TestMergeFanoutCap:
+    """Task 2393 (T5): the merge-role internal pytest fan-out is bounded by
+    its own dedicated cap (``merge_verify_max_concurrent_modules``),
+    decoupled from the general ``max_concurrent_module_verifies`` used by
+    task/background roles.
+
+    Merge-role pytests bypass the T2 counting admission slot
+    (``_admission_slot`` no-ops for role='merge'), so the merge internal
+    fan-out branch of ``run_scoped_verification`` needs its own bound.
+    """
+
+    @staticmethod
+    def _make_peak_tracker(expected_peak: int, *, wait_timeout: float = 2.0):
+        """Build a fake ``_run_cmd`` that observes concurrency deterministically.
+
+        Each call increments ``state['current']`` and records ``state['peak']``
+        the instant it's entered — a synchronous update with no intervening
+        await, so it can never race another call's own entry (asyncio is
+        single-threaded/cooperative here; there is no true parallelism to
+        race). It then blocks on an ``asyncio.Event`` that fires once
+        ``expected_peak`` concurrent calls have been observed, releasing all
+        of them together.
+
+        This replaces a fixed ``asyncio.sleep`` used just to "hold the slot":
+        under a slow/loaded event loop a fixed sleep could in theory elapse
+        before the next call is even scheduled, letting a held slot release
+        early and silently under-report the peak. Gating on the actual
+        condition being measured removes that race. ``wait_timeout`` is only
+        a hang-safety net — if a regression means concurrency never reaches
+        ``expected_peak``, each blocked call proceeds anyway once it elapses
+        so the test fails fast on the peak assertion instead of hanging.
+        """
+        state = {'current': 0, 'peak': 0}
+        reached = asyncio.Event()
+
+        async def fake_run_cmd(cmd, cwd, timeout, env=None, log_path=None, **kwargs):
+            state['current'] += 1
+            state['peak'] = max(state['peak'], state['current'])
+            if state['current'] >= expected_peak:
+                reached.set()
+            with contextlib.suppress(TimeoutError):
+                await asyncio.wait_for(reached.wait(), timeout=wait_timeout)
+            state['current'] -= 1
+            return 0, '', False
+
+        return fake_run_cmd, state
+
+    @pytest.mark.asyncio
+    async def test_merge_fanout_bounded_by_dedicated_merge_cap(self, tmp_path: Path):
+        """role='merge' fan-out is bounded by merge_verify_max_concurrent_modules,
+        not by the general max_concurrent_module_verifies.
+        """
+        (tmp_path / 'conftest.py').write_text('# root\n')  # source, fits no prefix
+        config = OrchestratorConfig(
+            project_root=tmp_path,
+            concurrent_verify=False,
+            max_concurrent_module_verifies=6,
+            merge_verify_max_concurrent_modules=2,
+        )
+        module_configs = [
+            ModuleConfig(prefix=f'mod{i}', test_command=f'__cmd{i}__')
+            for i in range(6)
+        ]
+
+        fake_run_cmd, state = self._make_peak_tracker(expected_peak=2)
+
+        with patch('orchestrator.verify._run_cmd', side_effect=fake_run_cmd):
+            result = await run_scoped_verification(
+                tmp_path, config, module_configs,
+                task_files=['conftest.py'],
+                role='merge',
+            )
+
+        assert result.passed
+        assert state['peak'] == 2, (
+            f'expected the dedicated merge cap (2) to bound AND saturate the '
+            f'fan-out (6 modules); peak={state["peak"]}'
+        )
+
+    @pytest.mark.asyncio
+    async def test_task_fanout_uses_general_cap_not_merge_cap(self, tmp_path: Path):
+        """role='task' fan-out still uses max_concurrent_module_verifies; the
+        merge-only cap is ignored — proves the two knobs are decoupled.
+        """
+        (tmp_path / 'conftest.py').write_text('# root\n')
+        config = OrchestratorConfig(
+            project_root=tmp_path,
+            concurrent_verify=False,
+            max_concurrent_module_verifies=2,
+            merge_verify_max_concurrent_modules=6,
+        )
+        module_configs = [
+            ModuleConfig(prefix=f'mod{i}', test_command=f'__cmd{i}__')
+            for i in range(6)
+        ]
+
+        fake_run_cmd, state = self._make_peak_tracker(expected_peak=2)
+
+        with patch('orchestrator.verify._run_cmd', side_effect=fake_run_cmd):
+            result = await run_scoped_verification(
+                tmp_path, config, module_configs,
+                task_files=['conftest.py'],
+                role='task',
+            )
+
+        assert result.passed
+        assert state['peak'] == 2, (
+            f'expected the general cap (2) to bound task-role fan-out '
+            f'regardless of merge_verify_max_concurrent_modules; peak={state["peak"]}'
+        )
+
+    @pytest.mark.asyncio
+    async def test_scoped_single_subproject_merge_unaffected(self, tmp_path: Path):
+        """A scoped (single-subproject) merge verify never fans out, so it is
+        unaffected by the merge cap's value (even a cap of 1 is a no-op here).
+
+        Documentation-only: with a single ModuleConfig the fan-out gather has
+        exactly one coroutine, so peak concurrency is 1 regardless of the cap
+        (even the general cap, or a value of 1000, would also yield peak==1).
+        This does NOT exercise ``merge_verify_max_concurrent_modules`` as a
+        bound — see ``test_scoped_multi_subproject_merge_bounded_by_cap``
+        below for the case that actually saturates and proves the cap on the
+        line-3669 scoped (multi-subproject) fan-out branch.
+        """
+        (tmp_path / 'mod0').mkdir()
+        (tmp_path / 'mod0' / 'test_foo.py').write_text('# foo\n')
+        config = OrchestratorConfig(
+            project_root=tmp_path,
+            concurrent_verify=False,
+            merge_verify_max_concurrent_modules=1,
+        )
+        module_configs = [
+            ModuleConfig(prefix='mod0', test_command='__cmd0__'),
+        ]
+
+        fake_run_cmd, state = self._make_peak_tracker(expected_peak=1)
+
+        with patch('orchestrator.verify._run_cmd', side_effect=fake_run_cmd):
+            result = await run_scoped_verification(
+                tmp_path, config, module_configs,
+                task_files=['mod0/test_foo.py'],
+                role='merge',
+            )
+
+        assert result.passed
+        assert state['peak'] == 1, (
+            f'scoped single-subproject merge verify should never fan out; '
+            f'peak={state["peak"]}'
+        )
+
+    @pytest.mark.asyncio
+    async def test_scoped_multi_subproject_merge_bounded_by_cap(self, tmp_path: Path):
+        """A scoped merge verify touching SEVERAL subprojects still fans out
+        (the line-3669 ``scoped`` gather branch, reached when task_files match
+        more than one subproject's prefix) and that fan-out is bounded by
+        ``merge_verify_max_concurrent_modules`` — the one fan-out branch not
+        covered by a peak assertion elsewhere in this class: the no-match
+        branch (line 3653) is covered by
+        ``test_merge_fanout_bounded_by_dedicated_merge_cap`` and the
+        single-subproject case is (deliberately) a no-fan-out no-op above.
+        """
+        task_files = []
+        for i in range(4):
+            (tmp_path / f'mod{i}').mkdir()
+            (tmp_path / f'mod{i}' / 'test_foo.py').write_text('# foo\n')
+            task_files.append(f'mod{i}/test_foo.py')
+        config = OrchestratorConfig(
+            project_root=tmp_path,
+            concurrent_verify=False,
+            max_concurrent_module_verifies=4,
+            merge_verify_max_concurrent_modules=2,
+        )
+        module_configs = [
+            ModuleConfig(prefix=f'mod{i}', test_command=f'__cmd{i}__')
+            for i in range(4)
+        ]
+
+        fake_run_cmd, state = self._make_peak_tracker(expected_peak=2)
+
+        with patch('orchestrator.verify._run_cmd', side_effect=fake_run_cmd):
+            result = await run_scoped_verification(
+                tmp_path, config, module_configs,
+                task_files=task_files,
+                role='merge',
+            )
+
+        assert result.passed
+        assert state['peak'] == 2, (
+            f'expected the dedicated merge cap (2) to bound AND saturate the '
+            f'scoped multi-subproject fan-out (4 matching subprojects); '
+            f'peak={state["peak"]}'
         )
 
 
