@@ -172,14 +172,17 @@ Both archive the record. Be specific in the note — it is the only audit trail.
   re-fire every cycle until the recon-side gating fix lands.
 - **`recon_stale_run`** (info) — "Run stale, recovered". The harness already
   self-recovered. **accept-as-known** (dismiss) unless several cluster, which
-  signals a stuck recon loop → tell the human.
+  signals a stuck recon loop → tell the human (and file a DecisionRecord, see
+  "Filing Parked Decisions to the Cockpit Registry" below).
 - **`recon_failure` / `recon_backlog_overflow`** (blocking) — a reconciliation
   run failed or the queue is overflowing. This is **infrastructure**: tell the
-  human with full detail, leave pending, do NOT attempt automated fixes.
+  human with full detail, leave pending, do NOT attempt automated fixes. Also
+  file a DecisionRecord via `write-decision`.
 - **`infra_issue`** (blocking) — DB/MCP/service problems. **Priority 1 — system
-  stability:** tell the human immediately, leave pending, do not auto-fix.
+  stability:** tell the human immediately, leave pending, do not auto-fix. Also
+  file a DecisionRecord via `write-decision`.
 - **`risk_identified`** (info) — needs human judgment. Tell the human, track as
-  todo, continue.
+  todo, continue. Also file a DecisionRecord via `write-decision`.
 - **`dependency_discovered`** — if a real prerequisite task exists, note it; else
   file-a-real-task. Then resolve.
 - **`cleanup_needed`** — file-a-real-task (two-phase), then resolve.
@@ -196,7 +199,35 @@ Both archive the record. Be specific in the note — it is the only audit trail.
 3. **Throughput** — clear-cut closures: act decisively. Ambiguous-and-consequential:
    leave pending, tell the human, track it, move on. For each item deliberately
    left pending, pass `--exclude-id <esc-id>` on the next watcher (re)start so
-   the initial scan does not instantly re-fire on it and busy-loop.
+   the initial scan does not instantly re-fire on it and busy-loop. Also file a
+   DecisionRecord via `write-decision` (see "Filing Parked Decisions to the
+   Cockpit Registry" below) — IN ADDITION to telling the human.
+
+## Filing Parked Decisions to the Cockpit Registry (C8)
+
+Fleet Cockpit C8 (`plans/fleet-cockpit-prd.md`): every time this skill leaves a finding pending
+for the human — `recon_failure`/`recon_backlog_overflow`, `infra_issue`, `risk_identified`, a
+clustered `recon_stale_run`, or the general Priority 3 "leave pending, tell the human" case —
+also file it to the cockpit decision registry, **IN ADDITION to** telling the human in-session.
+This is the same registry `escalation-watcher` files to (`skills/escalation-watcher/SKILL.md`,
+"Filing Parked Decisions to the Cockpit Registry"), so the cockpit decision queue (C5b) becomes
+the primary return-triage surface across both watchers:
+
+```bash
+python3 $DARK_FACTORY_ROOT/orchestrator/src/orchestrator/session_registry.py write-decision \
+  --id <stable-id> --project <project> --text "<one-line question>" \
+  [--task-id <task_id>] [--escalation-id <escalation_id>]
+```
+
+- **`--id`**: a stable id you can recompute idempotently for the same pending item — the
+  escalation id (e.g. `esc-recon-abc-1`) is the natural choice. Re-filing the same id overwrites
+  the prior record rather than duplicating it.
+- **`--text`**: the one-line question a human needs to answer.
+- **`--task-id` / `--escalation-id`**: thread through the synthetic `recon-<runid>` task id (if
+  any) and the escalation id, so the cockpit can cross-link the decision to its source.
+- The verb always files `state=open` and is fail-soft (a registry fault is logged and swallowed,
+  never raised) — filing a decision can never crash the watch loop or block the "leave pending"
+  action itself.
 
 ## Caveat: recon re-files until the go-forward fix lands
 
