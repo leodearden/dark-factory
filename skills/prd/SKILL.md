@@ -46,6 +46,8 @@ Complete when this can be answered "yes":
 
 No open **design** questions remain at PRD-save time. Tactical / implementation-time questions are fine and go in `## Open questions`.
 
+Once the PRD is committed, the session may continue straight into decompose mode, **hand off decompose to a fresh sibling session** (`skills/spawn/SKILL.md`'s generalized handoff pattern) and exit, or stop and leave decompose for later — see `references/author-mode.md` Stage 11.
+
 See `references/author-mode.md`.
 
 ### Decompose mode
