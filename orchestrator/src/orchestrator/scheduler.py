@@ -4066,6 +4066,20 @@ class Scheduler:
             )
         _external_resolver_failed = external_err is not None
 
+        # Per-tick sweep: stamp the frozen-once milestone_deps_satisfied_at
+        # wall-clock anchor for pending 'delayed' milestone tasks whose full
+        # (local + external) deps just became satisfied (task 2335 β).
+        # Placed after the external-dep cache above so the anchor reflects
+        # the SAME complete dep evaluation the candidate loops below use —
+        # and before those loops so a task's gate state this tick is still
+        # governed by its pre-sweep snapshot (the stamp only becomes visible
+        # on the next tick's get_tasks; see _stamp_milestone_deps_satisfied).
+        await self._stamp_milestone_deps_satisfied(
+            tasks, status_map, tasks_by_id,
+            external_status_cache=external_cache,
+            external_resolver_failed=_external_resolver_failed,
+        )
+
         # Load priority-override snapshot for this tick.
         current_overrides: dict[str, OverrideRow] = (
             self._override_store.get_overrides(self._project_root)
