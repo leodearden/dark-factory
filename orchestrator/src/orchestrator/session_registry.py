@@ -1449,6 +1449,13 @@ def _run_write_decision(
     cross-link it into its in-session note or afk-digest line. write_decision
     is itself self-guarding fail-soft (never raises), so a fault there is
     silently skipped here rather than printed as a false confirmation.
+
+    Intentionally omits DecisionRecord's ``options`` field: C8 watchers only
+    ever file plain open/text decisions, and the peer `update_decision_state`
+    / `set_manual_boost` helpers already own post-filing mutation (state,
+    boost). If a watcher ever needs to offer candidate answers up front, add
+    an optional repeatable ``--option`` flag here rather than widening this
+    verb's other args.
     """
     record = DecisionRecord(
         id=decision_id,
