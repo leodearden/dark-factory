@@ -1718,4 +1718,58 @@ class TestRecreateSubgraphRelationships:
 
         assert result.edges_recreated == 1
         assert result.edges_skipped == 0
+
+    @pytest.mark.asyncio
+    async def test_edge_already_present_in_target_is_idempotent_noop(
+        self, mock_config, make_backend, make_graph_mock, monkeypatch,
+    ):
+        """Re-running Phase B after a prior run already recreated an edge in
+        T must NOT duplicate it: FalkorDB enforces no uniqueness constraint
+        on a relationship's uuid (see _relates_to_edge_already_in_target's
+        docstring), so this presence probe is what makes a re-run converge
+        instead of double-creating the edge. No CREATE is issued and the raw
+        --compact embedding transport is never even read for this edge, and
+        the skip is a genuine no-op -- NOT counted as a loss in either
+        edges_recreated or edges_skipped (task 2415 step-19/20)."""
+        backend = make_backend(mock_config)
+
+        source_mock = make_graph_mock()
+
+        async def _source_ro_query(cypher, params=None):
+            if 'RELATES_TO' in cypher:
+                return MagicMock(result_set=[EDGE_ROW_FIXTURE])
+            return MagicMock(result_set=[])  # no MENTIONS in this scenario
+
+        source_mock.ro_query = AsyncMock(side_effect=_source_ro_query)
+
+        target_mock = make_graph_mock()
+        # The presence probe (_relates_to_edge_already_in_target) reports the
+        # edge is ALREADY there -- a re-run after a prior completed/partial
+        # Phase B.
+        target_mock.ro_query = AsyncMock(return_value=MagicMock(result_set=[[EDGE_UUID_FIXTURE]]))
+
+        backend._driver._get_graph = _route_graphs({
+            SOURCE_GRAPH_FIXTURE: source_mock,
+            TARGET_GRAPH_FIXTURE: target_mock,
+        })
+
+        fake_read_compact = AsyncMock(return_value=COMPACT_VECTOR_REPLY_FIXTURE)
+        monkeypatch.setattr(cross_graph_move, '_read_compact_vector', fake_read_compact)
+
+        specs = [
+            _move_spec(NODE_UUID_FIXTURE, SOURCE_GRAPH_FIXTURE, TARGET_GRAPH_FIXTURE),
+            _move_spec(OTHER_NODE_UUID_FIXTURE, SOURCE_GRAPH_FIXTURE, TARGET_GRAPH_FIXTURE),
+        ]
+
+        result = await recreate_subgraph_relationships(backend, specs)
+
+        # no CREATE issued for the edge -- it's already there.
+        target_mock.query.assert_not_awaited()
+        # the embedding is never read for a skipped edge either.
+        fake_read_compact.assert_not_awaited()
+
+        # a genuine idempotent no-op is NOT a loss: neither counter moves.
+        assert result.edges_recreated == 0
+        assert result.edges_skipped == 0
+        assert result.dropped_cross_target == []
         assert result.dropped_cross_target == []

@@ -1650,6 +1650,92 @@ class TestRunApplyCrossTargetDropped:
 
 
 # ===========================================================================
+# Tests: run() apply is a safe no-op on an already-applied manifest
+# (task 2415, step-19/20)
+# ===========================================================================
+
+class TestRunApplyIdempotentReRun:
+    """Proves re-running --apply against an already-applied manifest
+    converges instead of raising or re-recording loss -- the payoff of the
+    three phase primitives' own idempotency (create_moved_node's
+    already_created no-op, recreate_subgraph_relationships' skip-if-
+    already-present dedup, delete_source_node's no-precheck DETACH DELETE)
+    composed through run()'s per-node/per-phase exception isolation, which
+    treats a non-raising outcome as applied regardless of whether it did
+    fresh work or found everything already converged."""
+
+    def _write_manifest(self, tmp_path, nodes, census) -> Path:
+        manifest = _mod.build_manifest(nodes, census, dry_run=True)
+        manifest_path = tmp_path / 'manifest.json'
+        manifest_path.write_text(json.dumps(manifest))
+        return manifest_path
+
+    @pytest.mark.asyncio
+    async def test_reapplying_fully_migrated_manifest_is_a_safe_noop(
+        self, tmp_path, monkeypatch,
+    ):
+        """A MOVE node and a MERGE node whose migration already fully
+        completed on a prior run: Phase-A create_moved_node reports
+        already_created=True (node already present in target), Phase-B
+        recreates nothing new (its edges are already present, so
+        edges_recreated==0 and edges_skipped==0 -- a dedup skip, not a
+        loss), and Phase-C delete_source_node no-ops (source already gone,
+        no existence precheck). No exception propagates, neither node is
+        recorded blocked or lossy, the post-verify re-census reconciles,
+        and exit_code is 0."""
+        move_node = _classified_node(
+            'u-move', source_graph='reify', target_graph='dark_factory', disposition=_mod.MOVE,
+        )
+        merge_node = _classified_node(
+            'u-merge', source_graph='reify', target_graph='know_live', disposition=_mod.MERGE,
+        )
+        manifest_path = self._write_manifest(
+            tmp_path, [move_node, merge_node], {'reify': 2, 'dark_factory': 0, 'know_live': 0},
+        )
+
+        create_mock = AsyncMock(return_value=CreateResult(
+            uuid='u-move', source_graph='reify', target_graph='dark_factory',
+            already_created=True,
+        ))
+        recreate_mock = AsyncMock(return_value=SubgraphEdgeResult(
+            edges_recreated=0, edges_skipped=0,
+            mentions_recreated=0, mentions_skipped=0,
+            dropped_cross_target=[],
+        ))
+        delete_mock = AsyncMock(return_value=None)  # no-precheck DETACH DELETE no-op
+        monkeypatch.setattr(_mod, 'create_moved_node', create_mock)
+        monkeypatch.setattr(_mod, 'recreate_subgraph_relationships', recreate_mock)
+        monkeypatch.setattr(_mod, 'delete_source_node', delete_mock)
+
+        memory_service = _make_memory_service({
+            'reify': _make_graph_mock(ro_pages=[[]]),
+            'dark_factory': _make_graph_mock(ro_pages=[[]]),
+            'know_live': _make_graph_mock(ro_pages=[[]]),
+        })
+        args = _args(apply=True, manifest=str(manifest_path))
+
+        report = await _mod.run(args, memory_service)
+
+        create_mock.assert_awaited_once()
+        recreate_mock.assert_awaited_once()
+        assert delete_mock.await_count == 2
+
+        results_by_uuid = {r['uuid']: r for r in report['apply_results']}
+        assert results_by_uuid['u-move'] == {
+            'uuid': 'u-move', 'disposition': _mod.MOVE, 'applied': True, 'blocked': False,
+        }
+        assert results_by_uuid['u-merge'] == {
+            'uuid': 'u-merge', 'disposition': _mod.MERGE, 'applied': True, 'blocked': False,
+        }
+
+        assert report['edges_recreated'] == 0
+        assert report['edges_skipped'] == 0
+        assert report['dropped_cross_target_edges'] == []
+        assert report['post_verify']['matched'] is True
+        assert report['exit_code'] == 0
+
+
+# ===========================================================================
 # Tests: build_arg_parser (step-21/22)
 # ===========================================================================
 
