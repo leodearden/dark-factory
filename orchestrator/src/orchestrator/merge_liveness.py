@@ -45,6 +45,7 @@ from __future__ import annotations
 import dataclasses
 import logging
 import math
+import os
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
@@ -55,6 +56,59 @@ if TYPE_CHECKING:
     from orchestrator.config import OrchestratorConfig
 
 logger = logging.getLogger('orchestrator.merge_queue')
+
+
+# ---------------------------------------------------------------------------
+# Merge-worktree CONTENT-mtime no-progress signal (task 2420 / DEFECT 1,
+# split from 2357; extends #1728)
+# ---------------------------------------------------------------------------
+
+
+def newest_content_mtime(root: Path) -> float | None:
+    """Return the newest mtime among files/dirs STRICTLY BELOW *root*.
+
+    Pure, heartbeat-immune liveness signal backing the merge-worktree
+    no-progress budget in
+    :meth:`orchestrator.merge_queue.SpeculativeMergeWorker._run_inflight_verify`.
+    ``root`` itself is never stat'd, and any ``.git`` subtree is pruned from
+    the walk entirely — so the #1728 alpha owner-heartbeat
+    (``_touch_owned_merge_worktrees``), which calls ``os.utime`` on every
+    owned ``_merge-*`` worktree's ROOT inode every ``_HEARTBEAT_POLL_S``
+    seconds, can never mask a dead/hung verify subprocess that has stopped
+    writing under the worktree (e.g. to ``target/``).
+
+    Best-effort: a per-entry ``OSError`` (vanished mid-scan, unreadable,
+    broken symlink) is swallowed and that entry is simply skipped rather
+    than raised. A missing *root*, an empty *root*, or a *root* whose scan
+    fails entirely all return ``None`` — never raises.
+
+    Args:
+        root: The merge worktree root to scan.
+
+    Returns:
+        The newest ``st_mtime`` found strictly below *root*, or ``None``
+        when there is no such content (missing/empty root, or every entry
+        failed to stat).
+    """
+    newest: float | None = None
+    try:
+        for dirpath, dirnames, filenames in os.walk(root, topdown=True):
+            # Prune .git in place so os.walk never descends into it (and it
+            # is excluded from the current directory's own entries below).
+            dirnames[:] = [d for d in dirnames if d != '.git']
+            current_dir = Path(dirpath)
+            for name in (*dirnames, *filenames):
+                try:
+                    mtime = (current_dir / name).stat().st_mtime
+                except OSError:
+                    # Vanished mid-scan / unreadable / broken symlink — skip.
+                    continue
+                if newest is None or mtime > newest:
+                    newest = mtime
+    except OSError:
+        # Top-level scan failure (e.g. root exists but is unreadable).
+        return None
+    return newest
 
 
 # ---------------------------------------------------------------------------

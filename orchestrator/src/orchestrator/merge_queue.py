@@ -82,6 +82,7 @@ from orchestrator.merge_liveness import (  # noqa: F401  re-export shim
     check_merge_liveness_margin,
     enforce_merge_liveness_margin,
     enforce_persistent_worktree_serial_lane,
+    newest_content_mtime,
 )
 from orchestrator.merge_request_ledger import (  # noqa: F401  re-export shim
     RequestLedger,
