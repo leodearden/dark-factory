@@ -809,6 +809,67 @@ class TestVerifyRunnerPool:
 
         assert result.passed is True
 
+    async def test_dispatch_emits_depth_and_speculative_when_provided(self):
+        """task 2340: depth/speculative kwargs are threaded into the event
+        data dict, alongside the unchanged runner/merge_sha/passed/
+        duration_ms/attempt keys."""
+        from orchestrator.event_store import EventType
+        from orchestrator.verify_runner import VerifyRunnerPool
+        expected = _make_pass_result()
+        fake_runner = MagicMock(spec=VerifyRunner)
+        fake_runner.name = 'local'
+        fake_runner.is_local = True
+        fake_runner.run_merge_verify = AsyncMock(return_value=expected)
+
+        emitted = []
+        event_store = MagicMock()
+        event_store.emit = MagicMock(side_effect=lambda *a, **kw: emitted.append((a, kw)))
+
+        pool = VerifyRunnerPool([fake_runner], event_store=event_store, task_id='t-42')
+        await pool.dispatch('sha999', _make_spec(), attempt=0, depth=2, speculative=True)
+
+        assert len(emitted) == 1
+        (event_type,), kwargs = emitted[0]
+        assert event_type == EventType.merge_verify
+        data = kwargs['data']
+        assert data['runner'] == 'local'
+        assert data['merge_sha'] == 'sha999'
+        assert data['passed'] is True
+        assert data['attempt'] == 0
+        assert 'duration_ms' in data
+        assert data['depth'] == 2
+        assert data['speculative'] is True
+
+    async def test_dispatch_without_depth_or_speculative_is_none_safe(self):
+        """task 2340: the existing call form (no depth/speculative kwargs)
+        still emits both keys with value None, and dispatch still does not
+        raise with no event_store at all (legacy/bare callers)."""
+        from orchestrator.event_store import EventType
+        from orchestrator.verify_runner import VerifyRunnerPool
+
+        fake_runner = MagicMock(spec=VerifyRunner)
+        fake_runner.name = 'local'
+        fake_runner.is_local = True
+        fake_runner.run_merge_verify = AsyncMock(return_value=_make_pass_result())
+
+        emitted = []
+        event_store = MagicMock()
+        event_store.emit = MagicMock(side_effect=lambda *a, **kw: emitted.append((a, kw)))
+        pool = VerifyRunnerPool([fake_runner], event_store=event_store, task_id='t-42')
+
+        await pool.dispatch('sha999', _make_spec())
+
+        (event_type,), kwargs = emitted[0]
+        assert event_type == EventType.merge_verify
+        data = kwargs['data']
+        assert data['depth'] is None
+        assert data['speculative'] is None
+
+        # No event_store at all — still must not raise.
+        bare_pool = VerifyRunnerPool([fake_runner], event_store=None)
+        result = await bare_pool.dispatch('abc123', _make_spec())
+        assert result.passed is True
+
 
 # ---------------------------------------------------------------------------
 # Step-7: build_merge_verify_spec
