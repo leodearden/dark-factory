@@ -2621,7 +2621,8 @@ class GitOps:
         *tracked* WIP onto the victim's still-checked-out branch so 1912
         branch-retention preserves it via the retained branch ref for future
         ``reattach`` recovery.  ``.task/plan.json`` is intentionally excluded
-        (the commit uses the ``:!.task`` pathspec) and is **not** preserved
+        (task metadata lives outside the worktree; any leftover ``.task/`` is
+        self-ignored via its own ``.task/.gitignore``) and is **not** preserved
         across the reclaim; the resumed victim takes the orphan-commits reattach
         path, not disk-backstop reuse.
 
@@ -3418,8 +3419,9 @@ class GitOps:
         4. Recompute ``base_commit`` as ``merge-base main HEAD``.
         5. Re-provision the debug port (inv.7).
 
-        ``.task/plan.json`` is NOT committed by ``commit()`` (the
-        ``:!.task`` pathspec excludes it) and survives the rebase intact
+        ``.task/plan.json`` is NOT committed by ``commit()`` (task metadata
+        lives outside the worktree; any leftover ``.task/`` is self-ignored
+        via its own ``.task/.gitignore``) and survives the rebase intact
         because git rebase only touches tracked files.
 
         Returns:
@@ -5084,9 +5086,14 @@ class GitOps:
         return None
 
     async def has_uncommitted_work(self, worktree: Path) -> bool:
-        """Return True if worktree has staged or unstaged changes outside .task/."""
+        """Return True if worktree has staged or unstaged changes.
+
+        The leftover ``.task/`` (if any) is self-ignored via its own
+        ``.task/.gitignore``, so it never surfaces in ``git status`` output —
+        no pathspec exclusion is needed here.
+        """
         rc, output, _ = await _run(
-            ['git', 'status', '--porcelain', '--', '.', ':!.task'],
+            ['git', 'status', '--porcelain', '--', '.'],
             cwd=worktree,
         )
         return rc == 0 and bool(output.strip())
@@ -6643,16 +6650,17 @@ class GitOps:
                 # Use git diff to get tracked dirty filenames reliably.
                 # Porcelain parsing is fragile because _run strips stdout,
                 # which eats the leading space from " M filename" status.
-                # Exclude .task/ (ephemeral) and the worktree dir (managed by git).
+                # Exclude the worktree dir (managed by git); the leftover
+                # .task/ is self-ignored via its own .task/.gitignore.
                 wt_dir = self.config.worktree_dir
                 _, unstaged_files, _ = await _run(
                     ['git', 'diff', '--name-only', '--',
-                     '.', ':!.task', f':!{wt_dir}'],
+                     '.', f':!{wt_dir}'],
                     cwd=self.project_root,
                 )
                 _, staged_files, _ = await _run(
                     ['git', 'diff', '--name-only', '--cached', '--',
-                     '.', ':!.task', f':!{wt_dir}'],
+                     '.', f':!{wt_dir}'],
                     cwd=self.project_root,
                 )
                 dirty_tracked = {
@@ -7067,14 +7075,16 @@ class GitOps:
     async def has_dirty_working_tree(self) -> str:
         """Return names of tracked dirty files, or empty string if clean.
 
-        Excludes .task/ (ephemeral scratch) and untracked files.
+        Excludes untracked files.  The leftover ``.task/`` (if any) is
+        self-ignored via its own ``.task/.gitignore``, so it never appears
+        here without a pathspec exclusion.
         """
         _, unstaged, _ = await _run(
-            ['git', 'diff', '--name-only', '--', '.', ':!.task'],
+            ['git', 'diff', '--name-only', '--', '.'],
             cwd=self.project_root,
         )
         _, staged, _ = await _run(
-            ['git', 'diff', '--name-only', '--cached', '--', '.', ':!.task'],
+            ['git', 'diff', '--name-only', '--cached', '--', '.'],
             cwd=self.project_root,
         )
         files = {f.strip() for f in (unstaged + '\n' + staged).splitlines() if f.strip()}
