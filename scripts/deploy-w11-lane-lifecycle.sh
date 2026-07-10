@@ -145,6 +145,15 @@ lane_dirs = sorted(p for p in worktree_base.glob("_lane-*") if p.is_dir()) \
 
 for lane_dir in lane_dirs:
     lane_name = lane_dir.name
+
+    if (worktree_base / ".lane-state" / f"{lane_name}.json").exists():
+        # Never clobber an existing record: the restarted new-code
+        # orchestrator becomes the authoritative writer once it starts
+        # serving, so adopt only SEEDS records that are still absent --
+        # making a re-run (or a lane a live orchestrator already wrote)
+        # a total no-op.
+        continue
+
     branch = _git(lane_dir, "symbolic-ref", "--short", "-q", "HEAD")
     sha = _git(lane_dir, "rev-parse", "-q", "--verify", "HEAD")
 
