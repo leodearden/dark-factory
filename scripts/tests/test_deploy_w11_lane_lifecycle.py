@@ -396,3 +396,43 @@ def test_adopt_writes_assigned_record_for_bound_lane(tmp_path, plan_location):
     )
     assert record["title"] == "Some task title", f"record={record!r}"
     assert record["updated_at"], f"Expected a non-empty updated_at; record={record!r}"
+
+
+# ---------------------------------------------------------------------------
+# step-5: RED -- ADOPT writes REGISTERED for free lanes
+# ---------------------------------------------------------------------------
+
+def test_adopt_writes_registered_record_for_free_lanes(tmp_path):
+    """(a) a lane retaining a `task/<id>` branch but with NO plan.json (the
+    2098 re-poisoning guard case -- must NOT be mis-marked ASSIGNED) and
+    (b) a detached-HEAD lane (no branch at all) both get REGISTERED
+    records."""
+    worktree_base = _build_worktree_base(tmp_path, [
+        {"name": "_lane-8", "branch": "task/999", "plan": None},
+        {"name": "_lane-9", "branch": None},
+    ])
+
+    result = _run_script(worktree_base)
+
+    assert result.returncode == 0, (
+        f"Expected apply to exit 0; got {result.returncode}\n"
+        f"stdout={result.stdout!r} stderr={result.stderr!r}"
+    )
+
+    rec8 = _read_lane_record(worktree_base, "_lane-8")
+    assert rec8 is not None, (
+        f"Expected a _lane-8 record; stdout={result.stdout!r} stderr={result.stderr!r}"
+    )
+    assert rec8["state"] == "registered", f"record={rec8!r}"
+    assert rec8["task_id"] is None, f"record={rec8!r}"
+    assert rec8["branch"] == "task/999", f"record={rec8!r}"
+    assert rec8["seeded_from_sha"], f"Expected a non-empty seeded_from_sha; record={rec8!r}"
+
+    rec9 = _read_lane_record(worktree_base, "_lane-9")
+    assert rec9 is not None, (
+        f"Expected a _lane-9 record; stdout={result.stdout!r} stderr={result.stderr!r}"
+    )
+    assert rec9["state"] == "registered", f"record={rec9!r}"
+    assert rec9["task_id"] is None, f"record={rec9!r}"
+    assert not rec9["branch"], f"Expected a null/empty branch for a detached lane; record={rec9!r}"
+    assert rec9["seeded_from_sha"], f"Expected a non-empty seeded_from_sha; record={rec9!r}"
