@@ -3834,8 +3834,16 @@ async def test_update_task_tolerates_untouched_invalid_done_provenance(tmp_path,
     proves the write-boundary gate only blocks writes that are themselves
     responsible for the invalid field (or a whole-blob invariant); an
     untouched legacy ``done_provenance`` is tolerated and preserved as-is,
-    while a patch that touches ``done_provenance`` with a still-invalid value
-    is still rejected.
+    while a patch that itself TOUCHES ``done_provenance`` is still rejected.
+
+    Note (task 2201): update_task now carries an UNCONDITIONAL
+    write-authority floor that rejects any incoming metadata containing a
+    ``done_provenance`` key with :class:`DoneProvenanceWriteAuthorityError`,
+    raised BEFORE schema validation. So a patch that touches
+    ``done_provenance`` — valid or invalid — is rejected by the stricter
+    write-authority floor rather than the schema ``ValidationError``. The
+    untouched-legacy tolerance in (a) is unaffected: the floor inspects only
+    the incoming patch, not the post-merge blob.
     """
     cfg = TaskmasterConfig(project_root=str(tmp_path))
     backend = SqliteTaskBackend(cfg, task_metadata_enforce=True)
@@ -3865,9 +3873,12 @@ async def test_update_task_tolerates_untouched_invalid_done_provenance(tmp_path,
             f'got: {task["metadata"].get("done_provenance")!r}'
         )
 
-        # (b) Guard rail: a patch that itself TOUCHES done_provenance with a
-        # still-invalid value (missing 'kind') is still rejected.
-        with pytest.raises(ValidationError):
+        # (b) Guard rail: a patch that itself TOUCHES done_provenance is
+        # rejected. Under task 2201's unconditional write-authority floor this
+        # is a DoneProvenanceWriteAuthorityError raised before schema
+        # validation ever runs (previously a ValidationError on the invalid
+        # blob).
+        with pytest.raises(DoneProvenanceWriteAuthorityError):
             await backend.update_task(
                 dto['id'], project_root=project_root,
                 metadata=json.dumps({'done_provenance': {'commit': 'x'}}),

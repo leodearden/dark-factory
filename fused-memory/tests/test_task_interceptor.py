@@ -2742,8 +2742,11 @@ async def test_done_provenance_accepts_deterministic_gate(
 
     assert 'error' not in result, f'expected acceptance but got: {result}'
     taskmaster.set_task_status.assert_called_once()
-    taskmaster.update_task.assert_called_once()
-    persisted = json.loads(taskmaster.update_task.call_args.kwargs['metadata'])['done_provenance']
+    # done_provenance is persisted through the privileged stamp_audit_metadata
+    # seam (task 2201 floor: update_task now rejects metadata.done_provenance).
+    taskmaster.update_task.assert_not_called()
+    taskmaster.stamp_audit_metadata.assert_called_once()
+    persisted = taskmaster.stamp_audit_metadata.call_args.kwargs['fields']['done_provenance']
     assert persisted['kind'] == 'deterministic-gate'
     assert persisted['note'] == 'pure gate resolved'
 
@@ -4037,19 +4040,17 @@ async def test_terminal_exit_accepts_with_reopen_reason(
     )
     assert result.get('success') or 'error' not in result, result
     taskmaster.set_task_status.assert_called_once()
-    # update_task called with metadata containing reopen_reason.
-    assert taskmaster.update_task.called, 'reopen_reason must be persisted'
-    persisted_metadata = None
-    for call in taskmaster.update_task.call_args_list:
-        md = call.kwargs.get('metadata')
-        if md and 'reopen_reason' in md:
-            persisted_metadata = md
-            break
-    assert persisted_metadata is not None
-    parsed = json.loads(persisted_metadata)
-    assert parsed['reopen_reason'] == 'un-defer script'
-    assert parsed['reopen_from'] == 'done'
-    assert 'reopen_at' in parsed
+    # reopen_* audit fields are persisted through the privileged
+    # stamp_audit_metadata seam, NOT update_task: a task reopened out of a
+    # terminal status may carry a metadata.done_provenance stamped when it was
+    # marked done, and update_task now UNCONDITIONALLY rejects
+    # metadata.done_provenance (task 2201 backend floor).
+    taskmaster.update_task.assert_not_called()
+    assert taskmaster.stamp_audit_metadata.called, 'reopen_reason must be persisted'
+    persisted = taskmaster.stamp_audit_metadata.call_args.kwargs['fields']
+    assert persisted['reopen_reason'] == 'un-defer script'
+    assert persisted['reopen_from'] == 'done'
+    assert 'reopen_at' in persisted
 
 
 @pytest.mark.asyncio
