@@ -966,6 +966,41 @@ def _run_reap() -> list[ReapedSessionRecord]:
     return reap_stale_records()
 
 
+def _run_lease_claim(name: str, slug: str, pid: int, policy_value: str) -> None:
+    """Run the ``lease-claim`` verb: ALWAYS prints a ``decision=<value>`` line + message.
+
+    This carries its OWN fail-open guard, independent of main()'s outer
+    try/except: a fault raised by claim_lease itself (a corrupt lease body,
+    an unwritable leases_dir, ...) must never surface as a silent failure or
+    -- worse -- a false stand-down. On any exception here, the caller is
+    still told to PROCEED (fail-open), exactly as if the lease were free,
+    because a lease-substrate fault must never block a watcher cycle or a
+    /unblock session.
+    """
+    try:
+        holder = LeaseHolder(session_slug=slug, pid=pid, start_ts=datetime.now(UTC).isoformat())
+        claim = claim_lease(name, holder=holder, policy=LeasePolicy(policy_value))
+    except Exception:
+        logger.error('lease-claim %s failed', name, exc_info=True)
+        print(f'decision={LeaseDecision.PROCEED.value}')
+        print(f'lease-claim {name} faulted; proceeding (fail-open)')
+        return
+    print(f'decision={claim.decision.value}')
+    print(claim.message)
+
+
+def _run_lease_heartbeat(name: str) -> None:
+    heartbeat_lease(name)
+
+
+def _run_lease_release(name: str) -> None:
+    release_lease(name)
+
+
+def _run_lease_reap() -> list[ReapedLease]:
+    return reap_stale_leases()
+
+
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog='session_registry')
     sub = parser.add_subparsers(dest='verb', required=True)
@@ -981,6 +1016,27 @@ def _build_parser() -> argparse.ArgumentParser:
     refresh_p.add_argument('--status', required=True, choices=[s.value for s in Status])
 
     sub.add_parser('reap', help='sweep and remove stale session records')
+
+    lease_claim_p = sub.add_parser('lease-claim', help='claim a single-owner-per-role lease (T7)')
+    lease_claim_p.add_argument('--name', required=True, help='lease name, see build_lease_name')
+    lease_claim_p.add_argument('--slug', required=True, help="this claimant's own session_slug")
+    lease_claim_p.add_argument(
+        '--pid', type=int, default=os.getpid(), help="this claimant's own pid"
+    )
+    lease_claim_p.add_argument(
+        '--policy',
+        choices=[p.value for p in LeasePolicy],
+        default=LeasePolicy.STAND_DOWN.value,
+        help='how to respond when the lease is already held live',
+    )
+
+    lease_heartbeat_p = sub.add_parser('lease-heartbeat', help='touch a held lease (heartbeat)')
+    lease_heartbeat_p.add_argument('--name', required=True)
+
+    lease_release_p = sub.add_parser('lease-release', help='release a held lease')
+    lease_release_p.add_argument('--name', required=True)
+
+    sub.add_parser('lease-reap', help='sweep and remove stale leases')
 
     return parser
 
@@ -1005,6 +1061,14 @@ def main(argv: list[str] | None = None) -> int:
             _run_refresh(args.record, args.status)
         elif args.verb == 'reap':
             _run_reap()
+        elif args.verb == 'lease-claim':
+            _run_lease_claim(args.name, args.slug, args.pid, args.policy)
+        elif args.verb == 'lease-heartbeat':
+            _run_lease_heartbeat(args.name)
+        elif args.verb == 'lease-release':
+            _run_lease_release(args.name)
+        elif args.verb == 'lease-reap':
+            _run_lease_reap()
     except Exception:
         logger.error('session_registry %s failed', args.verb, exc_info=True)
         return 0
