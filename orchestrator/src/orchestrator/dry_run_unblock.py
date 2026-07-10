@@ -328,6 +328,15 @@ async def run_dry_run_unblock(
                 output_schema=DRY_RUN_PROPOSAL_SCHEMA,
                 effort=ua_cfg.effort,
                 timeout_seconds=ua_cfg.timeout_seconds,
+                # Working-regime progress extension (task 2360, reify-4827):
+                # config_dir + session_id (above) already revive the startup
+                # watchdog, so once the transcript shows turn-1 the watchdog
+                # can poll it — these two params let a genuinely productive
+                # investigation run past ua_cfg.timeout_seconds instead of
+                # being ceiling-killed and reproducing the very failure it is
+                # meant to diagnose.
+                working_idle_secs=config.timeouts.working_idle_secs,
+                absolute_cap_secs=config.invocation_timeout,
             )
 
         try:
