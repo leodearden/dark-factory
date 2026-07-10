@@ -346,6 +346,114 @@ class TestCountDoneInWindow:
 
 
 # ---------------------------------------------------------------------------
+# Merge-disposition counts from EventStore (task 2384 γ, boundary row 7)
+# ---------------------------------------------------------------------------
+
+
+def _seed_merge_attempt_events_db_direct(
+    db_path: Path, rows: list[tuple[str, str, dict]],
+) -> None:
+    """Seed an events DB (via EventStore schema + direct SQLite) with
+    merge_attempt rows, modeled on ``_seed_events_db_direct`` above.
+
+    *rows* is a list of ``(timestamp, task_id, data)`` — *data* is written
+    verbatim as the event's JSON payload, so callers control the
+    ``'disposition'`` key (present/absent/value) directly.
+    """
+    store = EventStore(db_path, 'run-test')
+    del store  # schema is created in __init__
+
+    conn = sqlite3.connect(str(db_path))
+    try:
+        for ts, task_id, data in rows:
+            conn.execute(
+                'INSERT INTO events (timestamp, run_id, task_id, event_type, data) '
+                'VALUES (?, ?, ?, ?, ?)',
+                (ts, 'run-test', task_id, 'merge_attempt', json.dumps(data)),
+            )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+class TestMergeDispositionCounts:
+    """Tests for digest.merge_disposition_counts(events_db_path, start_iso, end_iso)."""
+
+    def test_counts_by_disposition_excludes_out_of_window_and_null(
+        self, tmp_path: Path,
+    ) -> None:
+        """GROUPs BY disposition within the window; excludes out-of-window and
+        null-disposition rows — proving integration_skew is separable from
+        branch_bug/indeterminate/flakes (the γ stats-separation goal)."""
+        db_path = tmp_path / 'events.db'
+        _seed_merge_attempt_events_db_direct(db_path, [
+            # In-window, disposition set
+            ('2026-05-10T08:00:00+00:00', 't1',
+             {'outcome': 'verify_failed', 'disposition': 'integration_skew'}),
+            ('2026-05-10T09:00:00+00:00', 't2',
+             {'outcome': 'verify_failed', 'disposition': 'integration_skew'}),
+            ('2026-05-10T10:00:00+00:00', 't3',
+             {'outcome': 'verify_failed', 'disposition': 'branch_bug'}),
+            ('2026-05-10T11:00:00+00:00', 't4',
+             {'outcome': 'verify_failed', 'disposition': 'indeterminate'}),
+            # In-window, but no disposition key at all (pre-β / non-orchestrator
+            # submit paths) — must be excluded, not counted as a phantom bucket.
+            ('2026-05-10T12:00:00+00:00', 't5', {'outcome': 'verify_failed'}),
+            # Out-of-window (before window_start), disposition set — must be excluded.
+            ('2026-05-09T23:59:59+00:00', 't6',
+             {'outcome': 'verify_failed', 'disposition': 'integration_skew'}),
+        ])
+
+        counts = digest.merge_disposition_counts(
+            db_path,
+            '2026-05-10T00:00:00+00:00',
+            '2026-05-10T23:59:59+00:00',
+        )
+        assert counts == {'integration_skew': 2, 'branch_bug': 1, 'indeterminate': 1}, (
+            f"counts={counts}"
+        )
+
+    def test_missing_db_returns_empty_dict(self, tmp_path: Path) -> None:
+        """Non-existent DB returns {} (fail-open) and does NOT create a stub file."""
+        db_path = tmp_path / 'no-such.db'
+        counts = digest.merge_disposition_counts(
+            db_path,
+            '2026-05-10T00:00:00+00:00',
+            '2026-05-10T23:59:59+00:00',
+        )
+        assert counts == {}, f"Expected {{}} for missing DB; got {counts}"
+        assert not db_path.exists(), "merge_disposition_counts must not create a stub DB file"
+
+    def test_schema_missing_returns_empty_dict(
+        self, tmp_path: Path, caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """DB file exists but has no 'events' table — returns {} (fail-open) with WARNING.
+
+        This is the corrupt/unreadable-DB branch of the fail-open contract
+        (digest.py's `_query_events_ro` except-clause, WARNING path) — the one
+        most worth asserting since the whole point of fail-open stats
+        collection is that it never raises even when the DB is present but
+        unreadable in the expected shape. Mirrors
+        TestCountDoneInWindow.test_schema_missing_returns_zero.
+        """
+        db_path = tmp_path / 'schema-less.db'
+        # Create a real but schema-less SQLite file (no EventStore setup).
+        conn = sqlite3.connect(str(db_path))
+        conn.close()
+        assert db_path.exists(), "pre-condition: file must exist"
+
+        with caplog.at_level(logging.WARNING, logger='orchestrator.digest'):
+            counts = digest.merge_disposition_counts(
+                db_path,
+                '2026-05-10T00:00:00+00:00',
+                '2026-05-10T23:59:59+00:00',
+            )
+        assert counts == {}, f"Expected {{}} for schema-less DB; got {counts}"
+        warnings = [r for r in caplog.records if r.levelno >= logging.WARNING and r.name == 'orchestrator.digest']
+        assert len(warnings) == 1, f"Schema-missing must WARNING exactly once; got {len(warnings)}: {[r.message for r in warnings]}"
+
+
+# ---------------------------------------------------------------------------
 # Fixtures for async CostStore tests
 # ---------------------------------------------------------------------------
 
