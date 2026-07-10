@@ -102,6 +102,7 @@ import asyncio
 import json
 import logging
 import sys
+import types
 from pathlib import Path
 from typing import Any
 
@@ -861,6 +862,42 @@ async def run(args: Any, memory_service: Any) -> dict:
 
 
 # ---------------------------------------------------------------------------
+# Backend construction
+# ---------------------------------------------------------------------------
+
+async def build_memory_service(args: Any, config: Any) -> Any:
+    """Build+initialize the backend/service run() drives, branching on args.apply.
+
+    Dry-run (``args.apply`` False): the census/classify path only ever
+    READS (``list_graphs``, ``ro_query``) -- it never needs a full
+    ``MemoryService``, whose ``initialize()`` unconditionally runs the
+    W6-ε startup identity scan (a dup-uuid-edge REPAIR, i.e. a write) and
+    builds indices. Build a lean ``GraphitiBackend`` directly and
+    initialize it with ``skip_maintenance=True`` so the default
+    ``python migrate_cross_graph_leak.py > manifest.json`` invocation no
+    longer mutates on startup or contends with a running service's own
+    maintenance sweep. Returned as a tiny namespace exposing ``.graphiti``
+    (the backend itself) and an awaitable ``.close``, mirroring the shape
+    ``run()``/``_run_live`` expect from a full ``MemoryService``.
+
+    Apply (``args.apply`` True): ``--apply`` legitimately mutates, so build
+    and initialize the full ``MemoryService``, unskipped, exactly as
+    before.
+    """
+    from fused_memory.backends.graphiti_client import GraphitiBackend  # noqa: PLC0415
+    from fused_memory.services.memory_service import MemoryService  # noqa: PLC0415
+
+    if not args.apply:
+        backend = GraphitiBackend(config)
+        await backend.initialize(skip_maintenance=True)
+        return types.SimpleNamespace(graphiti=backend, close=backend.close)
+
+    memory = MemoryService(config)
+    await memory.initialize()
+    return memory
+
+
+# ---------------------------------------------------------------------------
 # CLI entry point
 # ---------------------------------------------------------------------------
 
@@ -908,16 +945,14 @@ def main() -> int:
 
     async def _run_live() -> dict:
         from fused_memory.config.schema import FusedMemoryConfig  # noqa: PLC0415
-        from fused_memory.services.memory_service import MemoryService  # noqa: PLC0415
 
         config = FusedMemoryConfig()
-        memory = MemoryService(config)
+        built = await build_memory_service(args, config)
         try:
-            await memory.initialize()
-            return await run(args, memory)
+            return await run(args, built)
         finally:
-            if hasattr(memory, 'close'):
-                await memory.close()
+            if hasattr(built, 'close'):
+                await built.close()
 
     report = asyncio.run(_run_live())
     print(json.dumps(report, indent=2, default=str))
