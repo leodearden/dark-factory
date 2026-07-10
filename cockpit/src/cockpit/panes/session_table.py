@@ -10,7 +10,9 @@ no-coerce policy for spawn_mode/display).
 
 from __future__ import annotations
 
-from orchestrator.session_registry import Status
+from datetime import UTC, datetime
+
+from orchestrator.session_registry import SessionRecord, Status
 
 _GLYPHS: dict[Status, str] = {
     Status.AWAITING_INPUT: '⏸',
@@ -36,3 +38,44 @@ def state_glyph(status: Status | str) -> str:
     except ValueError:
         return _FALLBACK_GLYPH
     return _GLYPHS.get(resolved, _FALLBACK_GLYPH)
+
+
+def format_title(record: SessionRecord) -> str:
+    """Render 'role:project#task_id' (the '#task_id' segment omitted when absent).
+
+    Never raises on an empty role/project -- a view must degrade, not
+    crash, on a record shape it didn't control (fail-soft, PRD §2).
+    """
+    base = f'{record.role}:{record.project}'
+    if record.task_id:
+        return f'{base}#{record.task_id}'
+    return base
+
+
+_AGE_PLACEHOLDER = '?'
+
+
+def format_age(start_ts: str, now: datetime) -> str:
+    """Render the age of *start_ts* relative to *now* as its largest whole unit.
+
+    An empty or unparseable start_ts degrades to '?' rather than raising
+    (fail-soft, PRD §2). Mirrors cockpit.priority.score's naive-datetime
+    handling: a naive start_ts or now is assumed to already be UTC, so
+    mixing naive/aware timestamps never raises TypeError.
+    """
+    if not start_ts:
+        return _AGE_PLACEHOLDER
+    try:
+        started = datetime.fromisoformat(start_ts)
+    except ValueError:
+        return _AGE_PLACEHOLDER
+    started_aware = started if started.tzinfo is not None else started.replace(tzinfo=UTC)
+    now_aware = now if now.tzinfo is not None else now.replace(tzinfo=UTC)
+    age_seconds = max(0.0, (now_aware - started_aware).total_seconds())
+    if age_seconds < 60:
+        return f'{int(age_seconds)}s'
+    if age_seconds < 3600:
+        return f'{int(age_seconds // 60)}m'
+    if age_seconds < 86400:
+        return f'{int(age_seconds // 3600)}h'
+    return f'{int(age_seconds // 86400)}d'
