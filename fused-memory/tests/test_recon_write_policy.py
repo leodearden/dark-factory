@@ -18,6 +18,7 @@ fixtures from ``test_task_write_agent_id.py`` and live further down this file.
 
 from __future__ import annotations
 
+import threading
 from unittest.mock import AsyncMock
 
 import pytest
@@ -356,6 +357,70 @@ class TestInterceptorSetTaskStatusLiveWorkflowBoundary:
 
         await interceptor.set_task_status('1', 'in-progress', '/project', agent_id=None)
 
+        taskmaster.set_task_status.assert_awaited_once()
+
+
+# ---------------------------------------------------------------------------
+# set_task_status recon check: offloaded to a thread, snapshot gate unreachable
+# ---------------------------------------------------------------------------
+
+
+class TestInterceptorSetTaskStatusReconCheckOffload:
+    @pytest.mark.asyncio
+    async def test_recon_check_runs_off_the_event_loop_thread(
+        self, interceptor, taskmaster, monkeypatch,
+    ):
+        """is_workflow_live_for_task shells out to git synchronously; the
+        recon-stage check() call in _apply_status_transition must be
+        dispatched via asyncio.to_thread so those blocking subprocess calls
+        never run on the event-loop thread while _write_lock is held —
+        otherwise they would block the loop and stall every other write to
+        the project for as long as git takes."""
+        seen_threads = []
+
+        def _spy(*args, **kwargs):
+            seen_threads.append(threading.current_thread())
+            return False
+
+        monkeypatch.setattr(recon_write_policy, 'is_workflow_live_for_task', _spy)
+
+        await interceptor.set_task_status(
+            '1', 'in-progress', '/project', agent_id=AGENT_ID,
+        )
+
+        assert len(seen_threads) == 1
+        assert seen_threads[0] is not threading.main_thread()
+        taskmaster.set_task_status.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_set_task_status_always_passes_snapshot_token_none(
+        self, interceptor, taskmaster, monkeypatch,
+    ):
+        """set_task_status has no metadata payload to source a snapshot
+        token from, so recon_write_policy.check() is always invoked with
+        snapshot_token=None on this path — gate 3 (stale-snapshot) is
+        reachable only via update_task in practice, even though check()'s
+        own gate 3 is op-agnostic. Pins the intentional None so a future
+        reader does not assume this path enforces snapshot freshness too."""
+        captured = {}
+        real_check = recon_write_policy.check
+
+        def _spy(op, **kwargs):
+            captured['op'] = op
+            captured.update(kwargs)
+            return real_check(op, **kwargs)
+
+        monkeypatch.setattr(recon_write_policy, 'check', _spy)
+        monkeypatch.setattr(
+            recon_write_policy, 'is_workflow_live_for_task', lambda *a, **k: False,
+        )
+
+        await interceptor.set_task_status(
+            '1', 'in-progress', '/project', agent_id=AGENT_ID,
+        )
+
+        assert captured.get('op') == 'set_task_status'
+        assert captured.get('snapshot_token') is None
         taskmaster.set_task_status.assert_awaited_once()
 
 

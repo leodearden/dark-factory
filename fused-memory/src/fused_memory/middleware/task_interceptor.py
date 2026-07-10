@@ -803,9 +803,27 @@ class TaskInterceptor:
 
             # W5-ζ ReconWritePolicy: only consulted for recon-stage callers.
             # Reuses old_status (already read above under the lock) rather
-            # than issuing a second get_task.
+            # than issuing a second get_task. snapshot_token is always None
+            # here — not an oversight: set_task_status carries no metadata
+            # payload to source a snapshot token from, so gate 3
+            # (stale-snapshot) is reachable only via update_task in
+            # practice, even though check()'s gate 3 itself is op-agnostic.
+            #
+            # check() is dispatched via asyncio.to_thread because gate 2
+            # (live workflow) calls is_workflow_live_for_task, which shells
+            # out to git synchronously (up to _GIT_TIMEOUT seconds per git
+            # call). This whole branch runs under _write_lock, so an inline
+            # call would both block the event loop and hold this project's
+            # write lock for however long git takes — stalling every other
+            # write to the project. to_thread keeps the lock's ordering
+            # guarantee (the awaiting coroutine still holds it across the
+            # call) while freeing the event loop to service other work
+            # meanwhile — the same pattern curator_escalator.py's
+            # _persist_state uses to offload a blocking write while holding
+            # _persist_lock.
             if isinstance(agent_id, str) and agent_id.startswith('recon-stage-'):
-                verdict = recon_write_policy.check(
+                verdict = await asyncio.to_thread(
+                    recon_write_policy.check,
                     'set_task_status',
                     task_id=task_id,
                     project_root=project_root,
@@ -3565,25 +3583,34 @@ class TaskInterceptor:
             return err
         tm = await self._ensure_taskmaster()
         project_id = resolve_project_id(project_root)
-        # W5-ζ ReconWritePolicy: only consulted for recon-stage callers.
-        # snapshot_token is extracted from the incoming metadata payload so
-        # gate 3 (stale-snapshot) can fire on this path.
-        if isinstance(agent_id, str) and agent_id.startswith('recon-stage-'):
-            before = await tm.get_task(task_id, project_root)
-            verdict = recon_write_policy.check(
-                'update_task',
-                task_id=task_id,
-                project_root=project_root,
-                agent_id=agent_id,
-                target_status=None,
-                live_status=_extract_status(before),
-                snapshot_token=recon_write_policy.extract_snapshot_token(kwargs.get('metadata')),
-            )
-            if verdict.is_rejection:
-                return verdict.to_error_dict()
         # WP-E: serialise the write; re-embed below reads only and stays
         # outside the lock.
         async with self._write_lock(project_id):
+            # W5-ζ ReconWritePolicy: only consulted for recon-stage callers.
+            # `before` is read here — under the lock, immediately ahead of
+            # the write below — rather than before the lock is acquired, so
+            # the live_status/snapshot check is atomic with the write that
+            # follows (mirrors _apply_status_transition's read old_status ->
+            # check -> write ordering; a prior version of this gate read
+            # `before` before the lock, which let the live task status drift
+            # between the check and the write). snapshot_token is extracted
+            # from the incoming metadata payload so gate 3 (stale-snapshot)
+            # can fire on this path.
+            if isinstance(agent_id, str) and agent_id.startswith('recon-stage-'):
+                before = await tm.get_task(task_id, project_root)
+                verdict = recon_write_policy.check(
+                    'update_task',
+                    task_id=task_id,
+                    project_root=project_root,
+                    agent_id=agent_id,
+                    target_status=None,
+                    live_status=_extract_status(before),
+                    snapshot_token=recon_write_policy.extract_snapshot_token(
+                        kwargs.get('metadata'),
+                    ),
+                )
+                if verdict.is_rejection:
+                    return verdict.to_error_dict()
             result: dict[str, Any] = dict(
                 await self._journal_around(
                     'update_task',
