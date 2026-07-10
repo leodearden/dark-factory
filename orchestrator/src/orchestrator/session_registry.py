@@ -50,7 +50,10 @@ per-record. Bump this when a new backward-compatible (optional/defaulted)
 field is added; SCHEMA_VERSION (the PERSISTED major) stays unchanged so
 rail-vintage and post-extension records remain version-indistinguishable on
 disk, and any consumer gating on ``record.schema_version == 1`` keeps
-working unmodified."""
+working unmodified. Not read by any consumer as of C1 -- it is intentional
+forward scaffolding (not dead code): a code-level seam later Fleet Cockpit
+steps (plans/fleet-cockpit-prd.md §2's C1-C10 decomposition) can consult
+when reasoning about additive schema drift."""
 
 RESULT_FILENAME = 'result.md'
 """Basename of the result-handback file inside each record dir (Attention
@@ -111,7 +114,15 @@ class SpawnMode(StrEnum):
 
 
 class DisplayKind(StrEnum):
-    """Where a session's terminal/pane lives, for focus-arrange (C4)."""
+    """Where a session's terminal/pane lives, for focus-arrange (C4).
+
+    Not consumed within C1 itself -- ``Display.kind`` stores the wire value
+    as a plain ``str`` with no coercion through this enum (see Display's
+    docstring). This is intentional forward scaffolding, not dead code: it
+    is the named-constant contract that C4's wm/X11 and tmux focus-arrange
+    backends and C6's tmux lane (both PRD-declared as depending on C1;
+    plans/fleet-cockpit-prd.md §2) will match against once they land.
+    """
 
     WM = 'wm'
     TMUX = 'tmux'
@@ -323,6 +334,18 @@ class DecisionRecord:
     manual_boost: an operator-assigned priority nudge; defaults to 0.
     state: current lifecycle state; see DecisionState. Defaults to
         ``DecisionState.OPEN``.
+
+    Concurrency: unlike SessionRecord (single-writer-per-slug -- only the
+    spawning session ever mutates its own record), a single decision id's
+    file may be mutated by TWO different subsystems: a C8 watcher (via
+    update_decision_state) and the C5 cockpit (via set_manual_boost). Both
+    helpers are unsynchronized read-modify-write cycles with no cross-process
+    locking or compare-and-swap, so a concurrent state-update and
+    boost-update racing on the same id can silently drop one side's mutation
+    (last os.replace() wins). This is a known, accepted limitation --
+    consistent with the module's existing lock-free convention -- not a
+    per-record corruption risk (each write is still individually atomic).
+    See update_decision_state/set_manual_boost for the caller-facing note.
     """
 
     id: str
@@ -628,6 +651,14 @@ def update_decision_state(
     Self-guarding FAIL-SOFT: returns None (logs ERROR) on any fault -- a
     missing file, a corrupt body, or a write failure -- rather than raising,
     matching write_decision's contract for its direct C8/cockpit callers.
+
+    Concurrency NOTE (see DecisionRecord's docstring): this read-modify-write
+    is unsynchronized against a concurrent set_manual_boost (or a second
+    update_decision_state) racing on the SAME decision id -- the later
+    os.replace() wins and silently drops the earlier call's field mutation.
+    Each individual write remains atomic; only the read+mutate+write SPAN is
+    unsynchronized. Accepted for now, consistent with the module's existing
+    lock-free convention.
     """
     path = decision_path_for_id(decision_id, root=root)
     try:
@@ -651,6 +682,14 @@ def set_manual_boost(
     Self-guarding FAIL-SOFT: returns None (logs ERROR) on any fault -- a
     missing file, a corrupt body, or a write failure -- rather than raising,
     matching write_decision's contract for its direct C8/cockpit callers.
+
+    Concurrency NOTE (see DecisionRecord's docstring): this read-modify-write
+    is unsynchronized against a concurrent update_decision_state (or a
+    second set_manual_boost) racing on the SAME decision id -- the later
+    os.replace() wins and silently drops the earlier call's field mutation.
+    Each individual write remains atomic; only the read+mutate+write SPAN is
+    unsynchronized. Accepted for now, consistent with the module's existing
+    lock-free convention.
     """
     path = decision_path_for_id(decision_id, root=root)
     try:
