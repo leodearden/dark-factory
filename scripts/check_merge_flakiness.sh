@@ -24,7 +24,7 @@
 # Exit codes:
 #   0  invariant holds    (value < threshold)
 #   1  invariant VIOLATED (value >= threshold)
-#   2  usage error (unknown or missing argument)
+#   2  usage error (unknown/missing argument, or non-numeric --threshold/--value)
 set -euo pipefail
 
 WINDOW_DAYS=""
@@ -35,19 +35,23 @@ SLEEP_SECS=0
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --window-days)
-            WINDOW_DAYS="${2:-}"
+            [ $# -ge 2 ] || { echo "check_merge_flakiness.sh: missing value for --window-days" >&2; exit 2; }
+            WINDOW_DAYS="$2"
             shift 2
             ;;
         --threshold)
-            THRESHOLD="${2:-}"
+            [ $# -ge 2 ] || { echo "check_merge_flakiness.sh: missing value for --threshold" >&2; exit 2; }
+            THRESHOLD="$2"
             shift 2
             ;;
         --value)
-            VALUE="${2:-}"
+            [ $# -ge 2 ] || { echo "check_merge_flakiness.sh: missing value for --value" >&2; exit 2; }
+            VALUE="$2"
             shift 2
             ;;
         --sleep-secs)
-            SLEEP_SECS="${2:-}"
+            [ $# -ge 2 ] || { echo "check_merge_flakiness.sh: missing value for --sleep-secs" >&2; exit 2; }
+            SLEEP_SECS="$2"
             shift 2
             ;;
         *)
@@ -62,11 +66,23 @@ if [ -z "$THRESHOLD" ] || [ -z "$VALUE" ]; then
     exit 2
 fi
 
+# Reject non-numeric input explicitly rather than letting awk silently
+# coerce garbage to 0 (which would misreport "invariant holds").
+NUMERIC_RE='^-?[0-9]+([.][0-9]+)?$'
+if ! [[ "$VALUE" =~ $NUMERIC_RE ]]; then
+    echo "check_merge_flakiness.sh: --value must be numeric, got: ${VALUE}" >&2
+    exit 2
+fi
+if ! [[ "$THRESHOLD" =~ $NUMERIC_RE ]]; then
+    echo "check_merge_flakiness.sh: --threshold must be numeric, got: ${THRESHOLD}" >&2
+    exit 2
+fi
+
 if [ "$SLEEP_SECS" != "0" ]; then
     sleep "$SLEEP_SECS"
 fi
 
-if awk "BEGIN { exit !($VALUE < $THRESHOLD) }"; then
+if awk -v v="$VALUE" -v t="$THRESHOLD" 'BEGIN { exit !(v < t) }'; then
     echo "check_merge_flakiness: value=${VALUE} threshold=${THRESHOLD} window_days=${WINDOW_DAYS} -- invariant holds"
     exit 0
 else
