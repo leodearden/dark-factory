@@ -1443,6 +1443,12 @@ def _run_write_decision(
     files open decisions; state transitions are the cockpit's job via
     update_decision_state). Root resolves via $CLAUDE_FLEET_ROOT, same as
     every other verb.
+
+    On success, prints the filed record's id (mirrors `launching` printing
+    the record dir and `lease-claim` printing `decision=`) so the caller can
+    cross-link it into its in-session note or afk-digest line. write_decision
+    is itself self-guarding fail-soft (never raises), so a fault there is
+    silently skipped here rather than printed as a false confirmation.
     """
     record = DecisionRecord(
         id=decision_id,
@@ -1453,7 +1459,8 @@ def _run_write_decision(
         escalation_id=escalation_id,
         session_id=session_id,
     )
-    write_decision(record)
+    if write_decision(record):
+        print(record.id)
 
 
 def _build_parser() -> argparse.ArgumentParser:
