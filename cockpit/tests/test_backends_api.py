@@ -1,10 +1,9 @@
 """Tests for the cockpit.backends package public surface (PRD §6.2 / C4).
 
-cockpit.backends.__init__ doesn't re-export anything yet (see its module
-comment), so every test here imports through the *package* — `from
-cockpit.backends import ...` — rather than the submodules, making the whole
-file ImportError-RED until step-10 fills in the re-exports. This is the
-single import surface C5b and C-smoke consume.
+cockpit.backends.__init__ re-exports the full public API, so every test here
+imports through the *package* — `from cockpit.backends import ...` — rather
+than the submodules. This is the single import surface C5b and C-smoke
+consume.
 """
 
 from __future__ import annotations

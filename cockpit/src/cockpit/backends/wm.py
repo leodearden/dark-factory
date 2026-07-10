@@ -87,9 +87,17 @@ class WmBackend:
                 )
 
     def is_alive(self, target: DisplayTarget) -> bool:
-        """Whether target's title still appears in `wmctrl -l`'s output."""
-        if not target.wm_title:
-            logger.warning('WmBackend.is_alive: target has no wm_title: %r', target)
+        """Whether target still resolves to a live window in `wmctrl -l`'s output.
+
+        `wmctrl -l` lines are `<id> <desktop> <host> <title>`; we parse those
+        fixed columns and compare the title field exactly (or the window id,
+        when known) rather than a raw substring, so e.g. title 'a' can't
+        false-positive against a longer title like 'session-a'.
+        """
+        if not target.wm_title and not target.wm_window_id:
+            logger.warning(
+                'WmBackend.is_alive: target has no wm_title or wm_window_id: %r', target
+            )
             return False
 
         result = self._run(['wmctrl', '-l'])
@@ -99,4 +107,13 @@ class WmBackend:
             )
             return False
 
-        return target.wm_title in result.stdout
+        for line in result.stdout.splitlines():
+            columns = line.split(None, 3)
+            if len(columns) < 4:
+                continue
+            window_id, _desktop, _host, title = columns
+            if target.wm_window_id and window_id == target.wm_window_id:
+                return True
+            if target.wm_title and title == target.wm_title:
+                return True
+        return False

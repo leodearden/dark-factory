@@ -48,10 +48,12 @@ class FakeBackend:
         self.set_urgency_calls.append((target, on))
 
     def reorder(self, targets: Sequence[DisplayTarget]) -> None:
-        self.reorder_calls.append(targets)
+        # Snapshot, not a live reference: a caller that mutates/reuses its list
+        # after this call must not retroactively change the recorded history.
+        self.reorder_calls.append(list(targets))
 
     def tile(self, targets: Sequence[DisplayTarget], zone: Zone) -> None:
-        self.tile_calls.append((targets, zone))
+        self.tile_calls.append((list(targets), zone))
 
     def is_alive(self, target: DisplayTarget) -> bool:
         self.is_alive_calls.append(target)

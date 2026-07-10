@@ -182,6 +182,36 @@ class TestWmBackendIsAlive:
 
         assert backend.is_alive(target) is False
 
+    def test_false_when_wm_title_is_only_a_substring_of_a_different_title(self):
+        """Title 'a' must not match a longer, unrelated title like 'session-a'."""
+        from cockpit.backends.base import CommandResult, DisplayTarget
+        from cockpit.backends.wm import WmBackend
+
+        runner = ScriptedRunner(
+            results={
+                ('wmctrl', '-l'): CommandResult(returncode=0, stdout='0x01 0 host session-a\n')
+            }
+        )
+        backend = WmBackend(run=runner)
+        target = DisplayTarget(kind='wm', wm_title='a')
+
+        assert backend.is_alive(target) is False
+
+    def test_true_when_matched_by_wm_window_id_even_if_title_differs(self):
+        """A stale-title/renamed-window is still found via the window id column."""
+        from cockpit.backends.base import CommandResult, DisplayTarget
+        from cockpit.backends.wm import WmBackend
+
+        runner = ScriptedRunner(
+            results={
+                ('wmctrl', '-l'): CommandResult(returncode=0, stdout='0x01 0 host session-a\n')
+            }
+        )
+        backend = WmBackend(run=runner)
+        target = DisplayTarget(kind='wm', wm_title='renamed-title', wm_window_id='0x01')
+
+        assert backend.is_alive(target) is True
+
 
 class TestWmBackendGoneTarget:
     """Every op no-ops + warns (never raises) on a gone/unaddressable target — PRD §6.2 invariant."""

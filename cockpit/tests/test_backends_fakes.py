@@ -64,6 +64,33 @@ class TestFakeBackendCallBuckets:
 
         assert fake.tile_calls == [(targets, zone)]
 
+    def test_reorder_call_is_a_snapshot_not_a_live_reference(self):
+        """Mutating the caller's list after the call must not retroactively rewrite history."""
+        from cockpit.backends.base import DisplayTarget
+        from cockpit.backends.fakes import FakeBackend
+
+        fake = FakeBackend()
+        targets = [DisplayTarget(kind='wm', wm_title='a')]
+
+        fake.reorder(targets)
+        targets.append(DisplayTarget(kind='wm', wm_title='b'))
+
+        assert fake.reorder_calls == [[DisplayTarget(kind='wm', wm_title='a')]]
+
+    def test_tile_call_is_a_snapshot_not_a_live_reference(self):
+        """Mutating the caller's list after the call must not retroactively rewrite history."""
+        from cockpit.backends.base import DisplayTarget, Zone
+        from cockpit.backends.fakes import FakeBackend
+
+        fake = FakeBackend()
+        targets = [DisplayTarget(kind='wm', wm_title='a')]
+        zone = Zone(x=0, y=0, width=100, height=100)
+
+        fake.tile(targets, zone)
+        targets.append(DisplayTarget(kind='wm', wm_title='b'))
+
+        assert fake.tile_calls == [([DisplayTarget(kind='wm', wm_title='a')], zone)]
+
     def test_is_alive_is_recorded(self):
         from cockpit.backends.base import DisplayTarget
         from cockpit.backends.fakes import FakeBackend

@@ -34,6 +34,39 @@ class ScriptedRunner:
         return self._results.get(tuple(argv), self._default)
 
 
+class FakeTmuxWindowTable:
+    """Simulates just enough of tmux's move-window semantics to catch collisions.
+
+    Tracks a live `{"session:index": window_id}` table. A move whose
+    destination index is already occupied by a *different* window fails
+    exactly like real tmux does ("index in use"), so a reorder implementation
+    that doesn't stage through a scratch range first gets caught colliding
+    instead of silently producing plausible-looking-but-wrong argv.
+    """
+
+    def __init__(self, windows):
+        self.windows = dict(windows)
+        self.calls: list[list[str]] = []
+
+    def __call__(self, argv):
+        from cockpit.backends.base import CommandResult
+
+        argv = list(argv)
+        self.calls.append(argv)
+        if argv[:2] != ['tmux', 'move-window']:
+            return CommandResult(returncode=0)
+
+        src = argv[argv.index('-s') + 1]
+        dst = argv[argv.index('-t') + 1]
+        if src not in self.windows:
+            return CommandResult(returncode=1, stderr=f'no such window: {src}')
+        if dst in self.windows:
+            return CommandResult(returncode=1, stderr="can't move window: index in use")
+
+        self.windows[dst] = self.windows.pop(src)
+        return CommandResult(returncode=0)
+
+
 class TestTmuxBackendFocus:
     def test_focus_issues_select_window_and_switch_client(self):
         from cockpit.backends.base import DisplayTarget
@@ -83,7 +116,11 @@ class TestTmuxBackendFocus:
 
 
 class TestTmuxBackendReorder:
-    def test_reorder_issues_move_window_in_priority_order(self):
+    def test_reorder_parks_then_places_in_priority_order(self):
+        """Two-phase argv shape: every target is parked at a scratch index first,
+        then placed at its final compacted index — never moved straight to a
+        destination another target in the same reorder might still occupy.
+        """
         from cockpit.backends.base import DisplayTarget
         from cockpit.backends.tmux import TmuxBackend
 
@@ -97,9 +134,31 @@ class TestTmuxBackendReorder:
         backend.reorder(targets)
 
         assert runner.calls == [
-            ['tmux', 'move-window', '-s', 's:2', '-t', 's:0'],
-            ['tmux', 'move-window', '-s', 's:0', '-t', 's:1'],
+            ['tmux', 'move-window', '-s', 's:2', '-t', 's:9000'],
+            ['tmux', 'move-window', '-s', 's:0', '-t', 's:9001'],
+            ['tmux', 'move-window', '-s', 's:9000', '-t', 's:0'],
+            ['tmux', 'move-window', '-s', 's:9001', '-t', 's:1'],
         ]
+
+    def test_reorder_succeeds_against_a_live_occupied_destination_index(self):
+        """Outcome-level proof: with destinations occupied by other targets awaiting
+        their own move (the common reorder case), a naive direct move-window would
+        fail with tmux's real 'index in use' error. The backend must still land the
+        final ordering, not just emit plausible-looking argv.
+        """
+        from cockpit.backends.base import DisplayTarget
+        from cockpit.backends.tmux import TmuxBackend
+
+        table = FakeTmuxWindowTable({'s:2': 'w2', 's:0': 'w0'})
+        backend = TmuxBackend(run=table)
+        targets = [
+            DisplayTarget(kind='tmux', tmux_target='s:2'),
+            DisplayTarget(kind='tmux', tmux_target='s:0'),
+        ]
+
+        backend.reorder(targets)
+
+        assert table.windows == {'s:0': 'w2', 's:1': 'w0'}
 
     def test_reorder_issues_zero_focus_commands(self):
         """Focus-preserving shape: reorder never touches select-window/switch-client."""
@@ -126,7 +185,10 @@ class TestTmuxBackendReorder:
             backend.reorder(targets)
 
         assert any(r.levelno == logging.WARNING for r in caplog.records)
-        assert runner.calls == [['tmux', 'move-window', '-s', 's:0', '-t', 's:1']]
+        assert runner.calls == [
+            ['tmux', 'move-window', '-s', 's:0', '-t', 's:9000'],
+            ['tmux', 'move-window', '-s', 's:9000', '-t', 's:1'],
+        ]
 
 
 class TestTmuxBackendSetUrgency:
@@ -186,6 +248,23 @@ class TestTmuxBackendIsAlive:
             results={
                 ('tmux', 'list-windows', '-a'): CommandResult(
                     returncode=0, stdout='other:0: bash\n'
+                )
+            }
+        )
+        backend = TmuxBackend(run=runner)
+        target = DisplayTarget(kind='tmux', tmux_target='s:0')
+
+        assert backend.is_alive(target) is False
+
+    def test_false_when_target_is_only_a_substring_of_another_windows_line(self):
+        """'s:0' must not match a line for 's:01' or a session literally named 'somes'."""
+        from cockpit.backends.base import CommandResult, DisplayTarget
+        from cockpit.backends.tmux import TmuxBackend
+
+        runner = ScriptedRunner(
+            results={
+                ('tmux', 'list-windows', '-a'): CommandResult(
+                    returncode=0, stdout='s:01: bash\nsomes:0: zsh\n'
                 )
             }
         )
