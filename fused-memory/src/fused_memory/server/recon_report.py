@@ -502,6 +502,54 @@ class ReconReportState:
             result['warnings'] = warnings
         return result
 
+    def delete_finding(self, run_id: str, finding_id: str) -> dict[str, Any]:
+        """Permanently remove a finding.  IRREVERSIBLE.
+
+        Mirrors ``delete_memory``'s semantics (server/tools.py): validate,
+        then perform an irreversible removal and return a structured
+        ``{'status': 'deleted', 'finding_id': ...}`` dict.  Scoped by
+        ``run_id`` + ``finding_id``.
+
+        The finding is resolved cross-stage via :meth:`_resolve_finding`
+        (same as the ``cite_*`` tools), so a finding filed by an earlier
+        stage of this run can still be deleted from a later stage.
+
+        Rejected with ``report_already_completed`` when the finding's
+        OWNING entry has already been completed — consistent with the
+        add_finding/set_stat/inc_stat post-completion guard, and protects
+        complete()'s cached ``flagged_count``/``stats`` from silent
+        corruption.  Retraction is intended for in-progress stages.
+
+        Only removes the finding from ``entry.findings`` and
+        ``_run_finding_index`` here; dedup-index cleanup
+        (``_run_sig_index`` / ``_run_desc_index`` and their per-entry
+        mirrors) is handled separately so a corrected finding can be
+        re-filed under the same signature/description.
+        """
+        entry = self._resolve_entry(run_id)
+        if entry is None:
+            return _ERR_RUN_UNKNOWN.copy()
+
+        resolved = self._resolve_finding(run_id, finding_id)
+        if resolved is None:
+            return _ERR_FINDING_UNKNOWN.copy()
+        owning_entry, finding = resolved
+
+        if owning_entry.completed_at is not None:
+            logger.warning(
+                'recon_report: delete_finding called after complete() for '
+                'run_id=%r stage=%r finding_id=%r; rejected',
+                run_id,
+                owning_entry.stage,
+                finding_id,
+            )
+            return _ERR_ALREADY_COMPLETED.copy()
+
+        owning_entry.findings.remove(finding)
+        self._run_finding_index.get(run_id, {}).pop(finding_id, None)
+
+        return {'status': 'deleted', 'finding_id': finding_id}
+
     def set_stat(
         self,
         run_id: str,
