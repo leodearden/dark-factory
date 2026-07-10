@@ -4619,6 +4619,16 @@ class SpeculativeMergeWorker(_WipHaltMixin):
     # deterministic coverage.  Mirrors the VERIFY_ABANDON_POLL_SECS
     # monkeypatch convention above.
     INFLIGHT_VERIFY_PROGRESS_PROBE_SECS: float = 60.0
+    # task 2420 (DEFECT 1): busy-loop guard for the no-progress abort trigger.
+    # After this many CONSECUTIVE no-progress aborts for the same task_id,
+    # the request resolves terminally as 'blocked' instead of being
+    # re-queued again — a deterministically-hanging verify would otherwise
+    # re-queue forever, churning a slot without ever making progress.
+    # Cleared on a successful verify for that task.  Kept as a class
+    # attribute so tests can monkeypatch it small (e.g.
+    # worker.MAX_INFLIGHT_DEAD_VERIFY_ABORTS = 2) for fast, deterministic
+    # coverage.  Mirrors the VERIFY_ABANDON_POLL_SECS monkeypatch convention.
+    MAX_INFLIGHT_DEAD_VERIFY_ABORTS: int = 3
     # MQ-invariants iota (task 1994): grace window (seconds, wall-clock mtime)
     # before an unregistered on-disk `_merge-*` worktree is flagged by
     # worktree_ledger_violations().  Tactical default sits strictly between
@@ -4773,6 +4783,15 @@ class SpeculativeMergeWorker(_WipHaltMixin):
         # tip-advance equivalence failure; popped on a clean 'done' landing
         # or bound-exceeded escalation.
         self._generation_chain_counts: dict[str, int] = {}
+        # task 2420 (DEFECT 1): per-task consecutive in-flight-verify
+        # no-progress-abort counter (abort trigger 3).  Incremented each time
+        # the LOCAL no-progress budget fires for a task; once it reaches
+        # MAX_INFLIGHT_DEAD_VERIFY_ABORTS the request resolves terminally as
+        # 'blocked' instead of being re-queued again, converting a
+        # deterministically-hanging verify into a loud escalation rather than
+        # an unbounded busy-loop.  Cleared on a successful verify for that
+        # task so a later transient hang starts counting fresh.
+        self._inflight_dead_verify_aborts: dict[str, int] = {}
         # Speculation-depth cap: one permit consumed by the Merger when it
         # prefetches a speculative item; released by the Verifier when it drains
         # that speculative item.  Symmetric accounting: acquire=prefetch,
@@ -9573,19 +9592,45 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                             _last_progress_at = _now
                     _no_progress_secs = _now - _last_progress_at
                     if _no_progress_secs >= self.INFLIGHT_VERIFY_PROGRESS_BUDGET_SECS:
+                        # Busy-loop guard (task 2420): count CONSECUTIVE
+                        # no-progress aborts per task_id.  Once the count
+                        # reaches MAX_INFLIGHT_DEAD_VERIFY_ABORTS, stop
+                        # re-queuing and resolve terminally instead —
+                        # converting a deterministically-hanging verify into
+                        # a loud 'blocked' escalation rather than an
+                        # unbounded churn of the same dead slot.  Cleared on
+                        # a successful verify for this task (see the `out is
+                        # None` pass path below).
+                        _dead_abort_n = self._inflight_dead_verify_aborts.get(req.task_id, 0) + 1
+                        self._inflight_dead_verify_aborts[req.task_id] = _dead_abort_n
+                        _busy_loop_capped = _dead_abort_n >= self.MAX_INFLIGHT_DEAD_VERIFY_ABORTS
                         logger.warning(
                             'Task %s: no in-flight verify progress for %.0fs '
-                            '(budget=%.0fs) — aborting and re-queuing merge for '
-                            're-verify',
+                            '(budget=%.0fs) — %s (%d/%d consecutive dead aborts)',
                             req.task_id,
                             _no_progress_secs,
                             self.INFLIGHT_VERIFY_PROGRESS_BUDGET_SECS,
+                            'abandoning without re-queue' if _busy_loop_capped
+                            else 'aborting and re-queuing merge for re-verify',
+                            _dead_abort_n,
+                            self.MAX_INFLIGHT_DEAD_VERIFY_ABORTS,
                         )
                         await self._abort_remote_verify(lease, req.task_id)
                         verify_task.cancel()
                         with contextlib.suppress(BaseException):
                             await verify_task
                         await self._release_or_cleanup(merge_wt, spec_warm=_spec_warm)
+                        if _busy_loop_capped:
+                            err_outcome = MergeOutcome(
+                                'blocked',
+                                reason=(
+                                    'repeated dead/hung in-flight verify (no '
+                                    f'progress for budget) x{_dead_abort_n}'
+                                ),
+                            )
+                            if not req.result.done():
+                                req.result.set_result(err_outcome)
+                            return InflightVerifyResult(outcome=err_outcome, merge_wt=None)
                         self._queue.put_nowait(req)
                         self._request_ledger.on_requeued(req.request_id)
                         return InflightVerifyResult(
@@ -9625,6 +9670,10 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                 f'Task {req.task_id}: verify end (merge={merge_commit[:8]}, '
                 f'passed=True)'
             )
+            # task 2420: a successful verify clears the per-task no-progress
+            # busy-loop counter so a later transient hang starts a fresh count
+            # rather than inheriting stale prior-episode aborts.
+            self._inflight_dead_verify_aborts.pop(req.task_id, None)
             if _warm_capture:
                 _warm_results = parse_per_test_results(_warm_capture[0].test_output or '')
                 if not _warm_results and req.config.git.warm_verify_shadow_compare:

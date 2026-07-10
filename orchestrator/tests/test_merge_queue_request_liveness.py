@@ -37,6 +37,7 @@ import contextlib
 import logging
 import time
 from pathlib import Path
+from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -792,7 +793,7 @@ class TestDeadInflightVerifyAborts:
         worker.INFLIGHT_VERIFY_PROGRESS_PROBE_SECS = 0.02
         worker.INFLIGHT_VERIFY_PROGRESS_BUDGET_SECS = 0.2
 
-        async def _healthy_writing_gate(*args: object, **kwargs: object) -> MagicMock:
+        async def _healthy_writing_gate(*args: Any, **kwargs: object) -> MagicMock:
             merge_wt_arg = Path(args[0])
             target = merge_wt_arg / 'target'
             target.mkdir(exist_ok=True)
@@ -948,6 +949,10 @@ class TestRepeatedDeadVerifyBusyLoopCap:
             )
         assert result1.status == InflightStatus.REQUEUED
         assert not req1.result.done()
+        # Drain the re-queued req1 so it doesn't shadow the emptiness checks
+        # below — a real merger loop would dequeue it well before the next
+        # dispatch attempt lands.
+        assert q.get_nowait() is req1
 
         # ── Attempt 2 (MAX-th, same task_id): dead verify → terminal 'blocked' ──
         req2, item2 = await _make_merged_item(
