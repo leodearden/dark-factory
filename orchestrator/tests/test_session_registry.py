@@ -537,6 +537,35 @@ def test_main_exit_sets_status_exited_and_exit_code(
     assert record.exit_code == 3
 
 
+def test_main_launching_populates_result_file_and_exit_preserves_it(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Attention Rail T5: `launching` must allocate a deterministic result.md
+    path inside the record dir, and the `exit` read-modify-write must preserve
+    it through to the EXITED record (result_file is set once, at launch, and
+    never touched again).
+    """
+    _set_env(monkeypatch, _launching_env(tmp_path))
+
+    sr.main(['launching'])
+    record_dir = capsys.readouterr().out.strip()
+
+    slug = sr.build_session_slug('unblock', 'df', '2085', 4242)
+    expected_result_file = str(sr.record_path_for_slug(slug, root=tmp_path).parent / 'result.md')
+
+    launching_record = sr.read_record(slug, root=tmp_path)
+    assert launching_record.result_file is not None
+    assert launching_record.result_file == expected_result_file
+
+    rc = sr.main(['exit', '--record', record_dir, '--code', '3'])
+    assert rc == 0
+
+    exited_record = sr.read_record(slug, root=tmp_path)
+    assert exited_record.result_file == expected_result_file
+
+
 def test_main_refresh_sets_status(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
