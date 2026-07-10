@@ -31,7 +31,9 @@ def _make_record(**overrides: object) -> sr.SessionRecord:
 
     Every field is given a concrete, distinguishable value so a round-trip
     test can catch a field being dropped/mis-typed; ``overrides`` lets a
-    test tweak just the field(s) it cares about.
+    test tweak just the field(s) it cares about. Includes the C1 schema
+    extensions (parent_session_id/spawn_mode/display/question) alongside the
+    original rail fields.
     """
     # Declared as a bare `dict` (not `dict[str, object]`) so pyright treats it
     # as dict[Unknown, Unknown] at the **fields unpack below -- mirrors
@@ -53,6 +55,12 @@ def _make_record(**overrides: object) -> sr.SessionRecord:
         'exit_code': None,
         'result_file': None,
         'transcript_path': '~/.claude/projects/-home-leo-src-dark-factory',
+        'parent_session_id': 'root-df-1-1',
+        'spawn_mode': 'sibling',
+        'display': sr.Display(
+            kind='wm', wm_title='unblock:df#2085 slug', wm_window_id='0x1a', tmux_target=None
+        ),
+        'question': sr.Question(text='approve rollout?', asked_at='2026-07-07T00:00:00+00:00'),
     }
     fields.update(overrides)
     return sr.SessionRecord(**fields)
@@ -130,6 +138,191 @@ def test_session_record_json_round_trip_with_null_fields() -> None:
         transcript_path=None,
     )
     assert sr.SessionRecord.from_json(r.to_json()) == r
+
+
+# ---------------------------------------------------------------------------
+# Step-1: SessionRecord C1 schema extensions (B1) -- Fleet Cockpit
+# parent_session_id/spawn_mode/display/question, SCHEMA_MINOR, SpawnMode,
+# DisplayKind, Display, Question. Additive + migration-free: a rail-vintage
+# dict (no C1 keys) must still parse, defaulting the new fields.
+# ---------------------------------------------------------------------------
+
+
+def test_session_record_round_trip_includes_new_c1_fields() -> None:
+    r = _make_record()
+    assert sr.SessionRecord.from_dict(r.to_dict()) == r
+    assert sr.SessionRecord.from_json(r.to_json()) == r
+
+    # A display whose optional wm_window_id/tmux_target are both None must
+    # also round-trip losslessly (None-safe nested (dis)assembly).
+    r_none_optionals = _make_record(
+        display=sr.Display(
+            kind='wm', wm_title='unblock:df#2085 slug', wm_window_id=None, tmux_target=None
+        ),
+    )
+    assert sr.SessionRecord.from_dict(r_none_optionals.to_dict()) == r_none_optionals
+    assert sr.SessionRecord.from_json(r_none_optionals.to_json()) == r_none_optionals
+
+    # A record with no parent/display/question at all (the common
+    # human-launched-root shape) must also round-trip losslessly.
+    r_all_none = _make_record(parent_session_id=None, display=None, question=None)
+    assert sr.SessionRecord.from_dict(r_all_none.to_dict()) == r_all_none
+    assert sr.SessionRecord.from_json(r_all_none.to_json()) == r_all_none
+
+
+def test_session_record_parses_rail_vintage_dict_migration_free() -> None:
+    """A dict written by the pre-C1 (rail) module -- containing only the
+    original schema keys, no parent_session_id/spawn_mode/display/question --
+    must still parse via from_dict without raising, defaulting the new C1
+    fields to None/'child'/None/None (migration-free additive contract).
+    """
+    rail_vintage = {
+        'schema_version': 1,
+        'session_slug': 'unblock-df-2085-4242',
+        'title': 'unblock:df#2085 routing-mechanism',
+        'role': 'unblock',
+        'project': 'df',
+        'task_id': '2085',
+        'escalation_id': 'esc-1',
+        'prompt': '/unblock 2085',
+        'cwd': '/home/leo/src/dark-factory',
+        'launcher_pid': 4242,
+        'start_ts': '2026-07-07T00:00:00+00:00',
+        'status': 'launching',
+        'exit_code': None,
+        'result_file': None,
+        'transcript_path': '~/.claude/projects/-home-leo-src-dark-factory',
+    }
+    record = sr.SessionRecord.from_dict(rail_vintage)
+    assert record.parent_session_id is None
+    assert record.spawn_mode == sr.SpawnMode.CHILD
+    assert record.display is None
+    assert record.question is None
+
+
+def test_schema_minor_is_int_bumped() -> None:
+    assert isinstance(sr.SCHEMA_MINOR, int)
+    assert sr.SCHEMA_MINOR >= 1
+    # The PERSISTED major must stay migration-free: bumping it would make
+    # rail-vintage and C1 records version-distinguishable on disk.
+    assert sr.SCHEMA_VERSION == 1
+
+
+def test_spawn_mode_enum_values() -> None:
+    assert issubclass(sr.SpawnMode, str)
+    assert {m.value for m in sr.SpawnMode} == {'child', 'sibling', 'detached'}
+    assert sr.SpawnMode.CHILD.value == 'child'
+    assert sr.SpawnMode.SIBLING.value == 'sibling'
+    assert sr.SpawnMode.DETACHED.value == 'detached'
+
+
+def test_display_kind_enum_values() -> None:
+    assert issubclass(sr.DisplayKind, str)
+    assert {m.value for m in sr.DisplayKind} == {'wm', 'tmux'}
+    assert sr.DisplayKind.WM.value == 'wm'
+    assert sr.DisplayKind.TMUX.value == 'tmux'
+
+
+def test_display_round_trip() -> None:
+    with_optionals = sr.Display(
+        kind='wm', wm_title='unblock:df#2085 slug', wm_window_id='0x1a', tmux_target=None
+    )
+    assert sr.Display.from_dict(with_optionals.to_dict()) == with_optionals
+
+    without_optionals = sr.Display(
+        kind='tmux', wm_title='', wm_window_id=None, tmux_target='session:0.1'
+    )
+    assert sr.Display.from_dict(without_optionals.to_dict()) == without_optionals
+
+
+def test_question_round_trip() -> None:
+    q = sr.Question(text='approve rollout?', asked_at='2026-07-07T00:00:00+00:00')
+    assert sr.Question.from_dict(q.to_dict()) == q
+
+
+# ---------------------------------------------------------------------------
+# Step-3: DecisionRecord type + paths (B2) -- Fleet Cockpit
+# ---------------------------------------------------------------------------
+
+
+def _make_decision(**overrides: object) -> sr.DecisionRecord:
+    """Build a fully-populated DecisionRecord for round-trip/identity tests.
+
+    Mirrors _make_record's kwargs-builder idiom: every field is given a
+    concrete, distinguishable value so a round-trip test can catch a field
+    being dropped/mis-typed; ``overrides`` lets a test tweak just the
+    field(s) it cares about.
+    """
+    fields: dict = {
+        'id': 'dec-1',
+        'project': 'df',
+        'text': 'approve?',
+        'filed_at': '2026-07-07T00:00:00+00:00',
+        'session_id': 'unblock-df-2085-4242',
+        'task_id': '2085',
+        'escalation_id': 'esc-1',
+        'options': ['yes', 'no'],
+        'manual_boost': 2,
+        'state': 'answered',
+    }
+    fields.update(overrides)
+    return sr.DecisionRecord(**fields)
+
+
+def test_decision_state_enum_values() -> None:
+    assert issubclass(sr.DecisionState, str)
+    assert {m.value for m in sr.DecisionState} == {'open', 'answered', 'dropped'}
+    assert sr.DecisionState.OPEN.value == 'open'
+    assert sr.DecisionState.ANSWERED.value == 'answered'
+    assert sr.DecisionState.DROPPED.value == 'dropped'
+
+
+def test_decision_record_dict_round_trip_is_lossless() -> None:
+    d = _make_decision()
+    assert sr.DecisionRecord.from_dict(d.to_dict()) == d
+
+
+def test_decision_record_json_round_trip_is_lossless() -> None:
+    d = _make_decision()
+    assert sr.DecisionRecord.from_json(d.to_json()) == d
+
+
+def test_decision_record_round_trip_with_null_fields() -> None:
+    """session_id/task_id/escalation_id/options may legitimately be None (a
+    project-level decision with no session/task/escalation context yet);
+    the round trip must preserve that, not coerce it or drop the key.
+    """
+    d = _make_decision(session_id=None, task_id=None, escalation_id=None, options=None)
+    round_tripped = sr.DecisionRecord.from_dict(d.to_dict())
+    assert round_tripped == d
+    assert round_tripped.session_id is None
+    assert round_tripped.task_id is None
+    assert round_tripped.escalation_id is None
+    assert round_tripped.options is None
+
+
+def test_decision_record_defaults() -> None:
+    d = sr.DecisionRecord(
+        id='dec-1', project='df', text='approve?', filed_at='2026-07-07T00:00:00+00:00'
+    )
+    assert d.manual_boost == 0
+    assert d.state == sr.DecisionState.OPEN
+
+
+def test_decision_path_for_id_under_decisions_dir(tmp_path: Path) -> None:
+    assert sr.decision_path_for_id('dec-1', root=tmp_path) == tmp_path / 'decisions' / 'dec-1.json'
+
+
+def test_decision_path_for_id_sanitizes_unsafe_id(tmp_path: Path) -> None:
+    # An id containing '/' must not escape decisions_dir: it still resolves
+    # to a single file directly inside decisions_dir (no nested directory,
+    # no traversal) -- mirrors lease_path_for_name's path-escape guard.
+    path = sr.decision_path_for_id('../../etc/passwd', root=tmp_path)
+    assert path.parent == sr.decisions_dir(root=tmp_path)
+    # Lock the actual sanitized stem, not just "has the right parent": every
+    # '/' maps to '-' via _DECISION_ID_SANITIZE_RE while '.' is preserved.
+    assert path.name == '..-..-etc-passwd.json'
+    assert '/' not in path.name
 
 
 # ---------------------------------------------------------------------------
@@ -249,6 +442,111 @@ def test_refresh_record_updates_existing_record_under_same_key(tmp_path: Path) -
     reread = sr.read_record(r.session_slug, root=tmp_path)
     assert reread.status == sr.Status.RUNNING
     assert sr.record_path_for_slug(r.session_slug, root=tmp_path) == path_before
+
+
+# ---------------------------------------------------------------------------
+# Step-5: decision helpers (B2) -- Fleet Cockpit
+# ---------------------------------------------------------------------------
+
+
+def test_write_then_list_decision(tmp_path: Path) -> None:
+    rec = _make_decision()
+
+    assert sr.write_decision(rec, root=tmp_path) is True
+
+    listed = sr.list_decisions(root=tmp_path)
+    assert len(listed) == 1
+    assert listed[0] == rec
+
+
+def test_update_decision_state_persists(tmp_path: Path) -> None:
+    rec = _make_decision(state=sr.DecisionState.OPEN)
+    sr.write_decision(rec, root=tmp_path)
+
+    updated = sr.update_decision_state(rec.id, sr.DecisionState.ANSWERED, root=tmp_path)
+
+    assert updated is not None
+    assert updated.state == sr.DecisionState.ANSWERED
+    [reread] = [d for d in sr.list_decisions(root=tmp_path) if d.id == rec.id]
+    assert reread.state == sr.DecisionState.ANSWERED
+
+
+def test_set_manual_boost_persists(tmp_path: Path) -> None:
+    rec = _make_decision(manual_boost=0)
+    sr.write_decision(rec, root=tmp_path)
+
+    updated = sr.set_manual_boost(rec.id, 3, root=tmp_path)
+
+    assert updated is not None
+    assert updated.manual_boost == 3
+    [reread] = [d for d in sr.list_decisions(root=tmp_path) if d.id == rec.id]
+    assert reread.manual_boost == 3
+
+
+def test_decisions_are_per_file_isolated(tmp_path: Path) -> None:
+    """Distinct <id>.json paths are the whole isolation guarantee: writing or
+    updating one decision must never touch another's file (no global index,
+    no shared body -- mirrors each session record's own directory).
+    """
+    rec_a = _make_decision(id='dec-a')
+    rec_b = _make_decision(id='dec-b')
+    sr.write_decision(rec_a, root=tmp_path)
+    sr.write_decision(rec_b, root=tmp_path)
+
+    path_a = sr.decision_path_for_id('dec-a', root=tmp_path)
+    path_b = sr.decision_path_for_id('dec-b', root=tmp_path)
+    assert path_a.is_file()
+    assert path_b.is_file()
+    assert path_a != path_b
+    assert {d.id for d in sr.list_decisions(root=tmp_path)} == {'dec-a', 'dec-b'}
+
+    bytes_b_before = path_b.read_bytes()
+    sr.set_manual_boost('dec-a', 9, root=tmp_path)
+    assert path_b.read_bytes() == bytes_b_before
+
+
+def test_list_decisions_missing_dir_returns_empty(tmp_path: Path) -> None:
+    assert sr.list_decisions(root=tmp_path) == []
+
+
+def test_list_decisions_skips_corrupt_file(
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    rec = _make_decision()
+    sr.write_decision(rec, root=tmp_path)
+    corrupt_path = sr.decisions_dir(root=tmp_path) / 'bogus.json'
+    corrupt_path.write_text('{not valid json')
+
+    with caplog.at_level(logging.ERROR):
+        listed = sr.list_decisions(root=tmp_path)
+
+    assert [d.id for d in listed] == [rec.id]
+    assert any(r.levelno >= logging.ERROR for r in caplog.records)
+
+
+def test_write_decision_fail_soft_on_unwritable_root(
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    # Mirrors test_main_launching_fail_soft_when_fleet_root_under_a_file: a
+    # root rooted under a pre-created regular file makes the write's
+    # mkdir(parents=True) raise NotADirectoryError deterministically.
+    blocker = tmp_path / 'blocker'
+    blocker.write_text('not a directory')
+    bad_root = blocker / 'fleet'
+
+    with caplog.at_level(logging.ERROR):
+        result = sr.write_decision(_make_decision(), root=bad_root)
+
+    assert result is False
+    assert any(r.levelno >= logging.ERROR for r in caplog.records)
+    assert not (blocker / 'fleet').exists()
+
+
+def test_update_and_set_boost_fail_soft_when_absent(tmp_path: Path) -> None:
+    assert sr.update_decision_state('no-such-id', sr.DecisionState.ANSWERED, root=tmp_path) is None
+    assert sr.set_manual_boost('no-such-id', 5, root=tmp_path) is None
 
 
 # ---------------------------------------------------------------------------

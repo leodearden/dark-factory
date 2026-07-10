@@ -1223,3 +1223,153 @@ def test_spawn_fail_soft_skips_result_handback_when_registry_faults(
         f"expected no 'result.md' substring anywhere in the prompt claude "
         f"received, got:\n{captured_prompt!r}"
     )
+
+
+# ===========================================================================
+# task-2291 step-7: Fleet Cockpit C1 spawn env exports (child/parent identity)
+# ===========================================================================
+# CLAUDE_SPAWN_SESSION_ID/CLAUDE_SPAWN_PARENT_ID let the spawned child (and
+# its own descendants) discover its own registry identity and its direct
+# spawner's, without re-deriving either from SESSION_RECORD_DIR. Default
+# 'child' spawn_mode: the child's parent-of-record is the DIRECT spawner --
+# this spawn-claude.sh invocation's own inherited CLAUDE_SPAWN_SESSION_ID.
+# Both exports mirror result_export's no-op-when-empty idiom, so a registry
+# fault (SESSION_RECORD_DIR empty) cleanly exports neither.
+
+
+def _write_fake_claude_capturing_env(
+    bin_dir: pathlib.Path, capture_file: pathlib.Path
+) -> None:
+    """Write a fake ``claude`` that captures its own CLAUDE_SPAWN_SESSION_ID
+    and CLAUDE_SPAWN_PARENT_ID env vars to *capture_file*, then exits 0.
+
+    Modeled on ``_write_fake_claude_capturing_prompt`` -- lets a test inspect
+    exactly what the two Fleet Cockpit C1 identity exports resolved to for
+    the spawned child process.
+    """
+    p = bin_dir / "claude"
+    p.write_text(
+        "#!/usr/bin/env bash\n"
+        "{\n"
+        '  echo "SESSION=${CLAUDE_SPAWN_SESSION_ID:-}"\n'
+        '  echo "PARENT=${CLAUDE_SPAWN_PARENT_ID:-}"\n'
+        f"}} > {capture_file!s}\n"
+        "exit 0\n"
+    )
+    p.chmod(0o755)
+
+
+def _parse_captured_env(capture_file: pathlib.Path) -> dict[str, str]:
+    """Parse the ``KEY=value`` lines written by _write_fake_claude_capturing_env."""
+    parsed: dict[str, str] = {}
+    for line in capture_file.read_text().splitlines():
+        key, _, value = line.partition("=")
+        parsed[key] = value
+    return parsed
+
+
+def test_spawn_exports_session_and_parent_ids(tmp_path: pathlib.Path) -> None:
+    """The child sees its OWN new session_slug as CLAUDE_SPAWN_SESSION_ID, and
+    the spawner's own inherited CLAUDE_SPAWN_SESSION_ID as
+    CLAUDE_SPAWN_PARENT_ID (default 'child' spawn_mode: parent-of-record is
+    the direct spawner).
+    """
+    bin_dir = _make_bin_dir(tmp_path)
+    capture_file = tmp_path / "captured_env.txt"
+    _write_fake_claude_capturing_env(bin_dir, capture_file)
+    _write_foreground_terminal(bin_dir, "xterm")
+    env = _base_env(bin_dir, "xterm")
+    # Simulate this spawn-claude.sh invocation itself being run BY an
+    # already-spawned parent session -- the spawner's own inherited identity
+    # token that this new child's CLAUDE_SPAWN_PARENT_ID must carry forward.
+    env.pop("CLAUDE_SPAWN_PARENT_ID", None)
+    env["CLAUDE_SPAWN_SESSION_ID"] = "root-df-1-1"
+
+    result = _run_spawn(env, tmp_path)
+    assert result.returncode == 0, f"stderr: {result.stderr.decode()}"
+
+    fleet_root = pathlib.Path(env["CLAUDE_FLEET_ROOT"])
+    record_path = _find_one_record(fleet_root)
+    record = session_registry.SessionRecord.from_json(record_path.read_text())
+
+    captured = _parse_captured_env(capture_file)
+    assert captured.get("SESSION") == record.session_slug, (
+        f"expected the child's own new session_slug, got {captured!r}"
+    )
+    assert captured.get("PARENT") == "root-df-1-1", (
+        f"expected the spawner's own inherited session id as the parent, got {captured!r}"
+    )
+
+
+def test_spawn_parent_id_empty_for_human_root(tmp_path: pathlib.Path) -> None:
+    """A human-launched root has no CLAUDE_SPAWN_SESSION_ID of its own to
+    inherit, so the child's CLAUDE_SPAWN_PARENT_ID must be empty -- while the
+    child still gets its own freshly-minted CLAUDE_SPAWN_SESSION_ID.
+    """
+    bin_dir = _make_bin_dir(tmp_path)
+    capture_file = tmp_path / "captured_env.txt"
+    _write_fake_claude_capturing_env(bin_dir, capture_file)
+    _write_foreground_terminal(bin_dir, "xterm")
+    env = _base_env(bin_dir, "xterm")
+    env.pop("CLAUDE_SPAWN_SESSION_ID", None)
+    env.pop("CLAUDE_SPAWN_PARENT_ID", None)
+
+    result = _run_spawn(env, tmp_path)
+    assert result.returncode == 0, f"stderr: {result.stderr.decode()}"
+
+    fleet_root = pathlib.Path(env["CLAUDE_FLEET_ROOT"])
+    record_path = _find_one_record(fleet_root)
+    record = session_registry.SessionRecord.from_json(record_path.read_text())
+
+    captured = _parse_captured_env(capture_file)
+    assert captured.get("SESSION") == record.session_slug
+    assert captured.get("PARENT") == "", (
+        f"a human-launched root has no parent to report, got {captured!r}"
+    )
+
+
+def test_spawn_id_exports_fail_soft_when_registry_faults(tmp_path: pathlib.Path) -> None:
+    """A forced registry-write failure (SESSION_RECORD_DIR empty) must yield
+    clean no-op exports -- with no ambient CLAUDE_SPAWN_SESSION_ID/PARENT_ID
+    to leak through, the child sees both empty -- while the pre-existing
+    exit-code contract is untouched (mirrors
+    test_spawn_fail_soft_on_unwritable_fleet_root).
+
+    Green-on-arrival guard (matches
+    test_spawn_fail_soft_skips_result_handback_when_registry_faults'
+    precedent): step-8 gates both exports on a non-empty SESSION_RECORD_DIR,
+    so with no ambient identity env to leak through this already passes
+    pre-implementation too -- it locks the fail-soft contract rather than
+    demonstrating a RED->GREEN transition.
+    """
+    bin_dir = _make_bin_dir(tmp_path)
+    capture_file = tmp_path / "captured_env.txt"
+    _write_fake_claude_capturing_env(bin_dir, capture_file)
+    _write_foreground_terminal(bin_dir, "xterm")
+    env = _base_env(bin_dir, "xterm")
+    env.pop("CLAUDE_SPAWN_SESSION_ID", None)
+    env.pop("CLAUDE_SPAWN_PARENT_ID", None)
+
+    # Shadow _base_env's CLAUDE_FLEET_ROOT with one that can never be
+    # created: a path nested UNDER a pre-existing regular file (same trick
+    # as test_spawn_fail_soft_on_unwritable_fleet_root).
+    blocker = tmp_path / "not_a_dir"
+    blocker.write_text("i am a regular file, not a directory\n")
+    env["CLAUDE_FLEET_ROOT"] = str(blocker / "fleet")
+
+    result = _run_spawn(env, tmp_path)
+
+    assert result.returncode == 0, (
+        f"a registry fault must never change the exit-code contract: "
+        f"got {result.returncode}\nstderr: {result.stderr.decode()}"
+    )
+
+    fleet_root = pathlib.Path(env["CLAUDE_FLEET_ROOT"])
+    assert not fleet_root.exists(), (
+        f"no record dir should have been created under an unwritable fleet "
+        f"root, but {fleet_root} exists"
+    )
+
+    captured = _parse_captured_env(capture_file)
+    assert captured.get("SESSION") == "", f"expected a clean no-op export, got {captured!r}"
+    assert captured.get("PARENT") == "", f"expected a clean no-op export, got {captured!r}"

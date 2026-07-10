@@ -43,6 +43,18 @@ logger = logging.getLogger(__name__)
 
 SCHEMA_VERSION = 1
 
+SCHEMA_MINOR = 1
+"""Additive-extension counter for this module's contract (Fleet Cockpit C1,
+plans/fleet-cockpit-prd.md §6.1). A CODE-LEVEL signal only -- never persisted
+per-record. Bump this when a new backward-compatible (optional/defaulted)
+field is added; SCHEMA_VERSION (the PERSISTED major) stays unchanged so
+rail-vintage and post-extension records remain version-indistinguishable on
+disk, and any consumer gating on ``record.schema_version == 1`` keeps
+working unmodified. Not read by any consumer as of C1 -- it is intentional
+forward scaffolding (not dead code): a code-level seam later Fleet Cockpit
+steps (plans/fleet-cockpit-prd.md §2's C1-C10 decomposition) can consult
+when reasoning about additive schema drift."""
+
 RESULT_FILENAME = 'result.md'
 """Basename of the result-handback file inside each record dir (Attention
 Rail T5): ``<record_dir>/result.md``. Kept in sync BY CONVENTION (not
@@ -79,6 +91,98 @@ TERMINAL_STATUSES: frozenset[Status] = frozenset({Status.EXITED, Status.FAILED_T
 """Statuses past which a record is eligible for the terminal-TTL reap rule."""
 
 
+class SpawnMode(StrEnum):
+    """How a session relates to its parent (Fleet Cockpit C1, PRD §6.1).
+
+    Modeled as a StrEnum contract for writers, but ``SessionRecord.spawn_mode``
+    itself is a plain ``str`` field with NO from_dict coercion through this
+    enum -- an unrecognized/foreign value must still round-trip rather than
+    raise ``CorruptSessionRecord`` (additive-safe, unlike the closed-set
+    ``Status`` contract).
+
+    CHILD: spawned directly by a parent session; parent_session_id names the
+        direct spawner. The default -- see spawn-claude.sh's env-export
+        baseline.
+    SIBLING: spawned to run alongside a parent under a shared ancestor (C7);
+        parent_session_id names that shared ancestor, not the direct spawner.
+    DETACHED: spawned with no tracked parent linkage.
+    """
+
+    CHILD = 'child'
+    SIBLING = 'sibling'
+    DETACHED = 'detached'
+
+
+class DisplayKind(StrEnum):
+    """Where a session's terminal/pane lives, for focus-arrange (C4).
+
+    Not consumed within C1 itself -- ``Display.kind`` stores the wire value
+    as a plain ``str`` with no coercion through this enum (see Display's
+    docstring). This is intentional forward scaffolding, not dead code: it
+    is the named-constant contract that C4's wm/X11 and tmux focus-arrange
+    backends and C6's tmux lane (both PRD-declared as depending on C1;
+    plans/fleet-cockpit-prd.md §2) will match against once they land.
+    """
+
+    WM = 'wm'
+    TMUX = 'tmux'
+
+
+@dataclass
+class Display:
+    """Where to find/focus this session's terminal (Fleet Cockpit C1, PRD §6.1).
+
+    kind: DisplayKind's wire value ('wm' or 'tmux'); stored as a plain
+        ``str`` (no from_dict coercion -- see SpawnMode's docstring for why).
+    wm_title: the spawned terminal's window title, for a 'wm' kind's
+        window-manager lookup.
+    wm_window_id: the window-manager's own window id, when known.
+    tmux_target: a tmux target spec (e.g. ``'session:window.pane'``), for a
+        'tmux' kind.
+    """
+
+    kind: str
+    wm_title: str = ''
+    wm_window_id: str | None = None
+    tmux_target: str | None = None
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            'kind': self.kind,
+            'wm_title': self.wm_title,
+            'wm_window_id': self.wm_window_id,
+            'tmux_target': self.tmux_target,
+        }
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> Display:
+        return cls(
+            kind=data['kind'],
+            wm_title=data.get('wm_title', ''),
+            wm_window_id=data.get('wm_window_id'),
+            tmux_target=data.get('tmux_target'),
+        )
+
+
+@dataclass
+class Question:
+    """A pending question queued against this session (Fleet Cockpit C1, PRD §6.1).
+
+    text: the question text.
+    asked_at: ISO-8601 timestamp of when it was queued.
+    """
+
+    text: str
+    asked_at: str
+
+    def to_dict(self) -> dict[str, Any]:
+        return {'text': self.text, 'asked_at': self.asked_at}
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> Question:
+        return cls(text=data['text'], asked_at=data['asked_at'])
+
+
 @dataclass
 class SessionRecord:
     """One session-registry record — ``<fleet_root>/sessions/<slug>/record.json``.
@@ -105,6 +209,14 @@ class SessionRecord:
         `_run_launching` at launch time (``<record_dir>/RESULT_FILENAME``)
         and preserved unchanged by every later read-modify-write.
     transcript_path: best-effort ``~/.claude/projects/<encoded-cwd>`` path.
+    parent_session_id: the spawning session's own session_slug, or None for
+        a human-launched root (Fleet Cockpit C1, PRD §6.1).
+    spawn_mode: how this session relates to its parent; see SpawnMode.
+        Defaults to ``SpawnMode.CHILD``.
+    display: where to find/focus this session's terminal, or None if
+        unknown; see Display.
+    question: a pending question queued against this session, or None; see
+        Question.
     """
 
     session_slug: str
@@ -122,6 +234,10 @@ class SessionRecord:
     exit_code: int | None = field(default=None, kw_only=True)
     result_file: str | None = field(default=None, kw_only=True)
     transcript_path: str | None = field(default=None, kw_only=True)
+    parent_session_id: str | None = field(default=None, kw_only=True)
+    spawn_mode: str = field(default=SpawnMode.CHILD, kw_only=True)
+    display: Display | None = field(default=None, kw_only=True)
+    question: Question | None = field(default=None, kw_only=True)
 
     def to_dict(self) -> dict[str, Any]:
         """Return a plain, JSON-scalar-only dict (status as its wire string)."""
@@ -141,10 +257,16 @@ class SessionRecord:
             'exit_code': self.exit_code,
             'result_file': self.result_file,
             'transcript_path': self.transcript_path,
+            'parent_session_id': self.parent_session_id,
+            'spawn_mode': str(self.spawn_mode),
+            'display': self.display.to_dict() if self.display is not None else None,
+            'question': self.question.to_dict() if self.question is not None else None,
         }
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> SessionRecord:
+        display_data = data.get('display')
+        question_data = data.get('question')
         return cls(
             session_slug=data['session_slug'],
             status=Status(data['status']),
@@ -161,6 +283,10 @@ class SessionRecord:
             exit_code=data.get('exit_code'),
             result_file=data.get('result_file'),
             transcript_path=data.get('transcript_path'),
+            parent_session_id=data.get('parent_session_id'),
+            spawn_mode=data.get('spawn_mode', SpawnMode.CHILD),
+            display=Display.from_dict(display_data) if isinstance(display_data, dict) else None,
+            question=Question.from_dict(question_data) if isinstance(question_data, dict) else None,
         )
 
     def to_json(self) -> str:
@@ -168,6 +294,105 @@ class SessionRecord:
 
     @classmethod
     def from_json(cls, raw: str) -> SessionRecord:
+        return cls.from_dict(json.loads(raw))
+
+
+class DecisionState(StrEnum):
+    """Wire-format lifecycle state for a DecisionRecord (Fleet Cockpit C1, PRD §6.1).
+
+    Modeled as a StrEnum contract for writers, but ``DecisionRecord.state``
+    itself is a plain ``str`` field with NO from_dict coercion through this
+    enum -- mirrors SpawnMode's additive-safe rationale: an unrecognized
+    value must still round-trip rather than raise.
+
+    OPEN: filed, awaiting a human decision.
+    ANSWERED: a decision has been recorded.
+    DROPPED: withdrawn/superseded without an answer.
+    """
+
+    OPEN = 'open'
+    ANSWERED = 'answered'
+    DROPPED = 'dropped'
+
+
+@dataclass
+class DecisionRecord:
+    """One decision-record — ``<fleet_root>/decisions/<id>.json`` (Fleet Cockpit C1 B2, PRD §6.1).
+
+    Only id/project/text/filed_at are mandatory; every other field has a
+    documented default so a minimally-filed decision is still well-formed.
+    Mirrors LeaseHolder's plain to_dict/from_dict/to_json/from_json shape.
+
+    id: this record's identity/filename key; see decision_path_for_id.
+    project: the project_id this decision concerns.
+    text: the decision/question text as filed.
+    filed_at: ISO-8601 timestamp of when this decision was filed.
+    session_id: the session that filed this decision, or None.
+    task_id: the task this decision is scoped to, or None.
+    escalation_id: the escalation this decision resolves, or None.
+    options: the candidate answers offered, or None.
+    manual_boost: an operator-assigned priority nudge; defaults to 0.
+    state: current lifecycle state; see DecisionState. Defaults to
+        ``DecisionState.OPEN``.
+
+    Concurrency: unlike SessionRecord (single-writer-per-slug -- only the
+    spawning session ever mutates its own record), a single decision id's
+    file may be mutated by TWO different subsystems: a C8 watcher (via
+    update_decision_state) and the C5 cockpit (via set_manual_boost). Both
+    helpers are unsynchronized read-modify-write cycles with no cross-process
+    locking or compare-and-swap, so a concurrent state-update and
+    boost-update racing on the same id can silently drop one side's mutation
+    (last os.replace() wins). This is a known, accepted limitation --
+    consistent with the module's existing lock-free convention -- not a
+    per-record corruption risk (each write is still individually atomic).
+    See update_decision_state/set_manual_boost for the caller-facing note.
+    """
+
+    id: str
+    project: str
+    text: str
+    filed_at: str
+    session_id: str | None = field(default=None, kw_only=True)
+    task_id: str | None = field(default=None, kw_only=True)
+    escalation_id: str | None = field(default=None, kw_only=True)
+    options: list[str] | None = field(default=None, kw_only=True)
+    manual_boost: int = field(default=0, kw_only=True)
+    state: str = field(default=DecisionState.OPEN, kw_only=True)
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            'id': self.id,
+            'project': self.project,
+            'text': self.text,
+            'filed_at': self.filed_at,
+            'session_id': self.session_id,
+            'task_id': self.task_id,
+            'escalation_id': self.escalation_id,
+            'options': self.options,
+            'manual_boost': self.manual_boost,
+            'state': str(self.state),
+        }
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> DecisionRecord:
+        return cls(
+            id=data['id'],
+            project=data['project'],
+            text=data['text'],
+            filed_at=data['filed_at'],
+            session_id=data.get('session_id'),
+            task_id=data.get('task_id'),
+            escalation_id=data.get('escalation_id'),
+            options=data.get('options'),
+            manual_boost=data.get('manual_boost', 0),
+            state=data.get('state', DecisionState.OPEN),
+        )
+
+    def to_json(self) -> str:
+        return json.dumps(self.to_dict())
+
+    @classmethod
+    def from_json(cls, raw: str) -> DecisionRecord:
         return cls.from_dict(json.loads(raw))
 
 
@@ -233,6 +458,27 @@ def transcript_path_for_cwd(cwd: str) -> str:
     return f'~/.claude/projects/{encoded}'
 
 
+_DECISION_ID_SANITIZE_RE = re.compile(r'[^A-Za-z0-9._-]')
+"""Mirrors _SLUG_SANITIZE_RE: anything outside [A-Za-z0-9._-] maps to '-', so
+a malformed decision id can never escape decisions_dir via a path
+separator."""
+
+
+def decisions_dir(root: Path | str | None = None) -> Path:
+    return fleet_root(root) / 'decisions'
+
+
+def decision_path_for_id(decision_id: str, root: Path | str | None = None) -> Path:
+    """Resolve *decision_id* (see DecisionRecord.id) to its ``<decisions_dir>/<id>.json`` path.
+
+    *decision_id* is sanitized through _DECISION_ID_SANITIZE_RE first, so it
+    always resolves to a single file directly inside decisions_dir (mirrors
+    lease_path_for_name's path-escape guard).
+    """
+    stem = _DECISION_ID_SANITIZE_RE.sub('-', decision_id)
+    return decisions_dir(root) / f'{stem}.json'
+
+
 # ---------------------------------------------------------------------------
 # Single-writer atomic write / read / update
 # ---------------------------------------------------------------------------
@@ -242,16 +488,17 @@ class CorruptSessionRecord(Exception):
     """Raised by read_record when a record.json exists but fails to parse."""
 
 
-def write_record(record: SessionRecord, root: Path | str | None = None) -> None:
-    """Atomically write *record* (tmp file in the same dir, then os.replace).
+def _atomic_write_text(path: Path, text: str) -> None:
+    """Atomically write *text* to *path* (tmp file in the same dir, then os.replace).
 
     Mirrors ``LaneStore._write`` (lane_lifecycle.py:279-298): the tmp file is
     created in the target's own parent dir so the replace stays within one
-    filesystem, and is cleaned up on any failure. Every successful write
-    bumps record.json's mtime, which reap_stale_records() reads as this
-    record's heartbeat.
+    filesystem, and is cleaned up on any failure. Shared atomic-write core:
+    write_record calls this and lets a failure propagate (its sole caller,
+    the CLI main(), provides the outer fail-soft boundary); write_decision
+    calls this too but swallows a failure itself (it is called directly by
+    watchers/cockpit code with no such boundary).
     """
-    path = record_path_for_slug(record.session_slug, root=root)
     path.parent.mkdir(parents=True, exist_ok=True)
     fd, tmp_path_str = tempfile.mkstemp(
         suffix='.tmp',
@@ -260,12 +507,22 @@ def write_record(record: SessionRecord, root: Path | str | None = None) -> None:
     )
     try:
         with os.fdopen(fd, 'w') as f:
-            f.write(record.to_json())
+            f.write(text)
         os.replace(tmp_path_str, str(path))
     except Exception:
         with contextlib.suppress(OSError):
             os.unlink(tmp_path_str)
         raise
+
+
+def write_record(record: SessionRecord, root: Path | str | None = None) -> None:
+    """Atomically write *record* (tmp file in the same dir, then os.replace).
+
+    Every successful write bumps record.json's mtime, which
+    reap_stale_records() reads as this record's heartbeat.
+    """
+    path = record_path_for_slug(record.session_slug, root=root)
+    _atomic_write_text(path, record.to_json())
 
 
 def read_record(slug: str, root: Path | str | None = None) -> SessionRecord:
@@ -342,6 +599,107 @@ def refresh_record(
     if status is not None:
         record.status = status
     write_record(record, root=root)
+    return record
+
+
+def write_decision(record: DecisionRecord, root: Path | str | None = None) -> bool:
+    """Atomically write *record* to its own ``<decisions_dir>/<id>.json`` file.
+
+    Self-guarding FAIL-SOFT: unlike write_record (whose sole caller, the CLI
+    main(), supplies its own outer try/except), this is called directly by
+    C8 watchers and the C5 cockpit, so a write fault must log and return
+    rather than raise into them. Returns True on success, False on any
+    fault.
+    """
+    path = decision_path_for_id(record.id, root=root)
+    try:
+        _atomic_write_text(path, record.to_json())
+    except Exception:
+        logger.error('write_decision: failed to write %s', path, exc_info=True)
+        return False
+    return True
+
+
+def list_decisions(root: Path | str | None = None) -> list[DecisionRecord]:
+    """Read every decision under decisions_dir. Missing dir -> [] (no raise).
+
+    A single corrupt or foreign ``*.json`` file is skipped (logged at ERROR)
+    rather than aborting the whole read -- mirrors reap_stale_records'
+    corrupt-body handling, so one bad file never breaks the cockpit's
+    whole-queue read.
+    """
+    base = decisions_dir(root)
+    if not base.is_dir():
+        return []
+    decisions: list[DecisionRecord] = []
+    for path in sorted(base.glob('*.json')):
+        try:
+            decisions.append(DecisionRecord.from_json(path.read_text()))
+        except (OSError, json.JSONDecodeError, KeyError, TypeError, ValueError):
+            logger.error('list_decisions: skipping unreadable %s', path, exc_info=True)
+            continue
+    return decisions
+
+
+def update_decision_state(
+    decision_id: str,
+    state: str,
+    root: Path | str | None = None,
+) -> DecisionRecord | None:
+    """Read-modify-write *decision_id*'s state field.
+
+    Self-guarding FAIL-SOFT: returns None (logs ERROR) on any fault -- a
+    missing file, a corrupt body, or a write failure -- rather than raising,
+    matching write_decision's contract for its direct C8/cockpit callers.
+
+    Concurrency NOTE (see DecisionRecord's docstring): this read-modify-write
+    is unsynchronized against a concurrent set_manual_boost (or a second
+    update_decision_state) racing on the SAME decision id -- the later
+    os.replace() wins and silently drops the earlier call's field mutation.
+    Each individual write remains atomic; only the read+mutate+write SPAN is
+    unsynchronized. Accepted for now, consistent with the module's existing
+    lock-free convention.
+    """
+    path = decision_path_for_id(decision_id, root=root)
+    try:
+        record = DecisionRecord.from_json(path.read_text())
+    except (OSError, json.JSONDecodeError, KeyError, TypeError, ValueError):
+        logger.error('update_decision_state: failed to read %s', path, exc_info=True)
+        return None
+    record.state = state
+    if not write_decision(record, root=root):
+        return None
+    return record
+
+
+def set_manual_boost(
+    decision_id: str,
+    boost: int,
+    root: Path | str | None = None,
+) -> DecisionRecord | None:
+    """Read-modify-write *decision_id*'s manual_boost field.
+
+    Self-guarding FAIL-SOFT: returns None (logs ERROR) on any fault -- a
+    missing file, a corrupt body, or a write failure -- rather than raising,
+    matching write_decision's contract for its direct C8/cockpit callers.
+
+    Concurrency NOTE (see DecisionRecord's docstring): this read-modify-write
+    is unsynchronized against a concurrent update_decision_state (or a
+    second set_manual_boost) racing on the SAME decision id -- the later
+    os.replace() wins and silently drops the earlier call's field mutation.
+    Each individual write remains atomic; only the read+mutate+write SPAN is
+    unsynchronized. Accepted for now, consistent with the module's existing
+    lock-free convention.
+    """
+    path = decision_path_for_id(decision_id, root=root)
+    try:
+        record = DecisionRecord.from_json(path.read_text())
+    except (OSError, json.JSONDecodeError, KeyError, TypeError, ValueError):
+        logger.error('set_manual_boost: failed to read %s', path, exc_info=True)
+        return None
+    record.manual_boost = boost
+    if not write_decision(record, root=root):
+        return None
     return record
 
 
