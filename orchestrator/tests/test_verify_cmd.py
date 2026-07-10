@@ -19,6 +19,7 @@ import pytest
 from orchestrator.verify_cmd import (
     ToolKind,
     VerifyCmd,
+    cargo_scope,
     parse_config_command,
     render,
     reproject,
@@ -393,3 +394,135 @@ class TestReproject:
         raw = 'cargo test --workspace && cargo test --workspace'
         cmd = parse_config_command(raw)
         assert reproject(cmd, 'shared') == cmd
+
+
+class TestCargoScopeStructured:
+    """cargo_scope(crates) on a single, structured cargo invocation.
+
+    Migrates test_verify.py::TestScopeCargoWorkspaceRewrite's A1/A2/A3/A6
+    cases (regression fd4758fcff: --exclude flags must be dropped after
+    rewriting --workspace -> -p <crate>).
+    """
+
+    def test_a1_single_exclude_stripped(self):
+        raw = 'cargo test --workspace --exclude foo -- --test-threads=1'
+        cmd = parse_config_command(raw)
+        result = render(cargo_scope(cmd, ['bar']))
+        assert '-p bar' in result
+        assert '--workspace' not in result
+        assert '--exclude' not in result
+        assert 'foo' not in result
+        assert '-- --test-threads=1' in result
+
+    def test_a2_multiple_excludes_all_stripped(self):
+        raw = (
+            'cargo test --workspace '
+            '--exclude alpha --exclude beta --exclude gamma '
+            '-- --test-threads=1'
+        )
+        cmd = parse_config_command(raw)
+        result = render(cargo_scope(cmd, ['delta']))
+        assert '-p delta' in result
+        assert '--workspace' not in result
+        assert '--exclude' not in result
+        assert 'alpha' not in result
+        assert 'beta' not in result
+        assert 'gamma' not in result
+
+    def test_a3_exclude_equals_form_stripped(self):
+        raw = 'cargo test --workspace --exclude=foo -- --test-threads=1'
+        cmd = parse_config_command(raw)
+        result = render(cargo_scope(cmd, ['bar']))
+        assert '-p bar' in result
+        assert '--workspace' not in result
+        assert '--exclude' not in result
+
+    def test_a6_idempotent_on_already_scoped_command(self):
+        """A command that's already -p-scoped (no --workspace) is a no-op."""
+        raw = 'cargo test -p my-crate -- --test-threads=1'
+        cmd = parse_config_command(raw)
+        assert render(cargo_scope(cmd, ['my-crate'])) == raw
+
+    def test_noop_empty_crates(self):
+        cmd = parse_config_command('cargo test --workspace')
+        assert cargo_scope(cmd, []) == cmd
+
+    def test_noop_non_cargo_tool(self):
+        cmd = parse_config_command('pytest tests/x.py')
+        assert cargo_scope(cmd, ['bar']) == cmd
+
+    def test_noop_on_opaque(self):
+        cmd = parse_config_command('mypy src/')
+        assert cargo_scope(cmd, ['bar']) == cmd
+
+
+class TestCargoScopeRawRetainedChain:
+    """cargo_scope on a recognised-but-unstructurable multi-segment cargo chain.
+
+    Migrates test_verify.py::TestScopeCargoWorkspaceRewrite's A4/A5/A7 cases:
+    the reify orchestrator.yaml 4-segment test_command (two gated wrapper
+    segments with no --workspace, followed by two ungated --workspace
+    segments).
+    """
+
+    _GATED_1 = (
+        './scripts/cargo-test-occt-gated.sh cargo test '
+        '-p reify-kernel-occt -p reify-eval -p reify-cli'
+    )
+    _GATED_2 = (
+        './scripts/cargo-test-occt-gated.sh cargo test '
+        '-p reify-kernel-occt-extra'
+    )
+    _UNGATED_EXCLUDES = (
+        '--exclude reify-kernel-occt --exclude reify-eval '
+        '--exclude reify-cli --exclude reify-kernel-occt-extra'
+    )
+
+    def test_a4_gated_segments_untouched_ungated_segments_rewritten(self):
+        ungated = f'cargo test --workspace {self._UNGATED_EXCLUDES} -- --test-threads=1'
+        raw = f'{self._GATED_1} && {self._GATED_2} && {ungated} && {ungated}'
+
+        cmd = parse_config_command(raw)
+        assert cmd.tool is ToolKind.CARGO_TEST
+        assert cmd.raw == raw
+
+        result = render(cargo_scope(cmd, ['reify-compiler']))
+        assert self._GATED_1 in result, f'gated_1 missing: {result!r}'
+        assert self._GATED_2 in result, f'gated_2 missing: {result!r}'
+        assert '--workspace' not in result
+        assert '-p reify-compiler' in result
+        assert '-- --test-threads=1' in result
+
+    def test_a5_non_cargo_exclude_in_chain_not_stripped(self):
+        raw = (
+            'cargo test --workspace --exclude some-crate -- --test-threads=1'
+            ' && npm test --exclude foo'
+        )
+        cmd = parse_config_command(raw)
+        result = render(cargo_scope(cmd, ['my-crate']))
+        assert 'npm test --exclude foo' in result, (
+            f'npm --exclude was incorrectly removed: {result!r}'
+        )
+        cargo_part = result.split('&&')[0]
+        assert '--exclude' not in cargo_part
+
+    def test_a7_no_exclude_token_in_rewritten_ungated_segment(self):
+        """The rewritten (last) segment alone must be clean of --exclude/crate
+
+        names — a whole-string check would be masked by the gated segment's
+        own, legitimate `-p reify-kernel-occt` substring.
+        """
+        ungated = f'cargo test --workspace {self._UNGATED_EXCLUDES} -- --test-threads=1'
+        raw = f'{self._GATED_1} && {ungated}'
+        cmd = parse_config_command(raw)
+        result = render(cargo_scope(cmd, ['reify-compiler']))
+        segments = [s.strip() for s in result.split('&&')]
+        rewritten = segments[-1]
+        assert '--exclude' not in rewritten
+        for excluded in ('reify-kernel-occt', 'reify-eval', 'reify-cli'):
+            assert excluded not in rewritten
+
+    def test_noop_no_workspace_in_chain(self):
+        raw = 'cargo test -p already-scoped && cargo test -p other'
+        cmd = parse_config_command(raw)
+        assert cargo_scope(cmd, ['bar']) == cmd
