@@ -82,7 +82,7 @@ class TestVerifyCmdConstruction:
     def test_is_frozen(self):
         cmd = VerifyCmd(tool=ToolKind.PYTEST)
         with pytest.raises(dataclasses.FrozenInstanceError):
-            cmd.tool = ToolKind.RUFF
+            cmd.tool = ToolKind.RUFF  # type: ignore[misc]
 
     def test_equal_instances_compare_equal(self):
         a = VerifyCmd(tool=ToolKind.PYTEST, targets=('x',))
