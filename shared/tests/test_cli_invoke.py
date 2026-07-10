@@ -696,6 +696,99 @@ class TestCapHitResume:
         assert str(uuid.UUID(new_sid)) == new_sid
 
 
+@pytest.mark.asyncio
+class TestResumeDiscardProgressTimeout:
+    """Regression for reify-4827 (task 2360 fix #2): a RESUMED invocation that
+    hit the working-regime ceiling but made real agentic progress
+    (transcript_turns > 0) must be RETURNED to the caller, not silently
+    discarded into a fresh re-dispatch that restarts from the original
+    prompt and throws away the transcript. The workflow gamma branch
+    (``is_timed_out_with_progress``) owns re-resuming this session with its
+    own continuation prompt.
+    """
+
+    async def test_resumed_progress_timeout_is_returned_not_reset(self):
+        """Resumed invocation timed out WITH progress → returned verbatim.
+
+        Only ONE invocation should occur: if the result were discarded into
+        the generic non-cap-hit resume-failure branch, a second (fresh)
+        invocation would fire and the caller would get back the fresh
+        result instead — losing timed_out/transcript_turns entirely.
+        """
+        gate = make_gate_mock(
+            account_count=1,
+            before_invoke=AsyncMock(side_effect=['token-a', 'token-a']),
+            detect_cap_hit=MagicMock(return_value=False),
+            active_account_name='acct',
+        )
+
+        progress_timeout = _make_result(
+            success=False, output='', timed_out=True, transcript_turns=7,
+            session_id='sess-123',
+        )
+        ok_result = _make_result()
+
+        with (
+            patch(
+                'shared.cli_invoke.invoke_claude_agent',
+                new_callable=AsyncMock,
+                side_effect=[progress_timeout, ok_result],
+            ) as mock_invoke,
+            patch('shared.cli_invoke.asyncio') as mock_asyncio,
+        ):
+            mock_asyncio.sleep = AsyncMock()
+            got = await invoke_with_cap_retry(
+                gate, 'test-label',
+                prompt='do stuff',
+                resume_session_id='sess-orig',
+            )
+
+        assert mock_invoke.call_count == 1
+        assert got.success is False
+        assert got.timed_out is True
+        assert got.transcript_turns == 7
+
+    async def test_resumed_zero_output_timeout_still_resets_fresh(self):
+        """Regression guard: a resumed ZERO-output timeout (transcript_turns
+        == 0) is NOT a progress timeout — it is mutually exclusive with
+        ``is_timed_out_with_progress`` and must still take the existing
+        fresh-fallback/wedge-clear path (unaffected by the new guard).
+        """
+        gate = make_gate_mock(
+            account_count=1,
+            before_invoke=AsyncMock(side_effect=['token-a', 'token-a']),
+            detect_cap_hit=MagicMock(return_value=False),
+            active_account_name='acct',
+        )
+
+        zero_output_timeout = _make_result(
+            success=False, output='', timed_out=True, transcript_turns=0,
+            session_id='sess-123',
+        )
+        ok_result = _make_result()
+
+        with (
+            patch(
+                'shared.cli_invoke.invoke_claude_agent',
+                new_callable=AsyncMock,
+                side_effect=[zero_output_timeout, ok_result],
+            ) as mock_invoke,
+            patch('shared.cli_invoke.asyncio') as mock_asyncio,
+        ):
+            mock_asyncio.sleep = AsyncMock()
+            got = await invoke_with_cap_retry(
+                gate, 'test-label',
+                prompt='real prompt',
+                resume_session_id='sess-orig',
+            )
+
+        assert mock_invoke.call_count == 2
+        second_call = mock_invoke.call_args_list[1]
+        assert 'resume_session_id' not in second_call.kwargs
+        assert second_call.kwargs.get('prompt') == 'real prompt'
+        assert got.success is True
+
+
 # ── Caller-initiated resume (crash recovery) ───────────────────────────
 
 
