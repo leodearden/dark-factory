@@ -4622,6 +4622,16 @@ class SpeculativeMergeWorker(_WipHaltMixin):
     # escalated to a terminal 'blocked' even though the verify was healthy.
     # Tune this budget to the longest expected no-write stretch of your
     # verify workloads, not just the dead-verify symptom's timescale.
+    # BLIND SPOT (reviewer finding, task 2420 amend #2): the same risk
+    # applies to any verify toolchain that writes primarily OUTSIDE
+    # merge_wt — e.g. pytest/mypy/ruff caches under ~/.cache, $TMPDIR
+    # scratch, or an out-of-tree build directory are all invisible to
+    # newest_content_mtime(merge_wt). This assumption ("a healthy verify
+    # writes some file incrementally under merge_wt within every budget
+    # window") is NOT enforced or validated anywhere — it is a per-repo
+    # tuning concern. Operators whose verify command writes its working
+    # output outside the worktree should raise this budget accordingly (or,
+    # if feasible, route that tool's cache/scratch dir back under merge_wt).
     INFLIGHT_VERIFY_PROGRESS_BUDGET_SECS: float = 1800.0
     # Throttle for the newest_content_mtime() worktree-subtree walk that
     # drives the budget above — distinct from VERIFY_ABANDON_POLL_SECS so
