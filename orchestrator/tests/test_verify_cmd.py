@@ -20,6 +20,7 @@ from orchestrator.verify_cmd import (
     ToolKind,
     VerifyCmd,
     cargo_scope,
+    govern_cpu,
     parse_config_command,
     render,
     reproject,
@@ -567,3 +568,48 @@ class TestSerialPytest:
     def test_noop_on_opaque(self):
         cmd = parse_config_command('mypy src/')
         assert serial_pytest(cmd) == cmd
+
+
+class TestGovernCpu:
+    """govern_cpu(exec_path) wraps the whole rendered command as an outer
+
+    cpu-governed-exec.sh invocation. Migrates test_verify.py::
+    TestMaybeGovernMergeCmd's merge-role-wrap and shell-operator-survival
+    cases.
+    """
+
+    _EXEC = '/abs/scripts/cpu-governed-exec.sh'
+
+    def test_wraps_rendered_command(self):
+        cmd = parse_config_command('cargo test --workspace')
+        result = render(govern_cpu(cmd, self._EXEC))
+        expected = (
+            f'{shlex.quote(self._EXEC)} --role merge -- '
+            f'/bin/bash -c {shlex.quote(render(cmd))}'
+        )
+        assert result == expected
+
+    def test_shell_operators_survive_inside_quoted_inner(self):
+        """A raw-retained chain's operators (&&) survive intact inside the
+
+        shlex.quote'd inner payload — mirrors _maybe_govern_merge_cmd's
+        test_shell_operators_in_cmd_survive.
+        """
+        raw = 'cargo test && cargo clippy --all -- -D warnings'
+        cmd = parse_config_command(raw)
+        assert cmd.raw == raw  # a chain; render(cmd) == raw verbatim
+
+        result = render(govern_cpu(cmd, self._EXEC))
+        expected = f'{shlex.quote(self._EXEC)} --role merge -- /bin/bash -c {shlex.quote(raw)}'
+        assert result == expected
+
+    def test_noop_falsy_exec_path(self):
+        cmd = parse_config_command('pytest tests/x.py')
+        assert govern_cpu(cmd, '') == cmd
+        assert govern_cpu(cmd, None) == cmd
+
+    def test_noop_on_opaque(self):
+        """govern_cpu on OPAQUE is a no-op (P1); OPAQUE still renders to its raw."""
+        cmd = parse_config_command('mypy src/')
+        assert govern_cpu(cmd, self._EXEC) == cmd
+        assert render(cmd) == 'mypy src/'
