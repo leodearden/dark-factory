@@ -417,3 +417,231 @@ class TestMergerDrainRegistersAndTransitions:
 
         await worker.stop()
         await worker_task
+
+
+# ---------------------------------------------------------------------------
+# step-5 RED / step-6 GREEN: merger->verifier handoff (the 4 _verifier_queue
+# puts transition MERGING -> AWAITING_VERIFY) and the 3 requeue-to-QUEUED
+# sites (operator-halt / cascade self-requeue).
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestMergerVerifierHandoffRegistersAwaitingVerify:
+    """Every ``_verifier_queue.put(...)`` site — the successful RealMergeItem
+    put and the three DecidedItem puts (conflict/train/loop-breaker) — must
+    transition the registry MERGING -> AWAITING_VERIFY the instant the item
+    becomes verifier-owned (task 2169 step-5).
+
+    RED until step-6 GREEN wires ``_note_transition`` at each
+    ``_verifier_queue.put`` call site.
+    """
+
+    async def test_successful_merge_progresses_to_awaiting_verify(
+        self, git_ops: GitOps, config: OrchestratorConfig,
+    ) -> None:
+        from orchestrator.merge_queue import (
+            ItemLifecycleState,
+            RealMergeItem,
+            SpeculativeMergeWorker,
+        )
+
+        wt = await _make_branch_with_file(
+            git_ops, 'kappa-awaiting-verify', 'file_kappa_av.py', 'z = 1\n',
+        )
+        queue: asyncio.Queue = asyncio.Queue()
+        worker = SpeculativeMergeWorker(git_ops, queue)
+        req = _make_request('kappa-awaiting-verify', 'kappa-awaiting-verify', wt, config)
+
+        observed: list[tuple[Any, Any]] = []
+        original_note_transition = worker._note_transition
+
+        def _spy_note_transition(rid: str, from_state: Any, to_state: Any, **kwargs: Any) -> None:
+            if rid == req.request_id:
+                observed.append((from_state, to_state))
+            return original_note_transition(rid, from_state, to_state, **kwargs)
+
+        worker._note_transition = _spy_note_transition  # type: ignore[method-assign]
+
+        worker_task = asyncio.create_task(worker.run())
+
+        with patch('orchestrator.merge_queue.run_scoped_verification', _mock_verify_pass()):
+            await queue.put(req)
+            outcome = await asyncio.wait_for(req.result, timeout=60)
+            assert outcome.status == 'done', f'{outcome}'
+
+        assert observed == [
+            (ItemLifecycleState.QUEUED, ItemLifecycleState.LANE_BUFFERED),
+            (ItemLifecycleState.LANE_BUFFERED, ItemLifecycleState.MERGING),
+            (ItemLifecycleState.MERGING, ItemLifecycleState.AWAITING_VERIFY),
+        ], f'unexpected transition sequence for {req.request_id}: {observed!r}'
+        assert isinstance(worker._live_items[req.request_id], RealMergeItem), (
+            '_live_items must hold the RealMergeItem (not the stale MergeRequest) '
+            'once the item becomes verifier-owned'
+        )
+
+        await worker.stop()
+        await worker_task
+
+    async def test_loop_breaker_decided_item_progresses_to_awaiting_verify(
+        self, git_ops: GitOps, config: OrchestratorConfig, tmp_path: Path,
+    ) -> None:
+        """The loop-breaker short-circuit (task already timed out
+        MAX_POST_MERGE_VERIFY_TIMEOUTS times) also rides the verifier queue
+        as a DecidedItem passthrough — the registry must observe
+        MERGING -> AWAITING_VERIFY there too, not just on the successful
+        RealMergeItem path above. Fires before any git work, so no worktree
+        setup is needed (mirrors the "without doing any git work" contract
+        in the loop-breaker's own docstring).
+        """
+        from orchestrator.merge_queue import (
+            DecidedItem,
+            ItemLifecycleState,
+            SpeculativeMergeWorker,
+        )
+
+        queue: asyncio.Queue = asyncio.Queue()
+        worker = SpeculativeMergeWorker(git_ops, queue)
+        req = _make_request(
+            'kappa-loop-breaker', 'kappa-loop-breaker', tmp_path / 'no-such-wt', config,
+        )
+        worker._post_merge_verify_timeouts[req.task_id] = worker.MAX_POST_MERGE_VERIFY_TIMEOUTS
+
+        observed: list[tuple[Any, Any]] = []
+        original_note_transition = worker._note_transition
+
+        def _spy_note_transition(rid: str, from_state: Any, to_state: Any, **kwargs: Any) -> None:
+            if rid == req.request_id:
+                observed.append((from_state, to_state))
+            return original_note_transition(rid, from_state, to_state, **kwargs)
+
+        worker._note_transition = _spy_note_transition  # type: ignore[method-assign]
+
+        worker_task = asyncio.create_task(worker.run())
+        await queue.put(req)
+        outcome = await asyncio.wait_for(req.result, timeout=60)
+        assert outcome.status == 'blocked', f'{outcome}'
+
+        assert observed == [
+            (ItemLifecycleState.QUEUED, ItemLifecycleState.LANE_BUFFERED),
+            (ItemLifecycleState.LANE_BUFFERED, ItemLifecycleState.MERGING),
+            (ItemLifecycleState.MERGING, ItemLifecycleState.AWAITING_VERIFY),
+        ], f'unexpected transition sequence for {req.request_id}: {observed!r}'
+        assert isinstance(worker._live_items[req.request_id], DecidedItem)
+
+        await worker.stop()
+        await worker_task
+
+
+@pytest.mark.asyncio
+class TestRequeueToQueuedSites:
+    """The 3 ``_queue.put_nowait(req)`` requeue sites (pre-dispatch
+    operator-halt in ``_dispatch_item``, mid-verify operator-halt in
+    ``_run_inflight_verify``, and the head-failure cascade's downstream
+    self-requeue) must transition a TRACKED item's registry entry back to
+    QUEUED, and the SAME request_id must be able to re-arm/re-drain through
+    the normal ``_buffer_owned_request`` chokepoint afterwards WITHOUT a
+    duplicate-register ``ValueError`` or a spurious escalation (task 2169
+    step-5).
+
+    Targets the pre-dispatch operator-halt branch of ``_dispatch_item``
+    directly (bare worker, no real ``worker.run()`` loop) — mirrors
+    test_merge_queue_request_liveness.py::TestOperatorHaltRequeueNoFalseAlarm's
+    bare-item pattern, which drives the SAME branch on an UNREGISTERED item
+    and asserts zero escalations; this test additionally pre-registers the
+    item (as kappa's later steps will have it arrive: DISPATCHING) to prove
+    the registry-side re-arm/re-drain contract.
+
+    RED until step-6 GREEN wires ``_note_requeue`` at the 3 sites and
+    teaches ``_buffer_owned_request`` to skip re-``register()``-ing an
+    already-tracked (requeued) request_id.
+    """
+
+    async def test_predispatch_operator_halt_requeues_and_redrains_cleanly(
+        self, git_ops: GitOps, config: OrchestratorConfig, tmp_path: Path,
+    ) -> None:
+        from orchestrator.merge_queue import (
+            InflightStatus,
+            ItemLifecycleState,
+            RealMergeItem,
+            SpeculativeMergeWorker,
+        )
+
+        fake_eq = _FakeEscalationQueue(open_l1=False)
+        queue: asyncio.Queue = asyncio.Queue()
+        worker = SpeculativeMergeWorker(git_ops, queue, escalation_queue=fake_eq)
+
+        req = _make_request(
+            'kappa-predispatch-halt', 'kappa-predispatch-halt', tmp_path, config,
+        )
+        item = RealMergeItem(
+            request=req,
+            merge_result=MagicMock(),
+            merge_wt=tmp_path / 'merge_wt',
+            base_sha='deadbeef',
+            speculative=False,
+        )
+        worker._register_item(item, initial=ItemLifecycleState.DISPATCHING)
+
+        worker._operator_halt.set()
+        entry = await worker._dispatch_item(item)
+
+        assert entry is not None and entry.status == InflightStatus.REQUEUED_PREDISPATCH
+        assert worker._lifecycle.current(req.request_id) == ItemLifecycleState.QUEUED
+        assert worker._live_items[req.request_id] is req
+        assert not queue.empty(), 'req must be put back on _queue by the halt branch'
+        assert len(fake_eq.submitted) == 0, (
+            f'requeue must not escalate: {fake_eq.submitted!r}'
+        )
+
+        # Re-arm and re-drain: the SAME request_id flows back through the
+        # normal drain chokepoint without a duplicate-register ValueError.
+        drained = await queue.get()
+        worker._buffer_owned_request(drained)
+
+        assert worker._lifecycle.current(req.request_id) == ItemLifecycleState.LANE_BUFFERED
+        assert worker._live_items[req.request_id] is drained
+        assert len(fake_eq.submitted) == 0, (
+            f're-drain must not escalate either: {fake_eq.submitted!r}'
+        )
+
+    async def test_predispatch_operator_halt_on_unregistered_item_stays_silent(
+        self, git_ops: GitOps, config: OrchestratorConfig, tmp_path: Path,
+    ) -> None:
+        """REGRESSION GUARD: an item whose request was never registered
+        (mirrors TestOperatorHaltRequeueNoFalseAlarm's bare-item pattern —
+        several existing unit tests construct items directly, bypassing the
+        drain chokepoint) must NOT escalate either.  ``_note_requeue`` is a
+        deliberate no-op on an unregistered rid — unlike
+        ``_note_transition``'s other callers, this is not itself treated as
+        a wiring-bug signal at these 3 sites.
+        """
+        from orchestrator.merge_queue import (
+            InflightStatus,
+            RealMergeItem,
+            SpeculativeMergeWorker,
+        )
+
+        fake_eq = _FakeEscalationQueue(open_l1=False)
+        queue: asyncio.Queue = asyncio.Queue()
+        worker = SpeculativeMergeWorker(git_ops, queue, escalation_queue=fake_eq)
+
+        req = _make_request(
+            'kappa-predispatch-halt-bare', 'kappa-predispatch-halt-bare', tmp_path, config,
+        )
+        item = RealMergeItem(
+            request=req,
+            merge_result=MagicMock(),
+            merge_wt=tmp_path / 'merge_wt',
+            base_sha='deadbeef',
+            speculative=False,
+        )
+
+        worker._operator_halt.set()
+        entry = await worker._dispatch_item(item)
+
+        assert entry is not None and entry.status == InflightStatus.REQUEUED_PREDISPATCH
+        assert worker._lifecycle.current(req.request_id) is None
+        assert len(fake_eq.submitted) == 0, (
+            f'unregistered requeue must stay silent: {fake_eq.submitted!r}'
+        )
