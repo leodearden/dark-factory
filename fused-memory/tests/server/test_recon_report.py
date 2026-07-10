@@ -2790,6 +2790,47 @@ class TestReconReportOverlengthTruncation:
         assert item['description'] == 'd'
         assert item['suggested_action'] == 'a'
 
+    def test_overlength_null_null_findings_dedup_on_truncated_text(self):
+        """Two null-null findings whose descriptions are identical for the
+        first _MAX_FINDING_TEXT_CHARS chars but differ only in the
+        (truncated-away) tail must collapse to ONE finding — pins the
+        add_finding ordering guarantee that dedup hashes the POST-truncation
+        string, not the raw input (truncation runs BEFORE dedup hashing).
+        """
+        from fused_memory.server.recon_report import _MAX_FINDING_TEXT_CHARS
+
+        state, _ = self._make_state()
+        state.start_report(run_id='r1', stage='s1', project_id='dark_factory')
+
+        shared_prefix = 'x' * _MAX_FINDING_TEXT_CHARS
+        first = state.add_finding(
+            run_id='r1',
+            severity='low',
+            category='informational',
+            description=shared_prefix + ' tail one',
+            suggested_action='none',
+            actionable=False,
+        )
+        assert 'finding_id' in first, f'First add_finding failed: {first}'
+
+        second = state.add_finding(
+            run_id='r1',
+            severity='low',
+            category='informational',
+            description=shared_prefix + ' tail two',
+            suggested_action='none',
+            actionable=False,
+        )
+        assert second.get('error') == 'duplicate_finding', (
+            'Expected duplicate_finding (dedup must key off the '
+            f'post-truncation string), got: {second}'
+        )
+        assert second['existing_finding_id'] == first['finding_id']
+
+        report = state.get_assembled_report('r1', 's1')
+        assert report is not None
+        assert len(report['flagged_items']) == 1
+
 
 # ---------------------------------------------------------------------------
 # task-2410 step-3: delete_finding basic behavior — RED until step-4 adds
@@ -2976,6 +3017,70 @@ class TestReconReportDeleteFinding:
         s1_report = state.get_assembled_report('r1', 'memory_consolidator')
         assert s1_report is not None
         assert s1_report['flagged_items'] == []
+
+    @pytest.mark.asyncio
+    async def test_cite_after_delete_of_cross_stage_duplicate_returns_finding_unknown(self):
+        """Stage 1 files A; Stage 2 re-raises the same signature and receives
+        duplicate_finding pointing at A (so Stage 2 now holds finding_id A);
+        A is deleted; Stage 2's later cite_* call using that now-dangling
+        finding_id must return finding_unknown, not resurrect A or silently
+        no-op.  Pins the post-delete resolution contract so cite_* never
+        operates on a retracted finding.
+        """
+        from fused_memory.server.recon_report import ReconReportState
+
+        class _FakeMemSvc:
+            async def get_entity(self, name: str, project_id: str) -> dict:
+                return {'nodes': [{'uuid': 'aaaa-bbbb', 'name': name}]}
+
+        t = [0.0]
+        state = ReconReportState(
+            ttl_seconds=300, clock=lambda: t[0], memory_service=_FakeMemSvc()
+        )
+
+        # Stage 1 files A.
+        state.start_report(run_id='r1', stage='memory_consolidator', project_id='dark_factory')
+        res1 = state.add_finding(
+            run_id='r1',
+            severity='high',
+            category='stuck_task',
+            description='task is stuck',
+            suggested_action='investigate',
+            task_id='3803',
+            flag_type='task_stuck_pending_merge',
+        )
+        assert 'finding_id' in res1, f'Stage 1 add_finding failed: {res1}'
+        finding_id_a = res1['finding_id']
+
+        # Stage 2 re-raises the same signature -> duplicate_finding -> A.
+        state.start_report(run_id='r1', stage='task_knowledge_sync', project_id='dark_factory')
+        dup = state.add_finding(
+            run_id='r1',
+            severity='high',
+            category='stuck_task',
+            description='same task (Stage 2 view)',
+            suggested_action='investigate',
+            task_id='3803',
+            flag_type='task_stuck_pending_merge',
+        )
+        assert dup.get('error') == 'duplicate_finding'
+        assert dup['existing_finding_id'] == finding_id_a
+
+        # A is retracted.
+        delete_result = state.delete_finding('r1', finding_id_a)
+        assert delete_result == {'status': 'deleted', 'finding_id': finding_id_a}
+
+        # Stage 2 still holds finding_id_a from the duplicate_finding pointer
+        # and tries to cite onto it -- must return finding_unknown.
+        cite_result = await state.cite_entity(
+            run_id='r1',
+            finding_id=finding_id_a,
+            name='SomeEntity',
+        )
+        assert cite_result.get('error') == 'finding_unknown', (
+            f'Expected finding_unknown for a cite_* call on a deleted finding, got: {cite_result}'
+        )
+        assert cite_result['error_type'] == 'ReconReportFindingUnknown'
 
 
 # ---------------------------------------------------------------------------
