@@ -2111,6 +2111,13 @@ class TaskKnowledgeSync(BaseStage):
         # from `report` — no LLM turn, no nonce, no verify/repair/reconstruct
         # self-heal (all retired by this task; see
         # summary_pool.write_cycle_summary).
+        # Cross-reference (reviewer finding design-consistency): unlike Stage 1
+        # (memory_consolidator.py), this call is unconditional — it also fires
+        # on remediation passes, not just full cycles. That is intentional,
+        # not a missed guard: it preserves the pre-refactor contract, where
+        # Stage 2's prompt mandated a summary write on every pass, whereas
+        # Stage 1's remediation payload never asked for one. Do not "fix" this
+        # to mirror Stage 1's full-cycle-only gating.
         cycle_summary_written = await write_cycle_summary(
             self.memory,
             self.project_id,
