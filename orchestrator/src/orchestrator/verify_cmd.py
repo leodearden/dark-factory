@@ -261,8 +261,31 @@ def render(cmd: VerifyCmd) -> str:
     any shell operators (``&&``, ``|``, ...) inside it intact, including for
     a raw-retained chain (migrates ``_maybe_govern_merge_cmd``'s bash-wrap).
     OPAQUE never carries a govern wrapper (P1 — ``govern_cpu`` no-ops on it).
+
+    Invariant asserts (defensive — no mutator produces these states; they
+    catch a hand-constructed VerifyCmd that bypassed a no-op guard): **P1**
+    OPAQUE must never have been mutated — ``uv_project``/``cwd_rel``/
+    ``wrappers`` are empty and ``targets`` is empty. **P3** ANY raw-retained
+    command (OPAQUE or a recognised-but-unstructurable chain) carries no
+    meaningful ``cwd_rel``/``targets`` — neither field is legitimately
+    settable once ``raw`` is retained (``cargo_scope``/``serial_pytest``
+    rewrite ``raw`` itself instead), so render() never has a reason to
+    treat ``targets`` as worktree-root-relative there. ``wrappers`` is
+    exempt from the P3 check — a raw-retained chain legitimately carries a
+    ``govern_cpu`` wrapper (the "legitimate wrapper context").
     """
-    inner = cmd.raw if cmd.raw is not None else _render_structured(cmd)
+    if cmd.raw is not None:
+        assert cmd.cwd_rel is None and not cmd.targets, (
+            'render: a raw-retained VerifyCmd (OPAQUE or an unstructurable '
+            'chain) must not carry cwd_rel/targets (P3)'
+        )
+        if cmd.tool is ToolKind.OPAQUE:
+            assert cmd.uv_project is None and not cmd.wrappers, (
+                'render: OPAQUE VerifyCmd must never be mutated (P1)'
+            )
+        inner = cmd.raw
+    else:
+        inner = _render_structured(cmd)
     govern_exec = next((w for w in cmd.wrappers if w != 'npx'), None)
     if govern_exec is None:
         return inner
