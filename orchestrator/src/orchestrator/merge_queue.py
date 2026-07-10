@@ -11136,9 +11136,14 @@ class SpeculativeMergeWorker(_WipHaltMixin):
         # (the compat shim used by direct-call tests) to keep shim tests green.
         try:
             _guard_main_sha = await self._git_ops.get_main_sha()
+            # DEFECT 2 (task 2357): refresh the §5.3 snapshot cache from the
+            # guard's own fresh SHA so snapshot()['two_layer_invariants'] never
+            # lags behind this dispatch's view of main (piggybacks the fetch
+            # above; no extra git round-trip).
+            self._last_known_main_sha = _guard_main_sha
             self._warn_if_verify_base_not_frozen_tip(item, _guard_main_sha)
         except Exception:
-            pass  # fail-open: skip the check on any git error
+            pass  # fail-open: skip the check (and the refresh) on any git error
 
         # ── Launch background verify task ────────────────────────────────────
         # depth (task 2340) is computed synchronously HERE — before
