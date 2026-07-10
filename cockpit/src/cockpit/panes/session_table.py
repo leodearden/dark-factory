@@ -12,7 +12,7 @@ from __future__ import annotations
 
 from datetime import UTC, datetime
 
-from orchestrator.session_registry import SessionRecord, Status
+from orchestrator.session_registry import TERMINAL_STATUSES, SessionRecord, Status
 
 _GLYPHS: dict[Status, str] = {
     Status.AWAITING_INPUT: '⏸',
@@ -79,3 +79,16 @@ def format_age(start_ts: str, now: datetime) -> str:
     if age_seconds < 86400:
         return f'{int(age_seconds // 3600)}h'
     return f'{int(age_seconds // 86400)}d'
+
+
+def count_outstanding_children(slug: str, all_records: list[SessionRecord]) -> int:
+    """Count *slug*'s non-terminal children (records with parent_session_id == slug).
+
+    A terminal child (exited/failed-to-start) is not "outstanding" -- it no
+    longer needs attention -- so it's excluded per TERMINAL_STATUSES.
+    """
+    return sum(
+        1
+        for record in all_records
+        if record.parent_session_id == slug and Status(record.status) not in TERMINAL_STATUSES
+    )
