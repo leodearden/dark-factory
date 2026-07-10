@@ -6613,6 +6613,62 @@ class TestMilestoneTimeGate:
             task, datetime(2026, 9, 1, tzinfo=UTC)
         ) is False
 
+    def test_malformed_milestone_warning_deduped_per_task_and_cause(self, caplog):
+        """reviewer_comprehensive observability finding (task 2335 β
+        amendment): _milestone_time_gated is invoked once per candidate loop
+        (scored + pin), every tick, for as long as a task stays pending —
+        without dedup a permanently-malformed milestone would log the
+        identical WARNING forever. Assert it logs exactly once across
+        repeated calls with the SAME malformed value, and logs again if the
+        malformed value actually changes (state change)."""
+        import logging
+
+        config = OrchestratorConfig(max_per_module=1)
+        scheduler = Scheduler(config)
+        task = self._task_with({'milestone': 'not-a-dict'})
+
+        with caplog.at_level(logging.WARNING, logger='orchestrator.scheduler'):
+            for _ in range(3):
+                assert scheduler._milestone_time_gated(task, datetime.now(UTC)) is True
+
+        not_a_dict_warnings = [
+            r for r in caplog.records if 'metadata.milestone is not a dict' in r.getMessage()
+        ]
+        assert len(not_a_dict_warnings) == 1, (
+            f'Expected exactly one WARNING for 3 calls with the same malformed '
+            f'value; got {len(not_a_dict_warnings)} '
+            f'records={[r.getMessage() for r in caplog.records]!r}'
+        )
+
+        # A different malformed value for the SAME task (state change) warns again.
+        task_changed = self._task_with({'milestone': {'mode': 'still-unknown'}})
+        with caplog.at_level(logging.WARNING, logger='orchestrator.scheduler'):
+            assert scheduler._milestone_time_gated(task_changed, datetime.now(UTC)) is True
+
+        unknown_mode_warnings = [
+            r for r in caplog.records if 'unknown mode' in r.getMessage()
+        ]
+        assert len(unknown_mode_warnings) == 1, (
+            f'Expected a fresh WARNING when the malformed cause changes; '
+            f'got records={[r.getMessage() for r in caplog.records]!r}'
+        )
+
+    def test_malformed_milestone_warning_deduped_across_two_tasks_independently(self):
+        """The dedup key includes task_id — a second, independently
+        malformed task must still warn (its own streak starts fresh),
+        proving the dedup does not cross task boundaries."""
+        config = OrchestratorConfig(max_per_module=1)
+        scheduler = Scheduler(config)
+        task_a = {**self._task_with({'milestone': 'not-a-dict'}), 'id': '3001'}
+        task_b = {**self._task_with({'milestone': 'not-a-dict'}), 'id': '3002'}
+
+        assert scheduler._milestone_time_gated(task_a, datetime.now(UTC)) is True
+        assert scheduler._streak_milestone_malformed.value('3001') == 1
+        assert scheduler._streak_milestone_malformed.value('3002') == 0
+
+        assert scheduler._milestone_time_gated(task_b, datetime.now(UTC)) is True
+        assert scheduler._streak_milestone_malformed.value('3002') == 1
+
 
 class TestMilestoneEligibilityGate:
     """The milestone time-gate wired into Scheduler._eligible_for_dispatch,
@@ -6788,7 +6844,7 @@ class TestStampMilestoneDepsSatisfied:
 
         await scheduler._stamp_milestone_deps_satisfied(tasks, status_map, tasks_by_id)
 
-        scheduler.update_task.assert_awaited_once_with(
+        scheduler.update_task.assert_awaited_once_with(  # type: ignore[attr-defined]
             '5001',
             {'milestone_deps_satisfied_at': self.FIXED_DT.isoformat()},
             metadata_mode='merge',
@@ -6808,7 +6864,7 @@ class TestStampMilestoneDepsSatisfied:
 
         await scheduler._stamp_milestone_deps_satisfied(tasks, status_map, tasks_by_id)
 
-        scheduler.update_task.assert_not_awaited()
+        scheduler.update_task.assert_not_awaited()  # type: ignore[attr-defined]
 
     @pytest.mark.asyncio
     async def test_frozen_once_skips_task_with_existing_anchor(
@@ -6831,7 +6887,7 @@ class TestStampMilestoneDepsSatisfied:
 
         await scheduler._stamp_milestone_deps_satisfied(tasks, status_map, tasks_by_id)
 
-        scheduler.update_task.assert_not_awaited()
+        scheduler.update_task.assert_not_awaited()  # type: ignore[attr-defined]
 
     @pytest.mark.asyncio
     async def test_dated_milestone_is_not_swept(self, scheduler: Scheduler):
@@ -6846,7 +6902,7 @@ class TestStampMilestoneDepsSatisfied:
 
         await scheduler._stamp_milestone_deps_satisfied(tasks, status_map, tasks_by_id)
 
-        scheduler.update_task.assert_not_awaited()
+        scheduler.update_task.assert_not_awaited()  # type: ignore[attr-defined]
 
     @pytest.mark.asyncio
     async def test_non_milestone_task_is_not_swept(self, scheduler: Scheduler):
@@ -6858,7 +6914,7 @@ class TestStampMilestoneDepsSatisfied:
 
         await scheduler._stamp_milestone_deps_satisfied(tasks, status_map, tasks_by_id)
 
-        scheduler.update_task.assert_not_awaited()
+        scheduler.update_task.assert_not_awaited()  # type: ignore[attr-defined]
 
     @pytest.mark.asyncio
     async def test_skips_when_external_dep_not_done(self, scheduler: Scheduler):
@@ -6882,7 +6938,7 @@ class TestStampMilestoneDepsSatisfied:
             external_resolver_failed=False,
         )
 
-        scheduler.update_task.assert_not_awaited()
+        scheduler.update_task.assert_not_awaited()  # type: ignore[attr-defined]
 
     @pytest.mark.asyncio
     async def test_stamps_when_external_dep_resolves_done(self, scheduler: Scheduler):
@@ -6905,8 +6961,47 @@ class TestStampMilestoneDepsSatisfied:
             external_resolver_failed=False,
         )
 
-        scheduler.update_task.assert_awaited_once_with(
+        scheduler.update_task.assert_awaited_once_with(  # type: ignore[attr-defined]
             '5007',
+            {'milestone_deps_satisfied_at': self.FIXED_DT.isoformat()},
+            metadata_mode='merge',
+        )
+
+    @pytest.mark.asyncio
+    async def test_one_task_failure_does_not_abort_sweep_for_remaining_tasks(
+        self, scheduler: Scheduler
+    ):
+        """reviewer_comprehensive test-coverage finding (task 2335 β
+        amendment): the docstring claims each task's stamp attempt is
+        wrapped so a single failure never aborts the sweep for the
+        remaining tasks. Exercise it directly — update_task raises for the
+        first of two eligible tasks — and assert the second is still
+        stamped (update_task awaited for both ids, second call succeeds)."""
+        task_a = self._task(
+            '5008',
+            {'milestone': {'mode': 'delayed', 'after_secs': 100}},
+            dependencies=[{'id': 'X'}],
+        )
+        task_b = self._task(
+            '5009',
+            {'milestone': {'mode': 'delayed', 'after_secs': 100}},
+            dependencies=[{'id': 'Y'}],
+        )
+        tasks = [task_a, task_b]
+        status_map = {'X': 'done', 'Y': 'done', '5008': 'pending', '5009': 'pending'}
+        tasks_by_id = {'5008': task_a, '5009': task_b}
+        scheduler.update_task = AsyncMock(side_effect=[Exception('boom'), True])
+
+        await scheduler._stamp_milestone_deps_satisfied(tasks, status_map, tasks_by_id)
+
+        assert scheduler.update_task.await_count == 2  # type: ignore[attr-defined]
+        scheduler.update_task.assert_any_await(  # type: ignore[attr-defined]
+            '5008',
+            {'milestone_deps_satisfied_at': self.FIXED_DT.isoformat()},
+            metadata_mode='merge',
+        )
+        scheduler.update_task.assert_any_await(  # type: ignore[attr-defined]
+            '5009',
             {'milestone_deps_satisfied_at': self.FIXED_DT.isoformat()},
             metadata_mode='merge',
         )
