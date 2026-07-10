@@ -305,3 +305,23 @@ def strip_cwd(cmd: VerifyCmd) -> VerifyCmd:
     if cmd.tool is ToolKind.OPAQUE or cmd.raw is not None:
         return cmd
     return replace(cmd, cwd_rel=None)
+
+
+def reproject(cmd: VerifyCmd, project: str) -> VerifyCmd:
+    """Return *cmd* with ``uv_project`` set to *project* (regression ef68777a17).
+
+    Applies only to a bare ``uv run <tool>`` — ``uv_project == ''`` (uv-wrapped,
+    no explicit ``--project``/``--directory`` yet; see the tri-state note on
+    ``VerifyCmd.uv_project``) and ``cwd_rel is None``. No-op when: not
+    uv-wrapped at all (``uv_project is None``); an explicit ``--project`` is
+    already set (``uv_project`` non-empty); an explicit ``--directory`` is
+    already set (``cwd_rel is not None`` — the structural equivalent of
+    05c2d87a72's clause-scoped "don't second-guess an explicit uv context"
+    guard); OPAQUE (P1); or a raw-retained chain. Idempotent: reprojecting an
+    already-reprojected command is a no-op (uv_project is then non-empty).
+    """
+    if cmd.tool is ToolKind.OPAQUE or cmd.raw is not None:
+        return cmd
+    if cmd.uv_project != '' or cmd.cwd_rel is not None:
+        return cmd
+    return replace(cmd, uv_project=project)
