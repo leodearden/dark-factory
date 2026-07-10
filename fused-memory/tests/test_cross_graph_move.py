@@ -20,12 +20,15 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 from _fm_helpers import extract_cypher, extract_params
 
+from fused_memory.backends.graphiti_client import NodeNotFoundError
 from fused_memory.maintenance import cross_graph_move
 from fused_memory.maintenance.cross_graph_move import (
+    CreateResult,
     ForeignDuplicateSuspectedError,
     MergeResult,
     MoveResult,
     classify_unique_wrong_edges,
+    create_moved_node,
     format_vecf32_literal,
     merge_foreign_duplicate,
     move_entity_across_graphs,
@@ -1111,3 +1114,224 @@ class TestMergeForeignDuplicate:
         assert result.home_edge_count_after != (
             result.home_edge_count_before + result.edges_recreated
         )
+
+
+# ---------------------------------------------------------------------------
+# task 2415 (CGL-η follow-up): three-phase barrier-ordered apply primitives.
+#
+# move_entity_across_graphs' single-call recreate-then-DETACH-DELETE loses a
+# co-moving neighbour's shared edge: the first-processed endpoint's target
+# CREATE silently skips the edge (the other endpoint isn't in target yet),
+# then the source node is unconditionally DETACH DELETEd, destroying the
+# edge before the second endpoint is ever processed. The fix restructures
+# --apply into three barrier-ordered batch passes -- create every target
+# node (Phase A, this section), THEN recreate every edge/mention (Phase B),
+# THEN delete every source node (Phase C) -- so both endpoints of a
+# co-moving edge are always present in target before any edge is recreated,
+# and no source is deleted until every edge is recreated.
+# ---------------------------------------------------------------------------
+
+# ---------------------------------------------------------------------------
+# step-1: create_moved_node (Phase A) -- node-only create, no edges/mentions/delete
+# ---------------------------------------------------------------------------
+
+class TestCreateMovedNode:
+    """create_moved_node(graphiti, uuid, source_graph, target_graph, *, rewrite_group_id=None).
+
+    Phase A of the three-phase apply: CREATEs the Entity node in
+    target_graph -- and ONLY the node. No RELATES_TO/MENTIONS recreate and
+    no source DETACH DELETE happen here (those are recreate_subgraph_
+    relationships / delete_source_node, Phase B / Phase C respectively) --
+    this is what lets every target node exist BEFORE any edge is recreated.
+    """
+
+    @pytest.mark.asyncio
+    async def test_creates_node_in_target_with_byte_exact_embedding_and_rewritten_group_id(
+        self, mock_config, make_backend, make_graph_mock, monkeypatch,
+    ):
+        """Reads node scalar props via ro_query + the exact name_embedding via
+        the raw --compact transport (group_id=source_graph), then CREATEs the
+        node in target with the byte-exact vecf32 literal and rewrite_group_id
+        applied to n.group_id.
+        """
+        backend = make_backend(mock_config)
+        source_mock = make_graph_mock()
+        source_mock.ro_query = AsyncMock(return_value=MagicMock(result_set=[NODE_ROW_FIXTURE]))
+        target_mock = make_graph_mock()
+        # unconditional target-presence probe: node absent from target.
+        target_mock.ro_query = AsyncMock(return_value=MagicMock(result_set=[]))
+        backend._driver._get_graph = _route_graphs({
+            SOURCE_GRAPH_FIXTURE: source_mock,
+            TARGET_GRAPH_FIXTURE: target_mock,
+        })
+
+        fake_read_compact = AsyncMock(return_value=COMPACT_VECTOR_REPLY_FIXTURE)
+        monkeypatch.setattr(cross_graph_move, '_read_compact_vector', fake_read_compact)
+
+        rewritten_group_id = 'dark_factory_rewritten'
+        result = await create_moved_node(
+            backend, NODE_UUID_FIXTURE, SOURCE_GRAPH_FIXTURE, TARGET_GRAPH_FIXTURE,
+            rewrite_group_id=rewritten_group_id,
+        )
+
+        # reads node props from source, and the exact name_embedding via the
+        # raw transport (group_id=source_graph).
+        read_params = extract_params(source_mock.ro_query.call_args_list[0])
+        assert read_params.get('uuid') == NODE_UUID_FIXTURE
+        fake_read_compact.assert_awaited_once()
+        assert fake_read_compact.call_args.kwargs.get('group_id') == SOURCE_GRAPH_FIXTURE
+
+        # CREATEs the node in target with the byte-exact vecf32 literal and
+        # the rewritten group_id -- never the source's original group_id.
+        target_mock.query.assert_awaited_once()
+        cypher = extract_cypher(target_mock.query.call_args)
+        params = extract_params(target_mock.query.call_args)
+        assert 'CREATE' in cypher
+        assert EXPECTED_VECF32_LITERAL_FIXTURE in cypher
+        assert params.get('uuid') == NODE_UUID_FIXTURE
+        assert params.get('name') == 'Alice'
+        assert params.get('group_id') == rewritten_group_id
+
+        assert isinstance(result, CreateResult)
+        assert result.uuid == NODE_UUID_FIXTURE
+        assert result.source_graph == SOURCE_GRAPH_FIXTURE
+        assert result.target_graph == TARGET_GRAPH_FIXTURE
+        assert result.already_created is False
+
+    @pytest.mark.asyncio
+    async def test_issues_no_edge_or_mention_recreate_and_no_source_delete(
+        self, mock_config, make_backend, make_graph_mock, monkeypatch,
+    ):
+        """Phase A is node-create ONLY: no RELATES_TO/MENTIONS reads or
+        recreate, and source.query is never awaited at all -- no DETACH
+        DELETE happens here (that's Phase C's delete_source_node).
+        """
+        backend = make_backend(mock_config)
+        source_mock = make_graph_mock()
+        source_mock.ro_query = AsyncMock(return_value=MagicMock(result_set=[NODE_ROW_FIXTURE]))
+        target_mock = make_graph_mock()
+        target_mock.ro_query = AsyncMock(return_value=MagicMock(result_set=[]))
+        backend._driver._get_graph = _route_graphs({
+            SOURCE_GRAPH_FIXTURE: source_mock,
+            TARGET_GRAPH_FIXTURE: target_mock,
+        })
+
+        fake_read_compact = AsyncMock(return_value=COMPACT_VECTOR_REPLY_FIXTURE)
+        monkeypatch.setattr(cross_graph_move, '_read_compact_vector', fake_read_compact)
+
+        await create_moved_node(
+            backend, NODE_UUID_FIXTURE, SOURCE_GRAPH_FIXTURE, TARGET_GRAPH_FIXTURE,
+        )
+
+        # exactly one ro_query on source (node scalar props) -- no
+        # RELATES_TO/MENTIONS reads.
+        assert source_mock.ro_query.await_count == 1
+        # exactly one mutating call: the node CREATE on target.
+        assert target_mock.query.await_count == 1
+        # source is NEVER mutated -- no DETACH DELETE (that's Phase C).
+        source_mock.query.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_already_present_in_target_is_idempotent_noop(
+        self, mock_config, make_backend, make_graph_mock, monkeypatch,
+    ):
+        """Node already present in target, absent from source (the
+        unconditional target-presence probe backs this, run regardless of
+        source presence) -- a no-op returning already_created=True; no
+        mutation on either graph, and the raw embedding transport is never
+        reached.
+        """
+        backend = make_backend(mock_config)
+        source_mock = make_graph_mock()
+        source_mock.ro_query = AsyncMock(return_value=MagicMock(result_set=[]))
+        target_mock = make_graph_mock()
+        target_mock.ro_query = AsyncMock(
+            return_value=MagicMock(
+                result_set=[[NODE_UUID_FIXTURE, 'Alice', '2026-01-01T00:00:00+00:00']]
+            )
+        )
+        backend._driver._get_graph = _route_graphs({
+            SOURCE_GRAPH_FIXTURE: source_mock,
+            TARGET_GRAPH_FIXTURE: target_mock,
+        })
+
+        fake_read_compact = AsyncMock(return_value=COMPACT_VECTOR_REPLY_FIXTURE)
+        monkeypatch.setattr(cross_graph_move, '_read_compact_vector', fake_read_compact)
+
+        result = await create_moved_node(
+            backend, NODE_UUID_FIXTURE, SOURCE_GRAPH_FIXTURE, TARGET_GRAPH_FIXTURE,
+        )
+
+        target_mock.query.assert_not_awaited()
+        source_mock.query.assert_not_awaited()
+        fake_read_compact.assert_not_awaited()
+
+        assert isinstance(result, CreateResult)
+        assert result.uuid == NODE_UUID_FIXTURE
+        assert result.source_graph == SOURCE_GRAPH_FIXTURE
+        assert result.target_graph == TARGET_GRAPH_FIXTURE
+        assert result.already_created is True
+
+    @pytest.mark.asyncio
+    async def test_divergent_duplicate_raises_foreign_duplicate_suspected(
+        self, mock_config, make_backend, make_graph_mock, monkeypatch,
+    ):
+        """Present in BOTH graphs, but target's name/created_at diverge from
+        source's -- a genuine foreign duplicate (merge_foreign_duplicate's
+        territory), not a partially-completed move. Raises
+        ForeignDuplicateSuspectedError before any mutation on either graph.
+        """
+        backend = make_backend(mock_config)
+        source_mock = make_graph_mock()
+        source_mock.ro_query = AsyncMock(return_value=MagicMock(result_set=[NODE_ROW_FIXTURE]))
+        target_mock = make_graph_mock()
+        target_mock.ro_query = AsyncMock(
+            return_value=MagicMock(
+                result_set=[[NODE_UUID_FIXTURE, 'Bob', '2020-06-01T00:00:00+00:00']]
+            )
+        )
+        backend._driver._get_graph = _route_graphs({
+            SOURCE_GRAPH_FIXTURE: source_mock,
+            TARGET_GRAPH_FIXTURE: target_mock,
+        })
+
+        fake_read_compact = AsyncMock(return_value=COMPACT_VECTOR_REPLY_FIXTURE)
+        monkeypatch.setattr(cross_graph_move, '_read_compact_vector', fake_read_compact)
+
+        with pytest.raises(ForeignDuplicateSuspectedError):
+            await create_moved_node(
+                backend, NODE_UUID_FIXTURE, SOURCE_GRAPH_FIXTURE, TARGET_GRAPH_FIXTURE,
+            )
+
+        target_mock.query.assert_not_awaited()
+        source_mock.query.assert_not_awaited()
+        fake_read_compact.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_absent_from_both_graphs_raises_node_not_found(
+        self, mock_config, make_backend, make_graph_mock, monkeypatch,
+    ):
+        """Absent from BOTH source and target -- genuinely not found, raises
+        NodeNotFoundError.
+        """
+        backend = make_backend(mock_config)
+        source_mock = make_graph_mock()
+        source_mock.ro_query = AsyncMock(return_value=MagicMock(result_set=[]))
+        target_mock = make_graph_mock()
+        target_mock.ro_query = AsyncMock(return_value=MagicMock(result_set=[]))
+        backend._driver._get_graph = _route_graphs({
+            SOURCE_GRAPH_FIXTURE: source_mock,
+            TARGET_GRAPH_FIXTURE: target_mock,
+        })
+
+        fake_read_compact = AsyncMock(return_value=COMPACT_VECTOR_REPLY_FIXTURE)
+        monkeypatch.setattr(cross_graph_move, '_read_compact_vector', fake_read_compact)
+
+        with pytest.raises(NodeNotFoundError):
+            await create_moved_node(
+                backend, NODE_UUID_FIXTURE, SOURCE_GRAPH_FIXTURE, TARGET_GRAPH_FIXTURE,
+            )
+
+        target_mock.query.assert_not_awaited()
+        source_mock.query.assert_not_awaited()
+        fake_read_compact.assert_not_awaited()
