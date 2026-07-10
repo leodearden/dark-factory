@@ -191,6 +191,16 @@ def _hand_launched_liveness_pid() -> int:
         return os.getppid()
 
 
+def _resolve_parent_session_id(env: Mapping[str, str]) -> str | None:
+    """Resolve the spawning session's slug from ``CLAUDE_SPAWN_PARENT_ID``.
+
+    A hand-launched root has no such env var (or it is blank) and stays
+    None -- ``parent_session_id`` encodes ONLY genuine spawn parentage
+    (Fleet Cockpit C1, PRD §6.1).
+    """
+    return env.get('CLAUDE_SPAWN_PARENT_ID') or None
+
+
 def run_session_start(
     hook_input: Mapping[str, Any],
     env: Mapping[str, str],
@@ -200,12 +210,14 @@ def run_session_start(
 
     When no record exists yet at this session's slug, this IS the session's
     first sight (PRD hand-launched-capture signal -- true for every hand-
-    launched session), so a RICH record is written:
+    launched session), so a RICH record is built:
     role/project/task_id/escalation_id/title/cwd/transcript_path all
     populated from the resolved identity, status=RUNNING. When a record
-    already exists under this slug, it is refreshed to RUNNING in place via
-    ``refresh_record`` -- every other already-populated field survives
-    untouched, and the write bumps the record's mtime heartbeat.
+    already exists under this slug, it is refreshed to RUNNING in place --
+    every other already-populated field survives untouched. Both paths then
+    receive the same best-effort enrichment (parent_session_id from
+    ``CLAUDE_SPAWN_PARENT_ID``; see ``_resolve_parent_session_id``) before a
+    single ``write_record`` call, which bumps the record's mtime heartbeat.
 
     KNOWN dual-record split for SPAWNED sessions: this slug is keyed on the
     Claude Code ``session_id`` (module docstring), while spawn-claude.sh's
@@ -226,7 +238,7 @@ def run_session_start(
     identity = resolve_hook_identity(hook_input, env)
     slug = hook_session_slug(hook_input, env)
     try:
-        session_registry.read_record(slug, root=root)
+        record = session_registry.read_record(slug, root=root)
     except FileNotFoundError:
         cwd = str(hook_input.get('cwd') or os.getcwd())
         launcher_pid_raw = env.get('CLAUDE_SPAWN_LAUNCHER_PID')
@@ -244,9 +256,13 @@ def run_session_start(
             start_ts=datetime.now(UTC).isoformat(),
             transcript_path=session_registry.transcript_path_for_cwd(cwd),
         )
-        session_registry.write_record(record, root=root)
-        return record
-    return session_registry.refresh_record(slug, root=root, status=session_registry.Status.RUNNING)
+
+    record.status = session_registry.Status.RUNNING
+    parent_session_id = _resolve_parent_session_id(env)
+    if parent_session_id is not None:
+        record.parent_session_id = parent_session_id
+    session_registry.write_record(record, root=root)
+    return record
 
 
 # ---------------------------------------------------------------------------
