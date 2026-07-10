@@ -191,6 +191,43 @@ def _hand_launched_liveness_pid() -> int:
         return os.getppid()
 
 
+def _resolve_parent_session_id(env: Mapping[str, str]) -> str | None:
+    """Resolve the spawning session's slug from ``CLAUDE_SPAWN_PARENT_ID``.
+
+    A hand-launched root has no such env var (or it is blank) and stays
+    None -- ``parent_session_id`` encodes ONLY genuine spawn parentage
+    (Fleet Cockpit C1, PRD §6.1).
+    """
+    return env.get('CLAUDE_SPAWN_PARENT_ID') or None
+
+
+def _resolve_display(env: Mapping[str, str], title: str) -> session_registry.Display | None:
+    """Resolve this session's best-effort focus target from env (Fleet Cockpit C2).
+
+    TMUX takes precedence over WINDOWID (hybrid window model, PRD §3 fork 1):
+    a session running inside tmux is best focused via the C4 tmux backend
+    even when a WINDOWID is also present (e.g. a terminal emulator hosting
+    the tmux client), so ``TMUX`` is checked first. ``tmux_target`` is the
+    pane spec from ``TMUX_PANE`` when present, else ``None`` (best-effort,
+    never guessed). The 'wm' case carries *title* as ``wm_title`` -- the
+    primary focus key (PRD §6.1: wmctrl -a by title) -- alongside the
+    best-effort ``WINDOWID`` optimization. Returns None when neither marker
+    is present.
+    """
+    if env.get('TMUX'):
+        return session_registry.Display(
+            kind=session_registry.DisplayKind.TMUX.value,
+            tmux_target=env.get('TMUX_PANE') or None,
+        )
+    if env.get('WINDOWID'):
+        return session_registry.Display(
+            kind=session_registry.DisplayKind.WM.value,
+            wm_title=title,
+            wm_window_id=env.get('WINDOWID'),
+        )
+    return None
+
+
 def run_session_start(
     hook_input: Mapping[str, Any],
     env: Mapping[str, str],
@@ -200,12 +237,15 @@ def run_session_start(
 
     When no record exists yet at this session's slug, this IS the session's
     first sight (PRD hand-launched-capture signal -- true for every hand-
-    launched session), so a RICH record is written:
+    launched session), so a RICH record is built:
     role/project/task_id/escalation_id/title/cwd/transcript_path all
     populated from the resolved identity, status=RUNNING. When a record
-    already exists under this slug, it is refreshed to RUNNING in place via
-    ``refresh_record`` -- every other already-populated field survives
-    untouched, and the write bumps the record's mtime heartbeat.
+    already exists under this slug, it is refreshed to RUNNING in place --
+    every other already-populated field survives untouched. Both paths then
+    receive the same best-effort enrichment (parent_session_id from
+    ``CLAUDE_SPAWN_PARENT_ID``, see ``_resolve_parent_session_id``; display
+    from ``TMUX``/``WINDOWID``, see ``_resolve_display``) before a single
+    ``write_record`` call, which bumps the record's mtime heartbeat.
 
     KNOWN dual-record split for SPAWNED sessions: this slug is keyed on the
     Claude Code ``session_id`` (module docstring), while spawn-claude.sh's
@@ -226,7 +266,7 @@ def run_session_start(
     identity = resolve_hook_identity(hook_input, env)
     slug = hook_session_slug(hook_input, env)
     try:
-        session_registry.read_record(slug, root=root)
+        record = session_registry.read_record(slug, root=root)
     except FileNotFoundError:
         cwd = str(hook_input.get('cwd') or os.getcwd())
         launcher_pid_raw = env.get('CLAUDE_SPAWN_LAUNCHER_PID')
@@ -244,9 +284,17 @@ def run_session_start(
             start_ts=datetime.now(UTC).isoformat(),
             transcript_path=session_registry.transcript_path_for_cwd(cwd),
         )
-        session_registry.write_record(record, root=root)
-        return record
-    return session_registry.refresh_record(slug, root=root, status=session_registry.Status.RUNNING)
+
+    record.status = session_registry.Status.RUNNING
+    parent_session_id = _resolve_parent_session_id(env)
+    if parent_session_id is not None:
+        record.parent_session_id = parent_session_id
+    title = record.title or hook_display_title(identity, env, record)
+    display = _resolve_display(env, title)
+    if display is not None:
+        record.display = display
+    session_registry.write_record(record, root=root)
+    return record
 
 
 # ---------------------------------------------------------------------------
@@ -254,16 +302,35 @@ def run_session_start(
 # ---------------------------------------------------------------------------
 
 
+def _extract_question(hook_input: Mapping[str, Any]) -> session_registry.Question | None:
+    """Extract a pending Question from a Notification hook's ``message``.
+
+    Returns None -- leaving any prior ``record.question`` untouched by the
+    caller -- when ``message`` is absent or blank/whitespace-only. Latest-
+    question semantics: an empty Notification must never clobber a real
+    question stamped by an earlier one.
+    """
+    message = hook_input.get('message')
+    if not message or not str(message).strip():
+        return None
+    return session_registry.Question(text=str(message), asked_at=datetime.now(UTC).isoformat())
+
+
 def _run_status_refresh_and_retitle(
     hook_input: Mapping[str, Any],
     env: Mapping[str, str],
     root: Path | str | None,
     status: session_registry.Status,
+    *,
+    question: session_registry.Question | None = None,
 ) -> str:
     """Shared refresh-then-retitle body for run_notification/run_stop."""
     identity = resolve_hook_identity(hook_input, env)
     slug = hook_session_slug(hook_input, env)
     record = session_registry.refresh_record(slug, root=root, status=status)
+    if question is not None:
+        record.question = question
+        session_registry.write_record(record, root=root)
     title = hook_display_title(identity, env, record)
     return osc_retitle_sequence(status, title)
 
@@ -273,9 +340,13 @@ def run_notification(
     env: Mapping[str, str],
     root: Path | str | None = None,
 ) -> str:
-    """Notification hook handler: status -> AWAITING_INPUT, return its OSC retitle."""
+    """Notification hook handler: status -> AWAITING_INPUT, stamp any question, return its OSC retitle."""
     return _run_status_refresh_and_retitle(
-        hook_input, env, root, session_registry.Status.AWAITING_INPUT
+        hook_input,
+        env,
+        root,
+        session_registry.Status.AWAITING_INPUT,
+        question=_extract_question(hook_input),
     )
 
 

@@ -17,6 +17,7 @@ import os
 import re
 import subprocess
 from collections.abc import Mapping
+from datetime import datetime
 from pathlib import Path
 
 import pytest  # pyright: ignore[reportMissingImports]
@@ -268,6 +269,162 @@ def test_run_session_start_spawned_still_prefers_explicit_launcher_pid_env(
 
 
 # ---------------------------------------------------------------------------
+# Task 2292 step-3: SessionStart parent_session_id stamping (Fleet Cockpit C2)
+# ---------------------------------------------------------------------------
+
+
+def test_run_session_start_create_path_stamps_parent_session_id(tmp_path: Path) -> None:
+    hook_input = {'session_id': 'sess-p1', 'cwd': '/home/leo/src/dark-factory'}
+    env = {'CLAUDE_SPAWN_PARENT_ID': 'unblock-df-2085-4242'}
+
+    sh.run_session_start(hook_input, env, root=tmp_path)
+
+    slug = sh.hook_session_slug(hook_input, env)
+    record = sr.read_record(slug, root=tmp_path)
+    assert record.status == sr.Status.RUNNING
+    assert record.parent_session_id == 'unblock-df-2085-4242'
+
+
+def test_run_session_start_refresh_path_stamps_parent_session_id_preserving_fields(
+    tmp_path: Path,
+) -> None:
+    hook_input = {'session_id': 'sess-p2', 'cwd': '/home/leo/src/dark-factory'}
+    env = {'CLAUDE_SPAWN_PARENT_ID': 'unblock-df-2085-4242'}
+    slug = sh.hook_session_slug(hook_input, env)
+    existing = sr.SessionRecord(
+        session_slug=slug,
+        status=sr.Status.LAUNCHING,
+        role='unblock',
+        project='df',
+        task_id='2085',
+        cwd='/home/leo/src/dark-factory',
+        prompt='/unblock 2085',
+    )
+    sr.write_record(existing, root=tmp_path)
+    record_path = sr.record_path_for_slug(slug, root=tmp_path)
+    old_ts = record_path.stat().st_mtime - 10
+    os.utime(record_path, (old_ts, old_ts))
+
+    sh.run_session_start(hook_input, env, root=tmp_path)
+
+    record = sr.read_record(slug, root=tmp_path)
+    assert record.status == sr.Status.RUNNING
+    assert record.parent_session_id == 'unblock-df-2085-4242'
+    # Previously-populated fields survive the enrichment write.
+    assert record.role == 'unblock'
+    assert record.project == 'df'
+    assert record.task_id == '2085'
+    assert record.prompt == '/unblock 2085'
+    # mtime heartbeat bumped by the refresh write.
+    assert record_path.stat().st_mtime > old_ts
+
+
+def test_run_session_start_no_parent_id_env_leaves_parent_session_id_none(tmp_path: Path) -> None:
+    # Hand-launched root: no CLAUDE_SPAWN_PARENT_ID -> stays None.
+    hook_input = {'session_id': 'sess-p3', 'cwd': '/home/leo/src/dark-factory'}
+    env: dict[str, str] = {}
+
+    sh.run_session_start(hook_input, env, root=tmp_path)
+
+    slug = sh.hook_session_slug(hook_input, env)
+    record = sr.read_record(slug, root=tmp_path)
+    assert record.parent_session_id is None
+
+
+# ---------------------------------------------------------------------------
+# Task 2292 step-5: SessionStart best-effort display stamping (Fleet Cockpit C2)
+# ---------------------------------------------------------------------------
+
+
+def test_run_session_start_tmux_env_stamps_tmux_display(tmp_path: Path) -> None:
+    hook_input = {'session_id': 'sess-d1', 'cwd': '/home/leo/src/dark-factory'}
+    env = {'TMUX': '/tmp/tmux-1000/default,123,0', 'TMUX_PANE': '%3'}
+
+    sh.run_session_start(hook_input, env, root=tmp_path)
+
+    slug = sh.hook_session_slug(hook_input, env)
+    record = sr.read_record(slug, root=tmp_path)
+    assert record.display is not None
+    # Assert on the wire value directly -- a StrEnum-vs-str choice can't drift.
+    assert record.display.kind == 'tmux'
+    assert record.display.tmux_target == '%3'
+
+
+def test_run_session_start_windowid_env_stamps_wm_display(tmp_path: Path) -> None:
+    hook_input = {'session_id': 'sess-d2', 'cwd': '/home/leo/src/dark-factory'}
+    env = {'WINDOWID': '0x3200007'}
+
+    sh.run_session_start(hook_input, env, root=tmp_path)
+
+    slug = sh.hook_session_slug(hook_input, env)
+    record = sr.read_record(slug, root=tmp_path)
+    assert record.display is not None
+    assert record.display.kind == 'wm'
+    assert record.display.wm_window_id == '0x3200007'
+    assert record.display.wm_title == 'session:dark-factory'
+
+
+def test_run_session_start_tmux_takes_precedence_over_windowid(tmp_path: Path) -> None:
+    hook_input = {'session_id': 'sess-d3', 'cwd': '/home/leo/src/dark-factory'}
+    env = {
+        'TMUX': '/tmp/tmux-1000/default,123,0',
+        'TMUX_PANE': '%3',
+        'WINDOWID': '0x3200007',
+    }
+
+    sh.run_session_start(hook_input, env, root=tmp_path)
+
+    slug = sh.hook_session_slug(hook_input, env)
+    record = sr.read_record(slug, root=tmp_path)
+    assert record.display is not None
+    assert record.display.kind == 'tmux'
+
+
+def test_run_session_start_no_tmux_or_windowid_leaves_display_none(tmp_path: Path) -> None:
+    hook_input = {'session_id': 'sess-d4', 'cwd': '/home/leo/src/dark-factory'}
+    env: dict[str, str] = {}
+
+    sh.run_session_start(hook_input, env, root=tmp_path)
+
+    slug = sh.hook_session_slug(hook_input, env)
+    record = sr.read_record(slug, root=tmp_path)
+    assert record.display is None
+
+
+def test_run_session_start_display_stamping_applies_on_refresh_path(tmp_path: Path) -> None:
+    hook_input = {'session_id': 'sess-d5', 'cwd': '/home/leo/src/dark-factory'}
+    env = {'WINDOWID': '0x3200007'}
+    slug = sh.hook_session_slug(hook_input, env)
+    existing = sr.SessionRecord(
+        session_slug=slug,
+        status=sr.Status.LAUNCHING,
+        title='unblock:df#2085 routing-mechanism',
+        role='unblock',
+        project='df',
+        task_id='2085',
+        cwd='/home/leo/src/dark-factory',
+        prompt='/unblock 2085',
+    )
+    sr.write_record(existing, root=tmp_path)
+
+    sh.run_session_start(hook_input, env, root=tmp_path)
+
+    record = sr.read_record(slug, root=tmp_path)
+    assert record.status == sr.Status.RUNNING
+    assert record.display is not None
+    assert record.display.kind == 'wm'
+    assert record.display.wm_window_id == '0x3200007'
+    # wm_title resolves from the persisted record title (hook_display_title's
+    # existing precedence), not a freshly-derived role:project fallback.
+    assert record.display.wm_title == 'unblock:df#2085 routing-mechanism'
+    # Previously-populated fields survive.
+    assert record.role == 'unblock'
+    assert record.project == 'df'
+    assert record.task_id == '2085'
+    assert record.prompt == '/unblock 2085'
+
+
+# ---------------------------------------------------------------------------
 # Step-7: run_notification / run_stop (status flip + OSC return)
 # ---------------------------------------------------------------------------
 
@@ -319,6 +476,155 @@ def test_run_notification_prefers_persisted_record_title(tmp_path: Path) -> None
     osc = sh.run_notification(hook_input, env, root=tmp_path)
 
     assert osc == '\033]0;⏸ AWAITING unblock:df#2085 routing-mechanism\007'
+
+
+# ---------------------------------------------------------------------------
+# Task 2292 step-1: Notification question capture (Fleet Cockpit C2)
+# ---------------------------------------------------------------------------
+
+
+def test_run_notification_stamps_question_from_message(tmp_path: Path) -> None:
+    hook_input = {
+        'session_id': 'sess-q1',
+        'cwd': '/home/leo/src/dark-factory',
+        'message': 'Claude needs your permission to run Bash',
+    }
+    env: dict[str, str] = {}
+    slug = sh.hook_session_slug(hook_input, env)
+    existing = sr.SessionRecord(
+        session_slug=slug,
+        status=sr.Status.RUNNING,
+        role='session',
+        project='dark-factory',
+        cwd='/home/leo/src/dark-factory',
+    )
+    sr.write_record(existing, root=tmp_path)
+
+    sh.run_notification(hook_input, env, root=tmp_path)
+
+    record = sr.read_record(slug, root=tmp_path)
+    assert record.status == sr.Status.AWAITING_INPUT
+    assert record.question is not None
+    assert record.question.text == 'Claude needs your permission to run Bash'
+    # asked_at is a non-empty, genuinely parseable ISO-8601 timestamp.
+    assert record.question.asked_at
+    datetime.fromisoformat(record.question.asked_at)
+
+
+def test_run_notification_question_stamp_preserves_other_fields(tmp_path: Path) -> None:
+    # merge-not-clobber, record-level: previously-populated fields (title/
+    # role/project/task_id) survive the question-stamping write.
+    hook_input = {
+        'session_id': 'sess-q2',
+        'cwd': '/home/leo/src/dark-factory',
+        'message': 'Allow file write?',
+    }
+    env: dict[str, str] = {}
+    slug = sh.hook_session_slug(hook_input, env)
+    existing = sr.SessionRecord(
+        session_slug=slug,
+        status=sr.Status.RUNNING,
+        title='unblock:df#2085 routing-mechanism',
+        role='unblock',
+        project='df',
+        task_id='2085',
+        cwd='/home/leo/src/dark-factory',
+    )
+    sr.write_record(existing, root=tmp_path)
+
+    sh.run_notification(hook_input, env, root=tmp_path)
+
+    record = sr.read_record(slug, root=tmp_path)
+    assert record.title == 'unblock:df#2085 routing-mechanism'
+    assert record.role == 'unblock'
+    assert record.project == 'df'
+    assert record.task_id == '2085'
+    assert record.question is not None
+    assert record.question.text == 'Allow file write?'
+
+
+@pytest.mark.parametrize(
+    'hook_input_extra',
+    [
+        {},
+        {'message': ''},
+        {'message': '   '},
+    ],
+    ids=['absent', 'blank', 'whitespace'],
+)
+def test_run_notification_no_question_when_message_absent_or_blank(
+    tmp_path: Path,
+    hook_input_extra: dict[str, str],
+) -> None:
+    hook_input = {'session_id': 'sess-q3', 'cwd': '/home/leo/src/dark-factory', **hook_input_extra}
+    env: dict[str, str] = {}
+    slug = sh.hook_session_slug(hook_input, env)
+    existing = sr.SessionRecord(
+        session_slug=slug,
+        status=sr.Status.RUNNING,
+        role='session',
+        project='dark-factory',
+        cwd='/home/leo/src/dark-factory',
+    )
+    sr.write_record(existing, root=tmp_path)
+
+    osc = sh.run_notification(hook_input, env, root=tmp_path)
+
+    record = sr.read_record(slug, root=tmp_path)
+    assert record.status == sr.Status.AWAITING_INPUT
+    assert record.question is None
+    assert osc == '\033]0;⏸ AWAITING session:dark-factory\007'
+
+
+def test_run_stop_does_not_stamp_question_even_with_message(tmp_path: Path) -> None:
+    # Stop (idle) never captures a question, even if the hook's stdin JSON
+    # happens to carry a 'message' key.
+    hook_input = {
+        'session_id': 'sess-q4',
+        'cwd': '/home/leo/src/dark-factory',
+        'message': 'Should not be captured by Stop',
+    }
+    env: dict[str, str] = {}
+    slug = sh.hook_session_slug(hook_input, env)
+    existing = sr.SessionRecord(
+        session_slug=slug,
+        status=sr.Status.RUNNING,
+        role='session',
+        project='dark-factory',
+        cwd='/home/leo/src/dark-factory',
+    )
+    sr.write_record(existing, root=tmp_path)
+
+    sh.run_stop(hook_input, env, root=tmp_path)
+
+    record = sr.read_record(slug, root=tmp_path)
+    assert record.status == sr.Status.IDLE
+    assert record.question is None
+
+
+def test_main_notification_stamps_question_via_stdin(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    # stdin -> question plumbing: the hooks/notification.sh entrypoint passes
+    # the Notification event's stdin JSON straight through to session_hooks
+    # via command substitution, so main() itself must thread 'message' into
+    # the stamped question with no .sh changes required.
+    monkeypatch.setenv('CLAUDE_FLEET_ROOT', str(tmp_path))
+    hook_input = {
+        'session_id': 'sess-main-q',
+        'cwd': '/home/leo/src/dark-factory',
+        'message': 'Claude needs your permission to run Bash',
+    }
+    _stdin_json(monkeypatch, hook_input)
+
+    rc = sh.main(['notification'])
+
+    assert rc == 0
+    slug = sh.hook_session_slug(hook_input, env={})
+    record = sr.read_record(slug, root=tmp_path)
+    assert record.question is not None
+    assert record.question.text == 'Claude needs your permission to run Bash'
 
 
 # ---------------------------------------------------------------------------
