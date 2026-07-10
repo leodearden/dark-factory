@@ -3566,8 +3566,8 @@ class TaskInterceptor:
         tm = await self._ensure_taskmaster()
         project_id = resolve_project_id(project_root)
         # W5-ζ ReconWritePolicy: only consulted for recon-stage callers.
-        # snapshot_token stays None here — wired to extract_snapshot_token
-        # once metadata-carrying snapshot checks land (task 2224 step-16).
+        # snapshot_token is extracted from the incoming metadata payload so
+        # gate 3 (stale-snapshot) can fire on this path.
         if isinstance(agent_id, str) and agent_id.startswith('recon-stage-'):
             before = await tm.get_task(task_id, project_root)
             verdict = recon_write_policy.check(
@@ -3577,7 +3577,7 @@ class TaskInterceptor:
                 agent_id=agent_id,
                 target_status=None,
                 live_status=_extract_status(before),
-                snapshot_token=None,
+                snapshot_token=recon_write_policy.extract_snapshot_token(kwargs.get('metadata')),
             )
             if verdict.is_rejection:
                 return verdict.to_error_dict()
