@@ -333,6 +333,100 @@ class TestVerifyInfraPermanentExhaustion:
 
 
 # ---------------------------------------------------------------------------
+# Task 2200 (ω4) step-3: the verify-infra STAMP lands the task on
+# status='infra-hold' (not 'blocked'), driven through the run()-level infra
+# block (_execute_verify_review_loop's _infra_hold_info branch -> the real
+# _mark_blocked), while still filing the L1.
+# ---------------------------------------------------------------------------
+
+class TestVerifyInfraStampUsesInfraHoldStatus:
+    """The STAMP write site must key the task row onto the first-class
+
+    'infra-hold' status (PRD C7/D3) rather than the generic 'blocked', so
+    the harness HOLD guard and RESUME cascade (both keyed on
+    ``is_infra_held``) see it.  This drives the REAL ``_mark_blocked`` (the
+    other tests in this module stub it out) through
+    ``_execute_verify_review_loop``'s ``_infra_hold_info`` branch.
+    """
+
+    @pytest.mark.asyncio
+    async def test_verify_infra_exhaustion_sets_status_infra_hold_not_blocked(self):
+        wf = _make(verify_infra_retry_max_attempts=3)
+
+        # Exercise the REAL _mark_blocked for this test only — _make() stubs
+        # it out (as an AsyncMock) for every other test in this module.  We
+        # need the real status-write logic to confirm the STAMP lands on
+        # 'infra-hold'.  `del` removes the instance-attribute stub so
+        # attribute access falls back to the bound class method.
+        del wf._mark_blocked
+        # Neutralize the two real side effects _mark_blocked would otherwise
+        # trigger that are out of scope for this status-write test: the
+        # fire-and-forget dry-run investigation task, and the L1 escalation
+        # filing internals (covered by its own assertion below via mock).
+        wf._spawn_dry_run_unblock = MagicMock()
+        wf._ensure_l1_escalation_for_blocked = AsyncMock()
+
+        # Simulate exhaustion having already stashed the hold info (this is
+        # what _run_scoped_verification_with_infra_retry does on permanent
+        # VerifyInfraError exhaustion — exercised separately above).
+        wf._infra_hold_info = {
+            'reason': 'Infra hold: warm_marker ENOSPC',
+            'detail': 'exhausted retry window',
+            'category': 'infra_issue',
+            'escalate_to_human': True,
+        }
+
+        with (
+            patch.object(
+                wf, '_execute_iterations',
+                new=AsyncMock(return_value=WorkflowOutcome.PLANNED),
+            ),
+            patch.object(
+                wf, '_verify_debugfix_loop',
+                new=AsyncMock(return_value=WorkflowOutcome.BLOCKED),
+            ),
+        ):
+            outcome = await wf._execute_verify_review_loop()
+
+        assert outcome == WorkflowOutcome.BLOCKED
+
+        # STAMP must write the first-class infra-hold status ...
+        wf.scheduler.set_task_status.assert_awaited_once_with(  # type: ignore[attr-defined]
+            wf.task_id, 'infra-hold',
+        )
+        # ... and NEVER 'blocked' for this path.
+        for call_args in wf.scheduler.set_task_status.await_args_list:  # type: ignore[attr-defined]
+            args = call_args.args
+            if len(args) >= 2:
+                assert args[1] != 'blocked', (
+                    f"set_task_status called with 'blocked' on the infra-hold "
+                    f"STAMP path: {call_args}"
+                )
+
+        # No update_task call may stamp the retired metadata.infra_hold flag.
+        for call_args in wf.scheduler.update_task.await_args_list:  # type: ignore[attr-defined]
+            metadata_arg = call_args.kwargs.get('metadata') or (
+                call_args.args[1] if len(call_args.args) > 1 else None
+            )
+            if metadata_arg:
+                assert 'infra_hold' not in metadata_arg, (
+                    f'metadata.infra_hold must not be written: {call_args}'
+                )
+
+        # _infra_hold_info must still be set (used by the L1 filing below).
+        assert wf._infra_hold_info is not None
+        assert wf._infra_hold_info.get('category') == 'infra_issue'
+        assert wf._infra_hold_info.get('escalate_to_human') is True
+
+        # The escalation/_mark_blocked path still fires so the L1 is created.
+        wf._ensure_l1_escalation_for_blocked.assert_awaited_once()  # type: ignore[attr-defined]
+        l1_call = wf._ensure_l1_escalation_for_blocked.await_args  # type: ignore[attr-defined]
+        assert l1_call.kwargs.get('category') == 'infra_issue', (
+            f'L1 must be filed with category=infra_issue, got: {l1_call}'
+        )
+
+
+# ---------------------------------------------------------------------------
 # Step 11: Defensive net — bare infra OSError escaping verify loop →
 #          _mark_blocked(category='infra_issue'), not generic 'Workflow error:'
 # ---------------------------------------------------------------------------
