@@ -10,7 +10,16 @@
 # Usage:
 #   spawn-claude.sh <cwd> <skip_permissions:true|false> <title|""> <prompt>
 #
-# Emulator discovery order:
+# Backend selection:
+#   $CLAUDE_SPAWN_BACKEND=tmux — bypass terminal-emulator discovery entirely
+#     and launch in a crash-survivable, reattachable tmux window instead
+#     (Fleet Cockpit C6). Per-project session `fleet-<project>` (project from
+#     $CLAUDE_SPAWN_PROJECT, else basename(cwd), else "fleet"), one window
+#     per runner; override the session name via $CLAUDE_SPAWN_TMUX_SESSION.
+#     Reattach with `tmux attach -t <session>`. Requires `tmux` on $PATH —
+#     see exit code 126 below.
+#
+# Emulator discovery order (when $CLAUDE_SPAWN_BACKEND != tmux):
 #   1. $CLAUDE_TERMINAL_CMD             (preferred env override)
 #   2. $ESCALATION_TERMINAL_CMD         (legacy fallback)
 #   3. gnome-terminal / kitty / konsole / xterm in $PATH
@@ -19,7 +28,7 @@
 #
 # Exit codes:
 #   0..125 — claude's own exit code (recovered from sentinel)
-#   126    — no terminal emulator found
+#   126    — no usable launcher (no terminal emulator found / tmux missing in tmux mode)
 #   127    — launcher itself failed (emulator exited before writing the sentinel)
 #   129    — terminal window closed while the session was alive (SIGHUP)
 #   144    — Claude never started within the started-grace window (registry marked failed-to-start)
@@ -476,10 +485,15 @@ resolve_detached() {
 
 if [ "${CLAUDE_SPAWN_BACKEND:-}" = "tmux" ]; then
   # Fleet Cockpit C6: the tmux lane is crash-survivable/reattachable and
-  # needs no terminal emulator at all -- bypass discovery entirely. (A
-  # tmux-availability guard mirroring the no-emulator exit 126 below lands
-  # separately.) first_word drives the case dispatch further down exactly
-  # like a discovered $emulator would.
+  # needs no terminal emulator at all -- bypass discovery entirely.
+  # first_word drives the case dispatch further down exactly like a
+  # discovered $emulator would. Mirrors the no-emulator exit 126 below:
+  # fail fast, before the watchdog fork, if the one thing this lane
+  # actually needs is missing.
+  if ! command -v tmux >/dev/null 2>&1; then
+    echo "spawn-claude.sh: CLAUDE_SPAWN_BACKEND=tmux but tmux not found — install tmux or unset CLAUDE_SPAWN_BACKEND" >&2
+    exit 126
+  fi
   first_word="tmux-lane"
 else
   emulator=""
