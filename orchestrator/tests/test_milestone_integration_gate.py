@@ -14,6 +14,7 @@ orchestrator parses nothing).
 
 from __future__ import annotations
 
+import asyncio
 import json
 import os
 import subprocess
@@ -26,7 +27,7 @@ from escalation.queue import EscalationQueue
 
 from orchestrator.config import OrchestratorConfig
 from orchestrator.deterministic_runner import DeterministicRunner
-from orchestrator.scheduler import Scheduler
+from orchestrator.scheduler import Scheduler, TaskAssignment
 from orchestrator.workflow import WorkflowOutcome
 
 # ---------------------------------------------------------------------------
@@ -117,6 +118,13 @@ def _build_scheduler(clock: list[datetime]) -> Scheduler:
     scheduler = Scheduler(config, wall_time_source=lambda: clock[0])
     scheduler.update_task = AsyncMock(return_value=True)
     return scheduler
+
+
+def _make_assignment(task: dict) -> TaskAssignment:
+    """Build a TaskAssignment directly (bypassing acquire_next) for tests
+    that exercise the runner half in isolation — deterministic tasks always
+    hold an empty modules list (I4/B12: no module lock)."""
+    return TaskAssignment(task_id=str(task['id']), task=task, modules=[])
 
 
 def _mock_scheduler(task: dict) -> MagicMock:
@@ -254,7 +262,7 @@ class TestExemplarPassLifecycle:
         # Tick 1: dep X still pending -> withheld, no anchor stamped.
         result_1 = await scheduler.acquire_next()
         assert result_1 is None, 'must withhold while dep X is unsatisfied'
-        scheduler.update_task.assert_not_awaited()
+        scheduler.update_task.assert_not_awaited()  # type: ignore[attr-defined]
 
         # Flip dep X -> done; tick 2 stamps the anchor exactly once (B2) but
         # STILL withholds this tick — the stamp is only visible on the NEXT
@@ -263,8 +271,8 @@ class TestExemplarPassLifecycle:
         mock_call.return_value = _task_response([dep_task, milestone_task])
         result_2 = await scheduler.acquire_next()
         assert result_2 is None, 'anchor just stamped is not visible until next tick'
-        scheduler.update_task.assert_awaited_once()
-        stamp_call = scheduler.update_task.call_args
+        scheduler.update_task.assert_awaited_once()  # type: ignore[attr-defined]
+        stamp_call = scheduler.update_task.call_args  # type: ignore[attr-defined]
         assert stamp_call.args[0] == self.TASK_ID
         anchor_iso = stamp_call.args[1]['milestone_deps_satisfied_at']
         assert stamp_call.kwargs.get('metadata_mode') == 'merge'
@@ -306,4 +314,120 @@ class TestExemplarPassLifecycle:
             f'stdout tail must appear in provenance note: {provenance!r}'
         )
 
+        unit_inspector.assert_not_awaited()
+
+
+# ---------------------------------------------------------------------------
+# B8+B9 — exemplar FAIL verdict and INFRA-fault paths.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestExemplarFailAndTimeout:
+    """B8: the REAL exemplar script's rc!=0 VIOLATED verdict end-to-end.
+
+    B9: an INFRA fault (no verdict produced) routes to infra_issue, never
+    milestone_check_failed.  γ's outer ``asyncio.wait_for`` guard is
+    ``before_done['timeout_secs'] + run_timeout_grace_secs`` — a STRICT
+    superset of ``_default_run_script``'s own inner per-subprocess timeout,
+    which always resolves first for a real, SIGKILL-able subprocess and
+    returns a normal ``(rc=1, tail)`` verdict (the *intended* behaviour:
+    ``run_timeout_grace_secs`` is documented as "a pure safety margin ON TOP
+    of before_done['timeout_secs']", not a race to win — see
+    deterministic_runner.py's ``_RUN_TIMEOUT_GRACE_SECS`` comment).  A real
+    subprocess timing out therefore exercises B8 (milestone_check_failed),
+    not B9 — reaching the outer guard needs a leaf that never returns at
+    all, so B9 is exercised with an injected hanging ``script_runner``,
+    exactly mirroring test_deterministic_runner.py's own
+    ``TestPredicateModeTimeout`` unit test.  This still drives the REAL,
+    unmocked ``_run_predicate``/``run()`` composition — only the leaf
+    ``run_fn`` callable differs from the exemplar-script path.
+    """
+
+    TASK_ID_FAIL = '9002'
+    TASK_ID_TIMEOUT = '9003'
+
+    async def test_check_fails_files_milestone_check_failed_and_blocks(
+        self, repo_root: Path | None, tmp_path: Path,
+    ):
+        if repo_root is None:
+            pytest.skip('not running inside a git checkout')
+        script = repo_root / 'scripts' / 'check_merge_flakiness.sh'
+        if not script.exists():
+            pytest.fail(f'scripts/check_merge_flakiness.sh does not exist at {script}')
+
+        task = _delayed_predicate_milestone_task(
+            self.TASK_ID_FAIL, script,
+            args=['--threshold', '0.05', '--value', '0.08'],
+        )
+        assignment = _make_assignment(task)
+        unit_inspector = AsyncMock()
+        runner = _real_runner(tmp_path, task, unit_inspector)
+
+        outcome = await runner.run(assignment)
+
+        assert outcome == WorkflowOutcome.BLOCKED
+
+        pending = runner.escalation_queue.get_by_task(self.TASK_ID_FAIL, status='pending')
+        assert len(pending) == 1, f'expected exactly 1 pending escalation, got {len(pending)}'
+        esc = pending[0]
+        assert esc.category == 'milestone_check_failed'
+        assert 'rc=1' in esc.detail, f'rc must appear in detail: {esc.detail!r}'
+        assert 'VIOLATED' in esc.detail, f'stdout tail must appear in detail: {esc.detail!r}'
+
+        runner.scheduler.set_task_status.assert_awaited_once_with(self.TASK_ID_FAIL, 'blocked')
+
+        runner.scheduler.update_task.assert_awaited_once()
+        stamp_call = runner.scheduler.update_task.call_args
+        metadata_update = (
+            stamp_call.args[1] if stamp_call.args else stamp_call.kwargs.get('metadata', {})
+        )
+        assert metadata_update.get('gate_escalated_at'), (
+            'gate_escalated_at should be a truthy ISO timestamp'
+        )
+
+        unit_inspector.assert_not_awaited()
+
+    async def test_predicate_hang_files_infra_issue_not_milestone_check_failed(
+        self, tmp_path: Path,
+    ):
+        """A hung check produces NO exit code — no verdict — so this is an
+        INFRA fault: infra_issue, never milestone_check_failed, and
+        gate_escalated_at is never stamped (re-attempted on the next
+        dispatch rather than latched into the resolve-to-done path)."""
+        task = _delayed_predicate_milestone_task(
+            self.TASK_ID_TIMEOUT, Path('/nonexistent/unused.sh'), timeout_secs=0,
+        )
+        assignment = _make_assignment(task)
+        queue = EscalationQueue(tmp_path)
+        scheduler = _mock_scheduler(task)
+        unit_inspector = AsyncMock()
+
+        async def _hang(_before_done):
+            await asyncio.Event().wait()
+
+        runner = DeterministicRunner(
+            scheduler=scheduler,
+            escalation_queue=queue,
+            unit_inspector=unit_inspector,
+            script_runner=_hang,
+            run_timeout_grace_secs=0.05,
+        )
+
+        # Hang tripwire: if the outer guard regresses, fail loudly instead of
+        # stalling the suite.
+        outcome = await asyncio.wait_for(runner.run(assignment), timeout=5)
+
+        assert outcome == WorkflowOutcome.BLOCKED
+
+        pending = queue.get_by_task(self.TASK_ID_TIMEOUT, status='pending')
+        assert len(pending) == 1, f'expected exactly 1 pending escalation, got {len(pending)}'
+        esc = pending[0]
+        assert esc.category == 'infra_issue', (
+            f'a hung check is an infra fault, not a verdict — must not be '
+            f'milestone_check_failed: {esc.category!r}'
+        )
+
+        scheduler.set_task_status.assert_awaited_once_with(self.TASK_ID_TIMEOUT, 'blocked')
+        scheduler.update_task.assert_not_awaited()
         unit_inspector.assert_not_awaited()
