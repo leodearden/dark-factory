@@ -28,14 +28,13 @@ class TestInit:
         assert (artifacts.root / 'metadata.json').exists()
         assert (artifacts.root / 'reviews').is_dir()
 
-    def test_creates_gitignore(self, artifacts: TaskArtifacts):
-        gitignore = artifacts.root / '.gitignore'
-        assert gitignore.exists()
-        content = gitignore.read_text()
-        # Must contain the wildcard that ignores all scratch files
-        assert '*\n' in content
-        # Must contain warning comments to dissuade agents from removing it
-        assert 'DO NOT' in content
+    def test_init_writes_no_gitignore(self, artifacts: TaskArtifacts):
+        """W11-ι: init() no longer writes a .gitignore — .task-meta/ lives
+        outside the worktree, so there's nothing for git to ignore.
+        """
+        assert not (artifacts.root / '.gitignore').exists()
+        assert (artifacts.root / 'metadata.json').exists()
+        assert (artifacts.root / 'reviews').is_dir()
 
     def test_metadata_contents(self, artifacts: TaskArtifacts):
         metadata = json.loads((artifacts.root / 'metadata.json').read_text())
@@ -1191,7 +1190,6 @@ class TestMetaRootConstructor:
 
         assert (meta_root / 'metadata.json').exists()
         assert (meta_root / 'reviews').is_dir()
-        assert (meta_root / '.gitignore').exists()
         assert (meta_root / 'plan.json').exists()
 
         # Writes are new-path ONLY — the legacy `.task` dir must not appear.
@@ -1199,9 +1197,10 @@ class TestMetaRootConstructor:
 
 
 class TestReadPlanNewThenOldCompat:
-    """`read_plan` reads new-path-then-old (compat window); write-backs
-    (e.g. via `update_step_status`) target the new path only — migrate on
-    write.
+    """`read_plan`/`read_base_commit` resolve the new (meta_root) path only.
+    The legacy `<worktree>/.task` path is never consulted, even when it
+    holds data and the new path is empty — the compat-window fallback was
+    retired in W11-ι.
     """
 
     @pytest.fixture
@@ -1223,17 +1222,24 @@ class TestReadPlanNewThenOldCompat:
         read = ta.read_plan()
         assert read['steps'][0]['id'] == 'new-step'
 
-    def test_falls_back_to_legacy_when_only_old(
+    def test_read_ignores_legacy_when_meta_root_supplied(
         self, worktree: Path, meta_root: Path, legacy_root: Path
     ):
+        """meta_root supplied (new path empty); plan.json + metadata.json
+        written ONLY under the legacy path. read_plan/read_base_commit must
+        NOT fall back to legacy — they see nothing.
+        """
         worktree.mkdir()
         legacy_root.mkdir(parents=True)
         legacy_plan = {'steps': [{'id': 'legacy-step', 'status': 'pending', 'commit': None}]}
         (legacy_root / 'plan.json').write_text(json.dumps(legacy_plan))
+        (legacy_root / 'metadata.json').write_text(json.dumps(
+            {'task_id': 'x', 'base_commit': 'legacy-sha'}
+        ))
 
         ta = TaskArtifacts(worktree, meta_root)
-        read = ta.read_plan()
-        assert read['steps'][0]['id'] == 'legacy-step'
+        assert ta.read_plan() == {}
+        assert ta.read_base_commit() is None
 
     def test_prefers_new_when_both_exist(
         self, worktree: Path, meta_root: Path, legacy_root: Path
@@ -1249,400 +1255,14 @@ class TestReadPlanNewThenOldCompat:
         read = ta.read_plan()
         assert read['steps'][0]['id'] == 'new-step'
 
-    def test_write_back_targets_new_only(
-        self, worktree: Path, meta_root: Path, legacy_root: Path
-    ):
-        worktree.mkdir()
-        legacy_root.mkdir(parents=True)
-        legacy_plan = {'steps': [{'id': 'step-1', 'status': 'pending', 'commit': None}]}
-        (legacy_root / 'plan.json').write_text(json.dumps(legacy_plan))
-
-        ta = TaskArtifacts(worktree, meta_root)
-        ta.update_step_status('step-1', 'done', commit='abc123')
-
-        new_plan = json.loads((meta_root / 'plan.json').read_text())
-        assert new_plan['steps'][0]['status'] == 'done'
-        assert new_plan['steps'][0]['commit'] == 'abc123'
-
-        # Legacy copy must be untouched by the write-back.
-        legacy_plan_after = json.loads((legacy_root / 'plan.json').read_text())
-        assert legacy_plan_after['steps'][0]['status'] == 'pending'
-        assert legacy_plan_after['steps'][0]['commit'] is None
-
-    def test_normalization_write_back_from_legacy_targets_new_only(
-        self, worktree: Path, meta_root: Path, legacy_root: Path
-    ):
-        """read_plan's normalize-on-read write-back is also migrate-on-write:
-        a malformed plan found ONLY at the legacy path is normalized and the
-        corrected plan is written under meta_root, leaving the legacy
-        (still-malformed) copy untouched.
-        """
-        worktree.mkdir()
-        legacy_root.mkdir(parents=True)
-        malformed = {
-            'task_id': 'task-1',
-            'tdd_steps': [{'id': 'step-1', 'status': 'pending'}],
-        }
-        (legacy_root / 'plan.json').write_text(json.dumps(malformed))
-
-        ta = TaskArtifacts(worktree, meta_root)
-        plan = ta.read_plan()
-
-        assert 'steps' in plan
-        assert 'tdd_steps' not in plan
-
-        new_plan = json.loads((meta_root / 'plan.json').read_text())
-        assert 'steps' in new_plan
-        assert 'tdd_steps' not in new_plan
-
-        # Legacy copy must be untouched — still malformed, not normalized.
-        legacy_plan_after = json.loads((legacy_root / 'plan.json').read_text())
-        assert 'tdd_steps' in legacy_plan_after
-        assert 'steps' not in legacy_plan_after
-
-    def test_stamp_plan_provenance_from_legacy_targets_new_only(
-        self, worktree: Path, meta_root: Path, legacy_root: Path
-    ):
-        """stamp_plan_provenance reads a legacy-only plan.json via the
-        new-then-old fallback (through read_plan) and writes the
-        provenance-stamped plan under meta_root only, leaving the legacy
-        copy un-stamped.
-        """
-        worktree.mkdir()
-        legacy_root.mkdir(parents=True)
-        legacy_plan = {'steps': [{'id': 'step-1', 'status': 'pending', 'commit': None}]}
-        (legacy_root / 'plan.json').write_text(json.dumps(legacy_plan))
-
-        ta = TaskArtifacts(worktree, meta_root)
-        ta.stamp_plan_provenance('session-abc123')
-
-        new_plan = json.loads((meta_root / 'plan.json').read_text())
-        assert new_plan['_session_id'] == 'session-abc123'
-        assert '_created_at' in new_plan
-        assert '_finalized_at' in new_plan
-
-        # Legacy copy must be untouched — still un-stamped.
-        legacy_plan_after = json.loads((legacy_root / 'plan.json').read_text())
-        assert '_session_id' not in legacy_plan_after
-
-    def test_bump_revalidation_stamp_from_legacy_targets_new_only(
-        self, worktree: Path, meta_root: Path, legacy_root: Path
-    ):
-        """bump_revalidation_stamp reads a legacy-only plan.json (via
-        read_plan's new-then-old fallback) and writes the revalidation
-        stamp under meta_root only. Passing base_commit also drives
-        update_base_commit's own migrate-on-write of a legacy-only
-        metadata.json to meta_root. Both legacy copies are left untouched.
-        """
-        worktree.mkdir()
-        legacy_root.mkdir(parents=True)
-        legacy_plan = {
-            '_session_id': 'orig-planner',
-            'steps': [{'id': 'step-1', 'status': 'pending', 'commit': None}],
-        }
-        (legacy_root / 'plan.json').write_text(json.dumps(legacy_plan))
-        (legacy_root / 'metadata.json').write_text(json.dumps({
-            'task_id': 'task-1', 'base_commit': 'old-sha',
-        }))
-
-        ta = TaskArtifacts(worktree, meta_root)
-        ta.bump_revalidation_stamp('reval-runner', base_commit='new-sha')
-
-        new_plan = json.loads((meta_root / 'plan.json').read_text())
-        assert new_plan['_revalidated_by_session'] == 'reval-runner'
-        assert new_plan['_session_id'] == 'orig-planner'  # preserved
-        new_metadata = json.loads((meta_root / 'metadata.json').read_text())
-        assert new_metadata['base_commit'] == 'new-sha'
-
-        # Legacy copies must be untouched.
-        legacy_plan_after = json.loads((legacy_root / 'plan.json').read_text())
-        assert '_revalidated_by_session' not in legacy_plan_after
-        legacy_metadata_after = json.loads((legacy_root / 'metadata.json').read_text())
-        assert legacy_metadata_after['base_commit'] == 'old-sha'
-
-
-class TestUniformReadFallback:
-    """The new-then-old read compat is uniform across artifact types, not
-    just plan.json.
-    """
-
-    @pytest.fixture
-    def meta_root(self, worktree: Path) -> Path:
-        return TaskArtifacts.meta_root_for(worktree.parent, worktree.name)
-
-    @pytest.fixture
-    def legacy_root(self, worktree: Path) -> Path:
-        return worktree / '.task'
-
-    def test_read_base_commit_falls_back_to_legacy(
-        self, worktree: Path, meta_root: Path, legacy_root: Path
-    ):
-        worktree.mkdir()
-        legacy_root.mkdir(parents=True)
-        (legacy_root / 'metadata.json').write_text(
-            json.dumps({'task_id': 'x', 'base_commit': 'legacy-sha'})
-        )
-
-        ta = TaskArtifacts(worktree, meta_root)
-        assert ta.read_base_commit() == 'legacy-sha'
-
-    def test_read_iteration_log_falls_back_to_legacy(
-        self, worktree: Path, meta_root: Path, legacy_root: Path
-    ):
-        worktree.mkdir()
-        legacy_root.mkdir(parents=True)
-        (legacy_root / 'iterations.jsonl').write_text(
-            json.dumps({'note': 'legacy-entry'}) + '\n'
-        )
-
-        ta = TaskArtifacts(worktree, meta_root)
-        entries, corrupted = ta.read_iteration_log()
-        assert entries == [{'note': 'legacy-entry'}]
-        assert corrupted == []
-
-    def test_read_agent_session_falls_back_to_legacy(
-        self, worktree: Path, meta_root: Path, legacy_root: Path
-    ):
-        worktree.mkdir()
-        legacy_root.mkdir(parents=True)
-        (legacy_root / 'agent_session.json').write_text(json.dumps({
-            'session_id': 'legacy-session',
-            'role': 'implementer',
-            'started_at': 'now',
-            'owner_pid': 123,
-        }))
-
-        ta = TaskArtifacts(worktree, meta_root)
-        session = ta.read_agent_session()
-        assert session is not None
-        assert session['session_id'] == 'legacy-session'
-
-    def test_read_reviews_falls_back_to_legacy(
-        self, worktree: Path, meta_root: Path, legacy_root: Path
-    ):
-        worktree.mkdir()
-        (legacy_root / 'reviews').mkdir(parents=True)
-        (legacy_root / 'reviews' / 'reviewer-a.json').write_text(
-            json.dumps({'verdict': 'PASS', 'issues': []})
-        )
-
-        ta = TaskArtifacts(worktree, meta_root)
-        reviews = ta.read_reviews()
-        assert reviews == {'reviewer-a': {'verdict': 'PASS', 'issues': []}}
-
-    def test_update_base_commit_reads_legacy_writes_new(
-        self, worktree: Path, meta_root: Path, legacy_root: Path
-    ):
-        worktree.mkdir()
-        legacy_root.mkdir(parents=True)
-        (legacy_root / 'metadata.json').write_text(
-            json.dumps({'task_id': 'x', 'base_commit': 'old-sha'})
-        )
-
-        ta = TaskArtifacts(worktree, meta_root)
-        ta.update_base_commit('new-sha')
-
-        assert ta.read_base_commit() == 'new-sha'
-        new_metadata = json.loads((meta_root / 'metadata.json').read_text())
-        assert new_metadata['base_commit'] == 'new-sha'
-        assert new_metadata['task_id'] == 'x'
-
-        # Legacy copy must be untouched by the write-back.
-        legacy_metadata = json.loads((legacy_root / 'metadata.json').read_text())
-        assert legacy_metadata['base_commit'] == 'old-sha'
-
-
-class TestClearRemovesLegacyDuringCompat:
-    """clear_* must remove the artifact from BOTH the new and legacy paths
-    during the compat window — otherwise a clear that only unlinks the new
-    (absent) path is a no-op on a legacy-only artifact, and the paired
-    read_*() resurrects it via the new-then-old fallback.
-    """
-
-    @pytest.fixture
-    def meta_root(self, worktree: Path) -> Path:
-        return TaskArtifacts.meta_root_for(worktree.parent, worktree.name)
-
-    @pytest.fixture
-    def legacy_root(self, worktree: Path) -> Path:
-        return worktree / '.task'
-
-    def test_clear_blocking_dependency_removes_legacy(
-        self, worktree: Path, meta_root: Path, legacy_root: Path
-    ):
-        worktree.mkdir()
-        legacy_root.mkdir(parents=True)
-        (legacy_root / 'blocking_dependency.json').write_text(json.dumps({
-            'depends_on_task_id': 'task-9',
-            'reason': 'blocked',
-            'main_sha_at_report': 'sha1',
-            'reported_at': 'now',
-        }))
-
-        ta = TaskArtifacts(worktree, meta_root)
-        ta.clear_blocking_dependency()
-
-        assert not (legacy_root / 'blocking_dependency.json').exists()
-        assert ta.read_blocking_dependency() is None
-
-    def test_clear_already_done_removes_legacy(
-        self, worktree: Path, meta_root: Path, legacy_root: Path
-    ):
-        worktree.mkdir()
-        legacy_root.mkdir(parents=True)
-        (legacy_root / 'already_done.json').write_text(json.dumps({
-            'commit': 'abc123',
-            'evidence': 'already merged',
-            'reported_at': 'now',
-        }))
-
-        ta = TaskArtifacts(worktree, meta_root)
-        ta.clear_already_done()
-
-        assert not (legacy_root / 'already_done.json').exists()
-        assert ta.read_already_done() is None
-
-    def test_clear_unactionable_task_removes_legacy(
-        self, worktree: Path, meta_root: Path, legacy_root: Path
-    ):
-        worktree.mkdir()
-        legacy_root.mkdir(parents=True)
-        (legacy_root / 'unactionable_task.json').write_text(json.dumps({
-            'reason': 'false premise',
-            'evidence': 'contradiction',
-            'reported_at': 'now',
-        }))
-
-        ta = TaskArtifacts(worktree, meta_root)
-        ta.clear_unactionable_task()
-
-        assert not (legacy_root / 'unactionable_task.json').exists()
-        assert ta.read_unactionable_task() is None
-
-    def test_clear_false_premise_removes_legacy(
-        self, worktree: Path, meta_root: Path, legacy_root: Path
-    ):
-        worktree.mkdir()
-        legacy_root.mkdir(parents=True)
-        (legacy_root / 'false_premise.json').write_text(json.dumps({
-            'classification': 'unreachable',
-            'premise': 'the RED test premise',
-            'evidence': 'evidence text',
-            'proposed_resolution': 'respec',
-            'reported_at': 'now',
-        }))
-
-        ta = TaskArtifacts(worktree, meta_root)
-        ta.clear_false_premise()
-
-        assert not (legacy_root / 'false_premise.json').exists()
-        assert ta.read_false_premise() is None
-
-    def test_clear_agent_session_removes_legacy(
-        self, worktree: Path, meta_root: Path, legacy_root: Path
-    ):
-        worktree.mkdir()
-        legacy_root.mkdir(parents=True)
-        (legacy_root / 'agent_session.json').write_text(json.dumps({
-            'session_id': 'legacy-session',
-            'role': 'implementer',
-            'started_at': 'now',
-            'owner_pid': 123,
-        }))
-
-        ta = TaskArtifacts(worktree, meta_root)
-        ta.clear_agent_session()
-
-        assert not (legacy_root / 'agent_session.json').exists()
-        assert ta.read_agent_session() is None
-
-
-class TestIterationLogCompatNoSplitBrain:
-    """append_iteration_log must migrate legacy history into the new path on
-    first append, so read_iteration_log (via `_read_path`) never silently
-    drops legacy entries once the new file exists — otherwise the first
-    new-path append creates a new-only file and `_read_path` resolves to it
-    exclusively, dropping every legacy entry (split-brain data loss).
-    """
-
-    @pytest.fixture
-    def meta_root(self, worktree: Path) -> Path:
-        return TaskArtifacts.meta_root_for(worktree.parent, worktree.name)
-
-    @pytest.fixture
-    def legacy_root(self, worktree: Path) -> Path:
-        return worktree / '.task'
-
-    def test_first_append_preserves_legacy_history(
-        self, worktree: Path, meta_root: Path, legacy_root: Path
-    ):
-        worktree.mkdir()
-        legacy_root.mkdir(parents=True)
-        (legacy_root / 'iterations.jsonl').write_text(
-            json.dumps({'note': 'legacy-1'}) + '\n'
-        )
-
-        ta = TaskArtifacts(worktree, meta_root)
-        ta.init('task-1', 'Test Task', 'Desc')
-        ta.append_iteration_log({'note': 'new-1'})
-
-        entries, corrupted = ta.read_iteration_log()
-        notes = [e['note'] for e in entries]
-        assert notes == ['legacy-1', 'new-1']
-        assert corrupted == []
-
-    def test_second_append_keeps_all_prior_entries(
-        self, worktree: Path, meta_root: Path, legacy_root: Path
-    ):
-        worktree.mkdir()
-        legacy_root.mkdir(parents=True)
-        (legacy_root / 'iterations.jsonl').write_text(
-            json.dumps({'note': 'legacy-1'}) + '\n'
-        )
-
-        ta = TaskArtifacts(worktree, meta_root)
-        ta.init('task-1', 'Test Task', 'Desc')
-        ta.append_iteration_log({'note': 'new-1'})
-        ta.append_iteration_log({'note': 'new-2'})
-
-        entries, corrupted = ta.read_iteration_log()
-        notes = [e['note'] for e in entries]
-        assert notes == ['legacy-1', 'new-1', 'new-2']
-        assert corrupted == []
-
-    def test_skips_migration_when_new_path_already_exists(
-        self, worktree: Path, meta_root: Path, legacy_root: Path
-    ):
-        """When a new-path iterations.jsonl is already present (e.g. from a
-        prior append), append_iteration_log must NOT re-copy the legacy log
-        — the migration branch only fires once, on the first append after
-        the new path is created, not on every subsequent append.
-        """
-        worktree.mkdir()
-        legacy_root.mkdir(parents=True)
-        (legacy_root / 'iterations.jsonl').write_text(
-            json.dumps({'note': 'legacy-1'}) + '\n'
-        )
-        meta_root.mkdir(parents=True)
-        (meta_root / 'iterations.jsonl').write_text(
-            json.dumps({'note': 'new-preexisting'}) + '\n'
-        )
-
-        ta = TaskArtifacts(worktree, meta_root)
-        ta.append_iteration_log({'note': 'new-2'})
-
-        entries, corrupted = ta.read_iteration_log()
-        notes = [e['note'] for e in entries]
-        assert notes == ['new-preexisting', 'new-2']
-        assert corrupted == []
-
 
 class TestReadReviewsMergesLegacyAndNew:
-    """read_reviews merges the legacy and new reviews/ directories during
-    the compat window (new wins on stem collision) instead of selecting a
-    single directory — otherwise, once any new reviewer writes, the new
-    reviews/ dir exists and a whole-dir `_read_path` resolution would make
-    every legacy reviewer vanish from the gate decision.
+    """read_reviews reads the new (meta_root) reviews/ directory only — the
+    legacy `<worktree>/.task/reviews/` directory is never consulted, even
+    when it holds reviewer files and the new dir is empty or absent. The
+    legacy-merge behavior this class originally covered was retired in
+    W11-ι; the remaining tests pin new-path-only reads and the still-fatal
+    corrupt-file contract on that path.
     """
 
     @pytest.fixture
@@ -1652,26 +1272,13 @@ class TestReadReviewsMergesLegacyAndNew:
     @pytest.fixture
     def legacy_root(self, worktree: Path) -> Path:
         return worktree / '.task'
-
-    def test_merges_legacy_and_new(
-        self, worktree: Path, meta_root: Path, legacy_root: Path
-    ):
-        worktree.mkdir()
-        (legacy_root / 'reviews').mkdir(parents=True)
-        (legacy_root / 'reviews' / 'reviewer-a.json').write_text(json.dumps({
-            'verdict': 'CHANGES',
-            'issues': [{'severity': 'blocking', 'description': 'x'}],
-        }))
-
-        ta = TaskArtifacts(worktree, meta_root)
-        ta.init('task-1', 'Test Task', 'Desc')
-        ta.write_review('reviewer-b', {'verdict': 'PASS', 'issues': []})
-
-        assert set(ta.read_reviews()) == {'reviewer-a', 'reviewer-b'}
 
     def test_new_wins_on_stem_collision(
         self, worktree: Path, meta_root: Path, legacy_root: Path
     ):
+        """Legacy data for the same reviewer stem is simply invisible — the
+        new-path write is the only one read_reviews ever sees.
+        """
         worktree.mkdir()
         (legacy_root / 'reviews').mkdir(parents=True)
         (legacy_root / 'reviews' / 'reviewer-a.json').write_text(json.dumps({
@@ -1685,45 +1292,15 @@ class TestReadReviewsMergesLegacyAndNew:
 
         assert ta.read_reviews()['reviewer-a']['verdict'] == 'NEW'
 
-    def test_aggregate_surfaces_legacy_blocking(
-        self, worktree: Path, meta_root: Path, legacy_root: Path
-    ):
-        worktree.mkdir()
-        (legacy_root / 'reviews').mkdir(parents=True)
-        (legacy_root / 'reviews' / 'reviewer-a.json').write_text(json.dumps({
-            'verdict': 'CHANGES',
-            'issues': [{'severity': 'blocking', 'description': 'x'}],
-        }))
-
-        ta = TaskArtifacts(worktree, meta_root)
-        ta.init('task-1', 'Test Task', 'Desc')
-        ta.write_review('reviewer-b', {'verdict': 'PASS', 'issues': []})
-
-        assert ta.aggregate_reviews().has_blocking_issues is True
-
-    def test_corrupt_legacy_review_file_is_fatal(
-        self, worktree: Path, meta_root: Path, legacy_root: Path
-    ):
-        """A corrupt reviewer JSON file is NOT silently tolerated by either
-        side of the merge — this documents the intentional (pre-existing)
-        failure mode rather than adding new tolerance: a malformed review
-        aborts read_reviews (and therefore aggregate_reviews) instead of
-        being skipped. Unlike read_iteration_log (which tolerates corrupted
-        *lines*), read_reviews has no per-file error handling.
-        """
-        worktree.mkdir()
-        (legacy_root / 'reviews').mkdir(parents=True)
-        (legacy_root / 'reviews' / 'reviewer-a.json').write_text('{not valid json')
-
-        ta = TaskArtifacts(worktree, meta_root)
-
-        with pytest.raises(json.JSONDecodeError):
-            ta.read_reviews()
-
     def test_corrupt_new_review_file_is_fatal(
         self, worktree: Path, meta_root: Path,
     ):
-        """Same intentional-fatal contract on the new-path side of the merge."""
+        """A corrupt reviewer JSON file under the new path is NOT silently
+        tolerated — a malformed review aborts read_reviews (and therefore
+        aggregate_reviews) instead of being skipped. Unlike
+        read_iteration_log (which tolerates corrupted *lines*), read_reviews
+        has no per-file error handling.
+        """
         worktree.mkdir()
         (meta_root / 'reviews').mkdir(parents=True)
         (meta_root / 'reviews' / 'reviewer-b.json').write_text('{not valid json')
@@ -1732,47 +1309,3 @@ class TestReadReviewsMergesLegacyAndNew:
 
         with pytest.raises(json.JSONDecodeError):
             ta.read_reviews()
-
-
-class TestValidatePlanOwnerCompat:
-    """validate_plan_owner must resolve plan.json via the same new-then-old
-    fallback as read_plan — otherwise a legacy-only plan.json (mid-
-    migration) is falsely reported as an ownership mismatch, even though
-    read_plan() would load it fine.
-    """
-
-    @pytest.fixture
-    def meta_root(self, worktree: Path) -> Path:
-        return TaskArtifacts.meta_root_for(worktree.parent, worktree.name)
-
-    @pytest.fixture
-    def legacy_root(self, worktree: Path) -> Path:
-        return worktree / '.task'
-
-    def test_validates_legacy_only_plan_by_session_id(
-        self, worktree: Path, meta_root: Path, legacy_root: Path
-    ):
-        worktree.mkdir()
-        legacy_root.mkdir(parents=True)
-        (legacy_root / 'plan.json').write_text(json.dumps({
-            '_session_id': 'sess-1',
-            'steps': [{'id': 'step-1', 'status': 'pending', 'commit': None}],
-        }))
-
-        ta = TaskArtifacts(worktree, meta_root)
-        assert ta.validate_plan_owner('sess-1') is True
-        assert ta.validate_plan_owner('other-sess') is False
-
-    def test_validates_legacy_only_plan_by_revalidated_session(
-        self, worktree: Path, meta_root: Path, legacy_root: Path
-    ):
-        worktree.mkdir()
-        legacy_root.mkdir(parents=True)
-        (legacy_root / 'plan.json').write_text(json.dumps({
-            '_session_id': 'sess-1',
-            '_revalidated_by_session': 'sess-2',
-            'steps': [{'id': 'step-1', 'status': 'pending', 'commit': None}],
-        }))
-
-        ta = TaskArtifacts(worktree, meta_root)
-        assert ta.validate_plan_owner('sess-2') is True
