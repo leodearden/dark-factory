@@ -54,7 +54,9 @@ class TestWmBackendFocus:
         from cockpit.backends.base import CommandResult, DisplayTarget
         from cockpit.backends.wm import WmBackend
 
-        runner = ScriptedRunner(results={('wmctrl', '-a', 'session-a'): CommandResult(returncode=1)})
+        runner = ScriptedRunner(
+            results={('wmctrl', '-a', 'session-a'): CommandResult(returncode=1)}
+        )
         backend = WmBackend(run=runner)
         target = DisplayTarget(kind='wm', wm_title='session-a')
 
@@ -89,7 +91,9 @@ class TestWmBackendSetUrgency:
 
         backend.set_urgency(target, True)
 
-        assert runner.calls == [['xdotool', 'search', '--name', 'session-a', 'set_window', '--urgency', '1']]
+        assert runner.calls == [
+            ['xdotool', 'search', '--name', 'session-a', 'set_window', '--urgency', '1']
+        ]
 
     def test_sets_urgency_off_by_title(self):
         from cockpit.backends.base import DisplayTarget
@@ -101,7 +105,9 @@ class TestWmBackendSetUrgency:
 
         backend.set_urgency(target, False)
 
-        assert runner.calls == [['xdotool', 'search', '--name', 'session-a', 'set_window', '--urgency', '0']]
+        assert runner.calls == [
+            ['xdotool', 'search', '--name', 'session-a', 'set_window', '--urgency', '0']
+        ]
 
     def test_prefers_wm_window_id_when_present_no_id_roundtrip(self):
         from cockpit.backends.base import DisplayTarget
@@ -153,7 +159,9 @@ class TestWmBackendIsAlive:
         from cockpit.backends.wm import WmBackend
 
         runner = ScriptedRunner(
-            results={('wmctrl', '-l'): CommandResult(returncode=0, stdout='0x01 0 host session-a\n')}
+            results={
+                ('wmctrl', '-l'): CommandResult(returncode=0, stdout='0x01 0 host session-a\n')
+            }
         )
         backend = WmBackend(run=runner)
         target = DisplayTarget(kind='wm', wm_title='session-a')
@@ -165,7 +173,9 @@ class TestWmBackendIsAlive:
         from cockpit.backends.wm import WmBackend
 
         runner = ScriptedRunner(
-            results={('wmctrl', '-l'): CommandResult(returncode=0, stdout='0x01 0 host other-session\n')}
+            results={
+                ('wmctrl', '-l'): CommandResult(returncode=0, stdout='0x01 0 host other-session\n')
+            }
         )
         backend = WmBackend(run=runner)
         target = DisplayTarget(kind='wm', wm_title='session-a')
