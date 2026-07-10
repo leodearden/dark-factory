@@ -11,12 +11,13 @@ from collections.abc import Callable
 from datetime import UTC, datetime
 from pathlib import Path
 
+from orchestrator.session_registry import SessionRecord
 from textual.app import App, ComposeResult
 from textual.containers import Horizontal
 
 from cockpit.panes.detail_pane import DetailPane
 from cockpit.panes.session_table import SessionTable, order_sessions
-from cockpit.registry_reader import scan_sessions
+from cockpit.registry_reader import build_snapshot, scan_sessions, snapshot_changed
 
 
 class CockpitApp(App):
@@ -34,6 +35,9 @@ class CockpitApp(App):
         self.fleet_root = fleet_root
         self.poll_interval = poll_interval
         self._now_fn = now_fn if now_fn is not None else lambda: datetime.now(UTC)
+        self._records: list[SessionRecord] = []
+        self._snapshot: dict[str, tuple] = {}
+        self._has_scanned = False
 
     def compose(self) -> ComposeResult:
         yield Horizontal(
@@ -43,10 +47,23 @@ class CockpitApp(App):
 
     def on_mount(self) -> None:
         self.refresh_registry()
+        self.set_interval(self.poll_interval, self.refresh_registry)
 
     def refresh_registry(self) -> None:
-        """Scan the registry and (re)populate the SessionTable."""
+        """Scan the registry and rebuild the SessionTable only when something changed.
+
+        The in-memory snapshot diff (build_snapshot/snapshot_changed) keys on
+        substantive fields only (never start_ts/age), so a purely-time-passing
+        poll tick is a no-op -- no flicker, and the table's own
+        replace_rows() re-locates the previously-highlighted slug so the
+        cursor survives a rebuild.
+        """
         records = scan_sessions(self.fleet_root)
-        ordered = order_sessions(records)
+        new_snapshot = build_snapshot(records)
+        if self._has_scanned and not snapshot_changed(self._snapshot, new_snapshot):
+            return
+        self._has_scanned = True
+        self._snapshot = new_snapshot
+        self._records = order_sessions(records)
         table = self.query_one('#session-table', SessionTable)
-        table.replace_rows(ordered, self._now_fn())
+        table.replace_rows(self._records, self._now_fn())
