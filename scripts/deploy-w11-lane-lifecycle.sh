@@ -40,8 +40,11 @@ set -euo pipefail
 #                  PROJECT_ROOT, absolute values are used as-is (default:
 #                  .worktrees, matching GitConfig.worktree_dir's pydantic
 #                  default -- dark_factory does not override it).
-#   SERVICE      - the orchestrator unit to restart+verify (default:
-#                  orchestrator-dark-factory.service).
+#
+# The restart step below delegates entirely to restart-orchestrator.sh,
+# which hardcodes its own target unit (orchestrator-dark-factory.service) --
+# there is no SERVICE override here; set PATH to shim `systemctl` for tests
+# instead (see scripts/tests/test_deploy_w11_lane_lifecycle.py).
 
 PROJECT_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 
@@ -51,8 +54,6 @@ if [[ "$WORKTREE_DIR" = /* ]]; then
 else
     WORKTREE_BASE="$PROJECT_ROOT/$WORKTREE_DIR"
 fi
-
-SERVICE="${SERVICE:-orchestrator-dark-factory.service}"
 
 MODE="apply"
 
