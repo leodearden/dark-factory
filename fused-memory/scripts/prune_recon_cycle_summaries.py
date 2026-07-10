@@ -463,6 +463,38 @@ def check_limit_cap(
     return exceeding, abort
 
 
+def check_scan_completeness(
+    per_project_counts: dict[str, tuple[int, int]],
+) -> list[str]:
+    """Check whether any project's metadata-filtered scroll under-counted.
+
+    The scroll used to enumerate a project's cycle-summary pool
+    (``memory.mem0.scroll_by_metadata``) is bounded by ``--scan-limit`` and
+    can silently truncate if a project's true cycle-summary count exceeds
+    that window. This flags any project where the scanned count fell short
+    of the ground-truth count (``memory.mem0.count_by_metadata``), so the
+    caller can abort before treating a truncated scan's classification as
+    trustworthy.
+
+    Parameters
+    ----------
+    per_project_counts:
+        ``{project_id: (scanned_count, expected_count)}`` where
+        ``scanned_count`` is the number of records returned by the scroll and
+        ``expected_count`` is the ground-truth ``count_by_metadata`` total.
+
+    Returns
+    -------
+    Sorted list of project_ids whose ``scanned_count < expected_count``
+    (strict undercount only; ``scanned_count >= expected_count`` is not
+    flagged).
+    """
+    return sorted(
+        pid for pid, (scanned, expected) in per_project_counts.items()
+        if scanned < expected
+    )
+
+
 # ---------------------------------------------------------------------------
 # Live shell: apply + run
 # ---------------------------------------------------------------------------
