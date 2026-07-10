@@ -197,6 +197,49 @@ guard — no re-dispatch, no churn).
 including cross-project `project_id:task_id` deps. See "Cross-project task
 dependencies" above.
 
+### Milestone tasks (dated / delayed)
+
+`metadata.milestone` is an orthogonal, time-based dispatch gate — **not** a
+new `task_kind`. Setting it holds a task out of dispatch until its time
+trigger fires; once fired, the task dispatches through its normal path
+unchanged. It is allowed on **both** `normal` and `deterministic` tasks
+(orthogonal to `task_kind`), so it can gate a normal LLM-agent task, a
+deterministic predicate check (below), or a pure human gate (a `dated`
+milestone on a deterministic task with `always_escalates=True` and no
+`before_done`).
+
+Two time modes:
+- **`dated`** — fires at an explicit wall-clock instant.
+- **`delayed`** — fires `after_secs` seconds after the task's own
+  dependencies (local deps **and** `metadata.external_deps` — see
+  "Cross-project task dependencies" above) are satisfied.
+
+**`metadata.milestone`** (set at `submit_task`; validated by the shared
+`Milestone` model):
+
+```
+{
+  mode: "dated" | "delayed",
+  at: "<ISO-8601 datetime>",  # required iff mode="dated"; datetime.fromisoformat-parseable; forbidden iff delayed
+  after_secs: <int>,          # required and > 0 iff mode="delayed"; forbidden iff dated
+}
+```
+
+The `mode`-conditional fields are a strict *iff*: a `dated` milestone must
+not also carry `after_secs`, and a `delayed` milestone must not also carry
+`at`. This is enforced by the shared `Milestone` model
+(`shared/src/shared/task_metadata.py`) and re-checked by the `submit_task`
+guard — a malformed spec (`delayed` with no `after_secs`, `dated` with an
+unparseable `at`) is rejected at submit with a structured `ValidationError`
+and never persisted.
+
+**Scheduler-stamped fields** (never author-supplied):
+`milestone_deps_satisfied_at` (`delayed` mode only — the frozen-once
+wall-clock UTC anchor, stamped the first tick all of the task's dependencies
+go `done`) and, only on a predicate check failure, `gate_escalated_at`
+(shared with "Deterministic task kind" above). A task author never sets
+either field.
+
 ## Session Lifecycle
 
 ### Starting a session
