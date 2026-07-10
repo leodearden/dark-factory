@@ -15,6 +15,7 @@ from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+from _orch_helpers import wire_scheduler_liveness_mock
 from escalation.models import Escalation
 from escalation.queue import EscalationQueue
 
@@ -42,10 +43,10 @@ def harness(tmp_path: Path, mock_orch_config) -> Harness:
     h.scheduler.get_status = AsyncMock(return_value='blocked')
     h.scheduler.set_task_status = AsyncMock()
     h.scheduler.update_task = AsyncMock(return_value=True)
-    # Provide dispatched/lock_table for mid_run path (not used in startup tests)
-    h.scheduler._dispatched = set()
-    h.scheduler.lock_table = MagicMock()
-    h.scheduler.lock_table._held = set()
+    # Provide dispatched/lock_table/cancel-grace accessors for the mid_run
+    # path and the stranded-blocked gate (task 2235: harness.py now calls
+    # scheduler.is_dispatched/.is_actively_held/.workflow_cancel_recent).
+    wire_scheduler_liveness_mock(h.scheduler)
 
     # Wire git_ops mocks so blocked tasks fall through to Fix #1b
     h.git_ops.is_ancestor = AsyncMock(return_value=False)
@@ -235,7 +236,7 @@ class TestWorkflowCancelRecentHelper:
 
     def test_stale_stamp_returns_false(self, harness: Harness):
         """Stamp > _RECONCILE_CANCEL_GRACE_S old → outside grace window → False."""
-        grace = harness._RECONCILE_CANCEL_GRACE_S
+        grace = harness.scheduler._RECONCILE_CANCEL_GRACE_S
         harness._workflow_cancel_at['stale-task'] = time.monotonic() - grace - 1.0
         assert harness._workflow_cancel_recent('stale-task') is False  # type: ignore[attr-defined]
 
@@ -259,7 +260,7 @@ class TestAgeGateSweepIntegration:
         harness._escalation_events.clear()
 
         # Stale stamp: older than _RECONCILE_CANCEL_GRACE_S
-        grace = harness._RECONCILE_CANCEL_GRACE_S
+        grace = harness.scheduler._RECONCILE_CANCEL_GRACE_S
         harness._workflow_cancel_at[task_id] = time.monotonic() - grace - 5.0
 
         harness.scheduler.get_statuses = AsyncMock(

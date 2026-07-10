@@ -13,6 +13,7 @@ import gc
 import inspect
 import logging
 import threading
+import time
 from collections.abc import Sequence
 from typing import TYPE_CHECKING
 from unittest.mock import AsyncMock, MagicMock
@@ -25,6 +26,65 @@ if TYPE_CHECKING:
     from orchestrator.harness import Harness
 
 _log = logging.getLogger(__name__)
+
+
+def mock_lock_table(held: dict[str, set[str]] | None = None) -> MagicMock:
+    """MagicMock ``ModuleLockTable`` stand-in with a working ``is_held(tid)``.
+
+    Task 2235: harness.py's liveness reach-ins now call
+    ``scheduler.is_actively_held()``, which reads ``lock_table.is_held()``
+    rather than ``lock_table._held`` directly. Tests that reassign
+    ``scheduler.lock_table`` to simulate held/free modules must use this
+    helper (not a bare ``MagicMock()``) so ``is_held`` reflects the
+    ``_held`` state they set up rather than an auto-mocked (truthy) stub.
+    """
+    lt = MagicMock()
+    lt._held = {} if held is None else held
+    lt.is_held = lambda task_id: task_id in lt._held
+    return lt
+
+
+def wire_scheduler_liveness_mock(scheduler_mock: MagicMock) -> None:
+    """Wire real (non-auto-mock) liveness-accessor behaviour onto a MagicMock
+    Scheduler stand-in.
+
+    Task 2235: harness.py now calls ``scheduler.is_dispatched`` /
+    ``.is_actively_held`` / ``.workflow_cancel_recent`` /
+    ``.note_workflow_cancelled`` / ``.clear_workflow_cancel`` instead of
+    reaching into ``_dispatched`` / ``lock_table._held`` /
+    ``_workflow_cancel_at`` directly. On a bare ``MagicMock()`` those methods
+    auto-mock to a truthy return regardless of any raw state a test sets up,
+    silently breaking tests that pre-date task 2235's accessor migration.
+    This wires real implementations closing over the mock's own mutable
+    state, so tests may still freely reassign ``scheduler_mock._dispatched``
+    (a plain set) or ``scheduler_mock.lock_table`` (use :func:`mock_lock_table`)
+    and have the accessors reflect it.
+    """
+    scheduler_mock._dispatched = set()
+    scheduler_mock.lock_table = mock_lock_table()
+    scheduler_mock._workflow_cancel_at = {}
+    scheduler_mock._RECONCILE_CANCEL_GRACE_S = 30.0
+    scheduler_mock.is_dispatched = lambda tid: tid in scheduler_mock._dispatched
+    scheduler_mock.note_workflow_cancelled = (
+        lambda tid: scheduler_mock._workflow_cancel_at.__setitem__(tid, time.monotonic())
+    )
+    scheduler_mock.clear_workflow_cancel = (
+        lambda tid: scheduler_mock._workflow_cancel_at.pop(tid, None)
+    )
+
+    def _workflow_cancel_recent(tid: str) -> bool:
+        stamp = scheduler_mock._workflow_cancel_at.get(tid)
+        return (
+            stamp is not None
+            and time.monotonic() - stamp < scheduler_mock._RECONCILE_CANCEL_GRACE_S
+        )
+
+    scheduler_mock.workflow_cancel_recent = _workflow_cancel_recent
+    scheduler_mock.is_actively_held = lambda tid: (
+        tid in scheduler_mock._dispatched
+        or scheduler_mock.lock_table.is_held(tid)
+        or scheduler_mock.workflow_cancel_recent(tid)
+    )
 
 # task 2376: generous merge-pipeline result-wait ceiling that tolerates host
 # oversubscription; never-narrow — only replaces literals <=15 across the
