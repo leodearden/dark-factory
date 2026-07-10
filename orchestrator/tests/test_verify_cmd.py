@@ -613,3 +613,64 @@ class TestGovernCpu:
         cmd = parse_config_command('mypy src/')
         assert govern_cpu(cmd, self._EXEC) == cmd
         assert render(cmd) == 'mypy src/'
+
+
+class TestRenderInvariantAsserts:
+    """render() defensively asserts P1 and P3 against a hand-constructed
+
+    VerifyCmd that bypasses every mutator's raw-retained no-op guard —
+    the mutators (scope_to/strip_cwd/reproject/cargo_scope/serial_pytest/
+    govern_cpu) never themselves produce these states; the asserts document
+    and enforce that a raw-retained command's cwd_rel/targets stay at their
+    parse-time defaults, since render() ignores them (uses `raw` verbatim).
+    """
+
+    def test_opaque_with_forced_fields_raises(self):
+        """P1: an OPAQUE VerifyCmd whose structural fields were forced
+
+        non-default (uv_project/cwd_rel/targets/wrappers all set, bypassing
+        every mutator's OPAQUE no-op guard) makes render() raise —
+        OPAQUE must never have been mutated.
+        """
+        cmd = VerifyCmd(
+            tool=ToolKind.OPAQUE,
+            raw='mypy src/',
+            uv_project='shared',
+            cwd_rel='fused-memory',
+            targets=('src/foo.py',),
+            wrappers=('/abs/exec.sh',),
+        )
+        with pytest.raises(AssertionError):
+            render(cmd)
+
+    def test_raw_retained_chain_with_forced_cwd_and_targets_raises(self):
+        """P3: a raw-retained (non-OPAQUE) chain hand-constructed with a
+
+        forced cwd_rel + targets makes render() raise — neither field is
+        legitimately settable on a raw-retained command (cargo_scope /
+        serial_pytest rewrite `raw` itself instead), so non-empty `targets`
+        alongside a non-None `cwd_rel` here can never be worktree-root-
+        relative in a way render() should honour.
+        """
+        raw = 'cargo test && cargo clippy --all -- -D warnings'
+        cmd = VerifyCmd(
+            tool=ToolKind.CARGO_TEST,
+            raw=raw,
+            cwd_rel='some/subdir',
+            targets=('some/subdir/x',),
+        )
+        with pytest.raises(AssertionError):
+            render(cmd)
+
+    def test_govern_wrapped_chain_is_the_legitimate_case_and_still_renders(self):
+        """The contrasting legitimate case: govern_cpu is the only mutator
+
+        that legitimately sets a field (wrappers) on a raw-retained chain;
+        cwd_rel/targets stay at their untouched defaults, so render() does
+        not raise.
+        """
+        raw = 'cargo test && cargo clippy --all -- -D warnings'
+        cmd = govern_cpu(parse_config_command(raw), '/abs/scripts/cpu-governed-exec.sh')
+        assert cmd.cwd_rel is None
+        assert cmd.targets == ()
+        render(cmd)  # must not raise
