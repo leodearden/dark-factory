@@ -71,8 +71,104 @@ done
 adopt() {
     # Seed absent `.lane-state/<lane>.json` records from live git reality
     # (or, in --check/--dry-run mode, print what would be seeded without
-    # writing). Stub for now -- filled in starting step-4.
-    :
+    # writing). Embedded stdlib-only python3 (no `uv`/orchestrator venv
+    # guaranteed in the detached systemd-run unit this script may run
+    # inside -- PRD design decision). Schema source of truth:
+    # orchestrator/src/orchestrator/lane_lifecycle.py (LaneRecord fields
+    # exactly state/task_id/title/branch/seeded_from_sha/updated_at, state
+    # persisted as the lowercase LaneState.value, LANE_STATE_DIRNAME=
+    # '.lane-state') and orchestrator/src/orchestrator/artifacts.py
+    # TaskArtifacts.meta_root_for -> <worktree_base>/.task-meta/<lane>/
+    # plan.json (config.py TASK_META_DIRNAME).
+    WORKTREE_BASE="$WORKTREE_BASE" MODE="$MODE" python3 - <<'PYEOF'
+import json
+import os
+import re
+import subprocess
+import tempfile
+from datetime import UTC, datetime
+from pathlib import Path
+
+worktree_base = Path(os.environ["WORKTREE_BASE"])
+mode = os.environ["MODE"]
+
+TASK_BRANCH_RE = re.compile(r"^task/(\d+)$")
+
+
+def _git(lane, *args):
+    result = subprocess.run(
+        ["git", "-C", str(lane), *args],
+        capture_output=True, text=True,
+    )
+    if result.returncode != 0:
+        return ""
+    return result.stdout.strip()
+
+
+def _plan_json_path(lane_dir, lane_name):
+    new_path = worktree_base / ".task-meta" / lane_name / "plan.json"
+    if new_path.is_file():
+        return new_path
+    legacy_path = lane_dir / ".task" / "plan.json"
+    if legacy_path.is_file():
+        return legacy_path
+    return None
+
+
+def _title_from_plan(plan_path):
+    try:
+        data = json.loads(plan_path.read_text())
+    except (OSError, ValueError):
+        return None
+    title = data.get("title") or data.get("context")
+    return title if isinstance(title, str) else None
+
+
+def _write_record(lane_name, record):
+    state_dir = worktree_base / ".lane-state"
+    state_dir.mkdir(parents=True, exist_ok=True)
+    fd, tmp_path = tempfile.mkstemp(
+        dir=state_dir, prefix=f".{lane_name}.", suffix=".tmp"
+    )
+    try:
+        with os.fdopen(fd, "w") as f:
+            json.dump(record, f, indent=2)
+        os.replace(tmp_path, state_dir / f"{lane_name}.json")
+    except BaseException:
+        if os.path.exists(tmp_path):
+            os.unlink(tmp_path)
+        raise
+
+
+lane_dirs = sorted(p for p in worktree_base.glob("_lane-*") if p.is_dir()) \
+    if worktree_base.is_dir() else []
+
+for lane_dir in lane_dirs:
+    lane_name = lane_dir.name
+    branch = _git(lane_dir, "symbolic-ref", "--short", "-q", "HEAD")
+    sha = _git(lane_dir, "rev-parse", "-q", "--verify", "HEAD")
+
+    m = TASK_BRANCH_RE.match(branch) if branch else None
+    plan_path = _plan_json_path(lane_dir, lane_name) if m else None
+
+    if m is None or plan_path is None:
+        continue  # REGISTERED else-branch lands in step-6
+
+    record = {
+        "state": "assigned",
+        "task_id": m.group(1),
+        "title": _title_from_plan(plan_path),
+        "branch": branch,
+        "seeded_from_sha": sha or None,
+        "updated_at": datetime.now(UTC).isoformat(),
+    }
+
+    if mode == "check":
+        print(f"{lane_name}: {json.dumps(record)}")
+        continue
+
+    _write_record(lane_name, record)
+PYEOF
 }
 
 adopt
