@@ -107,6 +107,21 @@ def _delayed_predicate_milestone_task(
     }
 
 
+def _dated_milestone_task(task_id: str, at: datetime, *, task_kind: str | None = None) -> dict:
+    """Build a pending, dated-milestone task dict (no dependencies — the
+    'dated' mode gates purely on wall-clock, no deps-satisfied anchor)."""
+    metadata: dict = {'milestone': {'mode': 'dated', 'at': at.isoformat()}}
+    if task_kind is not None:
+        metadata['task_kind'] = task_kind
+    return {
+        'id': task_id,
+        'title': 'Dated milestone task',
+        'status': 'pending',
+        'dependencies': [],
+        'metadata': metadata,
+    }
+
+
 def _build_scheduler(clock: list[datetime]) -> Scheduler:
     """A real Scheduler with an injected, mutable wall clock and a spied update_task.
 
@@ -431,3 +446,119 @@ class TestExemplarFailAndTimeout:
         scheduler.set_task_status.assert_awaited_once_with(self.TASK_ID_TIMEOUT, 'blocked')
         scheduler.update_task.assert_not_awaited()
         unit_inspector.assert_not_awaited()
+
+
+# ---------------------------------------------------------------------------
+# B1+B4+B5 — scheduler time-gate matrix via the public acquire_next() surface.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestMilestoneSchedulerGate:
+    """β's ``_milestone_time_gated`` / ``_stamp_milestone_deps_satisfied`` /
+    ``_eligible_for_dispatch`` are already unit-tested directly at their own
+    altitude (test_scheduler.py's TestMilestoneTimeGate / TestMilestone­
+    EligibilityGate / TestStampMilestoneDepsSatisfied). ε re-exercises the
+    same B1/B4/B5 boundaries composed through the ONE public entry point
+    production actually calls every tick — ``acquire_next()`` — with a real
+    Scheduler (injected wall clock) and mocked ``mcp_call``, mirroring the
+    multi-tick harness established by ``TestExemplarPassLifecycle``.
+    """
+
+    TASK_ID_DATED = '9101'
+    TASK_ID_DELAYED = '9102'
+
+    async def test_dated_milestone_withheld_then_dispatched(self, monkeypatch):
+        """B1: acquire_next withholds a dated-milestone task while
+        now_wall < at, and dispatches it the instant now_wall >= at."""
+        at = datetime(2026, 8, 1, tzinfo=UTC)
+        clock = [at - timedelta(seconds=1)]
+        task = _dated_milestone_task(self.TASK_ID_DATED, at)
+
+        mock_call = AsyncMock(return_value=_task_response([task]))
+        monkeypatch.setattr('orchestrator.scheduler.mcp_call', mock_call)
+        scheduler = _build_scheduler(clock)
+
+        result_before = await scheduler.acquire_next()
+        assert result_before is None, 'must withhold while now_wall < at'
+
+        clock[0] = at
+        result_after = await scheduler.acquire_next()
+        assert result_after is not None and result_after.task_id == self.TASK_ID_DATED, (
+            'must dispatch once now_wall >= at'
+        )
+
+    async def test_delayed_anchor_frozen_once_not_restamped_on_second_tick(
+        self, monkeypatch,
+    ):
+        """B4: once the deps-satisfied anchor is stamped, a SECOND
+        acquire_next tick (deps still satisfied, timer still running) does
+        NOT re-stamp it — update_task stays awaited exactly once across
+        both ticks, and the frozen anchor value is unchanged."""
+        anchor_base = datetime(2026, 7, 10, 12, 0, 0, tzinfo=UTC)
+        clock = [anchor_base]
+        after_secs = 100
+
+        milestone_task = _delayed_predicate_milestone_task(
+            self.TASK_ID_DELAYED, Path('/unused/for-this-test.sh'),
+            after_secs=after_secs,
+        )
+        dep_task = _dep_task('X', status='done')
+
+        mock_call = AsyncMock(return_value=_task_response([dep_task, milestone_task]))
+        monkeypatch.setattr('orchestrator.scheduler.mcp_call', mock_call)
+        scheduler = _build_scheduler(clock)
+
+        # Tick 1: deps satisfied, no anchor yet -> stamped exactly once.
+        result_1 = await scheduler.acquire_next()
+        assert result_1 is None, 'anchor just stamped is not visible until next tick'
+        scheduler.update_task.assert_awaited_once()  # type: ignore[attr-defined]
+        stamp_call = scheduler.update_task.call_args  # type: ignore[attr-defined]
+        anchor_iso = stamp_call.args[1]['milestone_deps_satisfied_at']
+
+        # Write the anchor back; advance the clock a little (still well
+        # before after_secs elapses) — deps remain satisfied.
+        milestone_task['metadata']['milestone_deps_satisfied_at'] = anchor_iso
+        mock_call.return_value = _task_response([dep_task, milestone_task])
+        clock[0] = anchor_base + timedelta(seconds=1)
+
+        # Tick 2: must NOT re-stamp — the anchor already exists (frozen-once).
+        result_2 = await scheduler.acquire_next()
+        assert result_2 is None, 'timer has not elapsed yet'
+        assert scheduler.update_task.await_count == 1, (  # type: ignore[attr-defined]
+            'the anchor must not be re-stamped on a second tick'
+        )
+        unchanged_call = scheduler.update_task.call_args  # type: ignore[attr-defined]
+        assert unchanged_call.args[1]['milestone_deps_satisfied_at'] == anchor_iso, (
+            'the frozen anchor value must not change across ticks'
+        )
+
+    async def test_dep_regression_after_timer_elapsed_still_withholds(
+        self, monkeypatch,
+    ):
+        """B5: even after the delayed timer has fully elapsed, a dep that
+        has regressed away from 'done' in the LIVE status map still blocks
+        dispatch through acquire_next — _deps_satisfied is re-checked live
+        at eligibility time, not just the frozen-once anchor."""
+        anchor = datetime(2026, 7, 25, tzinfo=UTC)
+        after_secs = 100
+        clock = [anchor + timedelta(seconds=after_secs + 1)]  # timer elapsed
+
+        milestone_task = _delayed_predicate_milestone_task(
+            self.TASK_ID_DELAYED, Path('/unused/for-this-test.sh'),
+            after_secs=after_secs, milestone_deps_satisfied_at=anchor.isoformat(),
+        )
+        # 'in-progress', not 'pending': isolates the milestone task's gate
+        # from the dep task's OWN dispatch eligibility through acquire_next
+        # (mirrors TestExemplarPassLifecycle's dep_task convention) — what
+        # matters to _deps_satisfied is that X is anything other than
+        # 'done', not the specific non-done value.
+        dep_task = _dep_task('X', status='in-progress')
+
+        mock_call = AsyncMock(return_value=_task_response([dep_task, milestone_task]))
+        monkeypatch.setattr('orchestrator.scheduler.mcp_call', mock_call)
+        scheduler = _build_scheduler(clock)
+
+        result = await scheduler.acquire_next()
+
+        assert result is None, 'must withhold: dep X regressed despite the elapsed timer'
