@@ -145,10 +145,17 @@ async def test_orchestrator_done_provenance_all_kinds_accepted_by_backend(
 
     Builds ``done_provenance`` via the REAL orchestrator seam
     (``_build_done_provenance`` — task 2167 W3-δ SEAM B) for each of the four
-    ``DoneProvenance.kind`` values, then writes it through an enforce-mode
-    backend. I2: the orchestrator and fused-memory share ONE valid-kinds
-    enum, so nothing the producer can legitimately build is ever rejected by
-    the consumer (structurally prevents the 1902/1976/1982 class of bug).
+    ``DoneProvenance.kind`` values. Task 2201/C1 made ``update_task``
+    unconditionally reject ``metadata.done_provenance`` — the field is now
+    validated solely by the backend's write-boundary validator
+    (``SqliteTaskBackend._validate_metadata_on_write``, the exact seam
+    ``add_task``/``update_task`` call internally) and persisted solely
+    through the privileged, non-protocol ``stamp_audit_metadata`` seam. This
+    exercises both directly: the validator must accept every kind, and the
+    seam must persist it byte-for-value. I2: the orchestrator and
+    fused-memory share ONE valid-kinds enum, so nothing the producer can
+    legitimately build is ever rejected by the consumer (structurally
+    prevents the 1902/1976/1982 class of bug).
     """
     backend = await make_backend(enforce=True)
     project_root = str(tmp_path / 'proj')
@@ -156,9 +163,20 @@ async def test_orchestrator_done_provenance_all_kinds_accepted_by_backend(
     built = _build_done_provenance(kind, **fields)
 
     dto = await backend.add_task(project_root=project_root, title='t')
-    await backend.update_task(
-        dto['id'], project_root=project_root,
-        metadata=json.dumps({'done_provenance': built}),
+    tid = int(dto['id'])
+
+    # Consumer-side acceptance: the same validator add_task/update_task run
+    # at the write boundary must accept everything the producer builds.
+    await backend._validate_metadata_on_write(
+        json.dumps({'done_provenance': built}),
+        project_root=project_root, tag='master', task_id=tid,
+    )
+
+    # Persist through the privileged stamp_audit_metadata seam — the sole
+    # sanctioned done_provenance writer now that update_task rejects the
+    # field unconditionally (task 2201/C1).
+    await backend.stamp_audit_metadata(
+        dto['id'], project_root, {'done_provenance': built},
     )
 
     task = await backend.get_task(dto['id'], project_root=project_root)
