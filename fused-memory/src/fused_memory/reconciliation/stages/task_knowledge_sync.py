@@ -181,94 +181,6 @@ def _suppress_same_run_human_operator_dups(
 # ── Stage 2 post-flight guard helpers (task 1137) ────────────────────────────
 
 
-def _check_flag_counter_completeness(
-    report_stats: dict,
-    prior_reports: list[StageReport],
-) -> dict:
-    """Compare ``report.stats['stage1_analytical_findings_processed']`` against Stage 1's truth.
-
-    Stage 1 (memory_consolidator) emits ``StageReport.items_flagged`` — the
-    definitive list of structured analytical flags it raised for Stage 2 to
-    review.  This guard compares that ground-truth count against whatever
-    Stage 2 self-reported in ``stats['stage1_analytical_findings_processed']``
-    (the count of Stage 1 flagged_items that Stage 2 actually reviewed).
-
-    Pure stats-arithmetic — no taskmaster calls, no I/O.
-
-    Args:
-        report_stats: The ``StageReport.stats`` dict from Stage 2's run.
-        prior_reports: Reports from earlier stages in this cycle.  When
-            non-empty, ``prior_reports[0]`` must be the Stage 1
-            (``memory_consolidator``) report — guarded by a stage-identity
-            check to avoid a silent wrong-baseline comparison if the pipeline
-            is ever reordered.  When empty, no baseline is available and the
-            function returns ``mismatch=False`` unconditionally.
-
-    Returns:
-        ``{'expected': int, 'reported': int, 'mismatch': bool}``
-        ``mismatch`` is ``True`` only when a Stage 1 baseline exists and
-        ``reported != expected``.
-    """
-    reported = report_stats.get('stage1_analytical_findings_processed')
-    if reported is None:
-        # Backward-compat: in-flight or cached Stage 2 agents may still emit the
-        # pre-rename key (task 1589).  Prompt and reader move together at deploy
-        # time, but the fallback ensures no spurious mismatch during rollout when
-        # an old-prompt agent is still running.
-        reported = report_stats.get('stage1_flags_processed', 0)
-    if not prior_reports:
-        return {'expected': 0, 'reported': reported, 'mismatch': False}
-
-    # Mirror the stage-identity guard used by the same-run dedup block above
-    # (lines ~757-761) — only treat prior_reports[0] as a Stage 1 baseline
-    # when it actually is Stage 1.  A wrong stage would produce a meaningless
-    # expected count and silently clamp stats to garbage.
-    if prior_reports[0].stage != StageId.memory_consolidator:
-        return {'expected': 0, 'reported': reported, 'mismatch': False}
-
-    expected = len(prior_reports[0].items_flagged)
-    return {
-        'expected': expected,
-        'reported': reported,
-        'mismatch': expected != reported,
-    }
-
-
-def _check_mem0_flag_counter_completeness(report_stats: dict) -> dict:
-    """Compare ``report.stats['stage1_mem0_flags_processed']`` against the flag_deleted records.
-
-    The Stage 2 prompt requires emitting one ``flag_deleted`` action record per FIX C
-    deletion into ``stats['flag_deleted_records']`` — a list of
-    ``{"action": "flag_deleted", "flag_id": ..., "reason": ...}`` dicts.
-    This guard uses that list as the ground-truth count so an agent that under- or
-    over-reports the Mem0 counter is caught and clamped, mirroring the analytical guard
-    in :func:`_check_flag_counter_completeness`.
-
-    Pure stats-arithmetic — no taskmaster calls, no I/O.
-
-    Args:
-        report_stats: The ``StageReport.stats`` dict from Stage 2's run.
-
-    Returns:
-        ``{'expected': int, 'reported': int, 'mismatch': bool}``
-        ``expected`` is the count of ``{"action": "flag_deleted", ...}`` dicts in
-        ``stats['flag_deleted_records']`` (defaults to 0 when the key is absent or
-        the list is empty).  ``mismatch`` is ``True`` only when
-        ``expected != reported``.
-    """
-    records = report_stats.get('flag_deleted_records', [])
-    expected = sum(
-        1 for r in (records if isinstance(records, list) else [])
-        if isinstance(r, dict) and r.get('action') == 'flag_deleted'
-    )
-    reported = report_stats.get('stage1_mem0_flags_processed', 0)
-    return {
-        'expected': expected,
-        'reported': reported,
-        'mismatch': expected != reported,
-    }
-
-
 async def _acknowledge_resolved_stage1_markers(
     memory_service: Any,
     project_id: str,
@@ -1839,17 +1751,17 @@ class TaskKnowledgeSync(BaseStage):
         prior_reports: list[StageReport],
         run_id: str,
     ) -> None:
-        """Reconcile Stage 2's self-reported flag-processing counters.
+        """Acknowledge resolved Stage 1 flag markers and normalize Stage 2 counters.
 
-        Compares ``report.stats['stage1_analytical_findings_processed']`` and
-        ``report.stats['stage1_mem0_flags_processed']`` against ground truth
-        (Stage 1's ``items_flagged`` and this run's ``flag_deleted_records``
-        respectively — see Guards 4 and 4b below), clamping to truth on
-        mismatch, then acknowledges resolved Stage 1 flag markers and
-        normalizes both counters to always be present in ``report.stats``.
+        ``report.stats['stage1_analytical_findings_processed']`` and
+        ``report.stats['stage1_mem0_flags_processed']`` are Stage 2's
+        self-reported flag-processing counters. They are no longer clamped
+        against ground truth here: that reconciliation now happens via
+        ``derive_stage_stats`` + ``stats_verifier`` (task 2229), which
+        recompute canonical counters from the write journal.
 
         Terminal-state, stall-guard-freshness, post-action-mismatch, and
-        live-workflow writes are no longer reclassified here: that write
+        live-workflow writes are also no longer reclassified here: that write
         class is now rejected pre-write, server-side, by ``ReconWritePolicy``
         (task 2224), so post-hoc detection is redundant.
 
@@ -1857,45 +1769,14 @@ class TaskKnowledgeSync(BaseStage):
             report: The ``StageReport`` returned by ``super().run()``.
                 Mutated in place.
             prior_reports: Stage reports for all earlier stages in this cycle.
-                Guard 4 reads ``prior_reports[0].items_flagged``.
+                Unused now that the analytical flag-counter clamp has been
+                removed; kept for signature compatibility with the sole call
+                site.
             run_id: Current reconciliation run identifier.
         """
-        # Guard 4 — analytical flag-counter completeness (pure stats arithmetic, no I/O)
-        flag_check = _check_flag_counter_completeness(report.stats, prior_reports)
-        if flag_check['mismatch']:
-            logger.warning(
-                'reconciliation.stage1_analytical_findings_processed_mismatch',
-                extra={
-                    'run_id': run_id,
-                    'project_id': self.project_id,
-                    'expected': flag_check['expected'],
-                    'reported': flag_check['reported'],
-                },
-            )
-            # Clamp to truth so downstream verifiers see the real picture.
-            report.stats['stage1_analytical_findings_processed'] = flag_check['expected']
-
-        # Guard 4b — Mem0 flag-counter completeness (pure stats arithmetic, no I/O)
-        # Counts flag_deleted action records in stats['flag_deleted_records'] as the
-        # ground-truth source, giving stage1_mem0_flags_processed the same clamp/warn
-        # coverage as the analytical counter.
-        mem0_check = _check_mem0_flag_counter_completeness(report.stats)
-        if mem0_check['mismatch']:
-            logger.warning(
-                'reconciliation.stage1_mem0_flags_processed_mismatch',
-                extra={
-                    'run_id': run_id,
-                    'project_id': self.project_id,
-                    'expected': mem0_check['expected'],
-                    'reported': mem0_check['reported'],
-                },
-            )
-            # Clamp to truth so downstream verifiers see the real picture.
-            report.stats['stage1_mem0_flags_processed'] = mem0_check['expected']
-
         # ── Stage-1 flag-marker acknowledgment (task-2029 scenario b) ──────────
-        # flag_deleted_records (read by Guard 4b above) names the flags Stage 2
-        # resolved via FIX C deletion this run.  Join those against the
+        # flag_deleted_records names the flags Stage 2 resolved via FIX C
+        # deletion this run.  Join those against the
         # combined_flags rendered by assemble_payload (stashed on self) to
         # recover each resolved flag's (task_id, flag_type), then tag the
         # originating Channel-1 stage1_flag_marker addressed_by=run_id so it
@@ -1912,7 +1793,7 @@ class TaskKnowledgeSync(BaseStage):
         # Normalize: ensure both Stage 2 counters are always present in stats so
         # Stage 3's audit sees a deterministic, present pair via recon_report's
         # free-form stats passthrough.  setdefault preserves any agent-reported
-        # value (including a clamped value written above by Guard 4 or 4b).
+        # value.
         report.stats.setdefault('stage1_analytical_findings_processed', 0)
         report.stats.setdefault('stage1_mem0_flags_processed', 0)
 
