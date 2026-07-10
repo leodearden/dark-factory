@@ -520,11 +520,14 @@ class ReconReportState:
         complete()'s cached ``flagged_count``/``stats`` from silent
         corruption.  Retraction is intended for in-progress stages.
 
-        Only removes the finding from ``entry.findings`` and
-        ``_run_finding_index`` here; dedup-index cleanup
-        (``_run_sig_index`` / ``_run_desc_index`` and their per-entry
-        mirrors) is handled separately so a corrected finding can be
-        re-filed under the same signature/description.
+        Removes the finding from ``entry.findings`` and
+        ``_run_finding_index``, and also cleans whichever dedup index it
+        was filed under (``_run_sig_index`` / ``_run_desc_index`` and
+        their per-entry mirrors) — recomputed from the finding's own
+        already-canonicalized ``task_id``/``flag_type``/``description`` —
+        so a corrected finding can be re-filed under the same
+        signature/description after retraction instead of bouncing off a
+        stale ``duplicate_finding`` pointer.
         """
         entry = self._resolve_entry(run_id)
         if entry is None:
@@ -547,6 +550,15 @@ class ReconReportState:
 
         owning_entry.findings.remove(finding)
         self._run_finding_index.get(run_id, {}).pop(finding_id, None)
+
+        sig = (finding.task_id, finding.flag_type)
+        if sig != (None, None):
+            self._run_sig_index.get(run_id, {}).pop(sig, None)
+            owning_entry._signature_to_finding.pop(sig, None)
+        elif _normalize_description(finding.description):
+            desc_hash = _description_hash(finding.description)
+            self._run_desc_index.get(run_id, {}).pop(desc_hash, None)
+            owning_entry._deschash_to_finding.pop(desc_hash, None)
 
         return {'status': 'deleted', 'finding_id': finding_id}
 
