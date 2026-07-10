@@ -24,6 +24,7 @@ from __future__ import annotations
 import asyncio
 from pathlib import Path
 from typing import Literal
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
@@ -32,12 +33,14 @@ from orchestrator.git_ops import GitOps, MergeResult, _run
 from orchestrator.merge_queue import (
     DecidedItem,
     InflightEntry,
+    InflightVerifyResult,
     MergeOutcome,
     MergeRequest,
     RealMergeItem,
     SpeculativeItem,
     SpeculativeMergeWorker,
 )
+from orchestrator.verify_runner import HostLease
 
 # ── Module-level sentinel for verify_task in pure unit tests ─────────────────
 #
@@ -265,4 +268,145 @@ class TestVerifyBaseFrozenTipPromotion:
         violations = worker.two_layer_invariants(main_sha)
         assert violations == [], (
             f'expected a healthy chained frozen prefix to have no violations, got: {violations}'
+        )
+
+
+# ── DEFECT 2 (task 2357) RED: dequeue/dispatch-time refresh of _last_known_main_sha ──
+
+
+def _fake_local_allocator() -> MagicMock:
+    """A MagicMock HostAllocator stub with a free local slot and a patched
+    ``acquire`` that returns a fake local HostLease directly — bypasses the
+    real LocalRunner factory closure entirely (merge_wt realness is
+    irrelevant to this guard-refresh test), mirroring the established
+    pattern at test_merge_queue_concurrent_verify.py:499.
+    """
+    allocator = MagicMock()
+    allocator.free_host_count.return_value = 1
+    allocator.acquire = AsyncMock(
+        return_value=HostLease(name='local', runner=MagicMock(), is_local=True)
+    )
+    return allocator
+
+
+@pytest.mark.asyncio
+class TestDispatchRefreshesLastKnownMainSha:
+    """The ε=1890 §5.3 dispatch guard in `_dispatch_item` must refresh
+    `worker._last_known_main_sha` from its own already-fetched fresh
+    `get_main_sha()` result, so `snapshot()['two_layer_invariants']` never
+    lags the live dispatch guard's view of main (task 2357 DEFECT 2).
+
+    RED until the GREEN step adds the one-line cache write inside the
+    guard's try-block (merge_queue.py `_dispatch_item`, ~10291-10295).
+    """
+
+    async def test_dispatch_refreshes_last_known_main_sha(
+        self, git_ops: GitOps, config: OrchestratorConfig, git_repo: Path,
+    ) -> None:
+        """A dispatch's fresh get_main_sha() must update worker._last_known_main_sha."""
+        worker = _make_worker(git_ops)
+        old_main = 'OLD00000'
+        new_main = 'NEW11111'
+        worker._last_known_main_sha = old_main
+
+        # Non-speculative item whose base_sha == new_main so Mechanism 2's
+        # main_advanced chain-remerge guard (merge_queue.py:10046) does not fire.
+        _, item = _make_fake_item(
+            't-dispatch', base_sha=new_main, merge_commit='c-dispatch',
+            config=config, git_repo=git_repo,
+        )
+
+        worker._git_ops.get_main_sha = AsyncMock(return_value=new_main)  # type: ignore[method-assign]
+        worker._host_allocator = _fake_local_allocator()
+        worker._run_inflight_verify = AsyncMock(  # type: ignore[method-assign]
+            return_value=InflightVerifyResult(outcome=None, merge_wt=item.merge_wt)
+        )
+
+        entry = await worker._dispatch_item(item)
+
+        assert entry is not None, 'dispatch should succeed with a free local slot'
+        assert worker._last_known_main_sha == new_main, (
+            f'expected _dispatch_item to refresh _last_known_main_sha to the fresh '
+            f'ε=1890 guard SHA {new_main!r}, got {worker._last_known_main_sha!r}'
+        )
+
+    async def test_dispatch_refresh_closes_snapshot_false_positive(
+        self, git_ops: GitOps, config: OrchestratorConfig, git_repo: Path,
+    ) -> None:
+        """Companion snapshot check: a stale cache produces a false §5.3
+        positive for a healthy frozen head before dispatch; the dispatch
+        guard's refresh closes it afterward — with the merger otherwise
+        idle (no recompute_suffix_conflict_graph call anywhere in this test).
+        """
+        worker = _make_worker(git_ops)
+        old_main = 'OLD00000'
+        new_main = 'NEW11111'
+        worker._last_known_main_sha = old_main
+
+        # A healthy frozen head already in _inflight, based on new_main.
+        _, head_item = _make_fake_item(
+            't-head', base_sha=new_main, merge_commit='c-head',
+            config=config, git_repo=git_repo,
+        )
+        worker._inflight.append(_make_inflight_entry(head_item, verifying=True))
+
+        # Before dispatch: cache is stale (old_main) → false positive.
+        assert worker.snapshot()['two_layer_invariants'] != [], (
+            'expected a false positive while _last_known_main_sha is stale'
+        )
+
+        _, item = _make_fake_item(
+            't-dispatch2', base_sha=new_main, merge_commit='c-dispatch2',
+            config=config, git_repo=git_repo,
+        )
+        worker._git_ops.get_main_sha = AsyncMock(return_value=new_main)  # type: ignore[method-assign]
+        worker._host_allocator = _fake_local_allocator()
+        worker._run_inflight_verify = AsyncMock(  # type: ignore[method-assign]
+            return_value=InflightVerifyResult(outcome=None, merge_wt=item.merge_wt)
+        )
+
+        await worker._dispatch_item(item)
+
+        # After dispatch: cache refreshed → the pre-existing head_item's false
+        # positive is gone (the newly-dispatched item is not itself appended
+        # to _inflight here — that is the caller's job on a successful dispatch).
+        violations = worker.snapshot()['two_layer_invariants']
+        assert violations == [], (
+            f'expected the false positive to clear once _last_known_main_sha '
+            f'is refreshed by dispatch, got: {violations!r}'
+        )
+
+    async def test_dispatch_fail_open_leaves_cache_unchanged(
+        self, git_ops: GitOps, config: OrchestratorConfig, git_repo: Path,
+    ) -> None:
+        """A transient get_main_sha() error at the guard must leave
+        _last_known_main_sha untouched — fail-open, never overwrite a good
+        cache with a bad read — while dispatch still succeeds.
+        """
+        worker = _make_worker(git_ops)
+        old_main = 'OLD00000'
+        worker._last_known_main_sha = old_main
+
+        # base_sha == old_main so Mechanism 2's staleness check (which fires
+        # first and uses its own get_main_sha() call) does not trigger a remerge.
+        _, item = _make_fake_item(
+            't-failopen', base_sha=old_main, merge_commit='c-failopen',
+            config=config, git_repo=git_repo,
+        )
+        # First call = Mechanism 2 staleness check (succeeds); second call =
+        # the ε=1890 guard's own fetch (fails) — isolates the fail-open
+        # behaviour to the guard's try/except without disturbing Mechanism 2.
+        worker._git_ops.get_main_sha = AsyncMock(  # type: ignore[method-assign]
+            side_effect=[old_main, RuntimeError('simulated transient git error')]
+        )
+        worker._host_allocator = _fake_local_allocator()
+        worker._run_inflight_verify = AsyncMock(  # type: ignore[method-assign]
+            return_value=InflightVerifyResult(outcome=None, merge_wt=item.merge_wt)
+        )
+
+        entry = await worker._dispatch_item(item)
+
+        assert entry is not None, 'dispatch must still succeed despite the guard error'
+        assert worker._last_known_main_sha == old_main, (
+            'a get_main_sha() error at the guard must leave the cache unchanged (fail-open)'
         )
