@@ -288,3 +288,38 @@ class TestInterceptorUpdateTaskTerminalBoundary:
         await interceptor.update_task('1', '/project', title='x', agent_id=None)
 
         taskmaster.update_task.assert_awaited_once()
+
+
+# ---------------------------------------------------------------------------
+# P2 — interceptor.set_task_status live-workflow boundary
+# ---------------------------------------------------------------------------
+
+
+class TestInterceptorSetTaskStatusLiveWorkflowBoundary:
+    @pytest.mark.asyncio
+    async def test_recon_stage_set_task_status_with_live_workflow_rejects(
+        self, interceptor, taskmaster, monkeypatch,
+    ):
+        """Default taskmaster.get_task fixture returns status='pending'."""
+        monkeypatch.setattr(
+            recon_write_policy, 'is_workflow_live_for_task', lambda *a, **k: True,
+        )
+
+        result = await interceptor.set_task_status(
+            '1', 'in-progress', '/project', agent_id=AGENT_ID,
+        )
+
+        assert result.get('error_type') == 'ReconLiveWorkflowWriteRejected'
+        taskmaster.set_task_status.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_non_recon_agent_id_is_not_gated(self, interceptor, taskmaster, monkeypatch):
+        """Recon-scoping negative: a non-recon-stage agent_id is never gated
+        even when the detector reports a live workflow."""
+        monkeypatch.setattr(
+            recon_write_policy, 'is_workflow_live_for_task', lambda *a, **k: True,
+        )
+
+        await interceptor.set_task_status('1', 'in-progress', '/project', agent_id=None)
+
+        taskmaster.set_task_status.assert_awaited_once()
