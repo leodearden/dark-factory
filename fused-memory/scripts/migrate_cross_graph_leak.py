@@ -828,6 +828,13 @@ async def run(args: Any, memory_service: Any) -> dict:
     # otherwise reconciles (a lost edge leaves no foreign-node residual of
     # its own to be caught by the count comparison above).
     has_edge_loss = bool(edge_result.edges_skipped or edge_result.mentions_skipped)
+    # An edge whose two endpoints resolve to DIFFERENT target graphs cannot
+    # be recreated in EITHER graph (FalkorDB RELATES_TO edges are
+    # single-graph) -- Phase B reports each as a dropped-with-reason record
+    # instead of silently losing it (see recreate_subgraph_relationships).
+    # Surfacing it here (never omitted) and forcing a blocking exit mirrors
+    # has_edge_loss/has_unresolved/has_blocked: a human must review it.
+    has_dropped_cross_target = bool(edge_result.dropped_cross_target)
 
     report = dict(manifest)
     report['dry_run'] = False
@@ -836,13 +843,19 @@ async def run(args: Any, memory_service: Any) -> dict:
     report['edges_skipped'] = edge_result.edges_skipped
     report['mentions_recreated'] = edge_result.mentions_recreated
     report['mentions_skipped'] = edge_result.mentions_skipped
+    report['dropped_cross_target_edges'] = edge_result.dropped_cross_target
     report['post_verify'] = {
         'matched': matched,
         'expected': expected_residual,
         'actual': after_counts,
     }
     report['exit_code'] = (
-        0 if (matched and not has_unresolved and not has_blocked and not has_edge_loss) else 1
+        0
+        if (
+            matched and not has_unresolved and not has_blocked
+            and not has_edge_loss and not has_dropped_cross_target
+        )
+        else 1
     )
     return report
 
