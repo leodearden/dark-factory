@@ -14,7 +14,7 @@ from collections.abc import Callable, Iterable, Iterator
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from typing import Any, Protocol
+from typing import Any, Protocol, runtime_checkable
 
 from shared.locking import (
     files_to_modules,
@@ -464,6 +464,77 @@ class McpSessionLike(Protocol):
         arguments: dict,
         timeout: float = ...,
     ) -> dict: ...
+
+
+@runtime_checkable
+class SchedulerFacade(Protocol):
+    """Structural interface for the task-store back-channel a ``TaskWorkflow``
+    needs from its ``scheduler`` -- task-status/data operations, NOT the
+    liveness/callback surface described by ``SchedulerCallbacks`` above.
+
+    Both ``Scheduler`` (production) and the lightweight ``FakeScheduler`` test
+    double (``orchestrator/tests/_workflow_helpers.py``) conform structurally
+    to this Protocol without either inheriting from the other. Relocated here
+    from ``workflow._SchedulerLike`` (task 2235) so the Scheduler owns the
+    seam it describes, rather than the seam being declared privately by its
+    consumer. ``@runtime_checkable`` additionally lets tests assert
+    conformance with ``isinstance()`` at runtime -- on top of (not instead
+    of) the ``TYPE_CHECKING`` pyright-only conformance blocks in
+    test_workflow_e2e.py / test_workflow_dry_run_hook.py /
+    _workflow_helpers.py that pin the exact method shapes.
+    """
+
+    async def set_task_status(
+        self,
+        task_id: str,
+        status: str,
+        /,
+        *,
+        done_provenance: dict | None = ...,
+        reopen_reason: str | None = ...,
+        claimant_run_id: str | None = ...,
+        heartbeat_at: str | None = ...,
+    ) -> None: ...
+    async def set_task_claimant(
+        self,
+        task_id: str,
+        /,
+        *,
+        claimant_run_id: str | None = ...,
+        heartbeat_at: str | None = ...,
+    ) -> None: ...
+    async def mark_done(
+        self,
+        task_id: str,
+        /,
+        *,
+        kind: str,
+        sha: str,
+        note: str | None = ...,
+    ) -> None: ...
+    async def handle_blast_radius_expansion(
+        self,
+        task_id: str,
+        current: list[str],
+        needed: list[str],
+        /,
+        *,
+        persist_files: list[str] | None = ...,
+    ) -> bool: ...
+    async def get_status(self, task_id: str, /) -> str | None: ...
+    async def get_task(self, task_id: str, /) -> dict | None: ...
+    async def update_task(
+        self, task_id: str, metadata: str | dict, *, append: bool = ...,
+    ) -> bool: ...
+    async def dispatch_tool(
+        self, name: str, arguments: dict, *, timeout: float = ...,
+    ) -> dict: ...
+    async def get_tasks(self, *, statuses: Iterable[str] | None = ...) -> list[dict]: ...
+    async def get_statuses(
+        self, ids: list[str] | None = ...,
+    ) -> tuple[dict[str, str], Exception | None]: ...
+    async def tasks_by_train(self, train_id: str, /) -> list[dict]: ...
+    def clear_requeue_count(self, task_id: str, /) -> None: ...
 
 
 @dataclass

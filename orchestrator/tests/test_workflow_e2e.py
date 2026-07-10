@@ -7902,8 +7902,7 @@ class TestBuildAgentEnvCpuGovern:
 
 
 if TYPE_CHECKING:
-    from orchestrator.scheduler import Scheduler
-    from orchestrator.workflow import _SchedulerLike
+    from orchestrator.scheduler import Scheduler, SchedulerFacade
 
-    _fake_scheduler_conforms: _SchedulerLike = FakeScheduler()
-    _scheduler_conforms: _SchedulerLike = Scheduler(OrchestratorConfig())
+    _fake_scheduler_conforms: SchedulerFacade = FakeScheduler()
+    _scheduler_conforms: SchedulerFacade = Scheduler(OrchestratorConfig())

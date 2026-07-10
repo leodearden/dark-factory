@@ -149,7 +149,7 @@ def test_project_checks_hook_invokes_pyright_on_orchestrator() -> None:
 
     If this test fails, the commit-gate that enforces the TYPE_CHECKING Protocol
     conformance block in test_workflow_e2e.py no longer exists for the orchestrator
-    package. Protocol drift between FakeScheduler/Scheduler and _SchedulerLike
+    package. Protocol drift between FakeScheduler/Scheduler and SchedulerFacade
     will go undetected until runtime. See task 699.
     """
     hook_path = _REPO_ROOT / "hooks" / "project-checks"

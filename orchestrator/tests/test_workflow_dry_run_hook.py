@@ -30,7 +30,7 @@ from orchestrator.workflow import TaskWorkflow
 
 
 class _Scheduler:
-    """Minimal fake scheduler satisfying _SchedulerLike for workflow tests."""
+    """Minimal fake scheduler satisfying SchedulerFacade for workflow tests."""
 
     def __init__(self) -> None:
         self.statuses: dict[str, list[str]] = {}
@@ -478,11 +478,11 @@ class TestMarkBlockedForwardsResilienceContext:
 
 # ---------------------------------------------------------------------------
 # Protocol-conformance assertion (static-only; never executes at runtime).
-# Mirrors the if TYPE_CHECKING / _SchedulerLike conformance block near the
+# Mirrors the if TYPE_CHECKING / SchedulerFacade conformance block near the
 # bottom of test_workflow_e2e.py.
 # ---------------------------------------------------------------------------
 
 if TYPE_CHECKING:
-    from orchestrator.workflow import _SchedulerLike
+    from orchestrator.scheduler import SchedulerFacade
 
-    _scheduler_conforms: _SchedulerLike = _Scheduler()
+    _scheduler_conforms: SchedulerFacade = _Scheduler()

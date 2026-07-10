@@ -270,11 +270,11 @@ def _make_status_setting_steward(
 
 # ---------------------------------------------------------------------------
 # Protocol-conformance assertion (static-only; never executes at runtime).
-# Mirrors the if TYPE_CHECKING / _SchedulerLike conformance block near the
+# Mirrors the if TYPE_CHECKING / SchedulerFacade conformance block near the
 # bottom of test_workflow_e2e.py.
 # ---------------------------------------------------------------------------
 
 if TYPE_CHECKING:
-    from orchestrator.workflow import _SchedulerLike
+    from orchestrator.scheduler import SchedulerFacade
 
-    _fake_scheduler_conforms: _SchedulerLike = FakeScheduler()
+    _fake_scheduler_conforms: SchedulerFacade = FakeScheduler()
