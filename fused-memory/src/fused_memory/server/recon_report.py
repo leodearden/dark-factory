@@ -1,7 +1,7 @@
 """recon_report MCP namespace — in-process state + tool scaffold (task α/β).
 
-Provides nine tools: start_report / add_finding / set_stat / inc_stat / complete /
-cite_entity / cite_edge / cite_task / cite_memory.
+Provides ten tools: start_report / add_finding / set_stat / inc_stat / complete /
+delete_finding / cite_entity / cite_edge / cite_task / cite_memory.
 State is owned by :class:`ReconReportState`; tools are thin delegates registered
 by :func:`create_recon_report_server`.  This split lets unit tests drive the state
 directly without spinning up FastMCP.
@@ -1109,21 +1109,26 @@ RECON_REPORT_INSTRUCTIONS = """\
 This server provides the recon_report MCP namespace for the Dark Factory
 reconciliation pipeline.
 
-Tools: start_report, add_finding, set_stat, inc_stat, complete,
+Tools: start_report, add_finding, set_stat, inc_stat, complete, delete_finding,
        cite_entity, cite_edge, cite_task, cite_memory.
 
 Usage pattern (per PRD §9.2):
 1. start_report — open a new report at the start of a stage run.
 2. add_finding — append a diagnostic finding (deduplicated by task_id + flag_type
-                  across ALL stages of the same run_id).
+                  across ALL stages of the same run_id).  Overlength
+                  description/suggested_action are truncated with a
+                  'warnings' entry on the response, never rejected.
 3. set_stat / inc_stat — track numeric metrics during the run.
 4. complete — stamp the summary and close the report; idempotent.
+5. delete_finding(run_id, finding_id) — IRREVERSIBLE retraction of a
+                  finding filed earlier in this run (any stage); rejected
+                  once that finding's owning stage has been completed.
 
 Citation tools (call after add_finding, before or after complete):
-5. cite_entity(run_id, finding_id, name) — resolve entity by name and attach.
-6. cite_edge(run_id, finding_id, edge_uuid) — validate UUID and attach edge.
-7. cite_task(run_id, finding_id, project_id, task_id) — look up task and attach.
-8. cite_memory(run_id, finding_id, memory_id, store) — look up memory and attach.
+6. cite_entity(run_id, finding_id, name) — resolve entity by name and attach.
+7. cite_edge(run_id, finding_id, edge_uuid) — validate UUID and attach edge.
+8. cite_task(run_id, finding_id, project_id, task_id) — look up task and attach.
+9. cite_memory(run_id, finding_id, memory_id, store) — look up memory and attach.
 """
 
 
@@ -1206,6 +1211,18 @@ def create_recon_report_server(state: ReconReportState):  # -> FastMCP
         summary appends a warning but does NOT overwrite the original.
         """
         return state.complete(run_id=run_id, summary=summary)
+
+    @mcp.tool()
+    async def delete_finding(run_id: str, finding_id: str) -> dict:
+        """Permanently remove a finding.  IRREVERSIBLE.
+
+        Scoped by run_id + finding_id; mirrors delete_memory's semantics.
+        Returns {status: 'deleted', finding_id} on success, or a structured
+        error dict (run_id_unknown / finding_unknown / report_already_completed).
+        Rejected once the finding's owning stage entry has been completed —
+        retraction is for in-progress stages only.
+        """
+        return state.delete_finding(run_id=run_id, finding_id=finding_id)
 
     @mcp.tool()
     async def cite_entity(run_id: str, finding_id: str, name: str) -> dict:
