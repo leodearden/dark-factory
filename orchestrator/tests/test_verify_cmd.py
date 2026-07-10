@@ -12,10 +12,11 @@ orchestrator/src/orchestrator/verify_cmd.py is created (step-2).
 from __future__ import annotations
 
 import dataclasses
+import shlex
 
 import pytest
 
-from orchestrator.verify_cmd import ToolKind, VerifyCmd, parse_config_command
+from orchestrator.verify_cmd import ToolKind, VerifyCmd, parse_config_command, render
 
 
 class TestToolKind:
@@ -183,3 +184,54 @@ class TestParseConfigCommandOpaque:
         assert cmd.base_flags == ()
         assert cmd.targets == ()
         assert cmd.wrappers == ()
+
+
+class TestRenderRoundTrip:
+    """render(parse(x)) is argv-equivalent to x for well-formed x (P2)."""
+
+    @pytest.mark.parametrize(
+        'raw',
+        [
+            'pytest tests/test_x.py',
+            'ruff check src/foo.py',
+            'pyright src/foo.py',
+            'cargo test --workspace',
+            'cargo clippy --workspace',
+            'npx --version',
+            'uv run --project shared pytest tests/x.py',
+            'cd fused-memory && npx pyright',
+        ],
+        ids=[
+            'pytest', 'ruff', 'pyright', 'cargo_test', 'cargo_clippy', 'npx',
+            'uv_run_project', 'leading_cd_npx',
+        ],
+    )
+    def test_round_trip_argv_equivalent(self, raw):
+        assert shlex.split(render(parse_config_command(raw))) == shlex.split(raw)
+
+
+class TestRenderOpaqueExact:
+    """render(parse(OPAQUE_raw)) == OPAQUE_raw exactly — raw passes through verbatim."""
+
+    @pytest.mark.parametrize(
+        'raw',
+        ['mypy src/', 'pytest "unterminated', ''],
+        ids=['unrecognised_head', 'unbalanced_quote', 'empty'],
+    )
+    def test_opaque_renders_back_to_raw(self, raw):
+        assert render(parse_config_command(raw)) == raw
+
+
+class TestRenderCanonicalFieldOrder:
+    """render reconstructs cwd_rel, uv_project (--project), base_flags and
+    targets in a canonical order — pinned independent of parse_config_command."""
+
+    def test_full_field_order(self):
+        cmd = VerifyCmd(
+            tool=ToolKind.PYTEST,
+            uv_project='shared',
+            cwd_rel='fused-memory',
+            base_flags=('-v',),
+            targets=('tests/test_x.py',),
+        )
+        assert render(cmd) == 'cd fused-memory && uv run --project shared pytest -v tests/test_x.py'
