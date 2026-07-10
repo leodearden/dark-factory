@@ -459,7 +459,9 @@ def classify_agent_failure(result: AgentResult) -> AgentFailureClass:
 
     1. ``classify_invocation(result, strict_confirm=True)`` is ``OK``
        (mirrors ``result.success``) → ``SUCCESS``.
-    2. ``result.timed_out`` → ``TIMED_OUT``.
+    2. ``result.timed_out`` → ``TIMED_OUT`` (summary distinguishes a
+       PRODUCTIVE kill — ``transcript_turns > 0`` — from a no-progress wedge;
+       see ``is_timed_out_with_progress``/reify-4827).
     3. ``result.subtype == 'error_max_turns'`` → ``MAX_TURNS``
        (high ``turns`` + non-zero ``output_tokens`` but empty ``output``).
     4. ``result.api_error_status`` set, OR the outcome is ``AuthFailed`` →
@@ -477,8 +479,8 @@ def classify_agent_failure(result: AgentResult) -> AgentFailureClass:
     7. otherwise → ``UNKNOWN``.
 
     ``diagnostic_detail`` always includes: subtype, turns, cost_usd,
-    duration_ms, timed_out, api_error_status, output length, last 500 chars
-    of stdout output, and last 500 chars of stderr.
+    duration_ms, timed_out, transcript_turns, api_error_status, output
+    length, last 500 chars of stdout output, and last 500 chars of stderr.
     """
     # Lazy (function-local) import — see the identical note in
     # invoke_with_cap_retry: a module-top import here would create a
@@ -495,6 +497,7 @@ def classify_agent_failure(result: AgentResult) -> AgentFailureClass:
         f'cost_usd={result.cost_usd}\n'
         f'duration_ms={result.duration_ms}\n'
         f'timed_out={result.timed_out}\n'
+        f'transcript_turns={result.transcript_turns}\n'
         f'api_error_status={result.api_error_status}\n'
         f'len(output)={len(result.output)}\n'
         f'output (last 500 chars):\n{tail_out}\n'
@@ -508,11 +511,22 @@ def classify_agent_failure(result: AgentResult) -> AgentFailureClass:
             diagnostic_detail=diagnostic_detail,
         )
     if result.timed_out:
+        # Truthful reporting (task 2360 fix #3): result.turns is always 0 on
+        # the empty-stdout timeout path by construction (the CLI's JSON is
+        # never parsed), so "(N turns)" was vacuous there — replace it with
+        # the transcript-authoritative signal and a productive/wedge
+        # distinction so a killed-but-productive run (reify-4827) is never
+        # reported as indistinguishable from a genuine no-progress wedge.
+        if result.transcript_turns:
+            progress_desc = (
+                f'{result.transcript_turns} transcript turns (productive; not a wedge)'
+            )
+        else:
+            progress_desc = 'no transcript turns (wedge — no progress made)'
         return AgentFailureClass(
             kind=AgentFailureKind.TIMED_OUT,
             summary=(
-                f'agent timed out after {result.duration_ms}ms '
-                f'({result.turns} turns)'
+                f'agent timed out after {result.duration_ms}ms with {progress_desc}'
             ),
             diagnostic_detail=diagnostic_detail,
         )
