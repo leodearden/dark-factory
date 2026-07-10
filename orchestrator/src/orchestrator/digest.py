@@ -264,6 +264,62 @@ def count_done_in_window(
 
 
 # ---------------------------------------------------------------------------
+# Merge-disposition counts from EventStore (task 2384 γ, mechanism M2 of
+# plans/merge-skew-attribution-prd.md, boundary row 7).
+#
+# GROUPs merge_attempt events by their optional 'disposition' payload key
+# (task 2381 α's MergeFailureDisposition, persisted by
+# merge_queue._emit_merge_attempt) so operator stats can separate
+# integration_skew from branch_bug/indeterminate/flakes instead of lumping
+# every merge failure into one undifferentiated bucket.
+# ---------------------------------------------------------------------------
+
+
+def merge_disposition_counts(
+    events_db: Path,
+    window_start_iso: str,
+    window_end_iso: str,
+) -> dict[str, int]:
+    """Count merge_attempt events inside the window, grouped by disposition.
+
+    Rows with no ``'disposition'`` key (pre-α/β emitters, or non-orchestrator
+    submit paths) are excluded — the map only covers actually-attributed
+    merge failures.
+
+    Uses sqlite3 directly (read-only).  Fail-open: any exception returns {}.
+    Missing DB returns {} (DEBUG); other failures return {} (WARNING).
+    """
+    try:
+        if not Path(events_db).exists():
+            logger.debug('merge_disposition_counts: DB not found (fail-open): %s', events_db)
+            return {}
+        # See count_done_in_window above for the resolve().as_uri()+?mode=ro rationale.
+        db_uri = Path(events_db).resolve().as_uri() + "?mode=ro"
+        conn = sqlite3.connect(db_uri, uri=True)
+        try:
+            rows = conn.execute(
+                "SELECT json_extract(data, '$.disposition') AS disp, COUNT(*) FROM events "
+                "WHERE event_type = 'merge_attempt' "
+                "  AND timestamp BETWEEN ? AND ? "
+                "  AND json_extract(data, '$.disposition') IS NOT NULL "
+                "GROUP BY disp",
+                (window_start_iso, window_end_iso),
+            ).fetchall()
+            return {disp: int(count) for disp, count in rows}
+        finally:
+            conn.close()
+    except Exception:
+        # TOCTOU guard: if the file disappeared between the structural check
+        # above and sqlite3.connect(), re-detect that as a missing-DB (DEBUG)
+        # rather than an unexpected failure (WARNING).
+        if not Path(events_db).exists():
+            logger.debug('merge_disposition_counts: DB not found (fail-open): %s', events_db)
+        else:
+            logger.warning('merge_disposition_counts: failed (fail-open)', exc_info=True)
+        return {}
+
+
+# ---------------------------------------------------------------------------
 # Cost statistics from CostStore
 # ---------------------------------------------------------------------------
 
