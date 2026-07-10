@@ -164,6 +164,8 @@ class StubInvoke:
         config_dir: Path | None = None,
         env_overrides: dict[str, str] | None = None,
         startup_grace_secs: float = 120.0,
+        working_idle_secs: float | None = None,
+        absolute_cap_secs: float | None = None,
     ) -> AgentResult:
         self.calls.append({'model': model})
         return AgentResult(success=True, output='OK')

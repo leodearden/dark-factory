@@ -7364,6 +7364,12 @@ Update the plan to address the blocking issues. You may add new steps to the `st
                     'output_tokens': result.output_tokens,
                     'cache_read_tokens': result.cache_read_tokens,
                     'cache_create_tokens': result.cache_create_tokens,
+                    # Truthful ceiling-kill reporting (task 2360 fix #3): lets
+                    # telemetry consumers distinguish a productive wall-clock
+                    # kill (timed_out=True, transcript_turns>0) from a genuine
+                    # zero-output wedge (transcript_turns==0/None).
+                    'transcript_turns': result.transcript_turns,
+                    'timed_out': result.timed_out,
                 },
             )
 

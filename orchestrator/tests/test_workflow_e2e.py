@@ -316,6 +316,8 @@ class AgentStub:
         config_dir: Path | None = None,
         env_overrides: dict[str, str] | None = None,
         startup_grace_secs: float = 120.0,
+        working_idle_secs: float | None = None,
+        absolute_cap_secs: float | None = None,
     ) -> AgentResult:
         """Determine role from system_prompt content, perform side effects."""
         role = self._detect_role(system_prompt)
