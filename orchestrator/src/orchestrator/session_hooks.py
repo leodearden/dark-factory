@@ -201,6 +201,33 @@ def _resolve_parent_session_id(env: Mapping[str, str]) -> str | None:
     return env.get('CLAUDE_SPAWN_PARENT_ID') or None
 
 
+def _resolve_display(env: Mapping[str, str], title: str) -> session_registry.Display | None:
+    """Resolve this session's best-effort focus target from env (Fleet Cockpit C2).
+
+    TMUX takes precedence over WINDOWID (hybrid window model, PRD §3 fork 1):
+    a session running inside tmux is best focused via the C4 tmux backend
+    even when a WINDOWID is also present (e.g. a terminal emulator hosting
+    the tmux client), so ``TMUX`` is checked first. ``tmux_target`` is the
+    pane spec from ``TMUX_PANE`` when present, else ``None`` (best-effort,
+    never guessed). The 'wm' case carries *title* as ``wm_title`` -- the
+    primary focus key (PRD §6.1: wmctrl -a by title) -- alongside the
+    best-effort ``WINDOWID`` optimization. Returns None when neither marker
+    is present.
+    """
+    if env.get('TMUX'):
+        return session_registry.Display(
+            kind=session_registry.DisplayKind.TMUX.value,
+            tmux_target=env.get('TMUX_PANE') or None,
+        )
+    if env.get('WINDOWID'):
+        return session_registry.Display(
+            kind=session_registry.DisplayKind.WM.value,
+            wm_title=title,
+            wm_window_id=env.get('WINDOWID'),
+        )
+    return None
+
+
 def run_session_start(
     hook_input: Mapping[str, Any],
     env: Mapping[str, str],
@@ -216,8 +243,9 @@ def run_session_start(
     already exists under this slug, it is refreshed to RUNNING in place --
     every other already-populated field survives untouched. Both paths then
     receive the same best-effort enrichment (parent_session_id from
-    ``CLAUDE_SPAWN_PARENT_ID``; see ``_resolve_parent_session_id``) before a
-    single ``write_record`` call, which bumps the record's mtime heartbeat.
+    ``CLAUDE_SPAWN_PARENT_ID``, see ``_resolve_parent_session_id``; display
+    from ``TMUX``/``WINDOWID``, see ``_resolve_display``) before a single
+    ``write_record`` call, which bumps the record's mtime heartbeat.
 
     KNOWN dual-record split for SPAWNED sessions: this slug is keyed on the
     Claude Code ``session_id`` (module docstring), while spawn-claude.sh's
@@ -261,6 +289,10 @@ def run_session_start(
     parent_session_id = _resolve_parent_session_id(env)
     if parent_session_id is not None:
         record.parent_session_id = parent_session_id
+    title = record.title or hook_display_title(identity, env, record)
+    display = _resolve_display(env, title)
+    if display is not None:
+        record.display = display
     session_registry.write_record(record, root=root)
     return record
 
