@@ -1,5 +1,6 @@
 """Tests for SpeculativeMergeWorker request-liveness checks + heartbeat wiring
-(MQ-invariants eta / task 1992).
+(MQ-invariants eta / task 1992), and the merge-worktree content-mtime
+no-progress budget (task 2420, DEFECT 1 split from 2357; extends #1728).
 
 Steps covered:
   step-7  RED   — _check_request_liveness unit tests (bare worker)
@@ -10,6 +11,18 @@ Steps covered:
   step-12 GREEN — wire the arm hook at the merger-loop head
   step-13 RED   — operator-halt requeue no-false-alarm
   step-14 GREEN — wire on_requeued at the 3 put_nowait sites
+
+  task 2420 (DEFECT 1 split from 2357; extends #1728):
+  step-3  RED   — dead LOCAL in-flight verify (no content progress) is
+                  aborted + re-dispatched within a bounded no-progress budget
+  step-4  GREEN — elapsed-only abort trigger 3 (minimal; no local-only gate
+                  or progress-reset yet)
+  step-5  RED   — healthy LOCAL verify that keeps writing is NOT aborted;
+                  REMOTE lease is never progress-aborted (scope fence)
+  step-6  GREEN — convert trigger 3 to a LOCAL-only no-PROGRESS budget
+  step-7  RED   — repeated dead verify converts to 'blocked' (busy-loop cap);
+                  a subsequent success clears the per-task counter
+  step-8  GREEN — per-task MAX_INFLIGHT_DEAD_VERIFY_ABORTS busy-loop guard
 
 This module intentionally imports orchestrator.merge_queue LOCALLY inside each
 test method (not at module scope) so a not-yet-implemented symbol
@@ -593,6 +606,138 @@ class TestOperatorHaltRequeueNoFalseAlarm:
             'age clock must restart from T2 on re-dequeue, not resume from the '
             'stale T0 — a bug here would immediately alarm (RED until step-14)'
         )
+
+        # Sanity: the re-armed entry genuinely is back in the ledger (not
+        # silently dropped by the requeue/re-dequeue sequence).
+        assert req.request_id in worker._request_ledger.open_request_ids()
+
+
+# ---------------------------------------------------------------------------
+# task 2420 step-3 RED / step-4 GREEN: dead LOCAL in-flight verify (no content
+# progress) is aborted + re-dispatched within a bounded no-progress budget
+# ---------------------------------------------------------------------------
+
+
+async def _make_merged_item(
+    git_ops: GitOps,
+    config: OrchestratorConfig,
+    branch: str,
+    filename: str,
+    content: str,
+):
+    """Create a merged RealMergeItem on a fresh branch (real git, no mocks).
+
+    Duplicated from test_merge_queue_concurrent_verify.py's
+    TestRunInflightVerifyAbortPoll._make_merged_item (per-file duplication
+    convention — see this file's module docstring).
+    """
+    from orchestrator.merge_queue import RealMergeItem
+
+    wt = await _make_branch_with_file(git_ops, branch, filename, content)
+    loop = asyncio.get_running_loop()
+    req = MergeRequest(
+        task_id=branch,
+        branch=branch,
+        worktree=wt,
+        pre_rebased=False,
+        task_files=None,
+        module_configs=[],
+        config=config,
+        result=loop.create_future(),
+        lane='normal',
+    )
+    merge_result = await git_ops.merge_to_main(wt, branch)
+    assert merge_result.success and merge_result.merge_commit
+    assert merge_result.merge_worktree is not None
+    base_sha = await git_ops.get_main_sha()
+    item = RealMergeItem(
+        request=req,
+        merge_result=merge_result,
+        merge_wt=merge_result.merge_worktree,
+        base_sha=base_sha,
+        speculative=False,
+    )
+    return req, item
+
+
+@pytest.mark.asyncio
+class TestDeadInflightVerifyAborts:
+    """SpeculativeMergeWorker._run_inflight_verify LOCAL no-progress abort
+    trigger (task 2420 DEFECT 1, split from 2357; extends #1728).
+
+    The #1728 alpha owner-heartbeat keeps a LIVE worker's merge worktree
+    ROOT mtime fresh even while its verify subprocess is dead/hung, so the
+    existing 3h root-mtime reaper never fires for this failure mode. This
+    class drives _run_inflight_verify directly (bare worker, no run() loop)
+    against a REAL local merge worktree with a gated fake
+    run_scoped_verification that never writes under merge_wt — simulating a
+    dead/hung verify with zero content progress.
+
+    RED until step-4 GREEN adds abort trigger 3 (elapsed-only to start).
+    """
+
+    async def test_dead_local_verify_is_aborted_and_requeued_within_budget(
+        self,
+        git_ops: GitOps,
+        config: OrchestratorConfig,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        from orchestrator.merge_queue import InflightStatus, SpeculativeMergeWorker
+        from orchestrator.verify_runner import HostLease
+
+        gate_entered = asyncio.Event()
+        never_release = asyncio.Event()
+
+        async def _dead_gate(*args: object, **kwargs: object) -> object:
+            # Simulates a dead/hung verify subprocess: never returns, and
+            # (crucially) never writes anything under merge_wt — zero
+            # content progress for the no-progress budget to observe.
+            gate_entered.set()
+            await never_release.wait()
+            raise AssertionError('unreachable — never_release is never set in this test')
+
+        req, item = await _make_merged_item(
+            git_ops, config, 'dead-verify-a', 'da.py', 'x=1\n',
+        )
+        q: asyncio.Queue[MergeRequest] = asyncio.Queue()
+        worker = SpeculativeMergeWorker(git_ops, q)
+        worker._register_owned_merge_worktree(item.merge_wt)
+
+        # Fast, deterministic tunables (VERIFY_ABANDON_POLL_SECS convention).
+        worker.VERIFY_ABANDON_POLL_SECS = 0.02
+        worker.INFLIGHT_VERIFY_PROGRESS_PROBE_SECS = 0.02
+        worker.INFLIGHT_VERIFY_PROGRESS_BUDGET_SECS = 0.2
+
+        fake_local = MagicMock()
+        fake_local.name = 'local'
+        fake_local.is_local = True
+        lease = HostLease(name='local', runner=fake_local, is_local=True)
+
+        t0 = 1_000_000.0
+        worker._request_ledger.on_dequeue(req, now=t0)
+
+        with (
+            patch('orchestrator.merge_queue.run_scoped_verification', _dead_gate),
+            caplog.at_level(logging.WARNING, logger='orchestrator.merge_queue'),
+        ):
+            result = await asyncio.wait_for(
+                worker._run_inflight_verify(item, lease), timeout=5.0,
+            )
+
+        assert result.status == InflightStatus.REQUEUED, (
+            f'expected a dead-verify abort to REQUEUE, got status={result.status!r}'
+        )
+        assert not q.empty(), 'dead verify must re-dispatch the request onto _queue'
+        assert result.merge_wt is None, 'merge_wt must be cleaned on dead-verify abort'
+        assert req.request_id not in worker._request_ledger.open_request_ids(), (
+            'on_requeued must clear the ledger entry so the parked request never ages out'
+        )
+
+        warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
+        assert any(
+            req.task_id in r.message and 'progress' in r.message.lower()
+            for r in warnings
+        ), f'expected a WARNING naming the task + no-progress budget, got: {caplog.text}'
 
         # Sanity: the re-armed entry genuinely is back in the ledger (not
         # silently dropped by the requeue/re-dequeue sequence).
