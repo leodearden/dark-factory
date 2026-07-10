@@ -2694,3 +2694,99 @@ class TestReconReportFlagTypeInheritance:
         assert 'finding_id' in r2_finding, f'r2 add_finding failed: {r2_finding}'
         assert r2_finding['finding_id'] != r1_finding['finding_id']
 
+
+# ---------------------------------------------------------------------------
+# task-2410 step-1: Overlength description/suggested_action truncation —
+# RED until step-2 adds _MAX_FINDING_TEXT_CHARS / _TRUNCATION_MARKER and
+# wires truncate+warn into ReconReportState.add_finding.
+# ---------------------------------------------------------------------------
+
+
+class TestReconReportOverlengthTruncation:
+    """add_finding must gracefully truncate overlength description /
+    suggested_action fields rather than storing them unbounded, surfacing a
+    'warnings' entry on the response ONLY when truncation actually occurred.
+    """
+
+    def _make_state(self):
+        from fused_memory.server.recon_report import ReconReportState
+
+        t = [0.0]
+        return ReconReportState(ttl_seconds=300, clock=lambda: t[0]), t
+
+    def test_overlength_description_is_truncated_with_warning(self):
+        from fused_memory.server.recon_report import (
+            _MAX_FINDING_TEXT_CHARS,
+            _TRUNCATION_MARKER,
+        )
+
+        state, _ = self._make_state()
+        state.start_report(run_id='r1', stage='s1', project_id='dark_factory')
+
+        overlength = 'x' * (_MAX_FINDING_TEXT_CHARS + 500)
+        result = state.add_finding(
+            run_id='r1',
+            severity='low',
+            category='c',
+            description=overlength,
+            suggested_action='a',
+        )
+        assert 'finding_id' in result, f'add_finding failed: {result}'
+        assert 'warnings' in result
+        assert result['warnings']
+        assert any('description' in w for w in result['warnings'])
+
+        report = state.get_assembled_report('r1', 's1')
+        assert report is not None
+        item = report['flagged_items'][0]
+        assert item['description'] == 'x' * _MAX_FINDING_TEXT_CHARS + _TRUNCATION_MARKER
+        assert item['suggested_action'] == 'a'
+
+    def test_overlength_suggested_action_is_truncated_with_warning(self):
+        from fused_memory.server.recon_report import (
+            _MAX_FINDING_TEXT_CHARS,
+            _TRUNCATION_MARKER,
+        )
+
+        state, _ = self._make_state()
+        state.start_report(run_id='r1', stage='s1', project_id='dark_factory')
+
+        overlength = 'y' * (_MAX_FINDING_TEXT_CHARS + 500)
+        result = state.add_finding(
+            run_id='r1',
+            severity='low',
+            category='c',
+            description='d',
+            suggested_action=overlength,
+        )
+        assert 'finding_id' in result, f'add_finding failed: {result}'
+        assert 'warnings' in result
+        assert result['warnings']
+        assert any('suggested_action' in w for w in result['warnings'])
+
+        report = state.get_assembled_report('r1', 's1')
+        assert report is not None
+        item = report['flagged_items'][0]
+        assert item['suggested_action'] == 'y' * _MAX_FINDING_TEXT_CHARS + _TRUNCATION_MARKER
+        assert item['description'] == 'd'
+
+    def test_short_finding_has_no_warnings_key(self):
+        state, _ = self._make_state()
+        state.start_report(run_id='r1', stage='s1', project_id='dark_factory')
+
+        result = state.add_finding(
+            run_id='r1',
+            severity='low',
+            category='c',
+            description='d',
+            suggested_action='a',
+        )
+        assert 'finding_id' in result, f'add_finding failed: {result}'
+        assert 'warnings' not in result
+
+        report = state.get_assembled_report('r1', 's1')
+        assert report is not None
+        item = report['flagged_items'][0]
+        assert item['description'] == 'd'
+        assert item['suggested_action'] == 'a'
+
