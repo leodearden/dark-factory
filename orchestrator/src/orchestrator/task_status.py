@@ -24,6 +24,8 @@ transition to 'done').
 
 from __future__ import annotations
 
+from typing import Any, Mapping, Optional
+
 from shared.task_statuses import ACTIVE, TERMINAL, WORKFLOW_PRESERVE, TaskStatus
 
 # Re-exported as `frozenset[str]` (rather than the shared `frozenset[TaskStatus]`
@@ -55,4 +57,26 @@ TERMINAL_STATUSES: frozenset[str] = TERMINAL
 ACTIVE_TASK_STATUSES: frozenset[str] = ACTIVE - {TaskStatus.INFRA_HOLD}
 WORKFLOW_PRESERVE_STATUSES: frozenset[str] = WORKFLOW_PRESERVE
 
-__all__ = ['TERMINAL_STATUSES', 'ACTIVE_TASK_STATUSES', 'WORKFLOW_PRESERVE_STATUSES']
+
+def is_infra_held(task: Optional[Mapping[str, Any]]) -> bool:
+    """Single source of truth for the infra-hold exemption (PRD C7/D3).
+
+    Returns True iff ``task``'s first-class ``status`` field is
+    ``TaskStatus.INFRA_HOLD`` ("infra-hold"). This is the ONLY accessor the
+    STAMP (verify-infra exhaustion), HOLD (reconcile revert-skip), and
+    RESUME (escalation-cascade) sites are allowed to consult so they cannot
+    drift from one another.
+
+    Deliberately does NOT read the retired ``metadata.infra_hold`` boolean
+    that previously overloaded 'in-progress'/'blocked' — that flag is gone;
+    the status itself is now the hold signal.
+    """
+    return (task or {}).get('status') == TaskStatus.INFRA_HOLD
+
+
+__all__ = [
+    'TERMINAL_STATUSES',
+    'ACTIVE_TASK_STATUSES',
+    'WORKFLOW_PRESERVE_STATUSES',
+    'is_infra_held',
+]
