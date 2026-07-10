@@ -82,6 +82,18 @@ def newest_content_mtime(root: Path) -> float | None:
     than raised. A missing *root*, an empty *root*, or a *root* whose scan
     fails entirely all return ``None`` — never raises.
 
+    Cost (reviewer finding, task 2420 amend): this is a full recursive
+    directory walk plus a ``stat()`` per entry — O(number of files/dirs
+    below *root*), unavoidable for a "what is the true newest mtime"
+    query without OS-level change notification (inotify) support. The
+    caller (``SpeculativeMergeWorker._run_inflight_verify``) invokes this
+    once per ``INFLIGHT_VERIFY_PROGRESS_PROBE_SECS`` for the duration of
+    every LOCAL in-flight verify, so its probe cadence assumes this walk
+    stays cheap relative to the verify — i.e. the worktree's content tree
+    (build/test output, excluding ``.git``) has at most thousands, not
+    millions, of entries. A repo with a much larger generated tree should
+    widen the caller's probe interval accordingly.
+
     Args:
         root: The merge worktree root to scan.
 

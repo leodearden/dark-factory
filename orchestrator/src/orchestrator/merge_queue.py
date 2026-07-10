@@ -4611,6 +4611,17 @@ class SpeculativeMergeWorker(_WipHaltMixin):
     # monkeypatch it tiny (e.g. worker.INFLIGHT_VERIFY_PROGRESS_BUDGET_SECS
     # = 0.2) for fast, deterministic abort-path coverage.  Mirrors the
     # VERIFY_ABANDON_POLL_SECS monkeypatch convention above.
+    # INVARIANT (reviewer finding, task 2420 amend): this heuristic's
+    # liveness signal is filesystem content mtime under merge_wt, so it
+    # assumes a HEALTHY verify writes some file incrementally within every
+    # budget window (test/lint/type-check output, build artifacts, etc.). A
+    # purely CPU-bound stretch that writes nothing to disk for longer than
+    # this budget (e.g. fully-buffered test output, a compiler that emits
+    # artifacts only at the very end) would be misclassified as dead and
+    # re-dispatched — and after MAX_INFLIGHT_DEAD_VERIFY_ABORTS repeats,
+    # escalated to a terminal 'blocked' even though the verify was healthy.
+    # Tune this budget to the longest expected no-write stretch of your
+    # verify workloads, not just the dead-verify symptom's timescale.
     INFLIGHT_VERIFY_PROGRESS_BUDGET_SECS: float = 1800.0
     # Throttle for the newest_content_mtime() worktree-subtree walk that
     # drives the budget above — distinct from VERIFY_ABANDON_POLL_SECS so
@@ -4618,6 +4629,14 @@ class SpeculativeMergeWorker(_WipHaltMixin):
     # Kept as a class attribute so tests can monkeypatch it tiny for fast,
     # deterministic coverage.  Mirrors the VERIFY_ABANDON_POLL_SECS
     # monkeypatch convention above.
+    # COST (reviewer finding, task 2420 amend): each probe is a full
+    # recursive os.walk + per-entry stat() over merge_wt — O(number of
+    # filesystem entries below root); see newest_content_mtime's docstring.
+    # The 60s default assumes the worktree's content tree (build/test
+    # output, excluding .git) stays in the thousands-of-entries range, not
+    # millions.  A repo whose verify writes a much larger tree should raise
+    # this interval so the per-probe I/O stays negligible relative to the
+    # verify itself — this is NOT currently self-tuning/adaptive.
     INFLIGHT_VERIFY_PROGRESS_PROBE_SECS: float = 60.0
     # task 2420 (DEFECT 1): busy-loop guard for the no-progress abort trigger.
     # After this many CONSECUTIVE no-progress aborts for the same task_id,
@@ -9621,6 +9640,18 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                             await verify_task
                         await self._release_or_cleanup(merge_wt, spec_warm=_spec_warm)
                         if _busy_loop_capped:
+                            # task 2420 amend (reviewer finding #2): the
+                            # counter has served its purpose once the
+                            # request resolves terminally — pop it so a
+                            # later re-submission/re-dispatch of this SAME
+                            # task_id (e.g. after an operator resolves the
+                            # 'blocked' outcome) gets a fresh dead-verify
+                            # budget instead of immediately re-tripping the
+                            # cap on its very first abort. Also bounds the
+                            # dict to live/in-flight task_ids instead of
+                            # growing unboundedly for permanently-blocked
+                            # tasks.
+                            self._inflight_dead_verify_aborts.pop(req.task_id, None)
                             err_outcome = MergeOutcome(
                                 'blocked',
                                 reason=(
@@ -9665,15 +9696,21 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                 req.result.set_result(err_outcome)
             return InflightVerifyResult(outcome=err_outcome, merge_wt=None)
 
+        # task 2420 amend (reviewer finding #1): verify_task returned a
+        # result HERE at all — pass, fail, or skipped — which proves this
+        # task's verify subprocess was not hung.  Clear the per-task
+        # no-progress busy-loop counter unconditionally (not only on the
+        # `out is None` pass path below) so a hang -> real verify failure ->
+        # hang sequence cannot silently accumulate two dead-abort counts
+        # toward MAX_INFLIGHT_DEAD_VERIFY_ABORTS even though a verify
+        # genuinely ran to completion in between.
+        self._inflight_dead_verify_aborts.pop(req.task_id, None)
+
         if out is None:
             logger.info(
                 f'Task {req.task_id}: verify end (merge={merge_commit[:8]}, '
                 f'passed=True)'
             )
-            # task 2420: a successful verify clears the per-task no-progress
-            # busy-loop counter so a later transient hang starts a fresh count
-            # rather than inheriting stale prior-episode aborts.
-            self._inflight_dead_verify_aborts.pop(req.task_id, None)
             if _warm_capture:
                 _warm_results = parse_per_test_results(_warm_capture[0].test_output or '')
                 if not _warm_results and req.config.git.warm_verify_shadow_compare:
