@@ -476,6 +476,103 @@ def reap_stale_records(
 
 
 # ---------------------------------------------------------------------------
+# Role leases: single-owner-per-role (Attention Rail T7; PRD T7 §4.1-4.2, §6 G5)
+# ---------------------------------------------------------------------------
+
+LEASE_NAME_SANITIZE_RE = re.compile(r'[^A-Za-z0-9._#-]')
+"""Unlike _SLUG_SANITIZE_RE, this PRESERVES '#': task-scoped lease names
+(build_lease_name('unblock', project, task_id)) encode their task with a
+literal '#', which must survive into the .lease filename. Everything else
+outside [A-Za-z0-9._#-] (notably '/') maps to '-', so a malformed name can
+never escape leases_dir via a path separator."""
+
+
+def leases_dir(root: Path | str | None = None) -> Path:
+    return fleet_root(root) / 'leases'
+
+
+def lease_path_for_name(name: str, root: Path | str | None = None) -> Path:
+    """Resolve *name* (see build_lease_name) to its ``<leases_dir>/<name>.lease`` path.
+
+    *name* is sanitized through LEASE_NAME_SANITIZE_RE first, so it always
+    resolves to a single file directly inside leases_dir.
+    """
+    safe_name = LEASE_NAME_SANITIZE_RE.sub('-', name)
+    return leases_dir(root) / f'{safe_name}.lease'
+
+
+def build_lease_name(role: str, project: str, task_id: str | None = None) -> str:
+    """Build the canonical lease name for *role* (PRD T7): ``<role>-<project>[#<task_id>]``.
+
+    task_id is optional; when supplied, the lease is scoped to a single task
+    (e.g. ``unblock-df#2085``), so two concurrent /unblock sessions on
+    DIFFERENT tasks in the same project never contend the same lease.
+    """
+    name = f'{role}-{project}'
+    if task_id:
+        name = f'{name}#{task_id}'
+    return name
+
+
+LEASE_HEARTBEAT_TTL = timedelta(minutes=5)
+"""How long a lease survives with a dead holder pid and no fresh heartbeat
+(mtime touch) before it is stale-reapable. Mirrors NON_TERMINAL_HEARTBEAT_TTL's
+role for session records: staleness requires BOTH a dead holder pid AND an
+aged heartbeat (see claim_lease/reap_stale_leases) -- a live holder is never
+reaped regardless of heartbeat age."""
+
+
+class LeasePolicy(StrEnum):
+    """How claim_lease should respond when the lease is already held live.
+
+    STAND_DOWN: the caller (e.g. a duplicate escalation-watcher) must exit.
+    WARN_AND_PROCEED: the caller (e.g. a second /unblock on the same task)
+        surfaces the current holder to the user but continues.
+    """
+
+    STAND_DOWN = 'stand-down'
+    WARN_AND_PROCEED = 'warn-and-proceed'
+
+
+class LeaseDecision(StrEnum):
+    """The outcome of a claim_lease call."""
+
+    ACQUIRED = 'acquired'
+    STAND_DOWN = 'stand-down'
+    PROCEED = 'proceed'
+
+
+@dataclass(frozen=True)
+class LeaseHolder:
+    """Serialized identity of a lease's current holder -- the exact ``.lease`` file body.
+
+    session_slug: the holder's own session-registry slug (see
+        build_session_slug), letting a contended claim point back at the
+        current owner's session_registry record.
+    pid: the holder process's pid; liveness is checked via _pid_alive.
+    start_ts: ISO-8601 timestamp of when this holder claimed the lease.
+    """
+
+    session_slug: str
+    pid: int
+    start_ts: str
+
+    def to_dict(self) -> dict[str, Any]:
+        return {'session_slug': self.session_slug, 'pid': self.pid, 'start_ts': self.start_ts}
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> LeaseHolder:
+        return cls(session_slug=data['session_slug'], pid=data['pid'], start_ts=data['start_ts'])
+
+    def to_json(self) -> str:
+        return json.dumps(self.to_dict())
+
+    @classmethod
+    def from_json(cls, raw: str) -> LeaseHolder:
+        return cls.from_dict(json.loads(raw))
+
+
+# ---------------------------------------------------------------------------
 # CLI + fail-soft (PRD: a registry fault must never change the spawn's exit code)
 # ---------------------------------------------------------------------------
 
