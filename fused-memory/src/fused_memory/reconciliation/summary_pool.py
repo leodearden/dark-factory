@@ -1,33 +1,24 @@
-"""Generic per-cycle summary pool-cap enforcement and absence self-heal —
-shared core for Stage 1 and Stage 2.
+"""Generic per-cycle summary pool-cap enforcement and deterministic ledger
+write — shared core for Stage 1 and Stage 2.
 
 Extracted from ``reconciliation.stages.task_knowledge_sync``'s Stage-2-specific
 ``_enforce_stage2_summary_pool_cap`` / ``_pretrim_stage2_summary_pool``
-(task 1657 + trim-then-write, task 1831). The trim/pretrim logic itself is
-generic — only two identifiers (the ``recon_pool`` tag used for enumeration
-and the ``_source`` used for the delete audit trail) differentiate one stage's
-pool from another's. Duplicating the ~90-line async GC logic into a second
-stage module would create a drift hazard (two copies to keep in sync), so it
-lives here once, parametrized, and both stages delegate to it (task 1942).
+(task 1657 + trim-then-write, task 1831). The trim logic itself is generic —
+only two identifiers (the ``recon_pool`` tag used for enumeration and the
+``_source`` used for the delete audit trail) differentiate one stage's pool
+from another's. Duplicating the ~90-line async GC logic into a second stage
+module would create a drift hazard (two copies to keep in sync), so it lives
+here once, parametrized, and both stages delegate to it (task 1942).
 
-Task 2366 extends this module with a second generic mechanism: per-cycle
-summary *absence* self-heal (verify a cycle_summary was written, and write a
-deterministic fallback stub when it was not). This generalizes Stage 2's
-``_verify_stage2_summary_written`` / ``_reconstruct_stage2_summary`` (the
-per-cycle summary is a PROMPT-DRIVEN final step of the LLM session, so a stage
-that exhausts its turn/token budget can exit before writing one — a code-side
-deterministic backstop closes that reliability gap without depending on LLM
-compliance). As with the pool-cap functions above, only a handful of
-identifiers (``stage``, ``recon_pool``, ``reconstruct_source``) differentiate
-one stage's self-heal from another's, so it lives here once, parametrized.
-
-Task 2229 (W5-λ) adds a THIRD mechanism, :func:`write_cycle_summary`, that
-supersedes the nonce/verify/reconstruct self-heal chain above rather than
-extending it: Python now writes the authoritative per-cycle summary directly
-to the :class:`~fused_memory.reconciliation.recon_ledger.ReconLedgerStore`
-from the stage's own ``StageReport`` — no LLM turn, no nonce, no absence to
-self-heal. The prior mechanisms remain in this module only until their last
-call sites (Stage 1 and Stage 2 ``run()``) are cut over.
+Task 2229 (W5-λ) adds :func:`write_cycle_summary`, which supersedes the
+LLM-driven nonce/verify/reconstruct self-heal chain that used to live in this
+module (task 1572 nonce, task 2366 absence self-heal): Python now writes the
+authoritative per-cycle summary directly to the
+:class:`~fused_memory.reconciliation.recon_ledger.ReconLedgerStore` from the
+stage's own ``StageReport`` — no LLM turn, no nonce, no absence to self-heal.
+The retired mechanisms (and their nonce generator,
+``cli_stage_runner.generate_summary_nonce`` / ``build_summary_nonce_section``)
+have been deleted now that Stage 1 and Stage 2 ``run()`` are both cut over.
 """
 
 from __future__ import annotations
