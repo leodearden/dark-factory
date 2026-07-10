@@ -182,6 +182,27 @@ def _write_fake_claude_writing_result(bin_dir: pathlib.Path) -> None:
     p.chmod(0o755)
 
 
+def _write_fake_claude_capturing_prompt(
+    bin_dir: pathlib.Path, capture_file: pathlib.Path
+) -> None:
+    """Write a fake ``claude`` that captures its prompt argument (``$1``) to
+    *capture_file*, then exits 0.
+
+    With ``skip_perms="false"`` (the default baked into ``_run_spawn``),
+    ``$flags`` is empty, so ``$1`` is exactly the prompt string
+    spawn-claude.sh assembled into ``$inner`` -- letting a test inspect
+    whatever transformation (e.g. a result-handback trailer) the script
+    applied before invoking claude.
+    """
+    p = bin_dir / "claude"
+    p.write_text(
+        f"#!/usr/bin/env bash\n"
+        f'printf %s "$1" > {capture_file!s}\n'
+        f"exit 0\n"
+    )
+    p.chmod(0o755)
+
+
 def _wait_for_path(path: pathlib.Path, timeout: float) -> None:
     """Poll until *path* exists, raising ``AssertionError`` on timeout."""
     deadline = time.monotonic() + timeout
@@ -1063,3 +1084,42 @@ def test_spawn_exports_result_file_and_session_writes_it(
         f"expected a result.md written to {result_file} by the session"
     )
     assert "outcome: done" in result_file.read_text()
+
+
+def test_spawn_appends_result_handback_trailer_to_prompt(
+    tmp_path: pathlib.Path,
+) -> None:
+    """spawn-claude.sh must append a result-handback trailer to the prompt,
+    pointing the spawned session at its own session record's result_file.
+
+    Uses skip_perms="false" (the default baked into _run_spawn) so $flags is
+    empty and $1 is exactly the prompt string spawn-claude.sh assembled --
+    letting this test inspect the literal string claude received.
+
+    RED today: no trailer is appended, so the captured prompt equals the
+    bare original ("test prompt") with no result_file path anywhere in it.
+    """
+    bin_dir = _make_bin_dir(tmp_path)
+    capture_file = tmp_path / "captured_prompt.txt"
+    _write_fake_claude_capturing_prompt(bin_dir, capture_file)
+    _write_foreground_terminal(bin_dir, "xterm")
+    env = _base_env(bin_dir, "xterm")
+
+    result = _run_spawn(env, tmp_path)
+    assert result.returncode == 0, f"stderr: {result.stderr.decode()}"
+
+    fleet_root = pathlib.Path(env["CLAUDE_FLEET_ROOT"])
+    record_path = _find_one_record(fleet_root)
+    record = session_registry.SessionRecord.from_json(record_path.read_text())
+    assert record.result_file, "expected a populated result_file on the record"
+
+    captured_prompt = capture_file.read_text()
+    assert "test prompt" in captured_prompt, (
+        f"expected the original prompt to survive in the captured prompt, "
+        f"got:\n{captured_prompt}"
+    )
+    assert record.result_file in captured_prompt, (
+        f"expected a result-handback trailer referencing "
+        f"{record.result_file!r} to be appended to the prompt, "
+        f"got:\n{captured_prompt}"
+    )
