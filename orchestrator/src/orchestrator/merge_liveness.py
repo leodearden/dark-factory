@@ -45,6 +45,7 @@ from __future__ import annotations
 import dataclasses
 import logging
 import math
+import os
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
@@ -55,6 +56,71 @@ if TYPE_CHECKING:
     from orchestrator.config import OrchestratorConfig
 
 logger = logging.getLogger('orchestrator.merge_queue')
+
+
+# ---------------------------------------------------------------------------
+# Merge-worktree CONTENT-mtime no-progress signal (task 2420 / DEFECT 1,
+# split from 2357; extends #1728)
+# ---------------------------------------------------------------------------
+
+
+def newest_content_mtime(root: Path) -> float | None:
+    """Return the newest mtime among files/dirs STRICTLY BELOW *root*.
+
+    Pure, heartbeat-immune liveness signal backing the merge-worktree
+    no-progress budget in
+    :meth:`orchestrator.merge_queue.SpeculativeMergeWorker._run_inflight_verify`.
+    ``root`` itself is never stat'd, and any ``.git`` subtree is pruned from
+    the walk entirely — so the #1728 alpha owner-heartbeat
+    (``_touch_owned_merge_worktrees``), which calls ``os.utime`` on every
+    owned ``_merge-*`` worktree's ROOT inode every ``_HEARTBEAT_POLL_S``
+    seconds, can never mask a dead/hung verify subprocess that has stopped
+    writing under the worktree (e.g. to ``target/``).
+
+    Best-effort: a per-entry ``OSError`` (vanished mid-scan, unreadable,
+    broken symlink) is swallowed and that entry is simply skipped rather
+    than raised. A missing *root*, an empty *root*, or a *root* whose scan
+    fails entirely all return ``None`` — never raises.
+
+    Cost (reviewer finding, task 2420 amend): this is a full recursive
+    directory walk plus a ``stat()`` per entry — O(number of files/dirs
+    below *root*), unavoidable for a "what is the true newest mtime"
+    query without OS-level change notification (inotify) support. The
+    caller (``SpeculativeMergeWorker._run_inflight_verify``) invokes this
+    once per ``INFLIGHT_VERIFY_PROGRESS_PROBE_SECS`` for the duration of
+    every LOCAL in-flight verify, so its probe cadence assumes this walk
+    stays cheap relative to the verify — i.e. the worktree's content tree
+    (build/test output, excluding ``.git``) has at most thousands, not
+    millions, of entries. A repo with a much larger generated tree should
+    widen the caller's probe interval accordingly.
+
+    Args:
+        root: The merge worktree root to scan.
+
+    Returns:
+        The newest ``st_mtime`` found strictly below *root*, or ``None``
+        when there is no such content (missing/empty root, or every entry
+        failed to stat).
+    """
+    newest: float | None = None
+    try:
+        for dirpath, dirnames, filenames in os.walk(root, topdown=True):
+            # Prune .git in place so os.walk never descends into it (and it
+            # is excluded from the current directory's own entries below).
+            dirnames[:] = [d for d in dirnames if d != '.git']
+            current_dir = Path(dirpath)
+            for name in (*dirnames, *filenames):
+                try:
+                    mtime = (current_dir / name).stat().st_mtime
+                except OSError:
+                    # Vanished mid-scan / unreadable / broken symlink — skip.
+                    continue
+                if newest is None or mtime > newest:
+                    newest = mtime
+    except OSError:
+        # Top-level scan failure (e.g. root exists but is unreadable).
+        return None
+    return newest
 
 
 # ---------------------------------------------------------------------------
