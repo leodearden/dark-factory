@@ -169,7 +169,9 @@ class TestTmuxBackendIsAlive:
         from cockpit.backends.tmux import TmuxBackend
 
         runner = ScriptedRunner(
-            results={('tmux', 'list-windows', '-a'): CommandResult(returncode=0, stdout='s:0: bash\n')}
+            results={
+                ('tmux', 'list-windows', '-a'): CommandResult(returncode=0, stdout='s:0: bash\n')
+            }
         )
         backend = TmuxBackend(run=runner)
         target = DisplayTarget(kind='tmux', tmux_target='s:0')
@@ -182,7 +184,9 @@ class TestTmuxBackendIsAlive:
 
         runner = ScriptedRunner(
             results={
-                ('tmux', 'list-windows', '-a'): CommandResult(returncode=0, stdout='other:0: bash\n')
+                ('tmux', 'list-windows', '-a'): CommandResult(
+                    returncode=0, stdout='other:0: bash\n'
+                )
             }
         )
         backend = TmuxBackend(run=runner)
