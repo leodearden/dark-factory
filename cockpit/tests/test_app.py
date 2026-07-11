@@ -310,3 +310,59 @@ class TestDecisionQueueRender:
             high_index = queue.get_row_index('decision:dec-high')
             low_index = queue.get_row_index('decision:dec-low')
             assert high_index < low_index
+
+
+class TestSignalDontMove:
+    @pytest.mark.timeout(10)
+    async def test_awaiting_input_transition_sets_urgency_never_focus(self, tmp_path):
+        """PRD B3 (§6.2/§7), this task's leaf signal: the refresh/diff path may
+        call only backend.set_urgency + backend.reorder -- NEVER focus/tile --
+        when a session flips into (or out of) awaiting-input. A synthetic
+        running->awaiting-input transition must reorder the queue to include
+        the newly-blocked target and set its urgency hint, while a
+        FakeBackend spy proves zero focus/tile/raise calls ever happen on
+        this path; a subsequent awaiting-input->idle transition clears the
+        urgency hint.
+        """
+        from cockpit.app import CockpitApp
+        from cockpit.backends import DisplayTarget, FakeBackend
+        from cockpit.panes.decision_queue import DecisionQueue
+
+        display = sr.Display(kind='wm', wm_title='unblock:df#2085 slug')
+        running = _make_record(session_slug='running-1', status=sr.Status.RUNNING, display=display)
+        sr.write_record(running, root=tmp_path)
+
+        backend = FakeBackend()
+        app = CockpitApp(fleet_root=tmp_path, backend=backend, poll_interval=0.05)
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            queue = app.query_one(DecisionQueue)
+            assert queue.row_count == 0
+
+            awaiting = _make_record(
+                session_slug='running-1',
+                status=sr.Status.AWAITING_INPUT,
+                display=display,
+                question=sr.Question(text='Which port?', asked_at='2026-07-07T00:00:00+00:00'),
+            )
+            sr.write_record(awaiting, root=tmp_path)
+
+            app.refresh_registry()
+            await pilot.pause()
+
+            target = DisplayTarget(kind='wm', wm_title='unblock:df#2085 slug')
+            assert queue.row_count == 1
+            assert (target, True) in backend.set_urgency_calls
+            assert backend.focus_calls == []
+            assert backend.tile_calls == []
+
+            idle = _make_record(session_slug='running-1', status=sr.Status.IDLE, display=display)
+            sr.write_record(idle, root=tmp_path)
+
+            app.refresh_registry()
+            await pilot.pause()
+
+            assert queue.row_count == 0
+            assert (target, False) in backend.set_urgency_calls
+            assert backend.focus_calls == []
+            assert backend.tile_calls == []
