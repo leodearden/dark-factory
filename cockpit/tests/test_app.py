@@ -1133,6 +1133,79 @@ class TestDeferResetsAge:
         assert not any(path.startswith(('sessions/', 'decisions/')) for path in new_paths)
 
 
+class TestWeightEditorReordersAndPersists:
+    @pytest.mark.timeout(10)
+    async def test_apply_priorities_reorders_live_and_persists(self, tmp_path):
+        """apply_priorities (PRD §9 C9b weight editor) is this task's leaf
+        signal: bumping a project weight reorders the DecisionQueue
+        IMMEDIATELY -- no poll tick, no explicit refresh_registry() call --
+        and persists the change to priorities.yaml via C3's save_priorities.
+
+        Driven directly (mirrors test_spawn_session_invokes_runner_with_exact_argv
+        driving app.spawn_session), ahead of the 'w' keybinding/screen wiring
+        added later in this task. Two decisions in projects 'alpha'/'beta'
+        with identical filed_at and boost=0 score equally under
+        Priorities.default() (project_weights={}), so the initial order is
+        decided purely by the (decision:alpha < decision:beta) key tiebreak
+        -- the "another factor" a project-weight bump on 'beta' alone must
+        overcome to flip the order.
+        """
+        from cockpit.app import CockpitApp
+        from cockpit.backends import FakeBackend
+        from cockpit.panes.decision_queue import DecisionQueue
+        from cockpit.panes.weight_editor import merge_weight_edits
+        from cockpit.priority import Priorities, load_priorities
+
+        fixed_now = datetime.fromisoformat('2026-07-07T00:00:00+00:00')
+
+        alpha = sr.DecisionRecord(
+            id='alpha',
+            project='alpha',
+            text='Alpha?',
+            filed_at='2026-07-07T00:00:00+00:00',
+            manual_boost=0,
+        )
+        beta = sr.DecisionRecord(
+            id='beta',
+            project='beta',
+            text='Beta?',
+            filed_at='2026-07-07T00:00:00+00:00',
+            manual_boost=0,
+        )
+        for d in (alpha, beta):
+            assert sr.write_decision(d, root=tmp_path)
+
+        backend = FakeBackend()
+        app = CockpitApp(
+            fleet_root=tmp_path,
+            backend=backend,
+            poll_interval=0.05,
+            now_fn=lambda: fixed_now,
+            priorities=Priorities.default(),
+        )
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            queue = app.query_one(DecisionQueue)
+            assert queue.row_count == 2
+            # sanity: equal score -> tiebroken by key, alpha before beta.
+            assert queue.get_row_index('decision:alpha') < queue.get_row_index('decision:beta')
+
+            new_priorities = merge_weight_edits(
+                app._priorities, category_edits={}, project_edits={'beta': '100'}
+            )
+            app.apply_priorities(new_priorities)
+            await pilot.pause()
+
+            # (a) live reorder -- no poll tick, no explicit
+            # refresh_registry() call anywhere in this test.
+            assert queue.get_row_index('decision:beta') < queue.get_row_index('decision:alpha')
+
+        # (b) persisted to priorities.yaml -- checked after unmount so this
+        # also proves the write landed on disk, not just in memory.
+        persisted = load_priorities(tmp_path / 'priorities.yaml')
+        assert persisted.project_weights['beta'] == 100.0
+
+
 class TestSpawnBar:
     @pytest.mark.timeout(10)
     async def test_new_session_key_pushes_spawn_screen(self, tmp_path):
