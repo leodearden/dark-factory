@@ -797,6 +797,22 @@ class SubgraphEdgeResult:
             Reported for human review, never silently lost. Populated by
             the cross-target detection extension (task 2415 step-8) --
             always empty for a batch with no such edges.
+        blocked: Records for individual edges/mentions whose embedding read
+            or CREATE raised (e.g. a transient FalkorDB error) -- each a
+            dict with ``kind`` (``'edge'`` or ``'mention'``), the item's own
+            ``uuid``, a human-readable ``reason`` (``str(exc)``), and
+            ``node_uuids`` (the incident node uuid(s): both endpoints for a
+            RELATES_TO edge, the entity uuid for a MENTIONS link). Per-item
+            isolation (CGL-η follow-up, task 2451) means a single bad
+            edge/mention costs only itself -- the batch continues and this
+            item is surfaced here for human review, same "never silently
+            lost" convention as ``dropped_cross_target``, rather than
+            aborting the whole batch the way it used to (see this
+            function's docstring). A caller MUST withhold Phase C
+            source-deletion for every uuid named here, or the un-recreated
+            edge/mention -- which still exists only in source -- would be
+            destroyed (see ``scripts/migrate_cross_graph_leak.py``'s
+            ``run()``). Always empty for a batch with no such failures.
     """
 
     edges_recreated: int = 0
@@ -804,6 +820,7 @@ class SubgraphEdgeResult:
     mentions_recreated: int = 0
     mentions_skipped: int = 0
     dropped_cross_target: list = field(default_factory=list)
+    blocked: list = field(default_factory=list)
 
 
 async def _entity_present_in_graph(graph: Any, uuid: str) -> bool:
@@ -949,19 +966,29 @@ async def recreate_subgraph_relationships(graphiti: Any, specs: list[dict]) -> S
 
     Returns:
         SubgraphEdgeResult tallying edges/mentions recreated vs. skipped
-        (plus, from step-8 onward, any cross-target-dropped edges).
+        (plus, from step-8 onward, any cross-target-dropped edges, and from
+        the CGL-η follow-up onward, any per-item ``blocked`` failures).
 
     Raises:
-        Whatever the underlying graph/embedding read or CREATE calls raise.
-        This primitive mutates target graphs incrementally as it walks the
-        batch, so a mid-batch failure can still leave real, non-zero
-        edges/mentions counts recreated before the raise -- that partial
-        tally is attached to the exception as ``exc.partial_result`` (a
-        ``SubgraphEdgeResult``) instead of being discarded, so a caller
-        (e.g. ``scripts/migrate_cross_graph_leak.py``'s ``run()``) can
-        surface accurate partial-progress counts instead of reporting an
-        all-zero default for a batch that was actually partway mutated
-        (task 2415 amendment round 2).
+        A single edge/mention's embedding read or CREATE raising (e.g. a
+        transient FalkorDB error) is per-item isolated (CGL-η follow-up,
+        task 2451): it does NOT raise out of this function -- it is instead
+        recorded on the returned result's ``blocked`` list and the batch
+        continues, so one bad item costs one item, not the whole census.
+        What DOES still raise out of this function is a systemic/batch-level
+        failure -- a per-spec gather ``ro_query`` (reading a spec's incident
+        edges/mentions, or a MERGE spec's wrong-copy/home edge sets) or a
+        lost falkor-client acquisition -- since that is not a single item's
+        problem. This primitive mutates target graphs incrementally as it
+        walks the batch, so a mid-batch systemic failure can still leave
+        real, non-zero edges/mentions counts (and blocked entries) recorded
+        before the raise -- that partial tally is attached to the exception
+        as ``exc.partial_result`` (a ``SubgraphEdgeResult``) instead of
+        being discarded, so a caller (e.g.
+        ``scripts/migrate_cross_graph_leak.py``'s ``run()``) can surface
+        accurate partial-progress counts instead of reporting an all-zero
+        default for a batch that was actually partway mutated (task 2415
+        amendment round 2).
     """
     result = SubgraphEdgeResult()
     try:
@@ -1068,48 +1095,72 @@ async def _recreate_subgraph_relationships_batch(
             # incremented.
             continue
 
-        edge_embedding_cypher = (
-            f'MATCH ()-[e:RELATES_TO {{uuid: {_quote_cypher_string(edge_uuid)}}}]-() '
-            'RETURN e.fact_embedding'
-        )
-        edge_embedding_reply = await _read_compact_vector(
-            falkor_client, group_id=source_graph, cypher=edge_embedding_cypher,
-        )
+        try:
+            edge_embedding_cypher = (
+                f'MATCH ()-[e:RELATES_TO {{uuid: {_quote_cypher_string(edge_uuid)}}}]-() '
+                'RETURN e.fact_embedding'
+            )
+            edge_embedding_reply = await _read_compact_vector(
+                falkor_client, group_id=source_graph, cypher=edge_embedding_cypher,
+            )
 
-        edge_create_result = await target.query(
-            'MATCH (a:Entity {uuid: $src_uuid}), (b:Entity {uuid: $dst_uuid}) '
-            'CREATE (a)-[r:RELATES_TO]->(b) '
-            'SET r.uuid = $edge_uuid, '
-            '    r.name = $name, '
-            '    r.fact = $fact, '
-            '    r.valid_at = $valid_at, '
-            '    r.invalid_at = $invalid_at, '
-            '    r.created_at = $created_at, '
-            '    r.group_id = $group_id, '
-            '    r.episodes = $episodes'
-            f'{_embedding_set_clause("r.fact_embedding", edge_embedding_reply)}',
-            {
-                'src_uuid': src_uuid,
-                'dst_uuid': dst_uuid,
-                'edge_uuid': edge_uuid,
-                'name': edge_name,
-                'fact': fact,
-                'valid_at': valid_at,
-                'invalid_at': invalid_at,
-                'created_at': edge_created_at,
-                'group_id': target_graph_name,
-                'episodes': episodes,
-            },
-        )
-        if edge_create_result.relationships_created:
-            result.edges_recreated += 1
-        else:
-            result.edges_skipped += 1
+            edge_create_result = await target.query(
+                'MATCH (a:Entity {uuid: $src_uuid}), (b:Entity {uuid: $dst_uuid}) '
+                'CREATE (a)-[r:RELATES_TO]->(b) '
+                'SET r.uuid = $edge_uuid, '
+                '    r.name = $name, '
+                '    r.fact = $fact, '
+                '    r.valid_at = $valid_at, '
+                '    r.invalid_at = $invalid_at, '
+                '    r.created_at = $created_at, '
+                '    r.group_id = $group_id, '
+                '    r.episodes = $episodes'
+                f'{_embedding_set_clause("r.fact_embedding", edge_embedding_reply)}',
+                {
+                    'src_uuid': src_uuid,
+                    'dst_uuid': dst_uuid,
+                    'edge_uuid': edge_uuid,
+                    'name': edge_name,
+                    'fact': fact,
+                    'valid_at': valid_at,
+                    'invalid_at': invalid_at,
+                    'created_at': edge_created_at,
+                    'group_id': target_graph_name,
+                    'episodes': episodes,
+                },
+            )
+            if edge_create_result.relationships_created:
+                result.edges_recreated += 1
+            else:
+                result.edges_skipped += 1
+                logger.warning(
+                    'recreate_subgraph_relationships: RELATES_TO edge uuid=%s '
+                    'silently skipped -- other endpoint (src=%s dst=%s) not '
+                    'present in target_graph=%s',
+                    edge_uuid, src_uuid, dst_uuid, target_graph_name,
+                )
+        except Exception as exc:
+            # Per-item isolation (CGL-η follow-up, task 2451): a single bad
+            # edge's embedding read or CREATE (e.g. a transient FalkorDB
+            # error) costs only this ONE edge, not the whole batch -- unlike
+            # a per-spec gather-read failure (outside this try/except),
+            # which remains a systemic/batch-level abort (see this module's
+            # recreate_subgraph_relationships docstring). Both incident node
+            # uuids are recorded so a caller can withhold Phase C
+            # source-deletion for them, preserving create-before-delete for
+            # this un-recreated edge.
+            result.blocked.append({
+                'kind': 'edge',
+                'uuid': edge_uuid,
+                'reason': str(exc),
+                'node_uuids': [src_uuid, dst_uuid],
+            })
             logger.warning(
                 'recreate_subgraph_relationships: RELATES_TO edge uuid=%s '
-                'silently skipped -- other endpoint (src=%s dst=%s) not '
-                'present in target_graph=%s',
-                edge_uuid, src_uuid, dst_uuid, target_graph_name,
+                'blocked -- %s: %s (src=%s dst=%s target_graph=%s); batch '
+                'continues',
+                edge_uuid, type(exc).__name__, exc, src_uuid, dst_uuid,
+                target_graph_name,
             )
 
     for mention_uuid, (row, _source_graph, entity_uuid) in mentions_by_uuid.items():
@@ -1123,29 +1174,46 @@ async def _recreate_subgraph_relationships_batch(
             # incremented. Mirrors the RELATES_TO skip above.
             continue
 
-        mention_create_result = await target.query(
-            'MATCH (ep:Episodic {uuid: $episode_uuid}), (n:Entity {uuid: $entity_uuid}) '
-            'CREATE (ep)-[e:MENTIONS]->(n) '
-            'SET e.uuid = $edge_uuid, '
-            '    e.group_id = $group_id, '
-            '    e.created_at = $created_at',
-            {
-                'episode_uuid': episode_uuid,
-                'entity_uuid': entity_uuid,
-                'edge_uuid': mention_uuid,
-                'group_id': target_graph_name,
-                'created_at': mention_created_at,
-            },
-        )
-        if mention_create_result.relationships_created:
-            result.mentions_recreated += 1
-        else:
-            result.mentions_skipped += 1
+        try:
+            mention_create_result = await target.query(
+                'MATCH (ep:Episodic {uuid: $episode_uuid}), (n:Entity {uuid: $entity_uuid}) '
+                'CREATE (ep)-[e:MENTIONS]->(n) '
+                'SET e.uuid = $edge_uuid, '
+                '    e.group_id = $group_id, '
+                '    e.created_at = $created_at',
+                {
+                    'episode_uuid': episode_uuid,
+                    'entity_uuid': entity_uuid,
+                    'edge_uuid': mention_uuid,
+                    'group_id': target_graph_name,
+                    'created_at': mention_created_at,
+                },
+            )
+            if mention_create_result.relationships_created:
+                result.mentions_recreated += 1
+            else:
+                result.mentions_skipped += 1
+                logger.warning(
+                    'recreate_subgraph_relationships: MENTIONS link uuid=%s '
+                    'silently skipped -- episode uuid=%s not present in '
+                    'target_graph=%s (entity_uuid=%s)',
+                    mention_uuid, episode_uuid, target_graph_name, entity_uuid,
+                )
+        except Exception as exc:
+            # Per-item isolation, same rationale as the RELATES_TO edge pass
+            # above: a single bad MENTIONS CREATE costs only this ONE link.
+            result.blocked.append({
+                'kind': 'mention',
+                'uuid': mention_uuid,
+                'reason': str(exc),
+                'node_uuids': [entity_uuid],
+            })
             logger.warning(
                 'recreate_subgraph_relationships: MENTIONS link uuid=%s '
-                'silently skipped -- episode uuid=%s not present in '
-                'target_graph=%s (entity_uuid=%s)',
-                mention_uuid, episode_uuid, target_graph_name, entity_uuid,
+                'blocked -- %s: %s (entity_uuid=%s target_graph=%s); batch '
+                'continues',
+                mention_uuid, type(exc).__name__, exc, entity_uuid,
+                target_graph_name,
             )
 
     # --- MERGE fold ---
@@ -1180,55 +1248,72 @@ async def _recreate_subgraph_relationships_batch(
             (_edge_uuid, edge_name, fact, valid_at, invalid_at, edge_created_at,
              edge_group_id, episodes, src_uuid, dst_uuid) = wrong_rows_by_uuid[edge_uuid]
 
-            edge_embedding_cypher = (
-                f'MATCH ()-[e:RELATES_TO {{uuid: {_quote_cypher_string(edge_uuid)}}}]-() '
-                'RETURN e.fact_embedding'
-            )
-            edge_embedding_reply = await _read_compact_vector(
-                falkor_client, group_id=wrong_graph, cypher=edge_embedding_cypher,
-            )
+            try:
+                edge_embedding_cypher = (
+                    f'MATCH ()-[e:RELATES_TO {{uuid: {_quote_cypher_string(edge_uuid)}}}]-() '
+                    'RETURN e.fact_embedding'
+                )
+                edge_embedding_reply = await _read_compact_vector(
+                    falkor_client, group_id=wrong_graph, cypher=edge_embedding_cypher,
+                )
 
-            # Both endpoints are MATCHed (never CREATEd): the home copy of
-            # this MERGE node and the edge's other endpoint must already
-            # exist in home_graph, or this MATCH yields no rows and the
-            # edge is silently skipped -- same convention as the MOVE-edge
-            # pass above / merge_foreign_duplicate. group_id is preserved
-            # from the wrong copy verbatim -- MERGE has no rewrite_group_id
-            # analogue (mirrors merge_foreign_duplicate).
-            edge_create_result = await home.query(
-                'MATCH (a:Entity {uuid: $src_uuid}), (b:Entity {uuid: $dst_uuid}) '
-                'CREATE (a)-[r:RELATES_TO]->(b) '
-                'SET r.uuid = $edge_uuid, '
-                '    r.name = $name, '
-                '    r.fact = $fact, '
-                '    r.valid_at = $valid_at, '
-                '    r.invalid_at = $invalid_at, '
-                '    r.created_at = $created_at, '
-                '    r.group_id = $group_id, '
-                '    r.episodes = $episodes'
-                f'{_embedding_set_clause("r.fact_embedding", edge_embedding_reply)}',
-                {
-                    'src_uuid': src_uuid,
-                    'dst_uuid': dst_uuid,
-                    'edge_uuid': edge_uuid,
-                    'name': edge_name,
-                    'fact': fact,
-                    'valid_at': valid_at,
-                    'invalid_at': invalid_at,
-                    'created_at': edge_created_at,
-                    'group_id': edge_group_id,
-                    'episodes': episodes,
-                },
-            )
-            if edge_create_result.relationships_created:
-                result.edges_recreated += 1
-            else:
-                result.edges_skipped += 1
+                # Both endpoints are MATCHed (never CREATEd): the home copy
+                # of this MERGE node and the edge's other endpoint must
+                # already exist in home_graph, or this MATCH yields no rows
+                # and the edge is silently skipped -- same convention as the
+                # MOVE-edge pass above / merge_foreign_duplicate. group_id is
+                # preserved from the wrong copy verbatim -- MERGE has no
+                # rewrite_group_id analogue (mirrors merge_foreign_duplicate).
+                edge_create_result = await home.query(
+                    'MATCH (a:Entity {uuid: $src_uuid}), (b:Entity {uuid: $dst_uuid}) '
+                    'CREATE (a)-[r:RELATES_TO]->(b) '
+                    'SET r.uuid = $edge_uuid, '
+                    '    r.name = $name, '
+                    '    r.fact = $fact, '
+                    '    r.valid_at = $valid_at, '
+                    '    r.invalid_at = $invalid_at, '
+                    '    r.created_at = $created_at, '
+                    '    r.group_id = $group_id, '
+                    '    r.episodes = $episodes'
+                    f'{_embedding_set_clause("r.fact_embedding", edge_embedding_reply)}',
+                    {
+                        'src_uuid': src_uuid,
+                        'dst_uuid': dst_uuid,
+                        'edge_uuid': edge_uuid,
+                        'name': edge_name,
+                        'fact': fact,
+                        'valid_at': valid_at,
+                        'invalid_at': invalid_at,
+                        'created_at': edge_created_at,
+                        'group_id': edge_group_id,
+                        'episodes': episodes,
+                    },
+                )
+                if edge_create_result.relationships_created:
+                    result.edges_recreated += 1
+                else:
+                    result.edges_skipped += 1
+                    logger.warning(
+                        'recreate_subgraph_relationships: MERGE-fold RELATES_TO '
+                        'edge uuid=%s silently skipped -- other endpoint '
+                        '(src=%s dst=%s) not present in home_graph=%s',
+                        edge_uuid, src_uuid, dst_uuid, home_graph,
+                    )
+            except Exception as exc:
+                # Per-item isolation, same rationale as the MOVE-edge pass
+                # above: a single bad MERGE-fold edge costs only itself.
+                result.blocked.append({
+                    'kind': 'edge',
+                    'uuid': edge_uuid,
+                    'reason': str(exc),
+                    'node_uuids': [src_uuid, dst_uuid],
+                })
                 logger.warning(
                     'recreate_subgraph_relationships: MERGE-fold RELATES_TO '
-                    'edge uuid=%s silently skipped -- other endpoint '
-                    '(src=%s dst=%s) not present in home_graph=%s',
-                    edge_uuid, src_uuid, dst_uuid, home_graph,
+                    'edge uuid=%s blocked -- %s: %s (src=%s dst=%s '
+                    'home_graph=%s); batch continues',
+                    edge_uuid, type(exc).__name__, exc, src_uuid, dst_uuid,
+                    home_graph,
                 )
 
 
