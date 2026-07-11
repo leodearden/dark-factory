@@ -23,6 +23,7 @@ from __future__ import annotations
 import asyncio
 import time
 from pathlib import Path
+from typing import cast
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -31,6 +32,7 @@ from orchestrator.config import GitConfig, OrchestratorConfig
 from orchestrator.event_store import EventStore, EventType
 from orchestrator.git_ops import GitOps, MergeResult, _run
 from orchestrator.merge_queue import (
+    InflightEntry,
     MergedOk,
     MergeRequest,
     RealMergeItem,
@@ -38,6 +40,18 @@ from orchestrator.merge_queue import (
     classify_and_merge,
 )
 from orchestrator.verify import VerifyResult
+
+
+def _sentinel_entry() -> InflightEntry:
+    """Opaque, identity-only stand-in for a real ``InflightEntry``.
+
+    Mirrors test_merge_queue_single_writer_asserts.py's ``_sentinel_entry``:
+    the tests below only care about the *count* of frozen entries
+    (``_verify_frontier_depth`` is a pure ``len()`` delegation), never their
+    fields, so a bare ``object()`` cast to ``InflightEntry`` is enough at
+    runtime without constructing a real merge-result/lease graph.
+    """
+    return cast(InflightEntry, object())
 
 
 def _make_bare_worker() -> SpeculativeMergeWorker:
@@ -75,13 +89,13 @@ class TestVerifyFrontierDepth:
     def test_one_frozen_entry_returns_one(self) -> None:
         """One speculated item ahead -> depth 1."""
         worker = _make_bare_worker()
-        worker._frozen_inflight_entries = lambda: [object()]
+        worker._frozen_inflight_entries = lambda: [_sentinel_entry()]
         assert worker._verify_frontier_depth() == 1
 
     def test_three_frozen_entries_returns_three(self) -> None:
         """Three speculated items ahead -> depth 3."""
         worker = _make_bare_worker()
-        worker._frozen_inflight_entries = lambda: [object(), object(), object()]
+        worker._frozen_inflight_entries = lambda: [_sentinel_entry() for _ in range(3)]
         assert worker._verify_frontier_depth() == 3
 
 
@@ -352,7 +366,7 @@ class TestSpeculativeMergeEventDepth:
         worker = SpeculativeMergeWorker(git_ops, queue, event_store=es)
         # Two speculated items already frozen/verifying ahead of this one
         # joining the frontier -> depth 2 (see _verify_frontier_depth()).
-        worker._frozen_inflight_entries = lambda: [object(), object()]
+        worker._frozen_inflight_entries = lambda: [_sentinel_entry() for _ in range(2)]
 
         req = _make_request('spec-depth-1', 'spec-depth-1', worktree, config)
         main_sha = await git_ops.get_main_sha()
