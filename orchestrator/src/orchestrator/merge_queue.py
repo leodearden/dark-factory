@@ -754,6 +754,7 @@ def _build_main_health_outcome(verify: VerifyResult, probe_sha: str) -> MergeOut
         dedupe_fingerprint=_main_health_fingerprint(
             verify.category or '', verify.cause_hint, probe_sha,
         ),
+        disposition=MergeFailureDisposition.MAIN_RED,
     )
 
 
