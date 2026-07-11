@@ -607,6 +607,45 @@ class WaiterRecord:
     """Git SHA of the branch tip at submit time (snapshot_tip), or None if unavailable."""
 
 
+@dataclass(frozen=True)
+class QueuedBranch:
+    """A merge-queue branch name in both its bare and full-ref shapes.
+
+    ``bare_id`` is the task id alone (e.g. ``'4778'``); ``full_name`` is the
+    branch name with the configured prefix applied (e.g. ``'task/4778'``).
+
+    :meth:`parse` is the ONLY place branch-prefix logic lives (parse-don't-
+    validate, ``plans/merge-queue-reliability-prd.md`` DD7) — construct
+    instances through it rather than the dataclass constructor directly.
+    Git refs should always be built from ``.full_name``; task/branch
+    bookkeeping keys should use ``.bare_id``.
+
+    Frozen (immutable) so two independently-parsed values compare equal by
+    field value (and hash identically), regardless of which shape the raw
+    input arrived in.
+    """
+
+    bare_id: str
+    full_name: str
+
+    @classmethod
+    def parse(cls, raw: str, branch_prefix: str) -> QueuedBranch:
+        """Parse *raw* (bare or already-prefixed) into a canonical QueuedBranch.
+
+        *raw* may arrive bare (``'4778'``) or already prefixed
+        (``'task/4778'``); both parse to the same value. ``full_name`` is
+        derived by the same prepend-unless-present rule as
+        :func:`orchestrator.git_ops.canonical_queued_branch_name`; ``bare_id``
+        is then stripped from it the same way the ``merge_queue_store.py``
+        journal normalization does. This is the ONLY place branch-prefix
+        logic should live — callers should not reimplement prefix
+        stripping/prepending elsewhere.
+        """
+        full_name = raw if raw.startswith(branch_prefix) else f'{branch_prefix}{raw}'
+        bare_id = full_name.removeprefix(branch_prefix)
+        return cls(bare_id=bare_id, full_name=full_name)
+
+
 @dataclass
 class MergeRequest:
     """A request to merge a task branch into main."""
