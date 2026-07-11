@@ -712,6 +712,90 @@ class TestCiteTaskInRunCitedTaskDedup:
         ids = {item['finding_id'] for item in report['flagged_items']}
         assert ids == {fid1, fid2}
 
+        # task-2425 amend: re-citing the same primary task must not create a
+        # duplicate citation entry either -- fid1's cited_tasks stays at its
+        # two distinct citations ('2405' primary + '9999' secondary), not
+        # three with '2405' appearing twice.
+        item_1 = next(i for i in report['flagged_items'] if i['finding_id'] == fid1)
+        cited_pairs = [(c['project_id'], c['task_id']) for c in item_1['cited_tasks']]
+        assert cited_pairs == [('dark_factory', '2405'), ('dark_factory', '9999')]
+
+    @pytest.mark.asyncio
+    async def test_two_memory_consolidator_findings_citing_same_task_both_survive(self):
+        """memory_consolidator (Stage-1) findings are EXEMPT from the in-run
+        cited-task fold (esc-2425-1): the fold is gated on
+        ``finding_entry.stage != 'memory_consolidator'``, mirroring Fix-1's
+        read-time ``stage != 'memory_consolidator'`` carve-out in
+        get_assembled_report. Two Stage-1 siblings citing the SAME external
+        task as their primary citation must both survive -- neither is
+        folded/purged -- exactly like
+        test_sibling_stage1_findings_not_mutually_suppressed in
+        test_recon_report.py, but exercised at the write-time fold rather
+        than the read-time suppression.
+        """
+        state, _ = self._make_state()
+        state.start_report(run_id='run-1', stage='memory_consolidator', project_id='dark_factory')
+
+        f1 = state.add_finding(
+            run_id='run-1', severity='low', category='cross_project',
+            description='mc desc one', suggested_action='a',
+            task_id=None, flag_type=None,
+        )
+        f2 = state.add_finding(
+            run_id='run-1', severity='low', category='cross_project',
+            description='mc desc two', suggested_action='a',
+            task_id=None, flag_type='other_flag',
+        )
+        fid1, fid2 = f1['finding_id'], f2['finding_id']
+
+        cite1 = await state.cite_task('run-1', fid1, 'dark_factory', '2405')
+        cite2 = await state.cite_task('run-1', fid2, 'dark_factory', '2405')
+
+        assert 'error' not in cite1, cite1
+        assert 'error' not in cite2, cite2
+
+        report = state.get_assembled_report('run-1', 'memory_consolidator')
+        assert report is not None
+        ids = {item['finding_id'] for item in report['flagged_items']}
+        assert ids == {fid1, fid2}
+
+    @pytest.mark.asyncio
+    async def test_memory_consolidator_finding_does_not_consume_fold_anchor_for_other_stage(self):
+        """A memory_consolidator-stage citation must not register a fold
+        anchor that a later non-mc-stage finding relies on. Stage 1 cites an
+        external task first; Stage 2 (reconciler) then cites the SAME task
+        as ITS OWN primary citation -- it must succeed plainly (not fold),
+        proving the Stage-1 citation registered nothing in
+        ``_run_cited_task_index`` for the non-mc stage to collide with.
+        """
+        state, _ = self._make_state()
+
+        state.start_report(run_id='run-1', stage='memory_consolidator', project_id='dark_factory')
+        f_mc = state.add_finding(
+            run_id='run-1', severity='low', category='cross_project',
+            description='mc desc', suggested_action='a',
+            task_id=None, flag_type=None,
+        )
+        fid_mc = f_mc['finding_id']
+        cite_mc = await state.cite_task('run-1', fid_mc, 'dark_factory', '2405')
+        assert 'error' not in cite_mc, cite_mc
+
+        state.start_report(run_id='run-1', stage='reconciler', project_id='dark_factory')
+        f_recon = state.add_finding(
+            run_id='run-1', severity='low', category='cross_project',
+            description='recon desc', suggested_action='a',
+            task_id=None, flag_type='recon_flag',
+        )
+        fid_recon = f_recon['finding_id']
+        cite_recon = await state.cite_task('run-1', fid_recon, 'dark_factory', '2405')
+        assert 'error' not in cite_recon, cite_recon
+
+        report_mc = state.get_assembled_report('run-1', 'memory_consolidator')
+        report_recon = state.get_assembled_report('run-1', 'reconciler')
+        assert report_mc is not None and report_recon is not None
+        assert [i['finding_id'] for i in report_mc['flagged_items']] == [fid_mc]
+        assert [i['finding_id'] for i in report_recon['flagged_items']] == [fid_recon]
+
 
 # ---------------------------------------------------------------------------
 # task-2425 step-3: TestCiteTaskFoldKeyClearedOnDelete — RED until step-4

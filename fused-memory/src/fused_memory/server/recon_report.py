@@ -999,7 +999,11 @@ class ReconReportState:
         Returns {project_id, task_id, title} on success, or a structured error
         dict (run_id_unknown / finding_unknown / unknown_project / task_not_found).
         project_id is validated against self.known_projects before any service call.
-        Appends to finding.cited_tasks only on success.
+        Appends to finding.cited_tasks only on success, skipping the append when
+        an identical {project_id, task_id} citation is already present so a
+        re-citation of the same task (e.g. re-citing a finding's own primary
+        task) stays idempotent instead of accumulating a duplicate entry
+        (task-2425 amend).
 
         In-run cited-task fold (task-2425): when *finding* has a null
         top-level task_id and this is its PRIMARY (first-ever) citation, the
@@ -1071,7 +1075,19 @@ class ReconReportState:
                 return _duplicate_finding_error(existing_id)
             run_cited_tasks[cited_task_key] = finding.finding_id
 
-        finding.cited_tasks.append(citation)
+        # task-2425 amend: skip the append when an identical {project_id,
+        # task_id} citation is already present. Without this, re-citing a
+        # finding's own primary task (see
+        # test_only_primary_citation_is_a_fold_anchor) appends a second,
+        # redundant citation entry — harmless to the fold itself (which
+        # always keys off cited_tasks[0]) but it lets cited_tasks accumulate
+        # duplicate rows.
+        already_cited = any(
+            c['project_id'] == project_id and c['task_id'] == task_id
+            for c in finding.cited_tasks
+        )
+        if not already_cited:
+            finding.cited_tasks.append(citation)
         return citation
 
     async def cite_memory(
