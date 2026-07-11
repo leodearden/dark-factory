@@ -158,3 +158,67 @@ class TestClassifyMainHealthRedSetsDisposition:
 
         outcome = asyncio.run(_run())
         assert outcome is None
+
+
+# ---------------------------------------------------------------------------
+# Step-3/4 [I4 surfacing content] — _render_skew_surfaces pure helper
+# ---------------------------------------------------------------------------
+
+
+class TestRenderSkewSurfaces:
+    """_render_skew_surfaces(disposition, evidence) is a pure helper: only
+    INTEGRATION_SKEW (with non-None evidence) yields a non-empty reason_suffix
+    + failure_diagnostic dict; every other disposition/evidence combination
+    returns ('', None)."""
+
+    def test_integration_skew_with_evidence_renders_surfaces(self) -> None:
+        from orchestrator.merge_queue import _render_skew_surfaces
+
+        evidence = SkewEvidence(
+            implicated_commits=('abc123deadbeef',),
+            failing_tests=('tests/test_foo.py::test_bar',),
+            overlap_files=('a/b.py',),
+        )
+        reason_suffix, failure_diagnostic = _render_skew_surfaces(
+            MergeFailureDisposition.INTEGRATION_SKEW, evidence,
+        )
+
+        assert 'integration_skew' in reason_suffix, reason_suffix
+        assert 'abc123deadbeef' in reason_suffix, reason_suffix
+        assert 'a/b.py' in reason_suffix, reason_suffix
+        assert 'port landed commit' in reason_suffix, reason_suffix
+        assert 'do not hunt your own diff' in reason_suffix, reason_suffix
+
+        assert failure_diagnostic is not None
+        assert all(isinstance(v, str) for v in failure_diagnostic.values()), (
+            f'failure_diagnostic must be dict[str,str]; got {failure_diagnostic!r}'
+        )
+        joined = ' '.join(failure_diagnostic.values())
+        assert 'integration_skew' in joined, joined
+        assert 'abc123deadbeef' in joined, joined
+        assert 'a/b.py' in joined, joined
+        assert 'tests/test_foo.py::test_bar' in joined, joined
+
+    @pytest.mark.parametrize('disposition', [
+        MergeFailureDisposition.MAIN_RED,
+        MergeFailureDisposition.BRANCH_BUG,
+        MergeFailureDisposition.INDETERMINATE,
+    ])
+    def test_non_skew_dispositions_render_nothing(
+        self, disposition: MergeFailureDisposition,
+    ) -> None:
+        from orchestrator.merge_queue import _render_skew_surfaces
+
+        evidence = SkewEvidence(
+            implicated_commits=('abc123',),
+            failing_tests=('t',),
+            overlap_files=('f.py',),
+        )
+        assert _render_skew_surfaces(disposition, evidence) == ('', None)
+
+    def test_integration_skew_with_none_evidence_renders_nothing(self) -> None:
+        from orchestrator.merge_queue import _render_skew_surfaces
+
+        assert _render_skew_surfaces(
+            MergeFailureDisposition.INTEGRATION_SKEW, None,
+        ) == ('', None)
