@@ -180,6 +180,33 @@ class TestIterationLog:
         assert entries == []
         assert len(corrupted) == 3
 
+    def test_clear_iteration_log_removes_file(self, artifacts: TaskArtifacts):
+        """clear_iteration_log() removes iterations.jsonl entirely — a
+        subsequent read sees a clean slate, not just an empty-but-present file.
+
+        Layer B (task 2372): called on re-dispatch onto a new fork point so a
+        prior dispatch's entries never masquerade as current-branch evidence.
+        """
+        artifacts.append_iteration_log({
+            'iteration': 1, 'agent': 'implementer', 'summary': 'stale',
+        })
+        log_path = artifacts.root / 'iterations.jsonl'
+        assert log_path.exists()
+
+        artifacts.clear_iteration_log()
+
+        assert not log_path.exists()
+        assert artifacts.read_iteration_log() == ([], [])
+
+    def test_clear_iteration_log_missing_ok(self, artifacts: TaskArtifacts):
+        """clear_iteration_log() on a never-written log must not raise."""
+        log_path = artifacts.root / 'iterations.jsonl'
+        assert not log_path.exists()
+
+        artifacts.clear_iteration_log()  # must not raise
+
+        assert artifacts.read_iteration_log() == ([], [])
+
 
 VALID_PLAN_WITH_STEPS = {
     'task_id': 'task-1',

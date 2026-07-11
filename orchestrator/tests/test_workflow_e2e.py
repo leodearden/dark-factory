@@ -2474,10 +2474,28 @@ class TestGhostLoopGuard:
         # The implementer MUST have been called (ghost-loop did not skip)
         assert 'implementer' in stub.calls
 
-    async def test_legitimate_ghost_loop_skips_to_done(
+    async def test_rebased_ghost_loop_with_no_journal_reexecutes_instead_of_skipping(
         self, config, git_ops, task_assignment, monkeypatch
     ):
-        """Worktree with implementer iteration entry + HEAD on main → skip."""
+        """Worktree rebased onto an already-merged main tip + iteration-log
+        entry, but NO journal binding → re-executes instead of silently
+        skipping (task 2372, Layer C accepted trade-off).
+
+        Previously (pre-task-2372) this exact setup — a worktree rebased so
+        wt_head == base_commit, with an iteration-log implementer entry —
+        made the pre-EXECUTE guard trust the (spoofable) iteration log alone
+        and skip straight to DONE. Layer C replaced that heuristic with a
+        real ``git diff base_commit..wt_head`` gate, which is empty here
+        (the rebase collapsed wt_head onto base_commit) regardless of the
+        iteration log. This is the explicitly accepted trade-off documented
+        in the task 2372 plan: a genuine merge that misses the journal now
+        re-executes (a wasted but self-correcting implementer invocation)
+        rather than being trusted via a heuristic that cannot be told apart
+        from the task 2125/2315/2340 phantom-done poison shape. In
+        production, a genuine merge like this IS normally journal-covered
+        (``MergeProvenance.lookup`` runs first, before this fallback is ever
+        reached) — this test exercises the uncovered case.
+        """
         # 1. Create worktree and simulate prior implementation
         wt_info = await git_ops.create_worktree(task_assignment.task_id)
         wt = wt_info.path
@@ -2485,24 +2503,33 @@ class TestGhostLoopGuard:
         task_dir.mkdir(parents=True, exist_ok=True)
         (task_dir / 'plan.json').write_text(json.dumps(PLAN, indent=2) + '\n')
 
-        # Write an implementer iteration log entry
+        # Write an implementer iteration log entry — no longer sufficient
+        # evidence on its own at this guard (Layer C, task 2372).
         import json as _json
         (task_dir / 'iterations.jsonl').write_text(
-            _json.dumps({'agent': 'implementer', 'iteration': 1, 'steps_attempted': []}) + '\n'
+            _json.dumps({
+                'agent': 'implementer', 'iteration': 1,
+                'steps_attempted': ['s1'], 'steps_completed': ['s1'],
+            }) + '\n'
         )
 
         # Make an implementation commit on the branch
         (wt / 'farewell.py').write_text('def farewell(name):\n    return f"Bye, {name}"\n')
         await git_ops.commit(wt, 'Implement farewell')
 
-        # 2. Merge the branch into main so its HEAD becomes an ancestor
+        # 2. Merge the branch into main so its HEAD becomes an ancestor —
+        #    directly via git_ops, bypassing the workflow's own merge phase,
+        #    so NO landed-outbox journal entry is recorded (journal miss —
+        #    the scenario this test exercises).
         result = await git_ops.merge_to_main(wt, task_assignment.task_id)
         assert result.success
         await git_ops.advance_main(result.merge_commit)
         if result.merge_worktree:
             await git_ops.cleanup_merge_worktree(result.merge_worktree)
 
-        # 3. Build and run workflow — should detect prior merge and skip
+        # 3. Build and run workflow — create_worktree reuses/rebases the
+        #    existing worktree onto the now-advanced main tip, so wt_head ==
+        #    base_commit and the branch-diff gate sees an empty diff.
         stub = AgentStub()
         workflow, scheduler = _build_workflow(config, git_ops, task_assignment, stub)
         monkeypatch.setattr('orchestrator.workflow.invoke_agent', stub.invoke_agent)
@@ -2517,8 +2544,11 @@ class TestGhostLoopGuard:
         outcome = await workflow.run()
 
         assert outcome == WorkflowOutcome.DONE
-        # The implementer must NOT have been called (ghost-loop skipped)
-        assert 'implementer' not in stub.calls
+        # The implementer IS called again — the accepted trade-off. A
+        # wasted but self-correcting re-execution beats trusting a
+        # heuristic that cannot distinguish this from a phantom-done poison
+        # entry (see the task 2372 plan's design decisions).
+        assert 'implementer' in stub.calls
 
     async def test_uncommitted_scratch_alone_does_not_skip_to_done(
         self, config, git_ops, task_assignment, monkeypatch
@@ -3780,8 +3810,15 @@ class TestRecoverIfAlreadyMerged:
             _json.dumps({'task_id': task_assignment.task_id, 'base_commit': base_sha})
         )
 
+        # steps_completed must be non-empty: the task 2372 Layer A classifier
+        # (_iteration_entry_is_work) excludes implementer entries with no
+        # steps_completed as the zero-work signature, so a genuine-prior-work
+        # fixture must carry real steps_completed to be classified as work.
         (task_dir / 'iterations.jsonl').write_text(
-            _json.dumps({'agent': 'implementer', 'iteration': 1, 'steps_attempted': []}) + '\n'
+            _json.dumps({
+                'agent': 'implementer', 'iteration': 1,
+                'steps_attempted': ['s1'], 'steps_completed': ['s1'],
+            }) + '\n'
         )
 
         # 2. Make a real implementation commit and merge it to main
@@ -4464,8 +4501,13 @@ class TestRecoverIfAlreadyMerged:
             _json.dumps({'task_id': task_assignment.task_id, 'base_commit': base_sha})
         )
 
+        # steps_completed must be non-empty — see the sibling comment in
+        # test_returns_done_when_branch_merged_with_prior_work (task 2372 Layer A).
         (task_dir / 'iterations.jsonl').write_text(
-            _json.dumps({'agent': 'implementer', 'iteration': 1, 'steps_attempted': []}) + '\n'
+            _json.dumps({
+                'agent': 'implementer', 'iteration': 1,
+                'steps_attempted': ['s1'], 'steps_completed': ['s1'],
+            }) + '\n'
         )
         (wt / 'provenance_check.py').write_text('def impl():\n    return 1\n')
         await git_ops.commit(wt, 'Implement feature (provenance test)')
@@ -4522,6 +4564,336 @@ class TestRecoverIfAlreadyMerged:
 
 
 # ---------------------------------------------------------------------------
+# Tests: TaskWorkflow._recover_before_execute — Layer C branch-diff gate
+# (task 2372, recurrence class 2125/2315/2340)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestRecoverBeforeExecuteGhostLoop:
+    """e2e regression tests for the pre-EXECUTE ghost-loop guard's Layer C
+    branch-content-diff gate (task 2372).
+
+    Each test exercises ``_recover_before_execute()`` directly against a real
+    worktree/git_ops, mirroring ``TestRecoverIfAlreadyMerged``'s direct-call
+    style — no full ``workflow.run()`` cycle, no architect invocation.
+    """
+
+    async def test_recover_before_execute_returns_none_for_fresh_worktree_zero_work_poison(
+        self, config, git_ops, task_assignment, tmp_path,
+    ):
+        """A fresh/re-dispatched worktree (wt_head == base_commit == main_sha)
+        carrying the EXACT task-2125 poison iteration-log entry (zero-work
+        implementer, no 'source' key, left over from a prior dispatch) must
+        NOT recover to DONE.
+
+        Fails on unmodified code: the pre-EXECUTE guard's bare iteration-log
+        fallback counts this entry as prior work even though the branch has
+        zero commits and zero diff against its own base — the exact
+        signature behind the task 2125 false-DONE recurrence.
+
+        Seeding goes through the real ``TaskArtifacts`` object (``.init()`` /
+        ``.append_iteration_log()``) rather than hand-written files under
+        ``wt/.task`` — this file's autouse ``_derive_meta_root_like_production``
+        fixture redirects ``TaskArtifacts(wt)`` to the sibling
+        ``.task-meta/<name>`` root, so hand-written legacy-path files would be
+        invisible to ``workflow.artifacts``.
+        """
+        # 1. Fresh worktree — wt_head == base_commit == main_sha (never advanced).
+        wt_info = await git_ops.create_worktree(task_assignment.task_id)
+        wt = wt_info.path
+        base_sha = wt_info.base_commit
+
+        # 2. Build workflow, wire up worktree and artifacts, stamp metadata.
+        stub = AgentStub()
+        workflow, scheduler, _queue = _build_workflow_no_merge_worker(
+            config, git_ops, task_assignment, stub, tmp_path,
+        )
+        workflow.worktree = wt
+        workflow.artifacts = TaskArtifacts(wt)
+        workflow.artifacts.init(
+            task_assignment.task_id, task_assignment.task['title'],
+            task_assignment.task['description'], base_commit=base_sha,
+        )
+
+        # 3. Seed the EXACT task-2125 poison entry: zero-work implementer,
+        #    no 'source' key.
+        workflow.artifacts.append_iteration_log({
+            'iteration': 1, 'agent': 'implementer',
+            'steps_attempted': [], 'steps_completed': [],
+            'commit': base_sha, 'summary': 'No new steps completed',
+        })
+
+        # 4. Call _recover_before_execute directly.
+        outcome = await workflow._recover_before_execute()
+
+        # 5. Assertions: poison entry on a fresh worktree must NOT false-DONE.
+        assert outcome is None, (
+            f'Expected None for fresh worktree with task-2125 poison entry '
+            f'but got {outcome!r} — the branch-diff gate must reject a '
+            f'zero-commit branch regardless of iteration-log contents'
+        )
+        statuses = scheduler.statuses.get(task_assignment.task_id, [])
+        assert 'done' not in statuses, (
+            f"'done' must not appear in scheduler statuses: {statuses}"
+        )
+        assert workflow.state != WorkflowState.DONE, (
+            f'workflow.state must not be DONE: {workflow.state!r}'
+        )
+
+    async def test_recover_before_execute_returns_none_for_fresh_worktree_with_genuine_looking_stale_entry(
+        self, config, git_ops, task_assignment, tmp_path,
+    ):
+        """A fresh/re-dispatched worktree carrying a GENUINE-looking stale
+        iteration-log entry (real non-empty steps_completed, surviving from
+        an orphaned prior worktree for the same task id) must still NOT
+        recover to DONE — the task-2315/2340 signature that Layer A's
+        per-entry classifier alone cannot catch, because the entry IS
+        legitimately classified as work.  Only the branch-content-diff gate
+        (empty base..wt_head on THIS fresh worktree) closes this hole.
+        """
+        # 1. Fresh worktree — wt_head == base_commit == main_sha (never advanced).
+        wt_info = await git_ops.create_worktree(task_assignment.task_id)
+        wt = wt_info.path
+        base_sha = wt_info.base_commit
+
+        # 2. Build workflow, wire up worktree and artifacts, stamp metadata.
+        stub = AgentStub()
+        workflow, scheduler, _queue = _build_workflow_no_merge_worker(
+            config, git_ops, task_assignment, stub, tmp_path,
+        )
+        workflow.worktree = wt
+        workflow.artifacts = TaskArtifacts(wt)
+        workflow.artifacts.init(
+            task_assignment.task_id, task_assignment.task['title'],
+            task_assignment.task['description'], base_commit=base_sha,
+        )
+
+        # 3. Seed a GENUINE-work-shaped entry (non-empty steps_completed) —
+        #    survives from a prior, orphaned worktree for this same task id.
+        #    This entry legitimately classifies as work under Layer A; only
+        #    the branch-diff gate can catch it on THIS fresh worktree.
+        workflow.artifacts.append_iteration_log({
+            'iteration': 3, 'agent': 'implementer', 'source': 'orchestrator',
+            'steps_attempted': ['s1'], 'steps_completed': ['s1'],
+            'commit': 'orphaned-worktree-sha', 'summary': 'Implemented step 1',
+        })
+
+        # 4. Call _recover_before_execute directly.
+        outcome = await workflow._recover_before_execute()
+
+        # 5. Assertions: genuine-looking stale entry on a fresh worktree must
+        #    NOT false-DONE — the branch-diff gate is the sole signal that
+        #    catches this, since Layer A alone would classify the entry as work.
+        assert outcome is None, (
+            f'Expected None for fresh worktree with a genuine-looking stale '
+            f'iteration-log entry but got {outcome!r} — the branch-diff gate '
+            f'must reject a zero-commit branch even when the iteration log '
+            f'contains a legitimately-classified-as-work entry from an '
+            f'orphaned prior worktree'
+        )
+        statuses = scheduler.statuses.get(task_assignment.task_id, [])
+        assert 'done' not in statuses, (
+            f"'done' must not appear in scheduler statuses: {statuses}"
+        )
+        assert workflow.state != WorkflowState.DONE, (
+            f'workflow.state must not be DONE: {workflow.state!r}'
+        )
+
+    async def test_recover_before_execute_genuine_found_on_main_stamps_files(
+        self, config, git_ops, task_assignment, tmp_path,
+    ):
+        """A genuinely-merged branch (real commit, merged + advanced to
+        main, no journal binding) must recover to DONE with provenance
+        pointing at the real main SHA — the positive-path complement to the
+        two regression tests above.
+        """
+        # 1. Create worktree; capture base_commit BEFORE the implementation
+        #    commit — the branch-diff gate reads base_commit from
+        #    metadata.json to compute base..wt_head.
+        wt_info = await git_ops.create_worktree(task_assignment.task_id)
+        wt = wt_info.path
+        base_sha = wt_info.base_commit
+
+        # 2. Build workflow, wire up worktree and artifacts, stamp metadata
+        #    with the PRE-implementation base_commit.
+        stub = AgentStub()
+        workflow, scheduler, _queue = _build_workflow_no_merge_worker(
+            config, git_ops, task_assignment, stub, tmp_path,
+        )
+        workflow.worktree = wt
+        workflow.artifacts = TaskArtifacts(wt)
+        workflow.artifacts.init(
+            task_assignment.task_id, task_assignment.task['title'],
+            task_assignment.task['description'], base_commit=base_sha,
+        )
+
+        # 3. Make a real implementation commit, merge + advance main — wt_head
+        #    becomes an ancestor of main and base..wt_head is non-empty.
+        #    Deliberately NO iterations.jsonl seeding and NO journal binding,
+        #    so the ONLY signal available is the real branch-content diff.
+        (wt / 'genuinely_merged.py').write_text('def impl():\n    return 7\n')
+        await git_ops.commit(wt, 'Implement feature (genuine found_on_main)')
+        result = await git_ops.merge_to_main(wt, task_assignment.task_id)
+        assert result.success
+        await git_ops.advance_main(result.merge_commit)
+        if result.merge_worktree:
+            await git_ops.cleanup_merge_worktree(result.merge_worktree)
+
+        expected_main_sha = await git_ops.get_main_sha()
+
+        # 4. Call _recover_before_execute directly.
+        outcome = await workflow._recover_before_execute()
+
+        # 5. Assertions: genuine merge must recover to DONE with real provenance.
+        assert outcome == WorkflowOutcome.DONE, (
+            f'Expected DONE for genuinely-merged branch but got {outcome!r}'
+        )
+        prov = scheduler.provenance.get(task_assignment.task_id)
+        assert prov is not None, (
+            f'Expected provenance entry for task {task_assignment.task_id!r}, got None'
+        )
+        assert prov['kind'] == 'found_on_main', (
+            f"Unexpected provenance kind: {prov['kind']!r}"
+        )
+        assert prov['commit'] == expected_main_sha, (
+            f"Provenance commit {prov['commit']!r} != expected main_sha {expected_main_sha!r}"
+        )
+        # ACTION #2 (Layer C): the pre-computed branch diff must be threaded
+        # through override_files into metadata.files — this is what closes
+        # task 2125's phantom-done (which stamped metadata.files=[]).
+        # _reconcile_metadata_files_for_done optimistically sets
+        # self.task['metadata'] before the (fake) scheduler.update_task call,
+        # so we can assert directly against workflow.task here.
+        stamped_files = workflow.task.get('metadata', {}).get('files')
+        assert stamped_files, (
+            f'Expected non-empty metadata.files stamped from the branch diff, '
+            f'got {stamped_files!r}'
+        )
+        assert 'genuinely_merged.py' in stamped_files, (
+            f'Expected genuinely_merged.py in stamped files, got {stamped_files!r}'
+        )
+
+
+@pytest.mark.asyncio
+class TestRedispatchIterationLogHygiene:
+    """e2e regression tests for Layer B (task 2372): ``_setup_worktree_and_artifacts``
+    wipes a stale ``iterations.jsonl`` inherited from a prior dispatch when
+    re-dispatch lands on a NEW fork point, and preserves it when the fork
+    point is unchanged (same-base crash-resume).
+
+    Each test pre-seeds the sibling ``.task-meta/<task_id>`` root — the exact
+    location a prior, since-abandoned dispatch would have left behind — via
+    the real ``TaskArtifacts`` object, BEFORE the workflow's own
+    ``_setup_worktree_and_artifacts`` runs its (real) ``git_ops.create_worktree``
+    call. ``workflow.worktree`` is deliberately left ``None`` so the method
+    takes the real create_worktree path rather than the external-worktree
+    (eval mode) branch.
+    """
+
+    async def test_redispatch_clears_stale_iteration_log_when_base_changed(
+        self, config, git_ops, task_assignment, tmp_path,
+    ):
+        """OLD base_commit != NEW base_commit (re-dispatch onto a new fork
+        point) must wipe the surviving iterations.jsonl so a stale
+        prior-dispatch entry never masquerades as current-branch evidence.
+
+        Fails on unmodified code: init() only overwrites metadata.json, so
+        iterations.jsonl silently survives across re-dispatch — the exact
+        signature behind the task 2125/2315/2340 false-DONE recurrence.
+        """
+        # 1. Pre-seed the sibling .task-meta/<task_id> root — the exact
+        #    location a prior, since-abandoned dispatch would have left
+        #    behind — with an OLD (fake) base_commit and a stale iteration
+        #    log entry, BEFORE the workflow creates its own fresh worktree.
+        worktree_path_to_be = git_ops.worktree_base / task_assignment.task_id
+        stale_artifacts = TaskArtifacts(worktree_path_to_be)
+        old_base = 'f' * 40
+        stale_artifacts.init(
+            task_assignment.task_id, task_assignment.task['title'],
+            task_assignment.task['description'], base_commit=old_base,
+        )
+        stale_artifacts.append_iteration_log({
+            'iteration': 1, 'agent': 'implementer', 'source': 'orchestrator',
+            'steps_attempted': [], 'steps_completed': [],
+            'commit': old_base, 'summary': 'No new steps completed',
+        })
+
+        # 2. Build a workflow with worktree=None so _setup_worktree_and_artifacts
+        #    performs its own real git_ops.create_worktree — a genuinely fresh
+        #    fork point, guaranteed to differ from the fake OLD base_commit.
+        stub = AgentStub()
+        workflow, _scheduler, _queue = _build_workflow_no_merge_worker(
+            config, git_ops, task_assignment, stub, tmp_path,
+        )
+
+        await workflow._setup_worktree_and_artifacts(task_assignment.task_id)
+
+        # 3. Preconditions: this genuinely was a base change, and the wipe
+        #    guard's inputs are what we think they are.
+        assert workflow._old_plan_base == old_base
+        assert workflow._base_commit != old_base
+        assert not workflow._worktree_external
+
+        # 4. The stale log must be gone — not merely unread, but wiped, so
+        #    a subsequent append starts from a clean slate.
+        assert workflow.artifacts is not None
+        entries, corrupted = workflow.artifacts.read_iteration_log()
+        assert entries == [] and corrupted == [], (
+            f'Expected iterations.jsonl to be wiped on re-dispatch onto a new '
+            f'base, but found entries={entries!r} corrupted={corrupted!r}'
+        )
+
+    async def test_redispatch_preserves_iteration_log_when_base_unchanged(
+        self, config, git_ops, task_assignment, tmp_path,
+    ):
+        """OLD base_commit == NEW base_commit (same-base crash-resume) must
+        NOT wipe iterations.jsonl — the in-flight implementer's progress log
+        must survive so the resumed run can see prior steps.
+        """
+        # 1. The fresh worktree's base_commit will be the current main tip
+        #    (no remote configured — _freshen_main falls back to local main).
+        #    Seed the sibling .task-meta/<task_id> root with THAT SAME sha as
+        #    the OLD base_commit, so create_worktree's fresh base matches it
+        #    exactly (same-base crash-resume, not a re-dispatch).
+        main_sha = await git_ops.get_main_sha()
+        worktree_path_to_be = git_ops.worktree_base / task_assignment.task_id
+        stale_artifacts = TaskArtifacts(worktree_path_to_be)
+        stale_artifacts.init(
+            task_assignment.task_id, task_assignment.task['title'],
+            task_assignment.task['description'], base_commit=main_sha,
+        )
+        stale_artifacts.append_iteration_log({
+            'iteration': 1, 'agent': 'implementer', 'source': 'orchestrator',
+            'steps_attempted': ['step-1'], 'steps_completed': ['step-1'],
+            'commit': main_sha, 'summary': 'Completed step-1',
+        })
+
+        # 2. Build a workflow with worktree=None so _setup_worktree_and_artifacts
+        #    performs its own real git_ops.create_worktree.
+        stub = AgentStub()
+        workflow, _scheduler, _queue = _build_workflow_no_merge_worker(
+            config, git_ops, task_assignment, stub, tmp_path,
+        )
+
+        await workflow._setup_worktree_and_artifacts(task_assignment.task_id)
+
+        # 3. Precondition: this genuinely is the same-base case.
+        assert workflow._old_plan_base == main_sha
+        assert workflow._base_commit == main_sha
+
+        # 4. The in-flight log must survive untouched.
+        assert workflow.artifacts is not None
+        entries, corrupted = workflow.artifacts.read_iteration_log()
+        assert corrupted == []
+        assert len(entries) == 1, (
+            f'Expected the seeded entry to survive a same-base re-dispatch, '
+            f'got entries={entries!r}'
+        )
+        assert entries[0]['steps_completed'] == ['step-1']
+
+
+# ---------------------------------------------------------------------------
 # Tests: pre-PLAN recovery in workflow.run
 # ---------------------------------------------------------------------------
 
@@ -4530,7 +4902,7 @@ class TestRecoverIfAlreadyMerged:
 class TestRunPrePlanRecovery:
     """workflow.run returns DONE on already-merged branches via the two-guard model.
 
-    After the SHA-primary fix (Option B), recovery uses two guards:
+    Recovery uses two guards:
 
     1. Pre-PLAN guard (_recover_if_already_merged, called before the architect):
        uses SHA-primary (wt_head != base_commit) to reject stale states.  If the
@@ -4539,42 +4911,55 @@ class TestRunPrePlanRecovery:
        returns None and the workflow falls through to PLAN.  This prevents
        false-DONE when a fresh worktree has no implementation work.
 
-    2. Pre-EXECUTE guard (workflow.py:412-457, called after PLAN):
-       uses the iteration-log fallback (no wt_head passed).  This is the backstop
-       that detects rebased ghost-loops: if create_worktree rebased a
+    2. Pre-EXECUTE guard (_recover_before_execute, called after PLAN):
+       gates on a REAL branch-content diff, base_commit..wt_head (task 2372,
+       Layer C) — NOT the iteration log.  If create_worktree rebased a
        genuinely-implemented branch so that wt_head == new_base_commit, the
-       pre-PLAN guard returns None, the architect runs (one wasted invocation —
-       explicitly accepted trade-off), and then the pre-EXECUTE guard finds the
-       committed implementer entry and routes to the SUCCESS path without calling
-       the implementer.
+       diff is empty regardless of any iteration-log entries: the guard
+       returns None and the workflow proceeds to EXECUTE, re-invoking the
+       implementer (a wasted-looking but self-correcting invocation) rather
+       than trusting a heuristic that cannot distinguish a genuine rebased
+       merge from the task 2125/2315/2340 phantom-done poison shape. A merge
+       that IS journal-covered (the common case — the workflow's own MERGE
+       phase always binds the journal) still skips straight to DONE via the
+       journal-first check, before this fallback is ever reached.
 
-    Net invariant: DONE is always reached; implementer is never called on an
-    already-merged branch; at most one architect invocation is wasted.
+    Net invariant: DONE is always reached; at most one architect invocation
+    is wasted; the implementer may be re-invoked (not skipped) when the
+    branch-diff gate is empty and no journal binding covers the merge.
     """
 
-    async def test_run_returns_done_via_pre_execute_ghost_loop_guard(
+    async def test_run_reexecutes_via_pre_execute_guard_when_no_journal_and_empty_diff(
         self, config, git_ops, task_assignment, monkeypatch
     ):
-        """workflow.run exits DONE (via pre-EXECUTE guard) on a merged branch.
+        """workflow.run reaches DONE by re-executing on a rebased-merged
+        branch with no journal binding (task 2372, Layer C).
 
         Set up: pre-create a worktree, stamp iterations.jsonl with an
-        implementer entry, commit a real file, merge to main.
+        implementer entry, commit a real file, merge to main — mirrors the
+        pre-task-2372 "ghost loop" scenario (see the sibling fix in
+        ``TestGhostLoopGuard.test_rebased_ghost_loop_with_no_journal_reexecutes_instead_of_skipping``).
 
-        Behaviour change after the SHA-primary fix (Option B):
+        Behaviour:
         - The pre-PLAN _recover_if_already_merged() call uses wt_head passed
           to _has_prior_implementation().  At that point artifacts.init() has
           already written base_commit = current HEAD, so wt_head == base_commit
           → SHA-primary → has_work=False → returns None.
         - The workflow therefore enters the PLAN phase and the architect IS
-          invoked (one wasted invocation — explicitly accepted trade-off; see
-          the design decisions in the task plan).
-        - After PLAN, the pre-EXECUTE ghost-loop guard (workflow.py:412-457)
-          still uses the iteration-log fallback (no wt_head passed), finds the
-          committed implementer entry, sees wt_head is already on main →
-          has_work=True → skips EXECUTE → falls through to the SUCCESS path →
-          marks DONE.
+          invoked (one wasted invocation — pre-existing accepted trade-off).
+        - After PLAN, the pre-EXECUTE guard's branch-content-diff gate
+          (task 2372, Layer C) sees base_commit..wt_head is empty — the
+          rebase collapsed wt_head onto base_commit — regardless of the
+          iteration-log entry, and there is no journal binding either. The
+          guard returns None and the workflow proceeds to EXECUTE, where the
+          implementer IS called and completes the plan normally; VERIFY/
+          REVIEW/MERGE (mocked green) carry the run to DONE via the
+          ordinary completion path.
 
-        Net: outcome == DONE, architect called once, implementer NOT called.
+        Net: outcome == DONE, architect called once, implementer IS called
+        (the accepted trade-off — a wasted-looking but self-correcting
+        re-execution, in exchange for no longer trusting a spoofable
+        iteration-log entry as proof of a genuine prior merge).
         """
         import json as _json
 
@@ -4585,7 +4970,10 @@ class TestRunPrePlanRecovery:
         task_dir.mkdir(parents=True, exist_ok=True)
         (task_dir / 'plan.json').write_text(json.dumps(PLAN, indent=2) + '\n')
         (task_dir / 'iterations.jsonl').write_text(
-            _json.dumps({'agent': 'implementer', 'iteration': 1, 'steps_attempted': []}) + '\n'
+            _json.dumps({
+                'agent': 'implementer', 'iteration': 1,
+                'steps_attempted': ['s1'], 'steps_completed': ['s1'],
+            }) + '\n'
         )
         (wt / 'pre_plan_recovery.py').write_text('def work():\n    return 42\n')
         await git_ops.commit(wt, 'Implement feature (pre-plan recovery test)')
@@ -4595,18 +4983,11 @@ class TestRunPrePlanRecovery:
         if result.merge_worktree:
             await git_ops.cleanup_merge_worktree(result.merge_worktree)
 
-        # 2. Build workflow with a stub that raises if implementer called.
-        #    NOTE: architect is NOT overridden — it IS called now (one wasted
-        #    invocation after the SHA-primary fix); the pre-EXECUTE guard
-        #    catches the ghost-loop and prevents the implementer from running.
-        class _NoCallStub(AgentStub):
-            async def _implementer(self, cwd):
-                raise AssertionError(
-                    'implementer must NOT be called when branch is already on main '
-                    '— the pre-EXECUTE ghost-loop guard should short-circuit EXECUTE'
-                )
-
-        stub = _NoCallStub()
+        # 2. Build workflow with a plain stub — the implementer WILL be
+        #    called (Layer C no longer trusts the iteration log alone) and
+        #    must complete normally so the run can reach DONE via EXECUTE/
+        #    VERIFY/REVIEW/MERGE.
+        stub = AgentStub()
         workflow, scheduler = _build_workflow(config, git_ops, task_assignment, stub)
         monkeypatch.setattr('orchestrator.workflow.invoke_agent', stub.invoke_agent)
         monkeypatch.setattr(
@@ -4617,21 +4998,24 @@ class TestRunPrePlanRecovery:
             )),
         )
 
-        # 3. Run workflow — enters PLAN (architect runs once), then pre-EXECUTE
-        #    guard detects the already-merged branch and routes to SUCCESS.
+        # 3. Run workflow — enters PLAN (architect runs once), then the
+        #    pre-EXECUTE guard's branch-diff gate is empty (no journal
+        #    binding either), so the workflow proceeds to EXECUTE and
+        #    completes normally.
         outcome = await workflow.run()
 
-        # 4. Assert DONE; architect WAS called (once), implementer was NOT called.
+        # 4. Assert DONE; architect called once, implementer IS called.
         assert outcome == WorkflowOutcome.DONE, (
             f'Expected DONE but got {outcome!r}'
         )
         assert stub.calls.count('architect') == 1, (
-            f'architect should have been called exactly once (SHA-primary fix trade-off — '
-            f'bounded cost invariant): {stub.calls}'
+            f'architect should have been called exactly once (pre-PLAN '
+            f'SHA-primary trade-off — bounded cost invariant): {stub.calls}'
         )
-        assert 'implementer' not in stub.calls, (
-            f'implementer must NOT be called — pre-EXECUTE ghost-loop guard should '
-            f'have prevented it: {stub.calls}'
+        assert 'implementer' in stub.calls, (
+            f'implementer SHOULD be called — the pre-EXECUTE guard no longer '
+            f'trusts the (spoofable) iteration log without a real branch-diff '
+            f'(task 2372, Layer C accepted trade-off): {stub.calls}'
         )
 
     async def test_run_proceeds_to_plan_when_recovery_returns_none(

@@ -308,6 +308,109 @@ class TestRecoverIfAlreadyMerged:
 
 
 # ---------------------------------------------------------------------------
+# Tests: TaskWorkflow._has_prior_implementation per-entry classification
+# (Layer A, task 2372 — recurrence class 2125/2315/2340)
+# ---------------------------------------------------------------------------
+
+# Each case: (iteration-log entry, expected has_work). Covers the entry
+# shapes actually written by the codebase (see workflow.py:4443 main
+# implementer, :4559 judge early_exit, :5218 debugger, :5443 amendment
+# implementer) plus the exact task-2125 poison shape (zero-work implementer
+# entry with no 'source' key).
+_CLASSIFICATION_CASES = [
+    pytest.param(
+        {
+            'agent': 'implementer', 'source': 'orchestrator',
+            'steps_attempted': [], 'steps_completed': [],
+            'commit': 'oldbase',
+        },
+        False,
+        id='zero_work_main_implementer',
+    ),
+    pytest.param(
+        {
+            'iteration': 1, 'agent': 'implementer',
+            'steps_attempted': [], 'steps_completed': [],
+            'commit': '3bbdf8a1', 'summary': 'No new steps completed',
+        },
+        False,
+        id='task_2125_poison_no_source_key',
+    ),
+    pytest.param(
+        {'agent': 'debugger', 'steps_completed': []},
+        True,
+        id='debugger_hardcoded_empty_steps_completed',
+    ),
+    pytest.param(
+        {'agent': 'implementer', 'source': 'amendment', 'amendment_round': 1},
+        True,
+        id='amendment_implementer_omits_steps_completed',
+    ),
+    pytest.param(
+        {'agent': 'judge', 'event': 'early_exit', 'substantive_work': True},
+        True,
+        id='judge_early_exit_substantive',
+    ),
+    pytest.param(
+        {'agent': 'judge', 'event': 'early_exit', 'substantive_work': False},
+        False,
+        id='judge_early_exit_not_substantive',
+    ),
+    pytest.param(
+        {
+            'agent': 'implementer', 'source': 'orchestrator',
+            'steps_attempted': ['s1'], 'steps_completed': ['s1'],
+            'commit': 'newhead',
+        },
+        True,
+        id='main_implementer_nonempty_steps_completed',
+    ),
+]
+
+
+@pytest.mark.asyncio
+class TestHasPriorImplementationClassification:
+    """Per-entry classification for the iteration-log fallback (task 2372,
+    Layer A). The classifier must exclude ONLY the narrow zero-work
+    implementer signature (``agent=='implementer' AND source!='amendment'
+    AND not steps_completed``) while still counting debugger entries
+    (which hard-code ``steps_completed:[]``), amendment-implementer entries
+    (which omit ``steps_completed`` entirely), and judge ``early_exit``
+    entries with ``substantive_work=True``.
+
+    Each case is checked via both call shapes of
+    ``_has_prior_implementation``: the bare fallback (no ``wt_head`` — used
+    by the pre-EXECUTE and pre-MERGE guards) and the SHA-primary path
+    (``wt_head`` supplied and diverging from ``base_commit='oldbase'`` —
+    isolates the iteration-log term of the ``sha_diverges AND
+    has_iter_log_work`` conjunction, since sha_diverges=True here makes
+    has_work reduce to exactly has_iter_log_work).
+    """
+
+    @pytest.mark.parametrize('entry, expected_has_work', _CLASSIFICATION_CASES)
+    async def test_bare_fallback_classification(
+        self, tmp_path: Path, entry: dict, expected_has_work: bool,
+    ):
+        f = _make(worktree=tmp_path / 'wt', project_root=tmp_path / 'proj')
+        f.artifacts.append_iteration_log(dict(entry))
+
+        status = f.wf._has_prior_implementation()
+
+        assert status.has_work is expected_has_work
+
+    @pytest.mark.parametrize('entry, expected_has_work', _CLASSIFICATION_CASES)
+    async def test_sha_primary_classification_isolates_iter_log_term(
+        self, tmp_path: Path, entry: dict, expected_has_work: bool,
+    ):
+        f = _make(worktree=tmp_path / 'wt', project_root=tmp_path / 'proj')
+        f.artifacts.append_iteration_log(dict(entry))
+
+        status = f.wf._has_prior_implementation(wt_head='newhead-diverged')
+
+        assert status.has_work is expected_has_work
+
+
+# ---------------------------------------------------------------------------
 # Tests: TaskWorkflow._recover_before_execute (Guard 2, extracted pre-EXECUTE)
 # ---------------------------------------------------------------------------
 
@@ -370,15 +473,14 @@ class TestRecoverBeforeExecute:
     async def test_journal_miss_on_main_with_prior_work_falls_back_to_found_on_main(
         self, tmp_path: Path,
     ):
-        """Journal miss + on-main + prior implementation work (iteration-log
-        fallback, no wt_head) → fallback DONE."""
+        """Journal miss + on-main + non-empty branch-content diff (Layer C,
+        task 2372: the ground-truth `git diff base..wt_head` gate) → fallback
+        DONE."""
         f = _make(worktree=tmp_path / 'wt', project_root=tmp_path / 'proj')
         f.wf._check_branch_on_main = AsyncMock(  # type: ignore[method-assign]
             return_value=('wthead123', 'mainsha123'),
         )
-        f.wf._has_prior_implementation = MagicMock(  # type: ignore[method-assign]
-            return_value=_PriorImplStatus(has_work=True, entries=[], base_commit=None),
-        )
+        f.wf.git_ops.get_merge_diff_files = AsyncMock(return_value=(['a.py'], None))
 
         outcome = await f.wf._recover_before_execute()
 
@@ -388,28 +490,56 @@ class TestRecoverBeforeExecute:
             f.wf.task_id, kind='found_on_main', sha='mainsha123',
             note='branch already on main at workflow start (pre-EXECUTE recovery)',
         )
-        # WT_HEAD INTENTIONALLY OMITTED for this guard (see
-        # _has_prior_implementation docstring) — called with no arguments.
-        f.wf._has_prior_implementation.assert_called_once_with()
 
     async def test_journal_miss_on_main_with_no_prior_work_returns_none(
         self, tmp_path: Path,
     ):
-        """Journal miss + on-main + no prior work → no recovery, proceed
-        normally (stale branch point, not a real ghost loop)."""
+        """Journal miss + on-main + EMPTY branch-content diff (Layer C, task
+        2372) → no recovery, proceed normally — a fresh/re-dispatched
+        worktree (wt_head trivially an ancestor of main) or a stale branch
+        point must never false-DONE regardless of iteration-log contents."""
         f = _make(worktree=tmp_path / 'wt', project_root=tmp_path / 'proj')
         f.wf._check_branch_on_main = AsyncMock(  # type: ignore[method-assign]
             return_value=('wthead123', 'mainsha123'),
         )
-        f.wf._has_prior_implementation = MagicMock(  # type: ignore[method-assign]
-            return_value=_PriorImplStatus(has_work=False, entries=[], base_commit=None),
-        )
+        f.wf.git_ops.get_merge_diff_files = AsyncMock(return_value=([], None))
 
         outcome = await f.wf._recover_before_execute()
 
         assert outcome is None
         assert f.wf._merge_recovery_basis is None
         f.mark_done.assert_not_awaited()
+
+    async def test_found_on_main_recovery_stamps_nonempty_metadata_files(
+        self, tmp_path: Path,
+    ):
+        """ACTION #2: a pre-EXECUTE found_on_main recovery-DONE must stamp
+        metadata.files with the real branch-diff files, never an empty list.
+
+        Task 2125's phantom-done stamped ``metadata.files=[]`` — precisely
+        what let it slip the reconciliation gate undetected.  Deriving files
+        from the same branch-diff gate that authorizes the recovery (Layer
+        C) closes that hole structurally: an empty diff now means NO
+        recovery at all (see the prior test), so a found_on_main DONE from
+        this guard always carries non-empty, real evidence.
+        """
+        f = _make(worktree=tmp_path / 'wt', project_root=tmp_path / 'proj')
+        f.wf._check_branch_on_main = AsyncMock(  # type: ignore[method-assign]
+            return_value=('wthead123', 'mainsha123'),
+        )
+        f.wf.git_ops.get_merge_diff_files = AsyncMock(
+            return_value=(['pkg/a.py', 'pkg/b.py'], None),
+        )
+
+        outcome = await f.wf._recover_before_execute()
+
+        assert outcome == WorkflowOutcome.DONE
+        f.update_task.assert_awaited_once()
+        args, _kwargs = f.update_task.await_args
+        assert args[0] == f.wf.task_id
+        metadata = args[1]
+        assert metadata['files'], f'Expected non-empty files, got {metadata["files"]!r}'
+        assert set(metadata['files']) == {'pkg/a.py', 'pkg/b.py'}
 
     async def test_journal_miss_not_on_main_returns_none(self, tmp_path: Path):
         """Journal miss + branch not on main → no recovery, no fallback probe."""
@@ -609,12 +739,14 @@ class TestNoPhantomDoneProperty:
         assert f1.wf._merge_recovery_basis is None
         f1.mark_done.assert_not_awaited()
 
-        # Guard 2: _recover_before_execute — on-main, no prior work.
+        # Guard 2: _recover_before_execute — on-main, EMPTY branch-content
+        # diff (Layer C, task 2372 — this guard no longer consults
+        # _has_prior_implementation at all).
         f2 = _make(worktree=tmp_path / 'wt2', project_root=tmp_path / 'proj2')
         f2.wf._check_branch_on_main = AsyncMock(  # type: ignore[method-assign]
             return_value=('wthead123', 'mainsha123'),
         )
-        f2.wf._has_prior_implementation = MagicMock(return_value=no_work)  # type: ignore[method-assign]
+        f2.wf.git_ops.get_merge_diff_files = AsyncMock(return_value=([], None))
         outcome2 = await f2.wf._recover_before_execute()
         assert outcome2 is None
         assert f2.wf._merge_recovery_basis is None
