@@ -598,6 +598,16 @@ def managed_runtime_data_dirs(project_id: str) -> tuple[Path, Path]:
     Rooted under ``${XDG_STATE_HOME:-~/.local/state}/dark-factory/<project_id>/``
     — outside any watched project's tree — and keyed by project_id so
     multiple managed instances never collide.
+
+    Wider blast radius, intentionally: fused-memory derives its
+    reconciliation *escalation* queue from the same var —
+    ``escalation_queue_dir: "${RECONCILIATION_DATA_DIR:./data/reconciliation}/escalations"``
+    (fused-memory/config/config.yaml) — so ``recon_dir`` here also relocates
+    that escalation queue out of ``<project>/data/reconciliation/escalations``
+    and into the XDG-rooted path. This is deliberate (task 2439's scope
+    treats reconciliation.db/tickets.db/escalations as one pollution class,
+    not just the queue DB); any tooling that globs the old project-relative
+    escalations path needs to point at the new XDG-rooted one instead.
     """
     base = Path(os.environ.get('XDG_STATE_HOME') or (Path.home() / '.local' / 'state'))
     root = base / 'dark-factory' / project_id
@@ -644,6 +654,8 @@ class McpLifecycle:
             # Redirect the managed fused-memory's runtime queue/reconciliation
             # SQLite state out of this (watched) project's tracked tree — task
             # 2439. env.setdefault() honors an operator-preset override.
+            # RECONCILIATION_DATA_DIR also relocates the recon *escalation*
+            # queue (see managed_runtime_data_dirs() docstring) — intentional.
             q_dir, r_dir = managed_runtime_data_dirs(self.config.project_id)
             env = dict(os.environ)
             env.setdefault('QUEUE_DATA_DIR', str(q_dir))
