@@ -1644,6 +1644,104 @@ def _significant_terms(text: str) -> set[str]:
     return {t for t in tokens if len(t) >= 3 and t not in _STOPWORDS}
 
 
+def _is_systemic_pattern_candidate(flag: dict[str, Any]) -> bool:
+    """Return True iff *flag* is a never-tracked systemic_pattern candidate.
+
+    A flag qualifies iff its ``category`` OR ``flag_type`` is
+    ``'systemic_pattern'`` (LLM-authored flags may carry the finding kind
+    under either field — checking both is robust to shaping/naming drift,
+    mirroring ``STALE_METADATA_FLAG_TYPES``' both-spellings robustness) AND
+    its ``description`` asserts never-tracked language per
+    :func:`_asserts_never_tracked`.
+
+    Pure, sync, no I/O.
+    """
+    category = flag.get('category')
+    flag_type = flag.get('flag_type')
+    if category != 'systemic_pattern' and flag_type != 'systemic_pattern':
+        return False
+    return _asserts_never_tracked(flag.get('description') or '')
+
+
+async def filter_already_tracked_systemic_patterns(
+    taskmaster: Any,
+    dark_factory_root: str | None,
+    flags: list[dict[str, Any]],
+    *,
+    min_key_terms: int = 4,
+    match_coverage: float = 0.75,
+) -> list[dict[str, Any]]:
+    """Drop systemic_pattern 'never tracked' findings already implemented by a done task.
+
+    Hardens against the e61b38f9/1938 false-positive incident: Stage 1 asserted
+    an idea ("diff project_status_correction cache vs live get_statuses every
+    cycle") was never converted to a tracked task, despite dark_factory task
+    1938 (done, merged 2026-07-01) already implementing it — the false finding
+    spawned duplicate dark_factory task 2412.
+
+    A flag is a CANDIDATE iff :func:`_is_systemic_pattern_candidate` returns
+    True for it.  Non-candidate flags pass through unchanged.
+
+    Fetches done dark_factory tasks ONCE via
+    ``taskmaster.get_tasks(dark_factory_root, statuses=['done'])`` and
+    precomputes each done task's key terms from ``title`` + ``description``
+    (:func:`_significant_terms`).  A candidate is DROPPED iff some done task's
+    key terms cover at least ``match_coverage`` (fraction) of the candidate's
+    own key terms (extracted from its ``description``):
+    ``|finding_terms ∩ task_terms| / |finding_terms|``, maximised over all
+    done tasks.  Order-preserving: surviving flags keep their original
+    relative order.
+
+    NOTE: this is the base matching behaviour only.  Fail-open guards (falsy
+    taskmaster/dark_factory_root, get_tasks errors, malformed results) and the
+    ``min_key_terms`` floor are added in a follow-up hardening pass (see the
+    updated docstring once that lands).
+
+    Args:
+        taskmaster: Object with an async ``get_tasks(project_root, *,
+            statuses=[...])`` method, typically ``self.taskmaster`` in
+            MemoryConsolidator.
+        dark_factory_root: dark_factory's project_root (resolved by the
+            caller from ``self.known_projects[DARK_FACTORY_PROJECT_ID]``).
+        flags: List of flag dicts from Stage 1 ``items_flagged``.
+        min_key_terms: Reserved for a follow-up hardening step; unused so far.
+        match_coverage: Minimum key-term coverage fraction required to drop a
+            candidate (default 0.75).
+
+    Returns:
+        Filtered list with already-tracked systemic_pattern flags removed.
+    """
+    candidate_positions: list[int] = []
+    candidate_terms: list[set[str]] = []
+    for i, flag in enumerate(flags):
+        if _is_systemic_pattern_candidate(flag):
+            candidate_positions.append(i)
+            candidate_terms.append(_significant_terms(flag.get('description') or ''))
+
+    result = await taskmaster.get_tasks(dark_factory_root, statuses=['done'])
+    done_tasks = result.get('tasks') or []
+    task_term_sets = [
+        _significant_terms(f"{task.get('title') or ''} {task.get('description') or ''}")
+        for task in done_tasks
+    ]
+
+    drop_positions: set[int] = set()
+    for pos, finding_terms in zip(candidate_positions, candidate_terms, strict=True):
+        if not finding_terms:
+            continue
+        best_coverage = 0.0
+        for task_terms in task_term_sets:
+            if not task_terms:
+                continue
+            coverage = len(finding_terms & task_terms) / len(finding_terms)
+            if coverage > best_coverage:
+                best_coverage = coverage
+        if best_coverage >= match_coverage:
+            drop_positions.add(pos)
+
+    return [flag for i, flag in enumerate(flags) if i not in drop_positions]
+
+
 # --------------------------------------------------------------------------- #
 # Blocked-snapshot finding filter for Stage 3 (task-1840)
 # --------------------------------------------------------------------------- #
