@@ -125,6 +125,10 @@ def build_spawn_forest(records: list[SessionRecord]) -> list[SpawnTreeNode]:
     return forest
 
 
+_OUTSTANDING_MARKER = '●'
+_OUTSTANDING_BLANK = ' '  # same display width as _OUTSTANDING_MARKER -- keeps columns aligned
+
+
 def _populate(parent: TreeNode[str], node: SpawnTreeNode) -> None:
     """Recursively add *node* (and its subtree) under *parent* (Fleet Cockpit C9a).
 
@@ -135,8 +139,15 @@ def _populate(parent: TreeNode[str], node: SpawnTreeNode) -> None:
     bare session_slug (str) -- never a Display/DisplayTarget -- so this
     stays import-clean of backends; resolving a slug to a focus target is
     the app's job (see cockpit.app.CockpitApp._focus_slug).
+
+    An outstanding node's label (see SpawnTreeNode.outstanding /
+    is_outstanding) is prefixed with _OUTSTANDING_MARKER; a non-outstanding
+    node is prefixed with _OUTSTANDING_BLANK instead, an equal-width blank,
+    so every row's glyph/title columns still line up regardless of which
+    rows are marked.
     """
-    label = f'{state_glyph(node.record.status)} {format_title(node.record)}'
+    marker = _OUTSTANDING_MARKER if node.outstanding else _OUTSTANDING_BLANK
+    label = f'{marker}{state_glyph(node.record.status)} {format_title(node.record)}'
     if node.children:
         tree_node = parent.add(label, data=node.slug, expand=True)
         for child in node.children:
