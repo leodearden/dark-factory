@@ -1452,6 +1452,8 @@ async def _run_post_merge_verify(
     main_health_probe_handles: _MainHealthProbeHandles | None = None,
     depth: int | None = None,
     speculative: bool | None = None,
+    merge_base_sha: str | None = None,
+    main_sha: str | None = None,
 ) -> MergeOutcome | None:
     """Run post-merge verification for a single task.
 
@@ -1524,6 +1526,20 @@ async def _run_post_merge_verify(
         speculative: Mirrors ``item.speculative``; threaded straight into
             ``pool.dispatch`` alongside *depth*.  ``None`` (default) keeps
             every existing caller byte-identical.
+        merge_base_sha: Dispatch-time merge-base SHA (task 2383 β, 2357:
+            caller-supplied, never re-derived here).  Paired with *main_sha*
+            to classify a non-preexisting task-fault failure via
+            :func:`_classify_disposition_for_outcome`, attaching
+            ``disposition``/``failure_diagnostic`` to the returned
+            :class:`MergeOutcome` and appending the rendered reason_suffix.
+            ``None`` (default) skips classification entirely — the train
+            (``_do_train_merge``) and solo (``reverify_member_solo``)
+            callers pass nothing and stay byte-identical (disposition stays
+            ``MergeOutcome``'s ``INDETERMINATE`` default, no
+            ``failure_diagnostic``).
+        main_sha: Dispatch-time main SHA (``item.base_sha``) paired with
+            *merge_base_sha*; see above.  Both must be non-``None`` for
+            classification to run.
     """
     # Pre-verify disk guard: if free space is low, prune stale merge
     # worktrees; if still low, skip the build and escalate as transient
@@ -1767,6 +1783,28 @@ async def _run_post_merge_verify(
             reason = f'{reason} [category: {verify.category}]'
         if detail:
             reason = f'{reason}\n\n{detail}'
+        # Merge-skew attribution (task 2383 β, M2 of
+        # plans/merge-skew-attribution-prd.md): classify this non-preexisting
+        # (I1: the main-health probe above already returned None) task-fault
+        # failure when the caller supplied dispatch-time base facts.  Absent
+        # base facts (default None — the train and solo-reverify callers pass
+        # nothing) skips classification entirely: disposition stays
+        # MergeOutcome's INDETERMINATE default and failure_diagnostic stays
+        # None, byte-identical to pre-β behaviour (I3).  Runs BEFORE the
+        # dry-run spawn below so the enriched reason (with the 'port landed
+        # commit ... do not hunt your own diff' suffix) flows into the
+        # debugger's dry-run context too.
+        disposition = MergeFailureDisposition.INDETERMINATE
+        failure_diagnostic: dict[str, str] | None = None
+        if merge_base_sha is not None and main_sha is not None:
+            disposition, failure_diagnostic, reason_suffix = (
+                await _classify_disposition_for_outcome(
+                    verify, req=req, merge_base_sha=merge_base_sha,
+                    main_sha=main_sha, event_store=event_store,
+                )
+            )
+            if reason_suffix:
+                reason = f'{reason}\n\n{reason_suffix}'
         # Loop-breaker bookkeeping: bump only when the failure was a
         # pure timeout.  Real test/lint/type failures already bubble
         # up to the steward and don't drive the re-queue oscillation
@@ -1810,6 +1848,8 @@ async def _run_post_merge_verify(
             'blocked', reason=reason,
             failure_category=verify.category,
             failure_cause_hint=verify.cause_hint,
+            disposition=disposition,
+            failure_diagnostic=failure_diagnostic,
         )
 
     return None
