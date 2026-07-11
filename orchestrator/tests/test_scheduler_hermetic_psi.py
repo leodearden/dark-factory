@@ -83,8 +83,13 @@ class TestIdlePsiSampleNeutralizesAdmissionGate:
         )
 
         # Phase B: idle_psi_sample() neutralizes the gate — the identical
-        # candidate now dispatches on a fresh scheduler.
+        # candidate now dispatches on a fresh scheduler. ``_dispatched`` is
+        # seeded identically to Phase A so min_inflight_floor is still met
+        # and the gate stays *engaged* (psi_in_flight >= floor); otherwise
+        # dispatch would succeed merely because the floor wasn't met, and
+        # this phase would prove nothing about idle_psi_sample specifically.
         scheduler2 = Scheduler(OrchestratorConfig(max_per_module=1))
+        scheduler2._dispatched.add('inflight')  # meets default min_inflight_floor=1
         scheduler2._read_psi_sample = idle_psi_sample
         scheduler2.get_tasks = AsyncMock(return_value=[task])
 
