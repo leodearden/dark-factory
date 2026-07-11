@@ -126,6 +126,21 @@ class TestCreatePlan:
         plan = artifacts.read_plan()
         assert plan['files'] == ['mod/a.py', 'mod/b.py']
 
+    def test_dropped_files_returns_actionable_error(self, artifacts):
+        """When `files` arrives as None (the harness dropped it entirely —
+        the 'Missing required argument' symptom, task 2428), _create_plan
+        must return an actionable error naming the reliable split-call
+        workaround rather than silently writing an empty-files plan."""
+        result = _create_plan(artifacts, 'test-1', 'T', 'A', None)
+        assert result['status'] == 'error'
+        assert 'update_plan_metadata' in result['message']
+        assert (
+            'placeholder' in result['message'].lower()
+            or 'short' in result['message'].lower()
+        )
+
+        assert artifacts.read_plan() == {}
+
 
 class TestAddPlanStep:
     def test_appends_step(self, artifacts):
@@ -807,3 +822,26 @@ class TestCreatePlanToolRecoversMisserializedFiles:
 
         plan = artifacts.read_plan()
         assert plan['files'] == ['mod/a.py', 'mod/b.py']
+
+
+@pytest.mark.asyncio
+class TestCreatePlanToolDroppedFiles:
+    """create_plan tolerates a fully-dropped files arg — the harness's
+    'Missing required argument' symptom (task 2428) — by returning an
+    actionable structured error instead of crashing pydantic validation.
+    """
+
+    async def test_missing_files_key_returns_structured_error(self, artifacts):
+        server = plan_tools.create_server(artifacts)
+        tool = await server.get_tool('create_plan')
+        assert tool is not None
+
+        result = await tool.run({
+            'task_id': 'test-1',
+            'title': 'Test task',
+            'analysis': _TRIGGER_ANALYSIS,
+            # 'files' deliberately omitted — the dropped-arg shape.
+        })
+
+        assert result.structured_content['status'] == 'error'
+        assert artifacts.read_plan() == {}
