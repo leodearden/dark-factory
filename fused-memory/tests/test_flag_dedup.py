@@ -406,6 +406,12 @@ async def test_dedup_flags_retires_mem0_marker_mirror(ledger_memory_service):
     but ``dedup_flags`` no longer calls ``add_memory`` to mirror it to Mem0.
     The ledger row is already reaped each cycle by
     ``ReconLedgerStore.gc()``, so no periodic collector is needed for it.
+
+    A second cycle of the SAME signature is included (amendment,
+    reviewer_comprehensive finding #1) to pin the read-FROM-ledger dedup
+    path specifically: ``persisted_from_run`` must still be annotated from
+    the ledger row the first cycle wrote, with the mirror staying uncalled
+    across both cycles — there is no Mem0 fallback of any kind involved.
     """
     from fused_memory.reconciliation.flag_dedup import dedup_flags
 
@@ -427,6 +433,52 @@ async def test_dedup_flags_retires_mem0_marker_mirror(ledger_memory_service):
 
     # (b) The best-effort Mem0 marker mirror is retired — never called.
     ledger_memory_service.add_memory.assert_not_called()
+
+    # (c) A second cycle of the same signature reads persisted_from_run back
+    # from the ledger row alone — the only possible source now that no Mem0
+    # fallback exists — and the mirror stays uncalled across both cycles.
+    result2 = await dedup_flags(
+        memory_service=ledger_memory_service,
+        project_id='p',
+        run_id='r2',
+        flags=flags,
+    )
+    assert result2[0]['persisted_from_run'] == 'r1'
+    assert result2[0]['last_seen_run_id'] == 'r2'
+    ledger_memory_service.add_memory.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_dedup_flags_marker_noop_when_ledger_unset():
+    """When ``memory_service.recon_ledger`` is unset/``None`` (ledger disabled
+    or not yet wired), the marker path degrades to a pure no-op (amendment,
+    reviewer_comprehensive finding #2) rather than falling back to a Mem0
+    mirror write — there is no longer a mirror fallback for markers. The flag
+    is returned unchanged (no ``persisted_from_run`` can be computed without a
+    ledger to read), ``dedup_flags`` does not raise, and ``add_memory`` is
+    never called.
+    """
+    from fused_memory.reconciliation.flag_dedup import dedup_flags
+
+    memory_service = AsyncMock()
+    memory_service.recon_ledger = None
+
+    flags = [{'task_id': '77', 'flag_type': 'missing_deliverable', 'description': 'x'}]
+
+    result = await dedup_flags(
+        memory_service=memory_service,
+        project_id='p',
+        run_id='r1',
+        flags=flags,
+    )
+
+    assert len(result) == 1
+    assert result[0]['task_id'] == '77'
+    assert 'persisted_from_run' not in result[0]
+    # last_seen_run_id requires no ledger read, so it is still stamped.
+    assert result[0]['last_seen_run_id'] == 'r1'
+
+    memory_service.add_memory.assert_not_called()
 
 
 # ---------------------------------------------------------------------------
