@@ -9,12 +9,15 @@ backend.focus/tile.
 
 Pure-consumer discipline (PRD §2/§5 hard invariant): every refresh/scan/
 select code path here is strictly READ-ONLY over the session and decision
-registries -- nothing in the refresh path calls write_record/write_decision/
-update_decision_state/set_manual_boost. The cockpit's ONLY unconditional
-write target is its own cockpit-ui.json (via cockpit.ui_config); C5b's
-explicit-action keybindings (boost/drop) add sanctioned, action-only writes
-to a DECISION's manual_boost/state via C1's set_manual_boost/
-update_decision_state -- see test_app.py's TestWriteDiscipline for the
+registries -- nothing in refresh_registry, _rebuild_queue, or
+_update_attention (the C5b queue-build/reorder/set_urgency path) calls
+write_record/write_decision/update_decision_state/set_manual_boost. The
+cockpit's ONLY unconditional write target is its own cockpit-ui.json (via
+cockpit.ui_config); C5b's explicit-action keybindings (boost/drop) add
+sanctioned, action-only writes to a DECISION's manual_boost/state via C1's
+set_manual_boost/update_decision_state -- see test_app.py's
+TestWriteDiscipline (the C5a session/detail path) and
+TestRefreshWriteDiscipline (the C5b queue/attention path) for the
 end-to-end proof of the refresh-path half of this contract.
 """
 
