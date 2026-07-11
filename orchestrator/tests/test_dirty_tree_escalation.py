@@ -110,3 +110,36 @@ class TestFileDirtyTreeEscalation:
         esc = escs[0]
         assert esc.dedupe_count >= 1
         assert 'src/baz.py' in esc.detail
+
+    @pytest.mark.asyncio
+    async def test_clean_tree_after_dirty_auto_resolves_pending_l2(
+        self, mock_orch_config, tmp_path,
+    ):
+        """Committing/stashing the WIP and restarting must self-close the L2.
+
+        The operator's documented remediation for this escalation is commit
+        or stash the WIP and restart — that must be sufficient on its own;
+        it must not additionally require a manual resolve_issue call to
+        clear the now-stale pending L2.
+        """
+        h = _build_bare_harness(mock_orch_config, tmp_path)
+        h.git_ops.has_dirty_working_tree = AsyncMock(return_value='src/foo.py')
+        await h._file_dirty_tree_escalation(force_dirty_start=False)
+
+        assert h._escalation_queue is not None
+        pending = h._escalation_queue.get_by_task(
+            _DIRTY_TREE_ESCALATION_SENTINEL, status='pending', level=2,
+        )
+        assert len(pending) == 1
+        esc_id = pending[0].id
+
+        # Operator committed/stashed the WIP; the next startup sees a clean tree.
+        h.git_ops.has_dirty_working_tree = AsyncMock(return_value='')
+        await h._file_dirty_tree_escalation(force_dirty_start=False)
+
+        assert h._escalation_queue.get_by_task(
+            _DIRTY_TREE_ESCALATION_SENTINEL, status='pending', level=2,
+        ) == []
+        resolved = h._escalation_queue.get(esc_id)
+        assert resolved is not None
+        assert resolved.status == 'resolved'

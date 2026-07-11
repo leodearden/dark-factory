@@ -5299,14 +5299,29 @@ Output JSON matching the schema. Every task must appear in the output.
         escalated because the process died before it could) — starting
         anyway and escalating loudly replaces that refusal.
 
-        None-safe: a no-op when the tree is clean, when ``force_dirty_start``
-        is set (silent override — no L2 filed), or when ``_escalation_queue``
-        is None (bare-Harness unit tests, or the escalation package missing).
-        The orchestrator never auto-commits/stashes/cleans the dirty WIP —
-        this only reads and escalates.
+        None-safe: a no-op in every branch when ``_escalation_queue`` is None
+        (bare-Harness unit tests, or the escalation package missing).  A
+        dirty tree with ``force_dirty_start`` set is a silent override (no
+        L2 filed).  The orchestrator never auto-commits/stashes/cleans the
+        dirty WIP — this only reads and escalates/resolves.
+
+        Self-closing: a clean tree auto-resolves any L2 this sentinel filed
+        on a prior dirty startup.  The operator's documented remediation is
+        commit-or-stash-and-restart; without this, that remediation would
+        leave the L2 pending forever unless the operator also separately
+        called ``resolve_issue``.
         """
         dirty = await self.git_ops.has_dirty_working_tree()
         if not dirty:
+            if self._escalation_queue is not None:
+                for esc in self._escalation_queue.get_by_task(
+                    _DIRTY_TREE_ESCALATION_SENTINEL, status='pending', level=2,
+                ):
+                    self._escalation_queue.resolve(
+                        esc.id,
+                        'tree now clean at startup',
+                        resolved_by='orchestrator-dirty-tree-guard',
+                    )
             return
         logger.warning(
             'project_root has uncommitted tracked changes at startup:\n%s',
