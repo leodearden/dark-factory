@@ -8,6 +8,7 @@ cyclic parent_session_id must degrade gracefully, never raise or hang.
 
 from __future__ import annotations
 
+import pytest
 from orchestrator import session_registry as sr
 
 
@@ -35,6 +36,15 @@ def _find_node(forest, slug):
         if found is not None:
             return found
     return None
+
+
+def _flatten(forest):
+    """Depth-first flatten *forest* into a list of every node in it."""
+    result = []
+    for node in forest:
+        result.append(node)
+        result.extend(_flatten(node.children))
+    return result
 
 
 class TestBuildSpawnForest:
@@ -148,3 +158,50 @@ class TestOutstandingFlag:
         forest = build_spawn_forest([root, child])
 
         assert _find_node(forest, 'child-1').outstanding is False
+
+
+class TestForestTotality:
+    def test_orphan_child_with_missing_parent_surfaces_as_root(self):
+        """A child whose parent_session_id names a slug NOT in the record
+        set (a vanished/never-registered parent) surfaces as a root rather
+        than silently vanishing."""
+        from cockpit.panes.spawn_tree import build_spawn_forest
+
+        orphan = _make_record(session_slug='orphan-1', parent_session_id='ghost-parent')
+
+        forest = build_spawn_forest([orphan])
+
+        assert [node.slug for node in forest] == ['orphan-1']
+
+    @pytest.mark.timeout(5)
+    def test_self_parented_record_does_not_vanish_or_hang(self):
+        """A record naming itself as its own parent must not infinite-loop
+        and must still appear exactly once in the forest."""
+        from cockpit.panes.spawn_tree import build_spawn_forest
+
+        selfie = _make_record(session_slug='selfie-1', parent_session_id='selfie-1')
+
+        forest = build_spawn_forest([selfie])
+
+        slugs = [node.slug for node in _flatten(forest)]
+        assert slugs == ['selfie-1']
+
+    @pytest.mark.timeout(5)
+    def test_two_cycle_does_not_vanish_or_hang(self):
+        """A 2-cycle (A's parent is B, B's parent is A) must not
+        infinite-loop, and both records must still appear exactly once
+        across the whole forest."""
+        from cockpit.panes.spawn_tree import build_spawn_forest
+
+        a = _make_record(session_slug='cycle-a', parent_session_id='cycle-b')
+        b = _make_record(session_slug='cycle-b', parent_session_id='cycle-a')
+
+        forest = build_spawn_forest([a, b])
+
+        slugs = sorted(node.slug for node in _flatten(forest))
+        assert slugs == ['cycle-a', 'cycle-b']
+
+    def test_empty_input_returns_empty_list(self):
+        from cockpit.panes.spawn_tree import build_spawn_forest
+
+        assert build_spawn_forest([]) == []
