@@ -366,3 +366,90 @@ class TestSignalDontMove:
             assert (target, False) in backend.set_urgency_calls
             assert backend.focus_calls == []
             assert backend.tile_calls == []
+
+
+class TestEnterFocus:
+    @pytest.mark.timeout(10)
+    async def test_enter_focuses_the_highlighted_row_not_row_zero(self, tmp_path):
+        """Explicit-action focus (PRD §6.2/§9 C5b): pressing Enter on the
+        DecisionQueue focuses the HIGHLIGHTED row's resolved target -- never
+        whatever happens to sit at row 0 -- and records that item's key in
+        the app's in-memory "handling" set. This is the ONLY place a focus()
+        call may originate from (see TestSignalDontMove for the refresh
+        path's complementary "never focus" half of the same invariant).
+        """
+        from cockpit.app import CockpitApp
+        from cockpit.backends import DisplayTarget, FakeBackend
+        from cockpit.panes.decision_queue import DecisionQueue
+
+        display_a = sr.Display(kind='wm', wm_title='awaiting-a title')
+        display_b = sr.Display(kind='wm', wm_title='awaiting-b title')
+        awaiting_a = _make_record(
+            session_slug='awaiting-a',
+            status=sr.Status.AWAITING_INPUT,
+            display=display_a,
+            question=sr.Question(text='A?', asked_at='2026-07-07T00:00:00+00:00'),
+        )
+        awaiting_b = _make_record(
+            session_slug='awaiting-b',
+            status=sr.Status.AWAITING_INPUT,
+            display=display_b,
+            question=sr.Question(text='B?', asked_at='2026-07-07T00:00:00+00:00'),
+        )
+        for r in (awaiting_a, awaiting_b):
+            sr.write_record(r, root=tmp_path)
+
+        backend = FakeBackend()
+        app = CockpitApp(fleet_root=tmp_path, backend=backend, poll_interval=0.05)
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            queue = app.query_one(DecisionQueue)
+            assert queue.row_count == 2
+
+            # Identical filed_at/manual_boost/state ties the two sessions'
+            # scores, so order_queue's (-score, key) tiebreak puts
+            # 'session:awaiting-a' at row 0 -- NOT our target below. If the
+            # handler wired Enter to "always focus row 0" instead of the
+            # actual highlighted row, this test would still catch it.
+            assert queue.highlighted_key() == 'session:awaiting-a'
+
+            target_key = 'session:awaiting-b'
+            queue.move_cursor(row=queue.get_row_index(target_key))
+            await pilot.pause()
+
+            await pilot.press('enter')
+            await pilot.pause()
+
+            assert backend.focus_calls == [DisplayTarget(kind='wm', wm_title='awaiting-b title')]
+            assert target_key in app._handling
+
+    @pytest.mark.timeout(10)
+    async def test_enter_on_unresolvable_target_is_fail_soft(self, tmp_path):
+        """A queue row with no resolvable focus target (an open decision
+        with no linked session) must not focus anything and must not raise
+        -- fail-soft, PRD §2. A gone/unlinked lead is still a no-op, never
+        a crash.
+        """
+        from cockpit.app import CockpitApp
+        from cockpit.backends import FakeBackend
+        from cockpit.panes.decision_queue import DecisionQueue
+
+        orphan = sr.DecisionRecord(
+            id='dec-orphan',
+            project='df',
+            text='Orphaned decision?',
+            filed_at='2026-07-07T00:00:00+00:00',
+        )
+        assert sr.write_decision(orphan, root=tmp_path)
+
+        backend = FakeBackend()
+        app = CockpitApp(fleet_root=tmp_path, backend=backend, poll_interval=0.05)
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            queue = app.query_one(DecisionQueue)
+            assert queue.row_count == 1
+
+            await pilot.press('enter')
+            await pilot.pause()
+
+            assert backend.focus_calls == []
