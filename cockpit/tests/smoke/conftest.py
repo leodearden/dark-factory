@@ -160,3 +160,29 @@ def disposable_wm_window():
 
     for window in created:
         _close_window_fail_soft(window.proc, window.title)
+
+
+def _wm_stack_order() -> list[str]:
+    """The managed-window stack: each `wmctrl -l` line's window-id column, in order."""
+    order = []
+    for line in run_command(['wmctrl', '-l']).stdout.splitlines():
+        columns = line.split(None, 1)
+        if columns:
+            order.append(columns[0])
+    return order
+
+
+@pytest.fixture
+def wm_stack_order():
+    return _wm_stack_order
+
+
+def _wm_urgency_set(win_id: str) -> bool:
+    """Whether `xprop -id win_id WM_HINTS` reports the urgency hint bit as set."""
+    stdout = run_command(['xprop', '-id', win_id, 'WM_HINTS']).stdout
+    return 'urgency hint bit is set' in stdout.lower()
+
+
+@pytest.fixture
+def wm_urgency_set():
+    return _wm_urgency_set
