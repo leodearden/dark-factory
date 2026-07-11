@@ -15,7 +15,7 @@ from fused_memory.models.scope import Scope
 from fused_memory.services import memory_service
 from fused_memory.services.memory_service import (
     MemoryService,
-    _is_quota_exhaustion_error,
+    _is_rate_limit_or_quota_error,
     _serialize_temporal,
 )
 
@@ -1873,47 +1873,54 @@ def _make_rate_limit_error(
     return RateLimitError(message, response=response, body=body)
 
 
-class TestIsQuotaExhaustionError:
-    """Classification contract for _is_quota_exhaustion_error (task 2448).
+class TestIsRateLimitOrQuotaError:
+    """Classification contract for _is_rate_limit_or_quota_error (task 2448).
 
-    Pins which exceptions count as embedding-provider quota/rate-limit
-    exhaustion (and therefore trigger get_entity's degraded fallback) versus
-    which must keep propagating as hard errors.
+    Pins which exceptions count as an embedding-provider rate-limit/quota
+    error (and therefore trigger get_entity's degraded fallback) versus
+    which must keep propagating as hard errors. Note the predicate matches
+    ANY openai.RateLimitError or duck-typed status_code==429 — it does not
+    distinguish hard quota exhaustion (insufficient_quota) from a transient,
+    retryable too-many-requests rate limit; both degrade get_entity the same
+    way since it has no retry loop of its own.
     """
 
     def test_real_openai_rate_limit_error_matches(self):
         """A real openai.RateLimitError (429, code=insufficient_quota) matches."""
         exc = _make_rate_limit_error()
-        assert _is_quota_exhaustion_error(exc) is True
+        assert _is_rate_limit_or_quota_error(exc) is True
 
     def test_duck_typed_status_code_429_matches(self):
-        """A non-openai exception with a duck-typed status_code == 429 matches."""
+        """A non-openai exception with a duck-typed status_code == 429 matches,
+        even with no insufficient_quota code/message — this predicate matches
+        transient/retryable 429s too, not just hard quota exhaustion."""
 
         class FakeQuotaError(Exception):
             status_code = 429
 
-        assert _is_quota_exhaustion_error(FakeQuotaError('rate limited')) is True
+        assert _is_rate_limit_or_quota_error(FakeQuotaError('rate limited')) is True
 
     def test_message_containing_insufficient_quota_matches(self):
         """An exception whose str() contains 'insufficient_quota' matches."""
         exc = Exception('insufficient_quota: no credits left')
-        assert _is_quota_exhaustion_error(exc) is True
+        assert _is_rate_limit_or_quota_error(exc) is True
 
     def test_runtime_error_does_not_match(self):
-        """A plain RuntimeError unrelated to quota/rate-limits does not match."""
-        assert _is_quota_exhaustion_error(RuntimeError('search failed')) is False
+        """A plain RuntimeError unrelated to rate-limits/quota does not match."""
+        assert _is_rate_limit_or_quota_error(RuntimeError('search failed')) is False
 
     def test_value_error_does_not_match(self):
-        """A plain ValueError unrelated to quota/rate-limits does not match."""
-        assert _is_quota_exhaustion_error(ValueError('nope')) is False
+        """A plain ValueError unrelated to rate-limits/quota does not match."""
+        assert _is_rate_limit_or_quota_error(ValueError('nope')) is False
 
     def test_cancelled_error_does_not_match(self):
         """asyncio.CancelledError (a BaseException, not an Exception) never matches.
 
-        Cancellation signals must never be classified as a quota error — they
-        are structured-concurrency shutdown signals, not application failures.
+        Cancellation signals must never be classified as a rate-limit/quota
+        error — they are structured-concurrency shutdown signals, not
+        application failures.
         """
-        assert _is_quota_exhaustion_error(asyncio.CancelledError()) is False
+        assert _is_rate_limit_or_quota_error(asyncio.CancelledError()) is False
 
 
 class TestGetEntity:
@@ -2499,8 +2506,12 @@ class TestGetEntity:
         assert service.graphiti.search.call_args.kwargs['num_results'] == 10
 
     # ------------------------------------------------------------------
-    # degraded fallback on embedding-provider quota/rate-limit exhaustion
-    # (task 2448) — mirrors search()'s degraded/failed_stores contract
+    # degraded fallback on embedding-provider rate-limit/quota errors
+    # (task 2448) — response SHAPE mirrors search()'s degraded/failed_stores
+    # convention, but the TRIGGER is narrower: search() degrades on any
+    # per-store Exception, get_entity only on a classified rate-limit/quota
+    # error (see _is_rate_limit_or_quota_error). Everything else still
+    # propagates — see test_non_quota_error_still_propagates below.
     # ------------------------------------------------------------------
 
     @pytest.mark.asyncio

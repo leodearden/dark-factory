@@ -451,7 +451,7 @@ def _edge_to_dict(e: Any) -> dict:
 
 # Defensive: resolve the embedding-provider's RateLimitError class at module
 # load. If the openai SDK is absent or its exception hierarchy is renamed,
-# _is_quota_exhaustion_error still works via its duck-typed fallback checks
+# _is_rate_limit_or_quota_error still works via its duck-typed fallback checks
 # below rather than raising an ImportError.
 try:
     from openai import RateLimitError as _OpenAIRateLimitError
@@ -459,16 +459,25 @@ except Exception:
     _OpenAIRateLimitError = None
 
 
-def _is_quota_exhaustion_error(exc: BaseException) -> bool:
-    """Return True if *exc* represents an embedding-provider quota/rate-limit exhaustion.
+def _is_rate_limit_or_quota_error(exc: BaseException) -> bool:
+    """Return True if *exc* represents an embedding-provider rate-limit or quota error.
 
-    Matches ``openai.RateLimitError`` plus duck-typed equivalents — a
-    ``status_code == 429`` attribute, or ``'insufficient_quota'`` appearing in
-    the error's ``code`` attribute or message — so callers (get_entity's
-    degraded fallback) can classify this condition without a hard dependency
-    on the openai SDK's exact exception hierarchy (e.g. if Graphiti
-    wraps/re-raises the error, or a different embedding provider is
-    configured).
+    Matches ANY ``openai.RateLimitError`` — this covers both hard quota
+    exhaustion (``insufficient_quota``, non-retryable) and transient
+    too-many-requests rate limiting (retryable); the two are not
+    distinguished. Also matches duck-typed equivalents — a
+    ``status_code == 429`` attribute (regardless of code/message), or
+    ``'insufficient_quota'`` appearing in the error's ``code`` attribute or
+    message — so callers (get_entity's degraded fallback) can classify this
+    condition without a hard dependency on the openai SDK's exact exception
+    hierarchy (e.g. if Graphiti wraps/re-raises the error, or a different
+    embedding provider is configured).
+
+    Callers that need to tell hard quota exhaustion apart from a
+    retryable transient rate limit must not rely on this predicate alone —
+    it deliberately treats both as one condition. get_entity's degraded
+    fallback is fine with that because it has no retry loop of its own: on
+    a match it degrades immediately rather than retrying, for either cause.
 
     Never matches a bare BaseException (e.g. ``asyncio.CancelledError``,
     ``KeyboardInterrupt``, ``SystemExit``) — those are structured-concurrency
@@ -2542,13 +2551,18 @@ class MemoryService:
         cancelled 2026-07-09 once the architect confirmed it was expected
         topological-vs-semantic divergence, not a bug.)
 
-        Degraded fallback: if an embedding-provider quota/rate-limit error
+        Degraded fallback: if an embedding-provider rate-limit or quota error
         (openai.RateLimitError or a duck-typed equivalent — see
-        _is_quota_exhaustion_error) is raised by either the exact-match or
+        _is_rate_limit_or_quota_error) is raised by either the exact-match or
         fuzzy-fallback Graphiti calls, this returns the degraded superset
         dict {'nodes': [], 'edges': [], 'degraded': True, 'failed_stores':
-        ['graphiti']} instead of raising — mirroring search()'s
-        degraded/failed_stores contract. All other errors (including
+        ['graphiti']} instead of raising. The RESPONSE SHAPE mirrors
+        search()'s degraded/failed_stores convention, but the TRIGGER is
+        narrower than search()'s: search() degrades on ANY per-store
+        Exception (task 1812), whereas get_entity degrades ONLY on a
+        classified rate-limit/quota error — a Graphiti connection failure,
+        timeout, or other backend error still propagates as a hard
+        exception here, unlike search(). All other errors (including
         asyncio.CancelledError, a BaseException that never reaches this
         except clause) propagate unchanged.
         """
@@ -2621,10 +2635,10 @@ class MemoryService:
 
             return {'nodes': node_data, 'edges': edge_data}
         except Exception as exc:
-            if not _is_quota_exhaustion_error(exc):
+            if not _is_rate_limit_or_quota_error(exc):
                 raise
             logger.warning(
-                'get_entity degraded: embedding-provider quota/rate-limit error for %r: %s',
+                'get_entity degraded: embedding-provider rate-limit/quota error for %r: %s',
                 name,
                 exc,
             )
