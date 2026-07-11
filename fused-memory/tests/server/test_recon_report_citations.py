@@ -714,6 +714,79 @@ class TestCiteTaskInRunCitedTaskDedup:
 
 
 # ---------------------------------------------------------------------------
+# task-2425 step-3: TestCiteTaskFoldKeyClearedOnDelete — RED until step-4
+# routes delete_finding through the shared _purge_finding helper
+# ---------------------------------------------------------------------------
+
+
+class TestCiteTaskFoldKeyClearedOnDelete:
+    """delete_finding must clear the primary-cited-task fold key (task-2425)
+    it registered in ``_run_cited_task_index``, mirroring how it already
+    clears the sig/desc dedup indices. Otherwise a deleted finding leaves a
+    dangling fold-key pointer, and a LATER finding that cites the same
+    external task as its own primary citation wrongly folds into the
+    stale, no-longer-resolvable finding_id instead of succeeding.
+    """
+
+    def _fake_ti(self):
+        known_roots = {'/home/leo/src/dark-factory'}
+        results = {}
+        for pr in known_roots:
+            for tid in ['2405']:
+                results[(tid, pr)] = {'id': tid, 'title': f'T-{tid}'}
+        return _FakeTaskInterceptor(results=results)
+
+    def _make_state(self):
+        from fused_memory.server.recon_report import ReconReportState
+
+        t = [0.0]
+        state = ReconReportState(
+            ttl_seconds=300,
+            clock=lambda: t[0],
+            task_interceptor=self._fake_ti(),
+        )
+        state.known_projects = dict(_KNOWN_PROJECTS)
+        return state, t
+
+    @pytest.mark.asyncio
+    async def test_delete_then_new_primary_citer_of_same_task_succeeds(self):
+        state, _ = self._make_state()
+        state.start_report(run_id='run-1', stage='reconciler', project_id='dark_factory')
+
+        f1 = state.add_finding(
+            run_id='run-1', severity='low', category='cross_project',
+            description='desc one', suggested_action='a',
+            task_id=None, flag_type=None,
+        )
+        fid1 = f1['finding_id']
+
+        cite1 = await state.cite_task('run-1', fid1, 'dark_factory', '2405')
+        assert 'error' not in cite1, cite1
+
+        delete_result = state.delete_finding('run-1', fid1)
+        assert delete_result == {'status': 'deleted', 'finding_id': fid1}
+
+        f2 = state.add_finding(
+            run_id='run-1', severity='low', category='cross_project',
+            description='desc two, worded differently', suggested_action='a',
+            task_id=None, flag_type='some_other_flag',
+        )
+        fid2 = f2['finding_id']
+
+        cite2 = await state.cite_task('run-1', fid2, 'dark_factory', '2405')
+        assert 'error' not in cite2, cite2
+        assert cite2 == {'project_id': 'dark_factory', 'task_id': '2405', 'title': 'T-2405'}
+
+        report = state.get_assembled_report('run-1', 'reconciler')
+        assert report is not None
+        ids = [item['finding_id'] for item in report['flagged_items']]
+        assert ids == [fid2]
+        assert report['flagged_items'][0]['cited_tasks'] == [
+            {'project_id': 'dark_factory', 'task_id': '2405', 'title': 'T-2405'}
+        ]
+
+
+# ---------------------------------------------------------------------------
 # step-7: TestCiteMemory — RED until step-8 adds cite_memory to ReconReportState
 # ---------------------------------------------------------------------------
 
