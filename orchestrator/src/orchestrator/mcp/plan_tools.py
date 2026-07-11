@@ -87,8 +87,9 @@ def _create_plan(
     task_id: str,
     title: str,
     analysis: str,
-    files: list[str],
+    files: list[str] | str | None,
 ) -> dict[str, Any]:
+    files = _coerce_files(files)
     plan = {
         'task_id': task_id,
         'title': title,
@@ -451,7 +452,7 @@ def create_server(artifacts: TaskArtifacts) -> FastMCP:
         task_id: str,
         title: str,
         analysis: str,
-        files: list[str],
+        files: list[str] | str | None = None,
     ) -> dict[str, Any]:
         """Initialize a new implementation plan with metadata.
 
@@ -464,7 +465,10 @@ def create_server(artifacts: TaskArtifacts) -> FastMCP:
             title: Human-readable task title.
             analysis: Your analysis of the task, existing code, and approach.
             files: List of files (or directory paths) this task will create or modify.
-                Drives concurrency locks and the phantom-done gate.
+                Drives concurrency locks and the phantom-done gate. Also
+                tolerates a stringified JSON array or a comma/newline-delimited
+                string, recovering it into a list — a known agent-harness
+                mis-serialization when paired with a large/complex analysis.
         """
         return _create_plan(artifacts, task_id, title, analysis, files)
 
