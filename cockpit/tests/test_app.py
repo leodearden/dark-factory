@@ -1206,6 +1206,24 @@ class TestWeightEditorReordersAndPersists:
         assert persisted.project_weights['beta'] == 100.0
 
 
+class TestWeightEditor:
+    @pytest.mark.timeout(10)
+    async def test_w_key_pushes_weight_editor_screen(self, tmp_path):
+        """'w' (PRD §9 C9b weight editor) pushes a WeightEditorScreen (mirrors
+        TestSpawnBar.test_new_session_key_pushes_spawn_screen)."""
+        from cockpit.app import CockpitApp
+        from cockpit.panes.weight_editor import WeightEditorScreen
+
+        app = CockpitApp(fleet_root=tmp_path, poll_interval=0.05)
+        async with app.run_test() as pilot:
+            await pilot.pause()
+
+            await pilot.press('w')
+            await pilot.pause()
+
+            assert isinstance(app.screen, WeightEditorScreen)
+
+
 class TestSpawnBar:
     @pytest.mark.timeout(10)
     async def test_new_session_key_pushes_spawn_screen(self, tmp_path):
