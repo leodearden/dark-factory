@@ -4759,6 +4759,20 @@ class TestRecoverBeforeExecuteGhostLoop:
         assert prov['commit'] == expected_main_sha, (
             f"Provenance commit {prov['commit']!r} != expected main_sha {expected_main_sha!r}"
         )
+        # ACTION #2 (Layer C): the pre-computed branch diff must be threaded
+        # through override_files into metadata.files — this is what closes
+        # task 2125's phantom-done (which stamped metadata.files=[]).
+        # _reconcile_metadata_files_for_done optimistically sets
+        # self.task['metadata'] before the (fake) scheduler.update_task call,
+        # so we can assert directly against workflow.task here.
+        stamped_files = workflow.task.get('metadata', {}).get('files')
+        assert stamped_files, (
+            f'Expected non-empty metadata.files stamped from the branch diff, '
+            f'got {stamped_files!r}'
+        )
+        assert 'genuinely_merged.py' in stamped_files, (
+            f'Expected genuinely_merged.py in stamped files, got {stamped_files!r}'
+        )
 
 
 @pytest.mark.asyncio
