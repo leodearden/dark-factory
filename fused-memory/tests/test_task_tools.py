@@ -851,6 +851,49 @@ async def test_trigger_reconciliation_without_taskmaster_returns_not_configured(
 
 
 # ------------------------------------------------------------------
+# rebuild_candidate_key_index (task 2402)
+# ------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_rebuild_candidate_key_index_forwards_project_root_and_returns_result(
+    mcp_server_with_tasks, task_interceptor,
+):
+    """rebuild_candidate_key_index forwards project_root to
+    task_interceptor.taskmaster.reaudit_candidate_key_index (the live,
+    on-demand re-run of the self-heal migration) and returns its result
+    dict unchanged."""
+    canned_result = {
+        'index_built': True, 'healed': [], 'flagged': [], 'user_version': 4,
+    }
+    task_interceptor.taskmaster.reaudit_candidate_key_index.return_value = canned_result
+    result = await mcp_server_with_tasks._tool_manager.call_tool(
+        'rebuild_candidate_key_index',
+        {'project_root': '/project'},
+    )
+    task_interceptor.taskmaster.reaudit_candidate_key_index.assert_called_once_with(
+        '/project',
+    )
+    assert result == canned_result
+
+
+@pytest.mark.asyncio
+async def test_rebuild_candidate_key_index_without_taskmaster_returns_not_configured():
+    """rebuild_candidate_key_index without a task_interceptor returns a clear
+    'not configured' error, matching trigger_reconciliation's guard, instead
+    of raising (e.g. AttributeError on ``task_interceptor.taskmaster``)."""
+    mock_service = AsyncMock()
+    server = create_mcp_server(mock_service)  # No task_interceptor
+    result = await server._tool_manager.call_tool(
+        'rebuild_candidate_key_index',
+        {'project_root': '/project'},
+    )
+    assert isinstance(result, dict)
+    assert 'error' in result
+    assert 'not configured' in result['error'].lower()
+
+
+# ------------------------------------------------------------------
 # error_type in exception handler responses
 # ------------------------------------------------------------------
 
