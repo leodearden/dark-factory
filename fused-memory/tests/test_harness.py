@@ -10625,3 +10625,97 @@ class TestMaybeEscalateStaleTaskCountSnapshot:
         await harness._maybe_escalate_stale_task_count_snapshot('test-project', 'run-current', run)
 
         harness._escalate.assert_called_once()
+
+
+# ── Tests for Task 2417: reconciliation freshness pre-check wiring ───────
+
+
+@pytest.mark.asyncio
+async def test_remediation_pass_wires_scope_freshness_precheck(
+    journal, event_buffer, mock_memory_service,
+):
+    """_run_remediation_pass calls precheck_scope_correction_freshness and feeds
+    Stage 1 the FILTERED findings list, not the original.
+
+    Task 2417: the harness-level findings list fed to
+    _configure_consolidator(..., remediation_findings=findings, ...)
+    (harness.py:~2649, attribute set at ~675) is the single choke point shared
+    by both Stage 1 (remediation_findings) and Stage 2 (remediation_mode=True
+    — no findings list of its own) remediation re-derivation, so gating it
+    there covers both stages with one edit.
+    """
+    from fused_memory.reconciliation.harness import TierConfig
+    from fused_memory.reconciliation.scope_freshness import ScopeFreshnessResult
+    from fused_memory.reconciliation.stages.memory_consolidator import MemoryConsolidator
+
+    harness = _make_harness_with_known_projects(
+        journal, event_buffer, mock_memory_service,
+        {'autopilot_video': '/r/av', 'dark_factory': '/r/df'},
+    )
+    stages = harness._make_stages(_scope('autopilot_video', '/r/av'))
+    harness._make_stages = lambda scope, **k: _rescope(stages, scope)
+
+    stage1 = stages[0]
+    assert isinstance(stage1, MemoryConsolidator)
+    for stage in stages:
+        _mock_stage_run(stage)
+
+    findings = _make_s3_findings()[:2]  # two actionable findings
+    kept_finding = findings[1]
+    freshness_result = ScopeFreshnessResult(
+        to_reinvestigate=[kept_finding],
+        skipped=[findings[0]],
+        stats={
+            'scope_freshness_candidates': 1,
+            'scope_freshness_reinvestigated': 1,
+            'scope_freshness_skipped': 1,
+        },
+    )
+    mock_precheck = AsyncMock(return_value=freshness_result)
+
+    tier = TierConfig(model='sonnet', episode_limit=100, memory_limit=200)
+
+    with patch(
+        'fused_memory.reconciliation.harness.precheck_scope_correction_freshness',
+        new=mock_precheck,
+    ):
+        await harness._run_remediation_pass(
+            'autopilot_video',
+            'parent-run-id',
+            findings,
+            tier,
+            scope=_scope('autopilot_video', '/r/av'),
+        )
+
+    mock_precheck.assert_awaited_once()
+    call_kwargs = mock_precheck.await_args.kwargs
+    assert call_kwargs.get('findings') == findings, (
+        'precheck must be called with the ORIGINAL (unfiltered) findings list'
+    )
+    assert call_kwargs.get('project_id') == 'autopilot_video'
+    run_id_arg = call_kwargs.get('run_id')
+    assert isinstance(run_id_arg, str) and run_id_arg, (
+        f'Expected a non-empty run_id string, got {run_id_arg!r}'
+    )
+    resolve_project_root = call_kwargs.get('resolve_project_root')
+    assert callable(resolve_project_root), (
+        'precheck must be given a resolve_project_root callable'
+    )
+    assert resolve_project_root('dark_factory') == '/r/df', (
+        'the injected resolve_project_root must resolve via the harness known-projects registry'
+    )
+
+    # Stage 1 must receive the FILTERED (post-precheck) findings list, not the
+    # original two-item list _run_remediation_pass was called with.
+    assert stage1.remediation_findings == freshness_result.to_reinvestigate, (
+        f'Expected stage1.remediation_findings == {freshness_result.to_reinvestigate!r} '
+        f'(the pre-check-filtered list), got {stage1.remediation_findings!r}'
+    )
+    assert stage1.remediation_findings != findings, (
+        'stage1.remediation_findings must be the FILTERED list, not the original two-item findings'
+    )
+
+    # _resolve_known_root: thin lookup into _known_projects, used to build the
+    # resolve_project_root callable threaded into the pre-check above.
+    assert harness._resolve_known_root('dark_factory') == '/r/df'
+    assert harness._resolve_known_root('nope') is None
