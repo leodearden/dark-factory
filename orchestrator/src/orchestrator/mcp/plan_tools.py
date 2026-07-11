@@ -89,6 +89,18 @@ def _create_plan(
     analysis: str,
     files: list[str] | str | None,
 ) -> dict[str, Any]:
+    if files is None:
+        return {
+            'status': 'error',
+            'message': (
+                'files argument was missing from this create_plan call — a known '
+                'agent-harness mis-serialization defect that occurs when a large '
+                'or complex analysis string accompanies the files array in the '
+                'same call. Workaround: call create_plan again with a SHORT '
+                'placeholder analysis plus the full files array, then set the '
+                'full analysis via update_plan_metadata(analysis=...).'
+            ),
+        }
     files = _coerce_files(files)
     plan = {
         'task_id': task_id,
