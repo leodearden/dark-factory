@@ -470,16 +470,38 @@ class TestManagedRuntimeDataDirs:
     def test_neither_path_is_under_a_sample_project_root(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
     ) -> None:
-        """Regression guard: the returned dirs must never nest under a
-        watched project's root — the pollution this task fixes."""
-        monkeypatch.setenv('XDG_STATE_HOME', str(tmp_path))
+        """Regression guard: with the process cwd set to a watched
+        project's root — exactly how McpLifecycle.start() spawns fused-memory
+        (cwd=str(project_root)) — the returned dirs must still resolve under
+        the XDG state root, not fall back to a CWD-relative path that would
+        nest them inside the project (the pollution this task fixes).
+
+        project_root and XDG_STATE_HOME are both siblings under tmp_path (not
+        an unrelated hard-coded path), and we actually chdir into
+        project_root, so a regression to a relative './data/...' default —
+        which the OS would resolve against cwd — is caught instead of
+        trivially passing."""
+        xdg_home = tmp_path / 'xdg-state'
+        project_root = tmp_path / 'watched-project'
+        project_root.mkdir()
+        monkeypatch.setenv('XDG_STATE_HOME', str(xdg_home))
+        monkeypatch.chdir(project_root)
         from orchestrator.mcp_lifecycle import managed_runtime_data_dirs
 
-        project_root = Path('/home/leo/src/reify')
         queue_dir, recon_dir = managed_runtime_data_dirs('reify')
 
+        # Absolute — never susceptible to CWD-relative resolution (the
+        # actual historical pollution vector: cwd=project_root + a relative
+        # env var default).
+        assert queue_dir.is_absolute()
+        assert recon_dir.is_absolute()
+        # Not nested under the project root the managed spawn's cwd is set to.
         assert not queue_dir.is_relative_to(project_root)
         assert not recon_dir.is_relative_to(project_root)
+        # Positively pinned to the XDG root — not merely "some absolute
+        # path elsewhere", closing the tautology gap.
+        assert queue_dir.is_relative_to(xdg_home)
+        assert recon_dir.is_relative_to(xdg_home)
 
 
 # ---------------------------------------------------------------------------
