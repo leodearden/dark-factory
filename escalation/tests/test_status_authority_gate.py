@@ -35,7 +35,9 @@ import socket
 import threading
 import time
 from collections.abc import Iterator
+from pathlib import Path
 from typing import Any
+from unittest.mock import patch
 
 import pytest
 from fastmcp import Client
@@ -204,3 +206,170 @@ async def _promote_over_http(
     async with Client(transport) as client:
         result = await client.call_tool('promote_to_l2', promote_kwargs)
         return result.data
+
+
+# ---------------------------------------------------------------------------
+# B5 — Table B gate rejects an unrecognised action before any record mutation.
+# ---------------------------------------------------------------------------
+
+
+class TestB5BogusActionRejected:
+    """B5: resolve_issue(action='bogus') is rejected by the Table B legality
+    gate (escalation.action_effects.effect_for) with a typed
+    code='illegal_transition', and the record is left completely unchanged
+    (status stays 'pending', resolution_action stays None) — asserted via
+    queue.get(), the escalation package's own read path."""
+
+    @pytest.mark.asyncio
+    async def test_bogus_action_returns_illegal_transition_record_unchanged(
+        self, tmp_path: Path,
+    ) -> None:
+        queue = EscalationQueue(tmp_path / 'esc')
+        server = create_server(queue)
+        esc = _seed(queue, level=1, task_id='t-b5')
+
+        result = await _resolve_issue(
+            server, escalation_id=esc.id, resolution='n/a', action='bogus',
+        )
+
+        assert result.get('code') == 'illegal_transition', (
+            f'Expected code=illegal_transition; got: {result}'
+        )
+        record = queue.get(esc.id)
+        assert record is not None
+        assert record.status == 'pending', (
+            f'Record must stay pending; got {record.status!r}'
+        )
+        assert record.resolution_action is None, (
+            f'Record must not be stamped; got {record.resolution_action!r}'
+        )
+
+
+# ---------------------------------------------------------------------------
+# B3 (escalation side) — park promotes to L2 and keeps the record OPEN.
+# ---------------------------------------------------------------------------
+
+
+class TestB3ServerParkKeepsL2Open:
+    """B3, escalation-side face (two-way with B3-harness in
+    orchestrator/tests/test_status_authority_gate.py): resolve_issue(action=
+    'park') promotes the record to level=2, stamps resolution_action='park',
+    and keeps status='pending' (version-a, task 1792) — it does NOT resolve
+    or archive the record. Read back via queue.get()."""
+
+    @pytest.mark.asyncio
+    async def test_park_open_keeps_record_live_at_l2(self, tmp_path: Path) -> None:
+        queue = EscalationQueue(tmp_path / 'esc')
+        server = create_server(queue)
+        esc = _seed(queue, level=1, task_id='t-b3-server')
+
+        result = await _resolve_issue(
+            server, escalation_id=esc.id, resolution='parked pending human', action='park',
+        )
+
+        assert 'error' not in result, f'Unexpected error: {result}'
+        record = queue.get(esc.id)
+        assert record is not None
+        assert record.level == 2, f'Expected level==2 after park; got {record.level}'
+        assert record.resolution_action == 'park', (
+            f'Expected resolution_action==park; got {record.resolution_action!r}'
+        )
+        assert record.status == 'pending', (
+            f'park must keep the record OPEN (pending), not resolved/dismissed; '
+            f'got {record.status!r}'
+        )
+        assert record.resolved_at is None, (
+            f'park must not set resolved_at (open invariant); got {record.resolved_at!r}'
+        )
+
+
+# ---------------------------------------------------------------------------
+# D1 — make_id(): strictly increasing, durable, never rescans the archive.
+# ---------------------------------------------------------------------------
+
+
+class TestD1MakeIdCounter:
+    """D1: make_id() ids are backed by a single durable per-task_id counter
+    (PRD contract C9 / finding 10.4) — strictly increasing with no
+    collisions, durable across a fresh EscalationQueue instance, and never
+    dependent on scanning the archive directory."""
+
+    def test_rapid_make_id_and_submit_strictly_increasing_no_collision(
+        self, tmp_path: Path,
+    ) -> None:
+        queue = EscalationQueue(tmp_path / 'esc')
+        n = 25
+        ids: list[str] = []
+        for _ in range(n):
+            esc_id = queue.make_id('t-d1-rapid')
+            queue.submit(
+                Escalation(
+                    id=esc_id,
+                    task_id='t-d1-rapid',
+                    agent_role='implementer',
+                    severity='blocking',
+                    category='scope_violation',
+                    summary='status-authority-gate D1 rapid id test',
+                )
+            )
+            ids.append(esc_id)
+
+        assert len(set(ids)) == n, f'Expected {n} unique ids; got {len(set(ids))}: {ids}'
+        seqs = [int(i.rsplit('-', 1)[-1]) for i in ids]
+        assert seqs == list(range(1, n + 1)), f'Expected contiguous 1..{n}: {seqs}'
+
+        on_disk = {e.id for e in queue.get_by_task('t-d1-rapid')}
+        assert on_disk == set(ids), (
+            f'Expected all {n} submitted ids readable back via get_by_task; '
+            f'missing={set(ids) - on_disk}, extra={on_disk - set(ids)}'
+        )
+
+    def test_make_id_durable_across_fresh_queue_instance(self, tmp_path: Path) -> None:
+        queue_dir = tmp_path / 'esc'
+        first = EscalationQueue(queue_dir)
+        assert first.make_id('t-d1-restart') == 'esc-t-d1-restart-1'
+        assert first.make_id('t-d1-restart') == 'esc-t-d1-restart-2'
+
+        # Simulate restart: fresh instance, no in-memory state carried over.
+        second = EscalationQueue(queue_dir)
+        next_id = second.make_id('t-d1-restart')
+        assert next_id == 'esc-t-d1-restart-3', (
+            f'Expected the durable on-disk counter to continue across a fresh '
+            f'EscalationQueue instance; got {next_id!r}'
+        )
+
+    def test_make_id_does_not_scan_archive_even_when_archive_present(
+        self, tmp_path: Path,
+    ) -> None:
+        queue_dir = tmp_path / 'esc'
+        archive_dir = queue_dir / 'archive' / '2026-01-01'
+        archive_dir.mkdir(parents=True, exist_ok=True)
+        seeded = Escalation(
+            id='esc-t-d1-archived-9',
+            task_id='t-d1-archived',
+            agent_role='implementer',
+            severity='blocking',
+            category='scope_violation',
+            summary='hand-seeded archive record (no counter behind it)',
+        )
+        seeded.status = 'resolved'
+        (archive_dir / f'{seeded.id}.json').write_text(seeded.to_json())
+
+        queue = EscalationQueue(queue_dir)
+        with patch.object(
+            queue, '_iter_archive_paths', wraps=queue._iter_archive_paths,
+        ) as spy:
+            first_id = queue.make_id('t-d1-archived')
+            second_id = queue.make_id('t-d1-archived')
+
+        assert spy.call_count == 0, (
+            f'make_id() must not scan the archive even with an archive file '
+            f'present; _iter_archive_paths called {spy.call_count}x'
+        )
+        assert first_id == 'esc-t-d1-archived-1', (
+            f'Counter is authoritative (no archive-derived catch-up); expected '
+            f'esc-t-d1-archived-1, got {first_id!r}'
+        )
+        assert second_id == 'esc-t-d1-archived-2', (
+            f'Expected esc-t-d1-archived-2; got {second_id!r}'
+        )
