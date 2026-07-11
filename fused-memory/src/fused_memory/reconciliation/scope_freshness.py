@@ -46,7 +46,15 @@ from __future__ import annotations
 import logging
 from typing import Any
 
+from fused_memory.reconciliation.flag_dedup import _content_fingerprint
+
 logger = logging.getLogger(__name__)
+
+CONSOLIDATED_SCOPE_KIND: str = 'consolidated_scope_correction'
+"""Mem0 metadata ``kind`` tag for a scope-correction freshness snapshot."""
+
+SCOPE_FRESHNESS_SOURCE: str = 'stage_scope_freshness'
+"""``_source`` audit tag used for every scope_freshness memory write."""
 
 
 def is_cross_project_scope_correction(finding: dict[str, Any], project_id: str) -> bool:
@@ -136,3 +144,49 @@ def compute_scope_signature(finding: dict[str, Any], project_id: str) -> tuple[s
     task_ref = f'{subject_project_id}:{subject_task_id}'
     flag_key = str(finding.get('flag_type') or finding.get('category') or '')
     return (task_ref, flag_key)
+
+
+def build_scope_snapshot_metadata(
+    *,
+    task_ref: str,
+    flag_key: str,
+    subject_project_id: str,
+    subject_task_id: str,
+    status: str | None,
+    updated_at: str | None,
+    description: str | None,
+    run_id: str,
+    snapshot_at: str,
+    no_change: bool = False,
+) -> dict[str, Any]:
+    """Build the canonical scope-freshness-snapshot Mem0 metadata payload.
+
+    Keyed by ``task_id=task_ref`` (project-qualified subject reference, e.g.
+    ``'dark_factory:2405'``) + ``flag_type=flag_key`` — the pair
+    :func:`precheck_scope_correction_freshness` queries back on the next
+    cycle via ``get_memories_by_metadata``.  ``subject_description_fingerprint``
+    reuses :func:`fused_memory.reconciliation.flag_dedup._content_fingerprint`
+    (deterministic SHA-256 of the normalized description) rather than storing
+    the full description text.
+
+    ``no_change`` is only included (as ``True``) when explicitly requested —
+    set on the lightweight 'still blocked, no change' marker written when a
+    finding is skipped; omitted (not merely ``False``) on a snapshot
+    recording a first-sight or changed subject.  Pure, sync, no I/O.
+    """
+    metadata: dict[str, Any] = {
+        'kind': CONSOLIDATED_SCOPE_KIND,
+        'source': SCOPE_FRESHNESS_SOURCE,
+        'task_id': task_ref,
+        'flag_type': flag_key,
+        'subject_project_id': subject_project_id,
+        'subject_task_id': subject_task_id,
+        'subject_status': status,
+        'subject_updated_at': updated_at,
+        'subject_description_fingerprint': _content_fingerprint(description or ''),
+        'run_id': run_id,
+        'snapshot_at': snapshot_at,
+    }
+    if no_change:
+        metadata['no_change'] = True
+    return metadata
