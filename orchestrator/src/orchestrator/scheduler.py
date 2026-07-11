@@ -1236,6 +1236,7 @@ class Scheduler:
         monotonic_clock_source: Callable[[], float] | None = None,
         park_eviction_store: ParkEvictionRequestStore | None = None,
         wall_time_source: Callable[[], datetime] | None = None,
+        state_snapshot_path: Path | None = None,
     ):
         self.config = config
         # Constructor-injected Harness callback bundle (task 2235).  Omitting
@@ -1474,6 +1475,16 @@ class Scheduler:
         # tick. Default None so bare-Scheduler unit tests are unaffected.
         self._already_landed_gate: Callable[[str], Any] | None = None
         # --- Snapshot write throttle (task 1332) ---
+        # Test-injectable override for the _write_snapshot_best_effort write
+        # target (task 2418).  None (default) preserves current behavior: the
+        # path is derived from _project_root and the no-project-root guard
+        # applies.  When set, the write goes to this exact path instead —
+        # bypassing both the derivation and the guard, since an explicit path
+        # is always honored — decoupling the on-disk write target from
+        # _project_root, which some tests must also use as an OverrideStore
+        # lookup key.  Mirrors the _read_psi_sample-style constructor-vs-
+        # instance-attr seam pattern used elsewhere in this class.
+        self._state_snapshot_path: Path | None = state_snapshot_path
         # Monotonic timestamp of the last successful _write_snapshot_best_effort
         # disk write.  None before the first write; the first write always
         # proceeds regardless of the throttle interval.
@@ -5151,7 +5162,14 @@ class Scheduler:
         # instead.  This guard MUST run before any timestamp bookkeeping so a
         # no-project-root scheduler does not advance _last_snapshot_write_ts
         # for a write that never happens.
-        if not self._project_root or self._project_root == 'None':
+        #
+        # Skipped entirely when ``self._state_snapshot_path`` is set (task
+        # 2418): an explicit injected path is always honored regardless of
+        # ``_project_root``, which some callers must independently set to a
+        # non-writable value for use as an OverrideStore lookup key.
+        if self._state_snapshot_path is None and (
+            not self._project_root or self._project_root == 'None'
+        ):
             if not self._snapshot_guard_warned:
                 self._snapshot_guard_warned = True
                 logger.warning(
@@ -5203,7 +5221,12 @@ class Scheduler:
                 # second get_state_snapshot() call on the actual write path.
                 disk_payload = json.dumps(state, default=str)
                 path = (
-                    Path(self._project_root) / 'data' / 'orchestrator' / 'scheduler_state.json'
+                    Path(self._state_snapshot_path)
+                    if self._state_snapshot_path is not None
+                    else Path(self._project_root)
+                    / 'data'
+                    / 'orchestrator'
+                    / 'scheduler_state.json'
                 )
                 await asyncio.to_thread(self._write_state_snapshot_raw, path, disk_payload)
                 # Bookkeeping advanced only after a confirmed successful write.
