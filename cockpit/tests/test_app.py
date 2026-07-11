@@ -1022,6 +1022,47 @@ class TestSpawnTreeEnterFocus:
             assert backend.focus_calls == []
 
 
+class TestSpawnTreeToggle:
+    @pytest.mark.timeout(10)
+    async def test_toggle_key_closes_an_already_open_tree(self, tmp_path):
+        """'t' toggles: pressing it again while the tree is open closes it
+        (back to the default screen) rather than leaving it open or
+        pushing a second modal on top (Fleet Cockpit C9a, PRD §9)."""
+        from cockpit.app import CockpitApp
+        from cockpit.panes.spawn_tree import SpawnTreeScreen
+
+        app = CockpitApp(fleet_root=tmp_path, poll_interval=0.05)
+        async with app.run_test() as pilot:
+            await pilot.pause()
+
+            await pilot.press('t')
+            await pilot.pause()
+            assert isinstance(app.screen, SpawnTreeScreen)
+
+            await pilot.press('t')
+            await pilot.pause()
+            assert not isinstance(app.screen, SpawnTreeScreen)
+
+    @pytest.mark.timeout(10)
+    async def test_escape_closes_the_open_tree(self, tmp_path):
+        """'escape' also dismisses the open spawn-tree modal, mirroring
+        SpawnScreen.action_cancel's own escape-to-dismiss binding."""
+        from cockpit.app import CockpitApp
+        from cockpit.panes.spawn_tree import SpawnTreeScreen
+
+        app = CockpitApp(fleet_root=tmp_path, poll_interval=0.05)
+        async with app.run_test() as pilot:
+            await pilot.pause()
+
+            await pilot.press('t')
+            await pilot.pause()
+            assert isinstance(app.screen, SpawnTreeScreen)
+
+            await pilot.press('escape')
+            await pilot.pause()
+            assert not isinstance(app.screen, SpawnTreeScreen)
+
+
 class TestRefreshWriteDiscipline:
     @pytest.mark.timeout(10)
     async def test_refresh_path_writes_nothing_under_sessions_or_decisions(self, tmp_path):
