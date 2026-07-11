@@ -373,3 +373,212 @@ class TestD1MakeIdCounter:
         assert second_id == 'esc-t-d1-archived-2', (
             f'Expected esc-t-d1-archived-2; got {second_id!r}'
         )
+
+
+# ---------------------------------------------------------------------------
+# C1 — header-less connection retains full L2 authority (esc-2087-2).
+# ---------------------------------------------------------------------------
+
+
+class TestC1HeaderlessFullL2Authority:
+    """C1: a header-less HTTP connection (no X-Escalation-Levels /
+    X-Escalation-Identity) is NEVER narrowed by the capability guard — it
+    keeps full authority to resolve an L2 record via resume, park, AND
+    close_only (the esc-2087-2 human-channel guarantee). Only the real HTTP
+    harness can exercise this: get_http_headers() always resolves {} for an
+    in-process tool.fn() call, which is indistinguishable from "header-less
+    over HTTP" for this gate — proved directly here instead."""
+
+    @pytest.mark.asyncio
+    async def test_resume_park_close_only_all_succeed_header_less(
+        self, http_server: tuple[str, EscalationQueue],
+    ) -> None:
+        base_url, queue = http_server
+        esc_resume = _seed(queue, level=2, task_id='zeta-c1-resume')
+        esc_park = _seed(queue, level=2, task_id='zeta-c1-park')
+        esc_close = _seed(queue, level=2, task_id='zeta-c1-close')
+
+        result_resume = await _resolve_over_http(
+            base_url, escalation_id=esc_resume.id, resolution='fixed', action='resume',
+        )
+        assert 'error' not in result_resume, f'Unexpected error: {result_resume}'
+        reread_resume = queue.get(esc_resume.id)
+        assert reread_resume is not None
+        assert reread_resume.status == 'resolved', (
+            f'Expected resolved, got: {reread_resume.status}'
+        )
+
+        result_park = await _resolve_over_http(
+            base_url, escalation_id=esc_park.id, resolution='parked', action='park',
+        )
+        assert 'error' not in result_park, f'Unexpected error: {result_park}'
+        reread_park = queue.get(esc_park.id)
+        assert reread_park is not None
+        assert reread_park.status == 'pending', (
+            f'park must keep the record OPEN; got {reread_park.status}'
+        )
+        assert reread_park.level == 2
+        assert reread_park.resolution_action == 'park'
+
+        result_close = await _resolve_over_http(
+            base_url, escalation_id=esc_close.id, resolution='n/a', action='close_only',
+        )
+        assert 'error' not in result_close, f'Unexpected error: {result_close}'
+        reread_close = queue.get(esc_close.id)
+        assert reread_close is not None
+        assert reread_close.status == 'dismissed', (
+            f'Expected dismissed, got: {reread_close.status}'
+        )
+
+
+# ---------------------------------------------------------------------------
+# C2 — a mapped identity is capped at its role ceiling with no levels header.
+# ---------------------------------------------------------------------------
+
+
+class TestC2MappedIdentityCeiling:
+    """C2: an identity mapped in ROLE_LEVEL_ALLOWLIST (the auto-watcher, {0,1})
+    is capped at that ceiling even with no X-Escalation-Levels header — an L2
+    record is denied and left completely unchanged (still live, unarchived)."""
+
+    @pytest.mark.asyncio
+    async def test_watcher_identity_denied_l2_no_levels_header(
+        self, http_server: tuple[str, EscalationQueue],
+    ) -> None:
+        base_url, queue = http_server
+        esc = _seed(queue, level=2, task_id='zeta-c2-denied')
+
+        result = await _resolve_over_http(
+            base_url, identity='orchestrator-escalation-watcher-auto',
+            escalation_id=esc.id, resolution='x', action='close_only',
+        )
+
+        assert result.get('code') == 'level_forbidden', (
+            f"Expected code='level_forbidden'; got: {result}"
+        )
+        reread = queue.get(esc.id)
+        assert reread is not None
+        assert reread.status == 'pending', f'Expected pending; got {reread.status}'
+        assert reread.resolution_action is None, (
+            f'Expected no resolution_action stamp; got {reread.resolution_action!r}'
+        )
+        assert (queue.queue_dir / f'{esc.id}.json').exists(), (
+            'Denied record must remain live in the queue root (not archived)'
+        )
+
+
+# ---------------------------------------------------------------------------
+# C3 — a levels header can only NARROW a mapped identity's ceiling, never widen.
+# ---------------------------------------------------------------------------
+
+
+class TestC3LevelsHeaderNarrowsNotWidens:
+    """C3: X-Escalation-Levels intersects with (never extends past) a mapped
+    identity's role ceiling — widening past {0,1} still fails, while a
+    genuine narrow ({0,1} & {0} = {0}) further restricts what the same
+    identity may touch."""
+
+    @pytest.mark.asyncio
+    async def test_widen_past_ceiling_still_denied(
+        self, http_server: tuple[str, EscalationQueue],
+    ) -> None:
+        base_url, queue = http_server
+        esc = _seed(queue, level=2, task_id='zeta-c3-widen')
+
+        result = await _resolve_over_http(
+            base_url, levels='0,1,2', identity='orchestrator-escalation-watcher-auto',
+            escalation_id=esc.id, resolution='x', action='close_only',
+        )
+
+        assert result.get('code') == 'level_forbidden', (
+            f"levels='0,1,2' must not widen the {{0,1}} ceiling; got: {result}"
+        )
+        reread = queue.get(esc.id)
+        assert reread is not None
+        assert reread.status == 'pending', f'Expected pending; got {reread.status}'
+        assert reread.resolution_action is None
+
+    @pytest.mark.asyncio
+    async def test_narrow_below_ceiling_allows_l0_denies_l1(
+        self, http_server: tuple[str, EscalationQueue],
+    ) -> None:
+        base_url, queue = http_server
+        esc_l0 = _seed(queue, level=0, task_id='zeta-c3-narrow-l0')
+        esc_l1 = _seed(queue, level=1, task_id='zeta-c3-narrow-l1')
+
+        result_l0 = await _resolve_over_http(
+            base_url, levels='0', identity='orchestrator-escalation-watcher-auto',
+            escalation_id=esc_l0.id, resolution='fixed', action='resume',
+        )
+        assert 'error' not in result_l0, (
+            f'levels=0 narrows {{0,1}} to {{0}}; an L0 record must still '
+            f'resolve: {result_l0}'
+        )
+        reread_l0 = queue.get(esc_l0.id)
+        assert reread_l0 is not None
+        assert reread_l0.status == 'resolved', f'Expected resolved; got {reread_l0.status}'
+
+        result_l1 = await _resolve_over_http(
+            base_url, levels='0', identity='orchestrator-escalation-watcher-auto',
+            escalation_id=esc_l1.id, resolution='x', action='close_only',
+        )
+        assert result_l1.get('code') == 'level_forbidden', (
+            f'levels=0 narrows {{0,1}} to {{0}}; an L1 record must now be '
+            f'denied: {result_l1}'
+        )
+        reread_l1 = queue.get(esc_l1.id)
+        assert reread_l1 is not None
+        assert reread_l1.status == 'pending', f'Expected pending; got {reread_l1.status}'
+
+
+# ---------------------------------------------------------------------------
+# C4 — promote_to_l2 is gated by identity (PROMOTE_ALLOWED), never by levels.
+# ---------------------------------------------------------------------------
+
+
+class TestC4PromoteToL2IdentityGate:
+    """C4: promote_to_l2 is gated solely by PROMOTE_ALLOWED identity
+    membership: a disallowed identity is denied with no L2 minted at all
+    (find_pending_l2_by_root_cause stays None); header-less callers remain
+    allowed (the esc-2087-2 guarantee applies here too)."""
+
+    @pytest.mark.asyncio
+    async def test_disallowed_identity_denied_no_l2_minted(
+        self, http_server: tuple[str, EscalationQueue],
+    ) -> None:
+        base_url, queue = http_server
+        m1 = _seed(queue, level=1, task_id='zeta-c4-denied-m1')
+        root_cause = 'zeta-rc-c4-denied'
+
+        result = await _promote_over_http(
+            base_url, identity='some-other-agent',
+            task_id='zeta-c4-denied', agent_role='some-other-agent',
+            member_ids=[m1.id], root_cause=root_cause, evidence='e',
+            options=['A', 'B'], summary='cluster',
+        )
+
+        assert result.get('code') == 'level_forbidden', (
+            f"Expected code='level_forbidden'; got: {result}"
+        )
+        assert queue.find_pending_l2_by_root_cause(root_cause) is None, (
+            'Expected no L2 minted for a disallowed identity'
+        )
+
+    @pytest.mark.asyncio
+    async def test_header_less_promote_allowed(
+        self, http_server: tuple[str, EscalationQueue],
+    ) -> None:
+        base_url, queue = http_server
+        m1 = _seed(queue, level=1, task_id='zeta-c4-headerless-m1')
+        root_cause = 'zeta-rc-c4-headerless'
+
+        result = await _promote_over_http(
+            base_url,
+            task_id='zeta-c4-headerless', agent_role='escalation-watcher-auto',
+            member_ids=[m1.id], root_cause=root_cause, evidence='e',
+            options=['A', 'B'], summary='cluster',
+        )
+
+        assert result.get('status') in {'created', 'updated'}, (
+            f"Expected status in {{'created','updated'}}; got: {result}"
+        )
