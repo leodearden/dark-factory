@@ -1184,16 +1184,22 @@ class SqliteTaskBackend:
         db_path = self._db_path(project_root)
         if not db_path.exists():
             return {}
-        conn = await connect_daemon(str(db_path), isolation_level=None)
+        # conn is opened *inside* the try (not before it) so that a failure
+        # to even open the dedicated connection — e.g. a permission error,
+        # disk I/O failure, or corrupt file — also fails open to {} per the
+        # "any error" contract documented above, instead of propagating.
+        conn: aiosqlite.Connection | None = None
         try:
+            conn = await connect_daemon(str(db_path), isolation_level=None)
             await apply_wal_pragmas(conn, busy_timeout_ms=5000)
             conn.row_factory = aiosqlite.Row
             return await self._statuses_from_conn(conn, tag or DEFAULT_TAG, ids)
         except Exception:
             return {}
         finally:
-            with contextlib.suppress(Exception):
-                await conn.close()
+            if conn is not None:
+                with contextlib.suppress(Exception):
+                    await conn.close()
 
     async def set_task_status(
         self,

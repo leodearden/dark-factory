@@ -3174,6 +3174,47 @@ async def test_get_statuses_fresh_sees_committed_write_despite_pinned_cached_sna
     await conn.rollback()
 
 
+@pytest.mark.asyncio
+async def test_get_statuses_fresh_returns_empty_when_db_file_missing(backend, project_root):
+    """get_statuses_fresh fails open to {} when the project's tasks.db file
+    has never been created — e.g. reconciliation runs for a project before
+    any task has ever been written for it. Must not raise; this pins the
+    ``if not db_path.exists(): return {}`` fast path documented on
+    get_statuses_fresh ("{} if the DB file does not exist yet...").
+    """
+    assert not SqliteTaskBackend._db_path(project_root).exists()
+
+    result = await backend.get_statuses_fresh(project_root)
+
+    assert result == {}
+
+
+@pytest.mark.asyncio
+async def test_get_statuses_fresh_returns_empty_when_connection_open_raises(
+    backend, project_root, monkeypatch,
+):
+    """get_statuses_fresh fails open to {} when opening its dedicated
+    short-lived connection raises for any reason (permission error, disk
+    I/O failure, corrupt file, ...) — not just when a read on an
+    already-open connection fails. Pins the ``except Exception: return {}``
+    branch that the reconciliation cycle relies on never raising through.
+    """
+    from fused_memory.backends import sqlite_task_backend as _sb
+
+    # Seed via the real connect_daemon first so the DB file exists and we
+    # get past the "missing file" fast path exercised above.
+    await backend.add_task(project_root=project_root, title='T1')
+
+    def _boom(*_args, **_kwargs):
+        raise OSError('simulated connection-open failure')
+
+    monkeypatch.setattr(_sb, 'connect_daemon', _boom)
+
+    result = await backend.get_statuses_fresh(project_root)
+
+    assert result == {}
+
+
 # ── Corrupt-blob refusal tests (task 1813) ──────────────────────────────
 
 
