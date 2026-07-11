@@ -36,6 +36,7 @@ from orchestrator.task_ground_truth import (
     EscalationRef,
     RecoveryAction,
     TruthReport,
+    classify_recovery,
 )
 
 # ---------------------------------------------------------------------------
@@ -110,3 +111,88 @@ class TestTruthReportConstruction:
         assert report.live_claimant == claimant
         assert report.deploy_phase == DeployPhase.RAN
         assert report.open_escalations == [EscalationRef(id='esc-1-1', level=1)]
+
+
+# ---------------------------------------------------------------------------
+# step-3 — table-driven classify_recovery (TG-2: ONE classification table)
+# ---------------------------------------------------------------------------
+
+
+class TestClassifyRecovery:
+    """TruthReport shape -> expected RecoveryAction.
+
+    Each row is a distinct, meaningful shape from PRD §5.4 / plan.json
+    step-3. Unmapped/degenerate shapes default to LEAVE (fail-safe — never
+    phantom-done); see row (i).
+    """
+
+    @staticmethod
+    def _report(
+        *,
+        db_status: str = 'in-progress',
+        live_claimant: Claimant | None = None,
+        branch_state: BranchState,
+        open_escalations: list[EscalationRef] | None = None,
+        deploy_phase: DeployPhase | None = None,
+    ) -> TruthReport:
+        return TruthReport(
+            db_status=db_status,
+            live_claimant=live_claimant,
+            branch_state=branch_state,
+            worktree_present=True,
+            open_escalations=open_escalations or [],
+            deploy_phase=deploy_phase,
+        )
+
+    def test_a_in_progress_no_claimant_on_main_no_open_l1_marks_done(self) -> None:
+        report = self._report(branch_state=BranchState(BranchStateKind.ON_MAIN, 'sha-a'))
+        assert classify_recovery(report) == RecoveryAction.MARK_DONE_WITH_PROVENANCE
+
+    def test_b_in_progress_no_claimant_gone_with_marker_marks_done(self) -> None:
+        report = self._report(
+            branch_state=BranchState(BranchStateKind.GONE_WITH_MERGE_MARKER, 'sha-b'),
+        )
+        assert classify_recovery(report) == RecoveryAction.MARK_DONE_WITH_PROVENANCE
+
+    def test_c_in_progress_no_claimant_exists_off_main_reverts_to_pending(self) -> None:
+        report = self._report(branch_state=BranchState(BranchStateKind.EXISTS_OFF_MAIN))
+        assert classify_recovery(report) == RecoveryAction.REVERT_TO_PENDING
+
+    def test_d_in_progress_no_claimant_gone_no_marker_reverts_to_pending(self) -> None:
+        report = self._report(branch_state=BranchState(BranchStateKind.GONE_NO_MARKER))
+        assert classify_recovery(report) == RecoveryAction.REVERT_TO_PENDING
+
+    def test_e_any_status_live_claimant_present_leaves(self) -> None:
+        claimant = Claimant(
+            run_id='run-1', heartbeat_at='2026-07-12T00:00:00+00:00', source=ClaimantSource.IN_MEMORY,
+        )
+        report = self._report(
+            db_status='blocked',
+            live_claimant=claimant,
+            branch_state=BranchState(BranchStateKind.ON_MAIN, 'sha-e'),
+        )
+        assert classify_recovery(report) == RecoveryAction.LEAVE
+
+    def test_f_on_main_open_l1_vetoes_auto_flip(self) -> None:
+        report = self._report(
+            branch_state=BranchState(BranchStateKind.ON_MAIN, 'sha-f'),
+            open_escalations=[EscalationRef(id='esc-1-1', level=1)],
+        )
+        assert classify_recovery(report) == RecoveryAction.LEAVE
+
+    def test_g_blocked_no_claimant_gone_no_marker_no_open_escalation_refiles(self) -> None:
+        report = self._report(db_status='blocked', branch_state=BranchState(BranchStateKind.GONE_NO_MARKER))
+        assert classify_recovery(report) == RecoveryAction.RE_FILE_ESCALATION
+
+    def test_h_deterministic_task_deploy_phase_ran_refiles_not_phantom_done(self) -> None:
+        # D1 (PRD §7): a deploy crashed between 'ran' and 'verified' must
+        # recover to a defined action, never phantom-done.
+        report = self._report(
+            branch_state=BranchState(BranchStateKind.GONE_NO_MARKER),
+            deploy_phase=DeployPhase.RAN,
+        )
+        assert classify_recovery(report) == RecoveryAction.RE_FILE_ESCALATION
+
+    def test_i_unmapped_degenerate_shape_defaults_to_leave(self) -> None:
+        report = self._report(db_status='pending', branch_state=BranchState(BranchStateKind.EXISTS_OFF_MAIN))
+        assert classify_recovery(report) == RecoveryAction.LEAVE
