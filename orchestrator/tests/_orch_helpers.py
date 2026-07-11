@@ -8,9 +8,11 @@ the same process.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import gc
 import inspect
 import logging
+import threading
 from collections.abc import Sequence
 from typing import TYPE_CHECKING
 from unittest.mock import AsyncMock, MagicMock
@@ -100,6 +102,99 @@ def drain_async_mock_coroutines() -> int:
             closed,
         )
         gc.collect()
+    return closed
+
+
+async def reap_leaked_aiosqlite_connections() -> int:
+    """Close and join any aiosqlite Connection whose worker thread outlived its test.
+
+    Task 2413 — fix for the scheduler-test xdist flake where a leaked aiosqlite
+    connection's background worker thread survives past the end of the test
+    that created it.
+
+    ROOT CAUSE: ``aiosqlite.Connection`` runs one background ``Thread`` per
+    connection (``aiosqlite.core._connection_worker_thread``). Each completed
+    operation resolves its future via
+    ``future.get_loop().call_soon_threadsafe(...)`` (core.py:66). If nothing
+    closes the connection before the test's event loop is torn down
+    (pytest-asyncio closes a fresh loop per test), the worker thread is still
+    alive when a later operation tries to resolve a future against the
+    now-CLOSED loop, raising ``RuntimeError: Event loop is closed`` from
+    inside the thread. ``core.py``'s own exception handler re-invokes
+    ``call_soon_threadsafe`` (which raises again, uncaught), so the thread
+    dies loudly and pytest's threadexception plugin attributes the failure to
+    whatever unrelated test happens to be executing when the thread fires —
+    under CPU starvation (``pytest -n auto`` on an oversubscribed host) that
+    is reliably a *different*, innocent test. orchestrator/pyproject.toml
+    promotes the resulting ``PytestUnhandledThreadExceptionWarning`` to a
+    hard error.
+
+    FIX: at every test's teardown boundary — while that test's own event loop
+    is STILL OPEN — find any live aiosqlite worker thread and gracefully
+    ``await conn.close()`` then join its thread. ``close()`` drains the
+    connection's queue and resolves any pending futures against the
+    still-open loop before flipping ``_running`` to False and queuing the
+    stop sentinel; joining guarantees the thread has actually exited before
+    this fixture (and therefore the test) returns, so it can never later
+    touch a closed loop.
+
+    MAINTENANCE NOTE: this walk relies on aiosqlite ``Connection`` internals
+    that are not part of its public API: the ``_running`` flag, the
+    ``_thread`` attribute, and ``aiosqlite.core._connection_worker_thread`` as
+    the pre-check thread target. If a future aiosqlite release renames or
+    removes any of these, the guarded import below makes this helper a no-op
+    (returns 0) rather than raising — but the leak protection this provides
+    would then be silently lost, so re-verify this helper against aiosqlite's
+    source whenever the pinned version changes.
+
+    PERFORMANCE NOTE: mirrors ``drain_async_mock_coroutines``'s gc-walk
+    shape, but gates the (relatively expensive) ``gc.get_objects()`` walk
+    behind a cheap ``threading.enumerate()`` pre-check for a live aiosqlite
+    worker thread, so the common no-leak path costs a single thread-list scan
+    rather than a full object-graph walk on every test.
+
+    Returns the number of connections reaped (useful for assertions in tests).
+    """
+    try:
+        import aiosqlite
+        from aiosqlite.core import _connection_worker_thread
+    except Exception:
+        return 0
+
+    if not any(
+        t.is_alive() and getattr(t, '_target', None) is _connection_worker_thread
+        for t in threading.enumerate()
+    ):
+        return 0
+
+    closed = 0
+    for obj in gc.get_objects():
+        if not (
+            isinstance(obj, aiosqlite.Connection)
+            and getattr(obj, '_running', False)
+            and obj._thread.is_alive()
+        ):
+            continue
+        # Exception (not BaseException): asyncio.CancelledError is a
+        # BaseException subclass (since 3.8) and must propagate rather than
+        # be silently absorbed if the test run itself is being cancelled
+        # while this teardown is awaiting; SystemExit/KeyboardInterrupt are
+        # likewise deliberately left unsuppressed. asyncio.TimeoutError
+        # (raised by the wait_for below) is a plain Exception subclass, so
+        # it — and any close()/thread-join failure — is still swallowed on
+        # this best-effort path.
+        with contextlib.suppress(Exception):
+            await asyncio.wait_for(obj.close(), timeout=15.0)
+            obj._thread.join(timeout=15.0)
+        if not obj._thread.is_alive():
+            closed += 1
+    if closed:
+        _log.debug(
+            'reap_leaked_aiosqlite_connections: closed %d leaked aiosqlite '
+            'connection(s) — consider auditing missing `await conn.close()` '
+            'in the preceding test',
+            closed,
+        )
     return closed
 
 
