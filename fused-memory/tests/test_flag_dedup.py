@@ -4924,3 +4924,130 @@ class TestFilterAlreadyTrackedSystemicPatterns:
             f'dark_factory task 1938 already covers the idea; got {result!r}'
         )
 
+    # ---- scope / keep-guard edge cases (step-5) ----------------------------
+
+    @pytest.mark.asyncio
+    async def test_keep_when_no_done_task_covers_the_idea(self):
+        """(KEEP) No done task's terms cover the finding — real signal preserved."""
+        from fused_memory.reconciliation.flag_dedup import (
+            filter_already_tracked_systemic_patterns,
+        )
+
+        flag = self._make_never_tracked_flag()
+        taskmaster = AsyncMock()
+        taskmaster.get_tasks = AsyncMock(return_value={
+            'tasks': [
+                {
+                    'id': '77',
+                    'status': 'done',
+                    'title': 'Rewrite the onboarding email template',
+                    'description': (
+                        'Refreshed wording and branding in the welcome email flow.'
+                    ),
+                },
+            ],
+        })
+
+        result = await filter_already_tracked_systemic_patterns(taskmaster, '/df', [flag])
+
+        assert result == [flag], (
+            'Finding must be KEPT when no done task covers its key terms (real '
+            f'systemic signal must be preserved); got {result!r}'
+        )
+
+    @pytest.mark.asyncio
+    async def test_non_systemic_pattern_flag_is_kept_and_get_tasks_not_called(self):
+        """(KEEP, scope guard) Non-systemic_pattern flag_type is out of scope.
+
+        get_tasks must NOT be called — the candidate list is empty before any
+        taskmaster I/O is attempted.
+        """
+        from fused_memory.reconciliation.flag_dedup import (
+            filter_already_tracked_systemic_patterns,
+        )
+
+        flag = {
+            'task_id': '42',
+            'category': 'stale_metadata',
+            'flag_type': 'stale_metadata',
+            'description': 'This idea was never converted to a tracked task.',
+        }
+        taskmaster = AsyncMock()
+        taskmaster.get_tasks = AsyncMock(return_value={'tasks': []})
+
+        result = await filter_already_tracked_systemic_patterns(taskmaster, '/df', [flag])
+
+        assert result == [flag], (
+            f'Non-systemic_pattern flag must pass through unchanged; got {result!r}'
+        )
+        taskmaster.get_tasks.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_systemic_pattern_without_never_tracked_language_is_kept_and_get_tasks_not_called(
+        self,
+    ):
+        """(KEEP, scope guard) systemic_pattern flag lacking never-tracked language.
+
+        get_tasks must NOT be called — the candidate list is empty before any
+        taskmaster I/O is attempted.
+        """
+        from fused_memory.reconciliation.flag_dedup import (
+            filter_already_tracked_systemic_patterns,
+        )
+
+        flag = {
+            'task_id': None,
+            'category': 'systemic_pattern',
+            'flag_type': 'systemic_pattern',
+            'description': (
+                'Recurring pattern: agents keep re-deriving the same cache diff '
+                'each cycle.'
+            ),
+        }
+        taskmaster = AsyncMock()
+        taskmaster.get_tasks = AsyncMock(return_value={'tasks': []})
+
+        result = await filter_already_tracked_systemic_patterns(taskmaster, '/df', [flag])
+
+        assert result == [flag], (
+            f'systemic_pattern flag without never-tracked language must be kept; got {result!r}'
+        )
+        taskmaster.get_tasks.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_candidate_with_too_few_key_terms_is_kept(self):
+        """(KEEP) Fewer than min_key_terms distinctive terms — cannot match confidently.
+
+        Even though a done task's text would otherwise fully cover this
+        candidate's (tiny) term set, too few distinctive terms means the match
+        cannot be trusted, so the finding must survive.
+        """
+        from fused_memory.reconciliation.flag_dedup import (
+            filter_already_tracked_systemic_patterns,
+        )
+
+        flag = {
+            'task_id': None,
+            'category': 'systemic_pattern',
+            'flag_type': 'systemic_pattern',
+            'description': 'This was never tracked: fix the cache.',
+        }
+        taskmaster = AsyncMock()
+        taskmaster.get_tasks = AsyncMock(return_value={
+            'tasks': [
+                {
+                    'id': '1',
+                    'status': 'done',
+                    'title': 'fix the cache',
+                    'description': 'fix the cache',
+                },
+            ],
+        })
+
+        result = await filter_already_tracked_systemic_patterns(taskmaster, '/df', [flag])
+
+        assert result == [flag], (
+            'A candidate with fewer than min_key_terms distinctive terms must be '
+            f'KEPT (cannot match confidently); got {result!r}'
+        )
+
