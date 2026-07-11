@@ -10387,28 +10387,19 @@ class SpeculativeMergeWorker(_WipHaltMixin):
             # future edit adding a throwing statement before the try cannot leave
             # _finalizing_head permanently stale.
             #
-            # MQ-reliability kappa (task 2169): mirror the same window onto the
-            # registry — VERIFYING -> FINALIZING — but ONLY for an entry that
-            # actually reaches real finalize work below.  A passthrough entry
-            # (entry.passthrough_outcome is not None) never awaits a verify_task
-            # or runs the CAS loop, and a pre-dispatch sentinel entry
-            # (ABANDONED_PREDISPATCH still sits at DISPATCHING; REQUEUED_PREDISPATCH
-            # was already moved to QUEUED by _dispatch_item's own _note_requeue
-            # call) is likewise never really "finalizing" — transitioning either
-            # to FINALIZING here would be a spurious hop (DISPATCHING/QUEUED ->
-            # FINALIZING is not even a legal edge). Both retire/requeue from
-            # whichever state they actually hold at their own return sites below.
-            if (
-                entry.passthrough_outcome is None
-                and entry.status not in (
-                    InflightStatus.ABANDONED_PREDISPATCH,
-                    InflightStatus.REQUEUED_PREDISPATCH,
-                )
-            ):
-                self._note_transition(
-                    req.request_id, ItemLifecycleState.VERIFYING,
-                    ItemLifecycleState.FINALIZING, live_obj=entry,
-                )
+            # MQ-reliability kappa (task 2169) / lambda (task 2173): the registry
+            # VERIFYING -> FINALIZING hop is deferred to AFTER the verify_task
+            # await below, NOT set here alongside _finalizing_head. _finalizing_head
+            # is a pure snapshot() observability surface for the invisible-finalize
+            # gap; the registry state is the item's true lifecycle position. While
+            # entry.verify_task is still awaiting (a wedged/gated verify), the item
+            # is genuinely VERIFYING — main's per-entry phase stayed 'verifying'
+            # across that await and only became 'finalizing' after it returned. Firing
+            # the FINALIZING hop here (before the await) would mislabel a wedged verify
+            # as finalizing (regression caught by esc-2173-6:
+            # test_wedged_verify_is_armed_and_alarmed_then_resolves_cleanly). The hop
+            # now fires just past the await, before any sentinel/RU/fail/pass handling
+            # (all of which already assume FINALIZING).
             self._finalizing_head = entry
 
             # ── Pre-dispatch sentinels (abandon / operator-halt) ─────────────────────
@@ -10447,6 +10438,28 @@ class SpeculativeMergeWorker(_WipHaltMixin):
             vr: InflightVerifyResult | None = None
             if entry.verify_task is not None:
                 vr = await entry.verify_task
+
+            # MQ-reliability lambda (task 2173): the verify await has returned, so
+            # the item is now genuinely finalizing — fire the VERIFYING -> FINALIZING
+            # hop here (deferred from the _finalizing_head assignment above so a
+            # wedged verify reads VERIFYING, not FINALIZING). Guarded exactly as
+            # before: passthrough / pre-dispatch-sentinel entries already returned
+            # above and never reach here, but keep the guard explicit so the legal
+            # edge (VERIFYING -> FINALIZING) is never mis-applied to an entry sitting
+            # at DISPATCHING/QUEUED. Every path below (DROPPED/REQUEUED, RUNNER_
+            # UNAVAILABLE's FINALIZING -> MERGING, FAIL/skip, PASS) already assumes
+            # FINALIZING as its from-state.
+            if (
+                entry.passthrough_outcome is None
+                and entry.status not in (
+                    InflightStatus.ABANDONED_PREDISPATCH,
+                    InflightStatus.REQUEUED_PREDISPATCH,
+                )
+            ):
+                self._note_transition(
+                    req.request_id, ItemLifecycleState.VERIFYING,
+                    ItemLifecycleState.FINALIZING, live_obj=entry,
+                )
 
             # ── (c) DROPPED / REQUEUED sentinels ────────────────────────────
             if vr is not None and vr.status in (InflightStatus.DROPPED, InflightStatus.REQUEUED):
