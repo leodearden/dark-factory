@@ -21,6 +21,7 @@ import json
 import pytest
 
 from orchestrator import verify
+from orchestrator.config import ModuleConfig
 from orchestrator.verify_cmd import parse_config_command
 from orchestrator.verify_plan import (
     FileKind,
@@ -31,6 +32,7 @@ from orchestrator.verify_plan import (
     _is_conftest,
     _is_test_file,
     classify_file,
+    derive_verify_plan,
 )
 
 # ---------------------------------------------------------------------------
@@ -325,3 +327,100 @@ class TestVerifyPlan:
         }
         # D3: round-trips through the real json module byte-for-byte as data.
         assert json.loads(json.dumps(d)) == d
+
+
+# ---------------------------------------------------------------------------
+# derive_verify_plan: module-config branch (step-7: RED)
+# ---------------------------------------------------------------------------
+
+
+def _run_for(plan: VerifyPlan, prefix: str, tool_word: str) -> PlannedRun | None:
+    """Find *prefix*'s PlannedRun whose reason names *tool_word* (e.g. ``'pytest:'``).
+
+    Tool identity is recoverable from ``cmd.tool`` for a non-SKIPPED run, but a
+    SKIPPED slot carries ``cmd=None`` (D3's "explicit reasoned skip, never a
+    dropped command") — so ``derive_verify_plan`` always prefixes each
+    per-tool ``PlannedRun.reason`` with its tool name, keeping the reason the
+    tool-identity signal of last resort.
+    """
+    return next(
+        (r for r in plan.runs if r.module_prefix == prefix and r.reason.startswith(tool_word)),
+        None,
+    )
+
+
+class TestDeriveVerifyPlanModulePath:
+    """derive_verify_plan(existing_files, module_configs, config, worktree_reader).
+
+    Module-config branch: module_configs is non-empty.
+    """
+
+    def test_root_conftest_full_suites_pytest(self):
+        """GOLDEN task-1077 (d7504d432d): conftest.py -> unscoped full-suite pytest."""
+        mc = ModuleConfig(
+            prefix='orchestrator',
+            test_command=(
+                'uv run --project orchestrator --directory orchestrator '
+                'pytest tests/ --tb=short -q'
+            ),
+            lint_command='uv run --directory orchestrator ruff check src/',
+        )
+        plan = derive_verify_plan(ROOT_CONFTEST_DIFF, [mc], None, fake_worktree_reader)
+        run = _run_for(plan, 'orchestrator', 'pytest:')
+        assert run is not None
+        assert run.scope_kind is ScopeKind.FULL_SUITE
+        # Verbatim unscoped test_command — structural equality against the
+        # same parse_config_command transform sidesteps render()'s documented
+        # cwd_rel-as-leading-`cd` normalisation (not always byte-identical to
+        # a --directory-form input — see verify_cmd.render's docstring).
+        assert run.cmd == parse_config_command(mc.test_command)
+        assert 'conftest' in run.reason.lower()
+
+    def test_structural_file_full_suites_pyright_and_skips_pytest(self):
+        """GOLDEN D2 module-side: a Protocol source file widens pyright, skips pytest."""
+        mc = ModuleConfig(
+            prefix='orchestrator',
+            test_command='uv run --project orchestrator --directory orchestrator pytest tests/',
+            lint_command='uv run --directory orchestrator ruff check src/',
+            type_check_command=(
+                'uv run --project orchestrator --directory orchestrator pyright src/ tests/'
+            ),
+        )
+        plan = derive_verify_plan(STRUCTURAL_DIFF, [mc], None, fake_worktree_reader)
+
+        pyright_run = _run_for(plan, 'orchestrator', 'pyright:')
+        assert pyright_run is not None
+        assert pyright_run.scope_kind is ScopeKind.FULL_SUITE
+        assert pyright_run.cmd == parse_config_command(mc.type_check_command)
+        assert STRUCTURAL_DIFF[0] in pyright_run.reason
+
+        pytest_run = _run_for(plan, 'orchestrator', 'pytest:')
+        assert pytest_run is not None
+        assert pytest_run.scope_kind is ScopeKind.SKIPPED
+
+    def test_lone_collectable_test_file_scopes_pytest(self):
+        """Control: a real test file alone must produce a FILE_SCOPED pytest run."""
+        mc = ModuleConfig(
+            prefix='shared',
+            test_command='uv run --directory shared pytest tests/',
+            lint_command='uv run --directory shared ruff check src/',
+        )
+        plan = derive_verify_plan(['shared/tests/test_x.py'], [mc], None, fake_worktree_reader)
+        run = _run_for(plan, 'shared', 'pytest:')
+        assert run is not None
+        assert run.scope_kind is ScopeKind.FILE_SCOPED
+        assert run.cmd is not None
+        assert 'shared/tests/test_x.py' in run.cmd.targets
+
+    def test_no_matching_files_contributes_only_skipped_runs(self):
+        """Control: a module with zero matching files contributes no non-SKIPPED runs."""
+        mc = ModuleConfig(
+            prefix='shared',
+            test_command='uv run --directory shared pytest tests/',
+            lint_command='uv run --directory shared ruff check src/',
+            type_check_command='uv run --directory shared pyright src/',
+        )
+        plan = derive_verify_plan(['fused-memory/src/foo.py'], [mc], None, fake_worktree_reader)
+        module_runs = [r for r in plan.runs if r.module_prefix == 'shared']
+        assert module_runs
+        assert all(r.scope_kind is ScopeKind.SKIPPED for r in module_runs)
