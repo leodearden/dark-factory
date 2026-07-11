@@ -12,6 +12,7 @@ Exercises the full integration of the deterministic task kind over the landed
 from __future__ import annotations
 
 import asyncio
+import time
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -94,6 +95,12 @@ class _StoreScheduler:
     def __init__(self) -> None:
         self._tasks: dict[str, dict] = {}
         self._status_history: dict[str, list[str]] = {}
+        # Task 2235 (W10-α): the workflow-cancel grace stamp dict now lives on
+        # the Scheduler (single owner, beside _dispatched/lock_table).  The
+        # Harness reads it through a back-compat property shim, so this
+        # scheduler stand-in must own the dict the same way the real Scheduler
+        # does (scheduler.py: ``self._workflow_cancel_at: dict[str, float] = {}``).
+        self._workflow_cancel_at: dict[str, float] = {}
 
     def seed(self, task: dict) -> None:
         """Seed a task dict into the store (used during test setup)."""
@@ -144,6 +151,21 @@ class _StoreScheduler:
 
     def release(self, task_id: str, *, requeued: bool = False) -> None:
         """No-op — no module lock table in this stand-in."""
+
+    # Task 2235 (W10-α): the workflow-cancel grace surface moved from the
+    # Harness onto the Scheduler (single owner).  The Harness now reaches these
+    # through ``self.scheduler`` (harness.py: cancel_workflow →
+    # note_workflow_cancelled; the reconcile sweep → clear_workflow_cancel /
+    # workflow_cancel_recent), so this stand-in mirrors them over its own dict.
+    def note_workflow_cancelled(self, tid: str) -> None:
+        self._workflow_cancel_at[str(tid)] = time.monotonic()
+
+    def clear_workflow_cancel(self, tid: str) -> None:
+        self._workflow_cancel_at.pop(str(tid), None)
+
+    def workflow_cancel_recent(self, tid: str) -> bool:
+        cancelled_at = self._workflow_cancel_at.get(str(tid))
+        return cancelled_at is not None and time.monotonic() - cancelled_at < 30.0
 
 
 # ---------------------------------------------------------------------------
@@ -1714,7 +1736,9 @@ def _build_reaper_harness(
     git_ops.release_lane_for_terminal_task = AsyncMock()
     h.git_ops = git_ops
     h.config.stranded_blocked_escalate_enabled = True
-    # Both are set to {} by Harness.__init__ — confirm our expectations
+    # _escalation_events is set to {} by Harness.__init__; _workflow_cancel_at
+    # is delegated (task 2235 shim) to the fresh _StoreScheduler's own {} dict —
+    # confirm both read empty at start.
     assert h._escalation_events == {}, '_escalation_events must be empty at start'
     assert h._workflow_cancel_at == {}, '_workflow_cancel_at must be empty at start'
     return h

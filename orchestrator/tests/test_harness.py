@@ -1,7 +1,8 @@
 """Tests for Harness external-dep escalation sink (task 1580).
 
 Asserts that:
-- After Harness construction, scheduler._on_external_dep_block is set (non-None).
+- After Harness construction, scheduler._callbacks.on_external_dep_block is set
+  (non-None) — the constructor-injected callback bundle (task 2235).
 - Invoking the callback sets the task to 'blocked' via scheduler.set_task_status.
 - Invoking the callback submits exactly one L1 Escalation to the escalation queue.
 - A second invocation with an open L1 is deduplicated (no duplicate submission).
@@ -44,15 +45,16 @@ def _install_mock_escalation_queue(harness: Harness) -> MagicMock:
 # ---------------------------------------------------------------------------
 
 class TestHarnessExternalDepBlockWiring:
-    """Harness must wire scheduler._on_external_dep_block after Scheduler construction."""
+    """Harness must wire on_external_dep_block into the Scheduler's
+    SchedulerCallbacks bundle at construction time (task 2235)."""
 
     def test_callback_installed_after_construction(self, tmp_path: Path) -> None:
-        """After Harness construction, scheduler._on_external_dep_block is not None."""
+        """After Harness construction, scheduler._callbacks.on_external_dep_block is not None."""
         harness = _make_harness(tmp_path)
 
-        assert harness.scheduler._on_external_dep_block is not None, (
-            'Harness must install _on_external_dep_block on the scheduler '
-            'right after Scheduler construction'
+        assert harness.scheduler._callbacks.on_external_dep_block is not None, (
+            'Harness must wire on_external_dep_block into the SchedulerCallbacks '
+            'bundle at Scheduler construction time'
         )
 
     @pytest.mark.asyncio
@@ -64,8 +66,8 @@ class TestHarnessExternalDepBlockWiring:
         # Patch scheduler.set_task_status to avoid real MCP calls.
         harness.scheduler.set_task_status = AsyncMock(return_value=True)
 
-        assert harness.scheduler._on_external_dep_block is not None
-        await harness.scheduler._on_external_dep_block(
+        assert harness.scheduler._callbacks.on_external_dep_block is not None
+        await harness.scheduler._callbacks.on_external_dep_block(
             '42',
             summary='EXTERNAL_DEP_CANCELLED: task 42 — dep cancelled',
             detail='dep dark_factory:5 is cancelled',
@@ -81,8 +83,8 @@ class TestHarnessExternalDepBlockWiring:
         mock_queue = _install_mock_escalation_queue(harness)
         harness.scheduler.set_task_status = AsyncMock(return_value=True)
 
-        assert harness.scheduler._on_external_dep_block is not None
-        await harness.scheduler._on_external_dep_block(
+        assert harness.scheduler._callbacks.on_external_dep_block is not None
+        await harness.scheduler._callbacks.on_external_dep_block(
             '42',
             summary='EXTERNAL_DEP_CANCELLED: task 42 — dep cancelled',
             detail='dep dark_factory:5 is cancelled',
@@ -108,11 +110,11 @@ class TestHarnessExternalDepBlockWiring:
         mock_queue = _install_mock_escalation_queue(harness)
         harness.scheduler.set_task_status = AsyncMock(return_value=True)
 
-        assert harness.scheduler._on_external_dep_block is not None
+        assert harness.scheduler._callbacks.on_external_dep_block is not None
 
         # First call — no open L1 yet → submits
         mock_queue.has_open_l1.return_value = False
-        await harness.scheduler._on_external_dep_block(
+        await harness.scheduler._callbacks.on_external_dep_block(
             '42',
             summary='EXTERNAL_DEP_CANCELLED: task 42 — dep cancelled',
             detail='detail',
@@ -121,7 +123,7 @@ class TestHarnessExternalDepBlockWiring:
 
         # Second call — L1 is now open → must NOT submit again
         mock_queue.has_open_l1.return_value = True
-        await harness.scheduler._on_external_dep_block(
+        await harness.scheduler._callbacks.on_external_dep_block(
             '42',
             summary='EXTERNAL_DEP_CANCELLED: task 42 — dep cancelled',
             detail='detail',
@@ -141,8 +143,8 @@ class TestHarnessExternalDepBlockWiring:
         harness.scheduler.set_task_status = AsyncMock(return_value=True)
 
         # Must not raise even without a queue.
-        assert harness.scheduler._on_external_dep_block is not None
-        await harness.scheduler._on_external_dep_block(
+        assert harness.scheduler._callbacks.on_external_dep_block is not None
+        await harness.scheduler._callbacks.on_external_dep_block(
             '99',
             summary='EXTERNAL_DEP_UNRESOLVED: ...',
             detail='detail',

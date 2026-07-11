@@ -14,7 +14,7 @@ from collections.abc import Callable, Iterable, Iterator
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from typing import Any, Protocol
+from typing import Any, Protocol, runtime_checkable
 
 from shared.locking import (
     files_to_modules,
@@ -367,6 +367,30 @@ class RequeueRecord:
     timestamp: float
 
 
+@dataclass(frozen=True)
+class SchedulerCallbacks:
+    """Constructor-injected Harness→Scheduler callback bundle (task 2235).
+
+    Replaces nine post-construction ``scheduler._on_*``-style monkey-patches
+    with a single immutable bundle passed to ``Scheduler.__init__``.  Every
+    field defaults to ``None`` so a bare ``Scheduler(config)`` (no
+    ``callbacks=`` argument) collapses to an all-no-op bundle — the existing
+    bare-Scheduler unit-test contract is unaffected.  Frozen: the Harness
+    builds one bundle at construction time; there is no post-hoc mutation or
+    half-wired window.
+    """
+
+    on_park_stop_trip: Callable[[str], Any] | None = None
+    on_external_dep_block: Callable[..., Any] | None = None
+    on_starvation_warn: Callable[..., Any] | None = None
+    on_starvation_resolve: Callable[..., Any] | None = None
+    warm_base_health_probe: Callable[..., Any] | None = None
+    on_warm_base_warn: Callable[..., Any] | None = None
+    on_warm_base_promote_l2: Callable[..., Any] | None = None
+    on_warm_base_resolve: Callable[..., Any] | None = None
+    suppress_blocked_write: Callable[[str], bool] | None = None
+
+
 def _render_retry_cap_report(
     *,
     task_id: str,
@@ -440,6 +464,77 @@ class McpSessionLike(Protocol):
         arguments: dict,
         timeout: float = ...,
     ) -> dict: ...
+
+
+@runtime_checkable
+class SchedulerFacade(Protocol):
+    """Structural interface for the task-store back-channel a ``TaskWorkflow``
+    needs from its ``scheduler`` -- task-status/data operations, NOT the
+    liveness/callback surface described by ``SchedulerCallbacks`` above.
+
+    Both ``Scheduler`` (production) and the lightweight ``FakeScheduler`` test
+    double (``orchestrator/tests/_workflow_helpers.py``) conform structurally
+    to this Protocol without either inheriting from the other. Relocated here
+    from ``workflow._SchedulerLike`` (task 2235) so the Scheduler owns the
+    seam it describes, rather than the seam being declared privately by its
+    consumer. ``@runtime_checkable`` additionally lets tests assert
+    conformance with ``isinstance()`` at runtime -- on top of (not instead
+    of) the ``TYPE_CHECKING`` pyright-only conformance blocks in
+    test_workflow_e2e.py / test_workflow_dry_run_hook.py /
+    _workflow_helpers.py that pin the exact method shapes.
+    """
+
+    async def set_task_status(
+        self,
+        task_id: str,
+        status: str,
+        /,
+        *,
+        done_provenance: dict | None = ...,
+        reopen_reason: str | None = ...,
+        claimant_run_id: str | None = ...,
+        heartbeat_at: str | None = ...,
+    ) -> None: ...
+    async def set_task_claimant(
+        self,
+        task_id: str,
+        /,
+        *,
+        claimant_run_id: str | None = ...,
+        heartbeat_at: str | None = ...,
+    ) -> None: ...
+    async def mark_done(
+        self,
+        task_id: str,
+        /,
+        *,
+        kind: str,
+        sha: str,
+        note: str | None = ...,
+    ) -> None: ...
+    async def handle_blast_radius_expansion(
+        self,
+        task_id: str,
+        current: list[str],
+        needed: list[str],
+        /,
+        *,
+        persist_files: list[str] | None = ...,
+    ) -> bool: ...
+    async def get_status(self, task_id: str, /) -> str | None: ...
+    async def get_task(self, task_id: str, /) -> dict | None: ...
+    async def update_task(
+        self, task_id: str, metadata: str | dict, *, append: bool = ...,
+    ) -> bool: ...
+    async def dispatch_tool(
+        self, name: str, arguments: dict, *, timeout: float = ...,
+    ) -> dict: ...
+    async def get_tasks(self, *, statuses: Iterable[str] | None = ...) -> list[dict]: ...
+    async def get_statuses(
+        self, ids: list[str] | None = ...,
+    ) -> tuple[dict[str, str], Exception | None]: ...
+    async def tasks_by_train(self, train_id: str, /) -> list[dict]: ...
+    def clear_requeue_count(self, task_id: str, /) -> None: ...
 
 
 @dataclass
@@ -1045,6 +1140,7 @@ class Scheduler:
         config: OrchestratorConfig,
         event_store: EventStore | None = None,
         *,
+        callbacks: SchedulerCallbacks | None = None,
         mcp_session: McpSessionLike | None = None,
         time_source: Callable[[], float] | None = None,
         override_store: OverrideStore | None = None,
@@ -1053,6 +1149,10 @@ class Scheduler:
         wall_time_source: Callable[[], datetime] | None = None,
     ):
         self.config = config
+        # Constructor-injected Harness callback bundle (task 2235).  Omitting
+        # callbacks= collapses to an all-None SchedulerCallbacks so bare-
+        # Scheduler unit tests are unaffected.
+        self._callbacks: SchedulerCallbacks = callbacks or SchedulerCallbacks()
         self._time_source: Callable[[], float] = _resolve_time_source(time_source)
         # Wall-clock source (task 2335 β) for the milestone time-gate: unlike
         # self._time_source (monotonic, resets across restarts), milestone
@@ -1075,6 +1175,15 @@ class Scheduler:
         self.event_store = event_store
         self._mcp_session = mcp_session
         self._dispatched: set[str] = set()
+        # --- Workflow-cancel grace stamp (task 2235, relocated from Harness) ---
+        # Written by cancel_workflow/hard_cancel_workflow so a mid-run
+        # reconcile sweep does not race a workflow's finally-block teardown
+        # (park→deferred / restart→pending) for _RECONCILE_CANCEL_GRACE_S
+        # seconds after cancellation.  Lives beside _dispatched/lock_table
+        # (their single writer = the Scheduler).  Semantics mirror the
+        # harness's former _workflow_cancel_recent exactly.
+        self._workflow_cancel_at: dict[str, float] = {}
+        self._RECONCILE_CANCEL_GRACE_S: float = 30.0
         self._memory_url = config.fused_memory.url
         self._project_root = str(config.project_root)
         self._module_cache: dict[str, list[str]] = {}  # task_id -> expanded modules
@@ -1124,6 +1233,11 @@ class Scheduler:
         self._overrides_initialized: bool = False
         # --- Park-eviction store (task 1871) ---
         self._park_eviction_store: ParkEvictionRequestStore | None = park_eviction_store
+        # --- Startup gate (task 2235, W10-α) ---
+        # False until finish_startup() is called.  acquire_next() asserts
+        # this — a runtime check for the "startup reconcile sweeps run
+        # before the first dispatch tick" invariant (previously comment-only).
+        self._started: bool = False
         # --- Park-and-stop pause state (task 1322) ---
         self._paused: bool = False
         self._pause_reason: str | None = None
@@ -1139,22 +1253,6 @@ class Scheduler:
         # entries currently in _blocked_transitions.  Kept in sync with the
         # deque — entries are added/removed together.
         self._blocked_task_ids_in_window: set[str] = set()
-        # Callback installed by the Harness so trip → persistence + event.
-        self._on_park_stop_trip: Callable[[str], Any] | None = None
-        # --- Cross-project external-dep escalation (task 1580) ---
-        # Callback installed by the Harness: (task_id, *, summary, detail,
-        # category) → block the task + submit L1.  Default None so bare-Harness
-        # unit tests (and park_gc) are unaffected.
-        self._on_external_dep_block: Callable[..., Any] | None = None
-        # --- Action-teardown suppression (task 1620, β Pair E / C3.2) ---
-        # Predicate installed by the Harness: when set, set_task_status('blocked',
-        # ...) returns early (before dispatch_tool) if the predicate returns True
-        # for that task_id.  Absorbs racing 'blocked' writes emitted by a workflow
-        # being killed during action teardown (park→deferred / restart→pending) so
-        # the action's target status is not clobbered.  Mirrors the
-        # _on_park_stop_trip / _on_external_dep_block callback-install pattern:
-        # declared here, installed by Harness.__init__.
-        self._suppress_blocked_write: Callable[[str], bool] | None = None
         # --- Consecutive-tick streak counters (task 2124) ---
         # Backed by StreakCounter/StreakRegistry (orchestrator.streaks).  The
         # registry owns COUNTING + GC only; fire/escalate/block decisions stay
@@ -1236,15 +1334,6 @@ class Scheduler:
         # get_by_task dedup).  Cleared when the task dispatches or is GC'd.
         # ALIASED to _streak_starvation.escalated (task 2124).
         self._starvation_escalated = self._streak_starvation.escalated
-        # Callback installed by the Harness to file an INFO escalation when a
-        # starved task crosses both thresholds.  Signature:
-        #   (task_id: str, *, summary: str, detail: str) -> None (async)
-        # Default None so bare-Scheduler unit tests are unaffected.
-        self._on_starvation_warn: Callable[..., Any] | None = None
-        # Callback installed by the Harness to resolve the open INFO escalation
-        # when the task finally dispatches.  Signature: (task_id: str) -> None (async)
-        # Default None so bare-Scheduler unit tests are unaffected.
-        self._on_starvation_resolve: Callable[..., Any] | None = None
         # --- Warm-base hard-down watchdog state (task 2061) ---
         # SINGLETON latch — one host-scoped warm-lane CoW seed base, so exactly
         # one signal/window/L2 (unlike the starvation watchdog's per-task dict/
@@ -1260,25 +1349,6 @@ class Scheduler:
         # for the CURRENT latch engagement.  Reset to False whenever the latch
         # re-engages after a resolve.
         self._warm_base_l2_promoted: bool = False
-        # Injected async probe installed by the Harness — calls
-        # GitOps._warm_lane_base_resolvable() and returns its WarmBaseHealth
-        # .value ('ok' | 'absent' | 'indeterminate').  Signature: () -> str
-        # (async).  Default None so bare-Scheduler unit tests are unaffected
-        # and the watchdog is a no-op until the Harness wires it up.
-        self._warm_base_health_probe: Callable[..., Any] | None = None
-        # Callback installed by the Harness to file the ONE INFO notice when
-        # the latch engages.  Signature: (*, summary: str, detail: str) -> None
-        # (async).  Default None so bare-Scheduler unit tests are unaffected.
-        self._on_warm_base_warn: Callable[..., Any] | None = None
-        # Callback installed by the Harness to promote the ONE born-at-L2
-        # escalation when the base is still absent past l2_window_secs.
-        # Signature: (*, summary: str, detail: str) -> None (async).  Default
-        # None so bare-Scheduler unit tests are unaffected.
-        self._on_warm_base_promote_l2: Callable[..., Any] | None = None
-        # Callback installed by the Harness to resolve BOTH the notice and any
-        # promoted L2 when the probe reports 'ok' again.  Signature: () -> None
-        # (async).  Default None so bare-Scheduler unit tests are unaffected.
-        self._on_warm_base_resolve: Callable[..., Any] | None = None
         # Injected async hook installed by the Harness — the landed-outbox
         # consult-before-dispatch gate (task 2156, W1 δ — PRD
         # merge-queue-reliability §8.2 SD-1, boundary B5).  Signature:
@@ -1454,7 +1524,7 @@ class Scheduler:
             return
         if not self.config.park_stop_enabled:
             return
-        if self._on_park_stop_trip is None:
+        if self._callbacks.on_park_stop_trip is None:
             return
         n = len(self._blocked_transitions)
         threshold = self.config.park_stop_parked_threshold
@@ -1472,7 +1542,7 @@ class Scheduler:
         self.pause(reason)
         logger.warning('Park-stop trip: %s — pausing scheduler', reason)
         try:
-            t = asyncio.ensure_future(self._on_park_stop_trip(reason))
+            t = asyncio.ensure_future(self._callbacks.on_park_stop_trip(reason))
             # Attach a done-callback so exceptions inside harness.pause_scheduler
             # (e.g. RunStore write failure, EventStore emit failure) are logged
             # immediately rather than surfacing as GC-collected Task warnings
@@ -1752,8 +1822,8 @@ class Scheduler:
         # write reach fused-memory, defeating C3.2.)
         if (
             status == 'blocked'
-            and self._suppress_blocked_write is not None
-            and self._suppress_blocked_write(task_id)
+            and self._callbacks.suppress_blocked_write is not None
+            and self._callbacks.suppress_blocked_write(task_id)
         ):
             logger.info(
                 'set_task_status(%s, blocked): suppressed by action-teardown — skipping write',
@@ -2206,7 +2276,7 @@ class Scheduler:
                     # Pop so the next crossing (if it persists) fires again —
                     # mirrors the sentinel re-fire pattern.
                     self._streak_resolver_degraded.clear(task_id)
-                    if self._on_external_dep_block is not None:
+                    if self._callbacks.on_external_dep_block is not None:
                         summary = (
                             f'EXTERNAL_DEP_RESOLVER_DEGRADED: task {task_id} — '
                             f'external-dep resolver degraded for {count} consecutive ticks'
@@ -2221,7 +2291,7 @@ class Scheduler:
                             f'are not re-evaluated automatically.  '
                             f'(prefer-loud backstop, task 1855)'
                         )
-                        await self._on_external_dep_block(
+                        await self._callbacks.on_external_dep_block(
                             task_id,
                             summary=summary,
                             detail=detail,
@@ -2284,8 +2354,8 @@ class Scheduler:
                         f'cancelled.  Task {task_id} cannot proceed; it should '
                         f'be re-architected or cancelled itself.'
                     )
-                    if self._on_external_dep_block is not None:
-                        await self._on_external_dep_block(
+                    if self._callbacks.on_external_dep_block is not None:
+                        await self._callbacks.on_external_dep_block(
                             task_id,
                             summary=summary,
                             detail=detail,
@@ -2321,8 +2391,8 @@ class Scheduler:
                             f'task {task_id} back to pending to reopen it — '
                             f'blocked tasks are not re-evaluated automatically.'
                         )
-                        if self._on_external_dep_block is not None:
-                            await self._on_external_dep_block(
+                        if self._callbacks.on_external_dep_block is not None:
+                            await self._callbacks.on_external_dep_block(
                                 task_id,
                                 summary=summary,
                                 detail=detail,
@@ -2437,7 +2507,7 @@ class Scheduler:
                 skip >= cfg.skip_threshold
                 and idle_elapsed >= cfg.idle_secs
                 and not self._streak_starvation.is_escalated(tid)
-                and self._on_starvation_warn is not None
+                and self._callbacks.on_starvation_warn is not None
             ):
                 summary = (
                     f'STARVATION_WATCHDOG: task {tid} skip_count={skip} '
@@ -2457,7 +2527,7 @@ class Scheduler:
                     f'by the fairness parks.\n\n'
                     f'skip_threshold={cfg.skip_threshold}, idle_secs={cfg.idle_secs}'
                 )
-                await self._on_starvation_warn(tid, summary=summary, detail=detail)
+                await self._callbacks.on_starvation_warn(tid, summary=summary, detail=detail)
                 self._streak_starvation.mark_escalated(tid)
 
     async def _resolve_starvation_escalation(self, task_id: str) -> None:
@@ -2473,8 +2543,8 @@ class Scheduler:
         failure can NEVER abort a successful dispatch (PROPERTY 1).
         """
         in_escalated = self._streak_starvation.is_escalated(task_id)
-        if in_escalated and self._on_starvation_resolve is not None:
-            await self._on_starvation_resolve(task_id)
+        if in_escalated and self._callbacks.on_starvation_resolve is not None:
+            await self._callbacks.on_starvation_resolve(task_id)
         # Unconditionally clear both dicts so no stale residue survives.
         self._streak_starvation.clear(task_id)
 
@@ -2487,8 +2557,8 @@ class Scheduler:
         ``StreakRegistry.gc`` already wraps this call in try/except, so no
         additional fail-safety is needed here.
         """
-        if self._on_starvation_resolve is not None:
-            await self._on_starvation_resolve(tid)
+        if self._callbacks.on_starvation_resolve is not None:
+            await self._callbacks.on_starvation_resolve(tid)
 
     async def _apply_warm_base_hard_down_watchdog(self) -> None:
         """Host-scoped warm-lane CoW base health latch (task 2061).
@@ -2549,14 +2619,14 @@ class Scheduler:
         """
         cfg = self.config.warm_base_hard_down
 
-        if not cfg.enabled or self._warm_base_health_probe is None:
+        if not cfg.enabled or self._callbacks.warm_base_health_probe is None:
             if self._warm_base_hard_down:
                 self._warm_base_hard_down = False
                 self._warm_base_hard_down_since = None
                 self._warm_base_l2_promoted = False
-                if self._on_warm_base_resolve is not None:
+                if self._callbacks.on_warm_base_resolve is not None:
                     try:
-                        await self._on_warm_base_resolve()
+                        await self._callbacks.on_warm_base_resolve()
                     except Exception:
                         logger.warning(
                             'warm-base resolve on watchdog-disable raised',
@@ -2565,7 +2635,7 @@ class Scheduler:
             return
 
         try:
-            health = await self._warm_base_health_probe()
+            health = await self._callbacks.warm_base_health_probe()
         except Exception:
             logger.warning(
                 'warm-base hard-down probe raised — holding current latch state',
@@ -2584,9 +2654,9 @@ class Scheduler:
                 self._warm_base_hard_down = False
                 self._warm_base_hard_down_since = None
                 self._warm_base_l2_promoted = False
-                if self._on_warm_base_resolve is not None:
+                if self._callbacks.on_warm_base_resolve is not None:
                     try:
-                        await self._on_warm_base_resolve()
+                        await self._callbacks.on_warm_base_resolve()
                     except Exception:
                         logger.warning(
                             'warm-base resolve on probe-recovery raised',
@@ -2602,7 +2672,7 @@ class Scheduler:
             self._warm_base_hard_down = True
             self._warm_base_hard_down_since = now
             self._warm_base_l2_promoted = False
-            if self._on_warm_base_warn is not None:
+            if self._callbacks.on_warm_base_warn is not None:
                 summary = (
                     'WARM_BASE_HARD_DOWN: warm-lane CoW seed base is absent — '
                     'halting dispatch host-wide (fail-open) until it is restored'
@@ -2619,7 +2689,7 @@ class Scheduler:
                     f'escalation follows if still absent after '
                     f'{cfg.l2_window_secs:.0f}s.'
                 )
-                await self._on_warm_base_warn(summary=summary, detail=detail)
+                await self._callbacks.on_warm_base_warn(summary=summary, detail=detail)
             return
 
         # Already latched & absent — check for L2 promotion (stuck past window).
@@ -2629,7 +2699,7 @@ class Scheduler:
             and (now - self._warm_base_hard_down_since) >= cfg.l2_window_secs
         ):
             self._warm_base_l2_promoted = True
-            if self._on_warm_base_promote_l2 is not None:
+            if self._callbacks.on_warm_base_promote_l2 is not None:
                 summary = (
                     'WARM_BASE_HARD_DOWN: still absent after '
                     f'{cfg.l2_window_secs:.0f}s — remediation appears stuck'
@@ -2642,7 +2712,7 @@ class Scheduler:
                     'cleared this latch via refresh_warm_base already).  '
                     'Human investigation required.'
                 )
-                await self._on_warm_base_promote_l2(summary=summary, detail=detail)
+                await self._callbacks.on_warm_base_promote_l2(summary=summary, detail=detail)
 
     async def update_task(
         self,
@@ -3850,6 +3920,11 @@ class Scheduler:
         No MCP round-trips, no GC, no override snapshots are performed while
         paused — all resume cleanly on the first unpaused tick.
         """
+        assert self._started, (
+            'acquire_next() called before finish_startup() — startup '
+            'reconcile sweeps must run before the first dispatch tick '
+            '(task 2235)'
+        )
         if self._paused:
             logger.debug(
                 'acquire_next() short-circuit: scheduler is paused (reason=%r)',
@@ -5125,6 +5200,76 @@ class Scheduler:
                     },
                 )
 
+    # --- Public liveness accessors (task 2235, W10-α) ---
+    # Replace the Harness's direct reach-ins into Scheduler-private liveness
+    # state (``_dispatched``, ``lock_table._held``, ``_requeue_history``) with
+    # a stable public surface.  The Scheduler remains the single writer.
+
+    def is_dispatched(self, tid: str) -> bool:
+        """True iff *tid* is currently held in the in-flight dispatched set."""
+        return tid in self._dispatched
+
+    def note_workflow_cancelled(self, tid: str) -> None:
+        """Stamp *tid* as just-cancelled, opening the reconcile grace window."""
+        self._workflow_cancel_at[tid] = time.monotonic()
+
+    def clear_workflow_cancel(self, tid: str) -> None:
+        """Clear *tid*'s cancel stamp, if any (no-op if absent)."""
+        self._workflow_cancel_at.pop(tid, None)
+
+    def workflow_cancel_recent(self, tid: str) -> bool:
+        """Return True if *tid* has a workflow-cancel stamp within the grace window.
+
+        Semantics (mirrors the former Harness._workflow_cancel_recent exactly):
+          - No stamp (never cancelled / already pruned) → False.
+          - Stamp exists AND now - stamp < _RECONCILE_CANCEL_GRACE_S → True
+            (workflow's finally-block may still be writing state; skip).
+          - Stamp exists AND now - stamp >= grace → False (stale; re-filing
+            is safe — the stamp is lazily pruned by the sweep loop's next
+            mid-run cycle via clear_workflow_cancel).
+        """
+        cancelled_at = self._workflow_cancel_at.get(tid)
+        return (
+            cancelled_at is not None
+            and time.monotonic() - cancelled_at < self._RECONCILE_CANCEL_GRACE_S
+        )
+
+    def is_actively_held(self, tid: str) -> bool:
+        """True if *tid* is dispatched, holds a module lock, or was recently
+        cancelled (still inside the reconcile grace window).
+
+        The single public liveness check a reconcile sweep should use before
+        acting on a task — folds together the three liveness signals the
+        Scheduler owns so callers no longer reach into ``_dispatched`` /
+        ``lock_table._held`` / the cancel-grace stamp individually.
+        """
+        return (
+            tid in self._dispatched
+            or self.lock_table.is_held(tid)
+            or self.workflow_cancel_recent(tid)
+        )
+
+    # --- Startup gate (task 2235, W10-α) ---
+
+    @property
+    def started(self) -> bool:
+        """True once ``finish_startup()`` has been called.
+
+        ``acquire_next()`` asserts this before doing any work — a runtime
+        check for the "startup reconcile sweeps run before the first
+        dispatch tick" invariant.
+        """
+        return self._started
+
+    def finish_startup(self) -> None:
+        """Mark startup complete, allowing ``acquire_next()`` to run.
+
+        Callers (the Harness main-loop bootstrap, and Scheduler-only test
+        factories that drive ``acquire_next()`` directly) must call this
+        once their startup reconcile sweeps have finished.  Idempotent.
+        """
+        self._started = True
+
     # --- Retry cap (per-task REQUEUED counter) ---
 
     def record_requeue(
@@ -5174,6 +5319,14 @@ class Scheduler:
     def transient_requeue_count(self, task_id: str) -> int:
         """Return the number of transient API requeues recorded for *task_id*."""
         return self._transient_requeue_counts.get(task_id, 0)
+
+    def requeue_history(self, task_id: str) -> list[RequeueRecord]:
+        """Return a list copy of *task_id*'s ``RequeueRecord`` history.
+
+        ``[]`` when the task has no recorded requeues.  The returned list is
+        a copy — mutating it does not affect the scheduler's internal state.
+        """
+        return list(self._requeue_history.get(task_id, ()))
 
     def clear_requeue_count(self, task_id: str) -> None:
         """Clear the requeue counters and history for *task_id*.

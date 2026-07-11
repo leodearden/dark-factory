@@ -13,7 +13,7 @@ import asyncio
 from unittest.mock import MagicMock, patch
 
 import pytest
-from _orch_helpers import _init_harness_state_for_test
+from _orch_helpers import _init_harness_state_for_test, wire_scheduler_liveness_mock
 
 from orchestrator.harness import Harness
 from orchestrator.scheduler import TaskAssignment
@@ -28,10 +28,14 @@ def harness() -> Harness:
     h = Harness.__new__(Harness)
     _init_harness_state_for_test(h)  # task 1449: initialise digest counters
     h._workflow_cancel_events = {}
-    # cancel_workflow stamps wall-clock for the reconcile sweep's grace
-    # window (R3 race guard).  Initialise here so the bypass-__init__
-    # fixture matches the real Harness attribute set.
-    h._workflow_cancel_at = {}
+    # cancel_workflow/hard_cancel_workflow stamp wall-clock for the reconcile
+    # sweep's grace window (R3 race guard) via the Scheduler (task 2235: the
+    # grace-stamp dict now lives on the Scheduler, not the Harness) — wire a
+    # scheduler mock with real liveness-accessor behaviour so
+    # note_workflow_cancelled() and the _workflow_cancel_at back-compat shim
+    # both work instead of AttributeError'ing on a missing `scheduler`.
+    h.scheduler = MagicMock()
+    wire_scheduler_liveness_mock(h.scheduler)
     # hard_cancel_workflow reads _workflow_slot_tasks (task 1491, step-6).
     h._workflow_slot_tasks = {}
     return h
@@ -112,6 +116,12 @@ def harness_for_run_slot() -> Harness:
     """Harness with all attributes needed to drive _run_slot directly."""
     h = Harness.__new__(Harness)
     _init_harness_state_for_test(h)
+    # scheduler must exist before any _workflow_cancel_at access below — the
+    # grace-stamp dict now lives on the Scheduler (task 2235) and the Harness
+    # `_workflow_cancel_at` property forwards reads/writes to
+    # self.scheduler._workflow_cancel_at.
+    h.scheduler = MagicMock()
+    wire_scheduler_liveness_mock(h.scheduler)
     # cancel / slot registries
     h._workflow_cancel_events = {}
     h._workflow_cancel_at = {}
@@ -140,8 +150,8 @@ def harness_for_run_slot() -> Harness:
     h._run_store = None
     h._run_id = None
     h.review_checkpoint = None
-    # scheduler — only release() is called from _run_slot's finally
-    h.scheduler = MagicMock()
+    # scheduler (wired above) — only release() is additionally called from
+    # _run_slot's finally
     h.scheduler.release = MagicMock()
     # carries_substrate_probe was added after these tests were written; mock it
     # False so _run_slot does not call _run_substrate_gate (which dereferences

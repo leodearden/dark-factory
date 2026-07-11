@@ -118,7 +118,6 @@ def harness_for_registry_run_slot() -> Harness:
     h = Harness.__new__(Harness)
     _init_harness_state_for_test(h)
     h._workflow_cancel_events = {}
-    h._workflow_cancel_at = {}
     h._workflow_slot_tasks = {}
     h._terminal_cancel_counts = {}
     h._escalation_events = {}
@@ -150,6 +149,9 @@ def harness_for_registry_run_slot() -> Harness:
     # mock it False so _run_slot stays on the normal (non-deterministic) path
     # rather than routing into _run_deterministic_slot.
     h.scheduler.is_deterministic = MagicMock(return_value=False)
+    # task 2235 (W10-α): the cancel-grace stamp dict now lives on the Scheduler
+    # (single owner); harness._workflow_cancel_at is a back-compat shim over it.
+    h.scheduler._workflow_cancel_at = {}
     return h
 
 

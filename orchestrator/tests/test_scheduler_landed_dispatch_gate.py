@@ -54,6 +54,7 @@ class TestLandedOutboxGateDefaultNoop:
 
     async def test_unset_gate_dispatches_normally(self) -> None:
         scheduler = Scheduler(OrchestratorConfig(max_per_module=1))
+        scheduler.finish_startup()
         task = _pending_task('Z')
         scheduler.get_tasks = AsyncMock(return_value=[task])
 
@@ -75,6 +76,7 @@ class TestLandedOutboxGateB5Gates:
 
     async def test_gate_true_withholds_dispatch(self) -> None:
         scheduler = Scheduler(OrchestratorConfig(max_per_module=1))
+        scheduler.finish_startup()
         task = _pending_task('Z')
         scheduler.get_tasks = AsyncMock(return_value=[task])
         scheduler._landed_outbox_gate = AsyncMock(return_value=True)
@@ -87,6 +89,7 @@ class TestLandedOutboxGateB5Gates:
 
     async def test_gate_false_dispatches_normally(self) -> None:
         scheduler = Scheduler(OrchestratorConfig(max_per_module=1))
+        scheduler.finish_startup()
         task = _pending_task('Z')
         scheduler.get_tasks = AsyncMock(return_value=[task])
         scheduler._landed_outbox_gate = AsyncMock(return_value=False)
@@ -123,6 +126,7 @@ class TestLandedOutboxGatePinnedParity:
         store.set_override('/proj', 'Z', pinned=True)
 
         scheduler = Scheduler(config, override_store=store)
+        scheduler.finish_startup()
         scheduler._project_root = '/proj'
         # Gate only 'Z' (the pinned task) — 'Y' must remain freely dispatchable
         # so the run doesn't short-circuit on an empty candidate list before
@@ -166,6 +170,7 @@ class TestLandedOutboxGateFailsOpen:
     async def test_gate_raises_fails_open_and_dispatches(self, caplog) -> None:
         caplog.set_level('WARNING')
         scheduler = Scheduler(OrchestratorConfig(max_per_module=1))
+        scheduler.finish_startup()
         task = _pending_task('Z')
         scheduler.get_tasks = AsyncMock(return_value=[task])
         scheduler._landed_outbox_gate = AsyncMock(side_effect=RuntimeError('git hiccup'))
@@ -181,6 +186,7 @@ class TestLandedOutboxGateFailsOpen:
 
     async def test_gate_raises_for_one_candidate_does_not_abort_others(self) -> None:
         scheduler = Scheduler(OrchestratorConfig(max_per_module=1))
+        scheduler.finish_startup()
         task_z = _pending_task('Z', files=['z/src'])
         task_y = _pending_task('Y', files=['y/src'])
         scheduler.get_tasks = AsyncMock(return_value=[task_z, task_y])

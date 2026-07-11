@@ -135,6 +135,11 @@ def _build_scheduler(clock: list[datetime]) -> Scheduler:
     config = OrchestratorConfig(max_per_module=1)
     scheduler = Scheduler(config, wall_time_source=lambda: clock[0])
     scheduler.update_task = AsyncMock(return_value=True)
+    # Task 2235: acquire_next() now asserts finish_startup() has run (the
+    # runtime-enforced 'startup sweeps run before the first tick' invariant).
+    # Test schedulers built directly (bypassing Harness's startup sweeps)
+    # must call it explicitly.
+    scheduler.finish_startup()
     return scheduler
 
 

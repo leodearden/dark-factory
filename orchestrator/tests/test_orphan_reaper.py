@@ -11,6 +11,7 @@ from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+from _orch_helpers import wire_scheduler_liveness_mock
 
 from orchestrator.event_store import EventType
 from orchestrator.harness import Harness
@@ -25,7 +26,11 @@ def harness(tmp_path: Path, mock_orch_config):
         h = Harness(mock_orch_config)
 
     h.scheduler = MagicMock()
-    h.scheduler._dispatched = set()
+    # Wire real (non-auto-mock) liveness-accessor behaviour (task 2235:
+    # harness.py now calls scheduler.is_dispatched() instead of reaching
+    # into _dispatched directly) so the reaper's live/orphan routing below
+    # exercises real semantics instead of an auto-mocked (always-truthy) stub.
+    wire_scheduler_liveness_mock(h.scheduler)
     h.scheduler.get_statuses = AsyncMock(return_value=({'100': 'pending', '101': 'done'}, None))
 
     base = (tmp_path / '.worktrees').resolve()

@@ -226,6 +226,10 @@ def build_harness(tmp_path: Path) -> tuple[Harness, TwoProjectMcpSession]:
     harness.scheduler._mcp_session = session
     # Wire a real EscalationQueue so escalations can be filed and read back.
     harness._escalation_queue = EscalationQueue(tmp_path / 'escalations')
+    # run_tick() drives harness.scheduler.acquire_next() directly, bypassing
+    # harness.run()'s startup sweeps — satisfy the startup gate (task 2235)
+    # the same way those sweeps would.
+    harness.scheduler.finish_startup()
     return harness, session
 
 

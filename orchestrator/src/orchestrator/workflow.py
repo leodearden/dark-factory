@@ -11,7 +11,6 @@ import re
 import sys
 import time
 import uuid
-from collections.abc import Iterable
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
@@ -230,66 +229,13 @@ if TYPE_CHECKING:
     from escalation.queue import EscalationQueue
 
     from orchestrator.merge_queue import InFlightMergeRegistry, MergeOutcome, SoloVerifyResult
+    from orchestrator.scheduler import SchedulerFacade
     from orchestrator.usage_gate import UsageGate
 
 
 # ---------------------------------------------------------------------------
 # Structural protocols — allow test doubles without inheriting concrete classes
 # ---------------------------------------------------------------------------
-
-
-class _SchedulerLike(Protocol):
-    async def set_task_status(
-        self,
-        task_id: str,
-        status: str,
-        /,
-        *,
-        done_provenance: dict | None = ...,
-        reopen_reason: str | None = ...,
-        claimant_run_id: str | None = ...,
-        heartbeat_at: str | None = ...,
-    ) -> None: ...
-    async def set_task_claimant(
-        self,
-        task_id: str,
-        /,
-        *,
-        claimant_run_id: str | None = ...,
-        heartbeat_at: str | None = ...,
-    ) -> None: ...
-    async def mark_done(
-        self,
-        task_id: str,
-        /,
-        *,
-        kind: str,
-        sha: str,
-        note: str | None = ...,
-    ) -> None: ...
-    async def handle_blast_radius_expansion(
-        self,
-        task_id: str,
-        current: list[str],
-        needed: list[str],
-        /,
-        *,
-        persist_files: list[str] | None = ...,
-    ) -> bool: ...
-    async def get_status(self, task_id: str, /) -> str | None: ...
-    async def get_task(self, task_id: str, /) -> dict | None: ...
-    async def update_task(
-        self, task_id: str, metadata: str | dict, *, append: bool = ...,
-    ) -> bool: ...
-    async def dispatch_tool(
-        self, name: str, arguments: dict, *, timeout: float = ...,
-    ) -> dict: ...
-    async def get_tasks(self, *, statuses: Iterable[str] | None = ...) -> list[dict]: ...
-    async def get_statuses(
-        self, ids: list[str] | None = ...,
-    ) -> tuple[dict[str, str], Exception | None]: ...
-    async def tasks_by_train(self, train_id: str, /) -> list[dict]: ...
-    def clear_requeue_count(self, task_id: str, /) -> None: ...
 
 
 class _McpLike(Protocol):
@@ -856,7 +802,7 @@ class TaskWorkflow:
         assignment: TaskAssignment,
         config: OrchestratorConfig,
         git_ops: GitOps,
-        scheduler: _SchedulerLike,
+        scheduler: SchedulerFacade,
         briefing: _BriefingLike,
         mcp: _McpLike | None,
         escalation_queue: EscalationQueue | None = None,

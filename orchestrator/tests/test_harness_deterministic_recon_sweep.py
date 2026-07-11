@@ -47,7 +47,7 @@ import asyncio
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
-from _orch_helpers import _init_harness_state_for_test
+from _orch_helpers import _init_harness_state_for_test, wire_scheduler_liveness_mock
 from escalation.models import Escalation
 
 from orchestrator.config import OrchestratorConfig
@@ -808,6 +808,13 @@ def _make_stranded_reaper_harness() -> Harness:
     h.git_ops.is_ancestor = AsyncMock(return_value=False)
     h.git_ops.find_merge_marker = AsyncMock(return_value=None)
     h.scheduler = MagicMock()
+    # Task 2235: harness._reconcile_one_stranded's stranded-blocked gate now
+    # calls self.scheduler.workflow_cancel_recent(tid) instead of reading
+    # self._workflow_cancel_at directly. A bare MagicMock auto-mocks that
+    # call to a truthy Mock regardless of state, which makes the `not
+    # self.scheduler.workflow_cancel_recent(tid)` guard always False and
+    # silently suppresses the escalation this fixture is meant to exercise.
+    wire_scheduler_liveness_mock(h.scheduler)
     h._escalation_queue = MagicMock()
     h._escalation_queue.make_id = MagicMock(return_value='esc-reaper-1')
     h._escalation_queue.get_by_task = MagicMock(return_value=[])

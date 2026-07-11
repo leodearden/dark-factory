@@ -47,6 +47,9 @@ class TestHarnessOverrideStoreIntegration:
 
         # Harness constructs its own OverrideStore at the same path.
         harness = Harness(config)
+        # This test drives acquire_next() directly (bypassing Harness.run()'s
+        # startup sweeps), so it must call finish_startup() itself (task 2235).
+        harness.scheduler.finish_startup()
 
         # Two competing tasks: pinned-low vs unpinned-critical.
         # Without overrides, task-critical would win on score alone.
