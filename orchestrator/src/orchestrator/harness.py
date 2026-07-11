@@ -7050,24 +7050,31 @@ Output JSON matching the schema. Every task must appear in the output.
 
         Called from BOTH run-loop rest branches (idle + busy-wait) so a
         saturated unit — which steady-states in the busy-wait branch — still
-        heartbeats.  (Fail-open guard added in task 2395 step-10.)
+        heartbeats.  Fail-open: any exception (state read or disk write) is
+        swallowed and logged — a heartbeat write must never stop the run loop.
         """
-        unit = os.environ.get('ORCH_UNIT', '')
-        merge_idle = self._merge_pipeline_idle()
-        queue_empty = self._merge_queue.empty()
-        depth = (
-            0 if self._merge_worker is None
-            else int(self._merge_worker.snapshot().get('depth', 0))
-        )
-        ts_epoch = time.time()
-        payload = build_heartbeat_payload(
-            unit=unit,
-            merge_idle=merge_idle,
-            depth=depth,
-            queue_empty=queue_empty,
-            ts_epoch=ts_epoch,
-        )
-        await asyncio.to_thread(write_heartbeat, resolve_fleet_dir(), unit, payload)
+        try:
+            unit = os.environ.get('ORCH_UNIT', '')
+            merge_idle = self._merge_pipeline_idle()
+            queue_empty = self._merge_queue.empty()
+            depth = (
+                0 if self._merge_worker is None
+                else int(self._merge_worker.snapshot().get('depth', 0))
+            )
+            ts_epoch = time.time()
+            payload = build_heartbeat_payload(
+                unit=unit,
+                merge_idle=merge_idle,
+                depth=depth,
+                queue_empty=queue_empty,
+                ts_epoch=ts_epoch,
+            )
+            await asyncio.to_thread(write_heartbeat, resolve_fleet_dir(), unit, payload)
+        except Exception:
+            logger.warning(
+                'merge heartbeat write failed; continuing (fail-open)',
+                exc_info=True,
+            )
 
     def _build_task_status_lookup(self) -> Callable[[str], Awaitable[str | None]]:
         """Return an async callable (task_id) -> str|None backed by the scheduler.
