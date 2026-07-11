@@ -2313,6 +2313,219 @@ class TestChainInvalidationUnderOverlap:
             'N (ci_a.py) must NOT be on main (verify failed)'
         )
 
+    async def test_head_failure_cascade_remerge_registers_merging_then_redispatch_parked(
+        self,
+        git_ops: GitOps,
+        git_repo: Path,
+        git_config: GitConfig,
+        config: OrchestratorConfig,
+    ) -> None:
+        """The head-failure cascade's remerge-and-park of a downstream entry
+        must reconcile the ItemLifecycle registry (VERIFYING -> MERGING ->
+        REDISPATCH_PARKED), not just move the item onto ``_redispatch``.
+
+        task 2441: merge_queue.py:9456-9460 re-merges N+1 and appends it to
+        ``_redispatch`` with NO ``_note_transition`` calls, so the registry
+        stays at VERIFYING while the item is physically parked on
+        ``_redispatch``. The later DISPATCH-FILL drain's
+        REDISPATCH_PARKED -> DISPATCHING ``_note_transition`` (9204-9209)
+        then fails its from_state cross-check against the diverged VERIFYING
+        registry state, firing a dedup'd L1
+        ``_alarm_illegal_lifecycle_transition`` escalation.
+
+        The bug is INVISIBLE to functional assertions: ``_note_transition``
+        is best-effort (never raises), so N+1 still resolves 'done' even on
+        RED. The RED signal is therefore the missing registry transitions /
+        spurious escalation, NOT the outcome — mirrors the sibling
+        ``test_runner_unavailable_cascade_finalizing_merging_redispatch_parked``
+        (test_merge_queue_lifecycle_registry.py:1219).
+
+        GREEN (task 2441): the cascade's remerge-and-park site wraps
+        ``_remerge`` with ``_note_transition(VERIFYING -> MERGING)`` before
+        and ``_note_transition(MERGING -> REDISPATCH_PARKED)`` after,
+        mirroring the RUNNER_UNAVAILABLE sibling template
+        (merge_queue.py:10532-10543).
+        """
+        from orchestrator.merge_queue import ItemLifecycleState
+
+        # ── N's local verify: gated (fails when gate_a_release is set) ──────
+        gate_a_release = asyncio.Event()
+        gate_a_entered = asyncio.Event()
+
+        # Track local-verify call count: first call = N (gate + fail),
+        # subsequent calls = N+1's re-dispatch (pass immediately).
+        _local_calls: list[int] = [0]
+
+        async def _gated_local(*args: Any, **kwargs: Any) -> MagicMock:
+            call = _local_calls[0]
+            _local_calls[0] += 1
+            if call == 0:
+                # N's verify: gate and fail
+                gate_a_entered.set()
+                await gate_a_release.wait()
+                return MagicMock(
+                    passed=False,
+                    summary='test_failure',
+                    test_output='FAILED',
+                    lint_output='',
+                    type_output='',
+                    category='test_failure',
+                    timed_out=False,
+                    verify_skipped=False,
+                )
+            # N+1's re-dispatched local verify (cascade path)
+            return MagicMock(
+                passed=True,
+                summary='ok',
+                test_output='ok',
+                lint_output='',
+                type_output='',
+                category='',
+                timed_out=False,
+                verify_skipped=False,
+            )
+
+        # ── N+1's remote verify: gated (passes when gate_b_release is set) ──
+        gate_b_release = asyncio.Event()
+        gate_b_entered = asyncio.Event()
+        gated_remote = _gated_runner(
+            gate_b_release, gate_b_entered, passed=True, name='laptop',
+        )
+
+        # ── Branches ─────────────────────────────────────────────────────────
+        wt_a = await _make_branch_with_file(
+            git_ops, 'task/ci-a-lifecycle', 'ci_a_lifecycle.py', 'a = 1\n'
+        )
+        wt_b = await _make_branch_with_file(
+            git_ops, 'task/ci-b-lifecycle', 'ci_b_lifecycle.py', 'b = 2\n'
+        )
+
+        # ── Worker setup ──────────────────────────────────────────────────────
+        q: asyncio.Queue[MergeRequest] = asyncio.Queue()
+        worker = SpeculativeMergeWorker(git_ops, q)
+        _inject_two_host_allocator(worker, gated_remote)
+
+        loop = asyncio.get_running_loop()
+        req_a = MergeRequest(
+            task_id='ci-a-lifecycle', branch='task/ci-a-lifecycle', worktree=wt_a,
+            pre_rebased=False, task_files=None, module_configs=[],
+            config=config, result=loop.create_future(), lane='normal',
+        )
+        req_b = MergeRequest(
+            task_id='ci-b-lifecycle', branch='task/ci-b-lifecycle', worktree=wt_b,
+            pre_rebased=False, task_files=None, module_configs=[],
+            config=config, result=loop.create_future(), lane='normal',
+        )
+
+        # ── Spies (installed BEFORE worker.run()) ───────────────────────────
+        # (a) _note_transition: record req_b's (from_state, to_state) pairs.
+        observed_b: list[tuple[Any, Any]] = []
+        original_note_transition = worker._note_transition
+
+        def _spy_note_transition(
+            rid: str, from_state: Any, to_state: Any, **kwargs: Any,
+        ) -> None:
+            if rid == req_b.request_id:
+                observed_b.append((from_state, to_state))
+            return original_note_transition(rid, from_state, to_state, **kwargs)
+
+        worker._note_transition = _spy_note_transition  # type: ignore[method-assign]
+
+        # (b) _remerge: capture the registry's current state for req_b mid-call,
+        # then delegate to the original so N+1 still re-merges and resolves.
+        mid_remerge_state: list[Any] = []
+        original_remerge = worker._remerge
+
+        async def _spying_remerge(req_: Any, started: Any) -> Any:
+            if req_.request_id == req_b.request_id:
+                mid_remerge_state.append(worker._lifecycle.current(req_b.request_id))
+            return await original_remerge(req_, started)
+
+        worker._remerge = _spying_remerge  # type: ignore[method-assign]
+
+        # (c) _alarm_illegal_lifecycle_transition: record request_ids of every
+        # rejected-transition alarm (2nd positional arg, per the call at
+        # merge_queue.py:5390-5393).
+        illegal_alarms: list[str] = []
+
+        def _spy_illegal_alarm(
+            escalation_queue: Any, request_id: str, *args: Any, **kwargs: Any,
+        ) -> None:
+            illegal_alarms.append(request_id)
+
+        outcome_b: MergeOutcome | None = None
+
+        with patch('orchestrator.merge_queue.run_scoped_verification', _gated_local), \
+                patch(
+                    'orchestrator.merge_queue._alarm_illegal_lifecycle_transition',
+                    _spy_illegal_alarm,
+                ):
+            worker_task = asyncio.create_task(worker.run())
+
+            await q.put(req_a)
+            await q.put(req_b)
+
+            # Wait for both verifies to enter (true concurrent overlap).
+            # NOTE (task 2350): widened timeouts -- fixed real-time deadlines
+            # starve under heavy shared-host xdist contention.
+            await asyncio.wait_for(gate_a_entered.wait(), timeout=45.0)
+            await asyncio.wait_for(gate_b_entered.wait(), timeout=45.0)
+
+            # N's verify fails
+            gate_a_release.set()
+
+            outcome_a = await asyncio.wait_for(req_a.result, timeout=45.0)
+            assert outcome_a.status not in ('done', 'already_merged'), (
+                f'Expected N to fail, got status={outcome_a.status!r}.'
+            )
+
+            # Release N+1's gate so the cascade's re-dispatched verify can pass.
+            gate_b_release.set()
+
+            outcome_b = await asyncio.wait_for(req_b.result, timeout=45.0)
+
+            await worker.stop()
+
+        with contextlib.suppress(Exception):
+            await asyncio.wait_for(worker_task, timeout=20.0)
+
+        # ── Functional sanity: the bug self-recovers, so this passes on both
+        # RED and GREEN. It is NOT the signal under test. ───────────────────
+        assert outcome_b is not None and outcome_b.status == 'done', (
+            f'Expected N+1 to resolve "done" after re-merge/re-verify, got {outcome_b!r}.'
+        )
+
+        # ── RED signal 1: the registry must read MERGING while the cascade's
+        # _remerge() call for req_b is in flight (RED reads VERIFYING because
+        # merge_queue.py:9456-9460 omits the _note_transition wiring). N+1
+        # re-merges exactly once (N failed, so main never advanced and the
+        # re-dispatch's Mechanism-2 staleness check finds base_sha==main and
+        # skips a second remerge).
+        assert mid_remerge_state == [ItemLifecycleState.MERGING], (
+            f'expected the registry to read MERGING while the cascade _remerge() '
+            f'ran for req_b, got {mid_remerge_state!r}'
+        )
+
+        # ── RED signal 2: both cascade transitions must be observed for req_b.
+        assert (ItemLifecycleState.VERIFYING, ItemLifecycleState.MERGING) in observed_b, (
+            f'expected VERIFYING -> MERGING in req_b transitions, got {observed_b!r}'
+        )
+        assert (
+            ItemLifecycleState.MERGING, ItemLifecycleState.REDISPATCH_PARKED,
+        ) in observed_b, (
+            f'expected MERGING -> REDISPATCH_PARKED in req_b transitions, got {observed_b!r}'
+        )
+
+        # ── RED signal 3: no spurious illegal-transition escalation for req_b.
+        # (Do NOT assert (REDISPATCH_PARKED, DISPATCHING) in observed_b as a RED
+        # signal -- the spy records the attempted transition even when the
+        # underlying registry call rejects it, so that pair appears on both
+        # RED and GREEN.)
+        assert req_b.request_id not in illegal_alarms, (
+            f'unexpected illegal-lifecycle-transition alarm for req_b '
+            f'(registry diverged from pipeline state): {illegal_alarms!r}'
+        )
+
 
 # ---------------------------------------------------------------------------
 # step-21 RED: OPERATOR-HALT aborts all in-flight + RUNNER_UNAVAILABLE quarantine
