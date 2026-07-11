@@ -3113,6 +3113,83 @@ async def test_v3_to_v4_mixed_db_heals_genuine_while_flagging_ambiguous(tmp_path
     ], residual_groups
 
 
+# ── index-independent write-path dedup (fm-task-dedup self-heal amendment) ──
+
+
+@pytest.mark.asyncio
+async def test_add_task_dedup_guard_rejects_duplicate_when_index_absent(tmp_path):
+    """Reproduces the incident's exact condition: a flagged residual group
+    blocks the v3->v4 partial UNIQUE index build (``ux_tasks_candidate_key``
+    stays absent, user_version stays at 3), yet a SEPARATE, unrelated
+    non-cancelled row R still must not be duplicated — the index-independent
+    pre-INSERT SELECT guard in ``add_task`` catches the collision even with
+    no DB-level UNIQUE backstop.
+    """
+    import sqlite3
+
+    from fused_memory.backends.task_backend_errors import DuplicateCandidateKeyError
+
+    project_root = str(tmp_path / 'proj')
+    db_path = Path(project_root) / '.taskmaster' / 'tasks' / 'tasks.db'
+    _make_v3_db_with_dup_groups(
+        db_path,
+        [
+            # Flagged (mixed-status) group -- unrelated to R, keeps the
+            # v3->v4 index build skipped so this test exercises the
+            # index-ABSENT window.
+            (1, 'Ambiguous task', 'done', ['x.py']),
+            (2, 'Ambiguous task', 'pending', ['x.py']),
+            # R: a normal, unique, non-cancelled row.
+            (3, 'Existing unique task', 'pending', ['r.py']),
+        ],
+    )
+
+    cfg = TaskmasterConfig(project_root=str(tmp_path))
+    b = SqliteTaskBackend(cfg)
+    await b.start()
+    try:
+        # Triggers connection-open migration: flags the group, skips the
+        # index build.
+        await b.get_tasks(project_root=project_root)
+
+        conn = sqlite3.connect(str(db_path))
+        try:
+            indexes = {row[1] for row in conn.execute('PRAGMA index_list(tasks)')}
+            user_version = conn.execute('PRAGMA user_version').fetchone()[0]
+        finally:
+            conn.close()
+        assert not any('candidate_key' in idx for idx in indexes), (
+            f'Precondition: the index must be ABSENT for this test to '
+            f'exercise the index-independent guard; got {indexes}'
+        )
+        assert user_version == 3, user_version
+
+        with pytest.raises(DuplicateCandidateKeyError) as exc_info:
+            await b.add_task(
+                project_root=project_root,
+                title='Existing unique task',
+                metadata=json.dumps({'files': ['r.py']}),
+            )
+        exc = exc_info.value
+        assert exc.existing_id == 3, f'Expected the collision to name survivor id=3; got {exc.existing_id!r}'
+        assert exc.existing_status == 'pending', (
+            f'Expected the survivor status to be pending; got {exc.existing_status!r}'
+        )
+
+        r_key = compute_candidate_key('Existing unique task', ['r.py'])
+        listing = await b.get_tasks(project_root=project_root)
+        matching = [
+            t for t in listing['tasks']
+            if t['status'] != 'cancelled' and t.get('candidate_key') == r_key
+        ]
+        assert len(matching) == 1, (
+            f'Expected exactly one non-cancelled row with the colliding key '
+            f'(no orphan from the rejected insert); got {len(matching)}: {matching}'
+        )
+    finally:
+        await b.close()
+
+
 # ── candidate_key collision (fm-task-dedup W8 task A2) ───────────────
 
 
