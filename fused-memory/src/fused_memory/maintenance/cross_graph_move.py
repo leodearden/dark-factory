@@ -924,6 +924,38 @@ async def recreate_subgraph_relationships(graphiti: Any, specs: list[dict]) -> S
     Returns:
         SubgraphEdgeResult tallying edges/mentions recreated vs. skipped
         (plus, from step-8 onward, any cross-target-dropped edges).
+
+    Raises:
+        Whatever the underlying graph/embedding read or CREATE calls raise.
+        This primitive mutates target graphs incrementally as it walks the
+        batch, so a mid-batch failure can still leave real, non-zero
+        edges/mentions counts recreated before the raise -- that partial
+        tally is attached to the exception as ``exc.partial_result`` (a
+        ``SubgraphEdgeResult``) instead of being discarded, so a caller
+        (e.g. ``scripts/migrate_cross_graph_leak.py``'s ``run()``) can
+        surface accurate partial-progress counts instead of reporting an
+        all-zero default for a batch that was actually partway mutated
+        (task 2415 amendment round 2).
+    """
+    result = SubgraphEdgeResult()
+    try:
+        await _recreate_subgraph_relationships_batch(graphiti, specs, result)
+    except Exception as exc:
+        exc.partial_result = result
+        raise
+    return result
+
+
+async def _recreate_subgraph_relationships_batch(
+    graphiti: Any, specs: list[dict], result: SubgraphEdgeResult,
+) -> None:
+    """Phase-B batch work for ``recreate_subgraph_relationships``, mutating
+    *result* in place as it recreates edges/mentions.
+
+    Split out of the public wrapper so it can hold a reference to the SAME
+    ``SubgraphEdgeResult`` it returns on success and attach it to
+    ``exc.partial_result`` on failure -- see
+    ``recreate_subgraph_relationships``'s docstring.
     """
     falkor_client = graphiti._require_falkor_client()
     target_of: dict[str, str] = {spec['uuid']: spec['target_graph'] for spec in specs}
@@ -956,8 +988,6 @@ async def recreate_subgraph_relationships(graphiti: Any, specs: list[dict]) -> S
         )
         for row in mentions_result.result_set or []:
             mentions_by_uuid.setdefault(row[0], (row, spec['source_graph'], spec['uuid']))
-
-    result = SubgraphEdgeResult()
 
     for edge_uuid, (row, source_graph) in edges_by_uuid.items():
         (_edge_uuid, edge_name, fact, valid_at, invalid_at, edge_created_at,
@@ -1180,8 +1210,6 @@ async def recreate_subgraph_relationships(graphiti: Any, specs: list[dict]) -> S
                     '(src=%s dst=%s) not present in home_graph=%s',
                     edge_uuid, src_uuid, dst_uuid, home_graph,
                 )
-
-    return result
 
 
 async def delete_source_node(graphiti: Any, uuid: str, source_graph: str) -> None:

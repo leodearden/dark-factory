@@ -60,7 +60,9 @@ Contract
     ``home_edge_count_before + edges_recreated`` -- both cases the other
     endpoint being absent from the target/home graph) is surfaced as a
     blocked ``apply_results`` entry with a descriptive ``error``, not a clean
-    exit -- see ``_move_result_entry``/``_merge_result_entry``.
+    exit -- see ``recreate_subgraph_relationships``'s ``SubgraphEdgeResult``,
+    folded into ``apply_results``/``exit_code`` by ``run()``'s three-phase
+    apply.
   * UNRESOLVED nodes (no populated-home and no ``ALIAS_MAP`` entry) are never
     silently dropped or routed to a new/unpopulated graph -- they block
     ``--apply`` for that node only and force a non-zero exit.
@@ -476,69 +478,6 @@ def missing_required_node_keys(node: dict) -> list[str]:
     return [key for key in _REQUIRED_NODE_KEYS if key not in node]
 
 
-def _move_result_entry(uuid: str, disposition: str, result: Any, target_graph: str) -> dict:
-    """Build a MOVE apply_results entry from move_entity_across_graphs' MoveResult.
-
-    MoveResult.edges_skipped/mentions_skipped count a RELATES_TO edge or
-    Episodic MENTIONS link whose OTHER endpoint was absent from
-    *target_graph* -- FalkorDB's CREATE silently matched nothing, so the
-    edge/mention was never recreated, even though the source node is still
-    unconditionally DETACH DELETEd (move_entity_across_graphs never rolls
-    that back). Discarding the returned MoveResult (as run() used to) hides
-    this from the manifest entirely -- a lossy move still reported
-    ``applied`` and a clean post-verify exit, since post-verify only checks
-    the foreign-node COUNT, not its topology. Folding the counts in here
-    (and blocking the node when either is non-zero) surfaces the loss to the
-    operator instead.
-    """
-    edges_skipped = result.edges_skipped
-    mentions_skipped = result.mentions_skipped
-    lossy = bool(edges_skipped or mentions_skipped)
-    entry = {
-        'uuid': uuid, 'disposition': disposition, 'applied': True, 'blocked': lossy,
-        'edges_moved': result.edges_moved, 'edges_skipped': edges_skipped,
-        'mentions_moved': result.mentions_moved, 'mentions_skipped': mentions_skipped,
-    }
-    if lossy:
-        entry['error'] = (
-            f'{edges_skipped} RELATES_TO edge(s) and {mentions_skipped} MENTIONS '
-            f'link(s) were silently skipped moving {uuid} into {target_graph!r} '
-            "(the edge/mention's other endpoint is not yet present there) -- "
-            'topology loss, needs manual review'
-        )
-    return entry
-
-
-def _merge_result_entry(uuid: str, disposition: str, result: Any, home_graph: str) -> dict:
-    """Build a MERGE apply_results entry from merge_foreign_duplicate's MergeResult.
-
-    MergeResult.home_edge_count_after is a genuine RE-READ of the home
-    copy's RELATES_TO edge count after the recreate loop -- comparing it
-    against ``home_edge_count_before + edges_recreated`` is a real
-    no-edge-lost check (an edge recreate whose CREATE silently matched no
-    endpoint in the home graph would leave the actual count short of that
-    sum). Discarding the returned MergeResult (as run() used to) hides this
-    from the manifest entirely. Folding the counts in here (and blocking the
-    node on a mismatch) surfaces the loss to the operator instead.
-    """
-    expected_after = result.home_edge_count_before + result.edges_recreated
-    lossy = result.home_edge_count_after != expected_after
-    entry = {
-        'uuid': uuid, 'disposition': disposition, 'applied': True, 'blocked': lossy,
-        'edges_recreated': result.edges_recreated,
-        'home_edge_count_before': result.home_edge_count_before,
-        'home_edge_count_after': result.home_edge_count_after,
-    }
-    if lossy:
-        entry['error'] = (
-            f'home graph {home_graph!r} RELATES_TO edge count after merging '
-            f'{uuid} ({result.home_edge_count_after}) does not match '
-            f'home_edge_count_before + edges_recreated ({expected_after}) -- an '
-            'edge recreate may have silently matched nothing, needs manual review'
-        )
-    return entry
-
-
 async def run(args: Any, memory_service: Any) -> dict:
     """Census -> classify -> manifest (dry-run), or apply a reviewed manifest.
 
@@ -738,6 +677,19 @@ async def run(args: Any, memory_service: Any) -> dict:
             edge_result = await recreate_subgraph_relationships(graphiti, phase_b_specs)
         except Exception as exc:
             phase_b_error = exc
+            # recreate_subgraph_relationships mutates target graphs AS IT
+            # GOES (each edge/mention CREATE lands immediately) -- a failure
+            # partway through the batch still leaves a real, non-zero tally
+            # of what it recreated before raising. Falling back to the
+            # all-zero default `edge_result` above would under-report an
+            # already-mutated target graph to the operator reading this
+            # report. Recover the partial tally the primitive attaches to
+            # its own exception (`exc.partial_result`, a SubgraphEdgeResult
+            # -- see that function's docstring) when present, rather than
+            # discarding it.
+            partial_result = getattr(exc, 'partial_result', None)
+            if partial_result is not None:
+                edge_result = partial_result
 
     # Phase C: DETACH DELETE every MOVE/MERGE source node whose earlier
     # phases succeeded -- deleting a source before its edges are known-
@@ -821,13 +773,14 @@ async def run(args: Any, memory_service: Any) -> dict:
     # A SubgraphEdgeResult.edges_skipped/mentions_skipped > 0 means Phase B
     # found an edge/mention whose other endpoint was genuinely absent from
     # the resolved target (never recreated) -- the same silent-topology-loss
-    # signal the old per-node MoveResult.edges_skipped/mentions_skipped
-    # surfaced via _move_result_entry, now read off the WHOLE batch's single
-    # SubgraphEdgeResult instead of one node's own result. Folded into
-    # exit_code the same way has_unresolved/has_blocked are: it forces a
-    # non-zero, blocking exit even when the post-verify count re-census
-    # otherwise reconciles (a lost edge leaves no foreign-node residual of
-    # its own to be caught by the count comparison above).
+    # signal the old per-node move_entity_across_graphs' MoveResult.edges_
+    # skipped/mentions_skipped surfaced (pre-task-2415), now read off the
+    # WHOLE batch's single SubgraphEdgeResult instead of one node's own
+    # result. Folded into exit_code the same way has_unresolved/has_blocked
+    # are: it forces a non-zero, blocking exit even when the post-verify
+    # count re-census otherwise reconciles (a lost edge leaves no
+    # foreign-node residual of its own to be caught by the count comparison
+    # above).
     has_edge_loss = bool(edge_result.edges_skipped or edge_result.mentions_skipped)
     # An edge whose two endpoints resolve to DIFFERENT target graphs cannot
     # be recreated in EITHER graph (FalkorDB RELATES_TO edges are

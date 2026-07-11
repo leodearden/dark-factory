@@ -1286,6 +1286,62 @@ class TestRunApplyExceptionIsolation:
         assert 'post_verify' in report
         assert report['exit_code'] != 0
 
+    @pytest.mark.asyncio
+    async def test_phase_b_failure_surfaces_partial_edge_tally_not_zero(
+        self, tmp_path, monkeypatch,
+    ):
+        """When recreate_subgraph_relationships (Phase B) raises partway
+        through a batch, it has already mutated target graphs for whatever
+        it completed before the raise (see that function's docstring) --
+        the exception carries that partial tally as exc.partial_result (a
+        SubgraphEdgeResult). run() must read it off the exception and fold
+        it into the report instead of falling back to the all-zero default
+        edge_result, which would understate what was actually mutated in
+        target graphs before the failure (task 2415 amendment round 2)."""
+        move_node = _classified_node(
+            'u-move', source_graph='reify', target_graph='dark_factory', disposition=_mod.MOVE,
+        )
+        manifest_path = self._write_manifest(tmp_path, [move_node], {'reify': 1, 'dark_factory': 0})
+
+        phase_b_error = RuntimeError('transient FalkorDB error mid-batch')
+        phase_b_error.partial_result = SubgraphEdgeResult(edges_recreated=3, mentions_recreated=1)
+
+        monkeypatch.setattr(
+            _mod, 'create_moved_node',
+            AsyncMock(return_value=CreateResult(uuid='u', source_graph='s', target_graph='t')),
+        )
+        monkeypatch.setattr(
+            _mod, 'recreate_subgraph_relationships', AsyncMock(side_effect=phase_b_error),
+        )
+        delete_mock = AsyncMock(return_value=None)
+        monkeypatch.setattr(_mod, 'delete_source_node', delete_mock)
+
+        memory_service = _make_memory_service({
+            'reify': _make_graph_mock(ro_pages=[[]]),
+            'dark_factory': _make_graph_mock(ro_pages=[[]]),
+        })
+        args = _args(apply=True, manifest=str(manifest_path))
+
+        report = await _mod.run(args, memory_service)
+
+        # the real partial tally survives into the report -- not the
+        # all-zero default a discarded exception would have left behind.
+        assert report['edges_recreated'] == 3
+        assert report['mentions_recreated'] == 1
+
+        move_result = [r for r in report['apply_results'] if r['uuid'] == 'u-move']
+        assert len(move_result) == 1
+        assert move_result[0]['applied'] is False
+        assert move_result[0]['blocked'] is True
+        assert 'transient FalkorDB error mid-batch' in move_result[0]['error']
+
+        # Phase C never runs for a node whose batch's Phase-B call failed --
+        # its source must not be deleted out from under an edge recreate
+        # that never completed.
+        delete_mock.assert_not_awaited()
+
+        assert report['exit_code'] != 0
+
 
 # ===========================================================================
 # Tests: run() post-verify re-census (step-19/20)
