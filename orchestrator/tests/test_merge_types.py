@@ -14,8 +14,10 @@ split:
 
 from __future__ import annotations
 
+import dataclasses
 from pathlib import Path
 
+import pytest
 from _orch_helpers import make_placeholder_future
 
 from orchestrator.config import OrchestratorConfig
@@ -174,3 +176,23 @@ class TestQueuedBranch:
         qb = QueuedBranch.parse('4778', '')
         assert qb.bare_id == '4778'
         assert qb.full_name == '4778'
+
+    def test_incoherent_pair_raises_value_error(self) -> None:
+        """A hand-built (bare_id, full_name) pair that doesn't cohere is rejected.
+
+        parse() never produces this shape — full_name always ends with
+        bare_id — so this only trips on a direct, bypassing-parse
+        construction. Realizes "mixed shape unrepresentable" (PRD DD7).
+        """
+        from orchestrator.merge_types import QueuedBranch
+
+        with pytest.raises(ValueError):
+            QueuedBranch(bare_id='4778', full_name='wrong/9999')
+
+    def test_parse_result_is_frozen(self) -> None:
+        """A QueuedBranch produced by parse is immutable."""
+        from orchestrator.merge_types import QueuedBranch
+
+        qb = QueuedBranch.parse('4778', 'task/')
+        with pytest.raises(dataclasses.FrozenInstanceError):
+            qb.bare_id = 'x'  # type: ignore[misc]
