@@ -545,3 +545,196 @@ class TestPrecheckFreshSkip:
         )
 
         assert result.stats['scope_freshness_skipped'] == 1
+
+
+class TestPrecheckChangedAndFailOpen:
+    """Tests for precheck_scope_correction_freshness — a changed subject, and
+    fail-open behaviour on every kind of per-finding uncertainty."""
+
+    @pytest.mark.asyncio
+    async def test_changed_subject_is_reinvestigated_and_snapshot_rewritten(self):
+        from fused_memory.reconciliation.scope_freshness import (
+            build_scope_snapshot_metadata,
+            precheck_scope_correction_freshness,
+        )
+
+        prior_metadata = build_scope_snapshot_metadata(
+            task_ref='dark_factory:2405',
+            flag_key='cross_project',
+            subject_project_id='dark_factory',
+            subject_task_id='2405',
+            status='pending',
+            updated_at='2026-07-10T10:00:00Z',
+            description='d',
+            run_id='run-0',
+            snapshot_at='2026-07-10T14:29:33Z',
+        )
+
+        memory_service = AsyncMock()
+        memory_service.get_memories_by_metadata.return_value = [
+            {
+                'id': 'a4ed9cad',
+                'created_at': '2026-07-10T14:29:33Z',
+                'metadata': prior_metadata,
+            },
+        ]
+        taskmaster = AsyncMock()
+        # ADVANCED updatedAt since the snapshot was taken — the subject moved.
+        taskmaster.get_task.return_value = {
+            'id': 2405,
+            'status': 'pending',
+            'updatedAt': '2026-07-11T00:00:00Z',
+            'description': 'd',
+            'metadata': {},
+        }
+
+        cross_project_finding = {
+            'flag_type': 'cross_project',
+            'description': 'scope correction thread',
+            'cited_tasks': [
+                {'project_id': 'dark_factory', 'task_id': '2405', 'title': 'x'},
+            ],
+        }
+
+        result = await precheck_scope_correction_freshness(
+            memory_service=memory_service,
+            taskmaster=taskmaster,
+            project_id='autopilot_video',
+            resolve_project_root=lambda pid: f'/roots/{pid}',
+            run_id='run-3',
+            findings=[cross_project_finding],
+        )
+
+        assert cross_project_finding in result.to_reinvestigate
+        assert cross_project_finding not in result.skipped
+
+        memory_service.add_memory.assert_awaited_once()
+        _, kwargs = memory_service.add_memory.await_args
+        assert kwargs['metadata']['subject_updated_at'] == '2026-07-11T00:00:00Z'
+        assert 'no_change' not in kwargs['metadata']
+
+        # Stale prior snapshot pool-capped after the fresh one was written.
+        memory_service.delete_memory.assert_awaited_once_with(
+            memory_id='a4ed9cad', store='mem0', project_id='autopilot_video',
+        )
+
+    @pytest.mark.asyncio
+    async def test_get_task_failure_keeps_finding_and_never_raises(self):
+        from fused_memory.backends.task_backend_errors import TaskmasterError
+        from fused_memory.reconciliation.scope_freshness import (
+            precheck_scope_correction_freshness,
+        )
+
+        memory_service = AsyncMock()
+        memory_service.get_memories_by_metadata.return_value = []
+        taskmaster = AsyncMock()
+        taskmaster.get_task.side_effect = TaskmasterError(
+            'TASKMASTER_TOOL_ERROR', 'No tasks found',
+        )
+
+        cross_project_finding = {
+            'flag_type': 'cross_project',
+            'cited_tasks': [
+                {'project_id': 'dark_factory', 'task_id': '2405', 'title': 'x'},
+            ],
+        }
+
+        result = await precheck_scope_correction_freshness(
+            memory_service=memory_service,
+            taskmaster=taskmaster,
+            project_id='autopilot_video',
+            resolve_project_root=lambda pid: f'/roots/{pid}',
+            run_id='run-4',
+            findings=[cross_project_finding],
+        )
+
+        assert result.to_reinvestigate == [cross_project_finding]
+        assert result.skipped == []
+        memory_service.add_memory.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_unknown_foreign_project_keeps_finding_without_calling_get_task(self):
+        from fused_memory.reconciliation.scope_freshness import (
+            precheck_scope_correction_freshness,
+        )
+
+        memory_service = AsyncMock()
+        taskmaster = AsyncMock()
+
+        cross_project_finding = {
+            'flag_type': 'cross_project',
+            'cited_tasks': [
+                {'project_id': 'dark_factory', 'task_id': '2405', 'title': 'x'},
+            ],
+        }
+
+        result = await precheck_scope_correction_freshness(
+            memory_service=memory_service,
+            taskmaster=taskmaster,
+            project_id='autopilot_video',
+            resolve_project_root=lambda pid: None,
+            run_id='run-5',
+            findings=[cross_project_finding],
+        )
+
+        assert result.to_reinvestigate == [cross_project_finding]
+        assert result.skipped == []
+        taskmaster.get_task.assert_not_awaited()
+        memory_service.get_memories_by_metadata.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_memory_read_failure_keeps_finding_and_never_raises(self):
+        from fused_memory.reconciliation.scope_freshness import (
+            precheck_scope_correction_freshness,
+        )
+
+        memory_service = AsyncMock()
+        memory_service.get_memories_by_metadata.side_effect = RuntimeError(
+            'qdrant unavailable',
+        )
+        taskmaster = AsyncMock()
+
+        cross_project_finding = {
+            'flag_type': 'cross_project',
+            'cited_tasks': [
+                {'project_id': 'dark_factory', 'task_id': '2405', 'title': 'x'},
+            ],
+        }
+
+        result = await precheck_scope_correction_freshness(
+            memory_service=memory_service,
+            taskmaster=taskmaster,
+            project_id='autopilot_video',
+            resolve_project_root=lambda pid: f'/roots/{pid}',
+            run_id='run-6',
+            findings=[cross_project_finding],
+        )
+
+        assert result.to_reinvestigate == [cross_project_finding]
+        assert result.skipped == []
+
+    @pytest.mark.asyncio
+    async def test_non_cross_project_finding_passes_through_untouched(self):
+        from fused_memory.reconciliation.scope_freshness import (
+            precheck_scope_correction_freshness,
+        )
+
+        memory_service = AsyncMock()
+        taskmaster = AsyncMock()
+
+        non_scope_finding = {'flag_type': 'task_memory_mismatch', 'description': 'unrelated'}
+
+        result = await precheck_scope_correction_freshness(
+            memory_service=memory_service,
+            taskmaster=taskmaster,
+            project_id='autopilot_video',
+            resolve_project_root=lambda pid: f'/roots/{pid}',
+            run_id='run-7',
+            findings=[non_scope_finding],
+        )
+
+        assert result.to_reinvestigate == [non_scope_finding]
+        assert result.skipped == []
+        taskmaster.get_task.assert_not_awaited()
+        memory_service.get_memories_by_metadata.assert_not_awaited()
+        memory_service.add_memory.assert_not_awaited()
