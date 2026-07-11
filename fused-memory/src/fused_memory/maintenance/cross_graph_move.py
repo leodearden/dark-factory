@@ -86,6 +86,25 @@ def format_vecf32_literal(tokens: list[str]) -> str:
     return f"vecf32([{', '.join(tokens)}])"
 
 
+def _embedding_set_clause(assignment_target: str, reply: str | None) -> str:
+    """Render an optional, comma-prefixed embedding SET fragment.
+
+    This is the single seam that makes the embedding property optional at
+    every recreate site (node ``name_embedding`` / edge ``fact_embedding``):
+    when *reply* is ``None`` (a null/absent source embedding -- see
+    ``_read_compact_vector``), returns ``''`` so the caller's CREATE omits
+    the embedding property entirely, preserving every other property on the
+    recreated node/edge. When *reply* is a real ``--compact`` vector reply,
+    returns ``f', {assignment_target} = {vecf32([...])}'`` -- reusing the
+    UNCHANGED byte-exact ``format_vecf32_literal(parse_compact_vector_reply(
+    ...))`` passthrough, so the non-null path stays byte-identical to before
+    this helper existed.
+    """
+    if reply is None:
+        return ''
+    return f', {assignment_target} = {format_vecf32_literal(parse_compact_vector_reply(reply))}'
+
+
 def _quote_cypher_string(value: str) -> str:
     """Inline *value* as a single-quoted Cypher string literal, escaping ``\\``/``'``.
 
