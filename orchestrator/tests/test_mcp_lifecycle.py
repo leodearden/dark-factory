@@ -8,15 +8,24 @@ mcp_config_json() regression guard (step-3/step-4).
 
 TestInvokeInjectsMcpStartupTimeout — _invoke_claude_with_sandbox injects
 MCP_TIMEOUT into env_overrides (step-5/step-6).
+
+TestManagedRuntimeDataDirs — managed_runtime_data_dirs() pure helper: XDG
+override, home fallback, and not-under-project-root (task 2439 step-1/step-2).
+
+TestManagedSpawnEnvInjection — McpLifecycle.start()'s managed-spawn branch
+injects QUEUE_DATA_DIR/RECONCILIATION_DATA_DIR out-of-tree, honoring an
+operator-preset override (task 2439 step-3/step-4).
 """
 
 from __future__ import annotations
 
 from pathlib import Path
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+from _orch_helpers import pydantic_spec
 
+from orchestrator.config import OrchestratorConfig
 from orchestrator.mcp_lifecycle import plan_tools_mcp_server
 
 # ---------------------------------------------------------------------------
@@ -419,3 +428,55 @@ class TestPlanToolsLaunchMetaRoot:
             python_executable='/venv/bin/python',
         )
         assert '--meta-root' not in cfg['args']
+
+
+# ---------------------------------------------------------------------------
+# Step-1/Step-2 (task 2439): managed_runtime_data_dirs() pure helper
+# ---------------------------------------------------------------------------
+
+
+class TestManagedRuntimeDataDirs:
+    """managed_runtime_data_dirs(project_id) — pure helper computing the
+    out-of-tree queue/reconciliation runtime dirs for a managed fused-memory
+    spawn, keeping its runtime SQLite state out of a watched project's
+    tracked tree (task 2439)."""
+
+    def test_xdg_state_home_set_returns_dark_factory_project_subdirs(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """With XDG_STATE_HOME set, both dirs nest under it as
+        dark-factory/<project_id>/{queue,reconciliation}."""
+        monkeypatch.setenv('XDG_STATE_HOME', str(tmp_path))
+        from orchestrator.mcp_lifecycle import managed_runtime_data_dirs
+
+        queue_dir, recon_dir = managed_runtime_data_dirs('reify')
+
+        assert queue_dir == tmp_path / 'dark-factory' / 'reify' / 'queue'
+        assert recon_dir == tmp_path / 'dark-factory' / 'reify' / 'reconciliation'
+
+    def test_xdg_state_home_unset_falls_back_to_home_local_state(
+        self, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """With XDG_STATE_HOME unset, the base falls back to ~/.local/state."""
+        monkeypatch.delenv('XDG_STATE_HOME', raising=False)
+        from orchestrator.mcp_lifecycle import managed_runtime_data_dirs
+
+        queue_dir, recon_dir = managed_runtime_data_dirs('reify')
+
+        expected_root = Path.home() / '.local' / 'state' / 'dark-factory' / 'reify'
+        assert queue_dir == expected_root / 'queue'
+        assert recon_dir == expected_root / 'reconciliation'
+
+    def test_neither_path_is_under_a_sample_project_root(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Regression guard: the returned dirs must never nest under a
+        watched project's root — the pollution this task fixes."""
+        monkeypatch.setenv('XDG_STATE_HOME', str(tmp_path))
+        from orchestrator.mcp_lifecycle import managed_runtime_data_dirs
+
+        project_root = Path('/home/leo/src/reify')
+        queue_dir, recon_dir = managed_runtime_data_dirs('reify')
+
+        assert not queue_dir.is_relative_to(project_root)
+        assert not recon_dir.is_relative_to(project_root)
