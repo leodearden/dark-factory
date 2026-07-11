@@ -5320,7 +5320,6 @@ Output JSON matching the schema. Every task must appear in the output.
 
         from escalation.models import Escalation
 
-        summary = 'dirty project_root at startup - commit or stash WIP'
         detail = (
             f'project_root has uncommitted tracked changes at startup:\n{dirty}\n\n'
             'The orchestrator started anyway (task 2380: dirty trees no '
@@ -5328,17 +5327,35 @@ Output JSON matching the schema. Every task must appear in the output.
             'stashed — an uncommitted tree left indefinitely risks being '
             'clobbered by unrelated operations run against project_root.'
         )
-        esc = Escalation(
-            id=self._escalation_queue.make_id(_DIRTY_TREE_ESCALATION_SENTINEL),
-            task_id=_DIRTY_TREE_ESCALATION_SENTINEL,
-            agent_role='orchestrator-dirty-tree-guard',
-            severity='critical',
-            level=2,
-            category='cleanup_needed',
-            summary=summary,
-            detail=detail,
-            suggested_action='Commit or stash the dirty files listed above in project_root.',
+
+        # Dedup across restarts: has_open_l1 is hardcoded to level=1
+        # (escalation/queue.py), so get_by_task is used directly (mirrors
+        # _alarm_verify_worktree_contention in merge_queue.py). A hit is
+        # refreshed in place (same id, re-submitted) rather than filed as a
+        # duplicate, so the watchdog's Restart=on-failure loop surfaces one
+        # persistent L2 instead of a burst of criticals.
+        existing = self._escalation_queue.get_by_task(
+            _DIRTY_TREE_ESCALATION_SENTINEL, status='pending', level=2,
         )
+        if existing:
+            esc = existing[0]
+            esc.detail = detail
+            esc.timestamp = datetime.now(UTC).isoformat()
+            esc.dedupe_count += 1
+        else:
+            esc = Escalation(
+                id=self._escalation_queue.make_id(_DIRTY_TREE_ESCALATION_SENTINEL),
+                task_id=_DIRTY_TREE_ESCALATION_SENTINEL,
+                agent_role='orchestrator-dirty-tree-guard',
+                severity='critical',
+                level=2,
+                category='cleanup_needed',
+                summary='dirty project_root at startup - commit or stash WIP',
+                detail=detail,
+                suggested_action=(
+                    'Commit or stash the dirty files listed above in project_root.'
+                ),
+            )
         self._escalation_queue.submit(esc)
 
     def _escalate_reconcile_skip(
