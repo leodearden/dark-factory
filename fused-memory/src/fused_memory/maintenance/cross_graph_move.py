@@ -941,7 +941,7 @@ async def recreate_subgraph_relationships(graphiti: Any, specs: list[dict]) -> S
     try:
         await _recreate_subgraph_relationships_batch(graphiti, specs, result)
     except Exception as exc:
-        exc.partial_result = result
+        exc.partial_result = result  # type: ignore[attr-defined]
         raise
     return result
 

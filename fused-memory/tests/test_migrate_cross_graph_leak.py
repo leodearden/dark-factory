@@ -1304,7 +1304,9 @@ class TestRunApplyExceptionIsolation:
         manifest_path = self._write_manifest(tmp_path, [move_node], {'reify': 1, 'dark_factory': 0})
 
         phase_b_error = RuntimeError('transient FalkorDB error mid-batch')
-        phase_b_error.partial_result = SubgraphEdgeResult(edges_recreated=3, mentions_recreated=1)
+        phase_b_error.partial_result = (  # type: ignore[attr-defined]
+            SubgraphEdgeResult(edges_recreated=3, mentions_recreated=1)
+        )
 
         monkeypatch.setattr(
             _mod, 'create_moved_node',
