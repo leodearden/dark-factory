@@ -29,8 +29,8 @@ from textual.app import App, ComposeResult
 from textual.containers import Horizontal, Vertical
 from textual.widgets import DataTable
 
-from cockpit.backends import FocusArrangeBackend, TmuxBackend, WmBackend
-from cockpit.panes.decision_queue import DecisionQueue, order_queue
+from cockpit.backends import DisplayTarget, FocusArrangeBackend, TmuxBackend, WmBackend
+from cockpit.panes.decision_queue import DecisionQueue, QueueItem, order_queue
 from cockpit.panes.detail_pane import DetailPane
 from cockpit.panes.session_table import SessionTable, order_sessions
 from cockpit.priority import Priorities, load_priorities
@@ -100,6 +100,7 @@ class CockpitApp(App):
         self._decisions_snapshot: dict[str, tuple] = {}
         self._has_scanned = False
         self._selected_slug: str | None = None
+        self._attention_targets: dict[str, DisplayTarget] = {}
 
     def compose(self) -> ComposeResult:
         yield Vertical(
@@ -152,6 +153,53 @@ class CockpitApp(App):
         queue_items = order_queue(decisions, records, self._priorities, now)
         queue = self.query_one('#decision-queue', DecisionQueue)
         queue.replace_rows(queue_items, now)
+        self._update_attention(queue_items)
+
+    def _backend_for(self, kind: str) -> FocusArrangeBackend:
+        """Resolve the focus/arrange backend for *kind* ('wm'/'tmux').
+
+        A single injected `backend` (constructor param) overrides routing
+        entirely and is used uniformly for every target regardless of kind
+        -- this is what lets a test assert against one FakeBackend spy
+        (PRD §2 design decisions). Otherwise routes by kind through the
+        default {'wm': WmBackend(), 'tmux': TmuxBackend()} map, falling
+        back to the wm backend for an unrecognized/foreign kind (fail-soft
+        -- a view must never crash on a target shape it didn't control).
+        """
+        if self._backend is not None:
+            return self._backend
+        return self._default_backends.get(kind, self._default_backends['wm'])
+
+    def _update_attention(self, queue_items: list[QueueItem]) -> None:
+        """Signal (never move) on attention transitions -- PRD B3, this task's leaf signal.
+
+        Diffs the current queue's resolvable targets against the previous
+        tick's set: a target newly appearing (a session just flipped to
+        awaiting-input, or a new open decision was filed) gets
+        set_urgency(True); one that dropped out (answered/dropped/resolved,
+        or its session vanished) gets set_urgency(False). Then reorders
+        each backend's own targets -- grouped by kind so a wm target never
+        pollutes a tmux backend's positional reorder (whose index IS the
+        destination window position) and vice versa. This method and its
+        caller are the ONLY place the refresh path may call backend.*; it
+        calls ONLY set_urgency/reorder, NEVER focus/tile (those live
+        exclusively in explicit-action handlers, e.g. action_focus_selected).
+        """
+        new_attention = {item.key: item.target for item in queue_items if item.target is not None}
+        for key, target in new_attention.items():
+            if key not in self._attention_targets:
+                self._backend_for(target.kind).set_urgency(target, True)
+        for key, target in self._attention_targets.items():
+            if key not in new_attention:
+                self._backend_for(target.kind).set_urgency(target, False)
+        self._attention_targets = new_attention
+
+        targets_by_kind: dict[str, list[DisplayTarget]] = {}
+        for item in queue_items:
+            if item.target is not None:
+                targets_by_kind.setdefault(item.target.kind, []).append(item.target)
+        for kind, targets in targets_by_kind.items():
+            self._backend_for(kind).reorder(targets)
 
     def _sync_detail_pane(self, slug: str | None) -> None:
         """Render *slug*'s record (or the empty placeholder) into the detail pane.
