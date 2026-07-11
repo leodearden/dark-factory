@@ -91,3 +91,30 @@ class TestIdlePsiSampleNeutralizesAdmissionGate:
         result = await scheduler2.acquire_next()
         assert result is not None
         assert result.task_id == 'X'
+
+
+class TestAutouseFixtureDefaultsToIdlePsi:
+    """Guard test for conftest's autouse ``_hermetic_psi_reader`` fixture."""
+
+    def test_autouse_fixture_defaults_scheduler_to_idle_psi(self) -> None:
+        """Every bare Scheduler defaults ``_read_psi_sample`` to ``idle_psi_sample``.
+
+        Without the autouse ``_hermetic_psi_reader`` fixture, the constructor
+        default (scheduler.py) is the real ``shared.psi.read_psi_sample``,
+        which reads live ``/proc/pressure/*`` — this identity assertion would
+        be False. Mirrors
+        ``test_scheduler_state.py::test_bare_config_project_root_isolated_to_tmp``,
+        the guard test for the sibling autouse ``_isolate_orch_config`` fixture.
+        """
+        scheduler = Scheduler(OrchestratorConfig(max_per_module=1))
+
+        assert scheduler._read_psi_sample is idle_psi_sample, (
+            'expected the autouse _hermetic_psi_reader fixture to default '
+            f'_read_psi_sample to idle_psi_sample; got {scheduler._read_psi_sample!r}'
+        )
+        sample = scheduler._read_psi_sample()
+        assert sample.read_ok is True
+        assert sample.cpu_some10 == 0.0
+        assert sample.mem_some10 == 0.0
+        assert sample.mem_full10 == 0.0
+        assert sample.io_some10 == 0.0
