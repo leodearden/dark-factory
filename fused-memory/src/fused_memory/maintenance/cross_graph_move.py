@@ -819,6 +819,25 @@ async def _relates_to_edge_already_in_target(graph: Any, edge_uuid: str) -> bool
     return bool(result.result_set)
 
 
+async def _mentions_link_already_in_target(graph: Any, mention_uuid: str) -> bool:
+    """Read-only presence probe: True iff a MENTIONS link with *mention_uuid*
+    already exists in *graph*.
+
+    Mirrors ``_relates_to_edge_already_in_target``: FalkorDB enforces no
+    uniqueness constraint on a relationship's ``uuid`` property either, so a
+    blind re-``CREATE`` on a crash-resumed or fully-idempotent re-run of
+    ``recreate_subgraph_relationships`` would duplicate a MENTIONS link it
+    already recreated in a prior pass -- the exact same hazard already
+    guarded for RELATES_TO. This probe is what lets a re-run skip a MENTIONS
+    link instead.
+    """
+    result = await graph.ro_query(
+        'MATCH ()-[e:MENTIONS]->() WHERE e.uuid = $uuid RETURN e.uuid LIMIT 1',
+        {'uuid': mention_uuid},
+    )
+    return bool(result.result_set)
+
+
 async def recreate_subgraph_relationships(graphiti: Any, specs: list[dict]) -> SubgraphEdgeResult:
     """Phase B of the three-phase barrier-ordered apply (CGL-η follow-up,
     task 2415): recreate every RELATES_TO edge and Episodic MENTIONS link
@@ -866,7 +885,11 @@ async def recreate_subgraph_relationships(graphiti: Any, specs: list[dict]) -> S
     count would be. MENTIONS are recreated the same way
     ``move_entity_across_graphs`` does (MATCH the episode + entity in the
     entity's resolved target, ``relationships_created`` distinguishes
-    recreate from silent skip).
+    recreate from silent skip), skipped as a genuine idempotent no-op if
+    already present in target (``_mentions_link_already_in_target`` -- the
+    same re-run-safety guard as RELATES_TO's
+    ``_relates_to_edge_already_in_target``, since FalkorDB enforces no
+    uniqueness constraint on a MENTIONS relationship's uuid either).
 
     MERGE fold: run AFTER the MOVE-edge/mentions passes above have fully
     completed for the batch. For every MERGE spec, every RELATES_TO edge
@@ -1040,6 +1063,12 @@ async def recreate_subgraph_relationships(graphiti: Any, specs: list[dict]) -> S
         _mention_uuid, _mention_group_id, mention_created_at, episode_uuid = row
         target_graph_name = target_of[entity_uuid]
         target = graphiti._graph_for(target_graph_name)
+
+        if await _mentions_link_already_in_target(target, mention_uuid):
+            # Genuine idempotent no-op (re-run after a prior completed/
+            # partial Phase B) -- not a loss, so neither counter is
+            # incremented. Mirrors the RELATES_TO skip above.
+            continue
 
         mention_create_result = await target.query(
             'MATCH (ep:Episodic {uuid: $episode_uuid}), (n:Entity {uuid: $entity_uuid}) '
