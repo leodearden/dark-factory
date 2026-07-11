@@ -5786,6 +5786,7 @@ Update the plan to address the blocking issues. You may add new steps to the `st
         paths suppress task-status transitions — the caller retries
         the merge in-place instead of requeueing via the scheduler.
         """
+        from orchestrator.merge_disposition import MergeFailureDisposition
         from orchestrator.merge_queue import (
             PLAN_FILES_NOT_TOUCHED_REASON_PREFIX,
             AttachAction,
@@ -6113,6 +6114,29 @@ Update the plan to address the blocking issues. You may add new steps to the `st
         if result.reason.startswith(MAIN_HEALTH_RED_REASON_PREFIX):
             self._write_merge_failure_review('main_health_red', result.reason)
             return await self._auto_heal_main_health(result, merge_phase=merge_phase)
+        # Merge-skew short-circuit (task 2383 β, M2 of
+        # plans/merge-skew-attribution-prd.md): the branch verified green
+        # pre-merge, but a landing on main overlapping the failing test's
+        # file(s) is implicated — this is a "port the landed change" case,
+        # not a bug on the branch.  Route straight to a human-facing L1
+        # tagged ``integration_skew`` (not the steward — porting a landed
+        # diff requires human/architect judgement, not a retry) so the
+        # implicated sha + overlap files carried in *result.reason* by
+        # ``_render_skew_surfaces`` are never buried in a generic task-fault
+        # escalation.  Checked AFTER the MAIN_HEALTH_RED short-circuit
+        # (mutually exclusive: MAIN_RED is stamped only when
+        # preexisting=True, INTEGRATION_SKEW only when preexisting=False)
+        # and BEFORE the generic blocked path.
+        if getattr(result, 'disposition', None) is MergeFailureDisposition.INTEGRATION_SKEW:
+            self._write_merge_failure_review('integration_skew', result.reason)
+            return await self._mark_blocked(
+                result.reason,
+                detail=result.reason,
+                merge_phase=merge_phase,
+                escalate_to_human=True,
+                category='integration_skew',
+                suggested_action='port_landed_change',
+            )
         # Fix 3 — capture the merge-queue blocked reason so the merge-phase
         # loop can fingerprint it for the thrash check before resubmitting.
         self._last_merge_block_reason = result.reason
