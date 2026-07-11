@@ -2568,6 +2568,31 @@ class TestGetEntity:
         }
 
     @pytest.mark.asyncio
+    async def test_degraded_fallback_on_exact_match_edge_fetch_quota_error(self, service):
+        """A quota/rate-limit error from get_valid_edges_for_node — reached only
+        after get_nodes_by_exact_name resolves a hit, via the exact-match
+        branch's gather_or_raise fan-out over resolved node uuids — also
+        degrades instead of raising. Distinct code path from the exact-name
+        lookup itself (test_degraded_fallback_on_exact_match_quota_error
+        above): that one fails before any uuid is resolved, this one fails
+        during the subsequent concurrent edge fetch."""
+        service.graphiti.get_nodes_by_exact_name = AsyncMock(
+            return_value=[{'uuid': 'u-115', 'name': 'Task 115', 'summary': 's', 'labels': []}]
+        )
+        service.graphiti.get_valid_edges_for_node = AsyncMock(
+            side_effect=_make_rate_limit_error()
+        )
+
+        result = await service.get_entity('Task 115', project_id='test')
+
+        assert result == {
+            'nodes': [],
+            'edges': [],
+            'degraded': True,
+            'failed_stores': ['graphiti'],
+        }
+
+    @pytest.mark.asyncio
     async def test_non_quota_error_still_propagates(self, service):
         """A non-quota RuntimeError from the fuzzy fallback still propagates unchanged —
         the degraded fallback is narrowly scoped to quota/rate-limit errors only."""
