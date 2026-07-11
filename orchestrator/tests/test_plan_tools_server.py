@@ -863,6 +863,7 @@ class TestCreatePlanToolDroppedFiles:
             # 'files' deliberately omitted — the dropped-arg shape.
         })
 
+        assert result.structured_content is not None
         assert result.structured_content['status'] == 'error'
         assert artifacts.read_plan() == {}
 
