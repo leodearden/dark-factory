@@ -39,7 +39,12 @@ def artifacts(tmp_path):
 # A ~2KB "trigger payload" analysis string mirroring the documented shape
 # that accompanies the harness's files-arg mis-serialization defect:
 # markdown backticks, a double-dot commit range, and a bang-pathspec token
-# (task 2428).
+# (task 2428). NOTE: this is realistic-context padding only — _coerce_files
+# / _create_plan's coercion behavior is independent of analysis content (the
+# tests below pass a stringified `files` arg directly). Its purpose is to
+# exercise the boundary tests with an analysis shape matching the documented
+# trigger, not to causally test analysis size/content; see TestCoerceFiles
+# for the coercion-behavior unit tests themselves.
 _TRIGGER_ANALYSIS = (
     'Root cause analysis referencing `backtick code`, a commit range like '
     "main..HEAD, and a bang-pathspec like :!.task/ as in `git add -- . "
