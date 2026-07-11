@@ -1992,6 +1992,17 @@ class VerifyResult:
     # pass it straight into VerifyResult(**d) without reconstructing it.
     # None for every non-contention result (default / back-compat).
     contention: dict | None = None
+    # Machine-readable record of the VerifyPlan (verify_plan.py, PRD task γ)
+    # that drove this verification attempt: VerifyPlan.to_dict() — {'runs':
+    # [...], 'needs_pipeline_guard_check': bool}. Deliberately a plain
+    # JSON-native dict (NOT a nested VerifyPlan dataclass), mirroring
+    # `contention` immediately above, so the generic codec
+    # (result_to_dict=asdict / result_from_dict=VerifyResult(**d)) round-trips
+    # it losslessly — a nested dataclass would come back as a bare dict from
+    # asdict but from_dict would pass it straight into VerifyResult(**d)
+    # without reconstructing it. None when no plan was derived (default /
+    # back-compat / _trivial_pass and other non-planned results).
+    plan: dict | None = None
     # Wall-clock verify cost.  For a single-module run: max(test, lint, type)
     # when the three commands ran concurrently (asyncio.gather), or their sum
     # when run serially.  For a multi-module run: max across child
