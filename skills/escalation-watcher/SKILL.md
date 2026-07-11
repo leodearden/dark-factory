@@ -175,8 +175,9 @@ If tasks.json has shrunk, task IDs are mismatched/duplicated, or tasks have disa
 1. Find the orchestrator process **for this project only** — verify its command-line args reference this project's root before doing anything
 2. Send SIGTERM (not SIGKILL) and let it finish gracefully
 3. Tell the human immediately with full details
-4. **Do NOT clean up any state** — preserve everything for post-mortem debugging
-5. Wait for instructions
+4. File a DecisionRecord via `write-decision` (see "Filing Parked Decisions to the Cockpit Registry" below) — IN ADDITION to telling the human directly
+5. **Do NOT clean up any state** — preserve everything for post-mortem debugging
+6. Wait for instructions
 
 ### 2. Software quality
 
@@ -196,8 +197,40 @@ Quality is king. In the long term, high quality is fast and cheap, but bugs and 
 - Continue handling other escalations while you wait
 - Periodically remind (every ~3-5 escalation cycles, not more)
 - **Pass `--exclude-id <esc-id>` on every subsequent watcher (re)start** while the item is deliberately pending, so the initial scan does not instantly re-fire on it and busy-loop. The flag also suppresses event-loop wakes from dedupe rewrites of that file.
+- **File a DecisionRecord via `write-decision`** (see "Filing Parked Decisions to the Cockpit Registry" below) — IN ADDITION to the reminder above, so this item surfaces in the cockpit decision queue.
 
 It is better to stall development than to bake in a significant bad decision.
+
+## Filing Parked Decisions to the Cockpit Registry (C8)
+
+Fleet Cockpit C8 (`plans/fleet-cockpit-prd.md`): every time this skill parks a decision for the
+human — Priority 3b, an AFK-mode deferral, a B3 gate abort/drift-pending outcome, or an
+`infra_issue`/`recon_*` "tell the human" — also file it to the cockpit decision registry, **IN
+ADDITION to** (not instead of) the in-session note and the `afk-digest.md` line. The registry is
+what makes the cockpit decision queue (C5b) the primary return-triage surface; `afk-digest.md` is
+**retained** (demoted to a generated history view, not removed in this batch), so nothing that
+already reads it breaks.
+
+```bash
+python3 $DARK_FACTORY_ROOT/orchestrator/src/orchestrator/session_registry.py write-decision \
+  --id <stable-id> --project <project> --text "<one-line question>" \
+  [--task-id <task_id>] [--escalation-id <escalation_id>] [--session-id watcher-<project>-$$]
+```
+
+- **`--id`**: a stable id you can recompute idempotently for the same pending item — the
+  escalation id (`esc-42-1`) is usually the natural choice. Re-filing the same id overwrites the
+  prior record rather than duplicating it (`write-decision` always writes the whole file).
+- **`--text`**: the one-line question a human needs to answer — the same summary you'd otherwise
+  only give in-session or in the digest.
+- **`--task-id` / `--escalation-id` / `--session-id`**: thread through whatever you have — the
+  blocked task, the escalation this resolves, and this watcher's own session slug (see "Claiming
+  the Watcher Lease" above) — so the cockpit can cross-link the decision to its source.
+- The verb always files `state=open` and prints the filed id on success for your own cross-link
+  (e.g. into the digest line). It is fail-soft — a registry fault is logged and swallowed, never
+  raised, so filing a decision can never crash the watch loop or block the park itself.
+
+This is additive at every "leave pending" / "tell the human" / "park" moment below — do the
+existing action exactly as documented, and also run `write-decision` once per parked item.
 
 ## Merge Submissions — Bounded Submit, Then Poll
 
@@ -261,7 +294,10 @@ explicit "I'll be away" or a long silence after one. Three behavioural shifts:
      `resolve_ticket`), and
    - `resolve_issue(..., action='park')` so the blocking task lands `blocked`, held under an open L2
      (no re-dispatch while the escalation is open; the stranded-blocked sweep skips a blocked task
-     that has an open escalation).
+     that has an open escalation), and
+   - File a DecisionRecord via `write-decision` (see "Filing Parked Decisions to the Cockpit
+     Registry" below) — IN ADDITION to the follow-up task, so the parked decision surfaces in the
+     cockpit decision queue.
    This is parking a decision for later human review — NOT making it. Only park when the task has no
    half-merged or destructive state. The Priority Hierarchy bar still holds: better to defer than to
    bake in a bad decision — when in real doubt, fall back to "leave pending + digest."
@@ -277,6 +313,8 @@ explicit "I'll be away" or a long silence after one. Three behavioural shifts:
      `risk_identified` / `infra_issue` / `recon_*`:** leave pending + digest. These need a human;
      a terminal nobody attends just clutters. Pass `--exclude-id <esc-id>` on the next watcher
      (re)start for each item left pending so the initial scan does not busy-loop on it.
+   - Either way, also **file a DecisionRecord via `write-decision`** (see "Filing Parked Decisions
+     to the Cockpit Registry" below) for each item left pending — IN ADDITION to the digest entry.
 
 3. **Batch into a digest, don't ping per-item.** Reminding "every 3-5 cycles" is noise when nobody is
    reading. Maintain a single rolling manifest at `<project_root>/data/escalations/afk-digest.md`
@@ -319,6 +357,10 @@ Parse the JSON output: `verdict` (`fresh`|`drift`|`abort`), `reason`, `cap_remai
 | `verdict == "abort"` | Leave escalation pending + digest line carrying the gate's `reason` |
 | `verdict == "drift"` | Drift path (see Drift path section below) |
 | `verdict == "fresh"` | Record-launch + launch (see below) |
+
+Every "leave escalation pending + digest line" outcome above also files a DecisionRecord via
+`write-decision` (see "Filing Parked Decisions to the Cockpit Registry" below) — IN ADDITION to
+the digest line, not instead of it.
 
 **On `fresh` — record-launch then launch:**
 
@@ -392,7 +434,8 @@ A malformed entry is fail-safe by construction — it simply fails the next `che
 is the single shape validator). Then **re-gate once**: re-run `b3_gate check`. If `fresh` →
 record-launch + launch; if `drift` again (a second drift in the same handling cycle) → leave
 pending + digest (drift-reinvestigated outcome — main is moving inside the task's footprint; a
-human should look). **At most one re-investigation per handling cycle.**
+human should look) and file a DecisionRecord via `write-decision`. **At most one re-investigation
+per handling cycle.**
 
 **Completion handling:**
 
@@ -405,7 +448,9 @@ launch by `task_id` / background-task-id):
   `task_id` in your context as completed this cycle (do NOT re-launch it), record the abort reason
   in the digest, and move on — do NOT retry, and do NOT spawn an interactive `/unblock` in AFK
   mode; it waits for the human. If the abort reason indicates drift/staleness and the one-shot has
-  not been used this cycle, route through the drift path once.
+  not been used this cycle, route through the drift path once. Also file a DecisionRecord via
+  `write-decision` carrying the abort reason as `--text` (see "Filing Parked Decisions to the
+  Cockpit Registry" below).
 
 The sub-agent re-checks the gate defensively and refuses anything not unambiguously low-risk; treat
 its abort as authoritative.
@@ -426,6 +471,11 @@ mode; AFK shift 3 manages it):
 - **Aborted**: `B3 <task_id> — aborted: <reason>`
 - **Drift-reinvestigated, second drift**: `B3 <task_id> — drift re-investigated; re-gate: drift-again → pending`
 - **Drift-reinvestigated, relaunched**: `B3 <task_id> — drift re-investigated; re-gate: fresh → launched`
+
+`afk-digest.md` is **retained** (Fleet Cockpit C8) — it is not removed in this batch, but it is
+demoted to a generated history view: the cockpit decision queue (C5b), fed by `write-decision`
+(see "Filing Parked Decisions to the Cockpit Registry" above), is now the primary return-triage
+surface for any of the above that left a decision open (i.e. every outcome except "Merged").
 
 ## Handling Escalations by Category
 
@@ -609,14 +659,16 @@ Infrastructure problems — database connectivity, MCP failures, service outages
 1. Tell the human immediately with full details
 2. Leave the escalation pending
 3. Do NOT attempt automated infrastructure fixes
-4. Wait for human instructions
-5. Pass `--exclude-id <esc-id>` on every subsequent watcher (re)start while this item is pending
+4. File a DecisionRecord via `write-decision` (see "Filing Parked Decisions to the Cockpit
+   Registry" above) — IN ADDITION to telling the human directly
+5. Wait for human instructions
+6. Pass `--exclude-id <esc-id>` on every subsequent watcher (re)start while this item is pending
 
 ### `recon_*` categories
 
 `recon_failure`, `recon_backlog_overflow`, `recon_stale_run`, `recon_integrity_issue` — these are all fused-memory reconciliation problems.
 
-Reconciliation is infrastructure that affects memory quality across the entire system. **Tell the human** with full details. Track as a todo. These may indicate systematic issues that need root-cause investigation rather than point fixes.
+Reconciliation is infrastructure that affects memory quality across the entire system. **Tell the human** with full details. Track as a todo. These may indicate systematic issues that need root-cause investigation rather than point fixes. Also file a DecisionRecord via `write-decision` (see "Filing Parked Decisions to the Cockpit Registry" above).
 
 ## Context Conservation
 
