@@ -5451,9 +5451,33 @@ class SpeculativeMergeWorker(_WipHaltMixin):
         fallback is defensive-only and never the hot path — it only matters
         for narrow unit tests that construct an ``InflightEntry`` without
         registering it.
+
+        The fallback deliberately still returns a *qualifying* phase
+        (rather than a fail-safe sentinel outside
+        ``{'verifying', 'gate_reverify', 'finalizing'}``) so it keeps
+        matching the pre-deletion default for those narrow unit tests
+        exactly (task 2173 amendment review, esc-2173-reviewer_comprehensive:
+        a non-qualifying sentinel would flip several existing
+        registration-skipping ``_finalizing_head`` tests from included to
+        excluded). Since this path is defensive-only in production, it logs
+        at DEBUG on every hit so a future wiring regression that reaches it
+        is at least observable rather than silently masquerading as a
+        genuinely-verifying/frozen head.
         """
         state = self._lifecycle.current(entry.item.request.request_id)
-        return state.value if state is not None else 'verifying'
+        if state is not None:
+            return state.value
+        logger.debug(
+            'Entry for request %s has no ItemLifecycle registry entry; '
+            'falling back to phase=%r. Defensive-only in production — every '
+            '_inflight entry is registered via _inflight_append, so this '
+            'normally only fires from a narrow unit test that constructs an '
+            'InflightEntry without registering it. If seen outside tests, '
+            'it signals a lifecycle-registration wiring regression.',
+            entry.item.request.request_id,
+            'verifying',
+        )
+        return 'verifying'
 
     # ── δ=1988 SuffixConflictTracker delegation ─────────────────────────────
     # Data-descriptor properties forwarding the original attribute names to
