@@ -889,6 +889,50 @@ async def _classify_disposition_for_outcome(
         return MergeFailureDisposition.INDETERMINATE, None, ''
 
 
+async def _resolve_dispatch_time_merge_base(
+    repo_root: Path,
+    main_sha: str,
+    branch_tip: str | None,
+) -> str | None:
+    """Best-effort ``git merge-base(main_sha, branch_tip)`` for the
+    merge-skew classifier's dispatch-time base facts (task 2383 β, 2357).
+
+    Both *main_sha* and *branch_tip* are caller-supplied frozen values —
+    *main_sha* is the production caller's ``item.base_sha`` (never a fresh
+    ``get_main_sha()`` re-read) and *branch_tip* is ``item.merged_branch_tip``
+    (never a fresh branch-ref re-read) — this helper only computes their
+    common ancestor via a read-only ``git merge-base`` call.
+
+    Returns ``None`` — degrading classification to INDETERMINATE via
+    ``_run_post_merge_verify``'s None-default (I3, fail-open) — when
+    *branch_tip* is unavailable or the git call fails for any reason
+    (non-git *repo_root*, unresolvable SHA, subprocess error).
+    """
+    if not branch_tip:
+        return None
+    try:
+        rc, out, err = await _run(
+            ['git', 'merge-base', main_sha, branch_tip], cwd=repo_root,
+        )
+        if rc != 0:
+            logger.warning(
+                '_resolve_dispatch_time_merge_base: git merge-base failed '
+                '(rc=%d) for main_sha=%s branch_tip=%s: %s; degrading to '
+                'None (fail-safe, I3)',
+                rc, main_sha, branch_tip, err.strip(),
+            )
+            return None
+        return out.strip() or None
+    except Exception:
+        logger.warning(
+            '_resolve_dispatch_time_merge_base: git merge-base raised for '
+            'main_sha=%s branch_tip=%s; degrading to None (fail-safe, I3)',
+            main_sha, branch_tip,
+            exc_info=True,
+        )
+        return None
+
+
 # Sentinel task_id prefix for a laptop-side flock-worktree-contention alarm
 # (task 2307 β, PRD plans/laptop-warm-verify-flock-orphan-prd.md §8.2).
 # Mirrors _VERIFY_HOST_UNREACHABLE_SENTINEL_PREFIX's per-host sentinel shape.
