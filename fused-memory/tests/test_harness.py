@@ -745,6 +745,12 @@ class TestStage1CycleSummaryHarnessBackstop:
         )
         assert payload['stats'].get('stage1_cycle_summary_degraded_backstop') is True
 
+        assert recent[0].stage_reports['_error']['stage1_cycle_summary_backstop_written'] is True, (
+            'the harness must stamp the operator-facing breadcrumb onto the persisted '
+            "run's _error record once the backstop ledger write succeeds, so the "
+            'observability signal is pinned to actual behavior'
+        )
+
     @pytest.mark.asyncio
     async def test_stage1_cancelled_error_triggers_degraded_backstop_and_still_propagates(
         self, journal, event_buffer, mock_memory_service, ledger_store
