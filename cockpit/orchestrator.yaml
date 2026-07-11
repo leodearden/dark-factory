@@ -1,0 +1,14 @@
+# Cockpit orchestrator configuration
+# Scopes verification to cockpit's own venv and the full tests/ tree (not just
+# the files a task happens to touch) — tests/smoke/ is default-deselected via
+# cockpit/pyproject.toml's `addopts = "-m 'not smoke'"` (this worktree is the
+# live DISPLAY=:0 host, so routine unscoped runs must never spawn real X11
+# windows/tmux sessions). Pinning the full tests/ tree keeps the selected set
+# non-empty regardless of which files a task touches, avoiding a pytest
+# rc=5 ("no tests ran") misclassification — see task 2446 / precedent 1852.
+
+# Verification commands
+test_command: "uv run --project cockpit --directory cockpit pytest tests/ --tb=short -q"
+# bare-MagicMock config gate (also runs in merge-queue verify; see hooks/project-checks)
+lint_command: "uv run --project cockpit --directory cockpit ruff check src/ tests/ && python3 fused-memory/scripts/check_bare_magicmock_config.py cockpit/tests"
+type_check_command: "uv run --project cockpit --directory cockpit pyright src/ tests/"
