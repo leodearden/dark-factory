@@ -6,12 +6,13 @@ client-side FSM is gone. What remains is the constant set that workflow.py
 still uses to distinguish terminal outcomes after the steward runs.
 """
 
+from shared.task_statuses import TaskStatus
+
 from orchestrator.task_status import (
     TERMINAL_STATUSES,
     WORKFLOW_PRESERVE_STATUSES,
     is_infra_held,
 )
-from shared.task_statuses import TaskStatus
 
 
 class TestTerminalStatuses:

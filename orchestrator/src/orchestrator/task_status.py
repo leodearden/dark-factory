@@ -24,7 +24,8 @@ transition to 'done').
 
 from __future__ import annotations
 
-from typing import Any, Mapping, Optional
+from collections.abc import Mapping
+from typing import Any
 
 from shared.task_statuses import ACTIVE, TERMINAL, WORKFLOW_PRESERVE, TaskStatus
 
@@ -58,7 +59,7 @@ ACTIVE_TASK_STATUSES: frozenset[str] = ACTIVE - {TaskStatus.INFRA_HOLD}
 WORKFLOW_PRESERVE_STATUSES: frozenset[str] = WORKFLOW_PRESERVE
 
 
-def is_infra_held(task: Optional[Mapping[str, Any]]) -> bool:
+def is_infra_held(task: Mapping[str, Any] | None) -> bool:
     """Single source of truth for the infra-hold exemption (PRD C7/D3).
 
     Returns True iff ``task``'s first-class ``status`` field is

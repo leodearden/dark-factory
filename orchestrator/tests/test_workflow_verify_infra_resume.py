@@ -426,6 +426,7 @@ class TestVerifyInfraStampUsesInfraHoldStatus:
         # The escalation/_mark_blocked path still fires so the L1 is created.
         wf._ensure_l1_escalation_for_blocked.assert_awaited_once()  # type: ignore[attr-defined]
         l1_call = wf._ensure_l1_escalation_for_blocked.await_args  # type: ignore[attr-defined]
+        assert l1_call is not None, 'await_args must not be None'
         assert l1_call.kwargs.get('category') == 'infra_issue', (
             f'L1 must be filed with category=infra_issue, got: {l1_call}'
         )
