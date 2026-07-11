@@ -2306,10 +2306,13 @@ class TaskWorkflow:
             # TerminalReport.phase is machine.state — this path never calls
             # _enter_phase, so it is the pre-existing working phase (PLAN,
             # since create_worktree runs before the first _enter_phase call
-            # in run()).
+            # in run()).  blocked_from_phase mirrors it (no BLOCKED transition
+            # here, so "pre-block" and "current" are the same phase) — keeps
+            # the harness's retry-cap block_phase at 'plan' (REVIEW-CYCLE-1).
             self._terminal_report = TerminalReport(
                 outcome=WorkflowOutcome.REQUEUED, reason=block_reason,
                 phase=self.machine.state, detail=str(e), category=None,
+                blocked_from_phase=self.machine.state,
             )
             return WorkflowOutcome.REQUEUED
 
@@ -3138,6 +3141,10 @@ class TaskWorkflow:
                     reason='plan_blast_radius_lock_conflict',
                     phase=self.machine.state, detail=block_detail,
                     category=None,
+                    # No BLOCKED transition on this path — blocked_from_phase
+                    # mirrors the current (working) phase, preserving the
+                    # harness's retry-cap block_phase='plan' (REVIEW-CYCLE-1).
+                    blocked_from_phase=self.machine.state,
                 )
                 return WorkflowOutcome.REQUEUED
             # Persistence of the tightened lock set is centralized in
@@ -8437,6 +8444,16 @@ Update the plan to address the blocking issues. You may add new steps to the `st
             )
             return WorkflowOutcome(self.state.value)
 
+        # REVIEW-CYCLE-1 fix: snapshot the PRE-block WORKING phase (e.g.
+        # VERIFY/REVIEW) BEFORE the `if not merge_phase` branch below calls
+        # _enter_phase(BLOCKED) — mirrors the deleted `_last_block_phase =
+        # self.state.value` pre-block stash.  Threaded into _record so every
+        # return point (including the merge_phase=True paths, which never
+        # transition) stamps TerminalReport.blocked_from_phase with the phase
+        # this call was entered at, distinct from `phase` (machine.state at
+        # _record time, kept == machine.state for SM-2).
+        pre_block_state = self.machine.state
+
         def _record(outcome: WorkflowOutcome) -> WorkflowOutcome:
             """Build the atomic TerminalReport at a _mark_blocked return point.
 
@@ -8450,6 +8467,7 @@ Update the plan to address the blocking issues. You may add new steps to the `st
             self._terminal_report = TerminalReport(
                 outcome=outcome, reason=reason, phase=self.machine.state,
                 detail=(detail or reason), category=None,
+                blocked_from_phase=pre_block_state,
             )
             return outcome
 
