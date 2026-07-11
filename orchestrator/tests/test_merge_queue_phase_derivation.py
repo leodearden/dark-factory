@@ -31,10 +31,11 @@ from __future__ import annotations
 
 import asyncio
 from pathlib import Path
+from unittest.mock import MagicMock
 
 import pytest
 
-from orchestrator.config import GitConfig
+from orchestrator.config import GitConfig, OrchestratorConfig
 from orchestrator.git_ops import GitOps, _run
 
 # ---------------------------------------------------------------------------
@@ -78,6 +79,11 @@ def git_ops(git_config: GitConfig, git_repo: Path) -> GitOps:
     return GitOps(git_config, git_repo)
 
 
+@pytest.fixture
+def config(git_repo: Path, git_config: GitConfig) -> OrchestratorConfig:
+    return OrchestratorConfig(project_root=git_repo, git=git_config)
+
+
 def _make_worker(git_ops: GitOps):
     """Build a bare SpeculativeMergeWorker for unit tests (no harness wiring).
 
@@ -87,6 +93,33 @@ def _make_worker(git_ops: GitOps):
     from orchestrator.merge_queue import SpeculativeMergeWorker
 
     return SpeculativeMergeWorker(git_ops, asyncio.Queue())
+
+
+def _make_request(
+    task_id: str,
+    branch: str,
+    worktree: Path,
+    config: OrchestratorConfig,
+):
+    """Build a MergeRequest with a fresh Future for the running event loop.
+
+    Duplicated from test_merge_queue_lifecycle_registry.py / test_merge_queue_
+    request_liveness.py (per-file duplication convention — see this file's
+    module docstring).
+    """
+    from orchestrator.merge_types import MergeRequest
+
+    return MergeRequest(
+        task_id=task_id,
+        branch=branch,
+        worktree=worktree,
+        pre_rebased=False,
+        task_files=None,
+        module_configs=[],
+        config=config,
+        result=asyncio.get_running_loop().create_future(),
+        lane='normal',
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -119,4 +152,100 @@ class TestVestigialVerifyFieldsRemoved:
         assert not hasattr(worker, '_verify_started_at'), (
             'worker._verify_started_at must be deleted — it is write-only '
             '(zero reads anywhere in the tree).'
+        )
+
+
+# ---------------------------------------------------------------------------
+# step-3 RED / step-4 GREEN: snapshot()/frozen_prefix() derive phase from the
+# ItemLifecycle registry, not the stored InflightEntry.phase field
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestPhaseDerivesFromRegistry:
+    """snapshot()/frozen_prefix() derive an entry's phase from the
+    ItemLifecycle registry (``self._lifecycle.current(request_id)``), not
+    from the stored ``InflightEntry.phase`` field (task lambda / task 2173
+    step-3).
+
+    RED until step-4 GREEN adds ``SpeculativeMergeWorker._entry_phase()`` and
+    repoints the production readers onto it: on current code, a
+    registry-only transition (via ``_note_transition``, with ``entry.phase``
+    left untouched) does not move snapshot()/frozen_prefix()'s reported
+    state, because they read the stale ``entry.phase`` field directly.
+    """
+
+    async def test_registry_transition_moves_reported_phase(
+        self, git_ops: GitOps, config: OrchestratorConfig, tmp_path: Path,
+    ) -> None:
+        from orchestrator.merge_queue import InflightEntry, ItemLifecycleState, RealMergeItem
+
+        worker = _make_worker(git_ops)
+
+        req = _make_request('lam-derive', 'lam-derive', tmp_path, config)
+        item = RealMergeItem(
+            request=req, merge_result=MagicMock(), merge_wt=tmp_path / 'merge_wt',
+            base_sha='deadbeef', speculative=False,
+        )
+        rid = worker._register_item(item, initial=ItemLifecycleState.VERIFYING)
+        entry = InflightEntry(
+            item=item, lease=None, verify_task=MagicMock(), merge_wt=item.merge_wt,
+            was_speculative=False, phase='verifying',
+        )
+        worker._inflight.append(entry)
+
+        snap = worker.snapshot()
+        assert snap['entries'][0]['state'] == 'verifying'
+        assert snap['verify_in_progress']['phase'] == 'verifying'
+        assert rid in worker.frozen_prefix()
+
+        # Advance the registry WITHOUT touching entry.phase at all.
+        worker._note_transition(
+            rid, ItemLifecycleState.VERIFYING, ItemLifecycleState.FINALIZING,
+        )
+        worker._note_transition(
+            rid, ItemLifecycleState.FINALIZING, ItemLifecycleState.GATE_REVERIFY,
+        )
+
+        snap2 = worker.snapshot()
+        assert snap2['entries'][0]['state'] == 'gate_reverify', (
+            "RED: entries[0]['state'] should follow the registry (GATE_REVERIFY) "
+            "even though entry.phase is untouched ('verifying'); got "
+            f"{snap2['entries'][0]['state']!r}."
+        )
+        assert snap2['verify_in_progress']['phase'] == 'gate_reverify', (
+            "RED: verify_in_progress['phase'] should follow the registry "
+            f"(GATE_REVERIFY); got {snap2['verify_in_progress']['phase']!r}."
+        )
+        assert rid in worker.frozen_prefix(), (
+            'the entry must still qualify for frozen_prefix after the '
+            'registry-only transition to GATE_REVERIFY.'
+        )
+
+    async def test_finalizing_head_excluded_when_registry_is_non_qualifying(
+        self, git_ops: GitOps, config: OrchestratorConfig, tmp_path: Path,
+    ) -> None:
+        from orchestrator.merge_queue import InflightEntry, ItemLifecycleState, RealMergeItem
+
+        worker = _make_worker(git_ops)
+
+        req2 = _make_request('lam-fh', 'lam-fh', tmp_path, config)
+        item2 = RealMergeItem(
+            request=req2, merge_result=MagicMock(), merge_wt=tmp_path / 'merge_wt2',
+            base_sha='deadbeef', speculative=False,
+        )
+        rid2 = worker._register_item(item2, initial=ItemLifecycleState.DISPATCHING)
+        entry2 = InflightEntry(
+            item=item2, lease=None, verify_task=None, merge_wt=item2.merge_wt,
+            was_speculative=False,
+            # Stale field deliberately DISAGREES with the registry (DISPATCHING)
+            # to prove the derivation source is the registry, not this field.
+            phase='verifying',
+        )
+        worker._finalizing_head = entry2
+
+        assert rid2 not in worker.frozen_prefix(), (
+            "RED: a _finalizing_head registered at DISPATCHING in the registry "
+            "must be excluded from frozen_prefix even though its stale "
+            "entry.phase field says 'verifying' (a qualifying value)."
         )
