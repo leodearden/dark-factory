@@ -1065,7 +1065,6 @@ def _build_entry(
         verify_task=asyncio.ensure_future(_resolved()),
         merge_wt=merge_wt,
         was_speculative=True,
-        phase='verifying',
     )
 
 

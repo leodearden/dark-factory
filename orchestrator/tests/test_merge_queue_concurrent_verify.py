@@ -948,7 +948,6 @@ class TestFinalizeInflightPass:
             verify_task=None,
             merge_wt=item.merge_wt,
             was_speculative=was_speculative,
-            phase='verifying',
             passthrough_outcome=None,
             verify_result=None,  # None = pass
             status=None,
@@ -1324,7 +1323,6 @@ class TestFinalizeInflightNonPass:
             verify_task=verify_task,
             merge_wt=merge_wt_val,
             was_speculative=False,
-            phase='verifying',
         )
 
     def _make_sentinel_entry(self, item, lease, sentinel_status, merge_wt_val=None):
@@ -1345,7 +1343,6 @@ class TestFinalizeInflightNonPass:
             verify_task=verify_task,
             merge_wt=merge_wt_val,
             was_speculative=False,
-            phase='verifying',
         )
 
     # ------------------------------------------------------------------
@@ -1483,7 +1480,6 @@ class TestFinalizeInflightNonPass:
             verify_task=None,
             merge_wt=None,
             was_speculative=False,
-            phase='passthrough',
             passthrough_outcome=conflict_outcome,
         )
         await worker._finalize_inflight(entry)  # RED: raises AssertionError
@@ -1510,7 +1506,7 @@ class TestFinalizeInflightNonPass:
 
         entry = InflightEntry(
             item=item, lease=None, verify_task=None, merge_wt=None,
-            was_speculative=False, phase='passthrough',
+            was_speculative=False,
             passthrough_outcome=conflict_outcome,
         )
         with contextlib.suppress(Exception):
@@ -1537,7 +1533,7 @@ class TestFinalizeInflightNonPass:
 
         entry = InflightEntry(
             item=item, lease=None, verify_task=None, merge_wt=None,
-            was_speculative=False, phase='passthrough',
+            was_speculative=False,
             passthrough_outcome=am_outcome,
         )
         with contextlib.suppress(Exception):
@@ -1563,7 +1559,7 @@ class TestFinalizeInflightNonPass:
 
         entry = InflightEntry(
             item=item, lease=None, verify_task=None, merge_wt=None,
-            was_speculative=False, phase='passthrough',
+            was_speculative=False,
             passthrough_outcome=conflict_outcome,
         )
         # req.result must NOT be set because already_delivered=True
@@ -2644,7 +2640,6 @@ class TestStopDrainsInflight:
             verify_task=verify_task_a,
             merge_wt=None,
             was_speculative=False,
-            phase='verifying',
         )
         entry_b = InflightEntry(
             item=item_b,
@@ -2652,7 +2647,6 @@ class TestStopDrainsInflight:
             verify_task=verify_task_b,
             merge_wt=None,
             was_speculative=False,
-            phase='verifying',
         )
 
         # Inject directly into _inflight
@@ -2711,7 +2705,6 @@ class TestStopDrainsInflight:
             verify_task=verify_task,
             merge_wt=None,
             was_speculative=False,
-            phase='verifying',
         )
         worker._inflight.append(entry)
 
@@ -2810,7 +2803,6 @@ class TestSnapshotInflight:
             verify_task=None,
             merge_wt=None,
             was_speculative=False,
-            phase='verifying',
         )
         entry_b = InflightEntry(
             item=item_b,
@@ -2818,7 +2810,6 @@ class TestSnapshotInflight:
             verify_task=None,
             merge_wt=None,
             was_speculative=False,
-            phase='verifying',
         )
 
         # Set head back-compat mirror
@@ -2872,7 +2863,6 @@ class TestSnapshotInflight:
             verify_task=None,
             merge_wt=None,
             was_speculative=False,
-            phase='verifying',
         )
 
         # Single-host scenario: _verify_item set + one _inflight entry
@@ -2921,11 +2911,11 @@ class TestSnapshotInflight:
         )
         entry_a = InflightEntry(
             item=item_a, lease=None, verify_task=None, merge_wt=None,
-            was_speculative=False, phase='verifying',
+            was_speculative=False,
         )
         entry_b = InflightEntry(
             item=item_b, lease=None, verify_task=None, merge_wt=None,
-            was_speculative=False, phase='verifying',
+            was_speculative=False,
         )
 
         worker._verify_item = item_a
@@ -3053,7 +3043,6 @@ class TestFinalizeInflightWarmResultsThreading:
             verify_task=vr_task,
             merge_wt=item.merge_wt,
             was_speculative=False,
-            phase='verifying',
         )
 
         shadow_mock = AsyncMock()
@@ -3103,7 +3092,6 @@ class TestFinalizeInflightWarmResultsThreading:
             verify_task=None,
             merge_wt=item.merge_wt,
             was_speculative=False,
-            phase='verifying',
         )
 
         shadow_mock = AsyncMock()
@@ -3622,7 +3610,6 @@ class TestStopDrainFiresRemoteCancel:
             verify_task=verify_task,
             merge_wt=None,
             was_speculative=False,
-            phase='verifying',
         )
 
         # ── LOCAL entry: negative control — _abort_remote_verify must skip ──
@@ -3646,7 +3633,6 @@ class TestStopDrainFiresRemoteCancel:
             verify_task=verify_task_local,
             merge_wt=None,
             was_speculative=False,
-            phase='verifying',
         )
 
         worker._inflight.append(entry_remote)
@@ -4638,7 +4624,6 @@ class TestFinalizeHeadSpeculativeAccountingThroughout:
             verify_task=None,
             merge_wt=second_item.merge_wt,
             was_speculative=True,
-            phase='awaiting_verify',
             permit=await worker._speculation_ledger.acquire(),
         ))
 
@@ -4650,7 +4635,6 @@ class TestFinalizeHeadSpeculativeAccountingThroughout:
             verify_task=verify_task,
             merge_wt=None,
             was_speculative=True,
-            phase='verifying',
             permit=await worker._speculation_ledger.acquire(),
         )
 

@@ -114,7 +114,6 @@ def _make_item(req: MergeRequest) -> DecidedItem:
 def _make_entry(
     req: MergeRequest,
     lease: HostLease | None,
-    phase: str = 'verifying',
     started_at: float | None = None,
 ) -> InflightEntry:
     return InflightEntry(
@@ -123,7 +122,6 @@ def _make_entry(
         verify_task=None,
         merge_wt=None,
         was_speculative=False,
-        phase=phase,
         started_at=started_at,
     )
 
@@ -168,8 +166,8 @@ class TestSnapshotFinalizingHeadEntries:
         laptop_lease = HostLease(name='laptop', runner=MagicMock(), is_local=False)
 
         started = time.time() - 5.0
-        local_head = _make_entry(req_local, local_lease, phase='verifying', started_at=started)
-        laptop_entry = _make_entry(req_laptop, laptop_lease, phase='verifying')
+        local_head = _make_entry(req_local, local_lease, started_at=started)
+        laptop_entry = _make_entry(req_laptop, laptop_lease)
 
         # The finalize window: local_head has been popped, laptop is still in _inflight.
         worker._inflight.append(laptop_entry)
@@ -219,7 +217,7 @@ class TestSnapshotFinalizingHeadEntries:
 
         req_a = _make_req('fhv-only', 'task/fhv-only', config, git_repo)
         laptop_lease = HostLease(name='laptop', runner=MagicMock(), is_local=False)
-        entry_a = _make_entry(req_a, laptop_lease, phase='verifying', started_at=time.time() - 2)
+        entry_a = _make_entry(req_a, laptop_lease, started_at=time.time() - 2)
 
         worker._inflight.append(entry_a)
         # _finalizing_head intentionally left at default (None after step-2 or unset before)
@@ -348,8 +346,8 @@ class TestSnapshotFinalizingHeadVerifyInProgress:
         laptop_lease = HostLease(name='laptop', runner=MagicMock(), is_local=False)
 
         started = time.time() - 3.0
-        local_head = _make_entry(req_local, local_lease, phase='verifying', started_at=started)
-        laptop_entry = _make_entry(req_laptop, laptop_lease, phase='verifying')
+        local_head = _make_entry(req_local, local_lease, started_at=started)
+        laptop_entry = _make_entry(req_laptop, laptop_lease)
 
         worker._inflight.append(laptop_entry)
         worker._finalizing_head = local_head  # type: ignore[attr-defined]
@@ -380,7 +378,7 @@ class TestSnapshotFinalizingHeadVerifyInProgress:
 
         req_a = _make_req('vip-only', 'task/vip-only', config, git_repo)
         local_lease = HostLease(name='local', runner=MagicMock(), is_local=True)
-        entry_a = _make_entry(req_a, local_lease, phase='verifying', started_at=time.time() - 1)
+        entry_a = _make_entry(req_a, local_lease, started_at=time.time() - 1)
 
         worker._inflight.append(entry_a)
 
@@ -482,7 +480,6 @@ class TestFinalizingHeadLifecycle:
             verify_task=verify_task,
             merge_wt=None,
             was_speculative=False,
-            phase='verifying',
             started_at=time.time() - 1.0,
         )
 

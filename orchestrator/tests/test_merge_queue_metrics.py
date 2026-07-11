@@ -416,7 +416,6 @@ class TestWiringIntegration:
             verify_task=None,
             merge_wt=item.merge_wt,
             was_speculative=False,
-            phase='verifying',
             passthrough_outcome=None,
             verify_result=None,
             status=None,

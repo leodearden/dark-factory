@@ -4406,9 +4406,11 @@ class ItemLifecycle:
     scope-4 iota / task 2164, L-1).
 
     Replaces today's four redundant state encodings — container membership
-    across the five queues, free-form ``InflightEntry.phase: str`` values,
-    the :class:`InflightStatus` sentinel enum, and the four worker transient
-    side-fields (``_inflight_req``/``_remerging_item``/``_finalizing_head``/
+    across the five queues, the free-form ``InflightEntry.phase: str`` field
+    (now deleted by task lambda / task 2173 — phase is derived via
+    :meth:`SpeculativeMergeWorker._entry_phase`), the :class:`InflightStatus`
+    sentinel enum, and the four worker transient side-fields
+    (``_inflight_req``/``_remerging_item``/``_finalizing_head``/
     ``_dispatching_item``) — with one :class:`ItemLifecycleState` per
     request_id, guarded on mutation by :meth:`transition` against the
     module-level ``_LEGAL_TRANSITIONS`` table.
@@ -4574,8 +4576,10 @@ reliability PRD scope-4 iota / task 2164, L-1). Defined after
 the same reason), so the class body never references it eagerly.
 
 Encodes the pipeline flow traced from snapshot construction and the
-phase-mutation call sites (``entry.phase = 'finalizing'``/``'gate_reverify'``,
-initial ``InflightEntry.phase = 'verifying'`` at dispatch): queued ->
+(now-deleted) phase-mutation call sites that used to set
+``entry.phase = 'finalizing'``/``'gate_reverify'``, with an initial
+``InflightEntry.phase = 'verifying'`` at dispatch (task lambda / task 2173
+deleted the field itself; the states below are unchanged): queued ->
 (lane_buffered ->) merging -> awaiting_verify -> (redispatch_parked <->)
 dispatching -> verifying -> gate_reverify -> finalizing -> terminal, plus two
 same-request_id in-place retry loops evidenced by ``_redispatch`` (the
@@ -4609,9 +4613,11 @@ above — that one never revisits DISPATCHING, it re-enters via
 ``_redispatch`` (-> REDISPATCH_PARKED) for a fresh dispatch attempt instead.
 
 kappa also adds FINALIZING -> GATE_REVERIFY. ``_finalize_inflight`` sets the
-registry to FINALIZING unconditionally at entry (mirroring its own
-``entry.phase = 'finalizing'`` set BEFORE the CAS loop's first
-``advance_main`` attempt), so a same-call ``rebased_pending_reverify`` result
+registry to FINALIZING unconditionally at entry (previously mirroring its
+own ``entry.phase = 'finalizing'`` set BEFORE the CAS loop's first
+``advance_main`` attempt — that write was deleted by task lambda / task 2173;
+the registry set at entry is now the sole source of truth), so a same-call
+``rebased_pending_reverify`` result
 moves the registry FINALIZING -> GATE_REVERIFY, not VERIFYING ->
 GATE_REVERIFY (the latter edge, above, models a *fresh* dispatch that lands
 directly on a gate re-verify with no intervening finalize attempt — not
@@ -5371,8 +5377,8 @@ class SpeculativeMergeWorker(_WipHaltMixin):
         (e.g. a ``MergeRequest`` becoming a ``SpeculativeItem`` at merge
         time). Only applied on a SUCCESSFUL transition; omitted (``None``,
         the default) when the caller's existing ``_live_items`` entry is
-        still the correct object (e.g. an in-place ``InflightEntry.phase``
-        mutation) or the object isn't tracked yet.
+        still the correct object (e.g. an in-place ``InflightEntry`` field
+        mutation, such as ``verify_result``) or the object isn't tracked yet.
         """
         try:
             self._lifecycle.transition(request_id, from_state, to_state)
@@ -5437,7 +5443,9 @@ class SpeculativeMergeWorker(_WipHaltMixin):
         scope-4 lambda / task 2173 step-4).
 
         Falls back to ``'verifying'`` when the entry's request is not
-        registered in ``self._lifecycle``. This preserves the prior
+        registered in ``self._lifecycle``. ``InflightEntry`` no longer
+        carries a ``phase`` field at all (deleted by task lambda / task 2173
+        step-6) — this constant fallback simply preserves the pre-deletion
         ``infl.phase or 'verifying'`` default: every production
         ``_inflight`` entry is registered via ``_inflight_append``, so the
         fallback is defensive-only and never the hot path — it only matters
@@ -6992,7 +7000,8 @@ class SpeculativeMergeWorker(_WipHaltMixin):
 
         # verify_in_progress: non-None only when the deque head is actively
         # verifying or in a post-verify gate phase.  Passthrough entries
-        # (phase='passthrough') produce None here — no verify task is running.
+        # (immediate-outcome delivery, no real verify task) produce None
+        # here — no verify task is running.
         # Includes 'phase' so consumers can distinguish verifying vs. gate_reverify
         # vs. finalizing without misreading the presence of this field.
         # Prefer _finalizing_head when set — it is the true submission-order head
@@ -10534,7 +10543,6 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                 return False
 
             # ── Step 5: CAS advance_main ──────────────────────────────────
-            entry.phase = 'finalizing'   # per-entry source of truth for snapshot()
             current_sha = merge_commit
             while True:
                 # Write-ahead (PRD WA-1): record a LandedRow into the durable
@@ -10645,7 +10653,6 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                         req.request_id, ItemLifecycleState.FINALIZING,
                         ItemLifecycleState.GATE_REVERIFY, live_obj=entry,
                     )
-                    entry.phase = 'gate_reverify'
                     gate = await _reverify_rebased_tree(
                         self._git_ops, req, merge_wt,
                         rebased_from=rebased_from,
@@ -10711,7 +10718,6 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                         req.request_id, ItemLifecycleState.GATE_REVERIFY,
                         ItemLifecycleState.FINALIZING, live_obj=entry,
                     )
-                    entry.phase = 'finalizing'
                     continue
 
                 if result in _HALT_ADVANCE_RESULTS and self._request_abandoned(req):
@@ -10860,7 +10866,6 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                 verify_task=None,
                 merge_wt=None,
                 was_speculative=item.speculative,
-                phase='abandoned',
                 status=InflightStatus.ABANDONED_PREDISPATCH,
                 permit=item.permit,
             )
@@ -10888,7 +10893,6 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                 verify_task=None,
                 merge_wt=None,
                 was_speculative=item.speculative,
-                phase='halted',
                 status=InflightStatus.REQUEUED_PREDISPATCH,
                 permit=item.permit,
             )
@@ -10902,7 +10906,6 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                 verify_task=None,
                 merge_wt=None,
                 was_speculative=item.speculative,
-                phase='passthrough',
                 passthrough_outcome=item.immediate_outcome,
                 permit=item.permit,
             )
@@ -11048,7 +11051,6 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                         verify_task=None,
                         merge_wt=None,
                         was_speculative=item_was_speculative,
-                        phase='passthrough',
                         passthrough_outcome=item.immediate_outcome,
                         started_at=time.time(),
                         permit=item_permit,
@@ -11119,7 +11121,6 @@ class SpeculativeMergeWorker(_WipHaltMixin):
             verify_task=verify_task,
             merge_wt=item.merge_wt,
             was_speculative=item_was_speculative,
-            phase='verifying',
             started_at=time.time(),
             permit=item_permit,
         )
@@ -11181,7 +11182,6 @@ class SpeculativeMergeWorker(_WipHaltMixin):
             verify_task=verify_task,
             merge_wt=item.merge_wt,
             was_speculative=False,  # shim does not manage the speculation slot
-            phase='verifying',
             started_at=time.time(),
         )
 

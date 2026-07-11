@@ -191,7 +191,7 @@ class TestPhaseDerivesFromRegistry:
         rid = worker._register_item(item, initial=ItemLifecycleState.VERIFYING)
         entry = InflightEntry(
             item=item, lease=None, verify_task=MagicMock(), merge_wt=item.merge_wt,
-            was_speculative=False, phase='verifying',
+            was_speculative=False,
         )
         worker._inflight.append(entry)
 
@@ -200,7 +200,7 @@ class TestPhaseDerivesFromRegistry:
         assert snap['verify_in_progress']['phase'] == 'verifying'
         assert rid in worker.frozen_prefix()
 
-        # Advance the registry WITHOUT touching entry.phase at all.
+        # Advance the registry — InflightEntry has no phase field to touch.
         worker._note_transition(
             rid, ItemLifecycleState.VERIFYING, ItemLifecycleState.FINALIZING,
         )
@@ -210,9 +210,8 @@ class TestPhaseDerivesFromRegistry:
 
         snap2 = worker.snapshot()
         assert snap2['entries'][0]['state'] == 'gate_reverify', (
-            "RED: entries[0]['state'] should follow the registry (GATE_REVERIFY) "
-            "even though entry.phase is untouched ('verifying'); got "
-            f"{snap2['entries'][0]['state']!r}."
+            "entries[0]['state'] should follow the registry (GATE_REVERIFY); "
+            f"got {snap2['entries'][0]['state']!r}."
         )
         assert snap2['verify_in_progress']['phase'] == 'gate_reverify', (
             "RED: verify_in_progress['phase'] should follow the registry "
@@ -236,19 +235,17 @@ class TestPhaseDerivesFromRegistry:
             base_sha='deadbeef', speculative=False,
         )
         rid2 = worker._register_item(item2, initial=ItemLifecycleState.DISPATCHING)
+        # InflightEntry has no phase field at all — exclusion must be driven
+        # purely by the registry state (DISPATCHING is non-qualifying).
         entry2 = InflightEntry(
             item=item2, lease=None, verify_task=None, merge_wt=item2.merge_wt,
             was_speculative=False,
-            # Stale field deliberately DISAGREES with the registry (DISPATCHING)
-            # to prove the derivation source is the registry, not this field.
-            phase='verifying',
         )
         worker._finalizing_head = entry2
 
         assert rid2 not in worker.frozen_prefix(), (
-            "RED: a _finalizing_head registered at DISPATCHING in the registry "
-            "must be excluded from frozen_prefix even though its stale "
-            "entry.phase field says 'verifying' (a qualifying value)."
+            "a _finalizing_head registered at DISPATCHING in the registry "
+            "must be excluded from frozen_prefix."
         )
 
 

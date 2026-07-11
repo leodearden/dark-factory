@@ -1718,7 +1718,6 @@ class TestFinalizeInflightRunnerUnavailableEscalation:
             verify_task=verify_task,
             merge_wt=item.merge_wt,
             was_speculative=False,
-            phase='verifying',
         )
 
     async def test_quarantine_and_release_still_runs(self):

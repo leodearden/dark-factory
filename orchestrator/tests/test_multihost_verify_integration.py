@@ -1348,7 +1348,7 @@ class TestUnreachableHostCapstone:
             vt = asyncio.ensure_future(_ru_verify())
             return InflightEntry(
                 item=item, lease=lease, verify_task=vt, merge_wt=item.merge_wt,
-                was_speculative=False, phase='verifying',
+                was_speculative=False,
             )
 
         remerged = MagicMock(spec=SpeculativeItem)

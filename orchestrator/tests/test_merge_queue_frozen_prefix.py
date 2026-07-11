@@ -40,6 +40,7 @@ from orchestrator.git_ops import GitOps, MergeResult, _run
 from orchestrator.merge_queue import (
     DecidedItem,
     InflightEntry,
+    ItemLifecycleState,
     MergeOutcome,
     MergeRequest,
     RealMergeItem,
@@ -182,7 +183,6 @@ def _make_inflight_entry(
         verify_task=_SENTINEL_VERIFY_TASK if verifying else None,  # type: ignore[arg-type]
         merge_wt=None,
         was_speculative=False,
-        phase='verifying',
     )
 
 
@@ -855,7 +855,7 @@ class TestFinalizingHeadInFrozenPrefix:
         _, item_p = _make_fake_item('t-p', base_sha='main0', merge_commit='sha-Pc',
                                     config=config, git_repo=git_repo)
         entry_p = _make_inflight_entry(item_p, verifying=True)
-        entry_p.phase = 'passthrough'  # override to a non-qualifying phase
+        worker._register_item(item_p, initial=ItemLifecycleState.DISPATCHING)  # non-qualifying phase
 
         worker._finalizing_head = entry_p
 
@@ -879,7 +879,10 @@ class TestFinalizingHeadInFrozenPrefix:
         _, item_g = _make_fake_item('t-g', base_sha='main0', merge_commit='sha-Gc',
                                     config=config, git_repo=git_repo)
         entry_g = _make_inflight_entry(item_g, verifying=True)
-        entry_g.phase = 'gate_reverify'  # a qualifying phase distinct from 'verifying'
+        worker._register_item(item_g, initial=ItemLifecycleState.VERIFYING)
+        worker._note_transition(
+            item_g.request.request_id, ItemLifecycleState.VERIFYING, ItemLifecycleState.GATE_REVERIFY,
+        )  # a qualifying phase distinct from 'verifying'
 
         worker._finalizing_head = entry_g
 
@@ -949,7 +952,9 @@ class TestDispatchItemGuardWiring:
             'even when get_main_sha() raises inside the §5.3 guard (fail-open)'
         )
         assert isinstance(result, InflightEntry)
-        assert result.phase == 'verifying', f'expected phase=verifying, got {result.phase!r}'
+        assert worker._entry_phase(result) == 'verifying', (
+            f'expected phase=verifying, got {worker._entry_phase(result)!r}'
+        )
 
         # Clean up the background verify task to prevent event-loop warnings.
         if result.verify_task is not None:
@@ -1026,7 +1031,7 @@ class TestDispatchItemGuardWiring:
 
         # Dispatch must still succeed — the guard is purely observational.
         assert result is not None, 'dispatch must succeed even when guard warns'
-        assert result.phase == 'verifying'
+        assert worker._entry_phase(result) == 'verifying'
 
         # Clean up the background verify task.
         if result.verify_task is not None:

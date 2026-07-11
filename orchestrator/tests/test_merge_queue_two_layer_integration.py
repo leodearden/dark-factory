@@ -239,7 +239,6 @@ def _make_inflight_entry(
         verify_task=_SENTINEL_VERIFY_TASK if verifying else None,  # type: ignore[arg-type]
         merge_wt=None,
         was_speculative=False,
-        phase='verifying',
     )
 
 
