@@ -672,7 +672,15 @@ class TestGetStateSnapshotPopulated:
 
         event_store = _RecordingEventStore()
         scheduler = Scheduler(
-            config, override_store=store, event_store=event_store  # type: ignore[arg-type]
+            config,
+            override_store=store,
+            event_store=event_store,  # type: ignore[arg-type]
+            # task 2418: redirect the real-tick snapshot writes below to a
+            # writable tmp path instead of the forbidden /proj tree — see
+            # the _project_root assignment immediately below, which is still
+            # required as the OverrideStore lookup key for set_override
+            # ('/proj', ...) above.
+            state_snapshot_path=tmp_path / 'scheduler_state.json',
         )
         scheduler.finish_startup()
         scheduler._project_root = '/proj'
