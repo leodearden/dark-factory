@@ -222,3 +222,147 @@ class TestRenderSkewSurfaces:
         assert _render_skew_surfaces(
             MergeFailureDisposition.INTEGRATION_SKEW, None,
         ) == ('', None)
+
+
+# ---------------------------------------------------------------------------
+# Step-5/6 [boundary rows 2/3/4 at the classify-wrapper level]
+# ---------------------------------------------------------------------------
+
+
+def _init_git_repo(root: Path) -> None:
+    """Init a real git repo at *root* (mirrors test_merge_disposition.py's
+    fixture convention)."""
+    for cmd in [
+        ['git', 'init', '-q', '-b', 'main'],
+        ['git', 'config', 'user.email', 'test@test.com'],
+        ['git', 'config', 'user.name', 'Test'],
+    ]:
+        subprocess.run(cmd, cwd=root, check=True, capture_output=True)
+
+
+def _commit_file(root: Path, rel_path: str, content: str, message: str) -> str:
+    """Write+commit *rel_path* at *root*; return the new commit's full SHA."""
+    file_path = root / rel_path
+    file_path.parent.mkdir(parents=True, exist_ok=True)
+    file_path.write_text(content)
+    subprocess.run(['git', 'add', rel_path], cwd=root, check=True, capture_output=True)
+    subprocess.run(
+        ['git', 'commit', '-q', '-m', message], cwd=root, check=True, capture_output=True,
+    )
+    return subprocess.run(
+        ['git', 'rev-parse', 'HEAD'], cwd=root, capture_output=True, text=True, check=True,
+    ).stdout.strip()
+
+
+# A verify_result whose failing test maps to src/x.py (pytest id path segment +
+# cause-hint file token both resolve to src/x.py) — mirrors
+# test_merge_disposition.py's _XPY_FAILURE constant.
+_XPY_FAILURE = VerifyResult(
+    passed=False,
+    test_output='FAILED src/x.py::test_bar - AssertionError',
+    lint_output='',
+    type_output='',
+    summary='1 failed',
+    cause_hint='src/x.py::test_bar',
+    category='test_failure',
+)
+
+
+class TestClassifyDispositionForOutcome:
+    """_classify_disposition_for_outcome(verify, *, req, merge_base_sha,
+    main_sha, event_store) thinly wraps classify_merge_failure_disposition +
+    _render_skew_surfaces, with a belt-and-suspenders fail-open (I3) atop the
+    classifier's own fail-open."""
+
+    def test_row2_integration_skew(self, tmp_path: Path) -> None:
+        from orchestrator.merge_queue import _classify_disposition_for_outcome
+
+        repo = tmp_path / 'repo'
+        repo.mkdir()
+        _init_git_repo(repo)
+        merge_base_sha = _commit_file(repo, 'src/x.py', 'v1', 'init x (merge-base)')
+        landing_sha = _commit_file(repo, 'src/x.py', 'v2', 'edit x on main (landing)')
+
+        config = _make_config(repo)
+        req = _make_req('2381', repo, config)
+        store = EventStore(tmp_path / 'runs.db', run_id='run-test')
+        store.emit(
+            EventType.workflow_verify, task_id='2381',
+            data={'passed': True, 'base_sha': merge_base_sha, 'branch': 'task/2381'},
+        )
+
+        async def _run() -> tuple[MergeFailureDisposition, dict[str, str] | None, str]:
+            return await _classify_disposition_for_outcome(
+                _XPY_FAILURE, req=req, merge_base_sha=merge_base_sha,
+                main_sha=landing_sha, event_store=store,
+            )
+
+        disposition, diag, reason_suffix = asyncio.run(_run())
+        assert disposition == MergeFailureDisposition.INTEGRATION_SKEW
+        assert diag is not None
+        assert landing_sha in diag.get('implicated_commits', ''), diag
+        assert reason_suffix, 'reason_suffix must be non-empty for INTEGRATION_SKEW'
+        assert landing_sha in reason_suffix
+
+    def test_row3_branch_bug(self, tmp_path: Path) -> None:
+        from orchestrator.merge_queue import _classify_disposition_for_outcome
+
+        repo = tmp_path / 'repo'
+        repo.mkdir()
+        _init_git_repo(repo)
+        merge_base_sha = _commit_file(repo, 'src/x.py', 'v1', 'init x (merge-base)')
+        # main moves, but only touches an UNRELATED file -> no implicated landing.
+        main_sha = _commit_file(repo, 'src/y.py', 'v1', 'add unrelated y on main')
+
+        config = _make_config(repo)
+        req = _make_req('2381', repo, config)
+        store = EventStore(tmp_path / 'runs.db', run_id='run-test')
+        store.emit(
+            EventType.workflow_verify, task_id='2381',
+            data={'passed': True, 'base_sha': merge_base_sha, 'branch': 'task/2381'},
+        )
+
+        async def _run() -> tuple[MergeFailureDisposition, dict[str, str] | None, str]:
+            return await _classify_disposition_for_outcome(
+                _XPY_FAILURE, req=req, merge_base_sha=merge_base_sha,
+                main_sha=main_sha, event_store=store,
+            )
+
+        disposition, diag, reason_suffix = asyncio.run(_run())
+        assert disposition == MergeFailureDisposition.BRANCH_BUG
+        assert diag is None
+        assert reason_suffix == ''
+
+    def test_row4_classifier_fault_fails_open(
+        self, tmp_path: Path, caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        from orchestrator.merge_queue import _classify_disposition_for_outcome
+
+        repo = tmp_path / 'repo'
+        repo.mkdir()
+        _init_git_repo(repo)
+        merge_base_sha = _commit_file(repo, 'src/x.py', 'v1', 'init x (merge-base)')
+        landing_sha = _commit_file(repo, 'src/x.py', 'v2', 'edit x on main (landing)')
+
+        config = _make_config(repo)
+        req = _make_req('2381', repo, config)
+
+        async def _run() -> tuple[MergeFailureDisposition, dict[str, str] | None, str]:
+            with (
+                patch(
+                    'orchestrator.merge_queue.classify_merge_failure_disposition',
+                    new=AsyncMock(side_effect=RuntimeError('injected fault')),
+                ),
+                caplog.at_level(logging.WARNING, logger='orchestrator.merge_queue'),
+            ):
+                return await _classify_disposition_for_outcome(
+                    _XPY_FAILURE, req=req, merge_base_sha=merge_base_sha,
+                    main_sha=landing_sha, event_store=None,
+                )
+
+        disposition, diag, reason_suffix = asyncio.run(_run())
+        assert disposition == MergeFailureDisposition.INDETERMINATE
+        assert diag is None
+        assert reason_suffix == ''
+        warning_texts = [r.message for r in caplog.records if r.levelno >= logging.WARNING]
+        assert warning_texts, 'Expected a WARNING to be logged on classifier fault'
