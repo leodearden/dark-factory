@@ -414,6 +414,53 @@ class TestAssertSingleWriterInflightWiring:
         worker._inflight_clear()  # must not raise
 
 
+# ── Regression: _sentinel_entry() choke-point contract (task 2445) ─────────
+
+
+@pytest.mark.asyncio
+class TestSentinelEntryChokePointContract:
+    """Regression guard for ``_sentinel_entry()``'s shape (task 2445).
+
+    MQ-reliability kappa (task 2169, commit 56132176382) made
+    ``_inflight_append`` call
+    ``_note_transition(entry.item.request.request_id, ...)`` unconditionally
+    — ahead of where ``_assert_single_writer``'s no-op could short-circuit.
+    A bare ``object()`` sentinel has no ``.item``, so every no-op test in
+    ``TestAssertSingleWriterInflightWiring`` above that appends a sentinel
+    raised ``AttributeError: 'object' object has no attribute 'item'`` at
+    that dereference (merge_queue.py:8992). This pins the fix so it cannot
+    regress silently.
+    """
+
+    async def test_sentinel_entry_survives_inflight_append_chokepoint(
+        self, git_ops: GitOps,
+    ) -> None:
+        """``_inflight_append`` must not raise on a bare ``_sentinel_entry()``.
+
+        Regression guard for ``AttributeError: 'object' object has no
+        attribute 'item'`` previously raised at ``_note_transition``'s
+        ``entry.item.request.request_id`` dereference (merge_queue.py:8992).
+        ``_make_worker`` builds a worker whose ``_verifier_task`` defaults to
+        None — so ``_assert_single_writer`` is a no-op regardless of
+        ``_DEBUG_ASSERTS`` — and whose ``_escalation_queue`` defaults to
+        None, pinned below as the precondition that makes the sentinel's
+        intentionally-unregistered request_id raise-and-swallow an
+        ``IllegalLifecycleTransition`` inside ``_note_transition`` (a
+        harmless WARNING log) rather than escalate anything: the None-guard
+        on ``_alarm_illegal_lifecycle_transition`` returns immediately. Do
+        NOT wire a non-None spy escalation queue here — with an unregistered
+        request_id that would spuriously fail, since the alarm would then
+        actually submit.
+        """
+        worker = _make_worker(git_ops)
+        assert worker._escalation_queue is None
+
+        entry = _sentinel_entry()
+        worker._inflight_append(entry)  # must not raise
+
+        assert worker._inflight[-1] is entry
+
+
 # ── step-07 RED: suite-wide enablement + end-to-end no-false-positive ───────
 # conformance ────────────────────────────────────────────────────────────────
 
