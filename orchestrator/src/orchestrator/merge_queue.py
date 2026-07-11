@@ -11145,6 +11145,19 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                 f'worktree={merge_wt.name})'
             )
 
+            # Merge-skew attribution (task 2383 β, 2357): dispatch-time base
+            # facts for the classifier.  main_sha is item.base_sha — the
+            # FROZEN main SHA captured at merge-dispatch time — never a
+            # fresh git_ops.get_main_sha() re-read.  merge_base_sha is the
+            # best-effort git merge-base of that SHA and the item's frozen
+            # merged_branch_tip; None (branch tip unavailable, or the git
+            # call fails) skips classification inside _run_post_merge_verify
+            # and degrades to INDETERMINATE (I3, fail-open).
+            main_sha = item.base_sha
+            merge_base_sha = await _resolve_dispatch_time_merge_base(
+                req.config.project_root, main_sha, item.merged_branch_tip,
+            )
+
             verify_task = asyncio.ensure_future(_run_post_merge_verify(
                 self._git_ops, req, merge_wt,
                 timeouts=self._post_merge_verify_timeouts,
@@ -11165,6 +11178,8 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                 ),
                 depth=depth,
                 speculative=item.speculative,
+                merge_base_sha=merge_base_sha,
+                main_sha=main_sha,
             ))
             # task 2420 (DEFECT 1, split from 2357; extends #1728): no-progress
             # budget seed.  Content-mtime is LOCAL-only — a REMOTE lease's
