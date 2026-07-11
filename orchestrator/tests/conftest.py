@@ -240,6 +240,21 @@ def _hermetic_psi_reader(monkeypatch):
     host/global dependency (project_root / PSI) so the suite is hermetic
     under parallel execution.  Guard test:
     ``test_scheduler_hermetic_psi.py::TestAutouseFixtureDefaultsToIdlePsi``.
+
+    Blast radius: this fixture is autouse at the top-level orchestrator
+    conftest, so it applies suite-wide, not just to scheduler tests. Verified
+    (task 2418 amendment pass) by running the full orchestrator suite
+    (``pytest -n auto --dist loadgroup``, 8171 tests) with this fixture
+    active: no test outside the PSI/scheduler files asserts identity against
+    the real ``shared.psi.read_psi_sample``, and no ``Scheduler`` is
+    constructed anywhere outside ``orchestrator/tests/``. The suite was
+    otherwise green (the sole failure was the pre-existing, unrelated,
+    independently-flaky aiosqlite thread-teardown race in
+    ``test_aiosqlite_leak_isolation.py`` — task 2413's domain, reproduces
+    solo with this fixture unloaded). If a future test needs the real
+    reader bound at construction, it can reassign
+    ``scheduler._read_psi_sample`` post-construction (as the saturation
+    tests already do) rather than removing this fixture.
     """
     monkeypatch.setattr('orchestrator.scheduler.read_psi_sample', idle_psi_sample)
 
