@@ -1,11 +1,13 @@
 # Cockpit orchestrator configuration
 # Scopes verification to cockpit's own venv and the full tests/ tree (not just
-# the files a task happens to touch) — tests/smoke/ is default-deselected via
-# cockpit/pyproject.toml's `addopts = "-m 'not smoke'"` (this worktree is the
-# live DISPLAY=:0 host, so routine unscoped runs must never spawn real X11
-# windows/tmux sessions). Pinning the full tests/ tree keeps the selected set
-# non-empty regardless of which files a task touches, avoiding a pytest
-# rc=5 ("no tests ran") misclassification — see task 2446 / precedent 1852.
+# the files a task happens to touch) — tests marked @pytest.mark.smoke are
+# default-deselected via cockpit/pyproject.toml's `addopts = "-m 'not smoke'"`
+# (a marker-based rule that deselects regardless of location, not a
+# tests/smoke/ path convention; this worktree is the live DISPLAY=:0 host, so
+# routine unscoped runs must never spawn real X11 windows/tmux sessions).
+# Pinning the full tests/ tree keeps the selected set non-empty regardless of
+# which files a task touches, avoiding a pytest rc=5 ("no tests ran")
+# misclassification — see task 2446 / precedent 1852.
 
 # Verification commands
 test_command: "uv run --project cockpit --directory cockpit pytest tests/ --tb=short -q"
