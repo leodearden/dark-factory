@@ -1129,9 +1129,9 @@ class ReconReportState:
         stay citable, and the object only becomes unreachable once the run's
         indices are popped at quiescence.
 
-        The three shared run-level dedup indices (``_run_sig_index`` /
-        ``_run_desc_index`` / ``_run_finding_index``) are RUN-QUIESCENCE
-        scoped, not per-entry (task-2088). They are keyed for the WHOLE run
+        The four shared run-level dedup indices (``_run_sig_index`` /
+        ``_run_desc_index`` / ``_run_finding_index`` / ``_run_cited_task_index``)
+        are RUN-QUIESCENCE scoped, not per-entry (task-2088). They are keyed for the WHOLE run
         across all of its stages, and reconciliation runs are multi-stage and
         long-lived: Stage 1 (memory_consolidator) typically files a finding
         and completes early, while Stage 2/3 + remediation keep the run live
@@ -1144,10 +1144,10 @@ class ReconReportState:
         collapsing _run_finding_index out from under it.
 
         So: while at least one ``(run_id, *)`` entry remains in ``_state``
-        (in-progress, or completed but not yet past its own TTL), all three
+        (in-progress, or completed but not yet past its own TTL), all four
         indices for that run_id are preserved untouched, even for stages that
         have already been evicted. Only when a run's LAST entry evicts do we
-        release its three indices, wholesale via ``pop(rid, None)`` rather
+        release its four indices, wholesale via ``pop(rid, None)`` rather
         than by walking the evicted entry's own signature/desc-hash/finding
         maps — this correctly reclaims contributions from every stage of the
         run in one shot and is robust to several same-run entries evicting
@@ -1168,7 +1168,7 @@ class ReconReportState:
         entry to individually hit completed_at + TTL. An in-progress entry
         never expires on its own — it is immortal by design (PRD §9.4; see
         test_inprogress_not_evicted_by_ttl) — so a stalled or crashed stage
-        that never calls complete() pins that run_id's three indices, and
+        that never calls complete() pins that run_id's four indices, and
         every already-evicted sibling entry object kept reachable through
         ``_run_finding_index``, for as long as the process keeps running.
         There is currently no separate max-lifetime sweep for in-progress
@@ -1196,7 +1196,7 @@ class ReconReportState:
             # Compute the set of run_ids with a surviving _state entry ONCE,
             # after all of this sweep's deletions, instead of rescanning
             # _state per evicted entry. A run_id that evicted this tick and
-            # has no surviving entry is fully quiescent — release its three
+            # has no surviving entry is fully quiescent — release its four
             # shared indices wholesale.
             live_run_ids = {r for (r, _s) in self._state}
             for rid in evicted_run_ids:
@@ -1204,6 +1204,7 @@ class ReconReportState:
                     self._run_sig_index.pop(rid, None)
                     self._run_finding_index.pop(rid, None)
                     self._run_desc_index.pop(rid, None)
+                    self._run_cited_task_index.pop(rid, None)
         if to_evict:
             logger.debug('recon_report reaper evicted %d entries', len(to_evict))
         return len(to_evict)
