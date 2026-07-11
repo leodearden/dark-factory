@@ -410,3 +410,98 @@ class TestDispatchRefreshesLastKnownMainSha:
         assert worker._last_known_main_sha == old_main, (
             'a get_main_sha() error at the guard must leave the cache unchanged (fail-open)'
         )
+
+
+# ── DEFECT 2 (task 2357) regression lock: no-over-correction ─────────────────
+
+
+@pytest.mark.asyncio
+class TestNoOverCorrectionRegressionLock:
+    """The DEFECT 2 refresh (dequeue + land, steps 2/4) must not blind the
+    underlying §5.3 invariant: genuine drift is still caught, and a healthy
+    stack with a fresh cache is genuinely clean.
+
+    Expected GREEN immediately (the refresh only corrects the cached SHA
+    fed into an unchanged invariant surface); RED would indicate a refresh
+    step wrongly mutated the invariant logic itself — the over-correction
+    guard.
+    """
+
+    async def test_genuine_drift_still_caught(
+        self, git_ops: GitOps, config: OrchestratorConfig, git_repo: Path,
+    ) -> None:
+        """A frozen head whose base_sha is NOT a FRESH main_sha still trips
+        both _verify_base_frozen_tip_violations() and two_layer_invariants()
+        — proving the refresh corrects the cached SHA rather than blinding
+        the check itself.
+        """
+        worker = _make_worker(git_ops)
+        fresh_main = 'FRESH-MAIN-001'
+
+        _, item = _make_fake_item(
+            't-drift', base_sha='STALE-DRIFT-BASE', merge_commit='c-drift',
+            config=config, git_repo=git_repo,
+        )
+        worker._inflight.append(_make_inflight_entry(item, verifying=True))
+        rid = item.request.request_id
+
+        direct_violations = worker._verify_base_frozen_tip_violations(fresh_main)
+        assert direct_violations, (
+            f'expected genuine drift (base_sha != fresh main_sha) to still be '
+            f'flagged by _verify_base_frozen_tip_violations(), got: {direct_violations}'
+        )
+        assert all(rid in v for v in direct_violations), (
+            f'expected every violation to name {rid!r}, got: {direct_violations}'
+        )
+
+        violations = worker.two_layer_invariants(fresh_main)
+        assert all(v in violations for v in direct_violations), (
+            f'expected two_layer_invariants() to still compose the genuine-drift '
+            f'violation(s) against a FRESH main_sha, got: {violations}'
+        )
+
+    async def test_healthy_chained_stack_with_fresh_cache_is_clean(
+        self, git_ops: GitOps, config: OrchestratorConfig, git_repo: Path,
+    ) -> None:
+        """A healthy multi-entry chained frozen stack (head base==real main;
+        each successor base==predecessor merge_commit) with
+        _last_known_main_sha set to the real current tip yields
+        two_layer_invariants() == [] — the false positive is genuinely gone,
+        not just papered over.
+        """
+        worker = _make_worker(git_ops)
+        real_main = await git_ops.get_main_sha()
+
+        _, item_0 = _make_fake_item(
+            't-chain-0', base_sha=real_main, merge_commit='c-chain-1',
+            config=config, git_repo=git_repo,
+        )
+        _, item_1 = _make_fake_item(
+            't-chain-1', base_sha='c-chain-1', merge_commit='c-chain-2',
+            config=config, git_repo=git_repo,
+        )
+        _, item_2 = _make_fake_item(
+            't-chain-2', base_sha='c-chain-2', merge_commit='c-chain-3',
+            config=config, git_repo=git_repo,
+        )
+        worker._inflight.append(_make_inflight_entry(item_0, verifying=True))
+        worker._inflight.append(_make_inflight_entry(item_1, verifying=True))
+        worker._inflight.append(_make_inflight_entry(item_2, verifying=True))
+
+        # The dequeue/land refresh (steps 2/4) is what keeps this field equal
+        # to the real tip in production; set it directly here to isolate the
+        # invariant-surface assertion from the refresh call sites themselves
+        # (those are covered by TestDispatchRefreshesLastKnownMainSha and
+        # test_merge_queue_two_layer_integration.py's land tests).
+        worker._last_known_main_sha = real_main
+
+        assert worker.two_layer_invariants(real_main) == [], (
+            'expected a healthy chained frozen stack to have no violations '
+            'against the real main tip'
+        )
+
+        snap_violations = worker.snapshot()['two_layer_invariants']
+        assert snap_violations == [], (
+            f'expected snapshot() to be clean once _last_known_main_sha is the '
+            f'real tip for a healthy chained stack, got: {snap_violations!r}'
+        )
