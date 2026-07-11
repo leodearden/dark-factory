@@ -29,6 +29,7 @@ from fused_memory.models.reconciliation import (
     RunStatus,
     RunType,
     StageId,
+    StageReport,
 )
 from fused_memory.models.scope import (
     ProjectId,
@@ -43,7 +44,10 @@ from fused_memory.reconciliation.judge import Judge
 from fused_memory.reconciliation.mem0_dedup import find_prior_memory
 from fused_memory.reconciliation.policies import is_snapshot_write_blocked
 from fused_memory.reconciliation.queue_health import summarize_graphiti_queue_health
-from fused_memory.reconciliation.stages.memory_consolidator import MemoryConsolidator
+from fused_memory.reconciliation.stages.memory_consolidator import (
+    MemoryConsolidator,
+    write_stage1_cycle_summary,
+)
 from fused_memory.reconciliation.stages.task_knowledge_sync import (
     IntegrityCheck,
     TaskKnowledgeSync,
@@ -2009,7 +2013,67 @@ class ReconciliationHarness:
             )
             raise
         finally:
+            await self._ensure_stage1_cycle_summary(
+                run, run_id, project_id, current_stage_name, cycle_start_time,
+            )
             await self.journal.update_run_stage_reports(run_id, run.stage_reports)
+
+    async def _ensure_stage1_cycle_summary(
+        self,
+        run: ReconciliationRun,
+        run_id: str,
+        project_id: str,
+        current_stage_name: str | None,
+        cycle_start_time: datetime,
+    ) -> None:
+        """Guarantee a Stage 1 ``cycle_summary`` ledger row exists for *run_id* (task 2440).
+
+        Structural backstop for the in-stage deterministic write
+        (``write_stage1_cycle_summary``, called from
+        :meth:`~fused_memory.reconciliation.stages.memory_consolidator.MemoryConsolidator.run`,
+        task 2229 W5-λ): that write is the last statement of Stage 1's
+        ``run()``, so it is skipped whenever the Stage 1 turn raises before
+        completing — a CLI timeout surfaced as ``asyncio.CancelledError``,
+        ``AllAccountsCappedException``, or any unwrapped post-processing
+        exception. Called from :meth:`run_full_cycle`'s ``finally`` block, so
+        this runs on every exit path regardless of whether Stage 1 completed.
+
+        The gate ``current_stage_name == StageId.memory_consolidator.value``
+        is provably equivalent to "Stage 1 raised before writing its own
+        summary": ``current_stage_name`` is set to Stage 1's id at the start
+        of its loop iteration and only advances to Stage 2's id when Stage 2
+        starts, and ``run()`` cannot raise AFTER its in-stage write (that
+        write is the last statement, and ``write_stage1_cycle_summary`` never
+        raises). The ``'memory_consolidator' not in run.stage_reports``
+        clause is defense-in-depth against a future stage-order refactor.
+        Both the happy path (ends at ``integrity_check``) and a Stage-2/3
+        failure (Stage 1's report already recorded) no-op here — so this
+        never depends on the ``stage1_cycle_summary_ledger_written`` stat.
+
+        On the raise path there is no captured ``StageReport`` — llm_calls/
+        tokens live inside ``BaseStage.run()`` and are lost with the
+        exception — so a degraded report is synthesized from harness-side
+        timing data alone. This leaves a truthful (not fabricated-metrics)
+        breadcrumb: the ``stage1_cycle_summary_degraded_backstop`` stat
+        self-identifies the row as harness-synthesized rather than a genuine
+        in-stage write.
+        """
+        if not (
+            current_stage_name == StageId.memory_consolidator.value
+            and 'memory_consolidator' not in run.stage_reports
+        ):
+            return
+
+        degraded_report = StageReport(
+            stage=StageId.memory_consolidator,
+            started_at=cycle_start_time,
+            completed_at=datetime.now(UTC),
+            items_flagged=[],
+            stats={'stage1_cycle_summary_degraded_backstop': True},
+            llm_calls=0,
+            tokens_used=0,
+        )
+        await write_stage1_cycle_summary(self.memory, project_id, degraded_report, run_id)
 
     # ── Remediation support ───────────────────────────────────────────
 
