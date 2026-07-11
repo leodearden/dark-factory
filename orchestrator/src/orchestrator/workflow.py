@@ -4200,6 +4200,7 @@ class TaskWorkflow:
                         detail=info.get('detail', ''),
                         category='infra_issue',
                         escalate_to_human=True,
+                        block_status='infra-hold',
                     )
                 if self._inherited_break_info is not None:
                     info = self._inherited_break_info
@@ -4996,8 +4997,10 @@ class TaskWorkflow:
         None
             When the retry window is exhausted.  The caller
             (:meth:`_verify_debugfix_loop`) interprets ``None`` as the cue to
-            stamp ``metadata.infra_hold`` (via :attr:`_infra_hold_info`) and
-            return ``WorkflowOutcome.BLOCKED``.
+            propagate :attr:`_infra_hold_info` up to ``run()``, which stamps
+            the task's first-class ``infra-hold`` status (via
+            ``_mark_blocked(block_status='infra-hold')``, task 2200/ω4) and
+            returns ``WorkflowOutcome.BLOCKED``.
 
         Modelled on the ``WarmLaneDiskPressure`` retry pattern
         (git_ops.py / workflow.py:1857-1889) but keeps the task in-progress
@@ -5034,7 +5037,7 @@ class TaskWorkflow:
                 )
                 await asyncio.sleep(delay)
 
-        # Window exhausted — stamp infra_hold and signal caller to BLOCK
+        # Window exhausted — stash infra-hold info and signal caller to BLOCK.
         # last_infra_exc is guaranteed non-None: the loop only reaches here
         # after catching at least one VerifyInfraError (max_attempts >= 1).
         assert last_infra_exc is not None
@@ -5053,22 +5056,13 @@ class TaskWorkflow:
             'phase': last_infra_exc.phase,
             'errno': last_infra_exc.errno,
         }
-        # Stamp metadata.infra_hold so harness recovery / escalation resolution
-        # can distinguish a verify-complete hold from a stranded in-progress task.
-        infra_hold_meta = {
-            'phase': last_infra_exc.phase,
-            'errno': last_infra_exc.errno,
-            'reason': reason,
-        }
-        try:
-            fresh = await self.scheduler.get_task(self.task_id)
-            current_meta = (fresh or {}).get('metadata') or {}
-        except Exception:
-            current_meta = {}
-        await self.scheduler.update_task(
-            self.task_id,
-            metadata={**current_meta, 'infra_hold': infra_hold_meta},
-        )
+        # No metadata write here (task 2200/ω4): the retired metadata.infra_hold
+        # boolean is gone.  _infra_hold_info propagates to run() via the
+        # WorkflowOutcome.BLOCKED return below, which stamps the task's
+        # first-class 'infra-hold' status through
+        # _mark_blocked(block_status='infra-hold') — see
+        # orchestrator.task_status.is_infra_held, the single source of truth
+        # the harness HOLD guard and RESUME cascade key on (PRD C7/D3).
         return None
 
     async def _verify_debugfix_loop(self) -> WorkflowOutcome:
@@ -8093,6 +8087,7 @@ Update the plan to address the blocking issues. You may add new steps to the `st
 
     async def _mark_blocked(
         self, reason: str, *, detail: str = '',
+        block_status: str = 'blocked',
         skip_escalation: bool = False,
         merge_phase: bool = False,
         escalate_to_human: bool = False,
@@ -8107,6 +8102,14 @@ Update the plan to address the blocking issues. You may add new steps to the `st
         *reason* is used as the escalation summary (truncated to 200 chars).
         *detail* is the full diagnostic context persisted in the escalation
         file; defaults to *reason* when not provided.
+        *block_status* (task 2200 / ω4) is the task-row status written when
+        *merge_phase* is False — defaults to the generic ``'blocked'``.  Pass
+        ``'infra-hold'`` to land the row on the first-class infra-hold status
+        (PRD C7/D3) instead, e.g. for the verify-infra STAMP so the harness
+        HOLD guard and RESUME cascade (both keyed on
+        :func:`orchestrator.task_status.is_infra_held`) see it.  The internal
+        ``WorkflowState.BLOCKED`` transition and escalation filing below are
+        unaffected by this choice.
         *skip_escalation* suppresses escalation creation when a level-1
         escalation already exists (e.g. steward re-escalated to human).
         *merge_phase* suppresses task-status transitions (blocked/pending)
@@ -8147,7 +8150,7 @@ Update the plan to address the blocking issues. You may add new steps to the `st
             self._enter_phase(WorkflowState.BLOCKED)
             _status_set_ok = False
             try:
-                await self.scheduler.set_task_status(self.task_id, 'blocked')
+                await self.scheduler.set_task_status(self.task_id, block_status)
                 _status_set_ok = True
             except TerminalExitRejection as exc:
                 bypass_outcome = await self._handle_terminal_exit_on_block(
