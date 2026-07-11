@@ -4072,6 +4072,52 @@ async def test_update_task_unknown_key_patch_tolerates_untouched_invalid_done_pr
         await backend.close()
 
 
+@pytest.mark.asyncio
+async def test_update_task_unknown_key_patch_still_rejects_invalid_known_field(
+    tmp_path, project_root,
+):
+    """An unknown key in the SAME patch must not mask a genuinely-fatal
+    warning on a different incoming KNOWN field (task 2405 regression guard).
+
+    Task 2405's fix narrows ``should_reraise`` to ignore ``unknown_key``
+    warnings on incoming keys — but ``unknown_key`` must be the ONLY code
+    suppressed. This test pins that down: the patch carries an out-of-enum
+    ``task_kind`` (a KNOWN ``TaskMetadata`` field, producing an
+    ``invalid_field`` warning — a genuinely fatal code) alongside an
+    unrelated unknown key (``duplicate_check_required``, producing a
+    non-fatal ``unknown_key`` warning). If a future change widened
+    ``_NON_FATAL_WRITE_WARNING_CODES`` too far, or the ``and w.code not in
+    ...`` conjunct in ``_validate_metadata_on_write`` regressed to an ``or``,
+    this would silently disable per-field enforcement — this test fails
+    first.
+    """
+    cfg = TaskmasterConfig(project_root=str(tmp_path))
+    backend = SqliteTaskBackend(cfg, task_metadata_enforce=True)
+    await backend.start()
+    try:
+        dto = await backend.add_task(
+            project_root=project_root, title='t',
+            metadata=json.dumps({'foo': 'bar'}),
+        )
+
+        with pytest.raises(ValidationError):
+            await backend.update_task(
+                dto['id'], project_root=project_root,
+                metadata=json.dumps({
+                    'task_kind': 'bogus_kind',
+                    'duplicate_check_required': True,
+                }),
+                metadata_mode='merge',
+            )
+
+        task = await backend.get_task(dto['id'], project_root=project_root)
+        assert task['metadata'] == {'foo': 'bar'}, (
+            f'Expected the rejected txn to leave metadata unchanged; got: {task["metadata"]}'
+        )
+    finally:
+        await backend.close()
+
+
 # ── read-path tolerance + collapse (task 2162, step-9/10) ─────────────
 
 
