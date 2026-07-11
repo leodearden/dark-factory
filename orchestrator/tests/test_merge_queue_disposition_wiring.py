@@ -546,3 +546,138 @@ class TestRunPostMergeVerifyDispositionWiring:
         assert outcome.failure_diagnostic is None
         assert outcome.reason.startswith('Post-merge verification failed'), outcome.reason
         assert 'port landed commit' not in outcome.reason
+
+
+# ---------------------------------------------------------------------------
+# Step-9/10 [2357 dispatch-time base facts on the production path]
+# ---------------------------------------------------------------------------
+
+
+class TestRunInflightVerifyBaseFactsWiring:
+    """_run_inflight_verify computes dispatch-time base facts — main_sha from
+    item.base_sha (the frozen value captured at merge-dispatch time, NEVER a
+    fresh get_main_sha() re-read) and merge_base_sha via git merge-base of
+    that base and the item's frozen merged_branch_tip — and threads both
+    into _run_post_merge_verify (task 2383 β, 2357)."""
+
+    def test_base_facts_forwarded_from_item_not_fresh_main_read(
+        self, tmp_path: Path,
+    ) -> None:
+        from orchestrator.git_ops import MergeResult
+        from orchestrator.merge_queue import RealMergeItem, SpeculativeMergeWorker
+        from orchestrator.verify_runner import HostLease
+
+        repo = tmp_path / 'repo'
+        repo.mkdir()
+        _init_git_repo(repo)
+        merge_base_sha = _commit_file(repo, 'src/x.py', 'v1', 'init x (merge-base)')
+        subprocess.run(
+            ['git', 'checkout', '-q', '-b', 'task/2381'], cwd=repo, check=True,
+        )
+        branch_tip = _commit_file(repo, 'src/branch_only.py', 'v1', 'task work')
+        subprocess.run(['git', 'checkout', '-q', 'main'], cwd=repo, check=True)
+        # item.base_sha: the FROZEN dispatch-time main SHA — deliberately
+        # DIFFERENT from whatever a fresh get_main_sha() call would return
+        # (git_ops.get_main_sha is stubbed to a distinguishing sentinel below
+        # so any accidental fresh re-read would leak into the assertion).
+        main_sha = _commit_file(repo, 'src/x.py', 'v2', 'edit x on main (landing)')
+
+        config = _make_config(repo)
+        merge_wt = tmp_path / 'merge-wt'
+        merge_wt.mkdir()
+        req = _make_req('2381', repo, config)
+
+        git_ops = MagicMock()
+        git_ops.get_main_sha = AsyncMock(return_value='should-not-be-used-sha')
+
+        item = RealMergeItem(
+            request=req,
+            merge_result=MergeResult(
+                success=True, merge_commit='deadbeef', merge_worktree=merge_wt,
+            ),
+            merge_wt=merge_wt,
+            base_sha=main_sha,
+            speculative=False,
+            merged_branch_tip=branch_tip,
+        )
+        lease = HostLease(name='laptop', runner=MagicMock(), is_local=False)
+
+        captured: dict = {}
+
+        async def _fake_run_post_merge_verify(*_args, **kwargs):
+            captured.update(kwargs)
+            return MergeOutcome(
+                'blocked', reason='Post-merge verification failed: boom',
+                disposition=MergeFailureDisposition.INTEGRATION_SKEW,
+            )
+
+        async def _run():
+            worker = SpeculativeMergeWorker(git_ops=git_ops, queue=asyncio.Queue())
+            with patch(
+                'orchestrator.merge_queue._run_post_merge_verify',
+                _fake_run_post_merge_verify,
+            ):
+                return await worker._run_inflight_verify(item, lease)
+
+        result = asyncio.run(_run())
+
+        git_ops.get_main_sha.assert_not_called()
+        assert captured.get('main_sha') == main_sha, captured
+        assert captured.get('merge_base_sha') == merge_base_sha, captured
+        assert result.outcome is not None
+        assert result.outcome.disposition == MergeFailureDisposition.INTEGRATION_SKEW
+
+    def test_missing_branch_tip_degrades_merge_base_to_none(
+        self, tmp_path: Path,
+    ) -> None:
+        """merged_branch_tip=None (best-effort unavailable) -> merge_base_sha
+        is passed as None rather than raising; classification degrades to
+        INDETERMINATE inside _run_post_merge_verify (I3, fail-open)."""
+        from orchestrator.git_ops import MergeResult
+        from orchestrator.merge_queue import RealMergeItem, SpeculativeMergeWorker
+        from orchestrator.verify_runner import HostLease
+
+        repo = tmp_path / 'repo'
+        repo.mkdir()
+        _init_git_repo(repo)
+        main_sha = _commit_file(repo, 'src/x.py', 'v1', 'init x')
+
+        config = _make_config(repo)
+        merge_wt = tmp_path / 'merge-wt'
+        merge_wt.mkdir()
+        req = _make_req('2381', repo, config)
+        git_ops = MagicMock()
+        git_ops.get_main_sha = AsyncMock(return_value='should-not-be-used-sha')
+
+        item = RealMergeItem(
+            request=req,
+            merge_result=MergeResult(
+                success=True, merge_commit='deadbeef', merge_worktree=merge_wt,
+            ),
+            merge_wt=merge_wt,
+            base_sha=main_sha,
+            speculative=False,
+            merged_branch_tip=None,
+        )
+        lease = HostLease(name='laptop', runner=MagicMock(), is_local=False)
+
+        captured: dict = {}
+
+        async def _fake_run_post_merge_verify(*_args, **kwargs):
+            captured.update(kwargs)
+            return MergeOutcome(
+                'blocked', reason='Post-merge verification failed: boom',
+            )
+
+        async def _run():
+            worker = SpeculativeMergeWorker(git_ops=git_ops, queue=asyncio.Queue())
+            with patch(
+                'orchestrator.merge_queue._run_post_merge_verify',
+                _fake_run_post_merge_verify,
+            ):
+                return await worker._run_inflight_verify(item, lease)
+
+        asyncio.run(_run())
+
+        assert captured.get('main_sha') == main_sha, captured
+        assert captured.get('merge_base_sha') is None, captured
