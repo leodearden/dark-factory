@@ -2182,42 +2182,69 @@ class TestRecreateSubgraphRelationships:
         assert result.dropped_cross_target == []
 
     @pytest.mark.asyncio
-    async def test_exception_partway_through_batch_carries_partial_progress_tally(
+    async def test_move_edge_create_failure_is_isolated_not_batch_aborting(
         self, mock_config, make_backend, make_graph_mock, monkeypatch,
     ):
-        """A batch that fails partway through (e.g. a transient FalkorDB
-        error raised by the MENTIONS create, AFTER the co-moving RELATES_TO
-        edge already landed in target) must not discard the real, non-zero
-        progress made before the raise. recreate_subgraph_relationships
-        mutates target graphs incrementally as it walks the batch, so the
-        exception it lets escape carries the tally accumulated so far as
-        exc.partial_result (a SubgraphEdgeResult) -- letting a caller (e.g.
-        run()'s Phase B error handling) report accurate partial-mutation
-        counts instead of an all-zero default (task 2415 amendment round 2).
+        """A single bad edge's CREATE (e.g. a transient FalkorDB error) in
+        the MOVE-edge pass must cost only that ONE edge, not the whole
+        batch: recreate_subgraph_relationships must RETURN (not raise),
+        still recreate every OTHER, independent edge normally, and record
+        the failing edge on result.blocked (kind='edge', its own uuid, a
+        reason naming the error, and its incident node uuid(s) -- so a
+        caller can withhold Phase C source-deletion for those nodes, per
+        this module's create-before-delete invariant). This generalizes the
+        live f0fc1aba-style failure from a null-embedding read (now
+        tolerated, see TestEmbeddingSetClause / the null-fact_embedding
+        tests above) to ANY per-edge CREATE failure -- the old whole-batch
+        abort (task 2415) is now reserved for systemic/gather failures only
+        (see test_gather_read_failure_still_propagates_with_partial_result
+        below).
         """
         backend = make_backend(mock_config)
+
+        # A second, fully INDEPENDENT MOVE spec/edge -- not a co-moving
+        # shared edge -- so the first edge's failure is unrelated to the
+        # second edge's success.
+        second_uuid = 'node-cccc-6666'
+        second_edge_uuid = 'edge-ffff-8888'
+        second_edge_other_uuid = 'node-dddd-7777'
+        second_edge_row = [
+            second_edge_uuid, 'is_related_to', 'Carol is related to Dave.',
+            '2026-01-01T00:00:00+00:00', None, '2026-01-01T00:00:00+00:00',
+            SOURCE_GRAPH_FIXTURE, ['episode-uuid-2'],
+            second_uuid, second_edge_other_uuid,
+        ]
 
         source_mock = make_graph_mock()
 
         async def _source_ro_query(cypher, params=None):
             params = params or {}
             if 'RELATES_TO' in cypher:
-                return MagicMock(result_set=[EDGE_ROW_FIXTURE])
-            if 'MENTIONS' in cypher:
                 if params.get('uuid') == NODE_UUID_FIXTURE:
-                    return MagicMock(result_set=[MENTION_ROW_FIXTURE])
-                return MagicMock(result_set=[])
-            return MagicMock(result_set=[])
+                    return MagicMock(result_set=[EDGE_ROW_FIXTURE])
+                if params.get('uuid') == second_uuid:
+                    return MagicMock(result_set=[second_edge_row])
+            return MagicMock(result_set=[])  # no MENTIONS in this scenario
 
         source_mock.ro_query = AsyncMock(side_effect=_source_ro_query)
 
         target_mock = make_graph_mock()
-        # Presence probes report "not yet present" -- a first-time apply --
-        # for both the edge and the mention, so both CREATEs are attempted.
-        target_mock.ro_query = AsyncMock(return_value=MagicMock(result_set=[]))
+
+        async def _target_ro_query(cypher, params=None):
+            if 'RELATES_TO' in cypher:
+                # edge-already-in-target idempotency probes: neither edge is
+                # yet present -- a first-time apply for both.
+                return MagicMock(result_set=[])
+            # entity-presence probes for both edges' non-migrating endpoints
+            # (OTHER_NODE_UUID_FIXTURE, second_edge_other_uuid): both already
+            # present in target.
+            return MagicMock(result_set=[['present']])
+
+        target_mock.ro_query = AsyncMock(side_effect=_target_ro_query)
 
         async def _target_query(cypher, params=None):
-            if 'MENTIONS' in cypher:
+            params = params or {}
+            if 'RELATES_TO' in cypher and params.get('edge_uuid') == EDGE_UUID_FIXTURE:
                 raise RuntimeError('simulated transient FalkorDB error')
             return MagicMock(relationships_created=1)
 
@@ -2231,26 +2258,121 @@ class TestRecreateSubgraphRelationships:
         fake_read_compact = AsyncMock(return_value=COMPACT_VECTOR_REPLY_FIXTURE)
         monkeypatch.setattr(cross_graph_move, '_read_compact_vector', fake_read_compact)
 
-        # Co-moving pair, same shape as test_co_moving_pair_shared_edge_
-        # recreated_exactly_once -- the shared RELATES_TO edge is recreated
-        # (edges loop runs to completion) BEFORE the MENTIONS loop runs and
-        # raises.
         specs = [
             _move_spec(NODE_UUID_FIXTURE, SOURCE_GRAPH_FIXTURE, TARGET_GRAPH_FIXTURE),
-            _move_spec(OTHER_NODE_UUID_FIXTURE, SOURCE_GRAPH_FIXTURE, TARGET_GRAPH_FIXTURE),
+            _move_spec(second_uuid, SOURCE_GRAPH_FIXTURE, TARGET_GRAPH_FIXTURE),
         ]
 
-        with pytest.raises(RuntimeError, match='simulated transient FalkorDB error') as exc_info:
+        result = await recreate_subgraph_relationships(backend, specs)
+
+        # the good, independent edge still landed -- one bad item costs one
+        # item, not the census.
+        assert result.edges_recreated == 1
+        assert result.edges_skipped == 0
+
+        assert len(result.blocked) == 1
+        blocked = result.blocked[0]
+        assert blocked['kind'] == 'edge'
+        assert blocked['uuid'] == EDGE_UUID_FIXTURE
+        assert 'simulated transient FalkorDB error' in blocked['reason']
+        # both incident (migrating-or-not) endpoints are carried, so a
+        # caller can withhold Phase C deletion for whichever of them is
+        # actually a migrating spec in this batch.
+        assert set(blocked['node_uuids']) == {NODE_UUID_FIXTURE, OTHER_NODE_UUID_FIXTURE}
+
+    @pytest.mark.asyncio
+    async def test_mentions_create_failure_is_isolated_not_batch_aborting(
+        self, mock_config, make_backend, make_graph_mock, monkeypatch,
+    ):
+        """The same per-item isolation applies to the MENTIONS pass: a bad
+        MENTIONS create is recorded on result.blocked (kind='mention', the
+        mention's own uuid, a reason naming the error, and the incident
+        entity's uuid) and the batch still returns normally instead of
+        raising.
+        """
+        backend = make_backend(mock_config)
+
+        source_mock = make_graph_mock()
+
+        async def _source_ro_query(cypher, params=None):
+            if 'MENTIONS' in cypher:
+                return MagicMock(result_set=[MENTION_ROW_FIXTURE])
+            return MagicMock(result_set=[])  # no RELATES_TO in this scenario
+
+        source_mock.ro_query = AsyncMock(side_effect=_source_ro_query)
+
+        target_mock = make_graph_mock()
+        # MENTIONS-already-in-target probe: not yet present -- a first-time
+        # apply, so the CREATE (which then raises) is attempted.
+        target_mock.ro_query = AsyncMock(return_value=MagicMock(result_set=[]))
+        target_mock.query = AsyncMock(
+            side_effect=RuntimeError('simulated transient FalkorDB mentions error'),
+        )
+
+        backend._driver._get_graph = _route_graphs({
+            SOURCE_GRAPH_FIXTURE: source_mock,
+            TARGET_GRAPH_FIXTURE: target_mock,
+        })
+
+        fake_read_compact = AsyncMock(return_value=COMPACT_VECTOR_REPLY_FIXTURE)
+        monkeypatch.setattr(cross_graph_move, '_read_compact_vector', fake_read_compact)
+
+        specs = [_move_spec(NODE_UUID_FIXTURE, SOURCE_GRAPH_FIXTURE, TARGET_GRAPH_FIXTURE)]
+
+        result = await recreate_subgraph_relationships(backend, specs)
+
+        assert result.mentions_recreated == 0
+        assert result.mentions_skipped == 0
+
+        assert len(result.blocked) == 1
+        blocked = result.blocked[0]
+        assert blocked['kind'] == 'mention'
+        assert blocked['uuid'] == MENTION_UUID_FIXTURE
+        assert 'simulated transient FalkorDB mentions error' in blocked['reason']
+        assert blocked['node_uuids'] == [NODE_UUID_FIXTURE]
+
+    @pytest.mark.asyncio
+    async def test_gather_read_failure_still_propagates_with_partial_result(
+        self, mock_config, make_backend, make_graph_mock, monkeypatch,
+    ):
+        """A per-spec gather ro_query (the edge/mentions READ that runs
+        BEFORE any of the three per-item recreate loops) raising is a
+        systemic/batch-level failure, not a single bad item -- it is
+        deliberately left OUTSIDE the new per-item isolation and still
+        propagates, carrying exc.partial_result (a SubgraphEdgeResult)
+        exactly like the retained task-2415 mechanism, so a caller can
+        still tell a total-outage batch apart from a batch with only a
+        handful of per-item blocks.
+        """
+        backend = make_backend(mock_config)
+
+        source_mock = make_graph_mock()
+        source_mock.ro_query = AsyncMock(
+            side_effect=RuntimeError('simulated gather read failure'),
+        )
+
+        target_mock = make_graph_mock()
+        backend._driver._get_graph = _route_graphs({
+            SOURCE_GRAPH_FIXTURE: source_mock,
+            TARGET_GRAPH_FIXTURE: target_mock,
+        })
+
+        fake_read_compact = AsyncMock(return_value=COMPACT_VECTOR_REPLY_FIXTURE)
+        monkeypatch.setattr(cross_graph_move, '_read_compact_vector', fake_read_compact)
+
+        specs = [_move_spec(NODE_UUID_FIXTURE, SOURCE_GRAPH_FIXTURE, TARGET_GRAPH_FIXTURE)]
+
+        with pytest.raises(RuntimeError, match='simulated gather read failure') as exc_info:
             await recreate_subgraph_relationships(backend, specs)
 
         partial = getattr(exc_info.value, 'partial_result', None)
         assert partial is not None
         assert isinstance(partial, SubgraphEdgeResult)
-        # the RELATES_TO edge landed BEFORE the MENTIONS create raised --
-        # that real progress must survive on the exception, not be silently
-        # discarded along with the rest of the (never-returned) result.
-        assert partial.edges_recreated == 1
-        assert partial.edges_skipped == 0
+        # nothing was mutated -- the raise happened during the gather phase,
+        # before any of the three per-item recreate loops ever started.
+        assert partial.edges_recreated == 0
         assert partial.mentions_recreated == 0
-        assert partial.mentions_skipped == 0
-        assert partial.dropped_cross_target == []
+        assert partial.blocked == []
+
+        target_mock.query.assert_not_awaited()
+        fake_read_compact.assert_not_awaited()
