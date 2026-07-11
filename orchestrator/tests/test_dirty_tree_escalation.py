@@ -48,6 +48,7 @@ class TestFileDirtyTreeEscalation:
 
         await h._file_dirty_tree_escalation(force_dirty_start=False)
 
+        assert h._escalation_queue is not None
         escs = h._escalation_queue.get_by_task(
             _DIRTY_TREE_ESCALATION_SENTINEL, status='pending', level=2,
         )
@@ -67,6 +68,7 @@ class TestFileDirtyTreeEscalation:
 
         await h._file_dirty_tree_escalation(force_dirty_start=False)
 
+        assert h._escalation_queue is not None
         assert h._escalation_queue.get_pending() == []
 
     @pytest.mark.asyncio
@@ -78,6 +80,7 @@ class TestFileDirtyTreeEscalation:
 
         await h._file_dirty_tree_escalation(force_dirty_start=True)
 
+        assert h._escalation_queue is not None
         escs = h._escalation_queue.get_by_task(
             _DIRTY_TREE_ESCALATION_SENTINEL, status='pending', level=2,
         )
@@ -99,6 +102,7 @@ class TestFileDirtyTreeEscalation:
         )
         await h._file_dirty_tree_escalation(force_dirty_start=False)
 
+        assert h._escalation_queue is not None
         escs = h._escalation_queue.get_by_task(
             _DIRTY_TREE_ESCALATION_SENTINEL, status='pending', level=2,
         )
