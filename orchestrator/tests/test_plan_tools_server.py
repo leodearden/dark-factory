@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import logging
+
 import pytest
 
 from orchestrator.artifacts import TaskArtifacts
@@ -80,6 +82,41 @@ class TestCoerceFiles:
 
     def test_list_entries_are_stripped(self):
         assert _coerce_files([' a.py ', ' b.py ']) == ['a.py', 'b.py']
+
+    def test_single_quoted_python_repr_list_recovered(self):
+        """A Python-repr-style stringified list (single quotes) is not
+        valid JSON but is a plausible mis-serialization shape; it must be
+        recovered via ast.literal_eval rather than degrading to garbage
+        comma-split fragments like "['a.py'" and "'b.py']"."""
+        assert _coerce_files("['mod/a.py', 'mod/b.py']") == ['mod/a.py', 'mod/b.py']
+
+    def test_dict_shaped_json_falls_back_and_logs_warning(self, caplog):
+        """A JSON value that decodes to something other than a list/str
+        (e.g. a dict) is not a recognized files shape. It still falls back
+        to a best-effort delimiter split, but must log a warning so the
+        corruption is visible rather than silently persisting a malformed
+        path."""
+        with caplog.at_level(logging.WARNING, logger='orchestrator.mcp.plan_tools'):
+            result = _coerce_files('{"a": 1}')
+
+        assert result == ['{"a": 1}']
+        assert any(
+            'unrecognized JSON shape' in r.getMessage() for r in caplog.records
+        )
+
+    def test_residual_bracket_chars_after_split_logs_warning(self, caplog):
+        """Input that is neither valid JSON nor a valid Python list literal
+        (e.g. unquoted comma-separated entries wrapped in brackets) falls
+        back to a delimiter split that leaves stray bracket characters in
+        the result. This must be logged rather than silently accepted as
+        valid file paths."""
+        with caplog.at_level(logging.WARNING, logger='orchestrator.mcp.plan_tools'):
+            result = _coerce_files('[mod/a.py, mod/b.py]')
+
+        assert result == ['[mod/a.py', 'mod/b.py]']
+        assert any(
+            'residual bracket/quote characters' in r.getMessage() for r in caplog.records
+        )
 
 
 # ---------------------------------------------------------------------------

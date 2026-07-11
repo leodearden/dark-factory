@@ -21,6 +21,7 @@ Usage (stdio transport, spawned by orchestrator):
 from __future__ import annotations
 
 import argparse
+import ast
 import json
 import logging
 import re
@@ -42,15 +43,24 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 
 
+# Bracket/quote characters that, if still present in a delimiter-split
+# fallback result, indicate the split did not fully recover clean file
+# paths (i.e. the input was corrupted in a shape we don't parse).
+_RESIDUAL_CORRUPTION_CHARS = frozenset("[]{}'\"")
+
+
 def _coerce_files(files: list[str] | str | None) -> list[str]:
     """Coerce a possibly mis-serialized ``files`` MCP arg into a clean list.
 
     The agent harness intermittently mis-serializes the ``create_plan``
     (and ``update_plan_metadata``) call when a large/complex ``analysis``
     string accompanies the ``files`` array in the same call, corrupting
-    ``files`` into a stringified JSON array, a bare JSON string, or a
-    comma/newline-delimited plain string. This recovers all of those
-    shapes back into a clean ``list[str]``; ``None`` maps to ``[]``.
+    ``files`` into a stringified JSON array, a bare JSON string, a
+    Python-repr-style single-quoted list, or a comma/newline-delimited
+    plain string. This recovers all of those shapes back into a clean
+    ``list[str]``; ``None`` maps to ``[]``. Shapes that cannot be
+    confidently recovered are logged (rather than silently accepted) so
+    the corruption stays visible to operators.
     """
     if files is None:
         return []
@@ -71,10 +81,41 @@ def _coerce_files(files: list[str] | str | None) -> list[str]:
     if isinstance(decoded, str):
         decoded = decoded.strip()
         return [decoded] if decoded else []
+    if decoded is not None:
+        # Valid JSON, but not a list/str (e.g. a dict or a number) is not a
+        # recognized files shape. Fall through to the delimiter split below
+        # for a best-effort recovery, but flag it — for a dict that split
+        # degrades to the whole brace-string as a single "path" rather than
+        # a real recovery.
+        logger.warning(
+            "_coerce_files: files arg decoded to unrecognized JSON shape "
+            "%s (expected list or str); falling back to delimiter-split "
+            "of raw text %r",
+            type(decoded).__name__,
+            text,
+        )
+    elif text.startswith('[') and text.endswith(']'):
+        # Not valid JSON. Try a Python-repr-style stringified list next —
+        # e.g. "['a.py', 'b.py']" (single-quoted) is a plausible
+        # mis-serialization shape that json.loads cannot parse.
+        try:
+            literal = ast.literal_eval(text)
+        except (ValueError, SyntaxError):
+            literal = None
+        if isinstance(literal, list):
+            return [str(f).strip() for f in literal if str(f).strip()]
 
-    # Not recoverable as JSON (or decoded to a non-list/non-str) — fall back
-    # to splitting on commas/newlines, the other corrupted shape observed.
-    return [part.strip() for part in re.split(r'[,\n]', text) if part.strip()]
+    # Last resort: split on commas/newlines, the other corrupted shape
+    # observed in practice.
+    parts = [part.strip() for part in re.split(r'[,\n]', text) if part.strip()]
+    if any(_RESIDUAL_CORRUPTION_CHARS & set(part) for part in parts):
+        logger.warning(
+            "_coerce_files: delimiter-split fallback produced entries with "
+            "residual bracket/quote characters — input may still be "
+            "corrupted: %r",
+            parts,
+        )
+    return parts
 
 
 # ---------------------------------------------------------------------------
