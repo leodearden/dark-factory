@@ -1195,6 +1195,12 @@ class SqliteTaskBackend:
             conn.row_factory = aiosqlite.Row
             return await self._statuses_from_conn(conn, tag or DEFAULT_TAG, ids)
         except Exception:
+            logger.warning(
+                "get_statuses_fresh: failing open to {} for project_root=%r "
+                "after error reading fresh status census",
+                project_root,
+                exc_info=True,
+            )
             return {}
         finally:
             if conn is not None:
