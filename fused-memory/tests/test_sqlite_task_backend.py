@@ -2816,6 +2816,116 @@ async def test_v3_to_v4_raising_escalation_cb_is_caught_and_logged(tmp_path, cap
     )
 
 
+@pytest.mark.asyncio
+async def test_v3_to_v4_self_heal_cancels_non_canonical_and_builds_index(
+    tmp_path, caplog,
+):
+    """A genuine content-duplicate residual group (all-active, identical
+    normalized title+files, no ``done`` row) is auto-healed at
+    connection-open: every non-canonical row is cancelled with a durable
+    ``auto_cancelled_by_self_heal`` metadata provenance stamp, the canonical
+    (lowest-id in-progress) row survives untouched, the escalation callback
+    is never invoked (nothing ambiguous to flag), and — since no residual
+    remains after healing — the partial UNIQUE index is built and
+    user_version advances to 4 in the SAME connection-open, with no restart.
+    This is the fix for reify incident esc-candidate-key-migration-2 (37 dup
+    groups / 58 rows previously required a manual set_task_status cancel
+    plus a server restart).
+    """
+    import sqlite3
+
+    project_root = str(tmp_path / 'proj')
+    db_path = Path(project_root) / '.taskmaster' / 'tasks' / 'tasks.db'
+    _make_v3_db_with_dup_groups(
+        db_path,
+        [
+            (1, 'Fix the bug', 'pending', ['a.py', 'b.py']),
+            (2, 'fix   the  bug', 'in-progress', ['a.py', 'b.py']),
+            (3, 'Totally different task', 'pending', ['z.py']),
+        ],
+    )
+
+    recorded: list[tuple[str, list[dict]]] = []
+
+    def recording_stub(project_root_arg, residual_groups):
+        recorded.append((project_root_arg, residual_groups))
+
+    cfg = TaskmasterConfig(project_root=str(tmp_path))
+    b = SqliteTaskBackend(cfg, residual_dup_escalation_cb=recording_stub)
+    await b.start()
+    try:
+        with caplog.at_level(
+            logging.INFO, logger='fused_memory.backends.sqlite_task_backend',
+        ):
+            # Triggers connection-open (_migrate); must not raise.
+            await b.get_tasks(project_root=project_root)
+    finally:
+        await b.close()
+
+    expected_key = compute_candidate_key('Fix the bug', ['a.py', 'b.py'])
+
+    conn = sqlite3.connect(str(db_path))
+    try:
+        conn.row_factory = sqlite3.Row
+        indexes = {row[1] for row in conn.execute('PRAGMA index_list(tasks)')}
+        user_version = conn.execute('PRAGMA user_version').fetchone()[0]
+        rows = {
+            row['id']: row
+            for row in conn.execute(
+                "SELECT id, status, metadata FROM tasks WHERE tag='master'",
+            )
+        }
+    finally:
+        conn.close()
+
+    # (a) the non-canonical row (id=1, pending) is auto-cancelled ...
+    assert rows[1]['status'] == 'cancelled', rows[1]['status']
+    # (b) ... while the canonical (lowest-id in-progress) row survives
+    # non-cancelled, untouched otherwise.
+    assert rows[2]['status'] == 'in-progress', rows[2]['status']
+    # ... and the unrelated unique row is unaffected.
+    assert rows[3]['status'] == 'pending', rows[3]['status']
+
+    # (c) the cancelled row's metadata carries a durable provenance stamp
+    # naming the canonical survivor and the shared candidate_key — the
+    # human sign-off this self-heal replaces.
+    cancelled_metadata = json.loads(rows[1]['metadata'])
+    stamp = cancelled_metadata.get('auto_cancelled_by_self_heal')
+    assert stamp is not None, cancelled_metadata
+    assert stamp['canonical_id'] == 2, stamp
+    assert stamp['candidate_key'] == expected_key, stamp
+    # Original metadata content survives the merge.
+    assert cancelled_metadata['files'] == ['a.py', 'b.py'], cancelled_metadata
+
+    # (d) no residual remains after healing, so the partial UNIQUE index IS
+    # built and user_version advances to 4 in this SAME connection-open —
+    # no restart required.
+    assert 'ux_tasks_candidate_key' in indexes, (
+        f'Expected the index to be built once the residual is self-healed; got {indexes}'
+    )
+    assert user_version == 4, (
+        f'Expected user_version=4 after a fully self-healed residual; got {user_version}'
+    )
+
+    # (e) nothing ambiguous here — the escalation callback must NOT fire.
+    assert recorded == [], (
+        f'Expected no escalation for a genuine auto-healed group; got {recorded}'
+    )
+
+    # (f) a loud log names the healed group (canonical + cancelled ids).
+    heal_records = [
+        r for r in caplog.records
+        if r.levelno >= logging.INFO
+        and 'self-heal' in r.message
+        and expected_key in r.message
+    ]
+    assert len(heal_records) == 1, (
+        f'Expected exactly one self-heal log record; got {len(heal_records)}: '
+        f'{[r.message for r in caplog.records]}'
+    )
+    assert 'canonical' in heal_records[0].message.lower(), heal_records[0].message
+
+
 # ── candidate_key collision (fm-task-dedup W8 task A2) ───────────────
 
 
