@@ -17,6 +17,7 @@ from typing import TYPE_CHECKING, Any, NamedTuple
 if TYPE_CHECKING:
     from fused_memory.backends.task_backend_protocol import TaskBackendProtocol
 
+from fused_memory.backends.task_backend_errors import DuplicateCandidateKeyError
 from fused_memory.middleware.task_interceptor import TERMINAL_STATUSES
 from fused_memory.models.reconciliation import (
     ReconciliationEvent,
@@ -2964,6 +2965,23 @@ async def _queue_briefing_refresh_tasks(
                     },
                 )
                 failed.append(task_id)
+        except DuplicateCandidateKeyError as exc:
+            # The store's index-independent dedup guard (or, when the
+            # partial UNIQUE index is present, the index itself) rejected
+            # this insert as a duplicate of an existing non-cancelled row.
+            # PRD decision #3: a candidate_key collision is a successful
+            # dedup, not a failure -- fold it into `skipped` rather than
+            # `failed` so this direct add_task path (bypassing the curator
+            # entirely) matches the interceptor's combined resolution.
+            logger.info(
+                'briefing_refresh_add_task_deduped',
+                extra={
+                    'project_root': project_root,
+                    'task_id': task_id,
+                    'existing_id': exc.existing_id,
+                },
+            )
+            skipped.append(task_id)
         except Exception:
             logger.warning(
                 'briefing_refresh_add_task_failed',

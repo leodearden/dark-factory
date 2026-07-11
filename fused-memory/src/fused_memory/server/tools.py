@@ -2459,6 +2459,46 @@ def create_mcp_server(
             ),
         }
 
+    @mcp.tool()
+    @mcp_tool_errors()
+    async def rebuild_candidate_key_index(project_root: str) -> dict[str, Any]:
+        """Re-audit residual ``candidate_key`` duplicates and, once clean,
+        (re)build the ``ux_tasks_candidate_key`` partial UNIQUE index --
+        on the LIVE cached connection, with no server restart required.
+
+        ``_migrate_v3_to_v4`` (the self-heal migration that auto-cancels
+        genuine content-duplicate groups and flags ambiguous ones for human
+        review) only ever runs at connection-open: a running server that
+        already holds a cached connection never re-lands the index after an
+        operator resolves a previously-flagged residual. Call this tool
+        after resolving flagged duplicates (see
+        ``emit_residual_candidate_key_escalation``) to land the index
+        immediately instead of waiting for the next server restart.
+
+        Idempotent -- a call when the index is already built (schema
+        already at v4) is a cheap no-op that reports
+        ``already_at_v4: True``.
+
+        Args:
+            project_root: Absolute path to project root
+
+        Returns:
+            The self-heal migration's result dict: ``{'index_built': bool,
+            'healed': [...], 'flagged': [...], 'user_version': int}`` (plus
+            ``'already_at_v4': True'`` on the no-op short-circuit). Healed
+            groups were genuine content-duplicates auto-cancelled this
+            pass; flagged groups are ambiguous residuals still blocking the
+            index and awaiting human review.
+        """
+        if not _taskmaster_configured:
+            return {
+                'error': 'Taskmaster is not configured. Cannot rebuild candidate_key index.',
+                'error_type': 'ConfigurationError',
+            }
+        return await task_interceptor.taskmaster.reaudit_candidate_key_index(  # type: ignore[union-attr]
+            project_root,
+        )
+
     # ------------------------------------------------------------------
     # Task proxy tools (always registered; errors if Taskmaster unavailable)
     # ------------------------------------------------------------------

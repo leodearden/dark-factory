@@ -466,34 +466,103 @@ async def _migrate_v2_to_v3(conn: aiosqlite.Connection) -> None:
     await conn.commit()
 
 
+def _classify_residual_group(
+    rows: list[Any],
+) -> tuple[str, int, list[int]] | tuple[str, str]:
+    """Classify one residual (tag, candidate_key) duplicate group of
+    non-cancelled rows for the v3->v4 self-heal migration step (fm-task-dedup
+    W8 amendment, reify incident esc-candidate-key-migration-2).
+
+    ``rows`` are dict-likes (``aiosqlite.Row`` or plain ``dict``), each
+    carrying at least ``id``, ``title``, ``status``, ``metadata`` (raw JSON
+    text or ``None``), and ``candidate_key`` (the STORED value shared by
+    every row in the group -- that's why the caller's audit query grouped
+    them together in the first place).
+
+    Returns:
+        ``('heal', canonical_id, cancel_ids)`` when every row recomputes to
+        the SAME candidate_key as what's stored (guards a stale/legacy
+        stored key -- the "verified same candidate_key" check) AND no row is
+        ``done`` (``shared.task_statuses.TaskStatus.DONE``) -- a genuine
+        content-duplicate, safe to auto-collapse. ``canonical_id`` is the
+        lowest id among ``in-progress`` rows if any, else the lowest id
+        overall; ``cancel_ids`` is the ascending-sorted remainder.
+
+        ``('flag', reason)`` otherwise, with ``reason`` one of:
+
+        * ``'title_divergent'`` -- some row's fresh ``(title, files)``
+          recompute disagrees with the group's stored candidate_key, so the
+          group is not actually a content match (a stale/legacy stored key
+          coincidentally collided). Checked FIRST: a group that fails this
+          "verified same candidate_key" check is never safe to reason about
+          via status alone.
+        * ``'mixed_status'`` -- a verified-same group that also contains a
+          ``done`` row. Cancelling completed work needs a human even though
+          the content genuinely matches.
+    """
+    stored_key = rows[0]['candidate_key']
+    if any(
+        compute_candidate_key(row['title'], _files_for_key(row['metadata'])) != stored_key
+        for row in rows
+    ):
+        return ('flag', 'title_divergent')
+    if any(row['status'] == TaskStatus.DONE for row in rows):
+        return ('flag', 'mixed_status')
+    in_progress_ids = [row['id'] for row in rows if row['status'] == TaskStatus.IN_PROGRESS]
+    canonical_id = min(in_progress_ids) if in_progress_ids else min(row['id'] for row in rows)
+    cancel_ids = sorted(row['id'] for row in rows if row['id'] != canonical_id)
+    return ('heal', canonical_id, cancel_ids)
+
+
 async def _migrate_v3_to_v4(
     conn: aiosqlite.Connection,
     *,
     project_root: str | None = None,
     residual_dup_escalation_cb: Any = None,
-) -> None:
-    """v3 -> v4 (fm-task-dedup W8 task A2): self-gating partial UNIQUE index.
+) -> dict[str, Any]:
+    """v3 -> v4 (fm-task-dedup W8 task A2, self-heal amendment): self-gating
+    partial UNIQUE index, now with an intermediate self-heal pass.
 
-    Re-runs the same residual non-cancelled duplicate ``candidate_key``
+    Runs the same residual non-cancelled duplicate ``candidate_key``
     audit ``_migrate_v2_to_v3`` performed (report-only there), extended with
     ``GROUP_CONCAT(id ORDER BY id)`` to name the offending rows in a
     deterministic (ascending id) order — SQLite does not otherwise guarantee
     ``GROUP_CONCAT`` row order, and both the ERROR log token and the
-    escalation payload's ``task_ids`` list depend on a stable order:
+    escalation payload's ``task_ids`` list depend on a stable order.
 
-    * **Residuals found** — log a loud ERROR naming the groups (via the
-      ``residual_group_count=`` token, deliberately distinct from v2->v3's
-      ``duplicate_groups=`` token so the two audits' log-scraping assertions
-      never collide), invoke ``residual_dup_escalation_cb(project_root,
-      residual_groups)`` when provided (best-effort — a raising callback is
-      caught and logged, never propagated), and SKIP the index build.
-      ``user_version`` is left at 3 (NOT stamped to 4): a later
-      connection-open — after an operator cleans up the residuals — re-runs
-      this step and lands the index then (PRD decision #4: "the next deploy
-      lands the index").
-    * **Clean** — build ``ux_tasks_candidate_key``, a PARTIAL UNIQUE index
-      over ``(tag, candidate_key)`` excluding NULL keys and cancelled rows,
-      then stamp ``user_version = 4``.
+    Every residual group is classified via ``_classify_residual_group``:
+
+    * **Heal** — a genuine content-duplicate (every row verified to
+      recompute the SAME candidate_key; no row ``done``): the non-canonical
+      rows are cancelled directly (``UPDATE ... SET status = 'cancelled'``),
+      each stamped with a durable ``auto_cancelled_by_self_heal`` metadata
+      provenance marker (canonical id + candidate_key) merged onto its
+      existing metadata, plus a loud per-group WARNING log. Fixes reify
+      incident esc-candidate-key-migration-2 (37 dup groups / 58 rows that
+      previously required a manual ``set_task_status`` cancel per row).
+    * **Flag** — ambiguous (``reason`` is ``'mixed_status'`` or
+      ``'title_divergent'``): left untouched and collected — with its
+      ``reason`` — into ``flagged_groups`` for escalation below.
+
+    * **Any group ends up flagged** — log a loud ERROR naming the flagged
+      groups and their reasons (via the ``residual_group_count=`` token,
+      deliberately distinct from v2->v3's ``duplicate_groups=`` token so
+      the two audits' log-scraping assertions never collide; also names
+      ``healed_group_count=`` so an operator sees both halves of the
+      pass), invoke ``residual_dup_escalation_cb(project_root,
+      flagged_groups)`` when provided — ONLY the flagged groups, never the
+      auto-healed ones — (best-effort — a raising callback is caught and
+      logged, never propagated), and SKIP the index build. ``user_version``
+      is left at 3 (NOT stamped to 4): a later connection-open — after an
+      operator resolves the flagged residuals — re-runs this step and
+      lands the index then (PRD decision #4 amendment: genuine duplicates
+      now self-heal automatically; only ambiguous residuals still require
+      a human before the index lands).
+    * **Nothing flagged** (whether or not anything was healed) — build
+      ``ux_tasks_candidate_key``, a PARTIAL UNIQUE index over ``(tag,
+      candidate_key)`` excluding NULL keys and cancelled rows, then stamp
+      ``user_version = 4`` — in the SAME connection-open that performed the
+      heal, no restart required.
 
     FAIL-SAFE: this step NEVER raises. ``_get_connection`` only caches the
     connection AFTER ``_migrate`` returns, so a raising migration would
@@ -507,6 +576,16 @@ async def _migrate_v3_to_v4(
     index against a DB that still holds residual duplicates, defeating the
     self-gating fail-safe. Fresh DBs still get the index via the full
     v0->v1->v2->v3->v4 chain, where this audit is trivially clean.
+
+    Returns a result dict ``{'index_built': bool, 'healed': [...],
+    'flagged': [...]}`` at every exit -- ``healed``/``flagged`` are lists of
+    per-group descriptor dicts (``flagged`` entries are the same shape fed to
+    ``residual_dup_escalation_cb``; ``healed`` entries carry ``tag``/
+    ``candidate_key``/``canonical_id``/``cancelled_ids``). The connection-open
+    call site (``_migrate``) ignores this return value -- it exists so
+    ``SqliteTaskBackend.reaudit_candidate_key_index`` (the live, on-demand
+    re-run) can share this single implementation and report an accurate
+    status without a server restart.
     """
     try:
         dup_cursor = await conn.execute(
@@ -523,34 +602,95 @@ async def _migrate_v3_to_v4(
         # to a list so len() below type-checks (it's already a list at runtime).
         residual_rows = list(await dup_cursor.fetchall())
 
-        if residual_rows:
+        healed_groups: list[dict[str, Any]] = []
+        flagged_groups: list[dict[str, Any]] = []
+        for group in residual_rows:
+            rows_cursor = await conn.execute(
+                "SELECT id, title, status, metadata, candidate_key FROM tasks "
+                "WHERE tag = ? AND candidate_key = ? AND status != 'cancelled' "
+                "ORDER BY id",
+                (group['tag'], group['candidate_key']),
+            )
+            group_rows = list(await rows_cursor.fetchall())
+            classification = _classify_residual_group(group_rows)
+            if len(classification) != 3:
+                _, reason = classification
+                flagged_groups.append({
+                    'tag': group['tag'],
+                    'candidate_key': group['candidate_key'],
+                    'task_ids': [str(row['id']) for row in group_rows],
+                    'count': len(group_rows),
+                    'reason': reason,
+                })
+                continue
+
+            _, canonical_id, cancel_ids = classification
+            by_id = {row['id']: row for row in group_rows}
+            now = _now()
+            for cancel_id in cancel_ids:
+                stamp = json.dumps({
+                    'auto_cancelled_by_self_heal': {
+                        'canonical_id': canonical_id,
+                        'candidate_key': group['candidate_key'],
+                        'migration': 'v3_v4',
+                    },
+                })
+                new_metadata = _merge_metadata(
+                    by_id[cancel_id]['metadata'], stamp,
+                    mode='merge',
+                    project_root=project_root, tag=group['tag'], task_id=cancel_id,
+                )
+                await conn.execute(
+                    "UPDATE tasks SET status = 'cancelled', updated_at = ?, "
+                    "metadata = ? WHERE tag = ? AND id = ?",
+                    (now, new_metadata, group['tag'], cancel_id),
+                )
+            healed_groups.append({
+                'tag': group['tag'],
+                'candidate_key': group['candidate_key'],
+                'canonical_id': canonical_id,
+                'cancelled_ids': cancel_ids,
+            })
+            logger.warning(
+                'sqlite_task_backend: schema v3->v4 self-heal -- auto-cancelled '
+                '%d redundant duplicate candidate_key row(s) for tag=%r '
+                'candidate_key=%r; canonical survivor id=%d retained, '
+                'cancelled_ids=%s (genuine content-duplicate group -- verified '
+                'same candidate_key, no done row -- safe to auto-collapse; see '
+                'fm-task-dedup self-heal amendment, reify incident '
+                'esc-candidate-key-migration-2)',
+                len(cancel_ids), group['tag'], group['candidate_key'],
+                canonical_id, cancel_ids,
+            )
+
+        if healed_groups:
+            # Commit unconditionally here (not deferred to the clean-build
+            # commit below): a still-flagged group below causes an early
+            # `return`, and healed cancels must survive that skip rather
+            # than riding on a commit that may never happen.
+            await conn.commit()
+
+        if flagged_groups:
             groups_desc = '; '.join(
-                f'tag={row["tag"]!r} candidate_key={row["candidate_key"]!r} '
-                f'ids=[{row["ids"]}]'
-                for row in residual_rows
+                f'tag={g["tag"]!r} candidate_key={g["candidate_key"]!r} '
+                f'ids=[{",".join(g["task_ids"])}] reason={g["reason"]!r}'
+                for g in flagged_groups
             )
             logger.error(
                 'sqlite_task_backend: schema v3->v4 migration SKIPPED -- '
-                'residual_group_count=%d non-cancelled duplicate candidate_key '
-                'group(s) still present; UNIQUE index NOT created, '
-                'user_version stays at 3. Clean up the residual duplicates '
+                'residual_group_count=%d ambiguous duplicate candidate_key '
+                'group(s) still flagged for human review '
+                '(healed_group_count=%d genuine duplicate group(s) '
+                'auto-resolved this pass); UNIQUE index NOT created, '
+                'user_version stays at 3. Resolve the flagged group(s) '
                 '(cancel or merge the extras) and the next connection-open '
                 'will land the index. Groups: %s',
-                len(residual_rows), groups_desc,
+                len(flagged_groups), len(healed_groups), groups_desc,
             )
 
-            residual_groups = [
-                {
-                    'tag': row['tag'],
-                    'candidate_key': row['candidate_key'],
-                    'task_ids': row['ids'].split(','),
-                    'count': row['n'],
-                }
-                for row in residual_rows
-            ]
             if residual_dup_escalation_cb is not None:
                 try:
-                    residual_dup_escalation_cb(project_root, residual_groups)
+                    residual_dup_escalation_cb(project_root, flagged_groups)
                 except Exception:
                     # A broken/misbehaving callback must never crash
                     # connection-open — the skip above has already happened;
@@ -559,9 +699,9 @@ async def _migrate_v3_to_v4(
                         'sqlite_task_backend: residual_dup_escalation_cb '
                         'raised while escalating %d residual duplicate '
                         'candidate_key group(s) for project_root=%r',
-                        len(residual_groups), project_root,
+                        len(flagged_groups), project_root,
                     )
-            return
+            return {'index_built': False, 'healed': healed_groups, 'flagged': flagged_groups}
 
         try:
             await conn.execute(
@@ -576,7 +716,7 @@ async def _migrate_v3_to_v4(
                 'clean audit (race?); skipping index build, user_version '
                 'stays at 3.',
             )
-            return
+            return {'index_built': False, 'healed': healed_groups, 'flagged': []}
 
         await conn.execute('PRAGMA user_version = 4')
         await conn.commit()
@@ -586,6 +726,7 @@ async def _migrate_v3_to_v4(
             '(tag, candidate_key) and advanced user_version to 4 '
             '(fm-task-dedup task A2).',
         )
+        return {'index_built': True, 'healed': healed_groups, 'flagged': []}
     except Exception:
         # Defensive backstop -- this step must NEVER raise at connection-open
         # (see docstring): a raising migration would crash-loop fused-memory.
@@ -593,6 +734,7 @@ async def _migrate_v3_to_v4(
             'sqlite_task_backend: schema v3->v4 migration failed unexpectedly; '
             'skipping (user_version stays below 4, retried on next open)',
         )
+        return {'index_built': False, 'healed': [], 'flagged': []}
 
 
 async def _claimant_columns_present(conn: aiosqlite.Connection) -> bool:
@@ -614,6 +756,30 @@ async def _claimant_columns_present(conn: aiosqlite.Connection) -> bool:
     info_rows = await (await conn.execute('PRAGMA table_info(tasks)')).fetchall()
     col_names = {r[1] for r in info_rows}
     return 'claimant_run_id' in col_names and 'heartbeat_at' in col_names
+
+
+async def _candidate_key_index_present(conn: aiosqlite.Connection) -> bool:
+    """True iff the ``ux_tasks_candidate_key`` partial UNIQUE index exists on ``tasks``.
+
+    Feature-detection backing the add_task/update_task pre-write dedup
+    guards' hot-path skip (fm-task-dedup self-heal amendment, reviewer
+    follow-up): once the index is present it alone enforces (tag,
+    candidate_key) uniqueness for non-cancelled rows (backstopped by the
+    existing post-write ``sqlite3.IntegrityError`` mapping), so the extra
+    guard SELECT those write paths run as an index-INDEPENDENT backstop is
+    only needed while the index is absent -- the v3->v4 migration's
+    self-gated window (a flagged residual leaves it absent indefinitely,
+    reify incident esc-candidate-key-migration-2).
+
+    Called once per project_root, from ``_get_connection`` right after
+    ``_migrate`` runs and again by ``reaudit_candidate_key_index`` after a
+    live rebuild; the result is cached on
+    ``SqliteTaskBackend._candidate_key_index_cache`` and reused by the write
+    paths so a hot add_task/update_task loop doesn't re-run ``PRAGMA
+    index_list`` on every call.
+    """
+    index_rows = await (await conn.execute('PRAGMA index_list(tasks)')).fetchall()
+    return any(row[1] == 'ux_tasks_candidate_key' for row in index_rows)
 
 
 def _warn_malformed_metadata_once(
@@ -786,6 +952,17 @@ class SqliteTaskBackend:
         # claimant write (the heartbeat-refresh hot path) is unnecessary.
         # Absent entries default to False (fail-safe) in the write paths.
         self._claimant_columns_cache: dict[str, bool] = {}
+        # Cached result of `_candidate_key_index_present` per project_root
+        # (reviewer follow-up to fm-task-dedup self-heal amendment):
+        # populated in `_get_connection` right after `_migrate` runs, and
+        # refreshed by `reaudit_candidate_key_index`. Lets add_task/
+        # update_task skip their index-independent pre-write dedup guard
+        # SELECT once the partial UNIQUE index is confirmed present -- the
+        # common steady state, where the index (backstopped by the existing
+        # post-write IntegrityError mapping) alone enforces uniqueness.
+        # Absent entries default to False (fail-safe: run the guard) so an
+        # unmigrated/absent cache entry never silently skips protection.
+        self._candidate_key_index_cache: dict[str, bool] = {}
         self._closed = False
         self._started = False
         # SQLite connections don't restart, so the counter is pinned at 1
@@ -935,6 +1112,7 @@ class SqliteTaskBackend:
             # __init__ for why this is safe to compute a single time here
             # rather than on every claimant write.
             self._claimant_columns_cache[project_root] = await _claimant_columns_present(conn)
+            self._candidate_key_index_cache[project_root] = await _candidate_key_index_present(conn)
             self._connections[project_root] = conn
             logger.info('SqliteTaskBackend opened %s', db_path)
             return conn
@@ -1395,6 +1573,69 @@ class SqliteTaskBackend:
             'message': f'Updated claimant fields for task {task_id}',
         }
 
+    async def reaudit_candidate_key_index(self, project_root: str) -> dict[str, Any]:
+        """Idempotently re-run the v3->v4 self-heal migration on the LIVE
+        cached connection for ``project_root`` -- no server restart required.
+
+        ``_migrate_v3_to_v4`` only ever runs at connection-open:
+        ``_get_connection`` short-circuits to the cached connection on every
+        later call, so a running server that already holds a pre-audit
+        connection never re-lands the partial UNIQUE index after an operator
+        resolves a previously-flagged residual (the reify incident's second
+        failure mode, esc-candidate-key-migration-2). This method closes
+        that gap by re-running the SAME classify/heal/audit/build logic
+        connection-open uses, sharing the implementation via
+        ``_migrate_v3_to_v4``'s result dict (fm-task-dedup self-heal
+        amendment).
+
+        Short-circuits to ``{'index_built': True, 'already_at_v4': True,
+        'user_version': 4}`` without touching the write lock when the
+        connection is already at v4 (the common case once the index has
+        landed) — a plain read, so no locking is needed for the check
+        itself. Otherwise acquires the write lock (excluding concurrent
+        writers for the duration of the re-audit, same as any other mutating
+        method) and re-reads ``PRAGMA user_version`` a SECOND time, now that
+        the lock is held: a concurrent caller (another ``reaudit_...`` call,
+        or a racing connection-open) may have landed the index between the
+        first unlocked read and lock acquisition, and re-running
+        ``_migrate_v3_to_v4`` against an already-v4 connection is merely
+        wasteful (idempotent, but logs a confusing "clean audit (race?)"
+        line) rather than unsafe — this second check avoids that. Returns
+        ``_migrate_v3_to_v4``'s result dict merged with the final
+        ``user_version`` when the migration does run.
+        """
+        await self.ensure_connected()
+        conn = await self._get_connection(project_root)
+        version_cursor = await conn.execute('PRAGMA user_version')
+        version_row = await version_cursor.fetchone()
+        current_version = version_row[0] if version_row is not None else 0
+        if current_version >= 4:
+            self._candidate_key_index_cache[project_root] = True
+            return {'index_built': True, 'already_at_v4': True, 'user_version': 4}
+
+        async with self._write_lock(project_root):
+            conn = await self._get_connection(project_root)
+            # Re-check under the lock (see docstring) — another writer may
+            # have already landed the index while we were waiting for it.
+            version_cursor = await conn.execute('PRAGMA user_version')
+            version_row = await version_cursor.fetchone()
+            current_version = version_row[0] if version_row is not None else current_version
+            if current_version >= 4:
+                self._candidate_key_index_cache[project_root] = True
+                return {'index_built': True, 'already_at_v4': True, 'user_version': 4}
+
+            result = await _migrate_v3_to_v4(
+                conn,
+                project_root=project_root,
+                residual_dup_escalation_cb=self._residual_dup_escalation_cb,
+            )
+            version_cursor = await conn.execute('PRAGMA user_version')
+            version_row = await version_cursor.fetchone()
+            final_version = version_row[0] if version_row is not None else current_version
+            self._candidate_key_index_cache[project_root] = final_version >= 4
+
+        return {**result, 'user_version': final_version}
+
     # ── Write-boundary validation (task 2162, W3-β) ────────────────────
 
     async def _validate_metadata_on_write(
@@ -1529,6 +1770,39 @@ class SqliteTaskBackend:
                 await self._validate_metadata_on_write(
                     metadata, project_root=project_root, tag=tag, task_id=next_id,
                 )
+
+                # Index-independent dedup guard (fm-task-dedup self-heal
+                # amendment): the v3->v4 partial UNIQUE index is
+                # self-gating — a flagged residual leaves it ABSENT
+                # indefinitely (reify incident esc-candidate-key-migration-2)
+                # — so this SELECT is the only backstop during that window.
+                # Same typed error the post-INSERT IntegrityError mapping
+                # below raises when the index IS present, so callers (the
+                # interceptor's create-dispatch combined resolution) need no
+                # changes regardless of which path catches the collision.
+                # Gated on `_candidate_key_index_cache` (reviewer follow-up):
+                # once the index is confirmed present, IT alone enforces
+                # uniqueness (via the IntegrityError mapping below), so this
+                # extra SELECT is skipped on that hot-path steady state and
+                # only runs during the degraded index-absent window. A
+                # missing cache entry defaults to "absent" (fail-safe).
+                if candidate_key is not None and not self._candidate_key_index_cache.get(
+                    project_root, False,
+                ):
+                    guard_cursor = await conn.execute(
+                        "SELECT id, status FROM tasks WHERE tag = ? AND candidate_key = ? "
+                        "AND status != 'cancelled' ORDER BY id LIMIT 1",
+                        (tag, candidate_key),
+                    )
+                    guard_row = await guard_cursor.fetchone()
+                    if guard_row is not None:
+                        raise DuplicateCandidateKeyError(
+                            existing_id=guard_row['id'],
+                            existing_status=guard_row['status'],
+                            tag=tag,
+                            candidate_key=candidate_key,
+                        )
+
                 await conn.execute(
                     """
                         INSERT INTO tasks (tag, id, title, description,
@@ -1760,6 +2034,38 @@ class SqliteTaskBackend:
                 )
                 set_columns.append('candidate_key = ?')
                 set_values.append(new_candidate_key)
+
+                # Index-independent dedup guard (fm-task-dedup self-heal
+                # amendment): mirrors add_task's pre-INSERT guard. The v3->v4
+                # partial UNIQUE index is self-gating — a flagged residual
+                # leaves it ABSENT indefinitely (reify incident
+                # esc-candidate-key-migration-2) — so this SELECT is the
+                # only backstop against reactivating the recomputed key onto
+                # another non-cancelled row during that window. Same typed
+                # error the post-UPDATE IntegrityError mapping below raises
+                # when the index IS present, so callers need no changes
+                # regardless of which path catches the collision. Excludes
+                # this row's own id — an update that recomputes to the key
+                # it already holds is not a collision. Gated on
+                # `_candidate_key_index_cache` (reviewer follow-up) — see
+                # add_task's identical guard for why this SELECT is skipped
+                # once the index is confirmed present.
+                if new_candidate_key is not None and not self._candidate_key_index_cache.get(
+                    project_root, False,
+                ):
+                    guard_cursor = await conn.execute(
+                        "SELECT id, status FROM tasks WHERE tag = ? AND candidate_key = ? "
+                        "AND status != 'cancelled' AND id != ? ORDER BY id LIMIT 1",
+                        (tag, new_candidate_key, tid),
+                    )
+                    guard_row = await guard_cursor.fetchone()
+                    if guard_row is not None:
+                        raise DuplicateCandidateKeyError(
+                            existing_id=guard_row['id'],
+                            existing_status=guard_row['status'],
+                            tag=tag,
+                            candidate_key=new_candidate_key,
+                        )
 
             # updated_at always advances, even on a no-op write — matches
             # the original behaviour and avoids surprising "stale" reads.

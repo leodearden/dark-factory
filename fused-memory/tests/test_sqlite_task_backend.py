@@ -7,6 +7,7 @@ import json
 import logging
 import re
 from pathlib import Path
+from typing import Any
 
 import pytest
 import pytest_asyncio
@@ -14,6 +15,7 @@ from pydantic import ValidationError
 
 from fused_memory.backends.sqlite_task_backend import (
     SqliteTaskBackend,
+    _classify_residual_group,
     _format_task_id,
     _merge_metadata,
     _parse_qualified_dep,
@@ -2191,11 +2193,15 @@ def _make_v1_schema_db_no_candidate_key(db_path: Path) -> None:
     through the parent_id->flat migration but predates candidate_key.
 
     Rows:
-      id=1: non-cancelled, title='Fix the bug',    files=[a.py, b.py]
-      id=2: non-cancelled, title='fix   the  bug' (extra internal whitespace
-            + different case), files=[b.py, a.py] (swapped order) —
-            normalizes to the SAME candidate_key as id=1 (one duplicate
-            group of size 2).
+      id=1: non-cancelled (pending), title='Fix the bug', files=[a.py, b.py]
+      id=2: non-cancelled (``done``), title='fix   the  bug' (extra internal
+            whitespace + different case), files=[b.py, a.py] (swapped
+            order) — normalizes to the SAME candidate_key as id=1 (one
+            duplicate group of size 2). Status is deliberately ``done``
+            (fm-task-dedup self-heal amendment) so ``_classify_residual_group``
+            flags this group as ``mixed_status`` rather than auto-healing
+            it — the tests seeding this fixture assert the pre-self-heal
+            skip+escalate outcome (user_version stays at 3, no index).
       id=3: CANCELLED, same title+files as id=1 — must NOT backfill/count.
       id=4: non-cancelled, unique title+files — no duplicate.
     """
@@ -2232,7 +2238,7 @@ def _make_v1_schema_db_no_candidate_key(db_path: Path) -> None:
     """)
     rows = [
         (1, 'Fix the bug', 'pending', {'files': ['a.py', 'b.py']}),
-        (2, 'fix   the  bug', 'in-progress', {'files': ['b.py', 'a.py']}),
+        (2, 'fix   the  bug', 'done', {'files': ['b.py', 'a.py']}),
         (3, 'Fix the bug', 'cancelled', {'files': ['a.py', 'b.py']}),
         (4, 'Totally different task', 'pending', {'files': ['z.py']}),
     ]
@@ -2463,6 +2469,162 @@ async def test_v2_to_v3_migration_clean_audit_logs_info_with_zero_duplicates(
     )
 
 
+def _dup_row(
+    task_id: int, title: str, status: str, files: list[str], candidate_key: str | None = None,
+) -> dict[str, Any]:
+    """Build one pure dict-like residual-group row for
+    ``_classify_residual_group`` tests (no DB involved).
+
+    ``candidate_key`` defaults to the REAL recompute of ``(title, files)`` —
+    the common case where the stored key still accurately reflects the row's
+    current content. Pass an explicit value to simulate a stale/
+    title-divergent stored key (mirrors the 5-tuple override accepted by
+    ``_make_v3_db_with_dup_groups``).
+    """
+    return {
+        'id': task_id,
+        'title': title,
+        'status': status,
+        'metadata': json.dumps({'files': files}) if files else None,
+        'candidate_key': (
+            candidate_key if candidate_key is not None
+            else compute_candidate_key(title, files)
+        ),
+    }
+
+
+class TestClassifyResidualGroup:
+    """Pure (no DB) tests for the v3->v4 self-heal classifier.
+
+    ``_classify_residual_group`` consumes the non-cancelled rows of ONE
+    residual (tag, candidate_key) duplicate group and decides whether it is
+    safe to auto-heal (cancel all but a canonical survivor) or must be
+    flagged for human review.
+    """
+
+    def test_all_active_identical_title_heals_preferring_lowest_in_progress(self):
+        """canonical prefers the lowest-id IN-PROGRESS row over pending rows,
+        even when a lower pending id exists."""
+        rows = [
+            _dup_row(5, 'Fix the bug', 'pending', ['a.py']),
+            _dup_row(3, 'Fix the bug', 'in-progress', ['a.py']),
+            _dup_row(9, 'Fix the bug', 'pending', ['a.py']),
+        ]
+        assert _classify_residual_group(rows) == ('heal', 3, [5, 9])
+
+    def test_all_active_no_in_progress_heals_preferring_lowest_id(self):
+        """No in-progress row in the group -> canonical falls back to the
+        lowest id overall."""
+        rows = [
+            _dup_row(7, 'Fix the bug', 'pending', ['a.py']),
+            _dup_row(4, 'Fix the bug', 'blocked', ['a.py']),
+        ]
+        assert _classify_residual_group(rows) == ('heal', 4, [7])
+
+    def test_group_containing_done_row_is_flagged_mixed_status(self):
+        """A `done` row anywhere in the group blocks auto-heal — cancelling
+        completed work needs a human, even though the candidate_key matches."""
+        rows = [
+            _dup_row(2, 'Fix the bug', 'done', ['a.py']),
+            _dup_row(6, 'Fix the bug', 'pending', ['a.py']),
+        ]
+        assert _classify_residual_group(rows) == ('flag', 'mixed_status')
+
+    def test_title_divergent_stale_key_group_is_flagged(self):
+        """Rows sharing a STORED candidate_key that no longer matches a fresh
+        recompute of (title, files) are NOT a genuine content-duplicate —
+        flag rather than heal."""
+        shared_stale_key = 'stale1234567890a'
+        rows = [
+            _dup_row(1, 'Fix the bug', 'pending', ['a.py'], candidate_key=shared_stale_key),
+            _dup_row(
+                2, 'Totally different task', 'pending', ['z.py'],
+                candidate_key=shared_stale_key,
+            ),
+        ]
+        assert _classify_residual_group(rows) == ('flag', 'title_divergent')
+
+
+def _make_v3_db_with_dup_groups(
+    db_path: Path,
+    rows: list[tuple[int, str, str, list[str]] | tuple[int, str, str, list[str], str]],
+) -> None:
+    """Create a tasks.db seeded directly at schema v3: ``candidate_key``
+    column present and backfilled, id_counters seeded, NO
+    ``ux_tasks_candidate_key`` index — the exact shape the v3->v4 self-heal
+    migration step (and the live ``reaudit_candidate_key_index`` re-run)
+    classifies and acts on.
+
+    Mirrors ``_make_v1_schema_db_no_candidate_key`` but seeds straight at
+    ``user_version = 3`` with the full v3 column set (including
+    ``claimant_run_id``/``heartbeat_at``, present on any real v3 DB since the
+    v1->v2 step necessarily ran first in the cumulative chain) so these tests
+    drive the v3->v4 step in isolation without re-exercising v1->v2->v3.
+
+    ``rows`` entries are ``(id, title, status, files)`` — the stored
+    ``candidate_key`` is backfilled via ``compute_candidate_key(title,
+    files)``, exactly like a real v2->v3 backfill would — or the 5-tuple
+    ``(id, title, status, files, explicit_candidate_key)``, which stores
+    ``explicit_candidate_key`` verbatim regardless of what ``(title, files)``
+    would recompute to. The 5-tuple form is how a test seeds a title-divergent
+    / stale-key group: rows whose STORED candidate_key collides (same
+    explicit value) but whose current (title, files) recompute to DIFFERENT
+    keys.
+    """
+    import sqlite3
+
+    db_path.parent.mkdir(parents=True, exist_ok=True)
+    conn = sqlite3.connect(str(db_path))
+    conn.executescript("""
+        CREATE TABLE IF NOT EXISTS tasks (
+            tag             TEXT NOT NULL DEFAULT 'master',
+            id              INTEGER NOT NULL,
+            title           TEXT NOT NULL,
+            description     TEXT,
+            details         TEXT,
+            test_strategy   TEXT,
+            status          TEXT NOT NULL,
+            priority        TEXT,
+            metadata        TEXT,
+            updated_at      TEXT NOT NULL,
+            claimant_run_id TEXT,
+            heartbeat_at    TEXT,
+            candidate_key   TEXT,
+            PRIMARY KEY (tag, id)
+        );
+        CREATE INDEX IF NOT EXISTS ix_tasks_status ON tasks (tag, status);
+        CREATE TABLE IF NOT EXISTS dependencies (
+            tag        TEXT NOT NULL DEFAULT 'master',
+            task_id    INTEGER NOT NULL,
+            depends_on INTEGER NOT NULL,
+            PRIMARY KEY (tag, task_id, depends_on)
+        );
+        CREATE TABLE IF NOT EXISTS id_counters (
+            tag    TEXT NOT NULL DEFAULT 'master',
+            max_id INTEGER NOT NULL DEFAULT 0,
+            PRIMARY KEY (tag)
+        );
+    """)
+    max_id = 0
+    for row in rows:
+        if len(row) == 5:
+            task_id, title, status, files, candidate_key = row
+        else:
+            task_id, title, status, files = row
+            candidate_key = compute_candidate_key(title, files)
+        metadata = json.dumps({'files': files}) if files else None
+        conn.execute(
+            "INSERT INTO tasks (tag, id, title, status, metadata, updated_at, candidate_key) "
+            "VALUES ('master', ?, ?, ?, ?, '2026-01-01T00:00:00.000Z', ?)",
+            (task_id, title, status, metadata, candidate_key),
+        )
+        max_id = max(max_id, task_id)
+    conn.execute("INSERT INTO id_counters (tag, max_id) VALUES ('master', ?)", (max_id,))
+    conn.execute('PRAGMA user_version = 3')
+    conn.commit()
+    conn.close()
+
+
 @pytest.mark.asyncio
 async def test_v3_to_v4_migration_clean_audit_builds_partial_unique_index(
     backend, project_root,
@@ -2589,7 +2751,10 @@ async def test_v3_to_v4_self_gating_skips_index_and_escalates_on_residual_duplic
     called_project_root, residual_groups = recorded[0]
     assert called_project_root == project_root
     assert residual_groups == [
-        {'tag': 'master', 'candidate_key': expected_key, 'task_ids': ['1', '2'], 'count': 2},
+        {
+            'tag': 'master', 'candidate_key': expected_key,
+            'task_ids': ['1', '2'], 'count': 2, 'reason': 'mixed_status',
+        },
     ], residual_groups
 
 
@@ -2656,6 +2821,524 @@ async def test_v3_to_v4_raising_escalation_cb_is_caught_and_logged(tmp_path, cap
         'Expected the callback failure to be logged with exc_info (via '
         'logger.exception) so the traceback is captured'
     )
+
+
+@pytest.mark.asyncio
+async def test_v3_to_v4_self_heal_cancels_non_canonical_and_builds_index(
+    tmp_path, caplog,
+):
+    """A genuine content-duplicate residual group (all-active, identical
+    normalized title+files, no ``done`` row) is auto-healed at
+    connection-open: every non-canonical row is cancelled with a durable
+    ``auto_cancelled_by_self_heal`` metadata provenance stamp, the canonical
+    (lowest-id in-progress) row survives untouched, the escalation callback
+    is never invoked (nothing ambiguous to flag), and — since no residual
+    remains after healing — the partial UNIQUE index is built and
+    user_version advances to 4 in the SAME connection-open, with no restart.
+    This is the fix for reify incident esc-candidate-key-migration-2 (37 dup
+    groups / 58 rows previously required a manual set_task_status cancel
+    plus a server restart).
+    """
+    import sqlite3
+
+    project_root = str(tmp_path / 'proj')
+    db_path = Path(project_root) / '.taskmaster' / 'tasks' / 'tasks.db'
+    _make_v3_db_with_dup_groups(
+        db_path,
+        [
+            (1, 'Fix the bug', 'pending', ['a.py', 'b.py']),
+            (2, 'fix   the  bug', 'in-progress', ['a.py', 'b.py']),
+            (3, 'Totally different task', 'pending', ['z.py']),
+        ],
+    )
+
+    recorded: list[tuple[str, list[dict]]] = []
+
+    def recording_stub(project_root_arg, residual_groups):
+        recorded.append((project_root_arg, residual_groups))
+
+    cfg = TaskmasterConfig(project_root=str(tmp_path))
+    b = SqliteTaskBackend(cfg, residual_dup_escalation_cb=recording_stub)
+    await b.start()
+    try:
+        with caplog.at_level(
+            logging.INFO, logger='fused_memory.backends.sqlite_task_backend',
+        ):
+            # Triggers connection-open (_migrate); must not raise.
+            await b.get_tasks(project_root=project_root)
+    finally:
+        await b.close()
+
+    expected_key = compute_candidate_key('Fix the bug', ['a.py', 'b.py'])
+
+    conn = sqlite3.connect(str(db_path))
+    try:
+        conn.row_factory = sqlite3.Row
+        indexes = {row[1] for row in conn.execute('PRAGMA index_list(tasks)')}
+        user_version = conn.execute('PRAGMA user_version').fetchone()[0]
+        rows = {
+            row['id']: row
+            for row in conn.execute(
+                "SELECT id, status, metadata FROM tasks WHERE tag='master'",
+            )
+        }
+    finally:
+        conn.close()
+
+    # (a) the non-canonical row (id=1, pending) is auto-cancelled ...
+    assert rows[1]['status'] == 'cancelled', rows[1]['status']
+    # (b) ... while the canonical (lowest-id in-progress) row survives
+    # non-cancelled, untouched otherwise.
+    assert rows[2]['status'] == 'in-progress', rows[2]['status']
+    # ... and the unrelated unique row is unaffected.
+    assert rows[3]['status'] == 'pending', rows[3]['status']
+
+    # (c) the cancelled row's metadata carries a durable provenance stamp
+    # naming the canonical survivor and the shared candidate_key — the
+    # human sign-off this self-heal replaces.
+    cancelled_metadata = json.loads(rows[1]['metadata'])
+    stamp = cancelled_metadata.get('auto_cancelled_by_self_heal')
+    assert stamp is not None, cancelled_metadata
+    assert stamp['canonical_id'] == 2, stamp
+    assert stamp['candidate_key'] == expected_key, stamp
+    # Original metadata content survives the merge.
+    assert cancelled_metadata['files'] == ['a.py', 'b.py'], cancelled_metadata
+
+    # (d) no residual remains after healing, so the partial UNIQUE index IS
+    # built and user_version advances to 4 in this SAME connection-open —
+    # no restart required.
+    assert 'ux_tasks_candidate_key' in indexes, (
+        f'Expected the index to be built once the residual is self-healed; got {indexes}'
+    )
+    assert user_version == 4, (
+        f'Expected user_version=4 after a fully self-healed residual; got {user_version}'
+    )
+
+    # (e) nothing ambiguous here — the escalation callback must NOT fire.
+    assert recorded == [], (
+        f'Expected no escalation for a genuine auto-healed group; got {recorded}'
+    )
+
+    # (f) a loud log names the healed group (canonical + cancelled ids).
+    heal_records = [
+        r for r in caplog.records
+        if r.levelno >= logging.INFO
+        and 'self-heal' in r.message
+        and expected_key in r.message
+    ]
+    assert len(heal_records) == 1, (
+        f'Expected exactly one self-heal log record; got {len(heal_records)}: '
+        f'{[r.message for r in caplog.records]}'
+    )
+    assert 'canonical' in heal_records[0].message.lower(), heal_records[0].message
+
+
+@pytest.mark.asyncio
+async def test_v3_to_v4_mixed_status_group_is_flagged_with_reason(tmp_path):
+    """A duplicate group containing a ``done`` row is NOT auto-healed —
+    cancelling completed work needs a human even though the content
+    genuinely matches. The group is left untouched, the index build is
+    skipped, and the escalation callback receives the group tagged
+    ``reason == 'mixed_status'``.
+    """
+    import sqlite3
+
+    project_root = str(tmp_path / 'proj')
+    db_path = Path(project_root) / '.taskmaster' / 'tasks' / 'tasks.db'
+    _make_v3_db_with_dup_groups(
+        db_path,
+        [
+            (1, 'Fix the bug', 'done', ['a.py']),
+            (2, 'Fix the bug', 'pending', ['a.py']),
+        ],
+    )
+
+    recorded: list[tuple[str, list[dict]]] = []
+
+    def recording_stub(project_root_arg, residual_groups):
+        recorded.append((project_root_arg, residual_groups))
+
+    cfg = TaskmasterConfig(project_root=str(tmp_path))
+    b = SqliteTaskBackend(cfg, residual_dup_escalation_cb=recording_stub)
+    await b.start()
+    try:
+        await b.get_tasks(project_root=project_root)  # must not raise
+    finally:
+        await b.close()
+
+    expected_key = compute_candidate_key('Fix the bug', ['a.py'])
+
+    conn = sqlite3.connect(str(db_path))
+    try:
+        indexes = {row[1] for row in conn.execute('PRAGMA index_list(tasks)')}
+        user_version = conn.execute('PRAGMA user_version').fetchone()[0]
+        statuses = dict(conn.execute("SELECT id, status FROM tasks WHERE tag='master'"))
+    finally:
+        conn.close()
+
+    # Neither row is cancelled — mixed-status groups are left for a human.
+    assert statuses == {1: 'done', 2: 'pending'}, statuses
+    assert not any('candidate_key' in idx for idx in indexes), indexes
+    assert user_version == 3, user_version
+
+    assert len(recorded) == 1, recorded
+    _, residual_groups = recorded[0]
+    assert residual_groups == [
+        {
+            'tag': 'master', 'candidate_key': expected_key,
+            'task_ids': ['1', '2'], 'count': 2, 'reason': 'mixed_status',
+        },
+    ], residual_groups
+
+
+@pytest.mark.asyncio
+async def test_v3_to_v4_title_divergent_group_is_flagged_with_reason(tmp_path):
+    """Rows sharing a STORED candidate_key that no longer matches a fresh
+    recompute of (title, files) are not a genuine content-duplicate — the
+    group is flagged (``reason == 'title_divergent'``), not healed.
+    """
+    import sqlite3
+
+    project_root = str(tmp_path / 'proj')
+    db_path = Path(project_root) / '.taskmaster' / 'tasks' / 'tasks.db'
+    stale_key = 'stale1234567890a'
+    _make_v3_db_with_dup_groups(
+        db_path,
+        [
+            (1, 'Fix the bug', 'pending', ['a.py'], stale_key),
+            (2, 'Totally different task', 'pending', ['z.py'], stale_key),
+        ],
+    )
+
+    recorded: list[tuple[str, list[dict]]] = []
+
+    def recording_stub(project_root_arg, residual_groups):
+        recorded.append((project_root_arg, residual_groups))
+
+    cfg = TaskmasterConfig(project_root=str(tmp_path))
+    b = SqliteTaskBackend(cfg, residual_dup_escalation_cb=recording_stub)
+    await b.start()
+    try:
+        await b.get_tasks(project_root=project_root)  # must not raise
+    finally:
+        await b.close()
+
+    conn = sqlite3.connect(str(db_path))
+    try:
+        indexes = {row[1] for row in conn.execute('PRAGMA index_list(tasks)')}
+        user_version = conn.execute('PRAGMA user_version').fetchone()[0]
+        statuses = dict(conn.execute("SELECT id, status FROM tasks WHERE tag='master'"))
+    finally:
+        conn.close()
+
+    assert statuses == {1: 'pending', 2: 'pending'}, statuses
+    assert not any('candidate_key' in idx for idx in indexes), indexes
+    assert user_version == 3, user_version
+
+    assert len(recorded) == 1, recorded
+    _, residual_groups = recorded[0]
+    assert residual_groups == [
+        {
+            'tag': 'master', 'candidate_key': stale_key,
+            'task_ids': ['1', '2'], 'count': 2, 'reason': 'title_divergent',
+        },
+    ], residual_groups
+
+
+@pytest.mark.asyncio
+async def test_v3_to_v4_mixed_db_heals_genuine_while_flagging_ambiguous(tmp_path):
+    """A DB holding BOTH a genuine all-active duplicate group AND a flagged
+    (mixed-status) group: the genuine group's non-canonical row IS
+    cancelled, while the flagged group is left untouched and escalated —
+    and since a residual (the flagged group) remains, the index build is
+    STILL skipped and user_version stays at 3.
+    """
+    import sqlite3
+
+    project_root = str(tmp_path / 'proj')
+    db_path = Path(project_root) / '.taskmaster' / 'tasks' / 'tasks.db'
+    _make_v3_db_with_dup_groups(
+        db_path,
+        [
+            (1, 'Fix the bug', 'pending', ['a.py', 'b.py']),
+            (2, 'fix   the  bug', 'in-progress', ['a.py', 'b.py']),
+            (3, 'Add feature', 'done', ['c.py']),
+            (4, 'Add feature', 'pending', ['c.py']),
+        ],
+    )
+
+    recorded: list[tuple[str, list[dict]]] = []
+
+    def recording_stub(project_root_arg, residual_groups):
+        recorded.append((project_root_arg, residual_groups))
+
+    cfg = TaskmasterConfig(project_root=str(tmp_path))
+    b = SqliteTaskBackend(cfg, residual_dup_escalation_cb=recording_stub)
+    await b.start()
+    try:
+        await b.get_tasks(project_root=project_root)  # must not raise
+    finally:
+        await b.close()
+
+    flagged_key = compute_candidate_key('Add feature', ['c.py'])
+
+    conn = sqlite3.connect(str(db_path))
+    try:
+        indexes = {row[1] for row in conn.execute('PRAGMA index_list(tasks)')}
+        user_version = conn.execute('PRAGMA user_version').fetchone()[0]
+        statuses = dict(conn.execute("SELECT id, status FROM tasks WHERE tag='master'"))
+    finally:
+        conn.close()
+
+    # The genuine group healed: id=1 (pending, non-canonical) cancelled,
+    # id=2 (in-progress, canonical) survives.
+    assert statuses[1] == 'cancelled', statuses
+    assert statuses[2] == 'in-progress', statuses
+    # The flagged (mixed-status) group is untouched.
+    assert statuses[3] == 'done', statuses
+    assert statuses[4] == 'pending', statuses
+
+    # A residual (the flagged group) remains, so the index is STILL skipped.
+    assert not any('candidate_key' in idx for idx in indexes), indexes
+    assert user_version == 3, user_version
+
+    # Escalation carries ONLY the flagged group, not the healed one.
+    assert len(recorded) == 1, recorded
+    _, residual_groups = recorded[0]
+    assert residual_groups == [
+        {
+            'tag': 'master', 'candidate_key': flagged_key,
+            'task_ids': ['3', '4'], 'count': 2, 'reason': 'mixed_status',
+        },
+    ], residual_groups
+
+
+# ── rebuild-without-restart: live re-audit (task 2402) ──────────────────
+
+
+@pytest.mark.asyncio
+async def test_reaudit_candidate_key_index_builds_on_live_connection_without_restart(
+    tmp_path,
+):
+    """A running server holding a pre-audit cached connection never re-runs
+    ``_migrate_v3_to_v4`` on its own (it only fires at connection-open) --
+    reproducing the incident's second failure mode. ``reaudit_candidate_key_index``
+    closes that gap: called on the SAME live backend after an operator
+    resolves the residual (no reopen/restart), it re-runs the self-heal audit
+    and lands the index. A second call is an idempotent no-op.
+    """
+    import sqlite3
+
+    project_root = str(tmp_path / 'proj')
+    db_path = Path(project_root) / '.taskmaster' / 'tasks' / 'tasks.db'
+    _make_v3_db_with_dup_groups(
+        db_path,
+        [
+            # Mixed-status flagged group -- blocks the index build at
+            # connection-open.
+            (1, 'Ambiguous task', 'done', ['x.py']),
+            (2, 'Ambiguous task', 'pending', ['x.py']),
+        ],
+    )
+
+    cfg = TaskmasterConfig(project_root=str(tmp_path))
+    b = SqliteTaskBackend(cfg)
+    await b.start()
+    try:
+        # Connection-open migration: flags the group, skips the index build.
+        await b.get_tasks(project_root=project_root)
+
+        conn = sqlite3.connect(str(db_path))
+        try:
+            indexes = {row[1] for row in conn.execute('PRAGMA index_list(tasks)')}
+            user_version = conn.execute('PRAGMA user_version').fetchone()[0]
+        finally:
+            conn.close()
+        assert not any('candidate_key' in idx for idx in indexes), (
+            f'Precondition: the index must be ABSENT before the re-audit; got {indexes}'
+        )
+        assert user_version == 3, user_version
+
+        # Operator resolves the residual on the SAME live backend -- no
+        # reopen/restart anywhere in this test.
+        await b.set_task_status('2', 'cancelled', project_root=project_root)
+
+        result = await b.reaudit_candidate_key_index(project_root)
+        assert result['index_built'] is True, result
+
+        conn = sqlite3.connect(str(db_path))
+        try:
+            indexes = {row[1] for row in conn.execute('PRAGMA index_list(tasks)')}
+            user_version = conn.execute('PRAGMA user_version').fetchone()[0]
+        finally:
+            conn.close()
+        assert any('candidate_key' in idx for idx in indexes), (
+            f'Expected ux_tasks_candidate_key to be built by the live re-audit; got {indexes}'
+        )
+        assert user_version == 4, user_version
+
+        # Idempotent second call -- already at v4, no-op.
+        result2 = await b.reaudit_candidate_key_index(project_root)
+        assert result2['index_built'] is True, result2
+        assert result2.get('already_at_v4') is True, result2
+    finally:
+        await b.close()
+
+
+# ── index-independent write-path dedup (fm-task-dedup self-heal amendment) ──
+
+
+@pytest.mark.asyncio
+async def test_add_task_dedup_guard_rejects_duplicate_when_index_absent(tmp_path):
+    """Reproduces the incident's exact condition: a flagged residual group
+    blocks the v3->v4 partial UNIQUE index build (``ux_tasks_candidate_key``
+    stays absent, user_version stays at 3), yet a SEPARATE, unrelated
+    non-cancelled row R still must not be duplicated — the index-independent
+    pre-INSERT SELECT guard in ``add_task`` catches the collision even with
+    no DB-level UNIQUE backstop.
+    """
+    import sqlite3
+
+    from fused_memory.backends.task_backend_errors import DuplicateCandidateKeyError
+
+    project_root = str(tmp_path / 'proj')
+    db_path = Path(project_root) / '.taskmaster' / 'tasks' / 'tasks.db'
+    _make_v3_db_with_dup_groups(
+        db_path,
+        [
+            # Flagged (mixed-status) group -- unrelated to R, keeps the
+            # v3->v4 index build skipped so this test exercises the
+            # index-ABSENT window.
+            (1, 'Ambiguous task', 'done', ['x.py']),
+            (2, 'Ambiguous task', 'pending', ['x.py']),
+            # R: a normal, unique, non-cancelled row.
+            (3, 'Existing unique task', 'pending', ['r.py']),
+        ],
+    )
+
+    cfg = TaskmasterConfig(project_root=str(tmp_path))
+    b = SqliteTaskBackend(cfg)
+    await b.start()
+    try:
+        # Triggers connection-open migration: flags the group, skips the
+        # index build.
+        await b.get_tasks(project_root=project_root)
+
+        conn = sqlite3.connect(str(db_path))
+        try:
+            indexes = {row[1] for row in conn.execute('PRAGMA index_list(tasks)')}
+            user_version = conn.execute('PRAGMA user_version').fetchone()[0]
+        finally:
+            conn.close()
+        assert not any('candidate_key' in idx for idx in indexes), (
+            f'Precondition: the index must be ABSENT for this test to '
+            f'exercise the index-independent guard; got {indexes}'
+        )
+        assert user_version == 3, user_version
+
+        with pytest.raises(DuplicateCandidateKeyError) as exc_info:
+            await b.add_task(
+                project_root=project_root,
+                title='Existing unique task',
+                metadata=json.dumps({'files': ['r.py']}),
+            )
+        exc = exc_info.value
+        assert exc.existing_id == 3, f'Expected the collision to name survivor id=3; got {exc.existing_id!r}'
+        assert exc.existing_status == 'pending', (
+            f'Expected the survivor status to be pending; got {exc.existing_status!r}'
+        )
+
+        r_key = compute_candidate_key('Existing unique task', ['r.py'])
+        listing = await b.get_tasks(project_root=project_root)
+        matching = [
+            t for t in listing['tasks']
+            if t['status'] != 'cancelled' and t.get('candidate_key') == r_key
+        ]
+        assert len(matching) == 1, (
+            f'Expected exactly one non-cancelled row with the colliding key '
+            f'(no orphan from the rejected insert); got {len(matching)}: {matching}'
+        )
+    finally:
+        await b.close()
+
+
+@pytest.mark.asyncio
+async def test_update_task_dedup_guard_rejects_recompute_collision_when_index_absent(
+    tmp_path,
+):
+    """Same incident condition as the add_task guard above, exercised on the
+    edit path: with the v3->v4 index build blocked by an unrelated flagged
+    residual group, an ``update_task`` recompute (title and/or metadata
+    touched) that lands on ANOTHER non-cancelled row's candidate_key must be
+    rejected before the UPDATE lands — no DB-level UNIQUE backstop exists
+    while the index is absent, so the pre-UPDATE SELECT guard is the only
+    thing preventing a silent duplicate reactivation.
+    """
+    import sqlite3
+
+    from fused_memory.backends.task_backend_errors import DuplicateCandidateKeyError
+
+    project_root = str(tmp_path / 'proj')
+    db_path = Path(project_root) / '.taskmaster' / 'tasks' / 'tasks.db'
+    _make_v3_db_with_dup_groups(
+        db_path,
+        [
+            # Flagged (mixed-status) group -- unrelated to A/B, keeps the
+            # v3->v4 index build skipped so this test exercises the
+            # index-ABSENT window.
+            (1, 'Ambiguous task', 'done', ['x.py']),
+            (2, 'Ambiguous task', 'pending', ['x.py']),
+            # A and B: two normal, distinct, non-cancelled rows.
+            (3, 'Task A', 'pending', ['a.py']),
+            (4, 'Task B', 'pending', ['b.py']),
+        ],
+    )
+
+    cfg = TaskmasterConfig(project_root=str(tmp_path))
+    b = SqliteTaskBackend(cfg)
+    await b.start()
+    try:
+        # Triggers connection-open migration: flags the group, skips the
+        # index build.
+        await b.get_tasks(project_root=project_root)
+
+        conn = sqlite3.connect(str(db_path))
+        try:
+            indexes = {row[1] for row in conn.execute('PRAGMA index_list(tasks)')}
+            user_version = conn.execute('PRAGMA user_version').fetchone()[0]
+        finally:
+            conn.close()
+        assert not any('candidate_key' in idx for idx in indexes), (
+            f'Precondition: the index must be ABSENT for this test to '
+            f'exercise the index-independent guard; got {indexes}'
+        )
+        assert user_version == 3, user_version
+
+        # Recompute B (id=4) onto A's (title, files) -- same candidate_key.
+        with pytest.raises(DuplicateCandidateKeyError) as exc_info:
+            await b.update_task(
+                task_id='4',
+                project_root=project_root,
+                title='Task A',
+                metadata=json.dumps({'files': ['a.py']}),
+            )
+        exc = exc_info.value
+        assert exc.existing_id == 3, f'Expected the collision to name survivor id=3; got {exc.existing_id!r}'
+        assert exc.existing_status == 'pending', (
+            f'Expected the survivor status to be pending; got {exc.existing_status!r}'
+        )
+
+        # B is unchanged -- the guard fired before the UPDATE landed.
+        b_task = await b.get_task(task_id='4', project_root=project_root)
+        assert b_task['title'] == 'Task B', (
+            f"Expected B's title untouched by the rejected update; got {b_task['title']!r}"
+        )
+        assert b_task['candidate_key'] == compute_candidate_key('Task B', ['b.py']), (
+            f"Expected B's candidate_key untouched by the rejected update; "
+            f"got {b_task['candidate_key']!r}"
+        )
+    finally:
+        await b.close()
 
 
 # ── candidate_key collision (fm-task-dedup W8 task A2) ───────────────

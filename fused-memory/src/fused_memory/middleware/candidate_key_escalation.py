@@ -66,8 +66,11 @@ def emit_residual_candidate_key_escalation(
     connection-open audit found.
 
     ``residual_groups`` entries carry ``tag``, ``candidate_key``,
-    ``task_ids`` (list[str]), and ``count`` — the same shape the migration's
-    ``GROUP_CONCAT``-based audit produces.
+    ``task_ids`` (list[str]), ``count``, and ``reason`` (``'mixed_status'``
+    | ``'title_divergent'``) — the migration (fm-task-dedup self-heal
+    amendment) auto-heals genuine content-duplicate groups itself and only
+    escalates the AMBIGUOUS remainder, so every group reaching here needs a
+    human, and ``reason`` says why.
 
     Returns the escalation id — either a freshly filed one, or the id of an
     already-open escalation for this condition when one exists (dedup, see
@@ -117,7 +120,8 @@ def emit_residual_candidate_key_escalation(
 
     groups_desc = '; '.join(
         f'tag={g.get("tag")!r} candidate_key={g.get("candidate_key")!r} '
-        f'task_ids={g.get("task_ids")!r} count={g.get("count")!r}'
+        f'task_ids={g.get("task_ids")!r} count={g.get("count")!r} '
+        f'reason={g.get("reason")!r}'
         for g in residual_groups
     )
     detail_lines = [
@@ -125,11 +129,17 @@ def emit_residual_candidate_key_escalation(
         f'residual_group_count={len(residual_groups)}',
         f'groups={groups_desc}',
         '',
-        'The v3->v4 schema migration (fm-task-dedup W8 task A2) found '
-        'non-cancelled rows sharing the same (tag, candidate_key) at '
-        'connection-open, so it skipped building the partial UNIQUE index '
-        'ux_tasks_candidate_key. Clean up the residual duplicates (cancel '
-        'or merge the extras in each group above) — the next '
+        'The v3->v4 schema migration (fm-task-dedup W8 task A2, self-heal '
+        'amendment) auto-healed every genuine content-duplicate group it '
+        'found (every row recomputes the same candidate_key, none done) — '
+        'the group(s) above are AMBIGUOUS and were left for a human: '
+        'reason=mixed_status means the group contains a done row '
+        '(cancelling completed work needs sign-off); '
+        'reason=title_divergent means the stored candidate_key no longer '
+        'matches a fresh recompute of that row\'s (title, files) (a stale '
+        'key, not a real content match). It skipped building the partial '
+        'UNIQUE index ux_tasks_candidate_key while any group above remains. '
+        'Resolve each (cancel or merge the extras) — the next '
         'connection-open will re-audit and land the index automatically.',
     ]
     detail = '\n'.join(detail_lines)
