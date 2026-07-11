@@ -12,6 +12,7 @@ from orchestrator.mcp.plan_tools import (
     _add_prerequisite,
     _add_reuse_item,
     _artifacts_from_args,
+    _coerce_files,
     _confirm_plan,
     _create_plan,
     _mark_step_done,
@@ -31,6 +32,42 @@ def artifacts(tmp_path):
     a = TaskArtifacts(tmp_path)
     a.init('test-1', 'Test task', 'A test')
     return a
+
+
+# ---------------------------------------------------------------------------
+# _coerce_files helper tests (task 2428)
+# ---------------------------------------------------------------------------
+
+
+class TestCoerceFiles:
+    """Unit tests for the ``files`` arg-recovery helper, independent of the
+    MCP tool/pydantic boundary (see the TestCreatePlanTool*/TestUpdatePlanMetadataTool*
+    boundary classes below for the pydantic-validation-path regression guards).
+    """
+
+    def test_none_returns_empty_list(self):
+        assert _coerce_files(None) == []
+
+    def test_list_passthrough(self):
+        assert _coerce_files(['a.py', 'b.py']) == ['a.py', 'b.py']
+
+    def test_json_array_string_recovered(self):
+        assert _coerce_files('["mod/a.py","mod/b.py"]') == ['mod/a.py', 'mod/b.py']
+
+    def test_comma_delimited_string_recovered(self):
+        assert _coerce_files('mod/a.py, mod/b.py') == ['mod/a.py', 'mod/b.py']
+
+    def test_newline_delimited_string_recovered(self):
+        assert _coerce_files('mod/a.py\nmod/b.py') == ['mod/a.py', 'mod/b.py']
+
+    def test_bare_json_string_recovered_as_single_path(self):
+        assert _coerce_files('"mod/a.py"') == ['mod/a.py']
+
+    def test_json_array_string_drops_blank_entries(self):
+        assert _coerce_files('["a.py", "  ", ""]') == ['a.py']
+
+    def test_list_entries_are_stripped(self):
+        assert _coerce_files([' a.py ', ' b.py ']) == ['a.py', 'b.py']
 
 
 # ---------------------------------------------------------------------------
