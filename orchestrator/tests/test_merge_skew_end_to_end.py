@@ -35,6 +35,7 @@ from orchestrator.event_store import EventStore, EventType
 from orchestrator.git_ops import GitOps, MergeResult
 from orchestrator.merge_disposition import MergeFailureDisposition
 from orchestrator.merge_queue import (
+    InflightEntry,
     MergeOutcome,
     MergeRequest,
     RealMergeItem,
@@ -346,3 +347,95 @@ class TestFirstAttemptSkewL1Escalation:
         assert topology['landing_sha'] in esc.detail, esc.detail
         assert 'src/x.py' in esc.detail, esc.detail
 
+
+# ---------------------------------------------------------------------------
+# Step-17 [I4 runs.db surface — merge_attempt carries disposition;
+# anti-orphan for γ (task 2384)]
+# ---------------------------------------------------------------------------
+
+
+class TestFirstAttemptSkewMergeAttemptDisposition:
+    """After a first-attempt skew failure is finalized through the REAL
+    SpeculativeMergeWorker._finalize_inflight, a merge_attempt event for the
+    branch's task_id must carry data['disposition']=='integration_skew' in
+    the shared EventStore — proving γ's runs.db disposition field (task
+    2384) is non-sentinel on the production skew path.  Control: on the
+    INDETERMINATE path (absent base facts, boundary row 4) no merge_attempt
+    row may carry a 'disposition' key at all — byte-identical to today."""
+
+    async def _finalize_via_real_worker(
+        self, tmp_path: Path, repo: Path, topology: dict[str, str],
+        store: EventStore, *, merged_branch_tip: str | None,
+    ) -> None:
+        git_ops = _make_git_ops(repo)
+        worker = SpeculativeMergeWorker(
+            git_ops=git_ops, queue=asyncio.Queue(), event_store=store,
+        )
+        alloc = MagicMock()
+        alloc.release = AsyncMock()
+        alloc.cancel_and_release = AsyncMock()
+        worker._host_allocator = alloc  # type: ignore[attr-defined]
+
+        lease = HostLease(name='local', runner=MagicMock(), is_local=True)
+        future: asyncio.Future = asyncio.get_running_loop().create_future()
+        _req, item = _make_item(
+            tmp_path, repo, topology, future,
+            merged_branch_tip=merged_branch_tip,
+        )
+        entry = InflightEntry(
+            item=item,
+            lease=lease,
+            verify_task=asyncio.ensure_future(worker._run_inflight_verify(item, lease)),
+            merge_wt=None,
+            was_speculative=False,
+            phase='verifying',
+        )
+        p1, p2 = _patched_verify_seams()
+        with p1, p2:
+            await worker._finalize_inflight(entry)
+
+    def test_first_attempt_skew_emits_merge_attempt_with_disposition(
+        self, tmp_path: Path,
+    ) -> None:
+        repo, topology, store = _setup_skew_scenario(tmp_path)
+
+        asyncio.run(
+            self._finalize_via_real_worker(
+                tmp_path, repo, topology, store,
+                merged_branch_tip=topology['branch_tip_sha'],
+            )
+        )
+
+        rows = [
+            r for r in store.fetch_events_by_type(EventType.merge_attempt)
+            if r['task_id'] == TASK_ID
+        ]
+        assert len(rows) == 1, f'Expected exactly one merge_attempt row; got {rows}'
+        assert rows[0]['data'].get('disposition') == 'integration_skew', (
+            f"Expected data['disposition']=='integration_skew'; got {rows[0]['data']!r}"
+        )
+
+    def test_indeterminate_first_attempt_emits_no_disposition_key(
+        self, tmp_path: Path,
+    ) -> None:
+        """merged_branch_tip=None -> base facts absent -> classification is
+        skipped inside _run_post_merge_verify (I3) -> disposition stays the
+        MergeOutcome default INDETERMINATE -> the guarded step-18 emit must
+        NOT fire (byte-identical to pre-β behaviour on this branch)."""
+        repo, topology, store = _setup_skew_scenario(tmp_path)
+
+        asyncio.run(
+            self._finalize_via_real_worker(
+                tmp_path, repo, topology, store,
+                merged_branch_tip=None,
+            )
+        )
+
+        rows_with_disposition = [
+            r for r in store.fetch_events_by_type(EventType.merge_attempt)
+            if r['task_id'] == TASK_ID and 'disposition' in (r['data'] or {})
+        ]
+        assert rows_with_disposition == [], (
+            f"Expected no merge_attempt row carrying a 'disposition' key on "
+            f"the INDETERMINATE path; got {rows_with_disposition}"
+        )
