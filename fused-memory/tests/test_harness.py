@@ -8229,7 +8229,6 @@ async def test_live_workflow_gate_drops_bare_orchestrator_signal_for_blocked_nor
 
     from escalation.queue import EscalationQueue  # type: ignore[import-untyped]
 
-    import fused_memory.reconciliation.harness as harness_module
     import fused_memory.services.live_workflow_detector as detector_module
     from fused_memory.reconciliation.harness import _INTEGRITY_FINDING_RECURRENCE_THRESHOLD
 
