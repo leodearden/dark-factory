@@ -289,3 +289,113 @@ class TestBuildScopeSnapshotMetadata:
             first['subject_description_fingerprint']
             == second['subject_description_fingerprint']
         )
+
+
+class TestSnapshotFreshness:
+    """Tests for _extract_task_fields(resp) and
+    snapshot_is_fresh(snapshot_metadata, live_task) -> bool."""
+
+    def test_extract_task_fields_handles_flat_sqlite_shape(self):
+        from fused_memory.reconciliation.scope_freshness import _extract_task_fields
+
+        task = {
+            'id': 2405,
+            'status': 'pending',
+            'updatedAt': '2026-07-10T10:00:00Z',
+            'description': 'd',
+            'metadata': {'foo': 'bar'},
+        }
+        assert _extract_task_fields(task) == (
+            'pending', '2026-07-10T10:00:00Z', 'd', {'foo': 'bar'},
+        )
+
+    def test_extract_task_fields_handles_data_envelope(self):
+        from fused_memory.reconciliation.scope_freshness import _extract_task_fields
+
+        resp = {
+            'data': {
+                'status': 'pending',
+                'updatedAt': '2026-07-10T10:00:00Z',
+                'description': 'd',
+                'metadata': {'foo': 'bar'},
+            },
+        }
+        assert _extract_task_fields(resp) == (
+            'pending', '2026-07-10T10:00:00Z', 'd', {'foo': 'bar'},
+        )
+
+    def test_extract_task_fields_tolerates_missing_metadata(self):
+        from fused_memory.reconciliation.scope_freshness import _extract_task_fields
+
+        status, updated_at, description, metadata = _extract_task_fields(
+            {'status': 'pending', 'updatedAt': 't0', 'description': 'd'},
+        )
+        assert (status, updated_at, description) == ('pending', 't0', 'd')
+        assert metadata == {}
+
+    def _snapshot_meta(self, **overrides):
+        from fused_memory.reconciliation.scope_freshness import (
+            build_scope_snapshot_metadata,
+        )
+
+        kwargs = {
+            'task_ref': 'dark_factory:2405',
+            'flag_key': 'cross_project',
+            'subject_project_id': 'dark_factory',
+            'subject_task_id': '2405',
+            'status': 'pending',
+            'updated_at': '2026-07-10T10:00:00Z',
+            'description': 'd',
+            'run_id': 'run-0',
+            'snapshot_at': '2026-07-10T14:29:33Z',
+        }
+        kwargs.update(overrides)
+        return build_scope_snapshot_metadata(**kwargs)
+
+    def test_fresh_when_status_updated_at_and_description_all_match(self):
+        from fused_memory.reconciliation.scope_freshness import snapshot_is_fresh
+
+        snapshot_meta = self._snapshot_meta()
+        live_task = {
+            'status': 'pending', 'updatedAt': '2026-07-10T10:00:00Z', 'description': 'd',
+        }
+        assert snapshot_is_fresh(snapshot_meta, live_task) is True
+
+    def test_not_fresh_when_updated_at_advanced(self):
+        from fused_memory.reconciliation.scope_freshness import snapshot_is_fresh
+
+        snapshot_meta = self._snapshot_meta()
+        live_task = {
+            'status': 'pending', 'updatedAt': '2026-07-11T00:00:00Z', 'description': 'd',
+        }
+        assert snapshot_is_fresh(snapshot_meta, live_task) is False
+
+    def test_not_fresh_when_status_differs(self):
+        from fused_memory.reconciliation.scope_freshness import snapshot_is_fresh
+
+        snapshot_meta = self._snapshot_meta()
+        live_task = {
+            'status': 'in-progress', 'updatedAt': '2026-07-10T10:00:00Z', 'description': 'd',
+        }
+        assert snapshot_is_fresh(snapshot_meta, live_task) is False
+
+    def test_not_fresh_when_description_differs(self):
+        from fused_memory.reconciliation.scope_freshness import snapshot_is_fresh
+
+        snapshot_meta = self._snapshot_meta()
+        live_task = {
+            'status': 'pending', 'updatedAt': '2026-07-10T10:00:00Z',
+            'description': 'a materially different description',
+        }
+        assert snapshot_is_fresh(snapshot_meta, live_task) is False
+
+    def test_not_fresh_when_snapshot_missing_subject_fields(self):
+        from fused_memory.reconciliation.scope_freshness import snapshot_is_fresh
+
+        live_task = {
+            'status': 'pending', 'updatedAt': '2026-07-10T10:00:00Z', 'description': 'd',
+        }
+        assert snapshot_is_fresh({}, live_task) is False
+        assert snapshot_is_fresh(
+            {'subject_status': 'pending'}, live_task,
+        ) is False
