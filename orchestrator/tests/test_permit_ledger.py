@@ -466,7 +466,6 @@ class TestPermitStorageSlot:
             verify_task=None,
             merge_wt=None,
             was_speculative=False,
-            phase='passthrough',
             permit=p,
         )
 
@@ -489,7 +488,6 @@ class TestPermitStorageSlot:
             verify_task=None,
             merge_wt=None,
             was_speculative=False,
-            phase='passthrough',
         )
 
         assert entry.permit is None

@@ -267,7 +267,6 @@ def _make_inflight_entry(
         verify_task=_SENTINEL_VERIFY_TASK if verifying else None,  # type: ignore[arg-type]
         merge_wt=None,
         was_speculative=False,
-        phase='verifying',
     )
 
 
@@ -825,7 +824,7 @@ class TestScenario234VerifierLifecycleFaults:
 
         entry = InflightEntry(
             item=item, lease=lease, verify_task=_wrap_verify_result(result),
-            merge_wt=None, was_speculative=False, phase='verifying',
+            merge_wt=None, was_speculative=False,
         )
         advanced = await worker._finalize_inflight(entry)
         assert advanced is False
@@ -1002,7 +1001,7 @@ class TestScenario234VerifierLifecycleFaults:
 
         entry = InflightEntry(
             item=item, lease=lease, verify_task=_wrap_verify_result(result),
-            merge_wt=None, was_speculative=True, phase='verifying',
+            merge_wt=None, was_speculative=True,
             permit=permit,
         )
         advanced = await worker._finalize_inflight(entry)
@@ -1222,7 +1221,6 @@ class TestScenario7ItemShape:
                 verify_task=None,
                 merge_wt=None,
                 was_speculative=False,
-                phase='passthrough',
                 passthrough_outcome=MergeOutcome('conflict'),
             )
 

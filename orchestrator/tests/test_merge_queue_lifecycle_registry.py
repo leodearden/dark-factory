@@ -1132,7 +1132,7 @@ class TestFinalizeInflightRegistersFinalizingAndTerminal:
         lease = HostLease(name='local', runner=MagicMock(), is_local=True)
         entry = InflightEntry(
             item=item, lease=lease, verify_task=None,
-            merge_wt=item.merge_wt, was_speculative=False, phase='verifying',
+            merge_wt=item.merge_wt, was_speculative=False,
         )
 
         captured: list[tuple[Any, Any, bool]] = []
@@ -1194,7 +1194,7 @@ class TestFinalizeInflightRegistersFinalizingAndTerminal:
 
         entry = InflightEntry(
             item=decided, lease=None, verify_task=None, merge_wt=None,
-            was_speculative=False, phase='decided', passthrough_outcome=outcome,
+            was_speculative=False, passthrough_outcome=outcome,
         )
 
         observed: list[tuple[Any, Any]] = []
@@ -1262,7 +1262,7 @@ class TestFinalizeInflightRegistersFinalizingAndTerminal:
 
         entry = InflightEntry(
             item=item, lease=lease, verify_task=asyncio.ensure_future(_fake_ru_verify()),
-            merge_wt=item.merge_wt, was_speculative=False, phase='verifying',
+            merge_wt=item.merge_wt, was_speculative=False,
         )
 
         remerged = MagicMock(spec=SpeculativeItem)
@@ -1455,7 +1455,7 @@ class TestStopMidFlightRetiresEveryContainer:
         worker._register_item(item_infl, initial=ItemLifecycleState.VERIFYING)
         entry_infl = InflightEntry(
             item=item_infl, lease=None, verify_task=None, merge_wt=None,
-            was_speculative=False, phase='verifying',
+            was_speculative=False,
         )
         worker._inflight.append(entry_infl)
 
@@ -1720,7 +1720,7 @@ class TestAutoChainParentSupersededRetiresRegistry:
         lease = HostLease(name='local', runner=MagicMock(), is_local=True)
         entry = InflightEntry(
             item=item, lease=lease, verify_task=None,
-            merge_wt=item.merge_wt, was_speculative=False, phase='verifying',
+            merge_wt=item.merge_wt, was_speculative=False,
         )
 
         superseded_outcome = MergeOutcome('superseded', superseded_by='mr-fake-gen2')

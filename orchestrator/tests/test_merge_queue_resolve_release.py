@@ -263,7 +263,6 @@ class TestResolveAndReleaseContract:
             verify_task=None,
             merge_wt=item.merge_wt,
             was_speculative=False,
-            phase='finalizing',
         )
         outcome = MergeOutcome('blocked', reason='z')
 
@@ -542,7 +541,6 @@ def _make_decided_item_and_entry(
         verify_task=None,
         merge_wt=None,
         was_speculative=was_speculative,
-        phase='decided',
         passthrough_outcome=immediate_outcome,
     )
     return item, entry
@@ -691,7 +689,6 @@ class TestFinalizeHeadErrorChokepoint:
             verify_task=verify_task,
             merge_wt=item.merge_wt,
             was_speculative=True,
-            phase='finalizing',
             permit=permit,
         )
 
@@ -796,7 +793,6 @@ class TestFinalizeHeadErrorChokepoint:
             verify_task=verify_task,
             merge_wt=item.merge_wt,
             was_speculative=True,
-            phase='finalizing',
         )
 
         async def _dispatch_returns_entry(_item: Any) -> Any:

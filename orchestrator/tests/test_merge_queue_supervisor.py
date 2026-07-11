@@ -444,7 +444,6 @@ async def test_verifier_restart_preserves_inflight_and_redispatch(
         verify_task=None,
         merge_wt=None,
         was_speculative=False,
-        phase='VERIFY',
     )
 
     # Seed the instance deques

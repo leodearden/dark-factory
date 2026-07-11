@@ -465,7 +465,6 @@ class TestFinalizeHeadSpeculativeAccounting:
             verify_task=None,
             merge_wt=None,
             was_speculative=speculative,
-            phase='finalizing',
             permit=permit,
         )
 
@@ -489,7 +488,6 @@ class TestFinalizeHeadSpeculativeAccounting:
             verify_task=None,
             merge_wt=None,
             was_speculative=True,
-            phase='verifying',
             permit=await worker._speculation_ledger.acquire(),
         )
         _finalizing_entry = self._make_finalizing_entry(
@@ -603,7 +601,6 @@ class TestDispatchGapSpeculativeAccounting:
             verify_task=None,
             merge_wt=None,
             was_speculative=True,
-            phase='verifying',
             permit=await worker._speculation_ledger.acquire(),
         ))
 

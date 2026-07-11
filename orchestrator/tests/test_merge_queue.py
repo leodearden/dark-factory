@@ -21741,7 +21741,7 @@ class TestSnapshotInflightCollection:
         lease_local = HostLease(name='local', runner=fake_runner, is_local=True)
         entry_a = InflightEntry(
             item=item_a, lease=lease_local, verify_task=None, merge_wt=wt / 'a',
-            was_speculative=False, phase='verifying',
+            was_speculative=False,
             started_at=now - 5.0,  # RED: no started_at field on InflightEntry yet
         )
 
@@ -21755,7 +21755,7 @@ class TestSnapshotInflightCollection:
         lease_remote = HostLease(name='laptop', runner=fake_runner, is_local=False)
         entry_b = InflightEntry(
             item=item_b, lease=lease_remote, verify_task=None, merge_wt=wt / 'b',
-            was_speculative=False, phase='verifying',
+            was_speculative=False,
             started_at=now - 2.0,
         )
 
@@ -21785,26 +21785,19 @@ class TestSnapshotInflightCollection:
     async def test_snapshot_no_phantom_when_inflight_empty(
         self, tmp_path: Path, config: OrchestratorConfig, git_ops: GitOps,
     ) -> None:
-        """verify_in_progress is None when _inflight empty, even if _verify_item is stale.
+        """verify_in_progress is None when _inflight is empty.
 
-        RED (step-3): current snapshot reads _verify_item for verify_in_progress,
-        producing a phantom non-None entry when _verify_item is never cleared.
+        Historically the single-host _verify_item/_verify_phase fields were
+        set but never cleared, producing a phantom non-None verify_in_progress
+        here even with _inflight empty. Task lambda (2173) deleted those
+        fields — verify_in_progress now derives solely from
+        _inflight/_finalizing_head, so that phantom-entry class is
+        structurally impossible.
         """
 
         queue: asyncio.Queue[MergeRequest] = asyncio.Queue()
         worker = SpeculativeMergeWorker(git_ops, queue)
 
-        wt = tmp_path / 'wt'
-        wt.mkdir()
-
-        req_stale = _make_request('phantom', 'phantom', wt, config)
-        item_stale = DecidedItem(
-            request=req_stale,
-            immediate_outcome=MergeOutcome('blocked'),
-            base_sha='dead' * 10, speculative=False,
-        )
-        worker._verify_item = item_stale   # stale, never cleared -- the gamma latent bug
-        worker._verify_phase = 'verifying'
         # _inflight is EMPTY
 
         snap = worker.snapshot()
@@ -21847,7 +21840,7 @@ class TestSnapshotInflightCollection:
         entry_head = InflightEntry(
             item=item_head,
             lease=HostLease(name='local', runner=fake_runner, is_local=True),
-            verify_task=None, merge_wt=wt, was_speculative=False, phase='verifying',
+            verify_task=None, merge_wt=wt, was_speculative=False,
             started_at=now,
         )
 
@@ -21861,7 +21854,7 @@ class TestSnapshotInflightCollection:
         entry_second = InflightEntry(
             item=item_second,
             lease=HostLease(name='laptop', runner=fake_runner, is_local=False),
-            verify_task=None, merge_wt=wt, was_speculative=False, phase='verifying',
+            verify_task=None, merge_wt=wt, was_speculative=False,
             started_at=now,
         )
 
@@ -22009,7 +22002,7 @@ class TestHeartbeatOccupancy:
         entry_a = InflightEntry(
             item=item_a,
             lease=HostLease(name='local', runner=fake_runner, is_local=True),
-            verify_task=None, merge_wt=wt, was_speculative=False, phase='verifying',
+            verify_task=None, merge_wt=wt, was_speculative=False,
             started_at=now - 10.0,
         )
 
@@ -22023,7 +22016,7 @@ class TestHeartbeatOccupancy:
         entry_b = InflightEntry(
             item=item_b,
             lease=HostLease(name='laptop', runner=fake_runner, is_local=False),
-            verify_task=None, merge_wt=wt, was_speculative=False, phase='verifying',
+            verify_task=None, merge_wt=wt, was_speculative=False,
             started_at=now - 5.0,
         )
 
@@ -22080,17 +22073,18 @@ class TestHeartbeatOccupancy:
 
 @pytest.mark.asyncio
 class TestEntryPhaseDuringFinalize:
-    """epsilon: entry.phase is updated to 'finalizing' during _finalize_inflight."""
+    """epsilon/lambda: the ItemLifecycle registry reports FINALIZING while
+    advance_main runs inside _finalize_inflight (task 2173 step-6 repoints
+    this off the deleted entry.phase field onto the registry — the single
+    source of truth kappa/task 2169 introduced)."""
 
     async def test_entry_phase_set_to_finalizing_before_advance_main(
         self, git_ops: GitOps, config: OrchestratorConfig,
     ) -> None:
-        """entry.phase == 'finalizing' when advance_main is called in _finalize_inflight.
-
-        RED: _finalize_inflight sets self._verify_phase='finalizing' but NOT entry.phase,
-        so entry.phase stays 'verifying' (stale dispatch-time value).
+        """worker._lifecycle.current(req.request_id) == FINALIZING when
+        advance_main is called in _finalize_inflight.
         """
-        from orchestrator.merge_queue import InflightEntry
+        from orchestrator.merge_queue import InflightEntry, ItemLifecycleState
         from orchestrator.verify_runner import HostLease
 
         branch = 'ep-finalize-a'
@@ -22120,19 +22114,20 @@ class TestEntryPhaseDuringFinalize:
         mock_allocator.cancel_and_release = AsyncMock()
         worker._host_allocator = mock_allocator
         worker._register_owned_merge_worktree(item.merge_wt)
+        worker._register_item(item, initial=ItemLifecycleState.VERIFYING)
 
         lease = HostLease(name='local', runner=MagicMock(), is_local=True)
         entry = InflightEntry(
             item=item, lease=lease, verify_task=None,
-            merge_wt=item.merge_wt, was_speculative=False, phase='verifying',
+            merge_wt=item.merge_wt, was_speculative=False,
             started_at=time.time(), verify_result=None, passthrough_outcome=None, status=None,
         )
 
-        captured_phase: list[str] = []
+        captured_phase: list[ItemLifecycleState | None] = []
         original_advance = git_ops.advance_main
 
         async def _capturing_advance(*args, **kwargs):
-            captured_phase.append(entry.phase)
+            captured_phase.append(worker._lifecycle.current(req.request_id))
             return await original_advance(*args, **kwargs)
 
         git_ops.advance_main = _capturing_advance
@@ -22144,8 +22139,8 @@ class TestEntryPhaseDuringFinalize:
 
         assert advanced is True, f'Expected True (advanced); got: {advanced}'
         assert len(captured_phase) >= 1, 'advance_main must have been called at least once'
-        assert captured_phase[0] == 'finalizing', (
-            f"entry.phase at advance_main must be 'finalizing'; got: {captured_phase[0]!r}"
+        assert captured_phase[0] == ItemLifecycleState.FINALIZING, (
+            f'registry state at advance_main must be FINALIZING; got: {captured_phase[0]!r}'
         )
 
 

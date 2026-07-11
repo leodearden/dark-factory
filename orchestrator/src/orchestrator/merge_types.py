@@ -1040,9 +1040,10 @@ class ItemLifecycleState(StrEnum):
 
     Normalizes today's FOUR redundant state encodings — container
     membership across the five queues (``_queue``/``_lane_buffers``/
-    ``_verifier_queue``/``_redispatch``/``_dispatch_item``), free-form
-    ``InflightEntry.phase: str`` values, the :class:`InflightStatus`
-    sentinel enum above, and the four worker transient side-fields
+    ``_verifier_queue``/``_redispatch``/``_dispatch_item``), the free-form
+    ``InflightEntry.phase: str`` field (deleted by task lambda / task 2173 —
+    phase is now derived via ``SpeculativeMergeWorker._entry_phase()``), the
+    :class:`InflightStatus` sentinel enum above, and the four worker transient side-fields
     (``_inflight_req``/``_remerging_item``/``_finalizing_head``/
     ``_dispatching_item``) — into ten members tracing the pipeline flow:
     queued -> (lane_buffered ->) merging -> awaiting_verify ->
@@ -1068,11 +1069,13 @@ class ItemLifecycleState(StrEnum):
         string for the conceptual MERGING state used by the cascade-remerge
         edges in ``_LEGAL_TRANSITIONS`` below — the wire VALUES differ
         ('remerging' vs 'merging') even though the STATE is the same.
-      * ``entry.phase`` values ``'abandoned'``, ``'halted'``, and
-        ``'passthrough'`` (pre-dispatch abandon / operator-halt / decided-
-        item passthrough branches) have no member here at all — this
-        substrate intentionally does not model them; kappa decides how (or
-        whether) they map onto a state below.
+      * The (deleted) ``entry.phase`` values ``'abandoned'``, ``'halted'``,
+        and ``'passthrough'`` (pre-dispatch abandon / operator-halt /
+        decided-item passthrough branches) never had a member here at all —
+        this substrate intentionally does not model them. Task lambda (task
+        2173) confirmed all three values only ever appeared on entries
+        finalized inline before any reader could observe them, so the
+        omission was never a gap.
 
     This is ONLY the state vocabulary — see
     ``orchestrator.merge_queue.ItemLifecycle`` for the request_id-keyed
@@ -1125,8 +1128,6 @@ class InflightEntry:
     verify_task    : the asyncio.Task wrapping _run_inflight_verify (None for passthroughs)
     merge_wt       : the merge worktree path (may have been warm-swapped by _run_inflight_verify)
     was_speculative: True if item.speculative was True at dispatch time (for slot release)
-    phase          : current phase string for snapshot() observability (per-entry source of
-                     truth for multi-host; _verify_phase is the single-host compat field)
     passthrough_outcome: set for immediate-outcome entries (conflict/already_merged/skip_verify)
                          that are enqueued without a real verify task so finalize can deliver
                          them in submission order
@@ -1140,7 +1141,6 @@ class InflightEntry:
     verify_task: asyncio.Task | None        # type: ignore[type-arg]
     merge_wt: Path | None
     was_speculative: bool
-    phase: str
     passthrough_outcome: MergeOutcome | None = None
     verify_result: VerifyResult | None = None  # None = pass; VerifyResult = fail/skip
     status: InflightStatus | None = None    # sentinel: DROPPED / REQUEUED / RUNNER_UNAVAILABLE / ABANDONED_PREDISPATCH / REQUEUED_PREDISPATCH

@@ -145,7 +145,6 @@ def _entry_kwargs(item: SpeculativeItem, **overrides: object) -> dict:
         verify_task=None,
         merge_wt=None,
         was_speculative=False,
-        phase='passthrough',
         passthrough_outcome=None,
     )
     base.update(overrides)
