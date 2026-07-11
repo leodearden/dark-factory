@@ -30,6 +30,7 @@ convention.
 from __future__ import annotations
 
 import asyncio
+import dataclasses
 from pathlib import Path
 from unittest.mock import MagicMock
 
@@ -249,3 +250,56 @@ class TestPhaseDerivesFromRegistry:
             "must be excluded from frozen_prefix even though its stale "
             "entry.phase field says 'verifying' (a qualifying value)."
         )
+
+
+class TestInflightEntryHasNoPhaseField:
+    """``InflightEntry`` no longer carries a free-form ``phase`` field — every
+    reader derives the phase from the ItemLifecycle registry via
+    ``SpeculativeMergeWorker._entry_phase()`` (task lambda / task 2173
+    step-5).
+
+    RED until step-6 GREEN deletes ``InflightEntry.phase`` (currently a
+    required field at merge_types.py:1143): on current code the field is
+    still present in ``dataclasses.fields(InflightEntry)``, and constructing
+    an entry without a ``phase=`` argument raises ``TypeError`` (missing
+    required positional argument).
+    """
+
+    def test_phase_field_absent_from_dataclass(git_ops):
+        from orchestrator.merge_queue import InflightEntry
+
+        field_names = {f.name for f in dataclasses.fields(InflightEntry)}
+        assert 'phase' not in field_names, (
+            'InflightEntry must no longer declare a phase field (derivation '
+            f'via _entry_phase() replaces it); got fields: {field_names!r}'
+        )
+
+    @pytest.mark.asyncio
+    async def test_derivation_works_with_no_phase_field(
+        git_ops, config, tmp_path,
+    ):
+        from orchestrator.merge_queue import InflightEntry, ItemLifecycleState, RealMergeItem
+
+        worker = _make_worker(git_ops)
+
+        req = _make_request('lam-nofield', 'lam-nofield', tmp_path, config)
+        item = RealMergeItem(
+            request=req, merge_result=MagicMock(), merge_wt=tmp_path / 'merge_wt',
+            base_sha='deadbeef', speculative=False,
+        )
+        rid = worker._register_item(item, initial=ItemLifecycleState.VERIFYING)
+        # No `phase=` kwarg at all — proves derivation needs no stored field.
+        entry = InflightEntry(
+            item=item, lease=None, verify_task=MagicMock(), merge_wt=item.merge_wt,
+            was_speculative=False,
+        )
+        worker._inflight.append(entry)
+
+        assert worker._entry_phase(entry) == 'verifying', (
+            f'expected _entry_phase to derive verifying from the registry '
+            f'for {rid!r} with no phase field present on the entry.'
+        )
+
+        snap = worker.snapshot()
+        assert snap['entries'][0]['state'] == 'verifying'
+        assert snap['verify_in_progress']['phase'] == 'verifying'
