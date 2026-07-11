@@ -45,6 +45,10 @@ logger = logging.getLogger(__name__)
 # reply scalar-type tag for a vecf32 column (see _read_compact_vector).
 _VALUE_VECTORF32 = 12
 
+# falkordb.query_result.ResultSetScalarTypes.VALUE_NULL -- the compact-reply
+# scalar-type tag for a NULL/absent property (see _read_compact_vector).
+_VALUE_NULL = 1
+
 
 # ---------------------------------------------------------------------------
 # Byte-exact vecf32 passthrough (pure functions -- never call float() here)
@@ -94,7 +98,9 @@ def _quote_cypher_string(value: str) -> str:
     return f"'{escaped}'"
 
 
-async def _read_compact_vector(falkor_client: Any, *, group_id: str, cypher: str) -> str:
+async def _read_compact_vector(
+    falkor_client: Any, *, group_id: str, cypher: str,
+) -> str | None:
     """Injectable raw ``--compact`` transport seam for a single vecf32 column.
 
     Issues *cypher* (expected to ``RETURN`` exactly one vecf32-typed value)
@@ -105,7 +111,8 @@ async def _read_compact_vector(falkor_client: Any, *, group_id: str, cypher: str
     textual double representation; this is the RCA-validated truncation this
     module exists to avoid). Returns the raw bracketed, comma-separated
     vector text (the same shape ``parse_compact_vector_reply`` consumes),
-    extracted from the reply WITHOUT ever calling ``float()``.
+    extracted from the reply WITHOUT ever calling ``float()`` -- or ``None``
+    when the source property is null/absent (see below).
 
     This default implementation reads the ``falkordb`` package's own
     (already-parsed-elsewhere) reply-shape convention
@@ -117,21 +124,22 @@ async def _read_compact_vector(falkor_client: Any, *, group_id: str, cypher: str
     remains validated separately, in the η live throwaway-graph rehearsal
     (see ``plans/cross-graph-entity-leak-prd.md`` decision 5).
 
-    A null/absent embedding (e.g. an Entity/RELATES_TO row somehow missing
-    its embedding property) surfaces as the ``ValueError`` below, never as a
-    silently-empty vector: FalkorDB reports a NULL property with a
-    non-VECTORF32 ``scalar_type``, so it fails the type check before the
-    token list is ever indexed. This is a deliberate choice, not an
-    oversight -- every row this module reads is expected to carry an
-    embedding, so a missing one is treated as a hard, descriptively-messaged
-    failure (naming *group_id* and *cypher*) that surfaces a corrupt/
-    unexpected source row immediately, rather than silently proceeding
-    without it (which would produce a differently-shaped, harder-to-
-    diagnose gap later -- e.g. a moved node that can no longer be found by
-    semantic search). A reply with zero rows (e.g. a transient race where
-    the source row was deleted between an earlier existence check and this
-    read, or an unexpected reply shape) raises the same kind of descriptive
-    ``ValueError`` rather than a bare ``IndexError``.
+    A null/absent embedding (e.g. an Entity/RELATES_TO row that was
+    persisted without its embedding property -- confirmed live: ~10% of
+    RELATES_TO edges) surfaces as a ``scalar_type`` of ``_VALUE_NULL`` (1).
+    This is now recognized as valid real data, not corruption: this function
+    returns ``None`` for exactly that tag, letting callers recreate the
+    node/edge embedding-less instead of failing. Any OTHER non-VECTORF32
+    ``scalar_type`` (a genuinely wrong-typed column -- e.g. VALUE_ARRAY) is
+    still a hard, descriptively-messaged failure (naming *group_id* and
+    *cypher*) that surfaces a corrupt/unexpected source row immediately,
+    rather than silently proceeding without it (which would produce a
+    differently-shaped, harder-to-diagnose gap later -- e.g. a moved node
+    that can no longer be found by semantic search). A reply with zero rows
+    (e.g. a transient race where the source row was deleted between an
+    earlier existence check and this read, or an unexpected reply shape)
+    raises the same kind of descriptive ``ValueError`` rather than a bare
+    ``IndexError``.
     """
     reply = await falkor_client.execute_command('GRAPH.RO_QUERY', group_id, cypher, '--compact')
     rows = reply[1]
@@ -144,12 +152,15 @@ async def _read_compact_vector(falkor_client: Any, *, group_id: str, cypher: str
         )
     cell = rows[0][0]
     scalar_type, value = int(cell[0]), cell[1]
+    if scalar_type == _VALUE_NULL:
+        return None
     if scalar_type != _VALUE_VECTORF32:
         raise ValueError(
             f'_read_compact_vector: expected a VECTORF32 (12) cell for '
             f'group_id={group_id!r}, got scalar_type={scalar_type} '
             f'(cypher={cypher!r}). A null/absent embedding on the source row '
-            f"surfaces here too -- see this function's docstring."
+            f'surfaces as scalar_type={_VALUE_NULL} (VALUE_NULL) and is '
+            "returned as None instead -- see this function's docstring."
         )
     tokens = [v.decode() if isinstance(v, bytes) else str(v) for v in value]
     return '[' + ', '.join(tokens) + ']'
