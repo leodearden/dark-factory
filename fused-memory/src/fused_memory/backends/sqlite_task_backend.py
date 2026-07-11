@@ -1654,6 +1654,31 @@ class SqliteTaskBackend:
                 await self._validate_metadata_on_write(
                     metadata, project_root=project_root, tag=tag, task_id=next_id,
                 )
+
+                # Index-independent dedup guard (fm-task-dedup self-heal
+                # amendment): the v3->v4 partial UNIQUE index is
+                # self-gating — a flagged residual leaves it ABSENT
+                # indefinitely (reify incident esc-candidate-key-migration-2)
+                # — so this SELECT is the only backstop during that window.
+                # Same typed error the post-INSERT IntegrityError mapping
+                # below raises when the index IS present, so callers (the
+                # interceptor's create-dispatch combined resolution) need no
+                # changes regardless of which path catches the collision.
+                if candidate_key is not None:
+                    guard_cursor = await conn.execute(
+                        "SELECT id, status FROM tasks WHERE tag = ? AND candidate_key = ? "
+                        "AND status != 'cancelled' ORDER BY id LIMIT 1",
+                        (tag, candidate_key),
+                    )
+                    guard_row = await guard_cursor.fetchone()
+                    if guard_row is not None:
+                        raise DuplicateCandidateKeyError(
+                            existing_id=guard_row['id'],
+                            existing_status=guard_row['status'],
+                            tag=tag,
+                            candidate_key=candidate_key,
+                        )
+
                 await conn.execute(
                     """
                         INSERT INTO tasks (tag, id, title, description,
