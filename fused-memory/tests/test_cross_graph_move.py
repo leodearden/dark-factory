@@ -1773,3 +1773,66 @@ class TestRecreateSubgraphRelationships:
         assert result.edges_skipped == 0
         assert result.dropped_cross_target == []
         assert result.dropped_cross_target == []
+
+    @pytest.mark.asyncio
+    async def test_mention_already_present_in_target_is_idempotent_noop(
+        self, mock_config, make_backend, make_graph_mock, monkeypatch,
+    ):
+        """Re-running Phase B after a prior run already recreated a MENTIONS
+        link in T must NOT duplicate it: FalkorDB enforces no uniqueness
+        constraint on a MENTIONS relationship's uuid either -- the exact same
+        hazard already guarded for RELATES_TO by
+        _relates_to_edge_already_in_target. Without a matching presence
+        guard, a crash between Phase-B's MENTIONS-create and Phase-C's
+        DETACH DELETE would let an --apply re-run re-read the still-present
+        source node's MENTIONS and re-CREATE it, duplicating the link. No
+        CREATE is issued and the skip is a genuine no-op -- NOT counted as a
+        loss in either mentions_recreated or mentions_skipped (task 2415
+        step-25/26)."""
+        backend = make_backend(mock_config)
+
+        source_mock = make_graph_mock()
+
+        async def _source_ro_query(cypher, params=None):
+            if 'MENTIONS' in cypher:
+                return MagicMock(result_set=[MENTION_ROW_FIXTURE])
+            return MagicMock(result_set=[])  # no RELATES_TO in this scenario -- keep the edge path inert
+
+        source_mock.ro_query = AsyncMock(side_effect=_source_ro_query)
+
+        target_mock = make_graph_mock()
+
+        async def _target_ro_query(cypher, params=None):
+            if 'MENTIONS' in cypher:
+                # The new MENTIONS presence probe reports the link is
+                # ALREADY there -- a re-run after a prior completed/partial
+                # Phase B.
+                return MagicMock(result_set=[[MENTION_UUID_FIXTURE]])
+            return MagicMock(result_set=[])  # every other probe: not present
+
+        target_mock.ro_query = AsyncMock(side_effect=_target_ro_query)
+
+        backend._driver._get_graph = _route_graphs({
+            SOURCE_GRAPH_FIXTURE: source_mock,
+            TARGET_GRAPH_FIXTURE: target_mock,
+        })
+
+        fake_read_compact = AsyncMock(return_value=COMPACT_VECTOR_REPLY_FIXTURE)
+        monkeypatch.setattr(cross_graph_move, '_read_compact_vector', fake_read_compact)
+
+        specs = [_move_spec(NODE_UUID_FIXTURE, SOURCE_GRAPH_FIXTURE, TARGET_GRAPH_FIXTURE)]
+
+        result = await recreate_subgraph_relationships(backend, specs)
+
+        # no CREATE issued for the mention -- it's already there. There are
+        # no edges in this scenario (RELATES_TO kept inert), so target.query
+        # is never awaited at all.
+        target_mock.query.assert_not_awaited()
+
+        # a genuine idempotent no-op is NOT a loss: neither counter moves --
+        # exactly like the RELATES_TO already-present skip above.
+        assert result.mentions_recreated == 0
+        assert result.mentions_skipped == 0
+        assert result.edges_recreated == 0
+        assert result.edges_skipped == 0
+        assert result.dropped_cross_target == []
