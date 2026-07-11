@@ -8,6 +8,7 @@ from a global or a clock read.
 
 from __future__ import annotations
 
+import contextlib
 import importlib.resources
 import logging
 import os
@@ -370,15 +371,23 @@ def save_priorities(priorities: Priorities, path: Path | None = None) -> None:
     half-written.
     """
     target = path if path is not None else _default_priorities_path()
-    target.parent.mkdir(parents=True, exist_ok=True)
-    fd, tmp_path_str = tempfile.mkstemp(
-        suffix='.tmp',
-        prefix=target.stem,
-        dir=str(target.parent),
-    )
-    with os.fdopen(fd, 'w') as f:
-        yaml.safe_dump(_priorities_to_dict(priorities), f)
-    os.replace(tmp_path_str, str(target))
+    try:
+        target.parent.mkdir(parents=True, exist_ok=True)
+        fd, tmp_path_str = tempfile.mkstemp(
+            suffix='.tmp',
+            prefix=target.stem,
+            dir=str(target.parent),
+        )
+        try:
+            with os.fdopen(fd, 'w') as f:
+                yaml.safe_dump(_priorities_to_dict(priorities), f)
+            os.replace(tmp_path_str, str(target))
+        except Exception:
+            with contextlib.suppress(OSError):
+                os.unlink(tmp_path_str)
+            raise
+    except OSError as exc:
+        logger.warning('save_priorities: failed to write %s: %s', target, exc)
 
 
 def ensure_priorities_file(path: Path | None = None) -> None:
