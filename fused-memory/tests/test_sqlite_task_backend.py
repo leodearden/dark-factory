@@ -3190,6 +3190,85 @@ async def test_add_task_dedup_guard_rejects_duplicate_when_index_absent(tmp_path
         await b.close()
 
 
+@pytest.mark.asyncio
+async def test_update_task_dedup_guard_rejects_recompute_collision_when_index_absent(
+    tmp_path,
+):
+    """Same incident condition as the add_task guard above, exercised on the
+    edit path: with the v3->v4 index build blocked by an unrelated flagged
+    residual group, an ``update_task`` recompute (title and/or metadata
+    touched) that lands on ANOTHER non-cancelled row's candidate_key must be
+    rejected before the UPDATE lands — no DB-level UNIQUE backstop exists
+    while the index is absent, so the pre-UPDATE SELECT guard is the only
+    thing preventing a silent duplicate reactivation.
+    """
+    import sqlite3
+
+    from fused_memory.backends.task_backend_errors import DuplicateCandidateKeyError
+
+    project_root = str(tmp_path / 'proj')
+    db_path = Path(project_root) / '.taskmaster' / 'tasks' / 'tasks.db'
+    _make_v3_db_with_dup_groups(
+        db_path,
+        [
+            # Flagged (mixed-status) group -- unrelated to A/B, keeps the
+            # v3->v4 index build skipped so this test exercises the
+            # index-ABSENT window.
+            (1, 'Ambiguous task', 'done', ['x.py']),
+            (2, 'Ambiguous task', 'pending', ['x.py']),
+            # A and B: two normal, distinct, non-cancelled rows.
+            (3, 'Task A', 'pending', ['a.py']),
+            (4, 'Task B', 'pending', ['b.py']),
+        ],
+    )
+
+    cfg = TaskmasterConfig(project_root=str(tmp_path))
+    b = SqliteTaskBackend(cfg)
+    await b.start()
+    try:
+        # Triggers connection-open migration: flags the group, skips the
+        # index build.
+        await b.get_tasks(project_root=project_root)
+
+        conn = sqlite3.connect(str(db_path))
+        try:
+            indexes = {row[1] for row in conn.execute('PRAGMA index_list(tasks)')}
+            user_version = conn.execute('PRAGMA user_version').fetchone()[0]
+        finally:
+            conn.close()
+        assert not any('candidate_key' in idx for idx in indexes), (
+            f'Precondition: the index must be ABSENT for this test to '
+            f'exercise the index-independent guard; got {indexes}'
+        )
+        assert user_version == 3, user_version
+
+        # Recompute B (id=4) onto A's (title, files) -- same candidate_key.
+        with pytest.raises(DuplicateCandidateKeyError) as exc_info:
+            await b.update_task(
+                task_id='4',
+                project_root=project_root,
+                title='Task A',
+                metadata=json.dumps({'files': ['a.py']}),
+            )
+        exc = exc_info.value
+        assert exc.existing_id == 3, f'Expected the collision to name survivor id=3; got {exc.existing_id!r}'
+        assert exc.existing_status == 'pending', (
+            f'Expected the survivor status to be pending; got {exc.existing_status!r}'
+        )
+
+        # B is unchanged -- the guard fired before the UPDATE landed.
+        b_task = await b.get_task(task_id='4', project_root=project_root)
+        assert b_task['title'] == 'Task B', (
+            f"Expected B's title untouched by the rejected update; got {b_task['title']!r}"
+        )
+        assert b_task['candidate_key'] == compute_candidate_key('Task B', ['b.py']), (
+            f"Expected B's candidate_key untouched by the rejected update; "
+            f"got {b_task['candidate_key']!r}"
+        )
+    finally:
+        await b.close()
+
+
 # ── candidate_key collision (fm-task-dedup W8 task A2) ───────────────
 
 
