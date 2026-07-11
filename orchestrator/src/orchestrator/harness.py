@@ -60,7 +60,11 @@ from orchestrator.systemd_inspect import (
     _deterministic_deploy_health_verdict,
     inspect_systemd_unit,
 )
-from orchestrator.task_status import ACTIVE_TASK_STATUSES, TERMINAL_STATUSES
+from orchestrator.task_status import (
+    ACTIVE_TASK_STATUSES,
+    TERMINAL_STATUSES,
+    is_infra_held,
+)
 from orchestrator.usage_gate import UsageGate
 from orchestrator.workflow import TaskWorkflow, WorkflowOutcome
 from orchestrator.worktree_identity import identities_match, read_worktree_title
@@ -3350,7 +3354,7 @@ Output JSON matching the schema. Every task must appear in the output.
                             tid, metadata.get('branch_base_sha'),
                         )
                         return await self._revert_in_progress_if_no_live_claimant(
-                            tid, mid_run=mid_run, metadata=metadata,
+                            tid, mid_run=mid_run, metadata=metadata, status=status,
                         )
                     logger.info(
                         'Reconcile: task %s branch is degenerate '
@@ -3398,7 +3402,7 @@ Output JSON matching the schema. Every task must appear in the output.
                             tid,
                         )
                         return await self._revert_in_progress_if_no_live_claimant(
-                            tid, mid_run=mid_run, metadata=metadata,
+                            tid, mid_run=mid_run, metadata=metadata, status=status,
                         )
                     logger.info(
                         'Reconcile: task %s branch is degenerate per '
@@ -3450,7 +3454,7 @@ Output JSON matching the schema. Every task must appear in the output.
                         tid, metadata.get('branch_base_sha'),
                     )
                     return await self._revert_in_progress_if_no_live_claimant(
-                        tid, mid_run=mid_run, metadata=metadata,
+                        tid, mid_run=mid_run, metadata=metadata, status=status,
                     )
                 logger.info(
                     'Reconcile: task %s branch tip == branch_base_sha (%s); '
@@ -3665,11 +3669,12 @@ Output JSON matching the schema. Every task must appear in the output.
         # is_ancestor==True degenerate-provisioning-branch guards above so a
         # never-advanced branch (the 2992 strand) is recovered, not left to sit.
         return await self._revert_in_progress_if_no_live_claimant(
-            tid, mid_run=mid_run, metadata=metadata,
+            tid, mid_run=mid_run, metadata=metadata, status=status,
         )
 
     async def _revert_in_progress_if_no_live_claimant(
         self, tid: str, *, mid_run: bool, metadata: dict | None = None,
+        status: str | None = None,
     ) -> str | None:
         """Revert a stranded in-progress task to pending when no live claimant.
 
@@ -3691,35 +3696,45 @@ Output JSON matching the schema. Every task must appear in the output.
         worktree_path = self._resolve_task_worktree(tid)
         lock_path = worktree_path / '.task' / 'plan.lock'
 
-        # A1 guard: a verify-complete task blocked by a transient infra failure
-        # (metadata.infra_hold set) must NOT be re-pended by the stranded
-        # recovery sweep.  The open infra_issue L1 is the non-dispatch hold
-        # (scheduler skips blocked rows; the open L1 suppresses stranded_blocked
-        # re-file).  Flipping to pending would force the task to re-win its
-        # full implement footprint in the scheduler's footprint-locked dispatch —
+        # A1 guard (task 2200/ω4): a verify-complete task held by a transient
+        # infra failure — first-class status == 'infra-hold', via
+        # is_infra_held — must NOT be re-pended by the stranded recovery
+        # sweep.  The open infra_issue L1 is the non-dispatch hold (dispatch
+        # is pending-only; the open L1 suppresses stranded_blocked re-file).
+        # Flipping to pending would force the task to re-win its full
+        # implement footprint in the scheduler's footprint-locked dispatch —
         # the root cause of the 3465 starvation.
-        # Guard conditions: metadata.infra_hold is set AND the branch is
+        # Guard conditions: is_infra_held(task) AND the branch is
         # non-degenerate (has commits beyond branch_base_sha).  Degenerate
         # branches (provisioned but never implemented) are not protected because
         # there is no real work to preserve.
-        # Prefer the metadata the reconcile caller already hoisted (one get_task
-        # per stranded task — see harness.py:2275). Re-fetching unconditionally
-        # here was the task-1883 step-14 regression that double-fetched on the
-        # neither-path; the row is immutable across the read-only intervening
-        # is_ancestor/marker/citation/degenerate checks. Standalone callers
-        # (direct unit tests) may omit metadata and pay one fetch.
+        # PRIMARY protection is the sweep-exclusion: infra-hold is not in
+        # _RECONCILE_SWEEP_STATUSES, so in production this function is only
+        # ever reached with status=='in-progress' (the production
+        # _reconcile_one_stranded call sites), making this guard structurally
+        # dormant there.  It is kept as defense-in-depth for any caller that
+        # hands this function an infra-held row directly.
+        # Prefer the metadata/status the reconcile caller already hoisted (one
+        # get_task per stranded task — see harness.py:2275). Re-fetching
+        # unconditionally here was the task-1883 step-14 regression that
+        # double-fetched on the neither-path; the row is immutable across the
+        # read-only intervening is_ancestor/marker/citation/degenerate checks.
+        # Standalone callers (direct unit tests) may omit metadata/status and
+        # pay one fetch.
         if metadata is None:
             try:
                 _infra_task = await self.scheduler.get_task(tid)
-                metadata = (_infra_task or {}).get('metadata') or {}
             except Exception:
-                metadata = {}
+                _infra_task = None
+            metadata = (_infra_task or {}).get('metadata') or {}
+            if status is None:
+                status = (_infra_task or {}).get('status')
         _infra_meta = metadata
-        if _infra_meta.get('infra_hold'):
+        if is_infra_held({'status': status}):
             _branch = f'{self.git_ops.config.branch_prefix}{tid}'
             if not await self._branch_is_degenerate(_branch, _infra_meta):
                 logger.info(
-                    'Reconcile: task %s has infra_hold on non-degenerate branch '
+                    'Reconcile: task %s is infra-held on non-degenerate branch '
                     '— skipping pending revert; held for infra resume',
                     tid,
                 )
