@@ -2751,7 +2751,10 @@ async def test_v3_to_v4_self_gating_skips_index_and_escalates_on_residual_duplic
     called_project_root, residual_groups = recorded[0]
     assert called_project_root == project_root
     assert residual_groups == [
-        {'tag': 'master', 'candidate_key': expected_key, 'task_ids': ['1', '2'], 'count': 2},
+        {
+            'tag': 'master', 'candidate_key': expected_key,
+            'task_ids': ['1', '2'], 'count': 2, 'reason': 'mixed_status',
+        },
     ], residual_groups
 
 

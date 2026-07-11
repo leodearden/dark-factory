@@ -523,7 +523,7 @@ async def _migrate_v3_to_v4(
     """v3 -> v4 (fm-task-dedup W8 task A2, self-heal amendment): self-gating
     partial UNIQUE index, now with an intermediate self-heal pass.
 
-    Re-runs the same residual non-cancelled duplicate ``candidate_key``
+    Runs the same residual non-cancelled duplicate ``candidate_key``
     audit ``_migrate_v2_to_v3`` performed (report-only there), extended with
     ``GROUP_CONCAT(id ORDER BY id)`` to name the offending rows in a
     deterministic (ascending id) order — SQLite does not otherwise guarantee
@@ -540,26 +540,26 @@ async def _migrate_v3_to_v4(
       existing metadata, plus a loud per-group WARNING log. Fixes reify
       incident esc-candidate-key-migration-2 (37 dup groups / 58 rows that
       previously required a manual ``set_task_status`` cancel per row).
-    * **Flag** — ambiguous (mixed-status or title-divergent): left
-      untouched for a human.
+    * **Flag** — ambiguous (``reason`` is ``'mixed_status'`` or
+      ``'title_divergent'``): left untouched and collected — with its
+      ``reason`` — into ``flagged_groups`` for escalation below.
 
-    After healing, the SAME residual audit is re-run (healed groups now
-    have exactly one non-cancelled survivor, so they no longer appear):
-
-    * **Still-residual (flagged) groups remain** — log a loud ERROR naming
-      the groups (via the ``residual_group_count=`` token, deliberately
-      distinct from v2->v3's ``duplicate_groups=`` token so the two audits'
-      log-scraping assertions never collide), invoke
-      ``residual_dup_escalation_cb(project_root, residual_groups)`` when
-      provided (best-effort — a raising callback is caught and logged,
-      never propagated), and SKIP the index build. ``user_version`` is left
-      at 3 (NOT stamped to 4): a later connection-open — after an operator
-      resolves the flagged residuals — re-runs this step and lands the
-      index then (PRD decision #4 amendment: genuine duplicates now
-      self-heal automatically; only ambiguous residuals still require a
-      human before the index lands).
-    * **Clean** (nothing flagged, whether or not anything was healed) —
-      build ``ux_tasks_candidate_key``, a PARTIAL UNIQUE index over ``(tag,
+    * **Any group ends up flagged** — log a loud ERROR naming the flagged
+      groups and their reasons (via the ``residual_group_count=`` token,
+      deliberately distinct from v2->v3's ``duplicate_groups=`` token so
+      the two audits' log-scraping assertions never collide; also names
+      ``healed_group_count=`` so an operator sees both halves of the
+      pass), invoke ``residual_dup_escalation_cb(project_root,
+      flagged_groups)`` when provided — ONLY the flagged groups, never the
+      auto-healed ones — (best-effort — a raising callback is caught and
+      logged, never propagated), and SKIP the index build. ``user_version``
+      is left at 3 (NOT stamped to 4): a later connection-open — after an
+      operator resolves the flagged residuals — re-runs this step and
+      lands the index then (PRD decision #4 amendment: genuine duplicates
+      now self-heal automatically; only ambiguous residuals still require
+      a human before the index lands).
+    * **Nothing flagged** (whether or not anything was healed) — build
+      ``ux_tasks_candidate_key``, a PARTIAL UNIQUE index over ``(tag,
       candidate_key)`` excluding NULL keys and cancelled rows, then stamp
       ``user_version = 4`` — in the SAME connection-open that performed the
       heal, no restart required.
@@ -577,108 +577,105 @@ async def _migrate_v3_to_v4(
     self-gating fail-safe. Fresh DBs still get the index via the full
     v0->v1->v2->v3->v4 chain, where this audit is trivially clean.
     """
-    residual_query = """
-        SELECT tag, candidate_key, GROUP_CONCAT(id ORDER BY id) AS ids,
-               COUNT(*) AS n
-        FROM tasks
-        WHERE candidate_key IS NOT NULL AND status != 'cancelled'
-        GROUP BY tag, candidate_key
-        HAVING COUNT(*) > 1
-        """
     try:
-        dup_cursor = await conn.execute(residual_query)
+        dup_cursor = await conn.execute(
+            """
+            SELECT tag, candidate_key, GROUP_CONCAT(id ORDER BY id) AS ids,
+                   COUNT(*) AS n
+            FROM tasks
+            WHERE candidate_key IS NOT NULL AND status != 'cancelled'
+            GROUP BY tag, candidate_key
+            HAVING COUNT(*) > 1
+            """,
+        )
         # aiosqlite types fetchall() as Iterable[Row] (not Sized); materialize
         # to a list so len() below type-checks (it's already a list at runtime).
         residual_rows = list(await dup_cursor.fetchall())
 
-        if residual_rows:
-            healed_group_count = 0
-            for group in residual_rows:
-                rows_cursor = await conn.execute(
-                    "SELECT id, title, status, metadata, candidate_key FROM tasks "
-                    "WHERE tag = ? AND candidate_key = ? AND status != 'cancelled' "
-                    "ORDER BY id",
-                    (group['tag'], group['candidate_key']),
-                )
-                group_rows = list(await rows_cursor.fetchall())
-                classification = _classify_residual_group(group_rows)
-                if len(classification) != 3:
-                    continue
-                _, canonical_id, cancel_ids = classification
-                by_id = {row['id']: row for row in group_rows}
-                now = _now()
-                for cancel_id in cancel_ids:
-                    stamp = json.dumps({
-                        'auto_cancelled_by_self_heal': {
-                            'canonical_id': canonical_id,
-                            'candidate_key': group['candidate_key'],
-                            'migration': 'v3_v4',
-                        },
-                    })
-                    new_metadata = _merge_metadata(
-                        by_id[cancel_id]['metadata'], stamp,
-                        mode='merge',
-                        project_root=project_root, tag=group['tag'], task_id=cancel_id,
-                    )
-                    await conn.execute(
-                        "UPDATE tasks SET status = 'cancelled', updated_at = ?, "
-                        "metadata = ? WHERE tag = ? AND id = ?",
-                        (now, new_metadata, group['tag'], cancel_id),
-                    )
-                healed_group_count += 1
-                logger.warning(
-                    'sqlite_task_backend: schema v3->v4 self-heal -- auto-cancelled '
-                    '%d redundant duplicate candidate_key row(s) for tag=%r '
-                    'candidate_key=%r; canonical survivor id=%d retained, '
-                    'cancelled_ids=%s (genuine content-duplicate group -- verified '
-                    'same candidate_key, no done row -- safe to auto-collapse; see '
-                    'fm-task-dedup self-heal amendment, reify incident '
-                    'esc-candidate-key-migration-2)',
-                    len(cancel_ids), group['tag'], group['candidate_key'],
-                    canonical_id, cancel_ids,
-                )
-            if healed_group_count:
-                # Commit unconditionally here (not deferred to the clean-build
-                # commit below): a still-flagged group elsewhere causes an
-                # early `return` in the branch below, and healed cancels must
-                # survive that skip rather than riding on a commit that may
-                # never happen.
-                await conn.commit()
+        healed_group_count = 0
+        flagged_groups: list[dict[str, Any]] = []
+        for group in residual_rows:
+            rows_cursor = await conn.execute(
+                "SELECT id, title, status, metadata, candidate_key FROM tasks "
+                "WHERE tag = ? AND candidate_key = ? AND status != 'cancelled' "
+                "ORDER BY id",
+                (group['tag'], group['candidate_key']),
+            )
+            group_rows = list(await rows_cursor.fetchall())
+            classification = _classify_residual_group(group_rows)
+            if len(classification) != 3:
+                _, reason = classification
+                flagged_groups.append({
+                    'tag': group['tag'],
+                    'candidate_key': group['candidate_key'],
+                    'task_ids': [str(row['id']) for row in group_rows],
+                    'count': len(group_rows),
+                    'reason': reason,
+                })
+                continue
 
-            # Re-audit: healed groups now have exactly one non-cancelled
-            # survivor, so re-running the SAME query surfaces only
-            # still-ambiguous (flagged) groups, if any.
-            dup_cursor = await conn.execute(residual_query)
-            residual_rows = list(await dup_cursor.fetchall())
+            _, canonical_id, cancel_ids = classification
+            by_id = {row['id']: row for row in group_rows}
+            now = _now()
+            for cancel_id in cancel_ids:
+                stamp = json.dumps({
+                    'auto_cancelled_by_self_heal': {
+                        'canonical_id': canonical_id,
+                        'candidate_key': group['candidate_key'],
+                        'migration': 'v3_v4',
+                    },
+                })
+                new_metadata = _merge_metadata(
+                    by_id[cancel_id]['metadata'], stamp,
+                    mode='merge',
+                    project_root=project_root, tag=group['tag'], task_id=cancel_id,
+                )
+                await conn.execute(
+                    "UPDATE tasks SET status = 'cancelled', updated_at = ?, "
+                    "metadata = ? WHERE tag = ? AND id = ?",
+                    (now, new_metadata, group['tag'], cancel_id),
+                )
+            healed_group_count += 1
+            logger.warning(
+                'sqlite_task_backend: schema v3->v4 self-heal -- auto-cancelled '
+                '%d redundant duplicate candidate_key row(s) for tag=%r '
+                'candidate_key=%r; canonical survivor id=%d retained, '
+                'cancelled_ids=%s (genuine content-duplicate group -- verified '
+                'same candidate_key, no done row -- safe to auto-collapse; see '
+                'fm-task-dedup self-heal amendment, reify incident '
+                'esc-candidate-key-migration-2)',
+                len(cancel_ids), group['tag'], group['candidate_key'],
+                canonical_id, cancel_ids,
+            )
 
-        if residual_rows:
+        if healed_group_count:
+            # Commit unconditionally here (not deferred to the clean-build
+            # commit below): a still-flagged group below causes an early
+            # `return`, and healed cancels must survive that skip rather
+            # than riding on a commit that may never happen.
+            await conn.commit()
+
+        if flagged_groups:
             groups_desc = '; '.join(
-                f'tag={row["tag"]!r} candidate_key={row["candidate_key"]!r} '
-                f'ids=[{row["ids"]}]'
-                for row in residual_rows
+                f'tag={g["tag"]!r} candidate_key={g["candidate_key"]!r} '
+                f'ids=[{",".join(g["task_ids"])}] reason={g["reason"]!r}'
+                for g in flagged_groups
             )
             logger.error(
                 'sqlite_task_backend: schema v3->v4 migration SKIPPED -- '
-                'residual_group_count=%d non-cancelled duplicate candidate_key '
-                'group(s) still present; UNIQUE index NOT created, '
-                'user_version stays at 3. Clean up the residual duplicates '
+                'residual_group_count=%d ambiguous duplicate candidate_key '
+                'group(s) still flagged for human review '
+                '(healed_group_count=%d genuine duplicate group(s) '
+                'auto-resolved this pass); UNIQUE index NOT created, '
+                'user_version stays at 3. Resolve the flagged group(s) '
                 '(cancel or merge the extras) and the next connection-open '
                 'will land the index. Groups: %s',
-                len(residual_rows), groups_desc,
+                len(flagged_groups), healed_group_count, groups_desc,
             )
 
-            residual_groups = [
-                {
-                    'tag': row['tag'],
-                    'candidate_key': row['candidate_key'],
-                    'task_ids': row['ids'].split(','),
-                    'count': row['n'],
-                }
-                for row in residual_rows
-            ]
             if residual_dup_escalation_cb is not None:
                 try:
-                    residual_dup_escalation_cb(project_root, residual_groups)
+                    residual_dup_escalation_cb(project_root, flagged_groups)
                 except Exception:
                     # A broken/misbehaving callback must never crash
                     # connection-open — the skip above has already happened;
@@ -687,7 +684,7 @@ async def _migrate_v3_to_v4(
                         'sqlite_task_backend: residual_dup_escalation_cb '
                         'raised while escalating %d residual duplicate '
                         'candidate_key group(s) for project_root=%r',
-                        len(residual_groups), project_root,
+                        len(flagged_groups), project_root,
                     )
             return
 
