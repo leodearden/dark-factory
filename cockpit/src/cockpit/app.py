@@ -549,10 +549,17 @@ class CockpitApp(App):
 
         Snapshots self._records (the most recently scanned/ordered set)
         into a fresh SpawnTreeScreen, which renders it as a point-in-time
-        parent->child forest -- see cockpit.panes.spawn_tree. The pop
-        branch below guards against ever stacking a second SpawnTreeScreen
-        on top of one already open; it is defensive, not how an
-        interactive 't' keypress actually closes the tree though --
+        parent->child forest -- see cockpit.panes.spawn_tree. That SAME
+        snapshot -- a local `records`, not the `self._records` attribute --
+        is also closed over for the screen's on_focus callback, so a later
+        Enter always resolves the selected slug against the exact list the
+        operator is looking at, never whatever list self._records has been
+        reassigned to by an intervening poll tick (see refresh_registry,
+        which replaces self._records wholesale on every changed scan) --
+        see _focus_slug's docstring for why that distinction matters. The
+        pop branch below guards against ever stacking a second
+        SpawnTreeScreen on top of one already open; it is defensive, not
+        how an interactive 't' keypress actually closes the tree though --
         Textual's ModalScreen truncates the non-priority key-binding chain
         at itself, so this app-level 't' binding is never consulted while
         a SpawnTreeScreen is on top of the stack. SpawnTreeScreen therefore
@@ -563,23 +570,40 @@ class CockpitApp(App):
         if isinstance(self.screen, SpawnTreeScreen):
             self.pop_screen()
             return
-        self.push_screen(SpawnTreeScreen(self._records, self._focus_slug))
+        records = self._records
+        self.push_screen(SpawnTreeScreen(records, lambda slug: self._focus_slug(slug, records)))
 
-    def _focus_slug(self, slug: str) -> None:
-        """Resolve *slug* to a focus target and route it to a backend (Fleet Cockpit C9a).
+    def _focus_slug(self, slug: str, records: list[SessionRecord]) -> None:
+        """Resolve *slug* within *records* to a focus target and route it to a backend (Fleet Cockpit C9a).
 
-        Reuses decision_queue.resolve_target over self._records, exactly
-        mirroring action_focus_selected's own resolve-then-route step, so
-        the tree's Enter path and the decision queue's Enter path share one
-        focus discipline. Fail-soft (PRD §2): a slug with no matching
-        record (a gone/stale snapshot entry) or a record with no resolvable
-        target (no Display) both no-op rather than raising.
+        *records* is the exact snapshot the open SpawnTreeScreen was built
+        from -- action_toggle_tree closes over it and passes it back in on
+        every call, rather than this method reading self._records fresh.
+        self._records is reassigned wholesale (not mutated) by every
+        changed refresh_registry tick, so resolving against the live
+        attribute could silently miss a slug that's still visible in the
+        (unchanged) open tree if a poll tick lands between opening the tree
+        and pressing Enter -- fail-soft in effect, but a surprising one,
+        since the operator selected a row they could plainly see. Reusing
+        the same snapshot the tree renders makes Enter's behavior match
+        what's on screen exactly.
+
+        Reuses decision_queue.resolve_target, exactly mirroring
+        action_focus_selected's own resolve-then-route step, so the tree's
+        Enter path and the decision queue's Enter path share one focus
+        discipline. resolve_target's sessions_by_slug param is only ever
+        read for a DecisionRecord (a SessionRecord resolves straight from
+        its own .display -- see resolve_target) -- *record* here is always
+        a SessionRecord, so an empty mapping is passed rather than
+        rebuilding one from *records* on every keypress. Fail-soft (PRD
+        §2): a slug with no matching record (a gone/stale snapshot entry)
+        or a record with no resolvable target (no Display) both no-op
+        rather than raising.
         """
-        record = next((r for r in self._records if r.session_slug == slug), None)
+        record = next((r for r in records if r.session_slug == slug), None)
         if record is None:
             return
-        sessions_by_slug = {r.session_slug: r for r in self._records}
-        target = resolve_target(record, sessions_by_slug)
+        target = resolve_target(record, {})
         if target is None:
             return
         self._backend_for(target.kind).focus(target)
