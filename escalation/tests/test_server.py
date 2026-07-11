@@ -2338,6 +2338,7 @@ class TestGetMergeQueue:
         from orchestrator.git_ops import MergeResult  # type: ignore[reportMissingImports]
         from orchestrator.merge_queue import (  # type: ignore[reportMissingImports]
             InflightEntry,
+            ItemLifecycleState,
             MergeRequest,
             RealMergeItem,
             SpeculativeMergeWorker,
@@ -2373,11 +2374,13 @@ class TestGetMergeQueue:
         await worker._verifier_queue.put(item_A)
 
         # V — currently being verified (phase = verify_phase param).
-        # Per-entry phase now lives on an InflightEntry in worker._inflight —
-        # the singular _verify_item/_verify_phase fields were retired in task
-        # 1736 and snapshot() no longer reads them.  snapshot() iterates
-        # _inflight head-first (section 1), so this entry is head-of-line at
-        # position 0, ahead of the awaiting_verify (A) and merging (M) sections.
+        # The entry lives in worker._inflight (the singular
+        # _verify_item/_verify_phase fields were retired in task 1736; the
+        # free-form InflightEntry.phase field was retired in task lambda / 2173).
+        # snapshot() derives the entry phase from the ItemLifecycle registry via
+        # _entry_phase() and iterates _inflight head-first (section 1), so this
+        # entry is head-of-line at position 0, ahead of the awaiting_verify (A)
+        # and merging (M) sections.
         merge_wt_V = tmp_path / 'mergeV'
         merge_wt_V.mkdir()
         merge_result_V = MergeResult(success=True, merge_commit='deadbeefV0000000', merge_worktree=merge_wt_V)
@@ -2392,8 +2395,21 @@ class TestGetMergeQueue:
             verify_task=None,
             merge_wt=merge_wt_V,
             was_speculative=False,
-            phase=verify_phase,
         ))
+        # Per-entry phase now DERIVES from the ItemLifecycle registry
+        # (task lambda / 2173 deleted InflightEntry.phase) — drive the registry
+        # to the parametrized state so snapshot()/_entry_phase surface it.
+        worker._register_item(item_V, initial=ItemLifecycleState.VERIFYING)
+        if verify_phase == 'gate_reverify':
+            worker._note_transition(
+                item_V.request.request_id,
+                ItemLifecycleState.VERIFYING, ItemLifecycleState.GATE_REVERIFY,
+            )
+        elif verify_phase == 'finalizing':
+            worker._note_transition(
+                item_V.request.request_id,
+                ItemLifecycleState.VERIFYING, ItemLifecycleState.FINALIZING,
+            )
 
         # WIP halt
         worker.halt_for_wip('test-wip')
@@ -2457,6 +2473,7 @@ class TestGetMergeQueue:
         )
         from orchestrator.merge_queue import (  # type: ignore[reportMissingImports]
             InflightEntry,
+            ItemLifecycleState,
             MergeRequest,
             RealMergeItem,
             SpeculativeMergeWorker,
@@ -2483,7 +2500,7 @@ class TestGetMergeQueue:
         # makes pyright report it as self-referential.
         async def fake_advance_main(*args, **kwargs) -> AdvanceOutcome:
             fh = worker._finalizing_head
-            captured_phases.append(fh.phase if fh is not None else None)
+            captured_phases.append(worker._entry_phase(fh) if fh is not None else None)
             snap = worker.snapshot()
             vip = snap.get('verify_in_progress')
             captured_snapshot_phases.append(vip['phase'] if vip else None)
@@ -2526,8 +2543,11 @@ class TestGetMergeQueue:
             verify_task=None,
             merge_wt=merge_wt,
             was_speculative=False,
-            phase='verifying',
         )
+        # Phase now derives from the registry (task lambda / 2173 deleted
+        # InflightEntry.phase); register at VERIFYING so _finalize_inflight's
+        # production VERIFYING->FINALIZING transition takes effect.
+        worker._register_item(item, initial=ItemLifecycleState.VERIFYING)
 
         await worker._finalize_inflight(entry)
 
@@ -2584,6 +2604,7 @@ class TestGetMergeQueue:
         )
         from orchestrator.merge_queue import (  # type: ignore[reportMissingImports]
             InflightEntry,
+            ItemLifecycleState,
             MergeRequest,
             RealMergeItem,
             SpeculativeMergeWorker,
@@ -2625,7 +2646,9 @@ class TestGetMergeQueue:
                 # _finalize_inflight), not a test-held reference, to avoid a
                 # forward closure ref to the later-bound `entry`.
                 fh = worker._finalizing_head
-                captured_phases_advance2.append(fh.phase if fh is not None else None)
+                captured_phases_advance2.append(
+                    worker._entry_phase(fh) if fh is not None else None
+                )
                 return AdvanceOutcome('not_descendant')
 
         async def fake_cleanup_merge_worktree(path):
@@ -2670,8 +2693,11 @@ class TestGetMergeQueue:
             verify_task=None,
             merge_wt=merge_wt,
             was_speculative=False,
-            phase='verifying',
         )
+        # Phase now derives from the registry (task lambda / 2173 deleted
+        # InflightEntry.phase); register at VERIFYING so _finalize_inflight's
+        # production VERIFYING->FINALIZING->GATE_REVERIFY transitions take effect.
+        worker._register_item(item, initial=ItemLifecycleState.VERIFYING)
 
         import orchestrator.merge_queue as mq_module  # type: ignore[reportMissingImports]
 
@@ -2680,7 +2706,7 @@ class TestGetMergeQueue:
         async def fake_reverify_rebased_tree(*args, **kwargs):
             # Capture the phase at the moment _reverify_rebased_tree is invoked,
             # both on the entry and via the live snapshot() observability path.
-            captured_phases_reverify.append(entry.phase)
+            captured_phases_reverify.append(worker._entry_phase(entry))
             snap = worker.snapshot()
             vip = snap.get('verify_in_progress')
             captured_snapshot_reverify.append(vip['phase'] if vip else None)
@@ -3598,6 +3624,7 @@ class TestMergeStatus:
         from orchestrator.git_ops import MergeResult  # type: ignore[reportMissingImports]
         from orchestrator.merge_queue import (  # type: ignore[reportMissingImports]
             InflightEntry,
+            ItemLifecycleState,
         )
 
         if verify_phase == 'queued':
@@ -3617,11 +3644,12 @@ class TestMergeStatus:
             elif verify_phase == 'awaiting_verify':
                 await worker._verifier_queue.put(item)
             else:
-                # verifying / gate_reverify / finalizing: the per-entry phase
-                # now lives on an InflightEntry in worker._inflight (the singular
-                # _verify_item/_verify_phase fields were retired in task 1736 —
-                # snapshot() no longer reads them).  snapshot() derives the entry
-                # 'state' from InflightEntry.phase, which the server maps via
+                # verifying / gate_reverify / finalizing: the entry lives in
+                # worker._inflight (the singular _verify_item/_verify_phase
+                # fields were retired in task 1736; the free-form
+                # InflightEntry.phase field was retired in task lambda / 2173).
+                # snapshot() derives the entry 'state' from the ItemLifecycle
+                # registry via _entry_phase(), which the server maps through
                 # _map_live_state.
                 worker._inflight.append(InflightEntry(
                     item=item,
@@ -3629,8 +3657,22 @@ class TestMergeStatus:
                     verify_task=None,
                     merge_wt=merge_wt,
                     was_speculative=False,
-                    phase=verify_phase,
                 ))
+                # Phase now DERIVES from the ItemLifecycle registry
+                # (task lambda / 2173 deleted InflightEntry.phase) — drive the
+                # registry to the parametrized verifying/gate_reverify/finalizing
+                # state so snapshot()/_entry_phase surface it.
+                worker._register_item(item, initial=ItemLifecycleState.VERIFYING)
+                if verify_phase == 'gate_reverify':
+                    worker._note_transition(
+                        req.request_id,
+                        ItemLifecycleState.VERIFYING, ItemLifecycleState.GATE_REVERIFY,
+                    )
+                elif verify_phase == 'finalizing':
+                    worker._note_transition(
+                        req.request_id,
+                        ItemLifecycleState.VERIFYING, ItemLifecycleState.FINALIZING,
+                    )
 
         esc_queue = EscalationQueue(tmp_path / 'esc')
         stub_harness = types.SimpleNamespace(_merge_worker=worker)
