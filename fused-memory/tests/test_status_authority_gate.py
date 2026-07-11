@@ -29,8 +29,11 @@ interceptor is needed (mirrors ``test_sqlite_task_backend.py``:407-553).
 
 from __future__ import annotations
 
+import json
 import logging
+import os
 import uuid
+from datetime import UTC, datetime, timedelta
 
 import pytest
 import pytest_asyncio
@@ -243,3 +246,120 @@ async def test_a4_unknown_or_human_actor_safe_open_in_enforce_mode(tmp_path, age
         assert statuses['1'] == 'pending'
     finally:
         await _close_stack(interceptor, backend, event_buffer)
+
+
+# ── A5-A6: claimant round-trip + is_stranded over a backend-fetched row ─
+
+
+@pytest.mark.asyncio
+async def test_a5_claimant_round_trip_via_set_task_status_and_release(backend, project_root):
+    """A5: the dispatch-time claimant stamp via set_task_status(claimant_run_id=,
+    heartbeat_at=) round-trips through get_task (both stamped, status
+    in-progress); release via set_task_claimant(None, None) clears both to
+    NULL on the same backend-fetched row without touching status.
+    """
+    await backend.add_task(project_root=project_root, title='t')
+    claimant_run_id = compose_claimant_run_id('run', 'sess', os.getpid())
+    heartbeat_at = datetime.now(UTC).isoformat()
+
+    await backend.set_task_status(
+        '1', 'in-progress', project_root=project_root,
+        claimant_run_id=claimant_run_id, heartbeat_at=heartbeat_at,
+    )
+
+    task = await backend.get_task('1', project_root=project_root)
+    assert task['status'] == 'in-progress'
+    assert task['claimant_run_id'] == claimant_run_id
+    assert task['heartbeat_at'] == heartbeat_at
+
+    await backend.set_task_claimant(
+        '1', project_root=project_root, claimant_run_id=None, heartbeat_at=None,
+    )
+
+    released = await backend.get_task('1', project_root=project_root)
+    assert released['claimant_run_id'] is None
+    assert released['heartbeat_at'] is None
+    assert released['status'] == 'in-progress'
+
+
+@pytest.mark.asyncio
+async def test_a5_claimant_atomic_clear_via_set_task_status_done(backend, project_root):
+    """A5 atomic-clear variant: set_task_status('done', claimant_run_id=None,
+    heartbeat_at=None) releases the claimant in the SAME call that
+    terminates the task.
+    """
+    await backend.add_task(project_root=project_root, title='t')
+    claimant_run_id = compose_claimant_run_id('run', 'sess', os.getpid())
+    heartbeat_at = datetime.now(UTC).isoformat()
+    await backend.set_task_status(
+        '1', 'in-progress', project_root=project_root,
+        claimant_run_id=claimant_run_id, heartbeat_at=heartbeat_at,
+    )
+
+    await backend.set_task_status(
+        '1', 'done', project_root=project_root,
+        claimant_run_id=None, heartbeat_at=None,
+    )
+
+    task = await backend.get_task('1', project_root=project_root)
+    assert task['status'] == 'done'
+    assert task['claimant_run_id'] is None
+    assert task['heartbeat_at'] is None
+
+
+@pytest.mark.asyncio
+async def test_a6_is_stranded_over_backend_fetched_row_stale_then_refreshed(backend, project_root):
+    """A6: is_stranded is fed a task dict FETCHED from the real backend
+    (get_task) — not a hand-built dict — proving the backend row shape
+    feeds the predicate's production surface. A stale heartbeat is
+    stranded; refreshing the heartbeat makes the SAME re-fetched row not
+    stranded.
+    """
+    await backend.add_task(project_root=project_root, title='t')
+    now = datetime.now(UTC)
+    ttl = timedelta(minutes=5)
+    stale_heartbeat = (now - timedelta(minutes=10)).isoformat()
+
+    await backend.set_task_status(
+        '1', 'in-progress', project_root=project_root,
+        claimant_run_id='run-x', heartbeat_at=stale_heartbeat,
+    )
+    task = await backend.get_task('1', project_root=project_root)
+    assert is_stranded(task, now, ttl) is True
+
+    await backend.set_task_claimant(
+        '1', project_root=project_root, heartbeat_at=now.isoformat(),
+    )
+    refreshed = await backend.get_task('1', project_root=project_root)
+    assert is_stranded(refreshed, now, ttl) is False
+
+
+@pytest.mark.asyncio
+async def test_a6_is_stranded_false_for_infra_hold_status(backend, project_root):
+    """A6 contrast: a first-class 'infra-hold' status is never stranded (the
+    in-progress gate alone excludes it), fetched straight from the backend.
+    """
+    await backend.add_task(project_root=project_root, title='t')
+    await backend.set_task_status('1', 'infra-hold', project_root=project_root)
+
+    now = datetime.now(UTC)
+    task = await backend.get_task('1', project_root=project_root)
+    assert is_stranded(task, now, timedelta(minutes=5)) is False
+
+
+@pytest.mark.asyncio
+async def test_a6_is_stranded_false_for_legacy_metadata_infra_hold_overload(backend, project_root):
+    """A6 contrast: the legacy in-progress + metadata.infra_hold=True
+    overload (pre-omega4 migration window) is also never stranded, fetched
+    straight from the real backend row.
+    """
+    await backend.add_task(
+        project_root=project_root, title='t',
+        metadata=json.dumps({'infra_hold': True}),
+    )
+    await backend.set_task_status('1', 'in-progress', project_root=project_root)
+
+    now = datetime.now(UTC)
+    task = await backend.get_task('1', project_root=project_root)
+    assert task['metadata'].get('infra_hold') is True  # sanity: round-tripped
+    assert is_stranded(task, now, timedelta(minutes=5)) is False
