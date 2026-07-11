@@ -153,6 +153,23 @@ class TestDefaults:
         with pytest.raises(ValidationError):
             GitConfig(spare_warm_lanes=-1)
 
+    def test_warm_lane_release_thin_field_defaults_false(self):
+        """GitConfig.warm_lane_release_thin exists, is typed bool, and
+        defaults to False (§9.5 η — mirrors warm_lane_disk_guard's
+        byte-identical/revertible default-off convention)."""
+        from orchestrator.config import GitConfig
+
+        field_info = GitConfig.model_fields['warm_lane_release_thin']
+        assert field_info.annotation is bool
+        assert field_info.default is False
+
+    def test_warm_lane_release_thin_explicit_override(self):
+        """GitConfig(warm_lane_release_thin=True) round-trips True."""
+        from orchestrator.config import GitConfig
+
+        cfg = GitConfig(warm_lane_release_thin=True)
+        assert cfg.warm_lane_release_thin is True
+
     def test_fused_memory_defaults(self, monkeypatch, tmp_path):
         monkeypatch.chdir(tmp_path)
         monkeypatch.delenv('ORCH_CONFIG_PATH', raising=False)
