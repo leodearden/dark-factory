@@ -37,7 +37,7 @@ from orchestrator.git_ops import (
     _run,
 )
 from orchestrator.landed_outbox import LandedOutbox, LandedRow, MergeProvenance
-from orchestrator.merge_disposition import MergeFailureDisposition
+from orchestrator.merge_disposition import MergeFailureDisposition, SkewEvidence
 from orchestrator.merge_drift import (  # noqa: F401  re-export shim
     _maybe_run_drift_check,
     _run_drift_check,
@@ -804,6 +804,41 @@ async def _classify_main_health_red(
     outcome = _build_main_health_outcome(verify, probe_sha)
     _emit_merge_attempt(event_store, req.task_id, OutcomeKind.main_health_red)
     return outcome
+
+
+def _render_skew_surfaces(
+    disposition: MergeFailureDisposition,
+    evidence: SkewEvidence | None,
+) -> tuple[str, dict[str, str] | None]:
+    """Render the I4 reason_suffix + failure_diagnostic surfaces for a
+    merge-skew attribution verdict (task 2383 β, M2 of
+    plans/merge-skew-attribution-prd.md).
+
+    Pure, no I/O.  Only ``INTEGRATION_SKEW`` with non-``None`` *evidence*
+    yields a non-empty ``reason_suffix`` — appended to the task-fault reason
+    so the debugger's dry-run context reads "port landed commit <sha>
+    touching <files> — do not hunt your own diff" — and a
+    ``failure_diagnostic`` ``dict[str, str]`` surfaced verbatim via
+    ``merge_status`` (I4).  Every other ``(disposition, evidence)``
+    combination — ``MAIN_RED`` / ``BRANCH_BUG`` / ``INDETERMINATE``, or
+    ``evidence=None`` — returns ``('', None)``.
+    """
+    if disposition is not MergeFailureDisposition.INTEGRATION_SKEW or evidence is None:
+        return '', None
+    commits = ', '.join(evidence.implicated_commits)
+    files = ', '.join(evidence.overlap_files)
+    tests = ', '.join(evidence.failing_tests)
+    reason_suffix = (
+        f'integration_skew: port landed commit(s) {commits} touching '
+        f'{files} — do not hunt your own diff'
+    )
+    failure_diagnostic = {
+        'disposition': disposition.value,
+        'implicated_commits': commits,
+        'overlap_files': files,
+        'failing_tests': tests,
+    }
+    return reason_suffix, failure_diagnostic
 
 
 # Sentinel task_id prefix for a laptop-side flock-worktree-contention alarm
