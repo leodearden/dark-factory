@@ -812,6 +812,35 @@ class TestStage1CycleSummaryHarnessBackstop:
             "Stage 1's report must remain present when Stage 2 fails"
         )
 
+    @pytest.mark.asyncio
+    async def test_backstop_failure_does_not_mask_original_exception_or_skip_persistence(
+        self, journal, event_buffer, mock_memory_service, ledger_store
+    ):
+        """A failing backstop write must never mask the real Stage 1 exception
+        nor prevent the finally block's existing update_run_stage_reports
+        persistence step from running (task 2440).
+
+        Without _ensure_stage1_cycle_summary's own try/except, an unhandled
+        exception raised inside a finally block replaces whatever exception
+        was already propagating — so an unguarded backstop failure would
+        both swallow the real 'stage1 exploded' error AND, because it raises
+        before reaching the next statement, skip update_run_stage_reports.
+        """
+        mock_memory_service.recon_ledger = ledger_store
+        mock_memory_service.get_memories_by_metadata = AsyncMock(return_value=[])
+        harness = _make_test_harness(journal, event_buffer, mock_memory_service)
+        harness.stages[0].run = AsyncMock(side_effect=RuntimeError('stage1 exploded'))
+        harness.journal.update_run_stage_reports = AsyncMock()
+
+        with patch(
+            'fused_memory.reconciliation.harness.write_stage1_cycle_summary',
+            AsyncMock(side_effect=RuntimeError('ledger boom')),
+        ):
+            with pytest.raises(RuntimeError, match='stage1 exploded'):
+                await harness.run_full_cycle('test-project', 'buffer_size:2')
+
+        harness.journal.update_run_stage_reports.assert_awaited_once()
+
 
 @pytest.mark.asyncio
 async def test_finding_partition_actionable_vs_non_actionable():
