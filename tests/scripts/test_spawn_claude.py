@@ -1783,11 +1783,21 @@ def test_sibling_parentage_two_way_into_hook_record(tmp_path: pathlib.Path) -> N
 # marker presence (started) + absence (done) rather than a wall-clock
 # tolerance: sleep_secs is chosen generously large relative to how long
 # _run_spawn itself takes to return, not tuned to any specific latency
-# budget.
+# budget -- large enough that the snapshot-on-return assertion stays
+# unambiguous even on a heavily-loaded CI runner.
+#
+# Two tests exercise two structurally different detach paths: the tmux lane
+# below (test_sibling_mode_is_fire_and_forget) was ALREADY detached by the
+# tmux server before this task, so sibling mode there only swaps
+# resolve_detached for resolve_sibling; the foreground-emulator lane further
+# down (test_sibling_mode_foreground_emulator_is_fire_and_forget) drives the
+# NEW explicit `setsid <emu> ... </dev/null >/dev/null 2>&1 &` detach this
+# task adds to the xterm/kitty/mac-terminal/custom branches -- the code most
+# likely to regress and, absent that second test, entirely uncovered.
 
 
 def _write_fake_claude_slow_with_markers(
-    bin_dir: pathlib.Path, started: pathlib.Path, done: pathlib.Path, sleep_secs: float = 5,
+    bin_dir: pathlib.Path, started: pathlib.Path, done: pathlib.Path, sleep_secs: float = 20,
 ) -> None:
     """Write a fake ``claude`` that touches *started* immediately, sleeps
     *sleep_secs*, then touches *done* and exits 0.
@@ -1795,6 +1805,11 @@ def _write_fake_claude_slow_with_markers(
     Used to prove fire-and-forget: the spawner returns after the child is
     launched (started exists) but WITHOUT waiting for it to finish (done
     does not exist yet) -- a marker-presence check, not a timing tolerance.
+    The default is deliberately generous (20s, comfortably inside
+    ``_run_spawn``'s 30s default timeout): the assertion is taken
+    immediately on return, not after the sleep, so a larger value costs
+    nothing in wall-clock but makes the "spawn-claude.sh reliably returns
+    well before the child finishes" premise robust under CI load.
     """
     p = bin_dir / "claude"
     p.write_text(
@@ -1826,7 +1841,7 @@ def test_sibling_mode_is_fire_and_forget(tmp_path: pathlib.Path) -> None:
     bin_dir = _make_bin_dir(tmp_path)
     started = tmp_path / "started"
     done = tmp_path / "done"
-    _write_fake_claude_slow_with_markers(bin_dir, started, done, sleep_secs=5)
+    _write_fake_claude_slow_with_markers(bin_dir, started, done, sleep_secs=20)
 
     tmux_marker = tmp_path / "tmux_used"
     _write_fake_tmux(bin_dir, tmux_marker)
@@ -1847,6 +1862,73 @@ def test_sibling_mode_is_fire_and_forget(tmp_path: pathlib.Path) -> None:
         "sibling mode must return WITHOUT waiting for the child to finish "
         "-- the done-marker must not exist yet at the moment "
         "spawn-claude.sh returns"
+    )
+
+    _wait_for_path(started, timeout=5.0)
+
+    fleet_root = pathlib.Path(env["CLAUDE_FLEET_ROOT"])
+    record_path = _find_one_record(fleet_root)
+    record = session_registry.SessionRecord.from_json(record_path.read_text())
+    assert record.status == session_registry.Status.RUNNING, (
+        f"expected a best-effort refresh to RUNNING, got {record.status}"
+    )
+
+
+def test_sibling_mode_foreground_emulator_is_fire_and_forget(tmp_path: pathlib.Path) -> None:
+    """Fire-and-forget must also hold for a foreground terminal emulator
+    (xterm) -- not just the tmux lane covered by
+    test_sibling_mode_is_fire_and_forget above.
+
+    The tmux lane was ALREADY detached by the tmux server before this task,
+    so sibling mode there only swaps resolve_detached for resolve_sibling.
+    The xterm branch is different: it needed a brand-new explicit detach
+    (``setsid xterm ... </dev/null >/dev/null 2>&1 &``, replacing the plain
+    foreground ``xterm ...`` call that resolve_foreground otherwise waits
+    on) -- the code most likely to regress, and, without this test, never
+    exercised by any sibling-mode test.
+
+    Premise-free and doubles as a pipe-holding check, not just a timing
+    check: ``_write_foreground_terminal``'s fake xterm does `exec bash -c
+    "$inner"` -- if spawn-claude.sh ever dropped the `setsid` backgrounding
+    or the `</dev/null >/dev/null 2>&1` stdio redirect, that exec'd process
+    (and the slow fake claude beneath it) would inherit and hold open THIS
+    test's own captured stdout/stderr pipe. subprocess.run's
+    capture_output read would then block until the child closes those
+    descriptors -- i.e. until it finishes sleeping and exits, ~sleep_secs
+    later -- so the done-marker would already exist (or the call would
+    approach its timeout) by the time control returned, not just fail a
+    bare marker check.
+
+    RED before step-4: sibling mode fell through to resolve_foreground's
+    plain, attached ``xterm "${args[@]}"`` call, so _run_spawn blocked until
+    the fake claude finished sleeping and touched done. GREEN after step-4's
+    setsid + stdio-redirect + resolve_sibling for the xterm branch.
+    """
+    bin_dir = _make_bin_dir(tmp_path)
+    started = tmp_path / "started"
+    done = tmp_path / "done"
+    _write_fake_claude_slow_with_markers(bin_dir, started, done, sleep_secs=20)
+    _write_foreground_terminal(bin_dir, "xterm")
+
+    env = _base_env(bin_dir, "xterm")
+    env["CLAUDE_SPAWN_MODE"] = "sibling"
+
+    result = _run_spawn(env, tmp_path)
+
+    assert result.returncode == 0, f"stderr: {result.stderr.decode()}"
+
+    # Snapshot immediately -- must reflect the state at the moment
+    # spawn-claude.sh returned, not after the started-marker poll below.
+    # Reaching this line at all (rather than subprocess.run blocking on a
+    # held-open pipe) is itself part of what's being asserted -- see the
+    # docstring above.
+    done_existed_at_return = done.exists()
+    assert not done_existed_at_return, (
+        "sibling mode via a foreground emulator (xterm) must return "
+        "WITHOUT waiting for the child to finish -- the done-marker must "
+        "not exist yet at the moment spawn-claude.sh returns, and the "
+        "caller's stdout/stderr pipe must not be held open by an "
+        "undetached child"
     )
 
     _wait_for_path(started, timeout=5.0)
