@@ -12,12 +12,14 @@ import, so its on-disk contract is pinned here.
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
 from orchestrator.fleet_heartbeat import (
     DEFAULT_FLEET_DIR,
     build_heartbeat_payload,
     resolve_fleet_dir,
+    write_heartbeat,
 )
 
 # ---------------------------------------------------------------------------
@@ -110,3 +112,90 @@ class TestBuildHeartbeatPayload:
             'queue_empty': False,
             'ts_epoch': 42.0,
         }
+
+
+# ---------------------------------------------------------------------------
+# write_heartbeat
+# ---------------------------------------------------------------------------
+
+
+class TestWriteHeartbeat:
+    """write_heartbeat(fleet_dir, unit, payload) — atomic tmp-file + os.replace writer."""
+
+    def test_writes_unit_json_and_creates_missing_parent_dirs(self, tmp_path):
+        """Writes <fleet_dir>/<unit>.json, creating missing nested parent dirs."""
+        fleet_dir = tmp_path / 'deep' / 'nested' / 'fleet'
+        payload = build_heartbeat_payload(
+            unit='orchestrator-reify.service',
+            merge_idle=True,
+            depth=0,
+            queue_empty=True,
+            ts_epoch=111.0,
+        )
+
+        result = write_heartbeat(fleet_dir, 'orchestrator-reify.service', payload)
+
+        expected = fleet_dir / 'orchestrator-reify.service.json'
+        assert expected.exists(), (
+            'Expected heartbeat file to be created, including missing parent dirs'
+        )
+        assert result == expected
+
+    def test_written_content_round_trips_the_exact_payload(self, tmp_path):
+        """File content json.loads back to the exact payload passed in."""
+        payload = build_heartbeat_payload(
+            unit='orchestrator-dark-factory.service',
+            merge_idle=False,
+            depth=2,
+            queue_empty=False,
+            ts_epoch=222.5,
+        )
+
+        result = write_heartbeat(tmp_path, 'orchestrator-dark-factory.service', payload)
+
+        assert json.loads(result.read_text()) == payload
+
+    def test_no_leftover_tmp_file_after_write(self, tmp_path):
+        """No <unit>.json.tmp remains after the atomic rename."""
+        payload = build_heartbeat_payload(
+            unit='orchestrator-reify.service',
+            merge_idle=True,
+            depth=0,
+            queue_empty=True,
+            ts_epoch=333.0,
+        )
+
+        write_heartbeat(tmp_path, 'orchestrator-reify.service', payload)
+
+        assert not (tmp_path / 'orchestrator-reify.service.json.tmp').exists()
+        assert sorted(p.name for p in tmp_path.iterdir()) == ['orchestrator-reify.service.json']
+
+    def test_returns_the_final_path(self, tmp_path):
+        """Returns the final on-disk Path (not the tmp path)."""
+        payload = build_heartbeat_payload(
+            unit='orchestrator-reify.service',
+            merge_idle=True,
+            depth=0,
+            queue_empty=True,
+            ts_epoch=444.0,
+        )
+
+        result = write_heartbeat(tmp_path, 'orchestrator-reify.service', payload)
+
+        assert result == tmp_path / 'orchestrator-reify.service.json'
+
+    def test_empty_unit_falls_back_to_deterministic_filename(self, tmp_path):
+        """unit='' never produces a file literally named '.json'; falls back deterministically."""
+        payload = build_heartbeat_payload(
+            unit='',
+            merge_idle=True,
+            depth=0,
+            queue_empty=True,
+            ts_epoch=555.0,
+        )
+
+        result = write_heartbeat(tmp_path, '', payload)
+
+        assert result.name != '.json'
+        assert result.exists()
+        assert result == tmp_path / 'unknown-unit.json'
