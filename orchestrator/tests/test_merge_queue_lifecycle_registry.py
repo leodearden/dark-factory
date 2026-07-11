@@ -27,7 +27,7 @@ import asyncio
 import contextlib
 import logging
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -1431,7 +1431,9 @@ class TestStopMidFlightRetiresEveryContainer:
         worker._register_item(item_pvg, initial=ItemLifecycleState.AWAITING_VERIFY)
         pvg_future: asyncio.Future = asyncio.get_running_loop().create_future()
         pvg_future.set_result(item_pvg)
-        worker._pending_verifier_get = pvg_future
+        # The production attr is typed asyncio.Task | None; this test seeds a
+        # done Future (only the .done()/.result() Future API is exercised).
+        worker._pending_verifier_get = cast(asyncio.Task, pvg_future)
 
         # 4. Verifier-queue item.
         req_vq = _make_request('kappa-stop-vq', 'kappa-stop-vq', tmp_path, config)
