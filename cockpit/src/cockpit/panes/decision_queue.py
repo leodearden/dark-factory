@@ -255,20 +255,27 @@ def order_queue(
     boosts: Mapping[str, int] | None = None,
     deferred: Mapping[str, datetime] | None = None,
     handling: Sequence[str] | None = None,
+    dropped: Sequence[str] | None = None,
 ) -> list[QueueItem]:
     """Build the score-ordered decision queue: every open decision + awaiting-input session.
 
     Pure and deterministic: identical inputs (including *now*) always
     produce an identical order (C3's score() is itself pure). Filters to
     state=='open' decisions and AWAITING_INPUT sessions only -- dropped/
-    answered decisions and non-awaiting sessions never appear (a session
-    row an operator has since dropped is excluded by the caller pre-
-    filtering *sessions*, not by this function). Sorted by score
-    descending, tiebroken by *key* for a total, stable order across calls.
+    answered decisions and non-awaiting sessions never appear. *dropped*
+    is a caller-supplied set of item keys ('decision:<id>'/'session:<slug>')
+    excluded on top of that: a DECISION row is normally dropped by
+    persisting state='dropped' and re-scanning (so it is already excluded
+    by the state filter above before it ever reaches *dropped*), but a
+    SESSION row has no cockpit-writable state field (PRD §2 design
+    decisions) -- its drop lives ONLY as an in-memory key in *dropped*,
+    which this function is what filters out. Sorted by score descending,
+    tiebroken by *key* for a total, stable order across calls.
     """
     boosts = boosts or {}
     deferred = deferred or {}
     handling_set = set(handling) if handling is not None else set()
+    dropped_set = set(dropped) if dropped is not None else set()
     sessions_by_slug = {session.session_slug: session for session in sessions}
 
     items: list[QueueItem] = []
@@ -277,6 +284,8 @@ def order_queue(
         if decision.state != DecisionState.OPEN:
             continue
         key = _decision_key(decision)
+        if key in dropped_set:
+            continue
         scoring_item = _apply_overrides(
             decision_to_scoring_item(decision, now=now), key, boosts, deferred
         )
@@ -299,6 +308,8 @@ def order_queue(
         if session.status != Status.AWAITING_INPUT:
             continue
         key = _session_key(session)
+        if key in dropped_set:
+            continue
         scoring_item = _apply_overrides(
             session_to_scoring_item(session, now=now), key, boosts, deferred
         )

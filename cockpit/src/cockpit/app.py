@@ -26,9 +26,11 @@ from pathlib import Path
 
 from orchestrator.session_registry import (
     DecisionRecord,
+    DecisionState,
     SessionRecord,
     list_decisions,
     set_manual_boost,
+    update_decision_state,
 )
 from textual.app import App, ComposeResult
 from textual.binding import Binding
@@ -80,6 +82,7 @@ class CockpitApp(App):
         Binding('enter', 'focus_selected', 'Focus', show=False),
         Binding('b', 'boost', 'Boost', show=False),
         Binding('B', 'big_boost', 'Big boost', show=False),
+        Binding('x', 'drop', 'Drop', show=False),
         *(Binding(str(d), f'set_priority({d})', f'Priority {d}', show=False) for d in range(10)),
     ]
 
@@ -120,6 +123,7 @@ class CockpitApp(App):
         self._queue_items_by_key: dict[str, QueueItem] = {}
         self._handling: set[str] = set()
         self._boosts: dict[str, int] = {}
+        self._dropped: set[str] = set()
 
     def compose(self) -> ComposeResult:
         yield Vertical(
@@ -192,6 +196,7 @@ class CockpitApp(App):
             now,
             boosts=self._boosts,
             handling=self._handling,
+            dropped=self._dropped,
         )
         queue = self.query_one('#decision-queue', DecisionQueue)
         queue.replace_rows(queue_items, now)
@@ -331,6 +336,37 @@ class CockpitApp(App):
         See _apply_boost.
         """
         self._apply_boost(absolute=priority)
+
+    def action_drop(self) -> None:
+        """'x' -- drop the highlighted row (PRD §9 C5b).
+
+        A DECISION-backed row persists via C1's update_decision_state --
+        the cockpit's other sanctioned decision write -- then re-scans
+        decisions so self._decisions (and its snapshot) reflect the
+        persisted state directly; order_queue's own state=='open' filter
+        then excludes it, exactly like _apply_boost's re-scan. A
+        SESSION-backed row has no cockpit-writable state field at all
+        (PRD §2 design decisions), so it is instead added to
+        self._dropped, an in-memory overlay order_queue filters out by
+        key -- never written to the session's own record. Either way the
+        queue is re-scored and re-rendered immediately -- never waits for
+        the next poll tick. Fail-soft: no highlighted row, or a key not
+        present in the last-built queue, no-ops.
+        """
+        queue = self.query_one('#decision-queue', DecisionQueue)
+        key = queue.highlighted_key()
+        if key is None:
+            return
+        item = self._queue_items_by_key.get(key)
+        if item is None:
+            return
+        if item.kind == 'decision' and item.decision_id is not None:
+            update_decision_state(item.decision_id, DecisionState.DROPPED, root=self.fleet_root)
+            self._decisions = list_decisions(self.fleet_root)
+            self._decisions_snapshot = _decisions_snapshot(self._decisions)
+        else:
+            self._dropped.add(key)
+        self._rebuild_queue()
 
     def _sync_detail_pane(self, slug: str | None) -> None:
         """Render *slug*'s record (or the empty placeholder) into the detail pane.
