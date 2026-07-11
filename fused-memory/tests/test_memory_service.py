@@ -2498,6 +2498,84 @@ class TestGetEntity:
         service.graphiti.search.assert_awaited_once()
         assert service.graphiti.search.call_args.kwargs['num_results'] == 10
 
+    # ------------------------------------------------------------------
+    # degraded fallback on embedding-provider quota/rate-limit exhaustion
+    # (task 2448) — mirrors search()'s degraded/failed_stores contract
+    # ------------------------------------------------------------------
+
+    @pytest.mark.asyncio
+    async def test_degraded_fallback_on_fuzzy_search_quota_error(self, service):
+        """A quota/rate-limit error from graphiti.search (fuzzy fallback) degrades
+        instead of raising: returns the degraded superset dict, no exception."""
+        service.graphiti.search_nodes = AsyncMock(return_value=[])
+        service.graphiti.search = AsyncMock(side_effect=_make_rate_limit_error())
+
+        result = await service.get_entity('entity', project_id='test')
+
+        assert result == {
+            'nodes': [],
+            'edges': [],
+            'degraded': True,
+            'failed_stores': ['graphiti'],
+        }
+
+    @pytest.mark.asyncio
+    async def test_degraded_fallback_on_fuzzy_search_nodes_duck_typed_quota_error(self, service):
+        """A duck-typed (non-openai) quota error from search_nodes also degrades —
+        the predicate isn't limited to the concrete openai.RateLimitError type."""
+
+        class FakeQuotaError(Exception):
+            status_code = 429
+
+        service.graphiti.search_nodes = AsyncMock(side_effect=FakeQuotaError('rate limited'))
+        service.graphiti.search = AsyncMock(return_value=[])
+
+        result = await service.get_entity('entity', project_id='test')
+
+        assert result == {
+            'nodes': [],
+            'edges': [],
+            'degraded': True,
+            'failed_stores': ['graphiti'],
+        }
+
+    @pytest.mark.asyncio
+    async def test_degraded_fallback_on_exact_match_quota_error(self, service):
+        """A quota/rate-limit error from get_nodes_by_exact_name (exact-match path)
+        also degrades instead of raising."""
+        service.graphiti.get_nodes_by_exact_name = AsyncMock(
+            side_effect=_make_rate_limit_error()
+        )
+
+        result = await service.get_entity('Task 115', project_id='test')
+
+        assert result == {
+            'nodes': [],
+            'edges': [],
+            'degraded': True,
+            'failed_stores': ['graphiti'],
+        }
+
+    @pytest.mark.asyncio
+    async def test_non_quota_error_still_propagates(self, service):
+        """A non-quota RuntimeError from the fuzzy fallback still propagates unchanged —
+        the degraded fallback is narrowly scoped to quota/rate-limit errors only."""
+        service.graphiti.search_nodes = AsyncMock(return_value=[])
+        service.graphiti.search = AsyncMock(side_effect=RuntimeError('boom'))
+
+        with pytest.raises(RuntimeError, match='boom'):
+            await service.get_entity('entity', project_id='test')
+
+    @pytest.mark.asyncio
+    async def test_cancelled_error_still_propagates_not_degraded(self, service):
+        """asyncio.CancelledError must still propagate unchanged — cancellation is
+        never treated as a degraded-fallback condition."""
+        service.graphiti.search_nodes = AsyncMock(return_value=[])
+        service.graphiti.search = AsyncMock(side_effect=asyncio.CancelledError())
+
+        with pytest.raises(asyncio.CancelledError):
+            await service.get_entity('entity', project_id='test')
+
 
 class TestEdgeToDict:
     """Unit tests for the module-level _edge_to_dict helper."""
