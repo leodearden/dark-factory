@@ -103,6 +103,21 @@ def _citation_identities(finding: dict) -> set[str]:
     return ids
 
 
+def _cited_task_key(project_id: str, task_id: str) -> str:
+    """Build the canonical ``'{project_id}:{task_id}'`` identity string that
+    anchors the in-run primary-cited-task fold (task-2425).
+
+    Single-sourced so :meth:`ReconReportState.cite_task` (fold registration)
+    and :meth:`ReconReportState._purge_finding` (fold-key cleanup) can never
+    drift apart — if the two built this string independently and the formats
+    diverged, a purge would silently fail to clear the anchor it registered,
+    leaking a stale ``_run_cited_task_index`` entry.  Mirrors the
+    ``f'{pid}:{tid}'`` convention :func:`_citation_identities` already uses
+    for ``cited_tasks`` entries.
+    """
+    return f'{project_id}:{task_id}'
+
+
 def _traces_exclusively_to_stage1(
     finding: dict,
     stage1_identities: set[str],
@@ -357,6 +372,12 @@ class ReconReportState:
         self._run_sig_index: dict[str, dict[tuple, str]] = {}  # run_id → {sig → finding_id}
         self._run_finding_index: dict[str, dict[str, _ReportEntry]] = {}  # run_id → {finding_id → entry}
         self._run_desc_index: dict[str, dict[str, str]] = {}  # run_id → {desc_hash → finding_id}
+        # run_id → {"project_id:task_id" → finding_id} for a null-task_id
+        # finding's PRIMARY (first-ever) cited external task (task-2425).
+        # Same run-quiescence-scoped lifetime as the three indices above —
+        # see tick()'s docstring — released together, never torn down
+        # per-entry.
+        self._run_cited_task_index: dict[str, dict[str, str]] = {}
         self._reaper_task: asyncio.Task | None = None
         # cite_* service injection (task β)
         self._memory_service = memory_service
@@ -567,14 +588,18 @@ class ReconReportState:
         complete()'s cached ``flagged_count``/``stats`` from silent
         corruption.  Retraction is intended for in-progress stages.
 
-        Removes the finding from ``entry.findings`` and
-        ``_run_finding_index``, and also cleans whichever dedup index it
-        was filed under (``_run_sig_index`` / ``_run_desc_index`` and
-        their per-entry mirrors) — recomputed from the finding's own
-        already-canonicalized ``task_id``/``flag_type``/``description`` —
-        so a corrected finding can be re-filed under the same
-        signature/description after retraction instead of bouncing off a
-        stale ``duplicate_finding`` pointer.
+        Removes the finding from ``entry.findings`` and every dedup index
+        it may be registered under — ``_run_finding_index``, whichever of
+        ``_run_sig_index`` / ``_run_desc_index`` it was filed under (and
+        their per-entry mirrors), and ``_run_cited_task_index`` if it is a
+        primary-cited-task fold anchor (task-2425) — via the single-sourced
+        :meth:`_purge_finding` helper shared with the in-run cited-task
+        fold's retract path in :meth:`cite_task`. Indices are recomputed
+        from the finding's own already-canonicalized
+        ``task_id``/``flag_type``/``description``/``cited_tasks``, so a
+        corrected finding can be re-filed under the same signature,
+        description, or primary cited task after retraction instead of
+        bouncing off a stale ``duplicate_finding`` pointer.
         """
         entry = self._resolve_entry(run_id)
         if entry is None:
@@ -595,24 +620,7 @@ class ReconReportState:
             )
             return _ERR_ALREADY_COMPLETED.copy()
 
-        # Identity-based removal (not list.remove(), which dispatches to
-        # _Finding's dataclass-generated __eq__): _resolve_finding returned
-        # this exact object by reference from owning_entry.findings, so
-        # filtering by `is` makes the "remove precisely the resolved
-        # object" invariant explicit rather than relying on field-by-field
-        # equality (harmless today since finding_id is unique and is one of
-        # the compared fields, but identity is the actual invariant).
-        owning_entry.findings[:] = [f for f in owning_entry.findings if f is not finding]
-        self._run_finding_index.get(run_id, {}).pop(finding_id, None)
-
-        sig = (finding.task_id, finding.flag_type)
-        if sig != (None, None):
-            self._run_sig_index.get(run_id, {}).pop(sig, None)
-            owning_entry._signature_to_finding.pop(sig, None)
-        elif _normalize_description(finding.description):
-            desc_hash = _description_hash(finding.description)
-            self._run_desc_index.get(run_id, {}).pop(desc_hash, None)
-            owning_entry._deschash_to_finding.pop(desc_hash, None)
+        self._purge_finding(run_id, owning_entry, finding)
 
         return {'status': 'deleted', 'finding_id': finding_id}
 
@@ -879,6 +887,59 @@ class ReconReportState:
                 return entry, f
         return None
 
+    def _purge_finding(
+        self,
+        run_id: str,
+        owning_entry: _ReportEntry,
+        finding: _Finding,
+    ) -> None:
+        """Remove *finding* from *owning_entry* and every dedup index it may
+        be registered under: ``_run_finding_index``, whichever of
+        ``_run_sig_index`` / ``_run_desc_index`` it was filed under, and
+        ``_run_cited_task_index`` if it is a primary-cited-task fold anchor.
+
+        Single-sourced (task-2425) by :meth:`delete_finding` and the in-run
+        cited-task fold's retract path in :meth:`cite_task`, so the four
+        run-level dedup indices can never drift out of sync between the two
+        removal paths, and neither path can leave a stale pointer to a
+        finding that no longer exists.
+
+        Identity-based removal (``is``, not ``==``) — *finding* is the exact
+        object reference returned by :meth:`_resolve_finding`; see
+        ``delete_finding``'s docstring for why this matters.
+
+        Removal is wholesale: *finding* is dropped from ``owning_entry.findings``
+        entirely, so any ``cited_entities`` / ``cited_edges`` / ``cited_memories``
+        already recorded on it (e.g. via ``cite_entity`` / ``cite_edge`` /
+        ``cite_memory`` calls made before this purge) are discarded along with
+        it — not just the four dedup indices. For the cite_task fold this is
+        intentional (task-2425): a finding judged a same-run duplicate of an
+        earlier one contributes no new information, so citations already
+        attached to it are not worth preserving. A caller that records
+        cite_entity/cite_edge/cite_memory citations on a null-task_id finding
+        BEFORE its first cite_task call should know those citations vanish
+        silently if that cite_task later folds the finding into an existing
+        duplicate.
+        """
+        owning_entry.findings[:] = [f for f in owning_entry.findings if f is not finding]
+        self._run_finding_index.get(run_id, {}).pop(finding.finding_id, None)
+
+        sig = (finding.task_id, finding.flag_type)
+        if sig != (None, None):
+            self._run_sig_index.get(run_id, {}).pop(sig, None)
+            owning_entry._signature_to_finding.pop(sig, None)
+        elif _normalize_description(finding.description):
+            desc_hash = _description_hash(finding.description)
+            self._run_desc_index.get(run_id, {}).pop(desc_hash, None)
+            owning_entry._deschash_to_finding.pop(desc_hash, None)
+
+        if finding.task_id is None and finding.cited_tasks:
+            primary = finding.cited_tasks[0]
+            primary_key = _cited_task_key(primary['project_id'], primary['task_id'])
+            run_cited_tasks = self._run_cited_task_index.get(run_id, {})
+            if run_cited_tasks.get(primary_key) == finding.finding_id:
+                run_cited_tasks.pop(primary_key, None)
+
     # ------------------------------------------------------------------
     # cite_* tools (task β)
     # ------------------------------------------------------------------
@@ -966,7 +1027,33 @@ class ReconReportState:
         Returns {project_id, task_id, title} on success, or a structured error
         dict (run_id_unknown / finding_unknown / unknown_project / task_not_found).
         project_id is validated against self.known_projects before any service call.
-        Appends to finding.cited_tasks only on success.
+        Appends to finding.cited_tasks only on success, skipping the append when
+        an identical {project_id, task_id} citation is already present so a
+        re-citation of the same task (e.g. re-citing a finding's own primary
+        task) stays idempotent instead of accumulating a duplicate entry
+        (task-2425 amend). This idempotency check keys ONLY on
+        {project_id, task_id} — first-cited title wins: if the upstream
+        task's title has since changed, a re-citation is still skipped and
+        the stored citation keeps the original title rather than refreshing
+        it. Titles are cosmetic display text, not part of the citation's
+        identity, so this staleness is accepted rather than reconciled.
+
+        In-run cited-task fold (task-2425): when *finding* has a null
+        top-level task_id and this is its PRIMARY (first-ever) citation, the
+        (project_id, task_id) pair doubles as an in-run dedup anchor. If an
+        earlier finding in this run already registered the same primary
+        cited task, the just-looked-up finding is purged and
+        ``duplicate_finding`` is returned instead — two findings citing the
+        same external blocker are semantically duplicate regardless of how
+        differently they are worded. Findings with a real top-level task_id,
+        and secondary (non-first) citations, are never fold anchors.
+
+        The fold EXEMPTS ``memory_consolidator`` (Stage-1) findings, mirroring
+        Fix-1's read-time ``stage != 'memory_consolidator'`` carve-out in
+        :meth:`get_assembled_report`: two sibling Stage-1 findings that cite the
+        same target stay distinct, and a Stage-2 echo of a Stage-1 citation is
+        already suppressed at read time — so the write-time fold only collapses
+        same-run duplicates in a non-Stage-1 stage that Fix-1 cannot reach.
         """
         entry = self._resolve_entry(run_id)
         if entry is None:
@@ -975,7 +1062,7 @@ class ReconReportState:
         resolved = self._resolve_finding(run_id, finding_id)
         if resolved is None:
             return _ERR_FINDING_UNKNOWN.copy()
-        _, finding = resolved
+        finding_entry, finding = resolved
 
         if project_id not in self.known_projects:
             return _ERR_UNKNOWN_PROJECT.copy()
@@ -993,7 +1080,50 @@ class ReconReportState:
         data = result.get('data') if isinstance(result.get('data'), dict) else {}
         title = result.get('title') or data.get('title', '')
         citation = {'project_id': project_id, 'task_id': task_id, 'title': title}
-        finding.cited_tasks.append(citation)
+
+        # In-run cited-task fold (task-2425) — see docstring above. Only the
+        # PRIMARY citation (finding.cited_tasks still empty) of a null-
+        # top-level-task_id finding is a fold anchor.
+        #
+        # memory_consolidator (Stage 1) findings are EXEMPT from the fold —
+        # mirroring Fix-1's own read-time carve-out in get_assembled_report
+        # (`stage != 'memory_consolidator'`). Two sibling Stage-1 findings that
+        # cite the same target are deliberately kept distinct (see
+        # test_sibling_stage1_findings_not_mutually_suppressed); a Stage-2 echo
+        # of a Stage-1 citation is already handled at read time by
+        # _traces_exclusively_to_stage1. The write-time fold therefore only
+        # targets the gap Fix-1 cannot reach: two same-run findings in a
+        # non-Stage-1 stage (e.g. task_knowledge_sync) that cite the same
+        # external blocker Stage 1 never cited — the autopilot_video repro.
+        if (
+            finding.task_id is None
+            and not finding.cited_tasks
+            and finding_entry.stage != 'memory_consolidator'
+        ):
+            cited_task_key = _cited_task_key(project_id, task_id)
+            run_cited_tasks = self._run_cited_task_index.setdefault(run_id, {})
+            existing_id = run_cited_tasks.get(cited_task_key)
+            if existing_id is not None and existing_id != finding.finding_id:
+                self._purge_finding(run_id, finding_entry, finding)
+                return _duplicate_finding_error(existing_id)
+            run_cited_tasks[cited_task_key] = finding.finding_id
+
+        # task-2425 amend: skip the append when an identical {project_id,
+        # task_id} citation is already present. Without this, re-citing a
+        # finding's own primary task (see
+        # test_only_primary_citation_is_a_fold_anchor) appends a second,
+        # redundant citation entry — harmless to the fold itself (which
+        # always keys off cited_tasks[0]) but it lets cited_tasks accumulate
+        # duplicate rows. Keyed on (project_id, task_id) only, NOT title —
+        # first-cited title wins; a re-citation after the upstream title
+        # changed is still skipped rather than refreshing the stored title
+        # (see cite_task's docstring).
+        already_cited = any(
+            c['project_id'] == project_id and c['task_id'] == task_id
+            for c in finding.cited_tasks
+        )
+        if not already_cited:
+            finding.cited_tasks.append(citation)
         return citation
 
     async def cite_memory(
@@ -1051,9 +1181,9 @@ class ReconReportState:
         stay citable, and the object only becomes unreachable once the run's
         indices are popped at quiescence.
 
-        The three shared run-level dedup indices (``_run_sig_index`` /
-        ``_run_desc_index`` / ``_run_finding_index``) are RUN-QUIESCENCE
-        scoped, not per-entry (task-2088). They are keyed for the WHOLE run
+        The four shared run-level dedup indices (``_run_sig_index`` /
+        ``_run_desc_index`` / ``_run_finding_index`` / ``_run_cited_task_index``)
+        are RUN-QUIESCENCE scoped, not per-entry (task-2088). They are keyed for the WHOLE run
         across all of its stages, and reconciliation runs are multi-stage and
         long-lived: Stage 1 (memory_consolidator) typically files a finding
         and completes early, while Stage 2/3 + remediation keep the run live
@@ -1066,10 +1196,10 @@ class ReconReportState:
         collapsing _run_finding_index out from under it.
 
         So: while at least one ``(run_id, *)`` entry remains in ``_state``
-        (in-progress, or completed but not yet past its own TTL), all three
+        (in-progress, or completed but not yet past its own TTL), all four
         indices for that run_id are preserved untouched, even for stages that
         have already been evicted. Only when a run's LAST entry evicts do we
-        release its three indices, wholesale via ``pop(rid, None)`` rather
+        release its four indices, wholesale via ``pop(rid, None)`` rather
         than by walking the evicted entry's own signature/desc-hash/finding
         maps — this correctly reclaims contributions from every stage of the
         run in one shot and is robust to several same-run entries evicting
@@ -1090,7 +1220,7 @@ class ReconReportState:
         entry to individually hit completed_at + TTL. An in-progress entry
         never expires on its own — it is immortal by design (PRD §9.4; see
         test_inprogress_not_evicted_by_ttl) — so a stalled or crashed stage
-        that never calls complete() pins that run_id's three indices, and
+        that never calls complete() pins that run_id's four indices, and
         every already-evicted sibling entry object kept reachable through
         ``_run_finding_index``, for as long as the process keeps running.
         There is currently no separate max-lifetime sweep for in-progress
@@ -1118,7 +1248,7 @@ class ReconReportState:
             # Compute the set of run_ids with a surviving _state entry ONCE,
             # after all of this sweep's deletions, instead of rescanning
             # _state per evicted entry. A run_id that evicted this tick and
-            # has no surviving entry is fully quiescent — release its three
+            # has no surviving entry is fully quiescent — release its four
             # shared indices wholesale.
             live_run_ids = {r for (r, _s) in self._state}
             for rid in evicted_run_ids:
@@ -1126,6 +1256,7 @@ class ReconReportState:
                     self._run_sig_index.pop(rid, None)
                     self._run_finding_index.pop(rid, None)
                     self._run_desc_index.pop(rid, None)
+                    self._run_cited_task_index.pop(rid, None)
         if to_evict:
             logger.debug('recon_report reaper evicted %d entries', len(to_evict))
         return len(to_evict)
@@ -1313,6 +1444,10 @@ def create_recon_report_server(state: ReconReportState):  # -> FastMCP
         Returns {project_id, task_id, title} or a structured error dict.
         unknown_project when project_id is not in the known_projects registry.
         task_not_found when the task does not exist in the project.
+        duplicate_finding (task-2425) when this is a null-task_id finding's
+        primary citation and an earlier finding in this run already cited
+        the same (project_id, task_id) — the newly-cited finding is purged
+        and existing_finding_id points at the original.
         """
         return await state.cite_task(
             run_id=run_id,

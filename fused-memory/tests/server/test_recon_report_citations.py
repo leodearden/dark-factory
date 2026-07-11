@@ -474,6 +474,534 @@ class TestCiteTask:
 
 
 # ---------------------------------------------------------------------------
+# task-2425 step-1: TestCiteTaskInRunCitedTaskDedup — RED until step-2 adds
+# the in-run cited-task fold to ReconReportState.cite_task
+# ---------------------------------------------------------------------------
+
+
+class TestCiteTaskInRunCitedTaskDedup:
+    """In-run dedup fold (task-2425): two null-task_id findings that cite the
+    SAME primary external task are semantically duplicate regardless of how
+    differently they are worded (different category/flag_type/description),
+    because they evade BOTH add_finding in-run guards — the (task_id,
+    flag_type) signature path (task_id=None on both is not itself a
+    collision) and the null-null description-content-hash path (task-1654;
+    differently-worded descriptions hash differently). The fold can only
+    live in cite_task: it is the first point after add_finding where the
+    finding's primary cited external task identity becomes known.
+    """
+
+    def _fake_ti(self):
+        """Fake task interceptor covering the external task ids these tests cite."""
+        known_roots = {'/home/leo/src/dark-factory'}
+        results = {}
+        for pr in known_roots:
+            for tid in ['2405', '2406', '9999']:
+                results[(tid, pr)] = {'id': tid, 'title': f'T-{tid}'}
+        return _FakeTaskInterceptor(results=results)
+
+    def _make_state(self, fake_ti=None, memory_service=None):
+        from fused_memory.server.recon_report import ReconReportState
+
+        if fake_ti is None:
+            fake_ti = self._fake_ti()
+        t = [0.0]
+        state = ReconReportState(
+            ttl_seconds=300,
+            clock=lambda: t[0],
+            task_interceptor=fake_ti,
+            memory_service=memory_service,
+        )
+        state.known_projects = dict(_KNOWN_PROJECTS)
+        return state, t
+
+    @pytest.mark.asyncio
+    async def test_core_repro_second_citer_of_same_task_folds_as_duplicate(self):
+        """CORE REPRO: two null-task_id findings, worded differently (one
+        null-null, one with a distinct non-null flag_type so it evades the
+        (task_id, flag_type) signature guard too), both cite the SAME
+        external task. The second cite_task must fold: return
+        duplicate_finding pointing at the first finding, and the assembled
+        report must retain exactly that one finding.
+        """
+        state, _ = self._make_state()
+        state.start_report(run_id='run-1', stage='reconciler', project_id='dark_factory')
+
+        first = state.add_finding(
+            run_id='run-1',
+            severity='moderate',
+            category='cross_project',
+            description='dark_factory:2405 still pending, unchanged',
+            suggested_action='wait for upstream',
+            actionable=True,
+            task_id=None,
+            flag_type=None,
+        )
+        assert 'finding_id' in first, f'add_finding failed: {first}'
+        finding_id_1 = first['finding_id']
+
+        second = state.add_finding(
+            run_id='run-1',
+            severity='moderate',
+            category='cross_project_routing',
+            description='blocked pending dark_factory task 2405 per routing check',
+            suggested_action='reroute once unblocked',
+            actionable=True,
+            task_id=None,
+            flag_type='cross_project_routing_stale',
+        )
+        assert 'finding_id' in second, f'add_finding failed: {second}'
+        finding_id_2 = second['finding_id']
+        # Sanity: both guards in add_finding were evaded — two distinct
+        # findings were allocated (this is the bug's precondition).
+        assert finding_id_2 != finding_id_1
+
+        cite_1 = await state.cite_task('run-1', finding_id_1, 'dark_factory', '2405')
+        assert cite_1.get('project_id') == 'dark_factory'
+        assert cite_1.get('task_id') == '2405'
+
+        cite_2 = await state.cite_task('run-1', finding_id_2, 'dark_factory', '2405')
+        assert cite_2.get('error') == 'duplicate_finding'
+        assert cite_2.get('error_type') == 'ReconReportDuplicateFinding'
+        assert cite_2.get('existing_finding_id') == finding_id_1
+
+        # The folded (second) finding is fully purged, not just hidden.
+        assert state._resolve_finding('run-1', finding_id_2) is None
+
+        report = state.get_assembled_report('run-1', 'reconciler')
+        assert report is not None
+        ids = [item['finding_id'] for item in report['flagged_items']]
+        assert ids == [finding_id_1]
+
+    @pytest.mark.asyncio
+    async def test_different_primary_cited_tasks_both_survive(self):
+        """Two null-task_id findings citing DIFFERENT external tasks must
+        both keep their citation — no false-positive fold.
+        """
+        state, _ = self._make_state()
+        state.start_report(run_id='run-1', stage='reconciler', project_id='dark_factory')
+
+        f1 = state.add_finding(
+            run_id='run-1', severity='low', category='cross_project',
+            description='desc A', suggested_action='a',
+            task_id=None, flag_type=None,
+        )
+        f2 = state.add_finding(
+            run_id='run-1', severity='low', category='cross_project',
+            description='desc B', suggested_action='a',
+            task_id=None, flag_type='other_flag',
+        )
+        fid1, fid2 = f1['finding_id'], f2['finding_id']
+
+        cite1 = await state.cite_task('run-1', fid1, 'dark_factory', '2405')
+        cite2 = await state.cite_task('run-1', fid2, 'dark_factory', '2406')
+
+        assert 'error' not in cite1, cite1
+        assert 'error' not in cite2, cite2
+
+        report = state.get_assembled_report('run-1', 'reconciler')
+        assert report is not None
+        ids = {item['finding_id'] for item in report['flagged_items']}
+        assert ids == {fid1, fid2}
+
+    @pytest.mark.asyncio
+    async def test_non_null_task_id_finding_is_never_a_fold_anchor(self):
+        """A finding with a REAL top-level task_id is never folded, even if
+        it cites the same external task that a null-task_id finding also
+        cites — the fold is gated strictly on finding.task_id is None.
+        """
+        state, _ = self._make_state()
+        state.start_report(run_id='run-1', stage='reconciler', project_id='dark_factory')
+
+        f_null = state.add_finding(
+            run_id='run-1', severity='low', category='cross_project',
+            description='null task_id desc', suggested_action='a',
+            task_id=None, flag_type=None,
+        )
+        f_real = state.add_finding(
+            run_id='run-1', severity='low', category='cross_project',
+            description='real task_id desc', suggested_action='a',
+            task_id='9876', flag_type='some_flag',
+        )
+        fid_null, fid_real = f_null['finding_id'], f_real['finding_id']
+
+        cite_null = await state.cite_task('run-1', fid_null, 'dark_factory', '2405')
+        cite_real = await state.cite_task('run-1', fid_real, 'dark_factory', '2405')
+
+        assert 'error' not in cite_null, cite_null
+        assert 'error' not in cite_real, cite_real
+
+        report = state.get_assembled_report('run-1', 'reconciler')
+        assert report is not None
+        ids = {item['finding_id'] for item in report['flagged_items']}
+        assert ids == {fid_null, fid_real}
+
+    @pytest.mark.asyncio
+    async def test_cross_run_isolation_same_primary_task_both_survive(self):
+        """The SAME primary external task cited from two different run_ids
+        must not fold across runs.
+        """
+        state, _ = self._make_state()
+        state.start_report(run_id='run-1', stage='reconciler', project_id='dark_factory')
+        state.start_report(run_id='run-2', stage='reconciler', project_id='dark_factory')
+
+        f1 = state.add_finding(
+            run_id='run-1', severity='low', category='cross_project',
+            description='run1 desc', suggested_action='a',
+            task_id=None, flag_type=None,
+        )
+        f2 = state.add_finding(
+            run_id='run-2', severity='low', category='cross_project',
+            description='run2 desc', suggested_action='a',
+            task_id=None, flag_type=None,
+        )
+        fid1, fid2 = f1['finding_id'], f2['finding_id']
+
+        cite1 = await state.cite_task('run-1', fid1, 'dark_factory', '2405')
+        cite2 = await state.cite_task('run-2', fid2, 'dark_factory', '2405')
+
+        assert 'error' not in cite1, cite1
+        assert 'error' not in cite2, cite2
+
+        report1 = state.get_assembled_report('run-1', 'reconciler')
+        report2 = state.get_assembled_report('run-2', 'reconciler')
+        assert report1 is not None and report2 is not None
+        assert [i['finding_id'] for i in report1['flagged_items']] == [fid1]
+        assert [i['finding_id'] for i in report2['flagged_items']] == [fid2]
+
+    @pytest.mark.asyncio
+    async def test_only_primary_citation_is_a_fold_anchor(self):
+        """Citing a SECOND task on a finding must not register a fold
+        anchor for that second task, and re-citing the finding's own
+        primary task again on the SAME finding must not self-collapse.
+        """
+        state, _ = self._make_state()
+        state.start_report(run_id='run-1', stage='reconciler', project_id='dark_factory')
+
+        f1 = state.add_finding(
+            run_id='run-1', severity='low', category='cross_project',
+            description='desc one', suggested_action='a',
+            task_id=None, flag_type=None,
+        )
+        fid1 = f1['finding_id']
+
+        cite_primary = await state.cite_task('run-1', fid1, 'dark_factory', '2405')
+        assert 'error' not in cite_primary, cite_primary
+
+        # Secondary citation on the SAME finding — must succeed plainly.
+        cite_secondary = await state.cite_task('run-1', fid1, 'dark_factory', '9999')
+        assert 'error' not in cite_secondary, cite_secondary
+
+        # A DIFFERENT finding citing '9999' as ITS primary must still
+        # succeed — proving the secondary citation above did not register
+        # '9999' as a fold anchor.
+        f2 = state.add_finding(
+            run_id='run-1', severity='low', category='cross_project',
+            description='desc two', suggested_action='a',
+            task_id=None, flag_type='another_flag',
+        )
+        fid2 = f2['finding_id']
+        cite_other_primary = await state.cite_task('run-1', fid2, 'dark_factory', '9999')
+        assert 'error' not in cite_other_primary, cite_other_primary
+
+        # Re-citing finding 1's own primary task again must not self-collapse.
+        cite_primary_again = await state.cite_task('run-1', fid1, 'dark_factory', '2405')
+        assert 'error' not in cite_primary_again, cite_primary_again
+
+        report = state.get_assembled_report('run-1', 'reconciler')
+        assert report is not None
+        ids = {item['finding_id'] for item in report['flagged_items']}
+        assert ids == {fid1, fid2}
+
+        # task-2425 amend: re-citing the same primary task must not create a
+        # duplicate citation entry either -- fid1's cited_tasks stays at its
+        # two distinct citations ('2405' primary + '9999' secondary), not
+        # three with '2405' appearing twice.
+        item_1 = next(i for i in report['flagged_items'] if i['finding_id'] == fid1)
+        cited_pairs = [(c['project_id'], c['task_id']) for c in item_1['cited_tasks']]
+        assert cited_pairs == [('dark_factory', '2405'), ('dark_factory', '9999')]
+
+    @pytest.mark.asyncio
+    async def test_two_memory_consolidator_findings_citing_same_task_both_survive(self):
+        """memory_consolidator (Stage-1) findings are EXEMPT from the in-run
+        cited-task fold (esc-2425-1): the fold is gated on
+        ``finding_entry.stage != 'memory_consolidator'``, mirroring Fix-1's
+        read-time ``stage != 'memory_consolidator'`` carve-out in
+        get_assembled_report. Two Stage-1 siblings citing the SAME external
+        task as their primary citation must both survive -- neither is
+        folded/purged -- exactly like
+        test_sibling_stage1_findings_not_mutually_suppressed in
+        test_recon_report.py, but exercised at the write-time fold rather
+        than the read-time suppression.
+        """
+        state, _ = self._make_state()
+        state.start_report(run_id='run-1', stage='memory_consolidator', project_id='dark_factory')
+
+        f1 = state.add_finding(
+            run_id='run-1', severity='low', category='cross_project',
+            description='mc desc one', suggested_action='a',
+            task_id=None, flag_type=None,
+        )
+        f2 = state.add_finding(
+            run_id='run-1', severity='low', category='cross_project',
+            description='mc desc two', suggested_action='a',
+            task_id=None, flag_type='other_flag',
+        )
+        fid1, fid2 = f1['finding_id'], f2['finding_id']
+
+        cite1 = await state.cite_task('run-1', fid1, 'dark_factory', '2405')
+        cite2 = await state.cite_task('run-1', fid2, 'dark_factory', '2405')
+
+        assert 'error' not in cite1, cite1
+        assert 'error' not in cite2, cite2
+
+        report = state.get_assembled_report('run-1', 'memory_consolidator')
+        assert report is not None
+        ids = {item['finding_id'] for item in report['flagged_items']}
+        assert ids == {fid1, fid2}
+
+    @pytest.mark.asyncio
+    async def test_memory_consolidator_finding_does_not_consume_fold_anchor_for_other_stage(self):
+        """A memory_consolidator-stage citation must not register a fold
+        anchor that a later non-mc-stage finding relies on. Stage 1 cites an
+        external task first; Stage 2 (reconciler) then cites the SAME task
+        as ITS OWN primary citation -- it must succeed plainly (not fold),
+        proving the Stage-1 citation registered nothing in
+        ``_run_cited_task_index`` for the non-mc stage to collide with.
+        """
+        state, _ = self._make_state()
+
+        state.start_report(run_id='run-1', stage='memory_consolidator', project_id='dark_factory')
+        f_mc = state.add_finding(
+            run_id='run-1', severity='low', category='cross_project',
+            description='mc desc', suggested_action='a',
+            task_id=None, flag_type=None,
+        )
+        fid_mc = f_mc['finding_id']
+        cite_mc = await state.cite_task('run-1', fid_mc, 'dark_factory', '2405')
+        assert 'error' not in cite_mc, cite_mc
+
+        state.start_report(run_id='run-1', stage='reconciler', project_id='dark_factory')
+        f_recon = state.add_finding(
+            run_id='run-1', severity='low', category='cross_project',
+            description='recon desc', suggested_action='a',
+            task_id=None, flag_type='recon_flag',
+        )
+        fid_recon = f_recon['finding_id']
+        cite_recon = await state.cite_task('run-1', fid_recon, 'dark_factory', '2405')
+        assert 'error' not in cite_recon, cite_recon
+
+        report_mc = state.get_assembled_report('run-1', 'memory_consolidator')
+        report_recon = state.get_assembled_report('run-1', 'reconciler')
+        assert report_mc is not None and report_recon is not None
+        assert [i['finding_id'] for i in report_mc['flagged_items']] == [fid_mc]
+        assert [i['finding_id'] for i in report_recon['flagged_items']] == [fid_recon]
+
+    @pytest.mark.asyncio
+    async def test_folded_finding_discards_previously_recorded_citations(self):
+        """task-2425 amend: _purge_finding removes a folded finding
+        wholesale, not just its dedup-index entries. If the folded finding
+        had already accumulated a cite_entity/cite_edge/cite_memory citation
+        BEFORE the cite_task call that folds it, that citation is discarded
+        along with the finding -- it is not merged onto the surviving
+        finding. Pins the behavior documented in _purge_finding's and
+        cite_task's docstrings so it stays intentional rather than an
+        undetected regression.
+        """
+        fake_ms = _FakeMemoryService(
+            entity_nodes=[{'uuid': 'aaaaaaaa-1111-1111-1111-111111111111', 'name': 'Foo'}]
+        )
+        state, _ = self._make_state(memory_service=fake_ms)
+        state.start_report(run_id='run-1', stage='reconciler', project_id='dark_factory')
+
+        first = state.add_finding(
+            run_id='run-1', severity='moderate', category='cross_project',
+            description='desc one', suggested_action='a',
+            task_id=None, flag_type=None,
+        )
+        fid1 = first['finding_id']
+        cite1 = await state.cite_task('run-1', fid1, 'dark_factory', '2405')
+        assert 'error' not in cite1, cite1
+
+        second = state.add_finding(
+            run_id='run-1', severity='moderate', category='cross_project_routing',
+            description='desc two', suggested_action='a',
+            task_id=None, flag_type='other_flag',
+        )
+        fid2 = second['finding_id']
+
+        # fid2 accumulates a cite_entity citation BEFORE the cite_task call
+        # that folds it into fid1.
+        cite_entity_result = await state.cite_entity('run-1', fid2, 'Foo')
+        assert 'error' not in cite_entity_result, cite_entity_result
+
+        fold_result = await state.cite_task('run-1', fid2, 'dark_factory', '2405')
+        assert fold_result.get('error') == 'duplicate_finding'
+        assert fold_result.get('existing_finding_id') == fid1
+
+        # fid2 is gone entirely -- its cite_entity citation is not
+        # resurrected anywhere, including on the surviving fid1.
+        assert state._resolve_finding('run-1', fid2) is None
+        report = state.get_assembled_report('run-1', 'reconciler')
+        assert report is not None
+        ids = [item['finding_id'] for item in report['flagged_items']]
+        assert ids == [fid1]
+        assert report['flagged_items'][0]['cited_entities'] == []
+
+
+# ---------------------------------------------------------------------------
+# task-2425 step-3: TestCiteTaskFoldKeyClearedOnDelete — RED until step-4
+# routes delete_finding through the shared _purge_finding helper
+# ---------------------------------------------------------------------------
+
+
+class TestCiteTaskFoldKeyClearedOnDelete:
+    """delete_finding must clear the primary-cited-task fold key (task-2425)
+    it registered in ``_run_cited_task_index``, mirroring how it already
+    clears the sig/desc dedup indices. Otherwise a deleted finding leaves a
+    dangling fold-key pointer, and a LATER finding that cites the same
+    external task as its own primary citation wrongly folds into the
+    stale, no-longer-resolvable finding_id instead of succeeding.
+    """
+
+    def _fake_ti(self):
+        known_roots = {'/home/leo/src/dark-factory'}
+        results = {}
+        for pr in known_roots:
+            for tid in ['2405']:
+                results[(tid, pr)] = {'id': tid, 'title': f'T-{tid}'}
+        return _FakeTaskInterceptor(results=results)
+
+    def _make_state(self):
+        from fused_memory.server.recon_report import ReconReportState
+
+        t = [0.0]
+        state = ReconReportState(
+            ttl_seconds=300,
+            clock=lambda: t[0],
+            task_interceptor=self._fake_ti(),
+        )
+        state.known_projects = dict(_KNOWN_PROJECTS)
+        return state, t
+
+    @pytest.mark.asyncio
+    async def test_delete_then_new_primary_citer_of_same_task_succeeds(self):
+        state, _ = self._make_state()
+        state.start_report(run_id='run-1', stage='reconciler', project_id='dark_factory')
+
+        f1 = state.add_finding(
+            run_id='run-1', severity='low', category='cross_project',
+            description='desc one', suggested_action='a',
+            task_id=None, flag_type=None,
+        )
+        fid1 = f1['finding_id']
+
+        cite1 = await state.cite_task('run-1', fid1, 'dark_factory', '2405')
+        assert 'error' not in cite1, cite1
+
+        delete_result = state.delete_finding('run-1', fid1)
+        assert delete_result == {'status': 'deleted', 'finding_id': fid1}
+
+        f2 = state.add_finding(
+            run_id='run-1', severity='low', category='cross_project',
+            description='desc two, worded differently', suggested_action='a',
+            task_id=None, flag_type='some_other_flag',
+        )
+        fid2 = f2['finding_id']
+
+        cite2 = await state.cite_task('run-1', fid2, 'dark_factory', '2405')
+        assert 'error' not in cite2, cite2
+        assert cite2 == {'project_id': 'dark_factory', 'task_id': '2405', 'title': 'T-2405'}
+
+        report = state.get_assembled_report('run-1', 'reconciler')
+        assert report is not None
+        ids = [item['finding_id'] for item in report['flagged_items']]
+        assert ids == [fid2]
+        assert report['flagged_items'][0]['cited_tasks'] == [
+            {'project_id': 'dark_factory', 'task_id': '2405', 'title': 'T-2405'}
+        ]
+
+
+# ---------------------------------------------------------------------------
+# task-2425 step-5: TestCiteTaskFoldReleasedAtRunQuiescence — RED until
+# step-6 makes tick() pop _run_cited_task_index at run quiescence
+# ---------------------------------------------------------------------------
+
+
+class TestCiteTaskFoldReleasedAtRunQuiescence:
+    """tick()'s run-quiescence release (task-2088) must also release the
+    primary-cited-task fold index (task-2425) once a run's last entry
+    evicts — mirroring the existing _run_sig_index / _run_desc_index /
+    _run_finding_index release. Otherwise a stale fold key survives past
+    the run it belonged to and wrongly folds a citation on a later,
+    unrelated run that happens to cite the same external task.
+    """
+
+    def _fake_ti(self):
+        known_roots = {'/home/leo/src/dark-factory'}
+        results = {}
+        for pr in known_roots:
+            for tid in ['2405']:
+                results[(tid, pr)] = {'id': tid, 'title': f'T-{tid}'}
+        return _FakeTaskInterceptor(results=results)
+
+    def _make_state(self, ttl=300):
+        from fused_memory.server.recon_report import ReconReportState
+
+        t = [0.0]
+        state = ReconReportState(
+            ttl_seconds=ttl,
+            clock=lambda: t[0],
+            task_interceptor=self._fake_ti(),
+        )
+        state.known_projects = dict(_KNOWN_PROJECTS)
+        return state, t
+
+    @pytest.mark.asyncio
+    async def test_full_quiescence_releases_cited_task_index(self):
+        state, t = self._make_state(ttl=300)
+
+        state.start_report(run_id='run-1', stage='reconciler', project_id='dark_factory')
+        f1 = state.add_finding(
+            run_id='run-1', severity='low', category='cross_project',
+            description='desc one', suggested_action='a',
+            task_id=None, flag_type=None,
+        )
+        fid1 = f1['finding_id']
+
+        cite1 = await state.cite_task('run-1', fid1, 'dark_factory', '2405')
+        assert 'error' not in cite1, cite1
+        assert state._run_cited_task_index.get('run-1', {}).get('dark_factory:2405') == fid1
+
+        state.complete('run-1', 'stage done')
+
+        # Advance past TTL and evict the run's only entry in one tick().
+        t[0] = 301.0
+        evicted = state.tick()
+        assert evicted == 1
+
+        assert state.get_assembled_report('run-1', 'reconciler') is None
+        assert 'run-1' not in state._run_sig_index
+        assert 'run-1' not in state._run_desc_index
+        assert 'run-1' not in state._run_finding_index
+        assert 'run-1' not in state._run_cited_task_index
+
+        # A FRESH run citing the SAME external task as its primary citation
+        # must succeed plainly — the released index must not leak across runs.
+        state.start_report(run_id='run-2', stage='reconciler', project_id='dark_factory')
+        f2 = state.add_finding(
+            run_id='run-2', severity='low', category='cross_project',
+            description='desc two, unrelated run', suggested_action='a',
+            task_id=None, flag_type=None,
+        )
+        fid2 = f2['finding_id']
+
+        cite2 = await state.cite_task('run-2', fid2, 'dark_factory', '2405')
+        assert 'error' not in cite2, cite2
+        assert cite2 == {'project_id': 'dark_factory', 'task_id': '2405', 'title': 'T-2405'}
+
+
+# ---------------------------------------------------------------------------
 # step-7: TestCiteMemory — RED until step-8 adds cite_memory to ReconReportState
 # ---------------------------------------------------------------------------
 
@@ -682,7 +1210,7 @@ class TestCiteMemoryExceptionNarrowing:
 class TestCiteToolsViaFastMCP:
     """Verify the four cite_* tools are registered and wired correctly in FastMCP."""
 
-    def _make(self):
+    def _make(self, task_interceptor=None, known_projects=None):
         from fused_memory.server.recon_report import ReconReportState, create_recon_report_server
 
         t = [0.0]
@@ -693,8 +1221,9 @@ class TestCiteToolsViaFastMCP:
             ttl_seconds=300,
             clock=lambda: t[0],
             memory_service=fake_ms,
+            task_interceptor=task_interceptor,
         )
-        state.known_projects = {}
+        state.known_projects = known_projects if known_projects is not None else {}
         mcp = create_recon_report_server(state)
         return state, mcp
 
@@ -764,6 +1293,71 @@ class TestCiteToolsViaFastMCP:
                 'task_id': '1',
                 # project_id intentionally omitted
             })
+
+    @pytest.mark.asyncio
+    async def test_cite_task_duplicate_finding_propagates_through_call_tool(self):
+        """task-2425 amend: the in-run cited-task fold's duplicate_finding
+        return (ReconReportState.cite_task) must propagate unchanged through
+        the registered FastMCP ``cite_task`` tool. Prior fold coverage
+        (TestCiteTaskInRunCitedTaskDedup) drives ReconReportState.cite_task
+        directly; this exercises the actual MCP invocation path
+        (tm.call_tool) end-to-end, matching the tool docstring's promise of
+        an ``existing_finding_id`` pointer on fold.
+        """
+        fake_ti = _FakeTaskInterceptor(
+            results={('2405', '/home/leo/src/dark-factory'): {'id': '2405', 'title': 'T-2405'}}
+        )
+        state, mcp = self._make(
+            task_interceptor=fake_ti,
+            known_projects={'dark_factory': '/home/leo/src/dark-factory'},
+        )
+        tm = mcp._tool_manager
+
+        await tm.call_tool('start_report', {
+            'run_id': 'r1', 'stage': 'reconciler', 'project_id': 'dark_factory',
+        })
+
+        # Two differently-worded null-task_id findings (distinct flag_type
+        # so neither add_finding in-run guard collapses them) that will both
+        # cite the same external task — mirrors the core repro.
+        f1 = await tm.call_tool('add_finding', {
+            'run_id': 'r1',
+            'severity': 'moderate',
+            'category': 'cross_project',
+            'description': 'dark_factory:2405 still pending',
+            'suggested_action': 'wait for upstream',
+        })
+        fid1 = f1['finding_id']
+
+        f2 = await tm.call_tool('add_finding', {
+            'run_id': 'r1',
+            'severity': 'moderate',
+            'category': 'cross_project_routing',
+            'description': 'blocked pending dark_factory task 2405 per routing check',
+            'suggested_action': 'reroute once unblocked',
+            'flag_type': 'cross_project_routing_stale',
+        })
+        fid2 = f2['finding_id']
+        assert fid2 != fid1
+
+        cite1 = await tm.call_tool('cite_task', {
+            'run_id': 'r1', 'finding_id': fid1,
+            'project_id': 'dark_factory', 'task_id': '2405',
+        })
+        assert 'error' not in cite1, cite1
+
+        cite2 = await tm.call_tool('cite_task', {
+            'run_id': 'r1', 'finding_id': fid2,
+            'project_id': 'dark_factory', 'task_id': '2405',
+        })
+        assert cite2.get('error') == 'duplicate_finding'
+        assert cite2.get('error_type') == 'ReconReportDuplicateFinding'
+        assert cite2.get('existing_finding_id') == fid1
+
+        # The fold purged fid2 server-side too, not just at the response level.
+        report = state.get_assembled_report('r1', 'reconciler')
+        assert report is not None
+        assert [i['finding_id'] for i in report['flagged_items']] == [fid1]
 
 
 # ---------------------------------------------------------------------------
