@@ -4751,3 +4751,105 @@ class TestModuleSurfaceCompensationsRemoved:
             '— the task-2312 completion branch must survive the cleanup.'
         )
 
+
+# ---------------------------------------------------------------------------
+# filter_already_tracked_systemic_patterns pure-helper tests (task 2416, step-1)
+# ---------------------------------------------------------------------------
+
+
+class TestAlreadyTrackedSystemicPatternHelpers:
+    """Tests for the pure helpers backing filter_already_tracked_systemic_patterns
+    (task 2416): ``_asserts_never_tracked(text) -> bool`` and
+    ``_significant_terms(text) -> set[str]``.
+
+    RED until step-2 adds both symbols to flag_dedup.py.
+    """
+
+    @pytest.mark.parametrize(
+        'text',
+        [
+            'This idea was never converted to a tracked task.',
+            'The recommendation was never converted to a task for follow-up.',
+            'This recurring pattern is never tracked in the task tree.',
+            'The suggestion was never filed as a task by anyone.',
+            'There is no tracked task for this recurring pattern.',
+            'NEVER CONVERTED TO A TRACKED TASK (shouting case still matches).',
+        ],
+        ids=[
+            'never-converted-to-a-tracked-task',
+            'was-never-converted-to-a-task',
+            'never-tracked',
+            'never-filed-as-a-task',
+            'no-tracked-task',
+            'case-insensitive',
+        ],
+    )
+    def test_asserts_never_tracked_true_for_lexicon_phrases(self, text):
+        """_asserts_never_tracked recognises every fixed never-tracked lexicon phrase."""
+        from fused_memory.reconciliation.flag_dedup import _asserts_never_tracked
+
+        assert _asserts_never_tracked(text) is True, (
+            f'Expected _asserts_never_tracked to detect never-tracked language in {text!r}'
+        )
+
+    def test_asserts_never_tracked_false_for_unrelated_text(self):
+        """Unrelated finding text (no never-tracked assertion) returns False."""
+        from fused_memory.reconciliation.flag_dedup import _asserts_never_tracked
+
+        text = 'Task 100 has no deliverable attached; consider closing it out.'
+        assert _asserts_never_tracked(text) is False, (
+            'Unrelated finding text must not be classified as never-tracked language'
+        )
+
+    def test_asserts_never_tracked_false_for_empty_text(self):
+        """Empty string returns False (no phrase can match)."""
+        from fused_memory.reconciliation.flag_dedup import _asserts_never_tracked
+
+        assert _asserts_never_tracked('') is False
+
+    def test_significant_terms_lowercases_splits_and_dedupes(self):
+        """_significant_terms lowercases, splits on non-alphanumeric runs, and dedupes.
+
+        'project_status_correction' must split into three distinct tokens
+        (underscore is a non-alphanumeric separator), not survive as one
+        underscore-joined token — this is what lets the finding's key terms
+        overlap with a done task's title/description prose.
+        """
+        from fused_memory.reconciliation.flag_dedup import _significant_terms
+
+        text = (
+            'Diff the project_status_correction cache vs live get_statuses '
+            'every cycle — Project_Status_Correction correction is needed.'
+        )
+        terms = _significant_terms(text)
+
+        assert isinstance(terms, set)
+        assert 'project' in terms
+        assert 'status' in terms
+        assert 'correction' in terms
+        assert 'get' in terms
+        assert 'statuses' in terms
+        assert 'cycle' in terms
+        assert 'cache' in terms
+        # Case-insensitive: 'Cache' and 'cache' collapse to a single set entry.
+        assert sum(1 for t in terms if t == 'cache') == 1
+
+    def test_significant_terms_drops_stopwords_and_short_tokens(self):
+        """Stopwords and tokens shorter than 3 chars are dropped."""
+        from fused_memory.reconciliation.flag_dedup import _significant_terms
+
+        text = 'This is a of to in on at it an idea for the cache.'
+        terms = _significant_terms(text)
+
+        for stopword in (
+            'this', 'is', 'a', 'of', 'to', 'in', 'on', 'at', 'it', 'an', 'for', 'the',
+        ):
+            assert stopword not in terms, f'Stopword {stopword!r} must be dropped from {terms!r}'
+        assert 'cache' in terms
+
+    def test_significant_terms_empty_string_returns_empty_set(self):
+        """Empty input returns an empty set (no I/O, no crash)."""
+        from fused_memory.reconciliation.flag_dedup import _significant_terms
+
+        assert _significant_terms('') == set()
+
