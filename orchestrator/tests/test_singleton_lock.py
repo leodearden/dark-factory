@@ -161,11 +161,12 @@ class TestHarnessSingletonIntegration:
         Mirrors test_dirty_tree_starts_and_escalates's fixture setup; the
         ONE difference is that the escalation helper itself faults.
         """
+        escalation_mock = AsyncMock(
+            side_effect=OSError('transient escalation I/O fault'),
+        )
         h, mock_mcp = _build_dirty_tree_startup_harness(
             mock_orch_config, tmp_path,
-            escalation_helper=AsyncMock(
-                side_effect=OSError('transient escalation I/O fault'),
-            ),
+            escalation_helper=escalation_mock,
         )
 
         # Startup must reach the scheduler loop despite the fault — the
@@ -176,7 +177,7 @@ class TestHarnessSingletonIntegration:
         # MCP (and other) servers still came up despite the faulting escalation.
         mock_mcp.start.assert_called_once()
         # The faulting call was actually exercised during startup.
-        h._file_dirty_tree_escalation.assert_awaited_once_with(False)
+        escalation_mock.assert_awaited_once_with(False)
 
     @pytest.mark.asyncio
     async def test_escalation_port_bind_failure_raises(self, mock_orch_config):
