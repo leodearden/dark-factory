@@ -288,6 +288,31 @@ class TestCheckTextForScope:
         v = check_text_for_scope('fused-memory/X', 'reify', empty)
         assert v.outcome == 'ok'
 
+    # ------------------------------------------------------------------
+    # 'memory'/'deploy' generic-dirs denylist (task 2434)
+    # ------------------------------------------------------------------
+
+    def test_generic_memory_and_deploy_dirs_not_owned(self, tmp_path):
+        """A project with top-level memory/ and deploy/ dirs must NOT have
+        either registered as an owned prefix — both are common scratch/config
+        dir names across projects (task 2434 over-fire fix)."""
+        reify = _mkproj(tmp_path, 'reify', ['crates', 'memory', 'deploy'])
+        registry = ProjectPrefixRegistry.from_roots([str(reify)])
+        assert 'memory/' not in registry.all_prefixes()
+        assert 'deploy/' not in registry.all_prefixes()
+        assert 'memory/' not in registry.prefix_to_project
+        assert 'deploy/' not in registry.prefix_to_project
+
+    def test_prose_mention_of_memory_edges_is_ok(self, tmp_path):
+        """Prose referencing 'memory/edges' (not a path) must not trigger a
+        scope_violation advisory now that 'memory' is a generic dir."""
+        reify = _mkproj(tmp_path, 'reify', ['crates', 'memory', 'deploy'])
+        registry = ProjectPrefixRegistry.from_roots([str(reify)])
+        v = check_text_for_scope(
+            're-cite the existing memory/edges', 'dark_factory', registry,
+        )
+        assert v.outcome == 'ok'
+
 
 # ---------------------------------------------------------------------------
 # check_files_for_scope — CERTAIN classifier for concrete metadata.files
