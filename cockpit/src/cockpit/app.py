@@ -49,6 +49,7 @@ from cockpit.panes.decision_queue import (
     QueueItem,
     known_project_roots,
     order_queue,
+    resolve_target,
 )
 from cockpit.panes.detail_pane import DetailPane
 from cockpit.panes.session_table import SessionTable, order_sessions
@@ -559,12 +560,21 @@ class CockpitApp(App):
     def _focus_slug(self, slug: str) -> None:
         """Resolve *slug* to a focus target and route it to a backend (Fleet Cockpit C9a).
 
-        Stub for now -- SpawnTreeScreen's Enter-to-focus wiring (resolving
-        *slug* against self._records via resolve_target, then routing to
-        _backend_for(target.kind).focus) lands in a later step; this
-        placeholder exists so action_toggle_tree already has a callback to
-        inject into SpawnTreeScreen.
+        Reuses decision_queue.resolve_target over self._records, exactly
+        mirroring action_focus_selected's own resolve-then-route step, so
+        the tree's Enter path and the decision queue's Enter path share one
+        focus discipline. Fail-soft (PRD §2): a slug with no matching
+        record (a gone/stale snapshot entry) or a record with no resolvable
+        target (no Display) both no-op rather than raising.
         """
+        record = next((r for r in self._records if r.session_slug == slug), None)
+        if record is None:
+            return
+        sessions_by_slug = {r.session_slug: r for r in self._records}
+        target = resolve_target(record, sessions_by_slug)
+        if target is None:
+            return
+        self._backend_for(target.kind).focus(target)
 
     def _sync_detail_pane(self, slug: str | None) -> None:
         """Render *slug*'s record (or the empty placeholder) into the detail pane.

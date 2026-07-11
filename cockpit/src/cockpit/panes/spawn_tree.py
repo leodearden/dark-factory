@@ -225,3 +225,19 @@ class SpawnTreeScreen(ModalScreen[None]):
 
     def on_mount(self) -> None:
         self.query_one(SpawnTree).build(self._records)
+
+    def on_tree_node_selected(self, event: Tree.NodeSelected[str]) -> None:
+        """Route a selected node's slug to the injected *on_focus* callback.
+
+        Tree posts NodeSelected for any selected node -- branch or leaf --
+        and every node built by _populate carries its own session_slug as
+        `data` regardless of whether it has children, so this fires
+        uniformly across the whole forest. Fail-soft (PRD §2): `data` is
+        only ever None for Tree's own hidden root (show_root=False, never
+        selectable), so the guard is defensive rather than load-bearing.
+        Resolving the slug to a Display target and routing it to a backend
+        is the app's job (see cockpit.app.CockpitApp._focus_slug) -- this
+        screen only ever forwards the bare slug.
+        """
+        if event.node.data is not None:
+            self._focus_callback(event.node.data)
