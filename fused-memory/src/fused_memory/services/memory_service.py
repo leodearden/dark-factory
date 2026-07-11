@@ -449,6 +449,44 @@ def _edge_to_dict(e: Any) -> dict:
     }
 
 
+# Defensive: resolve the embedding-provider's RateLimitError class at module
+# load. If the openai SDK is absent or its exception hierarchy is renamed,
+# _is_quota_exhaustion_error still works via its duck-typed fallback checks
+# below rather than raising an ImportError.
+try:
+    from openai import RateLimitError as _OpenAIRateLimitError
+except Exception:
+    _OpenAIRateLimitError = None
+
+
+def _is_quota_exhaustion_error(exc: BaseException) -> bool:
+    """Return True if *exc* represents an embedding-provider quota/rate-limit exhaustion.
+
+    Matches ``openai.RateLimitError`` plus duck-typed equivalents — a
+    ``status_code == 429`` attribute, or ``'insufficient_quota'`` appearing in
+    the error's ``code`` attribute or message — so callers (get_entity's
+    degraded fallback) can classify this condition without a hard dependency
+    on the openai SDK's exact exception hierarchy (e.g. if Graphiti
+    wraps/re-raises the error, or a different embedding provider is
+    configured).
+
+    Never matches a bare BaseException (e.g. ``asyncio.CancelledError``,
+    ``KeyboardInterrupt``, ``SystemExit``) — those are structured-concurrency
+    shutdown signals, not application-level errors, and must always
+    propagate unchanged.
+    """
+    if not isinstance(exc, Exception):
+        return False
+    if _OpenAIRateLimitError is not None and isinstance(exc, _OpenAIRateLimitError):
+        return True
+    if getattr(exc, 'status_code', None) == 429:
+        return True
+    code = str(getattr(exc, 'code', '') or '')
+    if 'insufficient_quota' in code:
+        return True
+    return 'insufficient_quota' in str(exc).lower()
+
+
 class SearchResults(list):
     """list subclass returned by MemoryService.search carrying in-band degrade metadata.
 
