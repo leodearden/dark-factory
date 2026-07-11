@@ -328,3 +328,25 @@ class TestSavePriorities:
 
         assert target.exists()
         assert load_priorities(target) == custom
+
+    def test_write_failure_is_fail_soft_and_warns(self, tmp_path, caplog):
+        """An unwritable target must fail soft: logged WARNING, never an exception.
+
+        Mirrors TestEnsurePrioritiesFile's own write-failure test -- forced
+        here by making the target's parent a *file* rather than a directory,
+        so mkdir(parents=True) raises OSError.
+        """
+        from cockpit.priority import Priorities, save_priorities
+
+        blocker = tmp_path / 'blocker'
+        blocker.write_text('not a directory')
+        target = blocker / 'priorities.yaml'
+
+        with caplog.at_level(logging.WARNING):
+            save_priorities(Priorities.default(), target)
+
+        assert not target.exists()
+        warnings = [r.message for r in caplog.records if r.levelno == logging.WARNING]
+        assert any('priorities' in msg.lower() for msg in warnings), (
+            f'Expected a WARNING mentioning "priorities"; got: {warnings}'
+        )
