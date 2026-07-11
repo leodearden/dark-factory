@@ -21,7 +21,9 @@ Usage (stdio transport, spawned by orchestrator):
 from __future__ import annotations
 
 import argparse
+import json
 import logging
+import re
 import subprocess
 import sys
 from datetime import UTC, datetime
@@ -33,6 +35,46 @@ from fastmcp import FastMCP
 from orchestrator.artifacts import TaskArtifacts
 
 logger = logging.getLogger(__name__)
+
+
+# ---------------------------------------------------------------------------
+# files-arg recovery helper (task 2428)
+# ---------------------------------------------------------------------------
+
+
+def _coerce_files(files: list[str] | str | None) -> list[str]:
+    """Coerce a possibly mis-serialized ``files`` MCP arg into a clean list.
+
+    The agent harness intermittently mis-serializes the ``create_plan``
+    (and ``update_plan_metadata``) call when a large/complex ``analysis``
+    string accompanies the ``files`` array in the same call, corrupting
+    ``files`` into a stringified JSON array, a bare JSON string, or a
+    comma/newline-delimited plain string. This recovers all of those
+    shapes back into a clean ``list[str]``; ``None`` maps to ``[]``.
+    """
+    if files is None:
+        return []
+    if isinstance(files, list):
+        return [str(f).strip() for f in files if str(f).strip()]
+
+    text = files.strip()
+    if not text:
+        return []
+
+    try:
+        decoded = json.loads(text)
+    except ValueError:
+        decoded = None
+
+    if isinstance(decoded, list):
+        return [str(f).strip() for f in decoded if str(f).strip()]
+    if isinstance(decoded, str):
+        decoded = decoded.strip()
+        return [decoded] if decoded else []
+
+    # Not recoverable as JSON (or decoded to a non-list/non-str) — fall back
+    # to splitting on commas/newlines, the other corrupted shape observed.
+    return [part.strip() for part in re.split(r'[,\n]', text) if part.strip()]
 
 
 # ---------------------------------------------------------------------------
