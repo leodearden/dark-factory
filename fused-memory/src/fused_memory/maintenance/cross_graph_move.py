@@ -357,15 +357,14 @@ async def _create_entity_in_target(
     embedding_reply = await _read_compact_vector(
         falkor_client, group_id=source_graph, cypher=embedding_cypher,
     )
-    embedding_literal = format_vecf32_literal(parse_compact_vector_reply(embedding_reply))
 
     await target.query(
         'CREATE (n:Entity {uuid: $uuid}) '
         'SET n.name = $name, '
         '    n.group_id = $group_id, '
         '    n.summary = $summary, '
-        '    n.created_at = $created_at, '
-        f'    n.name_embedding = {embedding_literal}',
+        '    n.created_at = $created_at'
+        f'{_embedding_set_clause("n.name_embedding", embedding_reply)}',
         {
             'uuid': node_uuid,
             'name': name,
