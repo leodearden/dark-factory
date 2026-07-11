@@ -20,6 +20,9 @@ end-to-end proof of the refresh-path half of this contract.
 
 from __future__ import annotations
 
+import logging
+import os
+import subprocess
 from collections.abc import Callable
 from datetime import UTC, datetime
 from pathlib import Path
@@ -38,12 +41,61 @@ from textual.containers import Horizontal, Vertical
 from textual.widgets import DataTable
 
 from cockpit.backends import DisplayTarget, FocusArrangeBackend, TmuxBackend, WmBackend
-from cockpit.panes.decision_queue import DecisionQueue, QueueItem, order_queue
+from cockpit.panes.decision_queue import (
+    DecisionQueue,
+    QueueItem,
+    known_project_roots,
+    order_queue,
+)
 from cockpit.panes.detail_pane import DetailPane
 from cockpit.panes.session_table import SessionTable, order_sessions
+from cockpit.panes.spawn_bar import SpawnScreen, build_spawn_argv
 from cockpit.priority import Priorities, load_priorities
 from cockpit.registry_reader import build_snapshot, scan_sessions, snapshot_changed
 from cockpit.ui_config import CockpitUIConfig, load_ui_config, save_ui_config
+
+_log = logging.getLogger(__name__)
+
+# skills/spawn/spawn-claude.sh, relative to this repo checkout -- this file
+# lives at <repo>/cockpit/src/cockpit/app.py, so the repo root is three
+# parents up. Only used as a last-resort fallback (see _default_spawn_script);
+# an installed cockpit package has no such repo layout at all.
+_REPO_RELATIVE_SPAWN_SCRIPT = (
+    Path(__file__).resolve().parents[3] / 'skills' / 'spawn' / 'spawn-claude.sh'
+)
+
+
+def _default_spawn_script() -> Path | None:
+    """Best-effort resolution of spawn-claude.sh's path (PRD §9 C5b spawn bar).
+
+    Prefers $CLAUDE_SPAWN_SCRIPT when set -- an installed cockpit package
+    has no guaranteed relative path to a checkout's skills/ directory.
+    Otherwise falls back to the path relative to this repo checkout, when
+    it actually exists there. Degrades to None (fail-soft, PRD §2) when
+    neither resolves -- spawn_session then simply no-ops rather than
+    raising: a view/action is never a hard dependency.
+    """
+    override = os.environ.get('CLAUDE_SPAWN_SCRIPT')
+    if override:
+        return Path(override)
+    if _REPO_RELATIVE_SPAWN_SCRIPT.is_file():
+        return _REPO_RELATIVE_SPAWN_SCRIPT
+    return None
+
+
+def _default_spawn_runner(argv: list[str]) -> None:
+    """Fire-and-forget default spawn runner: subprocess.Popen, fail-soft.
+
+    Mirrors the cockpit's fail-soft discipline (PRD §2): a launch failure
+    (missing/non-executable script, no terminal emulator found, etc.) is
+    logged, never raised -- the cockpit itself must keep running regardless
+    of whether a spawn attempt succeeded.
+    """
+    try:
+        subprocess.Popen(argv)  # noqa: S603 -- argv is built by build_spawn_argv, not shell text
+    except OSError:
+        _log.exception('spawn_session: failed to launch %r', argv)
+
 
 # Decision fields that feed the queue's scoring/display -- excludes
 # escalation_id/options (order_queue/format_queue_row never read them), so a
@@ -84,6 +136,7 @@ class CockpitApp(App):
         Binding('B', 'big_boost', 'Big boost', show=False),
         Binding('x', 'drop', 'Drop', show=False),
         Binding('d', 'defer', 'Defer', show=False),
+        Binding('n', 'new_session', 'New session', show=False),
         *(Binding(str(d), f'set_priority({d})', f'Priority {d}', show=False) for d in range(10)),
     ]
 
@@ -111,8 +164,8 @@ class CockpitApp(App):
             'wm': WmBackend(),
             'tmux': TmuxBackend(),
         }
-        self._spawn_runner = spawn_runner
-        self._spawn_script = spawn_script
+        self._spawn_runner = spawn_runner if spawn_runner is not None else _default_spawn_runner
+        self._spawn_script = spawn_script if spawn_script is not None else _default_spawn_script()
         self._priorities = priorities if priorities is not None else load_priorities()
         self._records: list[SessionRecord] = []
         self._decisions: list[DecisionRecord] = []
@@ -395,6 +448,39 @@ class CockpitApp(App):
             return
         self._deferred[key] = self._now_fn()
         self._rebuild_queue()
+
+    def action_new_session(self) -> None:
+        """'n' -- push the spawn bar's project/role/prompt picker (PRD §9 C5b).
+
+        Seeds the picker's project-root field from known_project_roots over
+        the most recently scanned session records (self._records) -- a
+        picker source, not a queue filter. Submitting the screen calls back
+        into spawn_session, this task's leaf signal; the screen itself never
+        builds argv or launches a process.
+        """
+        self.push_screen(SpawnScreen(known_project_roots(self._records), self.spawn_session))
+
+    def spawn_session(self, project_root: str, role: str, prompt: str) -> None:
+        """Spawn a new Claude session (PRD §9 C5b spawn bar) -- the `n` action's leaf signal.
+
+        Builds spawn-claude.sh's exact positional argv (build_spawn_argv)
+        from the picked project (cwd), a role-derived title (mirroring
+        session_table's own "role:project#task" shape, minus the task
+        segment a not-yet-spawned session doesn't have), and the prompt --
+        then hands it to the injected spawn_runner (default:
+        _default_spawn_runner, a fail-soft subprocess.Popen wrapper).
+        Fail-soft (PRD §2): with no resolvable spawn_script (no injected
+        path, no $CLAUDE_SPAWN_SCRIPT, and the repo-relative default not
+        found), this simply no-ops -- a view/action is never a hard
+        dependency, never an exception.
+        """
+        script = self._spawn_script
+        if script is None:
+            _log.warning('spawn_session: no spawn_script resolved, dropping spawn request')
+            return
+        title = f'{role}:{Path(project_root).name}'
+        argv = build_spawn_argv(script, project_root, title, prompt)
+        self._spawn_runner(argv)
 
     def _sync_detail_pane(self, slug: str | None) -> None:
         """Render *slug*'s record (or the empty placeholder) into the detail pane.
