@@ -4129,7 +4129,10 @@ async def run_main_tip_sweep(
             WorktreeKind.MAIN_SWEEP, main_sha,
         ) as tmp_path:
             # Run full (unscoped) verification — all discovered subprojects, no scope filter.
-            result = await run_full_verification(tmp_path, config)  # type: ignore[arg-type]
+            # role='background' (lowest nice tier — task 2391/PRD T3): the sweep is a
+            # background asyncio.Task with no dispatch/merge/deploy path awaiting it, so
+            # its fan-out should never contend with real task/merge lane verifies.
+            result = await run_full_verification(tmp_path, config, role='background')  # type: ignore[arg-type]
 
             # pytest INTERNALERROR means the test infrastructure itself crashed (e.g. an
             # xdist worker was killed by os._exit).  env_transient means a concurrent
@@ -4163,7 +4166,7 @@ async def run_main_tip_sweep(
                     'worktree to distinguish transient flake from deterministic drift',
                     _sha_prefix, result.category, result.cause_hint,
                 )
-                retry = await run_full_verification(tmp_path, config)  # type: ignore[arg-type]
+                retry = await run_full_verification(tmp_path, config, role='background')  # type: ignore[arg-type]
 
                 if retry.category in INFRA_TRANSIENT_CATEGORIES:
                     logger.warning(
