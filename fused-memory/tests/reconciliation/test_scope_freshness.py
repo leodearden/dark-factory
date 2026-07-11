@@ -462,3 +462,86 @@ class TestPrecheckBootstrap:
         _, kwargs = memory_service.add_memory.await_args
         assert kwargs['metadata']['kind'] == CONSOLIDATED_SCOPE_KIND
         assert kwargs['metadata']['task_id'] == 'dark_factory:2405'
+
+
+class TestPrecheckFreshSkip:
+    """Tests for precheck_scope_correction_freshness — fresh-skip path
+    (a prior snapshot exists and the subject is unchanged)."""
+
+    @pytest.mark.asyncio
+    async def test_unchanged_subject_is_skipped_and_no_change_marker_written(self):
+        from fused_memory.reconciliation.scope_freshness import (
+            CONSOLIDATED_SCOPE_KIND,
+            build_scope_snapshot_metadata,
+            precheck_scope_correction_freshness,
+        )
+
+        prior_metadata = build_scope_snapshot_metadata(
+            task_ref='dark_factory:2405',
+            flag_key='cross_project',
+            subject_project_id='dark_factory',
+            subject_task_id='2405',
+            status='pending',
+            updated_at='2026-07-10T10:00:00Z',
+            description='d',
+            run_id='run-0',
+            snapshot_at='2026-07-10T14:29:33Z',
+        )
+
+        memory_service = AsyncMock()
+        memory_service.get_memories_by_metadata.return_value = [
+            {
+                'id': 'a4ed9cad',
+                'created_at': '2026-07-10T14:29:33Z',
+                'metadata': prior_metadata,
+            },
+        ]
+        taskmaster = AsyncMock()
+        # SAME status/updatedAt/description as the prior snapshot — unchanged.
+        taskmaster.get_task.return_value = {
+            'id': 2405,
+            'status': 'pending',
+            'updatedAt': '2026-07-10T10:00:00Z',
+            'description': 'd',
+            'metadata': {},
+        }
+
+        cross_project_finding = {
+            'flag_type': 'cross_project',
+            'description': 'scope correction thread',
+            'cited_tasks': [
+                {'project_id': 'dark_factory', 'task_id': '2405', 'title': 'x'},
+            ],
+        }
+
+        result = await precheck_scope_correction_freshness(
+            memory_service=memory_service,
+            taskmaster=taskmaster,
+            project_id='autopilot_video',
+            resolve_project_root=lambda pid: f'/roots/{pid}',
+            run_id='run-2',
+            findings=[cross_project_finding],
+        )
+
+        # Unchanged subject: skipped, not sent back for re-investigation.
+        assert cross_project_finding in result.skipped
+        assert cross_project_finding not in result.to_reinvestigate
+
+        # Exactly one get_task call, for the cross-project finding's subject.
+        taskmaster.get_task.assert_awaited_once_with(
+            task_id='2405', project_root='/roots/dark_factory',
+        )
+
+        # A lightweight 'still blocked, no change' marker was written.
+        memory_service.add_memory.assert_awaited_once()
+        _, add_kwargs = memory_service.add_memory.await_args
+        assert add_kwargs['metadata']['kind'] == CONSOLIDATED_SCOPE_KIND
+        assert add_kwargs['metadata']['task_id'] == 'dark_factory:2405'
+        assert add_kwargs['metadata']['no_change'] is True
+
+        # Prior snapshot pool-capped: deleted after the new marker was added.
+        memory_service.delete_memory.assert_awaited_once_with(
+            memory_id='a4ed9cad', store='mem0', project_id='autopilot_video',
+        )
+
+        assert result.stats['scope_freshness_skipped'] == 1
