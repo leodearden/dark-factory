@@ -255,6 +255,31 @@ def _hermetic_psi_reader(monkeypatch):
     reader bound at construction, it can reassign
     ``scheduler._read_psi_sample`` post-construction (as the saturation
     tests already do) rather than removing this fixture.
+
+    Why not scope this down instead (task 2418 amendment pass, round 2)?
+    A code-review pass suggested narrowing this fixture to an opt-in
+    allowlist or a scheduler-specific conftest, so the neutralization is
+    "visible at the call site" instead of applied globally, since a docstring
+    documenting a one-time audit isn't enforcement and could rot as tests are
+    added. Re-checked against the *actual* blast radius rather than the ~11
+    tests this task's plan named: ``grep -rl 'Scheduler(' orchestrator/tests``
+    matches 34 files and ``grep -rl 'acquire_next' orchestrator/tests``
+    matches 28 — spanning ``test_harness_*.py``, ``test_workflow_*.py``,
+    ``test_merge_queue_*.py`` and more, none of which reassign
+    ``_read_psi_sample`` themselves. Only 5 files touch
+    ``_read_psi_sample`` directly at all (the two saturation-test files
+    named above, this file, and the two other files task 2418 holds locks
+    for). Properly scoping down would therefore mean auditing and editing
+    roughly two dozen test files this task does not hold locks for — and for
+    any file missed, it would silently re-admit the exact real-host-PSI
+    nondeterminism this fixture exists to prevent, in files nobody was
+    watching for it. That cost/risk is why the fixture stays suite-wide
+    autouse (matching this conftest's other host/global-state neutralizers
+    — ``_isolate_orch_config``, ``_no_dry_run_unblock``, etc. — all of which
+    are also broad-by-default rather than opt-in) with the post-construction
+    reassignment escape hatch above, rather than being narrowed here. A full
+    opt-in restructuring remains open as a follow-up outside this task's
+    locked scope.
     """
     monkeypatch.setattr('orchestrator.scheduler.read_psi_sample', idle_psi_sample)
 
