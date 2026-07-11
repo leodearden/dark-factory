@@ -22,7 +22,10 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 from _fm_helpers import extract_cypher, extract_params
 
-from fused_memory.maintenance.cross_graph_move import MergeResult, MoveResult
+from fused_memory.maintenance.cross_graph_move import (
+    CreateResult,
+    SubgraphEdgeResult,
+)
 
 SCRIPT_PATH = Path(__file__).parent.parent / 'scripts' / 'migrate_cross_graph_leak.py'
 
@@ -800,10 +803,12 @@ class TestRunDryRun:
         a fixed-order list -- this keeps the test correct regardless of
         which graph run() happens to enumerate first.
         """
-        move_mock = AsyncMock(side_effect=AssertionError('must not be called during dry-run'))
-        merge_mock = AsyncMock(side_effect=AssertionError('must not be called during dry-run'))
-        monkeypatch.setattr(_mod, 'move_entity_across_graphs', move_mock)
-        monkeypatch.setattr(_mod, 'merge_foreign_duplicate', merge_mock)
+        create_mock = AsyncMock(side_effect=AssertionError('must not be called during dry-run'))
+        recreate_mock = AsyncMock(side_effect=AssertionError('must not be called during dry-run'))
+        delete_mock = AsyncMock(side_effect=AssertionError('must not be called during dry-run'))
+        monkeypatch.setattr(_mod, 'create_moved_node', create_mock)
+        monkeypatch.setattr(_mod, 'recreate_subgraph_relationships', recreate_mock)
+        monkeypatch.setattr(_mod, 'delete_source_node', delete_mock)
 
         reify_row = _foreign_row('u0', 'dark_factory', name='Alice')
         reify_graph = _make_graph_mock(ro_side_effect=[
@@ -835,12 +840,13 @@ class TestRunDryRun:
         assert manifest['nodes'][0]['target_graph'] == 'dark_factory'
         assert manifest['exit_code'] == 0
 
-        # Nothing mutated: no .query on either graph, and neither epsilon
-        # primitive was invoked.
+        # Nothing mutated: no .query on either graph, and none of the three
+        # phase primitives was invoked.
         reify_graph.query.assert_not_awaited()
         dark_factory_graph.query.assert_not_awaited()
-        move_mock.assert_not_awaited()
-        merge_mock.assert_not_awaited()
+        create_mock.assert_not_awaited()
+        recreate_mock.assert_not_awaited()
+        delete_mock.assert_not_awaited()
 
     @pytest.mark.asyncio
     async def test_dry_run_with_no_foreign_nodes_returns_empty_manifest(self):
@@ -880,19 +886,23 @@ class TestLoadReviewedManifest:
 
     @pytest.mark.asyncio
     async def test_apply_without_manifest_refuses_with_no_mutations(self, monkeypatch):
-        """--apply with no --manifest refuses: zero epsilon calls, no census
-        recompute (list_graphs is never even awaited), non-zero exit_code."""
-        move_mock = AsyncMock()
-        merge_mock = AsyncMock()
-        monkeypatch.setattr(_mod, 'move_entity_across_graphs', move_mock)
-        monkeypatch.setattr(_mod, 'merge_foreign_duplicate', merge_mock)
+        """--apply with no --manifest refuses: zero phase-primitive calls, no
+        census recompute (list_graphs is never even awaited), non-zero
+        exit_code."""
+        create_mock = AsyncMock()
+        recreate_mock = AsyncMock()
+        delete_mock = AsyncMock()
+        monkeypatch.setattr(_mod, 'create_moved_node', create_mock)
+        monkeypatch.setattr(_mod, 'recreate_subgraph_relationships', recreate_mock)
+        monkeypatch.setattr(_mod, 'delete_source_node', delete_mock)
         memory_service = _make_memory_service({'reify': _make_graph_mock()})
         args = _args(apply=True, manifest=None)
 
         report = await _mod.run(args, memory_service)
 
-        move_mock.assert_not_awaited()
-        merge_mock.assert_not_awaited()
+        create_mock.assert_not_awaited()
+        recreate_mock.assert_not_awaited()
+        delete_mock.assert_not_awaited()
         memory_service.graphiti.list_graphs.assert_not_awaited()
         assert report['exit_code'] != 0
 
@@ -902,13 +912,19 @@ class TestLoadReviewedManifest:
 # ===========================================================================
 
 class TestRunApplyDispatch:
-    """Tests for run() dispatching a reviewed manifest's nodes by disposition."""
+    """Tests for run() dispatching a reviewed manifest's nodes by disposition
+    through the three-phase barrier-ordered apply (task 2415)."""
 
     @pytest.mark.asyncio
     async def test_dispatches_move_and_merge_skips_unresolved(self, tmp_path, monkeypatch):
-        """MOVE nodes dispatch to move_entity_across_graphs, MERGE nodes to
-        merge_foreign_duplicate, and an UNRESOLVED node is NEVER passed to
-        either primitive -- the report still records it as a blocked entry."""
+        """A MOVE node gets a Phase-A create_moved_node call (rewrite_group_id
+        == its target_graph) and a Phase-C delete_source_node call for its
+        source copy; a MERGE node gets no Phase-A create (its home copy
+        already exists) but IS included in the single, batched Phase-B
+        recreate_subgraph_relationships call alongside the MOVE node, and
+        gets its own Phase-C delete_source_node call for its wrong-copy; an
+        UNRESOLVED node is NEVER passed to any of the three phase primitives
+        -- the report still records it as a blocked entry."""
         move_node = _classified_node(
             'u-move', source_graph='reify', target_graph='dark_factory', disposition=_mod.MOVE,
         )
@@ -924,27 +940,31 @@ class TestRunApplyDispatch:
         manifest_path = tmp_path / 'manifest.json'
         manifest_path.write_text(json.dumps(manifest))
 
-        move_mock = AsyncMock(return_value=MoveResult(
+        create_mock = AsyncMock(return_value=CreateResult(
             uuid='u-move', source_graph='reify', target_graph='dark_factory',
         ))
-        merge_mock = AsyncMock(return_value=MergeResult(
-            uuid='u-merge', wrong_graph='reify', home_graph='know_live',
-        ))
-        monkeypatch.setattr(_mod, 'move_entity_across_graphs', move_mock)
-        monkeypatch.setattr(_mod, 'merge_foreign_duplicate', merge_mock)
+        recreate_mock = AsyncMock(return_value=SubgraphEdgeResult())
+        delete_mock = AsyncMock(return_value=None)
+        monkeypatch.setattr(_mod, 'create_moved_node', create_mock)
+        monkeypatch.setattr(_mod, 'recreate_subgraph_relationships', recreate_mock)
+        monkeypatch.setattr(_mod, 'delete_source_node', delete_mock)
 
         memory_service = _make_memory_service({})
         args = _args(apply=True, manifest=str(manifest_path))
 
         report = await _mod.run(args, memory_service)
 
-        move_mock.assert_awaited_once_with(
+        create_mock.assert_awaited_once_with(
             memory_service.graphiti, 'u-move', 'reify', 'dark_factory',
             rewrite_group_id='dark_factory',
         )
-        merge_mock.assert_awaited_once_with(
-            memory_service.graphiti, 'u-merge', wrong_graph='reify', home_graph='know_live',
-        )
+        recreate_mock.assert_awaited_once()
+        assert recreate_mock.await_args is not None
+        specs_arg = recreate_mock.await_args.args[1]
+        assert {spec['uuid'] for spec in specs_arg} == {'u-move', 'u-merge'}
+        delete_calls = {call.args[1]: call.args[2] for call in delete_mock.await_args_list}
+        assert delete_calls == {'u-move': 'reify', 'u-merge': 'reify'}
+
         assert report['unresolved_uuids'] == ['u-unresolved']
         blocked = [r for r in report['apply_results'] if r['uuid'] == 'u-unresolved']
         assert blocked == [{
@@ -956,14 +976,15 @@ class TestRunApplyDispatch:
     async def test_move_dispatch_passes_rewrite_group_id_matching_target(
         self, tmp_path, monkeypatch,
     ):
-        """Regression guard (review-fix cycle 1, Bug 2): a MOVE dispatch
-        must pass rewrite_group_id == the node's target_graph, so an
-        alias-mapped move re-keys the moved node (and, via epsilon's
-        uniform new_group_id, its edges/mentions) to its home-graph name.
-        Without this, the recreated node keeps its variant group_id, stays
-        foreign in its new home, and post-verify miscounts it as residual
-        (a false exit 1). Pinned as its OWN focused test so a future
-        refactor cannot silently drop the kwarg without a test failing."""
+        """Regression guard (review-fix cycle 1, Bug 2): a MOVE dispatch's
+        Phase-A create_moved_node call must pass rewrite_group_id == the
+        node's target_graph, so an alias-mapped move re-keys the moved node
+        (and, via Phase B's uniform new_group_id, its edges/mentions) to its
+        home-graph name. Without this, the recreated node keeps its variant
+        group_id, stays foreign in its new home, and post-verify miscounts it
+        as residual (a false exit 1). Pinned as its OWN focused test so a
+        future refactor cannot silently drop the kwarg without a test
+        failing."""
         move_node = _classified_node(
             'u-move', source_graph='reify', target_graph='know_live', disposition=_mod.MOVE,
         )
@@ -971,19 +992,22 @@ class TestRunApplyDispatch:
         manifest_path = tmp_path / 'manifest.json'
         manifest_path.write_text(json.dumps(manifest))
 
-        move_mock = AsyncMock(return_value=MoveResult(
+        create_mock = AsyncMock(return_value=CreateResult(
             uuid='u-move', source_graph='reify', target_graph='know_live',
         ))
-        monkeypatch.setattr(_mod, 'move_entity_across_graphs', move_mock)
-        monkeypatch.setattr(_mod, 'merge_foreign_duplicate', AsyncMock())
+        monkeypatch.setattr(_mod, 'create_moved_node', create_mock)
+        monkeypatch.setattr(
+            _mod, 'recreate_subgraph_relationships', AsyncMock(return_value=SubgraphEdgeResult()),
+        )
+        monkeypatch.setattr(_mod, 'delete_source_node', AsyncMock(return_value=None))
 
         memory_service = _make_memory_service({})
         args = _args(apply=True, manifest=str(manifest_path))
 
         await _mod.run(args, memory_service)
 
-        assert move_mock.await_args is not None
-        call_kwargs = move_mock.await_args.kwargs
+        assert create_mock.await_args is not None
+        call_kwargs = create_mock.await_args.kwargs
         assert call_kwargs.get('rewrite_group_id') == 'know_live'
 
 
@@ -1004,19 +1028,21 @@ class TestRunApplyEpisodicSkip:
 
     @pytest.mark.asyncio
     async def test_episodic_skip_node_never_dispatched(self, tmp_path, monkeypatch):
-        """An EPISODIC_SKIP node is never passed to move_entity_across_graphs
-        or merge_foreign_duplicate, and receives no rekey mutation either --
-        it is recorded blocked, not applied."""
+        """An EPISODIC_SKIP node is never passed to create_moved_node,
+        recreate_subgraph_relationships, or delete_source_node, and receives
+        no rekey mutation either -- it is recorded blocked, not applied."""
         ep_node = _classified_node(
             'u-ep', source_graph='reify', target_graph='dark_factory',
             disposition=_mod.EPISODIC_SKIP,
         )
         manifest_path = self._write_manifest(tmp_path, [ep_node], {'reify': 1})
 
-        move_mock = AsyncMock(side_effect=AssertionError('must not dispatch EPISODIC_SKIP'))
-        merge_mock = AsyncMock(side_effect=AssertionError('must not dispatch EPISODIC_SKIP'))
-        monkeypatch.setattr(_mod, 'move_entity_across_graphs', move_mock)
-        monkeypatch.setattr(_mod, 'merge_foreign_duplicate', merge_mock)
+        create_mock = AsyncMock(side_effect=AssertionError('must not dispatch EPISODIC_SKIP'))
+        recreate_mock = AsyncMock(side_effect=AssertionError('must not dispatch EPISODIC_SKIP'))
+        delete_mock = AsyncMock(side_effect=AssertionError('must not dispatch EPISODIC_SKIP'))
+        monkeypatch.setattr(_mod, 'create_moved_node', create_mock)
+        monkeypatch.setattr(_mod, 'recreate_subgraph_relationships', recreate_mock)
+        monkeypatch.setattr(_mod, 'delete_source_node', delete_mock)
 
         reify_graph = _make_graph_mock(
             ro_pages=[[_foreign_row('u-ep', 'dark_factory', labels=['Episodic'])]],
@@ -1026,8 +1052,9 @@ class TestRunApplyEpisodicSkip:
 
         report = await _mod.run(args, memory_service)
 
-        move_mock.assert_not_awaited()
-        merge_mock.assert_not_awaited()
+        create_mock.assert_not_awaited()
+        recreate_mock.assert_not_awaited()
+        delete_mock.assert_not_awaited()
         reify_graph.query.assert_not_awaited()
 
         ep_results = [r for r in report['apply_results'] if r['uuid'] == 'u-ep']
@@ -1037,9 +1064,7 @@ class TestRunApplyEpisodicSkip:
         assert ep_results[0]['disposition'] == _mod.EPISODIC_SKIP
 
     @pytest.mark.asyncio
-    async def test_episodic_skip_residual_matches_but_still_blocks_exit(
-        self, tmp_path, monkeypatch,
-    ):
+    async def test_episodic_skip_residual_matches_but_still_blocks_exit(self, tmp_path):
         """EPISODIC_SKIP is counted in expected_residual (mirroring
         UNRESOLVED), so a graph still holding the un-actioned foreign
         Episodic node after apply reconciles (matched=True -- NOT mistaken
@@ -1052,20 +1077,10 @@ class TestRunApplyEpisodicSkip:
         )
         manifest_path = self._write_manifest(tmp_path, [ep_node], {'reify': 1, 'dark_factory': 0})
 
-        # return_value is a real, zero-loss MoveResult/MergeResult (not a
-        # bare AsyncMock()) -- run() now reads edges_skipped/mentions_skipped/
-        # home_edge_count_after off the result (see _move_result_entry/
-        # _merge_result_entry), and an unconfigured MagicMock's truthy
-        # attributes and non-identical `+` result would otherwise be
-        # misread as a lossy outcome, spuriously flipping 'blocked' to True.
-        monkeypatch.setattr(
-            _mod, 'move_entity_across_graphs',
-            AsyncMock(return_value=MoveResult(uuid='u', source_graph='s', target_graph='t')),
-        )
-        monkeypatch.setattr(
-            _mod, 'merge_foreign_duplicate',
-            AsyncMock(return_value=MergeResult(uuid='u', wrong_graph='s', home_graph='t')),
-        )
+        # No MOVE/MERGE node is present in this manifest, so none of the
+        # three phase primitives (create_moved_node/recreate_subgraph_
+        # relationships/delete_source_node) are ever invoked -- nothing to
+        # monkeypatch.
 
         memory_service = _make_memory_service({
             'reify': _make_graph_mock(
@@ -1101,9 +1116,9 @@ class TestRunApplyRekeyAndGuard:
     @pytest.mark.asyncio
     async def test_apply_rekey_node_in_place_no_epsilon_call(self, tmp_path, monkeypatch):
         """A REKEY node (source_graph == target_graph) never dispatches to
-        either epsilon primitive -- both are monkeypatched to explode if
-        invoked, as a hard guard against the data-loss bug this fixes.
-        Instead, the home graph receives an in-place group_id SET (no
+        any of the three phase primitives -- all three are monkeypatched to
+        explode if invoked, as a hard guard against the data-loss bug this
+        fixes. Instead, the home graph receives an in-place group_id SET (no
         CREATE/DETACH DELETE), the node is recorded applied (not blocked),
         and a clean post-verify re-census yields exit_code 0."""
         rekey_node = _classified_node(
@@ -1112,10 +1127,12 @@ class TestRunApplyRekeyAndGuard:
         )
         manifest_path = self._write_manifest(tmp_path, [rekey_node], {'know_live': 1})
 
-        move_mock = AsyncMock(side_effect=AssertionError('must not be called for REKEY'))
-        merge_mock = AsyncMock(side_effect=AssertionError('must not be called for REKEY'))
-        monkeypatch.setattr(_mod, 'move_entity_across_graphs', move_mock)
-        monkeypatch.setattr(_mod, 'merge_foreign_duplicate', merge_mock)
+        create_mock = AsyncMock(side_effect=AssertionError('must not be called for REKEY'))
+        recreate_mock = AsyncMock(side_effect=AssertionError('must not be called for REKEY'))
+        delete_mock = AsyncMock(side_effect=AssertionError('must not be called for REKEY'))
+        monkeypatch.setattr(_mod, 'create_moved_node', create_mock)
+        monkeypatch.setattr(_mod, 'recreate_subgraph_relationships', recreate_mock)
+        monkeypatch.setattr(_mod, 'delete_source_node', delete_mock)
 
         home_graph = _make_graph_mock(ro_pages=[[]])  # clean post-verify re-census
         memory_service = _make_memory_service({'know_live': home_graph})
@@ -1123,8 +1140,9 @@ class TestRunApplyRekeyAndGuard:
 
         report = await _mod.run(args, memory_service)
 
-        move_mock.assert_not_awaited()
-        merge_mock.assert_not_awaited()
+        create_mock.assert_not_awaited()
+        recreate_mock.assert_not_awaited()
+        delete_mock.assert_not_awaited()
 
         cyphers = [extract_cypher(call) for call in home_graph.query.call_args_list]
         assert cyphers, 'expected at least one graph.query mutation for the rekey'
@@ -1143,10 +1161,10 @@ class TestRunApplyRekeyAndGuard:
         """A malformed/hand-edited manifest carrying a MOVE or MERGE node
         whose source_graph == target_graph (never produced by a correctly-
         behaving classify_node -- that's REKEY's territory) is REFUSED, not
-        dispatched: dispatching it would make move_entity_across_graphs /
-        merge_foreign_duplicate DETACH DELETE the node's only copy. Both
-        nodes are recorded blocked and force a non-zero exit_code even
-        though the mock re-census otherwise reconciles."""
+        dispatched: dispatching it would make the phase primitives treat the
+        node's only copy as both source AND target. Both nodes are recorded
+        blocked and force a non-zero exit_code even though the mock
+        re-census otherwise reconciles."""
         bad_move = _classified_node(
             'u-bad-move', source_graph='know_live', target_graph='know_live',
             disposition=_mod.MOVE,
@@ -1158,10 +1176,12 @@ class TestRunApplyRekeyAndGuard:
             tmp_path, [bad_move, bad_merge], {'know_live': 1, 'reify': 1},
         )
 
-        move_mock = AsyncMock()
-        merge_mock = AsyncMock()
-        monkeypatch.setattr(_mod, 'move_entity_across_graphs', move_mock)
-        monkeypatch.setattr(_mod, 'merge_foreign_duplicate', merge_mock)
+        create_mock = AsyncMock()
+        recreate_mock = AsyncMock()
+        delete_mock = AsyncMock()
+        monkeypatch.setattr(_mod, 'create_moved_node', create_mock)
+        monkeypatch.setattr(_mod, 'recreate_subgraph_relationships', recreate_mock)
+        monkeypatch.setattr(_mod, 'delete_source_node', delete_mock)
 
         memory_service = _make_memory_service({
             'know_live': _make_graph_mock(ro_pages=[[]]),
@@ -1171,8 +1191,9 @@ class TestRunApplyRekeyAndGuard:
 
         report = await _mod.run(args, memory_service)
 
-        move_mock.assert_not_awaited()
-        merge_mock.assert_not_awaited()
+        create_mock.assert_not_awaited()
+        recreate_mock.assert_not_awaited()
+        delete_mock.assert_not_awaited()
         blocked_uuids = {r['uuid'] for r in report['apply_results'] if r['blocked']}
         assert blocked_uuids == {'u-bad-move', 'u-bad-merge'}
         assert report['post_verify']['matched'] is True
@@ -1185,12 +1206,12 @@ class TestRunApplyRekeyAndGuard:
 # ===========================================================================
 
 class TestRunApplyExceptionIsolation:
-    """Tests for run()'s apply loop never letting one node's primitive
-    exception abort the whole batch. A hand-edited manifest mislabeling an
-    Episodic node as MOVE (escaping the classify-time EPISODIC_SKIP gate),
-    a ForeignDuplicateSuspectedError, or a transient FalkorDB error must not
-    lose the record of every OTHER node's outcome, and post-verify must
-    still run."""
+    """Tests for run()'s three-phase apply never letting one node's
+    Phase-A/C primitive exception abort the whole batch. A hand-edited
+    manifest mislabeling an Episodic node as MOVE (escaping the classify-time
+    EPISODIC_SKIP gate), a ForeignDuplicateSuspectedError, or a transient
+    FalkorDB error must not lose the record of every OTHER node's outcome,
+    and post-verify must still run."""
 
     def _write_manifest(self, tmp_path, nodes, census) -> Path:
         manifest = _mod.build_manifest(nodes, census, dry_run=True)
@@ -1200,11 +1221,14 @@ class TestRunApplyExceptionIsolation:
 
     @pytest.mark.asyncio
     async def test_failed_dispatch_does_not_abort_remaining_nodes(self, tmp_path, monkeypatch):
-        """A FIRST node whose primitive dispatch raises is recorded blocked
-        with the error captured -- but the loop continues: the SECOND node
-        is still dispatched, post-verify still runs, and run() returns a
-        report dict rather than propagating the exception. The failure
-        forces a non-zero exit_code."""
+        """A MOVE node whose Phase-A create_moved_node call raises is
+        recorded blocked with the error captured, and is excluded from the
+        Phase-B/C batch entirely (its edges cannot be safely recreated and
+        its non-existent target copy must not have its source deleted) --
+        but the batch continues: a MERGE node in the same manifest still
+        gets its Phase-B recreate and Phase-C wrong-copy delete, post-verify
+        still runs, and run() returns a report dict rather than propagating
+        the exception. The failure forces a non-zero exit_code."""
         failing_move = _classified_node(
             'u-move', source_graph='reify', target_graph='dark_factory', disposition=_mod.MOVE,
         )
@@ -1216,18 +1240,17 @@ class TestRunApplyExceptionIsolation:
             tmp_path, [failing_move, succeeding_merge], {'reify': 1, 'know_live': 1},
         )
 
-        # merge_mock's return_value is a real, zero-loss MergeResult (not a
-        # bare AsyncMock()) -- run() reads edges_recreated/home_edge_count_before/
-        # home_edge_count_after off the result (see _merge_result_entry), and an
-        # unconfigured MagicMock's truthy attributes and non-identical `+` result
-        # would otherwise be misread as a lossy outcome, spuriously flipping
-        # 'blocked' to True (same pitfall documented on the sibling tests above).
-        move_mock = AsyncMock(side_effect=RuntimeError('simulated epsilon failure'))
-        merge_mock = AsyncMock(return_value=MergeResult(
-            uuid='u-merge', wrong_graph='know_live', home_graph='pump_web_ui',
-        ))
-        monkeypatch.setattr(_mod, 'move_entity_across_graphs', move_mock)
-        monkeypatch.setattr(_mod, 'merge_foreign_duplicate', merge_mock)
+        # recreate_mock's return_value is a real, zero-loss SubgraphEdgeResult
+        # (not a bare AsyncMock()) -- run() reads edges_recreated/edges_skipped/
+        # dropped_cross_target off the result, and an unconfigured MagicMock's
+        # truthy attributes would otherwise be misread as a lossy outcome,
+        # spuriously affecting the exit_code semantics under test here.
+        create_mock = AsyncMock(side_effect=RuntimeError('simulated epsilon failure'))
+        recreate_mock = AsyncMock(return_value=SubgraphEdgeResult())
+        delete_mock = AsyncMock(return_value=None)
+        monkeypatch.setattr(_mod, 'create_moved_node', create_mock)
+        monkeypatch.setattr(_mod, 'recreate_subgraph_relationships', recreate_mock)
+        monkeypatch.setattr(_mod, 'delete_source_node', delete_mock)
 
         memory_service = _make_memory_service({
             'reify': _make_graph_mock(ro_pages=[[]]),
@@ -1243,14 +1266,82 @@ class TestRunApplyExceptionIsolation:
         assert move_result[0]['blocked'] is True
         assert 'simulated epsilon failure' in move_result[0]['error']
 
-        merge_mock.assert_awaited_once()
+        # The failed MOVE's spec is excluded from the Phase-B batch -- only
+        # the surviving MERGE spec is offered to recreate_subgraph_relationships.
+        recreate_mock.assert_awaited_once()
+        assert recreate_mock.await_args is not None
+        specs_arg = recreate_mock.await_args.args[1]
+        assert {spec['uuid'] for spec in specs_arg} == {'u-merge'}
+
+        # Phase C: the failed MOVE's source is never deleted (its node was
+        # never created in target); the MERGE's wrong-copy still is.
+        delete_calls = {call.args[1] for call in delete_mock.await_args_list}
+        assert delete_calls == {'u-merge'}
+
         merge_result = [r for r in report['apply_results'] if r['uuid'] == 'u-merge']
         assert merge_result == [{
             'uuid': 'u-merge', 'disposition': _mod.MERGE, 'applied': True, 'blocked': False,
-            'edges_recreated': 0, 'home_edge_count_before': 0, 'home_edge_count_after': 0,
         }]
 
         assert 'post_verify' in report
+        assert report['exit_code'] != 0
+
+    @pytest.mark.asyncio
+    async def test_phase_b_failure_surfaces_partial_edge_tally_not_zero(
+        self, tmp_path, monkeypatch,
+    ):
+        """When recreate_subgraph_relationships (Phase B) raises partway
+        through a batch, it has already mutated target graphs for whatever
+        it completed before the raise (see that function's docstring) --
+        the exception carries that partial tally as exc.partial_result (a
+        SubgraphEdgeResult). run() must read it off the exception and fold
+        it into the report instead of falling back to the all-zero default
+        edge_result, which would understate what was actually mutated in
+        target graphs before the failure (task 2415 amendment round 2)."""
+        move_node = _classified_node(
+            'u-move', source_graph='reify', target_graph='dark_factory', disposition=_mod.MOVE,
+        )
+        manifest_path = self._write_manifest(tmp_path, [move_node], {'reify': 1, 'dark_factory': 0})
+
+        phase_b_error = RuntimeError('transient FalkorDB error mid-batch')
+        phase_b_error.partial_result = (  # type: ignore[attr-defined]
+            SubgraphEdgeResult(edges_recreated=3, mentions_recreated=1)
+        )
+
+        monkeypatch.setattr(
+            _mod, 'create_moved_node',
+            AsyncMock(return_value=CreateResult(uuid='u', source_graph='s', target_graph='t')),
+        )
+        monkeypatch.setattr(
+            _mod, 'recreate_subgraph_relationships', AsyncMock(side_effect=phase_b_error),
+        )
+        delete_mock = AsyncMock(return_value=None)
+        monkeypatch.setattr(_mod, 'delete_source_node', delete_mock)
+
+        memory_service = _make_memory_service({
+            'reify': _make_graph_mock(ro_pages=[[]]),
+            'dark_factory': _make_graph_mock(ro_pages=[[]]),
+        })
+        args = _args(apply=True, manifest=str(manifest_path))
+
+        report = await _mod.run(args, memory_service)
+
+        # the real partial tally survives into the report -- not the
+        # all-zero default a discarded exception would have left behind.
+        assert report['edges_recreated'] == 3
+        assert report['mentions_recreated'] == 1
+
+        move_result = [r for r in report['apply_results'] if r['uuid'] == 'u-move']
+        assert len(move_result) == 1
+        assert move_result[0]['applied'] is False
+        assert move_result[0]['blocked'] is True
+        assert 'transient FalkorDB error mid-batch' in move_result[0]['error']
+
+        # Phase C never runs for a node whose batch's Phase-B call failed --
+        # its source must not be deleted out from under an edge recreate
+        # that never completed.
+        delete_mock.assert_not_awaited()
+
         assert report['exit_code'] != 0
 
 
@@ -1278,20 +1369,20 @@ class TestRunPostVerify:
         )
         manifest_path = self._write_manifest(tmp_path, [move_node], {'reify': 1, 'dark_factory': 0})
 
-        # return_value is a real, zero-loss MoveResult/MergeResult (not a
-        # bare AsyncMock()) -- run() now reads edges_skipped/mentions_skipped/
-        # home_edge_count_after off the result (see _move_result_entry/
-        # _merge_result_entry), and an unconfigured MagicMock's truthy
-        # attributes and non-identical `+` result would otherwise be
-        # misread as a lossy outcome, spuriously flipping 'blocked' to True.
+        # return_value is a real, zero-loss CreateResult/SubgraphEdgeResult
+        # (not a bare AsyncMock()) -- run() reads already_created/
+        # edges_skipped/mentions_skipped/dropped_cross_target off the
+        # result, and an unconfigured MagicMock's truthy attributes would
+        # otherwise be misread as a lossy outcome, spuriously flipping
+        # 'blocked' to True.
         monkeypatch.setattr(
-            _mod, 'move_entity_across_graphs',
-            AsyncMock(return_value=MoveResult(uuid='u', source_graph='s', target_graph='t')),
+            _mod, 'create_moved_node',
+            AsyncMock(return_value=CreateResult(uuid='u', source_graph='s', target_graph='t')),
         )
         monkeypatch.setattr(
-            _mod, 'merge_foreign_duplicate',
-            AsyncMock(return_value=MergeResult(uuid='u', wrong_graph='s', home_graph='t')),
+            _mod, 'recreate_subgraph_relationships', AsyncMock(return_value=SubgraphEdgeResult()),
         )
+        monkeypatch.setattr(_mod, 'delete_source_node', AsyncMock(return_value=None))
 
         memory_service = _make_memory_service({
             'reify': _make_graph_mock(ro_pages=[[]]),
@@ -1320,20 +1411,20 @@ class TestRunPostVerify:
         )
         manifest_path = self._write_manifest(tmp_path, [move_node], {'reify': 1, 'dark_factory': 0})
 
-        # return_value is a real, zero-loss MoveResult/MergeResult (not a
-        # bare AsyncMock()) -- run() now reads edges_skipped/mentions_skipped/
-        # home_edge_count_after off the result (see _move_result_entry/
-        # _merge_result_entry), and an unconfigured MagicMock's truthy
-        # attributes and non-identical `+` result would otherwise be
-        # misread as a lossy outcome, spuriously flipping 'blocked' to True.
+        # return_value is a real, zero-loss CreateResult/SubgraphEdgeResult
+        # (not a bare AsyncMock()) -- run() reads already_created/
+        # edges_skipped/mentions_skipped/dropped_cross_target off the
+        # result, and an unconfigured MagicMock's truthy attributes would
+        # otherwise be misread as a lossy outcome, spuriously flipping
+        # 'blocked' to True.
         monkeypatch.setattr(
-            _mod, 'move_entity_across_graphs',
-            AsyncMock(return_value=MoveResult(uuid='u', source_graph='s', target_graph='t')),
+            _mod, 'create_moved_node',
+            AsyncMock(return_value=CreateResult(uuid='u', source_graph='s', target_graph='t')),
         )
         monkeypatch.setattr(
-            _mod, 'merge_foreign_duplicate',
-            AsyncMock(return_value=MergeResult(uuid='u', wrong_graph='s', home_graph='t')),
+            _mod, 'recreate_subgraph_relationships', AsyncMock(return_value=SubgraphEdgeResult()),
         )
+        monkeypatch.setattr(_mod, 'delete_source_node', AsyncMock(return_value=None))
 
         memory_service = _make_memory_service({
             'reify': _make_graph_mock(ro_pages=[[_foreign_row('u-move', 'dark_factory')]]),
@@ -1348,7 +1439,7 @@ class TestRunPostVerify:
 
     @pytest.mark.asyncio
     async def test_any_unresolved_node_forces_nonzero_exit_even_if_counts_reconcile(
-        self, tmp_path, monkeypatch,
+        self, tmp_path,
     ):
         """An UNRESOLVED node blocks --apply's success regardless of whether
         the post-apply re-census otherwise reconciles: the residual foreign
@@ -1362,20 +1453,8 @@ class TestRunPostVerify:
             tmp_path, [unresolved_node], {'reify': 1, 'dark_factory': 0},
         )
 
-        # return_value is a real, zero-loss MoveResult/MergeResult (not a
-        # bare AsyncMock()) -- run() now reads edges_skipped/mentions_skipped/
-        # home_edge_count_after off the result (see _move_result_entry/
-        # _merge_result_entry), and an unconfigured MagicMock's truthy
-        # attributes and non-identical `+` result would otherwise be
-        # misread as a lossy outcome, spuriously flipping 'blocked' to True.
-        monkeypatch.setattr(
-            _mod, 'move_entity_across_graphs',
-            AsyncMock(return_value=MoveResult(uuid='u', source_graph='s', target_graph='t')),
-        )
-        monkeypatch.setattr(
-            _mod, 'merge_foreign_duplicate',
-            AsyncMock(return_value=MergeResult(uuid='u', wrong_graph='s', home_graph='t')),
-        )
+        # No MOVE/MERGE node is present in this manifest, so none of the
+        # three phase primitives are ever invoked -- nothing to monkeypatch.
 
         memory_service = _make_memory_service({
             'reify': _make_graph_mock(
@@ -1389,6 +1468,332 @@ class TestRunPostVerify:
 
         assert report['post_verify']['matched'] is True
         assert report['exit_code'] != 0
+
+
+# ===========================================================================
+# Tests: run() apply three-phase barrier ordering (task 2415, step-11/12)
+# ===========================================================================
+
+class TestRunApplyPhaseBarrier:
+    """Pins the barrier-ordering invariant of the three-phase apply (CGL-eta
+    follow-up, task 2415): run() must drive Phase A (create_moved_node, once
+    per MOVE node) to completion for the WHOLE batch before Phase B
+    (recreate_subgraph_relationships, a single batched call), and Phase B to
+    completion before Phase C (delete_source_node, once per MOVE/MERGE
+    node). This ordering is what prevents a co-moving neighbour's shared
+    RELATES_TO edge from being silently skipped and then destroyed before it
+    is ever recreated -- see the module docstring and cross_graph_move.py's
+    "Residual hazard" note on the old single-call move_entity_across_graphs.
+    """
+
+    def _write_manifest(self, tmp_path, nodes, census) -> Path:
+        manifest = _mod.build_manifest(nodes, census, dry_run=True)
+        manifest_path = tmp_path / 'manifest.json'
+        manifest_path.write_text(json.dumps(manifest))
+        return manifest_path
+
+    @pytest.mark.asyncio
+    async def test_all_phase_a_creates_precede_phase_b_which_precedes_all_phase_c_deletes(
+        self, tmp_path, monkeypatch,
+    ):
+        """A manifest with two MOVE nodes and one MERGE node: every Phase-A
+        create_moved_node call is logged before the single, batched Phase-B
+        recreate_subgraph_relationships call, which is logged before every
+        Phase-C delete_source_node call."""
+        move_a = _classified_node(
+            'u-move-a', source_graph='reify', target_graph='dark_factory', disposition=_mod.MOVE,
+        )
+        move_b = _classified_node(
+            'u-move-b', source_graph='reify', target_graph='dark_factory', disposition=_mod.MOVE,
+        )
+        merge_c = _classified_node(
+            'u-merge-c', source_graph='reify', target_graph='know_live', disposition=_mod.MERGE,
+        )
+        manifest_path = self._write_manifest(
+            tmp_path, [move_a, move_b, merge_c], {'reify': 3},
+        )
+
+        call_log: list[tuple] = []
+
+        async def _fake_create(graphiti, uuid, source_graph, target_graph, **kwargs):
+            call_log.append(('create', uuid))
+            return CreateResult(uuid=uuid, source_graph=source_graph, target_graph=target_graph)
+
+        async def _fake_recreate(graphiti, specs):
+            call_log.append(('recreate', tuple(sorted(spec['uuid'] for spec in specs))))
+            return SubgraphEdgeResult()
+
+        async def _fake_delete(graphiti, uuid, source_graph):
+            call_log.append(('delete', uuid))
+
+        monkeypatch.setattr(_mod, 'create_moved_node', AsyncMock(side_effect=_fake_create))
+        monkeypatch.setattr(
+            _mod, 'recreate_subgraph_relationships', AsyncMock(side_effect=_fake_recreate),
+        )
+        monkeypatch.setattr(_mod, 'delete_source_node', AsyncMock(side_effect=_fake_delete))
+
+        memory_service = _make_memory_service({
+            'reify': _make_graph_mock(ro_pages=[[]]),
+            'dark_factory': _make_graph_mock(ro_pages=[[]]),
+            'know_live': _make_graph_mock(ro_pages=[[]]),
+        })
+        args = _args(apply=True, manifest=str(manifest_path))
+
+        await _mod.run(args, memory_service)
+
+        kinds = [entry[0] for entry in call_log]
+        create_positions = [i for i, kind in enumerate(kinds) if kind == 'create']
+        recreate_positions = [i for i, kind in enumerate(kinds) if kind == 'recreate']
+        delete_positions = [i for i, kind in enumerate(kinds) if kind == 'delete']
+
+        # MOVE nodes each get a Phase-A create; the MERGE node does not (its
+        # home copy already exists -- see create_moved_node's docstring).
+        assert len(create_positions) == 2
+        assert {call_log[i][1] for i in create_positions} == {'u-move-a', 'u-move-b'}
+        # A single, batched Phase-B call over the WHOLE batch (MOVE + MERGE).
+        assert len(recreate_positions) == 1
+        assert set(call_log[recreate_positions[0]][1]) == {
+            'u-move-a', 'u-move-b', 'u-merge-c',
+        }
+        # Every MOVE/MERGE node gets a Phase-C delete.
+        assert len(delete_positions) == 3
+        assert {call_log[i][1] for i in delete_positions} == {
+            'u-move-a', 'u-move-b', 'u-merge-c',
+        }
+
+        assert max(create_positions) < min(recreate_positions), (
+            'every Phase-A create must precede the Phase-B recreate call'
+        )
+        assert max(recreate_positions) < min(delete_positions), (
+            'the Phase-B recreate call must precede every Phase-C delete'
+        )
+
+
+# ===========================================================================
+# Tests: run() apply preserves a co-moving pair's shared edge
+# (task 2415, step-13/14)
+# ===========================================================================
+
+class TestRunApplyCoMovingPreserved:
+    """Proves the three-phase barrier-ordered apply preserves a co-moving
+    pair's shared RELATES_TO edge -- the whole point of task 2415 -- by
+    folding recreate_subgraph_relationships's SubgraphEdgeResult into the
+    report instead of discarding it.
+    """
+
+    def _write_manifest(self, tmp_path, nodes, census) -> Path:
+        manifest = _mod.build_manifest(nodes, census, dry_run=True)
+        manifest_path = tmp_path / 'manifest.json'
+        manifest_path.write_text(json.dumps(manifest))
+        return manifest_path
+
+    @pytest.mark.asyncio
+    async def test_co_moving_pair_edge_recreated_count_folded_into_report(
+        self, tmp_path, monkeypatch,
+    ):
+        """Two MOVE nodes (u-A, u-B) sharing a RELATES_TO edge, both moving
+        reify -> dark_factory: run() passes BOTH specs to a single
+        recreate_subgraph_relationships call, folds its edges_recreated
+        count into report['edges_recreated'], records both nodes applied
+        (not blocked for edge loss), and -- with a clean post-verify
+        re-census -- yields exit_code 0. Proves the co-moving edge is
+        preserved, not lost."""
+        move_a = _classified_node(
+            'u-A', source_graph='reify', target_graph='dark_factory', disposition=_mod.MOVE,
+        )
+        move_b = _classified_node(
+            'u-B', source_graph='reify', target_graph='dark_factory', disposition=_mod.MOVE,
+        )
+        manifest_path = self._write_manifest(
+            tmp_path, [move_a, move_b], {'reify': 2, 'dark_factory': 0},
+        )
+
+        monkeypatch.setattr(_mod, 'create_moved_node', AsyncMock(return_value=None))
+        monkeypatch.setattr(_mod, 'delete_source_node', AsyncMock(return_value=None))
+        recreate_mock = AsyncMock(return_value=SubgraphEdgeResult(
+            edges_recreated=1, edges_skipped=0, dropped_cross_target=[],
+        ))
+        monkeypatch.setattr(_mod, 'recreate_subgraph_relationships', recreate_mock)
+
+        memory_service = _make_memory_service({
+            'reify': _make_graph_mock(ro_pages=[[]]),
+            'dark_factory': _make_graph_mock(ro_pages=[[]]),
+        })
+        args = _args(apply=True, manifest=str(manifest_path))
+
+        report = await _mod.run(args, memory_service)
+
+        recreate_mock.assert_awaited_once()
+        assert recreate_mock.await_args is not None
+        specs_arg = recreate_mock.await_args.args[1]
+        assert {spec['uuid'] for spec in specs_arg} == {'u-A', 'u-B'}
+
+        assert report['edges_recreated'] == 1
+
+        applied = {r['uuid']: r for r in report['apply_results']}
+        assert applied['u-A']['applied'] is True
+        assert applied['u-A']['blocked'] is False
+        assert applied['u-B']['applied'] is True
+        assert applied['u-B']['blocked'] is False
+
+        assert report['post_verify']['matched'] is True
+        assert report['exit_code'] == 0
+
+
+# ===========================================================================
+# Tests: run() apply surfaces cross-target-dropped edges
+# (task 2415, step-15/16)
+# ===========================================================================
+
+class TestRunApplyCrossTargetDropped:
+    """Proves a cross-target-dropped edge (Phase B's dropped_cross_target --
+    two endpoints resolving to DIFFERENT target graphs, which FalkorDB
+    cannot recreate in either) is surfaced verbatim for human review, never
+    silently omitted, and forces a blocking exit even when the post-verify
+    count re-census otherwise reconciles.
+    """
+
+    def _write_manifest(self, tmp_path, nodes, census) -> Path:
+        manifest = _mod.build_manifest(nodes, census, dry_run=True)
+        manifest_path = tmp_path / 'manifest.json'
+        manifest_path.write_text(json.dumps(manifest))
+        return manifest_path
+
+    @pytest.mark.asyncio
+    async def test_dropped_cross_target_edges_surfaced_and_forces_blocking_exit(
+        self, tmp_path, monkeypatch,
+    ):
+        """recreate_subgraph_relationships (monkeypatched) returns one
+        dropped_cross_target record; run()'s report carries it verbatim
+        under report['dropped_cross_target_edges'] (with its reason), and
+        the non-empty list forces a non-zero/blocking exit_code even though
+        the post-verify re-census otherwise reconciles cleanly."""
+        move_node = _classified_node(
+            'u-X', source_graph='reify', target_graph='dark_factory', disposition=_mod.MOVE,
+        )
+        manifest_path = self._write_manifest(tmp_path, [move_node], {'reify': 1, 'dark_factory': 0})
+
+        dropped_record = {
+            'edge_uuid': 'e-1',
+            'src_uuid': 'u-X',
+            'dst_uuid': 'u-Y',
+            'src_target': 'dark_factory',
+            'dst_target': 'know_live',
+            'reason': (
+                'edge endpoints resolve to different target graphs (or an '
+                'undeliverable non-migrating endpoint) -- cross-graph '
+                'RELATES_TO edges are unsupported; needs manual review'
+            ),
+        }
+
+        monkeypatch.setattr(_mod, 'create_moved_node', AsyncMock(return_value=None))
+        monkeypatch.setattr(_mod, 'delete_source_node', AsyncMock(return_value=None))
+        monkeypatch.setattr(
+            _mod, 'recreate_subgraph_relationships',
+            AsyncMock(return_value=SubgraphEdgeResult(
+                edges_recreated=0, edges_skipped=0, dropped_cross_target=[dropped_record],
+            )),
+        )
+
+        memory_service = _make_memory_service({
+            'reify': _make_graph_mock(ro_pages=[[]]),
+            'dark_factory': _make_graph_mock(ro_pages=[[]]),
+        })
+        args = _args(apply=True, manifest=str(manifest_path))
+
+        report = await _mod.run(args, memory_service)
+
+        assert report['dropped_cross_target_edges'] == [dropped_record]
+        assert 'needs manual review' in report['dropped_cross_target_edges'][0]['reason']
+
+        assert report['post_verify']['matched'] is True
+        assert report['exit_code'] != 0
+
+
+# ===========================================================================
+# Tests: run() apply is a safe no-op on an already-applied manifest
+# (task 2415, step-19/20)
+# ===========================================================================
+
+class TestRunApplyIdempotentReRun:
+    """Proves re-running --apply against an already-applied manifest
+    converges instead of raising or re-recording loss -- the payoff of the
+    three phase primitives' own idempotency (create_moved_node's
+    already_created no-op, recreate_subgraph_relationships' skip-if-
+    already-present dedup, delete_source_node's no-precheck DETACH DELETE)
+    composed through run()'s per-node/per-phase exception isolation, which
+    treats a non-raising outcome as applied regardless of whether it did
+    fresh work or found everything already converged."""
+
+    def _write_manifest(self, tmp_path, nodes, census) -> Path:
+        manifest = _mod.build_manifest(nodes, census, dry_run=True)
+        manifest_path = tmp_path / 'manifest.json'
+        manifest_path.write_text(json.dumps(manifest))
+        return manifest_path
+
+    @pytest.mark.asyncio
+    async def test_reapplying_fully_migrated_manifest_is_a_safe_noop(
+        self, tmp_path, monkeypatch,
+    ):
+        """A MOVE node and a MERGE node whose migration already fully
+        completed on a prior run: Phase-A create_moved_node reports
+        already_created=True (node already present in target), Phase-B
+        recreates nothing new (its edges are already present, so
+        edges_recreated==0 and edges_skipped==0 -- a dedup skip, not a
+        loss), and Phase-C delete_source_node no-ops (source already gone,
+        no existence precheck). No exception propagates, neither node is
+        recorded blocked or lossy, the post-verify re-census reconciles,
+        and exit_code is 0."""
+        move_node = _classified_node(
+            'u-move', source_graph='reify', target_graph='dark_factory', disposition=_mod.MOVE,
+        )
+        merge_node = _classified_node(
+            'u-merge', source_graph='reify', target_graph='know_live', disposition=_mod.MERGE,
+        )
+        manifest_path = self._write_manifest(
+            tmp_path, [move_node, merge_node], {'reify': 2, 'dark_factory': 0, 'know_live': 0},
+        )
+
+        create_mock = AsyncMock(return_value=CreateResult(
+            uuid='u-move', source_graph='reify', target_graph='dark_factory',
+            already_created=True,
+        ))
+        recreate_mock = AsyncMock(return_value=SubgraphEdgeResult(
+            edges_recreated=0, edges_skipped=0,
+            mentions_recreated=0, mentions_skipped=0,
+            dropped_cross_target=[],
+        ))
+        delete_mock = AsyncMock(return_value=None)  # no-precheck DETACH DELETE no-op
+        monkeypatch.setattr(_mod, 'create_moved_node', create_mock)
+        monkeypatch.setattr(_mod, 'recreate_subgraph_relationships', recreate_mock)
+        monkeypatch.setattr(_mod, 'delete_source_node', delete_mock)
+
+        memory_service = _make_memory_service({
+            'reify': _make_graph_mock(ro_pages=[[]]),
+            'dark_factory': _make_graph_mock(ro_pages=[[]]),
+            'know_live': _make_graph_mock(ro_pages=[[]]),
+        })
+        args = _args(apply=True, manifest=str(manifest_path))
+
+        report = await _mod.run(args, memory_service)
+
+        create_mock.assert_awaited_once()
+        recreate_mock.assert_awaited_once()
+        assert delete_mock.await_count == 2
+
+        results_by_uuid = {r['uuid']: r for r in report['apply_results']}
+        assert results_by_uuid['u-move'] == {
+            'uuid': 'u-move', 'disposition': _mod.MOVE, 'applied': True, 'blocked': False,
+        }
+        assert results_by_uuid['u-merge'] == {
+            'uuid': 'u-merge', 'disposition': _mod.MERGE, 'applied': True, 'blocked': False,
+        }
+
+        assert report['edges_recreated'] == 0
+        assert report['edges_skipped'] == 0
+        assert report['dropped_cross_target_edges'] == []
+        assert report['post_verify']['matched'] is True
+        assert report['exit_code'] == 0
 
 
 # ===========================================================================
@@ -1428,3 +1833,84 @@ class TestBuildArgParser:
         assert args.manifest == 'm.json'
         assert args.page_size == 500
         assert args.config == 'c.yaml'
+
+
+# ===========================================================================
+# Tests: build_memory_service (step-23/24)
+# ===========================================================================
+
+class TestBuildMemoryService:
+    """Tests for build_memory_service(args, config) -- task 2415 step-23/24.
+
+    The dry-run/census path only needs a driver/client-wired
+    GraphitiBackend for reads; building a full MemoryService -- whose
+    initialize() runs the W6-ε startup identity scan (a dup-uuid-edge
+    REPAIR, i.e. a write) and the index-build loop -- mutates on the
+    default `python migrate_cross_graph_leak.py > manifest.json` invocation
+    and contends with a running service. --apply legitimately mutates, so
+    it keeps the full MemoryService, unskipped.
+
+    GraphitiBackend/MemoryService are lazily imported inside
+    build_memory_service (mirroring main()'s existing _run_live lazy-import
+    idiom), so the classes are monkeypatched at their ORIGIN modules
+    (not on `_mod`, which never binds these names at module scope).
+    """
+
+    @pytest.mark.asyncio
+    async def test_dry_run_builds_lean_graphiti_backend_with_skip_maintenance(
+        self, mock_config, monkeypatch,
+    ):
+        """Dry-run (args.apply=False): construct a lean GraphitiBackend,
+        await its initialize(skip_maintenance=True), and never construct a
+        full MemoryService. The returned object exposes .graphiti (the
+        backend) and an awaitable close()."""
+        backend_instance = AsyncMock()
+        backend_cls = MagicMock(return_value=backend_instance)
+        memory_service_cls = MagicMock()
+        monkeypatch.setattr(
+            'fused_memory.backends.graphiti_client.GraphitiBackend', backend_cls,
+        )
+        monkeypatch.setattr(
+            'fused_memory.services.memory_service.MemoryService', memory_service_cls,
+        )
+
+        args = _args(apply=False)
+        config = mock_config
+
+        result = await _mod.build_memory_service(args, config)
+
+        backend_cls.assert_called_once_with(config)
+        backend_instance.initialize.assert_awaited_once_with(skip_maintenance=True)
+        memory_service_cls.assert_not_called()
+        assert result.graphiti is backend_instance
+
+        await result.close()
+        backend_instance.close.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_apply_builds_full_memory_service_without_skip(
+        self, mock_config, monkeypatch,
+    ):
+        """--apply (args.apply=True): construct the full MemoryService and
+        await its initialize() with no skip_maintenance override (the real
+        MemoryService.initialize() takes no arguments at all), never
+        constructing a lean GraphitiBackend directly."""
+        memory_instance = AsyncMock()
+        memory_service_cls = MagicMock(return_value=memory_instance)
+        backend_cls = MagicMock()
+        monkeypatch.setattr(
+            'fused_memory.backends.graphiti_client.GraphitiBackend', backend_cls,
+        )
+        monkeypatch.setattr(
+            'fused_memory.services.memory_service.MemoryService', memory_service_cls,
+        )
+
+        args = _args(apply=True, manifest='m.json')
+        config = mock_config
+
+        result = await _mod.build_memory_service(args, config)
+
+        memory_service_cls.assert_called_once_with(config)
+        memory_instance.initialize.assert_awaited_once_with()
+        backend_cls.assert_not_called()
+        assert result is memory_instance

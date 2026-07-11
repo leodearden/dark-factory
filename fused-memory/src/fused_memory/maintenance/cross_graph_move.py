@@ -177,6 +177,266 @@ class ForeignDuplicateSuspectedError(Exception):
 
 
 @dataclass
+class _NodeCreateOutcome:
+    """Internal result of ``_create_entity_in_target`` -- shared by
+    ``create_moved_node`` and ``move_entity_across_graphs``.
+
+    Attributes:
+        already_moved: True ONLY for the fully-idempotent short-circuit case
+            (absent from source, present in target) -- a caller processing
+            edges/mentions/delete (``move_entity_across_graphs``) MUST do NO
+            further work at all when this is True; the whole move already
+            happened.
+        created: True when this call issued a fresh node CREATE in target.
+            False covers both ``already_moved`` and the matching-resume
+            case (present in both graphs, name/created_at match -- CREATE
+            is skipped because the node is already there, but a caller
+            processing edges/mentions/delete still proceeds to do so).
+        node_uuid: The node's own uuid, as read from source (or the probed
+            uuid when ``already_moved`` short-circuited before any source
+            row was read).
+        new_group_id: ``rewrite_group_id`` if given, else the source node's
+            own group_id -- None when ``already_moved`` (no further group_id
+            use is possible; the caller returns immediately).
+        source: The resolved source-graph handle (``graphiti._graph_for``),
+            so callers continuing past the node-create step don't need to
+            re-resolve it.
+        target: The resolved target-graph handle, likewise.
+        falkor_client: The raw transport client (``graphiti._require_falkor_client()``),
+            likewise -- None when ``already_moved``.
+    """
+
+    already_moved: bool
+    created: bool
+    node_uuid: str | None
+    new_group_id: str | None
+    source: Any
+    target: Any
+    falkor_client: Any
+
+
+async def _create_entity_in_target(
+    graphiti: Any,
+    uuid: str,
+    source_graph: str,
+    target_graph: str,
+    *,
+    rewrite_group_id: str | None = None,
+) -> _NodeCreateOutcome:
+    """Node-core read+CREATE shared by ``create_moved_node`` (Phase A) and
+    ``move_entity_across_graphs`` (S5, still a single-call primitive).
+
+    Reads the node's scalar props from source (plain ``ro_query``) and runs
+    the unconditional target-presence probe, then either: short-circuits as
+    already-fully-moved (absent from source, present in target); raises
+    ``NodeNotFoundError`` (absent from both); raises
+    ``ForeignDuplicateSuspectedError`` (present in both, diverging
+    name/created_at); skips the CREATE as a genuine resume (present in both,
+    matching); or reads the exact ``name_embedding`` via the raw
+    ``--compact`` transport and CREATEs the node in target. See
+    ``move_entity_across_graphs``'s docstring "Idempotency" section for the
+    full case analysis -- this helper implements exactly that analysis, up
+    to (but not including) edges/mentions/delete, which remain the caller's
+    responsibility.
+    """
+    source = graphiti._graph_for(source_graph)
+    target = graphiti._graph_for(target_graph)
+
+    node_result = await source.ro_query(
+        'MATCH (n:Entity {uuid: $uuid}) '
+        'RETURN n.uuid, n.name, n.group_id, n.summary, n.created_at',
+        {'uuid': uuid},
+    )
+
+    # --- unconditional target-presence probe ---
+    # Always read target presence before any mutation, regardless of
+    # whether the node is still present in source. This one probe backs
+    # BOTH the fully-idempotent no-op (absent from source, present in
+    # target) AND detecting a crash that happened strictly between the node
+    # CREATE and the source DETACH DELETE (present in BOTH graphs).
+    target_probe = await target.ro_query(
+        'MATCH (n:Entity {uuid: $uuid}) RETURN n.uuid, n.name, n.created_at',
+        {'uuid': uuid},
+    )
+    node_already_in_target = bool(target_probe.result_set)
+
+    if not node_result.result_set:
+        if node_already_in_target:
+            logger.info(
+                '_create_entity_in_target: already moved, no-op uuid=%s '
+                'source=%s target=%s',
+                uuid, source_graph, target_graph,
+            )
+            return _NodeCreateOutcome(
+                already_moved=True,
+                created=False,
+                node_uuid=uuid,
+                new_group_id=None,
+                source=source,
+                target=target,
+                falkor_client=None,
+            )
+        raise NodeNotFoundError(f'Entity node not found in source_graph {source_graph!r}: {uuid}')
+    node_uuid, name, group_id, summary, created_at = node_result.result_set[0]
+
+    falkor_client = graphiti._require_falkor_client()
+    new_group_id = group_id if rewrite_group_id is None else rewrite_group_id
+
+    if node_already_in_target:
+        # Present in BOTH graphs: distinguish a genuine resume (this SAME
+        # node, recreated by a prior run that crashed strictly between the
+        # node CREATE and the source DETACH DELETE) from a genuine foreign
+        # duplicate (a DIFFERENT, divergent Entity that happens to share
+        # this uuid in target_graph -- merge_foreign_duplicate's territory,
+        # not this function's). This is a cheap heuristic (name +
+        # created_at), not a full deep-equality check.
+        _target_uuid, target_name, target_created_at = target_probe.result_set[0]
+        if target_name != name or target_created_at != created_at:
+            raise ForeignDuplicateSuspectedError(
+                f'_create_entity_in_target: uuid={uuid} exists in target_graph '
+                f'{target_graph!r} with a diverging name/created_at from the '
+                f'source_graph {source_graph!r} copy (target name={target_name!r} '
+                f'created_at={target_created_at!r}; source name={name!r} '
+                f'created_at={created_at!r}) -- this looks like a genuine '
+                'cross-graph duplicate, not a partially-completed move. Route '
+                'it through merge_foreign_duplicate instead.'
+            )
+        # Resuming after a crash strictly between the node CREATE and the
+        # source DETACH DELETE: skip re-CREATE-ing the node (it's already
+        # there) and let the caller fall straight through to (re-)attempting
+        # edges/mentions + delete.
+        logger.warning(
+            '_create_entity_in_target: resuming partially-completed move '
+            '(node already present in target, skipping node CREATE) uuid=%s '
+            'source=%s target=%s',
+            uuid, source_graph, target_graph,
+        )
+        return _NodeCreateOutcome(
+            already_moved=False,
+            created=False,
+            node_uuid=node_uuid,
+            new_group_id=new_group_id,
+            source=source,
+            target=target,
+            falkor_client=falkor_client,
+        )
+
+    embedding_cypher = (
+        f'MATCH (n:Entity {{uuid: {_quote_cypher_string(uuid)}}}) RETURN n.name_embedding'
+    )
+    embedding_reply = await _read_compact_vector(
+        falkor_client, group_id=source_graph, cypher=embedding_cypher,
+    )
+    embedding_literal = format_vecf32_literal(parse_compact_vector_reply(embedding_reply))
+
+    await target.query(
+        'CREATE (n:Entity {uuid: $uuid}) '
+        'SET n.name = $name, '
+        '    n.group_id = $group_id, '
+        '    n.summary = $summary, '
+        '    n.created_at = $created_at, '
+        f'    n.name_embedding = {embedding_literal}',
+        {
+            'uuid': node_uuid,
+            'name': name,
+            'group_id': new_group_id,
+            'summary': summary,
+            'created_at': created_at,
+        },
+    )
+    return _NodeCreateOutcome(
+        already_moved=False,
+        created=True,
+        node_uuid=node_uuid,
+        new_group_id=new_group_id,
+        source=source,
+        target=target,
+        falkor_client=falkor_client,
+    )
+
+
+@dataclass
+class CreateResult:
+    """Result of a ``create_moved_node`` call (Phase A: node-only create).
+
+    Attributes:
+        uuid: UUID of the created (or already-present) Entity node.
+        source_graph: Graph the node is being moved from -- read-only in
+            this phase; ``create_moved_node`` never mutates source_graph.
+        target_graph: Graph the node was (or already is) created in.
+        already_created: True when the node was already present in
+            target_graph, so no CREATE was (re-)issued -- covers BOTH the
+            fully-idempotent no-op (absent from source, present in target)
+            and the matching-resume case (present in both, name/created_at
+            match). False when this call issued a fresh node CREATE.
+    """
+
+    uuid: str
+    source_graph: str
+    target_graph: str
+    already_created: bool = False
+
+
+async def create_moved_node(
+    graphiti: Any,
+    uuid: str,
+    source_graph: str,
+    target_graph: str,
+    *,
+    rewrite_group_id: str | None = None,
+) -> CreateResult:
+    """Phase A of the three-phase barrier-ordered apply (CGL-η follow-up,
+    task 2415): CREATE *uuid*'s Entity node in *target_graph* -- and ONLY
+    the node.
+
+    Issues NO RELATES_TO/MENTIONS recreate and NO source DETACH DELETE --
+    those are ``recreate_subgraph_relationships`` (Phase B) and
+    ``delete_source_node`` (Phase C) respectively. Running Phase A for
+    every MOVE node in a batch BEFORE any Phase B/C call is what guarantees
+    both endpoints of a co-moving RELATES_TO edge are present in their
+    targets before that edge is recreated -- the barrier ordering that
+    closes the edge-loss bug in the old single-call recreate-then-delete
+    loop (see ``move_entity_across_graphs``'s "Residual hazard" note and
+    this module's ``run()`` caller in ``scripts/migrate_cross_graph_leak.py``).
+
+    Delegates the full read+probe+guard+create case analysis to
+    ``_create_entity_in_target`` (shared with ``move_entity_across_graphs``,
+    whose external behavior/Cypher/call-sequence is unchanged by this
+    delegation) and reports the outcome as a ``CreateResult``.
+
+    Args:
+        graphiti: An initialized GraphitiBackend (or compatible object
+            exposing ``_graph_for`` / ``_require_falkor_client``).
+        uuid: UUID of the Entity node to create in target_graph.
+        source_graph: Graph the node currently lives in (read-only).
+        target_graph: Graph to CREATE the node into.
+        rewrite_group_id: When given, substituted for the node's
+            ``group_id`` property on recreate; when None, the source node's
+            own group_id is carried through unchanged.
+
+    Returns:
+        CreateResult describing the create (or no-op).
+
+    Raises:
+        NodeNotFoundError: if no Entity node with *uuid* exists in
+            *source_graph* (and it is also absent from *target_graph*).
+        ForeignDuplicateSuspectedError: if *uuid* is present in BOTH graphs
+            but target's name/created_at diverge from source's -- callers
+            hitting this should route *uuid* through ``merge_foreign_duplicate``
+            instead.
+    """
+    outcome = await _create_entity_in_target(
+        graphiti, uuid, source_graph, target_graph, rewrite_group_id=rewrite_group_id,
+    )
+    return CreateResult(
+        uuid=uuid,
+        source_graph=source_graph,
+        target_graph=target_graph,
+        already_created=not outcome.created,
+    )
+
+
+@dataclass
 class MoveResult:
     """Result of a ``move_entity_across_graphs`` call.
 
@@ -322,101 +582,22 @@ async def move_entity_across_graphs(
             "Idempotency" section above. Callers hitting this should route
             *uuid* through ``merge_foreign_duplicate`` instead.
     """
-    source = graphiti._graph_for(source_graph)
-    target = graphiti._graph_for(target_graph)
-
-    node_result = await source.ro_query(
-        'MATCH (n:Entity {uuid: $uuid}) '
-        'RETURN n.uuid, n.name, n.group_id, n.summary, n.created_at',
-        {'uuid': uuid},
+    outcome = await _create_entity_in_target(
+        graphiti, uuid, source_graph, target_graph, rewrite_group_id=rewrite_group_id,
     )
-
-    # --- unconditional target-presence probe (step-13/14, amended) ---
-    # Always read target presence before any mutation, regardless of
-    # whether the node is still present in source. This one probe backs
-    # BOTH the fully-idempotent no-op (absent from source, present in
-    # target) AND detecting a crash that happened strictly between the node
-    # CREATE and the source DETACH DELETE (present in BOTH graphs) -- see
-    # the "Idempotency" section of this function's docstring.
-    target_probe = await target.ro_query(
-        'MATCH (n:Entity {uuid: $uuid}) RETURN n.uuid, n.name, n.created_at',
-        {'uuid': uuid},
-    )
-    node_already_in_target = bool(target_probe.result_set)
-
-    if not node_result.result_set:
-        if node_already_in_target:
-            logger.info(
-                'move_entity_across_graphs: already moved, no-op uuid=%s '
-                'source=%s target=%s',
-                uuid, source_graph, target_graph,
-            )
-            return MoveResult(
-                uuid=uuid,
-                source_graph=source_graph,
-                target_graph=target_graph,
-                already_moved=True,
-            )
-        raise NodeNotFoundError(f'Entity node not found in source_graph {source_graph!r}: {uuid}')
-    node_uuid, name, group_id, summary, created_at = node_result.result_set[0]
-
-    falkor_client = graphiti._require_falkor_client()
-    new_group_id = group_id if rewrite_group_id is None else rewrite_group_id
-
-    if node_already_in_target:
-        # Present in BOTH graphs: distinguish a genuine resume (this SAME
-        # node, recreated by a prior run that crashed strictly between the
-        # node CREATE and the source DETACH DELETE) from a genuine foreign
-        # duplicate (a DIFFERENT, divergent Entity that happens to share
-        # this uuid in target_graph -- merge_foreign_duplicate's territory,
-        # not this function's). This is a cheap heuristic (name +
-        # created_at), not a full deep-equality check -- see the docstring's
-        # "Idempotency" section and ForeignDuplicateSuspectedError.
-        _target_uuid, target_name, target_created_at = target_probe.result_set[0]
-        if target_name != name or target_created_at != created_at:
-            raise ForeignDuplicateSuspectedError(
-                f'move_entity_across_graphs: uuid={uuid} exists in target_graph '
-                f'{target_graph!r} with a diverging name/created_at from the '
-                f'source_graph {source_graph!r} copy (target name={target_name!r} '
-                f'created_at={target_created_at!r}; source name={name!r} '
-                f'created_at={created_at!r}) -- this looks like a genuine '
-                'cross-graph duplicate, not a partially-completed move. Route '
-                'it through merge_foreign_duplicate instead.'
-            )
-        # Resuming after a crash strictly between the node CREATE and the
-        # source DETACH DELETE below: skip re-CREATE-ing the node (it's
-        # already there -- see the docstring's "Idempotency" section) and
-        # fall straight through to (re-)attempting edges/mentions + delete.
-        logger.warning(
-            'move_entity_across_graphs: resuming partially-completed move '
-            '(node already present in target, skipping node CREATE) uuid=%s '
-            'source=%s target=%s',
-            uuid, source_graph, target_graph,
+    if outcome.already_moved:
+        return MoveResult(
+            uuid=uuid,
+            source_graph=source_graph,
+            target_graph=target_graph,
+            already_moved=True,
         )
-    else:
-        embedding_cypher = (
-            f'MATCH (n:Entity {{uuid: {_quote_cypher_string(uuid)}}}) RETURN n.name_embedding'
-        )
-        embedding_reply = await _read_compact_vector(
-            falkor_client, group_id=source_graph, cypher=embedding_cypher,
-        )
-        embedding_literal = format_vecf32_literal(parse_compact_vector_reply(embedding_reply))
 
-        await target.query(
-            'CREATE (n:Entity {uuid: $uuid}) '
-            'SET n.name = $name, '
-            '    n.group_id = $group_id, '
-            '    n.summary = $summary, '
-            '    n.created_at = $created_at, '
-            f'    n.name_embedding = {embedding_literal}',
-            {
-                'uuid': node_uuid,
-                'name': name,
-                'group_id': new_group_id,
-                'summary': summary,
-                'created_at': created_at,
-            },
-        )
+    source = outcome.source
+    target = outcome.target
+    node_uuid = outcome.node_uuid
+    new_group_id = outcome.new_group_id
+    falkor_client = outcome.falkor_client
 
     # --- RELATES_TO edges (step-7/8) ---
     # Undirected match + WITH DISTINCT e mirrors GraphitiBackend.get_valid_edges_for_node's
@@ -557,6 +738,516 @@ async def move_entity_across_graphs(
         edges_skipped=edges_skipped,
         mentions_moved=mentions_moved,
         mentions_skipped=mentions_skipped,
+    )
+
+
+@dataclass
+class SubgraphEdgeResult:
+    """Result of a ``recreate_subgraph_relationships`` call (Phase B: batch
+    edge/mention recreate of the three-phase barrier-ordered apply).
+
+    Attributes:
+        edges_recreated: Count of RELATES_TO edges actually recreated across
+            the WHOLE batch -- verified via the target CREATE's own
+            ``relationships_created`` stat, same convention as
+            ``MoveResult.edges_moved``. Each distinct edge (keyed by edge
+            uuid) is counted at most once, however many specs it is incident
+            to (see the module's co-moving-pair fix).
+        edges_skipped: Count of RELATES_TO edges whose target CREATE
+            matched no endpoint (the edge's other endpoint not present in
+            the resolved target graph) and was therefore silently skipped by
+            FalkorDB -- same meaning as ``MoveResult.edges_skipped``. Does
+            NOT include an edge that was skipped because it was already
+            present in target (a genuine idempotent no-op, not a loss).
+        mentions_recreated: Count of Episodic MENTIONS links actually
+            recreated (same ``relationships_created`` verification).
+        mentions_skipped: Count of MENTIONS links silently skipped because
+            the episode node was not present in the resolved target graph.
+        dropped_cross_target: Records for edges whose two endpoints resolve
+            to two DIFFERENT target graphs (FalkorDB RELATES_TO edges are
+            single-graph, so such an edge cannot be recreated in EITHER
+            graph) -- each a dict carrying the edge uuid, both endpoint
+            uuids, both resolved targets, and a human-readable reason.
+            Reported for human review, never silently lost. Populated by
+            the cross-target detection extension (task 2415 step-8) --
+            always empty for a batch with no such edges.
+    """
+
+    edges_recreated: int = 0
+    edges_skipped: int = 0
+    mentions_recreated: int = 0
+    mentions_skipped: int = 0
+    dropped_cross_target: list = field(default_factory=list)
+
+
+async def _entity_present_in_graph(graph: Any, uuid: str) -> bool:
+    """Read-only presence probe: True iff an ``:Entity`` node with *uuid*
+    exists in *graph*.
+
+    Used by ``recreate_subgraph_relationships`` to decide whether a
+    RELATES_TO edge's non-migrating endpoint (one with no spec of its own in
+    this batch, so it has no ``target_of`` entry) is deliverable into the
+    OTHER, migrating endpoint's resolved target -- i.e. whether it is
+    already a home-resident there. Scoped to ``:Entity`` (unlike
+    ``scripts/migrate_cross_graph_leak.py``'s broader, any-label
+    ``node_present_in_graph``) because RELATES_TO only ever connects
+    Entity<->Entity, matching this module's Entity-only scope.
+    """
+    result = await graph.ro_query(
+        'MATCH (n:Entity {uuid: $uuid}) RETURN n.uuid LIMIT 1',
+        {'uuid': uuid},
+    )
+    return bool(result.result_set)
+
+
+async def _relates_to_edge_already_in_target(graph: Any, edge_uuid: str) -> bool:
+    """Read-only presence probe: True iff a RELATES_TO edge with *edge_uuid*
+    already exists in *graph* (either direction).
+
+    Unlike an Entity node's uuid (guarded by ``_create_entity_in_target``'s
+    unconditional target-presence probe), FalkorDB enforces no uniqueness
+    constraint on a relationship's ``uuid`` property -- a blind re-``CREATE``
+    on a crash-resumed or fully-idempotent re-run of
+    ``recreate_subgraph_relationships`` would duplicate an edge it already
+    recreated in a prior pass, rather than silently no-op the way the node
+    CREATE does. This probe is what lets a re-run skip an edge instead.
+    """
+    result = await graph.ro_query(
+        'MATCH ()-[e:RELATES_TO {uuid: $uuid}]-() RETURN e.uuid LIMIT 1',
+        {'uuid': edge_uuid},
+    )
+    return bool(result.result_set)
+
+
+async def _mentions_link_already_in_target(graph: Any, mention_uuid: str) -> bool:
+    """Read-only presence probe: True iff a MENTIONS link with *mention_uuid*
+    already exists in *graph*.
+
+    Mirrors ``_relates_to_edge_already_in_target``: FalkorDB enforces no
+    uniqueness constraint on a relationship's ``uuid`` property either, so a
+    blind re-``CREATE`` on a crash-resumed or fully-idempotent re-run of
+    ``recreate_subgraph_relationships`` would duplicate a MENTIONS link it
+    already recreated in a prior pass -- the exact same hazard already
+    guarded for RELATES_TO. This probe is what lets a re-run skip a MENTIONS
+    link instead.
+    """
+    result = await graph.ro_query(
+        'MATCH ()-[e:MENTIONS]->() WHERE e.uuid = $uuid RETURN e.uuid LIMIT 1',
+        {'uuid': mention_uuid},
+    )
+    return bool(result.result_set)
+
+
+async def recreate_subgraph_relationships(graphiti: Any, specs: list[dict]) -> SubgraphEdgeResult:
+    """Phase B of the three-phase barrier-ordered apply (CGL-η follow-up,
+    task 2415): recreate every RELATES_TO edge and Episodic MENTIONS link
+    incident to *specs*, deduped by uuid across the WHOLE batch.
+
+    *specs* is a list of manifest-node-shaped dicts (``uuid``,
+    ``disposition``, ``source_graph``, ``target_graph``) -- the same shape
+    ``run()``'s apply loop partitions manifest nodes into (move_specs +
+    merge_specs, task 2415 step-12). Called ONLY after ``create_moved_node``
+    (Phase A) has run for every MOVE spec in the batch, so every migrating
+    node already exists in its target graph before any edge is read here --
+    this is what lets a co-moving neighbour's shared RELATES_TO edge survive
+    (the old single-call ``move_entity_across_graphs`` loop would have
+    DETACH DELETEd the source before the second endpoint was ever
+    processed; see this module's "Residual hazard" note and
+    ``scripts/migrate_cross_graph_leak.py``'s ``run()``).
+
+    MOVE edges: for every non-MERGE spec, every incident RELATES_TO edge
+    (full property row, read via the same ``startNode``/``endNode`` SELECT
+    ``move_entity_across_graphs`` uses) and every incident Episodic MENTIONS
+    link is read from the spec's ``source_graph``. Edges are accumulated
+    into a single dict keyed by edge uuid -- so a co-moving edge incident to
+    TWO specs in this batch (read once per incident spec) is recreated only
+    ONCE, not twice. For each distinct edge, both endpoints' target graphs
+    are looked up via a ``target_of`` map built from every spec's own
+    ``uuid``/``target_graph``; when an endpoint has no spec of its own (a
+    non-migrating home-resident), its deliverability is decided by a
+    presence probe (``_entity_present_in_graph``) against the OTHER,
+    migrating endpoint's resolved target. When both endpoints resolve to the
+    SAME target graph T, the edge is recreated in T (byte-exact
+    ``fact_embedding`` via the raw ``--compact`` transport, ``group_id``
+    rewritten to T -- mirroring ``create_moved_node``'s
+    ``rewrite_group_id=target_graph`` convention for Phase A), skipped as a
+    genuine idempotent no-op if an edge with that uuid already exists in T
+    (``_relates_to_edge_already_in_target``), or counted in
+    ``edges_skipped`` if the target CREATE's own ``relationships_created``
+    stat reports the other endpoint was silently unmatched. When the two
+    endpoints do NOT resolve to one shared target graph (differing targets,
+    or an endpoint that is neither migrating nor already present in the
+    other's target) -- cross-graph RELATES_TO edges are unsupported -- the
+    edge is recreated in NEITHER graph and a dropped-with-reason record
+    (edge uuid, both endpoint uuids, both resolved targets, a reason) is
+    appended to ``dropped_cross_target`` instead, so it is surfaced for
+    human review rather than silently lost the way a bare ``edges_skipped``
+    count would be. MENTIONS are recreated the same way
+    ``move_entity_across_graphs`` does (MATCH the episode + entity in the
+    entity's resolved target, ``relationships_created`` distinguishes
+    recreate from silent skip), skipped as a genuine idempotent no-op if
+    already present in target (``_mentions_link_already_in_target`` -- the
+    same re-run-safety guard as RELATES_TO's
+    ``_relates_to_edge_already_in_target``, since FalkorDB enforces no
+    uniqueness constraint on a MENTIONS relationship's uuid either).
+
+    MERGE fold: run AFTER the MOVE-edge/mentions passes above have fully
+    completed for the batch. For every MERGE spec, every RELATES_TO edge
+    incident to its wrong-copy (``source_graph``) is read (full property
+    rows, same SELECT as above) and compared -- via
+    ``classify_unique_wrong_edges`` over uuid sets -- against the home
+    copy's (``target_graph``) OWN current incident edge-uuid set (``_read_
+    relates_to_edge_uuids``, S6's uuid-only reader). Only the edges unique
+    to the wrong copy (absent from home) are recreated on the home copy,
+    preserving the wrong copy's OWN ``group_id`` verbatim (no rewrite -- S6
+    has no ``rewrite_group_id`` analogue, mirroring
+    ``merge_foreign_duplicate``); an edge already shared with home is left
+    untouched. Because this pass re-reads home's edge-uuid set fresh for
+    EACH merge spec, an edge the MOVE-edge pass (or an earlier merge spec in
+    this same batch) already landed on that home graph is correctly
+    excluded here too -- no double-create for a MOVE<->MERGE or
+    MERGE<->MERGE shared edge. MERGE has no MENTIONS-fold analogue (mirrors
+    ``merge_foreign_duplicate``, which never touches MENTIONS either).
+
+    Issues NO ``DETACH DELETE`` anywhere -- that is ``delete_source_node``'s
+    job (Phase C), which callers must run only after this function has
+    completed for the WHOLE batch (every edge recreated before any source is
+    deleted is the barrier ordering that closes the edge-loss bug).
+
+    Args:
+        graphiti: An initialized GraphitiBackend (or compatible object
+            exposing ``_graph_for`` / ``_require_falkor_client``).
+        specs: Manifest-node-shaped dicts for every MOVE/MERGE node in this
+            apply batch (``uuid``, ``disposition``, ``source_graph``,
+            ``target_graph``).
+
+    Returns:
+        SubgraphEdgeResult tallying edges/mentions recreated vs. skipped
+        (plus, from step-8 onward, any cross-target-dropped edges).
+
+    Raises:
+        Whatever the underlying graph/embedding read or CREATE calls raise.
+        This primitive mutates target graphs incrementally as it walks the
+        batch, so a mid-batch failure can still leave real, non-zero
+        edges/mentions counts recreated before the raise -- that partial
+        tally is attached to the exception as ``exc.partial_result`` (a
+        ``SubgraphEdgeResult``) instead of being discarded, so a caller
+        (e.g. ``scripts/migrate_cross_graph_leak.py``'s ``run()``) can
+        surface accurate partial-progress counts instead of reporting an
+        all-zero default for a batch that was actually partway mutated
+        (task 2415 amendment round 2).
+    """
+    result = SubgraphEdgeResult()
+    try:
+        await _recreate_subgraph_relationships_batch(graphiti, specs, result)
+    except Exception as exc:
+        exc.partial_result = result  # type: ignore[attr-defined]
+        raise
+    return result
+
+
+async def _recreate_subgraph_relationships_batch(
+    graphiti: Any, specs: list[dict], result: SubgraphEdgeResult,
+) -> None:
+    """Phase-B batch work for ``recreate_subgraph_relationships``, mutating
+    *result* in place as it recreates edges/mentions.
+
+    Split out of the public wrapper so it can hold a reference to the SAME
+    ``SubgraphEdgeResult`` it returns on success and attach it to
+    ``exc.partial_result`` on failure -- see
+    ``recreate_subgraph_relationships``'s docstring.
+    """
+    falkor_client = graphiti._require_falkor_client()
+    target_of: dict[str, str] = {spec['uuid']: spec['target_graph'] for spec in specs}
+
+    # MERGE specs' edges are folded separately (step-10) -- only MOVE specs'
+    # incident edges/mentions are read here. Compared against the literal
+    # 'MERGE' string (not scripts/migrate_cross_graph_leak.py's MERGE
+    # constant) -- this module must not import from its ζ-script consumer.
+    move_specs = [spec for spec in specs if spec.get('disposition') != 'MERGE']
+
+    edges_by_uuid: dict[str, tuple[list, str]] = {}
+    mentions_by_uuid: dict[str, tuple[list, str, str]] = {}
+    for spec in move_specs:
+        source = graphiti._graph_for(spec['source_graph'])
+
+        edges_result = await source.ro_query(
+            'MATCH (n:Entity {uuid: $uuid})-[e:RELATES_TO]-(m:Entity) '
+            'WITH DISTINCT e, startNode(e) AS s, endNode(e) AS t '
+            'RETURN e.uuid, e.name, e.fact, e.valid_at, e.invalid_at, e.created_at, '
+            '       e.group_id, e.episodes, s.uuid, t.uuid',
+            {'uuid': spec['uuid']},
+        )
+        for row in edges_result.result_set or []:
+            edges_by_uuid.setdefault(row[0], (row, spec['source_graph']))
+
+        mentions_result = await source.ro_query(
+            'MATCH (ep:Episodic)-[e:MENTIONS]->(n:Entity {uuid: $uuid}) '
+            'RETURN e.uuid, e.group_id, e.created_at, ep.uuid',
+            {'uuid': spec['uuid']},
+        )
+        for row in mentions_result.result_set or []:
+            mentions_by_uuid.setdefault(row[0], (row, spec['source_graph'], spec['uuid']))
+
+    for edge_uuid, (row, source_graph) in edges_by_uuid.items():
+        (_edge_uuid, edge_name, fact, valid_at, invalid_at, edge_created_at,
+         _edge_group_id, episodes, src_uuid, dst_uuid) = row
+
+        src_target = target_of.get(src_uuid)
+        dst_target = target_of.get(dst_uuid)
+
+        # A non-migrating endpoint (no spec of its own -- absent from
+        # target_of) is deliverable only if it is already a home-resident in
+        # the OTHER (migrating) endpoint's resolved target -- a presence
+        # probe decides it. At least one of src_target/dst_target is always
+        # resolved here, since every edge in edges_by_uuid was read via a
+        # MOVE spec's own incident-edge query (so that spec's uuid is always
+        # one of the two endpoints).
+        if src_target is None and dst_target is not None:
+            if await _entity_present_in_graph(graphiti._graph_for(dst_target), src_uuid):
+                src_target = dst_target
+        elif (
+            dst_target is None and src_target is not None
+            and await _entity_present_in_graph(graphiti._graph_for(src_target), dst_uuid)
+        ):
+            dst_target = src_target
+
+        if src_target is None or dst_target is None or src_target != dst_target:
+            # The two endpoints do not share one destination graph --
+            # cross-graph RELATES_TO edges are unsupported (FalkorDB edges
+            # are single-graph), so this edge cannot be recreated in EITHER
+            # graph. Reported for human review, never silently lost (unlike
+            # the old move_entity_across_graphs' edges_skipped, which only
+            # ever surfaced a bare count with no record of why).
+            result.dropped_cross_target.append({
+                'edge_uuid': edge_uuid,
+                'src_uuid': src_uuid,
+                'dst_uuid': dst_uuid,
+                'src_target': src_target,
+                'dst_target': dst_target,
+                'reason': (
+                    'edge endpoints resolve to different target graphs (or '
+                    'an undeliverable non-migrating endpoint) -- cross-graph '
+                    'RELATES_TO edges are unsupported; needs manual review'
+                ),
+            })
+            continue
+
+        target_graph_name = src_target
+        target = graphiti._graph_for(target_graph_name)
+
+        if await _relates_to_edge_already_in_target(target, edge_uuid):
+            # Genuine idempotent no-op (re-run after a prior completed/
+            # partial Phase B) -- not a loss, so neither counter is
+            # incremented.
+            continue
+
+        edge_embedding_cypher = (
+            f'MATCH ()-[e:RELATES_TO {{uuid: {_quote_cypher_string(edge_uuid)}}}]-() '
+            'RETURN e.fact_embedding'
+        )
+        edge_embedding_reply = await _read_compact_vector(
+            falkor_client, group_id=source_graph, cypher=edge_embedding_cypher,
+        )
+        edge_embedding_literal = format_vecf32_literal(
+            parse_compact_vector_reply(edge_embedding_reply)
+        )
+
+        edge_create_result = await target.query(
+            'MATCH (a:Entity {uuid: $src_uuid}), (b:Entity {uuid: $dst_uuid}) '
+            'CREATE (a)-[r:RELATES_TO]->(b) '
+            'SET r.uuid = $edge_uuid, '
+            '    r.name = $name, '
+            '    r.fact = $fact, '
+            '    r.valid_at = $valid_at, '
+            '    r.invalid_at = $invalid_at, '
+            '    r.created_at = $created_at, '
+            '    r.group_id = $group_id, '
+            '    r.episodes = $episodes, '
+            f'    r.fact_embedding = {edge_embedding_literal}',
+            {
+                'src_uuid': src_uuid,
+                'dst_uuid': dst_uuid,
+                'edge_uuid': edge_uuid,
+                'name': edge_name,
+                'fact': fact,
+                'valid_at': valid_at,
+                'invalid_at': invalid_at,
+                'created_at': edge_created_at,
+                'group_id': target_graph_name,
+                'episodes': episodes,
+            },
+        )
+        if edge_create_result.relationships_created:
+            result.edges_recreated += 1
+        else:
+            result.edges_skipped += 1
+            logger.warning(
+                'recreate_subgraph_relationships: RELATES_TO edge uuid=%s '
+                'silently skipped -- other endpoint (src=%s dst=%s) not '
+                'present in target_graph=%s',
+                edge_uuid, src_uuid, dst_uuid, target_graph_name,
+            )
+
+    for mention_uuid, (row, _source_graph, entity_uuid) in mentions_by_uuid.items():
+        _mention_uuid, _mention_group_id, mention_created_at, episode_uuid = row
+        target_graph_name = target_of[entity_uuid]
+        target = graphiti._graph_for(target_graph_name)
+
+        if await _mentions_link_already_in_target(target, mention_uuid):
+            # Genuine idempotent no-op (re-run after a prior completed/
+            # partial Phase B) -- not a loss, so neither counter is
+            # incremented. Mirrors the RELATES_TO skip above.
+            continue
+
+        mention_create_result = await target.query(
+            'MATCH (ep:Episodic {uuid: $episode_uuid}), (n:Entity {uuid: $entity_uuid}) '
+            'CREATE (ep)-[e:MENTIONS]->(n) '
+            'SET e.uuid = $edge_uuid, '
+            '    e.group_id = $group_id, '
+            '    e.created_at = $created_at',
+            {
+                'episode_uuid': episode_uuid,
+                'entity_uuid': entity_uuid,
+                'edge_uuid': mention_uuid,
+                'group_id': target_graph_name,
+                'created_at': mention_created_at,
+            },
+        )
+        if mention_create_result.relationships_created:
+            result.mentions_recreated += 1
+        else:
+            result.mentions_skipped += 1
+            logger.warning(
+                'recreate_subgraph_relationships: MENTIONS link uuid=%s '
+                'silently skipped -- episode uuid=%s not present in '
+                'target_graph=%s (entity_uuid=%s)',
+                mention_uuid, episode_uuid, target_graph_name, entity_uuid,
+            )
+
+    # --- MERGE fold ---
+    # Run AFTER the MOVE-edge pass above has fully completed (sequential
+    # awaits, so this is guaranteed): if a MOVE-pass edge already landed on
+    # this MERGE spec's home copy (e.g. a shared MOVE<->MERGE edge whose
+    # MOVE endpoint was processed first), _read_relates_to_edge_uuids below
+    # observes it in home_edge_uuids and classify_unique_wrong_edges
+    # correctly excludes it here -- no double-create.
+    merge_specs = [spec for spec in specs if spec.get('disposition') == 'MERGE']
+    for spec in merge_specs:
+        uuid = spec['uuid']
+        wrong_graph = spec['source_graph']
+        home_graph = spec['target_graph']
+        wrong = graphiti._graph_for(wrong_graph)
+        home = graphiti._graph_for(home_graph)
+
+        wrong_edges_result = await wrong.ro_query(
+            'MATCH (n:Entity {uuid: $uuid})-[e:RELATES_TO]-(m:Entity) '
+            'WITH DISTINCT e, startNode(e) AS s, endNode(e) AS t '
+            'RETURN e.uuid, e.name, e.fact, e.valid_at, e.invalid_at, e.created_at, '
+            '       e.group_id, e.episodes, s.uuid, t.uuid',
+            {'uuid': uuid},
+        )
+        wrong_rows_by_uuid = {row[0]: row for row in (wrong_edges_result.result_set or [])}
+        wrong_edge_uuids = set(wrong_rows_by_uuid)
+
+        home_edge_uuids = await _read_relates_to_edge_uuids(home, uuid)
+        unique_wrong_edge_uuids = classify_unique_wrong_edges(home_edge_uuids, wrong_edge_uuids)
+
+        for edge_uuid in unique_wrong_edge_uuids:
+            (_edge_uuid, edge_name, fact, valid_at, invalid_at, edge_created_at,
+             edge_group_id, episodes, src_uuid, dst_uuid) = wrong_rows_by_uuid[edge_uuid]
+
+            edge_embedding_cypher = (
+                f'MATCH ()-[e:RELATES_TO {{uuid: {_quote_cypher_string(edge_uuid)}}}]-() '
+                'RETURN e.fact_embedding'
+            )
+            edge_embedding_reply = await _read_compact_vector(
+                falkor_client, group_id=wrong_graph, cypher=edge_embedding_cypher,
+            )
+            edge_embedding_literal = format_vecf32_literal(
+                parse_compact_vector_reply(edge_embedding_reply)
+            )
+
+            # Both endpoints are MATCHed (never CREATEd): the home copy of
+            # this MERGE node and the edge's other endpoint must already
+            # exist in home_graph, or this MATCH yields no rows and the
+            # edge is silently skipped -- same convention as the MOVE-edge
+            # pass above / merge_foreign_duplicate. group_id is preserved
+            # from the wrong copy verbatim -- MERGE has no rewrite_group_id
+            # analogue (mirrors merge_foreign_duplicate).
+            edge_create_result = await home.query(
+                'MATCH (a:Entity {uuid: $src_uuid}), (b:Entity {uuid: $dst_uuid}) '
+                'CREATE (a)-[r:RELATES_TO]->(b) '
+                'SET r.uuid = $edge_uuid, '
+                '    r.name = $name, '
+                '    r.fact = $fact, '
+                '    r.valid_at = $valid_at, '
+                '    r.invalid_at = $invalid_at, '
+                '    r.created_at = $created_at, '
+                '    r.group_id = $group_id, '
+                '    r.episodes = $episodes, '
+                f'    r.fact_embedding = {edge_embedding_literal}',
+                {
+                    'src_uuid': src_uuid,
+                    'dst_uuid': dst_uuid,
+                    'edge_uuid': edge_uuid,
+                    'name': edge_name,
+                    'fact': fact,
+                    'valid_at': valid_at,
+                    'invalid_at': invalid_at,
+                    'created_at': edge_created_at,
+                    'group_id': edge_group_id,
+                    'episodes': episodes,
+                },
+            )
+            if edge_create_result.relationships_created:
+                result.edges_recreated += 1
+            else:
+                result.edges_skipped += 1
+                logger.warning(
+                    'recreate_subgraph_relationships: MERGE-fold RELATES_TO '
+                    'edge uuid=%s silently skipped -- other endpoint '
+                    '(src=%s dst=%s) not present in home_graph=%s',
+                    edge_uuid, src_uuid, dst_uuid, home_graph,
+                )
+
+
+async def delete_source_node(graphiti: Any, uuid: str, source_graph: str) -> None:
+    """Phase C of the three-phase barrier-ordered apply (CGL-η follow-up,
+    task 2415): ``DETACH DELETE`` *uuid*'s Entity node from *source_graph* --
+    and ONLY that.
+
+    Reuses the exact DETACH DELETE Cypher ``move_entity_across_graphs``
+    issues as its final mutation. Callers driving the three-phase apply must
+    call this ONLY after every ``create_moved_node`` (Phase A) and
+    ``recreate_subgraph_relationships`` (Phase B) call for the WHOLE batch
+    has completed -- deleting a source before its edges are recreated
+    elsewhere is exactly the bug this task fixes (a co-moving neighbour's
+    shared edge silently skipped by the OTHER endpoint's target CREATE, then
+    destroyed here before it is ever recreated).
+
+    Touches ONLY source_graph -- never resolves or queries target_graph.
+    Idempotent: FalkorDB's ``MATCH ... DETACH DELETE`` matches (and deletes)
+    nothing when the node is already gone, so a re-run after a completed
+    apply -- or a retry after Phase C partially completed -- is a safe
+    no-op; this function performs no existence pre-check of its own.
+
+    Args:
+        graphiti: An initialized GraphitiBackend (or compatible object
+            exposing ``_graph_for``).
+        uuid: UUID of the Entity node to delete from source_graph.
+        source_graph: Graph to delete the node from.
+
+    Returns:
+        None.
+    """
+    source = graphiti._graph_for(source_graph)
+    await source.query(
+        'MATCH (n:Entity {uuid: $uuid}) DETACH DELETE n',
+        {'uuid': uuid},
+    )
+    logger.info(
+        'delete_source_node: deleted uuid=%s source=%s', uuid, source_graph,
     )
 
 
