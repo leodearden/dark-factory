@@ -75,3 +75,19 @@ async def test_reap_ignores_already_closed_connection():
 
     count = await reap_leaked_aiosqlite_connections()
     assert count == 0, 'An already-closed connection must not be counted as reaped'
+
+
+def test_autouse_reap_fixture_is_active(request):
+    """_reap_leaked_aiosqlite_connections is wired as an autouse teardown fixture.
+
+    This assertion is deterministic and worker-placement-agnostic: existing
+    autouse fixtures (_drain_async_mock_coroutines, _reap_leaked_merge_workers)
+    appear in request.fixturenames; absent names do not. This is a behavioral
+    assertion that the reaper is applied to arbitrary tests — not a docstring
+    lint.
+    """
+    assert '_reap_leaked_aiosqlite_connections' in request.fixturenames, (
+        '_reap_leaked_aiosqlite_connections must be registered as an autouse '
+        'fixture in conftest.py so it runs after every test and closes any '
+        'leaked aiosqlite connection before the per-test event loop closes.'
+    )
