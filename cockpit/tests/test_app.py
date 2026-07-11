@@ -757,3 +757,93 @@ class TestSpawnBar:
         assert len(spawned) == 1
         expected_title = f'{role}:{Path(project_root).name}'
         assert spawned[0] == build_spawn_argv(spawn_script, project_root, expected_title, prompt)
+
+
+class TestRefreshWriteDiscipline:
+    @pytest.mark.timeout(10)
+    async def test_refresh_path_writes_nothing_under_sessions_or_decisions(self, tmp_path):
+        """Extends C5a's TestWriteDiscipline (PRD §2/§5 hard invariant) to the
+        C5b queue/attention path: building/reordering the DecisionQueue and
+        signaling an attention transition (set_urgency/reorder, PRD B3) on a
+        refresh tick must never create, modify, or delete a sessions/ or
+        decisions/ file. Only the explicit b/B/x/digit action handlers are
+        sanctioned registry writers (TestBoostReordersAndPersists/
+        TestDropRemovesAndPersists) -- refresh_registry (and everything it
+        calls: _rebuild_queue, _update_attention) is a pure reader + a
+        backend-signal emitter, never a writer.
+
+        The session's RUNNING->AWAITING_INPUT flip below is this test's OWN
+        setup write (sr.write_record), standing in for an external actor
+        (e.g. a T4-T7 hook) -- mirrors TestSignalDontMove's convention. The
+        write-discipline snapshot is taken AFTER that flip and BEFORE the
+        direct refresh_registry() call, so the diff below isolates exactly
+        what the automatic refresh/diff path itself writes: nothing.
+        """
+        from cockpit.app import CockpitApp
+        from cockpit.backends import FakeBackend
+        from cockpit.panes.decision_queue import DecisionQueue
+
+        display = sr.Display(kind='wm', wm_title='unblock:df#2085 slug')
+        running = _make_record(
+            session_slug='refresh-wd-1', status=sr.Status.RUNNING, display=display
+        )
+        sr.write_record(running, root=tmp_path)
+
+        decision = sr.DecisionRecord(
+            id='dec-refresh-wd-1',
+            project='df',
+            text='Which port?',
+            filed_at='2026-07-07T00:00:00+00:00',
+        )
+        assert sr.write_decision(decision, root=tmp_path)
+
+        backend = FakeBackend()
+        app = CockpitApp(fleet_root=tmp_path, backend=backend, poll_interval=0.05)
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            queue = app.query_one(DecisionQueue)
+            assert queue.row_count == 1  # the open decision only; session is still just RUNNING
+
+            awaiting = _make_record(
+                session_slug='refresh-wd-1',
+                status=sr.Status.AWAITING_INPUT,
+                display=display,
+                question=sr.Question(text='Which port?', asked_at='2026-07-07T00:00:00+00:00'),
+            )
+            sr.write_record(awaiting, root=tmp_path)
+
+            before = _snapshot_tree(tmp_path)
+            # sanity: prove the snapshot actually captured the seeded files,
+            # so the "unchanged" assertion below isn't vacuously true.
+            assert any(path.startswith('sessions/') for path in before)
+            assert any(path.startswith('decisions/') for path in before)
+
+            app.refresh_registry()
+            await pilot.pause()
+
+            # sanity: the refresh actually did the queue-rebuild + attention
+            # work under test, not a snapshot-unchanged short-circuit no-op.
+            assert queue.row_count == 2
+            assert backend.set_urgency_calls
+
+        after = _snapshot_tree(tmp_path)
+
+        # Scoped to sessions/decisions -- unlike TestWriteDiscipline/
+        # TestDeferResetsAge's whole-lifecycle before/after (taken pre-mount,
+        # before cockpit-ui.json exists at all), this test's "before" is
+        # taken mid-lifecycle, after cockpit-ui.json already exists (from
+        # on_mount's own initial refresh_registry() call). cockpit-ui.json
+        # is the cockpit's own sanctioned, unconditional write target (PRD
+        # §2/§5) and may legitimately be rewritten by a table rebuild's
+        # RowHighlighted repost (see session_table.py) on every tick --
+        # that's a pre-existing C5a behavior this test doesn't police. The
+        # invariant under test here is narrower and exactly what step-25
+        # specifies: zero sessions/ or decisions/ writes from the automatic
+        # refresh/diff path.
+        for path, value in before.items():
+            if path.startswith(('sessions/', 'decisions/')):
+                assert after.get(path) == value, (
+                    f'{path} was created/modified/removed by the refresh path'
+                )
+        new_paths = set(after) - set(before)
+        assert not any(path.startswith(('sessions/', 'decisions/')) for path in new_paths)
