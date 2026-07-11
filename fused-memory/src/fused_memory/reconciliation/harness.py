@@ -2772,8 +2772,13 @@ class ReconciliationHarness:
         # any failure here (unresolvable project, get_task/Mem0 errors, ...)
         # falls back to the original, unfiltered `findings` — see the
         # fused_memory.reconciliation.scope_freshness module docstring.
+        # `freshness` is pre-initialized to None so the except branch below
+        # (the pre-check raising before ever assigning it) leaves an
+        # unambiguous "pre-check did not run" sentinel for the short-circuit
+        # guard just below to key off of.
+        freshness: ScopeFreshnessResult | None = None
         try:
-            freshness: ScopeFreshnessResult = await precheck_scope_correction_freshness(
+            freshness = await precheck_scope_correction_freshness(
                 memory_service=self.memory,
                 taskmaster=self.taskmaster,
                 project_id=project_id,
@@ -2801,6 +2806,28 @@ class ReconciliationHarness:
                 'reconciliation.scope_freshness_precheck_wiring_failed',
                 extra={'run_id': run_id, 'project_id': project_id, 'error': str(exc)},
             )
+
+        # Short-circuit: every finding was confirmed fresh (unchanged) by the
+        # pre-check above — skip building/running any stage entirely (no LLM
+        # subprocess launches) and journal-complete the run as-is. Guarded on
+        # `freshness is not None` so a pre-check that raised (and therefore
+        # fell back to the original, unfiltered `findings` above) never
+        # short-circuits — only a POSITIVE freshness confirmation may skip
+        # remediation, never an error/uncertainty path.
+        if freshness is not None and not findings and freshness.skipped:
+            logger.info(
+                'reconciliation.remediation_skipped_all_fresh',
+                extra={
+                    'run_id': run_id,
+                    'project_id': project_id,
+                    'parent_run_id': parent_run_id,
+                    **freshness.stats,
+                },
+            )
+            run.completed_at = datetime.now(UTC)
+            run.status = RunStatus.completed
+            await self.journal.complete_run(run_id, 'completed')
+            return
 
         stages = self._make_stages(scope)
         try:
