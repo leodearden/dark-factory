@@ -15,7 +15,14 @@ arbitrary file lists — see PRD resolved-decision 6.
 
 from __future__ import annotations
 
-from orchestrator.verify_plan import FileKind, classify_file
+from orchestrator import verify
+from orchestrator.verify_plan import (
+    FileKind,
+    _is_collectable_test_file,
+    _is_conftest,
+    _is_test_file,
+    classify_file,
+)
 
 # ---------------------------------------------------------------------------
 # GOLDEN incident fixtures
@@ -136,3 +143,73 @@ class TestClassifyFile:
         """content=None must never raise — STRUCTURAL is simply not detected."""
         result = classify_file('orchestrator/src/orchestrator/foo.py', None)
         assert result is FileKind.SOURCE
+
+
+# ---------------------------------------------------------------------------
+# Derived predicates: _is_conftest / _is_collectable_test_file / _is_test_file
+# (step-3: RED)
+# ---------------------------------------------------------------------------
+
+# One representative path per FileKind, covering conftest at multiple depths,
+# both collectable-test naming conventions, a collectable test nested under
+# tests/ (precedence check), a data module under tests/, and plain source.
+_PREDICATE_PATH_TABLE: list[str] = [
+    'conftest.py',
+    'a/conftest.py',
+    'a/b/conftest.py',
+    'orchestrator/tests/conftest.py',
+    'shared/tests/conftest.py',
+    'test_foo.py',
+    'a/test_foo.py',
+    'foo_test.py',
+    'a/foo_test.py',
+    'a/tests/test_foo.py',
+    DATA_MODULE_DIFF[0],
+    'tests/data.py',
+    'a/tests/helpers.py',
+    'orchestrator/src/orchestrator/utils.py',
+    'foo.py',
+    'a/b/c/plain_module.py',
+]
+
+
+class TestDerivedPredicates:
+    """_is_conftest / _is_collectable_test_file / _is_test_file are DERIVED from classify_file.
+
+    Never recombined: each predicate is pinned as an exact FileKind membership
+    check, and each must stay behaviorally equivalent to the legacy verify.py
+    predicate it replaces.
+    """
+
+    # -- behavioral equivalence to the legacy verify.py predicates ------------
+
+    def test_is_conftest_matches_legacy(self):
+        for path in _PREDICATE_PATH_TABLE:
+            assert _is_conftest(path) == verify._is_conftest(path), path
+
+    def test_is_collectable_test_file_matches_legacy(self):
+        for path in _PREDICATE_PATH_TABLE:
+            assert _is_collectable_test_file(path) == verify._is_collectable_test_file(path), path
+
+    def test_is_test_file_matches_legacy(self):
+        for path in _PREDICATE_PATH_TABLE:
+            assert _is_test_file(path) == verify._is_test_file(path), path
+
+    # -- explicit narrow/broad pin against FileKind membership ----------------
+
+    def test_is_conftest_is_exact_classify_file_membership(self):
+        for path in _PREDICATE_PATH_TABLE:
+            expected = classify_file(path, None) is FileKind.CONFTEST
+            assert _is_conftest(path) == expected, path
+
+    def test_is_collectable_test_file_is_narrow_membership(self):
+        """NARROW: COLLECTABLE_TEST only."""
+        for path in _PREDICATE_PATH_TABLE:
+            expected = classify_file(path, None) is FileKind.COLLECTABLE_TEST
+            assert _is_collectable_test_file(path) == expected, path
+
+    def test_is_test_file_is_broad_membership(self):
+        """BROAD: COLLECTABLE_TEST ∪ TEST_DATA, excludes conftest."""
+        for path in _PREDICATE_PATH_TABLE:
+            expected = classify_file(path, None) in (FileKind.COLLECTABLE_TEST, FileKind.TEST_DATA)
+            assert _is_test_file(path) == expected, path
