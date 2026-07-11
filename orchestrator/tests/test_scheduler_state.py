@@ -818,6 +818,38 @@ class TestWriteStateSnapshot:
         with pytest.raises(OSError):
             scheduler._write_state_snapshot_raw(path)
 
+    @pytest.mark.asyncio
+    async def test_write_snapshot_best_effort_honors_state_snapshot_path(self, tmp_path):
+        """state_snapshot_path (task 2418) redirects the best-effort write off
+        the ``_project_root``-derived path, decoupling the on-disk write
+        target from the OverrideStore lookup key.
+
+        Simulates the realistic scenario where ``_project_root`` is set to a
+        non-writable OverrideStore key (e.g. ``'/proj'``, as
+        ``TestGetStateSnapshotPopulated`` does) while the write itself must
+        land in a writable tmp path: with ``state_snapshot_path`` set, the
+        write goes there instead of under ``/proj``, and the no-project-root
+        guard is bypassed since an explicit path is always honored.
+        """
+        sched = Scheduler(
+            OrchestratorConfig(max_per_module=1),
+            state_snapshot_path=tmp_path / 'scheduler_state.json',
+        )
+        sched._project_root = '/proj'
+
+        await sched._write_snapshot_best_effort(force=True)
+
+        snap_path = tmp_path / 'scheduler_state.json'
+        assert snap_path.exists(), 'Expected snapshot file at state_snapshot_path'
+        data = json.loads(snap_path.read_text())
+        assert set(data.keys()) == _SNAPSHOT_KEYS, (
+            f'Expected keys {_SNAPSHOT_KEYS}, got {set(data.keys())}'
+        )
+        assert not Path('/proj/data/orchestrator/scheduler_state.json').exists(), (
+            'state_snapshot_path must bypass the _project_root-derived write '
+            'target entirely — nothing should be written under /proj'
+        )
+
 
 # ===========================================================================
 # Step-17: acquire_next writes snapshot to default path
