@@ -306,3 +306,20 @@ def order_queue(
         )
 
     return sorted(items, key=lambda item: (-item.score, item.key))
+
+
+def known_project_roots(
+    records: Sequence[SessionRecord], extra: Sequence[str] = ()
+) -> list[str]:
+    """Candidate project roots for the spawn bar's project picker (PRD §9).
+
+    Derived from the distinct non-empty ``cwd`` values across *records*
+    (typically every scanned SessionRecord, not just awaiting-input ones --
+    this is a picker source, not a queue filter) unioned with any
+    explicitly-configured *extra* roots. Deduped and sorted for a stable,
+    deterministic picker order. Fail-soft (PRD §2): a record with an empty
+    cwd is simply excluded, never raises.
+    """
+    roots = {record.cwd for record in records if record.cwd}
+    roots.update(extra)
+    return sorted(roots)
