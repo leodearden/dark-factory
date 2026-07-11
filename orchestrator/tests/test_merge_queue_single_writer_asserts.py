@@ -49,6 +49,7 @@ from __future__ import annotations
 
 import asyncio
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Literal, cast
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -180,14 +181,38 @@ def _sentinel_entry() -> InflightEntry:
 
     The ``_inflight`` choke-point tests below exercise pure queue mechanics
     (raises vs. no-op, ``is``-identity of whatever gets popped) and never
-    inspect an entry's fields, so a bare ``object()`` is enough at runtime.
-    ``cast`` tells the type checker to treat it as an ``InflightEntry``
-    without constructing an irrelevant ``SpeculativeItem``/``MergeResult``
-    graph — contrast with test_merge_queue_verify_base_invariant.py's
-    ``_make_inflight_entry``, which builds a real one because that test's
-    assertions inspect ``base_sha``/``merge_commit``.
+    inspect an entry's fields, so a lightweight ``SimpleNamespace`` stub is
+    enough at runtime. ``cast`` tells the type checker to treat it as an
+    ``InflightEntry`` without constructing an irrelevant
+    ``SpeculativeItem``/``MergeResult`` graph — contrast with
+    test_merge_queue_verify_base_invariant.py's ``_make_inflight_entry``,
+    which builds a real one because that test's assertions inspect
+    ``base_sha``/``merge_commit``.
+
+    The ``.item.request.request_id`` attribute chain is required (not just
+    identity) because MQ-reliability kappa/2169 (commit 56132176382) made
+    ``_inflight_append`` call
+    ``_note_transition(entry.item.request.request_id, DISPATCHING, VERIFYING)``
+    unconditionally, ahead of where the ownership no-op in
+    ``_assert_single_writer`` can short-circuit — a bare ``object()`` has no
+    ``.item`` and raises ``AttributeError`` there. The request_id
+    (``'sentinel-request-id'``) is an intentionally UNREGISTERED
+    placeholder: the worker's fresh ``ItemLifecycle`` has never seen it, so
+    the transition raises ``IllegalLifecycleTransition``, which
+    ``_note_transition`` swallows (WARNING log only) and routes to
+    ``_alarm_illegal_lifecycle_transition`` — a no-op under
+    ``_make_worker``'s default ``escalation_queue=None``. So the no-op
+    tests above neither raise nor escalate; they just absorb a harmless
+    WARNING.
     """
-    return cast(InflightEntry, object())
+    return cast(
+        InflightEntry,
+        SimpleNamespace(
+            item=SimpleNamespace(
+                request=SimpleNamespace(request_id='sentinel-request-id'),
+            ),
+        ),
+    )
 
 
 # ── step-03 RED: _assert_single_writer semantics at the lane-buffer sites ───
@@ -412,6 +437,63 @@ class TestAssertSingleWriterInflightWiring:
         assert popped is entry
         worker._inflight_append(_sentinel_entry())
         worker._inflight_clear()  # must not raise
+
+
+# ── Regression: _sentinel_entry() choke-point contract (task 2445) ─────────
+
+
+@pytest.mark.asyncio
+class TestSentinelEntryChokePointContract:
+    """Regression guard for ``_sentinel_entry()``'s shape (task 2445).
+
+    MQ-reliability kappa (task 2169, commit 56132176382) made
+    ``_inflight_append`` call
+    ``_note_transition(entry.item.request.request_id, ...)`` unconditionally
+    — ahead of where ``_assert_single_writer``'s no-op could short-circuit.
+    A bare ``object()`` sentinel has no ``.item``, so every no-op test in
+    ``TestAssertSingleWriterInflightWiring`` above that appends a sentinel
+    raised ``AttributeError: 'object' object has no attribute 'item'`` at
+    that dereference (merge_queue.py:8992). This pins the fix so it cannot
+    regress silently.
+
+    This necessarily overlaps with ``TestAssertSingleWriterInflightWiring``'s
+    no-op cases above — they too call ``_inflight_append(_sentinel_entry())``
+    and would already fail the same way on a sentinel regression. It earns
+    its keep as a separate, minimal class anyway: it isolates the regression
+    to a single call independent of the flag/ownership matrix, and it is the
+    only place in this file that pins ``worker._escalation_queue is None`` —
+    the precondition that keeps the sentinel's intentionally-unregistered
+    request_id inert (swallowed WARNING, no escalation) rather than a silent
+    behavioral change if ``_make_worker`` ever starts wiring a queue.
+    """
+
+    async def test_sentinel_entry_survives_inflight_append_chokepoint(
+        self, git_ops: GitOps,
+    ) -> None:
+        """``_inflight_append`` must not raise on a bare ``_sentinel_entry()``.
+
+        Regression guard for ``AttributeError: 'object' object has no
+        attribute 'item'`` previously raised at ``_note_transition``'s
+        ``entry.item.request.request_id`` dereference (merge_queue.py:8992).
+        ``_make_worker`` builds a worker whose ``_verifier_task`` defaults to
+        None — so ``_assert_single_writer`` is a no-op regardless of
+        ``_DEBUG_ASSERTS`` — and whose ``_escalation_queue`` defaults to
+        None, pinned below as the precondition that makes the sentinel's
+        intentionally-unregistered request_id raise-and-swallow an
+        ``IllegalLifecycleTransition`` inside ``_note_transition`` (a
+        harmless WARNING log) rather than escalate anything: the None-guard
+        on ``_alarm_illegal_lifecycle_transition`` returns immediately. Do
+        NOT wire a non-None spy escalation queue here — with an unregistered
+        request_id that would spuriously fail, since the alarm would then
+        actually submit.
+        """
+        worker = _make_worker(git_ops)
+        assert worker._escalation_queue is None
+
+        entry = _sentinel_entry()
+        worker._inflight_append(entry)  # must not raise
+
+        assert worker._inflight[-1] is entry
 
 
 # ── step-07 RED: suite-wide enablement + end-to-end no-false-positive ───────
