@@ -787,6 +787,16 @@ class ReconciliationHarness:
         a dedicated connection, so it can't be pinned — a stale tree read now
         shows up as a genuine mismatch instead of being masked.
 
+        Note on read-skew: reading the census fresh while the tree read stays
+        on the cached connection makes the two reads slightly *more* likely to
+        straddle a status transition than when both shared one pinned
+        snapshot, so a transient single-cycle total_mismatch/done_mismatch
+        that resolves itself next cycle is somewhat more likely post-fix.
+        cross_verify_task_counts (task_filter.py:598) already documents
+        single-cycle divergence as advisory and only escalates divergence
+        that persists across consecutive cycles, so this is an accepted
+        trade-off for surfacing real drift instead of masking it.
+
         Mirrors _fetch_filtered_task_tree's fail-open posture: guard against a
         falsy taskmaster, an empty project_root, and any exception raised by
         get_statuses_fresh — all degrade to an empty dict so the caller can
