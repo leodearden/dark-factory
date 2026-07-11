@@ -18,7 +18,7 @@ from pathlib import Path
 from typing import Any
 
 import aiosqlite
-from shared.async_sqlite_base import apply_full_durability_pragmas, connect_daemon
+from shared.async_sqlite_base import apply_full_durability_pragmas, apply_wal_pragmas, connect_daemon
 from shared.task_metadata import (
     _WHOLE_METADATA_FIELD,
     SchemaWarning,
@@ -1029,6 +1029,60 @@ class SqliteTaskBackend:
             out['id'] = int(out['id'])
         return out
 
+    async def _statuses_from_conn(
+        self,
+        conn: aiosqlite.Connection,
+        tag: str,
+        ids: list[str] | None,
+    ) -> dict[str, str]:
+        """Run the id/status SELECT on *conn* and coerce to ``{id_str: status_str}``.
+
+        Shared body for :meth:`get_statuses_raw` (cached per-project
+        connection) and :meth:`get_statuses_fresh` (dedicated short-lived
+        connection) — a single source of truth for the ``ids`` filtering
+        and the ``NULL`` → ``'unknown'`` coercion rule, so both read paths
+        stay identical apart from which connection they run on.
+
+        Args:
+            conn: An open connection with ``row_factory`` already set to
+                :class:`aiosqlite.Row` (callers own connection setup).
+            tag: Tag context — callers apply the ``tag or DEFAULT_TAG``
+                default before calling this helper.
+            ids: When given, only return entries for these task ids (as strings;
+                 cast to int for the SQL IN clause; non-numeric ids silently
+                 omitted).  ``None`` returns all tasks.  ``[]`` returns ``{}``.
+
+        Returns:
+            ``{str(id): status}`` mapping.  Unknown ids are silently omitted.
+            A ``NULL`` status (defensive; unreachable via normal writes) maps to
+            ``'unknown'``.
+        """
+        if ids is not None:
+            if not ids:
+                return {}
+            int_ids: list[int] = []
+            for raw_id in ids:
+                with contextlib.suppress(ValueError, TypeError):
+                    int_ids.append(int(raw_id))
+            if not int_ids:
+                return {}
+            placeholders = ','.join('?' * len(int_ids))
+            cursor = await conn.execute(
+                f'SELECT id, status FROM tasks WHERE tag = ? AND id IN ({placeholders})',
+                (tag, *int_ids),
+            )
+        else:
+            cursor = await conn.execute(
+                'SELECT id, status FROM tasks WHERE tag = ?',
+                (tag,),
+            )
+
+        rows = await cursor.fetchall()
+        return {
+            str(row['id']): (row['status'] if row['status'] is not None else 'unknown')
+            for row in rows
+        }
+
     async def get_statuses_raw(
         self,
         project_root: str,
@@ -1059,32 +1113,7 @@ class SqliteTaskBackend:
         await self.ensure_connected()
         tag = tag or DEFAULT_TAG
         conn = await self._get_connection(project_root)
-
-        if ids is not None:
-            if not ids:
-                return {}
-            int_ids: list[int] = []
-            for raw_id in ids:
-                with contextlib.suppress(ValueError, TypeError):
-                    int_ids.append(int(raw_id))
-            if not int_ids:
-                return {}
-            placeholders = ','.join('?' * len(int_ids))
-            cursor = await conn.execute(
-                f'SELECT id, status FROM tasks WHERE tag = ? AND id IN ({placeholders})',
-                (tag, *int_ids),
-            )
-        else:
-            cursor = await conn.execute(
-                'SELECT id, status FROM tasks WHERE tag = ?',
-                (tag,),
-            )
-
-        rows = await cursor.fetchall()
-        return {
-            str(row['id']): (row['status'] if row['status'] is not None else 'unknown')
-            for row in rows
-        }
+        return await self._statuses_from_conn(conn, tag, ids)
 
     async def get_statuses(
         self,
@@ -1101,6 +1130,66 @@ class SqliteTaskBackend:
         reconciliation harness calls ``taskmaster.get_statuses`` directly).
         """
         return await self.get_statuses_raw(project_root, tag=tag, ids=ids)
+
+    async def get_statuses_fresh(
+        self,
+        project_root: str,
+        ids: list[str] | None = None,
+        tag: str | None = None,
+    ) -> dict[str, str]:
+        """Return a snapshot-fresh ``{id_str: status_str}`` census for *project_root*.
+
+        Unlike :meth:`get_statuses`/:meth:`get_statuses_raw`, which read via
+        the cached per-project connection returned by :meth:`_get_connection`,
+        this method opens a DEDICATED short-lived connection with
+        ``isolation_level=None`` (autocommit) for every call, so its SELECT
+        always sees the latest committed WAL state and can never be pinned.
+
+        Why this exists (task 2388): ``_get_connection``'s cached connection
+        is opened via ``connect_daemon(str(db_path))`` *without*
+        ``isolation_level=None`` — Python sqlite3's legacy deferred
+        transaction mode. If a read transaction is ever left open on that
+        cached connection, every subsequent read on it — including
+        ``get_statuses``/``get_statuses_raw`` and the ``get_tasks`` tree
+        read, since they all share the same cached connection — is pinned
+        to that transaction's WAL snapshot and silently returns stale data,
+        even after other connections/processes have committed newer writes.
+        Because the tree read and the census read went stale *together*,
+        they still agreed with each other, so
+        ``cross_verify_task_counts`` (``reconciliation/task_filter.py``)
+        reported a false ``consistent: true`` instead of surfacing the
+        drift. This method gives the reconciliation harness's authoritative
+        census (``_fetch_task_count_census``) a read that cannot be pinned;
+        the hot compact-status-map callers should keep using
+        ``get_statuses``/``get_statuses_raw`` unchanged.
+
+        Fails open to ``{}`` on any error (including a not-yet-created DB
+        file) — this is a best-effort freshness upgrade for a cross-check,
+        never a reason to raise into the reconciliation cycle.
+
+        Args:
+            project_root: Absolute path to the project root.
+            ids: When given, only return entries for these task ids (as
+                 strings).  ``None`` returns all tasks.  ``[]`` returns ``{}``.
+            tag: Tag context; defaults to ``DEFAULT_TAG`` when ``None``.
+
+        Returns:
+            ``{str(id): status}`` mapping; ``{}`` if the DB file does not
+            exist yet or the read fails for any reason.
+        """
+        db_path = self._db_path(project_root)
+        if not db_path.exists():
+            return {}
+        conn = await connect_daemon(str(db_path), isolation_level=None)
+        try:
+            await apply_wal_pragmas(conn, busy_timeout_ms=5000)
+            conn.row_factory = aiosqlite.Row
+            return await self._statuses_from_conn(conn, tag or DEFAULT_TAG, ids)
+        except Exception:
+            return {}
+        finally:
+            with contextlib.suppress(Exception):
+                await conn.close()
 
     async def set_task_status(
         self,
