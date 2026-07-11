@@ -4761,6 +4761,122 @@ class TestRecoverBeforeExecuteGhostLoop:
         )
 
 
+@pytest.mark.asyncio
+class TestRedispatchIterationLogHygiene:
+    """e2e regression tests for Layer B (task 2372): ``_setup_worktree_and_artifacts``
+    wipes a stale ``iterations.jsonl`` inherited from a prior dispatch when
+    re-dispatch lands on a NEW fork point, and preserves it when the fork
+    point is unchanged (same-base crash-resume).
+
+    Each test pre-seeds the sibling ``.task-meta/<task_id>`` root — the exact
+    location a prior, since-abandoned dispatch would have left behind — via
+    the real ``TaskArtifacts`` object, BEFORE the workflow's own
+    ``_setup_worktree_and_artifacts`` runs its (real) ``git_ops.create_worktree``
+    call. ``workflow.worktree`` is deliberately left ``None`` so the method
+    takes the real create_worktree path rather than the external-worktree
+    (eval mode) branch.
+    """
+
+    async def test_redispatch_clears_stale_iteration_log_when_base_changed(
+        self, config, git_ops, task_assignment, tmp_path,
+    ):
+        """OLD base_commit != NEW base_commit (re-dispatch onto a new fork
+        point) must wipe the surviving iterations.jsonl so a stale
+        prior-dispatch entry never masquerades as current-branch evidence.
+
+        Fails on unmodified code: init() only overwrites metadata.json, so
+        iterations.jsonl silently survives across re-dispatch — the exact
+        signature behind the task 2125/2315/2340 false-DONE recurrence.
+        """
+        # 1. Pre-seed the sibling .task-meta/<task_id> root — the exact
+        #    location a prior, since-abandoned dispatch would have left
+        #    behind — with an OLD (fake) base_commit and a stale iteration
+        #    log entry, BEFORE the workflow creates its own fresh worktree.
+        worktree_path_to_be = git_ops.worktree_base / task_assignment.task_id
+        stale_artifacts = TaskArtifacts(worktree_path_to_be)
+        old_base = 'f' * 40
+        stale_artifacts.init(
+            task_assignment.task_id, task_assignment.task['title'],
+            task_assignment.task['description'], base_commit=old_base,
+        )
+        stale_artifacts.append_iteration_log({
+            'iteration': 1, 'agent': 'implementer', 'source': 'orchestrator',
+            'steps_attempted': [], 'steps_completed': [],
+            'commit': old_base, 'summary': 'No new steps completed',
+        })
+
+        # 2. Build a workflow with worktree=None so _setup_worktree_and_artifacts
+        #    performs its own real git_ops.create_worktree — a genuinely fresh
+        #    fork point, guaranteed to differ from the fake OLD base_commit.
+        stub = AgentStub()
+        workflow, _scheduler, _queue = _build_workflow_no_merge_worker(
+            config, git_ops, task_assignment, stub, tmp_path,
+        )
+
+        await workflow._setup_worktree_and_artifacts(task_assignment.task_id)
+
+        # 3. Preconditions: this genuinely was a base change, and the wipe
+        #    guard's inputs are what we think they are.
+        assert workflow._old_plan_base == old_base
+        assert workflow._base_commit != old_base
+        assert not workflow._worktree_external
+
+        # 4. The stale log must be gone — not merely unread, but wiped, so
+        #    a subsequent append starts from a clean slate.
+        entries, corrupted = workflow.artifacts.read_iteration_log()
+        assert entries == [] and corrupted == [], (
+            f'Expected iterations.jsonl to be wiped on re-dispatch onto a new '
+            f'base, but found entries={entries!r} corrupted={corrupted!r}'
+        )
+
+    async def test_redispatch_preserves_iteration_log_when_base_unchanged(
+        self, config, git_ops, task_assignment, tmp_path,
+    ):
+        """OLD base_commit == NEW base_commit (same-base crash-resume) must
+        NOT wipe iterations.jsonl — the in-flight implementer's progress log
+        must survive so the resumed run can see prior steps.
+        """
+        # 1. The fresh worktree's base_commit will be the current main tip
+        #    (no remote configured — _freshen_main falls back to local main).
+        #    Seed the sibling .task-meta/<task_id> root with THAT SAME sha as
+        #    the OLD base_commit, so create_worktree's fresh base matches it
+        #    exactly (same-base crash-resume, not a re-dispatch).
+        main_sha = await git_ops.get_main_sha()
+        worktree_path_to_be = git_ops.worktree_base / task_assignment.task_id
+        stale_artifacts = TaskArtifacts(worktree_path_to_be)
+        stale_artifacts.init(
+            task_assignment.task_id, task_assignment.task['title'],
+            task_assignment.task['description'], base_commit=main_sha,
+        )
+        stale_artifacts.append_iteration_log({
+            'iteration': 1, 'agent': 'implementer', 'source': 'orchestrator',
+            'steps_attempted': ['step-1'], 'steps_completed': ['step-1'],
+            'commit': main_sha, 'summary': 'Completed step-1',
+        })
+
+        # 2. Build a workflow with worktree=None so _setup_worktree_and_artifacts
+        #    performs its own real git_ops.create_worktree.
+        stub = AgentStub()
+        workflow, _scheduler, _queue = _build_workflow_no_merge_worker(
+            config, git_ops, task_assignment, stub, tmp_path,
+        )
+
+        await workflow._setup_worktree_and_artifacts(task_assignment.task_id)
+
+        # 3. Precondition: this genuinely is the same-base case.
+        assert workflow._old_plan_base == main_sha
+        assert workflow._base_commit == main_sha
+
+        # 4. The in-flight log must survive untouched.
+        entries, corrupted = workflow.artifacts.read_iteration_log()
+        assert corrupted == []
+        assert len(entries) == 1, (
+            f'Expected the seeded entry to survive a same-base re-dispatch, '
+            f'got entries={entries!r}'
+        )
+        assert entries[0]['steps_completed'] == ['step-1']
+
+
 # ---------------------------------------------------------------------------
 # Tests: pre-PLAN recovery in workflow.run
 # ---------------------------------------------------------------------------
