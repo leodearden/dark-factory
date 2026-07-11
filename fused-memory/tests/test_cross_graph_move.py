@@ -1787,6 +1787,73 @@ class TestRecreateSubgraphRelationships:
         assert dropped['dst_target'] is None
 
     @pytest.mark.asyncio
+    async def test_null_fact_embedding_recreates_move_edge_without_embedding_property(
+        self, mock_config, make_backend, make_graph_mock, monkeypatch,
+    ):
+        """A null/absent fact_embedding on a MOVE-pass RELATES_TO edge is
+        valid real data, not corruption (the live f0fc1aba-in-reify scenario
+        that used to abort the WHOLE batch): the edge is still recreated in
+        the target, omitting the fact_embedding property entirely (no vecf32
+        literal) while every other property/param is preserved, edges_
+        recreated still counts it, and the call does NOT raise.
+        """
+        backend = make_backend(mock_config)
+
+        source_mock = make_graph_mock()
+
+        async def _source_ro_query(cypher, params=None):
+            if 'RELATES_TO' in cypher:
+                return MagicMock(result_set=[EDGE_ROW_FIXTURE])
+            return MagicMock(result_set=[])  # no MENTIONS in this scenario
+
+        source_mock.ro_query = AsyncMock(side_effect=_source_ro_query)
+
+        target_mock = make_graph_mock()
+
+        async def _target_ro_query(cypher, params=None):
+            if 'RELATES_TO' in cypher:
+                # edge-already-in-target idempotency probe: not yet present
+                # -- a first-time apply.
+                return MagicMock(result_set=[])
+            # entity-presence probe for the non-migrating endpoint (B):
+            # already present in target.
+            return MagicMock(result_set=[[OTHER_NODE_UUID_FIXTURE]])
+
+        target_mock.ro_query = AsyncMock(side_effect=_target_ro_query)
+        target_mock.query = AsyncMock(return_value=MagicMock(relationships_created=1))
+
+        backend._driver._get_graph = _route_graphs({
+            SOURCE_GRAPH_FIXTURE: source_mock,
+            TARGET_GRAPH_FIXTURE: target_mock,
+        })
+
+        # the edge's fact_embedding reads None (null/absent).
+        fake_read_compact = AsyncMock(return_value=None)
+        monkeypatch.setattr(cross_graph_move, '_read_compact_vector', fake_read_compact)
+
+        # Only A is in this batch -- B (OTHER_NODE_UUID_FIXTURE) is a
+        # non-migrating home-resident already present in T.
+        specs = [_move_spec(NODE_UUID_FIXTURE, SOURCE_GRAPH_FIXTURE, TARGET_GRAPH_FIXTURE)]
+
+        result = await recreate_subgraph_relationships(backend, specs)
+
+        target_mock.query.assert_awaited_once()
+        cypher = extract_cypher(target_mock.query.call_args)
+        params = extract_params(target_mock.query.call_args)
+        assert 'CREATE' in cypher
+        assert 'RELATES_TO' in cypher
+        assert 'fact_embedding' not in cypher
+        assert 'vecf32' not in cypher
+        assert params.get('src_uuid') == NODE_UUID_FIXTURE
+        assert params.get('dst_uuid') == OTHER_NODE_UUID_FIXTURE
+        assert params.get('edge_uuid') == EDGE_UUID_FIXTURE
+        assert params.get('group_id') == TARGET_GRAPH_FIXTURE
+
+        assert result.edges_recreated == 1
+        assert result.edges_skipped == 0
+        assert result.dropped_cross_target == []
+
+    @pytest.mark.asyncio
     async def test_merge_fold_recreates_only_wrong_copys_unique_edge(
         self, mock_config, make_backend, make_graph_mock, monkeypatch,
     ):
@@ -1846,6 +1913,64 @@ class TestRecreateSubgraphRelationships:
         fake_read_compact.assert_awaited_once()
         assert fake_read_compact.call_args.kwargs.get('group_id') == WRONG_GRAPH_FIXTURE
         assert UNIQUE_WRONG_EDGE_UUID_FIXTURE in fake_read_compact.call_args.kwargs.get('cypher', '')
+
+        # no DETACH DELETE of the wrong copy in this phase.
+        wrong_mock.query.assert_not_awaited()
+
+        assert result.edges_recreated == 1
+        assert result.edges_skipped == 0
+
+    @pytest.mark.asyncio
+    async def test_merge_fold_null_fact_embedding_recreates_edge_without_embedding_property(
+        self, mock_config, make_backend, make_graph_mock, monkeypatch,
+    ):
+        """A null/absent fact_embedding on the MERGE fold's unique-wrong-copy
+        edge is valid real data, not corruption: it is still folded onto the
+        home copy, omitting the fact_embedding property entirely (no vecf32
+        literal), counted in edges_recreated, and the call does NOT raise.
+        """
+        backend = make_backend(mock_config)
+
+        wrong_mock = make_graph_mock()
+        wrong_mock.ro_query = AsyncMock(
+            return_value=MagicMock(
+                result_set=[SHARED_EDGE_ROW_FIXTURE, UNIQUE_WRONG_EDGE_ROW_FIXTURE]
+            )
+        )
+
+        home_mock = make_graph_mock()
+        # home's CURRENT incident edge-uuid set: only the shared edge -- the
+        # unique-wrong edge is NOT yet there.
+        home_mock.ro_query = AsyncMock(
+            return_value=MagicMock(result_set=[[SHARED_EDGE_UUID_FIXTURE]])
+        )
+        home_mock.query = AsyncMock(return_value=MagicMock(relationships_created=1))
+
+        backend._driver._get_graph = _route_graphs({
+            WRONG_GRAPH_FIXTURE: wrong_mock,
+            HOME_GRAPH_FIXTURE: home_mock,
+        })
+
+        # the unique wrong-copy edge's fact_embedding reads None (null/absent).
+        fake_read_compact = AsyncMock(return_value=None)
+        monkeypatch.setattr(cross_graph_move, '_read_compact_vector', fake_read_compact)
+
+        specs = [_merge_spec(NODE_UUID_FIXTURE, WRONG_GRAPH_FIXTURE, HOME_GRAPH_FIXTURE)]
+
+        result = await recreate_subgraph_relationships(backend, specs)
+
+        assert home_mock.query.await_count == 1
+        cypher = extract_cypher(home_mock.query.call_args)
+        params = extract_params(home_mock.query.call_args)
+        assert 'CREATE' in cypher
+        assert 'fact_embedding' not in cypher
+        assert 'vecf32' not in cypher
+        assert params.get('edge_uuid') == UNIQUE_WRONG_EDGE_UUID_FIXTURE
+        assert params.get('src_uuid') == NODE_UUID_FIXTURE
+        assert params.get('dst_uuid') == OTHER_NODE_UUID_FIXTURE
+        # preserves the wrong-copy's OWN group_id -- MERGE has no
+        # rewrite_group_id analogue (mirrors merge_foreign_duplicate).
+        assert params.get('group_id') == WRONG_GRAPH_FIXTURE
 
         # no DETACH DELETE of the wrong copy in this phase.
         wrong_mock.query.assert_not_awaited()
