@@ -29,8 +29,10 @@ interceptor is needed (mirrors ``test_sqlite_task_backend.py``:407-553).
 
 from __future__ import annotations
 
+import logging
 import uuid
 
+import pytest
 import pytest_asyncio
 
 from fused_memory.backends.sqlite_task_backend import SqliteTaskBackend
@@ -103,3 +105,141 @@ async def backend(tmp_path):
 @pytest_asyncio.fixture
 async def project_root(tmp_path):
     return str(tmp_path / 'proj')
+
+
+# ── A1-A4: vocabulary rejection + transition-legality (log/enforce) ────
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('enforce', [False, True])
+async def test_a1_vocab_rejection_raises_and_read_path_unaffected(tmp_path, enforce):
+    """A1: an out-of-vocabulary status ('in_progress' typo, underscore not
+    hyphen) raises TaskmasterError(TASKMASTER_TOOL_ERROR) through the real
+    interceptor+backend stack in BOTH log-mode and enforce-mode — this is
+    rho1a's vocabulary gate, which sits ahead of (and is orthogonal to) the
+    transition-legality gate (a ValueError from TaskStatus coercion inside
+    is_legal_transition is treated as legal — never bricking on bad
+    vocabulary — so the write reaches the backend, which is the actual
+    vocabulary authority). The read path proves the write never landed:
+    get_task still shows 'pending' and get_statuses still lists the task —
+    still dispatchable.
+    """
+    interceptor, backend, project_root, event_buffer = await _fresh_stack(tmp_path, enforce=enforce)
+    try:
+        await backend.add_task(project_root=project_root, title='t')
+
+        with pytest.raises(TaskmasterError) as exc_info:
+            await interceptor.set_task_status(
+                '1', 'in_progress', project_root, agent_id='orchestrator-x',
+            )
+        assert exc_info.value.code == 'TASKMASTER_TOOL_ERROR'
+
+        task = await backend.get_task('1', project_root=project_root)
+        assert task['status'] == 'pending'
+
+        statuses = await backend.get_statuses(project_root)
+        assert statuses['1'] == 'pending'
+    finally:
+        await _close_stack(interceptor, backend, event_buffer)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('enforce', [False, True])
+async def test_a2_legal_dispatch_no_warning_persists_both_modes(tmp_path, enforce, caplog):
+    """A2: pending->in-progress by an ORCHESTRATOR actor is the ordinary
+    dispatch transition — legal in BOTH log-mode and enforce-mode, so no
+    'illegal_transition would-reject' WARNING fires either way, and the
+    write persists (get_statuses reflects 'in-progress') in both modes.
+    """
+    interceptor, backend, project_root, event_buffer = await _fresh_stack(tmp_path, enforce=enforce)
+    try:
+        await backend.add_task(project_root=project_root, title='t')
+
+        with caplog.at_level(logging.WARNING, logger='fused_memory.middleware.task_interceptor'):
+            result = await interceptor.set_task_status(
+                '1', 'in-progress', project_root, agent_id='orchestrator-x',
+            )
+        assert 'error' not in result, result
+        assert not any(
+            'illegal_transition would-reject' in r.message for r in caplog.records
+        ), [r.message for r in caplog.records]
+
+        statuses = await backend.get_statuses(project_root)
+        assert statuses['1'] == 'in-progress'
+    finally:
+        await _close_stack(interceptor, backend, event_buffer)
+
+
+@pytest.mark.asyncio
+async def test_a3_reconciliation_illegal_transition_log_mode_warns_and_proceeds(tmp_path, caplog):
+    """A3 log-mode: RECONCILIATION is the one actor-specific restriction
+    (Table A) — in-progress->pending is illegal FOR IT ALONE. In log-mode
+    (enforce=False, the default) the gate logs a grep-stable WARNING but the
+    write still proceeds: get_statuses shows 'pending' after the call.
+    """
+    interceptor, backend, project_root, event_buffer = await _fresh_stack(tmp_path, enforce=False)
+    try:
+        await backend.add_task(project_root=project_root, title='t')
+        await backend.set_task_status('1', 'in-progress', project_root=project_root)
+
+        with caplog.at_level(logging.WARNING, logger='fused_memory.middleware.task_interceptor'):
+            result = await interceptor.set_task_status(
+                '1', 'pending', project_root, agent_id='recon-stage-7',
+            )
+        assert 'error' not in result, result
+        assert any(
+            'illegal_transition would-reject in-progress->pending actor=reconciliation' in r.message
+            for r in caplog.records
+        ), [r.message for r in caplog.records]
+
+        statuses = await backend.get_statuses(project_root)
+        assert statuses['1'] == 'pending'
+    finally:
+        await _close_stack(interceptor, backend, event_buffer)
+
+
+@pytest.mark.asyncio
+async def test_a3_reconciliation_illegal_transition_enforce_mode_rejects(tmp_path):
+    """A3 enforce-mode: the same in-progress->pending write by RECONCILIATION
+    is typed-rejected (a structured 'illegal_transition' error) and the
+    backend row is left unchanged (still 'in-progress') — the write never
+    lands.
+    """
+    interceptor, backend, project_root, event_buffer = await _fresh_stack(tmp_path, enforce=True)
+    try:
+        await backend.add_task(project_root=project_root, title='t')
+        await backend.set_task_status('1', 'in-progress', project_root=project_root)
+
+        result = await interceptor.set_task_status(
+            '1', 'pending', project_root, agent_id='recon-stage-7',
+        )
+        assert result.get('error') == 'illegal_transition', result
+
+        statuses = await backend.get_statuses(project_root)
+        assert statuses['1'] == 'in-progress'
+    finally:
+        await _close_stack(interceptor, backend, event_buffer)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('agent_id', [None, 'claude-task-9'])
+async def test_a4_unknown_or_human_actor_safe_open_in_enforce_mode(tmp_path, agent_id):
+    """A4: an UNKNOWN (agent_id=None, header-less) or interactive HUMAN
+    (agent_id='claude-task-9') actor gets the safe-open union (D5) — the
+    SAME in-progress->pending write RECONCILIATION is denied for (A3) is
+    accepted here even in enforce-mode, and persists.
+    """
+    interceptor, backend, project_root, event_buffer = await _fresh_stack(tmp_path, enforce=True)
+    try:
+        await backend.add_task(project_root=project_root, title='t')
+        await backend.set_task_status('1', 'in-progress', project_root=project_root)
+
+        result = await interceptor.set_task_status(
+            '1', 'pending', project_root, agent_id=agent_id,
+        )
+        assert 'error' not in result, result
+
+        statuses = await backend.get_statuses(project_root)
+        assert statuses['1'] == 'pending'
+    finally:
+        await _close_stack(interceptor, backend, event_buffer)
