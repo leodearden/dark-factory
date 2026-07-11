@@ -14,11 +14,16 @@ test_app.py's pilot tests instead.
 
 from __future__ import annotations
 
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 
 from orchestrator.session_registry import TERMINAL_STATUSES, SessionRecord, Status
+from textual.app import ComposeResult
+from textual.screen import ModalScreen
+from textual.widgets import Tree
+from textual.widgets.tree import TreeNode
 
-from cockpit.panes.session_table import order_sessions
+from cockpit.panes.session_table import format_title, order_sessions, state_glyph
 
 
 def is_outstanding(record: SessionRecord) -> bool:
@@ -118,3 +123,94 @@ def build_spawn_forest(records: list[SessionRecord]) -> list[SpawnTreeNode]:
     )
 
     return forest
+
+
+def _populate(parent: TreeNode[str], node: SpawnTreeNode) -> None:
+    """Recursively add *node* (and its subtree) under *parent* (Fleet Cockpit C9a).
+
+    A node with children is added expanded (Tree.add(..., expand=True)) so
+    the forest's structure is visible without the operator needing to
+    expand each branch by hand; a childless node is added via add_leaf
+    instead (there is nothing to expand). Either way `data` is the node's
+    bare session_slug (str) -- never a Display/DisplayTarget -- so this
+    stays import-clean of backends; resolving a slug to a focus target is
+    the app's job (see cockpit.app.CockpitApp._focus_slug).
+    """
+    label = f'{state_glyph(node.record.status)} {format_title(node.record)}'
+    if node.children:
+        tree_node = parent.add(label, data=node.slug, expand=True)
+        for child in node.children:
+            _populate(tree_node, child)
+    else:
+        parent.add_leaf(label, data=node.slug)
+
+
+class SpawnTree(Tree[str]):
+    """Renders the parent->child spawn forest (Fleet Cockpit C9a, PRD §9).
+
+    build(records) is the sole entry point: it fully replaces the tree's
+    contents from a fresh snapshot of *records* every time it's called --
+    there is no incremental update. show_root is False since the forest
+    itself may hang multiple roots off Tree's own single hidden root node.
+    """
+
+    def __init__(self, *args, **kwargs) -> None:
+        super().__init__('sessions', *args, **kwargs)
+        self.show_root = False
+
+    def build(self, records: Sequence[SessionRecord]) -> None:
+        """Replace the tree's contents with the forest built from *records*."""
+        self.clear()
+        for root in build_spawn_forest(list(records)):
+            _populate(self.root, root)
+
+
+class SpawnTreeScreen(ModalScreen[None]):
+    """The 't' spawn-tree toggle's modal (Fleet Cockpit C9a, PRD §9).
+
+    A read-only, point-in-time snapshot view: *records* is captured once at
+    construction (mirrors SpawnScreen's own constructed-with-data shape,
+    see spawn_bar.py) and rendered via SpawnTree.build on mount -- this
+    screen never re-scans the registry itself and never touches a backend
+    directly. Selecting a node calls the injected *on_focus* callback with
+    that node's slug (its `data`); resolving the slug to a Display target
+    and routing it to a backend is the app's job (see
+    cockpit.app.CockpitApp._focus_slug), preserving the same C4/C5b
+    separation SpawnScreen keeps around spawn_session.
+    """
+
+    DEFAULT_CSS = """
+    SpawnTreeScreen {
+        align: center middle;
+    }
+
+    SpawnTreeScreen > SpawnTree {
+        width: 80%;
+        height: 80%;
+        border: round $accent;
+        background: $surface;
+    }
+    """
+
+    def __init__(
+        self,
+        records: Sequence[SessionRecord],
+        on_focus: Callable[[str], None],
+        *args,
+        **kwargs,
+    ) -> None:
+        super().__init__(*args, **kwargs)
+        self._records = list(records)
+        # NOT named `_on_focus`: Widget already defines an internal
+        # `_on_focus(self, event: events.Focus)` message-dispatch handler
+        # (textual.widget.Widget._on_focus) that Textual's MessagePump looks
+        # up by that exact name whenever this screen receives a real Focus
+        # event -- an attribute of the same name here would silently shadow
+        # it with an incompatible str -> None callable.
+        self._focus_callback = on_focus
+
+    def compose(self) -> ComposeResult:
+        yield SpawnTree()
+
+    def on_mount(self) -> None:
+        self.query_one(SpawnTree).build(self._records)

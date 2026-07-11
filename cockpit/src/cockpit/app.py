@@ -53,6 +53,7 @@ from cockpit.panes.decision_queue import (
 from cockpit.panes.detail_pane import DetailPane
 from cockpit.panes.session_table import SessionTable, order_sessions
 from cockpit.panes.spawn_bar import SpawnScreen, build_spawn_argv
+from cockpit.panes.spawn_tree import SpawnTreeScreen
 from cockpit.priority import Priorities, load_priorities
 from cockpit.registry_reader import build_snapshot, scan_sessions, snapshot_changed
 from cockpit.ui_config import CockpitUIConfig, load_ui_config, save_ui_config
@@ -148,6 +149,7 @@ class CockpitApp(App):
         Binding('x', 'drop', 'Drop', show=False),
         Binding('d', 'defer', 'Defer', show=False),
         Binding('n', 'new_session', 'New session', show=False),
+        Binding('t', 'toggle_tree', 'Spawn tree', show=False),
         # All ten digits are bound, but a digit's SCORE effect saturates
         # once it exceeds the active Priorities.manual_boost.max (default 5
         # -- see priority.py's score(), which clamps manual_boost into
@@ -540,6 +542,29 @@ class CockpitApp(App):
         title = f'{role}:{Path(project_root).name}'
         argv = build_spawn_argv(script, project_root, title, prompt)
         self._spawn_runner(argv)
+
+    def action_toggle_tree(self) -> None:
+        """'t' -- push the spawn-tree toggle's modal (Fleet Cockpit C9a, PRD §9).
+
+        Snapshots self._records (the most recently scanned/ordered set) into
+        a SpawnTreeScreen, which renders it as a point-in-time parent->child
+        forest -- see cockpit.panes.spawn_tree. Guards against pushing a
+        second SpawnTreeScreen on top of an already-open one; popping it
+        back off (the toggle's "close" half) is wired in a later step.
+        """
+        if isinstance(self.screen, SpawnTreeScreen):
+            return
+        self.push_screen(SpawnTreeScreen(self._records, self._focus_slug))
+
+    def _focus_slug(self, slug: str) -> None:
+        """Resolve *slug* to a focus target and route it to a backend (Fleet Cockpit C9a).
+
+        Stub for now -- SpawnTreeScreen's Enter-to-focus wiring (resolving
+        *slug* against self._records via resolve_target, then routing to
+        _backend_for(target.kind).focus) lands in a later step; this
+        placeholder exists so action_toggle_tree already has a callback to
+        inject into SpawnTreeScreen.
+        """
 
     def _sync_detail_pane(self, slug: str | None) -> None:
         """Render *slug*'s record (or the empty placeholder) into the detail pane.
