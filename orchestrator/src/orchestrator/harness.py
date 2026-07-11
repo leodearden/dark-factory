@@ -35,6 +35,7 @@ from orchestrator.config import (
 )
 from orchestrator.deterministic_runner import DeterministicRunner
 from orchestrator.event_store import EventStore, EventType
+from orchestrator.fleet_heartbeat import build_heartbeat_payload, resolve_fleet_dir, write_heartbeat
 from orchestrator.git_ops import GitOps
 from orchestrator.lane_lifecycle import LANE_STATE_DIRNAME
 from orchestrator.lane_lifecycle import LaneState as DurableLaneState
@@ -7033,6 +7034,40 @@ Output JSON matching the schema. Every task must appear in the output.
             if await coord.maybe_restart(agents_idle=agents_idle):
                 any_fired = True
         return any_fired
+
+    async def _write_merge_heartbeat(self) -> None:
+        """Write this unit's fleet-common merge-idle heartbeat (task 2395, α).
+
+        Gathers ON the event loop: ``ORCH_UNIT`` (self-identification, same
+        env convention as ``deterministic_runner._default_resolve_own_unit``),
+        ``merge_idle`` via ``self._merge_pipeline_idle()`` (the authoritative
+        drain-gate truth source — task 1973 U2), and the ``queue_empty``/
+        ``depth`` diagnostics read directly from the same in-memory state.
+        Offloads only the serialize+atomic-write to a thread
+        (``asyncio.to_thread``), mirroring
+        ``Scheduler._write_snapshot_best_effort``'s loop/thread split — all
+        asyncio/in-memory reads happen here, before the thread hop.
+
+        Called from BOTH run-loop rest branches (idle + busy-wait) so a
+        saturated unit — which steady-states in the busy-wait branch — still
+        heartbeats.  (Fail-open guard added in task 2395 step-10.)
+        """
+        unit = os.environ.get('ORCH_UNIT', '')
+        merge_idle = self._merge_pipeline_idle()
+        queue_empty = self._merge_queue.empty()
+        depth = (
+            0 if self._merge_worker is None
+            else int(self._merge_worker.snapshot().get('depth', 0))
+        )
+        ts_epoch = time.time()
+        payload = build_heartbeat_payload(
+            unit=unit,
+            merge_idle=merge_idle,
+            depth=depth,
+            queue_empty=queue_empty,
+            ts_epoch=ts_epoch,
+        )
+        await asyncio.to_thread(write_heartbeat, resolve_fleet_dir(), unit, payload)
 
     def _build_task_status_lookup(self) -> Callable[[str], Awaitable[str | None]]:
         """Return an async callable (task_id) -> str|None backed by the scheduler.
