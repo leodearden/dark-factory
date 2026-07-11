@@ -249,3 +249,64 @@ class TestWriteDiscipline:
         assert new_or_modified == {'cockpit-ui.json'}, (
             f'expected only cockpit-ui.json as a new path, got {new_or_modified}'
         )
+
+
+class TestDecisionQueueRender:
+    @pytest.mark.timeout(10)
+    async def test_open_decisions_and_awaiting_sessions_render_score_ordered(self, tmp_path):
+        """The DecisionQueue widget renders every open decision + awaiting-input
+        session (never a plain running session), rows keyed stably by
+        decision/session identity, with the higher-scored item ranked above
+        the lower one (PRD §9 C5b: rows `[score][age][project#task][question]`).
+        """
+        from cockpit.app import CockpitApp
+        from cockpit.backends import FakeBackend
+        from cockpit.panes.decision_queue import DecisionQueue
+        from textual.widgets.data_table import RowDoesNotExist
+
+        running = _make_record(session_slug='running-1', status=sr.Status.RUNNING)
+        awaiting = _make_record(
+            session_slug='awaiting-1',
+            status=sr.Status.AWAITING_INPUT,
+            question=sr.Question(text='Which port?', asked_at='2026-07-07T00:00:00+00:00'),
+        )
+        for r in (running, awaiting):
+            sr.write_record(r, root=tmp_path)
+
+        low = sr.DecisionRecord(
+            id='dec-low',
+            project='df',
+            text='Low priority question?',
+            filed_at='2026-07-07T00:00:00+00:00',
+            manual_boost=0,
+        )
+        high = sr.DecisionRecord(
+            id='dec-high',
+            project='df',
+            text='High priority question?',
+            filed_at='2026-07-07T00:00:00+00:00',
+            manual_boost=5,
+        )
+        for d in (low, high):
+            assert sr.write_decision(d, root=tmp_path)
+
+        app = CockpitApp(fleet_root=tmp_path, backend=FakeBackend(), poll_interval=0.05)
+        async with app.run_test() as pilot:
+            await pilot.pause()
+
+            queue = app.query_one(DecisionQueue)
+            assert queue.row_count == 3
+
+            # rows keyed stably by decision/session identity
+            assert queue.get_row('decision:dec-low')
+            assert queue.get_row('decision:dec-high')
+            assert queue.get_row('session:awaiting-1')
+
+            # the plain running session never appears in the queue
+            with pytest.raises(RowDoesNotExist):
+                queue.get_row('session:running-1')
+
+            # the higher-scored item (manual_boost=5) ranks above the lower one
+            high_index = queue.get_row_index('decision:dec-high')
+            low_index = queue.get_row_index('decision:dec-low')
+            assert high_index < low_index
