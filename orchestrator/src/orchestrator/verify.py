@@ -2699,7 +2699,7 @@ def _resolve_verify_env(
     config: OrchestratorConfig,
     module_config: ModuleConfig | None,
     *,
-    role: Literal['merge', 'task'] = 'task',
+    role: Literal['merge', 'task', 'background'] = 'task',
 ) -> dict[str, str]:
     """Return the effective env injected into verify commands.
 
@@ -2921,7 +2921,7 @@ async def run_verification(
     attempt_id: int | None = None,
     task_id: str | None = None,
     archive_root: Path | None = None,
-    role: Literal['merge', 'task'] = 'task',
+    role: Literal['merge', 'task', 'background'] = 'task',
 ) -> VerifyResult:
     """Run test suite, linter, and type checker. Return structured result.
 
@@ -3440,12 +3440,21 @@ async def run_full_verification(
     config: OrchestratorConfig,
     *,
     force_rediscover: bool = False,
+    role: Literal['merge', 'task', 'background'] = 'task',
 ) -> VerifyResult:
     """Run verification for ALL subprojects against the project root.
 
     Unlike run_scoped_verification, this runs full (unscoped) test suites
     for every subproject that has an orchestrator.yaml. Used by review
     checkpoints to check integration health across the whole codebase.
+
+    *role* is threaded to every internal :func:`run_verification` call
+    (both the per-subproject fan-out and the no-subproject global-fallback
+    branch).  Defaults to ``'task'``, which keeps the primary production
+    caller ``review_checkpoint.py`` (and every other existing caller)
+    byte-identical.  ``run_main_tip_sweep`` passes ``role='background'`` so
+    the sweep's fan-out acquires the background admission slot and the
+    nice-19/ionice-idle tier instead.
 
     Discovery reuse: ``config._module_configs`` uses a sentinel of ``None`` to
     mean "discovery never ran".  When it holds any dict (including ``{}``,
@@ -3480,14 +3489,14 @@ async def run_full_verification(
         module_configs = _discover_module_configs(project_root)
     if not module_configs:
         logger.info('Full verification: no subproject configs — using global')
-        return await run_verification(project_root, config)
+        return await run_verification(project_root, config, role=role)
 
     logger.info(
         'Full verification: running %d subprojects in parallel',
         len(module_configs),
     )
     results = await asyncio.gather(
-        *(run_verification(project_root, config, mc) for mc in module_configs.values())
+        *(run_verification(project_root, config, mc, role=role) for mc in module_configs.values())
     )
     return _aggregate_results(list(results))
 
