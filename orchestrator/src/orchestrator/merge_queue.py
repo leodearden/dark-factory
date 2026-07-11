@@ -37,7 +37,11 @@ from orchestrator.git_ops import (
     _run,
 )
 from orchestrator.landed_outbox import LandedOutbox, LandedRow, MergeProvenance
-from orchestrator.merge_disposition import MergeFailureDisposition, SkewEvidence
+from orchestrator.merge_disposition import (
+    MergeFailureDisposition,
+    SkewEvidence,
+    classify_merge_failure_disposition,
+)
 from orchestrator.merge_drift import (  # noqa: F401  re-export shim
     _maybe_run_drift_check,
     _run_drift_check,
@@ -839,6 +843,50 @@ def _render_skew_surfaces(
         'failing_tests': tests,
     }
     return reason_suffix, failure_diagnostic
+
+
+async def _classify_disposition_for_outcome(
+    verify: VerifyResult,
+    *,
+    req: MergeRequest,
+    merge_base_sha: str,
+    main_sha: str,
+    event_store: EventStore | None,
+) -> tuple[MergeFailureDisposition, dict[str, str] | None, str]:
+    """Classify a non-preexisting merge-verify failure and render its I4
+    surfaces (task 2383 β).
+
+    Thin async wrapper: calls ``classify_merge_failure_disposition`` (with
+    ``preexisting=False`` — I1: this is only ever reached on the non-
+    preexisting bucket) and threads the result through
+    ``_render_skew_surfaces``.
+
+    Belt-and-suspenders fail-open (I3): any exception — including one raised
+    by the classifier itself, atop its own internal fail-open — is caught
+    here, logged at WARNING, and degrades to ``(INDETERMINATE, None, '')``
+    so the caller's outcome is never left half-attached.
+    """
+    try:
+        disposition, evidence = await classify_merge_failure_disposition(
+            verify_result=verify,
+            branch=req.branch,
+            merge_base_sha=merge_base_sha,
+            main_sha=main_sha,
+            preexisting=False,
+            task_id=req.task_id,
+            repo_root=req.config.project_root,
+            event_store=event_store,
+        )
+        reason_suffix, failure_diagnostic = _render_skew_surfaces(disposition, evidence)
+        return disposition, failure_diagnostic, reason_suffix
+    except Exception:
+        logger.warning(
+            'Task %s: _classify_disposition_for_outcome failed; degrading to '
+            'INDETERMINATE (fail-open, I3)',
+            req.task_id,
+            exc_info=True,
+        )
+        return MergeFailureDisposition.INDETERMINATE, None, ''
 
 
 # Sentinel task_id prefix for a laptop-side flock-worktree-contention alarm
