@@ -508,6 +508,26 @@ resolve_detached() {
 # launcher_pid) is long gone. The authoritative join is the child's own C2
 # SessionStart-hook-written record plus its result.md (Attention Rail T5),
 # not this pid-keyed record.
+#
+# KNOWN LEAK (deliberate -- same shape as the mac-terminal tmpscript leak
+# further below): $inner's EXIT trap (see the `inner=` assignment above)
+# still writes `${ec:-$?}` to $sentinel whenever the detached child
+# eventually exits, but by then this script has long since returned via the
+# `exit 0` below. finish() and finish_failed_to_start() are the only two
+# removers of $sentinel, and sibling mode reaches neither, so one stale
+# "*.done" file per sibling spawn accumulates in TMPDIR. Not worth chasing
+# for a few stray bytes in TMPDIR -- reclaimed by normal OS tmp-dir cleanup,
+# same as the mac-terminal tmpscript leak.
+#
+# KNOWN LIMITATION (started-verification watchdog does not apply here): the
+# _started_watchdog background job (forked below, before the emulator case
+# dispatch) is still forked in sibling mode, but the `exit 0` below runs
+# this script's EXIT trap (_cleanup) immediately, which kills watchdog_pid
+# before it can ever poll long enough to flag failed-to-start. Attention
+# Rail T4 therefore does NOT protect sibling spawns: a sibling child that
+# never starts simply leaves its LAUNCHING/RUNNING record to be silently
+# reclaimed by the normal stale-pid reaper, not marked failed-to-start. Do
+# not assume the watchdog is protecting this path -- it isn't.
 resolve_sibling() {
   if [ -n "$SESSION_RECORD_DIR" ] && command -v python3 >/dev/null 2>&1; then
     python3 "$SESSION_REGISTRY_PY" refresh --record "$SESSION_RECORD_DIR" --status running || true
@@ -559,7 +579,10 @@ fi
 # _cleanup + trap installed earlier (right after the mktemp calls near the
 # top of the script), so spawn_ref can never leak -- including on the
 # `exit 126` (no emulator found) path just above. Only the fork itself
-# happens here, immediately before the emulator case dispatch.
+# happens here, immediately before the emulator case dispatch. Forked
+# unconditionally, including for spawn_mode=sibling -- see resolve_sibling's
+# KNOWN LIMITATION comment above for why this watchdog can never actually
+# flag failed-to-start on that path.
 watchdog_pid=""
 _started_watchdog &
 watchdog_pid=$!
