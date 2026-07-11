@@ -4853,3 +4853,74 @@ class TestAlreadyTrackedSystemicPatternHelpers:
 
         assert _significant_terms('') == set()
 
+
+# ---------------------------------------------------------------------------
+# filter_already_tracked_systemic_patterns core-drop test (task 2416, step-3)
+# ---------------------------------------------------------------------------
+
+
+class TestFilterAlreadyTrackedSystemicPatterns:
+    """Tests for async filter_already_tracked_systemic_patterns(taskmaster,
+    dark_factory_root, flags) -> list[dict] (task 2416).
+
+    Drops a systemic_pattern 'never tracked' finding when a done dark_factory
+    task's title+description already covers its distinctive key terms —
+    hardening against the e61b38f9/1938 false-positive incident (a finding
+    claiming the 'diff project_status_correction cache vs live get_statuses
+    every cycle' idea was never tracked, despite dark_factory task 1938
+    (done, merged 2026-07-01) already implementing it).
+
+    RED until step-4 adds filter_already_tracked_systemic_patterns to
+    flag_dedup.py.
+    """
+
+    def _make_never_tracked_flag(self) -> dict:
+        return {
+            'task_id': None,
+            'category': 'systemic_pattern',
+            'flag_type': 'systemic_pattern',
+            'description': (
+                'This systemic pattern was never converted to a tracked task: diff '
+                'the project_status_correction cache against live get_statuses every '
+                'cycle to catch drift.'
+            ),
+            'suggested_action': (
+                'File a task to diff the cache against live status each cycle.'
+            ),
+        }
+
+    @pytest.mark.asyncio
+    async def test_drop_when_done_task_already_implements_the_idea(self):
+        """Core e61b38f9/1938 scenario: DROP when a done task covers the idea."""
+        from fused_memory.reconciliation.flag_dedup import (
+            filter_already_tracked_systemic_patterns,
+        )
+
+        flag = self._make_never_tracked_flag()
+        taskmaster = AsyncMock()
+        taskmaster.get_tasks = AsyncMock(return_value={
+            'tasks': [
+                {
+                    'id': '1938',
+                    'status': 'done',
+                    'title': (
+                        'Diff project_status_correction cache against live '
+                        'get_statuses every cycle'
+                    ),
+                    'description': (
+                        'Implemented a periodic diff of the cached '
+                        'project_status_correction value against a live '
+                        'get_statuses call each cycle to catch drift and correct '
+                        'stale cache entries before they propagate.'
+                    ),
+                },
+            ],
+        })
+
+        result = await filter_already_tracked_systemic_patterns(taskmaster, '/df', [flag])
+
+        assert result == [], (
+            'systemic_pattern never-tracked finding must be DROPPED when done '
+            f'dark_factory task 1938 already covers the idea; got {result!r}'
+        )
+
