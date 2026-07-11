@@ -302,6 +302,13 @@ class TestCheckTextForScope:
         assert 'deploy/' not in registry.all_prefixes()
         assert 'memory/' not in registry.prefix_to_project
         assert 'deploy/' not in registry.prefix_to_project
+        # Deliberate coverage-loss tradeoff (task 2434): the CERTAIN
+        # files-check (project_for_path / check_files_for_scope) also no
+        # longer classifies concrete files under these generic dirs as
+        # owned by any project. Pin that here so it's an explicit, intended
+        # behavior rather than a silent gap.
+        assert registry.project_for_path('memory/foo.py') is None
+        assert registry.project_for_path('deploy/x.service') is None
 
     def test_prose_mention_of_memory_edges_is_ok(self, tmp_path):
         """Prose referencing 'memory/edges' (not a path) must not trigger a
