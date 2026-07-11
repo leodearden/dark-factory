@@ -641,10 +641,19 @@ class McpLifecycle:
             config_path = (self.project_root / self.config.config_path).resolve()
             cmd = [*cmd, '--config', str(config_path)]
 
+            # Redirect the managed fused-memory's runtime queue/reconciliation
+            # SQLite state out of this (watched) project's tracked tree — task
+            # 2439. env.setdefault() honors an operator-preset override.
+            q_dir, r_dir = managed_runtime_data_dirs(self.config.project_id)
+            env = dict(os.environ)
+            env.setdefault('QUEUE_DATA_DIR', str(q_dir))
+            env.setdefault('RECONCILIATION_DATA_DIR', str(r_dir))
+
             logger.info(f'Starting fused-memory HTTP server: {" ".join(cmd)}')
             self._process = await asyncio.create_subprocess_exec(
                 *cmd,
                 cwd=str(self.project_root),
+                env=env,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
                 start_new_session=True,
