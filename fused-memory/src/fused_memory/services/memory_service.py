@@ -2541,74 +2541,99 @@ class MemoryService:
         omitting edges found via search(); it became dark_factory task 2404,
         cancelled 2026-07-09 once the architect confirmed it was expected
         topological-vs-semantic divergence, not a bug.)
+
+        Degraded fallback: if an embedding-provider quota/rate-limit error
+        (openai.RateLimitError or a duck-typed equivalent — see
+        _is_quota_exhaustion_error) is raised by either the exact-match or
+        fuzzy-fallback Graphiti calls, this returns the degraded superset
+        dict {'nodes': [], 'edges': [], 'degraded': True, 'failed_stores':
+        ['graphiti']} instead of raising — mirroring search()'s
+        degraded/failed_stores contract. All other errors (including
+        asyncio.CancelledError, a BaseException that never reaches this
+        except clause) propagate unchanged.
         """
-        # See "Performance trade-off" above: this call is intentionally serial —
-        # its 0/1/many result decides whether the fuzzy gather runs at all.
-        exact = await self.graphiti.get_nodes_by_exact_name(name, group_id=project_id)
-        if exact:
-            uuids = [uuid for n in exact if (uuid := n.get('uuid'))]
-            # Two-tier check via gather_or_raise (fused_memory.utils.async_utils),
-            # mirroring the fuzzy fallback below: return_exceptions=True ensures a
-            # transient failure in one concurrent get_valid_edges_for_node call
-            # cannot leave sibling coroutines running as orphaned background
-            # tasks. Pass 1 re-raises structured-cancellation signals; Pass 2
-            # logs every exception, then raises the first (get_entity's local
-            # Pass-2 semantics — see async_utils docstring).
-            edge_results = await gather_or_raise(
-                (self.graphiti.get_valid_edges_for_node(u, group_id=project_id) for u in uuids),
-                label='get_entity: get_valid_edges_for_node failed',
+        try:
+            # See "Performance trade-off" above: this call is intentionally serial —
+            # its 0/1/many result decides whether the fuzzy gather runs at all.
+            exact = await self.graphiti.get_nodes_by_exact_name(name, group_id=project_id)
+            if exact:
+                uuids = [uuid for n in exact if (uuid := n.get('uuid'))]
+                # Two-tier check via gather_or_raise (fused_memory.utils.async_utils),
+                # mirroring the fuzzy fallback below: return_exceptions=True ensures a
+                # transient failure in one concurrent get_valid_edges_for_node call
+                # cannot leave sibling coroutines running as orphaned background
+                # tasks. Pass 1 re-raises structured-cancellation signals; Pass 2
+                # logs every exception, then raises the first (get_entity's local
+                # Pass-2 semantics — see async_utils docstring).
+                edge_results = await gather_or_raise(
+                    (self.graphiti.get_valid_edges_for_node(u, group_id=project_id) for u in uuids),
+                    label='get_entity: get_valid_edges_for_node failed',
+                    logger=logger,
+                )
+                edge_lists = cast(list, edge_results)
+                # Duplicate-name matches each contribute their own edges; dedup by
+                # edge uuid so `edges` stays consistent with the (possibly
+                # multi-node) `nodes` array instead of double-counting shared edges.
+                seen: set = set()
+                edges = []
+                for edge_list in edge_lists:
+                    for e in edge_list:
+                        edge_uuid = e.get('uuid')
+                        if edge_uuid is not None:
+                            if edge_uuid in seen:
+                                continue
+                            seen.add(edge_uuid)
+                        edges.append(e)
+                node_data = [_node_to_dict(n) for n in exact]
+                edge_data = [_edge_to_dict(e) for e in edges]
+                return {'nodes': node_data, 'edges': edge_data}
+
+            # Two-tier check via gather_or_raise (fused_memory.utils.async_utils).
+            # Both coroutines settle before either is inspected (no orphans).
+            # Pass 1: re-raises structured-cancellation signals (CancelledError,
+            #   KeyboardInterrupt, SystemExit) before any per-call logging —
+            #   cancellation takes precedence over application-level failures
+            #   regardless of position in the results list.
+            # Pass 2: logs each captured Exception and raises the first — these
+            #   are application-level failures from the Graphiti backend.
+            results = await gather_or_raise(
+                (
+                    self.graphiti.search_nodes(
+                        query=name,
+                        group_ids=[project_id],
+                        max_nodes=5,
+                    ),
+                    self.graphiti.search(
+                        query=name,
+                        group_ids=[project_id],
+                        num_results=edge_limit,
+                    ),
+                ),
+                label='get_entity: Graphiti call failed',
                 logger=logger,
             )
-            edge_lists = cast(list, edge_results)
-            # Duplicate-name matches each contribute their own edges; dedup by
-            # edge uuid so `edges` stays consistent with the (possibly
-            # multi-node) `nodes` array instead of double-counting shared edges.
-            seen: set = set()
-            edges = []
-            for edge_list in edge_lists:
-                for e in edge_list:
-                    edge_uuid = e.get('uuid')
-                    if edge_uuid is not None:
-                        if edge_uuid in seen:
-                            continue
-                        seen.add(edge_uuid)
-                    edges.append(e)
-            node_data = [_node_to_dict(n) for n in exact]
+
+            nodes = cast(list, results[0])
+            edges = cast(list, results[1])
+
+            node_data = [_node_to_dict(n) for n in nodes]
             edge_data = [_edge_to_dict(e) for e in edges]
+
             return {'nodes': node_data, 'edges': edge_data}
-
-        # Two-tier check via gather_or_raise (fused_memory.utils.async_utils).
-        # Both coroutines settle before either is inspected (no orphans).
-        # Pass 1: re-raises structured-cancellation signals (CancelledError,
-        #   KeyboardInterrupt, SystemExit) before any per-call logging —
-        #   cancellation takes precedence over application-level failures
-        #   regardless of position in the results list.
-        # Pass 2: logs each captured Exception and raises the first — these
-        #   are application-level failures from the Graphiti backend.
-        results = await gather_or_raise(
-            (
-                self.graphiti.search_nodes(
-                    query=name,
-                    group_ids=[project_id],
-                    max_nodes=5,
-                ),
-                self.graphiti.search(
-                    query=name,
-                    group_ids=[project_id],
-                    num_results=edge_limit,
-                ),
-            ),
-            label='get_entity: Graphiti call failed',
-            logger=logger,
-        )
-
-        nodes = cast(list, results[0])
-        edges = cast(list, results[1])
-
-        node_data = [_node_to_dict(n) for n in nodes]
-        edge_data = [_edge_to_dict(e) for e in edges]
-
-        return {'nodes': node_data, 'edges': edge_data}
+        except Exception as exc:
+            if not _is_quota_exhaustion_error(exc):
+                raise
+            logger.warning(
+                'get_entity degraded: embedding-provider quota/rate-limit error for %r: %s',
+                name,
+                exc,
+            )
+            return {
+                'nodes': [],
+                'edges': [],
+                'degraded': True,
+                'failed_stores': [SourceStore.graphiti.value],
+            }
 
     # ------------------------------------------------------------------
     # Read: get_edge (thin wrapper for cite_edge — task β)
