@@ -871,6 +871,36 @@ class TestSpawnBar:
         assert spawned[0] == build_spawn_argv(spawn_script, project_root, expected_title, prompt)
 
 
+class TestSpawnTree:
+    @pytest.mark.timeout(10)
+    async def test_toggle_key_pushes_tree_screen_with_structure(self, tmp_path):
+        """'t' (Fleet Cockpit C9a spawn-tree toggle) pushes a SpawnTreeScreen
+        rendering the parent_session_id parent→child session-tree structure."""
+        from cockpit.app import CockpitApp
+        from cockpit.panes.spawn_tree import SpawnTree, SpawnTreeScreen
+
+        parent = _make_record(session_slug='parent-1', parent_session_id=None)
+        child = _make_record(session_slug='child-1', parent_session_id='parent-1')
+        for r in (parent, child):
+            sr.write_record(r, root=tmp_path)
+
+        app = CockpitApp(fleet_root=tmp_path, poll_interval=0.05)
+        async with app.run_test() as pilot:
+            await pilot.pause()
+
+            await pilot.press('t')
+            await pilot.pause()
+
+            assert isinstance(app.screen, SpawnTreeScreen)
+            tree = app.screen.query_one(SpawnTree)
+            top_level_slugs = {node.data for node in tree.root.children}
+            assert 'parent-1' in top_level_slugs
+
+            parent_node = next(node for node in tree.root.children if node.data == 'parent-1')
+            child_slugs = {node.data for node in parent_node.children}
+            assert child_slugs == {'child-1'}
+
+
 class TestRefreshWriteDiscipline:
     @pytest.mark.timeout(10)
     async def test_refresh_path_writes_nothing_under_sessions_or_decisions(self, tmp_path):
