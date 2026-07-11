@@ -4055,8 +4055,12 @@ async def test_update_task_unknown_key_patch_tolerates_untouched_invalid_done_pr
         # SECONDARY guard rail (green before and after — regression guard,
         # not the RED signal): a patch that ITSELF touches done_provenance
         # with a still-invalid value, alongside an unknown key, is still
-        # rejected.
-        with pytest.raises(ValidationError):
+        # rejected. Per task 2201's unconditional write-authority floor
+        # (see test_update_task_tolerates_untouched_invalid_done_provenance
+        # part (b)), ANY incoming metadata containing a done_provenance key
+        # is rejected with DoneProvenanceWriteAuthorityError before schema
+        # validation ever runs — so this is not a ValidationError.
+        with pytest.raises(DoneProvenanceWriteAuthorityError):
             await backend.update_task(
                 dto['id'], project_root=project_root,
                 metadata=json.dumps({
