@@ -1571,6 +1571,80 @@ def confirm_task_absent(get_task_result: object) -> bool:
 
 
 # --------------------------------------------------------------------------- #
+# Already-tracked systemic-pattern guard (task-2416)
+# --------------------------------------------------------------------------- #
+
+#: Fixed lexicon of phrases that assert an idea/pattern was never converted
+#: into a tracked task.  Case-insensitive substring match, mirroring
+#: _CORRECTION_LANGUAGE_SUBSTRINGS' fixed-lexicon approach.
+_NEVER_TRACKED_PHRASES: frozenset[str] = frozenset({
+    'never converted to a tracked task',
+    'was never converted to a task',
+    'never tracked',
+    'never filed as a task',
+    'no tracked task',
+})
+
+#: Small English + domain stopword set for _significant_terms.  The domain
+#: words (e.g. 'never', 'tracked', 'task', 'idea') are deliberately excluded
+#: from the key-term set because they are boilerplate from the never-tracked
+#: assertion wrapper itself, not part of the distinctive idea a candidate
+#: finding is about — keeping them would dilute coverage matching against an
+#: unrelated done task that happens to also mention "task".
+_STOPWORDS: frozenset[str] = frozenset({
+    # Common English stopwords.
+    'the', 'a', 'an', 'and', 'or', 'of', 'to', 'in', 'on', 'at', 'for',
+    'is', 'are', 'was', 'were', 'be', 'been', 'being', 'this', 'that',
+    'these', 'those', 'with', 'as', 'by', 'from', 'it', 'its', 'into',
+    'over', 'than', 'then', 'not', 'no', 'but', 'if', 'so', 'do', 'does',
+    'has', 'have', 'had', 'will', 'would', 'should', 'could', 'can', 'may',
+    'about', 'each', 'every', 'any', 'all', 'more', 'most', 'such', 'via',
+    'once', 'again', 'also', 'out', 'up', 'down',
+    # Domain / boilerplate words from the never-tracked assertion wrapper.
+    'never', 'tracked', 'track', 'task', 'tasks', 'converted', 'convert',
+    'idea', 'pattern', 'systemic', 'filed', 'file', 'finding', 'findings',
+})
+
+#: Splits on runs of non-alphanumeric characters — underscore and punctuation
+#: are both treated as separators so identifier-style terms like
+#: 'project_status_correction' or 'get_statuses' split into their component
+#: words, which is what lets them overlap with a done task's prose title/
+#: description.
+_TERM_SPLIT_RE: re.Pattern[str] = re.compile(r'[^a-z0-9]+')
+
+
+def _asserts_never_tracked(text: str) -> bool:
+    """Return True iff *text* asserts that an idea/pattern was never tracked as a task.
+
+    Case-insensitive substring match against the fixed lexicon
+    :data:`_NEVER_TRACKED_PHRASES`, mirroring :func:`_has_correction_language`'s
+    fixed-lexicon substring approach.
+
+    Pure, sync, no I/O.
+    """
+    if not text:
+        return False
+    lowered = text.lower()
+    return any(phrase in lowered for phrase in _NEVER_TRACKED_PHRASES)
+
+
+def _significant_terms(text: str) -> set[str]:
+    """Extract the distinctive lowercase key terms from *text*.
+
+    Lowercases *text*, splits on runs of non-alphanumeric characters (see
+    :data:`_TERM_SPLIT_RE`), then drops stopwords (:data:`_STOPWORDS`) and
+    tokens shorter than 3 characters.  Returns a deduped set — callers only
+    ever measure set overlap (coverage), never sequence.
+
+    Pure, sync, no I/O.
+    """
+    if not text:
+        return set()
+    tokens = _TERM_SPLIT_RE.split(text.lower())
+    return {t for t in tokens if len(t) >= 3 and t not in _STOPWORDS}
+
+
+# --------------------------------------------------------------------------- #
 # Blocked-snapshot finding filter for Stage 3 (task-1840)
 # --------------------------------------------------------------------------- #
 
