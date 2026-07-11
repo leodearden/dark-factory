@@ -35,7 +35,11 @@ if str(_TESTS_DIR) not in sys.path:
 # `_DEBUG_ASSERTS = os.environ.get(...)` seed picks it up.
 os.environ.setdefault('ORCH_DEBUG_ASSERTS', '1')
 
-from _orch_helpers import drain_async_mock_coroutines, pydantic_spec  # noqa: E402
+from _orch_helpers import (  # noqa: E402
+    drain_async_mock_coroutines,
+    pydantic_spec,
+    reap_leaked_aiosqlite_connections,
+)
 from shared.config_models import UsageCapConfig  # noqa: E402
 
 from orchestrator import merge_queue  # noqa: E402
@@ -102,6 +106,35 @@ async def _reap_leaked_merge_workers():
                 await asyncio.wait_for(
                     asyncio.gather(task, return_exceptions=True), timeout=15.0
                 )
+
+
+@pytest_asyncio.fixture(autouse=True)
+async def _reap_leaked_aiosqlite_connections():
+    """Close any leaked aiosqlite connection before the per-test event loop closes.
+
+    Task 2413 — fix for the scheduler-test xdist flake. ``aiosqlite.Connection``
+    runs one background worker ``Thread`` per connection. If a test leaks a
+    live connection (never calls ``await conn.close()``), that thread outlives
+    the test: pytest-asyncio then closes the per-test event loop while the
+    thread is still alive, and the next time the thread tries to resolve a
+    future via ``future.get_loop().call_soon_threadsafe(...)`` it raises
+    ``RuntimeError: Event loop is closed`` from inside the thread. pytest's
+    threadexception plugin surfaces this as a
+    ``PytestUnhandledThreadExceptionWarning`` (promoted to a hard error by this
+    project's ``filterwarnings``) and attributes it to whatever unrelated test
+    happens to be running when the thread fires — under ``-n auto`` on an
+    oversubscribed host that is reliably a *different*, innocent test.
+
+    Reaping here — in the test's own loop, before it is closed — closes and
+    joins any live aiosqlite connection so its worker thread is guaranteed
+    dead before this fixture (and therefore the test) returns; it can then
+    never touch a closed loop. Best-effort and bounded (see
+    ``reap_leaked_aiosqlite_connections`` in ``_orch_helpers.py``): it never
+    fails a test and is a cheap no-op for the (vast majority of) tests that
+    leak no connection.
+    """
+    yield
+    await reap_leaked_aiosqlite_connections()
 
 
 @pytest.fixture(scope="session")
