@@ -100,6 +100,13 @@ MAX_RECONCILE_FAILURES: int = 5
 # inside the declared module scope without touching config.py / defaults.yaml.
 _REBLOCK_GUARD_THRESHOLD: int = 3
 
+# Fixed sentinel task_id for the dirty-project-root-at-startup born-at-L2
+# escalation (task 2380). Not a real task — _on_escalation only bumps a
+# counter and wakes a workflow waiting on this exact task_id, and nothing
+# waits on this sentinel, so dispatch is never blocked. A stable sentinel
+# also gives get_by_task(..., level=2) a durable dedup key across restarts.
+_DIRTY_TREE_ESCALATION_SENTINEL: str = 'dirty-project-root-startup'
+
 # Statuses swept by _reconcile_stranded_in_progress for stranded-task recovery.
 # Intentionally EXCLUDES:
 #   'done' / 'cancelled'   — terminal-by-decision; nothing to recover
@@ -5276,6 +5283,63 @@ Output JSON matching the schema. Every task must appear in the output.
         self._file_scheduler_pause_escalation(
             f'(restored from prior run) {self._restored_pause_reason}'
         )
+
+    async def _file_dirty_tree_escalation(self, force_dirty_start: bool) -> None:
+        """File (or refresh) the born-at-L2 escalation for a dirty project_root at startup.
+
+        Deferred from the old top-of-run() guard (task 2380): the escalation
+        queue only exists once ``_start_escalation_server`` has run, so this
+        is called after startup has settled rather than at the original
+        pre-server guard site.  RCA 2026-07-08: refusing to start on a dirty
+        tree composed with systemd Restart=on-failure + the watchdog revive
+        loop into a silent multi-hour crash-loop (459 aborted runs, nothing
+        escalated because the process died before it could) — starting
+        anyway and escalating loudly replaces that refusal.
+
+        None-safe: a no-op when the tree is clean, when ``force_dirty_start``
+        is set (silent override — no L2 filed), or when ``_escalation_queue``
+        is None (bare-Harness unit tests, or the escalation package missing).
+        The orchestrator never auto-commits/stashes/cleans the dirty WIP —
+        this only reads and escalates.
+        """
+        dirty = await self.git_ops.has_dirty_working_tree()
+        if not dirty:
+            return
+        logger.warning(
+            'project_root has uncommitted tracked changes at startup:\n%s',
+            dirty,
+        )
+        if force_dirty_start:
+            logger.warning(
+                '--force-dirty-start set — starting dirty without filing a '
+                'cleanup escalation (silent override)'
+            )
+            return
+        if self._escalation_queue is None:
+            return
+
+        from escalation.models import Escalation
+
+        summary = 'dirty project_root at startup - commit or stash WIP'
+        detail = (
+            f'project_root has uncommitted tracked changes at startup:\n{dirty}\n\n'
+            'The orchestrator started anyway (task 2380: dirty trees no '
+            'longer block startup) but this WIP should be committed or '
+            'stashed — an uncommitted tree left indefinitely risks being '
+            'clobbered by unrelated operations run against project_root.'
+        )
+        esc = Escalation(
+            id=self._escalation_queue.make_id(_DIRTY_TREE_ESCALATION_SENTINEL),
+            task_id=_DIRTY_TREE_ESCALATION_SENTINEL,
+            agent_role='orchestrator-dirty-tree-guard',
+            severity='critical',
+            level=2,
+            category='cleanup_needed',
+            summary=summary,
+            detail=detail,
+            suggested_action='Commit or stash the dirty files listed above in project_root.',
+        )
+        self._escalation_queue.submit(esc)
 
     def _escalate_reconcile_skip(
         self,
