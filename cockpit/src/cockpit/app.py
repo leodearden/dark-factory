@@ -49,10 +49,12 @@ from cockpit.panes.decision_queue import (
     QueueItem,
     known_project_roots,
     order_queue,
+    resolve_target,
 )
 from cockpit.panes.detail_pane import DetailPane
 from cockpit.panes.session_table import SessionTable, order_sessions
 from cockpit.panes.spawn_bar import SpawnScreen, build_spawn_argv
+from cockpit.panes.spawn_tree import SpawnTreeScreen
 from cockpit.priority import Priorities, load_priorities
 from cockpit.registry_reader import build_snapshot, scan_sessions, snapshot_changed
 from cockpit.ui_config import CockpitUIConfig, load_ui_config, save_ui_config
@@ -148,6 +150,7 @@ class CockpitApp(App):
         Binding('x', 'drop', 'Drop', show=False),
         Binding('d', 'defer', 'Defer', show=False),
         Binding('n', 'new_session', 'New session', show=False),
+        Binding('t', 'toggle_tree', 'Spawn tree', show=False),
         # All ten digits are bound, but a digit's SCORE effect saturates
         # once it exceeds the active Priorities.manual_boost.max (default 5
         # -- see priority.py's score(), which clamps manual_boost into
@@ -540,6 +543,70 @@ class CockpitApp(App):
         title = f'{role}:{Path(project_root).name}'
         argv = build_spawn_argv(script, project_root, title, prompt)
         self._spawn_runner(argv)
+
+    def action_toggle_tree(self) -> None:
+        """'t' -- open the spawn-tree modal (Fleet Cockpit C9a, PRD §9).
+
+        Snapshots self._records (the most recently scanned/ordered set)
+        into a fresh SpawnTreeScreen, which renders it as a point-in-time
+        parent->child forest -- see cockpit.panes.spawn_tree. That SAME
+        snapshot -- a local `records`, not the `self._records` attribute --
+        is also closed over for the screen's on_focus callback, so a later
+        Enter always resolves the selected slug against the exact list the
+        operator is looking at, never whatever list self._records has been
+        reassigned to by an intervening poll tick (see refresh_registry,
+        which replaces self._records wholesale on every changed scan) --
+        see _focus_slug's docstring for why that distinction matters. The
+        pop branch below guards against ever stacking a second
+        SpawnTreeScreen on top of one already open; it is defensive, not
+        how an interactive 't' keypress actually closes the tree though --
+        Textual's ModalScreen truncates the non-priority key-binding chain
+        at itself, so this app-level 't' binding is never consulted while
+        a SpawnTreeScreen is on top of the stack. SpawnTreeScreen therefore
+        binds 't' (and Escape) itself, straight to its own dismiss()-based
+        action_cancel -- see SpawnTreeScreen.action_cancel for the full
+        explanation.
+        """
+        if isinstance(self.screen, SpawnTreeScreen):
+            self.pop_screen()
+            return
+        records = self._records
+        self.push_screen(SpawnTreeScreen(records, lambda slug: self._focus_slug(slug, records)))
+
+    def _focus_slug(self, slug: str, records: list[SessionRecord]) -> None:
+        """Resolve *slug* within *records* to a focus target and route it to a backend (Fleet Cockpit C9a).
+
+        *records* is the exact snapshot the open SpawnTreeScreen was built
+        from -- action_toggle_tree closes over it and passes it back in on
+        every call, rather than this method reading self._records fresh.
+        self._records is reassigned wholesale (not mutated) by every
+        changed refresh_registry tick, so resolving against the live
+        attribute could silently miss a slug that's still visible in the
+        (unchanged) open tree if a poll tick lands between opening the tree
+        and pressing Enter -- fail-soft in effect, but a surprising one,
+        since the operator selected a row they could plainly see. Reusing
+        the same snapshot the tree renders makes Enter's behavior match
+        what's on screen exactly.
+
+        Reuses decision_queue.resolve_target, exactly mirroring
+        action_focus_selected's own resolve-then-route step, so the tree's
+        Enter path and the decision queue's Enter path share one focus
+        discipline. resolve_target's sessions_by_slug param is only ever
+        read for a DecisionRecord (a SessionRecord resolves straight from
+        its own .display -- see resolve_target) -- *record* here is always
+        a SessionRecord, so an empty mapping is passed rather than
+        rebuilding one from *records* on every keypress. Fail-soft (PRD
+        §2): a slug with no matching record (a gone/stale snapshot entry)
+        or a record with no resolvable target (no Display) both no-op
+        rather than raising.
+        """
+        record = next((r for r in records if r.session_slug == slug), None)
+        if record is None:
+            return
+        target = resolve_target(record, {})
+        if target is None:
+            return
+        self._backend_for(target.kind).focus(target)
 
     def _sync_detail_pane(self, slug: str | None) -> None:
         """Render *slug*'s record (or the empty placeholder) into the detail pane.
