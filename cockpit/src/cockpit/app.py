@@ -752,6 +752,25 @@ class CockpitApp(App):
         argv = build_spawn_argv(script, project_root, title, prompt, skip_perms=skip_perms)
         self._spawn_runner(argv)
 
+    def apply_priorities(self, new_priorities: Priorities) -> None:
+        """Apply an edited Priorities snapshot (PRD §9 C9b weight editor) -- this task's leaf signal.
+
+        Swaps self._priorities to *new_priorities*, persists it to
+        self._priorities_path via C3's save_priorities (fail-soft -- see
+        save_priorities's own docstring: a write fault is logged and
+        swallowed, never raised), then calls _rebuild_queue() immediately
+        so the DecisionQueue re-scores and re-renders against the new
+        weights right now -- exactly like a boost/drop/defer keypress,
+        never waiting for the next poll tick. The caller (eventually
+        WeightEditorScreen, via action_edit_weights) builds *new_priorities*
+        itself from the pure merge_weight_edits helper; this method never
+        parses raw edits and never touches priorities.yaml except through
+        save_priorities.
+        """
+        self._priorities = new_priorities
+        save_priorities(new_priorities, self._priorities_path)
+        self._rebuild_queue()
+
     def action_toggle_tree(self) -> None:
         """'t' -- open the spawn-tree modal (Fleet Cockpit C9a, PRD §9).
 
