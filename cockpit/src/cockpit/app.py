@@ -34,6 +34,7 @@ from orchestrator.session_registry import (
     DecisionRecord,
     DecisionState,
     SessionRecord,
+    fleet_root as resolve_fleet_root,
     list_decisions,
     set_manual_boost,
     update_decision_state,
@@ -58,7 +59,7 @@ from cockpit.panes.detail_pane import DetailPane
 from cockpit.panes.session_table import SessionTable, filter_live_sessions, order_sessions
 from cockpit.panes.spawn_bar import SpawnScreen, build_spawn_argv, default_skip_perms
 from cockpit.panes.spawn_tree import SpawnTreeScreen
-from cockpit.priority import Priorities, load_priorities
+from cockpit.priority import Priorities, load_priorities, save_priorities
 from cockpit.registry_reader import (
     SessionScanner,
     SessionScannerProtocol,
@@ -200,7 +201,10 @@ class CockpitApp(App):
         }
         self._spawn_runner = spawn_runner if spawn_runner is not None else _default_spawn_runner
         self._spawn_script = spawn_script if spawn_script is not None else _default_spawn_script()
-        self._priorities = priorities if priorities is not None else load_priorities()
+        self._priorities_path = resolve_fleet_root(self.fleet_root) / 'priorities.yaml'
+        self._priorities = (
+            priorities if priorities is not None else load_priorities(self._priorities_path)
+        )
         self._records: list[SessionRecord] = []
         self._decisions: list[DecisionRecord] = []
         self._snapshot: dict[str, tuple] = {}
