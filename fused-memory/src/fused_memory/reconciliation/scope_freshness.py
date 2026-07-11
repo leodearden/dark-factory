@@ -190,3 +190,62 @@ def build_scope_snapshot_metadata(
     if no_change:
         metadata['no_change'] = True
     return metadata
+
+
+def _extract_task_fields(resp: Any) -> tuple[str | None, str | None, str | None, dict]:
+    """Normalize a taskmaster ``get_task`` response to its four freshness fields.
+
+    Mirrors :func:`fused_memory.reconciliation.targeted._extract_task`'s
+    ``'data'``-envelope unwrap: accepts either the flat sqlite-backend shape
+    (``{'status', 'updatedAt', 'description', 'metadata', ...}``) or a
+    ``{'data': {...}}``-enveloped shape (live-Taskmaster / MCP-proxied).
+    Tolerates a non-dict *resp* (or non-dict ``metadata``) by returning
+    ``(None, None, None, {})`` / ``metadata={}`` rather than raising.  Pure,
+    sync, no I/O.
+
+    Returns:
+        ``(status, updated_at, description, metadata)``.
+    """
+    task = resp
+    if isinstance(resp, dict) and isinstance(resp.get('data'), dict):
+        task = resp['data']
+    if not isinstance(task, dict):
+        return (None, None, None, {})
+
+    metadata = task.get('metadata')
+    if not isinstance(metadata, dict):
+        metadata = {}
+    return (task.get('status'), task.get('updatedAt'), task.get('description'), metadata)
+
+
+def snapshot_is_fresh(snapshot_metadata: dict[str, Any], live_task: Any) -> bool:
+    """Return True iff *live_task* is unchanged from *snapshot_metadata*.
+
+    Requires ALL THREE of live ``status``, ``updatedAt``, and the
+    content-fingerprint of ``description`` (via
+    :func:`fused_memory.reconciliation.flag_dedup._content_fingerprint`) to
+    equal the snapshot's ``subject_status``, ``subject_updated_at``, and
+    ``subject_description_fingerprint`` respectively.  ``updatedAt`` is the
+    load-bearing signal — sqlite_task_backend always advances it on any
+    write, even a no-op — the other two are corroborating.
+
+    Fail-safe: returns False (not fresh — i.e. keep for re-investigation)
+    when *snapshot_metadata* is not a dict, or is missing any of the three
+    ``subject_*`` keys it needs to compare against.  Pure, sync, no I/O.
+    """
+    if not isinstance(snapshot_metadata, dict):
+        return False
+    required_keys = (
+        'subject_status', 'subject_updated_at', 'subject_description_fingerprint',
+    )
+    if any(key not in snapshot_metadata for key in required_keys):
+        return False
+
+    status, updated_at, description, _metadata = _extract_task_fields(live_task)
+    if status != snapshot_metadata['subject_status']:
+        return False
+    if updated_at != snapshot_metadata['subject_updated_at']:
+        return False
+    if _content_fingerprint(description or '') != snapshot_metadata['subject_description_fingerprint']:
+        return False
+    return True
