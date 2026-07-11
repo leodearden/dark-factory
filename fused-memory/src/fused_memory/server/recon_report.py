@@ -197,27 +197,12 @@ _ERR_ALREADY_COMPLETED: dict[str, str] = {
 }
 
 
-def _duplicate_finding_error(
-    existing_id: str, warnings: list[str] | None = None
-) -> dict[str, Any]:
-    """Build the duplicate_finding error dict, optionally carrying truncation
-    warnings (task-2410).
-
-    add_finding truncates description/suggested_action BEFORE the dedup
-    check runs (see its docstring), so a caller whose overlength input turns
-    out to be a duplicate must still learn its text was capped — the
-    truncated text itself is discarded (a duplicate is never stored), but
-    the warning is not.  Mirrors the success-path contract: ``'warnings'``
-    is present only when *warnings* is non-empty.
-    """
-    error: dict[str, Any] = {
+def _duplicate_finding_error(existing_id: str) -> dict[str, str]:
+    return {
         'error': 'duplicate_finding',
         'error_type': 'ReconReportDuplicateFinding',
         'existing_finding_id': existing_id,
     }
-    if warnings:
-        error['warnings'] = warnings
-    return error
 
 
 def _stat_type_mismatch_error(key: str) -> dict[str, str]:
@@ -382,16 +367,6 @@ class ReconReportState:
         the signature lookup runs (task-2318), so an under-specified re-raise
         collapses onto the canonical finding instead of allocating a distinct
         ``(task_id, None)`` row.
-
-        ``description``/``suggested_action`` are truncated to
-        ``_MAX_FINDING_TEXT_CHARS`` BEFORE dedup hashing (task-2410;
-        see :func:`_truncate_field`).  One consequence for the null-null
-        (no task_id/flag_type) path: the description-hash dedup key is
-        computed from the POST-truncation string, so two null-null findings
-        that are identical for the first ``_MAX_FINDING_TEXT_CHARS``
-        characters and differ only in the truncated-away tail collapse into
-        a single finding. This is an accepted tradeoff at today's generous
-        10_000-char cap — revisit only if the cap is ever tightened.
         """
         entry = self._resolve_entry(run_id)
         if entry is None:
@@ -453,7 +428,7 @@ class ReconReportState:
         if sig != (None, None):
             existing_id = self._run_sig_index.get(run_id, {}).get(sig)
             if existing_id is not None:
-                return _duplicate_finding_error(existing_id, warnings)
+                return _duplicate_finding_error(existing_id)
         else:
             # Blank/whitespace-only descriptions normalize to '' — skip dedup so
             # each blank informational finding allocates independently.  The empty
@@ -463,7 +438,7 @@ class ReconReportState:
                 desc_hash = _description_hash(description)
                 existing_id = self._run_desc_index.get(run_id, {}).get(desc_hash)
                 if existing_id is not None:
-                    return _duplicate_finding_error(existing_id, warnings)
+                    return _duplicate_finding_error(existing_id)
 
         finding_id = str(uuid.uuid4())
         finding = _Finding(
