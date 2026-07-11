@@ -5082,13 +5082,6 @@ class SpeculativeMergeWorker(_WipHaltMixin):
         # queue. Used by stop() to resolve Futures for requests that were
         # mid-processing when shutdown was initiated.
         self._inflight_req: MergeRequest | None = None
-        # Vestigial single-host observability fields — write-only after ε.
-        # snapshot() no longer reads these; all observability derives from
-        # self._inflight (InflightEntry.phase) and self._remerging_item.
-        # Retained to avoid a large diff; may be removed in a later cleanup.
-        self._verify_item: SpeculativeItem | None = None
-        self._verify_phase: str | None = None
-        self._verify_started_at: float | None = None
         # Remerge-window observability: set to the MergeRequest being remerged
         # so snapshot() can surface it between queue-pop and _inflight append.
         # Cleared to None immediately after _remerge() returns.
@@ -6897,8 +6890,10 @@ class SpeculativeMergeWorker(_WipHaltMixin):
 
         # 1. In-flight verify entries: iterate self._inflight head-first.
         # self._inflight is the sole source of truth for concurrent-verify state.
-        # The singular self._verify_item/_verify_phase are no longer read here
-        # (they are set but never cleared after γ, causing a stale phantom entry).
+        # The vestigial single-host _verify_item/_verify_phase fields (set but
+        # never cleared after γ, causing a stale phantom entry) were deleted by
+        # task λ (2173) — that phantom-entry class is now structurally
+        # impossible.
         # Each entry carries host (from lease.name), started_at (dispatch time ≈
         # verify start), and phase (per-entry authoritative source under multi-host).
         for _infl in self._inflight:
@@ -8105,9 +8100,9 @@ class SpeculativeMergeWorker(_WipHaltMixin):
         #    waiter has its future cancelled — excluded AND never receives
         #    set_result (so it stays cancelled, not overwritten with 'superseded').
         #  · In-flight / verifying request: lives in self._inflight_req or is
-        #    carried by a SpeculativeItem in self._verify_item — structurally
+        #    carried by an InflightEntry in self._inflight — structurally
         #    absent from self._lane_buffers, so it is excluded without any
-        #    explicit filter.  No buffer scan of _inflight_req/_verify_item is
+        #    explicit filter.  No buffer scan of _inflight_req/self._inflight is
         #    required or performed.
         candidates = [
             req for req in self._lane_buffers['normal']
@@ -10021,14 +10016,6 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                     or (req.config.git.merge_spec_warm_lane_pool and _spec_warm)
                 )
 
-            # NOTE: _verify_item/_verify_phase/_verify_started_at are vestigial
-            # fields retained for future single-host shim compatibility only.
-            # snapshot() no longer reads them — all verify observability derives
-            # from self._inflight (InflightEntry.phase) and self._remerging_item.
-            # These assignments are write-only; nothing currently reads them.
-            self._verify_item = item
-            self._verify_phase = 'verifying'
-            self._verify_started_at = time.time()
             logger.info(
                 f'Task {req.task_id}: verify start (merge={merge_commit[:8]}, '
                 f'worktree={merge_wt.name})'
@@ -10531,7 +10518,6 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                 return False
 
             # ── Step 5: CAS advance_main ──────────────────────────────────
-            self._verify_phase = 'finalizing'
             entry.phase = 'finalizing'   # per-entry source of truth for snapshot()
             current_sha = merge_commit
             while True:
@@ -10643,7 +10629,6 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                         req.request_id, ItemLifecycleState.FINALIZING,
                         ItemLifecycleState.GATE_REVERIFY, live_obj=entry,
                     )
-                    self._verify_phase = 'gate_reverify'
                     entry.phase = 'gate_reverify'
                     gate = await _reverify_rebased_tree(
                         self._git_ops, req, merge_wt,
@@ -10710,7 +10695,6 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                         req.request_id, ItemLifecycleState.GATE_REVERIFY,
                         ItemLifecycleState.FINALIZING, live_obj=entry,
                     )
-                    self._verify_phase = 'finalizing'
                     entry.phase = 'finalizing'
                     continue
 
@@ -11011,8 +10995,6 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                 # _inflight, so without this it is invisible to all observability).
                 # Cleared to None immediately after _remerge() returns.
                 self._remerging_item = req
-                self._verify_item = item
-                self._verify_phase = 'remerging'
                 # merge_wt is a required non-Optional Path on RealMergeItem — no
                 # truthy guard needed here (task ο).
                 await self._cleanup_owned_merge_worktree(item.merge_wt)
@@ -11026,7 +11008,6 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                 )
                 item = await self._remerge(req, item.started_monotonic)
                 self._remerging_item = None
-                self._verify_item = item
                 # MQ-reliability kappa (task 2169): "then back" — regardless of
                 # whether the re-merged item now falls through to a passthrough
                 # outcome (-> TERMINAL, wired by a later step) or proceeds to a
