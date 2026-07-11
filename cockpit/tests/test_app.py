@@ -370,6 +370,60 @@ class TestSignalDontMove:
             assert backend.tile_calls == []
 
 
+class TestSharedTargetAttentionNotClearedPrematurely:
+    @pytest.mark.timeout(10)
+    async def test_urgency_stays_set_while_a_second_item_still_targets_it(self, tmp_path):
+        """PRD B3 edge case: a DecisionRecord and the AWAITING_INPUT session
+        it links to (via session_id) can resolve to the exact SAME
+        DisplayTarget (resolve_target maps a decision through its session's
+        display). _update_attention must diff by resolved TARGET, not by
+        item key -- otherwise the decision leaving the queue (e.g. answered
+        by a C8 watcher) while its session is STILL awaiting input would
+        incorrectly clear the shared target's urgency hint, even though a
+        live ask (the session) still points at it.
+        """
+        from cockpit.app import CockpitApp
+        from cockpit.backends import DisplayTarget, FakeBackend
+
+        display = sr.Display(kind='wm', wm_title='shared title')
+        awaiting = _make_record(
+            session_slug='shared-1',
+            status=sr.Status.AWAITING_INPUT,
+            display=display,
+            question=sr.Question(text='Which port?', asked_at='2026-07-07T00:00:00+00:00'),
+        )
+        sr.write_record(awaiting, root=tmp_path)
+        decision = sr.DecisionRecord(
+            id='dec-shared',
+            project='df',
+            text='Proceed?',
+            filed_at='2026-07-07T00:00:00+00:00',
+            session_id='shared-1',
+        )
+        assert sr.write_decision(decision, root=tmp_path)
+
+        backend = FakeBackend()
+        app = CockpitApp(fleet_root=tmp_path, backend=backend, poll_interval=0.05)
+        async with app.run_test() as pilot:
+            await pilot.pause()
+
+            target = DisplayTarget(kind='wm', wm_title='shared title')
+            assert (target, True) in backend.set_urgency_calls
+
+            # The decision resolves elsewhere (e.g. a C8 watcher answers it)
+            # while the session it's linked to is STILL awaiting input.
+            sr.update_decision_state('dec-shared', sr.DecisionState.ANSWERED, root=tmp_path)
+
+            calls_before = len(backend.set_urgency_calls)
+            app.refresh_registry()
+            await pilot.pause()
+
+            # The session's own queue item still resolves to `target` -- its
+            # urgency must NOT be cleared just because the decision left.
+            new_calls = backend.set_urgency_calls[calls_before:]
+            assert (target, False) not in new_calls
+
+
 class TestEnterFocus:
     @pytest.mark.timeout(10)
     async def test_enter_focuses_the_highlighted_row_not_row_zero(self, tmp_path):
@@ -455,6 +509,62 @@ class TestEnterFocus:
             await pilot.pause()
 
             assert backend.focus_calls == []
+
+
+class TestHandlingPrunedOnQueueExit:
+    @pytest.mark.timeout(10)
+    async def test_handling_flag_does_not_stick_past_the_ask_it_was_set_for(self, tmp_path):
+        """self._handling is an in-memory 'already acted on' marker keyed by
+        QueueItem.key (PRD §9 C5b). For a SESSION-backed row the key is
+        stable for the session's whole lifetime, so once Enter marks it
+        handling, it must be cleared again once that ask resolves (the
+        session leaves the queue) -- otherwise a brand new question from
+        the SAME session would silently inherit a stale "already handled"
+        flag left over from a completely different, earlier ask.
+        """
+        from cockpit.app import CockpitApp
+        from cockpit.backends import FakeBackend
+
+        display = sr.Display(kind='wm', wm_title='handling title')
+        awaiting = _make_record(
+            session_slug='handling-1',
+            status=sr.Status.AWAITING_INPUT,
+            display=display,
+            question=sr.Question(text='First ask?', asked_at='2026-07-07T00:00:00+00:00'),
+        )
+        sr.write_record(awaiting, root=tmp_path)
+
+        backend = FakeBackend()
+        app = CockpitApp(fleet_root=tmp_path, backend=backend, poll_interval=0.05)
+        async with app.run_test() as pilot:
+            await pilot.pause()
+
+            key = 'session:handling-1'
+            await pilot.press('enter')
+            await pilot.pause()
+            assert key in app._handling
+
+            # The ask resolves -- the session leaves the queue entirely.
+            idle = _make_record(session_slug='handling-1', status=sr.Status.IDLE, display=display)
+            sr.write_record(idle, root=tmp_path)
+            app.refresh_registry()
+            await pilot.pause()
+
+            assert key not in app._handling
+
+            # A brand new question from the SAME session must not inherit
+            # the stale handling flag left by the earlier, resolved ask.
+            second_ask = _make_record(
+                session_slug='handling-1',
+                status=sr.Status.AWAITING_INPUT,
+                display=display,
+                question=sr.Question(text='Second ask?', asked_at='2026-07-08T00:00:00+00:00'),
+            )
+            sr.write_record(second_ask, root=tmp_path)
+            app.refresh_registry()
+            await pilot.pause()
+
+            assert app._queue_items_by_key[key].handling is False
 
 
 class TestBoostReordersAndPersists:

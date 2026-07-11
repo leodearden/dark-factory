@@ -176,8 +176,16 @@ class CockpitApp(App):
         self._decisions_snapshot: dict[str, tuple] = {}
         self._has_scanned = False
         self._selected_slug: str | None = None
-        self._attention_targets: dict[str, DisplayTarget] = {}
+        # Keyed by resolved DisplayTarget, NOT by item key -- see
+        # _update_attention's docstring: a decision and the AWAITING_INPUT
+        # session it links to can resolve to the SAME target, so urgency
+        # must be a function of "is any live item still pointing here", not
+        # of any one item's key.
+        self._attention_targets: set[DisplayTarget] = set()
         self._queue_items_by_key: dict[str, QueueItem] = {}
+        # In-memory "already acted on" marker, set by action_focus_selected.
+        # Pruned to the live queue on every rebuild (_rebuild_queue) so a
+        # key never keeps reporting "handling" past the ask it was set for.
         self._handling: set[str] = set()
         self._boosts: dict[str, int] = {}
         self._dropped: set[str] = set()
@@ -245,6 +253,12 @@ class CockpitApp(App):
         handlers that mutate self._decisions directly (a persisted
         decision-row boost) call this afterward instead of waiting for the
         next poll tick.
+
+        Also prunes self._handling down to the keys still present in the
+        freshly-built queue: a key whose item left (resolved/dropped, or a
+        session moved off AWAITING_INPUT) stops being "handling" so a later,
+        unrelated ask that happens to reuse the same key (e.g. the same
+        session asking a brand new question) starts out unmarked.
         """
         now = self._now_fn()
         queue_items = order_queue(
@@ -260,6 +274,7 @@ class CockpitApp(App):
         queue = self.query_one('#decision-queue', DecisionQueue)
         queue.replace_rows(queue_items, now)
         self._queue_items_by_key = {item.key: item for item in queue_items}
+        self._handling &= self._queue_items_by_key.keys()
         self._update_attention(queue_items)
 
     def _backend_for(self, kind: str) -> FocusArrangeBackend:
@@ -281,25 +296,32 @@ class CockpitApp(App):
         """Signal (never move) on attention transitions -- PRD B3, this task's leaf signal.
 
         Diffs the current queue's resolvable targets against the previous
-        tick's set: a target newly appearing (a session just flipped to
-        awaiting-input, or a new open decision was filed) gets
-        set_urgency(True); one that dropped out (answered/dropped/resolved,
-        or its session vanished) gets set_urgency(False). Then reorders
-        each backend's own targets -- grouped by kind so a wm target never
-        pollutes a tmux backend's positional reorder (whose index IS the
-        destination window position) and vice versa. This method and its
-        caller are the ONLY place the refresh path may call backend.*; it
-        calls ONLY set_urgency/reorder, NEVER focus/tile (those live
-        exclusively in explicit-action handlers, e.g. action_focus_selected).
+        tick's set of urgent TARGETS -- not item keys: a target newly
+        appearing (a session just flipped to awaiting-input, or a new open
+        decision was filed) gets set_urgency(True); a target that no longer
+        has ANY live item pointing at it (every item that resolved to it
+        left the queue -- answered/dropped/resolved, or its session
+        vanished) gets set_urgency(False). Diffing by resolved target
+        rather than by item key matters because a DecisionRecord and the
+        AWAITING_INPUT session it links to (via session_id) can resolve to
+        the exact SAME target (see resolve_target) -- keying by item key
+        would clear urgency on a still-live target the moment just ONE of
+        its two items (e.g. the decision, answered elsewhere) left the
+        queue, even though the other (the session) is still asking. Then
+        reorders each backend's own targets -- grouped by kind so a wm
+        target never pollutes a tmux backend's positional reorder (whose
+        index IS the destination window position) and vice versa. This
+        method and its caller are the ONLY place the refresh path may call
+        backend.*; it calls ONLY set_urgency/reorder, NEVER focus/tile
+        (those live exclusively in explicit-action handlers, e.g.
+        action_focus_selected).
         """
-        new_attention = {item.key: item.target for item in queue_items if item.target is not None}
-        for key, target in new_attention.items():
-            if key not in self._attention_targets:
-                self._backend_for(target.kind).set_urgency(target, True)
-        for key, target in self._attention_targets.items():
-            if key not in new_attention:
-                self._backend_for(target.kind).set_urgency(target, False)
-        self._attention_targets = new_attention
+        new_targets = {item.target for item in queue_items if item.target is not None}
+        for target in new_targets - self._attention_targets:
+            self._backend_for(target.kind).set_urgency(target, True)
+        for target in self._attention_targets - new_targets:
+            self._backend_for(target.kind).set_urgency(target, False)
+        self._attention_targets = new_targets
 
         targets_by_kind: dict[str, list[DisplayTarget]] = {}
         for item in queue_items:
@@ -324,10 +346,15 @@ class CockpitApp(App):
         "handling" (an in-memory, best-effort "already acted on" marker,
         fed back into the next order_queue call) -- even when no target
         resolved, since the operator's acknowledgement is real regardless
-        of whether a live window was found. Fail-soft: an empty queue (no
-        highlighted key) or a key not present in the last-built queue
-        no-ops without raising -- a gone/unlinked lead is simply not
-        focusable, never a crash.
+        of whether a live window was found. This mark is not permanent:
+        _rebuild_queue prunes self._handling down to whatever is still in
+        the queue on every rebuild, so the flag tracks the CURRENT ask, not
+        any historical acknowledgement -- a key that later leaves the queue
+        and resurfaces (e.g. the same session filing a brand new question)
+        starts unmarked again. Fail-soft: an empty queue (no highlighted
+        key) or a key not present in the last-built queue no-ops without
+        raising -- a gone/unlinked lead is simply not focusable, never a
+        crash.
         """
         queue = self.query_one('#decision-queue', DecisionQueue)
         key = queue.highlighted_key()
