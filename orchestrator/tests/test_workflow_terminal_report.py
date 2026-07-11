@@ -103,6 +103,30 @@ class TestTerminalReportValueType:
 
         assert ShimTerminalReport is TerminalReport
 
+    def test_blocked_from_phase_round_trips_and_defaults_to_none(self):
+        """REVIEW-CYCLE-1 fix: ``blocked_from_phase`` accepts a WorkflowState
+        and round-trips; defaults to None when omitted — additive to every
+        pre-existing/synthesized construction site (e.g. the four tests
+        above, which never pass it)."""
+        report = TerminalReport(
+            outcome=WorkflowOutcome.BLOCKED,
+            reason='r',
+            phase=WorkflowState.BLOCKED,
+            detail='d',
+            category=None,
+            blocked_from_phase=WorkflowState.VERIFY,
+        )
+        assert report.blocked_from_phase == WorkflowState.VERIFY
+
+        report_omitted = TerminalReport(
+            outcome=WorkflowOutcome.DONE,
+            reason='',
+            phase=WorkflowState.DONE,
+            detail='',
+            category=None,
+        )
+        assert report_omitted.blocked_from_phase is None
+
 
 # ---------------------------------------------------------------------------
 # Fixtures for the e2e-style block paths (mirrors test_workflow_e2e.py /
@@ -220,6 +244,65 @@ class TestTerminalReportPopulatedAtBlockPaths:
         assert report.phase == wf.machine.state
         assert report.detail
         assert report.category is None
+
+
+@pytest.mark.asyncio
+class TestBlockedFromPhaseField:
+    """REVIEW-CYCLE-1 fix (reviewer_comprehensive, correctness_regression):
+    ``TerminalReport.blocked_from_phase`` preserves the PRE-block WORKING
+    phase (e.g. VERIFY), distinct from ``phase`` (the terminal
+    ``machine.state`` kept for SM-2 — BLOCKED after ``_mark_blocked``'s
+    ``_enter_phase(BLOCKED)`` transition). Without this field, the harness's
+    ``block_phase`` derived solely from ``phase`` collapses to ``'blocked'``
+    for every ``_mark_blocked`` exit, silently disabling the optimistic-path
+    auto-eval redo (Lever B/C recovery).
+    """
+
+    async def test_mark_blocked_captures_pre_block_working_phase(
+        self, config, git_ops, task_assignment,
+    ):
+        """A ``_mark_blocked`` block driven from a WORKING phase (VERIFY)
+        stashes that phase in ``blocked_from_phase`` while ``phase`` itself
+        becomes the terminal BLOCKED state (SM-2's
+        ``report.phase == machine.state`` invariant)."""
+        stub = AgentStub()
+        workflow, scheduler = _build_workflow(config, git_ops, task_assignment, stub)
+
+        workflow.state = WorkflowState.VERIFY
+        outcome = await workflow._mark_blocked('verify failed', detail='d')
+
+        assert outcome == WorkflowOutcome.BLOCKED
+        report = workflow._terminal_report
+        assert isinstance(report, TerminalReport)
+        assert report.blocked_from_phase == WorkflowState.VERIFY
+        assert report.phase == WorkflowState.BLOCKED
+        assert report.phase == workflow.machine.state
+
+    async def test_warm_lane_requeue_sets_blocked_from_phase_to_working_phase(
+        self, tmp_path: Path,
+    ):
+        """Warm-lane requeue never transitions to BLOCKED, so
+        ``blocked_from_phase`` equals the (unchanged) working phase — the
+        same value as ``phase`` (reuses ``_make_warmlane_workflow`` setup)."""
+        from orchestrator.git_ops import WarmLanePoolHardDown
+
+        wf = _make_warmlane_workflow(tmp_path=tmp_path)
+        wf.git_ops.create_worktree = AsyncMock(
+            side_effect=WarmLanePoolHardDown(
+                "warm-lane base absent (host-scoped pool hard-down) for branch "
+                "'1859'; requeue"
+            )
+        )
+        mark_blocked = AsyncMock(return_value=WorkflowOutcome.BLOCKED)
+        wf._mark_blocked = mark_blocked  # type: ignore[method-assign]
+
+        outcome = (await wf.run()).outcome
+
+        assert outcome == WorkflowOutcome.REQUEUED
+        report = wf._terminal_report
+        assert isinstance(report, TerminalReport)
+        assert report.blocked_from_phase == wf.machine.state
+        assert report.phase == wf.machine.state
 
 
 @pytest.mark.asyncio
