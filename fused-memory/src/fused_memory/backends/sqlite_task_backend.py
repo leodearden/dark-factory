@@ -1911,6 +1911,33 @@ class SqliteTaskBackend:
                 set_columns.append('candidate_key = ?')
                 set_values.append(new_candidate_key)
 
+                # Index-independent dedup guard (fm-task-dedup self-heal
+                # amendment): mirrors add_task's pre-INSERT guard. The v3->v4
+                # partial UNIQUE index is self-gating — a flagged residual
+                # leaves it ABSENT indefinitely (reify incident
+                # esc-candidate-key-migration-2) — so this SELECT is the
+                # only backstop against reactivating the recomputed key onto
+                # another non-cancelled row during that window. Same typed
+                # error the post-UPDATE IntegrityError mapping below raises
+                # when the index IS present, so callers need no changes
+                # regardless of which path catches the collision. Excludes
+                # this row's own id — an update that recomputes to the key
+                # it already holds is not a collision.
+                if new_candidate_key is not None:
+                    guard_cursor = await conn.execute(
+                        "SELECT id, status FROM tasks WHERE tag = ? AND candidate_key = ? "
+                        "AND status != 'cancelled' AND id != ? ORDER BY id LIMIT 1",
+                        (tag, new_candidate_key, tid),
+                    )
+                    guard_row = await guard_cursor.fetchone()
+                    if guard_row is not None:
+                        raise DuplicateCandidateKeyError(
+                            existing_id=guard_row['id'],
+                            existing_status=guard_row['status'],
+                            tag=tag,
+                            candidate_key=new_candidate_key,
+                        )
+
             # updated_at always advances, even on a no-op write — matches
             # the original behaviour and avoids surprising "stale" reads.
             set_columns.append('updated_at = ?')
