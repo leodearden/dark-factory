@@ -2058,7 +2058,13 @@ class ReconciliationHarness:
         timing data alone. This leaves a truthful (not fabricated-metrics)
         breadcrumb: the ``stage1_cycle_summary_degraded_backstop`` stat
         self-identifies the row as harness-synthesized rather than a genuine
-        in-stage write.
+        in-stage write. Note ``started_at`` is set to ``cycle_start_time`` —
+        the whole-cycle anchor taken before Stage 0 setup (task-tree fetch,
+        census cross-verify, queue-health read) — not Stage 1's real start,
+        since that is unrecoverable once ``run()`` raised without returning
+        a report. The synthesized ``completed_at - started_at`` therefore
+        *overstates* Stage 1's true elapsed time; treat it as an upper bound
+        for latency diagnosis, not a measured duration.
 
         This method must never raise: it is awaited unshielded inside
         ``run_full_cycle``'s ``finally`` block, immediately before the
@@ -2086,6 +2092,9 @@ class ReconciliationHarness:
         try:
             degraded_report = StageReport(
                 stage=StageId.memory_consolidator,
+                # Whole-cycle anchor, not Stage 1's real start — see the
+                # docstring note above; the implied duration is an upper
+                # bound, not a measured Stage-1 elapsed time.
                 started_at=cycle_start_time,
                 completed_at=datetime.now(UTC),
                 items_flagged=[],
@@ -2120,7 +2129,12 @@ class ReconciliationHarness:
             # from the shield above being interrupted, or from any other
             # BaseException — is logged and swallowed here rather than
             # propagating out and replacing the exception already unwinding
-            # through run_full_cycle's finally block.
+            # through run_full_cycle's finally block. This also intentionally
+            # swallows SystemExit/KeyboardInterrupt if either fires during
+            # this narrow, bounded shielded write — acceptable here since the
+            # only work in scope is a single best-effort ledger upsert, and
+            # letting it interrupt the finally would still risk skipping the
+            # update_run_stage_reports call that follows.
             logger.warning(
                 'reconciliation.stage1_cycle_summary_backstop_failed',
                 exc_info=True,
