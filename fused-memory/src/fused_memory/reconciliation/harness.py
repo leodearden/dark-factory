@@ -2044,8 +2044,10 @@ class ReconciliationHarness:
         of its loop iteration and only advances to Stage 2's id when Stage 2
         starts, and ``run()`` cannot raise AFTER its in-stage write (that
         write is the last statement, and ``write_stage1_cycle_summary`` never
-        raises). The ``'memory_consolidator' not in run.stage_reports``
-        clause is defense-in-depth against a future stage-order refactor.
+        raises). The ``StageId.memory_consolidator.value not in
+        run.stage_reports`` clause is defense-in-depth against a future
+        stage-order refactor — derived from the same enum member as the
+        first clause so the two can never silently diverge.
         Both the happy path (ends at ``integrity_check``) and a Stage-2/3
         failure (Stage 1's report already recorded) no-op here — so this
         never depends on the ``stage1_cycle_summary_ledger_written`` stat.
@@ -2058,18 +2060,26 @@ class ReconciliationHarness:
         self-identifies the row as harness-synthesized rather than a genuine
         in-stage write.
 
-        This method must never raise: it runs unshielded inside
+        This method must never raise: it is awaited unshielded inside
         ``run_full_cycle``'s ``finally`` block, immediately before the
         existing ``update_run_stage_reports`` persistence call. An exception
         raised here (mid-finally, with another exception already
         propagating) would replace that propagating exception rather than
         chain alongside it, and would also skip the subsequent
-        ``update_run_stage_reports`` call — so the whole body is wrapped in a
-        blanket ``except Exception`` that logs and swallows.
+        ``update_run_stage_reports`` call. A second cancellation arriving
+        while the ledger write is in flight (e.g. server shutdown racing a
+        CLI-timeout-triggered ``CancelledError``) is the sharpest version of
+        this: without protection it would raise ``CancelledError`` out of
+        this method, replacing the original propagating exception. So the
+        write itself runs under ``asyncio.shield`` (mirroring the
+        ``CancelledError`` handler above) and the whole body is wrapped in a
+        blanket ``except BaseException`` — not just ``Exception`` — that logs
+        and swallows, so even that second cancellation can't mask the real
+        error or skip the persistence step that follows.
         """
         if not (
             current_stage_name == StageId.memory_consolidator.value
-            and 'memory_consolidator' not in run.stage_reports
+            and StageId.memory_consolidator.value not in run.stage_reports
         ):
             return
 
@@ -2083,8 +2093,13 @@ class ReconciliationHarness:
                 llm_calls=0,
                 tokens_used=0,
             )
-            ledger_written = await write_stage1_cycle_summary(
-                self.memory, project_id, degraded_report, run_id,
+            # Shielded so a second cancellation arriving while this write is in
+            # flight can't abort it mid-write — it keeps running to completion
+            # in its own Task even if this await itself raises CancelledError.
+            ledger_written = await asyncio.shield(
+                write_stage1_cycle_summary(
+                    self.memory, project_id, degraded_report, run_id,
+                )
             )
             logger.warning(
                 'reconciliation.stage1_cycle_summary_backstop_fired',
@@ -2100,7 +2115,12 @@ class ReconciliationHarness:
             error_record = run.stage_reports.get('_error')
             if isinstance(error_record, dict):
                 error_record['stage1_cycle_summary_backstop_written'] = ledger_written
-        except Exception:
+        except BaseException:
+            # BaseException (not just Exception) so a second CancelledError —
+            # from the shield above being interrupted, or from any other
+            # BaseException — is logged and swallowed here rather than
+            # propagating out and replacing the exception already unwinding
+            # through run_full_cycle's finally block.
             logger.warning(
                 'reconciliation.stage1_cycle_summary_backstop_failed',
                 exc_info=True,
