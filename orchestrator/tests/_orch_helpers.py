@@ -175,7 +175,15 @@ async def reap_leaked_aiosqlite_connections() -> int:
             and obj._thread.is_alive()
         ):
             continue
-        with contextlib.suppress(BaseException):
+        # Exception (not BaseException): asyncio.CancelledError is a
+        # BaseException subclass (since 3.8) and must propagate rather than
+        # be silently absorbed if the test run itself is being cancelled
+        # while this teardown is awaiting; SystemExit/KeyboardInterrupt are
+        # likewise deliberately left unsuppressed. asyncio.TimeoutError
+        # (raised by the wait_for below) is a plain Exception subclass, so
+        # it — and any close()/thread-join failure — is still swallowed on
+        # this best-effort path.
+        with contextlib.suppress(Exception):
             await asyncio.wait_for(obj.close(), timeout=15.0)
             obj._thread.join(timeout=15.0)
         if not obj._thread.is_alive():
