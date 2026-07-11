@@ -76,8 +76,17 @@ class TestInitialRender:
 class TestPollRefresh:
     @pytest.mark.timeout(10)
     async def test_new_record_appears_and_orders_blocked_first(self, tmp_path):
-        """A record written to disk after mount appears within one poll window,
-        and a newly-blocked record is ordered first (blocked-first, timer-driven)."""
+        """A record written to disk after mount appears once refresh_registry runs,
+        and a newly-blocked record is ordered first (blocked-first).
+
+        Drives refresh_registry() directly rather than sleeping across real
+        poll ticks: rebuild-on-change is the behavior under test, and coupling
+        it to wall-clock timing (poll_interval vs. a pilot.pause duration) is
+        a flake risk under a loaded runner. The timer wiring itself
+        (set_interval actually calling refresh_registry) is covered
+        separately by TestTimerIntegration below -- the one test in this
+        module allowed to depend on real timing.
+        """
         from cockpit.app import CockpitApp
         from cockpit.panes.session_table import SessionTable
 
@@ -93,7 +102,8 @@ class TestPollRefresh:
             blocked = _make_record(session_slug='blocked-1', status=sr.Status.AWAITING_INPUT)
             sr.write_record(blocked, root=tmp_path)
 
-            await pilot.pause(0.2)
+            app.refresh_registry()
+            await pilot.pause()
 
             assert table.row_count == 2
             first_row_key = table.coordinate_to_cell_key(Coordinate(0, 0)).row_key
@@ -101,7 +111,11 @@ class TestPollRefresh:
 
     @pytest.mark.timeout(10)
     async def test_mutated_status_reflected_after_poll(self, tmp_path):
-        """An existing record's status change on disk is picked up by the next poll tick."""
+        """An existing record's status change on disk is picked up by refresh_registry.
+
+        Same rationale as above: calls refresh_registry() directly instead of
+        racing the real poll_interval timer via pilot.pause(<duration>).
+        """
         from cockpit.app import CockpitApp
         from cockpit.panes.session_table import SessionTable, state_glyph
 
@@ -116,11 +130,40 @@ class TestPollRefresh:
 
             sr.update_status('running-1', root=tmp_path, status=sr.Status.IDLE)
 
-            await pilot.pause(0.2)
+            app.refresh_registry()
+            await pilot.pause()
 
             row = table.get_row('running-1')
             assert state_glyph(sr.Status.IDLE) in row
             assert state_glyph(sr.Status.RUNNING) not in row
+
+
+class TestTimerIntegration:
+    """The one test allowed to depend on real poll timing (see TestPollRefresh).
+
+    Everything in TestPollRefresh now drives refresh_registry() directly
+    (deterministic, no sleeping across real ticks). This test alone proves
+    on_mount's set_interval(poll_interval, refresh_registry) is actually
+    wired end-to-end, so that guarantee isn't lost entirely to determinism.
+    """
+
+    @pytest.mark.timeout(10)
+    async def test_timer_tick_triggers_refresh(self, tmp_path):
+        from cockpit.app import CockpitApp
+        from cockpit.panes.session_table import SessionTable
+
+        app = CockpitApp(fleet_root=tmp_path, poll_interval=0.05)
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            table = app.query_one(SessionTable)
+            assert table.row_count == 0
+
+            record = _make_record(session_slug='timer-1', status=sr.Status.RUNNING)
+            sr.write_record(record, root=tmp_path)
+
+            await pilot.pause(0.3)
+
+            assert table.row_count == 1
 
 
 class TestRowSelectionDetail:
