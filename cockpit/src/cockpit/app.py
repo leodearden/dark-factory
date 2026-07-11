@@ -26,6 +26,7 @@ from pathlib import Path
 
 from orchestrator.session_registry import DecisionRecord, SessionRecord, list_decisions
 from textual.app import App, ComposeResult
+from textual.binding import Binding
 from textual.containers import Horizontal, Vertical
 from textual.widgets import DataTable
 
@@ -70,6 +71,10 @@ def _decisions_snapshot(decisions: list[DecisionRecord]) -> dict[str, tuple]:
 class CockpitApp(App):
     """Fleet Cockpit TUI: decision queue + session table + detail pane, polling for changes."""
 
+    BINDINGS = [
+        Binding('enter', 'focus_selected', 'Focus', show=False),
+    ]
+
     def __init__(
         self,
         *,
@@ -101,6 +106,8 @@ class CockpitApp(App):
         self._has_scanned = False
         self._selected_slug: str | None = None
         self._attention_targets: dict[str, DisplayTarget] = {}
+        self._queue_items_by_key: dict[str, QueueItem] = {}
+        self._handling: set[str] = set()
 
     def compose(self) -> ComposeResult:
         yield Vertical(
@@ -150,9 +157,12 @@ class CockpitApp(App):
         self._sync_detail_pane(table.highlighted_slug())
 
         now = self._now_fn()
-        queue_items = order_queue(decisions, records, self._priorities, now)
+        queue_items = order_queue(
+            decisions, records, self._priorities, now, handling=self._handling
+        )
         queue = self.query_one('#decision-queue', DecisionQueue)
         queue.replace_rows(queue_items, now)
+        self._queue_items_by_key = {item.key: item for item in queue_items}
         self._update_attention(queue_items)
 
     def _backend_for(self, kind: str) -> FocusArrangeBackend:
@@ -201,6 +211,37 @@ class CockpitApp(App):
         for kind, targets in targets_by_kind.items():
             self._backend_for(kind).reorder(targets)
 
+    def action_focus_selected(self) -> None:
+        """Explicit-action focus (PRD B3/§6.2, §9 C5b) -- the ONLY place a
+        focus() call may originate from. Bound to Enter (via BINDINGS) and
+        routed here from a DecisionQueue row-selected message too (Enter
+        AND a same-row click both post DataTable.RowSelected -- see
+        on_data_table_row_selected), so both triggers funnel through this
+        one handler. _update_attention (the refresh/diff path) is the
+        structural complement: it may call ONLY set_urgency/reorder, never
+        focus/tile -- this method is where focus/tile live instead.
+
+        Resolves the DecisionQueue's currently-highlighted row to its
+        QueueItem and, when a target is resolvable, calls
+        backend.focus(target) exactly once. Always marks the row's key
+        "handling" (an in-memory, best-effort "already acted on" marker,
+        fed back into the next order_queue call) -- even when no target
+        resolved, since the operator's acknowledgement is real regardless
+        of whether a live window was found. Fail-soft: an empty queue (no
+        highlighted key) or a key not present in the last-built queue
+        no-ops without raising -- a gone/unlinked lead is simply not
+        focusable, never a crash.
+        """
+        queue = self.query_one('#decision-queue', DecisionQueue)
+        key = queue.highlighted_key()
+        if key is None:
+            return
+        self._handling.add(key)
+        item = self._queue_items_by_key.get(key)
+        if item is None or item.target is None:
+            return
+        self._backend_for(item.target.kind).focus(item.target)
+
     def _sync_detail_pane(self, slug: str | None) -> None:
         """Render *slug*'s record (or the empty placeholder) into the detail pane.
 
@@ -235,6 +276,20 @@ class CockpitApp(App):
             return
         self._sync_detail_pane(event.row_key.value)
         self._persist_ui_config()
+
+    def on_data_table_row_selected(self, event: DataTable.RowSelected) -> None:
+        """Route a DecisionQueue selection (Enter, via DataTable's own
+        'enter' binding, or a same-row click) to action_focus_selected.
+
+        SessionTable also posts RowSelected (same message namespace, same
+        disambiguation idiom as on_data_table_row_highlighted above) --
+        selecting a session-table row has no focus action of its own, so
+        that case is simply ignored here.
+        """
+        queue = self.query_one('#decision-queue', DecisionQueue)
+        if event.data_table is not queue:
+            return
+        self.action_focus_selected()
 
     def _persist_ui_config(self) -> None:
         """Write the cockpit's own UI state -- its ONLY write target (PRD §2/§5).
