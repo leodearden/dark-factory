@@ -299,3 +299,32 @@ class TestEnsurePrioritiesFile:
         assert any('priorities' in msg.lower() for msg in warnings), (
             f'Expected a WARNING mentioning "priorities"; got: {warnings}'
         )
+
+
+class TestSavePriorities:
+    def test_round_trips_custom_weights(self, tmp_path):
+        """save_priorities must be the exact inverse of load_priorities/_priorities_from_dict:
+        a non-default Priorities written out and read back must compare equal."""
+        from cockpit.priority import (
+            AgeCurve,
+            Defaults,
+            ManualBoostConfig,
+            Priorities,
+            load_priorities,
+            save_priorities,
+        )
+
+        custom = Priorities(
+            severity_weights={'critical': 9.0, 'high': 4.0, 'medium': 2.0, 'low': 1.0},
+            category_weights={'bug': 4.0},
+            project_weights={'df': 9.0},
+            defaults=Defaults(severity=1.1, category=0.6, project=0.2),
+            age_curve=AgeCurve(max_bonus=3.3, saturation_seconds=123.0),
+            manual_boost=ManualBoostConfig(weight=2.0, min=-7, max=7),
+        )
+        target = tmp_path / 'nested' / 'priorities.yaml'
+
+        save_priorities(custom, target)
+
+        assert target.exists()
+        assert load_priorities(target) == custom
