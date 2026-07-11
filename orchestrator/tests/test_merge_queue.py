@@ -21785,26 +21785,19 @@ class TestSnapshotInflightCollection:
     async def test_snapshot_no_phantom_when_inflight_empty(
         self, tmp_path: Path, config: OrchestratorConfig, git_ops: GitOps,
     ) -> None:
-        """verify_in_progress is None when _inflight empty, even if _verify_item is stale.
+        """verify_in_progress is None when _inflight is empty.
 
-        RED (step-3): current snapshot reads _verify_item for verify_in_progress,
-        producing a phantom non-None entry when _verify_item is never cleared.
+        Historically the single-host _verify_item/_verify_phase fields were
+        set but never cleared, producing a phantom non-None verify_in_progress
+        here even with _inflight empty. Task lambda (2173) deleted those
+        fields — verify_in_progress now derives solely from
+        _inflight/_finalizing_head, so that phantom-entry class is
+        structurally impossible.
         """
 
         queue: asyncio.Queue[MergeRequest] = asyncio.Queue()
         worker = SpeculativeMergeWorker(git_ops, queue)
 
-        wt = tmp_path / 'wt'
-        wt.mkdir()
-
-        req_stale = _make_request('phantom', 'phantom', wt, config)
-        item_stale = DecidedItem(
-            request=req_stale,
-            immediate_outcome=MergeOutcome('blocked'),
-            base_sha='dead' * 10, speculative=False,
-        )
-        worker._verify_item = item_stale   # stale, never cleared -- the gamma latent bug
-        worker._verify_phase = 'verifying'
         # _inflight is EMPTY
 
         snap = worker.snapshot()

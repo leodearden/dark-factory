@@ -2812,10 +2812,6 @@ class TestSnapshotInflight:
             was_speculative=False,
         )
 
-        # Set head back-compat mirror
-        worker._verify_item = item_a
-        worker._verify_phase = 'verifying'
-
         # Both entries in _inflight
         worker._inflight.append(entry_a)
         worker._inflight.append(entry_b)
@@ -2840,8 +2836,8 @@ class TestSnapshotInflight:
     ) -> None:
         """Single-host (≤1 in-flight): snapshot unchanged from today.
 
-        With only _verify_item set and _inflight having exactly that one entry,
-        the snapshot must produce the SAME output as the pre-γ code.
+        With _inflight having exactly one entry, the snapshot must produce
+        the SAME output as the pre-γ code.
 
         GREEN both before and after step-24 (byte-identical oracle).
         """
@@ -2865,9 +2861,7 @@ class TestSnapshotInflight:
             was_speculative=False,
         )
 
-        # Single-host scenario: _verify_item set + one _inflight entry
-        worker._verify_item = item
-        worker._verify_phase = 'verifying'
+        # Single-host scenario: one _inflight entry
         worker._inflight.append(entry)
 
         snap = worker.snapshot()
@@ -2888,8 +2882,9 @@ class TestSnapshotInflight:
     ) -> None:
         """verify_in_progress still mirrors the head (back-compat unchanged).
 
-        After step-24, verify_in_progress must still come from _verify_item
-        (back-compat); additional _inflight entries appear only in 'entries'.
+        After step-24, verify_in_progress must still come from the _inflight
+        head (back-compat); additional _inflight entries appear only in
+        'entries'.
         """
         from orchestrator.merge_queue import DecidedItem, InflightEntry
 
@@ -2918,8 +2913,6 @@ class TestSnapshotInflight:
             was_speculative=False,
         )
 
-        worker._verify_item = item_a
-        worker._verify_phase = 'verifying'
         worker._inflight.append(entry_a)
         worker._inflight.append(entry_b)
 

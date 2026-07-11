@@ -262,7 +262,7 @@ class TestInflightEntryHasNoPhaseField:
     required positional argument).
     """
 
-    def test_phase_field_absent_from_dataclass(git_ops):
+    def test_phase_field_absent_from_dataclass(self, git_ops: GitOps) -> None:
         from orchestrator.merge_queue import InflightEntry
 
         field_names = {f.name for f in dataclasses.fields(InflightEntry)}
@@ -273,8 +273,8 @@ class TestInflightEntryHasNoPhaseField:
 
     @pytest.mark.asyncio
     async def test_derivation_works_with_no_phase_field(
-        git_ops, config, tmp_path,
-    ):
+        self, git_ops: GitOps, config: OrchestratorConfig, tmp_path: Path,
+    ) -> None:
         from orchestrator.merge_queue import InflightEntry, ItemLifecycleState, RealMergeItem
 
         worker = _make_worker(git_ops)
