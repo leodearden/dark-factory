@@ -971,8 +971,17 @@ class TaskWorkflow:
         self._progress_resume_churn_info: dict | None = None
         # When True, the finally-block config-dir cleanup is skipped so the
         # preserved dir can be used for forensic analysis.  Set alongside
-        # _zero_output_hang_info when the circuit breaker trips (task 1739).
+        # _zero_output_hang_info when that circuit breaker trips (task 1739),
+        # and alongside _progress_resume_churn_info when the churn breaker
+        # trips (task 2360, reify-4827) — a repeatedly ceiling-killed
+        # productive session is at least as worth preserving as a
+        # zero-output wedge, since real work happened each time yet the
+        # session never converged.
         self._preserve_config_dir: bool = False
+        # Which breaker set _preserve_config_dir, for the forensic log line
+        # in _cleanup_config_dir. Stays None only if _preserve_config_dir is
+        # still at its False default.
+        self._preserve_config_dir_reason: str | None = None
         # Per-run history of (category, normalised cause_hint) tuples for the
         # signature-repetition guard.  Ephemeral — intentionally not persisted
         # in task metadata because the verify loop is wholly within one
@@ -4450,6 +4459,7 @@ class TaskWorkflow:
         # the exclusion earned by earlier execute phases on re-entry.
         self._progress_resume_churn_info = None
         self._preserve_config_dir = False
+        self._preserve_config_dir_reason = None
         while self.artifacts.get_pending_steps():
             if (
                 self.metrics.execute_iterations - self.metrics.progress_resume_total
@@ -4623,6 +4633,7 @@ class TaskWorkflow:
                         ),
                     }
                     self._preserve_config_dir = True
+                    self._preserve_config_dir_reason = ZERO_OUTPUT_HANG_REASON
                     logger.error(
                         'Task %s: zero-output hang circuit breaker tripped after %d '
                         'consecutive fresh-invocation timeouts — blocking as infra_issue',
@@ -4675,6 +4686,13 @@ class TaskWorkflow:
                             f'last_transcript_turns={result.transcript_turns}'
                         ),
                     }
+                    # Preserve the config dir for forensic analysis, same as
+                    # the zero-output hang breaker above: a session that made
+                    # real work every time (transcript_turns > 0) yet never
+                    # converged is at least as worth inspecting post-mortem
+                    # as a zero-output wedge (task 2360 amendment, reify-4827).
+                    self._preserve_config_dir = True
+                    self._preserve_config_dir_reason = PROGRESS_RESUME_CHURN_REASON
                     logger.error(
                         'Task %s: progress-resume churn circuit breaker tripped '
                         'after %d ceiling-kill+resume cycles of a productive '
@@ -4773,8 +4791,10 @@ class TaskWorkflow:
         Behaviour:
         - ``self._config_dir is None`` → no-op (dir was never created).
         - ``self._preserve_config_dir is True`` → skip cleanup and log a
-          warning naming the preserved path and the zero-output-hang reason,
-          so the on-call engineer knows the dir is intentional.
+          warning naming the preserved path and the tripped breaker's reason
+          (``self._preserve_config_dir_reason`` — zero-output hang or
+          progress-resume churn, task 1739 / task 2360), so the on-call
+          engineer knows the dir is intentional and why.
         - Otherwise → ``self._config_dir.cleanup()`` (normal path).
         """
         if not self._config_dir:
@@ -4784,7 +4804,7 @@ class TaskWorkflow:
                 'Task %s: config dir preserved for forensic analysis '
                 '(reason: %s) → %s',
                 self.task_id,
-                ZERO_OUTPUT_HANG_REASON,
+                self._preserve_config_dir_reason or ZERO_OUTPUT_HANG_REASON,
                 self._config_dir.path,
             )
             return

@@ -1481,6 +1481,16 @@ class OrchestratorConfig(BaseSettings):
     # workflow returns BLOCKED with a distinct reason, separate from the
     # zero-output-hang and generic 'Execution iterations exhausted' paths.
     # Default 20 leaves generous headroom above a normal task's 0-2 resumes.
+    #
+    # Combined worst case: each progress-resume invocation may itself run up
+    # to invocation_timeout (the working-regime absolute cap, default 7200s)
+    # before being ceiling-killed, so the churn breaker's worst-case
+    # aggregate wall-clock before tripping is
+    # max_progress_resume_iterations * invocation_timeout — e.g. the
+    # shipped defaults (20 * 7200s) compound to ~40h. That is intentional
+    # (the two knobs bound independent things: iteration-count churn vs.
+    # per-attempt wall-clock), but the multiplicative interaction is easy to
+    # miss when tuning either default in isolation — see invocation_timeout.
     max_progress_resume_iterations: int = Field(default=20, ge=1)
     max_verify_attempts: int = Field(default=5)
     # Fast-fail cap for ``infra_timeout`` results whose cause_hint is the
