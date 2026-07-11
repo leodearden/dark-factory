@@ -579,6 +579,31 @@ async def mcp_call(
     return await session._raw_call(method, params, timeout=timeout)
 
 
+# ---------------------------------------------------------------------------
+# Managed-spawn runtime data dirs (task 2439)
+# ---------------------------------------------------------------------------
+
+
+def managed_runtime_data_dirs(project_id: str) -> tuple[Path, Path]:
+    """Return (queue_dir, recon_dir) for a managed fused-memory spawn.
+
+    Keeps the managed fused-memory server's runtime SQLite state — the
+    write_queue.db (+ -shm/-wal) and reconciliation.db/tickets.db — out of the
+    watched project's git-tracked tree. A prior CWD-relative default (the
+    fused-memory config default is ``./data/queue`` /
+    ``./data/reconciliation``) let this state land inside the project root
+    that ``McpLifecycle.start()`` spawns fused-memory in, dirtying the tree
+    and poisoning the startup dirty-tree-guard and warm-lane GC (task 2439).
+
+    Rooted under ``${XDG_STATE_HOME:-~/.local/state}/dark-factory/<project_id>/``
+    — outside any watched project's tree — and keyed by project_id so
+    multiple managed instances never collide.
+    """
+    base = Path(os.environ.get('XDG_STATE_HOME') or (Path.home() / '.local' / 'state'))
+    root = base / 'dark-factory' / project_id
+    return root / 'queue', root / 'reconciliation'
+
+
 class McpLifecycle:
     """Manages the fused-memory MCP HTTP server process."""
 
