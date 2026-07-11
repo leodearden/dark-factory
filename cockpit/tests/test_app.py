@@ -535,3 +535,86 @@ class TestBoostReordersAndPersists:
 
             persisted = {d.id: d for d in sr.list_decisions(root=tmp_path)}
             assert persisted['dec-b'].manual_boost == 7
+
+
+class TestDropRemovesAndPersists:
+    @pytest.mark.timeout(10)
+    async def test_drop_decision_row_removes_live_and_persists(self, tmp_path):
+        """'x' on a DECISION-backed row (PRD §9 C5b) removes it from the
+        queue IMMEDIATELY -- no poll tick, no explicit refresh_registry()
+        call -- and persists via C1's update_decision_state, the cockpit's
+        other sanctioned decision write. A dropped decision never
+        resurfaces (order_queue's own state=='open' filter excludes it).
+        """
+        from cockpit.app import CockpitApp
+        from cockpit.backends import FakeBackend
+        from cockpit.panes.decision_queue import DecisionQueue
+        from textual.widgets.data_table import RowDoesNotExist
+
+        first = sr.DecisionRecord(
+            id='dec-1', project='df', text='First?', filed_at='2026-07-07T00:00:00+00:00'
+        )
+        second = sr.DecisionRecord(
+            id='dec-2', project='df', text='Second?', filed_at='2026-07-07T00:00:00+00:00'
+        )
+        for d in (first, second):
+            assert sr.write_decision(d, root=tmp_path)
+
+        backend = FakeBackend()
+        app = CockpitApp(fleet_root=tmp_path, backend=backend, poll_interval=0.05)
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            queue = app.query_one(DecisionQueue)
+            assert queue.row_count == 2
+
+            queue.move_cursor(row=queue.get_row_index('decision:dec-1'))
+            await pilot.pause()
+
+            await pilot.press('x')
+            await pilot.pause()
+
+            # (a) removed from the live queue -- no poll tick, no explicit
+            # refresh_registry() call anywhere in this test.
+            assert queue.row_count == 1
+            with pytest.raises(RowDoesNotExist):
+                queue.get_row('decision:dec-1')
+            assert queue.get_row('decision:dec-2')
+
+            # (b) persisted via C1.
+            persisted = {d.id: d for d in sr.list_decisions(root=tmp_path)}
+            assert persisted['dec-1'].state == sr.DecisionState.DROPPED
+            assert persisted['dec-2'].state == sr.DecisionState.OPEN  # untouched
+
+    @pytest.mark.timeout(10)
+    async def test_drop_session_row_removes_live_without_writing_the_session(self, tmp_path):
+        """'x' on a SESSION-backed row hides it from the queue in-memory
+        ONLY -- sessions aren't cockpit-writable (PRD §2/§6.6), so this
+        must not touch the session's record on disk, and must not raise.
+        """
+        from cockpit.app import CockpitApp
+        from cockpit.backends import FakeBackend
+        from cockpit.panes.decision_queue import DecisionQueue
+
+        awaiting = _make_record(
+            session_slug='awaiting-1',
+            status=sr.Status.AWAITING_INPUT,
+            question=sr.Question(text='Which port?', asked_at='2026-07-07T00:00:00+00:00'),
+        )
+        sr.write_record(awaiting, root=tmp_path)
+
+        backend = FakeBackend()
+        app = CockpitApp(fleet_root=tmp_path, backend=backend, poll_interval=0.05)
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            queue = app.query_one(DecisionQueue)
+            assert queue.row_count == 1
+
+            await pilot.press('x')
+            await pilot.pause()
+
+            assert queue.row_count == 0
+
+            # the session's own record is untouched -- still awaiting-input,
+            # proving no registry write was attempted for a session row.
+            reread = sr.read_record('awaiting-1', root=tmp_path)
+            assert reread.status == sr.Status.AWAITING_INPUT
