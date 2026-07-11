@@ -1023,6 +1023,13 @@ class ReconReportState:
         same external blocker are semantically duplicate regardless of how
         differently they are worded. Findings with a real top-level task_id,
         and secondary (non-first) citations, are never fold anchors.
+
+        The fold EXEMPTS ``memory_consolidator`` (Stage-1) findings, mirroring
+        Fix-1's read-time ``stage != 'memory_consolidator'`` carve-out in
+        :meth:`get_assembled_report`: two sibling Stage-1 findings that cite the
+        same target stay distinct, and a Stage-2 echo of a Stage-1 citation is
+        already suppressed at read time — so the write-time fold only collapses
+        same-run duplicates in a non-Stage-1 stage that Fix-1 cannot reach.
         """
         entry = self._resolve_entry(run_id)
         if entry is None:
@@ -1053,7 +1060,22 @@ class ReconReportState:
         # In-run cited-task fold (task-2425) — see docstring above. Only the
         # PRIMARY citation (finding.cited_tasks still empty) of a null-
         # top-level-task_id finding is a fold anchor.
-        if finding.task_id is None and not finding.cited_tasks:
+        #
+        # memory_consolidator (Stage 1) findings are EXEMPT from the fold —
+        # mirroring Fix-1's own read-time carve-out in get_assembled_report
+        # (`stage != 'memory_consolidator'`). Two sibling Stage-1 findings that
+        # cite the same target are deliberately kept distinct (see
+        # test_sibling_stage1_findings_not_mutually_suppressed); a Stage-2 echo
+        # of a Stage-1 citation is already handled at read time by
+        # _traces_exclusively_to_stage1. The write-time fold therefore only
+        # targets the gap Fix-1 cannot reach: two same-run findings in a
+        # non-Stage-1 stage (e.g. task_knowledge_sync) that cite the same
+        # external blocker Stage 1 never cited — the autopilot_video repro.
+        if (
+            finding.task_id is None
+            and not finding.cited_tasks
+            and finding_entry.stage != 'memory_consolidator'
+        ):
             cited_task_key = f'{project_id}:{task_id}'
             run_cited_tasks = self._run_cited_task_index.setdefault(run_id, {})
             existing_id = run_cited_tasks.get(cited_task_key)
