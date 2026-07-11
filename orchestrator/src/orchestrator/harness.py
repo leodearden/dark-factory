@@ -1606,6 +1606,10 @@ class Harness:
                         # if a code-touching merge has been debounced and the
                         # orchestrator is idle (no dispatched agents = quiet window).
                         await self._maybe_restart_stale_service(agents_idle=True)
+                        # Fleet-common merge-idle heartbeat (task 2395, α): written
+                        # in both rest branches so a saturated unit (steady-state
+                        # busy-wait branch below) still heartbeats.
+                        await self._write_merge_heartbeat()
                         await asyncio.sleep(self.config.idle_poll_secs)
                         continue
                     # Wait for any active task to complete, then retry.
@@ -1623,6 +1627,10 @@ class Harness:
                     # branches are mutually exclusive per tick and maybe_restart
                     # clears pending on fire, so there is no double-fire.
                     await self._maybe_restart_stale_service(agents_idle=False)
+                    # Fleet-common merge-idle heartbeat (task 2395, α): a
+                    # saturated unit steady-states in this busy-wait branch, so
+                    # it must heartbeat here too — see the idle branch above.
+                    await self._write_merge_heartbeat()
                     continue
 
                 await sem.acquire()
