@@ -134,12 +134,28 @@ class CockpitApp(App):
     """Fleet Cockpit TUI: decision queue + session table + detail pane, polling for changes."""
 
     BINDINGS = [
+        # Fallback only: in normal operation Enter is consumed by whichever
+        # DataTable (SessionTable or DecisionQueue) currently holds focus --
+        # both bind 'enter' to their own select_cursor action, which posts
+        # RowSelected and is resolved from the focused widget UP the DOM, so
+        # it wins before this app-level binding is ever consulted (see
+        # on_data_table_row_selected, which is what actually routes a
+        # DecisionQueue selection to action_focus_selected). This entry only
+        # fires when no DataTable holds focus at all.
         Binding('enter', 'focus_selected', 'Focus', show=False),
         Binding('b', 'boost', 'Boost', show=False),
         Binding('B', 'big_boost', 'Big boost', show=False),
         Binding('x', 'drop', 'Drop', show=False),
         Binding('d', 'defer', 'Defer', show=False),
         Binding('n', 'new_session', 'New session', show=False),
+        # All ten digits are bound, but a digit's SCORE effect saturates
+        # once it exceeds the active Priorities.manual_boost.max (default 5
+        # -- see priority.py's score(), which clamps manual_boost into
+        # [manual_boost.min, .max] before weighting it). Under the bundled
+        # default config, '6'..'9' therefore reorder identically to '5'.
+        # The persisted/in-memory boost still records the exact digit
+        # pressed (see action_set_priority) -- only the resulting score
+        # saturates.
         *(Binding(str(d), f'set_priority({d})', f'Priority {d}', show=False) for d in range(10)),
     ]
 
@@ -427,7 +443,12 @@ class CockpitApp(App):
         """A digit key (0-9) -- set the highlighted row's priority to that EXACT value.
 
         Absolute, not additive -- distinct from action_boost/action_big_boost.
-        See _apply_boost.
+        The stored manual_boost is set to *priority* exactly (unclamped --
+        see _apply_boost/TestBoostReordersAndPersists), but cockpit.priority
+        .score() clamps manual_boost into [Priorities.manual_boost.min,
+        .max] (default [-5, 5]) before scoring it, so under the default
+        config digits above 5 persist distinctly yet reorder identically to
+        '5' (see the BINDINGS comment above). See _apply_boost.
         """
         self._apply_boost(absolute=priority)
 
