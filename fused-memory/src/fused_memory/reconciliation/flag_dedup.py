@@ -1680,22 +1680,26 @@ async def filter_already_tracked_systemic_patterns(
     spawned duplicate dark_factory task 2412.
 
     A flag is a CANDIDATE iff :func:`_is_systemic_pattern_candidate` returns
-    True for it.  Non-candidate flags pass through unchanged.
+    True for it.  Non-candidate flags always pass through unchanged, and when
+    there are ZERO candidates in the batch this returns immediately WITHOUT
+    issuing any ``get_tasks`` call at all.
 
-    Fetches done dark_factory tasks ONCE via
-    ``taskmaster.get_tasks(dark_factory_root, statuses=['done'])`` and
-    precomputes each done task's key terms from ``title`` + ``description``
-    (:func:`_significant_terms`).  A candidate is DROPPED iff some done task's
-    key terms cover at least ``match_coverage`` (fraction) of the candidate's
-    own key terms (extracted from its ``description``):
-    ``|finding_terms ∩ task_terms| / |finding_terms|``, maximised over all
-    done tasks.  Order-preserving: surviving flags keep their original
-    relative order.
+    A candidate whose :func:`_significant_terms` count is below
+    ``min_key_terms`` is KEPT unconditionally, with no match attempted —
+    too few distinctive terms to trust a coverage match.  Otherwise, fetches
+    done dark_factory tasks ONCE via ``taskmaster.get_tasks(dark_factory_root,
+    statuses=['done'])`` and precomputes each done task's key terms from
+    ``title`` + ``description`` (:func:`_significant_terms`).  A candidate is
+    DROPPED iff some done task's key terms cover at least ``match_coverage``
+    (fraction) of the candidate's own key terms (extracted from its
+    ``description``): ``|finding_terms ∩ task_terms| / |finding_terms|``,
+    maximised over all done tasks.  Order-preserving: surviving flags keep
+    their original relative order.
 
-    NOTE: this is the base matching behaviour only.  Fail-open guards (falsy
-    taskmaster/dark_factory_root, get_tasks errors, malformed results) and the
-    ``min_key_terms`` floor are added in a follow-up hardening pass (see the
-    updated docstring once that lands).
+    NOTE: this is the base matching + scope-guard behaviour.  Fail-open
+    guards around the ``get_tasks`` call itself (falsy taskmaster/
+    dark_factory_root, get_tasks errors, malformed results) are added in a
+    follow-up hardening pass (see the updated docstring once that lands).
 
     Args:
         taskmaster: Object with an async ``get_tasks(project_root, *,
@@ -1704,7 +1708,8 @@ async def filter_already_tracked_systemic_patterns(
         dark_factory_root: dark_factory's project_root (resolved by the
             caller from ``self.known_projects[DARK_FACTORY_PROJECT_ID]``).
         flags: List of flag dicts from Stage 1 ``items_flagged``.
-        min_key_terms: Reserved for a follow-up hardening step; unused so far.
+        min_key_terms: Minimum distinct key terms a candidate must have
+            before a match is even attempted (default 4).
         match_coverage: Minimum key-term coverage fraction required to drop a
             candidate (default 0.75).
 
@@ -1718,6 +1723,11 @@ async def filter_already_tracked_systemic_patterns(
             candidate_positions.append(i)
             candidate_terms.append(_significant_terms(flag.get('description') or ''))
 
+    if not candidate_positions:
+        # No candidates at all — skip the get_tasks call entirely, not just
+        # the matching loop below (scope guard, task 2416 step-6).
+        return list(flags)
+
     result = await taskmaster.get_tasks(dark_factory_root, statuses=['done'])
     done_tasks = result.get('tasks') or []
     task_term_sets = [
@@ -1727,7 +1737,9 @@ async def filter_already_tracked_systemic_patterns(
 
     drop_positions: set[int] = set()
     for pos, finding_terms in zip(candidate_positions, candidate_terms, strict=True):
-        if not finding_terms:
+        if len(finding_terms) < min_key_terms:
+            # Too few distinctive terms to trust a coverage match — KEEP
+            # without attempting a match (task 2416 step-6 min-term floor).
             continue
         best_coverage = 0.0
         for task_terms in task_term_sets:
