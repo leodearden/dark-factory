@@ -232,6 +232,24 @@ class TimeoutsConfig(BaseModel):
             "per-role ceiling applies."
         ),
     )
+    working_idle_secs: float = Field(
+        default=1800.0,
+        description=(
+            "Post-turn-1 no-progress idle bound (seconds). Once the STARTUP "
+            "grace window has passed (≥1 assistant turn observed), the "
+            "working-regime watchdog no longer kills at a flat per-role "
+            "ceiling: it polls the transcript at a coarse cadence and kills "
+            "only after no NEW assistant turn has appeared for "
+            "max(working_idle_secs, the per-role ceiling) — the per-role "
+            "timeout becomes the FLOOR of the idle window (B6 long-tool-call "
+            "safety: a single legitimate synchronous tool call must never be "
+            "false-killed), not a hard wall on a productive run. Bounded "
+            "above by OrchestratorConfig.invocation_timeout, the absolute "
+            "cap. Only engages when the transcript is readable; an "
+            "unreadable transcript falls back to the old flat "
+            "per-role-ceiling kill (B7 conservative degrade)."
+        ),
+    )
 
 
 class BackendsConfig(BaseModel):
@@ -254,7 +272,7 @@ class UnblockAutoConfig(BaseModel):
 
     enabled: bool = Field(default=True)
     budget_usd: float = Field(default=5.0)
-    timeout_seconds: float = Field(default=600.0)
+    timeout_seconds: float = Field(default=1200.0)
     model: str = Field(default='sonnet')
     max_turns: int = Field(default=50)
     effort: str = Field(default='high')
@@ -1453,6 +1471,27 @@ class OrchestratorConfig(BaseSettings):
 
     # Iteration limits
     max_execute_iterations: int = Field(default=10)
+    # Independent bound on progress-timeout+resume churn. A ceiling-kill of a
+    # productive run (transcript_turns>0) followed by its resume counts as
+    # ONE iteration against max_execute_iterations (see
+    # workflow._execute_iterations), so a steadily-advancing task can no
+    # longer exhaust its iteration budget purely on kill/resume churn. This
+    # field bounds that excluded churn independently: once
+    # max_progress_resume_iterations progress-resumes have accumulated, the
+    # workflow returns BLOCKED with a distinct reason, separate from the
+    # zero-output-hang and generic 'Execution iterations exhausted' paths.
+    # Default 20 leaves generous headroom above a normal task's 0-2 resumes.
+    #
+    # Combined worst case: each progress-resume invocation may itself run up
+    # to invocation_timeout (the working-regime absolute cap, default 7200s)
+    # before being ceiling-killed, so the churn breaker's worst-case
+    # aggregate wall-clock before tripping is
+    # max_progress_resume_iterations * invocation_timeout — e.g. the
+    # shipped defaults (20 * 7200s) compound to ~40h. That is intentional
+    # (the two knobs bound independent things: iteration-count churn vs.
+    # per-attempt wall-clock), but the multiplicative interaction is easy to
+    # miss when tuning either default in isolation — see invocation_timeout.
+    max_progress_resume_iterations: int = Field(default=20, ge=1)
     max_verify_attempts: int = Field(default=5)
     # Fast-fail cap for ``infra_timeout`` results whose cause_hint is the
     # verifier's own injected ``Command timed out after Ns: …`` wrapper string
@@ -2298,9 +2337,16 @@ class OrchestratorConfig(BaseSettings):
         ),
     )
 
-    # Legacy scalar — ignored if `timeouts` section is present in config.
-    # Kept for backwards-compat with config files that haven't migrated.
-    invocation_timeout: float = Field(default=1200.0)
+    # Two LIVE uses: (1) per-role timeout FALLBACK — workflow._invoke reads
+    # `getattr(timeouts_cfg, role_key, self.config.invocation_timeout)`, so
+    # any role whose split role_key misses a TimeoutsConfig field (e.g.
+    # module_tagger/deep_reviewer) falls through to this scalar; (2) the
+    # working-regime ABSOLUTE CAP — the outer bound on the post-turn-1
+    # progress extension (see TimeoutsConfig.working_idle_secs), regardless
+    # of how much the transcript keeps advancing. Default 7200.0 matches
+    # defaults.yaml, which has shipped this value since before this scalar
+    # was repurposed as the absolute cap.
+    invocation_timeout: float = Field(default=7200.0)
 
     # Models, budgets, turns, timeouts per role
     models: ModelsConfig = Field(default_factory=ModelsConfig)

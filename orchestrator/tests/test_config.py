@@ -2122,4 +2122,90 @@ class TestApplyReloadHybridRollback:
         # restart_required under the synthetic allowlist).
         assert live.model_dump() == live_dump_before
         assert live.timeouts.steward == 1800.0
-        assert live.steward_completion_timeout == 900.0
+
+
+class TestProgressExtensionConfig:
+    """Working-regime progress-extended deadline config (task 2360, step-1).
+
+    Pins the four new/changed config knobs that back the post-turn-1 progress
+    extension: TimeoutsConfig.working_idle_secs (new post-turn-1 no-progress
+    idle bound), the repurposed OrchestratorConfig.invocation_timeout absolute
+    cap (1200 -> 7200, aligning the Pydantic default with defaults.yaml, which
+    already ships 7200 and is live as the per-role timeout fallback at
+    workflow.py:7130), the raised UnblockAutoConfig.timeout_seconds (600 ->
+    1200, >= the implementer's 1200s per-role ceiling), and the new
+    OrchestratorConfig.max_progress_resume_iterations churn bound.
+    """
+
+    def test_working_idle_secs_default_is_1800(self, monkeypatch, tmp_path):
+        """TimeoutsConfig.working_idle_secs defaults to 1800.0.
+
+        The working-regime watchdog kills only after the transcript shows no
+        NEW assistant turn for max(working_idle_secs, per-role ceiling); this
+        pins the idle-bound half of that pair.
+        """
+        monkeypatch.chdir(tmp_path)
+        monkeypatch.setenv('ORCH_CONFIG_PATH', '')
+        config = OrchestratorConfig()
+        assert config.timeouts.working_idle_secs == 1800.0
+
+    def test_invocation_timeout_pydantic_default_is_7200(self):
+        """Raw Pydantic field default for invocation_timeout is 7200.0 (repurposed absolute cap).
+
+        Mirrors the verify_cold_command_timeout_secs_pydantic_default_is_none
+        pattern above: probes OrchestratorConfig.model_fields directly so the
+        assertion is meaningful independent of defaults.yaml loading. A bare
+        OrchestratorConfig() already resolves to 7200.0 today via package
+        defaults.yaml (settings_customise_sources), which is why this checks
+        the raw field default rather than the loaded value — direct-construction
+        callers (tests, or a project config that sets `timeouts:` but omits
+        `invocation_timeout`) must also land on 7200.0 now that this scalar
+        doubles as the working-regime absolute cap.
+        """
+        field_info = OrchestratorConfig.model_fields['invocation_timeout']
+        assert field_info.default == 7200.0
+
+    def test_unblock_auto_timeout_seconds_default_is_1200(self, monkeypatch, tmp_path):
+        """UnblockAutoConfig.timeout_seconds default is raised 600.0 -> 1200.0.
+
+        Raised to >= the implementer's per-role ceiling (timeouts.implementer
+        == 1200.0) so unblock_auto's dry-run investigator no longer reproduces
+        the exact ceiling-kill failure it is diagnosing.
+        """
+        monkeypatch.chdir(tmp_path)
+        monkeypatch.setenv('ORCH_CONFIG_PATH', '')
+        config = OrchestratorConfig()
+        assert config.unblock_auto.timeout_seconds == 1200.0
+
+    def test_max_progress_resume_iterations_default_is_20(self, monkeypatch, tmp_path):
+        """OrchestratorConfig.max_progress_resume_iterations defaults to 20.
+
+        Independent churn bound on progress-timeout+resume pairs, separate
+        from max_execute_iterations (which progress-resumes no longer consume
+        toward — see workflow._execute_iterations).
+        """
+        monkeypatch.chdir(tmp_path)
+        monkeypatch.setenv('ORCH_CONFIG_PATH', '')
+        config = OrchestratorConfig()
+        assert config.max_progress_resume_iterations == 20
+
+    def test_defaults_yaml_round_trips_progress_extension_fields(self, monkeypatch, tmp_path):
+        """defaults.yaml carries the shipped values for all four fields, and a
+        bare OrchestratorConfig() (which loads package defaults.yaml via
+        settings_customise_sources) picks them up byte-for-byte."""
+        monkeypatch.chdir(tmp_path)
+        monkeypatch.setenv('ORCH_CONFIG_PATH', '')
+        config = OrchestratorConfig()
+        defaults = _load_package_defaults()
+
+        assert defaults['timeouts']['working_idle_secs'] == 1800
+        assert config.timeouts.working_idle_secs == defaults['timeouts']['working_idle_secs']
+
+        assert defaults['invocation_timeout'] == 7200
+        assert config.invocation_timeout == defaults['invocation_timeout']
+
+        assert defaults['unblock_auto']['timeout_seconds'] == 1200
+        assert config.unblock_auto.timeout_seconds == defaults['unblock_auto']['timeout_seconds']
+
+        assert defaults['max_progress_resume_iterations'] == 20
+        assert config.max_progress_resume_iterations == defaults['max_progress_resume_iterations']

@@ -23,6 +23,7 @@ from shared.cli_invoke import (
     AllAccountsCappedException,
     classify_agent_failure,
     invoke_with_cap_retry,
+    is_timed_out_with_progress,
     is_zero_output_timeout,
 )
 from shared.config_dir import TaskConfigDir
@@ -327,6 +328,15 @@ async def run_dry_run_unblock(
                 output_schema=DRY_RUN_PROPOSAL_SCHEMA,
                 effort=ua_cfg.effort,
                 timeout_seconds=ua_cfg.timeout_seconds,
+                # Working-regime progress extension (task 2360, reify-4827):
+                # config_dir + session_id (above) already revive the startup
+                # watchdog, so once the transcript shows turn-1 the watchdog
+                # can poll it — these two params let a genuinely productive
+                # investigation run past ua_cfg.timeout_seconds instead of
+                # being ceiling-killed and reproducing the very failure it is
+                # meant to diagnose.
+                working_idle_secs=config.timeouts.working_idle_secs,
+                absolute_cap_secs=config.invocation_timeout,
             )
 
         try:
@@ -528,12 +538,24 @@ def _build_entry(result: Any, *, reason: str, budget_usd: float) -> dict[str, An
             }
         failure_cls = classify_agent_failure(result)
         if failure_cls.kind in _INFRA_FAILURE_KINDS:
+            proposal_text = (
+                f'Infra wedge (retryable, not a human-review conclusion): '
+                f'{failure_cls.summary}; subtype={result.subtype}'
+            )
+            if is_timed_out_with_progress(result):
+                # Truthful reporting (task 2360 fix #3/reify-4827): the bare
+                # "Infra wedge (retryable...)" framing above reads as a
+                # contradiction next to a many-turn productive run — append
+                # an explicit marker that routes the reader toward "raise
+                # the wall / task is slow" rather than "retryable infra".
+                proposal_text += (
+                    f' (timed_out=True, transcript_turns={result.transcript_turns} '
+                    f'— productive wall-clock kill, not a wedge; raise the '
+                    f'wall / task is slow)'
+                )
             return {
                 'status': 'infra_failure',
-                'proposal_text': (
-                    f'Infra wedge (retryable, not a human-review conclusion): '
-                    f'{failure_cls.summary}; subtype={result.subtype}'
-                ),
+                'proposal_text': proposal_text,
                 'risk_label': _HUMAN_REVIEW_REQUIRED,
                 'files_referenced': [],
                 'block_reason': reason,

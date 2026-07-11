@@ -52,6 +52,14 @@ _WATCHDOG_POLL_SECS = 5.0
 # time_to_grace and time_to_ceiling have already elapsed (would otherwise cause an
 # asyncio.wait(timeout=0) tight-spin hammering count_transcript_turns).
 _WATCHDOG_MIN_POLL_SECS = 0.01
+# Coarse poll cadence for the WORKING-regime progress extension (task 2360).
+# Once seen_turn latches AND working_idle_secs/absolute_cap_secs are both set,
+# the watchdog keeps polling count_transcript_turns — but at this much coarser
+# cadence than _WATCHDOG_POLL_SECS, since a healthy working session can run for
+# 20-40 minutes and there is no need to hammer the transcript file every 5s.
+# Still floored by _WATCHDOG_MIN_POLL_SECS and clamped by time-to-idle-kill /
+# time-to-absolute-cap so a kill boundary is never overshot by a full poll.
+_WATCHDOG_WORKING_POLL_SECS = 60.0
 # Per-caller cap-wait policy (post-1365 audit, task 1401)
 # ─────────────────────────────────────────────────────────────────────────────
 # _DEFAULT_CAP_WAIT_SANITY_SECS (14 days) is inherited by callers that do NOT
@@ -451,7 +459,9 @@ def classify_agent_failure(result: AgentResult) -> AgentFailureClass:
 
     1. ``classify_invocation(result, strict_confirm=True)`` is ``OK``
        (mirrors ``result.success``) → ``SUCCESS``.
-    2. ``result.timed_out`` → ``TIMED_OUT``.
+    2. ``result.timed_out`` → ``TIMED_OUT`` (summary distinguishes a
+       PRODUCTIVE kill — ``transcript_turns > 0`` — from a no-progress wedge;
+       see ``is_timed_out_with_progress``/reify-4827).
     3. ``result.subtype == 'error_max_turns'`` → ``MAX_TURNS``
        (high ``turns`` + non-zero ``output_tokens`` but empty ``output``).
     4. ``result.api_error_status`` set, OR the outcome is ``AuthFailed`` →
@@ -469,8 +479,8 @@ def classify_agent_failure(result: AgentResult) -> AgentFailureClass:
     7. otherwise → ``UNKNOWN``.
 
     ``diagnostic_detail`` always includes: subtype, turns, cost_usd,
-    duration_ms, timed_out, api_error_status, output length, last 500 chars
-    of stdout output, and last 500 chars of stderr.
+    duration_ms, timed_out, transcript_turns, api_error_status, output
+    length, last 500 chars of stdout output, and last 500 chars of stderr.
     """
     # Lazy (function-local) import — see the identical note in
     # invoke_with_cap_retry: a module-top import here would create a
@@ -487,6 +497,7 @@ def classify_agent_failure(result: AgentResult) -> AgentFailureClass:
         f'cost_usd={result.cost_usd}\n'
         f'duration_ms={result.duration_ms}\n'
         f'timed_out={result.timed_out}\n'
+        f'transcript_turns={result.transcript_turns}\n'
         f'api_error_status={result.api_error_status}\n'
         f'len(output)={len(result.output)}\n'
         f'output (last 500 chars):\n{tail_out}\n'
@@ -500,11 +511,22 @@ def classify_agent_failure(result: AgentResult) -> AgentFailureClass:
             diagnostic_detail=diagnostic_detail,
         )
     if result.timed_out:
+        # Truthful reporting (task 2360 fix #3): result.turns is always 0 on
+        # the empty-stdout timeout path by construction (the CLI's JSON is
+        # never parsed), so "(N turns)" was vacuous there — replace it with
+        # the transcript-authoritative signal and a productive/wedge
+        # distinction so a killed-but-productive run (reify-4827) is never
+        # reported as indistinguishable from a genuine no-progress wedge.
+        if result.transcript_turns:
+            progress_desc = (
+                f'{result.transcript_turns} transcript turns (productive; not a wedge)'
+            )
+        else:
+            progress_desc = 'no transcript turns (wedge — no progress made)'
         return AgentFailureClass(
             kind=AgentFailureKind.TIMED_OUT,
             summary=(
-                f'agent timed out after {result.duration_ms}ms '
-                f'({result.turns} turns)'
+                f'agent timed out after {result.duration_ms}ms with {progress_desc}'
             ),
             diagnostic_detail=diagnostic_detail,
         )
@@ -623,6 +645,8 @@ async def invoke_claude_agent(
     env_overrides: dict[str, str] | None = None,
     startup_grace_secs: float = 120.0,
     sandbox_wrap: Callable[[list[str]], list[str]] | None = None,
+    working_idle_secs: float | None = None,
+    absolute_cap_secs: float | None = None,
 ) -> AgentResult:
     """Invoke Claude Code CLI and return structured result.
 
@@ -648,6 +672,13 @@ async def invoke_claude_agent(
     Keeps ``shared`` policy-agnostic: callers supply the confinement closure;
     the subprocess sees the wrapped argv.  Default ``None`` → no wrap (today's
     behavior).
+
+    *working_idle_secs* / *absolute_cap_secs*, when BOTH set, extend the
+    working-regime watchdog past *timeout_seconds* while the transcript keeps
+    advancing: the subprocess is killed only after no new transcript turn for
+    ``max(working_idle_secs, timeout_seconds)``, or at *absolute_cap_secs*,
+    whichever comes first.  Default ``None`` for both → no extension,
+    *timeout_seconds* stays the hard wall (today's exact behavior).
     """
     return await _invoke_claude(
         prompt=prompt, system_prompt=system_prompt, cwd=cwd, model=model,
@@ -661,6 +692,8 @@ async def invoke_claude_agent(
         env_overrides=env_overrides,
         startup_grace_secs=startup_grace_secs,
         sandbox_wrap=sandbox_wrap,
+        working_idle_secs=working_idle_secs,
+        absolute_cap_secs=absolute_cap_secs,
     )
 
 
@@ -1094,6 +1127,33 @@ async def invoke_with_cap_retry(
                             await asyncio.sleep(cooldown)
                             continue
 
+                # Progress-timeout guard (reify-4827, task 2360 fix #2): a
+                # RESUMED invocation that hit the working-regime ceiling but
+                # made real agentic progress (transcript_turns > 0) must be
+                # returned to the caller, not silently discarded into the
+                # generic non-cap-hit resume-failure branch below — that
+                # branch restarts from the ORIGINAL prompt, throwing away the
+                # transcript and all agent progress. The workflow gamma
+                # branch (is_timed_out_with_progress) owns re-resuming this
+                # session with its own continuation prompt. Mutually
+                # exclusive with the ZeroOutputWedge guard above
+                # (transcript_turns 0 vs >0), so zero-output wedges are
+                # unaffected and still take the existing fresh-fallback path.
+                if (
+                    invoke_kwargs.get('resume_session_id')
+                    and is_timed_out_with_progress(result)
+                ):
+                    logger.warning(
+                        f'{label}: resumed invocation timed out WITH progress '
+                        f'(transcript_turns={result.transcript_turns}, '
+                        f'duration_ms={result.duration_ms}) — returning to '
+                        f'caller for γ re-resume instead of discarding into '
+                        f'a fresh retry',
+                    )
+                    if not unattributed_cap:
+                        slot.confirm(result.cost_usd)
+                    break
+
                 # Non-cap-hit failure while resuming → fall back to fresh invocation.
                 # Rebuild via the caller's hook (no-op when rebuild_prompt is None):
                 # mirrors the two cap-hit fresh-fallback paths above, since a
@@ -1158,6 +1218,8 @@ async def _invoke_claude(
     env_overrides: dict[str, str] | None = None,
     startup_grace_secs: float = 120.0,
     sandbox_wrap: Callable[[list[str]], list[str]] | None = None,
+    working_idle_secs: float | None = None,
+    absolute_cap_secs: float | None = None,
 ) -> AgentResult:
     """Invoke Claude Code CLI."""
     cmd = ['claude', '--print', '--output-format', 'json']
@@ -1265,6 +1327,8 @@ async def _invoke_claude(
             session_id=(resume_session_id or session_id),
             config_dir=config_dir,
             startup_grace_secs=startup_grace_secs,
+            working_idle_secs=working_idle_secs,
+            absolute_cap_secs=absolute_cap_secs,
         )
         return _parse_claude_output(result)
     finally:
@@ -1281,10 +1345,22 @@ def _parse_claude_output(result: _SubprocessResult) -> AgentResult:
     return path.
     """
     if not result.stdout.strip():
+        # Distinct subtype (task 2360 fix #3): a wall-clock timeout that DID
+        # make real agentic progress (transcript_turns>0) is not the same
+        # failure as a genuine pre-turn wedge (transcript_turns==0/None) —
+        # conflating them under 'error_empty_output' fabricates "no real work
+        # done" for a productive run (reify-4827). Mirrors
+        # is_timed_out_with_progress's condition inline since that predicate
+        # takes an AgentResult, not this _SubprocessResult.
+        empty_output_subtype = (
+            'error_timeout_killed_with_progress'
+            if result.timed_out and (result.transcript_turns or 0) > 0
+            else 'error_empty_output'
+        )
         return AgentResult(
             success=False,
             output='Agent produced no output',
-            subtype='error_empty_output',
+            subtype=empty_output_subtype,
             stderr=result.stderr,
             timed_out=result.timed_out,
             duration_ms=result.duration_ms,
@@ -1471,11 +1547,18 @@ async def _run_subprocess(
     session_id: str | None = None,
     config_dir: Path | None = None,
     startup_grace_secs: float = 120.0,
+    working_idle_secs: float | None = None,
+    absolute_cap_secs: float | None = None,
 ) -> _SubprocessResult:
     """Run a subprocess, log output.
 
     *stdin_data*, when set, is piped to the process's stdin.  This avoids
     passing large payloads as command-line arguments (which hit ARG_MAX).
+
+    *working_idle_secs* / *absolute_cap_secs*, when BOTH set, extend the
+    WORKING regime past *timeout_seconds* while the transcript keeps
+    advancing.  Default ``None`` for both → today's exact behavior:
+    *timeout_seconds* is the flat WORKING-regime ceiling.
     """
     logger.info(f'Invoking claude agent: model={model} cwd={cwd}')
     logger.info(f'Command: {" ".join(cmd[:15])}...')
@@ -1530,6 +1613,12 @@ async def _run_subprocess(
             watchdog_start = time.monotonic()
             seen_turn = False  # latched True once ≥1 assistant turn observed
             live_turns: int | None = None  # last non-None turn count read
+            # WORKING-regime progress extension (task 2360): last observed
+            # turn count and the monotonic time it was observed increasing.
+            # Both are set together, the moment seen_turn first latches, and
+            # updated together whenever a later poll observes MORE turns.
+            last_progress_turns: int | None = None
+            last_progress_monotonic: float | None = None
 
             comm_task = asyncio.ensure_future(
                 proc.communicate(input=stdin_data)
@@ -1537,6 +1626,14 @@ async def _run_subprocess(
 
             while True:
                 elapsed = time.monotonic() - watchdog_start
+                # Extension engages once liveness is proven (seen_turn) AND the
+                # caller opted in (both params set).  Monotonic: seen_turn only
+                # ever goes False→True, so this can only turn on, never off.
+                extension_engaged = (
+                    seen_turn
+                    and working_idle_secs is not None
+                    and absolute_cap_secs is not None
+                )
                 # How long until the next mandatory check-point?
                 #
                 # time_to_grace: collapse to inf once the startup-grace kill can
@@ -1558,19 +1655,43 @@ async def _run_subprocess(
                     float('inf') if _grace_spent
                     else max(0.0, startup_grace_secs - elapsed)
                 )
-                time_to_ceiling = (
-                    max(0.0, timeout_seconds - elapsed)
-                    if timeout_seconds is not None
-                    else float('inf')
-                )
-                # Floor at _WATCHDOG_MIN_POLL_SECS so the poll never degenerates
-                # to 0.0 (which would make asyncio.wait return immediately and
-                # tight-spin, hammering count_transcript_turns and starving the
-                # event loop).
-                poll = max(
-                    min(_WATCHDOG_POLL_SECS, time_to_grace, time_to_ceiling),
-                    _WATCHDOG_MIN_POLL_SECS,
-                )
+                if extension_engaged:
+                    # extension_engaged's own definition requires both params to
+                    # be set (see derivation above/below) — narrow for the type
+                    # checker, which cannot infer that from the bool flag alone.
+                    assert working_idle_secs is not None and absolute_cap_secs is not None
+                    # idle_bound: the per-role ceiling is the FLOOR of the idle
+                    # window (B6 long-tool-call safety) — never smaller than
+                    # today's ceiling.
+                    idle_bound = (
+                        max(working_idle_secs, timeout_seconds)
+                        if timeout_seconds is not None
+                        else working_idle_secs
+                    )
+                    time_to_idle_kill = (
+                        max(0.0, idle_bound - (time.monotonic() - last_progress_monotonic))
+                        if last_progress_monotonic is not None
+                        else idle_bound
+                    )
+                    time_to_abs_cap = max(0.0, absolute_cap_secs - elapsed)
+                    poll = max(
+                        min(_WATCHDOG_WORKING_POLL_SECS, time_to_idle_kill, time_to_abs_cap),
+                        _WATCHDOG_MIN_POLL_SECS,
+                    )
+                else:
+                    time_to_ceiling = (
+                        max(0.0, timeout_seconds - elapsed)
+                        if timeout_seconds is not None
+                        else float('inf')
+                    )
+                    # Floor at _WATCHDOG_MIN_POLL_SECS so the poll never degenerates
+                    # to 0.0 (which would make asyncio.wait return immediately and
+                    # tight-spin, hammering count_transcript_turns and starving the
+                    # event loop).
+                    poll = max(
+                        min(_WATCHDOG_POLL_SECS, time_to_grace, time_to_ceiling),
+                        _WATCHDOG_MIN_POLL_SECS,
+                    )
 
                 done, _ = await asyncio.wait({comm_task}, timeout=poll)
 
@@ -1586,7 +1707,9 @@ async def _run_subprocess(
                 # guard requires `not seen_turn`, so live_turns is never consulted
                 # again in the working regime.  Skip the on-disk read to avoid
                 # redundant FS I/O for the (potentially 20-40 min) post-turn-1
-                # lifetime of a healthy long-running agent.
+                # lifetime of a healthy long-running agent — UNLESS the progress
+                # extension is engaged, in which case the read is the extension's
+                # own (coarse-cadence) liveness signal.
                 # The post-kill transcript_turns re-read in the except block is
                 # unaffected — it is a separate, one-shot read outside this loop.
                 if not seen_turn and config_dir and session_id:
@@ -1595,8 +1718,22 @@ async def _run_subprocess(
                         live_turns = n
                         if n >= 1:
                             seen_turn = True
+                            last_progress_turns = n
+                            last_progress_monotonic = time.monotonic()
+                elif extension_engaged and config_dir and session_id:
+                    n = count_transcript_turns(config_dir, session_id)
+                    if n is not None and (last_progress_turns is None or n > last_progress_turns):
+                        last_progress_turns = n
+                        last_progress_monotonic = time.monotonic()
 
                 elapsed = time.monotonic() - watchdog_start
+                # Re-derive fresh (not the top-of-loop value) so a seen_turn
+                # transition earlier in THIS iteration is reflected immediately.
+                extension_engaged = (
+                    seen_turn
+                    and working_idle_secs is not None
+                    and absolute_cap_secs is not None
+                )
 
                 # Startup-regime kill: explicit 0-turn read AND grace expired.
                 # NEVER kill on None (unreadable transcript) — conservative degrade.
@@ -1615,16 +1752,58 @@ async def _run_subprocess(
                         await comm_task
                     raise TimeoutError
 
-                # Absolute-ceiling kill.
-                if timeout_seconds is not None and elapsed >= timeout_seconds:
-                    logger.warning(
-                        f'Absolute ceiling reached after {elapsed:.1f}s '
-                        f'(ceiling={timeout_seconds}s): model={model} — killing'
+                if extension_engaged:
+                    # extension_engaged ⟹ seen_turn ⟹ last_progress_turns/
+                    # last_progress_monotonic were set atomically with seen_turn
+                    # (above) and are never reset to None; working_idle_secs/
+                    # absolute_cap_secs are part of extension_engaged's own
+                    # definition — narrow all three for the type checker.
+                    assert (
+                        working_idle_secs is not None
+                        and absolute_cap_secs is not None
+                        and last_progress_monotonic is not None
                     )
-                    comm_task.cancel()
-                    with contextlib.suppress(asyncio.CancelledError, Exception):
-                        await comm_task
-                    raise TimeoutError
+                    idle_bound = (
+                        max(working_idle_secs, timeout_seconds)
+                        if timeout_seconds is not None
+                        else working_idle_secs
+                    )
+                    idle_elapsed = time.monotonic() - last_progress_monotonic
+                    if idle_elapsed >= idle_bound:
+                        logger.warning(
+                            f'Working-regime idle bound reached after {idle_elapsed:.1f}s '
+                            f'with no new transcript turn (idle_bound={idle_bound}s, '
+                            f'last progress at {last_progress_turns} turns): '
+                            f'model={model} — cancelling comm_task and killing'
+                        )
+                        comm_task.cancel()
+                        with contextlib.suppress(asyncio.CancelledError, Exception):
+                            await comm_task
+                        raise TimeoutError
+
+                    if elapsed >= absolute_cap_secs:
+                        logger.warning(
+                            f'Working-regime absolute cap reached after {elapsed:.1f}s '
+                            f'(cap={absolute_cap_secs}s): model={model} — killing'
+                        )
+                        comm_task.cancel()
+                        with contextlib.suppress(asyncio.CancelledError, Exception):
+                            await comm_task
+                        raise TimeoutError
+                else:
+                    # Absolute-ceiling kill — today's exact behavior.  Fires
+                    # only when the extension is not engaged: either param is
+                    # None, OR seen_turn hasn't latched, OR (transitively) the
+                    # transcript never proved readable (B7 conservative degrade).
+                    if timeout_seconds is not None and elapsed >= timeout_seconds:
+                        logger.warning(
+                            f'Absolute ceiling reached after {elapsed:.1f}s '
+                            f'(ceiling={timeout_seconds}s): model={model} — killing'
+                        )
+                        comm_task.cancel()
+                        with contextlib.suppress(asyncio.CancelledError, Exception):
+                            await comm_task
+                        raise TimeoutError
 
         except TimeoutError:
             # Snapshot the process group FIRST — before terminate() — while the

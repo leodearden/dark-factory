@@ -28,7 +28,7 @@ from _orch_helpers import pydantic_spec
 from orchestrator.agents.invoke import AgentResult
 from orchestrator.artifacts import TaskArtifacts
 from orchestrator.config import OrchestratorConfig
-from orchestrator.workflow import TaskWorkflow, WorkflowOutcome
+from orchestrator.workflow import ZERO_OUTPUT_HANG_REASON, TaskWorkflow, WorkflowOutcome
 
 # ---------------------------------------------------------------------------
 # Shared harness (mirrors test_workflow_zero_output_hang.py)
@@ -41,6 +41,7 @@ def _make_workflow(
     task_id: str = '1780',
     max_execute_iterations: int = 10,
     max_consecutive_zero_output_timeouts: int = 2,
+    max_progress_resume_iterations: int = 20,
 ) -> TaskWorkflow:
     """Minimal TaskWorkflow harness for resume-on-progress tests.
 
@@ -65,6 +66,7 @@ def _make_workflow(
     config.merge_train_max_members = 3
     config.max_execute_iterations = max_execute_iterations
     config.max_consecutive_zero_output_timeouts = max_consecutive_zero_output_timeouts
+    config.max_progress_resume_iterations = max_progress_resume_iterations
     config.recycle_config_dir_on_zero_output = False
     config.judge_after_each_iteration = False
     config.inter_iteration_rebase = False
@@ -311,6 +313,189 @@ class TestProgressResetsZeroOutputCounter:
         assert mock_invoke.call_count == 4, (
             f'Expected 4 _invoke calls (counter resets after progress), '
             f'got {mock_invoke.call_count}'
+        )
+
+
+# ---------------------------------------------------------------------------
+# task 2360 step-17: progress-resume iteration accounting
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestProgressResumeIterationAccounting:
+    """A progress-timeout+resume pair counts as ONE against max_execute_iterations
+    (excluded from the cap check), independently bounded by
+    config.max_progress_resume_iterations so a non-converging kill/resume
+    loop cannot run forever (task 2360, reify-4827).
+
+    (a) test_progress_resume_pairs_excluded_from_iteration_cap — PAIR-COUNTS-AS-ONE:
+        two progress-timeouts followed by a successful, plan-clearing iteration
+        must NOT trip a max_execute_iterations=2 cap (both progress-timeouts
+        are excluded from the count), and the third (successful) invocation
+        must actually run.
+    (b) test_progress_resume_churn_bound_blocks_with_distinct_reason — CHURN-BOUND:
+        an endless progress-timeout stream trips the independent
+        max_progress_resume_iterations=3 bound and returns BLOCKED with a
+        reason distinct from both ZERO_OUTPUT_HANG_REASON and the generic
+        'Execution iterations exhausted' path.
+
+    Fails RED: today every progress-timeout increments execute_iterations
+    toward the cap with no exclusion, and there is no independent churn bound
+    — (a) would BLOCK after 2 invocations (never reaching the 3rd), and (b)
+    has no ``_progress_resume_churn_info`` attribute at all.
+    """
+
+    async def test_progress_resume_pairs_excluded_from_iteration_cap(self, tmp_path: Path):
+        wf = _make_workflow(
+            tmp_path=tmp_path,
+            max_execute_iterations=2,
+            max_progress_resume_iterations=100,
+        )
+        mock_invoke = _stub_iteration_helpers(wf, _progress_timeout_agent_result())
+        wf._last_invoke_session_id = 'killed-sid'  # type: ignore[attr-defined]
+
+        # Pending steps truthy for the first 3 while-checks, cleared after the
+        # 3rd (successful) invocation so the loop exits with DONE.
+        wf.artifacts.get_pending_steps.side_effect = [  # type: ignore[attr-defined]
+            [{'id': 'step-1'}],
+            [{'id': 'step-1'}],
+            [{'id': 'step-1'}],
+            [],
+        ]
+        mock_invoke.side_effect = [
+            _progress_timeout_agent_result(),  # iter 1: progress-timeout (excluded)
+            _progress_timeout_agent_result(),  # iter 2: progress-timeout (excluded)
+            _success_agent_result(),           # iter 3: succeeds, plan clears
+        ]
+
+        outcome = await wf._execute_iterations()
+
+        assert outcome == WorkflowOutcome.DONE, (
+            f'Expected DONE (cap not tripped by excluded progress-resumes), '
+            f'got {outcome!r}'
+        )
+        assert mock_invoke.call_count == 3, (
+            f'Expected all 3 invocations to run (2 excluded progress-resumes '
+            f'+ 1 successful), got {mock_invoke.call_count}'
+        )
+
+    async def test_progress_resume_churn_bound_blocks_with_distinct_reason(self, tmp_path: Path):
+        wf = _make_workflow(
+            tmp_path=tmp_path,
+            max_execute_iterations=100,
+            max_progress_resume_iterations=3,
+        )
+        mock_invoke = _stub_iteration_helpers(wf, _progress_timeout_agent_result())
+        wf._last_invoke_session_id = 'killed-sid'  # type: ignore[attr-defined]
+        # Endless progress-timeout stream — pending steps never clear
+        # (_stub_iteration_helpers' default get_pending_steps stays truthy).
+
+        outcome = await wf._execute_iterations()
+
+        assert outcome == WorkflowOutcome.BLOCKED
+        assert mock_invoke.call_count == 3, (
+            f'Expected exactly 3 progress-resume invocations before the churn '
+            f'bound trips, got {mock_invoke.call_count}'
+        )
+        info = wf._progress_resume_churn_info
+        assert info is not None, (
+            '_progress_resume_churn_info must be set when the churn bound trips'
+        )
+        assert 'reason' in info and 'detail' in info
+        assert info['reason'] != ZERO_OUTPUT_HANG_REASON, (
+            'progress-resume churn must use a reason distinct from the '
+            'zero-output-hang reason'
+        )
+        assert info['reason'] != 'Execution iterations exhausted', (
+            'progress-resume churn must use a reason distinct from the '
+            'generic iteration-cap-exhausted reason'
+        )
+        # The generic zero-output hang info must NOT be set by this path.
+        assert wf._zero_output_hang_info is None
+
+
+# ---------------------------------------------------------------------------
+# reify comprehensive review (task 2360): progress_resume_total must be
+# cumulative across _execute_iterations re-entries
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestProgressResumeTotalSurvivesReentry:
+    """progress_resume_total (the max_execute_iterations cap-exclusion
+    counter) must be cumulative across separate _execute_iterations calls,
+    mirroring self.metrics.execute_iterations' own never-reset lifetime.
+
+    _execute_verify_review_loop re-enters _execute_iterations after a review
+    cycle (_replan) or an amendment round (_amend) — see the `continue`
+    statements in that loop. If progress_resume_total resets to 0 at the top
+    of _execute_iterations instead of living on self.metrics, a second (or
+    later) execute phase loses the exclusion earned by progress-resumes in
+    earlier phases: the cap check then compares the FULL cumulative
+    execute_iterations against a freshly-zeroed exclusion, so a task that
+    passed through review/amendment cycles can trip max_execute_iterations
+    immediately on re-entry even though every phase individually stayed well
+    under budget (reviewer_comprehensive.json finding #1).
+    """
+
+    async def test_progress_resume_total_survives_execute_phase_reentry(self, tmp_path):
+        """Phase 1: 4 progress-timeouts (excluded) + 1 success -> DONE.
+        Phase 2 (re-entry, as if from a replan/amend `continue`): 1 more
+        success should be enough to finish -- the phase-1 exclusion must
+        still hold so the cap isn't seen as already exhausted.
+
+        Fails RED: today progress_resume_total resets to 0 on re-entry, so
+        phase 2's cap check sees (execute_iterations=5 - 0 >= 5) and returns
+        BLOCKED before running a single phase-2 iteration.
+        """
+        wf = _make_workflow(
+            tmp_path=tmp_path,
+            max_execute_iterations=5,
+            max_progress_resume_iterations=100,
+        )
+        mock_invoke = _stub_iteration_helpers(wf, _progress_timeout_agent_result())
+        wf._last_invoke_session_id = 'killed-sid'  # type: ignore[attr-defined]
+
+        # Phase 1: 4 progress-timeouts then a success that clears pending steps.
+        wf.artifacts.get_pending_steps.side_effect = [  # type: ignore[attr-defined]
+            [{'id': 'step-1'}],
+            [{'id': 'step-1'}],
+            [{'id': 'step-1'}],
+            [{'id': 'step-1'}],
+            [{'id': 'step-1'}],
+            [],
+        ]
+        mock_invoke.side_effect = [
+            _progress_timeout_agent_result(),
+            _progress_timeout_agent_result(),
+            _progress_timeout_agent_result(),
+            _progress_timeout_agent_result(),
+            _success_agent_result(),
+        ]
+
+        phase1_outcome = await wf._execute_iterations()
+
+        assert phase1_outcome == WorkflowOutcome.DONE
+        assert mock_invoke.call_count == 5
+
+        # Phase 2 (re-entry): as if a review/amendment cycle just added more
+        # pending steps and looped back to EXECUTE. One more success should
+        # be enough -- the phase-1 exclusion must still hold.
+        wf.artifacts.get_pending_steps.side_effect = [  # type: ignore[attr-defined]
+            [{'id': 'step-2'}],
+            [],
+        ]
+        mock_invoke.side_effect = [_success_agent_result()]
+
+        phase2_outcome = await wf._execute_iterations()
+
+        assert phase2_outcome == WorkflowOutcome.DONE, (
+            f'Expected DONE (phase-1 progress-resume exclusion must survive '
+            f're-entry), got {phase2_outcome!r}'
+        )
+        assert mock_invoke.call_count == 6, (
+            f'Expected phase 2 to actually run its 1 iteration, '
+            f'got {mock_invoke.call_count} total calls'
         )
 
 

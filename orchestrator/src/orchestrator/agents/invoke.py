@@ -71,6 +71,8 @@ async def invoke_agent(
     config_dir: Path | None = None,
     env_overrides: dict[str, str] | None = None,
     startup_grace_secs: float = 120.0,
+    working_idle_secs: float | None = None,
+    absolute_cap_secs: float | None = None,
 ) -> AgentResult:
     """Invoke an agent via CLI and return structured result.
 
@@ -82,6 +84,9 @@ async def invoke_agent(
     session UUID via ``--session-id``.
     *timeout_seconds*, when set, kills the subprocess after this many seconds.
     *env_overrides*, when set, are merged into the subprocess environment.
+    *working_idle_secs* / *absolute_cap_secs*, when BOTH set (claude backend
+    only), extend the working-regime watchdog past *timeout_seconds* while
+    the transcript keeps advancing. Default ``None`` for both → no extension.
     """
     if backend == 'claude':
         return await _invoke_claude_with_sandbox(
@@ -97,6 +102,8 @@ async def invoke_agent(
             config_dir=config_dir,
             env_overrides=env_overrides,
             startup_grace_secs=startup_grace_secs,
+            working_idle_secs=working_idle_secs,
+            absolute_cap_secs=absolute_cap_secs,
         )
     elif backend == 'codex':
         return await _invoke_codex(
@@ -141,6 +148,8 @@ async def _invoke_claude_with_sandbox(
     config_dir: Path | None = None,
     env_overrides: dict[str, str] | None = None,
     startup_grace_secs: float = 120.0,
+    working_idle_secs: float | None = None,
+    absolute_cap_secs: float | None = None,
 ) -> AgentResult:
     """Invoke Claude Code CLI with optional bwrap sandboxing.
 
@@ -218,6 +227,8 @@ async def _invoke_claude_with_sandbox(
                     session_id=(resume_session_id or session_id),
                     config_dir=config_dir,
                     startup_grace_secs=startup_grace_secs,
+                    working_idle_secs=working_idle_secs,
+                    absolute_cap_secs=absolute_cap_secs,
                 )
                 return _parse_claude_output(result)
             finally:
@@ -236,6 +247,8 @@ async def _invoke_claude_with_sandbox(
         timeout_seconds=timeout_seconds, config_dir=config_dir,
         env_overrides=env_overrides,
         startup_grace_secs=startup_grace_secs,
+        working_idle_secs=working_idle_secs,
+        absolute_cap_secs=absolute_cap_secs,
     )
 
 

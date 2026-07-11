@@ -9,6 +9,10 @@ module_overrides: {}
 
 # Iteration limits
 max_execute_iterations: 10
+# Independent bound on progress-timeout+resume churn; excluded from
+# max_execute_iterations (a kill+resume pair of a productive run counts as
+# ONE iteration there). See OrchestratorConfig.max_progress_resume_iterations.
+max_progress_resume_iterations: 20
 max_verify_attempts: 5
 max_review_cycles: 2
 reviewer_stagger_secs: 2.0
@@ -127,8 +131,10 @@ steward_max_timeouts_per_escalation: 3
 # Pre-triage threshold for review suggestions (count)
 suggestion_triage_threshold: 10
 
-# Wall-clock backstop for any single agent invocation (seconds).
-# Legacy scalar — per-role timeouts below take precedence.
+# Wall-clock backstop for any single agent invocation (seconds). Two live
+# uses: (1) per-role timeout fallback for a role whose split role_key misses
+# a field below; (2) the working-regime absolute cap on the post-turn-1
+# progress extension (see timeouts.working_idle_secs).
 invocation_timeout: 7200.0
 
 # Per-role wall-clock timeout (seconds)
@@ -143,6 +149,10 @@ timeouts:
   module_tagger: 300
   deep_reviewer: 2400
   judge: 300
+  # Post-turn-1 no-progress idle bound (seconds) — the working-regime
+  # watchdog kills only after no NEW assistant turn for
+  # max(working_idle_secs, the per-role ceiling above).
+  working_idle_secs: 1800
 
 # Models per role
 models:
@@ -341,7 +351,9 @@ git:
 unblock_auto:
   enabled: true
   budget_usd: 5.0
-  timeout_seconds: 600.0
+  # >= timeouts.implementer (1200s) so the dry-run investigator no longer
+  # reproduces the exact ceiling-kill failure it is diagnosing.
+  timeout_seconds: 1200.0
   model: "sonnet"
   max_turns: 50
   effort: "high"
