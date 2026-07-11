@@ -83,6 +83,7 @@ class CockpitApp(App):
         Binding('b', 'boost', 'Boost', show=False),
         Binding('B', 'big_boost', 'Big boost', show=False),
         Binding('x', 'drop', 'Drop', show=False),
+        Binding('d', 'defer', 'Defer', show=False),
         *(Binding(str(d), f'set_priority({d})', f'Priority {d}', show=False) for d in range(10)),
     ]
 
@@ -124,6 +125,7 @@ class CockpitApp(App):
         self._handling: set[str] = set()
         self._boosts: dict[str, int] = {}
         self._dropped: set[str] = set()
+        self._deferred: dict[str, datetime] = {}
 
     def compose(self) -> ComposeResult:
         yield Vertical(
@@ -197,6 +199,7 @@ class CockpitApp(App):
             boosts=self._boosts,
             handling=self._handling,
             dropped=self._dropped,
+            deferred=self._deferred,
         )
         queue = self.query_one('#decision-queue', DecisionQueue)
         queue.replace_rows(queue_items, now)
@@ -366,6 +369,31 @@ class CockpitApp(App):
             self._decisions_snapshot = _decisions_snapshot(self._decisions)
         else:
             self._dropped.add(key)
+        self._rebuild_queue()
+
+    def action_defer(self) -> None:
+        """'d' -- defer the highlighted row: reset its EFFECTIVE age to ~0 (PRD §9 C5b).
+
+        Stamps self._deferred[key] = now(), an in-memory overlay
+        order_queue's *deferred* param uses to override that item's
+        scoring filed_at -- NEVER a rewrite of the underlying record's
+        real filed_at/asked_at/start_ts (that field is provenance -- when
+        it was actually filed -- not a UI knob). Applies uniformly to
+        both a decision- and a session-backed row, since neither the C1
+        registry nor a session record has a cockpit-writable "deferred"
+        field (PRD §2 design decisions): a defer is a pure, ephemeral
+        "sink this for now" applied on top of whatever order_queue reads.
+        Re-scores and re-renders the queue immediately -- never waits for
+        the next poll tick. Fail-soft: no highlighted row, or a key not
+        present in the last-built queue, no-ops.
+        """
+        queue = self.query_one('#decision-queue', DecisionQueue)
+        key = queue.highlighted_key()
+        if key is None:
+            return
+        if key not in self._queue_items_by_key:
+            return
+        self._deferred[key] = self._now_fn()
         self._rebuild_queue()
 
     def _sync_detail_pane(self, slug: str | None) -> None:
