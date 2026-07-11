@@ -65,6 +65,6 @@ def test_wm_focus_raises_exactly_the_disposable_window(
     result = backend.focus(target_a)
 
     assert result.ok is True
-    assert wait_until(
-        lambda: active_window_id() == window_a.id
-    ), 'focus() did not raise the disposable window A'
+    assert wait_until(lambda: active_window_id() == window_a.id), (
+        'focus() did not raise the disposable window A'
+    )
