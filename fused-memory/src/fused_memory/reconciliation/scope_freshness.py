@@ -257,6 +257,39 @@ def snapshot_is_fresh(snapshot_metadata: dict[str, Any], live_task: Any) -> bool
     return True
 
 
+async def _pool_cap_scope_snapshots(
+    memory_service: MemoryService,
+    prior_memories: list[dict[str, Any]],
+    project_id: str,
+    task_ref: str,
+) -> None:
+    """Best-effort delete every memory in *prior_memories*.
+
+    Called immediately after a fresh snapshot/marker has already been
+    written for the same ``(task_ref, flag_key)``, so the pool is bounded
+    back down to that single just-written memory regardless of delete
+    outcomes here — mirrors
+    :meth:`ReconciliationHarness._delete_status_correction_memories`'s
+    add-then-delete, per-item-exception-swallowing pattern. A no-op when
+    *prior_memories* is empty (bootstrap: nothing to delete). Never raises.
+    """
+    for prior in prior_memories:
+        try:
+            await memory_service.delete_memory(
+                memory_id=prior['id'], store='mem0', project_id=project_id,
+            )
+        except Exception as exc:
+            logger.warning(
+                'reconciliation.scope_freshness_delete_failed',
+                extra={
+                    'project_id': project_id,
+                    'task_ref': task_ref,
+                    'memory_id': prior.get('id'),
+                    'error': str(exc),
+                },
+            )
+
+
 class ScopeFreshnessResult(NamedTuple):
     """Result of :func:`precheck_scope_correction_freshness`.
 
@@ -348,9 +381,45 @@ async def precheck_scope_correction_freshness(
         status, updated_at, description, _live_metadata = _extract_task_fields(live_task)
         snapshot_at = datetime.now(UTC).isoformat()
 
-        # No prior snapshot (bootstrap / first sight): keep for
-        # re-investigation and record the subject's current state so the
-        # NEXT cycle has something to compare against.
+        latest_prior = (
+            max(prior_memories, key=lambda m: m.get('created_at') or '')
+            if prior_memories else None
+        )
+
+        if latest_prior is not None and snapshot_is_fresh(
+            latest_prior.get('metadata') or {}, live_task,
+        ):
+            # Unchanged since the last snapshot: skip re-derivation and write
+            # a lightweight 'still blocked, no change' marker instead.
+            skipped.append(finding)
+            stats['scope_freshness_skipped'] += 1
+            no_change_metadata = build_scope_snapshot_metadata(
+                task_ref=task_ref, flag_key=flag_key,
+                subject_project_id=subject_project_id, subject_task_id=subject_task_id,
+                status=status, updated_at=updated_at, description=description,
+                run_id=run_id, snapshot_at=snapshot_at, no_change=True,
+            )
+            await memory_service.add_memory(
+                content=(
+                    f'Scope-correction freshness check for {task_ref} '
+                    f'(flag_type={flag_key!r}): still blocked, no change.'
+                ),
+                category='observations_and_summaries',
+                project_id=project_id,
+                metadata=no_change_metadata,
+                _source=SCOPE_FRESHNESS_SOURCE,
+            )
+            await _pool_cap_scope_snapshots(memory_service, prior_memories, project_id, task_ref)
+            logger.info(
+                'reconciliation.scope_freshness_skipped',
+                extra={'project_id': project_id, 'task_ref': task_ref, 'flag_type': flag_key},
+            )
+            continue
+
+        # First sight (no prior snapshot), or the subject changed since the
+        # last snapshot: keep for re-investigation and (re)write the
+        # snapshot recording the subject's current state so the NEXT cycle
+        # has something to compare against.
         to_reinvestigate.append(finding)
         stats['scope_freshness_reinvestigated'] += 1
         fresh_metadata = build_scope_snapshot_metadata(
@@ -369,5 +438,6 @@ async def precheck_scope_correction_freshness(
             metadata=fresh_metadata,
             _source=SCOPE_FRESHNESS_SOURCE,
         )
+        await _pool_cap_scope_snapshots(memory_service, prior_memories, project_id, task_ref)
 
     return ScopeFreshnessResult(to_reinvestigate=to_reinvestigate, skipped=skipped, stats=stats)
