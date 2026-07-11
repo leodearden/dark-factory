@@ -455,6 +455,16 @@ class TestSentinelEntryChokePointContract:
     raised ``AttributeError: 'object' object has no attribute 'item'`` at
     that dereference (merge_queue.py:8992). This pins the fix so it cannot
     regress silently.
+
+    This necessarily overlaps with ``TestAssertSingleWriterInflightWiring``'s
+    no-op cases above — they too call ``_inflight_append(_sentinel_entry())``
+    and would already fail the same way on a sentinel regression. It earns
+    its keep as a separate, minimal class anyway: it isolates the regression
+    to a single call independent of the flag/ownership matrix, and it is the
+    only place in this file that pins ``worker._escalation_queue is None`` —
+    the precondition that keeps the sentinel's intentionally-unregistered
+    request_id inert (swallowed WARNING, no escalation) rather than a silent
+    behavioral change if ``_make_worker`` ever starts wiring a queue.
     """
 
     async def test_sentinel_entry_survives_inflight_append_chokepoint(
