@@ -24,6 +24,9 @@ transition to 'done').
 
 from __future__ import annotations
 
+from collections.abc import Mapping
+from typing import Any
+
 from shared.task_statuses import ACTIVE, TERMINAL, WORKFLOW_PRESERVE, TaskStatus
 
 # Re-exported as `frozenset[str]` (rather than the shared `frozenset[TaskStatus]`
@@ -55,4 +58,41 @@ TERMINAL_STATUSES: frozenset[str] = TERMINAL
 ACTIVE_TASK_STATUSES: frozenset[str] = ACTIVE - {TaskStatus.INFRA_HOLD}
 WORKFLOW_PRESERVE_STATUSES: frozenset[str] = WORKFLOW_PRESERVE
 
-__all__ = ['TERMINAL_STATUSES', 'ACTIVE_TASK_STATUSES', 'WORKFLOW_PRESERVE_STATUSES']
+
+def is_infra_held(task: Mapping[str, Any] | None) -> bool:
+    """Single source of truth for the infra-hold exemption (PRD C7/D3).
+
+    Returns True iff ``task``'s first-class ``status`` field is
+    ``TaskStatus.INFRA_HOLD`` ("infra-hold"). This is the ONLY accessor the
+    STAMP (verify-infra exhaustion), HOLD (reconcile revert-skip), and
+    RESUME (escalation-cascade) sites are allowed to consult so they cannot
+    drift from one another.
+
+    Deliberately does NOT read the retired ``metadata.infra_hold`` boolean
+    that previously overloaded 'in-progress'/'blocked' — that flag is gone;
+    the status itself is now the hold signal.
+
+    Migration-window caveat (review amendment, task 2200): a task stamped by
+    pre-task-2200 code carries ``metadata.infra_hold`` while its status is
+    still 'blocked' or 'in-progress' — this accessor returns False for such a
+    row (see
+    ``test_legacy_metadata_flag_without_infra_hold_status_still_reverts``),
+    so any row still in that legacy shape at deploy time loses its hold on
+    the next reconcile pass or escalation resolution and re-competes for its
+    implement footprint instead of resuming at verify. This is accepted as a
+    one-time deploy-boundary cost, not a steady-state bug: there is no
+    startup sweep that relabels legacy ``metadata.infra_hold`` rows to
+    ``status='infra-hold'``. Confirm no live task carries
+    ``metadata.infra_hold`` at deploy time before retiring the flag from
+    operator tooling/dashboards; see the escalate_info filed alongside this
+    amendment (task 2200) for the follow-up recommendation.
+    """
+    return (task or {}).get('status') == TaskStatus.INFRA_HOLD
+
+
+__all__ = [
+    'TERMINAL_STATUSES',
+    'ACTIVE_TASK_STATUSES',
+    'WORKFLOW_PRESERVE_STATUSES',
+    'is_infra_held',
+]

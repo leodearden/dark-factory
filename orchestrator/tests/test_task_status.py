@@ -6,7 +6,13 @@ client-side FSM is gone. What remains is the constant set that workflow.py
 still uses to distinguish terminal outcomes after the steward runs.
 """
 
-from orchestrator.task_status import TERMINAL_STATUSES, WORKFLOW_PRESERVE_STATUSES
+from shared.task_statuses import TaskStatus
+
+from orchestrator.task_status import (
+    TERMINAL_STATUSES,
+    WORKFLOW_PRESERVE_STATUSES,
+    is_infra_held,
+)
 
 
 class TestTerminalStatuses:
@@ -55,3 +61,41 @@ class TestWorkflowPreserveStatuses:
         runtime, so membership here is the authoritative signal.
         """
         assert 'merge-deferred' in WORKFLOW_PRESERVE_STATUSES
+
+
+class TestIsInfraHeld:
+    """is_infra_held is the single source of truth for the infra-hold
+
+    exemption (PRD C7/D3): it keys on the first-class ``status`` field, not
+    the retired ``metadata.infra_hold`` boolean, so the write/skip/resume
+    sites cannot drift from one another.
+    """
+
+    def test_status_infra_hold_string_is_true(self):
+        assert is_infra_held({'status': 'infra-hold'}) is True
+
+    def test_status_infra_hold_enum_member_is_true(self):
+        assert is_infra_held({'status': TaskStatus.INFRA_HOLD}) is True
+
+    def test_status_in_progress_is_false(self):
+        assert is_infra_held({'status': 'in-progress'}) is False
+
+    def test_status_blocked_is_false(self):
+        assert is_infra_held({'status': 'blocked'}) is False
+
+    def test_missing_status_key_is_false(self):
+        assert is_infra_held({}) is False
+
+    def test_none_task_is_false(self):
+        assert is_infra_held(None) is False
+
+    def test_legacy_metadata_flag_without_status_is_false(self):
+        """Proves the accessor keys on status, not the retired metadata flag.
+
+        A task that still carries the legacy ``metadata.infra_hold`` boolean
+        but whose status is something other than 'infra-hold' must NOT be
+        reported as held — the metadata flag is retired and must not be
+        consulted.
+        """
+        task = {'status': 'in-progress', 'metadata': {'infra_hold': True}}
+        assert is_infra_held(task) is False

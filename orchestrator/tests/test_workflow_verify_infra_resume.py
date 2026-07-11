@@ -252,8 +252,14 @@ class TestVerifyInfraPermanentExhaustion:
         assert outcome == WorkflowOutcome.BLOCKED
 
     @pytest.mark.asyncio
-    async def test_exhaustion_stamps_infra_hold_metadata(self):
-        """On exhaustion, metadata.infra_hold is stamped via scheduler.update_task."""
+    async def test_exhaustion_does_not_stamp_metadata_infra_hold(self):
+        """On exhaustion, the retired metadata.infra_hold flag is NOT written.
+
+        Task 2200 (ω4): the hold is now stamped onto the task's first-class
+        'infra-hold' status by run()'s _mark_blocked(block_status=
+        'infra-hold') call, keyed via _infra_hold_info (asserted separately
+        below) — not via a scheduler.update_task metadata write here.
+        """
         wf = _make(verify_infra_retry_max_attempts=3)
 
         async def always_infra(*args, **kwargs):
@@ -265,15 +271,14 @@ class TestVerifyInfraPermanentExhaustion:
         ):
             await wf._verify_debugfix_loop()
 
-        # update_task must have been called with metadata containing infra_hold
-        assert wf.scheduler.update_task.called, 'update_task must be called to stamp infra_hold'  # type: ignore[attr-defined]
-        call_kwargs = wf.scheduler.update_task.await_args  # type: ignore[attr-defined]
-        metadata_arg = call_kwargs.kwargs.get('metadata') or (call_kwargs.args[1] if len(call_kwargs.args) > 1 else None)
-        assert metadata_arg is not None, 'update_task must receive metadata kwarg'
-        assert 'infra_hold' in metadata_arg, f'infra_hold missing from metadata: {metadata_arg}'
-        infra_hold = metadata_arg['infra_hold']
-        assert infra_hold.get('phase') == 'warm_marker'
-        assert infra_hold.get('errno') == errno_module.ENOSPC
+        for call_args in wf.scheduler.update_task.await_args_list:  # type: ignore[attr-defined]
+            metadata_arg = call_args.kwargs.get('metadata') or (
+                call_args.args[1] if len(call_args.args) > 1 else None
+            )
+            if metadata_arg:
+                assert 'infra_hold' not in metadata_arg, (
+                    f'metadata.infra_hold must not be written: {call_args}'
+                )
 
     @pytest.mark.asyncio
     async def test_exhaustion_sets_infra_hold_info_dict(self):
@@ -329,6 +334,101 @@ class TestVerifyInfraPermanentExhaustion:
         assert not wf._mark_blocked.called, (  # type: ignore[attr-defined]
             '_verify_debugfix_loop must NOT call _mark_blocked directly on exhaustion; '
             'that is run()\'s job via _infra_hold_info stash'
+        )
+
+
+# ---------------------------------------------------------------------------
+# Task 2200 (ω4) step-3: the verify-infra STAMP lands the task on
+# status='infra-hold' (not 'blocked'), driven through the run()-level infra
+# block (_execute_verify_review_loop's _infra_hold_info branch -> the real
+# _mark_blocked), while still filing the L1.
+# ---------------------------------------------------------------------------
+
+class TestVerifyInfraStampUsesInfraHoldStatus:
+    """The STAMP write site must key the task row onto the first-class
+
+    'infra-hold' status (PRD C7/D3) rather than the generic 'blocked', so
+    the harness HOLD guard and RESUME cascade (both keyed on
+    ``is_infra_held``) see it.  This drives the REAL ``_mark_blocked`` (the
+    other tests in this module stub it out) through
+    ``_execute_verify_review_loop``'s ``_infra_hold_info`` branch.
+    """
+
+    @pytest.mark.asyncio
+    async def test_verify_infra_exhaustion_sets_status_infra_hold_not_blocked(self):
+        wf = _make(verify_infra_retry_max_attempts=3)
+
+        # Exercise the REAL _mark_blocked for this test only — _make() stubs
+        # it out (as an AsyncMock) for every other test in this module.  We
+        # need the real status-write logic to confirm the STAMP lands on
+        # 'infra-hold'.  `del` removes the instance-attribute stub so
+        # attribute access falls back to the bound class method.
+        del wf._mark_blocked
+        # Neutralize the two real side effects _mark_blocked would otherwise
+        # trigger that are out of scope for this status-write test: the
+        # fire-and-forget dry-run investigation task, and the L1 escalation
+        # filing internals (covered by its own assertion below via mock).
+        wf._spawn_dry_run_unblock = MagicMock()
+        wf._ensure_l1_escalation_for_blocked = AsyncMock()
+
+        # Simulate exhaustion having already stashed the hold info (this is
+        # what _run_scoped_verification_with_infra_retry does on permanent
+        # VerifyInfraError exhaustion — exercised separately above).
+        wf._infra_hold_info = {
+            'reason': 'Infra hold: warm_marker ENOSPC',
+            'detail': 'exhausted retry window',
+            'category': 'infra_issue',
+            'escalate_to_human': True,
+        }
+
+        with (
+            patch.object(
+                wf, '_execute_iterations',
+                new=AsyncMock(return_value=WorkflowOutcome.PLANNED),
+            ),
+            patch.object(
+                wf, '_verify_debugfix_loop',
+                new=AsyncMock(return_value=WorkflowOutcome.BLOCKED),
+            ),
+        ):
+            outcome = await wf._execute_verify_review_loop()
+
+        assert outcome == WorkflowOutcome.BLOCKED
+
+        # STAMP must write the first-class infra-hold status ...
+        wf.scheduler.set_task_status.assert_awaited_once_with(  # type: ignore[attr-defined]
+            wf.task_id, 'infra-hold',
+        )
+        # ... and NEVER 'blocked' for this path.
+        for call_args in wf.scheduler.set_task_status.await_args_list:  # type: ignore[attr-defined]
+            args = call_args.args
+            if len(args) >= 2:
+                assert args[1] != 'blocked', (
+                    f"set_task_status called with 'blocked' on the infra-hold "
+                    f"STAMP path: {call_args}"
+                )
+
+        # No update_task call may stamp the retired metadata.infra_hold flag.
+        for call_args in wf.scheduler.update_task.await_args_list:  # type: ignore[attr-defined]
+            metadata_arg = call_args.kwargs.get('metadata') or (
+                call_args.args[1] if len(call_args.args) > 1 else None
+            )
+            if metadata_arg:
+                assert 'infra_hold' not in metadata_arg, (
+                    f'metadata.infra_hold must not be written: {call_args}'
+                )
+
+        # _infra_hold_info must still be set (used by the L1 filing below).
+        assert wf._infra_hold_info is not None
+        assert wf._infra_hold_info.get('category') == 'infra_issue'
+        assert wf._infra_hold_info.get('escalate_to_human') is True
+
+        # The escalation/_mark_blocked path still fires so the L1 is created.
+        wf._ensure_l1_escalation_for_blocked.assert_awaited_once()  # type: ignore[attr-defined]
+        l1_call = wf._ensure_l1_escalation_for_blocked.await_args  # type: ignore[attr-defined]
+        assert l1_call is not None, 'await_args must not be None'
+        assert l1_call.kwargs.get('category') == 'infra_issue', (
+            f'L1 must be filed with category=infra_issue, got: {l1_call}'
         )
 
 
@@ -518,7 +618,9 @@ class TestBoundaryVerifyInfraReproCases:
 
         Verifies:
         - _verify_debugfix_loop returns BLOCKED (not REQUEUED, not DONE)
-        - metadata.infra_hold is stamped with phase + errno (via scheduler.update_task)
+        - the retired metadata.infra_hold flag is NOT stamped (task 2200/ω4:
+          the hold now lands on the first-class 'infra-hold' status via
+          run()'s _mark_blocked(block_status='infra-hold'), not metadata)
         - _infra_hold_info carries category='infra_issue' and escalate_to_human=True
           (which run() uses to call _mark_blocked with category='infra_issue')
         - set_task_status is NEVER called with 'pending'
@@ -546,20 +648,18 @@ class TestBoundaryVerifyInfraReproCases:
                     f'set_task_status("pending") called for infra_hold task: {call_args}'
                 )
 
-        # infra_hold must be in metadata (enables harness step-16 resume path)
-        assert wf.scheduler.update_task.called, 'update_task must stamp infra_hold metadata'  # type: ignore[attr-defined]
-        call_kwargs = wf.scheduler.update_task.await_args  # type: ignore[attr-defined]
-        metadata_arg = (
-            call_kwargs.kwargs.get('metadata')
-            or (call_kwargs.args[1] if len(call_kwargs.args) > 1 else None)
-        )
-        assert metadata_arg is not None and 'infra_hold' in metadata_arg, (
-            f'metadata.infra_hold not stamped; update_task called with: {call_kwargs}'
-        )
-        infra_hold = metadata_arg['infra_hold']
-        assert infra_hold.get('phase') == 'warm_marker', (
-            f"Expected infra_hold.phase='warm_marker', got {infra_hold!r}"
-        )
+        # The retired metadata.infra_hold flag must NOT be stamped (task
+        # 2200/ω4) — the hold is now the first-class status, written by
+        # run()'s _mark_blocked(block_status='infra-hold') (enables harness
+        # step-16 resume path via is_infra_held, not a metadata read).
+        for call_args in wf.scheduler.update_task.await_args_list:  # type: ignore[attr-defined]
+            metadata_arg = call_args.kwargs.get('metadata') or (
+                call_args.args[1] if len(call_args.args) > 1 else None
+            )
+            if metadata_arg:
+                assert 'infra_hold' not in metadata_arg, (
+                    f'metadata.infra_hold must not be written: {call_args}'
+                )
 
         # _infra_hold_info must be set for run() to call _mark_blocked(category='infra_issue')
         assert wf._infra_hold_info is not None, (

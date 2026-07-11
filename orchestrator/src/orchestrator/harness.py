@@ -60,7 +60,11 @@ from orchestrator.systemd_inspect import (
     _deterministic_deploy_health_verdict,
     inspect_systemd_unit,
 )
-from orchestrator.task_status import ACTIVE_TASK_STATUSES, TERMINAL_STATUSES
+from orchestrator.task_status import (
+    ACTIVE_TASK_STATUSES,
+    TERMINAL_STATUSES,
+    is_infra_held,
+)
 from orchestrator.usage_gate import UsageGate
 from orchestrator.workflow import TaskWorkflow, WorkflowOutcome
 from orchestrator.worktree_identity import identities_match, read_worktree_title
@@ -3360,7 +3364,7 @@ Output JSON matching the schema. Every task must appear in the output.
                             tid, metadata.get('branch_base_sha'),
                         )
                         return await self._revert_in_progress_if_no_live_claimant(
-                            tid, mid_run=mid_run, metadata=metadata,
+                            tid, mid_run=mid_run, metadata=metadata, status=status,
                         )
                     logger.info(
                         'Reconcile: task %s branch is degenerate '
@@ -3408,7 +3412,7 @@ Output JSON matching the schema. Every task must appear in the output.
                             tid,
                         )
                         return await self._revert_in_progress_if_no_live_claimant(
-                            tid, mid_run=mid_run, metadata=metadata,
+                            tid, mid_run=mid_run, metadata=metadata, status=status,
                         )
                     logger.info(
                         'Reconcile: task %s branch is degenerate per '
@@ -3460,7 +3464,7 @@ Output JSON matching the schema. Every task must appear in the output.
                         tid, metadata.get('branch_base_sha'),
                     )
                     return await self._revert_in_progress_if_no_live_claimant(
-                        tid, mid_run=mid_run, metadata=metadata,
+                        tid, mid_run=mid_run, metadata=metadata, status=status,
                     )
                 logger.info(
                     'Reconcile: task %s branch tip == branch_base_sha (%s); '
@@ -3675,11 +3679,12 @@ Output JSON matching the schema. Every task must appear in the output.
         # is_ancestor==True degenerate-provisioning-branch guards above so a
         # never-advanced branch (the 2992 strand) is recovered, not left to sit.
         return await self._revert_in_progress_if_no_live_claimant(
-            tid, mid_run=mid_run, metadata=metadata,
+            tid, mid_run=mid_run, metadata=metadata, status=status,
         )
 
     async def _revert_in_progress_if_no_live_claimant(
         self, tid: str, *, mid_run: bool, metadata: dict | None = None,
+        status: str | None = None,
     ) -> str | None:
         """Revert a stranded in-progress task to pending when no live claimant.
 
@@ -3701,35 +3706,52 @@ Output JSON matching the schema. Every task must appear in the output.
         worktree_path = self._resolve_task_worktree(tid)
         lock_path = worktree_path / '.task' / 'plan.lock'
 
-        # A1 guard: a verify-complete task blocked by a transient infra failure
-        # (metadata.infra_hold set) must NOT be re-pended by the stranded
-        # recovery sweep.  The open infra_issue L1 is the non-dispatch hold
-        # (scheduler skips blocked rows; the open L1 suppresses stranded_blocked
-        # re-file).  Flipping to pending would force the task to re-win its
-        # full implement footprint in the scheduler's footprint-locked dispatch —
+        # A1 guard (task 2200/ω4): a verify-complete task held by a transient
+        # infra failure — first-class status == 'infra-hold', via
+        # is_infra_held — must NOT be re-pended by the stranded recovery
+        # sweep.  The open infra_issue L1 is the non-dispatch hold (dispatch
+        # is pending-only; the open L1 suppresses stranded_blocked re-file).
+        # Flipping to pending would force the task to re-win its full
+        # implement footprint in the scheduler's footprint-locked dispatch —
         # the root cause of the 3465 starvation.
-        # Guard conditions: metadata.infra_hold is set AND the branch is
+        # Guard conditions: is_infra_held(task) AND the branch is
         # non-degenerate (has commits beyond branch_base_sha).  Degenerate
         # branches (provisioned but never implemented) are not protected because
         # there is no real work to preserve.
-        # Prefer the metadata the reconcile caller already hoisted (one get_task
-        # per stranded task — see harness.py:2275). Re-fetching unconditionally
-        # here was the task-1883 step-14 regression that double-fetched on the
-        # neither-path; the row is immutable across the read-only intervening
-        # is_ancestor/marker/citation/degenerate checks. Standalone callers
-        # (direct unit tests) may omit metadata and pay one fetch.
+        # PRIMARY protection is the sweep-exclusion: infra-hold is not in
+        # _RECONCILE_SWEEP_STATUSES, so in production this function is only
+        # ever reached with status=='in-progress' (the production
+        # _reconcile_one_stranded call sites), making this guard structurally
+        # dormant there.  It is kept as defense-in-depth for any caller that
+        # hands this function an infra-held row directly.
+        # Migration-window caveat (review amendment, task 2200): a row still
+        # carrying the legacy metadata.infra_hold flag with status !=
+        # 'infra-hold' at deploy time is NOT recognised here (is_infra_held
+        # keys on status only) and reverts to pending like any other stranded
+        # in-progress task — see the docstring on
+        # orchestrator.task_status.is_infra_held for the accepted-risk
+        # rationale and the operator follow-up.
+        # Prefer the metadata/status the reconcile caller already hoisted (one
+        # get_task per stranded task — see harness.py:2275). Re-fetching
+        # unconditionally here was the task-1883 step-14 regression that
+        # double-fetched on the neither-path; the row is immutable across the
+        # read-only intervening is_ancestor/marker/citation/degenerate checks.
+        # Standalone callers (direct unit tests) may omit metadata/status and
+        # pay one fetch.
         if metadata is None:
             try:
                 _infra_task = await self.scheduler.get_task(tid)
-                metadata = (_infra_task or {}).get('metadata') or {}
             except Exception:
-                metadata = {}
+                _infra_task = None
+            metadata = (_infra_task or {}).get('metadata') or {}
+            if status is None:
+                status = (_infra_task or {}).get('status')
         _infra_meta = metadata
-        if _infra_meta.get('infra_hold'):
+        if is_infra_held({'status': status}):
             _branch = f'{self.git_ops.config.branch_prefix}{tid}'
             if not await self._branch_is_degenerate(_branch, _infra_meta):
                 logger.info(
-                    'Reconcile: task %s has infra_hold on non-degenerate branch '
+                    'Reconcile: task %s is infra-held on non-degenerate branch '
                     '— skipping pending revert; held for infra resume',
                     tid,
                 )
@@ -9314,14 +9336,77 @@ Output JSON matching the schema. Every task must appear in the output.
         their L2 cluster is still pending is an expected, common outcome and
         should not produce operator-visible WARNINGs.
 
+        EXCEPTION: an infra-held task (first-class status == 'infra-hold',
+        via is_infra_held — task 2200/ω4) is checked FIRST, before the
+        'blocked'-only gate below, because its status is 'infra-hold', never
+        'blocked' — see the A1 guard.
+
         TOCTOU note: get_status and set_task_status are separate MCP
         round-trips with no atomic compare-and-set. If the task transitions
         away from 'blocked' between the read and the write (e.g. a workflow
         picks it up → 'in-progress'), set_task_status('pending') may succeed
         and clobber the newer status. This is accepted as a best-effort
         policy; the race window is narrow in practice.
+
+        Efficiency note (review amendment, task 2200): get_task above (used
+        only for the is_infra_held pre-gate) and get_status below both
+        dispatch the same underlying fused-memory 'get_task' RPC, so the
+        non-infra-held path pays for two round-trips over the same row. This
+        is intentional, not an oversight: get_status is kept as an
+        independent, as-late-as-possible read to narrow the TOCTOU window
+        above rather than reuse the earlier (by-then slightly staler)
+        get_task snapshot. Collapsing the two would also require reworking
+        test_cascade_unblock.py (outside this task's locked module scope),
+        whose mixed-status-cascade coverage
+        (test_criterion_7_mixed_status_cascade) drives get_status with a
+        per-task_id side_effect while get_task's mock stays fixed/shared —
+        i.e. that suite already treats the two reads as independent by
+        design.
         """
         task_id = escalation.task_id
+
+        # A1 guard (task 2200/ω4): an infra-held task (first-class status ==
+        # 'infra-hold', via is_infra_held) is a verify-complete branch held by
+        # a transient infra failure.  Checked BEFORE the blocked-only gate
+        # below — an infra-held task's status is 'infra-hold', never
+        # 'blocked', so this must run first or the gate would skip it
+        # entirely.  Flipping to 'pending' would force the task to re-compete
+        # for its implement footprint in the scheduler's footprint-locked
+        # dispatch — the 3465 starvation root cause.  Instead resume-at-verify:
+        # set in-progress (the scheduler already skips re-implement for
+        # branches with prior work via _has_prior_implementation).  There is
+        # no metadata flag to clear anymore — the status IS the hold.
+        # Migration-window caveat (review amendment, task 2200): this check
+        # cannot see a legacy metadata.infra_hold-only row (status still
+        # 'blocked') — it falls through to the ordinary Table B resume below
+        # and re-competes for its footprint.  See
+        # orchestrator.task_status.is_infra_held's docstring for the
+        # accepted-risk rationale and the operator follow-up.
+        _infra_task = await self.scheduler.get_task(task_id)
+        if is_infra_held(_infra_task):
+            try:
+                await self.scheduler.set_task_status(task_id, 'in-progress')
+                logger.info(
+                    'cascade-unblock: task %s is infra-held — resuming at '
+                    'verify (infra-hold→in-progress) via %s',
+                    task_id, escalation.resolved_by,
+                )
+            except SetTaskStatusRejected as e:
+                logger.warning(
+                    'cascade-unblock: infra-hold resume refused for %s '
+                    '(TOCTOU race or guard): %s',
+                    task_id, e,
+                )
+            except Exception:
+                logger.warning(
+                    'cascade-unblock: infra-hold resume failed for %s',
+                    task_id, exc_info=True,
+                )
+            return
+
+        # Deliberately a fresh, independent round-trip — not reused from
+        # _infra_task above.  See the "Efficiency note" in this method's
+        # docstring.
         status = await self.scheduler.get_status(task_id)
 
         if status != 'blocked':
@@ -9329,42 +9414,6 @@ Output JSON matching the schema. Every task must appear in the output.
                 'cascade-unblock: task %s is %s (not blocked; skipping flip via %s)',
                 task_id, status, escalation.resolved_by,
             )
-            return
-
-        # A1 guard: an infra_hold task is a verify-complete branch held by a
-        # transient infra failure.  Flipping it to 'pending' would force it to
-        # re-compete for its implement footprint in the scheduler's footprint-locked
-        # dispatch — the 3465 starvation root cause.  Instead resume-at-verify:
-        # set in-progress (the scheduler already skips re-implement for branches
-        # with prior work via _has_prior_implementation) and clear the hold.
-        _infra_task = await self.scheduler.get_task(task_id)
-        _infra_meta = (_infra_task or {}).get('metadata') or {}
-        if _infra_meta.get('infra_hold'):
-            try:
-                # Clear infra_hold sentinel before flipping status so a concurrent
-                # stranded-recovery sweep (which reads infra_hold) cannot race.
-                await self.scheduler.update_task(
-                    task_id,
-                    {'infra_hold': None},
-                    metadata_mode='merge',
-                )
-                await self.scheduler.set_task_status(task_id, 'in-progress')
-                logger.info(
-                    'cascade-unblock: task %s has infra_hold — resuming at verify '
-                    '(blocked→in-progress) via %s; infra_hold cleared',
-                    task_id, escalation.resolved_by,
-                )
-            except SetTaskStatusRejected as e:
-                logger.warning(
-                    'cascade-unblock: infra_hold resume refused for %s '
-                    '(TOCTOU race or guard): %s',
-                    task_id, e,
-                )
-            except Exception:
-                logger.warning(
-                    'cascade-unblock: infra_hold resume failed for %s',
-                    task_id, exc_info=True,
-                )
             return
 
         # Re-block guard (C5/D6): count same-signature re-pends cross-incarnation;

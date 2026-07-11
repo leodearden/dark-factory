@@ -209,6 +209,49 @@ class TestReconReportInRunDedup:
         assert 'finding_id' in r2
         assert r1['finding_id'] != r2['finding_id']
 
+    def test_duplicate_finding_paths_return_clean_error_dict_not_nameerror(self):
+        """Regression guard for task 2200: WIP commit f46d386e7d ("save WIP
+        before requeue rebase") leaked a stray partial fragment of task-2410
+        (truncation warnings) onto this branch — both in-run dedup return
+        sites called ``_duplicate_finding_error(existing_id, warnings)`` with
+        ``warnings`` never defined anywhere in scope, raising
+        ``NameError: name 'warnings' is not defined`` on every duplicate hit.
+        Both dedup namespaces must instead return the plain 3-key
+        duplicate_finding dict (no 'warnings' key) — pinning revert-to-base
+        behavior, not a half-landed truncation feature.
+        """
+        state = self._make_state()
+
+        # (a) Signature path (recon_report.py:456) — same (task_id, flag_type).
+        # Already latently exercised by test_second_same_sig_returns_duplicate_error
+        # above (itself RED today via the NameError); re-asserted here with the
+        # exact dict shape pinned (dict equality also proves no 'warnings' key).
+        sig_first = self._finding(state, task_id='42', flag_type='orphaned_knowledge')
+        sig_id1 = sig_first['finding_id']
+        sig_second = self._finding(
+            state,
+            task_id='42',
+            flag_type='orphaned_knowledge',
+            description='different text still same sig',
+        )
+        assert sig_second == {
+            'error': 'duplicate_finding',
+            'error_type': 'ReconReportDuplicateFinding',
+            'existing_finding_id': sig_id1,
+        }
+
+        # (b) NEW null-null description-hash path (recon_report.py:466) — currently
+        # UNCOVERED by test_both_none_no_dedup, which only uses DISTINCT
+        # descriptions and so never reaches the duplicate return.
+        desc_first = self._finding(state, task_id=None, flag_type=None, description='same observation text')
+        desc_id1 = desc_first['finding_id']
+        desc_second = self._finding(state, task_id=None, flag_type=None, description='same observation text')
+        assert desc_second == {
+            'error': 'duplicate_finding',
+            'error_type': 'ReconReportDuplicateFinding',
+            'existing_finding_id': desc_id1,
+        }
+
 
 # ---------------------------------------------------------------------------
 # step-7: complete() idempotence — RED until step-8 implements it
