@@ -10,6 +10,7 @@ tests/scripts/test_spawn_claude.py's bash-level harness.
 
 from __future__ import annotations
 
+import fcntl
 import logging
 import os
 import re
@@ -547,6 +548,65 @@ def test_write_decision_fail_soft_on_unwritable_root(
 def test_update_and_set_boost_fail_soft_when_absent(tmp_path: Path) -> None:
     assert sr.update_decision_state('no-such-id', sr.DecisionState.ANSWERED, root=tmp_path) is None
     assert sr.set_manual_boost('no-such-id', 5, root=tmp_path) is None
+
+
+# ---------------------------------------------------------------------------
+# Step-6: decision_id_lock per-decision-id sidecar flock (task 2427)
+# ---------------------------------------------------------------------------
+
+
+class TestDecisionIdLock:
+    """Unit tests for the sr.decision_id_lock(decision_id, root=...) context manager.
+
+    Mirrors TestEscalationIdLock (escalation/tests/test_queue.py:2553) -- same
+    stable-sidecar-flock contract (task 1609), retargeted to decisions_dir /
+    decision_path_for_id and the ``<id>.json.lock`` sidecar path.
+    """
+
+    def test_importable_from_session_registry(self) -> None:
+        """(a) decision_id_lock is importable from orchestrator.session_registry."""
+        from orchestrator.session_registry import decision_id_lock  # noqa: F401
+
+    def test_entering_context_creates_sidecar_file(self, tmp_path: Path) -> None:
+        """(b) Entering the context creates the sidecar .lock file at the expected path."""
+        lock_path = sr.decisions_dir(root=tmp_path) / 'dec-1.json.lock'
+
+        assert not lock_path.exists(), 'Sidecar must not exist before context entry'
+        with sr.decision_id_lock('dec-1', root=tmp_path):
+            assert lock_path.exists(), 'Sidecar must exist while context is held'
+        # File persists after release -- stable inode, never renamed/replaced.
+        assert lock_path.exists(), 'Sidecar must persist after context exit (stable inode)'
+
+    def test_held_lock_blocks_second_acquire_nonblocking(self, tmp_path: Path) -> None:
+        """(c) While the context is held, a non-blocking flock on the same sidecar raises BlockingIOError."""
+        lock_path = sr.decisions_dir(root=tmp_path) / 'dec-1.json.lock'
+
+        with sr.decision_id_lock('dec-1', root=tmp_path):
+            fd2 = os.open(str(lock_path), os.O_RDWR | os.O_CREAT, 0o644)
+            try:
+                with pytest.raises(BlockingIOError):
+                    fcntl.flock(fd2, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            finally:
+                os.close(fd2)
+
+        # After context exit the lock is released -- non-blocking acquire succeeds.
+        fd3 = os.open(str(lock_path), os.O_RDWR | os.O_CREAT, 0o644)
+        try:
+            fcntl.flock(fd3, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            fcntl.flock(fd3, fcntl.LOCK_UN)
+        finally:
+            os.close(fd3)
+
+    def test_lock_sidecar_invisible_to_list_decisions(self, tmp_path: Path) -> None:
+        """(d) The .lock sidecar never becomes a phantom decision via list_decisions' `*.json` glob."""
+        rec = _make_decision(id='dec-1')
+        sr.write_decision(rec, root=tmp_path)
+
+        with sr.decision_id_lock('dec-1', root=tmp_path):
+            listed = sr.list_decisions(root=tmp_path)
+
+        assert len(listed) == 1
+        assert listed[0] == rec
 
 
 # ---------------------------------------------------------------------------
