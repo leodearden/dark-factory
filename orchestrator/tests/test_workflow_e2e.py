@@ -4823,6 +4823,7 @@ class TestRedispatchIterationLogHygiene:
 
         # 4. The stale log must be gone — not merely unread, but wiped, so
         #    a subsequent append starts from a clean slate.
+        assert workflow.artifacts is not None
         entries, corrupted = workflow.artifacts.read_iteration_log()
         assert entries == [] and corrupted == [], (
             f'Expected iterations.jsonl to be wiped on re-dispatch onto a new '
@@ -4868,6 +4869,7 @@ class TestRedispatchIterationLogHygiene:
         assert workflow._base_commit == main_sha
 
         # 4. The in-flight log must survive untouched.
+        assert workflow.artifacts is not None
         entries, corrupted = workflow.artifacts.read_iteration_log()
         assert corrupted == []
         assert len(entries) == 1, (
