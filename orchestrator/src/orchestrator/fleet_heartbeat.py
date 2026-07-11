@@ -47,3 +47,26 @@ def resolve_fleet_dir(env: Mapping[str, str] | None = None) -> Path:
     if override:
         return Path(override)
     return DEFAULT_FLEET_DIR
+
+
+def build_heartbeat_payload(
+    unit: str,
+    merge_idle: bool,
+    depth: int,
+    queue_empty: bool,
+    ts_epoch: float,
+) -> dict[str, Any]:
+    """Build the on-disk heartbeat payload.
+
+    Returns a dict with exactly the five fields ``{unit, merge_idle, depth,
+    queue_empty, ts_epoch}`` in that key order, with values passed through
+    unchanged (no coercion) — this is the single definition of the on-disk
+    contract shared with the future readers (γ drain gate, ε ``--report``).
+    """
+    return {
+        'unit': unit,
+        'merge_idle': merge_idle,
+        'depth': depth,
+        'queue_empty': queue_empty,
+        'ts_epoch': ts_epoch,
+    }
