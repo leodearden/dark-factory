@@ -7,6 +7,7 @@ import json
 import logging
 import re
 from pathlib import Path
+from typing import Any
 
 import pytest
 import pytest_asyncio
@@ -14,6 +15,7 @@ from pydantic import ValidationError
 
 from fused_memory.backends.sqlite_task_backend import (
     SqliteTaskBackend,
+    _classify_residual_group,
     _format_task_id,
     _merge_metadata,
     _parse_qualified_dep,
@@ -2461,6 +2463,82 @@ async def test_v2_to_v3_migration_clean_audit_logs_info_with_zero_duplicates(
     assert re.search(r'\bduplicate_groups=0\b', audit_records[0].message), (
         f'Expected duplicate_groups=0 in audit log; got: {audit_records[0].message!r}'
     )
+
+
+def _dup_row(
+    task_id: int, title: str, status: str, files: list[str], candidate_key: str | None = None,
+) -> dict[str, Any]:
+    """Build one pure dict-like residual-group row for
+    ``_classify_residual_group`` tests (no DB involved).
+
+    ``candidate_key`` defaults to the REAL recompute of ``(title, files)`` —
+    the common case where the stored key still accurately reflects the row's
+    current content. Pass an explicit value to simulate a stale/
+    title-divergent stored key (mirrors the 5-tuple override accepted by
+    ``_make_v3_db_with_dup_groups``).
+    """
+    return {
+        'id': task_id,
+        'title': title,
+        'status': status,
+        'metadata': json.dumps({'files': files}) if files else None,
+        'candidate_key': (
+            candidate_key if candidate_key is not None
+            else compute_candidate_key(title, files)
+        ),
+    }
+
+
+class TestClassifyResidualGroup:
+    """Pure (no DB) tests for the v3->v4 self-heal classifier.
+
+    ``_classify_residual_group`` consumes the non-cancelled rows of ONE
+    residual (tag, candidate_key) duplicate group and decides whether it is
+    safe to auto-heal (cancel all but a canonical survivor) or must be
+    flagged for human review.
+    """
+
+    def test_all_active_identical_title_heals_preferring_lowest_in_progress(self):
+        """canonical prefers the lowest-id IN-PROGRESS row over pending rows,
+        even when a lower pending id exists."""
+        rows = [
+            _dup_row(5, 'Fix the bug', 'pending', ['a.py']),
+            _dup_row(3, 'Fix the bug', 'in-progress', ['a.py']),
+            _dup_row(9, 'Fix the bug', 'pending', ['a.py']),
+        ]
+        assert _classify_residual_group(rows) == ('heal', 3, [5, 9])
+
+    def test_all_active_no_in_progress_heals_preferring_lowest_id(self):
+        """No in-progress row in the group -> canonical falls back to the
+        lowest id overall."""
+        rows = [
+            _dup_row(7, 'Fix the bug', 'pending', ['a.py']),
+            _dup_row(4, 'Fix the bug', 'blocked', ['a.py']),
+        ]
+        assert _classify_residual_group(rows) == ('heal', 4, [7])
+
+    def test_group_containing_done_row_is_flagged_mixed_status(self):
+        """A `done` row anywhere in the group blocks auto-heal — cancelling
+        completed work needs a human, even though the candidate_key matches."""
+        rows = [
+            _dup_row(2, 'Fix the bug', 'done', ['a.py']),
+            _dup_row(6, 'Fix the bug', 'pending', ['a.py']),
+        ]
+        assert _classify_residual_group(rows) == ('flag', 'mixed_status')
+
+    def test_title_divergent_stale_key_group_is_flagged(self):
+        """Rows sharing a STORED candidate_key that no longer matches a fresh
+        recompute of (title, files) are NOT a genuine content-duplicate —
+        flag rather than heal."""
+        shared_stale_key = 'stale1234567890a'
+        rows = [
+            _dup_row(1, 'Fix the bug', 'pending', ['a.py'], candidate_key=shared_stale_key),
+            _dup_row(
+                2, 'Totally different task', 'pending', ['z.py'],
+                candidate_key=shared_stale_key,
+            ),
+        ]
+        assert _classify_residual_group(rows) == ('flag', 'title_divergent')
 
 
 def _make_v3_db_with_dup_groups(
