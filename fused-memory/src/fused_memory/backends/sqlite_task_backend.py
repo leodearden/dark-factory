@@ -466,6 +466,54 @@ async def _migrate_v2_to_v3(conn: aiosqlite.Connection) -> None:
     await conn.commit()
 
 
+def _classify_residual_group(
+    rows: list[Any],
+) -> tuple[str, int, list[int]] | tuple[str, str]:
+    """Classify one residual (tag, candidate_key) duplicate group of
+    non-cancelled rows for the v3->v4 self-heal migration step (fm-task-dedup
+    W8 amendment, reify incident esc-candidate-key-migration-2).
+
+    ``rows`` are dict-likes (``aiosqlite.Row`` or plain ``dict``), each
+    carrying at least ``id``, ``title``, ``status``, ``metadata`` (raw JSON
+    text or ``None``), and ``candidate_key`` (the STORED value shared by
+    every row in the group -- that's why the caller's audit query grouped
+    them together in the first place).
+
+    Returns:
+        ``('heal', canonical_id, cancel_ids)`` when every row recomputes to
+        the SAME candidate_key as what's stored (guards a stale/legacy
+        stored key -- the "verified same candidate_key" check) AND no row is
+        ``done`` (``shared.task_statuses.TaskStatus.DONE``) -- a genuine
+        content-duplicate, safe to auto-collapse. ``canonical_id`` is the
+        lowest id among ``in-progress`` rows if any, else the lowest id
+        overall; ``cancel_ids`` is the ascending-sorted remainder.
+
+        ``('flag', reason)`` otherwise, with ``reason`` one of:
+
+        * ``'title_divergent'`` -- some row's fresh ``(title, files)``
+          recompute disagrees with the group's stored candidate_key, so the
+          group is not actually a content match (a stale/legacy stored key
+          coincidentally collided). Checked FIRST: a group that fails this
+          "verified same candidate_key" check is never safe to reason about
+          via status alone.
+        * ``'mixed_status'`` -- a verified-same group that also contains a
+          ``done`` row. Cancelling completed work needs a human even though
+          the content genuinely matches.
+    """
+    stored_key = rows[0]['candidate_key']
+    if any(
+        compute_candidate_key(row['title'], _files_for_key(row['metadata'])) != stored_key
+        for row in rows
+    ):
+        return ('flag', 'title_divergent')
+    if any(row['status'] == TaskStatus.DONE for row in rows):
+        return ('flag', 'mixed_status')
+    in_progress_ids = [row['id'] for row in rows if row['status'] == TaskStatus.IN_PROGRESS]
+    canonical_id = min(in_progress_ids) if in_progress_ids else min(row['id'] for row in rows)
+    cancel_ids = sorted(row['id'] for row in rows if row['id'] != canonical_id)
+    return ('heal', canonical_id, cancel_ids)
+
+
 async def _migrate_v3_to_v4(
     conn: aiosqlite.Connection,
     *,
