@@ -1409,9 +1409,6 @@ async def merge_foreign_duplicate(
         edge_embedding_reply = await _read_compact_vector(
             falkor_client, group_id=wrong_graph, cypher=edge_embedding_cypher,
         )
-        edge_embedding_literal = format_vecf32_literal(
-            parse_compact_vector_reply(edge_embedding_reply)
-        )
 
         # Both endpoints are MATCHed (never CREATEd): the home copy of the
         # moved-duplicate's node and the edge's other endpoint must already
@@ -1427,8 +1424,8 @@ async def merge_foreign_duplicate(
             '    r.invalid_at = $invalid_at, '
             '    r.created_at = $created_at, '
             '    r.group_id = $group_id, '
-            '    r.episodes = $episodes, '
-            f'    r.fact_embedding = {edge_embedding_literal}',
+            '    r.episodes = $episodes'
+            f'{_embedding_set_clause("r.fact_embedding", edge_embedding_reply)}',
             {
                 'src_uuid': src_uuid,
                 'dst_uuid': dst_uuid,
