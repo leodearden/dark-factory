@@ -1699,6 +1699,23 @@ class TaskWorkflow:
                 EventType.phase_enter,
                 task_id=self.task_id, phase=new_state.value,
             )
+            # Task 2383 β: the branch's OWN pre-merge verify verdict, keyed
+            # by task_id.  REVIEW is reachable from VERIFY only on a PASSING
+            # verify (a failing verify routes to BLOCKED/ESCALATED before
+            # _enter_phase(REVIEW) is ever called), so this edge is a
+            # reliable "branch verified green pre-merge" signal.  Consumed
+            # by the merge-skew attribution classifier's I5 branch-green
+            # fact (merge_disposition._branch_pre_merge_verify_green).
+            if prev is WorkflowState.VERIFY and new_state is WorkflowState.REVIEW:
+                self.event_store.emit(
+                    EventType.workflow_verify,
+                    task_id=self.task_id,
+                    data={
+                        'passed': True,
+                        'base_sha': self._base_commit,
+                        'branch': self.task_id,
+                    },
+                )
         self._phase_cost_at_entry = self.metrics.total_cost_usd
 
     async def _setup_worktree_and_artifacts(self, branch_name: str) -> None:
