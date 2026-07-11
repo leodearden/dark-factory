@@ -519,7 +519,7 @@ async def _migrate_v3_to_v4(
     *,
     project_root: str | None = None,
     residual_dup_escalation_cb: Any = None,
-) -> None:
+) -> dict[str, Any]:
     """v3 -> v4 (fm-task-dedup W8 task A2, self-heal amendment): self-gating
     partial UNIQUE index, now with an intermediate self-heal pass.
 
@@ -576,6 +576,16 @@ async def _migrate_v3_to_v4(
     index against a DB that still holds residual duplicates, defeating the
     self-gating fail-safe. Fresh DBs still get the index via the full
     v0->v1->v2->v3->v4 chain, where this audit is trivially clean.
+
+    Returns a result dict ``{'index_built': bool, 'healed': [...],
+    'flagged': [...]}`` at every exit -- ``healed``/``flagged`` are lists of
+    per-group descriptor dicts (``flagged`` entries are the same shape fed to
+    ``residual_dup_escalation_cb``; ``healed`` entries carry ``tag``/
+    ``candidate_key``/``canonical_id``/``cancelled_ids``). The connection-open
+    call site (``_migrate``) ignores this return value -- it exists so
+    ``SqliteTaskBackend.reaudit_candidate_key_index`` (the live, on-demand
+    re-run) can share this single implementation and report an accurate
+    status without a server restart.
     """
     try:
         dup_cursor = await conn.execute(
@@ -592,7 +602,7 @@ async def _migrate_v3_to_v4(
         # to a list so len() below type-checks (it's already a list at runtime).
         residual_rows = list(await dup_cursor.fetchall())
 
-        healed_group_count = 0
+        healed_groups: list[dict[str, Any]] = []
         flagged_groups: list[dict[str, Any]] = []
         for group in residual_rows:
             rows_cursor = await conn.execute(
@@ -635,7 +645,12 @@ async def _migrate_v3_to_v4(
                     "metadata = ? WHERE tag = ? AND id = ?",
                     (now, new_metadata, group['tag'], cancel_id),
                 )
-            healed_group_count += 1
+            healed_groups.append({
+                'tag': group['tag'],
+                'candidate_key': group['candidate_key'],
+                'canonical_id': canonical_id,
+                'cancelled_ids': cancel_ids,
+            })
             logger.warning(
                 'sqlite_task_backend: schema v3->v4 self-heal -- auto-cancelled '
                 '%d redundant duplicate candidate_key row(s) for tag=%r '
@@ -648,7 +663,7 @@ async def _migrate_v3_to_v4(
                 canonical_id, cancel_ids,
             )
 
-        if healed_group_count:
+        if healed_groups:
             # Commit unconditionally here (not deferred to the clean-build
             # commit below): a still-flagged group below causes an early
             # `return`, and healed cancels must survive that skip rather
@@ -670,7 +685,7 @@ async def _migrate_v3_to_v4(
                 'user_version stays at 3. Resolve the flagged group(s) '
                 '(cancel or merge the extras) and the next connection-open '
                 'will land the index. Groups: %s',
-                len(flagged_groups), healed_group_count, groups_desc,
+                len(flagged_groups), len(healed_groups), groups_desc,
             )
 
             if residual_dup_escalation_cb is not None:
@@ -686,7 +701,7 @@ async def _migrate_v3_to_v4(
                         'candidate_key group(s) for project_root=%r',
                         len(flagged_groups), project_root,
                     )
-            return
+            return {'index_built': False, 'healed': healed_groups, 'flagged': flagged_groups}
 
         try:
             await conn.execute(
@@ -701,7 +716,7 @@ async def _migrate_v3_to_v4(
                 'clean audit (race?); skipping index build, user_version '
                 'stays at 3.',
             )
-            return
+            return {'index_built': False, 'healed': healed_groups, 'flagged': []}
 
         await conn.execute('PRAGMA user_version = 4')
         await conn.commit()
@@ -711,6 +726,7 @@ async def _migrate_v3_to_v4(
             '(tag, candidate_key) and advanced user_version to 4 '
             '(fm-task-dedup task A2).',
         )
+        return {'index_built': True, 'healed': healed_groups, 'flagged': []}
     except Exception:
         # Defensive backstop -- this step must NEVER raise at connection-open
         # (see docstring): a raising migration would crash-loop fused-memory.
@@ -718,6 +734,7 @@ async def _migrate_v3_to_v4(
             'sqlite_task_backend: schema v3->v4 migration failed unexpectedly; '
             'skipping (user_version stays below 4, retried on next open)',
         )
+        return {'index_built': False, 'healed': [], 'flagged': []}
 
 
 async def _claimant_columns_present(conn: aiosqlite.Connection) -> bool:
@@ -1519,6 +1536,51 @@ class SqliteTaskBackend:
             'id': task_id,
             'message': f'Updated claimant fields for task {task_id}',
         }
+
+    async def reaudit_candidate_key_index(self, project_root: str) -> dict[str, Any]:
+        """Idempotently re-run the v3->v4 self-heal migration on the LIVE
+        cached connection for ``project_root`` -- no server restart required.
+
+        ``_migrate_v3_to_v4`` only ever runs at connection-open:
+        ``_get_connection`` short-circuits to the cached connection on every
+        later call, so a running server that already holds a pre-audit
+        connection never re-lands the partial UNIQUE index after an operator
+        resolves a previously-flagged residual (the reify incident's second
+        failure mode, esc-candidate-key-migration-2). This method closes
+        that gap by re-running the SAME classify/heal/audit/build logic
+        connection-open uses, sharing the implementation via
+        ``_migrate_v3_to_v4``'s result dict (fm-task-dedup self-heal
+        amendment).
+
+        Short-circuits to ``{'index_built': True, 'already_at_v4': True,
+        'user_version': 4}`` without touching the write lock when the
+        connection is already at v4 (the common case once the index has
+        landed) — a plain read, so no locking is needed for the check
+        itself. Otherwise acquires the write lock (excluding concurrent
+        writers for the duration of the re-audit, same as any other mutating
+        method) and returns ``_migrate_v3_to_v4``'s result dict merged with
+        the final ``user_version``.
+        """
+        await self.ensure_connected()
+        conn = await self._get_connection(project_root)
+        version_cursor = await conn.execute('PRAGMA user_version')
+        version_row = await version_cursor.fetchone()
+        current_version = version_row[0] if version_row is not None else 0
+        if current_version >= 4:
+            return {'index_built': True, 'already_at_v4': True, 'user_version': 4}
+
+        async with self._write_lock(project_root):
+            conn = await self._get_connection(project_root)
+            result = await _migrate_v3_to_v4(
+                conn,
+                project_root=project_root,
+                residual_dup_escalation_cb=self._residual_dup_escalation_cb,
+            )
+            version_cursor = await conn.execute('PRAGMA user_version')
+            version_row = await version_cursor.fetchone()
+            final_version = version_row[0] if version_row is not None else current_version
+
+        return {**result, 'user_version': final_version}
 
     # ── Write-boundary validation (task 2162, W3-β) ────────────────────
 
