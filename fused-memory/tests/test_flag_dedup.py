@@ -421,6 +421,37 @@ async def test_dedup_flags_prior_marker_with_malformed_run_id_uses_sentinel(
 
 
 @pytest.mark.asyncio
+async def test_dedup_flags_retires_mem0_marker_mirror(ledger_memory_service):
+    """The best-effort Mem0 ``stage1_flag_marker`` mirror write is retired
+    (task 2406, option (a)): the ``recon_ledger`` row remains the sole store
+    for an ordinary recurring flag's marker — upserted exactly as before —
+    but ``dedup_flags`` no longer calls ``add_memory`` to mirror it to Mem0.
+    The ledger row is already reaped each cycle by
+    ``ReconLedgerStore.gc()``, so no periodic collector is needed for it.
+    """
+    from fused_memory.reconciliation.flag_dedup import dedup_flags
+
+    flags = [{'task_id': '77', 'flag_type': 'missing_deliverable', 'description': 'x'}]
+
+    result = await dedup_flags(
+        memory_service=ledger_memory_service,
+        project_id='p',
+        run_id='r1',
+        flags=flags,
+    )
+
+    assert len(result) == 1
+
+    # (a) The ledger row is still upserted — the ledger remains authoritative.
+    row = await _get_marker(ledger_memory_service.recon_ledger, 'p', '77', 'missing_deliverable')
+    assert row is not None
+    assert row.state == 'active'
+
+    # (b) The best-effort Mem0 marker mirror is retired — never called.
+    ledger_memory_service.add_memory.assert_not_called()
+
+
+@pytest.mark.asyncio
 async def test_dedup_flags_mirror_write_exception_does_not_raise_ledger_still_committed(
     ledger_memory_service, caplog
 ):
