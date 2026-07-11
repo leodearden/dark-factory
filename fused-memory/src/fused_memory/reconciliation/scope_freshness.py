@@ -338,7 +338,9 @@ async def precheck_scope_correction_freshness(
     Fail-open: an unresolvable foreign project root, a ``get_task`` failure,
     a Mem0 read/write failure, or any other unexpected per-finding error
     keeps that finding in ``to_reinvestigate`` rather than raising — see the
-    module docstring.  Never raises.
+    module docstring.  A catastrophic failure outside the per-finding guard
+    (e.g. a bug in the pure helpers) falls all the way back to treating
+    EVERY input finding as needing re-investigation.  Never raises.
     """
     safe_findings = list(findings) if isinstance(findings, list) else []
     to_reinvestigate: list[dict[str, Any]] = []
@@ -349,95 +351,141 @@ async def precheck_scope_correction_freshness(
         'scope_freshness_skipped': 0,
     }
 
-    for finding in safe_findings:
-        if not is_cross_project_scope_correction(finding, project_id):
-            to_reinvestigate.append(finding)
-            continue
+    try:
+        for finding in safe_findings:
+            if not is_cross_project_scope_correction(finding, project_id):
+                to_reinvestigate.append(finding)
+                continue
 
-        signature = compute_scope_signature(finding, project_id)
-        subject = select_primary_subject(finding, project_id)
-        if signature is None or subject is None:
-            to_reinvestigate.append(finding)
-            continue
-        task_ref, flag_key = signature
-        subject_project_id, subject_task_id = subject
-        stats['scope_freshness_candidates'] += 1
+            signature = compute_scope_signature(finding, project_id)
+            subject = select_primary_subject(finding, project_id)
+            if signature is None or subject is None:
+                to_reinvestigate.append(finding)
+                continue
+            task_ref, flag_key = signature
+            subject_project_id, subject_task_id = subject
+            stats['scope_freshness_candidates'] += 1
 
-        subject_root = resolve_project_root(subject_project_id)
-        if not subject_root:
-            to_reinvestigate.append(finding)
-            stats['scope_freshness_reinvestigated'] += 1
-            continue
+            try:
+                subject_root = resolve_project_root(subject_project_id)
+                if not subject_root:
+                    to_reinvestigate.append(finding)
+                    stats['scope_freshness_reinvestigated'] += 1
+                    continue
 
-        prior_memories = await memory_service.get_memories_by_metadata(
-            project_id=project_id,
-            filters={
-                'kind': CONSOLIDATED_SCOPE_KIND,
-                'task_id': task_ref,
-                'flag_type': flag_key,
+                prior_memories = await memory_service.get_memories_by_metadata(
+                    project_id=project_id,
+                    filters={
+                        'kind': CONSOLIDATED_SCOPE_KIND,
+                        'task_id': task_ref,
+                        'flag_type': flag_key,
+                    },
+                )
+                live_task = await taskmaster.get_task(
+                    task_id=subject_task_id, project_root=subject_root,
+                )
+                status, updated_at, description, _live_metadata = _extract_task_fields(
+                    live_task,
+                )
+                snapshot_at = datetime.now(UTC).isoformat()
+
+                latest_prior = (
+                    max(prior_memories, key=lambda m: m.get('created_at') or '')
+                    if prior_memories else None
+                )
+
+                if latest_prior is not None and snapshot_is_fresh(
+                    latest_prior.get('metadata') or {}, live_task,
+                ):
+                    # Unchanged since the last snapshot: skip re-derivation
+                    # and write a lightweight 'still blocked, no change'
+                    # marker instead.
+                    no_change_metadata = build_scope_snapshot_metadata(
+                        task_ref=task_ref, flag_key=flag_key,
+                        subject_project_id=subject_project_id,
+                        subject_task_id=subject_task_id,
+                        status=status, updated_at=updated_at, description=description,
+                        run_id=run_id, snapshot_at=snapshot_at, no_change=True,
+                    )
+                    await memory_service.add_memory(
+                        content=(
+                            f'Scope-correction freshness check for {task_ref} '
+                            f'(flag_type={flag_key!r}): still blocked, no change.'
+                        ),
+                        category='observations_and_summaries',
+                        project_id=project_id,
+                        metadata=no_change_metadata,
+                        _source=SCOPE_FRESHNESS_SOURCE,
+                    )
+                    await _pool_cap_scope_snapshots(
+                        memory_service, prior_memories, project_id, task_ref,
+                    )
+                    skipped.append(finding)
+                    stats['scope_freshness_skipped'] += 1
+                    logger.info(
+                        'reconciliation.scope_freshness_skipped',
+                        extra={
+                            'project_id': project_id, 'task_ref': task_ref,
+                            'flag_type': flag_key,
+                        },
+                    )
+                    continue
+
+                # First sight (no prior snapshot), or the subject changed
+                # since the last snapshot: keep for re-investigation and
+                # (re)write the snapshot recording the subject's current
+                # state so the NEXT cycle has something to compare against.
+                fresh_metadata = build_scope_snapshot_metadata(
+                    task_ref=task_ref, flag_key=flag_key,
+                    subject_project_id=subject_project_id,
+                    subject_task_id=subject_task_id,
+                    status=status, updated_at=updated_at, description=description,
+                    run_id=run_id, snapshot_at=snapshot_at,
+                )
+                await memory_service.add_memory(
+                    content=(
+                        f'Scope-correction freshness snapshot for {task_ref} '
+                        f'(flag_type={flag_key!r}).'
+                    ),
+                    category='observations_and_summaries',
+                    project_id=project_id,
+                    metadata=fresh_metadata,
+                    _source=SCOPE_FRESHNESS_SOURCE,
+                )
+                await _pool_cap_scope_snapshots(memory_service, prior_memories, project_id, task_ref)
+                to_reinvestigate.append(finding)
+                stats['scope_freshness_reinvestigated'] += 1
+            except Exception as exc:
+                # Fail-open: an unresolvable root, a get_task/Mem0 read
+                # failure, or any other per-finding surprise must never
+                # drop — let alone silently skip — a genuinely-changed
+                # thread. Keep it for full re-investigation instead.
+                logger.warning(
+                    'reconciliation.scope_freshness_precheck_failed',
+                    extra={
+                        'project_id': project_id,
+                        'task_ref': task_ref,
+                        'flag_type': flag_key,
+                        'error': str(exc),
+                    },
+                )
+                to_reinvestigate.append(finding)
+    except Exception as exc:
+        # Catastrophic failure outside the per-finding guard (e.g. a pure
+        # helper misbehaving) — fail open for the WHOLE batch rather than
+        # risk returning a partial/inconsistent result.
+        logger.warning(
+            'reconciliation.scope_freshness_precheck_catastrophic_failure',
+            extra={'project_id': project_id, 'error': str(exc)},
+        )
+        return ScopeFreshnessResult(
+            to_reinvestigate=list(safe_findings),
+            skipped=[],
+            stats={
+                'scope_freshness_candidates': 0,
+                'scope_freshness_reinvestigated': 0,
+                'scope_freshness_skipped': 0,
             },
         )
-        live_task = await taskmaster.get_task(task_id=subject_task_id, project_root=subject_root)
-        status, updated_at, description, _live_metadata = _extract_task_fields(live_task)
-        snapshot_at = datetime.now(UTC).isoformat()
-
-        latest_prior = (
-            max(prior_memories, key=lambda m: m.get('created_at') or '')
-            if prior_memories else None
-        )
-
-        if latest_prior is not None and snapshot_is_fresh(
-            latest_prior.get('metadata') or {}, live_task,
-        ):
-            # Unchanged since the last snapshot: skip re-derivation and write
-            # a lightweight 'still blocked, no change' marker instead.
-            skipped.append(finding)
-            stats['scope_freshness_skipped'] += 1
-            no_change_metadata = build_scope_snapshot_metadata(
-                task_ref=task_ref, flag_key=flag_key,
-                subject_project_id=subject_project_id, subject_task_id=subject_task_id,
-                status=status, updated_at=updated_at, description=description,
-                run_id=run_id, snapshot_at=snapshot_at, no_change=True,
-            )
-            await memory_service.add_memory(
-                content=(
-                    f'Scope-correction freshness check for {task_ref} '
-                    f'(flag_type={flag_key!r}): still blocked, no change.'
-                ),
-                category='observations_and_summaries',
-                project_id=project_id,
-                metadata=no_change_metadata,
-                _source=SCOPE_FRESHNESS_SOURCE,
-            )
-            await _pool_cap_scope_snapshots(memory_service, prior_memories, project_id, task_ref)
-            logger.info(
-                'reconciliation.scope_freshness_skipped',
-                extra={'project_id': project_id, 'task_ref': task_ref, 'flag_type': flag_key},
-            )
-            continue
-
-        # First sight (no prior snapshot), or the subject changed since the
-        # last snapshot: keep for re-investigation and (re)write the
-        # snapshot recording the subject's current state so the NEXT cycle
-        # has something to compare against.
-        to_reinvestigate.append(finding)
-        stats['scope_freshness_reinvestigated'] += 1
-        fresh_metadata = build_scope_snapshot_metadata(
-            task_ref=task_ref, flag_key=flag_key,
-            subject_project_id=subject_project_id, subject_task_id=subject_task_id,
-            status=status, updated_at=updated_at, description=description,
-            run_id=run_id, snapshot_at=snapshot_at,
-        )
-        await memory_service.add_memory(
-            content=(
-                f'Scope-correction freshness snapshot for {task_ref} '
-                f'(flag_type={flag_key!r}).'
-            ),
-            category='observations_and_summaries',
-            project_id=project_id,
-            metadata=fresh_metadata,
-            _source=SCOPE_FRESHNESS_SOURCE,
-        )
-        await _pool_cap_scope_snapshots(memory_service, prior_memories, project_id, task_ref)
 
     return ScopeFreshnessResult(to_reinvestigate=to_reinvestigate, skipped=skipped, stats=stats)
