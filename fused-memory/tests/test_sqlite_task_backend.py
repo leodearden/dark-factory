@@ -2463,6 +2463,86 @@ async def test_v2_to_v3_migration_clean_audit_logs_info_with_zero_duplicates(
     )
 
 
+def _make_v3_db_with_dup_groups(
+    db_path: Path,
+    rows: list[tuple[int, str, str, list[str]] | tuple[int, str, str, list[str], str]],
+) -> None:
+    """Create a tasks.db seeded directly at schema v3: ``candidate_key``
+    column present and backfilled, id_counters seeded, NO
+    ``ux_tasks_candidate_key`` index — the exact shape the v3->v4 self-heal
+    migration step (and the live ``reaudit_candidate_key_index`` re-run)
+    classifies and acts on.
+
+    Mirrors ``_make_v1_schema_db_no_candidate_key`` but seeds straight at
+    ``user_version = 3`` with the full v3 column set (including
+    ``claimant_run_id``/``heartbeat_at``, present on any real v3 DB since the
+    v1->v2 step necessarily ran first in the cumulative chain) so these tests
+    drive the v3->v4 step in isolation without re-exercising v1->v2->v3.
+
+    ``rows`` entries are ``(id, title, status, files)`` — the stored
+    ``candidate_key`` is backfilled via ``compute_candidate_key(title,
+    files)``, exactly like a real v2->v3 backfill would — or the 5-tuple
+    ``(id, title, status, files, explicit_candidate_key)``, which stores
+    ``explicit_candidate_key`` verbatim regardless of what ``(title, files)``
+    would recompute to. The 5-tuple form is how a test seeds a title-divergent
+    / stale-key group: rows whose STORED candidate_key collides (same
+    explicit value) but whose current (title, files) recompute to DIFFERENT
+    keys.
+    """
+    import sqlite3
+
+    db_path.parent.mkdir(parents=True, exist_ok=True)
+    conn = sqlite3.connect(str(db_path))
+    conn.executescript("""
+        CREATE TABLE IF NOT EXISTS tasks (
+            tag             TEXT NOT NULL DEFAULT 'master',
+            id              INTEGER NOT NULL,
+            title           TEXT NOT NULL,
+            description     TEXT,
+            details         TEXT,
+            test_strategy   TEXT,
+            status          TEXT NOT NULL,
+            priority        TEXT,
+            metadata        TEXT,
+            updated_at      TEXT NOT NULL,
+            claimant_run_id TEXT,
+            heartbeat_at    TEXT,
+            candidate_key   TEXT,
+            PRIMARY KEY (tag, id)
+        );
+        CREATE INDEX IF NOT EXISTS ix_tasks_status ON tasks (tag, status);
+        CREATE TABLE IF NOT EXISTS dependencies (
+            tag        TEXT NOT NULL DEFAULT 'master',
+            task_id    INTEGER NOT NULL,
+            depends_on INTEGER NOT NULL,
+            PRIMARY KEY (tag, task_id, depends_on)
+        );
+        CREATE TABLE IF NOT EXISTS id_counters (
+            tag    TEXT NOT NULL DEFAULT 'master',
+            max_id INTEGER NOT NULL DEFAULT 0,
+            PRIMARY KEY (tag)
+        );
+    """)
+    max_id = 0
+    for row in rows:
+        if len(row) == 5:
+            task_id, title, status, files, candidate_key = row
+        else:
+            task_id, title, status, files = row
+            candidate_key = compute_candidate_key(title, files)
+        metadata = json.dumps({'files': files}) if files else None
+        conn.execute(
+            "INSERT INTO tasks (tag, id, title, status, metadata, updated_at, candidate_key) "
+            "VALUES ('master', ?, ?, ?, ?, '2026-01-01T00:00:00.000Z', ?)",
+            (task_id, title, status, metadata, candidate_key),
+        )
+        max_id = max(max_id, task_id)
+    conn.execute("INSERT INTO id_counters (tag, max_id) VALUES ('master', ?)", (max_id,))
+    conn.execute('PRAGMA user_version = 3')
+    conn.commit()
+    conn.close()
+
+
 @pytest.mark.asyncio
 async def test_v3_to_v4_migration_clean_audit_builds_partial_unique_index(
     backend, project_root,
