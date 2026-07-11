@@ -34,6 +34,18 @@ def artifacts(tmp_path):
     return a
 
 
+# A ~2KB "trigger payload" analysis string mirroring the documented shape
+# that accompanies the harness's files-arg mis-serialization defect:
+# markdown backticks, a double-dot commit range, and a bang-pathspec token
+# (task 2428).
+_TRIGGER_ANALYSIS = (
+    'Root cause analysis referencing `backtick code`, a commit range like '
+    "main..HEAD, and a bang-pathspec like :!.task/ as in `git add -- . "
+    "':!.task'`. "
+    + ('Extra context padding sentence describing the approach in detail. ' * 30)
+)
+
+
 # ---------------------------------------------------------------------------
 # _coerce_files helper tests (task 2428)
 # ---------------------------------------------------------------------------
@@ -97,6 +109,22 @@ class TestCreatePlan:
         assert plan['design_decisions'] == []
         assert plan['reuse'] == []
         assert '_schema_version' in plan
+
+    def test_recovers_stringified_files_array(self, artifacts):
+        """A large/complex analysis paired with a stringified files array
+        (the harness mis-serialization defect, task 2428) must still recover
+        the intended file list rather than storing the raw JSON text."""
+        result = _create_plan(
+            artifacts,
+            'test-1',
+            'Test task',
+            _TRIGGER_ANALYSIS,
+            '["mod/a.py","mod/b.py"]',
+        )
+        assert result['status'] == 'ok'
+
+        plan = artifacts.read_plan()
+        assert plan['files'] == ['mod/a.py', 'mod/b.py']
 
 
 class TestAddPlanStep:
@@ -733,3 +761,49 @@ class TestReportBlockingDependencyToolResolvesRealWorktree:
         data = artifacts.read_blocking_dependency()
         assert data is not None
         assert data['main_sha_at_report'] == 'deadbeefcafef00d'
+
+
+# ---------------------------------------------------------------------------
+# files-arg pydantic-boundary regression guards (task 2428).
+#
+# These drive the REGISTERED MCP tool via create_server(...).get_tool(...)
+# and await tool.run({...}) — NOT tool.fn(...), which bypasses FastMCP's
+# pydantic argument validation (FunctionTool.run's type_adapter.validate_python,
+# called BEFORE the tool body executes). A corrupted `files` arg crashes at
+# that boundary, so only a tool.run(...) call exercises the real defect.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestCreatePlanToolRecoversMisserializedFiles:
+    """create_plan tolerates a mis-serialized (stringified) files arg."""
+
+    async def test_json_array_string_recovered_via_tool_run(self, artifacts):
+        server = plan_tools.create_server(artifacts)
+        tool = await server.get_tool('create_plan')
+        assert tool is not None
+
+        await tool.run({
+            'task_id': 'test-1',
+            'title': 'Test task',
+            'analysis': _TRIGGER_ANALYSIS,
+            'files': '["mod/a.py","mod/b.py"]',
+        })
+
+        plan = artifacts.read_plan()
+        assert plan['files'] == ['mod/a.py', 'mod/b.py']
+
+    async def test_comma_delimited_string_recovered_via_tool_run(self, artifacts):
+        server = plan_tools.create_server(artifacts)
+        tool = await server.get_tool('create_plan')
+        assert tool is not None
+
+        await tool.run({
+            'task_id': 'test-1',
+            'title': 'Test task',
+            'analysis': _TRIGGER_ANALYSIS,
+            'files': 'mod/a.py,mod/b.py',
+        })
+
+        plan = artifacts.read_plan()
+        assert plan['files'] == ['mod/a.py', 'mod/b.py']
