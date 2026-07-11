@@ -82,3 +82,27 @@ class TestFileDirtyTreeEscalation:
             _DIRTY_TREE_ESCALATION_SENTINEL, status='pending', level=2,
         )
         assert escs == []
+
+    @pytest.mark.asyncio
+    async def test_repeated_dirty_startup_refreshes_instead_of_duplicating(
+        self, mock_orch_config, tmp_path,
+    ):
+        """A restart while still dirty must refresh the L2 in place, not duplicate it."""
+        h = _build_bare_harness(mock_orch_config, tmp_path)
+        h.git_ops.has_dirty_working_tree = AsyncMock(return_value='src/foo.py')
+
+        await h._file_dirty_tree_escalation(force_dirty_start=False)
+
+        # Simulate a watchdog restart: still dirty, but the file list changed.
+        h.git_ops.has_dirty_working_tree = AsyncMock(
+            return_value='src/foo.py\nsrc/baz.py',
+        )
+        await h._file_dirty_tree_escalation(force_dirty_start=False)
+
+        escs = h._escalation_queue.get_by_task(
+            _DIRTY_TREE_ESCALATION_SENTINEL, status='pending', level=2,
+        )
+        assert len(escs) == 1, 'second dirty startup must refresh, not duplicate'
+        esc = escs[0]
+        assert esc.dedupe_count >= 1
+        assert 'src/baz.py' in esc.detail
