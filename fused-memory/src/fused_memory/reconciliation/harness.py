@@ -44,6 +44,11 @@ from fused_memory.reconciliation.judge import Judge
 from fused_memory.reconciliation.mem0_dedup import find_prior_memory
 from fused_memory.reconciliation.policies import is_snapshot_write_blocked
 from fused_memory.reconciliation.queue_health import summarize_graphiti_queue_health
+from fused_memory.reconciliation.scope_freshness import (
+    ScopeFreshnessResult,
+    compute_scope_signature,
+    precheck_scope_correction_freshness,
+)
 from fused_memory.reconciliation.stages.memory_consolidator import (
     MemoryConsolidator,
     write_stage1_cycle_summary,
@@ -549,6 +554,19 @@ class ReconciliationHarness:
                 f'Set DASHBOARD_KNOWN_PROJECT_ROOTS env var or add a '
                 f'TaskmasterConfig.project_root that resolves to a known project.'
             ) from None
+
+    def _resolve_known_root(self, project_id: str) -> str | None:
+        """Return the registered project_root for *project_id*, or None if unknown.
+
+        Thin lookup into ``self._known_projects``.  Unlike
+        ``_known_project_scope_for`` (which raises ``UnknownProjectError`` for
+        an unrecognised project_id), this returns ``None`` on a miss so it can
+        be injected as the ``resolve_project_root`` callable for
+        :func:`fused_memory.reconciliation.scope_freshness.precheck_scope_correction_freshness`,
+        whose fail-open contract treats an unresolvable foreign project as
+        "keep for re-investigation" rather than raising (task 2417).
+        """
+        return self._known_projects.get(project_id)
 
     def drain(self) -> None:
         """Signal the harness to stop starting new reconciliation cycles.
@@ -2743,6 +2761,47 @@ class ReconciliationHarness:
             task_kind_by_id[tid] = _metadata.get('task_kind') if isinstance(_metadata, dict) else None
 
         current_stage_name: str | None = None
+
+        # Task 2417: cheap, deterministic freshness pre-check — BEFORE any
+        # stage is built or run. Filters cross-project scope-correction
+        # findings whose subject task is unchanged since the last
+        # consolidated snapshot out of `findings`, the single choke point
+        # shared by both Stage 1 (remediation_findings, wired below via
+        # _configure_consolidator) and Stage 2 (remediation_mode=True — no
+        # findings list of its own) remediation re-derivation. Best-effort:
+        # any failure here (unresolvable project, get_task/Mem0 errors, ...)
+        # falls back to the original, unfiltered `findings` — see the
+        # fused_memory.reconciliation.scope_freshness module docstring.
+        try:
+            freshness: ScopeFreshnessResult = await precheck_scope_correction_freshness(
+                memory_service=self.memory,
+                taskmaster=self.taskmaster,
+                project_id=project_id,
+                resolve_project_root=self._resolve_known_root,
+                run_id=run_id,
+                findings=findings,
+            )
+            findings = freshness.to_reinvestigate
+            skipped_task_refs = []
+            for _skipped in freshness.skipped:
+                _sig = compute_scope_signature(_skipped, project_id)
+                if _sig is not None:
+                    skipped_task_refs.append(_sig[0])
+            logger.info(
+                'reconciliation.scope_freshness_precheck',
+                extra={
+                    'run_id': run_id,
+                    'project_id': project_id,
+                    'skipped_task_refs': skipped_task_refs,
+                    **freshness.stats,
+                },
+            )
+        except Exception as exc:
+            logger.warning(
+                'reconciliation.scope_freshness_precheck_wiring_failed',
+                extra={'run_id': run_id, 'project_id': project_id, 'error': str(exc)},
+            )
+
         stages = self._make_stages(scope)
         try:
             # Configure stages for remediation mode
