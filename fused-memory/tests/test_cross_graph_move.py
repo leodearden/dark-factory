@@ -124,6 +124,43 @@ class TestFormatVecf32Literal:
 
 
 # ---------------------------------------------------------------------------
+# step-3/4: _embedding_set_clause -- the seam that makes the embedding
+# property optional (null-tolerant) at every recreate site.
+# ---------------------------------------------------------------------------
+
+class TestEmbeddingSetClause:
+    """_embedding_set_clause(assignment_target, reply) -> '' or a SET fragment.
+
+    The single seam every CREATE's embedding assignment routes through: a
+    ``None`` reply (null/absent source embedding) renders no clause at all,
+    so the recreated node/edge omits that property entirely; a real reply
+    renders a comma-prefixed assignment naming *assignment_target*, reusing
+    the UNCHANGED byte-exact ``format_vecf32_literal(parse_compact_vector_
+    reply(...))`` passthrough.
+    """
+
+    def test_none_reply_returns_empty_string(self):
+        """A null/absent embedding renders no clause at all -- the CREATE
+        must omit the embedding property entirely rather than setting it to
+        an empty/placeholder vector."""
+        assert cross_graph_move._embedding_set_clause('r.fact_embedding', None) == ''
+
+    def test_real_reply_returns_comma_prefixed_assignment_with_byte_exact_literal(self):
+        """A real reply renders a comma-separated SET fragment naming the
+        given assignment target, embedding the byte-exact vecf32 literal
+        verbatim (no float() coercion) -- proving the non-null branch reuses
+        the unchanged format_vecf32_literal(parse_compact_vector_reply(...))
+        passthrough rather than re-deriving it.
+        """
+        clause = cross_graph_move._embedding_set_clause(
+            'r.fact_embedding', COMPACT_VECTOR_REPLY_FIXTURE,
+        )
+        assert clause.startswith(',')
+        assert 'r.fact_embedding' in clause
+        assert EXPECTED_VECF32_LITERAL_FIXTURE in clause
+
+
+# ---------------------------------------------------------------------------
 # _read_compact_vector: the ONE non-pure, byte-exactness-critical read path.
 #
 # Every OTHER test in this module monkeypatches _read_compact_vector away, so
