@@ -186,3 +186,70 @@ def _wm_urgency_set(win_id: str) -> bool:
 @pytest.fixture
 def wm_urgency_set():
     return _wm_urgency_set
+
+
+def _tmux_active_window_id(session: str) -> str:
+    """The stable @id of session's current/active window."""
+    return run_command(
+        ['tmux', 'display-message', '-p', '-t', session, '#{window_id}']
+    ).stdout.strip()
+
+
+@pytest.fixture
+def tmux_active_window_id():
+    return _tmux_active_window_id
+
+
+@dataclass
+class TmuxSession:
+    """A disposable tmux session, confined to by the `disposable_tmux_session` fixture."""
+
+    name: str
+
+    def windows(self) -> list[tuple[str, str, str]]:
+        """(index, window_id, active-flag) rows for every live window, in `tmux list-windows` order."""
+        stdout = run_command(
+            [
+                'tmux',
+                'list-windows',
+                '-t',
+                self.name,
+                '-F',
+                '#{window_index} #{window_id} #{window_active}',
+            ]
+        ).stdout
+        rows = []
+        for line in stdout.splitlines():
+            parts = line.split()
+            if len(parts) == 3:
+                rows.append((parts[0], parts[1], parts[2]))
+        return rows
+
+    def select(self, index: int) -> None:
+        """Mark window `index` as this session's current/active window."""
+        run_command(['tmux', 'select-window', '-t', f'{self.name}:{index}'])
+
+
+def _kill_tmux_session_fail_soft(name: str) -> None:
+    try:
+        run_command(['tmux', 'kill-session', '-t', name])
+    except Exception:
+        logger.warning('disposable_tmux_session teardown: failed to kill %r', name, exc_info=True)
+
+
+@pytest.fixture
+def disposable_tmux_session():
+    """A uniquely-named session with >=3 windows (indices 0,1,2), killed fail-soft at teardown.
+
+    Every tmux op the smoke tests issue is confined to this session name
+    (TmuxBackend.reorder addresses only `<name>:<index>`, parking at
+    `<name>:9000+`), so a run never touches a real operator tmux session.
+    """
+    name = f'cockpit-smoke-{os.getpid()}'
+    run_command(['tmux', 'new-session', '-d', '-s', name])
+    run_command(['tmux', 'new-window', '-t', name])
+    run_command(['tmux', 'new-window', '-t', name])
+
+    yield TmuxSession(name=name)
+
+    _kill_tmux_session_fail_soft(name)
