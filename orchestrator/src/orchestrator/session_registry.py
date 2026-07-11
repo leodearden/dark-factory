@@ -752,6 +752,14 @@ def decision_id_lock(decision_id: str, root: Path | str | None = None) -> Iterat
     contention -- only two callers racing on the SAME id ever block each
     other.
 
+    ORPHAN SIDECARS: taking this lock for a decision id that has never been
+    (or never will be) written -- e.g. update_decision_state/set_manual_boost
+    called against an unknown id -- still creates decisions_dir and an empty
+    ``<id>.json.lock`` sidecar for that id, even though the subsequent read
+    then fails and the caller gets None back. Lock files are, as in 1609,
+    intentionally never deleted, so a burst of calls against unknown ids can
+    leave harmless orphan sidecars behind at current volumes.
+
     Usage::
 
         with decision_id_lock(decision_id, root=root):
@@ -761,7 +769,9 @@ def decision_id_lock(decision_id: str, root: Path | str | None = None) -> Iterat
     """
     lock_path = Path(str(decision_path_for_id(decision_id, root=root)) + '.lock')
     # Defensively create the parent dir so a caller can take this lock
-    # without a decision having been written for this id yet.
+    # without a decision having been written for this id yet -- note this
+    # means the sidecar itself is created even for an unknown id (see
+    # ORPHAN SIDECARS above).
     lock_path.parent.mkdir(parents=True, exist_ok=True)
     fd = os.open(str(lock_path), os.O_CREAT | os.O_RDWR, 0o644)
     try:
