@@ -9445,7 +9445,7 @@ class TestAssemblePayloadLiveWorkflowSignalsSection:
         )
 
     @pytest.mark.asyncio
-    async def test_live_workflow_signals_section_drops_orchestrator_signal_for_blocked_deterministic_task(
+    async def test_live_workflow_signals_section_drops_orchestrator_signal_for_blocked_deterministic_and_normal_tasks(
         self, mock_deps, watermark, monkeypatch
     ):
         """A BLOCKED task's ONLY live signal (the project-wide orchestrator lock) is
@@ -9517,7 +9517,20 @@ class TestAssemblePayloadLiveWorkflowSignalsSection:
         # bare-evidence case (no worktree, no recent commit) — it is inverted from the
         # pre-2409 expectation. With BOTH tasks now suppressed (561 via rule 2,
         # unconditional; 742 via rule 3, task 2409), no task in this pool is live, so
-        # the whole section is absent.
+        # the whole section is absent. Explicit per-task assertions come first so a
+        # PARTIAL regression (e.g. rule 3 stops suppressing 742 while rule 2 keeps
+        # suppressing 561) is attributed to the correct task, rather than only
+        # failing the whole-section-absence check below with a generic message.
+        assert f'task/{blocked_deterministic_id}' not in payload, (
+            f"Expected blocked deterministic task {blocked_deterministic_id} NOT "
+            f"listed — rule 2 (unconditional) must still suppress its bare "
+            f"orchestrator signal; got payload snippet:\n{payload[-500:]!r}"
+        )
+        assert f'task/{blocked_normal_id}' not in payload, (
+            f"Expected blocked normal task {blocked_normal_id} NOT listed — rule 3 "
+            f"(task 2409: no worktree/no recent commit) must suppress its bare "
+            f"orchestrator signal; got payload snippet:\n{payload[-500:]!r}"
+        )
         assert '### Live-Workflow Signals' not in payload, (
             f"Expected '### Live-Workflow Signals' section absent — neither the "
             f"blocked deterministic task 561 (rule 2, unconditional) nor the blocked "
