@@ -24,7 +24,12 @@ from collections.abc import Callable
 from datetime import UTC, datetime
 from pathlib import Path
 
-from orchestrator.session_registry import DecisionRecord, SessionRecord, list_decisions
+from orchestrator.session_registry import (
+    DecisionRecord,
+    SessionRecord,
+    list_decisions,
+    set_manual_boost,
+)
 from textual.app import App, ComposeResult
 from textual.binding import Binding
 from textual.containers import Horizontal, Vertical
@@ -73,7 +78,13 @@ class CockpitApp(App):
 
     BINDINGS = [
         Binding('enter', 'focus_selected', 'Focus', show=False),
+        Binding('b', 'boost', 'Boost', show=False),
+        Binding('B', 'big_boost', 'Big boost', show=False),
+        *(Binding(str(d), f'set_priority({d})', f'Priority {d}', show=False) for d in range(10)),
     ]
+
+    _BOOST_STEP = 1
+    _BIG_BOOST_STEP = 3
 
     def __init__(
         self,
@@ -108,6 +119,7 @@ class CockpitApp(App):
         self._attention_targets: dict[str, DisplayTarget] = {}
         self._queue_items_by_key: dict[str, QueueItem] = {}
         self._handling: set[str] = set()
+        self._boosts: dict[str, int] = {}
 
     def compose(self) -> ComposeResult:
         yield Vertical(
@@ -155,10 +167,31 @@ class CockpitApp(App):
         table = self.query_one('#session-table', SessionTable)
         table.replace_rows(self._records, self._now_fn())
         self._sync_detail_pane(table.highlighted_slug())
+        self._rebuild_queue()
 
+    def _rebuild_queue(self) -> None:
+        """Re-score and re-render the DecisionQueue from current in-memory state, right now.
+
+        Unlike refresh_registry (which only re-scans disk and rebuilds when
+        the on-disk snapshot actually changed), this always re-runs
+        order_queue and replace_rows against self._decisions/self._records
+        as they stand -- the live-reorder half of a boost/drop/defer
+        keypress (PRD §9 C5b). A SESSION-row boost/drop/defer is in-memory
+        only (self._boosts, and later self._dropped/self._deferred) and
+        never touches disk, so it would never be picked up by
+        refresh_registry's snapshot-diff short-circuit otherwise. Action
+        handlers that mutate self._decisions directly (a persisted
+        decision-row boost) call this afterward instead of waiting for the
+        next poll tick.
+        """
         now = self._now_fn()
         queue_items = order_queue(
-            decisions, records, self._priorities, now, handling=self._handling
+            self._decisions,
+            self._records,
+            self._priorities,
+            now,
+            boosts=self._boosts,
+            handling=self._handling,
         )
         queue = self.query_one('#decision-queue', DecisionQueue)
         queue.replace_rows(queue_items, now)
@@ -241,6 +274,63 @@ class CockpitApp(App):
         if item is None or item.target is None:
             return
         self._backend_for(item.target.kind).focus(item.target)
+
+    def _decision_by_id(self, decision_id: str) -> DecisionRecord | None:
+        return next((d for d in self._decisions if d.id == decision_id), None)
+
+    def _apply_boost(self, *, delta: int | None = None, absolute: int | None = None) -> None:
+        """Shared boost logic for action_boost/action_big_boost/action_set_priority.
+
+        Exactly one of *delta* (additive -- b/B) or *absolute* (a direct
+        set -- a digit key) is given. A DECISION-backed highlighted row
+        persists its new manual_boost via C1's set_manual_boost -- the
+        cockpit's own sanctioned decision write -- then re-scans decisions
+        so self._decisions (and its snapshot, so a later poll tick doesn't
+        redundantly re-detect this same change as external) reflect the
+        persisted value directly; no in-memory overlay is needed once a
+        decision's boost is on disk. A SESSION-backed row has no
+        persisted priority field at all (PRD §2 design decisions), so its
+        boost lives ONLY in self._boosts, an ephemeral overlay order_queue
+        layers on top of the item's base (always-0) manual_boost. Either
+        way, the queue is re-scored and re-rendered immediately after --
+        never waits for the next poll tick. Fail-soft: no highlighted row,
+        or a key not present in the last-built queue, no-ops.
+        """
+        queue = self.query_one('#decision-queue', DecisionQueue)
+        key = queue.highlighted_key()
+        if key is None:
+            return
+        item = self._queue_items_by_key.get(key)
+        if item is None:
+            return
+        if item.kind == 'decision' and item.decision_id is not None:
+            current = self._decision_by_id(item.decision_id)
+            current_boost = current.manual_boost if current is not None else 0
+            new_boost = absolute if absolute is not None else current_boost + delta
+            set_manual_boost(item.decision_id, new_boost, root=self.fleet_root)
+            self._decisions = list_decisions(self.fleet_root)
+            self._decisions_snapshot = _decisions_snapshot(self._decisions)
+        else:
+            current_boost = self._boosts.get(key, 0)
+            new_boost = absolute if absolute is not None else current_boost + delta
+            self._boosts[key] = new_boost
+        self._rebuild_queue()
+
+    def action_boost(self) -> None:
+        """'b' -- nudge the highlighted row's priority up by one point. See _apply_boost."""
+        self._apply_boost(delta=self._BOOST_STEP)
+
+    def action_big_boost(self) -> None:
+        """'B' -- nudge the highlighted row's priority up by a bigger step. See _apply_boost."""
+        self._apply_boost(delta=self._BIG_BOOST_STEP)
+
+    def action_set_priority(self, priority: int) -> None:
+        """A digit key (0-9) -- set the highlighted row's priority to that EXACT value.
+
+        Absolute, not additive -- distinct from action_boost/action_big_boost.
+        See _apply_boost.
+        """
+        self._apply_boost(absolute=priority)
 
     def _sync_detail_pane(self, slug: str | None) -> None:
         """Render *slug*'s record (or the empty placeholder) into the detail pane.
