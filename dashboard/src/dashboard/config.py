@@ -79,22 +79,43 @@ class DashboardConfig:
                 [self.project_root, *self.known_project_roots],
             )
 
+    def _runtime_data_dir(self, env_var: str, subdir: str) -> Path:
+        """Resolve a managed fused-memory runtime data dir, env-var first.
+
+        Mirrors fused-memory's own config substitution
+        (``${QUEUE_DATA_DIR:./data/queue}`` /
+        ``${RECONCILIATION_DATA_DIR:./data/reconciliation}``, fused-memory/config/
+        config.yaml) so this reader stays in lockstep with whatever the managed
+        fused-memory spawn actually wrote to. The orchestrator's managed spawn
+        (``McpLifecycle.start()``, task 2439) injects ``QUEUE_DATA_DIR`` /
+        ``RECONCILIATION_DATA_DIR`` pointing at an XDG-rooted path outside the
+        watched project's tracked tree; when those vars are unset (the canonical
+        shared external-mode deployment on port 8002, CWD=dark_factory), this
+        falls back to today's ``project_root/data/...`` paths — a strict no-op.
+
+        A truthy check (not just presence) treats an empty-string env var as
+        unset, matching fused-memory's ``${VAR:default}`` empty-as-unset
+        semantics.
+        """
+        override = os.environ.get(env_var)
+        return Path(override) if override else self.project_root / 'data' / subdir
+
     @property
     def reconciliation_db(self) -> Path:
-        return self.project_root / 'data' / 'reconciliation' / 'reconciliation.db'
+        return self._runtime_data_dir('RECONCILIATION_DATA_DIR', 'reconciliation') / 'reconciliation.db'
 
     @property
     def tickets_db(self) -> Path:
         """Canonical tickets.db path (sibling of reconciliation.db)."""
-        return self.project_root / 'data' / 'reconciliation' / 'tickets.db'
+        return self._runtime_data_dir('RECONCILIATION_DATA_DIR', 'reconciliation') / 'tickets.db'
 
     @property
     def write_queue_db(self) -> Path:
-        return self.project_root / 'data' / 'queue' / 'write_queue.db'
+        return self._runtime_data_dir('QUEUE_DATA_DIR', 'queue') / 'write_queue.db'
 
     @property
     def write_journal_db(self) -> Path:
-        return self.project_root / 'data' / 'reconciliation' / 'write_journal.db'
+        return self._runtime_data_dir('RECONCILIATION_DATA_DIR', 'reconciliation') / 'write_journal.db'
 
     @property
     def worktrees_dir(self) -> Path:
@@ -110,7 +131,7 @@ class DashboardConfig:
 
     @property
     def reconciliation_escalations_dir(self) -> Path:
-        return self.project_root / 'data' / 'reconciliation' / 'escalations'
+        return self._runtime_data_dir('RECONCILIATION_DATA_DIR', 'reconciliation') / 'escalations'
 
     @property
     def burndown_db(self) -> Path:
