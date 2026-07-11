@@ -14,7 +14,11 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from orchestrator.fleet_heartbeat import DEFAULT_FLEET_DIR, resolve_fleet_dir
+from orchestrator.fleet_heartbeat import (
+    DEFAULT_FLEET_DIR,
+    build_heartbeat_payload,
+    resolve_fleet_dir,
+)
 
 # ---------------------------------------------------------------------------
 # DEFAULT_FLEET_DIR / resolve_fleet_dir
@@ -57,3 +61,52 @@ class TestResolveFleetDir:
         monkeypatch.delenv('ORCH_FLEET_DIR', raising=False)
 
         assert resolve_fleet_dir() == DEFAULT_FLEET_DIR
+
+
+# ---------------------------------------------------------------------------
+# build_heartbeat_payload
+# ---------------------------------------------------------------------------
+
+
+class TestBuildHeartbeatPayload:
+    """build_heartbeat_payload(...) — the five-field on-disk payload shape."""
+
+    def test_returns_exactly_five_fields_with_type_fidelity(self):
+        """Payload has exactly {unit, merge_idle, depth, queue_empty, ts_epoch}, values/types preserved."""
+        payload = build_heartbeat_payload(
+            unit='orchestrator-reify.service',
+            merge_idle=True,
+            depth=0,
+            queue_empty=True,
+            ts_epoch=1234567890.5,
+        )
+
+        assert set(payload.keys()) == {'unit', 'merge_idle', 'depth', 'queue_empty', 'ts_epoch'}
+        assert payload['unit'] == 'orchestrator-reify.service'
+        assert isinstance(payload['unit'], str)
+        assert payload['merge_idle'] is True
+        assert isinstance(payload['merge_idle'], bool)
+        assert payload['depth'] == 0
+        assert isinstance(payload['depth'], int)
+        assert payload['queue_empty'] is True
+        assert isinstance(payload['queue_empty'], bool)
+        assert payload['ts_epoch'] == 1234567890.5
+        assert isinstance(payload['ts_epoch'], float)
+
+    def test_busy_values_preserved(self):
+        """A busy/non-idle tick's values pass through unchanged (no truthy coercion)."""
+        payload = build_heartbeat_payload(
+            unit='orchestrator-dark-factory.service',
+            merge_idle=False,
+            depth=3,
+            queue_empty=False,
+            ts_epoch=42.0,
+        )
+
+        assert payload == {
+            'unit': 'orchestrator-dark-factory.service',
+            'merge_idle': False,
+            'depth': 3,
+            'queue_empty': False,
+            'ts_epoch': 42.0,
+        }
