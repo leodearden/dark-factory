@@ -227,3 +227,65 @@ class TestScopeSignature:
         from fused_memory.reconciliation.scope_freshness import compute_scope_signature
 
         assert compute_scope_signature({'flag_type': 'cross_project'}, 'autopilot_video') is None
+
+
+class TestBuildScopeSnapshotMetadata:
+    """Tests for build_scope_snapshot_metadata(...) -> dict."""
+
+    def _build(self, **overrides):
+        from fused_memory.reconciliation.scope_freshness import (
+            build_scope_snapshot_metadata,
+        )
+
+        kwargs = {
+            'task_ref': 'dark_factory:2405',
+            'flag_key': 'cross_project',
+            'subject_project_id': 'dark_factory',
+            'subject_task_id': '2405',
+            'status': 'pending',
+            'updated_at': '2026-07-10T10:00:00Z',
+            'description': 'Some description text.',
+            'run_id': 'run-1',
+            'snapshot_at': '2026-07-10T14:29:33Z',
+        }
+        kwargs.update(overrides)
+        return build_scope_snapshot_metadata(**kwargs)
+
+    def test_returns_canonical_payload(self):
+        from fused_memory.reconciliation.scope_freshness import (
+            CONSOLIDATED_SCOPE_KIND,
+            SCOPE_FRESHNESS_SOURCE,
+            _content_fingerprint,
+        )
+
+        metadata = self._build()
+
+        assert metadata['kind'] == CONSOLIDATED_SCOPE_KIND
+        assert metadata['source'] == SCOPE_FRESHNESS_SOURCE
+        assert metadata['task_id'] == 'dark_factory:2405'
+        assert metadata['flag_type'] == 'cross_project'
+        assert metadata['subject_project_id'] == 'dark_factory'
+        assert metadata['subject_task_id'] == '2405'
+        assert metadata['subject_status'] == 'pending'
+        assert metadata['subject_updated_at'] == '2026-07-10T10:00:00Z'
+        assert metadata['subject_description_fingerprint'] == _content_fingerprint(
+            'Some description text.',
+        )
+        assert metadata['run_id'] == 'run-1'
+        assert metadata['snapshot_at']
+
+    def test_no_change_flag_defaults_absent(self):
+        metadata = self._build()
+        assert 'no_change' not in metadata
+
+    def test_no_change_flag_set_when_requested(self):
+        metadata = self._build(no_change=True)
+        assert metadata['no_change'] is True
+
+    def test_description_fingerprint_is_deterministic(self):
+        first = self._build(description='Identical description.')
+        second = self._build(description='Identical description.')
+        assert (
+            first['subject_description_fingerprint']
+            == second['subject_description_fingerprint']
+        )
