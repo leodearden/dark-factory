@@ -64,6 +64,16 @@ Where:
 
 If `$CLAUDE_TERMINAL_CMD` (preferred) or `$ESCALATION_TERMINAL_CMD` (legacy) is set, the script honours it; otherwise it discovers an emulator in `$PATH`. **Do not** re-implement discovery in the skill — the script is the single source of truth.
 
+### Sibling mode (`CLAUDE_SPAWN_MODE=sibling`)
+
+By default (`CLAUDE_SPAWN_MODE` unset, or any value other than `sibling`) a spawned session's parent-of-record is its **direct spawner** — this invocation's own inherited identity — and `spawn-claude.sh` blocks until the spawned session exits, exactly as described in [Verification](#verification) below.
+
+Set `CLAUDE_SPAWN_MODE=sibling` when a session should hand off to a fresh session that runs *alongside* it rather than *beneath* it — see [Generalized handoff pattern](#generalized-handoff-pattern-authorexecute-investigatefix) below. Sibling mode changes two things:
+
+- **Parent-of-record.** The child's parent is set to *this invocation's own parent* (the shared ancestor it was itself spawned under), not this invocation's own session id — so a chain of handoffs stays flat under one shared ancestor instead of nesting one level deeper on every handoff. A spawner with no parent of its own (a human-launched root) produces a child with no parent either (null → root).
+- **Fire-and-forget.** `spawn-claude.sh` returns **immediately** once the child is launched, with **no blocking wait** for it to finish — the exit-code contract in [Verification](#verification) does not apply to a sibling spawn's own return code. The child is launched **detached** (`setsid`, its stdio redirected off this script's own output) so it survives the spawner's process exiting. Because of this, sibling handoff pairs best with a launcher that already keeps the window alive independent of the launching client — a daemon-owned emulator (`gnome-terminal`, `konsole`) or the tmux lane (`$CLAUDE_SPAWN_BACKEND=tmux`, Fleet Cockpit C6) — rather than one whose only lifetime is the launching terminal's own session.
+- **The join is not the exit code.** Since there is no blocking wait, a caller cannot join a sibling spawn the way it would a normal one. Read the session-registry record (best-effort refreshed to `running` once launched) and, authoritatively, the child's own [result.md](#result-handback-resultmd) once it writes one.
+
 ## Verification
 
 The background task's completion is a reliable **liveness** signal: it tells you the spawned session's process is gone, present vs. died-silent. As of Attention Rail T5, exit codes are documented as **liveness-only** — they are not, and should not be treated as, the semantic outcome channel. That channel is an explicit file the session writes: see [Result-handback (result.md)](#result-handback-resultmd) below. All codes below are still returned unchanged (nothing here is a breaking change); only their meaning narrows to "was the process alive, and how did it stop," not "did the work succeed." Script-level exit codes the caller should distinguish:
@@ -96,6 +106,16 @@ Exit codes (above) only tell you the process is gone and roughly how it stopped 
 - This is **best-effort**: nothing in `spawn-claude.sh`, and nothing the trailer asks for, blocks the session's own exit. A parent joining a completed spawn (e.g. escalation-watcher on a `/spawn` background task's completion) should read `record.result_file` (equivalently `<record-dir>/result.md`) for the authoritative outcome, and fall back to exploring the worktree/task only when the file is absent, empty, or unparsable.
 - **Fail-soft, matching the registry's own fail-soft contract:** if the session-registry `launching` write itself faults (missing `python3`, an unwritable fleet root, etc.), `SESSION_RECORD_DIR` is empty and both the env export and the prompt trailer are cleanly skipped — no bogus `/result.md` path is ever exported, referenced, or created. The exit-code contract above is unaffected either way.
 - A future `Stop`/`SessionEnd` hook (Attention Rail T6) may add a fallback stub-write for a session that skips the trailer's instruction, but this protocol does not depend on T6 landing — the prompt trailer plus the session's own best-effort write is already a complete signal, if occasionally missed.
+
+## Generalized handoff pattern (author→execute, investigate→fix)
+
+A session that has produced a **durable artifact** — a committed PRD, a distilled fix plan, anything the next phase can pick up from disk without this session's own context — can hand off to the next phase instead of blocking to babysit it:
+
+1. Spawn the next-phase session as a **sibling** (`CLAUDE_SPAWN_MODE=sibling`, see [Sibling mode](#sibling-mode-claude_spawn_modesibling) above), with a self-contained prompt pointing at the durable artifact (an absolute path, a commit sha, a task id — never a contextual reference back to this conversation; see [Resolving the prompt for a fresh context](#resolving-the-prompt-for-a-fresh-context) above).
+2. Write this session's own [result.md](#result-handback-resultmd): `outcome: handed-off`, `changed` naming the artifact just produced, and `action_needed`/prose pointing at the spawned sibling.
+3. Exit cleanly — do not wait for the sibling to finish.
+
+Worked example: `/prd` author mode, once the PRD is committed, may spawn `/prd decompose <path>` as a sibling and hand off rather than continuing inline (see `skills/prd/references/author-mode.md` Stage 11). The same shape applies to an investigate→fix handoff: a session that distills a root-cause and fix plan spawns the implementer as a sibling pointed at the plan, instead of implementing the fix itself in an already-long-running investigation session.
 
 ## When NOT to use
 

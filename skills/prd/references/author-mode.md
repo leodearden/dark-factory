@@ -111,7 +111,16 @@ The commit happens **before** any decompose-mode work — task agents run in wor
 
 ### Stage 11 — Transition to decompose?
 
-After committing, ask: "session has room — continue into decompose mode now, or stop and trigger decompose later (possibly a fresh session)?" If continuing → switch to `decompose-mode.md`. If stopping → write a hand-off note summarizing what was authored and what's pending.
+After committing, ask: "session has room — continue into decompose mode now, hand off to a fresh sibling decompose session, or stop and trigger decompose later (possibly a fresh session)?"
+
+- **Continue inline** → switch to `decompose-mode.md`.
+- **Hand off to a sibling decompose session** → spawn it and exit rather than continuing or blocking on it (the generalized handoff pattern documented in `skills/spawn/SKILL.md`, worked for this case):
+  1. Invoke `skills/spawn/spawn-claude.sh` with `CLAUDE_SPAWN_MODE=sibling` set in the environment, `run_in_background=true`, `skip_permissions=true`, `cwd` = the repo root, `title` following the convention `prd:<project> <slug>-decompose`, and a self-contained prompt naming the committed PRD by absolute path — e.g. `/prd decompose the committed PRD at <abs-path>` — never a contextual reference back to this conversation.
+  2. Write this session's own result.md: `outcome: handed-off`, `changed` = the PRD's commit sha/path, `action_needed: none`, and prose noting the decompose is now running as a sibling session (name/point at it). Write this to `$CLAUDE_SPAWN_RESULT_FILE` **only** when that env var is set — a human-launched author root has none, so skip fail-soft otherwise.
+  3. Exit cleanly.
+
+  Only after the Stage 10 commit — the PRD must be on disk before the sibling decompose session can reference it.
+- **Stop without spawning** → write a hand-off note summarizing what was authored and what's pending.
 
 ## PRD section template (content-matched, not literal)
 

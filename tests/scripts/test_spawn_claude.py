@@ -25,11 +25,16 @@ SPAWN_SCRIPT = REPO_ROOT / "skills" / "spawn" / "spawn-claude.sh"
 # editable install pointing at a different checkout) so `import
 # orchestrator.session_registry` resolves to the module spawn-claude.sh
 # itself invokes by absolute path (task 2285) -- letting this file assert
-# in-process against the exact same record/reap contract.
+# in-process against the exact same record/reap contract. Also gives the
+# task-2298 (Fleet Cockpit C7) two-way boundary test direct, in-process
+# access to session_hooks.run_session_start -- the already-landed C1/C2
+# consumer of the CLAUDE_SPAWN_PARENT_ID this file's sibling-mode tests
+# export.
 _ORCH_SRC = REPO_ROOT / "orchestrator" / "src"
 if str(_ORCH_SRC) not in sys.path:
     sys.path.insert(0, str(_ORCH_SRC))
 
+from orchestrator import session_hooks  # noqa: E402  # pyright: ignore[reportAttributeAccessIssue]
 from orchestrator import session_registry  # noqa: E402  # pyright: ignore[reportAttributeAccessIssue]
 
 # Branch routing: the script dispatches on the first word of $CLAUDE_TERMINAL_CMD.
@@ -1632,4 +1637,305 @@ def test_tmux_backend_missing_tmux_yields_126(tmp_path: pathlib.Path) -> None:
     stderr = result.stderr.decode()
     assert "tmux" in stderr.lower(), (
         f"expected a loud stderr line mentioning tmux, got:\n{stderr}"
+    )
+
+
+# ===========================================================================
+# task-2298 step-1: Fleet Cockpit C7 sibling spawn mode (parent-of-record)
+# ===========================================================================
+# CLAUDE_SPAWN_MODE=sibling changes which identity the child inherits as its
+# own CLAUDE_SPAWN_PARENT_ID: not the direct spawner (this spawn-claude.sh
+# invocation's own CLAUDE_SPAWN_SESSION_ID -- the 'child' default exercised
+# by the C1 tests above), but the spawner's OWN inherited
+# CLAUDE_SPAWN_PARENT_ID -- the shared ancestor. All three tests below route
+# through CLAUDE_SPAWN_BACKEND=tmux (Fleet Cockpit C6, see _write_fake_tmux
+# above) rather than a foreground emulator, and poll for captured_env.txt via
+# _wait_for_path rather than assuming it is present the instant _run_spawn
+# returns: the eventual GREEN state (step-4, fire-and-forget) returns from
+# spawn-claude.sh before the detached child has necessarily finished writing
+# it, so these tests must not depend on the pre-step-4 blocking-wait timing
+# they'd otherwise get for free.
+
+
+def _run_sibling_capture_spawn(
+    tmp_path: pathlib.Path,
+    *,
+    spawner_session_id: str | None,
+    spawner_parent_id: str | None,
+) -> tuple[subprocess.CompletedProcess[bytes], dict[str, str], pathlib.Path]:
+    """Run a CLAUDE_SPAWN_MODE=sibling spawn behind the tmux backend and
+    return ``(result, parsed captured env, fleet_root)``.
+
+    Shared setup for the three sibling parent-of-record tests below.
+    """
+    bin_dir = _make_bin_dir(tmp_path)
+    capture_file = tmp_path / "captured_env.txt"
+    _write_fake_claude_capturing_env(bin_dir, capture_file)
+    tmux_marker = tmp_path / "tmux_used"
+    _write_fake_tmux(bin_dir, tmux_marker)
+
+    env = _base_env(bin_dir, "xterm")
+    env["CLAUDE_SPAWN_BACKEND"] = "tmux"
+    env["CLAUDE_SPAWN_PROJECT"] = "proj"
+    env["CLAUDE_SPAWN_MODE"] = "sibling"
+    if spawner_session_id is None:
+        env.pop("CLAUDE_SPAWN_SESSION_ID", None)
+    else:
+        env["CLAUDE_SPAWN_SESSION_ID"] = spawner_session_id
+    if spawner_parent_id is None:
+        env.pop("CLAUDE_SPAWN_PARENT_ID", None)
+    else:
+        env["CLAUDE_SPAWN_PARENT_ID"] = spawner_parent_id
+
+    result = _run_spawn(env, tmp_path)
+    _wait_for_path(capture_file, timeout=5.0)
+    captured = _parse_captured_env(capture_file)
+    fleet_root = pathlib.Path(env["CLAUDE_FLEET_ROOT"])
+    return result, captured, fleet_root
+
+
+def test_sibling_mode_parents_at_shared_ancestor(tmp_path: pathlib.Path) -> None:
+    """Sibling mode: the child's CLAUDE_SPAWN_PARENT_ID must be the
+    spawner's OWN inherited parent ("A", the shared ancestor) -- NOT the
+    spawner's own session id ("P", the direct spawner). The child still
+    gets its own freshly-minted CLAUDE_SPAWN_SESSION_ID either way.
+
+    RED today: CLAUDE_SPAWN_MODE is ignored (default 'child' behavior), so
+    parent_id_export always resolves to the spawner's own
+    CLAUDE_SPAWN_SESSION_ID ("P") regardless of spawn_mode. GREEN after
+    step-2.
+    """
+    result, captured, fleet_root = _run_sibling_capture_spawn(
+        tmp_path, spawner_session_id="P", spawner_parent_id="A",
+    )
+    assert result.returncode == 0, f"stderr: {result.stderr.decode()}"
+
+    record_path = _find_one_record(fleet_root)
+    record = session_registry.SessionRecord.from_json(record_path.read_text())
+
+    assert captured.get("SESSION") == record.session_slug, (
+        f"expected the child's own new session_slug, got {captured!r}"
+    )
+    assert captured.get("PARENT") == "A", (
+        f"sibling mode must parent the child at the spawner's OWN parent "
+        f"(shared ancestor 'A'), not the direct spawner 'P', got {captured!r}"
+    )
+
+
+def test_sibling_mode_null_parent_becomes_root(tmp_path: pathlib.Path) -> None:
+    """Sibling mode with no CLAUDE_SPAWN_PARENT_ID of its own (the spawner
+    is itself root, or was hand-launched) -- the child's
+    CLAUDE_SPAWN_PARENT_ID must be empty (null -> root), not silently fall
+    back to the spawner's own session id.
+
+    RED today: same root cause as test_sibling_mode_parents_at_shared_ancestor
+    -- CLAUDE_SPAWN_MODE is ignored, so parent_id_export uses the spawner's
+    own CLAUDE_SPAWN_SESSION_ID ("P") instead of staying empty.
+    """
+    result, captured, _fleet_root = _run_sibling_capture_spawn(
+        tmp_path, spawner_session_id="P", spawner_parent_id=None,
+    )
+    assert result.returncode == 0, f"stderr: {result.stderr.decode()}"
+
+    assert captured.get("PARENT") == "", (
+        f"a spawner with no parent of its own must yield an empty (root) "
+        f"parent for a sibling child, got {captured!r}"
+    )
+
+
+def test_sibling_parentage_two_way_into_hook_record(tmp_path: pathlib.Path) -> None:
+    """B7 boundary (C7 spawn-side export <-> C1/C2 hook-side schema): the
+    CLAUDE_SPAWN_PARENT_ID a sibling spawn actually exports must, when fed
+    to the already-landed SessionStart hook
+    (orchestrator.session_hooks.run_session_start), land as
+    record.parent_session_id -- proving the two sides of the seam compose
+    end-to-end, not just independently.
+
+    RED today: the sibling spawn exports "P" (the direct spawner) instead of
+    "A" (the shared ancestor), so the fed-through value fails both the
+    equals-"A" and not-equals-"P" assertions below.
+    """
+    result, captured, fleet_root = _run_sibling_capture_spawn(
+        tmp_path, spawner_session_id="P", spawner_parent_id="A",
+    )
+    assert result.returncode == 0, f"stderr: {result.stderr.decode()}"
+
+    hook_input = {"session_id": "child-hook-boundary", "cwd": str(tmp_path)}
+    hook_env = {"CLAUDE_SPAWN_PARENT_ID": captured.get("PARENT", "")}
+    record = session_hooks.run_session_start(hook_input, hook_env, root=fleet_root)
+
+    assert record.parent_session_id == "A", (
+        f"expected the sibling-exported parent id to land as "
+        f"record.parent_session_id, got {record.parent_session_id!r}"
+    )
+    assert record.parent_session_id != "P", (
+        "record.parent_session_id must not be the direct spawner's own "
+        "session id in sibling mode"
+    )
+
+
+# ===========================================================================
+# task-2298 step-3: Fleet Cockpit C7 sibling mode is fire-and-forget
+# ===========================================================================
+# The /prd author->decompose handoff needs to spawn its sibling and exit
+# cleanly, not babysit it -- so sibling mode must return once the child is
+# LAUNCHED, without blocking on the sentinel until it exits. Proven by
+# marker presence (started) + absence (done) rather than a wall-clock
+# tolerance: sleep_secs is chosen generously large relative to how long
+# _run_spawn itself takes to return, not tuned to any specific latency
+# budget -- large enough that the snapshot-on-return assertion stays
+# unambiguous even on a heavily-loaded CI runner.
+#
+# Two tests exercise two structurally different detach paths: the tmux lane
+# below (test_sibling_mode_is_fire_and_forget) was ALREADY detached by the
+# tmux server before this task, so sibling mode there only swaps
+# resolve_detached for resolve_sibling; the foreground-emulator lane further
+# down (test_sibling_mode_foreground_emulator_is_fire_and_forget) drives the
+# NEW explicit `setsid <emu> ... </dev/null >/dev/null 2>&1 &` detach this
+# task adds to the xterm/kitty/mac-terminal/custom branches -- the code most
+# likely to regress and, absent that second test, entirely uncovered.
+
+
+def _write_fake_claude_slow_with_markers(
+    bin_dir: pathlib.Path, started: pathlib.Path, done: pathlib.Path, sleep_secs: float = 20,
+) -> None:
+    """Write a fake ``claude`` that touches *started* immediately, sleeps
+    *sleep_secs*, then touches *done* and exits 0.
+
+    Used to prove fire-and-forget: the spawner returns after the child is
+    launched (started exists) but WITHOUT waiting for it to finish (done
+    does not exist yet) -- a marker-presence check, not a timing tolerance.
+    The default is deliberately generous (20s, comfortably inside
+    ``_run_spawn``'s 30s default timeout): the assertion is taken
+    immediately on return, not after the sleep, so a larger value costs
+    nothing in wall-clock but makes the "spawn-claude.sh reliably returns
+    well before the child finishes" premise robust under CI load.
+    """
+    p = bin_dir / "claude"
+    p.write_text(
+        f"#!/usr/bin/env bash\n"
+        f"touch {started!s}\n"
+        f"sleep {sleep_secs}\n"
+        f"touch {done!s}\n"
+        f"exit 0\n"
+    )
+    p.chmod(0o755)
+
+
+def test_sibling_mode_is_fire_and_forget(tmp_path: pathlib.Path) -> None:
+    """Sibling mode must return from spawn-claude.sh once the child is
+    LAUNCHED, without blocking on the sentinel until it exits.
+
+    Premise-free: the done-marker absence is checked as a snapshot taken
+    immediately after ``_run_spawn`` returns (before any further polling
+    delay), and the started-marker's eventual presence is confirmed via
+    ``_wait_for_path`` (robust to scheduling jitter, not a race against the
+    assertion above it).
+
+    RED today: sibling mode still falls through to
+    resolve_detached->await_sentinel, so _run_spawn blocks until the child
+    exits and touches done -- done.exists() is True by the time _run_spawn
+    returns, failing the "must be absent" assertion below. GREEN after
+    step-4.
+    """
+    bin_dir = _make_bin_dir(tmp_path)
+    started = tmp_path / "started"
+    done = tmp_path / "done"
+    _write_fake_claude_slow_with_markers(bin_dir, started, done, sleep_secs=20)
+
+    tmux_marker = tmp_path / "tmux_used"
+    _write_fake_tmux(bin_dir, tmux_marker)
+
+    env = _base_env(bin_dir, "xterm")
+    env["CLAUDE_SPAWN_BACKEND"] = "tmux"
+    env["CLAUDE_SPAWN_PROJECT"] = "proj"
+    env["CLAUDE_SPAWN_MODE"] = "sibling"
+
+    result = _run_spawn(env, tmp_path)
+
+    assert result.returncode == 0, f"stderr: {result.stderr.decode()}"
+
+    # Snapshot immediately -- must reflect the state at the moment
+    # spawn-claude.sh returned, not after the started-marker poll below.
+    done_existed_at_return = done.exists()
+    assert not done_existed_at_return, (
+        "sibling mode must return WITHOUT waiting for the child to finish "
+        "-- the done-marker must not exist yet at the moment "
+        "spawn-claude.sh returns"
+    )
+
+    _wait_for_path(started, timeout=5.0)
+
+    fleet_root = pathlib.Path(env["CLAUDE_FLEET_ROOT"])
+    record_path = _find_one_record(fleet_root)
+    record = session_registry.SessionRecord.from_json(record_path.read_text())
+    assert record.status == session_registry.Status.RUNNING, (
+        f"expected a best-effort refresh to RUNNING, got {record.status}"
+    )
+
+
+def test_sibling_mode_foreground_emulator_is_fire_and_forget(tmp_path: pathlib.Path) -> None:
+    """Fire-and-forget must also hold for a foreground terminal emulator
+    (xterm) -- not just the tmux lane covered by
+    test_sibling_mode_is_fire_and_forget above.
+
+    The tmux lane was ALREADY detached by the tmux server before this task,
+    so sibling mode there only swaps resolve_detached for resolve_sibling.
+    The xterm branch is different: it needed a brand-new explicit detach
+    (``setsid xterm ... </dev/null >/dev/null 2>&1 &``, replacing the plain
+    foreground ``xterm ...`` call that resolve_foreground otherwise waits
+    on) -- the code most likely to regress, and, without this test, never
+    exercised by any sibling-mode test.
+
+    Premise-free and doubles as a pipe-holding check, not just a timing
+    check: ``_write_foreground_terminal``'s fake xterm does `exec bash -c
+    "$inner"` -- if spawn-claude.sh ever dropped the `setsid` backgrounding
+    or the `</dev/null >/dev/null 2>&1` stdio redirect, that exec'd process
+    (and the slow fake claude beneath it) would inherit and hold open THIS
+    test's own captured stdout/stderr pipe. subprocess.run's
+    capture_output read would then block until the child closes those
+    descriptors -- i.e. until it finishes sleeping and exits, ~sleep_secs
+    later -- so the done-marker would already exist (or the call would
+    approach its timeout) by the time control returned, not just fail a
+    bare marker check.
+
+    RED before step-4: sibling mode fell through to resolve_foreground's
+    plain, attached ``xterm "${args[@]}"`` call, so _run_spawn blocked until
+    the fake claude finished sleeping and touched done. GREEN after step-4's
+    setsid + stdio-redirect + resolve_sibling for the xterm branch.
+    """
+    bin_dir = _make_bin_dir(tmp_path)
+    started = tmp_path / "started"
+    done = tmp_path / "done"
+    _write_fake_claude_slow_with_markers(bin_dir, started, done, sleep_secs=20)
+    _write_foreground_terminal(bin_dir, "xterm")
+
+    env = _base_env(bin_dir, "xterm")
+    env["CLAUDE_SPAWN_MODE"] = "sibling"
+
+    result = _run_spawn(env, tmp_path)
+
+    assert result.returncode == 0, f"stderr: {result.stderr.decode()}"
+
+    # Snapshot immediately -- must reflect the state at the moment
+    # spawn-claude.sh returned, not after the started-marker poll below.
+    # Reaching this line at all (rather than subprocess.run blocking on a
+    # held-open pipe) is itself part of what's being asserted -- see the
+    # docstring above.
+    done_existed_at_return = done.exists()
+    assert not done_existed_at_return, (
+        "sibling mode via a foreground emulator (xterm) must return "
+        "WITHOUT waiting for the child to finish -- the done-marker must "
+        "not exist yet at the moment spawn-claude.sh returns, and the "
+        "caller's stdout/stderr pipe must not be held open by an "
+        "undetached child"
+    )
+
+    _wait_for_path(started, timeout=5.0)
+
+    fleet_root = pathlib.Path(env["CLAUDE_FLEET_ROOT"])
+    record_path = _find_one_record(fleet_root)
+    record = session_registry.SessionRecord.from_json(record_path.read_text())
+    assert record.status == session_registry.Status.RUNNING, (
+        f"expected a best-effort refresh to RUNNING, got {record.status}"
     )

@@ -59,6 +59,14 @@ skip_perms="$2"
 title="$3"
 prompt="$4"
 
+# Fleet Cockpit C7 (plans/fleet-cockpit-prd.md §6.1): spawn_mode selects
+# which identity the child inherits as its own CLAUDE_SPAWN_PARENT_ID (see
+# the identity-export block below) and, later, whether this launch is
+# fire-and-forget (see resolve_sibling). Read once, up front, alongside the
+# positional-arg parse -- 'child' (the default) preserves every existing
+# caller's behavior byte-for-byte.
+spawn_mode="${CLAUDE_SPAWN_MODE:-child}"
+
 # Started-verification watchdog (Attention Rail T4) state: a spawn-time
 # reference marker (mtime = spawn start, used by the step-4 transcript-
 # appearance probe to distinguish a fresh transcript from a stale one), a
@@ -136,12 +144,13 @@ fi
 # the spawned child its OWN new session-registry slug, plus its parent
 # linkage. Default 'child' spawn_mode -- the child's parent-of-record is the
 # DIRECT spawner, i.e. THIS script's own inherited CLAUDE_SPAWN_SESSION_ID
-# (empty when this is a human-launched root with nothing to inherit). C7
-# later overrides parent_id_export for spawn_mode=sibling (parent = the
-# spawner's own inherited CLAUDE_SPAWN_PARENT_ID -- the shared ancestor, not
-# the direct spawner); this establishes the child-default baseline C7 builds
-# on. Both are nested under the same SESSION_RECORD_DIR check as
-# CLAUDE_SPAWN_RESULT_FILE above, so a registry fault (empty
+# (empty when this is a human-launched root with nothing to inherit).
+# Fleet Cockpit C7: spawn_mode=sibling instead parents the child at THIS
+# script's own inherited CLAUDE_SPAWN_PARENT_ID -- the shared ancestor, not
+# the direct spawner -- so a sibling handoff (e.g. /prd author->decompose)
+# renders under the same ancestor as the spawner itself, rather than nesting
+# one level deeper. Both branches are nested under the same SESSION_RECORD_DIR
+# check as CLAUDE_SPAWN_RESULT_FILE above, so a registry fault (empty
 # SESSION_RECORD_DIR) cleanly no-ops BOTH exports together -- it would be
 # incoherent to hand the child a parent link with no session identity of its
 # own. child_session_id is derived from SESSION_RECORD_DIR's basename,
@@ -155,7 +164,11 @@ if [ -n "$SESSION_RECORD_DIR" ]; then
   q_child=$(printf %q "$child_session_id")
   spawn_id_export="export CLAUDE_SPAWN_SESSION_ID=$q_child; "
 
-  parent_of_child="${CLAUDE_SPAWN_SESSION_ID:-}"
+  if [ "$spawn_mode" = "sibling" ]; then
+    parent_of_child="${CLAUDE_SPAWN_PARENT_ID:-}"
+  else
+    parent_of_child="${CLAUDE_SPAWN_SESSION_ID:-}"
+  fi
   if [ -n "$parent_of_child" ]; then
     q_parent=$(printf %q "$parent_of_child")
     parent_id_export="export CLAUDE_SPAWN_PARENT_ID=$q_parent; "
@@ -481,6 +494,47 @@ resolve_detached() {
   fi
 }
 
+# resolve_sibling: called after a sibling-mode (Fleet Cockpit C7) child has
+# been launched detached (setsid, stdio redirected off this script's own
+# pipe -- see the emulator case dispatch below). Deliberately does NOT wait
+# on the sentinel at all: the whole point of sibling mode is fire-and-forget
+# -- e.g. the /prd author->decompose handoff must spawn its sibling and exit
+# cleanly, not babysit it until it finishes. Best-effort refreshes the
+# pid-keyed record from LAUNCHING to RUNNING (a concrete, non-LAUNCHING
+# marker, fail-soft exactly like the launching/exit/set-display calls
+# above); this script never touches that record again afterward -- no
+# EXITED write ever lands on it in sibling mode -- so it is reclaimed by the
+# normal stale-pid reaper once this script's own pid (the record's
+# launcher_pid) is long gone. The authoritative join is the child's own C2
+# SessionStart-hook-written record plus its result.md (Attention Rail T5),
+# not this pid-keyed record.
+#
+# KNOWN LEAK (deliberate -- same shape as the mac-terminal tmpscript leak
+# further below): $inner's EXIT trap (see the `inner=` assignment above)
+# still writes `${ec:-$?}` to $sentinel whenever the detached child
+# eventually exits, but by then this script has long since returned via the
+# `exit 0` below. finish() and finish_failed_to_start() are the only two
+# removers of $sentinel, and sibling mode reaches neither, so one stale
+# "*.done" file per sibling spawn accumulates in TMPDIR. Not worth chasing
+# for a few stray bytes in TMPDIR -- reclaimed by normal OS tmp-dir cleanup,
+# same as the mac-terminal tmpscript leak.
+#
+# KNOWN LIMITATION (started-verification watchdog does not apply here): the
+# _started_watchdog background job (forked below, before the emulator case
+# dispatch) is still forked in sibling mode, but the `exit 0` below runs
+# this script's EXIT trap (_cleanup) immediately, which kills watchdog_pid
+# before it can ever poll long enough to flag failed-to-start. Attention
+# Rail T4 therefore does NOT protect sibling spawns: a sibling child that
+# never starts simply leaves its LAUNCHING/RUNNING record to be silently
+# reclaimed by the normal stale-pid reaper, not marked failed-to-start. Do
+# not assume the watchdog is protecting this path -- it isn't.
+resolve_sibling() {
+  if [ -n "$SESSION_RECORD_DIR" ] && command -v python3 >/dev/null 2>&1; then
+    python3 "$SESSION_REGISTRY_PY" refresh --record "$SESSION_RECORD_DIR" --status running || true
+  fi
+  exit 0
+}
+
 # --- emulator selection ----------------------------------------------------
 
 if [ "${CLAUDE_SPAWN_BACKEND:-}" = "tmux" ]; then
@@ -525,57 +579,101 @@ fi
 # _cleanup + trap installed earlier (right after the mktemp calls near the
 # top of the script), so spawn_ref can never leak -- including on the
 # `exit 126` (no emulator found) path just above. Only the fork itself
-# happens here, immediately before the emulator case dispatch.
+# happens here, immediately before the emulator case dispatch. Forked
+# unconditionally, including for spawn_mode=sibling -- see resolve_sibling's
+# KNOWN LIMITATION comment above for why this watchdog can never actually
+# flag failed-to-start on that path.
 watchdog_pid=""
 _started_watchdog &
 watchdog_pid=$!
 
 case "$first_word" in
   gnome-terminal)
-    # --wait keeps the launcher attached until the window closes.
-    args=(--wait)
+    # --wait keeps the launcher attached until the window closes -- dropped
+    # in sibling mode (Fleet Cockpit C7) so gnome-terminal-server keeps the
+    # window running detached from the launching client while this script
+    # returns immediately via resolve_sibling instead of waiting for it.
+    args=()
+    [ "$spawn_mode" != "sibling" ] && args+=(--wait)
     [ -n "$title" ] && args+=(--title="$title")
     args+=(-- bash -c "$inner")
     gnome-terminal "${args[@]}"
-    resolve_foreground
+    if [ "$spawn_mode" = "sibling" ]; then
+      resolve_sibling
+    else
+      resolve_foreground
+    fi
     ;;
   xterm)
-    # xterm is naturally foreground.
+    # xterm is naturally foreground -- in sibling mode (Fleet Cockpit C7) it
+    # must be detached explicitly: setsid (survive this script's exit) and
+    # stdio redirected off this script's own pipe (else a caller capturing
+    # this script's output, e.g. /spawn's background task, would block
+    # until the detached xterm itself exits).
     args=()
     [ -n "$title" ] && args+=(-T "$title")
     args+=(-e bash -c "$inner")
-    xterm "${args[@]}"
-    resolve_foreground
+    if [ "$spawn_mode" = "sibling" ]; then
+      setsid xterm "${args[@]}" </dev/null >/dev/null 2>&1 &
+      resolve_sibling
+    else
+      xterm "${args[@]}"
+      resolve_foreground
+    fi
     ;;
   kitty)
-    # Default kitty (no --single-instance) is naturally foreground.
+    # Default kitty (no --single-instance) is naturally foreground -- same
+    # sibling-mode detach treatment as xterm above.
     args=()
     [ -n "$title" ] && args+=(--title "$title")
     args+=(bash -c "$inner")
-    kitty "${args[@]}"
-    resolve_foreground
+    if [ "$spawn_mode" = "sibling" ]; then
+      setsid kitty "${args[@]}" </dev/null >/dev/null 2>&1 &
+      resolve_sibling
+    else
+      kitty "${args[@]}"
+      resolve_foreground
+    fi
     ;;
   konsole)
-    # konsole daemonizes — launch, then wait on the sentinel.
+    # konsole daemonizes — launch, then wait on the sentinel. In sibling
+    # mode it's already effectively detached (the GUI process outlives the
+    # launching client), so just launch and return via resolve_sibling
+    # without waiting even for the launcher client itself.
     args=()
     [ -n "$title" ] && args+=(-p "tabtitle=$title")
     args+=(-e bash -c "$inner")
-    konsole "${args[@]}" &
-    wait $!
-    resolve_detached $?
+    if [ "$spawn_mode" = "sibling" ]; then
+      setsid konsole "${args[@]}" </dev/null >/dev/null 2>&1 &
+      resolve_sibling
+    else
+      konsole "${args[@]}" &
+      wait $!
+      resolve_detached $?
+    fi
     ;;
   mac-terminal)
     # `open -a Terminal` needs a script file — it doesn't forward command args.
     tmpscript=$(mktemp -t spawn-claude-XXXXXX)
     printf '#!/usr/bin/env bash\n%s\n' "$inner" > "$tmpscript"
     chmod +x "$tmpscript"
-    open -a Terminal "$tmpscript" || { rm -f "$tmpscript" "$sentinel"; exit 127; }
-    await_sentinel
-    rm -f "$tmpscript"
-    if _failed_to_start_pending; then
-      finish_failed_to_start
+    if [ "$spawn_mode" = "sibling" ]; then
+      # Detach explicitly, same as xterm/kitty above. Deliberately do NOT
+      # rm the tmpscript here (unlike the non-sibling path below) --
+      # Terminal.app is still reading/executing it after this script
+      # returns, so removing it now would race the launch; it is a
+      # best-effort leak reclaimed by normal OS tmp-dir cleanup.
+      setsid open -a Terminal "$tmpscript" </dev/null >/dev/null 2>&1 &
+      resolve_sibling
+    else
+      open -a Terminal "$tmpscript" || { rm -f "$tmpscript" "$sentinel"; exit 127; }
+      await_sentinel
+      rm -f "$tmpscript"
+      if _failed_to_start_pending; then
+        finish_failed_to_start
+      fi
+      finish
     fi
-    finish
     ;;
   tmux-lane)
     # Fleet Cockpit C6: crash-survivable, reattachable tmux lane. A window
@@ -618,18 +716,32 @@ case "$first_word" in
         echo "spawn-claude.sh: warning: tmux reported no window target — skipping display stamp" >&2
       fi
     fi
-    resolve_detached "$launch_rc"
+    # Fleet Cockpit C7: the tmux server already owns the payload
+    # detached (see the comment above) regardless of spawn_mode -- sibling
+    # mode only changes whether THIS script waits for it to finish.
+    if [ "$spawn_mode" = "sibling" ]; then
+      resolve_sibling
+    else
+      resolve_detached "$launch_rc"
+    fi
     ;;
   *)
     # User-supplied launcher via $CLAUDE_TERMINAL_CMD. Assume `<cmd> -- bash -c '<payload>'`
-    # and detaching semantics — wait on sentinel.
+    # and detaching semantics — wait on sentinel (or, in sibling mode,
+    # detach explicitly via setsid + stdio redirect and don't wait at all --
+    # same treatment as xterm/kitty/mac-terminal above).
     # Word-split $emulator into an array so multi-word commands like
     # "some-term --opt" work.  Do NOT use eval: $inner contains literal double
     # quotes which break the quoting when eval re-parses "bash -c \"$inner\"".
     # shellcheck disable=SC2206
     _emcmd=($emulator)
-    "${_emcmd[@]}" -- bash -c "$inner" &
-    wait $!
-    resolve_detached $?
+    if [ "$spawn_mode" = "sibling" ]; then
+      setsid "${_emcmd[@]}" -- bash -c "$inner" </dev/null >/dev/null 2>&1 &
+      resolve_sibling
+    else
+      "${_emcmd[@]}" -- bash -c "$inner" &
+      wait $!
+      resolve_detached $?
+    fi
     ;;
 esac
