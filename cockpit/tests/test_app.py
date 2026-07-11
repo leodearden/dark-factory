@@ -941,6 +941,87 @@ class TestSpawnTree:
             assert _OUTSTANDING_MARKER not in exited_label
 
 
+class TestSpawnTreeEnterFocus:
+    @pytest.mark.timeout(10)
+    async def test_enter_focuses_the_highlighted_child_node(self, tmp_path):
+        """Enter on the spawn tree's CHILD node (deliberately not the
+        parent/row-0) resolves that child's own Display and routes it to
+        the focus backend -- the C9a leaf signal (PRD §9), mirroring
+        TestEnterFocus's decision-queue contract at the tree-toggle level.
+        """
+        from cockpit.app import CockpitApp
+        from cockpit.backends import DisplayTarget, FakeBackend
+        from cockpit.panes.spawn_tree import SpawnTree, SpawnTreeScreen
+
+        parent_display = sr.Display(kind='wm', wm_title='parent title')
+        child_display = sr.Display(kind='wm', wm_title='child title')
+        parent = _make_record(
+            session_slug='parent-1', parent_session_id=None, display=parent_display
+        )
+        child = _make_record(
+            session_slug='child-1', parent_session_id='parent-1', display=child_display
+        )
+        for r in (parent, child):
+            sr.write_record(r, root=tmp_path)
+
+        backend = FakeBackend()
+        app = CockpitApp(fleet_root=tmp_path, backend=backend, poll_interval=0.05)
+        async with app.run_test() as pilot:
+            await pilot.pause()
+
+            await pilot.press('t')
+            await pilot.pause()
+
+            assert isinstance(app.screen, SpawnTreeScreen)
+            tree = app.screen.query_one(SpawnTree)
+            parent_node = next(node for node in tree.root.children if node.data == 'parent-1')
+            child_node = next(node for node in parent_node.children if node.data == 'child-1')
+
+            tree.move_cursor(child_node)
+            await pilot.pause()
+
+            await pilot.press('enter')
+            await pilot.pause()
+
+            assert backend.focus_calls == [DisplayTarget(kind='wm', wm_title='child title')]
+
+    @pytest.mark.timeout(10)
+    async def test_enter_on_child_with_no_display_is_fail_soft(self, tmp_path):
+        """A child with no Display resolves to no focus target -- pressing
+        Enter on it must not focus anything and must not raise (PRD §2)."""
+        from cockpit.app import CockpitApp
+        from cockpit.backends import FakeBackend
+        from cockpit.panes.spawn_tree import SpawnTree, SpawnTreeScreen
+
+        parent = _make_record(session_slug='parent-1', parent_session_id=None)
+        child = _make_record(
+            session_slug='child-1', parent_session_id='parent-1', display=None
+        )
+        for r in (parent, child):
+            sr.write_record(r, root=tmp_path)
+
+        backend = FakeBackend()
+        app = CockpitApp(fleet_root=tmp_path, backend=backend, poll_interval=0.05)
+        async with app.run_test() as pilot:
+            await pilot.pause()
+
+            await pilot.press('t')
+            await pilot.pause()
+
+            assert isinstance(app.screen, SpawnTreeScreen)
+            tree = app.screen.query_one(SpawnTree)
+            parent_node = next(node for node in tree.root.children if node.data == 'parent-1')
+            child_node = next(node for node in parent_node.children if node.data == 'child-1')
+
+            tree.move_cursor(child_node)
+            await pilot.pause()
+
+            await pilot.press('enter')
+            await pilot.pause()
+
+            assert backend.focus_calls == []
+
+
 class TestRefreshWriteDiscipline:
     @pytest.mark.timeout(10)
     async def test_refresh_path_writes_nothing_under_sessions_or_decisions(self, tmp_path):
