@@ -328,6 +328,79 @@ class TestMemoryConsolidatorDeterministicCycleSummaryWrite:
 
 
 # ---------------------------------------------------------------------------
+# Task 2440: module-level `write_stage1_cycle_summary` helper — extracted
+# from the inline write_cycle_summary(...) call in MemoryConsolidator.run()
+# (task 2229 W5-λ) so the Stage-1 pool constants (recon_pool, cap,
+# trim_source, stage) bind in exactly one place, shared by both the in-stage
+# fast-path write and the harness-level raise-path backstop (task 2440).
+#
+# RED — the helper does not exist yet.
+# ---------------------------------------------------------------------------
+
+
+class TestWriteStage1CycleSummaryHelper:
+    """`write_stage1_cycle_summary` writes the authoritative ledger row and
+    binds the Stage-1 recon_pool/cap/trim_source/stage constants — parity
+    with TestMemoryConsolidatorDeterministicCycleSummaryWrite's in-stage
+    coverage above, but exercising the extracted helper directly."""
+
+    @pytest_asyncio.fixture
+    async def ledger_store(self, tmp_path):
+        from fused_memory.reconciliation.recon_ledger import ReconLedgerStore
+
+        s = ReconLedgerStore(tmp_path / 'reconciliation.db')
+        await s.initialize()
+        yield s
+        await s.close()
+
+    def _report(self) -> StageReport:
+        return StageReport(
+            stage=StageId.memory_consolidator,
+            started_at=datetime(2026, 7, 11, 11, 0, 0, tzinfo=UTC),
+            completed_at=datetime(2026, 7, 11, 11, 5, 0, tzinfo=UTC),
+            items_flagged=[],
+            stats={},
+            llm_calls=2,
+            tokens_used=500,
+        )
+
+    @pytest.mark.asyncio
+    async def test_writes_one_ledger_row_and_binds_stage1_pool(self, ledger_store):
+        from fused_memory.reconciliation.stages.memory_consolidator import (
+            write_stage1_cycle_summary,
+        )
+
+        memory_service = AsyncMock()
+        memory_service.recon_ledger = ledger_store
+        memory_service.get_memories_by_metadata = AsyncMock(return_value=[])
+
+        run_id = 'run-helper-stage1'
+        report = self._report()
+
+        written = await write_stage1_cycle_summary(
+            memory_service, 'test_project', report, run_id,
+        )
+
+        assert written is True
+
+        record = await ledger_store.get_by_identity(
+            'test_project', 'cycle_summary', flag_type='memory_consolidator', run_id=run_id,
+        )
+        assert record is not None
+        assert record.record_kind == 'cycle_summary'
+        assert record.flag_type == 'memory_consolidator'
+        assert record.task_id == ''
+        assert record.run_id == run_id
+
+        # Binds the Stage-1 pool constants: the best-effort Mem0 mirror write
+        # tags metadata.stage with Stage 1's own stage identifier.
+        memory_service.add_system_record.assert_awaited_once()
+        assert memory_service.add_system_record.call_args.kwargs['metadata']['stage'] == (
+            'memory_consolidator'
+        )
+
+
+# ---------------------------------------------------------------------------
 # A7b: harness._escalate fingerprint stamping + dedup routing
 # ---------------------------------------------------------------------------
 
