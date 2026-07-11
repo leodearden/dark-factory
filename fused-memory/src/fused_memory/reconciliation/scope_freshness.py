@@ -82,3 +82,57 @@ def is_cross_project_scope_correction(finding: dict[str, Any], project_id: str) 
             return True
 
     return False
+
+
+def select_primary_subject(
+    finding: dict[str, Any], project_id: str,
+) -> tuple[str, str] | None:
+    """Pick the finding's primary subject task as ``(subject_project_id, subject_task_id)``.
+
+    Prefers the FIRST ``cited_tasks`` entry whose ``project_id`` differs from
+    the running *project_id* (the foreign subject a scope-correction finding
+    is usually about).  Falls back to the first structurally-valid entry
+    (truthy ``project_id`` + non-None ``task_id``) when none are foreign.
+    Returns None when ``cited_tasks`` is missing/empty, or contains no
+    structurally-valid entry.  ``task_id`` is coerced to ``str``.  Pure,
+    sync, no I/O.
+    """
+    if not isinstance(finding, dict):
+        return None
+    cited_tasks = finding.get('cited_tasks')
+    if not isinstance(cited_tasks, list) or not cited_tasks:
+        return None
+
+    fallback: tuple[str, str] | None = None
+    for cited in cited_tasks:
+        if not isinstance(cited, dict):
+            continue
+        cited_project_id = cited.get('project_id')
+        cited_task_id = cited.get('task_id')
+        if not cited_project_id or cited_task_id is None:
+            continue
+        if fallback is None:
+            fallback = (str(cited_project_id), str(cited_task_id))
+        if cited_project_id != project_id:
+            return (str(cited_project_id), str(cited_task_id))
+
+    return fallback
+
+
+def compute_scope_signature(finding: dict[str, Any], project_id: str) -> tuple[str, str] | None:
+    """Derive the freshness-snapshot key ``(task_ref, flag_key)`` for *finding*.
+
+    ``task_ref`` is the project-qualified subject reference
+    (``f'{subject_project_id}:{subject_task_id}'``) from
+    :func:`select_primary_subject`; ``flag_key`` is
+    ``finding['flag_type']`` or ``finding['category']`` or ``''``.  Returns
+    None when :func:`select_primary_subject` finds no usable subject.  Pure,
+    sync, no I/O.
+    """
+    subject = select_primary_subject(finding, project_id)
+    if subject is None:
+        return None
+    subject_project_id, subject_task_id = subject
+    task_ref = f'{subject_project_id}:{subject_task_id}'
+    flag_key = str(finding.get('flag_type') or finding.get('category') or '')
+    return (task_ref, flag_key)
