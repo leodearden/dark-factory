@@ -5051,3 +5051,93 @@ class TestFilterAlreadyTrackedSystemicPatterns:
             f'KEPT (cannot match confidently); got {result!r}'
         )
 
+    # ---- done-only + fail-open edge cases (step-7) -------------------------
+
+    @pytest.mark.asyncio
+    async def test_get_tasks_called_with_done_status_only(self):
+        """(a) get_tasks must be called with statuses=['done'].
+
+        Only done/merged tasks can trigger suppression — a PENDING duplicate
+        (like task 2412 in the e61b38f9 incident) must never be able to
+        suppress the finding that motivated filing it.
+        """
+        from fused_memory.reconciliation.flag_dedup import (
+            filter_already_tracked_systemic_patterns,
+        )
+
+        flag = self._make_never_tracked_flag()
+        taskmaster = AsyncMock()
+        taskmaster.get_tasks = AsyncMock(return_value={'tasks': []})
+
+        await filter_already_tracked_systemic_patterns(taskmaster, '/df', [flag])
+
+        taskmaster.get_tasks.assert_called_once_with('/df', statuses=['done'])
+
+    @pytest.mark.asyncio
+    async def test_none_taskmaster_keeps_all_flags(self):
+        """(b) taskmaster is None → no-op KEEP-all (degrade to pass-through)."""
+        from fused_memory.reconciliation.flag_dedup import (
+            filter_already_tracked_systemic_patterns,
+        )
+
+        flag = self._make_never_tracked_flag()
+
+        result = await filter_already_tracked_systemic_patterns(None, '/df', [flag])
+
+        assert result == [flag], (
+            f'A None taskmaster must degrade to a no-op KEEP-all; got {result!r}'
+        )
+
+    @pytest.mark.asyncio
+    async def test_none_dark_factory_root_keeps_all_flags_and_get_tasks_not_called(self):
+        """(c) dark_factory_root is None → no-op KEEP-all, get_tasks NOT called."""
+        from fused_memory.reconciliation.flag_dedup import (
+            filter_already_tracked_systemic_patterns,
+        )
+
+        flag = self._make_never_tracked_flag()
+        taskmaster = AsyncMock()
+        taskmaster.get_tasks = AsyncMock(return_value={'tasks': []})
+
+        result = await filter_already_tracked_systemic_patterns(taskmaster, None, [flag])
+
+        assert result == [flag], (
+            f'A None dark_factory_root must degrade to a no-op KEEP-all; got {result!r}'
+        )
+        taskmaster.get_tasks.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_empty_dark_factory_root_keeps_all_flags_and_get_tasks_not_called(self):
+        """(c) dark_factory_root is '' → no-op KEEP-all, get_tasks NOT called."""
+        from fused_memory.reconciliation.flag_dedup import (
+            filter_already_tracked_systemic_patterns,
+        )
+
+        flag = self._make_never_tracked_flag()
+        taskmaster = AsyncMock()
+        taskmaster.get_tasks = AsyncMock(return_value={'tasks': []})
+
+        result = await filter_already_tracked_systemic_patterns(taskmaster, '', [flag])
+
+        assert result == [flag], (
+            f"An empty-string dark_factory_root must degrade to a no-op KEEP-all; got {result!r}"
+        )
+        taskmaster.get_tasks.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_get_tasks_raising_keeps_all_flags(self):
+        """(d) get_tasks raising → fail-open KEEP-all."""
+        from fused_memory.reconciliation.flag_dedup import (
+            filter_already_tracked_systemic_patterns,
+        )
+
+        flag = self._make_never_tracked_flag()
+        taskmaster = AsyncMock()
+        taskmaster.get_tasks = AsyncMock(side_effect=RuntimeError('backend down'))
+
+        result = await filter_already_tracked_systemic_patterns(taskmaster, '/df', [flag])
+
+        assert result == [flag], (
+            f'get_tasks raising must fail-open to KEEP-all; got {result!r}'
+        )
+
