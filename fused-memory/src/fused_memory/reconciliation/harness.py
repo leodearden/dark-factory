@@ -774,12 +774,23 @@ class ReconciliationHarness:
             return FilteredTaskTree()
 
     async def _fetch_task_count_census(self, project_root: ProjectRoot) -> dict[str, str]:
-        """Fetch the authoritative {id: status} map from taskmaster.get_statuses().
+        """Fetch the authoritative {id: status} map from taskmaster.get_statuses_fresh().
+
+        Reads via get_statuses_fresh (task 2388), not get_statuses: get_statuses
+        may be served from taskmaster's cached per-project connection, which can
+        have a read transaction pinning it to a stale WAL snapshot. Because
+        _fetch_filtered_task_tree's tree read shares that same cached connection,
+        a pinned get_statuses would go stale *together* with the tree read, so
+        they'd still agree with each other and cross_verify_task_counts
+        (task_filter.py:598) would report a false consistent:true instead of
+        surfacing the drift. get_statuses_fresh always reads a fresh snapshot on
+        a dedicated connection, so it can't be pinned — a stale tree read now
+        shows up as a genuine mismatch instead of being masked.
 
         Mirrors _fetch_filtered_task_tree's fail-open posture: guard against a
         falsy taskmaster, an empty project_root, and any exception raised by
-        get_statuses — all degrade to an empty dict so the caller can distinguish
-        'not available' from a real status map.
+        get_statuses_fresh — all degrade to an empty dict so the caller can
+        distinguish 'not available' from a real status map.
 
         Args:
             project_root: Absolute path to the project root for taskmaster.
@@ -800,11 +811,11 @@ class ReconciliationHarness:
             )
             return {}
         try:
-            statuses = await self.taskmaster.get_statuses(project_root=project_root)
+            statuses = await self.taskmaster.get_statuses_fresh(project_root=project_root)
             if isinstance(statuses, dict):
                 return statuses
             logger.warning(
-                '_fetch_task_count_census: get_statuses returned a non-dict'
+                '_fetch_task_count_census: get_statuses_fresh returned a non-dict'
                 ' (type=%s, repr=%s) for %r; census cross-check will be skipped',
                 type(statuses).__name__,
                 repr(statuses)[:200],
