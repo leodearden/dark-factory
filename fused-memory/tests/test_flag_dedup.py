@@ -138,28 +138,6 @@ async def test_dedup_flags_no_signature_flags_pass_through_unchanged():
 # ---------------------------------------------------------------------------
 
 
-def _assert_valid_stage1_marker(
-    call_kwargs: dict,
-    *,
-    task_id: str,
-    flag_type: str,
-    run_id: str,
-) -> None:
-    """Assert that an add_memory call_kwargs encodes a well-formed stage1_flag_marker.
-
-    Centralises the marker-shape contract so that a schema change only needs to
-    be updated here rather than in every test that writes or inspects a marker.
-    """
-    assert call_kwargs.get('category') == 'observations_and_summaries'
-    meta = call_kwargs.get('metadata', {})
-    assert meta.get('source') == 'stage1_flag_marker'
-    assert meta.get('kind') == 'stage1_flag_marker'
-    assert meta.get('task_id') == task_id
-    assert meta.get('flag_type') == flag_type
-    assert meta.get('run_id') == run_id
-    assert meta.get('last_seen_run_id') == run_id
-
-
 # ---------------------------------------------------------------------------
 # Ledger-backed memory_service fixture (task 2227 prereq-1)
 #
@@ -449,47 +427,6 @@ async def test_dedup_flags_retires_mem0_marker_mirror(ledger_memory_service):
 
     # (b) The best-effort Mem0 marker mirror is retired — never called.
     ledger_memory_service.add_memory.assert_not_called()
-
-
-@pytest.mark.asyncio
-async def test_dedup_flags_mirror_write_exception_does_not_raise_ledger_still_committed(
-    ledger_memory_service, caplog
-):
-    """When the best-effort Mem0 mirror add_memory raises, dedup_flags does
-    not raise and the ledger row (already committed before the mirror
-    attempt) survives — only the mirror is best-effort, the ledger write is
-    not gated on it.
-    """
-    import logging
-
-    from fused_memory.reconciliation.flag_dedup import dedup_flags
-
-    ledger_memory_service.add_memory = AsyncMock(side_effect=RuntimeError('mirror write failed'))
-
-    flags = [{'task_id': '66', 'flag_type': 'missing_deliverable', 'description': 'test'}]
-
-    with caplog.at_level(logging.DEBUG, logger='fused_memory.reconciliation.flag_dedup'):
-        result = await dedup_flags(
-            memory_service=ledger_memory_service,
-            project_id='p',
-            run_id='r1',
-            flags=flags,
-        )
-
-    # (a) Does NOT raise
-    # (b) Returns flag unchanged (fresh signature — no persisted_from_run)
-    assert len(result) == 1
-    assert 'persisted_from_run' not in result[0]
-
-    # (c) The ledger row is committed despite the mirror failure
-    row = await _get_marker(ledger_memory_service.recon_ledger, 'p', '66', 'missing_deliverable')
-    assert row is not None
-
-    # (d) DEBUG log mentions the failure and task_id
-    assert any(
-        '66' in record.message and record.levelno == logging.DEBUG
-        for record in caplog.records
-    )
 
 
 # ---------------------------------------------------------------------------
@@ -4461,11 +4398,7 @@ async def test_dedup_flags_recurring_flag_without_flag_for_stage2_unaffected(
     assert row is not None
     assert row.state == 'active'
 
-    ledger_memory_service.add_memory.assert_called_once()
-    _assert_valid_stage1_marker(
-        ledger_memory_service.add_memory.call_args.kwargs,
-        task_id='99', flag_type='stale_metadata', run_id='r1',
-    )
+    ledger_memory_service.add_memory.assert_not_called()
     ledger_memory_service.delete_memory.assert_not_called()
 
 

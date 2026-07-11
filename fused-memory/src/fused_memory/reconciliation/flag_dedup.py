@@ -757,9 +757,8 @@ async def write_suppression_record(
     type stays uniform.
 
     The ``_source='stage1_flag_suppression'`` sentinel distinguishes these
-    mirror writes from ``'stage1_flag_dedup'`` and ``'targeted_recon'``
-    writes in the audit journal, enabling per-class retention and query
-    filtering.
+    mirror writes from ``'targeted_recon'`` writes in the audit journal,
+    enabling per-class retention and query filtering.
 
     ``flag_types`` is an OPTIONAL scoping allowlist (task-1966), forwarded
     verbatim to :func:`build_suppression_payload` for the mirror payload.
