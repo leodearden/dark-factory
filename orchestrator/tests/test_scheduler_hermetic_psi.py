@@ -102,24 +102,35 @@ class TestAutouseFixtureDefaultsToIdlePsi:
     """Guard test for conftest's autouse ``_hermetic_psi_reader`` fixture."""
 
     def test_autouse_fixture_defaults_scheduler_to_idle_psi(self) -> None:
-        """Every bare Scheduler defaults ``_read_psi_sample`` to ``idle_psi_sample``.
+        """Every bare Scheduler defaults ``_read_psi_sample`` to an idle sample.
 
         Without the autouse ``_hermetic_psi_reader`` fixture, the constructor
         default (scheduler.py) is the real ``shared.psi.read_psi_sample``,
-        which reads live ``/proc/pressure/*`` — this identity assertion would
-        be False. Mirrors
+        which reads live ``/proc/pressure/*`` — the behavioral assertions
+        below would then reflect actual host pressure instead of the fixed
+        idle values asserted here. Mirrors
         ``test_scheduler_state.py::test_bare_config_project_root_isolated_to_tmp``,
         the guard test for the sibling autouse ``_isolate_orch_config`` fixture.
         """
         scheduler = Scheduler(OrchestratorConfig(max_per_module=1))
 
-        assert scheduler._read_psi_sample is idle_psi_sample, (
-            'expected the autouse _hermetic_psi_reader fixture to default '
-            f'_read_psi_sample to idle_psi_sample; got {scheduler._read_psi_sample!r}'
-        )
+        # Primary, behavior-level contract: the bound reader returns a
+        # non-saturating, successful sample regardless of host load. This is
+        # the meaningful guarantee callers of _read_psi_sample rely on.
         sample = scheduler._read_psi_sample()
         assert sample.read_ok is True
         assert sample.cpu_some10 == 0.0
         assert sample.mem_some10 == 0.0
         assert sample.mem_full10 == 0.0
         assert sample.io_some10 == 0.0
+
+        # Secondary, implementation-coupled check: pins the fixture to the
+        # exact `idle_psi_sample` object. Lower value than the behavior
+        # assertions above — a harmless refactor of the fixture (e.g.
+        # wrapping idle_psi_sample in a lambda/partial) would break this
+        # specific line with no behavioral regression; if that happens,
+        # update this assertion rather than treating it as a real failure.
+        assert scheduler._read_psi_sample is idle_psi_sample, (
+            'expected the autouse _hermetic_psi_reader fixture to default '
+            f'_read_psi_sample to idle_psi_sample; got {scheduler._read_psi_sample!r}'
+        )
