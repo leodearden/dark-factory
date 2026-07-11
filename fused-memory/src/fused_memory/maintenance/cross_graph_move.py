@@ -1075,9 +1075,6 @@ async def _recreate_subgraph_relationships_batch(
         edge_embedding_reply = await _read_compact_vector(
             falkor_client, group_id=source_graph, cypher=edge_embedding_cypher,
         )
-        edge_embedding_literal = format_vecf32_literal(
-            parse_compact_vector_reply(edge_embedding_reply)
-        )
 
         edge_create_result = await target.query(
             'MATCH (a:Entity {uuid: $src_uuid}), (b:Entity {uuid: $dst_uuid}) '
@@ -1089,8 +1086,8 @@ async def _recreate_subgraph_relationships_batch(
             '    r.invalid_at = $invalid_at, '
             '    r.created_at = $created_at, '
             '    r.group_id = $group_id, '
-            '    r.episodes = $episodes, '
-            f'    r.fact_embedding = {edge_embedding_literal}',
+            '    r.episodes = $episodes'
+            f'{_embedding_set_clause("r.fact_embedding", edge_embedding_reply)}',
             {
                 'src_uuid': src_uuid,
                 'dst_uuid': dst_uuid,
@@ -1190,9 +1187,6 @@ async def _recreate_subgraph_relationships_batch(
             edge_embedding_reply = await _read_compact_vector(
                 falkor_client, group_id=wrong_graph, cypher=edge_embedding_cypher,
             )
-            edge_embedding_literal = format_vecf32_literal(
-                parse_compact_vector_reply(edge_embedding_reply)
-            )
 
             # Both endpoints are MATCHed (never CREATEd): the home copy of
             # this MERGE node and the edge's other endpoint must already
@@ -1211,8 +1205,8 @@ async def _recreate_subgraph_relationships_batch(
                 '    r.invalid_at = $invalid_at, '
                 '    r.created_at = $created_at, '
                 '    r.group_id = $group_id, '
-                '    r.episodes = $episodes, '
-                f'    r.fact_embedding = {edge_embedding_literal}',
+                '    r.episodes = $episodes'
+                f'{_embedding_set_clause("r.fact_embedding", edge_embedding_reply)}',
                 {
                     'src_uuid': src_uuid,
                     'dst_uuid': dst_uuid,
