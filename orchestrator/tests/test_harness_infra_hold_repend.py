@@ -303,3 +303,115 @@ class TestInfraHoldEscalationResolution:
 
         # Normal resume → flip to 'pending'
         harness.scheduler.set_task_status.assert_awaited_once_with(tid, 'pending')  # type: ignore[attr-defined]
+
+
+# ---------------------------------------------------------------------------
+# Task 2200 (ω4) step-5: the reconcile SKIP site keys on the task's
+# first-class status via is_infra_held, not the retired metadata.infra_hold
+# boolean.
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+class TestRevertInProgressKeysOnInfraHoldStatus:
+    """_revert_in_progress_if_no_live_claimant must key its hold guard on
+    the task's status (is_infra_held), not the retired metadata.infra_hold
+    flag.
+
+    RED before step-6: the guard still reads metadata.infra_hold only and
+    never looks at status.
+    """
+
+    async def test_status_infra_hold_non_degenerate_not_reverted(
+        self, harness: Harness,
+    ):
+        """(i) status='infra-hold' + non-degenerate branch + no live claimant
+        -> NOT reverted, even with no metadata.infra_hold flag at all — the
+        first-class status alone is now the hold signal.
+        """
+        tid = '1883'
+        _make_worktree(harness, tid)  # no lock → no live claimant
+
+        harness.scheduler.get_task = AsyncMock(return_value={
+            'id': tid,
+            'status': 'infra-hold',
+            'metadata': {'branch_base_sha': _BASE_SHA},
+        })
+        # Non-degenerate branch: tip ≠ base
+        harness.git_ops.resolve_branch_sha = AsyncMock(return_value=_TIP_SHA)
+
+        result = await harness._revert_in_progress_if_no_live_claimant(
+            tid, mid_run=False,
+        )
+
+        assert result != 'reverted', (
+            f"_revert_in_progress_if_no_live_claimant reverted task {tid!r} "
+            f"despite status='infra-hold' on a non-degenerate branch. An "
+            f'infra-hold must survive the stranded recovery sweep.'
+        )
+        for call in harness.scheduler.set_task_status.await_args_list:  # type: ignore[attr-defined]
+            assert call.args[1] != 'pending', (
+                f'set_task_status({tid!r}, "pending") was called despite '
+                f"status='infra-hold': {call}"
+            )
+
+    async def test_legacy_metadata_flag_without_infra_hold_status_still_reverts(
+        self, harness: Harness,
+    ):
+        """(ii) status='in-progress' + a LEGACY metadata.infra_hold flag
+        (status != 'infra-hold') -> STILL reverted.  Proves the guard no
+        longer honors the retired metadata flag by itself.
+        """
+        tid = '1884'
+        _make_worktree(harness, tid)  # no lock → no live claimant
+
+        harness.scheduler.get_task = AsyncMock(return_value={
+            'id': tid,
+            'status': 'in-progress',
+            'metadata': {
+                'infra_hold': {'phase': 'warm_marker', 'errno': 28},
+                'branch_base_sha': _BASE_SHA,
+            },
+        })
+        # Non-degenerate branch: tip ≠ base
+        harness.git_ops.resolve_branch_sha = AsyncMock(return_value=_TIP_SHA)
+
+        result = await harness._revert_in_progress_if_no_live_claimant(
+            tid, mid_run=False,
+        )
+
+        assert result == 'reverted', (
+            f'Task with a legacy metadata.infra_hold flag but '
+            f"status != 'infra-hold' should still be reverted to pending "
+            f'(the retired flag must not be honored on its own); '
+            f'got {result!r}'
+        )
+        harness.scheduler.set_task_status.assert_awaited_once_with(tid, 'pending')  # type: ignore[attr-defined]
+
+
+@pytest.mark.asyncio
+class TestReconcileSweepExcludesInfraHold:
+    """Regression lock: infra-hold rows never reach _reconcile_one_stranded.
+
+    _RECONCILE_SWEEP_STATUSES = {'in-progress', 'blocked'} already excludes
+    'infra-hold', so this is green-on-arrival — no production code change
+    accompanies it.  It guards against a future edit silently adding
+    'infra-hold' to the sweep set, which would re-introduce the re-pend bug
+    this task's STAMP/HOLD/RESUME migration fixes.
+    """
+
+    async def test_infra_hold_row_never_reaches_reconcile_one_stranded(
+        self, harness: Harness,
+    ):
+        tid = '1886'
+        harness.scheduler.get_statuses = AsyncMock(
+            return_value=({tid: 'infra-hold'}, None),
+        )
+
+        with patch.object(
+            harness, '_reconcile_one_stranded', new=AsyncMock(),
+        ) as mock_reconcile_one:
+            count = await harness._reconcile_stranded_in_progress()
+
+        mock_reconcile_one.assert_not_called()
+        harness.scheduler.set_task_status.assert_not_called()  # type: ignore[attr-defined]
+        assert count == 0
