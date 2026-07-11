@@ -3113,6 +3113,78 @@ async def test_v3_to_v4_mixed_db_heals_genuine_while_flagging_ambiguous(tmp_path
     ], residual_groups
 
 
+# ── rebuild-without-restart: live re-audit (task 2402) ──────────────────
+
+
+@pytest.mark.asyncio
+async def test_reaudit_candidate_key_index_builds_on_live_connection_without_restart(
+    tmp_path,
+):
+    """A running server holding a pre-audit cached connection never re-runs
+    ``_migrate_v3_to_v4`` on its own (it only fires at connection-open) --
+    reproducing the incident's second failure mode. ``reaudit_candidate_key_index``
+    closes that gap: called on the SAME live backend after an operator
+    resolves the residual (no reopen/restart), it re-runs the self-heal audit
+    and lands the index. A second call is an idempotent no-op.
+    """
+    import sqlite3
+
+    project_root = str(tmp_path / 'proj')
+    db_path = Path(project_root) / '.taskmaster' / 'tasks' / 'tasks.db'
+    _make_v3_db_with_dup_groups(
+        db_path,
+        [
+            # Mixed-status flagged group -- blocks the index build at
+            # connection-open.
+            (1, 'Ambiguous task', 'done', ['x.py']),
+            (2, 'Ambiguous task', 'pending', ['x.py']),
+        ],
+    )
+
+    cfg = TaskmasterConfig(project_root=str(tmp_path))
+    b = SqliteTaskBackend(cfg)
+    await b.start()
+    try:
+        # Connection-open migration: flags the group, skips the index build.
+        await b.get_tasks(project_root=project_root)
+
+        conn = sqlite3.connect(str(db_path))
+        try:
+            indexes = {row[1] for row in conn.execute('PRAGMA index_list(tasks)')}
+            user_version = conn.execute('PRAGMA user_version').fetchone()[0]
+        finally:
+            conn.close()
+        assert not any('candidate_key' in idx for idx in indexes), (
+            f'Precondition: the index must be ABSENT before the re-audit; got {indexes}'
+        )
+        assert user_version == 3, user_version
+
+        # Operator resolves the residual on the SAME live backend -- no
+        # reopen/restart anywhere in this test.
+        await b.set_task_status('2', 'cancelled', project_root=project_root)
+
+        result = await b.reaudit_candidate_key_index(project_root)
+        assert result['index_built'] is True, result
+
+        conn = sqlite3.connect(str(db_path))
+        try:
+            indexes = {row[1] for row in conn.execute('PRAGMA index_list(tasks)')}
+            user_version = conn.execute('PRAGMA user_version').fetchone()[0]
+        finally:
+            conn.close()
+        assert any('candidate_key' in idx for idx in indexes), (
+            f'Expected ux_tasks_candidate_key to be built by the live re-audit; got {indexes}'
+        )
+        assert user_version == 4, user_version
+
+        # Idempotent second call -- already at v4, no-op.
+        result2 = await b.reaudit_candidate_key_index(project_root)
+        assert result2['index_built'] is True, result2
+        assert result2.get('already_at_v4') is True, result2
+    finally:
+        await b.close()
+
+
 # ── index-independent write-path dedup (fm-task-dedup self-heal amendment) ──
 
 
