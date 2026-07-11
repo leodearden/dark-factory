@@ -21,7 +21,10 @@ Usage (stdio transport, spawned by orchestrator):
 from __future__ import annotations
 
 import argparse
+import ast
+import json
 import logging
+import re
 import subprocess
 import sys
 from datetime import UTC, datetime
@@ -36,6 +39,86 @@ logger = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------
+# files-arg recovery helper (task 2428)
+# ---------------------------------------------------------------------------
+
+
+# Bracket/quote characters that, if still present in a delimiter-split
+# fallback result, indicate the split did not fully recover clean file
+# paths (i.e. the input was corrupted in a shape we don't parse).
+_RESIDUAL_CORRUPTION_CHARS = frozenset("[]{}'\"")
+
+
+def _coerce_files(files: list[str] | str | None) -> list[str]:
+    """Coerce a possibly mis-serialized ``files`` MCP arg into a clean list.
+
+    The agent harness intermittently mis-serializes the ``create_plan``
+    (and ``update_plan_metadata``) call when a large/complex ``analysis``
+    string accompanies the ``files`` array in the same call, corrupting
+    ``files`` into a stringified JSON array, a bare JSON string, a
+    Python-repr-style single-quoted list, or a comma/newline-delimited
+    plain string. This recovers all of those shapes back into a clean
+    ``list[str]``; ``None`` maps to ``[]``. Shapes that cannot be
+    confidently recovered are logged (rather than silently accepted) so
+    the corruption stays visible to operators.
+    """
+    if files is None:
+        return []
+    if isinstance(files, list):
+        return [str(f).strip() for f in files if str(f).strip()]
+
+    text = files.strip()
+    if not text:
+        return []
+
+    try:
+        decoded = json.loads(text)
+    except ValueError:
+        decoded = None
+
+    if isinstance(decoded, list):
+        return [str(f).strip() for f in decoded if str(f).strip()]
+    if isinstance(decoded, str):
+        decoded = decoded.strip()
+        return [decoded] if decoded else []
+    if decoded is not None:
+        # Valid JSON, but not a list/str (e.g. a dict or a number) is not a
+        # recognized files shape. Fall through to the delimiter split below
+        # for a best-effort recovery, but flag it — for a dict that split
+        # degrades to the whole brace-string as a single "path" rather than
+        # a real recovery.
+        logger.warning(
+            "_coerce_files: files arg decoded to unrecognized JSON shape "
+            "%s (expected list or str); falling back to delimiter-split "
+            "of raw text %r",
+            type(decoded).__name__,
+            text,
+        )
+    elif text.startswith('[') and text.endswith(']'):
+        # Not valid JSON. Try a Python-repr-style stringified list next —
+        # e.g. "['a.py', 'b.py']" (single-quoted) is a plausible
+        # mis-serialization shape that json.loads cannot parse.
+        try:
+            literal = ast.literal_eval(text)
+        except (ValueError, SyntaxError):
+            literal = None
+        if isinstance(literal, list):
+            return [str(f).strip() for f in literal if str(f).strip()]
+
+    # Last resort: split on commas/newlines, the other corrupted shape
+    # observed in practice.
+    parts = [part.strip() for part in re.split(r'[,\n]', text) if part.strip()]
+    if any(_RESIDUAL_CORRUPTION_CHARS & set(part) for part in parts):
+        logger.warning(
+            "_coerce_files: delimiter-split fallback produced entries with "
+            "residual bracket/quote characters — input may still be "
+            "corrupted: %r",
+            parts,
+        )
+    return parts
+
+
+# ---------------------------------------------------------------------------
 # Standalone implementation functions (testable without MCP transport)
 # ---------------------------------------------------------------------------
 
@@ -45,8 +128,21 @@ def _create_plan(
     task_id: str,
     title: str,
     analysis: str,
-    files: list[str],
+    files: list[str] | str | None,
 ) -> dict[str, Any]:
+    if files is None:
+        return {
+            'status': 'error',
+            'message': (
+                'files argument was missing from this create_plan call — a known '
+                'agent-harness mis-serialization defect that occurs when a large '
+                'or complex analysis string accompanies the files array in the '
+                'same call. Workaround: call create_plan again with a SHORT '
+                'placeholder analysis plus the full files array, then set the '
+                'full analysis via update_plan_metadata(analysis=...).'
+            ),
+        }
+    files = _coerce_files(files)
     plan = {
         'task_id': task_id,
         'title': title,
@@ -183,7 +279,7 @@ def _mark_step_done(
 
 def _update_plan_metadata(
     artifacts: TaskArtifacts,
-    files: list[str] | None = None,
+    files: list[str] | str | None = None,
     analysis: str | None = None,
 ) -> dict[str, Any]:
     plan = artifacts.read_plan()
@@ -191,7 +287,7 @@ def _update_plan_metadata(
         return {'status': 'error', 'message': 'No plan exists. Call create_plan first.'}
 
     if files is not None:
-        plan['files'] = files
+        plan['files'] = _coerce_files(files)
     if analysis is not None:
         plan['analysis'] = analysis
     artifacts.write_plan(plan)
@@ -409,7 +505,7 @@ def create_server(artifacts: TaskArtifacts) -> FastMCP:
         task_id: str,
         title: str,
         analysis: str,
-        files: list[str],
+        files: list[str] | str | None = None,
     ) -> dict[str, Any]:
         """Initialize a new implementation plan with metadata.
 
@@ -422,7 +518,10 @@ def create_server(artifacts: TaskArtifacts) -> FastMCP:
             title: Human-readable task title.
             analysis: Your analysis of the task, existing code, and approach.
             files: List of files (or directory paths) this task will create or modify.
-                Drives concurrency locks and the phantom-done gate.
+                Drives concurrency locks and the phantom-done gate. Also
+                tolerates a stringified JSON array or a comma/newline-delimited
+                string, recovering it into a list — a known agent-harness
+                mis-serialization when paired with a large/complex analysis.
         """
         return _create_plan(artifacts, task_id, title, analysis, files)
 
@@ -505,7 +604,7 @@ def create_server(artifacts: TaskArtifacts) -> FastMCP:
 
     @mcp.tool()
     def update_plan_metadata(
-        files: list[str] | None = None,
+        files: list[str] | str | None = None,
         analysis: str | None = None,
     ) -> dict[str, Any]:
         """Update the plan's top-level metadata without touching steps or prerequisites.
@@ -517,6 +616,9 @@ def create_server(artifacts: TaskArtifacts) -> FastMCP:
         Args:
             files: Updated list of files (or directory paths) this task will
                 create or modify. Drives concurrency locks and the phantom-done gate.
+                Tolerates a stringified array (e.g. a JSON-encoded list or a
+                comma/newline-delimited string) and recovers it into a clean
+                list; leave unset/None to keep the existing files unchanged.
             analysis: Updated analysis text.
         """
         return _update_plan_metadata(artifacts, files, analysis)

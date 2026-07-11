@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import logging
+
 import pytest
 
 from orchestrator.artifacts import TaskArtifacts
@@ -12,6 +14,7 @@ from orchestrator.mcp.plan_tools import (
     _add_prerequisite,
     _add_reuse_item,
     _artifacts_from_args,
+    _coerce_files,
     _confirm_plan,
     _create_plan,
     _mark_step_done,
@@ -31,6 +34,94 @@ def artifacts(tmp_path):
     a = TaskArtifacts(tmp_path)
     a.init('test-1', 'Test task', 'A test')
     return a
+
+
+# A ~2KB "trigger payload" analysis string mirroring the documented shape
+# that accompanies the harness's files-arg mis-serialization defect:
+# markdown backticks, a double-dot commit range, and a bang-pathspec token
+# (task 2428). NOTE: this is realistic-context padding only — _coerce_files
+# / _create_plan's coercion behavior is independent of analysis content (the
+# tests below pass a stringified `files` arg directly). Its purpose is to
+# exercise the boundary tests with an analysis shape matching the documented
+# trigger, not to causally test analysis size/content; see TestCoerceFiles
+# for the coercion-behavior unit tests themselves.
+_TRIGGER_ANALYSIS = (
+    'Root cause analysis referencing `backtick code`, a commit range like '
+    "main..HEAD, and a bang-pathspec like :!.task/ as in `git add -- . "
+    "':!.task'`. "
+    + ('Extra context padding sentence describing the approach in detail. ' * 30)
+)
+
+
+# ---------------------------------------------------------------------------
+# _coerce_files helper tests (task 2428)
+# ---------------------------------------------------------------------------
+
+
+class TestCoerceFiles:
+    """Unit tests for the ``files`` arg-recovery helper, independent of the
+    MCP tool/pydantic boundary (see the TestCreatePlanTool*/TestUpdatePlanMetadataTool*
+    boundary classes below for the pydantic-validation-path regression guards).
+    """
+
+    def test_none_returns_empty_list(self):
+        assert _coerce_files(None) == []
+
+    def test_list_passthrough(self):
+        assert _coerce_files(['a.py', 'b.py']) == ['a.py', 'b.py']
+
+    def test_json_array_string_recovered(self):
+        assert _coerce_files('["mod/a.py","mod/b.py"]') == ['mod/a.py', 'mod/b.py']
+
+    def test_comma_delimited_string_recovered(self):
+        assert _coerce_files('mod/a.py, mod/b.py') == ['mod/a.py', 'mod/b.py']
+
+    def test_newline_delimited_string_recovered(self):
+        assert _coerce_files('mod/a.py\nmod/b.py') == ['mod/a.py', 'mod/b.py']
+
+    def test_bare_json_string_recovered_as_single_path(self):
+        assert _coerce_files('"mod/a.py"') == ['mod/a.py']
+
+    def test_json_array_string_drops_blank_entries(self):
+        assert _coerce_files('["a.py", "  ", ""]') == ['a.py']
+
+    def test_list_entries_are_stripped(self):
+        assert _coerce_files([' a.py ', ' b.py ']) == ['a.py', 'b.py']
+
+    def test_single_quoted_python_repr_list_recovered(self):
+        """A Python-repr-style stringified list (single quotes) is not
+        valid JSON but is a plausible mis-serialization shape; it must be
+        recovered via ast.literal_eval rather than degrading to garbage
+        comma-split fragments like "['a.py'" and "'b.py']"."""
+        assert _coerce_files("['mod/a.py', 'mod/b.py']") == ['mod/a.py', 'mod/b.py']
+
+    def test_dict_shaped_json_falls_back_and_logs_warning(self, caplog):
+        """A JSON value that decodes to something other than a list/str
+        (e.g. a dict) is not a recognized files shape. It still falls back
+        to a best-effort delimiter split, but must log a warning so the
+        corruption is visible rather than silently persisting a malformed
+        path."""
+        with caplog.at_level(logging.WARNING, logger='orchestrator.mcp.plan_tools'):
+            result = _coerce_files('{"a": 1}')
+
+        assert result == ['{"a": 1}']
+        assert any(
+            'unrecognized JSON shape' in r.getMessage() for r in caplog.records
+        )
+
+    def test_residual_bracket_chars_after_split_logs_warning(self, caplog):
+        """Input that is neither valid JSON nor a valid Python list literal
+        (e.g. unquoted comma-separated entries wrapped in brackets) falls
+        back to a delimiter split that leaves stray bracket characters in
+        the result. This must be logged rather than silently accepted as
+        valid file paths."""
+        with caplog.at_level(logging.WARNING, logger='orchestrator.mcp.plan_tools'):
+            result = _coerce_files('[mod/a.py, mod/b.py]')
+
+        assert result == ['[mod/a.py', 'mod/b.py]']
+        assert any(
+            'residual bracket/quote characters' in r.getMessage() for r in caplog.records
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -60,6 +151,37 @@ class TestCreatePlan:
         assert plan['design_decisions'] == []
         assert plan['reuse'] == []
         assert '_schema_version' in plan
+
+    def test_recovers_stringified_files_array(self, artifacts):
+        """A large/complex analysis paired with a stringified files array
+        (the harness mis-serialization defect, task 2428) must still recover
+        the intended file list rather than storing the raw JSON text."""
+        result = _create_plan(
+            artifacts,
+            'test-1',
+            'Test task',
+            _TRIGGER_ANALYSIS,
+            '["mod/a.py","mod/b.py"]',
+        )
+        assert result['status'] == 'ok'
+
+        plan = artifacts.read_plan()
+        assert plan['files'] == ['mod/a.py', 'mod/b.py']
+
+    def test_dropped_files_returns_actionable_error(self, artifacts):
+        """When `files` arrives as None (the harness dropped it entirely —
+        the 'Missing required argument' symptom, task 2428), _create_plan
+        must return an actionable error naming the reliable split-call
+        workaround rather than silently writing an empty-files plan."""
+        result = _create_plan(artifacts, 'test-1', 'T', 'A', None)
+        assert result['status'] == 'error'
+        assert 'update_plan_metadata' in result['message']
+        assert (
+            'placeholder' in result['message'].lower()
+            or 'short' in result['message'].lower()
+        )
+
+        assert artifacts.read_plan() == {}
 
 
 class TestAddPlanStep:
@@ -274,6 +396,26 @@ class TestUpdatePlanMetadata:
         _setup_full_plan(artifacts)
         result = _update_plan_metadata(artifacts)
         assert result['status'] == 'ok'
+        plan = artifacts.read_plan()
+        assert plan['files'] == ['mod_a/foo.py', 'mod_a/bar.py']
+
+    def test_recovers_stringified_files_array(self, artifacts):
+        """A mis-serialized (stringified) files arg (task 2428) must be
+        recovered into a clean list, same as create_plan."""
+        _setup_full_plan(artifacts)
+        result = _update_plan_metadata(artifacts, files='["x.py","y.py"]')
+        assert result['status'] == 'ok'
+
+        plan = artifacts.read_plan()
+        assert plan['files'] == ['x.py', 'y.py']
+
+    def test_explicit_none_files_leaves_unchanged(self, artifacts):
+        """None must keep meaning 'leave files unchanged' — it must NOT be
+        treated as the create_plan dropped-files error case."""
+        _setup_full_plan(artifacts)
+        result = _update_plan_metadata(artifacts, files=None)
+        assert result['status'] == 'ok'
+
         plan = artifacts.read_plan()
         assert plan['files'] == ['mod_a/foo.py', 'mod_a/bar.py']
 
@@ -696,3 +838,90 @@ class TestReportBlockingDependencyToolResolvesRealWorktree:
         data = artifacts.read_blocking_dependency()
         assert data is not None
         assert data['main_sha_at_report'] == 'deadbeefcafef00d'
+
+
+# ---------------------------------------------------------------------------
+# files-arg pydantic-boundary regression guards (task 2428).
+#
+# These drive the REGISTERED MCP tool via create_server(...).get_tool(...)
+# and await tool.run({...}) — NOT tool.fn(...), which bypasses FastMCP's
+# pydantic argument validation (FunctionTool.run's type_adapter.validate_python,
+# called BEFORE the tool body executes). A corrupted `files` arg crashes at
+# that boundary, so only a tool.run(...) call exercises the real defect.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestCreatePlanToolRecoversMisserializedFiles:
+    """create_plan tolerates a mis-serialized (stringified) files arg."""
+
+    async def test_json_array_string_recovered_via_tool_run(self, artifacts):
+        server = plan_tools.create_server(artifacts)
+        tool = await server.get_tool('create_plan')
+        assert tool is not None
+
+        await tool.run({
+            'task_id': 'test-1',
+            'title': 'Test task',
+            'analysis': _TRIGGER_ANALYSIS,
+            'files': '["mod/a.py","mod/b.py"]',
+        })
+
+        plan = artifacts.read_plan()
+        assert plan['files'] == ['mod/a.py', 'mod/b.py']
+
+    async def test_comma_delimited_string_recovered_via_tool_run(self, artifacts):
+        server = plan_tools.create_server(artifacts)
+        tool = await server.get_tool('create_plan')
+        assert tool is not None
+
+        await tool.run({
+            'task_id': 'test-1',
+            'title': 'Test task',
+            'analysis': _TRIGGER_ANALYSIS,
+            'files': 'mod/a.py,mod/b.py',
+        })
+
+        plan = artifacts.read_plan()
+        assert plan['files'] == ['mod/a.py', 'mod/b.py']
+
+
+@pytest.mark.asyncio
+class TestCreatePlanToolDroppedFiles:
+    """create_plan tolerates a fully-dropped files arg — the harness's
+    'Missing required argument' symptom (task 2428) — by returning an
+    actionable structured error instead of crashing pydantic validation.
+    """
+
+    async def test_missing_files_key_returns_structured_error(self, artifacts):
+        server = plan_tools.create_server(artifacts)
+        tool = await server.get_tool('create_plan')
+        assert tool is not None
+
+        result = await tool.run({
+            'task_id': 'test-1',
+            'title': 'Test task',
+            'analysis': _TRIGGER_ANALYSIS,
+            # 'files' deliberately omitted — the dropped-arg shape.
+        })
+
+        assert result.structured_content is not None
+        assert result.structured_content['status'] == 'error'
+        assert artifacts.read_plan() == {}
+
+
+@pytest.mark.asyncio
+class TestUpdatePlanMetadataToolRecoversMisserializedFiles:
+    """update_plan_metadata tolerates a mis-serialized (stringified) files
+    arg, same as create_plan (task 2428)."""
+
+    async def test_json_array_string_recovered_via_tool_run(self, artifacts):
+        _setup_full_plan(artifacts)
+        server = plan_tools.create_server(artifacts)
+        tool = await server.get_tool('update_plan_metadata')
+        assert tool is not None
+
+        await tool.run({'files': '["x.py","y.py"]'})
+
+        plan = artifacts.read_plan()
+        assert plan['files'] == ['x.py', 'y.py']
