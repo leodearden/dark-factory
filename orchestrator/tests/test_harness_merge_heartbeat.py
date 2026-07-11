@@ -13,11 +13,13 @@ Covers:
     merge_idle:True.
   - A busy tick (worker snapshot depth>0) writes merge_idle:False with the
     diagnostic depth preserved.
+  - A disk write failure is swallowed (fail-open), never propagated.
 """
 
 from __future__ import annotations
 
 import json
+import logging
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
@@ -98,3 +100,27 @@ class TestWriteMergeHeartbeat:
         assert payload['merge_idle'] is False
         assert payload['depth'] == 2
         assert isinstance(payload['ts_epoch'], float)
+
+
+# ---------------------------------------------------------------------------
+# Harness._write_merge_heartbeat — fail-open
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestWriteMergeHeartbeatFailOpen:
+    """A heartbeat write must never crash or stall the run loop."""
+
+    async def test_disk_write_failure_does_not_propagate(
+        self, harness: Harness, monkeypatch, caplog
+    ):
+        """write_heartbeat raising must be swallowed (logged), not propagated."""
+        monkeypatch.setenv('ORCH_UNIT', 'orchestrator-reify.service')
+
+        with patch(
+            'orchestrator.harness.write_heartbeat',
+            side_effect=RuntimeError('disk full'),
+        ), caplog.at_level(logging.WARNING):
+            await harness._write_merge_heartbeat()  # must not raise
+
+        assert 'merge heartbeat write failed' in caplog.text
