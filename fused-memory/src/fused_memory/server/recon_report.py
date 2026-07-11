@@ -357,6 +357,12 @@ class ReconReportState:
         self._run_sig_index: dict[str, dict[tuple, str]] = {}  # run_id → {sig → finding_id}
         self._run_finding_index: dict[str, dict[str, _ReportEntry]] = {}  # run_id → {finding_id → entry}
         self._run_desc_index: dict[str, dict[str, str]] = {}  # run_id → {desc_hash → finding_id}
+        # run_id → {"project_id:task_id" → finding_id} for a null-task_id
+        # finding's PRIMARY (first-ever) cited external task (task-2425).
+        # Same run-quiescence-scoped lifetime as the three indices above —
+        # see tick()'s docstring — released together, never torn down
+        # per-entry.
+        self._run_cited_task_index: dict[str, dict[str, str]] = {}
         self._reaper_task: asyncio.Task | None = None
         # cite_* service injection (task β)
         self._memory_service = memory_service
@@ -879,6 +885,46 @@ class ReconReportState:
                 return entry, f
         return None
 
+    def _purge_finding(
+        self,
+        run_id: str,
+        owning_entry: _ReportEntry,
+        finding: _Finding,
+    ) -> None:
+        """Remove *finding* from *owning_entry* and every dedup index it may
+        be registered under: ``_run_finding_index``, whichever of
+        ``_run_sig_index`` / ``_run_desc_index`` it was filed under, and
+        ``_run_cited_task_index`` if it is a primary-cited-task fold anchor.
+
+        Single-sourced (task-2425) by :meth:`delete_finding` and the in-run
+        cited-task fold's retract path in :meth:`cite_task`, so the four
+        run-level dedup indices can never drift out of sync between the two
+        removal paths, and neither path can leave a stale pointer to a
+        finding that no longer exists.
+
+        Identity-based removal (``is``, not ``==``) — *finding* is the exact
+        object reference returned by :meth:`_resolve_finding`; see
+        ``delete_finding``'s docstring for why this matters.
+        """
+        owning_entry.findings[:] = [f for f in owning_entry.findings if f is not finding]
+        self._run_finding_index.get(run_id, {}).pop(finding.finding_id, None)
+
+        sig = (finding.task_id, finding.flag_type)
+        if sig != (None, None):
+            self._run_sig_index.get(run_id, {}).pop(sig, None)
+            owning_entry._signature_to_finding.pop(sig, None)
+        elif _normalize_description(finding.description):
+            desc_hash = _description_hash(finding.description)
+            self._run_desc_index.get(run_id, {}).pop(desc_hash, None)
+            owning_entry._deschash_to_finding.pop(desc_hash, None)
+
+        if finding.task_id is None and finding.cited_tasks:
+            primary = finding.cited_tasks[0]
+            primary_key = f"{primary['project_id']}:{primary['task_id']}"
+            run_cited_tasks = self._run_cited_task_index.get(run_id, {})
+            if run_cited_tasks.get(primary_key) == finding.finding_id:
+                run_cited_tasks.pop(primary_key, None)
+
     # ------------------------------------------------------------------
     # cite_* tools (task β)
     # ------------------------------------------------------------------
@@ -967,6 +1013,16 @@ class ReconReportState:
         dict (run_id_unknown / finding_unknown / unknown_project / task_not_found).
         project_id is validated against self.known_projects before any service call.
         Appends to finding.cited_tasks only on success.
+
+        In-run cited-task fold (task-2425): when *finding* has a null
+        top-level task_id and this is its PRIMARY (first-ever) citation, the
+        (project_id, task_id) pair doubles as an in-run dedup anchor. If an
+        earlier finding in this run already registered the same primary
+        cited task, the just-looked-up finding is purged and
+        ``duplicate_finding`` is returned instead — two findings citing the
+        same external blocker are semantically duplicate regardless of how
+        differently they are worded. Findings with a real top-level task_id,
+        and secondary (non-first) citations, are never fold anchors.
         """
         entry = self._resolve_entry(run_id)
         if entry is None:
@@ -975,7 +1031,7 @@ class ReconReportState:
         resolved = self._resolve_finding(run_id, finding_id)
         if resolved is None:
             return _ERR_FINDING_UNKNOWN.copy()
-        _, finding = resolved
+        finding_entry, finding = resolved
 
         if project_id not in self.known_projects:
             return _ERR_UNKNOWN_PROJECT.copy()
@@ -993,6 +1049,19 @@ class ReconReportState:
         data = result.get('data') if isinstance(result.get('data'), dict) else {}
         title = result.get('title') or data.get('title', '')
         citation = {'project_id': project_id, 'task_id': task_id, 'title': title}
+
+        # In-run cited-task fold (task-2425) — see docstring above. Only the
+        # PRIMARY citation (finding.cited_tasks still empty) of a null-
+        # top-level-task_id finding is a fold anchor.
+        if finding.task_id is None and not finding.cited_tasks:
+            cited_task_key = f'{project_id}:{task_id}'
+            run_cited_tasks = self._run_cited_task_index.setdefault(run_id, {})
+            existing_id = run_cited_tasks.get(cited_task_key)
+            if existing_id is not None and existing_id != finding.finding_id:
+                self._purge_finding(run_id, finding_entry, finding)
+                return _duplicate_finding_error(existing_id)
+            run_cited_tasks[cited_task_key] = finding.finding_id
+
         finding.cited_tasks.append(citation)
         return citation
 
@@ -1313,6 +1382,10 @@ def create_recon_report_server(state: ReconReportState):  # -> FastMCP
         Returns {project_id, task_id, title} or a structured error dict.
         unknown_project when project_id is not in the known_projects registry.
         task_not_found when the task does not exist in the project.
+        duplicate_finding (task-2425) when this is a null-task_id finding's
+        primary citation and an earlier finding in this run already cited
+        the same (project_id, task_id) — the newly-cited finding is purged
+        and existing_finding_id points at the original.
         """
         return await state.cite_task(
             run_id=run_id,
