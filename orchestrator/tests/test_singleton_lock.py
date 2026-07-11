@@ -63,25 +63,69 @@ class TestHarnessSingletonIntegration:
     """Tests that Harness.run() acquires and releases the lock."""
 
     @pytest.mark.asyncio
-    async def test_dirty_tree_check_before_servers(self, mock_orch_config):
-        """Dirty-tree check must run before any server starts."""
+    async def test_dirty_tree_starts_and_escalates(self, mock_orch_config, tmp_path):
+        """Dirty tree no longer refuses to start (task 2380).
+
+        RCA 2026-07-08: the old refuse-to-start guard composed with systemd
+        Restart=on-failure + the watchdog revive loop into a silent
+        multi-hour crash-loop (459 aborted runs, nothing escalated because
+        the process died before it could).  A dirty project_root must now
+        start normally and file a deferred born-at-L2 escalation instead.
+
+        Drives run() through startup to the scheduler loop via the
+        loop-sentinel pattern (mirrors startup_harness in
+        test_harness_startup_get_statuses.py — same mocks, duplicated here
+        per this suite's per-file fixture convention).
+        """
+        mock_orch_config.max_concurrent_tasks = 2
+        mock_orch_config.fused_memory.project_id = 'test'
+
         with patch('orchestrator.harness.McpLifecycle') as mock_mcp_cls, \
              patch('orchestrator.harness.Scheduler'), \
              patch('orchestrator.harness.BriefingAssembler'):
             h = Harness(mock_orch_config)
 
-        h.git_ops = MagicMock()
-        h.git_ops.has_dirty_working_tree = AsyncMock(return_value='M dirty_file.py')
         mock_mcp = mock_mcp_cls.return_value
         mock_mcp.start = AsyncMock()
+        mock_mcp.stop = AsyncMock()
 
-        with pytest.raises(RuntimeError, match='uncommitted tracked changes'):
+        h.git_ops = MagicMock()
+        h.git_ops.has_dirty_working_tree = AsyncMock(return_value='M dirty_file.py')
+        h.git_ops.worktree_base = tmp_path / '.worktrees'
+
+        h._start_escalation_server = AsyncMock()
+        h._start_merge_worker = AsyncMock()
+        h._start_offline_lane = AsyncMock()
+        h._dismiss_stale_escalations = AsyncMock()
+        h._start_orphan_l0_reaper = MagicMock()
+        h._start_terminal_status_watcher = MagicMock()
+        h._tag_task_modules = AsyncMock()
+        h._recover_crashed_tasks = AsyncMock()
+        h._reconcile_lane_checkouts = AsyncMock()
+        h._reconcile_stranded_in_progress = AsyncMock()
+        h._tag_prd_metadata = AsyncMock()
+
+        escalation_mock = AsyncMock()
+        h._file_dirty_tree_escalation = escalation_mock
+
+        h.scheduler = MagicMock()
+        h.scheduler.get_tasks = AsyncMock(return_value=[
+            {'id': '99', 'status': 'pending'},
+        ])
+        h.scheduler.get_statuses = AsyncMock(return_value=({}, None))
+        h.scheduler.set_task_status = AsyncMock()
+        h.scheduler.acquire_next = AsyncMock(
+            side_effect=RuntimeError('__loop_reached_sentinel__'),
+        )
+
+        with pytest.raises(RuntimeError, match='__loop_reached_sentinel__'):
             await h.run()
 
-        # MCP server should never have been started
-        mock_mcp.start.assert_not_called()
-        # Lock should be released
-        assert h._lock_file is None
+        # MCP (and other) servers now start despite the dirty tree.
+        mock_mcp.start.assert_called_once()
+        # The deferred dirty-tree escalation helper ran during startup,
+        # replacing the old top-of-run() RuntimeError refusal.
+        escalation_mock.assert_awaited_once_with(False)
 
     @pytest.mark.asyncio
     async def test_escalation_port_bind_failure_raises(self, mock_orch_config):
