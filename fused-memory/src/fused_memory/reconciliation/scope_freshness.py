@@ -44,9 +44,15 @@ decoupled and unit-testable without a real harness.
 from __future__ import annotations
 
 import logging
-from typing import Any
+from collections.abc import Callable
+from datetime import UTC, datetime
+from typing import TYPE_CHECKING, Any, NamedTuple
 
 from fused_memory.reconciliation.flag_dedup import _content_fingerprint
+
+if TYPE_CHECKING:
+    from fused_memory.backends.task_backend_protocol import TaskBackendProtocol
+    from fused_memory.services.memory_service import MemoryService
 
 logger = logging.getLogger(__name__)
 
@@ -249,3 +255,119 @@ def snapshot_is_fresh(snapshot_metadata: dict[str, Any], live_task: Any) -> bool
     if _content_fingerprint(description or '') != snapshot_metadata['subject_description_fingerprint']:
         return False
     return True
+
+
+class ScopeFreshnessResult(NamedTuple):
+    """Result of :func:`precheck_scope_correction_freshness`.
+
+    Attributes:
+        to_reinvestigate: Findings to feed into the LLM stages — every
+            non-scope-correction finding, every scope-correction finding with
+            no usable/resolvable subject, and every scope-correction finding
+            whose subject is new or has changed since the last snapshot.
+            Order-preserving relative to the input ``findings`` list.
+        skipped: Cross-project scope-correction findings confirmed unchanged
+            since the last consolidated snapshot — dropped from this cycle's
+            LLM re-derivation.
+        stats: Counters for logging/observability —
+            ``scope_freshness_candidates`` (cross-project scope-correction
+            findings with a usable subject and a resolvable project root),
+            ``scope_freshness_reinvestigated``, ``scope_freshness_skipped``.
+    """
+
+    to_reinvestigate: list[dict[str, Any]]
+    skipped: list[dict[str, Any]]
+    stats: dict[str, int]
+
+
+async def precheck_scope_correction_freshness(
+    *,
+    memory_service: MemoryService,
+    taskmaster: TaskBackendProtocol,
+    project_id: str,
+    resolve_project_root: Callable[[str], str | None],
+    run_id: str,
+    findings: list[dict[str, Any]],
+) -> ScopeFreshnessResult:
+    """Filter *findings*, skipping re-derivation of unchanged scope-correction threads.
+
+    For each finding: non-scope-correction findings pass through untouched.
+    Cross-project scope-correction findings (see
+    :func:`is_cross_project_scope_correction`) with a usable subject are
+    checked against the most recent prior freshness snapshot for
+    ``(task_ref, flag_key)``; a single ``taskmaster.get_task`` call reads the
+    subject's live state.  When unchanged since the snapshot (see
+    :func:`snapshot_is_fresh`), the finding is skipped and a lightweight
+    'still blocked, no change' marker is written; otherwise (first sight, or
+    the subject changed) the finding is kept and the snapshot is (re)written
+    to record the subject's current state.
+
+    Fail-open: an unresolvable foreign project root, a ``get_task`` failure,
+    a Mem0 read/write failure, or any other unexpected per-finding error
+    keeps that finding in ``to_reinvestigate`` rather than raising — see the
+    module docstring.  Never raises.
+    """
+    safe_findings = list(findings) if isinstance(findings, list) else []
+    to_reinvestigate: list[dict[str, Any]] = []
+    skipped: list[dict[str, Any]] = []
+    stats: dict[str, int] = {
+        'scope_freshness_candidates': 0,
+        'scope_freshness_reinvestigated': 0,
+        'scope_freshness_skipped': 0,
+    }
+
+    for finding in safe_findings:
+        if not is_cross_project_scope_correction(finding, project_id):
+            to_reinvestigate.append(finding)
+            continue
+
+        signature = compute_scope_signature(finding, project_id)
+        subject = select_primary_subject(finding, project_id)
+        if signature is None or subject is None:
+            to_reinvestigate.append(finding)
+            continue
+        task_ref, flag_key = signature
+        subject_project_id, subject_task_id = subject
+        stats['scope_freshness_candidates'] += 1
+
+        subject_root = resolve_project_root(subject_project_id)
+        if not subject_root:
+            to_reinvestigate.append(finding)
+            stats['scope_freshness_reinvestigated'] += 1
+            continue
+
+        prior_memories = await memory_service.get_memories_by_metadata(
+            project_id=project_id,
+            filters={
+                'kind': CONSOLIDATED_SCOPE_KIND,
+                'task_id': task_ref,
+                'flag_type': flag_key,
+            },
+        )
+        live_task = await taskmaster.get_task(task_id=subject_task_id, project_root=subject_root)
+        status, updated_at, description, _live_metadata = _extract_task_fields(live_task)
+        snapshot_at = datetime.now(UTC).isoformat()
+
+        # No prior snapshot (bootstrap / first sight): keep for
+        # re-investigation and record the subject's current state so the
+        # NEXT cycle has something to compare against.
+        to_reinvestigate.append(finding)
+        stats['scope_freshness_reinvestigated'] += 1
+        fresh_metadata = build_scope_snapshot_metadata(
+            task_ref=task_ref, flag_key=flag_key,
+            subject_project_id=subject_project_id, subject_task_id=subject_task_id,
+            status=status, updated_at=updated_at, description=description,
+            run_id=run_id, snapshot_at=snapshot_at,
+        )
+        await memory_service.add_memory(
+            content=(
+                f'Scope-correction freshness snapshot for {task_ref} '
+                f'(flag_type={flag_key!r}).'
+            ),
+            category='observations_and_summaries',
+            project_id=project_id,
+            metadata=fresh_metadata,
+            _source=SCOPE_FRESHNESS_SOURCE,
+        )
+
+    return ScopeFreshnessResult(to_reinvestigate=to_reinvestigate, skipped=skipped, stats=stats)
