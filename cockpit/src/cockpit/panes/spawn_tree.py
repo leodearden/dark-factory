@@ -16,9 +16,25 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-from orchestrator.session_registry import SessionRecord
+from orchestrator.session_registry import TERMINAL_STATUSES, SessionRecord, Status
 
 from cockpit.panes.session_table import order_sessions
+
+
+def is_outstanding(record: SessionRecord) -> bool:
+    """Whether *record* counts as an "outstanding child" (Fleet Cockpit C9a).
+
+    Reuses count_outstanding_children's exact "non-terminal" semantics
+    (session_table.py) so the tree's highlight agrees with the session
+    table's outstanding-children column. Fail-soft (PRD §2), mirroring
+    state_glyph: a foreign/unrecognized status degrades to False rather
+    than raising.
+    """
+    try:
+        resolved = Status(record.status)
+    except ValueError:
+        return False
+    return resolved not in TERMINAL_STATUSES
 
 
 @dataclass(frozen=True)
@@ -62,13 +78,13 @@ def build_spawn_forest(records: list[SessionRecord]) -> list[SpawnTreeNode]:
         else:
             roots.append(record)
 
-    def _build_node(record: SessionRecord) -> SpawnTreeNode:
+    def _build_node(record: SessionRecord, *, is_root: bool) -> SpawnTreeNode:
         child_records = order_sessions(children_by_parent.get(record.session_slug, []))
         return SpawnTreeNode(
             slug=record.session_slug,
             record=record,
-            outstanding=False,
-            children=tuple(_build_node(child) for child in child_records),
+            outstanding=False if is_root else is_outstanding(record),
+            children=tuple(_build_node(child, is_root=False) for child in child_records),
         )
 
-    return [_build_node(record) for record in order_sessions(roots)]
+    return [_build_node(record, is_root=True) for record in order_sessions(roots)]
