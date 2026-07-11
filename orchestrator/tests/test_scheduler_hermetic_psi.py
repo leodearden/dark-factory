@@ -1,0 +1,93 @@
+"""Tests for the suite-wide PSI-hermeticity seam (task 2418).
+
+Two independent host-state dependencies made ~11 scheduler / scheduler-state
+tests non-deterministic under full parallel ``pytest -n auto --dist
+loadgroup``: the dispatch-admission gate reads real ``/proc/pressure/*`` by
+default (``psi_admission.enabled`` defaults True), and under host load
+``mem_some_avg10`` can cross the configured threshold and defer dispatch of
+non-deterministic candidates. This file pins the fix for that half of the
+flake (the snapshot-path half is covered by
+``test_scheduler_state.py::TestWriteStateSnapshot``):
+
+  step-3 (RED)  An idle PsiSample neutralizes the dispatch-admission gate;
+                a saturated one (injected, never host-sampled) still defers
+                a non-deterministic candidate exactly as designed. Proves
+                ``idle_psi_sample()`` is a safe, deterministic default for
+                every scheduler test — saturation is injected here, never
+                sampled from the host.
+  step-5 (RED)  The autouse conftest fixture defaults every bare Scheduler's
+                ``_read_psi_sample`` to ``idle_psi_sample``, so the suite is
+                host-independent by default without per-test injection.
+
+Mirrors test_scheduler_dispatch_admission.py's conventions: module-local
+task-dict helper, ``scheduler.get_tasks = AsyncMock(return_value=[...])``,
+driving ``acquire_next()`` directly.
+"""
+
+from __future__ import annotations
+
+from unittest.mock import AsyncMock
+
+import pytest
+from _orch_helpers import idle_psi_sample
+from shared.psi import PsiSample
+
+from orchestrator.config import OrchestratorConfig
+from orchestrator.scheduler import Scheduler
+
+
+def _pending_task(
+    task_id: str,
+    *,
+    priority: str = 'medium',
+    files: list[str] | None = None,
+) -> dict:
+    """Minimal non-deterministic (no task_kind metadata) pending-task dict.
+
+    Absence of ``metadata.task_kind`` makes ``Scheduler.is_deterministic``
+    return False (see scheduler.py), so this candidate is fully subject to
+    the dispatch-admission gate — deterministic-kind tasks are exempt and
+    would not exercise psi_hold at all.
+    """
+    return {
+        'id': task_id,
+        'title': f'Task {task_id}',
+        'status': 'pending',
+        'dependencies': [],
+        'metadata': {'files': files or [f'{task_id}/src']},
+        'priority': priority,
+    }
+
+
+@pytest.mark.asyncio
+class TestIdlePsiSampleNeutralizesAdmissionGate:
+    """idle_psi_sample() is a safe, deterministic non-saturating default;
+    an injected saturated sample still defers as designed."""
+
+    async def test_idle_psi_sample_neutralizes_admission_gate(self) -> None:
+        task = _pending_task('X', priority='high')
+
+        # Phase A: a saturated PSI sample — injected directly, never
+        # sampled from the host — defers the non-deterministic candidate.
+        # mem_some10=99.0 is over the default mem_some_avg10=15.0 threshold.
+        scheduler = Scheduler(OrchestratorConfig(max_per_module=1))
+        scheduler._dispatched.add('inflight')  # meets default min_inflight_floor=1
+        scheduler._read_psi_sample = lambda: PsiSample(
+            cpu_some10=0.0, mem_some10=99.0, mem_full10=0.0, io_some10=0.0,
+            read_ok=True,
+        )
+        scheduler.get_tasks = AsyncMock(return_value=[task])
+
+        assert await scheduler.acquire_next() is None, (
+            'a saturated PSI sample must defer the non-deterministic candidate'
+        )
+
+        # Phase B: idle_psi_sample() neutralizes the gate — the identical
+        # candidate now dispatches on a fresh scheduler.
+        scheduler2 = Scheduler(OrchestratorConfig(max_per_module=1))
+        scheduler2._read_psi_sample = idle_psi_sample
+        scheduler2.get_tasks = AsyncMock(return_value=[task])
+
+        result = await scheduler2.acquire_next()
+        assert result is not None
+        assert result.task_id == 'X'
