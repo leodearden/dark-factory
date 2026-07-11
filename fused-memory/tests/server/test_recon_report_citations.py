@@ -787,6 +787,85 @@ class TestCiteTaskFoldKeyClearedOnDelete:
 
 
 # ---------------------------------------------------------------------------
+# task-2425 step-5: TestCiteTaskFoldReleasedAtRunQuiescence — RED until
+# step-6 makes tick() pop _run_cited_task_index at run quiescence
+# ---------------------------------------------------------------------------
+
+
+class TestCiteTaskFoldReleasedAtRunQuiescence:
+    """tick()'s run-quiescence release (task-2088) must also release the
+    primary-cited-task fold index (task-2425) once a run's last entry
+    evicts — mirroring the existing _run_sig_index / _run_desc_index /
+    _run_finding_index release. Otherwise a stale fold key survives past
+    the run it belonged to and wrongly folds a citation on a later,
+    unrelated run that happens to cite the same external task.
+    """
+
+    def _fake_ti(self):
+        known_roots = {'/home/leo/src/dark-factory'}
+        results = {}
+        for pr in known_roots:
+            for tid in ['2405']:
+                results[(tid, pr)] = {'id': tid, 'title': f'T-{tid}'}
+        return _FakeTaskInterceptor(results=results)
+
+    def _make_state(self, ttl=300):
+        from fused_memory.server.recon_report import ReconReportState
+
+        t = [0.0]
+        state = ReconReportState(
+            ttl_seconds=ttl,
+            clock=lambda: t[0],
+            task_interceptor=self._fake_ti(),
+        )
+        state.known_projects = dict(_KNOWN_PROJECTS)
+        return state, t
+
+    @pytest.mark.asyncio
+    async def test_full_quiescence_releases_cited_task_index(self):
+        state, t = self._make_state(ttl=300)
+
+        state.start_report(run_id='run-1', stage='reconciler', project_id='dark_factory')
+        f1 = state.add_finding(
+            run_id='run-1', severity='low', category='cross_project',
+            description='desc one', suggested_action='a',
+            task_id=None, flag_type=None,
+        )
+        fid1 = f1['finding_id']
+
+        cite1 = await state.cite_task('run-1', fid1, 'dark_factory', '2405')
+        assert 'error' not in cite1, cite1
+        assert state._run_cited_task_index.get('run-1', {}).get('dark_factory:2405') == fid1
+
+        state.complete('run-1', 'stage done')
+
+        # Advance past TTL and evict the run's only entry in one tick().
+        t[0] = 301.0
+        evicted = state.tick()
+        assert evicted == 1
+
+        assert state.get_assembled_report('run-1', 'reconciler') is None
+        assert 'run-1' not in state._run_sig_index
+        assert 'run-1' not in state._run_desc_index
+        assert 'run-1' not in state._run_finding_index
+        assert 'run-1' not in state._run_cited_task_index
+
+        # A FRESH run citing the SAME external task as its primary citation
+        # must succeed plainly — the released index must not leak across runs.
+        state.start_report(run_id='run-2', stage='reconciler', project_id='dark_factory')
+        f2 = state.add_finding(
+            run_id='run-2', severity='low', category='cross_project',
+            description='desc two, unrelated run', suggested_action='a',
+            task_id=None, flag_type=None,
+        )
+        fid2 = f2['finding_id']
+
+        cite2 = await state.cite_task('run-2', fid2, 'dark_factory', '2405')
+        assert 'error' not in cite2, cite2
+        assert cite2 == {'project_id': 'dark_factory', 'task_id': '2405', 'title': 'T-2405'}
+
+
+# ---------------------------------------------------------------------------
 # step-7: TestCiteMemory — RED until step-8 adds cite_memory to ReconReportState
 # ---------------------------------------------------------------------------
 
