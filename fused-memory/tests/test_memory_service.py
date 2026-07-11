@@ -6,12 +6,18 @@ import types
 from datetime import UTC, datetime, timedelta, timezone
 from unittest.mock import AsyncMock, MagicMock, patch
 
+import httpx
 import pytest
+from openai import RateLimitError
 
 from fused_memory.models.enums import MemoryCategory, SourceStore
 from fused_memory.models.scope import Scope
 from fused_memory.services import memory_service
-from fused_memory.services.memory_service import MemoryService, _serialize_temporal
+from fused_memory.services.memory_service import (
+    MemoryService,
+    _is_quota_exhaustion_error,
+    _serialize_temporal,
+)
 
 
 @pytest.fixture
@@ -1854,6 +1860,60 @@ class TestGetEpisodeContent:
         result = await service.get_episode_content('ep-missing', 'proj')
 
         assert result is None
+
+
+def _make_rate_limit_error(
+    message: str = 'Rate limit exceeded.',
+    code: str = 'insufficient_quota',
+) -> RateLimitError:
+    """Build a real openai.RateLimitError (429 response) for quota-exhaustion tests."""
+    request = httpx.Request('POST', 'https://api.openai.com/v1/embeddings')
+    response = httpx.Response(429, request=request)
+    body = {'message': message, 'type': 'insufficient_quota', 'param': None, 'code': code}
+    return RateLimitError(message, response=response, body=body)
+
+
+class TestIsQuotaExhaustionError:
+    """Classification contract for _is_quota_exhaustion_error (task 2448).
+
+    Pins which exceptions count as embedding-provider quota/rate-limit
+    exhaustion (and therefore trigger get_entity's degraded fallback) versus
+    which must keep propagating as hard errors.
+    """
+
+    def test_real_openai_rate_limit_error_matches(self):
+        """A real openai.RateLimitError (429, code=insufficient_quota) matches."""
+        exc = _make_rate_limit_error()
+        assert _is_quota_exhaustion_error(exc) is True
+
+    def test_duck_typed_status_code_429_matches(self):
+        """A non-openai exception with a duck-typed status_code == 429 matches."""
+
+        class FakeQuotaError(Exception):
+            status_code = 429
+
+        assert _is_quota_exhaustion_error(FakeQuotaError('rate limited')) is True
+
+    def test_message_containing_insufficient_quota_matches(self):
+        """An exception whose str() contains 'insufficient_quota' matches."""
+        exc = Exception('insufficient_quota: no credits left')
+        assert _is_quota_exhaustion_error(exc) is True
+
+    def test_runtime_error_does_not_match(self):
+        """A plain RuntimeError unrelated to quota/rate-limits does not match."""
+        assert _is_quota_exhaustion_error(RuntimeError('search failed')) is False
+
+    def test_value_error_does_not_match(self):
+        """A plain ValueError unrelated to quota/rate-limits does not match."""
+        assert _is_quota_exhaustion_error(ValueError('nope')) is False
+
+    def test_cancelled_error_does_not_match(self):
+        """asyncio.CancelledError (a BaseException, not an Exception) never matches.
+
+        Cancellation signals must never be classified as a quota error — they
+        are structured-concurrency shutdown signals, not application failures.
+        """
+        assert _is_quota_exhaustion_error(asyncio.CancelledError()) is False
 
 
 class TestGetEntity:
