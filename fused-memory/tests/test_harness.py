@@ -799,9 +799,8 @@ class TestStage1CycleSummaryHarnessBackstop:
         with patch(
             'fused_memory.reconciliation.harness.write_stage1_cycle_summary',
             AsyncMock(),
-        ) as mock_write:
-            with pytest.raises(RuntimeError, match='stage2 exploded'):
-                await harness.run_full_cycle('test-project', 'test-trigger')
+        ) as mock_write, pytest.raises(RuntimeError, match='stage2 exploded'):
+            await harness.run_full_cycle('test-project', 'test-trigger')
 
         mock_write.assert_not_called()
 
@@ -835,9 +834,8 @@ class TestStage1CycleSummaryHarnessBackstop:
         with patch(
             'fused_memory.reconciliation.harness.write_stage1_cycle_summary',
             AsyncMock(side_effect=RuntimeError('ledger boom')),
-        ):
-            with pytest.raises(RuntimeError, match='stage1 exploded'):
-                await harness.run_full_cycle('test-project', 'buffer_size:2')
+        ), pytest.raises(RuntimeError, match='stage1 exploded'):
+            await harness.run_full_cycle('test-project', 'buffer_size:2')
 
         harness.journal.update_run_stage_reports.assert_awaited_once()
 

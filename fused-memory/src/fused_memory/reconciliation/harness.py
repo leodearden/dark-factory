@@ -2057,6 +2057,15 @@ class ReconciliationHarness:
         breadcrumb: the ``stage1_cycle_summary_degraded_backstop`` stat
         self-identifies the row as harness-synthesized rather than a genuine
         in-stage write.
+
+        This method must never raise: it runs unshielded inside
+        ``run_full_cycle``'s ``finally`` block, immediately before the
+        existing ``update_run_stage_reports`` persistence call. An exception
+        raised here (mid-finally, with another exception already
+        propagating) would replace that propagating exception rather than
+        chain alongside it, and would also skip the subsequent
+        ``update_run_stage_reports`` call — so the whole body is wrapped in a
+        blanket ``except Exception`` that logs and swallows.
         """
         if not (
             current_stage_name == StageId.memory_consolidator.value
@@ -2064,16 +2073,39 @@ class ReconciliationHarness:
         ):
             return
 
-        degraded_report = StageReport(
-            stage=StageId.memory_consolidator,
-            started_at=cycle_start_time,
-            completed_at=datetime.now(UTC),
-            items_flagged=[],
-            stats={'stage1_cycle_summary_degraded_backstop': True},
-            llm_calls=0,
-            tokens_used=0,
-        )
-        await write_stage1_cycle_summary(self.memory, project_id, degraded_report, run_id)
+        try:
+            degraded_report = StageReport(
+                stage=StageId.memory_consolidator,
+                started_at=cycle_start_time,
+                completed_at=datetime.now(UTC),
+                items_flagged=[],
+                stats={'stage1_cycle_summary_degraded_backstop': True},
+                llm_calls=0,
+                tokens_used=0,
+            )
+            ledger_written = await write_stage1_cycle_summary(
+                self.memory, project_id, degraded_report, run_id,
+            )
+            logger.warning(
+                'reconciliation.stage1_cycle_summary_backstop_fired',
+                extra={
+                    'run_id': run_id,
+                    'project_id': project_id,
+                    'ledger_written': ledger_written,
+                },
+            )
+            # Breadcrumb on the existing _error record (when present) rather than
+            # a new top-level stage_reports key — keeps this observable from the
+            # same place operators already look for a failed cycle's diagnosis.
+            error_record = run.stage_reports.get('_error')
+            if isinstance(error_record, dict):
+                error_record['stage1_cycle_summary_backstop_written'] = ledger_written
+        except Exception:
+            logger.warning(
+                'reconciliation.stage1_cycle_summary_backstop_failed',
+                exc_info=True,
+                extra={'run_id': run_id, 'project_id': project_id},
+            )
 
     # ── Remediation support ───────────────────────────────────────────
 
