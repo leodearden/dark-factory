@@ -226,21 +226,25 @@ class TestReadCompactVectorTransport:
         assert '10' in msg  # the offending scalar_type is reported
 
     @pytest.mark.asyncio
-    async def test_null_absent_embedding_raises_not_empty_vector(self):
-        """A NULL/absent embedding raises rather than yielding an empty vector.
+    async def test_null_absent_embedding_returns_none_sentinel(self):
+        """A NULL/absent embedding returns None rather than raising.
 
         FalkorDB reports a missing property as a non-VECTORF32 (VALUE_NULL)
-        scalar_type with a null value; the type check fires BEFORE the value is
-        ever indexed, so a corrupt/embedding-less source row surfaces as a hard
-        ValueError instead of a silently-empty vecf32([]) literal.
+        scalar_type with a null value; this is now recognized as valid real
+        data (some source rows were persisted without an embedding) rather
+        than corruption -- the type check special-cases exactly this tag and
+        returns None instead of raising, so callers can recreate the node/
+        edge embedding-less instead of aborting the whole batch over one
+        missing vector.
         """
         reply = _compact_reply([_VALUE_NULL_TAG, None])
         client = self._client_returning(reply)
 
-        with pytest.raises(ValueError):
-            await cross_graph_move._read_compact_vector(
-                client, group_id=SOURCE_GRAPH_FIXTURE, cypher='RETURN n.name_embedding',
-            )
+        out = await cross_graph_move._read_compact_vector(
+            client, group_id=SOURCE_GRAPH_FIXTURE, cypher='RETURN n.name_embedding',
+        )
+
+        assert out is None
 
     @pytest.mark.asyncio
     async def test_empty_rows_raises_naming_group_id_and_cypher(self):
