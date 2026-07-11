@@ -2884,6 +2884,13 @@ async def classify_and_merge(
     # typing narrowing (the test-local MergeWorker reference has no
     # _emit_speculative), not a behavioural gate.
     if speculative and isinstance(worker, SpeculativeMergeWorker):
+        # NOTE: _emit_speculative str-converts every data value (see its
+        # `{k: str(v) ...}` coercion below), so depth lands here as a str
+        # (e.g. "2") — unlike the merge_verify event's depth (dispatch, in
+        # verify_runner.py), which is a native int. analyze_speculation_depth's
+        # compute_per_depth() coerces both defensively, but a future consumer
+        # that aggregates depth across both event types should not assume a
+        # single type.
         worker._emit_speculative(
             EventType.speculative_merge, req.task_id, base_sha=base_sha,
             depth=worker._verify_frontier_depth(),
