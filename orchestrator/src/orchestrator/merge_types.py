@@ -628,6 +628,22 @@ class QueuedBranch:
     bare_id: str
     full_name: str
 
+    def __post_init__(self) -> None:
+        """Enforce the coherent-pair invariant: full_name must end with bare_id.
+
+        :meth:`parse` always produces this shape — ``full_name`` is always
+        ``branch_prefix + bare_id``, so ``full_name.endswith(bare_id)`` holds
+        for every prefix (including the empty-prefix case, where
+        ``full_name == bare_id``). This guard never rejects ``parse()``
+        output; it only trips on a hand-built incoherent pair that bypasses
+        ``parse()``, realizing "mixed shape unrepresentable" (PRD DD7).
+        """
+        if not self.full_name.endswith(self.bare_id):
+            raise ValueError(
+                f'QueuedBranch is incoherent: full_name={self.full_name!r} '
+                f'does not end with bare_id={self.bare_id!r}',
+            )
+
     @classmethod
     def parse(cls, raw: str, branch_prefix: str) -> QueuedBranch:
         """Parse *raw* (bare or already-prefixed) into a canonical QueuedBranch.
