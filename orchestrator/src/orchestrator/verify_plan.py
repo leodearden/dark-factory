@@ -10,7 +10,10 @@ Unifies the twice-fixed scope decision between ``scope_module_config`` and
 from __future__ import annotations
 
 import re
-from enum import Enum
+from dataclasses import dataclass
+from enum import Enum, StrEnum
+
+from orchestrator.verify_cmd import VerifyCmd
 
 
 class FileKind(Enum):
@@ -102,3 +105,74 @@ def _is_test_file(path: str) -> bool:
     Distinct from ``_is_collectable_test_file`` (narrow, collectable only).
     """
     return classify_file(path, None) in (FileKind.COLLECTABLE_TEST, FileKind.TEST_DATA)
+
+
+class ScopeKind(StrEnum):
+    """The four outcomes ``derive_verify_plan`` can assign a (module, tool) slot."""
+
+    FULL_SUITE = 'full_suite'
+    FILE_SCOPED = 'file_scoped'
+    SKIPPED = 'skipped'
+    TRIVIAL = 'trivial'
+
+
+def _verify_cmd_to_dict(cmd: VerifyCmd) -> dict:
+    """Render *cmd* as a plain JSON-native dict (D3).
+
+    ``ToolKind`` (a StrEnum) renders as ``str``; ``base_flags``/``targets``/
+    ``wrappers`` tuples render as lists; ``env`` renders as a plain dict —
+    every value is a JSON-native primitive, dict, or list, never a nested
+    dataclass or Enum member.
+    """
+    return {
+        'tool': str(cmd.tool),
+        'uv_project': cmd.uv_project,
+        'cwd_rel': cmd.cwd_rel,
+        'base_flags': list(cmd.base_flags),
+        'targets': list(cmd.targets),
+        'env': dict(cmd.env),
+        'wrappers': list(cmd.wrappers),
+        'raw': cmd.raw,
+    }
+
+
+@dataclass(frozen=True)
+class PlannedRun:
+    """One (module, tool) slot's planned outcome — the unit ``derive_verify_plan`` emits.
+
+    Split per tool (never one PlannedRun bundling test/lint/type-check) so D1
+    (CONFTEST/TEST_DATA -> FULL_SUITE pytest) and D2 (STRUCTURAL -> unscoped
+    pyright) are independently expressible for the SAME module, and a skip is
+    an explicit reasoned PlannedRun (``cmd=None``, non-empty ``reason``)
+    rather than a silently dropped command (the task-1852 "not silent"
+    requirement).
+    """
+
+    module_prefix: str
+    cmd: VerifyCmd | None
+    scope_kind: ScopeKind
+    reason: str
+
+    def to_dict(self) -> dict:
+        """Render as a plain JSON-native dict (D3) — see ``_verify_cmd_to_dict``."""
+        return {
+            'module_prefix': self.module_prefix,
+            'cmd': _verify_cmd_to_dict(self.cmd) if self.cmd is not None else None,
+            'scope_kind': str(self.scope_kind),
+            'reason': self.reason,
+        }
+
+
+@dataclass(frozen=True)
+class VerifyPlan:
+    """The full set of planned runs for one verify attempt, plus plan-level flags."""
+
+    runs: tuple[PlannedRun, ...]
+    needs_pipeline_guard_check: bool = False
+
+    def to_dict(self) -> dict:
+        """Render as a plain JSON-native dict (D3) — attached to ``VerifyResult.plan``."""
+        return {
+            'runs': [run.to_dict() for run in self.runs],
+            'needs_pipeline_guard_check': self.needs_pipeline_guard_check,
+        }
