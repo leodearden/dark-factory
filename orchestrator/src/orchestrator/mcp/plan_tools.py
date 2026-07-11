@@ -238,7 +238,7 @@ def _mark_step_done(
 
 def _update_plan_metadata(
     artifacts: TaskArtifacts,
-    files: list[str] | None = None,
+    files: list[str] | str | None = None,
     analysis: str | None = None,
 ) -> dict[str, Any]:
     plan = artifacts.read_plan()
@@ -246,7 +246,7 @@ def _update_plan_metadata(
         return {'status': 'error', 'message': 'No plan exists. Call create_plan first.'}
 
     if files is not None:
-        plan['files'] = files
+        plan['files'] = _coerce_files(files)
     if analysis is not None:
         plan['analysis'] = analysis
     artifacts.write_plan(plan)
@@ -563,7 +563,7 @@ def create_server(artifacts: TaskArtifacts) -> FastMCP:
 
     @mcp.tool()
     def update_plan_metadata(
-        files: list[str] | None = None,
+        files: list[str] | str | None = None,
         analysis: str | None = None,
     ) -> dict[str, Any]:
         """Update the plan's top-level metadata without touching steps or prerequisites.
@@ -575,6 +575,9 @@ def create_server(artifacts: TaskArtifacts) -> FastMCP:
         Args:
             files: Updated list of files (or directory paths) this task will
                 create or modify. Drives concurrency locks and the phantom-done gate.
+                Tolerates a stringified array (e.g. a JSON-encoded list or a
+                comma/newline-delimited string) and recovers it into a clean
+                list; leave unset/None to keep the existing files unchanged.
             analysis: Updated analysis text.
         """
         return _update_plan_metadata(artifacts, files, analysis)
