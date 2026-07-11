@@ -1243,6 +1243,48 @@ class TestCreateMovedNode:
         assert result.already_created is False
 
     @pytest.mark.asyncio
+    async def test_null_name_embedding_creates_node_without_embedding_property(
+        self, mock_config, make_backend, make_graph_mock, monkeypatch,
+    ):
+        """A null/absent name_embedding (_read_compact_vector returns None)
+        is valid real data, not corruption: the node CREATE still issues,
+        omitting the name_embedding property entirely (no vecf32 literal)
+        while every other property/param is preserved, and the call does
+        NOT raise.
+        """
+        backend = make_backend(mock_config)
+        source_mock = make_graph_mock()
+        source_mock.ro_query = AsyncMock(return_value=MagicMock(result_set=[NODE_ROW_FIXTURE]))
+        target_mock = make_graph_mock()
+        target_mock.ro_query = AsyncMock(return_value=MagicMock(result_set=[]))
+        backend._driver._get_graph = _route_graphs({
+            SOURCE_GRAPH_FIXTURE: source_mock,
+            TARGET_GRAPH_FIXTURE: target_mock,
+        })
+
+        fake_read_compact = AsyncMock(return_value=None)
+        monkeypatch.setattr(cross_graph_move, '_read_compact_vector', fake_read_compact)
+
+        result = await create_moved_node(
+            backend, NODE_UUID_FIXTURE, SOURCE_GRAPH_FIXTURE, TARGET_GRAPH_FIXTURE,
+        )
+
+        target_mock.query.assert_awaited_once()
+        cypher = extract_cypher(target_mock.query.call_args)
+        params = extract_params(target_mock.query.call_args)
+        assert 'CREATE' in cypher
+        assert 'name_embedding' not in cypher
+        assert 'vecf32' not in cypher
+        assert params.get('uuid') == NODE_UUID_FIXTURE
+        assert params.get('name') == 'Alice'
+        assert params.get('group_id') == SOURCE_GRAPH_FIXTURE
+        assert params.get('summary') == 'Alice is a person.'
+        assert params.get('created_at') == '2026-01-01T00:00:00+00:00'
+
+        assert isinstance(result, CreateResult)
+        assert result.already_created is False
+
+    @pytest.mark.asyncio
     async def test_issues_no_edge_or_mention_recreate_and_no_source_delete(
         self, mock_config, make_backend, make_graph_mock, monkeypatch,
     ):
