@@ -59,6 +59,7 @@ from cockpit.panes.detail_pane import DetailPane
 from cockpit.panes.session_table import SessionTable, filter_live_sessions, order_sessions
 from cockpit.panes.spawn_bar import SpawnScreen, build_spawn_argv, default_skip_perms
 from cockpit.panes.spawn_tree import SpawnTreeScreen
+from cockpit.panes.weight_editor import WeightEditorScreen, known_projects
 from cockpit.priority import Priorities, load_priorities, save_priorities
 from cockpit.registry_reader import (
     SessionScanner,
@@ -162,6 +163,7 @@ class CockpitApp(App):
         Binding('n', 'new_session', 'New session', show=False),
         Binding('t', 'toggle_tree', 'Spawn tree', show=False),
         Binding('h', 'toggle_history', 'Toggle history', show=False),
+        Binding('w', 'edit_weights', 'Edit weights', show=False),
         # All ten digits are bound, but a digit's SCORE effect saturates
         # once it exceeds the active Priorities.manual_boost.max (default 5
         # -- see priority.py's score(), which clamps manual_boost into
@@ -751,6 +753,27 @@ class CockpitApp(App):
         title = f'{role}:{Path(project_root).name}'
         argv = build_spawn_argv(script, project_root, title, prompt, skip_perms=skip_perms)
         self._spawn_runner(argv)
+
+    def action_edit_weights(self) -> None:
+        """'w' -- push the in-cockpit priority weight editor (PRD §9 C9b).
+
+        Seeds the screen with a snapshot of self._priorities (the current
+        weights, mutated only via apply_priorities/the injected callback --
+        never in place) and the known project names -- the sorted union of
+        self._records'/self._decisions' own .project plus
+        self._priorities.project_weights' existing keys (known_projects),
+        so an already-weighted project is always offered even with no live
+        session/decision right now. Submitting the screen calls back into
+        apply_priorities, this task's leaf signal; the screen itself never
+        persists priorities.yaml or rebuilds the queue.
+        """
+        self.push_screen(
+            WeightEditorScreen(
+                self._priorities,
+                known_projects(self._records, self._decisions, self._priorities.project_weights),
+                self.apply_priorities,
+            )
+        )
 
     def apply_priorities(self, new_priorities: Priorities) -> None:
         """Apply an edited Priorities snapshot (PRD §9 C9b weight editor) -- this task's leaf signal.
