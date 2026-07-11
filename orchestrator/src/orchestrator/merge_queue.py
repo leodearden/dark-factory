@@ -5431,6 +5431,22 @@ class SpeculativeMergeWorker(_WipHaltMixin):
             return
         self._note_transition(request_id, current, ItemLifecycleState.QUEUED, live_obj=live_obj)
 
+    def _entry_phase(self, entry: InflightEntry) -> str:
+        """Return *entry*'s current phase, derived from the ItemLifecycle
+        registry rather than a stored field (merge-queue-reliability PRD
+        scope-4 lambda / task 2173 step-4).
+
+        Falls back to ``'verifying'`` when the entry's request is not
+        registered in ``self._lifecycle``. This preserves the prior
+        ``infl.phase or 'verifying'`` default: every production
+        ``_inflight`` entry is registered via ``_inflight_append``, so the
+        fallback is defensive-only and never the hot path — it only matters
+        for narrow unit tests that construct an ``InflightEntry`` without
+        registering it.
+        """
+        state = self._lifecycle.current(entry.item.request.request_id)
+        return state.value if state is not None else 'verifying'
+
     # ── δ=1988 SuffixConflictTracker delegation ─────────────────────────────
     # Data-descriptor properties forwarding the original attribute names to
     # self._suffix_tracker's fields, so existing read/write call sites (incl.
@@ -5971,7 +5987,7 @@ class SpeculativeMergeWorker(_WipHaltMixin):
         entries: list[InflightEntry] = []
         if (
             self._finalizing_head is not None
-            and self._finalizing_head.phase in {'verifying', 'gate_reverify', 'finalizing'}
+            and self._entry_phase(self._finalizing_head) in {'verifying', 'gate_reverify', 'finalizing'}
         ):
             entries.append(self._finalizing_head)
         for e in self._inflight:
@@ -6869,7 +6885,7 @@ class SpeculativeMergeWorker(_WipHaltMixin):
             """
             e = _entry(
                 infl.item.request,
-                infl.phase or 'verifying',
+                self._entry_phase(infl),
                 worktree_path=infl.merge_wt,
                 position=position,
             )
@@ -6988,13 +7004,13 @@ class SpeculativeMergeWorker(_WipHaltMixin):
         # Prefer _finalizing_head only when its phase qualifies — a passthrough
         # finalize entry would otherwise mask a genuinely-verifying _inflight[0].
         _vip_head = (
-            _fh if _fh is not None and _fh.phase in _verify_phases
+            _fh if _fh is not None and self._entry_phase(_fh) in _verify_phases
             else (self._inflight[0] if self._inflight else None)
         )
-        if _vip_head is not None and _vip_head.phase in _verify_phases:
+        if _vip_head is not None and self._entry_phase(_vip_head) in _verify_phases:
             verify_in_progress = {
                 'task_id': _vip_head.item.request.task_id,
-                'phase': _vip_head.phase,
+                'phase': self._entry_phase(_vip_head),
                 # age_secs: total time since enqueued (queue wait + verify time).
                 'age_secs': max(0.0, now - _vip_head.item.request.enqueued_at),
                 # verify_age_secs: time since dispatch (includes host acquisition).
