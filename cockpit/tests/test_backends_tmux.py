@@ -134,10 +134,11 @@ class TestTmuxBackendReorder:
         backend.reorder(targets)
 
         assert runner.calls == [
-            ['tmux', 'move-window', '-s', 's:2', '-t', 's:9000'],
-            ['tmux', 'move-window', '-s', 's:0', '-t', 's:9001'],
-            ['tmux', 'move-window', '-s', 's:9000', '-t', 's:0'],
-            ['tmux', 'move-window', '-s', 's:9001', '-t', 's:1'],
+            ['tmux', 'display-message', '-p', '-t', 's', '#{window_id}'],
+            ['tmux', 'move-window', '-d', '-s', 's:2', '-t', 's:9000'],
+            ['tmux', 'move-window', '-d', '-s', 's:0', '-t', 's:9001'],
+            ['tmux', 'move-window', '-d', '-s', 's:9000', '-t', 's:0'],
+            ['tmux', 'move-window', '-d', '-s', 's:9001', '-t', 's:1'],
         ]
 
     def test_reorder_succeeds_against_a_live_occupied_destination_index(self):
@@ -160,18 +161,34 @@ class TestTmuxBackendReorder:
 
         assert table.windows == {'s:0': 'w2', 's:1': 'w0'}
 
-    def test_reorder_issues_zero_focus_commands(self):
-        """Focus-preserving shape: reorder never touches select-window/switch-client."""
-        from cockpit.backends.base import DisplayTarget
+    def test_reorder_restores_active_window_and_never_switch_client(self):
+        """Signal-don't-move shape: move-window inevitably churns a session's
+        current window, so reorder snapshots the active window by its stable
+        @id up front and re-selects exactly that window at the end (restoring
+        operator focus to where it already was). The only focus command it may
+        issue is that restoring select-window -- never switch-client, and never
+        a select-window for any window other than the one that was active.
+        """
+        from cockpit.backends.base import CommandResult, DisplayTarget
         from cockpit.backends.tmux import TmuxBackend
 
-        runner = ScriptedRunner()
+        runner = ScriptedRunner(
+            results={
+                ('tmux', 'display-message', '-p', '-t', 's', '#{window_id}'): CommandResult(
+                    returncode=0, stdout='@7\n'
+                )
+            }
+        )
         backend = TmuxBackend(run=runner)
         targets = [DisplayTarget(kind='tmux', tmux_target='s:0')]
 
         backend.reorder(targets)
 
-        assert not any(argv[1] in ('select-window', 'switch-client') for argv in runner.calls)
+        assert not any(argv[1] == 'switch-client' for argv in runner.calls)
+        select_calls = [argv for argv in runner.calls if argv[1] == 'select-window']
+        assert select_calls == [['tmux', 'select-window', '-t', '@7']]
+        # ...and the restore is the LAST thing reorder does, after every move.
+        assert runner.calls[-1] == ['tmux', 'select-window', '-t', '@7']
 
     def test_reorder_skips_target_with_missing_tmux_target_and_warns(self, caplog):
         from cockpit.backends.base import DisplayTarget
@@ -186,8 +203,9 @@ class TestTmuxBackendReorder:
 
         assert any(r.levelno == logging.WARNING for r in caplog.records)
         assert runner.calls == [
-            ['tmux', 'move-window', '-s', 's:0', '-t', 's:9000'],
-            ['tmux', 'move-window', '-s', 's:9000', '-t', 's:1'],
+            ['tmux', 'display-message', '-p', '-t', 's', '#{window_id}'],
+            ['tmux', 'move-window', '-d', '-s', 's:0', '-t', 's:9000'],
+            ['tmux', 'move-window', '-d', '-s', 's:9000', '-t', 's:1'],
         ]
 
 
