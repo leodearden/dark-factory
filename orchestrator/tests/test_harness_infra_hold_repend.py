@@ -416,3 +416,91 @@ class TestReconcileSweepExcludesInfraHold:
         mock_reconcile_one.assert_not_called()
         harness.scheduler.set_task_status.assert_not_called()  # type: ignore[attr-defined]
         assert count == 0
+
+
+# ---------------------------------------------------------------------------
+# Task 2200 (ω4) step-7: the WRITE site _cascade_unblock_member keys on the
+# task's first-class status via is_infra_held, not the retired
+# metadata.infra_hold boolean, and must check it BEFORE the status != 'blocked'
+# early return — an infra-held task is never 'blocked', so the pre-step-8
+# early return skips the resume-at-verify branch entirely.
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+class TestCascadeUnblockKeysOnInfraHoldStatus:
+    """_cascade_unblock_member must key its infra-hold resume branch on
+    is_infra_held(task) — the task's first-class status — checked BEFORE the
+    status != 'blocked' early return, and resume-at-verify from that status
+    alone (no metadata.infra_hold flag to read or clear).
+
+    RED before step-8: the cascade reads status via get_status() and
+    early-returns whenever it is not 'blocked' — an infra-held task's status
+    is 'infra-hold', so it never reaches the (also still metadata-keyed)
+    infra branch at all.
+    """
+
+    async def test_status_infra_hold_resumes_at_verify(
+        self, harness: Harness,
+    ):
+        """status='infra-hold' (no metadata.infra_hold flag) on a resolved
+        infra_issue L1, via the orphan path -> resume-at-verify
+        ('in-progress'), never 'pending', and no update_task call (there is
+        no flag to clear under the first-class status).
+        """
+        tid = '1887'
+
+        harness.scheduler.get_task = AsyncMock(return_value={
+            'id': tid,
+            'status': 'infra-hold',
+            'metadata': {},
+        })
+        harness.scheduler.get_status = AsyncMock(return_value='infra-hold')
+
+        esc = _make_infra_esc(task_id=tid)  # status='resolved' → legacy 'resume' action
+
+        # Ensure orphan path: task not in _escalation_events
+        harness._escalation_events.pop(tid, None)
+
+        harness._on_escalation_resolved(esc)
+        await asyncio.gather(*list(harness._background_tasks))
+
+        # Must resume-at-verify: 'in-progress'.
+        harness.scheduler.set_task_status.assert_awaited_once_with(tid, 'in-progress')  # type: ignore[attr-defined]
+
+        # Must NOT flip to 'pending'.
+        pending_calls = [
+            c for c in harness.scheduler.set_task_status.await_args_list  # type: ignore[attr-defined]
+            if c.args[1] == 'pending'
+        ]
+        assert not pending_calls, (
+            f"set_task_status('pending') was called for a status='infra-hold' "
+            f'task. Calls: {pending_calls}'
+        )
+
+        # No metadata.infra_hold clear — there is no flag left to clear.
+        harness.scheduler.update_task.assert_not_awaited()  # type: ignore[attr-defined]
+
+    async def test_blocked_no_infra_hold_still_flips_to_pending(
+        self, harness: Harness,
+    ):
+        """Contrast/no-regression: plain status='blocked' + metadata:{} still
+        flips to 'pending' via Table B — the is_infra_held pre-gate must not
+        disturb the existing non-infra resume path.
+        """
+        tid = '1888'
+
+        harness.scheduler.get_task = AsyncMock(return_value={
+            'id': tid,
+            'status': 'blocked',
+            'metadata': {},
+        })
+        harness.scheduler.get_status = AsyncMock(return_value='blocked')
+
+        esc = _make_infra_esc(task_id=tid)
+
+        harness._escalation_events.pop(tid, None)
+
+        harness._on_escalation_resolved(esc)
+        await asyncio.gather(*list(harness._background_tasks))
+
+        harness.scheduler.set_task_status.assert_awaited_once_with(tid, 'pending')  # type: ignore[attr-defined]
