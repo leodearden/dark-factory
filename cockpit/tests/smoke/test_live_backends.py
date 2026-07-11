@@ -7,22 +7,26 @@ B3) exercise the same contracts against a scripted/fake CommandRunner, never
 a real window manager or tmux server. This module is the live re-proof PRD
 C-smoke requires before the C10 human gate.
 
-All tests are @pytest.mark.smoke; deselected by default
-(cockpit/pyproject.toml addopts = "-m 'not smoke'") so routine/headless runs
-never spawn windows or tmux sessions -- select explicitly with `pytest
-cockpit/tests/smoke -m smoke`. The autouse `_require_live_host` fixture
-(smoke/conftest.py) also skips cleanly on a host missing
-DISPLAY/wmctrl/xdotool/xprop/tmux/tkinter.
+All tests are @pytest.mark.smoke; deselected by default so routine/headless
+runs never spawn windows or tmux sessions -- select explicitly with `pytest
+cockpit/tests/smoke -m smoke`. The `smoke` marker is registered and
+deselected (`-m 'not smoke'`) in BOTH the root pyproject.toml (effective when
+pytest is run from the repo root -- pytest reads only the rootdir's single
+inifile, never merges addopts/markers across pyproject.toml files) and
+cockpit/pyproject.toml (effective for per-subproject runs, e.g. `cd cockpit
+&& uv run pytest tests/`), so smoke is deselected under every invocation
+mode. The autouse `_require_live_host` fixture (smoke/conftest.py) also skips
+cleanly on a host missing DISPLAY/wmctrl/xdotool/xprop/tmux/tkinter.
 
 The live harness (skip guard, disposable-resource fixtures, observation
 helpers) lives entirely in smoke/conftest.py and is never imported by name
-here: the repo runs pytest with --import-mode=importlib (root pyproject.toml
-addopts), so a test module's own directory is not added to sys.path and it
-cannot `import` a sibling helper module -- conftest.py is discovered and
-loaded by pytest by path regardless of import mode, so fixtures are the only
-cross-file channel available. Every harness helper this module uses
-(disposable_wm_window, active_window_id, wait_until, ...) is therefore
-requested as a fixture, never imported.
+here: the root pyproject.toml sets --import-mode=importlib, under which a
+test module's own directory is not added to sys.path and it cannot `import`
+a sibling helper module -- conftest.py is discovered and loaded by pytest by
+path regardless of import mode, so fixtures are the only cross-file channel
+available. Every harness helper this module uses (disposable_wm_window,
+active_window_id, wait_until, ...) is therefore requested as a fixture,
+never imported.
 
 cockpit.backends.wm/base already exist (C4 landed), so importing them below
 is a plain top-level import -- only the *harness* is new here. Each new test
