@@ -490,3 +490,55 @@ class TestRunMainTipSweepRetryOnFlake:
             'git worktree remove --force must run even when retry returns '
             'pytest_internalerror (cleanup-in-finally guarantee)'
         )
+
+
+class TestRunMainTipSweepRoleStamp:
+    """task 2391 (PRD T3): run_main_tip_sweep stamps role='background' on
+    both the first-pass and flake-retry run_full_verification calls.
+
+    RED today: run_main_tip_sweep calls run_full_verification(tmp_path,
+    config) with no role kwarg at either call site.
+    """
+
+    def test_run_main_tip_sweep_stamps_background_role_on_both_calls(
+        self, tmp_path: Path
+    ) -> None:
+        """Both the first-pass and the flake-retry call must receive
+        role='background'.
+
+        Uses the FAILING -> PASSING side_effect (mirrors
+        TestRunMainTipSweepRetryOnFlake) to exercise both call sites in one
+        sweep invocation.
+        """
+        from orchestrator import verify as verify_module
+
+        config = _make_config(tmp_path)
+        git_ops = _make_git_ops(tmp_path)
+
+        async def _fake_run(cmd, **kwargs):
+            return (0, '', '')
+
+        rfv = AsyncMock(side_effect=[FAILING_RESULT, PASSING_RESULT])
+
+        with (
+            patch('orchestrator.git_ops._run', side_effect=_fake_run),
+            patch.object(verify_module, 'run_full_verification', rfv),
+        ):
+            result = asyncio.run(
+                verify_module.run_main_tip_sweep(config, git_ops)
+            )
+
+        assert result is not None, 'Expected (sha, VerifyResult), got None'
+        swept_sha, vr = result
+        assert swept_sha == MAIN_SHA
+        assert vr.passed is True
+
+        assert rfv.call_count == 2, (
+            f'Expected exactly 2 calls to run_full_verification '
+            f'(first-pass + flake-retry), got {rfv.call_count}'
+        )
+        for call_index, one_call in enumerate(rfv.call_args_list):
+            assert one_call.kwargs.get('role') == 'background', (
+                f'Expected call #{call_index} to run_full_verification to receive '
+                f"role='background'; got kwargs={one_call.kwargs!r}"
+            )
