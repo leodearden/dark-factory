@@ -60,6 +60,11 @@ DATA_MODULE_DIFF: list[str] = ['shared/tests/silent_fallthrough_allowlist.py']
 # widened for this case).
 STRUCTURAL_DIFF: list[str] = ['orchestrator/src/orchestrator/interfaces.py']
 
+# An all-INERT diff (no .py/.rs at all) for the plan-level flags: every
+# module-path/fallback branch would no-op on this, so derive_verify_plan must
+# short-circuit to a TRIVIAL PlannedRun rather than fabricate a pytest run.
+_ALL_INERT_DIFF: list[str] = ['docs/README.md', 'scripts/deploy.yaml']
+
 # Canned file contents for the dict-backed fake worktree_reader below. Only
 # STRUCTURAL_DIFF's file has real (Protocol-bearing) content; every other
 # path — including ROOT_CONFTEST_DIFF/DATA_MODULE_DIFF's files, and any path
@@ -528,3 +533,74 @@ class TestDeriveVerifyPlanFallbackPath:
         assert run.scope_kind is ScopeKind.FULL_SUITE
         assert run.cmd is not None
         assert run.cmd.targets == ('.',)
+
+
+# ---------------------------------------------------------------------------
+# Plan-level flags: needs_pipeline_guard_check / TRIVIAL (step-11: RED)
+# ---------------------------------------------------------------------------
+
+
+class TestPlanFlags:
+    """VerifyPlan's plan-level flags: needs_pipeline_guard_check and TRIVIAL."""
+
+    # -- (a) needs_pipeline_guard_check ---------------------------------------
+
+    def test_needs_pipeline_guard_check_true_for_merge_role(self):
+        """An all-INERT diff in a merge-role context flags the caller to check the guard.
+
+        derive_verify_plan never executes _verify_pipeline_guard_requires_full_gate
+        itself (that's an impure subprocess call) — it only records that the
+        caller must run it before trusting this plan's trivial verdict.
+        """
+        plan = derive_verify_plan(_ALL_INERT_DIFF, [], None, fake_worktree_reader, role='merge')
+        assert plan.needs_pipeline_guard_check is True
+
+    def test_needs_pipeline_guard_check_false_for_task_role(self):
+        """The SAME all-INERT diff outside merge role never needs the guard check."""
+        plan = derive_verify_plan(_ALL_INERT_DIFF, [], None, fake_worktree_reader, role='task')
+        assert plan.needs_pipeline_guard_check is False
+
+    def test_needs_pipeline_guard_check_defaults_false(self):
+        """role defaults to 'task' — omitting it must not accidentally opt into the guard."""
+        plan = derive_verify_plan(_ALL_INERT_DIFF, [], None, fake_worktree_reader)
+        assert plan.needs_pipeline_guard_check is False
+
+    # -- (b) TRIVIAL -------------------------------------------------------------
+
+    def test_all_inert_diff_emits_trivial_run_not_fabricated_pytest(self):
+        """An all-INERT diff must not fabricate a pytest run — it marks TRIVIAL."""
+        plan = derive_verify_plan(_ALL_INERT_DIFF, [], None, fake_worktree_reader)
+        assert len(plan.runs) == 1
+        assert plan.runs[0].scope_kind is ScopeKind.TRIVIAL
+        assert plan.runs[0].cmd is None
+        assert plan.runs[0].reason
+
+    def test_all_inert_diff_with_module_configs_still_trivial(self):
+        """The TRIVIAL short-circuit applies before ever branching on module_configs."""
+        mc = ModuleConfig(
+            prefix='orchestrator',
+            test_command='uv run --directory orchestrator pytest tests/',
+            lint_command='uv run --directory orchestrator ruff check src/',
+        )
+        plan = derive_verify_plan(_ALL_INERT_DIFF, [mc], None, fake_worktree_reader)
+        assert len(plan.runs) == 1
+        assert plan.runs[0].scope_kind is ScopeKind.TRIVIAL
+
+    # -- (c) D1-with-suite pin (module path) --------------------------------------
+
+    def test_module_path_test_data_full_suites_distinct_from_fallback_skip(self):
+        """A TEST_DATA file in the MODULE path always has mc.test_command as a real
+        suite, so it FULL_SUITEs — never SKIPPED, unlike the bare-fallback golden
+        (TestDeriveVerifyPlanFallbackPath.test_data_module_bare_pytest_default_skips_with_reason).
+        Locks the step-8 module-path reconciliation so it can't regress silently.
+        """
+        mc = ModuleConfig(
+            prefix='shared',
+            test_command='uv run --directory shared pytest tests/',
+            lint_command='uv run --directory shared ruff check src/',
+        )
+        plan = derive_verify_plan(DATA_MODULE_DIFF, [mc], None, fake_worktree_reader)
+        run = _run_for(plan, 'shared', 'pytest:')
+        assert run is not None
+        assert run.scope_kind is ScopeKind.FULL_SUITE
+        assert run.cmd == parse_config_command(mc.test_command)
