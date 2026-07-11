@@ -260,10 +260,11 @@ class TestDecisionQueueRender:
         decision/session identity, with the higher-scored item ranked above
         the lower one (PRD §9 C5b: rows `[score][age][project#task][question]`).
         """
+        from textual.widgets.data_table import RowDoesNotExist
+
         from cockpit.app import CockpitApp
         from cockpit.backends import FakeBackend
         from cockpit.panes.decision_queue import DecisionQueue
-        from textual.widgets.data_table import RowDoesNotExist
 
         running = _make_record(session_slug='running-1', status=sr.Status.RUNNING)
         awaiting = _make_record(
@@ -546,10 +547,11 @@ class TestDropRemovesAndPersists:
         other sanctioned decision write. A dropped decision never
         resurfaces (order_queue's own state=='open' filter excludes it).
         """
+        from textual.widgets.data_table import RowDoesNotExist
+
         from cockpit.app import CockpitApp
         from cockpit.backends import FakeBackend
         from cockpit.panes.decision_queue import DecisionQueue
-        from textual.widgets.data_table import RowDoesNotExist
 
         first = sr.DecisionRecord(
             id='dec-1', project='df', text='First?', filed_at='2026-07-07T00:00:00+00:00'

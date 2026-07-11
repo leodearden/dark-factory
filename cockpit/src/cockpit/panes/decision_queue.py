@@ -15,7 +15,7 @@ frozen C1 record shape, never re-derive it).
 
 from __future__ import annotations
 
-from collections.abc import Mapping, Sequence
+from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass, replace
 from datetime import datetime
 from typing import Protocol
@@ -254,8 +254,8 @@ def order_queue(
     *,
     boosts: Mapping[str, int] | None = None,
     deferred: Mapping[str, datetime] | None = None,
-    handling: Sequence[str] | None = None,
-    dropped: Sequence[str] | None = None,
+    handling: Iterable[str] | None = None,
+    dropped: Iterable[str] | None = None,
 ) -> list[QueueItem]:
     """Build the score-ordered decision queue: every open decision + awaiting-input session.
 

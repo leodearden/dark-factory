@@ -11,18 +11,24 @@ from __future__ import annotations
 
 from datetime import UTC, datetime
 from types import SimpleNamespace
+from typing import cast
 
 from orchestrator import session_registry as sr
+
+from cockpit.panes.decision_queue import _QueueRowLike
 
 _NOW = datetime(2026, 7, 11, tzinfo=UTC)
 
 
-def _make_row_item(**overrides):
+def _make_row_item(**overrides) -> _QueueRowLike:
     """A duck-typed stand-in exposing exactly format_queue_row's attribute
     contract (score/filed_at/project/task_id/question) -- mirrors
     ScoringItem/DisplayTarget's own "structural, not isinstance" convention.
     QueueItem itself doesn't exist yet at this step (see TestOrderQueue
-    below), so format_queue_row must not require one.
+    below), so format_queue_row must not require one. The cast is a
+    type-checker-only annotation (SimpleNamespace has no statically-visible
+    attributes of its own) -- it asserts nothing at runtime, so a missing
+    override still degrades exactly like a real _QueueRowLike would.
     """
     fields: dict = {
         'score': 1.0,
@@ -32,7 +38,7 @@ def _make_row_item(**overrides):
         'question': 'Which port?',
     }
     fields.update(overrides)
-    return SimpleNamespace(**fields)
+    return cast(_QueueRowLike, SimpleNamespace(**fields))
 
 
 def _make_decision(**overrides):

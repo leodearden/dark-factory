@@ -370,13 +370,21 @@ class CockpitApp(App):
         if item.kind == 'decision' and item.decision_id is not None:
             current = self._decision_by_id(item.decision_id)
             current_boost = current.manual_boost if current is not None else 0
-            new_boost = absolute if absolute is not None else current_boost + delta
+            if absolute is not None:
+                new_boost = absolute
+            else:
+                assert delta is not None, 'exactly one of delta/absolute must be given'
+                new_boost = current_boost + delta
             set_manual_boost(item.decision_id, new_boost, root=self.fleet_root)
             self._decisions = list_decisions(self.fleet_root)
             self._decisions_snapshot = _decisions_snapshot(self._decisions)
         else:
             current_boost = self._boosts.get(key, 0)
-            new_boost = absolute if absolute is not None else current_boost + delta
+            if absolute is not None:
+                new_boost = absolute
+            else:
+                assert delta is not None, 'exactly one of delta/absolute must be given'
+                new_boost = current_boost + delta
             self._boosts[key] = new_boost
         self._rebuild_queue()
 
