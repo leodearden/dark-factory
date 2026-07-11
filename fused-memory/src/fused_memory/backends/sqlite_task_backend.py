@@ -18,7 +18,11 @@ from pathlib import Path
 from typing import Any
 
 import aiosqlite
-from shared.async_sqlite_base import apply_full_durability_pragmas, apply_wal_pragmas, connect_daemon
+from shared.async_sqlite_base import (
+    apply_full_durability_pragmas,
+    apply_wal_pragmas,
+    connect_daemon,
+)
 from shared.task_metadata import (
     _WHOLE_METADATA_FIELD,
     SchemaWarning,
