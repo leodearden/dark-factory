@@ -480,3 +480,112 @@ class TestManagedRuntimeDataDirs:
 
         assert not queue_dir.is_relative_to(project_root)
         assert not recon_dir.is_relative_to(project_root)
+
+
+# ---------------------------------------------------------------------------
+# Step-3/Step-4 (task 2439): McpLifecycle.start() managed-spawn env injection
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestManagedSpawnEnvInjection:
+    """McpLifecycle.start()'s managed-spawn branch injects
+    QUEUE_DATA_DIR/RECONCILIATION_DATA_DIR pointing out-of-tree, so the
+    managed fused-memory's runtime SQLite state never dirties the watched
+    project's tracked tree (task 2439). Mirrors
+    TestMcpLifecycleProcessGroup's mock/patch idiom in test_mcp_retry.py."""
+
+    @pytest.fixture
+    def mock_config(self, tmp_path: Path) -> MagicMock:
+        """Config-shaped mock for McpLifecycle: non-empty server_command
+        (managed mode), a real project_id, and project_root=tmp_path."""
+        cfg = MagicMock(spec_set=pydantic_spec(OrchestratorConfig))
+        cfg.fused_memory.server_command = ['echo', 'ok']
+        cfg.fused_memory.url = 'http://localhost:8002'
+        cfg.fused_memory.config_path = 'fused-memory/config/config.yaml'
+        cfg.fused_memory.project_id = 'reify'
+        cfg.project_root = tmp_path
+        return cfg
+
+    async def test_start_injects_out_of_tree_queue_and_reconciliation_dirs(
+        self, mock_config: MagicMock, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """No operator override present -> env carries the computed
+        managed_runtime_data_dirs() paths, neither of which is under
+        project_root; cwd stays project_root (unchanged by this task)."""
+        monkeypatch.delenv('QUEUE_DATA_DIR', raising=False)
+        monkeypatch.delenv('RECONCILIATION_DATA_DIR', raising=False)
+
+        from orchestrator.mcp_lifecycle import McpLifecycle, managed_runtime_data_dirs
+
+        captured_kwargs: dict = {}
+
+        async def fake_exec(*args: object, **kwargs: object) -> MagicMock:
+            captured_kwargs.update(kwargs)
+            proc = MagicMock()
+            proc.returncode = None
+            proc.stdout = MagicMock()
+            proc.stderr = MagicMock()
+            return proc
+
+        with (
+            patch(
+                'orchestrator.mcp_lifecycle.asyncio.create_subprocess_exec',
+                side_effect=fake_exec,
+            ),
+            patch.object(
+                McpLifecycle, '_wait_for_health', new=AsyncMock(return_value=True)
+            ),
+            patch('orchestrator.mcp_lifecycle.McpSession') as mock_session_cls,
+        ):
+            mock_session_cls.return_value.initialize = AsyncMock()
+            mcp = McpLifecycle(mock_config)
+            await mcp.start()
+
+        env = captured_kwargs.get('env')
+        assert env is not None, 'create_subprocess_exec must be called with env='
+        expected_queue, expected_recon = managed_runtime_data_dirs('reify')
+        assert env['QUEUE_DATA_DIR'] == str(expected_queue)
+        assert env['RECONCILIATION_DATA_DIR'] == str(expected_recon)
+        assert not Path(env['QUEUE_DATA_DIR']).is_relative_to(tmp_path)
+        assert not Path(env['RECONCILIATION_DATA_DIR']).is_relative_to(tmp_path)
+        # cwd is unchanged by this task
+        assert captured_kwargs.get('cwd') == str(tmp_path)
+
+    async def test_start_honors_operator_preset_queue_data_dir(
+        self, mock_config: MagicMock, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """An operator-preset QUEUE_DATA_DIR in the environment survives —
+        setdefault() must not clobber it."""
+        monkeypatch.setenv('QUEUE_DATA_DIR', '/custom/q')
+        monkeypatch.delenv('RECONCILIATION_DATA_DIR', raising=False)
+
+        from orchestrator.mcp_lifecycle import McpLifecycle
+
+        captured_kwargs: dict = {}
+
+        async def fake_exec(*args: object, **kwargs: object) -> MagicMock:
+            captured_kwargs.update(kwargs)
+            proc = MagicMock()
+            proc.returncode = None
+            proc.stdout = MagicMock()
+            proc.stderr = MagicMock()
+            return proc
+
+        with (
+            patch(
+                'orchestrator.mcp_lifecycle.asyncio.create_subprocess_exec',
+                side_effect=fake_exec,
+            ),
+            patch.object(
+                McpLifecycle, '_wait_for_health', new=AsyncMock(return_value=True)
+            ),
+            patch('orchestrator.mcp_lifecycle.McpSession') as mock_session_cls,
+        ):
+            mock_session_cls.return_value.initialize = AsyncMock()
+            mcp = McpLifecycle(mock_config)
+            await mcp.start()
+
+        env = captured_kwargs.get('env')
+        assert env is not None
+        assert env['QUEUE_DATA_DIR'] == '/custom/q'
