@@ -19,6 +19,7 @@ from dataclasses import dataclass
 
 from orchestrator.session_registry import TERMINAL_STATUSES, SessionRecord, Status
 from textual.app import ComposeResult
+from textual.binding import Binding
 from textual.screen import ModalScreen
 from textual.widgets import Tree
 from textual.widgets.tree import TreeNode
@@ -187,7 +188,10 @@ class SpawnTreeScreen(ModalScreen[None]):
     that node's slug (its `data`); resolving the slug to a Display target
     and routing it to a backend is the app's job (see
     cockpit.app.CockpitApp._focus_slug), preserving the same C4/C5b
-    separation SpawnScreen keeps around spawn_session.
+    separation SpawnScreen keeps around spawn_session. Both Escape and 't'
+    dismiss this screen directly via action_cancel -- see its docstring for
+    why 't' can't simply rely on bubbling up to CockpitApp.action_toggle_tree
+    the way an ordinary (non-modal) key press would.
     """
 
     DEFAULT_CSS = """
@@ -202,6 +206,11 @@ class SpawnTreeScreen(ModalScreen[None]):
         background: $surface;
     }
     """
+
+    BINDINGS = [
+        Binding('t', 'cancel', 'Close tree', show=False),
+        Binding('escape', 'cancel', 'Cancel', show=False),
+    ]
 
     def __init__(
         self,
@@ -241,3 +250,20 @@ class SpawnTreeScreen(ModalScreen[None]):
         """
         if event.node.data is not None:
             self._focus_callback(event.node.data)
+
+    def action_cancel(self) -> None:
+        """Dismiss this screen -- bound to both Escape and 't' (Fleet Cockpit C9a).
+
+        Mirrors SpawnScreen.action_cancel's own escape-to-dismiss shape.
+        't' is bound here too (not just Escape) because Textual's
+        ModalScreen truncates the non-priority key-binding chain at itself
+        (Screen._modal_binding_chain stops at the first is_modal node in
+        the DOM) -- so CockpitApp's own plain 't' -> toggle_tree Binding is
+        never consulted while this screen sits on top of the stack; only
+        bindings declared here (or on a focused descendant, e.g. the
+        SpawnTree itself) are. Binding 't' directly to this same dismiss()
+        is what actually makes the toggle's "press 't' again to close"
+        contract work -- see CockpitApp.action_toggle_tree's own docstring
+        for the app-level half of this.
+        """
+        self.dismiss()

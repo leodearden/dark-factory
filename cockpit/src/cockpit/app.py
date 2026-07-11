@@ -545,15 +545,23 @@ class CockpitApp(App):
         self._spawn_runner(argv)
 
     def action_toggle_tree(self) -> None:
-        """'t' -- push the spawn-tree toggle's modal (Fleet Cockpit C9a, PRD §9).
+        """'t' -- open the spawn-tree modal (Fleet Cockpit C9a, PRD §9).
 
-        Snapshots self._records (the most recently scanned/ordered set) into
-        a SpawnTreeScreen, which renders it as a point-in-time parent->child
-        forest -- see cockpit.panes.spawn_tree. Guards against pushing a
-        second SpawnTreeScreen on top of an already-open one; popping it
-        back off (the toggle's "close" half) is wired in a later step.
+        Snapshots self._records (the most recently scanned/ordered set)
+        into a fresh SpawnTreeScreen, which renders it as a point-in-time
+        parent->child forest -- see cockpit.panes.spawn_tree. The pop
+        branch below guards against ever stacking a second SpawnTreeScreen
+        on top of one already open; it is defensive, not how an
+        interactive 't' keypress actually closes the tree though --
+        Textual's ModalScreen truncates the non-priority key-binding chain
+        at itself, so this app-level 't' binding is never consulted while
+        a SpawnTreeScreen is on top of the stack. SpawnTreeScreen therefore
+        binds 't' (and Escape) itself, straight to its own dismiss()-based
+        action_cancel -- see SpawnTreeScreen.action_cancel for the full
+        explanation.
         """
         if isinstance(self.screen, SpawnTreeScreen):
+            self.pop_screen()
             return
         self.push_screen(SpawnTreeScreen(self._records, self._focus_slug))
 
