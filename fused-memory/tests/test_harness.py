@@ -746,6 +746,77 @@ class TestStage1CycleSummaryHarnessBackstop:
         assert payload['stats'].get('stage1_cycle_summary_degraded_backstop') is True
 
     @pytest.mark.asyncio
+    async def test_stage1_cancelled_error_triggers_degraded_backstop_and_still_propagates(
+        self, journal, event_buffer, mock_memory_service, ledger_store
+    ):
+        """The primary motivating scenario (per this method's docstring) is a
+        CLI timeout surfacing as asyncio.CancelledError — a different except
+        branch (run_full_cycle's `except asyncio.CancelledError`) than the
+        generic RuntimeError case above. The backstop must still fire from
+        the finally block, and CancelledError must still propagate out of
+        run_full_cycle unchanged."""
+        import json
+
+        mock_memory_service.recon_ledger = ledger_store
+        mock_memory_service.get_memories_by_metadata = AsyncMock(return_value=[])
+        harness = _make_test_harness(journal, event_buffer, mock_memory_service)
+        harness.stages[0].run = AsyncMock(side_effect=asyncio.CancelledError())
+
+        with pytest.raises(asyncio.CancelledError):
+            await harness.run_full_cycle('test-project', 'buffer_size:2')
+
+        recent = await journal.get_recent_runs('test-project', limit=1)
+        assert recent, 'expected the cancelled run to be persisted by the journal'
+        run_id = recent[0].id
+
+        record = await ledger_store.get_by_identity(
+            'test-project', 'cycle_summary', flag_type='memory_consolidator', run_id=run_id,
+        )
+        assert record is not None, (
+            'harness backstop must write a cycle_summary ledger row when Stage 1 '
+            'is cancelled before completing its own in-stage write'
+        )
+        payload = json.loads(record.payload_json)
+        assert payload['stats'].get('stage1_cycle_summary_degraded_backstop') is True
+
+    @pytest.mark.asyncio
+    async def test_stage1_all_accounts_capped_triggers_degraded_backstop_without_raising(
+        self, journal, event_buffer, mock_memory_service, ledger_store
+    ):
+        """AllAccountsCappedException takes the deferral branch (`except
+        AllAccountsCappedException`), which RETURNS the run instead of
+        re-raising — an untested control-flow shape where the finally-block
+        backstop still must fire even though run_full_cycle completes
+        normally rather than raising."""
+        import json
+
+        from shared.cli_invoke import AllAccountsCappedException
+
+        mock_memory_service.recon_ledger = ledger_store
+        mock_memory_service.get_memories_by_metadata = AsyncMock(return_value=[])
+        harness = _make_test_harness(journal, event_buffer, mock_memory_service)
+        harness.stages[0].run = AsyncMock(
+            side_effect=AllAccountsCappedException(
+                retries=3, elapsed_secs=200.0, label='Reconciliation stage (sonnet)'
+            )
+        )
+
+        run = await harness.run_full_cycle('test-project', 'buffer_size:2')
+
+        assert run.status in (RunStatus.failed, 'failed')
+
+        record = await ledger_store.get_by_identity(
+            'test-project', 'cycle_summary', flag_type='memory_consolidator', run_id=run.id,
+        )
+        assert record is not None, (
+            'harness backstop must write a cycle_summary ledger row when Stage 1 '
+            'defers via AllAccountsCappedException, even though run_full_cycle '
+            'returns normally instead of raising'
+        )
+        payload = json.loads(record.payload_json)
+        assert payload['stats'].get('stage1_cycle_summary_degraded_backstop') is True
+
+    @pytest.mark.asyncio
     async def test_happy_path_does_not_invoke_backstop_write(
         self, journal, event_buffer, mock_memory_service, ledger_store
     ):
