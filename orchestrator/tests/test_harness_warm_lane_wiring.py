@@ -43,7 +43,7 @@ def _build_harness(config: OrchestratorConfig) -> Harness:
     # instead of reaching into _dispatched/lock_table._held directly) so
     # tests below that set harness.scheduler._dispatched (or .lock_table)
     # exercise real semantics instead of an auto-mocked (always-truthy) stub.
-    wire_scheduler_liveness_mock(harness.scheduler)
+    wire_scheduler_liveness_mock(harness.scheduler)  # type: ignore[arg-type]
     return harness
 
 

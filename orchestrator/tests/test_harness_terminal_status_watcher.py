@@ -19,10 +19,10 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
-from _orch_helpers import _init_harness_state_for_test
+from _orch_helpers import _init_harness_state_for_test, wire_scheduler_liveness_mock
 
 from orchestrator.config import OrchestratorConfig
 from orchestrator.harness import Harness
@@ -33,15 +33,18 @@ def harness() -> Harness:
     h = Harness.__new__(Harness)
     _init_harness_state_for_test(h)  # task 1449: initialise digest counters
     h._workflow_cancel_events = {}
-    # cancel_workflow stamps wall-clock for the reconcile sweep grace
-    # window (R3 race guard) — match the real Harness attribute set.
-    h._workflow_cancel_at = {}
     # task 1491: hard-cancel registry and consecutive-poll counts.
     h._workflow_slot_tasks = {}
     h._terminal_cancel_counts = {}
     # High threshold so existing tests never trigger hard-cancel path.
     h.config = OrchestratorConfig(terminal_status_hard_cancel_polls=100)
-    h.scheduler = type('S', (), {})()  # type: ignore[assignment]
+    h.scheduler = MagicMock()  # type: ignore[assignment]
+    # task 2235 (W10-α): the cancel-grace + liveness state now live on the
+    # Scheduler (single owner).  Wire real accessor behaviour so the harness's
+    # cancel_workflow → scheduler.note_workflow_cancelled() and the reconcile
+    # sweep's workflow_cancel_recent()/clear_workflow_cancel() calls operate on
+    # real state instead of always-truthy auto-mocks.
+    wire_scheduler_liveness_mock(h.scheduler)  # type: ignore[arg-type]
     return h
 
 

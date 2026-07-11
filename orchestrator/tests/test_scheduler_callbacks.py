@@ -59,7 +59,7 @@ class TestSchedulerCallbacksDataclass:
     def test_is_frozen(self):
         callbacks = SchedulerCallbacks()
         with pytest.raises(dataclasses.FrozenInstanceError):
-            callbacks.on_park_stop_trip = lambda reason: None
+            callbacks.on_park_stop_trip = lambda reason: None  # type: ignore[misc]
 
 
 class TestSchedulerConstructorCallbacks:
@@ -242,7 +242,7 @@ class TestLivenessAccessors:
         )
 
         history = scheduler.requeue_history('T1')
-        history.append('not-a-real-record')
+        history.append('not-a-real-record')  # type: ignore[arg-type]
         history.clear()
 
         assert len(scheduler.requeue_history('T1')) == 1
