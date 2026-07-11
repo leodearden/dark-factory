@@ -1608,7 +1608,12 @@ class Harness:
                         await self._maybe_restart_stale_service(agents_idle=True)
                         # Fleet-common merge-idle heartbeat (task 2395, α): written
                         # in both rest branches so a saturated unit (steady-state
-                        # busy-wait branch below) still heartbeats.
+                        # busy-wait branch below) still heartbeats.  Does NOT cover
+                        # a unit that is continuously dispatching with spare
+                        # semaphore headroom (never idle, never busy-waiting) — see
+                        # the docstring of _write_merge_heartbeat for why that gap
+                        # is accepted rather than closed with an unconditional
+                        # per-tick call.
                         await self._write_merge_heartbeat()
                         await asyncio.sleep(self.config.idle_poll_secs)
                         continue
@@ -7048,9 +7053,13 @@ Output JSON matching the schema. Every task must appear in the output.
 
         Gathers ON the event loop: ``ORCH_UNIT`` (self-identification, same
         env convention as ``deterministic_runner._default_resolve_own_unit``),
-        ``merge_idle`` via ``self._merge_pipeline_idle()`` (the authoritative
-        drain-gate truth source — task 1973 U2), and the ``queue_empty``/
-        ``depth`` diagnostics read directly from the same in-memory state.
+        and ``merge_idle``/``queue_empty``/``depth`` from a SINGLE
+        ``self._merge_worker.snapshot()`` read (when a worker exists) using
+        the exact idle formula and fallback ``_merge_pipeline_idle`` uses
+        (``queue_empty and depth == 0``, missing ``'depth'`` treated as ``1``
+        i.e. active) — so idle-truth and the reported depth are always
+        mutually consistent and the worker is polled at most once per tick,
+        rather than once via ``_merge_pipeline_idle()`` and again here.
         Offloads only the serialize+atomic-write to a thread
         (``asyncio.to_thread``), mirroring
         ``Scheduler._write_snapshot_best_effort``'s loop/thread split — all
@@ -7060,15 +7069,37 @@ Output JSON matching the schema. Every task must appear in the output.
         saturated unit — which steady-states in the busy-wait branch — still
         heartbeats.  Fail-open: any exception (state read or disk write) is
         swallowed and logged — a heartbeat write must never stop the run loop.
+
+        Known gap: a unit that is continuously dispatching with spare
+        semaphore headroom (an assignment ready every tick, ``sem`` never
+        full) loops through neither rest branch and will not refresh its
+        heartbeat while that lasts.  Closing this with an unconditional
+        per-outer-loop-iteration call was evaluated and reverted: it makes
+        every ``run()`` invocation write to the fleet-common path on its very
+        first tick, and several existing tests drive ``run()`` for real
+        without sandboxing ``ORCH_UNIT``/``ORCH_FLEET_DIR`` — verified to
+        clobber this host's real ``data/fleet/orchestrator-dark-factory.
+        service.json`` when this shell inherits ``ORCH_UNIT`` from the
+        systemd unit.  Fixing that would require test-isolation changes
+        outside this task's locked scope (harness.py only).  Readers (γ
+        drain gate, ε ``--report``) must therefore treat a stale/absent
+        heartbeat conservatively — i.e. NOT idle / restart-eligible only
+        after a grace period — the same fail-safe stance
+        ``_merge_pipeline_idle`` already takes on a read error.
         """
         try:
             unit = os.environ.get('ORCH_UNIT', '')
-            merge_idle = self._merge_pipeline_idle()
             queue_empty = self._merge_queue.empty()
-            depth = (
-                0 if self._merge_worker is None
-                else int(self._merge_worker.snapshot().get('depth', 0))
-            )
+            worker = self._merge_worker
+            if worker is None:
+                # No pipeline to drain (bare / unit-test harness) — mirrors
+                # _merge_pipeline_idle's own worker-is-None short-circuit;
+                # no snapshot() call is involved on this branch.
+                merge_idle = self._merge_pipeline_idle()
+                depth = 0
+            else:
+                depth = int(worker.snapshot().get('depth', 1))
+                merge_idle = queue_empty and depth == 0
             ts_epoch = time.time()
             payload = build_heartbeat_payload(
                 unit=unit,
