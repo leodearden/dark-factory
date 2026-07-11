@@ -1227,7 +1227,17 @@ class Harness:
             # 2380); file (or refresh) a deferred born-at-L2 escalation
             # instead. Runs after _dismiss_stale_escalations, which only
             # touches L0, so a prior run's L2 survives for dedup here.
-            await self._file_dirty_tree_escalation(force_dirty_start)
+            # Own try/except (non-fatal), like every neighboring startup
+            # step, so a fault in the escalation path itself (e.g. a
+            # transient git subprocess/lock failure in
+            # has_dirty_working_tree(), or an fsync/rename OSError in
+            # _escalation_queue.submit()) never aborts startup and
+            # recreates the RCA 2026-07-08 crash-loop this task exists to
+            # eliminate.
+            try:
+                await self._file_dirty_tree_escalation(force_dirty_start)
+            except Exception as e:
+                logger.warning(f'Failed to file dirty-tree escalation: {e}')
 
             # 1c0. Rehydrate merge-halt state from preserved L1s (non-fatal).
             # Must run after _dismiss_stale_escalations so we scan the
