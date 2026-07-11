@@ -14,6 +14,10 @@ cross-project scope-correction threads.  Grown step-by-step per plan.json:
 
 from __future__ import annotations
 
+from unittest.mock import AsyncMock
+
+import pytest
+
 
 class TestIsCrossProjectScopeCorrection:
     """Tests for is_cross_project_scope_correction(finding, project_id) -> bool."""
@@ -399,3 +403,62 @@ class TestSnapshotFreshness:
         assert snapshot_is_fresh(
             {'subject_status': 'pending'}, live_task,
         ) is False
+
+
+class TestPrecheckBootstrap:
+    """Tests for precheck_scope_correction_freshness — bootstrap path (no prior snapshot)."""
+
+    @pytest.mark.asyncio
+    async def test_bootstrap_keeps_everything_and_writes_snapshot(self):
+        from fused_memory.reconciliation.scope_freshness import (
+            CONSOLIDATED_SCOPE_KIND,
+            precheck_scope_correction_freshness,
+        )
+
+        memory_service = AsyncMock()
+        memory_service.get_memories_by_metadata.return_value = []
+        taskmaster = AsyncMock()
+        taskmaster.get_task.return_value = {
+            'id': 2405,
+            'status': 'pending',
+            'updatedAt': '2026-07-10T10:00:00Z',
+            'description': 'd',
+            'metadata': {},
+        }
+
+        cross_project_finding = {
+            'flag_type': 'cross_project',
+            'description': 'scope correction thread',
+            'cited_tasks': [
+                {'project_id': 'dark_factory', 'task_id': '2405', 'title': 'x'},
+            ],
+        }
+        non_scope_finding = {
+            'flag_type': 'task_memory_mismatch',
+            'description': 'unrelated finding',
+        }
+
+        result = await precheck_scope_correction_freshness(
+            memory_service=memory_service,
+            taskmaster=taskmaster,
+            project_id='autopilot_video',
+            resolve_project_root=lambda pid: f'/roots/{pid}',
+            run_id='run-1',
+            findings=[cross_project_finding, non_scope_finding],
+        )
+
+        # Bootstrap: no prior snapshot exists, so both findings are kept.
+        assert cross_project_finding in result.to_reinvestigate
+        assert non_scope_finding in result.to_reinvestigate
+        assert result.skipped == []
+
+        # Exactly one get_task call, for the cross-project finding's subject.
+        taskmaster.get_task.assert_awaited_once_with(
+            task_id='2405', project_root='/roots/dark_factory',
+        )
+
+        # A fresh snapshot was written for the cross-project finding.
+        memory_service.add_memory.assert_awaited_once()
+        _, kwargs = memory_service.add_memory.await_args
+        assert kwargs['metadata']['kind'] == CONSOLIDATED_SCOPE_KIND
+        assert kwargs['metadata']['task_id'] == 'dark_factory:2405'
