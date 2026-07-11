@@ -144,7 +144,7 @@ class TmuxBackend:
         # Restore each session's originally-active window by its stable @id. This
         # is a no-op for operator focus (the window was already current before the
         # reorder) but undoes the current-window churn move-window causes.
-        for session, active_id in active_before:
+        for _session, active_id in active_before:
             self._run(['tmux', 'select-window', '-t', active_id])
 
     def tile(self, targets: Sequence[DisplayTarget], zone: Zone) -> None:
