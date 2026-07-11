@@ -136,6 +136,21 @@ _UNSET = object()
 # added there is accepted here automatically.
 _VALID_STATUSES: frozenset[TaskStatus] = frozenset(TaskStatus)
 
+# `SchemaWarning.code` values that `_validate_metadata_on_write`'s enforce-mode
+# gate (below) must NOT treat as fatal when deciding whether an incoming-key
+# warning re-triggers whole-blob validation. `unknown_key` is the ONLY code
+# `parse_metadata(..., enforce=True)` never actually raises on: `TaskMetadata`
+# has `model_config = ConfigDict(extra='allow')`, so an unrecognised top-level
+# key is accepted into the model and its `unknown_key` warning is emitted only
+# AFTER construction already succeeded (shared/task_metadata.py
+# `parse_metadata`). Every other code (unparseable_json, not_an_object,
+# invalid_submodel, invalid_field, invalid_metadata) corresponds to a path
+# that DOES raise under enforce=True. Blacklisting this one code — rather
+# than whitelisting the fatal ones — is fail-closed: a hypothetical future
+# warning code defaults to fatal rather than silently under-blocking a
+# genuinely-bad write (task 2405).
+_NON_FATAL_WRITE_WARNING_CODES: frozenset[str] = frozenset({'unknown_key'})
+
 
 def _now() -> str:
     """ISO-8601 UTC timestamp matching the Taskmaster ``updatedAt`` format."""
@@ -1409,10 +1424,15 @@ class SqliteTaskBackend:
         ``ValueError`` / ``TypeError`` propagates uncaught — the caller's
         ``_txn`` rolls back. This tolerates an untouched legacy field (e.g. a
         pre-existing ``done_provenance`` missing the now-required ``kind``)
-        rather than blocking every future write to the row. The heuristic can
-        over-flag (e.g. an ``unknown_key`` warning, which ``parse_metadata``
-        never actually raises on) — the second call self-corrects since it
-        only raises for findings that are genuinely fatal in enforce-mode.
+        rather than blocking every future write to the row. An incoming-key
+        warning only opens this gate when its code is genuinely fatal (i.e.
+        not in :data:`_NON_FATAL_WRITE_WARNING_CODES`): an ``unknown_key``
+        warning is never fatal under ``enforce=True`` (``TaskMetadata``
+        accepts unrecognised top-level keys via ``extra='allow'``), so a
+        patch whose OWN keys are themselves unrecognised (e.g. a
+        reconciliation sidecar patch) must not, by itself, re-trigger
+        whole-blob validation and trip over an untouched fatal field
+        elsewhere in the row (task 2405).
 
         ``project_root``/``tag`` are accepted but not yet read by this method
         — the census line only carries ``task_id``/field/error. They mirror
@@ -1429,7 +1449,8 @@ class SqliteTaskBackend:
                 should_reraise = True
             else:
                 should_reraise = any(
-                    w.field == _WHOLE_METADATA_FIELD or w.field in incoming_keys
+                    (w.field == _WHOLE_METADATA_FIELD or w.field in incoming_keys)
+                    and w.code not in _NON_FATAL_WRITE_WARNING_CODES
                     for w in warnings
                 )
             if should_reraise:

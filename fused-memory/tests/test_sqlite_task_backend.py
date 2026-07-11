@@ -3988,6 +3988,136 @@ async def test_update_task_tolerates_untouched_invalid_done_provenance(tmp_path,
         await backend.close()
 
 
+@pytest.mark.asyncio
+async def test_update_task_unknown_key_patch_tolerates_untouched_invalid_done_provenance(
+    tmp_path, project_root,
+):
+    """Enforce-mode update_task tolerates an untouched legacy done_provenance
+    even when the patch's OWN keys are themselves unrecognised (task 2405).
+
+    Task 2401 scoped the enforce-mode raise to ``incoming_keys`` (the current
+    write's own top-level keys), but ``should_reraise`` treated ANY warning
+    on an incoming key as fatal — including a merely-informational
+    ``unknown_key`` warning. A reconciliation-sidecar patch (e.g.
+    ``{"540_status": ..., "duplicate_check_required": ...}``, the exact
+    shape external projects such as autopilot-video attach to task
+    metadata) is made entirely of such unrecognised keys: TaskMetadata's
+    ``extra='allow'`` means ``unknown_key`` is NEVER fatal under
+    ``enforce=True``. This test proves such a patch no longer trips the
+    whole-blob re-validation pass onto an untouched legacy
+    ``done_provenance`` (missing the now-required ``kind``), while a patch
+    that itself touches ``done_provenance`` with a still-invalid value is
+    still rejected.
+    """
+    cfg = TaskmasterConfig(project_root=str(tmp_path))
+    backend = SqliteTaskBackend(cfg, task_metadata_enforce=True)
+    await backend.start()
+    try:
+        # Seed a pre-migration row carrying BOTH the legacy (missing 'kind')
+        # done_provenance AND an unknown sidecar key, mirroring the real
+        # autopilot_video:544 shape. Enforcement must be disabled to plant it.
+        backend._task_metadata_enforce = False
+        dto = await backend.add_task(
+            project_root=project_root, title='t',
+            metadata=json.dumps({
+                'done_provenance': {'commit': 'abc123'},
+                'duplicate_check_required': True,
+            }),
+        )
+        backend._task_metadata_enforce = True
+
+        # PRIMARY (currently RED): a patch whose OWN keys are themselves
+        # unknown/extra keys (the autopilot_video:544 shape) must not raise —
+        # even though the row's untouched done_provenance is still missing
+        # 'kind'.
+        await backend.update_task(
+            dto['id'], project_root=project_root,
+            metadata=json.dumps({
+                'duplicate_check_required': False,
+                '540_status': 'cancelled',
+            }),
+            metadata_mode='merge',
+        )
+        task = await backend.get_task(dto['id'], project_root=project_root)
+        assert task['metadata']['done_provenance'] == {'commit': 'abc123'}, (
+            f'Expected the untouched legacy done_provenance to be preserved; '
+            f'got: {task["metadata"].get("done_provenance")!r}'
+        )
+        assert task['metadata']['duplicate_check_required'] is False, (
+            f'Expected the unknown-key patch to land; got: '
+            f'{task["metadata"].get("duplicate_check_required")!r}'
+        )
+        assert task['metadata']['540_status'] == 'cancelled', (
+            f'Expected the unknown-key patch to land; got: '
+            f'{task["metadata"].get("540_status")!r}'
+        )
+
+        # SECONDARY guard rail (green before and after — regression guard,
+        # not the RED signal): a patch that ITSELF touches done_provenance
+        # with a still-invalid value, alongside an unknown key, is still
+        # rejected. Per task 2201's unconditional write-authority floor
+        # (see test_update_task_tolerates_untouched_invalid_done_provenance
+        # part (b)), ANY incoming metadata containing a done_provenance key
+        # is rejected with DoneProvenanceWriteAuthorityError before schema
+        # validation ever runs — so this is not a ValidationError.
+        with pytest.raises(DoneProvenanceWriteAuthorityError):
+            await backend.update_task(
+                dto['id'], project_root=project_root,
+                metadata=json.dumps({
+                    'done_provenance': {'commit': 'x'},
+                    'duplicate_check_required': True,
+                }),
+            )
+    finally:
+        await backend.close()
+
+
+@pytest.mark.asyncio
+async def test_update_task_unknown_key_patch_still_rejects_invalid_known_field(
+    tmp_path, project_root,
+):
+    """An unknown key in the SAME patch must not mask a genuinely-fatal
+    warning on a different incoming KNOWN field (task 2405 regression guard).
+
+    Task 2405's fix narrows ``should_reraise`` to ignore ``unknown_key``
+    warnings on incoming keys — but ``unknown_key`` must be the ONLY code
+    suppressed. This test pins that down: the patch carries an out-of-enum
+    ``task_kind`` (a KNOWN ``TaskMetadata`` field, producing an
+    ``invalid_field`` warning — a genuinely fatal code) alongside an
+    unrelated unknown key (``duplicate_check_required``, producing a
+    non-fatal ``unknown_key`` warning). If a future change widened
+    ``_NON_FATAL_WRITE_WARNING_CODES`` too far, or the ``and w.code not in
+    ...`` conjunct in ``_validate_metadata_on_write`` regressed to an ``or``,
+    this would silently disable per-field enforcement — this test fails
+    first.
+    """
+    cfg = TaskmasterConfig(project_root=str(tmp_path))
+    backend = SqliteTaskBackend(cfg, task_metadata_enforce=True)
+    await backend.start()
+    try:
+        dto = await backend.add_task(
+            project_root=project_root, title='t',
+            metadata=json.dumps({'foo': 'bar'}),
+        )
+
+        with pytest.raises(ValidationError):
+            await backend.update_task(
+                dto['id'], project_root=project_root,
+                metadata=json.dumps({
+                    'task_kind': 'bogus_kind',
+                    'duplicate_check_required': True,
+                }),
+                metadata_mode='merge',
+            )
+
+        task = await backend.get_task(dto['id'], project_root=project_root)
+        assert task['metadata'] == {'foo': 'bar'}, (
+            f'Expected the rejected txn to leave metadata unchanged; got: {task["metadata"]}'
+        )
+    finally:
+        await backend.close()
+
+
 # ── read-path tolerance + collapse (task 2162, step-9/10) ─────────────
 
 
