@@ -3988,6 +3988,67 @@ class TestBriefingKnownGapsRefresh:
         assert getattr(warning_records[0], 'task_id', None) == '1751'
 
     # ------------------------------------------------------------------ #
+    # _queue_briefing_refresh_tasks — candidate_key dedup (task 2402)       #
+    # ------------------------------------------------------------------ #
+
+    @pytest.mark.asyncio
+    async def test_queue_refresh_tasks_treats_duplicate_candidate_key_as_skipped_dedup(
+        self, caplog,
+    ):
+        """add_task raises DuplicateCandidateKeyError -> task_id lands in
+        skipped (NOT failed) -- a candidate_key collision is a successful
+        dedup (PRD decision #3), not a failure. A dedup log line naming the
+        surviving existing_id is emitted instead of the generic
+        briefing_refresh_add_task_failed warning.
+        """
+        from fused_memory.backends.task_backend_errors import DuplicateCandidateKeyError
+
+        taskmaster = AsyncMock()
+        # No pending-title match -- the local exact-title pre-check must not
+        # short-circuit before add_task is even attempted.
+        taskmaster.get_tasks.return_value = {'tasks': []}
+        taskmaster.add_task.side_effect = DuplicateCandidateKeyError(
+            existing_id=42, existing_status='pending', tag='master', candidate_key='abc123',
+        )
+
+        mismatches = [{'task_id': '1751', 'title': 'Foo', 'subproject': 'bar', 'what': 'gap'}]
+
+        with caplog.at_level(
+            logging.INFO,
+            logger='fused_memory.reconciliation.stages.task_knowledge_sync',
+        ):
+            result = await _queue_briefing_refresh_tasks(taskmaster, ProjectRoot('/tmp/p'), mismatches)
+
+        assert result['skipped'] == ['1751'], (
+            f"expected the collision folded into skipped, got {result['skipped']!r}"
+        )
+        assert result['failed'] == [], (
+            f"a candidate_key collision must not count as failed, got {result['failed']!r}"
+        )
+        assert result['created'] == []
+
+        our_records = [
+            r for r in caplog.records
+            if r.name == 'fused_memory.reconciliation.stages.task_knowledge_sync'
+        ]
+        failed_warnings = [
+            r for r in our_records
+            if r.levelno == logging.WARNING and 'briefing_refresh_add_task_failed' in r.getMessage()
+        ]
+        assert failed_warnings == [], (
+            f'must not emit the generic failure warning on a dedup collision; got {failed_warnings}'
+        )
+        dedup_records = [
+            r for r in our_records
+            if 'briefing_refresh_add_task_deduped' in r.getMessage()
+        ]
+        assert len(dedup_records) == 1, (
+            f'expected exactly one dedup log record; got {our_records}'
+        )
+        assert getattr(dedup_records[0], 'task_id', None) == '1751'
+        assert getattr(dedup_records[0], 'existing_id', None) == 42
+
+    # ------------------------------------------------------------------ #
     # _queue_briefing_refresh_tasks — unexpected-shape (contract-drift)     #
     # ------------------------------------------------------------------ #
 
