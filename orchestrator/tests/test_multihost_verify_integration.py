@@ -1288,6 +1288,7 @@ class TestUnreachableHostCapstone:
             InflightEntry,
             InflightStatus,
             InflightVerifyResult,
+            ItemLifecycleState,
             MergeRequest,
             RealMergeItem,
         )
@@ -1331,6 +1332,12 @@ class TestUnreachableHostCapstone:
                 base_sha='base',
                 speculative=False,
             )
+            # task 2169 kappa: production always reaches _finalize_inflight
+            # via the registered DISPATCHING -> VERIFYING dispatch path; an
+            # unregistered entry here would spuriously fire the best-effort
+            # "rejected transition" escalation on every kappa-wired
+            # _note_transition call, polluting this test's L1 escalation count.
+            worker._register_item(item, initial=ItemLifecycleState.VERIFYING)
 
             async def _ru_verify():
                 return InflightVerifyResult(

@@ -4528,6 +4528,7 @@ _LEGAL_TRANSITIONS: dict[ItemLifecycleState, frozenset[ItemLifecycleState]] = {
     ItemLifecycleState.MERGING: frozenset({
         ItemLifecycleState.AWAITING_VERIFY,
         ItemLifecycleState.REDISPATCH_PARKED,
+        ItemLifecycleState.DISPATCHING,
         ItemLifecycleState.TERMINAL,
     }),
     ItemLifecycleState.AWAITING_VERIFY: frozenset({
@@ -4542,12 +4543,15 @@ _LEGAL_TRANSITIONS: dict[ItemLifecycleState, frozenset[ItemLifecycleState]] = {
     ItemLifecycleState.DISPATCHING: frozenset({
         ItemLifecycleState.VERIFYING,
         ItemLifecycleState.REDISPATCH_PARKED,
+        ItemLifecycleState.QUEUED,
+        ItemLifecycleState.MERGING,
         ItemLifecycleState.TERMINAL,
     }),
     ItemLifecycleState.VERIFYING: frozenset({
         ItemLifecycleState.GATE_REVERIFY,
         ItemLifecycleState.FINALIZING,
         ItemLifecycleState.MERGING,
+        ItemLifecycleState.QUEUED,
         ItemLifecycleState.TERMINAL,
     }),
     ItemLifecycleState.GATE_REVERIFY: frozenset({
@@ -4559,6 +4563,7 @@ _LEGAL_TRANSITIONS: dict[ItemLifecycleState, frozenset[ItemLifecycleState]] = {
     ItemLifecycleState.FINALIZING: frozenset({
         ItemLifecycleState.TERMINAL,
         ItemLifecycleState.MERGING,
+        ItemLifecycleState.GATE_REVERIFY,
     }),
     ItemLifecycleState.TERMINAL: frozenset(),
 }
@@ -4578,12 +4583,163 @@ redispatch bounce, DISPATCHING<->REDISPATCH_PARKED) and ``_remerging_item``
 (the cascade remerge, VERIFYING/GATE_REVERIFY/FINALIZING -> MERGING ->
 REDISPATCH_PARKED).
 
+MQ-reliability kappa (task 2169) adds two further backward edges,
+DISPATCHING -> QUEUED and VERIFYING -> QUEUED, for the three
+``_queue.put_nowait(req)`` re-arm sites that put an in-flight request BACK
+on the external input queue with its request_id and result Future intact
+(operator-halt pre-dispatch requeue in ``_dispatch_item``, operator-halt
+mid-verify requeue in ``_run_inflight_verify``, and the head-failure
+cascade's downstream self-requeue in the verifier loop) — see
+:meth:`SpeculativeMergeWorker._note_requeue`. Unlike the forward edges
+above, these three sites are wired via the dynamic-current-state helper
+rather than a hardcoded *from_state*, so a registered item legally lands
+back at QUEUED regardless of which of the two states it was requeued from.
+
+kappa also adds the DISPATCHING <-> MERGING pair for the dispatch-time
+staleness/chain-invalidation remerge inside ``_dispatch_item`` (Mechanism 2):
+an item already transitioned to DISPATCHING at the verifier's dispatch call
+site discovers its base is stale, is recorded at MERGING for the duration of
+the (pre-existing, ``_remerging_item``-tracked) ``_remerge()`` call, then
+moves back to DISPATCHING once ``_remerge()`` returns — either to fall
+through to a passthrough outcome (-> TERMINAL, wired by a later step) or to
+proceed to a normal host-acquire + verify dispatch (-> VERIFYING via
+``_inflight_append``). This is a DIFFERENT remerge window than the
+VERIFYING/GATE_REVERIFY/FINALIZING -> MERGING head-failure cascade documented
+above — that one never revisits DISPATCHING, it re-enters via
+``_redispatch`` (-> REDISPATCH_PARKED) for a fresh dispatch attempt instead.
+
+kappa also adds FINALIZING -> GATE_REVERIFY. ``_finalize_inflight`` sets the
+registry to FINALIZING unconditionally at entry (mirroring its own
+``entry.phase = 'finalizing'`` set BEFORE the CAS loop's first
+``advance_main`` attempt), so a same-call ``rebased_pending_reverify`` result
+moves the registry FINALIZING -> GATE_REVERIFY, not VERIFYING ->
+GATE_REVERIFY (the latter edge, above, models a *fresh* dispatch that lands
+directly on a gate re-verify with no intervening finalize attempt — not
+exercised by current wiring, but kept for symmetry / future call sites).
+Both edges coexist without conflict since ``ItemLifecycle.transition``
+validates the caller's *from_state* against the registry's actual current
+state independently of which edge licenses the move.
+
 TERMINAL is absorbing (empty out-set): conflict auto-chain regeneration
 mints a NEW request_id for the regenerated attempt
 (``_maybe_auto_chain_generation``), so a request's lifecycle is always
 forward-to-TERMINAL under its OWN id — a "restart" is a different registry
 key entirely, never a backward edge on this one.
 """
+
+
+def _request_id_of(obj: MergeRequest | SpeculativeItem | InflightEntry) -> str:
+    """Return the stable request_id for *obj* (merge-queue-reliability PRD
+    scope-4 kappa / task 2169).
+
+    ``SpeculativeMergeWorker._live_items`` holds three different shapes
+    across a request's pipeline lifetime — a :class:`MergeRequest`
+    pre-merge, a :class:`SpeculativeItem` (``RealMergeItem | DecidedItem``)
+    in-flight to the verifier, an :class:`InflightEntry` once dispatched —
+    all keyed by the SAME request_id, so ``_register_item``/``_note_transition``
+    callers can pass whichever shape they are currently holding without a
+    per-call-site type check.
+    """
+    if isinstance(obj, InflightEntry):
+        return obj.item.request.request_id
+    if isinstance(obj, MergeRequest):
+        return obj.request_id
+    return obj.request.request_id
+
+
+_LIFECYCLE_TRANSITION_REJECTED_SENTINEL_PREFIX = '__merge_lifecycle_transition_rejected__'
+
+
+def _lifecycle_transition_rejected_sentinel(request_id: str) -> str:
+    """Return the per-request dedup sentinel task_id for rejected-transition alarms."""
+    return f'{_LIFECYCLE_TRANSITION_REJECTED_SENTINEL_PREFIX}{request_id}'
+
+
+def _alarm_illegal_lifecycle_transition(
+    escalation_queue: Any,
+    request_id: str,
+    from_state: ItemLifecycleState,
+    to_state: ItemLifecycleState,
+    exc: IllegalLifecycleTransition,
+    *,
+    event_store: Any = None,
+) -> None:
+    """Submit a dedup'd L1 escalation for a rejected :class:`ItemLifecycle`
+    transition (merge-queue-reliability PRD scope-4 kappa / task 2169).
+
+    Modeled verbatim on
+    :func:`orchestrator.merge_request_ledger._alarm_merge_request_stuck`.
+    Fires at most ONCE per open episode per request_id (dedup'd via
+    ``has_open_l1``). Called by :meth:`SpeculativeMergeWorker._note_transition`
+    when a wired put/pop call site's belief about an item's lifecycle state
+    disagrees with the registry — a wiring-bug signal, not itself a merge
+    failure. OBSERVATION + ESCALATION only: never mutates queue/inflight
+    state or halts the pipeline (PRD design decision 4: invariants escalate
+    loudly, degrade never).
+
+    * ``level=1`` (L1 blocking).
+    * ``category='merge_lifecycle_transition_rejected'``
+    * ``task_id=_lifecycle_transition_rejected_sentinel(request_id)``
+
+    None-safe: returns immediately when *escalation_queue* is None.
+    Dedup: returns immediately when an open L1 already exists for the sentinel.
+    """
+    if escalation_queue is None:
+        return
+
+    sentinel = _lifecycle_transition_rejected_sentinel(request_id)
+
+    # Dedup: don't re-alarm while an open L1 already exists for this request.
+    if escalation_queue.has_open_l1(sentinel):
+        return
+
+    from escalation.models import Escalation  # local import — escalation optional dep
+
+    summary = (
+        f'ItemLifecycle rejected a transition for request_id {request_id!r}: '
+        f'{from_state!r} -> {to_state!r}'
+    )
+    detail = (
+        f'request_id: {request_id}\n'
+        f'attempted transition: {from_state!r} -> {to_state!r}\n'
+        f'ItemLifecycle.transition() error: {exc}\n'
+        '\n'
+        'A wired put/pop call site disagreed with the ItemLifecycle registry '
+        '(unregistered request_id, an edge outside _LEGAL_TRANSITIONS, or a '
+        'stale from_state belief). The registry state was left UNCHANGED and '
+        'no pipeline state was mutated (PRD design decision 4: invariants '
+        'escalate loudly, degrade never) — this is a wiring-bug signal, not '
+        'itself a merge failure.'
+    )
+
+    esc = Escalation(
+        id=escalation_queue.make_id(sentinel),
+        task_id=sentinel,
+        agent_role='orchestrator-merge-lifecycle-monitor',
+        severity='blocking',
+        level=1,
+        category='merge_lifecycle_transition_rejected',
+        summary=summary,
+        detail=detail,
+        suggested_action=(
+            f'Inspect the ItemLifecycle wiring for request_id {request_id!r} '
+            f'around the {from_state!r} -> {to_state!r} call site; the '
+            'registry and the actual pipeline state have diverged.'
+        ),
+    )
+    escalation_queue.submit(esc)
+
+    if event_store is not None:
+        from orchestrator.event_store import EventType
+
+        event_store.emit(
+            EventType.escalation_created,
+            data={
+                'request_id': request_id,
+                'from_state': str(from_state),
+                'to_state': str(to_state),
+            },
+        )
 
 
 class SpeculativeMergeWorker(_WipHaltMixin):
@@ -4909,6 +5065,18 @@ class SpeculativeMergeWorker(_WipHaltMixin):
         self._verifier_task: asyncio.Task | None = None
         self._heartbeat_task: asyncio.Task | None = None
         self._reprobe_task: asyncio.Task | None = None
+        # MQ-reliability kappa (task 2169): single source of truth for every
+        # in-flight item's lifecycle state, keyed by request_id (see
+        # ItemLifecycle's docstring above). Wired at every put/pop chokepoint
+        # by _register_item/_note_transition/_retire_item below. Lockstep
+        # `_live_items` holds the actual rich object (MergeRequest |
+        # SpeculativeItem | InflightEntry) for each non-terminal request_id —
+        # the registry alone only stores request_id -> ItemLifecycleState, but
+        # snapshot()/occupancy/verify_in_progress need the rich object, so the
+        # two are mutated together at the same chokepoints and can never
+        # disagree on membership.
+        self._lifecycle = ItemLifecycle()
+        self._live_items: dict[str, MergeRequest | SpeculativeItem | InflightEntry] = {}
         # In-flight request being processed by the merger loop. Set after
         # dequeue, cleared after the SpeculativeItem is pushed to the verifier
         # queue. Used by stop() to resolve Futures for requests that were
@@ -5157,6 +5325,118 @@ class SpeculativeMergeWorker(_WipHaltMixin):
         # dedup'd L1 escalation (_alarm_resource_audit) fires. See
         # _check_resource_audit for the full contract.
         self._resource_audit_violation_streak: int = 0
+
+    # ── MQ-reliability kappa (task 2169): ItemLifecycle chokepoint helpers ──
+    # register/transition/retire an item's lifecycle state + the lockstep
+    # `_live_items` object index in ONE place each, so every put/pop wiring
+    # site below calls one of these three rather than touching
+    # self._lifecycle/self._live_items directly.
+
+    def _register_item(
+        self,
+        obj: MergeRequest | SpeculativeItem | InflightEntry,
+        initial: ItemLifecycleState = ItemLifecycleState.QUEUED,
+    ) -> str:
+        """Register *obj* in the lifecycle registry at *initial* and index it
+        in ``_live_items`` by request_id.
+
+        Returns the request_id for convenience at call sites that need it
+        right after registering. Raises ``ValueError`` if *obj*'s request_id
+        is already registered — a genuine duplicate-register programming
+        error (see :meth:`ItemLifecycle.register`'s docstring), NOT wrapped
+        in the best-effort-loud handling :meth:`_note_transition` uses for
+        edge violations: there is no legal way to recover from registering
+        the same in-flight attempt twice.
+        """
+        rid = _request_id_of(obj)
+        self._lifecycle.register(rid, initial=initial)
+        self._live_items[rid] = obj
+        return rid
+
+    def _note_transition(
+        self,
+        request_id: str,
+        from_state: ItemLifecycleState,
+        to_state: ItemLifecycleState,
+        *,
+        live_obj: MergeRequest | SpeculativeItem | InflightEntry | None = None,
+    ) -> None:
+        """Best-effort-loud wrapper around :meth:`ItemLifecycle.transition`.
+
+        NEVER raises — merge_queue.py is the #1-reliability file, and a
+        mis-wired call site must never wedge the merger/verifier hot path
+        (PRD design decision 4: invariants escalate loudly, degrade never).
+        ``IllegalLifecycleTransition`` (unregistered request_id, an edge
+        outside ``_LEGAL_TRANSITIONS``, or a stale *from_state* belief) is
+        caught, logged at WARNING, and reported via a dedup'd L1 escalation
+        (:func:`_alarm_illegal_lifecycle_transition`) instead of propagating.
+        The registry state is left UNCHANGED on rejection (same contract as
+        the wrapped ``transition()`` call).
+
+        *live_obj*, when given, replaces ``_live_items[request_id]`` — used
+        by call sites where the transition also changes the item's shape
+        (e.g. a ``MergeRequest`` becoming a ``SpeculativeItem`` at merge
+        time). Only applied on a SUCCESSFUL transition; omitted (``None``,
+        the default) when the caller's existing ``_live_items`` entry is
+        still the correct object (e.g. an in-place ``InflightEntry.phase``
+        mutation) or the object isn't tracked yet.
+        """
+        try:
+            self._lifecycle.transition(request_id, from_state, to_state)
+        except IllegalLifecycleTransition as exc:
+            logger.warning(
+                'ItemLifecycle: rejected transition for request_id=%s (%s -> %s): %s',
+                request_id, from_state, to_state, exc,
+            )
+            _alarm_illegal_lifecycle_transition(
+                self._escalation_queue, request_id, from_state, to_state, exc,
+                event_store=self._event_store,
+            )
+            return
+        if live_obj is not None:
+            self._live_items[request_id] = live_obj
+
+    def _retire_item(self, request_id: str) -> None:
+        """Best-effort transition *request_id* to TERMINAL then drop it from
+        ``_live_items``.
+
+        Safe to call on an already-TERMINAL or unregistered request_id —
+        both are treated as nothing-left-to-retire (no :meth:`_note_transition`
+        call) and the ``_live_items`` pop always runs so a stale reference is
+        never leaked either way.
+        """
+        current = self._lifecycle.current(request_id)
+        if current is not None and current != ItemLifecycleState.TERMINAL:
+            self._note_transition(request_id, current, ItemLifecycleState.TERMINAL)
+        self._live_items.pop(request_id, None)
+
+    def _note_requeue(
+        self,
+        request_id: str,
+        live_obj: MergeRequest | SpeculativeItem | InflightEntry | None = None,
+    ) -> None:
+        """Best-effort transition *request_id* back to QUEUED at a requeue site
+        (operator-halt abort-poll, pre-dispatch operator-halt, cascade
+        downstream self-requeue — MQ-reliability kappa / task 2169).
+
+        Reads the CURRENT registry state dynamically rather than a
+        hardcoded *from_state*: these three sites sit downstream of the
+        VERIFYING/DISPATCHING wiring landed by kappa's later steps, so
+        during the additive rollout window the true current state may
+        still be an earlier stage (e.g. AWAITING_VERIFY). No-ops silently
+        (no :meth:`_note_transition` call, hence no WARNING/escalation)
+        when *request_id* is unregistered — unlike the drain/pop
+        chokepoints, an unregistered rid here is NOT itself a wiring-bug
+        signal: several existing narrow unit tests exercise these requeue
+        branches by constructing an item directly (bypassing the normal
+        drain chokepoint), e.g.
+        test_merge_queue_request_liveness.py::TestOperatorHaltRequeueNoFalseAlarm,
+        which asserts zero escalations for exactly this call pattern.
+        """
+        current = self._lifecycle.current(request_id)
+        if current is None:
+            return
+        self._note_transition(request_id, current, ItemLifecycleState.QUEUED, live_obj=live_obj)
 
     # ── δ=1988 SuffixConflictTracker delegation ─────────────────────────────
     # Data-descriptor properties forwarding the original attribute names to
@@ -5497,9 +5777,33 @@ class SpeculativeMergeWorker(_WipHaltMixin):
 
         Fail-open: store errors are logged and never propagate so a broken
         journal never stalls the merge pipeline.
+
+        MQ-reliability kappa (task 2169): this is the worker's first sighting
+        of *item* for a FRESH request — its three callers
+        (``_drain_queue_into_lanes``, ``_acquire_next_request``'s harvest
+        branch, and the merger loop's look-ahead harvest) all pull an item
+        straight off the external ``_queue``/``_pending_get``. That item is
+        USUALLY a brand-new request_id, but it may also be a request
+        previously put back on ``_queue`` by a requeue site
+        (:meth:`_note_requeue` — operator-halt / cascade self-requeue),
+        which leaves it registered at QUEUED rather than removing it
+        (:class:`ItemLifecycle` has no deregister op). Registers only when
+        the request_id is not already tracked; an already-tracked rid skips
+        straight to the QUEUED -> LANE_BUFFERED transition below instead of
+        re-``register()``-ing, which would raise ``ValueError`` on the live
+        duplicate (:meth:`ItemLifecycle.register`'s precondition). Either
+        way, the item ends up seeded/confirmed at QUEUED then immediately
+        transitioned to LANE_BUFFERED, matching this method's own
+        postcondition (the item is now sitting in a lane buffer).
         """
         lane = _normalize_lane(item.lane)
         self._assert_single_writer(self._merger_task, '_lane_buffers')
+        rid = item.request_id
+        if self._lifecycle.current(rid) is None:
+            self._register_item(item, initial=ItemLifecycleState.QUEUED)
+        self._note_transition(
+            rid, ItemLifecycleState.QUEUED, ItemLifecycleState.LANE_BUFFERED, live_obj=item,
+        )
         self._lane_buffers[lane].append(item)
 
         if self._merge_store is not None:
@@ -5600,6 +5904,18 @@ class SpeculativeMergeWorker(_WipHaltMixin):
 
         Returns None when every non-empty lane is halted or all buffers are
         empty.  Pure/synchronous so unit tests run without an event loop.
+
+        MQ-reliability kappa (task 2169): every item in ``_lane_buffers`` got
+        there via ``_buffer_owned_request`` (fresh drain) or the coalesce
+        QUEUE SURGERY (``_maybe_coalesce_waiting_singles``'s GroupMergeRequest,
+        registered directly at LANE_BUFFERED) — both leave the registry at
+        LANE_BUFFERED, so a pop here is always a LANE_BUFFERED->MERGING
+        transition. This is the ONLY place that pops ``_lane_buffers``
+        (``_acquire_next_request``'s regular pick and the merger loop's
+        speculative look-ahead both call this method), so wiring the
+        transition here — rather than at each caller — covers both paths in
+        one chokepoint; by the time either caller's ``_inflight_req = req``
+        assignment runs, the registry already reads MERGING for *req*.
         """
         graph = self._suffix_conflict_graph
         for lane in MERGE_LANES:  # high → normal
@@ -5624,11 +5940,20 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                            if item.request_id in neighbors):
                     self._assert_single_writer(self._merger_task, '_lane_buffers')
                     del buf[i]
+                    self._note_transition(
+                        x.request_id, ItemLifecycleState.LANE_BUFFERED, ItemLifecycleState.MERGING,
+                        live_obj=x,
+                    )
                     return x
             # Defensive fallback (unreachable: the aging-minimal item is always
             # minimal by the above criterion, so the loop always returns).
             self._assert_single_writer(self._merger_task, '_lane_buffers')
-            return buf.popleft()
+            popped = buf.popleft()
+            self._note_transition(
+                popped.request_id, ItemLifecycleState.LANE_BUFFERED, ItemLifecycleState.MERGING,
+                live_obj=popped,
+            )
+            return popped
         return None
 
     # ── ε=1890 frozen-prefix / verify-frontier partition ─────────────────────
@@ -7358,13 +7683,24 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                 req = self._lane_buffers[lane].popleft()
                 if not req.result.done():
                     req.result.set_result(shutdown)
+                # MQ-reliability kappa (task 2169): stop() is a genuine last-
+                # container exit for this request_id — retire unconditionally
+                # (even if the Future was already done) or it leaks forever.
+                self._retire_item(req.request_id)
 
         # Drain main queue (items not yet drained into lane buffers)
         while not self._queue.empty():
             try:
                 req = self._queue.get_nowait()
-                if req is not None and not req.result.done():
-                    req.result.set_result(shutdown)
+                # MQ-reliability kappa (task 2169): req may be the shutdown
+                # sentinel itself (None) — guard before touching request_id.
+                # A raw-queue item may also be genuinely pre-registry (never
+                # drained); _retire_item is a documented no-op for an
+                # unregistered request_id either way.
+                if req is not None:
+                    if not req.result.done():
+                        req.result.set_result(shutdown)
+                    self._retire_item(req.request_id)
             except asyncio.QueueEmpty:
                 break
 
@@ -7395,6 +7731,9 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                             )
                     if not _harvested.request.result.done():
                         _harvested.request.result.set_result(shutdown)
+                    # MQ-reliability kappa (task 2169): last sighting of this
+                    # request_id — retire it.
+                    self._retire_item(_harvested.request.request_id)
             elif not _pvg.done():
                 _pvg.cancel()
 
@@ -7413,6 +7752,9 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                             await self._cleanup_owned_merge_worktree(_item_wt)
                     if not item.request.result.done():
                         item.request.result.set_result(shutdown)
+                    # MQ-reliability kappa (task 2169): retire — this item
+                    # never proceeds past AWAITING_VERIFY once drained here.
+                    self._retire_item(item.request.request_id)
             except asyncio.QueueEmpty:
                 break
 
@@ -7426,6 +7768,10 @@ class SpeculativeMergeWorker(_WipHaltMixin):
             _ie_req = _ie.item.request
             if not _ie_req.result.done():
                 _ie_req.result.set_result(shutdown)
+            # MQ-reliability kappa (task 2169): retire — this entry never
+            # reaches its own FINALIZING/TERMINAL transition once stop()
+            # short-circuits it here.
+            self._retire_item(_ie_req.request_id)
             if _ie.verify_task is not None and not _ie.verify_task.done():
                 # Fire remote cancel BEFORE task.cancel() so the remote
                 # verify-merge process is signalled while _inflight_request_id
@@ -7461,6 +7807,9 @@ class SpeculativeMergeWorker(_WipHaltMixin):
             _rd = self._redispatch.popleft()
             if not _rd.request.result.done():
                 _rd.request.result.set_result(shutdown)
+            # MQ-reliability kappa (task 2169): retire — parked awaiting
+            # re-dispatch, never reaches DISPATCHING again once dropped here.
+            self._retire_item(_rd.request.request_id)
             _rd_wt = item_merge_wt(_rd)
             if _rd_wt is not None:
                 with contextlib.suppress(BaseException):
@@ -7496,6 +7845,8 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                             await self._cleanup_owned_merge_worktree(_item_wt)
                     if not item.request.result.done():
                         item.request.result.set_result(shutdown)
+                    # MQ-reliability kappa (task 2169): retire.
+                    self._retire_item(item.request.request_id)
             except asyncio.QueueEmpty:
                 break
 
@@ -7507,8 +7858,13 @@ class SpeculativeMergeWorker(_WipHaltMixin):
         while not self._queue.empty():
             try:
                 req_post = self._queue.get_nowait()
-                if req_post is not None and not req_post.result.done():
-                    req_post.result.set_result(shutdown)
+                # MQ-reliability kappa (task 2169): guard against the None
+                # shutdown sentinel (already put on _queue above) before
+                # touching request_id — mirrors the first-pass drain's guard.
+                if req_post is not None:
+                    if not req_post.result.done():
+                        req_post.result.set_result(shutdown)
+                    self._retire_item(req_post.request_id)
             except asyncio.QueueEmpty:
                 break
 
@@ -7931,6 +8287,13 @@ class SpeculativeMergeWorker(_WipHaltMixin):
             mark_member_done=callbacks.mark_member_done,
             redrive_member=callbacks.redrive_member,
         )
+        # MQ-reliability kappa (task 2169): group_req is a brand-new
+        # request_id (GroupMergeRequest.request_id auto-generated at
+        # construction, merge_types.py) that never passed through the
+        # `_queue` drain, so it has no QUEUED registry entry to transition
+        # from — register it directly at LANE_BUFFERED, matching the QUEUE
+        # SURGERY below that places it straight into a lane buffer.
+        self._register_item(group_req, initial=ItemLifecycleState.LANE_BUFFERED)
 
         # QUEUE SURGERY: rebuild _lane_buffers['normal'] preserving FIFO order for
         # non-survivor + ejected solos, then append the new train at the tail.
@@ -7953,6 +8316,13 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                 s_req.result.set_result(
                     MergeOutcome('superseded', superseded_by=train_id)
                 )
+            # MQ-reliability kappa (task 2169): each absorbed single's OWN
+            # request_id is a genuine terminal exit here — it never proceeds
+            # past coalescing under its own id (the new GroupMergeRequest is
+            # a separate, already-registered request_id) — so retire it
+            # unconditionally, mirroring _resolve_or_drop_abandoned's
+            # always-retire semantics.
+            self._retire_item(s_req.request_id)
 
         # EMIT train_coalesced lifecycle event.
         _emit_train_event(
@@ -8098,6 +8468,13 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                 self._request_ledger.on_dequeue(req, now=time.time())
 
                 self._inflight_req = req  # track for stop() race resolution
+                # MQ-reliability kappa (task 2169): no separate registry
+                # transition needed here — `req` always came from a
+                # `_pop_next_pickable()` pop (either just now via
+                # `_acquire_next_request()`, or on a prior iteration via the
+                # speculative look-ahead), which already transitioned it to
+                # MERGING and indexed it in `_live_items`. By construction
+                # the registry already agrees with this transient field.
                 # ι=1894: stash main_position for this request so
                 # _note_conflict_detected can compute drift later.
                 self._note_merge_started(req.request_id)
@@ -8110,6 +8487,11 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                     # ι=1894 amend: drop stashed drift base — request retired without
                     # landing or conflict detection, so it would otherwise leak forever.
                     self._drift_base.pop(req.request_id, None)
+                    # MQ-reliability kappa (task 2169): this request never
+                    # proceeds past MERGING — retire it here or it leaks in
+                    # the registry forever (no Future is ever resolved on
+                    # this path; the waiter already cancelled it).
+                    self._retire_item(req.request_id)
                     continue
                 if self._event_store is not None:
                     self._event_store.emit(
@@ -8199,16 +8581,21 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                                         'raised unexpectedly — members may remain stranded',
                                         req.train_id,
                                     )
-                        await self._verifier_queue.put(DecidedItem(
+                        _train_decided_item = DecidedItem(
                             request=req,
                             base_sha=actual_main, speculative=False,
                             immediate_outcome=outcome,
                             started_monotonic=t0,
-                        ))
+                        )
+                        await self._verifier_queue.put(_train_decided_item)
                         # Train is put with speculative=False so the verifier
                         # will NOT release the slot on drain.  Release explicitly
                         # if the train was prefetched as a speculative item.
                         self._speculation_controller.on_abort()
+                        self._note_transition(
+                            req.request_id, ItemLifecycleState.MERGING,
+                            ItemLifecycleState.AWAITING_VERIFY, live_obj=_train_decided_item,
+                        )
                         self._inflight_req = None
                         continue
 
@@ -8252,6 +8639,10 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                         # verifier see permit=None and silently skip the
                         # release, leaking the token in ledger.live forever.
                         _decided_item.permit = self._speculation_controller.on_transfer_terminal()
+                        self._note_transition(
+                            req.request_id, ItemLifecycleState.MERGING,
+                            ItemLifecycleState.AWAITING_VERIFY, live_obj=_decided_item,
+                        )
                         self._inflight_req = None
                         continue
 
@@ -8305,6 +8696,10 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                         # verifier see permit=None and silently skip the
                         # release, leaking the token in ledger.live forever.
                         _decided_item.permit = self._speculation_controller.on_transfer_terminal()
+                        self._note_transition(
+                            req.request_id, ItemLifecycleState.MERGING,
+                            ItemLifecycleState.AWAITING_VERIFY, live_obj=_decided_item,
+                        )
                         self._inflight_req = None
                         continue
 
@@ -8420,6 +8815,10 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                     # ledger.live forever — same hazard as the
                     # on_transfer_terminal() sites above.
                     _real_item.permit = self._speculation_controller.on_transfer()
+                    self._note_transition(
+                        req.request_id, ItemLifecycleState.MERGING,
+                        ItemLifecycleState.AWAITING_VERIFY, live_obj=_real_item,
+                    )
                     self._inflight_req = None  # item is now owned by verifier
 
                     # ── Speculative look-ahead (depth-K cap) ──────────────────
@@ -8578,8 +8977,21 @@ class SpeculativeMergeWorker(_WipHaltMixin):
         via ``self._verifier_task`` before mutating — the single choke point
         every ``_verifier_loop`` append site routes through, mirroring
         ``_buffer_owned_request`` on the merger side.
+
+        MQ-reliability kappa (task 2169): both append call sites only reach
+        here for a REAL dispatch (``entry.verify_task`` is not None —
+        passthrough entries finalize inline instead, never appending), and
+        both call sites already transitioned the item to DISPATCHING right
+        before calling ``_dispatch_item``, so this is always a
+        DISPATCHING -> VERIFYING move. Single chokepoint covers both the
+        DISPATCH-FILL and blocking-get call sites, mirroring
+        ``_buffer_owned_request``'s single-chokepoint precedent.
         """
         self._assert_single_writer(self._verifier_task, '_inflight')
+        self._note_transition(
+            entry.item.request.request_id, ItemLifecycleState.DISPATCHING,
+            ItemLifecycleState.VERIFYING, live_obj=entry,
+        )
         self._inflight.append(entry)
 
     def _inflight_popleft(self) -> InflightEntry:
@@ -8736,7 +9148,21 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                 # inside _dispatch_item can never leave it stale.  This closes the
                 # I4 speculation-permit census for the whole dispatch-gap window
                 # (the item is off the queue but not yet in self._inflight).
+                #
+                # MQ-reliability kappa (task 2169): the registry mirrors this same
+                # window — AWAITING_VERIFY -> DISPATCHING when `item` came from
+                # `_verifier_queue` (is_from_verifier_queue), REDISPATCH_PARKED ->
+                # DISPATCHING when it came from `_redispatch` — but, unlike the
+                # census-only `_dispatching_item` field, covers BOTH
+                # `_dispatch_item` call sites (this one and the blocking-get one
+                # below), not just this one.
                 try:
+                    self._note_transition(
+                        item.request.request_id,
+                        ItemLifecycleState.AWAITING_VERIFY if is_from_verifier_queue
+                        else ItemLifecycleState.REDISPATCH_PARKED,
+                        ItemLifecycleState.DISPATCHING, live_obj=item,
+                    )
                     self._dispatching_item = item
                     try:
                         entry = await self._dispatch_item(item)
@@ -8764,6 +9190,10 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                     # it to prevent a double-release on re-dispatch.
                     assert isinstance(item, RealMergeItem)
                     item_back = dataclasses.replace(item, cap_permit=None)
+                    self._note_transition(
+                        item_back.request.request_id, ItemLifecycleState.DISPATCHING,
+                        ItemLifecycleState.REDISPATCH_PARKED, live_obj=item_back,
+                    )
                     self._redispatch.appendleft(item_back)
                     fill_done = True
                     break
@@ -8975,6 +9405,9 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                                     # entry so this parked request never ages
                                     # out; the next dequeue re-arms it fresh.
                                     self._request_ledger.on_requeued(_entry_req.request_id)
+                                    # MQ-reliability kappa (task 2169): mirror
+                                    # the re-arm onto the lifecycle registry.
+                                    self._note_requeue(_entry_req.request_id, live_obj=_entry_req)
                                 continue
                             _remerged = await self._remerge(
                                 _entry.item.request,
@@ -9035,8 +9468,31 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                     # Shutdown sentinel with an already-empty queue.
                     return
 
+                # MQ-reliability kappa (task 2169): this branch's `item` is
+                # ALWAYS sourced from `_verifier_queue` (the persistent-getter
+                # harvest above or the direct get() here) — never from
+                # `_redispatch` (checked first, and only reached, in
+                # DISPATCH-FILL above) — so the registry's from_state is
+                # unconditionally AWAITING_VERIFY, unlike the DISPATCH-FILL
+                # call site. This call site previously had no `_dispatching_item`
+                # (census-only field) coverage at all; kappa extends the field
+                # here too (mirroring DISPATCH-FILL) so the legacy census and
+                # the registry/`_live_items` agree on EVERY dispatch, not just
+                # the DISPATCH-FILL one — a single fresh item on an otherwise
+                # idle worker is dispatched from exactly this call site (the
+                # verifier loop is already blocked on the queue get before the
+                # merger's item arrives), so this is the common case, not an
+                # edge case.
                 try:
-                    entry = await self._dispatch_item(item)
+                    self._note_transition(
+                        item.request.request_id, ItemLifecycleState.AWAITING_VERIFY,
+                        ItemLifecycleState.DISPATCHING, live_obj=item,
+                    )
+                    self._dispatching_item = item
+                    try:
+                        entry = await self._dispatch_item(item)
+                    finally:
+                        self._dispatching_item = None
                 except (asyncio.CancelledError, KeyboardInterrupt):
                     raise
                 except BaseException as exc:
@@ -9057,6 +9513,10 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                     # RealMergeItem here (see the DISPATCH-FILL branch above).
                     assert isinstance(item, RealMergeItem)
                     item_back = dataclasses.replace(item, cap_permit=None)
+                    self._note_transition(
+                        item_back.request.request_id, ItemLifecycleState.DISPATCHING,
+                        ItemLifecycleState.REDISPATCH_PARKED, live_obj=item_back,
+                    )
                     self._redispatch.appendleft(item_back)
                     continue
 
@@ -9307,11 +9767,20 @@ class SpeculativeMergeWorker(_WipHaltMixin):
         Synchronous — no ``await`` between the abandonment check and
         ``set_result``, preserving the detach resolution-race guard invariant
         documented at merge_queue.py:2105-2119.
+
+        MQ-reliability kappa (task 2169): this is one of the two unified
+        terminal chokepoints (the other, :meth:`_resolve_and_release`, itself
+        calls this one) — every call site here is delivering a FINAL outcome
+        or recognizing the request was already abandoned, so *req*'s
+        request_id is retired (best-effort TERMINAL + drop from
+        ``_live_items``) unconditionally, covering both branches below.
         """
         if self._request_abandoned(req):
+            self._retire_item(req.request_id)
             return
         if not req.result.done():
             req.result.set_result(outcome)
+        self._retire_item(req.request_id)
 
     async def _resolve_and_release(
         self,
@@ -9404,6 +9873,11 @@ class SpeculativeMergeWorker(_WipHaltMixin):
         This is also the intended hook surface for task eta's liveness-ledger
         'resolved' transition: every _verifier_loop error-resolution path now
         funnels through this one coroutine.
+
+        MQ-reliability kappa (task 2169): retirement (best-effort TERMINAL +
+        drop from ``_live_items``) is NOT duplicated here — it is inherited
+        from the internal :meth:`_resolve_or_drop_abandoned` call below,
+        which every call site of THIS coroutine routes through.
         """
         if isinstance(entry_or_item, InflightEntry):
             item = entry_or_item.item
@@ -9669,6 +10143,9 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                     # pending — remove the ledger entry so this parked request
                     # never ages out; the next dequeue re-arms it fresh.
                     self._request_ledger.on_requeued(req.request_id)
+                    # MQ-reliability kappa (task 2169): mirror the re-arm onto
+                    # the lifecycle registry.
+                    self._note_requeue(req.request_id, live_obj=req)
                     return InflightVerifyResult(
                         outcome=None,
                         merge_wt=None,
@@ -9873,6 +10350,29 @@ class SpeculativeMergeWorker(_WipHaltMixin):
             # Set/clear are structurally symmetric (both inside this try/finally), so a
             # future edit adding a throwing statement before the try cannot leave
             # _finalizing_head permanently stale.
+            #
+            # MQ-reliability kappa (task 2169): mirror the same window onto the
+            # registry — VERIFYING -> FINALIZING — but ONLY for an entry that
+            # actually reaches real finalize work below.  A passthrough entry
+            # (entry.passthrough_outcome is not None) never awaits a verify_task
+            # or runs the CAS loop, and a pre-dispatch sentinel entry
+            # (ABANDONED_PREDISPATCH still sits at DISPATCHING; REQUEUED_PREDISPATCH
+            # was already moved to QUEUED by _dispatch_item's own _note_requeue
+            # call) is likewise never really "finalizing" — transitioning either
+            # to FINALIZING here would be a spurious hop (DISPATCHING/QUEUED ->
+            # FINALIZING is not even a legal edge). Both retire/requeue from
+            # whichever state they actually hold at their own return sites below.
+            if (
+                entry.passthrough_outcome is None
+                and entry.status not in (
+                    InflightStatus.ABANDONED_PREDISPATCH,
+                    InflightStatus.REQUEUED_PREDISPATCH,
+                )
+            ):
+                self._note_transition(
+                    req.request_id, ItemLifecycleState.VERIFYING,
+                    ItemLifecycleState.FINALIZING, live_obj=entry,
+                )
             self._finalizing_head = entry
 
             # ── Pre-dispatch sentinels (abandon / operator-halt) ─────────────────────
@@ -9899,6 +10399,10 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                     entry.passthrough_outcome.status not in ('done', 'already_merged')
                 )
                 _skip_release = True  # passthrough entries have no lease
+                # MQ-reliability kappa (task 2169): passthrough never reaches
+                # FINALIZING (see the guard above) — retire straight from
+                # whatever state it currently holds (DISPATCHING).
+                self._retire_item(req.request_id)
                 return entry.passthrough_outcome.status in ('done', 'already_merged')
 
             # ── Await verify task (if any) ───────────────────────────────────
@@ -9968,8 +10472,24 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                 # so the item is retried before any newer queue arrivals.
                 # The head-failure cascade (fired because this returns False) will
                 # handle any downstream entries still in _inflight.
+                #
+                # MQ-reliability kappa (task 2169): the registry observes
+                # MERGING for the duration of the _remerge() call, then the
+                # re-merged item lands at REDISPATCH_PARKED — it re-enters the
+                # pipeline via _redispatch for a fresh dispatch attempt rather
+                # than returning to FINALIZING/DISPATCHING, mirroring the
+                # downstream head-failure cascade's own remerge-then-redispatch
+                # shape.
+                self._note_transition(
+                    req.request_id, ItemLifecycleState.FINALIZING,
+                    ItemLifecycleState.MERGING, live_obj=entry,
+                )
                 _remerged_ru = await self._remerge(
                     entry.item.request, entry.item.started_monotonic,
+                )
+                self._note_transition(
+                    req.request_id, ItemLifecycleState.MERGING,
+                    ItemLifecycleState.REDISPATCH_PARKED, live_obj=_remerged_ru,
                 )
                 self._redispatch.appendleft(_remerged_ru)
                 return False
@@ -10119,6 +10639,10 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                             f'without SHA fields (task {req.task_id})'
                         )
 
+                    self._note_transition(
+                        req.request_id, ItemLifecycleState.FINALIZING,
+                        ItemLifecycleState.GATE_REVERIFY, live_obj=entry,
+                    )
                     self._verify_phase = 'gate_reverify'
                     entry.phase = 'gate_reverify'
                     gate = await _reverify_rebased_tree(
@@ -10181,6 +10705,10 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                         self._event_store, req.task_id, OutcomeKind.gate_retry,
                         attempt=gate_total,
                         duration_ms=_elapsed_ms(item.started_monotonic),
+                    )
+                    self._note_transition(
+                        req.request_id, ItemLifecycleState.GATE_REVERIFY,
+                        ItemLifecycleState.FINALIZING, live_obj=entry,
                     )
                     self._verify_phase = 'finalizing'
                     entry.phase = 'finalizing'
@@ -10320,6 +10848,12 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                 with contextlib.suppress(BaseException):
                     await self._cleanup_owned_merge_worktree(_abandon_wt)
             self._remerge_occurred = False  # abandon → reset chain flag
+            # MQ-reliability kappa (task 2169): retire at this, the item's
+            # own return site (mirrors the REQUEUED_PREDISPATCH branch's
+            # own _note_requeue call below) — no Future is ever resolved on
+            # this path (the waiter already cancelled it), so retirement is
+            # the only observable exit for this request_id.
+            self._retire_item(req.request_id)
             return InflightEntry(
                 item=item,
                 lease=None,
@@ -10344,6 +10878,9 @@ class SpeculativeMergeWorker(_WipHaltMixin):
             # remove the ledger entry so this parked request never ages out;
             # the next dequeue re-arms it fresh.
             self._request_ledger.on_requeued(req.request_id)
+            # MQ-reliability kappa (task 2169): mirror the re-arm onto the
+            # lifecycle registry.
+            self._note_requeue(req.request_id, live_obj=req)
             self._remerge_occurred = False  # halt → reset chain flag
             return InflightEntry(
                 item=item,
@@ -10460,6 +10997,15 @@ class SpeculativeMergeWorker(_WipHaltMixin):
 
             if remerge_reason is not None:
                 iteration_did_remerge = True
+                # MQ-reliability kappa (task 2169): DISPATCHING -> MERGING for
+                # the duration of this dispatch-time remerge (Mechanism 2) —
+                # see the kappa addendum to _LEGAL_TRANSITIONS' docstring above
+                # this class for why this is a DIFFERENT remerge window than
+                # the VERIFYING/GATE_REVERIFY/FINALIZING head-failure cascade.
+                self._note_transition(
+                    req.request_id, ItemLifecycleState.DISPATCHING,
+                    ItemLifecycleState.MERGING, live_obj=req,
+                )
                 # Set _remerging_item so snapshot() surfaces this request during
                 # the remerge window (item is popped from queue but not yet in
                 # _inflight, so without this it is invisible to all observability).
@@ -10481,6 +11027,16 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                 item = await self._remerge(req, item.started_monotonic)
                 self._remerging_item = None
                 self._verify_item = item
+                # MQ-reliability kappa (task 2169): "then back" — regardless of
+                # whether the re-merged item now falls through to a passthrough
+                # outcome (-> TERMINAL, wired by a later step) or proceeds to a
+                # normal host-acquire + verify dispatch (-> VERIFYING via
+                # _inflight_append below), the remerge itself is over, so the
+                # registry moves back to DISPATCHING immediately.
+                self._note_transition(
+                    req.request_id, ItemLifecycleState.MERGING,
+                    ItemLifecycleState.DISPATCHING, live_obj=item,
+                )
 
                 # After remerge the new item may itself carry an immediate_outcome
                 # (e.g. conflict during remerge, or a train slot).  Return it as a
