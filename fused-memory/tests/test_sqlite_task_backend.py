@@ -2193,11 +2193,15 @@ def _make_v1_schema_db_no_candidate_key(db_path: Path) -> None:
     through the parent_id->flat migration but predates candidate_key.
 
     Rows:
-      id=1: non-cancelled, title='Fix the bug',    files=[a.py, b.py]
-      id=2: non-cancelled, title='fix   the  bug' (extra internal whitespace
-            + different case), files=[b.py, a.py] (swapped order) —
-            normalizes to the SAME candidate_key as id=1 (one duplicate
-            group of size 2).
+      id=1: non-cancelled (pending), title='Fix the bug', files=[a.py, b.py]
+      id=2: non-cancelled (``done``), title='fix   the  bug' (extra internal
+            whitespace + different case), files=[b.py, a.py] (swapped
+            order) — normalizes to the SAME candidate_key as id=1 (one
+            duplicate group of size 2). Status is deliberately ``done``
+            (fm-task-dedup self-heal amendment) so ``_classify_residual_group``
+            flags this group as ``mixed_status`` rather than auto-healing
+            it — the tests seeding this fixture assert the pre-self-heal
+            skip+escalate outcome (user_version stays at 3, no index).
       id=3: CANCELLED, same title+files as id=1 — must NOT backfill/count.
       id=4: non-cancelled, unique title+files — no duplicate.
     """
@@ -2234,7 +2238,7 @@ def _make_v1_schema_db_no_candidate_key(db_path: Path) -> None:
     """)
     rows = [
         (1, 'Fix the bug', 'pending', {'files': ['a.py', 'b.py']}),
-        (2, 'fix   the  bug', 'in-progress', {'files': ['b.py', 'a.py']}),
+        (2, 'fix   the  bug', 'done', {'files': ['b.py', 'a.py']}),
         (3, 'Fix the bug', 'cancelled', {'files': ['a.py', 'b.py']}),
         (4, 'Totally different task', 'pending', {'files': ['z.py']}),
     ]
