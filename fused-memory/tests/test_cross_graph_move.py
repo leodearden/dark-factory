@@ -1151,6 +1151,91 @@ class TestMergeForeignDuplicate:
         assert result.unique_wrong_edge_uuids == {UNIQUE_WRONG_EDGE_UUID_FIXTURE}
 
     @pytest.mark.asyncio
+    async def test_null_fact_embedding_recreates_edge_without_embedding_property(
+        self, mock_config, make_backend, make_graph_mock, monkeypatch,
+    ):
+        """A null/absent fact_embedding on the wrong copy's unique edge is
+        valid real data, not corruption: it is still recreated on the home
+        copy, omitting the fact_embedding property entirely (no vecf32
+        literal) while every other property/param is preserved, the wrong
+        copy is still DETACH-DELETEd LAST (create-before-delete preserved),
+        and the call does NOT raise.
+        """
+        backend = make_backend(mock_config)
+        call_order: list[tuple[str, str, dict]] = []
+
+        wrong_mock = make_graph_mock()
+        wrong_mock.ro_query = AsyncMock(
+            return_value=MagicMock(
+                result_set=[SHARED_EDGE_ROW_FIXTURE, UNIQUE_WRONG_EDGE_ROW_FIXTURE]
+            )
+        )
+
+        async def _record_wrong_query(cypher, params=None):
+            call_order.append(('wrong', cypher, params or {}))
+            return MagicMock()
+
+        wrong_mock.query = AsyncMock(side_effect=_record_wrong_query)
+
+        home_mock = make_graph_mock()
+        home_mock.ro_query = AsyncMock(
+            side_effect=[
+                MagicMock(
+                    result_set=[[SHARED_EDGE_UUID_FIXTURE], [HOME_ONLY_EDGE_UUID_FIXTURE]]
+                ),
+                MagicMock(
+                    result_set=[
+                        [SHARED_EDGE_UUID_FIXTURE],
+                        [HOME_ONLY_EDGE_UUID_FIXTURE],
+                        [UNIQUE_WRONG_EDGE_UUID_FIXTURE],
+                    ]
+                ),
+            ]
+        )
+
+        async def _record_home_query(cypher, params=None):
+            call_order.append(('home', cypher, params or {}))
+            return MagicMock()
+
+        home_mock.query = AsyncMock(side_effect=_record_home_query)
+
+        backend._driver._get_graph = _route_graphs({
+            WRONG_GRAPH_FIXTURE: wrong_mock,
+            HOME_GRAPH_FIXTURE: home_mock,
+        })
+
+        # the unique wrong-copy edge's fact_embedding reads None (null/absent).
+        fake_read_compact = AsyncMock(return_value=None)
+        monkeypatch.setattr(cross_graph_move, '_read_compact_vector', fake_read_compact)
+
+        result = await merge_foreign_duplicate(
+            backend, NODE_UUID_FIXTURE, WRONG_GRAPH_FIXTURE, HOME_GRAPH_FIXTURE,
+        )
+
+        assert len(call_order) == 2
+        create_role, create_cypher, create_params = call_order[0]
+        assert create_role == 'home'
+        assert 'CREATE' in create_cypher
+        assert 'RELATES_TO' in create_cypher
+        assert 'fact_embedding' not in create_cypher
+        assert 'vecf32' not in create_cypher
+        assert create_params.get('edge_uuid') == UNIQUE_WRONG_EDGE_UUID_FIXTURE
+        assert create_params.get('src_uuid') == NODE_UUID_FIXTURE
+        assert create_params.get('dst_uuid') == OTHER_NODE_UUID_FIXTURE
+        assert create_params.get('fact') == 'Alice is related to Carol.'
+
+        # the wrong-graph-copy DETACH DELETE still runs strictly AFTER the
+        # recreate -- create-before-delete preserved for a null-embedding edge.
+        delete_role, delete_cypher, delete_params = call_order[1]
+        assert delete_role == 'wrong'
+        assert 'DETACH DELETE' in delete_cypher
+        assert delete_params.get('uuid') == NODE_UUID_FIXTURE
+
+        assert result.edges_recreated == 1
+        assert result.home_edge_count_before == 2
+        assert result.home_edge_count_after == 3
+
+    @pytest.mark.asyncio
     async def test_home_edge_count_after_is_independent_reread_not_arithmetic(
         self, mock_config, make_backend, make_graph_mock, monkeypatch,
     ):
