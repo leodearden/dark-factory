@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import argparse
 import contextlib
+import fcntl
 import json
 import logging
 import os
@@ -27,7 +28,7 @@ import re
 import shutil
 import sys
 import tempfile
-from collections.abc import Mapping
+from collections.abc import Iterator, Mapping
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from enum import StrEnum
@@ -728,6 +729,49 @@ def set_manual_boost(
     if not write_decision(record, root=root):
         return None
     return record
+
+
+@contextlib.contextmanager
+def decision_id_lock(decision_id: str, root: Path | str | None = None) -> Iterator[None]:
+    """Per-decision-id exclusive advisory lock using a stable sidecar file.
+
+    Mirrors escalation's ``escalation_id_lock`` (escalation/queue.py:24-69,
+    task 1609) near-verbatim, retargeted to the decisions dir.
+
+    WHY A SIDECAR (PRD-D3 rationale, same as 1609): write_decision's writer
+    is atomic tmp+os.replace (_atomic_write_text). After a replace, the data
+    file ``<decisions_dir>/<id>.json`` is a NEW inode. A second writer that
+    flock()s the (new) data-file path binds to a different inode and races
+    anyway -- the lock is defeated. The fix is a STABLE lock target:
+    ``<decisions_dir>/<id>.json.lock``, created once via os.open(O_CREAT)
+    and NEVER renamed or replaced, so all callers flock the same inode and
+    actually serialize.
+
+    Different decision ids resolve to different sidecars (via
+    decision_path_for_id's sanitization), so there is no cross-id
+    contention -- only two callers racing on the SAME id ever block each
+    other.
+
+    Usage::
+
+        with decision_id_lock(decision_id, root=root):
+            record = DecisionRecord.from_json(path.read_text())
+            record.some_field = new_value
+            write_decision(record, root=root)
+    """
+    lock_path = Path(str(decision_path_for_id(decision_id, root=root)) + '.lock')
+    # Defensively create the parent dir so a caller can take this lock
+    # without a decision having been written for this id yet.
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    fd = os.open(str(lock_path), os.O_CREAT | os.O_RDWR, 0o644)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            fcntl.flock(fd, fcntl.LOCK_UN)
+    finally:
+        os.close(fd)
 
 
 # ---------------------------------------------------------------------------
