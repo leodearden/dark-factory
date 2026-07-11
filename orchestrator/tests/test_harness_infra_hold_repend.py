@@ -223,32 +223,37 @@ def _make_infra_esc(
 
 @pytest.mark.asyncio
 class TestInfraHoldEscalationResolution:
-    """_on_escalation_resolved with infra_hold → resume-at-verify (in-progress), not pending.
+    """_on_escalation_resolved with an infra-held task → resume-at-verify
+    (in-progress), not pending.
 
     RED before step-16: _cascade_unblock_member always calls set_task_status('pending'),
-    so the infra_hold task gets wrongly re-pended.
-    GREEN after step-16: infra_hold check intercepts the flip and sets 'in-progress' instead.
+    so the infra-held task gets wrongly re-pended.
+    GREEN after step-16: is_infra_held (status='infra-hold'; task 2200/ω4,
+    formerly metadata.infra_hold) intercepts the flip and sets 'in-progress'
+    instead.
     """
 
     async def test_infra_hold_escalation_resolved_resumes_at_verify(
         self, harness: Harness
     ):
-        """infra_hold task: resolved infra_issue escalation → 'in-progress', NOT 'pending'.
+        """status='infra-hold' task: resolved infra_issue escalation →
+        'in-progress', NOT 'pending'.
 
-        Currently FAILS (RED): _cascade_unblock_member calls set_task_status('pending')
-        without checking infra_hold — after step-16 it will call 'in-progress' instead.
+        After step-16 (re-keyed onto the first-class status by task 2200/ω4)
+        _cascade_unblock_member checks is_infra_held before the blocked-gate
+        and calls 'in-progress' instead of 'pending'.
         """
         tid = '1883'
 
-        # Task is blocked with infra_hold set
+        # Task status is infra-hold (first-class status, task 2200/ω4)
         harness.scheduler.get_task = AsyncMock(return_value={
             'id': tid,
+            'status': 'infra-hold',
             'metadata': {
-                'infra_hold': {'phase': 'verify', 'errno': 28, 'reason': 'ENOSPC'},
                 'branch_base_sha': _BASE_SHA,
             },
         })
-        harness.scheduler.get_status = AsyncMock(return_value='blocked')
+        harness.scheduler.get_status = AsyncMock(return_value='infra-hold')
 
         esc = _make_infra_esc(task_id=tid)  # status='resolved' → legacy 'resume' action
 
@@ -264,8 +269,8 @@ class TestInfraHoldEscalationResolution:
             if c.args[1] == 'pending'
         ]
         assert not pending_calls, (
-            f'set_task_status("pending") was called despite infra_hold. '
-            f'An infra_hold task must resume-at-verify (in-progress), not re-pend. '
+            f"set_task_status('pending') was called despite status='infra-hold'. "
+            f'An infra-held task must resume-at-verify (in-progress), not re-pend. '
             f'Calls: {pending_calls}'
         )
 
@@ -275,8 +280,8 @@ class TestInfraHoldEscalationResolution:
             if c.args[1] == 'in-progress'
         ]
         assert inprog_calls, (
-            f'set_task_status("in-progress") was never called for infra_hold task. '
-            f'Expected resume-at-verify but got: '
+            f"set_task_status('in-progress') was never called for status='infra-hold' "
+            f'task. Expected resume-at-verify but got: '
             f'{[c.args for c in harness.scheduler.set_task_status.await_args_list]}'  # type: ignore[attr-defined]
         )
 

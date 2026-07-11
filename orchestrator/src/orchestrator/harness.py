@@ -9230,6 +9230,11 @@ Output JSON matching the schema. Every task must appear in the output.
         their L2 cluster is still pending is an expected, common outcome and
         should not produce operator-visible WARNINGs.
 
+        EXCEPTION: an infra-held task (first-class status == 'infra-hold',
+        via is_infra_held — task 2200/ω4) is checked FIRST, before the
+        'blocked'-only gate below, because its status is 'infra-hold', never
+        'blocked' — see the A1 guard.
+
         TOCTOU note: get_status and set_task_status are separate MCP
         round-trips with no atomic compare-and-set. If the task transitions
         away from 'blocked' between the read and the write (e.g. a workflow
@@ -9238,6 +9243,40 @@ Output JSON matching the schema. Every task must appear in the output.
         policy; the race window is narrow in practice.
         """
         task_id = escalation.task_id
+
+        # A1 guard (task 2200/ω4): an infra-held task (first-class status ==
+        # 'infra-hold', via is_infra_held) is a verify-complete branch held by
+        # a transient infra failure.  Checked BEFORE the blocked-only gate
+        # below — an infra-held task's status is 'infra-hold', never
+        # 'blocked', so this must run first or the gate would skip it
+        # entirely.  Flipping to 'pending' would force the task to re-compete
+        # for its implement footprint in the scheduler's footprint-locked
+        # dispatch — the 3465 starvation root cause.  Instead resume-at-verify:
+        # set in-progress (the scheduler already skips re-implement for
+        # branches with prior work via _has_prior_implementation).  There is
+        # no metadata flag to clear anymore — the status IS the hold.
+        _infra_task = await self.scheduler.get_task(task_id)
+        if is_infra_held(_infra_task):
+            try:
+                await self.scheduler.set_task_status(task_id, 'in-progress')
+                logger.info(
+                    'cascade-unblock: task %s is infra-held — resuming at '
+                    'verify (infra-hold→in-progress) via %s',
+                    task_id, escalation.resolved_by,
+                )
+            except SetTaskStatusRejected as e:
+                logger.warning(
+                    'cascade-unblock: infra-hold resume refused for %s '
+                    '(TOCTOU race or guard): %s',
+                    task_id, e,
+                )
+            except Exception:
+                logger.warning(
+                    'cascade-unblock: infra-hold resume failed for %s',
+                    task_id, exc_info=True,
+                )
+            return
+
         status = await self.scheduler.get_status(task_id)
 
         if status != 'blocked':
@@ -9245,42 +9284,6 @@ Output JSON matching the schema. Every task must appear in the output.
                 'cascade-unblock: task %s is %s (not blocked; skipping flip via %s)',
                 task_id, status, escalation.resolved_by,
             )
-            return
-
-        # A1 guard: an infra_hold task is a verify-complete branch held by a
-        # transient infra failure.  Flipping it to 'pending' would force it to
-        # re-compete for its implement footprint in the scheduler's footprint-locked
-        # dispatch — the 3465 starvation root cause.  Instead resume-at-verify:
-        # set in-progress (the scheduler already skips re-implement for branches
-        # with prior work via _has_prior_implementation) and clear the hold.
-        _infra_task = await self.scheduler.get_task(task_id)
-        _infra_meta = (_infra_task or {}).get('metadata') or {}
-        if _infra_meta.get('infra_hold'):
-            try:
-                # Clear infra_hold sentinel before flipping status so a concurrent
-                # stranded-recovery sweep (which reads infra_hold) cannot race.
-                await self.scheduler.update_task(
-                    task_id,
-                    {'infra_hold': None},
-                    metadata_mode='merge',
-                )
-                await self.scheduler.set_task_status(task_id, 'in-progress')
-                logger.info(
-                    'cascade-unblock: task %s has infra_hold — resuming at verify '
-                    '(blocked→in-progress) via %s; infra_hold cleared',
-                    task_id, escalation.resolved_by,
-                )
-            except SetTaskStatusRejected as e:
-                logger.warning(
-                    'cascade-unblock: infra_hold resume refused for %s '
-                    '(TOCTOU race or guard): %s',
-                    task_id, e,
-                )
-            except Exception:
-                logger.warning(
-                    'cascade-unblock: infra_hold resume failed for %s',
-                    task_id, exc_info=True,
-                )
             return
 
         # Re-block guard (C5/D6): count same-signature re-pends cross-incarnation;
