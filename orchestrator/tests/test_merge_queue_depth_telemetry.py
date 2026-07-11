@@ -10,6 +10,9 @@ Covers:
   step-13 RED   — speculative_merge event carries depth
   step-14 GREEN — classify_and_merge threads worker._verify_frontier_depth()
                   into the speculative_merge _emit_speculative call
+  amend         — TestDispatchItemDepthAheadOfItem: _dispatch_item reads the
+                  frozen-frontier count BEFORE the dispatching item joins it
+                  (review followup: reviewer_comprehensive/test_coverage)
 
 DEPTH DEFINITION (ε=1890 verify-frontier stack height): depth 0 = a head
 verify against real main; depth d = d speculated items already
