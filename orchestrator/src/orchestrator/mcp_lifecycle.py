@@ -608,6 +608,17 @@ def managed_runtime_data_dirs(project_id: str) -> tuple[Path, Path]:
     treats reconciliation.db/tickets.db/escalations as one pollution class,
     not just the queue DB); any tooling that globs the old project-relative
     escalations path needs to point at the new XDG-rooted one instead.
+
+    Lockstep consumer: ``dashboard/src/dashboard/config.py``'s
+    ``reconciliation_db`` / ``tickets_db`` / ``write_journal_db`` /
+    ``write_queue_db`` / ``reconciliation_escalations_dir`` properties read
+    this same runtime state and honor the same ``QUEUE_DATA_DIR`` /
+    ``RECONCILIATION_DATA_DIR`` env vars (falling back to
+    ``project_root/data/...`` when unset) — task 2439. If this function's
+    rooting scheme ever changes, that dashboard consumer must move in
+    lockstep, or its queue / reconciliation / tickets / journal /
+    recon-escalation panels will silently go blank or stale reading a path
+    the managed spawn no longer writes to.
     """
     base = Path(os.environ.get('XDG_STATE_HOME') or (Path.home() / '.local' / 'state'))
     root = base / 'dark-factory' / project_id
