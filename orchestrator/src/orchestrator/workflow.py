@@ -1844,6 +1844,30 @@ class TaskWorkflow:
             base_commit=base_commit,
         )
 
+        # ── Layer B: stale iteration-log hygiene on re-dispatch ─────
+        # init() only overwrites metadata.json — iterations.jsonl otherwise
+        # survives across re-dispatch.  When this is a definitive re-dispatch
+        # onto a NEW fork point (old base_commit known and different from the
+        # fresh one), a prior dispatch's entries could otherwise masquerade as
+        # current-branch evidence for recovery guards that consult the
+        # iteration log (task 2372, recurrence class 2125/2315/2340).
+        # Same-base crash-resume (`_old_plan_base == base_commit`) and the
+        # first-ever dispatch (`_old_plan_base is None`) are left untouched so
+        # in-flight progress survives; external (eval-mode) worktrees are
+        # never wiped since their lifecycle is caller-owned.
+        if (
+            not self._worktree_external
+            and self._old_plan_base is not None
+            and base_commit is not None
+            and self._old_plan_base != base_commit
+        ):
+            logger.warning(
+                'Task %s: re-dispatch onto new base (%s→%s) — '
+                'clearing stale iterations.jsonl from prior dispatch',
+                self.task_id, self._old_plan_base[:8], base_commit[:8],
+            )
+            self.artifacts.clear_iteration_log()
+
         # ── .task/ contamination guard ────────────────────────────
         # If .task/ slipped into git on main (inherited contamination),
         # untrack it here so agents don't accidentally commit it.

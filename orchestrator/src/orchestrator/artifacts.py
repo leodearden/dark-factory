@@ -480,6 +480,15 @@ class TaskArtifacts:
                 corrupted.append(line)
         return entries, corrupted
 
+    def clear_iteration_log(self) -> None:
+        """Remove ``iterations.jsonl`` if present.
+
+        Called on re-dispatch onto a new fork point (Layer B, task 2372) so a
+        prior dispatch's entries never masquerade as current-branch evidence
+        — see ``_setup_worktree_and_artifacts``'s guarded wipe.
+        """
+        self._clear_path('iterations.jsonl')
+
     def write_review(self, reviewer_name: str, review: dict) -> None:
         """Write .task/reviews/{name}.json.
 
