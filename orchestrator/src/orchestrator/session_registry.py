@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import argparse
 import contextlib
+import fcntl
 import json
 import logging
 import os
@@ -27,7 +28,7 @@ import re
 import shutil
 import sys
 import tempfile
-from collections.abc import Mapping
+from collections.abc import Iterator, Mapping
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from enum import StrEnum
@@ -339,13 +340,13 @@ class DecisionRecord:
     spawning session ever mutates its own record), a single decision id's
     file may be mutated by TWO different subsystems: a C8 watcher (via
     update_decision_state) and the C5 cockpit (via set_manual_boost). Both
-    helpers are unsynchronized read-modify-write cycles with no cross-process
-    locking or compare-and-swap, so a concurrent state-update and
-    boost-update racing on the same id can silently drop one side's mutation
-    (last os.replace() wins). This is a known, accepted limitation --
-    consistent with the module's existing lock-free convention -- not a
-    per-record corruption risk (each write is still individually atomic).
-    See update_decision_state/set_manual_boost for the caller-facing note.
+    helpers now serialize their read-modify-write span per-decision-id via
+    decision_id_lock (a stable ``<id>.json.lock`` sidecar, mirroring task
+    1609's escalation_id_lock), so a concurrent state-update and
+    boost-update racing on the same id no longer drops either mutation --
+    each write remains individually atomic AND the read+mutate+write span
+    is now serialized against other callers on the same id. See
+    update_decision_state/set_manual_boost for the caller-facing note.
     """
 
     id: str
@@ -676,25 +677,25 @@ def update_decision_state(
     """Read-modify-write *decision_id*'s state field.
 
     Self-guarding FAIL-SOFT: returns None (logs ERROR) on any fault -- a
-    missing file, a corrupt body, or a write failure -- rather than raising,
-    matching write_decision's contract for its direct C8/cockpit callers.
+    missing file, a corrupt body, a lock-acquisition fault, or a write
+    failure -- rather than raising, matching write_decision's contract for
+    its direct C8/cockpit callers.
 
     Concurrency NOTE (see DecisionRecord's docstring): this read-modify-write
-    is unsynchronized against a concurrent set_manual_boost (or a second
-    update_decision_state) racing on the SAME decision id -- the later
-    os.replace() wins and silently drops the earlier call's field mutation.
-    Each individual write remains atomic; only the read+mutate+write SPAN is
-    unsynchronized. Accepted for now, consistent with the module's existing
-    lock-free convention.
+    is now serialized per-decision-id via decision_id_lock (a stable
+    ``<id>.json.lock`` sidecar, mirroring task 1609's escalation_id_lock), so
+    a concurrent set_manual_boost (or a second update_decision_state) racing
+    on the SAME decision id no longer drops either call's field mutation.
     """
     path = decision_path_for_id(decision_id, root=root)
     try:
-        record = DecisionRecord.from_json(path.read_text())
+        with decision_id_lock(decision_id, root=root):
+            record = DecisionRecord.from_json(path.read_text())
+            record.state = state
+            if not write_decision(record, root=root):
+                return None
     except (OSError, json.JSONDecodeError, KeyError, TypeError, ValueError):
         logger.error('update_decision_state: failed to read %s', path, exc_info=True)
-        return None
-    record.state = state
-    if not write_decision(record, root=root):
         return None
     return record
 
@@ -707,27 +708,80 @@ def set_manual_boost(
     """Read-modify-write *decision_id*'s manual_boost field.
 
     Self-guarding FAIL-SOFT: returns None (logs ERROR) on any fault -- a
-    missing file, a corrupt body, or a write failure -- rather than raising,
-    matching write_decision's contract for its direct C8/cockpit callers.
+    missing file, a corrupt body, a lock-acquisition fault, or a write
+    failure -- rather than raising, matching write_decision's contract for
+    its direct C8/cockpit callers.
 
     Concurrency NOTE (see DecisionRecord's docstring): this read-modify-write
-    is unsynchronized against a concurrent update_decision_state (or a
-    second set_manual_boost) racing on the SAME decision id -- the later
-    os.replace() wins and silently drops the earlier call's field mutation.
-    Each individual write remains atomic; only the read+mutate+write SPAN is
-    unsynchronized. Accepted for now, consistent with the module's existing
-    lock-free convention.
+    is now serialized per-decision-id via decision_id_lock (a stable
+    ``<id>.json.lock`` sidecar, mirroring task 1609's escalation_id_lock), so
+    a concurrent update_decision_state (or a second set_manual_boost) racing
+    on the SAME decision id no longer drops either call's field mutation.
     """
     path = decision_path_for_id(decision_id, root=root)
     try:
-        record = DecisionRecord.from_json(path.read_text())
+        with decision_id_lock(decision_id, root=root):
+            record = DecisionRecord.from_json(path.read_text())
+            record.manual_boost = boost
+            if not write_decision(record, root=root):
+                return None
     except (OSError, json.JSONDecodeError, KeyError, TypeError, ValueError):
         logger.error('set_manual_boost: failed to read %s', path, exc_info=True)
         return None
-    record.manual_boost = boost
-    if not write_decision(record, root=root):
-        return None
     return record
+
+
+@contextlib.contextmanager
+def decision_id_lock(decision_id: str, root: Path | str | None = None) -> Iterator[None]:
+    """Per-decision-id exclusive advisory lock using a stable sidecar file.
+
+    Mirrors escalation's ``escalation_id_lock`` (escalation/queue.py:24-69,
+    task 1609) near-verbatim, retargeted to the decisions dir.
+
+    WHY A SIDECAR (PRD-D3 rationale, same as 1609): write_decision's writer
+    is atomic tmp+os.replace (_atomic_write_text). After a replace, the data
+    file ``<decisions_dir>/<id>.json`` is a NEW inode. A second writer that
+    flock()s the (new) data-file path binds to a different inode and races
+    anyway -- the lock is defeated. The fix is a STABLE lock target:
+    ``<decisions_dir>/<id>.json.lock``, created once via os.open(O_CREAT)
+    and NEVER renamed or replaced, so all callers flock the same inode and
+    actually serialize.
+
+    Different decision ids resolve to different sidecars (via
+    decision_path_for_id's sanitization), so there is no cross-id
+    contention -- only two callers racing on the SAME id ever block each
+    other.
+
+    ORPHAN SIDECARS: taking this lock for a decision id that has never been
+    (or never will be) written -- e.g. update_decision_state/set_manual_boost
+    called against an unknown id -- still creates decisions_dir and an empty
+    ``<id>.json.lock`` sidecar for that id, even though the subsequent read
+    then fails and the caller gets None back. Lock files are, as in 1609,
+    intentionally never deleted, so a burst of calls against unknown ids can
+    leave harmless orphan sidecars behind at current volumes.
+
+    Usage::
+
+        with decision_id_lock(decision_id, root=root):
+            record = DecisionRecord.from_json(path.read_text())
+            record.some_field = new_value
+            write_decision(record, root=root)
+    """
+    lock_path = Path(str(decision_path_for_id(decision_id, root=root)) + '.lock')
+    # Defensively create the parent dir so a caller can take this lock
+    # without a decision having been written for this id yet -- note this
+    # means the sidecar itself is created even for an unknown id (see
+    # ORPHAN SIDECARS above).
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    fd = os.open(str(lock_path), os.O_CREAT | os.O_RDWR, 0o644)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            fcntl.flock(fd, fcntl.LOCK_UN)
+    finally:
+        os.close(fd)
 
 
 # ---------------------------------------------------------------------------
