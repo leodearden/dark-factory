@@ -13,13 +13,22 @@ frozen C1 record shape, never re-derive it).
 
 from __future__ import annotations
 
+from collections.abc import Mapping, Sequence
+from dataclasses import dataclass, replace
 from datetime import datetime
 from typing import Protocol
 
-from orchestrator.session_registry import DecisionRecord, SessionRecord
+from orchestrator.session_registry import (
+    DecisionRecord,
+    DecisionState,
+    Display,
+    SessionRecord,
+    Status,
+)
 
+from cockpit.backends import DisplayTarget
 from cockpit.panes.session_table import format_age
-from cockpit.priority import ScoringItem
+from cockpit.priority import Priorities, ScoringItem, score
 
 
 def _parse_timestamp(raw: str | None, now: datetime) -> datetime:
@@ -133,3 +142,167 @@ def format_queue_row(item: _QueueRowLike, now: datetime) -> tuple[str, str, str,
         _format_project_task(item.project, item.task_id),
         _one_line_question(item.question),
     )
+
+
+@dataclass(frozen=True)
+class QueueItem:
+    """One score-ordered decision-queue row -- a decision or an awaiting-input session.
+
+    key: a stable, kind-prefixed identity ('decision:<id>' / 'session:<slug>')
+        used both as the DataTable row key and as the lookup key into the
+        app's in-memory boosts/deferred/handling overlays.
+    kind: 'decision' | 'session'.
+    decision_id: the backing DecisionRecord's id, or None for a session item
+        (sessions aren't cockpit-writable -- see set_manual_boost/
+        update_decision_state's callers).
+    target: this item's resolved focus target, or None when unresolvable
+        (a gone/unlinked session) -- see resolve_target.
+    handling: whether this item's key is in the app's in-memory "already
+        acted on" set (stamped by order_queue's *handling* param).
+    """
+
+    key: str
+    kind: str
+    decision_id: str | None
+    project: str
+    task_id: str | None
+    question: str
+    filed_at: datetime
+    score: float
+    target: DisplayTarget | None
+    handling: bool
+
+
+def _to_display_target(display: Display | None) -> DisplayTarget | None:
+    if display is None:
+        return None
+    return DisplayTarget(
+        kind=display.kind,
+        wm_title=display.wm_title,
+        wm_window_id=display.wm_window_id,
+        tmux_target=display.tmux_target,
+    )
+
+
+def resolve_target(
+    record: DecisionRecord | SessionRecord,
+    sessions_by_slug: Mapping[str, SessionRecord],
+) -> DisplayTarget | None:
+    """Resolve *record*'s focus target.
+
+    A SessionRecord resolves from its own display. A DecisionRecord has no
+    display of its own -- it resolves via the session named by its
+    session_id, looked up in *sessions_by_slug*. Fail-soft (PRD §2): a
+    session-less decision, an unresolvable session_id, or a linked session
+    with no display all degrade to None rather than raising -- a gone or
+    never-linked target simply means no focus/urgency call is possible for
+    this item.
+    """
+    if isinstance(record, DecisionRecord):
+        session = sessions_by_slug.get(record.session_id) if record.session_id else None
+        display = session.display if session is not None else None
+    else:
+        display = record.display
+    return _to_display_target(display)
+
+
+def _apply_overrides(
+    item: ScoringItem,
+    key: str,
+    boosts: Mapping[str, int],
+    deferred: Mapping[str, datetime],
+) -> ScoringItem:
+    """Layer the in-memory boosts/deferred overlays onto *item* (PRD §2 design decisions).
+
+    boosts ADDS to the item's own manual_boost (an ephemeral overlay for a
+    session row; a no-op overlay for a decision row once its boost is
+    persisted and re-scanned). deferred OVERRIDES filed_at to the stamped
+    defer-moment, resetting the item's effective age -- never a rewrite of
+    the underlying record's real filed_at/asked_at/start_ts.
+    """
+    filed_at = deferred.get(key, item.filed_at)
+    manual_boost = item.manual_boost + boosts.get(key, 0)
+    return replace(item, filed_at=filed_at, manual_boost=manual_boost)
+
+
+def _decision_key(decision: DecisionRecord) -> str:
+    return f'decision:{decision.id}'
+
+
+def _session_key(session: SessionRecord) -> str:
+    return f'session:{session.session_slug}'
+
+
+def order_queue(
+    decisions: Sequence[DecisionRecord],
+    sessions: Sequence[SessionRecord],
+    priorities: Priorities,
+    now: datetime,
+    *,
+    boosts: Mapping[str, int] | None = None,
+    deferred: Mapping[str, datetime] | None = None,
+    handling: Sequence[str] | None = None,
+) -> list[QueueItem]:
+    """Build the score-ordered decision queue: every open decision + awaiting-input session.
+
+    Pure and deterministic: identical inputs (including *now*) always
+    produce an identical order (C3's score() is itself pure). Filters to
+    state=='open' decisions and AWAITING_INPUT sessions only -- dropped/
+    answered decisions and non-awaiting sessions never appear (a session
+    row an operator has since dropped is excluded by the caller pre-
+    filtering *sessions*, not by this function). Sorted by score
+    descending, tiebroken by *key* for a total, stable order across calls.
+    """
+    boosts = boosts or {}
+    deferred = deferred or {}
+    handling_set = set(handling) if handling is not None else set()
+    sessions_by_slug = {session.session_slug: session for session in sessions}
+
+    items: list[QueueItem] = []
+
+    for decision in decisions:
+        if decision.state != DecisionState.OPEN:
+            continue
+        key = _decision_key(decision)
+        scoring_item = _apply_overrides(
+            decision_to_scoring_item(decision, now=now), key, boosts, deferred
+        )
+        items.append(
+            QueueItem(
+                key=key,
+                kind='decision',
+                decision_id=decision.id,
+                project=decision.project,
+                task_id=decision.task_id,
+                question=decision.text,
+                filed_at=scoring_item.filed_at,
+                score=score(scoring_item, priorities, now),
+                target=resolve_target(decision, sessions_by_slug),
+                handling=key in handling_set,
+            )
+        )
+
+    for session in sessions:
+        if session.status != Status.AWAITING_INPUT:
+            continue
+        key = _session_key(session)
+        scoring_item = _apply_overrides(
+            session_to_scoring_item(session, now=now), key, boosts, deferred
+        )
+        question_text = session.question.text if session.question is not None else ''
+        items.append(
+            QueueItem(
+                key=key,
+                kind='session',
+                decision_id=None,
+                project=session.project,
+                task_id=session.task_id,
+                question=question_text,
+                filed_at=scoring_item.filed_at,
+                score=score(scoring_item, priorities, now),
+                target=resolve_target(session, sessions_by_slug),
+                handling=key in handling_set,
+            )
+        )
+
+    return sorted(items, key=lambda item: (-item.score, item.key))
