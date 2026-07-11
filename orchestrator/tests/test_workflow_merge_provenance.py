@@ -739,12 +739,14 @@ class TestNoPhantomDoneProperty:
         assert f1.wf._merge_recovery_basis is None
         f1.mark_done.assert_not_awaited()
 
-        # Guard 2: _recover_before_execute — on-main, no prior work.
+        # Guard 2: _recover_before_execute — on-main, EMPTY branch-content
+        # diff (Layer C, task 2372 — this guard no longer consults
+        # _has_prior_implementation at all).
         f2 = _make(worktree=tmp_path / 'wt2', project_root=tmp_path / 'proj2')
         f2.wf._check_branch_on_main = AsyncMock(  # type: ignore[method-assign]
             return_value=('wthead123', 'mainsha123'),
         )
-        f2.wf._has_prior_implementation = MagicMock(return_value=no_work)  # type: ignore[method-assign]
+        f2.wf.git_ops.get_merge_diff_files = AsyncMock(return_value=([], None))
         outcome2 = await f2.wf._recover_before_execute()
         assert outcome2 is None
         assert f2.wf._merge_recovery_basis is None
