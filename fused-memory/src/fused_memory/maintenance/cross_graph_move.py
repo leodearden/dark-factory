@@ -652,9 +652,6 @@ async def move_entity_across_graphs(
         edge_embedding_reply = await _read_compact_vector(
             falkor_client, group_id=source_graph, cypher=edge_embedding_cypher,
         )
-        edge_embedding_literal = format_vecf32_literal(
-            parse_compact_vector_reply(edge_embedding_reply)
-        )
 
         # Both endpoints are MATCHed (never CREATEd) by uuid: the other
         # endpoint (dst_uuid) must already exist in target_graph for the
@@ -674,8 +671,8 @@ async def move_entity_across_graphs(
             '    r.invalid_at = $invalid_at, '
             '    r.created_at = $created_at, '
             '    r.group_id = $group_id, '
-            '    r.episodes = $episodes, '
-            f'    r.fact_embedding = {edge_embedding_literal}',
+            '    r.episodes = $episodes'
+            f'{_embedding_set_clause("r.fact_embedding", edge_embedding_reply)}',
             {
                 'src_uuid': src_uuid,
                 'dst_uuid': dst_uuid,
