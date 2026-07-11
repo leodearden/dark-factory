@@ -88,3 +88,40 @@ def test_emit_residual_candidate_key_escalation_dedupes_against_existing_pending
         f'Expected a fresh escalation once the prior one was resolved; got '
         f'the same id {third_id!r} again'
     )
+
+
+def test_emit_residual_candidate_key_escalation_detail_surfaces_group_reason(tmp_path):
+    """fm-task-dedup self-heal amendment: the v3->v4 migration now only
+    escalates AMBIGUOUS groups, each carrying a per-group ``reason``
+    (``'mixed_status'`` | ``'title_divergent'``). The filed escalation's
+    detail text must surface each group's reason — and explain that
+    genuine content-duplicates were already auto-healed — so an operator
+    understands why THESE groups still need a human without
+    cross-referencing the migration source.
+    """
+    residual_groups = [
+        {
+            'tag': 'master', 'candidate_key': 'abc123', 'task_ids': ['1', '2'],
+            'count': 2, 'reason': 'mixed_status',
+        },
+        {
+            'tag': 'master', 'candidate_key': 'def456', 'task_ids': ['3', '4'],
+            'count': 2, 'reason': 'title_divergent',
+        },
+    ]
+    result = emit_residual_candidate_key_escalation(
+        project_root=str(tmp_path),
+        residual_groups=residual_groups,
+    )
+    if not cke_mod.HAS_ESCALATION:
+        assert result is None
+        return
+
+    queue_dir = tmp_path / 'data' / 'escalations'
+    files = list(queue_dir.glob('esc-*.json'))
+    assert len(files) == 1, f'expected one escalation file, found: {files}'
+    payload = json.loads(files[0].read_text())
+    detail = payload['detail']
+    assert 'mixed_status' in detail, detail
+    assert 'title_divergent' in detail, detail
+    assert 'auto-heal' in detail.lower(), detail

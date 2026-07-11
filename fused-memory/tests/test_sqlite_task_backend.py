@@ -2930,6 +2930,186 @@ async def test_v3_to_v4_self_heal_cancels_non_canonical_and_builds_index(
     assert 'canonical' in heal_records[0].message.lower(), heal_records[0].message
 
 
+@pytest.mark.asyncio
+async def test_v3_to_v4_mixed_status_group_is_flagged_with_reason(tmp_path):
+    """A duplicate group containing a ``done`` row is NOT auto-healed —
+    cancelling completed work needs a human even though the content
+    genuinely matches. The group is left untouched, the index build is
+    skipped, and the escalation callback receives the group tagged
+    ``reason == 'mixed_status'``.
+    """
+    import sqlite3
+
+    project_root = str(tmp_path / 'proj')
+    db_path = Path(project_root) / '.taskmaster' / 'tasks' / 'tasks.db'
+    _make_v3_db_with_dup_groups(
+        db_path,
+        [
+            (1, 'Fix the bug', 'done', ['a.py']),
+            (2, 'Fix the bug', 'pending', ['a.py']),
+        ],
+    )
+
+    recorded: list[tuple[str, list[dict]]] = []
+
+    def recording_stub(project_root_arg, residual_groups):
+        recorded.append((project_root_arg, residual_groups))
+
+    cfg = TaskmasterConfig(project_root=str(tmp_path))
+    b = SqliteTaskBackend(cfg, residual_dup_escalation_cb=recording_stub)
+    await b.start()
+    try:
+        await b.get_tasks(project_root=project_root)  # must not raise
+    finally:
+        await b.close()
+
+    expected_key = compute_candidate_key('Fix the bug', ['a.py'])
+
+    conn = sqlite3.connect(str(db_path))
+    try:
+        indexes = {row[1] for row in conn.execute('PRAGMA index_list(tasks)')}
+        user_version = conn.execute('PRAGMA user_version').fetchone()[0]
+        statuses = dict(conn.execute("SELECT id, status FROM tasks WHERE tag='master'"))
+    finally:
+        conn.close()
+
+    # Neither row is cancelled — mixed-status groups are left for a human.
+    assert statuses == {1: 'done', 2: 'pending'}, statuses
+    assert not any('candidate_key' in idx for idx in indexes), indexes
+    assert user_version == 3, user_version
+
+    assert len(recorded) == 1, recorded
+    _, residual_groups = recorded[0]
+    assert residual_groups == [
+        {
+            'tag': 'master', 'candidate_key': expected_key,
+            'task_ids': ['1', '2'], 'count': 2, 'reason': 'mixed_status',
+        },
+    ], residual_groups
+
+
+@pytest.mark.asyncio
+async def test_v3_to_v4_title_divergent_group_is_flagged_with_reason(tmp_path):
+    """Rows sharing a STORED candidate_key that no longer matches a fresh
+    recompute of (title, files) are not a genuine content-duplicate — the
+    group is flagged (``reason == 'title_divergent'``), not healed.
+    """
+    import sqlite3
+
+    project_root = str(tmp_path / 'proj')
+    db_path = Path(project_root) / '.taskmaster' / 'tasks' / 'tasks.db'
+    stale_key = 'stale1234567890a'
+    _make_v3_db_with_dup_groups(
+        db_path,
+        [
+            (1, 'Fix the bug', 'pending', ['a.py'], stale_key),
+            (2, 'Totally different task', 'pending', ['z.py'], stale_key),
+        ],
+    )
+
+    recorded: list[tuple[str, list[dict]]] = []
+
+    def recording_stub(project_root_arg, residual_groups):
+        recorded.append((project_root_arg, residual_groups))
+
+    cfg = TaskmasterConfig(project_root=str(tmp_path))
+    b = SqliteTaskBackend(cfg, residual_dup_escalation_cb=recording_stub)
+    await b.start()
+    try:
+        await b.get_tasks(project_root=project_root)  # must not raise
+    finally:
+        await b.close()
+
+    conn = sqlite3.connect(str(db_path))
+    try:
+        indexes = {row[1] for row in conn.execute('PRAGMA index_list(tasks)')}
+        user_version = conn.execute('PRAGMA user_version').fetchone()[0]
+        statuses = dict(conn.execute("SELECT id, status FROM tasks WHERE tag='master'"))
+    finally:
+        conn.close()
+
+    assert statuses == {1: 'pending', 2: 'pending'}, statuses
+    assert not any('candidate_key' in idx for idx in indexes), indexes
+    assert user_version == 3, user_version
+
+    assert len(recorded) == 1, recorded
+    _, residual_groups = recorded[0]
+    assert residual_groups == [
+        {
+            'tag': 'master', 'candidate_key': stale_key,
+            'task_ids': ['1', '2'], 'count': 2, 'reason': 'title_divergent',
+        },
+    ], residual_groups
+
+
+@pytest.mark.asyncio
+async def test_v3_to_v4_mixed_db_heals_genuine_while_flagging_ambiguous(tmp_path):
+    """A DB holding BOTH a genuine all-active duplicate group AND a flagged
+    (mixed-status) group: the genuine group's non-canonical row IS
+    cancelled, while the flagged group is left untouched and escalated —
+    and since a residual (the flagged group) remains, the index build is
+    STILL skipped and user_version stays at 3.
+    """
+    import sqlite3
+
+    project_root = str(tmp_path / 'proj')
+    db_path = Path(project_root) / '.taskmaster' / 'tasks' / 'tasks.db'
+    _make_v3_db_with_dup_groups(
+        db_path,
+        [
+            (1, 'Fix the bug', 'pending', ['a.py', 'b.py']),
+            (2, 'fix   the  bug', 'in-progress', ['a.py', 'b.py']),
+            (3, 'Add feature', 'done', ['c.py']),
+            (4, 'Add feature', 'pending', ['c.py']),
+        ],
+    )
+
+    recorded: list[tuple[str, list[dict]]] = []
+
+    def recording_stub(project_root_arg, residual_groups):
+        recorded.append((project_root_arg, residual_groups))
+
+    cfg = TaskmasterConfig(project_root=str(tmp_path))
+    b = SqliteTaskBackend(cfg, residual_dup_escalation_cb=recording_stub)
+    await b.start()
+    try:
+        await b.get_tasks(project_root=project_root)  # must not raise
+    finally:
+        await b.close()
+
+    flagged_key = compute_candidate_key('Add feature', ['c.py'])
+
+    conn = sqlite3.connect(str(db_path))
+    try:
+        indexes = {row[1] for row in conn.execute('PRAGMA index_list(tasks)')}
+        user_version = conn.execute('PRAGMA user_version').fetchone()[0]
+        statuses = dict(conn.execute("SELECT id, status FROM tasks WHERE tag='master'"))
+    finally:
+        conn.close()
+
+    # The genuine group healed: id=1 (pending, non-canonical) cancelled,
+    # id=2 (in-progress, canonical) survives.
+    assert statuses[1] == 'cancelled', statuses
+    assert statuses[2] == 'in-progress', statuses
+    # The flagged (mixed-status) group is untouched.
+    assert statuses[3] == 'done', statuses
+    assert statuses[4] == 'pending', statuses
+
+    # A residual (the flagged group) remains, so the index is STILL skipped.
+    assert not any('candidate_key' in idx for idx in indexes), indexes
+    assert user_version == 3, user_version
+
+    # Escalation carries ONLY the flagged group, not the healed one.
+    assert len(recorded) == 1, recorded
+    _, residual_groups = recorded[0]
+    assert residual_groups == [
+        {
+            'tag': 'master', 'candidate_key': flagged_key,
+            'task_ids': ['3', '4'], 'count': 2, 'reason': 'mixed_status',
+        },
+    ], residual_groups
+
+
 # ── candidate_key collision (fm-task-dedup W8 task A2) ───────────────
 
 
