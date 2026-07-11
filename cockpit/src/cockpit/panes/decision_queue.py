@@ -1,10 +1,12 @@
 """cockpit.panes.decision_queue — score-ordered decision queue (Fleet Cockpit C5b, PRD §9).
 
-Pure logic only: scoring adapters mapping the C1 registry contract onto C3's
-ScoringItem, row formatting, and order_queue's queue-build/sort. The
-DecisionQueue(DataTable) widget itself lands in a later C5b step; this
-module stays import-clean of any Textual dependency so it is fast and
-deterministic to unit test (no pilot, no event loop).
+Pure logic (scoring adapters mapping the C1 registry contract onto C3's
+ScoringItem, row formatting, and order_queue's queue-build/sort) plus the
+DecisionQueue(DataTable) widget itself, mirroring session_table.py's own
+mix of pure helpers + the SessionTable(DataTable) widget in one module. The
+pure functions above DecisionQueue stay fast/deterministic to unit test
+directly (no pilot, no event loop) -- only DecisionQueue itself requires a
+running Textual app, and is covered by test_app.py's pilot tests instead.
 
 Consumers import orchestrator.session_registry directly (mirrors
 registry_reader.py/session_table.py -- PRD §6 G5: consumers import the
@@ -25,6 +27,8 @@ from orchestrator.session_registry import (
     SessionRecord,
     Status,
 )
+from textual.widgets import DataTable
+from textual.widgets.data_table import RowDoesNotExist
 
 from cockpit.backends import DisplayTarget
 from cockpit.panes.session_table import format_age
@@ -306,6 +310,61 @@ def order_queue(
         )
 
     return sorted(items, key=lambda item: (-item.score, item.key))
+
+
+class DecisionQueue(DataTable):
+    """The score-ordered decision/awaiting-input queue (PRD §9 C5b).
+
+    Columns: score / age / project#task / question. Selection-preserving,
+    mirroring SessionTable.replace_rows' idiom exactly: replace_rows
+    re-locates the previously-highlighted item's key after a rebuild, so a
+    live re-score (boost/defer/drop, or a poll pickup) never yanks the
+    cursor away from the row an operator is looking at. Rows are keyed by
+    QueueItem.key ('decision:<id>' / 'session:<slug>'), not by row position.
+    """
+
+    DEFAULT_CSS = """
+    DecisionQueue {
+        width: 1fr;
+        height: 1fr;
+    }
+    """
+
+    def __init__(self, *args, **kwargs) -> None:
+        kwargs.setdefault('cursor_type', 'row')
+        super().__init__(*args, **kwargs)
+
+    def on_mount(self) -> None:
+        self.add_columns('score', 'age', 'project#task', 'question')
+
+    def highlighted_key(self) -> str | None:
+        """Return the QueueItem.key of the currently-highlighted row, or None if empty."""
+        if self.row_count == 0:
+            return None
+        row_key = self.coordinate_to_cell_key(self.cursor_coordinate).row_key
+        return row_key.value
+
+    def replace_rows(self, items: Sequence[QueueItem], now: datetime) -> None:
+        """Rebuild rows from *items* (already ordered), preserving the cursor by key."""
+        previous_key = self.highlighted_key()
+        self.clear()
+        for item in items:
+            self.add_row(*format_queue_row(item, now), key=item.key)
+        if not self.row_count:
+            return
+        if previous_key is not None:
+            try:
+                self.move_cursor(row=self.get_row_index(previous_key))
+            except RowDoesNotExist:
+                self.move_cursor(row=0)
+
+    def select_key(self, key: str) -> bool:
+        """Move the cursor to *key*'s row if present. Returns whether it was found."""
+        try:
+            self.move_cursor(row=self.get_row_index(key))
+        except RowDoesNotExist:
+            return False
+        return True
 
 
 def known_project_roots(
