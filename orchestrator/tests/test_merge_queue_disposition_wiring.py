@@ -366,3 +366,183 @@ class TestClassifyDispositionForOutcome:
         assert reason_suffix == ''
         warning_texts = [r.message for r in caplog.records if r.levelno >= logging.WARNING]
         assert warning_texts, 'Expected a WARNING to be logged on classifier fault'
+
+
+# ---------------------------------------------------------------------------
+# Step-7/8 [I4 on the real outcome + I3 absent-base-facts]
+# ---------------------------------------------------------------------------
+
+
+async def _drive_verify_with_base_facts(
+    req: MergeRequest,
+    merge_wt: Path,
+    git_ops: GitOps,
+    *,
+    event_store: EventStore | None = None,
+    merge_base_sha: str | None = None,
+    main_sha: str | None = None,
+) -> MergeOutcome | None:
+    """Call _run_post_merge_verify with standard test parameters, threading
+    the optional merge_base_sha/main_sha kw-params under test."""
+    return await _run_post_merge_verify(
+        git_ops, req, merge_wt,
+        timeouts={},
+        enospc_retries={},
+        max_timeouts=3,
+        max_enospc=1,
+        event_store=event_store,
+        merge_base_sha=merge_base_sha,
+        main_sha=main_sha,
+    )
+
+
+class TestRunPostMergeVerifyDispositionWiring:
+    """_run_post_merge_verify threads merge_base_sha/main_sha through to
+    _classify_disposition_for_outcome on the generic (not-preexisting)
+    task-fault path, attaching disposition/failure_diagnostic/reason_suffix
+    to the returned MergeOutcome.  Absent base facts (default None) skips
+    classification entirely — byte-identical to today (I3)."""
+
+    def test_base_facts_supplied_with_implicated_landing_yields_integration_skew(
+        self, tmp_path: Path,
+    ) -> None:
+        repo = tmp_path / 'repo'
+        repo.mkdir()
+        _init_git_repo(repo)
+        merge_base_sha = _commit_file(repo, 'src/x.py', 'v1', 'init x (merge-base)')
+        landing_sha = _commit_file(repo, 'src/x.py', 'v2', 'edit x on main (landing)')
+
+        config = _make_config(repo)
+        git_ops = _make_git_ops(repo)
+        merge_wt = tmp_path / 'merge-wt'
+        merge_wt.mkdir()
+        task_wt = tmp_path / 'task-wt'
+        task_wt.mkdir()
+        req = _make_req('2381', task_wt, config)
+
+        store = EventStore(tmp_path / 'runs.db', run_id='run-test')
+        store.emit(
+            EventType.workflow_verify, task_id='2381',
+            data={'passed': True, 'base_sha': merge_base_sha, 'branch': 'task/2381'},
+        )
+
+        async def _run() -> MergeOutcome | None:
+            with (
+                patch(
+                    'orchestrator.merge_queue.run_scoped_verification',
+                    new=AsyncMock(return_value=_XPY_FAILURE),
+                ),
+                patch(
+                    'orchestrator.merge_queue.verify_failure_is_preexisting_on_main',
+                    new=AsyncMock(return_value=(False, '')),
+                ),
+            ):
+                return await _drive_verify_with_base_facts(
+                    req, merge_wt, git_ops,
+                    event_store=store,
+                    merge_base_sha=merge_base_sha,
+                    main_sha=landing_sha,
+                )
+
+        outcome = asyncio.run(_run())
+        assert outcome is not None
+        assert outcome.disposition == MergeFailureDisposition.INTEGRATION_SKEW, (
+            f'Expected INTEGRATION_SKEW; got {outcome.disposition!r}'
+        )
+        assert outcome.failure_diagnostic is not None
+        assert landing_sha in outcome.failure_diagnostic.get('implicated_commits', ''), (
+            outcome.failure_diagnostic
+        )
+        assert 'src/x.py' in outcome.failure_diagnostic.get('overlap_files', ''), (
+            outcome.failure_diagnostic
+        )
+        assert 'port landed commit' in outcome.reason, outcome.reason
+        assert landing_sha in outcome.reason
+
+    def test_base_facts_supplied_no_implicated_landing_yields_branch_bug(
+        self, tmp_path: Path,
+    ) -> None:
+        repo = tmp_path / 'repo'
+        repo.mkdir()
+        _init_git_repo(repo)
+        merge_base_sha = _commit_file(repo, 'src/x.py', 'v1', 'init x (merge-base)')
+        # main moves, but only touches an UNRELATED file -> no implicated landing.
+        main_sha = _commit_file(repo, 'src/y.py', 'v1', 'add unrelated y on main')
+
+        config = _make_config(repo)
+        git_ops = _make_git_ops(repo)
+        merge_wt = tmp_path / 'merge-wt'
+        merge_wt.mkdir()
+        task_wt = tmp_path / 'task-wt'
+        task_wt.mkdir()
+        req = _make_req('2381', task_wt, config)
+
+        store = EventStore(tmp_path / 'runs.db', run_id='run-test')
+        store.emit(
+            EventType.workflow_verify, task_id='2381',
+            data={'passed': True, 'base_sha': merge_base_sha, 'branch': 'task/2381'},
+        )
+
+        async def _run() -> MergeOutcome | None:
+            with (
+                patch(
+                    'orchestrator.merge_queue.run_scoped_verification',
+                    new=AsyncMock(return_value=_XPY_FAILURE),
+                ),
+                patch(
+                    'orchestrator.merge_queue.verify_failure_is_preexisting_on_main',
+                    new=AsyncMock(return_value=(False, '')),
+                ),
+            ):
+                return await _drive_verify_with_base_facts(
+                    req, merge_wt, git_ops,
+                    event_store=store,
+                    merge_base_sha=merge_base_sha,
+                    main_sha=main_sha,
+                )
+
+        outcome = asyncio.run(_run())
+        assert outcome is not None
+        assert outcome.disposition == MergeFailureDisposition.BRANCH_BUG, (
+            f'Expected BRANCH_BUG; got {outcome.disposition!r}'
+        )
+        assert outcome.failure_diagnostic is None
+        assert 'port landed commit' not in outcome.reason
+        assert outcome.reason.startswith('Post-merge verification failed'), outcome.reason
+
+    def test_base_facts_absent_skips_classification_byte_identical(
+        self, tmp_path: Path,
+    ) -> None:
+        """merge_base_sha/main_sha=None (default) -> classification skipped
+        entirely; disposition stays INDETERMINATE, failure_diagnostic None,
+        reason unchanged from today's shape (I3, byte-identical)."""
+        config = _make_config(tmp_path)
+        git_ops = _make_git_ops(tmp_path)
+        merge_wt = tmp_path / 'merge-wt'
+        merge_wt.mkdir()
+        task_wt = tmp_path / 'task-wt'
+        task_wt.mkdir()
+        req = _make_req('2381', task_wt, config)
+
+        async def _run() -> MergeOutcome | None:
+            with (
+                patch(
+                    'orchestrator.merge_queue.run_scoped_verification',
+                    new=AsyncMock(return_value=_XPY_FAILURE),
+                ),
+                patch(
+                    'orchestrator.merge_queue.verify_failure_is_preexisting_on_main',
+                    new=AsyncMock(return_value=(False, '')),
+                ),
+            ):
+                return await _drive_verify_with_base_facts(req, merge_wt, git_ops)
+
+        outcome = asyncio.run(_run())
+        assert outcome is not None
+        assert outcome.disposition == MergeFailureDisposition.INDETERMINATE, (
+            f'Expected INDETERMINATE (default, classification skipped); '
+            f'got {outcome.disposition!r}'
+        )
+        assert outcome.failure_diagnostic is None
+        assert outcome.reason.startswith('Post-merge verification failed'), outcome.reason
+        assert 'port landed commit' not in outcome.reason
