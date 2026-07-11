@@ -20,13 +20,18 @@ cleanly on a host missing DISPLAY/wmctrl/xdotool/xprop/tmux/tkinter.
 
 The live harness (skip guard, disposable-resource fixtures, observation
 helpers) lives entirely in smoke/conftest.py and is never imported by name
-here: the root pyproject.toml sets --import-mode=importlib, under which a
-test module's own directory is not added to sys.path and it cannot `import`
-a sibling helper module -- conftest.py is discovered and loaded by pytest by
-path regardless of import mode, so fixtures are the only cross-file channel
-available. Every harness helper this module uses (disposable_wm_window,
-active_window_id, wait_until, ...) is therefore requested as a fixture,
-never imported.
+here. The root pyproject.toml sets --import-mode=importlib, but that flag is
+root-only -- cockpit/pyproject.toml does not repeat it, so a per-subproject
+invocation (e.g. `cd cockpit && uv run pytest tests/`) runs under pytest's
+default 'prepend' import mode instead, not importlib. Under importlib mode
+(repo-root runs) a test module's own directory is not added to sys.path, so
+it cannot `import` a sibling helper module there. conftest.py, by contrast,
+is discovered and loaded by pytest via its own file-path mechanism
+regardless of import mode, making it the one cross-file channel that behaves
+identically under both invocations -- which is why every harness helper this
+module uses (disposable_wm_window, active_window_id, wait_until, ...) is
+requested as a fixture, never imported, even under a subproject/prepend-mode
+run where a bare sibling `import` would happen to work too.
 
 cockpit.backends.wm/base already exist (C4 landed), so importing them below
 is a plain top-level import -- only the *harness* is new here. Each new test
