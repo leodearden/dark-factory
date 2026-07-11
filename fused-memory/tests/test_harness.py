@@ -8199,6 +8199,142 @@ async def test_live_workflow_gate_threads_task_kind_for_blocked_deterministic_ci
     )
 
 
+@pytest.mark.asyncio
+async def test_live_workflow_gate_drops_bare_orchestrator_signal_for_blocked_normal_cited_task(
+    journal,
+    event_buffer,
+    mock_memory_service,
+    tmp_path,
+    monkeypatch,
+    caplog,
+):
+    """_run_remediation_pass's live-workflow gate must NOT treat a BLOCKED
+    task_kind='normal' cited task as live when its ONLY evidence is the bare
+    project-wide orchestrator lock (no registered worktree, no recent commit) —
+    task 2409 closes the repeated re-deferral loop affecting tasks 2335/2196: the
+    persistently-unresolved escalation FIRES instead of being suppressed.
+
+    Unlike test_live_workflow_gate_threads_task_kind_for_blocked_deterministic_cited_task
+    (which uses a FAKE detector to prove status/task_kind threading), this test
+    drives the REAL is_workflow_live_for_task / detect_live_workflow so it actually
+    exercises the task 2409 detector-layer rule 3, not just the harness's
+    threading. is_orchestrator_live_for is monkeypatched True (the project-wide
+    lock is held) on the live_workflow_detector module — NOT on harness_module,
+    which only imports is_workflow_live_for_task, not is_orchestrator_live_for —
+    and subprocess.run is mocked to report no registered worktree and no recent
+    commit for task/2335's branch.
+    """
+    import subprocess
+    import uuid as _uuid
+
+    from escalation.queue import EscalationQueue  # type: ignore[import-untyped]
+
+    import fused_memory.services.live_workflow_detector as detector_module
+    from fused_memory.reconciliation.harness import _INTEGRITY_FINDING_RECURRENCE_THRESHOLD
+
+    harness = _make_test_harness(journal, event_buffer, mock_memory_service)
+    esc_queue = EscalationQueue(tmp_path / 'esc')
+    harness._escalation_queue = esc_queue
+
+    task_id = '2335'
+    actionable_finding = _make_finding_with_cited_task(task_id)
+
+    # remediation_tree is built (inside _run_remediation_pass) from
+    # taskmaster.get_tasks — populate it with the blocked normal cited task so the
+    # harness has a status+task_kind to look up and forward.
+    harness.taskmaster.get_tasks.return_value = {  # type: ignore[union-attr,attr-defined]
+        'tasks': [
+            {
+                'id': 2335, 'title': 'Blocked normal task', 'status': 'blocked',
+                'metadata': {'task_kind': 'normal'}, 'dependencies': [],
+            },
+        ]
+    }
+
+    # Drive the REAL detector: project-wide orchestrator lock reports live...
+    monkeypatch.setattr(detector_module, 'is_orchestrator_live_for', lambda _pr: True)
+
+    # ...and both git-derived signals are False for every branch (no worktree
+    # registered, `git log` exits non-zero for the branch => recent_commit False
+    # via the returncode guard).
+    def _no_git_signals(args, **kwargs):
+        if '--porcelain' in args:
+            return subprocess.CompletedProcess(
+                args=args, returncode=0,
+                stdout='worktree /tmp/test-project\nHEAD abc1234\nbranch refs/heads/main\n\n',
+                stderr='',
+            )
+        return subprocess.CompletedProcess(
+            args=args, returncode=1, stdout='', stderr='',
+        )
+
+    # Seed N-2 prior completed runs so persistence reaches threshold.
+    n_seed = max(1, _INTEGRITY_FINDING_RECURRENCE_THRESHOLD - 2)
+    base_time = datetime.now(UTC) - timedelta(minutes=n_seed + 1)
+    for i in range(n_seed):
+        rid = str(_uuid.uuid4())
+        run = ReconciliationRun(
+            id=rid,
+            project_id='test-project',
+            run_type=RunType.full,
+            trigger_reason='buffer_size:1',
+            started_at=base_time + timedelta(minutes=i),
+            events_processed=1,
+            status=RunStatus.running,
+        )
+        await journal.start_run(run)
+        await journal.update_run_stage_reports(
+            rid, {'integrity_check': {'items_flagged': [actionable_finding]}}
+        )
+        await journal.complete_run(rid, 'completed')
+
+    await event_buffer.push(_make_event())
+
+    async def s3_returns_finding(events, watermark, prior_reports, run_id, model=None, _s=harness.stages[2]):
+        return StageReport(
+            stage=_s.stage_id,
+            started_at=datetime.now(UTC),
+            completed_at=datetime.now(UTC),
+            items_flagged=[actionable_finding],
+            stats={},
+            llm_calls=0,
+            tokens_used=0,
+        )
+
+    _mock_stage_run(harness.stages[0])
+    _mock_stage_run(harness.stages[1])
+    harness.stages[2].run = s3_returns_finding
+
+    with patch('subprocess.run', side_effect=_no_git_signals), caplog.at_level(
+        logging.INFO, logger='fused_memory.reconciliation.harness'
+    ):
+        await harness.run_full_cycle('test-project', 'buffer_size:1')
+
+    # (a) Escalation MUST be emitted — the blocked normal task's bare project-wide
+    # orchestrator signal must not suppress it.
+    pending = esc_queue.get_pending()
+    stranded_escalations = [
+        e for e in pending
+        if e.category == 'recon_integrity_issue'
+        and 'Persistently unresolved' in e.summary
+    ]
+    assert len(stranded_escalations) >= 1, (
+        f'Expected an escalation for the blocked normal cited task (the bare '
+        f'orchestrator signal must be dropped per task 2409); got pending: '
+        f'{[e.summary for e in pending]}'
+    )
+
+    # (b) No suppression log fired for task 2335.
+    suppressed_records = [
+        r for r in caplog.records
+        if r.getMessage() == 'reconciliation.integrity_escalation_suppressed_live_workflow'
+    ]
+    assert suppressed_records == [], (
+        f'Expected NO suppression log for the blocked normal task; got '
+        f'affected_ids: {[r.__dict__.get("affected_ids") for r in suppressed_records]}'
+    )
+
+
 # ---------------------------------------------------------------------------
 # Harness injects filtered_task_tree into IntegrityCheck (task 1661 step-7)
 # ---------------------------------------------------------------------------

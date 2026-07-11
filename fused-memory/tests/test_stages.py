@@ -9445,15 +9445,19 @@ class TestAssemblePayloadLiveWorkflowSignalsSection:
         )
 
     @pytest.mark.asyncio
-    async def test_live_workflow_signals_section_drops_orchestrator_signal_for_blocked_deterministic_task(
+    async def test_live_workflow_signals_section_drops_orchestrator_signal_for_blocked_deterministic_and_normal_tasks(
         self, mock_deps, watermark, monkeypatch
     ):
         """A BLOCKED task's ONLY live signal (the project-wide orchestrator lock) is
-        dropped when the task is deterministic (never acquires a worktree/branch —
-        routed to DeterministicRunner), so it is NOT listed under Live-Workflow
-        Signals — while a normal blocked task with the same (orchestrator-only)
-        evidence IS still listed, because it may legitimately auto-unblock and be
-        mid-pipeline (task 2031).
+        dropped both when the task is deterministic (never acquires a worktree/branch
+        — routed to DeterministicRunner) AND when the task is normal/task_kind-absent
+        with no registered worktree and no recent commit (task 2409 extends the
+        suppression to that bare-orchestrator-evidence case — it caused tasks
+        2335/2196 to loop through repeated re-deferral). With both tasks in this pool
+        suppressed, the whole '### Live-Workflow Signals' section is absent; see
+        TestAssemblePayloadLiveWorkflowSignalsSection's
+        test_live_workflow_signals_section_drops_bare_orchestrator_signal_for_blocked_normal_task
+        for the contrasting with-worktree preservation case.
 
         Drives the REAL (task_kind-aware) detect_live_workflow — does NOT
         monkeypatch it — to prove the renderer actually threads
@@ -9509,23 +9513,126 @@ class TestAssemblePayloadLiveWorkflowSignalsSection:
         with patch('subprocess.run', side_effect=_no_git_signals):
             payload = await stage.assemble_payload([], watermark, [])
 
+        # Task 2409: the normal blocked task (742) no longer keeps the signal in the
+        # bare-evidence case (no worktree, no recent commit) — it is inverted from the
+        # pre-2409 expectation. With BOTH tasks now suppressed (561 via rule 2,
+        # unconditional; 742 via rule 3, task 2409), no task in this pool is live, so
+        # the whole section is absent. Explicit per-task assertions come first so a
+        # PARTIAL regression (e.g. rule 3 stops suppressing 742 while rule 2 keeps
+        # suppressing 561) is attributed to the correct task, rather than only
+        # failing the whole-section-absence check below with a generic message.
+        assert f'task/{blocked_deterministic_id}' not in payload, (
+            f"Expected blocked deterministic task {blocked_deterministic_id} NOT "
+            f"listed — rule 2 (unconditional) must still suppress its bare "
+            f"orchestrator signal; got payload snippet:\n{payload[-500:]!r}"
+        )
+        assert f'task/{blocked_normal_id}' not in payload, (
+            f"Expected blocked normal task {blocked_normal_id} NOT listed — rule 3 "
+            f"(task 2409: no worktree/no recent commit) must suppress its bare "
+            f"orchestrator signal; got payload snippet:\n{payload[-500:]!r}"
+        )
+        assert '### Live-Workflow Signals' not in payload, (
+            f"Expected '### Live-Workflow Signals' section absent — neither the "
+            f"blocked deterministic task 561 (rule 2, unconditional) nor the blocked "
+            f"normal task 742 (rule 3, task 2409: no worktree/no recent commit) "
+            f"retains a live signal; got snippet:\n{payload[-500:]!r}"
+        )
+
+    @pytest.mark.asyncio
+    async def test_live_workflow_signals_section_drops_bare_orchestrator_signal_for_blocked_normal_task(
+        self, mock_deps, watermark, monkeypatch
+    ):
+        """A BLOCKED normal (or task_kind-absent) task's ONLY live signal (the
+        project-wide orchestrator lock) is dropped when it has no registered
+        worktree and no recent commit — task 2409 closes the repeated re-deferral
+        loop affecting tasks 2335/2196, whose only Live-Workflow Signal was the bare
+        project-wide orchestrator lock despite satisfied deps and no genuine live
+        pipeline. A blocked normal task that DOES carry genuine per-task evidence (a
+        registered worktree) is unaffected by the guard and remains listed.
+
+        Drives the REAL (task_kind-aware) detect_live_workflow — does NOT
+        monkeypatch it — to prove the renderer actually threads metadata.task_kind
+        and status through to the detector's new rule 3 rather than just filtering
+        elsewhere.
+        """
+        import subprocess
+
+        import fused_memory.reconciliation.stages.task_knowledge_sync as tks_module
+
+        bare_normal_id = '2335'
+        bare_kindless_id = '2196'
+        with_worktree_id = '999'
+        bare_normal_task = {
+            'id': int(bare_normal_id),
+            'title': 'Blocked normal task, bare orchestrator only',
+            'status': 'blocked',
+            'metadata': {'task_kind': 'normal'},
+        }
+        bare_kindless_task = {
+            'id': int(bare_kindless_id),
+            'title': 'Blocked task_kind-absent task, bare orchestrator only',
+            'status': 'blocked',
+        }
+        with_worktree_task = {
+            'id': int(with_worktree_id),
+            'title': 'Blocked normal task with a registered worktree',
+            'status': 'blocked',
+            'metadata': {'task_kind': 'normal'},
+        }
+
+        # Project-wide orchestrator lock reports live...
+        monkeypatch.setattr(tks_module, 'is_orchestrator_live_for', lambda _pr: True)
+
+        # ...and git-derived signals are False for every branch EXCEPT a registered
+        # worktree for task/999 (the with_worktree_task's branch); `git log` exits
+        # non-zero for every branch (recent_commit False via the returncode guard).
+        def _signals(args, **kwargs):
+            if '--porcelain' in args:
+                return subprocess.CompletedProcess(
+                    args=args, returncode=0,
+                    stdout=(
+                        'worktree /project\nHEAD abc1234\nbranch refs/heads/main\n\n'
+                        f'worktree /project-999\nHEAD def5678\n'
+                        f'branch refs/heads/task/{with_worktree_id}\n\n'
+                    ),
+                    stderr='',
+                )
+            return subprocess.CompletedProcess(
+                args=args, returncode=1, stdout='', stderr='',
+            )
+
+        stage = make_configured_task_knowledge_sync_stage(
+            mock_deps, project_id='dark_factory', project_root='/project'
+        )
+        stage.filtered_task_tree = self._make_filtered_tree_with_tasks(
+            [bare_normal_task, bare_kindless_task, with_worktree_task]
+        )
+
+        with patch('subprocess.run', side_effect=_signals):
+            payload = await stage.assemble_payload([], watermark, [])
+
         assert '### Live-Workflow Signals' in payload, (
-            f"Expected '### Live-Workflow Signals' section (the normal blocked task "
-            f"is live via the orchestrator signal); got snippet:\n{payload[-500:]!r}"
+            f"Expected '### Live-Workflow Signals' section (the with-worktree task "
+            f"is live); got snippet:\n{payload[-500:]!r}"
         )
         section_start = payload.find('### Live-Workflow Signals')
         section_end = payload.find('\n#', section_start + 1)
         section_body = payload[section_start:section_end if section_end != -1 else None]
 
-        assert f'task/{blocked_normal_id}' in section_body, (
-            f"Expected normal blocked task 742 (orchestrator signal legitimately "
-            f"fires — may auto-unblock mid-pipeline) listed; got section:\n{section_body!r}"
+        assert f'task/{with_worktree_id}' in section_body, (
+            f"Expected blocked normal task {with_worktree_id} WITH a registered "
+            f"worktree listed — genuine per-task evidence means the bare-orchestrator "
+            f"guard does not apply; got section:\n{section_body!r}"
         )
-        assert f'task/{blocked_deterministic_id}' not in section_body, (
-            f"Expected blocked deterministic task 561 NOT listed — its only signal "
-            f"(the project-wide orchestrator lock) must be dropped since a "
-            f"deterministic task never acquires a worktree/branch of its own; "
-            f"got section:\n{section_body!r}"
+        assert f'task/{bare_normal_id}' not in section_body, (
+            f"Expected blocked normal task {bare_normal_id} (orchestrator-only, no "
+            f"worktree, no recent commit) NOT listed — task 2409 drops the bare "
+            f"project-wide orchestrator signal for it; got section:\n{section_body!r}"
+        )
+        assert f'task/{bare_kindless_id}' not in section_body, (
+            f"Expected blocked task_kind-absent task {bare_kindless_id} "
+            f"(orchestrator-only) NOT listed — task_kind=None is treated the same as "
+            f"'normal'; got section:\n{section_body!r}"
         )
 
 

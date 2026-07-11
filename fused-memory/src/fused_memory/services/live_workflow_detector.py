@@ -54,6 +54,23 @@ per-task ``worktree_registered``/``recent_commit`` signals remain unaffected,
 so a blocked deterministic task that somehow did acquire a worktree is still
 live.
 
+**Blocked normal tasks (task 2409).** The same bare-orchestrator-lock problem
+also affects **normal** (``task_kind`` absent or ``'normal'``) blocked tasks:
+a blocked, normal-kind task with satisfied dependencies and no genuine live
+pipeline can show only the project-wide ``orchestrator`` signal and be treated
+as owned/live indefinitely, so reconciliation/redispatch never fires — the
+repeated re-deferral loop observed for tasks 2335/2196.  ``detect_live_workflow``
+therefore also forces ``orchestrator_live`` to ``False`` when ``status ==
+'blocked' AND task_kind in (None, 'normal') AND NOT worktree_registered AND NOT
+recent_commit``.  Unlike the deterministic rule, this one is guarded on the
+per-task git signals: a normal blocked task *can* legitimately hold a
+registered worktree or a recent commit while auto-unblocking mid-pipeline
+(task 2031's original concern), so the guard only suppresses the bare case —
+whenever real per-task evidence exists, ``orchestrator_live`` is reported
+honestly and the task remains live via that evidence (``is_live`` is
+unaffected either way, since it already ORs in ``worktree_registered``/
+``recent_commit``).
+
 The legitimate stranded case (orchestrator down, no worktree, no recent commits)
 has all three signals False, so recon still escalates it.
 
@@ -99,6 +116,12 @@ ORCH_LIVE_INELIGIBLE_STATUSES: frozenset[str] = frozenset({'deferred', 'done', '
 # (DeterministicRunner-routed: no worktree/branch is ever acquired). Mirrors
 # Scheduler._is_deterministic's metadata.task_kind == 'deterministic' check.
 DETERMINISTIC_TASK_KIND: str = 'deterministic'
+
+# task_kind value (and documented default when metadata.task_kind is unset) for
+# ordinary LLM-agent-pipeline tasks. Used by rule 3 of
+# _orchestrator_signal_ineligible (task 2409) to scope the blocked-normal
+# bare-orchestrator suppression.
+NORMAL_TASK_KIND: str = 'normal'
 
 
 @dataclass(frozen=True)
@@ -158,10 +181,14 @@ def detect_live_workflow(
             the project-wide ``orchestrator_live`` signal is also forced to
             ``False`` — a deterministic task never acquires a worktree/branch,
             so the bare project lock is not task-specific evidence for it while
-            blocked.  See :func:`_orchestrator_signal_ineligible`.  ``None``
-            (default) leaves the orchestrator_live computation unaffected for
-            non-deterministic (or unknown-kind) tasks — fully backward
-            compatible.
+            blocked.  Likewise (task 2409), when ``status == 'blocked'`` and
+            ``task_kind`` is ``None`` or ``NORMAL_TASK_KIND`` and there is
+            neither a registered worktree nor a recent commit for the task's
+            own branch, the signal is forced ``False`` too — see
+            :func:`_orchestrator_signal_ineligible` for both rules.  For a
+            blocked task with genuine per-task evidence (a registered worktree
+            or a recent commit), or for any non-blocked status, the
+            orchestrator_live computation is unaffected by ``task_kind``.
         _orchestrator_live: Pre-computed project-level orchestrator-lock result.
             When provided, skips the ``is_orchestrator_live_for(project_root)``
             call — use this to hoist the constant project-level check out of
@@ -190,8 +217,11 @@ def detect_live_workflow(
     # _orchestrator_signal_ineligible) force this signal False — the
     # project-wide lock is not evidence of liveness for a task that will never
     # be dispatched (or, for blocked deterministic tasks, never acquires a
-    # worktree/branch of its own).
-    if _orchestrator_signal_ineligible(status, task_kind):
+    # worktree/branch of its own; or, for blocked normal tasks with no
+    # per-task git evidence, task 2409).  worktree_registered/recent_commit
+    # (already computed above) are threaded through so rule 3 can require
+    # their absence.
+    if _orchestrator_signal_ineligible(status, task_kind, worktree_registered, recent_commit):
         orchestrator_live = False
     else:
         orchestrator_live = (
@@ -230,11 +260,17 @@ def is_workflow_live_for_task(
 # ---------------------------------------------------------------------------
 
 
-def _orchestrator_signal_ineligible(status: str | None, task_kind: str | None) -> bool:
+def _orchestrator_signal_ineligible(
+    status: str | None,
+    task_kind: str | None,
+    worktree_registered: bool = False,
+    recent_commit: bool = False,
+) -> bool:
     """Return True when the project-wide ``orchestrator_live`` signal must be
-    forced False for this *status*/*task_kind* combination.
+    forced False for this *status*/*task_kind* (/*worktree_registered*/
+    *recent_commit*) combination.
 
-    Two independent rules are centralized here:
+    Three independent rules are centralized here:
 
     1. ``status`` is a member of :data:`ORCH_LIVE_INELIGIBLE_STATUSES`
        (``deferred``, ``done``, ``cancelled``) — statuses that are never
@@ -243,18 +279,38 @@ def _orchestrator_signal_ineligible(status: str | None, task_kind: str | None) -
     2. ``status == 'blocked' and task_kind == DETERMINISTIC_TASK_KIND`` — a
        blocked deterministic task, which never acquires a worktree/branch (it
        is routed to ``DeterministicRunner`` instead), so the bare project lock
-       is not task-specific evidence for it either (task 2067).
+       is not task-specific evidence for it either (task 2067). Unconditional:
+       a deterministic task never has git evidence to lose.
+    3. ``status == 'blocked' and task_kind in (None, NORMAL_TASK_KIND) and not
+       worktree_registered and not recent_commit`` — a blocked normal (or
+       task_kind-absent) task with NO per-task git evidence, which is the
+       bare-orchestrator false positive that caused tasks 2335/2196 to loop
+       through repeated re-deferral (task 2409). Guarded on the git signals
+       (unlike rule 2): a normal blocked task can legitimately hold a
+       worktree/recent commit while auto-unblocking mid-pipeline (task 2031's
+       concern), so this rule only suppresses the bare case, leaving
+       ``is_live`` (which already ORs in ``worktree_registered``/
+       ``recent_commit``) unaffected whenever real per-task evidence exists.
 
     ``'blocked'`` is deliberately NOT added to ``ORCH_LIVE_INELIGIBLE_STATUSES``
     wholesale: a normal blocked task (``task_kind`` absent or not
     ``'deterministic'``) may auto-unblock and be legitimately mid-pipeline, so
-    the project-wide orchestrator lock remains real per-task evidence for it.
-    Hence the compound (status AND task_kind) condition for rule 2, rather than
-    an unconditional status addition.
+    the project-wide orchestrator lock remains real per-task evidence for it
+    *when there is other evidence to corroborate it*. Hence the compound
+    (status AND task_kind [AND NOT git-evidence]) conditions for rules 2 and 3,
+    rather than an unconditional status addition.
     """
     if status is not None and status in ORCH_LIVE_INELIGIBLE_STATUSES:
         return True
-    return status == 'blocked' and task_kind == DETERMINISTIC_TASK_KIND
+    if status != 'blocked':
+        return False
+    if task_kind == DETERMINISTIC_TASK_KIND:
+        return True
+    return (
+        task_kind in (None, NORMAL_TASK_KIND)
+        and not worktree_registered
+        and not recent_commit
+    )
 
 
 def _check_worktree_registered(project_root: str, branch: str) -> bool:

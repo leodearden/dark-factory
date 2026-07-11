@@ -431,10 +431,19 @@ class TestStatusScopedOrchestratorSignal:
         assert result.is_live is False
 
     @pytest.mark.parametrize(
-        'status', ['pending', 'in-progress', 'blocked', 'review', 'merge-deferred']
+        'status', ['pending', 'in-progress', 'review', 'merge-deferred']
     )
     def test_non_ineligible_status_preserves_orchestrator_signal(self, tmp_path, status):
-        """Non-ineligible statuses leave the project-wide orchestrator_live signal intact."""
+        """Non-ineligible statuses leave the project-wide orchestrator_live signal intact.
+
+        'blocked' is deliberately EXCLUDED from this parametrize list (unlike prior to
+        task 2409): with no task_kind passed (defaults to None) and no git evidence,
+        'blocked' now depends on rule 3 (see _orchestrator_signal_ineligible) rather
+        than being unconditionally preserved. See
+        TestBlockedNormalOrchestratorSuppression (bare case: suppressed) and
+        TestBlockedDeterministicOrchestratorSuppression for 'blocked''s task_kind-aware
+        coverage.
+        """
         with patch('subprocess.run', side_effect=self._no_worktree_no_commit_side_effect()):
             result = detect_live_workflow(
                 _TASK_ID, str(tmp_path), status=status, _orchestrator_live=True
@@ -496,8 +505,11 @@ class TestBlockedDeterministicOrchestratorSuppression:
     A deterministic task (task_kind == 'deterministic') never acquires a worktree/branch
     (it is routed to DeterministicRunner instead), so the bare project-wide orchestrator
     lock is not task-specific evidence for it while blocked. Normal blocked tasks
-    (task_kind != 'deterministic', including task_kind=None) keep the signal, since they
-    may legitimately be mid-pipeline and auto-unblock (task 2031).
+    (task_kind != 'deterministic', including task_kind=None) keep the signal ONLY when
+    they carry genuine per-task evidence (a registered worktree or a recent commit) —
+    since task 2409, the bare-orchestrator-only case is suppressed too. See
+    TestBlockedNormalOrchestratorSuppression below for that case (task 2409 closes the
+    repeated re-deferral loop this caused for tasks 2335/2196).
     """
 
     def _no_worktree_no_commit_side_effect(self):
@@ -526,22 +538,14 @@ class TestBlockedDeterministicOrchestratorSuppression:
         assert result.recent_commit is False
         assert result.is_live is False
 
-    @pytest.mark.parametrize('task_kind', ['normal', None])
-    def test_blocked_non_deterministic_preserves_orchestrator_signal(self, tmp_path, task_kind):
-        """status='blocked' with a non-deterministic (or absent) task_kind keeps the signal.
-
-        Regression guard: normal blocked tasks may auto-unblock and be legitimately
-        mid-pipeline (task 2031), so the project-wide orchestrator lock is still real
-        per-task evidence for them.
-        """
-        with patch('subprocess.run', side_effect=self._no_worktree_no_commit_side_effect()):
-            result = detect_live_workflow(
-                _TASK_ID, str(tmp_path),
-                status='blocked', task_kind=task_kind, _orchestrator_live=True,
-            )
-
-        assert result.orchestrator_live is True
-        assert result.is_live is True
+    # test_blocked_non_deterministic_preserves_orchestrator_signal previously lived
+    # here, asserting that a blocked normal/None-task_kind task with NO worktree and
+    # NO recent commit still preserved the orchestrator_live signal. Task 2409
+    # reverses that premise for the bare-evidence case (it caused a repeated
+    # re-deferral loop for tasks 2335/2196) — see
+    # TestBlockedNormalOrchestratorSuppression below, which folds in both the
+    # inverted bare-suppression case and the with-worktree/with-recent-commit
+    # preservation cases.
 
     def test_blocked_deterministic_does_not_suppress_worktree_signal(self, tmp_path):
         """A blocked deterministic task with a REGISTERED worktree is still live —
@@ -591,6 +595,145 @@ class TestBlockedDeterministicOrchestratorSuppression:
             live = is_workflow_live_for_task(
                 _TASK_ID, str(tmp_path),
                 status='blocked', task_kind='deterministic', _orchestrator_live=True,
+            )
+
+        assert live is False
+
+
+# ---------------------------------------------------------------------------
+# Blocked-normal bare-orchestrator suppression (task 2409)
+# ---------------------------------------------------------------------------
+
+
+class TestBlockedNormalOrchestratorSuppression:
+    """detect_live_workflow(status='blocked', task_kind in (None, 'normal')) suppresses
+    the project-wide orchestrator_live signal when the task carries NO per-task
+    evidence (no registered worktree, no recent commit) — the bare-orchestrator false
+    positive that caused tasks 2335/2196 to loop through repeated re-deferral: a
+    blocked, normal-kind task with satisfied deps and no genuine live pipeline showed
+    only 'orchestrator' in Live-Workflow Signals and was treated as owned/live.
+
+    When genuine per-task evidence DOES exist (a registered worktree or a recent
+    commit on the task's branch), the project-wide orchestrator lock remains real
+    corroborating evidence and is preserved — a normal blocked task may legitimately
+    be mid-pipeline and auto-unblock (task 2031's concern). Non-blocked statuses
+    (pending/in-progress/review/merge-deferred) are entirely unaffected by this rule,
+    regardless of task_kind or git signals — the status guard from task 2031
+    preserves dispatch-raceable and in-pipeline tasks.
+    """
+
+    def _no_worktree_no_commit_side_effect(self):
+        """subprocess.run side_effect driving both git signals False."""
+        def side_effect(args, **kwargs):
+            return subprocess.CompletedProcess(
+                args=args, returncode=0,
+                stdout=_worktree_porcelain_no_branch(), stderr=''
+            )
+        return side_effect
+
+    @pytest.mark.parametrize('task_kind', ['normal', None])
+    def test_blocked_normal_bare_orchestrator_signal_suppressed(self, tmp_path, task_kind):
+        """status='blocked' + task_kind in ('normal', None) + no worktree/commit forces
+        orchestrator_live False — the bare-orchestrator false positive (tasks 2335/2196).
+
+        Both git signals are False, so is_live=False proves the project-wide
+        orchestrator lock is not being consulted at all for this combination. This
+        inverts the pre-2409 expectation (see the note left in
+        TestBlockedDeterministicOrchestratorSuppression where the old
+        test_blocked_non_deterministic_preserves_orchestrator_signal used to live).
+        """
+        with patch('subprocess.run', side_effect=self._no_worktree_no_commit_side_effect()):
+            result = detect_live_workflow(
+                _TASK_ID, str(tmp_path),
+                status='blocked', task_kind=task_kind, _orchestrator_live=True,
+            )
+
+        assert result.orchestrator_live is False
+        assert result.worktree_registered is False
+        assert result.recent_commit is False
+        assert result.is_live is False
+
+    def test_blocked_normal_with_registered_worktree_preserves_signal(self, tmp_path):
+        """status='blocked' + task_kind='normal' + a REGISTERED worktree keeps
+        orchestrator_live True — genuine per-task evidence means the bare-evidence
+        guard does not apply, and the project-wide lock is still reported honestly
+        for the renderer's per-signal display.
+        """
+        def side_effect(args, **kwargs):
+            if '--porcelain' in args:
+                return subprocess.CompletedProcess(
+                    args=args, returncode=0,
+                    stdout=_worktree_porcelain_with_branch(_BRANCH), stderr=''
+                )
+            return subprocess.CompletedProcess(
+                args=args, returncode=1, stdout='', stderr=''
+            )
+
+        with patch('subprocess.run', side_effect=side_effect):
+            result = detect_live_workflow(
+                _TASK_ID, str(tmp_path),
+                status='blocked', task_kind='normal', _orchestrator_live=True,
+            )
+
+        assert result.orchestrator_live is True
+        assert result.worktree_registered is True
+        assert result.is_live is True
+
+    def test_blocked_normal_with_recent_commit_preserves_signal(self, tmp_path):
+        """status='blocked' + task_kind='normal' + a recent commit on task/<id> keeps
+        orchestrator_live True — genuine per-task evidence means the bare-evidence
+        guard does not apply.
+        """
+        now = datetime(2026, 1, 1, tzinfo=UTC)
+        recent_ts = (now - timedelta(hours=1)).isoformat()
+
+        def side_effect(args, **kwargs):
+            if '--porcelain' in args:
+                return subprocess.CompletedProcess(
+                    args=args, returncode=0,
+                    stdout=_worktree_porcelain_no_branch(), stderr=''
+                )
+            return subprocess.CompletedProcess(
+                args=args, returncode=0, stdout=recent_ts, stderr=''
+            )
+
+        with patch('subprocess.run', side_effect=side_effect):
+            result = detect_live_workflow(
+                _TASK_ID, str(tmp_path),
+                status='blocked', task_kind='normal', _orchestrator_live=True,
+                now=now,
+            )
+
+        assert result.orchestrator_live is True
+        assert result.recent_commit is True
+        assert result.is_live is True
+
+    @pytest.mark.parametrize('status', ['pending', 'in-progress', 'review', 'merge-deferred'])
+    def test_non_blocked_status_preserves_orchestrator_signal_for_normal_task(
+        self, tmp_path, status
+    ):
+        """Only the blocked+normal(-or-None) combination triggers rule 3. Other live
+        statuses (pending/in-progress/review/merge-deferred) with a normal task_kind
+        leave the project-wide orchestrator_live signal intact — the status guard
+        preserves dispatch-raceable / in-pipeline tasks regardless of task_kind.
+        """
+        with patch('subprocess.run', side_effect=self._no_worktree_no_commit_side_effect()):
+            result = detect_live_workflow(
+                _TASK_ID, str(tmp_path),
+                status=status, task_kind='normal', _orchestrator_live=True,
+            )
+
+        assert result.orchestrator_live is True
+        assert result.is_live is True
+
+    def test_is_workflow_live_for_task_suppresses_for_blocked_normal(self, tmp_path):
+        """is_workflow_live_for_task returns False for a blocked normal task with no
+        git signals and only the bare project-wide orchestrator lock as evidence.
+        """
+        with patch('subprocess.run', side_effect=self._no_worktree_no_commit_side_effect()):
+            live = is_workflow_live_for_task(
+                _TASK_ID, str(tmp_path),
+                status='blocked', task_kind='normal', _orchestrator_live=True,
             )
 
         assert live is False

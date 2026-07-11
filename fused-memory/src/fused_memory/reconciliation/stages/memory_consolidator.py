@@ -709,6 +709,9 @@ Review the above data and perform memory consolidation:
         Reuses Stage 2's ``_render_live_workflow_section`` renderer (imported from
         task_knowledge_sync.py) so both stages emit byte-identical section
         formatting for the same underlying live-workflow signals (task 1977).
+        This reuse means detector-layer behavior changes apply here
+        automatically with no code change — including the blocked-normal
+        bare-orchestrator-signal suppression added in task 2409.
 
         Returns '' when the guard fails or no active task is currently live —
         keeps the payload tight, matching _build_task_tree_section's pattern.
