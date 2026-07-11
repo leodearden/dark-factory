@@ -1696,10 +1696,29 @@ async def filter_already_tracked_systemic_patterns(
     maximised over all done tasks.  Order-preserving: surviving flags keep
     their original relative order.
 
-    NOTE: this is the base matching + scope-guard behaviour.  Fail-open
-    guards around the ``get_tasks`` call itself (falsy taskmaster/
-    dark_factory_root, get_tasks errors, malformed results) are added in a
-    follow-up hardening pass (see the updated docstring once that lands).
+    **Done-only** (task 2412 cannot self-suppress its own duplicate finding):
+    ``statuses=['done']`` is passed explicitly, so a PENDING duplicate task
+    can never suppress the finding that motivated filing it — only already
+    *merged* work counts as "already tracked".
+
+    **Fail-open** in every direction, mirroring
+    :func:`filter_terminal_metadata_flags`'s drop-only-on-positive-
+    confirmation posture (losing a genuine systemic-pattern signal is worse
+    than one extra dedup cycle):
+
+    * A falsy ``taskmaster`` or ``dark_factory_root`` degrades to a no-op
+      ``list(flags)`` pass-through with no ``get_tasks`` call — e.g. a
+      harness/test that never registers dark_factory in ``known_projects``.
+    * A ``get_tasks`` exception (other than ``asyncio.CancelledError`` /
+      ``KeyboardInterrupt`` / ``SystemExit``, which re-raise) is logged and
+      treated as KEEP-all for this cycle.
+    * A malformed result (not a dict, or missing/empty ``'tasks'``) is
+      treated as zero done tasks — every candidate survives the matching
+      loop with coverage 0.
+
+    A structured ``logger.info('reconciliation.systemic_pattern_already_tracked_dropped',
+    ...)`` is emitted per dropped flag with the matched done task id and the
+    finding's key terms, mirroring the sibling filters' drop observability.
 
     Args:
         taskmaster: Object with an async ``get_tasks(project_root, *,
@@ -1716,6 +1735,11 @@ async def filter_already_tracked_systemic_patterns(
     Returns:
         Filtered list with already-tracked systemic_pattern flags removed.
     """
+    if not taskmaster or not dark_factory_root:
+        # Degrade to a no-op pass-through — mirrors filter_terminal_metadata_flags
+        # / filter_false_absence_flags (task 2416 step-8).
+        return list(flags)
+
     candidate_positions: list[int] = []
     candidate_terms: list[set[str]] = []
     for i, flag in enumerate(flags):
@@ -1728,10 +1752,26 @@ async def filter_already_tracked_systemic_patterns(
         # the matching loop below (scope guard, task 2416 step-6).
         return list(flags)
 
-    result = await taskmaster.get_tasks(dark_factory_root, statuses=['done'])
-    done_tasks = result.get('tasks') or []
-    task_term_sets = [
-        _significant_terms(f"{task.get('title') or ''} {task.get('description') or ''}")
+    try:
+        result = await taskmaster.get_tasks(dark_factory_root, statuses=['done'])
+    except (asyncio.CancelledError, KeyboardInterrupt, SystemExit):
+        raise
+    except Exception as exc:
+        logger.info(
+            'reconciliation.systemic_pattern_already_tracked_get_tasks_error error=%s',
+            exc,
+        )
+        return list(flags)  # fail-open: KEEP all on lookup error
+
+    # Tolerate a malformed result (not a dict, or missing/empty 'tasks') —
+    # degrades to "zero done tasks", so every candidate KEEPS below.
+    done_tasks = result.get('tasks') if isinstance(result, dict) else None
+    done_tasks = done_tasks or []
+    done_tasks_with_terms = [
+        (
+            task,
+            _significant_terms(f"{task.get('title') or ''} {task.get('description') or ''}"),
+        )
         for task in done_tasks
     ]
 
@@ -1742,14 +1782,21 @@ async def filter_already_tracked_systemic_patterns(
             # without attempting a match (task 2416 step-6 min-term floor).
             continue
         best_coverage = 0.0
-        for task_terms in task_term_sets:
+        best_task_id: Any = None
+        for task, task_terms in done_tasks_with_terms:
             if not task_terms:
                 continue
             coverage = len(finding_terms & task_terms) / len(finding_terms)
             if coverage > best_coverage:
                 best_coverage = coverage
+                best_task_id = task.get('id')
         if best_coverage >= match_coverage:
             drop_positions.add(pos)
+            logger.info(
+                'reconciliation.systemic_pattern_already_tracked_dropped '
+                'matched_task_id=%s coverage=%.2f finding_terms=%s',
+                best_task_id, best_coverage, sorted(finding_terms),
+            )
 
     return [flag for i, flag in enumerate(flags) if i not in drop_positions]
 
