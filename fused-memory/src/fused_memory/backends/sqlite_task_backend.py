@@ -758,6 +758,30 @@ async def _claimant_columns_present(conn: aiosqlite.Connection) -> bool:
     return 'claimant_run_id' in col_names and 'heartbeat_at' in col_names
 
 
+async def _candidate_key_index_present(conn: aiosqlite.Connection) -> bool:
+    """True iff the ``ux_tasks_candidate_key`` partial UNIQUE index exists on ``tasks``.
+
+    Feature-detection backing the add_task/update_task pre-write dedup
+    guards' hot-path skip (fm-task-dedup self-heal amendment, reviewer
+    follow-up): once the index is present it alone enforces (tag,
+    candidate_key) uniqueness for non-cancelled rows (backstopped by the
+    existing post-write ``sqlite3.IntegrityError`` mapping), so the extra
+    guard SELECT those write paths run as an index-INDEPENDENT backstop is
+    only needed while the index is absent -- the v3->v4 migration's
+    self-gated window (a flagged residual leaves it absent indefinitely,
+    reify incident esc-candidate-key-migration-2).
+
+    Called once per project_root, from ``_get_connection`` right after
+    ``_migrate`` runs and again by ``reaudit_candidate_key_index`` after a
+    live rebuild; the result is cached on
+    ``SqliteTaskBackend._candidate_key_index_cache`` and reused by the write
+    paths so a hot add_task/update_task loop doesn't re-run ``PRAGMA
+    index_list`` on every call.
+    """
+    index_rows = await (await conn.execute('PRAGMA index_list(tasks)')).fetchall()
+    return any(row[1] == 'ux_tasks_candidate_key' for row in index_rows)
+
+
 def _warn_malformed_metadata_once(
     project_root: str,
     tag: str,
@@ -928,6 +952,17 @@ class SqliteTaskBackend:
         # claimant write (the heartbeat-refresh hot path) is unnecessary.
         # Absent entries default to False (fail-safe) in the write paths.
         self._claimant_columns_cache: dict[str, bool] = {}
+        # Cached result of `_candidate_key_index_present` per project_root
+        # (reviewer follow-up to fm-task-dedup self-heal amendment):
+        # populated in `_get_connection` right after `_migrate` runs, and
+        # refreshed by `reaudit_candidate_key_index`. Lets add_task/
+        # update_task skip their index-independent pre-write dedup guard
+        # SELECT once the partial UNIQUE index is confirmed present -- the
+        # common steady state, where the index (backstopped by the existing
+        # post-write IntegrityError mapping) alone enforces uniqueness.
+        # Absent entries default to False (fail-safe: run the guard) so an
+        # unmigrated/absent cache entry never silently skips protection.
+        self._candidate_key_index_cache: dict[str, bool] = {}
         self._closed = False
         self._started = False
         # SQLite connections don't restart, so the counter is pinned at 1
@@ -1077,6 +1112,7 @@ class SqliteTaskBackend:
             # __init__ for why this is safe to compute a single time here
             # rather than on every claimant write.
             self._claimant_columns_cache[project_root] = await _claimant_columns_present(conn)
+            self._candidate_key_index_cache[project_root] = await _candidate_key_index_present(conn)
             self._connections[project_root] = conn
             logger.info('SqliteTaskBackend opened %s', db_path)
             return conn
@@ -1558,8 +1594,15 @@ class SqliteTaskBackend:
         landed) — a plain read, so no locking is needed for the check
         itself. Otherwise acquires the write lock (excluding concurrent
         writers for the duration of the re-audit, same as any other mutating
-        method) and returns ``_migrate_v3_to_v4``'s result dict merged with
-        the final ``user_version``.
+        method) and re-reads ``PRAGMA user_version`` a SECOND time, now that
+        the lock is held: a concurrent caller (another ``reaudit_...`` call,
+        or a racing connection-open) may have landed the index between the
+        first unlocked read and lock acquisition, and re-running
+        ``_migrate_v3_to_v4`` against an already-v4 connection is merely
+        wasteful (idempotent, but logs a confusing "clean audit (race?)"
+        line) rather than unsafe — this second check avoids that. Returns
+        ``_migrate_v3_to_v4``'s result dict merged with the final
+        ``user_version`` when the migration does run.
         """
         await self.ensure_connected()
         conn = await self._get_connection(project_root)
@@ -1567,10 +1610,20 @@ class SqliteTaskBackend:
         version_row = await version_cursor.fetchone()
         current_version = version_row[0] if version_row is not None else 0
         if current_version >= 4:
+            self._candidate_key_index_cache[project_root] = True
             return {'index_built': True, 'already_at_v4': True, 'user_version': 4}
 
         async with self._write_lock(project_root):
             conn = await self._get_connection(project_root)
+            # Re-check under the lock (see docstring) — another writer may
+            # have already landed the index while we were waiting for it.
+            version_cursor = await conn.execute('PRAGMA user_version')
+            version_row = await version_cursor.fetchone()
+            current_version = version_row[0] if version_row is not None else current_version
+            if current_version >= 4:
+                self._candidate_key_index_cache[project_root] = True
+                return {'index_built': True, 'already_at_v4': True, 'user_version': 4}
+
             result = await _migrate_v3_to_v4(
                 conn,
                 project_root=project_root,
@@ -1579,6 +1632,7 @@ class SqliteTaskBackend:
             version_cursor = await conn.execute('PRAGMA user_version')
             version_row = await version_cursor.fetchone()
             final_version = version_row[0] if version_row is not None else current_version
+            self._candidate_key_index_cache[project_root] = final_version >= 4
 
         return {**result, 'user_version': final_version}
 
@@ -1726,7 +1780,15 @@ class SqliteTaskBackend:
                 # below raises when the index IS present, so callers (the
                 # interceptor's create-dispatch combined resolution) need no
                 # changes regardless of which path catches the collision.
-                if candidate_key is not None:
+                # Gated on `_candidate_key_index_cache` (reviewer follow-up):
+                # once the index is confirmed present, IT alone enforces
+                # uniqueness (via the IntegrityError mapping below), so this
+                # extra SELECT is skipped on that hot-path steady state and
+                # only runs during the degraded index-absent window. A
+                # missing cache entry defaults to "absent" (fail-safe).
+                if candidate_key is not None and not self._candidate_key_index_cache.get(
+                    project_root, False,
+                ):
                     guard_cursor = await conn.execute(
                         "SELECT id, status FROM tasks WHERE tag = ? AND candidate_key = ? "
                         "AND status != 'cancelled' ORDER BY id LIMIT 1",
@@ -1984,8 +2046,13 @@ class SqliteTaskBackend:
                 # when the index IS present, so callers need no changes
                 # regardless of which path catches the collision. Excludes
                 # this row's own id — an update that recomputes to the key
-                # it already holds is not a collision.
-                if new_candidate_key is not None:
+                # it already holds is not a collision. Gated on
+                # `_candidate_key_index_cache` (reviewer follow-up) — see
+                # add_task's identical guard for why this SELECT is skipped
+                # once the index is confirmed present.
+                if new_candidate_key is not None and not self._candidate_key_index_cache.get(
+                    project_root, False,
+                ):
                     guard_cursor = await conn.execute(
                         "SELECT id, status FROM tasks WHERE tag = ? AND candidate_key = ? "
                         "AND status != 'cancelled' AND id != ? ORDER BY id LIMIT 1",
