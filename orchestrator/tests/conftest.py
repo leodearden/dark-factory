@@ -132,6 +132,17 @@ async def _reap_leaked_aiosqlite_connections():
     ``reap_leaked_aiosqlite_connections`` in ``_orch_helpers.py``): it never
     fails a test and is a cheap no-op for the (vast majority of) tests that
     leak no connection.
+
+    ASSUMPTION: every aiosqlite connection in this suite is function-scoped
+    (verified at task-2413 authorship time — no test uses a
+    module/session/package/class-scoped aiosqlite or ``CostStore`` fixture).
+    This autouse reaper runs after *every* test, so a future higher-scoped
+    shared aiosqlite connection meant to persist across tests would be
+    force-closed the first time this fixture tears down within that scope,
+    producing a confusing "Connection closed" failure in a later test rather
+    than in the one that actually introduced the shared fixture. If such a
+    fixture is ever added, it will need an explicit opt-out here (or its own
+    teardown ordered ahead of this one).
     """
     yield
     await reap_leaked_aiosqlite_connections()
