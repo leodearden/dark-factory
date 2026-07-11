@@ -553,6 +553,38 @@ def test_update_and_set_boost_fail_soft_when_absent(tmp_path: Path) -> None:
     assert sr.set_manual_boost('no-such-id', 5, root=tmp_path) is None
 
 
+def test_update_and_set_boost_fail_soft_when_lock_acquisition_raises(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A lock-acquisition fault (mkdir/os.open/flock raising OSError inside
+    decision_id_lock) must be absorbed by the same fail-soft try/except as a
+    read/write fault, not propagate into C8/cockpit callers.
+
+    Regression guard for the `with decision_id_lock(...)` placement: if it
+    were ever moved outside (or above) the helpers' existing try/except, this
+    would start raising instead of returning None.
+    """
+    rec = _make_decision(id='dec-lockfault', state=sr.DecisionState.OPEN, manual_boost=0)
+    sr.write_decision(rec, root=tmp_path)
+
+    @contextlib.contextmanager
+    def raising_lock(decision_id: str, root: Path | str | None = None):
+        raise OSError('simulated lock-acquisition fault')
+        yield  # pragma: no cover -- unreachable, satisfies generator-function shape
+
+    monkeypatch.setattr(sr, 'decision_id_lock', raising_lock)
+
+    with caplog.at_level(logging.ERROR):
+        state_result = sr.update_decision_state('dec-lockfault', sr.DecisionState.ANSWERED, root=tmp_path)
+        boost_result = sr.set_manual_boost('dec-lockfault', 5, root=tmp_path)
+
+    assert state_result is None
+    assert boost_result is None
+    assert any(r.levelno >= logging.ERROR for r in caplog.records)
+
+
 # ---------------------------------------------------------------------------
 # Step-6: decision_id_lock per-decision-id sidecar flock (task 2427)
 # ---------------------------------------------------------------------------
