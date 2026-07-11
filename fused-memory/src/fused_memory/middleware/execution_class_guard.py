@@ -45,10 +45,8 @@ from fused_memory.reconciliation.recon_self_model import EXECUTION_CLASSES
 
 __all__ = [
     'execution_class_error',
+    'inject_execution_class',
 ]
-# NOTE: 'inject_execution_class' joins __all__ in step-4 (task 2225) once it
-# is defined — pre-declaring it here would trip ruff F822 (undefined name in
-# __all__) in the interim.
 
 _VALID_EXECUTION_CLASSES: frozenset[str] = frozenset(EXECUTION_CLASSES)
 
@@ -136,5 +134,25 @@ def execution_class_error(
     return None
 
 
-# NOTE: inject_execution_class (and its __all__ entry) is added in step-4
-# (task 2225) — step-3 adds a RED test importing it first.
+def inject_execution_class(
+    metadata: str | dict[str, Any] | None,
+) -> dict[str, Any]:
+    """Return *metadata* normalised to a fresh dict (the persistence seam).
+
+    Mirrors ``inject_task_kind``'s normalisation half: None / JSON-string /
+    dict / unparseable → a fresh, shallow-copied ``dict`` so the caller's
+    object is never mutated and the result is always a plain dict ready for
+    JSON serialisation and for later typing (W3/2158).
+
+    Unlike ``inject_task_kind`` this injects *no* default value: a declared
+    ``execution_class`` is preserved verbatim, and an absent one stays absent.
+    Validity is enforced separately — and earlier — by
+    ``execution_class_error`` for recon-stage callers, so by the time a
+    recon-stage submission reaches here the field is already present and
+    valid; non-recon callers are unconstrained, so the field may legitimately
+    be absent.
+
+    Args:
+        metadata: Incoming task metadata (dict, JSON string, or None).
+    """
+    return dict(_parse_metadata(metadata))
