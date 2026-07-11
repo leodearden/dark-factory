@@ -8839,6 +8839,28 @@ class TestHarnessFetchTaskCountCensus:
         harness.taskmaster.get_statuses.assert_called_once_with(project_root='/abs/project')  # type: ignore[union-attr,attr-defined]
 
     @pytest.mark.asyncio
+    async def test_fetch_task_count_census_uses_fresh_read(self, journal, event_buffer, mock_memory_service):
+        """_fetch_task_count_census reads the authoritative census via get_statuses_fresh.
+
+        task 2388: get_statuses (served from the cached per-project connection)
+        can be pinned to a stale WAL snapshot, which is exactly what made the
+        census cross-check falsely report consistent:true. The authoritative
+        census must come from get_statuses_fresh (a dedicated, never-pinned
+        connection) instead — get_statuses must not be called at all.
+        """
+        harness = _make_test_harness(journal, event_buffer, mock_memory_service)
+        harness.taskmaster.get_statuses_fresh = AsyncMock(  # type: ignore[union-attr,attr-defined]
+            return_value={'1': 'cancelled', '2': 'done'}
+        )
+        harness.taskmaster.get_statuses = AsyncMock(return_value={'1': 'done', '2': 'done'})  # type: ignore[union-attr,attr-defined]
+
+        result = await harness._fetch_task_count_census(ProjectRoot('/abs/project'))
+
+        assert result == {'1': 'cancelled', '2': 'done'}
+        harness.taskmaster.get_statuses_fresh.assert_called_once_with(project_root='/abs/project')  # type: ignore[union-attr,attr-defined]
+        harness.taskmaster.get_statuses.assert_not_called()  # type: ignore[union-attr,attr-defined]
+
+    @pytest.mark.asyncio
     async def test_degrades_when_taskmaster_is_none(self, journal, event_buffer, mock_memory_service):
         """_fetch_task_count_census returns {} when taskmaster is None — no exception."""
         from fused_memory.config.schema import FusedMemoryConfig, ReconciliationConfig
