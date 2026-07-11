@@ -11,6 +11,35 @@ from __future__ import annotations
 
 from dataclasses import replace
 
+from orchestrator import session_registry as sr
+
+
+def _make_session(**overrides):
+    """Mirrors test_app.py/test_decision_queue.py's _make_record convention."""
+    fields: dict = {
+        'session_slug': 'unblock-df-2085-4242',
+        'status': sr.Status.RUNNING,
+        'title': 'unblock:df#2085 slug',
+        'role': 'unblock',
+        'project': 'df',
+        'task_id': '2085',
+        'start_ts': '2026-07-07T00:00:00+00:00',
+    }
+    fields.update(overrides)
+    return sr.SessionRecord(**fields)
+
+
+def _make_decision(**overrides):
+    """Mirrors test_decision_queue.py's _make_decision convention."""
+    fields: dict = {
+        'id': 'dec-1',
+        'project': 'df',
+        'text': 'Which port?',
+        'filed_at': '2026-07-07T00:00:00+00:00',
+    }
+    fields.update(overrides)
+    return sr.DecisionRecord(**fields)
+
 
 class TestMergeWeightEdits:
     def test_updates_only_category_and_project_weights(self):
@@ -43,3 +72,49 @@ class TestMergeWeightEdits:
 
         assert unparseable.project_weights == {'df': 3.0}
         assert empty.project_weights == {'df': 3.0}
+
+
+class TestKnownProjects:
+    def test_sorted_distinct_union_of_records_decisions_and_existing(self):
+        from cockpit.panes.weight_editor import known_projects
+
+        records = [_make_session(project='df')]
+        decisions = [_make_decision(project='other')]
+        existing = {'zeta': 1.0}
+
+        result = known_projects(records, decisions, existing)
+
+        assert result == ['df', 'other', 'zeta']
+
+    def test_dedupes_across_records_decisions_and_existing(self):
+        from cockpit.panes.weight_editor import known_projects
+
+        records = [_make_session(project='df')]
+        decisions = [_make_decision(project='df')]
+        existing = {'df': 1.0}
+
+        result = known_projects(records, decisions, existing)
+
+        assert result == ['df']
+
+    def test_empty_records_and_decisions_returns_existing_alone(self):
+        from cockpit.panes.weight_editor import known_projects
+
+        result = known_projects([], [], {'df': 1.0})
+
+        assert result == ['df']
+
+    def test_defaults_existing_to_empty(self):
+        from cockpit.panes.weight_editor import known_projects
+
+        assert known_projects([], []) == []
+
+    def test_empty_project_names_excluded_and_never_raise(self):
+        from cockpit.panes.weight_editor import known_projects
+
+        records = [_make_session(project='')]
+        decisions = [_make_decision(project='')]
+
+        result = known_projects(records, decisions, {'': 1.0})
+
+        assert result == []
