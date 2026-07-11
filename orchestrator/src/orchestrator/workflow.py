@@ -1705,7 +1705,10 @@ class TaskWorkflow:
             # _enter_phase(REVIEW) is ever called), so this edge is a
             # reliable "branch verified green pre-merge" signal.  Consumed
             # by the merge-skew attribution classifier's I5 branch-green
-            # fact (merge_disposition._branch_pre_merge_verify_green).
+            # fact (merge_disposition._branch_pre_merge_verify_green), which
+            # keys on task_id and reads only data['passed'] — base_sha/branch
+            # below are informational only (kept for future telemetry/log
+            # correlation; the classifier ignores them today).
             if prev is WorkflowState.VERIFY and new_state is WorkflowState.REVIEW:
                 self.event_store.emit(
                     EventType.workflow_verify,
@@ -1713,7 +1716,7 @@ class TaskWorkflow:
                     data={
                         'passed': True,
                         'base_sha': self._base_commit,
-                        'branch': self.task_id,
+                        'branch': f'{self.config.git.branch_prefix}{self.task_id}',
                     },
                 )
         self._phase_cost_at_entry = self.metrics.total_cost_usd

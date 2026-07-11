@@ -43,6 +43,7 @@ def _make_workflow(
     assignment.modules = []
 
     config = MagicMock(spec_set=pydantic_spec(OrchestratorConfig))
+    config.git = GitConfig()  # branch_prefix defaults to 'task/'
 
     scheduler = MagicMock()
     scheduler.set_task_status = AsyncMock()
@@ -61,10 +62,16 @@ def _make_workflow(
 class TestWorkflowVerifyProducerEmit:
     """The VERIFY→REVIEW edge inside ``_enter_phase`` must emit exactly one
     ``EventType.workflow_verify`` row keyed by ``task_id``, carrying
-    ``{'passed': True, 'base_sha': self._base_commit, 'branch': self.task_id}``.
+    ``{'passed': True, 'base_sha': self._base_commit, 'branch': <real branch ref>}``.
     REVIEW is reachable from VERIFY only on a passing verify (a failing
     verify routes to BLOCKED/ESCALATED before ``_enter_phase(REVIEW)``), so
     this edge is a reliable "branch verified green pre-merge" signal.
+
+    Only ``passed`` (plus the top-level ``task_id``) is actually read by the
+    classifier's I5 consumer (``merge_disposition._branch_pre_merge_verify_green``);
+    ``base_sha``/``branch`` are informational only, so ``branch`` must be the
+    real branch ref (``<branch_prefix><task_id>``), not a bare task id that
+    could be mistaken for one.
     """
 
     def test_verify_to_review_emits_exactly_one_workflow_verify_row(self, tmp_path: Path):
@@ -81,7 +88,7 @@ class TestWorkflowVerifyProducerEmit:
         assert rows[0]['data'] == {
             'passed': True,
             'base_sha': 'deadbeef',
-            'branch': wf.task_id,
+            'branch': f'{wf.config.git.branch_prefix}{wf.task_id}',
         }
 
     def test_execute_to_verify_emits_no_workflow_verify_row(self, tmp_path: Path):
