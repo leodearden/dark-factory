@@ -190,6 +190,70 @@ class TestTmuxBackendReorder:
         # ...and the restore is the LAST thing reorder does, after every move.
         assert runner.calls[-1] == ['tmux', 'select-window', '-t', '@7']
 
+    def test_reorder_restores_active_window_per_session_when_targets_span_sessions(self):
+        """Multi-session snapshot/restore: reorder() snapshots and restores
+        each involved session's active window INDEPENDENTLY -- exactly one
+        select-window per session, each using that session's own @id -- not
+        just a single session's worth of restore logic (every other
+        reorder() test here drives one session, 's').
+        """
+        from cockpit.backends.base import CommandResult, DisplayTarget
+        from cockpit.backends.tmux import TmuxBackend
+
+        runner = ScriptedRunner(
+            results={
+                ('tmux', 'display-message', '-p', '-t', 's1', '#{window_id}'): CommandResult(
+                    returncode=0, stdout='@11\n'
+                ),
+                ('tmux', 'display-message', '-p', '-t', 's2', '#{window_id}'): CommandResult(
+                    returncode=0, stdout='@22\n'
+                ),
+            }
+        )
+        backend = TmuxBackend(run=runner)
+        targets = [
+            DisplayTarget(kind='tmux', tmux_target='s1:0'),
+            DisplayTarget(kind='tmux', tmux_target='s2:0'),
+        ]
+
+        backend.reorder(targets)
+
+        assert not any(argv[1] == 'switch-client' for argv in runner.calls)
+        select_calls = [argv for argv in runner.calls if argv[1] == 'select-window']
+        assert select_calls == [
+            ['tmux', 'select-window', '-t', '@11'],
+            ['tmux', 'select-window', '-t', '@22'],
+        ]
+        # ...and both restores happen last, after every move for both sessions.
+        assert runner.calls[-2:] == select_calls
+
+    def test_reorder_skips_restore_for_session_when_display_message_fails(self, caplog):
+        """If a session's pre-reorder active-window snapshot can't be read
+        (display-message returns a nonzero rc, e.g. the session vanished),
+        reorder must not guess -- it skips restoring that session's focus
+        entirely (no select-window at all) rather than issuing one with a
+        bogus/empty target, and it warns so the skip is observable.
+        """
+        from cockpit.backends.base import CommandResult, DisplayTarget
+        from cockpit.backends.tmux import TmuxBackend
+
+        runner = ScriptedRunner(
+            results={
+                ('tmux', 'display-message', '-p', '-t', 's', '#{window_id}'): CommandResult(
+                    returncode=1, stderr='session not found: s'
+                ),
+            }
+        )
+        backend = TmuxBackend(run=runner)
+        targets = [DisplayTarget(kind='tmux', tmux_target='s:0')]
+
+        with caplog.at_level(logging.WARNING):
+            backend.reorder(targets)
+
+        assert not any(argv[1] == 'select-window' for argv in runner.calls)
+        assert not any(argv[1] == 'switch-client' for argv in runner.calls)
+        assert any(r.levelno == logging.WARNING for r in caplog.records)
+
     def test_reorder_skips_target_with_missing_tmux_target_and_warns(self, caplog):
         from cockpit.backends.base import DisplayTarget
         from cockpit.backends.tmux import TmuxBackend
