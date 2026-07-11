@@ -10,6 +10,8 @@ from __future__ import annotations
 
 import importlib.resources
 import logging
+import os
+import tempfile
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
@@ -286,6 +288,35 @@ def _warn_if_severity_weights_missing_escalation_vocabulary(
         )
 
 
+def _priorities_to_dict(priorities: Priorities) -> dict[str, Any]:
+    """Build a YAML-ready dict from *priorities* — the exact inverse of _priorities_from_dict.
+
+    Emits the same six top-level sections load_priorities/_priorities_from_dict
+    read (severity_weights/category_weights/project_weights + defaults/
+    age_curve/manual_boost), so save_priorities -> load_priorities round-trips
+    to an equal Priorities.
+    """
+    return {
+        'severity_weights': dict(priorities.severity_weights),
+        'category_weights': dict(priorities.category_weights),
+        'project_weights': dict(priorities.project_weights),
+        'defaults': {
+            'severity': priorities.defaults.severity,
+            'category': priorities.defaults.category,
+            'project': priorities.defaults.project,
+        },
+        'age_curve': {
+            'max_bonus': priorities.age_curve.max_bonus,
+            'saturation_seconds': priorities.age_curve.saturation_seconds,
+        },
+        'manual_boost': {
+            'weight': priorities.manual_boost.weight,
+            'min': priorities.manual_boost.min,
+            'max': priorities.manual_boost.max,
+        },
+    }
+
+
 def load_priorities(path: Path | None = None) -> Priorities:
     """Load Priorities from *path* (default ``~/.claude/fleet/priorities.yaml``).
 
@@ -326,6 +357,28 @@ def load_priorities(path: Path | None = None) -> Priorities:
         return priorities
 
     return _priorities_from_dict(_load_bundled_defaults())
+
+
+def save_priorities(priorities: Priorities, path: Path | None = None) -> None:
+    """Atomically write *priorities* to *path* (default ``~/.claude/fleet/priorities.yaml``).
+
+    The exact inverse of load_priorities/_priorities_from_dict (see
+    _priorities_to_dict): writes the same six sections load_priorities
+    reads, so ``load_priorities(path) == priorities`` after this call.
+    Mirrors ui_config.save_ui_config's atomic tmp-file-in-target's-own-
+    parent-dir + os.replace idiom, so a save is never observed
+    half-written.
+    """
+    target = path if path is not None else _default_priorities_path()
+    target.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp_path_str = tempfile.mkstemp(
+        suffix='.tmp',
+        prefix=target.stem,
+        dir=str(target.parent),
+    )
+    with os.fdopen(fd, 'w') as f:
+        yaml.safe_dump(_priorities_to_dict(priorities), f)
+    os.replace(tmp_path_str, str(target))
 
 
 def ensure_priorities_file(path: Path | None = None) -> None:
