@@ -13,7 +13,11 @@ requires-python = ">=3.11,<4"
 dependencies = [
     "textual>=0.60",
     "pyyaml>=6.0",
+    "orchestrator",
 ]
+
+[tool.uv.sources]
+orchestrator = { workspace = true }
 
 [dependency-groups]
 dev = [
@@ -27,7 +31,7 @@ dev = [
 
 [tool.pyright]
 include = ["src", "tests"]
-extraPaths = ["src", "../shared/src"]
+extraPaths = ["src", "../shared/src", "../orchestrator/src"]
 pythonVersion = "3.11"
 typeCheckingMode = "basic"
 venvPath = ".."

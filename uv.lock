@@ -491,6 +491,7 @@ name = "cockpit"
 version = "0.1.0"
 source = { editable = "cockpit" }
 dependencies = [
+    { name = "orchestrator" },
     { name = "pyyaml" },
     { name = "textual" },
 ]
@@ -507,6 +508,7 @@ dev = [
 
 [package.metadata]
 requires-dist = [
+    { name = "orchestrator", editable = "orchestrator" },
     { name = "pyyaml", specifier = ">=6.0" },
     { name = "textual", specifier = ">=0.60" },
 ]
