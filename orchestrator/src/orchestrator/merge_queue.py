@@ -9453,9 +9453,36 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                                     # the re-arm onto the lifecycle registry.
                                     self._note_requeue(_entry_req.request_id, live_obj=_entry_req)
                                 continue
+                            # MQ-reliability kappa follow-up (task 2441): this
+                            # is the ONE `_redispatch` append site task 2169
+                            # left unwired. Reconcile the registry to pipeline
+                            # state around the remerge — VERIFYING -> MERGING
+                            # for the duration of _remerge(), then MERGING ->
+                            # REDISPATCH_PARKED once landed on _redispatch —
+                            # mirroring the RUNNER_UNAVAILABLE cascade template
+                            # in _finalize_inflight. from_state is hardcoded
+                            # VERIFYING (not a dynamic current-state read)
+                            # because every downstream _inflight entry is
+                            # guaranteed at VERIFYING by _inflight_append.
+                            # Without this, the registry stays at VERIFYING
+                            # while the item is physically parked on
+                            # _redispatch, so the DISPATCH-FILL drain's
+                            # REDISPATCH_PARKED -> DISPATCHING _note_transition
+                            # fails its from_state cross-check and fires a
+                            # spurious dedup'd L1 escalation on every
+                            # cascade-remerge redispatch.
+                            _rid = _entry.item.request.request_id
+                            self._note_transition(
+                                _rid, ItemLifecycleState.VERIFYING,
+                                ItemLifecycleState.MERGING, live_obj=_entry,
+                            )
                             _remerged = await self._remerge(
                                 _entry.item.request,
                                 _entry.item.started_monotonic,
+                            )
+                            self._note_transition(
+                                _rid, ItemLifecycleState.MERGING,
+                                ItemLifecycleState.REDISPATCH_PARKED, live_obj=_remerged,
                             )
                             self._redispatch.append(_remerged)
                         except (asyncio.CancelledError, KeyboardInterrupt):
