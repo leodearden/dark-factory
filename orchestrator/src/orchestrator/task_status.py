@@ -71,6 +71,21 @@ def is_infra_held(task: Mapping[str, Any] | None) -> bool:
     Deliberately does NOT read the retired ``metadata.infra_hold`` boolean
     that previously overloaded 'in-progress'/'blocked' — that flag is gone;
     the status itself is now the hold signal.
+
+    Migration-window caveat (review amendment, task 2200): a task stamped by
+    pre-task-2200 code carries ``metadata.infra_hold`` while its status is
+    still 'blocked' or 'in-progress' — this accessor returns False for such a
+    row (see
+    ``test_legacy_metadata_flag_without_infra_hold_status_still_reverts``),
+    so any row still in that legacy shape at deploy time loses its hold on
+    the next reconcile pass or escalation resolution and re-competes for its
+    implement footprint instead of resuming at verify. This is accepted as a
+    one-time deploy-boundary cost, not a steady-state bug: there is no
+    startup sweep that relabels legacy ``metadata.infra_hold`` rows to
+    ``status='infra-hold'``. Confirm no live task carries
+    ``metadata.infra_hold`` at deploy time before retiring the flag from
+    operator tooling/dashboards; see the escalate_info filed alongside this
+    amendment (task 2200) for the follow-up recommendation.
     """
     return (task or {}).get('status') == TaskStatus.INFRA_HOLD
 

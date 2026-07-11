@@ -3714,6 +3714,13 @@ Output JSON matching the schema. Every task must appear in the output.
         # _reconcile_one_stranded call sites), making this guard structurally
         # dormant there.  It is kept as defense-in-depth for any caller that
         # hands this function an infra-held row directly.
+        # Migration-window caveat (review amendment, task 2200): a row still
+        # carrying the legacy metadata.infra_hold flag with status !=
+        # 'infra-hold' at deploy time is NOT recognised here (is_infra_held
+        # keys on status only) and reverts to pending like any other stranded
+        # in-progress task — see the docstring on
+        # orchestrator.task_status.is_infra_held for the accepted-risk
+        # rationale and the operator follow-up.
         # Prefer the metadata/status the reconcile caller already hoisted (one
         # get_task per stranded task — see harness.py:2275). Re-fetching
         # unconditionally here was the task-1883 step-14 regression that
@@ -9241,6 +9248,21 @@ Output JSON matching the schema. Every task must appear in the output.
         picks it up → 'in-progress'), set_task_status('pending') may succeed
         and clobber the newer status. This is accepted as a best-effort
         policy; the race window is narrow in practice.
+
+        Efficiency note (review amendment, task 2200): get_task above (used
+        only for the is_infra_held pre-gate) and get_status below both
+        dispatch the same underlying fused-memory 'get_task' RPC, so the
+        non-infra-held path pays for two round-trips over the same row. This
+        is intentional, not an oversight: get_status is kept as an
+        independent, as-late-as-possible read to narrow the TOCTOU window
+        above rather than reuse the earlier (by-then slightly staler)
+        get_task snapshot. Collapsing the two would also require reworking
+        test_cascade_unblock.py (outside this task's locked module scope),
+        whose mixed-status-cascade coverage
+        (test_criterion_7_mixed_status_cascade) drives get_status with a
+        per-task_id side_effect while get_task's mock stays fixed/shared —
+        i.e. that suite already treats the two reads as independent by
+        design.
         """
         task_id = escalation.task_id
 
@@ -9255,6 +9277,12 @@ Output JSON matching the schema. Every task must appear in the output.
         # set in-progress (the scheduler already skips re-implement for
         # branches with prior work via _has_prior_implementation).  There is
         # no metadata flag to clear anymore — the status IS the hold.
+        # Migration-window caveat (review amendment, task 2200): this check
+        # cannot see a legacy metadata.infra_hold-only row (status still
+        # 'blocked') — it falls through to the ordinary Table B resume below
+        # and re-competes for its footprint.  See
+        # orchestrator.task_status.is_infra_held's docstring for the
+        # accepted-risk rationale and the operator follow-up.
         _infra_task = await self.scheduler.get_task(task_id)
         if is_infra_held(_infra_task):
             try:
@@ -9277,6 +9305,9 @@ Output JSON matching the schema. Every task must appear in the output.
                 )
             return
 
+        # Deliberately a fresh, independent round-trip — not reused from
+        # _infra_task above.  See the "Efficiency note" in this method's
+        # docstring.
         status = await self.scheduler.get_status(task_id)
 
         if status != 'blocked':
