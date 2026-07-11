@@ -134,7 +134,9 @@ class TestOutstandingFlag:
 
         forest = build_spawn_forest([root, child])
 
-        assert _find_node(forest, 'child-1').outstanding is False
+        node = _find_node(forest, 'child-1')
+        assert node is not None
+        assert node.outstanding is False
 
     def test_root_is_never_outstanding_even_if_non_terminal(self):
         from cockpit.panes.spawn_tree import build_spawn_forest
@@ -157,7 +159,9 @@ class TestOutstandingFlag:
 
         forest = build_spawn_forest([root, child])
 
-        assert _find_node(forest, 'child-1').outstanding is False
+        node = _find_node(forest, 'child-1')
+        assert node is not None
+        assert node.outstanding is False
 
 
 class TestForestTotality:
