@@ -70,3 +70,25 @@ def build_heartbeat_payload(
         'queue_empty': queue_empty,
         'ts_epoch': ts_epoch,
     }
+
+
+def write_heartbeat(fleet_dir: Path, unit: str, payload: Mapping[str, Any]) -> Path:
+    """Atomically write *payload* to ``<fleet_dir>/<unit>.json``.
+
+    Mirrors ``Scheduler._write_state_snapshot_raw`` (scheduler.py:4749):
+    creates missing parent directories, writes to a ``.json.tmp`` sibling,
+    then ``os.replace``s it into place so concurrent readers (γ, ε) never
+    observe a partial write. An empty/unresolved ``unit`` falls back to a
+    deterministic ``unknown-unit.json`` filename rather than a file
+    literally named ``.json``.
+
+    Returns the final on-disk ``Path``.
+    """
+    fleet_dir = Path(fleet_dir)
+    fleet_dir.mkdir(parents=True, exist_ok=True)
+    stem = unit if unit else _UNKNOWN_UNIT_STEM
+    path = fleet_dir / f'{stem}.json'
+    tmp_path = path.with_suffix('.json.tmp')
+    tmp_path.write_text(json.dumps(payload), encoding='utf-8')
+    os.replace(tmp_path, path)
+    return path
