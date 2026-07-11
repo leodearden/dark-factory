@@ -279,9 +279,12 @@ async def run_eval(
 
     timeout_minutes = timeout_override or task.get('timeout_minutes', 60)
     try:
-        outcome = await asyncio.wait_for(
+        # W9-γ: workflow.run() now returns a TerminalReport (TR-1); unwrap to
+        # the WorkflowOutcome this function has always propagated.
+        terminal_report = await asyncio.wait_for(
             workflow.run(), timeout=timeout_minutes * 60,
         )
+        outcome = terminal_report.outcome
     except TimeoutError:
         logger.error(
             f'Eval {task_id} × {config.name} timed out after {timeout_minutes}m'

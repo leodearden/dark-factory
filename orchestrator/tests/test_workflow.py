@@ -493,7 +493,7 @@ class TestRunMergeDeferredGuard:
         )
 
         wf = _make_run_wf(tmp_path, with_train=True)
-        outcome = await wf.run()
+        outcome = (await wf.run()).outcome
 
         assert outcome == WorkflowOutcome.MERGE_DEFERRED, (
             f'Expected MERGE_DEFERRED for train member; got {outcome!r}'
@@ -517,7 +517,7 @@ class TestRunMergeDeferredGuard:
         )
 
         wf = _make_run_wf(tmp_path, with_train=False)
-        outcome = await wf.run()
+        outcome = (await wf.run()).outcome
 
         assert outcome == WorkflowOutcome.DONE, (
             f'Expected DONE for non-train task merge path; got {outcome!r}'
@@ -1979,7 +1979,10 @@ def _make_wip_conflict_workflow(*, task_id: str = '2282') -> TaskWorkflow:
     scheduler = MagicMock()
     scheduler.update_task = AsyncMock(return_value=True)
     scheduler.set_task_status = AsyncMock()
-    scheduler.get_status = AsyncMock(return_value='in-progress')
+    # run()'s SM-2 exit check reads this back — _mark_blocked is stubbed
+    # below (its real body, which would persist 'blocked', never runs), so
+    # this must reflect the forced BLOCKED outcome directly.
+    scheduler.get_status = AsyncMock(return_value='blocked')
     scheduler.get_task = AsyncMock(return_value={'id': task_id, 'metadata': {}})
 
     git_ops = MagicMock()
@@ -2037,7 +2040,7 @@ class TestWorktreeConflictErrorRouting:
                 side_effect=WorktreeConflictError(worktree, ['foo.py']),
             ),
         ):
-            outcome = await wf.run()
+            outcome = (await wf.run()).outcome
 
         assert outcome == WorkflowOutcome.BLOCKED
 

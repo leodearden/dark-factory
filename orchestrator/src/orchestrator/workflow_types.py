@@ -22,6 +22,7 @@ projection instead of maintaining an independent copy.
 from __future__ import annotations
 
 import enum
+from dataclasses import dataclass
 
 from shared.task_statuses import TaskStatus
 from shared.task_transitions import (
@@ -30,9 +31,12 @@ from shared.task_transitions import (
     outcome_allows_status,  # noqa: F401  re-export for W9-γ
 )
 
+from orchestrator.verify_categories import FailureCategory
+
 __all__ = [
     "STATE_TO_STATUS",
     "IllegalTransition",
+    "TerminalReport",
     "WorkflowOutcome",
     "WorkflowState",
     "WorkflowStateMachine",
@@ -61,6 +65,29 @@ class WorkflowOutcome(enum.Enum):
     CANCELLED = 'cancelled'
     MERGE_DEFERRED = 'merge-deferred'
     SOFT_CANCELLED = 'soft-cancelled'
+
+
+@dataclass(frozen=True)
+class TerminalReport:
+    """The workflow↔harness terminal contract, as a typed RETURN value.
+
+    Replaces the ``_last_block_reason``/``_last_block_detail``/
+    ``_last_block_phase`` side channel (three independent, mutable
+    ``TaskWorkflow`` attributes that could go partially stale — bug_history
+    882/883/851, esc-2073-15) with ONE atomic, immutable object built at the
+    same choke point (``_mark_blocked``, plus the two non-``_mark_blocked``
+    block paths) and returned by :meth:`TaskWorkflow.run`.
+
+    ``category`` is typed ``FailureCategory | None`` for the future W9-ε
+    wiring (``classify_failure`` → ``BlockDisposition``); it is always
+    ``None`` through W9-γ — see that task's design decisions.
+    """
+
+    outcome: WorkflowOutcome
+    reason: str
+    phase: WorkflowState
+    detail: str
+    category: FailureCategory | None
 
 
 class IllegalTransition(Exception):

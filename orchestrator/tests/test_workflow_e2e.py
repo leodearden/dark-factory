@@ -540,7 +540,7 @@ class TestHappyPath:
             )),
         )
 
-        outcome = await workflow.run()
+        outcome = (await workflow.run()).outcome
 
         assert outcome == WorkflowOutcome.DONE
         assert workflow.state == WorkflowState.DONE
@@ -602,7 +602,7 @@ class TestHappyPath:
             )),
         )
 
-        outcome = await workflow.run()
+        outcome = (await workflow.run()).outcome
         assert outcome == WorkflowOutcome.DONE
 
         # Verify the farewell function is in main's git tree
@@ -699,7 +699,7 @@ class TestHappyPath:
             )),
         )
 
-        outcome = await workflow.run()
+        outcome = (await workflow.run()).outcome
 
         assert outcome == WorkflowOutcome.DONE
         # After step-15: merge_sha 'FEEDFACE' from MergeOutcome must be recorded.
@@ -753,7 +753,7 @@ class TestCompletionJudge:
             )),
         )
 
-        outcome = await workflow.run()
+        outcome = (await workflow.run()).outcome
 
         assert outcome == WorkflowOutcome.DONE
         assert workflow.metrics.execute_iterations == 1
@@ -792,7 +792,7 @@ class TestCompletionJudge:
             )),
         )
 
-        outcome = await workflow.run()
+        outcome = (await workflow.run()).outcome
 
         # The implementer still completes all plan steps in iteration 1, so the
         # loop exits via the normal `while pending_steps` gate — NOT via judge
@@ -818,7 +818,7 @@ class TestCompletionJudge:
             )),
         )
 
-        outcome = await workflow.run()
+        outcome = (await workflow.run()).outcome
 
         # Workflow still completes via normal plan-step completion path
         assert outcome == WorkflowOutcome.DONE
@@ -844,7 +844,7 @@ class TestCompletionJudge:
             )),
         )
 
-        outcome = await workflow.run()
+        outcome = (await workflow.run()).outcome
 
         assert outcome == WorkflowOutcome.DONE
         assert workflow.metrics.judge_early_exits == 0
@@ -867,7 +867,7 @@ class TestCompletionJudge:
             )),
         )
 
-        outcome = await workflow.run()
+        outcome = (await workflow.run()).outcome
 
         assert outcome == WorkflowOutcome.DONE
         assert workflow.metrics.judge_invocations == 0
@@ -903,7 +903,7 @@ class TestCompletionJudge:
             )),
         )
 
-        outcome = await workflow.run()
+        outcome = (await workflow.run()).outcome
 
         assert outcome == WorkflowOutcome.DONE
         # Implementer receives env_overrides (ANTHROPIC_BASE_URL present).
@@ -940,7 +940,7 @@ class TestCompletionJudge:
             )),
         )
 
-        outcome = await workflow.run()
+        outcome = (await workflow.run()).outcome
 
         assert outcome == WorkflowOutcome.DONE
         # Implementer must receive REIFY_DEBUG_PORT in its env.
@@ -990,7 +990,7 @@ class TestVerifyDebugfixLoop:
 
         monkeypatch.setattr('orchestrator.workflow.run_scoped_verification', verify_sequence)
 
-        outcome = await workflow.run()
+        outcome = (await workflow.run()).outcome
 
         assert outcome == WorkflowOutcome.DONE
         # Should see debugger in the call sequence
@@ -1039,7 +1039,7 @@ class TestVerifyDebugfixLoop:
 
         monkeypatch.setattr('orchestrator.workflow.run_scoped_verification', verify_sequence)
 
-        outcome = await workflow.run()
+        outcome = (await workflow.run()).outcome
 
         assert outcome == WorkflowOutcome.DONE
         assert 'debugger' in stub.calls
@@ -1076,7 +1076,7 @@ class TestVerifyDebugfixLoop:
             )),
         )
 
-        outcome = await workflow.run()
+        outcome = (await workflow.run()).outcome
 
         assert outcome == WorkflowOutcome.BLOCKED
         assert scheduler.statuses['42'][-1] == 'blocked'
@@ -1194,7 +1194,7 @@ class TestReviewLoop:
             )),
         )
 
-        outcome = await workflow.run()
+        outcome = (await workflow.run()).outcome
 
         assert outcome == WorkflowOutcome.DONE
         # Should have gone through review cycle
@@ -1339,7 +1339,7 @@ class TestPostRebaseVerifyFailure:
         monkeypatch.setattr('orchestrator.workflow.run_scoped_verification', verify_fn)
         monkeypatch.setattr('orchestrator.merge_queue.run_scoped_verification', verify_fn)
 
-        outcome = await workflow.run()
+        outcome = (await workflow.run()).outcome
 
         # Post-rebase verify failure is non-blocking; merge queue handles it
         assert outcome == WorkflowOutcome.DONE
@@ -1381,7 +1381,7 @@ class TestBlastRadiusExpansion:
             )),
         )
 
-        outcome = await workflow.run()
+        outcome = (await workflow.run()).outcome
 
         assert outcome == WorkflowOutcome.DONE
         assert set(workflow.modules) == {'lib.py', 'test_lib.py'}
@@ -1427,14 +1427,15 @@ class TestBlastRadiusExpansion:
             )),
         )
 
-        outcome = await workflow.run()
+        report = await workflow.run()
 
-        assert outcome == WorkflowOutcome.REQUEUED
-        # The retry-cap report reads block_phase/reason/detail off the workflow
-        # via TaskReport — annotate so cap exhaustion does not say 'unknown'.
-        assert workflow._last_block_phase == 'plan'
-        assert workflow._last_block_reason == 'plan_blast_radius_lock_conflict'
-        assert 'locked_module.py' in workflow._last_block_detail
+        assert report.outcome == WorkflowOutcome.REQUEUED
+        # The retry-cap report reads block_phase/reason/detail off the
+        # returned TerminalReport via TaskReport — annotate so cap
+        # exhaustion does not say 'unknown'.
+        assert report.phase == WorkflowState.PLAN
+        assert report.reason == 'plan_blast_radius_lock_conflict'
+        assert 'locked_module.py' in report.detail
 
 
 # ---------------------------------------------------------------------------
@@ -1549,7 +1550,7 @@ class TestPlanLockAndProvenance:
             )),
         )
 
-        outcome = await workflow.run()
+        outcome = (await workflow.run()).outcome
         assert outcome == WorkflowOutcome.DONE
 
         # Worktree is cleaned up on success — capture artifacts before run
@@ -1591,7 +1592,7 @@ class TestPlanLockAndProvenance:
             )),
         )
 
-        outcome = await workflow.run()
+        outcome = (await workflow.run()).outcome
 
         # Workflow continues past the overwrite (re-stamps instead of blocking)
         assert outcome == WorkflowOutcome.DONE
@@ -1624,7 +1625,7 @@ class TestPlanLockAndProvenance:
         arts.stamp_plan_provenance('pre-existing-session')
         arts.lock_plan('pre-existing-session')
 
-        outcome = await workflow.run()
+        outcome = (await workflow.run()).outcome
         # A duplicate workflow finding an existing lock should REQUEUE (not continue executing)
         assert outcome == WorkflowOutcome.REQUEUED
 
@@ -1666,7 +1667,7 @@ class TestPlanLockAndProvenance:
         # This is the second (duplicate) workflow — it has a different session_id
         assert workflow.session_id != original_session
 
-        outcome = await workflow.run()
+        outcome = (await workflow.run()).outcome
 
         # Duplicate workflow must REQUEUE, not continue executing
         assert outcome == WorkflowOutcome.REQUEUED
@@ -1707,7 +1708,7 @@ class TestPlanLockAndProvenance:
         arts.lock_plan(original_session)
 
         # Run the duplicate workflow
-        outcome = await workflow.run()
+        outcome = (await workflow.run()).outcome
         assert outcome == WorkflowOutcome.REQUEUED
 
         # plan.json's _session_id must still be the original owner's session
@@ -1748,7 +1749,7 @@ class TestPlanLockAndProvenance:
 
         git_ops.cleanup_worktree = capture_then_cleanup
 
-        outcome = await workflow.run()
+        outcome = (await workflow.run()).outcome
         assert outcome == WorkflowOutcome.DONE
 
         # plan.lock must have been created
@@ -1932,7 +1933,7 @@ class TestTaskFailureEscalation:
         )
         workflow.config = config_strict
 
-        outcome = await workflow.run()
+        outcome = (await workflow.run()).outcome
 
         assert outcome == WorkflowOutcome.BLOCKED
 
@@ -1975,7 +1976,7 @@ class TestTaskFailureEscalation:
             )),
         )
 
-        outcome = await workflow.run()
+        outcome = (await workflow.run()).outcome
 
         assert outcome == WorkflowOutcome.BLOCKED
 
@@ -2012,7 +2013,7 @@ class TestTaskFailureEscalation:
         )
         workflow.config = config_strict
 
-        outcome = await workflow.run()
+        outcome = (await workflow.run()).outcome
 
         assert outcome == WorkflowOutcome.BLOCKED
         assert scheduler.statuses['42'][-1] == 'blocked'
@@ -2046,7 +2047,7 @@ class TestTaskFailureEscalation:
         )
         workflow.config = config_strict
 
-        outcome = await workflow.run()
+        outcome = (await workflow.run()).outcome
 
         assert outcome == WorkflowOutcome.BLOCKED
 
@@ -2101,7 +2102,7 @@ class TestTaskFailureEscalation:
         )
         workflow.config = config_strict
 
-        outcome = await workflow.run()
+        outcome = (await workflow.run()).outcome
 
         assert outcome == WorkflowOutcome.BLOCKED
 
@@ -2179,7 +2180,7 @@ class TestCorruptedIterationLogEscalation:
             )),
         )
 
-        outcome = await workflow.run()
+        outcome = (await workflow.run()).outcome
 
         assert outcome == WorkflowOutcome.DONE
 
@@ -2342,7 +2343,7 @@ class TestReviewerErrors:
             )),
         )
 
-        outcome = await workflow.run()
+        outcome = (await workflow.run()).outcome
 
         assert outcome == WorkflowOutcome.BLOCKED
         assert 'blocked' in scheduler.statuses.get(task_assignment.task_id, [])
@@ -2377,7 +2378,7 @@ class TestReviewerErrors:
             )),
         )
 
-        outcome = await workflow.run()
+        outcome = (await workflow.run()).outcome
 
         assert outcome == WorkflowOutcome.BLOCKED
         # Verify the review artifacts have ERROR verdicts
@@ -2425,7 +2426,7 @@ class TestReviewerErrors:
             )),
         )
 
-        outcome = await workflow.run()
+        outcome = (await workflow.run()).outcome
 
         assert outcome == WorkflowOutcome.DONE
         # comprehensive reviewer was called twice (initial fail + retry success)
@@ -2470,7 +2471,7 @@ class TestGhostLoopGuard:
             )),
         )
 
-        outcome = await workflow.run()
+        outcome = (await workflow.run()).outcome
 
         assert outcome == WorkflowOutcome.DONE
         # The implementer MUST have been called (ghost-loop did not skip)
@@ -2543,7 +2544,7 @@ class TestGhostLoopGuard:
             )),
         )
 
-        outcome = await workflow.run()
+        outcome = (await workflow.run()).outcome
 
         assert outcome == WorkflowOutcome.DONE
         # The implementer IS called again — the accepted trade-off. A
@@ -2600,7 +2601,7 @@ class TestGhostLoopGuard:
             )),
         )
 
-        outcome = await workflow.run()
+        outcome = (await workflow.run()).outcome
 
         assert outcome == WorkflowOutcome.DONE
         # The implementer MUST have been called — uncommitted scratch alone
@@ -2671,7 +2672,7 @@ class TestWipRecoveryNoAdvance:
         assert workflow._escalation_event is not None, 'Handler must have set _escalation_event'
         workflow._escalation_event.set()
 
-        outcome = await workflow_task
+        outcome = (await workflow_task).outcome
 
         # Merge did NOT land — must return BLOCKED, not DONE
         assert outcome == WorkflowOutcome.BLOCKED
@@ -2796,7 +2797,7 @@ class TestPrerequisitesValidation:
             )),
         )
 
-        outcome = await workflow.run()
+        outcome = (await workflow.run()).outcome
 
         assert outcome == WorkflowOutcome.BLOCKED
         assert scheduler.statuses['42'][-1] == 'blocked'
@@ -2866,7 +2867,7 @@ class TestPlanFinalizeMarker:
             )),
         )
 
-        outcome = await workflow.run()
+        outcome = (await workflow.run()).outcome
 
         # Salvaged: the finalized plan carried the workflow past PLAN to DONE.
         assert outcome == WorkflowOutcome.DONE
@@ -2909,7 +2910,7 @@ class TestPlanFinalizeMarker:
             )),
         )
 
-        outcome = await workflow.run()
+        outcome = (await workflow.run()).outcome
 
         assert outcome == WorkflowOutcome.BLOCKED
         l0 = queue.get_by_task('42', level=0)
@@ -2949,7 +2950,7 @@ class TestPlanFinalizeMarker:
             )),
         )
 
-        outcome = await workflow.run()
+        outcome = (await workflow.run()).outcome
 
         assert outcome == WorkflowOutcome.BLOCKED
         l0 = queue.get_by_task('42', level=0)
@@ -3008,7 +3009,7 @@ class TestPlanFinalizeMarker:
         partial = {k: v for k, v in PLAN.items() if k != '_finalized_at'}
         arts.write_plan(partial)
 
-        outcome = await workflow.run()
+        outcome = (await workflow.run()).outcome
 
         assert briefing.completion_called is True
         assert 'architect' in stub.calls
@@ -5004,7 +5005,7 @@ class TestRunPrePlanRecovery:
         #    pre-EXECUTE guard's branch-diff gate is empty (no journal
         #    binding either), so the workflow proceeds to EXECUTE and
         #    completes normally.
-        outcome = await workflow.run()
+        outcome = (await workflow.run()).outcome
 
         # 4. Assert DONE; architect called once, implementer IS called.
         assert outcome == WorkflowOutcome.DONE, (
@@ -5048,7 +5049,7 @@ class TestRunPrePlanRecovery:
             )),
         )
 
-        outcome = await workflow.run()
+        outcome = (await workflow.run()).outcome
 
         # Outcome should be DONE via the normal PLAN → EXECUTE → MERGE path
         assert outcome == WorkflowOutcome.DONE, (
@@ -5150,7 +5151,17 @@ class TestPlanDoneEarlyReturn:
         workflow, scheduler = _build_workflow(config, git_ops, task_assignment, stub)
 
         # Stub _plan to return DONE (simulates _handle_already_done_report).
-        workflow._plan = AsyncMock(return_value=WorkflowOutcome.DONE)
+        # run()'s SM-2 exit check reads scheduler.get_status back — the real
+        # _plan body (which would persist 'done') never runs, so the stub
+        # seeds the fake's status history itself, at call time. Seeding it
+        # up front (before run()) would instead trip the pre-empt check at
+        # the top of _setup_worktree_and_artifacts, which treats a live
+        # 'done' row as an out-of-band terminal exit.
+        async def fake_plan_done(*args, **kwargs):
+            scheduler.statuses.setdefault(workflow.task_id, []).append('done')
+            return WorkflowOutcome.DONE
+
+        workflow._plan = AsyncMock(side_effect=fake_plan_done)
         # If EXECUTE were entered, this would raise.
         workflow._execute_iterations = AsyncMock(
             side_effect=AssertionError(
@@ -5158,7 +5169,7 @@ class TestPlanDoneEarlyReturn:
             ),
         )
 
-        outcome = await workflow.run()
+        outcome = (await workflow.run()).outcome
 
         assert outcome == WorkflowOutcome.DONE
         workflow._execute_iterations.assert_not_called()
@@ -5180,8 +5191,13 @@ class TestPlanDoneEarlyReturn:
         workflow._execute_verify_review_loop = AsyncMock(
             return_value=WorkflowOutcome.BLOCKED,
         )
+        # run()'s SM-2 exit check reads scheduler.get_status back —
+        # _execute_verify_review_loop is stubbed above (its real body, which
+        # would persist 'blocked', never runs), so seed the fake's status
+        # history to match the forced BLOCKED outcome directly.
+        scheduler.statuses.setdefault(workflow.task_id, []).append('blocked')
 
-        outcome = await workflow.run()
+        outcome = (await workflow.run()).outcome
 
         workflow._execute_verify_review_loop.assert_called_once()
         assert outcome == WorkflowOutcome.BLOCKED
@@ -5570,7 +5586,7 @@ class TestMergePhaseEscalationGate:
             return WorkflowOutcome.DONE
         workflow._execute_verify_review_loop = _exec_and_escalate  # type: ignore[method-assign]
 
-        outcome = await workflow.run()
+        outcome = (await workflow.run()).outcome
 
         # MERGE-phase gate must intercept before submitting to the queue.
         assert outcome == WorkflowOutcome.ESCALATED
@@ -5893,7 +5909,7 @@ class TestBornAtL2GatesMergeEntry:
             return WorkflowOutcome.DONE
         workflow._execute_verify_review_loop = _exec_and_escalate  # type: ignore[method-assign]
 
-        outcome = await workflow.run()
+        outcome = (await workflow.run()).outcome
 
         # MERGE-phase gate must intercept before merge is attempted.
         assert outcome == WorkflowOutcome.ESCALATED
@@ -5965,7 +5981,7 @@ class TestBornAtL2HaltsRunViaWaitForResolution:
 
         workflow._execute_verify_review_loop = _escalate_and_return_escalated  # type: ignore[method-assign]
 
-        outcome = await workflow.run()
+        outcome = (await workflow.run()).outcome
 
         # With the fix: _wait_for_resolution raises _StewardReescalated for the
         # pending level-2 escalation → _mark_blocked → BLOCKED.
@@ -6032,7 +6048,7 @@ class TestAllAccountsCappedExceptionBoundary:
             AsyncMock(side_effect=AssertionError('run_scoped_verification must not be called')),
         )
 
-        outcome = await workflow.run()
+        outcome = (await workflow.run()).outcome
 
         # Outcome and state
         assert outcome == WorkflowOutcome.BLOCKED
@@ -6079,7 +6095,7 @@ class TestAllAccountsCappedEscalationLevel:
             AsyncMock(side_effect=AssertionError('run_scoped_verification must not be called')),
         )
 
-        outcome = await workflow.run()
+        outcome = (await workflow.run()).outcome
 
         # Outcome and state
         assert outcome == WorkflowOutcome.BLOCKED
@@ -6151,7 +6167,7 @@ class TestSessionBudgetExhaustionEscalation:
             AsyncMock(side_effect=AssertionError('run_scoped_verification must not be called')),
         )
 
-        outcome = await workflow.run()
+        outcome = (await workflow.run()).outcome
 
         assert outcome == WorkflowOutcome.BLOCKED
         assert workflow.state == WorkflowState.BLOCKED
@@ -6210,7 +6226,7 @@ class TestSessionBudgetExhaustionEscalation:
             AsyncMock(side_effect=AssertionError('run_scoped_verification must not be called')),
         )
 
-        outcome = await workflow.run()
+        outcome = (await workflow.run()).outcome
 
         assert outcome == WorkflowOutcome.BLOCKED
 
@@ -6274,7 +6290,7 @@ class TestFirstInvocationBudgetExhaustion:
             AsyncMock(side_effect=AssertionError('run_scoped_verification must not be called')),
         )
 
-        outcome = await workflow.run()
+        outcome = (await workflow.run()).outcome
 
         assert outcome == WorkflowOutcome.BLOCKED, (
             f'Expected BLOCKED outcome, got: {outcome!r}'
@@ -6710,7 +6726,7 @@ class TestMarkBlockedBypassDetection:
 
         scheduler.set_task_status = raising_set  # type: ignore[method-assign]
 
-        outcome = await workflow.run()
+        outcome = (await workflow.run()).outcome
 
         # Cancelled at setup → CANCELLED outcome, not BLOCKED.
         assert outcome == WorkflowOutcome.CANCELLED, (
@@ -6768,7 +6784,7 @@ class TestMarkBlockedBypassDetection:
         # prevent it from being called entirely.
         scheduler.statuses[task_assignment.task_id] = ['cancelled']
 
-        outcome = await workflow.run()
+        outcome = (await workflow.run()).outcome
 
         # (a) Outcome must be CANCELLED.
         assert outcome == WorkflowOutcome.CANCELLED, (
@@ -6843,7 +6859,7 @@ class TestMarkBlockedBypassDetection:
             },
         }
 
-        outcome = await workflow.run()
+        outcome = (await workflow.run()).outcome
 
         # (a) RED: fails — unhandled-rejection path returns BLOCKED, not DONE.
         assert outcome == WorkflowOutcome.DONE, (
@@ -6896,7 +6912,7 @@ class TestMarkBlockedBypassDetection:
         # get_task returns None → provenance commit is missing → bypass path.
         scheduler.statuses[tid] = ['done']
 
-        outcome = await workflow.run()
+        outcome = (await workflow.run()).outcome
 
         # (a) outcome must be BLOCKED (bypass-done path).
         assert outcome == WorkflowOutcome.BLOCKED, (
@@ -7347,7 +7363,7 @@ class TestMergeRetryLoopSoftCancelExits:
         workflow._submit_to_merge_queue = soft_cancel_wrapper  # type: ignore[method-assign]
 
         with caplog.at_level(_logging.INFO, logger='orchestrator.workflow'):
-            outcome = await workflow.run()
+            outcome = (await workflow.run()).outcome
 
         assert outcome == WorkflowOutcome.SOFT_CANCELLED, (
             f'Expected SOFT_CANCELLED, got {outcome!r}'
@@ -7422,7 +7438,7 @@ class TestMergeRetryLoopSoftCancelExits:
         workflow._submit_to_merge_queue = requeued_with_cancel_wrapper  # type: ignore[method-assign]
 
         with caplog.at_level(_logging.INFO, logger='orchestrator.workflow'):
-            outcome = await workflow.run()
+            outcome = (await workflow.run()).outcome
 
         # After step-4: cancel re-check fires immediately after REQUEUED + cancel_event.
         # submit_calls == 1 (no retry), no "retrying merge" log, outcome SOFT_CANCELLED.

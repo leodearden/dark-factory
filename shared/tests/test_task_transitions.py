@@ -314,6 +314,20 @@ class TestOutcomeAllowsStatus:
 
     def test_blocked_outcome(self):
         assert outcome_allows_status('blocked', 'blocked') is True
+        # Fix 1 (orchestrator/workflow.py ~2057): a steward-resolved L0 that
+        # preserves cancelled/deferred/merge-deferred also exits BLOCKED.
+        assert outcome_allows_status('blocked', 'cancelled') is True
+        assert outcome_allows_status('blocked', 'deferred') is True
+        assert outcome_allows_status('blocked', 'merge-deferred') is True
+        # Merge-halt escalation-wait paths (_handle_wip_recovery_no_advance /
+        # _handle_unmerged_state) return BLOCKED without ever rewriting
+        # status, leaving the row at whatever it was mid-merge.
+        assert outcome_allows_status('blocked', 'in-progress') is True
+        # 'done'/'pending' are NOT legitimate BLOCKED exits — 'done' has its
+        # own dedicated branch (never falls through to BLOCKED), and nothing
+        # returns BLOCKED before an initial 'pending'->'in-progress' claim.
+        assert outcome_allows_status('blocked', 'done') is False
+        assert outcome_allows_status('blocked', 'pending') is False
 
     def test_escalated_outcome(self):
         # Dominant _mark_blocked+open-L1 path, and the merge-gating bail

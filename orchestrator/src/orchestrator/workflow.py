@@ -93,9 +93,11 @@ from orchestrator.verify import (
 from orchestrator.verify_categories import PREEXISTING_BREAK_SKIP_CATEGORIES, FailureCategory
 from orchestrator.workflow_types import (  # noqa: F401  re-export shim
     IllegalTransition,
+    TerminalReport,
     WorkflowOutcome,
     WorkflowState,
     WorkflowStateMachine,
+    outcome_allows_status,
 )
 
 # Orchestrator package directory — used to resolve ``uv run --project`` for
@@ -933,13 +935,14 @@ class TaskWorkflow:
         # in task metadata because the verify loop is wholly within one
         # workflow run (unlike _check_infra_resume_thrash which crosses runs).
         self._failure_signature_history: list[tuple[str, str]] = []
-        # Block-reason surfacing for the harness-level retry cap.  Populated
-        # when _mark_blocked takes the REQUEUED return path; the harness reads
-        # these after workflow.run() returns to decide whether to increment
-        # the per-task requeue counter.
-        self._last_block_reason: str = ''
-        self._last_block_detail: str = ''
-        self._last_block_phase: str = ''
+        # TR-1: the atomic terminal-contract value returned by run().  Built
+        # at the same choke points (_mark_blocked's _record helper, plus the
+        # warm-lane-requeue and blast-radius-lock-conflict non-_mark_blocked
+        # block paths); the harness reads it off workflow.run()'s return to
+        # decide whether to increment the per-task requeue counter. A clean
+        # DONE/CANCELLED exit (no block ever hit) has no stashed report, so
+        # run() synthesizes one from machine.state instead.
+        self._terminal_report: TerminalReport | None = None
         # Last blocked-from-merge-queue reason — captured by
         # _submit_to_merge_queue and consumed by the merge-phase thrash
         # check (Fix 3).  Cleared between merge attempts so a stale
@@ -1905,7 +1908,7 @@ class TaskWorkflow:
             await self._claimant_heartbeat_task
         self._claimant_heartbeat_task = None
 
-    async def run(  # pyright: ignore[reportGeneralTypeIssues]
+    async def _drive(  # pyright: ignore[reportGeneralTypeIssues]
         self,
     ) -> WorkflowOutcome:
         # reportGeneralTypeIssues: pyright reports "Code is too complex to
@@ -1916,7 +1919,14 @@ class TaskWorkflow:
         # task.  The ignore is on the def line (the only site pyright accepts
         # it for this diagnostic) and is narrowed to reportGeneralTypeIssues
         # so genuine type regressions in other categories are still caught.
-        """Execute the full state machine."""
+        """Execute the full state machine.
+
+        Internal — the WorkflowOutcome propagation currency for the ~55
+        ``_mark_blocked``-callers and their ``== WorkflowOutcome.X`` checks
+        (W9-γ decided retyping all of them was disproportionate for one
+        spine leaf). ``run()`` is the public boundary: a thin wrapper below
+        that turns this outcome into the returned ``TerminalReport`` (TR-1).
+        """
         branch_name = self.task_id
         try:
             await self._setup_worktree_and_artifacts(branch_name)
@@ -2285,20 +2295,22 @@ class TaskWorkflow:
             # any task already in flight when the base vanished.
             if isinstance(e, WarmLanePoolHardDown):
                 block_reason = 'warm_lane_pool_hard_down'
-                block_phase = 'host_pool_hard_down'
             elif isinstance(e, WarmLanePoolExhausted):
                 block_reason = 'warm_lane_pool_exhausted'
-                block_phase = 'backpressure'
             else:  # WarmLaneDiskPressure
                 block_reason = 'warm_lane_disk_pressure (transient infra)'
-                block_phase = 'transient_infra'
             logger.info(
                 'Task %s: warm-lane requeue (%s): %s',
                 self.task_id, block_reason, e,
             )
-            self._last_block_reason = block_reason
-            self._last_block_phase = block_phase
-            self._last_block_detail = str(e)
+            # TerminalReport.phase is machine.state — this path never calls
+            # _enter_phase, so it is the pre-existing working phase (PLAN,
+            # since create_worktree runs before the first _enter_phase call
+            # in run()).
+            self._terminal_report = TerminalReport(
+                outcome=WorkflowOutcome.REQUEUED, reason=block_reason,
+                phase=self.machine.state, detail=str(e), category=None,
+            )
             return WorkflowOutcome.REQUEUED
 
         except VerifyInfraError as e:
@@ -2421,6 +2433,89 @@ class TaskWorkflow:
             # Cleanup per-task config dir (preserve-aware — skips when circuit
             # breaker tripped so the dir is available for forensic analysis).
             self._cleanup_config_dir()
+
+    async def run(self) -> TerminalReport:
+        """Execute the full state machine and return the terminal contract.
+
+        TR-1: the workflow↔harness terminal contract is this RETURN value,
+        not the (now-deleted) ``_last_block_*`` side channel. ``_drive()``
+        carries the actual control flow; this wrapper turns its
+        ``WorkflowOutcome`` into the ``TerminalReport`` that ``_mark_blocked``
+        (or a non-``_mark_blocked`` block path) already stashed at
+        ``self._terminal_report`` for BLOCKED/REQUEUED/ESCALATED exits. A
+        clean exit (DONE/CANCELLED, no block ever hit) has no stashed report,
+        so one is synthesized here from ``machine.state`` with empty
+        reason/detail and ``category=None``.
+
+        SM-2: before returning, assert the report is internally consistent.
+        ``report.phase`` must always equal the live state-machine state (it
+        is built from ``machine.state`` at construction, so a mismatch here
+        means a report was constructed from a stale/foreign source). When
+        the authoritative last-persisted status is legible, ``report.outcome``
+        must also be an allowed pairing with it (``outcome_allows_status``) —
+        this is what catches the false-done class (DB row says 'done' while
+        the actual outcome is BLOCKED). A ``None`` or out-of-vocabulary
+        status row (transient ``get_status`` failure, or a status outside
+        the closed vocabulary) is treated as fail-safe-wait rather than a
+        mismatch, so a flaky read never crashes ``run()``.
+
+        The outcome<->status half is skipped entirely in eval mode
+        (``self._worktree_external``): the MERGE phase — and with it the
+        only call that ever persists a terminal 'done' row — is
+        unconditionally skipped for external worktrees (see the ``MERGE
+        (skip for eval mode)`` guard above), so an eval-mode DONE exit
+        legitimately leaves the last persisted status wherever the pre-empt
+        claim left it. Every other terminal-bookkeeping step in this class
+        (lane release, DONE-cleanup gate) already carries this same
+        ``not self._worktree_external`` guard for the identical reason —
+        eval mode's task row is not the authoritative record real dispatch
+        relies on.
+        """
+        outcome = await self._drive()
+        report = (
+            self._terminal_report
+            if (
+                self._terminal_report is not None
+                and self._terminal_report.outcome == outcome
+            )
+            else TerminalReport(
+                outcome=outcome, reason='', phase=self.machine.state,
+                detail='', category=None,
+            )
+        )
+        assert report.phase == self.machine.state, (
+            f'run()-exit SM-2: report.phase {report.phase!r} != '
+            f'machine.state {self.machine.state!r} (task {self.task_id})'
+        )
+        if not self._worktree_external:
+            try:
+                last_status_row = await self.scheduler.get_status(self.task_id)
+            except Exception:
+                # get_status's own contract is str | None (it never raises —
+                # see Scheduler.get_status), so this only fires against a
+                # non-conforming test double.  Same fail-safe fallback as the
+                # worktree-missing-fallback get_status call above.
+                logger.exception(
+                    'Task %s: get_status failed during run()-exit SM-2 check; '
+                    'skipping the outcome<->status consistency check',
+                    self.task_id,
+                )
+                last_status_row = None
+            if last_status_row is not None:
+                try:
+                    status_consistent = outcome_allows_status(report.outcome, last_status_row)
+                except ValueError:
+                    # Out-of-vocabulary/unreadable status row — fail-safe:
+                    # skip the check rather than crash run() on a transient
+                    # or garbled read (mirrors the pre-empt check's None
+                    # handling).
+                    status_consistent = True
+                if not status_consistent:
+                    raise AssertionError(
+                        f'run()-exit SM-2: outcome {report.outcome!r} inconsistent '
+                        f'with status {last_status_row!r} (task {self.task_id})'
+                    )
+        return report
 
     async def _run_merge_phase(self, branch_name: str) -> WorkflowOutcome | None:
         """Execute the MERGE phase. Returns None to fall through to SUCCESS."""
@@ -3032,13 +3127,17 @@ class TaskWorkflow:
                 # name *why* — without this, three blast-radius requeues in a
                 # row produce a cap-exhaust report with phase/reason='unknown'.
                 additional = sorted(set(plan_modules) - set(self.modules))
-                self._last_block_phase = self.state.value
-                self._last_block_reason = 'plan_blast_radius_lock_conflict'
-                self._last_block_detail = (
+                block_detail = (
                     f'Plan expansion blocked: additional locks {additional} '
                     f'unavailable (held by other tasks). '
                     f'Held modules: {sorted(self.modules)}; '
                     f'plan modules: {sorted(plan_modules)}.'
+                )
+                self._terminal_report = TerminalReport(
+                    outcome=WorkflowOutcome.REQUEUED,
+                    reason='plan_blast_radius_lock_conflict',
+                    phase=self.machine.state, detail=block_detail,
+                    category=None,
                 )
                 return WorkflowOutcome.REQUEUED
             # Persistence of the tightened lock set is centralized in
@@ -8337,12 +8436,23 @@ Update the plan to address the blocking issues. You may add new steps to the `st
                 self.task_id, self.state.value, reason,
             )
             return WorkflowOutcome(self.state.value)
-        # Capture the phase we were in before transitioning to BLOCKED so the
-        # harness-level retry cap can report *which* phase looped.  _enter_phase
-        # overwrites self.state, so stash first.
-        self._last_block_phase = self.state.value
-        self._last_block_reason = reason
-        self._last_block_detail = detail or reason
+
+        def _record(outcome: WorkflowOutcome) -> WorkflowOutcome:
+            """Build the atomic TerminalReport at a _mark_blocked return point.
+
+            Captures ``self.machine.state`` AT CALL TIME — BLOCKED after
+            ``_enter_phase(BLOCKED)`` for the block-return paths below, or
+            DONE/etc. for the bypass/steward-resolved paths that never enter
+            BLOCKED.  W9-γ: TerminalReport.category stays None throughout
+            this task (see design decisions) — _mark_blocked's category=
+            parameter is an ESCALATION taxonomy, not FailureCategory.
+            """
+            self._terminal_report = TerminalReport(
+                outcome=outcome, reason=reason, phase=self.machine.state,
+                detail=(detail or reason), category=None,
+            )
+            return outcome
+
         if not merge_phase:
             self._enter_phase(WorkflowState.BLOCKED)
             _status_set_ok = False
@@ -8354,7 +8464,7 @@ Update the plan to address the blocking issues. You may add new steps to the `st
                     exc, reason, detail or reason,
                 )
                 if bypass_outcome is not None:
-                    return bypass_outcome
+                    return _record(bypass_outcome)
                 # Legitimate done — fall through; the existing post-steward
                 # flow below handles current==done by returning DONE.
             if _status_set_ok:
@@ -8430,7 +8540,7 @@ Update the plan to address the blocking issues. You may add new steps to the `st
                     reason, detail or reason, category=category,
                     root_cause=root_cause,
                 )
-                return WorkflowOutcome.BLOCKED
+                return _record(WorkflowOutcome.BLOCKED)
 
             # Don't create a duplicate if level-1 already pending
             if not self.escalation_queue.has_open_l1(self.task_id):
@@ -8521,9 +8631,9 @@ Update the plan to address the blocking issues. You may add new steps to the `st
                     )
                     if current == 'done':
                         self._enter_phase(WorkflowState.DONE)
-                        return WorkflowOutcome.DONE
+                        return _record(WorkflowOutcome.DONE)
                     # 'cancelled' is an intentional terminal — no L1 needed.
-                    return WorkflowOutcome.BLOCKED
+                    return _record(WorkflowOutcome.BLOCKED)
 
                 # If steward resolved all level-0 escalations, set task back
                 # to pending so the scheduler re-picks it on the next cycle.
@@ -8541,7 +8651,7 @@ Update the plan to address the blocking issues. You may add new steps to the `st
                             'off to human; leaving status as-is and exiting',
                             self.task_id,
                         )
-                        return WorkflowOutcome.ESCALATED
+                        return _record(WorkflowOutcome.ESCALATED)
 
                     # Preserve steward-set deferred. Terminal statuses (done,
                     # cancelled) were caught earlier via ``current``; blocked
@@ -8556,7 +8666,7 @@ Update the plan to address the blocking issues. You may add new steps to the `st
                             'preserving, skipping auto-requeue',
                             self.task_id,
                         )
-                        return WorkflowOutcome.BLOCKED
+                        return _record(WorkflowOutcome.BLOCKED)
 
                     # Fix A (broadened): detect dismiss-with-terminate for
                     # ANY L0 on this task whose resolved_at falls inside the
@@ -8587,7 +8697,7 @@ Update the plan to address the blocking issues. You may add new steps to the `st
                         await self._ensure_l1_escalation_for_blocked(
                             reason, detail or reason,
                         )
-                        return WorkflowOutcome.BLOCKED
+                        return _record(WorkflowOutcome.BLOCKED)
 
                     if self.event_store:
                         self.event_store.emit(
@@ -8606,7 +8716,7 @@ Update the plan to address the blocking issues. You may add new steps to the `st
                             f'Task {self.task_id}: steward resolved blocking '
                             f'escalation, caller will retry merge in-place'
                         )
-                    return WorkflowOutcome.REQUEUED
+                    return _record(WorkflowOutcome.REQUEUED)
 
         # Fall-through BLOCKED: either no escalation queue, or the steward
         # never resolved the L0.  Either way a human should know — submit
@@ -8640,7 +8750,7 @@ Update the plan to address the blocking issues. You may add new steps to the `st
                     '(steward consumer dead; L1 already filed)',
                     self.task_id, len(orphan_l0),
                 )
-        return WorkflowOutcome.BLOCKED
+        return _record(WorkflowOutcome.BLOCKED)
 
     def _durable_ref_suffix(self) -> str:
         """Durable git identifiers to append to an L1 escalation's detail.

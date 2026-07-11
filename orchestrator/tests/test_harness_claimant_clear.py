@@ -26,7 +26,7 @@ from orchestrator.config import OrchestratorConfig
 from orchestrator.harness import Harness
 from orchestrator.merge_queue import InFlightMergeRegistry
 from orchestrator.scheduler import Scheduler, TaskAssignment
-from orchestrator.workflow import WorkflowOutcome
+from orchestrator.workflow import TerminalReport, WorkflowOutcome, WorkflowState
 
 
 @pytest.fixture
@@ -67,6 +67,14 @@ def _make_harness(config: OrchestratorConfig, scheduler: Scheduler) -> Harness:
     return harness
 
 
+_OUTCOME_TO_PHASE = {
+    WorkflowOutcome.DONE: WorkflowState.DONE,
+    WorkflowOutcome.CANCELLED: WorkflowState.CANCELLED,
+    WorkflowOutcome.BLOCKED: WorkflowState.BLOCKED,
+    WorkflowOutcome.REQUEUED: WorkflowState.PLAN,
+}
+
+
 def _make_stub_workflow_class(outcome: WorkflowOutcome) -> type:
     """Build a stub TaskWorkflow replacement whose run() returns ``outcome``.
 
@@ -79,8 +87,12 @@ def _make_stub_workflow_class(outcome: WorkflowOutcome) -> type:
         def __init__(self, **kwargs):
             pass
 
-        async def run(self) -> WorkflowOutcome:
-            return outcome
+        async def run(self) -> TerminalReport:
+            return TerminalReport(
+                outcome=outcome, reason='',
+                phase=_OUTCOME_TO_PHASE.get(outcome, WorkflowState.PLAN),
+                detail='', category=None,
+            )
 
         _steward = None
         metrics = MagicMock(
@@ -91,9 +103,6 @@ def _make_stub_workflow_class(outcome: WorkflowOutcome) -> type:
             verify_attempts=0,
             review_cycles=0,
         )
-        _last_block_reason = None
-        _last_block_detail = None
-        _last_block_phase = None
 
     return _StubWorkflow
 
