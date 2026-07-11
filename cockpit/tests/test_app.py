@@ -900,6 +900,46 @@ class TestSpawnTree:
             child_slugs = {node.data for node in parent_node.children}
             assert child_slugs == {'child-1'}
 
+    @pytest.mark.timeout(10)
+    async def test_outstanding_children_are_highlighted(self, tmp_path):
+        """Outstanding (non-terminal) children are visually marked in the
+        rendered tree (Fleet Cockpit C9a, PRD §9) -- pins the "outstanding
+        children highlighted" half of the leaf signal at the widget level."""
+        from cockpit.app import CockpitApp
+        from cockpit.panes.spawn_tree import _OUTSTANDING_MARKER, SpawnTree, SpawnTreeScreen
+
+        parent = _make_record(session_slug='parent-1', parent_session_id=None)
+        running_child = _make_record(
+            session_slug='child-running',
+            parent_session_id='parent-1',
+            status=sr.Status.RUNNING,
+        )
+        exited_child = _make_record(
+            session_slug='child-exited',
+            parent_session_id='parent-1',
+            status=sr.Status.EXITED,
+        )
+        for r in (parent, running_child, exited_child):
+            sr.write_record(r, root=tmp_path)
+
+        app = CockpitApp(fleet_root=tmp_path, poll_interval=0.05)
+        async with app.run_test() as pilot:
+            await pilot.pause()
+
+            await pilot.press('t')
+            await pilot.pause()
+
+            assert isinstance(app.screen, SpawnTreeScreen)
+            tree = app.screen.query_one(SpawnTree)
+            parent_node = next(node for node in tree.root.children if node.data == 'parent-1')
+            nodes_by_slug = {node.data: node for node in parent_node.children}
+
+            running_label = str(nodes_by_slug['child-running'].label)
+            exited_label = str(nodes_by_slug['child-exited'].label)
+
+            assert _OUTSTANDING_MARKER in running_label
+            assert _OUTSTANDING_MARKER not in exited_label
+
 
 class TestRefreshWriteDiscipline:
     @pytest.mark.timeout(10)
