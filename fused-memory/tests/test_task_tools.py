@@ -784,6 +784,11 @@ async def test_submit_task_accepts_agent_id_and_forwards_existing_kwargs_unchang
             'prompt': 'Do the thing',
             'priority': 'high',
             'agent_id': 'recon-stage-7',
+            # A recon-stage caller must now declare metadata.execution_class
+            # (η guard, task 2225) or the submit is rejected before the
+            # interceptor is reached — this test only exercises agent_id
+            # forwarding, so declare a valid class to stay past the guard.
+            'metadata': {'execution_class': 'code_tdd'},
         },
     )
     assert 'error' not in result
@@ -829,6 +834,85 @@ async def test_update_task_accepts_agent_id_and_forwards_existing_kwargs_unchang
         dependencies=None,
         agent_id='recon-stage-7',
     )
+
+
+# ------------------------------------------------------------------
+# submit_task execution-class guard η (task 2225/W5-η) — boundary test E1
+#
+# The unit-level invariant matrix for execution_class_error /
+# inject_execution_class lives in test_execution_class_guard.py; these
+# tests assert the guard is WIRED into the submit_task tool boundary so the
+# E1 user-observable signal is actually delivered: a recon-stage caller that
+# omits metadata.execution_class is rejected BEFORE the interceptor is
+# reached, a valid class is accepted and persists into the forwarded
+# metadata, and non-recon callers are entirely unaffected.
+# ------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_submit_task_recon_stage_without_execution_class_rejected(
+    mcp_server_with_tasks, task_interceptor,
+):
+    """E1: a recon-stage submit_task with no metadata.execution_class is
+    rejected with a ValidationError and never reaches the interceptor."""
+    task_interceptor.submit_task = AsyncMock(return_value={'ticket': 'tkt_x'})
+    result = await mcp_server_with_tasks._tool_manager.call_tool(
+        'submit_task',
+        {
+            'project_root': '/project',
+            'prompt': 'Reconcile task 7',
+            'agent_id': 'recon-stage-task_knowledge_sync',
+        },
+    )
+    assert result.get('error_type') == 'ValidationError', f'got {result!r}'
+    assert 'execution_class' in result.get('error', '')
+    task_interceptor.submit_task.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_submit_task_recon_stage_with_valid_execution_class_accepted_and_persisted(
+    mcp_server_with_tasks, task_interceptor,
+):
+    """E1: a recon-stage submit_task with a valid execution_class is accepted
+    and the declared class persists into the metadata forwarded to the
+    interceptor (for 2085's routing + ξ's premise-lint to consume)."""
+    task_interceptor.submit_task = AsyncMock(return_value={'ticket': 'tkt_x'})
+    result = await mcp_server_with_tasks._tool_manager.call_tool(
+        'submit_task',
+        {
+            'project_root': '/project',
+            'prompt': 'Reconcile task 7',
+            'agent_id': 'recon-stage-task_knowledge_sync',
+            'metadata': {'execution_class': 'operational'},
+        },
+    )
+    assert 'error' not in result
+    task_interceptor.submit_task.assert_awaited_once()
+    forwarded = task_interceptor.submit_task.call_args.kwargs.get('metadata')
+    assert isinstance(forwarded, dict), f'metadata not normalised to dict; got {forwarded!r}'
+    assert forwarded.get('execution_class') == 'operational', (
+        f'declared execution_class must persist into forwarded metadata; got {forwarded!r}'
+    )
+
+
+@pytest.mark.asyncio
+async def test_submit_task_non_recon_without_execution_class_accepted(
+    mcp_server_with_tasks, task_interceptor,
+):
+    """A non-recon caller (e.g. claude-interactive) is never enforced: a
+    submit_task with no execution_class is accepted and reaches the
+    interceptor unchanged."""
+    task_interceptor.submit_task = AsyncMock(return_value={'ticket': 'tkt_x'})
+    result = await mcp_server_with_tasks._tool_manager.call_tool(
+        'submit_task',
+        {
+            'project_root': '/project',
+            'prompt': 'Do the thing',
+            'agent_id': 'claude-interactive',
+        },
+    )
+    assert 'error' not in result
+    task_interceptor.submit_task.assert_awaited_once()
 
 
 # ------------------------------------------------------------------

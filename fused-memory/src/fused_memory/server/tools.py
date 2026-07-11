@@ -24,6 +24,10 @@ from fused_memory.middleware.deterministic_task_guard import (
     deterministic_task_error,
     inject_task_kind,
 )
+from fused_memory.middleware.execution_class_guard import (
+    execution_class_error,
+    inject_execution_class,
+)
 from fused_memory.middleware.lock_charter_guard import (
     directory_locks,
     extract_files,
@@ -3068,6 +3072,17 @@ def create_mcp_server(
         if _det_err is not None:
             return _det_err
         metadata = inject_task_kind(metadata, task_kind)
+
+        # Execution-class guard η: for recon-stage callers, require + validate
+        # metadata.execution_class (declaration layer, PRD §8.5), then normalise
+        # so the declared class persists via the existing metadata path. This is
+        # the explicit, lintable input that task 2085's route_deterministic and
+        # W5-ξ's premise-lint consume — η declares/validates only; it does NOT
+        # coerce routing (that stays 2085's job). Non-recon callers are exempt.
+        _exec_err = execution_class_error(metadata, agent_id, project_root)
+        if _exec_err is not None:
+            return _exec_err
+        metadata = inject_execution_class(metadata)
 
         return await task_interceptor.submit_task(
             project_root=project_root,
