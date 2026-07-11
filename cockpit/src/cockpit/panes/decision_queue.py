@@ -97,15 +97,24 @@ class _QueueRowLike(Protocol):
     """Structural contract format_queue_row reads.
 
     Mirrors ScoringItem's own "any object exposing these attributes works"
-    convention -- format_queue_row reads attributes, not isinstance.
-    QueueItem (a later step) satisfies this directly.
+    convention -- format_queue_row reads attributes, not isinstance. Declared
+    as read-only properties (rather than plain mutable attributes) so a
+    frozen dataclass -- QueueItem, below, is the real caller -- satisfies
+    this structurally: a read-only Protocol attribute accepts either a
+    read-only or a writable concrete attribute, but a writable Protocol
+    attribute would reject a frozen field.
     """
 
-    score: float
-    filed_at: datetime
-    project: str
-    task_id: str | None
-    question: str | None
+    @property
+    def score(self) -> float: ...
+    @property
+    def filed_at(self) -> datetime: ...
+    @property
+    def project(self) -> str: ...
+    @property
+    def task_id(self) -> str | None: ...
+    @property
+    def question(self) -> str | None: ...
 
 
 _QUESTION_MAX_WIDTH = 60
