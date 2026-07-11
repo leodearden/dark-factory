@@ -1846,6 +1846,33 @@ async def test_get_statuses_routes_through_get_statuses_raw(event_buffer):
     assert stats['size'] == 0
 
 
+# ── Tests for get_statuses_fresh (task 2388) ─────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_get_statuses_fresh_delegates_to_backend(taskmaster, interceptor, event_buffer):
+    """interceptor.get_statuses_fresh delegates verbatim to tm.get_statuses_fresh.
+
+    Mirrors the get_statuses delegation tests above (task 2388): the
+    interceptor has no get_statuses_raw-style method of its own for the
+    fresh census read — it just forwards to the wrapped backend's
+    get_statuses_fresh, exactly like get_statuses forwards to
+    get_statuses_raw.
+    """
+    taskmaster.get_statuses_fresh = AsyncMock(return_value={'42': 'cancelled'})
+    event_buffer.push = AsyncMock(wraps=event_buffer.push)
+
+    result = await interceptor.get_statuses_fresh('/project', ids=['42'], tag=None)
+
+    assert result == {'42': 'cancelled'}
+    taskmaster.get_statuses_fresh.assert_awaited_once_with('/project', ids=['42'], tag=None)
+
+    # Pure read: no events emitted.
+    event_buffer.push.assert_not_called()
+    stats = await event_buffer.get_buffer_stats('project')
+    assert stats['size'] == 0
+
+
 # ── Tests for None / disconnected taskmaster ───────────────────────
 
 

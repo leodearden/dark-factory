@@ -3114,6 +3114,107 @@ async def test_get_tasks_status_filter_pushed_into_sql(backend, project_root, mo
     )
 
 
+# ── get_statuses_fresh (task 2388) ───────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_get_statuses_fresh_sees_committed_write_despite_pinned_cached_snapshot(
+    backend, project_root,
+):
+    """get_statuses_fresh reads a live WAL snapshot even when the cached
+    per-project connection has a read transaction pinned open.
+
+    Reproduces the task 2388 root cause: ``_get_connection`` opens its
+    cached connection in legacy deferred-transaction mode, so a read
+    transaction left open on it pins a stale WAL snapshot. ``get_statuses``
+    (and ``get_statuses_raw``) share that cached connection and go stale
+    with it. ``get_statuses_fresh`` must open its own short-lived
+    autocommit connection instead, so it always observes the latest
+    committed state regardless of what the cached connection is doing.
+    """
+    from shared.async_sqlite_base import apply_wal_pragmas, connect_daemon
+
+    # Seed two tasks and mark both 'done'.
+    await backend.add_task(project_root=project_root, title='T1')  # id=1
+    await backend.add_task(project_root=project_root, title='T2')  # id=2
+    await backend.set_task_status('1', 'done', project_root)
+    await backend.set_task_status('2', 'done', project_root)
+
+    # Pin the cached connection's WAL read-snapshot by leaving a read
+    # transaction open on it (materialize the snapshot via fetchall()).
+    conn = await backend._get_connection(project_root)
+    await conn.execute('BEGIN')
+    cur = await conn.execute('SELECT id, status FROM tasks')
+    await cur.fetchall()
+
+    # Simulate a separate process committing a status change out-of-band,
+    # via a fresh autocommit connection to the same DB file on disk.
+    db_path = SqliteTaskBackend._db_path(project_root)
+    writer = await connect_daemon(str(db_path), isolation_level=None)
+    try:
+        await apply_wal_pragmas(writer, busy_timeout_ms=5000)
+        await writer.execute("UPDATE tasks SET status='cancelled' WHERE id=1")
+        await writer.commit()
+    finally:
+        await writer.close()
+
+    # The pinned cached-connection read is STALE — documents the bug.
+    stale = await backend.get_statuses(project_root)
+    assert stale.get('1') == 'done', (
+        f"Expected the pinned cached read to still see 'done', got: {stale}"
+    )
+
+    # The fresh read reflects LIVE committed state.
+    fresh = await backend.get_statuses_fresh(project_root)
+    assert fresh['1'] == 'cancelled', (
+        f"Expected the fresh read to see 'cancelled', got: {fresh}"
+    )
+
+    # Release the pin so the fixture's backend.close() isn't left mid-txn.
+    await conn.rollback()
+
+
+@pytest.mark.asyncio
+async def test_get_statuses_fresh_returns_empty_when_db_file_missing(backend, project_root):
+    """get_statuses_fresh fails open to {} when the project's tasks.db file
+    has never been created — e.g. reconciliation runs for a project before
+    any task has ever been written for it. Must not raise; this pins the
+    ``if not db_path.exists(): return {}`` fast path documented on
+    get_statuses_fresh ("{} if the DB file does not exist yet...").
+    """
+    assert not SqliteTaskBackend._db_path(project_root).exists()
+
+    result = await backend.get_statuses_fresh(project_root)
+
+    assert result == {}
+
+
+@pytest.mark.asyncio
+async def test_get_statuses_fresh_returns_empty_when_connection_open_raises(
+    backend, project_root, monkeypatch,
+):
+    """get_statuses_fresh fails open to {} when opening its dedicated
+    short-lived connection raises for any reason (permission error, disk
+    I/O failure, corrupt file, ...) — not just when a read on an
+    already-open connection fails. Pins the ``except Exception: return {}``
+    branch that the reconciliation cycle relies on never raising through.
+    """
+    from fused_memory.backends import sqlite_task_backend as _sb
+
+    # Seed via the real connect_daemon first so the DB file exists and we
+    # get past the "missing file" fast path exercised above.
+    await backend.add_task(project_root=project_root, title='T1')
+
+    def _boom(*_args, **_kwargs):
+        raise OSError('simulated connection-open failure')
+
+    monkeypatch.setattr(_sb, 'connect_daemon', _boom)
+
+    result = await backend.get_statuses_fresh(project_root)
+
+    assert result == {}
+
+
 # ── Corrupt-blob refusal tests (task 1813) ──────────────────────────────
 
 

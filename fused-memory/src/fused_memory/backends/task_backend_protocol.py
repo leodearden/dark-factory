@@ -89,6 +89,23 @@ class TaskBackendProtocol(Protocol):
         """
         ...
 
+    async def get_statuses_fresh(
+        self,
+        project_root: str,
+        ids: list[str] | None = None,
+        tag: str | None = None,
+    ) -> dict[str, str]:
+        """Return a snapshot-fresh ``{id_str: status_str}`` census (task 2388).
+
+        Unlike ``get_statuses``/``get_statuses_raw``, which may be served
+        from a cached connection that can pin a stale WAL read-snapshot,
+        this method must read state that is current as of the call — it is
+        the authoritative-census read used by reconciliation's
+        ``cross_verify_task_counts`` cross-check, and a stale result there
+        can mask real drift instead of surfacing it.
+        """
+        ...
+
     # ── Mutations ──────────────────────────────────────────────────────
 
     async def set_task_status(

@@ -3860,6 +3860,28 @@ class TaskInterceptor:
         tm = await self._ensure_taskmaster()
         return await tm.get_statuses_raw(project_root, tag=tag, ids=ids)
 
+    async def get_statuses_fresh(
+        self,
+        project_root: str,
+        ids: list[str] | None = None,
+        tag: str | None = None,
+    ) -> dict[str, str]:
+        """Return a snapshot-fresh ``{id_str: status_str}`` census (task 2388).
+
+        Delegates verbatim to the wrapped taskmaster's ``get_statuses_fresh``
+        — like ``get_statuses``, this is a pure read: no events are emitted,
+        no journal entry is written.
+
+        Args:
+            project_root: Absolute path to project root.
+            ids: When given, only these task ids are returned (unknown ids are
+                 silently omitted).  ``None`` returns all tasks.  ``[]`` returns
+                 ``{}``.
+            tag: Tag context forwarded to ``get_statuses_fresh`` (optional).
+        """
+        tm = await self._ensure_taskmaster()
+        return await tm.get_statuses_fresh(project_root, ids=ids, tag=tag)
+
     async def search_tasks(
         self,
         project_root: str,

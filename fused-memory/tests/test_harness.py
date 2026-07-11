@@ -8829,14 +8829,36 @@ class TestHarnessFetchTaskCountCensus:
 
     @pytest.mark.asyncio
     async def test_fetches_statuses_from_taskmaster(self, journal, event_buffer, mock_memory_service):
-        """_fetch_task_count_census calls taskmaster.get_statuses and returns the map."""
+        """_fetch_task_count_census calls taskmaster.get_statuses_fresh and returns the map."""
         harness = _make_test_harness(journal, event_buffer, mock_memory_service)
-        harness.taskmaster.get_statuses = AsyncMock(return_value={'1': 'done', '2': 'pending'})  # type: ignore[union-attr,attr-defined]
+        harness.taskmaster.get_statuses_fresh = AsyncMock(return_value={'1': 'done', '2': 'pending'})  # type: ignore[union-attr,attr-defined]
 
         result = await harness._fetch_task_count_census(ProjectRoot('/abs/project'))
 
         assert result == {'1': 'done', '2': 'pending'}
-        harness.taskmaster.get_statuses.assert_called_once_with(project_root='/abs/project')  # type: ignore[union-attr,attr-defined]
+        harness.taskmaster.get_statuses_fresh.assert_called_once_with(project_root='/abs/project')  # type: ignore[union-attr,attr-defined]
+
+    @pytest.mark.asyncio
+    async def test_fetch_task_count_census_uses_fresh_read(self, journal, event_buffer, mock_memory_service):
+        """_fetch_task_count_census reads the authoritative census via get_statuses_fresh.
+
+        task 2388: get_statuses (served from the cached per-project connection)
+        can be pinned to a stale WAL snapshot, which is exactly what made the
+        census cross-check falsely report consistent:true. The authoritative
+        census must come from get_statuses_fresh (a dedicated, never-pinned
+        connection) instead — get_statuses must not be called at all.
+        """
+        harness = _make_test_harness(journal, event_buffer, mock_memory_service)
+        harness.taskmaster.get_statuses_fresh = AsyncMock(  # type: ignore[union-attr,attr-defined]
+            return_value={'1': 'cancelled', '2': 'done'}
+        )
+        harness.taskmaster.get_statuses = AsyncMock(return_value={'1': 'done', '2': 'done'})  # type: ignore[union-attr,attr-defined]
+
+        result = await harness._fetch_task_count_census(ProjectRoot('/abs/project'))
+
+        assert result == {'1': 'cancelled', '2': 'done'}
+        harness.taskmaster.get_statuses_fresh.assert_called_once_with(project_root='/abs/project')  # type: ignore[union-attr,attr-defined]
+        harness.taskmaster.get_statuses.assert_not_called()  # type: ignore[union-attr,attr-defined]
 
     @pytest.mark.asyncio
     async def test_degrades_when_taskmaster_is_none(self, journal, event_buffer, mock_memory_service):
@@ -8866,9 +8888,9 @@ class TestHarnessFetchTaskCountCensus:
 
     @pytest.mark.asyncio
     async def test_degrades_on_get_statuses_exception(self, journal, event_buffer, mock_memory_service):
-        """_fetch_task_count_census returns {} when get_statuses raises — no exception propagated."""
+        """_fetch_task_count_census returns {} when get_statuses_fresh raises — no exception propagated."""
         harness = _make_test_harness(journal, event_buffer, mock_memory_service)
-        harness.taskmaster.get_statuses = AsyncMock(side_effect=RuntimeError('connection refused'))  # type: ignore[union-attr,attr-defined]
+        harness.taskmaster.get_statuses_fresh = AsyncMock(side_effect=RuntimeError('connection refused'))  # type: ignore[union-attr,attr-defined]
 
         result = await harness._fetch_task_count_census(ProjectRoot('/abs/project'))
 
@@ -8881,12 +8903,12 @@ class TestHarnessFetchTaskCountCensus:
     async def test_non_dict_statuses_returns_empty_and_warns(
         self, bad_return, journal, event_buffer, mock_memory_service, caplog
     ):
-        """get_statuses returning a non-dict (without raising) => {} + WARNING.
+        """get_statuses_fresh returning a non-dict (without raising) => {} + WARNING.
 
         Currently RED: the non-dict branch returns {} silently (no logger call).
         """
         harness = _make_test_harness(journal, event_buffer, mock_memory_service)
-        harness.taskmaster.get_statuses = AsyncMock(return_value=bad_return)  # type: ignore[union-attr,attr-defined]
+        harness.taskmaster.get_statuses_fresh = AsyncMock(return_value=bad_return)  # type: ignore[union-attr,attr-defined]
 
         _HARNESS_LOGGER = 'fused_memory.reconciliation.harness'
         with caplog.at_level(logging.WARNING, logger=_HARNESS_LOGGER):
@@ -8906,9 +8928,9 @@ class TestHarnessFetchTaskCountCensus:
     async def test_empty_dict_statuses_returns_empty_no_warning(
         self, journal, event_buffer, mock_memory_service, caplog
     ):
-        """REGRESSION: legit-empty {} from get_statuses => {} with ZERO warnings."""
+        """REGRESSION: legit-empty {} from get_statuses_fresh => {} with ZERO warnings."""
         harness = _make_test_harness(journal, event_buffer, mock_memory_service)
-        harness.taskmaster.get_statuses = AsyncMock(return_value={})  # type: ignore[union-attr,attr-defined]
+        harness.taskmaster.get_statuses_fresh = AsyncMock(return_value={})  # type: ignore[union-attr,attr-defined]
 
         _HARNESS_LOGGER = 'fused_memory.reconciliation.harness'
         with caplog.at_level(logging.WARNING, logger=_HARNESS_LOGGER):
@@ -9611,7 +9633,7 @@ class TestFullCycleWiringDiagnostics:
                 ]
             }
         )
-        harness.taskmaster.get_statuses = AsyncMock(
+        harness.taskmaster.get_statuses_fresh = AsyncMock(
             return_value={'1': 'done', '2': 'pending'}
         )
 
@@ -9658,7 +9680,7 @@ class TestFullCycleWiringDiagnostics:
         )
         assert tcv.get('available') is True, (
             f'task_count_verification["available"] expected True, got {tcv.get("available")!r}; '
-            'get_statuses returned a non-empty map so census should be marked available'
+            'get_statuses_fresh returned a non-empty map so census should be marked available'
         )
 
         gqh = captured.get('graphiti_queue_health')
@@ -9702,7 +9724,7 @@ class TestFullCycleWiringDiagnostics:
                 ]
             }
         )
-        harness.taskmaster.get_statuses = AsyncMock(
+        harness.taskmaster.get_statuses_fresh = AsyncMock(
             return_value={'1': 'done', '2': 'pending'}
         )
 
@@ -9748,7 +9770,7 @@ class TestFullCycleWiringDiagnostics:
             )
 
         # _reconcile_status_correction must be awaited once with the SAME
-        # statuses map used for task_count_verification (no extra get_statuses
+        # statuses map used for task_count_verification (no extra get_statuses_fresh
         # round-trip).
         spy.assert_awaited_once_with('test-project', {'1': 'done', '2': 'pending'})
 
