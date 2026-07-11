@@ -357,6 +357,26 @@ class TestUpdatePlanMetadata:
         plan = artifacts.read_plan()
         assert plan['files'] == ['mod_a/foo.py', 'mod_a/bar.py']
 
+    def test_recovers_stringified_files_array(self, artifacts):
+        """A mis-serialized (stringified) files arg (task 2428) must be
+        recovered into a clean list, same as create_plan."""
+        _setup_full_plan(artifacts)
+        result = _update_plan_metadata(artifacts, files='["x.py","y.py"]')
+        assert result['status'] == 'ok'
+
+        plan = artifacts.read_plan()
+        assert plan['files'] == ['x.py', 'y.py']
+
+    def test_explicit_none_files_leaves_unchanged(self, artifacts):
+        """None must keep meaning 'leave files unchanged' — it must NOT be
+        treated as the create_plan dropped-files error case."""
+        _setup_full_plan(artifacts)
+        result = _update_plan_metadata(artifacts, files=None)
+        assert result['status'] == 'ok'
+
+        plan = artifacts.read_plan()
+        assert plan['files'] == ['mod_a/foo.py', 'mod_a/bar.py']
+
 
 class TestRemovePlanStep:
     def test_removes_pending_step(self, artifacts):
@@ -845,3 +865,20 @@ class TestCreatePlanToolDroppedFiles:
 
         assert result.structured_content['status'] == 'error'
         assert artifacts.read_plan() == {}
+
+
+@pytest.mark.asyncio
+class TestUpdatePlanMetadataToolRecoversMisserializedFiles:
+    """update_plan_metadata tolerates a mis-serialized (stringified) files
+    arg, same as create_plan (task 2428)."""
+
+    async def test_json_array_string_recovered_via_tool_run(self, artifacts):
+        _setup_full_plan(artifacts)
+        server = plan_tools.create_server(artifacts)
+        tool = await server.get_tool('update_plan_metadata')
+        assert tool is not None
+
+        await tool.run({'files': '["x.py","y.py"]'})
+
+        plan = artifacts.read_plan()
+        assert plan['files'] == ['x.py', 'y.py']
