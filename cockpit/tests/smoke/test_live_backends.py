@@ -120,16 +120,27 @@ def test_tmux_reorder_preserves_focused_window(disposable_tmux_session, tmux_act
     mutable index) even across a reorder that relocates that window's own
     index -- reorder only ever issues move-window, never
     select-window/switch-client (see TmuxBackend.reorder's docstring).
+
+    Window indices are read back from the live session via `.windows()`
+    rather than assumed to be 0/1/2: tmux assigns a new session's window
+    indices starting from the operator's own tmux.conf `base-index` (0 by
+    default, but commonly 1), so hardcoding 0/1/2 would address a
+    nonexistent window and make this test's outcome host-config-dependent.
     """
     session = disposable_tmux_session
-    session.select(1)
+    rows = sorted(session.windows(), key=lambda row: int(row[0]))
+    assert len(rows) >= 3, f'expected >=3 windows in the disposable session, got {rows!r}'
+    index_a, index_b, index_c = (int(row[0]) for row in rows[:3])
+
+    session.select(index_b)
     active0 = tmux_active_window_id(session.name)
 
-    # Non-identity order that relocates index 1 (the active window) to index 0.
+    # Non-identity order that relocates the now-active window (index_b) out
+    # of its original slot.
     targets = [
-        DisplayTarget(kind='tmux', tmux_target=f'{session.name}:1'),
-        DisplayTarget(kind='tmux', tmux_target=f'{session.name}:2'),
-        DisplayTarget(kind='tmux', tmux_target=f'{session.name}:0'),
+        DisplayTarget(kind='tmux', tmux_target=f'{session.name}:{index_b}'),
+        DisplayTarget(kind='tmux', tmux_target=f'{session.name}:{index_c}'),
+        DisplayTarget(kind='tmux', tmux_target=f'{session.name}:{index_a}'),
     ]
 
     TmuxBackend().reorder(targets)

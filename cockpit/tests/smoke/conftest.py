@@ -239,7 +239,14 @@ def _kill_tmux_session_fail_soft(name: str) -> None:
 
 @pytest.fixture
 def disposable_tmux_session():
-    """A uniquely-named session with >=3 windows (indices 0,1,2), killed fail-soft at teardown.
+    """A uniquely-named session with >=3 windows, killed fail-soft at teardown.
+
+    tmux assigns each new window's index by searching for the lowest unused
+    index starting at the *operator's own* `base-index` tmux.conf setting (0
+    by default, but commonly 1) -- this fixture does not force that setting,
+    so callers MUST NOT assume the three windows land at indices 0,1,2.
+    Discover the real indices via the returned TmuxSession's `.windows()`
+    (in `tmux list-windows` order, i.e. ascending by index).
 
     Every tmux op the smoke tests issue is confined to this session name
     (TmuxBackend.reorder addresses only `<name>:<index>`, parking at
