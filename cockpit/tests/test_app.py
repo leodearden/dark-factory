@@ -705,3 +705,55 @@ class TestDeferResetsAge:
             assert after.get(path) == value, f'{path} was created/modified/removed by the defer'
         new_paths = set(after) - set(before)
         assert not any(path.startswith(('sessions/', 'decisions/')) for path in new_paths)
+
+
+class TestSpawnBar:
+    @pytest.mark.timeout(10)
+    async def test_new_session_key_pushes_spawn_screen(self, tmp_path):
+        """'n' (PRD §9 C5b spawn bar) pushes a SpawnScreen project/role/prompt picker."""
+        from cockpit.app import CockpitApp
+        from cockpit.panes.spawn_bar import SpawnScreen
+
+        app = CockpitApp(fleet_root=tmp_path, poll_interval=0.05, spawn_runner=lambda argv: None)
+        async with app.run_test() as pilot:
+            await pilot.pause()
+
+            await pilot.press('n')
+            await pilot.pause()
+
+            assert isinstance(app.screen, SpawnScreen)
+
+    @pytest.mark.timeout(10)
+    async def test_spawn_session_invokes_runner_with_exact_argv(self, tmp_path):
+        """spawn_session(project_root, role, prompt) -- the spawn bar's leaf
+        signal (PRD §9 C5b) -- builds spawn-claude.sh's exact positional
+        argv (build_spawn_argv) from the picked project (cwd), a
+        role-derived title, and the prompt, then hands it to the injected
+        spawn_runner. No real terminal/process is launched here (the
+        runner is faked) -- driven directly per this task's plan, rather
+        than through SpawnScreen's own Input/Select widgets.
+        """
+        from cockpit.app import CockpitApp
+        from cockpit.panes.spawn_bar import build_spawn_argv
+
+        spawned: list[list[str]] = []
+        spawn_script = '/repo/skills/spawn/spawn-claude.sh'
+
+        app = CockpitApp(
+            fleet_root=tmp_path,
+            poll_interval=0.05,
+            spawn_runner=spawned.append,
+            spawn_script=spawn_script,
+        )
+        async with app.run_test() as pilot:
+            await pilot.pause()
+
+            project_root = '/home/leo/src/dark-factory'
+            role = 'unblock'
+            prompt = 'Please look at this'
+            app.spawn_session(project_root, role, prompt)
+            await pilot.pause()
+
+        assert len(spawned) == 1
+        expected_title = f'{role}:{Path(project_root).name}'
+        assert spawned[0] == build_spawn_argv(spawn_script, project_root, expected_title, prompt)
