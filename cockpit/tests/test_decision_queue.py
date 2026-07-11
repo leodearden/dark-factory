@@ -241,3 +241,176 @@ class TestFormatQueueRow:
         _, _, _, question_col = format_queue_row(item, now)
 
         assert question_col != ''
+
+
+class TestOrderQueue:
+    def test_includes_only_open_decisions_and_awaiting_sessions(self):
+        from cockpit.priority import Priorities
+
+        from cockpit.panes.decision_queue import order_queue
+
+        open_decision = _make_decision(id='dec-open', state=sr.DecisionState.OPEN)
+        dropped_decision = _make_decision(id='dec-dropped', state=sr.DecisionState.DROPPED)
+        answered_decision = _make_decision(id='dec-answered', state=sr.DecisionState.ANSWERED)
+        awaiting_session = _make_session(session_slug='awaiting-1', status=sr.Status.AWAITING_INPUT)
+        running_session = _make_session(session_slug='running-1', status=sr.Status.RUNNING)
+
+        items = order_queue(
+            [open_decision, dropped_decision, answered_decision],
+            [awaiting_session, running_session],
+            Priorities.default(),
+            _NOW,
+        )
+
+        assert len(items) == 2
+        assert {item.decision_id for item in items if item.kind == 'decision'} == {'dec-open'}
+        session_items = [item for item in items if item.kind == 'session']
+        assert len(session_items) == 1
+
+    def test_returns_queue_item_instances(self):
+        from cockpit.priority import Priorities
+
+        from cockpit.panes.decision_queue import QueueItem, order_queue
+
+        decision = _make_decision(state=sr.DecisionState.OPEN)
+
+        items = order_queue([decision], [], Priorities.default(), _NOW)
+
+        assert len(items) == 1
+        assert isinstance(items[0], QueueItem)
+
+    def test_higher_manual_boost_decision_precedes_lower(self):
+        from cockpit.priority import Priorities
+
+        from cockpit.panes.decision_queue import order_queue
+
+        low = _make_decision(id='dec-low', manual_boost=0)
+        high = _make_decision(id='dec-high', manual_boost=5)
+
+        items = order_queue([low, high], [], Priorities.default(), _NOW)
+
+        assert [item.decision_id for item in items] == ['dec-high', 'dec-low']
+
+    def test_pure_deterministic_across_calls(self):
+        from cockpit.priority import Priorities
+
+        from cockpit.panes.decision_queue import order_queue
+
+        decisions = [
+            _make_decision(id='dec-a', manual_boost=1),
+            _make_decision(id='dec-b', manual_boost=3),
+        ]
+        sessions = [_make_session(session_slug='s-1', status=sr.Status.AWAITING_INPUT)]
+
+        first = order_queue(decisions, sessions, Priorities.default(), _NOW)
+        second = order_queue(decisions, sessions, Priorities.default(), _NOW)
+
+        assert [item.key for item in first] == [item.key for item in second]
+        assert [item.score for item in first] == [item.score for item in second]
+
+    def test_session_item_target_resolved_from_own_display(self):
+        from cockpit.priority import Priorities
+
+        from cockpit.backends import DisplayTarget
+        from cockpit.panes.decision_queue import order_queue
+
+        display = sr.Display(kind='wm', wm_title='unblock:df#2085 slug')
+        session = _make_session(
+            session_slug='awaiting-1', status=sr.Status.AWAITING_INPUT, display=display
+        )
+
+        items = order_queue([], [session], Priorities.default(), _NOW)
+
+        assert len(items) == 1
+        assert items[0].target == DisplayTarget(kind='wm', wm_title='unblock:df#2085 slug')
+
+    def test_decision_item_target_resolved_from_linked_session_display(self):
+        from cockpit.priority import Priorities
+
+        from cockpit.backends import DisplayTarget
+        from cockpit.panes.decision_queue import order_queue
+
+        display = sr.Display(kind='tmux', tmux_target='fleet-df:3')
+        linked_session = _make_session(
+            session_slug='linked-1', status=sr.Status.RUNNING, display=display
+        )
+        decision = _make_decision(session_id='linked-1', state=sr.DecisionState.OPEN)
+
+        items = order_queue([decision], [linked_session], Priorities.default(), _NOW)
+
+        assert len(items) == 1
+        assert items[0].target == DisplayTarget(kind='tmux', tmux_target='fleet-df:3')
+
+    def test_decision_item_target_none_when_session_unresolvable(self):
+        from cockpit.priority import Priorities
+
+        from cockpit.panes.decision_queue import order_queue
+
+        decision = _make_decision(session_id='no-such-session', state=sr.DecisionState.OPEN)
+
+        items = order_queue([decision], [], Priorities.default(), _NOW)
+
+        assert len(items) == 1
+        assert items[0].target is None
+
+    def test_decision_item_target_none_when_no_session_id(self):
+        from cockpit.priority import Priorities
+
+        from cockpit.panes.decision_queue import order_queue
+
+        decision = _make_decision(session_id=None, state=sr.DecisionState.OPEN)
+
+        items = order_queue([decision], [], Priorities.default(), _NOW)
+
+        assert items[0].target is None
+
+    def test_boosts_overlay_can_flip_order(self):
+        from cockpit.priority import Priorities
+
+        from cockpit.panes.decision_queue import order_queue
+
+        low = _make_decision(id='dec-low', manual_boost=0)
+        high = _make_decision(id='dec-high', manual_boost=0)
+
+        baseline = order_queue([low, high], [], Priorities.default(), _NOW)
+        assert [item.decision_id for item in baseline] == ['dec-high', 'dec-low']
+
+        boosted = order_queue(
+            [low, high], [], Priorities.default(), _NOW, boosts={'decision:dec-low': 10}
+        )
+
+        assert boosted[0].decision_id == 'dec-low'
+
+    def test_deferred_overlay_resets_effective_age(self):
+        from cockpit.priority import Priorities
+
+        from cockpit.panes.decision_queue import order_queue
+
+        older = _make_decision(id='dec-older', filed_at='2020-01-01T00:00:00+00:00')
+        newer = _make_decision(id='dec-newer', filed_at=_NOW.isoformat())
+
+        baseline = order_queue([older, newer], [], Priorities.default(), _NOW)
+        assert baseline[0].decision_id == 'dec-older'
+
+        deferred = order_queue(
+            [older, newer],
+            [],
+            Priorities.default(),
+            _NOW,
+            deferred={'decision:dec-older': _NOW},
+        )
+
+        assert deferred[0].decision_id == 'dec-newer'
+
+    def test_handling_flag_reflected_on_item(self):
+        from cockpit.priority import Priorities
+
+        from cockpit.panes.decision_queue import order_queue
+
+        decision = _make_decision(id='dec-1', state=sr.DecisionState.OPEN)
+
+        items = order_queue(
+            [decision], [], Priorities.default(), _NOW, handling={'decision:dec-1'}
+        )
+
+        assert items[0].handling is True
