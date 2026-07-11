@@ -103,6 +103,21 @@ def _citation_identities(finding: dict) -> set[str]:
     return ids
 
 
+def _cited_task_key(project_id: str, task_id: str) -> str:
+    """Build the canonical ``'{project_id}:{task_id}'`` identity string that
+    anchors the in-run primary-cited-task fold (task-2425).
+
+    Single-sourced so :meth:`ReconReportState.cite_task` (fold registration)
+    and :meth:`ReconReportState._purge_finding` (fold-key cleanup) can never
+    drift apart — if the two built this string independently and the formats
+    diverged, a purge would silently fail to clear the anchor it registered,
+    leaking a stale ``_run_cited_task_index`` entry.  Mirrors the
+    ``f'{pid}:{tid}'`` convention :func:`_citation_identities` already uses
+    for ``cited_tasks`` entries.
+    """
+    return f'{project_id}:{task_id}'
+
+
 def _traces_exclusively_to_stage1(
     finding: dict,
     stage1_identities: set[str],
@@ -892,6 +907,19 @@ class ReconReportState:
         Identity-based removal (``is``, not ``==``) — *finding* is the exact
         object reference returned by :meth:`_resolve_finding`; see
         ``delete_finding``'s docstring for why this matters.
+
+        Removal is wholesale: *finding* is dropped from ``owning_entry.findings``
+        entirely, so any ``cited_entities`` / ``cited_edges`` / ``cited_memories``
+        already recorded on it (e.g. via ``cite_entity`` / ``cite_edge`` /
+        ``cite_memory`` calls made before this purge) are discarded along with
+        it — not just the four dedup indices. For the cite_task fold this is
+        intentional (task-2425): a finding judged a same-run duplicate of an
+        earlier one contributes no new information, so citations already
+        attached to it are not worth preserving. A caller that records
+        cite_entity/cite_edge/cite_memory citations on a null-task_id finding
+        BEFORE its first cite_task call should know those citations vanish
+        silently if that cite_task later folds the finding into an existing
+        duplicate.
         """
         owning_entry.findings[:] = [f for f in owning_entry.findings if f is not finding]
         self._run_finding_index.get(run_id, {}).pop(finding.finding_id, None)
@@ -907,7 +935,7 @@ class ReconReportState:
 
         if finding.task_id is None and finding.cited_tasks:
             primary = finding.cited_tasks[0]
-            primary_key = f"{primary['project_id']}:{primary['task_id']}"
+            primary_key = _cited_task_key(primary['project_id'], primary['task_id'])
             run_cited_tasks = self._run_cited_task_index.get(run_id, {})
             if run_cited_tasks.get(primary_key) == finding.finding_id:
                 run_cited_tasks.pop(primary_key, None)
@@ -1003,7 +1031,12 @@ class ReconReportState:
         an identical {project_id, task_id} citation is already present so a
         re-citation of the same task (e.g. re-citing a finding's own primary
         task) stays idempotent instead of accumulating a duplicate entry
-        (task-2425 amend).
+        (task-2425 amend). This idempotency check keys ONLY on
+        {project_id, task_id} — first-cited title wins: if the upstream
+        task's title has since changed, a re-citation is still skipped and
+        the stored citation keeps the original title rather than refreshing
+        it. Titles are cosmetic display text, not part of the citation's
+        identity, so this staleness is accepted rather than reconciled.
 
         In-run cited-task fold (task-2425): when *finding* has a null
         top-level task_id and this is its PRIMARY (first-ever) citation, the
@@ -1067,7 +1100,7 @@ class ReconReportState:
             and not finding.cited_tasks
             and finding_entry.stage != 'memory_consolidator'
         ):
-            cited_task_key = f'{project_id}:{task_id}'
+            cited_task_key = _cited_task_key(project_id, task_id)
             run_cited_tasks = self._run_cited_task_index.setdefault(run_id, {})
             existing_id = run_cited_tasks.get(cited_task_key)
             if existing_id is not None and existing_id != finding.finding_id:
@@ -1081,7 +1114,10 @@ class ReconReportState:
         # test_only_primary_citation_is_a_fold_anchor) appends a second,
         # redundant citation entry — harmless to the fold itself (which
         # always keys off cited_tasks[0]) but it lets cited_tasks accumulate
-        # duplicate rows.
+        # duplicate rows. Keyed on (project_id, task_id) only, NOT title —
+        # first-cited title wins; a re-citation after the upstream title
+        # changed is still skipped rather than refreshing the stored title
+        # (see cite_task's docstring).
         already_cited = any(
             c['project_id'] == project_id and c['task_id'] == task_id
             for c in finding.cited_tasks
