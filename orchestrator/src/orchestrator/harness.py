@@ -1195,19 +1195,6 @@ class Harness:
             self.review_checkpoint.cost_store = self.cost_store
             self.review_checkpoint.run_id = run_id
 
-        # 0c. Refuse to start with dirty working tree (unless forced).
-        # Checked before any servers start to avoid zombie processes on failure.
-        if not force_dirty_start:
-            dirty = await self.git_ops.has_dirty_working_tree()
-            if dirty:
-                self._lock_file.close()
-                self._lock_file = None
-                raise RuntimeError(
-                    'Refusing to start: project_root has uncommitted tracked changes. '
-                    'Commit or stash your work first, or pass --force-dirty-start to override.\n'
-                    f'Dirty files:\n{dirty}'
-                )
-
         # Hoisted out of the try block so the finally clause can cancel
         # in-flight workflow tasks even if an exception fires before the
         # main loop creates them.
@@ -1235,6 +1222,12 @@ class Harness:
                 await self._dismiss_stale_escalations()
             except Exception as e:
                 logger.warning(f'Failed to dismiss stale escalations: {e}')
+
+            # 1c0-dirty. Dirty project_root no longer refuses to start (task
+            # 2380); file (or refresh) a deferred born-at-L2 escalation
+            # instead. Runs after _dismiss_stale_escalations, which only
+            # touches L0, so a prior run's L2 survives for dedup here.
+            await self._file_dirty_tree_escalation(force_dirty_start)
 
             # 1c0. Rehydrate merge-halt state from preserved L1s (non-fatal).
             # Must run after _dismiss_stale_escalations so we scan the

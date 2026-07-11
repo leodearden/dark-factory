@@ -222,7 +222,8 @@ def main(verbose: bool):
               help='Delay before executing tasks (e.g. 4h, 30m, 90s). '
                    'Escalation server starts immediately.')
 @click.option('--force-dirty-start', is_flag=True,
-              help='Start even if project_root has uncommitted changes (risky)')
+              help='project_root with uncommitted changes always starts; this '
+                   'silently skips filing the born-at-L2 cleanup escalation')
 @click.option('--retag-modules', is_flag=True,
               help='Force re-tag all non-done/cancelled tasks with code modules')
 @click.option('--until-idle', is_flag=True,
