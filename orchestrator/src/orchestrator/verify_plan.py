@@ -13,6 +13,7 @@ import re
 from collections.abc import Callable
 from dataclasses import dataclass
 from enum import Enum, StrEnum
+from typing import Literal
 
 from orchestrator.config import ModuleConfig, OrchestratorConfig
 from orchestrator.verify_cmd import VerifyCmd, parse_config_command, scope_to, strip_cwd
@@ -450,11 +451,35 @@ def _derive_fallback_runs(
     return runs
 
 
+# Extensions considered "real source" for the TRIVIAL / needs_pipeline_guard_check
+# short-circuit below — mirrors verify._has_source_files exactly. NOT the same
+# concept as FileKind.INERT: classify_file treats a .rs path as INERT too
+# (cargo/.rs scoping is a separate concern left to run_scoped_verification's
+# execute step — see FileKind's docstring), but .rs is still real source for
+# the purposes of "is this diff trivially a no-op".
+_SOURCE_EXTENSIONS = ('.py', '.rs')
+
+
+def _has_source_files(files: list[str]) -> bool:
+    """Return True when *files* contains at least one ``.py`` or ``.rs`` path.
+
+    Duplicated from (not imported from) ``verify._has_source_files`` — this
+    module stays a standalone decision layer during the incremental rollout;
+    see :func:`classify_file`'s docstring for the same rationale re:
+    ``_PROTOCOL_RE``/``_TYPEDDICT_RE``.
+    """
+    return any(f.endswith(_SOURCE_EXTENSIONS) for f in files)
+
+
+_TRIVIAL_REASON = 'No source files changed — verify trivially passes'
+
+
 def derive_verify_plan(
     existing_files: list[str],
     module_configs: list[ModuleConfig],
     config: OrchestratorConfig | None,
     worktree_reader: Callable[[str], str | None],
+    role: Literal['merge', 'task'] = 'task',
 ) -> VerifyPlan:
     """Derive the declarative VerifyPlan for one verify attempt (PRD task γ).
 
@@ -465,6 +490,19 @@ def derive_verify_plan(
     unscoped pyright) are each expressed a single time instead of being
     reimplemented per call site.
 
+    TRIVIAL short-circuit: when *existing_files* has no ``.py``/``.rs`` file
+    at all, every module-path/fallback branch below would no-op anyway —
+    this unifies the two near-identical "no source files" checks
+    ``run_scoped_verification`` currently duplicates once per branch
+    (module-config and fallback) into the ONE check here, ahead of both.
+    The plan then carries a single ``TRIVIAL`` :class:`PlannedRun` plus
+    ``needs_pipeline_guard_check`` — set when *role* is ``'merge'`` —
+    recording that the CALLER must still run the impure
+    ``_verify_pipeline_guard_requires_full_gate`` subprocess check (e.g. a
+    diff touching ``verify.sh`` itself shifts plan-line counts — the
+    drift-ambush class) before trusting this trivial verdict.
+    ``derive_verify_plan`` never executes that guard itself, staying pure.
+
     Module-config branch (*module_configs* non-empty): each ModuleConfig is
     scoped independently via :func:`_derive_module_runs`.
 
@@ -472,6 +510,11 @@ def derive_verify_plan(
     ``'__fallback__'`` module is derived from *config*'s global commands via
     :func:`_derive_fallback_runs`.
     """
+    if not _has_source_files(existing_files):
+        return VerifyPlan(
+            runs=(PlannedRun('', None, ScopeKind.TRIVIAL, _TRIVIAL_REASON),),
+            needs_pipeline_guard_check=(role == 'merge'),
+        )
     if module_configs:
         runs: list[PlannedRun] = []
         for mc in module_configs:
