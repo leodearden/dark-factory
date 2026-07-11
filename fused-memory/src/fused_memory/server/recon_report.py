@@ -573,14 +573,18 @@ class ReconReportState:
         complete()'s cached ``flagged_count``/``stats`` from silent
         corruption.  Retraction is intended for in-progress stages.
 
-        Removes the finding from ``entry.findings`` and
-        ``_run_finding_index``, and also cleans whichever dedup index it
-        was filed under (``_run_sig_index`` / ``_run_desc_index`` and
-        their per-entry mirrors) — recomputed from the finding's own
-        already-canonicalized ``task_id``/``flag_type``/``description`` —
-        so a corrected finding can be re-filed under the same
-        signature/description after retraction instead of bouncing off a
-        stale ``duplicate_finding`` pointer.
+        Removes the finding from ``entry.findings`` and every dedup index
+        it may be registered under — ``_run_finding_index``, whichever of
+        ``_run_sig_index`` / ``_run_desc_index`` it was filed under (and
+        their per-entry mirrors), and ``_run_cited_task_index`` if it is a
+        primary-cited-task fold anchor (task-2425) — via the single-sourced
+        :meth:`_purge_finding` helper shared with the in-run cited-task
+        fold's retract path in :meth:`cite_task`. Indices are recomputed
+        from the finding's own already-canonicalized
+        ``task_id``/``flag_type``/``description``/``cited_tasks``, so a
+        corrected finding can be re-filed under the same signature,
+        description, or primary cited task after retraction instead of
+        bouncing off a stale ``duplicate_finding`` pointer.
         """
         entry = self._resolve_entry(run_id)
         if entry is None:
@@ -601,24 +605,7 @@ class ReconReportState:
             )
             return _ERR_ALREADY_COMPLETED.copy()
 
-        # Identity-based removal (not list.remove(), which dispatches to
-        # _Finding's dataclass-generated __eq__): _resolve_finding returned
-        # this exact object by reference from owning_entry.findings, so
-        # filtering by `is` makes the "remove precisely the resolved
-        # object" invariant explicit rather than relying on field-by-field
-        # equality (harmless today since finding_id is unique and is one of
-        # the compared fields, but identity is the actual invariant).
-        owning_entry.findings[:] = [f for f in owning_entry.findings if f is not finding]
-        self._run_finding_index.get(run_id, {}).pop(finding_id, None)
-
-        sig = (finding.task_id, finding.flag_type)
-        if sig != (None, None):
-            self._run_sig_index.get(run_id, {}).pop(sig, None)
-            owning_entry._signature_to_finding.pop(sig, None)
-        elif _normalize_description(finding.description):
-            desc_hash = _description_hash(finding.description)
-            self._run_desc_index.get(run_id, {}).pop(desc_hash, None)
-            owning_entry._deschash_to_finding.pop(desc_hash, None)
+        self._purge_finding(run_id, owning_entry, finding)
 
         return {'status': 'deleted', 'finding_id': finding_id}
 
