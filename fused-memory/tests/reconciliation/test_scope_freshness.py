@@ -142,3 +142,88 @@ class TestIsCrossProjectScopeCorrection:
             ],
         }
         assert is_cross_project_scope_correction(finding, 'autopilot_video') is True
+
+
+class TestScopeSignature:
+    """Tests for select_primary_subject(finding, project_id) -> tuple[str, str] | None
+    and compute_scope_signature(finding, project_id) -> tuple[str, str] | None."""
+
+    def test_select_primary_subject_returns_first_foreign_entry(self):
+        from fused_memory.reconciliation.scope_freshness import select_primary_subject
+
+        finding = {
+            'flag_type': 'cross_project',
+            'cited_tasks': [
+                {'project_id': 'autopilot_video', 'task_id': '540', 'title': 'x'},
+                {'project_id': 'dark_factory', 'task_id': '2405', 'title': 'y'},
+                {'project_id': 'dark_factory', 'task_id': '1097', 'title': 'z'},
+            ],
+        }
+        assert select_primary_subject(finding, 'autopilot_video') == ('dark_factory', '2405')
+
+    def test_select_primary_subject_falls_back_to_first_entry_when_none_foreign(self):
+        from fused_memory.reconciliation.scope_freshness import select_primary_subject
+
+        finding = {
+            'flag_type': 'cross_project',
+            'cited_tasks': [
+                {'project_id': 'autopilot_video', 'task_id': '540', 'title': 'x'},
+                {'project_id': 'autopilot_video', 'task_id': '544', 'title': 'y'},
+            ],
+        }
+        assert select_primary_subject(finding, 'autopilot_video') == ('autopilot_video', '540')
+
+    def test_select_primary_subject_none_when_cited_tasks_empty(self):
+        from fused_memory.reconciliation.scope_freshness import select_primary_subject
+
+        assert select_primary_subject({'flag_type': 'cross_project'}, 'autopilot_video') is None
+        assert (
+            select_primary_subject(
+                {'flag_type': 'cross_project', 'cited_tasks': []}, 'autopilot_video',
+            )
+            is None
+        )
+
+    def test_select_primary_subject_coerces_task_id_to_str(self):
+        from fused_memory.reconciliation.scope_freshness import select_primary_subject
+
+        finding = {
+            'flag_type': 'cross_project',
+            'cited_tasks': [{'project_id': 'dark_factory', 'task_id': 2405, 'title': 'x'}],
+        }
+        assert select_primary_subject(finding, 'autopilot_video') == ('dark_factory', '2405')
+
+    def test_compute_scope_signature_uses_flag_type(self):
+        from fused_memory.reconciliation.scope_freshness import compute_scope_signature
+
+        finding = {
+            'flag_type': 'cross_project',
+            'cited_tasks': [{'project_id': 'dark_factory', 'task_id': '2405', 'title': 'x'}],
+        }
+        assert compute_scope_signature(finding, 'autopilot_video') == (
+            'dark_factory:2405', 'cross_project',
+        )
+
+    def test_compute_scope_signature_falls_back_to_category(self):
+        from fused_memory.reconciliation.scope_freshness import compute_scope_signature
+
+        finding = {
+            'category': 'cross_project_routing',
+            'cited_tasks': [{'project_id': 'dark_factory', 'task_id': '2405', 'title': 'x'}],
+        }
+        assert compute_scope_signature(finding, 'autopilot_video') == (
+            'dark_factory:2405', 'cross_project_routing',
+        )
+
+    def test_compute_scope_signature_none_when_no_flag_type_or_category(self):
+        from fused_memory.reconciliation.scope_freshness import compute_scope_signature
+
+        finding = {
+            'cited_tasks': [{'project_id': 'dark_factory', 'task_id': '2405', 'title': 'x'}],
+        }
+        assert compute_scope_signature(finding, 'autopilot_video') == ('dark_factory:2405', '')
+
+    def test_compute_scope_signature_none_when_no_primary_subject(self):
+        from fused_memory.reconciliation.scope_freshness import compute_scope_signature
+
+        assert compute_scope_signature({'flag_type': 'cross_project'}, 'autopilot_video') is None
