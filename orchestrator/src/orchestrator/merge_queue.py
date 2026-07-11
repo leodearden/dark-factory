@@ -11660,6 +11660,23 @@ class SpeculativeMergeWorker(_WipHaltMixin):
             if vr is not None and vr.outcome is not None:
                 fail_merge_wt = vr.merge_wt
                 await self._release_or_cleanup(fail_merge_wt, spec_warm=vr.spec_warm)
+                # I4 runs.db surface (task 2383 β, step 18): thread the skew
+                # attribution verdict into a merge_attempt event so gamma's
+                # digest.merge_disposition_counts (task 2384) is non-sentinel
+                # on the production path.  Guarded to INTEGRATION_SKEW/BRANCH_BUG
+                # only — MAIN_RED already emitted 'main_health_red' when the
+                # outcome was built (see _classify_main_health_red, above), and
+                # INDETERMINATE (fail-open default, I3) stays byte-identical
+                # with no emit at all.
+                if vr.outcome.disposition in (
+                    MergeFailureDisposition.INTEGRATION_SKEW,
+                    MergeFailureDisposition.BRANCH_BUG,
+                ):
+                    _emit_merge_attempt(
+                        self._event_store, req.task_id, OutcomeKind.verify_failed,
+                        disposition=vr.outcome.disposition,
+                        duration_ms=_elapsed_ms(item.started_monotonic),
+                    )
                 self._resolve_or_drop_abandoned(req, vr.outcome)
                 _n_failed_val = True
                 return False
