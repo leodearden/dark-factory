@@ -10,10 +10,12 @@ Unifies the twice-fixed scope decision between ``scope_module_config`` and
 from __future__ import annotations
 
 import re
+from collections.abc import Callable
 from dataclasses import dataclass
 from enum import Enum, StrEnum
 
-from orchestrator.verify_cmd import VerifyCmd
+from orchestrator.config import ModuleConfig, OrchestratorConfig
+from orchestrator.verify_cmd import VerifyCmd, parse_config_command, scope_to, strip_cwd
 
 
 class FileKind(Enum):
@@ -176,3 +178,148 @@ class VerifyPlan:
             'runs': [run.to_dict() for run in self.runs],
             'needs_pipeline_guard_check': self.needs_pipeline_guard_check,
         }
+
+
+def _derive_module_runs(
+    mc: ModuleConfig,
+    existing_files: list[str],
+    worktree_reader: Callable[[str], str | None],
+) -> list[PlannedRun]:
+    """Derive one ModuleConfig's PlannedRuns — one per (module, tool) slot.
+
+    Filters *existing_files* to ``.py`` files under ``mc.prefix + '/'`` and
+    classifies each EXACTLY ONCE via :func:`classify_file` (content is read
+    through *worktree_reader* only when ``mc.type_check_command`` is
+    configured — only STRUCTURAL detection needs content, and only
+    ``.type_check_command``'s outcome can change because of it). Zero
+    matching files yields a single explicit SKIPPED PlannedRun rather than
+    silently contributing nothing (mirrors ``scope_module_config``'s
+    ``return None`` "caller must skip this subproject" contract, upgraded to
+    an explicit reasoned run).
+
+    Each per-tool run's ``reason`` is prefixed with the tool name
+    (``'lint:'``/``'pyright:'``/``'pytest:'``) so a caller can recover tool
+    identity even for a SKIPPED slot, whose ``cmd`` is ``None``.
+    """
+    prefix = mc.prefix + '/'
+    scoped = [f for f in existing_files if f.startswith(prefix) and f.endswith('.py')]
+    if not scoped:
+        return [PlannedRun(mc.prefix, None, ScopeKind.SKIPPED, 'no files under prefix')]
+
+    # Guard: content is only consulted by classify_file's STRUCTURAL check, so
+    # skip the I/O entirely when there is no type-check command to widen.
+    need_structural = bool(mc.type_check_command)
+    kinds: dict[str, FileKind] = {
+        f: classify_file(f, worktree_reader(f) if need_structural else None)
+        for f in scoped
+    }
+
+    conftest_trigger = next((f for f, k in kinds.items() if k is FileKind.CONFTEST), None)
+    test_data_trigger = next((f for f, k in kinds.items() if k is FileKind.TEST_DATA), None)
+    structural_trigger = next((f for f, k in kinds.items() if k is FileKind.STRUCTURAL), None)
+    collectable_tests = [f for f, k in kinds.items() if k is FileKind.COLLECTABLE_TEST]
+
+    runs: list[PlannedRun] = []
+
+    # -- lint: always FILE_SCOPED to every matched file — ruff has no
+    # cross-file invariant to protect, unlike pyright's Protocol/TypedDict
+    # concern (D2), so there is no "widen to full suite" branch here. --
+    if mc.lint_command:
+        lint_cmd = strip_cwd(scope_to(parse_config_command(mc.lint_command), scoped))
+        runs.append(PlannedRun(
+            mc.prefix, lint_cmd, ScopeKind.FILE_SCOPED, 'lint: file-scoped to touched file(s)',
+        ))
+    else:
+        runs.append(PlannedRun(
+            mc.prefix, None, ScopeKind.SKIPPED, 'lint: no lint_command configured',
+        ))
+
+    # -- pyright: FULL_SUITE (unscoped) when a STRUCTURAL file is present (D2)
+    # — file-scoped pyright cannot verify cross-file Protocol/TypedDict
+    # conformance — else FILE_SCOPED. --
+    if mc.type_check_command:
+        if structural_trigger is not None:
+            type_cmd = parse_config_command(mc.type_check_command)
+            runs.append(PlannedRun(
+                mc.prefix, type_cmd, ScopeKind.FULL_SUITE,
+                f'pyright: structural file {structural_trigger} requires unscoped type check',
+            ))
+        else:
+            type_cmd = strip_cwd(scope_to(parse_config_command(mc.type_check_command), scoped))
+            runs.append(PlannedRun(
+                mc.prefix, type_cmd, ScopeKind.FILE_SCOPED,
+                'pyright: file-scoped to touched file(s)',
+            ))
+    else:
+        runs.append(PlannedRun(
+            mc.prefix, None, ScopeKind.SKIPPED, 'pyright: no type_check_command configured',
+        ))
+
+    # -- pytest: FULL_SUITE (unscoped) when CONFTEST or TEST_DATA is present
+    # (D1) — a conftest's fixtures/hooks affect the whole subtree, and a data
+    # module under tests/ is consumed by tests we can't enumerate from the
+    # path alone — else FILE_SCOPED to collectable tests, else an explicit
+    # reasoned SKIPPED (the task-1852 "not silent" requirement: never a
+    # dropped command). --
+    if mc.test_command:
+        if conftest_trigger is not None:
+            test_cmd = parse_config_command(mc.test_command)
+            runs.append(PlannedRun(
+                mc.prefix, test_cmd, ScopeKind.FULL_SUITE,
+                f'pytest: conftest touched ({conftest_trigger}) — full suite required',
+            ))
+        elif test_data_trigger is not None:
+            test_cmd = parse_config_command(mc.test_command)
+            runs.append(PlannedRun(
+                mc.prefix, test_cmd, ScopeKind.FULL_SUITE,
+                f'pytest: test-data module touched ({test_data_trigger}) — full suite required',
+            ))
+        elif collectable_tests:
+            test_cmd = strip_cwd(scope_to(parse_config_command(mc.test_command), collectable_tests))
+            runs.append(PlannedRun(
+                mc.prefix, test_cmd, ScopeKind.FILE_SCOPED,
+                'pytest: file-scoped to touched test file(s)',
+            ))
+        else:
+            runs.append(PlannedRun(
+                mc.prefix, None, ScopeKind.SKIPPED,
+                'pytest: no collectable test files touched — nothing to run',
+            ))
+    else:
+        runs.append(PlannedRun(
+            mc.prefix, None, ScopeKind.SKIPPED, 'pytest: no test_command configured',
+        ))
+
+    return runs
+
+
+def derive_verify_plan(
+    existing_files: list[str],
+    module_configs: list[ModuleConfig],
+    config: OrchestratorConfig | None,
+    worktree_reader: Callable[[str], str | None],
+) -> VerifyPlan:
+    """Derive the declarative VerifyPlan for one verify attempt (PRD task γ).
+
+    Unifies the twice-fixed scope decision (``scope_module_config`` +
+    ``_build_fallback_config``) behind one pure decision layer: file
+    classification happens EXACTLY ONCE per file via :func:`classify_file`,
+    so D1 (CONFTEST/TEST_DATA -> full-suite pytest) and D2 (STRUCTURAL ->
+    unscoped pyright) are each expressed a single time instead of being
+    reimplemented per call site.
+
+    Module-config branch (*module_configs* non-empty): each ModuleConfig is
+    scoped independently via :func:`_derive_module_runs`.
+
+    The fallback branch (*module_configs* empty — a synthetic module is
+    built from *config*'s defaults) is task γ step-10 and not yet
+    implemented.
+    """
+    if module_configs:
+        runs: list[PlannedRun] = []
+        for mc in module_configs:
+            runs.extend(_derive_module_runs(mc, existing_files, worktree_reader))
+        return VerifyPlan(runs=tuple(runs))
+    raise NotImplementedError(
+        'derive_verify_plan fallback branch (module_configs=[]) lands in task 2126 step-10'
+    )
