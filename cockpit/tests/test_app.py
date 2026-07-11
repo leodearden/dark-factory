@@ -12,6 +12,7 @@ test_ui_config.py.
 
 from __future__ import annotations
 
+from datetime import datetime
 from pathlib import Path
 
 import pytest
@@ -453,3 +454,84 @@ class TestEnterFocus:
             await pilot.pause()
 
             assert backend.focus_calls == []
+
+
+class TestBoostReordersAndPersists:
+    @pytest.mark.timeout(10)
+    async def test_boost_and_digit_reorder_live_and_persist(self, tmp_path):
+        """b/B/digit priority keys (PRD §9 C5b) re-score and re-render the
+        DecisionQueue IMMEDIATELY -- no poll tick, no explicit
+        refresh_registry() call -- and, for a decision-backed row, persist
+        the new manual_boost via C1's set_manual_boost (the cockpit's own
+        sanctioned decision write). 'b' is additive (each press nudges the
+        boost by one); a digit sets manual_boost to that EXACT integer
+        (absolute, not additive).
+
+        A fixed now_fn + an explicit Priorities.default() keep the score
+        comparison hermetic -- independent of wall-clock time and of
+        whatever priorities.yaml (if any) happens to live on the host.
+        """
+        from cockpit.app import CockpitApp
+        from cockpit.backends import FakeBackend
+        from cockpit.panes.decision_queue import DecisionQueue
+        from cockpit.priority import Priorities
+
+        fixed_now = datetime.fromisoformat('2026-07-07T00:00:00+00:00')
+
+        older = sr.DecisionRecord(
+            id='dec-a',
+            project='df',
+            text='A?',
+            filed_at='2026-06-01T00:00:00+00:00',  # far enough back to saturate the age bonus
+            manual_boost=0,
+        )
+        newer = sr.DecisionRecord(
+            id='dec-b',
+            project='df',
+            text='B?',
+            filed_at='2026-07-07T00:00:00+00:00',  # same instant as `now` -- age 0
+            manual_boost=0,
+        )
+        for d in (older, newer):
+            assert sr.write_decision(d, root=tmp_path)
+
+        backend = FakeBackend()
+        app = CockpitApp(
+            fleet_root=tmp_path,
+            backend=backend,
+            poll_interval=0.05,
+            now_fn=lambda: fixed_now,
+            priorities=Priorities.default(),
+        )
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            queue = app.query_one(DecisionQueue)
+            assert queue.row_count == 2
+            # sanity: A (much older -- a bigger age bonus) currently
+            # outranks B (freshly filed) by age alone, both at boost=0 --
+            # this is the "another factor" the boost below must overcome.
+            assert queue.get_row_index('decision:dec-a') < queue.get_row_index('decision:dec-b')
+
+            queue.move_cursor(row=queue.get_row_index('decision:dec-b'))
+            await pilot.pause()
+
+            for _ in range(3):
+                await pilot.press('b')
+                await pilot.pause()
+
+            # (a) live reorder -- B now ranks above A, with no poll tick and
+            # no explicit refresh_registry() call anywhere in this test.
+            assert queue.get_row_index('decision:dec-b') < queue.get_row_index('decision:dec-a')
+
+            # (b) persisted via C1 -- disk reflects the raised boost.
+            persisted = {d.id: d for d in sr.list_decisions(root=tmp_path)}
+            assert persisted['dec-b'].manual_boost == 3
+            assert persisted['dec-a'].manual_boost == 0  # untouched
+
+            # a digit key sets manual_boost to that EXACT integer --
+            # absolute, not additive (3 + 7 would be 10, not 7).
+            await pilot.press('7')
+            await pilot.pause()
+
+            persisted = {d.id: d for d in sr.list_decisions(root=tmp_path)}
+            assert persisted['dec-b'].manual_boost == 7
