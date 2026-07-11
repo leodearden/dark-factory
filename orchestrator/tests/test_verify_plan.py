@@ -15,6 +15,8 @@ arbitrary file lists — see PRD resolved-decision 6.
 
 from __future__ import annotations
 
+from orchestrator.verify_plan import FileKind, classify_file
+
 # ---------------------------------------------------------------------------
 # GOLDEN incident fixtures
 # ---------------------------------------------------------------------------
@@ -57,3 +59,80 @@ def fake_worktree_reader(path: str) -> str | None:
     file, else None.
     """
     return _FAKE_FILE_CONTENTS.get(path)
+
+
+# ---------------------------------------------------------------------------
+# FileKind / classify_file (step-1: RED)
+# ---------------------------------------------------------------------------
+
+
+class TestFileKindMembers:
+    """FileKind is a plain Enum with exactly the six classification kinds."""
+
+    def test_members_present(self):
+        names = {member.name for member in FileKind}
+        assert names == {
+            'CONFTEST', 'COLLECTABLE_TEST', 'TEST_DATA', 'STRUCTURAL', 'SOURCE', 'INERT',
+        }
+
+
+class TestClassifyFile:
+    """classify_file(path, content) -> FileKind runs the classification ladder exactly once.
+
+    Precedence: CONFTEST > COLLECTABLE_TEST > TEST_DATA > STRUCTURAL > SOURCE > INERT.
+    """
+
+    # -- one representative path per FileKind ---------------------------------
+
+    def test_conftest_under_subdirectory(self):
+        assert classify_file('orchestrator/tests/conftest.py', None) is FileKind.CONFTEST
+
+    def test_conftest_at_root(self):
+        assert classify_file('conftest.py', None) is FileKind.CONFTEST
+
+    def test_collectable_test_prefix(self):
+        assert classify_file('a/test_x.py', None) is FileKind.COLLECTABLE_TEST
+
+    def test_collectable_test_suffix(self):
+        assert classify_file('a/x_test.py', None) is FileKind.COLLECTABLE_TEST
+
+    def test_data_module_under_tests_dir(self):
+        """Task-1852 golden: not conftest, not collectable, but a test-tree member."""
+        assert classify_file(DATA_MODULE_DIFF[0], None) is FileKind.TEST_DATA
+
+    def test_structural_protocol_source_file(self):
+        content = _FAKE_FILE_CONTENTS[STRUCTURAL_DIFF[0]]
+        assert classify_file(STRUCTURAL_DIFF[0], content) is FileKind.STRUCTURAL
+
+    def test_structural_typeddict_source_file(self):
+        content = 'class Bar(TypedDict):\n    name: str\n'
+        assert classify_file('orchestrator/src/orchestrator/types.py', content) is FileKind.STRUCTURAL
+
+    def test_plain_source_file(self):
+        content = 'def do_thing(x: int) -> str:\n    return str(x)\n'
+        assert classify_file('orchestrator/src/orchestrator/utils.py', content) is FileKind.SOURCE
+
+    def test_non_python_path_is_inert(self):
+        assert classify_file('docs/README.md', None) is FileKind.INERT
+        assert classify_file('scripts/deploy.yaml', None) is FileKind.INERT
+        assert classify_file('crates/foo/src/lib.rs', None) is FileKind.INERT
+
+    # -- precedence assertions -------------------------------------------------
+
+    def test_test_data_beats_structural(self):
+        """A data module under tests/ that ALSO defines a Protocol stays TEST_DATA.
+
+        TEST_DATA must outrank STRUCTURAL so a Protocol-defining data module
+        under tests/ still full-suites (D1) rather than merely widening pyright.
+        """
+        content = 'class Foo(Protocol):\n    def method(self) -> None: ...\n'
+        assert classify_file(DATA_MODULE_DIFF[0], content) is FileKind.TEST_DATA
+
+    def test_conftest_beats_test_data(self):
+        """conftest.py under tests/ classifies CONFTEST, never TEST_DATA."""
+        assert classify_file('shared/tests/conftest.py', None) is FileKind.CONFTEST
+
+    def test_none_content_never_raises_and_skips_structural(self):
+        """content=None must never raise — STRUCTURAL is simply not detected."""
+        result = classify_file('orchestrator/src/orchestrator/foo.py', None)
+        assert result is FileKind.SOURCE
