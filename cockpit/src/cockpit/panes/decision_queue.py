@@ -14,9 +14,11 @@ frozen C1 record shape, never re-derive it).
 from __future__ import annotations
 
 from datetime import datetime
+from typing import Protocol
 
 from orchestrator.session_registry import DecisionRecord, SessionRecord
 
+from cockpit.panes.session_table import format_age
 from cockpit.priority import ScoringItem
 
 
@@ -75,4 +77,59 @@ def session_to_scoring_item(session: SessionRecord, *, now: datetime) -> Scoring
         filed_at=_parse_timestamp(raw, now),
         manual_boost=0,
         state='open',
+    )
+
+
+class _QueueRowLike(Protocol):
+    """Structural contract format_queue_row reads.
+
+    Mirrors ScoringItem's own "any object exposing these attributes works"
+    convention -- format_queue_row reads attributes, not isinstance.
+    QueueItem (a later step) satisfies this directly.
+    """
+
+    score: float
+    filed_at: datetime
+    project: str
+    task_id: str | None
+    question: str | None
+
+
+_QUESTION_MAX_WIDTH = 60
+_QUESTION_PLACEHOLDER = '(no question)'
+
+
+def _one_line_question(question: str | None) -> str:
+    """Collapse *question* to a single truncated line; empty/None -> a placeholder.
+
+    Fail-soft (PRD §2): a view must degrade a bad question shape, not raise.
+    """
+    if not question:
+        return _QUESTION_PLACEHOLDER
+    collapsed = ' '.join(question.split())
+    if not collapsed:
+        return _QUESTION_PLACEHOLDER
+    if len(collapsed) <= _QUESTION_MAX_WIDTH:
+        return collapsed
+    return collapsed[: _QUESTION_MAX_WIDTH - 1].rstrip() + '…'
+
+
+def _format_project_task(project: str, task_id: str | None) -> str:
+    """Render 'project#task_id' ('#task_id' segment omitted when absent). Mirrors
+    session_table.format_title's title-shape convention, minus the role segment."""
+    return f'{project}#{task_id}' if task_id else project
+
+
+def format_queue_row(item: _QueueRowLike, now: datetime) -> tuple[str, str, str, str]:
+    """Render *item* as the PRD row shape: score / age / project#task / question.
+
+    Reuses session_table.format_age for the age column (fed item.filed_at's
+    isoformat -- format_age's contract is a string timestamp) so the queue's
+    age rendering stays byte-identical to the session table's.
+    """
+    return (
+        f'{item.score:.1f}',
+        format_age(item.filed_at.isoformat(), now),
+        _format_project_task(item.project, item.task_id),
+        _one_line_question(item.question),
     )
