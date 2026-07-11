@@ -37,6 +37,7 @@ from __future__ import annotations
 import pytest
 
 from cockpit.backends.base import DisplayTarget
+from cockpit.backends.tmux import TmuxBackend
 from cockpit.backends.wm import WmBackend
 
 
@@ -106,3 +107,27 @@ def test_signal_change_sets_urgency_and_moves_no_window_nor_steals_focus(
     assert wait_until(lambda: wm_urgency_set(window_a.id)), "window A's urgency hint was not set"
     assert wm_stack_order() == stack0, 'the managed-window stack changed'
     assert active_window_id() == active0, 'input focus moved off window B -- A was raised/focused'
+
+
+@pytest.mark.smoke
+def test_tmux_reorder_preserves_focused_window(disposable_tmux_session, tmux_active_window_id):
+    """B6: TmuxBackend.reorder's two-phase park-then-place move must preserve
+    the session's active window (identified by its STABLE @id, not its
+    mutable index) even across a reorder that relocates that window's own
+    index -- reorder only ever issues move-window, never
+    select-window/switch-client (see TmuxBackend.reorder's docstring).
+    """
+    session = disposable_tmux_session
+    session.select(1)
+    active0 = tmux_active_window_id(session.name)
+
+    # Non-identity order that relocates index 1 (the active window) to index 0.
+    targets = [
+        DisplayTarget(kind='tmux', tmux_target=f'{session.name}:1'),
+        DisplayTarget(kind='tmux', tmux_target=f'{session.name}:2'),
+        DisplayTarget(kind='tmux', tmux_target=f'{session.name}:0'),
+    ]
+
+    TmuxBackend().reorder(targets)
+
+    assert tmux_active_window_id(session.name) == active0
