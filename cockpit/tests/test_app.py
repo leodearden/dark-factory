@@ -618,3 +618,90 @@ class TestDropRemovesAndPersists:
             # proving no registry write was attempted for a session row.
             reread = sr.read_record('awaiting-1', root=tmp_path)
             assert reread.status == sr.Status.AWAITING_INPUT
+
+
+class TestDeferResetsAge:
+    @pytest.mark.timeout(10)
+    async def test_defer_resets_age_live_without_writing_registry(self, tmp_path):
+        """'d' (defer, PRD §9 C5b) resets the highlighted item's EFFECTIVE
+        age to ~0 IMMEDIATELY -- no poll tick, no explicit
+        refresh_registry() call -- sinking it below an item that was
+        previously outranked purely by age. This is an in-memory age-reset
+        ONLY: DecisionRecord.filed_at (provenance -- when a decision was
+        actually filed) is NEVER rewritten, so the defer must leave every
+        sessions/ and decisions/ file on disk byte-identical (mirrors
+        TestWriteDiscipline's _snapshot_tree before/after convention).
+
+        A fixed now_fn + an explicit Priorities.default() keep the score
+        comparison hermetic -- independent of wall-clock time and of
+        whatever priorities.yaml (if any) happens to live on the host.
+        """
+        from cockpit.app import CockpitApp
+        from cockpit.backends import FakeBackend
+        from cockpit.panes.decision_queue import DecisionQueue
+        from cockpit.priority import Priorities
+
+        fixed_now = datetime.fromisoformat('2026-07-07T00:00:00+00:00')
+
+        older = sr.DecisionRecord(
+            id='dec-old',
+            project='df',
+            text='Old?',
+            filed_at='2026-06-01T00:00:00+00:00',  # far enough back to saturate the age bonus
+            manual_boost=0,
+        )
+        newer = sr.DecisionRecord(
+            id='dec-new',
+            project='df',
+            text='New?',
+            filed_at='2026-07-07T00:00:00+00:00',  # same instant as `now` -- age 0
+            manual_boost=0,
+        )
+        for d in (older, newer):
+            assert sr.write_decision(d, root=tmp_path)
+
+        before = _snapshot_tree(tmp_path)
+        assert any(path.startswith('decisions/') for path in before)
+
+        backend = FakeBackend()
+        app = CockpitApp(
+            fleet_root=tmp_path,
+            backend=backend,
+            poll_interval=0.05,
+            now_fn=lambda: fixed_now,
+            priorities=Priorities.default(),
+        )
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            queue = app.query_one(DecisionQueue)
+            assert queue.row_count == 2
+            # sanity: the older item (a much bigger age bonus) currently
+            # outranks the newer one, both at boost=0 -- this is the
+            # ordering the defer below must flip.
+            assert queue.get_row_index('decision:dec-old') < queue.get_row_index(
+                'decision:dec-new'
+            )
+
+            queue.move_cursor(row=queue.get_row_index('decision:dec-old'))
+            await pilot.pause()
+
+            await pilot.press('d')
+            await pilot.pause()
+
+            # (a) live reorder -- the deferred item now sinks below the
+            # newer one, with no poll tick and no explicit
+            # refresh_registry() call anywhere in this test.
+            assert queue.get_row_index('decision:dec-new') < queue.get_row_index(
+                'decision:dec-old'
+            )
+
+        # (b) in-memory only -- not a single sessions/ or decisions/ file
+        # was created/modified/removed (filed_at is never rewritten by a
+        # defer). Taken after the app has unmounted, so this also covers
+        # on_unmount's own _persist_ui_config write -- which never touches
+        # sessions/ or decisions/ either way.
+        after = _snapshot_tree(tmp_path)
+        for path, value in before.items():
+            assert after.get(path) == value, f'{path} was created/modified/removed by the defer'
+        new_paths = set(after) - set(before)
+        assert not any(path.startswith(('sessions/', 'decisions/')) for path in new_paths)
