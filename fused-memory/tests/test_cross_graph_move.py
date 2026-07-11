@@ -516,6 +516,57 @@ class TestMoveEntityAcrossGraphsEdges:
         assert result.edges_moved == 0
         assert result.edges_skipped == 1
 
+    @pytest.mark.asyncio
+    async def test_null_fact_embedding_recreates_edge_without_embedding_property(
+        self, mock_config, make_backend, make_graph_mock, monkeypatch,
+    ):
+        """A null/absent fact_embedding on the RELATES_TO edge is valid real
+        data, not corruption: the edge CREATE still issues, omitting the
+        fact_embedding property entirely (no vecf32 literal) while every
+        other property/param is preserved, edges_moved still counts it, and
+        the call does NOT raise.
+        """
+        backend = make_backend(mock_config)
+        source_mock = make_graph_mock()
+        source_mock.ro_query = AsyncMock(side_effect=[
+            MagicMock(result_set=[NODE_ROW_FIXTURE]),
+            MagicMock(result_set=[EDGE_ROW_FIXTURE]),
+            MagicMock(result_set=[]),  # no MENTIONS links in this scenario
+        ])
+        target_mock = make_graph_mock()
+        backend._driver._get_graph = _route_graphs({
+            SOURCE_GRAPH_FIXTURE: source_mock,
+            TARGET_GRAPH_FIXTURE: target_mock,
+        })
+
+        # NODE name_embedding read returns a real reply; EDGE fact_embedding
+        # read returns None (null/absent).
+        fake_read_compact = AsyncMock(side_effect=[COMPACT_VECTOR_REPLY_FIXTURE, None])
+        monkeypatch.setattr(cross_graph_move, '_read_compact_vector', fake_read_compact)
+
+        result = await move_entity_across_graphs(
+            backend, NODE_UUID_FIXTURE, SOURCE_GRAPH_FIXTURE, TARGET_GRAPH_FIXTURE,
+        )
+
+        assert target_mock.query.await_count == 2
+        edge_create_call = target_mock.query.call_args_list[1]
+        cypher = extract_cypher(edge_create_call)
+        params = extract_params(edge_create_call)
+        assert 'CREATE' in cypher
+        assert 'RELATES_TO' in cypher
+        assert 'fact_embedding' not in cypher
+        assert 'vecf32' not in cypher
+        assert params.get('src_uuid') == NODE_UUID_FIXTURE
+        assert params.get('dst_uuid') == OTHER_NODE_UUID_FIXTURE
+        assert params.get('edge_uuid') == EDGE_UUID_FIXTURE
+        assert params.get('name') == 'is_related_to'
+        assert params.get('fact') == 'Alice is related to Bob.'
+        assert params.get('group_id') == SOURCE_GRAPH_FIXTURE
+        assert params.get('episodes') == ['episode-uuid-1']
+
+        assert result.edges_moved == 1
+        assert result.edges_skipped == 0
+
 
 # ---------------------------------------------------------------------------
 # step-9: move_entity_across_graphs -- Episodic MENTIONS reattachment
