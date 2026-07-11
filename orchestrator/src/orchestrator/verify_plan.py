@@ -77,3 +77,28 @@ def classify_file(path: str, content: str | None) -> FileKind:
         return FileKind.STRUCTURAL
 
     return FileKind.SOURCE
+
+
+def _is_conftest(path: str) -> bool:
+    """Return True when *path* is a ``conftest.py`` file."""
+    return classify_file(path, None) is FileKind.CONFTEST
+
+
+def _is_collectable_test_file(path: str) -> bool:
+    """Return True for files pytest will actually collect when passed as a target.
+
+    NARROW predicate: ``COLLECTABLE_TEST`` only. A data module under ``tests/``
+    (e.g. ``shared/tests/silent_fallthrough_allowlist.py``) is test-tree
+    membership (``_is_test_file``) but not this — passing it to pytest
+    produces rc=5 ("no tests ran").
+    """
+    return classify_file(path, None) is FileKind.COLLECTABLE_TEST
+
+
+def _is_test_file(path: str) -> bool:
+    """Return True for test-tree members: collectable tests plus test data.
+
+    BROAD predicate: ``COLLECTABLE_TEST ∪ TEST_DATA``, excluding conftest.
+    Distinct from ``_is_collectable_test_file`` (narrow, collectable only).
+    """
+    return classify_file(path, None) in (FileKind.COLLECTABLE_TEST, FileKind.TEST_DATA)
