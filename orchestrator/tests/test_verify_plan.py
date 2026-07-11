@@ -17,11 +17,12 @@ from __future__ import annotations
 
 import dataclasses
 import json
+from pathlib import Path
 
 import pytest
 
 from orchestrator import verify
-from orchestrator.config import ModuleConfig
+from orchestrator.config import ModuleConfig, OrchestratorConfig
 from orchestrator.verify_cmd import parse_config_command
 from orchestrator.verify_plan import (
     FileKind,
@@ -424,3 +425,106 @@ class TestDeriveVerifyPlanModulePath:
         module_runs = [r for r in plan.runs if r.module_prefix == 'shared']
         assert module_runs
         assert all(r.scope_kind is ScopeKind.SKIPPED for r in module_runs)
+
+
+# ---------------------------------------------------------------------------
+# derive_verify_plan: fallback branch (step-9: RED)
+# ---------------------------------------------------------------------------
+
+
+class TestDeriveVerifyPlanFallbackPath:
+    """derive_verify_plan(existing_files, [], config, worktree_reader).
+
+    Fallback branch: module_configs is empty. A synthetic ``'__fallback__'``
+    module (mirrors ``_build_fallback_config``'s ``prefix='__fallback__'``
+    sentinel) is derived straight from *config*'s global commands, unifying
+    the SAME D1/D2 rules as the module-config branch with one reconciliation:
+    CONFTEST/TEST_DATA only widen to FULL_SUITE when a real suite exists
+    (module path's ``mc.test_command``, or here a non-default configured
+    ``config.test_command``); the bare-``'pytest'``-default + TEST_DATA-only
+    case has no real suite to run, so it degrades to an explicit reasoned
+    SKIPPED rather than fabricating a run that would rc=5 (task-1852 golden).
+    CONFTEST always full-suites regardless — a directory target is always
+    safe to run, even against the bare ``pytest`` default.
+    """
+
+    def test_data_module_bare_pytest_default_skips_with_reason(self):
+        """GOLDEN task-1852 (7c9b316260): bare-fallback data module -> explicit SKIPPED.
+
+        config.test_command == 'pytest' (the bare default) means there is no
+        real suite to fall back to — the twice-fixed bug's second fix made
+        _build_fallback_config yield test_cmd=None here rather than risk
+        rc=5 ("no tests ran"). derive_verify_plan upgrades the silent None to
+        an explicit reasoned SKIPPED PlannedRun — explicitly NOT silent.
+        """
+        config = OrchestratorConfig(project_root=Path('/fake'), test_command='pytest')
+        plan = derive_verify_plan(DATA_MODULE_DIFF, [], config, fake_worktree_reader)
+        run = _run_for(plan, '__fallback__', 'pytest:')
+        assert run is not None
+        assert run.scope_kind is ScopeKind.SKIPPED
+        assert run.reason
+        assert DATA_MODULE_DIFF[0] in run.reason
+        assert '1852' in run.reason
+
+    def test_data_module_with_configured_suite_full_suites(self):
+        """Reconciliation pin: a non-default configured suite -> FULL_SUITE, not SKIPPED.
+
+        Distinct from the bare-default case above: when a real suite exists,
+        using it is strictly safer than skipping (mirrors
+        _build_fallback_config's
+        test_data_module_with_nonconfigured_pytest_uses_full_suite).
+        """
+        config = OrchestratorConfig(
+            project_root=Path('/fake'), test_command="uv run --extra dev pytest -m 'not slow'",
+        )
+        plan = derive_verify_plan(DATA_MODULE_DIFF, [], config, fake_worktree_reader)
+        run = _run_for(plan, '__fallback__', 'pytest:')
+        assert run is not None
+        assert run.scope_kind is ScopeKind.FULL_SUITE
+        assert run.cmd == parse_config_command(config.test_command)
+
+    def test_structural_file_full_suites_pyright(self):
+        """GOLDEN D2 fallback gap: _build_fallback_config never widens; derive_verify_plan does.
+
+        A Protocol source file must widen pyright to the unscoped command in
+        the fallback path too, matching the module-path behavior — pytest
+        for the same source-only diff stays SKIPPED (nothing collectable).
+        """
+        config = OrchestratorConfig(project_root=Path('/fake'), test_command='pytest')
+        plan = derive_verify_plan(STRUCTURAL_DIFF, [], config, fake_worktree_reader)
+
+        pyright_run = _run_for(plan, '__fallback__', 'pyright:')
+        assert pyright_run is not None
+        assert pyright_run.scope_kind is ScopeKind.FULL_SUITE
+        assert pyright_run.cmd == parse_config_command(config.type_check_command)
+        assert STRUCTURAL_DIFF[0] in pyright_run.reason
+
+        pytest_run = _run_for(plan, '__fallback__', 'pytest:')
+        assert pytest_run is not None
+        assert pytest_run.scope_kind is ScopeKind.SKIPPED
+
+    def test_fallback_conftest_targets_parent_directory(self):
+        """GOLDEN fallback conftest (reconstructs cb7277926d).
+
+        'a/conftest.py' -> pytest targets parent directory 'a', never the
+        conftest file itself (pytest >= 9 exits 1 "no tests ran" on a bare
+        conftest target) — full suite, runnable command.
+        """
+        config = OrchestratorConfig(project_root=Path('/fake'), test_command='pytest')
+        plan = derive_verify_plan(['a/conftest.py'], [], config, fake_worktree_reader)
+        run = _run_for(plan, '__fallback__', 'pytest:')
+        assert run is not None
+        assert run.scope_kind is ScopeKind.FULL_SUITE
+        assert run.cmd is not None
+        assert 'a' in run.cmd.targets
+        assert not any('conftest.py' in t for t in run.cmd.targets)
+
+    def test_root_conftest_maps_to_dot(self):
+        """A root-level conftest.py must target '.', never itself (root -> '.')."""
+        config = OrchestratorConfig(project_root=Path('/fake'), test_command='pytest')
+        plan = derive_verify_plan(['conftest.py'], [], config, fake_worktree_reader)
+        run = _run_for(plan, '__fallback__', 'pytest:')
+        assert run is not None
+        assert run.scope_kind is ScopeKind.FULL_SUITE
+        assert run.cmd is not None
+        assert run.cmd.targets == ('.',)
