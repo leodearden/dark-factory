@@ -32,7 +32,7 @@ class TestDefaultFleetDir:
 
     def test_default_fleet_dir_matches_watchdog_repo_dir(self):
         """Pins the constant to scripts/orchestrator-watchdog.py's REPO_DIR (task 2395 analysis)."""
-        assert DEFAULT_FLEET_DIR == Path('/home/leo/src/dark-factory/data/fleet')
+        assert Path('/home/leo/src/dark-factory/data/fleet') == DEFAULT_FLEET_DIR
 
 
 class TestResolveFleetDir:
