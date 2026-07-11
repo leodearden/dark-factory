@@ -15,9 +15,18 @@ arbitrary file lists — see PRD resolved-decision 6.
 
 from __future__ import annotations
 
+import dataclasses
+import json
+
+import pytest
+
 from orchestrator import verify
+from orchestrator.verify_cmd import parse_config_command
 from orchestrator.verify_plan import (
     FileKind,
+    PlannedRun,
+    ScopeKind,
+    VerifyPlan,
     _is_collectable_test_file,
     _is_conftest,
     _is_test_file,
@@ -213,3 +222,106 @@ class TestDerivedPredicates:
         for path in _PREDICATE_PATH_TABLE:
             expected = classify_file(path, None) in (FileKind.COLLECTABLE_TEST, FileKind.TEST_DATA)
             assert _is_test_file(path) == expected, path
+
+
+# ---------------------------------------------------------------------------
+# Plan datatypes: ScopeKind / PlannedRun / VerifyPlan (step-5: RED)
+# ---------------------------------------------------------------------------
+
+
+class TestScopeKind:
+    """ScopeKind is a StrEnum with exactly the four scope outcomes."""
+
+    def test_members_present(self):
+        names = {member.name for member in ScopeKind}
+        assert names == {'FULL_SUITE', 'FILE_SCOPED', 'SKIPPED', 'TRIVIAL'}
+
+    def test_serialises_to_lowercase_str_value(self):
+        assert str(ScopeKind.FULL_SUITE) == 'full_suite'
+        assert str(ScopeKind.FILE_SCOPED) == 'file_scoped'
+        assert str(ScopeKind.SKIPPED) == 'skipped'
+        assert str(ScopeKind.TRIVIAL) == 'trivial'
+
+
+class TestPlannedRun:
+    """PlannedRun is a frozen dataclass: one (module, tool) slot's outcome."""
+
+    def test_is_frozen(self):
+        run = PlannedRun(
+            module_prefix='orchestrator', cmd=None, scope_kind=ScopeKind.TRIVIAL, reason='x',
+        )
+        with pytest.raises(dataclasses.FrozenInstanceError):
+            run.reason = 'y'  # type: ignore[misc]
+
+    def test_to_dict_with_real_cmd_is_json_native(self):
+        """D3: a PlannedRun carrying a real VerifyCmd serialises cmd to a dict."""
+        cmd = parse_config_command('pytest -q a/test_x.py')
+        run = PlannedRun(
+            module_prefix='orchestrator',
+            cmd=cmd,
+            scope_kind=ScopeKind.FILE_SCOPED,
+            reason='file-scoped collectable test',
+        )
+        d = run.to_dict()
+        assert d == {
+            'module_prefix': 'orchestrator',
+            'cmd': {
+                'tool': 'pytest',
+                'uv_project': None,
+                'cwd_rel': None,
+                'base_flags': ['-q'],
+                'targets': ['a/test_x.py'],
+                'env': {},
+                'wrappers': [],
+                'raw': None,
+            },
+            'scope_kind': 'file_scoped',
+            'reason': 'file-scoped collectable test',
+        }
+        json.dumps(d)  # D3: must not raise.
+
+    def test_skipped_run_serialises_cmd_null_with_nonempty_reason(self):
+        run = PlannedRun(
+            module_prefix='shared',
+            cmd=None,
+            scope_kind=ScopeKind.SKIPPED,
+            reason='task-1852: bare-fallback data module, no real suite to run',
+        )
+        d = run.to_dict()
+        assert d['cmd'] is None
+        assert d['scope_kind'] == 'skipped'
+        assert d['reason'] == 'task-1852: bare-fallback data module, no real suite to run'
+        json.dumps(d)  # D3: must not raise.
+
+
+class TestVerifyPlan:
+    """VerifyPlan is a frozen dataclass: the full set of planned runs plus flags."""
+
+    def test_is_frozen(self):
+        plan = VerifyPlan(runs=())
+        with pytest.raises(dataclasses.FrozenInstanceError):
+            plan.needs_pipeline_guard_check = True  # type: ignore[misc]
+
+    def test_default_needs_pipeline_guard_check_is_false(self):
+        assert VerifyPlan(runs=()).needs_pipeline_guard_check is False
+
+    def test_to_dict_is_json_native_dict(self):
+        cmd = parse_config_command('pytest -q')
+        plan = VerifyPlan(
+            runs=(
+                PlannedRun('orchestrator', cmd, ScopeKind.FULL_SUITE, 'conftest touched'),
+                PlannedRun('shared', None, ScopeKind.SKIPPED, 'no files under prefix'),
+            ),
+            needs_pipeline_guard_check=True,
+        )
+        d = plan.to_dict()
+        assert isinstance(d, dict)
+        assert d['needs_pipeline_guard_check'] is True
+        assert len(d['runs']) == 2
+        assert d['runs'][0]['scope_kind'] == 'full_suite'
+        assert d['runs'][1] == {
+            'module_prefix': 'shared', 'cmd': None, 'scope_kind': 'skipped',
+            'reason': 'no files under prefix',
+        }
+        # D3: round-trips through the real json module byte-for-byte as data.
+        assert json.loads(json.dumps(d)) == d
