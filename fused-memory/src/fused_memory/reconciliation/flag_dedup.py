@@ -6,9 +6,13 @@ flag_type) pair can be emitted cycle after cycle.  Dedup/suppression/
 acknowledge state is persisted in the ``recon_ledger`` SQLite-backed table
 (:mod:`fused_memory.reconciliation.recon_ledger`), reached through
 ``memory_service.recon_ledger`` (task 2227).  The ledger is authoritative
-and the only thing this module reads back — a best-effort Mem0 mirror
-write accompanies every ledger write so legacy Mem0-based searchers keep
-working during the cutover, but Mem0 is never searched by this module.
+and the only thing this module reads back.  ``dedup_flags``'s Mem0
+``stage1_flag_marker`` mirror write has been retired (task 2406, option
+(a)): the recon_ledger row is now the sole store for markers, already
+reaped each cycle by ``ReconLedgerStore.gc()``.
+``write_suppression_record``'s separate ``stage1_flag_suppression`` Mem0
+mirror is unaffected and still writes on every suppression upsert; either
+way, Mem0 is never searched by this module.
 
 Note: this module does not suppress persistent flags before Stage 2 sees
 them at the LLM level; suppression logic also lives in Stage 2's prompt
@@ -96,15 +100,21 @@ compatibility).  ``acknowledge_resolved_flags`` is the batch entry point:
 it computes and de-duplicates signatures, then fans out to
 ``acknowledge_flag_marker`` via ``gather_collect``, summing the counts.
 
-Mem0 mirror (PRD decisions #4/#6: write-both, read-new)
------------------------------------------------------------
-Marker and suppression writes also perform a best-effort single
+Mem0 mirror — suppression only; marker mirror retired (task 2406)
+-----------------------------------------------------------------
+``write_suppression_record`` still performs a best-effort single
 ``add_memory`` mirror to Mem0 (wrapped in try/except; never raises, no
 read-back, no confirmation search, no delete) so legacy Mem0-based
-searchers keep working during the cutover to the ledger.  Reads in this
-module NEVER consult Mem0 — the ledger is the sole read source.  When
-``memory_service.recon_ledger`` is unset/``None`` (ledger disabled or not
-yet wired), marker/suppression writes degrade to mirror-only and
+searchers keep working for suppressions during the cutover to the ledger.
+``dedup_flags``'s ``stage1_flag_marker`` mirror write was retired in task
+2406 (option (a)): the read-new cutover was confirmed complete — no
+runtime reader still depended on the Mem0 marker copy — so the ledger row
+is now the sole store for markers, reaped each cycle by
+``ReconLedgerStore.gc()``.  Reads in this module NEVER consult Mem0 — the
+ledger is the sole read source.  When ``memory_service.recon_ledger`` is
+unset/``None`` (ledger disabled or not yet wired), suppression writes
+degrade to mirror-only, but marker writes degrade to a no-op (there is no
+longer a mirror fallback for markers); regardless,
 ``filter_suppressed``/``acknowledge_flag_marker``/``acknowledge_resolved_flags``
 degrade to a conservative pass-through/no-op — this module never raises
 because the ledger is absent.
@@ -448,12 +458,14 @@ async def dedup_flags(
       malformed/non-JSON ``payload_json`` on a prior row) is logged at
       WARNING and this flag simply gets no ledger annotation/persistence for
       this cycle — it never aborts the batch or propagates to the caller.
-    - A best-effort Mem0 mirror (single ``add_memory``, no read-back/confirm/
-      delete) is attempted after the ledger write — wrapped in try/except so a
-      mirror failure never raises or rolls back the ledger write.  When no
-      ledger is attached (``recon_ledger`` unset/``None``), this mirror write
-      is the ONLY effect (pass-through dedup — no ``persisted_from_run`` can
-      be computed without a ledger to read).
+    - The Mem0 marker mirror write has been retired (task 2406, option (a)):
+      the ``recon_ledger`` row above is now the sole store for the marker,
+      already reaped each cycle by ``ReconLedgerStore.gc()``.  When no
+      ledger is attached (``recon_ledger`` unset/``None``), the UPSERT above
+      is simply skipped and the flag is returned with no persisted
+      annotation at all (pass-through dedup — no ``persisted_from_run`` can
+      be computed without a ledger to read, and there is no longer a mirror
+      fallback).
 
     ``persisted_from_run`` is set to the ``run_id`` stored in the prior row's
     payload.  If that field is absent, ``None``, or an empty string (i.e. any
@@ -465,9 +477,9 @@ async def dedup_flags(
     ONLY (per :func:`is_content_fingerprint_task_id`), the resolvable memory
     UUID(s) the flag cites as duplicates are extracted via
     :func:`_extract_deduped_against_uuids` and threaded into the ledger
-    payload / Mem0 mirror metadata as ``deduped_against``.  Numeric and
-    comma-joined markers always omit it — they are already resolvable anchors
-    and their payload is unchanged.
+    payload as ``deduped_against``.  Numeric and comma-joined markers always
+    omit it — they are already resolvable anchors and their payload is
+    unchanged.
 
     Returns the (possibly annotated) flag list.
     """
@@ -510,8 +522,7 @@ async def dedup_flags(
         # Gap-1 enrichment (task-2047): scoped to fp:-keyed markers only — numeric
         # and comma-joined tids are already resolvable anchors and must not change
         # payload (see design decision in plan.json). Computed once per occurrence,
-        # ahead of the ledger UPSERT below, so the ledger payload and the Mem0
-        # mirror write share the identical value.
+        # ahead of the ledger UPSERT below, so the ledger payload carries it.
         deduped_against = (
             _extract_deduped_against_uuids(flag)
             if is_content_fingerprint_task_id(tid)
@@ -655,45 +666,6 @@ async def dedup_flags(
         if persisted_from_run is not None:
             flag['persisted_from_run'] = persisted_from_run
         flag['last_seen_run_id'] = run_id
-
-        # Best-effort Mem0 mirror (PRD decision #4/#6 write-both/read-new): a
-        # single add_memory, no read-back/confirm/delete loop.  Never raises —
-        # a mirror failure must not roll back the ledger write above (or, when
-        # no ledger is attached, must not abort the batch either).
-        #
-        # GC gap (task 2228 W5-κ, review finding robustness_unbounded_growth):
-        # this Mem0-resident mirror (metadata.source='stage1_flag_marker') has
-        # NO periodic collector. Task 2228 retired _sweep_stale_flag_markers —
-        # its sole sweep — when marker GC collapsed onto
-        # recon_ledger.ReconLedgerStore.gc() (see _gc_recon_markers above in
-        # task_knowledge_sync.py), which deletes only ledger rows, never Mem0
-        # memories. scripts/sweep_orphan_flag_markers.py still reads this same
-        # source tag, but only as a manual, one-shot sweep for a disjoint
-        # legacy-orphan concern (missing kind/task_id) — it does not collect
-        # ordinary, well-formed, aging markers. No read path re-derives an
-        # escalation count/threshold from this Mem0 pool (unlike
-        # stage2_persistence_marker's _track_flag_persistence), so unbounded
-        # growth here is a storage/latency cost, not a correctness regression
-        # — the ledger row (above) is the read-of-record and IS reaped by
-        # gc(). Accepted for the write-both/read-new cutover window; tracked
-        # by follow-up task 2406 (retire this mirror write, or restore a
-        # lightweight age sweep, once the cutover is confirmed complete).
-        try:
-            await memory_service.add_memory(
-                content=f'Stage 1 flag marker: task={tid} type={ftype} from run={run_id}',
-                category='observations_and_summaries',
-                project_id=project_id,
-                metadata=payload,
-                causation_id=run_id,
-                _source='stage1_flag_dedup',
-            )
-        except Exception as e:
-            logger.debug(
-                'flag_dedup: Mem0 mirror write failed for marker task=%s flag_type=%s: %s'
-                ' (ledger write, if any, already committed)',
-                tid, ftype, e,
-                exc_info=True,
-            )
 
         result.append(flag)
     return result
