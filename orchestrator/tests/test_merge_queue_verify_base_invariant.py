@@ -315,6 +315,7 @@ class TestDispatchRefreshesLastKnownMainSha:
             't-dispatch', base_sha=new_main, merge_commit='c-dispatch',
             config=config, git_repo=git_repo,
         )
+        assert isinstance(item, RealMergeItem)  # narrow union arm for item.merge_wt (pyright)
 
         worker._git_ops.get_main_sha = AsyncMock(return_value=new_main)  # type: ignore[method-assign]
         worker._host_allocator = _fake_local_allocator()
@@ -359,6 +360,7 @@ class TestDispatchRefreshesLastKnownMainSha:
             't-dispatch2', base_sha=new_main, merge_commit='c-dispatch2',
             config=config, git_repo=git_repo,
         )
+        assert isinstance(item, RealMergeItem)  # narrow union arm for item.merge_wt (pyright)
         worker._git_ops.get_main_sha = AsyncMock(return_value=new_main)  # type: ignore[method-assign]
         worker._host_allocator = _fake_local_allocator()
         worker._run_inflight_verify = AsyncMock(  # type: ignore[method-assign]
@@ -393,6 +395,7 @@ class TestDispatchRefreshesLastKnownMainSha:
             't-failopen', base_sha=old_main, merge_commit='c-failopen',
             config=config, git_repo=git_repo,
         )
+        assert isinstance(item, RealMergeItem)  # narrow union arm for item.merge_wt (pyright)
         # First call = Mechanism 2 staleness check (succeeds); second call =
         # the ε=1890 guard's own fetch (fails) — isolates the fail-open
         # behaviour to the guard's try/except without disturbing Mechanism 2.
