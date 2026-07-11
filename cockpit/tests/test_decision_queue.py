@@ -401,3 +401,60 @@ class TestOrderQueue:
         items = order_queue([decision], [], Priorities.default(), _NOW, handling={'decision:dec-1'})
 
         assert items[0].handling is True
+
+
+class TestKnownProjectRoots:
+    def test_distinct_nonempty_cwds_deduped_and_sorted(self):
+        from cockpit.panes.decision_queue import known_project_roots
+
+        sessions = [
+            _make_session(session_slug='s-1', cwd='/home/leo/src/dark-factory'),
+            _make_session(session_slug='s-2', cwd='/home/leo/src/other-project'),
+            _make_session(session_slug='s-3', cwd='/home/leo/src/dark-factory'),
+        ]
+
+        roots = known_project_roots(sessions, [])
+
+        assert roots == ['/home/leo/src/dark-factory', '/home/leo/src/other-project']
+
+    def test_unions_with_extra_roots(self):
+        from cockpit.panes.decision_queue import known_project_roots
+
+        sessions = [_make_session(session_slug='s-1', cwd='/home/leo/src/dark-factory')]
+
+        roots = known_project_roots(sessions, ['/home/leo/src/extra-project'])
+
+        assert roots == ['/home/leo/src/dark-factory', '/home/leo/src/extra-project']
+
+    def test_empty_records_returns_extras_alone(self):
+        from cockpit.panes.decision_queue import known_project_roots
+
+        roots = known_project_roots([], ['/home/leo/src/extra-project'])
+
+        assert roots == ['/home/leo/src/extra-project']
+
+    def test_empty_records_and_no_extras_returns_empty_list(self):
+        from cockpit.panes.decision_queue import known_project_roots
+
+        assert known_project_roots([], []) == []
+
+    def test_empty_cwd_records_excluded_and_never_raise(self):
+        from cockpit.panes.decision_queue import known_project_roots
+
+        sessions = [
+            _make_session(session_slug='s-1', cwd=''),
+            _make_session(session_slug='s-2', cwd='/home/leo/src/dark-factory'),
+        ]
+
+        roots = known_project_roots(sessions, [])
+
+        assert roots == ['/home/leo/src/dark-factory']
+
+    def test_duplicate_extra_deduped_against_records(self):
+        from cockpit.panes.decision_queue import known_project_roots
+
+        sessions = [_make_session(session_slug='s-1', cwd='/home/leo/src/dark-factory')]
+
+        roots = known_project_roots(sessions, ['/home/leo/src/dark-factory'])
+
+        assert roots == ['/home/leo/src/dark-factory']
