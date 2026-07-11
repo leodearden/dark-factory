@@ -12,6 +12,7 @@ test_ui_config.py.
 
 from __future__ import annotations
 
+from datetime import datetime
 from pathlib import Path
 
 import pytest
@@ -249,3 +250,712 @@ class TestWriteDiscipline:
         assert new_or_modified == {'cockpit-ui.json'}, (
             f'expected only cockpit-ui.json as a new path, got {new_or_modified}'
         )
+
+
+class TestDecisionQueueRender:
+    @pytest.mark.timeout(10)
+    async def test_open_decisions_and_awaiting_sessions_render_score_ordered(self, tmp_path):
+        """The DecisionQueue widget renders every open decision + awaiting-input
+        session (never a plain running session), rows keyed stably by
+        decision/session identity, with the higher-scored item ranked above
+        the lower one (PRD §9 C5b: rows `[score][age][project#task][question]`).
+        """
+        from textual.widgets.data_table import RowDoesNotExist
+
+        from cockpit.app import CockpitApp
+        from cockpit.backends import FakeBackend
+        from cockpit.panes.decision_queue import DecisionQueue
+
+        running = _make_record(session_slug='running-1', status=sr.Status.RUNNING)
+        awaiting = _make_record(
+            session_slug='awaiting-1',
+            status=sr.Status.AWAITING_INPUT,
+            question=sr.Question(text='Which port?', asked_at='2026-07-07T00:00:00+00:00'),
+        )
+        for r in (running, awaiting):
+            sr.write_record(r, root=tmp_path)
+
+        low = sr.DecisionRecord(
+            id='dec-low',
+            project='df',
+            text='Low priority question?',
+            filed_at='2026-07-07T00:00:00+00:00',
+            manual_boost=0,
+        )
+        high = sr.DecisionRecord(
+            id='dec-high',
+            project='df',
+            text='High priority question?',
+            filed_at='2026-07-07T00:00:00+00:00',
+            manual_boost=5,
+        )
+        for d in (low, high):
+            assert sr.write_decision(d, root=tmp_path)
+
+        app = CockpitApp(fleet_root=tmp_path, backend=FakeBackend(), poll_interval=0.05)
+        async with app.run_test() as pilot:
+            await pilot.pause()
+
+            queue = app.query_one(DecisionQueue)
+            assert queue.row_count == 3
+
+            # rows keyed stably by decision/session identity
+            assert queue.get_row('decision:dec-low')
+            assert queue.get_row('decision:dec-high')
+            assert queue.get_row('session:awaiting-1')
+
+            # the plain running session never appears in the queue
+            with pytest.raises(RowDoesNotExist):
+                queue.get_row('session:running-1')
+
+            # the higher-scored item (manual_boost=5) ranks above the lower one
+            high_index = queue.get_row_index('decision:dec-high')
+            low_index = queue.get_row_index('decision:dec-low')
+            assert high_index < low_index
+
+
+class TestSignalDontMove:
+    @pytest.mark.timeout(10)
+    async def test_awaiting_input_transition_sets_urgency_never_focus(self, tmp_path):
+        """PRD B3 (§6.2/§7), this task's leaf signal: the refresh/diff path may
+        call only backend.set_urgency + backend.reorder -- NEVER focus/tile --
+        when a session flips into (or out of) awaiting-input. A synthetic
+        running->awaiting-input transition must reorder the queue to include
+        the newly-blocked target and set its urgency hint, while a
+        FakeBackend spy proves zero focus/tile/raise calls ever happen on
+        this path; a subsequent awaiting-input->idle transition clears the
+        urgency hint.
+        """
+        from cockpit.app import CockpitApp
+        from cockpit.backends import DisplayTarget, FakeBackend
+        from cockpit.panes.decision_queue import DecisionQueue
+
+        display = sr.Display(kind='wm', wm_title='unblock:df#2085 slug')
+        running = _make_record(session_slug='running-1', status=sr.Status.RUNNING, display=display)
+        sr.write_record(running, root=tmp_path)
+
+        backend = FakeBackend()
+        app = CockpitApp(fleet_root=tmp_path, backend=backend, poll_interval=0.05)
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            queue = app.query_one(DecisionQueue)
+            assert queue.row_count == 0
+
+            awaiting = _make_record(
+                session_slug='running-1',
+                status=sr.Status.AWAITING_INPUT,
+                display=display,
+                question=sr.Question(text='Which port?', asked_at='2026-07-07T00:00:00+00:00'),
+            )
+            sr.write_record(awaiting, root=tmp_path)
+
+            app.refresh_registry()
+            await pilot.pause()
+
+            target = DisplayTarget(kind='wm', wm_title='unblock:df#2085 slug')
+            assert queue.row_count == 1
+            assert (target, True) in backend.set_urgency_calls
+            assert backend.focus_calls == []
+            assert backend.tile_calls == []
+
+            idle = _make_record(session_slug='running-1', status=sr.Status.IDLE, display=display)
+            sr.write_record(idle, root=tmp_path)
+
+            app.refresh_registry()
+            await pilot.pause()
+
+            assert queue.row_count == 0
+            assert (target, False) in backend.set_urgency_calls
+            assert backend.focus_calls == []
+            assert backend.tile_calls == []
+
+
+class TestSharedTargetAttentionNotClearedPrematurely:
+    @pytest.mark.timeout(10)
+    async def test_urgency_stays_set_while_a_second_item_still_targets_it(self, tmp_path):
+        """PRD B3 edge case: a DecisionRecord and the AWAITING_INPUT session
+        it links to (via session_id) can resolve to the exact SAME
+        DisplayTarget (resolve_target maps a decision through its session's
+        display). _update_attention must diff by resolved TARGET, not by
+        item key -- otherwise the decision leaving the queue (e.g. answered
+        by a C8 watcher) while its session is STILL awaiting input would
+        incorrectly clear the shared target's urgency hint, even though a
+        live ask (the session) still points at it.
+        """
+        from cockpit.app import CockpitApp
+        from cockpit.backends import DisplayTarget, FakeBackend
+
+        display = sr.Display(kind='wm', wm_title='shared title')
+        awaiting = _make_record(
+            session_slug='shared-1',
+            status=sr.Status.AWAITING_INPUT,
+            display=display,
+            question=sr.Question(text='Which port?', asked_at='2026-07-07T00:00:00+00:00'),
+        )
+        sr.write_record(awaiting, root=tmp_path)
+        decision = sr.DecisionRecord(
+            id='dec-shared',
+            project='df',
+            text='Proceed?',
+            filed_at='2026-07-07T00:00:00+00:00',
+            session_id='shared-1',
+        )
+        assert sr.write_decision(decision, root=tmp_path)
+
+        backend = FakeBackend()
+        app = CockpitApp(fleet_root=tmp_path, backend=backend, poll_interval=0.05)
+        async with app.run_test() as pilot:
+            await pilot.pause()
+
+            target = DisplayTarget(kind='wm', wm_title='shared title')
+            assert (target, True) in backend.set_urgency_calls
+
+            # The decision resolves elsewhere (e.g. a C8 watcher answers it)
+            # while the session it's linked to is STILL awaiting input.
+            sr.update_decision_state('dec-shared', sr.DecisionState.ANSWERED, root=tmp_path)
+
+            calls_before = len(backend.set_urgency_calls)
+            app.refresh_registry()
+            await pilot.pause()
+
+            # The session's own queue item still resolves to `target` -- its
+            # urgency must NOT be cleared just because the decision left.
+            new_calls = backend.set_urgency_calls[calls_before:]
+            assert (target, False) not in new_calls
+
+
+class TestEnterFocus:
+    @pytest.mark.timeout(10)
+    async def test_enter_focuses_the_highlighted_row_not_row_zero(self, tmp_path):
+        """Explicit-action focus (PRD §6.2/§9 C5b): pressing Enter on the
+        DecisionQueue focuses the HIGHLIGHTED row's resolved target -- never
+        whatever happens to sit at row 0 -- and records that item's key in
+        the app's in-memory "handling" set. This is the ONLY place a focus()
+        call may originate from (see TestSignalDontMove for the refresh
+        path's complementary "never focus" half of the same invariant).
+        """
+        from cockpit.app import CockpitApp
+        from cockpit.backends import DisplayTarget, FakeBackend
+        from cockpit.panes.decision_queue import DecisionQueue
+
+        display_a = sr.Display(kind='wm', wm_title='awaiting-a title')
+        display_b = sr.Display(kind='wm', wm_title='awaiting-b title')
+        awaiting_a = _make_record(
+            session_slug='awaiting-a',
+            status=sr.Status.AWAITING_INPUT,
+            display=display_a,
+            question=sr.Question(text='A?', asked_at='2026-07-07T00:00:00+00:00'),
+        )
+        awaiting_b = _make_record(
+            session_slug='awaiting-b',
+            status=sr.Status.AWAITING_INPUT,
+            display=display_b,
+            question=sr.Question(text='B?', asked_at='2026-07-07T00:00:00+00:00'),
+        )
+        for r in (awaiting_a, awaiting_b):
+            sr.write_record(r, root=tmp_path)
+
+        backend = FakeBackend()
+        app = CockpitApp(fleet_root=tmp_path, backend=backend, poll_interval=0.05)
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            queue = app.query_one(DecisionQueue)
+            assert queue.row_count == 2
+
+            # Identical filed_at/manual_boost/state ties the two sessions'
+            # scores, so order_queue's (-score, key) tiebreak puts
+            # 'session:awaiting-a' at row 0 -- NOT our target below. If the
+            # handler wired Enter to "always focus row 0" instead of the
+            # actual highlighted row, this test would still catch it.
+            assert queue.highlighted_key() == 'session:awaiting-a'
+
+            target_key = 'session:awaiting-b'
+            queue.move_cursor(row=queue.get_row_index(target_key))
+            await pilot.pause()
+
+            await pilot.press('enter')
+            await pilot.pause()
+
+            assert backend.focus_calls == [DisplayTarget(kind='wm', wm_title='awaiting-b title')]
+            assert target_key in app._handling
+
+    @pytest.mark.timeout(10)
+    async def test_enter_on_unresolvable_target_is_fail_soft(self, tmp_path):
+        """A queue row with no resolvable focus target (an open decision
+        with no linked session) must not focus anything and must not raise
+        -- fail-soft, PRD §2. A gone/unlinked lead is still a no-op, never
+        a crash.
+        """
+        from cockpit.app import CockpitApp
+        from cockpit.backends import FakeBackend
+        from cockpit.panes.decision_queue import DecisionQueue
+
+        orphan = sr.DecisionRecord(
+            id='dec-orphan',
+            project='df',
+            text='Orphaned decision?',
+            filed_at='2026-07-07T00:00:00+00:00',
+        )
+        assert sr.write_decision(orphan, root=tmp_path)
+
+        backend = FakeBackend()
+        app = CockpitApp(fleet_root=tmp_path, backend=backend, poll_interval=0.05)
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            queue = app.query_one(DecisionQueue)
+            assert queue.row_count == 1
+
+            await pilot.press('enter')
+            await pilot.pause()
+
+            assert backend.focus_calls == []
+
+
+class TestHandlingPrunedOnQueueExit:
+    @pytest.mark.timeout(10)
+    async def test_handling_flag_does_not_stick_past_the_ask_it_was_set_for(self, tmp_path):
+        """self._handling is an in-memory 'already acted on' marker keyed by
+        QueueItem.key (PRD §9 C5b). For a SESSION-backed row the key is
+        stable for the session's whole lifetime, so once Enter marks it
+        handling, it must be cleared again once that ask resolves (the
+        session leaves the queue) -- otherwise a brand new question from
+        the SAME session would silently inherit a stale "already handled"
+        flag left over from a completely different, earlier ask.
+        """
+        from cockpit.app import CockpitApp
+        from cockpit.backends import FakeBackend
+
+        display = sr.Display(kind='wm', wm_title='handling title')
+        awaiting = _make_record(
+            session_slug='handling-1',
+            status=sr.Status.AWAITING_INPUT,
+            display=display,
+            question=sr.Question(text='First ask?', asked_at='2026-07-07T00:00:00+00:00'),
+        )
+        sr.write_record(awaiting, root=tmp_path)
+
+        backend = FakeBackend()
+        app = CockpitApp(fleet_root=tmp_path, backend=backend, poll_interval=0.05)
+        async with app.run_test() as pilot:
+            await pilot.pause()
+
+            key = 'session:handling-1'
+            await pilot.press('enter')
+            await pilot.pause()
+            assert key in app._handling
+
+            # The ask resolves -- the session leaves the queue entirely.
+            idle = _make_record(session_slug='handling-1', status=sr.Status.IDLE, display=display)
+            sr.write_record(idle, root=tmp_path)
+            app.refresh_registry()
+            await pilot.pause()
+
+            assert key not in app._handling
+
+            # A brand new question from the SAME session must not inherit
+            # the stale handling flag left by the earlier, resolved ask.
+            second_ask = _make_record(
+                session_slug='handling-1',
+                status=sr.Status.AWAITING_INPUT,
+                display=display,
+                question=sr.Question(text='Second ask?', asked_at='2026-07-08T00:00:00+00:00'),
+            )
+            sr.write_record(second_ask, root=tmp_path)
+            app.refresh_registry()
+            await pilot.pause()
+
+            assert app._queue_items_by_key[key].handling is False
+
+
+class TestBoostReordersAndPersists:
+    @pytest.mark.timeout(10)
+    async def test_boost_and_digit_reorder_live_and_persist(self, tmp_path):
+        """b/B/digit priority keys (PRD §9 C5b) re-score and re-render the
+        DecisionQueue IMMEDIATELY -- no poll tick, no explicit
+        refresh_registry() call -- and, for a decision-backed row, persist
+        the new manual_boost via C1's set_manual_boost (the cockpit's own
+        sanctioned decision write). 'b' is additive (each press nudges the
+        boost by one); a digit sets manual_boost to that EXACT integer
+        (absolute, not additive).
+
+        A fixed now_fn + an explicit Priorities.default() keep the score
+        comparison hermetic -- independent of wall-clock time and of
+        whatever priorities.yaml (if any) happens to live on the host.
+        """
+        from cockpit.app import CockpitApp
+        from cockpit.backends import FakeBackend
+        from cockpit.panes.decision_queue import DecisionQueue
+        from cockpit.priority import Priorities
+
+        fixed_now = datetime.fromisoformat('2026-07-07T00:00:00+00:00')
+
+        older = sr.DecisionRecord(
+            id='dec-a',
+            project='df',
+            text='A?',
+            filed_at='2026-06-01T00:00:00+00:00',  # far enough back to saturate the age bonus
+            manual_boost=0,
+        )
+        newer = sr.DecisionRecord(
+            id='dec-b',
+            project='df',
+            text='B?',
+            filed_at='2026-07-07T00:00:00+00:00',  # same instant as `now` -- age 0
+            manual_boost=0,
+        )
+        for d in (older, newer):
+            assert sr.write_decision(d, root=tmp_path)
+
+        backend = FakeBackend()
+        app = CockpitApp(
+            fleet_root=tmp_path,
+            backend=backend,
+            poll_interval=0.05,
+            now_fn=lambda: fixed_now,
+            priorities=Priorities.default(),
+        )
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            queue = app.query_one(DecisionQueue)
+            assert queue.row_count == 2
+            # sanity: A (much older -- a bigger age bonus) currently
+            # outranks B (freshly filed) by age alone, both at boost=0 --
+            # this is the "another factor" the boost below must overcome.
+            assert queue.get_row_index('decision:dec-a') < queue.get_row_index('decision:dec-b')
+
+            queue.move_cursor(row=queue.get_row_index('decision:dec-b'))
+            await pilot.pause()
+
+            for _ in range(3):
+                await pilot.press('b')
+                await pilot.pause()
+
+            # (a) live reorder -- B now ranks above A, with no poll tick and
+            # no explicit refresh_registry() call anywhere in this test.
+            assert queue.get_row_index('decision:dec-b') < queue.get_row_index('decision:dec-a')
+
+            # (b) persisted via C1 -- disk reflects the raised boost.
+            persisted = {d.id: d for d in sr.list_decisions(root=tmp_path)}
+            assert persisted['dec-b'].manual_boost == 3
+            assert persisted['dec-a'].manual_boost == 0  # untouched
+
+            # a digit key sets manual_boost to that EXACT integer --
+            # absolute, not additive (3 + 7 would be 10, not 7).
+            await pilot.press('7')
+            await pilot.pause()
+
+            persisted = {d.id: d for d in sr.list_decisions(root=tmp_path)}
+            assert persisted['dec-b'].manual_boost == 7
+
+
+class TestDropRemovesAndPersists:
+    @pytest.mark.timeout(10)
+    async def test_drop_decision_row_removes_live_and_persists(self, tmp_path):
+        """'x' on a DECISION-backed row (PRD §9 C5b) removes it from the
+        queue IMMEDIATELY -- no poll tick, no explicit refresh_registry()
+        call -- and persists via C1's update_decision_state, the cockpit's
+        other sanctioned decision write. A dropped decision never
+        resurfaces (order_queue's own state=='open' filter excludes it).
+        """
+        from textual.widgets.data_table import RowDoesNotExist
+
+        from cockpit.app import CockpitApp
+        from cockpit.backends import FakeBackend
+        from cockpit.panes.decision_queue import DecisionQueue
+
+        first = sr.DecisionRecord(
+            id='dec-1', project='df', text='First?', filed_at='2026-07-07T00:00:00+00:00'
+        )
+        second = sr.DecisionRecord(
+            id='dec-2', project='df', text='Second?', filed_at='2026-07-07T00:00:00+00:00'
+        )
+        for d in (first, second):
+            assert sr.write_decision(d, root=tmp_path)
+
+        backend = FakeBackend()
+        app = CockpitApp(fleet_root=tmp_path, backend=backend, poll_interval=0.05)
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            queue = app.query_one(DecisionQueue)
+            assert queue.row_count == 2
+
+            queue.move_cursor(row=queue.get_row_index('decision:dec-1'))
+            await pilot.pause()
+
+            await pilot.press('x')
+            await pilot.pause()
+
+            # (a) removed from the live queue -- no poll tick, no explicit
+            # refresh_registry() call anywhere in this test.
+            assert queue.row_count == 1
+            with pytest.raises(RowDoesNotExist):
+                queue.get_row('decision:dec-1')
+            assert queue.get_row('decision:dec-2')
+
+            # (b) persisted via C1.
+            persisted = {d.id: d for d in sr.list_decisions(root=tmp_path)}
+            assert persisted['dec-1'].state == sr.DecisionState.DROPPED
+            assert persisted['dec-2'].state == sr.DecisionState.OPEN  # untouched
+
+    @pytest.mark.timeout(10)
+    async def test_drop_session_row_removes_live_without_writing_the_session(self, tmp_path):
+        """'x' on a SESSION-backed row hides it from the queue in-memory
+        ONLY -- sessions aren't cockpit-writable (PRD §2/§6.6), so this
+        must not touch the session's record on disk, and must not raise.
+        """
+        from cockpit.app import CockpitApp
+        from cockpit.backends import FakeBackend
+        from cockpit.panes.decision_queue import DecisionQueue
+
+        awaiting = _make_record(
+            session_slug='awaiting-1',
+            status=sr.Status.AWAITING_INPUT,
+            question=sr.Question(text='Which port?', asked_at='2026-07-07T00:00:00+00:00'),
+        )
+        sr.write_record(awaiting, root=tmp_path)
+
+        backend = FakeBackend()
+        app = CockpitApp(fleet_root=tmp_path, backend=backend, poll_interval=0.05)
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            queue = app.query_one(DecisionQueue)
+            assert queue.row_count == 1
+
+            await pilot.press('x')
+            await pilot.pause()
+
+            assert queue.row_count == 0
+
+            # the session's own record is untouched -- still awaiting-input,
+            # proving no registry write was attempted for a session row.
+            reread = sr.read_record('awaiting-1', root=tmp_path)
+            assert reread.status == sr.Status.AWAITING_INPUT
+
+
+class TestDeferResetsAge:
+    @pytest.mark.timeout(10)
+    async def test_defer_resets_age_live_without_writing_registry(self, tmp_path):
+        """'d' (defer, PRD §9 C5b) resets the highlighted item's EFFECTIVE
+        age to ~0 IMMEDIATELY -- no poll tick, no explicit
+        refresh_registry() call -- sinking it below an item that was
+        previously outranked purely by age. This is an in-memory age-reset
+        ONLY: DecisionRecord.filed_at (provenance -- when a decision was
+        actually filed) is NEVER rewritten, so the defer must leave every
+        sessions/ and decisions/ file on disk byte-identical (mirrors
+        TestWriteDiscipline's _snapshot_tree before/after convention).
+
+        A fixed now_fn + an explicit Priorities.default() keep the score
+        comparison hermetic -- independent of wall-clock time and of
+        whatever priorities.yaml (if any) happens to live on the host.
+        """
+        from cockpit.app import CockpitApp
+        from cockpit.backends import FakeBackend
+        from cockpit.panes.decision_queue import DecisionQueue
+        from cockpit.priority import Priorities
+
+        fixed_now = datetime.fromisoformat('2026-07-07T00:00:00+00:00')
+
+        older = sr.DecisionRecord(
+            id='dec-old',
+            project='df',
+            text='Old?',
+            filed_at='2026-06-01T00:00:00+00:00',  # far enough back to saturate the age bonus
+            manual_boost=0,
+        )
+        newer = sr.DecisionRecord(
+            id='dec-new',
+            project='df',
+            text='New?',
+            filed_at='2026-07-07T00:00:00+00:00',  # same instant as `now` -- age 0
+            manual_boost=0,
+        )
+        for d in (older, newer):
+            assert sr.write_decision(d, root=tmp_path)
+
+        before = _snapshot_tree(tmp_path)
+        assert any(path.startswith('decisions/') for path in before)
+
+        backend = FakeBackend()
+        app = CockpitApp(
+            fleet_root=tmp_path,
+            backend=backend,
+            poll_interval=0.05,
+            now_fn=lambda: fixed_now,
+            priorities=Priorities.default(),
+        )
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            queue = app.query_one(DecisionQueue)
+            assert queue.row_count == 2
+            # sanity: the older item (a much bigger age bonus) currently
+            # outranks the newer one, both at boost=0 -- this is the
+            # ordering the defer below must flip.
+            assert queue.get_row_index('decision:dec-old') < queue.get_row_index(
+                'decision:dec-new'
+            )
+
+            queue.move_cursor(row=queue.get_row_index('decision:dec-old'))
+            await pilot.pause()
+
+            await pilot.press('d')
+            await pilot.pause()
+
+            # (a) live reorder -- the deferred item now sinks below the
+            # newer one, with no poll tick and no explicit
+            # refresh_registry() call anywhere in this test.
+            assert queue.get_row_index('decision:dec-new') < queue.get_row_index(
+                'decision:dec-old'
+            )
+
+        # (b) in-memory only -- not a single sessions/ or decisions/ file
+        # was created/modified/removed (filed_at is never rewritten by a
+        # defer). Taken after the app has unmounted, so this also covers
+        # on_unmount's own _persist_ui_config write -- which never touches
+        # sessions/ or decisions/ either way.
+        after = _snapshot_tree(tmp_path)
+        for path, value in before.items():
+            assert after.get(path) == value, f'{path} was created/modified/removed by the defer'
+        new_paths = set(after) - set(before)
+        assert not any(path.startswith(('sessions/', 'decisions/')) for path in new_paths)
+
+
+class TestSpawnBar:
+    @pytest.mark.timeout(10)
+    async def test_new_session_key_pushes_spawn_screen(self, tmp_path):
+        """'n' (PRD §9 C5b spawn bar) pushes a SpawnScreen project/role/prompt picker."""
+        from cockpit.app import CockpitApp
+        from cockpit.panes.spawn_bar import SpawnScreen
+
+        app = CockpitApp(fleet_root=tmp_path, poll_interval=0.05, spawn_runner=lambda argv: None)
+        async with app.run_test() as pilot:
+            await pilot.pause()
+
+            await pilot.press('n')
+            await pilot.pause()
+
+            assert isinstance(app.screen, SpawnScreen)
+
+    @pytest.mark.timeout(10)
+    async def test_spawn_session_invokes_runner_with_exact_argv(self, tmp_path):
+        """spawn_session(project_root, role, prompt) -- the spawn bar's leaf
+        signal (PRD §9 C5b) -- builds spawn-claude.sh's exact positional
+        argv (build_spawn_argv) from the picked project (cwd), a
+        role-derived title, and the prompt, then hands it to the injected
+        spawn_runner. No real terminal/process is launched here (the
+        runner is faked) -- driven directly per this task's plan, rather
+        than through SpawnScreen's own Input/Select widgets.
+        """
+        from cockpit.app import CockpitApp
+        from cockpit.panes.spawn_bar import build_spawn_argv
+
+        spawned: list[list[str]] = []
+        spawn_script = '/repo/skills/spawn/spawn-claude.sh'
+
+        app = CockpitApp(
+            fleet_root=tmp_path,
+            poll_interval=0.05,
+            spawn_runner=spawned.append,
+            spawn_script=spawn_script,
+        )
+        async with app.run_test() as pilot:
+            await pilot.pause()
+
+            project_root = '/home/leo/src/dark-factory'
+            role = 'unblock'
+            prompt = 'Please look at this'
+            app.spawn_session(project_root, role, prompt)
+            await pilot.pause()
+
+        assert len(spawned) == 1
+        expected_title = f'{role}:{Path(project_root).name}'
+        assert spawned[0] == build_spawn_argv(spawn_script, project_root, expected_title, prompt)
+
+
+class TestRefreshWriteDiscipline:
+    @pytest.mark.timeout(10)
+    async def test_refresh_path_writes_nothing_under_sessions_or_decisions(self, tmp_path):
+        """Extends C5a's TestWriteDiscipline (PRD §2/§5 hard invariant) to the
+        C5b queue/attention path: building/reordering the DecisionQueue and
+        signaling an attention transition (set_urgency/reorder, PRD B3) on a
+        refresh tick must never create, modify, or delete a sessions/ or
+        decisions/ file. Only the explicit b/B/x/digit action handlers are
+        sanctioned registry writers (TestBoostReordersAndPersists/
+        TestDropRemovesAndPersists) -- refresh_registry (and everything it
+        calls: _rebuild_queue, _update_attention) is a pure reader + a
+        backend-signal emitter, never a writer.
+
+        The session's RUNNING->AWAITING_INPUT flip below is this test's OWN
+        setup write (sr.write_record), standing in for an external actor
+        (e.g. a T4-T7 hook) -- mirrors TestSignalDontMove's convention. The
+        write-discipline snapshot is taken AFTER that flip and BEFORE the
+        direct refresh_registry() call, so the diff below isolates exactly
+        what the automatic refresh/diff path itself writes: nothing.
+        """
+        from cockpit.app import CockpitApp
+        from cockpit.backends import FakeBackend
+        from cockpit.panes.decision_queue import DecisionQueue
+
+        display = sr.Display(kind='wm', wm_title='unblock:df#2085 slug')
+        running = _make_record(
+            session_slug='refresh-wd-1', status=sr.Status.RUNNING, display=display
+        )
+        sr.write_record(running, root=tmp_path)
+
+        decision = sr.DecisionRecord(
+            id='dec-refresh-wd-1',
+            project='df',
+            text='Which port?',
+            filed_at='2026-07-07T00:00:00+00:00',
+        )
+        assert sr.write_decision(decision, root=tmp_path)
+
+        backend = FakeBackend()
+        app = CockpitApp(fleet_root=tmp_path, backend=backend, poll_interval=0.05)
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            queue = app.query_one(DecisionQueue)
+            assert queue.row_count == 1  # the open decision only; session is still just RUNNING
+
+            awaiting = _make_record(
+                session_slug='refresh-wd-1',
+                status=sr.Status.AWAITING_INPUT,
+                display=display,
+                question=sr.Question(text='Which port?', asked_at='2026-07-07T00:00:00+00:00'),
+            )
+            sr.write_record(awaiting, root=tmp_path)
+
+            before = _snapshot_tree(tmp_path)
+            # sanity: prove the snapshot actually captured the seeded files,
+            # so the "unchanged" assertion below isn't vacuously true.
+            assert any(path.startswith('sessions/') for path in before)
+            assert any(path.startswith('decisions/') for path in before)
+
+            app.refresh_registry()
+            await pilot.pause()
+
+            # sanity: the refresh actually did the queue-rebuild + attention
+            # work under test, not a snapshot-unchanged short-circuit no-op.
+            assert queue.row_count == 2
+            assert backend.set_urgency_calls
+
+        after = _snapshot_tree(tmp_path)
+
+        # Scoped to sessions/decisions -- unlike TestWriteDiscipline/
+        # TestDeferResetsAge's whole-lifecycle before/after (taken pre-mount,
+        # before cockpit-ui.json exists at all), this test's "before" is
+        # taken mid-lifecycle, after cockpit-ui.json already exists (from
+        # on_mount's own initial refresh_registry() call). cockpit-ui.json
+        # is the cockpit's own sanctioned, unconditional write target (PRD
+        # §2/§5) and may legitimately be rewritten by a table rebuild's
+        # RowHighlighted repost (see session_table.py) on every tick --
+        # that's a pre-existing C5a behavior this test doesn't police. The
+        # invariant under test here is narrower and exactly what step-25
+        # specifies: zero sessions/ or decisions/ writes from the automatic
+        # refresh/diff path.
+        for path, value in before.items():
+            if path.startswith(('sessions/', 'decisions/')):
+                assert after.get(path) == value, (
+                    f'{path} was created/modified/removed by the refresh path'
+                )
+        new_paths = set(after) - set(before)
+        assert not any(path.startswith(('sessions/', 'decisions/')) for path in new_paths)
