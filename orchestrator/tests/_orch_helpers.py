@@ -8,9 +8,11 @@ the same process.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import gc
 import inspect
 import logging
+import threading
 from collections.abc import Sequence
 from typing import TYPE_CHECKING
 from unittest.mock import AsyncMock, MagicMock
