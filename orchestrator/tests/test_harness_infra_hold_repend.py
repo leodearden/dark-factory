@@ -87,29 +87,30 @@ def _make_worktree(harness: Harness, tid: str, *, with_lock: bool = False) -> Pa
 
 @pytest.mark.asyncio
 class TestRevertInProgressInfraHoldGuard:
-    """_revert_in_progress_if_no_live_claimant must NOT revert infra_hold tasks.
+    """_revert_in_progress_if_no_live_claimant must NOT revert infra-held tasks.
 
     RED before step-14: function reverts regardless of metadata.
-    GREEN after step-14: metadata.infra_hold + non-degenerate branch → skip revert.
+    GREEN after step-14: status='infra-hold' (task 2200/ω4; formerly
+    metadata.infra_hold) + non-degenerate branch → skip revert.
     """
 
     async def test_infra_hold_non_degenerate_not_reverted(
         self, harness: Harness, monkeypatch
     ):
-        """Task with infra_hold + non-degenerate branch + no live claimant → intact.
+        """Task with status='infra-hold' + non-degenerate branch + no live
+        claimant → intact.
 
-        Currently FAILS (RED): _revert_in_progress_if_no_live_claimant always
-        reverts when there is no plan.lock, regardless of infra_hold.
-        After step-14 the guard fires and returns None (task left intact).
+        After step-14 (re-keyed onto the first-class status by task 2200/ω4)
+        the guard fires and returns None (task left intact).
         """
         tid = '1883'
         _make_worktree(harness, tid)  # no lock → no live claimant
 
-        # Task metadata has infra_hold set
+        # Task status is infra-hold (first-class status, task 2200/ω4)
         harness.scheduler.get_task = AsyncMock(return_value={
             'id': tid,
+            'status': 'infra-hold',
             'metadata': {
-                'infra_hold': {'phase': 'warm_marker', 'errno': 28, 'reason': 'ENOSPC'},
                 'branch_base_sha': _BASE_SHA,
             },
         })
@@ -124,13 +125,13 @@ class TestRevertInProgressInfraHoldGuard:
         # MUST NOT call set_task_status with 'pending'.
         assert result != 'reverted', (
             f'_revert_in_progress_if_no_live_claimant reverted task {tid!r} '
-            f'despite metadata.infra_hold being set and branch being non-degenerate. '
-            f'An infra_hold hold must survive the stranded recovery sweep.'
+            f"despite status='infra-hold' and branch being non-degenerate. "
+            f'An infra-hold must survive the stranded recovery sweep.'
         )
         for call in harness.scheduler.set_task_status.await_args_list:  # type: ignore[attr-defined]
             assert call.args[1] != 'pending', (
-                f'set_task_status({tid!r}, "pending") was called despite infra_hold: '
-                f'{call}'
+                f'set_task_status({tid!r}, "pending") was called despite '
+                f"status='infra-hold': {call}"
             )
 
     async def test_no_infra_hold_still_reverts(self, harness: Harness):
@@ -160,22 +161,22 @@ class TestRevertInProgressInfraHoldGuard:
     async def test_infra_hold_degenerate_branch_still_reverts(
         self, harness: Harness, monkeypatch
     ):
-        """Task with infra_hold BUT degenerate branch → still reverts.
+        """Task with status='infra-hold' BUT degenerate branch → still reverts.
 
         A degenerate branch (tip == branch_base_sha) has no real implementation
-        commits — it was just provisioned.  The guard is narrow: infra_hold alone
-        is insufficient; the branch must also be non-degenerate.
+        commits — it was just provisioned.  The guard is narrow: infra-hold
+        alone is insufficient; the branch must also be non-degenerate.
 
         Passes both before and after step-14 (guard requires BOTH conditions).
         """
         tid = '1885'
         _make_worktree(harness, tid)  # no lock → no live claimant
 
-        # infra_hold set but branch is degenerate (tip == base → no work done)
+        # status is infra-hold but branch is degenerate (tip == base → no work done)
         harness.scheduler.get_task = AsyncMock(return_value={
             'id': tid,
+            'status': 'infra-hold',
             'metadata': {
-                'infra_hold': {'phase': 'warm_marker', 'errno': 28},
                 'branch_base_sha': _BASE_SHA,
             },
         })
@@ -188,8 +189,8 @@ class TestRevertInProgressInfraHoldGuard:
 
         # Degenerate branch → still reverts (no real work to preserve)
         assert result == 'reverted', (
-            f'Task with infra_hold on degenerate branch should still revert; '
-            f'got {result!r}'
+            f"Task with status='infra-hold' on degenerate branch should still "
+            f'revert; got {result!r}'
         )
 
 
