@@ -2924,12 +2924,12 @@ class TestSpeculativeMergeWorker:
         original_riv = worker._run_inflight_verify
         call_count = 0
 
-        async def mock_riv(item, lease):  # type: ignore[no-untyped-def]
+        async def mock_riv(item, lease, **kwargs):  # type: ignore[no-untyped-def]
             nonlocal call_count
             call_count += 1
             if call_count == 1:
                 raise RuntimeError('Unexpected verifier error')
-            return await original_riv(item, lease)
+            return await original_riv(item, lease, **kwargs)
 
         worker._run_inflight_verify = mock_riv  # type: ignore[method-assign]
 

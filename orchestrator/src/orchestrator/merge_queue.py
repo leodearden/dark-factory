@@ -1010,6 +1010,8 @@ async def _run_post_merge_verify(
     runner: VerifyRunner | None = None,
     escalation_queue: Any = None,
     dry_run_handles: _DryRunInvestigationHandles | None = None,
+    depth: int | None = None,
+    speculative: bool | None = None,
 ) -> MergeOutcome | None:
     """Run post-merge verification for a single task.
 
@@ -1060,6 +1062,13 @@ async def _run_post_merge_verify(
             (generic task-fault or unscoped-typecheck-FAILED) fires a
             fire-and-forget dry-run investigation via
             :func:`_spawn_merge_verify_dry_run`.
+        depth: Verify-frontier stack height (task 2340, ε=1890) at dispatch
+            time; threaded straight into ``pool.dispatch`` for the
+            ``merge_verify`` event.  ``None`` (default) keeps every existing
+            caller byte-identical.
+        speculative: Mirrors ``item.speculative``; threaded straight into
+            ``pool.dispatch`` alongside *depth*.  ``None`` (default) keeps
+            every existing caller byte-identical.
     """
     # Pre-verify disk guard: if free space is low, prune stale merge
     # worktrees; if still low, skip the build and escalate as transient
@@ -1142,7 +1151,7 @@ async def _run_post_merge_verify(
     # classifying them as warm.  The per-command cold timeout used here
     # is `merge_verify_cold_command_timeout_secs` (config default 7200 s)
     # if set, falling back to `verify_cold_command_timeout_secs` then warm.
-    verify = await pool.dispatch(merge_sha, spec)
+    verify = await pool.dispatch(merge_sha, spec, depth=depth, speculative=speculative)
 
     # Transient-infra (disk pressure) retry: an ENOSPC failure is
     # often a self-healing host condition.  Prune stale _merge-*
@@ -1161,7 +1170,9 @@ async def _run_post_merge_verify(
                 'stale merge worktree(s), retrying verify once',
                 req.task_id, len(pruned),
             )
-            verify = await pool.dispatch(merge_sha, spec, attempt=1)
+            verify = await pool.dispatch(
+                merge_sha, spec, attempt=1, depth=depth, speculative=speculative,
+            )
 
     # Invoke the optional result-capture callback (PRD §10 invariant 6(b)):
     # called with the FINAL VerifyResult (after any ENOSPC retry) so the
@@ -2873,8 +2884,16 @@ async def classify_and_merge(
     # typing narrowing (the test-local MergeWorker reference has no
     # _emit_speculative), not a behavioural gate.
     if speculative and isinstance(worker, SpeculativeMergeWorker):
+        # NOTE: _emit_speculative str-converts every data value (see its
+        # `{k: str(v) ...}` coercion below), so depth lands here as a str
+        # (e.g. "2") — unlike the merge_verify event's depth (dispatch, in
+        # verify_runner.py), which is a native int. analyze_speculation_depth's
+        # compute_per_depth() coerces both defensively, but a future consumer
+        # that aggregates depth across both event types should not assume a
+        # single type.
         worker._emit_speculative(
             EventType.speculative_merge, req.task_id, base_sha=base_sha,
+            depth=worker._verify_frontier_depth(),
         )
     merge_result = await git_ops.merge_to_main(
         req.worktree, req.branch, base_sha=base_sha if speculative else None,
@@ -5641,6 +5660,15 @@ class SpeculativeMergeWorker(_WipHaltMixin):
             if e.verify_task is not None:
                 entries.append(e)
         return entries
+
+    def _verify_frontier_depth(self) -> int:
+        """Return the verify-frontier stack height (task 2340, reuses ε=1890).
+
+        depth 0 = a head verify against real main; depth d = d speculated
+        items already frozen/verifying ahead of the item joining the
+        frontier.  Pure/synchronous (no await) — mirrors frozen_prefix().
+        """
+        return len(self._frozen_inflight_entries())
 
     def frozen_prefix(self) -> tuple[str, ...]:
         """Return request_ids of the frozen prefix in submission order (ε=1890).
@@ -9440,6 +9468,7 @@ class SpeculativeMergeWorker(_WipHaltMixin):
         self,
         item: RealMergeItem,
         lease: Any,  # HostLease
+        depth: int | None = None,
     ) -> InflightVerifyResult:
         """Run the verify portion for one in-flight item.
 
@@ -9466,6 +9495,12 @@ class SpeculativeMergeWorker(_WipHaltMixin):
         loop so sole-waiter abandon and operator-halt can abort mid-verify.
         Abandon-wins ordering matches _verify_and_advance: abandon (trigger 1)
         is checked before halt (trigger 2) when both land simultaneously.
+
+        depth: Verify-frontier stack height (task 2340, ε=1890), computed
+            synchronously by the caller (_dispatch_item) before this task is
+            launched.  Forwarded into _run_post_merge_verify alongside
+            item.speculative.  ``None`` (default) keeps the _verify_and_advance
+            shim and any other non-production caller byte-identical.
         """
         req = item.request
         merge_wt = item.merge_wt
@@ -9539,6 +9574,8 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                 runner=None if lease.is_local else lease.runner,
                 escalation_queue=self._escalation_queue,
                 dry_run_handles=self._dry_run_handles,
+                depth=depth,
+                speculative=item.speculative,
             ))
             # task 2420 (DEFECT 1, split from 2357; extends #1728): no-progress
             # budget seed.  LOCAL-only — a REMOTE lease's verify runs on the
@@ -10512,8 +10549,15 @@ class SpeculativeMergeWorker(_WipHaltMixin):
             pass  # fail-open: skip the check on any git error
 
         # ── Launch background verify task ────────────────────────────────────
+        # depth (task 2340) is computed synchronously HERE — before
+        # ensure_future launches the verify task — rather than read back out
+        # of the deque later, so it reflects exactly the items already
+        # frozen/verifying AHEAD of this item joining the frontier (no
+        # async-timing fragility from a concurrent dispatch mutating
+        # self._inflight between now and when the task actually runs).
+        depth = self._verify_frontier_depth()
         verify_task: asyncio.Task = asyncio.ensure_future(  # type: ignore[type-arg]
-            self._run_inflight_verify(item, lease)
+            self._run_inflight_verify(item, lease, depth=depth)
         )
 
         return InflightEntry(
