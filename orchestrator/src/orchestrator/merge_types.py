@@ -20,7 +20,7 @@ from enum import StrEnum
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Literal, TypeAlias, assert_never
 
-from orchestrator.git_ops import MergeResult
+from orchestrator.git_ops import MergeResult, canonical_queued_branch_name
 from orchestrator.merge_disposition import MergeFailureDisposition
 from orchestrator.verify import VerifyResult
 
@@ -614,10 +614,13 @@ class QueuedBranch:
     ``bare_id`` is the task id alone (e.g. ``'4778'``); ``full_name`` is the
     branch name with the configured prefix applied (e.g. ``'task/4778'``).
 
-    :meth:`parse` is the ONLY place branch-prefix logic lives (parse-don't-
-    validate, ``plans/merge-queue-reliability-prd.md`` DD7) — construct
-    instances through it rather than the dataclass constructor directly.
-    Git refs should always be built from ``.full_name``; task/branch
+    :meth:`parse` is the ONLY place bare/full pairing logic lives
+    (parse-don't-validate, ``plans/merge-queue-reliability-prd.md`` DD7) —
+    construct instances through it rather than the dataclass constructor
+    directly. It delegates the actual prefix-prepend rule to
+    :func:`orchestrator.git_ops.canonical_queued_branch_name`, the existing
+    single source of truth for that rule, so the two never diverge. Git
+    refs should always be built from ``.full_name``; task/branch
     bookkeeping keys should use ``.bare_id``.
 
     Frozen (immutable) so two independently-parsed values compare equal by
@@ -650,14 +653,16 @@ class QueuedBranch:
 
         *raw* may arrive bare (``'4778'``) or already prefixed
         (``'task/4778'``); both parse to the same value. ``full_name`` is
-        derived by the same prepend-unless-present rule as
-        :func:`orchestrator.git_ops.canonical_queued_branch_name`; ``bare_id``
-        is then stripped from it the same way the ``merge_queue_store.py``
-        journal normalization does. This is the ONLY place branch-prefix
+        computed by delegating to
+        :func:`orchestrator.git_ops.canonical_queued_branch_name` — the
+        existing single source of truth for the prepend-unless-present rule
+        — rather than reimplementing it here; ``bare_id`` is then stripped
+        from it the same way the ``merge_queue_store.py`` journal
+        normalization does. This is the ONLY place branch-prefix *pairing*
         logic should live — callers should not reimplement prefix
         stripping/prepending elsewhere.
         """
-        full_name = raw if raw.startswith(branch_prefix) else f'{branch_prefix}{raw}'
+        full_name = canonical_queued_branch_name(raw, branch_prefix)
         bare_id = full_name.removeprefix(branch_prefix)
         return cls(bare_id=bare_id, full_name=full_name)
 
