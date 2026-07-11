@@ -37,6 +37,7 @@ os.environ.setdefault('ORCH_DEBUG_ASSERTS', '1')
 
 from _orch_helpers import (  # noqa: E402
     drain_async_mock_coroutines,
+    idle_psi_sample,
     pydantic_spec,
     reap_leaked_aiosqlite_connections,
 )
@@ -204,6 +205,43 @@ def _isolate_orch_config(monkeypatch, tmp_path):
     """
     monkeypatch.delenv("ORCH_CONFIG_PATH", raising=False)
     monkeypatch.setenv("ORCH_PROJECT_ROOT", str(tmp_path))
+
+
+@pytest.fixture(autouse=True)
+def _hermetic_psi_reader(monkeypatch):
+    """Default every Scheduler's PSI reader to a deterministic idle sample.
+
+    Task 2418 — fix for the scheduler-test xdist flake where the dispatch-
+    admission gate (``psi_admission.enabled`` defaults True,
+    ``orchestrator.config.PsiAdmissionConfig``) reads REAL
+    ``/proc/pressure/*`` via ``self._read_psi_sample()`` once per
+    ``acquire_next()`` tick (scheduler.py).  Under host load (e.g. full
+    parallel ``pytest -n auto --dist loadgroup``) ``mem_some_avg10`` can
+    cross its configured threshold, non-deterministically deferring dispatch
+    of non-deterministic candidates in any bare-config test that calls
+    ``acquire_next()`` — flipping dispatch/skip/park/holder assertions.
+
+    Monkeypatches the module-level ``orchestrator.scheduler.read_psi_sample``
+    — the seam ``Scheduler.__init__`` binds to ``self._read_psi_sample`` by
+    default — to ``idle_psi_sample`` (``_orch_helpers.py``), a non-saturating
+    PsiSample (all metrics 0.0, ``read_ok=True``).  Every ``Scheduler``
+    constructed during a test therefore defaults to a deterministic,
+    non-saturating PSI reading regardless of host load.
+
+    Saturation tests (``test_scheduler_dispatch_admission.py``,
+    ``test_scheduler_psi_saturation_transition.py``) reassign
+    ``scheduler._read_psi_sample`` post-construction and are unaffected —
+    that per-instance assignment overrides this constructor-time default.
+
+    ``monkeypatch`` auto-reverts at teardown, so production
+    (``orchestrator.scheduler.read_psi_sample``) is never touched.
+
+    Mirrors ``_isolate_orch_config`` immediately above: both neutralize a
+    host/global dependency (project_root / PSI) so the suite is hermetic
+    under parallel execution.  Guard test:
+    ``test_scheduler_hermetic_psi.py::TestAutouseFixtureDefaultsToIdlePsi``.
+    """
+    monkeypatch.setattr('orchestrator.scheduler.read_psi_sample', idle_psi_sample)
 
 
 @pytest.fixture(autouse=True)
