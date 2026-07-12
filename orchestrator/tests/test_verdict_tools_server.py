@@ -8,6 +8,7 @@ from orchestrator.artifacts import TaskArtifacts
 from orchestrator.mcp.verdict_tools import (
     _submit_completion_verdict,
     _submit_review_verdict,
+    _submit_triage,
 )
 
 
@@ -73,4 +74,38 @@ class TestSubmitCompletionVerdict:
             'reasoning': 'done',
             'uncovered_plan_steps': [],
             'substantive_work': True,
+        }
+
+
+class TestSubmitTriage:
+    def test_writes_envelope_and_returns_ok(self, artifacts):
+        accepted = [{
+            'index': 0,
+            'suggestion': 'x',
+            'reason': 'r',
+            'files': ['a.py'],
+            'proposed_task_title': 't',
+        }]
+        proposed_task_groups = [{
+            'title': 'g',
+            'description': 'd',
+            'accepted_indices': [0],
+        }]
+        result = _submit_triage(
+            artifacts,
+            role='triage',
+            session_id='s',
+            accepted=accepted,
+            skipped=[],
+            proposed_task_groups=proposed_task_groups,
+        )
+        assert result == {'status': 'ok', 'role': 'triage'}
+
+        envelope = artifacts.read_verdict('triage')
+        assert envelope is not None
+        assert envelope['role'] == 'triage'
+        assert envelope['verdict'] == {
+            'accepted': accepted,
+            'skipped': [],
+            'proposed_task_groups': proposed_task_groups,
         }
