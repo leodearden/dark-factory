@@ -401,6 +401,99 @@ class TestEnumerateGraphEntityNodes:
         assert caplog.records == []
 
 
+class TestEnumerateGraphEpisodicNodes:
+    """Tests for async enumerate_graph_episodic_nodes(graphiti, key, *, limit)."""
+
+    @pytest.mark.asyncio
+    async def test_calls_graph_for_with_key(self):
+        """graphiti._graph_for is called with the key argument."""
+        graphiti = MagicMock()
+        graph = _make_graph_mock([])
+        graphiti._graph_for = MagicMock(return_value=graph)
+
+        await _mod.enumerate_graph_episodic_nodes(graphiti, 'know-live', limit=1000)
+
+        graphiti._graph_for.assert_called_once_with('know-live')
+
+    @pytest.mark.asyncio
+    async def test_uses_ro_query_not_query(self):
+        """Enumeration is read-only: ro_query is used, .query is NEVER called."""
+        graphiti = MagicMock()
+        graph = _make_graph_mock([])
+        graphiti._graph_for = MagicMock(return_value=graph)
+
+        await _mod.enumerate_graph_episodic_nodes(graphiti, 'know-live', limit=1000)
+
+        graph.ro_query.assert_called_once()
+        graph.query.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_query_matches_episodic_label(self):
+        """The Cypher issued matches :Episodic nodes specifically."""
+        graphiti = MagicMock()
+        graph = _make_graph_mock([])
+        graphiti._graph_for = MagicMock(return_value=graph)
+
+        await _mod.enumerate_graph_episodic_nodes(graphiti, 'know-live', limit=1000)
+
+        cypher = graph.ro_query.call_args.args[0]
+        assert ':Episodic' in cypher
+
+    @pytest.mark.asyncio
+    async def test_normalizes_rows_to_uuid_dicts(self):
+        """result_set rows [uuid] are normalized to [{'uuid': ...}, ...]."""
+        graphiti = MagicMock()
+        rows = [['episode-uuid-1'], ['episode-uuid-2']]
+        graph = _make_graph_mock(rows)
+        graphiti._graph_for = MagicMock(return_value=graph)
+
+        result = await _mod.enumerate_graph_episodic_nodes(graphiti, 'know-live', limit=1000)
+
+        assert result == [
+            {'uuid': 'episode-uuid-1'},
+            {'uuid': 'episode-uuid-2'},
+        ]
+
+    @pytest.mark.asyncio
+    async def test_empty_graph_returns_empty_list(self):
+        """An empty result_set returns an empty list, not an error."""
+        graphiti = MagicMock()
+        graph = _make_graph_mock([])
+        graphiti._graph_for = MagicMock(return_value=graph)
+
+        result = await _mod.enumerate_graph_episodic_nodes(graphiti, 'know-live', limit=1000)
+
+        assert result == []
+
+    @pytest.mark.asyncio
+    async def test_warns_when_row_count_hits_limit(self, caplog):
+        """No-silent-caps: hitting the limit logs a WARNING."""
+        graphiti = MagicMock()
+        rows = [[f'episode-uuid-{i}'] for i in range(3)]
+        graph = _make_graph_mock(rows)
+        graphiti._graph_for = MagicMock(return_value=graph)
+
+        with caplog.at_level('WARNING'):
+            await _mod.enumerate_graph_episodic_nodes(graphiti, 'know-live', limit=3)
+
+        assert any('limit' in rec.message.lower() for rec in caplog.records), (
+            f'Expected a limit-related WARNING, got: {[r.message for r in caplog.records]}'
+        )
+
+    @pytest.mark.asyncio
+    async def test_no_warning_when_under_limit(self, caplog):
+        """Row count below the limit does not log a WARNING."""
+        graphiti = MagicMock()
+        rows = [['episode-uuid-1']]
+        graph = _make_graph_mock(rows)
+        graphiti._graph_for = MagicMock(return_value=graph)
+
+        with caplog.at_level('WARNING'):
+            await _mod.enumerate_graph_episodic_nodes(graphiti, 'know-live', limit=1000)
+
+        assert caplog.records == []
+
+
 class TestCountGraphNodes:
     """Tests for async count_graph_nodes(graphiti, key)."""
 
