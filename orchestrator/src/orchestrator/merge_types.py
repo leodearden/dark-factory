@@ -632,14 +632,25 @@ class QueuedBranch:
     full_name: str
 
     def __post_init__(self) -> None:
-        """Enforce the coherent-pair invariant: full_name must end with bare_id.
+        """Reject the grossest incoherent pairs: full_name must end with bare_id.
 
         :meth:`parse` always produces this shape — ``full_name`` is always
         ``branch_prefix + bare_id``, so ``full_name.endswith(bare_id)`` holds
         for every prefix (including the empty-prefix case, where
         ``full_name == bare_id``). This guard never rejects ``parse()``
-        output; it only trips on a hand-built incoherent pair that bypasses
-        ``parse()``, realizing "mixed shape unrepresentable" (PRD DD7).
+        output.
+
+        This is a partial, not complete, realization of "mixed shape
+        unrepresentable" (PRD DD7): ``__post_init__`` has no ``branch_prefix``
+        to check against, so it cannot enforce the stronger invariant
+        ``full_name == branch_prefix + bare_id`` — only the weaker
+        ``endswith`` consequence of it. A pathological hand-built pair can
+        still slip through, e.g. ``QueuedBranch(bare_id='778',
+        full_name='task/4778')`` satisfies ``endswith`` even though
+        ``bare_id`` is a truncation of the real id. ``parse()`` is the sole
+        intended constructor and always satisfies the stronger invariant;
+        this guard exists to catch gross incoherence (e.g. an unrelated or
+        wrongly-prefixed ``full_name``) in pairs built by bypassing it.
         """
         if not self.full_name.endswith(self.bare_id):
             raise ValueError(
