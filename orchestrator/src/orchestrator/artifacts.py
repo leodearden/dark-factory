@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
@@ -123,6 +124,29 @@ def _normalize_plan(plan: dict) -> tuple[dict, bool]:
             modified = True
 
     return plan, modified
+
+
+_VALID_VERDICT_ROLE_RE = re.compile(r'^[A-Za-z0-9_-]+$')
+
+
+def _validate_verdict_role(role: str) -> None:
+    """Guard ``verdicts/<role>.json`` against escaping the ``verdicts/`` dir.
+
+    ``role`` is currently always the trusted ``--verdict-role`` CLI arg
+    (see verdict_tools.py's ``_artifacts_from_args``), so a path separator
+    or ``..`` can never reach here today. The guard exists so a future,
+    less-trusted caller can't turn an unsanitized role into a
+    write/read/clear outside ``verdicts/``.
+
+    Raises:
+        ValueError: if *role* contains anything other than letters, digits,
+            underscores, or hyphens.
+    """
+    if not _VALID_VERDICT_ROLE_RE.match(role):
+        raise ValueError(
+            f'invalid verdict role {role!r}: must match '
+            f'{_VALID_VERDICT_ROLE_RE.pattern!r}'
+        )
 
 
 @dataclass
@@ -727,7 +751,11 @@ class TaskArtifacts:
         out-of-band), skip the write rather than raising — mirrors
         ``write_review``'s root-gone guard. This method assumes ``init()``
         has already created ``self.root``.
+
+        Raises:
+            ValueError: if *role* is invalid — see ``_validate_verdict_role``.
         """
+        _validate_verdict_role(role)
         if not self.root.is_dir():
             logger.info(
                 'TaskArtifacts: skipping write_verdict %r — root %s no longer exists',
@@ -740,7 +768,11 @@ class TaskArtifacts:
     def read_verdict(self, role: str) -> dict | None:
         """Return parsed ``.task/verdicts/{role}.json``, or ``None`` if
         missing/corrupt.
+
+        Raises:
+            ValueError: if *role* is invalid — see ``_validate_verdict_role``.
         """
+        _validate_verdict_role(role)
         path = self._read_path(f'verdicts/{role}.json')
         if not path.exists():
             return None
@@ -755,7 +787,11 @@ class TaskArtifacts:
 
         Called before spawning a role's agent so a stale verdict from a
         prior invocation never masquerades as this run's output.
+
+        Raises:
+            ValueError: if *role* is invalid — see ``_validate_verdict_role``.
         """
+        _validate_verdict_role(role)
         self._clear_path(f'verdicts/{role}.json')
 
     def lock_plan(self, session_id: str) -> bool:

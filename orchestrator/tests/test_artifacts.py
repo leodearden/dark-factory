@@ -560,6 +560,24 @@ class TestVerdicts:
         artifacts.clear_verdict('judge')  # must not raise
         artifacts.clear_verdict('judge')  # still idempotent
 
+    @pytest.mark.parametrize('bad_role', ['../escape', 'a/b', '..', '.', '/etc/passwd'])
+    def test_write_verdict_rejects_unsafe_role(self, artifacts: TaskArtifacts, bad_role):
+        with pytest.raises(ValueError, match='invalid verdict role'):
+            artifacts.write_verdict(bad_role, {'role': bad_role})
+        # Nothing escaped verdicts/ or landed anywhere under root.
+        assert not any(artifacts.root.rglob('escape*'))
+        assert not any(artifacts.root.rglob('passwd*'))
+
+    @pytest.mark.parametrize('bad_role', ['../escape', 'a/b', '..', '.', '/etc/passwd'])
+    def test_read_verdict_rejects_unsafe_role(self, artifacts: TaskArtifacts, bad_role):
+        with pytest.raises(ValueError, match='invalid verdict role'):
+            artifacts.read_verdict(bad_role)
+
+    @pytest.mark.parametrize('bad_role', ['../escape', 'a/b', '..', '.', '/etc/passwd'])
+    def test_clear_verdict_rejects_unsafe_role(self, artifacts: TaskArtifacts, bad_role):
+        with pytest.raises(ValueError, match='invalid verdict role'):
+            artifacts.clear_verdict(bad_role)
+
 
 class TestReviews:
     def test_write_and_read_reviews(self, artifacts: TaskArtifacts):
@@ -1185,6 +1203,24 @@ class TestWorktreeMissingTolerance:
         ta.write_review('reviewer-x', {'verdict': 'PASS', 'issues': []})
         # And nothing was created
         assert not ta.root.exists()
+
+    def test_write_verdict_skips_when_root_gone(self, tmp_path: Path):
+        worktree = tmp_path / 'gone-verdict'
+        worktree.mkdir()
+        ta = TaskArtifacts(worktree)
+        ta.init('task-v', 'gone', 'desc')
+        import shutil
+        shutil.rmtree(worktree)
+        assert not ta.root.is_dir()
+
+        # Must not raise
+        ta.write_verdict('judge', {
+            'role': 'judge', 'schema_version': 1, 'session_id': 's',
+            'emitted_at': 't', 'verdict': {'complete': True},
+        })
+        # And nothing was created
+        assert not ta.root.exists()
+        assert ta.read_verdict('judge') is None
 
     def test_write_json_skips_when_root_gone(self, tmp_path: Path):
         worktree = tmp_path / 'also-gone'
