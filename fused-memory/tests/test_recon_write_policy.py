@@ -181,14 +181,18 @@ class TestCheckGate1Terminal:
     def test_terminal_hint_routes_to_set_task_status_done_provenance_repair(self):
         """The Gate 1 hint must route metadata/done_provenance corrections
         to the sanctioned same-status set_task_status(..., 'done',
-        done_provenance=...) repair seam, and must not describe a metadata
-        correction as needing a reopen_reason (destructive, wrong seam).
-        Asserted on semantic substrings only, to avoid a brittle wording
-        pin."""
+        done_provenance=...) repair seam, and must not recommend a
+        reopen_reason-based transition as the fix (destructive, wrong seam
+        for a metadata-only correction). The negative check is pinned to
+        the specific historical misleading phrase ('with a reopen_reason')
+        rather than the bare token, so an incidental future mention of
+        reopen_reason (e.g. contrasting it with this seam) doesn't trip a
+        false regression. Asserted on semantic substrings only, to avoid a
+        brittle wording pin."""
         hint = _check('update_task', live_status='done').hint
         assert 'set_task_status' in hint
         assert 'done_provenance' in hint
-        assert 'reopen_reason' not in hint
+        assert 'with a reopen_reason' not in hint
 
 
 # ---------------------------------------------------------------------------
