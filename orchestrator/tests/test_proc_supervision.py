@@ -311,3 +311,79 @@ class TestDetachedSystemdRunAlwaysHasWorkingDirectory:
         assert wrapped.split()[0] == '/proj/scripts/restart-orchestrator.sh', (
             'the bare relative path must never appear as the payload script token'
         )
+
+
+# ---------------------------------------------------------------------------
+# step-7: RED — R3 2064 self-kill cell (RP-1 fail-closed)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestFailClosedSelfKillGuard:
+    """RP-1: a BLOCKING restart (verify set) with an UNKNOWN own_unit refuses
+    rather than risking a same-unit self-kill (the 2064 bug — today's
+    ``self_target = bool(own_unit) and (target_unit == own_unit)`` fails OPEN
+    when own_unit is falsy, routing an unprovable-self case onto the blocking
+    cross-unit path). No blocking subprocess may ever be spawned in this cell
+    — safety must not depend on the runner/inspector ever being called."""
+
+    async def _assert_refuses_without_running_anything(
+        self, tmp_queue_dir: Path, own_unit: str | None, task_id: str,
+    ) -> None:
+        from orchestrator.proc_supervision import (
+            EscalationSpec,
+            FreshPidVerify,
+            RestartDisposition,
+            RestartPlan,
+        )
+
+        runner = FakeRunner(returncode=0)
+        inspector = make_fake_inspector(
+            {'MainPID': 99, 'ActiveState': 'active', 'ActiveEnterTimestampMonotonic': 2000}
+        )
+        plan = RestartPlan(
+            script=Path('/proj/scripts/deploy.sh'),
+            args=[],
+            cwd=Path('/proj'),
+            target_unit='some-target.service',
+            own_unit=own_unit,
+            on_failure_escalation=EscalationSpec(
+                queue_dir=str(tmp_queue_dir),
+                task_id=task_id,
+                summary='Cannot verify own unit before blocking restart',
+            ),
+            verify=FreshPidVerify(
+                baseline_active_enter_monotonic=1000,
+                baseline_main_pid=42,
+                inspect_timeout_secs=10.0,
+            ),
+        )
+
+        outcome = await plan.execute(runner=runner, inspector=inspector)
+
+        assert outcome.disposition == RestartDisposition.REFUSED
+        assert outcome.escalated is True
+        assert runner.calls == [], (
+            'no blocking self-restart subprocess may ever be spawned when '
+            'own_unit is unknown — this is the 2064 self-kill guard'
+        )
+        assert inspector.calls == [], 'no inspect call before the refusal'
+
+        escalations = read_escalations(
+            tmp_queue_dir, task_id, agent_role='orchestrator-deterministic',
+        )
+        assert len(escalations) == 1
+        esc = escalations[0]
+        assert esc.level == 2
+        assert esc.severity == 'critical'
+        assert esc.category == 'infra_issue'
+
+    async def test_refuses_and_escalates_when_own_unit_empty_string(
+        self, tmp_queue_dir: Path,
+    ) -> None:
+        await self._assert_refuses_without_running_anything(tmp_queue_dir, '', 'task-77')
+
+    async def test_refuses_and_escalates_when_own_unit_none(
+        self, tmp_queue_dir: Path,
+    ) -> None:
+        await self._assert_refuses_without_running_anything(tmp_queue_dir, None, 'task-78')
