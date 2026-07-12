@@ -4050,3 +4050,109 @@ class TestInvokeWithCapRetryForwardsStartupGraceSecs:
         assert captured.get('startup_grace_secs') == 77.0, (
             f'startup_grace_secs not forwarded to invoke_fn; captured kwargs: {captured}'
         )
+
+
+# ── invoke_with_cap_retry backend forwarding (PRD harness-backend-reconnect T1) ──
+
+@pytest.mark.asyncio
+class TestBackendForwarding:
+    """Two-way boundary test for `backend` forwarding (PRD Appendix A).
+
+    Invariant 2: a custom ``invoke_fn`` (the multi-backend dispatcher) must
+    receive ``backend`` — on both the no-gate fast path and the gated
+    cap-retry path.  Invariants 1 & 3: the default ``invoke_claude_agent``
+    path (used by callers with no ``invoke_fn``, e.g. the fused-memory
+    reconciliation/curator caller) must keep today's exact call shape and
+    must NEVER receive a ``backend`` kwarg — ``invoke_claude_agent`` has no
+    such parameter, so an unconditional forward would raise ``TypeError``
+    there.  All three are authored together: with no fix, Invariant 2 fails;
+    with a naive unconditional forward, Invariants 1 & 3 fail.
+    """
+
+    async def test_custom_invoke_fn_receives_backend_no_gate(self):
+        """A custom invoke_fn receives backend='codex' on the no-gate fast path."""
+        captured: dict = {}
+
+        async def spy(**kwargs):
+            captured.update(kwargs)
+            return _make_result()
+
+        await invoke_with_cap_retry(
+            None,  # no gate → fast path
+            'lbl',
+            invoke_fn=spy,
+            backend='codex',
+            prompt='hi',
+            system_prompt='sp',
+            cwd=Path('.'),
+            model='gpt-5.4',
+        )
+
+        assert captured.get('backend') == 'codex', (
+            f'backend not forwarded to invoke_fn on no-gate path; captured kwargs: {captured}'
+        )
+
+    async def test_custom_invoke_fn_receives_backend_with_gate(self):
+        """A custom invoke_fn receives backend='codex' on the gated cap-retry path.
+
+        Representative of the orchestrator, which always supplies a gate.
+        make_gate_mock's detect_cap_hit defaults to False, so the spy runs
+        exactly once with no retry/backoff.
+        """
+        captured: dict = {}
+
+        async def spy(**kwargs):
+            captured.update(kwargs)
+            return _make_result()
+
+        gate = make_gate_mock(account_count=1)
+
+        await invoke_with_cap_retry(
+            gate,
+            'lbl',
+            invoke_fn=spy,
+            backend='codex',
+            prompt='hi',
+            system_prompt='sp',
+            cwd=Path('.'),
+            model='gpt-5.4',
+        )
+
+        assert captured.get('backend') == 'codex', (
+            f'backend not forwarded to invoke_fn on gated path; captured kwargs: {captured}'
+        )
+
+    async def test_claude_default_shape_unchanged_and_no_backend_kwarg(self):
+        """Default invoke_claude_agent path: call shape unchanged, no `backend` kwarg.
+
+        Locks out the naive unconditional-forward fix: invoke_claude_agent
+        has no `backend` parameter, so passing it would raise TypeError in
+        production — breaking the fused-memory reconciliation/curator caller,
+        which always dispatches through this default (no invoke_fn) path.
+        """
+        with patch(
+            'shared.cli_invoke.invoke_claude_agent',
+            new_callable=AsyncMock,
+            return_value=_make_result(),
+        ) as mock_invoke:
+            await invoke_with_cap_retry(
+                None,  # no gate → fast path
+                'lbl',
+                prompt='hi',
+                system_prompt='sp',
+                cwd=Path('.'),
+                model='opus',
+            )
+
+        mock_invoke.assert_awaited_once()
+        call_kwargs = mock_invoke.call_args.kwargs
+        assert 'backend' not in call_kwargs, (
+            f'invoke_claude_agent must never receive a backend kwarg; got: {call_kwargs}'
+        )
+        assert call_kwargs == {
+            'prompt': 'hi',
+            'system_prompt': 'sp',
+            'cwd': Path('.'),
+            'model': 'opus',
+            'config_dir': None,
+        }, f'invoke_claude_agent call shape changed unexpectedly: {call_kwargs}'
