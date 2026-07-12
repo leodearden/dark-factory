@@ -282,6 +282,21 @@ class TaskGroundTruth:
         straight to ``None`` — it deliberately does NOT fall through to the
         plan.lock check, which exists solely for the claimant-absent case.
 
+        NOTE (``is_stranded`` is in-progress-only): ``is_stranded`` returns
+        False unconditionally whenever ``db_status`` is anything other than
+        ``'in-progress'`` (its own contract — task 2182). So a non-in-progress
+        task (e.g. ``blocked``) that still carries a non-blank
+        ``claimant_run_id`` — left behind by a crash rather than a clean
+        release, which clears it (harness.py:5810) — is treated as LIVE here
+        regardless of heartbeat age, and ``classify_recovery`` then defers to
+        LEAVE rather than reaching the blocked/no-claimant
+        RE_FILE_ESCALATION row (g). This is an accepted, intentionally scoped
+        edge case, pinned by
+        ``test_stale_db_claimant_on_blocked_task_is_treated_as_live_by_design``
+        — not an oversight. Broadening the staleness check to non-in-progress
+        statuses would mean re-deriving ``is_stranded``'s own contract here;
+        left to a follow-up if this edge case proves to matter in practice.
+
         *task* is the already-fetched row (:meth:`derive_truth` fetches it
         exactly once and shares it across every field that needs it) — this
         method makes no I/O of its own beyond the plan.lock read.

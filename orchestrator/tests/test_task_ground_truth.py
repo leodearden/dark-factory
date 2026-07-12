@@ -465,6 +465,34 @@ class TestDeriveTruthLiveClaimant:
 
         assert report.live_claimant is None
 
+    async def test_stale_db_claimant_on_blocked_task_is_treated_as_live_by_design(self) -> None:
+        # is_stranded (task 2182) returns False unconditionally for any
+        # status other than 'in-progress' — so a 'blocked' task with a
+        # stale-but-present claimant_run_id resolves to a LIVE db Claimant
+        # here, not None. This is an intentionally scoped edge case (see the
+        # NOTE in _resolve_live_claimant's docstring), not an oversight:
+        # classify_recovery folds live_claimant=True into LEAVE, so the
+        # blocked/no-claimant RE_FILE_ESCALATION row (g) is unreachable for
+        # this specific stranded-blocked shape (review finding #2).
+        fixed_now = datetime(2026, 7, 12, 12, 0, 0, tzinfo=UTC)
+        task = {
+            'status': 'blocked',
+            'claimant_run_id': 'run-1/session-1/pid=123',
+            'heartbeat_at': '2026-07-12T00:00:00+00:00',  # 12 hours stale
+        }
+        scheduler = _fake_scheduler(is_actively_held=False, task=task)
+        resolver = _make_ground_truth(
+            scheduler=scheduler, now_fn=lambda: fixed_now, heartbeat_ttl=timedelta(minutes=10),
+        )
+
+        report = await resolver.derive_truth('28')
+
+        assert report.live_claimant == Claimant(
+            run_id='run-1/session-1/pid=123',
+            heartbeat_at='2026-07-12T00:00:00+00:00',
+            source=ClaimantSource.DB,
+        )
+
     async def test_plan_lock_dead_owner_pid_returns_none(self, tmp_path: Path) -> None:
         # _pid_alive(2**31 - 1) is deterministically False — not a valid
         # live PID on any standard Linux (mirrors
