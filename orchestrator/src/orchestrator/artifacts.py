@@ -217,6 +217,7 @@ class TaskArtifacts:
         """
         self.root.mkdir(parents=True, exist_ok=True)
         (self.root / 'reviews').mkdir(exist_ok=True)
+        (self.root / 'verdicts').mkdir(exist_ok=True)
 
         metadata = {
             'task_id': task_id,
