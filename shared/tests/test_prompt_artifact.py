@@ -13,6 +13,8 @@ Built bottom-up in TDD order (see task 2492's plan.json):
 
 from __future__ import annotations
 
+import json
+
 import pytest
 from pydantic import ValidationError
 
@@ -264,3 +266,57 @@ class TestKeyIsolationAndPathSafety:
         resolved = store.resolve(spec, executor_model='opus', harness_version='v1')
         assert resolved.source == 'artifact'
         assert resolved.text == compose_prompt(spec.contract, 'escape-attempt')
+
+
+class TestFailSafeUnverifiablePin:
+    """Half-written or corrupt on-disk state must never surface as a pinned artifact.
+
+    Each case constructs the half-pinned state directly on tmp_path (bypassing
+    ``pin()``, which always writes a coherent pair) and asserts ``resolve()``
+    falls back to the in-code constant rather than raising or returning an
+    unverified artifact.
+    """
+
+    def test_heuristics_without_provenance_falls_back_to_in_code(self, tmp_path):
+        store = PromptArtifactStore(tmp_path)
+        spec = _make_spec()
+        key_dir = store._key_dir('reviewer', 'claude-opus-4', 'v1')
+        key_dir.mkdir(parents=True)
+        (key_dir / 'heuristics.txt').write_text('orphan heuristics', encoding='utf-8')
+        # No provenance.json written.
+
+        resolved = store.resolve(spec, executor_model='claude-opus-4', harness_version='v1')
+
+        assert resolved.text == spec.in_code_constant
+        assert resolved.provenance is None
+        assert resolved.source == 'in_code'
+
+    def test_corrupt_provenance_json_falls_back_to_in_code(self, tmp_path):
+        store = PromptArtifactStore(tmp_path)
+        spec = _make_spec()
+        key_dir = store._key_dir('reviewer', 'claude-opus-4', 'v1')
+        key_dir.mkdir(parents=True)
+        (key_dir / 'heuristics.txt').write_text('some heuristics', encoding='utf-8')
+        (key_dir / 'provenance.json').write_text('{not valid json', encoding='utf-8')
+
+        resolved = store.resolve(spec, executor_model='claude-opus-4', harness_version='v1')
+
+        assert resolved.text == spec.in_code_constant
+        assert resolved.provenance is None
+        assert resolved.source == 'in_code'
+
+    def test_provenance_missing_required_field_falls_back_to_in_code(self, tmp_path):
+        store = PromptArtifactStore(tmp_path)
+        spec = _make_spec()
+        key_dir = store._key_dir('reviewer', 'claude-opus-4', 'v1')
+        key_dir.mkdir(parents=True)
+        (key_dir / 'heuristics.txt').write_text('some heuristics', encoding='utf-8')
+        incomplete = _provenance_kwargs(harness_version='v1')
+        del incomplete['git_sha']  # a schema-valid ArtifactProvenance requires this
+        (key_dir / 'provenance.json').write_text(json.dumps(incomplete), encoding='utf-8')
+
+        resolved = store.resolve(spec, executor_model='claude-opus-4', harness_version='v1')
+
+        assert resolved.text == spec.in_code_constant
+        assert resolved.provenance is None
+        assert resolved.source == 'in_code'
