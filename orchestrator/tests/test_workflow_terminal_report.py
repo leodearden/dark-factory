@@ -10,7 +10,7 @@ from __future__ import annotations
 import asyncio
 import dataclasses
 from pathlib import Path
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
@@ -26,6 +26,7 @@ import pytest
 # get_pending_steps() never observes completion and any full-execute-loop
 # test (e.g. the clean-DONE case below) spuriously blocks with "Execution
 # iterations exhausted" instead of reaching DONE.
+from test_harness_warm_lane_wiring import _build_harness, _init_git_repo
 from test_workflow_e2e import (
     AgentStub,
     _build_workflow,
@@ -40,6 +41,7 @@ from orchestrator.harness import TaskReport
 from orchestrator.scheduler import TaskAssignment
 from orchestrator.verify import VerifyResult
 from orchestrator.verify_categories import FailureCategory
+from orchestrator.workflow import WorkflowMetrics
 from orchestrator.workflow_types import (
     TerminalReport,
     WorkflowOutcome,
@@ -654,3 +656,157 @@ class TestLastBlockSideChannelDeleted:
         assert not hasattr(wf, '_last_block_detail')
         assert not hasattr(wf, '_last_block_phase')
         assert report.reason == 'warm_lane_pool_hard_down'
+
+
+@pytest.mark.asyncio
+class TestHarnessBlockPhaseFromWorkingPhase:
+    """REVIEW-CYCLE-1 regression (steps 13-14): the harness must map
+    ``TaskReport.block_phase`` from ``TerminalReport.blocked_from_phase``
+    (the PRE-block WORKING phase), NOT from the terminal ``phase``
+    (``machine.state`` == BLOCKED after ``_mark_blocked``'s
+    ``_enter_phase(BLOCKED)`` transition). Without this fix,
+    ``_maybe_auto_eval``'s phase gate (``config.auto_eval_phases`` ==
+    ``{plan,execute,verify,review}``) never matches ``'blocked'``, silently
+    and permanently disabling the optimistic-path auto-eval redo (Lever B/C
+    recovery).
+
+    RED at step-13 (before step-14's harness fix): harness.py still maps
+    ``block_phase=terminal_report.phase.value``, so a ``_mark_blocked``-style
+    exit surfaces ``block_phase == 'blocked'`` instead of the working phase.
+    """
+
+    async def _run_stubbed_slot(
+        self, tmp_path: Path, report: TerminalReport, *, task_id: str,
+    ) -> TaskReport:
+        """Drive ``Harness._run_slot`` with ``TaskWorkflow`` stubbed to
+        return ``report`` directly from ``run()`` (no real agent/git work).
+        """
+        repo = tmp_path / 'repo'
+        repo.mkdir()
+        await _init_git_repo(repo)
+        config = OrchestratorConfig(project_root=repo, max_concurrent_tasks=1)
+        harness = _build_harness(config)
+        # `_build_harness` leaves `Scheduler` a bare MagicMock (only the
+        # liveness accessors are wired) — `is_deterministic` must be pinned
+        # False or the MagicMock auto-mock (truthy) would route this through
+        # `_run_deterministic_slot` instead of the TaskWorkflow path below.
+        harness.scheduler.is_deterministic.return_value = False  # type: ignore[attr-defined]
+        # `_apply_retry_cap` compares these against real ints from `config`
+        # (`count >= self.config.requeue_cap`) whenever outcome==REQUEUED —
+        # an unconfigured MagicMock return value would raise TypeError on
+        # that comparison and mask the finally block's real work.
+        harness.scheduler.record_requeue.return_value = 0  # type: ignore[attr-defined]
+        harness.scheduler.transient_requeue_count.return_value = 0  # type: ignore[attr-defined]
+
+        with patch('orchestrator.harness.TaskWorkflow') as MockWorkflow:
+            mock_wf = MagicMock()
+            mock_wf.run = AsyncMock(return_value=report)
+            mock_wf._steward = None
+            mock_wf.metrics = WorkflowMetrics()
+            MockWorkflow.return_value = mock_wf
+
+            assignment = TaskAssignment(
+                task_id=task_id,
+                task={
+                    'id': task_id, 'title': 'Test task', 'status': 'pending',
+                    'metadata': {}, 'dependencies': [],
+                },
+                modules=[],
+            )
+            sem = asyncio.Semaphore(1)
+            result = await harness._run_slot(assignment, sem)
+
+        assert result is not None
+        return result
+
+    async def test_mark_blocked_exit_maps_block_phase_to_working_phase(
+        self, tmp_path: Path,
+    ):
+        """A ``_mark_blocked`` exit (``phase==BLOCKED``,
+        ``blocked_from_phase==VERIFY``) must surface
+        ``block_phase == 'verify'`` — the WORKING phase — not ``'blocked'``.
+        """
+        report = TerminalReport(
+            outcome=WorkflowOutcome.BLOCKED,
+            reason='verify failed',
+            phase=WorkflowState.BLOCKED,
+            detail='d',
+            category=None,
+            blocked_from_phase=WorkflowState.VERIFY,
+        )
+        task_report = await self._run_stubbed_slot(tmp_path, report, task_id='77')
+
+        assert task_report.outcome == WorkflowOutcome.BLOCKED
+        assert task_report.block_phase == 'verify'
+
+    async def test_warm_lane_requeue_exit_keeps_block_phase_plan(
+        self, tmp_path: Path,
+    ):
+        """Warm-lane REQUEUED (``blocked_from_phase==PLAN``, no BLOCKED
+        transition) must keep ``block_phase == 'plan'`` — retry-cap
+        forensics preserved (this boundary case is already green pre-fix,
+        since ``phase`` itself is also ``PLAN`` there; it pins the
+        no-regression half of the contract).
+        """
+        report = TerminalReport(
+            outcome=WorkflowOutcome.REQUEUED,
+            reason='warm_lane_pool_hard_down',
+            phase=WorkflowState.PLAN,
+            detail='d',
+            category=None,
+            blocked_from_phase=WorkflowState.PLAN,
+        )
+        task_report = await self._run_stubbed_slot(tmp_path, report, task_id='78')
+
+        assert task_report.outcome == WorkflowOutcome.REQUEUED
+        assert task_report.block_phase == 'plan'
+
+    async def test_clean_done_exit_has_empty_block_phase(self, tmp_path: Path):
+        """A clean DONE exit (``blocked_from_phase`` defaults to ``None``)
+        must map to ``block_phase == ''`` — matches the pre-2247
+        ``_last_block_phase`` default (never set on a non-block exit).
+        """
+        report = TerminalReport(
+            outcome=WorkflowOutcome.DONE,
+            reason='',
+            phase=WorkflowState.DONE,
+            detail='',
+            category=None,
+        )
+        task_report = await self._run_stubbed_slot(tmp_path, report, task_id='79')
+
+        assert task_report.outcome == WorkflowOutcome.DONE
+        assert task_report.block_phase == ''
+
+    async def test_auto_eval_triggers_from_real_run_slot_report(
+        self, tmp_path: Path,
+    ):
+        """End-to-end: feed the REAL ``TaskReport`` produced by ``_run_slot``
+        (from the ``_mark_blocked``-style block above) into
+        ``_maybe_auto_eval`` on an optimistic-path assignment — the redo
+        must actually dispatch.
+
+        RED on current code: the real ``report.block_phase`` is ``'blocked'``
+        (not a member of ``auto_eval_phases``), so ``_maybe_auto_eval``
+        returns early and no redo is dispatched.
+        """
+        from test_auto_eval import _make
+
+        report = TerminalReport(
+            outcome=WorkflowOutcome.BLOCKED,
+            reason='verify failed',
+            phase=WorkflowState.BLOCKED,
+            detail='d',
+            category=None,
+            blocked_from_phase=WorkflowState.VERIFY,
+        )
+        task_report = await self._run_stubbed_slot(tmp_path, report, task_id='80')
+        assert task_report.block_phase == 'verify'  # sanity, pinned above too
+
+        fixture = _make(project_root=tmp_path / 'auto-eval-proj')
+        await fixture.harness._maybe_auto_eval(fixture.assignment, task_report)
+
+        assert fixture.submit_calls, (
+            'auto-eval redo must dispatch when the real _run_slot report '
+            'carries block_phase derived from the pre-block WORKING phase'
+        )
