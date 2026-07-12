@@ -56,6 +56,11 @@ def _submit_review_verdict(
     issues: list[dict],
     summary: str,
 ) -> dict[str, Any]:
+    if verdict not in {'PASS', 'ISSUES_FOUND'}:
+        return {
+            'status': 'error',
+            'message': f'verdict must be one of PASS/ISSUES_FOUND, got {verdict!r}',
+        }
     payload = {
         'reviewer': reviewer,
         'verdict': verdict,
