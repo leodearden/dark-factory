@@ -316,6 +316,7 @@ async def propose_labels_frontier(
     model: str = 'opus',
     description: str = '',
     oauth_token: str | None = None,
+    max_turns: int = 3,
 ) -> tuple[list[GroundTruthIssue], float]:
     """Propose ground-truth issue labels for a mined diff via a frontier model.
 
@@ -343,6 +344,12 @@ async def propose_labels_frontier(
     ``CLAUDE_CONFIG_DIR`` credentials — needed when this is invoked from a
     task-scoped sandbox that has no logged-in Claude CLI of its own (see the
     ``mine`` CLI command in ``__main__.py``, which sources it from the pool).
+
+    *max_turns* defaults to 3 (matching ``match_issues``' turn budget), but
+    empirically ``effort='high'`` needs materially more turns than a plain
+    low-effort matcher call to reach a schema-conformant final answer — the
+    ``mine`` CLI passes a larger value (~15) to avoid a silent
+    ``error_max_turns`` (empty output, cost still billed).
     """
     diff_context = diff_text[:10_000] if len(diff_text) > 10_000 else diff_text
 
@@ -388,7 +395,7 @@ If there are no issues, return an empty issues list. Output your findings as JSO
         system_prompt=system_prompt,
         cwd=Path('/home/leo/src/dark-factory'),
         model=model,
-        max_turns=3,
+        max_turns=max_turns,
         max_budget_usd=2.0,
         output_schema=_FRONTIER_LABEL_SCHEMA,
         effort='high',
