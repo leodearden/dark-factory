@@ -93,6 +93,8 @@ from fused_memory.reconciliation.event_buffer import EventBuffer
 from fused_memory.reconciliation.flag_dedup import filter_suppressed, write_suppression_record
 from fused_memory.reconciliation.recon_ledger import ReconLedgerRecord, ReconLedgerStore
 from fused_memory.reconciliation.stages.task_knowledge_sync import _gc_recon_markers
+from fused_memory.server.tools import create_mcp_server
+from fused_memory.services.memory_service import MemoryService
 from fused_memory.services.write_journal import WriteJournal
 
 # Recon-stage agent_id used throughout this suite's interceptor/journal
@@ -827,3 +829,40 @@ class TestDedupExemptPermission:
             '(fresh point every call, no caching/memoization across calls)'
         )
         service.mem0.add.assert_not_called()
+
+    # -- driving harness (task 2232 step-10) ---------------------------------
+
+    async def _drive_reject_via_mcp_tool(self) -> tuple[AsyncMock, dict]:
+        """Non-recon caller through the REAL MCP tool boundary
+        (create_mcp_server + _tool_manager.call_tool), mirroring
+        tests/server/test_add_system_record_gate.py."""
+        mock_service = AsyncMock()
+        server = create_mcp_server(mock_service)
+
+        result = await server._tool_manager.call_tool(
+            'add_system_record',
+            {
+                'content': self._CONTENT,
+                'project_id': self._PROJECT_ID,
+                'category': self._CATEGORY,
+                'agent_id': 'claude-interactive',
+            },
+        )
+        return mock_service, result
+
+    async def _drive_fresh_point_routing(self, mock_config) -> MemoryService:
+        """A real MemoryService with mem0 mocked; call the real
+        add_system_record producer TWICE as a recon-stage caller."""
+        service = MemoryService(mock_config)
+        service.mem0 = AsyncMock()
+        service.mem0.add_system_record = AsyncMock(return_value={'results': [{'id': 'sys-1'}]})
+        service.mem0.add = AsyncMock(return_value={'results': [{'id': 'dedup-1'}]})
+
+        for _ in range(2):
+            await service.add_system_record(
+                self._CONTENT,
+                project_id=self._PROJECT_ID,
+                agent_id=AGENT_ID,
+                category=self._CATEGORY,
+            )
+        return service
