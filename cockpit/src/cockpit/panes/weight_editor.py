@@ -86,19 +86,32 @@ class WeightEditorScreen(ModalScreen[None]):
     """The 'w' weight editor (PRD §9 C9b) -- edit category/project weights in-cockpit.
 
     A minimal modal form -- one labeled Input per existing category weight
-    (id ``cat-<name>``) and one per known project name (id ``proj-<name>``),
-    each seeded with its current value: a category Input is seeded directly
-    from *priorities*.category_weights (every entry there already has a
-    value); a project Input is seeded from priorities.project_weights.get
-    (name, priorities.defaults.project) -- the same fallback score() itself
-    uses (see priority.score), so an as-yet-unweighted known project shows
-    its real effective weight, not a fake placeholder. Submitting (the
-    button, or Enter in any Input) reads every Input's current value into
-    category_edits/project_edits, builds a new Priorities via the pure
-    merge_weight_edits, dismisses, then calls the injected *on_submit* with
-    that new Priorities -- this widget never persists to priorities.yaml or
-    touches the DecisionQueue itself; that's app.apply_priorities' job (see
-    cockpit.app.CockpitApp). Escape dismisses without submitting.
+    (id ``cat-<index>``) and one per known project name (id
+    ``proj-<index>``), each seeded with its current value: a category Input
+    is seeded directly from *priorities*.category_weights (every entry
+    there already has a value); a project Input is seeded from
+    priorities.project_weights.get(name, priorities.defaults.project) --
+    the same fallback score() itself uses (see priority.score), so an
+    as-yet-unweighted known project shows its real effective weight, not a
+    fake placeholder. Ids are positional (enumerate index), not derived from
+    the category/project name itself: names are arbitrary
+    operator-editable strings (priorities.yaml keys / on-disk project
+    names) that may contain '.', '/', ':' or spaces, which Textual's
+    identifier rules reject (BadIdentifier) -- a name-derived id would crash
+    the whole screen on compose, violating the cockpit's fail-soft
+    invariant (PRD §2). compose() and _submit() enumerate the same
+    sequences (self._priorities.category_weights / self._project_names) in
+    the same order, so the index correspondence is stable within one screen
+    instance. Submitting (the button, or Enter in any Input) reads every
+    Input's current value into category_edits/project_edits -- a project
+    edit is only included when it differs from that Input's seeded value,
+    so accepting the defaults without touching a field never materializes
+    an explicit priorities.yaml entry for it -- builds a new Priorities via
+    the pure merge_weight_edits, dismisses, then calls the injected
+    *on_submit* with that new Priorities -- this widget never persists to
+    priorities.yaml or touches the DecisionQueue itself; that's
+    app.apply_priorities' job (see cockpit.app.CockpitApp). Escape
+    dismisses without submitting.
     """
 
     DEFAULT_CSS = """
@@ -136,12 +149,14 @@ class WeightEditorScreen(ModalScreen[None]):
         with Vertical():
             yield Label('Edit priority weights')
             yield Label('Category weights')
-            for name, value in self._priorities.category_weights.items():
-                yield Input(value=str(value), placeholder=name, id=f'cat-{name}')
+            for index, (name, value) in enumerate(self._priorities.category_weights.items()):
+                yield Input(value=str(value), placeholder=name, id=f'cat-{index}')
             yield Label('Project weights')
-            for name in self._project_names:
-                current = self._priorities.project_weights.get(name, self._priorities.defaults.project)
-                yield Input(value=str(current), placeholder=name, id=f'proj-{name}')
+            for index, name in enumerate(self._project_names):
+                current = self._priorities.project_weights.get(
+                    name, self._priorities.defaults.project
+                )
+                yield Input(value=str(current), placeholder=name, id=f'proj-{index}')
             yield Button('Apply', id='weight-submit', variant='primary')
 
     def on_button_pressed(self, event: Button.Pressed) -> None:
@@ -153,12 +168,19 @@ class WeightEditorScreen(ModalScreen[None]):
 
     def _submit(self) -> None:
         category_edits = {
-            name: self.query_one(f'#cat-{name}', Input).value
-            for name in self._priorities.category_weights
+            name: self.query_one(f'#cat-{index}', Input).value
+            for index, name in enumerate(self._priorities.category_weights)
         }
-        project_edits = {
-            name: self.query_one(f'#proj-{name}', Input).value for name in self._project_names
-        }
+        project_edits: dict[str, str] = {}
+        for index, name in enumerate(self._project_names):
+            raw = self.query_one(f'#proj-{index}', Input).value
+            seeded = self._priorities.project_weights.get(name, self._priorities.defaults.project)
+            try:
+                if float(raw) == seeded:
+                    continue
+            except (TypeError, ValueError):
+                continue
+            project_edits[name] = raw
         new_priorities = merge_weight_edits(
             self._priorities, category_edits=category_edits, project_edits=project_edits
         )
