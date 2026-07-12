@@ -785,6 +785,11 @@ class TestStage1CycleSummaryHarnessBackstop:
         payload = json.loads(record.payload_json)
         assert payload['stats'].get('stage1_cycle_summary_degraded_backstop') is True
 
+        assert recent[0].stage_reports['_error']['stage1_cycle_summary_backstop_written'] is True, (
+            'the breadcrumb must be stamped on this exit path too, not just the '
+            'generic Exception branch'
+        )
+
     @pytest.mark.asyncio
     async def test_stage1_all_accounts_capped_triggers_degraded_backstop_without_raising(
         self, journal, event_buffer, mock_memory_service, ledger_store
@@ -821,6 +826,11 @@ class TestStage1CycleSummaryHarnessBackstop:
         )
         payload = json.loads(record.payload_json)
         assert payload['stats'].get('stage1_cycle_summary_degraded_backstop') is True
+
+        assert run.stage_reports['_error']['stage1_cycle_summary_backstop_written'] is True, (
+            'the breadcrumb must be stamped on the deferral (return, not raise) '
+            'exit path too'
+        )
 
     @pytest.mark.asyncio
     async def test_happy_path_does_not_invoke_backstop_write(
@@ -886,6 +896,78 @@ class TestStage1CycleSummaryHarnessBackstop:
         run = recent[0]
         assert 'memory_consolidator' in run.stage_reports, (
             "Stage 1's report must remain present when Stage 2 fails"
+        )
+
+    @pytest.mark.asyncio
+    async def test_stage2_failure_preserves_real_stage1_ledger_row_without_overwrite(
+        self, journal, event_buffer, mock_memory_service, ledger_store
+    ):
+        """Non-regression guard for the design's core invariant (see this
+        method's docstring on the harness): once Stage 1's in-stage write has
+        actually produced a real, non-degraded ledger row,
+        ``run()`` cannot raise afterwards — that write is its last statement —
+        so ``current_stage_name`` has already advanced past Stage 1 by the
+        time any later failure reaches the finally block. This drives a REAL
+        write_stage1_cycle_summary call from Stage 1 (unlike the sibling
+        tests above, which stub .run entirely) and proves the backstop never
+        clobbers that real row with a degraded synthesis when Stage 2 then
+        fails.
+        """
+        import json
+
+        from fused_memory.models.reconciliation import StageId
+        from fused_memory.reconciliation.stages.memory_consolidator import (
+            write_stage1_cycle_summary,
+        )
+
+        mock_memory_service.recon_ledger = ledger_store
+        mock_memory_service.get_memories_by_metadata = AsyncMock(return_value=[])
+        harness = _make_test_harness(journal, event_buffer, mock_memory_service)
+
+        real_report = StageReport(
+            stage=StageId.memory_consolidator,
+            started_at=datetime.now(UTC),
+            completed_at=datetime.now(UTC),
+            items_flagged=[],
+            stats={},
+            llm_calls=7,
+            tokens_used=4242,
+        )
+
+        async def real_stage1_run(events, watermark, prior_reports, run_id, model=None):
+            # Mirrors MemoryConsolidator.run()'s actual last statement: the
+            # real in-stage write completes, and only then is the report
+            # returned — so current_stage_name has already moved to Stage 2
+            # by the time it raises below.
+            written = await write_stage1_cycle_summary(
+                mock_memory_service, 'test-project', real_report, run_id,
+            )
+            real_report.stats['stage1_cycle_summary_ledger_written'] = 1 if written else 0
+            return real_report
+
+        harness.stages[0].run = real_stage1_run
+        harness.stages[1].run = AsyncMock(side_effect=RuntimeError('stage2 exploded'))
+
+        with pytest.raises(RuntimeError, match='stage2 exploded'):
+            await harness.run_full_cycle('test-project', 'test-trigger')
+
+        recent = await journal.get_recent_runs('test-project', limit=1)
+        assert recent, 'expected the failed run to be persisted by the journal'
+        run_id = recent[0].id
+
+        record = await ledger_store.get_by_identity(
+            'test-project', 'cycle_summary', flag_type='memory_consolidator', run_id=run_id,
+        )
+        assert record is not None, 'the real in-stage ledger row must still exist'
+
+        payload = json.loads(record.payload_json)
+        assert payload['llm_calls'] == 7, (
+            "the real row's llm_calls must survive Stage 2 failing afterward — the "
+            'finally-block backstop must not overwrite it with a degraded synthesis'
+        )
+        assert 'stage1_cycle_summary_degraded_backstop' not in payload['stats'], (
+            'a real ledger row must never be replaced by the harness-synthesized '
+            'degraded one'
         )
 
     @pytest.mark.asyncio
