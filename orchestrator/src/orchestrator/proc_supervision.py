@@ -76,9 +76,25 @@ class EscalationSpec:
     def to_escalation(self, queue: EscalationQueue) -> Escalation:
         """Build the in-process ``Escalation`` record (RP-1/RP-5 filing path).
 
-        Not yet implemented — driven by step-8's RED test (R3 self-kill cell).
+        ``level=2`` plus the sentinel ``agent_role`` default
+        ('orchestrator-deterministic') mirrors
+        ``DeterministicRunner._file_infra_issue_and_block``'s born-at-L2
+        pattern (deterministic_runner.py:587-641) — the id is minted from the
+        queue's durable per-task_id counter (``queue.make_id``), never
+        derived locally.
         """
-        raise NotImplementedError
+        from escalation.models import Escalation
+
+        return Escalation(
+            id=queue.make_id(self.task_id),
+            task_id=self.task_id,
+            agent_role=self.agent_role,
+            severity=self.severity,
+            category=self.category,
+            summary=self.summary[:200],
+            detail=self.detail,
+            level=2,
+        )
 
     def to_submit_argv(self, python_exe: str) -> list[str]:
         """Build the ``python -m escalation submit ...`` argv (RP-4 shell branch).
@@ -97,6 +113,40 @@ class EscalationSpec:
             '--agent-role', self.agent_role,
             '--detail', self.detail,
         ]
+
+
+def _file_inprocess_escalation(spec: EscalationSpec) -> None:
+    """File *spec*'s L2 escalation in-process (RP-1/RP-5 filing path).
+
+    Reused by both the RP-1 fail-closed refuse and the RP-5 verify-fail/
+    restart-fail branches — one filing routine for every in-process escalation
+    ``RestartPlan.execute()`` can produce.
+
+    Includes a dedup guard mirroring
+    ``DeterministicRunner._file_infra_issue_and_block`` (deterministic_runner.py:
+    611-620): if a pending escalation already exists for ``spec.task_id`` +
+    ``spec.agent_role``, filing is skipped so a crash-safe re-dispatch of the
+    same plan does not double-file L2 escalations.
+    """
+    from escalation.queue import EscalationQueue
+
+    queue = EscalationQueue(Path(spec.queue_dir))
+    existing_pending = queue.get_by_task(
+        spec.task_id, status='pending', agent_role=spec.agent_role,
+    )
+    if existing_pending:
+        logger.info(
+            'proc_supervision: task %s already has %d pending escalation(s) — '
+            'skipping re-file (dedup guard)',
+            spec.task_id, len(existing_pending),
+        )
+        return
+    esc = spec.to_escalation(queue)
+    queue.submit(esc)
+    logger.info(
+        'proc_supervision: filed L2 %s escalation %s for task %s',
+        spec.category, esc.id, spec.task_id,
+    )
 
 
 @dataclass(frozen=True)
@@ -177,8 +227,8 @@ class RestartPlan:
         Decision tree (own=own_unit or ''; wants_blocking=verify is not None;
         self_target=bool(own) and target_unit==own):
 
-        1. wants_blocking and not own -> RP-1 fail-closed REFUSE (step-7/8; not
-           yet implemented here).
+        1. wants_blocking and not own -> RP-1 fail-closed REFUSE (implemented
+           below, step-8).
         2. wants_blocking and not self_target -> RP-2 cross-unit BLOCKING +
            RP-5 verify (step-9/10/11/12; not yet implemented here).
         3. transient_unit set -> DETACHED systemd-run (RP-3/RP-4; implemented
@@ -194,8 +244,34 @@ class RestartPlan:
         self_target = bool(own) and self.target_unit == own
 
         if wants_blocking and not own:
-            # RP-1 fail-closed refuse — implemented in step-8.
-            raise NotImplementedError
+            # RP-1 fail-closed refuse (the 2064 self-kill guard): a blocking
+            # restart's safety proof requires a KNOWN own_unit to show
+            # target_unit != own_unit. own_unit unknown -> cannot prove ->
+            # refuse BEFORE touching runner/inspector — no blocking subprocess
+            # is ever spawned in this branch.
+            detail = (
+                f'Refusing blocking restart of target_unit={self.target_unit!r}: '
+                f'own_unit is unknown ({self.own_unit!r}), so this process cannot '
+                f'prove target_unit != own_unit before running a synchronous '
+                f'restart that could SIGKILL itself (the 2064 self-kill bug). '
+                f'No restart subprocess was spawned.'
+            )
+            escalated = False
+            if self.on_failure_escalation is not None:
+                _file_inprocess_escalation(self.on_failure_escalation)
+                escalated = True
+            else:
+                logger.warning(
+                    'proc_supervision: RP-1 refused a blocking restart of %s '
+                    '(own_unit unknown) but no on_failure_escalation was '
+                    'configured — no L2 escalation filed for this refusal',
+                    self.target_unit,
+                )
+            return RestartOutcome(
+                disposition=RestartDisposition.REFUSED,
+                escalated=escalated,
+                detail=detail,
+            )
 
         if wants_blocking and not self_target:
             # RP-2 cross-unit blocking + RP-5 verify — implemented in step-10/12.
