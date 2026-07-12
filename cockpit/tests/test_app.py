@@ -1264,6 +1264,50 @@ class TestWeightEditor:
         assert received[0].project_weights == {'beta': 42.0}
         assert received[0].category_weights == base.category_weights
 
+    @pytest.mark.timeout(10)
+    async def test_submit_reads_edited_category_input_into_new_priorities(self, tmp_path):
+        """compose()->_submit() for a CATEGORY Input, symmetric with the
+        project-Input coverage above (test_submit_reads_edited_input_into_new_priorities).
+
+        Unlike project_edits (only included when changed from its seeded
+        value), _submit() reads EVERY category Input unconditionally, so
+        this also pins that untouched category values round-trip through
+        str(value)->float(raw) unchanged while the edited one takes the
+        new value.
+        """
+        from textual.widgets import Input
+
+        from cockpit.app import CockpitApp
+        from cockpit.panes.weight_editor import WeightEditorScreen
+        from cockpit.priority import Priorities
+
+        received: list[Priorities] = []
+        base = Priorities.default()
+
+        app = CockpitApp(fleet_root=tmp_path, poll_interval=0.05)
+        async with app.run_test() as pilot:
+            await pilot.pause()
+
+            screen = WeightEditorScreen(base, [], received.append)
+            await app.push_screen(screen)
+            await pilot.pause()
+
+            # base.category_weights == {'security': 2.0, 'bug': 1.0, 'feature': 0.5,
+            # 'chore': 0.2} (dict insertion order) -> compose() assigns id
+            # 'cat-1' to 'bug'.
+            bug_input = screen.query_one('#cat-1', Input)
+            bug_input.value = '9.0'
+            await pilot.pause()
+
+            await pilot.click('#weight-submit')
+            await pilot.pause()
+
+        assert len(received) == 1
+        expected_category_weights = dict(base.category_weights)
+        expected_category_weights['bug'] = 9.0
+        assert received[0].category_weights == expected_category_weights
+        assert received[0].project_weights == {}
+
 
 class TestSpawnBar:
     @pytest.mark.timeout(10)

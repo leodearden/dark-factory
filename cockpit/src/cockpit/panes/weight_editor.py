@@ -102,7 +102,23 @@ class WeightEditorScreen(ModalScreen[None]):
     invariant (PRD §2). compose() and _submit() enumerate the same
     sequences (self._priorities.category_weights / self._project_names) in
     the same order, so the index correspondence is stable within one screen
-    instance. Submitting (the button, or Enter in any Input) reads every
+    instance.
+
+    Category rows are, deliberately, NOT symmetric with project rows: a
+    project row is seeded from known_projects, a union of
+    project_weights' own keys with project names observed on live
+    records/decisions, so an as-yet-unweighted-but-active project still
+    gets an editable row. There is no analogous union for categories today
+    -- SessionRecord/DecisionRecord carry no per-item category field yet
+    (decision_queue.decision_to_scoring_item/session_to_scoring_item
+    hardcode category='' -- see those docstrings), so there is no live
+    "categories observed on records/decisions" set to union against.
+    Category rows are therefore seeded ONLY from priorities.category_weights'
+    own keys: a category scoring purely via defaults.category (no explicit
+    priorities.yaml entry) has no row here and isn't editable from this
+    screen -- add it to priorities.yaml directly to expose it.
+
+    Submitting (the button, or Enter in any Input) reads every
     Input's current value into category_edits/project_edits -- a project
     edit is only included when it differs from that Input's seeded value,
     so accepting the defaults without touching a field never materializes
@@ -149,6 +165,9 @@ class WeightEditorScreen(ModalScreen[None]):
         with Vertical():
             yield Label('Edit priority weights')
             yield Label('Category weights')
+            # Only pre-existing category_weights keys get a row -- there is
+            # no known_projects-style union for categories; see the class
+            # docstring's "NOT symmetric with project rows" note.
             for index, (name, value) in enumerate(self._priorities.category_weights.items()):
                 yield Input(value=str(value), placeholder=name, id=f'cat-{index}')
             yield Label('Project weights')
