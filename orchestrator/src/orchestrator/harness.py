@@ -5662,7 +5662,21 @@ Output JSON matching the schema. Every task must appear in the output.
                 completed_at=datetime.now(UTC).isoformat(),
                 block_reason=terminal_report.reason,
                 block_detail=terminal_report.detail,
-                block_phase=terminal_report.phase.value,
+                # REVIEW-CYCLE-1 fix: block_phase comes from blocked_from_phase
+                # (the PRE-block WORKING phase), NOT terminal_report.phase (the
+                # terminal machine.state — BLOCKED for a _mark_blocked exit).
+                # _maybe_auto_eval gates its optimistic-path redo on block_phase
+                # in config.auto_eval_phases = {plan,execute,verify,review};
+                # 'blocked' is never a member of that set, so mapping from the
+                # terminal phase would silently and permanently disable the
+                # Lever B/C auto-eval recovery. blocked_from_phase defaults to
+                # None on clean/non-block exits, mapped to '' here — matching
+                # the pre-2247 _last_block_phase default.
+                block_phase=(
+                    terminal_report.blocked_from_phase.value
+                    if terminal_report.blocked_from_phase is not None
+                    else ''
+                ),
             )
 
             if self.event_store:
