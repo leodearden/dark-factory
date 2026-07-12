@@ -6,6 +6,7 @@ import pytest
 
 from orchestrator.artifacts import TaskArtifacts
 from orchestrator.mcp.verdict_tools import (
+    _submit_completion_verdict,
     _submit_review_verdict,
 )
 
@@ -47,4 +48,29 @@ class TestSubmitReviewVerdict:
             'verdict': 'PASS',
             'issues': [],
             'summary': 'ok',
+        }
+
+
+class TestSubmitCompletionVerdict:
+    def test_writes_envelope_and_returns_ok(self, artifacts):
+        result = _submit_completion_verdict(
+            artifacts,
+            role='judge',
+            session_id='s',
+            complete=True,
+            reasoning='done',
+            uncovered_plan_steps=[],
+            substantive_work=True,
+        )
+        assert result == {'status': 'ok', 'role': 'judge'}
+
+        envelope = artifacts.read_verdict('judge')
+        assert envelope is not None
+        assert envelope['role'] == 'judge'
+        assert envelope['schema_version'] == 1
+        assert envelope['verdict'] == {
+            'complete': True,
+            'reasoning': 'done',
+            'uncovered_plan_steps': [],
+            'substantive_work': True,
         }
