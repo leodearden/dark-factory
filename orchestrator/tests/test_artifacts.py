@@ -543,6 +543,23 @@ class TestVerdicts:
         (artifacts.root / 'verdicts' / 'judge.json').write_text('{not valid json')
         assert artifacts.read_verdict('judge') is None
 
+    def test_clear_removes_file(self, artifacts: TaskArtifacts):
+        envelope = {
+            'role': 'judge',
+            'schema_version': 1,
+            'session_id': 's',
+            'emitted_at': 't',
+            'verdict': {'complete': True},
+        }
+        artifacts.write_verdict('judge', envelope)
+        artifacts.clear_verdict('judge')
+        assert not (artifacts.root / 'verdicts' / 'judge.json').exists()
+        assert artifacts.read_verdict('judge') is None
+
+    def test_clear_is_idempotent(self, artifacts: TaskArtifacts):
+        artifacts.clear_verdict('judge')  # must not raise
+        artifacts.clear_verdict('judge')  # still idempotent
+
 
 class TestReviews:
     def test_write_and_read_reviews(self, artifacts: TaskArtifacts):
