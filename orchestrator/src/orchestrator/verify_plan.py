@@ -225,6 +225,15 @@ def _derive_module_runs(
         for f in scoped
     }
 
+    # Drift note (task γ review, architecture finding): this trigger scan is
+    # mirrored BY HAND in verify.scope_module_config's
+    # has_structural/has_conftest/has_test_data loop, which consumes the same
+    # classify_file-derived predicates but does not read these triggers back
+    # — the two are independently maintained decision trees kept in sync only
+    # by convention. A new narrowing rule added to one must be mirrored in
+    # the other, or the VerifyResult.plan this function feeds can diverge
+    # from what scope_module_config actually scoped — see
+    # derive_verify_plan's "Fidelity" docstring paragraph.
     conftest_trigger = next((f for f, k in kinds.items() if k is FileKind.CONFTEST), None)
     test_data_trigger = next((f for f, k in kinds.items() if k is FileKind.TEST_DATA), None)
     structural_trigger = next((f for f, k in kinds.items() if k is FileKind.STRUCTURAL), None)

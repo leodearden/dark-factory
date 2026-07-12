@@ -1487,6 +1487,17 @@ def scope_module_config(
     # Guard: skip the I/O loop entirely when there is no type-check command to
     # widen — has_structural can only affect type_cmd, so reading files is
     # wasted work when mc.type_check_command is None/empty.
+    # Drift note (task γ review, architecture finding): this
+    # has_structural/has_conftest/has_test_data scan is a SEPARATE decision
+    # tree from verify_plan._derive_module_runs's equivalent
+    # structural_trigger/conftest_trigger/test_data_trigger scan — both
+    # consume the same classify_file-derived predicates (so today's outcomes
+    # agree), but neither reads the other's result back. A new narrowing rule
+    # added HERE must be mirrored in _derive_module_runs (and vice versa), or
+    # the VerifyResult.plan attached by run_scoped_verification will silently
+    # misrepresent what this function actually scoped — see
+    # derive_verify_plan's "Fidelity" docstring paragraph for the accepted
+    # trade-off and the run_scoped_verification call site's matching comment.
     has_structural = False
     structural_trigger: str | None = None
     if worktree is not None and mc.type_check_command:
