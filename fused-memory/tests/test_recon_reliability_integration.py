@@ -777,3 +777,53 @@ class TestInterceptorReconWritePolicy:
         return await interceptor.update_task(
             self._TASK_ID, '/project', metadata={'snapshot_status': 'pending'}, agent_id=AGENT_ID,
         )
+
+
+# ---------------------------------------------------------------------------
+# P4 — Dedup-exempt add_system_record permission + fresh-point routing [δ=2222]
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestDedupExemptPermission:
+    """P4 (δ=2222): a non-recon agent_id is rejected at the MCP tool
+    boundary before the underlying service is ever touched; a recon-stage
+    agent_id is permitted and EVERY call is routed through the fresh-uuid
+    ``mem0.add_system_record`` path (never the dedup ``mem0.add`` path) —
+    so a fresh point lands on every call, not just the first.
+
+    Driving harness (``_drive_reject_via_mcp_tool`` /
+    ``_drive_fresh_point_routing``) lands in step-10 — this step only
+    declares the §9 postconditions, so it is RED until then (the harness
+    methods referenced below don't exist yet).
+    """
+
+    _CONTENT = 'Stage 2 cycle summary for run r1'
+    _PROJECT_ID = 'proj-p4-dedup-exempt'
+    _CATEGORY = 'observations_and_summaries'
+
+    async def test_non_recon_agent_rejected_before_service_touched(self) -> None:
+        """A non-recon-stage caller gets the exact DedupExemptNotPermitted
+        dict, and the gate fires before the underlying service method is
+        ever called."""
+        mock_service, result = await self._drive_reject_via_mcp_tool()
+
+        assert result == {
+            'error': 'dedup_exempt_write_not_permitted',
+            'error_type': 'DedupExemptNotPermitted',
+            'agent_id': 'claude-interactive',
+        }, f'Expected the exact DedupExemptNotPermitted dict, got {result!r}'
+        mock_service.add_system_record.assert_not_called()
+
+    async def test_recon_stage_agent_permitted_fresh_point_every_call(self, mock_config) -> None:
+        """A recon-stage agent_id is permitted, and calling
+        add_system_record twice routes through mem0.add_system_record
+        BOTH times — never the dedup mem0.add path — proving a fresh
+        point lands on every call, not just the first."""
+        service = await self._drive_fresh_point_routing(mock_config)
+
+        assert service.mem0.add_system_record.await_count == 2, (
+            'Expected mem0.add_system_record to be awaited once per call '
+            '(fresh point every call, no caching/memoization across calls)'
+        )
+        service.mem0.add.assert_not_called()
