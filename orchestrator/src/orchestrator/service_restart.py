@@ -548,17 +548,29 @@ class StaleServiceRestartCoordinator:
     async def _default_restart_executor(self) -> None:
         """Fire-and-forget: spawn the restart script detached.
 
-        Positional args after the script path are taken from ``self._script_args``
-        (e.g. ``['--drain']`` for fused-memory, ``[]`` for the dashboard).
+        Thin ``proc_supervision.RestartPlan`` caller (M1, task 2237) —
+        fused-memory/dashboard LEAF restart. Positional args after the
+        script path are taken from ``self._script_args`` (e.g. ``['--drain']``
+        for fused-memory, ``[]`` for the dashboard). ``target_unit``/
+        ``own_unit`` are both ``''`` (unused for this shape: ``verify=None``
+        and ``transient_unit=None`` route ``RestartPlan.execute()`` straight
+        to the leaf plain-spawn path, which never consults them).
         """
-        script = self._project_root / self._script_path
-        await asyncio.create_subprocess_exec(
-            str(script),
-            *self._script_args,
-            start_new_session=True,
+        plan = RestartPlan(
+            script=self._project_root / self._script_path,
+            args=list(self._script_args),
+            cwd=self._project_root,
+            target_unit='',
+            own_unit='',
+            on_failure_escalation=None,
+            verify=None,
+            transient_unit=None,
         )
+        await plan.execute()
         # Intentionally NOT awaiting the process exit — the script runs
         # detached so its health-poll never blocks the orchestrator event loop.
+        # (RestartPlan.execute()'s leaf plain-spawn path does not await it
+        # either — see proc_supervision._execute_detached_leaf_plain_spawn.)
 
     # ------------------------------------------------------------------
     # Min-interval rate-cap persistence (restart-safe)
