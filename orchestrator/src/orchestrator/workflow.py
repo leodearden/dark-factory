@@ -8636,99 +8636,12 @@ Update the plan to address the blocking issues. You may add new steps to the `st
                                   'severity': 'blocking', 'summary': reason[:200]},
                         )
 
-            # Capture window-start for the broadened dismiss-with-terminate
-            # guard below.  Any L0 whose resolved_at falls inside this window
-            # is attributable to the current steward invocation — including
-            # follow-on L0s the steward chains and dismisses itself, not just
-            # the L0 the workflow itself just submitted (the original narrow
-            # Fix A guard tracked only that one).
-            steward_window_start = datetime.now(UTC).isoformat()
-
             # Give the steward a chance to resolve the escalation
             await self._ensure_steward_started()
             if self._steward:
-                await self._await_steward_completion()
+                outcome = await self._await_steward_completion()
 
-                # Single fresh read of the store — replaces the old cached
-                # scheduler snapshots. Server-side terminal guard rejects
-                # done→pending, but we still need the correct workflow
-                # outcome.
-                current = await self.scheduler.get_status(self.task_id)
-                if current in TERMINAL_STATUSES:
-                    logger.info(
-                        'Task %s: status is %s after steward — not re-queueing',
-                        self.task_id, current,
-                    )
-                    if current == 'done':
-                        self._enter_phase(WorkflowState.DONE)
-                        return _record(WorkflowOutcome.DONE)
-                    # 'cancelled' is an intentional terminal — no L1 needed.
-                    return _record(WorkflowOutcome.BLOCKED)
-
-                # If steward resolved all level-0 escalations, set task back
-                # to pending so the scheduler re-picks it on the next cycle.
-                remaining = self.escalation_queue.get_by_task(
-                    self.task_id, status='pending', level=0,
-                )
-                if not remaining:
-                    # Guard: if the steward escalated to L1 (auto-watcher consumer),
-                    # leave the task's status untouched and exit.  L0-empty
-                    # alone does not mean "all clear" — an open L1 signals
-                    # that the steward handed off.
-                    if self.escalation_queue.has_open_l1(self.task_id):
-                        logger.info(
-                            'Task %s: L1 escalation open — steward handed '
-                            'off to human; leaving status as-is and exiting',
-                            self.task_id,
-                        )
-                        return _record(WorkflowOutcome.ESCALATED)
-
-                    # Preserve steward-set deferred. Terminal statuses (done,
-                    # cancelled) were caught earlier via ``current``; blocked
-                    # intentionally falls through to requeue because the
-                    # orchestrator's own _mark_blocked wrote it and the steward
-                    # leaving it alone is indistinguishable from re-asserting
-                    # it. 'deferred' is the one case the steward chooses
-                    # explicitly that we must not overwrite.
-                    if current == 'deferred':
-                        logger.info(
-                            'Task %s: steward set status to deferred — '
-                            'preserving, skipping auto-requeue',
-                            self.task_id,
-                        )
-                        return _record(WorkflowOutcome.BLOCKED)
-
-                    # Fix A (broadened): detect dismiss-with-terminate for
-                    # ANY L0 on this task whose resolved_at falls inside the
-                    # current steward invocation window — not just the L0
-                    # the workflow itself just submitted (the original narrow
-                    # Fix A guard tracked only that one).
-                    #
-                    # The steward may chain a follow-on L0 (e.g. an
-                    # ``infra_issue`` raised while resolving the original
-                    # ``task_failure``) and dismiss-with-terminate THAT one.
-                    # That is still "agent gives up", so halt and submit an
-                    # L1 instead of re-pending the task.
-                    dismissed_l0s = self.escalation_queue.get_by_task(
-                        self.task_id, status='dismissed', level=0,
-                    )
-                    recent_dismissals = [
-                        e for e in dismissed_l0s
-                        if e.resolved_at is not None
-                        and e.resolved_at >= steward_window_start
-                    ]
-                    if recent_dismissals:
-                        logger.warning(
-                            'Task %s: steward dismissed %d L0(s) during this '
-                            'invocation (ids=%s) — halting, escalating to L1',
-                            self.task_id, len(recent_dismissals),
-                            [e.id for e in recent_dismissals],
-                        )
-                        await self._ensure_l1_escalation_for_blocked(
-                            reason, detail or reason,
-                        )
-                        return _record(WorkflowOutcome.BLOCKED)
-
+                async def _requeue() -> WorkflowOutcome:
                     if self.event_store:
                         self.event_store.emit(
                             EventType.escalation_resolved,
@@ -8747,6 +8660,78 @@ Update the plan to address the blocking issues. You may add new steps to the `st
                             f'escalation, caller will retry merge in-place'
                         )
                     return _record(WorkflowOutcome.REQUEUED)
+
+                # Single isinstance dispatch on the typed outcome (task 2248 /
+                # W9-delta, SO-1) — replaces the forensic re-read of scheduler
+                # status + escalation-queue state (current-status / L0-empty /
+                # has_open_l1 / deferred / timestamp-window dismissal probes)
+                # that used to live here.
+                if isinstance(outcome, StewardResolved):
+                    return await _requeue()
+
+                if isinstance(outcome, StewardTerminalDecision):
+                    if outcome.new_status == TaskStatus.DONE:
+                        self._enter_phase(WorkflowState.DONE)
+                        return _record(WorkflowOutcome.DONE)
+                    # 'cancelled'/'deferred' are steward-driven terminal or
+                    # preserved decisions — no L1 needed, do not requeue.
+                    logger.info(
+                        'Task %s: steward-driven status is %s — preserving, '
+                        'not re-queueing', self.task_id, outcome.new_status.value,
+                    )
+                    return _record(WorkflowOutcome.BLOCKED)
+
+                if isinstance(outcome, StewardReescalatedL1):
+                    # The steward's _auto_escalate_to_human already filed the
+                    # L1 and dismissed its L0 before publishing this outcome —
+                    # nothing left for _mark_blocked to do.
+                    logger.info(
+                        'Task %s: L1 escalation open — steward handed '
+                        'off to human; leaving status as-is and exiting',
+                        self.task_id,
+                    )
+                    return _record(WorkflowOutcome.ESCALATED)
+
+                if isinstance(outcome, StewardInterrupted):
+                    if outcome.wip_commits_present:
+                        # Task-2060 fix: a steward interruption (attempt-cap
+                        # or timeout) with real work already committed must
+                        # resume the plan, not be triaged as "steward
+                        # failed".  Dismiss the still-pending L0 — its only
+                        # consumer (the steward) is done — and re-pend.
+                        if self.escalation_queue:
+                            orphan_l0 = self.escalation_queue.get_by_task(
+                                self.task_id, status='pending', level=0,
+                            )
+                            for esc in orphan_l0:
+                                self.escalation_queue.resolve(
+                                    esc.id,
+                                    'Auto-dismissed: steward interrupted '
+                                    f'({outcome.reason}) with WIP present — '
+                                    'resuming plan, not escalating (task '
+                                    '2060 fix)',
+                                    dismiss=True, resolved_by='auto-dismissed',
+                                )
+                            if orphan_l0:
+                                logger.info(
+                                    'Task %s: dismissed %d pending L0(s) — '
+                                    'steward interrupted (%s) with WIP '
+                                    'present, resuming plan',
+                                    self.task_id, len(orphan_l0), outcome.reason,
+                                )
+                        return await _requeue()
+
+                    await self._ensure_l1_escalation_for_blocked(
+                        reason, detail or reason, category=category,
+                    )
+                    return _record(WorkflowOutcome.BLOCKED)
+
+                # StewardBudgetExhausted: the steward cannot make further
+                # progress at all, wip or not — always L1.
+                await self._ensure_l1_escalation_for_blocked(
+                    reason, detail or reason, category=category,
+                )
+                return _record(WorkflowOutcome.BLOCKED)
 
         # Fall-through BLOCKED: either no escalation queue, or the steward
         # never resolved the L0.  Either way a human should know — submit
