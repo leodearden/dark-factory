@@ -64,3 +64,22 @@ def _submit_review_verdict(
     }
     artifacts.write_verdict(role, _envelope(role, session_id, payload))
     return {'status': 'ok', 'role': role}
+
+
+def _submit_completion_verdict(
+    artifacts: TaskArtifacts,
+    role: str,
+    session_id: str,
+    complete: bool,
+    reasoning: str,
+    uncovered_plan_steps: list[str],
+    substantive_work: bool,
+) -> dict[str, Any]:
+    payload = {
+        'complete': complete,
+        'reasoning': reasoning,
+        'uncovered_plan_steps': uncovered_plan_steps,
+        'substantive_work': substantive_work,
+    }
+    artifacts.write_verdict(role, _envelope(role, session_id, payload))
+    return {'status': 'ok', 'role': role}
