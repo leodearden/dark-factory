@@ -296,15 +296,15 @@ class TestLedgerUpsertAndGcInterleave:
     serializes every write on its single connection, so asyncio.gather()
     only varies which coroutine's await points are scheduled first, not
     whether writes can actually interleave at the storage layer. The
-    invariants below (exactly one surviving row for the racing identity,
-    the terminal marker deleted, the live marker kept) therefore hold by
-    construction for any scheduling order — this class guards those
-    invariants across the async interleave, it does not detect a race
-    condition.
+    invariants below (exactly one surviving row for the interleaved
+    identity, the terminal marker deleted, the live marker kept)
+    therefore hold by construction for any scheduling order — this class
+    guards those invariants across the async interleave, it does not
+    detect a race condition.
     """
 
     _PROJECT_L2 = 'proj-l2-upsert-idempotency'
-    _PROJECT_L1 = 'proj-l1-writer-gc-race'
+    _PROJECT_L1 = 'proj-l1-upsert-gc-interleave'
 
     async def test_l2_repeated_upsert_same_identity_leaves_one_row_last_write_wins(
         self, ledger,
@@ -334,22 +334,23 @@ class TestLedgerUpsertAndGcInterleave:
         self, ledger,
     ) -> None:
         """L1: same-identity UPSERTs and a gc() pass, run concurrently via
-        asyncio.gather(), leave exactly one row for the racing identity,
-        last-writer-wins on payload, AND a co-resident still-active,
-        non-expired, non-terminal marker is NEVER deleted by the
-        interleaved GC — invariants that hold under any scheduling order
-        (see class docstring; aiosqlite serializes the actual writes)."""
-        candidates, terminal_task_id, live_task_id = await self._drive_l1_concurrent_race(ledger)
+        asyncio.gather(), leave exactly one row for the interleaved
+        identity, last-writer-wins on payload, AND a co-resident
+        still-active, non-expired, non-terminal marker is NEVER deleted by
+        the interleaved GC — invariants that hold under any scheduling
+        order (see class docstring; aiosqlite serializes the actual
+        writes)."""
+        candidates, terminal_task_id, live_task_id = await self._drive_l1_concurrent_interleave(ledger)
 
-        fetched_race = await ledger.get_by_identity(
+        fetched_interleaved = await ledger.get_by_identity(
             self._PROJECT_L1, 'stage1_flag_marker',
-            task_id='T-race', flag_type='flag_race', run_id='',
+            task_id='T-interleave', flag_type='flag_interleave', run_id='',
         )
-        assert fetched_race is not None, 'Expected the racing identity to survive the interleave'
+        assert fetched_interleaved is not None, 'Expected the interleaved identity to survive the interleave'
         candidate_payloads = {c.payload_json for c in candidates}
-        assert fetched_race.payload_json in candidate_payloads, (
+        assert fetched_interleaved.payload_json in candidate_payloads, (
             f'Expected the surviving row to match one of the concurrent '
-            f'writers {candidate_payloads!r}, got {fetched_race.payload_json!r}'
+            f'writers {candidate_payloads!r}, got {fetched_interleaved.payload_json!r}'
         )
 
         terminal_marker = await ledger.get_by_identity(
@@ -371,11 +372,11 @@ class TestLedgerUpsertAndGcInterleave:
             'must NEVER be deleted by an interleaved GC pass'
         )
 
-        # Total surviving rows for the project: racing identity + live
+        # Total surviving rows for the project: interleaved identity + live
         # marker (terminal marker was collected by the interleaved gc()).
         count = await _count_ledger_rows(ledger, self._PROJECT_L1)
         assert count == 2, (
-            f'Expected exactly 2 surviving rows (race + live) after the '
+            f'Expected exactly 2 surviving rows (interleaved + live) after the '
             f'interleaved gc() collected the terminal marker, got {count}'
         )
 
@@ -386,7 +387,7 @@ class TestLedgerUpsertAndGcInterleave:
         payload_json/state each call; return the LAST record written.
 
         Sequential (not concurrent) — ordering is deterministic, so the
-        "last write" is unambiguous, unlike the L1 race below.
+        "last write" is unambiguous, unlike the L1 interleave below.
         """
         created_at = '2026-07-01T00:00:00+00:00'
         expires_at = '2099-01-01T00:00:00+00:00'
@@ -407,16 +408,17 @@ class TestLedgerUpsertAndGcInterleave:
         assert last_record is not None
         return last_record
 
-    async def _drive_l1_concurrent_race(
+    async def _drive_l1_concurrent_interleave(
         self, ledger: ReconLedgerStore,
     ) -> tuple[list[ReconLedgerRecord], str, str]:
         """Seed a terminal marker + a live marker, then UPSERT two versions
-        of a THIRD (racing) identity while a gc() pass (given the terminal
-        marker's task_id explicitly via ``terminal_task_ids`` — resolving
-        which task_ids are terminal is L4's concern, not this store-level
-        check) runs interleaved via asyncio.gather().
+        of a THIRD (concurrently-upserted) identity while a gc() pass
+        (given the terminal marker's task_id explicitly via
+        ``terminal_task_ids`` — resolving which task_ids are terminal is
+        L4's concern, not this store-level check) runs interleaved via
+        asyncio.gather().
 
-        Returns ([race_v1, race_v2], terminal_task_id, live_task_id).
+        Returns ([interleave_v1, interleave_v2], terminal_task_id, live_task_id).
         """
         seeded_at = '2026-07-01T00:00:00+00:00'
         far_future = '2099-01-01T00:00:00+00:00'  # never TTL-expires in this test
@@ -444,45 +446,46 @@ class TestLedgerUpsertAndGcInterleave:
             run_id='',
             expires_at=far_future,
         )
-        # Seed BEFORE the race so the interleaved gc() has real rows to
-        # evaluate — these two are not part of the concurrent gather().
+        # Seed BEFORE the interleave so the interleaved gc() has real rows
+        # to evaluate — these two are not part of the concurrent gather().
         await ledger.upsert(terminal_marker)
         await ledger.upsert(live_marker)
 
-        race_v1 = ReconLedgerRecord(
+        interleave_v1 = ReconLedgerRecord(
             project_id=self._PROJECT_L1,
             record_kind='stage1_flag_marker',
             payload_json=json.dumps({'writer': 1}),
             state='active',
             created_at=seeded_at,
-            task_id='T-race',
-            flag_type='flag_race',
+            task_id='T-interleave',
+            flag_type='flag_interleave',
             run_id='',
             expires_at=far_future,
         )
-        race_v2 = ReconLedgerRecord(
+        interleave_v2 = ReconLedgerRecord(
             project_id=self._PROJECT_L1,
             record_kind='stage1_flag_marker',
             payload_json=json.dumps({'writer': 2}),
             state='active',
             created_at=seeded_at,
-            task_id='T-race',
-            flag_type='flag_race',
+            task_id='T-interleave',
+            flag_type='flag_interleave',
             run_id='',
             expires_at=far_future,
         )
 
-        # The two racing UPSERTs interleave with a gc() pass referencing
-        # the terminal marker's task_id — a single aiosqlite connection
-        # serializes the actual writes, so exactly one racing row and a
-        # real terminal-delete both land regardless of scheduling order.
+        # The two concurrently-issued UPSERTs interleave with a gc() pass
+        # referencing the terminal marker's task_id — a single aiosqlite
+        # connection serializes the actual writes, so exactly one
+        # surviving row and a real terminal-delete both land regardless of
+        # scheduling order.
         await asyncio.gather(
-            ledger.upsert(race_v1),
-            ledger.upsert(race_v2),
+            ledger.upsert(interleave_v1),
+            ledger.upsert(interleave_v2),
             ledger.gc(self._PROJECT_L1, now_iso, terminal_task_ids=['T-done']),
         )
 
-        return [race_v1, race_v2], 'T-done', 'T-live'
+        return [interleave_v1, interleave_v2], 'T-done', 'T-live'
 
 
 # ---------------------------------------------------------------------------
