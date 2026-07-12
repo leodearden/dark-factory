@@ -32,6 +32,7 @@ from orchestrator.merge_queue import (
     DecidedItem,
     InflightEntry,
     InflightVerifyResult,
+    ItemLifecycleState,
     MergeOutcome,
     MergeRequest,
     SpeculativeMergeWorker,
@@ -170,8 +171,12 @@ class TestSnapshotFinalizingHeadEntries:
         laptop_entry = _make_entry(req_laptop, laptop_lease)
 
         # The finalize window: local_head has been popped, laptop is still in _inflight.
+        # local_head is registered (VERIFYING, mirroring the registry state a real
+        # entry holds pre-await -- mq:10431-10443) in _live_items but deliberately
+        # NOT appended to _inflight, so the derived _finalizing_head_entry() finds
+        # it as the sole _live_items InflightEntry absent from the deque.
         worker._inflight.append(laptop_entry)
-        worker._finalizing_head = local_head  # type: ignore[attr-defined]
+        worker._register_item(local_head, initial=ItemLifecycleState.VERIFYING)
 
         snap = worker.snapshot()
 
@@ -264,7 +269,7 @@ class TestSnapshotFinalizingHeadOccupancy:
         laptop_entry = _make_entry(req_laptop, laptop_lease)
 
         worker._inflight.append(laptop_entry)
-        worker._finalizing_head = local_head  # type: ignore[attr-defined]
+        worker._register_item(local_head, initial=ItemLifecycleState.VERIFYING)
 
         snap = worker.snapshot()
         occ = snap['occupancy']
@@ -350,7 +355,7 @@ class TestSnapshotFinalizingHeadVerifyInProgress:
         laptop_entry = _make_entry(req_laptop, laptop_lease)
 
         worker._inflight.append(laptop_entry)
-        worker._finalizing_head = local_head  # type: ignore[attr-defined]
+        worker._register_item(local_head, initial=ItemLifecycleState.VERIFYING)
 
         snap = worker.snapshot()
 

@@ -1765,12 +1765,13 @@ class TestRegistrySnapshotAgreementAtSamplingPoints:
     boundary asymmetry (an undrained raw-``_queue`` item would legitimately
     show up in snapshot() before it is registered).
 
-    The DISPATCHING window is the one EXCEPTION: ``_dispatching_item`` is
+    The DISPATCHING window WAS the one exception: ``_dispatching_item`` was
     documented as census-only, deliberately absent from
-    ``snapshot()['entries']`` (task 2068) — a pre-existing gap outside
-    kappa step-11/12's scope, closed as a side effect of steps 13-14
-    repointing snapshot() onto the registry. That sample asserts the
-    (weaker, currently-true) superset relationship instead of equality.
+    ``snapshot()['entries']`` (task 2068) — a pre-existing gap outside kappa
+    step-11/12's scope. Task 2435 (kappa-b) closes it by repointing
+    snapshot()'s registry-sourced entry loop to surface DISPATCHING, so the
+    DISPATCHING sample below now asserts equality too, exactly like every
+    other sampling point in this class.
     """
 
     async def test_agreement_at_merging_window(
@@ -1822,20 +1823,16 @@ class TestRegistrySnapshotAgreementAtSamplingPoints:
         await worker.stop()
         await worker_task
 
-    async def test_dispatching_window_registry_is_a_strict_superset_of_snapshot(
+    async def test_dispatching_window_registry_equals_snapshot(
         self, git_ops: GitOps, config: OrchestratorConfig,
     ) -> None:
-        """The DISPATCHING window is a KNOWN, pre-existing exception to the
-        equal-sets rule proven by the other sampling points: ``_dispatching_item``
-        is census-only and deliberately NOT surfaced in ``snapshot()['entries']``
-        (task 2068), so a plain equality assertion here would fail for a
-        reason kappa's step-11/12 does not (and is not scoped to) fix — that
-        gap closes as a side effect of steps 13-14 repointing snapshot()
-        onto the registry directly. Until then, the registry must still see
-        the item (it is the STRICTLY MORE COMPLETE source) while snapshot()
-        stays blind to it — proven here as an explicit regression guard
-        instead of silently relying on an equality assertion that cannot
-        hold yet.
+        """The DISPATCHING window now agrees exactly between the registry and
+        snapshot() (task 2435 kappa-b): snapshot()'s registry-sourced entry
+        loop now surfaces DISPATCHING directly, closing the task-2068 census
+        gap that used to make this sampling point a strict-superset
+        exception. Mirrors the equality idiom already used by
+        ``test_agreement_at_merging_window``/``test_agreement_at_finalizing_window``
+        above.
         """
         from orchestrator.merge_queue import ItemLifecycleState, SpeculativeMergeWorker
 
@@ -1876,16 +1873,11 @@ class TestRegistrySnapshotAgreementAtSamplingPoints:
 
         assert fired, 'expected the get_main_sha gate to fire while DISPATCHING'
         snap_ids, registry_ids = captured[0]
-        assert req.request_id in registry_ids, (
-            'the registry must see the item while DISPATCHING even though '
-            'snapshot() (task 2068) does not'
+        assert req.request_id in registry_ids
+        assert snap_ids == registry_ids, (
+            f'registry/snapshot disagree at DISPATCHING sample: '
+            f'snapshot only={snap_ids - registry_ids}, registry only={registry_ids - snap_ids}'
         )
-        assert req.request_id not in snap_ids, (
-            'snapshot() unexpectedly surfaced a DISPATCHING entry — if task '
-            '2068 was fixed independently, tighten this to an equality '
-            'assertion like the MERGING/FINALIZING sampling points'
-        )
-        assert registry_ids - snap_ids == {req.request_id}
 
         await worker.stop()
         await worker_task
