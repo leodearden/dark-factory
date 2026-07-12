@@ -70,6 +70,26 @@ class TestSubmitReviewVerdict:
 
         assert artifacts.read_verdict('test_analyst') is None
 
+    def test_reviewer_role_mismatch_returns_error_and_writes_nothing(self, artifacts):
+        """A reviewer cannot misname its payload onto a sibling's role —
+        ``reviewer`` must match the authoritative ``--verdict-role``.
+        """
+        result = _submit_review_verdict(
+            artifacts,
+            role='test_analyst',
+            session_id='s',
+            reviewer='security',
+            verdict='PASS',
+            issues=[],
+            summary='x',
+        )
+        assert result['status'] == 'error'
+        assert 'test_analyst' in result['message']
+        assert 'security' in result['message']
+
+        assert artifacts.read_verdict('test_analyst') is None
+        assert artifacts.read_verdict('security') is None
+
 
 class TestSubmitCompletionVerdict:
     def test_writes_envelope_and_returns_ok(self, artifacts):

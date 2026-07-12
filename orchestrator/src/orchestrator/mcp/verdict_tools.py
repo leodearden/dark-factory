@@ -6,7 +6,10 @@ verdict via the single tool registered for its ``--verdict-role``. The tool
 writes a schema-versioned envelope to ``verdicts/<role>.json`` under the
 task's ``TaskArtifacts`` root — the role-derived filename is authoritative
 (never an agent-supplied field), so a reviewer cannot misname its artifact
-onto a sibling's path.
+onto a sibling's path. For reviewer verdicts, the ``reviewer`` payload field
+is also validated to match ``--verdict-role``: a mismatch is rejected
+(``status: error``) rather than written, so the payload can never disagree
+with the filename it lands in either.
 
 Usage (stdio transport, spawned by orchestrator):
     <sys.executable> -m orchestrator.mcp.verdict_tools --worktree /path/to/worktree \
@@ -49,6 +52,14 @@ def _envelope(role: str, session_id: str, payload: dict) -> dict:
 
 # ---------------------------------------------------------------------------
 # Standalone implementation functions (testable without MCP transport)
+#
+# Only _submit_review_verdict has constrained/validated fields (the
+# reviewer==role identity check and the verdict enum below) — the other
+# three payloads (completion/triage/merge) have no enum-like fields today,
+# so they write whatever they receive. Booleans and lists are still
+# type-checked at the pydantic MCP tool boundary in create_server(). Add
+# parallel validation here if any of those payloads gain a constrained
+# field in the future.
 # ---------------------------------------------------------------------------
 
 
@@ -61,6 +72,15 @@ def _submit_review_verdict(
     issues: list[dict],
     summary: str,
 ) -> dict[str, Any]:
+    if reviewer != role:
+        return {
+            'status': 'error',
+            'message': (
+                f'reviewer {reviewer!r} must match --verdict-role {role!r} — '
+                'the artifact filename is authoritative for this role; a '
+                'mismatched payload is rejected rather than written'
+            ),
+        }
     if verdict not in {'PASS', 'ISSUES_FOUND'}:
         return {
             'status': 'error',
@@ -212,7 +232,9 @@ def create_server(artifacts: TaskArtifacts, role: str, session_id: str = '') -> 
             """Submit a reviewer's verdict for this task.
 
             Args:
-                reviewer: The reviewer's name (matches --verdict-role).
+                reviewer: The reviewer's name. Must equal --verdict-role;
+                    a mismatch is rejected (status: error) rather than
+                    written.
                 verdict: One of "PASS" or "ISSUES_FOUND".
                 issues: Structured list of issues found (empty if PASS).
                 summary: One-paragraph summary of the review.
