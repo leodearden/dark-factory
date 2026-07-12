@@ -237,8 +237,8 @@ completion the decompose session will attach as `user_observable_signal`.
   rollback lever). Consumer: T2, T3, T6, T8.
 
 - **T2 — Reviewer prompt CONTRACT/HEURISTICS split + loader wiring
-  (`agents/roles.py`).** *[deps: T1; **dark_factory:2484** (verdict-servers δ —
-  P-3)]* — **Signal:** `_reviewer_role` builds its system prompt via the loader;
+  (`agents/roles.py`).** *[deps: T1; **2484** (verdict-servers δ, bare-integer
+  intra-`dark_factory` dep — P-3)]* — **Signal:** `_reviewer_role` builds its system prompt via the loader;
   the reviewer's **live** output contract (post-2484: the `submit_review_verdict`
   tool instruction + verdict-field schema + blocking-definition) lives in a
   frozen CONTRACT constant and the editable guidance in a HEURISTICS block; a
@@ -346,9 +346,11 @@ task, wire all deps, commit the capability manifest beside this PRD, then flip
 the whole batch `deferred → pending` in one `commit_planning`.
 
 **Intra-batch deps:** T2→T1, T3→T1, T5→T3+T6, T6→T1, T7→T2+T6, T8→T1.
-**Cross-PRD dep (qualified `project_id:task_id` form, §Cross-project in
-CLAUDE.md):** T2→`dark_factory:2484` (verdict-servers δ — the reviewer contract;
-P-3). T7 inherits it via T2. No other cross-PRD dep is a hard blocker
+**Cross-PRD dep:** T2→**2484** (verdict-servers δ — the reviewer contract; P-3).
+2484 is a `dark_factory` task, so this is a **bare-integer** `add_dependency`
+edge (the standard intra-project dependencies table), **not** the qualified
+`project_id:task_id` external form — matching the sibling PRDs' own intra-`dark_factory`
+convention. T7 inherits it via T2. No other cross-PRD dep is a hard blocker
 (adaptive-model-routing is design-compat via the loader's model key, P-4; the
 reciprocal 2476→T4 dep is eval-revival's to wire).
 
