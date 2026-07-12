@@ -101,7 +101,7 @@ class McpClient:
         }
         if self._session_id is not None:
             headers['mcp-session-id'] = self._session_id
-        resp = await self._client.post(f'{self._url}/mcp/', json=payload, headers=headers)
+        resp = await self._client.post(f'{self._url}/mcp', json=payload, headers=headers)
         resp.raise_for_status()
         # Capture the server-assigned session id (returned on `initialize`) so
         # it can be reused on every subsequent request. Must happen before the
