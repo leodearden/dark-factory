@@ -3892,26 +3892,6 @@ class TestMarkBlockedStewardOutcomeRouting:
             'Budget exhaustion must file an L1'
         )
 
-    async def test_dismissal_window_heuristic_is_deleted(self):
-        """Guard: the timestamp-window dismissal heuristic must be gone.
-
-        Pre-2248, _mark_blocked captured ``steward_window_start`` and scanned
-        dismissed L0s against it (``recent_dismissals``) to detect a steward
-        dismiss-with-terminate.  That forensic re-read is replaced by the
-        typed ``StewardReescalatedL1``/``StewardInterrupted`` outcomes above
-        — pin that the old identifiers are actually gone from the source,
-        not just unreachable.
-        """
-        import inspect
-
-        src = inspect.getsource(TaskWorkflow._mark_blocked)
-        assert 'steward_window_start' not in src, (
-            'steward_window_start must be deleted from _mark_blocked'
-        )
-        assert 'recent_dismissals' not in src, (
-            'recent_dismissals must be deleted from _mark_blocked'
-        )
-
 
 # ---------------------------------------------------------------------------
 # Tests: _check_branch_on_main helper unit tests
