@@ -405,6 +405,68 @@ class TestFailClosedSelfKillGuard:
 
 
 # ---------------------------------------------------------------------------
+# amend (task 2237): self_target + wants_blocking degrades observably
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestSameUnitBlockingVerifyFallsThroughObservably:
+    """wants_blocking (verify set) with a KNOWN own_unit provably EQUAL to
+    target_unit (self_target=True) is the one plan shape neither RP-1's
+    refuse branch (only fires when own_unit is unknown) nor RP-2's
+    cross-unit-blocking branch (only fires when self_target is False)
+    claims. It falls through to the DETACHED path instead — never the
+    blocking one, since blocking a same-unit restart is exactly the 2064
+    self-kill risk RP-1 exists to prevent — with ``verify`` intentionally
+    dropped (a fresh-PID check would be meaningless for a fire-and-forget
+    detached restart that hasn't happened yet). This pins the fallthrough
+    behaviourally: the inspector/blocking runner must never be touched, and
+    the detached shape (systemd-run, here) must still be taken."""
+
+    async def test_self_target_with_verify_falls_through_to_systemd_run_scheduled(
+        self, tmp_queue_dir: Path,
+    ) -> None:
+        from orchestrator.proc_supervision import (
+            FreshPidVerify,
+            RestartDisposition,
+            RestartPlan,
+        )
+
+        runner = FakeRunner(returncode=0)
+        inspector = make_fake_inspector(
+            {'MainPID': 99, 'ActiveState': 'active', 'ActiveEnterTimestampMonotonic': 2000}
+        )
+        plan = RestartPlan(
+            script=Path('/proj/scripts/restart-orchestrator.sh'),
+            args=[],
+            cwd=Path('/proj'),
+            target_unit='orch.service',
+            own_unit='orch.service',
+            on_failure_escalation=None,
+            verify=FreshPidVerify(
+                baseline_active_enter_monotonic=1000,
+                baseline_main_pid=42,
+                inspect_timeout_secs=10.0,
+            ),
+            transient_unit='orch-redeploy-restart-5.service',
+            on_active_secs=10,
+        )
+
+        outcome = await plan.execute(runner=runner, inspector=inspector)
+
+        # The blocking cross-unit path was never taken: no verify occurred.
+        assert inspector.calls == []
+        # The detached systemd-run path WAS taken (the fallthrough), not a
+        # direct blocking run of the script.
+        assert len(runner.calls) == 1
+        argv, _kwargs = runner.calls[0]
+        assert argv[0] == 'systemd-run'
+
+        assert outcome.disposition == RestartDisposition.SCHEDULED
+        assert outcome.escalated is False
+
+
+# ---------------------------------------------------------------------------
 # step-9: RED — R4 cross-unit blocking verify-pass cell (RP-2/5)
 # ---------------------------------------------------------------------------
 

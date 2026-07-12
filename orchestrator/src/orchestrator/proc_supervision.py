@@ -258,6 +258,12 @@ class RestartPlan:
            below, step-8).
         2. wants_blocking and not self_target -> RP-2 cross-unit BLOCKING +
            RP-5 verify (implemented below, step-10/12).
+           (wants_blocking and self_target — a KNOWN own_unit provably equal
+           to target_unit — deliberately does NOT reach this branch: RP-1's
+           safety proof forbids ever blocking a same-unit restart, so this
+           combination falls through to 3/4 below with ``verify`` dropped and
+           a warning logged, rather than silently discarded — see the guard
+           immediately before the ``transient_unit`` check.)
         3. transient_unit set -> DETACHED systemd-run (RP-3/RP-4; implemented
            below, step-4).
         4. else -> DETACHED leaf plain-spawn, fused-memory/dashboard parity
@@ -302,6 +308,27 @@ class RestartPlan:
 
         if wants_blocking and not self_target:
             return await self._execute_cross_unit_blocking(runner, inspector)
+
+        if wants_blocking:
+            # Reaching here with wants_blocking still True implies self_target
+            # is True (the two branches above already handled "not own" and
+            # "not self_target"): a KNOWN own_unit provably equal to
+            # target_unit. RP-1's safety proof forbids ever blocking a
+            # same-unit restart (that is precisely the 2064 self-kill risk
+            # this guard exists to prevent), so this never routes to
+            # _execute_cross_unit_blocking — it falls through to the DETACHED
+            # path below instead, and the caller-supplied ``verify`` is
+            # INTENTIONALLY dropped: no fresh-PID check runs for a same-unit
+            # restart. Log it so the degrade is observable rather than a
+            # future caller mistaking a SCHEDULED outcome for a verified one.
+            logger.warning(
+                'proc_supervision: verify was set on a same-unit plan '
+                '(target_unit=%r == own_unit=%r) — blocking verify is never '
+                'used for a same-unit restart (would risk the 2064 self-kill '
+                'bug); downgrading to the detached path with verify dropped. '
+                'No fresh-PID check will run for this restart.',
+                self.target_unit, own,
+            )
 
         if self.transient_unit:
             return await self._execute_detached_systemd_run(runner)
