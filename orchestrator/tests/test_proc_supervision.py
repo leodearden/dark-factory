@@ -86,3 +86,107 @@ def read_escalations(queue_dir: str | Path, task_id: str, **kwargs: object) -> l
     this helper rather than inspecting on-disk JSON directly.
     """
     return EscalationQueue(Path(queue_dir)).get_by_task(task_id, **kwargs)
+
+
+# ---------------------------------------------------------------------------
+# step-1: RED — types + construction
+# ---------------------------------------------------------------------------
+
+
+class TestConstruction:
+    """All five contract types construct; RestartPlan.__post_init__ validates cwd
+    and absolutizes a relative script (the 2105 "no implicit cwd" fix)."""
+
+    def test_escalation_spec_constructs_with_defaults(self) -> None:
+        from orchestrator.proc_supervision import EscalationSpec
+
+        spec = EscalationSpec(queue_dir='/tmp/q', task_id='t1', summary='boom')
+
+        assert spec.queue_dir == '/tmp/q'
+        assert spec.task_id == 't1'
+        assert spec.summary == 'boom'
+        assert spec.detail == ''
+        assert spec.severity == 'critical'
+        assert spec.category == 'infra_issue'
+        assert spec.agent_role == 'orchestrator-deterministic'
+
+    def test_fresh_pid_verify_constructs(self) -> None:
+        from orchestrator.proc_supervision import FreshPidVerify
+
+        verify = FreshPidVerify(
+            baseline_active_enter_monotonic=1000,
+            baseline_main_pid=42,
+            inspect_timeout_secs=10.0,
+        )
+
+        assert verify.baseline_active_enter_monotonic == 1000
+        assert verify.baseline_main_pid == 42
+        assert verify.inspect_timeout_secs == 10.0
+
+    def test_restart_disposition_has_six_members(self) -> None:
+        from orchestrator.proc_supervision import RestartDisposition
+
+        names = {member.name for member in RestartDisposition}
+
+        assert names == {
+            'REFUSED',
+            'SCHEDULED',
+            'DEPLOYED_AND_VERIFIED',
+            'VERIFY_FAILED',
+            'REGISTRATION_FAILED',
+            'RESTART_FAILED',
+        }
+
+    def test_restart_outcome_defaults_escalated_false(self) -> None:
+        from orchestrator.proc_supervision import RestartDisposition, RestartOutcome
+
+        outcome = RestartOutcome(disposition=RestartDisposition.SCHEDULED)
+
+        assert outcome.escalated is False
+        assert outcome.detail == ''
+
+    def test_restart_plan_absolutizes_relative_script_against_cwd(self) -> None:
+        from orchestrator.proc_supervision import RestartPlan
+
+        plan = RestartPlan(
+            script=Path('scripts/x.sh'),
+            args=[],
+            cwd=Path('/proj'),
+            target_unit='unit.service',
+            own_unit=None,
+            on_failure_escalation=None,
+            verify=None,
+        )
+
+        assert plan.script == Path('/proj/scripts/x.sh')
+
+    def test_restart_plan_leaves_absolute_script_unchanged(self) -> None:
+        """An already-absolute script is left unchanged (no double-join)."""
+        from orchestrator.proc_supervision import RestartPlan
+
+        plan = RestartPlan(
+            script=Path('/abs/scripts/x.sh'),
+            args=[],
+            cwd=Path('/proj'),
+            target_unit='unit.service',
+            own_unit=None,
+            on_failure_escalation=None,
+            verify=None,
+        )
+
+        assert plan.script == Path('/abs/scripts/x.sh')
+
+    def test_restart_plan_rejects_non_absolute_cwd(self) -> None:
+        """Structural "no implicit cwd" (the 2105 fix): a relative cwd raises ValueError."""
+        from orchestrator.proc_supervision import RestartPlan
+
+        with pytest.raises(ValueError):
+            RestartPlan(
+                script=Path('/abs/scripts/x.sh'),
+                args=[],
+                cwd=Path('relative/dir'),
+                target_unit='unit.service',
+                own_unit=None,
+                on_failure_escalation=None,
+                verify=None,
+            )
