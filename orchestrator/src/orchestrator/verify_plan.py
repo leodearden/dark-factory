@@ -106,6 +106,16 @@ def _is_test_file(path: str) -> bool:
 
     BROAD predicate: ``COLLECTABLE_TEST ∪ TEST_DATA``, excluding conftest.
     Distinct from ``_is_collectable_test_file`` (narrow, collectable only).
+
+    ``.py``-only contract: TEST_DATA (like every ``FileKind`` besides
+    CONFTEST/COLLECTABLE_TEST) is only ever assigned to a ``.py`` path —
+    ``classify_file`` maps every non-``.py`` path to INERT regardless of
+    directory, so this returns False for a non-``.py`` file under ``tests/``
+    (e.g. ``tests/fixture.json``). That is narrower than a hypothetical bare
+    "is this path under tests/" predicate would be. Every current caller
+    pre-filters to ``.py`` before calling this, so the narrowing is
+    behaviorally invisible today — but a future caller passing an unfiltered
+    path list should not assume broad test-tree membership from this alone.
     """
     return classify_file(path, None) in (FileKind.COLLECTABLE_TEST, FileKind.TEST_DATA)
 
@@ -348,6 +358,22 @@ def _derive_fallback_runs(
     commit 7c9b316260). CONFTEST always full-suites regardless — a
     directory target is always safe to run, even bare (task-1077 golden,
     commit cb7277926d).
+
+    Fidelity caveat: this derives an IDEALIZED D1/D2 record against the flat
+    *existing_files* list and *config*'s global commands — it does NOT model
+    the subproject-scoping (task 2344 ``_single_subproject_prefix``) or
+    mixed-root+subproject (task 2368 ``_root_plus_single_subproject_prefix``)
+    rescoping that ``_build_fallback_config`` itself actually performs. When
+    a fallback diff lands entirely or partly inside a real subproject,
+    execution runs ``cd <sub> && uv run pytest ...`` (or the mixed
+    root+subproject chain via ``_ROOT_OWNING_TEST_COMMAND``), while this
+    function still records a single ``'__fallback__'`` FILE_SCOPED/FULL_SUITE
+    run against the flat file list — the recorded ``module_prefix`` and
+    ``cmd`` targets/cwd will not match what actually ran in that case. The
+    D1/D2 scope_kind decision itself (SKIPPED vs FULL_SUITE vs FILE_SCOPED)
+    does not depend on subproject rescoping, so ``plan`` remains a reliable
+    record of *why* a decision was made, but not always of *where*/*how* it
+    ran for a subproject-shaped fallback diff.
     """
     py_files = [f for f in existing_files if f.endswith('.py')]
     if not py_files:
@@ -509,6 +535,24 @@ def derive_verify_plan(
     Fallback branch (*module_configs* empty): a single synthetic
     ``'__fallback__'`` module is derived from *config*'s global commands via
     :func:`_derive_fallback_runs`.
+
+    Fidelity: this is a decision record, not an execution trace — the two
+    branches above are independently derived from *existing_files* /
+    *module_configs* / *config*, not read back from whatever a caller
+    actually executed, so two known gaps can make the returned
+    :class:`VerifyPlan` diverge from what ran. (1) The fallback branch does
+    NOT model the subproject / mixed-root+subproject rescoping that
+    ``_build_fallback_config`` applies (see :func:`_derive_fallback_runs`'s
+    docstring) — a diff landing in a real subproject executes
+    ``cd <sub> && ...`` while the plan still records a flat
+    ``'__fallback__'`` run. (2) The module-config branch recomputes each
+    module's per-tool ``scope_kind`` from :func:`classify_file` independently
+    of ``scope_module_config`` rather than reading back its actual output —
+    the two are carefully kept in sync (both consume the same classify_file
+    predicates) but are not the same code path, so a future change to one
+    must be mirrored in the other to keep this record accurate. Callers that
+    need a faithful diagnostic record of what ran, not just why, should treat
+    the attached ``VerifyResult.plan`` accordingly.
     """
     if not _has_source_files(existing_files):
         return VerifyPlan(
