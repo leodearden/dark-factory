@@ -40,6 +40,17 @@ _GENERIC_DIRS: frozenset[str] = frozenset({
     # repo-management / ops dirs commonly seen at top level:
     'fixtures', 'assets', 'public', 'static', 'vendor', 'third_party',
     'proto', 'protos', 'sdks', 'sdk',
+    # task 2434: 'memory' and 'deploy' recur as generic top-level dir names
+    # across orchestrator-target projects (e.g. reify's memory/ is a 2-file
+    # scratch/notes dir, deploy/ is 6 systemd unit files) and were over-
+    # matching unrelated DF prose ("memory/edges", "deterministic deploy").
+    # Dropping them here is symmetric across every project, so they can
+    # never become a prefix via either the prose heuristic (find_paths) or
+    # the certain files-check (project_for_path).
+    # NOTE: 'gui/' is deliberately NOT added here — reify's gui/ is a real
+    # 13.6k-file frontend, so denylisting it would lose genuine coverage;
+    # the cost/benefit differs from these two scratch/config dirs.
+    'memory', 'deploy',
 })
 
 
