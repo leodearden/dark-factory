@@ -254,6 +254,37 @@ class TestTmuxBackendReorder:
         assert not any(argv[1] == 'switch-client' for argv in runner.calls)
         assert any(r.levelno == logging.WARNING for r in caplog.records)
 
+    def test_reorder_warns_when_restore_select_window_fails(self, caplog):
+        """If the final restore select-window fails (e.g. the snapshotted window
+        vanished mid-reorder), reorder must not silently no-op -- it warns so a
+        failed focus restoration is observable, mirroring every other _run call
+        in this method (move-window and the display-message snapshot read both
+        already warn on a nonzero rc).
+        """
+        from cockpit.backends.base import CommandResult, DisplayTarget
+        from cockpit.backends.tmux import TmuxBackend
+
+        runner = ScriptedRunner(
+            results={
+                ('tmux', 'display-message', '-p', '-t', 's', '#{window_id}'): CommandResult(
+                    returncode=0, stdout='@7\n'
+                ),
+                ('tmux', 'select-window', '-t', '@7'): CommandResult(
+                    returncode=1, stderr='window not found: @7'
+                ),
+            }
+        )
+        backend = TmuxBackend(run=runner)
+        targets = [DisplayTarget(kind='tmux', tmux_target='s:0')]
+
+        with caplog.at_level(logging.WARNING):
+            backend.reorder(targets)
+
+        # The restore is still attempted (and is still the last call reorder
+        # issues) even though it fails -- only the diagnostic changes.
+        assert runner.calls[-1] == ['tmux', 'select-window', '-t', '@7']
+        assert any(r.levelno == logging.WARNING for r in caplog.records)
+
     def test_reorder_skips_target_with_missing_tmux_target_and_warns(self, caplog):
         from cockpit.backends.base import DisplayTarget
         from cockpit.backends.tmux import TmuxBackend
