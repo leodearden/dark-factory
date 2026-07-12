@@ -9479,6 +9479,44 @@ Update the plan to address the blocking issues. You may add new steps to the `st
             return WorkflowOutcome.SOFT_CANCELLED
         return WorkflowOutcome.REQUEUED
 
+    @staticmethod
+    def _outcome_severity(outcome: StewardOutcome) -> int:
+        """Rank a published ``StewardOutcome`` for the drain+reduce step in
+        :meth:`_await_steward_completion` (task 2248 / W9-delta review fix).
+
+        The steward handles escalations serially and can publish more than
+        one outcome within a single grace window — e.g. resolve the
+        workflow's own L0 (``StewardResolved``), then chain a follow-on L0
+        of its own and give up on it (``StewardReescalatedL1``).  A single
+        ``channel.get()`` would only ever see the leading (least severe)
+        outcome.  Higher wins: an L1 hand-off outranks budget exhaustion,
+        which outranks a no-wip interruption, which outranks a wip-present
+        interruption (already the "softest" give-up — task-2060 resume-plan),
+        which outranks a clean resolution.  ``StewardTerminalDecision`` is
+        never published on the channel (it is synthesized from a scheduler
+        status read, not ranked here) so it has no case.
+        """
+        if isinstance(outcome, StewardReescalatedL1):
+            return 4
+        if isinstance(outcome, StewardBudgetExhausted):
+            return 3
+        if isinstance(outcome, StewardInterrupted):
+            return 2 if not outcome.wip_commits_present else 1
+        return 0  # StewardResolved
+
+    @staticmethod
+    def _outcome_requeues(outcome: StewardOutcome) -> bool:
+        """True for the ``StewardOutcome`` variants that lead ``_mark_blocked``
+        to re-pend the task: a clean ``StewardResolved``, or a
+        ``StewardInterrupted`` with WIP present (the task-2060 resume-plan
+        branch).  These are exactly the outcomes the ``has_open_l1``
+        source-of-truth override in :meth:`_await_steward_completion` must
+        gate — a requeue must never race past an L1 that is already open.
+        """
+        if isinstance(outcome, StewardResolved):
+            return True
+        return isinstance(outcome, StewardInterrupted) and outcome.wip_commits_present
+
     async def _await_steward_completion(self) -> StewardOutcome:
         """Wait for the steward to publish an outcome, with a grace period
         (task 2248 / W9-delta, SO-1).
@@ -9506,6 +9544,17 @@ Update the plan to address the blocking issues. You may add new steps to the `st
         synthesized ``StewardInterrupted('timeout', wip=...)`` is returned —
         wip/no-wip routing is resolved later, by ``_mark_blocked``'s single
         branch (the task-2060 fix), not here.
+
+        Two extra layers close the multi-outcome silent-requeue gap (review
+        fix): (1) once an outcome is obtained, any further outcomes already
+        sitting on the channel (the serial steward published a burst within
+        this same grace window) are drained non-blockingly and reduced to
+        the most severe via :meth:`_outcome_severity`.  (2) before returning
+        a requeue-producing outcome (:meth:`_outcome_requeues`), the
+        escalation queue's ``has_open_l1`` is re-checked as a source-of-truth
+        backstop — catching the publish-timing race where a follow-on L1 was
+        filed but its outcome has not yet landed on the channel — and
+        ``StewardReescalatedL1`` is returned instead when one is open.
         """
         channel = self._steward_outcome_channel
         if channel is None:
@@ -9535,7 +9584,18 @@ Update the plan to address the blocking issues. You may add new steps to the `st
                         with contextlib.suppress(asyncio.CancelledError):
                             await t
             if get_wait in done:
-                outcome = get_wait.result()
+                most_severe: StewardOutcome = get_wait.result()
+                # Drain any further outcomes the serial steward already
+                # published in this same grace window and reduce to the
+                # most severe (review fix — see class docstring above).
+                while True:
+                    try:
+                        next_outcome: StewardOutcome = channel.get_nowait()
+                    except asyncio.QueueEmpty:
+                        break
+                    if self._outcome_severity(next_outcome) > self._outcome_severity(most_severe):
+                        most_severe = next_outcome
+                outcome = most_severe
             elif cancel_wait in done:
                 logger.info(
                     f'Task {self.task_id}: cancel-event fired during steward grace — '
@@ -9553,6 +9613,24 @@ Update the plan to address the blocking issues. You may add new steps to the `st
         if status in TERMINAL_STATUSES or status == 'deferred':
             return StewardTerminalDecision(new_status=TaskStatus(status))
         if outcome is not None:
+            # has_open_l1 source-of-truth override (review fix): a
+            # requeue-producing outcome must not race past an L1 that is
+            # already open — the publish-timing race where the steward
+            # filed a follow-on L1 whose outcome has not yet landed on the
+            # channel.  _mark_blocked's existing StewardReescalatedL1
+            # branch (unmodified) routes this to ESCALATED with no
+            # duplicate L1.
+            if (
+                self._outcome_requeues(outcome)
+                and self.escalation_queue is not None
+                and self.escalation_queue.has_open_l1(self.task_id)
+            ):
+                open_l1 = self.escalation_queue.get_by_task(
+                    self.task_id, status='pending', level=1,
+                )
+                return StewardReescalatedL1(
+                    esc_id=open_l1[0].id if open_l1 else '',
+                )
             return outcome
         return StewardInterrupted(
             'timeout', wip_commits_present=await self._worktree_has_wip_commits(),
