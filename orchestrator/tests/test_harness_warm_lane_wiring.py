@@ -345,7 +345,7 @@ class TestCancelledWorkflowLaneRelease:
         )
 
         # ── Run ─────────────────────────────────────────────────────────────
-        outcome = await workflow.run()
+        outcome = (await workflow.run()).outcome
 
         # (a) state must be CANCELLED (RED: _handle_cancelled_terminal_exit
         #     doesn't call _enter_phase(CANCELLED))
@@ -639,7 +639,7 @@ class TestHardCancelLaneRelease:
         """
         from orchestrator.scheduler import TaskAssignment
         from orchestrator.warm_lane_pool import LaneState
-        from orchestrator.workflow import WorkflowOutcome
+        from orchestrator.workflow import TerminalReport, WorkflowOutcome, WorkflowState
 
         repo = tmp_path / 'repo'
         repo.mkdir()
@@ -668,7 +668,10 @@ class TestHardCancelLaneRelease:
         # synthetic_cancel defaulting to False.
         with patch('orchestrator.harness.TaskWorkflow') as MockWorkflow:
             mock_wf = MagicMock()
-            mock_wf.run = AsyncMock(return_value=WorkflowOutcome.CANCELLED)
+            mock_wf.run = AsyncMock(return_value=TerminalReport(
+                outcome=WorkflowOutcome.CANCELLED, reason='',
+                phase=WorkflowState.CANCELLED, detail='', category=None,
+            ))
             MockWorkflow.return_value = mock_wf
 
             assignment = TaskAssignment(

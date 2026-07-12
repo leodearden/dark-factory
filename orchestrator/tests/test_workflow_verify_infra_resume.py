@@ -456,6 +456,10 @@ class TestBareInfraOSErrorDefensiveNet:
         # Pre-set initial_plan to suppress the simple_task optimistic path
         # (not self.initial_plan would be False → simple task path is skipped)
         wf.initial_plan = {'task_id': '1883', 'steps': []}
+        # run()'s SM-2 exit check reads get_status back — _mark_blocked is
+        # stubbed (its real body, which would persist 'blocked', never
+        # runs), so this must reflect the forced BLOCKED outcome directly.
+        wf.scheduler.get_status = AsyncMock(return_value='blocked')
 
         async def fake_setup(*args, **kwargs):
             # worktree and artifacts already set by _make(); just return.
@@ -476,7 +480,7 @@ class TestBareInfraOSErrorDefensiveNet:
                 side_effect=OSError(errno_module.ENOSPC, 'No space left on device'),
             ),
         ):
-            outcome = await wf.run()
+            outcome = (await wf.run()).outcome
 
         assert outcome == WorkflowOutcome.BLOCKED
 
@@ -509,6 +513,10 @@ class TestBareInfraOSErrorDefensiveNet:
         wf = _make()
         wf.plan = {'task_id': '1883', 'steps': []}
         wf.initial_plan = {'task_id': '1883', 'steps': []}
+        # run()'s SM-2 exit check reads get_status back — _mark_blocked is
+        # stubbed (its real body, which would persist 'blocked', never
+        # runs), so this must reflect the forced BLOCKED outcome directly.
+        wf.scheduler.get_status = AsyncMock(return_value='blocked')
 
         async def fake_setup(*args, **kwargs):
             pass
@@ -524,7 +532,7 @@ class TestBareInfraOSErrorDefensiveNet:
                 side_effect=OSError(errno_module.EACCES, 'Permission denied'),
             ),
         ):
-            outcome = await wf.run()
+            outcome = (await wf.run()).outcome
 
         assert outcome == WorkflowOutcome.BLOCKED
         wf._mark_blocked.assert_awaited_once()  # type: ignore[attr-defined]

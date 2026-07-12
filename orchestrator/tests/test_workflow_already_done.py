@@ -240,7 +240,7 @@ async def test_run_short_circuits_on_architect_already_done(tmp_path: Path):
         return_value=None,
     )
 
-    outcome = await f.wf.run()
+    outcome = (await f.wf.run()).outcome
 
     assert outcome == WorkflowOutcome.DONE
     f.wf._execute_iterations.assert_not_called()
@@ -297,7 +297,7 @@ async def test_run_short_circuits_on_plan_escalated(tmp_path: Path):
     f.wf._check_branch_on_main = check_branch  # type: ignore[method-assign]
     f.wf.git_ops.has_uncommitted_work = AsyncMock(return_value=True)
 
-    outcome = await f.wf.run()
+    outcome = (await f.wf.run()).outcome
 
     assert outcome == WorkflowOutcome.ESCALATED
     f.wf._execute_iterations.assert_not_called()

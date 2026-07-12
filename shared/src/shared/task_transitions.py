@@ -241,7 +241,23 @@ _OUTCOME_ALLOWED: dict[str, frozenset[TaskStatus]] = {
     "done": frozenset({TaskStatus.DONE}),
     # Internal-only sub-phase — the task stays claimed (in-progress).
     "planned": frozenset({TaskStatus.IN_PROGRESS}),
-    "blocked": frozenset({TaskStatus.BLOCKED}),
+    # BLOCKED is TaskWorkflow's own dominant exit for _mark_blocked, but the
+    # post-escalation resume guard ("Fix 1", orchestrator/workflow.py ~2057)
+    # also returns BLOCKED when a steward resolves an L0 by setting the task
+    # to another WORKFLOW_PRESERVE_STATUSES member (cancelled / deferred /
+    # merge-deferred) — an intentional steward terminal decision the
+    # orchestrator must not overwrite. 'done' is excluded: that status is
+    # handled by a dedicated branch that returns WorkflowOutcome.DONE, never
+    # BLOCKED. IN_PROGRESS is also included: the merge-halt escalation-wait
+    # paths (_handle_wip_recovery_no_advance / _handle_unmerged_state) submit
+    # an L1 and return BLOCKED directly (no _mark_blocked call) without ever
+    # rewriting task status, so the row stays at whatever it was mid-merge —
+    # the same "preserves in-progress" shape already noted below for
+    # 'escalated'.
+    "blocked": frozenset({
+        TaskStatus.BLOCKED, TaskStatus.CANCELLED, TaskStatus.DEFERRED,
+        TaskStatus.MERGE_DEFERRED, TaskStatus.IN_PROGRESS,
+    }),
     # Self-repend / deferred-to-stranded-sweep window / requeue-cap
     # exhausted -> blocked.
     "requeued": frozenset({TaskStatus.PENDING, TaskStatus.IN_PROGRESS, TaskStatus.BLOCKED}),

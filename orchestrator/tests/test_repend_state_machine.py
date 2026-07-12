@@ -220,7 +220,7 @@ class TestWorkflowGatesB1B2:
 
         workflow._execute_verify_review_loop = _exec_and_escalate  # type: ignore[method-assign]
 
-        outcome = await workflow.run()
+        outcome = (await workflow.run()).outcome
 
         assert outcome == WorkflowOutcome.ESCALATED, (
             f'MERGE-entry gate must return ESCALATED; got {outcome}'

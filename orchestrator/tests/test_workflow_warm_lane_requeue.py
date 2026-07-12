@@ -91,7 +91,7 @@ async def test_pool_exhausted_returns_requeued(tmp_path: Path):
     mark_blocked = AsyncMock(return_value=WorkflowOutcome.BLOCKED)
     wf._mark_blocked = mark_blocked  # type: ignore[method-assign]
 
-    outcome = await wf.run()
+    outcome = (await wf.run()).outcome
 
     assert outcome == WorkflowOutcome.REQUEUED
     mark_blocked.assert_not_awaited()
@@ -117,7 +117,7 @@ async def test_disk_pressure_returns_requeued(tmp_path: Path):
     mark_blocked = AsyncMock(return_value=WorkflowOutcome.BLOCKED)
     wf._mark_blocked = mark_blocked  # type: ignore[method-assign]
 
-    outcome = await wf.run()
+    outcome = (await wf.run()).outcome
 
     assert outcome == WorkflowOutcome.REQUEUED
     mark_blocked.assert_not_awaited()
@@ -150,11 +150,11 @@ async def test_pool_hard_down_returns_requeued(tmp_path: Path):
     mark_blocked = AsyncMock(return_value=WorkflowOutcome.BLOCKED)
     wf._mark_blocked = mark_blocked  # type: ignore[method-assign]
 
-    outcome = await wf.run()
+    report = await wf.run()
 
-    assert outcome == WorkflowOutcome.REQUEUED
+    assert report.outcome == WorkflowOutcome.REQUEUED
     mark_blocked.assert_not_awaited()
-    assert wf._last_block_reason == 'warm_lane_pool_hard_down'
+    assert report.reason == 'warm_lane_pool_hard_down'
 
 
 # ---------------------------------------------------------------------------
@@ -177,8 +177,14 @@ async def test_fault_runtime_error_returns_blocked(tmp_path: Path):
     )
     mark_blocked = AsyncMock(return_value=WorkflowOutcome.BLOCKED)
     wf._mark_blocked = mark_blocked  # type: ignore[method-assign]
+    # run()'s SM-2 exit check reads get_status back — _mark_blocked is
+    # stubbed above (its real body, which would persist 'blocked', never
+    # runs), so this must reflect the forced BLOCKED outcome directly
+    # (_make_workflow's shared default of 'pending' suits the REQUEUED
+    # cases the other tests in this module force).
+    wf.scheduler.get_status = AsyncMock(return_value='blocked')
 
-    outcome = await wf.run()
+    outcome = (await wf.run()).outcome
 
     assert outcome == WorkflowOutcome.BLOCKED
     mark_blocked.assert_awaited_once()

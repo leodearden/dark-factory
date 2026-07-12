@@ -67,7 +67,7 @@ from orchestrator.task_status import (
     is_infra_held,
 )
 from orchestrator.usage_gate import UsageGate
-from orchestrator.workflow import TaskWorkflow, WorkflowOutcome
+from orchestrator.workflow import TaskWorkflow, TerminalReport, WorkflowOutcome
 from orchestrator.worktree_identity import identities_match, read_worktree_title
 
 if TYPE_CHECKING:
@@ -454,9 +454,10 @@ class TaskReport:
     steward_invocations: int = 0
     completed_at: str = ''
     # Block-context surfacing for the per-task retry cap.  Populated by
-    # _run_slot from the workflow's stashed _last_block_* attrs when the
-    # outcome is REQUEUED (harmless/empty on DONE paths).  Not persisted
-    # to runs.db — purely in-memory for the cap check + cap-exhaust report.
+    # _run_slot from the TerminalReport returned by workflow.run() (TR-1)
+    # when the outcome is REQUEUED (harmless/empty on DONE paths).  Not
+    # persisted to runs.db — purely in-memory for the cap check + cap-exhaust
+    # report.
     block_reason: str = ''
     block_detail: str = ''
     block_phase: str = ''
@@ -5629,7 +5630,15 @@ Output JSON matching the schema. Every task must appear in the output.
                     data={'title': assignment.task.get('title', '')},
                 )
 
-            outcome = await workflow.run()
+            # TR-1: the workflow↔harness terminal contract is this RETURN
+            # value, not a `_last_block_*` side channel (deleted — W9-γ).
+            # Held in `terminal_report` (NOT `report`) so the `finally`
+            # block's `report is not None` guard stays a reliable "did we
+            # build a real TaskReport" check — `report` must stay None if an
+            # exception fires in the narrow window below (steward-cost
+            # computation) before the TaskReport is actually constructed.
+            terminal_report: TerminalReport = await workflow.run()
+            outcome = terminal_report.outcome
 
             steward_cost = 0.0
             steward_invocations = 0
@@ -5651,9 +5660,23 @@ Output JSON matching the schema. Every task must appear in the output.
                 steward_cost_usd=steward_cost,
                 steward_invocations=steward_invocations,
                 completed_at=datetime.now(UTC).isoformat(),
-                block_reason=workflow._last_block_reason,
-                block_detail=workflow._last_block_detail,
-                block_phase=workflow._last_block_phase,
+                block_reason=terminal_report.reason,
+                block_detail=terminal_report.detail,
+                # REVIEW-CYCLE-1 fix: block_phase comes from blocked_from_phase
+                # (the PRE-block WORKING phase), NOT terminal_report.phase (the
+                # terminal machine.state — BLOCKED for a _mark_blocked exit).
+                # _maybe_auto_eval gates its optimistic-path redo on block_phase
+                # in config.auto_eval_phases = {plan,execute,verify,review};
+                # 'blocked' is never a member of that set, so mapping from the
+                # terminal phase would silently and permanently disable the
+                # Lever B/C auto-eval recovery. blocked_from_phase defaults to
+                # None on clean/non-block exits, mapped to '' here — matching
+                # the pre-2247 _last_block_phase default.
+                block_phase=(
+                    terminal_report.blocked_from_phase.value
+                    if terminal_report.blocked_from_phase is not None
+                    else ''
+                ),
             )
 
             if self.event_store:

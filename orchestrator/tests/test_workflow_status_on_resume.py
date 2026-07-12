@@ -233,7 +233,7 @@ class TestStatusPreservationOnResume:
         invoke_mock = AsyncMock(return_value=AgentResult(success=True, output=''))
         workflow._invoke = invoke_mock  # type: ignore[method-assign]
 
-        outcome = await workflow.run()
+        outcome = (await workflow.run()).outcome
 
         assert outcome == WorkflowOutcome.BLOCKED, (
             f'Expected BLOCKED, got {outcome!r}; '
@@ -275,7 +275,7 @@ class TestStatusPreservationOnResume:
         invoke_mock = AsyncMock(return_value=AgentResult(success=True, output=''))
         workflow._invoke = invoke_mock  # type: ignore[method-assign]
 
-        outcome = await workflow.run()
+        outcome = (await workflow.run()).outcome
 
         assert outcome == WorkflowOutcome.BLOCKED
         assert state['count'] == 1
@@ -305,7 +305,7 @@ class TestStatusPreservationOnResume:
         invoke_mock = AsyncMock(return_value=AgentResult(success=True, output=''))
         workflow._invoke = invoke_mock  # type: ignore[method-assign]
 
-        outcome = await workflow.run()
+        outcome = (await workflow.run()).outcome
 
         assert outcome == WorkflowOutcome.DONE, (
             f'Expected DONE, got {outcome!r}; '
@@ -343,7 +343,7 @@ class TestStatusPreservationOnResume:
         invoke_mock = AsyncMock(return_value=AgentResult(success=True, output=''))
         workflow._invoke = invoke_mock  # type: ignore[method-assign]
 
-        outcome = await workflow.run()
+        outcome = (await workflow.run()).outcome
 
         # After resume + DONE second loop iteration + skip-merge (eval-mode),
         # the SUCCESS path runs and writes 'done' to the scheduler.
@@ -393,7 +393,7 @@ class TestStatusPreservationOnResume:
         invoke_mock = AsyncMock(return_value=AgentResult(success=True, output=''))
         workflow._invoke = invoke_mock  # type: ignore[method-assign]
 
-        outcome = await workflow.run()
+        outcome = (await workflow.run()).outcome
 
         # already-on-main path → break → eval-mode skip MERGE → SUCCESS → DONE.
         # If Fix 1 ran first (regression) the outcome would be BLOCKED.

@@ -873,9 +873,13 @@ def _make_slot_harness(tmp_path: Path):
 
 def _make_mock_workflow():
     """Return a minimal AsyncMock workflow whose run() is awaitable."""
-    from orchestrator.workflow import WorkflowOutcome
+    from orchestrator.workflow import TerminalReport, WorkflowOutcome, WorkflowState
     wf = AsyncMock()
-    wf.run = AsyncMock(return_value=WorkflowOutcome.DONE)
+    # W9-γ: run() returns a TerminalReport (TR-1), not a bare WorkflowOutcome.
+    wf.run = AsyncMock(return_value=TerminalReport(
+        outcome=WorkflowOutcome.DONE, reason='', phase=WorkflowState.DONE,
+        detail='', category=None,
+    ))
     wf.metrics = MagicMock(
         total_cost_usd=0.0,
         total_duration_ms=0,
@@ -885,9 +889,6 @@ def _make_mock_workflow():
         review_cycles=0,
     )
     wf._steward = None
-    wf._last_block_reason = None
-    wf._last_block_detail = None
-    wf._last_block_phase = None
     return wf
 
 

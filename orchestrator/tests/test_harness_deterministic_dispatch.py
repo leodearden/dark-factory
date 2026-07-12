@@ -16,7 +16,7 @@ from escalation.queue import EscalationQueue
 
 from orchestrator.harness import Harness
 from orchestrator.scheduler import Scheduler, TaskAssignment
-from orchestrator.workflow import WorkflowOutcome
+from orchestrator.workflow import TerminalReport, WorkflowOutcome, WorkflowState
 
 # ---------------------------------------------------------------------------
 # Fixtures and helpers
@@ -191,16 +191,18 @@ class TestRunSlotRouting:
             patch('orchestrator.harness.DeterministicRunner') as mock_dr,
         ):
             mock_wf = MagicMock()
-            mock_wf.run = AsyncMock(return_value=WorkflowOutcome.DONE)
+            # W9-γ: run() returns a TerminalReport (TR-1), not a bare WorkflowOutcome.
+            # (DeterministicRunner.run() above is a separate contract — unchanged.)
+            mock_wf.run = AsyncMock(return_value=TerminalReport(
+                outcome=WorkflowOutcome.DONE, reason='', phase=WorkflowState.DONE,
+                detail='', category=None,
+            ))
             mock_wf.metrics = MagicMock(
                 total_cost_usd=0.0, total_duration_ms=0,
                 agent_invocations=0, execute_iterations=0,
                 verify_attempts=0, review_cycles=0,
             )
             mock_wf._steward = None
-            mock_wf._last_block_reason = ''
-            mock_wf._last_block_detail = ''
-            mock_wf._last_block_phase = ''
             mock_tw.return_value = mock_wf
 
             await harness._run_slot(assignment, _make_sem())
