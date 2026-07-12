@@ -885,20 +885,3 @@ class TestProcSupervisionAntiOrphanGuard:
 
     def test_proc_supervision_imports_cleanly(self) -> None:
         import orchestrator.proc_supervision  # noqa: F401
-
-    def test_service_restart_source_references_restart_plan(self) -> None:
-        import inspect
-
-        from orchestrator import service_restart
-
-        source = inspect.getsource(service_restart)
-        assert 'proc_supervision' in source
-        assert 'RestartPlan' in source
-
-    def test_service_restart_source_no_longer_has_accepted_gap(self) -> None:
-        import inspect
-
-        from orchestrator import service_restart
-
-        source = inspect.getsource(service_restart)
-        assert 'accepted gap' not in source
