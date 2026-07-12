@@ -691,6 +691,26 @@ async def run(args: Any, memory_service: Any) -> dict:
             if partial_result is not None:
                 edge_result = partial_result
 
+    # edge_result.blocked (CGL-η follow-up, task 2451): per-item Phase-B
+    # failures that recreate_subgraph_relationships isolated instead of
+    # letting abort the whole batch (see that function's docstring). If
+    # Phase C still deleted a blocked item's incident source node(s), the
+    # un-recreated edge/mention -- which now exists only in source -- would
+    # be DESTROYED, data loss worse than the old whole-batch abort. So every
+    # uuid named in a blocked item's node_uuids is collected here and Phase C
+    # below withholds source deletion for exactly those nodes, leaving them
+    # as recoverable source residue (create-before-delete preserved) rather
+    # than silently converting an isolated item failure into a real loss.
+    blocked_node_uuids: set[str] = set()
+    blocked_reasons_by_node: dict[str, list[str]] = {}
+    for blocked_item in edge_result.blocked:
+        for node_uuid in blocked_item.get('node_uuids', []):
+            blocked_node_uuids.add(node_uuid)
+            blocked_reasons_by_node.setdefault(node_uuid, []).append(
+                f"{blocked_item.get('kind', 'item')} {blocked_item.get('uuid', '?')}: "
+                f"{blocked_item.get('reason', '')}"
+            )
+
     # Phase C: DETACH DELETE every MOVE/MERGE source node whose earlier
     # phases succeeded -- deleting a source before its edges are known-
     # recreated is exactly the bug this task fixes, so a node whose Phase-A
@@ -708,6 +728,17 @@ async def run(args: Any, memory_service: Any) -> dict:
             apply_results.append({
                 'uuid': uuid, 'disposition': MOVE, 'applied': False, 'blocked': True,
                 'error': f'Phase B (recreate_subgraph_relationships) failed: {phase_b_error}',
+            })
+            continue
+        if uuid in blocked_node_uuids:
+            apply_results.append({
+                'uuid': uuid, 'disposition': MOVE, 'applied': False, 'blocked': True,
+                'error': (
+                    'Phase B (recreate_subgraph_relationships) blocked an '
+                    "incident edge/mention -- source preserved (create-"
+                    "before-delete); see report['phase_b_blocked']: "
+                    + '; '.join(blocked_reasons_by_node.get(uuid, []))
+                ),
             })
             continue
         try:
@@ -728,6 +759,17 @@ async def run(args: Any, memory_service: Any) -> dict:
             apply_results.append({
                 'uuid': uuid, 'disposition': MERGE, 'applied': False, 'blocked': True,
                 'error': f'Phase B (recreate_subgraph_relationships) failed: {phase_b_error}',
+            })
+            continue
+        if uuid in blocked_node_uuids:
+            apply_results.append({
+                'uuid': uuid, 'disposition': MERGE, 'applied': False, 'blocked': True,
+                'error': (
+                    'Phase B (recreate_subgraph_relationships) blocked an '
+                    "incident edge/mention -- source preserved (create-"
+                    "before-delete); see report['phase_b_blocked']: "
+                    + '; '.join(blocked_reasons_by_node.get(uuid, []))
+                ),
             })
             continue
         try:
@@ -789,6 +831,15 @@ async def run(args: Any, memory_service: Any) -> dict:
     # Surfacing it here (never omitted) and forcing a blocking exit mirrors
     # has_edge_loss/has_unresolved/has_blocked: a human must review it.
     has_dropped_cross_target = bool(edge_result.dropped_cross_target)
+    # A per-item Phase-B failure (CGL-η follow-up, task 2451) -- an edge or
+    # mention whose embedding read or CREATE raised, isolated rather than
+    # aborting the whole batch. Its incident node(s)' source deletion was
+    # already withheld above (blocked_node_uuids), which independently
+    # forces has_blocked True for THOSE nodes' apply_results entries -- this
+    # flag is a direct, explicit fold (mirroring has_dropped_cross_target)
+    # so a non-empty blocked list always forces a human-review exit even if
+    # its node_uuids ever failed to line up with an apply_results entry.
+    has_blocked_items = bool(edge_result.blocked)
 
     report = dict(manifest)
     report['dry_run'] = False
@@ -797,7 +848,14 @@ async def run(args: Any, memory_service: Any) -> dict:
     report['edges_skipped'] = edge_result.edges_skipped
     report['mentions_recreated'] = edge_result.mentions_recreated
     report['mentions_skipped'] = edge_result.mentions_skipped
+    # embedding_omitted (CGL-η follow-up, task 2451 reviewer amendment): how
+    # many of edges_recreated landed without a fact_embedding because the
+    # source read null/absent (see SubgraphEdgeResult docstring). Purely
+    # informational -- deliberately NOT folded into exit_code, since a null
+    # embedding is valid data, not a failure requiring human review.
+    report['embedding_omitted'] = edge_result.embedding_omitted
     report['dropped_cross_target_edges'] = edge_result.dropped_cross_target
+    report['phase_b_blocked'] = edge_result.blocked
     report['post_verify'] = {
         'matched': matched,
         'expected': expected_residual,
@@ -808,6 +866,7 @@ async def run(args: Any, memory_service: Any) -> dict:
         if (
             matched and not has_unresolved and not has_blocked
             and not has_edge_loss and not has_dropped_cross_target
+            and not has_blocked_items
         )
         else 1
     )

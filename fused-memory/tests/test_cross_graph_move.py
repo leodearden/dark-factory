@@ -124,6 +124,43 @@ class TestFormatVecf32Literal:
 
 
 # ---------------------------------------------------------------------------
+# step-3/4: _embedding_set_clause -- the seam that makes the embedding
+# property optional (null-tolerant) at every recreate site.
+# ---------------------------------------------------------------------------
+
+class TestEmbeddingSetClause:
+    """_embedding_set_clause(assignment_target, reply) -> '' or a SET fragment.
+
+    The single seam every CREATE's embedding assignment routes through: a
+    ``None`` reply (null/absent source embedding) renders no clause at all,
+    so the recreated node/edge omits that property entirely; a real reply
+    renders a comma-prefixed assignment naming *assignment_target*, reusing
+    the UNCHANGED byte-exact ``format_vecf32_literal(parse_compact_vector_
+    reply(...))`` passthrough.
+    """
+
+    def test_none_reply_returns_empty_string(self):
+        """A null/absent embedding renders no clause at all -- the CREATE
+        must omit the embedding property entirely rather than setting it to
+        an empty/placeholder vector."""
+        assert cross_graph_move._embedding_set_clause('r.fact_embedding', None) == ''
+
+    def test_real_reply_returns_comma_prefixed_assignment_with_byte_exact_literal(self):
+        """A real reply renders a comma-separated SET fragment naming the
+        given assignment target, embedding the byte-exact vecf32 literal
+        verbatim (no float() coercion) -- proving the non-null branch reuses
+        the unchanged format_vecf32_literal(parse_compact_vector_reply(...))
+        passthrough rather than re-deriving it.
+        """
+        clause = cross_graph_move._embedding_set_clause(
+            'r.fact_embedding', COMPACT_VECTOR_REPLY_FIXTURE,
+        )
+        assert clause.startswith(',')
+        assert 'r.fact_embedding' in clause
+        assert EXPECTED_VECF32_LITERAL_FIXTURE in clause
+
+
+# ---------------------------------------------------------------------------
 # _read_compact_vector: the ONE non-pure, byte-exactness-critical read path.
 #
 # Every OTHER test in this module monkeypatches _read_compact_vector away, so
@@ -226,21 +263,25 @@ class TestReadCompactVectorTransport:
         assert '10' in msg  # the offending scalar_type is reported
 
     @pytest.mark.asyncio
-    async def test_null_absent_embedding_raises_not_empty_vector(self):
-        """A NULL/absent embedding raises rather than yielding an empty vector.
+    async def test_null_absent_embedding_returns_none_sentinel(self):
+        """A NULL/absent embedding returns None rather than raising.
 
         FalkorDB reports a missing property as a non-VECTORF32 (VALUE_NULL)
-        scalar_type with a null value; the type check fires BEFORE the value is
-        ever indexed, so a corrupt/embedding-less source row surfaces as a hard
-        ValueError instead of a silently-empty vecf32([]) literal.
+        scalar_type with a null value; this is now recognized as valid real
+        data (some source rows were persisted without an embedding) rather
+        than corruption -- the type check special-cases exactly this tag and
+        returns None instead of raising, so callers can recreate the node/
+        edge embedding-less instead of aborting the whole batch over one
+        missing vector.
         """
         reply = _compact_reply([_VALUE_NULL_TAG, None])
         client = self._client_returning(reply)
 
-        with pytest.raises(ValueError):
-            await cross_graph_move._read_compact_vector(
-                client, group_id=SOURCE_GRAPH_FIXTURE, cypher='RETURN n.name_embedding',
-            )
+        out = await cross_graph_move._read_compact_vector(
+            client, group_id=SOURCE_GRAPH_FIXTURE, cypher='RETURN n.name_embedding',
+        )
+
+        assert out is None
 
     @pytest.mark.asyncio
     async def test_empty_rows_raises_naming_group_id_and_cypher(self):
@@ -474,6 +515,57 @@ class TestMoveEntityAcrossGraphsEdges:
 
         assert result.edges_moved == 0
         assert result.edges_skipped == 1
+
+    @pytest.mark.asyncio
+    async def test_null_fact_embedding_recreates_edge_without_embedding_property(
+        self, mock_config, make_backend, make_graph_mock, monkeypatch,
+    ):
+        """A null/absent fact_embedding on the RELATES_TO edge is valid real
+        data, not corruption: the edge CREATE still issues, omitting the
+        fact_embedding property entirely (no vecf32 literal) while every
+        other property/param is preserved, edges_moved still counts it, and
+        the call does NOT raise.
+        """
+        backend = make_backend(mock_config)
+        source_mock = make_graph_mock()
+        source_mock.ro_query = AsyncMock(side_effect=[
+            MagicMock(result_set=[NODE_ROW_FIXTURE]),
+            MagicMock(result_set=[EDGE_ROW_FIXTURE]),
+            MagicMock(result_set=[]),  # no MENTIONS links in this scenario
+        ])
+        target_mock = make_graph_mock()
+        backend._driver._get_graph = _route_graphs({
+            SOURCE_GRAPH_FIXTURE: source_mock,
+            TARGET_GRAPH_FIXTURE: target_mock,
+        })
+
+        # NODE name_embedding read returns a real reply; EDGE fact_embedding
+        # read returns None (null/absent).
+        fake_read_compact = AsyncMock(side_effect=[COMPACT_VECTOR_REPLY_FIXTURE, None])
+        monkeypatch.setattr(cross_graph_move, '_read_compact_vector', fake_read_compact)
+
+        result = await move_entity_across_graphs(
+            backend, NODE_UUID_FIXTURE, SOURCE_GRAPH_FIXTURE, TARGET_GRAPH_FIXTURE,
+        )
+
+        assert target_mock.query.await_count == 2
+        edge_create_call = target_mock.query.call_args_list[1]
+        cypher = extract_cypher(edge_create_call)
+        params = extract_params(edge_create_call)
+        assert 'CREATE' in cypher
+        assert 'RELATES_TO' in cypher
+        assert 'fact_embedding' not in cypher
+        assert 'vecf32' not in cypher
+        assert params.get('src_uuid') == NODE_UUID_FIXTURE
+        assert params.get('dst_uuid') == OTHER_NODE_UUID_FIXTURE
+        assert params.get('edge_uuid') == EDGE_UUID_FIXTURE
+        assert params.get('name') == 'is_related_to'
+        assert params.get('fact') == 'Alice is related to Bob.'
+        assert params.get('group_id') == SOURCE_GRAPH_FIXTURE
+        assert params.get('episodes') == ['episode-uuid-1']
+
+        assert result.edges_moved == 1
+        assert result.edges_skipped == 0
 
 
 # ---------------------------------------------------------------------------
@@ -1059,6 +1151,91 @@ class TestMergeForeignDuplicate:
         assert result.unique_wrong_edge_uuids == {UNIQUE_WRONG_EDGE_UUID_FIXTURE}
 
     @pytest.mark.asyncio
+    async def test_null_fact_embedding_recreates_edge_without_embedding_property(
+        self, mock_config, make_backend, make_graph_mock, monkeypatch,
+    ):
+        """A null/absent fact_embedding on the wrong copy's unique edge is
+        valid real data, not corruption: it is still recreated on the home
+        copy, omitting the fact_embedding property entirely (no vecf32
+        literal) while every other property/param is preserved, the wrong
+        copy is still DETACH-DELETEd LAST (create-before-delete preserved),
+        and the call does NOT raise.
+        """
+        backend = make_backend(mock_config)
+        call_order: list[tuple[str, str, dict]] = []
+
+        wrong_mock = make_graph_mock()
+        wrong_mock.ro_query = AsyncMock(
+            return_value=MagicMock(
+                result_set=[SHARED_EDGE_ROW_FIXTURE, UNIQUE_WRONG_EDGE_ROW_FIXTURE]
+            )
+        )
+
+        async def _record_wrong_query(cypher, params=None):
+            call_order.append(('wrong', cypher, params or {}))
+            return MagicMock()
+
+        wrong_mock.query = AsyncMock(side_effect=_record_wrong_query)
+
+        home_mock = make_graph_mock()
+        home_mock.ro_query = AsyncMock(
+            side_effect=[
+                MagicMock(
+                    result_set=[[SHARED_EDGE_UUID_FIXTURE], [HOME_ONLY_EDGE_UUID_FIXTURE]]
+                ),
+                MagicMock(
+                    result_set=[
+                        [SHARED_EDGE_UUID_FIXTURE],
+                        [HOME_ONLY_EDGE_UUID_FIXTURE],
+                        [UNIQUE_WRONG_EDGE_UUID_FIXTURE],
+                    ]
+                ),
+            ]
+        )
+
+        async def _record_home_query(cypher, params=None):
+            call_order.append(('home', cypher, params or {}))
+            return MagicMock()
+
+        home_mock.query = AsyncMock(side_effect=_record_home_query)
+
+        backend._driver._get_graph = _route_graphs({
+            WRONG_GRAPH_FIXTURE: wrong_mock,
+            HOME_GRAPH_FIXTURE: home_mock,
+        })
+
+        # the unique wrong-copy edge's fact_embedding reads None (null/absent).
+        fake_read_compact = AsyncMock(return_value=None)
+        monkeypatch.setattr(cross_graph_move, '_read_compact_vector', fake_read_compact)
+
+        result = await merge_foreign_duplicate(
+            backend, NODE_UUID_FIXTURE, WRONG_GRAPH_FIXTURE, HOME_GRAPH_FIXTURE,
+        )
+
+        assert len(call_order) == 2
+        create_role, create_cypher, create_params = call_order[0]
+        assert create_role == 'home'
+        assert 'CREATE' in create_cypher
+        assert 'RELATES_TO' in create_cypher
+        assert 'fact_embedding' not in create_cypher
+        assert 'vecf32' not in create_cypher
+        assert create_params.get('edge_uuid') == UNIQUE_WRONG_EDGE_UUID_FIXTURE
+        assert create_params.get('src_uuid') == NODE_UUID_FIXTURE
+        assert create_params.get('dst_uuid') == OTHER_NODE_UUID_FIXTURE
+        assert create_params.get('fact') == 'Alice is related to Carol.'
+
+        # the wrong-graph-copy DETACH DELETE still runs strictly AFTER the
+        # recreate -- create-before-delete preserved for a null-embedding edge.
+        delete_role, delete_cypher, delete_params = call_order[1]
+        assert delete_role == 'wrong'
+        assert 'DETACH DELETE' in delete_cypher
+        assert delete_params.get('uuid') == NODE_UUID_FIXTURE
+
+        assert result.edges_recreated == 1
+        assert result.home_edge_count_before == 2
+        assert result.home_edge_count_after == 3
+
+    @pytest.mark.asyncio
     async def test_home_edge_count_after_is_independent_reread_not_arithmetic(
         self, mock_config, make_backend, make_graph_mock, monkeypatch,
     ):
@@ -1199,6 +1376,48 @@ class TestCreateMovedNode:
         assert result.uuid == NODE_UUID_FIXTURE
         assert result.source_graph == SOURCE_GRAPH_FIXTURE
         assert result.target_graph == TARGET_GRAPH_FIXTURE
+        assert result.already_created is False
+
+    @pytest.mark.asyncio
+    async def test_null_name_embedding_creates_node_without_embedding_property(
+        self, mock_config, make_backend, make_graph_mock, monkeypatch,
+    ):
+        """A null/absent name_embedding (_read_compact_vector returns None)
+        is valid real data, not corruption: the node CREATE still issues,
+        omitting the name_embedding property entirely (no vecf32 literal)
+        while every other property/param is preserved, and the call does
+        NOT raise.
+        """
+        backend = make_backend(mock_config)
+        source_mock = make_graph_mock()
+        source_mock.ro_query = AsyncMock(return_value=MagicMock(result_set=[NODE_ROW_FIXTURE]))
+        target_mock = make_graph_mock()
+        target_mock.ro_query = AsyncMock(return_value=MagicMock(result_set=[]))
+        backend._driver._get_graph = _route_graphs({
+            SOURCE_GRAPH_FIXTURE: source_mock,
+            TARGET_GRAPH_FIXTURE: target_mock,
+        })
+
+        fake_read_compact = AsyncMock(return_value=None)
+        monkeypatch.setattr(cross_graph_move, '_read_compact_vector', fake_read_compact)
+
+        result = await create_moved_node(
+            backend, NODE_UUID_FIXTURE, SOURCE_GRAPH_FIXTURE, TARGET_GRAPH_FIXTURE,
+        )
+
+        target_mock.query.assert_awaited_once()
+        cypher = extract_cypher(target_mock.query.call_args)
+        params = extract_params(target_mock.query.call_args)
+        assert 'CREATE' in cypher
+        assert 'name_embedding' not in cypher
+        assert 'vecf32' not in cypher
+        assert params.get('uuid') == NODE_UUID_FIXTURE
+        assert params.get('name') == 'Alice'
+        assert params.get('group_id') == SOURCE_GRAPH_FIXTURE
+        assert params.get('summary') == 'Alice is a person.'
+        assert params.get('created_at') == '2026-01-01T00:00:00+00:00'
+
+        assert isinstance(result, CreateResult)
         assert result.already_created is False
 
     @pytest.mark.asyncio
@@ -1539,6 +1758,7 @@ class TestRecreateSubgraphRelationships:
         assert result.edges_recreated == 1
         assert result.edges_skipped == 0
         assert result.dropped_cross_target == []
+        assert result.embedding_omitted == 0
 
     @pytest.mark.asyncio
     async def test_edge_between_two_different_targets_is_dropped_not_created_in_either(
@@ -1653,6 +1873,74 @@ class TestRecreateSubgraphRelationships:
         assert dropped['dst_target'] is None
 
     @pytest.mark.asyncio
+    async def test_null_fact_embedding_recreates_move_edge_without_embedding_property(
+        self, mock_config, make_backend, make_graph_mock, monkeypatch,
+    ):
+        """A null/absent fact_embedding on a MOVE-pass RELATES_TO edge is
+        valid real data, not corruption (the live f0fc1aba-in-reify scenario
+        that used to abort the WHOLE batch): the edge is still recreated in
+        the target, omitting the fact_embedding property entirely (no vecf32
+        literal) while every other property/param is preserved, edges_
+        recreated still counts it, and the call does NOT raise.
+        """
+        backend = make_backend(mock_config)
+
+        source_mock = make_graph_mock()
+
+        async def _source_ro_query(cypher, params=None):
+            if 'RELATES_TO' in cypher:
+                return MagicMock(result_set=[EDGE_ROW_FIXTURE])
+            return MagicMock(result_set=[])  # no MENTIONS in this scenario
+
+        source_mock.ro_query = AsyncMock(side_effect=_source_ro_query)
+
+        target_mock = make_graph_mock()
+
+        async def _target_ro_query(cypher, params=None):
+            if 'RELATES_TO' in cypher:
+                # edge-already-in-target idempotency probe: not yet present
+                # -- a first-time apply.
+                return MagicMock(result_set=[])
+            # entity-presence probe for the non-migrating endpoint (B):
+            # already present in target.
+            return MagicMock(result_set=[[OTHER_NODE_UUID_FIXTURE]])
+
+        target_mock.ro_query = AsyncMock(side_effect=_target_ro_query)
+        target_mock.query = AsyncMock(return_value=MagicMock(relationships_created=1))
+
+        backend._driver._get_graph = _route_graphs({
+            SOURCE_GRAPH_FIXTURE: source_mock,
+            TARGET_GRAPH_FIXTURE: target_mock,
+        })
+
+        # the edge's fact_embedding reads None (null/absent).
+        fake_read_compact = AsyncMock(return_value=None)
+        monkeypatch.setattr(cross_graph_move, '_read_compact_vector', fake_read_compact)
+
+        # Only A is in this batch -- B (OTHER_NODE_UUID_FIXTURE) is a
+        # non-migrating home-resident already present in T.
+        specs = [_move_spec(NODE_UUID_FIXTURE, SOURCE_GRAPH_FIXTURE, TARGET_GRAPH_FIXTURE)]
+
+        result = await recreate_subgraph_relationships(backend, specs)
+
+        target_mock.query.assert_awaited_once()
+        cypher = extract_cypher(target_mock.query.call_args)
+        params = extract_params(target_mock.query.call_args)
+        assert 'CREATE' in cypher
+        assert 'RELATES_TO' in cypher
+        assert 'fact_embedding' not in cypher
+        assert 'vecf32' not in cypher
+        assert params.get('src_uuid') == NODE_UUID_FIXTURE
+        assert params.get('dst_uuid') == OTHER_NODE_UUID_FIXTURE
+        assert params.get('edge_uuid') == EDGE_UUID_FIXTURE
+        assert params.get('group_id') == TARGET_GRAPH_FIXTURE
+
+        assert result.edges_recreated == 1
+        assert result.edges_skipped == 0
+        assert result.dropped_cross_target == []
+        assert result.embedding_omitted == 1
+
+    @pytest.mark.asyncio
     async def test_merge_fold_recreates_only_wrong_copys_unique_edge(
         self, mock_config, make_backend, make_graph_mock, monkeypatch,
     ):
@@ -1718,6 +2006,66 @@ class TestRecreateSubgraphRelationships:
 
         assert result.edges_recreated == 1
         assert result.edges_skipped == 0
+        assert result.embedding_omitted == 0
+
+    @pytest.mark.asyncio
+    async def test_merge_fold_null_fact_embedding_recreates_edge_without_embedding_property(
+        self, mock_config, make_backend, make_graph_mock, monkeypatch,
+    ):
+        """A null/absent fact_embedding on the MERGE fold's unique-wrong-copy
+        edge is valid real data, not corruption: it is still folded onto the
+        home copy, omitting the fact_embedding property entirely (no vecf32
+        literal), counted in edges_recreated, and the call does NOT raise.
+        """
+        backend = make_backend(mock_config)
+
+        wrong_mock = make_graph_mock()
+        wrong_mock.ro_query = AsyncMock(
+            return_value=MagicMock(
+                result_set=[SHARED_EDGE_ROW_FIXTURE, UNIQUE_WRONG_EDGE_ROW_FIXTURE]
+            )
+        )
+
+        home_mock = make_graph_mock()
+        # home's CURRENT incident edge-uuid set: only the shared edge -- the
+        # unique-wrong edge is NOT yet there.
+        home_mock.ro_query = AsyncMock(
+            return_value=MagicMock(result_set=[[SHARED_EDGE_UUID_FIXTURE]])
+        )
+        home_mock.query = AsyncMock(return_value=MagicMock(relationships_created=1))
+
+        backend._driver._get_graph = _route_graphs({
+            WRONG_GRAPH_FIXTURE: wrong_mock,
+            HOME_GRAPH_FIXTURE: home_mock,
+        })
+
+        # the unique wrong-copy edge's fact_embedding reads None (null/absent).
+        fake_read_compact = AsyncMock(return_value=None)
+        monkeypatch.setattr(cross_graph_move, '_read_compact_vector', fake_read_compact)
+
+        specs = [_merge_spec(NODE_UUID_FIXTURE, WRONG_GRAPH_FIXTURE, HOME_GRAPH_FIXTURE)]
+
+        result = await recreate_subgraph_relationships(backend, specs)
+
+        assert home_mock.query.await_count == 1
+        cypher = extract_cypher(home_mock.query.call_args)
+        params = extract_params(home_mock.query.call_args)
+        assert 'CREATE' in cypher
+        assert 'fact_embedding' not in cypher
+        assert 'vecf32' not in cypher
+        assert params.get('edge_uuid') == UNIQUE_WRONG_EDGE_UUID_FIXTURE
+        assert params.get('src_uuid') == NODE_UUID_FIXTURE
+        assert params.get('dst_uuid') == OTHER_NODE_UUID_FIXTURE
+        # preserves the wrong-copy's OWN group_id -- MERGE has no
+        # rewrite_group_id analogue (mirrors merge_foreign_duplicate).
+        assert params.get('group_id') == WRONG_GRAPH_FIXTURE
+
+        # no DETACH DELETE of the wrong copy in this phase.
+        wrong_mock.query.assert_not_awaited()
+
+        assert result.edges_recreated == 1
+        assert result.edges_skipped == 0
+        assert result.embedding_omitted == 1
 
     @pytest.mark.asyncio
     async def test_edge_already_present_in_target_is_idempotent_noop(
@@ -1838,42 +2186,69 @@ class TestRecreateSubgraphRelationships:
         assert result.dropped_cross_target == []
 
     @pytest.mark.asyncio
-    async def test_exception_partway_through_batch_carries_partial_progress_tally(
+    async def test_move_edge_create_failure_is_isolated_not_batch_aborting(
         self, mock_config, make_backend, make_graph_mock, monkeypatch,
     ):
-        """A batch that fails partway through (e.g. a transient FalkorDB
-        error raised by the MENTIONS create, AFTER the co-moving RELATES_TO
-        edge already landed in target) must not discard the real, non-zero
-        progress made before the raise. recreate_subgraph_relationships
-        mutates target graphs incrementally as it walks the batch, so the
-        exception it lets escape carries the tally accumulated so far as
-        exc.partial_result (a SubgraphEdgeResult) -- letting a caller (e.g.
-        run()'s Phase B error handling) report accurate partial-mutation
-        counts instead of an all-zero default (task 2415 amendment round 2).
+        """A single bad edge's CREATE (e.g. a transient FalkorDB error) in
+        the MOVE-edge pass must cost only that ONE edge, not the whole
+        batch: recreate_subgraph_relationships must RETURN (not raise),
+        still recreate every OTHER, independent edge normally, and record
+        the failing edge on result.blocked (kind='edge', its own uuid, a
+        reason naming the error, and its incident node uuid(s) -- so a
+        caller can withhold Phase C source-deletion for those nodes, per
+        this module's create-before-delete invariant). This generalizes the
+        live f0fc1aba-style failure from a null-embedding read (now
+        tolerated, see TestEmbeddingSetClause / the null-fact_embedding
+        tests above) to ANY per-edge CREATE failure -- the old whole-batch
+        abort (task 2415) is now reserved for systemic/gather failures only
+        (see test_gather_read_failure_still_propagates_with_partial_result
+        below).
         """
         backend = make_backend(mock_config)
+
+        # A second, fully INDEPENDENT MOVE spec/edge -- not a co-moving
+        # shared edge -- so the first edge's failure is unrelated to the
+        # second edge's success.
+        second_uuid = 'node-cccc-6666'
+        second_edge_uuid = 'edge-ffff-8888'
+        second_edge_other_uuid = 'node-dddd-7777'
+        second_edge_row = [
+            second_edge_uuid, 'is_related_to', 'Carol is related to Dave.',
+            '2026-01-01T00:00:00+00:00', None, '2026-01-01T00:00:00+00:00',
+            SOURCE_GRAPH_FIXTURE, ['episode-uuid-2'],
+            second_uuid, second_edge_other_uuid,
+        ]
 
         source_mock = make_graph_mock()
 
         async def _source_ro_query(cypher, params=None):
             params = params or {}
             if 'RELATES_TO' in cypher:
-                return MagicMock(result_set=[EDGE_ROW_FIXTURE])
-            if 'MENTIONS' in cypher:
                 if params.get('uuid') == NODE_UUID_FIXTURE:
-                    return MagicMock(result_set=[MENTION_ROW_FIXTURE])
-                return MagicMock(result_set=[])
-            return MagicMock(result_set=[])
+                    return MagicMock(result_set=[EDGE_ROW_FIXTURE])
+                if params.get('uuid') == second_uuid:
+                    return MagicMock(result_set=[second_edge_row])
+            return MagicMock(result_set=[])  # no MENTIONS in this scenario
 
         source_mock.ro_query = AsyncMock(side_effect=_source_ro_query)
 
         target_mock = make_graph_mock()
-        # Presence probes report "not yet present" -- a first-time apply --
-        # for both the edge and the mention, so both CREATEs are attempted.
-        target_mock.ro_query = AsyncMock(return_value=MagicMock(result_set=[]))
+
+        async def _target_ro_query(cypher, params=None):
+            if 'RELATES_TO' in cypher:
+                # edge-already-in-target idempotency probes: neither edge is
+                # yet present -- a first-time apply for both.
+                return MagicMock(result_set=[])
+            # entity-presence probes for both edges' non-migrating endpoints
+            # (OTHER_NODE_UUID_FIXTURE, second_edge_other_uuid): both already
+            # present in target.
+            return MagicMock(result_set=[['present']])
+
+        target_mock.ro_query = AsyncMock(side_effect=_target_ro_query)
 
         async def _target_query(cypher, params=None):
-            if 'MENTIONS' in cypher:
+            params = params or {}
+            if 'RELATES_TO' in cypher and params.get('edge_uuid') == EDGE_UUID_FIXTURE:
                 raise RuntimeError('simulated transient FalkorDB error')
             return MagicMock(relationships_created=1)
 
@@ -1887,26 +2262,121 @@ class TestRecreateSubgraphRelationships:
         fake_read_compact = AsyncMock(return_value=COMPACT_VECTOR_REPLY_FIXTURE)
         monkeypatch.setattr(cross_graph_move, '_read_compact_vector', fake_read_compact)
 
-        # Co-moving pair, same shape as test_co_moving_pair_shared_edge_
-        # recreated_exactly_once -- the shared RELATES_TO edge is recreated
-        # (edges loop runs to completion) BEFORE the MENTIONS loop runs and
-        # raises.
         specs = [
             _move_spec(NODE_UUID_FIXTURE, SOURCE_GRAPH_FIXTURE, TARGET_GRAPH_FIXTURE),
-            _move_spec(OTHER_NODE_UUID_FIXTURE, SOURCE_GRAPH_FIXTURE, TARGET_GRAPH_FIXTURE),
+            _move_spec(second_uuid, SOURCE_GRAPH_FIXTURE, TARGET_GRAPH_FIXTURE),
         ]
 
-        with pytest.raises(RuntimeError, match='simulated transient FalkorDB error') as exc_info:
+        result = await recreate_subgraph_relationships(backend, specs)
+
+        # the good, independent edge still landed -- one bad item costs one
+        # item, not the census.
+        assert result.edges_recreated == 1
+        assert result.edges_skipped == 0
+
+        assert len(result.blocked) == 1
+        blocked = result.blocked[0]
+        assert blocked['kind'] == 'edge'
+        assert blocked['uuid'] == EDGE_UUID_FIXTURE
+        assert 'simulated transient FalkorDB error' in blocked['reason']
+        # both incident (migrating-or-not) endpoints are carried, so a
+        # caller can withhold Phase C deletion for whichever of them is
+        # actually a migrating spec in this batch.
+        assert set(blocked['node_uuids']) == {NODE_UUID_FIXTURE, OTHER_NODE_UUID_FIXTURE}
+
+    @pytest.mark.asyncio
+    async def test_mentions_create_failure_is_isolated_not_batch_aborting(
+        self, mock_config, make_backend, make_graph_mock, monkeypatch,
+    ):
+        """The same per-item isolation applies to the MENTIONS pass: a bad
+        MENTIONS create is recorded on result.blocked (kind='mention', the
+        mention's own uuid, a reason naming the error, and the incident
+        entity's uuid) and the batch still returns normally instead of
+        raising.
+        """
+        backend = make_backend(mock_config)
+
+        source_mock = make_graph_mock()
+
+        async def _source_ro_query(cypher, params=None):
+            if 'MENTIONS' in cypher:
+                return MagicMock(result_set=[MENTION_ROW_FIXTURE])
+            return MagicMock(result_set=[])  # no RELATES_TO in this scenario
+
+        source_mock.ro_query = AsyncMock(side_effect=_source_ro_query)
+
+        target_mock = make_graph_mock()
+        # MENTIONS-already-in-target probe: not yet present -- a first-time
+        # apply, so the CREATE (which then raises) is attempted.
+        target_mock.ro_query = AsyncMock(return_value=MagicMock(result_set=[]))
+        target_mock.query = AsyncMock(
+            side_effect=RuntimeError('simulated transient FalkorDB mentions error'),
+        )
+
+        backend._driver._get_graph = _route_graphs({
+            SOURCE_GRAPH_FIXTURE: source_mock,
+            TARGET_GRAPH_FIXTURE: target_mock,
+        })
+
+        fake_read_compact = AsyncMock(return_value=COMPACT_VECTOR_REPLY_FIXTURE)
+        monkeypatch.setattr(cross_graph_move, '_read_compact_vector', fake_read_compact)
+
+        specs = [_move_spec(NODE_UUID_FIXTURE, SOURCE_GRAPH_FIXTURE, TARGET_GRAPH_FIXTURE)]
+
+        result = await recreate_subgraph_relationships(backend, specs)
+
+        assert result.mentions_recreated == 0
+        assert result.mentions_skipped == 0
+
+        assert len(result.blocked) == 1
+        blocked = result.blocked[0]
+        assert blocked['kind'] == 'mention'
+        assert blocked['uuid'] == MENTION_UUID_FIXTURE
+        assert 'simulated transient FalkorDB mentions error' in blocked['reason']
+        assert blocked['node_uuids'] == [NODE_UUID_FIXTURE]
+
+    @pytest.mark.asyncio
+    async def test_gather_read_failure_still_propagates_with_partial_result(
+        self, mock_config, make_backend, make_graph_mock, monkeypatch,
+    ):
+        """A per-spec gather ro_query (the edge/mentions READ that runs
+        BEFORE any of the three per-item recreate loops) raising is a
+        systemic/batch-level failure, not a single bad item -- it is
+        deliberately left OUTSIDE the new per-item isolation and still
+        propagates, carrying exc.partial_result (a SubgraphEdgeResult)
+        exactly like the retained task-2415 mechanism, so a caller can
+        still tell a total-outage batch apart from a batch with only a
+        handful of per-item blocks.
+        """
+        backend = make_backend(mock_config)
+
+        source_mock = make_graph_mock()
+        source_mock.ro_query = AsyncMock(
+            side_effect=RuntimeError('simulated gather read failure'),
+        )
+
+        target_mock = make_graph_mock()
+        backend._driver._get_graph = _route_graphs({
+            SOURCE_GRAPH_FIXTURE: source_mock,
+            TARGET_GRAPH_FIXTURE: target_mock,
+        })
+
+        fake_read_compact = AsyncMock(return_value=COMPACT_VECTOR_REPLY_FIXTURE)
+        monkeypatch.setattr(cross_graph_move, '_read_compact_vector', fake_read_compact)
+
+        specs = [_move_spec(NODE_UUID_FIXTURE, SOURCE_GRAPH_FIXTURE, TARGET_GRAPH_FIXTURE)]
+
+        with pytest.raises(RuntimeError, match='simulated gather read failure') as exc_info:
             await recreate_subgraph_relationships(backend, specs)
 
         partial = getattr(exc_info.value, 'partial_result', None)
         assert partial is not None
         assert isinstance(partial, SubgraphEdgeResult)
-        # the RELATES_TO edge landed BEFORE the MENTIONS create raised --
-        # that real progress must survive on the exception, not be silently
-        # discarded along with the rest of the (never-returned) result.
-        assert partial.edges_recreated == 1
-        assert partial.edges_skipped == 0
+        # nothing was mutated -- the raise happened during the gather phase,
+        # before any of the three per-item recreate loops ever started.
+        assert partial.edges_recreated == 0
         assert partial.mentions_recreated == 0
-        assert partial.mentions_skipped == 0
-        assert partial.dropped_cross_target == []
+        assert partial.blocked == []
+
+        target_mock.query.assert_not_awaited()
+        fake_read_compact.assert_not_awaited()

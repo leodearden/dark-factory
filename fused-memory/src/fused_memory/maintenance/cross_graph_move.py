@@ -45,6 +45,10 @@ logger = logging.getLogger(__name__)
 # reply scalar-type tag for a vecf32 column (see _read_compact_vector).
 _VALUE_VECTORF32 = 12
 
+# falkordb.query_result.ResultSetScalarTypes.VALUE_NULL -- the compact-reply
+# scalar-type tag for a NULL/absent property (see _read_compact_vector).
+_VALUE_NULL = 1
+
 
 # ---------------------------------------------------------------------------
 # Byte-exact vecf32 passthrough (pure functions -- never call float() here)
@@ -82,6 +86,25 @@ def format_vecf32_literal(tokens: list[str]) -> str:
     return f"vecf32([{', '.join(tokens)}])"
 
 
+def _embedding_set_clause(assignment_target: str, reply: str | None) -> str:
+    """Render an optional, comma-prefixed embedding SET fragment.
+
+    This is the single seam that makes the embedding property optional at
+    every recreate site (node ``name_embedding`` / edge ``fact_embedding``):
+    when *reply* is ``None`` (a null/absent source embedding -- see
+    ``_read_compact_vector``), returns ``''`` so the caller's CREATE omits
+    the embedding property entirely, preserving every other property on the
+    recreated node/edge. When *reply* is a real ``--compact`` vector reply,
+    returns ``f', {assignment_target} = {vecf32([...])}'`` -- reusing the
+    UNCHANGED byte-exact ``format_vecf32_literal(parse_compact_vector_reply(
+    ...))`` passthrough, so the non-null path stays byte-identical to before
+    this helper existed.
+    """
+    if reply is None:
+        return ''
+    return f', {assignment_target} = {format_vecf32_literal(parse_compact_vector_reply(reply))}'
+
+
 def _quote_cypher_string(value: str) -> str:
     """Inline *value* as a single-quoted Cypher string literal, escaping ``\\``/``'``.
 
@@ -94,7 +117,9 @@ def _quote_cypher_string(value: str) -> str:
     return f"'{escaped}'"
 
 
-async def _read_compact_vector(falkor_client: Any, *, group_id: str, cypher: str) -> str:
+async def _read_compact_vector(
+    falkor_client: Any, *, group_id: str, cypher: str,
+) -> str | None:
     """Injectable raw ``--compact`` transport seam for a single vecf32 column.
 
     Issues *cypher* (expected to ``RETURN`` exactly one vecf32-typed value)
@@ -105,7 +130,8 @@ async def _read_compact_vector(falkor_client: Any, *, group_id: str, cypher: str
     textual double representation; this is the RCA-validated truncation this
     module exists to avoid). Returns the raw bracketed, comma-separated
     vector text (the same shape ``parse_compact_vector_reply`` consumes),
-    extracted from the reply WITHOUT ever calling ``float()``.
+    extracted from the reply WITHOUT ever calling ``float()`` -- or ``None``
+    when the source property is null/absent (see below).
 
     This default implementation reads the ``falkordb`` package's own
     (already-parsed-elsewhere) reply-shape convention
@@ -117,21 +143,51 @@ async def _read_compact_vector(falkor_client: Any, *, group_id: str, cypher: str
     remains validated separately, in the η live throwaway-graph rehearsal
     (see ``plans/cross-graph-entity-leak-prd.md`` decision 5).
 
-    A null/absent embedding (e.g. an Entity/RELATES_TO row somehow missing
-    its embedding property) surfaces as the ``ValueError`` below, never as a
-    silently-empty vector: FalkorDB reports a NULL property with a
-    non-VECTORF32 ``scalar_type``, so it fails the type check before the
-    token list is ever indexed. This is a deliberate choice, not an
-    oversight -- every row this module reads is expected to carry an
-    embedding, so a missing one is treated as a hard, descriptively-messaged
-    failure (naming *group_id* and *cypher*) that surfaces a corrupt/
-    unexpected source row immediately, rather than silently proceeding
-    without it (which would produce a differently-shaped, harder-to-
-    diagnose gap later -- e.g. a moved node that can no longer be found by
-    semantic search). A reply with zero rows (e.g. a transient race where
-    the source row was deleted between an earlier existence check and this
-    read, or an unexpected reply shape) raises the same kind of descriptive
-    ``ValueError`` rather than a bare ``IndexError``.
+    A null/absent embedding (e.g. an Entity/RELATES_TO row that was
+    persisted without its embedding property -- confirmed live: ~10% of
+    RELATES_TO edges) surfaces as a ``scalar_type`` of ``_VALUE_NULL`` (1).
+    This is now recognized as valid real data, not corruption: this function
+    returns ``None`` for exactly that tag, letting callers recreate the
+    node/edge embedding-less instead of failing. Any OTHER non-VECTORF32
+    ``scalar_type`` (a genuinely wrong-typed column -- e.g. VALUE_ARRAY) is
+    still a hard, descriptively-messaged failure (naming *group_id* and
+    *cypher*) that surfaces a corrupt/unexpected source row immediately,
+    rather than silently proceeding without it (which would produce a
+    differently-shaped, harder-to-diagnose gap later -- e.g. a moved node
+    that can no longer be found by semantic search). A reply with zero rows
+    (e.g. a transient race where the source row was deleted between an
+    earlier existence check and this read, or an unexpected reply shape)
+    raises the same kind of descriptive ``ValueError`` rather than a bare
+    ``IndexError``.
+
+    CAVEAT (reviewer follow-up, task 2451 amendment): the ``scalar_type ==
+    _VALUE_NULL`` (1) tag match immediately below is exercised only by a
+    hand-built mock reply (``TestReadCompactVectorTransport::
+    test_null_absent_embedding_returns_none_sentinel``'s
+    ``_compact_reply([_VALUE_NULL_TAG, None])``). The live incident that
+    motivated this fix (edge f0fc1aba in reify, 2026-07-11) confirms that
+    null/absent embeddings EXIST at ~10% prevalence in production -- it
+    does not, by itself, confirm this exact compact-reply cell shape for a
+    null property against a real FalkorDB. If the live shape ever differs
+    (a different tag or a wrapped cell), this function falls through to the
+    ValueError branch below instead -- safe (matches the pre-fix behaviour,
+    no data corruption) but silently non-fixing for the ~10% scenario this
+    task targets, with every unit test still green.
+
+    TRACKED (not just this comment): filed as a fused-memory follow-up via
+    submit_task; the curator confirmed it as a duplicate of, and folded it
+    into, task 2273 (CGL-η Phase-1 live migration gate -- ``dark_factory``
+    project, currently ``blocked`` pending a human/L2 session) rather than
+    creating a new task, because task 2273's own RUNBOOK step 1 ("LIVE
+    REHEARSAL... on the LIVE FalkorDB") already mandates exactly this kind
+    of probe before the census apply. Whoever resolves task 2273's
+    escalation MUST extend that rehearsal with one additional probe case --
+    seed a ``_probe``-prefixed edge with a persisted-null ``fact_embedding``
+    and assert this function returns ``None`` against that real row --
+    before the null-tolerance path added here is trusted at full-census
+    scale. Editing task 2273's runbook text or ``plans/cross-graph-entity-
+    leak-prd.md`` itself is outside ``fused_memory/maintenance``'s locked
+    scope for this amendment pass and is not done here.
     """
     reply = await falkor_client.execute_command('GRAPH.RO_QUERY', group_id, cypher, '--compact')
     rows = reply[1]
@@ -144,12 +200,19 @@ async def _read_compact_vector(falkor_client: Any, *, group_id: str, cypher: str
         )
     cell = rows[0][0]
     scalar_type, value = int(cell[0]), cell[1]
+    if scalar_type == _VALUE_NULL:
+        # Mock-verified only -- see this function's "CAVEAT" docstring
+        # paragraph: tracked as part of task 2273's (CGL-η) live rehearsal,
+        # which must confirm this tag against a real FalkorDB null property
+        # before full-census trust.
+        return None
     if scalar_type != _VALUE_VECTORF32:
         raise ValueError(
             f'_read_compact_vector: expected a VECTORF32 (12) cell for '
             f'group_id={group_id!r}, got scalar_type={scalar_type} '
             f'(cypher={cypher!r}). A null/absent embedding on the source row '
-            f"surfaces here too -- see this function's docstring."
+            f'surfaces as scalar_type={_VALUE_NULL} (VALUE_NULL) and is '
+            "returned as None instead -- see this function's docstring."
         )
     tokens = [v.decode() if isinstance(v, bytes) else str(v) for v in value]
     return '[' + ', '.join(tokens) + ']'
@@ -327,15 +390,14 @@ async def _create_entity_in_target(
     embedding_reply = await _read_compact_vector(
         falkor_client, group_id=source_graph, cypher=embedding_cypher,
     )
-    embedding_literal = format_vecf32_literal(parse_compact_vector_reply(embedding_reply))
 
     await target.query(
         'CREATE (n:Entity {uuid: $uuid}) '
         'SET n.name = $name, '
         '    n.group_id = $group_id, '
         '    n.summary = $summary, '
-        '    n.created_at = $created_at, '
-        f'    n.name_embedding = {embedding_literal}',
+        '    n.created_at = $created_at'
+        f'{_embedding_set_clause("n.name_embedding", embedding_reply)}',
         {
             'uuid': node_uuid,
             'name': name,
@@ -623,9 +685,6 @@ async def move_entity_across_graphs(
         edge_embedding_reply = await _read_compact_vector(
             falkor_client, group_id=source_graph, cypher=edge_embedding_cypher,
         )
-        edge_embedding_literal = format_vecf32_literal(
-            parse_compact_vector_reply(edge_embedding_reply)
-        )
 
         # Both endpoints are MATCHed (never CREATEd) by uuid: the other
         # endpoint (dst_uuid) must already exist in target_graph for the
@@ -645,8 +704,8 @@ async def move_entity_across_graphs(
             '    r.invalid_at = $invalid_at, '
             '    r.created_at = $created_at, '
             '    r.group_id = $group_id, '
-            '    r.episodes = $episodes, '
-            f'    r.fact_embedding = {edge_embedding_literal}',
+            '    r.episodes = $episodes'
+            f'{_embedding_set_clause("r.fact_embedding", edge_embedding_reply)}',
             {
                 'src_uuid': src_uuid,
                 'dst_uuid': dst_uuid,
@@ -771,6 +830,35 @@ class SubgraphEdgeResult:
             Reported for human review, never silently lost. Populated by
             the cross-target detection extension (task 2415 step-8) --
             always empty for a batch with no such edges.
+        blocked: Records for individual edges/mentions whose embedding read
+            or CREATE raised (e.g. a transient FalkorDB error) -- each a
+            dict with ``kind`` (``'edge'`` or ``'mention'``), the item's own
+            ``uuid``, a human-readable ``reason`` (``str(exc)``), and
+            ``node_uuids`` (the incident node uuid(s): both endpoints for a
+            RELATES_TO edge, the entity uuid for a MENTIONS link). Per-item
+            isolation (CGL-η follow-up, task 2451) means a single bad
+            edge/mention costs only itself -- the batch continues and this
+            item is surfaced here for human review, same "never silently
+            lost" convention as ``dropped_cross_target``, rather than
+            aborting the whole batch the way it used to (see this
+            function's docstring). A caller MUST withhold Phase C
+            source-deletion for every uuid named here, or the un-recreated
+            edge/mention -- which still exists only in source -- would be
+            destroyed (see ``scripts/migrate_cross_graph_leak.py``'s
+            ``run()``). Always empty for a batch with no such failures.
+        embedding_omitted: Count of RELATES_TO edges counted in
+            ``edges_recreated`` (a subset of it, never mentions -- MENTIONS
+            links carry no embedding property) whose source
+            ``fact_embedding`` read null/absent, so the recreated edge
+            landed WITHOUT that property (see ``_embedding_set_clause`` /
+            ``_read_compact_vector``'s null-tolerance, CGL-η follow-up
+            reviewer amendment, task 2451). An embedding-less RELATES_TO
+            edge is invisible to vector/semantic search, so this is a
+            quality signal surfaced for operator visibility -- purely
+            informational, it does NOT gate ``blocked``/exit_code the way
+            ``dropped_cross_target``/``blocked`` do, since a null embedding
+            is valid data, not a failure. Always 0 for a batch where every
+            recreated edge carried a real embedding.
     """
 
     edges_recreated: int = 0
@@ -778,6 +866,8 @@ class SubgraphEdgeResult:
     mentions_recreated: int = 0
     mentions_skipped: int = 0
     dropped_cross_target: list = field(default_factory=list)
+    blocked: list = field(default_factory=list)
+    embedding_omitted: int = 0
 
 
 async def _entity_present_in_graph(graph: Any, uuid: str) -> bool:
@@ -923,19 +1013,29 @@ async def recreate_subgraph_relationships(graphiti: Any, specs: list[dict]) -> S
 
     Returns:
         SubgraphEdgeResult tallying edges/mentions recreated vs. skipped
-        (plus, from step-8 onward, any cross-target-dropped edges).
+        (plus, from step-8 onward, any cross-target-dropped edges, and from
+        the CGL-η follow-up onward, any per-item ``blocked`` failures).
 
     Raises:
-        Whatever the underlying graph/embedding read or CREATE calls raise.
-        This primitive mutates target graphs incrementally as it walks the
-        batch, so a mid-batch failure can still leave real, non-zero
-        edges/mentions counts recreated before the raise -- that partial
-        tally is attached to the exception as ``exc.partial_result`` (a
-        ``SubgraphEdgeResult``) instead of being discarded, so a caller
-        (e.g. ``scripts/migrate_cross_graph_leak.py``'s ``run()``) can
-        surface accurate partial-progress counts instead of reporting an
-        all-zero default for a batch that was actually partway mutated
-        (task 2415 amendment round 2).
+        A single edge/mention's embedding read or CREATE raising (e.g. a
+        transient FalkorDB error) is per-item isolated (CGL-η follow-up,
+        task 2451): it does NOT raise out of this function -- it is instead
+        recorded on the returned result's ``blocked`` list and the batch
+        continues, so one bad item costs one item, not the whole census.
+        What DOES still raise out of this function is a systemic/batch-level
+        failure -- a per-spec gather ``ro_query`` (reading a spec's incident
+        edges/mentions, or a MERGE spec's wrong-copy/home edge sets) or a
+        lost falkor-client acquisition -- since that is not a single item's
+        problem. This primitive mutates target graphs incrementally as it
+        walks the batch, so a mid-batch systemic failure can still leave
+        real, non-zero edges/mentions counts (and blocked entries) recorded
+        before the raise -- that partial tally is attached to the exception
+        as ``exc.partial_result`` (a ``SubgraphEdgeResult``) instead of
+        being discarded, so a caller (e.g.
+        ``scripts/migrate_cross_graph_leak.py``'s ``run()``) can surface
+        accurate partial-progress counts instead of reporting an all-zero
+        default for a batch that was actually partway mutated (task 2415
+        amendment round 2).
     """
     result = SubgraphEdgeResult()
     try:
@@ -1042,51 +1142,84 @@ async def _recreate_subgraph_relationships_batch(
             # incremented.
             continue
 
-        edge_embedding_cypher = (
-            f'MATCH ()-[e:RELATES_TO {{uuid: {_quote_cypher_string(edge_uuid)}}}]-() '
-            'RETURN e.fact_embedding'
-        )
-        edge_embedding_reply = await _read_compact_vector(
-            falkor_client, group_id=source_graph, cypher=edge_embedding_cypher,
-        )
-        edge_embedding_literal = format_vecf32_literal(
-            parse_compact_vector_reply(edge_embedding_reply)
-        )
+        try:
+            edge_embedding_cypher = (
+                f'MATCH ()-[e:RELATES_TO {{uuid: {_quote_cypher_string(edge_uuid)}}}]-() '
+                'RETURN e.fact_embedding'
+            )
+            edge_embedding_reply = await _read_compact_vector(
+                falkor_client, group_id=source_graph, cypher=edge_embedding_cypher,
+            )
+            embedding_clause = _embedding_set_clause('r.fact_embedding', edge_embedding_reply)
 
-        edge_create_result = await target.query(
-            'MATCH (a:Entity {uuid: $src_uuid}), (b:Entity {uuid: $dst_uuid}) '
-            'CREATE (a)-[r:RELATES_TO]->(b) '
-            'SET r.uuid = $edge_uuid, '
-            '    r.name = $name, '
-            '    r.fact = $fact, '
-            '    r.valid_at = $valid_at, '
-            '    r.invalid_at = $invalid_at, '
-            '    r.created_at = $created_at, '
-            '    r.group_id = $group_id, '
-            '    r.episodes = $episodes, '
-            f'    r.fact_embedding = {edge_embedding_literal}',
-            {
-                'src_uuid': src_uuid,
-                'dst_uuid': dst_uuid,
-                'edge_uuid': edge_uuid,
-                'name': edge_name,
-                'fact': fact,
-                'valid_at': valid_at,
-                'invalid_at': invalid_at,
-                'created_at': edge_created_at,
-                'group_id': target_graph_name,
-                'episodes': episodes,
-            },
-        )
-        if edge_create_result.relationships_created:
-            result.edges_recreated += 1
-        else:
-            result.edges_skipped += 1
-            logger.warning(
+            edge_create_result = await target.query(
+                'MATCH (a:Entity {uuid: $src_uuid}), (b:Entity {uuid: $dst_uuid}) '
+                'CREATE (a)-[r:RELATES_TO]->(b) '
+                'SET r.uuid = $edge_uuid, '
+                '    r.name = $name, '
+                '    r.fact = $fact, '
+                '    r.valid_at = $valid_at, '
+                '    r.invalid_at = $invalid_at, '
+                '    r.created_at = $created_at, '
+                '    r.group_id = $group_id, '
+                '    r.episodes = $episodes'
+                f'{embedding_clause}',
+                {
+                    'src_uuid': src_uuid,
+                    'dst_uuid': dst_uuid,
+                    'edge_uuid': edge_uuid,
+                    'name': edge_name,
+                    'fact': fact,
+                    'valid_at': valid_at,
+                    'invalid_at': invalid_at,
+                    'created_at': edge_created_at,
+                    'group_id': target_graph_name,
+                    'episodes': episodes,
+                },
+            )
+            if edge_create_result.relationships_created:
+                result.edges_recreated += 1
+                if not embedding_clause:
+                    result.embedding_omitted += 1
+            else:
+                result.edges_skipped += 1
+                logger.warning(
+                    'recreate_subgraph_relationships: RELATES_TO edge uuid=%s '
+                    'silently skipped -- other endpoint (src=%s dst=%s) not '
+                    'present in target_graph=%s',
+                    edge_uuid, src_uuid, dst_uuid, target_graph_name,
+                )
+        except Exception as exc:
+            # Per-item isolation (CGL-η follow-up, task 2451): a single bad
+            # edge's embedding read or CREATE (e.g. a transient FalkorDB
+            # error) costs only this ONE edge, not the whole batch -- unlike
+            # a per-spec gather-read failure (outside this try/except),
+            # which remains a systemic/batch-level abort (see this module's
+            # recreate_subgraph_relationships docstring). Both incident node
+            # uuids are recorded so a caller can withhold Phase C
+            # source-deletion for them, preserving create-before-delete for
+            # this un-recreated edge.
+            result.blocked.append({
+                'kind': 'edge',
+                'uuid': edge_uuid,
+                'reason': str(exc),
+                'node_uuids': [src_uuid, dst_uuid],
+            })
+            # error + exc_info (reviewer follow-up, task 2451 amendment):
+            # this broad `except Exception` deliberately isolates any
+            # per-item failure, including a genuine programming error from a
+            # future refactor -- logging the full traceback here (instead of
+            # a bare warning) keeps such a bug diagnosable as a traceback in
+            # the logs rather than reading as a routine per-item data skip,
+            # without narrowing the catch and risking an un-isolated
+            # transient failure aborting the batch again.
+            logger.error(
                 'recreate_subgraph_relationships: RELATES_TO edge uuid=%s '
-                'silently skipped -- other endpoint (src=%s dst=%s) not '
-                'present in target_graph=%s',
-                edge_uuid, src_uuid, dst_uuid, target_graph_name,
+                'blocked -- %s: %s (src=%s dst=%s target_graph=%s); batch '
+                'continues',
+                edge_uuid, type(exc).__name__, exc, src_uuid, dst_uuid,
+                target_graph_name,
+                exc_info=True,
             )
 
     for mention_uuid, (row, _source_graph, entity_uuid) in mentions_by_uuid.items():
@@ -1100,29 +1233,50 @@ async def _recreate_subgraph_relationships_batch(
             # incremented. Mirrors the RELATES_TO skip above.
             continue
 
-        mention_create_result = await target.query(
-            'MATCH (ep:Episodic {uuid: $episode_uuid}), (n:Entity {uuid: $entity_uuid}) '
-            'CREATE (ep)-[e:MENTIONS]->(n) '
-            'SET e.uuid = $edge_uuid, '
-            '    e.group_id = $group_id, '
-            '    e.created_at = $created_at',
-            {
-                'episode_uuid': episode_uuid,
-                'entity_uuid': entity_uuid,
-                'edge_uuid': mention_uuid,
-                'group_id': target_graph_name,
-                'created_at': mention_created_at,
-            },
-        )
-        if mention_create_result.relationships_created:
-            result.mentions_recreated += 1
-        else:
-            result.mentions_skipped += 1
-            logger.warning(
+        try:
+            mention_create_result = await target.query(
+                'MATCH (ep:Episodic {uuid: $episode_uuid}), (n:Entity {uuid: $entity_uuid}) '
+                'CREATE (ep)-[e:MENTIONS]->(n) '
+                'SET e.uuid = $edge_uuid, '
+                '    e.group_id = $group_id, '
+                '    e.created_at = $created_at',
+                {
+                    'episode_uuid': episode_uuid,
+                    'entity_uuid': entity_uuid,
+                    'edge_uuid': mention_uuid,
+                    'group_id': target_graph_name,
+                    'created_at': mention_created_at,
+                },
+            )
+            if mention_create_result.relationships_created:
+                result.mentions_recreated += 1
+            else:
+                result.mentions_skipped += 1
+                logger.warning(
+                    'recreate_subgraph_relationships: MENTIONS link uuid=%s '
+                    'silently skipped -- episode uuid=%s not present in '
+                    'target_graph=%s (entity_uuid=%s)',
+                    mention_uuid, episode_uuid, target_graph_name, entity_uuid,
+                )
+        except Exception as exc:
+            # Per-item isolation, same rationale as the RELATES_TO edge pass
+            # above: a single bad MENTIONS CREATE costs only this ONE link.
+            result.blocked.append({
+                'kind': 'mention',
+                'uuid': mention_uuid,
+                'reason': str(exc),
+                'node_uuids': [entity_uuid],
+            })
+            # error + exc_info: see the RELATES_TO MOVE-edge pass's matching
+            # comment above -- keeps a programming-error traceback visible
+            # in the logs instead of reading as a routine per-item skip.
+            logger.error(
                 'recreate_subgraph_relationships: MENTIONS link uuid=%s '
-                'silently skipped -- episode uuid=%s not present in '
-                'target_graph=%s (entity_uuid=%s)',
-                mention_uuid, episode_uuid, target_graph_name, entity_uuid,
+                'blocked -- %s: %s (entity_uuid=%s target_graph=%s); batch '
+                'continues',
+                mention_uuid, type(exc).__name__, exc, entity_uuid,
+                target_graph_name,
+                exc_info=True,
             )
 
     # --- MERGE fold ---
@@ -1157,58 +1311,80 @@ async def _recreate_subgraph_relationships_batch(
             (_edge_uuid, edge_name, fact, valid_at, invalid_at, edge_created_at,
              edge_group_id, episodes, src_uuid, dst_uuid) = wrong_rows_by_uuid[edge_uuid]
 
-            edge_embedding_cypher = (
-                f'MATCH ()-[e:RELATES_TO {{uuid: {_quote_cypher_string(edge_uuid)}}}]-() '
-                'RETURN e.fact_embedding'
-            )
-            edge_embedding_reply = await _read_compact_vector(
-                falkor_client, group_id=wrong_graph, cypher=edge_embedding_cypher,
-            )
-            edge_embedding_literal = format_vecf32_literal(
-                parse_compact_vector_reply(edge_embedding_reply)
-            )
+            try:
+                edge_embedding_cypher = (
+                    f'MATCH ()-[e:RELATES_TO {{uuid: {_quote_cypher_string(edge_uuid)}}}]-() '
+                    'RETURN e.fact_embedding'
+                )
+                edge_embedding_reply = await _read_compact_vector(
+                    falkor_client, group_id=wrong_graph, cypher=edge_embedding_cypher,
+                )
+                embedding_clause = _embedding_set_clause('r.fact_embedding', edge_embedding_reply)
 
-            # Both endpoints are MATCHed (never CREATEd): the home copy of
-            # this MERGE node and the edge's other endpoint must already
-            # exist in home_graph, or this MATCH yields no rows and the
-            # edge is silently skipped -- same convention as the MOVE-edge
-            # pass above / merge_foreign_duplicate. group_id is preserved
-            # from the wrong copy verbatim -- MERGE has no rewrite_group_id
-            # analogue (mirrors merge_foreign_duplicate).
-            edge_create_result = await home.query(
-                'MATCH (a:Entity {uuid: $src_uuid}), (b:Entity {uuid: $dst_uuid}) '
-                'CREATE (a)-[r:RELATES_TO]->(b) '
-                'SET r.uuid = $edge_uuid, '
-                '    r.name = $name, '
-                '    r.fact = $fact, '
-                '    r.valid_at = $valid_at, '
-                '    r.invalid_at = $invalid_at, '
-                '    r.created_at = $created_at, '
-                '    r.group_id = $group_id, '
-                '    r.episodes = $episodes, '
-                f'    r.fact_embedding = {edge_embedding_literal}',
-                {
-                    'src_uuid': src_uuid,
-                    'dst_uuid': dst_uuid,
-                    'edge_uuid': edge_uuid,
-                    'name': edge_name,
-                    'fact': fact,
-                    'valid_at': valid_at,
-                    'invalid_at': invalid_at,
-                    'created_at': edge_created_at,
-                    'group_id': edge_group_id,
-                    'episodes': episodes,
-                },
-            )
-            if edge_create_result.relationships_created:
-                result.edges_recreated += 1
-            else:
-                result.edges_skipped += 1
-                logger.warning(
+                # Both endpoints are MATCHed (never CREATEd): the home copy
+                # of this MERGE node and the edge's other endpoint must
+                # already exist in home_graph, or this MATCH yields no rows
+                # and the edge is silently skipped -- same convention as the
+                # MOVE-edge pass above / merge_foreign_duplicate. group_id is
+                # preserved from the wrong copy verbatim -- MERGE has no
+                # rewrite_group_id analogue (mirrors merge_foreign_duplicate).
+                edge_create_result = await home.query(
+                    'MATCH (a:Entity {uuid: $src_uuid}), (b:Entity {uuid: $dst_uuid}) '
+                    'CREATE (a)-[r:RELATES_TO]->(b) '
+                    'SET r.uuid = $edge_uuid, '
+                    '    r.name = $name, '
+                    '    r.fact = $fact, '
+                    '    r.valid_at = $valid_at, '
+                    '    r.invalid_at = $invalid_at, '
+                    '    r.created_at = $created_at, '
+                    '    r.group_id = $group_id, '
+                    '    r.episodes = $episodes'
+                    f'{embedding_clause}',
+                    {
+                        'src_uuid': src_uuid,
+                        'dst_uuid': dst_uuid,
+                        'edge_uuid': edge_uuid,
+                        'name': edge_name,
+                        'fact': fact,
+                        'valid_at': valid_at,
+                        'invalid_at': invalid_at,
+                        'created_at': edge_created_at,
+                        'group_id': edge_group_id,
+                        'episodes': episodes,
+                    },
+                )
+                if edge_create_result.relationships_created:
+                    result.edges_recreated += 1
+                    if not embedding_clause:
+                        result.embedding_omitted += 1
+                else:
+                    result.edges_skipped += 1
+                    logger.warning(
+                        'recreate_subgraph_relationships: MERGE-fold RELATES_TO '
+                        'edge uuid=%s silently skipped -- other endpoint '
+                        '(src=%s dst=%s) not present in home_graph=%s',
+                        edge_uuid, src_uuid, dst_uuid, home_graph,
+                    )
+            except Exception as exc:
+                # Per-item isolation, same rationale as the MOVE-edge pass
+                # above: a single bad MERGE-fold edge costs only itself.
+                result.blocked.append({
+                    'kind': 'edge',
+                    'uuid': edge_uuid,
+                    'reason': str(exc),
+                    'node_uuids': [src_uuid, dst_uuid],
+                })
+                # error + exc_info: see the RELATES_TO MOVE-edge pass's
+                # matching comment above -- keeps a programming-error
+                # traceback visible in the logs instead of reading as a
+                # routine per-item skip.
+                logger.error(
                     'recreate_subgraph_relationships: MERGE-fold RELATES_TO '
-                    'edge uuid=%s silently skipped -- other endpoint '
-                    '(src=%s dst=%s) not present in home_graph=%s',
-                    edge_uuid, src_uuid, dst_uuid, home_graph,
+                    'edge uuid=%s blocked -- %s: %s (src=%s dst=%s '
+                    'home_graph=%s); batch continues',
+                    edge_uuid, type(exc).__name__, exc, src_uuid, dst_uuid,
+                    home_graph,
+                    exc_info=True,
                 )
 
 
@@ -1389,9 +1565,6 @@ async def merge_foreign_duplicate(
         edge_embedding_reply = await _read_compact_vector(
             falkor_client, group_id=wrong_graph, cypher=edge_embedding_cypher,
         )
-        edge_embedding_literal = format_vecf32_literal(
-            parse_compact_vector_reply(edge_embedding_reply)
-        )
 
         # Both endpoints are MATCHed (never CREATEd): the home copy of the
         # moved-duplicate's node and the edge's other endpoint must already
@@ -1407,8 +1580,8 @@ async def merge_foreign_duplicate(
             '    r.invalid_at = $invalid_at, '
             '    r.created_at = $created_at, '
             '    r.group_id = $group_id, '
-            '    r.episodes = $episodes, '
-            f'    r.fact_embedding = {edge_embedding_literal}',
+            '    r.episodes = $episodes'
+            f'{_embedding_set_clause("r.fact_embedding", edge_embedding_reply)}',
             {
                 'src_uuid': src_uuid,
                 'dst_uuid': dst_uuid,

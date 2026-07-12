@@ -1612,6 +1612,7 @@ class TestRunApplyCoMovingPreserved:
         monkeypatch.setattr(_mod, 'delete_source_node', AsyncMock(return_value=None))
         recreate_mock = AsyncMock(return_value=SubgraphEdgeResult(
             edges_recreated=1, edges_skipped=0, dropped_cross_target=[],
+            embedding_omitted=1,
         ))
         monkeypatch.setattr(_mod, 'recreate_subgraph_relationships', recreate_mock)
 
@@ -1637,6 +1638,11 @@ class TestRunApplyCoMovingPreserved:
         assert applied['u-B']['blocked'] is False
 
         assert report['post_verify']['matched'] is True
+        # embedding_omitted (task 2451 reviewer amendment) is folded into
+        # the report verbatim but stays purely informational -- it does NOT
+        # gate exit_code the way dropped_cross_target_edges/phase_b_blocked
+        # do, since a null embedding is valid data, not a failure.
+        assert report['embedding_omitted'] == 1
         assert report['exit_code'] == 0
 
 
@@ -1708,6 +1714,143 @@ class TestRunApplyCrossTargetDropped:
 
         assert report['post_verify']['matched'] is True
         assert report['exit_code'] != 0
+
+
+# ===========================================================================
+# Tests: run() apply withholds Phase C deletion for Phase-B-blocked nodes
+# (CGL-η follow-up, task 2451, step-15/16)
+# ===========================================================================
+
+class TestRunApplyPhaseBBlocked:
+    """Proves a Phase-B per-item blocked edge/mention (task 2451's new
+    SubgraphEdgeResult.blocked -- see cross_graph_move.py's per-item
+    isolation) withholds Phase C source-deletion for its incident node(s)
+    -- preserving create-before-delete for the un-recreated edge/mention,
+    since Phase B isolating a bad item but Phase C still deleting its
+    source would DESTROY an edge that exists only in source, worse than the
+    old whole-batch abort -- is surfaced verbatim under
+    report['phase_b_blocked'], and forces a blocking exit, mirroring
+    dropped_cross_target's contract.
+    """
+
+    def _write_manifest(self, tmp_path, nodes, census) -> Path:
+        manifest = _mod.build_manifest(nodes, census, dry_run=True)
+        manifest_path = tmp_path / 'manifest.json'
+        manifest_path.write_text(json.dumps(manifest))
+        return manifest_path
+
+    @pytest.mark.asyncio
+    async def test_blocked_edge_withholds_source_deletion_and_forces_blocking_exit(
+        self, tmp_path, monkeypatch,
+    ):
+        """recreate_subgraph_relationships (monkeypatched) returns one
+        blocked edge record naming 'u-move' as an incident node: run() must
+        NOT delete_source_node for u-move (its source is preserved), must
+        record u-move's apply_results entry as blocked=True/applied=False
+        with a reason referencing the blocked edge, must surface the
+        blocked list verbatim under report['phase_b_blocked'], and must
+        force a non-zero exit_code -- even though an unrelated co-migrating
+        node ('u-safe') is NOT named in the blocked record and its source
+        IS deleted normally (selective withholding, not a batch-wide one --
+        "one bad item costs one item")."""
+        move_blocked = _classified_node(
+            'u-move', source_graph='reify', target_graph='dark_factory', disposition=_mod.MOVE,
+        )
+        move_safe = _classified_node(
+            'u-safe', source_graph='reify', target_graph='dark_factory', disposition=_mod.MOVE,
+        )
+        manifest_path = self._write_manifest(
+            tmp_path, [move_blocked, move_safe], {'reify': 2, 'dark_factory': 0},
+        )
+
+        blocked_record = {
+            'kind': 'edge',
+            'uuid': 'e-1',
+            'reason': 'simulated transient FalkorDB error',
+            'node_uuids': ['u-move'],
+        }
+
+        monkeypatch.setattr(_mod, 'create_moved_node', AsyncMock(return_value=None))
+        delete_mock = AsyncMock(return_value=None)
+        monkeypatch.setattr(_mod, 'delete_source_node', delete_mock)
+        monkeypatch.setattr(
+            _mod, 'recreate_subgraph_relationships',
+            AsyncMock(return_value=SubgraphEdgeResult(
+                edges_recreated=1, edges_skipped=0, dropped_cross_target=[],
+                blocked=[blocked_record],
+            )),
+        )
+
+        memory_service = _make_memory_service({
+            'reify': _make_graph_mock(ro_pages=[[]]),
+            'dark_factory': _make_graph_mock(ro_pages=[[]]),
+        })
+        args = _args(apply=True, manifest=str(manifest_path))
+
+        report = await _mod.run(args, memory_service)
+
+        # (i) source deletion withheld for u-move, but NOT for the unrelated
+        # u-safe node -- selective, not batch-wide.
+        deleted_uuids = {c.args[1] for c in delete_mock.await_args_list}
+        assert 'u-move' not in deleted_uuids
+        assert 'u-safe' in deleted_uuids
+
+        # (ii) u-move's apply_results entry is blocked, not applied, with a
+        # reason referencing the blocked edge.
+        applied = {r['uuid']: r for r in report['apply_results']}
+        assert applied['u-move']['applied'] is False
+        assert applied['u-move']['blocked'] is True
+        assert 'e-1' in applied['u-move']['error']
+
+        assert applied['u-safe']['applied'] is True
+        assert applied['u-safe']['blocked'] is False
+
+        # (iii) the blocked list is surfaced verbatim.
+        assert report['phase_b_blocked'] == [blocked_record]
+
+        # (iv) non-zero, blocking exit.
+        assert report['exit_code'] != 0
+
+    @pytest.mark.asyncio
+    async def test_empty_blocked_list_still_deletes_source_and_exits_cleanly(
+        self, tmp_path, monkeypatch,
+    ):
+        """Regression guard: an empty SubgraphEdgeResult.blocked list (the
+        common, unaffected case) withholds no source deletion and, with an
+        otherwise-clean post-verify, still exits 0 -- unchanged behavior for
+        every existing caller/test that returns/mocks an empty-blocked
+        result."""
+        move_node = _classified_node(
+            'u-clean', source_graph='reify', target_graph='dark_factory', disposition=_mod.MOVE,
+        )
+        manifest_path = self._write_manifest(tmp_path, [move_node], {'reify': 1, 'dark_factory': 0})
+
+        monkeypatch.setattr(_mod, 'create_moved_node', AsyncMock(return_value=None))
+        delete_mock = AsyncMock(return_value=None)
+        monkeypatch.setattr(_mod, 'delete_source_node', delete_mock)
+        monkeypatch.setattr(
+            _mod, 'recreate_subgraph_relationships',
+            AsyncMock(return_value=SubgraphEdgeResult(
+                edges_recreated=1, edges_skipped=0, dropped_cross_target=[], blocked=[],
+            )),
+        )
+
+        memory_service = _make_memory_service({
+            'reify': _make_graph_mock(ro_pages=[[]]),
+            'dark_factory': _make_graph_mock(ro_pages=[[]]),
+        })
+        args = _args(apply=True, manifest=str(manifest_path))
+
+        report = await _mod.run(args, memory_service)
+
+        delete_mock.assert_awaited_once()
+        applied = {r['uuid']: r for r in report['apply_results']}
+        assert applied['u-clean']['applied'] is True
+        assert applied['u-clean']['blocked'] is False
+
+        assert report['phase_b_blocked'] == []
+        assert report['post_verify']['matched'] is True
+        assert report['exit_code'] == 0
 
 
 # ===========================================================================
