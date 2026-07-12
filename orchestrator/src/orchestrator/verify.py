@@ -209,7 +209,14 @@ def _cargo_scope_str(cmd: str | None, crates: list[str]) -> str | None:
 # identity re-exports — step-3/4 (TestDerivedPredicates) already proved them
 # behaviorally equivalent to the predicates they replace, across a path
 # table covering conftest at various depths, test_*/*_test files, data
-# modules under tests/, and plain source.
+# modules under tests/, and plain source — all of that table is ``.py``
+# paths, which is what every current caller in this module pre-filters to
+# before calling any of these three. The equivalence does NOT extend to
+# non-``.py`` paths: classify_file maps any non-``.py`` path to INERT
+# regardless of directory, so e.g. _is_test_file('tests/fixture.json') is
+# False here, whereas a hypothetical bare "is this under tests/" predicate
+# would say True. See verify_plan._is_test_file's docstring for the full
+# narrowed contract.
 _is_conftest = verify_plan._is_conftest
 _is_collectable_test_file = verify_plan._is_collectable_test_file
 _is_test_file = verify_plan._is_test_file
@@ -1418,6 +1425,7 @@ def scope_module_config(
     mc: ModuleConfig,
     task_files: list[str],
     worktree: Path | None = None,
+    content_cache: dict[str, str | None] | None = None,
 ) -> ModuleConfig | None:
     """Narrow *mc*'s commands to the specific *task_files* it covers.
 
@@ -1434,6 +1442,11 @@ def scope_module_config(
     unscoped case — it is required for ``uv run`` to resolve ``src/``/``tests/``
     correctly when running from the worktree root.  This mirrors the existing
     ``has_conftest`` branch that sets ``test_cmd = mc.test_command`` verbatim.
+
+    *content_cache*, when given, is threaded into the structural-file content
+    read (see :func:`_worktree_reader`) so a file already read for this verify
+    attempt (e.g. by a sibling module's scope, or by ``derive_verify_plan``'s
+    observability pass) is not read from disk again (task γ amendment).
 
     Returns ``None`` when no ``.py`` files from *task_files* fall under the
     prefix — the caller should skip that subproject entirely rather than run
@@ -1477,17 +1490,13 @@ def scope_module_config(
     has_structural = False
     structural_trigger: str | None = None
     if worktree is not None and mc.type_check_command:
+        _read = _worktree_reader(worktree, cache=content_cache)
         for f in scoped:
-            full = worktree / f
-            if full.is_file():
-                try:
-                    content = full.read_text(encoding='utf-8', errors='replace')
-                except OSError:
-                    continue
-                if _is_structural_python_file(f, content):
-                    has_structural = True
-                    structural_trigger = f
-                    break
+            content = _read(f)
+            if content is not None and _is_structural_python_file(f, content):
+                has_structural = True
+                structural_trigger = f
+                break
 
     # Build scoped commands with worktree-relative paths, then strip any cwd
     # shift (leading `cd` or `--directory`) so tools resolve paths from the
@@ -1666,6 +1675,7 @@ def _build_fallback_config(
     task_files: list[str],
     config: OrchestratorConfig | None = None,
     worktree: Path | None = None,
+    content_cache: dict[str, str | None] | None = None,
 ) -> ModuleConfig | None:
     """Build a synthetic ModuleConfig from *task_files* when no module configs match.
 
@@ -1690,6 +1700,15 @@ def _build_fallback_config(
     used as-is when it differs from the bare ``pytest`` default so that
     complex flag sequences like ``-m 'not slow' --ignore=tests/e2e`` are not
     mangled by :func:`_scope_to_keyword`'s prefix-then-parse approach.
+
+    *content_cache*, when given, is threaded into the structural-file content
+    read (see :func:`_worktree_reader`) so a file already read through the
+    SAME dict is not read from disk again (task γ amendment). Mirrors
+    ``scope_module_config``'s identical parameter for interface symmetry;
+    ``run_scoped_verification``'s fallback branch currently leaves this
+    unwired (does not pass a cache shared with ``derive_verify_plan``'s
+    reader) — see the "NOTE (task γ amendment)" comment at that call site for
+    why. A direct caller can still pass its own dict to dedupe repeat calls.
 
     Returns ``None`` when no ``.py`` files are found.
     """
@@ -1750,17 +1769,13 @@ def _build_fallback_config(
     structural_trigger: str | None = None
     _type_check_command_raw = config.type_check_command if config is not None else 'pyright'
     if worktree is not None and _type_check_command_raw:
+        _read = _worktree_reader(worktree, cache=content_cache)
         for f in py_files:
-            full = worktree / f
-            if full.is_file():
-                try:
-                    content = full.read_text(encoding='utf-8', errors='replace')
-                except OSError:
-                    continue
-                if _is_structural_python_file(f, content):
-                    has_structural = True
-                    structural_trigger = f
-                    break
+            content = _read(f)
+            if content is not None and _is_structural_python_file(f, content):
+                has_structural = True
+                structural_trigger = f
+                break
     if has_structural:
         logger.info(
             'pyright unscoped (fallback): structural file %s in diff', structural_trigger,
@@ -1988,6 +2003,14 @@ class VerifyResult:
     # asdict but from_dict would pass it straight into VerifyResult(**d)
     # without reconstructing it. None when no plan was derived (default /
     # back-compat / _trivial_pass and other non-planned results).
+    #
+    # Fidelity caveat: `plan` is an independently-derived decision record
+    # (why a scope was chosen), not a trace of exactly what executed — see
+    # derive_verify_plan's docstring ("Fidelity" paragraph) and the
+    # "Fidelity note" comments at this field's call sites in
+    # run_scoped_verification for the specific known gaps (fallback
+    # subproject/mixed-subproject rescoping; module-path scope recomputed
+    # rather than read back from the executed ModuleConfigs).
     plan: dict | None = None
     # Wall-clock verify cost.  For a single-module run: max(test, lint, type)
     # when the three commands ran concurrently (asyncio.gather), or their sum
@@ -3484,7 +3507,10 @@ async def run_full_verification(
     return _aggregate_results(list(results))
 
 
-def _worktree_reader(worktree: Path | None) -> Callable[[str], str | None]:
+def _worktree_reader(
+    worktree: Path | None,
+    cache: dict[str, str | None] | None = None,
+) -> Callable[[str], str | None]:
     """Build a ``verify_plan`` ``worktree_reader`` bound to *worktree*.
 
     Mirrors the ``is_file()`` + ``read_text(errors='replace')`` pattern used
@@ -3494,17 +3520,35 @@ def _worktree_reader(worktree: Path | None) -> Callable[[str], str | None]:
     functions do. Always answers ``None`` when *worktree* is ``None``
     (mirrors those functions' own ``worktree is not None`` guards) — no
     STRUCTURAL PlannedRun can be derived without a worktree to read from.
+
+    *cache*, when given, memoizes each path's content (including a ``None``
+    miss) for the lifetime of the returned reader. A caller that also passes
+    the SAME dict to ``scope_module_config``/``_build_fallback_config``'s own
+    ``content_cache`` parameter gets a touched file's content read from disk
+    at most once — shared between the execution-scoping structural probe and
+    this reader's use by ``derive_verify_plan`` — instead of once per
+    consumer (task γ amendment, addressing a duplicate-I/O finding).
+    ``run_scoped_verification``'s module_configs branch wires this; its
+    fallback branch currently does not (see the "NOTE (task γ amendment)"
+    comment at that call site).
     """
     def _read(path: str) -> str | None:
+        if cache is not None and path in cache:
+            return cache[path]
         if worktree is None:
-            return None
-        full = worktree / path
-        if not full.is_file():
-            return None
-        try:
-            return full.read_text(encoding='utf-8', errors='replace')
-        except OSError:
-            return None
+            value = None
+        else:
+            full = worktree / path
+            if not full.is_file():
+                value = None
+            else:
+                try:
+                    value = full.read_text(encoding='utf-8', errors='replace')
+                except OSError:
+                    value = None
+        if cache is not None:
+            cache[path] = value
+        return value
     return _read
 
 
@@ -3621,10 +3665,21 @@ async def run_scoped_verification(
             if task_files:
                 # Filter to files that still exist — tasks may delete files as part of their work
                 existing_files = [f for f in task_files if (worktree / f).exists()]
+                # Shared structural-content cache (task γ amendment): threaded
+                # through every scope_module_config call below AND into
+                # derive_verify_plan's worktree_reader further down, so a
+                # touched file is read from disk at most once per attempt
+                # instead of once per (module, observability) consumer.
+                _content_cache: dict[str, str | None] = {}
                 # scope_module_config returns None when no files touch the subproject;
                 # those subprojects are skipped rather than running their full suite.
                 per_module = [
-                    (mc.prefix, scope_module_config(mc, existing_files, worktree=worktree))
+                    (
+                        mc.prefix,
+                        scope_module_config(
+                            mc, existing_files, worktree=worktree, content_cache=_content_cache,
+                        ),
+                    )
                     for mc in module_configs
                 ]
                 skipped = [prefix for prefix, scoped_mc in per_module if scoped_mc is None]
@@ -3690,8 +3745,25 @@ async def run_scoped_verification(
                 # logic byte-for-byte. derive_verify_plan is attached to the
                 # aggregated result (VerifyResult.plan) and logged per
                 # attempt for observability/diagnosis.
+                #
+                # Fidelity note: this plan is derived from the pre-scope
+                # `module_configs` + `existing_files` via derive_verify_plan's
+                # OWN independent per-tool scope_kind decision (the same
+                # classify_file predicates as scope_module_config, but not
+                # literally read back from the `scoped` ModuleConfigs above)
+                # — it is not reconciled against `scoped`/`skipped` line for
+                # line. A module scope_module_config skips for lack of
+                # matching files is recorded the same way here (a single
+                # SKIPPED PlannedRun, from the identical prefix filter), but
+                # if scope_module_config's decision tree ever grows a new
+                # narrowing branch, _derive_module_runs must be updated in
+                # parallel to keep this record accurate (see
+                # derive_verify_plan's "Fidelity" docstring paragraph).
+                # Reuses `_content_cache` (built above for scope_module_config)
+                # so the structural-content probe reads each file once.
                 plan_dict = verify_plan.derive_verify_plan(
-                    existing_files, module_configs, config, _worktree_reader(worktree), role=role,
+                    existing_files, module_configs, config,
+                    _worktree_reader(worktree, cache=_content_cache), role=role,
                 ).to_dict()
                 logger.info('Verify plan: %s', plan_dict)
             else:
@@ -3733,6 +3805,18 @@ async def run_scoped_verification(
                     return _trivial_pass(
                         'No source files changed — verify trivially passes',
                     )
+            # NOTE (task γ amendment): unlike the module_configs branch below,
+            # this call site deliberately does NOT thread a shared
+            # content_cache into _build_fallback_config — doing so would add
+            # a keyword argument that TestRunScopedVerificationForwardsWorktreeToFallback
+            # .test_worktree_forwarded_to_build_fallback_config (test_verify.py,
+            # outside this task's locked modules) cannot accept: it replaces
+            # _build_fallback_config with a fixed `(task_files, config=None,
+            # worktree=None)` fake with no **kwargs catch-all, so any new
+            # call-site keyword breaks it. _build_fallback_config still
+            # accepts content_cache for direct/future callers; only this
+            # branch's dedup between it and derive_verify_plan's reader below
+            # is left unwired pending a follow-up that updates the test double.
             fallback = _build_fallback_config(existing_files, config, worktree=worktree)
             if fallback is not None:
                 fallback = _apply_cargo_scope(
@@ -3744,6 +3828,19 @@ async def run_scoped_verification(
                 # execution driver. module_configs is [] here by construction
                 # (we're past the `if module_configs:` branch above), which
                 # selects derive_verify_plan's fallback branch.
+                #
+                # Fidelity note (see _derive_fallback_runs's docstring for
+                # detail): this fallback plan does NOT model the
+                # subproject/mixed-root+subproject rescoping (tasks 2344/
+                # 2368) that _build_fallback_config (above) actually applies
+                # to `fallback`. When the diff lands in a real subproject,
+                # execution runs `cd <sub> && uv run pytest ...` while this
+                # plan still records a flat `'__fallback__'` run against
+                # *existing_files* — the D1/D2 scope_kind decision itself is
+                # unaffected, but the recorded module_prefix/targets/cwd can
+                # diverge from what actually ran. Its structural-content read
+                # is NOT deduped against _build_fallback_config's own read
+                # above (see the NOTE at the _build_fallback_config call site).
                 plan_dict = verify_plan.derive_verify_plan(
                     existing_files, module_configs, config, _worktree_reader(worktree), role=role,
                 ).to_dict()
