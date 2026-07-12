@@ -309,6 +309,11 @@ class TestCheckTextForScope:
         # behavior rather than a silent gap.
         assert registry.project_for_path('memory/foo.py') is None
         assert registry.project_for_path('deploy/x.service') is None
+        # Positive-coverage pin: denylisting 'memory'/'deploy' must not
+        # collaterally drop a genuine, non-generic top-level dir like
+        # 'crates/' from the registry.
+        assert 'crates/' in registry.all_prefixes()
+        assert registry.project_for_path('crates/foo.rs') == 'reify'
 
     def test_prose_mention_of_memory_edges_is_ok(self, tmp_path):
         """Prose referencing 'memory/edges' (not a path) must not trigger a
