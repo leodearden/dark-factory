@@ -9,13 +9,18 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from _reviewer_trial_mining_fixtures import build_synthetic_runs_db, write_sample_escalations
+from _reviewer_trial_mining_fixtures import (
+    build_synthetic_runs_db,
+    make_git_repo_with_merge,
+    write_sample_escalations,
+)
 
 from orchestrator.evals.reviewer_trial.mining import (
     EscalationRef,
     FnCandidate,
     mine_escalation_refs,
     mine_fn_candidates,
+    recover_diff,
 )
 
 
@@ -168,3 +173,24 @@ class TestMineEscalationRefs:
         esc_dir = tmp_path / 'empty_escalations'
         esc_dir.mkdir()
         assert mine_escalation_refs(esc_dir) == {}
+
+
+class TestRecoverDiff:
+    """recover_diff shells out to git to recover the unified diff for a merge_sha."""
+
+    def test_recovers_diff_for_merge_commit(self, tmp_path: Path) -> None:
+        repo, merge_sha = make_git_repo_with_merge(tmp_path)
+
+        diff_text = recover_diff(merge_sha, repo)
+
+        assert diff_text is not None
+        assert diff_text.strip() != ''
+        assert '+++' in diff_text
+        assert '---' in diff_text
+
+    def test_returns_none_for_unknown_sha(self, tmp_path: Path) -> None:
+        repo, _merge_sha = make_git_repo_with_merge(tmp_path)
+
+        diff_text = recover_diff('0' * 40, repo)
+
+        assert diff_text is None
