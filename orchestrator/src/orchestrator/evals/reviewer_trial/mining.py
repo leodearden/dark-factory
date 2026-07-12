@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import json
 import sqlite3
+import subprocess
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -170,3 +171,33 @@ def mine_escalation_refs(esc_dir: Path) -> dict[str, list[EscalationRef]]:
         refs.setdefault(task_id, []).append(ref)
 
     return refs
+
+
+def recover_diff(merge_sha: str, repo_path: Path) -> str | None:
+    """Recover the unified diff text for a commit via ``git show``.
+
+    Tries a plain ``git show --format= <sha>`` first (works for ordinary
+    single-parent commits). A genuine merge commit typically produces no
+    output from that alone (no direct per-parent diff is shown by default),
+    so this falls back to the first-parent diff (``git diff <sha>^1 <sha>``)
+    — i.e. what the merge changed relative to the branch it landed on.
+
+    Returns ``None`` (never raises) when the sha is unknown/invalid or both
+    attempts yield no diff.
+    """
+    result = subprocess.run(
+        ['git', 'show', '--format=', merge_sha],
+        cwd=repo_path, capture_output=True, text=True,
+    )
+    if result.returncode != 0:
+        return None
+    if result.stdout.strip():
+        return result.stdout
+
+    fallback = subprocess.run(
+        ['git', 'diff', f'{merge_sha}^1', merge_sha],
+        cwd=repo_path, capture_output=True, text=True,
+    )
+    if fallback.returncode != 0 or not fallback.stdout.strip():
+        return None
+    return fallback.stdout
