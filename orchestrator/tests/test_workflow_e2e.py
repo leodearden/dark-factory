@@ -32,7 +32,14 @@ from orchestrator.event_store import EventType
 from orchestrator.git_ops import AdvanceOutcome, GitOps, _run
 from orchestrator.scheduler import TaskAssignment
 from orchestrator.verify import VerifyResult
-from orchestrator.workflow import TaskWorkflow, WorkflowOutcome, WorkflowState
+from orchestrator.workflow import (
+    StewardInterrupted,
+    StewardReescalatedL1,
+    StewardResolved,
+    TaskWorkflow,
+    WorkflowOutcome,
+    WorkflowState,
+)
 
 # ---------------------------------------------------------------------------
 # Fixtures

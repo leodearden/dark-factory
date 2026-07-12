@@ -37,6 +37,7 @@ from shared.config_dir import TaskConfigDir
 from shared.cost_store import CostStore
 from shared.task_claimant import compose_claimant_run_id
 from shared.task_metadata import RetryLedger
+from shared.task_statuses import TaskStatus
 
 from orchestrator.agents.briefing import COMPLETION_JUDGE_SCHEMA
 from orchestrator.agents.invoke import AgentResult, invoke_agent
@@ -9493,100 +9494,81 @@ Update the plan to address the blocking issues. You may add new steps to the `st
             return WorkflowOutcome.SOFT_CANCELLED
         return WorkflowOutcome.REQUEUED
 
-    async def _await_steward_completion(self) -> None:
-        """Wait for the steward to finish pending work, with grace period.
+    async def _await_steward_completion(self) -> StewardOutcome:
+        """Wait for the steward to publish an outcome, with a grace period
+        (task 2248 / W9-delta, SO-1).
 
-        On timeout, auto-re-escalate remaining level-0 escalations to
-        level 1 (steward→auto-watcher) and dismiss the originals.
+        Races ``self._steward_outcome_channel.get()`` against the soft-cancel
+        event and the configured grace deadline — replaces the old
+        escalation-queue file-polling loop entirely (no more re-reading
+        ``_pending_l0()``; the channel is the sole synchronization signal).
 
-        Only waits if the steward is actually running — otherwise there's
-        nothing to wait for.
+        A steward is only ever started (and the channel only ever created)
+        by :meth:`_ensure_steward_started` when there is real pending work
+        (see its own pending-L0 gate) — so ``self._steward_outcome_channel``
+        being ``None`` here means no steward was started for this call and
+        there is nothing to wait for; return a safe default without
+        touching the scheduler (avoids an unnecessary status round-trip on
+        every steward-free call site, e.g. the post-merge success path).
+
+        Otherwise — whether the wait ends via a published outcome, the
+        grace deadline, or a soft-cancel — a SINGLE fresh scheduler status
+        read follows.  A terminal (``done``/``cancelled``) or ``deferred``
+        status ALWAYS overrides, preserving the pre-W9-delta ordering where
+        the terminal check preceded the L0-resolved check.  Absent an
+        override, the published outcome (if any) is returned as-is;
+        otherwise (grace-timeout/cancel with nothing published) a
+        synthesized ``StewardInterrupted('timeout', wip=...)`` is returned —
+        wip/no-wip routing is resolved later, by ``_mark_blocked``'s single
+        branch (the task-2060 fix), not here.
         """
-        if not self.escalation_queue or not self._steward:
-            return
+        channel = self._steward_outcome_channel
+        if channel is None:
+            return StewardInterrupted('timeout', wip_commits_present=False)
 
         timeout = self.config.steward_completion_timeout
-        queue = self.escalation_queue
-
-        def _pending_l0():
-            return queue.get_by_task(self.task_id, status='pending', level=0)
-
-        pending = _pending_l0()
-        if not pending:
-            return
-
         logger.info(
             f'Task {self.task_id}: waiting up to {timeout:.0f}s for steward completion'
         )
 
-        if self._escalation_event is None:
-            self._escalation_event = asyncio.Event()
-
+        outcome: StewardOutcome | None = None
         deadline = asyncio.get_event_loop().time() + timeout
-        while True:
-            pending = _pending_l0()
-            if not pending:
-                logger.info(f'Task {self.task_id}: steward completed all pending work')
-                return
-
-            # Soft-cancel takes precedence over the steward grace period.
-            if self._cancel_event.is_set():
-                logger.info(
-                    f'Task {self.task_id}: cancel-event set during steward grace — '
-                    f'skipping remaining wait'
-                )
-                return
-
-            remaining = deadline - asyncio.get_event_loop().time()
-            if remaining <= 0:
-                break
-
-            self._escalation_event.clear()
-            esc_wait = asyncio.create_task(self._escalation_event.wait())
+        remaining = deadline - asyncio.get_event_loop().time()
+        if not self._cancel_event.is_set() and remaining > 0:
+            get_wait = asyncio.create_task(channel.get())
             cancel_wait = asyncio.create_task(self._cancel_event.wait())
             try:
                 done, _pending = await asyncio.wait(
-                    {esc_wait, cancel_wait},
+                    {get_wait, cancel_wait},
                     timeout=remaining,
                     return_when=asyncio.FIRST_COMPLETED,
                 )
             finally:
-                for t in (esc_wait, cancel_wait):
+                for t in (get_wait, cancel_wait):
                     if not t.done():
                         t.cancel()
                         with contextlib.suppress(asyncio.CancelledError):
                             await t
-            if not done:
-                break  # timeout — fall through to re-escalation
-            if cancel_wait in done:
+            if get_wait in done:
+                outcome = get_wait.result()
+            elif cancel_wait in done:
                 logger.info(
                     f'Task {self.task_id}: cancel-event fired during steward grace — '
                     f'exiting completion wait'
                 )
-                return
+            else:
+                logger.warning(
+                    f'Task {self.task_id}: steward completion timed out after '
+                    f'{timeout:.0f}s with no outcome published'
+                )
 
-        # Timeout — re-escalate remaining to level 1
-        from escalation.models import Escalation
-
-        logger.warning(
-            f'Task {self.task_id}: steward completion timed out after {timeout:.0f}s, '
-            f're-escalating {len(pending)} item(s) to level 1'
+        # Single fresh read of the store — a terminal/deferred status always
+        # wins, regardless of what (if anything) the channel produced.
+        status = await self.scheduler.get_status(self.task_id)
+        if status in TERMINAL_STATUSES or status == 'deferred':
+            return StewardTerminalDecision(new_status=TaskStatus(status))
+        if outcome is not None:
+            return outcome
+        return StewardInterrupted(
+            'timeout', wip_commits_present=await self._worktree_has_wip_commits(),
         )
-        for esc in pending:
-            reesc = Escalation(
-                id=queue.make_id(self.task_id),
-                task_id=self.task_id,
-                agent_role='steward',
-                severity=esc.severity,
-                category=esc.category,
-                summary=f'Steward timeout: {esc.summary}',
-                detail=esc.detail,
-                suggested_action='manual_intervention',
-                level=1,
-            )
-            queue.submit(reesc)
-            queue.resolve(
-                esc.id,
-                'Auto-dismissed: steward completion timeout, re-escalated to level 1',
-                dismiss=True,
-            )
