@@ -216,10 +216,22 @@ class RestartPlan:
         any other detached fire-and-forget-with-verification need.
 
         ``--working-directory=<cwd>`` (RP-3) guards against the ``systemd
-        --user`` manager's $HOME-default cwd (the 2105 exit-127 bug) — the
-        transient unit's payload always resolves relative to an explicit,
-        absolute cwd instead. The ``/bin/sh -c`` wrapper's on-failure branch
-        (RP-4) files a born-at-L2 escalation via
+        --user`` manager's $HOME-default cwd (the 2105 exit-127 bug: a
+        relative deploy script is not found once a ``--user`` transient unit
+        fires under $HOME) — the transient unit's payload always resolves
+        relative to an explicit, absolute cwd instead. This mirrors
+        ``DeterministicRunner._default_schedule_detached_restart``'s own 2105
+        fix (deterministic_runner.py:388-394 cwd resolution, :434-438 script
+        absolutization, :455 ``--working-directory=<cwd>``). Two independent
+        layers enforce this here, belt-and-braces: ``RestartPlan.__post_init__``
+        absolutizes ``self.script`` against ``self.cwd`` at construction time
+        (so ``str(self.script)`` in the payload below is always absolute), and
+        ``--working-directory=<self.cwd>`` is added to EVERY detached
+        systemd-run argv UNCONDITIONALLY (not gated on whether the script
+        happened to already be relative) — so the invariant holds even for a
+        future caller that somehow bypasses ``__post_init__``. The
+        ``/bin/sh -c`` wrapper's on-failure branch (RP-4) files a born-at-L2
+        escalation via
         ``EscalationSpec.to_submit_argv`` ONLY when the deferred payload
         itself exits non-zero at fire time — never at registration time, so a
         successful self-deploy never spuriously escalates. When
