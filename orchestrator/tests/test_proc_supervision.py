@@ -265,3 +265,49 @@ class TestSelfRestartSystemdRunArgv:
         # Success path: no in-process escalation filed (the on-failure branch
         # above only fires later, at systemd-run's deferred fire time).
         assert read_escalations(tmp_queue_dir, 'task-99') == []
+
+
+# ---------------------------------------------------------------------------
+# step-5: RED — R2 2105 cwd cell (RP-3, the exit-127 fix)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestDetachedSystemdRunAlwaysHasWorkingDirectory:
+    """A systemd --user transient unit's cwd defaults to $HOME, so a RELATIVE
+    deploy script would 127 once the deferred unit fires (the 2105 incident).
+    Every detached systemd-run argv must carry --working-directory=<cwd> AND
+    an ABSOLUTE script token inside the /bin/sh -c payload — never the bare
+    relative path."""
+
+    async def test_relative_script_absolutized_and_working_directory_present(
+        self, tmp_queue_dir: Path,
+    ) -> None:
+        from orchestrator.proc_supervision import RestartPlan
+
+        runner = FakeRunner(returncode=0)
+        plan = RestartPlan(
+            script=Path('scripts/restart-orchestrator.sh'),  # RELATIVE
+            args=[],
+            cwd=Path('/proj'),
+            target_unit='orch.service',
+            own_unit='orch.service',
+            on_failure_escalation=None,
+            verify=None,
+            transient_unit='orch-redeploy-restart-1.service',
+            on_active_secs=10,
+        )
+
+        await plan.execute(runner=runner)
+
+        argv, _kwargs = runner.calls[0]
+        assert '--working-directory=/proj' in argv, (
+            'a detached systemd-run argv must never omit --working-directory'
+        )
+        wrapped = argv[-1]
+        assert '/proj/scripts/restart-orchestrator.sh' in wrapped, (
+            'the script token inside the /bin/sh -c payload must be absolute'
+        )
+        assert wrapped.split()[0] == '/proj/scripts/restart-orchestrator.sh', (
+            'the bare relative path must never appear as the payload script token'
+        )
