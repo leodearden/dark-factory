@@ -382,9 +382,12 @@ class TestDeriveTruthLiveClaimant:
        collapses straight to ``None`` and never falls through to plan.lock.
     """
 
-    async def test_actively_held_returns_in_memory_claimant_without_fetching_task(
-        self,
-    ) -> None:
+    async def test_actively_held_returns_in_memory_claimant(self) -> None:
+        # get_task IS still awaited once here (step-12: derive_truth fetches
+        # the task row unconditionally for db_status/deploy_phase,
+        # regardless of which live_claimant signal wins) — only the
+        # is_actively_held short-circuit's OWN resolution skips consulting
+        # the fetched row's claimant columns / plan.lock.
         scheduler = _fake_scheduler(is_actively_held=True)
         resolver = _make_ground_truth(scheduler=scheduler)
 
@@ -393,7 +396,6 @@ class TestDeriveTruthLiveClaimant:
         assert report.live_claimant is not None
         assert report.live_claimant.source == ClaimantSource.IN_MEMORY
         scheduler.is_actively_held.assert_called_once_with('11')
-        scheduler.get_task.assert_not_awaited()
 
     async def test_fresh_db_claimant_returns_db_claimant(self) -> None:
         fixed_now = datetime(2026, 7, 12, 12, 0, 0, tzinfo=UTC)

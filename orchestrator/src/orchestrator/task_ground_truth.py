@@ -26,7 +26,7 @@ from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from typing import TYPE_CHECKING
 
-from shared.deploy_state import DeployPhase
+from shared.deploy_state import DeployPhase, DeployState
 from shared.task_claimant import is_stranded
 from shared.task_statuses import TaskStatus
 
@@ -206,21 +206,21 @@ class TaskGroundTruth:
         TG-1: ``branch_state`` resolves journal-first — see
         :meth:`_resolve_branch_state`. TG-3: ``live_claimant`` folds the
         in-memory/db/plan.lock liveness signals — see
-        :meth:`_resolve_live_claimant`. The remaining fields
-        (db_status/worktree_present/open_escalations/deploy_phase) are
-        populated incrementally as θ1 proceeds; until then they carry
-        placeholder values that no meaningful shape maps onto in
-        ``_RECOVERY`` below.
+        :meth:`_resolve_live_claimant`. The task row is fetched exactly
+        ONCE here and shared across ``db_status``, the db-claimant leg of
+        ``live_claimant``, and ``deploy_phase`` — no second fetch.
         """
         branch_state = await self._resolve_branch_state(tid)
-        live_claimant = await self._resolve_live_claimant(tid)
+        task = await self.scheduler.get_task(tid) or {}
+        metadata = task.get('metadata')
+        deploy_state = DeployState.from_metadata(metadata) if isinstance(metadata, dict) else None
         return TruthReport(
-            db_status='',
-            live_claimant=live_claimant,
+            db_status=task.get('status') or '',
+            live_claimant=self._resolve_live_claimant(tid, task),
             branch_state=branch_state,
-            worktree_present=False,
-            open_escalations=[],
-            deploy_phase=None,
+            worktree_present=self.worktree_resolver(tid).exists(),
+            open_escalations=self._resolve_open_escalations(tid),
+            deploy_phase=deploy_state.phase if deploy_state is not None else None,
         )
 
     async def _resolve_branch_state(self, tid: str) -> BranchState:
@@ -255,13 +255,12 @@ class TaskGroundTruth:
             return BranchState(BranchStateKind.GONE_WITH_MERGE_MARKER, marker_sha)
         return BranchState(BranchStateKind.GONE_NO_MARKER)
 
-    async def _resolve_live_claimant(self, tid: str) -> Claimant | None:
+    def _resolve_live_claimant(self, tid: str, task: dict) -> Claimant | None:
         """Resolve *tid*'s live claimant (TG-3), folding three signals in
         priority order:
 
         1. ``scheduler.is_actively_held(tid)`` — the in-memory public
-           accessor (task 2235). A hit short-circuits without fetching the
-           task row at all.
+           accessor (task 2235).
         2. A fresh W2 db claimant: ``claimant_run_id`` present AND NOT
            ``shared.task_claimant.is_stranded`` against the injected
            ``now_fn``/``heartbeat_ttl``.
@@ -272,11 +271,14 @@ class TaskGroundTruth:
         A present-but-stale db claimant (``is_stranded`` True) collapses
         straight to ``None`` — it deliberately does NOT fall through to the
         plan.lock check, which exists solely for the claimant-absent case.
+
+        *task* is the already-fetched row (:meth:`derive_truth` fetches it
+        exactly once and shares it across every field that needs it) — this
+        method makes no I/O of its own beyond the plan.lock read.
         """
         if self.scheduler.is_actively_held(tid):
             return Claimant(run_id=None, heartbeat_at=None, source=ClaimantSource.IN_MEMORY)
 
-        task = await self.scheduler.get_task(tid) or {}
         claimant_run_id = task.get('claimant_run_id')
         if claimant_run_id and str(claimant_run_id).strip():
             if is_stranded(task, self.now_fn(), self.heartbeat_ttl):
@@ -301,6 +303,18 @@ class TaskGroundTruth:
                     source=ClaimantSource.PLAN_LOCK,
                 )
         return None
+
+    def _resolve_open_escalations(self, tid: str) -> list[EscalationRef]:
+        """Map *tid*'s pending escalations to lightweight refs.
+
+        ``[]`` when no ``escalation_queue`` was injected — a caller that
+        doesn't wire one up gets an empty-but-valid TruthReport field rather
+        than an error.
+        """
+        if self.escalation_queue is None:
+            return []
+        rows = self.escalation_queue.get_by_task(tid, status='pending')
+        return [EscalationRef(id=row.id, level=row.level) for row in rows]
 
 
 # ---------------------------------------------------------------------------
