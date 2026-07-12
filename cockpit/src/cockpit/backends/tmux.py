@@ -21,6 +21,17 @@ logger = logging.getLogger(__name__)
 _REORDER_SCRATCH_BASE = 9000
 
 
+def _current_index(tmux_target: str) -> int | None:
+    """Parse the numeric window index out of a 'session:index'-shaped target.
+
+    Returns None if the part after the first ':' isn't a plain non-negative
+    integer, so a target with an unexpected shape safely fails reorder()'s
+    no-op comparison (falls through to the normal path) rather than raising.
+    """
+    _, _, index_str = tmux_target.partition(':')
+    return int(index_str) if index_str.isdigit() else None
+
+
 class TmuxBackend:
     """Focus/arrange sessions running inside tmux."""
 
@@ -80,6 +91,14 @@ class TmuxBackend:
         already current is a net no-op for operator focus -- it restores the
         invariant regardless of how indices were shuffled -- and is the only
         select-window reorder ever issues (never switch-client).
+
+        Short-circuit: app._update_attention calls reorder() on every
+        attention refresh tick, and most ticks don't actually change any
+        target's position. If every valid target is already at its final
+        index, the park-then-place moves and the focus snapshot/restore
+        would accomplish nothing, so this returns immediately without
+        issuing any command. A single target out of place still runs the
+        full path below.
         """
         # (index, tmux_target) — captured as a plain str (not target.tmux_target,
         # which stays str | None) so the loop below is narrowing-clean for pyright.
@@ -89,6 +108,10 @@ class TmuxBackend:
                 logger.warning('TmuxBackend.reorder: target has no tmux_target: %r', target)
                 continue
             valid.append((index, target.tmux_target))
+
+        if valid and all(_current_index(tmux_target) == index for index, tmux_target in valid):
+            logger.debug('TmuxBackend.reorder: no-op — every target already at its final index')
+            return
 
         # Snapshot each involved session's currently-active window by its stable
         # @id, in first-seen order, so we can restore focus after the moves.

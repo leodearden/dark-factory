@@ -161,6 +161,63 @@ class TestTmuxBackendReorder:
 
         assert table.windows == {'s:0': 'w2', 's:1': 'w0'}
 
+    def test_reorder_is_a_full_noop_when_the_sole_target_is_already_at_its_final_index(self):
+        """Efficiency: app._update_attention calls reorder() on every attention
+        refresh tick, and most ticks don't move anything. When the (only)
+        target already sits at its final index, reorder must issue ZERO
+        commands -- no display-message snapshot, no park-then-place moves,
+        no restore select-window -- rather than doing free work for no effect.
+        """
+        from cockpit.backends.base import DisplayTarget
+        from cockpit.backends.tmux import TmuxBackend
+
+        runner = ScriptedRunner()
+        backend = TmuxBackend(run=runner)
+        targets = [DisplayTarget(kind='tmux', tmux_target='s:0')]
+
+        backend.reorder(targets)
+
+        assert runner.calls == []
+
+    def test_reorder_is_a_full_noop_when_multiple_targets_are_already_in_order(self):
+        """The no-op short-circuit isn't limited to a single target: when
+        EVERY target in a multi-target reorder already sits at its final
+        index (the set is already fully sorted), nothing would move and
+        reorder issues zero commands.
+        """
+        from cockpit.backends.base import DisplayTarget
+        from cockpit.backends.tmux import TmuxBackend
+
+        runner = ScriptedRunner()
+        backend = TmuxBackend(run=runner)
+        targets = [
+            DisplayTarget(kind='tmux', tmux_target='s:0'),
+            DisplayTarget(kind='tmux', tmux_target='s:1'),
+        ]
+
+        backend.reorder(targets)
+
+        assert runner.calls == []
+
+    def test_reorder_does_not_short_circuit_when_only_some_targets_are_in_place(self):
+        """Conservative: a partial match must not trigger the no-op skip. If
+        even one target needs to move, the full park-then-place plus focus
+        restore machinery still runs for the whole batch.
+        """
+        from cockpit.backends.base import DisplayTarget
+        from cockpit.backends.tmux import TmuxBackend
+
+        runner = ScriptedRunner()
+        backend = TmuxBackend(run=runner)
+        targets = [
+            DisplayTarget(kind='tmux', tmux_target='s:0'),  # already at index 0
+            DisplayTarget(kind='tmux', tmux_target='s:5'),  # wants index 1, currently at 5
+        ]
+
+        backend.reorder(targets)
+
+        assert any(argv[:2] == ['tmux', 'move-window'] for argv in runner.calls)
+
     def test_reorder_restores_active_window_and_never_switch_client(self):
         """Signal-don't-move shape: move-window inevitably churns a session's
         current window, so reorder snapshots the active window by its stable
@@ -180,7 +237,11 @@ class TestTmuxBackendReorder:
             }
         )
         backend = TmuxBackend(run=runner)
-        targets = [DisplayTarget(kind='tmux', tmux_target='s:0')]
+        # tmux_target is 's:5' (not the sole target's final index, 0) so this
+        # is a genuine move, not the no-op short-circuit -- otherwise reorder
+        # would return before issuing any command and there'd be nothing here
+        # to observe.
+        targets = [DisplayTarget(kind='tmux', tmux_target='s:5')]
 
         backend.reorder(targets)
 
@@ -245,7 +306,10 @@ class TestTmuxBackendReorder:
             }
         )
         backend = TmuxBackend(run=runner)
-        targets = [DisplayTarget(kind='tmux', tmux_target='s:0')]
+        # 's:5', not the sole target's final index 0 -- a genuine move, so the
+        # no-op short-circuit doesn't return before display-message is ever
+        # attempted.
+        targets = [DisplayTarget(kind='tmux', tmux_target='s:5')]
 
         with caplog.at_level(logging.WARNING):
             backend.reorder(targets)
@@ -275,7 +339,9 @@ class TestTmuxBackendReorder:
             }
         )
         backend = TmuxBackend(run=runner)
-        targets = [DisplayTarget(kind='tmux', tmux_target='s:0')]
+        # 's:5', not the sole target's final index 0 -- a genuine move, so the
+        # no-op short-circuit doesn't return before the restore is attempted.
+        targets = [DisplayTarget(kind='tmux', tmux_target='s:5')]
 
         with caplog.at_level(logging.WARNING):
             backend.reorder(targets)
