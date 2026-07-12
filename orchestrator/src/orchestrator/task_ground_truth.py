@@ -200,7 +200,26 @@ class TaskGroundTruth:
         row = MergeProvenance.lookup(tid)
         if row is not None:
             return BranchState(BranchStateKind.ON_MAIN, row.advanced_sha)
-        # Git-archaeology fallback (journal miss) — added in step-8.
+
+        # Git-archaeology fallback (journal miss). EXACTLY ONCE — this is
+        # the sole owner of the is_ancestor -> resolve_branch_sha ->
+        # find_merge_marker sequence (mirrors the archaeology previously
+        # inlined per-sweep in harness._reconcile_one_stranded).
+        branch = f'{self.git_ops.config.branch_prefix}{tid}'
+        main_branch = self.git_ops.config.main_branch
+        if await self.git_ops.is_ancestor(branch, main_branch):
+            sha = await self.git_ops.resolve_branch_sha(branch)
+            return BranchState(BranchStateKind.ON_MAIN, sha)
+
+        if await self.git_ops.resolve_branch_sha(branch) is not None:
+            # Branch ref still exists but is not an ancestor of main — no
+            # merged sha to carry (BranchState docstring: sha is only
+            # carried for on_main / gone_with_merge_marker).
+            return BranchState(BranchStateKind.EXISTS_OFF_MAIN)
+
+        marker_sha = await self.git_ops.find_merge_marker(branch)
+        if marker_sha:
+            return BranchState(BranchStateKind.GONE_WITH_MERGE_MARKER, marker_sha)
         return BranchState(BranchStateKind.GONE_NO_MARKER)
 
 
