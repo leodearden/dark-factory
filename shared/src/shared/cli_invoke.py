@@ -776,7 +776,11 @@ async def invoke_with_cap_retry(
     When *cost_store* is provided, successful invocations are recorded via
     ``save_invocation()`` and cap-hit events via ``save_account_event()``.
 
-    All keyword arguments are forwarded to ``invoke_claude_agent()``.
+    All keyword arguments are forwarded to ``invoke_claude_agent()``.  When a
+    custom *invoke_fn* is supplied, it additionally receives *backend*
+    (multi-backend reconnect, PRD harness-backend-reconnect-pi T1) — the
+    default ``invoke_claude_agent`` path never does, since it has no
+    ``backend`` parameter.
     """
     model = invoke_kwargs.get('model', 'opus')
     original_prompt = invoke_kwargs.get('prompt', '')
@@ -882,6 +886,14 @@ async def invoke_with_cap_retry(
 
     # Default to Claude-specific invocation when no invoke_fn was provided
     invoke: Callable[..., Awaitable[AgentResult]] = invoke_fn or invoke_claude_agent
+
+    # Multi-backend reconnect (PRD T1, harness-backend-reconnect-pi): forward
+    # `backend` into the dispatched call ONLY when a custom invoke_fn (the
+    # multi-backend invoke_agent) is supplied. The default invoke_claude_agent
+    # path (fused-memory recon/curator, cli_stage_runner.py) has NO `backend`
+    # parameter and must NEVER receive the kwarg (Invariant 3, PRD Appendix A).
+    if invoke_fn is not None:
+        invoke_kwargs.setdefault('backend', backend)
 
     # Fast path: no usage gate → single invocation, no cap retry.
     # NOTE: if `resume_session_id` was set by the caller (crash-recovery path),
