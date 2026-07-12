@@ -2138,7 +2138,7 @@ class TestWorktreeHasWipCommits:
 
     async def test_returns_false_when_git_ops_is_none(self, tmp_path: Path):
         wf = _make_workflow(tmp_path=tmp_path)
-        wf.git_ops = None
+        wf.git_ops = None  # type: ignore[assignment]
 
         result = await wf._worktree_has_wip_commits()
 
