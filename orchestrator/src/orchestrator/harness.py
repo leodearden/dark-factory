@@ -45,6 +45,7 @@ from orchestrator.module_charter import sanitize_files_for_persist
 from orchestrator.offline_lane import OfflineLaneWorker
 from orchestrator.overrides import OverrideStore
 from orchestrator.park_eviction_requests import ParkEvictionRequestStore
+from orchestrator.proc_supervision import EscalationSpec
 from orchestrator.review_checkpoint import ReviewCheckpoint
 from orchestrator.run_store import RunStore
 from orchestrator.scheduler import (
@@ -6959,12 +6960,32 @@ Output JSON matching the schema. Every task must appear in the output.
         counter = itertools.count()
 
         async def _systemd_run_restart_executor() -> None:
+            # transient_unit is computed once and reused below (both for the
+            # escalation detail text and the schedule_ call) — next(counter)
+            # must only advance once per fire, or the collision-avoidance unit
+            # numbering (see class docstring) would skip a number every fire.
+            transient_unit = f'orch-selfrestart-on-merge-{next(counter)}.service'
+            on_failure_escalation = (
+                EscalationSpec(
+                    queue_dir=str(self._escalation_queue.queue_dir),
+                    task_id='orchestrator-self-redeploy',
+                    summary='Orchestrator self-restart fire-time failure',
+                    detail=(
+                        f'systemd-run transient unit {transient_unit} exited '
+                        'non-zero at fire time (after registration already '
+                        f'returned). See: journalctl --user -u {transient_unit}'
+                    ),
+                )
+                if self._escalation_queue is not None
+                else None
+            )
             await schedule_detached_systemd_restart(
                 script=self.config.orchestrator_restart_script,
                 script_args=[],
                 project_root=self.config.project_root,
-                transient_unit=f'orch-selfrestart-on-merge-{next(counter)}.service',
+                transient_unit=transient_unit,
                 on_active_secs=max(self.config.orchestrator_restart_on_active_secs, 5),
+                on_failure_escalation=on_failure_escalation,
             )
 
         # Restart-safe rate cap on the self-redeploy (task 2371). The last-fire
