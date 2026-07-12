@@ -29,6 +29,7 @@ from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
+from escalation.models import Escalation
 from shared.deploy_state import DeployPhase
 
 from orchestrator.artifacts import TaskArtifacts
@@ -268,6 +269,7 @@ def _make_ground_truth(
     *,
     git_ops: MagicMock | None = None,
     scheduler: MagicMock | None = None,
+    escalation_queue: MagicMock | None = None,
     worktree_resolver=None,
     now_fn=None,
     heartbeat_ttl: timedelta | None = None,
@@ -280,7 +282,7 @@ def _make_ground_truth(
     return TaskGroundTruth(
         git_ops or _fake_git_ops(),
         scheduler or _fake_scheduler(),
-        None,
+        escalation_queue,
         worktree_resolver or (lambda tid: Path('/nonexistent-worktree') / tid),
         **kwargs,
     )
@@ -476,3 +478,113 @@ class TestDeriveTruthLiveClaimant:
         report = await resolver.derive_truth('16')
 
         assert report.live_claimant is None
+
+
+# ---------------------------------------------------------------------------
+# step-11 — derive_truth's remaining TruthReport fields
+# ---------------------------------------------------------------------------
+
+
+def _fake_escalation_queue(*, rows: list[Escalation] | None = None) -> MagicMock:
+    """A minimal escalation_queue double exposing exactly the sync
+    ``get_by_task`` surface TaskGroundTruth's open_escalations resolution
+    consumes."""
+    queue = MagicMock()
+    queue.get_by_task = MagicMock(return_value=rows or [])
+    return queue
+
+
+@pytest.mark.asyncio
+class TestDeriveTruthRemainingFields:
+    """db_status / worktree_present / open_escalations / deploy_phase —
+    the four TruthReport fields left stubbed through step-10. Also locks in
+    that the task row backing db_status/deploy_phase is fetched exactly
+    ONCE per derive_truth call (shared with live_claimant's db-claimant
+    check — step-12 GREEN must not double-fetch)."""
+
+    async def test_db_status_passes_through_from_task_row(self) -> None:
+        task = {'status': 'blocked', 'claimant_run_id': None, 'heartbeat_at': None}
+        scheduler = _fake_scheduler(is_actively_held=False, task=task)
+        resolver = _make_ground_truth(scheduler=scheduler)
+
+        report = await resolver.derive_truth('17')
+
+        assert report.db_status == 'blocked'
+
+    async def test_worktree_present_true_when_path_exists(self, tmp_path: Path) -> None:
+        resolver = _make_ground_truth(worktree_resolver=lambda tid: tmp_path)
+
+        report = await resolver.derive_truth('18')
+
+        assert report.worktree_present is True
+
+    async def test_worktree_present_false_when_path_missing(self) -> None:
+        resolver = _make_ground_truth()
+
+        report = await resolver.derive_truth('19')
+
+        assert report.worktree_present is False
+
+    async def test_open_escalations_maps_pending_rows_to_refs(self) -> None:
+        rows = [
+            Escalation(
+                id='esc-20-1', task_id='20', agent_role='implementer',
+                severity='blocking', category='scope_violation', summary='s1', level=1,
+            ),
+            Escalation(
+                id='esc-20-2', task_id='20', agent_role='implementer',
+                severity='info', category='cleanup_needed', summary='s2', level=0,
+            ),
+        ]
+        escalation_queue = _fake_escalation_queue(rows=rows)
+        resolver = _make_ground_truth(escalation_queue=escalation_queue)
+
+        report = await resolver.derive_truth('20')
+
+        assert report.open_escalations == [
+            EscalationRef(id='esc-20-1', level=1),
+            EscalationRef(id='esc-20-2', level=0),
+        ]
+        escalation_queue.get_by_task.assert_called_once_with('20', status='pending')
+
+    async def test_open_escalations_empty_when_queue_none(self) -> None:
+        resolver = _make_ground_truth()  # escalation_queue defaults to None
+
+        report = await resolver.derive_truth('21')
+
+        assert report.open_escalations == []
+
+    async def test_deploy_phase_from_present_deploy_state_slice(self) -> None:
+        task = {
+            'status': 'in-progress',
+            'claimant_run_id': None,
+            'heartbeat_at': None,
+            'metadata': {'deploy_state': {'phase': 'ran'}},
+        }
+        scheduler = _fake_scheduler(is_actively_held=False, task=task)
+        resolver = _make_ground_truth(scheduler=scheduler)
+
+        report = await resolver.derive_truth('22')
+
+        assert report.deploy_phase == DeployPhase.RAN
+
+    async def test_deploy_phase_none_when_slice_absent(self) -> None:
+        task = {
+            'status': 'in-progress', 'claimant_run_id': None, 'heartbeat_at': None,
+            'metadata': {},
+        }
+        scheduler = _fake_scheduler(is_actively_held=False, task=task)
+        resolver = _make_ground_truth(scheduler=scheduler)
+
+        report = await resolver.derive_truth('23')
+
+        assert report.deploy_phase is None
+
+    async def test_fetches_task_row_exactly_once(self) -> None:
+        task = {'status': 'pending', 'claimant_run_id': None, 'heartbeat_at': None}
+        scheduler = _fake_scheduler(is_actively_held=False, task=task)
+        resolver = _make_ground_truth(scheduler=scheduler)
+
+        await resolver.derive_truth('24')
+
+        scheduler.get_task.assert_awaited_once_with('24')
