@@ -3999,11 +3999,25 @@ class GitOps:
            main tip).  When it carries commits, the branch is RETAINED and a
            log line is emitted; the pool release still proceeds.
         3. ``await self.warm_lane_pool.release(lane_dir)`` — flip ASSIGNED→FREE.
+        4. **§9.5 η (task 2442)**: when ``self.config.warm_lane_release_thin``
+           is True, invoke :meth:`_run_thin_warm_lane` — an eager free-first
+           reclaim of the lane's ``target/`` via reify δ's
+           ``scripts/thin-warm-lane.sh``, run strictly AFTER the ASSIGNED→FREE
+           flip.  The script holds the lane's own flock (T3), so a concurrent
+           re-acquire of this just-freed lane makes it exit 75 (benign skip) —
+           never thinned while ASSIGNED, by construction (inv.10).  Only
+           ``target/`` is ever removed (T1); invoked WITHOUT ``--reseed`` — the
+           next :meth:`acquire_warm_lane` always re-seeds from the current
+           base regardless (D10), so net warmth is unchanged and only the
+           idle-hold of a divergent ``target/`` is eliminated.  Best-effort /
+           never-raise (:meth:`_run_thin_warm_lane` never raises), so a thin
+           hiccup can never strand the pool release or the scheduler
+           (inv.11: release-thin is not an escalation/fault).
 
-        Never removes the worktree; ``target/`` is left in place incidentally
-        (CoW-cheap, harmless).  The *next* :meth:`acquire_warm_lane` always
-        re-seeds from the current base (D10), so a released lane's target/
-        drift is irrelevant — retention is no longer a contract promise.
+        Absent the knob (default False), ``target/`` is left in place
+        incidentally (CoW-cheap, harmless) — the *next*
+        :meth:`acquire_warm_lane` always re-seeds from the current base (D10),
+        so a released lane's target/ drift is irrelevant either way.
 
         Fully best-effort / never-raise (mirrors ``cleanup_merge_worktree``
         contract) so a hiccup cannot strand the scheduler.
@@ -4033,6 +4047,11 @@ class GitOps:
         await self.warm_lane_pool.release(lane_dir)
         self._lifecycle_note_released(lane_dir)
         logger.info('release_warm_lane: released %s (branch %s)', lane_dir, full_branch)
+
+        # §9.5 η (task 2442): eager free-first release-thin — LAST step, so a
+        # thin hiccup can never strand the pool release above (inv.11).
+        if self.config.warm_lane_release_thin:
+            await self._run_thin_warm_lane(lane_dir)
 
     def _lifecycle_note_released(self, lane: Path) -> None:
         """Best-effort durable RELEASED write for :meth:`release_warm_lane`.
