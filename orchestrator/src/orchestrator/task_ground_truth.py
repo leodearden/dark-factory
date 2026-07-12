@@ -223,6 +223,15 @@ class TaskGroundTruth:
             deploy_phase=deploy_state.phase if deploy_state is not None else None,
         )
 
+    async def recovery_for(self, tid: str) -> tuple[TruthReport, RecoveryAction]:
+        """Compose :meth:`derive_truth` -> :func:`classify_recovery` (TG-2).
+
+        The thin seam θ2's seven harness reconcile sweeps call in place of
+        re-deriving recovery policy themselves.
+        """
+        report = await self.derive_truth(tid)
+        return report, classify_recovery(report)
+
     async def _resolve_branch_state(self, tid: str) -> BranchState:
         """Resolve *tid*'s branch state (TG-1: journal-first).
 
