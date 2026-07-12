@@ -387,3 +387,74 @@ class TestFailClosedSelfKillGuard:
         self, tmp_queue_dir: Path,
     ) -> None:
         await self._assert_refuses_without_running_anything(tmp_queue_dir, None, 'task-78')
+
+
+# ---------------------------------------------------------------------------
+# step-9: RED — R4 cross-unit blocking verify-pass cell (RP-2/5)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestCrossUnitBlockingVerifyPass:
+    """own_unit != target_unit (both truthy, provably different) + verify set
+    -> BLOCKING restart: run the script directly to completion (no
+    systemd-run), then re-inspect the target unit for a fresh MainPID and a
+    strictly-later monotonic timestamp than the persisted baseline (RP-5). A
+    provably different target can never self-kill the caller, so this path
+    is allowed to block the event loop."""
+
+    async def test_cross_unit_blocking_restart_runs_script_and_verifies_fresh_pid(
+        self, tmp_queue_dir: Path,
+    ) -> None:
+        from orchestrator.proc_supervision import (
+            EscalationSpec,
+            FreshPidVerify,
+            RestartDisposition,
+            RestartPlan,
+        )
+
+        runner = FakeRunner(returncode=0)
+        inspector = make_fake_inspector({
+            'MainPID': 99,
+            'ActiveState': 'active',
+            'ActiveEnterTimestampMonotonic': 2000,
+        })
+        spec = EscalationSpec(
+            queue_dir=str(tmp_queue_dir),
+            task_id='task-55',
+            summary='Cross-unit deploy verify failed',
+        )
+        plan = RestartPlan(
+            script=Path('/proj/scripts/deploy.sh'),
+            args=['--flag'],
+            cwd=Path('/proj'),
+            target_unit='fused-memory.service',
+            own_unit='orch.service',
+            on_failure_escalation=spec,
+            verify=FreshPidVerify(
+                baseline_active_enter_monotonic=1000,
+                baseline_main_pid=42,
+                inspect_timeout_secs=10.0,
+            ),
+        )
+
+        outcome = await plan.execute(runner=runner, inspector=inspector)
+
+        assert len(runner.calls) == 1
+        args, kwargs = runner.calls[0]
+        assert args == ('/proj/scripts/deploy.sh', '--flag'), (
+            'the blocking path runs the script directly — no systemd-run wrapping'
+        )
+        assert 'systemd-run' not in args
+        assert kwargs.get('cwd') == '/proj'
+
+        assert inspector.calls == [
+            {'unit': 'fused-memory.service', 'timeout_secs': 10.0, 'reap_grace_secs': 5.0},
+        ]
+
+        assert outcome.disposition == RestartDisposition.DEPLOYED_AND_VERIFIED
+        assert outcome.escalated is False
+
+        # Success path: no in-process escalation filed even though one was
+        # configured via on_failure_escalation.
+        assert read_escalations(tmp_queue_dir, 'task-55') == []
