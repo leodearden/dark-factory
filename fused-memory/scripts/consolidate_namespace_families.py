@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Consolidation script for the cross-graph entity leak cleanup (CGL-θ, task 2274).
 
-Three independent, order-insensitive operations against the FalkorDB
+Four independent, order-insensitive operations against the FalkorDB
 (Graphiti) and Qdrant (Mem0) backends. Each is dry-run by default and each
 is guarded so a partial/incomplete state is reported UNRESOLVED rather than
 destroying data:
@@ -36,17 +36,35 @@ destroying data:
      graph but leaves its key in ``GRAPH.LIST``. Guarded on a live node
      count of exactly 0; a non-empty key is reported UNRESOLVED and its
      deletion is blocked.
+  4. GUARDED EMPTY-COLLECTION DELETION -- known-empty divergent/junk Qdrant
+     collections (``EMPTY_COLLECTION_CLEANUP``) that hold no real data and
+     have no merge target are removed via ``delete_collection``, guarded on
+     a live point count of exactly 0 (``count_collection_points``) --
+     mirroring step 3's count-0 GRAPH.DELETE guard, applied to Qdrant. A
+     non-empty collection is reported UNRESOLVED and its deletion is
+     blocked.
 
 Reviewable, static module-level constants (``GRAPH_FAMILY_ALIASES``,
-``COLLECTION_MERGES``, ``JUNK_KEYS``) are the human-reviewable artifact PRD
-decision 4 requires -- this script ships its OWN config (a sibling to, not
-shared with, the ζ migration script's alias map).
+``COLLECTION_MERGES``, ``JUNK_KEYS``, ``EMPTY_COLLECTION_CLEANUP``) are the
+human-reviewable artifact PRD decision 4 requires -- this script ships its
+OWN config (a sibling to, not shared with, the ζ migration script's alias
+map).
 
 Contract (S7, per ``plans/cross-graph-entity-leak-prd.md``): dry-run by
 default, prints a full JSON manifest; ``--apply`` performs the mutations
-described above plus a post-verify recount, and exits non-zero if any
-section of the manifest carries an ``UNRESOLVED`` disposition (see
-``has_unresolved``).
+described above, and exits non-zero if any section of the manifest carries
+an ``UNRESOLVED`` disposition (see ``has_unresolved``). INTENTIONAL S7
+DEVIATION (task 2502): ``--apply`` here is constants-driven -- there is no
+manifest-path argument to replay a previously-printed dry-run report, and
+no separate post-verify recount pass after the mutations. Both are safe to
+omit because every mutating section is safe-by-construction: graph-family
+merges are create-before-delete (a source is only removed after its
+target-graph copy -- and every intra-family edge/mention -- has been
+successfully recreated, per ``merge_graph_family``'s three-phase barrier),
+and every deletion (junk key or empty collection) is guarded on a live
+count of exactly 0 recomputed at run time, never trusted from a stale
+manifest. The PRD's own S7 wording is left to the ι human-review step
+(shared-doc scope), not edited by this task.
 
 Scope: this script + its test suite are MOCK-unit only (MagicMock graphs,
 AsyncMock Qdrant client) -- no live FalkorDB/Qdrant, and no assertion of
@@ -59,7 +77,8 @@ Usage
   # Dry run (default): print the full JSON manifest, touch nothing.
   python scripts/consolidate_namespace_families.py > consolidation_manifest.json
 
-  # Commit the merges + junk-key deletions (exits non-zero on UNRESOLVED).
+  # Commit the merges + junk-key/empty-collection deletions (exits non-zero
+  # on UNRESOLVED).
   python scripts/consolidate_namespace_families.py --apply
 """
 
@@ -111,6 +130,7 @@ COLLECTION_MERGES: dict[str, str] = {
     'fused_dark-factory': 'fused_dark_factory',
     'reify_reify': 'fused_reify',
     'autopilot_video_autopilot_video': 'fused_autopilot_video',
+    'fused_pump-web-ui': 'fused_pump_web_ui',
 }
 
 # Known-junk FalkorDB graph keys with no legitimate data (RCA §"empty junk
@@ -123,6 +143,24 @@ JUNK_KEYS: tuple[str, ...] = (
     'test-project',
     'default',
     '1098',
+)
+
+# Empty divergent/junk Qdrant collections with no merge target -- unlike
+# COLLECTION_MERGES (which scrolls -> upserts -> deletes a POPULATED
+# source), these strays hold no real data and are simply removed once
+# verified empty (count_collection_points == 0), mirroring the
+# JUNK_KEYS/delete_junk_key count-0 guard for FalkorDB graph keys. reify_
+# (empty project id) and fused_fused_memory are DELIBERATELY OMITTED here
+# too -- PRD Open Q2 defers their disposition to ι human review, same as
+# COLLECTION_MERGES above.
+EMPTY_COLLECTION_CLEANUP: tuple[str, ...] = (
+    'fused_knowlive',
+    'fused_know-live',
+    'fused_autopilot-video',
+    'fused_my-project',
+    'fused_1098',
+    'fused_default',
+    'fused_-home-leo-src-dark-factory',
 )
 
 
@@ -157,6 +195,7 @@ def build_consolidation_report(
     graph_family_items: list[dict],
     collection_items: list[dict],
     junk_key_items: list[dict],
+    empty_collection_items: list[dict],
     *,
     dry_run: bool,
 ) -> dict:
@@ -166,11 +205,12 @@ def build_consolidation_report(
         'graph_family_merges': list(graph_family_items),
         'collection_merges': list(collection_items),
         'junk_key_deletions': list(junk_key_items),
+        'empty_collection_deletions': list(empty_collection_items),
     }
 
 
 def has_unresolved(report: dict) -> bool:
-    """True iff any item in any of the three manifest sections carries an
+    """True iff any item in any of the four manifest sections carries an
     'UNRESOLVED' disposition.
 
     This is the S7 exit-code predicate: ``main()`` returns non-zero on
@@ -180,6 +220,7 @@ def has_unresolved(report: dict) -> bool:
         report['graph_family_merges'],
         report['collection_merges'],
         report['junk_key_deletions'],
+        report['empty_collection_deletions'],
     )
     return any(item.get('disposition') == 'UNRESOLVED' for section in sections for item in section)
 
@@ -549,6 +590,45 @@ async def delete_junk_key(graphiti: Any, key: str, node_count: int) -> str:
 
 
 # ---------------------------------------------------------------------------
+# Guarded empty-collection deletion (Qdrant)
+# ---------------------------------------------------------------------------
+
+async def count_collection_points(qdrant_client: Any, collection: str) -> int:
+    """Read-only exact point count for *collection* via Qdrant's count API.
+
+    Used as the guard for ``delete_empty_collection``: deletion is only
+    safe when this is exactly 0. Defensively treats a missing/falsy
+    ``.count`` as 0 rather than raising, mirroring ``count_graph_nodes``'s
+    ``result.result_set or []`` guard.
+    """
+    result = await qdrant_client.count(collection_name=collection)
+    return getattr(result, 'count', 0) or 0
+
+
+async def delete_empty_collection(qdrant_client: Any, collection: str, point_count: int) -> str:
+    """Delete the *collection* -- but ONLY when its live *point_count* is
+    exactly 0.
+
+    Mirrors ``delete_junk_key``'s count-0 guard: a non-zero count returns
+    'UNRESOLVED' without ever calling ``delete_collection()`` (deletion
+    blocked, no data loss). Best-effort: a raising ``delete_collection()``
+    is caught and reported as UNRESOLVED rather than propagating.
+    """
+    if point_count > 0:
+        return 'UNRESOLVED'
+    try:
+        await qdrant_client.delete_collection(collection)
+    except Exception as e:
+        logger.warning(
+            "consolidate_namespace_families: failed to delete empty Qdrant "
+            "collection '%s': %s",
+            collection, e,
+        )
+        return 'UNRESOLVED'
+    return 'DELETE'
+
+
+# ---------------------------------------------------------------------------
 # Orchestration
 # ---------------------------------------------------------------------------
 
@@ -558,17 +638,18 @@ async def run(
     *,
     limit: int = 1000,
 ) -> dict:
-    """Enumerate/scroll/count every configured family, collection, and junk
-    key and, with ``args.apply``, perform the merges + guarded deletions.
+    """Enumerate/scroll/count every configured family, collection, junk key,
+    and empty-collection candidate and, with ``args.apply``, perform the
+    merges + guarded deletions.
 
     Dry-run (``args.apply`` falsy) performs ZERO mutations: every section's
     ``disposition`` is a PREVIEW of what ``--apply`` would do, computed from
     read-only enumeration/count/scroll alone -- ``merge_graph_family`` and
     ``merge_collection`` are only invoked when ``args.apply`` is true AND the
     corresponding read was not capped (an UNRESOLVED item is never mutated,
-    not even partially); the mutating half of ``delete_junk_key`` is only
-    invoked when ``args.apply`` is true (guarded internally on
-    ``node_count == 0``).
+    not even partially); the mutating halves of ``delete_junk_key`` and
+    ``delete_empty_collection`` are only invoked when ``args.apply`` is true
+    (each guarded internally on its own count being exactly 0).
 
     A capped enumeration/scroll (row or point count hits *limit*) is
     reported ``UNRESOLVED`` rather than ``MERGE`` for that item, mirroring
@@ -694,8 +775,41 @@ async def run(
             'disposition': disposition,
         })
 
+    # --- 4. Guarded empty-collection deletion (EMPTY_COLLECTION_CLEANUP) ---
+    empty_collection_items: list[dict] = []
+    for collection in EMPTY_COLLECTION_CLEANUP:
+        try:
+            point_count = await count_collection_points(qdrant_client, collection)
+        except Exception as e:
+            # Mirrors the junk-key count guard above: a raising count must
+            # never abort the whole consolidation run -- earlier keys/
+            # sections in this same --apply pass may already hold committed
+            # mutations. Report this collection UNRESOLVED and move on.
+            logger.warning(
+                "consolidate_namespace_families: failed to count points for "
+                "Qdrant collection '%s': %s -- reporting UNRESOLVED rather "
+                "than aborting the run.",
+                collection, e,
+            )
+            empty_collection_items.append({
+                'collection': collection,
+                'point_count': None,
+                'disposition': 'UNRESOLVED',
+            })
+            continue
+        if args.apply:
+            disposition = await delete_empty_collection(qdrant_client, collection, point_count)
+        else:
+            disposition = 'DELETE' if point_count == 0 else 'UNRESOLVED'
+        empty_collection_items.append({
+            'collection': collection,
+            'point_count': point_count,
+            'disposition': disposition,
+        })
+
     return build_consolidation_report(
-        graph_family_items, collection_items, junk_key_items, dry_run=not args.apply,
+        graph_family_items, collection_items, junk_key_items, empty_collection_items,
+        dry_run=not args.apply,
     )
 
 
@@ -713,12 +827,14 @@ def main() -> int:
         description=(
             'Consolidate cross-graph namespace families: merge sibling Graphiti '
             'graphs (with identity rewrite), merge legacy Qdrant collections '
-            '(with user_id rewrite), and delete guarded junk keys.'
+            '(with user_id rewrite), and delete guarded junk keys and empty '
+            'Qdrant collections.'
         ),
     )
     parser.add_argument(
         '--apply', action='store_true', default=False,
-        help='Commit the merges + junk-key deletions (default: dry-run only, report and exit).',
+        help='Commit the merges + junk-key/empty-collection deletions '
+             '(default: dry-run only, report and exit).',
     )
     parser.add_argument(
         '--limit', type=int, default=1000,
