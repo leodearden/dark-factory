@@ -33,6 +33,7 @@ from fused_memory.middleware.lock_charter_guard import (
     extract_files,
     lock_charter_error,
 )
+from fused_memory.middleware.premise_lint_guard import premise_lint_error
 from fused_memory.middleware.task_interceptor import (
     TERMINAL_STATUSES,
     _is_ticket_id,
@@ -3083,6 +3084,15 @@ def create_mcp_server(
         if _exec_err is not None:
             return _exec_err
         metadata = inject_execution_class(metadata)
+
+        # Premise-lint guard xi (task 2231/W5-xi): for recon-stage callers,
+        # reject a description asserting a known-false premise about recon's
+        # control-plane mechanics (the 2083/2092/2093 false-premise batch,
+        # e.g. "run_id persists across cycles") BEFORE the task is filed.
+        # Sourced from recon_self_model.premise_lint — see premise_lint_guard.py.
+        _premise_err = premise_lint_error(description, agent_id, project_root)
+        if _premise_err is not None:
+            return _premise_err
 
         return await task_interceptor.submit_task(
             project_root=project_root,
