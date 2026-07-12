@@ -510,11 +510,11 @@ def _assert_quiescent(
     main_sha: str,
     requests: list[MergeRequest],
 ) -> None:
-    """Assert the 5-surface QUIESCENCE contract holds for *worker*.
+    """Assert the 6-surface QUIESCENCE contract holds for *worker*.
 
     Called after each scenario to confirm the pipeline returned to a clean
-    resting state with no leaked permits, worktrees, ledger entries, or
-    unresolved Futures:
+    resting state with no leaked permits, worktrees, ledger entries,
+    unresolved Futures, or registry residue:
 
       (a) every request in *requests* has resolved (done or cancelled) — no
           dangling in-flight work left over from the scenario.
@@ -535,6 +535,11 @@ def _assert_quiescent(
           REAL sha, never 'unknown': the base-chain and verify-base
           sub-checks are silently skipped for the 'unknown' sentinel, which
           would make this assertion pass vacuously rather than meaningfully.
+      (f) set(worker._lifecycle.non_terminal_items()) == set() — the
+          ItemLifecycle registry (merge-queue-reliability PRD scope-4
+          kappa-b / task 2435) has retired every request_id; no registry
+          leak survives quiescence. Placed after the request-ledger sweep
+          (d) so it samples a truly-drained pipeline.
     """
     for req in requests:
         assert req.result.done() or req.result.cancelled(), (
@@ -567,6 +572,15 @@ def _assert_quiescent(
     tli_violations = worker.two_layer_invariants(main_sha)
     assert tli_violations == [], (
         f'two_layer_invariants({main_sha!r}) non-empty at quiescence: {tli_violations!r}'
+    )
+
+    # (f) MQ-reliability kappa-b (task 2435): the ItemLifecycle registry must
+    # have retired every request_id by quiescence — a non-empty result here
+    # is a registry leak (a chokepoint that transitioned a rid away from
+    # LANE_BUFFERED/... but never reached _retire_item's TERMINAL hop).
+    registry_ids = set(worker._lifecycle.non_terminal_items())
+    assert registry_ids == set(), (
+        f'ItemLifecycle registry non-terminal at quiescence: {registry_ids!r}'
     )
 
 
@@ -1816,3 +1830,164 @@ class TestScenario1112Preservation:
             f'expected coalesced result to alias to primary request_id '
             f'{req1.request_id!r}, got {result2.inflight_request_id!r}'
         )
+
+
+# ── B8 (MQ-reliability kappa-b / task 2435): registry single-read signal ────
+# Not one of the π-task's original 12 rows above — this is the boundary test
+# for the SEPARATE, later merge-queue-reliability PRD scope-4 kappa-b task
+# (single-read conversion: snapshot()/liveness repointed onto the
+# ItemLifecycle registry, the 4 transient side-fields deleted). Reuses Row
+# 1's exact two-item speculative-cascade setup (TestScenario1SpeculativeCascade
+# above) as its structural template — the only addition is a LIVE sampling
+# point taken while both items are still mid-verify (registry VERIFYING),
+# before either Future resolves, proving the census/audit/liveness agreement
+# holds genuinely mid-flight and not merely once the pipeline is at rest.
+
+
+@pytest.mark.asyncio
+class TestB8RegistrySingleSourceOfTruth:
+    """B8: snapshot() census, resource-audit, and the liveness phase source
+    all agree with the ItemLifecycle registry's non-terminal view — sampled
+    LIVE while genuinely mid-pipeline (worker still ``_running``, neither
+    Future resolved), then again as full 6-surface quiescence once the
+    pipeline drains and ``stop()`` runs.
+    """
+
+    async def test_b8_snapshot_audit_liveness_agree_across_pipeline(
+        self,
+        git_ops: GitOps,
+        git_repo: Path,
+        git_config: GitConfig,
+        config: OrchestratorConfig,
+    ) -> None:
+        """Two-item cascade (mirrors Row 1's test_head_failure_cascade_
+        relands_both_requests); sampled mid-verify — both items registry-
+        VERIFYING, neither Future resolved yet — before N's gate releases
+        and the head-failure cascade fires.
+        """
+        # ── N's gated local verify: FAILS (failing VerifyResult) on call 0 ───
+        gate_a_release = asyncio.Event()
+        gate_a_entered = asyncio.Event()
+        _local_calls: list[int] = [0]
+
+        async def _local_verify_side_effect(*args: Any, **kwargs: Any) -> VerifyResult:
+            call = _local_calls[0]
+            _local_calls[0] += 1
+            if call == 0:
+                # N's initial verify: wait for gate, then FAIL (not raise).
+                gate_a_entered.set()
+                await gate_a_release.wait()
+                return _mock_verify_result(False)
+            # Re-dispatched verifies (N and N+1 after cascade re-merge): pass.
+            return _mock_verify_result(True)
+
+        # ── N+1's remote verify: gated, then passes ──────────────────────────
+        gate_b_release = asyncio.Event()
+        gate_b_entered = asyncio.Event()
+        gated_remote = _gated_runner(
+            gate_b_release, gate_b_entered, passed=True, name='remote-b8',
+        )
+
+        # ── Branches ─────────────────────────────────────────────────────────
+        wt_a = await _make_branch_with_file(git_ops, 'task/b8-a', 'b8_a.py', 'a = 1\n')
+        wt_b = await _make_branch_with_file(git_ops, 'task/b8-b', 'b8_b.py', 'b = 2\n')
+
+        # ── Worker + two-host allocator (N local, N+1 remote) ────────────────
+        q: asyncio.Queue[MergeRequest] = asyncio.Queue()
+        worker = SpeculativeMergeWorker(git_ops, q)
+        _inject_two_host_allocator(worker, gated_remote)
+
+        loop = asyncio.get_running_loop()
+        req_a = MergeRequest(
+            task_id='b8-a', branch='task/b8-a', worktree=wt_a,
+            pre_rebased=False, task_files=None, module_configs=[],
+            config=config, result=loop.create_future(), lane='normal',
+        )
+        req_b = MergeRequest(
+            task_id='b8-b', branch='task/b8-b', worktree=wt_b,
+            pre_rebased=False, task_files=None, module_configs=[],
+            config=config, result=loop.create_future(), lane='normal',
+        )
+
+        outcome_a: MergeOutcome | None = None
+        outcome_b: MergeOutcome | None = None
+
+        with patch(
+            'orchestrator.merge_queue.run_scoped_verification',
+            _local_verify_side_effect,
+        ):
+            worker_task = asyncio.create_task(worker.run())
+
+            await q.put(req_a)
+            await q.put(req_b)
+
+            # Wait for BOTH verifies to enter — both items are now registry
+            # VERIFYING (dequeued, merged, dispatched), but neither Future
+            # has resolved: a genuinely mid-pipeline sampling point, unlike
+            # Row 1's own pre-stop() sample which is taken only after both
+            # outcomes have already resolved.
+            await asyncio.wait_for(gate_a_entered.wait(), timeout=15.0)
+            await asyncio.wait_for(gate_b_entered.wait(), timeout=15.0)
+
+            # ── B8 assertions (live, mid-pipeline, worker still _running) ────
+            snap = worker.snapshot()
+            snap_ids = {e['request_id'] for e in snap['entries']}
+            registry_ids = set(worker._lifecycle.non_terminal_items())
+            assert snap_ids == registry_ids, (
+                f'snapshot() census {snap_ids!r} != registry non-terminal set '
+                f'{registry_ids!r} while mid-pipeline'
+            )
+            assert {req_a.request_id, req_b.request_id} <= snap_ids, (
+                f'expected both in-flight requests in the mid-pipeline census, '
+                f'got {snap_ids!r}'
+            )
+
+            assert snap['resource_audit']['speculation_accounting'] == [], (
+                f"speculation_accounting non-empty mid-pipeline: "
+                f"{snap['resource_audit']['speculation_accounting']!r}"
+            )
+
+            # Liveness's phase source IS snapshot()['entries'] — this mirrors
+            # _check_request_liveness's own `phase_by_request_id`
+            # construction (merge_queue.py) verbatim, so it proves the SAME
+            # derivation rather than a re-implemented one. Every request_id
+            # still armed in the liveness ledger must resolve a phase from it.
+            phase_by_request_id = {
+                entry['request_id']: entry['state'] for entry in snap['entries']
+            }
+            open_ids = worker._request_ledger.open_request_ids()
+            assert open_ids, 'expected both requests still armed in the ledger mid-pipeline'
+            for rid in open_ids:
+                assert rid in phase_by_request_id, (
+                    f'open ledger request_id {rid!r} has no phase in '
+                    f"snapshot()['entries'] {phase_by_request_id!r} — liveness's "
+                    f'phase source has diverged from the census'
+                )
+
+            # ── Let the cascade run to completion (N fails, N+1 lands via
+            # the head-failure cascade re-merge — mirrors Row 1) ─────────────
+            gate_a_release.set()
+            gate_b_release.set()
+
+            with contextlib.suppress(TimeoutError):
+                outcome_a = await asyncio.wait_for(req_a.result, timeout=MERGE_RESULT_TIMEOUT)
+            with contextlib.suppress(TimeoutError):
+                outcome_b = await asyncio.wait_for(req_b.result, timeout=MERGE_RESULT_TIMEOUT)
+
+            assert outcome_a is not None and outcome_a.status not in ('done', 'already_merged'), (
+                f'Expected N to fail (genuine VerifyResult failure), got {outcome_a!r}.'
+            )
+            assert outcome_b is not None and outcome_b.status == 'done', (
+                f'Expected N+1 to resolve "done" after cascade re-merge, got {outcome_b!r}.'
+            )
+
+            # ── Full 6-surface quiescence once the cascade has drained —
+            # sampled here, before worker.stop(), for the same reason as
+            # Row 1 (I4/I6 short-circuit to [] once stopped).
+            main_sha = await git_ops.get_main_sha()
+            _assert_quiescent(worker, main_sha, [req_a, req_b])
+
+            await worker.stop()
+
+        with contextlib.suppress(Exception):
+            await asyncio.wait_for(worker_task, timeout=5.0)
