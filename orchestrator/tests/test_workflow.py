@@ -22,13 +22,22 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 from _orch_helpers import pydantic_spec
 
+from shared.task_statuses import TaskStatus
+
 from orchestrator.agents.invoke import AgentResult
 from orchestrator.artifacts import TaskArtifacts
 from orchestrator.config import OrchestratorConfig
 from orchestrator.git_ops import WorktreeConflictError
 from orchestrator.merge_queue import PlanFilesTouchedResult
 from orchestrator.verify import VerifyResult
-from orchestrator.workflow import TaskWorkflow, WorkflowOutcome, WorkflowState
+from orchestrator.workflow import (
+    StewardInterrupted,
+    StewardResolved,
+    StewardTerminalDecision,
+    TaskWorkflow,
+    WorkflowOutcome,
+    WorkflowState,
+)
 
 
 def _make_workflow(*, tmp_path: Path, task_id: str = '2656') -> TaskWorkflow:
@@ -2180,3 +2189,73 @@ class TestEnsureStewardStartedWiresOutcomeChannel:
         assert isinstance(wf._steward_outcome_channel, asyncio.Queue)
         assert fake.outcome_channel is wf._steward_outcome_channel
         assert fake.wip_probe == wf._worktree_has_wip_commits
+
+
+# ---------------------------------------------------------------------------
+# _await_steward_completion returns a StewardOutcome (task 2248 / W9-delta,
+# step-9/10)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestAwaitStewardCompletionReturnsOutcome:
+    """``_await_steward_completion`` now returns a ``StewardOutcome`` (SO-1):
+    it awaits the in-process channel instead of polling escalation-queue
+    file state, and a single fresh scheduler status read overrides with
+    ``StewardTerminalDecision`` when terminal/deferred — preserving the
+    pre-W9-delta precedence where the terminal check preceded the
+    L0-resolved check — regardless of what (if anything) the channel
+    produced.
+    """
+
+    async def test_channel_outcome_passes_through_when_status_non_terminal(
+        self, tmp_path: Path,
+    ):
+        """A published outcome is returned as-is when status is live."""
+        wf = _make_workflow(tmp_path=tmp_path)
+        wf.config.steward_completion_timeout = 5.0
+        wf._steward_outcome_channel = asyncio.Queue()
+        wf._steward_outcome_channel.put_nowait(
+            StewardResolved(resolution_text='fixed it'),
+        )
+        wf.scheduler.get_status = AsyncMock(return_value='blocked')
+
+        outcome = await wf._await_steward_completion()
+
+        assert outcome == StewardResolved(resolution_text='fixed it')
+
+    @pytest.mark.parametrize('status', ['done', 'cancelled', 'deferred'])
+    async def test_terminal_or_deferred_status_overrides_channel_content(
+        self, tmp_path: Path, status: str,
+    ):
+        """Terminal/deferred status wins over a published outcome — the
+        channel already has ``StewardResolved`` queued, but the fresh status
+        read must override it (SO-1 override precedence)."""
+        wf = _make_workflow(tmp_path=tmp_path)
+        wf.config.steward_completion_timeout = 5.0
+        wf._steward_outcome_channel = asyncio.Queue()
+        wf._steward_outcome_channel.put_nowait(
+            StewardResolved(resolution_text='fixed it'),
+        )
+        wf.scheduler.get_status = AsyncMock(return_value=status)
+
+        outcome = await wf._await_steward_completion()
+
+        assert outcome == StewardTerminalDecision(new_status=TaskStatus(status))
+
+    @pytest.mark.parametrize('wip', [True, False])
+    async def test_grace_timeout_with_empty_channel_returns_interrupted(
+        self, tmp_path: Path, wip: bool,
+    ):
+        """Nothing published before the grace deadline → synthesized
+        StewardInterrupted('timeout', ...), wip derived via the workflow's
+        own probe."""
+        wf = _make_workflow(tmp_path=tmp_path)
+        wf.config.steward_completion_timeout = 0.1
+        wf._steward_outcome_channel = asyncio.Queue()
+        wf.scheduler.get_status = AsyncMock(return_value='blocked')
+        wf._worktree_has_wip_commits = AsyncMock(return_value=wip)
+
+        outcome = await wf._await_steward_completion()
+
+        assert outcome == StewardInterrupted('timeout', wip_commits_present=wip)
