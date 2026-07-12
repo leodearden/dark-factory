@@ -45,6 +45,16 @@ from fused_memory.services.live_workflow_detector import is_workflow_live_for_ta
 # so the server enforces the same keys the post-hoc guard checked.
 SNAPSHOT_TOKEN_KEYS: tuple[str, ...] = ('snapshot_status', 'observed_status')
 
+# Stable, machine-readable Verdict.corrective_path token for the Gate 1
+# (terminal-write) rejection. Names the sanctioned same-status
+# done_provenance repair seam
+# (``set_task_status(task_id, 'done', done_provenance={...})``, which routes
+# an already-done task to
+# ``task_interceptor._repair_done_provenance_same_status`` — task 2401)
+# rather than the destructive reopen path. Never used by the Gate 2
+# (live-workflow) or Gate 3 (stale-snapshot) rejections — see :class:`Verdict`.
+TERMINAL_CORRECTIVE_PATH = 'set_task_status_done_provenance_repair'
+
 # ---------------------------------------------------------------------------
 # Verdict
 # ---------------------------------------------------------------------------
@@ -129,6 +139,7 @@ def _reject(
     live_status: str,
     target_status: str | None = None,
     snapshot_token: str | None = None,
+    corrective_path: str = '',
 ) -> Verdict:
     """Small internal factory for a rejection :class:`Verdict`."""
     return Verdict(
@@ -142,6 +153,7 @@ def _reject(
         live_status=live_status,
         target_status=target_status,
         snapshot_token=snapshot_token,
+        corrective_path=corrective_path,
     )
 
 
@@ -201,6 +213,7 @@ def check(
             live_status=live_status,
             target_status=target_status,
             snapshot_token=snapshot_token,
+            corrective_path=TERMINAL_CORRECTIVE_PATH,
         )
 
     if op == 'set_task_status' and is_workflow_live_for_task(
