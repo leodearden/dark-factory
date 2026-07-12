@@ -24,10 +24,13 @@ Covers:
 from __future__ import annotations
 
 import dataclasses
+from pathlib import Path
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 from shared.deploy_state import DeployPhase
 
+from orchestrator.landed_outbox import LandedOutbox, LandedRow, MergeProvenance
 from orchestrator.task_ground_truth import (
     BranchState,
     BranchStateKind,
@@ -35,6 +38,7 @@ from orchestrator.task_ground_truth import (
     ClaimantSource,
     EscalationRef,
     RecoveryAction,
+    TaskGroundTruth,
     TruthReport,
     classify_recovery,
 )
@@ -196,3 +200,77 @@ class TestClassifyRecovery:
     def test_i_unmapped_degenerate_shape_defaults_to_leave(self) -> None:
         report = self._report(db_status='pending', branch_state=BranchState(BranchStateKind.EXISTS_OFF_MAIN))
         assert classify_recovery(report) == RecoveryAction.LEAVE
+
+
+# ---------------------------------------------------------------------------
+# step-5 — derive_truth's branch_state resolves JOURNAL-FIRST (TG-1)
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture(autouse=True)
+def _reset_merge_provenance():
+    """``MergeProvenance._outbox`` is a process-global — never leak a bound
+    outbox into another test (mirrors test_workflow_merge_provenance.py's
+    identically-named fixture)."""
+    MergeProvenance._outbox = None
+    yield
+    MergeProvenance._outbox = None
+
+
+def _bind_landed_row(tmp_path: Path, *, task_id: str, advanced_sha: str) -> None:
+    """Bind a real LandedOutbox (via MergeProvenance.bind) holding a row for *task_id*."""
+    outbox = LandedOutbox(tmp_path / 'landed.json')
+    outbox.record(LandedRow(
+        task_id=task_id, branch_tip_sha='branchtip', advanced_sha=advanced_sha,
+        landed_at=1.0,
+    ))
+    MergeProvenance.bind(outbox)
+
+
+def _fake_git_ops(
+    *,
+    branch_prefix: str = 'task/',
+    main_branch: str = 'main',
+    is_ancestor: bool = False,
+    branch_sha: str | None = None,
+    marker_sha: str | None = None,
+) -> MagicMock:
+    """A minimal git_ops double exposing exactly the async surface
+    TaskGroundTruth's branch-state archaeology consumes, plus the
+    ``config.branch_prefix`` / ``config.main_branch`` attributes it derives
+    the branch name and main-ref from."""
+    git_ops = MagicMock()
+    git_ops.config = MagicMock(branch_prefix=branch_prefix, main_branch=main_branch)
+    git_ops.is_ancestor = AsyncMock(return_value=is_ancestor)
+    git_ops.resolve_branch_sha = AsyncMock(return_value=branch_sha)
+    git_ops.find_merge_marker = AsyncMock(return_value=marker_sha)
+    return git_ops
+
+
+def _make_ground_truth(*, git_ops: MagicMock | None = None) -> TaskGroundTruth:
+    return TaskGroundTruth(
+        git_ops or _fake_git_ops(),
+        MagicMock(),
+        None,
+        lambda tid: Path('/nonexistent-worktree') / tid,
+    )
+
+
+@pytest.mark.asyncio
+class TestDeriveTruthBranchStateJournalFirst:
+    """A ``MergeProvenance`` journal hit is authoritative and short-circuits
+    before any git archaeology runs."""
+
+    async def test_journal_hit_resolves_on_main_without_touching_git(
+        self, tmp_path: Path,
+    ) -> None:
+        _bind_landed_row(tmp_path, task_id='42', advanced_sha='advancedsha123')
+        git_ops = _fake_git_ops()
+        resolver = _make_ground_truth(git_ops=git_ops)
+
+        report = await resolver.derive_truth('42')
+
+        assert report.branch_state == BranchState(BranchStateKind.ON_MAIN, 'advancedsha123')
+        git_ops.is_ancestor.assert_not_awaited()
+        git_ops.resolve_branch_sha.assert_not_awaited()
+        git_ops.find_merge_marker.assert_not_awaited()
