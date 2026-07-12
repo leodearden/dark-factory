@@ -4007,7 +4007,7 @@ class Scheduler:
     # assignment). Docstrings declare each phase's ctx reads/writes.
 
     async def _phase_backfill_dep_status(self, ctx: TickContext) -> object:
-        """Phase 1/18: backfill dep-status for local deps missing from status_map.
+        """Backfill dep-status for local deps missing from status_map.
 
         Reads: ``ctx.tasks``. Writes: ``ctx.status_map`` (updated in place
         on a clean backfill; left as-is — fail-safe-wait — on a degraded
@@ -4104,7 +4104,7 @@ class Scheduler:
         return _CONTINUE
 
     async def _phase_drain_park_eviction(self, ctx: TickContext) -> object:
-        """Hygiene phase 2/18: drain queued operator force-evict requests.
+        """Hygiene: drain queued operator force-evict requests.
 
         Reads: ``ctx.status_map``, ``ctx.tasks_by_id``. Writes: none on
         ctx (mutates the park-eviction store + lock table directly via
@@ -4117,7 +4117,7 @@ class Scheduler:
         return _CONTINUE
 
     async def _phase_park_gc(self, ctx: TickContext) -> object:
-        """Hygiene phase 3/18: owner-state park-GC sweep.
+        """Hygiene: owner-state park-GC sweep.
 
         Reads: ``ctx.status_map``, ``ctx.tasks_by_id``. Writes: none on
         ctx (mutates ``self.lock_table``/``self._skip_count`` and emits
@@ -4163,7 +4163,7 @@ class Scheduler:
         return _CONTINUE
 
     async def _phase_stale_sweep(self, ctx: TickContext) -> object:
-        """Hygiene phase 4/18: sweep stale per-task bookkeeping + streak counters.
+        """Hygiene: sweep stale per-task bookkeeping + streak counters.
 
         Reads: ``ctx.status_map``, ``ctx.tasks_by_id``. Writes:
         ``ctx.stale_ids``. Drops ``_last_dispatch_at`` / ``_skip_count`` /
@@ -4203,7 +4203,7 @@ class Scheduler:
         return _CONTINUE
 
     async def _phase_cooldown_gc(self, ctx: TickContext) -> object:
-        """Hygiene phase 5/18: GC the requeue-cooldown dict.
+        """Hygiene: GC the requeue-cooldown dict.
 
         Reads/writes: none on ctx (mutates ``self._requeue_until``
         directly via ``_gc_expired_cooldowns``). Runs before both the
@@ -4216,8 +4216,8 @@ class Scheduler:
         return _CONTINUE
 
     async def _phase_external_dep_policy(self, ctx: TickContext) -> object:
-        """Phase 6/18: cross-project external-dep gate (invariant 5 — one
-        batched call per tick).
+        """Cross-project external-dep gate (invariant 5 — one batched call
+        per tick).
 
         Reads: ``ctx.tasks``. Writes: ``ctx.external_cache``,
         ``ctx.external_resolver_failed``. Collects the union of
@@ -4265,7 +4265,7 @@ class Scheduler:
         return _CONTINUE
 
     async def _phase_stamp_milestone(self, ctx: TickContext) -> object:
-        """Phase 7/18: stamp the frozen-once ``milestone_deps_satisfied_at`` anchor.
+        """Stamp the frozen-once ``milestone_deps_satisfied_at`` anchor.
 
         Reads: ``ctx.tasks``, ``ctx.status_map``, ``ctx.tasks_by_id``,
         ``ctx.external_cache``, ``ctx.external_resolver_failed``. Writes:
@@ -4286,7 +4286,7 @@ class Scheduler:
         return _CONTINUE
 
     async def _phase_override_snapshot_gc(self, ctx: TickContext) -> object:
-        """Phase 8/18: load + GC this tick's priority-override snapshot.
+        """Load + GC this tick's priority-override snapshot.
 
         Reads: ``ctx.status_map``, ``ctx.tasks_by_id``. Writes:
         ``ctx.overrides``. Loads the override snapshot from the override
@@ -4320,7 +4320,7 @@ class Scheduler:
         return _CONTINUE
 
     async def _phase_reserve_now(self, ctx: TickContext) -> object:
-        """Phase 9/18: snapshot pre-short-circuit overrides, then reserve-now.
+        """Snapshot pre-short-circuit overrides, then reserve-now.
 
         Reads: ``ctx.overrides``, ``ctx.tasks_by_id``, ``ctx.status_map``.
         Writes: ``ctx.overrides_for_diff`` (snapshot BEFORE the
@@ -4406,7 +4406,7 @@ class Scheduler:
         return _CONTINUE
 
     async def _phase_override_diff(self, ctx: TickContext) -> object:
-        """Phase 10/18: diff-detect override changes and emit events.
+        """Diff-detect override changes and emit events.
 
         Reads: ``ctx.overrides_for_diff``, ``ctx.overrides``. Writes: none
         on ctx (mutates ``self._prev_overrides_snapshot`` /
@@ -4428,7 +4428,7 @@ class Scheduler:
         return _CONTINUE
 
     async def _phase_compute_priorities(self, ctx: TickContext) -> object:
-        """Phase 11/18: build reverse index + compute effective priorities + CPM counts.
+        """Build reverse index + compute effective priorities + CPM counts.
 
         Reads: ``ctx.tasks``, ``ctx.overrides``, ``ctx.tasks_by_id``,
         ``ctx.status_map``. Writes: ``ctx.effective_priorities``,
@@ -4454,7 +4454,7 @@ class Scheduler:
         return _CONTINUE
 
     async def _phase_build_candidates(self, ctx: TickContext) -> object:
-        """Phase 12/18: filter tasks to dispatch-eligible candidates.
+        """Filter tasks to dispatch-eligible candidates.
 
         Reads: ``ctx.tasks``, ``ctx.status_map``, ``ctx.tasks_by_id``,
         ``ctx.external_cache``, ``ctx.external_resolver_failed``. Writes:
@@ -4491,7 +4491,7 @@ class Scheduler:
         return _CONTINUE
 
     async def _phase_landed_outbox_gate(self, ctx: TickContext) -> object:
-        """Phase 13/18: landed-outbox + already-landed consult-before-dispatch gate.
+        """Landed-outbox + already-landed consult-before-dispatch gate.
 
         Reads: ``ctx.candidates``. Writes: ``ctx.gated_ids``,
         ``ctx.candidates`` (filtered). Consulted once per candidate here,
@@ -4522,7 +4522,7 @@ class Scheduler:
         return _CONTINUE
 
     async def _phase_starvation(self, ctx: TickContext) -> object:
-        """Phase 14/18: starvation watchdog pass over dispatch-eligible candidates.
+        """Starvation watchdog pass over dispatch-eligible candidates.
 
         Reads: ``ctx.candidates``. Writes: none on ctx (side-effecting
         scan; may emit escalation callbacks). Runs once per tick, wrapped
@@ -4540,7 +4540,7 @@ class Scheduler:
         return _CONTINUE
 
     async def _phase_empty_candidate_gate(self, ctx: TickContext) -> object:
-        """Phase 15/18: end the tick now if no candidates survived the gates.
+        """End the tick now if no candidates survived the gates.
 
         Reads: ``ctx.candidates``. Writes: none. Kept as a distinct phase
         (rather than folded into ``_phase_starvation`` or
@@ -4553,7 +4553,7 @@ class Scheduler:
         return _CONTINUE
 
     async def _phase_psi_gate(self, ctx: TickContext) -> object:
-        """Phase 16/18: dispatch-admission gate (task 2328, DA3 of PRD
+        """Dispatch-admission gate (task 2328, DA3 of PRD
         docs/prds/dispatch-admission-load-cap.md).
 
         Reads: none on ctx. Writes: ``ctx.psi_sample``, ``ctx.psi_hold``,
@@ -4643,8 +4643,7 @@ class Scheduler:
             self._last_dispatch_deferred_log = _now
 
     async def _phase_select_pins(self, ctx: TickContext) -> object:
-        """Phase 17/18: pin-dispatch — try pinned tasks in pin_order ASC
-        before scoring.
+        """Pin-dispatch — try pinned tasks in pin_order ASC before scoring.
 
         Reads: ``ctx.overrides``, ``ctx.tasks_by_id``, ``ctx.status_map``,
         ``ctx.external_cache``, ``ctx.external_resolver_failed``,
@@ -4729,7 +4728,7 @@ class Scheduler:
         return _CONTINUE
 
     async def _phase_select_scored(self, ctx: TickContext) -> object:
-        """Phase 18/18: score each candidate and dispatch the best available.
+        """Score each candidate and dispatch the best available.
 
         Reads: ``ctx.candidates``, ``ctx.effective_priorities``,
         ``ctx.max_id``, ``ctx.transitive_counts``, ``ctx.psi_hold``,
@@ -4927,10 +4926,16 @@ class Scheduler:
         # per-phase commentary off of.
         for label in self._TICK_PHASE_ORDER:
             r = await getattr(self, f'_phase_{label}')(ctx)
-            assert r is _CONTINUE or isinstance(r, TickOutcome), (
-                f'_phase_{label} returned {r!r} — every _phase_* method must '
-                f'return _CONTINUE or a TickOutcome (did it forget a return?)'
-            )
+            # Explicit check (not a bare `assert`) so the contract is still
+            # enforced under `python -O` (asserts stripped) — without it, a
+            # phase that forgets to return would fall through to
+            # `return r.assignment` on `None` and raise an opaque
+            # AttributeError instead of this descriptive error.
+            if not (r is _CONTINUE or isinstance(r, TickOutcome)):
+                raise RuntimeError(
+                    f'_phase_{label} returned {r!r} — every _phase_* method must '
+                    f'return _CONTINUE or a TickOutcome (did it forget a return?)'
+                )
             if r is not _CONTINUE:
                 return r.assignment
         return None
