@@ -582,3 +582,122 @@ class TestC4PromoteToL2IdentityGate:
         assert result.get('status') in {'created', 'updated'}, (
             f"Expected status in {{'created','updated'}}; got: {result}"
         )
+
+
+# ---------------------------------------------------------------------------
+# Composition comp-1 — Table B (escalation.action_effects) targets are Table A
+# (shared.task_transitions/task_statuses) vocabulary members AND legal
+# transitions. PRD D1: "Table B computes intent; Table A validates legality
+# at the chokepoint; never three tables." This is the load-bearing GATE
+# assertion no per-cell unit test can make — it crosses both tables.
+# ---------------------------------------------------------------------------
+
+_TASK_STATUS_VALUES = frozenset(s.value for s in TaskStatus)
+
+# Representative escalation-side SOURCE statuses per action, chosen to prove
+# both a blocked-task resolution (the common case, B1) and an in-progress-task
+# resolution (orphan/cascade re-pend and stranded-revert, B1/B2) reach a
+# LEGAL Table A transition for the same Table B target. close_only's
+# TaskEffect has target_status=None (no task-status effect), so it has no
+# representative sources and is excluded from the transition check (still
+# covered separately below as a recognised action).
+_REPRESENTATIVE_SOURCES: dict[str, tuple[str, ...]] = {
+    'resume': ('blocked',),
+    'restart': ('blocked',),
+    'park': ('blocked', 'in-progress'),
+    'abandon': ('blocked', 'in-progress'),
+}
+
+
+class TestCompositionTableBSubsetOfTableA:
+    """comp-1: every ACTION_EFFECTS entry with a non-None target_status names
+    a real TaskStatus vocabulary member AND is reachable via a legal Table A
+    ESCALATION-actor transition from its representative source(s)."""
+
+    def test_every_target_status_is_a_taskstatus_member(self) -> None:
+        for (action, _level, _category), effect in ACTION_EFFECTS.items():
+            if effect.target_status is None:
+                continue
+            assert effect.target_status in _TASK_STATUS_VALUES, (
+                f'action={action!r} targets {effect.target_status!r}, which is '
+                f'not a shared.task_statuses.TaskStatus member: {sorted(_TASK_STATUS_VALUES)}'
+            )
+
+    def test_every_target_status_is_a_legal_escalation_transition(self) -> None:
+        checked_actions: set[str] = set()
+        for (action, _level, _category), effect in ACTION_EFFECTS.items():
+            if effect.target_status is None:
+                continue
+            sources = _REPRESENTATIVE_SOURCES.get(action)
+            assert sources is not None, (
+                f'No representative source(s) registered for action {action!r}; '
+                'update _REPRESENTATIVE_SOURCES to cover every ACTION_EFFECTS '
+                'action with a non-None target_status.'
+            )
+            for src in sources:
+                assert is_legal_transition(
+                    src, effect.target_status, ActorClass.ESCALATION,
+                ), (
+                    f'Table B action={action!r} targets {effect.target_status!r}, '
+                    f'but Table A rejects {src}->{effect.target_status} for '
+                    f'ActorClass.ESCALATION — Table B and Table A have drifted '
+                    f'apart (PRD D1 violation).'
+                )
+            checked_actions.add(action)
+
+        assert checked_actions == set(_REPRESENTATIVE_SOURCES), (
+            f'Expected to check exactly {set(_REPRESENTATIVE_SOURCES)}; '
+            f'checked {checked_actions} (has ACTION_EFFECTS action set drifted?)'
+        )
+
+    def test_close_only_has_no_target_status_but_is_still_a_recognised_action(
+        self,
+    ) -> None:
+        effect = ACTION_EFFECTS[('close_only', ANY, ANY)]
+        assert effect.target_status is None, (
+            f'close_only must have no task-status effect; got {effect.target_status!r}'
+        )
+        # Still resolves through effect_for — it is a recognised action, just
+        # one with WORKFLOW_NONE disposition and no Table A check to make.
+        assert effect_for('close_only', 0, 'scope_violation') == effect
+
+
+# ---------------------------------------------------------------------------
+# Composition comp-2 — ONE shared effect_for table serves both the escalation
+# server (B5, resolve_issue) and the orchestrator harness (comp-2 harness
+# face, _on_escalation_resolved, step-11) — level/category never narrow.
+# ---------------------------------------------------------------------------
+
+
+class TestCompositionSharedEffectForTable:
+    """comp-2: effect_for(action, level, category) resolves a TaskEffect for
+    each of the 5 RESOLVE_ACTIONS and None for an unrecognised action,
+    regardless of level or category — the SAME table consumed by both the
+    escalation server's resolve_issue (B5) and the orchestrator harness's
+    _on_escalation_resolved (comp-2 harness face, step-11)."""
+
+    _RESOLVE_ACTIONS = ('resume', 'restart', 'park', 'abandon', 'close_only')
+    _LEVELS = (0, 1, 2)
+    # Includes 'milestone_gate', a category absent from server.CATEGORIES
+    # (G6 archive verification) — proves category never narrows legality.
+    _CATEGORIES = ('scope_violation', 'milestone_gate')
+
+    def test_all_five_actions_resolve_across_level_and_category(self) -> None:
+        for action in self._RESOLVE_ACTIONS:
+            for level in self._LEVELS:
+                for category in self._CATEGORIES:
+                    effect = effect_for(action, level, category)
+                    assert isinstance(effect, TaskEffect), (
+                        f'effect_for({action!r}, {level}, {category!r}) must '
+                        f'resolve a TaskEffect (level/category never narrow); '
+                        f'got {effect!r}'
+                    )
+
+    def test_unknown_action_is_none_across_level_and_category(self) -> None:
+        for level in self._LEVELS:
+            for category in self._CATEGORIES:
+                assert effect_for('bogus', level, category) is None, (
+                    f"effect_for('bogus', {level}, {category!r}) must be None "
+                    f'(unrecognised action) — the same table both the server '
+                    f'(B5) and the harness (comp-2 harness face) reject on.'
+                )
