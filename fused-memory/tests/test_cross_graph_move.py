@@ -1623,14 +1623,14 @@ class TestDeleteSourceNode:
 # embedding-free episode relocation)
 # ---------------------------------------------------------------------------
 
-EPISODE_UUID_FIXTURE = 'episode-aaaa-2222'
+MOVED_EPISODE_UUID_FIXTURE = 'episode-aaaa-2222'
 
 # (uuid, name, group_id, source_description, source, content, entity_edges,
 # created_at, valid_at) -- the full Episodic property set (graphiti_core's
 # own EPISODIC_NODE_RETURN / get_episode_node_save_query, models/nodes/
 # node_db_queries.py) -- NO embedding property exists on an Episodic node.
 EPISODE_ROW_FIXTURE = [
-    EPISODE_UUID_FIXTURE, 'Episode 1', SOURCE_GRAPH_FIXTURE, 'test source',
+    MOVED_EPISODE_UUID_FIXTURE, 'Episode 1', SOURCE_GRAPH_FIXTURE, 'test source',
     'message', 'Alice said hello.', ['edge-uuid-1', 'edge-uuid-2'],
     '2026-01-01T00:00:00+00:00', '2026-01-01T00:00:00+00:00',
 ]
@@ -1670,19 +1670,19 @@ class TestCreateMovedEpisode:
 
         rewritten_group_id = 'dark_factory_rewritten'
         result = await create_moved_episode(
-            backend, EPISODE_UUID_FIXTURE, SOURCE_GRAPH_FIXTURE, TARGET_GRAPH_FIXTURE,
+            backend, MOVED_EPISODE_UUID_FIXTURE, SOURCE_GRAPH_FIXTURE, TARGET_GRAPH_FIXTURE,
             rewrite_group_id=rewritten_group_id,
         )
 
         read_params = extract_params(source_mock.ro_query.call_args_list[0])
-        assert read_params.get('uuid') == EPISODE_UUID_FIXTURE
+        assert read_params.get('uuid') == MOVED_EPISODE_UUID_FIXTURE
 
         target_mock.query.assert_awaited_once()
         cypher = extract_cypher(target_mock.query.call_args)
         params = extract_params(target_mock.query.call_args)
         assert 'CREATE' in cypher
         assert ':Episodic' in cypher
-        assert params.get('uuid') == EPISODE_UUID_FIXTURE
+        assert params.get('uuid') == MOVED_EPISODE_UUID_FIXTURE
         assert params.get('name') == 'Episode 1'
         assert params.get('group_id') == rewritten_group_id
         assert params.get('source_description') == 'test source'
@@ -1695,7 +1695,7 @@ class TestCreateMovedEpisode:
         fake_read_compact.assert_not_awaited()
 
         assert isinstance(result, EpisodeCreateResult)
-        assert result.uuid == EPISODE_UUID_FIXTURE
+        assert result.uuid == MOVED_EPISODE_UUID_FIXTURE
         assert result.source_graph == SOURCE_GRAPH_FIXTURE
         assert result.target_graph == TARGET_GRAPH_FIXTURE
         assert result.already_created is False
@@ -1717,7 +1717,7 @@ class TestCreateMovedEpisode:
         })
 
         await create_moved_episode(
-            backend, EPISODE_UUID_FIXTURE, SOURCE_GRAPH_FIXTURE, TARGET_GRAPH_FIXTURE,
+            backend, MOVED_EPISODE_UUID_FIXTURE, SOURCE_GRAPH_FIXTURE, TARGET_GRAPH_FIXTURE,
         )
 
         params = extract_params(target_mock.query.call_args)
@@ -1744,7 +1744,7 @@ class TestCreateMovedEpisode:
         monkeypatch.setattr(cross_graph_move, '_read_compact_vector', fake_read_compact)
 
         await create_moved_episode(
-            backend, EPISODE_UUID_FIXTURE, SOURCE_GRAPH_FIXTURE, TARGET_GRAPH_FIXTURE,
+            backend, MOVED_EPISODE_UUID_FIXTURE, SOURCE_GRAPH_FIXTURE, TARGET_GRAPH_FIXTURE,
         )
 
         fake_read_compact.assert_not_awaited()
@@ -1768,7 +1768,7 @@ class TestCreateMovedEpisode:
         })
 
         await create_moved_episode(
-            backend, EPISODE_UUID_FIXTURE, SOURCE_GRAPH_FIXTURE, TARGET_GRAPH_FIXTURE,
+            backend, MOVED_EPISODE_UUID_FIXTURE, SOURCE_GRAPH_FIXTURE, TARGET_GRAPH_FIXTURE,
         )
 
         cypher = extract_cypher(target_mock.query.call_args)
@@ -1790,7 +1790,7 @@ class TestCreateMovedEpisode:
         source_mock.ro_query = AsyncMock(return_value=MagicMock(result_set=[]))
         target_mock = make_graph_mock()
         target_mock.ro_query = AsyncMock(
-            return_value=MagicMock(result_set=[[EPISODE_UUID_FIXTURE]])
+            return_value=MagicMock(result_set=[[MOVED_EPISODE_UUID_FIXTURE]])
         )
         backend._driver._get_graph = _route_graphs({
             SOURCE_GRAPH_FIXTURE: source_mock,
@@ -1801,7 +1801,7 @@ class TestCreateMovedEpisode:
         monkeypatch.setattr(cross_graph_move, '_read_compact_vector', fake_read_compact)
 
         result = await create_moved_episode(
-            backend, EPISODE_UUID_FIXTURE, SOURCE_GRAPH_FIXTURE, TARGET_GRAPH_FIXTURE,
+            backend, MOVED_EPISODE_UUID_FIXTURE, SOURCE_GRAPH_FIXTURE, TARGET_GRAPH_FIXTURE,
         )
 
         target_mock.query.assert_not_awaited()
@@ -1809,7 +1809,7 @@ class TestCreateMovedEpisode:
         fake_read_compact.assert_not_awaited()
 
         assert isinstance(result, EpisodeCreateResult)
-        assert result.uuid == EPISODE_UUID_FIXTURE
+        assert result.uuid == MOVED_EPISODE_UUID_FIXTURE
         assert result.source_graph == SOURCE_GRAPH_FIXTURE
         assert result.target_graph == TARGET_GRAPH_FIXTURE
         assert result.already_created is True
@@ -1833,7 +1833,7 @@ class TestCreateMovedEpisode:
 
         with pytest.raises(NodeNotFoundError):
             await create_moved_episode(
-                backend, EPISODE_UUID_FIXTURE, SOURCE_GRAPH_FIXTURE, TARGET_GRAPH_FIXTURE,
+                backend, MOVED_EPISODE_UUID_FIXTURE, SOURCE_GRAPH_FIXTURE, TARGET_GRAPH_FIXTURE,
             )
 
         target_mock.query.assert_not_awaited()
@@ -1858,7 +1858,7 @@ class TestCreateMovedEpisode:
         })
 
         await create_moved_episode(
-            backend, EPISODE_UUID_FIXTURE, SOURCE_GRAPH_FIXTURE, TARGET_GRAPH_FIXTURE,
+            backend, MOVED_EPISODE_UUID_FIXTURE, SOURCE_GRAPH_FIXTURE, TARGET_GRAPH_FIXTURE,
         )
 
         # exactly one ro_query on source (episode scalar props) -- no
@@ -1896,7 +1896,7 @@ class TestDeleteSourceEpisode:
         source_mock = make_graph_mock()
         backend._driver._get_graph = _route_graphs({SOURCE_GRAPH_FIXTURE: source_mock})
 
-        await delete_source_episode(backend, EPISODE_UUID_FIXTURE, SOURCE_GRAPH_FIXTURE)
+        await delete_source_episode(backend, MOVED_EPISODE_UUID_FIXTURE, SOURCE_GRAPH_FIXTURE)
 
         assert source_mock.query.await_count == 1
         cypher = extract_cypher(source_mock.query.call_args)
@@ -1904,7 +1904,7 @@ class TestDeleteSourceEpisode:
         assert 'DETACH DELETE' in cypher
         assert ':Episodic' in cypher
         assert 'CREATE' not in cypher
-        assert params.get('uuid') == EPISODE_UUID_FIXTURE
+        assert params.get('uuid') == MOVED_EPISODE_UUID_FIXTURE
 
     @pytest.mark.asyncio
     async def test_missing_source_episode_is_idempotent_noop(
@@ -1921,7 +1921,7 @@ class TestDeleteSourceEpisode:
         backend._driver._get_graph = _route_graphs({SOURCE_GRAPH_FIXTURE: source_mock})
 
         # Must not raise.
-        await delete_source_episode(backend, EPISODE_UUID_FIXTURE, SOURCE_GRAPH_FIXTURE)
+        await delete_source_episode(backend, MOVED_EPISODE_UUID_FIXTURE, SOURCE_GRAPH_FIXTURE)
 
         assert source_mock.query.await_count == 1
         cypher = extract_cypher(source_mock.query.call_args)
