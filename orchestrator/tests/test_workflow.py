@@ -31,6 +31,7 @@ from orchestrator.merge_queue import PlanFilesTouchedResult
 from orchestrator.verify import VerifyResult
 from orchestrator.workflow import (
     StewardInterrupted,
+    StewardReescalatedL1,
     StewardResolved,
     StewardTerminalDecision,
     TaskWorkflow,
@@ -2258,3 +2259,139 @@ class TestAwaitStewardCompletionReturnsOutcome:
         outcome = await wf._await_steward_completion()
 
         assert outcome == StewardInterrupted('timeout', wip_commits_present=wip)
+
+
+# ---------------------------------------------------------------------------
+# _await_steward_completion drains multi-outcome bursts and re-asserts
+# has_open_l1 before returning a requeue-producing outcome (review fix,
+# task 2248 / W9-delta, step-13/14)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestAwaitStewardCompletionDrainsAndGatesOnOpenL1:
+    """Closes the multi-outcome silent-requeue gap: the steward processes
+    escalations serially and can publish more than one outcome in a single
+    grace window (e.g. resolve the workflow's own L0, then chain a
+    follow-on L0 and give up on it — ``[StewardResolved, StewardReescalatedL1]``
+    on the channel). A single ``channel.get()`` only ever saw the leading
+    outcome. ``_await_steward_completion`` now (1) drains every outcome
+    already queued and reduces to the most-severe disposition, and (2)
+    re-asserts ``escalation_queue.has_open_l1`` as a source-of-truth
+    backstop before returning any requeue-producing outcome — catching the
+    publish-timing race where a follow-on L1 is filed but its outcome has
+    not yet landed on the channel. ``_mark_blocked`` itself is untouched —
+    it still branches once on whatever this method returns.
+    """
+
+    async def test_drains_multiple_outcomes_and_returns_most_severe(
+        self, tmp_path: Path,
+    ):
+        """[StewardResolved, StewardReescalatedL1] queued together reduces
+        to the more-severe StewardReescalatedL1 — draining both, not just
+        the first ``get()``."""
+        wf = _make_workflow(tmp_path=tmp_path)
+        wf.config.steward_completion_timeout = 5.0
+        wf._steward_outcome_channel = asyncio.Queue()
+        wf._steward_outcome_channel.put_nowait(
+            StewardResolved(resolution_text='fixed it'),
+        )
+        wf._steward_outcome_channel.put_nowait(
+            StewardReescalatedL1(esc_id='L1'),
+        )
+        wf.scheduler.get_status = AsyncMock(return_value='blocked')
+        wf.escalation_queue = MagicMock()
+        wf.escalation_queue.has_open_l1 = MagicMock(return_value=False)
+
+        outcome = await wf._await_steward_completion()
+
+        assert outcome == StewardReescalatedL1(esc_id='L1')
+        assert wf._steward_outcome_channel.empty(), (
+            'both queued outcomes must be drained, not just the first'
+        )
+
+    async def test_open_l1_overrides_resolved_with_reescalated(
+        self, tmp_path: Path,
+    ):
+        """A lone StewardResolved is overridden by an open L1 — the
+        source-of-truth backstop for the publish-timing race."""
+        wf = _make_workflow(tmp_path=tmp_path)
+        wf.config.steward_completion_timeout = 5.0
+        wf._steward_outcome_channel = asyncio.Queue()
+        wf._steward_outcome_channel.put_nowait(
+            StewardResolved(resolution_text='fixed it'),
+        )
+        wf.scheduler.get_status = AsyncMock(return_value='blocked')
+        wf.escalation_queue = MagicMock()
+        wf.escalation_queue.has_open_l1 = MagicMock(return_value=True)
+        wf.escalation_queue.get_by_task = MagicMock(
+            return_value=[MagicMock(id='L1')],
+        )
+
+        outcome = await wf._await_steward_completion()
+
+        assert outcome == StewardReescalatedL1(esc_id='L1')
+        wf.escalation_queue.get_by_task.assert_called_once_with(
+            wf.task_id, status='pending', level=1,
+        )
+
+    async def test_no_open_l1_returns_resolved_unchanged(
+        self, tmp_path: Path,
+    ):
+        """Without an open L1, a clean StewardResolved requeue is preserved
+        unchanged — the override is conditional, not unconditional."""
+        wf = _make_workflow(tmp_path=tmp_path)
+        wf.config.steward_completion_timeout = 5.0
+        wf._steward_outcome_channel = asyncio.Queue()
+        wf._steward_outcome_channel.put_nowait(
+            StewardResolved(resolution_text='fixed it'),
+        )
+        wf.scheduler.get_status = AsyncMock(return_value='blocked')
+        wf.escalation_queue = MagicMock()
+        wf.escalation_queue.has_open_l1 = MagicMock(return_value=False)
+
+        outcome = await wf._await_steward_completion()
+
+        assert outcome == StewardResolved(resolution_text='fixed it')
+
+    async def test_open_l1_gates_interrupted_with_wip_too(
+        self, tmp_path: Path,
+    ):
+        """StewardInterrupted(wip=True) is also requeue-producing (task-2060
+        resume-plan branch) and is likewise gated by an open L1 — not just
+        StewardResolved."""
+        wf = _make_workflow(tmp_path=tmp_path)
+        wf.config.steward_completion_timeout = 5.0
+        wf._steward_outcome_channel = asyncio.Queue()
+        wf._steward_outcome_channel.put_nowait(
+            StewardInterrupted('attempt_cap', wip_commits_present=True),
+        )
+        wf.scheduler.get_status = AsyncMock(return_value='blocked')
+        wf.escalation_queue = MagicMock()
+        wf.escalation_queue.has_open_l1 = MagicMock(return_value=True)
+        wf.escalation_queue.get_by_task = MagicMock(
+            return_value=[MagicMock(id='L1')],
+        )
+
+        outcome = await wf._await_steward_completion()
+
+        assert outcome == StewardReescalatedL1(esc_id='L1')
+
+    async def test_terminal_status_still_wins_over_open_l1(
+        self, tmp_path: Path,
+    ):
+        """Terminal precedence is unconditional: a steward-driven 'done'
+        status overrides even when an L1 happens to be open."""
+        wf = _make_workflow(tmp_path=tmp_path)
+        wf.config.steward_completion_timeout = 5.0
+        wf._steward_outcome_channel = asyncio.Queue()
+        wf._steward_outcome_channel.put_nowait(
+            StewardResolved(resolution_text='fixed it'),
+        )
+        wf.scheduler.get_status = AsyncMock(return_value='done')
+        wf.escalation_queue = MagicMock()
+        wf.escalation_queue.has_open_l1 = MagicMock(return_value=True)
+
+        outcome = await wf._await_steward_completion()
+
+        assert outcome == StewardTerminalDecision(new_status=TaskStatus.DONE)

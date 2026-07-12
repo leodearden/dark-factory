@@ -1899,7 +1899,11 @@ def _make_resolve_then_dismiss_chained_steward(
     Mirrors the live failure mode that drove the original Fix A: the
     steward chains a fresh L0 and gives up on it rather than the one the
     workflow itself submitted (``created_l0_id``).  Publishes
-    ``StewardReescalatedL1`` so the workflow routes to ESCALATED.
+    ``StewardResolved`` (for the resolved workflow L0) THEN
+    ``StewardReescalatedL1`` (for the chained give-up) — the same dual
+    publish the real steward performs — so the workflow's drain+reduce
+    (task 2248 / W9-delta review fix) must see past the leading
+    ``StewardResolved`` to route to ESCALATED.
     """
     from escalation.models import Escalation
 
@@ -1920,6 +1924,18 @@ def _make_resolve_then_dismiss_chained_steward(
                 queue.resolve(
                     esc.id, 'Resolved by FakeSteward (workflow L0)',
                     resolved_by='fake-steward',
+                )
+            # Faithful to the real steward's dual publish (task 2248 /
+            # W9-delta review fix): TaskSteward._handle_escalation publishes
+            # StewardResolved for the workflow's own L0 (steward.py:563)
+            # BEFORE it ever chains a follow-on escalation of its own — so
+            # the channel must carry [StewardResolved, StewardReescalatedL1],
+            # not just the trailing re-escalation.
+            if self._outcome_channel is not None:
+                self._outcome_channel.put_nowait(
+                    StewardResolved(
+                        resolution_text='Resolved by FakeSteward (workflow L0)',
+                    ),
                 )
             chained = Escalation(
                 id=queue.make_id(task_id),
