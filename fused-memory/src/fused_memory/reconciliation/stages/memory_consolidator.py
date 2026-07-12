@@ -6,6 +6,7 @@ import asyncio
 import json
 import logging
 from datetime import datetime
+from typing import TYPE_CHECKING
 
 from fused_memory.models.reconciliation import (
     AssembledPayload,
@@ -55,6 +56,9 @@ from fused_memory.reconciliation.task_filter import (
     strip_snapshot_lines,
 )
 
+if TYPE_CHECKING:
+    from fused_memory.services.memory_service import MemoryService
+
 logger = logging.getLogger(__name__)
 
 # Stage 1 per-cycle summary pool cap and related constants.
@@ -69,7 +73,7 @@ _STAGE1_CYCLE_SUMMARY_TRIM_SOURCE = 'stage1_cycle_summary_trim'
 
 
 async def write_stage1_cycle_summary(
-    memory_service,
+    memory_service: MemoryService,
     project_id: str,
     report: StageReport,
     run_id: str,
