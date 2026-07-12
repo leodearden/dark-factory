@@ -431,13 +431,23 @@ _GAP_NO_NEGATION = r"(?:(?!\bnot\b|\bnever\b|n['’]t\b).)*"
 # Module-level rule table for premise_lint: (compiled case-insensitive
 # regex, invariant_name, detail). Each rule encodes one known-false premise
 # from the 2083/2092/2093 false-premise batch, which mis-modeled run_id and
-# stage1_flag_marker lifecycle. Extend this table as new false premises are
-# discovered; premise_lint returns one Violation per matching rule.
+# stage1_flag_marker lifecycle. Extend this table as new false premises (or
+# new paraphrasings of an existing one) are discovered; premise_lint returns
+# one Violation per matching rule.
+#
+# BEST-EFFORT DENYLIST, NOT EXHAUSTIVE VALIDATION: premise_lint is a regex
+# lint over a fixed, small set of known-false phrasings — it does not
+# understand the premises semantically. A paraphrase not yet enumerated
+# here (or in the future, an entirely new false premise) silently passes:
+# premise_lint returning no Violation means no KNOWN false premise was
+# matched, not that the description is otherwise correct. Treat a clean
+# lint result accordingly and keep extending this table as new paraphrases
+# surface, rather than over-trusting its coverage.
 _PREMISE_RULES: tuple[tuple[re.Pattern[str], str, str], ...] = (
     (
         re.compile(
-            r'run_id\s+(?:persists?|is\s+persist(?:ed|ent)|stable|the\s+same)'
-            r'\s+across\s+(?:cycles|runs)',
+            r'run_id\s+(?:persists?|is\s+persist(?:ed|ent)|stable|the\s+same|'
+            r'carr(?:y|ies)\s+over)\s+(?:across|between)\s+(?:cycles|runs)',
             re.IGNORECASE,
         ),
         'run_id_is_fresh_per_run',
@@ -449,8 +459,22 @@ _PREMISE_RULES: tuple[tuple[re.Pattern[str], str, str], ...] = (
     ),
     (
         re.compile(
-            r'(?:stage\s*3|remediation|the\s+llm)' + _GAP_NO_NEGATION + r'\bdeletes?\b'
-            r'' + _GAP_NO_NEGATION + r'\b(?:flag_for_stage2|flag\s+marker|'
+            r'reuse\s+(?:the\s+)?run_id\s+from\s+(?:the\s+)?'
+            r'(?:previous|prior|last)\s+(?:cycle|run)',
+            re.IGNORECASE,
+        ),
+        'run_id_is_fresh_per_run',
+        (
+            'run_id is minted fresh per run and must never be reused from a '
+            'prior cycle (see render_marker_lifecycle_section()) — each run '
+            'mints its own.'
+        ),
+    ),
+    (
+        re.compile(
+            r'(?:stage\s*3|remediation|the\s+llm)' + _GAP_NO_NEGATION
+            + r'\b(?:deletes?|removes?|clears?|purges?)\b'
+            + _GAP_NO_NEGATION + r'\b(?:flag_for_stage2|flag\s+marker|'
             r'stage1_flag_marker|marker)\b',
             re.IGNORECASE,
         ),

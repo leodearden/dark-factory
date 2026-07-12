@@ -420,3 +420,34 @@ class TestSubmitTaskPremiseLintGuard:
         parsed = _parse_tool_result(result)
         assert 'error' not in parsed, f'got {parsed!r}'
         mock_task_interceptor.submit_task.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_submit_task_recon_stage_false_premise_in_prompt_rejected(self, monkeypatch):
+        """A recon-stage submit_task whose `prompt` (not `description`)
+        asserts a known-false premise is rejected before the interceptor is
+        reached. `prompt` is submit_task's own docstring-named primary
+        "Task description for AI generation" field, so linting
+        `description` alone would leave a false premise stated only here
+        unchecked (the coverage gap this guard closes)."""
+        monkeypatch.setattr(
+            'fused_memory.server.tools.resolve_main_checkout', lambda p: str(p),
+        )
+        mock_service = AsyncMock()
+        mock_task_interceptor = AsyncMock()
+        server = create_mcp_server(mock_service, task_interceptor=mock_task_interceptor)
+
+        result = await server._tool_manager.call_tool(
+            'submit_task',
+            {
+                'project_root': '/project',
+                'prompt': 'Fix the bug where run_id persists across cycles in the ledger.',
+                'description': 'Reconcile task 7 status against the knowledge graph.',
+                'agent_id': 'recon-stage-task_knowledge_sync',
+                'metadata': {'execution_class': 'code_tdd'},
+            },
+        )
+
+        parsed = _parse_tool_result(result)
+        assert parsed.get('error_type') == 'ValidationError', f'got {parsed!r}'
+        assert 'run_id_is_fresh_per_run' in parsed.get('error', ''), f'got {parsed!r}'
+        mock_task_interceptor.submit_task.assert_not_called()

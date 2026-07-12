@@ -83,3 +83,74 @@ class TestPremiseLintErrorInvariantMatrix:
             '/proj',
         )
         assert result is None
+
+    def test_recon_stage_false_premise_in_prompt_only_rejects(self):
+        """A false premise stated in `prompt` (submit_task's own docstring
+        names this its primary "Task description for AI generation" field)
+        is caught even when `description` is entirely clean — description
+        and prompt are both linted, so a false premise cannot dodge the
+        guard by choosing the other channel."""
+        result = premise_lint_error(
+            'Reconcile task 7 status against the knowledge graph.',
+            'recon-stage-task_knowledge_sync',
+            '/proj',
+            prompt='Fix the bug where run_id persists across cycles in the ledger.',
+        )
+        assert result is not None
+        assert result.get('error_type') == 'ValidationError'
+        assert 'run_id_is_fresh_per_run' in result['error']
+
+    def test_recon_stage_both_fields_clean_accepts(self):
+        """A clean `description` AND a clean `prompt` -> accept (None)."""
+        result = premise_lint_error(
+            'Reconcile task 7 status against the knowledge graph.',
+            'recon-stage-task_knowledge_sync',
+            '/proj',
+            prompt='Reconcile task 7',
+        )
+        assert result is None
+
+    def test_recon_stage_run_id_reuse_paraphrase_rejects(self):
+        """A paraphrase of run_id persistence ("reuse the run_id from the
+        previous cycle") is also caught — the lint is a denylist over
+        common phrasings of a false premise, not a single rigid template."""
+        result = premise_lint_error(
+            'Just reuse the run_id from the previous cycle to save a mint.',
+            'recon-stage-task_knowledge_sync',
+            '/proj',
+        )
+        assert result is not None
+        assert 'run_id_is_fresh_per_run' in result['error']
+
+    def test_recon_stage_run_id_carries_over_paraphrase_rejects(self):
+        """Another paraphrase ("the run_id carries over between cycles")
+        is caught by the broadened verb/preposition alternation."""
+        result = premise_lint_error(
+            'Note that the run_id carries over between cycles.',
+            'recon-stage-task_knowledge_sync',
+            '/proj',
+        )
+        assert result is not None
+        assert 'run_id_is_fresh_per_run' in result['error']
+
+    def test_recon_stage_marker_removal_paraphrase_rejects(self):
+        """A paraphrase of marker deletion using "removes" rather than
+        "deletes" is also caught by the broadened verb alternation."""
+        result = premise_lint_error(
+            'Stage 3 remediation removes the flag marker once resolved.',
+            'recon-stage-task_knowledge_sync',
+            '/proj',
+        )
+        assert result is not None
+        assert 'markers_deleted_only_by_gc' in result['error']
+
+    def test_recon_stage_marker_clears_paraphrase_rejects(self):
+        """"clears" is likewise caught (removes/clears/purges are all
+        paraphrases of the same false marker-deletion premise)."""
+        result = premise_lint_error(
+            'Stage 3 remediation clears the stage1_flag_marker once resolved.',
+            'recon-stage-task_knowledge_sync',
+            '/proj',
+        )
+        assert result is not None
+        assert 'markers_deleted_only_by_gc' in result['error']
