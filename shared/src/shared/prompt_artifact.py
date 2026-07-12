@@ -26,7 +26,9 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Literal
 
-from pydantic import BaseModel, ConfigDict
+from pydantic import BaseModel, ConfigDict, ValidationError
+
+from shared.safe_io import load_json_or_warn
 
 __all__ = [
     'ArtifactProvenance',
@@ -143,6 +145,24 @@ def _encode_segment(segment: str) -> str:
     return urllib.parse.quote(segment, safe='').replace('.', '%2E')
 
 
+def _load_valid_provenance(path: Path) -> ArtifactProvenance | None:
+    """Load *path* as a schema-valid :class:`ArtifactProvenance`, fail-safe.
+
+    Returns ``None`` — never raises — when *path* is absent, when it is
+    present but corrupt/non-JSON, or when it parses as JSON but does not
+    satisfy :class:`ArtifactProvenance`'s required fields (e.g. a half-written
+    or hand-edited sidecar). Callers treat ``None`` identically to "nothing
+    pinned": an unverifiable artifact must never be surfaced as a pinned one.
+    """
+    parsed, _ok = load_json_or_warn(path, default=None)
+    if parsed is None:
+        return None
+    try:
+        return ArtifactProvenance.model_validate(parsed)
+    except ValidationError:
+        return None
+
+
 def _atomic_write_text(path: Path, text: str) -> None:
     """Write *text* to *path* via temp-in-dir + os.replace (safe_io.py's pattern).
 
@@ -179,14 +199,13 @@ class PromptArtifactStore:
         key_dir = self._key_dir(spec.prompt_id, executor_model, harness_version)
         heuristics_path = key_dir / _HEURISTICS_FILENAME
         provenance_path = key_dir / _PROVENANCE_FILENAME
-        if heuristics_path.exists() and provenance_path.exists():
-            heuristics = heuristics_path.read_text(encoding='utf-8')
-            provenance = ArtifactProvenance.model_validate_json(
-                provenance_path.read_text(encoding='utf-8')
-            )
-            return ResolvedPrompt(
-                compose_prompt(spec.contract, heuristics), provenance, 'artifact'
-            )
+        if heuristics_path.exists():
+            provenance = _load_valid_provenance(provenance_path)
+            if provenance is not None:
+                heuristics = heuristics_path.read_text(encoding='utf-8')
+                return ResolvedPrompt(
+                    compose_prompt(spec.contract, heuristics), provenance, 'artifact'
+                )
         return ResolvedPrompt(spec.in_code_constant, None, 'in_code')
 
     def pin(
@@ -223,12 +242,7 @@ class PromptArtifactStore:
         self, prompt_id: str, executor_model: str, harness_version: str
     ) -> ArtifactProvenance | None:
         key_dir = self._key_dir(prompt_id, executor_model, harness_version)
-        provenance_path = key_dir / _PROVENANCE_FILENAME
-        if not provenance_path.exists():
-            return None
-        return ArtifactProvenance.model_validate_json(
-            provenance_path.read_text(encoding='utf-8')
-        )
+        return _load_valid_provenance(key_dir / _PROVENANCE_FILENAME)
 
     def unpin(self, prompt_id: str, executor_model: str, harness_version: str) -> bool:
         """Remove the pin for this key — the sole rollback lever (no separate revert path).
