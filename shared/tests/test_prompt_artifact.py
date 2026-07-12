@@ -176,3 +176,21 @@ class TestPinAndResolve:
             store.pin(
                 'reviewer', 'claude-opus-4', 'v2', heuristics='h', provenance=provenance
             )
+
+
+class TestUnpinRollback:
+    def test_unpin_after_pin_restores_in_code_constant_and_is_idempotent(self, tmp_path):
+        store = PromptArtifactStore(tmp_path)
+        spec = _make_spec()
+        provenance = ArtifactProvenance(**_provenance_kwargs(harness_version='v1'))
+        store.pin('reviewer', 'claude-opus-4', 'v1', heuristics='h', provenance=provenance)
+
+        assert store.unpin('reviewer', 'claude-opus-4', 'v1') is True
+
+        resolved = store.resolve(spec, executor_model='claude-opus-4', harness_version='v1')
+        assert resolved.text == spec.in_code_constant
+        assert resolved.provenance is None
+        assert resolved.source == 'in_code'
+
+        # Idempotent: nothing left to unpin the second time.
+        assert store.unpin('reviewer', 'claude-opus-4', 'v1') is False
