@@ -284,7 +284,7 @@ async def _count_ledger_rows(
 
 
 @pytest.mark.asyncio
-class TestLedgerUpsertAndRace:
+class TestLedgerUpsertAndGcInterleave:
     """L1 + L2 (α=2219): ReconLedgerStore UPSERT idempotency + an
     interleaved-invariants check against a concurrent gc() pass.
 
@@ -329,7 +329,7 @@ class TestLedgerUpsertAndRace:
             f'Expected last-write-wins state {last_record.state!r}, got {fetched.state!r}'
         )
 
-    async def test_l1_concurrent_upsert_interleaved_with_gc_preserves_live_marker(
+    async def test_l1_upsert_interleaved_with_gc_preserves_live_marker(
         self, ledger,
     ) -> None:
         """L1: same-identity UPSERTs and a gc() pass, run concurrently via
