@@ -2953,3 +2953,145 @@ class TestStewardOutcomeChannelResolved:
         with patch('orchestrator.steward.invoke_agent', new_callable=AsyncMock) as mock_invoke:
             mock_invoke.return_value = _make_result(session_id='sess-abc')
             await steward._handle_escalation(esc)  # must not raise
+
+
+# ---------------------------------------------------------------------------
+# Give-up guards publish typed outcomes, gated on wip (task 2248 step-5/6)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestStewardOutcomeChannelGiveUpGuards:
+    """Give-up guards publish typed ``StewardOutcome`` variants on the
+    in-process channel; the retry-cap and timeout-cap guards additionally
+    gate the level-1 re-escalation on ``wip_commits_present`` (task-2060
+    lesson: ``steward_max_attempts=1`` + a wall-clock kill with partial WIP
+    commits must resume the plan, not be triaged as "steward failed" via an
+    L1 auto-escalation).
+    """
+
+    async def test_retry_cap_wip_present_publishes_interrupted_no_l1(
+        self, steward, mock_config,
+    ):
+        mock_config.steward_max_attempts = 1
+        channel = asyncio.Queue()
+        steward.set_outcome_channel(channel)
+        steward._wip_probe = AsyncMock(return_value=True)
+        esc = _make_escalation(id='esc-42-1')
+        steward._retry_counts['esc-42-1'] = 1  # at cap (>= max_attempts)
+
+        with patch('orchestrator.steward.invoke_agent', new_callable=AsyncMock) as mock_invoke:
+            await steward._handle_escalation(esc)
+
+        mock_invoke.assert_not_called()
+        steward.escalation_queue.submit.assert_not_called()
+        assert channel.get_nowait() == StewardInterrupted(
+            reason='attempt_cap', wip_commits_present=True,
+        )
+
+    async def test_retry_cap_wip_absent_publishes_interrupted_and_files_l1(
+        self, steward, mock_config,
+    ):
+        mock_config.steward_max_attempts = 1
+        channel = asyncio.Queue()
+        steward.set_outcome_channel(channel)
+        steward._wip_probe = AsyncMock(return_value=False)
+        esc = _make_escalation(id='esc-42-1')
+        steward._retry_counts['esc-42-1'] = 1
+
+        with patch('orchestrator.steward.invoke_agent', new_callable=AsyncMock) as mock_invoke:
+            await steward._handle_escalation(esc)
+
+        _assert_cap_fire_pops_counters(steward, 'esc-42-1', mock_invoke)
+        assert channel.get_nowait() == StewardInterrupted(
+            reason='attempt_cap', wip_commits_present=False,
+        )
+
+    async def test_budget_guard_publishes_budget_exhausted(
+        self, steward, mock_config,
+    ):
+        mock_config.steward_lifetime_budget = 5.0
+        steward.metrics.total_cost_usd = 6.0
+        channel = asyncio.Queue()
+        steward.set_outcome_channel(channel)
+        esc = _make_escalation(id='esc-42-1')
+        steward._retry_counts['esc-42-1'] = 1
+        steward._timeout_counts['esc-42-1'] = 1
+
+        with patch('orchestrator.steward.invoke_agent', new_callable=AsyncMock) as mock_invoke:
+            await steward._handle_escalation(esc)
+
+        _assert_cap_fire_pops_counters(steward, 'esc-42-1', mock_invoke)
+        assert channel.get_nowait() == StewardBudgetExhausted()
+
+    async def test_timeout_cap_wip_present_publishes_interrupted_no_l1(
+        self, steward, mock_config,
+    ):
+        mock_config.steward_max_timeouts_per_escalation = 2
+        channel = asyncio.Queue()
+        steward.set_outcome_channel(channel)
+        steward._wip_probe = AsyncMock(return_value=True)
+        esc = _make_escalation(id='esc-42-1')
+        steward._timeout_counts['esc-42-1'] = 2  # at cap
+
+        with patch('orchestrator.steward.invoke_agent', new_callable=AsyncMock) as mock_invoke:
+            await steward._handle_escalation(esc)
+
+        mock_invoke.assert_not_called()
+        steward.escalation_queue.submit.assert_not_called()
+        assert channel.get_nowait() == StewardInterrupted(
+            reason='timeout', wip_commits_present=True,
+        )
+
+    async def test_timeout_cap_wip_absent_publishes_interrupted_and_files_l1(
+        self, steward, mock_config,
+    ):
+        mock_config.steward_max_timeouts_per_escalation = 2
+        channel = asyncio.Queue()
+        steward.set_outcome_channel(channel)
+        steward._wip_probe = AsyncMock(return_value=False)
+        esc = _make_escalation(id='esc-42-1')
+        steward._timeout_counts['esc-42-1'] = 2
+
+        with patch('orchestrator.steward.invoke_agent', new_callable=AsyncMock) as mock_invoke:
+            await steward._handle_escalation(esc)
+
+        _assert_cap_fire_pops_counters(steward, 'esc-42-1', mock_invoke)
+        assert channel.get_nowait() == StewardInterrupted(
+            reason='timeout', wip_commits_present=False,
+        )
+
+    async def test_empty_output_cap_publishes_reescalated_l1(
+        self, steward, mock_config,
+    ):
+        mock_config.steward_max_empty_outputs_per_escalation = 2
+        channel = asyncio.Queue()
+        steward.set_outcome_channel(channel)
+        esc = _make_escalation(id='esc-42-1')
+        steward._empty_output_counts['esc-42-1'] = 2
+
+        with patch('orchestrator.steward.invoke_agent', new_callable=AsyncMock) as mock_invoke:
+            await steward._handle_escalation(esc)
+
+        submitted = _assert_cap_fire_pops_counters(steward, 'esc-42-1', mock_invoke)
+        assert channel.get_nowait() == StewardReescalatedL1(esc_id=submitted.id)
+
+    async def test_worktree_missing_preflight_publishes_reescalated_l1(
+        self, steward,
+    ):
+        import shutil
+        shutil.rmtree(steward.worktree)
+        channel = asyncio.Queue()
+        steward.set_outcome_channel(channel)
+        esc = _make_escalation()
+
+        with patch.object(
+            steward, '_invoke_with_session', new_callable=AsyncMock,
+        ) as mock_invoke:
+            await steward._handle_escalation(esc)
+
+        mock_invoke.assert_not_called()
+        steward.escalation_queue.submit.assert_called_once()
+        submitted = steward.escalation_queue.submit.call_args[0][0]
+        assert submitted.level == 1
+        assert channel.get_nowait() == StewardReescalatedL1(esc_id=submitted.id)
