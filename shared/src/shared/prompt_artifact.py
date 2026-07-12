@@ -19,11 +19,20 @@ strict ``__all__`` union assertion untouched.
 
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass
+from pathlib import Path
+from typing import Literal
 
 from pydantic import BaseModel, ConfigDict
 
-__all__ = ['ArtifactProvenance', 'compose_prompt', 'PromptSpec']
+__all__ = [
+    'ArtifactProvenance',
+    'compose_prompt',
+    'PromptSpec',
+    'ResolvedPrompt',
+    'PromptArtifactStore',
+]
 
 # Fixed separator between the in-code CONTRACT and the (baseline or pinned)
 # heuristics block. Part of compose_prompt's contract: changing this value
@@ -85,3 +94,43 @@ class PromptSpec:
     @property
     def in_code_constant(self) -> str:
         return compose_prompt(self.contract, self.baseline_heuristics)
+
+
+@dataclass(frozen=True)
+class ResolvedPrompt:
+    """The result of :meth:`PromptArtifactStore.resolve`.
+
+    ``source`` names which of the two paths produced ``text``: ``'artifact'``
+    when a valid pinned artifact was found (``provenance`` is then non-None),
+    ``'in_code'`` for the fallback (``provenance`` is then None).
+    """
+
+    text: str
+    provenance: ArtifactProvenance | None
+    source: Literal['artifact', 'in_code']
+
+
+_HEURISTICS_FILENAME = 'heuristics.txt'
+_PROVENANCE_FILENAME = 'provenance.json'
+
+
+class PromptArtifactStore:
+    """Resolves a :class:`PromptSpec` to a pinned artifact or the in-code fallback.
+
+    Backed by an on-disk tree rooted at *root*; see :meth:`_key_dir` for the
+    per-key layout.
+    """
+
+    def __init__(self, root: str | os.PathLike[str]) -> None:
+        self.root = Path(root)
+
+    def _key_dir(self, prompt_id: str, executor_model: str, harness_version: str) -> Path:
+        # NOTE: naive direct segment join for now — hardened to a
+        # filesystem-safe, collision-free, traversal-safe encoding once
+        # TestKeyIsolationAndPathSafety is in place.
+        return self.root / prompt_id / executor_model / harness_version
+
+    def resolve(
+        self, spec: PromptSpec, executor_model: str, harness_version: str
+    ) -> ResolvedPrompt:
+        return ResolvedPrompt(spec.in_code_constant, None, 'in_code')
