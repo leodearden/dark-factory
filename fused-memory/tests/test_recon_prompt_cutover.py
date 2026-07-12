@@ -13,6 +13,16 @@ prompt recomputes to match automatically on next import.
 Step 5 (RED) covers only the stage1 half; step 6 (GREEN) cuts stage1.py
 over to interpolate these rendered sections. Steps 7/8 extend this module
 with the analogous stage2 half.
+
+Amendment (post-verify review): the four containment assertions below are
+self-referential — both sides are computed from the same render_*() call,
+so they can only fail if the interpolation itself is removed, not if
+someone deletes content from inside a render_*() body (that would update
+both sides of the containment check at once). Each test now carries a
+second, real-signal assertion pinning one specific invariant phrase drawn
+from that render function's own prose, so an accidental content deletion
+inside recon_self_model is still caught even though the containment
+relation with it would not be broken.
 """
 
 from __future__ import annotations
@@ -49,6 +59,20 @@ class TestStage1PromptCutover:
             'W5-xi) — a hand-transcribed paraphrase of the suppression '
             'schema is prompt/code drift by definition.'
         )
+        # Real-signal check (not just tautological containment): pins a
+        # specific invariant phrase from the schema's own content, so an
+        # accidental deletion inside recon_self_model's render body — which
+        # would update BOTH sides of the containment check above and so
+        # never fail it — still fails here.
+        assert (
+            'a blanket suppression cannot be narrowed by a more specific '
+            'scoped record' in STAGE1_SYSTEM_PROMPT
+        ), (
+            'STAGE1_SYSTEM_PROMPT is missing the scoped-vs-blanket '
+            'suppression precedence invariant — this must survive edits to '
+            'render_suppression_schema_section(), not just the containment '
+            'relation with it.'
+        )
 
     def test_stage1_prompt_contains_rendered_marker_lifecycle_section(self):
         """render_marker_lifecycle_section()'s output must appear verbatim
@@ -61,6 +85,15 @@ class TestStage1PromptCutover:
             '— a hand-transcribed paraphrase of the marker lifecycle / '
             'run_id-fresh-per-cycle mechanics is prompt/code drift by '
             'definition.'
+        )
+        # Real-signal check: pins the run_id-freshness invariant phrase
+        # itself, so deleting it from recon_self_model (rather than just
+        # de-interpolating the prompt) still fails this test.
+        assert 'is never persisted across cycles' in STAGE1_SYSTEM_PROMPT, (
+            'STAGE1_SYSTEM_PROMPT is missing the run_id-fresh-per-cycle '
+            'invariant phrase — this must survive edits to '
+            'render_marker_lifecycle_section(), not just the containment '
+            'relation with it.'
         )
 
 
@@ -87,6 +120,18 @@ class TestStage2PromptCutover:
             'a hand-transcribed paraphrase of the cycle_summary metadata '
             'convention is prompt/code drift by definition.'
         )
+        # Real-signal check: pins the stage-key-is-required invariant
+        # phrase itself, so deleting it from recon_self_model (rather than
+        # just de-interpolating the prompt) still fails this test.
+        assert (
+            "a stage-less filter would conflate the two stages' summaries"
+            in STAGE2_SYSTEM_PROMPT
+        ), (
+            'STAGE2_SYSTEM_PROMPT is missing the stage-key-required lookup '
+            'invariant — this must survive edits to '
+            'render_cycle_summary_section(), not just the containment '
+            'relation with it.'
+        )
 
     def test_stage2_prompt_contains_rendered_execution_class_section(self):
         """render_execution_class_section()'s output must appear verbatim
@@ -102,4 +147,16 @@ class TestStage2PromptCutover:
             '— the execution_class declaration/rejection contract must be '
             "stated in the prompt, not only enforced silently at the "
             'submit_task middleware boundary.'
+        )
+        # Real-signal check: pins the hard-rejection wording itself, so
+        # deleting it from recon_self_model (rather than just
+        # de-interpolating the prompt) still fails this test.
+        assert (
+            'this is a hard rejection invariant, not a lint warning'
+            in STAGE2_SYSTEM_PROMPT
+        ), (
+            'STAGE2_SYSTEM_PROMPT is missing the hard-rejection wording of '
+            'the execution_class contract — this must survive edits to '
+            'render_execution_class_section(), not just the containment '
+            'relation with it.'
         )
