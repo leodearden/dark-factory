@@ -9453,10 +9453,51 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                                     # the re-arm onto the lifecycle registry.
                                     self._note_requeue(_entry_req.request_id, live_obj=_entry_req)
                                 continue
+                            # MQ-reliability kappa follow-up (task 2441,
+                            # amended per review): this is the ONE
+                            # `_redispatch` append site task 2169 left
+                            # unwired. Reconcile the registry to pipeline
+                            # state around the remerge — current -> MERGING
+                            # for the duration of _remerge(), then MERGING ->
+                            # REDISPATCH_PARKED once landed on _redispatch —
+                            # mirroring the RUNNER_UNAVAILABLE cascade template
+                            # in _finalize_inflight. from_state is read
+                            # dynamically off the registry (the same
+                            # dynamic-current-state idiom as _note_requeue)
+                            # rather than hardcoded VERIFYING: every downstream
+                            # _inflight entry is guaranteed at VERIFYING by
+                            # _inflight_append in the common case, but the
+                            # documented cascade contract (_LEGAL_TRANSITIONS
+                            # comment: "VERIFYING/GATE_REVERIFY/FINALIZING ->
+                            # MERGING") allows a downstream entry to still be
+                            # resident at GATE_REVERIFY or FINALIZING too — a
+                            # hardcoded VERIFYING would misfire a spurious
+                            # illegal-transition alarm for those. An
+                            # unregistered rid (None) is a silent no-op for
+                            # both hops, same as _note_requeue. Without this,
+                            # the registry stays stale while the item is
+                            # physically parked on _redispatch, so the
+                            # DISPATCH-FILL drain's REDISPATCH_PARKED ->
+                            # DISPATCHING _note_transition fails its
+                            # from_state cross-check and fires a spurious
+                            # dedup'd L1 escalation on every cascade-remerge
+                            # redispatch.
+                            _rid = _entry.item.request.request_id
+                            _from_state = self._lifecycle.current(_rid)
+                            if _from_state is not None:
+                                self._note_transition(
+                                    _rid, _from_state,
+                                    ItemLifecycleState.MERGING, live_obj=_entry,
+                                )
                             _remerged = await self._remerge(
                                 _entry.item.request,
                                 _entry.item.started_monotonic,
                             )
+                            if _from_state is not None:
+                                self._note_transition(
+                                    _rid, ItemLifecycleState.MERGING,
+                                    ItemLifecycleState.REDISPATCH_PARKED, live_obj=_remerged,
+                                )
                             self._redispatch.append(_remerged)
                         except (asyncio.CancelledError, KeyboardInterrupt):
                             raise
