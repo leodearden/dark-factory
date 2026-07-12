@@ -1195,6 +1195,35 @@ def _task_external_deps(task: dict) -> list[str]:
 class Scheduler:
     """Selects next eligible task and manages module locks."""
 
+    # Ordering-as-data (task 2236, W10-β): the SINGLE source of dispatch
+    # order for acquire_next's per-tick phase sequence. acquire_next
+    # iterates this tuple directly (`for label in self._TICK_PHASE_ORDER`)
+    # to invoke each `_phase_<label>` method, so reordering/editing this
+    # literal changes real dispatch order — it is not documentation.
+    # Asserted by test_tick_phase_order_literal and
+    # test_acquire_next_delegates_to_phase_list in
+    # tests/test_scheduler_tick_phases.py.
+    _TICK_PHASE_ORDER: tuple[str, ...] = (
+        'backfill_dep_status',
+        'drain_park_eviction',
+        'park_gc',
+        'stale_sweep',
+        'cooldown_gc',
+        'external_dep_policy',
+        'stamp_milestone',
+        'override_snapshot_gc',
+        'reserve_now',
+        'override_diff',
+        'compute_priorities',
+        'build_candidates',
+        'landed_outbox_gate',
+        'starvation',
+        'empty_candidate_gate',
+        'psi_gate',
+        'select_pins',
+        'select_scored',
+    )
+
     def __init__(
         self,
         config: OrchestratorConfig,
@@ -4887,68 +4916,19 @@ class Scheduler:
             max_id=max_id,
         )
 
-        # Correctness crux (γ2): the active-only filter drops terminal tasks
-        # from the result, so dep-ids referencing DONE/CANCELLED tasks will be
-        # absent from status_map. _deps_satisfied reads status_map.get(dep_id,
-        # 'unknown'), so those deps would block dispatching forever. Fix: collect
-        # local dep-ids referenced by the fetched tasks that are NOT already in
-        # status_map, then backfill them via the lean get_statuses(ids=missing).
-        # In production this backfill commonly fires every tick (most pending tasks
-        # have at least one done dep), but the two-call total (active get_tasks +
-        # compact get_statuses) is still a net win over the old single full get_tasks
-        # call (~95% smaller payload per γ1's get_statuses path).  In unit tests
-        # whose get_tasks mocks return the full set (incl. done deps), status_map
-        # is already complete → missing_dep_ids is empty → zero get_statuses calls.
-        await self._phase_backfill_dep_status(ctx)
-        await self._phase_drain_park_eviction(ctx)
-        await self._phase_park_gc(ctx)
-
-        # Drop _last_dispatch_at, _skip_count, _module_cache, _pending_anchor,
-        # and sub-threshold _external_unresolved_counts entries for tasks that are:
-        #   (a) in a terminal status in status_map, OR
-        #   (b) absent from tasks_by_id (active-only filter dropped them because
-        #       they completed between ticks — γ2: previously the full get_tasks
-        #       result kept completed tasks visible so the terminal sweep could
-        #       clean them up; active-only filtering removes them from the result).
-        # so a future legitimate re-dispatch (e.g. cancelled -> pending
-        # re-architect, or a freshly-created task reusing the id) starts from a
-        # clean slate.  Resurrection-safe: a re-queued task re-derives modules
-        # and re-accumulates its skip count fresh.
-        # _pending_anchor and _was_non_pending are handled here directly (not only
-        # in _update_age_anchors) because active-only filtering means terminal
-        # tasks are absent from the `tasks` list that _update_age_anchors iterates.
-        # Without this, a task that goes pending → terminal (e.g. cancelled while
-        # pending, never dispatched) leaks its _pending_anchor entry permanently.
-        # Recording _was_non_pending preserves resurrection semantics: if the task
-        # is re-queued to pending, it gets a fresh max_id anchor instead of
-        # re-using its old (stale) numeric id as the age anchor.
-        await self._phase_stale_sweep(ctx)
-        await self._phase_cooldown_gc(ctx)
-
-        await self._phase_external_dep_policy(ctx)
-        await self._phase_stamp_milestone(ctx)
-        await self._phase_override_snapshot_gc(ctx)
-        await self._phase_reserve_now(ctx)
-        await self._phase_override_diff(ctx)
-        await self._phase_compute_priorities(ctx)
-        await self._phase_build_candidates(ctx)
-        await self._phase_landed_outbox_gate(ctx)
-        await self._phase_starvation(ctx)
-
-        r = await self._phase_empty_candidate_gate(ctx)
-        if r is not _CONTINUE:
-            return r.assignment
-
-        await self._phase_psi_gate(ctx)
-
-        r = await self._phase_select_pins(ctx)
-        if r is not _CONTINUE:
-            return r.assignment
-
-        r = await self._phase_select_scored(ctx)
-        if r is not _CONTINUE:
-            return r.assignment
-
+        # Ordering-as-data (task 2236, W10-β): drive the whole tick from
+        # Scheduler._TICK_PHASE_ORDER — the single source of dispatch
+        # order (see the class-level literal for the full ordered list and
+        # the tests that assert on it). Per-phase rationale (γ2 dep-status
+        # backfill correctness, stale-sweep resurrection-safety, the
+        # external-dep-policy exactly-once contract, etc.) now lives on
+        # each `_phase_<label>` method's own docstring rather than inline
+        # here, since a generic loop has no single call site to hang
+        # per-phase commentary off of.
+        for label in self._TICK_PHASE_ORDER:
+            r = await getattr(self, f'_phase_{label}')(ctx)
+            if r is not _CONTINUE:
+                return r.assignment
         return None
 
     def get_state_snapshot(self) -> dict:
