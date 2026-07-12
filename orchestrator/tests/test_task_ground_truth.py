@@ -24,12 +24,14 @@ Covers:
 from __future__ import annotations
 
 import dataclasses
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 from shared.deploy_state import DeployPhase
 
+from orchestrator.artifacts import TaskArtifacts
 from orchestrator.landed_outbox import LandedOutbox, LandedRow, MergeProvenance
 from orchestrator.task_ground_truth import (
     BranchState,
@@ -247,12 +249,40 @@ def _fake_git_ops(
     return git_ops
 
 
-def _make_ground_truth(*, git_ops: MagicMock | None = None) -> TaskGroundTruth:
+def _fake_scheduler(
+    *,
+    is_actively_held: bool = False,
+    task: dict | None = None,
+) -> MagicMock:
+    """A minimal scheduler double exposing exactly the TG-3 liveness surface
+    (``is_actively_held`` — sync) and the task-fetch surface
+    (``get_task`` — async) TaskGroundTruth's live_claimant resolution
+    consumes."""
+    scheduler = MagicMock()
+    scheduler.is_actively_held = MagicMock(return_value=is_actively_held)
+    scheduler.get_task = AsyncMock(return_value=task)
+    return scheduler
+
+
+def _make_ground_truth(
+    *,
+    git_ops: MagicMock | None = None,
+    scheduler: MagicMock | None = None,
+    worktree_resolver=None,
+    now_fn=None,
+    heartbeat_ttl: timedelta | None = None,
+) -> TaskGroundTruth:
+    kwargs = {}
+    if now_fn is not None:
+        kwargs['now_fn'] = now_fn
+    if heartbeat_ttl is not None:
+        kwargs['heartbeat_ttl'] = heartbeat_ttl
     return TaskGroundTruth(
         git_ops or _fake_git_ops(),
-        MagicMock(),
+        scheduler or _fake_scheduler(),
         None,
-        lambda tid: Path('/nonexistent-worktree') / tid,
+        worktree_resolver or (lambda tid: Path('/nonexistent-worktree') / tid),
+        **kwargs,
     )
 
 
@@ -331,3 +361,116 @@ class TestDeriveTruthBranchStateGitFallback:
         assert report.branch_state == BranchState(BranchStateKind.GONE_NO_MARKER, None)
         git_ops.is_ancestor.assert_awaited_once_with('task/10', 'main')
         git_ops.find_merge_marker.assert_awaited_once_with('task/10')
+
+
+# ---------------------------------------------------------------------------
+# step-9 — derive_truth's live_claimant composition (TG-3)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestDeriveTruthLiveClaimant:
+    """live_claimant folds three liveness signals, in priority order:
+
+    1. ``scheduler.is_actively_held(tid)`` (in-memory, TG-3 public accessor).
+    2. A fresh W2 db claimant (``claimant_run_id`` present AND NOT
+       ``is_stranded``).
+    3. A live ``plan.lock`` — consulted ONLY when the db claimant is
+       genuinely absent (pre-2182 rows); a present-but-stale db claimant
+       collapses straight to ``None`` and never falls through to plan.lock.
+    """
+
+    async def test_actively_held_returns_in_memory_claimant_without_fetching_task(
+        self,
+    ) -> None:
+        scheduler = _fake_scheduler(is_actively_held=True)
+        resolver = _make_ground_truth(scheduler=scheduler)
+
+        report = await resolver.derive_truth('11')
+
+        assert report.live_claimant is not None
+        assert report.live_claimant.source == ClaimantSource.IN_MEMORY
+        scheduler.is_actively_held.assert_called_once_with('11')
+        scheduler.get_task.assert_not_awaited()
+
+    async def test_fresh_db_claimant_returns_db_claimant(self) -> None:
+        fixed_now = datetime(2026, 7, 12, 12, 0, 0, tzinfo=UTC)
+        task = {
+            'status': 'in-progress',
+            'claimant_run_id': 'run-1/session-1/pid=123',
+            'heartbeat_at': '2026-07-12T11:55:00+00:00',  # 5 minutes stale
+        }
+        scheduler = _fake_scheduler(is_actively_held=False, task=task)
+        resolver = _make_ground_truth(
+            scheduler=scheduler, now_fn=lambda: fixed_now, heartbeat_ttl=timedelta(minutes=10),
+        )
+
+        report = await resolver.derive_truth('12')
+
+        assert report.live_claimant == Claimant(
+            run_id='run-1/session-1/pid=123',
+            heartbeat_at='2026-07-12T11:55:00+00:00',
+            source=ClaimantSource.DB,
+        )
+        scheduler.get_task.assert_awaited_once_with('12')
+
+    async def test_no_db_claimant_live_plan_lock_returns_plan_lock_claimant(
+        self, tmp_path: Path,
+    ) -> None:
+        TaskArtifacts(tmp_path).root.mkdir(parents=True)
+        TaskArtifacts(tmp_path).lock_plan('sess-13-abc123')
+        locked_at = TaskArtifacts(tmp_path).read_plan_lock()['locked_at']
+        task = {'status': 'pending', 'claimant_run_id': None, 'heartbeat_at': None}
+        scheduler = _fake_scheduler(is_actively_held=False, task=task)
+        resolver = _make_ground_truth(scheduler=scheduler, worktree_resolver=lambda tid: tmp_path)
+
+        report = await resolver.derive_truth('13')
+
+        assert report.live_claimant == Claimant(
+            run_id='sess-13-abc123',
+            heartbeat_at=locked_at,
+            source=ClaimantSource.PLAN_LOCK,
+        )
+
+    async def test_stale_db_claimant_returns_none_even_with_live_plan_lock(
+        self, tmp_path: Path,
+    ) -> None:
+        # A present-but-stale db claimant must collapse straight to None —
+        # it must NOT fall through to the plan.lock fallback, which exists
+        # only for rows with no db claimant at all (pre-2182 rows).
+        TaskArtifacts(tmp_path).root.mkdir(parents=True)
+        TaskArtifacts(tmp_path).lock_plan('sess-14-abc123')
+        fixed_now = datetime(2026, 7, 12, 12, 0, 0, tzinfo=UTC)
+        task = {
+            'status': 'in-progress',
+            'claimant_run_id': 'run-1/session-1/pid=999',
+            'heartbeat_at': '2026-07-12T11:00:00+00:00',  # 60 minutes stale
+        }
+        scheduler = _fake_scheduler(is_actively_held=False, task=task)
+        resolver = _make_ground_truth(
+            scheduler=scheduler,
+            worktree_resolver=lambda tid: tmp_path,
+            now_fn=lambda: fixed_now,
+            heartbeat_ttl=timedelta(minutes=10),
+        )
+
+        report = await resolver.derive_truth('14')
+
+        assert report.live_claimant is None
+
+    async def test_no_claimant_and_no_plan_lock_returns_none(self) -> None:
+        task = {'status': 'pending', 'claimant_run_id': None, 'heartbeat_at': None}
+        scheduler = _fake_scheduler(is_actively_held=False, task=task)
+        resolver = _make_ground_truth(scheduler=scheduler)
+
+        report = await resolver.derive_truth('15')
+
+        assert report.live_claimant is None
+
+    async def test_missing_task_row_returns_none(self) -> None:
+        scheduler = _fake_scheduler(is_actively_held=False, task=None)
+        resolver = _make_ground_truth(scheduler=scheduler)
+
+        report = await resolver.derive_truth('16')
+
+        assert report.live_claimant is None
