@@ -837,6 +837,19 @@ class SubgraphEdgeResult:
             edge/mention -- which still exists only in source -- would be
             destroyed (see ``scripts/migrate_cross_graph_leak.py``'s
             ``run()``). Always empty for a batch with no such failures.
+        embedding_omitted: Count of RELATES_TO edges counted in
+            ``edges_recreated`` (a subset of it, never mentions -- MENTIONS
+            links carry no embedding property) whose source
+            ``fact_embedding`` read null/absent, so the recreated edge
+            landed WITHOUT that property (see ``_embedding_set_clause`` /
+            ``_read_compact_vector``'s null-tolerance, CGL-η follow-up
+            reviewer amendment, task 2451). An embedding-less RELATES_TO
+            edge is invisible to vector/semantic search, so this is a
+            quality signal surfaced for operator visibility -- purely
+            informational, it does NOT gate ``blocked``/exit_code the way
+            ``dropped_cross_target``/``blocked`` do, since a null embedding
+            is valid data, not a failure. Always 0 for a batch where every
+            recreated edge carried a real embedding.
     """
 
     edges_recreated: int = 0
@@ -845,6 +858,7 @@ class SubgraphEdgeResult:
     mentions_skipped: int = 0
     dropped_cross_target: list = field(default_factory=list)
     blocked: list = field(default_factory=list)
+    embedding_omitted: int = 0
 
 
 async def _entity_present_in_graph(graph: Any, uuid: str) -> bool:
@@ -1127,6 +1141,7 @@ async def _recreate_subgraph_relationships_batch(
             edge_embedding_reply = await _read_compact_vector(
                 falkor_client, group_id=source_graph, cypher=edge_embedding_cypher,
             )
+            embedding_clause = _embedding_set_clause('r.fact_embedding', edge_embedding_reply)
 
             edge_create_result = await target.query(
                 'MATCH (a:Entity {uuid: $src_uuid}), (b:Entity {uuid: $dst_uuid}) '
@@ -1139,7 +1154,7 @@ async def _recreate_subgraph_relationships_batch(
                 '    r.created_at = $created_at, '
                 '    r.group_id = $group_id, '
                 '    r.episodes = $episodes'
-                f'{_embedding_set_clause("r.fact_embedding", edge_embedding_reply)}',
+                f'{embedding_clause}',
                 {
                     'src_uuid': src_uuid,
                     'dst_uuid': dst_uuid,
@@ -1155,6 +1170,8 @@ async def _recreate_subgraph_relationships_batch(
             )
             if edge_create_result.relationships_created:
                 result.edges_recreated += 1
+                if not embedding_clause:
+                    result.embedding_omitted += 1
             else:
                 result.edges_skipped += 1
                 logger.warning(
@@ -1280,6 +1297,7 @@ async def _recreate_subgraph_relationships_batch(
                 edge_embedding_reply = await _read_compact_vector(
                     falkor_client, group_id=wrong_graph, cypher=edge_embedding_cypher,
                 )
+                embedding_clause = _embedding_set_clause('r.fact_embedding', edge_embedding_reply)
 
                 # Both endpoints are MATCHed (never CREATEd): the home copy
                 # of this MERGE node and the edge's other endpoint must
@@ -1299,7 +1317,7 @@ async def _recreate_subgraph_relationships_batch(
                     '    r.created_at = $created_at, '
                     '    r.group_id = $group_id, '
                     '    r.episodes = $episodes'
-                    f'{_embedding_set_clause("r.fact_embedding", edge_embedding_reply)}',
+                    f'{embedding_clause}',
                     {
                         'src_uuid': src_uuid,
                         'dst_uuid': dst_uuid,
@@ -1315,6 +1333,8 @@ async def _recreate_subgraph_relationships_batch(
                 )
                 if edge_create_result.relationships_created:
                     result.edges_recreated += 1
+                    if not embedding_clause:
+                        result.embedding_omitted += 1
                 else:
                     result.edges_skipped += 1
                     logger.warning(

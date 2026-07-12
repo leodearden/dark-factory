@@ -848,6 +848,12 @@ async def run(args: Any, memory_service: Any) -> dict:
     report['edges_skipped'] = edge_result.edges_skipped
     report['mentions_recreated'] = edge_result.mentions_recreated
     report['mentions_skipped'] = edge_result.mentions_skipped
+    # embedding_omitted (CGL-η follow-up, task 2451 reviewer amendment): how
+    # many of edges_recreated landed without a fact_embedding because the
+    # source read null/absent (see SubgraphEdgeResult docstring). Purely
+    # informational -- deliberately NOT folded into exit_code, since a null
+    # embedding is valid data, not a failure requiring human review.
+    report['embedding_omitted'] = edge_result.embedding_omitted
     report['dropped_cross_target_edges'] = edge_result.dropped_cross_target
     report['phase_b_blocked'] = edge_result.blocked
     report['post_verify'] = {

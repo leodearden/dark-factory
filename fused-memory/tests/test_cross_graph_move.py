@@ -1758,6 +1758,7 @@ class TestRecreateSubgraphRelationships:
         assert result.edges_recreated == 1
         assert result.edges_skipped == 0
         assert result.dropped_cross_target == []
+        assert result.embedding_omitted == 0
 
     @pytest.mark.asyncio
     async def test_edge_between_two_different_targets_is_dropped_not_created_in_either(
@@ -1937,6 +1938,7 @@ class TestRecreateSubgraphRelationships:
         assert result.edges_recreated == 1
         assert result.edges_skipped == 0
         assert result.dropped_cross_target == []
+        assert result.embedding_omitted == 1
 
     @pytest.mark.asyncio
     async def test_merge_fold_recreates_only_wrong_copys_unique_edge(
@@ -2004,6 +2006,7 @@ class TestRecreateSubgraphRelationships:
 
         assert result.edges_recreated == 1
         assert result.edges_skipped == 0
+        assert result.embedding_omitted == 0
 
     @pytest.mark.asyncio
     async def test_merge_fold_null_fact_embedding_recreates_edge_without_embedding_property(
@@ -2062,6 +2065,7 @@ class TestRecreateSubgraphRelationships:
 
         assert result.edges_recreated == 1
         assert result.edges_skipped == 0
+        assert result.embedding_omitted == 1
 
     @pytest.mark.asyncio
     async def test_edge_already_present_in_target_is_idempotent_noop(

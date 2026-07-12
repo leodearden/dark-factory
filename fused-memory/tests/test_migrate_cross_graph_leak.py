@@ -1612,6 +1612,7 @@ class TestRunApplyCoMovingPreserved:
         monkeypatch.setattr(_mod, 'delete_source_node', AsyncMock(return_value=None))
         recreate_mock = AsyncMock(return_value=SubgraphEdgeResult(
             edges_recreated=1, edges_skipped=0, dropped_cross_target=[],
+            embedding_omitted=1,
         ))
         monkeypatch.setattr(_mod, 'recreate_subgraph_relationships', recreate_mock)
 
@@ -1637,6 +1638,11 @@ class TestRunApplyCoMovingPreserved:
         assert applied['u-B']['blocked'] is False
 
         assert report['post_verify']['matched'] is True
+        # embedding_omitted (task 2451 reviewer amendment) is folded into
+        # the report verbatim but stays purely informational -- it does NOT
+        # gate exit_code the way dropped_cross_target_edges/phase_b_blocked
+        # do, since a null embedding is valid data, not a failure.
+        assert report['embedding_omitted'] == 1
         assert report['exit_code'] == 0
 
 
