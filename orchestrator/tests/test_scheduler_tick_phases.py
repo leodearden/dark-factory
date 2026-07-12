@@ -358,7 +358,7 @@ class TestSelectionPhases:
         event_store = _RecordingEventStore()
         config = OrchestratorConfig(max_per_module=1)
         store = OverrideStore(tmp_path / 'o.db')
-        scheduler = Scheduler(config, event_store=event_store, override_store=store)
+        scheduler = Scheduler(config, event_store=event_store, override_store=store)  # type: ignore[arg-type]
         scheduler.finish_startup()
         scheduler._project_root = '/proj'
 
