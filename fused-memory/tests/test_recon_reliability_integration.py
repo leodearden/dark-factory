@@ -21,7 +21,8 @@ something this test-only task fixes) — escalate rather than patch.
 
 §9 scenario -> seam module -> dependency map
 ---------------------------------------------
-  L1  Ledger writer-vs-GC race (concurrent UPSERT + gc() interleave)
+  L1  Ledger UPSERT/gc() interleave invariants (concurrent asyncio.gather;
+      aiosqlite serializes writes, so this is not a genuine data race)
         -> reconciliation/recon_ledger.py (ReconLedgerStore)          [α=2219]
   L2  Ledger UPSERT idempotency (N upserts, one row, last-write-wins)
         -> reconciliation/recon_ledger.py (ReconLedgerStore)          [α=2219]
@@ -253,26 +254,52 @@ def _scope(project_id: str, project_root: str) -> ProjectScope:
     return ProjectScope(ProjectId(project_id), ProjectRoot(project_root))
 
 
+async def _count_ledger_rows(
+    ledger: ReconLedgerStore, project_id: str, *, record_kind: str | None = None,
+) -> int:
+    """Raw SELECT COUNT(*) over recon_ledger for *project_id*, optionally
+    filtered to a single *record_kind* — a direct check on the store's own
+    connection, independent of get_by_identity's per-identity read path.
+    Shared by L1/L2 (all record_kinds) and D1 (record_kind='cycle_summary')."""
+    db = ledger._db  # noqa: SLF001 — intentional direct-connection check
+    assert db is not None, 'Expected an initialized store with an open connection'
+    if record_kind is None:
+        cursor = await db.execute(
+            'SELECT COUNT(*) FROM recon_ledger WHERE project_id = ?',
+            (project_id,),
+        )
+    else:
+        cursor = await db.execute(
+            'SELECT COUNT(*) FROM recon_ledger WHERE project_id = ? AND record_kind = ?',
+            (project_id, record_kind),
+        )
+    row = await cursor.fetchone()
+    assert row is not None
+    return row[0]
+
+
 # ---------------------------------------------------------------------------
-# L1 + L2 — ReconLedgerStore UPSERT idempotency + writer-vs-GC race [α=2219]
+# L1 + L2 — ReconLedgerStore UPSERT idempotency + writer/GC interleave [α=2219]
 # ---------------------------------------------------------------------------
 
 
 @pytest.mark.asyncio
 class TestLedgerUpsertAndRace:
-    """L1 + L2 (α=2219): ReconLedgerStore UPSERT idempotency + writer-vs-GC race.
+    """L1 + L2 (α=2219): ReconLedgerStore UPSERT idempotency + an
+    interleaved-invariants check against a concurrent gc() pass.
 
     Integration delta over test_recon_ledger.py's sequential UPSERT/gc
-    coverage: L1 drives a CONCURRENT asyncio.gather() interleave of
-    same-identity UPSERTs against an in-flight gc() pass — no existing
-    per-seam unit test exercises this interleaving. The 5-column primary
-    key plus aiosqlite's single-connection write serialization together
-    guarantee the invariants below regardless of task-scheduling order.
-
-    Driving harness (``_drive_l2_sequential_upserts`` /
-    ``_drive_l1_concurrent_race`` / ``_count_rows``) lands in step-2 —
-    this step only declares the §9 postconditions, so it is RED until
-    then (the harness methods referenced below don't exist yet).
+    coverage: L1 drives same-identity UPSERTs and a gc() pass concurrently
+    via asyncio.gather() — no existing per-seam unit test exercises this
+    interleaving. This is NOT a genuine data-race stressor: aiosqlite
+    serializes every write on its single connection, so asyncio.gather()
+    only varies which coroutine's await points are scheduled first, not
+    whether writes can actually interleave at the storage layer. The
+    invariants below (exactly one surviving row for the racing identity,
+    the terminal marker deleted, the live marker kept) therefore hold by
+    construction for any scheduling order — this class guards those
+    invariants across the async interleave, it does not detect a race
+    condition.
     """
 
     _PROJECT_L2 = 'proj-l2-upsert-idempotency'
@@ -286,7 +313,7 @@ class TestLedgerUpsertAndRace:
         upsert's values."""
         last_record = await self._drive_l2_sequential_upserts(ledger)
 
-        count = await self._count_rows(ledger, self._PROJECT_L2)
+        count = await _count_ledger_rows(ledger, self._PROJECT_L2)
         assert count == 1, f'Expected exactly one row after N upserts, got {count}'
 
         fetched = await ledger.get_by_identity(
@@ -305,11 +332,12 @@ class TestLedgerUpsertAndRace:
     async def test_l1_concurrent_upsert_interleaved_with_gc_preserves_live_marker(
         self, ledger,
     ) -> None:
-        """L1: two concurrent same-identity UPSERTs interleaved with a
-        gc() pass (via asyncio.gather) leave exactly one row for the
-        racing identity, last-writer-wins on payload, AND a co-resident
-        still-active, non-expired, non-terminal marker is NEVER deleted
-        by the interleaved GC."""
+        """L1: same-identity UPSERTs and a gc() pass, run concurrently via
+        asyncio.gather(), leave exactly one row for the racing identity,
+        last-writer-wins on payload, AND a co-resident still-active,
+        non-expired, non-terminal marker is NEVER deleted by the
+        interleaved GC — invariants that hold under any scheduling order
+        (see class docstring; aiosqlite serializes the actual writes)."""
         candidates, terminal_task_id, live_task_id = await self._drive_l1_concurrent_race(ledger)
 
         fetched_race = await ledger.get_by_identity(
@@ -344,13 +372,13 @@ class TestLedgerUpsertAndRace:
 
         # Total surviving rows for the project: racing identity + live
         # marker (terminal marker was collected by the interleaved gc()).
-        count = await self._count_rows(ledger, self._PROJECT_L1)
+        count = await _count_ledger_rows(ledger, self._PROJECT_L1)
         assert count == 2, (
             f'Expected exactly 2 surviving rows (race + live) after the '
             f'interleaved gc() collected the terminal marker, got {count}'
         )
 
-    # -- driving harness (task 2232 step-2) ---------------------------------
+    # -- driving harness ------------------------------------------------------
 
     async def _drive_l2_sequential_upserts(self, ledger: ReconLedgerStore) -> ReconLedgerRecord:
         """Sequentially UPSERT the SAME 5-part identity N=4 times, varying
@@ -381,10 +409,11 @@ class TestLedgerUpsertAndRace:
     async def _drive_l1_concurrent_race(
         self, ledger: ReconLedgerStore,
     ) -> tuple[list[ReconLedgerRecord], str, str]:
-        """Seed a terminal marker + a live marker, then concurrently UPSERT
-        two versions of a THIRD (racing) identity while a gc() pass
-        (referencing the terminal marker's task_id) runs interleaved via
-        asyncio.gather().
+        """Seed a terminal marker + a live marker, then UPSERT two versions
+        of a THIRD (racing) identity while a gc() pass (given the terminal
+        marker's task_id explicitly via ``terminal_task_ids`` — resolving
+        which task_ids are terminal is L4's concern, not this store-level
+        check) runs interleaved via asyncio.gather().
 
         Returns ([race_v1, race_v2], terminal_task_id, live_task_id).
         """
@@ -454,20 +483,6 @@ class TestLedgerUpsertAndRace:
 
         return [race_v1, race_v2], 'T-done', 'T-live'
 
-    async def _count_rows(self, ledger: ReconLedgerStore, project_id: str) -> int:
-        """Raw SELECT COUNT(*) over recon_ledger for *project_id* (all
-        record_kinds) — a direct check on the store's own connection,
-        independent of get_by_identity's per-identity read path."""
-        db = ledger._db  # noqa: SLF001 — intentional direct-connection check
-        assert db is not None, 'Expected an initialized store with an open connection'
-        cursor = await db.execute(
-            'SELECT COUNT(*) FROM recon_ledger WHERE project_id = ?',
-            (project_id,),
-        )
-        row = await cursor.fetchone()
-        assert row is not None
-        return row[0]
-
 
 # ---------------------------------------------------------------------------
 # L3 — Suppression round-trip: write_suppression_record -> filter_suppressed,
@@ -481,11 +496,6 @@ class TestSuppressionRoundTrip:
     ``filter_suppressed`` round-trip, proving the indexed
     ``list_suppressions`` ledger query fully replaces the retired
     project-wide Mem0 semantic search.
-
-    Driving harness (``_drive_scoped_round_trip`` /
-    ``_drive_blanket_round_trip``) lands in step-4 — this step only
-    declares the §9 postconditions, so it is RED until then (the harness
-    methods referenced below don't exist yet).
     """
 
     _PROJECT = 'proj-l3-suppression-round-trip'
@@ -531,7 +541,7 @@ class TestSuppressionRoundTrip:
         )
         recon_service.search.assert_not_called()
 
-    # -- driving harness (task 2232 step-4) ---------------------------------
+    # -- driving harness ------------------------------------------------------
 
     def _candidate_flags(self) -> list[dict]:
         """Three flags shared by both scenarios: the (task_id,
@@ -577,10 +587,6 @@ class TestSuppressionRoundTrip:
 class TestGcTerminalReferenced:
     """L4 (κ=2228): one ``_gc_recon_markers`` pass deletes ONLY the
     terminal-referenced marker and KEEPS the live-referenced marker.
-
-    Driving harness (``_drive_gc_pass``) lands in step-6 — this step only
-    declares the §9 postcondition, so it is RED until then (the harness
-    method referenced below doesn't exist yet).
     """
 
     _PROJECT = 'proj-l4-gc-terminal-referenced'
@@ -612,7 +618,7 @@ class TestGcTerminalReferenced:
         )
         assert live_marker is not None, 'Expected the live-referenced marker to be kept'
 
-    # -- driving harness (task 2232 step-6) ---------------------------------
+    # -- driving harness ------------------------------------------------------
 
     async def _drive_gc_pass(self, ledger: ReconLedgerStore) -> int:
         """Seed a terminal-referenced marker and a live-referenced marker
@@ -672,12 +678,6 @@ class TestInterceptorReconWritePolicy:
     never awaits the underlying taskmaster write — while a non-recon caller
     on the same conditions is never gated (recon-scoping negative, one per
     op, since both ops share the same top-level scoping check).
-
-    Driving harness (``_drive_p1_terminal_reject`` / ``_drive_p1_non_recon``
-    / ``_drive_p2_live_workflow_reject`` / ``_drive_p2_non_recon`` /
-    ``_drive_p3_stale_snapshot_reject``) lands in step-8 — this step only
-    declares the §9 postconditions, so it is RED until then (the harness
-    methods referenced below don't exist yet).
     """
 
     _TASK_ID = '1'
@@ -747,7 +747,7 @@ class TestInterceptorReconWritePolicy:
         )
         taskmaster.update_task.assert_not_awaited()
 
-    # -- driving harness (task 2232 step-8) ---------------------------------
+    # -- driving harness ------------------------------------------------------
 
     async def _drive_p1_terminal_reject(self, interceptor, taskmaster) -> dict:
         taskmaster.get_task = AsyncMock(
@@ -798,11 +798,6 @@ class TestDedupExemptPermission:
     agent_id is permitted and EVERY call is routed through the fresh-uuid
     ``mem0.add_system_record`` path (never the dedup ``mem0.add`` path) —
     so a fresh point lands on every call, not just the first.
-
-    Driving harness (``_drive_reject_via_mcp_tool`` /
-    ``_drive_fresh_point_routing``) lands in step-10 — this step only
-    declares the §9 postconditions, so it is RED until then (the harness
-    methods referenced below don't exist yet).
     """
 
     _CONTENT = 'Stage 2 cycle summary for run r1'
@@ -835,7 +830,7 @@ class TestDedupExemptPermission:
         )
         service.mem0.add.assert_not_called()  # type: ignore[attr-defined]
 
-    # -- driving harness (task 2232 step-10) ---------------------------------
+    # -- driving harness ------------------------------------------------------
 
     async def _drive_reject_via_mcp_tool(self) -> tuple[AsyncMock, dict]:
         """Non-recon caller through the REAL MCP tool boundary
@@ -896,11 +891,6 @@ class TestDeterministicCycleSummary:
     the retired nonce/verify/repair/reconstruct machinery is gone — a
     repo-wide ``retry_nonce`` grep would falsely hit residual prompt prose
     in ``prompts/stage2.py`` owned by a downstream task.
-
-    Driving harness (``_drive_single_write`` / ``_drive_repeat_write`` /
-    ``_count_rows``) lands in step-12 — this step only declares the §9
-    postconditions, so it is RED until then (the harness methods referenced
-    below don't exist yet).
     """
 
     _PROJECT = 'proj-d1-cycle-summary'
@@ -922,7 +912,9 @@ class TestDeterministicCycleSummary:
         report, wrote = await self._drive_single_write(recon_service)
 
         assert wrote is True, 'Expected write_cycle_summary to report the ledger upsert succeeded'
-        count = await self._count_rows(recon_service.recon_ledger, self._PROJECT)
+        count = await _count_ledger_rows(
+            recon_service.recon_ledger, self._PROJECT, record_kind='cycle_summary',
+        )
         assert count == 1, f'Expected exactly one cycle_summary row to exist, got {count}'
 
         record = await recon_service.recon_ledger.get_by_identity(
@@ -951,7 +943,9 @@ class TestDeterministicCycleSummary:
         an idempotent UPSERT, not an accumulating insert."""
         second_report = await self._drive_repeat_write(recon_service)
 
-        count = await self._count_rows(recon_service.recon_ledger, self._PROJECT)
+        count = await _count_ledger_rows(
+            recon_service.recon_ledger, self._PROJECT, record_kind='cycle_summary',
+        )
         assert count == 1, f'Expected exactly one row after a repeat write, got {count}'
 
         record = await recon_service.recon_ledger.get_by_identity(
@@ -965,7 +959,7 @@ class TestDeterministicCycleSummary:
         assert payload['llm_calls'] == second_report.llm_calls
         assert payload['tokens_used'] == second_report.tokens_used
 
-    # -- driving harness (task 2232 step-12) ---------------------------------
+    # -- driving harness ------------------------------------------------------
 
     async def _drive_single_write(self, recon_service) -> tuple[StageReport, bool]:
         """Build a real StageReport and drive the real producer
@@ -1034,20 +1028,6 @@ class TestDeterministicCycleSummary:
         )
         return second_report
 
-    async def _count_rows(self, ledger: ReconLedgerStore, project_id: str) -> int:
-        """Raw SELECT COUNT(*) over recon_ledger for *project_id*'s
-        cycle_summary rows — a direct check on the store's own connection,
-        independent of get_by_identity's per-identity read path."""
-        db = ledger._db  # noqa: SLF001 — intentional direct-connection check
-        assert db is not None, 'Expected an initialized store with an open connection'
-        cursor = await db.execute(
-            "SELECT COUNT(*) FROM recon_ledger WHERE project_id = ? AND record_kind = 'cycle_summary'",
-            (project_id,),
-        )
-        row = await cursor.fetchone()
-        assert row is not None
-        return row[0]
-
 
 # ---------------------------------------------------------------------------
 # S1 — Write-journal-derived stats override self-reported counters
@@ -1073,10 +1053,6 @@ class TestComputedStatsOverride:
     that would be a doomed premise. See plan.json design decisions.) Mirrors
     the canonical green
     ``test_stats_verifier.py::test_verify_boundary_s1_computed_stats_override_llm_report``.
-
-    Driving harness (``_drive_verify``) lands in step-14 — this step only
-    declares the §9 postconditions, so it is RED until then (the harness
-    method referenced below doesn't exist yet).
     """
 
     _STAGE = 'memory_consolidator'
@@ -1102,7 +1078,7 @@ class TestComputedStatsOverride:
             "Expected the LLM's memories_written claim to survive under _reported"
         )
 
-    # -- driving harness (task 2232 step-14) ---------------------------------
+    # -- driving harness ------------------------------------------------------
 
     async def _drive_verify(self, journal: WriteJournal) -> StageReport:
         """Log 2 real successful add_memory ops for the stage (journal
@@ -1154,12 +1130,6 @@ class TestExecutionClassEnforcement:
     execution_class_error / inject_execution_class (mirrors
     test_execution_class_guard.py) in case the MCP-boundary accept path
     ever needs deeper taskmaster plumbing than this AsyncMock provides.
-
-    Driving harness (``_drive_reject_missing_class`` /
-    ``_drive_accept_and_persist`` / ``_drive_non_recon_not_enforced`` /
-    ``_drive_guard_level_backstop``) lands in step-16 — this step only
-    declares the §9 postconditions, so it is RED until then (the harness
-    methods referenced below don't exist yet).
     """
 
     _PROJECT_ROOT = '/project'
@@ -1217,7 +1187,7 @@ class TestExecutionClassEnforcement:
         assert accept is None
         assert persisted.get('execution_class') == 'operational'
 
-    # -- driving harness (task 2232 step-16) ---------------------------------
+    # -- driving harness ------------------------------------------------------
 
     def _passthrough_main_checkout(self, monkeypatch) -> None:
         """Stub resolve_main_checkout to pass its argument through unchanged
