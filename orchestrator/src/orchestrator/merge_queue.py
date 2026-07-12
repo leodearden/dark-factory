@@ -5953,7 +5953,9 @@ class SpeculativeMergeWorker(_WipHaltMixin):
         )
         return 'verifying'
 
-    def _finalizing_head_entry(self) -> InflightEntry | None:
+    def _finalizing_head_entry(
+        self, inflight_ids: set[str] | None = None,
+    ) -> InflightEntry | None:
         """Return the popped-for-finalize ``InflightEntry`` still tracked in
         ``_live_items``, if any (merge-queue-reliability PRD scope-4 kappa-b
         / task 2435).
@@ -5968,18 +5970,53 @@ class SpeculativeMergeWorker(_WipHaltMixin):
         ``_live_items`` ``InflightEntry`` whose request_id is absent from the
         ``_inflight`` deque.
 
+        *inflight_ids*, if given, is used verbatim instead of re-deriving
+        ``{e.item.request.request_id for e in self._inflight}``. Callers
+        that already materialized that set for their own purposes (e.g.
+        :meth:`snapshot`, which also needs it for ``_container_ids``) can
+        pass it to avoid a second O(inflight) pass over the same deque
+        within a single call; callers without one (e.g.
+        :meth:`_frozen_inflight_entries`) simply omit it.
+
         Replaces the deleted ``_finalizing_head`` field — reused by
         :meth:`snapshot`'s section 0 / occupancy / verify_in_progress, and by
         :meth:`_frozen_inflight_entries` (task 2435 step-6), so every reader
         shares one derivation instead of a second bespoke reconstruction.
 
+        The at-most-one ordering invariant above is NOT enforced elsewhere,
+        so this scans the full ``_live_items`` mapping rather than
+        short-circuiting on the first match: if more than one qualifying
+        ``InflightEntry`` is ever found, that invariant has been violated
+        (e.g. by a future change to registration ordering) and a WARNING is
+        logged so the regression is observable instead of silently
+        reporting an arbitrary entry as THE finalize head. The first entry
+        found (in ``_live_items`` iteration order) is still returned,
+        fail-safe.
+
         Returns ``None`` when nothing is mid-finalize (the common case).
         """
-        _inflight_ids = {e.item.request.request_id for e in self._inflight}
+        if inflight_ids is None:
+            inflight_ids = {e.item.request.request_id for e in self._inflight}
+        found: InflightEntry | None = None
+        extra_rids: list[str] = []
         for rid, obj in self._live_items.items():
-            if isinstance(obj, InflightEntry) and rid not in _inflight_ids:
-                return obj
-        return None
+            if isinstance(obj, InflightEntry) and rid not in inflight_ids:
+                if found is None:
+                    found = obj
+                else:
+                    extra_rids.append(rid)
+        if extra_rids:
+            logger.warning(
+                'Invariant violation: %d extra InflightEntry object(s) in '
+                '_live_items absent from _inflight beyond the expected '
+                'single finalize head (chosen=%s, extra=%s) — the '
+                '"at most one mid-finalize" ordering invariant no longer '
+                'holds. Returning the first found, fail-safe.',
+                len(extra_rids),
+                found.item.request.request_id if found is not None else None,
+                extra_rids,
+            )
+        return found
 
     def _resolve_merging_requests(self, outcome: MergeOutcome) -> None:
         """Resolve the Future of every ``_live_items`` request still at
@@ -7485,8 +7522,12 @@ class SpeculativeMergeWorker(_WipHaltMixin):
         # down (double-count avoidance), while still running in its original
         # position right after the _inflight loop. Independent of emission
         # order because it reads the containers directly rather than the
-        # `entries` list built so far.
-        _container_ids: set[str] = {e.item.request.request_id for e in self._inflight}
+        # `entries` list built so far. _inflight_ids is materialized once
+        # and reused below for _finalizing_head_entry() too, rather than
+        # letting it re-derive the same set internally (both would
+        # otherwise take an O(inflight) pass over the identical deque).
+        _inflight_ids: set[str] = {e.item.request.request_id for e in self._inflight}
+        _container_ids: set[str] = set(_inflight_ids)
         _container_ids |= {_rd.request.request_id for _rd in self._redispatch}
         _container_ids |= {
             _vq_item.request.request_id
@@ -7511,7 +7552,7 @@ class SpeculativeMergeWorker(_WipHaltMixin):
         # submission-order head. Replaces the deleted _finalizing_head field
         # (merge-queue-reliability PRD scope-4 kappa-b / task 2435).
         _excluded_ids: set[str] = set(_container_ids)
-        _fh_entry = self._finalizing_head_entry()
+        _fh_entry = self._finalizing_head_entry(_inflight_ids)
         if _fh_entry is not None:
             entries.append(_infl_entry(_fh_entry, 0))
             _excluded_ids.add(_fh_entry.item.request.request_id)
