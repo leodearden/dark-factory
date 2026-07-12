@@ -4122,6 +4122,37 @@ class TestBackendForwarding:
             f'backend not forwarded to invoke_fn on gated path; captured kwargs: {captured}'
         )
 
+    async def test_custom_invoke_fn_receives_default_backend_when_unset(self):
+        """A custom invoke_fn receives the default backend='claude' when the
+        caller omits `backend=` entirely.
+
+        This is the most common orchestrator shape (e.g. harness.py's
+        dispatch omits `backend=` and relies on the signature default) — a
+        regression that dropped the default while guarding the codex-forward
+        path would go uncaught without this.
+        """
+        captured: dict = {}
+
+        async def spy(**kwargs):
+            captured.update(kwargs)
+            return _make_result()
+
+        await invoke_with_cap_retry(
+            None,  # no gate → fast path
+            'lbl',
+            invoke_fn=spy,
+            # backend intentionally omitted — exercises the
+            # `backend: str = 'claude'` default on invoke_with_cap_retry.
+            prompt='hi',
+            system_prompt='sp',
+            cwd=Path('.'),
+            model='gpt-5.4',
+        )
+
+        assert captured.get('backend') == 'claude', (
+            f'default backend not forwarded to invoke_fn; captured kwargs: {captured}'
+        )
+
     async def test_claude_default_shape_unchanged_and_no_backend_kwarg(self):
         """Default invoke_claude_agent path: call shape unchanged, no `backend` kwarg.
 
@@ -4156,3 +4187,43 @@ class TestBackendForwarding:
             'model': 'opus',
             'config_dir': None,
         }, f'invoke_claude_agent call shape changed unexpectedly: {call_kwargs}'
+
+    async def test_claude_default_shape_unchanged_and_no_backend_kwarg_with_gate(self):
+        """Gated-path variant: invoke_claude_agent still gets no `backend` kwarg.
+
+        The forwarding guard (:895-896) sits once, before the no-gate/gate
+        branch, so it should cover both dispatch sites. This confirms the
+        gated cap-retry call site (:928) — not just the no-gate fast path
+        (:907) — actually honors it, and pins the gated call shape (adds
+        `oauth_token` from the leased slot) so a future change can't silently
+        smuggle `backend` in alongside it.
+        """
+        gate = make_gate_mock(account_count=1)
+
+        with patch(
+            'shared.cli_invoke.invoke_claude_agent',
+            new_callable=AsyncMock,
+            return_value=_make_result(),
+        ) as mock_invoke:
+            await invoke_with_cap_retry(
+                gate,
+                'lbl',
+                prompt='hi',
+                system_prompt='sp',
+                cwd=Path('.'),
+                model='opus',
+            )
+
+        mock_invoke.assert_awaited_once()
+        call_kwargs = mock_invoke.call_args.kwargs
+        assert 'backend' not in call_kwargs, (
+            f'invoke_claude_agent must never receive a backend kwarg (gated path); got: {call_kwargs}'
+        )
+        assert call_kwargs == {
+            'prompt': 'hi',
+            'system_prompt': 'sp',
+            'cwd': Path('.'),
+            'model': 'opus',
+            'oauth_token': 'tok',
+            'config_dir': None,
+        }, f'invoke_claude_agent call shape changed unexpectedly (gated path): {call_kwargs}'
