@@ -4510,6 +4510,308 @@ class Scheduler:
             )
         return _CONTINUE
 
+    async def _phase_empty_candidate_gate(self, ctx: TickContext) -> object:
+        """Phase 15/18: end the tick now if no candidates survived the gates.
+
+        Reads: ``ctx.candidates``. Writes: none. Kept as a distinct phase
+        (rather than folded into ``_phase_starvation`` or
+        ``_phase_psi_gate``) to preserve the "empty check BEFORE the PSI
+        sample is read" contract — an idle tick never pays for a PSI read.
+        Terminal only on the empty path.
+        """
+        if not ctx.candidates:
+            return TickOutcome(None)
+        return _CONTINUE
+
+    async def _phase_psi_gate(self, ctx: TickContext) -> object:
+        """Phase 16/18: dispatch-admission gate (task 2328, DA3 of PRD
+        docs/prds/dispatch-admission-load-cap.md).
+
+        Reads: none on ctx. Writes: ``ctx.psi_sample``, ``ctx.psi_hold``,
+        ``ctx.psi_in_flight``. Computed ONCE per tick, before both the
+        pinned and scored dispatch loops, so a single hold decision
+        governs both (DA-D5 parity) and ``len(self._dispatched)`` is read
+        before this tick's own dispatch can mutate it (stable floor
+        comparison). Runs after the empty-candidate short-circuit so an
+        idle tick never pays for a PSI read. Always continues.
+        """
+        cfg_psi = self.config.psi_admission
+        psi_sample: PsiSample | None = None
+        psi_hold = False
+        psi_in_flight = 0
+        if cfg_psi.enabled:
+            psi_sample = self._read_psi_sample()
+            if not psi_sample.read_ok:
+                # Fail-open (DA-D6): saturated() is False whenever read_ok is
+                # False, so psi_hold stays False and dispatch proceeds
+                # normally — this WARNING is only the loud operator signal.
+                _now = self._time_source()
+                if _now - self._last_psi_read_fail_log >= _DISPATCH_DEFERRED_LOG_SECS:
+                    logger.warning(
+                        'Dispatch-admission gate: PSI sample unreadable — '
+                        'failing open (heavy dispatch is NOT throttled this tick)'
+                    )
+                    self._last_psi_read_fail_log = _now
+            psi_in_flight = len(self._dispatched)
+            psi_hold = (
+                psi_sample.saturated(cfg_psi) and psi_in_flight >= cfg_psi.min_inflight_floor
+            )
+        ctx.psi_sample = psi_sample
+        ctx.psi_hold = psi_hold
+        ctx.psi_in_flight = psi_in_flight
+        return _CONTINUE
+
+    def _note_heavy_deferral(self, ctx: TickContext, deferred_task_id: str) -> None:
+        """Emit dispatch_deferred + a rate-limited WARNING for the FIRST
+        heavy candidate skipped this tick.
+
+        Per-tick dedup lives on ``ctx.dispatch_deferred_emitted`` (promoted
+        from a ``nonlocal`` closure variable so ``_phase_select_pins`` and
+        ``_phase_select_scored`` — two separate phase methods — share the
+        SAME once-per-tick decision/event, exactly as the two loops did
+        when they were one method body).
+        """
+        if ctx.dispatch_deferred_emitted:
+            return
+        ctx.dispatch_deferred_emitted = True
+        cfg_psi = self.config.psi_admission
+        # invariant: only reachable when ctx.psi_hold is True, which is only
+        # ever set True inside `if cfg_psi.enabled:` after ctx.psi_sample is
+        # assigned — so ctx.psi_sample is never None here.
+        assert ctx.psi_sample is not None
+        psi_sample = ctx.psi_sample
+        # DA-D1 ranked order: cpu > mem_some > mem_full > io.
+        if psi_sample.cpu_some10 >= cfg_psi.cpu_some_avg10:
+            metric, value = 'cpu_some_avg10', psi_sample.cpu_some10
+        elif psi_sample.mem_some10 >= cfg_psi.mem_some_avg10:
+            metric, value = 'mem_some_avg10', psi_sample.mem_some10
+        elif psi_sample.mem_full10 >= cfg_psi.mem_full_avg10:
+            metric, value = 'mem_full_avg10', psi_sample.mem_full10
+        else:
+            metric, value = 'io_some_avg10', psi_sample.io_some10
+        if self.event_store:
+            self.event_store.emit(
+                EventType.dispatch_deferred,
+                task_id=deferred_task_id,
+                data={
+                    'metric': metric,
+                    'value': value,
+                    'in_flight': ctx.psi_in_flight,
+                    'floor': cfg_psi.min_inflight_floor,
+                },
+            )
+        _now = self._time_source()
+        if _now - self._last_dispatch_deferred_log >= _DISPATCH_DEFERRED_LOG_SECS:
+            logger.warning(
+                'Dispatch-admission gate: deferring heavy task %s — '
+                'PSI %s=%.1f (in_flight=%d, floor=%d)',
+                deferred_task_id,
+                metric,
+                value,
+                ctx.psi_in_flight,
+                cfg_psi.min_inflight_floor,
+            )
+            self._last_dispatch_deferred_log = _now
+
+    async def _phase_select_pins(self, ctx: TickContext) -> object:
+        """Phase 17/18: pin-dispatch — try pinned tasks in pin_order ASC
+        before scoring.
+
+        Reads: ``ctx.overrides``, ``ctx.tasks_by_id``, ``ctx.status_map``,
+        ``ctx.external_cache``, ``ctx.external_resolver_failed``,
+        ``ctx.gated_ids``, ``ctx.psi_hold``, ``ctx.effective_priorities``.
+        Writes: none on ctx (dispatch bookkeeping lives on ``self``).
+        Pinned candidates bypass scoring entirely but still respect lock
+        availability and eligibility checks (status, deps, cooldown). On
+        lock conflict, falls through to the next pinned candidate without
+        touching skip counters or arming parks (pins bypass fairness).
+        Returns ``TickOutcome(TaskAssignment)`` on a successful dispatch,
+        else ``_CONTINUE`` to fall through to the scored loop.
+        """
+        if self._override_store:
+            pin_queue: list[tuple[str, OverrideRow]] = sorted(
+                ((tid, row) for tid, row in ctx.overrides.items() if row.pinned),
+                key=lambda x: (x[1].pin_order if x[1].pin_order is not None else 0),
+            )
+            for pin_tid, _pin_row in pin_queue:
+                if pin_tid not in ctx.tasks_by_id:
+                    continue
+                pin_task = ctx.tasks_by_id[pin_tid]
+                # Re-use the same eligibility helper as the scored-candidate
+                # loop to keep both paths in sync.  A future gate addition only
+                # needs to be added to _eligible_for_dispatch.
+                eligible, pin_signal = self._eligible_for_dispatch(
+                    pin_task, pin_tid, ctx.status_map, ctx.tasks_by_id,
+                    external_status_cache=ctx.external_cache,
+                    external_resolver_failed=ctx.external_resolver_failed,
+                )
+                if not eligible:
+                    continue
+                if pin_tid in ctx.gated_ids:
+                    # Landed-outbox gate (task 2156, SD-1/B5): this pinned
+                    # task's merge already landed on main and is being driven
+                    # to done inline — skip it here too so the pin loop and
+                    # the scored loop share the one gated_ids source of truth.
+                    continue
+                if ctx.psi_hold and not self.is_deterministic(pin_task):
+                    # Dispatch-admission gate (task 2328, DA3/DA-D5): a pin
+                    # doesn't reduce host load, so a pinned HEAVY candidate is
+                    # deferred exactly like a scored one — deterministic pins
+                    # remain exempt.  ctx.psi_hold and _note_heavy_deferral are
+                    # the SAME once-per-tick decision/helper the scored loop
+                    # uses below, so both loops share one hold and one event.
+                    self._note_heavy_deferral(ctx, pin_tid)
+                    continue
+                # Eligible pinned candidate — try to acquire its modules.
+                pin_modules = self._get_modules(pin_task)
+                if self.lock_table.try_acquire(pin_tid, pin_modules):
+                    self._dispatched.add(pin_tid)
+                    # Starvation-watchdog resolve (task 1880): if a pinned task
+                    # had an open INFO escalation, self-resolve it now.
+                    # Wrapped in try/except so a resolve failure can NEVER abort
+                    # a successful dispatch (PROPERTY 1).
+                    try:
+                        await self._resolve_starvation_escalation(pin_tid)
+                    except Exception:
+                        logger.warning(
+                            'Starvation watchdog resolve for pin_tid=%s raised — '
+                            'dispatch continues normally',
+                            pin_tid,
+                            exc_info=True,
+                        )
+                    if pin_signal is not None:
+                        self._last_dispatch_at[pin_tid] = self._time_source()
+                    pin_pri = ctx.effective_priorities.get(
+                        pin_tid, coerce_tier(pin_task.get('priority'))
+                    )
+                    self._dispatched_priority[pin_tid] = pin_pri
+                    if self.event_store:
+                        self.event_store.emit(
+                            EventType.lock_acquired,
+                            task_id=pin_tid,
+                            data={'modules': pin_modules, 'priority': pin_pri},
+                        )
+                    await self._write_snapshot_best_effort()
+                    return TickOutcome(TaskAssignment(
+                        task_id=pin_tid, task=pin_task, modules=pin_modules
+                    ))
+                # Lock conflict — fall through to next pinned candidate.
+                # No skip-bookkeeping for pinned tasks (pins bypass fairness).
+        return _CONTINUE
+
+    async def _phase_select_scored(self, ctx: TickContext) -> object:
+        """Phase 18/18: score each candidate and dispatch the best available.
+
+        Reads: ``ctx.candidates``, ``ctx.effective_priorities``,
+        ``ctx.max_id``, ``ctx.transitive_counts``, ``ctx.psi_hold``,
+        ``ctx.candidate_signals``. Writes: none on ctx (dispatch
+        bookkeeping lives on ``self``). ALWAYS terminal — returns
+        ``TickOutcome(TaskAssignment)`` on a successful dispatch, or
+        ``TickOutcome(None)`` once the loop is exhausted with no acquire
+        (the top candidate's skip counter is bumped either way it is
+        passed over). Higher score wins; ties broken by task_id string
+        order (stable, FIFO-ish for numeric ids).
+        """
+        scored: list[tuple[float, str, dict, str]] = []
+        for t in ctx.candidates:
+            tid = str(t.get('id', ''))
+            pri = ctx.effective_priorities.get(tid, coerce_tier(t.get('priority')))
+            age = self._compute_age(tid, ctx.max_id)
+            transitive = ctx.transitive_counts.get(tid, 0)
+            score = self._compute_score(pri, age, transitive)
+            scored.append((score, tid, t, pri))
+
+        scored.sort(key=lambda entry: (-entry[0], entry[1]))
+
+        # DEBUG: log the top 3 so α/β tuning is post-hoc diagnosable.
+        if logger.isEnabledFor(logging.DEBUG):
+            top3 = scored[:3]
+            logger.debug(
+                'acquire_next top candidates: %s',
+                [
+                    {
+                        'id': e[1],
+                        'score': round(e[0], 2),
+                        'pri': e[3],
+                    }
+                    for e in top3
+                ],
+            )
+
+        # Strict top is the highest-scoring eligible candidate.  We track it
+        # for fairness bookkeeping (skip counter / park installation).
+        top_score, top_id, top_task, top_pri = scored[0]
+        top_modules = self._get_modules(top_task)
+        top_had_parks = self.lock_table.has_parks(top_id)
+
+        for _score, task_id, task, pri in scored:
+            if ctx.psi_hold and not self.is_deterministic(task):
+                # Dispatch-admission gate (DA3): defer this HEAVY candidate —
+                # deterministic candidates are exempt (DA-D4) and lower-
+                # ranked exempt/light candidates behind it still get a turn
+                # (per-candidate `continue`, not a top-level `return None`).
+                self._note_heavy_deferral(ctx, task_id)
+                continue
+            modules = self._get_modules(task)
+            if self.lock_table.try_acquire(task_id, modules):
+                self._dispatched.add(task_id)
+                # Starvation-watchdog resolve (task 1880): if this scored task
+                # had an open INFO escalation, self-resolve it now that it is
+                # dispatching.  Wrapped in try/except so a resolve failure can
+                # NEVER abort a successful dispatch (PROPERTY 1).
+                try:
+                    await self._resolve_starvation_escalation(task_id)
+                except Exception:
+                    logger.warning(
+                        'Starvation watchdog resolve for task_id=%s raised — '
+                        'dispatch continues normally',
+                        task_id,
+                        exc_info=True,
+                    )
+                # arm cooldown gate — only for signal-bearing dispatches.
+                # Steward signals that arrive *after* a signal-free dispatch
+                # will not retroactively suppress re-dispatch; the gate is
+                # intentionally scoped to tasks that were already flagged
+                # when first picked up (bounded _last_dispatch_at size).
+                if ctx.candidate_signals.get(task_id) is not None:
+                    self._last_dispatch_at[task_id] = self._time_source()
+                self._dispatched_priority[task_id] = pri
+                if task_id == top_id:
+                    self._skip_count.pop(task_id, None)
+                    if top_had_parks:
+                        restored_pairs = self.lock_table.clear_parks_for(task_id)
+                        if self.event_store:
+                            self.event_store.emit(
+                                EventType.reservation_used,
+                                task_id=task_id,
+                                data={'modules': modules, 'priority': pri},
+                            )
+                            for restored_owner, restored_modules in restored_pairs:
+                                self.event_store.emit(
+                                    EventType.reservation_restored,
+                                    task_id=restored_owner,
+                                    data={
+                                        'restored_owner': restored_owner,
+                                        'modules': restored_modules,
+                                    },
+                                )
+                else:
+                    # A lower-ranked task won — top was passed over this tick.
+                    self._bump_skip_and_maybe_park(top_id, top_modules, top_pri)
+                if self.event_store:
+                    self.event_store.emit(
+                        EventType.lock_acquired,
+                        task_id=task_id,
+                        data={'modules': modules, 'priority': pri},
+                    )
+                await self._write_snapshot_best_effort()
+                return TickOutcome(TaskAssignment(task_id=task_id, task=task, modules=modules))
+
+        # Loop exhausted with no acquire — top candidate was also skipped.
+        self._bump_skip_and_maybe_park(top_id, top_modules, top_pri)
+        await self._write_snapshot_best_effort()
+        return TickOutcome(None)
+
     async def acquire_next(self) -> TaskAssignment | None:
         """Find next eligible task under the value/h scoring model.
 
@@ -4575,9 +4877,9 @@ class Scheduler:
 
         # Per-tick mutable state threaded through the phase methods below
         # (W10-β). Constructed once the status/id indices + age anchors are
-        # ready; `status_map`/`tasks_by_id`/`tasks` below are the SAME
-        # objects as ctx's fields (mutated in place by the not-yet-extracted
-        # code immediately following), so ctx stays consistent as they fill in.
+        # ready; `status_map`/`tasks_by_id`/`tasks` above are the SAME
+        # objects as ctx's fields (mutated in place by the phase methods
+        # that follow), so ctx stays consistent as they fill in.
         ctx = TickContext(
             tasks=tasks,
             status_map=status_map,
@@ -4633,276 +4935,20 @@ class Scheduler:
         await self._phase_landed_outbox_gate(ctx)
         await self._phase_starvation(ctx)
 
-        # Rebind locals from ctx for the not-yet-extracted tail below
-        # (empty-candidate gate, PSI gate, pin/scored dispatch loops —
-        # W10-β step-10). These names are read (not reassigned) by that
-        # tail exactly as before extraction.
-        candidates = ctx.candidates
-        candidate_signals = ctx.candidate_signals
-        current_overrides = ctx.overrides
-        external_cache = ctx.external_cache
-        _external_resolver_failed = ctx.external_resolver_failed
-        effective_priorities = ctx.effective_priorities
-        transitive_counts = ctx.transitive_counts
-        gated_ids = ctx.gated_ids
+        r = await self._phase_empty_candidate_gate(ctx)
+        if r is not _CONTINUE:
+            return r.assignment
 
-        if not candidates:
-            return None
+        await self._phase_psi_gate(ctx)
 
-        # Dispatch-admission gate (task 2328, DA3 of PRD
-        # docs/prds/dispatch-admission-load-cap.md).  Computed ONCE per tick,
-        # before both the pinned and scored dispatch loops, so a single hold
-        # decision governs both (DA-D5 parity) and len(self._dispatched) is
-        # read before this tick's own dispatch can mutate it (stable floor
-        # comparison).  Placed after the empty-candidate short-circuit so an
-        # idle tick never pays for a PSI read.
-        cfg_psi = self.config.psi_admission
-        psi_sample: PsiSample | None = None
-        psi_hold = False
-        psi_in_flight = 0
-        if cfg_psi.enabled:
-            psi_sample = self._read_psi_sample()
-            if not psi_sample.read_ok:
-                # Fail-open (DA-D6): saturated() is False whenever read_ok is
-                # False, so psi_hold stays False and dispatch proceeds
-                # normally — this WARNING is only the loud operator signal.
-                _now = self._time_source()
-                if _now - self._last_psi_read_fail_log >= _DISPATCH_DEFERRED_LOG_SECS:
-                    logger.warning(
-                        'Dispatch-admission gate: PSI sample unreadable — '
-                        'failing open (heavy dispatch is NOT throttled this tick)'
-                    )
-                    self._last_psi_read_fail_log = _now
-            psi_in_flight = len(self._dispatched)
-            psi_hold = (
-                psi_sample.saturated(cfg_psi) and psi_in_flight >= cfg_psi.min_inflight_floor
-            )
+        r = await self._phase_select_pins(ctx)
+        if r is not _CONTINUE:
+            return r.assignment
 
-        _dispatch_deferred_emitted = False
+        r = await self._phase_select_scored(ctx)
+        if r is not _CONTINUE:
+            return r.assignment
 
-        def _note_heavy_deferral(deferred_task_id: str) -> None:
-            """Emit dispatch_deferred + a rate-limited WARNING for the FIRST
-            heavy candidate skipped this tick (per-tick dedup)."""
-            nonlocal _dispatch_deferred_emitted
-            if _dispatch_deferred_emitted:
-                return
-            _dispatch_deferred_emitted = True
-            # invariant: only reachable when psi_hold is True, which is only
-            # ever set True inside `if cfg_psi.enabled:` after psi_sample is
-            # assigned — so psi_sample is never None here.
-            assert psi_sample is not None
-            # DA-D1 ranked order: cpu > mem_some > mem_full > io.
-            if psi_sample.cpu_some10 >= cfg_psi.cpu_some_avg10:
-                metric, value = 'cpu_some_avg10', psi_sample.cpu_some10
-            elif psi_sample.mem_some10 >= cfg_psi.mem_some_avg10:
-                metric, value = 'mem_some_avg10', psi_sample.mem_some10
-            elif psi_sample.mem_full10 >= cfg_psi.mem_full_avg10:
-                metric, value = 'mem_full_avg10', psi_sample.mem_full10
-            else:
-                metric, value = 'io_some_avg10', psi_sample.io_some10
-            if self.event_store:
-                self.event_store.emit(
-                    EventType.dispatch_deferred,
-                    task_id=deferred_task_id,
-                    data={
-                        'metric': metric,
-                        'value': value,
-                        'in_flight': psi_in_flight,
-                        'floor': cfg_psi.min_inflight_floor,
-                    },
-                )
-            _now = self._time_source()
-            if _now - self._last_dispatch_deferred_log >= _DISPATCH_DEFERRED_LOG_SECS:
-                logger.warning(
-                    'Dispatch-admission gate: deferring heavy task %s — '
-                    'PSI %s=%.1f (in_flight=%d, floor=%d)',
-                    deferred_task_id,
-                    metric,
-                    value,
-                    psi_in_flight,
-                    cfg_psi.min_inflight_floor,
-                )
-                self._last_dispatch_deferred_log = _now
-
-        # Pin-dispatch: try pinned tasks in pin_order ASC before scoring.
-        # Pinned candidates bypass scoring entirely but still respect lock
-        # availability and eligibility checks (status, deps, cooldown).
-        # On lock conflict, fall through to the next pinned candidate without
-        # touching skip counters or arming parks (pins bypass fairness).
-        #
-        # The pin queue is derived from the in-memory current_overrides snapshot
-        # (already loaded above) so we avoid a second SQLite round-trip on every
-        # tick.  The post-GC snapshot is already authoritative.
-        if self._override_store:
-            pin_queue: list[tuple[str, OverrideRow]] = sorted(
-                ((tid, row) for tid, row in current_overrides.items() if row.pinned),
-                key=lambda x: (x[1].pin_order if x[1].pin_order is not None else 0),
-            )
-            for pin_tid, _pin_row in pin_queue:
-                if pin_tid not in tasks_by_id:
-                    continue
-                pin_task = tasks_by_id[pin_tid]
-                # Re-use the same eligibility helper as the scored-candidate
-                # loop to keep both paths in sync.  A future gate addition only
-                # needs to be added to _eligible_for_dispatch.
-                eligible, pin_signal = self._eligible_for_dispatch(
-                    pin_task, pin_tid, status_map, tasks_by_id,
-                    external_status_cache=external_cache,
-                    external_resolver_failed=_external_resolver_failed,
-                )
-                if not eligible:
-                    continue
-                if pin_tid in gated_ids:
-                    # Landed-outbox gate (task 2156, SD-1/B5): this pinned
-                    # task's merge already landed on main and is being driven
-                    # to done inline — skip it here too so the pin loop and
-                    # the scored loop share the one gated_ids source of truth.
-                    continue
-                if psi_hold and not self.is_deterministic(pin_task):
-                    # Dispatch-admission gate (task 2328, DA3/DA-D5): a pin
-                    # doesn't reduce host load, so a pinned HEAVY candidate is
-                    # deferred exactly like a scored one — deterministic pins
-                    # remain exempt.  psi_hold and _note_heavy_deferral are
-                    # the SAME once-per-tick decision/helper the scored loop
-                    # uses below, so both loops share one hold and one event.
-                    _note_heavy_deferral(pin_tid)
-                    continue
-                # Eligible pinned candidate — try to acquire its modules.
-                pin_modules = self._get_modules(pin_task)
-                if self.lock_table.try_acquire(pin_tid, pin_modules):
-                    self._dispatched.add(pin_tid)
-                    # Starvation-watchdog resolve (task 1880): if a pinned task
-                    # had an open INFO escalation, self-resolve it now.
-                    # Wrapped in try/except so a resolve failure can NEVER abort
-                    # a successful dispatch (PROPERTY 1).
-                    try:
-                        await self._resolve_starvation_escalation(pin_tid)
-                    except Exception:
-                        logger.warning(
-                            'Starvation watchdog resolve for pin_tid=%s raised — '
-                            'dispatch continues normally',
-                            pin_tid,
-                            exc_info=True,
-                        )
-                    if pin_signal is not None:
-                        self._last_dispatch_at[pin_tid] = self._time_source()
-                    pin_pri = effective_priorities.get(
-                        pin_tid, coerce_tier(pin_task.get('priority'))
-                    )
-                    self._dispatched_priority[pin_tid] = pin_pri
-                    if self.event_store:
-                        self.event_store.emit(
-                            EventType.lock_acquired,
-                            task_id=pin_tid,
-                            data={'modules': pin_modules, 'priority': pin_pri},
-                        )
-                    await self._write_snapshot_best_effort()
-                    return TaskAssignment(
-                        task_id=pin_tid, task=pin_task, modules=pin_modules
-                    )
-                # Lock conflict — fall through to next pinned candidate.
-                # No skip-bookkeeping for pinned tasks (pins bypass fairness).
-
-        # Score each candidate.  Higher score wins; ties broken by task_id
-        # string order (stable, FIFO-ish for numeric ids).
-        scored: list[tuple[float, str, dict, str]] = []
-        for t in candidates:
-            tid = str(t.get('id', ''))
-            pri = effective_priorities.get(tid, coerce_tier(t.get('priority')))
-            age = self._compute_age(tid, max_id)
-            transitive = transitive_counts.get(tid, 0)
-            score = self._compute_score(pri, age, transitive)
-            scored.append((score, tid, t, pri))
-
-        scored.sort(key=lambda entry: (-entry[0], entry[1]))
-
-        # DEBUG: log the top 3 so α/β tuning is post-hoc diagnosable.
-        if logger.isEnabledFor(logging.DEBUG):
-            top3 = scored[:3]
-            logger.debug(
-                'acquire_next top candidates: %s',
-                [
-                    {
-                        'id': e[1],
-                        'score': round(e[0], 2),
-                        'pri': e[3],
-                    }
-                    for e in top3
-                ],
-            )
-
-        # Strict top is the highest-scoring eligible candidate.  We track it
-        # for fairness bookkeeping (skip counter / park installation).
-        top_score, top_id, top_task, top_pri = scored[0]
-        top_modules = self._get_modules(top_task)
-        top_had_parks = self.lock_table.has_parks(top_id)
-
-        for _score, task_id, task, pri in scored:
-            if psi_hold and not self.is_deterministic(task):
-                # Dispatch-admission gate (DA3): defer this HEAVY candidate —
-                # deterministic candidates are exempt (DA-D4) and lower-
-                # ranked exempt/light candidates behind it still get a turn
-                # (per-candidate `continue`, not a top-level `return None`).
-                _note_heavy_deferral(task_id)
-                continue
-            modules = self._get_modules(task)
-            if self.lock_table.try_acquire(task_id, modules):
-                self._dispatched.add(task_id)
-                # Starvation-watchdog resolve (task 1880): if this scored task
-                # had an open INFO escalation, self-resolve it now that it is
-                # dispatching.  Wrapped in try/except so a resolve failure can
-                # NEVER abort a successful dispatch (PROPERTY 1).
-                try:
-                    await self._resolve_starvation_escalation(task_id)
-                except Exception:
-                    logger.warning(
-                        'Starvation watchdog resolve for task_id=%s raised — '
-                        'dispatch continues normally',
-                        task_id,
-                        exc_info=True,
-                    )
-                # arm cooldown gate — only for signal-bearing dispatches.
-                # Steward signals that arrive *after* a signal-free dispatch
-                # will not retroactively suppress re-dispatch; the gate is
-                # intentionally scoped to tasks that were already flagged
-                # when first picked up (bounded _last_dispatch_at size).
-                if candidate_signals.get(task_id) is not None:
-                    self._last_dispatch_at[task_id] = self._time_source()
-                self._dispatched_priority[task_id] = pri
-                if task_id == top_id:
-                    self._skip_count.pop(task_id, None)
-                    if top_had_parks:
-                        restored_pairs = self.lock_table.clear_parks_for(task_id)
-                        if self.event_store:
-                            self.event_store.emit(
-                                EventType.reservation_used,
-                                task_id=task_id,
-                                data={'modules': modules, 'priority': pri},
-                            )
-                            for restored_owner, restored_modules in restored_pairs:
-                                self.event_store.emit(
-                                    EventType.reservation_restored,
-                                    task_id=restored_owner,
-                                    data={
-                                        'restored_owner': restored_owner,
-                                        'modules': restored_modules,
-                                    },
-                                )
-                else:
-                    # A lower-ranked task won — top was passed over this tick.
-                    self._bump_skip_and_maybe_park(top_id, top_modules, top_pri)
-                if self.event_store:
-                    self.event_store.emit(
-                        EventType.lock_acquired,
-                        task_id=task_id,
-                        data={'modules': modules, 'priority': pri},
-                    )
-                await self._write_snapshot_best_effort()
-                return TaskAssignment(task_id=task_id, task=task, modules=modules)
-
-        # Loop exhausted with no acquire — top candidate was also skipped.
-        self._bump_skip_and_maybe_park(top_id, top_modules, top_pri)
-        await self._write_snapshot_best_effort()
         return None
 
     def get_state_snapshot(self) -> dict:
