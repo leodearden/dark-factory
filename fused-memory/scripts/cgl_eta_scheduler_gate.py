@@ -98,10 +98,18 @@ class McpClient:
         headers = {
             'Content-Type': 'application/json',
             'Accept': 'application/json, text/event-stream',
-            'mcp-session-id': self._session_id or '',
         }
+        if self._session_id is not None:
+            headers['mcp-session-id'] = self._session_id
         resp = await self._client.post(f'{self._url}/mcp/', json=payload, headers=headers)
         resp.raise_for_status()
+        # Capture the server-assigned session id (returned on `initialize`) so
+        # it can be reused on every subsequent request. Must happen before the
+        # 202/empty-content early return below, since `initialize` responses
+        # carry a JSON body but `notifications/initialized` may not.
+        sid = resp.headers.get('mcp-session-id')
+        if sid:
+            self._session_id = sid
         if resp.status_code == 202 or not resp.content:
             return {}
         if 'text/event-stream' in resp.headers.get('content-type', ''):
