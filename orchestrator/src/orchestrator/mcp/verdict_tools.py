@@ -19,6 +19,8 @@ import logging
 from datetime import UTC, datetime
 from typing import Any
 
+from fastmcp import FastMCP
+
 from orchestrator.artifacts import TaskArtifacts
 
 logger = logging.getLogger(__name__)
@@ -120,3 +122,100 @@ def _submit_merge_disposition(
     }
     artifacts.write_verdict(role, _envelope(role, session_id, payload))
     return {'status': 'ok', 'role': role}
+
+
+# ---------------------------------------------------------------------------
+# FastMCP server factory
+# ---------------------------------------------------------------------------
+
+# Roles that get a dedicated singleton tool. Any role NOT in this set is
+# treated as a reviewer-panel member's name (defined in roles.py, task β) —
+# verdict_tools stays decoupled from that list and falls back to
+# submit_review_verdict for it.
+_SINGLETON_ROLE_TOOLS = frozenset({'judge', 'triage', 'merger'})
+
+
+def create_server(artifacts: TaskArtifacts, role: str, session_id: str = '') -> FastMCP:
+    """Create the verdict-tools MCP server with EXACTLY ONE tool registered,
+    selected by *role*.
+    """
+    mcp = FastMCP('verdict-tools')
+
+    if role == 'judge':
+        @mcp.tool()
+        def submit_completion_verdict(
+            complete: bool,
+            reasoning: str,
+            uncovered_plan_steps: list[str],
+            substantive_work: bool,
+        ) -> dict[str, Any]:
+            """Submit the completion-judge verdict for this task.
+
+            Args:
+                complete: Whether the plan's substantive work is complete.
+                reasoning: Explanation for the verdict.
+                uncovered_plan_steps: Plan step ids not covered by the diff.
+                substantive_work: Whether the diff contains substantive work.
+            """
+            return _submit_completion_verdict(
+                artifacts, role, session_id,
+                complete, reasoning, uncovered_plan_steps, substantive_work,
+            )
+    elif role == 'triage':
+        @mcp.tool()
+        def submit_triage(
+            accepted: list[dict],
+            skipped: list[dict],
+            proposed_task_groups: list[dict],
+        ) -> dict[str, Any]:
+            """Submit the triage verdict for this task.
+
+            Args:
+                accepted: Suggestions accepted for follow-up tasks.
+                skipped: Suggestions skipped, with reasons.
+                proposed_task_groups: Proposed grouping of accepted suggestions.
+            """
+            return _submit_triage(
+                artifacts, role, session_id,
+                accepted, skipped, proposed_task_groups,
+            )
+    elif role == 'merger':
+        @mcp.tool()
+        def submit_merge_disposition(
+            blocked: bool,
+            reason: str,
+        ) -> dict[str, Any]:
+            """Submit the merge disposition verdict for this task.
+
+            Args:
+                blocked: Whether the merge should be blocked.
+                reason: Explanation for the disposition (may be empty when
+                    not blocked).
+            """
+            return _submit_merge_disposition(
+                artifacts, role, session_id, blocked, reason,
+            )
+    else:
+        # A reviewer-panel member's name — see _SINGLETON_ROLE_TOOLS above.
+        assert role not in _SINGLETON_ROLE_TOOLS
+
+        @mcp.tool()
+        def submit_review_verdict(
+            reviewer: str,
+            verdict: str,
+            issues: list[dict],
+            summary: str,
+        ) -> dict[str, Any]:
+            """Submit a reviewer's verdict for this task.
+
+            Args:
+                reviewer: The reviewer's name (matches --verdict-role).
+                verdict: One of "PASS" or "ISSUES_FOUND".
+                issues: Structured list of issues found (empty if PASS).
+                summary: One-paragraph summary of the review.
+            """
+            return _submit_review_verdict(
+                artifacts, role, session_id, reviewer, verdict, issues, summary,
+            )
+
+    return mcp
