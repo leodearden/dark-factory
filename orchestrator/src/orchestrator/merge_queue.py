@@ -5200,6 +5200,42 @@ def _alarm_illegal_lifecycle_transition(
         )
 
 
+_REGISTRY_STATE_TO_WIRE: dict[ItemLifecycleState, str] = {
+    ItemLifecycleState.QUEUED: 'queued',
+    ItemLifecycleState.LANE_BUFFERED: 'queued',
+    ItemLifecycleState.MERGING: 'merging',
+    ItemLifecycleState.AWAITING_VERIFY: 'awaiting_verify',
+    ItemLifecycleState.REDISPATCH_PARKED: 'awaiting_host',
+    ItemLifecycleState.DISPATCHING: 'dispatching',
+    ItemLifecycleState.VERIFYING: ItemLifecycleState.VERIFYING.value,
+    ItemLifecycleState.GATE_REVERIFY: ItemLifecycleState.GATE_REVERIFY.value,
+    ItemLifecycleState.FINALIZING: ItemLifecycleState.FINALIZING.value,
+}
+"""Registry-state -> snapshot()-wire-string map for MergeRequest/SpeculativeItem
+entries surfaced directly from ``_live_items`` (merge-queue-reliability PRD
+scope-4 kappa-b / task 2435). ``InflightEntry`` entries do NOT use this table —
+they keep going through :meth:`SpeculativeMergeWorker._entry_phase`, already
+registry-driven since task lambda (2173).
+
+Two members diverge from their own ``.value`` (the historical wire strings
+predate the registry): ``LANE_BUFFERED`` ('lane_buffered' -> 'queued', the
+same wire string as plain ``QUEUED`` — snapshot() has never distinguished
+lane-buffered-but-undispatched from freshly-queued) and
+``REDISPATCH_PARKED`` ('redispatch_parked' -> 'awaiting_host', matching the
+1c redispatch-window container section's existing wire string). ``MERGING``
+maps to 'merging' for BOTH the initial dequeue-time merge (formerly
+``_inflight_req``) and the dispatch-time chain-invalidation remerge (formerly
+``_remerging_item``, wired 'remerging') — DD6 collapses the two historical
+wire strings into one now that both are the same registry state.
+``DISPATCHING`` is net-new (task-2068 census gap closed). ``TERMINAL`` is
+deliberately absent — callers only look up non-terminal states (retired
+items are dropped from ``_live_items`` by
+:meth:`SpeculativeMergeWorker._retire_item`), so a lookup miss here would
+signal a real wiring bug rather than something to paper over with a
+fallback.
+"""
+
+
 class SpeculativeMergeWorker(_WipHaltMixin):
     """Two-coroutine speculative merge-verify pipeline.
 
@@ -5930,6 +5966,34 @@ class SpeculativeMergeWorker(_WipHaltMixin):
             'verifying',
         )
         return 'verifying'
+
+    def _finalizing_head_entry(self) -> InflightEntry | None:
+        """Return the popped-for-finalize ``InflightEntry`` still tracked in
+        ``_live_items``, if any (merge-queue-reliability PRD scope-4 kappa-b
+        / task 2435).
+
+        ``_finalize_inflight`` pops its entry from ``self._inflight`` via
+        ``popleft()`` before the (possibly long) ``await entry.verify_task``
+        that finalizes it — during that window the entry is off the deque
+        but still tracked in ``_live_items`` (registry-non-terminal, per the
+        deferred VERIFYING -> FINALIZING hop documented at the top of
+        ``_finalize_inflight``). The ordering invariant (at most one entry
+        mid-finalize at a time) makes this uniquely identifiable: the sole
+        ``_live_items`` ``InflightEntry`` whose request_id is absent from the
+        ``_inflight`` deque.
+
+        Replaces the deleted ``_finalizing_head`` field — reused by
+        :meth:`snapshot`'s section 0 / occupancy / verify_in_progress, and by
+        :meth:`_frozen_inflight_entries` (task 2435 step-6), so every reader
+        shares one derivation instead of a second bespoke reconstruction.
+
+        Returns ``None`` when nothing is mid-finalize (the common case).
+        """
+        _inflight_ids = {e.item.request.request_id for e in self._inflight}
+        for rid, obj in self._live_items.items():
+            if isinstance(obj, InflightEntry) and rid not in _inflight_ids:
+                return obj
+        return None
 
     # ── δ=1988 SuffixConflictTracker delegation ─────────────────────────────
     # Data-descriptor properties forwarding the original attribute names to
@@ -7330,8 +7394,12 @@ class SpeculativeMergeWorker(_WipHaltMixin):
           task_id, branch, state, enqueued_at, age_secs, position,
           waiter_alive, worktree, pre_rebased, request_id, lane.
           host, verify_started_at, verify_age_secs — non-None only on _inflight entries.
-        State values: queued, merging, remerging, awaiting_host, awaiting_verify,
-          verifying, passthrough, gate_reverify, finalizing.
+        State values: queued, merging, awaiting_host, awaiting_verify,
+          dispatching, verifying, passthrough, gate_reverify, finalizing.
+          (task 2435 kappa-b: 'remerging' collapsed into 'merging' now that
+          both the initial dequeue-time merge and the dispatch-time
+          chain-invalidation remerge are registry-sourced MERGING entries;
+          'dispatching' is net-new, closing the task-2068 census gap.)
         """
         entries: list[dict] = []
         now = time.time()
@@ -7381,12 +7449,42 @@ class SpeculativeMergeWorker(_WipHaltMixin):
             )
             return e
 
-        # 0. Finalize-head window: item popped from _inflight for finalization but
-        # not yet complete.  Prepended at position 0 so it remains head-of-line —
-        # it is the submission-order head.  Mirrors _remerging_item (section 1b)
-        # and _inflight_req (section 3) — same transient-window side-field pattern.
-        if self._finalizing_head is not None:
-            entries.append(_infl_entry(self._finalizing_head, 0))
+        # Pre-scan container membership (task 2435 kappa-b) — computed BEFORE
+        # any entries are built so the registry-sourced section below can
+        # skip request_ids already surfaced by a container section further
+        # down (double-count avoidance), while still running in its original
+        # position right after the _inflight loop. Independent of emission
+        # order because it reads the containers directly rather than the
+        # `entries` list built so far.
+        _container_ids: set[str] = {e.item.request.request_id for e in self._inflight}
+        _container_ids |= {_rd.request.request_id for _rd in self._redispatch}
+        _container_ids |= {
+            _vq_item.request.request_id
+            for _vq_item in self._verifier_queue._queue  # type: ignore[attr-defined]
+            if _vq_item is not None
+        }
+        _container_ids |= {
+            _lb_req.request_id
+            for _lane in MERGE_LANES
+            for _lb_req in self._lane_buffers[_lane]
+        }
+        _container_ids |= {
+            _q_req.request_id
+            for _q_req in self._queue._queue  # type: ignore[attr-defined]
+            if _q_req is not None
+        }
+
+        # 0. Finalize-head window: derived from _live_items — the single
+        # InflightEntry whose request_id is absent from the _inflight deque
+        # (popped by _finalize_inflight but still tracked pre-/mid-await).
+        # Prepended at position 0 so it remains head-of-line — it is the
+        # submission-order head. Replaces the deleted _finalizing_head field
+        # (merge-queue-reliability PRD scope-4 kappa-b / task 2435).
+        _excluded_ids: set[str] = set(_container_ids)
+        _fh_entry = self._finalizing_head_entry()
+        if _fh_entry is not None:
+            entries.append(_infl_entry(_fh_entry, 0))
+            _excluded_ids.add(_fh_entry.item.request.request_id)
 
         # 1. In-flight verify entries: iterate self._inflight head-first.
         # self._inflight is the sole source of truth for concurrent-verify state.
@@ -7399,15 +7497,39 @@ class SpeculativeMergeWorker(_WipHaltMixin):
         for _infl in self._inflight:
             entries.append(_infl_entry(_infl, len(entries)))
 
-        # 1b. Remerge-window entry: item popped from queue and being remerged
-        # but not yet appended to _inflight.  Without this, the item is invisible
-        # to all observability during the await self._remerge(...) call.
-        if self._remerging_item is not None:
-            entries.append(_entry(
-                self._remerging_item, 'remerging',
-                worktree_path=None,
-                position=len(entries),
-            ))
+        # 1b/3 replacement (task 2435 kappa-b): every remaining non-terminal
+        # _live_items entry not already surfaced by a container section (1,
+        # 1c, 2, 4 below) or the finalize-head above. Covers the two
+        # historical transient-field windows — _inflight_req's initial
+        # dequeue-time merge and _remerging_item's dispatch-time
+        # chain-invalidation remerge, both registry MERGING, DD6-collapsed to
+        # the SAME 'merging' wire string — plus the net-new DISPATCHING
+        # window (closes the task-2068 census gap: an item off every
+        # container mid _dispatch_item, formerly tracked only by the
+        # census-only, snapshot-blind _dispatching_item field).
+        # MergeRequest / SpeculativeItem shapes map their registry state to a
+        # wire string via _REGISTRY_STATE_TO_WIRE; InflightEntry shapes are
+        # structurally unreachable here — the only _live_items InflightEntry
+        # ever absent from _inflight is the finalize head, already excluded
+        # above (ordering invariant: at most one at a time).
+        for _rid, _obj in self._live_items.items():
+            if _rid in _excluded_ids:
+                continue
+            _state = self._lifecycle.current(_rid)
+            if _state is None or _state == ItemLifecycleState.TERMINAL:
+                continue
+            if isinstance(_obj, MergeRequest):
+                entries.append(_entry(
+                    _obj, _REGISTRY_STATE_TO_WIRE[_state],
+                    worktree_path=None, position=len(entries),
+                ))
+            elif isinstance(_obj, InflightEntry):
+                continue
+            else:
+                entries.append(_entry(
+                    _obj.request, _REGISTRY_STATE_TO_WIRE[_state],
+                    worktree_path=item_merge_wt(_obj), position=len(entries),
+                ))
 
         # 1c. Redispatch window: an item popped from the verifier queue —
         # either a speculative item bounced back because no host was free
@@ -7424,8 +7546,9 @@ class SpeculativeMergeWorker(_WipHaltMixin):
         # occupancy is deliberately left untouched: it derives solely from
         # self._inflight (hosts with an actual lease), and a redispatch-parked
         # item holds no host lease while it waits, so it must NOT be counted
-        # toward occupancy. Mirrors 1b (_remerging_item)'s transient-window
-        # side-field pattern. self._redispatch is front-priority (drained by
+        # toward occupancy. Mirrors the registry-sourced section above (the
+        # 1b/3 replacement) — items surfaced there hold no host lease either.
+        # self._redispatch is front-priority (drained by
         # the verifier loop's DISPATCH-FILL ahead of _verifier_queue), so its
         # entries are listed here, ahead of the awaiting_verify section below.
         for _rd_item in self._redispatch:
@@ -7447,14 +7570,6 @@ class SpeculativeMergeWorker(_WipHaltMixin):
             entries.append(_entry(
                 item.request, 'awaiting_verify',
                 worktree_path=item_merge_wt(item),
-                position=len(entries),
-            ))
-
-        # 3. Merging (in-flight with the merger)
-        if self._inflight_req is not None:
-            entries.append(_entry(
-                self._inflight_req, 'merging',
-                worktree_path=None,
                 position=len(entries),
             ))
 
@@ -7480,16 +7595,17 @@ class SpeculativeMergeWorker(_WipHaltMixin):
         # here — no verify task is running.
         # Includes 'phase' so consumers can distinguish verifying vs. gate_reverify
         # vs. finalizing without misreading the presence of this field.
-        # Prefer _finalizing_head when set — it is the true submission-order head
-        # (popped from _inflight); self._inflight[0] is the SECOND entry during
-        # the finalize window and would misreport the verifying head.
+        # Prefer the finalize-head entry when set — it is the true
+        # submission-order head (popped from _inflight); self._inflight[0]
+        # is the SECOND entry during the finalize window and would
+        # misreport the verifying head.
         verify_in_progress = None
         _verify_phases = {'verifying', 'gate_reverify', 'finalizing'}
-        _fh = self._finalizing_head
-        # Prefer _finalizing_head only when its phase qualifies — a passthrough
-        # finalize entry would otherwise mask a genuinely-verifying _inflight[0].
+        # Prefer the finalize-head entry only when its phase qualifies — a
+        # passthrough finalize entry would otherwise mask a
+        # genuinely-verifying _inflight[0].
         _vip_head = (
-            _fh if _fh is not None and self._entry_phase(_fh) in _verify_phases
+            _fh_entry if _fh_entry is not None and self._entry_phase(_fh_entry) in _verify_phases
             else (self._inflight[0] if self._inflight else None)
         )
         if _vip_head is not None and self._entry_phase(_vip_head) in _verify_phases:
@@ -7515,9 +7631,9 @@ class SpeculativeMergeWorker(_WipHaltMixin):
         # Include the finalizing head (if any) — it is the submission-order head
         # and its host slot is still occupied while _finalize_inflight awaits.
         # Inserted head-first so 'local' leads the dict, matching position 0 in entries.
-        if self._finalizing_head is not None and self._finalizing_head.lease is not None:
-            _fh_name = self._finalizing_head.lease.name
-            _fh_tid = self._finalizing_head.item.request.task_id
+        if _fh_entry is not None and _fh_entry.lease is not None:
+            _fh_name = _fh_entry.lease.name
+            _fh_tid = _fh_entry.item.request.task_id
             _by_host = {_fh_name: _fh_tid, **_by_host}
         _hosts_total = (
             len(self._host_allocator.host_names)

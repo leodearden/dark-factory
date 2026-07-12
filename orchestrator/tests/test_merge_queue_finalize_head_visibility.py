@@ -487,6 +487,14 @@ class TestFinalizingHeadLifecycle:
             was_speculative=False,
             started_at=time.time() - 1.0,
         )
+        # Register at VERIFYING before invoking _finalize_inflight directly —
+        # mirrors what the real _inflight_append chokepoint already does
+        # before any entry reaches _finalize_inflight in production (task
+        # 2435 kappa-b: snapshot()'s finalize-head section 0 is now derived
+        # from _live_items via _finalizing_head_entry(), not the bare field,
+        # so the entry must be tracked in the registry for snap_mid below to
+        # see it).
+        worker._register_item(entry, initial=ItemLifecycleState.VERIFYING)
 
         # Launch _finalize_inflight; it will pause at `await entry.verify_task`
         fin = asyncio.ensure_future(worker._finalize_inflight(entry))
