@@ -33,8 +33,11 @@ from shared.proc_group import terminate_process_group
 from orchestrator.agents.invoke import invoke_agent
 from orchestrator.agents.roles import STEWARD
 from orchestrator.event_store import EventStore, EventType
+from orchestrator.workflow_types import StewardResolved
 
 if TYPE_CHECKING:
+    from collections.abc import Awaitable, Callable
+
     from escalation.models import Escalation
     from escalation.queue import EscalationQueue
     from shared.config_dir import TaskConfigDir
@@ -43,6 +46,7 @@ if TYPE_CHECKING:
     from orchestrator.config import OrchestratorConfig
     from orchestrator.mcp_lifecycle import McpLifecycle
     from orchestrator.usage_gate import UsageGate
+    from orchestrator.workflow_types import StewardOutcome
 
 logger = logging.getLogger(__name__)
 
@@ -107,6 +111,15 @@ class TaskSteward:
         self._empty_output_counts: dict[str, int] = {}
         self.metrics = StewardMetrics()
 
+        # Outcome channel (task 2248 / W9-delta): the workflow registers a
+        # per-task asyncio.Queue + a wip-derivation probe via the setters
+        # below (in TaskWorkflow._ensure_steward_started).  Both stay None
+        # for stewards built without that wiring (most of this module's
+        # unit tests, and any other caller) — _publish_outcome is a no-op
+        # and the wip-gated guards below default to wip=False in that case.
+        self._outcome_channel: asyncio.Queue | None = None
+        self._wip_probe: Callable[[], Awaitable[bool]] | None = None
+
     # ------------------------------------------------------------------
     # Lifecycle
     # ------------------------------------------------------------------
@@ -117,6 +130,37 @@ class TaskSteward:
             self._run_loop(), name=f'steward-{self.task_id}',
         )
         logger.info(f'Steward started for task {self.task_id}')
+
+    def set_outcome_channel(self, channel: asyncio.Queue) -> None:
+        """Register the in-process channel :meth:`_handle_escalation` publishes on.
+
+        Wired by :meth:`TaskWorkflow._ensure_steward_started`.  Left unset
+        (``None``) by every caller that does not need the typed outcome —
+        :meth:`_publish_outcome` is then a no-op.
+        """
+        self._outcome_channel = channel
+
+    def set_wip_probe(self, probe: Callable[[], Awaitable[bool]]) -> None:
+        """Register the callable used to derive ``wip_commits_present``.
+
+        Wired by :meth:`TaskWorkflow._ensure_steward_started` to
+        ``TaskWorkflow._worktree_has_wip_commits`` — the SAME implementation
+        the workflow uses for its own grace-timeout case, so wip is derived
+        via one shared primitive (``git_ops.worktree_has_unsaved_work``).
+        """
+        self._wip_probe = probe
+
+    def _publish_outcome(self, outcome: StewardOutcome) -> None:
+        """Put *outcome* on the registered channel; no-op when none is set.
+
+        Synchronous (``put_nowait``, not ``await queue.put``) so it is safe
+        to call from both async call sites (``_handle_escalation``) and sync
+        ones (``_auto_escalate_to_human``).  A per-task ``asyncio.Queue`` is
+        unbounded by construction here, so ``put_nowait`` never raises
+        ``QueueFull``.
+        """
+        if self._outcome_channel is not None:
+            self._outcome_channel.put_nowait(outcome)
 
     async def stop(self) -> None:
         """Cancel the steward loop and cleanup."""
@@ -489,6 +533,12 @@ class TaskSteward:
             self._retry_counts.pop(escalation.id, None)
             self._timeout_counts.pop(escalation.id, None)
             self._empty_output_counts.pop(escalation.id, None)
+            resolution_text = (
+                (updated.resolution if updated else None)
+                or result.output
+                or escalation.summary
+            )
+            self._publish_outcome(StewardResolved(resolution_text=resolution_text))
 
     # ------------------------------------------------------------------
     # Session-aware invocation with cap-hit recovery
