@@ -2495,15 +2495,24 @@ class TestChainInvalidationUnderOverlap:
             f'Expected N+1 to resolve "done" after re-merge/re-verify, got {outcome_b!r}.'
         )
 
-        # ── RED signal 1: the registry must read MERGING while the cascade's
-        # _remerge() call for req_b is in flight (RED reads VERIFYING because
-        # merge_queue.py:9456-9460 omits the _note_transition wiring). N+1
-        # re-merges exactly once (N failed, so main never advanced and the
-        # re-dispatch's Mechanism-2 staleness check finds base_sha==main and
-        # skips a second remerge).
-        assert mid_remerge_state == [ItemLifecycleState.MERGING], (
-            f'expected the registry to read MERGING while the cascade _remerge() '
-            f'ran for req_b, got {mid_remerge_state!r}'
+        # ── RED signal 1: the registry must read MERGING (and never VERIFYING)
+        # while the cascade's _remerge() call for req_b is in flight (RED
+        # reads [VERIFYING] because merge_queue.py:9456-9460 omits the
+        # _note_transition wiring). Asserted on intent rather than exact list
+        # equality/call-count: in this harness N+1 re-merges exactly once (N
+        # failed, so main never advanced and the re-dispatch's Mechanism-2
+        # staleness check finds base_sha==main and skips a second remerge),
+        # but a future change that causes an extra remerge shouldn't fail
+        # this assertion when the lifecycle wiring under test is otherwise
+        # correct — only ever observing VERIFYING (the pre-fix stale read)
+        # is the actual defect signal.
+        assert ItemLifecycleState.MERGING in mid_remerge_state, (
+            f'expected the registry to read MERGING at least once while the '
+            f'cascade _remerge() ran for req_b, got {mid_remerge_state!r}'
+        )
+        assert ItemLifecycleState.VERIFYING not in mid_remerge_state, (
+            f'registry must never read VERIFYING (the pre-fix stale state) '
+            f'while the cascade _remerge() ran for req_b, got {mid_remerge_state!r}'
         )
 
         # ── RED signal 2: both cascade transitions must be observed for req_b.
