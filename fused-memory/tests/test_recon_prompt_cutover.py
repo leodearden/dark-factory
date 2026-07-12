@@ -18,7 +18,10 @@ with the analogous stage2 half.
 from __future__ import annotations
 
 from fused_memory.reconciliation.prompts.stage1 import STAGE1_SYSTEM_PROMPT
+from fused_memory.reconciliation.prompts.stage2 import STAGE2_SYSTEM_PROMPT
 from fused_memory.reconciliation.recon_self_model import (
+    render_cycle_summary_section,
+    render_execution_class_section,
     render_marker_lifecycle_section,
     render_suppression_schema_section,
 )
@@ -58,4 +61,45 @@ class TestStage1PromptCutover:
             '— a hand-transcribed paraphrase of the marker lifecycle / '
             'run_id-fresh-per-cycle mechanics is prompt/code drift by '
             'definition.'
+        )
+
+
+# ---------------------------------------------------------------------------
+# Stage 2: cycle-summary convention + execution-class contract
+# ---------------------------------------------------------------------------
+
+
+class TestStage2PromptCutover:
+    """STAGE2_SYSTEM_PROMPT must interpolate recon_self_model's rendered
+    sections verbatim, not a hand-transcribed paraphrase of them."""
+
+    def test_stage2_prompt_contains_rendered_cycle_summary_section(self):
+        """render_cycle_summary_section()'s output must appear verbatim in
+        STAGE2_SYSTEM_PROMPT. The prompt's own "Re-Verify Reconstruction
+        Writes" section already references "the canonical cycle_summary
+        metadata convention" by name — this containment relation is what
+        makes that reference resolve to real, rendered text instead of a
+        dangling pointer to a hand-transcribed (and driftable) copy
+        elsewhere in the prompt."""
+        assert render_cycle_summary_section() in STAGE2_SYSTEM_PROMPT, (
+            'STAGE2_SYSTEM_PROMPT must interpolate '
+            'render_cycle_summary_section() verbatim (task 2231 W5-xi) — '
+            'a hand-transcribed paraphrase of the cycle_summary metadata '
+            'convention is prompt/code drift by definition.'
+        )
+
+    def test_stage2_prompt_contains_rendered_execution_class_section(self):
+        """render_execution_class_section()'s output must appear verbatim
+        in STAGE2_SYSTEM_PROMPT. execution_class has no prior prompt
+        precedent (task 2225/W5-eta added only the middleware-side
+        declare-or-reject enforcement); this is net-new prompt content
+        threaded into the "## Creating Tasks" submit_task guidance so
+        recon agents are told what they must declare, rather than
+        discovering the requirement only via a rejected submit_task call."""
+        assert render_execution_class_section() in STAGE2_SYSTEM_PROMPT, (
+            'STAGE2_SYSTEM_PROMPT must interpolate '
+            'render_execution_class_section() verbatim (task 2231 W5-xi) '
+            '— the execution_class declaration/rejection contract must be '
+            "stated in the prompt, not only enforced silently at the "
+            'submit_task middleware boundary.'
         )
