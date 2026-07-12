@@ -2559,6 +2559,73 @@ class GitOps:
             )
             return False
 
+    async def _run_thin_warm_lane(self, lane_dir: Path) -> int:
+        """Invoke ``<project_root>/scripts/thin-warm-lane.sh <lane_dir>``.
+
+        Task 2442 (§9.5 η): fail-soft, never-raise wrapper around reify δ's
+        free-first target-reclaim primitive, modeled on
+        :meth:`_run_warm_lane_gc_reclaim`. Invoked WITHOUT ``--reseed`` (D3) —
+        the next :meth:`acquire_warm_lane` always re-seeds ``target/`` from
+        the current base regardless (D10), so leaving ``target/`` empty here
+        does not change net warmth; only the idle-hold between release and a
+        re-acquire that may never come is eliminated.
+
+        **Pool-storage guard (task 2099)**: refuses to spawn the script when
+        a pool is configured (:meth:`pool_in_use`) but
+        :meth:`pool_storage_present` is False — an unmounted mountpoint must
+        never let this script operate against a lane it can only see as
+        missing. Mirrors :meth:`_run_warm_lane_gc_reclaim`'s guard exactly.
+
+        Exit-code taxonomy (per the reify δ contract):
+            0   — thinned (``target/`` removed).
+            1   — guard refusal (logged at WARNING).
+            2   — usage error (logged at WARNING).
+            75  — EX_TEMPFAIL: the lane's own flock is held (already
+                  re-acquired concurrently) — a BENIGN skip, never logged at
+                  WARNING (§9.5 inv.11: release-thin is not an
+                  escalation/fault).
+            127 — script absent, pool storage absent, or unexpected
+                  exception (fail-soft sentinel).
+
+        Never raises.
+        """
+        if self.pool_in_use() and not self.pool_storage_present():
+            logger.warning(
+                '_run_thin_warm_lane: pool storage absent/unmounted at %s — '
+                'refusing to spawn thin-warm-lane.sh for %s',
+                self.worktree_base, lane_dir,
+            )
+            self._note_pool_storage_absent()
+            return 127
+        try:
+            script = self.project_root / 'scripts' / 'thin-warm-lane.sh'
+            if not script.exists():
+                logger.debug(
+                    '_run_thin_warm_lane: script absent at %s — no-op', script,
+                )
+                return 127
+            cmd = [str(script), str(lane_dir)]
+            rc, _, err = await _run(cmd, cwd=self.project_root)
+            if rc == 0:
+                logger.info('_run_thin_warm_lane: thinned %s', lane_dir)
+            elif rc == 75:
+                logger.debug(
+                    '_run_thin_warm_lane: lane %s already re-acquired '
+                    '(rc=75, flock held) — benign skip',
+                    lane_dir,
+                )
+            else:
+                logger.warning(
+                    '_run_thin_warm_lane: script exited %d for %s (stderr=%r)',
+                    rc, lane_dir, err,
+                )
+            return rc
+        except Exception:
+            logger.warning(
+                '_run_thin_warm_lane: unexpected error for %s', lane_dir, exc_info=True,
+            )
+            return 127
+
     async def _warm_lane_disk_admission_blocked(self) -> bool:
         """Run the ε disk-pressure admission check: check → reclaim → recheck.
 
