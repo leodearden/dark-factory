@@ -22,8 +22,8 @@ from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
-
 from escalation.queue import EscalationQueue
+
 from orchestrator.harness import Harness
 from orchestrator.service_restart import StaleServiceRestartCoordinator
 
@@ -830,6 +830,7 @@ class TestOrchestratorRestartExecutorEscalationWiring:
         harness._escalation_queue = EscalationQueue(tmp_path / 'escalations')
 
         coord = harness._build_orchestrator_restart_coordinator()
+        assert coord._restart_executor is not None
 
         spy = AsyncMock()
         with patch('orchestrator.harness.schedule_detached_systemd_restart', spy):
@@ -855,6 +856,7 @@ class TestOrchestratorRestartExecutorEscalationWiring:
         harness._escalation_queue = None
 
         coord = harness._build_orchestrator_restart_coordinator()
+        assert coord._restart_executor is not None
 
         spy = AsyncMock()
         with patch('orchestrator.harness.schedule_detached_systemd_restart', spy):

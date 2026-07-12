@@ -86,13 +86,22 @@ def tmp_queue_dir(tmp_path: Path) -> Path:
     return tmp_path / 'escalations'
 
 
-def read_escalations(queue_dir: str | Path, task_id: str, **kwargs: object) -> list:
-    """Construct ``EscalationQueue(queue_dir)`` and return ``get_by_task(task_id, **kwargs)``.
+def read_escalations(
+    queue_dir: str | Path,
+    task_id: str,
+    *,
+    status: str | None = None,
+    level: int | None = None,
+    agent_role: str | None = None,
+) -> list:
+    """Construct ``EscalationQueue(queue_dir)`` and return ``get_by_task(task_id, ...)``.
 
     Product read path (PRD Sec 7): tests assert filed escalations through
     this helper rather than inspecting on-disk JSON directly.
     """
-    return EscalationQueue(Path(queue_dir)).get_by_task(task_id, **kwargs)
+    return EscalationQueue(Path(queue_dir)).get_by_task(
+        task_id, status=status, level=level, agent_role=agent_role,
+    )
 
 
 # ---------------------------------------------------------------------------

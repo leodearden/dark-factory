@@ -26,7 +26,15 @@ Two instances are used in production:
 
 from __future__ import annotations
 
-import asyncio
+import asyncio  # noqa: F401 — no direct call site in this module (the actual
+
+# asyncio.create_subprocess_exec now lives in proc_supervision.RestartPlan.execute()),
+# but this binding is load-bearing: tests patch it via the
+# 'orchestrator.service_restart.asyncio.create_subprocess_exec' dotted path,
+# which requires the 'asyncio' module object to be reachable as an attribute
+# of this module (patching an attribute on that shared module object patches
+# it for every importer, including proc_supervision). Removing this import
+# breaks that patch path with AttributeError — see test_fleet_staleness_composition.py.
 import json
 import logging
 import time
