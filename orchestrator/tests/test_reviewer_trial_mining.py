@@ -9,6 +9,10 @@ from __future__ import annotations
 
 from collections import Counter
 from pathlib import Path
+from unittest.mock import AsyncMock, patch
+
+import pytest
+from shared.cli_invoke import AgentResult
 
 from _reviewer_trial_mining_fixtures import (
     build_synthetic_runs_db,
@@ -16,12 +20,14 @@ from _reviewer_trial_mining_fixtures import (
     write_sample_escalations,
 )
 
+from orchestrator.evals.reviewer_trial.corpus import GroundTruthIssue
 from orchestrator.evals.reviewer_trial.mining import (
     EscalationRef,
     FnCandidate,
     assign_split,
     mine_escalation_refs,
     mine_fn_candidates,
+    propose_labels_frontier,
     recover_diff,
 )
 
@@ -228,3 +234,109 @@ class TestAssignSplit:
         assert abs(counts['train'] / n - 0.2) < 0.05
         assert abs(counts['selection'] / n - 0.1) < 0.05
         assert abs(counts['test'] / n - 0.7) < 0.05
+
+
+def _make_frontier_result(
+    cost_usd: float = 0.15,
+    structured: dict | None = None,
+    output: str = '',
+) -> AgentResult:
+    """Build a real AgentResult for invoke_agent in propose_labels_frontier.
+
+    Mirrors _make_matcher_result in test_reviewer_trial_scorer.py — uses the
+    actual AgentResult dataclass so field-shape drift is caught at test time.
+    """
+    return AgentResult(
+        success=True,
+        output=output,
+        cost_usd=cost_usd,
+        structured_output=structured,
+    )
+
+
+class TestProposeLabelsFrontier:
+    """propose_labels_frontier maps a frontier model's structured output into
+    GroundTruthIssue objects tagged with adjudication provenance (an id
+    namespaced 'frontier_*' rather than a hand-authored corpus id), and never
+    raises on unparseable output."""
+
+    @pytest.mark.asyncio
+    async def test_maps_structured_output_to_ground_truth_issues(self) -> None:
+        fake_result = _make_frontier_result(
+            cost_usd=0.15,
+            structured={
+                'issues': [
+                    {
+                        'location': 'src/foo.py:10',
+                        'category': 'off_by_one',
+                        'severity': 'blocking',
+                        'description': 'Loop bound is off by one.',
+                        'mutation_type': 'logic',
+                    },
+                ],
+            },
+        )
+
+        with patch('orchestrator.evals.reviewer_trial.mining.invoke_agent', new_callable=AsyncMock) as mock_invoke:
+            mock_invoke.return_value = fake_result
+            issues, cost = await propose_labels_frontier(
+                'diff text', model='opus', description='a mined diff',
+            )
+
+        assert cost == pytest.approx(0.15)
+        assert len(issues) == 1
+        issue = issues[0]
+        assert isinstance(issue, GroundTruthIssue)
+        assert issue.location == 'src/foo.py:10'
+        assert issue.category == 'off_by_one'
+        assert issue.severity == 'blocking'
+        assert issue.description == 'Loop bound is off by one.'
+        assert issue.mutation_type == 'logic'
+        # id is synthesized (never hallucinated by the model) and tagged so
+        # a frontier-proposed label is distinguishable from a hand-authored one.
+        assert issue.id.startswith('frontier_')
+
+    @pytest.mark.asyncio
+    async def test_maps_multiple_issues_with_distinct_ids(self) -> None:
+        fake_result = _make_frontier_result(structured={
+            'issues': [
+                {
+                    'location': 'a.py:1', 'category': 'bug', 'severity': 'blocking',
+                    'description': 'First.', 'mutation_type': 'logic',
+                },
+                {
+                    'location': 'b.py:2', 'category': 'style', 'severity': 'suggestion',
+                    'description': 'Second.', 'mutation_type': 'style',
+                },
+            ],
+        })
+
+        with patch('orchestrator.evals.reviewer_trial.mining.invoke_agent', new_callable=AsyncMock) as mock_invoke:
+            mock_invoke.return_value = fake_result
+            issues, _cost = await propose_labels_frontier('diff text', model='opus', description='d')
+
+        assert len(issues) == 2
+        assert len({i.id for i in issues}) == 2  # ids are distinct
+
+    @pytest.mark.asyncio
+    async def test_returns_empty_list_on_unparseable_output_without_raising(self) -> None:
+        fake_result = _make_frontier_result(cost_usd=0.05, structured=None, output='not json at all')
+
+        with patch('orchestrator.evals.reviewer_trial.mining.invoke_agent', new_callable=AsyncMock) as mock_invoke:
+            mock_invoke.return_value = fake_result
+            issues, cost = await propose_labels_frontier('diff text', model='opus', description='d')
+
+        assert issues == []
+        # Cost is still reported — the tokens were billed regardless (mirrors
+        # match_issues' unparseable-output-still-reports-cost behaviour).
+        assert cost == pytest.approx(0.05)
+
+    @pytest.mark.asyncio
+    async def test_returns_empty_list_when_issues_key_missing(self) -> None:
+        fake_result = _make_frontier_result(structured={'not_issues': []})
+
+        with patch('orchestrator.evals.reviewer_trial.mining.invoke_agent', new_callable=AsyncMock) as mock_invoke:
+            mock_invoke.return_value = fake_result
+            issues, _cost = await propose_labels_frontier('diff text', model='opus', description='d')
+
+        assert issues == []
