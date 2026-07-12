@@ -7,6 +7,7 @@ data/escalations/.
 
 from __future__ import annotations
 
+import subprocess
 from collections import Counter
 from pathlib import Path
 from unittest.mock import AsyncMock, patch
@@ -31,6 +32,7 @@ from orchestrator.evals.reviewer_trial.mining import (
     mine_fn_candidates,
     propose_labels_frontier,
     recover_diff,
+    resolve_merge_sha_by_task_id,
 )
 
 
@@ -225,6 +227,37 @@ class TestRecoverDiff:
         diff_text = recover_diff('0' * 40, repo)
 
         assert diff_text is None
+
+
+class TestResolveMergeShaByTaskId:
+    """Fallback recovery: greps git log for the 'Merge task/<id> into ...'
+    commit-message convention when a candidate has no merge_finalized event."""
+
+    def test_resolves_sha_from_merge_commit_message_convention(self, tmp_path: Path) -> None:
+        repo, _fixture_merge_sha = make_git_repo_with_merge(tmp_path)
+        subprocess.run(
+            ['git', 'commit', '--allow-empty', '-q', '-m', 'Merge task/9999 into main'],
+            cwd=repo, check=True,
+        )
+        expected_sha = subprocess.run(
+            ['git', 'rev-parse', 'HEAD'], cwd=repo, capture_output=True, text=True, check=True,
+        ).stdout.strip()
+
+        sha = resolve_merge_sha_by_task_id('9999', repo)
+
+        assert sha == expected_sha
+
+    def test_returns_none_when_no_matching_commit(self, tmp_path: Path) -> None:
+        repo, _merge_sha = make_git_repo_with_merge(tmp_path)
+
+        sha = resolve_merge_sha_by_task_id('no-such-task', repo)
+
+        assert sha is None
+
+    def test_returns_none_for_nonexistent_repo(self, tmp_path: Path) -> None:
+        sha = resolve_merge_sha_by_task_id('1234', tmp_path / 'does-not-exist')
+
+        assert sha is None
 
 
 class TestAssignSplit:

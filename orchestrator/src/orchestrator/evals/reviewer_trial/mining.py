@@ -215,6 +215,30 @@ def recover_diff(merge_sha: str, repo_path: Path) -> str | None:
     return fallback.stdout
 
 
+def resolve_merge_sha_by_task_id(task_id: str, repo_path: Path) -> str | None:
+    """Fallback merge-sha lookup for FN candidates with no ``merge_finalized`` event.
+
+    Older/legacy task rows (or logging gaps) can lack the ``merge_finalized``
+    event ``mine_fn_candidates`` normally reads ``merge_sha`` from. This repo's
+    merge commits follow a fixed message convention, ``"Merge task/<id> into
+    <branch>"`` (see e.g. ``git log --oneline``), so greps ``git log --all``
+    for it as a second recovery path. Returns the most recent matching
+    commit's sha, or ``None`` (never raises) when no such commit exists, the
+    repo path is invalid, or git errors.
+    """
+    try:
+        result = subprocess.run(
+            ['git', 'log', '--all', '--format=%H', '--grep', f'^Merge task/{task_id} ', '-E', '-n', '1'],
+            cwd=repo_path, capture_output=True, text=True,
+        )
+    except OSError:
+        return None
+    if result.returncode != 0:
+        return None
+    sha = result.stdout.strip()
+    return sha or None
+
+
 _SPLIT_NAMES = ('train', 'selection', 'test')
 
 
@@ -291,6 +315,7 @@ async def propose_labels_frontier(
     diff_text: str,
     model: str = 'opus',
     description: str = '',
+    oauth_token: str | None = None,
 ) -> tuple[list[GroundTruthIssue], float]:
     """Propose ground-truth issue labels for a mined diff via a frontier model.
 
@@ -311,6 +336,13 @@ async def propose_labels_frontier(
     when the output is unparseable or carries no usable ``issues`` list —
     the incurred cost is still reported since the tokens were billed
     regardless (mirrors ``match_issues``' unparseable-output behaviour).
+
+    *oauth_token*, when set, is forwarded to ``invoke_agent`` to select a
+    specific Claude account from the multi-account pool (env vars
+    ``CLAUDE_OAUTH_TOKEN_A``..``_G``) rather than relying on ambient
+    ``CLAUDE_CONFIG_DIR`` credentials — needed when this is invoked from a
+    task-scoped sandbox that has no logged-in Claude CLI of its own (see the
+    ``mine`` CLI command in ``__main__.py``, which sources it from the pool).
     """
     diff_context = diff_text[:10_000] if len(diff_text) > 10_000 else diff_text
 
@@ -361,6 +393,7 @@ If there are no issues, return an empty issues list. Output your findings as JSO
         output_schema=_FRONTIER_LABEL_SCHEMA,
         effort='high',
         allowed_tools=[],  # no tools needed — all context is in the prompt
+        oauth_token=oauth_token,
     )
 
     cost = result.cost_usd
