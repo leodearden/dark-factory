@@ -1,8 +1,10 @@
 """Tests for git operations — worktree lifecycle."""
 
 import asyncio
+import fcntl
 import json
 import logging
+import os
 import subprocess
 from pathlib import Path
 from unittest.mock import patch
@@ -9297,4 +9299,120 @@ class TestRunThinWarmLane:
         assert rc == 127
         assert _read_thin_warm_lane_call_log(git_repo) == [], (
             'script must not be spawned when pool storage is absent/unmounted'
+        )
+
+
+# ---------------------------------------------------------------------------
+# Task 2442 amend — real flock contention for _run_thin_warm_lane's rc=75 path
+# (review: git_ops.py:2323 — the rc=75 benign-skip path was previously only
+# exercised via a forced stub exit code, never an actual flock conflict on
+# <lane_dir>.lock, the mechanism a concurrent re-acquire actually relies on)
+# ---------------------------------------------------------------------------
+
+
+def _write_thin_warm_lane_flock_stub(scripts_dir: Path) -> None:
+    """Write a thin-warm-lane.sh stub that mirrors the REAL T3 flock gate.
+
+    Unlike ``_write_thin_warm_lane_stub`` above (a configurable-exit stub
+    used to unit-test each branch of ``_run_thin_warm_lane`` in isolation
+    without caring *why* a given rc was produced), this stub reproduces the
+    shape of reify's actual ``scripts/thin-warm-lane.sh`` T3 block: it opens
+    ``<lane_dir>.lock`` (a sibling lock file, trailing slash stripped —
+    same convention as the real script) and acquires it via non-blocking
+    ``flock -n``, exiting 75 if — and only if — it genuinely cannot.
+    Otherwise it exits 0. This lets a test hold a real OS-level flock on
+    that same lock file from the test process and observe
+    ``_run_thin_warm_lane`` correctly propagate the rc=75 that real
+    contention produces, rather than one a stub was merely told to return.
+    """
+    script = scripts_dir / 'thin-warm-lane.sh'
+    script.write_text(
+        '#!/usr/bin/env bash\n'
+        'set -euo pipefail\n'
+        'DIR="$(cd "$(dirname "$0")" && pwd)"\n'
+        'ROOT="$(dirname "$DIR")"\n'
+        'LANE_DIR="${1%/}"\n'
+        'echo "$*" >> "$ROOT/.test_thin_warm_lane_call_log"\n'
+        'LANE_LOCK="${LANE_DIR}.lock"\n'
+        'exec 9>"$LANE_LOCK"\n'
+        'if ! flock -n 9; then\n'
+        '    exec 9>&-\n'
+        '    exit 75\n'
+        'fi\n'
+        'exit 0\n'
+    )
+    script.chmod(0o755)
+
+
+@pytest.mark.asyncio
+class TestRunThinWarmLaneFlockContention:
+    """rc=75 exercised against a REAL held flock, not a scripted exit code.
+
+    Amendment requested by the task 2442 code review (git_ops.py:2323):
+    ``TestRunThinWarmLane.test_exit_75_returns_75_and_no_warning`` only
+    proves ``_run_thin_warm_lane`` *interprets* rc=75 correctly once told to
+    return it — it says nothing about whether genuine contention on
+    ``<lane_dir>.lock`` (the T3 mechanism a concurrent re-acquire actually
+    relies on — see the "Flock contract" note on ``_run_thin_warm_lane``'s
+    docstring and reify PRD §9.3 invariant T3 / §9.5 inv.10) is observed
+    correctly end-to-end. These tests hold a genuine OS-level flock from the
+    test process itself, against a stub that performs the real ``flock -n``
+    gate, to close that gap.
+    """
+
+    async def test_contended_lock_yields_75_and_no_warning(
+        self, git_ops: GitOps, git_repo: Path, caplog,
+    ):
+        """Test process holds the lane's flock → the stub genuinely fails
+        to acquire it and exits 75 → wrapper propagates 75 and never WARNs
+        (inv.11: a benign re-acquire race is not a fault)."""
+        scripts_dir = git_repo / 'scripts'
+        scripts_dir.mkdir(parents=True, exist_ok=True)
+        _write_thin_warm_lane_flock_stub(scripts_dir)
+        lane = git_repo / '_lane-0'
+        lane.mkdir()
+        lock_path = Path(f'{lane}.lock')
+        lock_fd = os.open(str(lock_path), os.O_RDWR | os.O_CREAT, 0o644)
+        try:
+            fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+
+            with caplog.at_level(logging.WARNING, logger='orchestrator.git_ops'):
+                rc = await git_ops._run_thin_warm_lane(lane)
+
+            assert rc == 75, (
+                'a genuinely held flock on <lane_dir>.lock must surface as '
+                'rc=75, exactly like a concurrent re-acquire racing this '
+                'release would produce'
+            )
+            assert _read_thin_warm_lane_call_log(git_repo) == [str(lane)], (
+                'the script must actually have been spawned and attempted '
+                'the flock — this is real contention, not a skipped call'
+            )
+            warnings = [r for r in caplog.records if r.levelno >= logging.WARNING]
+            assert not warnings, (
+                f'rc=75 from real contention must never WARN (inv.11); got '
+                f'{[r.getMessage() for r in warnings]}'
+            )
+        finally:
+            fcntl.flock(lock_fd, fcntl.LOCK_UN)
+            os.close(lock_fd)
+
+    async def test_uncontended_lock_yields_0(
+        self, git_ops: GitOps, git_repo: Path,
+    ):
+        """Control for the above: with nobody holding the lock, the SAME
+        flock-real stub acquires it and exits 0 — proving the stub
+        genuinely discriminates on contention rather than being hardcoded
+        to 75, so the rc=75 assertion above is meaningful."""
+        scripts_dir = git_repo / 'scripts'
+        scripts_dir.mkdir(parents=True, exist_ok=True)
+        _write_thin_warm_lane_flock_stub(scripts_dir)
+        lane = git_repo / '_lane-1'
+        lane.mkdir()
+
+        rc = await git_ops._run_thin_warm_lane(lane)
+
+        assert rc == 0, (
+            'with no concurrent holder, the flock-real stub must acquire '
+            'the lock and exit 0 (thinned)'
         )

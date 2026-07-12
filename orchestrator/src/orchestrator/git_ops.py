@@ -2576,6 +2576,20 @@ class GitOps:
         never let this script operate against a lane it can only see as
         missing. Mirrors :meth:`_run_warm_lane_gc_reclaim`'s guard exactly.
 
+        **Flock contract (pinned — this wrapper holds no lock of its own)**:
+        safety against a concurrent re-acquire racing this call rests
+        entirely on the script side. reify's ``scripts/thin-warm-lane.sh``
+        acquires ``<lane_dir>.lock`` (a sibling lock file, non-blocking
+        ``flock -n``) BEFORE touching ``target/`` and exits 75 if it cannot
+        — see that script's "T3" block and PRD
+        ``docs/prds/warm-lane-pool-sizing-lifecycle.md`` §9.3 invariant T3 /
+        §9.5 inv.10 (reify repo). This wrapper only spawns the script and
+        interprets its exit code; if the script's flock behavior ever
+        regresses, this wrapper provides no independent defense. See
+        ``TestRunThinWarmLaneFlockContention`` in ``test_git_ops.py`` for a
+        unit test that exercises this against a real held flock (not just a
+        scripted exit code).
+
         Exit-code taxonomy (per the reify δ contract):
             0   — thinned (``target/`` removed).
             1   — guard refusal (logged at WARNING).
