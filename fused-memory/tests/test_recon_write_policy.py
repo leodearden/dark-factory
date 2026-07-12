@@ -178,6 +178,18 @@ class TestCheckGate1Terminal:
         assert gate3_verdict.error_type == 'ReconStaleSnapshotRejected'
         assert gate3_verdict.corrective_path == ''
 
+    def test_terminal_hint_routes_to_set_task_status_done_provenance_repair(self):
+        """The Gate 1 hint must route metadata/done_provenance corrections
+        to the sanctioned same-status set_task_status(..., 'done',
+        done_provenance=...) repair seam, and must not describe a metadata
+        correction as needing a reopen_reason (destructive, wrong seam).
+        Asserted on semantic substrings only, to avoid a brittle wording
+        pin."""
+        hint = _check('update_task', live_status='done').hint
+        assert 'set_task_status' in hint
+        assert 'done_provenance' in hint
+        assert 'reopen_reason' not in hint
+
 
 # ---------------------------------------------------------------------------
 # check() gate 2 — live workflow (set_task_status only)
