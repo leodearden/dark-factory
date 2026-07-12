@@ -257,6 +257,14 @@ class TestTmuxBackendReorder:
         select-window per session, each using that session's own @id -- not
         just a single session's worth of restore logic (every other
         reorder() test here drives one session, 's').
+
+        Also locks down each target's *destination* index: it is computed
+        WITHIN ITS OWN SESSION (a per-session compacted position), not as a
+        global position across every target in the call. s2's sole target
+        here must land at s2:0 (its own session's index 0) -- a
+        global-position bug would instead send it to s2:1, since it's the
+        second target overall, leaving a gap and contradicting reorder()'s
+        own docstring ("within its own session").
         """
         from cockpit.backends.base import CommandResult, DisplayTarget
         from cockpit.backends.tmux import TmuxBackend
@@ -272,21 +280,29 @@ class TestTmuxBackendReorder:
             }
         )
         backend = TmuxBackend(run=runner)
+        # Neither target sits at index 0 -- each is the SOLE target in its own
+        # session, so each belongs at that session's own compacted index 0
+        # (not the global positions 0/1 a cross-session bug would produce).
         targets = [
-            DisplayTarget(kind='tmux', tmux_target='s1:0'),
-            DisplayTarget(kind='tmux', tmux_target='s2:0'),
+            DisplayTarget(kind='tmux', tmux_target='s1:5'),
+            DisplayTarget(kind='tmux', tmux_target='s2:7'),
         ]
 
         backend.reorder(targets)
 
-        assert not any(argv[1] == 'switch-client' for argv in runner.calls)
-        select_calls = [argv for argv in runner.calls if argv[1] == 'select-window']
-        assert select_calls == [
+        assert runner.calls == [
+            ['tmux', 'display-message', '-p', '-t', 's1', '#{window_id}'],
+            ['tmux', 'display-message', '-p', '-t', 's2', '#{window_id}'],
+            ['tmux', 'move-window', '-d', '-s', 's1:5', '-t', 's1:9000'],
+            ['tmux', 'move-window', '-d', '-s', 's2:7', '-t', 's2:9001'],
+            ['tmux', 'move-window', '-d', '-s', 's1:9000', '-t', 's1:0'],
+            # s2's target lands at s2:0 -- its OWN session's compacted index --
+            # not s2:1, which is what a global (cross-session) position would
+            # have produced for the second target overall.
+            ['tmux', 'move-window', '-d', '-s', 's2:9001', '-t', 's2:0'],
             ['tmux', 'select-window', '-t', '@11'],
             ['tmux', 'select-window', '-t', '@22'],
         ]
-        # ...and both restores happen last, after every move for both sessions.
-        assert runner.calls[-2:] == select_calls
 
     def test_reorder_skips_restore_for_session_when_display_message_fails(self, caplog):
         """If a session's pre-reorder active-window snapshot can't be read
@@ -357,7 +373,13 @@ class TestTmuxBackendReorder:
 
         runner = ScriptedRunner()
         backend = TmuxBackend(run=runner)
-        targets = [DisplayTarget(kind='tmux'), DisplayTarget(kind='tmux', tmux_target='s:0')]
+        # 's:5', not 's:0' -- a target with no tmux_target contributes no
+        # session/position (it has no session to belong to), so the
+        # remaining valid target is alone in session 's' and belongs at
+        # THAT session's own index 0 regardless of the skipped target;
+        # starting it at 's:0' already would trigger the no-op short-circuit
+        # and this test would exercise no move at all.
+        targets = [DisplayTarget(kind='tmux'), DisplayTarget(kind='tmux', tmux_target='s:5')]
 
         with caplog.at_level(logging.WARNING):
             backend.reorder(targets)
@@ -365,8 +387,8 @@ class TestTmuxBackendReorder:
         assert any(r.levelno == logging.WARNING for r in caplog.records)
         assert runner.calls == [
             ['tmux', 'display-message', '-p', '-t', 's', '#{window_id}'],
-            ['tmux', 'move-window', '-d', '-s', 's:0', '-t', 's:9000'],
-            ['tmux', 'move-window', '-d', '-s', 's:9000', '-t', 's:1'],
+            ['tmux', 'move-window', '-d', '-s', 's:5', '-t', 's:9000'],
+            ['tmux', 'move-window', '-d', '-s', 's:9000', '-t', 's:0'],
         ]
 
 

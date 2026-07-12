@@ -100,13 +100,24 @@ class TmuxBackend:
         issuing any command. A single target out of place still runs the
         full path below.
         """
-        # (index, tmux_target) — captured as a plain str (not target.tmux_target,
-        # which stays str | None) so the loop below is narrowing-clean for pyright.
+        # (index, tmux_target) — index is each target's priority-order position
+        # WITHIN ITS OWN SESSION (a running per-session counter), matching the
+        # "within its own session" contract above — NOT its global position
+        # across every target in this call, which would misplace a session's
+        # sole target at a gap-leaving cross-session index (e.g. two targets
+        # [s1:_, s2:_] would wrongly send s2's target to index 1 instead of
+        # its own session's index 0). tmux_target is captured as a plain str
+        # (not target.tmux_target, which stays str | None) so the loop below
+        # is narrowing-clean for pyright.
         valid: list[tuple[int, str]] = []
-        for index, target in enumerate(targets):
+        session_positions: dict[str, int] = {}
+        for target in targets:
             if not target.tmux_target:
                 logger.warning('TmuxBackend.reorder: target has no tmux_target: %r', target)
                 continue
+            session = target.tmux_target.split(':', 1)[0]
+            index = session_positions.get(session, 0)
+            session_positions[session] = index + 1
             valid.append((index, target.tmux_target))
 
         if valid and all(_current_index(tmux_target) == index for index, tmux_target in valid):
