@@ -9,9 +9,14 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from _reviewer_trial_mining_fixtures import build_synthetic_runs_db
+from _reviewer_trial_mining_fixtures import build_synthetic_runs_db, write_sample_escalations
 
-from orchestrator.evals.reviewer_trial.mining import FnCandidate, mine_fn_candidates
+from orchestrator.evals.reviewer_trial.mining import (
+    EscalationRef,
+    FnCandidate,
+    mine_escalation_refs,
+    mine_fn_candidates,
+)
 
 
 class TestMineFnCandidates:
@@ -117,3 +122,49 @@ class TestMineFnCandidates:
         candidates = mine_fn_candidates(db_path)
         ids = {c.task_id for c in candidates}
         assert ids == {'fn1', 'fn2'}
+
+
+class TestMineEscalationRefs:
+    """mine_escalation_refs parses esc-<id>.json records, skipping noise files
+    and tolerating malformed JSON, keyed by task_id for cross-referencing."""
+
+    def test_parses_valid_escalation_records(self, tmp_path: Path) -> None:
+        esc_dir = tmp_path / 'escalations'
+        write_sample_escalations(esc_dir)
+
+        refs = mine_escalation_refs(esc_dir)
+
+        assert '101' in refs
+        assert '202' in refs
+        ref = refs['101'][0]
+        assert isinstance(ref, EscalationRef)
+        assert ref.task_id == '101'
+        assert ref.category == 'review_suggestions'
+        assert ref.severity == 'blocking'
+        assert ref.summary == 'Sample escalation summary 1'
+        assert ref.level == 0
+        assert ref.path.name == 'esc-101-1.json'
+
+    def test_skips_lock_and_state_files(self, tmp_path: Path) -> None:
+        esc_dir = tmp_path / 'escalations'
+        write_sample_escalations(esc_dir)
+
+        refs = mine_escalation_refs(esc_dir)
+
+        all_paths = [r.path.name for group in refs.values() for r in group]
+        assert not any(p.endswith('.lock') for p in all_paths)
+        assert 'b3-state.json' not in all_paths
+
+    def test_tolerates_malformed_json_without_raising(self, tmp_path: Path) -> None:
+        esc_dir = tmp_path / 'escalations'
+        write_sample_escalations(esc_dir)  # includes esc-303-1.json = malformed
+
+        refs = mine_escalation_refs(esc_dir)  # must not raise
+
+        all_paths = [r.path.name for group in refs.values() for r in group]
+        assert 'esc-303-1.json' not in all_paths
+
+    def test_empty_dir_returns_empty_dict(self, tmp_path: Path) -> None:
+        esc_dir = tmp_path / 'empty_escalations'
+        esc_dir.mkdir()
+        assert mine_escalation_refs(esc_dir) == {}
