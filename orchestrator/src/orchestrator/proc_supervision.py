@@ -40,6 +40,8 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import shlex
+import sys
 from dataclasses import dataclass
 from enum import StrEnum
 from pathlib import Path
@@ -81,9 +83,20 @@ class EscalationSpec:
     def to_submit_argv(self, python_exe: str) -> list[str]:
         """Build the ``python -m escalation submit ...`` argv (RP-4 shell branch).
 
-        Not yet implemented — driven by step-4's RED test (R1 self-restart cell).
+        Mirrors ``DeterministicRunner._default_schedule_detached_restart``'s
+        ``escalation_cmd`` list (deterministic_runner.py:414-427) exactly, so
+        the two restart mechanisms produce byte-identical submit invocations.
         """
-        raise NotImplementedError
+        return [
+            python_exe, '-m', 'escalation', 'submit',
+            '--queue-dir', self.queue_dir,
+            '--task', self.task_id,
+            '--severity', self.severity,
+            '--category', self.category,
+            '--summary', self.summary[:200],
+            '--agent-role', self.agent_role,
+            '--detail', self.detail,
+        ]
 
 
 @dataclass(frozen=True)
@@ -161,11 +174,96 @@ class RestartPlan:
         defaults to :func:`orchestrator.systemd_inspect.inspect_systemd_unit`.
         Both are injectable seams for tests.
 
-        Not yet implemented — the decision tree is driven incrementally by
-        steps 3/4 (R1 self-restart), 5/6 (R2 cwd), 7/8 (R3 fail-closed), 9/10
-        (R4 cross-unit verify-pass), 11/12 (R5 verify-fail), 13/14 (RP-4
-        exactness + registration failure), and 15/16 (leaf plain-spawn).
+        Decision tree (own=own_unit or ''; wants_blocking=verify is not None;
+        self_target=bool(own) and target_unit==own):
+
+        1. wants_blocking and not own -> RP-1 fail-closed REFUSE (step-7/8; not
+           yet implemented here).
+        2. wants_blocking and not self_target -> RP-2 cross-unit BLOCKING +
+           RP-5 verify (step-9/10/11/12; not yet implemented here).
+        3. transient_unit set -> DETACHED systemd-run (RP-3/RP-4; implemented
+           below, step-4).
+        4. else -> DETACHED leaf plain-spawn (step-15/16; not yet implemented
+           here).
         """
         runner = runner or asyncio.create_subprocess_exec
         inspector = inspector or inspect_systemd_unit
+
+        own = self.own_unit or ''
+        wants_blocking = self.verify is not None
+        self_target = bool(own) and self.target_unit == own
+
+        if wants_blocking and not own:
+            # RP-1 fail-closed refuse — implemented in step-8.
+            raise NotImplementedError
+
+        if wants_blocking and not self_target:
+            # RP-2 cross-unit blocking + RP-5 verify — implemented in step-10/12.
+            raise NotImplementedError
+
+        if self.transient_unit:
+            return await self._execute_detached_systemd_run(runner)
+
+        # Leaf plain-spawn path — implemented in step-16.
         raise NotImplementedError
+
+    async def _execute_detached_systemd_run(self, runner) -> RestartOutcome:
+        """RP-3/RP-4: register a deferred ``systemd-run --user`` transient unit.
+
+        Registers immediately and returns; the payload (script + args) fires
+        LATER under the user systemd manager, so this never blocks or risks
+        killing the caller — used both for a same-unit self-restart and for
+        any other detached fire-and-forget-with-verification need.
+
+        ``--working-directory=<cwd>`` (RP-3) guards against the ``systemd
+        --user`` manager's $HOME-default cwd (the 2105 exit-127 bug) — the
+        transient unit's payload always resolves relative to an explicit,
+        absolute cwd instead. The ``/bin/sh -c`` wrapper's on-failure branch
+        (RP-4) files a born-at-L2 escalation via
+        ``EscalationSpec.to_submit_argv`` ONLY when the deferred payload
+        itself exits non-zero at fire time — never at registration time, so a
+        successful self-deploy never spuriously escalates. When
+        ``on_failure_escalation`` is None the payload is left unbranched (no
+        wrapper) — still a valid ``/bin/sh -c`` invocation, just with no
+        on-failure reporting.
+        """
+        on_active_secs = max(int(self.on_active_secs), 5)
+        payload = ' '.join(shlex.quote(p) for p in [str(self.script), *self.args])
+        if self.on_failure_escalation is not None:
+            on_failure_argv = self.on_failure_escalation.to_submit_argv(sys.executable)
+            on_failure = ' '.join(shlex.quote(p) for p in on_failure_argv)
+            wrapped = (
+                f'{payload}; __rc=$?; '
+                f'if [ "$__rc" -ne 0 ]; then {on_failure}; fi; '
+                f'exit "$__rc"'
+            )
+        else:
+            wrapped = payload
+
+        argv = [
+            'systemd-run', '--user',
+            f'--on-active={on_active_secs}',
+            f'--unit={self.transient_unit}',
+            '--collect',
+            f'--working-directory={self.cwd}',
+            '/bin/sh', '-c', wrapped,
+        ]
+        proc = await runner(
+            *argv,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.STDOUT,
+        )
+        stdout, _ = await proc.communicate()
+        rc = proc.returncode or 0
+        tail = (stdout or b'').decode(errors='replace')[-2000:]
+        if rc != 0:
+            logger.warning(
+                'proc_supervision: failed to register restart transient unit %s (rc=%d)',
+                self.transient_unit, rc,
+            )
+            return RestartOutcome(
+                disposition=RestartDisposition.REGISTRATION_FAILED,
+                escalated=False,
+                detail=f'systemd-run registration of {self.transient_unit} failed (rc={rc}): {tail}',
+            )
+        return RestartOutcome(disposition=RestartDisposition.SCHEDULED)
