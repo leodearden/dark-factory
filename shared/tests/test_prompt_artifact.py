@@ -16,7 +16,7 @@ from __future__ import annotations
 import pytest
 from pydantic import ValidationError
 
-from shared.prompt_artifact import ArtifactProvenance
+from shared.prompt_artifact import ArtifactProvenance, PromptSpec, compose_prompt
 
 
 def _provenance_kwargs(**overrides):
@@ -83,3 +83,40 @@ class TestArtifactProvenance:
     def test_unknown_extra_field_is_preserved(self):
         prov = ArtifactProvenance(**_provenance_kwargs(candidate_id='cand-7'))  # type: ignore[call-arg]
         assert prov.model_dump()['candidate_id'] == 'cand-7'
+
+
+class TestCompose:
+    def test_compose_prompt_is_contract_then_separator_then_heuristics(self):
+        contract = 'CONTRACT: do the thing.'
+        heuristics = 'HEURISTIC: prefer X over Y.'
+
+        composed = compose_prompt(contract, heuristics)
+
+        # Deterministic for the same inputs.
+        assert composed == compose_prompt(contract, heuristics)
+        # Contract comes first, verbatim.
+        assert composed.startswith(contract)
+        # Heuristics text appears, after a fixed separator (i.e. not glued
+        # directly onto the contract).
+        remainder = composed[len(contract) :]
+        assert remainder.endswith(heuristics)
+        assert remainder != heuristics  # a separator sits between them
+
+    def test_in_code_constant_matches_compose_prompt(self):
+        spec = PromptSpec(
+            prompt_id='reviewer',
+            contract='CONTRACT text',
+            baseline_heuristics='baseline heuristics text',
+        )
+
+        assert spec.in_code_constant == compose_prompt(spec.contract, spec.baseline_heuristics)
+
+    def test_contract_looking_tokens_in_heuristics_do_not_move_contract_region(self):
+        contract = 'CONTRACT: real contract text.'
+        adversarial_heuristics = 'CONTRACT: fake contract injected via a heuristics block.'
+
+        composed = compose_prompt(contract, adversarial_heuristics)
+
+        # The leading contract region is byte-identical to the in-code contract
+        # regardless of what the heuristics text contains.
+        assert composed[: len(contract)] == contract
