@@ -159,6 +159,27 @@ async def _read_compact_vector(
     earlier existence check and this read, or an unexpected reply shape)
     raises the same kind of descriptive ``ValueError`` rather than a bare
     ``IndexError``.
+
+    CAVEAT (reviewer follow-up, task 2451 amendment): the ``scalar_type ==
+    _VALUE_NULL`` (1) tag match immediately below is exercised only by a
+    hand-built mock reply (``TestReadCompactVectorTransport::
+    test_null_absent_embedding_returns_none_sentinel``'s
+    ``_compact_reply([_VALUE_NULL_TAG, None])``). The live incident that
+    motivated this fix (edge f0fc1aba in reify, 2026-07-11) confirms that
+    null/absent embeddings EXIST at ~10% prevalence in production -- it
+    does not, by itself, confirm this exact compact-reply cell shape for a
+    null property against a real FalkorDB. If the live shape ever differs
+    (a different tag or a wrapped cell), this function falls through to the
+    ValueError branch below instead -- safe (matches the pre-fix behaviour,
+    no data corruption) but silently non-fixing for the ~10% scenario this
+    task targets, with every unit test still green. The η live
+    throwaway-graph rehearsal (``plans/cross-graph-entity-leak-prd.md``
+    decision 5) MUST be extended with a probe case -- seed a
+    ``_probe``-prefixed edge with a persisted-null ``fact_embedding`` and
+    assert this function returns ``None`` against that real row -- before
+    this null-tolerance path is trusted at full-census scale. That PRD/
+    runbook update is outside ``fused_memory/maintenance``'s locked scope
+    for this amendment pass and is tracked as follow-up, not done here.
     """
     reply = await falkor_client.execute_command('GRAPH.RO_QUERY', group_id, cypher, '--compact')
     rows = reply[1]
@@ -172,6 +193,9 @@ async def _read_compact_vector(
     cell = rows[0][0]
     scalar_type, value = int(cell[0]), cell[1]
     if scalar_type == _VALUE_NULL:
+        # Mock-verified only -- see this function's "CAVEAT" docstring
+        # paragraph for why the η live rehearsal must confirm this tag
+        # against a real FalkorDB null property before full-census trust.
         return None
     if scalar_type != _VALUE_VECTORF32:
         raise ValueError(
