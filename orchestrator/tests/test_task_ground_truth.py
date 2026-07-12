@@ -590,3 +590,78 @@ class TestDeriveTruthRemainingFields:
         await resolver.derive_truth('24')
 
         scheduler.get_task.assert_awaited_once_with('24')
+
+
+# ---------------------------------------------------------------------------
+# step-13 — recovery_for(tid): the derive_truth -> classify_recovery seam
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestRecoveryFor:
+    """``recovery_for(tid)`` composes ``derive_truth`` -> ``classify_recovery``
+    — the thin seam θ2's seven sweeps will call. Boundary scenarios from the
+    PRD's boundary-test sketch (G1/G2/D1)."""
+
+    async def test_g1_stale_in_progress_journal_on_main_marks_done(
+        self, tmp_path: Path,
+    ) -> None:
+        _bind_landed_row(tmp_path, task_id='30', advanced_sha='g1advancedsha')
+        fixed_now = datetime(2026, 7, 12, 12, 0, 0, tzinfo=UTC)
+        task = {
+            'status': 'in-progress',
+            'claimant_run_id': 'run-1/session-1/pid=1',
+            'heartbeat_at': '2026-07-12T11:00:00+00:00',  # 60 minutes stale
+        }
+        git_ops = _fake_git_ops()
+        scheduler = _fake_scheduler(is_actively_held=False, task=task)
+        resolver = _make_ground_truth(
+            git_ops=git_ops, scheduler=scheduler,
+            now_fn=lambda: fixed_now, heartbeat_ttl=timedelta(minutes=10),
+        )
+
+        report, action = await resolver.recovery_for('30')
+
+        assert report.branch_state == BranchState(BranchStateKind.ON_MAIN, 'g1advancedsha')
+        assert report.live_claimant is None
+        assert action == RecoveryAction.MARK_DONE_WITH_PROVENANCE
+        git_ops.find_merge_marker.assert_not_awaited()
+
+    async def test_g2_journal_miss_git_marker_marks_done(self) -> None:
+        fixed_now = datetime(2026, 7, 12, 12, 0, 0, tzinfo=UTC)
+        task = {
+            'status': 'in-progress',
+            'claimant_run_id': 'run-1/session-1/pid=2',
+            'heartbeat_at': '2026-07-12T11:00:00+00:00',  # 60 minutes stale
+        }
+        git_ops = _fake_git_ops(is_ancestor=False, branch_sha=None, marker_sha='g2markersha')
+        scheduler = _fake_scheduler(is_actively_held=False, task=task)
+        resolver = _make_ground_truth(
+            git_ops=git_ops, scheduler=scheduler,
+            now_fn=lambda: fixed_now, heartbeat_ttl=timedelta(minutes=10),
+        )
+
+        report, action = await resolver.recovery_for('31')
+
+        assert report.branch_state == BranchState(
+            BranchStateKind.GONE_WITH_MERGE_MARKER, 'g2markersha',
+        )
+        assert action == RecoveryAction.MARK_DONE_WITH_PROVENANCE
+        git_ops.find_merge_marker.assert_awaited_once_with('task/31')
+
+    async def test_d1_deterministic_deploy_ran_refiles_not_phantom_done(self) -> None:
+        task = {
+            'status': 'in-progress',
+            'claimant_run_id': None,
+            'heartbeat_at': None,
+            'metadata': {'deploy_state': {'phase': 'ran'}},
+        }
+        git_ops = _fake_git_ops(is_ancestor=False, branch_sha=None, marker_sha=None)
+        scheduler = _fake_scheduler(is_actively_held=False, task=task)
+        resolver = _make_ground_truth(git_ops=git_ops, scheduler=scheduler)
+
+        report, action = await resolver.recovery_for('32')
+
+        assert report.branch_state == BranchState(BranchStateKind.GONE_NO_MARKER, None)
+        assert report.deploy_phase == DeployPhase.RAN
+        assert action == RecoveryAction.RE_FILE_ESCALATION
