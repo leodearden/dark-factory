@@ -1040,3 +1040,57 @@ class TestDeterministicCycleSummary:
         )
         row = await cursor.fetchone()
         return row[0]
+
+
+# ---------------------------------------------------------------------------
+# S1 — Write-journal-derived stats override self-reported counters
+# [θ, merged support]
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestComputedStatsOverride:
+    """S1 (θ, merged support): ``stats_verifier.verify_and_rewrite_stats``
+    overrides a stage's self-reported write counters with the write-journal
+    truth — the LLM's self-report survives only as a divergence signal under
+    ``stats['_reported']``.
+
+    Given the journal records 2 successful add_memory ops for the stage and
+    the StageReport self-reports memories_added=5 (and the retired
+    memories_written=5): journal truth wins (memories_added -> 2), both LLM
+    originals are preserved under ``_reported``, and memories_written — an
+    allowlisted LLM-reported key that is no longer in ``_COMPUTED_STAT_KEYS``
+    — is DROPPED from top-level stats entirely. (Corrected from ο's task
+    description's imprecise "unknown key dropped": a truly-unknown key is
+    left completely untouched by ``_apply_observed``, not dropped — asserting
+    that would be a doomed premise. See plan.json design decisions.) Mirrors
+    the canonical green
+    ``test_stats_verifier.py::test_verify_boundary_s1_computed_stats_override_llm_report``.
+
+    Driving harness (``_drive_verify``) lands in step-14 — this step only
+    declares the §9 postconditions, so it is RED until then (the harness
+    method referenced below doesn't exist yet).
+    """
+
+    _STAGE = 'memory_consolidator'
+
+    async def test_journal_truth_overrides_self_reported_stats(self, journal) -> None:
+        """Given 2 real journal-observed add_memory ops and a self-reported
+        memories_added=5 / memories_written=5: journal truth wins
+        (memories_added -> 2), both LLM originals are preserved under
+        _reported as the judge's divergence signal, and the retired
+        memories_written counter is dropped from top-level stats entirely."""
+        report = await self._drive_verify(journal)
+
+        assert report.stats['memories_added'] == 2, (
+            f"Expected journal truth (2) to win, got {report.stats.get('memories_added')!r}"
+        )
+        assert report.stats['_reported']['memories_added'] == 5, (
+            "Expected the LLM's self-reported memories_added to survive under _reported"
+        )
+        assert 'memories_written' not in report.stats, (
+            'Expected the retired memories_written counter to be dropped from top-level stats'
+        )
+        assert report.stats['_reported']['memories_written'] == 5, (
+            "Expected the LLM's memories_written claim to survive under _reported"
+        )
