@@ -19,11 +19,13 @@ from _reviewer_trial_mining_fixtures import (
 )
 from shared.cli_invoke import AgentResult
 
-from orchestrator.evals.reviewer_trial.corpus import GroundTruthIssue
+from orchestrator.evals.reviewer_trial.adjudication import AdjudicationLog
+from orchestrator.evals.reviewer_trial.corpus import CorpusDiff, CorpusManifest, GroundTruthIssue
 from orchestrator.evals.reviewer_trial.mining import (
     EscalationRef,
     FnCandidate,
     assign_split,
+    audit_corpus,
     mine_escalation_refs,
     mine_fn_candidates,
     propose_labels_frontier,
@@ -339,3 +341,114 @@ class TestProposeLabelsFrontier:
             issues, _cost = await propose_labels_frontier('diff text', model='opus', description='d')
 
         assert issues == []
+
+
+class TestAuditCorpus:
+    """audit_corpus(manifest, adjudication_log, min_diffs) reports ok=True
+    only when every corpus-integrity signal holds, naming which check(s)
+    failed otherwise (task 2495 / PRD D-6)."""
+
+    @staticmethod
+    def _make_diff(
+        diff_id: str,
+        source: str = 'synthetic',
+        split: str | None = None,
+        provenance: dict | None = None,
+    ) -> CorpusDiff:
+        return CorpusDiff(
+            diff_id=diff_id,
+            language='python',
+            source=source,
+            diff_text='--- a\n+++ b\n',
+            description='d',
+            ground_truth=[],
+            split=split,
+            provenance=provenance,
+        )
+
+    @classmethod
+    def _passing_manifest_and_log(cls, n: int = 30) -> tuple[CorpusManifest, AdjudicationLog]:
+        """A manifest + adjudication log that satisfies all five audit_corpus
+        checks: >=n diffs, every diff split (~2:1:7 via assign_split), every
+        mined diff has provenance, adjudication covers every diff_id, and a
+        non-empty spot-check subset is flagged."""
+        diff_ids = [f'd{i}' for i in range(n)]
+        splits = assign_split(diff_ids, seed='audit-test')
+
+        diffs = []
+        for i, diff_id in enumerate(diff_ids):
+            source = 'mined' if i % 2 == 0 else 'synthetic'
+            provenance = {'merge_sha': 'deadbeef'} if source == 'mined' else None
+            diffs.append(cls._make_diff(diff_id, source=source, split=splits[diff_id], provenance=provenance))
+        manifest = CorpusManifest(diffs=diffs, split_seed='audit-test')
+
+        log = AdjudicationLog()
+        for i, diff_id in enumerate(diff_ids):
+            log.append(diff_id, frontier_proposal=[], in_spot_check_subset=(i == 0))
+
+        return manifest, log
+
+    def test_passes_when_all_signals_hold(self) -> None:
+        manifest, log = self._passing_manifest_and_log(n=30)
+
+        report = audit_corpus(manifest, log, min_diffs=30)
+
+        assert report.ok is True
+        assert report.failures == []
+        assert report.diff_count == 30
+
+    def test_fails_when_below_min_diffs(self) -> None:
+        manifest, log = self._passing_manifest_and_log(n=10)
+
+        report = audit_corpus(manifest, log, min_diffs=50)
+
+        assert report.ok is False
+        assert 'diff_count' in report.failures
+
+    def test_fails_when_split_missing(self) -> None:
+        manifest, log = self._passing_manifest_and_log(n=30)
+        manifest.diffs[0].split = None
+
+        report = audit_corpus(manifest, log, min_diffs=30)
+
+        assert report.ok is False
+        assert 'missing_split' in report.failures
+
+    def test_fails_when_split_ratio_off(self) -> None:
+        manifest, log = self._passing_manifest_and_log(n=30)
+        for d in manifest.diffs:
+            d.split = 'train'  # every diff in one bucket -> ratio way off 2:1:7
+
+        report = audit_corpus(manifest, log, min_diffs=30)
+
+        assert report.ok is False
+        assert 'split_ratio' in report.failures
+
+    def test_fails_when_mined_diff_missing_provenance(self) -> None:
+        manifest, log = self._passing_manifest_and_log(n=30)
+        mined_diff = next(d for d in manifest.diffs if d.source == 'mined')
+        mined_diff.provenance = None
+
+        report = audit_corpus(manifest, log, min_diffs=30)
+
+        assert report.ok is False
+        assert 'missing_provenance' in report.failures
+
+    def test_fails_when_adjudication_coverage_incomplete(self) -> None:
+        manifest, log = self._passing_manifest_and_log(n=30)
+        log.entries.pop()  # last diff_id now has no adjudication entry
+
+        report = audit_corpus(manifest, log, min_diffs=30)
+
+        assert report.ok is False
+        assert 'adjudication_coverage' in report.failures
+
+    def test_fails_when_spot_check_subset_empty(self) -> None:
+        manifest, log = self._passing_manifest_and_log(n=30)
+        for entry in log.entries:
+            entry.in_spot_check_subset = False
+
+        report = audit_corpus(manifest, log, min_diffs=30)
+
+        assert report.ok is False
+        assert 'spot_check_subset_empty' in report.failures
