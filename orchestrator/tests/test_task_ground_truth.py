@@ -201,6 +201,31 @@ class TestClassifyRecovery:
         )
         assert classify_recovery(report) == RecoveryAction.RE_FILE_ESCALATION
 
+    def test_h2_deploy_phase_failed_defaults_to_leave_deliberately(self) -> None:
+        # FAILED is NOT in _RECOVERY (only RAN is, per D1/row (h)) — a
+        # FAILED deploy already has its own mandatory DS-2 escalation path
+        # (FAILED -> ESCALATED is a required, loud transition — see
+        # orchestrator/deploy_state.py's `_LEGAL` + `enforce_transition`), so
+        # this table deliberately leaves it rather than risking a
+        # second/competing escalation. Pinned so the gap is a tested choice,
+        # not an accidental one (review finding #4).
+        report = self._report(
+            branch_state=BranchState(BranchStateKind.GONE_NO_MARKER),
+            deploy_phase=DeployPhase.FAILED,
+        )
+        assert classify_recovery(report) == RecoveryAction.LEAVE
+
+    def test_h3_deploy_phase_verified_defaults_to_leave_deliberately(self) -> None:
+        # VERIFIED is a terminal-success phase; a task stranded alongside
+        # one is a degenerate shape, not D1's crashed-mid-deploy case (that's
+        # RAN). Pinned so the LEAVE default is deliberate, not an accidental
+        # gap (review finding #4).
+        report = self._report(
+            branch_state=BranchState(BranchStateKind.GONE_NO_MARKER),
+            deploy_phase=DeployPhase.VERIFIED,
+        )
+        assert classify_recovery(report) == RecoveryAction.LEAVE
+
     def test_i_unmapped_degenerate_shape_defaults_to_leave(self) -> None:
         report = self._report(db_status='pending', branch_state=BranchState(BranchStateKind.EXISTS_OFF_MAIN))
         assert classify_recovery(report) == RecoveryAction.LEAVE

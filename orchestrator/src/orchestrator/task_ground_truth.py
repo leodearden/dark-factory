@@ -403,6 +403,30 @@ _RECOVERY: dict[_RecoveryShape, RecoveryAction] = {
     # already taken effect); re-file an escalation for a human/DS-2 gate.
     (TaskStatus.IN_PROGRESS, False, BranchStateKind.GONE_NO_MARKER, False, DeployPhase.RAN):
         RecoveryAction.RE_FILE_ESCALATION,
+    # Deliberately-unmapped deploy phases (VERIFIED / FAILED / SCHEDULED /
+    # ESCALATED / DONE): `RAN` is the only deploy_phase this table
+    # discriminates on, because it is the sole phase D1 names as a crashed
+    # in-flight deploy (PRD §7) — every other stranded-in-progress shape
+    # falls through to the LEAVE default below, and that is a deliberate,
+    # tested choice (see TestClassifyRecovery's
+    # test_h2_deploy_phase_failed_defaults_to_leave_deliberately /
+    # test_h3_deploy_phase_verified_defaults_to_leave_deliberately), not an
+    # accidental gap:
+    #   - VERIFIED / DONE are terminal-success phases; a task stranded
+    #     alongside one is an inconsistent/degenerate shape, not the D1
+    #     crashed-mid-deploy case, so there is no evidence-backed action
+    #     to take beyond LEAVE.
+    #   - FAILED / ESCALATED already have their OWN mandatory recovery path
+    #     in the DS-2 deploy-phase state machine itself — `_LEGAL` (see
+    #     orchestrator/deploy_state.py) requires FAILED -> ESCALATED to file
+    #     a loud escalation via `enforce_transition`'s `escalation_sink`
+    #     ("DS-2 loudness — never silently dropped"). A second,
+    #     independent RE_FILE_ESCALATION from this table for the same
+    #     failure would risk a duplicate/competing escalation rather than
+    #     deferring to that dedicated machinery.
+    # If fleet experience shows a stranded FAILED deploy genuinely needs a
+    # THIRD path (neither DS-2's own escalation nor this table), that is a
+    # follow-up table row for whoever owns that evidence — not a guess here.
 }
 
 
