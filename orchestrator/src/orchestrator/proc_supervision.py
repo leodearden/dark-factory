@@ -249,8 +249,8 @@ class RestartPlan:
            RP-5 verify (implemented below, step-10/12).
         3. transient_unit set -> DETACHED systemd-run (RP-3/RP-4; implemented
            below, step-4).
-        4. else -> DETACHED leaf plain-spawn (step-15/16; not yet implemented
-           here).
+        4. else -> DETACHED leaf plain-spawn, fused-memory/dashboard parity
+           (implemented below, step-16).
         """
         runner = runner or asyncio.create_subprocess_exec
         inspector = inspector or inspect_systemd_unit
@@ -295,8 +295,7 @@ class RestartPlan:
         if self.transient_unit:
             return await self._execute_detached_systemd_run(runner)
 
-        # Leaf plain-spawn path — implemented in step-16.
-        raise NotImplementedError
+        return await self._execute_detached_leaf_plain_spawn(runner)
 
     async def _execute_cross_unit_blocking(self, runner, inspector) -> RestartOutcome:
         """RP-2/RP-5: run a BLOCKING restart against a provably different unit.
@@ -479,4 +478,35 @@ class RestartPlan:
                 escalated=False,
                 detail=f'systemd-run registration of {self.transient_unit} failed (rc={rc}): {tail}',
             )
+        return RestartOutcome(disposition=RestartDisposition.SCHEDULED)
+
+    async def _execute_detached_leaf_plain_spawn(self, runner) -> RestartOutcome:
+        """Leaf DETACHED path (no ``transient_unit``, no ``verify``): a bare
+        immediate ``create_subprocess_exec`` spawn — fused-memory/dashboard
+        parity with ``service_restart._default_restart_executor``.
+
+        No ``/bin/sh -c`` on-failure wrapper here (unlike RP-4's systemd-run
+        payload): a plain immediate spawn has no DEFERRED fire-time gap to
+        guard — a spawn failure (e.g. a missing/non-executable script) raises
+        SYNCHRONOUSLY out of ``runner(...)``, straight into the caller's own
+        try/except (``StaleServiceRestartCoordinator.maybe_restart`` branches
+        on FileNotFoundError/PermissionError == permanent vs. any other
+        Exception == transient-retry). RP-4's wrapper exists only because a
+        deferred ``--on-active`` systemd-run payload's failure happens LATER,
+        out-of-band from this call having already returned — there is no such
+        gap here, so no wrapper is needed or wanted. Accordingly
+        FileNotFoundError/PermissionError are deliberately NOT caught below —
+        they propagate uncaught, preserving the coordinator's
+        permanent-vs-transient retry contract.
+
+        Fire-and-forget: the spawned process's exit is intentionally never
+        awaited (mirrors ``_default_restart_executor``'s own comment) — the
+        restart script runs detached so its own health-poll never blocks this
+        event loop.
+        """
+        await runner(
+            str(self.script), *self.args,
+            cwd=str(self.cwd),
+            start_new_session=True,
+        )
         return RestartOutcome(disposition=RestartDisposition.SCHEDULED)
