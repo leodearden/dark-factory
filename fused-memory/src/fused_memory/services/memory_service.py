@@ -496,6 +496,25 @@ def _is_rate_limit_or_quota_error(exc: BaseException) -> bool:
     return 'insufficient_quota' in str(exc).lower()
 
 
+def _graphiti_degraded_entity_result() -> dict:
+    """Return get_entity's degraded-fallback superset dict.
+
+    Centralizes the {'nodes': [], 'edges': [], 'degraded': True,
+    'failed_stores': [...]} shape so get_entity's exact-match and
+    fuzzy-fallback degrade sites (see get_entity) cannot drift apart.
+    Deliberately NOT shared with search()'s degraded convention
+    (memory_service.py's SearchResults / search() failed_stores
+    construction): that path returns a SearchResults list-subclass, not a
+    plain dict, and the two shapes are intentionally different types.
+    """
+    return {
+        'nodes': [],
+        'edges': [],
+        'degraded': True,
+        'failed_stores': [SourceStore.graphiti.value],
+    }
+
+
 class SearchResults(list):
     """list subclass returned by MemoryService.search carrying in-band degrade metadata.
 
@@ -2566,6 +2585,11 @@ class MemoryService:
         asyncio.CancelledError, a BaseException that never reaches this
         except clause) propagate unchanged.
         """
+        # NOTE: each try/except below wraps ONLY the awaited Graphiti calls, not
+        # the local dict-building that follows a successful gather (_node_to_dict/
+        # _edge_to_dict, the edge-dedup loop). Keeping that pure data-transformation
+        # code outside the guarded region means a bug there raises normally instead
+        # of risking mis-classification as a degraded quota error (see plan review).
         try:
             # See "Performance trade-off" above: this call is intentionally serial —
             # its 0/1/many result decides whether the fuzzy gather runs at all.
@@ -2584,24 +2608,36 @@ class MemoryService:
                     label='get_entity: get_valid_edges_for_node failed',
                     logger=logger,
                 )
-                edge_lists = cast(list, edge_results)
-                # Duplicate-name matches each contribute their own edges; dedup by
-                # edge uuid so `edges` stays consistent with the (possibly
-                # multi-node) `nodes` array instead of double-counting shared edges.
-                seen: set = set()
-                edges = []
-                for edge_list in edge_lists:
-                    for e in edge_list:
-                        edge_uuid = e.get('uuid')
-                        if edge_uuid is not None:
-                            if edge_uuid in seen:
-                                continue
-                            seen.add(edge_uuid)
-                        edges.append(e)
-                node_data = [_node_to_dict(n) for n in exact]
-                edge_data = [_edge_to_dict(e) for e in edges]
-                return {'nodes': node_data, 'edges': edge_data}
+        except Exception as exc:
+            if not _is_rate_limit_or_quota_error(exc):
+                raise
+            logger.warning(
+                'get_entity degraded: rate-limit/quota error (429) for %r: %s',
+                name,
+                exc,
+            )
+            return _graphiti_degraded_entity_result()
 
+        if exact:
+            edge_lists = cast(list, edge_results)
+            # Duplicate-name matches each contribute their own edges; dedup by
+            # edge uuid so `edges` stays consistent with the (possibly
+            # multi-node) `nodes` array instead of double-counting shared edges.
+            seen: set = set()
+            edges = []
+            for edge_list in edge_lists:
+                for e in edge_list:
+                    edge_uuid = e.get('uuid')
+                    if edge_uuid is not None:
+                        if edge_uuid in seen:
+                            continue
+                        seen.add(edge_uuid)
+                    edges.append(e)
+            node_data = [_node_to_dict(n) for n in exact]
+            edge_data = [_edge_to_dict(e) for e in edges]
+            return {'nodes': node_data, 'edges': edge_data}
+
+        try:
             # Two-tier check via gather_or_raise (fused_memory.utils.async_utils).
             # Both coroutines settle before either is inspected (no orphans).
             # Pass 1: re-raises structured-cancellation signals (CancelledError,
@@ -2626,14 +2662,6 @@ class MemoryService:
                 label='get_entity: Graphiti call failed',
                 logger=logger,
             )
-
-            nodes = cast(list, results[0])
-            edges = cast(list, results[1])
-
-            node_data = [_node_to_dict(n) for n in nodes]
-            edge_data = [_edge_to_dict(e) for e in edges]
-
-            return {'nodes': node_data, 'edges': edge_data}
         except Exception as exc:
             if not _is_rate_limit_or_quota_error(exc):
                 raise
@@ -2642,12 +2670,15 @@ class MemoryService:
                 name,
                 exc,
             )
-            return {
-                'nodes': [],
-                'edges': [],
-                'degraded': True,
-                'failed_stores': [SourceStore.graphiti.value],
-            }
+            return _graphiti_degraded_entity_result()
+
+        nodes = cast(list, results[0])
+        edges = cast(list, results[1])
+
+        node_data = [_node_to_dict(n) for n in nodes]
+        edge_data = [_edge_to_dict(e) for e in edges]
+
+        return {'nodes': node_data, 'edges': edge_data}
 
     # ------------------------------------------------------------------
     # Read: get_edge (thin wrapper for cite_edge — task β)
