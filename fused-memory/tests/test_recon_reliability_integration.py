@@ -85,6 +85,7 @@ from unittest.mock import AsyncMock
 import pytest
 import pytest_asyncio
 
+from fused_memory.middleware import recon_write_policy
 from fused_memory.middleware.task_interceptor import TaskInterceptor
 from fused_memory.models.reconciliation import StageId, StageReport
 from fused_memory.models.scope import ProjectId, ProjectRoot, ProjectScope
@@ -738,3 +739,41 @@ class TestInterceptorReconWritePolicy:
             result, error_type='ReconStaleSnapshotRejected', op='update_task',
         )
         taskmaster.update_task.assert_not_awaited()
+
+    # -- driving harness (task 2232 step-8) ---------------------------------
+
+    async def _drive_p1_terminal_reject(self, interceptor, taskmaster) -> dict:
+        taskmaster.get_task = AsyncMock(
+            return_value={'id': self._TASK_ID, 'status': 'done', 'title': 'T'},
+        )
+        return await interceptor.update_task(
+            self._TASK_ID, '/project', title='x', agent_id=AGENT_ID,
+        )
+
+    async def _drive_p1_non_recon(self, interceptor, taskmaster) -> None:
+        taskmaster.get_task = AsyncMock(
+            return_value={'id': self._TASK_ID, 'status': 'done', 'title': 'T'},
+        )
+        await interceptor.update_task(self._TASK_ID, '/project', title='x', agent_id=None)
+
+    async def _drive_p2_live_workflow_reject(self, interceptor, taskmaster, monkeypatch) -> dict:
+        monkeypatch.setattr(
+            recon_write_policy, 'is_workflow_live_for_task', lambda *a, **k: True,
+        )
+        return await interceptor.set_task_status(
+            self._TASK_ID, 'in-progress', '/project', agent_id=AGENT_ID,
+        )
+
+    async def _drive_p2_non_recon(self, interceptor, taskmaster, monkeypatch) -> None:
+        monkeypatch.setattr(
+            recon_write_policy, 'is_workflow_live_for_task', lambda *a, **k: True,
+        )
+        await interceptor.set_task_status(self._TASK_ID, 'in-progress', '/project', agent_id=None)
+
+    async def _drive_p3_stale_snapshot_reject(self, interceptor, taskmaster) -> dict:
+        taskmaster.get_task = AsyncMock(
+            return_value={'id': self._TASK_ID, 'status': 'in-progress', 'title': 'T'},
+        )
+        return await interceptor.update_task(
+            self._TASK_ID, '/project', metadata={'snapshot_status': 'pending'}, agent_id=AGENT_ID,
+        )
