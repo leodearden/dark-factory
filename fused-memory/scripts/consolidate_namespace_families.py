@@ -574,6 +574,24 @@ async def run(
     reported ``UNRESOLVED`` rather than ``MERGE`` for that item, mirroring
     the junk-key count>0 guard: a partial read must never be mistaken for a
     clean, complete one (no-silent-caps).
+
+    A graph-family item's ``disposition`` is DOWNGRADED from ``MERGE`` to
+    ``UNRESOLVED`` after a clean (uncapped) ``--apply`` merge whenever the
+    returned summary carries any loss/blocked signal (``edges_skipped``,
+    ``mentions_skipped``, a non-empty ``dropped_cross_target``, a non-empty
+    ``blocked``, or any ``nodes_blocked``/``episodes_blocked``) -- otherwise
+    a family that tallies skipped edges/mentions but empties cleanly (no
+    episodes left behind) would exit 0 despite losing data, the exact
+    silent-signal failure task 2502 fixes. This mirrors
+    ``migrate_cross_graph_leak.py``'s ``has_edge_loss``/
+    ``has_dropped_cross_target``/``has_blocked_items`` exit-code folding,
+    adapted to this script's per-item disposition rather than a parallel
+    top-level predicate -- ``has_unresolved`` already scans every section
+    for ``'UNRESOLVED'``, so no new predicate is needed. A source whose
+    deletion was withheld (Phase-A create failure or Phase-B ``blocked``)
+    leaves recoverable residue in the sibling graph, which also keeps that
+    sibling's junk-key node count > 0 -- so its GRAPH.DELETE (step 3 below)
+    is correctly guarded off too, without any extra bookkeeping here.
     """
     graphiti = memory_service.graphiti
     qdrant_client = await memory_service.mem0._get_async_qdrant()
@@ -581,17 +599,40 @@ async def run(
     # --- 1. Graph-family merges (identity rewrite) -------------------------
     graph_family_items: list[dict] = []
     for sibling, canonical in GRAPH_FAMILY_ALIASES.items():
-        rows = await enumerate_graph_entity_nodes(graphiti, sibling, limit=limit)
-        capped = len(rows) >= limit
+        entity_rows = await enumerate_graph_entity_nodes(graphiti, sibling, limit=limit)
+        episode_rows = await enumerate_graph_episodic_nodes(graphiti, sibling, limit=limit)
+        capped = len(entity_rows) >= limit or len(episode_rows) >= limit
         item: dict[str, Any] = {
             'sibling': sibling,
             'canonical': canonical,
-            'node_count': len(rows),
-            'node_uuids': [row['uuid'] for row in rows],
+            'node_count': len(entity_rows),
+            'node_uuids': [row['uuid'] for row in entity_rows],
+            'episode_count': len(episode_rows),
+            'episode_uuids': [row['uuid'] for row in episode_rows],
             'disposition': 'UNRESOLVED' if capped else 'MERGE',
         }
         if args.apply and not capped:
-            item.update(await merge_graph_family(graphiti, sibling, canonical, rows))
+            summary = await merge_graph_family(graphiti, sibling, canonical, entity_rows, episode_rows)
+            item.update(summary)
+            # Fold edge/mention loss + dropped_cross_target + blocked + Phase-A
+            # create failures into UNRESOLVED -- the exact silent-signal
+            # failure this task fixes (merge_graph_family tallies skipped
+            # counts, but a family with no episodes empties cleanly and used
+            # to exit 0 even after losing edges). Mirrors
+            # migrate_cross_graph_leak.py's has_edge_loss/
+            # has_dropped_cross_target/has_blocked_items exit-code folding,
+            # adapted from that script's per-manifest predicate to this
+            # script's per-item disposition -- has_unresolved (already
+            # scanning for 'UNRESOLVED') picks this up with no new predicate.
+            if (
+                summary['edges_skipped']
+                or summary['mentions_skipped']
+                or summary['dropped_cross_target']
+                or summary['blocked']
+                or summary['nodes_blocked']
+                or summary['episodes_blocked']
+            ):
+                item['disposition'] = 'UNRESOLVED'
         graph_family_items.append(item)
 
     # --- 2. Qdrant collection merges ----------------------------------------
