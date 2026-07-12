@@ -13,6 +13,7 @@ from unittest.mock import AsyncMock
 
 import pytest
 from _recording_event_store import _RecordingEventStore
+from shared.psi import PsiSample
 
 from orchestrator.config import OrchestratorConfig
 from orchestrator.overrides import OverrideRow, OverrideStore
@@ -342,6 +343,70 @@ class TestSelectionPhases:
 
         assert result is _CONTINUE
         assert not scheduler.lock_table.is_held('A')
+
+    @pytest.mark.asyncio
+    async def test_dispatch_deferred_emitted_shared_across_pins_and_scored(
+        self, tmp_path
+    ):
+        """``ctx.dispatch_deferred_emitted`` (promoted from a nested-closure
+        ``nonlocal`` to per-tick ``TickContext`` state, task 2236 step-10) must
+        stay SHARED across the pins/scored split: a heavy PINNED candidate
+        deferred by ``_phase_select_pins`` must suppress a second
+        ``dispatch_deferred`` emission when ``_phase_select_scored`` later
+        defers its own heavy candidate against the SAME ctx — exactly one
+        event per tick, as when both loops lived in one method body."""
+        event_store = _RecordingEventStore()
+        config = OrchestratorConfig(max_per_module=1)
+        store = OverrideStore(tmp_path / 'o.db')
+        scheduler = Scheduler(config, event_store=event_store, override_store=store)
+        scheduler.finish_startup()
+        scheduler._project_root = '/proj'
+
+        pinned_task = {
+            'id': 'P', 'status': 'pending', 'dependencies': [],
+            'metadata': {'files': ['mod_p/x.py']}, 'priority': 'medium',
+        }
+        scored_task = {
+            'id': 'S', 'status': 'pending', 'dependencies': [],
+            'metadata': {'files': ['mod_s/x.py']}, 'priority': 'medium',
+        }
+        pinned_row = OverrideRow(
+            boost_tier=None, pinned=True, pin_order=0, reserve_now=False,
+            ttl_until=None,
+        )
+        ctx = TickContext(
+            tasks=[pinned_task, scored_task],
+            status_map={'P': 'pending', 'S': 'pending'},
+            tasks_by_id={'P': pinned_task, 'S': scored_task},
+            candidates=[scored_task],
+            overrides={'P': pinned_row},
+            effective_priorities={'P': 'medium', 'S': 'medium'},
+            psi_sample=PsiSample(
+                cpu_some10=90.0, mem_some10=0.0, mem_full10=0.0,
+                io_some10=0.0, read_ok=True,
+            ),
+            psi_hold=True,
+        )
+
+        pins_result = await scheduler._phase_select_pins(ctx)
+        scored_result = await scheduler._phase_select_scored(ctx)
+
+        assert pins_result is _CONTINUE, 'pinned heavy candidate deferred, not dispatched'
+        assert isinstance(scored_result, TickOutcome)
+        assert scored_result.assignment is None, 'scored heavy candidate also deferred'
+        assert 'P' not in scheduler._dispatched
+        assert 'S' not in scheduler._dispatched
+
+        deferred_events = [e for e in event_store.events if e[0] == 'dispatch_deferred']
+        assert len(deferred_events) == 1, (
+            'the scored phase must NOT re-emit dispatch_deferred once the pin '
+            'phase already emitted it this tick — dispatch_deferred_emitted is '
+            'shared per-tick ctx state, not per-phase'
+        )
+        assert deferred_events[0][1]['task_id'] == 'P', (
+            'the pin loop runs first and hits the deferral first'
+        )
+        assert ctx.dispatch_deferred_emitted is True
 
 
 class TestTickPhaseOrderLiteral:
