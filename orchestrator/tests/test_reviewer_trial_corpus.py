@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
 import pytest
@@ -140,3 +141,90 @@ class TestCorpusManifest:
         assert len(py) == 6
         assert len(rs) == 6
         assert len(ts) == 3
+
+
+class TestCorpusDiffSplitProvenance:
+    """CorpusDiff gains optional `split` and `provenance` fields (task 2495)."""
+
+    def test_split_and_provenance_default_to_none(self) -> None:
+        diff = _make_diff()
+        assert diff.split is None
+        assert diff.provenance is None
+
+    def test_split_and_provenance_are_settable(self) -> None:
+        diff = _make_diff()
+        diff.split = 'train'
+        diff.provenance = {'kind': 'mined', 'merge_sha': 'abc123'}
+        assert diff.split == 'train'
+        assert diff.provenance == {'kind': 'mined', 'merge_sha': 'abc123'}
+
+
+class TestCorpusManifestSplitSeed:
+    """CorpusManifest gains a top-level `split_seed` field (task 2495)."""
+
+    def test_split_seed_defaults_to_none(self) -> None:
+        manifest = CorpusManifest(diffs=[_make_diff()])
+        assert manifest.split_seed is None
+
+    def test_split_seed_is_settable(self) -> None:
+        manifest = CorpusManifest(diffs=[_make_diff()], split_seed='seed-v1')
+        assert manifest.split_seed == 'seed-v1'
+
+
+class TestSplitProvenanceRoundTrip:
+    """save() -> load() round-trips split (manifest entry) + provenance (annotation file)."""
+
+    def test_save_persists_split_in_manifest_entry_and_provenance_in_annotation(
+        self, tmp_path: Path,
+    ) -> None:
+        gt = _make_gt()
+        diff = _make_diff(ground_truth=[gt])
+        diff.split = 'test'
+        diff.provenance = {
+            'kind': 'mined',
+            'runs_db_query': "outcome IN ('requeued','blocked')",
+            'merge_sha': 'deadbeef',
+            'escalation_refs': ['esc-101-1'],
+        }
+        manifest = CorpusManifest(diffs=[diff], split_seed='seed-v1')
+
+        manifest_path = tmp_path / 'manifest.json'
+        manifest.save(manifest_path)
+
+        raw = json.loads(manifest_path.read_text())
+        assert raw['diffs'][0]['split'] == 'test'
+        assert raw['split_seed'] == 'seed-v1'
+
+        ann_path = tmp_path / 'annotations' / f'{diff.diff_id}.json'
+        ann_raw = json.loads(ann_path.read_text())
+        assert ann_raw['provenance'] == diff.provenance
+        assert 'ground_truth' in ann_raw
+
+    def test_load_round_trips_split_and_provenance(self, tmp_path: Path) -> None:
+        gt = _make_gt()
+        diff = _make_diff(ground_truth=[gt])
+        diff.split = 'selection'
+        diff.provenance = {'kind': 'mined', 'merge_sha': 'cafef00d'}
+        manifest = CorpusManifest(diffs=[diff], split_seed='seed-v2')
+
+        manifest_path = tmp_path / 'manifest.json'
+        manifest.save(manifest_path)
+
+        loaded = CorpusManifest.load(manifest_path)
+        assert loaded.split_seed == 'seed-v2'
+        loaded_diff = loaded.get_diff(diff.diff_id)
+        assert loaded_diff is not None
+        assert loaded_diff.split == 'selection'
+        assert loaded_diff.provenance == diff.provenance
+
+    def test_backward_compatible_defaults_when_absent(self, tmp_path: Path) -> None:
+        """A manifest/annotation written without split/provenance/split_seed still loads."""
+        diff = _make_diff()
+        manifest = CorpusManifest(diffs=[diff])
+        manifest_path = tmp_path / 'manifest.json'
+        manifest.save(manifest_path)
+
+        loaded = CorpusManifest.load(manifest_path)
+        assert loaded.split_seed is None
+        assert loaded.diffs[0].split is None
+        assert loaded.diffs[0].provenance is None
