@@ -649,7 +649,8 @@ class QueuedBranch:
         ``branch_prefix + bare_id``, so ``full_name.endswith(bare_id)`` holds
         for every prefix (including the empty-prefix case, where
         ``full_name == bare_id``). This guard never rejects ``parse()``
-        output.
+        output built from a non-empty raw id (the only kind any current
+        caller ever passes).
 
         This is a partial, not complete, realization of "mixed shape
         unrepresentable" (PRD DD7): ``__post_init__`` has no ``branch_prefix``
@@ -662,7 +663,21 @@ class QueuedBranch:
         intended constructor and always satisfies the stronger invariant;
         this guard exists to catch gross incoherence (e.g. an unrelated or
         wrongly-prefixed ``full_name``) in pairs built by bypassing it.
+
+        A degenerate empty ``bare_id`` is rejected outright rather than
+        left to the ``endswith`` check above, since every string trivially
+        ends with ``''`` — the ``endswith`` check alone cannot catch it.
+        This is reachable via ``parse('', branch_prefix)`` or
+        ``parse(branch_prefix, branch_prefix)`` (both strip to ``''``); no
+        current caller passes either, but an empty task id is meaningless,
+        so it is refused rather than silently producing a
+        ``QueuedBranch(bare_id='', full_name=branch_prefix)``.
         """
+        if not self.bare_id:
+            raise ValueError(
+                f'QueuedBranch is incoherent: bare_id is empty '
+                f'(full_name={self.full_name!r})',
+            )
         if not self.full_name.endswith(self.bare_id):
             raise ValueError(
                 f'QueuedBranch is incoherent: full_name={self.full_name!r} '
