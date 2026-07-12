@@ -8,11 +8,22 @@ destroying data:
 
   1. GRAPH-FAMILY MERGES with IDENTITY REWRITE -- sibling Graphiti graphs
      that are the same logical project under a different key (hyphenated,
-     no-separator, ...) are merged into their underscore-canonical graph.
-     Reuses ε's move primitive (``move_entity_across_graphs``,
-     ``fused_memory.maintenance.cross_graph_move``, task 2271) with
-     ``rewrite_group_id=canonical`` -- the Phase-2 identity rewrite (PRD
-     decision 6) that ε's Phase-1 moves did not need.
+     no-separator, ...) are merged into their underscore-canonical graph via
+     the three-phase barrier-ordered apply (CGL-η follow-up, task 2415,
+     extended to Episodic-node relocation by task 2502): Phase A creates
+     every sibling Entity (``create_moved_node``) AND every sibling Episodic
+     node (``create_moved_episode``) in the canonical graph, each with
+     ``rewrite_group_id=canonical`` (the Phase-2 identity rewrite, PRD
+     decision 6); Phase B recreates every intra-family RELATES_TO edge and
+     MENTIONS link in ONE batched ``recreate_subgraph_relationships`` call;
+     Phase C deletes every non-blocked source. This closes two bugs the OLD
+     per-node ``move_entity_across_graphs`` loop had: an intra-family
+     RELATES_TO edge between two co-moving nodes was destroyed by the first
+     endpoint's delete before the second endpoint was ever processed, and a
+     MENTIONS link from a sibling-resident Episodic node was silently
+     dropped because episodes were never relocated at all. See
+     ``fused_memory.maintenance.cross_graph_move`` and
+     ``merge_graph_family``'s own docstring for the full barrier contract.
   2. QDRANT COLLECTION MERGES -- legacy/divergent Mem0 collections (from
      historical ``collection_prefix`` values, RCA §4) are merged into their
      ``fused_<project>`` target: scrolled with vectors, payload ``user_id``
@@ -62,8 +73,12 @@ import sys
 from typing import Any
 
 from fused_memory.maintenance.cross_graph_move import (  # noqa: F401
-    MoveResult,
-    move_entity_across_graphs,
+    SubgraphEdgeResult,
+    create_moved_episode,
+    create_moved_node,
+    delete_source_episode,
+    delete_source_node,
+    recreate_subgraph_relationships,
 )
 
 logger = logging.getLogger('consolidate_namespace_families')
@@ -181,11 +196,13 @@ async def enumerate_graph_entity_nodes(
 ) -> list[dict]:
     """Read-only enumeration of every :Entity node in the *key* FalkorDB graph.
 
-    Scoped to :Entity (not every label) -- the family-merge move primitive
-    (``move_entity_across_graphs``) only moves Entity nodes; any Episodic-
-    only residual left behind in *key* is exactly what should make the
-    junk-key guard (``delete_junk_key``) classify it UNRESOLVED rather than
-    silently GRAPH.DELETE-ing it.
+    Scoped to :Entity (not every label) -- Episodic nodes are enumerated
+    separately, via ``enumerate_graph_episodic_nodes``, and relocated by
+    ``merge_graph_family``'s own Phase A (``create_moved_episode``). Any
+    OTHER-labeled (e.g. Community) residual left behind in *key* after a
+    clean merge is exactly what should make the junk-key guard
+    (``delete_junk_key``, which counts every label) classify it UNRESOLVED
+    rather than silently GRAPH.DELETE-ing it.
 
     Single-page fetch: this issues exactly ONE ``LIMIT $limit`` query and
     never follows up with a second page, so a graph with more than *limit*
@@ -275,31 +292,145 @@ async def merge_graph_family(
     graphiti: Any,
     sibling: str,
     canonical: str,
-    node_rows: list[dict],
+    entity_rows: list[dict],
+    episode_rows: list[dict],
 ) -> dict:
-    """Move every *node_rows* entry from *sibling* into *canonical*.
+    """Move every *entity_rows* Entity and *episode_rows* Episodic node from
+    *sibling* into *canonical* via the three-phase barrier-ordered apply
+    (CGL-η follow-up, task 2502 -- template: ``migrate_cross_graph_leak.py``'s
+    ``run()``, which closed the identical edge-loss bug for the ζ migration
+    script; this brings the same fix -- plus Episodic/MENTIONS relocation --
+    to the θ family merge).
 
-    Calls ``move_entity_across_graphs(graphiti, uuid, sibling, canonical,
-    rewrite_group_id=canonical)`` once per row -- the Phase-2 identity
-    rewrite (PRD decision 6) -- and tallies the returned MoveResults.
+    The OLD implementation drove ``move_entity_across_graphs`` once per node,
+    which DETACH-DELETEd each source node (with its edges) immediately after
+    creating it in target, BEFORE the next node moved -- destroying any
+    RELATES_TO edge between two nodes in the SAME family (the first
+    endpoint's delete took the edge; the second endpoint never saw it). It
+    also never relocated Episodic nodes, so every MENTIONS link from a
+    sibling-resident episode onto a moved entity was lost too (edges are
+    single-graph; the episode stayed behind).
+
+    Phase A: CREATE every entity's (``create_moved_node``) and every
+    episode's (``create_moved_episode``) target-graph copy, each isolated --
+    a single item's create failure is recorded in ``create_failed``/
+    ``episode_create_failed`` (never aborts the batch) and excluded from
+    Phase B/C below. Relocating sibling Episodic nodes here (not just Entity
+    nodes) is what lets Phase B's UNCHANGED MENTIONS recreate succeed: it
+    only recreates a MENTIONS link when the episode is already present in
+    the entity's resolved target graph -- absent, it silently counts the
+    link in ``mentions_skipped`` instead.
+
+    Phase B: recreate every intra-family RELATES_TO edge and MENTIONS link in
+    ONE batched ``recreate_subgraph_relationships`` call, built from a MOVE
+    spec (``uuid``/``disposition='MOVE'``/``source_graph=sibling``/
+    ``target_graph=canonical``) for every entity that survived Phase A.
+    Episodes are never passed as their own specs -- only entities carry
+    RELATES_TO/MENTIONS specs in this module's schema; an episode's
+    relevance to Phase B is only as the MENTIONS target, already satisfied
+    by its Phase-A relocation. A single batched call (not one per entity) is
+    what dedupes a co-moving edge shared by two entities in this family,
+    recreating it exactly once. If the call raises, its ``exc.partial_result``
+    (always attached by ``recreate_subgraph_relationships`` -- see that
+    function's docstring) is recovered so a partial tally is never discarded
+    in favor of an all-zero default.
+
+    Phase C: DETACH DELETE every entity's (``delete_source_node``) and every
+    episode's (``delete_source_episode``) source copy -- WITHHELD for any
+    uuid that failed Phase A, or (entities only) named in Phase B's
+    ``SubgraphEdgeResult.blocked`` (whose ``node_uuids`` entries are always
+    entity uuids, even for a blocked MENTIONS item -- see that dataclass's
+    docstring), since deleting a source whose edge/mention was never
+    successfully recreated elsewhere would destroy the only remaining copy.
+
+    Returns:
+        A summary dict: ``nodes_moved``, ``episodes_moved``,
+        ``nodes_blocked``, ``episodes_blocked`` (counts -- Phase-A failures
+        plus, for entities only, Phase-B ``blocked`` withholding),
+        ``edges_recreated``, ``edges_skipped``, ``mentions_recreated``,
+        ``mentions_skipped`` (straight from the batch's ``SubgraphEdgeResult``),
+        ``dropped_cross_target`` and ``blocked`` (both lists, passed through
+        from the ``SubgraphEdgeResult`` verbatim -- never silently dropped).
     """
-    summary = {
-        'nodes_moved': 0,
-        'edges_moved': 0,
-        'edges_skipped': 0,
-        'mentions_moved': 0,
-        'mentions_skipped': 0,
+    # --- Phase A: create every entity + episode in canonical ---------------
+    create_failed: dict[str, Exception] = {}
+    for row in entity_rows:
+        try:
+            await create_moved_node(
+                graphiti, row['uuid'], sibling, canonical, rewrite_group_id=canonical,
+            )
+        except Exception as exc:
+            create_failed[row['uuid']] = exc
+
+    episode_create_failed: dict[str, Exception] = {}
+    for row in episode_rows:
+        try:
+            await create_moved_episode(
+                graphiti, row['uuid'], sibling, canonical, rewrite_group_id=canonical,
+            )
+        except Exception as exc:
+            episode_create_failed[row['uuid']] = exc
+
+    # --- Phase B: batch-recreate intra-family edges + MENTIONS --------------
+    entity_specs = [
+        {
+            'uuid': row['uuid'], 'disposition': 'MOVE',
+            'source_graph': sibling, 'target_graph': canonical,
+        }
+        for row in entity_rows if row['uuid'] not in create_failed
+    ]
+    edge_result = SubgraphEdgeResult()
+    if entity_specs:
+        try:
+            edge_result = await recreate_subgraph_relationships(graphiti, entity_specs)
+        except Exception as exc:
+            partial_result = getattr(exc, 'partial_result', None)
+            if partial_result is not None:
+                edge_result = partial_result
+
+    # blocked_node_uuids (mirrors migrate_cross_graph_leak.py's run()): every
+    # uuid named in a Phase-B blocked item's node_uuids -- both endpoints for
+    # a blocked RELATES_TO edge, the entity uuid for a blocked MENTIONS link
+    # -- must have its Phase-C deletion withheld too, or the un-recreated
+    # edge/mention (which now exists only in source) would be destroyed.
+    blocked_node_uuids: set[str] = set()
+    for blocked_item in edge_result.blocked:
+        for node_uuid in blocked_item.get('node_uuids', []):
+            blocked_node_uuids.add(node_uuid)
+
+    # --- Phase C: delete every non-blocked, non-failed source ---------------
+    nodes_moved = 0
+    nodes_blocked = 0
+    for row in entity_rows:
+        uuid = row['uuid']
+        if uuid in create_failed or uuid in blocked_node_uuids:
+            nodes_blocked += 1
+            continue
+        await delete_source_node(graphiti, uuid, sibling)
+        nodes_moved += 1
+
+    episodes_moved = 0
+    episodes_blocked = 0
+    for row in episode_rows:
+        uuid = row['uuid']
+        if uuid in episode_create_failed:
+            episodes_blocked += 1
+            continue
+        await delete_source_episode(graphiti, uuid, sibling)
+        episodes_moved += 1
+
+    return {
+        'nodes_moved': nodes_moved,
+        'episodes_moved': episodes_moved,
+        'nodes_blocked': nodes_blocked,
+        'episodes_blocked': episodes_blocked,
+        'edges_recreated': edge_result.edges_recreated,
+        'edges_skipped': edge_result.edges_skipped,
+        'mentions_recreated': edge_result.mentions_recreated,
+        'mentions_skipped': edge_result.mentions_skipped,
+        'dropped_cross_target': edge_result.dropped_cross_target,
+        'blocked': edge_result.blocked,
     }
-    for row in node_rows:
-        result = await move_entity_across_graphs(
-            graphiti, row['uuid'], sibling, canonical, rewrite_group_id=canonical,
-        )
-        summary['nodes_moved'] += 1
-        summary['edges_moved'] += result.edges_moved
-        summary['edges_skipped'] += result.edges_skipped
-        summary['mentions_moved'] += result.mentions_moved
-        summary['mentions_skipped'] += result.mentions_skipped
-    return summary
 
 
 # ---------------------------------------------------------------------------
