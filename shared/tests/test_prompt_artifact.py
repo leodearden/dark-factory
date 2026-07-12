@@ -16,7 +16,12 @@ from __future__ import annotations
 import pytest
 from pydantic import ValidationError
 
-from shared.prompt_artifact import ArtifactProvenance, PromptSpec, compose_prompt
+from shared.prompt_artifact import (
+    ArtifactProvenance,
+    PromptArtifactStore,
+    PromptSpec,
+    compose_prompt,
+)
 
 
 def _provenance_kwargs(**overrides):
@@ -32,6 +37,16 @@ def _provenance_kwargs(**overrides):
     )
     kwargs.update(overrides)
     return kwargs
+
+
+def _make_spec(**overrides):
+    kwargs = dict(
+        prompt_id='reviewer',
+        contract='CONTRACT text',
+        baseline_heuristics='baseline heuristics text',
+    )
+    kwargs.update(overrides)
+    return PromptSpec(**kwargs)
 
 
 class TestArtifactProvenance:
@@ -120,3 +135,15 @@ class TestCompose:
         # The leading contract region is byte-identical to the in-code contract
         # regardless of what the heuristics text contains.
         assert composed[: len(contract)] == contract
+
+
+class TestResolveFallback:
+    def test_resolve_with_nothing_pinned_returns_in_code_constant(self, tmp_path):
+        store = PromptArtifactStore(tmp_path)
+        spec = _make_spec()
+
+        resolved = store.resolve(spec, executor_model='claude-opus-4', harness_version='v1')
+
+        assert resolved.text == spec.in_code_constant
+        assert resolved.provenance is None
+        assert resolved.source == 'in_code'
