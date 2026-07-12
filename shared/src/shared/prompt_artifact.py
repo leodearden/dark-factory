@@ -114,6 +114,21 @@ _HEURISTICS_FILENAME = 'heuristics.txt'
 _PROVENANCE_FILENAME = 'provenance.json'
 
 
+def _atomic_write_text(path: Path, text: str) -> None:
+    """Write *text* to *path* via temp-in-dir + os.replace (safe_io.py's pattern).
+
+    A reader never observes a half-written file: either the old contents (if
+    any) or the complete new contents, never a truncated partial write.
+    """
+    tmp = path.with_name(f'{path.name}.{os.getpid()}.tmp')
+    try:
+        tmp.write_text(text, encoding='utf-8')
+        os.replace(tmp, path)
+    except BaseException:
+        tmp.unlink(missing_ok=True)
+        raise
+
+
 class PromptArtifactStore:
     """Resolves a :class:`PromptSpec` to a pinned artifact or the in-code fallback.
 
@@ -133,4 +148,56 @@ class PromptArtifactStore:
     def resolve(
         self, spec: PromptSpec, executor_model: str, harness_version: str
     ) -> ResolvedPrompt:
+        key_dir = self._key_dir(spec.prompt_id, executor_model, harness_version)
+        heuristics_path = key_dir / _HEURISTICS_FILENAME
+        provenance_path = key_dir / _PROVENANCE_FILENAME
+        if heuristics_path.exists() and provenance_path.exists():
+            heuristics = heuristics_path.read_text(encoding='utf-8')
+            provenance = ArtifactProvenance.model_validate_json(
+                provenance_path.read_text(encoding='utf-8')
+            )
+            return ResolvedPrompt(
+                compose_prompt(spec.contract, heuristics), provenance, 'artifact'
+            )
         return ResolvedPrompt(spec.in_code_constant, None, 'in_code')
+
+    def pin(
+        self,
+        prompt_id: str,
+        executor_model: str,
+        harness_version: str,
+        *,
+        heuristics: str,
+        provenance: ArtifactProvenance,
+    ) -> None:
+        """Pin *heuristics* + *provenance* under the (prompt_id, executor_model,
+        harness_version) key.
+
+        *provenance.harness_version* must equal *harness_version* — a
+        key/provenance mismatch is a caller bug, so this raises rather than
+        silently persisting an incoherent artifact.
+
+        Writes atomically, ``provenance.json`` LAST: a crash between the two
+        writes leaves at most a heuristics-only directory, which resolve()
+        treats as not-pinned (fail-safe).
+        """
+        if provenance.harness_version != harness_version:
+            raise ValueError(
+                f'pin: provenance.harness_version={provenance.harness_version!r} does not '
+                f'match the harness_version key {harness_version!r}'
+            )
+        key_dir = self._key_dir(prompt_id, executor_model, harness_version)
+        key_dir.mkdir(parents=True, exist_ok=True)
+        _atomic_write_text(key_dir / _HEURISTICS_FILENAME, heuristics)
+        _atomic_write_text(key_dir / _PROVENANCE_FILENAME, provenance.model_dump_json())
+
+    def read_provenance(
+        self, prompt_id: str, executor_model: str, harness_version: str
+    ) -> ArtifactProvenance | None:
+        key_dir = self._key_dir(prompt_id, executor_model, harness_version)
+        provenance_path = key_dir / _PROVENANCE_FILENAME
+        if not provenance_path.exists():
+            return None
+        return ArtifactProvenance.model_validate_json(
+            provenance_path.read_text(encoding='utf-8')
+        )
