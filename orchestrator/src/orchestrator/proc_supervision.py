@@ -491,10 +491,20 @@ class RestartPlan:
             # Byte-for-byte reuse of deterministic_runner.py:439-445's wrapper
             # shape (`_default_schedule_detached_restart`) — same three-part
             # `payload; __rc=$?; if [ "$__rc" -ne 0 ]; then on_failure; fi;
-            # exit "$__rc"` shell so DeterministicRunner's two mechanisms (task
-            # 2237's sibling, delta) can later collapse onto this one helper
-            # with no behaviour delta. Exactness is pinned by
-            # TestDetachedWrapperExactnessAndRegistrationFailure (step-13).
+            # exit "$__rc"` shell. This IS intentional interim duplication,
+            # not an oversight: task 2237 (this module) is scoped OUT of
+            # deterministic_runner.py — that file belongs to task 2237's
+            # sibling, delta — so until delta lands, this wrapper and
+            # EscalationSpec.to_submit_argv's submit argv are TWO independent
+            # copies of the same shape that must be kept byte-identical by
+            # hand/convention, pinned only by
+            # TestDetachedWrapperExactnessAndRegistrationFailure (step-13)
+            # here and its deterministic_runner.py counterpart. Tracked as a
+            # follow-up (filed as a non-blocking escalation alongside this
+            # comment) for delta to make DeterministicRunner's two mechanisms
+            # delegate to this one helper (EscalationSpec.to_submit_argv /
+            # RestartPlan) instead, retiring the hand-kept-identical coupling
+            # with no behaviour delta.
             wrapped = (
                 f'{payload}; __rc=$?; '
                 f'if [ "$__rc" -ne 0 ]; then {on_failure}; fi; '
