@@ -130,17 +130,22 @@ class TestCorpusManifest:
             pytest.skip('Corpus manifest not found')
 
         manifest = CorpusManifest.load(manifest_path)
-        assert len(manifest.diffs) == 15
+        # Task 2495 expands the corpus from 15 hand-authored diffs toward
+        # ~100 via mining; pin a floor (not an exact count) so the mined
+        # additions don't require touching this test again.
+        assert len(manifest.diffs) >= 50
         assert all(d.diff_text for d in manifest.diffs)
         assert all(d.ground_truth for d in manifest.diffs)
 
-        # Check language distribution
+        # Check language distribution -- per-language minimums (the original
+        # 15 hand-authored diffs are never removed by mining) rather than
+        # exact counts, since mined diffs may add to any language.
         py = manifest.filter_by_language('python')
         rs = manifest.filter_by_language('rust')
         ts = manifest.filter_by_language('typescript')
-        assert len(py) == 6
-        assert len(rs) == 6
-        assert len(ts) == 3
+        assert len(py) >= 6
+        assert len(rs) >= 6
+        assert len(ts) >= 3
 
 
 class TestCorpusDiffSplitProvenance:
