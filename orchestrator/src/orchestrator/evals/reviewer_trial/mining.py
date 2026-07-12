@@ -122,3 +122,51 @@ def mine_fn_candidates(
         ))
 
     return candidates
+
+
+@dataclass
+class EscalationRef:
+    """A reference to an escalation record (``data/escalations/esc-<id>.json``)."""
+
+    task_id: str
+    category: str
+    severity: str
+    summary: str
+    level: int
+    path: Path
+
+
+def mine_escalation_refs(esc_dir: Path) -> dict[str, list[EscalationRef]]:
+    """Parse ``esc-<id>.json`` escalation records, keyed by task_id.
+
+    Only files matching ``esc-*.json`` are considered, which naturally
+    excludes ``*.json.lock`` sidecars (wrong suffix) and non-escalation
+    state files like ``b3-state.json`` (wrong prefix) — both of which live
+    alongside the real escalations in ``data/escalations/``.
+
+    Tolerates malformed JSON in an otherwise-matching file by skipping it
+    rather than raising — offline mining over ~2,400 files must not abort
+    on one bad record.
+    """
+    refs: dict[str, list[EscalationRef]] = {}
+    for path in sorted(esc_dir.glob('esc-*.json')):
+        try:
+            data = json.loads(path.read_text())
+        except (json.JSONDecodeError, OSError):
+            continue
+
+        task_id = data.get('task_id')
+        if not task_id:
+            continue
+
+        ref = EscalationRef(
+            task_id=task_id,
+            category=data.get('category', ''),
+            severity=data.get('severity', ''),
+            summary=data.get('summary', ''),
+            level=data.get('level', 0),
+            path=path,
+        )
+        refs.setdefault(task_id, []).append(ref)
+
+    return refs
