@@ -13,6 +13,7 @@ the real gitignored data.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import sqlite3
 import subprocess
@@ -201,3 +202,49 @@ def recover_diff(merge_sha: str, repo_path: Path) -> str | None:
     if fallback.returncode != 0 or not fallback.stdout.strip():
         return None
     return fallback.stdout
+
+
+_SPLIT_NAMES = ('train', 'selection', 'test')
+
+
+def _stable_hash(seed: str, diff_id: str) -> str:
+    """Stable (deterministic across processes/runs) hash of seed+diff_id."""
+    return hashlib.sha256(f'{seed}:{diff_id}'.encode()).hexdigest()
+
+
+def assign_split(
+    diff_ids: list[str],
+    seed: str,
+    ratios: tuple[int, int, int] = (2, 1, 7),
+) -> dict[str, str]:
+    """Deterministically assign each diff_id to train/selection/test.
+
+    Orders ``diff_ids`` by a stable hash of ``f"{seed}:{diff_id}"`` — a
+    reproducible pseudo-random permutation independent of input order and
+    of any other seed — then slices the ordering into cumulative buckets
+    sized by *ratios* (train:selection:test, default 2:1:7). Slicing a
+    sorted permutation (rather than bucketing each id independently by
+    hash-modulo) gives near-exact proportions for any N rather than a
+    statistical approximation that only converges at large N.
+
+    Same *diff_ids* + same *seed* always yields the same assignment
+    (determinism required for a reproducible TEST split — see PRD §2).
+    """
+    total = sum(ratios)
+    ordered = sorted(diff_ids, key=lambda d: _stable_hash(seed, d))
+    n = len(ordered)
+
+    boundaries = []
+    running = 0
+    for r in ratios:
+        running += r
+        boundaries.append(round(n * running / total))
+
+    assignment: dict[str, str] = {}
+    start = 0
+    for name, end in zip(_SPLIT_NAMES, boundaries):
+        for diff_id in ordered[start:end]:
+            assignment[diff_id] = name
+        start = end
+
+    return assignment
