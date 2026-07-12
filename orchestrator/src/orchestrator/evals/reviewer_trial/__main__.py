@@ -417,6 +417,53 @@ def corpus_sanity(max_parallel: int, stagger: float, report_dir: Path | None) ->
 
 
 # ---------------------------------------------------------------------------
+# Corpus audit: integrity signals over the (expanded) corpus
+# ---------------------------------------------------------------------------
+
+_ADJUDICATION_LOG_PATH = _PKG_DIR / 'corpus' / 'adjudication_log.jsonl'
+
+# (check key, human-readable description) — order matches mining.audit_corpus's
+# check ordering so PASS/FAIL output reads top-to-bottom in the same sequence
+# the report's `failures` reasons would appear in.
+_AUDIT_CHECKS = (
+    ('diff_count', 'diff count meets the minimum floor'),
+    ('missing_split', 'every diff has a split assigned'),
+    ('split_ratio', 'train/selection/test ratio approximates 2:1:7'),
+    ('missing_provenance', 'every mined-source diff has non-empty provenance'),
+    ('adjudication_coverage', 'adjudication_log covers every diff_id'),
+    ('spot_check_subset_empty', 'a non-empty documented spot-check subset exists'),
+)
+
+
+@cli.command('corpus-audit')
+@click.option('--min-diffs', default=50, type=int, help='Minimum required diff count')
+def corpus_audit(min_diffs: int) -> None:
+    """Audit corpus integrity: size, split ratios, provenance, adjudication coverage, spot-check subset."""
+    from .adjudication import AdjudicationLog
+    from .mining import audit_corpus
+
+    corpus = _load_corpus()
+    log = AdjudicationLog.load(_ADJUDICATION_LOG_PATH)
+    report = audit_corpus(corpus, log, min_diffs=min_diffs)
+
+    click.echo(click.style(f'Corpus Audit: {report.diff_count} diffs (min {min_diffs})', bold=True))
+    click.echo('=' * 50)
+
+    checks_passed = 0
+    for key, message in _AUDIT_CHECKS:
+        if _print_check(key not in report.failures, message):
+            checks_passed += 1
+
+    click.echo()
+    color = 'green' if report.ok else 'red'
+    status = 'PASS' if report.ok else 'FAIL'
+    click.echo(click.style(
+        f'Result: {status} ({checks_passed}/{len(_AUDIT_CHECKS)} checks passed)', fg=color, bold=True,
+    ))
+    sys.exit(0 if report.ok else 1)
+
+
+# ---------------------------------------------------------------------------
 # Full trial: all variants x all diffs
 # ---------------------------------------------------------------------------
 
