@@ -1,0 +1,28 @@
+{
+  "diff_id": "mined_1030",
+  "ground_truth": [
+    {
+      "id": "frontier_1",
+      "location": "orchestrator/tests/test_workflow_e2e.py:387-391",
+      "category": "test_gap",
+      "severity": "suggestion",
+      "description": "The fake `_dispatch_tool` unconditionally returns an empty dict `{}`, so it carries no cost/scorer fields. If the code under test reads reviewer_trial (haiku) scorer cost from `_dispatch_tool`'s result, this stub yields zero cost and the test can pass without ever verifying that the scorer cost is actually accumulated into TrialReport totals \u2014 a potential false negative for the very feature (task 1030) being tested.",
+      "mutation_type": "test_gap"
+    }
+  ],
+  "provenance": {
+    "kind": "mined",
+    "task_id": "1030",
+    "project_id": "dark_factory",
+    "outcome": "done",
+    "review_cycles": 1,
+    "verify_attempts": 1,
+    "signal_reason": [
+      "escalation_created event"
+    ],
+    "merge_sha": "e76e86710eee6c325adab2ef8782d66952927376",
+    "runs_db_path": "/home/leo/src/dark-factory/data/orchestrator/runs.db",
+    "runs_db_query": "SELECT task_id, project_id, outcome, review_cycles, verify_attempts FROM task_results WHERE review_cycles >= 1, cross-referenced with events (escalation_created, merge_finalized) -- see mining.mine_fn_candidates.",
+    "escalation_refs": []
+  }
+}

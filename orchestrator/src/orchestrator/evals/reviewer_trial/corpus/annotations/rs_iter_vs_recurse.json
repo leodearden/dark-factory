@@ -14,7 +14,7 @@
       "location": "crates/reify-syntax/src/ts_parser.rs:1720",
       "category": "incorrect_traversal_order",
       "severity": "blocking",
-      "description": "For binary_expression, the code pushes children onto the stack AND calls self.lower_binary_expr(node) which processes the same children recursively. This double-processes child nodes — once via the recursive call and again when they're popped from the stack later, producing duplicate/corrupted results.",
+      "description": "For binary_expression, the code pushes children onto the stack AND calls self.lower_binary_expr(node) which processes the same children recursively. This double-processes child nodes \u2014 once via the recursive call and again when they're popped from the stack later, producing duplicate/corrupted results.",
       "mutation_type": "iter_vs_recurse"
     },
     {
@@ -22,7 +22,7 @@
       "location": "crates/reify-syntax/src/ts_parser.rs:1745",
       "category": "incorrect_result_assembly",
       "severity": "blocking",
-      "description": "results.into_iter().last().flatten() returns the last expression pushed, but the stack is LIFO — the root node is processed first (popped first from the initial push) and its result is pushed first into results. For a tree with children, the last result will be from the deepest leaf, not the root expression. The function returns the wrong AST node.",
+      "description": "results.into_iter().last().flatten() returns the last expression pushed, but the stack is LIFO \u2014 the root node is processed first (popped first from the initial push) and its result is pushed first into results. For a tree with children, the last result will be from the deepest leaf, not the root expression. The function returns the wrong AST node.",
       "mutation_type": "iter_vs_recurse"
     },
     {

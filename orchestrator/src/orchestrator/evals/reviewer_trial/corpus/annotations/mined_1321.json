@@ -1,0 +1,28 @@
+{
+  "diff_id": "mined_1321",
+  "ground_truth": [
+    {
+      "id": "frontier_1",
+      "location": "escalation/src/escalation/queue.py:375",
+      "category": "documentation",
+      "severity": "suggestion",
+      "description": "The filter `e.level == 0` preserves ALL non-L0 escalations, including born-at-L2 escalations (level=2, per the deterministic/milestone escalation paths), yet the docstring and harness comments claim only 'Level-1' escalations are preserved. The behavior (preserving L2 too) is likely correct, but the documentation is misleading about which levels survive restart.",
+      "mutation_type": "style"
+    }
+  ],
+  "provenance": {
+    "kind": "mined",
+    "task_id": "1321",
+    "project_id": "dark_factory",
+    "outcome": "done",
+    "review_cycles": 1,
+    "verify_attempts": 1,
+    "signal_reason": [
+      "escalation_created event"
+    ],
+    "merge_sha": "b7fb91542bc3d26c8b61537c6f18b72581707bce",
+    "runs_db_path": "/home/leo/src/dark-factory/data/orchestrator/runs.db",
+    "runs_db_query": "SELECT task_id, project_id, outcome, review_cycles, verify_attempts FROM task_results WHERE review_cycles >= 1, cross-referenced with events (escalation_created, merge_finalized) -- see mining.mine_fn_candidates.",
+    "escalation_refs": []
+  }
+}

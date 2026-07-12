@@ -1,0 +1,132 @@
+diff --git a/fused-memory/tests/reconciliation/test_stage1_stall_detector.py b/fused-memory/tests/reconciliation/test_stage1_stall_detector.py
+index 2cf2daa356..39710dd4e2 100644
+--- a/fused-memory/tests/reconciliation/test_stage1_stall_detector.py
++++ b/fused-memory/tests/reconciliation/test_stage1_stall_detector.py
+@@ -9,7 +9,7 @@ Covers:
+ 
+ from __future__ import annotations
+ 
+-import importlib
++import importlib.util
+ import sys
+ from unittest.mock import AsyncMock, MagicMock
+ 
+@@ -425,55 +425,80 @@ class TestMaybeEscalateStalledTasks:
+ class TestEscalationBinding:
+     """Verify Escalation is unconditionally bound on the module namespace.
+ 
+-    .. warning::
+-        This class calls ``importlib.reload(mod)`` twice — once with
+-        ``sys.modules['escalation']`` poisoned to ``None`` and once in the
+-        ``finally`` block to restore the real module state.  ``reload()``
+-        re-executes the entire module body, which rebinds **all** module-level
+-        attributes (loggers, constants, etc.).  Any test that relies on a
+-        module-level patch established at import/collection time (e.g. a
+-        session-scoped autouse fixture that patches ``stage1_stall_detector.logger``)
+-        will see that patch wiped out after this class runs.  If you add such a
+-        patch in the future, ensure it is re-applied **after** this class or
+-        refactor to restore module state explicitly instead of relying on reload.
++    Two behavioral checks replace the previous importlib.reload approach:
++
++    1. ``test_escalation_attribute_is_bound`` — runtime hasattr on the loaded
++       module; catches regressions where the symbol is dropped entirely.
++    2. ``test_except_branch_binds_escalation_to_none`` — loads a fresh isolated
++       copy of the production module from source via
++       ``importlib.util.spec_from_file_location`` with ``sys.modules['escalation']``
++       and ``sys.modules['escalation.models']`` stubbed to ``None``; asserts the
++       except branch binds ``Escalation = None`` and ``_HAS_ESCALATION = False``
++       as actual runtime behavior even when CI has escalation installed.
+     """
+ 
+-    def test_escalation_bound_when_package_unavailable(self):
+-        """Escalation is bound to None and _HAS_ESCALATION is False when the
+-        escalation package cannot be imported.
++    def test_escalation_attribute_is_bound(self):
++        """Escalation is always bound on the module namespace.
+ 
+-        Uses sys.modules injection + importlib.reload to exercise the
+-        ``except ImportError`` branch without restarting the interpreter.
+-        A finally-block restores the real package and reloads the module so
+-        subsequent tests in the suite see the normal module state.
++        When the escalation package is installed (normal CI), also asserts the
++        success-branch contract: ``Escalation`` is the real class and
++        ``_HAS_ESCALATION`` is ``True``.
+         """
+         import fused_memory.reconciliation.stage1_stall_detector as mod
+ 
+-        # Sentinel distinguishes "key was absent" from "key was None"
+-        _absent = object()
+-        orig = {k: sys.modules.get(k, _absent) for k in ('escalation', 'escalation.models')}
++        assert hasattr(mod, 'Escalation'), (
++            'Escalation must be bound on the module namespace at all times'
++        )
++        # In this repo the escalation package is always installed, so the
++        # try-branch runs and _HAS_ESCALATION must be True.
++        assert mod._HAS_ESCALATION is True, (
++            '_HAS_ESCALATION must be True when the escalation package is installed'
++        )
++
++    def test_except_branch_binds_escalation_to_none(self):
++        """Behavioral check: except ImportError branch sets Escalation=None and _HAS_ESCALATION=False.
++
++        Loads an isolated copy of the production module from source via
++        ``importlib.util.spec_from_file_location`` against a synthetic module
++        name, with ``sys.modules['escalation']`` and
++        ``sys.modules['escalation.models']`` stubbed to ``None`` so Python
++        treats them as failed imports and falls through to the except branch.
++        The live ``fused_memory.reconciliation.stage1_stall_detector`` cache
++        entry is never overwritten — no reload blast radius.
++        """
++        import fused_memory.reconciliation.stage1_stall_detector as live_mod
++
++        source_path = live_mod.__file__
++        _MISSING = object()
++
++        esc_saved = sys.modules.get('escalation', _MISSING)
++        esc_models_saved = sys.modules.get('escalation.models', _MISSING)
+ 
+         try:
+-            # Setting a sys.modules entry to None causes Python's import
+-            # machinery to raise ImportError on the next ``from ... import``.
+             sys.modules['escalation'] = None  # type: ignore[assignment]
+             sys.modules['escalation.models'] = None  # type: ignore[assignment]
+ 
+-            importlib.reload(mod)
++            spec = importlib.util.spec_from_file_location(
++                '_test_stage1_stall_detector_isolated', source_path
++            )
++            assert spec is not None and spec.loader is not None, source_path
++            fresh_mod = importlib.util.module_from_spec(spec)
++            spec.loader.exec_module(fresh_mod)  # type: ignore[union-attr]
+ 
+-            assert hasattr(mod, 'Escalation'), (
+-                'Escalation must be bound on the module even when the '
+-                'escalation package is unavailable'
++            assert fresh_mod.Escalation is None, (
++                'When escalation package is unavailable, '
++                'the except ImportError branch must bind Escalation = None'
++            )
++            assert fresh_mod._HAS_ESCALATION is False, (
++                'When escalation package is unavailable, '
++                'the except ImportError branch must set _HAS_ESCALATION = False'
+             )
+-            assert mod.Escalation is None
+-            assert mod._HAS_ESCALATION is False
+         finally:
+-            # Restore sys.modules to pre-test state so subsequent tests see
+-            # the real escalation package.
+-            for k, v in orig.items():
+-                if v is _absent:
+-                    sys.modules.pop(k, None)
+-                else:
+-                    sys.modules[k] = v  # type: ignore[assignment]
+-            # Reload with real imports restored so module bindings are correct.
+-            importlib.reload(mod)
++            if esc_saved is _MISSING:
++                sys.modules.pop('escalation', None)
++            else:
++                sys.modules['escalation'] = esc_saved  # type: ignore[assignment]
++            if esc_models_saved is _MISSING:
++                sys.modules.pop('escalation.models', None)
++            else:
++                sys.modules['escalation.models'] = esc_models_saved  # type: ignore[assignment]

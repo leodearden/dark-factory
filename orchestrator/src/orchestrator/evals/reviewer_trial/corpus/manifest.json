@@ -5,106 +5,298 @@
       "diff_id": "py_missing_await",
       "language": "python",
       "source": "synthetic",
-      "description": "Missing await on async run_verification() call in collect_metrics — coroutine object used as result",
-      "project": "dark-factory"
+      "description": "Missing await on async run_verification() call in collect_metrics \u2014 coroutine object used as result",
+      "project": "dark-factory",
+      "split": "selection"
     },
     {
       "diff_id": "py_swapped_args",
       "language": "python",
       "source": "synthetic",
       "description": "Swapped positional args (from_sha, to_sha) in git diff command, reversing diff direction",
-      "project": "dark-factory"
+      "project": "dark-factory",
+      "split": "test"
     },
     {
       "diff_id": "py_always_passes",
       "language": "python",
       "source": "synthetic",
       "description": "Weakened test assertion from == to >= and added tautological assertion in new test",
-      "project": "dark-factory"
+      "project": "dark-factory",
+      "split": "test"
     },
     {
       "diff_id": "py_obvious_copy",
       "language": "python",
       "source": "synthetic",
       "description": "Added _count_diff_changes() which duplicates existing _git_diff_stats() with different implementation",
-      "project": "dark-factory"
+      "project": "dark-factory",
+      "split": "test"
     },
     {
       "diff_id": "py_deep_shallow",
       "language": "python",
       "source": "synthetic",
       "description": "Removed .copy() from _deep_merge, causing caller's base dict to be mutated in place",
-      "project": "dark-factory"
+      "project": "dark-factory",
+      "split": "train"
     },
     {
       "diff_id": "py_real_01",
       "language": "python",
       "source": "real_world",
       "description": "Fix usage gate cap detection: add 'extra usage' prefix + respect is_error field + heuristic safety net",
-      "project": "dark-factory"
+      "project": "dark-factory",
+      "split": "test"
     },
     {
       "diff_id": "rs_off_by_one",
       "language": "rust",
       "source": "synthetic",
-      "description": "Changed 0..n to 0..=n in simplex builder — creates n+2 vertices and panics on params[n]",
-      "project": "reify"
+      "description": "Changed 0..n to 0..=n in simplex builder \u2014 creates n+2 vertices and panics on params[n]",
+      "project": "reify",
+      "split": "train"
     },
     {
       "diff_id": "rs_leaked_resource",
       "language": "rust",
       "source": "synthetic",
-      "description": "File::from_raw_fd takes ownership of fd but doc says caller closes it — double-close bug",
-      "project": "reify"
+      "description": "File::from_raw_fd takes ownership of fd but doc says caller closes it \u2014 double-close bug",
+      "project": "reify",
+      "split": "selection"
     },
     {
       "diff_id": "rs_heavy_mutation_copy",
       "language": "rust",
       "source": "synthetic",
       "description": "Added create_solution_map() which is a verbatim rename-only copy of build_solved_values()",
-      "project": "reify"
+      "project": "reify",
+      "split": "test"
     },
     {
       "diff_id": "rs_iter_vs_recurse",
       "language": "rust",
       "source": "synthetic",
       "description": "Added flawed iterative lower_expr that falls back to recursion and corrupts traversal order",
-      "project": "reify"
+      "project": "reify",
+      "split": "train"
     },
     {
       "diff_id": "rs_missing_error_prop",
       "language": "rust",
       "source": "synthetic",
-      "description": "Changed .unwrap_or(text) to .unwrap() in string literal lowering — panics on malformed nodes",
-      "project": "reify"
+      "description": "Changed .unwrap_or(text) to .unwrap() in string literal lowering \u2014 panics on malformed nodes",
+      "project": "reify",
+      "split": "test"
     },
     {
       "diff_id": "rs_real_01",
       "language": "rust",
       "source": "real_world",
-      "description": "Fix duplicate template name detection in SCC — HashMap::collect silently overwrites duplicates",
-      "project": "reify"
+      "description": "Fix duplicate template name detection in SCC \u2014 HashMap::collect silently overwrites duplicates",
+      "project": "reify",
+      "split": "test"
     },
     {
       "diff_id": "ts_shallow_mutate",
       "language": "typescript",
       "source": "synthetic",
-      "description": "Solid.js store reference leak — tool_input stored without deep copy, resultCache replaces reactive object",
-      "project": "reify-gui"
+      "description": "Solid.js store reference leak \u2014 tool_input stored without deep copy, resultCache replaces reactive object",
+      "project": "reify-gui",
+      "split": "test"
     },
     {
       "diff_id": "ts_obvious_copy",
       "language": "typescript",
       "source": "synthetic",
       "description": "Added focusOnBounds/focusOnEntities duplicating camera positioning logic from fitToView/flyToEntity",
-      "project": "reify-gui"
+      "project": "reify-gui",
+      "split": "test"
     },
     {
       "diff_id": "ts_real_01",
       "language": "typescript",
       "source": "real_world",
       "description": "Guard view.dispatch against destroyed EditorView in async gotoDefinition callback",
-      "project": "reify-gui"
+      "project": "reify-gui",
+      "split": "test"
+    },
+    {
+      "diff_id": "mined_1030",
+      "language": "python",
+      "source": "mined",
+      "description": "Task 1030 (dark_factory): Include reviewer_trial scorer (haiku) cost in TrialReport totals. Flagged as a false-negative candidate -- review passed but escalation_created event.",
+      "project": "dark-factory",
+      "split": "train"
+    },
+    {
+      "diff_id": "mined_1210",
+      "language": "python",
+      "source": "mined",
+      "description": "Task 1210 (dark_factory): Log known_projects snapshot semantics at TicketJanitor init (discoverability nudge). Flagged as a false-negative candidate -- review passed but escalation_created event.",
+      "project": "dark-factory",
+      "split": "selection"
+    },
+    {
+      "diff_id": "mined_1169",
+      "language": "python",
+      "source": "mined",
+      "description": "Task 1169 (dark_factory): Stage 1 system prompt: add pre-emission suppression check before writing any stage1_flag_marker for task 452. Flagged as a false-negative candidate -- review passed but escalation_created event.",
+      "project": "dark-factory",
+      "split": "test"
+    },
+    {
+      "diff_id": "mined_988",
+      "language": "python",
+      "source": "mined",
+      "description": "Task 988 (dark_factory): Surface legible per-project diagnostic when two_projects_do_not_serialise rendezvous times out. Flagged as a false-negative candidate -- review passed but verify_attempts>=2 (actual=2).",
+      "project": "dark-factory",
+      "split": "test"
+    },
+    {
+      "diff_id": "mined_1187",
+      "language": "python",
+      "source": "mined",
+      "description": "Task 1187 (dark_factory): Harden Stage 1 suppression-check prompt: search params, error semantics, task_id type. Flagged as a false-negative candidate -- review passed but escalation_created event.",
+      "project": "dark-factory",
+      "split": "test"
+    },
+    {
+      "diff_id": "mined_1234",
+      "language": "python",
+      "source": "mined",
+      "description": "Task 1234 (dark_factory): Add dashboard smoke test for index.html CDN script tags + cache-buster. Flagged as a false-negative candidate -- review passed but escalation_created event.",
+      "project": "dark-factory",
+      "split": "test"
+    },
+    {
+      "diff_id": "mined_1821",
+      "language": "python",
+      "source": "mined",
+      "description": "Task 1821 (dark_factory): Fix stage1.py:160 latent dedup-trap: nonce-prepend retry for per-cycle summary (sibling of task 1796). Flagged as a false-negative candidate -- review passed but escalation_created event.",
+      "project": "dark-factory",
+      "split": "selection"
+    },
+    {
+      "diff_id": "mined_1236",
+      "language": "python",
+      "source": "mined",
+      "description": "Task 1236 (dark_factory): MarkdownText: skip anchor rewrite for in-page/same-origin links, short-circuit when no <a>. Flagged as a false-negative candidate -- review passed but escalation_created event.",
+      "project": "dark-factory",
+      "split": "test"
+    },
+    {
+      "diff_id": "mined_1098",
+      "language": "python",
+      "source": "mined",
+      "description": "Task 1098 (dark_factory): Stage 2 prompt: handle multi-id and no_op set_task_status response shapes. Flagged as a false-negative candidate -- review passed but escalation_created event.",
+      "project": "dark-factory",
+      "split": "test"
+    },
+    {
+      "diff_id": "mined_1082",
+      "language": "python",
+      "source": "mined",
+      "description": "Task 1082 (dark_factory): Fix reconciliation agents to verify operation success before incrementing stat counters. Flagged as a false-negative candidate -- review passed but escalation_created event.",
+      "project": "dark-factory",
+      "split": "test"
+    },
+    {
+      "diff_id": "mined_1208",
+      "language": "python",
+      "source": "mined",
+      "description": "Task 1208 (dark_factory): Simplify TestEscalationBinding to avoid importlib.reload blast radius. Flagged as a false-negative candidate -- review passed but escalation_created event.",
+      "project": "dark-factory",
+      "split": "train"
+    },
+    {
+      "diff_id": "mined_924",
+      "language": "python",
+      "source": "mined",
+      "description": "Task 924 (dark_factory): Batched curator prompt for ticket worker. Flagged as a false-negative candidate -- review passed but verify_attempts>=2 (actual=4); escalation_created event.",
+      "project": "dark-factory",
+      "split": "test"
+    },
+    {
+      "diff_id": "mined_1538",
+      "language": "python",
+      "source": "mined",
+      "description": "Task 1538 (dark_factory): OCCT throttle L3: dashboard Host load card with live values + 5-min sparklines. Flagged as a false-negative candidate -- review passed but escalation_created event.",
+      "project": "dark-factory",
+      "split": "train"
+    },
+    {
+      "diff_id": "mined_1685",
+      "language": "python",
+      "source": "mined",
+      "description": "Task 1685 (dark_factory): Stage 2 recon: add deterministic count_memories_by_metadata pre-check before writing completion notes for done tasks. Flagged as a false-negative candidate -- review passed but escalation_created event.",
+      "project": "dark-factory",
+      "split": "test"
+    },
+    {
+      "diff_id": "mined_1594",
+      "language": "python",
+      "source": "mined",
+      "description": "Task 1594 (dark_factory): Fix stage2.py STAGE2_SYSTEM_PROMPT cross_project section to instruct cite_task for cross_project findings. Flagged as a false-negative candidate -- review passed but escalation_created event.",
+      "project": "dark-factory",
+      "split": "test"
+    },
+    {
+      "diff_id": "mined_1157",
+      "language": "python",
+      "source": "mined",
+      "description": "Task 1157 (dark_factory): Stage 1 system prompt: record entity_uuid in stats on refresh_entity_summary failure. Flagged as a false-negative candidate -- review passed but verify_attempts>=2 (actual=3); escalation_created event.",
+      "project": "dark-factory",
+      "split": "test"
+    },
+    {
+      "diff_id": "mined_1335",
+      "language": "python",
+      "source": "mined",
+      "description": "Task 1335 (dark_factory): test_scheduler_state_tools: de-flake 50ms perf assertion. Flagged as a false-negative candidate -- review passed but escalation_created event.",
+      "project": "dark-factory",
+      "split": "test"
+    },
+    {
+      "diff_id": "mined_752",
+      "language": "python",
+      "source": "mined",
+      "description": "Task 752 (dark_factory): test_merge_queue_panel: marker-based script extraction in _extract_inline_script. Flagged as a false-negative candidate -- review passed but escalation_created event.",
+      "project": "dark-factory",
+      "split": "test"
+    },
+    {
+      "diff_id": "mined_1321",
+      "language": "python",
+      "source": "mined",
+      "description": "Task 1321 (dark_factory): AFK hardening: Persist L1 escalations across orchestrator restart. Flagged as a false-negative candidate -- review passed but escalation_created event.",
+      "project": "dark-factory",
+      "split": "test"
+    },
+    {
+      "diff_id": "mined_1227",
+      "language": "python",
+      "source": "mined",
+      "description": "Task 1227 (dark_factory): Render Task Detail pane description + details as markdown. Flagged as a false-negative candidate -- review passed but escalation_created event.",
+      "project": "dark-factory",
+      "split": "test"
+    },
+    {
+      "diff_id": "mined_1060",
+      "language": "python",
+      "source": "mined",
+      "description": "Task 1060 (dark_factory): Pin observed wire type for get_task['id'] in test_taskmaster_mcp_contract.py instead of accepting (str, int). Flagged as a false-negative candidate -- review passed but escalation_created event.",
+      "project": "dark-factory",
+      "split": "test"
+    },
+    {
+      "diff_id": "mined_921",
+      "language": "python",
+      "source": "mined",
+      "description": "Task 921 (dark_factory): Migrate reconciliation add_task callers to submit_task + resolve_ticket. Flagged as a false-negative candidate -- review passed but escalation_created event.",
+      "project": "dark-factory",
+      "split": "train"
     }
-  ]
+  ],
+  "split_seed": "reviewer_trial-2495-fn-mining"
 }

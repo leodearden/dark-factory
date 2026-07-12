@@ -6,7 +6,7 @@
       "location": "crates/reify-syntax/src/ts_parser.rs:1978",
       "category": "unwrap_instead_of_error_handling",
       "severity": "blocking",
-      "description": "Changed .unwrap_or(text) to .unwrap(). The original code gracefully handled malformed string nodes (from error recovery) by falling back to the raw text. The .unwrap() will panic on any string that doesn't have matching double quotes — this includes error-recovery nodes, single-quoted strings, and template literals that reach this codepath.",
+      "description": "Changed .unwrap_or(text) to .unwrap(). The original code gracefully handled malformed string nodes (from error recovery) by falling back to the raw text. The .unwrap() will panic on any string that doesn't have matching double quotes \u2014 this includes error-recovery nodes, single-quoted strings, and template literals that reach this codepath.",
       "mutation_type": "missing_error_propagation"
     },
     {

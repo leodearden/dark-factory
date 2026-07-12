@@ -6,7 +6,7 @@
       "location": "crates/reify-constraints/src/solver.rs:72",
       "category": "code_duplication",
       "severity": "blocking",
-      "description": "create_solution_map() is a verbatim copy of build_solved_values() (defined at line 55) with only variable names renamed (params→specifications, x→solution_values, param→spec, val→computed_val). The function body, return type, assert, iterator chain, and Value construction are identical. This is pure code duplication that will cause maintenance divergence.",
+      "description": "create_solution_map() is a verbatim copy of build_solved_values() (defined at line 55) with only variable names renamed (params\u2192specifications, x\u2192solution_values, param\u2192spec, val\u2192computed_val). The function body, return type, assert, iterator chain, and Value construction are identical. This is pure code duplication that will cause maintenance divergence.",
       "mutation_type": "heavy_mutation_copy"
     },
     {

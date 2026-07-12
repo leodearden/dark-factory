@@ -1,0 +1,44 @@
+{
+  "diff_id": "mined_1082",
+  "ground_truth": [
+    {
+      "id": "frontier_1",
+      "location": "fused-memory/src/fused_memory/reconciliation/prompts/stage2.py:L112-118",
+      "category": "logic",
+      "severity": "blocking",
+      "description": "The set_task_status verification rule says to increment the success counter (e.g. tasks_reopened) whenever newStatus matches the requested status. A no-op call (task already in the requested status) has newStatus == requested, so it is over-counted as a successful operation. The later-corrected version explicitly added a `\"no_op\": true` branch that skips the increment, confirming this omission over-reports counters and defeats the task's goal of verifying real operation success.",
+      "mutation_type": "logic"
+    },
+    {
+      "id": "frontier_2",
+      "location": "fused-memory/src/fused_memory/reconciliation/prompts/stage2.py:L98-104",
+      "category": "logic",
+      "severity": "suggestion",
+      "description": "The guidance counts status=\"combined\" toward tasks_created, but a combined ticket was merged into an existing task (no new task created, per lines 41-42), so incrementing tasks_created inflates the creation count.",
+      "mutation_type": "logic"
+    },
+    {
+      "id": "frontier_3",
+      "location": "fused-memory/src/fused_memory/reconciliation/prompts/stage2.py:L106-118",
+      "category": "api_misuse",
+      "severity": "suggestion",
+      "description": "The set_task_status response contract is described only as a single per-task record (tasks[n] with camelCase taskId/oldStatus/newStatus) and omits the comma-separated-list wrapper ({\"success\": bool, \"results\": [...]}) and per-id result.error cases. An agent applying the top-level newStatus rule to a batched call, or encountering a per-id error, will mis-count or spuriously flag/escalate a discrepancy \u2014 consistent with the review-passed-but-escalation-created symptom. Field naming is also inconsistent (taskId camelCase vs task_id snake_case used elsewhere).",
+      "mutation_type": "api_misuse"
+    }
+  ],
+  "provenance": {
+    "kind": "mined",
+    "task_id": "1082",
+    "project_id": "dark_factory",
+    "outcome": "done",
+    "review_cycles": 1,
+    "verify_attempts": 0,
+    "signal_reason": [
+      "escalation_created event"
+    ],
+    "merge_sha": "a8dc363d9eb94ff9cb68756f239f713088f66861",
+    "runs_db_path": "/home/leo/src/dark-factory/data/orchestrator/runs.db",
+    "runs_db_query": "SELECT task_id, project_id, outcome, review_cycles, verify_attempts FROM task_results WHERE review_cycles >= 1, cross-referenced with events (escalation_created, merge_finalized) -- see mining.mine_fn_candidates.",
+    "escalation_refs": []
+  }
+}

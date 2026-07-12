@@ -1,0 +1,44 @@
+{
+  "diff_id": "mined_1060",
+  "ground_truth": [
+    {
+      "id": "frontier_1",
+      "location": "fused-memory/tests/integration/test_taskmaster_mcp_contract.py:151-155",
+      "category": "wrong_wire_type_assumption",
+      "severity": "blocking",
+      "description": "The new (b2) block asserts isinstance(list_task['id'], int) for the get_tasks list path on the false premise that get_task and get_tasks 'must agree'. Per the backend, get_tasks is asymmetric with get_task: _row_to_task returns 'id': str(row['id']) and get_tasks does NOT coerce (only get_task casts to int). So get_tasks ids are strings and this assertion fails at runtime \u2014 the escalation_created event. The diff's justifying comment ('both are raw passthroughs ... id types must agree') is incorrect.",
+      "mutation_type": "type"
+    },
+    {
+      "id": "frontier_2",
+      "location": "fused-memory/tests/integration/test_taskmaster_mcp_contract.py:140-155",
+      "category": "test_gap",
+      "severity": "blocking",
+      "description": "The added get_tasks round-trip check itself is broken: it pins the wrong type (int) for the list endpoint whose documented/live wire shape is str, so the test can never pass against the real backend and mislabels a correct str id as a contract violation.",
+      "mutation_type": "test_gap"
+    },
+    {
+      "id": "frontier_3",
+      "location": "fused-memory/tests/test_taskmaster_client_contract.py:343-356",
+      "category": "contract_drift",
+      "severity": "blocking",
+      "description": "test_get_tasks_returns_flat_dto was changed to mock ids as int ({'id': 1, ...}) and assert dto['tasks'][0]['id'] == 1, but the real get_tasks wire shape surfaces string ids (_row_to_task returns str(row['id']); only get_task coerces to int). The canned mock now misrepresents live behavior, so the static and live suites are pinned to contradictory shapes rather than kept in lockstep as the comment claims.",
+      "mutation_type": "type"
+    }
+  ],
+  "provenance": {
+    "kind": "mined",
+    "task_id": "1060",
+    "project_id": "dark_factory",
+    "outcome": "done",
+    "review_cycles": 1,
+    "verify_attempts": 1,
+    "signal_reason": [
+      "escalation_created event"
+    ],
+    "merge_sha": "3dc8836867443cff674128069037e871514bf750",
+    "runs_db_path": "/home/leo/src/dark-factory/data/orchestrator/runs.db",
+    "runs_db_query": "SELECT task_id, project_id, outcome, review_cycles, verify_attempts FROM task_results WHERE review_cycles >= 1, cross-referenced with events (escalation_created, merge_finalized) -- see mining.mine_fn_candidates.",
+    "escalation_refs": []
+  }
+}

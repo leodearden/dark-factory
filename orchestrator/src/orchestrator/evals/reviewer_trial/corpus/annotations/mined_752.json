@@ -1,0 +1,28 @@
+{
+  "diff_id": "mined_752",
+  "ground_truth": [
+    {
+      "id": "frontier_1",
+      "location": "dashboard/tests/test_merge_queue_panel.py:82-93",
+      "category": "logic",
+      "severity": "suggestion",
+      "description": "The marker-based _extract_inline_script matches the first <script> body containing the sentinel using a regex that does not parse HTML comments, so a commented-out <script> block containing 'mergeQueueDepthChart' is returned before the real partial script. This is a real correctness weakness (self-documented and asserted by test_sentinel_in_commented_script_is_still_matched), though unlikely to bite given real rendered HTML.",
+      "mutation_type": "logic"
+    }
+  ],
+  "provenance": {
+    "kind": "mined",
+    "task_id": "752",
+    "project_id": "dark_factory",
+    "outcome": "done",
+    "review_cycles": 1,
+    "verify_attempts": 0,
+    "signal_reason": [
+      "escalation_created event"
+    ],
+    "merge_sha": "e59a648cf3c44765838c29265959a9bd5b43fac2",
+    "runs_db_path": "/home/leo/src/dark-factory/data/orchestrator/runs.db",
+    "runs_db_query": "SELECT task_id, project_id, outcome, review_cycles, verify_attempts FROM task_results WHERE review_cycles >= 1, cross-referenced with events (escalation_created, merge_finalized) -- see mining.mine_fn_candidates.",
+    "escalation_refs": []
+  }
+}

@@ -1,0 +1,36 @@
+{
+  "diff_id": "mined_1335",
+  "ground_truth": [
+    {
+      "id": "frontier_1",
+      "location": "fused-memory/tests/test_scheduler_state_tools.py:527-595",
+      "category": "test_gap",
+      "severity": "suggestion",
+      "description": "The class's stated contract was that the MCP tool 'get_scheduler_state' serves a 1500-task snapshot under 50ms, but the test now times only the sync helper 'read_scheduler_state', bypassing the asyncio.to_thread handoff and FastMCP dispatch entirely. A regression in the actual MCP request path that blows the 50ms orchestrator budget would no longer be caught by this canary, so perf coverage of the promised end-to-end path is lost.",
+      "mutation_type": "test_gap"
+    },
+    {
+      "id": "frontier_2",
+      "location": "fused-memory/tests/test_scheduler_state_tools.py:557-594",
+      "category": "flaky_test",
+      "severity": "suggestion",
+      "description": "The change removes asyncio/FastMCP overhead but keeps an absolute wall-clock 50ms bound measured with time.perf_counter, which still includes OS scheduling latency. Under pytest-xdist -n auto with 32 workers on a contended CPU, the process can be descheduled for tens of milliseconds during json.loads of the ~500KB file, so the median-of-20 assertion can still intermittently trip \u2014 the de-flake root cause (CI load sensitivity of a wall-clock latency bound) is only partially addressed.",
+      "mutation_type": "test_gap"
+    }
+  ],
+  "provenance": {
+    "kind": "mined",
+    "task_id": "1335",
+    "project_id": "dark_factory",
+    "outcome": "done",
+    "review_cycles": 1,
+    "verify_attempts": 0,
+    "signal_reason": [
+      "escalation_created event"
+    ],
+    "merge_sha": "9fbc0e02d68df4e309050d6757e5d891aeb66e0b",
+    "runs_db_path": "/home/leo/src/dark-factory/data/orchestrator/runs.db",
+    "runs_db_query": "SELECT task_id, project_id, outcome, review_cycles, verify_attempts FROM task_results WHERE review_cycles >= 1, cross-referenced with events (escalation_created, merge_finalized) -- see mining.mine_fn_candidates.",
+    "escalation_refs": []
+  }
+}

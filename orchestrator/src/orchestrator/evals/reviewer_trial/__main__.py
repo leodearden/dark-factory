@@ -15,8 +15,12 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import os
+import re
+import sqlite3
 import subprocess
 import sys
+from collections import Counter
 from dataclasses import asdict
 from pathlib import Path
 
@@ -461,6 +465,325 @@ def corpus_audit(min_diffs: int) -> None:
         f'Result: {status} ({checks_passed}/{len(_AUDIT_CHECKS)} checks passed)', fg=color, bold=True,
     ))
     sys.exit(0 if report.ok else 1)
+
+
+# ---------------------------------------------------------------------------
+# Mine: FN-candidate mining + frontier labeling (task 2495 / PRD D-6)
+# ---------------------------------------------------------------------------
+
+_MINE_DEFAULT_DB = Path('/home/leo/src/dark-factory/data/orchestrator/runs.db')
+_MINE_DEFAULT_ESC_DIR = Path('/home/leo/src/dark-factory/data/escalations')
+_MINE_DEFAULT_REPO = Path('/home/leo/src/dark-factory')
+_MINE_SPLIT_SEED = 'reviewer_trial-2495-fn-mining'
+
+_LANG_EXTENSIONS = {
+    'python': {'.py', '.pyi'},
+    'rust': {'.rs'},
+    'typescript': {'.ts', '.tsx'},
+}
+
+
+def _infer_language(diff_text: str) -> str:
+    """Best-effort language sniff from a unified diff's ``diff --git`` headers.
+
+    Tallies changed-file extensions against the corpus's three known
+    languages and returns the majority; defaults to 'python' (dark_factory
+    is an all-Python monorepo) when no file matches or the diff carries no
+    recognizable header.
+    """
+    paths = re.findall(r'^diff --git a/(\S+) b/\S+', diff_text, re.M)
+    counts: Counter[str] = Counter()
+    for p in paths:
+        suffix = Path(p).suffix
+        for lang, exts in _LANG_EXTENSIONS.items():
+            if suffix in exts:
+                counts[lang] += 1
+                break
+    if not counts:
+        return 'python'
+    return counts.most_common(1)[0][0]
+
+
+def _fetch_titles(db_path: Path, task_ids: list[str]) -> dict[str, str]:
+    """Supplementary read-only lookup of ``task_results.title``, keyed by task_id.
+
+    Kept separate from ``mining.mine_fn_candidates`` (whose FnCandidate field
+    set is unit-tested) -- this is CLI-only convenience for building a
+    human-readable frontier-prompt description.
+    """
+    if not task_ids:
+        return {}
+    conn = sqlite3.connect(str(db_path))
+    try:
+        placeholders = ','.join('?' for _ in task_ids)
+        rows = conn.execute(
+            f'SELECT task_id, title FROM task_results WHERE task_id IN ({placeholders})',
+            task_ids,
+        ).fetchall()
+        return {row[0]: row[1] or '' for row in rows}
+    finally:
+        conn.close()
+
+
+def _select_spot_check_subset(diff_ids: list[str], fraction: float = 0.1, minimum: int = 5) -> set[str]:
+    """Deterministic, evenly-spread sample of *diff_ids* for the documented
+    human spot-check subset (~10% of mined diffs, floor 5, capped at N)."""
+    ordered = sorted(diff_ids)
+    n = len(ordered)
+    if n == 0:
+        return set()
+    k = min(n, max(minimum, round(n * fraction)))
+    step = n / k
+    indices = sorted({int(i * step) for i in range(k)})
+    return {ordered[i] for i in indices}
+
+
+@cli.command('mine')
+@click.option('--runs-db', default=str(_MINE_DEFAULT_DB), type=click.Path(path_type=Path),
+              help='Path to the offline orchestrator runs.db')
+@click.option('--escalations-dir', default=str(_MINE_DEFAULT_ESC_DIR), type=click.Path(path_type=Path),
+              help='Path to the offline escalations directory')
+@click.option('--repo-path', default=str(_MINE_DEFAULT_REPO), type=click.Path(path_type=Path),
+              help='Git repo to recover mined diffs from')
+@click.option('--target-total', default=100, type=int, help='Aim for this many total diffs (existing + mined)')
+@click.option('--max-parallel', default=8, type=int, help='Max concurrent frontier-labeling calls')
+@click.option('--model', default='opus', help='Frontier model for propose_labels_frontier')
+@click.option('--max-turns', default=15, type=int, help='Turn budget per frontier call (effort=high needs >3)')
+@click.option('--seed', default=_MINE_SPLIT_SEED, help='Deterministic train/selection/test split seed')
+@click.option('--oauth-token-env', default='CLAUDE_OAUTH_TOKEN_A',
+              help='Env var holding the OAuth token for frontier calls (multi-account pool)')
+@click.option('--limit', default=None, type=int, help='Cap the number of NEW candidates attempted this run')
+def mine(
+    runs_db: Path, escalations_dir: Path, repo_path: Path, target_total: int,
+    max_parallel: int, model: str, max_turns: int, seed: str, oauth_token_env: str,
+    limit: int | None,
+) -> None:
+    """Mine FN-candidate diffs from runs.db/escalations, frontier-label them, and
+    expand + re-split the committed corpus (task 2495 / PRD D-6).
+
+    Idempotent and resumable: re-running skips diff_ids already present in the
+    corpus, and persists (manifest + adjudication log, re-split every time)
+    after every successfully-labeled diff -- an interrupted run loses at most
+    the in-flight batch.
+    """
+
+    async def _run() -> int:
+        from .adjudication import AdjudicationLog
+        from .corpus import CorpusDiff
+        from .mining import (
+            FnCandidate,
+            assign_split,
+            audit_corpus,
+            mine_escalation_refs,
+            mine_fn_candidates,
+            propose_labels_frontier,
+            recover_diff,
+            resolve_merge_sha_by_task_id,
+        )
+
+        oauth_token = os.environ.get(oauth_token_env)
+        if not oauth_token:
+            click.echo(
+                f'Warning: {oauth_token_env} not set; falling back to ambient Claude CLI credentials.',
+                err=True,
+            )
+
+        manifest = _load_corpus()
+        log = AdjudicationLog.load(_ADJUDICATION_LOG_PATH)
+
+        click.echo(click.style(
+            f'Mine: FN-candidate mining (corpus: {len(manifest.diffs)} diffs on disk)', bold=True,
+        ))
+        click.echo('=' * 60)
+
+        def _resave() -> None:
+            """Persist manifest + adjudication log, re-deriving split + the
+            spot-check subset from the CURRENT full diff set. Synchronous (no
+            ``await`` inside) so it's safe to call after every successful
+            mine -- an interrupted run leaves a fully consistent, resumable
+            on-disk corpus."""
+            mined_ids = sorted(d.diff_id for d in manifest.diffs if d.source == 'mined')
+            subset = _select_spot_check_subset(mined_ids) if mined_ids else set()
+            entries_by_id = {e.diff_id: e for e in log.entries}
+            for diff_id in mined_ids:
+                entry = entries_by_id.get(diff_id)
+                if entry is not None:
+                    entry.in_spot_check_subset = diff_id in subset
+
+            assignment = assign_split([d.diff_id for d in manifest.diffs], seed=seed)
+            for d in manifest.diffs:
+                d.split = assignment.get(d.diff_id)
+            manifest.split_seed = seed
+
+            manifest.save(_CORPUS_PATH)
+            log.save(_ADJUDICATION_LOG_PATH)
+
+        # Backfill adjudication coverage for pre-existing hand-authored diffs
+        # (never fabricated as "frontier" -- logged with their own original
+        # ground truth, tagged with a frontier_model that names them as
+        # hand-authored so the provenance is honest).
+        logged_ids = {e.diff_id for e in log.entries}
+        backfilled = 0
+        for diff in manifest.diffs:
+            if diff.diff_id in logged_ids or diff.source == 'mined':
+                continue
+            log.append(
+                diff.diff_id,
+                frontier_proposal=diff.ground_truth,
+                in_spot_check_subset=False,
+                frontier_model='hand-authored',
+                notes=(
+                    'Pre-existing hand-authored ground truth from the original '
+                    '15-diff corpus (predates task 2495 FN mining); not frontier-proposed.'
+                ),
+            )
+            logged_ids.add(diff.diff_id)
+            backfilled += 1
+        if backfilled:
+            click.echo(f'  Backfilled {backfilled} adjudication entries for pre-existing hand-authored diffs.')
+            _resave()
+
+        candidates = mine_fn_candidates(runs_db)
+        esc_refs = mine_escalation_refs(escalations_dir)
+        click.echo(f'  {len(candidates)} FN candidates mined from runs.db')
+
+        titles = _fetch_titles(runs_db, [c.task_id for c in candidates])
+
+        existing_ids = {d.diff_id for d in manifest.diffs}
+        recovered: list[tuple[FnCandidate, str, str]] = []
+        for c in candidates:
+            diff_id = f'mined_{c.task_id}'
+            if diff_id in existing_ids:
+                continue
+            sha = c.merge_sha or resolve_merge_sha_by_task_id(c.task_id, repo_path)
+            if not sha:
+                continue
+            text = recover_diff(sha, repo_path)
+            if not text or not text.strip():
+                continue
+            recovered.append((c, sha, text))
+
+        # Smallest diffs first: propose_labels_frontier truncates its prompt
+        # context to 10K chars, so prioritizing smaller (fully-visible) diffs
+        # both biases toward higher-fidelity frontier labels and, since most
+        # recovered merge-commit diffs are far larger than 10K chars, keeps
+        # per-call prompt size (and cost) down across the batch.
+        recovered.sort(key=lambda item: len(item[2]))
+
+        needed = max(0, target_total - len(manifest.diffs))
+        if needed == 0:
+            pool = []
+        else:
+            pool_size = needed + max(5, needed // 4)  # buffer for attrition
+            pool = recovered[:pool_size]
+        if limit is not None:
+            pool = pool[:limit]
+
+        click.echo(f'  {len(recovered)} candidates have a recoverable diff not already in the corpus')
+        click.echo(f'  Attempting {len(pool)} this run (target_total={target_total}, limit={limit})')
+        click.echo()
+
+        semaphore = asyncio.Semaphore(max(1, max_parallel))
+        total = len(pool)
+        state = {'completed': 0, 'added': 0, 'cost': 0.0}
+
+        async def _worker(candidate: FnCandidate, sha: str, diff_text: str) -> None:
+            async with semaphore:
+                title = titles.get(candidate.task_id, '')
+                description = (
+                    f'Task {candidate.task_id} ({candidate.project_id}): {title}. '
+                    f'Flagged as a false-negative candidate -- review passed but '
+                    f'{"; ".join(candidate.signal_reason)}.'
+                )
+                try:
+                    issues, cost = await propose_labels_frontier(
+                        diff_text, model=model, description=description,
+                        oauth_token=oauth_token, max_turns=max_turns,
+                    )
+                except Exception as exc:  # noqa: BLE001 -- offline generation script; one bad candidate must not sink the batch
+                    logging.getLogger(__name__).warning(
+                        'propose_labels_frontier failed for task %s: %s', candidate.task_id, exc,
+                    )
+                    issues, cost = [], 0.0
+
+            state['completed'] += 1
+            state['cost'] += cost
+            diff_id = f'mined_{candidate.task_id}'
+            if not issues:
+                click.echo(f'  [{state["completed"]}/{total}] {diff_id}: no issues proposed -- skipping (cost=${cost:.3f})')
+                return
+
+            provenance = {
+                'kind': 'mined',
+                'task_id': candidate.task_id,
+                'project_id': candidate.project_id,
+                'outcome': candidate.outcome,
+                'review_cycles': candidate.review_cycles,
+                'verify_attempts': candidate.verify_attempts,
+                'signal_reason': candidate.signal_reason,
+                'merge_sha': sha,
+                'runs_db_path': str(runs_db),
+                'runs_db_query': (
+                    'SELECT task_id, project_id, outcome, review_cycles, verify_attempts FROM '
+                    'task_results WHERE review_cycles >= 1, cross-referenced with events '
+                    '(escalation_created, merge_finalized) -- see mining.mine_fn_candidates.'
+                ),
+                'escalation_refs': [
+                    {
+                        'task_id': ref.task_id,
+                        'category': ref.category,
+                        'severity': ref.severity,
+                        'summary': ref.summary,
+                        'level': ref.level,
+                        'path': str(ref.path),
+                    }
+                    for ref in esc_refs.get(candidate.task_id, [])
+                ],
+            }
+            diff = CorpusDiff(
+                diff_id=diff_id,
+                language=_infer_language(diff_text),
+                source='mined',
+                diff_text=diff_text,
+                description=description,
+                ground_truth=issues,
+                project='dark-factory',
+                split=None,
+                provenance=provenance,
+            )
+            manifest.diffs.append(diff)
+            log.append(
+                diff.diff_id,
+                frontier_proposal=diff.ground_truth,
+                in_spot_check_subset=False,  # corrected by _resave()'s stratified pass
+                frontier_model=model,
+                notes=f'Frontier-proposed labels for FN candidate task {candidate.task_id}.',
+            )
+            _resave()
+            state['added'] += 1
+            click.echo(
+                f'  [{state["completed"]}/{total}] {diff_id}: {len(issues)} issues added '
+                f'(cost=${cost:.3f}, corpus now {len(manifest.diffs)})'
+            )
+
+        await asyncio.gather(*(_worker(c, sha, text) for c, sha, text in pool))
+
+        click.echo()
+        click.echo(f'Mined {state["added"]}/{total} new diffs this run (frontier cost: ${state["cost"]:.2f}).')
+        click.echo(f'Corpus: {len(manifest.diffs)} diffs total.')
+
+        report = audit_corpus(manifest, log, min_diffs=50)
+        click.echo()
+        click.echo(click.style(f'Corpus Audit: {report.diff_count} diffs', bold=True))
+        for key, message in _AUDIT_CHECKS:
+            _print_check(key not in report.failures, message)
+        return 0 if report.ok else 1
+
+    try:
+        sys.exit(asyncio.run(_run()))
+    except KeyboardInterrupt:
+        click.echo('\nInterrupted -- progress up to the last completed diff was saved; rerun `mine` to resume.')
+        sys.exit(130)
 
 
 # ---------------------------------------------------------------------------

@@ -1,0 +1,36 @@
+{
+  "diff_id": "mined_1208",
+  "ground_truth": [
+    {
+      "id": "frontier_1",
+      "location": "fused-memory/tests/reconciliation/test_stage1_stall_detector.py:L487-L491",
+      "category": "api_misuse",
+      "severity": "suggestion",
+      "description": "The freshly created module from `module_from_spec` is executed via `exec_module` without first being registered in `sys.modules` under its synthetic name. The Python docs recommend inserting the module into `sys.modules` before `exec_module` so that self-referential or circular imports within the module resolve correctly; omitting it can make the isolated load fail (or behave differently from a real import) if the production module ever imports itself.",
+      "mutation_type": "api_misuse"
+    },
+    {
+      "id": "frontier_2",
+      "location": "fused-memory/tests/reconciliation/test_stage1_stall_detector.py:L456-L462",
+      "category": "test_brittleness",
+      "severity": "suggestion",
+      "description": "`test_escalation_attribute_is_bound` hard-asserts `mod._HAS_ESCALATION is True`, coupling the test to the assumption that the escalation package is always installed. Unlike the previous test (which forced the unavailable branch), this new assertion will fail in any environment where escalation is not installed, reducing portability of the test suite.",
+      "mutation_type": "test_gap"
+    }
+  ],
+  "provenance": {
+    "kind": "mined",
+    "task_id": "1208",
+    "project_id": "dark_factory",
+    "outcome": "done",
+    "review_cycles": 1,
+    "verify_attempts": 0,
+    "signal_reason": [
+      "escalation_created event"
+    ],
+    "merge_sha": "2a3152ce62c9e1885531bf1a434424db9c125387",
+    "runs_db_path": "/home/leo/src/dark-factory/data/orchestrator/runs.db",
+    "runs_db_query": "SELECT task_id, project_id, outcome, review_cycles, verify_attempts FROM task_results WHERE review_cycles >= 1, cross-referenced with events (escalation_created, merge_finalized) -- see mining.mine_fn_candidates.",
+    "escalation_refs": []
+  }
+}

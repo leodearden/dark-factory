@@ -1,0 +1,85 @@
+diff --git a/fused-memory/src/fused_memory/reconciliation/prompts/__init__.py b/fused-memory/src/fused_memory/reconciliation/prompts/__init__.py
+index 7af2a203e7..355cf135c0 100644
+--- a/fused-memory/src/fused_memory/reconciliation/prompts/__init__.py
++++ b/fused-memory/src/fused_memory/reconciliation/prompts/__init__.py
+@@ -65,14 +65,15 @@ _STAGE2_GRAPHITI_QUEUED_GUIDANCE = _GRAPHITI_QUEUED_GUIDANCE_TEMPLATE.format(
+ #   Stage 3 — "## Report Channel" section header + read-only NOTE inserted
+ #             between the cite-tool list and the stats line.
+ #
+-# Dedup anchor (reviewer finding dedup_correctness, PRD §9.3):
+-#   When a finding targets a specific task, pass task_id= at the top level of
+-#   add_finding() in addition to cite_task().  The dedup engine's cited_tasks
+-#   fallback derives a signature from the sorted union of all cited task IDs;
+-#   that signature changes whenever citations grow or shrink, defeating
+-#   recurrence tracking for evolving multi-task findings.  An explicit top-level
+-#   task_id is stable and should always be set when there is a clear primary
+-#   subject task.
++# Dedup anchor (reviewer finding dedup_correctness, PRD §9.3; corrected task-1594):
++#   _derive_affected_ids reads cited_tasks (not the top-level task_id field of
++#   add_finding) when building the fingerprint identity for compute_content_fingerprint.
++#   Always call cite_task for the primary subject task so the fingerprint is stable.
++#   For multi-task findings, the cited_tasks signature shifts as citations grow or
++#   shrink — pass task_id=<primary> at the top level of add_finding as a supplementary
++#   stable anchor when one primary subject exists.
++#   Exception: cross_project findings use task_id=None (operator routing); cite_task
++#   is the sole dedup anchor there (see ## Cross-Project Routing in stage2.py).
+ _RECON_REPORT_TOOL_GUIDANCE = (
+     'The harness calls `mcp__recon-report__start_report` for you before the stage begins'
+     ' — do NOT call it yourself. For each finding, call `mcp__recon-report__add_finding(...)`'
+@@ -83,11 +84,15 @@ _RECON_REPORT_TOOL_GUIDANCE = (
+     ' copy the UUID verbatim from the `id` field of a fresh tool result'
+     ' (`xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx`). Never truncate or construct edge UUIDs.\n'
+     '- `mcp__recon-report__cite_task(finding_id=..., project_id=<project_id>,'
+-    ' task_id=<task_id>)` — both fields are required. **Dedup anchor**: when the finding'
+-    ' has a clear primary subject task, also pass `task_id=<that task_id>` at the top'
+-    ' level of `add_finding(...)`. The dedup engine prefers the top-level field; the'
+-    ' cited_tasks fallback signature changes as citation sets grow, defeating recurrence'
+-    ' tracking.\n'
++    ' task_id=<task_id>)` — both fields are required. **Dedup anchor**:'
++    ' `_derive_affected_ids` reads `cited_tasks` (not the top-level `task_id` field of'
++    ' `add_finding`) when building the fingerprint for `compute_content_fingerprint`.'
++    ' Always call `cite_task` for the primary subject task so the fingerprint is stable.'
++    ' For multi-task findings, the cited_tasks signature shifts as citations grow or'
++    ' shrink — also pass `task_id=<primary>` at the top level of `add_finding` as a'
++    ' supplementary stable anchor when one clear primary subject exists. Exception:'
++    ' cross_project findings use `task_id=None` (operator routing); `cite_task` is the'
++    ' sole dedup anchor there.\n'
+     "- `mcp__recon-report__cite_memory(finding_id=..., memory_id=<uuid>,"
+     " store=<'mem0'|'graphiti'>)` — `memory_id` must be the full 36-char UUID from the"
+     ' `id` field of a fresh tool result.\n'
+diff --git a/fused-memory/src/fused_memory/reconciliation/prompts/stage2.py b/fused-memory/src/fused_memory/reconciliation/prompts/stage2.py
+index 8cb61f4f56..0cc6f20f01 100644
+--- a/fused-memory/src/fused_memory/reconciliation/prompts/stage2.py
++++ b/fused-memory/src/fused_memory/reconciliation/prompts/stage2.py
+@@ -115,10 +115,18 @@ current project as a workaround. Instead, emit a finding via recon_report: call
+ flag_type='cross_project', actionable=False, \
+ description=<one-line summary + target_project_hint>, \
+ suggested_action=<short evidence notes>, task_id=None)` so the operator can route it manually. \
+-Because the target project is NOT in Known Projects, cite_task would return unknown_project \
+-and attach nothing — so this finding has no cited-task anchor and is deduped by its \
+-normalised description until an operator registers the project or routes the work. \
+-No dedicated cross-project tool is needed — the category/flag_type encoding carries the routing signal.
++No dedicated cross-project tool is needed — the category/flag_type encoding carries the routing signal. \
++Dedup anchor for this branch has two sub-cases. (1) If a LOCAL task is the subject of the reroute \
++(its scope is being re-scoped or cancelled because the work belongs to the not-yet-known target \
++project), also call `mcp__recon-report__cite_task(finding_id=<finding_id>, project_id=<local project_id>, \
++task_id=<local task_id>)` for that local task — even when it is being re-scoped or cancelled. The local \
++task's project_id IS in "Known Projects" (this cycle is bound to it), so cite_task resolves and appends \
++to cited_tasks; _derive_affected_ids reads cited_tasks (not the top-level task_id field, which is \
++intentionally None here) to build the cross-cycle dedup anchor for compute_content_fingerprint, so the \
++finding stops re-escalating every cycle. (2) If no local task is the subject — the work lives entirely \
++in the target project with no local anchor — then cite_task on the TARGET project would return \
++unknown_project and attach nothing, so this finding has no cited-task anchor and is deduped by its \
++normalised description until an operator registers the project or routes the work.
+ - Re-scoping or deleting an existing local task because its scope belongs elsewhere is fine \
+ — follow the Authority Model rules for that.
+ 
+diff --git a/fused-memory/tests/test_stages.py b/fused-memory/tests/test_stages.py
+index af9923bb08..3f2a5e5e48 100644
+--- a/fused-memory/tests/test_stages.py
++++ b/fused-memory/tests/test_stages.py
+@@ -10055,4 +10055,3 @@ class TestBuildSummaryNonceSectionPrefix:
+             f"'summary_nonce: STAGE2_<8-hex>'; got: {section!r}"
+         )
+ 
+-

@@ -1,0 +1,45 @@
+{
+  "diff_id": "mined_1157",
+  "ground_truth": [
+    {
+      "id": "frontier_1",
+      "location": "fused-memory/src/fused_memory/reconciliation/prompts/stage2.py:236-241",
+      "category": "logic",
+      "severity": "blocking",
+      "description": "Stage 2 is told to record over-cap and outage-deferred UUIDs under stats key `entity_refresh_retried_deferred` \"so the next cycle can pick them up,\" but the only channel Stage 2 consumes is Stage 1's `entity_refresh_failed_uuids`. Stage 1 only records freshly-failed refreshes into that key and never re-reads a prior Stage 2's `entity_refresh_retried_deferred`, so deferred/over-cap UUIDs are silently dropped and never actually retried in a later cycle.",
+      "mutation_type": "logic"
+    },
+    {
+      "id": "frontier_2",
+      "location": "fused-memory/src/fused_memory/reconciliation/prompts/stage2.py:230-241",
+      "category": "logic",
+      "severity": "suggestion",
+      "description": "The 3-consecutive-error abort and the 20-UUID cap both dump remaining UUIDs into `entity_refresh_retried_deferred`, but an errored UUID is also added to `entity_refresh_retried_failed` (step 3); the prompt does not disambiguate whether the UUID that triggered the 3rd consecutive error belongs to `retried_failed`, `retried_deferred`, or both, allowing double-counting or omission depending on interpretation.",
+      "mutation_type": "logic"
+    },
+    {
+      "id": "frontier_3",
+      "location": "fused-memory/tests/test_refresh_entity_summary.py:876-908",
+      "category": "test_gap",
+      "severity": "suggestion",
+      "description": "The new contract test only exercises `_format_report` serialization of the stats key; it does not verify that Stage 1 actually writes `entity_refresh_failed_uuids` on an error response, nor that Stage 2 reads and retries them, so the core producer/consumer behavior claimed by the change remains untested.",
+      "mutation_type": "test_gap"
+    }
+  ],
+  "provenance": {
+    "kind": "mined",
+    "task_id": "1157",
+    "project_id": "dark_factory",
+    "outcome": "done",
+    "review_cycles": 2,
+    "verify_attempts": 3,
+    "signal_reason": [
+      "verify_attempts>=2 (actual=3)",
+      "escalation_created event"
+    ],
+    "merge_sha": "b9a3cdfd117feebf2eaacdc82c029609578e4e44",
+    "runs_db_path": "/home/leo/src/dark-factory/data/orchestrator/runs.db",
+    "runs_db_query": "SELECT task_id, project_id, outcome, review_cycles, verify_attempts FROM task_results WHERE review_cycles >= 1, cross-referenced with events (escalation_created, merge_finalized) -- see mining.mine_fn_candidates.",
+    "escalation_refs": []
+  }
+}
