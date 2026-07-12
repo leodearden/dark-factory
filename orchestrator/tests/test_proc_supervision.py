@@ -578,3 +578,110 @@ class TestCrossUnitBlockingVerifyFail:
         assert esc.level == 2
         assert esc.severity == 'critical'
         assert esc.category == 'infra_issue'
+
+
+# ---------------------------------------------------------------------------
+# step-13: RED — RP-4 wrapper exactness + registration failure
+# ---------------------------------------------------------------------------
+
+
+class TestEscalationSpecSubmitArgvExact:
+    """EscalationSpec.to_submit_argv builds the exact ``python -m escalation
+    submit ...`` argv (RP-4 shell branch) — byte-for-byte, so the detached
+    on-failure wrapper and any future direct caller produce an identical
+    invocation."""
+
+    def test_to_submit_argv_exact_shape(self) -> None:
+        from orchestrator.proc_supervision import EscalationSpec
+
+        spec = EscalationSpec(
+            queue_dir='/tmp/q',
+            task_id='task-1',
+            summary='boom',
+            detail='full context',
+        )
+
+        argv = spec.to_submit_argv('/usr/bin/python3')
+
+        assert argv == [
+            '/usr/bin/python3', '-m', 'escalation', 'submit',
+            '--queue-dir', '/tmp/q',
+            '--task', 'task-1',
+            '--severity', 'critical',
+            '--category', 'infra_issue',
+            '--summary', 'boom',
+            '--agent-role', 'orchestrator-deterministic',
+            '--detail', 'full context',
+        ]
+
+
+@pytest.mark.asyncio
+class TestDetachedWrapperExactnessAndRegistrationFailure:
+    """(b) The ``/bin/sh -c`` payload for a detached self-restart is
+    byte-for-byte
+    ``f'{quoted_payload}; __rc=$?; if [ "$__rc" -ne 0 ]; then {quoted_on_failure}; fi; exit "$__rc"'``.
+    (c) A non-zero systemd-run registration rc reports REGISTRATION_FAILED —
+    no crash, no false SCHEDULED."""
+
+    async def test_wrapper_payload_is_byte_for_byte(self, tmp_queue_dir: Path) -> None:
+        import sys
+
+        from orchestrator.proc_supervision import EscalationSpec, RestartPlan
+
+        runner = FakeRunner(returncode=0)
+        spec = EscalationSpec(
+            queue_dir=str(tmp_queue_dir),
+            task_id='task-99',
+            summary='Self-restart fire-time failure',
+        )
+        plan = RestartPlan(
+            script=Path('/proj/scripts/restart-orchestrator.sh'),
+            args=['--foo'],
+            cwd=Path('/proj'),
+            target_unit='orch.service',
+            own_unit='orch.service',
+            on_failure_escalation=spec,
+            verify=None,
+            transient_unit='orch-redeploy-restart-99.service',
+            on_active_secs=10,
+        )
+
+        await plan.execute(runner=runner)
+
+        argv, _kwargs = runner.calls[0]
+        wrapped = argv[-1]
+
+        quoted_payload = ' '.join(
+            shlex.quote(p) for p in ['/proj/scripts/restart-orchestrator.sh', '--foo']
+        )
+        quoted_on_failure = ' '.join(
+            shlex.quote(p) for p in spec.to_submit_argv(sys.executable)
+        )
+        expected = (
+            f'{quoted_payload}; __rc=$?; '
+            f'if [ "$__rc" -ne 0 ]; then {quoted_on_failure}; fi; '
+            f'exit "$__rc"'
+        )
+        assert wrapped == expected
+
+    async def test_registration_failure_reports_registration_failed(
+        self, tmp_queue_dir: Path,
+    ) -> None:
+        from orchestrator.proc_supervision import RestartDisposition, RestartPlan
+
+        runner = FakeRunner(returncode=1, stdout=b'systemd-run: unit already exists\n')
+        plan = RestartPlan(
+            script=Path('/proj/scripts/restart-orchestrator.sh'),
+            args=[],
+            cwd=Path('/proj'),
+            target_unit='orch.service',
+            own_unit='orch.service',
+            on_failure_escalation=None,
+            verify=None,
+            transient_unit='orch-redeploy-restart-1.service',
+        )
+
+        outcome = await plan.execute(runner=runner)
+
+        assert outcome.disposition == RestartDisposition.REGISTRATION_FAILED
+        assert outcome.escalated is False
