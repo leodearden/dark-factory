@@ -3969,6 +3969,126 @@ class Scheduler:
                 gated.add(tid)
         return gated
 
+    # ---- acquire_next tick phases (W10-β) ----
+    #
+    # Each `_phase_*` method below is one ordered, side-effecting step of the
+    # `acquire_next` tick, in `Scheduler._TICK_PHASE_ORDER` order. Every
+    # phase takes the per-tick `TickContext` and returns either `_CONTINUE`
+    # (proceed to the next phase) or a `TickOutcome` (end the tick with that
+    # assignment). Docstrings declare each phase's ctx reads/writes.
+
+    async def _phase_drain_park_eviction(self, ctx: TickContext) -> object:
+        """Hygiene phase 2/18: drain queued operator force-evict requests.
+
+        Reads: ``ctx.status_map``, ``ctx.tasks_by_id``. Writes: none on
+        ctx (mutates the park-eviction store + lock table directly via
+        ``_drain_park_eviction_requests``). Runs BEFORE the automatic
+        park-GC sweep so operator-lever evictions emit
+        reservation_force_evicted (not reservation_expired) for the same
+        dead owner. Always continues.
+        """
+        self._drain_park_eviction_requests(ctx.status_map, ctx.tasks_by_id)
+        return _CONTINUE
+
+    async def _phase_park_gc(self, ctx: TickContext) -> object:
+        """Hygiene phase 3/18: owner-state park-GC sweep.
+
+        Reads: ``ctx.status_map``, ``ctx.tasks_by_id``. Writes: none on
+        ctx (mutates ``self.lock_table``/``self._skip_count`` and emits
+        reservation_expired/reservation_restored events). Replaces the
+        wall-clock lease mechanic: a park whose owner is terminal /
+        missing / deps-unsatisfied has no reason to keep blocking other
+        tasks, so it's evicted now. Always continues.
+        """
+        def _park_gc(tid: str) -> bool:
+            status = ctx.status_map.get(tid)
+            if status in TERMINAL_STATUSES:
+                return True
+            if tid not in ctx.tasks_by_id:
+                return True
+            return not self._deps_satisfied(ctx.tasks_by_id[tid], ctx.status_map, ctx.tasks_by_id)
+
+        gc_evicted, gc_restored = self.lock_table.prune_owners(_park_gc)
+        for owner in gc_evicted:
+            self._skip_count.pop(owner, None)
+            if self.event_store:
+                owner_status = ctx.status_map.get(owner)
+                if owner_status in TERMINAL_STATUSES:
+                    reason = f'terminal:{owner_status}'
+                elif owner not in ctx.tasks_by_id:
+                    reason = 'missing'
+                else:
+                    reason = 'deps_unsatisfied'
+                self.event_store.emit(
+                    EventType.reservation_expired,
+                    task_id=owner,
+                    data={'reason': reason},
+                )
+        if self.event_store:
+            for restored_owner, restored_modules in gc_restored:
+                self.event_store.emit(
+                    EventType.reservation_restored,
+                    task_id=restored_owner,
+                    data={
+                        'restored_owner': restored_owner,
+                        'modules': restored_modules,
+                    },
+                )
+        return _CONTINUE
+
+    async def _phase_stale_sweep(self, ctx: TickContext) -> object:
+        """Hygiene phase 4/18: sweep stale per-task bookkeeping + streak counters.
+
+        Reads: ``ctx.status_map``, ``ctx.tasks_by_id``. Writes:
+        ``ctx.stale_ids``. Drops ``_last_dispatch_at`` / ``_skip_count`` /
+        ``_module_cache`` / ``_pending_anchor`` entries for tasks that are
+        (a) in a terminal status, or (b) absent from tasks_by_id
+        (active-only filter dropped them), recording each dropped id in
+        ``_was_non_pending`` and ``ctx.stale_ids``. Then sweeps every
+        registered ``StreakRegistry`` counter (task 2124) via
+        ``self._streak_registry.gc`` — CONSUMED here, not re-collapsed
+        into a hand loop — unioning in tasks that left the candidate pool
+        for a non-terminal, non-eligible status (starvation-only sweep
+        set). Always continues.
+        """
+        stale_ids: set[str] = set()
+        all_tracked: set[str] = (
+            set(self._last_dispatch_at)
+            | set(self._skip_count)
+            | set(self._module_cache)
+            | set(self._pending_anchor)
+        )
+        for tid_str in all_tracked:
+            if ctx.status_map.get(tid_str) in TERMINAL_STATUSES or tid_str not in ctx.tasks_by_id:
+                self._last_dispatch_at.pop(tid_str, None)
+                self._skip_count.pop(tid_str, None)
+                self._module_cache.pop(tid_str, None)
+                self._pending_anchor.pop(tid_str, None)
+                self._was_non_pending.add(tid_str)
+                stale_ids.add(tid_str)
+        starvation_non_eligible = {
+            tid for tid in self._starvation_escalated
+            if ctx.status_map.get(tid) in _STARVATION_NON_ELIGIBLE
+        }
+        await self._streak_registry.gc(
+            stale_ids, extra={'starvation': starvation_non_eligible}
+        )
+        ctx.stale_ids = stale_ids
+        return _CONTINUE
+
+    async def _phase_cooldown_gc(self, ctx: TickContext) -> object:
+        """Hygiene phase 5/18: GC the requeue-cooldown dict.
+
+        Reads/writes: none on ctx (mutates ``self._requeue_until``
+        directly via ``_gc_expired_cooldowns``). Runs before both the
+        scored-candidate loop and the pin-dispatch loop so both observe
+        post-GC state, matching the contract previously provided by the
+        lazy per-call delete inside ``_eligible_for_dispatch``. Always
+        continues.
+        """
+        self._gc_expired_cooldowns()
+        return _CONTINUE
+
     async def acquire_next(self) -> TaskAssignment | None:
         """Find next eligible task under the value/h scoring model.
 
@@ -4031,6 +4151,18 @@ class Scheduler:
 
         # Maintain age anchors (resurrected tasks reset their anchor).
         self._update_age_anchors(tasks, max_id)
+
+        # Per-tick mutable state threaded through the phase methods below
+        # (W10-β). Constructed once the status/id indices + age anchors are
+        # ready; `status_map`/`tasks_by_id`/`tasks` below are the SAME
+        # objects as ctx's fields (mutated in place by the not-yet-extracted
+        # code immediately following), so ctx stays consistent as they fill in.
+        ctx = TickContext(
+            tasks=tasks,
+            status_map=status_map,
+            tasks_by_id=tasks_by_id,
+            max_id=max_id,
+        )
 
         # Correctness crux (γ2): the active-only filter drops terminal tasks
         # from the result, so dep-ids referencing DONE/CANCELLED tasks will be
@@ -4125,48 +4257,8 @@ class Scheduler:
                                 _dep_id,
                             )
 
-        # Operator-issued eviction drain: process any queued force-evict
-        # requests BEFORE the automatic park-GC sweep so that operator-lever
-        # evictions emit reservation_force_evicted (not reservation_expired).
-        self._drain_park_eviction_requests(status_map, tasks_by_id)
-
-        # Owner-state park-GC sweep. Replaces the wall-clock lease mechanic:
-        # a park whose owner is terminal / missing / deps-unsatisfied has no
-        # reason to keep blocking other tasks, so it's evicted now.
-        def _park_gc(tid: str) -> bool:
-            status = status_map.get(tid)
-            if status in TERMINAL_STATUSES:
-                return True
-            if tid not in tasks_by_id:
-                return True
-            return not self._deps_satisfied(tasks_by_id[tid], status_map, tasks_by_id)
-
-        gc_evicted, gc_restored = self.lock_table.prune_owners(_park_gc)
-        for owner in gc_evicted:
-            self._skip_count.pop(owner, None)
-            if self.event_store:
-                owner_status = status_map.get(owner)
-                if owner_status in TERMINAL_STATUSES:
-                    reason = f'terminal:{owner_status}'
-                elif owner not in tasks_by_id:
-                    reason = 'missing'
-                else:
-                    reason = 'deps_unsatisfied'
-                self.event_store.emit(
-                    EventType.reservation_expired,
-                    task_id=owner,
-                    data={'reason': reason},
-                )
-        if self.event_store:
-            for restored_owner, restored_modules in gc_restored:
-                self.event_store.emit(
-                    EventType.reservation_restored,
-                    task_id=restored_owner,
-                    data={
-                        'restored_owner': restored_owner,
-                        'modules': restored_modules,
-                    },
-                )
+        await self._phase_drain_park_eviction(ctx)
+        await self._phase_park_gc(ctx)
 
         # Drop _last_dispatch_at, _skip_count, _module_cache, _pending_anchor,
         # and sub-threshold _external_unresolved_counts entries for tasks that are:
@@ -4187,52 +4279,8 @@ class Scheduler:
         # Recording _was_non_pending preserves resurrection semantics: if the task
         # is re-queued to pending, it gets a fresh max_id anchor instead of
         # re-using its old (stale) numeric id as the age anchor.
-        _stale_ids: set[str] = set()
-        # Iterate the union of all tracked bookkeeping keys so we catch ids that
-        # are absent from status_map entirely (completed, dropped by active filter).
-        # _pending_anchor is included so anchor-only entries (tasks that went
-        # pending → terminal without ever being dispatched) are also caught.
-        _all_tracked: set[str] = (
-            set(self._last_dispatch_at)
-            | set(self._skip_count)
-            | set(self._module_cache)
-            | set(self._pending_anchor)
-        )
-        for tid_str in _all_tracked:
-            if status_map.get(tid_str) in TERMINAL_STATUSES or tid_str not in tasks_by_id:
-                self._last_dispatch_at.pop(tid_str, None)
-                self._skip_count.pop(tid_str, None)
-                self._module_cache.pop(tid_str, None)
-                self._pending_anchor.pop(tid_str, None)
-                self._was_non_pending.add(tid_str)
-                _stale_ids.add(tid_str)
-        # Sweep every registered streak counter (task 2124): external_unresolved
-        # / local_backfill / hold / resolver_degraded are keyed off _stale_ids;
-        # starvation is ALSO keyed off tasks that transition to a non-terminal
-        # but non-eligible status (blocked/deferred/review/merge-deferred) —
-        # those leave the candidate pool without going terminal, so the
-        # dispatch-site resolve and the _stale_ids sweep would never fire.
-        # 'in-progress' tasks are already resolved at the dispatch site;
-        # 'pending' tasks may return to candidacy so we keep their escalation.
-        # StreakRegistry.gc resolves (via the 'starvation' counter's on_gc,
-        # i.e. _starvation_gc_resolve) BEFORE clearing each escalated key in
-        # the sweep set, and wraps the callback in try/except so a resolve
-        # failure never aborts the GC sweep — mirrors the previous inline
-        # resolve-then-clear block exactly.
-        _starvation_non_eligible = {
-            tid for tid in self._starvation_escalated
-            if status_map.get(tid) in _STARVATION_NON_ELIGIBLE
-        }
-        await self._streak_registry.gc(
-            _stale_ids, extra={'starvation': _starvation_non_eligible}
-        )
-
-        # Per-tick GC of the requeue-cooldown dict — keeps the dict bounded
-        # and lets _eligible_for_dispatch stay side-effect-free.  Runs before
-        # both the scored-candidate loop and the pin-dispatch loop so both
-        # observe post-GC state, matching the contract previously provided by
-        # the lazy per-call delete inside _eligible_for_dispatch.
-        self._gc_expired_cooldowns()
+        await self._phase_stale_sweep(ctx)
+        await self._phase_cooldown_gc(ctx)
 
         # Cross-project external dep gate (invariant 5 — one batched call per tick).
         # Collect the union of metadata.external_deps across all pending tasks; if
