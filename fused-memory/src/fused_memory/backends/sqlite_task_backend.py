@@ -1017,6 +1017,8 @@ class SqliteTaskBackend:
         async with self._connect_locks_lock:
             connection_items = list(self._connections.items())
             self._connections.clear()
+            read_connection_items = list(self._read_connections.items())
+            self._read_connections.clear()
         # Final TRUNCATE checkpoint on each connection so a clean shutdown
         # leaves the WAL empty and the main DB up to date — the prod
         # recovery path on next-open then has nothing to replay. Best-effort:
@@ -1027,6 +1029,12 @@ class SqliteTaskBackend:
             with contextlib.suppress(Exception):
                 await conn.close()
             logger.debug('SqliteTaskBackend final-checkpointed and closed %s', root)
+        # Read connections (task 2455) are autocommit and never write, so
+        # there's no WAL checkpoint to run — just close them, best-effort.
+        for root, read_conn in read_connection_items:
+            with contextlib.suppress(Exception):
+                await read_conn.close()
+            logger.debug('SqliteTaskBackend closed read connection for %s', root)
         logger.info('SqliteTaskBackend closed (%d connection(s))', len(connection_items))
 
     async def is_alive(self) -> tuple[bool, str | None]:

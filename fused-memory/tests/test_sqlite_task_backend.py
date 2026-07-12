@@ -3988,7 +3988,8 @@ async def test_close_drains_cached_read_connections(backend, project_root):
     assert backend._read_connections == {}, (
         f'Expected _read_connections to be drained/cleared by close(), got: {backend._read_connections}'
     )
-    with pytest.raises(Exception):
+    # A closed aiosqlite connection raises ValueError on further operations.
+    with pytest.raises(ValueError):
         await read_conn.execute('SELECT 1')
 
 
