@@ -206,9 +206,13 @@ def check(
             ),
             hint=(
                 'Terminal tasks (done, cancelled) are frozen against '
-                'recon-stage writes. If this task genuinely needs updating, '
-                'use a non-recon-stage agent_id or route through '
-                'set_task_status with a reopen_reason.'
+                'recon-stage update_task writes. To correct done_provenance '
+                'or other metadata on a done task, use set_task_status('
+                'task_id, \'done\', done_provenance={\'kind\': \'merged\'|'
+                '\'found_on_main\', \'commit\': <ancestor-checked sha>}) '
+                '— a done->done repair that does not reopen the task. '
+                'Note: update_task can never write done_provenance — it is '
+                'rejected for every caller by the write-authority floor.'
             ),
             live_status=live_status,
             target_status=target_status,
