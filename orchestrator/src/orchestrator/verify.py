@@ -12,6 +12,7 @@ import shlex
 import shutil
 import time
 import uuid
+from collections.abc import Callable
 from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime
 from pathlib import Path
@@ -20,6 +21,7 @@ from typing import Literal, TypedDict
 from shared.proc_group import terminate_process_group
 from shared.verify_admission import acquire_task_slot, nice_prefix
 
+from orchestrator import verify_plan
 from orchestrator.cargo_scope import discover_workspace_crates, files_to_crates
 from orchestrator.config import ModuleConfig, OrchestratorConfig
 from orchestrator.verify_categories import (
@@ -195,90 +197,41 @@ def _cargo_scope_str(cmd: str | None, crates: list[str]) -> str | None:
     return render(scoped)
 
 
-def _is_test_file(path: str) -> bool:
-    """Return True for test-tree members (test_*.py, *_test.py, anything under tests/).
-
-    This is the BROAD test-tree-membership predicate: a file that is True here
-    means the test tree was touched and tests should run.  It is distinct from
-    ``_is_collectable_test_file`` (the narrow pytest-collectability predicate):
-    a data module under tests/ is a test-tree member but NOT collectable (passing
-    it to pytest produces rc=5 "no tests ran").
-
-    Returns False for conftest.py at any depth — conftest files are not directly
-    runnable by pytest, so excluding them here means callers can pass the result
-    straight to pytest without a follow-up filter.
-    """
-    name = path.rsplit('/', 1)[-1]
-    return (
-        (
-            name.startswith('test_')
-            or name.endswith('_test.py')
-            or '/tests/' in path
-            or path.startswith('tests/')
-        )
-        and not _is_conftest(path)
-    )
-
-
-def _is_collectable_test_file(path: str) -> bool:
-    """Return True for files pytest will actually collect when passed as a target.
-
-    Narrow predicate: only ``test_*.py`` and ``*_test.py`` (minus conftest).
-    A data module under tests/ (e.g. ``shared/tests/silent_fallthrough_allowlist.py``)
-    satisfies ``_is_test_file`` (test-tree membership) but NOT this predicate
-    because its filename is not in the ``test_*`` / ``*_test`` convention —
-    passing it to pytest produces rc=5 ("no tests ran").
-
-    Distinct from ``_is_test_file`` (test-tree membership, broad).
-    Task 1852: scoping builders must use this predicate for pytest targets.
-    """
-    name = path.rsplit('/', 1)[-1]
-    return (name.startswith('test_') or name.endswith('_test.py')) and not _is_conftest(path)
-
-
-def _is_conftest(path: str) -> bool:
-    """Return True when *path* is a ``conftest.py`` file."""
-    return path.rsplit('/', 1)[-1] == 'conftest.py'
-
-
-# Matches a class that inherits from Protocol or TypedDict (as a base class).
-# Deliberately a cheap content grep rather than an AST parse: structural files
-# almost always use the canonical ``class Foo(Protocol):`` /
-# ``class Bar(TypedDict):`` form, and the cost of a rare false positive (an
-# extra package-wide pyright run) is far cheaper than missing a cross-file
-# invariance break caused by scoping pyright to only the changed file.
-_PROTOCOL_RE = re.compile(r'\bclass\s+\w+\s*\([^)]*\bProtocol\b')
-_TYPEDDICT_RE = re.compile(r'\bclass\s+\w+\s*\([^)]*\bTypedDict\b')
+# Task γ (2126): file classification lives in exactly ONE place —
+# verify_plan.classify_file's precedence ladder (CONFTEST > COLLECTABLE_TEST
+# > TEST_DATA > STRUCTURAL > SOURCE > INERT). This closes the "same
+# file-classification bug independently fixed in both scope_module_config AND
+# _build_fallback_config" class by construction (task-1077 conftest,
+# task-1852 data-module): both functions call these same four names, so a
+# fix (or a future D-invariant) here is automatically visible in both.
+#
+# _is_conftest / _is_collectable_test_file / _is_test_file are direct
+# identity re-exports — step-3/4 (TestDerivedPredicates) already proved them
+# behaviorally equivalent to the predicates they replace, across a path
+# table covering conftest at various depths, test_*/*_test files, data
+# modules under tests/, and plain source.
+_is_conftest = verify_plan._is_conftest
+_is_collectable_test_file = verify_plan._is_collectable_test_file
+_is_test_file = verify_plan._is_test_file
 
 
 def _is_structural_python_file(path: str, content: str) -> bool:
     """Return True when *path* defines a Protocol or TypedDict subclass.
 
-    A deliberately cheap content grep (not an AST parse): matches
-    ``class Foo(Protocol):`` and ``class Bar(TypedDict):`` patterns including
-    multi-base forms such as ``class Foo(Base, Protocol):``.
-
-    Cross-file invariant trap: pyright scoped to a single file cannot verify
-    that all implementors of a Protocol still conform after the Protocol's
-    definition widens.  Returning True causes ``scope_module_config`` to fall
-    back to the full package-wide type-check command so pyright sees the
-    complete picture.
-
-    Scope notes:
-    - ``.pyi`` stub files are explicitly excluded (``path.endswith('.py')``
-      check).  Stub-defined Protocols create the same cross-file invariant
-      trap, but ``.pyi`` stubs are filtered from ``scoped`` before this
-      helper is reached (see ``scope_module_config``'s ``endswith('.py')``
-      filter), so they would never be passed here in normal operation.
-    - Type-argument usage such as ``class Foo(Dict[str, Protocol]):`` is a
-      known false positive: the regex matches ``Protocol`` inside the base
-      list even when it is not a direct base.  The cost is an extra
-      package-wide pyright run — acceptable given the alternative is silently
-      missing a real invariance break.
+    Delegates to :func:`verify_plan.classify_file`'s precedence ladder: a
+    CONFTEST / COLLECTABLE_TEST / TEST_DATA file is never STRUCTURAL even
+    when its content defines a Protocol/TypedDict — those classifications
+    outrank STRUCTURAL (see ``FileKind``'s docstring; TEST_DATA outranking
+    STRUCTURAL is what keeps a Protocol-defining data module under ``tests/``
+    triggering the full pytest suite rather than merely widening pyright).
+    This only differs from the pre-task-γ content-only check for that
+    conftest/test-tree edge case — every existing non-test-tree caller
+    (``scope_module_config``'s ``has_structural`` loop, and now
+    ``_build_fallback_config``'s) sees identical results, including the
+    documented ``.pyi``-exclusion and type-argument false-positive behavior
+    (``TestIsStructuralPythonFile``).
     """
-    if not path.endswith('.py'):
-        return False
-    return bool(_PROTOCOL_RE.search(content) or _TYPEDDICT_RE.search(content))
+    return verify_plan.classify_file(path, content) is verify_plan.FileKind.STRUCTURAL
 
 
 # Workspace member whose venv declares ``ruff`` (shared/pyproject.toml: ``ruff>=0.4``).
@@ -1783,6 +1736,39 @@ def _build_fallback_config(
     else:
         lint_scoped = lint_cmd = 'ruff check ' + ' '.join(py_files)
         type_scoped = type_cmd = 'pyright ' + ' '.join(py_files)
+
+    # Structural widening (D2, task γ): a Protocol/TypedDict-defining .py file
+    # needs the FULL unscoped type-check command — file-scoped pyright cannot
+    # verify cross-file Protocol/TypedDict conformance.  Mirrors
+    # scope_module_config's has_structural block; this is the gap
+    # _build_fallback_config used to lack entirely (it never inspected file
+    # content at all) prior to task γ.  Overrides type_scoped/type_cmd
+    # in-place so every branch below (pure-subproject, mixed-subproject,
+    # non-default-configured, bare-default) inherits the widening uniformly,
+    # matching how has_structural applies module-wide in scope_module_config.
+    has_structural = False
+    structural_trigger: str | None = None
+    _type_check_command_raw = config.type_check_command if config is not None else 'pyright'
+    if worktree is not None and _type_check_command_raw:
+        for f in py_files:
+            full = worktree / f
+            if full.is_file():
+                try:
+                    content = full.read_text(encoding='utf-8', errors='replace')
+                except OSError:
+                    continue
+                if _is_structural_python_file(f, content):
+                    has_structural = True
+                    structural_trigger = f
+                    break
+    if has_structural:
+        logger.info(
+            'pyright unscoped (fallback): structural file %s in diff', structural_trigger,
+        )
+        type_scoped = _type_check_command_raw
+        type_cmd = (
+            _reproject_str(type_scoped, _FALLBACK_UV_PROJECT) if config is not None else type_scoped
+        )
 
     # Subproject-scoped TEST command (task 2344): when every touched file
     # lives under a single top-level directory that is itself a real
@@ -3498,6 +3484,30 @@ async def run_full_verification(
     return _aggregate_results(list(results))
 
 
+def _worktree_reader(worktree: Path | None) -> Callable[[str], str | None]:
+    """Build a ``verify_plan`` ``worktree_reader`` bound to *worktree*.
+
+    Mirrors the ``is_file()`` + ``read_text(errors='replace')`` pattern used
+    inline by ``scope_module_config``'s and ``_build_fallback_config``'s own
+    structural-file content reads, so ``derive_verify_plan``'s STRUCTURAL
+    detection (task γ, D2) sees exactly the same file content those
+    functions do. Always answers ``None`` when *worktree* is ``None``
+    (mirrors those functions' own ``worktree is not None`` guards) — no
+    STRUCTURAL PlannedRun can be derived without a worktree to read from.
+    """
+    def _read(path: str) -> str | None:
+        if worktree is None:
+            return None
+        full = worktree / path
+        if not full.is_file():
+            return None
+        try:
+            return full.read_text(encoding='utf-8', errors='replace')
+        except OSError:
+            return None
+    return _read
+
+
 async def run_scoped_verification(
     worktree: Path,
     config: OrchestratorConfig,
@@ -3674,13 +3684,27 @@ async def run_scoped_verification(
                 n_files = len(existing_files)
                 n_mods = len(scoped)
                 logger.info('Verification mode: file-scoped (%d files across %d subprojects)', n_files, n_mods)
+                # Declarative decision record (task γ, verify_plan.py) — NOT
+                # the execution driver: scope_module_config (above) already
+                # built `scoped`, preserving its subproject-narrowing/cargo
+                # logic byte-for-byte. derive_verify_plan is attached to the
+                # aggregated result (VerifyResult.plan) and logged per
+                # attempt for observability/diagnosis.
+                plan_dict = verify_plan.derive_verify_plan(
+                    existing_files, module_configs, config, _worktree_reader(worktree), role=role,
+                ).to_dict()
+                logger.info('Verify plan: %s', plan_dict)
             else:
                 scoped = module_configs
+                plan_dict = None
                 logger.info('Verification mode: subproject-scoped (%d subprojects)', len(module_configs))
             results = await asyncio.gather(
                 *(_verify_module(mc) for mc in scoped)
             )
-            return _aggregate_results(list(results))
+            aggregated = _aggregate_results(list(results))
+            if plan_dict is not None:
+                aggregated.plan = plan_dict
+            return aggregated
 
         # No module_configs — try fallback or global
         if task_files:
@@ -3715,12 +3739,23 @@ async def run_scoped_verification(
                     fallback, existing_files, worktree, scope_cargo_enabled,
                 )
                 logger.info('Verification mode: fallback-scoped (%d files)', len(existing_files))
-                return await run_verification(
+                # Declarative decision record (task γ) — see the
+                # module_configs branch's identical comment above; not the
+                # execution driver. module_configs is [] here by construction
+                # (we're past the `if module_configs:` branch above), which
+                # selects derive_verify_plan's fallback branch.
+                plan_dict = verify_plan.derive_verify_plan(
+                    existing_files, module_configs, config, _worktree_reader(worktree), role=role,
+                ).to_dict()
+                logger.info('Verify plan: %s', plan_dict)
+                fallback_result = await run_verification(
                     worktree, config, fallback, max_retries=max_retries,
                     is_merge_verify=is_merge_verify,
                     attempt_id=attempt_id, task_id=task_id, archive_root=archive_root,
                     role=role,
                 )
+                fallback_result.plan = plan_dict
+                return fallback_result
 
             # For Rust projects with no module_configs and no Python fallback
             # (Reify's layout), try to scope the global commands.

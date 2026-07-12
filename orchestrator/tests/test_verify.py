@@ -7316,11 +7316,13 @@ class TestRunScopedVerificationPlan:
             ),
         ]
 
-        with patch.object(verify, 'run_verification', new=AsyncMock(return_value=_canned_passing_result())):
-            with caplog.at_level(logging.INFO, logger='orchestrator.verify'):
-                await run_scoped_verification(
-                    tmp_path, config, module_configs, task_files=['mymod/test_thing.py'],
-                )
+        with (
+            patch.object(verify, 'run_verification', new=AsyncMock(return_value=_canned_passing_result())),
+            caplog.at_level(logging.INFO, logger='orchestrator.verify'),
+        ):
+            await run_scoped_verification(
+                tmp_path, config, module_configs, task_files=['mymod/test_thing.py'],
+            )
 
         # needs_pipeline_guard_check is a distinctive VerifyPlan.to_dict() key
         # — its presence in the log text proves the plan (not just a summary
@@ -7342,7 +7344,15 @@ class TestRunScopedVerificationPlan:
             'from typing import Protocol\n\n\nclass Foo(Protocol):\n    def method(self) -> None: ...\n'
         )
 
-        config = OrchestratorConfig(project_root=tmp_path)
+        # Explicit commands: OrchestratorConfig is a pydantic-settings
+        # BaseSettings — an unset type_check_command/lint_command can pick up
+        # this repo's real orchestrator.yaml (via its settings sources) even
+        # with project_root=tmp_path, which would make cmd.tool OPAQUE
+        # instead of PYRIGHT for reasons unrelated to what this test checks.
+        config = OrchestratorConfig(
+            project_root=tmp_path,
+            test_command='pytest', lint_command='ruff check', type_check_command='pyright',
+        )
         mock_run_verification = AsyncMock(return_value=_canned_passing_result())
 
         with patch.object(verify, 'run_verification', new=mock_run_verification):
