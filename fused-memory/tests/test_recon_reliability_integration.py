@@ -93,6 +93,7 @@ from fused_memory.reconciliation.event_buffer import EventBuffer
 from fused_memory.reconciliation.flag_dedup import filter_suppressed, write_suppression_record
 from fused_memory.reconciliation.recon_ledger import ReconLedgerRecord, ReconLedgerStore
 from fused_memory.reconciliation.stages.task_knowledge_sync import _gc_recon_markers
+from fused_memory.reconciliation.stats_verifier import verify_and_rewrite_stats
 from fused_memory.reconciliation.summary_pool import write_cycle_summary
 from fused_memory.server.tools import create_mcp_server
 from fused_memory.services.memory_service import MemoryService
@@ -1094,3 +1095,29 @@ class TestComputedStatsOverride:
         assert report.stats['_reported']['memories_written'] == 5, (
             "Expected the LLM's memories_written claim to survive under _reported"
         )
+
+    # -- driving harness (task 2232 step-14) ---------------------------------
+
+    async def _drive_verify(self, journal: WriteJournal) -> StageReport:
+        """Log 2 real successful add_memory ops for the stage (journal
+        truth), build a StageReport that self-reports memories_added=5 /
+        memories_written=5 (LLM claim), then drive the real
+        verify_and_rewrite_stats and return the (in-place mutated)
+        report."""
+        run_id = str(uuid.uuid4())
+        for i in range(2):
+            await _log_write(
+                journal,
+                causation_id=run_id,
+                operation='add_memory',
+                agent_id=f'recon-stage-{self._STAGE}',
+                result_summary={'memory_ids': [f'm{i}'], 'stores': ['mem0']},
+            )
+
+        report = _make_stage_report(
+            stage=self._STAGE,
+            stats={'memories_added': 5, 'memories_written': 5},
+        )
+
+        await verify_and_rewrite_stats(run_id, {self._STAGE: report}, journal)
+        return report
