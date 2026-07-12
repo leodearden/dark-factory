@@ -458,3 +458,123 @@ class TestCrossUnitBlockingVerifyPass:
         # Success path: no in-process escalation filed even though one was
         # configured via on_failure_escalation.
         assert read_escalations(tmp_queue_dir, 'task-55') == []
+
+
+# ---------------------------------------------------------------------------
+# step-11: RED — R5 verify-fail-escalate cell (RP-5), 3 sub-cases
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestCrossUnitBlockingVerifyFail:
+    """RP-5: a cross-unit blocking restart that does NOT produce a provably
+    fresh target process must never report DEPLOYED_AND_VERIFIED — it
+    escalates instead. Three sub-cases: a stale-sentinel MainPID, a monotonic
+    timestamp that is not strictly later than the persisted baseline, and a
+    restart script that itself exits non-zero (in which case the inspector is
+    never even consulted — no point verifying freshness after a failed
+    restart)."""
+
+    async def test_stale_pid_sentinel_is_verify_failed(self, tmp_queue_dir: Path) -> None:
+        from orchestrator.proc_supervision import RestartDisposition
+
+        await self._assert_not_deployed_and_escalates(
+            tmp_queue_dir,
+            task_id='task-201',
+            runner=FakeRunner(returncode=0),
+            inspector=make_fake_inspector({
+                'MainPID': 0,  # stale sentinel — never a real fresh PID
+                'ActiveState': 'active',
+                'ActiveEnterTimestampMonotonic': 2000,
+            }),
+            inspector_called=True,
+            expected_disposition=RestartDisposition.VERIFY_FAILED,
+        )
+
+    async def test_stale_monotonic_timestamp_is_verify_failed(self, tmp_queue_dir: Path) -> None:
+        from orchestrator.proc_supervision import RestartDisposition
+
+        await self._assert_not_deployed_and_escalates(
+            tmp_queue_dir,
+            task_id='task-202',
+            runner=FakeRunner(returncode=0),
+            inspector=make_fake_inspector({
+                'MainPID': 99,
+                'ActiveState': 'active',
+                'ActiveEnterTimestampMonotonic': 500,  # <= baseline 1000: not fresh
+            }),
+            inspector_called=True,
+            expected_disposition=RestartDisposition.VERIFY_FAILED,
+        )
+
+    async def test_restart_script_failure_is_restart_failed_and_skips_inspect(
+        self, tmp_queue_dir: Path,
+    ) -> None:
+        from orchestrator.proc_supervision import RestartDisposition
+
+        await self._assert_not_deployed_and_escalates(
+            tmp_queue_dir,
+            task_id='task-203',
+            runner=FakeRunner(returncode=1),
+            inspector=make_fake_inspector({
+                'MainPID': 99,
+                'ActiveState': 'active',
+                'ActiveEnterTimestampMonotonic': 2000,
+            }),
+            inspector_called=False,
+            expected_disposition=RestartDisposition.RESTART_FAILED,
+        )
+
+    async def _assert_not_deployed_and_escalates(
+        self,
+        tmp_queue_dir: Path,
+        *,
+        task_id: str,
+        runner,
+        inspector,
+        inspector_called: bool,
+        expected_disposition,
+    ) -> None:
+        from orchestrator.proc_supervision import (
+            EscalationSpec,
+            FreshPidVerify,
+            RestartDisposition,
+            RestartPlan,
+        )
+
+        spec = EscalationSpec(
+            queue_dir=str(tmp_queue_dir),
+            task_id=task_id,
+            summary='Cross-unit deploy verify failed',
+        )
+        plan = RestartPlan(
+            script=Path('/proj/scripts/deploy.sh'),
+            args=[],
+            cwd=Path('/proj'),
+            target_unit='fused-memory.service',
+            own_unit='orch.service',
+            on_failure_escalation=spec,
+            verify=FreshPidVerify(
+                baseline_active_enter_monotonic=1000,
+                baseline_main_pid=42,
+                inspect_timeout_secs=10.0,
+            ),
+        )
+
+        outcome = await plan.execute(runner=runner, inspector=inspector)
+
+        assert outcome.disposition == expected_disposition
+        assert outcome.disposition != RestartDisposition.DEPLOYED_AND_VERIFIED, (
+            'a non-fresh or failed cross-unit restart must never be reported done'
+        )
+        assert outcome.escalated is True
+        assert bool(inspector.calls) == inspector_called
+
+        escalations = read_escalations(
+            tmp_queue_dir, task_id, agent_role='orchestrator-deterministic',
+        )
+        assert len(escalations) == 1
+        esc = escalations[0]
+        assert esc.level == 2
+        assert esc.severity == 'critical'
+        assert esc.category == 'infra_issue'
