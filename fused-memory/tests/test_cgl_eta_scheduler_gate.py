@@ -149,3 +149,24 @@ class TestSessionHandshake:
         tool_calls = [c for c in calls if c['body'].get('method') == 'tools/call']
         assert len(tool_calls) == 1
         assert tool_calls[0]['headers'].get('mcp-session-id') == SERVER_SID
+
+
+class TestCanonicalPath:
+    """McpClient must POST to the canonical '/mcp' path (no trailing slash),
+    matching the orchestrator's McpSession and the dashboard client, and
+    avoiding an extra 307-redirect round trip."""
+
+    @pytest.mark.asyncio
+    async def test_posts_to_canonical_mcp_path_without_trailing_slash(self):
+        calls: list[dict] = []
+        transport = httpx.MockTransport(_make_stateful_handler(calls))
+
+        client = _mod.McpClient('http://127.0.0.1:8102', transport=transport)
+        async with client:
+            await client.call_tool('halt_scheduler', {'reason': 'x'})
+
+        paths = [c['path'] for c in calls]
+        assert paths, 'expected at least one request to be recorded'
+        assert all(p == '/mcp' for p in paths), (
+            f'Expected all paths to be /mcp, got {paths}'
+        )
