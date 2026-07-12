@@ -3898,6 +3898,67 @@ async def test_get_statuses_fresh_returns_empty_when_connection_open_raises(
     assert result == {}
 
 
+# ── get_statuses hot-path freshness (task 2455) ─────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_get_statuses_hot_path_fresh_despite_pinned_write_connection(
+    backend, project_root,
+):
+    """get_statuses (and get_statuses_raw, bulk and scoped) must observe the
+    latest committed WAL state even when the cached WRITE connection
+    (``_get_connection``) has a read transaction pinned open.
+
+    Reproduces the task 2388 pinned-snapshot harness, but flips the
+    expectation: prior to the task 2455 fix, get_statuses shared the
+    pinnable cached write connection and went stale together with it
+    (see the historical assertion this superseded, just below in this
+    file). The fix routes get_statuses_raw through a dedicated per-project
+    cached AUTOCOMMIT connection that can never hold a read transaction
+    open across statements, so it can never be pinned.
+    """
+    from shared.async_sqlite_base import apply_wal_pragmas, connect_daemon
+
+    # Seed two tasks and mark both 'done'.
+    await backend.add_task(project_root=project_root, title='T1')  # id=1
+    await backend.add_task(project_root=project_root, title='T2')  # id=2
+    await backend.set_task_status('1', 'done', project_root)
+    await backend.set_task_status('2', 'done', project_root)
+
+    # Pin the cached WRITE connection's WAL read-snapshot by leaving a read
+    # transaction open on it (materialize the snapshot via fetchall()).
+    conn = await backend._get_connection(project_root)
+    await conn.execute('BEGIN')
+    cur = await conn.execute('SELECT id, status FROM tasks')
+    await cur.fetchall()
+
+    # Simulate a separate process committing a status change out-of-band,
+    # via a fresh autocommit connection to the same DB file on disk.
+    db_path = SqliteTaskBackend._db_path(project_root)
+    writer = await connect_daemon(str(db_path), isolation_level=None)
+    try:
+        await apply_wal_pragmas(writer, busy_timeout_ms=5000)
+        await writer.execute("UPDATE tasks SET status='cancelled' WHERE id=1")
+        await writer.commit()
+    finally:
+        await writer.close()
+
+    # The hot path must be FRESH despite the write connection's open pin —
+    # both bulk and scoped (ids=[...]) reads.
+    bulk = await backend.get_statuses(project_root)
+    assert bulk['1'] == 'cancelled', (
+        f"Expected the hot bulk get_statuses to see fresh 'cancelled', got: {bulk}"
+    )
+
+    scoped = await backend.get_statuses(project_root, ids=['1'])
+    assert scoped['1'] == 'cancelled', (
+        f"Expected the hot scoped get_statuses to see fresh 'cancelled', got: {scoped}"
+    )
+
+    # Release the pin so the fixture's backend.close() isn't left mid-txn.
+    await conn.rollback()
+
+
 # ── Corrupt-blob refusal tests (task 1813) ──────────────────────────────
 
 
