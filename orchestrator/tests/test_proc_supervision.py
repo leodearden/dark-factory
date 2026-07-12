@@ -38,12 +38,18 @@ class FakeRunner:
         self.returncode = returncode
         self.stdout = stdout
         self.calls: list[tuple[tuple, dict]] = []
+        # Every fake proc this runner has handed back, in call order — lets a
+        # test assert on a spawned proc's post-return state (e.g. that
+        # .communicate() was never awaited on a fire-and-forget leaf spawn)
+        # without execute() needing to hand the proc back to the caller.
+        self.procs: list[MagicMock] = []
 
     async def __call__(self, *args: object, **kwargs: object):
         self.calls.append((args, kwargs))
         proc = MagicMock()
         proc.communicate = AsyncMock(return_value=(self.stdout, None))
         proc.returncode = self.returncode
+        self.procs.append(proc)
         return proc
 
 
@@ -685,3 +691,77 @@ class TestDetachedWrapperExactnessAndRegistrationFailure:
 
         assert outcome.disposition == RestartDisposition.REGISTRATION_FAILED
         assert outcome.escalated is False
+
+
+# ---------------------------------------------------------------------------
+# step-15: RED — detached LEAF plain-spawn path (fused-memory/dashboard parity)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestDetachedLeafPlainSpawn:
+    """transient_unit=None + verify=None -> DETACHED leaf plain-spawn: a bare
+    ``create_subprocess_exec(str(script), *args, cwd=str(cwd),
+    start_new_session=True)`` with NO ``/bin/sh`` wrapper and NO systemd-run —
+    fused-memory/dashboard parity (service_restart.py's
+    ``_default_restart_executor``). Fire-and-forget: the process exit is
+    never awaited. Spawn errors (FileNotFoundError/PermissionError) propagate
+    uncaught — the coordinator's permanent-failure branch
+    (``maybe_restart``) depends on seeing them."""
+
+    async def test_plain_spawn_argv_and_kwargs_no_wrapper(self) -> None:
+        from orchestrator.proc_supervision import RestartDisposition, RestartPlan
+
+        runner = FakeRunner(returncode=0)
+        plan = RestartPlan(
+            script=Path('/proj/scripts/restart-fused-memory.sh'),
+            args=['--drain'],
+            cwd=Path('/proj'),
+            target_unit='fused-memory.service',
+            own_unit='',
+            on_failure_escalation=None,
+            verify=None,
+            transient_unit=None,
+        )
+
+        outcome = await plan.execute(runner=runner)
+
+        assert len(runner.calls) == 1
+        args, kwargs = runner.calls[0]
+        assert args == ('/proj/scripts/restart-fused-memory.sh', '--drain')
+        assert 'systemd-run' not in args
+        assert '/bin/sh' not in args
+        assert kwargs.get('start_new_session') is True
+        assert kwargs.get('cwd') == '/proj'
+
+        assert runner.procs[0].communicate.called is False, (
+            'the leaf plain-spawn path is fire-and-forget — communicate() '
+            'must never be awaited'
+        )
+
+        assert outcome.disposition == RestartDisposition.SCHEDULED
+        assert outcome.escalated is False
+
+    async def test_spawn_error_propagates_uncaught(self) -> None:
+        """FileNotFoundError from the runner is NOT swallowed — it propagates
+        so the coordinator's permanent-failure branch (``maybe_restart``) can
+        see it and clear pending instead of crash-looping on a permanently
+        missing/non-executable script."""
+        from orchestrator.proc_supervision import RestartPlan
+
+        async def raising_runner(*args: object, **kwargs: object):
+            raise FileNotFoundError('restart-fused-memory.sh not found')
+
+        plan = RestartPlan(
+            script=Path('/proj/scripts/restart-fused-memory.sh'),
+            args=[],
+            cwd=Path('/proj'),
+            target_unit='fused-memory.service',
+            own_unit='',
+            on_failure_escalation=None,
+            verify=None,
+            transient_unit=None,
+        )
+
+        with pytest.raises(FileNotFoundError):
+            await plan.execute(runner=raising_runner)
