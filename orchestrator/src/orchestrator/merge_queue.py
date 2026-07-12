@@ -4905,6 +4905,26 @@ class ItemLifecycle:
         """The current state for *request_id*, or ``None`` if unregistered."""
         return self._states.get(request_id)
 
+    def non_terminal_items(self) -> dict[str, ItemLifecycleState]:
+        """Return a fresh ``{request_id: state}`` mapping of every registered
+        item NOT currently at TERMINAL (merge-queue-reliability PRD scope-4
+        kappa-b / task 2435, ARC 1).
+
+        This is the registry's bulk-iteration counterpart to :meth:`current`
+        (single-key read) — the accessor kappa-b's ``snapshot()``/liveness
+        repoint and boundary test B8 need to derive the full non-terminal
+        request_id census (``set(non_terminal_items())``) without a second,
+        bespoke reconstruction of registry membership.
+
+        Always a NEW ``dict`` — never a view onto ``self._states`` — so a
+        caller mutating the result can never corrupt the registry.
+        """
+        return {
+            rid: state
+            for rid, state in self._states.items()
+            if state != ItemLifecycleState.TERMINAL
+        }
+
     def transition(
         self,
         request_id: str,
