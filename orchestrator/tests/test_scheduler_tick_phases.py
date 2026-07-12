@@ -8,6 +8,7 @@ suite that exercises full ticks end-to-end.
 """
 
 import dataclasses
+import inspect
 from unittest.mock import AsyncMock
 
 import pytest
@@ -342,3 +343,65 @@ class TestSelectionPhases:
 
         assert result is _CONTINUE
         assert not scheduler.lock_table.is_held('A')
+
+
+class TestTickPhaseOrderLiteral:
+    """Ordering-as-data: ``Scheduler._TICK_PHASE_ORDER`` is the SINGLE source
+    of dispatch order — asserted here AND iterated by ``acquire_next`` (see
+    ``test_acquire_next_delegates_to_phase_list`` below), so the assertions
+    on the literal are a behavioural check, not a documentation meta-test.
+    """
+
+    def test_tick_phase_order_literal(self):
+        order = Scheduler._TICK_PHASE_ORDER
+
+        assert isinstance(order, tuple)
+        assert all(isinstance(label, str) for label in order)
+
+        # (1) drain_park_eviction before park_gc.
+        assert order.index('drain_park_eviction') < order.index('park_gc')
+        # (2) cooldown_gc before BOTH candidate-dispatch loops.
+        assert order.index('cooldown_gc') < order.index('select_pins')
+        assert order.index('cooldown_gc') < order.index('select_scored')
+        # (3) external-dep policy runs exactly once per tick.
+        assert order.count('external_dep_policy') == 1
+
+        # Every label genuinely drives dispatch — it maps to a real
+        # coroutine method on Scheduler, not just a decorative string.
+        for label in order:
+            method = getattr(Scheduler, f'_phase_{label}', None)
+            assert method is not None, f'Scheduler._phase_{label} does not exist'
+            assert inspect.iscoroutinefunction(method), (
+                f'Scheduler._phase_{label} must be an async method'
+            )
+
+    @pytest.mark.asyncio
+    async def test_acquire_next_delegates_to_phase_list(self, scheduler: Scheduler):
+        """A light end-to-end tick proves acquire_next dispatches THROUGH
+        ``_TICK_PHASE_ORDER`` — every phase named in the tuple is invoked,
+        in the tuple's own order, on the way to the correct dispatch."""
+        task = {
+            'id': 'A', 'title': 'Task A', 'status': 'pending', 'dependencies': [],
+            'metadata': {'files': ['backend']}, 'priority': 'medium',
+        }
+        scheduler.get_tasks = AsyncMock(return_value=[task])
+
+        called: list[str] = []
+        for label in Scheduler._TICK_PHASE_ORDER:
+            attr_name = f'_phase_{label}'
+            original = getattr(scheduler, attr_name)
+
+            def _make_wrapper(attr_name=attr_name, original=original):
+                async def _wrapper(ctx):
+                    called.append(attr_name)
+                    return await original(ctx)
+                return _wrapper
+
+            setattr(scheduler, attr_name, _make_wrapper())
+
+        result = await scheduler.acquire_next()
+
+        assert result is not None
+        assert result.task_id == 'A'
+        assert scheduler.lock_table.is_held('A')
+        assert called == [f'_phase_{label}' for label in Scheduler._TICK_PHASE_ORDER]
