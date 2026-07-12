@@ -71,6 +71,13 @@ async def test_reap_ignores_already_closed_connection():
 
     conn = await aiosqlite.connect(':memory:')
     await conn.close()
+    # aiosqlite's worker thread resolves the close() future via
+    # call_soon_threadsafe() *before* its own Python frame returns and the OS
+    # thread actually terminates — an inherent TOCTOU race. A bounded join
+    # avoids asserting is_alive() before the thread has had a chance to exit
+    # (mirrors dashboard/tests/test_db.py's join(timeout=...) convention for
+    # the same aiosqlite worker-exit race).
+    conn._thread.join(timeout=2.0)
     assert not conn._thread.is_alive()
 
     count = await reap_leaked_aiosqlite_connections()
