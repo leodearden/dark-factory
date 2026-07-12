@@ -3966,6 +3966,32 @@ async def test_get_statuses_hot_path_fresh_despite_pinned_write_connection(
     await conn.rollback()
 
 
+@pytest.mark.asyncio
+async def test_close_drains_cached_read_connections(backend, project_root):
+    """close() must drain the cached read connections opened by
+    :meth:`~SqliteTaskBackend._get_read_connection` (task 2455), not just
+    the write connections in ``self._connections`` — otherwise the
+    autocommit read connection is leaked open (a stray file handle / WAL
+    reader) past shutdown.
+    """
+    await backend.add_task(project_root=project_root, title='T1')
+    # Lazily opens a cached read connection for project_root.
+    await backend.get_statuses(project_root)
+
+    assert project_root in backend._read_connections, (
+        'Expected a cached read connection to have been opened for project_root'
+    )
+    read_conn = backend._read_connections[project_root]
+
+    await backend.close()
+
+    assert backend._read_connections == {}, (
+        f'Expected _read_connections to be drained/cleared by close(), got: {backend._read_connections}'
+    )
+    with pytest.raises(Exception):
+        await read_conn.execute('SELECT 1')
+
+
 # ── Corrupt-blob refusal tests (task 1813) ──────────────────────────────
 
 
