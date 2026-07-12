@@ -42,7 +42,7 @@ import asyncio
 import logging
 import shlex
 import sys
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from enum import StrEnum
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -115,12 +115,22 @@ class EscalationSpec:
         ]
 
 
-def _file_inprocess_escalation(spec: EscalationSpec) -> None:
+def _file_inprocess_escalation(
+    spec: EscalationSpec, *, summary: str | None = None, detail: str | None = None,
+) -> None:
     """File *spec*'s L2 escalation in-process (RP-1/RP-5 filing path).
 
     Reused by both the RP-1 fail-closed refuse and the RP-5 verify-fail/
     restart-fail branches — one filing routine for every in-process escalation
     ``RestartPlan.execute()`` can produce.
+
+    *summary*/*detail*, when given, OVERRIDE ``spec.summary``/``spec.detail``
+    for this filing only (``spec`` itself is frozen and unchanged). RP-5's
+    verify-fail/restart-fail branches use this to carry the target_unit and
+    the pid/monotonic values discovered at ``execute()``-time, which the
+    caller could not have known when constructing the ``RestartPlan``/
+    ``EscalationSpec`` up front (mirrors deterministic_runner.py:1608-1620,
+    1633-1652's per-failure detail text).
 
     Includes a dedup guard mirroring
     ``DeterministicRunner._file_infra_issue_and_block`` (deterministic_runner.py:
@@ -141,6 +151,12 @@ def _file_inprocess_escalation(spec: EscalationSpec) -> None:
             spec.task_id, len(existing_pending),
         )
         return
+    if summary is not None or detail is not None:
+        spec = replace(
+            spec,
+            summary=summary if summary is not None else spec.summary,
+            detail=detail if detail is not None else spec.detail,
+        )
     esc = spec.to_escalation(queue)
     queue.submit(esc)
     logger.info(
@@ -230,8 +246,7 @@ class RestartPlan:
         1. wants_blocking and not own -> RP-1 fail-closed REFUSE (implemented
            below, step-8).
         2. wants_blocking and not self_target -> RP-2 cross-unit BLOCKING +
-           RP-5 verify (happy path implemented below, step-10; rc!=0/
-           not-fresh escalation branches are step-12 stubs for now).
+           RP-5 verify (implemented below, step-10/12).
         3. transient_unit set -> DETACHED systemd-run (RP-3/RP-4; implemented
            below, step-4).
         4. else -> DETACHED leaf plain-spawn (step-15/16; not yet implemented
@@ -301,10 +316,11 @@ class RestartPlan:
         Models deterministic_runner.py:1546-1652's blocking-deploy-then-verify
         shape: run to completion, re-inspect, then
         ``fresh = isinstance(pid, int) and pid > 0 and new_monotonic > baseline_monotonic``
-        (deterministic_runner.py:1624-1630).
-
-        rc != 0 and "not fresh" are handled in step-12 (currently stubs —
-        this method only implements the happy path, step-10's scope).
+        (deterministic_runner.py:1624-1630). A script failure (rc != 0) or a
+        non-fresh re-inspect never falsely reports DEPLOYED_AND_VERIFIED —
+        both escalate via the shared ``_file_inprocess_escalation`` filing
+        routine (skipped, with a logged warning, when no
+        ``on_failure_escalation`` was configured for this plan).
         """
         assert self.verify is not None, 'router only calls this when wants_blocking'
 
@@ -314,27 +330,76 @@ class RestartPlan:
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.STDOUT,
         )
-        await proc.communicate()
+        stdout, _ = await proc.communicate()
         rc = proc.returncode or 0
         if rc != 0:
-            # RESTART_FAILED + escalation — implemented in step-12.
-            raise NotImplementedError
+            # Script failed outright — no point inspecting the target unit.
+            tail = (stdout or b'').decode(errors='replace')[-2000:]
+            detail = (
+                f'Cross-unit restart of {self.target_unit!r} failed: script '
+                f'exit code rc={rc}. Output:\n{tail}'
+            )
+            escalated = self._file_verify_stage_escalation(
+                summary=f'Restart failed: {self.target_unit}',
+                detail=detail,
+                log_context=f'restart of {self.target_unit} failed (rc={rc})',
+            )
+            return RestartOutcome(
+                disposition=RestartDisposition.RESTART_FAILED,
+                escalated=escalated,
+                detail=detail,
+            )
 
         new_state = await inspector(
             self.target_unit, timeout_secs=self.verify.inspect_timeout_secs,
         )
         pid = new_state.get('MainPID', 0)
         new_monotonic = new_state.get('ActiveEnterTimestampMonotonic', 0)
+        baseline_monotonic = self.verify.baseline_active_enter_monotonic
         fresh = (
             isinstance(pid, int)
             and pid > 0
-            and new_monotonic > self.verify.baseline_active_enter_monotonic
+            and new_monotonic > baseline_monotonic
         )
         if not fresh:
-            # VERIFY_FAILED + escalation — implemented in step-12.
-            raise NotImplementedError
+            detail = (
+                f'Cross-unit restart verify failed for {self.target_unit!r}: '
+                f'new MainPID={pid!r} new_monotonic={new_monotonic} '
+                f'baseline_monotonic={baseline_monotonic}. Expected a fresh '
+                f'non-sentinel MainPID (>0) and a strictly-later '
+                f'ActiveEnterTimestampMonotonic after the restart.'
+            )
+            escalated = self._file_verify_stage_escalation(
+                summary=f'Restart verify failed: {self.target_unit}',
+                detail=detail,
+                log_context=f'restart verify failed for {self.target_unit}',
+            )
+            return RestartOutcome(
+                disposition=RestartDisposition.VERIFY_FAILED,
+                escalated=escalated,
+                detail=detail,
+            )
 
         return RestartOutcome(disposition=RestartDisposition.DEPLOYED_AND_VERIFIED)
+
+    def _file_verify_stage_escalation(
+        self, *, summary: str, detail: str, log_context: str,
+    ) -> bool:
+        """File ``self.on_failure_escalation`` (if configured) and report whether it fired.
+
+        Shared by the RESTART_FAILED and VERIFY_FAILED branches above — both
+        need the identical "file if configured, else log a warning and don't
+        claim escalated" fallback that RP-1's refuse branch also uses.
+        """
+        if self.on_failure_escalation is None:
+            logger.warning(
+                'proc_supervision: %s but no on_failure_escalation was '
+                'configured — no L2 escalation filed',
+                log_context,
+            )
+            return False
+        _file_inprocess_escalation(self.on_failure_escalation, summary=summary, detail=detail)
+        return True
 
     async def _execute_detached_systemd_run(self, runner) -> RestartOutcome:
         """RP-3/RP-4: register a deferred ``systemd-run --user`` transient unit.
