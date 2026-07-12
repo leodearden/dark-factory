@@ -1177,6 +1177,22 @@ class GitConfig(BaseModel):
             'warm_lane_pool knob convention.'
         ),
     )
+    warm_lane_release_thin: bool = Field(
+        default=False,
+        description=(
+            'When True, GitOps.release_warm_lane invokes reify δ '
+            'scripts/thin-warm-lane.sh on the released lane after the '
+            'ASSIGNED→FREE flip (free-first target reclaim; §9.5 η).  '
+            'Free-only — invoked WITHOUT --reseed; the next acquire_warm_lane '
+            'always re-seeds target/ from the current base regardless (D10), '
+            'so net warmth is unchanged and only the idle-hold of a divergent '
+            'target/ between release and a re-acquire that may never come is '
+            'eliminated.  Fail-open/no-op when the script is absent.  '
+            'Default False → byte-identical and revertible, mirroring the '
+            'warm_lane_disk_guard convention; reify enables it in its own '
+            'orchestrator.yaml.'
+        ),
+    )
     warm_lane_min_free_gib: int = Field(
         default=50,
         ge=0,
