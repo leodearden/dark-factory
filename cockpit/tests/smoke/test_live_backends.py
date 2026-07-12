@@ -124,7 +124,12 @@ def test_tmux_reorder_preserves_focused_window(disposable_tmux_session, tmux_act
     the session's active window (identified by its STABLE @id, not its
     mutable index) even across a reorder that relocates that window's own
     index -- reorder only ever issues move-window, never
-    select-window/switch-client (see TmuxBackend.reorder's docstring).
+    select-window/switch-client (see TmuxBackend.reorder's docstring). It
+    must also prove the move itself actually happened: beyond focus
+    preservation, every window's final index (identified by its stable @id,
+    read back live) must match the requested priority order -- a completely
+    no-op reorder, or one where every move-window silently failed, would
+    leave focus untouched too and must not pass this test.
 
     Window indices are read back from the live session via `.windows()`
     rather than assumed to be 0/1/2: tmux assigns a new session's window
@@ -135,7 +140,8 @@ def test_tmux_reorder_preserves_focused_window(disposable_tmux_session, tmux_act
     session = disposable_tmux_session
     rows = sorted(session.windows(), key=lambda row: int(row[0]))
     assert len(rows) >= 3, f'expected >=3 windows in the disposable session, got {rows!r}'
-    index_a, index_b, index_c = (int(row[0]) for row in rows[:3])
+    (idx_a, id_a, _), (idx_b, id_b, _), (idx_c, id_c, _) = rows[:3]
+    index_a, index_b, index_c = int(idx_a), int(idx_b), int(idx_c)
 
     session.select(index_b)
     active0 = tmux_active_window_id(session.name)
@@ -151,3 +157,12 @@ def test_tmux_reorder_preserves_focused_window(disposable_tmux_session, tmux_act
     TmuxBackend().reorder(targets)
 
     assert tmux_active_window_id(session.name) == active0
+
+    # The reorder must actually have happened, not merely left focus alone:
+    # each window (identified by its stable @id) landed at its requested
+    # priority-order index -- the window that was at index_b is now at 0,
+    # index_c's is now at 1, index_a's is now at 2.
+    after = {int(index): window_id for index, window_id, _ in session.windows()}
+    assert after == {0: id_b, 1: id_c, 2: id_a}, (
+        f'reorder did not land windows at their requested priority-order indices: {after!r}'
+    )
