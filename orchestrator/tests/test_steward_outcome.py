@@ -15,7 +15,6 @@ from __future__ import annotations
 import dataclasses
 
 import pytest
-
 from shared.task_statuses import TaskStatus
 
 from orchestrator import workflow_types
@@ -109,10 +108,20 @@ class TestStewardOutcomeExports:
     def test_reexported_from_workflow_module(self):
         from orchestrator.workflow import (
             StewardBudgetExhausted as ShimBudgetExhausted,
+        )
+        from orchestrator.workflow import (
             StewardInterrupted as ShimInterrupted,
+        )
+        from orchestrator.workflow import (
             StewardOutcome as ShimOutcome,
+        )
+        from orchestrator.workflow import (
             StewardReescalatedL1 as ShimReescalatedL1,
+        )
+        from orchestrator.workflow import (
             StewardResolved as ShimResolved,
+        )
+        from orchestrator.workflow import (
             StewardTerminalDecision as ShimTerminalDecision,
         )
 

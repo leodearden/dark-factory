@@ -21,7 +21,6 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 from _orch_helpers import pydantic_spec
-
 from shared.task_statuses import TaskStatus
 
 from orchestrator.agents.invoke import AgentResult
@@ -2153,7 +2152,7 @@ class _RecordingFakeSteward:
     ``set_wip_probe`` calls so the wiring can be asserted directly.
     """
 
-    instances: list['_RecordingFakeSteward'] = []
+    instances: list[_RecordingFakeSteward] = []
 
     def __init__(self, wt_path, cfg_dir):  # noqa: ARG002
         self.outcome_channel = None

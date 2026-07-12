@@ -23,6 +23,7 @@ from _workflow_helpers import (
     _make_status_setting_steward,
 )
 from escalation.queue import EscalationQueue
+from shared.task_statuses import TaskStatus
 
 from orchestrator.agents.invoke import AgentResult
 from orchestrator.agents.roles import ARCHITECT, DEBUGGER, IMPLEMENTER, JUDGE, MERGER
@@ -42,7 +43,6 @@ from orchestrator.workflow import (
     WorkflowOutcome,
     WorkflowState,
 )
-from shared.task_statuses import TaskStatus
 
 # ---------------------------------------------------------------------------
 # Fixtures
