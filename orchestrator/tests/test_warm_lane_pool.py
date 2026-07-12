@@ -2025,6 +2025,7 @@ class TestReleaseWarmLane:
 
         await git_ops.release_warm_lane(info.path, 'task-A')
 
+        assert git_ops.warm_lane_pool is not None
         assert git_ops.warm_lane_pool.state(info.path) == LaneState.FREE
         assert await git_ops._is_registered_worktree(info.path), (
             'lane must remain a registered worktree after release-thin'
@@ -2090,6 +2091,7 @@ class TestReleaseWarmLane:
 
         await git_ops.release_warm_lane(info.path, 'task-A')  # must not raise
 
+        assert git_ops.warm_lane_pool is not None
         assert git_ops.warm_lane_pool.state(info.path) == LaneState.FREE
 
 
