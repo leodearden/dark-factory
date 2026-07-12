@@ -19,9 +19,8 @@ from __future__ import annotations
 import json
 from unittest.mock import AsyncMock, MagicMock
 
-import httpx
 import pytest
-from openai import RateLimitError
+from _fm_helpers import _make_rate_limit_error
 
 from fused_memory.server.tools import create_mcp_server
 from fused_memory.services.memory_service import MemoryService
@@ -35,17 +34,6 @@ def _parse_tool_result(result):
         content = result[0].text if hasattr(result[0], 'text') else str(result[0])
         return json.loads(content)
     return result
-
-
-def _make_rate_limit_error(
-    message: str = 'Rate limit exceeded.',
-    code: str = 'insufficient_quota',
-) -> RateLimitError:
-    """Build a real openai.RateLimitError (429 response) for quota-exhaustion tests."""
-    request = httpx.Request('POST', 'https://api.openai.com/v1/embeddings')
-    response = httpx.Response(429, request=request)
-    body = {'message': message, 'type': 'insufficient_quota', 'param': None, 'code': code}
-    return RateLimitError(message, response=response, body=body)
 
 
 @pytest.fixture
