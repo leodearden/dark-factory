@@ -76,6 +76,8 @@ qdrant_skipif() (see test_recon_dedup_premise.py's precedent).
 
 from __future__ import annotations
 
+import asyncio
+import json
 import uuid
 from datetime import UTC, datetime
 from unittest.mock import AsyncMock
@@ -86,7 +88,7 @@ import pytest_asyncio
 from fused_memory.middleware.task_interceptor import TaskInterceptor
 from fused_memory.models.reconciliation import StageId, StageReport
 from fused_memory.reconciliation.event_buffer import EventBuffer
-from fused_memory.reconciliation.recon_ledger import ReconLedgerStore
+from fused_memory.reconciliation.recon_ledger import ReconLedgerRecord, ReconLedgerStore
 from fused_memory.services.write_journal import WriteJournal
 
 # Recon-stage agent_id used throughout this suite's interceptor/journal
@@ -333,3 +335,118 @@ class TestLedgerUpsertAndRace:
             f'Expected exactly 2 surviving rows (race + live) after the '
             f'interleaved gc() collected the terminal marker, got {count}'
         )
+
+    # -- driving harness (task 2232 step-2) ---------------------------------
+
+    async def _drive_l2_sequential_upserts(self, ledger: ReconLedgerStore) -> ReconLedgerRecord:
+        """Sequentially UPSERT the SAME 5-part identity N=4 times, varying
+        payload_json/state each call; return the LAST record written.
+
+        Sequential (not concurrent) — ordering is deterministic, so the
+        "last write" is unambiguous, unlike the L1 race below.
+        """
+        created_at = '2026-07-01T00:00:00+00:00'
+        expires_at = '2099-01-01T00:00:00+00:00'
+        last_record: ReconLedgerRecord | None = None
+        for seq in range(4):
+            last_record = ReconLedgerRecord(
+                project_id=self._PROJECT_L2,
+                record_kind='stage1_flag_marker',
+                payload_json=json.dumps({'seq': seq}),
+                state='active' if seq % 2 == 0 else 'addressed',
+                created_at=created_at,
+                task_id='T-idempotent',
+                flag_type='flag_idempotent',
+                run_id='',
+                expires_at=expires_at,
+            )
+            await ledger.upsert(last_record)
+        assert last_record is not None
+        return last_record
+
+    async def _drive_l1_concurrent_race(
+        self, ledger: ReconLedgerStore,
+    ) -> tuple[list[ReconLedgerRecord], str, str]:
+        """Seed a terminal marker + a live marker, then concurrently UPSERT
+        two versions of a THIRD (racing) identity while a gc() pass
+        (referencing the terminal marker's task_id) runs interleaved via
+        asyncio.gather().
+
+        Returns ([race_v1, race_v2], terminal_task_id, live_task_id).
+        """
+        seeded_at = '2026-07-01T00:00:00+00:00'
+        far_future = '2099-01-01T00:00:00+00:00'  # never TTL-expires in this test
+        now_iso = '2026-07-09T00:00:00+00:00'  # canonical zero-padded UTC ISO-8601
+
+        terminal_marker = ReconLedgerRecord(
+            project_id=self._PROJECT_L1,
+            record_kind='stage1_flag_marker',
+            payload_json='{}',
+            state='active',
+            created_at=seeded_at,
+            task_id='T-done',
+            flag_type='flag_terminal',
+            run_id='',
+            expires_at=far_future,
+        )
+        live_marker = ReconLedgerRecord(
+            project_id=self._PROJECT_L1,
+            record_kind='stage1_flag_marker',
+            payload_json='{}',
+            state='active',
+            created_at=seeded_at,
+            task_id='T-live',
+            flag_type='flag_live',
+            run_id='',
+            expires_at=far_future,
+        )
+        # Seed BEFORE the race so the interleaved gc() has real rows to
+        # evaluate — these two are not part of the concurrent gather().
+        await ledger.upsert(terminal_marker)
+        await ledger.upsert(live_marker)
+
+        race_v1 = ReconLedgerRecord(
+            project_id=self._PROJECT_L1,
+            record_kind='stage1_flag_marker',
+            payload_json=json.dumps({'writer': 1}),
+            state='active',
+            created_at=seeded_at,
+            task_id='T-race',
+            flag_type='flag_race',
+            run_id='',
+            expires_at=far_future,
+        )
+        race_v2 = ReconLedgerRecord(
+            project_id=self._PROJECT_L1,
+            record_kind='stage1_flag_marker',
+            payload_json=json.dumps({'writer': 2}),
+            state='active',
+            created_at=seeded_at,
+            task_id='T-race',
+            flag_type='flag_race',
+            run_id='',
+            expires_at=far_future,
+        )
+
+        # The two racing UPSERTs interleave with a gc() pass referencing
+        # the terminal marker's task_id — a single aiosqlite connection
+        # serializes the actual writes, so exactly one racing row and a
+        # real terminal-delete both land regardless of scheduling order.
+        await asyncio.gather(
+            ledger.upsert(race_v1),
+            ledger.upsert(race_v2),
+            ledger.gc(self._PROJECT_L1, now_iso, terminal_task_ids=['T-done']),
+        )
+
+        return [race_v1, race_v2], 'T-done', 'T-live'
+
+    async def _count_rows(self, ledger: ReconLedgerStore, project_id: str) -> int:
+        """Raw SELECT COUNT(*) over recon_ledger for *project_id* (all
+        record_kinds) — a direct check on the store's own connection,
+        independent of get_by_identity's per-identity read path."""
+        cursor = await ledger._db.execute(  # noqa: SLF001 — intentional direct-connection check
+            'SELECT COUNT(*) FROM recon_ledger WHERE project_id = ?',
+            (project_id,),
+        )
+        row = await cursor.fetchone()
+        return row[0]
