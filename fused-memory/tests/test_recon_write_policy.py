@@ -144,6 +144,40 @@ class TestCheckGate1Terminal:
         verdict = _check('set_task_status', target_status='pending', live_status='done')
         assert verdict.error_type != 'ReconTerminalWriteRejected'
 
+    def test_terminal_rejection_on_done_populates_corrective_path(self):
+        verdict = _check('update_task', live_status='done')
+        assert verdict.corrective_path == 'set_task_status_done_provenance_repair'
+        assert (
+            verdict.to_error_dict()['corrective_path']
+            == 'set_task_status_done_provenance_repair'
+        )
+
+    def test_terminal_rejection_on_cancelled_populates_corrective_path(self):
+        verdict = _check('update_task', live_status='cancelled')
+        assert verdict.corrective_path == 'set_task_status_done_provenance_repair'
+        assert (
+            verdict.to_error_dict()['corrective_path']
+            == 'set_task_status_done_provenance_repair'
+        )
+
+    def test_other_gate_rejections_leave_corrective_path_empty(self, monkeypatch):
+        """Scoping: corrective_path is a Gate-1-only redirect to the
+        same-status done_provenance repair seam. Neither a Gate-2
+        live-workflow rejection nor a Gate-3 stale-snapshot rejection is
+        served by that seam, so both must leave corrective_path == ''."""
+        monkeypatch.setattr(
+            recon_write_policy, 'is_workflow_live_for_task', lambda *a, **k: True,
+        )
+        gate2_verdict = _check('set_task_status', live_status='in-progress')
+        assert gate2_verdict.error_type == 'ReconLiveWorkflowWriteRejected'
+        assert gate2_verdict.corrective_path == ''
+
+        gate3_verdict = _check(
+            'update_task', live_status='in-progress', snapshot_token='pending',
+        )
+        assert gate3_verdict.error_type == 'ReconStaleSnapshotRejected'
+        assert gate3_verdict.corrective_path == ''
+
 
 # ---------------------------------------------------------------------------
 # check() gate 2 — live workflow (set_task_status only)
