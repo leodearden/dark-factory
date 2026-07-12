@@ -713,6 +713,43 @@ class TaskArtifacts:
             logger.warning('Corrupt agent_session.json at %s: %s', path, exc)
             return None
 
+    # ──────────────────────────────────────────────────────────────────
+    # Verdict artifacts — written by the per-worktree verdict-tools MCP
+    # server (task 2481). One file per role under verdicts/<role>.json;
+    # the role-derived filename is authoritative (never an agent-supplied
+    # field), so a reviewer cannot misname its artifact onto a sibling's.
+    # ──────────────────────────────────────────────────────────────────
+
+    def write_verdict(self, role: str, envelope: dict) -> None:
+        """Write ``.task/verdicts/{role}.json``.
+
+        Best-effort: if the artifacts root has been removed (worktree gone
+        out-of-band), skip the write rather than raising — mirrors
+        ``write_review``'s root-gone guard. This method assumes ``init()``
+        has already created ``self.root``.
+        """
+        if not self.root.is_dir():
+            logger.info(
+                'TaskArtifacts: skipping write_verdict %r — root %s no longer exists',
+                role, self.root,
+            )
+            return
+        verdict_path = self.root / 'verdicts' / f'{role}.json'
+        self._write_json(verdict_path, envelope)
+
+    def read_verdict(self, role: str) -> dict | None:
+        """Return parsed ``.task/verdicts/{role}.json``, or ``None`` if
+        missing/corrupt.
+        """
+        path = self._read_path(f'verdicts/{role}.json')
+        if not path.exists():
+            return None
+        try:
+            return json.loads(path.read_text())
+        except (json.JSONDecodeError, OSError) as exc:
+            logger.warning('Corrupt verdicts/%s.json at %s: %s', role, path, exc)
+            return None
+
     def lock_plan(self, session_id: str) -> bool:
         """Atomically acquire the plan lock.
 
