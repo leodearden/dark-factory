@@ -52,6 +52,22 @@ class TestSubmitReviewVerdict:
             'summary': 'ok',
         }
 
+    def test_invalid_verdict_returns_error_and_writes_nothing(self, artifacts):
+        result = _submit_review_verdict(
+            artifacts,
+            role='test_analyst',
+            session_id='s',
+            reviewer='test_analyst',
+            verdict='GARBAGE',
+            issues=[],
+            summary='x',
+        )
+        assert result['status'] == 'error'
+        assert 'PASS' in result['message']
+        assert 'ISSUES_FOUND' in result['message']
+
+        assert artifacts.read_verdict('test_analyst') is None
+
 
 class TestSubmitCompletionVerdict:
     def test_writes_envelope_and_returns_ok(self, artifacts):
