@@ -649,3 +649,92 @@ class TestGcTerminalReferenced:
             memory_service, taskmaster, scope, 'r1',
             now=datetime(2026, 7, 9, 0, 0, 0, tzinfo=UTC),
         )
+
+
+# ---------------------------------------------------------------------------
+# P1 + P2 + P3 — TaskInterceptor two-way rejection round-trips [ζ=2224]
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestInterceptorReconWritePolicy:
+    """P1 + P2 + P3 (ζ=2224): the REAL TaskInterceptor.update_task /
+    set_task_status boundary rejects a recon-stage caller's write with the
+    canonical ``{error, error_type, agent_id, task_id, op, ...}`` dict and
+    never awaits the underlying taskmaster write — while a non-recon caller
+    on the same conditions is never gated (recon-scoping negative, one per
+    op, since both ops share the same top-level scoping check).
+
+    Driving harness (``_drive_p1_terminal_reject`` / ``_drive_p1_non_recon``
+    / ``_drive_p2_live_workflow_reject`` / ``_drive_p2_non_recon`` /
+    ``_drive_p3_stale_snapshot_reject``) lands in step-8 — this step only
+    declares the §9 postconditions, so it is RED until then (the harness
+    methods referenced below don't exist yet).
+    """
+
+    _TASK_ID = '1'
+
+    def _assert_rejection_shape(self, result: dict, *, error_type: str, op: str) -> None:
+        """The LLM-visible rejection dict carries the canonical
+        {error(str), error_type, agent_id, task_id, op} shape."""
+        assert result.get('error_type') == error_type, (
+            f'Expected error_type={error_type!r}, got {result!r}'
+        )
+        assert isinstance(result.get('error'), str) and result['error'], (
+            f'Expected a non-empty str "error" message, got {result!r}'
+        )
+        assert result.get('agent_id') == AGENT_ID
+        assert result.get('task_id') == self._TASK_ID
+        assert result.get('op') == op
+
+    async def test_p1_update_task_on_terminal_task_rejects(
+        self, interceptor, taskmaster,
+    ) -> None:
+        """update_task against a task whose live status is terminal
+        (done) is rejected before the underlying taskmaster write."""
+        result = await self._drive_p1_terminal_reject(interceptor, taskmaster)
+
+        self._assert_rejection_shape(
+            result, error_type='ReconTerminalWriteRejected', op='update_task',
+        )
+        taskmaster.update_task.assert_not_awaited()
+
+    async def test_p1_non_recon_agent_id_not_gated(self, interceptor, taskmaster) -> None:
+        """Recon-scoping negative: a non-recon/None agent_id on the same
+        terminal-task condition is never gated — the write proceeds."""
+        await self._drive_p1_non_recon(interceptor, taskmaster)
+
+        taskmaster.update_task.assert_awaited_once()
+
+    async def test_p2_set_task_status_with_live_workflow_rejects(
+        self, interceptor, taskmaster, monkeypatch,
+    ) -> None:
+        """set_task_status when a live workflow is detected for the task
+        is rejected before the underlying taskmaster write."""
+        result = await self._drive_p2_live_workflow_reject(interceptor, taskmaster, monkeypatch)
+
+        self._assert_rejection_shape(
+            result, error_type='ReconLiveWorkflowWriteRejected', op='set_task_status',
+        )
+        taskmaster.set_task_status.assert_not_awaited()
+
+    async def test_p2_non_recon_agent_id_not_gated(
+        self, interceptor, taskmaster, monkeypatch,
+    ) -> None:
+        """Recon-scoping negative: a non-recon/None agent_id is never
+        gated even when the detector reports a live workflow."""
+        await self._drive_p2_non_recon(interceptor, taskmaster, monkeypatch)
+
+        taskmaster.set_task_status.assert_awaited_once()
+
+    async def test_p3_update_task_with_stale_snapshot_rejects(
+        self, interceptor, taskmaster,
+    ) -> None:
+        """update_task carrying a snapshot_status that disagrees with the
+        task's live (non-terminal) status is rejected before the write."""
+        result = await self._drive_p3_stale_snapshot_reject(interceptor, taskmaster)
+
+        self._assert_rejection_shape(
+            result, error_type='ReconStaleSnapshotRejected', op='update_task',
+        )
+        taskmaster.update_task.assert_not_awaited()
