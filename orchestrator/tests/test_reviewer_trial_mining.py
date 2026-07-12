@@ -12,13 +12,12 @@ from pathlib import Path
 from unittest.mock import AsyncMock, patch
 
 import pytest
-from shared.cli_invoke import AgentResult
-
 from _reviewer_trial_mining_fixtures import (
     build_synthetic_runs_db,
     make_git_repo_with_merge,
     write_sample_escalations,
 )
+from shared.cli_invoke import AgentResult
 
 from orchestrator.evals.reviewer_trial.corpus import GroundTruthIssue
 from orchestrator.evals.reviewer_trial.mining import (

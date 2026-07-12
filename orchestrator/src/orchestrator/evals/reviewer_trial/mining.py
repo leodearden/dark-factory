@@ -15,10 +15,16 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import sqlite3
 import subprocess
 from dataclasses import dataclass, field
 from pathlib import Path
+
+from orchestrator.agents.invoke import invoke_agent
+from orchestrator.evals.reviewer_trial.corpus import GroundTruthIssue
+
+logger = logging.getLogger(__name__)
 
 DEFAULT_MIN_VERIFY_ATTEMPTS = 2
 
@@ -242,9 +248,146 @@ def assign_split(
 
     assignment: dict[str, str] = {}
     start = 0
-    for name, end in zip(_SPLIT_NAMES, boundaries):
+    for name, end in zip(_SPLIT_NAMES, boundaries, strict=True):
         for diff_id in ordered[start:end]:
             assignment[diff_id] = name
         start = end
 
     return assignment
+
+
+# Schema for the frontier label-proposal LLM output — mirrors scorer._MATCH_SCHEMA's
+# invoke_agent pattern but proposes NEW issues rather than matching existing ones.
+# Deliberately omits "id": ids are synthesized by propose_labels_frontier itself
+# (never trusted from the model) so they can be tagged as frontier-provenance.
+_FRONTIER_LABEL_SCHEMA = {
+    'type': 'object',
+    'properties': {
+        'issues': {
+            'type': 'array',
+            'items': {
+                'type': 'object',
+                'properties': {
+                    'location': {'type': 'string'},
+                    'category': {'type': 'string'},
+                    'severity': {'type': 'string', 'enum': ['blocking', 'suggestion']},
+                    'description': {'type': 'string'},
+                    'mutation_type': {'type': 'string'},
+                },
+                'required': ['location', 'category', 'severity', 'description', 'mutation_type'],
+            },
+        },
+    },
+    'required': ['issues'],
+}
+
+
+async def propose_labels_frontier(
+    diff_text: str,
+    model: str = 'opus',
+    description: str = '',
+) -> tuple[list[GroundTruthIssue], float]:
+    """Propose ground-truth issue labels for a mined diff via a frontier model.
+
+    Reuses the ``scorer.match_issues`` ``invoke_agent`` pattern (no tools,
+    structured JSON output, cost always reported) but the frontier model
+    proposes NEW issues found in *diff_text* rather than matching against
+    existing ground truth.
+
+    Each proposed issue is mapped into a ``GroundTruthIssue``. Its ``id`` is
+    always synthesized as ``"frontier_<n>"`` — never taken from the model's
+    output — so a frontier-proposed label is identifiable (adjudication
+    provenance) rather than indistinguishable from a hand-authored corpus id
+    like ``"py_obo_1"``. Callers (the ``mine`` CLI / ``AdjudicationLog``)
+    layer richer provenance (model name, diff description, timestamps) on
+    top of this.
+
+    Returns ``(issues, cost_usd)``. Never raises: returns ``([], cost_usd)``
+    when the output is unparseable or carries no usable ``issues`` list —
+    the incurred cost is still reported since the tokens were billed
+    regardless (mirrors ``match_issues``' unparseable-output behaviour).
+    """
+    diff_context = diff_text[:10_000] if len(diff_text) > 10_000 else diff_text
+
+    prompt = f"""\
+Identify concrete bugs and notable issues introduced by this code diff.
+
+## Context
+
+{description}
+
+## Diff
+
+```diff
+{diff_context}
+```
+
+## Instructions
+
+List every issue you can find: correctness bugs, off-by-one errors, missing
+error handling, missing awaits, security issues, race conditions, etc. For
+each issue, give:
+
+- location: "path/to/file:LINE" (or a line range "path/to/file:L1-L2")
+- category: a short category tag (e.g. "off_by_one", "missing_await", "security")
+- severity: "blocking" (breaks correctness/security) or "suggestion" (style/minor)
+- description: one or two sentences explaining the issue
+- mutation_type: which broad category this issue maps to (e.g. "logic",
+  "concurrency", "error_handling", "security", "style", "off_by_one", "type",
+  "resource_leak", "api_misuse", "test_gap", "other")
+
+Be precise and conservative — only report issues you are confident are real.
+If there are no issues, return an empty issues list. Output your findings as JSON.
+"""
+
+    system_prompt = (
+        'You are a meticulous senior code reviewer proposing ground-truth issue '
+        'labels for an evaluation corpus. Be precise and conservative — only '
+        'report issues you are confident are real. Output ONLY valid JSON.'
+    )
+
+    result = await invoke_agent(
+        prompt=prompt,
+        system_prompt=system_prompt,
+        cwd=Path('/home/leo/src/dark-factory'),
+        model=model,
+        max_turns=3,
+        max_budget_usd=2.0,
+        output_schema=_FRONTIER_LABEL_SCHEMA,
+        effort='high',
+        allowed_tools=[],  # no tools needed — all context is in the prompt
+    )
+
+    cost = result.cost_usd
+
+    data = result.structured_output
+    if not data:
+        try:
+            data = json.loads(result.output)
+        except (json.JSONDecodeError, TypeError):
+            logger.warning(
+                'Frontier label proposal produced unparseable output: %s',
+                result.output[:200],
+            )
+            return [], cost
+
+    raw_issues = data.get('issues') if isinstance(data, dict) else None
+    if not isinstance(raw_issues, list):
+        return [], cost
+
+    issues: list[GroundTruthIssue] = []
+    for i, raw in enumerate(raw_issues, start=1):
+        try:
+            issues.append(GroundTruthIssue(
+                id=f'frontier_{i}',
+                location=raw['location'],
+                category=raw['category'],
+                severity=raw['severity'],
+                description=raw['description'],
+                mutation_type=raw['mutation_type'],
+            ))
+        except (KeyError, TypeError):
+            logger.warning('Skipping malformed frontier issue at index %d: %r', i, raw)
+            continue
+
+    return issues, cost
