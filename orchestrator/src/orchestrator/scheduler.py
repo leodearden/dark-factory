@@ -4927,6 +4927,10 @@ class Scheduler:
         # per-phase commentary off of.
         for label in self._TICK_PHASE_ORDER:
             r = await getattr(self, f'_phase_{label}')(ctx)
+            assert r is _CONTINUE or isinstance(r, TickOutcome), (
+                f'_phase_{label} returned {r!r} — every _phase_* method must '
+                f'return _CONTINUE or a TickOutcome (did it forget a return?)'
+            )
             if r is not _CONTINUE:
                 return r.assignment
         return None
