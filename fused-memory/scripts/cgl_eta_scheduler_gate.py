@@ -65,14 +65,21 @@ def _log(msg: str) -> None:
 class McpClient:
     """Minimal HTTP/JSON-RPC client for an escalation MCP server."""
 
-    def __init__(self, url: str):
+    def __init__(self, url: str, transport: httpx.BaseTransport | None = None):
         self._url = url.rstrip('/')
         self._client: httpx.AsyncClient | None = None
         self._session_id: str | None = None
+        self._transport = transport
 
     async def __aenter__(self) -> McpClient:
-        self._client = httpx.AsyncClient(timeout=30.0, follow_redirects=True)
-        self._session_id = uuid.uuid4().hex
+        self._client = httpx.AsyncClient(
+            timeout=30.0, follow_redirects=True, transport=self._transport,
+        )
+        # No session id on the FIRST request: the MCP streamable-HTTP contract
+        # requires `initialize` to be sent session-less. A STATEFUL server
+        # (e.g. the escalation servers) 404s "Session not found" if a client
+        # invents its own id here. The server-assigned id is captured from the
+        # initialize response in `_post` below and reused from then on.
         await self._post({
             'jsonrpc': '2.0', 'id': 1, 'method': 'initialize',
             'params': {'protocolVersion': '2024-11-05',
