@@ -37,14 +37,14 @@ from datetime import UTC, datetime, timedelta
 
 import pytest
 import pytest_asyncio
+from shared.task_claimant import compose_claimant_run_id, is_stranded
+from shared.task_statuses import TaskStatus
 
 from fused_memory.backends.sqlite_task_backend import SqliteTaskBackend
 from fused_memory.backends.task_backend_errors import TaskmasterError
 from fused_memory.config.schema import FusedMemoryConfig, TaskmasterConfig
 from fused_memory.middleware.task_interceptor import TaskInterceptor
 from fused_memory.reconciliation.event_buffer import EventBuffer
-from shared.task_claimant import compose_claimant_run_id, is_stranded
-from shared.task_statuses import TaskStatus
 
 __all__ = [
     'TaskmasterError',

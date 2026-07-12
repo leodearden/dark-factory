@@ -42,14 +42,14 @@ from unittest.mock import patch
 import pytest
 from fastmcp import Client
 from fastmcp.client.transports import StreamableHttpTransport
+from shared.task_statuses import TaskStatus
+from shared.task_transitions import ActorClass, is_legal_transition
 
 from escalation.action_effects import ACTION_EFFECTS, ANY, TaskEffect, effect_for
 from escalation.authority import PROMOTE_ALLOWED, ROLE_LEVEL_ALLOWLIST
 from escalation.models import Escalation
 from escalation.queue import EscalationQueue
 from escalation.server import create_server
-from shared.task_statuses import TaskStatus
-from shared.task_transitions import ActorClass, is_legal_transition
 
 __all__ = [
     'ACTION_EFFECTS',
