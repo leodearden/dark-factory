@@ -1035,122 +1035,173 @@ async def test_note_merge_empty_success_returns_false_not_error() -> None:
 
 # ---------------------------------------------------------------------------
 # U2 (task 1973): schedule_detached_systemd_restart — cgroup-escaping restart
+#
+# task 2237 (W10-gamma): schedule_detached_systemd_restart is now a thin
+# proc_supervision.RestartPlan caller (the M1 restart-seam) — it builds a
+# same-unit plan (own_unit=target_unit=transient_unit, verify=None) and
+# delegates to RestartPlan.execute(), which routes to the DETACHED
+# systemd-run path. RestartPlan.execute() now owns the actual
+# asyncio.create_subprocess_exec call (inside proc_supervision.py), so these
+# tests pass an explicit `runner=` fake through schedule_detached_systemd_
+# restart's injectable seam instead of patching
+# orchestrator.service_restart.asyncio.create_subprocess_exec (which the
+# conversion no longer calls). The conversion closes the "accepted gap":
+# every detached self-restart argv now carries --working-directory=<cwd>
+# (RP-3) and, when on_failure_escalation is supplied, a /bin/sh -c
+# on-failure escalation wrapper (RP-4) — a fire-time failure of the deferred
+# payload is no longer traceable only via journald.
 # ---------------------------------------------------------------------------
+
+
+class _RecordingRunner:
+    """Local async-callable stand-in for asyncio.create_subprocess_exec.
+
+    Records every ``(argv, kwargs)`` call; returns a configurable-returncode
+    fake proc. Mirrors the FakeRunner idiom in test_proc_supervision.py.
+    """
+
+    def __init__(self, returncode: int = 0, stdout: bytes = b'') -> None:
+        self.returncode = returncode
+        self.stdout = stdout
+        self.calls: list[tuple[tuple, dict]] = []
+
+    async def __call__(self, *args: object, **kwargs: object):
+        self.calls.append((args, kwargs))
+        proc = MagicMock()
+        proc.communicate = AsyncMock(return_value=(self.stdout, None))
+        proc.returncode = self.returncode
+        return proc
 
 
 @pytest.mark.asyncio
 async def test_schedule_detached_systemd_restart_builds_correct_argv() -> None:
-    """Builds the systemd-run --user cgroup-escaping argv and spawns it with PIPE/STDOUT.
-
-    Mirrors DeterministicRunner._default_schedule_detached_restart's argv
-    pattern (systemd-run --user --on-active=N --unit=<unit> --collect <target>)
-    but WITHOUT the /bin/sh on-failure wrapper — restart-orchestrator.sh
-    self-verifies and self-reports to journald, and the coordinator's
-    maybe_restart already clears pending on executor failure.
+    """Builds the systemd-run --user cgroup-escaping argv, now WITH
+    --working-directory=<project_root> (RP-3) and a /bin/sh -c wrapper whose
+    on-failure branch submits the given EscalationSpec (RP-4) — the accepted
+    gap is closed.
     """
     from pathlib import Path
-    from unittest.mock import patch
 
+    from orchestrator.proc_supervision import EscalationSpec
     from orchestrator.service_restart import schedule_detached_systemd_restart
 
-    fake_proc = MagicMock()
-    fake_proc.communicate = AsyncMock(return_value=(b'', None))
-    fake_proc.returncode = 0
+    runner = _RecordingRunner(returncode=0)
+    spec = EscalationSpec(
+        queue_dir='/fake/queue',
+        task_id='orchestrator-self-redeploy',
+        summary='Orchestrator self-restart fire-time failure',
+    )
 
-    with patch(
-        'orchestrator.service_restart.asyncio.create_subprocess_exec',
-        new_callable=AsyncMock,
-        return_value=fake_proc,
-    ) as mock_exec:
-        await schedule_detached_systemd_restart(
-            script='scripts/restart-orchestrator.sh',
-            script_args=[],
-            project_root='/fake/project',
-            transient_unit='orch-selfrestart-on-merge-0.service',
-            on_active_secs=10,
-        )
+    await schedule_detached_systemd_restart(
+        script='scripts/restart-orchestrator.sh',
+        script_args=[],
+        project_root='/fake/project',
+        transient_unit='orch-selfrestart-on-merge-0.service',
+        on_active_secs=10,
+        on_failure_escalation=spec,
+        runner=runner,
+    )
 
-    mock_exec.assert_awaited_once()
-    call_args = mock_exec.call_args
-    pos_args = call_args.args if call_args.args else call_args[0]
-    assert pos_args == (
+    assert len(runner.calls) == 1
+    argv, kwargs = runner.calls[0]
+    assert argv[:7] == (
         'systemd-run',
         '--user',
         '--on-active=10',
         '--unit=orch-selfrestart-on-merge-0.service',
         '--collect',
-        str(Path('/fake/project') / 'scripts/restart-orchestrator.sh'),
+        '--working-directory=/fake/project',
+        '/bin/sh',
     )
-    assert call_args.kwargs.get('stdout') is not None
-    assert call_args.kwargs.get('stderr') is not None
-    fake_proc.communicate.assert_awaited_once()
+    assert argv[7] == '-c'
+    assert len(argv) == 9
+    wrapped = argv[8]
+    expected_script = str(Path('/fake/project') / 'scripts/restart-orchestrator.sh')
+    assert wrapped.startswith(expected_script)
+    assert '__rc=$?;' in wrapped
+    assert '-m escalation submit' in wrapped
+    assert '--task orchestrator-self-redeploy' in wrapped
+    assert kwargs.get('stdout') is not None
+    assert kwargs.get('stderr') is not None
 
 
 @pytest.mark.asyncio
 async def test_schedule_detached_systemd_restart_appends_script_args() -> None:
-    """script_args are appended after the script path, mirroring the coordinator's spawn convention."""
+    """script_args are appended after the script path inside the wrapped payload."""
     from pathlib import Path
-    from unittest.mock import patch
 
     from orchestrator.service_restart import schedule_detached_systemd_restart
 
-    fake_proc = MagicMock()
-    fake_proc.communicate = AsyncMock(return_value=(b'', None))
-    fake_proc.returncode = 0
+    runner = _RecordingRunner(returncode=0)
 
-    with patch(
-        'orchestrator.service_restart.asyncio.create_subprocess_exec',
-        new_callable=AsyncMock,
-        return_value=fake_proc,
-    ) as mock_exec:
-        await schedule_detached_systemd_restart(
-            script='scripts/restart-orchestrator.sh',
-            script_args=['--drain'],
-            project_root='/fake/project',
-            transient_unit='orch-selfrestart-on-merge-1.service',
-            on_active_secs=10,
-        )
-
-    call_args = mock_exec.call_args
-    pos_args = call_args.args if call_args.args else call_args[0]
-    assert pos_args == (
-        'systemd-run',
-        '--user',
-        '--on-active=10',
-        '--unit=orch-selfrestart-on-merge-1.service',
-        '--collect',
-        str(Path('/fake/project') / 'scripts/restart-orchestrator.sh'),
-        '--drain',
+    await schedule_detached_systemd_restart(
+        script='scripts/restart-orchestrator.sh',
+        script_args=['--drain'],
+        project_root='/fake/project',
+        transient_unit='orch-selfrestart-on-merge-1.service',
+        on_active_secs=10,
+        runner=runner,
     )
+
+    argv, _kwargs = runner.calls[0]
+    wrapped = argv[-1]
+    expected_script = str(Path('/fake/project') / 'scripts/restart-orchestrator.sh')
+    assert wrapped.split()[:2] == [expected_script, '--drain']
 
 
 @pytest.mark.asyncio
 async def test_schedule_detached_systemd_restart_raises_on_nonzero_rc() -> None:
-    """A non-zero systemd-run registration rc raises RuntimeError carrying the output tail."""
-    from unittest.mock import patch
-
+    """A non-zero systemd-run registration rc raises RuntimeError carrying the
+    output tail — a REGISTRATION_FAILED RestartOutcome is translated back to
+    a raised RuntimeError, preserving the coordinator's transient-retry
+    contract (maybe_restart treats any non-FileNotFoundError/PermissionError
+    exception as retryable)."""
     from orchestrator.service_restart import schedule_detached_systemd_restart
 
-    fake_proc = MagicMock()
-    fake_proc.communicate = AsyncMock(
-        return_value=(b'systemd-run: failed to register unit', None)
+    runner = _RecordingRunner(
+        returncode=1, stdout=b'systemd-run: failed to register unit',
     )
-    fake_proc.returncode = 1
 
-    with patch(
-        'orchestrator.service_restart.asyncio.create_subprocess_exec',
-        new_callable=AsyncMock,
-        return_value=fake_proc,
-    ), pytest.raises(RuntimeError) as exc_info:
+    with pytest.raises(RuntimeError) as exc_info:
         await schedule_detached_systemd_restart(
             script='scripts/restart-orchestrator.sh',
             script_args=[],
             project_root='/fake/project',
             transient_unit='orch-selfrestart-on-merge-2.service',
             on_active_secs=10,
+            runner=runner,
         )
 
     assert 'failed to register unit' in str(exc_info.value)
+
+
+@pytest.mark.asyncio
+async def test_schedule_detached_systemd_restart_without_escalation_builds_unbranched_wrapper() -> None:
+    """on_failure_escalation=None (the default) still builds a valid,
+    UNBRANCHED /bin/sh -c payload — just the quoted script+args, no __rc
+    on-failure branch. No crash, no escalation-submit reference."""
+    from pathlib import Path
+
+    from orchestrator.service_restart import schedule_detached_systemd_restart
+
+    runner = _RecordingRunner(returncode=0)
+
+    await schedule_detached_systemd_restart(
+        script='scripts/restart-orchestrator.sh',
+        script_args=[],
+        project_root='/fake/project',
+        transient_unit='orch-selfrestart-on-merge-3.service',
+        on_active_secs=10,
+        runner=runner,
+    )
+
+    argv, _kwargs = runner.calls[0]
+    assert argv[7] == '-c'
+    wrapped = argv[8]
+    expected_script = str(Path('/fake/project') / 'scripts/restart-orchestrator.sh')
+    assert wrapped == expected_script
+    assert '__rc' not in wrapped
+    assert 'escalation submit' not in wrapped
 
 
 # ---------------------------------------------------------------------------
