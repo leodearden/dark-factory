@@ -2099,6 +2099,12 @@ class ReconciliationHarness:
                 completed_at=datetime.now(UTC),
                 items_flagged=[],
                 stats={'stage1_cycle_summary_degraded_backstop': True},
+                # llm_calls/tokens_used are zeroed, not "no work happened" —
+                # Stage 1's real counts live inside BaseStage.run() and are
+                # lost with the exception (see docstring). Any dashboard that
+                # sums llm_calls/tokens across cycles without filtering out
+                # stats['stage1_cycle_summary_degraded_backstop'] is True rows
+                # will silently undercount the work Stage 1 did before raising.
                 llm_calls=0,
                 tokens_used=0,
             )
