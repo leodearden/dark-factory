@@ -73,7 +73,14 @@ def _estimate_cost(
     if prices is None:
         from orchestrator.config import default_price_table
         prices = default_price_table()
-    entry = prices.get(model, _FALLBACK_PRICE)
+    entry = prices.get(model)
+    if entry is None:
+        logger.warning(
+            'No configured price for model %r; falling back to $%.2f/1M input, '
+            '$%.2f/1M output (add it to config.prices to silence)',
+            model, _FALLBACK_PRICE['input_per_1m'], _FALLBACK_PRICE['output_per_1m'],
+        )
+        entry = _FALLBACK_PRICE
     return (
         input_tokens * _rate(entry, 'input_per_1m')
         + output_tokens * _rate(entry, 'output_per_1m')
