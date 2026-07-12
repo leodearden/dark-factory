@@ -611,3 +611,44 @@ class TestManagedSpawnEnvInjection:
         env = captured_kwargs.get('env')
         assert env is not None
         assert env['QUEUE_DATA_DIR'] == '/custom/q'
+
+    async def test_start_honors_operator_preset_reconciliation_data_dir(
+        self, mock_config: MagicMock, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """An operator-preset RECONCILIATION_DATA_DIR in the environment
+        survives — setdefault() must not clobber it. Mirrors
+        test_start_honors_operator_preset_queue_data_dir: the two env vars
+        are set via separate setdefault() calls, so each needs its own
+        override assertion or a regression to one could go unnoticed."""
+        monkeypatch.delenv('QUEUE_DATA_DIR', raising=False)
+        monkeypatch.setenv('RECONCILIATION_DATA_DIR', '/custom/r')
+
+        from orchestrator.mcp_lifecycle import McpLifecycle
+
+        captured_kwargs: dict = {}
+
+        async def fake_exec(*args: object, **kwargs: object) -> MagicMock:
+            captured_kwargs.update(kwargs)
+            proc = MagicMock()
+            proc.returncode = None
+            proc.stdout = MagicMock()
+            proc.stderr = MagicMock()
+            return proc
+
+        with (
+            patch(
+                'orchestrator.mcp_lifecycle.asyncio.create_subprocess_exec',
+                side_effect=fake_exec,
+            ),
+            patch.object(
+                McpLifecycle, '_wait_for_health', new=AsyncMock(return_value=True)
+            ),
+            patch('orchestrator.mcp_lifecycle.McpSession') as mock_session_cls,
+        ):
+            mock_session_cls.return_value.initialize = AsyncMock()
+            mcp = McpLifecycle(mock_config)
+            await mcp.start()
+
+        env = captured_kwargs.get('env')
+        assert env is not None
+        assert env['RECONCILIATION_DATA_DIR'] == '/custom/r'
