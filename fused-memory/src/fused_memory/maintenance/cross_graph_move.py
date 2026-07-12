@@ -172,14 +172,22 @@ async def _read_compact_vector(
     (a different tag or a wrapped cell), this function falls through to the
     ValueError branch below instead -- safe (matches the pre-fix behaviour,
     no data corruption) but silently non-fixing for the ~10% scenario this
-    task targets, with every unit test still green. The η live
-    throwaway-graph rehearsal (``plans/cross-graph-entity-leak-prd.md``
-    decision 5) MUST be extended with a probe case -- seed a
-    ``_probe``-prefixed edge with a persisted-null ``fact_embedding`` and
-    assert this function returns ``None`` against that real row -- before
-    this null-tolerance path is trusted at full-census scale. That PRD/
-    runbook update is outside ``fused_memory/maintenance``'s locked scope
-    for this amendment pass and is tracked as follow-up, not done here.
+    task targets, with every unit test still green.
+
+    TRACKED (not just this comment): filed as a fused-memory follow-up via
+    submit_task; the curator confirmed it as a duplicate of, and folded it
+    into, task 2273 (CGL-η Phase-1 live migration gate -- ``dark_factory``
+    project, currently ``blocked`` pending a human/L2 session) rather than
+    creating a new task, because task 2273's own RUNBOOK step 1 ("LIVE
+    REHEARSAL... on the LIVE FalkorDB") already mandates exactly this kind
+    of probe before the census apply. Whoever resolves task 2273's
+    escalation MUST extend that rehearsal with one additional probe case --
+    seed a ``_probe``-prefixed edge with a persisted-null ``fact_embedding``
+    and assert this function returns ``None`` against that real row --
+    before the null-tolerance path added here is trusted at full-census
+    scale. Editing task 2273's runbook text or ``plans/cross-graph-entity-
+    leak-prd.md`` itself is outside ``fused_memory/maintenance``'s locked
+    scope for this amendment pass and is not done here.
     """
     reply = await falkor_client.execute_command('GRAPH.RO_QUERY', group_id, cypher, '--compact')
     rows = reply[1]
@@ -194,8 +202,9 @@ async def _read_compact_vector(
     scalar_type, value = int(cell[0]), cell[1]
     if scalar_type == _VALUE_NULL:
         # Mock-verified only -- see this function's "CAVEAT" docstring
-        # paragraph for why the η live rehearsal must confirm this tag
-        # against a real FalkorDB null property before full-census trust.
+        # paragraph: tracked as part of task 2273's (CGL-η) live rehearsal,
+        # which must confirm this tag against a real FalkorDB null property
+        # before full-census trust.
         return None
     if scalar_type != _VALUE_VECTORF32:
         raise ValueError(
@@ -1196,12 +1205,21 @@ async def _recreate_subgraph_relationships_batch(
                 'reason': str(exc),
                 'node_uuids': [src_uuid, dst_uuid],
             })
-            logger.warning(
+            # error + exc_info (reviewer follow-up, task 2451 amendment):
+            # this broad `except Exception` deliberately isolates any
+            # per-item failure, including a genuine programming error from a
+            # future refactor -- logging the full traceback here (instead of
+            # a bare warning) keeps such a bug diagnosable as a traceback in
+            # the logs rather than reading as a routine per-item data skip,
+            # without narrowing the catch and risking an un-isolated
+            # transient failure aborting the batch again.
+            logger.error(
                 'recreate_subgraph_relationships: RELATES_TO edge uuid=%s '
                 'blocked -- %s: %s (src=%s dst=%s target_graph=%s); batch '
                 'continues',
                 edge_uuid, type(exc).__name__, exc, src_uuid, dst_uuid,
                 target_graph_name,
+                exc_info=True,
             )
 
     for mention_uuid, (row, _source_graph, entity_uuid) in mentions_by_uuid.items():
@@ -1249,12 +1267,16 @@ async def _recreate_subgraph_relationships_batch(
                 'reason': str(exc),
                 'node_uuids': [entity_uuid],
             })
-            logger.warning(
+            # error + exc_info: see the RELATES_TO MOVE-edge pass's matching
+            # comment above -- keeps a programming-error traceback visible
+            # in the logs instead of reading as a routine per-item skip.
+            logger.error(
                 'recreate_subgraph_relationships: MENTIONS link uuid=%s '
                 'blocked -- %s: %s (entity_uuid=%s target_graph=%s); batch '
                 'continues',
                 mention_uuid, type(exc).__name__, exc, entity_uuid,
                 target_graph_name,
+                exc_info=True,
             )
 
     # --- MERGE fold ---
@@ -1352,12 +1374,17 @@ async def _recreate_subgraph_relationships_batch(
                     'reason': str(exc),
                     'node_uuids': [src_uuid, dst_uuid],
                 })
-                logger.warning(
+                # error + exc_info: see the RELATES_TO MOVE-edge pass's
+                # matching comment above -- keeps a programming-error
+                # traceback visible in the logs instead of reading as a
+                # routine per-item skip.
+                logger.error(
                     'recreate_subgraph_relationships: MERGE-fold RELATES_TO '
                     'edge uuid=%s blocked -- %s: %s (src=%s dst=%s '
                     'home_graph=%s); batch continues',
                     edge_uuid, type(exc).__name__, exc, src_uuid, dst_uuid,
                     home_graph,
+                    exc_info=True,
                 )
 
 
