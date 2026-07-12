@@ -65,7 +65,7 @@ def _log(msg: str) -> None:
 class McpClient:
     """Minimal HTTP/JSON-RPC client for an escalation MCP server."""
 
-    def __init__(self, url: str, transport: httpx.BaseTransport | None = None):
+    def __init__(self, url: str, transport: httpx.AsyncBaseTransport | None = None):
         self._url = url.rstrip('/')
         self._client: httpx.AsyncClient | None = None
         self._session_id: str | None = None
