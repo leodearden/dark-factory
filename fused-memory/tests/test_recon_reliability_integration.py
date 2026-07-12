@@ -93,6 +93,7 @@ from fused_memory.reconciliation.event_buffer import EventBuffer
 from fused_memory.reconciliation.flag_dedup import filter_suppressed, write_suppression_record
 from fused_memory.reconciliation.recon_ledger import ReconLedgerRecord, ReconLedgerStore
 from fused_memory.reconciliation.stages.task_knowledge_sync import _gc_recon_markers
+from fused_memory.reconciliation.summary_pool import write_cycle_summary
 from fused_memory.server.tools import create_mcp_server
 from fused_memory.services.memory_service import MemoryService
 from fused_memory.services.write_journal import WriteJournal
@@ -901,6 +902,10 @@ class TestDeterministicCycleSummary:
     _PROJECT = 'proj-d1-cycle-summary'
     _STAGE = 'task_knowledge_sync'
     _RUN_ID = 'run-d1-cycle-summary'
+    _RECON_POOL = 'stage2_cycle_summary'
+    _TRIM_SOURCE = 'stage2_cycle_summary_trim'
+    _CAP = 5
+    _NOW = datetime(2026, 7, 9, 0, 5, 0, tzinfo=UTC)
 
     async def test_write_cycle_summary_writes_single_ledger_row_from_report(
         self, recon_service,
@@ -955,3 +960,83 @@ class TestDeterministicCycleSummary:
         )
         assert payload['llm_calls'] == second_report.llm_calls
         assert payload['tokens_used'] == second_report.tokens_used
+
+    # -- driving harness (task 2232 step-12) ---------------------------------
+
+    async def _drive_single_write(self, recon_service) -> tuple[StageReport, bool]:
+        """Build a real StageReport and drive the real producer
+        write_cycle_summary ONCE for this class's (project, stage, run_id)
+        identity; return (report, wrote)."""
+        report = _make_stage_report(
+            stage=self._STAGE,
+            items_flagged=[{'description': 'a'}, {'description': 'b'}],
+            stats={'stage2_stage1_dups_suppressed': 1},
+            llm_calls=4,
+            tokens_used=1234,
+        )
+        wrote = await write_cycle_summary(
+            recon_service,
+            self._PROJECT,
+            report,
+            self._RUN_ID,
+            stage=self._STAGE,
+            recon_pool=self._RECON_POOL,
+            trim_source=self._TRIM_SOURCE,
+            cap=self._CAP,
+            now=self._NOW,
+        )
+        return report, wrote
+
+    async def _drive_repeat_write(self, recon_service) -> StageReport:
+        """Drive the real producer write_cycle_summary TWICE for the same
+        (project, stage, run_id) identity with differing report content;
+        return the SECOND report (the one that must survive)."""
+        first_report = _make_stage_report(
+            stage=self._STAGE,
+            items_flagged=[{'description': 'a'}],
+            stats={'first': True},
+            llm_calls=1,
+            tokens_used=100,
+        )
+        await write_cycle_summary(
+            recon_service,
+            self._PROJECT,
+            first_report,
+            self._RUN_ID,
+            stage=self._STAGE,
+            recon_pool=self._RECON_POOL,
+            trim_source=self._TRIM_SOURCE,
+            cap=self._CAP,
+            now=self._NOW,
+        )
+
+        second_report = _make_stage_report(
+            stage=self._STAGE,
+            items_flagged=[{'description': 'c'}, {'description': 'd'}, {'description': 'e'}],
+            stats={'second': True},
+            llm_calls=9,
+            tokens_used=999,
+        )
+        await write_cycle_summary(
+            recon_service,
+            self._PROJECT,
+            second_report,
+            self._RUN_ID,
+            stage=self._STAGE,
+            recon_pool=self._RECON_POOL,
+            trim_source=self._TRIM_SOURCE,
+            cap=self._CAP,
+            now=self._NOW,
+        )
+        return second_report
+
+    async def _count_rows(self, ledger: ReconLedgerStore, project_id: str) -> int:
+        """Raw SELECT COUNT(*) over recon_ledger for *project_id*'s
+        cycle_summary rows — a direct check on the store's own connection,
+        independent of get_by_identity's per-identity read path."""
+        cursor = await ledger._db.execute(  # noqa: SLF001 — intentional direct-connection check
+            "SELECT COUNT(*) FROM recon_ledger WHERE project_id = ? AND record_kind = 'cycle_summary'",
+            (project_id,),
+        )
+        row = await cursor.fetchone()
+        return row[0]
