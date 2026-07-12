@@ -893,6 +893,12 @@ async def invoke_with_cap_retry(
     # path (fused-memory recon/curator, cli_stage_runner.py) has NO `backend`
     # parameter and must NEVER receive the kwarg (Invariant 3, PRD Appendix A).
     if invoke_fn is not None:
+        # setdefault (not `=`) is purely defensive: `backend` is a
+        # keyword-only parameter of this function, so a caller can never
+        # smuggle a pre-existing `backend` key into invoke_kwargs — there is
+        # no live override path today. Kept as setdefault so a future
+        # invoke_kwargs source that does pre-populate `backend` isn't
+        # silently clobbered.
         invoke_kwargs.setdefault('backend', backend)
 
     # Fast path: no usage gate → single invocation, no cap retry.
