@@ -192,3 +192,28 @@ class TestParseGeminiOutputConfigPrices:
             prices={'gemini-3-flash': {'input_per_1m': 0.075, 'output_per_1m': 0.30}},
         )
         assert agent_result.cost_usd == pytest.approx((100 * 0.075 + 50 * 0.30) / 1_000_000)
+
+
+class TestParseCodexOutputUnknownModelFallback:
+    """An un-listed model must never silently fall back — it logs a WARNING
+    and uses the single defined `_FALLBACK_PRICE` (task 2459)."""
+
+    def test_unknown_model_logs_warning_and_uses_fallback_price(self, caplog):
+        events = [
+            {'type': 'thread.started', 'thread_id': 'tid-fallback-1'},
+            {'type': 'item.completed', 'item': {'type': 'agent_message', 'text': 'done'}},
+            {'type': 'turn.completed', 'usage': {'input_tokens': 200, 'output_tokens': 100}},
+        ]
+        payload = '\n'.join(json.dumps(e) for e in events)
+        result = _make_subprocess_result(stdout=payload)
+        with caplog.at_level(logging.WARNING):
+            agent_result = _parse_codex_output(
+                result, 'totally-unknown-model',
+                prices={'o4-mini': {'input_per_1m': 1.10, 'output_per_1m': 4.40}},
+            )
+        warning_records = [r for r in caplog.records if r.levelno >= logging.WARNING]
+        assert any('totally-unknown-model' in r.getMessage() for r in warning_records), (
+            f'expected a WARNING mentioning the unknown model; got: {[r.getMessage() for r in warning_records]}'
+        )
+        # _FALLBACK_PRICE: input=2.0/1M, output=8.0/1M
+        assert agent_result.cost_usd == pytest.approx((200 * 2.0 + 100 * 8.0) / 1_000_000)
