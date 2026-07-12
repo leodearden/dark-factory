@@ -612,6 +612,26 @@ class TestDeriveTruthLiveClaimant:
 
         assert report.live_claimant is None
 
+    async def test_plan_lock_non_utf8_bytes_returns_none_not_raise(self, tmp_path: Path) -> None:
+        # A byte-corrupt (non-UTF-8) plan.lock — another realistic outcome
+        # of a torn write during the crash this resolver recovers from —
+        # raises UnicodeDecodeError from read_plan_lock's
+        # lock_path.read_text(). UnicodeDecodeError is a ValueError
+        # subclass but NOT an OSError/json.JSONDecodeError subclass, so the
+        # pre-fix (json.JSONDecodeError, OSError) guard let it escape
+        # uncaught (amendment review finding #2). Must degrade to "no
+        # plan-lock claimant", same as the corrupt-JSON case above.
+        TaskArtifacts(tmp_path).root.mkdir(parents=True)
+        lock_path = TaskArtifacts(tmp_path).root / 'plan.lock'
+        lock_path.write_bytes(b'\xff\xfe\x00\x01garbage')
+        task = {'status': 'pending', 'claimant_run_id': None, 'heartbeat_at': None}
+        scheduler = _fake_scheduler(is_actively_held=False, task=task)
+        resolver = _make_ground_truth(scheduler=scheduler, worktree_resolver=lambda tid: tmp_path)
+
+        report = await resolver.derive_truth('33')
+
+        assert report.live_claimant is None
+
     async def test_no_claimant_and_no_plan_lock_returns_none(self) -> None:
         task = {'status': 'pending', 'claimant_run_id': None, 'heartbeat_at': None}
         scheduler = _fake_scheduler(is_actively_held=False, task=task)
@@ -727,6 +747,40 @@ class TestDeriveTruthRemainingFields:
         resolver = _make_ground_truth(scheduler=scheduler)
 
         report = await resolver.derive_truth('23')
+
+        assert report.deploy_phase is None
+
+    async def test_deploy_phase_none_when_slice_has_invalid_phase_value(self) -> None:
+        # DeployState.from_metadata does cls(**slice_) once the slice is
+        # confirmed to be a dict — an invalid `phase` value (not one of
+        # DeployPhase's members) raises pydantic ValidationError, which
+        # must degrade to deploy_phase=None rather than propagate out of
+        # derive_truth and abort the whole ground-truth sweep for this
+        # task (amendment review finding #1).
+        task = {
+            'status': 'in-progress', 'claimant_run_id': None, 'heartbeat_at': None,
+            'metadata': {'deploy_state': {'phase': 'bogus'}},
+        }
+        scheduler = _fake_scheduler(is_actively_held=False, task=task)
+        resolver = _make_ground_truth(scheduler=scheduler)
+
+        report = await resolver.derive_truth('34')
+
+        assert report.deploy_phase is None
+
+    async def test_deploy_phase_none_when_slice_missing_required_phase_key(self) -> None:
+        # `phase` has no default on DeployState — a deploy_state slice
+        # without it (e.g. a torn write that dropped the field) also
+        # raises pydantic ValidationError and must degrade the same way
+        # (amendment review finding #1).
+        task = {
+            'status': 'in-progress', 'claimant_run_id': None, 'heartbeat_at': None,
+            'metadata': {'deploy_state': {}},
+        }
+        scheduler = _fake_scheduler(is_actively_held=False, task=task)
+        resolver = _make_ground_truth(scheduler=scheduler)
+
+        report = await resolver.derive_truth('35')
 
         assert report.deploy_phase is None
 

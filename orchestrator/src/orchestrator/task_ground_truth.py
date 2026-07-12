@@ -21,12 +21,12 @@ in :meth:`TaskGroundTruth.derive_truth` and :func:`classify_recovery` below.
 from __future__ import annotations
 
 import enum
-import json
 import os
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from typing import TYPE_CHECKING
 
+from pydantic import ValidationError
 from shared.deploy_state import DeployPhase, DeployState
 from shared.task_claimant import is_stranded
 from shared.task_statuses import TaskStatus
@@ -216,8 +216,6 @@ class TaskGroundTruth:
         """
         branch_state = await self._resolve_branch_state(tid)
         task = await self.scheduler.get_task(tid) or {}
-        metadata = task.get('metadata')
-        deploy_state = DeployState.from_metadata(metadata) if isinstance(metadata, dict) else None
         worktree_path = self.worktree_resolver(tid)
         return TruthReport(
             db_status=task.get('status') or '',
@@ -225,7 +223,7 @@ class TaskGroundTruth:
             branch_state=branch_state,
             worktree_present=worktree_path.exists(),
             open_escalations=self._resolve_open_escalations(tid),
-            deploy_phase=deploy_state.phase if deploy_state is not None else None,
+            deploy_phase=self._resolve_deploy_phase(task.get('metadata')),
         )
 
     async def recovery_for(self, tid: str) -> tuple[TruthReport, RecoveryAction]:
@@ -336,11 +334,18 @@ class TaskGroundTruth:
 
         try:
             lock_data = TaskArtifacts(worktree_path).read_plan_lock()
-        except (json.JSONDecodeError, OSError):
+        except (ValueError, OSError):
             # A truncated/corrupt plan.lock is a realistic outcome of the
             # very crash this resolver recovers from — degrade to "no
             # plan-lock claimant" rather than letting one bad lock file
             # abort the whole ground-truth sweep for this task.
+            # ValueError (not just json.JSONDecodeError, itself already a
+            # ValueError subclass) also catches UnicodeDecodeError: a
+            # byte-corrupt, non-UTF-8 plan.lock raises UnicodeDecodeError
+            # from `read_plan_lock`'s `lock_path.read_text()` — a ValueError
+            # subclass, but NOT an OSError/JSONDecodeError subclass — so the
+            # narrower tuple let a byte-corrupt lock escape uncaught
+            # (review finding #2).
             lock_data = None
         if lock_data is not None:
             owner_pid = lock_data.get('owner_pid')
@@ -367,6 +372,33 @@ class TaskGroundTruth:
             return []
         rows = self.escalation_queue.get_by_task(tid, status='pending')
         return [EscalationRef(id=row.id, level=row.level) for row in rows]
+
+    def _resolve_deploy_phase(self, metadata: object) -> DeployPhase | None:
+        """Resolve a deterministic task's ``deploy_state.phase`` (DS-1/ε).
+
+        ``None`` when *metadata* isn't a mapping, when it carries no
+        ``deploy_state`` slice at all, or when the slice fails to validate.
+
+        ``DeployState.from_metadata`` only guards that the slice is a dict
+        before doing ``cls(**slice_)`` — a metadata blob carrying a
+        malformed slice (e.g. an invalid ``phase`` value, or one missing
+        the required ``phase`` key) raises pydantic ``ValidationError``; a
+        slice dict with non-string keys raises ``TypeError`` from that same
+        ``**slice_`` unpack. This mirrors ``shared.task_metadata``'s
+        identical ``except (ValidationError, TypeError)`` guard around the
+        same ``submodel(**parsed[key])`` shape. Either failure degrades to
+        "no deploy state" rather than aborting the whole ground-truth sweep
+        for this task — exactly the partially-written/corrupt state this
+        resolver exists to recover from (review finding #1), mirroring the
+        plan.lock corruption handling in :meth:`_resolve_live_claimant`.
+        """
+        if not isinstance(metadata, dict):
+            return None
+        try:
+            deploy_state = DeployState.from_metadata(metadata)
+        except (ValidationError, TypeError):
+            return None
+        return deploy_state.phase if deploy_state is not None else None
 
 
 # ---------------------------------------------------------------------------
