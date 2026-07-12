@@ -63,7 +63,7 @@
       "source": "synthetic",
       "description": "File::from_raw_fd takes ownership of fd but doc says caller closes it \u2014 double-close bug",
       "project": "reify",
-      "split": "selection"
+      "split": "train"
     },
     {
       "diff_id": "rs_heavy_mutation_copy",
@@ -296,6 +296,14 @@
       "description": "Task 921 (dark_factory): Migrate reconciliation add_task callers to submit_task + resolve_ticket. Flagged as a false-negative candidate -- review passed but escalation_created event.",
       "project": "dark-factory",
       "split": "train"
+    },
+    {
+      "diff_id": "mined_1653",
+      "language": "python",
+      "source": "mined",
+      "description": "Task 1653 (dark_factory): Fix stage1.py (memory_consolidator): add metadata.stage='memory_consolidator' to cycle summary writes. Flagged as a false-negative candidate -- review passed but escalation_created event.",
+      "project": "dark-factory",
+      "split": "test"
     }
   ],
   "split_seed": "reviewer_trial-2495-fn-mining"

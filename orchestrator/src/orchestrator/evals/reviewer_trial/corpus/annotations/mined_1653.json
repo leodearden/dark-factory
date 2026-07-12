@@ -1,0 +1,44 @@
+{
+  "diff_id": "mined_1653",
+  "ground_truth": [
+    {
+      "id": "frontier_1",
+      "location": "fused-memory/src/fused_memory/reconciliation/prompts/stage1.py:155",
+      "category": "logic",
+      "severity": "blocking",
+      "description": "The new Stage 1 text asserts that 'Stage 3's triple-filter verification' will otherwise 'falsely report \"Stage 1 summary missing\"', implying Stage 3 verifies the Stage 1 cycle summary (stage='memory_consolidator'). But the stage3.py changes in this diff only add/keep a check for the Stage 2 summary (stage='task_knowledge_sync'); Stage 3 is never given a path to verify the Stage 1 summary. This is a dangling reference to a verification that does not exist, so the newly-written Stage 1 summary's persistence is never actually confirmed downstream \u2014 the plausible source of the escalation despite a passing review.",
+      "mutation_type": "logic"
+    },
+    {
+      "id": "frontier_2",
+      "location": "fused-memory/src/fused_memory/reconciliation/prompts/stage3.py:76-98",
+      "category": "logic",
+      "severity": "suggestion",
+      "description": "Requiring the disambiguating key 'stage':'task_knowledge_sync' in Path 2 means Stage 2 summaries written after task 1588 but before task 9af436fe (they have run_id but no stage) now count as 0 under the triple filter. This silently narrows Path 2 coverage and re-exposes those legacy summaries to exactly the low-cosine semantic-search false-negative (run 80a85eeb / memory 91e6a3b9 at relevance 0.71) that Path 2 was introduced to eliminate, for that legacy window.",
+      "mutation_type": "logic"
+    },
+    {
+      "id": "frontier_3",
+      "location": "fused-memory/src/fused_memory/reconciliation/prompts/stage1.py:158",
+      "category": "api_misuse",
+      "severity": "suggestion",
+      "description": "The verify-then-retry instruction ('confirm it returns >= 1 ... A return of 0 means ... retry the add_memory write once') assumes count_memories_by_metadata is immediately consistent with the just-completed add_memory. If Qdrant metadata indexing lags the write (read-after-write delay), the count can transiently return 0 even though the write persisted, and the mandated retry then creates a duplicate cycle summary \u2014 the same duplicate-per-cycle entry the surrounding text warns later cycles must clean up. The same pattern was added to stage2.py:227-233.",
+      "mutation_type": "api_misuse"
+    }
+  ],
+  "provenance": {
+    "kind": "mined",
+    "task_id": "1653",
+    "project_id": "dark_factory",
+    "outcome": "done",
+    "review_cycles": 2,
+    "verify_attempts": 0,
+    "signal_reason": [
+      "escalation_created event"
+    ],
+    "merge_sha": "2f4212e9380085b6704b59eeb479bdfa7279f899",
+    "runs_db_path": "/home/leo/src/dark-factory/data/orchestrator/runs.db",
+    "runs_db_query": "SELECT task_id, project_id, outcome, review_cycles, verify_attempts FROM task_results WHERE review_cycles >= 1, cross-referenced with events (escalation_created, merge_finalized) -- see mining.mine_fn_candidates.",
+    "escalation_refs": []
+  }
+}
