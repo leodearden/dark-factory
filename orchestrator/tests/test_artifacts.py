@@ -521,6 +521,29 @@ class TestAgentSession:
         assert artifacts.read_agent_session() is None
 
 
+class TestVerdicts:
+    """Verdict artifacts written by the verdict-tools MCP server (task 2481)."""
+
+    def test_write_read_roundtrip(self, artifacts: TaskArtifacts):
+        envelope = {
+            'role': 'judge',
+            'schema_version': 1,
+            'session_id': 's',
+            'emitted_at': 't',
+            'verdict': {'complete': True},
+        }
+        artifacts.write_verdict('judge', envelope)
+        assert (artifacts.root / 'verdicts' / 'judge.json').exists()
+        assert artifacts.read_verdict('judge') == envelope
+
+    def test_read_returns_none_when_missing(self, artifacts: TaskArtifacts):
+        assert artifacts.read_verdict('missing') is None
+
+    def test_read_returns_none_on_corrupt_json(self, artifacts: TaskArtifacts):
+        (artifacts.root / 'verdicts' / 'judge.json').write_text('{not valid json')
+        assert artifacts.read_verdict('judge') is None
+
+
 class TestReviews:
     def test_write_and_read_reviews(self, artifacts: TaskArtifacts):
         artifacts.write_review('test_analyst', {
