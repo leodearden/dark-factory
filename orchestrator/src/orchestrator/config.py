@@ -3046,6 +3046,9 @@ RELOADABLE_FIELDS: frozenset[str] = frozenset().union(
         'review.full_review_min_tasks',
         # Verify env (fresh config's value already carries the sccache fold)
         'verify_env',
+        # Per-model USD/1M-token price table (task 2459) — an operator can
+        # retune rates without a process restart, same as verify_env above.
+        'prices',
         # Offline-lane tunables (leaf fields on the existing `git` submodel —
         # leaf-mutation only per I3)
         'git.offline_lane_test_threads',
