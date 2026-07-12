@@ -2269,3 +2269,42 @@ class TestOrchestratorConfigPrices:
         table = default_price_table()
         assert set(table) == self._SEED_KEYS
         assert table['o4-mini'] == {'input_per_1m': 1.10, 'output_per_1m': 4.40}
+
+
+class TestPricesReloadDisposition:
+    """`prices` is a green-tier hot-reloadable dict-valued top-level leaf,
+    mirroring the existing `verify_env` precedent in RELOADABLE_FIELDS.
+    """
+
+    def test_prices_is_reloadable(self):
+        assert 'prices' in RELOADABLE_FIELDS
+
+    def test_price_edit_lands_in_applied_candidates_not_restart_required(
+        self, monkeypatch, tmp_path
+    ):
+        monkeypatch.chdir(tmp_path)
+        monkeypatch.setenv('ORCH_CONFIG_PATH', '')
+        live = OrchestratorConfig(
+            prices={'o4-mini': PriceEntry(input_per_1m=1.10, output_per_1m=4.40)}
+        )
+        fresh = OrchestratorConfig(
+            prices={'o4-mini': PriceEntry(input_per_1m=9.99, output_per_1m=4.40)}
+        )
+        diff = diff_config(live, fresh)
+        assert 'prices' in diff.applied_candidates
+        assert 'prices' not in diff.restart_required
+
+    def test_apply_reload_applies_in_place(self, monkeypatch, tmp_path):
+        monkeypatch.chdir(tmp_path)
+        monkeypatch.setenv('ORCH_CONFIG_PATH', '')
+        live = OrchestratorConfig(
+            prices={'o4-mini': PriceEntry(input_per_1m=1.10, output_per_1m=4.40)}
+        )
+        fresh = OrchestratorConfig(
+            prices={'o4-mini': PriceEntry(input_per_1m=9.99, output_per_1m=4.40)}
+        )
+        report = apply_reload(live, fresh)
+        assert report['reloaded'] is True
+        assert 'prices' in report['applied']
+        assert 'prices' not in report['restart_required']
+        assert live.prices['o4-mini'].input_per_1m == 9.99
