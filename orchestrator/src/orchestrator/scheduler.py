@@ -11,7 +11,7 @@ import re
 import time
 from collections import deque
 from collections.abc import Callable, Iterable, Iterator
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any, Protocol, runtime_checkable
@@ -544,6 +544,66 @@ class TaskAssignment:
     task_id: str
     task: dict
     modules: list[str]
+
+
+@dataclass
+class TickContext:
+    """Per-tick mutable state threaded through ``acquire_next``'s phase list.
+
+    Built once per tick (after the pre-ctx preamble in ``acquire_next`` —
+    guards, ``get_tasks``, empty-tasks drain, status/id index build, and
+    ``_update_age_anchors``) and passed to each ``_phase_*`` method in
+    ``Scheduler._TICK_PHASE_ORDER`` order. Fields are the six task-named
+    fields (``tasks``, ``status_map``, ``tasks_by_id``, ``external_cache``,
+    ``overrides``, ``candidates``) plus every other piece of per-tick state a
+    phase reads or writes.
+
+    Deliberately a MUTABLE dataclass, not frozen: phases mutate shared
+    per-tick state in place exactly as the pre-decomposition inline locals
+    did (``status_map`` backfilled, ``candidates`` filtered, ``external_cache``
+    / ``psi_*`` written across phases). Co-located here (not a new module)
+    to avoid a circular import — it references ``OverrideRow``, ``PsiSample``,
+    and ``TaskAssignment``, all already defined/imported in this module.
+    """
+
+    tasks: list[dict]
+    status_map: dict[str, str]
+    tasks_by_id: dict[str, dict]
+    max_id: int = 0
+    external_cache: dict[str, str] = field(default_factory=dict)
+    external_resolver_failed: bool = False
+    overrides: dict[str, OverrideRow] = field(default_factory=dict)
+    overrides_for_diff: dict[str, OverrideRow] = field(default_factory=dict)
+    effective_priorities: dict[str, str] = field(default_factory=dict)
+    transitive_counts: dict[str, int] = field(default_factory=dict)
+    candidates: list[dict] = field(default_factory=list)
+    candidate_signals: dict[str, str | None] = field(default_factory=dict)
+    gated_ids: set[str] = field(default_factory=set)
+    stale_ids: set[str] = field(default_factory=set)
+    psi_sample: PsiSample | None = None
+    psi_hold: bool = False
+    psi_in_flight: int = 0
+    dispatch_deferred_emitted: bool = False
+
+
+# Sentinel a `_phase_*` method returns to mean "proceed to the next phase in
+# `Scheduler._TICK_PHASE_ORDER`".  A bare `TaskAssignment | None` return
+# can't distinguish "this phase is done, keep going" from a genuine terminal
+# `TickOutcome(assignment=None)` (idle tick) since `None` is itself a valid
+# terminal value — this sentinel disambiguates continue-vs-terminate.
+_CONTINUE = object()
+
+
+@dataclass(frozen=True)
+class TickOutcome:
+    """Terminal result returned by a `_phase_*` method to END the tick.
+
+    ``assignment`` is exactly what ``acquire_next`` should return this tick
+    — a ``TaskAssignment`` on a successful dispatch, or ``None`` for an idle
+    tick (no candidates, lock conflicts, PSI hold with no eligible dispatch).
+    """
+
+    assignment: TaskAssignment | None
 
 
 def _resolve_time_source(ts: Callable[[], float] | None) -> Callable[[], float]:
@@ -1134,6 +1194,35 @@ def _task_external_deps(task: dict) -> list[str]:
 
 class Scheduler:
     """Selects next eligible task and manages module locks."""
+
+    # Ordering-as-data (task 2236, W10-β): the SINGLE source of dispatch
+    # order for acquire_next's per-tick phase sequence. acquire_next
+    # iterates this tuple directly (`for label in self._TICK_PHASE_ORDER`)
+    # to invoke each `_phase_<label>` method, so reordering/editing this
+    # literal changes real dispatch order — it is not documentation.
+    # Asserted by test_tick_phase_order_literal and
+    # test_acquire_next_delegates_to_phase_list in
+    # tests/test_scheduler_tick_phases.py.
+    _TICK_PHASE_ORDER: tuple[str, ...] = (
+        'backfill_dep_status',
+        'drain_park_eviction',
+        'park_gc',
+        'stale_sweep',
+        'cooldown_gc',
+        'external_dep_policy',
+        'stamp_milestone',
+        'override_snapshot_gc',
+        'reserve_now',
+        'override_diff',
+        'compute_priorities',
+        'build_candidates',
+        'landed_outbox_gate',
+        'starvation',
+        'empty_candidate_gate',
+        'psi_gate',
+        'select_pins',
+        'select_scored',
+    )
 
     def __init__(
         self,
@@ -3909,6 +3998,848 @@ class Scheduler:
                 gated.add(tid)
         return gated
 
+    # ---- acquire_next tick phases (W10-β) ----
+    #
+    # Each `_phase_*` method below is one ordered, side-effecting step of the
+    # `acquire_next` tick, in `Scheduler._TICK_PHASE_ORDER` order. Every
+    # phase takes the per-tick `TickContext` and returns either `_CONTINUE`
+    # (proceed to the next phase) or a `TickOutcome` (end the tick with that
+    # assignment). Docstrings declare each phase's ctx reads/writes.
+
+    async def _phase_backfill_dep_status(self, ctx: TickContext) -> object:
+        """Backfill dep-status for local deps missing from status_map.
+
+        Reads: ``ctx.tasks``. Writes: ``ctx.status_map`` (updated in place
+        on a clean backfill; left as-is — fail-safe-wait — on a degraded
+        resolver result). Correctness crux (γ2): the active-only
+        ``get_tasks`` filter drops terminal tasks from the result, so
+        dep-ids referencing DONE/CANCELLED tasks are absent from
+        ``ctx.status_map``, and ``_deps_satisfied`` reads
+        ``status_map.get(dep_id, 'unknown')`` — those deps would block
+        dispatching forever without this backfill. Consumes
+        ``_iter_pending_deps_in`` (task 2124) for all three inner passes
+        (degraded-bump, recovered-clear, still-missing-bump) — CONSUMED
+        here, not re-collapsed into a hand loop. Always continues.
+        """
+        _all_dep_ids: set[str] = set()
+        for _t in ctx.tasks:
+            for _d in (_t.get('dependencies') or []):
+                _dep_id = str(
+                    _d.get('id', _d) if isinstance(_d, dict) else _d
+                )
+                if _dep_id:
+                    _all_dep_ids.add(_dep_id)
+        _missing_dep_ids = sorted(_all_dep_ids - set(ctx.status_map))
+        if _missing_dep_ids:
+            _backfilled, _backfill_err = await self.get_statuses(
+                ids=_missing_dep_ids
+            )
+            if resolver_failed(_backfilled, _backfill_err):
+                logger.warning(
+                    'acquire_next: dep-status backfill degraded '
+                    '(err=%r, missing_dep_ids=%r) — affected pending tasks '
+                    'held fail-safe-wait',
+                    _backfill_err,
+                    _missing_dep_ids,
+                )
+                for _tid, _dep_id in _iter_pending_deps_in(ctx.tasks, _missing_dep_ids):
+                    _cnt = self._streak_local_backfill.bump((_tid, _dep_id))
+                    # Reuse max_external_dep_unresolved_cycles as the
+                    # grace threshold — same "consecutive ticks before
+                    # loud escalation" semantics as the external-dep
+                    # resolver-degraded path being mirrored here.
+                    # A dedicated max_local_backfill_unresolved_cycles
+                    # field is deferred (config.py is out of scope).
+                    if _cnt >= self.config.max_external_dep_unresolved_cycles:
+                        logger.warning(
+                            'acquire_next: local dep backfill unresolved '
+                            'for %d consecutive ticks '
+                            '(task=%s, dep=%s) — possible scheduler '
+                            'degradation',
+                            _cnt,
+                            _tid,
+                            _dep_id,
+                        )
+            else:
+                ctx.status_map.update(_backfilled)
+                # Reset the consecutive-tick counters for deps that resolved
+                # successfully in this backfill — mirrors the
+                # _external_unresolved_counts.pop(...) on the 'done' branch in
+                # _apply_external_dep_policy.  Without this reset, a dep that
+                # degrades → recovers → degrades again accumulates across the
+                # gap, making the "consecutive" counters and warning messages
+                # misreport the streak length.
+                for _tid, _dep_id in _iter_pending_deps_in(ctx.tasks, _backfilled):
+                    self._streak_local_backfill.clear((_tid, _dep_id))
+                # Partial-response guard: get_statuses returned a valid
+                # (non-error) dict that is still missing some of the requested
+                # dep ids.  Treat those still-missing ids as degraded — warn +
+                # bump counter — mirroring the missing-key guard in
+                # get_external_statuses (~1545).  The absent ids stay out of
+                # status_map so _deps_satisfied returns False → fail-safe-wait,
+                # now VISIBLE rather than a silent idle.
+                _still_missing = set(_missing_dep_ids) - set(_backfilled)
+                if _still_missing:
+                    logger.warning(
+                        'acquire_next: dep-status backfill returned partial '
+                        'result (missing %d/%d dep ids: %r) — affected '
+                        'pending tasks held fail-safe-wait',
+                        len(_still_missing),
+                        len(_missing_dep_ids),
+                        sorted(_still_missing),
+                    )
+                    for _tid, _dep_id in _iter_pending_deps_in(ctx.tasks, _still_missing):
+                        _cnt = self._streak_local_backfill.bump((_tid, _dep_id))
+                        # Same threshold as the degraded path above.
+                        if _cnt >= self.config.max_external_dep_unresolved_cycles:
+                            logger.warning(
+                                'acquire_next: local dep absent from '
+                                'backfill for %d consecutive ticks '
+                                '(task=%s, dep=%s) — possible '
+                                'scheduler degradation',
+                                _cnt,
+                                _tid,
+                                _dep_id,
+                            )
+        return _CONTINUE
+
+    async def _phase_drain_park_eviction(self, ctx: TickContext) -> object:
+        """Hygiene: drain queued operator force-evict requests.
+
+        Reads: ``ctx.status_map``, ``ctx.tasks_by_id``. Writes: none on
+        ctx (mutates the park-eviction store + lock table directly via
+        ``_drain_park_eviction_requests``). Runs BEFORE the automatic
+        park-GC sweep so operator-lever evictions emit
+        reservation_force_evicted (not reservation_expired) for the same
+        dead owner. Always continues.
+        """
+        self._drain_park_eviction_requests(ctx.status_map, ctx.tasks_by_id)
+        return _CONTINUE
+
+    async def _phase_park_gc(self, ctx: TickContext) -> object:
+        """Hygiene: owner-state park-GC sweep.
+
+        Reads: ``ctx.status_map``, ``ctx.tasks_by_id``. Writes: none on
+        ctx (mutates ``self.lock_table``/``self._skip_count`` and emits
+        reservation_expired/reservation_restored events). Replaces the
+        wall-clock lease mechanic: a park whose owner is terminal /
+        missing / deps-unsatisfied has no reason to keep blocking other
+        tasks, so it's evicted now. Always continues.
+        """
+        def _park_gc(tid: str) -> bool:
+            status = ctx.status_map.get(tid)
+            if status in TERMINAL_STATUSES:
+                return True
+            if tid not in ctx.tasks_by_id:
+                return True
+            return not self._deps_satisfied(ctx.tasks_by_id[tid], ctx.status_map, ctx.tasks_by_id)
+
+        gc_evicted, gc_restored = self.lock_table.prune_owners(_park_gc)
+        for owner in gc_evicted:
+            self._skip_count.pop(owner, None)
+            if self.event_store:
+                owner_status = ctx.status_map.get(owner)
+                if owner_status in TERMINAL_STATUSES:
+                    reason = f'terminal:{owner_status}'
+                elif owner not in ctx.tasks_by_id:
+                    reason = 'missing'
+                else:
+                    reason = 'deps_unsatisfied'
+                self.event_store.emit(
+                    EventType.reservation_expired,
+                    task_id=owner,
+                    data={'reason': reason},
+                )
+        if self.event_store:
+            for restored_owner, restored_modules in gc_restored:
+                self.event_store.emit(
+                    EventType.reservation_restored,
+                    task_id=restored_owner,
+                    data={
+                        'restored_owner': restored_owner,
+                        'modules': restored_modules,
+                    },
+                )
+        return _CONTINUE
+
+    async def _phase_stale_sweep(self, ctx: TickContext) -> object:
+        """Hygiene: sweep stale per-task bookkeeping + streak counters.
+
+        Reads: ``ctx.status_map``, ``ctx.tasks_by_id``. Writes:
+        ``ctx.stale_ids``. Drops ``_last_dispatch_at`` / ``_skip_count`` /
+        ``_module_cache`` / ``_pending_anchor`` entries for tasks that are
+        (a) in a terminal status, or (b) absent from tasks_by_id
+        (active-only filter dropped them), recording each dropped id in
+        ``_was_non_pending`` and ``ctx.stale_ids``. Then sweeps every
+        registered ``StreakRegistry`` counter (task 2124) via
+        ``self._streak_registry.gc`` — CONSUMED here, not re-collapsed
+        into a hand loop — unioning in tasks that left the candidate pool
+        for a non-terminal, non-eligible status (starvation-only sweep
+        set). Always continues.
+        """
+        stale_ids: set[str] = set()
+        all_tracked: set[str] = (
+            set(self._last_dispatch_at)
+            | set(self._skip_count)
+            | set(self._module_cache)
+            | set(self._pending_anchor)
+        )
+        for tid_str in all_tracked:
+            if ctx.status_map.get(tid_str) in TERMINAL_STATUSES or tid_str not in ctx.tasks_by_id:
+                self._last_dispatch_at.pop(tid_str, None)
+                self._skip_count.pop(tid_str, None)
+                self._module_cache.pop(tid_str, None)
+                self._pending_anchor.pop(tid_str, None)
+                self._was_non_pending.add(tid_str)
+                stale_ids.add(tid_str)
+        starvation_non_eligible = {
+            tid for tid in self._starvation_escalated
+            if ctx.status_map.get(tid) in _STARVATION_NON_ELIGIBLE
+        }
+        await self._streak_registry.gc(
+            stale_ids, extra={'starvation': starvation_non_eligible}
+        )
+        ctx.stale_ids = stale_ids
+        return _CONTINUE
+
+    async def _phase_cooldown_gc(self, ctx: TickContext) -> object:
+        """Hygiene: GC the requeue-cooldown dict.
+
+        Reads/writes: none on ctx (mutates ``self._requeue_until``
+        directly via ``_gc_expired_cooldowns``). Runs before both the
+        scored-candidate loop and the pin-dispatch loop so both observe
+        post-GC state, matching the contract previously provided by the
+        lazy per-call delete inside ``_eligible_for_dispatch``. Always
+        continues.
+        """
+        self._gc_expired_cooldowns()
+        return _CONTINUE
+
+    async def _phase_external_dep_policy(self, ctx: TickContext) -> object:
+        """Cross-project external-dep gate (invariant 5 — one batched call
+        per tick).
+
+        Reads: ``ctx.tasks``. Writes: ``ctx.external_cache``,
+        ``ctx.external_resolver_failed``. Collects the union of
+        ``metadata.external_deps`` across all pending tasks; if non-empty
+        issues ONE ``get_external_statuses`` call (zero deps → zero
+        calls). The per-tick cache is forwarded to ``_eligible_for_dispatch``
+        at both call sites below (``_phase_build_candidates`` /
+        ``_phase_select_pins``); ``_apply_external_dep_policy`` runs the
+        side-effecting pass (counter increments, escalation callbacks)
+        exactly once per tick, wrapped in try/except so a policy-pass
+        failure degrades to fail-safe-wait instead of aborting the tick.
+        Always continues.
+        """
+        _pending_ext_deps: list[tuple[dict, list[str]]] = [
+            (t, deps)
+            for t in ctx.tasks
+            if t.get('status') == 'pending'
+            and (deps := _task_external_deps(t))
+        ]
+        _pending_tasks_with_ext: list[dict] = [t for t, _ in _pending_ext_deps]
+        _ext_dep_union: list[str] = list({
+            dep
+            for _, deps in _pending_ext_deps
+            for dep in deps
+        })
+        if _ext_dep_union:
+            external_cache, external_err = await self.get_external_statuses(_ext_dep_union)
+        else:
+            external_cache, external_err = {}, None
+        try:
+            await self._apply_external_dep_policy(
+                _pending_tasks_with_ext, external_cache, external_err
+            )
+        except Exception:
+            # A failure in the policy pass (e.g. set_task_status raising inside
+            # the _on_external_dep_block callback) must not abort the whole tick.
+            # Degrade to a fail-safe wait: the gate stays closed via
+            # ctx.external_resolver_failed below, and the policy retries next tick.
+            logger.warning(
+                'External dep policy pass raised — degrading to fail-safe wait this tick',
+                exc_info=True,
+            )
+        ctx.external_cache = external_cache
+        ctx.external_resolver_failed = external_err is not None
+        return _CONTINUE
+
+    async def _phase_stamp_milestone(self, ctx: TickContext) -> object:
+        """Stamp the frozen-once ``milestone_deps_satisfied_at`` anchor.
+
+        Reads: ``ctx.tasks``, ``ctx.status_map``, ``ctx.tasks_by_id``,
+        ``ctx.external_cache``, ``ctx.external_resolver_failed``. Writes:
+        none on ctx (persists via ``_stamp_milestone_deps_satisfied``). For
+        pending 'delayed' milestone tasks whose full (local + external)
+        deps just became satisfied (task 2335 β). Placed after the
+        external-dep cache phase so the anchor reflects the SAME complete
+        dep evaluation the candidate loops below use, and before those
+        loops so a task's gate state this tick is still governed by its
+        pre-sweep snapshot (the stamp only becomes visible on the next
+        tick's get_tasks). Always continues.
+        """
+        await self._stamp_milestone_deps_satisfied(
+            ctx.tasks, ctx.status_map, ctx.tasks_by_id,
+            external_status_cache=ctx.external_cache,
+            external_resolver_failed=ctx.external_resolver_failed,
+        )
+        return _CONTINUE
+
+    async def _phase_override_snapshot_gc(self, ctx: TickContext) -> object:
+        """Load + GC this tick's priority-override snapshot.
+
+        Reads: ``ctx.status_map``, ``ctx.tasks_by_id``. Writes:
+        ``ctx.overrides``. Loads the override snapshot from the override
+        store, then removes rows for tasks that are terminal/missing or
+        whose TTL has elapsed. Runs alongside the park_gc sweep so the
+        rest of the tick sees post-GC state. Always continues.
+        """
+        current_overrides: dict[str, OverrideRow] = (
+            self._override_store.get_overrides(self._project_root)
+            if self._override_store
+            else {}
+        )
+        if self._override_store and current_overrides:
+            terminal_or_missing_ids: set[str] = (
+                {tid for tid, st in ctx.status_map.items() if st in TERMINAL_STATUSES}
+                | (set(current_overrides.keys()) - set(ctx.tasks_by_id.keys()))
+            )
+            if terminal_or_missing_ids:
+                cleared_overrides = self._override_store.clear_terminal(
+                    self._project_root, terminal_or_missing_ids
+                )
+                for tid in cleared_overrides:
+                    current_overrides.pop(tid, None)
+            # TTL sweep: clear any rows whose ttl_until has elapsed.
+            expired_overrides = self._override_store.clear_expired(
+                self._project_root, datetime.now(UTC)
+            )
+            for tid in expired_overrides:
+                current_overrides.pop(tid, None)
+        ctx.overrides = current_overrides
+        return _CONTINUE
+
+    async def _phase_reserve_now(self, ctx: TickContext) -> object:
+        """Snapshot pre-short-circuit overrides, then reserve-now.
+
+        Reads: ``ctx.overrides``, ``ctx.tasks_by_id``, ``ctx.status_map``.
+        Writes: ``ctx.overrides_for_diff`` (snapshot BEFORE the
+        short-circuit below), then mutates ``ctx.overrides`` in place via
+        the reserve-now short-circuit: for any task with reserve_now=1,
+        eagerly install parks on its modules then clear the flag. This is
+        single-tick fire-and-forget — the parks survive until the owner-GC
+        sweep evicts them (owner goes terminal/missing or its deps lapse).
+        Always continues.
+        """
+        ctx.overrides_for_diff = dict(ctx.overrides)
+
+        if self._override_store:
+            for rid, rrow in list(ctx.overrides.items()):
+                if not rrow.reserve_now:
+                    continue
+                if rid not in ctx.tasks_by_id:
+                    continue
+                if ctx.status_map.get(rid) in TERMINAL_STATUSES:
+                    continue
+                r_task = ctx.tasks_by_id[rid]
+                r_modules = self._get_modules(r_task)
+                r_tier = coerce_tier(r_task.get('priority'))
+                # Clear the flag BEFORE installing parks.  install_parks is
+                # naturally idempotent (duplicate parks are a no-op), so if the
+                # process crashes between clear and install, the next tick re-runs
+                # install harmlessly.  The opposite order risks a duplicate
+                # reservation_installed event if the clear fails after a
+                # successful install.
+                #
+                # In-process exceptions from install_parks are handled separately:
+                # the flag is restored via set_override so the next tick retries.
+                self._override_store.clear_override(
+                    self._project_root, rid, field='reserve_now'
+                )
+                try:
+                    installed, _evicted = self.lock_table.install_parks(
+                        rid, r_modules, r_tier
+                    )
+                    if self.event_store and installed:
+                        self.event_store.emit(
+                            EventType.reserve_now_consumed,
+                            task_id=rid,
+                            data={'modules': installed, 'priority': r_tier},
+                        )
+                    # Reflect the cleared flag in the in-memory snapshot so
+                    # downstream diff-detection doesn't spuriously re-emit for
+                    # this tick.
+                    ctx.overrides[rid] = OverrideRow(
+                        boost_tier=rrow.boost_tier,
+                        pinned=rrow.pinned,
+                        pin_order=rrow.pin_order,
+                        reserve_now=False,
+                        ttl_until=rrow.ttl_until,
+                    )
+                except Exception:
+                    logger.warning(
+                        'reserve_now: install_parks failed for task %s; restoring reserve_now flag',
+                        rid,
+                        exc_info=True,
+                    )
+                    try:
+                        self._override_store.set_override(
+                            self._project_root, rid, reserve_now=True
+                        )
+                    except Exception:
+                        logger.warning(
+                            'reserve_now: failed to restore reserve_now flag for task %s',
+                            rid,
+                            exc_info=True,
+                        )
+                        # Restore failed — DB still holds reserve_now=False (cleared
+                        # above).  Mirror that in memory so the diff-layer doesn't
+                        # fabricate a spurious priority_override_cleared event next tick.
+                        ctx.overrides[rid] = OverrideRow(
+                            boost_tier=rrow.boost_tier,
+                            pinned=rrow.pinned,
+                            pin_order=rrow.pin_order,
+                            reserve_now=False,
+                            ttl_until=rrow.ttl_until,
+                        )
+                    continue
+        return _CONTINUE
+
+    async def _phase_override_diff(self, ctx: TickContext) -> object:
+        """Diff-detect override changes and emit events.
+
+        Reads: ``ctx.overrides_for_diff``, ``ctx.overrides``. Writes: none
+        on ctx (mutates ``self._prev_overrides_snapshot`` /
+        ``self._overrides_initialized``). Uses the pre-short-circuit
+        override snapshot (``ctx.overrides_for_diff``) so reserve_now
+        False→True transitions are visible even though the short-circuit
+        already cleared the flag in ``ctx.overrides``. Skips the diff on
+        the first tick after a scheduler restart (empty snapshot would
+        emit spurious events for every pre-existing override) and seeds
+        the snapshot so subsequent ticks diff correctly. Always continues.
+        """
+        if self._overrides_initialized:
+            self._emit_override_diff_events(
+                self._prev_overrides_snapshot, ctx.overrides_for_diff
+            )
+        else:
+            self._overrides_initialized = True
+        self._prev_overrides_snapshot = dict(ctx.overrides)
+        return _CONTINUE
+
+    async def _phase_compute_priorities(self, ctx: TickContext) -> object:
+        """Build reverse index + compute effective priorities + CPM counts.
+
+        Reads: ``ctx.tasks``, ``ctx.overrides``, ``ctx.tasks_by_id``,
+        ``ctx.status_map``. Writes: ``ctx.effective_priorities``,
+        ``ctx.transitive_counts``. Computed once per tick (O(N+E)).
+        Always continues.
+        """
+        reverse_index = self._build_reverse_index(ctx.tasks)
+        override_boosts = {
+            tid: row.boost_tier
+            for tid, row in ctx.overrides.items()
+            if row.boost_tier
+        }
+        effective_priorities = self._compute_effective_priorities(
+            ctx.tasks_by_id, reverse_index, ctx.status_map,
+            override_boosts=override_boosts or None,
+        )
+        self._last_effective_priorities = dict(effective_priorities)
+        transitive_counts = self._compute_transitive_counts(
+            ctx.tasks_by_id, reverse_index, ctx.status_map
+        )
+        ctx.effective_priorities = effective_priorities
+        ctx.transitive_counts = transitive_counts
+        return _CONTINUE
+
+    async def _phase_build_candidates(self, ctx: TickContext) -> object:
+        """Filter tasks to dispatch-eligible candidates.
+
+        Reads: ``ctx.tasks``, ``ctx.status_map``, ``ctx.tasks_by_id``,
+        ``ctx.external_cache``, ``ctx.external_resolver_failed``. Writes:
+        ``ctx.candidates``, ``ctx.candidate_signals``. Filters to pending
+        tasks whose deps are all done and that aren't dispatched or in
+        their post-requeue cooldown window. ``_eligible_for_dispatch``
+        (UNCHANGED) encapsulates all gates so the pin-dispatch loop below
+        uses the same logic (single source of truth). Always continues.
+        """
+        candidates: list[dict] = []
+        candidate_signals: dict[str, str | None] = {}
+        for t in ctx.tasks:
+            tid_str = str(t.get('id', ''))
+            if not tid_str:
+                continue
+            eligible, signal_label = self._eligible_for_dispatch(
+                t, tid_str, ctx.status_map, ctx.tasks_by_id,
+                external_status_cache=ctx.external_cache,
+                external_resolver_failed=ctx.external_resolver_failed,
+            )
+            if not eligible:
+                continue
+            # signal_label is stashed and reused at the dispatch arm site so
+            # _dispatch_cooldown_signal is not called a second time.
+            # Note: cooldown-suppressed tasks intentionally bypass the fairness
+            # skip-bookkeeping machinery for the duration of the settle window.
+            # They are invisible to skip counters and parking logic until the
+            # window elapses, at which point they re-enter the normal candidate
+            # pool and can accumulate skips like any other task.
+            candidates.append(t)
+            candidate_signals[tid_str] = signal_label
+        ctx.candidates = candidates
+        ctx.candidate_signals = candidate_signals
+        return _CONTINUE
+
+    async def _phase_landed_outbox_gate(self, ctx: TickContext) -> object:
+        """Landed-outbox + already-landed consult-before-dispatch gate.
+
+        Reads: ``ctx.candidates``. Writes: ``ctx.gated_ids``,
+        ``ctx.candidates`` (filtered). Consulted once per candidate here,
+        BEFORE the starvation watchdog / pin loop / scored loop, so a
+        single ``gated_ids`` set is honored by both dispatch paths. A
+        gated task's merge already landed on main and is being driven to
+        done inline by the injected hook. ``_consult_landed_outbox`` is a
+        TOTAL function (fails open per-candidate on hook error) — no outer
+        try/except needed here. Always continues.
+        """
+        gated_ids = await self._consult_landed_outbox(
+            [str(t.get('id', '')) for t in ctx.candidates]
+        )
+        # Already-landed pre-dispatch gate (task 2313) — consulted immediately
+        # after the landed-outbox gate above and unioned into the SAME
+        # gated_ids set, so both the scored candidate filter below and the
+        # pin loop honor a single source of truth (mirrors the
+        # _consult_landed_outbox / gated_ids pattern verbatim). Catches
+        # out-of-band landings (ancestry / merge-marker / content-
+        # equivalence) that never passed through this orchestrator's own
+        # merge queue.
+        gated_ids |= await self._consult_already_landed(ctx.candidates)
+        if gated_ids:
+            ctx.candidates = [
+                t for t in ctx.candidates if str(t.get('id', '')) not in gated_ids
+            ]
+        ctx.gated_ids = gated_ids
+        return _CONTINUE
+
+    async def _phase_starvation(self, ctx: TickContext) -> object:
+        """Starvation watchdog pass over dispatch-eligible candidates.
+
+        Reads: ``ctx.candidates``. Writes: none on ctx (side-effecting
+        scan; may emit escalation callbacks). Runs once per tick, wrapped
+        in try/except so a watchdog/callback failure can NEVER abort the
+        tick or gate dispatch (PROPERTY 1 — mirrors the
+        ``_apply_external_dep_policy`` wrapper). Always continues.
+        """
+        try:
+            await self._apply_starvation_watchdog(ctx.candidates)
+        except Exception:
+            logger.warning(
+                'Starvation watchdog pass raised — continuing tick normally',
+                exc_info=True,
+            )
+        return _CONTINUE
+
+    async def _phase_empty_candidate_gate(self, ctx: TickContext) -> object:
+        """End the tick now if no candidates survived the gates.
+
+        Reads: ``ctx.candidates``. Writes: none. Kept as a distinct phase
+        (rather than folded into ``_phase_starvation`` or
+        ``_phase_psi_gate``) to preserve the "empty check BEFORE the PSI
+        sample is read" contract — an idle tick never pays for a PSI read.
+        Terminal only on the empty path.
+        """
+        if not ctx.candidates:
+            return TickOutcome(None)
+        return _CONTINUE
+
+    async def _phase_psi_gate(self, ctx: TickContext) -> object:
+        """Dispatch-admission gate (task 2328, DA3 of PRD
+        docs/prds/dispatch-admission-load-cap.md).
+
+        Reads: none on ctx. Writes: ``ctx.psi_sample``, ``ctx.psi_hold``,
+        ``ctx.psi_in_flight``. Computed ONCE per tick, before both the
+        pinned and scored dispatch loops, so a single hold decision
+        governs both (DA-D5 parity) and ``len(self._dispatched)`` is read
+        before this tick's own dispatch can mutate it (stable floor
+        comparison). Runs after the empty-candidate short-circuit so an
+        idle tick never pays for a PSI read. Always continues.
+        """
+        cfg_psi = self.config.psi_admission
+        psi_sample: PsiSample | None = None
+        psi_hold = False
+        psi_in_flight = 0
+        if cfg_psi.enabled:
+            psi_sample = self._read_psi_sample()
+            if not psi_sample.read_ok:
+                # Fail-open (DA-D6): saturated() is False whenever read_ok is
+                # False, so psi_hold stays False and dispatch proceeds
+                # normally — this WARNING is only the loud operator signal.
+                _now = self._time_source()
+                if _now - self._last_psi_read_fail_log >= _DISPATCH_DEFERRED_LOG_SECS:
+                    logger.warning(
+                        'Dispatch-admission gate: PSI sample unreadable — '
+                        'failing open (heavy dispatch is NOT throttled this tick)'
+                    )
+                    self._last_psi_read_fail_log = _now
+            psi_in_flight = len(self._dispatched)
+            psi_hold = (
+                psi_sample.saturated(cfg_psi) and psi_in_flight >= cfg_psi.min_inflight_floor
+            )
+        ctx.psi_sample = psi_sample
+        ctx.psi_hold = psi_hold
+        ctx.psi_in_flight = psi_in_flight
+        return _CONTINUE
+
+    def _note_heavy_deferral(self, ctx: TickContext, deferred_task_id: str) -> None:
+        """Emit dispatch_deferred + a rate-limited WARNING for the FIRST
+        heavy candidate skipped this tick.
+
+        Per-tick dedup lives on ``ctx.dispatch_deferred_emitted`` (promoted
+        from a ``nonlocal`` closure variable so ``_phase_select_pins`` and
+        ``_phase_select_scored`` — two separate phase methods — share the
+        SAME once-per-tick decision/event, exactly as the two loops did
+        when they were one method body).
+        """
+        if ctx.dispatch_deferred_emitted:
+            return
+        ctx.dispatch_deferred_emitted = True
+        cfg_psi = self.config.psi_admission
+        # invariant: only reachable when ctx.psi_hold is True, which is only
+        # ever set True inside `if cfg_psi.enabled:` after ctx.psi_sample is
+        # assigned — so ctx.psi_sample is never None here.
+        assert ctx.psi_sample is not None
+        psi_sample = ctx.psi_sample
+        # DA-D1 ranked order: cpu > mem_some > mem_full > io.
+        if psi_sample.cpu_some10 >= cfg_psi.cpu_some_avg10:
+            metric, value = 'cpu_some_avg10', psi_sample.cpu_some10
+        elif psi_sample.mem_some10 >= cfg_psi.mem_some_avg10:
+            metric, value = 'mem_some_avg10', psi_sample.mem_some10
+        elif psi_sample.mem_full10 >= cfg_psi.mem_full_avg10:
+            metric, value = 'mem_full_avg10', psi_sample.mem_full10
+        else:
+            metric, value = 'io_some_avg10', psi_sample.io_some10
+        if self.event_store:
+            self.event_store.emit(
+                EventType.dispatch_deferred,
+                task_id=deferred_task_id,
+                data={
+                    'metric': metric,
+                    'value': value,
+                    'in_flight': ctx.psi_in_flight,
+                    'floor': cfg_psi.min_inflight_floor,
+                },
+            )
+        _now = self._time_source()
+        if _now - self._last_dispatch_deferred_log >= _DISPATCH_DEFERRED_LOG_SECS:
+            logger.warning(
+                'Dispatch-admission gate: deferring heavy task %s — '
+                'PSI %s=%.1f (in_flight=%d, floor=%d)',
+                deferred_task_id,
+                metric,
+                value,
+                ctx.psi_in_flight,
+                cfg_psi.min_inflight_floor,
+            )
+            self._last_dispatch_deferred_log = _now
+
+    async def _phase_select_pins(self, ctx: TickContext) -> object:
+        """Pin-dispatch — try pinned tasks in pin_order ASC before scoring.
+
+        Reads: ``ctx.overrides``, ``ctx.tasks_by_id``, ``ctx.status_map``,
+        ``ctx.external_cache``, ``ctx.external_resolver_failed``,
+        ``ctx.gated_ids``, ``ctx.psi_hold``, ``ctx.effective_priorities``.
+        Writes: none on ctx (dispatch bookkeeping lives on ``self``).
+        Pinned candidates bypass scoring entirely but still respect lock
+        availability and eligibility checks (status, deps, cooldown). On
+        lock conflict, falls through to the next pinned candidate without
+        touching skip counters or arming parks (pins bypass fairness).
+        Returns ``TickOutcome(TaskAssignment)`` on a successful dispatch,
+        else ``_CONTINUE`` to fall through to the scored loop.
+        """
+        if self._override_store:
+            pin_queue: list[tuple[str, OverrideRow]] = sorted(
+                ((tid, row) for tid, row in ctx.overrides.items() if row.pinned),
+                key=lambda x: (x[1].pin_order if x[1].pin_order is not None else 0),
+            )
+            for pin_tid, _pin_row in pin_queue:
+                if pin_tid not in ctx.tasks_by_id:
+                    continue
+                pin_task = ctx.tasks_by_id[pin_tid]
+                # Re-use the same eligibility helper as the scored-candidate
+                # loop to keep both paths in sync.  A future gate addition only
+                # needs to be added to _eligible_for_dispatch.
+                eligible, pin_signal = self._eligible_for_dispatch(
+                    pin_task, pin_tid, ctx.status_map, ctx.tasks_by_id,
+                    external_status_cache=ctx.external_cache,
+                    external_resolver_failed=ctx.external_resolver_failed,
+                )
+                if not eligible:
+                    continue
+                if pin_tid in ctx.gated_ids:
+                    # Landed-outbox gate (task 2156, SD-1/B5): this pinned
+                    # task's merge already landed on main and is being driven
+                    # to done inline — skip it here too so the pin loop and
+                    # the scored loop share the one gated_ids source of truth.
+                    continue
+                if ctx.psi_hold and not self.is_deterministic(pin_task):
+                    # Dispatch-admission gate (task 2328, DA3/DA-D5): a pin
+                    # doesn't reduce host load, so a pinned HEAVY candidate is
+                    # deferred exactly like a scored one — deterministic pins
+                    # remain exempt.  ctx.psi_hold and _note_heavy_deferral are
+                    # the SAME once-per-tick decision/helper the scored loop
+                    # uses below, so both loops share one hold and one event.
+                    self._note_heavy_deferral(ctx, pin_tid)
+                    continue
+                # Eligible pinned candidate — try to acquire its modules.
+                pin_modules = self._get_modules(pin_task)
+                if self.lock_table.try_acquire(pin_tid, pin_modules):
+                    self._dispatched.add(pin_tid)
+                    # Starvation-watchdog resolve (task 1880): if a pinned task
+                    # had an open INFO escalation, self-resolve it now.
+                    # Wrapped in try/except so a resolve failure can NEVER abort
+                    # a successful dispatch (PROPERTY 1).
+                    try:
+                        await self._resolve_starvation_escalation(pin_tid)
+                    except Exception:
+                        logger.warning(
+                            'Starvation watchdog resolve for pin_tid=%s raised — '
+                            'dispatch continues normally',
+                            pin_tid,
+                            exc_info=True,
+                        )
+                    if pin_signal is not None:
+                        self._last_dispatch_at[pin_tid] = self._time_source()
+                    pin_pri = ctx.effective_priorities.get(
+                        pin_tid, coerce_tier(pin_task.get('priority'))
+                    )
+                    self._dispatched_priority[pin_tid] = pin_pri
+                    if self.event_store:
+                        self.event_store.emit(
+                            EventType.lock_acquired,
+                            task_id=pin_tid,
+                            data={'modules': pin_modules, 'priority': pin_pri},
+                        )
+                    await self._write_snapshot_best_effort()
+                    return TickOutcome(TaskAssignment(
+                        task_id=pin_tid, task=pin_task, modules=pin_modules
+                    ))
+                # Lock conflict — fall through to next pinned candidate.
+                # No skip-bookkeeping for pinned tasks (pins bypass fairness).
+        return _CONTINUE
+
+    async def _phase_select_scored(self, ctx: TickContext) -> object:
+        """Score each candidate and dispatch the best available.
+
+        Reads: ``ctx.candidates``, ``ctx.effective_priorities``,
+        ``ctx.max_id``, ``ctx.transitive_counts``, ``ctx.psi_hold``,
+        ``ctx.candidate_signals``. Writes: none on ctx (dispatch
+        bookkeeping lives on ``self``). ALWAYS terminal — returns
+        ``TickOutcome(TaskAssignment)`` on a successful dispatch, or
+        ``TickOutcome(None)`` once the loop is exhausted with no acquire
+        (the top candidate's skip counter is bumped either way it is
+        passed over). Higher score wins; ties broken by task_id string
+        order (stable, FIFO-ish for numeric ids).
+        """
+        scored: list[tuple[float, str, dict, str]] = []
+        for t in ctx.candidates:
+            tid = str(t.get('id', ''))
+            pri = ctx.effective_priorities.get(tid, coerce_tier(t.get('priority')))
+            age = self._compute_age(tid, ctx.max_id)
+            transitive = ctx.transitive_counts.get(tid, 0)
+            score = self._compute_score(pri, age, transitive)
+            scored.append((score, tid, t, pri))
+
+        scored.sort(key=lambda entry: (-entry[0], entry[1]))
+
+        # DEBUG: log the top 3 so α/β tuning is post-hoc diagnosable.
+        if logger.isEnabledFor(logging.DEBUG):
+            top3 = scored[:3]
+            logger.debug(
+                'acquire_next top candidates: %s',
+                [
+                    {
+                        'id': e[1],
+                        'score': round(e[0], 2),
+                        'pri': e[3],
+                    }
+                    for e in top3
+                ],
+            )
+
+        # Strict top is the highest-scoring eligible candidate.  We track it
+        # for fairness bookkeeping (skip counter / park installation).
+        top_score, top_id, top_task, top_pri = scored[0]
+        top_modules = self._get_modules(top_task)
+        top_had_parks = self.lock_table.has_parks(top_id)
+
+        for _score, task_id, task, pri in scored:
+            if ctx.psi_hold and not self.is_deterministic(task):
+                # Dispatch-admission gate (DA3): defer this HEAVY candidate —
+                # deterministic candidates are exempt (DA-D4) and lower-
+                # ranked exempt/light candidates behind it still get a turn
+                # (per-candidate `continue`, not a top-level `return None`).
+                self._note_heavy_deferral(ctx, task_id)
+                continue
+            modules = self._get_modules(task)
+            if self.lock_table.try_acquire(task_id, modules):
+                self._dispatched.add(task_id)
+                # Starvation-watchdog resolve (task 1880): if this scored task
+                # had an open INFO escalation, self-resolve it now that it is
+                # dispatching.  Wrapped in try/except so a resolve failure can
+                # NEVER abort a successful dispatch (PROPERTY 1).
+                try:
+                    await self._resolve_starvation_escalation(task_id)
+                except Exception:
+                    logger.warning(
+                        'Starvation watchdog resolve for task_id=%s raised — '
+                        'dispatch continues normally',
+                        task_id,
+                        exc_info=True,
+                    )
+                # arm cooldown gate — only for signal-bearing dispatches.
+                # Steward signals that arrive *after* a signal-free dispatch
+                # will not retroactively suppress re-dispatch; the gate is
+                # intentionally scoped to tasks that were already flagged
+                # when first picked up (bounded _last_dispatch_at size).
+                if ctx.candidate_signals.get(task_id) is not None:
+                    self._last_dispatch_at[task_id] = self._time_source()
+                self._dispatched_priority[task_id] = pri
+                if task_id == top_id:
+                    self._skip_count.pop(task_id, None)
+                    if top_had_parks:
+                        restored_pairs = self.lock_table.clear_parks_for(task_id)
+                        if self.event_store:
+                            self.event_store.emit(
+                                EventType.reservation_used,
+                                task_id=task_id,
+                                data={'modules': modules, 'priority': pri},
+                            )
+                            for restored_owner, restored_modules in restored_pairs:
+                                self.event_store.emit(
+                                    EventType.reservation_restored,
+                                    task_id=restored_owner,
+                                    data={
+                                        'restored_owner': restored_owner,
+                                        'modules': restored_modules,
+                                    },
+                                )
+                else:
+                    # A lower-ranked task won — top was passed over this tick.
+                    self._bump_skip_and_maybe_park(top_id, top_modules, top_pri)
+                if self.event_store:
+                    self.event_store.emit(
+                        EventType.lock_acquired,
+                        task_id=task_id,
+                        data={'modules': modules, 'priority': pri},
+                    )
+                await self._write_snapshot_best_effort()
+                return TickOutcome(TaskAssignment(task_id=task_id, task=task, modules=modules))
+
+        # Loop exhausted with no acquire — top candidate was also skipped.
+        self._bump_skip_and_maybe_park(top_id, top_modules, top_pri)
+        await self._write_snapshot_best_effort()
+        return TickOutcome(None)
+
     async def acquire_next(self) -> TaskAssignment | None:
         """Find next eligible task under the value/h scoring model.
 
@@ -3972,738 +4903,41 @@ class Scheduler:
         # Maintain age anchors (resurrected tasks reset their anchor).
         self._update_age_anchors(tasks, max_id)
 
-        # Correctness crux (γ2): the active-only filter drops terminal tasks
-        # from the result, so dep-ids referencing DONE/CANCELLED tasks will be
-        # absent from status_map. _deps_satisfied reads status_map.get(dep_id,
-        # 'unknown'), so those deps would block dispatching forever. Fix: collect
-        # local dep-ids referenced by the fetched tasks that are NOT already in
-        # status_map, then backfill them via the lean get_statuses(ids=missing).
-        # In production this backfill commonly fires every tick (most pending tasks
-        # have at least one done dep), but the two-call total (active get_tasks +
-        # compact get_statuses) is still a net win over the old single full get_tasks
-        # call (~95% smaller payload per γ1's get_statuses path).  In unit tests
-        # whose get_tasks mocks return the full set (incl. done deps), status_map
-        # is already complete → missing_dep_ids is empty → zero get_statuses calls.
-        _all_dep_ids: set[str] = set()
-        for _t in tasks:
-            for _d in (_t.get('dependencies') or []):
-                _dep_id = str(
-                    _d.get('id', _d) if isinstance(_d, dict) else _d
-                )
-                if _dep_id:
-                    _all_dep_ids.add(_dep_id)
-        _missing_dep_ids = sorted(_all_dep_ids - set(status_map))
-        if _missing_dep_ids:
-            _backfilled, _backfill_err = await self.get_statuses(
-                ids=_missing_dep_ids
-            )
-            if resolver_failed(_backfilled, _backfill_err):
-                logger.warning(
-                    'acquire_next: dep-status backfill degraded '
-                    '(err=%r, missing_dep_ids=%r) — affected pending tasks '
-                    'held fail-safe-wait',
-                    _backfill_err,
-                    _missing_dep_ids,
-                )
-                for _tid, _dep_id in _iter_pending_deps_in(tasks, _missing_dep_ids):
-                    _cnt = self._streak_local_backfill.bump((_tid, _dep_id))
-                    # Reuse max_external_dep_unresolved_cycles as the
-                    # grace threshold — same "consecutive ticks before
-                    # loud escalation" semantics as the external-dep
-                    # resolver-degraded path being mirrored here.
-                    # A dedicated max_local_backfill_unresolved_cycles
-                    # field is deferred (config.py is out of scope).
-                    if _cnt >= self.config.max_external_dep_unresolved_cycles:
-                        logger.warning(
-                            'acquire_next: local dep backfill unresolved '
-                            'for %d consecutive ticks '
-                            '(task=%s, dep=%s) — possible scheduler '
-                            'degradation',
-                            _cnt,
-                            _tid,
-                            _dep_id,
-                        )
-            else:
-                status_map.update(_backfilled)
-                # Reset the consecutive-tick counters for deps that resolved
-                # successfully in this backfill — mirrors the
-                # _external_unresolved_counts.pop(...) on the 'done' branch in
-                # _apply_external_dep_policy.  Without this reset, a dep that
-                # degrades → recovers → degrades again accumulates across the
-                # gap, making the "consecutive" counters and warning messages
-                # misreport the streak length.
-                for _tid, _dep_id in _iter_pending_deps_in(tasks, _backfilled):
-                    self._streak_local_backfill.clear((_tid, _dep_id))
-                # Partial-response guard: get_statuses returned a valid
-                # (non-error) dict that is still missing some of the requested
-                # dep ids.  Treat those still-missing ids as degraded — warn +
-                # bump counter — mirroring the missing-key guard in
-                # get_external_statuses (~1545).  The absent ids stay out of
-                # status_map so _deps_satisfied returns False → fail-safe-wait,
-                # now VISIBLE rather than a silent idle.
-                _still_missing = set(_missing_dep_ids) - set(_backfilled)
-                if _still_missing:
-                    logger.warning(
-                        'acquire_next: dep-status backfill returned partial '
-                        'result (missing %d/%d dep ids: %r) — affected '
-                        'pending tasks held fail-safe-wait',
-                        len(_still_missing),
-                        len(_missing_dep_ids),
-                        sorted(_still_missing),
-                    )
-                    for _tid, _dep_id in _iter_pending_deps_in(tasks, _still_missing):
-                        _cnt = self._streak_local_backfill.bump((_tid, _dep_id))
-                        # Same threshold as the degraded path above.
-                        if _cnt >= self.config.max_external_dep_unresolved_cycles:
-                            logger.warning(
-                                'acquire_next: local dep absent from '
-                                'backfill for %d consecutive ticks '
-                                '(task=%s, dep=%s) — possible '
-                                'scheduler degradation',
-                                _cnt,
-                                _tid,
-                                _dep_id,
-                            )
-
-        # Operator-issued eviction drain: process any queued force-evict
-        # requests BEFORE the automatic park-GC sweep so that operator-lever
-        # evictions emit reservation_force_evicted (not reservation_expired).
-        self._drain_park_eviction_requests(status_map, tasks_by_id)
-
-        # Owner-state park-GC sweep. Replaces the wall-clock lease mechanic:
-        # a park whose owner is terminal / missing / deps-unsatisfied has no
-        # reason to keep blocking other tasks, so it's evicted now.
-        def _park_gc(tid: str) -> bool:
-            status = status_map.get(tid)
-            if status in TERMINAL_STATUSES:
-                return True
-            if tid not in tasks_by_id:
-                return True
-            return not self._deps_satisfied(tasks_by_id[tid], status_map, tasks_by_id)
-
-        gc_evicted, gc_restored = self.lock_table.prune_owners(_park_gc)
-        for owner in gc_evicted:
-            self._skip_count.pop(owner, None)
-            if self.event_store:
-                owner_status = status_map.get(owner)
-                if owner_status in TERMINAL_STATUSES:
-                    reason = f'terminal:{owner_status}'
-                elif owner not in tasks_by_id:
-                    reason = 'missing'
-                else:
-                    reason = 'deps_unsatisfied'
-                self.event_store.emit(
-                    EventType.reservation_expired,
-                    task_id=owner,
-                    data={'reason': reason},
-                )
-        if self.event_store:
-            for restored_owner, restored_modules in gc_restored:
-                self.event_store.emit(
-                    EventType.reservation_restored,
-                    task_id=restored_owner,
-                    data={
-                        'restored_owner': restored_owner,
-                        'modules': restored_modules,
-                    },
-                )
-
-        # Drop _last_dispatch_at, _skip_count, _module_cache, _pending_anchor,
-        # and sub-threshold _external_unresolved_counts entries for tasks that are:
-        #   (a) in a terminal status in status_map, OR
-        #   (b) absent from tasks_by_id (active-only filter dropped them because
-        #       they completed between ticks — γ2: previously the full get_tasks
-        #       result kept completed tasks visible so the terminal sweep could
-        #       clean them up; active-only filtering removes them from the result).
-        # so a future legitimate re-dispatch (e.g. cancelled -> pending
-        # re-architect, or a freshly-created task reusing the id) starts from a
-        # clean slate.  Resurrection-safe: a re-queued task re-derives modules
-        # and re-accumulates its skip count fresh.
-        # _pending_anchor and _was_non_pending are handled here directly (not only
-        # in _update_age_anchors) because active-only filtering means terminal
-        # tasks are absent from the `tasks` list that _update_age_anchors iterates.
-        # Without this, a task that goes pending → terminal (e.g. cancelled while
-        # pending, never dispatched) leaks its _pending_anchor entry permanently.
-        # Recording _was_non_pending preserves resurrection semantics: if the task
-        # is re-queued to pending, it gets a fresh max_id anchor instead of
-        # re-using its old (stale) numeric id as the age anchor.
-        _stale_ids: set[str] = set()
-        # Iterate the union of all tracked bookkeeping keys so we catch ids that
-        # are absent from status_map entirely (completed, dropped by active filter).
-        # _pending_anchor is included so anchor-only entries (tasks that went
-        # pending → terminal without ever being dispatched) are also caught.
-        _all_tracked: set[str] = (
-            set(self._last_dispatch_at)
-            | set(self._skip_count)
-            | set(self._module_cache)
-            | set(self._pending_anchor)
-        )
-        for tid_str in _all_tracked:
-            if status_map.get(tid_str) in TERMINAL_STATUSES or tid_str not in tasks_by_id:
-                self._last_dispatch_at.pop(tid_str, None)
-                self._skip_count.pop(tid_str, None)
-                self._module_cache.pop(tid_str, None)
-                self._pending_anchor.pop(tid_str, None)
-                self._was_non_pending.add(tid_str)
-                _stale_ids.add(tid_str)
-        # Sweep every registered streak counter (task 2124): external_unresolved
-        # / local_backfill / hold / resolver_degraded are keyed off _stale_ids;
-        # starvation is ALSO keyed off tasks that transition to a non-terminal
-        # but non-eligible status (blocked/deferred/review/merge-deferred) —
-        # those leave the candidate pool without going terminal, so the
-        # dispatch-site resolve and the _stale_ids sweep would never fire.
-        # 'in-progress' tasks are already resolved at the dispatch site;
-        # 'pending' tasks may return to candidacy so we keep their escalation.
-        # StreakRegistry.gc resolves (via the 'starvation' counter's on_gc,
-        # i.e. _starvation_gc_resolve) BEFORE clearing each escalated key in
-        # the sweep set, and wraps the callback in try/except so a resolve
-        # failure never aborts the GC sweep — mirrors the previous inline
-        # resolve-then-clear block exactly.
-        _starvation_non_eligible = {
-            tid for tid in self._starvation_escalated
-            if status_map.get(tid) in _STARVATION_NON_ELIGIBLE
-        }
-        await self._streak_registry.gc(
-            _stale_ids, extra={'starvation': _starvation_non_eligible}
+        # Per-tick mutable state threaded through the phase methods below
+        # (W10-β). Constructed once the status/id indices + age anchors are
+        # ready; `status_map`/`tasks_by_id`/`tasks` above are the SAME
+        # objects as ctx's fields (mutated in place by the phase methods
+        # that follow), so ctx stays consistent as they fill in.
+        ctx = TickContext(
+            tasks=tasks,
+            status_map=status_map,
+            tasks_by_id=tasks_by_id,
+            max_id=max_id,
         )
 
-        # Per-tick GC of the requeue-cooldown dict — keeps the dict bounded
-        # and lets _eligible_for_dispatch stay side-effect-free.  Runs before
-        # both the scored-candidate loop and the pin-dispatch loop so both
-        # observe post-GC state, matching the contract previously provided by
-        # the lazy per-call delete inside _eligible_for_dispatch.
-        self._gc_expired_cooldowns()
-
-        # Cross-project external dep gate (invariant 5 — one batched call per tick).
-        # Collect the union of metadata.external_deps across all pending tasks; if
-        # non-empty issue ONE get_external_statuses call.  Zero deps → zero calls.
-        # The per-tick cache is then forwarded to _eligible_for_dispatch at both
-        # call sites below; _apply_external_dep_policy runs the side-effecting pass
-        # (counter increments, escalation callbacks) exactly once per tick.
-        # The _park_gc call site above does NOT receive the cache, preserving park-GC
-        # semantics (design decision 4: scope containment).
-        # _task_external_deps(t) runs the full parse_metadata pipeline (JSON parse,
-        # apply_migrations copy, sub-model validation, TaskMetadata construction) —
-        # noticeably heavier than the old dict.get idiom.  Compute it once per
-        # pending task here and reuse the cached list for both the filter and the
-        # union, instead of calling it again per task in a second comprehension.
-        _pending_ext_deps: list[tuple[dict, list[str]]] = [
-            (t, deps)
-            for t in tasks
-            if t.get('status') == 'pending'
-            and (deps := _task_external_deps(t))
-        ]
-        _pending_tasks_with_ext: list[dict] = [t for t, _ in _pending_ext_deps]
-        _ext_dep_union: list[str] = list({
-            dep
-            for _, deps in _pending_ext_deps
-            for dep in deps
-        })
-        if _ext_dep_union:
-            external_cache, external_err = await self.get_external_statuses(_ext_dep_union)
-        else:
-            external_cache, external_err = {}, None
-        try:
-            await self._apply_external_dep_policy(
-                _pending_tasks_with_ext, external_cache, external_err
-            )
-        except Exception:
-            # A failure in the policy pass (e.g. set_task_status raising inside
-            # the _on_external_dep_block callback) must not abort the whole tick.
-            # Degrade to a fail-safe wait: the gate stays closed via
-            # _external_resolver_failed below, and the policy retries next tick.
-            logger.warning(
-                'External dep policy pass raised — degrading to fail-safe wait this tick',
-                exc_info=True,
-            )
-        _external_resolver_failed = external_err is not None
-
-        # Per-tick sweep: stamp the frozen-once milestone_deps_satisfied_at
-        # wall-clock anchor for pending 'delayed' milestone tasks whose full
-        # (local + external) deps just became satisfied (task 2335 β).
-        # Placed after the external-dep cache above so the anchor reflects
-        # the SAME complete dep evaluation the candidate loops below use —
-        # and before those loops so a task's gate state this tick is still
-        # governed by its pre-sweep snapshot (the stamp only becomes visible
-        # on the next tick's get_tasks; see _stamp_milestone_deps_satisfied).
-        await self._stamp_milestone_deps_satisfied(
-            tasks, status_map, tasks_by_id,
-            external_status_cache=external_cache,
-            external_resolver_failed=_external_resolver_failed,
-        )
-
-        # Load priority-override snapshot for this tick.
-        current_overrides: dict[str, OverrideRow] = (
-            self._override_store.get_overrides(self._project_root)
-            if self._override_store
-            else {}
-        )
-
-        # Override GC: remove override rows for tasks that are terminal or missing,
-        # and remove rows whose TTL has elapsed.
-        # Runs alongside the park_gc sweep so the rest of the tick sees post-GC state.
-        if self._override_store and current_overrides:
-            terminal_or_missing_ids: set[str] = (
-                {tid for tid, st in status_map.items() if st in TERMINAL_STATUSES}
-                | (set(current_overrides.keys()) - set(tasks_by_id.keys()))
-            )
-            if terminal_or_missing_ids:
-                cleared_overrides = self._override_store.clear_terminal(
-                    self._project_root, terminal_or_missing_ids
+        # Ordering-as-data (task 2236, W10-β): drive the whole tick from
+        # Scheduler._TICK_PHASE_ORDER — the single source of dispatch
+        # order (see the class-level literal for the full ordered list and
+        # the tests that assert on it). Per-phase rationale (γ2 dep-status
+        # backfill correctness, stale-sweep resurrection-safety, the
+        # external-dep-policy exactly-once contract, etc.) now lives on
+        # each `_phase_<label>` method's own docstring rather than inline
+        # here, since a generic loop has no single call site to hang
+        # per-phase commentary off of.
+        for label in self._TICK_PHASE_ORDER:
+            r = await getattr(self, f'_phase_{label}')(ctx)
+            # Explicit check (not a bare `assert`) so the contract is still
+            # enforced under `python -O` (asserts stripped) — without it, a
+            # phase that forgets to return would fall through to
+            # `return r.assignment` on `None` and raise an opaque
+            # AttributeError instead of this descriptive error.
+            if not (r is _CONTINUE or isinstance(r, TickOutcome)):
+                raise RuntimeError(
+                    f'_phase_{label} returned {r!r} — every _phase_* method must '
+                    f'return _CONTINUE or a TickOutcome (did it forget a return?)'
                 )
-                for tid in cleared_overrides:
-                    current_overrides.pop(tid, None)
-            # TTL sweep: clear any rows whose ttl_until has elapsed.
-            expired_overrides = self._override_store.clear_expired(
-                self._project_root, datetime.now(UTC)
-            )
-            for tid in expired_overrides:
-                current_overrides.pop(tid, None)
-
-        # Snapshot pre-short-circuit overrides for diff-detection.  The
-        # short-circuit below mutates current_overrides (clears reserve_now) so
-        # the diff would otherwise never see a False→True transition for
-        # reserve_now.  The next tick's prev snapshot uses the post-short-circuit
-        # state (current_overrides), keeping the per-tick diff semantics correct.
-        overrides_for_diff = dict(current_overrides)
-
-        # Reserve-Now short-circuit: for any task with reserve_now=1, eagerly
-        # install parks on its modules then clear the flag.  This is single-tick
-        # fire-and-forget — the parks will survive until the owner-GC sweep evicts
-        # them (owner goes terminal/missing or its deps lapse).  The loop skips
-        # only tasks that are absent from the task list entirely, or that are
-        # already in TERMINAL_STATUSES (done/cancelled).  A blocked-but-non-terminal
-        # task DOES get parks installed — reserve_now is an explicit user override
-        # so holding the modules for it is intentional.  The park-GC sweep
-        # (_park_gc) reclaims those parks once the owner transitions to terminal.
-        if self._override_store:
-            for rid, rrow in list(current_overrides.items()):
-                if not rrow.reserve_now:
-                    continue
-                if rid not in tasks_by_id:
-                    continue
-                if status_map.get(rid) in TERMINAL_STATUSES:
-                    continue
-                r_task = tasks_by_id[rid]
-                r_modules = self._get_modules(r_task)
-                r_tier = coerce_tier(r_task.get('priority'))
-                # Clear the flag BEFORE installing parks.  install_parks is
-                # naturally idempotent (duplicate parks are a no-op), so if the
-                # process crashes between clear and install, the next tick re-runs
-                # install harmlessly.  The opposite order risks a duplicate
-                # reservation_installed event if the clear fails after a
-                # successful install.
-                #
-                # In-process exceptions from install_parks are handled separately:
-                # the flag is restored via set_override so the next tick retries.
-                self._override_store.clear_override(
-                    self._project_root, rid, field='reserve_now'
-                )
-                try:
-                    installed, _evicted = self.lock_table.install_parks(
-                        rid, r_modules, r_tier
-                    )
-                    if self.event_store and installed:
-                        self.event_store.emit(
-                            EventType.reserve_now_consumed,
-                            task_id=rid,
-                            data={'modules': installed, 'priority': r_tier},
-                        )
-                    # Reflect the cleared flag in the in-memory snapshot so
-                    # downstream diff-detection doesn't spuriously re-emit for
-                    # this tick.
-                    current_overrides[rid] = OverrideRow(
-                        boost_tier=rrow.boost_tier,
-                        pinned=rrow.pinned,
-                        pin_order=rrow.pin_order,
-                        reserve_now=False,
-                        ttl_until=rrow.ttl_until,
-                    )
-                except Exception:
-                    logger.warning(
-                        'reserve_now: install_parks failed for task %s; restoring reserve_now flag',
-                        rid,
-                        exc_info=True,
-                    )
-                    try:
-                        self._override_store.set_override(
-                            self._project_root, rid, reserve_now=True
-                        )
-                    except Exception:
-                        logger.warning(
-                            'reserve_now: failed to restore reserve_now flag for task %s',
-                            rid,
-                            exc_info=True,
-                        )
-                        # Restore failed — DB still holds reserve_now=False (cleared
-                        # above).  Mirror that in memory so the diff-layer doesn't
-                        # fabricate a spurious priority_override_cleared event next tick.
-                        current_overrides[rid] = OverrideRow(
-                            boost_tier=rrow.boost_tier,
-                            pinned=rrow.pinned,
-                            pin_order=rrow.pin_order,
-                            reserve_now=False,
-                            ttl_until=rrow.ttl_until,
-                        )
-                    continue
-
-        # Diff-detect override changes and emit priority_override_* events.
-        # Uses the pre-short-circuit override snapshot (overrides_for_diff) so
-        # reserve_now False→True transitions are visible even though the
-        # short-circuit already cleared the flag in current_overrides.
-        #
-        # On the first tick after a scheduler restart the snapshot starts empty.
-        # Diffing against {} would emit spurious priority_override_set / task_pinned
-        # events for every pre-existing override, confusing downstream consumers
-        # that interpret them as fresh user actions.  We skip the diff on the
-        # first tick and seed the snapshot so subsequent ticks diff correctly.
-        if self._overrides_initialized:
-            self._emit_override_diff_events(self._prev_overrides_snapshot, overrides_for_diff)
-        else:
-            self._overrides_initialized = True
-        self._prev_overrides_snapshot = dict(current_overrides)
-
-        # Build reverse index + compute effective priorities + CPM counts
-        # once per tick (O(N+E)).
-        reverse_index = self._build_reverse_index(tasks)
-        override_boosts = {
-            tid: row.boost_tier
-            for tid, row in current_overrides.items()
-            if row.boost_tier
-        }
-        effective_priorities = self._compute_effective_priorities(
-            tasks_by_id, reverse_index, status_map,
-            override_boosts=override_boosts or None,
-        )
-        self._last_effective_priorities = dict(effective_priorities)
-        transitive_counts = self._compute_transitive_counts(
-            tasks_by_id, reverse_index, status_map
-        )
-
-        # Filter to pending tasks whose deps are all done and that aren't
-        # dispatched or in their post-requeue cooldown window.
-        # _eligible_for_dispatch encapsulates all gates so the pin-dispatch
-        # loop below uses the same logic (single source of truth).
-        candidates: list[dict] = []
-        candidate_signals: dict[str, str | None] = {}
-        for t in tasks:
-            tid_str = str(t.get('id', ''))
-            if not tid_str:
-                continue
-            eligible, signal_label = self._eligible_for_dispatch(
-                t, tid_str, status_map, tasks_by_id,
-                external_status_cache=external_cache,
-                external_resolver_failed=_external_resolver_failed,
-            )
-            if not eligible:
-                continue
-            # signal_label is stashed and reused at the dispatch arm site so
-            # _dispatch_cooldown_signal is not called a second time.
-            # Note: cooldown-suppressed tasks intentionally bypass the fairness
-            # skip-bookkeeping machinery for the duration of the settle window.
-            # They are invisible to skip counters and parking logic until the
-            # window elapses, at which point they re-enter the normal candidate
-            # pool and can accumulate skips like any other task.
-            candidates.append(t)
-            candidate_signals[tid_str] = signal_label
-
-        # Landed-outbox consult-before-dispatch gate (task 2156, W1 δ — PRD
-        # merge-queue-reliability §8.2 SD-1, boundary B5).  Consulted once per
-        # candidate here, BEFORE the starvation watchdog / pin loop / scored
-        # loop, so a single gated_ids set is honored by both dispatch paths.
-        # A gated task's merge already landed on main and is being driven to
-        # done inline by the injected hook — dropping it from `candidates`
-        # here stops the ghost-loop re-dispatch without touching starvation
-        # bookkeeping for a task that is effectively already finished.
-        # _consult_landed_outbox is a TOTAL function (fails open per-candidate
-        # on hook error, PROPERTY 1) — no outer try/except is needed here,
-        # mirroring the _apply_starvation_watchdog wrapper immediately below.
-        gated_ids = await self._consult_landed_outbox(
-            [str(t.get('id', '')) for t in candidates]
-        )
-        # Already-landed pre-dispatch gate (task 2313) — consulted immediately
-        # after the landed-outbox gate above and unioned into the SAME
-        # gated_ids set, so both the scored candidate filter below and the
-        # pin loop honor a single source of truth (mirrors the
-        # _consult_landed_outbox / gated_ids pattern verbatim). Catches
-        # out-of-band landings (ancestry / merge-marker / content-
-        # equivalence) that never passed through this orchestrator's own
-        # merge queue.
-        gated_ids |= await self._consult_already_landed(candidates)
-        if gated_ids:
-            candidates = [
-                t for t in candidates if str(t.get('id', '')) not in gated_ids
-            ]
-
-        # Starvation watchdog pass (task 1880): side-effecting scan over the
-        # dispatch-eligible candidate list.  Runs once per tick, wrapped in
-        # try/except so a watchdog/callback failure can NEVER abort the tick or
-        # gate dispatch (PROPERTY 1 — mirrors the _apply_external_dep_policy wrapper).
-        try:
-            await self._apply_starvation_watchdog(candidates)
-        except Exception:
-            logger.warning(
-                'Starvation watchdog pass raised — continuing tick normally',
-                exc_info=True,
-            )
-
-        if not candidates:
-            return None
-
-        # Dispatch-admission gate (task 2328, DA3 of PRD
-        # docs/prds/dispatch-admission-load-cap.md).  Computed ONCE per tick,
-        # before both the pinned and scored dispatch loops, so a single hold
-        # decision governs both (DA-D5 parity) and len(self._dispatched) is
-        # read before this tick's own dispatch can mutate it (stable floor
-        # comparison).  Placed after the empty-candidate short-circuit so an
-        # idle tick never pays for a PSI read.
-        cfg_psi = self.config.psi_admission
-        psi_sample: PsiSample | None = None
-        psi_hold = False
-        psi_in_flight = 0
-        if cfg_psi.enabled:
-            psi_sample = self._read_psi_sample()
-            if not psi_sample.read_ok:
-                # Fail-open (DA-D6): saturated() is False whenever read_ok is
-                # False, so psi_hold stays False and dispatch proceeds
-                # normally — this WARNING is only the loud operator signal.
-                _now = self._time_source()
-                if _now - self._last_psi_read_fail_log >= _DISPATCH_DEFERRED_LOG_SECS:
-                    logger.warning(
-                        'Dispatch-admission gate: PSI sample unreadable — '
-                        'failing open (heavy dispatch is NOT throttled this tick)'
-                    )
-                    self._last_psi_read_fail_log = _now
-            psi_in_flight = len(self._dispatched)
-            psi_hold = (
-                psi_sample.saturated(cfg_psi) and psi_in_flight >= cfg_psi.min_inflight_floor
-            )
-
-        _dispatch_deferred_emitted = False
-
-        def _note_heavy_deferral(deferred_task_id: str) -> None:
-            """Emit dispatch_deferred + a rate-limited WARNING for the FIRST
-            heavy candidate skipped this tick (per-tick dedup)."""
-            nonlocal _dispatch_deferred_emitted
-            if _dispatch_deferred_emitted:
-                return
-            _dispatch_deferred_emitted = True
-            # invariant: only reachable when psi_hold is True, which is only
-            # ever set True inside `if cfg_psi.enabled:` after psi_sample is
-            # assigned — so psi_sample is never None here.
-            assert psi_sample is not None
-            # DA-D1 ranked order: cpu > mem_some > mem_full > io.
-            if psi_sample.cpu_some10 >= cfg_psi.cpu_some_avg10:
-                metric, value = 'cpu_some_avg10', psi_sample.cpu_some10
-            elif psi_sample.mem_some10 >= cfg_psi.mem_some_avg10:
-                metric, value = 'mem_some_avg10', psi_sample.mem_some10
-            elif psi_sample.mem_full10 >= cfg_psi.mem_full_avg10:
-                metric, value = 'mem_full_avg10', psi_sample.mem_full10
-            else:
-                metric, value = 'io_some_avg10', psi_sample.io_some10
-            if self.event_store:
-                self.event_store.emit(
-                    EventType.dispatch_deferred,
-                    task_id=deferred_task_id,
-                    data={
-                        'metric': metric,
-                        'value': value,
-                        'in_flight': psi_in_flight,
-                        'floor': cfg_psi.min_inflight_floor,
-                    },
-                )
-            _now = self._time_source()
-            if _now - self._last_dispatch_deferred_log >= _DISPATCH_DEFERRED_LOG_SECS:
-                logger.warning(
-                    'Dispatch-admission gate: deferring heavy task %s — '
-                    'PSI %s=%.1f (in_flight=%d, floor=%d)',
-                    deferred_task_id,
-                    metric,
-                    value,
-                    psi_in_flight,
-                    cfg_psi.min_inflight_floor,
-                )
-                self._last_dispatch_deferred_log = _now
-
-        # Pin-dispatch: try pinned tasks in pin_order ASC before scoring.
-        # Pinned candidates bypass scoring entirely but still respect lock
-        # availability and eligibility checks (status, deps, cooldown).
-        # On lock conflict, fall through to the next pinned candidate without
-        # touching skip counters or arming parks (pins bypass fairness).
-        #
-        # The pin queue is derived from the in-memory current_overrides snapshot
-        # (already loaded above) so we avoid a second SQLite round-trip on every
-        # tick.  The post-GC snapshot is already authoritative.
-        if self._override_store:
-            pin_queue: list[tuple[str, OverrideRow]] = sorted(
-                ((tid, row) for tid, row in current_overrides.items() if row.pinned),
-                key=lambda x: (x[1].pin_order if x[1].pin_order is not None else 0),
-            )
-            for pin_tid, _pin_row in pin_queue:
-                if pin_tid not in tasks_by_id:
-                    continue
-                pin_task = tasks_by_id[pin_tid]
-                # Re-use the same eligibility helper as the scored-candidate
-                # loop to keep both paths in sync.  A future gate addition only
-                # needs to be added to _eligible_for_dispatch.
-                eligible, pin_signal = self._eligible_for_dispatch(
-                    pin_task, pin_tid, status_map, tasks_by_id,
-                    external_status_cache=external_cache,
-                    external_resolver_failed=_external_resolver_failed,
-                )
-                if not eligible:
-                    continue
-                if pin_tid in gated_ids:
-                    # Landed-outbox gate (task 2156, SD-1/B5): this pinned
-                    # task's merge already landed on main and is being driven
-                    # to done inline — skip it here too so the pin loop and
-                    # the scored loop share the one gated_ids source of truth.
-                    continue
-                if psi_hold and not self.is_deterministic(pin_task):
-                    # Dispatch-admission gate (task 2328, DA3/DA-D5): a pin
-                    # doesn't reduce host load, so a pinned HEAVY candidate is
-                    # deferred exactly like a scored one — deterministic pins
-                    # remain exempt.  psi_hold and _note_heavy_deferral are
-                    # the SAME once-per-tick decision/helper the scored loop
-                    # uses below, so both loops share one hold and one event.
-                    _note_heavy_deferral(pin_tid)
-                    continue
-                # Eligible pinned candidate — try to acquire its modules.
-                pin_modules = self._get_modules(pin_task)
-                if self.lock_table.try_acquire(pin_tid, pin_modules):
-                    self._dispatched.add(pin_tid)
-                    # Starvation-watchdog resolve (task 1880): if a pinned task
-                    # had an open INFO escalation, self-resolve it now.
-                    # Wrapped in try/except so a resolve failure can NEVER abort
-                    # a successful dispatch (PROPERTY 1).
-                    try:
-                        await self._resolve_starvation_escalation(pin_tid)
-                    except Exception:
-                        logger.warning(
-                            'Starvation watchdog resolve for pin_tid=%s raised — '
-                            'dispatch continues normally',
-                            pin_tid,
-                            exc_info=True,
-                        )
-                    if pin_signal is not None:
-                        self._last_dispatch_at[pin_tid] = self._time_source()
-                    pin_pri = effective_priorities.get(
-                        pin_tid, coerce_tier(pin_task.get('priority'))
-                    )
-                    self._dispatched_priority[pin_tid] = pin_pri
-                    if self.event_store:
-                        self.event_store.emit(
-                            EventType.lock_acquired,
-                            task_id=pin_tid,
-                            data={'modules': pin_modules, 'priority': pin_pri},
-                        )
-                    await self._write_snapshot_best_effort()
-                    return TaskAssignment(
-                        task_id=pin_tid, task=pin_task, modules=pin_modules
-                    )
-                # Lock conflict — fall through to next pinned candidate.
-                # No skip-bookkeeping for pinned tasks (pins bypass fairness).
-
-        # Score each candidate.  Higher score wins; ties broken by task_id
-        # string order (stable, FIFO-ish for numeric ids).
-        scored: list[tuple[float, str, dict, str]] = []
-        for t in candidates:
-            tid = str(t.get('id', ''))
-            pri = effective_priorities.get(tid, coerce_tier(t.get('priority')))
-            age = self._compute_age(tid, max_id)
-            transitive = transitive_counts.get(tid, 0)
-            score = self._compute_score(pri, age, transitive)
-            scored.append((score, tid, t, pri))
-
-        scored.sort(key=lambda entry: (-entry[0], entry[1]))
-
-        # DEBUG: log the top 3 so α/β tuning is post-hoc diagnosable.
-        if logger.isEnabledFor(logging.DEBUG):
-            top3 = scored[:3]
-            logger.debug(
-                'acquire_next top candidates: %s',
-                [
-                    {
-                        'id': e[1],
-                        'score': round(e[0], 2),
-                        'pri': e[3],
-                    }
-                    for e in top3
-                ],
-            )
-
-        # Strict top is the highest-scoring eligible candidate.  We track it
-        # for fairness bookkeeping (skip counter / park installation).
-        top_score, top_id, top_task, top_pri = scored[0]
-        top_modules = self._get_modules(top_task)
-        top_had_parks = self.lock_table.has_parks(top_id)
-
-        for _score, task_id, task, pri in scored:
-            if psi_hold and not self.is_deterministic(task):
-                # Dispatch-admission gate (DA3): defer this HEAVY candidate —
-                # deterministic candidates are exempt (DA-D4) and lower-
-                # ranked exempt/light candidates behind it still get a turn
-                # (per-candidate `continue`, not a top-level `return None`).
-                _note_heavy_deferral(task_id)
-                continue
-            modules = self._get_modules(task)
-            if self.lock_table.try_acquire(task_id, modules):
-                self._dispatched.add(task_id)
-                # Starvation-watchdog resolve (task 1880): if this scored task
-                # had an open INFO escalation, self-resolve it now that it is
-                # dispatching.  Wrapped in try/except so a resolve failure can
-                # NEVER abort a successful dispatch (PROPERTY 1).
-                try:
-                    await self._resolve_starvation_escalation(task_id)
-                except Exception:
-                    logger.warning(
-                        'Starvation watchdog resolve for task_id=%s raised — '
-                        'dispatch continues normally',
-                        task_id,
-                        exc_info=True,
-                    )
-                # arm cooldown gate — only for signal-bearing dispatches.
-                # Steward signals that arrive *after* a signal-free dispatch
-                # will not retroactively suppress re-dispatch; the gate is
-                # intentionally scoped to tasks that were already flagged
-                # when first picked up (bounded _last_dispatch_at size).
-                if candidate_signals.get(task_id) is not None:
-                    self._last_dispatch_at[task_id] = self._time_source()
-                self._dispatched_priority[task_id] = pri
-                if task_id == top_id:
-                    self._skip_count.pop(task_id, None)
-                    if top_had_parks:
-                        restored_pairs = self.lock_table.clear_parks_for(task_id)
-                        if self.event_store:
-                            self.event_store.emit(
-                                EventType.reservation_used,
-                                task_id=task_id,
-                                data={'modules': modules, 'priority': pri},
-                            )
-                            for restored_owner, restored_modules in restored_pairs:
-                                self.event_store.emit(
-                                    EventType.reservation_restored,
-                                    task_id=restored_owner,
-                                    data={
-                                        'restored_owner': restored_owner,
-                                        'modules': restored_modules,
-                                    },
-                                )
-                else:
-                    # A lower-ranked task won — top was passed over this tick.
-                    self._bump_skip_and_maybe_park(top_id, top_modules, top_pri)
-                if self.event_store:
-                    self.event_store.emit(
-                        EventType.lock_acquired,
-                        task_id=task_id,
-                        data={'modules': modules, 'priority': pri},
-                    )
-                await self._write_snapshot_best_effort()
-                return TaskAssignment(task_id=task_id, task=task, modules=modules)
-
-        # Loop exhausted with no acquire — top candidate was also skipped.
-        self._bump_skip_and_maybe_park(top_id, top_modules, top_pri)
-        await self._write_snapshot_best_effort()
+            if r is not _CONTINUE:
+                return r.assignment
         return None
 
     def get_state_snapshot(self) -> dict:
