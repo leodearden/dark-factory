@@ -412,16 +412,22 @@ class TestFailClosedSelfKillGuard:
 @pytest.mark.asyncio
 class TestSameUnitBlockingVerifyFallsThroughObservably:
     """wants_blocking (verify set) with a KNOWN own_unit provably EQUAL to
-    target_unit (self_target=True) is the one plan shape neither RP-1's
-    refuse branch (only fires when own_unit is unknown) nor RP-2's
-    cross-unit-blocking branch (only fires when self_target is False)
-    claims. It falls through to the DETACHED path instead — never the
-    blocking one, since blocking a same-unit restart is exactly the 2064
-    self-kill risk RP-1 exists to prevent — with ``verify`` intentionally
-    dropped (a fresh-PID check would be meaningless for a fire-and-forget
-    detached restart that hasn't happened yet). This pins the fallthrough
-    behaviourally: the inspector/blocking runner must never be touched, and
-    the detached shape (systemd-run, here) must still be taken."""
+    target_unit (self_target=True) AND a transient_unit set is the one plan
+    shape neither RP-1's refuse branch (only fires when own_unit is unknown)
+    nor RP-2's cross-unit-blocking branch (only fires when self_target is
+    False) claims. It falls through to the DEFERRED systemd-run path instead
+    — never the blocking one, since blocking a same-unit restart is exactly
+    the 2064 self-kill risk RP-1 exists to prevent — with ``verify``
+    intentionally dropped (a fresh-PID check would be meaningless for a
+    fire-and-forget detached restart that hasn't happened yet). This pins the
+    fallthrough behaviourally: the inspector/blocking runner must never be
+    touched, and the detached shape (systemd-run, here) must still be taken.
+
+    This fallthrough is conditioned on transient_unit being set — see
+    ``TestSameUnitBlockingVerifyRefusesWithoutTransientUnit`` below for the
+    sibling cell where no transient_unit means REFUSE instead, because the
+    only remaining path would otherwise be an IMMEDIATE (not deferred) leaf
+    spawn, which reintroduces the same self-kill hazard."""
 
     async def test_self_target_with_verify_falls_through_to_systemd_run_scheduled(
         self, tmp_queue_dir: Path,
@@ -464,6 +470,103 @@ class TestSameUnitBlockingVerifyFallsThroughObservably:
 
         assert outcome.disposition == RestartDisposition.SCHEDULED
         assert outcome.escalated is False
+
+
+@pytest.mark.asyncio
+class TestSameUnitBlockingVerifyRefusesWithoutTransientUnit:
+    """wants_blocking + self_target (a KNOWN own_unit provably equal to
+    target_unit) with NO transient_unit must REFUSE rather than fall through
+    to the leaf plain-spawn path (``_execute_detached_leaf_plain_spawn``):
+    that path is an IMMEDIATE, synchronous ``create_subprocess_exec`` — not
+    deferred — so for a same-unit restart script it is exactly the
+    2064-class self-kill hazard RP-1 exists to prevent. Being "detached" in
+    the fire-and-forget sense does not make an immediate same-unit restart
+    safe. Mirrors RP-1's fail-closed refuse shape exactly: no runner/
+    inspector call, escalation only when configured."""
+
+    async def test_refuses_and_escalates_without_running_anything(
+        self, tmp_queue_dir: Path,
+    ) -> None:
+        from orchestrator.proc_supervision import (
+            EscalationSpec,
+            FreshPidVerify,
+            RestartDisposition,
+            RestartPlan,
+        )
+
+        runner = FakeRunner(returncode=0)
+        inspector = make_fake_inspector(
+            {'MainPID': 99, 'ActiveState': 'active', 'ActiveEnterTimestampMonotonic': 2000}
+        )
+        plan = RestartPlan(
+            script=Path('/proj/scripts/restart-orchestrator.sh'),
+            args=[],
+            cwd=Path('/proj'),
+            target_unit='orch.service',
+            own_unit='orch.service',
+            on_failure_escalation=EscalationSpec(
+                queue_dir=str(tmp_queue_dir),
+                task_id='task-210',
+                summary='Same-unit blocking restart refused (no transient_unit)',
+            ),
+            verify=FreshPidVerify(
+                baseline_active_enter_monotonic=1000,
+                baseline_main_pid=42,
+                inspect_timeout_secs=10.0,
+            ),
+            transient_unit=None,
+        )
+
+        outcome = await plan.execute(runner=runner, inspector=inspector)
+
+        assert outcome.disposition == RestartDisposition.REFUSED
+        assert outcome.escalated is True
+        assert runner.calls == [], (
+            'no subprocess may ever be spawned for a same-unit blocking plan '
+            'with no transient_unit — the only other path is an IMMEDIATE '
+            'leaf spawn, the same self-kill hazard RP-1 exists to prevent'
+        )
+        assert inspector.calls == [], 'no inspect call before the refusal'
+
+        escalations = read_escalations(
+            tmp_queue_dir, 'task-210', agent_role='orchestrator-deterministic',
+        )
+        assert len(escalations) == 1
+        esc = escalations[0]
+        assert esc.level == 2
+        assert esc.severity == 'critical'
+        assert esc.category == 'infra_issue'
+
+    async def test_refuses_without_escalation_when_none_configured(
+        self, tmp_queue_dir: Path,
+    ) -> None:
+        from orchestrator.proc_supervision import (
+            FreshPidVerify,
+            RestartDisposition,
+            RestartPlan,
+        )
+
+        runner = FakeRunner(returncode=0)
+        plan = RestartPlan(
+            script=Path('/proj/scripts/restart-orchestrator.sh'),
+            args=[],
+            cwd=Path('/proj'),
+            target_unit='orch.service',
+            own_unit='orch.service',
+            on_failure_escalation=None,
+            verify=FreshPidVerify(
+                baseline_active_enter_monotonic=1000,
+                baseline_main_pid=42,
+                inspect_timeout_secs=10.0,
+            ),
+            transient_unit=None,
+        )
+
+        outcome = await plan.execute(runner=runner, inspector=make_fake_inspector({}))
+
+        assert outcome.disposition == RestartDisposition.REFUSED
+        assert outcome.escalated is False
+        assert runner.calls == []
 
 
 # ---------------------------------------------------------------------------
@@ -682,6 +785,123 @@ class TestCrossUnitBlockingVerifyFail:
         assert esc.level == 2
         assert esc.severity == 'critical'
         assert esc.category == 'infra_issue'
+
+
+# ---------------------------------------------------------------------------
+# amend (task 2237): escalated reflects actual filing, not dedup-existence
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestEscalatedReflectsActualFiling:
+    """``RestartOutcome.escalated`` means "this call filed a NEW L2
+    escalation" — not "an escalation exists for this task". When
+    ``on_failure_escalation`` is configured but a pending escalation for the
+    same task_id+agent_role already exists (e.g. filed by an earlier,
+    crash-recovered call), ``_file_inprocess_escalation``'s dedup guard skips
+    the re-file — and ``escalated`` must be ``False`` in that case, even
+    though an escalation record for this task does exist and
+    ``on_failure_escalation`` was configured. Exercised through both call
+    sites that thread a bool into ``RestartOutcome.escalated``: RP-1's refuse
+    branch and the shared ``_file_verify_stage_escalation`` helper (used by
+    both RESTART_FAILED and VERIFY_FAILED)."""
+
+    async def test_rp1_refuse_reports_escalated_false_when_deduped(
+        self, tmp_queue_dir: Path,
+    ) -> None:
+        from orchestrator.proc_supervision import (
+            EscalationSpec,
+            FreshPidVerify,
+            RestartDisposition,
+            RestartPlan,
+        )
+
+        spec = EscalationSpec(
+            queue_dir=str(tmp_queue_dir),
+            task_id='task-dedup-1',
+            summary='Cannot verify own unit before blocking restart',
+        )
+        # Pre-file a pending escalation for the same task_id+agent_role, as
+        # if an earlier RestartPlan.execute() call already filed it.
+        queue = EscalationQueue(tmp_queue_dir)
+        queue.submit(spec.to_escalation(queue))
+
+        plan = RestartPlan(
+            script=Path('/proj/scripts/deploy.sh'),
+            args=[],
+            cwd=Path('/proj'),
+            target_unit='some-target.service',
+            own_unit=None,
+            on_failure_escalation=spec,
+            verify=FreshPidVerify(
+                baseline_active_enter_monotonic=1000,
+                baseline_main_pid=42,
+                inspect_timeout_secs=10.0,
+            ),
+        )
+
+        outcome = await plan.execute(
+            runner=FakeRunner(), inspector=make_fake_inspector({}),
+        )
+
+        assert outcome.disposition == RestartDisposition.REFUSED
+        assert outcome.escalated is False, (
+            'the dedup guard skipped filing a duplicate — this call filed no '
+            'NEW escalation, so escalated must be False even though '
+            'on_failure_escalation was configured and an escalation record '
+            'for this task does exist'
+        )
+        escalations = read_escalations(
+            tmp_queue_dir, 'task-dedup-1', agent_role='orchestrator-deterministic',
+        )
+        assert len(escalations) == 1, 'still exactly one — the dedup guard prevented a duplicate'
+
+    async def test_verify_stage_reports_escalated_false_when_deduped(
+        self, tmp_queue_dir: Path,
+    ) -> None:
+        from orchestrator.proc_supervision import (
+            EscalationSpec,
+            FreshPidVerify,
+            RestartDisposition,
+            RestartPlan,
+        )
+
+        spec = EscalationSpec(
+            queue_dir=str(tmp_queue_dir),
+            task_id='task-dedup-2',
+            summary='Cross-unit deploy verify failed',
+        )
+        queue = EscalationQueue(tmp_queue_dir)
+        queue.submit(spec.to_escalation(queue))
+
+        plan = RestartPlan(
+            script=Path('/proj/scripts/deploy.sh'),
+            args=[],
+            cwd=Path('/proj'),
+            target_unit='fused-memory.service',
+            own_unit='orch.service',
+            on_failure_escalation=spec,
+            verify=FreshPidVerify(
+                baseline_active_enter_monotonic=1000,
+                baseline_main_pid=42,
+                inspect_timeout_secs=10.0,
+            ),
+        )
+
+        # rc != 0 -> RESTART_FAILED, routed through the shared
+        # _file_verify_stage_escalation helper (also used by VERIFY_FAILED).
+        outcome = await plan.execute(
+            runner=FakeRunner(returncode=1), inspector=make_fake_inspector({}),
+        )
+
+        assert outcome.disposition == RestartDisposition.RESTART_FAILED
+        assert outcome.escalated is False, (
+            'deduped by the same guard — no NEW escalation was filed this call'
+        )
+        escalations = read_escalations(
+            tmp_queue_dir, 'task-dedup-2', agent_role='orchestrator-deterministic',
+        )
+        assert len(escalations) == 1
 
 
 # ---------------------------------------------------------------------------

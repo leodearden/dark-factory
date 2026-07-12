@@ -117,7 +117,7 @@ class EscalationSpec:
 
 def _file_inprocess_escalation(
     spec: EscalationSpec, *, summary: str | None = None, detail: str | None = None,
-) -> None:
+) -> bool:
     """File *spec*'s L2 escalation in-process (RP-1/RP-5 filing path).
 
     Reused by both the RP-1 fail-closed refuse and the RP-5 verify-fail/
@@ -137,6 +137,13 @@ def _file_inprocess_escalation(
     611-620): if a pending escalation already exists for ``spec.task_id`` +
     ``spec.agent_role``, filing is skipped so a crash-safe re-dispatch of the
     same plan does not double-file L2 escalations.
+
+    Returns ``True`` iff a NEW escalation was actually submitted this call,
+    ``False`` when the dedup guard skipped filing because a pending
+    escalation for ``spec.task_id``+``spec.agent_role`` already existed.
+    Callers propagate this into ``RestartOutcome.escalated`` so ``escalated``
+    means "this call filed a new L2 escalation", never "an escalation exists
+    for this task" (which could also be true from an earlier call).
     """
     from escalation.queue import EscalationQueue
 
@@ -150,7 +157,7 @@ def _file_inprocess_escalation(
             'skipping re-file (dedup guard)',
             spec.task_id, len(existing_pending),
         )
-        return
+        return False
     if summary is not None or detail is not None:
         spec = replace(
             spec,
@@ -163,6 +170,7 @@ def _file_inprocess_escalation(
         'proc_supervision: filed L2 %s escalation %s for task %s',
         spec.category, esc.id, spec.task_id,
     )
+    return True
 
 
 @dataclass(frozen=True)
@@ -204,7 +212,15 @@ class RestartDisposition(StrEnum):
 
 @dataclass(frozen=True)
 class RestartOutcome:
-    """Result of a ``RestartPlan.execute()`` call."""
+    """Result of a ``RestartPlan.execute()`` call.
+
+    ``escalated`` means "this call itself filed a NEW L2 escalation" — not
+    "an escalation exists for this task". When ``on_failure_escalation`` is
+    configured but ``_file_inprocess_escalation``'s dedup guard skips filing
+    because a pending escalation for the same task_id+agent_role already
+    exists (e.g. filed by an earlier, crash-recovered call), ``escalated`` is
+    ``False`` even though an escalation record for this task does exist.
+    """
 
     disposition: RestartDisposition
     escalated: bool = False
@@ -260,14 +276,27 @@ class RestartPlan:
            RP-5 verify (implemented below, step-10/12).
            (wants_blocking and self_target — a KNOWN own_unit provably equal
            to target_unit — deliberately does NOT reach this branch: RP-1's
-           safety proof forbids ever blocking a same-unit restart, so this
-           combination falls through to 3/4 below with ``verify`` dropped and
-           a warning logged, rather than silently discarded — see the guard
-           immediately before the ``transient_unit`` check.)
+           safety proof forbids ever blocking a same-unit restart.
+           * If transient_unit is ALSO unset, this REFUSES too (2a below),
+             same shape as 1 — the only other path, the leaf plain-spawn in
+             4, is an IMMEDIATE synchronous spawn, not deferred, so it is
+             exactly the 2064-class self-kill hazard RP-1 exists to prevent;
+             being "detached" in the fire-and-forget sense does not make an
+             immediate same-unit restart safe.
+           * Only when transient_unit IS set does this fall through to 3,
+             with ``verify`` dropped and a warning logged (a fresh-PID check
+             would be meaningless for a fire-and-forget restart that hasn't
+             happened yet) — see the guards immediately before the
+             ``transient_unit`` check.)
+        2a. wants_blocking and self_target and not transient_unit -> REFUSE
+            (implemented below, alongside 1's branch).
         3. transient_unit set -> DETACHED systemd-run (RP-3/RP-4; implemented
-           below, step-4).
+           below, step-4). Reached either with wants_blocking False, or via
+           2's fallthrough (wants_blocking True, self_target True, verify
+           dropped).
         4. else -> DETACHED leaf plain-spawn, fused-memory/dashboard parity
-           (implemented below, step-16).
+           (implemented below, step-16). Only reachable with wants_blocking
+           False — see 2a.
         """
         runner = runner or asyncio.create_subprocess_exec
         inspector = inspector or inspect_systemd_unit
@@ -291,8 +320,7 @@ class RestartPlan:
             )
             escalated = False
             if self.on_failure_escalation is not None:
-                _file_inprocess_escalation(self.on_failure_escalation)
-                escalated = True
+                escalated = _file_inprocess_escalation(self.on_failure_escalation)
             else:
                 logger.warning(
                     'proc_supervision: RP-1 refused a blocking restart of %s '
@@ -316,17 +344,60 @@ class RestartPlan:
             # target_unit. RP-1's safety proof forbids ever blocking a
             # same-unit restart (that is precisely the 2064 self-kill risk
             # this guard exists to prevent), so this never routes to
-            # _execute_cross_unit_blocking — it falls through to the DETACHED
-            # path below instead, and the caller-supplied ``verify`` is
-            # INTENTIONALLY dropped: no fresh-PID check runs for a same-unit
-            # restart. Log it so the degrade is observable rather than a
+            # _execute_cross_unit_blocking.
+            if not self.transient_unit:
+                # RP-1 fail-closed REFUSE, cell 2a: with no transient_unit,
+                # the only remaining path is the LEAF plain-spawn branch
+                # below (``_execute_detached_leaf_plain_spawn``), which is an
+                # IMMEDIATE, synchronous ``create_subprocess_exec`` — not
+                # deferred. For a same-unit restart script (e.g. one that
+                # runs ``systemctl --user restart <own_unit>``), that
+                # immediate spawn can itself SIGKILL this very process before
+                # this call returns — the exact 2064-class hazard RP-1 exists
+                # to prevent. Being "detached" in the fire-and-forget sense
+                # does not make an immediate same-unit restart safe, so this
+                # refuses rather than risk it, exactly mirroring the RP-1
+                # branch above. A caller that legitimately wants a
+                # same-unit verified restart must set transient_unit to
+                # schedule it DEFERRED instead (the branch just below).
+                detail = (
+                    f'Refusing blocking restart of target_unit={self.target_unit!r}: '
+                    f'target_unit == own_unit ({own!r}) and no transient_unit was '
+                    f'set, so the only remaining path is an IMMEDIATE leaf spawn — '
+                    f'not deferred — which could SIGKILL this process before this '
+                    f'call returns (the 2064 self-kill bug). Set transient_unit to '
+                    f'schedule a same-unit restart DETACHED instead. No restart '
+                    f'subprocess was spawned.'
+                )
+                escalated = False
+                if self.on_failure_escalation is not None:
+                    escalated = _file_inprocess_escalation(self.on_failure_escalation)
+                else:
+                    logger.warning(
+                        'proc_supervision: refused a same-unit blocking restart '
+                        'of %s (no transient_unit) but no on_failure_escalation '
+                        'was configured — no L2 escalation filed for this '
+                        'refusal',
+                        self.target_unit,
+                    )
+                return RestartOutcome(
+                    disposition=RestartDisposition.REFUSED,
+                    escalated=escalated,
+                    detail=detail,
+                )
+            # transient_unit IS set: the DEFERRED systemd-run path below never
+            # blocks the event loop (it registers now, fires LATER), so it is
+            # safe even for a same-unit restart — but the caller-supplied
+            # ``verify`` is still INTENTIONALLY dropped: a fresh-PID check
+            # would be meaningless for a fire-and-forget restart that hasn't
+            # happened yet. Log it so the degrade is observable rather than a
             # future caller mistaking a SCHEDULED outcome for a verified one.
             logger.warning(
                 'proc_supervision: verify was set on a same-unit plan '
                 '(target_unit=%r == own_unit=%r) — blocking verify is never '
                 'used for a same-unit restart (would risk the 2064 self-kill '
-                'bug); downgrading to the detached path with verify dropped. '
-                'No fresh-PID check will run for this restart.',
+                'bug); downgrading to the detached systemd-run path with '
+                'verify dropped. No fresh-PID check will run for this restart.',
                 self.target_unit, own,
             )
 
@@ -435,11 +506,18 @@ class RestartPlan:
     def _file_verify_stage_escalation(
         self, *, summary: str, detail: str, log_context: str,
     ) -> bool:
-        """File ``self.on_failure_escalation`` (if configured) and report whether it fired.
+        """File ``self.on_failure_escalation`` (if configured) and report whether a NEW escalation was filed.
 
         Shared by the RESTART_FAILED and VERIFY_FAILED branches above — both
         need the identical "file if configured, else log a warning and don't
         claim escalated" fallback that RP-1's refuse branch also uses.
+
+        Returns ``False`` both when unconfigured (nothing to file) and when
+        ``_file_inprocess_escalation``'s dedup guard skipped filing an
+        already-pending duplicate — either way, no NEW escalation was filed
+        by this call, so ``RestartOutcome.escalated`` (fed directly from this
+        return value) means "this call filed a new L2", not "an escalation
+        exists for this task".
         """
         if self.on_failure_escalation is None:
             logger.warning(
@@ -448,8 +526,9 @@ class RestartPlan:
                 log_context,
             )
             return False
-        _file_inprocess_escalation(self.on_failure_escalation, summary=summary, detail=detail)
-        return True
+        return _file_inprocess_escalation(
+            self.on_failure_escalation, summary=summary, detail=detail,
+        )
 
     async def _execute_detached_systemd_run(self, runner) -> RestartOutcome:
         """RP-3/RP-4: register a deferred ``systemd-run --user`` transient unit.
