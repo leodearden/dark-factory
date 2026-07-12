@@ -43,6 +43,19 @@ def _log(msg: str) -> None:
     print(f'[cgl-finalize] {msg}', flush=True)
 
 
+def _gate_done_provenance(note: str) -> dict:
+    """Build the `done_provenance` blob for finalizing a pure gate task.
+
+    kind='deterministic-gate' is the pure-gate-resolved DoneProvenance kind
+    (task 2331/2334, shared/src/shared/task_metadata.py) — accepted by the
+    MCP validator commit-less and pid-less, unlike a bare {'note': ...}
+    blob (no `kind`), which `_validate_done_provenance` unconditionally
+    rejects as done_provenance_invalid. That rejection is what stranded
+    task 2273 (the CGL-η 2273 stranding class).
+    """
+    return {'kind': 'deterministic-gate', 'note': note}
+
+
 async def main_async() -> int:
     note = (
         f'CGL-η Phase-1 bulk cross-graph migration auto-applied and post-verified '
