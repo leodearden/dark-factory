@@ -83,3 +83,20 @@ def _submit_completion_verdict(
     }
     artifacts.write_verdict(role, _envelope(role, session_id, payload))
     return {'status': 'ok', 'role': role}
+
+
+def _submit_triage(
+    artifacts: TaskArtifacts,
+    role: str,
+    session_id: str,
+    accepted: list[dict],
+    skipped: list[dict],
+    proposed_task_groups: list[dict],
+) -> dict[str, Any]:
+    payload = {
+        'accepted': accepted,
+        'skipped': skipped,
+        'proposed_task_groups': proposed_task_groups,
+    }
+    artifacts.write_verdict(role, _envelope(role, session_id, payload))
+    return {'status': 'ok', 'role': role}
