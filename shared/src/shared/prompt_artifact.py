@@ -20,6 +20,7 @@ strict ``__all__`` union assertion untouched.
 from __future__ import annotations
 
 import os
+import shutil
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Literal
@@ -201,3 +202,16 @@ class PromptArtifactStore:
         return ArtifactProvenance.model_validate_json(
             provenance_path.read_text(encoding='utf-8')
         )
+
+    def unpin(self, prompt_id: str, executor_model: str, harness_version: str) -> bool:
+        """Remove the pin for this key — the sole rollback lever (no separate revert path).
+
+        Returns ``True`` when a pin was removed, ``False`` when there was
+        nothing pinned (idempotent). Either way, the next :meth:`resolve` for
+        this key returns the in-code constant.
+        """
+        key_dir = self._key_dir(prompt_id, executor_model, harness_version)
+        if key_dir.exists():
+            shutil.rmtree(key_dir)
+            return True
+        return False
