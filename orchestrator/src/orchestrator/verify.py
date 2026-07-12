@@ -3552,6 +3552,39 @@ def _worktree_reader(
     return _read
 
 
+def _safe_derive_verify_plan_dict(
+    existing_files: list[str],
+    module_configs: list[ModuleConfig],
+    config: OrchestratorConfig,
+    worktree_reader: Callable[[str], str | None],
+    *,
+    role: Literal['merge', 'task'],
+) -> dict | None:
+    """Best-effort ``derive_verify_plan(...).to_dict()`` for ``VerifyResult.plan``.
+
+    ``plan`` is diagnostic-only (task γ, verify_plan.py) — attached to the
+    aggregated ``VerifyResult`` for post-hoc triage but never consulted to
+    decide what actually runs (see the "Declarative decision record" comments
+    at this helper's call sites in :func:`run_scoped_verification`).  A bug in
+    the pure decision layer — an unforeseen ``VerifyCmd``/dataclass edge, or a
+    future change to ``_verify_cmd_to_dict``/``to_dict`` — must never fail an
+    otherwise-passing verify attempt just because its diagnostic record
+    couldn't be built.  Catches broadly and logs a warning, returning ``None``
+    (``VerifyResult.plan``'s own default) on any failure instead of
+    propagating and failing the gate.
+    """
+    try:
+        return verify_plan.derive_verify_plan(
+            existing_files, module_configs, config, worktree_reader, role=role,
+        ).to_dict()
+    except Exception as exc:  # noqa: BLE001 — diagnostic-only; must never fail the verify gate
+        logger.warning(
+            'derive_verify_plan failed — omitting VerifyResult.plan for this attempt: %s',
+            exc, exc_info=True,
+        )
+        return None
+
+
 async def run_scoped_verification(
     worktree: Path,
     config: OrchestratorConfig,
@@ -3761,11 +3794,12 @@ async def run_scoped_verification(
                 # derive_verify_plan's "Fidelity" docstring paragraph).
                 # Reuses `_content_cache` (built above for scope_module_config)
                 # so the structural-content probe reads each file once.
-                plan_dict = verify_plan.derive_verify_plan(
+                plan_dict = _safe_derive_verify_plan_dict(
                     existing_files, module_configs, config,
                     _worktree_reader(worktree, cache=_content_cache), role=role,
-                ).to_dict()
-                logger.info('Verify plan: %s', plan_dict)
+                )
+                if plan_dict is not None:
+                    logger.info('Verify plan: %s', plan_dict)
             else:
                 scoped = module_configs
                 plan_dict = None
@@ -3841,10 +3875,11 @@ async def run_scoped_verification(
                 # diverge from what actually ran. Its structural-content read
                 # is NOT deduped against _build_fallback_config's own read
                 # above (see the NOTE at the _build_fallback_config call site).
-                plan_dict = verify_plan.derive_verify_plan(
+                plan_dict = _safe_derive_verify_plan_dict(
                     existing_files, module_configs, config, _worktree_reader(worktree), role=role,
-                ).to_dict()
-                logger.info('Verify plan: %s', plan_dict)
+                )
+                if plan_dict is not None:
+                    logger.info('Verify plan: %s', plan_dict)
                 fallback_result = await run_verification(
                     worktree, config, fallback, max_retries=max_retries,
                     is_merge_verify=is_merge_verify,
