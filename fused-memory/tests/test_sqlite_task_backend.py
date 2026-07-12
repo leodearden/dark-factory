@@ -3805,15 +3805,20 @@ async def test_get_statuses_fresh_sees_committed_write_despite_pinned_cached_sna
     backend, project_root,
 ):
     """get_statuses_fresh reads a live WAL snapshot even when the cached
-    per-project connection has a read transaction pinned open.
+    WRITE connection has a read transaction pinned open.
 
     Reproduces the task 2388 root cause: ``_get_connection`` opens its
-    cached connection in legacy deferred-transaction mode, so a read
-    transaction left open on it pins a stale WAL snapshot. ``get_statuses``
-    (and ``get_statuses_raw``) share that cached connection and go stale
-    with it. ``get_statuses_fresh`` must open its own short-lived
-    autocommit connection instead, so it always observes the latest
-    committed state regardless of what the cached connection is doing.
+    cached WRITE connection in legacy deferred-transaction mode, so a read
+    transaction left open on it pins a stale WAL snapshot. Originally
+    ``get_statuses``/``get_statuses_raw`` shared that cached connection and
+    went stale with it; task 2455 hardened the hot ``get_statuses`` path to
+    read via a dedicated cached AUTOCOMMIT connection instead (see
+    ``_get_read_connection``), so it is now fresh here too — this test
+    pins that. ``get_statuses_fresh`` remains the dedicated
+    short-lived-autocommit-connection census read for callers (like
+    ``cross_verify_task_counts``) that need a guaranteed-uncached fresh
+    read regardless of what the hot path's cached read connection is
+    doing.
     """
     from shared.async_sqlite_base import apply_wal_pragmas, connect_daemon
 
@@ -3823,7 +3828,7 @@ async def test_get_statuses_fresh_sees_committed_write_despite_pinned_cached_sna
     await backend.set_task_status('1', 'done', project_root)
     await backend.set_task_status('2', 'done', project_root)
 
-    # Pin the cached connection's WAL read-snapshot by leaving a read
+    # Pin the cached WRITE connection's WAL read-snapshot by leaving a read
     # transaction open on it (materialize the snapshot via fetchall()).
     conn = await backend._get_connection(project_root)
     await conn.execute('BEGIN')
@@ -3841,13 +3846,15 @@ async def test_get_statuses_fresh_sees_committed_write_despite_pinned_cached_sna
     finally:
         await writer.close()
 
-    # The pinned cached-connection read is STALE — documents the bug.
-    stale = await backend.get_statuses(project_root)
-    assert stale.get('1') == 'done', (
-        f"Expected the pinned cached read to still see 'done', got: {stale}"
+    # The hot get_statuses path is now FRESH (task 2455) despite the pinned
+    # write connection — it reads via a separate cached autocommit
+    # connection that the write-side pin can't touch.
+    fresh_hot = await backend.get_statuses(project_root)
+    assert fresh_hot.get('1') == 'cancelled', (
+        f"Expected the hardened hot get_statuses read to see 'cancelled', got: {fresh_hot}"
     )
 
-    # The fresh read reflects LIVE committed state.
+    # The dedicated census read also reflects LIVE committed state.
     fresh = await backend.get_statuses_fresh(project_root)
     assert fresh['1'] == 'cancelled', (
         f"Expected the fresh read to see 'cancelled', got: {fresh}"

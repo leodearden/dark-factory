@@ -936,6 +936,14 @@ class SqliteTaskBackend:
         # production code paths never set this — it stays None.
         self._after_insert_fault_hook: Callable[[], None] | None = None
         self._connections: dict[str, aiosqlite.Connection] = {}
+        # Cached per-project AUTOCOMMIT (isolation_level=None) read
+        # connections for the hot get_statuses/get_statuses_raw path (task
+        # 2455). Distinct from self._connections (the write connection,
+        # opened in Python sqlite3's legacy deferred-transaction mode): an
+        # autocommit connection never holds a read transaction open across
+        # statements, so it can never be pinned to a stale WAL snapshot the
+        # way the write connection can be. See _get_read_connection.
+        self._read_connections: dict[str, aiosqlite.Connection] = {}
         # Guards the connection map AND each project's first-access bring-up
         # (schema + WAL pragmas). Held briefly during open; released before
         # any user-visible call runs.
@@ -1117,6 +1125,42 @@ class SqliteTaskBackend:
             logger.info('SqliteTaskBackend opened %s', db_path)
             return conn
 
+    async def _get_read_connection(self, project_root: str) -> aiosqlite.Connection:
+        """Return a cached per-project AUTOCOMMIT connection for hot status reads.
+
+        Used by :meth:`get_statuses_raw` (task 2455). Unlike
+        :meth:`_get_connection`'s cached connection — opened in Python
+        sqlite3's legacy deferred-transaction mode, so a read transaction
+        left open on it pins a stale WAL snapshot (task 2388) — this
+        connection is opened with ``isolation_level=None`` (autocommit), so
+        it never holds a transaction open across statements and can never
+        be pinned. It uses the exact same open recipe as
+        :meth:`get_statuses_fresh` (``connect_daemon(..., isolation_level=
+        None)`` + ``apply_wal_pragmas``), but caches the result per
+        ``project_root`` so repeated hot-path calls don't pay a per-call
+        connection-open cost.
+        """
+        if self._closed:
+            raise RuntimeError('SqliteTaskBackend is closed')
+        # Ensure the DB file + schema + migrations exist before opening our
+        # own connection onto the same file.
+        await self._get_connection(project_root)
+        if project_root in self._read_connections:
+            return self._read_connections[project_root]
+
+        async with self._connect_locks_lock:
+            # Re-check after acquiring lock — another caller may have raced us.
+            conn = self._read_connections.get(project_root)
+            if conn is not None:
+                return conn
+
+            conn = await connect_daemon(str(self._db_path(project_root)), isolation_level=None)
+            await apply_wal_pragmas(conn, busy_timeout_ms=5000)
+            conn.row_factory = aiosqlite.Row
+            self._read_connections[project_root] = conn
+            logger.info('SqliteTaskBackend opened read connection for %s', project_root)
+            return conn
+
     def _write_lock(self, project_root: str) -> asyncio.Lock:
         return self._write_locks.setdefault(project_root, asyncio.Lock())
 
@@ -1292,6 +1336,13 @@ class SqliteTaskBackend:
         ``_get_tasks_internal``, ``_row_to_task``, or ``json.loads``,
         so metadata columns are never decoded.
 
+        Reads via the cached per-project AUTOCOMMIT connection returned by
+        :meth:`_get_read_connection` (task 2455) rather than the cached
+        WRITE connection (:meth:`_get_connection`) that :meth:`get_task`/
+        :meth:`get_tasks` use — see :meth:`_get_read_connection` and
+        :meth:`get_statuses_fresh` for why a pinnable connection can go
+        stale here.
+
         Args:
             project_root: Absolute path to the project root.
             tag: Tag context; defaults to ``DEFAULT_TAG`` when ``None``.
@@ -1309,7 +1360,7 @@ class SqliteTaskBackend:
         # safely callable in isolation without relying on the caller to connect first.
         await self.ensure_connected()
         tag = tag or DEFAULT_TAG
-        conn = await self._get_connection(project_root)
+        conn = await self._get_read_connection(project_root)
         return await self._statuses_from_conn(conn, tag, ids)
 
     async def get_statuses(
