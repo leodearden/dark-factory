@@ -94,6 +94,7 @@ async def invoke_agent(
     model: str = 'opus',
     max_turns: int = 50,
     max_budget_usd: float = 5.0,
+    prices: dict[str, Any] | None = None,
     allowed_tools: list[str] | None = None,
     disallowed_tools: list[str] | None = None,
     mcp_config: dict | None = None,
@@ -125,6 +126,9 @@ async def invoke_agent(
     *working_idle_secs* / *absolute_cap_secs*, when BOTH set (claude backend
     only), extend the working-regime watchdog past *timeout_seconds* while
     the transcript keeps advancing. Default ``None`` for both → no extension.
+    *prices*, when set (codex/gemini backends only — claude reports native
+    cost), is forwarded to the parser's cost estimator in place of the
+    packaged default price table; see ``_estimate_cost``.
     """
     if backend == 'claude':
         return await _invoke_claude_with_sandbox(
@@ -148,14 +152,14 @@ async def invoke_agent(
             prompt=prompt, system_prompt=system_prompt, cwd=cwd, model=model,
             max_budget_usd=max_budget_usd, mcp_config=mcp_config,
             sandbox_modules=sandbox_modules, effort=effort,
-            timeout_seconds=timeout_seconds,
+            timeout_seconds=timeout_seconds, prices=prices,
         )
     elif backend == 'gemini':
         return await _invoke_gemini(
             prompt=prompt, system_prompt=system_prompt, cwd=cwd, model=model,
             max_budget_usd=max_budget_usd, mcp_config=mcp_config,
             sandbox_modules=sandbox_modules, effort=effort,
-            timeout_seconds=timeout_seconds,
+            timeout_seconds=timeout_seconds, prices=prices,
         )
     else:
         raise ValueError(f'Unknown backend: {backend!r}')
@@ -286,6 +290,7 @@ async def _invoke_codex(
     sandbox_modules: list[str] | None,
     effort: str | None,
     timeout_seconds: float | None = None,
+    prices: dict[str, Any] | None = None,
 ) -> AgentResult:
     """Invoke OpenAI Codex CLI."""
     temp_files: list[Path] = []
@@ -319,7 +324,7 @@ async def _invoke_codex(
         env = dict(os.environ)
 
         result = await _run_subprocess_local(cmd, cwd, env, 'codex', model, max_budget_usd, timeout_seconds)
-        return _parse_codex_output(result, model)
+        return _parse_codex_output(result, model, prices)
 
     finally:
         for f in temp_files:
@@ -465,6 +470,7 @@ async def _invoke_gemini(
     sandbox_modules: list[str] | None,
     effort: str | None,
     timeout_seconds: float | None = None,
+    prices: dict[str, Any] | None = None,
 ) -> AgentResult:
     """Invoke Google Gemini CLI."""
     temp_files: list[Path] = []
@@ -490,7 +496,7 @@ async def _invoke_gemini(
         env = dict(os.environ)
 
         result = await _run_subprocess_local(cmd, cwd, env, 'gemini', model, max_budget_usd, timeout_seconds)
-        return _parse_gemini_output(result, model)
+        return _parse_gemini_output(result, model, prices)
 
     finally:
         for f in temp_files:
