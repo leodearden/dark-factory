@@ -27,7 +27,7 @@ def test_gate_done_provenance_has_accepted_kind():
     scripts_dir = os.path.join(os.path.dirname(__file__), '..', 'scripts')
     sys.path.insert(0, os.path.abspath(scripts_dir))
     try:
-        import cgl_eta_finalize_gate
+        import cgl_eta_finalize_gate  # pyright: ignore[reportMissingImports]
         from shared.task_metadata import DoneProvenance
 
         result = cgl_eta_finalize_gate._gate_done_provenance('clean migration note')
@@ -79,7 +79,7 @@ def test_finalize_sends_deterministic_gate_provenance(monkeypatch):
     scripts_dir = os.path.join(os.path.dirname(__file__), '..', 'scripts')
     sys.path.insert(0, os.path.abspath(scripts_dir))
     try:
-        import cgl_eta_finalize_gate
+        import cgl_eta_finalize_gate  # pyright: ignore[reportMissingImports]
         from shared.task_metadata import DoneProvenance
 
         calls: list = []
