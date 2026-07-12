@@ -15,8 +15,11 @@ Usage (stdio transport, spawned by orchestrator):
 
 from __future__ import annotations
 
+import argparse
 import logging
+import sys
 from datetime import UTC, datetime
+from pathlib import Path
 from typing import Any
 
 from fastmcp import FastMCP
@@ -219,3 +222,66 @@ def create_server(artifacts: TaskArtifacts, role: str, session_id: str = '') -> 
             )
 
     return mcp
+
+
+# ---------------------------------------------------------------------------
+# CLI entry point
+# ---------------------------------------------------------------------------
+
+
+def _artifacts_from_args(
+    argv: list[str] | None = None,
+) -> tuple[TaskArtifacts, str, str]:
+    """Parse ``--worktree``/``--meta-root``/``--verdict-role``/``--session-id``
+    and return the corresponding ``(TaskArtifacts, role, session_id)``.
+
+    The worktree/meta-root resolution mirrors plan_tools.py's
+    ``_artifacts_from_args`` byte-identically (parity signal) so both sides
+    resolve the IDENTICAL meta_root for a given worktree. When
+    ``--meta-root`` is omitted, the root dir checked for existence is the
+    legacy ``<worktree>/.task``.
+    """
+    parser = argparse.ArgumentParser(description='Verdict-tools MCP server (stdio)')
+    parser.add_argument(
+        '--worktree', type=Path, required=True,
+        help='Path to the git worktree containing .task/',
+    )
+    parser.add_argument(
+        '--meta-root', type=Path, default=None,
+        help=(
+            'Optional `.task-meta` root (sibling of the worktree). When '
+            'omitted, verdicts/ et al. are read/written at the legacy '
+            '<worktree>/.task location.'
+        ),
+    )
+    parser.add_argument(
+        '--verdict-role', type=str, required=True,
+        help='The role submitting a verdict (judge/triage/merger, or a '
+             'reviewer-panel name) — selects the one registered tool and '
+             'the authoritative verdicts/<role>.json filename.',
+    )
+    parser.add_argument(
+        '--session-id', type=str, default='',
+        help='Optional session id recorded in the verdict envelope.',
+    )
+    args = parser.parse_args(argv)
+
+    worktree = args.worktree.resolve()
+    meta_root = args.meta_root.resolve() if args.meta_root is not None else None
+    root_to_check = meta_root if meta_root is not None else worktree / '.task'
+    if not root_to_check.is_dir():
+        print(f'Error: {root_to_check} does not exist', file=sys.stderr)
+        sys.exit(1)
+
+    return TaskArtifacts(worktree, meta_root), args.verdict_role, args.session_id
+
+
+def main() -> None:
+    """Parse CLI args and run the stdio MCP server."""
+    artifacts, role, session_id = _artifacts_from_args()
+    server = create_server(artifacts, role, session_id)
+    server.run(transport='stdio')
+
+
+if __name__ == '__main__':
+    main()
