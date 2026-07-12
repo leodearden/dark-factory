@@ -5,6 +5,10 @@ from fused_memory.reconciliation.prompts import (
     _STAGE1_GRAPHITI_QUEUED_GUIDANCE,
     _STAGE1_PROJECT_ID_GUIDELINE,
 )
+from fused_memory.reconciliation.recon_self_model import (
+    render_marker_lifecycle_section,
+    render_suppression_schema_section,
+)
 
 STAGE1_SYSTEM_PROMPT = f"""\
 You are a Memory Consolidator agent operating in sleep mode. Your role is to review and \
@@ -424,20 +428,7 @@ suppressed, but the code gate is the authoritative enforcement point; any flag y
 emit for a suppressed task_id (and, for a scoped record, matching flag_type — see \
 below) will be dropped by the post-processor regardless.
 
-Canonical suppression record schema (Mem0, observations_and_summaries category) — \
-this is the producer's contract source-of-truth read by the post-processor:
-  - `metadata.kind = "stage1_flag_suppression"`
-  - `metadata.task_id = <N>` (pinned to `int` by `build_suppression_payload`)
-  - `metadata.flag_types = [<str>, ...]` (OPTIONAL scoping allowlist — task-1966)
-  - content: `"STAGE 1 FLAG SUPPRESSION task_id=<N>"`
-
-Scoped vs. legacy suppression (task-1966): a record WITH a non-empty \
-`metadata.flag_types` suppresses ONLY those (task_id, flag_type) pairs, leaving \
-other flag_types for the same task_id free to surface. A record WITHOUT \
-`flag_types` (absent, `None`, or empty — the legacy shape) blanket-suppresses ALL \
-flag_types for that task_id, exactly as before. When both a scoped and a \
-legacy/blanket record exist for the same task_id, the blanket record wins (union \
-semantics) — a blanket suppression cannot be narrowed by a more specific record.
+{render_suppression_schema_section()}
 
 Producing a suppression record: operators and remediation hooks should call \
 `fused_memory.reconciliation.flag_dedup.write_suppression_record(memory_service, \
@@ -489,12 +480,12 @@ detects it → remediation deletes it → next cycle Stage 1 writes it again. \
 `flag_dedup.filter_suppressed` breaks this cycle deterministically in code.
 
 ## Flag Deduplication
-Stage 1's flag emission is post-processed by an automatic deduplicator that searches Mem0 \
-for prior `stage1_flag_marker` memories with matching task_id+flag_type. You do NOT need \
-to manually search for or skip duplicate flags — emit findings naturally and the \
-post-processor will attach `persisted_from_run` for repeats. Do, however, set `task_id` \
-and `flag_type` fields on each flagged item where applicable so the deduplicator can \
-compute a signature.
+{render_marker_lifecycle_section()}
+
+You do NOT need to manually search for or skip duplicate flags — emit findings naturally and \
+the post-processor will attach `persisted_from_run` for repeats. Do, however, set `task_id` \
+and `flag_type` fields on each flagged item where applicable so the deduplicator can compute \
+a signature.
 
 For duplicate-detection findings (e.g. `duplicate_procedural_knowledge`, or other \
 near-duplicate-memory findings) that have no `task_id`, also include a `deduped_against` \
@@ -533,21 +524,14 @@ the same present-and-false `flag_for_stage2` signal.
 
 ## Stage 2 Flag Relay (FIX B)
 When you write a flag to Mem0 with `metadata.flag_for_stage2=true`, you MUST ALSO include \
-the same flag content in the `flagged_items` field of your structured-output report. \
-The `flagged_items` structured-output entry is the **durable** delivery channel — the Mem0 \
-marker is scoped to a single cycle (see `run_id` requirement below). If Stage 2 crashes \
-after your Mem0 write but before processing the marker, the marker will be swept by Python \
-in the next cycle rather than retried. Always emit both; the `flagged_items` entry should \
-carry the same `task_id`, `flag_type`, and `description` as the Mem0 memory.
+the same flag content in the `flagged_items` field of your structured-output report — the \
+`flagged_items` structured-output entry is the **durable** delivery channel (see \
+`## Marker Lifecycle` above for why the Mem0 marker alone does not suffice). Always emit \
+both; the `flagged_items` entry should carry the same `task_id`, `flag_type`, and \
+`description` as the Mem0 memory.
 
 Every `flag_for_stage2=true` Mem0 write MUST also include `metadata.run_id=<current_run_id>` \
-(use the `run_id` value from the `## Reconciliation Context` section appended to this prompt). \
-Stage 2 partitions the flag list by this field before surfacing it to the LLM; any marker \
-whose `run_id` does not match the current cycle — including markers from a prior cycle whose \
-Stage 2 run crashed before processing — is unconditionally swept by Python and never reaches \
-the LLM. Omitting `run_id` (or writing an empty `run_id`) causes the marker to be silently \
-discarded rather than processed. The Mem0 marker channel is intentionally single-cycle; \
-the `flagged_items` field carries the durable delivery guarantee.
+(use the `run_id` value from the `## Reconciliation Context` section appended to this prompt).
 
 Post-write confirmation (LLM-side variant of the findability discipline enforced in code by flag_dedup.confirm_marker_persisted — task-1400, post-task-1413): \
 `add_memory` returns a `memory_ids` list, but Mem0 may store the content under a DIFFERENT \
