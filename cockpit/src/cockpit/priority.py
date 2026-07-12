@@ -368,7 +368,10 @@ def save_priorities(priorities: Priorities, path: Path | None = None) -> None:
     reads, so ``load_priorities(path) == priorities`` after this call.
     Mirrors ui_config.save_ui_config's atomic tmp-file-in-target's-own-
     parent-dir + os.replace idiom, so a save is never observed
-    half-written.
+    half-written. Fail-soft: ANY exception during the write (not just
+    OSError -- e.g. an unexpected yaml.safe_dump fault) is logged and
+    swallowed, never raised, per the cockpit's hard constraint that a view
+    must never be a dependency (PRD §2).
     """
     target = path if path is not None else _default_priorities_path()
     try:
@@ -386,7 +389,7 @@ def save_priorities(priorities: Priorities, path: Path | None = None) -> None:
             with contextlib.suppress(OSError):
                 os.unlink(tmp_path_str)
             raise
-    except OSError as exc:
+    except Exception as exc:
         logger.warning('save_priorities: failed to write %s: %s', target, exc)
 
 

@@ -350,3 +350,29 @@ class TestSavePriorities:
         assert any('priorities' in msg.lower() for msg in warnings), (
             f'Expected a WARNING mentioning "priorities"; got: {warnings}'
         )
+
+    def test_non_os_error_during_write_is_fail_soft_and_warns(self, tmp_path, caplog, monkeypatch):
+        """save_priorities' fail-soft guarantee isn't limited to OSError.
+
+        Forces a non-OSError fault (e.g. an unexpected yaml.safe_dump
+        error) mid-write; this must still be logged and swallowed, never
+        raised -- the cockpit's 'a view must never be a dependency'
+        guarantee (PRD §2) doesn't carve out an exception type.
+        """
+        from cockpit import priority
+        from cockpit.priority import Priorities, save_priorities
+
+        def _boom(*args, **kwargs):
+            raise TypeError('boom')
+
+        monkeypatch.setattr(priority.yaml, 'safe_dump', _boom)
+        target = tmp_path / 'priorities.yaml'
+
+        with caplog.at_level(logging.WARNING):
+            save_priorities(Priorities.default(), target)
+
+        assert not target.exists()
+        warnings = [r.message for r in caplog.records if r.levelno == logging.WARNING]
+        assert any('priorities' in msg.lower() for msg in warnings), (
+            f'Expected a WARNING mentioning "priorities"; got: {warnings}'
+        )
