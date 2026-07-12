@@ -866,3 +866,92 @@ class TestDedupExemptPermission:
                 category=self._CATEGORY,
             )
         return service
+
+
+# ---------------------------------------------------------------------------
+# D1 — Deterministic per-cycle summary: one Python-written ledger row per
+# (stage, run_id), idempotent on repeat [λ=2229]
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestDeterministicCycleSummary:
+    """D1 (λ=2229): the deterministic Python ``write_cycle_summary`` writes
+    EXACTLY ONE authoritative ``cycle_summary`` ledger row per (project_id,
+    'cycle_summary', task_id='', flag_type=stage, run_id) identity, sourced
+    directly from the stage's own ``StageReport`` — no LLM turn, no nonce,
+    nothing to self-heal. A repeat call for the same identity is an
+    idempotent UPSERT: last write wins, row count stays 1.
+
+    Assertions are scoped to the LEDGER row (the authoritative copy) only —
+    the best-effort Mem0 mirror is covered by λ's own unit suite
+    (test_summary_pool.py::TestWriteCycleSummaryMirrorAndTrim) and is out of
+    scope here. Per Rule 5 (and plan.json's design decision), this class
+    deliberately has NO grep-source / import-introspection assertion that
+    the retired nonce/verify/repair/reconstruct machinery is gone — a
+    repo-wide ``retry_nonce`` grep would falsely hit residual prompt prose
+    in ``prompts/stage2.py`` owned by a downstream task.
+
+    Driving harness (``_drive_single_write`` / ``_drive_repeat_write`` /
+    ``_count_rows``) lands in step-12 — this step only declares the §9
+    postconditions, so it is RED until then (the harness methods referenced
+    below don't exist yet).
+    """
+
+    _PROJECT = 'proj-d1-cycle-summary'
+    _STAGE = 'task_knowledge_sync'
+    _RUN_ID = 'run-d1-cycle-summary'
+
+    async def test_write_cycle_summary_writes_single_ledger_row_from_report(
+        self, recon_service,
+    ) -> None:
+        """A single write_cycle_summary call for a completed stage writes
+        exactly one cycle_summary ledger row, whose payload is derived
+        verbatim from the StageReport (stage/run_id/started_at/completed_at/
+        items_flagged_count/stats/llm_calls/tokens_used) — never an LLM
+        turn."""
+        report, wrote = await self._drive_single_write(recon_service)
+
+        assert wrote is True, 'Expected write_cycle_summary to report the ledger upsert succeeded'
+        count = await self._count_rows(recon_service.recon_ledger, self._PROJECT)
+        assert count == 1, f'Expected exactly one cycle_summary row to exist, got {count}'
+
+        record = await recon_service.recon_ledger.get_by_identity(
+            self._PROJECT, 'cycle_summary', task_id='', flag_type=self._STAGE, run_id=self._RUN_ID,
+        )
+        assert record is not None, 'Expected the row to be readable via get_by_identity'
+        assert record.task_id == ''
+        assert record.flag_type == self._STAGE
+        assert record.run_id == self._RUN_ID
+
+        payload = json.loads(record.payload_json)
+        assert payload['stage'] == self._STAGE
+        assert payload['run_id'] == self._RUN_ID
+        assert payload['started_at'] == report.started_at.isoformat()
+        assert payload['completed_at'] == report.completed_at.isoformat()
+        assert payload['items_flagged_count'] == len(report.items_flagged)
+        assert payload['stats'] == report.stats
+        assert payload['llm_calls'] == report.llm_calls
+        assert payload['tokens_used'] == report.tokens_used
+
+    async def test_repeat_call_same_identity_keeps_one_row_last_write_wins(
+        self, recon_service,
+    ) -> None:
+        """Calling the writer twice for the same (stage, run_id) identity
+        leaves exactly one ledger row, carrying the SECOND call's payload —
+        an idempotent UPSERT, not an accumulating insert."""
+        second_report = await self._drive_repeat_write(recon_service)
+
+        count = await self._count_rows(recon_service.recon_ledger, self._PROJECT)
+        assert count == 1, f'Expected exactly one row after a repeat write, got {count}'
+
+        record = await recon_service.recon_ledger.get_by_identity(
+            self._PROJECT, 'cycle_summary', task_id='', flag_type=self._STAGE, run_id=self._RUN_ID,
+        )
+        assert record is not None
+        payload = json.loads(record.payload_json)
+        assert payload['items_flagged_count'] == len(second_report.items_flagged), (
+            'Expected the surviving row to carry the SECOND call payload (last write wins)'
+        )
+        assert payload['llm_calls'] == second_report.llm_calls
+        assert payload['tokens_used'] == second_report.tokens_used
