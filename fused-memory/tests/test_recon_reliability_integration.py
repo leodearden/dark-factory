@@ -450,3 +450,66 @@ class TestLedgerUpsertAndRace:
         )
         row = await cursor.fetchone()
         return row[0]
+
+
+# ---------------------------------------------------------------------------
+# L3 — Suppression round-trip: write_suppression_record -> filter_suppressed,
+# no Mem0 search [ι=2227]
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestSuppressionRoundTrip:
+    """L3 (ι=2227): producer ``write_suppression_record`` -> consumer
+    ``filter_suppressed`` round-trip, proving the indexed
+    ``list_suppressions`` ledger query fully replaces the retired
+    project-wide Mem0 semantic search.
+
+    Driving harness (``_drive_scoped_round_trip`` /
+    ``_drive_blanket_round_trip``) lands in step-4 — this step only
+    declares the §9 postconditions, so it is RED until then (the harness
+    methods referenced below don't exist yet).
+    """
+
+    _PROJECT = 'proj-l3-suppression-round-trip'
+    _TASK_ID = 501
+    _OTHER_TASK_ID = 502
+    _SUPPRESSED_FLAG_TYPE = 'missing_deliverable'
+    _SURVIVING_FLAG_TYPE = 'human_review_required_deferred'
+
+    async def test_scoped_suppression_drops_matching_flag_keeps_others(
+        self, recon_service,
+    ) -> None:
+        """A SCOPED suppression for (task_id, flag_type) drops only that
+        pair: a different flag_type for the same task, and the same
+        flag_type for a different task, both survive. Mem0 is never
+        searched — the indexed ledger query is the sole read path."""
+        result = await self._drive_scoped_round_trip(recon_service)
+
+        kept = {(f['task_id'], f['flag_type']) for f in result}
+        assert (self._TASK_ID, self._SUPPRESSED_FLAG_TYPE) not in kept, (
+            'Expected the scoped-suppressed (task_id, flag_type) pair to be dropped'
+        )
+        assert (self._TASK_ID, self._SURVIVING_FLAG_TYPE) in kept, (
+            'Expected a differently-typed flag for the same task to survive'
+        )
+        assert (self._OTHER_TASK_ID, self._SUPPRESSED_FLAG_TYPE) in kept, (
+            'Expected the same flag_type for a different task to survive'
+        )
+        recon_service.search.assert_not_called()
+
+    async def test_blanket_suppression_drops_every_flag_type_for_task(
+        self, recon_service,
+    ) -> None:
+        """A BLANKET suppression (``flag_types=None``) drops EVERY
+        flag_type for that task_id, while a different task's matching
+        flag_type survives untouched. Mem0 is never searched."""
+        result = await self._drive_blanket_round_trip(recon_service)
+
+        assert result == [
+            {'task_id': self._OTHER_TASK_ID, 'flag_type': self._SUPPRESSED_FLAG_TYPE},
+        ], (
+            "Expected every flag_type for the blanket-suppressed task to be "
+            "dropped, keeping only the other task's flag"
+        )
+        recon_service.search.assert_not_called()
