@@ -1161,6 +1161,16 @@ class SqliteTaskBackend:
             conn = self._read_connections.get(project_root)
             if conn is not None:
                 return conn
+            # Re-check _closed too (not just the map): close() sets
+            # self._closed BEFORE acquiring this same lock to drain the map,
+            # so a close() that flips the flag and completes its drain during
+            # the window between our first _closed check above (before the
+            # `await self._get_connection(...)` bring-up call) and this lock
+            # acquisition would otherwise let us open-and-cache a brand new
+            # connection that close() has already stopped watching for — a
+            # leaked file handle / WAL reader past shutdown.
+            if self._closed:
+                raise RuntimeError('SqliteTaskBackend is closed')
 
             conn = await connect_daemon(str(self._db_path(project_root)), isolation_level=None)
             await apply_wal_pragmas(conn, busy_timeout_ms=5000)
@@ -1351,6 +1361,24 @@ class SqliteTaskBackend:
         :meth:`get_statuses_fresh` for why a pinnable connection can go
         stale here.
 
+        Snapshot consistency: because this reads a different connection —
+        and therefore potentially a different WAL snapshot — than
+        :meth:`get_task`/:meth:`get_tasks`, a caller that reads both is NOT
+        guaranteed to see them agree to the instant; a status committed
+        between the two calls can show up in one and not the other,
+        regardless of call order. No in-tree caller currently depends on
+        the two being snapshot-consistent: the one caller that compares a
+        ``get_tasks`` tree against a status census
+        (``cross_verify_task_counts`` in ``reconciliation/task_filter.py``)
+        is fed by :meth:`get_statuses_fresh`, not this method — see
+        ``reconciliation/harness.py``'s ``_fetch_task_count_census`` — and
+        that comparison already treats single-cycle divergence as an
+        advisory read-skew artifact rather than an error. A future caller
+        that needs single-instant consistency between the tree and the
+        status map should read both from :meth:`get_task`/:meth:`get_tasks`
+        (which still share :meth:`_get_connection`) rather than assume it
+        from this method.
+
         Args:
             project_root: Absolute path to the project root.
             tag: Tag context; defaults to ``DEFAULT_TAG`` when ``None``.
@@ -1395,33 +1423,47 @@ class SqliteTaskBackend:
     ) -> dict[str, str]:
         """Return a snapshot-fresh ``{id_str: status_str}`` census for *project_root*.
 
-        Unlike :meth:`get_statuses`/:meth:`get_statuses_raw`, which read via
-        the cached per-project connection returned by :meth:`_get_connection`,
-        this method opens a DEDICATED short-lived connection with
-        ``isolation_level=None`` (autocommit) for every call, so its SELECT
-        always sees the latest committed WAL state and can never be pinned.
-
-        Why this exists (task 2388): ``_get_connection``'s cached connection
-        is opened via ``connect_daemon(str(db_path))`` *without*
-        ``isolation_level=None`` — Python sqlite3's legacy deferred
-        transaction mode. If a read transaction is ever left open on that
-        cached connection, every subsequent read on it — including
-        ``get_statuses``/``get_statuses_raw`` and the ``get_tasks`` tree
-        read, since they all share the same cached connection — is pinned
-        to that transaction's WAL snapshot and silently returns stale data,
-        even after other connections/processes have committed newer writes.
-        Because the tree read and the census read went stale *together*,
-        they still agreed with each other, so
-        ``cross_verify_task_counts`` (``reconciliation/task_filter.py``)
-        reported a false ``consistent: true`` instead of surfacing the
-        drift. This method gives the reconciliation harness's authoritative
-        census (``_fetch_task_count_census``) a read that cannot be pinned;
+        As of task 2455, :meth:`get_statuses`/:meth:`get_statuses_raw` no
+        longer read via :meth:`_get_connection`'s cached WRITE connection —
+        they read via :meth:`_get_read_connection`, a dedicated per-project
+        CACHED AUTOCOMMIT connection that can never hold a read transaction
+        open across statements, so it can never be pinned to a stale WAL
+        snapshot either. This method goes one step further: it opens its
+        OWN short-lived autocommit connection for every call — no caching
+        at all — so it never shares a connection with any other reader,
+        including other concurrent callers of this same method. It remains
+        the guaranteed-uncached read the reconciliation harness's
+        authoritative census (``_fetch_task_count_census``) uses for
+        ``cross_verify_task_counts`` (``reconciliation/task_filter.py``);
         the hot compact-status-map callers should keep using
-        ``get_statuses``/``get_statuses_raw`` unchanged.
+        ``get_statuses``/``get_statuses_raw``, which are equally unpinnable
+        now but reuse a cached connection instead of paying a per-call
+        connection-open cost.
+
+        Why "cannot be pinned" matters (task 2388): ``_get_connection``'s
+        cached WRITE connection is opened via ``connect_daemon(str(db_path))``
+        *without* ``isolation_level=None`` — Python sqlite3's legacy
+        deferred transaction mode. If a read transaction is ever left open
+        on that connection, every subsequent read on it — including the
+        ``get_task``/``get_tasks`` tree read, which still uses it (task 2455
+        did not touch it) — is pinned to that transaction's WAL snapshot and
+        silently returns stale data, even after other connections/processes
+        have committed newer writes. Before task 2455,
+        ``get_statuses``/``get_statuses_raw`` also shared that cached write
+        connection, so a pin made the tree read and the census go stale
+        *together* — they still agreed with each other, so
+        ``cross_verify_task_counts`` reported a false ``consistent: true``
+        instead of surfacing the drift. That history is why this method's
+        never-shared connection exists independently of whichever
+        connection ``get_statuses`` happens to use.
 
         Fails open to ``{}`` on any error (including a not-yet-created DB
         file) — this is a best-effort freshness upgrade for a cross-check,
-        never a reason to raise into the reconciliation cycle.
+        never a reason to raise into the reconciliation cycle. Contrast
+        :meth:`get_statuses_raw`, which must propagate errors rather than
+        fail open — see its docstring's "Snapshot consistency" note for the
+        related caveat about reading it alongside :meth:`get_task`/
+        :meth:`get_tasks`.
 
         Args:
             project_root: Absolute path to the project root.
