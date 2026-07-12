@@ -15,7 +15,6 @@ import pytest
 from _recording_event_store import _RecordingEventStore
 
 from orchestrator.config import OrchestratorConfig
-from orchestrator.event_store import EventType
 from orchestrator.overrides import OverrideRow, OverrideStore
 from orchestrator.scheduler import _CONTINUE, Scheduler, TickContext, TickOutcome
 
