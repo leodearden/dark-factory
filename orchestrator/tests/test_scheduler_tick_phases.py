@@ -9,6 +9,7 @@ suite that exercises full ticks end-to-end.
 
 import dataclasses
 import inspect
+from datetime import UTC, datetime, timedelta
 from unittest.mock import AsyncMock
 
 import pytest
@@ -116,8 +117,8 @@ class TestHygienePhases:
 
 
 class TestBackfillDepStatusPhase:
-    """Isolation test for the backfill_dep_status phase (phase 1/18) — the
-    dep-status backfill that consumes ``_iter_pending_deps_in`` (task 2124)."""
+    """Isolation test for the backfill_dep_status phase — the dep-status
+    backfill that consumes ``_iter_pending_deps_in`` (task 2124)."""
 
     @pytest.mark.asyncio
     async def test_phase_backfill_consumes_iter_helper(self, scheduler: Scheduler):
@@ -142,6 +143,7 @@ class TestBackfillDepStatusPhase:
 
 class TestPolicySelectionPrepPhases:
     """Isolation tests for the Policy/selection-prep phases (external_dep_policy,
+    stamp_milestone, override_snapshot_gc, reserve_now, override_diff,
     build_candidates, starvation) — each calls its ``_phase_*`` method directly
     against a hand-built ``TickContext``, no full-tick orchestration."""
 
@@ -202,11 +204,168 @@ class TestPolicySelectionPrepPhases:
 
         assert result is _CONTINUE
 
+    @pytest.mark.asyncio
+    async def test_phase_reserve_now_installs_parks_and_clears_flag(self, tmp_path):
+        config = OrchestratorConfig(max_per_module=1)
+        store = OverrideStore(tmp_path / 'o.db')
+        scheduler = Scheduler(config, override_store=store)
+        scheduler.finish_startup()
+        scheduler._project_root = '/proj'
+        store.set_override('/proj', 'A', reserve_now=True)
+
+        task = {
+            'id': 'A', 'status': 'pending', 'dependencies': [],
+            'metadata': {'files': ['mod_a/x.py']}, 'priority': 'medium',
+        }
+        reserve_row = OverrideRow(
+            boost_tier=None, pinned=False, pin_order=None, reserve_now=True,
+            ttl_until=None,
+        )
+        ctx = TickContext(
+            tasks=[task],
+            status_map={'A': 'pending'},
+            tasks_by_id={'A': task},
+            overrides={'A': reserve_row},
+        )
+
+        result = await scheduler._phase_reserve_now(ctx)
+
+        assert result is _CONTINUE
+        # ctx.overrides_for_diff is snapshotted BEFORE the short-circuit, so it
+        # still shows the pre-consumption reserve_now=True (needed so
+        # _phase_override_diff can still see the False→True transition).
+        assert ctx.overrides_for_diff['A'].reserve_now is True
+        # ctx.overrides is rewritten in place once the flag is consumed.
+        assert ctx.overrides['A'].reserve_now is False
+        # The durable store's flag is cleared too.
+        assert store.get_overrides('/proj')['A'].reserve_now is False
+        # Parks were eagerly installed on A's modules.
+        assert scheduler.lock_table.has_parks('A')
+
+    @pytest.mark.asyncio
+    async def test_phase_override_diff_seeds_without_emitting_on_first_tick(self):
+        event_store = _RecordingEventStore()
+        config = OrchestratorConfig(max_per_module=1)
+        scheduler = Scheduler(config, event_store=event_store)  # type: ignore[arg-type]
+        scheduler.finish_startup()
+        assert scheduler._overrides_initialized is False
+
+        row = OverrideRow(
+            boost_tier='high', pinned=False, pin_order=None, reserve_now=False,
+            ttl_until=None,
+        )
+        ctx = TickContext(
+            tasks=[], status_map={}, tasks_by_id={},
+            overrides={'A': row}, overrides_for_diff={'A': row},
+        )
+
+        result = await scheduler._phase_override_diff(ctx)
+
+        assert result is _CONTINUE
+        # First tick after a (re)start: seeds the snapshot but emits nothing —
+        # diffing against an empty prev snapshot would otherwise fabricate a
+        # spurious priority_override_set event for every pre-existing override.
+        assert event_store.events == []
+        assert scheduler._overrides_initialized is True
+        assert scheduler._prev_overrides_snapshot == {'A': row}
+
+    @pytest.mark.asyncio
+    async def test_phase_override_diff_emits_on_subsequent_tick(self):
+        event_store = _RecordingEventStore()
+        config = OrchestratorConfig(max_per_module=1)
+        scheduler = Scheduler(config, event_store=event_store)  # type: ignore[arg-type]
+        scheduler.finish_startup()
+        # Simulate "already past the first tick": initialized, with an empty
+        # prior snapshot so this tick's row reads as a fresh boost_tier set.
+        scheduler._overrides_initialized = True
+        scheduler._prev_overrides_snapshot = {}
+
+        row = OverrideRow(
+            boost_tier='high', pinned=False, pin_order=None, reserve_now=False,
+            ttl_until=None,
+        )
+        ctx = TickContext(
+            tasks=[], status_map={}, tasks_by_id={},
+            overrides={'A': row}, overrides_for_diff={'A': row},
+        )
+
+        result = await scheduler._phase_override_diff(ctx)
+
+        assert result is _CONTINUE
+        boost_events = [
+            e for e in event_store.events if e[0] == 'priority_override_set'
+        ]
+        assert len(boost_events) == 1
+        assert boost_events[0][1]['task_id'] == 'A'
+        assert boost_events[0][1]['data'] == {'boost_tier': 'high'}
+        assert scheduler._prev_overrides_snapshot == {'A': row}
+
+    @pytest.mark.asyncio
+    async def test_phase_override_snapshot_gc_clears_terminal_and_expired(
+        self, tmp_path
+    ):
+        config = OrchestratorConfig(max_per_module=1)
+        store = OverrideStore(tmp_path / 'o.db')
+        scheduler = Scheduler(config, override_store=store)
+        scheduler.finish_startup()
+        scheduler._project_root = '/proj'
+
+        store.set_override('/proj', 'DONE', boost_tier='high')
+        store.set_override(
+            '/proj', 'EXPIRED', boost_tier='high',
+            ttl_until=datetime.now(UTC) - timedelta(seconds=1),
+        )
+        store.set_override('/proj', 'LIVE', boost_tier='high')
+
+        expired_task = {'id': 'EXPIRED', 'status': 'pending', 'dependencies': []}
+        live_task = {'id': 'LIVE', 'status': 'pending', 'dependencies': []}
+        ctx = TickContext(
+            tasks=[expired_task, live_task],
+            status_map={'DONE': 'done', 'EXPIRED': 'pending', 'LIVE': 'pending'},
+            # 'DONE' intentionally absent from tasks_by_id — mirrors the
+            # active-only get_tasks() filter dropping terminal tasks, and
+            # exercises the terminal-OR-missing branch distinctly from the
+            # separate TTL-elapsed branch that clears 'EXPIRED' below.
+            tasks_by_id={'EXPIRED': expired_task, 'LIVE': live_task},
+        )
+
+        result = await scheduler._phase_override_snapshot_gc(ctx)
+
+        assert result is _CONTINUE
+        assert set(ctx.overrides) == {'LIVE'}
+        remaining = store.get_overrides('/proj')
+        assert 'DONE' not in remaining, 'terminal-status override must be GC-ed'
+        assert 'EXPIRED' not in remaining, 'TTL-elapsed override must be GC-ed'
+        assert 'LIVE' in remaining
+
+    @pytest.mark.asyncio
+    async def test_phase_stamp_milestone_stamps_when_deps_satisfied(
+        self, scheduler: Scheduler
+    ):
+        task = {
+            'id': 'T', 'status': 'pending', 'dependencies': [],
+            'metadata': {'milestone': {'mode': 'delayed', 'after_secs': 600}},
+        }
+        ctx = TickContext(
+            tasks=[task], status_map={'T': 'pending'}, tasks_by_id={'T': task},
+        )
+        scheduler.update_task = AsyncMock(return_value=True)
+
+        result = await scheduler._phase_stamp_milestone(ctx)
+
+        assert result is _CONTINUE
+        scheduler.update_task.assert_awaited_once()
+        assert scheduler.update_task.await_args is not None
+        args, kwargs = scheduler.update_task.await_args
+        assert args[0] == 'T'
+        assert 'milestone_deps_satisfied_at' in args[1]
+        assert kwargs.get('metadata_mode') == 'merge'
+
 
 class TestSelectionPhases:
     """Isolation tests for the Selection phases (empty_candidate_gate,
-    select_pins, select_scored) — each calls its ``_phase_*`` method
-    directly against a hand-built ``TickContext``, no full-tick
+    psi_gate, select_pins, select_scored) — each calls its ``_phase_*``
+    method directly against a hand-built ``TickContext``, no full-tick
     orchestration."""
 
     @pytest.mark.asyncio
@@ -407,6 +566,28 @@ class TestSelectionPhases:
             'the pin loop runs first and hits the deferral first'
         )
         assert ctx.dispatch_deferred_emitted is True
+
+    @pytest.mark.asyncio
+    async def test_phase_psi_gate_fails_open_on_unreadable_sample(
+        self, scheduler: Scheduler
+    ):
+        """DA-D6 fail-open: an unreadable PSI sample (``read_ok=False``) must
+        never hold dispatch, even though every raw metric looks saturated —
+        ``saturated()`` is unconditionally False when ``read_ok`` is False."""
+        scheduler._read_psi_sample = lambda: PsiSample(
+            cpu_some10=99.0, mem_some10=99.0, mem_full10=99.0, io_some10=99.0,
+            read_ok=False,
+        )
+        scheduler._dispatched.update({'X', 'Y'})  # in_flight >= min_inflight_floor
+        ctx = TickContext(tasks=[], status_map={}, tasks_by_id={})
+
+        result = await scheduler._phase_psi_gate(ctx)
+
+        assert result is _CONTINUE
+        assert ctx.psi_sample is not None
+        assert ctx.psi_sample.read_ok is False
+        assert ctx.psi_hold is False, 'an unreadable PSI sample must fail OPEN'
+        assert ctx.psi_in_flight == len(scheduler._dispatched)
 
 
 class TestTickPhaseOrderLiteral:
