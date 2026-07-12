@@ -7,6 +7,7 @@ import pytest
 from orchestrator.artifacts import TaskArtifacts
 from orchestrator.mcp.verdict_tools import (
     _submit_completion_verdict,
+    _submit_merge_disposition,
     _submit_review_verdict,
     _submit_triage,
 )
@@ -109,3 +110,35 @@ class TestSubmitTriage:
             'skipped': [],
             'proposed_task_groups': proposed_task_groups,
         }
+
+
+class TestSubmitMergeDisposition:
+    def test_writes_envelope_not_blocked(self, artifacts):
+        result = _submit_merge_disposition(
+            artifacts,
+            role='merger',
+            session_id='s',
+            blocked=False,
+            reason='',
+        )
+        assert result == {'status': 'ok', 'role': 'merger'}
+
+        envelope = artifacts.read_verdict('merger')
+        assert envelope is not None
+        assert envelope['role'] == 'merger'
+        assert envelope['verdict'] == {'blocked': False, 'reason': ''}
+
+    def test_writes_envelope_blocked_with_reason(self, artifacts):
+        result = _submit_merge_disposition(
+            artifacts,
+            role='merger',
+            session_id='s',
+            blocked=True,
+            reason='conflict',
+        )
+        assert result == {'status': 'ok', 'role': 'merger'}
+
+        envelope = artifacts.read_verdict('merger')
+        assert envelope is not None
+        assert envelope['role'] == 'merger'
+        assert envelope['verdict'] == {'blocked': True, 'reason': 'conflict'}
