@@ -739,6 +739,24 @@ class TestDeriveTruthRemainingFields:
 
         scheduler.get_task.assert_awaited_once_with('24')
 
+    async def test_resolves_worktree_path_exactly_once(self, tmp_path: Path) -> None:
+        # worktree_resolver(tid) backs both `worktree_present` and
+        # `_resolve_live_claimant`'s plan.lock read; derive_truth must call
+        # it exactly ONCE and share the resulting Path between the two,
+        # mirroring the task-row single-fetch discipline above (review
+        # finding #2). A bound plan.lock (and no db claimant) is required
+        # to exercise the plan.lock leg that previously re-resolved.
+        TaskArtifacts(tmp_path).root.mkdir(parents=True)
+        TaskArtifacts(tmp_path).lock_plan('sess-29-abc123')
+        task = {'status': 'pending', 'claimant_run_id': None, 'heartbeat_at': None}
+        scheduler = _fake_scheduler(is_actively_held=False, task=task)
+        worktree_resolver = MagicMock(side_effect=lambda tid: tmp_path)
+        resolver = _make_ground_truth(scheduler=scheduler, worktree_resolver=worktree_resolver)
+
+        await resolver.derive_truth('29')
+
+        worktree_resolver.assert_called_once_with('29')
+
 
 # ---------------------------------------------------------------------------
 # step-13 — recovery_for(tid): the derive_truth -> classify_recovery seam

@@ -209,17 +209,21 @@ class TaskGroundTruth:
         in-memory/db/plan.lock liveness signals — see
         :meth:`_resolve_live_claimant`. The task row is fetched exactly
         ONCE here and shared across ``db_status``, the db-claimant leg of
-        ``live_claimant``, and ``deploy_phase`` — no second fetch.
+        ``live_claimant``, and ``deploy_phase`` — no second fetch. Likewise,
+        ``worktree_resolver(tid)`` is called exactly ONCE here and the
+        resulting path is shared with ``_resolve_live_claimant``'s
+        plan.lock read — no second resolve (review finding #2).
         """
         branch_state = await self._resolve_branch_state(tid)
         task = await self.scheduler.get_task(tid) or {}
         metadata = task.get('metadata')
         deploy_state = DeployState.from_metadata(metadata) if isinstance(metadata, dict) else None
+        worktree_path = self.worktree_resolver(tid)
         return TruthReport(
             db_status=task.get('status') or '',
-            live_claimant=self._resolve_live_claimant(tid, task),
+            live_claimant=self._resolve_live_claimant(tid, task, worktree_path),
             branch_state=branch_state,
-            worktree_present=self.worktree_resolver(tid).exists(),
+            worktree_present=worktree_path.exists(),
             open_escalations=self._resolve_open_escalations(tid),
             deploy_phase=deploy_state.phase if deploy_state is not None else None,
         )
@@ -278,7 +282,7 @@ class TaskGroundTruth:
             return BranchState(BranchStateKind.GONE_WITH_MERGE_MARKER, marker_sha)
         return BranchState(BranchStateKind.GONE_NO_MARKER)
 
-    def _resolve_live_claimant(self, tid: str, task: dict) -> Claimant | None:
+    def _resolve_live_claimant(self, tid: str, task: dict, worktree_path: Path) -> Claimant | None:
         """Resolve *tid*'s live claimant (TG-3), folding three signals in
         priority order:
 
@@ -311,8 +315,11 @@ class TaskGroundTruth:
         left to a follow-up if this edge case proves to matter in practice.
 
         *task* is the already-fetched row (:meth:`derive_truth` fetches it
-        exactly once and shares it across every field that needs it) — this
-        method makes no I/O of its own beyond the plan.lock read.
+        exactly once and shares it across every field that needs it) and
+        *worktree_path* is :meth:`derive_truth`'s single
+        ``worktree_resolver(tid)`` resolution (also shared with
+        ``worktree_present``, review finding #2) — this method makes no I/O
+        of its own beyond the plan.lock read under *worktree_path*.
         """
         if self.scheduler.is_actively_held(tid):
             return Claimant(run_id=None, heartbeat_at=None, source=ClaimantSource.IN_MEMORY)
@@ -328,7 +335,7 @@ class TaskGroundTruth:
             )
 
         try:
-            lock_data = TaskArtifacts(self.worktree_resolver(tid)).read_plan_lock()
+            lock_data = TaskArtifacts(worktree_path).read_plan_lock()
         except (json.JSONDecodeError, OSError):
             # A truncated/corrupt plan.lock is a realistic outcome of the
             # very crash this resolver recovers from — degrade to "no
