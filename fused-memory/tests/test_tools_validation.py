@@ -347,3 +347,76 @@ class TestGetEntityEdgeLimitMCPTool:
         assert call_kwargs.get('edge_limit') == 1000, (
             f"edge_limit=5000 must be clamped to 1000, got: {call_kwargs.get('edge_limit')!r}"
         )
+
+
+class TestSubmitTaskPremiseLintGuard:
+    """submit_task premise-lint guard xi (task 2231/W5-xi) — boundary test.
+
+    The unit-level invariant matrix for premise_lint_error lives in
+    test_premise_lint_guard.py; these tests assert the guard is WIRED into
+    the submit_task tool boundary, mirroring TestToolsValidationIntegration's
+    create_mcp_server(mock_service, task_interceptor=mock_task_interceptor) +
+    assert_not_called() pattern: a recon-stage caller whose description
+    asserts a known-false premise about recon internals is rejected BEFORE
+    the interceptor is reached, while a clean description from the same
+    caller reaches the interceptor unchanged.
+    """
+
+    @pytest.mark.asyncio
+    async def test_submit_task_recon_stage_false_premise_rejected(self, monkeypatch):
+        """A recon-stage submit_task whose description asserts run_id
+        persists across cycles is rejected with a ValidationError naming the
+        violated invariant and never reaches the interceptor."""
+        # Synthetic project_root ('/project') isn't a real git working tree;
+        # stub resolve_main_checkout to pass it through unchanged, mirroring
+        # test_task_tools.py's passthrough_main_checkout fixture.
+        monkeypatch.setattr(
+            'fused_memory.server.tools.resolve_main_checkout', lambda p: str(p),
+        )
+        mock_service = AsyncMock()
+        mock_task_interceptor = AsyncMock()
+        server = create_mcp_server(mock_service, task_interceptor=mock_task_interceptor)
+
+        result = await server._tool_manager.call_tool(
+            'submit_task',
+            {
+                'project_root': '/project',
+                'prompt': 'Fix the ledger',
+                'description': 'Fix the bug where run_id persists across cycles in the ledger.',
+                'agent_id': 'recon-stage-task_knowledge_sync',
+                'metadata': {'execution_class': 'code_tdd'},
+            },
+        )
+
+        parsed = _parse_tool_result(result)
+        assert parsed.get('error_type') == 'ValidationError', f'got {parsed!r}'
+        assert 'run_id_is_fresh_per_run' in parsed.get('error', ''), f'got {parsed!r}'
+        mock_task_interceptor.submit_task.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_submit_task_recon_stage_clean_description_accepted(self, monkeypatch):
+        """A recon-stage submit_task with a clean description (no known
+        false premise) is accepted and reaches the interceptor — premise-lint
+        does not block clean recon submits."""
+        monkeypatch.setattr(
+            'fused_memory.server.tools.resolve_main_checkout', lambda p: str(p),
+        )
+        mock_service = AsyncMock()
+        mock_task_interceptor = AsyncMock()
+        mock_task_interceptor.submit_task.return_value = {'ticket': 'tkt_x'}
+        server = create_mcp_server(mock_service, task_interceptor=mock_task_interceptor)
+
+        result = await server._tool_manager.call_tool(
+            'submit_task',
+            {
+                'project_root': '/project',
+                'prompt': 'Reconcile task 7',
+                'description': 'Reconcile task 7 status against the knowledge graph.',
+                'agent_id': 'recon-stage-task_knowledge_sync',
+                'metadata': {'execution_class': 'code_tdd'},
+            },
+        )
+
+        parsed = _parse_tool_result(result)
+        assert 'error' not in parsed, f'got {parsed!r}'
+        mock_task_interceptor.submit_task.assert_awaited_once()
