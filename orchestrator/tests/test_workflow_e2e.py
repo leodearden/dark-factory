@@ -1836,6 +1836,12 @@ def _make_dismissing_steward(queue: EscalationQueue, task_id: str) -> type:
         def __init__(self, wt_path, cfg_dir):  # noqa: ARG002
             pass
 
+        def set_outcome_channel(self, channel) -> None:  # noqa: ARG002
+            pass
+
+        def set_wip_probe(self, probe) -> None:  # noqa: ARG002
+            pass
+
         async def start(self) -> None:
             pending = queue.get_by_task(task_id, status='pending', level=0)
             assert pending, 'expected at least one pending L0 escalation to dismiss'
@@ -1870,6 +1876,12 @@ def _make_resolve_then_dismiss_chained_steward(
 
     class _FakeSteward:
         def __init__(self, wt_path, cfg_dir):  # noqa: ARG002
+            pass
+
+        def set_outcome_channel(self, channel) -> None:  # noqa: ARG002
+            pass
+
+        def set_wip_probe(self, probe) -> None:  # noqa: ARG002
             pass
 
         async def start(self) -> None:
@@ -5216,6 +5228,12 @@ def _make_l1_escalating_steward(
         def __init__(self, wt_path, cfg_dir):  # noqa: ARG002
             pass
 
+        def set_outcome_channel(self, channel) -> None:  # noqa: ARG002
+            pass
+
+        def set_wip_probe(self, probe) -> None:  # noqa: ARG002
+            pass
+
         async def start(self) -> None:
             pending = queue.get_by_task(task_id, status='pending', level=0)
             for esc in pending:
@@ -6328,6 +6346,12 @@ def _make_done_setting_steward(
     """
     class _FakeSteward:
         def __init__(self, wt_path, cfg_dir):  # noqa: ARG002
+            pass
+
+        def set_outcome_channel(self, channel) -> None:  # noqa: ARG002
+            pass
+
+        def set_wip_probe(self, probe) -> None:  # noqa: ARG002
             pass
 
         async def start(self) -> None:

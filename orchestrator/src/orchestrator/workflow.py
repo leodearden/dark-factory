@@ -880,6 +880,11 @@ class TaskWorkflow:
 
         self._steward_factory = steward_factory
         self._steward: Any | None = None
+        # In-process StewardOutcome channel (task 2248 / W9-delta): created
+        # lazily in _ensure_steward_started and registered on the steward via
+        # set_outcome_channel — replaces the escalation-queue forensic re-read
+        # that _mark_blocked used to perform.
+        self._steward_outcome_channel: asyncio.Queue | None = None
         self._config_dir: TaskConfigDir | None = None
         self._old_plan_base: str | None = None  # base commit from prior session (for revalidation diff)
         # Base commit for the current run's worktree (set in run() right after
@@ -9350,6 +9355,22 @@ Update the plan to address the blocking issues. You may add new steps to the `st
             f'to steward ({esc.id})'
         )
 
+    async def _worktree_has_wip_commits(self) -> bool:
+        """Whether this task's worktree holds work worth resuming (task 2248).
+
+        Wraps ``git_ops.worktree_has_unsaved_work`` (commits-beyond-main ∨
+        dirty-tree, fail-safe ``True``) — the single wip-derivation primitive
+        shared with the steward's own ``_wip_probe`` (injected below in
+        :meth:`_ensure_steward_started`), so wip is derived exactly once
+        rather than guessed independently by each side. Returns ``False``
+        (not the primitive's fail-safe ``True``) when there is no
+        worktree/git_ops to inspect at all — an absent worktree cannot hold
+        WIP worth resuming.
+        """
+        if self.worktree is None or self.git_ops is None:
+            return False
+        return await self.git_ops.worktree_has_unsaved_work(self.worktree, self.task_id)
+
     async def _ensure_steward_started(self) -> None:
         """Start the steward lazily on first call, if factory was provided."""
         if self._steward is not None:
@@ -9365,6 +9386,14 @@ Update the plan to address the blocking issues. You may add new steps to the `st
                 return
         steward = self._steward_factory(self.worktree, self._config_dir)
         self._steward = steward
+        # Wire the in-process StewardOutcome channel + this workflow's own
+        # wip probe onto the freshly-built steward (task 2248 / W9-delta,
+        # SO-1): the queue is lazily created here (not eagerly in __init__)
+        # so a task that never starts a steward never allocates one.
+        if self._steward_outcome_channel is None:
+            self._steward_outcome_channel = asyncio.Queue()
+        steward.set_outcome_channel(self._steward_outcome_channel)
+        steward.set_wip_probe(self._worktree_has_wip_commits)
         await steward.start()
 
     async def _await_cancellable(self, awaitable, *, on_soft_cancel=None):
