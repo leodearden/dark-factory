@@ -3977,6 +3977,103 @@ class Scheduler:
     # (proceed to the next phase) or a `TickOutcome` (end the tick with that
     # assignment). Docstrings declare each phase's ctx reads/writes.
 
+    async def _phase_backfill_dep_status(self, ctx: TickContext) -> object:
+        """Phase 1/18: backfill dep-status for local deps missing from status_map.
+
+        Reads: ``ctx.tasks``. Writes: ``ctx.status_map`` (updated in place
+        on a clean backfill; left as-is — fail-safe-wait — on a degraded
+        resolver result). Correctness crux (γ2): the active-only
+        ``get_tasks`` filter drops terminal tasks from the result, so
+        dep-ids referencing DONE/CANCELLED tasks are absent from
+        ``ctx.status_map``, and ``_deps_satisfied`` reads
+        ``status_map.get(dep_id, 'unknown')`` — those deps would block
+        dispatching forever without this backfill. Consumes
+        ``_iter_pending_deps_in`` (task 2124) for all three inner passes
+        (degraded-bump, recovered-clear, still-missing-bump) — CONSUMED
+        here, not re-collapsed into a hand loop. Always continues.
+        """
+        _all_dep_ids: set[str] = set()
+        for _t in ctx.tasks:
+            for _d in (_t.get('dependencies') or []):
+                _dep_id = str(
+                    _d.get('id', _d) if isinstance(_d, dict) else _d
+                )
+                if _dep_id:
+                    _all_dep_ids.add(_dep_id)
+        _missing_dep_ids = sorted(_all_dep_ids - set(ctx.status_map))
+        if _missing_dep_ids:
+            _backfilled, _backfill_err = await self.get_statuses(
+                ids=_missing_dep_ids
+            )
+            if resolver_failed(_backfilled, _backfill_err):
+                logger.warning(
+                    'acquire_next: dep-status backfill degraded '
+                    '(err=%r, missing_dep_ids=%r) — affected pending tasks '
+                    'held fail-safe-wait',
+                    _backfill_err,
+                    _missing_dep_ids,
+                )
+                for _tid, _dep_id in _iter_pending_deps_in(ctx.tasks, _missing_dep_ids):
+                    _cnt = self._streak_local_backfill.bump((_tid, _dep_id))
+                    # Reuse max_external_dep_unresolved_cycles as the
+                    # grace threshold — same "consecutive ticks before
+                    # loud escalation" semantics as the external-dep
+                    # resolver-degraded path being mirrored here.
+                    # A dedicated max_local_backfill_unresolved_cycles
+                    # field is deferred (config.py is out of scope).
+                    if _cnt >= self.config.max_external_dep_unresolved_cycles:
+                        logger.warning(
+                            'acquire_next: local dep backfill unresolved '
+                            'for %d consecutive ticks '
+                            '(task=%s, dep=%s) — possible scheduler '
+                            'degradation',
+                            _cnt,
+                            _tid,
+                            _dep_id,
+                        )
+            else:
+                ctx.status_map.update(_backfilled)
+                # Reset the consecutive-tick counters for deps that resolved
+                # successfully in this backfill — mirrors the
+                # _external_unresolved_counts.pop(...) on the 'done' branch in
+                # _apply_external_dep_policy.  Without this reset, a dep that
+                # degrades → recovers → degrades again accumulates across the
+                # gap, making the "consecutive" counters and warning messages
+                # misreport the streak length.
+                for _tid, _dep_id in _iter_pending_deps_in(ctx.tasks, _backfilled):
+                    self._streak_local_backfill.clear((_tid, _dep_id))
+                # Partial-response guard: get_statuses returned a valid
+                # (non-error) dict that is still missing some of the requested
+                # dep ids.  Treat those still-missing ids as degraded — warn +
+                # bump counter — mirroring the missing-key guard in
+                # get_external_statuses (~1545).  The absent ids stay out of
+                # status_map so _deps_satisfied returns False → fail-safe-wait,
+                # now VISIBLE rather than a silent idle.
+                _still_missing = set(_missing_dep_ids) - set(_backfilled)
+                if _still_missing:
+                    logger.warning(
+                        'acquire_next: dep-status backfill returned partial '
+                        'result (missing %d/%d dep ids: %r) — affected '
+                        'pending tasks held fail-safe-wait',
+                        len(_still_missing),
+                        len(_missing_dep_ids),
+                        sorted(_still_missing),
+                    )
+                    for _tid, _dep_id in _iter_pending_deps_in(ctx.tasks, _still_missing):
+                        _cnt = self._streak_local_backfill.bump((_tid, _dep_id))
+                        # Same threshold as the degraded path above.
+                        if _cnt >= self.config.max_external_dep_unresolved_cycles:
+                            logger.warning(
+                                'acquire_next: local dep absent from '
+                                'backfill for %d consecutive ticks '
+                                '(task=%s, dep=%s) — possible '
+                                'scheduler degradation',
+                                _cnt,
+                                _tid,
+                                _dep_id,
+                            )
+        return _CONTINUE
+
     async def _phase_drain_park_eviction(self, ctx: TickContext) -> object:
         """Hygiene phase 2/18: drain queued operator force-evict requests.
 
@@ -4176,87 +4273,7 @@ class Scheduler:
         # call (~95% smaller payload per γ1's get_statuses path).  In unit tests
         # whose get_tasks mocks return the full set (incl. done deps), status_map
         # is already complete → missing_dep_ids is empty → zero get_statuses calls.
-        _all_dep_ids: set[str] = set()
-        for _t in tasks:
-            for _d in (_t.get('dependencies') or []):
-                _dep_id = str(
-                    _d.get('id', _d) if isinstance(_d, dict) else _d
-                )
-                if _dep_id:
-                    _all_dep_ids.add(_dep_id)
-        _missing_dep_ids = sorted(_all_dep_ids - set(status_map))
-        if _missing_dep_ids:
-            _backfilled, _backfill_err = await self.get_statuses(
-                ids=_missing_dep_ids
-            )
-            if resolver_failed(_backfilled, _backfill_err):
-                logger.warning(
-                    'acquire_next: dep-status backfill degraded '
-                    '(err=%r, missing_dep_ids=%r) — affected pending tasks '
-                    'held fail-safe-wait',
-                    _backfill_err,
-                    _missing_dep_ids,
-                )
-                for _tid, _dep_id in _iter_pending_deps_in(tasks, _missing_dep_ids):
-                    _cnt = self._streak_local_backfill.bump((_tid, _dep_id))
-                    # Reuse max_external_dep_unresolved_cycles as the
-                    # grace threshold — same "consecutive ticks before
-                    # loud escalation" semantics as the external-dep
-                    # resolver-degraded path being mirrored here.
-                    # A dedicated max_local_backfill_unresolved_cycles
-                    # field is deferred (config.py is out of scope).
-                    if _cnt >= self.config.max_external_dep_unresolved_cycles:
-                        logger.warning(
-                            'acquire_next: local dep backfill unresolved '
-                            'for %d consecutive ticks '
-                            '(task=%s, dep=%s) — possible scheduler '
-                            'degradation',
-                            _cnt,
-                            _tid,
-                            _dep_id,
-                        )
-            else:
-                status_map.update(_backfilled)
-                # Reset the consecutive-tick counters for deps that resolved
-                # successfully in this backfill — mirrors the
-                # _external_unresolved_counts.pop(...) on the 'done' branch in
-                # _apply_external_dep_policy.  Without this reset, a dep that
-                # degrades → recovers → degrades again accumulates across the
-                # gap, making the "consecutive" counters and warning messages
-                # misreport the streak length.
-                for _tid, _dep_id in _iter_pending_deps_in(tasks, _backfilled):
-                    self._streak_local_backfill.clear((_tid, _dep_id))
-                # Partial-response guard: get_statuses returned a valid
-                # (non-error) dict that is still missing some of the requested
-                # dep ids.  Treat those still-missing ids as degraded — warn +
-                # bump counter — mirroring the missing-key guard in
-                # get_external_statuses (~1545).  The absent ids stay out of
-                # status_map so _deps_satisfied returns False → fail-safe-wait,
-                # now VISIBLE rather than a silent idle.
-                _still_missing = set(_missing_dep_ids) - set(_backfilled)
-                if _still_missing:
-                    logger.warning(
-                        'acquire_next: dep-status backfill returned partial '
-                        'result (missing %d/%d dep ids: %r) — affected '
-                        'pending tasks held fail-safe-wait',
-                        len(_still_missing),
-                        len(_missing_dep_ids),
-                        sorted(_still_missing),
-                    )
-                    for _tid, _dep_id in _iter_pending_deps_in(tasks, _still_missing):
-                        _cnt = self._streak_local_backfill.bump((_tid, _dep_id))
-                        # Same threshold as the degraded path above.
-                        if _cnt >= self.config.max_external_dep_unresolved_cycles:
-                            logger.warning(
-                                'acquire_next: local dep absent from '
-                                'backfill for %d consecutive ticks '
-                                '(task=%s, dep=%s) — possible '
-                                'scheduler degradation',
-                                _cnt,
-                                _tid,
-                                _dep_id,
-                            )
-
+        await self._phase_backfill_dep_status(ctx)
         await self._phase_drain_park_eviction(ctx)
         await self._phase_park_gc(ctx)
 
