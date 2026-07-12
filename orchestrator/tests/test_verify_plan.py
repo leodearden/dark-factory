@@ -379,6 +379,7 @@ class TestDeriveVerifyPlanModulePath:
         # same parse_config_command transform sidesteps render()'s documented
         # cwd_rel-as-leading-`cd` normalisation (not always byte-identical to
         # a --directory-form input — see verify_cmd.render's docstring).
+        assert mc.test_command is not None
         assert run.cmd == parse_config_command(mc.test_command)
         assert 'conftest' in run.reason.lower()
 
@@ -397,6 +398,7 @@ class TestDeriveVerifyPlanModulePath:
         pyright_run = _run_for(plan, 'orchestrator', 'pyright:')
         assert pyright_run is not None
         assert pyright_run.scope_kind is ScopeKind.FULL_SUITE
+        assert mc.type_check_command is not None
         assert pyright_run.cmd == parse_config_command(mc.type_check_command)
         assert STRUCTURAL_DIFF[0] in pyright_run.reason
 
@@ -603,4 +605,5 @@ class TestPlanFlags:
         run = _run_for(plan, 'shared', 'pytest:')
         assert run is not None
         assert run.scope_kind is ScopeKind.FULL_SUITE
+        assert mc.test_command is not None
         assert run.cmd == parse_config_command(mc.test_command)

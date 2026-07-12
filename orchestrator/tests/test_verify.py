@@ -7297,6 +7297,7 @@ class TestRunScopedVerificationPlan:
             existing_files, module_configs, config, _real_worktree_reader(tmp_path),
         ).to_dict()
         assert result.plan == expected_plan
+        assert result.plan is not None
         # Sanity: this really is the "representative file-scoped" shape the
         # step description asks for, not an accidental SKIPPED/TRIVIAL plan.
         assert any(r['scope_kind'] == 'file_scoped' for r in result.plan['runs'])
@@ -7371,6 +7372,7 @@ class TestRunScopedVerificationPlan:
         )
 
         assert mock_run_verification.await_count == 1
+        assert mock_run_verification.await_args is not None
         called_module_config = mock_run_verification.await_args.args[2]
         assert 'structural.py' not in (called_module_config.type_check_command or ''), (
             'D2 gap not closed end-to-end — _build_fallback_config scoped pyright to '
