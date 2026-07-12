@@ -21,13 +21,16 @@ in :meth:`TaskGroundTruth.derive_truth` and :func:`classify_recovery` below.
 from __future__ import annotations
 
 import enum
+import os
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from typing import TYPE_CHECKING
 
 from shared.deploy_state import DeployPhase
+from shared.task_claimant import is_stranded
 from shared.task_statuses import TaskStatus
 
+from orchestrator.artifacts import TaskArtifacts
 from orchestrator.landed_outbox import MergeProvenance
 
 if TYPE_CHECKING:
@@ -141,6 +144,33 @@ def _utc_now() -> datetime:
 _DEFAULT_HEARTBEAT_TTL = timedelta(minutes=10)
 
 
+def _pid_alive(pid: int) -> bool:
+    """Return True if the process identified by *pid* is alive.
+
+    Duplicates ``orchestrator.harness._pid_alive`` (itself mirroring
+    fused-memory's ``orchestrator_detector.py:58-72``) rather than importing
+    it, to avoid a harness->task_ground_truth->harness circular import once
+    θ2 migrates the harness's reconcile sweeps to call derive_truth/
+    recovery_for.
+
+    - Returns False for pid <= 0 (invalid).
+    - Uses os.kill(pid, 0): success → alive; ProcessLookupError → dead;
+      PermissionError → alive (we can see it but lack permission to signal it);
+      other OSError → treat as dead.
+    """
+    if pid <= 0:
+        return False
+    try:
+        os.kill(pid, 0)
+        return True
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    except OSError:
+        return False
+
+
 class TaskGroundTruth:
     """Composes one task's DB/git/liveness/escalation/deploy signals into a
     single frozen :class:`TruthReport` (PRD §5.4).
@@ -174,16 +204,19 @@ class TaskGroundTruth:
         """Compose a fresh :class:`TruthReport` for *tid* (PRD §5.4).
 
         TG-1: ``branch_state`` resolves journal-first — see
-        :meth:`_resolve_branch_state`. The remaining fields are populated
-        incrementally as θ1 proceeds (db_status/worktree_present/
-        open_escalations/deploy_phase; live_claimant); until then they carry
+        :meth:`_resolve_branch_state`. TG-3: ``live_claimant`` folds the
+        in-memory/db/plan.lock liveness signals — see
+        :meth:`_resolve_live_claimant`. The remaining fields
+        (db_status/worktree_present/open_escalations/deploy_phase) are
+        populated incrementally as θ1 proceeds; until then they carry
         placeholder values that no meaningful shape maps onto in
         ``_RECOVERY`` below.
         """
         branch_state = await self._resolve_branch_state(tid)
+        live_claimant = await self._resolve_live_claimant(tid)
         return TruthReport(
             db_status='',
-            live_claimant=None,
+            live_claimant=live_claimant,
             branch_state=branch_state,
             worktree_present=False,
             open_escalations=[],
@@ -221,6 +254,53 @@ class TaskGroundTruth:
         if marker_sha:
             return BranchState(BranchStateKind.GONE_WITH_MERGE_MARKER, marker_sha)
         return BranchState(BranchStateKind.GONE_NO_MARKER)
+
+    async def _resolve_live_claimant(self, tid: str) -> Claimant | None:
+        """Resolve *tid*'s live claimant (TG-3), folding three signals in
+        priority order:
+
+        1. ``scheduler.is_actively_held(tid)`` — the in-memory public
+           accessor (task 2235). A hit short-circuits without fetching the
+           task row at all.
+        2. A fresh W2 db claimant: ``claimant_run_id`` present AND NOT
+           ``shared.task_claimant.is_stranded`` against the injected
+           ``now_fn``/``heartbeat_ttl``.
+        3. A live ``plan.lock`` (owner_pid alive) — consulted ONLY when the
+           db claimant is genuinely absent (pre-2182 rows predating the
+           claimant_run_id/heartbeat_at columns).
+
+        A present-but-stale db claimant (``is_stranded`` True) collapses
+        straight to ``None`` — it deliberately does NOT fall through to the
+        plan.lock check, which exists solely for the claimant-absent case.
+        """
+        if self.scheduler.is_actively_held(tid):
+            return Claimant(run_id=None, heartbeat_at=None, source=ClaimantSource.IN_MEMORY)
+
+        task = await self.scheduler.get_task(tid) or {}
+        claimant_run_id = task.get('claimant_run_id')
+        if claimant_run_id and str(claimant_run_id).strip():
+            if is_stranded(task, self.now_fn(), self.heartbeat_ttl):
+                return None
+            return Claimant(
+                run_id=claimant_run_id,
+                heartbeat_at=task.get('heartbeat_at'),
+                source=ClaimantSource.DB,
+            )
+
+        lock_data = TaskArtifacts(self.worktree_resolver(tid)).read_plan_lock()
+        if lock_data is not None:
+            owner_pid = lock_data.get('owner_pid')
+            try:
+                owner_alive = owner_pid is not None and _pid_alive(int(owner_pid))
+            except (TypeError, ValueError):
+                owner_alive = False
+            if owner_alive:
+                return Claimant(
+                    run_id=lock_data.get('session_id'),
+                    heartbeat_at=lock_data.get('locked_at'),
+                    source=ClaimantSource.PLAN_LOCK,
+                )
+        return None
 
 
 # ---------------------------------------------------------------------------

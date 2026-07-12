@@ -419,7 +419,9 @@ class TestDeriveTruthLiveClaimant:
     ) -> None:
         TaskArtifacts(tmp_path).root.mkdir(parents=True)
         TaskArtifacts(tmp_path).lock_plan('sess-13-abc123')
-        locked_at = TaskArtifacts(tmp_path).read_plan_lock()['locked_at']
+        lock_data = TaskArtifacts(tmp_path).read_plan_lock()
+        assert lock_data is not None
+        locked_at = lock_data['locked_at']
         task = {'status': 'pending', 'claimant_run_id': None, 'heartbeat_at': None}
         scheduler = _fake_scheduler(is_actively_held=False, task=task)
         resolver = _make_ground_truth(scheduler=scheduler, worktree_resolver=lambda tid: tmp_path)
