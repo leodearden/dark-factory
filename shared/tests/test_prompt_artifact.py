@@ -14,6 +14,7 @@ Built bottom-up in TDD order (see task 2492's plan.json):
 from __future__ import annotations
 
 import json
+from pathlib import Path
 
 import pytest
 from pydantic import ValidationError
@@ -23,6 +24,7 @@ from shared.prompt_artifact import (
     PromptArtifactStore,
     PromptSpec,
     compose_prompt,
+    default_artifacts_root,
 )
 
 
@@ -320,3 +322,26 @@ class TestFailSafeUnverifiablePin:
         assert resolved.text == spec.in_code_constant
         assert resolved.provenance is None
         assert resolved.source == 'in_code'
+
+
+class TestDefaultArtifactsRoot:
+    def test_env_override_wins(self, monkeypatch, tmp_path):
+        custom = tmp_path / 'custom-artifacts'
+        monkeypatch.setenv('DARK_FACTORY_PROMPT_ARTIFACTS', str(custom))
+
+        assert default_artifacts_root() == Path(custom)
+
+    def test_unset_env_anchors_at_monorepo_root(self, monkeypatch):
+        monkeypatch.delenv('DARK_FACTORY_PROMPT_ARTIFACTS', raising=False)
+
+        root = default_artifacts_root()
+
+        # Ends in data/prompt_artifacts...
+        assert root.name == 'prompt_artifacts'
+        assert root.parent.name == 'data'
+        # ...anchored at a directory that contains orchestrator/, fused-memory/,
+        # and shared/ (the monorepo root marker).
+        monorepo_root = root.parent.parent
+        assert (monorepo_root / 'orchestrator').is_dir()
+        assert (monorepo_root / 'fused-memory').is_dir()
+        assert (monorepo_root / 'shared').is_dir()
