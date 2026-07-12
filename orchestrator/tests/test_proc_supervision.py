@@ -15,6 +15,7 @@ inspector pattern in test_deterministic_runner.py (AsyncMock unit_inspector).
 
 from __future__ import annotations
 
+import shlex
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock
 
@@ -190,3 +191,77 @@ class TestConstruction:
                 on_failure_escalation=None,
                 verify=None,
             )
+
+
+# ---------------------------------------------------------------------------
+# step-3: RED — R1 own-unit self-restart cell (RP-2/3/4)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestSelfRestartSystemdRunArgv:
+    """own_unit == target_unit + transient_unit set -> DETACHED systemd-run
+    with the RP-3 --working-directory flag and the RP-4 /bin/sh -c on-failure
+    escalation wrapper. Never blocks (SCHEDULED), never escalates in-process
+    on the success path."""
+
+    async def test_self_restart_builds_systemd_run_argv_with_wrapper(
+        self, tmp_queue_dir: Path,
+    ) -> None:
+        from orchestrator.proc_supervision import (
+            EscalationSpec,
+            RestartDisposition,
+            RestartPlan,
+        )
+
+        runner = FakeRunner(returncode=0)
+        spec = EscalationSpec(
+            queue_dir=str(tmp_queue_dir),
+            task_id='task-99',
+            summary='Self-restart fire-time failure',
+        )
+        plan = RestartPlan(
+            script=Path('/proj/scripts/restart-orchestrator.sh'),
+            args=['--foo'],
+            cwd=Path('/proj'),
+            target_unit='orch.service',
+            own_unit='orch.service',
+            on_failure_escalation=spec,
+            verify=None,
+            transient_unit='orch-redeploy-restart-99.service',
+            on_active_secs=10,
+        )
+
+        outcome = await plan.execute(runner=runner)
+
+        assert len(runner.calls) == 1
+        argv, _kwargs = runner.calls[0]
+        assert argv[:7] == (
+            'systemd-run', '--user',
+            '--on-active=10',
+            '--unit=orch-redeploy-restart-99.service',
+            '--collect',
+            '--working-directory=/proj',
+            '/bin/sh',
+        )
+        assert argv[7] == '-c'
+        assert len(argv) == 9
+        wrapped = argv[8]
+
+        expected_payload = ' '.join(
+            shlex.quote(p) for p in ['/proj/scripts/restart-orchestrator.sh', '--foo']
+        )
+        assert wrapped.startswith(expected_payload)
+        assert '__rc=$?;' in wrapped
+        assert 'if [ "$__rc" -ne 0 ]; then' in wrapped
+        assert wrapped.rstrip().endswith('fi; exit "$__rc"')
+        # on-failure branch carries the escalation-submit argv (RP-4)
+        assert '-m escalation submit' in wrapped
+        assert '--task task-99' in wrapped
+
+        assert outcome.disposition == RestartDisposition.SCHEDULED
+        assert outcome.escalated is False
+
+        # Success path: no in-process escalation filed (the on-failure branch
+        # above only fires later, at systemd-run's deferred fire time).
+        assert read_escalations(tmp_queue_dir, 'task-99') == []
