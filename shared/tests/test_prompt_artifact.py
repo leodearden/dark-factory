@@ -194,3 +194,73 @@ class TestUnpinRollback:
 
         # Idempotent: nothing left to unpin the second time.
         assert store.unpin('reviewer', 'claude-opus-4', 'v1') is False
+
+
+class TestKeyIsolationAndPathSafety:
+    def test_pin_is_isolated_per_model_and_per_harness(self, tmp_path):
+        store = PromptArtifactStore(tmp_path)
+        spec = _make_spec()
+        provenance = ArtifactProvenance(**_provenance_kwargs(harness_version='v1'))
+        store.pin('reviewer', 'opus', 'v1', heuristics='opus-heuristic', provenance=provenance)
+
+        # Different executor_model, same harness_version -> falls back.
+        other_model = store.resolve(spec, executor_model='sonnet', harness_version='v1')
+        assert other_model.source == 'in_code'
+        assert other_model.text == spec.in_code_constant
+
+        # Same executor_model, different harness_version -> falls back.
+        other_harness = store.resolve(spec, executor_model='opus', harness_version='v2')
+        assert other_harness.source == 'in_code'
+        assert other_harness.text == spec.in_code_constant
+
+        # The original key still resolves to the pinned artifact.
+        same_key = store.resolve(spec, executor_model='opus', harness_version='v1')
+        assert same_key.source == 'artifact'
+
+    def test_router_resolved_model_id_with_slash_and_colon_round_trips(self, tmp_path):
+        store = PromptArtifactStore(tmp_path)
+        spec = _make_spec()
+        model_id = 'vendor/model-x:20260701'
+        provenance = ArtifactProvenance(**_provenance_kwargs(harness_version='v1'))
+        store.pin(
+            'reviewer', model_id, 'v1', heuristics='router-heuristic', provenance=provenance
+        )
+
+        resolved = store.resolve(spec, executor_model=model_id, harness_version='v1')
+
+        assert resolved.source == 'artifact'
+        assert resolved.text == compose_prompt(spec.contract, 'router-heuristic')
+        assert resolved.provenance == provenance
+
+    def test_distinct_model_ids_never_collide_on_disk(self, tmp_path):
+        store = PromptArtifactStore(tmp_path)
+        spec = _make_spec()
+        # These two distinct (executor_model, harness_version) pairs would
+        # collide under a naive '/'-joined path: root/reviewer/a/b/c for both.
+        provenance_first = ArtifactProvenance(**_provenance_kwargs(harness_version='b/c'))
+        provenance_second = ArtifactProvenance(**_provenance_kwargs(harness_version='c'))
+
+        store.pin('reviewer', 'a', 'b/c', heuristics='first', provenance=provenance_first)
+        store.pin('reviewer', 'a/b', 'c', heuristics='second', provenance=provenance_second)
+
+        first = store.resolve(spec, executor_model='a', harness_version='b/c')
+        second = store.resolve(spec, executor_model='a/b', harness_version='c')
+
+        assert first.source == 'artifact'
+        assert second.source == 'artifact'
+        assert first.text == compose_prompt(spec.contract, 'first')
+        assert second.text == compose_prompt(spec.contract, 'second')
+
+    def test_dotdot_segment_does_not_escape_store_root(self, tmp_path):
+        store = PromptArtifactStore(tmp_path)
+        spec = _make_spec(prompt_id='..')
+        provenance = ArtifactProvenance(**_provenance_kwargs(harness_version='v1'))
+
+        store.pin('..', 'opus', 'v1', heuristics='escape-attempt', provenance=provenance)
+
+        key_dir = store._key_dir('..', 'opus', 'v1')
+        assert key_dir.resolve().is_relative_to(tmp_path.resolve())
+
+        resolved = store.resolve(spec, executor_model='opus', harness_version='v1')
+        assert resolved.source == 'artifact'
+        assert resolved.text == compose_prompt(spec.contract, 'escape-attempt')
