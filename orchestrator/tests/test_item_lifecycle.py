@@ -363,3 +363,74 @@ class TestItemLifecycleTransitionRedispatchParkedEntryEdges:
         )
 
         assert registry.current(rid) == ItemLifecycleState.REDISPATCH_PARKED
+
+
+# ---------------------------------------------------------------------------
+# task 2435 (kappa-b) step-1 RED / step-2 GREEN: ItemLifecycle.non_terminal_items()
+# ---------------------------------------------------------------------------
+
+
+class TestItemLifecycleBulkAccessor:
+    """``ItemLifecycle.non_terminal_items() -> dict[str, ItemLifecycleState]``
+    is the bulk-iteration accessor kappa-b's ``snapshot()``/liveness registry
+    repoint and boundary test B8 need (task 2435, ARC 1).
+
+    RED until step-2 GREEN adds ``ItemLifecycle.non_terminal_items()``.
+    """
+
+    def test_empty_registry_returns_empty_dict(self) -> None:
+        from orchestrator.merge_queue import ItemLifecycle
+
+        registry = ItemLifecycle()
+
+        assert registry.non_terminal_items() == {}
+
+    def test_returns_exactly_the_non_terminal_state_mapping(self) -> None:
+        from orchestrator.merge_queue import ItemLifecycle, ItemLifecycleState
+
+        registry = ItemLifecycle()
+        registry.register('mr-aaaaaaaa')  # defaults to QUEUED
+        registry.register('mr-bbbbbbbb', initial=ItemLifecycleState.MERGING)
+        registry.register('mr-cccccccc', initial=ItemLifecycleState.VERIFYING)
+
+        assert registry.non_terminal_items() == {
+            'mr-aaaaaaaa': ItemLifecycleState.QUEUED,
+            'mr-bbbbbbbb': ItemLifecycleState.MERGING,
+            'mr-cccccccc': ItemLifecycleState.VERIFYING,
+        }
+
+    def test_terminal_rid_is_excluded(self) -> None:
+        """A rid transitioned to TERMINAL does not leak into the view --
+        retired items must not appear to still be in flight."""
+        from orchestrator.merge_queue import ItemLifecycle, ItemLifecycleState
+
+        registry = ItemLifecycle()
+        registry.register('mr-aaaaaaaa')
+        registry.register('mr-bbbbbbbb', initial=ItemLifecycleState.FINALIZING)
+
+        registry.transition(
+            'mr-bbbbbbbb', ItemLifecycleState.FINALIZING, ItemLifecycleState.TERMINAL,
+        )
+
+        assert registry.non_terminal_items() == {
+            'mr-aaaaaaaa': ItemLifecycleState.QUEUED,
+        }
+
+    def test_returned_dict_is_a_copy(self) -> None:
+        """Mutating the returned mapping must never corrupt the registry --
+        callers (snapshot(), B8) take ``set(non_terminal_items())`` freely
+        without risking a side effect on the live registry state."""
+        from orchestrator.merge_queue import ItemLifecycle, ItemLifecycleState
+
+        registry = ItemLifecycle()
+        registry.register('mr-aaaaaaaa')
+
+        view = registry.non_terminal_items()
+        view['mr-aaaaaaaa'] = ItemLifecycleState.TERMINAL
+        view['mr-zzzzzzzz'] = ItemLifecycleState.MERGING
+
+        assert registry.current('mr-aaaaaaaa') == ItemLifecycleState.QUEUED
+        assert registry.current('mr-zzzzzzzz') is None
+        assert registry.non_terminal_items() == {
+            'mr-aaaaaaaa': ItemLifecycleState.QUEUED,
+        }
