@@ -149,17 +149,20 @@ class EscalationRef:
 def mine_escalation_refs(esc_dir: Path) -> dict[str, list[EscalationRef]]:
     """Parse ``esc-<id>.json`` escalation records, keyed by task_id.
 
-    Only files matching ``esc-*.json`` are considered, which naturally
-    excludes ``*.json.lock`` sidecars (wrong suffix) and non-escalation
-    state files like ``b3-state.json`` (wrong prefix) — both of which live
-    alongside the real escalations in ``data/escalations/``.
+    Recurses: the real ``data/escalations/`` holds only ``*.lock``/``*.seq``
+    sentinels for currently-open escalations at its top level — resolved
+    records rotate into dated ``archive/<YYYY-MM-DD>/esc-<id>.json``
+    subdirectories, so a non-recursive glob would silently find nothing.
+    Only files matching ``esc-*.json`` (at any depth) are considered, which
+    naturally excludes ``*.json.lock`` sidecars (wrong suffix) and
+    non-escalation state files like ``b3-state.json`` (wrong prefix).
 
     Tolerates malformed JSON in an otherwise-matching file by skipping it
     rather than raising — offline mining over ~2,400 files must not abort
     on one bad record.
     """
     refs: dict[str, list[EscalationRef]] = {}
-    for path in sorted(esc_dir.glob('esc-*.json')):
+    for path in sorted(esc_dir.rglob('esc-*.json')):
         try:
             data = json.loads(path.read_text())
         except (json.JSONDecodeError, OSError):

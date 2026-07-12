@@ -212,6 +212,41 @@ def write_sample_escalations(esc_dir: Path) -> list[Path]:
     return written
 
 
+def write_archived_escalations(esc_dir: Path) -> list[Path]:
+    """Write an escalation record nested under a dated ``archive/`` subdirectory.
+
+    Mirrors the REAL ``data/escalations/`` layout: the flat top level holds
+    only ``*.lock``/``*.seq`` sentinels for currently-open escalations (see
+    ``write_sample_escalations``'s ``.lock`` noise) — resolved records
+    rotate into ``archive/<YYYY-MM-DD>/esc-<id>.json``. ``mine_escalation_refs``
+    must recurse to find them.
+    """
+    archive_dir = esc_dir / 'archive' / '2026-07-01'
+    archive_dir.mkdir(parents=True, exist_ok=True)
+    written: list[Path] = []
+
+    esc = {
+        'id': 'esc-404-1',
+        'task_id': '404',
+        'agent_role': 'reviewer',
+        'severity': 'blocking',
+        'category': 'review_suggestions',
+        'summary': 'Archived escalation summary',
+        'detail': 'Archived escalation detail',
+        'level': 0,
+        'status': 'resolved',
+    }
+    p = archive_dir / f'{esc["id"]}.json'
+    p.write_text(json.dumps(esc, indent=2))
+    written.append(p)
+
+    # A resolved escalation's lock sentinel can remain alongside it in the
+    # archive dir too -- must still be skipped by mine_escalation_refs.
+    (archive_dir / 'esc-404-1.json.lock').write_text('')
+
+    return written
+
+
 def make_git_repo_with_merge(tmp_path: Path) -> tuple[Path, str]:
     """Init a temp git repo and create a real (2-parent) merge commit.
 

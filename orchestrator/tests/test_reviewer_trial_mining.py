@@ -15,6 +15,7 @@ import pytest
 from _reviewer_trial_mining_fixtures import (
     build_synthetic_runs_db,
     make_git_repo_with_merge,
+    write_archived_escalations,
     write_sample_escalations,
 )
 from shared.cli_invoke import AgentResult
@@ -182,6 +183,27 @@ class TestMineEscalationRefs:
         esc_dir = tmp_path / 'empty_escalations'
         esc_dir.mkdir()
         assert mine_escalation_refs(esc_dir) == {}
+
+    def test_recurses_into_dated_archive_subdirectories(self, tmp_path: Path) -> None:
+        """The real data/escalations/ holds only *.lock/*.seq sentinels for
+        OPEN escalations at the top level; resolved records rotate into
+        dated archive/<YYYY-MM-DD>/esc-*.json subdirectories (discovered
+        running the miner against the real tree for step-18). Confirmed via
+        `find data/escalations/archive -name 'esc-*.json' | wc -l` = 1292
+        real records live there, invisible to a non-recursive glob."""
+        esc_dir = tmp_path / 'escalations'
+        write_archived_escalations(esc_dir)
+
+        refs = mine_escalation_refs(esc_dir)
+
+        assert '404' in refs
+        ref = refs['404'][0]
+        assert isinstance(ref, EscalationRef)
+        assert ref.task_id == '404'
+        assert ref.path.name == 'esc-404-1.json'
+        # The archived lock sentinel alongside it must still be skipped.
+        all_paths = [r.path.name for group in refs.values() for r in group]
+        assert 'esc-404-1.json.lock' not in all_paths
 
 
 class TestRecoverDiff:
