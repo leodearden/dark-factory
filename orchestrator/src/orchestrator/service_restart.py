@@ -38,8 +38,10 @@ from typing import TYPE_CHECKING
 if TYPE_CHECKING:
     from orchestrator.event_store import EventStore
     from orchestrator.git_ops import GitOps
+    from orchestrator.proc_supervision import EscalationSpec
 
 from orchestrator.event_store import EventType
+from orchestrator.proc_supervision import RestartDisposition, RestartPlan
 
 logger = logging.getLogger(__name__)
 
@@ -84,24 +86,21 @@ async def schedule_detached_systemd_restart(
     project_root: str | Path,
     transient_unit: str,
     on_active_secs: int,
+    on_failure_escalation: EscalationSpec | None = None,
     runner=None,
 ):
     """Schedule a detached, cgroup-escaping self-restart via ``systemd-run --user``.
 
-    Mirrors ``DeterministicRunner._default_schedule_detached_restart``'s argv
-    pattern but WITHOUT its ``/bin/sh`` on-failure escalation wrapper — an
-    accepted gap for this operator-gated rollout (see config.py's
-    ``orchestrator_restart_on_merge_enabled`` comment). Concretely: this
-    coroutine raises ONLY when the ``systemd-run`` *registration* itself
-    fails (rc != 0). Once registration succeeds it returns immediately (per
-    ``--on-active``, before the deferred payload has run), and the
-    coordinator's ``maybe_restart`` treats the fire as successful — it emits
-    the restart event and clears pending right away. A LATER fire-time
-    failure of ``scripts/restart-orchestrator.sh`` itself (e.g. a failed
-    MainPID/timestamp verify) is therefore NOT escalated anywhere
-    in-process; its only trace is the transient unit's journald output
-    (``journalctl --user -u <transient_unit>``). During the soak period,
-    operators should watch that log rather than relying on escalations.
+    Thin ``proc_supervision.RestartPlan`` caller (M1, task 2237) — the gap is
+    closed by RP-4: builds a same-unit plan (``own_unit=target_unit=
+    transient_unit``, ``verify=None``) which routes ``RestartPlan.execute()``
+    to the DETACHED systemd-run path, carrying ``--working-directory=<cwd>``
+    (RP-3) and, when *on_failure_escalation* is supplied, a ``/bin/sh -c``
+    on-failure escalation-submit wrapper (RP-4) so a LATER fire-time failure
+    of the deferred payload (e.g. a failed MainPID/timestamp verify inside
+    ``scripts/restart-orchestrator.sh``) files a born-at-L2 escalation
+    instead of being traceable only via journald
+    (``journalctl --user -u <transient_unit>``).
 
     ``--on-active=<on_active_secs>`` defers execution so this call returns
     immediately after *registering* the transient unit; the restart payload
@@ -126,6 +125,11 @@ async def schedule_detached_systemd_restart(
         ``orch-selfrestart-on-merge-3.service``).
     on_active_secs:
         Seconds to defer before the transient unit fires.
+    on_failure_escalation:
+        Optional ``EscalationSpec`` filed (via the RP-4 ``/bin/sh -c``
+        on-failure branch) if the deferred payload itself exits non-zero at
+        fire time. ``None`` (default) builds a valid, unbranched payload —
+        no on-failure reporting.
     runner:
         Optional injectable async callable with the same signature as
         ``asyncio.create_subprocess_exec`` (for testing). Defaults to
@@ -134,30 +138,28 @@ async def schedule_detached_systemd_restart(
     Raises
     ------
     RuntimeError:
-        When the ``systemd-run`` registration itself exits non-zero. The
-        error carries the last 2000 characters of combined stdout/stderr.
+        When the ``systemd-run`` *registration* itself exits non-zero (a
+        ``RestartDisposition.REGISTRATION_FAILED`` outcome). The error
+        carries the last 2000 characters of combined stdout/stderr —
+        preserves the coordinator's transient-retry contract
+        (``StaleServiceRestartCoordinator.maybe_restart`` treats any
+        non-FileNotFoundError/PermissionError exception as retryable).
     """
-    target = Path(project_root) / script
-    argv = [
-        'systemd-run', '--user',
-        f'--on-active={on_active_secs}',
-        f'--unit={transient_unit}',
-        '--collect',
-        str(target),
-        *script_args,
-    ]
-    spawn = runner or asyncio.create_subprocess_exec
-    proc = await spawn(
-        *argv,
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.STDOUT,
+    plan = RestartPlan(
+        script=Path(script),
+        args=list(script_args),
+        cwd=Path(project_root),
+        target_unit=transient_unit,
+        own_unit=transient_unit,
+        on_failure_escalation=on_failure_escalation,
+        verify=None,
+        transient_unit=transient_unit,
+        on_active_secs=on_active_secs,
     )
-    stdout, _ = await proc.communicate()
-    rc = proc.returncode or 0
-    tail = (stdout or b'').decode(errors='replace')[-2000:]
-    if rc != 0:
+    outcome = await plan.execute(runner=runner)
+    if outcome.disposition == RestartDisposition.REGISTRATION_FAILED:
         raise RuntimeError(
-            f'systemd-run registration of {transient_unit} failed (rc={rc}): {tail}'
+            f'systemd-run registration of {transient_unit} failed: {outcome.detail}'
         )
 
 
