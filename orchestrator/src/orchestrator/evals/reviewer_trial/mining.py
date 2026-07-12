@@ -1,0 +1,124 @@
+"""FN-label mining machinery for the reviewer_trial corpus (task 2495 / PRD D-6).
+
+Mines "false negative" (FN) candidates from the offline, gitignored
+orchestrator run history — ``data/orchestrator/runs.db`` and
+``data/escalations/*.json`` in the main repo checkout — tasks whose review
+phase PASSed but where a bug surfaced downstream. These sources are
+build-time-only inputs consumed by the ``mine`` CLI subcommand
+(``__main__.py``) when generating the committed corpus; they are never
+runtime dependencies. Unit tests exercise this module exclusively against
+synthetic fixtures (``tests/_reviewer_trial_mining_fixtures.py``) — never
+the real gitignored data.
+"""
+
+from __future__ import annotations
+
+import json
+import sqlite3
+from dataclasses import dataclass, field
+from pathlib import Path
+
+DEFAULT_MIN_VERIFY_ATTEMPTS = 2
+
+# Outcomes that themselves indicate a downstream bug signal after review passed.
+_DOWNSTREAM_OUTCOMES = {'requeued', 'blocked'}
+
+
+@dataclass
+class FnCandidate:
+    """A task flagged as a false-negative (FN) candidate by ``mine_fn_candidates``.
+
+    "Review PASSed" is operationalized as ``review_cycles >= 1`` — the
+    review loop ran and the task moved past the review phase to verify/
+    merge/requeue/etc. ``task_results`` has no explicit review-verdict
+    column, so this is the closest available proxy (refined against the
+    real runs.db during corpus generation — see PRD D-6 / Open-Q §9).
+
+    ``signal_reason`` names every downstream bug signal that fired, for
+    provenance/audit (persisted into the mined diff's annotation
+    ``provenance`` — see ``corpus.CorpusDiff.provenance``).
+    """
+
+    task_id: str
+    project_id: str
+    outcome: str
+    review_cycles: int
+    verify_attempts: int
+    merge_sha: str | None
+    signal_reason: list[str] = field(default_factory=list)
+
+
+def mine_fn_candidates(
+    db_path: Path,
+    min_verify_attempts: int = DEFAULT_MIN_VERIFY_ATTEMPTS,
+) -> list[FnCandidate]:
+    """Mine FN candidates from a ``runs.db`` (``task_results`` + ``events``).
+
+    A task is a candidate when ``review_cycles >= 1`` (review phase ran)
+    AND at least one downstream bug signal is present:
+
+    - ``outcome`` in ``{'requeued', 'blocked'}``
+    - ``verify_attempts >= min_verify_attempts``
+    - a ``escalation_created`` event exists for the task_id in ``events``
+
+    Read-only: opens the database file directly via stdlib ``sqlite3``, no
+    writes. Returns ``[]`` when nothing matches.
+    """
+    conn = sqlite3.connect(str(db_path))
+    conn.row_factory = sqlite3.Row
+    try:
+        rows = conn.execute(
+            """
+            SELECT task_id, project_id, outcome, review_cycles, verify_attempts
+            FROM task_results
+            WHERE review_cycles >= 1
+            """
+        ).fetchall()
+
+        escalated_task_ids = {
+            r['task_id'] for r in conn.execute(
+                "SELECT DISTINCT task_id FROM events WHERE event_type = 'escalation_created'"
+            ).fetchall()
+        }
+        merge_sha_by_task: dict[str, str | None] = {}
+        for r in conn.execute(
+            "SELECT task_id, data FROM events WHERE event_type = 'merge_finalized'"
+        ).fetchall():
+            try:
+                data = json.loads(r['data'])
+            except (json.JSONDecodeError, TypeError):
+                continue
+            merge_sha_by_task[r['task_id']] = data.get('merge_sha')
+    finally:
+        conn.close()
+
+    candidates: list[FnCandidate] = []
+    for row in rows:
+        task_id = row['task_id']
+        outcome = row['outcome']
+        verify_attempts = row['verify_attempts']
+
+        signal_reason: list[str] = []
+        if outcome in _DOWNSTREAM_OUTCOMES:
+            signal_reason.append(f'outcome:{outcome}')
+        if verify_attempts >= min_verify_attempts:
+            signal_reason.append(
+                f'verify_attempts>={min_verify_attempts} (actual={verify_attempts})'
+            )
+        if task_id in escalated_task_ids:
+            signal_reason.append('escalation_created event')
+
+        if not signal_reason:
+            continue
+
+        candidates.append(FnCandidate(
+            task_id=task_id,
+            project_id=row['project_id'],
+            outcome=outcome,
+            review_cycles=row['review_cycles'],
+            verify_attempts=verify_attempts,
+            merge_sha=merge_sha_by_task.get(task_id),
+            signal_reason=signal_reason,
+        ))
+
+    return candidates
