@@ -96,7 +96,14 @@ asserts "+X F1" (G6).
   artifact carries a **provenance sidecar**: `optimizer_model`, `corpus_hash`,
   `split_seed`, `held_out_TEST_score`, `accept_delta`, `git_sha`, `date`,
   `harness_version`. The **unpin operation is the rollback lever** — no separate
-  revert path.
+  revert path. **The `executor_model` key is the model resolved *at invocation
+  time*, not a static `defaults.yaml` value** — the concurrent
+  `adaptive-model-routing` PRD makes the reviewer model dynamic via
+  `resolve_route`, so the loader must be called with the router-resolved model
+  and the artifact set is **per-model** (a reviewer routed to sonnet must not
+  load an opus-optimized block — the exact strong→weak transfer drop §2 warns
+  about). Keying on `executor_model` already makes this correct by construction;
+  the seam is that the *call site* passes the resolved model. See §5.
 
 - **D-5 — Variance gate (makes strict-improvement honest, G6).** The reviewer
   scorer uses a haiku LLM matcher → noisy; bare tie-rejection would be unsound.
@@ -140,7 +147,8 @@ Confirmed live 2026-07-12:
 - Reviewer executor = **opus**, $5, 30 turns (`defaults.yaml:162/175`); curator,
   triage, module_tagger = **sonnet** (`defaults.yaml:165-166`). The in-code
   `_reviewer_role(default_model='sonnet')` is overridden per-role by
-  `defaults.yaml` — the deployed reviewer executor is opus.
+  `defaults.yaml` — the deployed reviewer executor is opus today, but see P-4:
+  the reviewer model is becoming router-resolved, not static.
 
 **Must be verified before the dependent task dispatches:**
 
@@ -152,22 +160,44 @@ Confirmed live 2026-07-12:
   optimizer model distinct from the executor (needed to run a frontier optimizer
   against an opus/sonnet executor). `reviewer_trial/runner.py` already sets model
   per `ReviewerSpec`; confirm the same for the optimizer call.
+- **P-3 (HARD-blocks T2, and T7 transitively — reviewer contract; cross-PRD):**
+  the reviewer output contract is being replaced by **verdict-servers task
+  δ = 2484** (pending) — it edits `roles.py:389-408,:422,:426`, dropping "output
+  pure JSON" + the fenced example and moving the verdict to an MCP
+  `submit_review_verdict` tool with the verdict *content* schema preserved. T2
+  must refactor onto the **post-2484** contract, so **T2 declares a cross-task
+  dep on 2484** (T7 inherits it via T2). T6 (the generic engine, tested on a
+  synthetic fixture) needs **no** 2484 dep. The reviewer *heuristics* being
+  optimized are transport-independent (what to flag, not how to emit it), but
+  `reviewer_trial`'s rollout path must mirror the live transport (or explicitly
+  justify transport-independence) for score validity.
+- **P-4 (shapes D-4 loader + reviewer runs; cross-PRD, soft):** the
+  `adaptive-model-routing` PRD (`resolve_route`) makes the reviewer executor
+  model dynamic. Confirm the loader call site can obtain the router-resolved
+  model, and that a per-model artifact set is acceptable. No hard task dep (the
+  loader keying on `executor_model` is forward-compatible), but the reviewer
+  optimization run must target whichever model(s) the router can pick.
 
 ## 5. Cross-PRD relationship + seam ownership (G4)
 
-| Seam | Owner | Note |
-|---|---|---|
-| `orchestrator/src/orchestrator/evals/reviewer_trial/` (corpus, variants, scorer, loop) | **This PRD** | Ratified with user 2026-07-12. |
-| `evals/runner.py`, benchmark task suite, Elo judge (`evals/judge.py`, `elo.py`) | **Separate live eval-harness session** | This PRD must **not** restructure these. |
-| `shared/` prompt-artifact loader (new) | **This PRD** | Shared infra; no competing owner flagged. Verify P-1. |
-| Live reviewer review-phase + `submit_task` curator middleware call sites | **This PRD** (adds loader wiring, preserves behaviour) | Contract sections frozen; regression tests prove parity. |
+Four sibling PRDs were authored/decomposed concurrently on 2026-07-12; their
+task ids are live. Seams reconciled below. **The curator anchor (T3, T5) is
+clean against all four; every seam is on the reviewer anchor.**
 
-**Hand-off note to the eval-harness session** (do **not** file as tasks here):
-more benchmark tasks; sandboxed recon Stage-1/2 replay (Tier 2, blocked on that
-sandbox); score-repeatability features *inside the workflow-eval harness* (as
-distinct from this PRD's own §4 variance gate). If `reviewer_trial` turns out to
-be inside that session's **active** scope after all, that is a stop-and-check —
-pause the reviewer-corpus task and confirm before proceeding.
+| Sibling PRD (live task ids) | Seam with this PRD | Resolution |
+|---|---|---|
+| **mcp-verdict-servers** — δ=**2484** (reviewer, pending), α=2481, β=2482, η=2487 | 2484 co-edits `roles.py:389-408,:422,:426` (my T2 target) and **replaces the reviewer output transport** (inline JSON → `submit_review_verdict` MCP tool). **Direct collision.** | **T2 hard-deps 2484** (T7 inherits; P-3) — refactor onto the post-migration contract. Curator is **explicitly excluded** by verdict-servers (2487 preserves the shared `--json-schema` path for `task_curator.py:2002,2093`), so **T3 is clean**. |
+| **eval-framework-revival** — κ=**2476** (`reviewer_trial` refresh, pending, low-pri) | 2476 re-runs `reviewer_trial/*` (15-diff corpus, Sonnet-5 candidate). **Dual-ownership of `reviewer_trial/`.** | Ownership split: **this PRD owns `reviewer_trial` corpus-expansion + the optimization loop**; 2476 is a consuming measurement-refresh. **Wire 2476 → T4** at decompose so κ refreshes on the expanded corpus. This PRD must **not** restructure `evals/runner.py`, the benchmark suite, or the Elo judge (eval-revival's core). |
+| **adaptive-model-routing** (PRD in flight; `resolve_route`) | Makes the reviewer executor model **dynamic**, breaking a static "pin to opus" assumption; also touches `evals/`, `reviewer_trial/`. | Loader keys on `executor_model` (D-4) → forward-compatible; **P-4** — call site passes the router-resolved model, artifacts are per-model. No hard dep. |
+| **harness-backend-reconnect-pi** — T4 (`roles.py` pi `--tools` allowlist) | Additive `roles.py` co-edit; `invoke_agent`/backend forwarding. | Benign — no contract overlap. Opus/sonnet anchors are Claude, so backend-forwarding is irrelevant here; the **follow-on** gpt-4o-mini routing classifier will consume reconnect's backend work. |
+| `shared/` prompt-artifact loader (new) | No sibling claims `shared/` or a prompt loader. | **This PRD** owns it (verify P-1); model-key interoperates with `resolve_route` (P-4). |
+
+**Hand-off note to the eval-harness session (eval-revival)** — do **not** file
+as tasks here: more benchmark tasks; sandboxed recon Stage-1/2 replay (Tier 2);
+score-repeatability features *inside the workflow-eval harness* (distinct from
+this PRD's §4 variance gate). One reciprocal ask: eval-revival's κ (2476) should
+depend on this PRD's T4 (shared corpus) — flagged for whoever decomposes/refines
+2476.
 
 ## 6. Out of scope
 
@@ -180,8 +210,13 @@ pause the reviewer-corpus task and confirm before proceeding.
   for replay data; the routing classifier is the natural first classifier
   (cleanest hard label, cheapest rollout, proves cross-model-family).
 - **Any change to prompt CONTRACT sections**; **any live-pipeline rollout**
-  (all rollouts are offline replays); **any eval-harness restructuring**;
+  (all rollouts are offline replays); **any eval-harness restructuring**
+  (`evals/runner.py` / benchmark suite / Elo judge — eval-revival's);
   **any LLM-judge-only acceptance gate** where a hard signal exists.
+- **The reviewer output *transport*** (inline JSON → MCP `submit_review_verdict`)
+  — owned by **mcp-verdict-servers (2484)**; this PRD refactors the reviewer
+  prompt's *heuristics* onto whatever contract 2484 lands, it does not design the
+  transport (P-3, §5).
 - **Running the expensive real optimization loops and the ship/rollback
   decisions themselves** — these are **operator runbook** steps (§8), not
   orchestrator tasks: reviewer runs are $300–800 / overnight-to-weekend and the
@@ -202,13 +237,16 @@ completion the decompose session will attach as `user_observable_signal`.
   rollback lever). Consumer: T2, T3, T6, T8.
 
 - **T2 — Reviewer prompt CONTRACT/HEURISTICS split + loader wiring
-  (`agents/roles.py`).** *[deps: T1]* — **Signal:** `_reviewer_role` builds its
-  system prompt via the loader; the JSON output schema + "output pure JSON only"
-  + blocking-definition contract live in a frozen CONTRACT constant and the
-  editable guidance in a HEURISTICS block; a `reviewer_trial` rollout still emits
-  schema-valid JSON (parity regression); a **boundary test proves an artifact
-  that tries to alter a CONTRACT token has no effect on the composed contract**
-  (G5 two-way). Consumer: live review phase.
+  (`agents/roles.py`).** *[deps: T1; **dark_factory:2484** (verdict-servers δ —
+  P-3)]* — **Signal:** `_reviewer_role` builds its system prompt via the loader;
+  the reviewer's **live** output contract (post-2484: the `submit_review_verdict`
+  tool instruction + verdict-field schema + blocking-definition) lives in a
+  frozen CONTRACT constant and the editable guidance in a HEURISTICS block; a
+  `reviewer_trial` rollout still produces a valid verdict via the live transport
+  (parity regression); a **boundary test proves an artifact that tries to alter a
+  CONTRACT token has no effect on the composed contract** (G5 two-way). Consumer:
+  live review phase. *Rebase onto 2484's `roles.py` edit — do not freeze the
+  pre-2484 "output pure JSON" text.*
 
 - **T3 — Curator prompt CONTRACT/HEURISTICS split + loader wiring
   (`middleware/task_curator.py`).** *[deps: T1]* — **Signal:** `_SYSTEM_PROMPT`
@@ -226,7 +264,10 @@ completion the decompose session will attach as `user_observable_signal`.
   mining provenance (the `runs.db` query + escalation refs behind each
   false-negative label) is captured; an adjudication log shows frontier-proposed
   labels + human spot-check on a documented subset; the existing scorer runs
-  green over the expanded corpus. Consumer: the reviewer optimization run.
+  green over the expanded corpus. Consumer: the reviewer optimization run; **also
+  eval-revival's κ (2476), which should dep on this task** (§5 — shared corpus).
+  *Transport-independent (labels are about which bugs exist, not how the reviewer
+  emits), so this task needs **no** dep on 2484 and can proceed in parallel.*
 
 - **T5 — Curator replay corpus + curator scorer (hard signal).**
   *[deps: T3, T6]* — **Signal:** a curator replay corpus is built from
@@ -248,7 +289,7 @@ completion the decompose session will attach as `user_observable_signal`.
   Consumer: T5, T7, the operator runs, Tier 2.
 
 - **T7 — End-to-end loop acceptance smoke on a fixture (cheap, hermetic).**
-  *[deps: T2, T6]* — **Signal:** the full stack (loader → reviewer HEURISTICS →
+  *[deps: T2, T6]* (T2 already carries the 2484 dep transitively) — **Signal:** the full stack (loader → reviewer HEURISTICS →
   loop → scorer → report) runs on a ≤3-diff fixture corpus and produces a report
   with a held-out verdict, provenance, and a proof the CONTRACT was untouched —
   demonstrating the machinery works end-to-end **without** a $300–800 real run.
@@ -301,7 +342,17 @@ Not filed as tasks (high-cost, human-judgment; G1 consumer = Leo):
 The orchestrator does **not** yet read the `user_observable_signal` /
 `consumer_ref` / substrate-confirmed metadata fields — they are substrate for a
 future tracking-infra session. File the batch with `planning_mode=True` on every
-task, wire all deps (T2→T1, T3→T1, T5→T3+T6, T6→T1, T7→T2+T6, T8→T1), commit the
-capability manifest beside this PRD, then flip the whole batch `deferred →
-pending` in one `commit_planning`. Re-verify P-1 and P-2 (§4) at decompose —
-both are hard G3 pre-conditions.
+task, wire all deps, commit the capability manifest beside this PRD, then flip
+the whole batch `deferred → pending` in one `commit_planning`.
+
+**Intra-batch deps:** T2→T1, T3→T1, T5→T3+T6, T6→T1, T7→T2+T6, T8→T1.
+**Cross-PRD dep (qualified `project_id:task_id` form, §Cross-project in
+CLAUDE.md):** T2→`dark_factory:2484` (verdict-servers δ — the reviewer contract;
+P-3). T7 inherits it via T2. No other cross-PRD dep is a hard blocker
+(adaptive-model-routing is design-compat via the loader's model key, P-4; the
+reciprocal 2476→T4 dep is eval-revival's to wire).
+
+Re-verify **P-1** (shared-package import), **P-2** (`invoke_agent` optimizer
+model), and **P-3/P-4** (§4) at decompose — P-1/P-2/P-3 are hard G3
+pre-conditions; the T2→2484 edge means the reviewer sub-chain will not dispatch
+until verdict-servers δ is `done` (correct — it must land first).
