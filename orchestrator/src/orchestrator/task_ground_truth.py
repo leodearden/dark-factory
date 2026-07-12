@@ -21,6 +21,7 @@ in :meth:`TaskGroundTruth.derive_truth` and :func:`classify_recovery` below.
 from __future__ import annotations
 
 import enum
+import json
 import os
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
@@ -298,7 +299,14 @@ class TaskGroundTruth:
                 source=ClaimantSource.DB,
             )
 
-        lock_data = TaskArtifacts(self.worktree_resolver(tid)).read_plan_lock()
+        try:
+            lock_data = TaskArtifacts(self.worktree_resolver(tid)).read_plan_lock()
+        except (json.JSONDecodeError, OSError):
+            # A truncated/corrupt plan.lock is a realistic outcome of the
+            # very crash this resolver recovers from — degrade to "no
+            # plan-lock claimant" rather than letting one bad lock file
+            # abort the whole ground-truth sweep for this task.
+            lock_data = None
         if lock_data is not None:
             owner_pid = lock_data.get('owner_pid')
             try:

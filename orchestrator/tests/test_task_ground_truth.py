@@ -24,6 +24,7 @@ Covers:
 from __future__ import annotations
 
 import dataclasses
+import json
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock
@@ -461,6 +462,62 @@ class TestDeriveTruthLiveClaimant:
         )
 
         report = await resolver.derive_truth('14')
+
+        assert report.live_claimant is None
+
+    async def test_plan_lock_dead_owner_pid_returns_none(self, tmp_path: Path) -> None:
+        # _pid_alive(2**31 - 1) is deterministically False — not a valid
+        # live PID on any standard Linux (mirrors
+        # test_pid_alive_contract.py's identical convention) — so a
+        # plan.lock whose owner process has died must NOT be treated as a
+        # live claimant (review finding #3).
+        TaskArtifacts(tmp_path).root.mkdir(parents=True)
+        lock_path = TaskArtifacts(tmp_path).root / 'plan.lock'
+        lock_path.write_text(json.dumps({
+            'session_id': 'sess-dead-abc123',
+            'locked_at': '2026-07-12T00:00:00+00:00',
+            'owner_pid': 2 ** 31 - 1,
+        }))
+        task = {'status': 'pending', 'claimant_run_id': None, 'heartbeat_at': None}
+        scheduler = _fake_scheduler(is_actively_held=False, task=task)
+        resolver = _make_ground_truth(scheduler=scheduler, worktree_resolver=lambda tid: tmp_path)
+
+        report = await resolver.derive_truth('25')
+
+        assert report.live_claimant is None
+
+    async def test_plan_lock_malformed_owner_pid_returns_none(self, tmp_path: Path) -> None:
+        # A non-numeric owner_pid must be swallowed by the int(owner_pid)
+        # TypeError/ValueError guard rather than raise out of derive_truth
+        # (review finding #3).
+        TaskArtifacts(tmp_path).root.mkdir(parents=True)
+        lock_path = TaskArtifacts(tmp_path).root / 'plan.lock'
+        lock_path.write_text(json.dumps({
+            'session_id': 'sess-malformed-abc123',
+            'locked_at': '2026-07-12T00:00:00+00:00',
+            'owner_pid': 'not-a-pid',
+        }))
+        task = {'status': 'pending', 'claimant_run_id': None, 'heartbeat_at': None}
+        scheduler = _fake_scheduler(is_actively_held=False, task=task)
+        resolver = _make_ground_truth(scheduler=scheduler, worktree_resolver=lambda tid: tmp_path)
+
+        report = await resolver.derive_truth('26')
+
+        assert report.live_claimant is None
+
+    async def test_corrupt_plan_lock_json_returns_none_not_raise(self, tmp_path: Path) -> None:
+        # A truncated/corrupt plan.lock (a realistic outcome of the very
+        # crash this resolver recovers from) must degrade to "no plan-lock
+        # claimant", not propagate json.JSONDecodeError out of derive_truth
+        # (review finding #1).
+        TaskArtifacts(tmp_path).root.mkdir(parents=True)
+        lock_path = TaskArtifacts(tmp_path).root / 'plan.lock'
+        lock_path.write_text('{not valid json')
+        task = {'status': 'pending', 'claimant_run_id': None, 'heartbeat_at': None}
+        scheduler = _fake_scheduler(is_actively_held=False, task=task)
+        resolver = _make_ground_truth(scheduler=scheduler, worktree_resolver=lambda tid: tmp_path)
+
+        report = await resolver.derive_truth('27')
 
         assert report.live_claimant is None
 
