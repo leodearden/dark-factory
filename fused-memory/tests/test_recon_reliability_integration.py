@@ -1210,3 +1210,97 @@ class TestExecutionClassEnforcement:
         assert 'execution_class' in reject.get('error', '')
         assert accept is None
         assert persisted.get('execution_class') == 'operational'
+
+    # -- driving harness (task 2232 step-16) ---------------------------------
+
+    def _passthrough_main_checkout(self, monkeypatch) -> None:
+        """Stub resolve_main_checkout to pass its argument through unchanged
+        — mirrors test_submit_resolve_tools.py's passthrough_main_checkout
+        fixture — so a synthetic project_root like '/project' works without
+        a real git working tree."""
+        monkeypatch.setattr(
+            'fused_memory.server.tools.resolve_main_checkout', lambda p: str(p),
+        )
+
+    def _make_task_interceptor(self) -> AsyncMock:
+        """AsyncMock task_interceptor standing in for taskmaster plumbing —
+        mirrors test_submit_resolve_tools.py's task_interceptor fixture."""
+        task_interceptor = AsyncMock()
+        task_interceptor.submit_task = AsyncMock(
+            return_value={'ticket': 'tkt_ABCDEFGHIJKLMNOPQRSTUVWXYZ'},
+        )
+        return task_interceptor
+
+    async def _drive_reject_missing_class(self, monkeypatch) -> tuple[AsyncMock, dict]:
+        """Recon-stage submit_task with NO metadata.execution_class through
+        the REAL submit_task MCP tool boundary (create_mcp_server +
+        _tool_manager.call_tool, mirroring P4's MCP-boundary pattern)."""
+        self._passthrough_main_checkout(monkeypatch)
+        task_interceptor = self._make_task_interceptor()
+        server = create_mcp_server(AsyncMock(), task_interceptor=task_interceptor)
+
+        result = await server._tool_manager.call_tool(
+            'submit_task',
+            {
+                'project_root': self._PROJECT_ROOT,
+                'title': 'Recon stage task',
+                'agent_id': AGENT_ID,
+                'metadata': {},
+            },
+        )
+        return task_interceptor, result
+
+    async def _drive_accept_and_persist(self, monkeypatch, valid_class: str) -> AsyncMock:
+        """Recon-stage submit_task WITH a valid metadata.execution_class
+        through the REAL submit_task MCP tool boundary; the interceptor is
+        awaited once with the class persisted into the forwarded metadata."""
+        self._passthrough_main_checkout(monkeypatch)
+        task_interceptor = self._make_task_interceptor()
+        server = create_mcp_server(AsyncMock(), task_interceptor=task_interceptor)
+
+        await server._tool_manager.call_tool(
+            'submit_task',
+            {
+                'project_root': self._PROJECT_ROOT,
+                'title': 'Recon stage task',
+                'agent_id': AGENT_ID,
+                'metadata': {'execution_class': valid_class},
+            },
+        )
+        return task_interceptor
+
+    async def _drive_non_recon_not_enforced(self, monkeypatch) -> AsyncMock:
+        """A non-recon (None) agent_id submit_task with NO
+        metadata.execution_class is never gated — the interceptor call
+        proceeds through the REAL submit_task MCP tool boundary."""
+        self._passthrough_main_checkout(monkeypatch)
+        task_interceptor = self._make_task_interceptor()
+        server = create_mcp_server(AsyncMock(), task_interceptor=task_interceptor)
+
+        await server._tool_manager.call_tool(
+            'submit_task',
+            {
+                'project_root': self._PROJECT_ROOT,
+                'title': 'Non-recon task',
+                'metadata': {},
+            },
+        )
+        return task_interceptor
+
+    def _drive_guard_level_backstop(self) -> tuple[dict | None, dict | None, dict]:
+        """Backstop at the guard level (execution_class_error /
+        inject_execution_class), independent of the MCP tool wiring: missing
+        -> reject naming execution_class; valid 'operational' -> accept
+        (None) AND inject_execution_class persists it into a fresh metadata
+        dict — mirrors test_execution_class_guard.py."""
+        from fused_memory.middleware.execution_class_guard import (
+            execution_class_error,
+            inject_execution_class,
+        )
+
+        reject = execution_class_error({}, AGENT_ID, self._PROJECT_ROOT)
+        accept = execution_class_error(
+            {'execution_class': 'operational'}, AGENT_ID, self._PROJECT_ROOT,
+        )
+        persisted = inject_execution_class({'execution_class': 'operational'})
+        return reject, accept, persisted
