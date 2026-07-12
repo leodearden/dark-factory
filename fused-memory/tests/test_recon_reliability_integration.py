@@ -458,11 +458,14 @@ class TestLedgerUpsertAndRace:
         """Raw SELECT COUNT(*) over recon_ledger for *project_id* (all
         record_kinds) — a direct check on the store's own connection,
         independent of get_by_identity's per-identity read path."""
-        cursor = await ledger._db.execute(  # noqa: SLF001 — intentional direct-connection check
+        db = ledger._db  # noqa: SLF001 — intentional direct-connection check
+        assert db is not None, 'Expected an initialized store with an open connection'
+        cursor = await db.execute(
             'SELECT COUNT(*) FROM recon_ledger WHERE project_id = ?',
             (project_id,),
         )
         row = await cursor.fetchone()
+        assert row is not None
         return row[0]
 
 
@@ -826,11 +829,11 @@ class TestDedupExemptPermission:
         point lands on every call, not just the first."""
         service = await self._drive_fresh_point_routing(mock_config)
 
-        assert service.mem0.add_system_record.await_count == 2, (
+        assert service.mem0.add_system_record.await_count == 2, (  # type: ignore[attr-defined]
             'Expected mem0.add_system_record to be awaited once per call '
             '(fresh point every call, no caching/memoization across calls)'
         )
-        service.mem0.add.assert_not_called()
+        service.mem0.add.assert_not_called()  # type: ignore[attr-defined]
 
     # -- driving harness (task 2232 step-10) ---------------------------------
 
@@ -1035,11 +1038,14 @@ class TestDeterministicCycleSummary:
         """Raw SELECT COUNT(*) over recon_ledger for *project_id*'s
         cycle_summary rows — a direct check on the store's own connection,
         independent of get_by_identity's per-identity read path."""
-        cursor = await ledger._db.execute(  # noqa: SLF001 — intentional direct-connection check
+        db = ledger._db  # noqa: SLF001 — intentional direct-connection check
+        assert db is not None, 'Expected an initialized store with an open connection'
+        cursor = await db.execute(
             "SELECT COUNT(*) FROM recon_ledger WHERE project_id = ? AND record_kind = 'cycle_summary'",
             (project_id,),
         )
         row = await cursor.fetchone()
+        assert row is not None
         return row[0]
 
 
