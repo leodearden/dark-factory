@@ -188,9 +188,33 @@ class TestClassifyRecovery:
         )
         assert classify_recovery(report) == RecoveryAction.LEAVE
 
+    def test_f2_on_main_open_l2_also_vetoes_auto_flip(self) -> None:
+        # The veto is "any open escalation, any level" — not L1-only.
+        # Before review finding #1's fix, `_shape` checked `level == 1`
+        # only, so an open L2 (the actual human-facing tier — see
+        # escalation/models.py's consumer-per-level contract) slipped
+        # through and this shape still hit row (a)'s auto-flip.
+        report = self._report(
+            branch_state=BranchState(BranchStateKind.ON_MAIN, 'sha-f2'),
+            open_escalations=[EscalationRef(id='esc-1-2', level=2)],
+        )
+        assert classify_recovery(report) == RecoveryAction.LEAVE
+
     def test_g_blocked_no_claimant_gone_no_marker_no_open_escalation_refiles(self) -> None:
         report = self._report(db_status='blocked', branch_state=BranchState(BranchStateKind.GONE_NO_MARKER))
         assert classify_recovery(report) == RecoveryAction.RE_FILE_ESCALATION
+
+    def test_g2_blocked_with_open_l0_escalation_does_not_refile(self) -> None:
+        # Before review finding #1's fix, an already-open L0/L2 escalation
+        # was invisible to `_shape` (only level==1 counted), so this shape
+        # still hit row (g)'s RE_FILE_ESCALATION — risking a duplicate/
+        # competing escalation once θ2 wires the action to a real re-file.
+        report = self._report(
+            db_status='blocked',
+            branch_state=BranchState(BranchStateKind.GONE_NO_MARKER),
+            open_escalations=[EscalationRef(id='esc-2-1', level=0)],
+        )
+        assert classify_recovery(report) == RecoveryAction.LEAVE
 
     def test_h_deterministic_task_deploy_phase_ran_refiles_not_phantom_done(self) -> None:
         # D1 (PRD §7): a deploy crashed between 'ran' and 'verified' must
@@ -200,6 +224,20 @@ class TestClassifyRecovery:
             deploy_phase=DeployPhase.RAN,
         )
         assert classify_recovery(report) == RecoveryAction.RE_FILE_ESCALATION
+
+    def test_h4_deploy_ran_with_open_l2_escalation_does_not_refile(self) -> None:
+        # The motivating case from review finding #1: a deterministic
+        # deploy stranded at DeployPhase.RAN typically already carries the
+        # runner's own born-at-L2 escalation (task_kind='deterministic's
+        # "Born-at-L2 escalations" convention). Re-filing a second one over
+        # an already-open L2 would risk a duplicate/competing escalation,
+        # so this shape must fall through to LEAVE, not row (h).
+        report = self._report(
+            branch_state=BranchState(BranchStateKind.GONE_NO_MARKER),
+            deploy_phase=DeployPhase.RAN,
+            open_escalations=[EscalationRef(id='esc-3-1', level=2)],
+        )
+        assert classify_recovery(report) == RecoveryAction.LEAVE
 
     def test_h2_deploy_phase_failed_defaults_to_leave_deliberately(self) -> None:
         # FAILED is NOT in _RECOVERY (only RAN is, per D1/row (h)) — a

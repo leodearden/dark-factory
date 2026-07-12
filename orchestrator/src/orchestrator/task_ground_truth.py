@@ -386,7 +386,9 @@ _RecoveryShape = tuple[str, bool, BranchStateKind, bool, DeployPhase | None]
 
 _RECOVERY: dict[_RecoveryShape, RecoveryAction] = {
     # (a) Stranded in-progress, branch already on main (journal or git
-    # evidence) -> the work landed; mark done with provenance.
+    # evidence), and no escalation already open at ANY level -> the work
+    # landed; mark done with provenance. (If an escalation IS already open —
+    # any level — the shape instead matches row (f)'s veto below.)
     (TaskStatus.IN_PROGRESS, False, BranchStateKind.ON_MAIN, False, None):
         RecoveryAction.MARK_DONE_WITH_PROVENANCE,
     # (b) Stranded in-progress, branch gone but a merge marker on main
@@ -401,19 +403,31 @@ _RECOVERY: dict[_RecoveryShape, RecoveryAction] = {
     # evidence either; same revert-to-pending outcome as (c).
     (TaskStatus.IN_PROGRESS, False, BranchStateKind.GONE_NO_MARKER, False, None):
         RecoveryAction.REVERT_TO_PENDING,
-    # (f) An open L1 escalation is the deliberate human-handoff signal — a
-    # sweep must never second-guess it, even with on-main landing evidence.
+    # (f) An escalation already open at ANY level (L0/L1/L2 — not just L1)
+    # is the deliberate human/automation-handoff signal — a sweep must never
+    # second-guess it, even with on-main landing evidence (review finding
+    # #1: this used to check level==1 only, so an open L2 slipped through
+    # and still hit row (a)'s auto-flip).
     (TaskStatus.IN_PROGRESS, False, BranchStateKind.ON_MAIN, True, None):
         RecoveryAction.LEAVE,
-    # (g) Stranded 'blocked' with no landing evidence and no open
-    # escalation: blocked discipline forbids a silent blocked->pending
-    # revert, so the sweep must re-file an escalation rather than guess.
+    # (g) Stranded 'blocked' with no landing evidence and no escalation
+    # already open at any level: blocked discipline forbids a silent
+    # blocked->pending revert, so the sweep must re-file an escalation
+    # rather than guess. If an escalation IS already open (any level), the
+    # shape is absent from this table and falls through to the LEAVE
+    # default — re-filing over an already-open escalation would risk a
+    # duplicate/competing one (review finding #1).
     (TaskStatus.BLOCKED, False, BranchStateKind.GONE_NO_MARKER, False, None):
         RecoveryAction.RE_FILE_ESCALATION,
-    # (h) D1: a deterministic deploy crashed between 'ran' and 'verified'.
-    # This is a NAMED, in-flight deploy state — never phantom-done and
-    # never silently reverted (that would re-run a deploy that may have
-    # already taken effect); re-file an escalation for a human/DS-2 gate.
+    # (h) D1: a deterministic deploy crashed between 'ran' and 'verified',
+    # with no escalation already open at any level. This is a NAMED,
+    # in-flight deploy state — never phantom-done and never silently
+    # reverted (that would re-run a deploy that may have already taken
+    # effect); re-file an escalation for a human/DS-2 gate. A
+    # DeployPhase.RAN task typically already carries the runner's own
+    # born-at-L2 escalation, in which case the shape falls through to the
+    # LEAVE default instead — same duplicate-escalation avoidance as row
+    # (g) (review finding #1).
     (TaskStatus.IN_PROGRESS, False, BranchStateKind.GONE_NO_MARKER, False, DeployPhase.RAN):
         RecoveryAction.RE_FILE_ESCALATION,
     # Deliberately-unmapped deploy phases (VERIFIED / FAILED / SCHEDULED /
@@ -444,13 +458,22 @@ _RECOVERY: dict[_RecoveryShape, RecoveryAction] = {
 
 
 def _shape(report: TruthReport) -> _RecoveryShape:
-    """Discretize *report* to the tuple `_RECOVERY` is keyed on."""
-    has_open_l1 = any(ref.level == 1 for ref in report.open_escalations)
+    """Discretize *report* to the tuple `_RECOVERY` is keyed on.
+
+    The escalation-boolean element folds ANY open escalation, at ANY level
+    (L0/L1/L2) — not just L1. An escalation already open at any level is the
+    same "don't second-guess a pending human/automation handoff" signal
+    regardless of which tier is currently holding it, so rows (a)/(f) and
+    (g)/(h) all key off this one boolean (review finding #1: a level-1-only
+    check let an open L2 slip through row (a)'s veto and let rows (g)/(h)
+    re-file over an already-open L0/L2).
+    """
+    has_open_escalation = bool(report.open_escalations)
     return (
         report.db_status,
         report.live_claimant is not None,
         report.branch_state.kind,
-        has_open_l1,
+        has_open_escalation,
         report.deploy_phase,
     )
 
