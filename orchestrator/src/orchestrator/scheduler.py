@@ -11,7 +11,7 @@ import re
 import time
 from collections import deque
 from collections.abc import Callable, Iterable, Iterator
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any, Protocol, runtime_checkable
@@ -544,6 +544,66 @@ class TaskAssignment:
     task_id: str
     task: dict
     modules: list[str]
+
+
+@dataclass
+class TickContext:
+    """Per-tick mutable state threaded through ``acquire_next``'s phase list.
+
+    Built once per tick (after the pre-ctx preamble in ``acquire_next`` —
+    guards, ``get_tasks``, empty-tasks drain, status/id index build, and
+    ``_update_age_anchors``) and passed to each ``_phase_*`` method in
+    ``Scheduler._TICK_PHASE_ORDER`` order. Fields are the six task-named
+    fields (``tasks``, ``status_map``, ``tasks_by_id``, ``external_cache``,
+    ``overrides``, ``candidates``) plus every other piece of per-tick state a
+    phase reads or writes.
+
+    Deliberately a MUTABLE dataclass, not frozen: phases mutate shared
+    per-tick state in place exactly as the pre-decomposition inline locals
+    did (``status_map`` backfilled, ``candidates`` filtered, ``external_cache``
+    / ``psi_*`` written across phases). Co-located here (not a new module)
+    to avoid a circular import — it references ``OverrideRow``, ``PsiSample``,
+    and ``TaskAssignment``, all already defined/imported in this module.
+    """
+
+    tasks: list[dict]
+    status_map: dict[str, str]
+    tasks_by_id: dict[str, dict]
+    max_id: int = 0
+    external_cache: dict[str, str] = field(default_factory=dict)
+    external_resolver_failed: bool = False
+    overrides: dict[str, OverrideRow] = field(default_factory=dict)
+    overrides_for_diff: dict[str, OverrideRow] = field(default_factory=dict)
+    effective_priorities: dict[str, str] = field(default_factory=dict)
+    transitive_counts: dict[str, int] = field(default_factory=dict)
+    candidates: list[dict] = field(default_factory=list)
+    candidate_signals: dict[str, str | None] = field(default_factory=dict)
+    gated_ids: set[str] = field(default_factory=set)
+    stale_ids: set[str] = field(default_factory=set)
+    psi_sample: PsiSample | None = None
+    psi_hold: bool = False
+    psi_in_flight: int = 0
+    dispatch_deferred_emitted: bool = False
+
+
+# Sentinel a `_phase_*` method returns to mean "proceed to the next phase in
+# `Scheduler._TICK_PHASE_ORDER`".  A bare `TaskAssignment | None` return
+# can't distinguish "this phase is done, keep going" from a genuine terminal
+# `TickOutcome(assignment=None)` (idle tick) since `None` is itself a valid
+# terminal value — this sentinel disambiguates continue-vs-terminate.
+_CONTINUE = object()
+
+
+@dataclass(frozen=True)
+class TickOutcome:
+    """Terminal result returned by a `_phase_*` method to END the tick.
+
+    ``assignment`` is exactly what ``acquire_next`` should return this tick
+    — a ``TaskAssignment`` on a successful dispatch, or ``None`` for an idle
+    tick (no candidates, lock conflicts, PSI hold with no eligible dispatch).
+    """
+
+    assignment: TaskAssignment | None
 
 
 def _resolve_time_source(ts: Callable[[], float] | None) -> Callable[[], float]:
