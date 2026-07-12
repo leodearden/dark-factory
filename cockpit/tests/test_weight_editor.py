@@ -73,6 +73,26 @@ class TestMergeWeightEdits:
         assert unparseable.project_weights == {'df': 3.0}
         assert empty.project_weights == {'df': 3.0}
 
+    def test_non_finite_edits_are_skipped_and_never_raise(self):
+        """float() itself accepts 'inf'/'-inf'/'nan' -- a non-finite weight
+        would poison priority.score()'s urgency into inf/nan and corrupt the
+        DecisionQueue's sort order, so both loops must reject these exactly
+        like any other unparseable input (not just skip ValueError/TypeError).
+        """
+        from cockpit.panes.weight_editor import merge_weight_edits
+        from cockpit.priority import Priorities
+
+        base = replace(
+            Priorities.default(),
+            category_weights={'bug': 1.0},
+            project_weights={'df': 3.0},
+        )
+
+        for bad in ('inf', '-inf', 'nan', 'Infinity'):
+            result = merge_weight_edits(base, category_edits={'bug': bad}, project_edits={'df': bad})
+            assert result.category_weights == {'bug': 1.0}, bad
+            assert result.project_weights == {'df': 3.0}, bad
+
 
 class TestKnownProjects:
     def test_sorted_distinct_union_of_records_decisions_and_existing(self):

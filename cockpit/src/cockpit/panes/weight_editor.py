@@ -15,6 +15,7 @@ the DecisionQueue directly.
 
 from __future__ import annotations
 
+import math
 from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import replace
 
@@ -28,6 +29,25 @@ from textual.widgets import Button, Input, Label
 from cockpit.priority import Priorities
 
 
+def _parse_weight(raw: str) -> float | None:
+    """Parse *raw* as a finite float, or None if unparseable/empty/non-finite.
+
+    float() itself accepts 'inf'/'-inf'/'nan', which priority.score() cannot
+    tolerate: an inf project/category weight makes raw=inf and
+    urgency=inf/(1+inf)=nan, and a nan weight makes urgency nan outright --
+    nan comparisons are undefined, so the DecisionQueue sort order would
+    become non-deterministic garbage for that item. Fail-soft (PRD §2) means
+    REJECTING a bad edit, not admitting a non-finite one, so this is the one
+    shared parse+finite-check site for both merge_weight_edits loops and
+    WeightEditorScreen._submit's seeded-value comparison below.
+    """
+    try:
+        value = float(raw)
+    except (TypeError, ValueError):
+        return None
+    return value if math.isfinite(value) else None
+
+
 def merge_weight_edits(
     base: Priorities,
     *,
@@ -39,24 +59,25 @@ def merge_weight_edits(
     Only category_weights/project_weights are touched (via
     dataclasses.replace) -- severity_weights/defaults/age_curve/manual_boost
     pass through from *base* unchanged. Each raw edit string (as read from a
-    WeightEditorScreen Input) is parsed with float(); an unparseable or
-    empty value is fail-soft skipped (PRD §2), keeping *base*'s existing
-    value for that key rather than raising or clearing it -- a weight is
-    cleared by typing 0, not by blanking a field.
+    WeightEditorScreen Input) is parsed via the shared _parse_weight
+    (float() plus a finite check); an unparseable, empty, or non-finite
+    ('inf'/'-inf'/'nan') value is fail-soft skipped (PRD §2), keeping
+    *base*'s existing value for that key rather than raising or clearing it
+    -- a weight is cleared by typing 0, not by blanking a field.
     """
     category_weights = dict(base.category_weights)
     for name, raw in category_edits.items():
-        try:
-            category_weights[name] = float(raw)
-        except (TypeError, ValueError):
+        value = _parse_weight(raw)
+        if value is None:
             continue
+        category_weights[name] = value
 
     project_weights = dict(base.project_weights)
     for name, raw in project_edits.items():
-        try:
-            project_weights[name] = float(raw)
-        except (TypeError, ValueError):
+        value = _parse_weight(raw)
+        if value is None:
             continue
+        project_weights[name] = value
 
     return replace(base, category_weights=category_weights, project_weights=project_weights)
 
@@ -194,10 +215,8 @@ class WeightEditorScreen(ModalScreen[None]):
         for index, name in enumerate(self._project_names):
             raw = self.query_one(f'#proj-{index}', Input).value
             seeded = self._priorities.project_weights.get(name, self._priorities.defaults.project)
-            try:
-                if float(raw) == seeded:
-                    continue
-            except (TypeError, ValueError):
+            value = _parse_weight(raw)
+            if value is None or value == seeded:
                 continue
             project_edits[name] = raw
         new_priorities = merge_weight_edits(
