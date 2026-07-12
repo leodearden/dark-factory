@@ -100,3 +100,18 @@ def _submit_triage(
     }
     artifacts.write_verdict(role, _envelope(role, session_id, payload))
     return {'status': 'ok', 'role': role}
+
+
+def _submit_merge_disposition(
+    artifacts: TaskArtifacts,
+    role: str,
+    session_id: str,
+    blocked: bool,
+    reason: str,
+) -> dict[str, Any]:
+    payload = {
+        'blocked': blocked,
+        'reason': reason,
+    }
+    artifacts.write_verdict(role, _envelope(role, session_id, payload))
+    return {'status': 'ok', 'role': role}
