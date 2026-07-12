@@ -1121,3 +1121,92 @@ class TestComputedStatsOverride:
 
         await verify_and_rewrite_stats(run_id, {self._STAGE: report}, journal)
         return report
+
+
+# ---------------------------------------------------------------------------
+# E1 — Execution-class declaration-layer enforcement at submit_task [η=2225]
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestExecutionClassEnforcement:
+    """E1 (η=2225): the REAL submit_task MCP tool boundary enforces
+    metadata.execution_class for recon-stage callers ONLY — reject when
+    missing, accept and PERSIST when valid — while a non-recon caller is
+    never gated. Scoped to η's ratified declaration layer: this class does
+    NOT assert operational -> deterministic pure-gate routing (task 2085's
+    job, not delivered by any of ο's dependencies — see plan.json design
+    decisions).
+
+    Driven through the real submit_task tool (create_mcp_server +
+    _tool_manager.call_tool, mirroring P4's MCP-boundary pattern) with an
+    AsyncMock task_interceptor standing in for taskmaster plumbing, and
+    resolve_main_checkout monkeypatched to a passthrough — mirrors
+    test_submit_resolve_tools.py's passthrough_main_checkout fixture — so a
+    synthetic project_root works without a real git working tree.
+    Backstopped by a direct guard-level round-trip against
+    execution_class_error / inject_execution_class (mirrors
+    test_execution_class_guard.py) in case the MCP-boundary accept path
+    ever needs deeper taskmaster plumbing than this AsyncMock provides.
+
+    Driving harness (``_drive_reject_missing_class`` /
+    ``_drive_accept_and_persist`` / ``_drive_non_recon_not_enforced`` /
+    ``_drive_guard_level_backstop``) lands in step-16 — this step only
+    declares the §9 postconditions, so it is RED until then (the harness
+    methods referenced below don't exist yet).
+    """
+
+    _PROJECT_ROOT = '/project'
+
+    async def test_recon_stage_missing_execution_class_rejected_before_interceptor(
+        self, monkeypatch,
+    ) -> None:
+        """A recon-stage submit_task with NO metadata.execution_class is
+        rejected with a ValidationError naming execution_class, and
+        task_interceptor.submit_task is never awaited."""
+        task_interceptor, result = await self._drive_reject_missing_class(monkeypatch)
+
+        assert result.get('error_type') == 'ValidationError', (
+            f'Expected error_type=ValidationError, got {result!r}'
+        )
+        assert 'execution_class' in result.get('error', ''), (
+            f'Expected the error message to name execution_class, got {result!r}'
+        )
+        task_interceptor.submit_task.assert_not_awaited()
+
+    @pytest.mark.parametrize('valid_class', ['code_tdd', 'operational', 'decision'])
+    async def test_recon_stage_valid_execution_class_accepted_and_persisted(
+        self, monkeypatch, valid_class,
+    ) -> None:
+        """A recon-stage submit_task WITH a valid execution_class is
+        accepted, and the class is PERSISTED into the metadata forwarded
+        to task_interceptor.submit_task."""
+        task_interceptor = await self._drive_accept_and_persist(monkeypatch, valid_class)
+
+        task_interceptor.submit_task.assert_awaited_once()
+        call_kwargs = task_interceptor.submit_task.call_args.kwargs
+        assert call_kwargs.get('metadata', {}).get('execution_class') == valid_class, (
+            f'Expected execution_class={valid_class!r} persisted into the forwarded '
+            f'metadata, got {call_kwargs.get("metadata")!r}'
+        )
+
+    async def test_non_recon_agent_id_not_enforced(self, monkeypatch) -> None:
+        """Recon-scoping negative: a non-recon (None) agent_id with NO
+        execution_class is never gated — the submission proceeds."""
+        task_interceptor = await self._drive_non_recon_not_enforced(monkeypatch)
+
+        task_interceptor.submit_task.assert_awaited_once()
+
+    async def test_guard_level_backstop_reject_and_accept_matrix(self) -> None:
+        """Backstop at the guard level (execution_class_error /
+        inject_execution_class), independent of the MCP tool wiring:
+        missing -> reject naming execution_class; valid -> accept (None)
+        AND inject_execution_class persists it into a fresh metadata
+        dict."""
+        reject, accept, persisted = self._drive_guard_level_backstop()
+
+        assert reject is not None
+        assert reject.get('error_type') == 'ValidationError'
+        assert 'execution_class' in reject.get('error', '')
+        assert accept is None
+        assert persisted.get('execution_class') == 'operational'
