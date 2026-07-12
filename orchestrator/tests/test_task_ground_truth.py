@@ -274,3 +274,60 @@ class TestDeriveTruthBranchStateJournalFirst:
         git_ops.is_ancestor.assert_not_awaited()
         git_ops.resolve_branch_sha.assert_not_awaited()
         git_ops.find_merge_marker.assert_not_awaited()
+
+
+# ---------------------------------------------------------------------------
+# step-7 — derive_truth's branch_state GIT-FALLBACK on a journal miss (TG-1)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestDeriveTruthBranchStateGitFallback:
+    """On a journal miss (``MergeProvenance`` unbound / no row for *tid*),
+    derive_truth falls back to git archaeology: all four ``BranchStateKind``
+    shapes, with ``find_merge_marker`` consulted only on the branch-gone
+    path."""
+
+    async def test_ancestor_true_resolves_on_main_via_branch_tip(self) -> None:
+        git_ops = _fake_git_ops(is_ancestor=True, branch_sha='tipsha123')
+        resolver = _make_ground_truth(git_ops=git_ops)
+
+        report = await resolver.derive_truth('7')
+
+        assert report.branch_state == BranchState(BranchStateKind.ON_MAIN, 'tipsha123')
+        git_ops.is_ancestor.assert_awaited_once_with('task/7', 'main')
+        git_ops.resolve_branch_sha.assert_awaited_once_with('task/7')
+        git_ops.find_merge_marker.assert_not_awaited()
+
+    async def test_branch_exists_not_ancestor_resolves_exists_off_main(self) -> None:
+        git_ops = _fake_git_ops(is_ancestor=False, branch_sha='tipsha456')
+        resolver = _make_ground_truth(git_ops=git_ops)
+
+        report = await resolver.derive_truth('8')
+
+        assert report.branch_state == BranchState(BranchStateKind.EXISTS_OFF_MAIN)
+        git_ops.is_ancestor.assert_awaited_once_with('task/8', 'main')
+        git_ops.resolve_branch_sha.assert_awaited_once_with('task/8')
+        git_ops.find_merge_marker.assert_not_awaited()
+
+    async def test_branch_gone_with_marker_resolves_gone_with_merge_marker(self) -> None:
+        git_ops = _fake_git_ops(is_ancestor=False, branch_sha=None, marker_sha='markersha789')
+        resolver = _make_ground_truth(git_ops=git_ops)
+
+        report = await resolver.derive_truth('9')
+
+        assert report.branch_state == BranchState(
+            BranchStateKind.GONE_WITH_MERGE_MARKER, 'markersha789',
+        )
+        git_ops.is_ancestor.assert_awaited_once_with('task/9', 'main')
+        git_ops.find_merge_marker.assert_awaited_once_with('task/9')
+
+    async def test_branch_gone_no_marker_resolves_gone_no_marker(self) -> None:
+        git_ops = _fake_git_ops(is_ancestor=False, branch_sha=None, marker_sha=None)
+        resolver = _make_ground_truth(git_ops=git_ops)
+
+        report = await resolver.derive_truth('10')
+
+        assert report.branch_state == BranchState(BranchStateKind.GONE_NO_MARKER, None)
+        git_ops.is_ancestor.assert_awaited_once_with('task/10', 'main')
+        git_ops.find_merge_marker.assert_awaited_once_with('task/10')
