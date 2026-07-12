@@ -23,6 +23,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
+from escalation.queue import EscalationQueue
 from orchestrator.harness import Harness
 from orchestrator.service_restart import StaleServiceRestartCoordinator
 
@@ -799,3 +800,103 @@ class TestOrchestratorCoordinatorEndToEnd:
         assert result is False
         assert orch_coord.is_pending is False
         harness.git_ops.get_merge_diff_files.assert_not_awaited()
+
+
+# ---------------------------------------------------------------------------
+# task 2237 step-21: harness escalation wiring for the self-restart executor
+#
+# _build_orchestrator_restart_coordinator's _systemd_run_restart_executor
+# closure must build an on_failure_escalation EscalationSpec from the
+# harness's live _escalation_queue and thread it through to
+# schedule_detached_systemd_restart — closing the RP-4 on-failure-escalation
+# gap for the REAL named consumer (proc_supervision.py itself only makes the
+# gap-closure possible; nothing in production called it with a non-None
+# on_failure_escalation until this wiring).
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestOrchestratorRestartExecutorEscalationWiring:
+    """The self-restart executor closure passes an on_failure_escalation
+    EscalationSpec (built from harness._escalation_queue) through to
+    schedule_detached_systemd_restart — or None when no queue is wired yet."""
+
+    async def test_passes_escalation_spec_built_from_harness_queue(
+        self, harness: Harness, tmp_path: Path,
+    ):
+        """With a real EscalationQueue wired, the spec's queue_dir/agent_role
+        match the harness's queue and summary/task_id are non-empty."""
+        harness.config.orchestrator_restart_on_merge_enabled = True
+        harness._escalation_queue = EscalationQueue(tmp_path / 'escalations')
+
+        coord = harness._build_orchestrator_restart_coordinator()
+
+        spy = AsyncMock()
+        with patch('orchestrator.harness.schedule_detached_systemd_restart', spy):
+            await coord._restart_executor()
+
+        spy.assert_awaited_once()
+        call_kwargs = spy.call_args.kwargs
+        assert 'on_failure_escalation' in call_kwargs
+        spec = call_kwargs['on_failure_escalation']
+        assert spec is not None
+        assert spec.queue_dir == str(harness._escalation_queue.queue_dir)
+        assert spec.agent_role == 'orchestrator-deterministic'
+        assert spec.summary
+        assert spec.task_id
+
+    async def test_passes_none_when_escalation_queue_is_none(
+        self, harness: Harness,
+    ):
+        """With _escalation_queue=None (bare harness / before
+        _start_escalation_server runs), the closure passes
+        on_failure_escalation=None without raising."""
+        harness.config.orchestrator_restart_on_merge_enabled = True
+        harness._escalation_queue = None
+
+        coord = harness._build_orchestrator_restart_coordinator()
+
+        spy = AsyncMock()
+        with patch('orchestrator.harness.schedule_detached_systemd_restart', spy):
+            await coord._restart_executor()  # must not raise
+
+        spy.assert_awaited_once()
+        call_kwargs = spy.call_args.kwargs
+        assert 'on_failure_escalation' in call_kwargs
+        assert call_kwargs['on_failure_escalation'] is None
+
+
+# ---------------------------------------------------------------------------
+# task 2237 step-21: anti-orphan guard
+#
+# proc_supervision.py must be a real, importable, referenced consumer of
+# service_restart.py — not an orphaned module — and the pre-2237 "accepted
+# gap" docstring (which described the on-failure-escalation gap this task
+# closes) must be gone.
+# ---------------------------------------------------------------------------
+
+
+class TestProcSupervisionAntiOrphanGuard:
+    """Regression lock: service_restart.py actually delegates to
+    proc_supervision.RestartPlan, and the old "accepted gap" docstring
+    paragraph it used to carry is gone."""
+
+    def test_proc_supervision_imports_cleanly(self) -> None:
+        import orchestrator.proc_supervision  # noqa: F401
+
+    def test_service_restart_source_references_restart_plan(self) -> None:
+        import inspect
+
+        from orchestrator import service_restart
+
+        source = inspect.getsource(service_restart)
+        assert 'proc_supervision' in source
+        assert 'RestartPlan' in source
+
+    def test_service_restart_source_no_longer_has_accepted_gap(self) -> None:
+        import inspect
+
+        from orchestrator import service_restart
+
+        source = inspect.getsource(service_restart)
+        assert 'accepted gap' not in source
