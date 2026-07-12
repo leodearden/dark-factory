@@ -993,29 +993,38 @@ class TestDeleteJunkKey:
 # ===========================================================================
 # Helpers: run() fixtures
 #
-# run() queries the SAME graph key for two distinct purposes -- entity
-# enumeration (a family sibling) and total-node counting (every junk-key
-# candidate, INCLUDING that same sibling, per the "plus emptied family
-# siblings" junk-key policy) -- so a single graph mock must answer both
-# ro_query shapes correctly. These helpers are shared by TestRunDryRun and
-# TestRunApply.
+# run() queries the SAME graph key for THREE distinct purposes -- Entity
+# enumeration (a family sibling), Episodic enumeration (ditto, task 2502),
+# and total-node counting (every junk-key candidate, INCLUDING that same
+# sibling, per the "plus emptied family siblings" junk-key policy) -- so a
+# single graph mock must answer all three ro_query shapes correctly. These
+# helpers are shared by TestRunDryRun and TestRunApply.
 # ===========================================================================
 
 def _make_run_graph_mock(
     entity_rows: list[list] | None = None,
+    episode_rows: list[list] | None = None,
     total_count: int | None = None,
 ) -> MagicMock:
     """Graph mock whose ro_query dispatches on the Cypher text: the
-    Entity-enumeration query returns *entity_rows*, the total-count query
-    returns [[*total_count*]]. Defaults total_count to len(entity_rows) when
-    not given explicitly."""
+    Entity-enumeration query returns *entity_rows*, the Episodic-enumeration
+    query returns *episode_rows*, and the total-count query returns
+    [[*total_count*]]. Defaults total_count to len(entity_rows) +
+    len(episode_rows) when not given explicitly -- the total-count query
+    (``MATCH (n) ...``) counts every label, so both node kinds contribute."""
     entity_rows = entity_rows if entity_rows is not None else []
+    episode_rows = episode_rows if episode_rows is not None else []
     if total_count is None:
-        total_count = len(entity_rows)
+        total_count = len(entity_rows) + len(episode_rows)
 
     async def _ro_query(cypher: str, params: dict | None = None):
         result = MagicMock()
-        result.result_set = entity_rows if 'Entity' in cypher else [[total_count]]
+        if 'Episodic' in cypher:
+            result.result_set = episode_rows
+        elif 'Entity' in cypher:
+            result.result_set = entity_rows
+        else:
+            result.result_set = [[total_count]]
         return result
 
     graph = MagicMock()
@@ -1027,6 +1036,7 @@ def _make_run_graph_mock(
 
 def _make_run_graphiti_mock(
     entity_rows_by_key: dict[str, list] | None = None,
+    episode_rows_by_key: dict[str, list] | None = None,
     total_count_by_key: dict[str, int] | None = None,
 ) -> MagicMock:
     """MagicMock graphiti whose _graph_for(key) MEMOIZES one graph mock per
@@ -1036,14 +1046,16 @@ def _make_run_graphiti_mock(
     ._graphs_by_key for post-call assertions (e.g. .delete/.query
     not-called)."""
     entity_rows_by_key = entity_rows_by_key or {}
+    episode_rows_by_key = episode_rows_by_key or {}
     total_count_by_key = total_count_by_key or {}
     graphs: dict[str, MagicMock] = {}
 
     def _graph_for(key: str) -> MagicMock:
         if key not in graphs:
             rows = entity_rows_by_key.get(key, [])
-            count = total_count_by_key.get(key, len(rows))
-            graphs[key] = _make_run_graph_mock(rows, count)
+            episode_rows = episode_rows_by_key.get(key, [])
+            count = total_count_by_key.get(key, len(rows) + len(episode_rows))
+            graphs[key] = _make_run_graph_mock(rows, episode_rows, count)
         return graphs[key]
 
     graphiti = MagicMock()
@@ -1087,6 +1099,46 @@ def _run_args(apply: bool = False, **overrides):
     return _types.SimpleNamespace(**base)
 
 
+def _patch_merge_primitives(
+    monkeypatch, *,
+    recreate_result=None,
+    create_node_side_effect=None,
+    create_episode_side_effect=None,
+    delete_node_side_effect=None,
+    delete_episode_side_effect=None,
+):
+    """Patch the five three-phase primitives merge_graph_family drives
+    (create_moved_node, create_moved_episode, recreate_subgraph_relationships,
+    delete_source_node, delete_source_episode) for run()-level orchestration
+    tests.
+
+    Cypher-level correctness of each primitive -- and of merge_graph_family's
+    own barrier ordering -- is already covered by test_cross_graph_move.py
+    and this module's TestMergeGraphFamily; these run()-level tests exercise
+    run()'s OWN per-sibling enumeration/dispatch/disposition-folding logic
+    instead, so the primitives themselves are patched away here."""
+    create_node_mock = AsyncMock(side_effect=create_node_side_effect)
+    create_episode_mock = AsyncMock(side_effect=create_episode_side_effect)
+    recreate_mock = AsyncMock(
+        return_value=recreate_result if recreate_result is not None else SubgraphEdgeResult(),
+    )
+    delete_node_mock = AsyncMock(side_effect=delete_node_side_effect)
+    delete_episode_mock = AsyncMock(side_effect=delete_episode_side_effect)
+
+    monkeypatch.setattr(_mod, 'create_moved_node', create_node_mock)
+    monkeypatch.setattr(_mod, 'create_moved_episode', create_episode_mock)
+    monkeypatch.setattr(_mod, 'recreate_subgraph_relationships', recreate_mock)
+    monkeypatch.setattr(_mod, 'delete_source_node', delete_node_mock)
+    monkeypatch.setattr(_mod, 'delete_source_episode', delete_episode_mock)
+    return {
+        'create_node': create_node_mock,
+        'create_episode': create_episode_mock,
+        'recreate': recreate_mock,
+        'delete_node': delete_node_mock,
+        'delete_episode': delete_episode_mock,
+    }
+
+
 # ===========================================================================
 # Tests: run() -- dry-run path
 # ===========================================================================
@@ -1095,12 +1147,13 @@ class TestRunDryRun:
     """Tests for async run(args, memory_service, *, limit) in dry-run (args.apply=False)."""
 
     def _scenario(self):
-        """One sibling with entity rows (know-live, unmerged); one non-empty
-        JUNK_KEYS entry (my-project); one collection with points
-        (fused_dark-factory). Every other alias/collection/key falls back to
-        the empty/zero-count default."""
+        """One sibling with entity AND episode rows (know-live, unmerged);
+        one non-empty JUNK_KEYS entry (my-project); one collection with
+        points (fused_dark-factory). Every other alias/collection/key falls
+        back to the empty/zero-count default."""
         graphiti = _make_run_graphiti_mock(
             entity_rows_by_key={'know-live': [['uuid-1', 'Node A']]},
+            episode_rows_by_key={'know-live': [['episode-1']]},
             total_count_by_key={'my-project': 3},
         )
         qdrant_client = _make_run_qdrant_mock(
@@ -1113,17 +1166,20 @@ class TestRunDryRun:
 
     @pytest.mark.asyncio
     async def test_dry_run_touches_nothing(self, monkeypatch):
-        """Dry-run performs ZERO mutations across every backend: no
-        move_entity_across_graphs, no qdrant upsert/delete_collection, no
-        GRAPH.DELETE, and read-only ro_query only (.query is NEVER called
-        on any graph)."""
-        move_mock = AsyncMock()
-        monkeypatch.setattr(_mod, 'move_entity_across_graphs', move_mock)
+        """Dry-run performs ZERO mutations across every backend: none of the
+        three-phase primitives are called, no qdrant upsert/delete_collection,
+        no GRAPH.DELETE, and read-only ro_query only (.query is NEVER called
+        on any graph -- this includes the Episodic-enumeration query)."""
+        mocks = _patch_merge_primitives(monkeypatch)
         memory_service, graphiti, qdrant_client = self._scenario()
 
         await _mod.run(_run_args(apply=False), memory_service, limit=1000)
 
-        move_mock.assert_not_called()
+        mocks['create_node'].assert_not_called()
+        mocks['create_episode'].assert_not_called()
+        mocks['recreate'].assert_not_called()
+        mocks['delete_node'].assert_not_called()
+        mocks['delete_episode'].assert_not_called()
         qdrant_client.upsert.assert_not_called()
         qdrant_client.delete_collection.assert_not_called()
         assert graphiti._graphs_by_key, 'expected at least one graph to have been touched'
@@ -1133,10 +1189,11 @@ class TestRunDryRun:
 
     @pytest.mark.asyncio
     async def test_dry_run_report_shape_and_dispositions(self):
-        """dry_run=True; a sibling with entity rows is MERGE; a collection
-        with points is MERGE; a non-empty JUNK_KEYS entry is UNRESOLVED even
-        in dry-run; an unmerged sibling is ALSO UNRESOLVED as a junk-key
-        candidate (its entities are still present, node_count > 0)."""
+        """dry_run=True; a sibling with entity rows is MERGE and carries its
+        episode_count/episode_uuids too; a collection with points is MERGE;
+        a non-empty JUNK_KEYS entry is UNRESOLVED even in dry-run; an
+        unmerged sibling is ALSO UNRESOLVED as a junk-key candidate (its
+        entities/episodes are still present, node_count > 0)."""
         memory_service, _, _ = self._scenario()
 
         report = await _mod.run(_run_args(apply=False), memory_service, limit=1000)
@@ -1147,6 +1204,8 @@ class TestRunDryRun:
         assert graph_by_sibling['know-live']['canonical'] == 'know_live'
         assert graph_by_sibling['know-live']['node_count'] == 1
         assert graph_by_sibling['know-live']['node_uuids'] == ['uuid-1']
+        assert graph_by_sibling['know-live']['episode_count'] == 1
+        assert graph_by_sibling['know-live']['episode_uuids'] == ['episode-1']
         assert graph_by_sibling['know-live']['disposition'] == 'MERGE'
 
         collection_by_source = {item['source']: item for item in report['collection_merges']}
@@ -1159,7 +1218,9 @@ class TestRunDryRun:
         assert junk_by_key['my-project']['disposition'] == 'UNRESOLVED'
         assert junk_by_key['test-project']['node_count'] == 0
         assert junk_by_key['test-project']['disposition'] == 'DELETE'
-        assert junk_by_key['know-live']['node_count'] == 1
+        # know-live's total node count is entity(1) + episode(1) = 2 -- the
+        # total-count query counts every label, not just :Entity.
+        assert junk_by_key['know-live']['node_count'] == 2
         assert junk_by_key['know-live']['disposition'] == 'UNRESOLVED'
 
     @pytest.mark.asyncio
@@ -1185,6 +1246,24 @@ class TestRunDryRun:
         not MERGE (same no-silent-caps guard as the collection scroll)."""
         rows = [['uuid-1', 'Node A'], ['uuid-2', 'Node B']]
         graphiti = _make_run_graphiti_mock(entity_rows_by_key={'know-live': rows})
+        qdrant_client = _make_run_qdrant_mock()
+        memory_service = _make_run_memory_service(graphiti, qdrant_client)
+
+        report = await _mod.run(_run_args(apply=False), memory_service, limit=2)
+
+        graph_by_sibling = {item['sibling']: item for item in report['graph_family_merges']}
+        assert graph_by_sibling['know-live']['disposition'] == 'UNRESOLVED'
+
+    @pytest.mark.asyncio
+    async def test_dry_run_sibling_unresolved_when_episode_enumeration_capped(self):
+        """A sibling whose Episodic enumeration hits --limit is UNRESOLVED,
+        not MERGE -- the same no-silent-caps guard as the Entity enumeration
+        cap, now also applied to episode enumeration (task 2502)."""
+        episode_rows = [['episode-1'], ['episode-2']]
+        graphiti = _make_run_graphiti_mock(
+            entity_rows_by_key={'know-live': [['uuid-1', 'Node A']]},
+            episode_rows_by_key={'know-live': episode_rows},
+        )
         qdrant_client = _make_run_qdrant_mock()
         memory_service = _make_run_memory_service(graphiti, qdrant_client)
 
@@ -1222,40 +1301,197 @@ class TestRunApply:
         memory_service = _make_run_memory_service(graphiti, qdrant_client)
         return memory_service, graphiti, qdrant_client
 
-    def _move_mock(self, monkeypatch) -> AsyncMock:
-        """Patch move_entity_across_graphs so the family-merge branch (which
-        --apply always exercises for a non-capped sibling) never reaches the
-        real ε primitive."""
-        move_mock = AsyncMock(
-            return_value=_mod.MoveResult(
-                uuid='uuid-1', source_graph='know-live', target_graph='know_live',
-                edges_moved=2, edges_skipped=0, mentions_moved=1, mentions_skipped=0,
-            ),
-        )
-        monkeypatch.setattr(_mod, 'move_entity_across_graphs', move_mock)
-        return move_mock
-
     @pytest.mark.asyncio
-    async def test_apply_moves_each_sibling_entity_with_rewrite_group_id(self, monkeypatch):
-        """move_entity_across_graphs is called once per sibling entity row,
-        with source=sibling, target=canonical, and rewrite_group_id=canonical
-        -- the Phase-2 identity rewrite (PRD decision 6) -- and the know-live
-        graph_family item carries the merge summary (nodes_moved etc.)."""
-        move_mock = self._move_mock(monkeypatch)
+    async def test_apply_drives_three_phase_primitives_with_rewrite_group_id(self, monkeypatch):
+        """create_moved_node is called once per sibling entity row, with
+        source=sibling, target=canonical, and rewrite_group_id=canonical --
+        the Phase-2 identity rewrite (PRD decision 6); recreate_subgraph_
+        relationships and delete_source_node are each driven once
+        afterwards; no episode primitive runs (this sibling has no episode
+        rows); and the know-live graph_family item carries the merge
+        summary (nodes_moved etc.) -- replacing the old single-call
+        move_entity_across_graphs assertion with the three-phase primitives."""
+        mocks = _patch_merge_primitives(monkeypatch)
         memory_service, graphiti, _ = self._scenario()
 
         report = await _mod.run(_run_args(apply=True), memory_service, limit=1000)
 
-        move_mock.assert_called_once()
-        call = move_mock.call_args
+        mocks['create_node'].assert_awaited_once()
+        call = mocks['create_node'].call_args
         assert call.args == (graphiti, 'uuid-1', 'know-live', 'know_live')
         assert call.kwargs == {'rewrite_group_id': 'know_live'}
+        mocks['create_episode'].assert_not_called()
+        mocks['recreate'].assert_awaited_once()
+        mocks['delete_node'].assert_awaited_once()
+        mocks['delete_episode'].assert_not_called()
 
         graph_by_sibling = {item['sibling']: item for item in report['graph_family_merges']}
         know_live_item = graph_by_sibling['know-live']
         assert know_live_item['nodes_moved'] == 1
-        assert know_live_item['edges_moved'] == 2
-        assert know_live_item['mentions_moved'] == 1
+        assert know_live_item['episodes_moved'] == 0
+        assert know_live_item['edges_recreated'] == 0
+        assert know_live_item['mentions_recreated'] == 0
+        assert know_live_item['disposition'] == 'MERGE'
+
+    @pytest.mark.asyncio
+    async def test_apply_clean_multi_node_family_stays_merge_with_summary(self, monkeypatch):
+        """A family with 2 entities + 1 episode, whose Phase-B batch reports
+        a clean (no skip/drop/blocked) edge + mention recreate, keeps
+        disposition MERGE and carries the full merge summary on the family
+        item -- the structural guarantee that a clean multi-node merge
+        (intra-family RELATES_TO edge + sibling-resident Episodic/MENTIONS)
+        is preserved end-to-end through run()."""
+        clean_result = SubgraphEdgeResult(edges_recreated=1, mentions_recreated=1)
+        mocks = _patch_merge_primitives(monkeypatch, recreate_result=clean_result)
+        graphiti = _make_run_graphiti_mock(
+            entity_rows_by_key={'know-live': [['uuid-1', 'Node A'], ['uuid-2', 'Node B']]},
+            episode_rows_by_key={'know-live': [['episode-1']]},
+            total_count_by_key={'know-live': 0},
+        )
+        qdrant_client = _make_run_qdrant_mock()
+        memory_service = _make_run_memory_service(graphiti, qdrant_client)
+
+        report = await _mod.run(_run_args(apply=True), memory_service, limit=1000)
+
+        assert mocks['create_node'].await_count == 2
+        mocks['create_episode'].assert_awaited_once()
+        assert mocks['delete_node'].await_count == 2
+        mocks['delete_episode'].assert_awaited_once()
+
+        graph_by_sibling = {item['sibling']: item for item in report['graph_family_merges']}
+        know_live_item = graph_by_sibling['know-live']
+        assert know_live_item['disposition'] == 'MERGE'
+        assert know_live_item['nodes_moved'] == 2
+        assert know_live_item['episodes_moved'] == 1
+        assert know_live_item['edges_recreated'] == 1
+        assert know_live_item['mentions_recreated'] == 1
+        assert know_live_item['edges_skipped'] == 0
+        assert know_live_item['mentions_skipped'] == 0
+        assert know_live_item['dropped_cross_target'] == []
+        assert know_live_item['blocked'] == []
+        assert _mod.has_unresolved(report) is False
+
+    @pytest.mark.asyncio
+    async def test_apply_family_edges_skipped_downgrades_to_unresolved(self, monkeypatch):
+        """A merge summary reporting edges_skipped>0 downgrades the family
+        item's disposition to UNRESOLVED -- the exact silent-signal failure
+        this task fixes: edge loss must not exit 0."""
+        lossy_result = SubgraphEdgeResult(edges_recreated=1, edges_skipped=1)
+        _patch_merge_primitives(monkeypatch, recreate_result=lossy_result)
+        graphiti = _make_run_graphiti_mock(
+            entity_rows_by_key={'know-live': [['uuid-1', 'Node A'], ['uuid-2', 'Node B']]},
+            total_count_by_key={'know-live': 0},
+        )
+        qdrant_client = _make_run_qdrant_mock()
+        memory_service = _make_run_memory_service(graphiti, qdrant_client)
+
+        report = await _mod.run(_run_args(apply=True), memory_service, limit=1000)
+
+        graph_by_sibling = {item['sibling']: item for item in report['graph_family_merges']}
+        assert graph_by_sibling['know-live']['disposition'] == 'UNRESOLVED'
+        assert _mod.has_unresolved(report) is True
+
+    @pytest.mark.asyncio
+    async def test_apply_family_mentions_skipped_downgrades_to_unresolved(self, monkeypatch):
+        """A merge summary reporting mentions_skipped>0 downgrades the
+        family item's disposition to UNRESOLVED."""
+        lossy_result = SubgraphEdgeResult(mentions_recreated=0, mentions_skipped=1)
+        _patch_merge_primitives(monkeypatch, recreate_result=lossy_result)
+        graphiti = _make_run_graphiti_mock(
+            entity_rows_by_key={'know-live': [['uuid-1', 'Node A']]},
+            episode_rows_by_key={'know-live': [['episode-1']]},
+            total_count_by_key={'know-live': 0},
+        )
+        qdrant_client = _make_run_qdrant_mock()
+        memory_service = _make_run_memory_service(graphiti, qdrant_client)
+
+        report = await _mod.run(_run_args(apply=True), memory_service, limit=1000)
+
+        graph_by_sibling = {item['sibling']: item for item in report['graph_family_merges']}
+        assert graph_by_sibling['know-live']['disposition'] == 'UNRESOLVED'
+        assert _mod.has_unresolved(report) is True
+
+    @pytest.mark.asyncio
+    async def test_apply_family_dropped_cross_target_downgrades_to_unresolved(self, monkeypatch):
+        """A merge summary carrying a non-empty dropped_cross_target list
+        downgrades the family item's disposition to UNRESOLVED, even though
+        edges_skipped/mentions_skipped are both 0."""
+        lossy_result = SubgraphEdgeResult(
+            dropped_cross_target=[{'edge_uuid': 'edge-1', 'reason': 'cross-target'}],
+        )
+        _patch_merge_primitives(monkeypatch, recreate_result=lossy_result)
+        graphiti = _make_run_graphiti_mock(
+            entity_rows_by_key={'know-live': [['uuid-1', 'Node A']]},
+            total_count_by_key={'know-live': 0},
+        )
+        qdrant_client = _make_run_qdrant_mock()
+        memory_service = _make_run_memory_service(graphiti, qdrant_client)
+
+        report = await _mod.run(_run_args(apply=True), memory_service, limit=1000)
+
+        graph_by_sibling = {item['sibling']: item for item in report['graph_family_merges']}
+        assert graph_by_sibling['know-live']['disposition'] == 'UNRESOLVED'
+        assert _mod.has_unresolved(report) is True
+
+    @pytest.mark.asyncio
+    async def test_apply_family_blocked_downgrades_to_unresolved_and_withholds_deletion(self, monkeypatch):
+        """A merge summary carrying a non-empty blocked list downgrades the
+        family item's disposition to UNRESOLVED, AND the blocked uuid's
+        source deletion is withheld (create-before-delete preserved) -- the
+        residual node keeps this sibling's junk-key count > 0, so its
+        GRAPH.DELETE is guarded off too."""
+        blocked_result = SubgraphEdgeResult(
+            blocked=[{'kind': 'edge', 'uuid': 'edge-1', 'reason': 'boom', 'node_uuids': ['uuid-1']}],
+        )
+        mocks = _patch_merge_primitives(monkeypatch, recreate_result=blocked_result)
+        graphiti = _make_run_graphiti_mock(
+            entity_rows_by_key={'know-live': [['uuid-1', 'Node A']]},
+            total_count_by_key={'know-live': 1},  # residual: source deletion withheld
+        )
+        qdrant_client = _make_run_qdrant_mock()
+        memory_service = _make_run_memory_service(graphiti, qdrant_client)
+
+        report = await _mod.run(_run_args(apply=True), memory_service, limit=1000)
+
+        mocks['delete_node'].assert_not_called()
+
+        graph_by_sibling = {item['sibling']: item for item in report['graph_family_merges']}
+        assert graph_by_sibling['know-live']['disposition'] == 'UNRESOLVED'
+        assert _mod.has_unresolved(report) is True
+
+        junk_by_key = {item['key']: item for item in report['junk_key_deletions']}
+        assert junk_by_key['know-live']['disposition'] == 'UNRESOLVED'
+        graphiti._graphs_by_key['know-live'].delete.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_apply_family_phase_a_create_failure_downgrades_to_unresolved(self, monkeypatch):
+        """A Phase-A create_moved_node failure (nodes_blocked>0 in the merge
+        summary) downgrades the family item's disposition to UNRESOLVED,
+        even though the SubgraphEdgeResult itself reports no skip/drop/
+        blocked -- the create failure alone must not be silently absorbed --
+        and the failed uuid's source deletion is withheld."""
+        def _create_node_side_effect(graphiti_arg, uuid, *rest, **kwargs):
+            raise RuntimeError('boom')
+
+        mocks = _patch_merge_primitives(
+            monkeypatch, create_node_side_effect=_create_node_side_effect,
+        )
+        graphiti = _make_run_graphiti_mock(
+            entity_rows_by_key={'know-live': [['uuid-1', 'Node A']]},
+            total_count_by_key={'know-live': 1},
+        )
+        qdrant_client = _make_run_qdrant_mock()
+        memory_service = _make_run_memory_service(graphiti, qdrant_client)
+
+        report = await _mod.run(_run_args(apply=True), memory_service, limit=1000)
+
+        mocks['delete_node'].assert_not_called()
+
+        graph_by_sibling = {item['sibling']: item for item in report['graph_family_merges']}
+        know_live_item = graph_by_sibling['know-live']
+        assert know_live_item['nodes_blocked'] == 1
+        assert know_live_item['disposition'] == 'UNRESOLVED'
+        assert _mod.has_unresolved(report) is True
 
     @pytest.mark.asyncio
     async def test_apply_upserts_with_canonical_user_id_and_deletes_source_collection(self, monkeypatch):
@@ -1263,7 +1499,7 @@ class TestRunApply:
         point's payload user_id rewritten to canonical; the not-capped
         source collection is deleted; the collection item carries
         points_upserted/source_deleted=True."""
-        self._move_mock(monkeypatch)
+        _patch_merge_primitives(monkeypatch)
         memory_service, _, qdrant_client = self._scenario()
 
         report = await _mod.run(_run_args(apply=True), memory_service, limit=1000)
@@ -1291,7 +1527,7 @@ class TestRunApply:
         disposition UNRESOLVED) untouched -- .delete() is never called on
         it. The know-live sibling, whose total count is fixed at 0 (the
         post-move state), is likewise DELETE-able in the same pass."""
-        self._move_mock(monkeypatch)
+        _patch_merge_primitives(monkeypatch)
         memory_service, graphiti, _ = self._scenario()
 
         report = await _mod.run(_run_args(apply=True), memory_service, limit=1000)
@@ -1307,7 +1543,7 @@ class TestRunApply:
     @pytest.mark.asyncio
     async def test_apply_report_dry_run_is_false(self, monkeypatch):
         """report['dry_run'] is False when args.apply is True."""
-        self._move_mock(monkeypatch)
+        _patch_merge_primitives(monkeypatch)
         memory_service, _, _ = self._scenario()
 
         report = await _mod.run(_run_args(apply=True), memory_service, limit=1000)
@@ -1319,7 +1555,7 @@ class TestRunApply:
         """A collection whose scroll hits --limit is NOT deleted even with
         --apply (no data loss on a partial migration) and its disposition
         stays UNRESOLVED."""
-        self._move_mock(monkeypatch)
+        _patch_merge_primitives(monkeypatch)
         points = [_make_point(f'p{i}') for i in range(2)]
         graphiti = _make_run_graphiti_mock()
         qdrant_client = _make_run_qdrant_mock(
