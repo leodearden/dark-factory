@@ -1197,6 +1197,18 @@ class SqliteTaskBackend:
             conn = await connect_daemon(str(self._db_path(project_root)), isolation_level=None)
             await apply_wal_pragmas(conn, busy_timeout_ms=5000)
             conn.row_factory = aiosqlite.Row
+            # Re-check once more: close() could have run to completion
+            # entirely during the connect_daemon/apply_wal_pragmas awaits
+            # above (it doesn't hold this per-project lock, only the global
+            # one, and only briefly). If so, it already snapshotted-and-
+            # drained self._read_connections — without this conn, since it
+            # wasn't cached yet — and closed everything it saw. Caching it
+            # now would strand a live connection past shutdown, so close it
+            # ourselves and raise instead.
+            if self._closed:
+                with contextlib.suppress(Exception):
+                    await conn.close()
+                raise RuntimeError('SqliteTaskBackend is closed')
             self._read_connections[project_root] = conn
             logger.info('SqliteTaskBackend opened read connection for %s', project_root)
             return conn

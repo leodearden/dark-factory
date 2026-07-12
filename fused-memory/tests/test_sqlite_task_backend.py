@@ -4029,6 +4029,53 @@ async def test_get_read_connection_does_not_leak_when_closed_during_bring_up(
     )
 
 
+@pytest.mark.asyncio
+async def test_get_read_connection_does_not_leak_when_closed_during_open(
+    backend, project_root, monkeypatch,
+):
+    """_get_read_connection must not strand a live connection in
+    ``self._read_connections`` if ``close()`` runs to completion *during*
+    the ``connect_daemon``/``apply_wal_pragmas`` open sequence — i.e. after
+    the pre-open ``self._closed`` re-check (inside the per-project lock)
+    but before the new connection is cached.
+
+    Regression test for a second, narrower resource-leak race flagged in
+    task 2455 review (distinct from
+    ``test_get_read_connection_does_not_leak_when_closed_during_bring_up``,
+    which covers the earlier window before the lock is acquired): a
+    ``close()`` that wins the race here drains an ``_read_connections`` map
+    that doesn't contain this in-flight connection yet (it isn't cached
+    until after the open completes), so without a post-open re-check the
+    connection would be cached anyway — stranded past shutdown, since
+    ``close()`` already ran and is idempotent.
+    """
+    from fused_memory.backends import sqlite_task_backend as _sb
+
+    await backend.add_task(project_root=project_root, title='T1')
+
+    real_connect_daemon = _sb.connect_daemon
+
+    async def _connect_daemon_then_close(*args, **kwargs):
+        conn = await real_connect_daemon(*args, **kwargs)
+        # Simulate close() winning the race here: it runs to completion
+        # (setting self._closed and draining the — at this point still
+        # empty — _read_connections map, since this conn isn't cached
+        # yet) while _get_read_connection is still inside its
+        # connect_daemon/apply_wal_pragmas open sequence.
+        await backend.close()
+        return conn
+
+    monkeypatch.setattr(_sb, 'connect_daemon', _connect_daemon_then_close)
+
+    with pytest.raises(RuntimeError, match='closed'):
+        await backend._get_read_connection(project_root)
+
+    assert backend._read_connections == {}, (
+        'Expected no connection to be stranded in _read_connections after a '
+        f'close() race during open, got: {backend._read_connections}'
+    )
+
+
 # ── Corrupt-blob refusal tests (task 1813) ──────────────────────────────
 
 
