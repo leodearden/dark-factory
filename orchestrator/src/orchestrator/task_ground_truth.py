@@ -250,6 +250,19 @@ class TaskGroundTruth:
         # inlined per-sweep in harness._reconcile_one_stranded).
         branch = f'{self.git_ops.config.branch_prefix}{tid}'
         main_branch = self.git_ops.config.main_branch
+        # Safe to call is_ancestor before confirming `branch` exists: per
+        # git_ops.py, `_run` maps every git exit code to a plain
+        # (rc, stdout, stderr) tuple, and `is_ancestor` reduces that to
+        # `rc == 0` — so `git merge-base --is-ancestor` against a missing
+        # ref exits non-zero ("fatal: not a valid object name") and is
+        # folded into False exactly like a real non-ancestor result; it
+        # never raises for that case. `_run` raises `WorktreeMissing` only
+        # when the worktree directory itself (`cwd`) is gone, which is a
+        # distinct failure mode from a missing branch ref inside an
+        # existing worktree. (Verified by inspection against git_ops.py —
+        # task 2242 amendment review finding #5; an integration-style test
+        # against real git for this path is deferred to θ2 wiring, per that
+        # review's own suggested fix.)
         if await self.git_ops.is_ancestor(branch, main_branch):
             sha = await self.git_ops.resolve_branch_sha(branch)
             return BranchState(BranchStateKind.ON_MAIN, sha)
