@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import os
 import shutil
+import urllib.parse
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Literal
@@ -115,6 +116,33 @@ _HEURISTICS_FILENAME = 'heuristics.txt'
 _PROVENANCE_FILENAME = 'provenance.json'
 
 
+def _encode_segment(segment: str) -> str:
+    """Encode one on-disk key segment: filesystem-safe, injective, traversal-safe.
+
+    ``urllib.parse.quote(segment, safe='')`` alone is not sufficient: per
+    RFC 3986, ``.`` (like ``-_~`` and alphanumerics) is *always* left
+    unescaped by :func:`urllib.parse.quote` — the ``safe`` argument only
+    controls which *additional* characters are spared, it cannot force an
+    always-safe character to be escaped. So a segment equal to ``'..'``
+    would quote to ``'..'`` unchanged and still resolve as a parent-directory
+    reference.
+
+    To close that gap, every literal ``.`` left over from ``quote()`` is
+    replaced with the 3-character escape ``%2E`` (the same escape a naive
+    percent-encoder would have produced for it). This is still injective:
+    ``quote()`` never escapes a ``.`` itself (it is always-safe), so the
+    literal substring ``%2E`` never occurs natively in a ``quote()`` output —
+    every ``%`` in a ``quote()`` output starts a genuine, non-``%2E`` escape
+    triple. That means the position of every ``.``-derived ``%2E`` in the
+    final string is unambiguous, so distinct inputs can never collide on the
+    same encoded segment. A segment of ``'.'`` or ``'..'`` therefore encodes
+    to ``'%2E'`` / ``'%2E%2E'`` — plain directory names that cannot be
+    interpreted as "this directory" or "parent directory" — so no segment
+    can ever escape the store root.
+    """
+    return urllib.parse.quote(segment, safe='').replace('.', '%2E')
+
+
 def _atomic_write_text(path: Path, text: str) -> None:
     """Write *text* to *path* via temp-in-dir + os.replace (safe_io.py's pattern).
 
@@ -141,10 +169,9 @@ class PromptArtifactStore:
         self.root = Path(root)
 
     def _key_dir(self, prompt_id: str, executor_model: str, harness_version: str) -> Path:
-        # NOTE: naive direct segment join for now — hardened to a
-        # filesystem-safe, collision-free, traversal-safe encoding once
-        # TestKeyIsolationAndPathSafety is in place.
-        return self.root / prompt_id / executor_model / harness_version
+        return self.root.joinpath(
+            *(_encode_segment(segment) for segment in (prompt_id, executor_model, harness_version))
+        )
 
     def resolve(
         self, spec: PromptSpec, executor_model: str, harness_version: str
