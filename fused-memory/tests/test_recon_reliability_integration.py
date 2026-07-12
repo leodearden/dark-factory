@@ -87,9 +87,11 @@ import pytest_asyncio
 
 from fused_memory.middleware.task_interceptor import TaskInterceptor
 from fused_memory.models.reconciliation import StageId, StageReport
+from fused_memory.models.scope import ProjectId, ProjectRoot, ProjectScope
 from fused_memory.reconciliation.event_buffer import EventBuffer
 from fused_memory.reconciliation.flag_dedup import filter_suppressed, write_suppression_record
 from fused_memory.reconciliation.recon_ledger import ReconLedgerRecord, ReconLedgerStore
+from fused_memory.reconciliation.stages.task_knowledge_sync import _gc_recon_markers
 from fused_memory.services.write_journal import WriteJournal
 
 # Recon-stage agent_id used throughout this suite's interceptor/journal
@@ -238,6 +240,12 @@ def _make_stage_report(**overrides) -> StageReport:
     }
     defaults.update(overrides)
     return StageReport(**defaults)
+
+
+def _scope(project_id: str, project_root: str) -> ProjectScope:
+    """Build a ProjectScope from raw strings — mirrors test_stages.py's
+    helper of the same name, used by L4's ``_gc_recon_markers`` drive."""
+    return ProjectScope(ProjectId(project_id), ProjectRoot(project_root))
 
 
 # ---------------------------------------------------------------------------
@@ -595,3 +603,49 @@ class TestGcTerminalReferenced:
             task_id=self._LIVE_TASK_ID, flag_type='flag_live', run_id='',
         )
         assert live_marker is not None, 'Expected the live-referenced marker to be kept'
+
+    # -- driving harness (task 2232 step-6) ---------------------------------
+
+    async def _drive_gc_pass(self, ledger: ReconLedgerStore) -> int:
+        """Seed a terminal-referenced marker and a live-referenced marker
+        directly on the real ledger, wire a taskmaster whose get_statuses
+        reports the terminal/live split, and drive the real consumer
+        _gc_recon_markers(memory_service, taskmaster, scope, run_id, now=)."""
+        seeded_at = '2026-07-01T00:00:00+00:00'
+        far_future = '2099-01-01T00:00:00+00:00'  # never TTL-expires in this test
+
+        await ledger.upsert(ReconLedgerRecord(
+            project_id=self._PROJECT,
+            record_kind='stage1_flag_marker',
+            payload_json='{}',
+            state='active',
+            created_at=seeded_at,
+            task_id=self._TERMINAL_TASK_ID,
+            flag_type='flag_terminal',
+            run_id='',
+            expires_at=far_future,
+        ))
+        await ledger.upsert(ReconLedgerRecord(
+            project_id=self._PROJECT,
+            record_kind='stage1_flag_marker',
+            payload_json='{}',
+            state='active',
+            created_at=seeded_at,
+            task_id=self._LIVE_TASK_ID,
+            flag_type='flag_live',
+            run_id='',
+            expires_at=far_future,
+        ))
+
+        memory_service = AsyncMock()
+        memory_service.recon_ledger = ledger
+        taskmaster = AsyncMock()
+        taskmaster.get_statuses = AsyncMock(
+            return_value={self._TERMINAL_TASK_ID: 'done', self._LIVE_TASK_ID: 'in-progress'},
+        )
+        scope = _scope(self._PROJECT, '/tmp/' + self._PROJECT)
+
+        return await _gc_recon_markers(
+            memory_service, taskmaster, scope, 'r1',
+            now=datetime(2026, 7, 9, 0, 0, 0, tzinfo=UTC),
+        )
