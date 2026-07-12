@@ -10,9 +10,11 @@ suite that exercises full ticks end-to-end.
 import dataclasses
 
 import pytest
+from _recording_event_store import _RecordingEventStore
 
 from orchestrator.config import OrchestratorConfig
-from orchestrator.scheduler import Scheduler, TickContext
+from orchestrator.event_store import EventType
+from orchestrator.scheduler import _CONTINUE, Scheduler, TickContext
 
 
 @pytest.fixture
@@ -60,3 +62,51 @@ class TestTickContextShape:
         assert default_ctx.stale_ids == set()
         assert default_ctx.psi_hold is False
         assert default_ctx.dispatch_deferred_emitted is False
+
+
+class TestHygienePhases:
+    """Isolation tests for the Hygiene phases (park_gc, stale_sweep,
+    cooldown_gc) — each calls its ``_phase_*`` method directly against a
+    hand-built ``TickContext``, no full-tick orchestration."""
+
+    @pytest.mark.asyncio
+    async def test_phase_park_gc_evicts_terminal_owner(self, scheduler: Scheduler):
+        event_store = _RecordingEventStore()
+        scheduler.event_store = event_store  # type: ignore[assignment]
+        scheduler.lock_table.install_parks('A', ['backend'], priority='medium')
+        assert scheduler.lock_table.has_parks('A')
+
+        ctx = TickContext(tasks=[], status_map={'A': 'done'}, tasks_by_id={})
+        result = await scheduler._phase_park_gc(ctx)
+
+        assert result is _CONTINUE
+        assert not scheduler.lock_table.has_parks('A')
+        expired = [e for e in event_store.events if 'reservation_expired' in e[0]]
+        assert len(expired) == 1
+        assert expired[0][1]['task_id'] == 'A'
+        assert expired[0][1]['data']['reason'] == 'terminal:done'
+
+    @pytest.mark.asyncio
+    async def test_phase_stale_sweep_runs_registry_gc(self, scheduler: Scheduler):
+        scheduler._skip_count['A'] = 3
+        scheduler._streak_local_backfill.counts[('A', '9')] = 2
+
+        ctx = TickContext(tasks=[], status_map={'A': 'cancelled'}, tasks_by_id={})
+        result = await scheduler._phase_stale_sweep(ctx)
+
+        assert result is _CONTINUE
+        assert 'A' in ctx.stale_ids
+        assert 'A' not in scheduler._skip_count
+        # Proves _streak_registry.gc (StreakRegistry.gc, task 2124) was
+        # actually consumed — not a re-collapsed hand loop.
+        assert ('A', '9') not in scheduler._streak_local_backfill.counts
+
+    @pytest.mark.asyncio
+    async def test_phase_cooldown_gc_drops_expired(self, scheduler: Scheduler):
+        scheduler._requeue_until['A'] = scheduler._time_source() - 1.0
+
+        ctx = TickContext(tasks=[], status_map={}, tasks_by_id={})
+        result = await scheduler._phase_cooldown_gc(ctx)
+
+        assert result is _CONTINUE
+        assert 'A' not in scheduler._requeue_until
