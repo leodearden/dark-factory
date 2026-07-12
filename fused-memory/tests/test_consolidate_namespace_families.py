@@ -10,9 +10,11 @@ import importlib.util
 import sys
 import types
 from pathlib import Path
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import ANY, AsyncMock, MagicMock
 
 import pytest
+
+from fused_memory.maintenance.cross_graph_move import SubgraphEdgeResult
 
 SCRIPT_PATH = Path(__file__).parent.parent / 'scripts' / 'consolidate_namespace_families.py'
 
@@ -548,68 +550,256 @@ class TestCountGraphNodes:
 # ===========================================================================
 
 class TestMergeGraphFamily:
-    """Tests for async merge_graph_family(graphiti, sibling, canonical, node_rows)."""
+    """Tests for async merge_graph_family(graphiti, sibling, canonical,
+    entity_rows, episode_rows) -- the three-phase barrier-ordered apply
+    (task 2502, template: migrate_cross_graph_leak.py's run()): Phase A
+    creates every entity + episode in canonical BEFORE any delete; Phase B
+    recreates every intra-family RELATES_TO edge and MENTIONS link in ONE
+    batched call; Phase C deletes every non-blocked/non-failed source.
+    """
+
+    def _patch_primitives(
+        self, monkeypatch, *,
+        create_node_side_effect=None,
+        create_episode_side_effect=None,
+        recreate_result=None,
+        delete_node_side_effect=None,
+        delete_episode_side_effect=None,
+    ):
+        """Patch every three-phase primitive merge_graph_family drives (all
+        five are new module-level names this task adds to the script's
+        import block -- absent until step-8 lands, hence raising=False),
+        returning the mocks for call-order/argument assertions."""
+        create_node_mock = AsyncMock(side_effect=create_node_side_effect)
+        create_episode_mock = AsyncMock(side_effect=create_episode_side_effect)
+        recreate_mock = AsyncMock(
+            return_value=recreate_result if recreate_result is not None else SubgraphEdgeResult(),
+        )
+        delete_node_mock = AsyncMock(side_effect=delete_node_side_effect)
+        delete_episode_mock = AsyncMock(side_effect=delete_episode_side_effect)
+
+        monkeypatch.setattr(_mod, 'create_moved_node', create_node_mock, raising=False)
+        monkeypatch.setattr(_mod, 'create_moved_episode', create_episode_mock, raising=False)
+        monkeypatch.setattr(_mod, 'recreate_subgraph_relationships', recreate_mock, raising=False)
+        monkeypatch.setattr(_mod, 'delete_source_node', delete_node_mock, raising=False)
+        monkeypatch.setattr(_mod, 'delete_source_episode', delete_episode_mock, raising=False)
+        return {
+            'create_node': create_node_mock,
+            'create_episode': create_episode_mock,
+            'recreate': recreate_mock,
+            'delete_node': delete_node_mock,
+            'delete_episode': delete_episode_mock,
+        }
 
     @pytest.mark.asyncio
-    async def test_calls_move_once_per_node_with_rewrite_group_id(self, monkeypatch):
-        """move_entity_across_graphs is called once per node row, with
-        source=sibling, target=canonical, and rewrite_group_id=canonical --
-        the Phase-2 identity rewrite (PRD decision 6)."""
-        node_rows = [{'uuid': 'uuid-1', 'name': 'A'}, {'uuid': 'uuid-2', 'name': 'B'}]
-        move_mock = AsyncMock(side_effect=[
-            _mod.MoveResult(uuid='uuid-1', source_graph='know-live', target_graph='know_live'),
-            _mod.MoveResult(uuid='uuid-2', source_graph='know-live', target_graph='know_live'),
-        ])
-        monkeypatch.setattr(_mod, 'move_entity_across_graphs', move_mock)
-        graphiti = MagicMock()
+    async def test_barrier_ordering_all_creates_before_any_delete(self, monkeypatch):
+        """Every create_moved_node/create_moved_episode call is awaited
+        BEFORE any delete_source_node/delete_source_episode call -- the
+        barrier ordering that guarantees a co-moving intra-family RELATES_TO
+        edge (or a MENTIONS link onto a just-relocated episode) survives.
+        """
+        call_order = []
 
-        await _mod.merge_graph_family(graphiti, 'know-live', 'know_live', node_rows)
+        def _record(tag):
+            def _fn(graphiti_arg, uuid, *rest, **kwargs):
+                call_order.append((tag, uuid))
+            return _fn
 
-        assert move_mock.call_count == 2
-        for call, row in zip(move_mock.call_args_list, node_rows, strict=True):
-            assert call.args == (graphiti, row['uuid'], 'know-live', 'know_live')
-            assert call.kwargs == {'rewrite_group_id': 'know_live'}
+        mocks = self._patch_primitives(
+            monkeypatch,
+            create_node_side_effect=_record('create_node'),
+            create_episode_side_effect=_record('create_episode'),
+            delete_node_side_effect=_record('delete_node'),
+            delete_episode_side_effect=_record('delete_episode'),
+        )
+
+        entity_rows = [{'uuid': 'entity-1', 'name': 'Alice'}, {'uuid': 'entity-2', 'name': 'Bob'}]
+        episode_rows = [{'uuid': 'episode-1'}]
+
+        await _mod.merge_graph_family(
+            MagicMock(), 'know-live', 'know_live', entity_rows, episode_rows,
+        )
+
+        tags = [t for t, _u in call_order]
+        last_create_idx = max(i for i, t in enumerate(tags) if t in ('create_node', 'create_episode'))
+        first_delete_idx = min(i for i, t in enumerate(tags) if t in ('delete_node', 'delete_episode'))
+        assert last_create_idx < first_delete_idx
+
+        assert {u for t, u in call_order if t == 'create_node'} == {'entity-1', 'entity-2'}
+        assert {u for t, u in call_order if t == 'create_episode'} == {'episode-1'}
+        assert {u for t, u in call_order if t == 'delete_node'} == {'entity-1', 'entity-2'}
+        assert {u for t, u in call_order if t == 'delete_episode'} == {'episode-1'}
+        mocks['recreate'].assert_awaited_once()
 
     @pytest.mark.asyncio
-    async def test_tallies_move_results(self, monkeypatch):
-        """The MoveResults' edges/mentions counters are summed, and
-        nodes_moved reflects the number of nodes processed."""
-        node_rows = [{'uuid': 'uuid-1', 'name': 'A'}, {'uuid': 'uuid-2', 'name': 'B'}]
-        move_mock = AsyncMock(side_effect=[
-            _mod.MoveResult(
-                uuid='uuid-1', source_graph='know-live', target_graph='know_live',
-                edges_moved=2, edges_skipped=1, mentions_moved=3, mentions_skipped=0,
-            ),
-            _mod.MoveResult(
-                uuid='uuid-2', source_graph='know-live', target_graph='know_live',
-                edges_moved=1, edges_skipped=0, mentions_moved=0, mentions_skipped=1,
-            ),
-        ])
-        monkeypatch.setattr(_mod, 'move_entity_across_graphs', move_mock)
-        graphiti = MagicMock()
+    async def test_creates_use_rewrite_group_id_canonical(self, monkeypatch):
+        """Every create_moved_node/create_moved_episode call is given
+        rewrite_group_id=canonical -- the Phase-2 identity rewrite (PRD
+        decision 6)."""
+        mocks = self._patch_primitives(monkeypatch)
+        entity_rows = [{'uuid': 'entity-1', 'name': 'Alice'}]
+        episode_rows = [{'uuid': 'episode-1'}]
 
-        summary = await _mod.merge_graph_family(graphiti, 'know-live', 'know_live', node_rows)
+        await _mod.merge_graph_family(
+            MagicMock(), 'know-live', 'know_live', entity_rows, episode_rows,
+        )
+
+        node_call = mocks['create_node'].call_args
+        assert node_call.args == (ANY, 'entity-1', 'know-live', 'know_live')
+        assert node_call.kwargs == {'rewrite_group_id': 'know_live'}
+
+        episode_call = mocks['create_episode'].call_args
+        assert episode_call.args == (ANY, 'episode-1', 'know-live', 'know_live')
+        assert episode_call.kwargs == {'rewrite_group_id': 'know_live'}
+
+    @pytest.mark.asyncio
+    async def test_recreate_subgraph_relationships_called_once_with_move_specs(self, monkeypatch):
+        """recreate_subgraph_relationships is called EXACTLY once with a
+        MOVE spec (source=sibling, target=canonical) for every entity --
+        NOT once per entity -- so a co-moving intra-family edge shared by
+        two specs in this batch is deduped and recreated exactly once."""
+        mocks = self._patch_primitives(monkeypatch)
+        entity_rows = [{'uuid': 'entity-1', 'name': 'Alice'}, {'uuid': 'entity-2', 'name': 'Bob'}]
+
+        await _mod.merge_graph_family(MagicMock(), 'know-live', 'know_live', entity_rows, [])
+
+        mocks['recreate'].assert_awaited_once()
+        specs = mocks['recreate'].call_args.args[1]
+        assert {s['uuid'] for s in specs} == {'entity-1', 'entity-2'}
+        for spec in specs:
+            assert spec['disposition'] == 'MOVE'
+            assert spec['source_graph'] == 'know-live'
+            assert spec['target_graph'] == 'know_live'
+
+    @pytest.mark.asyncio
+    async def test_deletes_run_after_phase_b_for_every_non_blocked_source(self, monkeypatch):
+        """delete_source_node/delete_source_episode run for every
+        entity/episode once Phase A + Phase B have both completed cleanly.
+        """
+        mocks = self._patch_primitives(monkeypatch)
+        entity_rows = [{'uuid': 'entity-1', 'name': 'Alice'}, {'uuid': 'entity-2', 'name': 'Bob'}]
+        episode_rows = [{'uuid': 'episode-1'}]
+
+        await _mod.merge_graph_family(
+            MagicMock(), 'know-live', 'know_live', entity_rows, episode_rows,
+        )
+
+        assert mocks['delete_node'].await_count == 2
+        deleted_node_uuids = {c.args[1] for c in mocks['delete_node'].call_args_list}
+        assert deleted_node_uuids == {'entity-1', 'entity-2'}
+        for c in mocks['delete_node'].call_args_list:
+            assert c.args[2] == 'know-live'  # source_graph
+
+        mocks['delete_episode'].assert_awaited_once()
+        episode_call = mocks['delete_episode'].call_args
+        assert episode_call.args[1] == 'episode-1'
+        assert episode_call.args[2] == 'know-live'
+
+    @pytest.mark.asyncio
+    async def test_withholds_deletion_for_phase_a_create_failure(self, monkeypatch):
+        """A uuid whose Phase-A create_moved_node raises is isolated: its
+        source deletion is WITHHELD (create-before-delete preserved) and it
+        is excluded from the Phase-B batch, but the OTHER entity still
+        proceeds through Phase B/C cleanly."""
+        def _create_node_side_effect(graphiti_arg, uuid, *rest, **kwargs):
+            if uuid == 'entity-1':
+                raise RuntimeError('boom')
+
+        mocks = self._patch_primitives(
+            monkeypatch, create_node_side_effect=_create_node_side_effect,
+        )
+        entity_rows = [{'uuid': 'entity-1', 'name': 'Alice'}, {'uuid': 'entity-2', 'name': 'Bob'}]
+
+        summary = await _mod.merge_graph_family(
+            MagicMock(), 'know-live', 'know_live', entity_rows, [],
+        )
+
+        deleted_node_uuids = {c.args[1] for c in mocks['delete_node'].call_args_list}
+        assert 'entity-1' not in deleted_node_uuids
+        assert 'entity-2' in deleted_node_uuids
+
+        # The failed entity must not be offered to Phase B either -- its
+        # target-graph copy was never created.
+        specs = mocks['recreate'].call_args.args[1]
+        assert {s['uuid'] for s in specs} == {'entity-2'}
+
+        assert summary['nodes_blocked'] == 1
+        assert summary['nodes_moved'] == 1
+
+    @pytest.mark.asyncio
+    async def test_withholds_deletion_for_phase_b_blocked_uuid(self, monkeypatch):
+        """A uuid named in Phase B's SubgraphEdgeResult.blocked has its
+        source deletion WITHHELD -- the un-recreated edge/mention still
+        exists only in source, so deleting it would destroy the only copy.
+        """
+        blocked_result = SubgraphEdgeResult(
+            edges_recreated=0,
+            blocked=[{'kind': 'edge', 'uuid': 'edge-1', 'reason': 'boom', 'node_uuids': ['entity-1']}],
+        )
+        mocks = self._patch_primitives(monkeypatch, recreate_result=blocked_result)
+        entity_rows = [{'uuid': 'entity-1', 'name': 'Alice'}, {'uuid': 'entity-2', 'name': 'Bob'}]
+
+        summary = await _mod.merge_graph_family(
+            MagicMock(), 'know-live', 'know_live', entity_rows, [],
+        )
+
+        deleted_node_uuids = {c.args[1] for c in mocks['delete_node'].call_args_list}
+        assert 'entity-1' not in deleted_node_uuids
+        assert 'entity-2' in deleted_node_uuids
+        assert summary['blocked'] == blocked_result.blocked
+        assert summary['nodes_blocked'] == 1
+        assert summary['nodes_moved'] == 1
+
+    @pytest.mark.asyncio
+    async def test_summary_tallies_and_surfaces_dropped_and_blocked(self, monkeypatch):
+        """The returned summary tallies nodes_moved/episodes_moved/
+        edges_recreated/edges_skipped/mentions_recreated/mentions_skipped
+        and carries dropped_cross_target + blocked -- never silently
+        dropped."""
+        recreate_result = SubgraphEdgeResult(
+            edges_recreated=1, edges_skipped=1,
+            mentions_recreated=1, mentions_skipped=0,
+            dropped_cross_target=[{'edge_uuid': 'edge-2', 'reason': 'cross-target'}],
+        )
+        mocks = self._patch_primitives(monkeypatch, recreate_result=recreate_result)
+        entity_rows = [{'uuid': 'entity-1', 'name': 'Alice'}, {'uuid': 'entity-2', 'name': 'Bob'}]
+        episode_rows = [{'uuid': 'episode-1'}]
+
+        summary = await _mod.merge_graph_family(
+            MagicMock(), 'know-live', 'know_live', entity_rows, episode_rows,
+        )
 
         assert summary['nodes_moved'] == 2
-        assert summary['edges_moved'] == 3
+        assert summary['episodes_moved'] == 1
+        assert summary['nodes_blocked'] == 0
+        assert summary['episodes_blocked'] == 0
+        assert summary['edges_recreated'] == 1
         assert summary['edges_skipped'] == 1
-        assert summary['mentions_moved'] == 3
-        assert summary['mentions_skipped'] == 1
+        assert summary['mentions_recreated'] == 1
+        assert summary['mentions_skipped'] == 0
+        assert summary['dropped_cross_target'] == recreate_result.dropped_cross_target
+        assert summary['blocked'] == []
 
     @pytest.mark.asyncio
-    async def test_empty_node_rows_returns_zeroed_summary_without_calling_move(self, monkeypatch):
-        """No node rows -> move_entity_across_graphs is never called, and the
-        summary is all-zero."""
-        move_mock = AsyncMock()
-        monkeypatch.setattr(_mod, 'move_entity_across_graphs', move_mock)
-        graphiti = MagicMock()
+    async def test_empty_family_makes_no_primitive_calls_and_zeroed_summary(self, monkeypatch):
+        """No entity rows and no episode rows -> none of the three-phase
+        primitives are called, and the summary is all-zero/empty."""
+        mocks = self._patch_primitives(monkeypatch)
 
-        summary = await _mod.merge_graph_family(graphiti, 'know-live', 'know_live', [])
+        summary = await _mod.merge_graph_family(MagicMock(), 'know-live', 'know_live', [], [])
 
-        move_mock.assert_not_called()
+        mocks['create_node'].assert_not_called()
+        mocks['create_episode'].assert_not_called()
+        mocks['recreate'].assert_not_called()
+        mocks['delete_node'].assert_not_called()
+        mocks['delete_episode'].assert_not_called()
+
         assert summary == {
-            'nodes_moved': 0, 'edges_moved': 0, 'edges_skipped': 0,
-            'mentions_moved': 0, 'mentions_skipped': 0,
+            'nodes_moved': 0, 'episodes_moved': 0,
+            'nodes_blocked': 0, 'episodes_blocked': 0,
+            'edges_recreated': 0, 'edges_skipped': 0,
+            'mentions_recreated': 0, 'mentions_skipped': 0,
+            'dropped_cross_target': [], 'blocked': [],
         }
 
 
