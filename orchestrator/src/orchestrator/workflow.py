@@ -93,6 +93,12 @@ from orchestrator.verify import (
 from orchestrator.verify_categories import PREEXISTING_BREAK_SKIP_CATEGORIES, FailureCategory
 from orchestrator.workflow_types import (  # noqa: F401  re-export shim
     IllegalTransition,
+    StewardBudgetExhausted,
+    StewardInterrupted,
+    StewardOutcome,
+    StewardReescalatedL1,
+    StewardResolved,
+    StewardTerminalDecision,
     TerminalReport,
     WorkflowOutcome,
     WorkflowState,

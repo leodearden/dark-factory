@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import enum
 from dataclasses import dataclass
+from typing import Literal
 
 from shared.task_statuses import TaskStatus
 from shared.task_transitions import (
@@ -36,6 +37,12 @@ from orchestrator.verify_categories import FailureCategory
 __all__ = [
     "STATE_TO_STATUS",
     "IllegalTransition",
+    "StewardBudgetExhausted",
+    "StewardInterrupted",
+    "StewardOutcome",
+    "StewardReescalatedL1",
+    "StewardResolved",
+    "StewardTerminalDecision",
     "TerminalReport",
     "WorkflowOutcome",
     "WorkflowState",
@@ -103,6 +110,91 @@ class TerminalReport:
     detail: str
     category: FailureCategory | None
     blocked_from_phase: WorkflowState | None = None
+
+
+@dataclass(frozen=True)
+class StewardResolved:
+    """The steward cleared the level-0 escalation itself (no re-escalation).
+
+    Published by :meth:`TaskSteward._handle_escalation` on the success
+    branch. ``resolution_text`` is sourced from the resolved escalation's
+    ``resolution`` field, falling back to the invocation result/summary.
+    """
+
+    resolution_text: str
+
+
+@dataclass(frozen=True)
+class StewardReescalatedL1:
+    """The steward gave up and filed a level-1 (human) escalation.
+
+    Published by :meth:`TaskSteward._auto_escalate_to_human` — the single
+    choke point for every give-up path (empty-output cap, worktree-missing
+    preflight, and the wip-less branches of the retry/timeout caps below).
+    ``esc_id`` is the id of the newly-filed level-1 escalation.
+    """
+
+    esc_id: str
+
+
+@dataclass(frozen=True)
+class StewardTerminalDecision:
+    """The scheduler's task status is already terminal or ``deferred``.
+
+    SYNTHESIZED by :meth:`TaskWorkflow._await_steward_completion` from a
+    single scheduler status read — never published by the steward itself
+    (the steward has no scheduler reference; only the workflow can observe
+    status changes the sub-agent made via MCP tools). Overrides a channel
+    ``StewardResolved`` when both are true (the terminal/deferred check
+    takes precedence, preserving the pre-W9-δ ordering).
+    """
+
+    new_status: TaskStatus
+
+
+@dataclass(frozen=True)
+class StewardInterrupted:
+    """The steward's work on this escalation was cut short.
+
+    ``reason='attempt_cap'`` — the per-escalation retry limit
+    (``steward_max_attempts``) was reached.  ``reason='timeout'`` — either
+    the steward's per-escalation wall-clock timeout cap fired, or
+    :meth:`TaskWorkflow._await_steward_completion`'s grace period elapsed
+    with no outcome published.
+
+    ``wip_commits_present`` is the task-2060 fix: when ``True``, the
+    workflow's resume-plan branch re-pends the task instead of filing an L1
+    — a wall-clock kill with partial work committed must not be triaged as
+    "steward failed".  Derived via the shared ``_worktree_has_wip_commits``
+    probe (workflow method, injected into the steward as ``_wip_probe``).
+    """
+
+    reason: Literal['timeout', 'attempt_cap']
+    wip_commits_present: bool
+
+
+@dataclass(frozen=True)
+class StewardBudgetExhausted:
+    """The steward's lifetime budget (``steward_lifetime_budget``) was exhausted.
+
+    Always routes to an L1 escalation regardless of wip — unlike
+    ``StewardInterrupted``, budget exhaustion is not gated on in-flight work
+    because the steward cannot make further progress at all, wip or not.
+    """
+
+
+# The workflow↔steward RPC payload carried on the per-task in-process
+# asyncio.Queue (PRD §10 / Contract §8.1-8.2 SO-1, resolved decision D6).
+# A PEP-604 union (not an enum-with-payload) so every variant branches
+# uniformly via isinstance/match in TaskWorkflow._mark_blocked's single
+# routing choke point.
+StewardOutcome = (
+    StewardResolved
+    | StewardReescalatedL1
+    | StewardTerminalDecision
+    | StewardInterrupted
+    | StewardBudgetExhausted
+)
 
 
 class IllegalTransition(Exception):
