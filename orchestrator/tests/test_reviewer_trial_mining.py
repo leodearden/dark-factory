@@ -7,6 +7,7 @@ data/escalations/.
 
 from __future__ import annotations
 
+from collections import Counter
 from pathlib import Path
 
 from _reviewer_trial_mining_fixtures import (
@@ -18,6 +19,7 @@ from _reviewer_trial_mining_fixtures import (
 from orchestrator.evals.reviewer_trial.mining import (
     EscalationRef,
     FnCandidate,
+    assign_split,
     mine_escalation_refs,
     mine_fn_candidates,
     recover_diff,
@@ -194,3 +196,35 @@ class TestRecoverDiff:
         diff_text = recover_diff('0' * 40, repo)
 
         assert diff_text is None
+
+
+class TestAssignSplit:
+    """assign_split deterministically buckets diff_ids into train/selection/test."""
+
+    def test_maps_every_id_to_exactly_one_valid_split(self) -> None:
+        diff_ids = [f'd{i}' for i in range(20)]
+        result = assign_split(diff_ids, seed='seed1')
+        assert set(result.keys()) == set(diff_ids)
+        assert all(v in {'train', 'selection', 'test'} for v in result.values())
+
+    def test_deterministic_for_fixed_seed(self) -> None:
+        diff_ids = [f'd{i}' for i in range(50)]
+        result1 = assign_split(diff_ids, seed='seed-fixed')
+        result2 = assign_split(diff_ids, seed='seed-fixed')
+        assert result1 == result2
+
+    def test_varies_with_seed(self) -> None:
+        diff_ids = [f'd{i}' for i in range(50)]
+        result1 = assign_split(diff_ids, seed='seed-a')
+        result2 = assign_split(diff_ids, seed='seed-b')
+        assert result1 != result2
+
+    def test_ratios_approximate_2_1_7_for_large_n(self) -> None:
+        diff_ids = [f'd{i}' for i in range(300)]
+        result = assign_split(diff_ids, seed='seed-ratio')
+        counts = Counter(result.values())
+        n = len(diff_ids)
+
+        assert abs(counts['train'] / n - 0.2) < 0.05
+        assert abs(counts['selection'] / n - 0.1) < 0.05
+        assert abs(counts['test'] / n - 0.7) < 0.05
