@@ -340,6 +340,24 @@ def wl_git_config_off() -> GitConfig:
 
 
 @pytest.fixture
+def wl_git_config_thin_on() -> GitConfig:
+    """GitConfig with warm_lane_pool=True AND warm_lane_release_thin=True.
+
+    Task 2442 (§9.5 η): enables the eager free-first release-thin wiring
+    under test in TestReleaseWarmLane's thin-specific test methods.
+    """
+    return GitConfig(
+        main_branch='main',
+        branch_prefix='task/',
+        remote='origin',
+        worktree_dir='.worktrees',
+        push_after_advance=False,
+        warm_lane_pool=True,
+        warm_lane_release_thin=True,
+    )
+
+
+@pytest.fixture
 def wl_git_config_rolling_base(tmp_path: Path) -> GitConfig:
     """GitConfig with warm_lane_base_target_dir pointing to a SEPARATE rolling-base.
 
@@ -1836,6 +1854,48 @@ class TestAcquireWarmLaneResetInPlace:
 # ===========================================================================
 
 
+def _write_thin_warm_lane_stub(scripts_dir: Path) -> None:
+    """Write a thin-warm-lane.sh stub into scripts_dir (task 2442 step-5).
+
+    Appends the lane_dir positional arg (one line) to
+    ``<repo>/.test_thin_warm_lane_call_log`` and, on exit 0 (the default,
+    overridable via ``<repo>/.test_thin_warm_lane_exit``), ``rm -rf``s the
+    lane's ``target/`` — mirroring the real reify δ script only freeing
+    target/ on success (a guard refusal/EX_TEMPFAIL exit leaves target/
+    untouched).
+    """
+    script = scripts_dir / 'thin-warm-lane.sh'
+    script.write_text(
+        '#!/usr/bin/env bash\n'
+        'set -euo pipefail\n'
+        'DIR="$(cd "$(dirname "$0")" && pwd)"\n'
+        'ROOT="$(dirname "$DIR")"\n'
+        'echo "$1" >> "$ROOT/.test_thin_warm_lane_call_log"\n'
+        'if [ -f "$ROOT/.test_thin_warm_lane_exit" ]; then\n'
+        '    rc=$(cat "$ROOT/.test_thin_warm_lane_exit")\n'
+        'else\n'
+        '    rc=0\n'
+        'fi\n'
+        'if [ "$rc" = "0" ]; then\n'
+        '    rm -rf "$1/target"\n'
+        'fi\n'
+        'exit "$rc"\n'
+    )
+    script.chmod(0o755)
+
+
+def _set_thin_warm_lane_exit(repo: Path, code: int) -> None:
+    """Set the exit code the thin-warm-lane.sh stub will return next call."""
+    (repo / '.test_thin_warm_lane_exit').write_text(str(code))
+
+
+def _read_thin_warm_lane_call_log(repo: Path) -> list[str]:
+    log = repo / '.test_thin_warm_lane_call_log'
+    if not log.exists():
+        return []
+    return [line for line in log.read_text().splitlines() if line.strip()]
+
+
 @pytest.mark.asyncio
 class TestReleaseWarmLane:
     """release_warm_lane: FREE pool, delete branch, retain worktree + target/."""
@@ -1948,6 +2008,89 @@ class TestReleaseWarmLane:
         await git_ops.release_warm_lane(lane, 'task-A')
         # Second call — pool thinks it's FREE, method must not raise
         await git_ops.release_warm_lane(lane, 'task-A')  # must not raise
+
+    async def test_release_thin_invokes_stub_and_removes_target(
+        self, wl_git_repo: Path, wl_git_config_thin_on: GitConfig,
+    ):
+        """warm_lane_release_thin=True: after release, the thin stub was
+        invoked with the released lane path and target/ is removed; pool
+        state is FREE and the lane remains a registered worktree (thin ran
+        AFTER the ASSIGNED→FREE flip — §9.5 η)."""
+        from orchestrator.warm_lane_pool import LaneState
+
+        git_ops, info = await self._acquire_lane_a(wl_git_repo, wl_git_config_thin_on)
+        _write_thin_warm_lane_stub(wl_git_repo / 'scripts')
+        target_file = info.path / 'target' / 'seeded.bin'
+        assert target_file.exists(), 'prerequisite: seed.bin should exist after acquire'
+
+        await git_ops.release_warm_lane(info.path, 'task-A')
+
+        assert git_ops.warm_lane_pool.state(info.path) == LaneState.FREE
+        assert await git_ops._is_registered_worktree(info.path), (
+            'lane must remain a registered worktree after release-thin'
+        )
+        call_log = _read_thin_warm_lane_call_log(wl_git_repo)
+        assert call_log == [str(info.path)], (
+            f'thin stub must be invoked once with the released lane path; got {call_log!r}'
+        )
+        assert not (info.path / 'target').exists(), 'target/ must be thinned after release'
+
+    async def test_release_thin_b9_next_acquire_reseeds_warm(
+        self, wl_git_repo: Path, wl_git_config_thin_on: GitConfig,
+    ):
+        """B9: after a knob-True release thins target/, the next acquire
+        re-seeds target/ (present again) — net warmth unchanged (D10)."""
+        git_ops, info = await self._acquire_lane_a(wl_git_repo, wl_git_config_thin_on)
+        _write_thin_warm_lane_stub(wl_git_repo / 'scripts')
+
+        await git_ops.release_warm_lane(info.path, 'task-A')
+        assert not (info.path / 'target').exists(), (
+            'prerequisite: target/ must be thinned by release before re-acquire'
+        )
+
+        _, start_ref, _ = await _run(['git', 'rev-parse', 'HEAD'], cwd=wl_git_repo)
+        info2 = await git_ops.acquire_warm_lane('task-C', start_ref.strip())
+
+        assert isinstance(info2, WorktreeInfo)
+        assert info2.path == info.path
+        assert (info2.path / 'target' / 'seeded.bin').exists(), (
+            're-acquire must re-seed target/ warm even though release thinned '
+            'it (D10 — net warmth unchanged)'
+        )
+
+    async def test_release_thin_knob_off_stub_not_invoked(
+        self, wl_git_repo: Path, wl_git_config_on: GitConfig,
+    ):
+        """Default warm_lane_release_thin=False: byte-identical baseline —
+        the thin stub (even if present) is never invoked and target/ is
+        retained (matches test_release_retains_target_dir)."""
+        git_ops, info = await self._acquire_lane_a(wl_git_repo, wl_git_config_on)
+        _write_thin_warm_lane_stub(wl_git_repo / 'scripts')
+        target_file = info.path / 'target' / 'seeded.bin'
+
+        await git_ops.release_warm_lane(info.path, 'task-A')
+
+        assert _read_thin_warm_lane_call_log(wl_git_repo) == [], (
+            'thin stub must NOT be invoked when warm_lane_release_thin is False (default)'
+        )
+        assert target_file.exists(), 'target/ must be retained when the knob is off'
+
+    @pytest.mark.parametrize('stub_rc', [1, 75])
+    async def test_release_thin_never_raises_on_guard_refusal(
+        self, wl_git_repo: Path, wl_git_config_thin_on: GitConfig, stub_rc: int,
+    ):
+        """inv.11: a guard refusal (1) or EX_TEMPFAIL (75) from the thin
+        script must never raise out of release_warm_lane; pool state is
+        still FREE."""
+        from orchestrator.warm_lane_pool import LaneState
+
+        git_ops, info = await self._acquire_lane_a(wl_git_repo, wl_git_config_thin_on)
+        _write_thin_warm_lane_stub(wl_git_repo / 'scripts')
+        _set_thin_warm_lane_exit(wl_git_repo, stub_rc)
+
+        await git_ops.release_warm_lane(info.path, 'task-A')  # must not raise
+
+        assert git_ops.warm_lane_pool.state(info.path) == LaneState.FREE
 
 
 # ===========================================================================
