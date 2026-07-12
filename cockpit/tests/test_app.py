@@ -1223,6 +1223,47 @@ class TestWeightEditor:
 
             assert isinstance(app.screen, WeightEditorScreen)
 
+    @pytest.mark.timeout(10)
+    async def test_submit_reads_edited_input_into_new_priorities(self, tmp_path):
+        """compose()->_submit() end-to-end against REAL widgets -- proves the
+        positional cat-<index>/proj-<index> ids compose() assigns are the
+        same ones _submit()'s query_one lookups read back (a name-derived id
+        would BadIdentifier-crash for a name with '.'/'/'/':'/spaces), and
+        that only the edited project Input reaches the on_submit callback's
+        new Priorities -- an untouched project Input (still showing its
+        seeded fallback) must NOT materialize a project_weights entry.
+        """
+        from textual.widgets import Input
+
+        from cockpit.app import CockpitApp
+        from cockpit.panes.weight_editor import WeightEditorScreen
+        from cockpit.priority import Priorities
+
+        received: list[Priorities] = []
+        base = Priorities.default()
+
+        app = CockpitApp(fleet_root=tmp_path, poll_interval=0.05)
+        async with app.run_test() as pilot:
+            await pilot.pause()
+
+            screen = WeightEditorScreen(base, ['alpha', 'beta'], received.append)
+            await app.push_screen(screen)
+            await pilot.pause()
+
+            # project_names == ['alpha', 'beta'] -> compose() assigns
+            # id 'proj-1' to 'beta' (enumerate order); 'alpha' (proj-0) is
+            # left untouched at its seeded fallback.
+            beta_input = screen.query_one('#proj-1', Input)
+            beta_input.value = '42'
+            await pilot.pause()
+
+            await pilot.click('#weight-submit')
+            await pilot.pause()
+
+        assert len(received) == 1
+        assert received[0].project_weights == {'beta': 42.0}
+        assert received[0].category_weights == base.category_weights
+
 
 class TestSpawnBar:
     @pytest.mark.timeout(10)
