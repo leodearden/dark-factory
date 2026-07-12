@@ -1206,6 +1206,36 @@ class TestWeightEditorReordersAndPersists:
         assert persisted.project_weights['beta'] == 100.0
 
 
+class TestPrioritiesPathResolution:
+    @pytest.mark.timeout(10)
+    async def test_load_and_save_target_the_same_fleet_root_relative_path(self, tmp_path):
+        """apply_priorities persists to self._priorities_path, derived as
+        resolve_fleet_root(self.fleet_root)/'priorities.yaml' (see
+        TestWeightEditorReordersAndPersists above for the write half of this
+        contract). This pins the READ half: __init__'s in-app default is
+        LOADED from that exact same fleet_root-relative path -- not the
+        global ~/.claude/fleet default load_priorities() falls back to --
+        so an explicit fleet_root=tmp_path CockpitApp is fully
+        self-contained under tmp_path for both read and write. Regression
+        test for a reviewer-flagged incidental behavior change (see
+        app.py's design_decisions).
+        """
+        from dataclasses import replace
+
+        from orchestrator.session_registry import fleet_root as resolve_fleet_root
+
+        from cockpit.app import CockpitApp
+        from cockpit.priority import Priorities, save_priorities
+
+        seeded = replace(Priorities.default(), project_weights={'df': 7.0})
+        save_priorities(seeded, resolve_fleet_root(tmp_path) / 'priorities.yaml')
+
+        app = CockpitApp(fleet_root=tmp_path, poll_interval=0.05)
+
+        assert app._priorities_path == resolve_fleet_root(tmp_path) / 'priorities.yaml'
+        assert app._priorities.project_weights == {'df': 7.0}
+
+
 class TestWeightEditor:
     @pytest.mark.timeout(10)
     async def test_w_key_pushes_weight_editor_screen(self, tmp_path):
