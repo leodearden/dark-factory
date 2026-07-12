@@ -15,6 +15,14 @@ Reachable by both the orchestrator and fused-memory (both declare
 (``shared.prompt_artifact.X``) and is deliberately **not** re-exported from
 ``shared/__init__.py`` — this keeps ``shared/tests/test_public_api.py``'s
 strict ``__all__`` union assertion untouched.
+
+A pinned artifact is only ever trusted when both its heuristics block and a
+schema-valid provenance sidecar are present; anything else (nothing pinned,
+an orphan heuristics file, or a corrupt/incomplete provenance sidecar)
+fails safe to the in-code constant. :func:`default_artifacts_root` gives
+every consumer (the T6 optimization loop, T2/T3 call sites, T8 tooling) one
+agreed on-disk root, so they never each invent a divergent location for the
+same on-disk state.
 """
 
 from __future__ import annotations
@@ -36,6 +44,7 @@ __all__ = [
     'PromptSpec',
     'ResolvedPrompt',
     'PromptArtifactStore',
+    'default_artifacts_root',
 ]
 
 # Fixed separator between the in-code CONTRACT and the (baseline or pinned)
@@ -256,3 +265,32 @@ class PromptArtifactStore:
             shutil.rmtree(key_dir)
             return True
         return False
+
+
+def default_artifacts_root() -> Path:
+    """The one agreed on-disk root for prompt artifacts.
+
+    Returns ``Path(os.environ['DARK_FACTORY_PROMPT_ARTIFACTS'])`` when that
+    env var is set. Otherwise walks up from this file's location looking for
+    the monorepo root — a directory containing ``orchestrator/``,
+    ``fused-memory/``, and ``shared/`` — and returns
+    ``<monorepo_root>/data/prompt_artifacts``. Falls back to
+    ``Path.cwd() / 'data' / 'prompt_artifacts'`` when no such marker directory
+    is found (e.g. this file was relocated outside the monorepo layout).
+
+    Every T2/T3/T8 consumer should call this instead of hard-coding a path,
+    so they never drift onto a different root for the same on-disk state.
+    """
+    env_override = os.environ.get('DARK_FACTORY_PROMPT_ARTIFACTS')
+    if env_override:
+        return Path(env_override)
+
+    for candidate in Path(__file__).resolve().parents:
+        if (
+            (candidate / 'orchestrator').is_dir()
+            and (candidate / 'fused-memory').is_dir()
+            and (candidate / 'shared').is_dir()
+        ):
+            return candidate / 'data' / 'prompt_artifacts'
+
+    return Path.cwd() / 'data' / 'prompt_artifacts'
