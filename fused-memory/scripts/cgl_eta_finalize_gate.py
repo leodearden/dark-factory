@@ -9,6 +9,10 @@ Order matters and is deliberate:
   1. set_task_status(2273, done)  — terminal state FIRST, so there is never a
      blocked-without-open-escalation window for the stranded-blocked reconciler
      to reclaim + re-dispatch 2273 (which, as a pure gate, would just re-escalate).
+     Finalized with done_provenance kind='deterministic-gate' (see
+     _gate_done_provenance) — the pure-gate-resolved DoneProvenance kind the
+     MCP validator accepts commit-less and pid-less; a bare {'note': ...}
+     blob with no `kind` is unconditionally rejected as done_provenance_invalid.
   2. resolve_issue(esc-2273-1, close_only) — dismiss the stale escalation on the
      now-done task (`close_only` = no status effect; the done in step 1 is what
      matters). NB: no resolve *action* yields `done` (ACTION_EFFECTS maps
@@ -68,7 +72,7 @@ async def main_async() -> int:
         async with McpClient(FUSED_URL) as fm:
             res = await fm.call_tool('set_task_status', {
                 'id': GATE_TASK, 'status': 'done', 'project_root': REPO,
-                'done_provenance': {'note': note},
+                'done_provenance': _gate_done_provenance(note),
             })
         _log(f'set_task_status({GATE_TASK}, done): {res}')
     except Exception as exc:
