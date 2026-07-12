@@ -277,6 +277,42 @@ class TestCheckGate3StaleSnapshot:
 
 
 # ---------------------------------------------------------------------------
+# Regression pin: the sanctioned same-status repair seam the new
+# corrective_path/hint redirect to is NOT itself recon-gated
+# ---------------------------------------------------------------------------
+
+
+class TestCorrectivePathSeamIsReachable:
+    def test_set_task_status_done_provenance_repair_on_done_task_is_not_gated(
+        self, monkeypatch,
+    ):
+        """Locks the invariant the Gate 1 redirect depends on: a recon-stage
+        set_task_status(task_id, 'done', ...) call against an already-done
+        task — the same-status done_provenance repair transition
+        (task_interceptor._repair_done_provenance_same_status, task 2401)
+        that corrective_path/hint now advertise — is not itself blocked by
+        this gate. Gate 1 is update_task-only (doesn't fire here); Gate 2
+        forces orchestrator_live False for a done task in the real
+        detector, mirrored here by monkeypatching it to False; Gate 3 never
+        fires because set_task_status always passes snapshot_token=None.
+        Guards against a future Gate-2 tightening silently breaking the
+        advertised corrective seam."""
+        monkeypatch.setattr(
+            recon_write_policy, 'is_workflow_live_for_task', lambda *a, **k: False,
+        )
+
+        verdict = _check(
+            'set_task_status',
+            target_status='done',
+            live_status='done',
+            snapshot_token=None,
+        )
+
+        assert verdict.is_rejection is False
+        assert verdict.corrective_path == ''
+
+
+# ---------------------------------------------------------------------------
 # SNAPSHOT_TOKEN_KEYS / extract_snapshot_token
 # ---------------------------------------------------------------------------
 
