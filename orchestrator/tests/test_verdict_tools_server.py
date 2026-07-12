@@ -6,6 +6,7 @@ import pytest
 
 from orchestrator.artifacts import TaskArtifacts
 from orchestrator.mcp.verdict_tools import (
+    _artifacts_from_args,
     _submit_completion_verdict,
     _submit_merge_disposition,
     _submit_review_verdict,
@@ -201,3 +202,60 @@ class TestCreateServer:
         assert envelope is not None
         assert envelope['role'] == 'merger'
         assert envelope['verdict'] == {'blocked': True, 'reason': 'x'}
+
+
+# ---------------------------------------------------------------------------
+# _artifacts_from_args parity tests (mirrors plan_tools.TestArtifactsFromArgs)
+# ---------------------------------------------------------------------------
+
+
+class TestArtifactsFromArgs:
+    """``_artifacts_from_args`` parses ``--worktree``/``--meta-root`` into a
+    ``TaskArtifacts`` — the same construction shape as plan_tools' own
+    ``_artifacts_from_args`` — plus the verdict-specific ``--verdict-role``
+    and ``--session-id`` flags.
+    """
+
+    def test_meta_root_flag_produces_relocated_root(self, tmp_path):
+        wt = tmp_path / 'wt'
+        wt.mkdir()
+        mr = tmp_path / 'base' / '.task-meta' / 'wt'
+        mr.mkdir(parents=True)
+
+        arts, role, sid = _artifacts_from_args([
+            '--worktree', str(wt),
+            '--meta-root', str(mr),
+            '--verdict-role', 'judge',
+            '--session-id', 'sess-9',
+        ])
+
+        assert arts.root == mr
+        assert arts.worktree == wt
+        assert role == 'judge'
+        assert sid == 'sess-9'
+
+    def test_omitted_meta_root_falls_back_to_legacy_task_dir(self, tmp_path):
+        wt = tmp_path / 'wt'
+        wt.mkdir()
+        (wt / '.task').mkdir()
+
+        arts, role, sid = _artifacts_from_args([
+            '--worktree', str(wt),
+            '--verdict-role', 'merger',
+        ])
+
+        assert arts.root == wt / '.task'
+        assert arts.worktree == wt
+        assert role == 'merger'
+
+    def test_omitted_session_id_defaults_empty(self, tmp_path):
+        wt = tmp_path / 'wt'
+        wt.mkdir()
+        (wt / '.task').mkdir()
+
+        arts, role, sid = _artifacts_from_args([
+            '--worktree', str(wt),
+            '--verdict-role', 'merger',
+        ])
+
+        assert sid == ''
