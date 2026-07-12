@@ -74,6 +74,14 @@ class Verdict:
             (``set_task_status`` only; ``None`` for ``update_task``).
         snapshot_token: The snapshot status token the caller's write was
             based on, when supplied.
+        corrective_path: Stable, machine-readable token naming the
+            sanctioned seam a caller should use instead, when one exists.
+            Empty on ok and on rejections with no sanctioned redirect
+            (Gate 2 live-workflow, Gate 3 stale-snapshot). Populated only
+            on the Gate 1 terminal-write rejection, where it names the
+            same-status ``done_provenance`` repair seam
+            (``set_task_status(..., 'done', done_provenance={...})``) —
+            see :data:`TERMINAL_CORRECTIVE_PATH`.
     """
 
     outcome: Literal['ok', 'rejection']
@@ -86,6 +94,7 @@ class Verdict:
     live_status: str = ''
     target_status: str | None = None
     snapshot_token: str | None = None
+    corrective_path: str = ''
 
     @property
     def is_rejection(self) -> bool:
@@ -105,6 +114,7 @@ class Verdict:
             'target_status': self.target_status,
             'snapshot_token': self.snapshot_token,
             'hint': self.hint,
+            'corrective_path': self.corrective_path,
         }
 
 
