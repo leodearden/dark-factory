@@ -438,6 +438,13 @@ class RestartPlan:
         if self.on_failure_escalation is not None:
             on_failure_argv = self.on_failure_escalation.to_submit_argv(sys.executable)
             on_failure = ' '.join(shlex.quote(p) for p in on_failure_argv)
+            # Byte-for-byte reuse of deterministic_runner.py:439-445's wrapper
+            # shape (`_default_schedule_detached_restart`) — same three-part
+            # `payload; __rc=$?; if [ "$__rc" -ne 0 ]; then on_failure; fi;
+            # exit "$__rc"` shell so DeterministicRunner's two mechanisms (task
+            # 2237's sibling, delta) can later collapse onto this one helper
+            # with no behaviour delta. Exactness is pinned by
+            # TestDetachedWrapperExactnessAndRegistrationFailure (step-13).
             wrapped = (
                 f'{payload}; __rc=$?; '
                 f'if [ "$__rc" -ne 0 ]; then {on_failure}; fi; '
