@@ -626,6 +626,17 @@ class QueuedBranch:
     Frozen (immutable) so two independently-parsed values compare equal by
     field value (and hash identically), regardless of which shape the raw
     input arrived in.
+
+    This type has no production consumer yet: it is deliberately the
+    *producer half* of ``plans/merge-queue-reliability-prd.md`` scope 5
+    (task μ; boundary test B9). The consumer half — repointing
+    :attr:`MergeRequest.branch` (below) onto ``QueuedBranch``, building refs
+    from ``.full_name``, and deleting ``canonical_queued_branch_name``, the
+    try-both ``resolve_queued_branch_ref``, and the ``merge_queue_store``
+    journal strip/re-add — is the PRD's next spine task (task ν, prereq: μ;
+    see PRD lines 218-220). Until ν lands, do not add further ad hoc
+    prefix-stripping/prepending call sites; route them through
+    :meth:`parse` instead.
     """
 
     bare_id: str
@@ -683,7 +694,7 @@ class MergeRequest:
     """A request to merge a task branch into main."""
 
     task_id: str
-    branch: str  # e.g. "591" — without the task/ prefix
+    branch: str  # e.g. "591" — without the task/ prefix; becomes QueuedBranch at task ν (PRD scope 5, plans/merge-queue-reliability-prd.md:218)
     worktree: Path
     pre_rebased: bool
     task_files: list[str] | None
