@@ -2638,7 +2638,7 @@ class MemoryService:
             if not _is_rate_limit_or_quota_error(exc):
                 raise
             logger.warning(
-                'get_entity degraded: embedding-provider rate-limit/quota error for %r: %s',
+                'get_entity degraded: rate-limit/quota error (429) for %r: %s',
                 name,
                 exc,
             )
