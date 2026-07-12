@@ -509,6 +509,27 @@ class RestartPlan:
         immediate ``create_subprocess_exec`` spawn — fused-memory/dashboard
         parity with ``service_restart._default_restart_executor``.
 
+        That parity covers argv shape and fire-and-forget semantics, NOT a
+        byte-identical spawn-kwargs set: this path passes ``cwd=str(self.cwd)``
+        (the caller's ``project_root``) explicitly, whereas the pre-2237
+        ``_default_restart_executor`` spawned with only
+        ``start_new_session=True`` and no explicit ``cwd``, inheriting the
+        orchestrator process's own cwd. This is a deliberate, narrow behavior
+        change, not an oversight: RP-3's "no implicit cwd" invariant is
+        applied uniformly to every ``RestartPlan`` spawn in this seam, not
+        just the systemd-run path, so a future leaf caller can never regress
+        into an implicit-cwd bug the way the systemd-run path once did (the
+        2105 incident). It is confirmed safe for the two current leaf
+        callers: ``scripts/restart-fused-memory.sh`` and
+        ``scripts/restart-dashboard.sh`` are themselves cwd-insensitive (they
+        act only via ``systemctl --user``/``curl``/``journalctl`` against
+        absolute unit names and URLs, with no relative file access), and
+        ``self.script`` is already absolutized by ``__post_init__``, so the
+        script's own lookup never depended on cwd either way. A future leaf
+        script that DOES rely on relative file access would need an absolute
+        path — the same requirement RP-3 already imposes on the systemd-run
+        path.
+
         No ``/bin/sh -c`` on-failure wrapper here (unlike RP-4's systemd-run
         payload): a plain immediate spawn has no DEFERRED fire-time gap to
         guard — a spawn failure (e.g. a missing/non-executable script) raises
