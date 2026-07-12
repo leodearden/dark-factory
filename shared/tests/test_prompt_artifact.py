@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+from typing import Any
 
 import pytest
 from pydantic import ValidationError
@@ -28,8 +29,11 @@ from shared.prompt_artifact import (
 )
 
 
-def _provenance_kwargs(**overrides):
-    kwargs = dict(
+def _provenance_kwargs(**overrides: Any) -> dict[str, Any]:
+    # dict[str, Any] is intentional: ArtifactProvenance's fields have
+    # heterogeneous types and spreading a concrete dict[str, <union>] defeats
+    # pyright's per-parameter type checking at the ** call site.
+    kwargs: dict[str, Any] = dict(
         optimizer_model='claude-opus-4',
         corpus_hash='sha256:deadbeef',
         split_seed=42,
