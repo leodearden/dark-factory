@@ -18,11 +18,13 @@ import json
 import logging
 import sqlite3
 import subprocess
+from collections import Counter
 from dataclasses import dataclass, field
 from pathlib import Path
 
 from orchestrator.agents.invoke import invoke_agent
-from orchestrator.evals.reviewer_trial.corpus import GroundTruthIssue
+from orchestrator.evals.reviewer_trial.adjudication import AdjudicationLog
+from orchestrator.evals.reviewer_trial.corpus import CorpusManifest, GroundTruthIssue
 
 logger = logging.getLogger(__name__)
 
@@ -391,3 +393,79 @@ If there are no issues, return an empty issues list. Output your findings as JSO
             continue
 
     return issues, cost
+
+
+_SPLIT_RATIO_NAMES = ('train', 'selection', 'test')
+
+
+@dataclass
+class AuditReport:
+    """Structured result of ``audit_corpus``'s five corpus-integrity checks.
+
+    ``ok`` is True only when every check passes; otherwise ``failures``
+    names each failing check so a CLI/CI caller can report exactly what's
+    wrong rather than a bare pass/fail.
+    """
+
+    ok: bool
+    diff_count: int
+    failures: list[str] = field(default_factory=list)
+
+
+def audit_corpus(
+    manifest: CorpusManifest,
+    adjudication_log: AdjudicationLog,
+    min_diffs: int = 50,
+    ratios: tuple[int, int, int] = (2, 1, 7),
+    ratio_tolerance: float = 0.1,
+) -> AuditReport:
+    """Audit corpus integrity across five signals (task 2495 / PRD D-6).
+
+    Checks, each contributing a named reason to ``AuditReport.failures``
+    when violated:
+
+    - ``diff_count``            — ``len(manifest.diffs) >= min_diffs``.
+    - ``missing_split``         — every diff has a non-``None`` ``split``.
+    - ``split_ratio``           — train/selection/test proportions
+      approximate *ratios* (default 2:1:7) within *ratio_tolerance*.
+    - ``missing_provenance``    — every ``source == 'mined'`` diff carries
+      non-empty ``provenance``.
+    - ``adjudication_coverage`` — *adjudication_log* has an entry for every
+      diff_id in the manifest.
+    - ``spot_check_subset_empty`` — *adjudication_log* flags a non-empty
+      documented human spot-check subset.
+
+    Never raises: an empty manifest simply fails ``diff_count`` (and, since
+    there's nothing to compute a ratio over, skips the ``split_ratio``
+    check rather than dividing by zero).
+    """
+    diffs = manifest.diffs
+    failures: list[str] = []
+
+    if len(diffs) < min_diffs:
+        failures.append('diff_count')
+
+    if any(d.split is None for d in diffs):
+        failures.append('missing_split')
+
+    split_counts = Counter(d.split for d in diffs if d.split is not None)
+    n_split = sum(split_counts.values())
+    if n_split:
+        total_ratio = sum(ratios)
+        for name, target in zip(_SPLIT_RATIO_NAMES, ratios, strict=True):
+            actual = split_counts.get(name, 0) / n_split
+            if abs(actual - target / total_ratio) > ratio_tolerance:
+                failures.append('split_ratio')
+                break
+
+    if any(d.source == 'mined' and not d.provenance for d in diffs):
+        failures.append('missing_provenance')
+
+    coverage = adjudication_log.coverage(d.diff_id for d in diffs)
+    if not coverage.ok:
+        failures.append('adjudication_coverage')
+
+    if not adjudication_log.spot_check_subset():
+        failures.append('spot_check_subset_empty')
+
+    return AuditReport(ok=not failures, diff_count=len(diffs), failures=failures)
