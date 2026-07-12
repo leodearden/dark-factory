@@ -9,7 +9,9 @@ test_config_psi_admission_reload.py's stated rationale).
 
 from __future__ import annotations
 
+import hashlib
 import os
+from pathlib import Path
 
 import pytest
 from pydantic import ValidationError
@@ -33,7 +35,15 @@ class TestVerifyAdmissionConfigDefaults:
         cfg = OrchestratorConfig()
         assert cfg.verify_admission_enabled is True
         assert cfg.verify_admission_task_slots == 1
-        assert cfg.verify_admission_slots_dir == f'/tmp/df-verify-slots-{os.getuid()}'
+        # task 2501: the default is now per-project (uid + a short hash of
+        # the resolved project_root), not the old UID-only host-global path
+        # that let co-tenant projects collide on one shared slots dir.
+        expected = (
+            f'/tmp/df-verify-slots-{os.getuid()}-'
+            + hashlib.sha256(str(Path(tmp_path).resolve()).encode()).hexdigest()[:12]
+        )
+        assert cfg.verify_admission_slots_dir == expected
+        assert cfg.verify_admission_slots_dir != f'/tmp/df-verify-slots-{os.getuid()}'
         assert cfg.verify_admission_nice_merge == ''
         assert cfg.verify_admission_nice_task == ''
         assert cfg.verify_admission_nice_background == ''
