@@ -8,6 +8,7 @@ suite that exercises full ticks end-to-end.
 """
 
 import dataclasses
+from unittest.mock import AsyncMock
 
 import pytest
 from _recording_event_store import _RecordingEventStore
@@ -110,3 +111,28 @@ class TestHygienePhases:
 
         assert result is _CONTINUE
         assert 'A' not in scheduler._requeue_until
+
+
+class TestBackfillDepStatusPhase:
+    """Isolation test for the backfill_dep_status phase (phase 1/18) — the
+    dep-status backfill that consumes ``_iter_pending_deps_in`` (task 2124)."""
+
+    @pytest.mark.asyncio
+    async def test_phase_backfill_consumes_iter_helper(self, scheduler: Scheduler):
+        task = {'id': 'T', 'status': 'pending', 'dependencies': ['9']}
+        ctx = TickContext(
+            tasks=[task],
+            status_map={},  # '9' (T's only dep) is missing from status_map
+            tasks_by_id={'T': task},
+        )
+        # Degraded resolver result: resolver_failed({}, <err>) is True, so the
+        # degraded (bump) branch runs instead of the recovered (clear) branch.
+        scheduler.get_statuses = AsyncMock(return_value=({}, Exception('degraded')))
+
+        result = await scheduler._phase_backfill_dep_status(ctx)
+
+        assert result is _CONTINUE
+        # Only producible by iterating `_iter_pending_deps_in(ctx.tasks, missing_dep_ids)`
+        # over the pending (task, dep) pairs — proves the shared helper is consumed,
+        # not a re-collapsed hand loop.
+        assert scheduler._streak_local_backfill.counts[('T', '9')] == 1
