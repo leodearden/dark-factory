@@ -20,13 +20,17 @@ side (mirrors test_harness_action_dispatch.py / test_harness_infra_hold_repend.p
 from __future__ import annotations
 
 import asyncio
+import json
+import logging
+import os
+import shutil
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
-
 from escalation.action_effects import effect_for
 from escalation.models import Escalation
+
 from orchestrator.harness import Harness
 from orchestrator.task_status import is_infra_held
 
@@ -58,9 +62,25 @@ def harness(tmp_path: Path, mock_orch_config) -> Harness:
 
     h.scheduler = MagicMock()
     h.scheduler.get_status = AsyncMock(return_value='blocked')
+    h.scheduler.get_statuses = AsyncMock(return_value=({}, None))
     h.scheduler.set_task_status = AsyncMock()
     h.scheduler.get_task = AsyncMock(return_value={'id': 'task', 'metadata': {}})
     h.scheduler.update_task = AsyncMock(return_value=True)
+
+    # B2/B6 drive _revert_in_progress_if_no_live_claimant /
+    # _reconcile_stranded_in_progress directly, which touch git_ops — NOT
+    # mocked above (only McpLifecycle/OverrideStore/Scheduler/
+    # BriefingAssembler are patched at construction). Mirrors
+    # test_harness_infra_hold_repend.py:53-62: keep worktree_base real
+    # (rooted under tmp_path) so a per-test worktree dir can be created, and
+    # default cleanup_worktree/resolve_branch_sha so B1/B3/B4/comp2 (which
+    # never touch git_ops) are unaffected.
+    h.git_ops.worktree_base = (tmp_path / '.worktrees').resolve()
+
+    def _fake_cleanup(worktree_path, tid):
+        shutil.rmtree(worktree_path, ignore_errors=True)
+    h.git_ops.cleanup_worktree = AsyncMock(side_effect=_fake_cleanup)
+    h.git_ops.resolve_branch_sha = AsyncMock(return_value=_TIP_SHA)
 
     # _merge_worker stays None — unhalt branch skipped in all tests here.
     return h
@@ -108,6 +128,24 @@ def _make_infra_esc(
         status=status,
         resolved_by=resolved_by,
     )
+
+
+def _make_worktree(harness: Harness, tid: str, *, with_lock: bool = False) -> Path:
+    """Create a minimal worktree directory for *tid*.
+
+    Mirrors test_harness_infra_hold_repend.py:67-81. If ``with_lock`` is
+    False (default), no plan.lock is created — simulates the no-live-
+    claimant / orphan scenario that B2's stranded-revert sweep targets.
+    """
+    wt = harness.git_ops.worktree_base / tid
+    (wt / '.task').mkdir(parents=True, exist_ok=True)
+    if with_lock:
+        (wt / '.task' / 'plan.lock').write_text(json.dumps({
+            'session_id': f'{tid}-test',
+            'locked_at': '2026-06-23T00:00:00Z',
+            'owner_pid': os.getpid(),  # live PID → not reaped
+        }))
+    return wt
 
 
 # ---------------------------------------------------------------------------
@@ -261,3 +299,188 @@ class TestComp2HarnessFaceUnknownActionNoWrite:
         await asyncio.gather(*list(harness._background_tasks))
 
         harness.scheduler.set_task_status.assert_not_awaited()  # type: ignore[attr-defined]
+
+
+# ---------------------------------------------------------------------------
+# B2 (esc-2073-15 regression) — the accurate landed mechanism is the
+# stranded-revert sweep _revert_in_progress_if_no_live_claimant, NOT the
+# escalation-resume cascade (_cascade_unblock_member is blocked-only and
+# DELIBERATELY carves out in-progress — test_cascade_unblock.py:143).
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestB2StrandedInProgressRevert:
+    """B2: a stranded in-progress task with no live claimant is re-pended by
+    the stranded-revert sweep (_revert_in_progress_if_no_live_claimant,
+    harness.py:3719), NOT by the escalation-resume cascade
+    (_cascade_unblock_member is blocked-only — a status='in-progress' task
+    handed to it is a DEBUG-skipped no-op). An infra-held row is exempt.
+    Mirrors test_harness_infra_hold_repend.py:88-195."""
+
+    async def test_no_live_claimant_reverts_to_pending(self, harness: Harness) -> None:
+        tid = 'zeta-b2-stranded'
+        _make_worktree(harness, tid)  # no lock -> no live claimant
+        harness.scheduler.get_task = AsyncMock(return_value={
+            'id': tid, 'status': 'in-progress', 'metadata': {},
+        })
+
+        result = await harness._revert_in_progress_if_no_live_claimant(tid, mid_run=False)
+
+        assert result == 'reverted', (
+            f'Stranded in-progress task with no live claimant should be '
+            f'reverted to pending via the stranded-revert sweep; got {result!r}'
+        )
+        harness.scheduler.set_task_status.assert_awaited_once_with(tid, 'pending')  # type: ignore[attr-defined]
+
+    async def test_live_claimant_not_reverted(self, harness: Harness) -> None:
+        """Contrast: a LIVE claimant (fresh plan.lock, live owner_pid) on a
+        startup sweep (mid_run=False) is left intact — the stranded-revert
+        sweep only reaps tasks with NO live claimant."""
+        tid = 'zeta-b2-live'
+        _make_worktree(harness, tid, with_lock=True)
+        harness.scheduler.get_task = AsyncMock(return_value={
+            'id': tid, 'status': 'in-progress', 'metadata': {},
+        })
+
+        result = await harness._revert_in_progress_if_no_live_claimant(tid, mid_run=False)
+
+        assert result != 'reverted', (
+            f'Task with a live claimant (fresh plan.lock) must not be '
+            f'reverted; got {result!r}'
+        )
+        harness.scheduler.set_task_status.assert_not_awaited()  # type: ignore[attr-defined]
+
+    async def test_infra_held_stranded_row_exempt_from_revert(self, harness: Harness) -> None:
+        """An infra-held row (status='infra-hold') on a non-degenerate branch
+        is EXEMPT from the stranded-revert sweep even with no live claimant —
+        the A1 guard fires before the lock-liveness classification."""
+        tid = 'zeta-b2-infra-exempt'
+        _make_worktree(harness, tid)  # no lock -> no live claimant
+        harness.scheduler.get_task = AsyncMock(return_value={
+            'id': tid,
+            'status': 'infra-hold',
+            'metadata': {'branch_base_sha': _BASE_SHA},
+        })
+        harness.git_ops.resolve_branch_sha = AsyncMock(return_value=_TIP_SHA)  # non-degenerate
+
+        result = await harness._revert_in_progress_if_no_live_claimant(tid, mid_run=False)
+
+        assert result != 'reverted', (
+            f"An infra-held row must be exempt from the stranded-revert "
+            f'sweep; got {result!r}'
+        )
+        for call in harness.scheduler.set_task_status.await_args_list:  # type: ignore[attr-defined]
+            assert call.args[1] != 'pending', (
+                f'set_task_status({tid!r}, "pending") was called despite '
+                f"status='infra-hold': {call}"
+            )
+
+    async def test_cascade_unblock_member_does_not_flip_in_progress(
+        self, harness: Harness, caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """Proves B2 is NOT served by the escalation cascade: a status=
+        'in-progress' task routed through _on_escalation_resolved's
+        l2-cascade path (-> _cascade_unblock_member) is a DEBUG-skipped
+        no-op — _cascade_unblock_member is blocked-only and DELIBERATELY
+        carves out in-progress (test_cascade_unblock.py:143,
+        test_criterion_4_in_progress_task_not_flipped)."""
+        task_id = 'zeta-b2-not-cascade'
+        esc = _make_esc(
+            task_id=task_id,
+            resolution_action=None,  # legacy resolve -> maps to 'resume'
+            status='resolved',
+            resolved_by='l2-cascade:esc-parent-1',
+            level=1,
+        )
+        harness.scheduler.get_status = AsyncMock(return_value='in-progress')
+
+        with caplog.at_level(logging.DEBUG):
+            harness._on_escalation_resolved(esc)
+            await asyncio.gather(*list(harness._background_tasks))
+
+        harness.scheduler.set_task_status.assert_not_awaited()  # type: ignore[attr-defined]
+        assert any(r.levelno == logging.DEBUG for r in caplog.records), (
+            'Expected a DEBUG record for the in-progress carve-out'
+        )
+
+
+# ---------------------------------------------------------------------------
+# B6 — infra-hold first-class: resolved infra_issue escalation on an
+# infra-held task resumes-at-verify (in-progress), NEVER 'pending'; the
+# reconcile stranded sweep skips an infra-held row; a non-infra blocked task
+# still flips to pending (contrast).
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestB6InfraHoldFirstClass:
+    """B6: infra-hold is a first-class status (task 2200/omega4). A resolved
+    infra_issue escalation on an infra-held task resumes-at-verify
+    (in-progress) via _cascade_unblock_member's A1 guard (harness.py:9402-
+    9439), never re-pends to 'pending'; the reconcile stranded sweep skips
+    an infra-held row entirely (is_infra_held guard); a non-infra blocked
+    task still flips to pending. Mirrors
+    test_harness_infra_hold_repend.py:224-424."""
+
+    async def test_infra_hold_resolved_escalation_resumes_at_verify(
+        self, harness: Harness,
+    ) -> None:
+        tid = 'zeta-b6-infra'
+        harness.scheduler.get_task = AsyncMock(return_value={
+            'id': tid,
+            'status': 'infra-hold',
+            'metadata': {'branch_base_sha': _BASE_SHA},
+        })
+        harness.scheduler.get_status = AsyncMock(return_value='infra-hold')
+        esc = _make_infra_esc(task_id=tid)  # status='resolved' -> legacy 'resume'
+
+        harness._escalation_events.pop(tid, None)  # orphan path
+
+        harness._on_escalation_resolved(esc)
+        await asyncio.gather(*list(harness._background_tasks))
+
+        harness.scheduler.set_task_status.assert_awaited_once_with(tid, 'in-progress')  # type: ignore[attr-defined]
+        pending_calls = [
+            c for c in harness.scheduler.set_task_status.await_args_list  # type: ignore[attr-defined]
+            if c.args[1] == 'pending'
+        ]
+        assert not pending_calls, (
+            f"set_task_status('pending') was called despite status='infra-hold'. "
+            f'Calls: {pending_calls}'
+        )
+
+    async def test_reconcile_sweep_skips_infra_held_row(self, harness: Harness) -> None:
+        tid = 'zeta-b6-sweep-skip'
+        harness.scheduler.get_statuses = AsyncMock(
+            return_value=({tid: 'infra-hold'}, None),
+        )
+
+        with patch.object(
+            harness, '_reconcile_one_stranded', new=AsyncMock(),
+        ) as mock_reconcile_one:
+            count = await harness._reconcile_stranded_in_progress()
+
+        mock_reconcile_one.assert_not_called()
+        harness.scheduler.set_task_status.assert_not_called()  # type: ignore[attr-defined]
+        assert count == 0
+
+    async def test_non_infra_blocked_task_still_flips_to_pending(
+        self, harness: Harness,
+    ) -> None:
+        """Contrast control: a plain status='blocked' task (no infra-hold)
+        still resumes via the ordinary Table B resume->pending path — the
+        is_infra_held pre-gate must not disturb non-infra tasks."""
+        tid = 'zeta-b6-contrast'
+        harness.scheduler.get_task = AsyncMock(return_value={
+            'id': tid, 'status': 'blocked', 'metadata': {},
+        })
+        harness.scheduler.get_status = AsyncMock(return_value='blocked')
+        esc = _make_infra_esc(task_id=tid)
+
+        harness._escalation_events.pop(tid, None)
+
+        harness._on_escalation_resolved(esc)
+        await asyncio.gather(*list(harness._background_tasks))
+
+        harness.scheduler.set_task_status.assert_awaited_once_with(tid, 'pending')  # type: ignore[attr-defined]
