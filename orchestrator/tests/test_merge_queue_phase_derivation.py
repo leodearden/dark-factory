@@ -234,18 +234,22 @@ class TestPhaseDerivesFromRegistry:
             request=req2, merge_result=MagicMock(), merge_wt=tmp_path / 'merge_wt2',
             base_sha='deadbeef', speculative=False,
         )
-        rid2 = worker._register_item(item2, initial=ItemLifecycleState.DISPATCHING)
         # InflightEntry has no phase field at all — exclusion must be driven
         # purely by the registry state (DISPATCHING is non-qualifying).
         entry2 = InflightEntry(
             item=item2, lease=None, verify_task=None, merge_wt=item2.merge_wt,
             was_speculative=False,
         )
-        worker._finalizing_head = entry2
+        # Register the InflightEntry itself (task 2435 kappa-b: the finalize
+        # head is discovered via _live_items/_finalizing_head_entry(), which
+        # requires the popped InflightEntry — not the raw item — to be the
+        # live object; the deleted _finalizing_head field previously made
+        # this entry discoverable directly).
+        rid2 = worker._register_item(entry2, initial=ItemLifecycleState.DISPATCHING)
 
         assert rid2 not in worker.frozen_prefix(), (
-            "a _finalizing_head registered at DISPATCHING in the registry "
-            "must be excluded from frozen_prefix."
+            "a finalizing-head InflightEntry registered at DISPATCHING in "
+            "the registry must be excluded from frozen_prefix."
         )
 
 

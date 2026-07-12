@@ -451,10 +451,10 @@ class TestFinalizingHeadLifecycle:
     async def test_finalizing_head_set_during_await_cleared_after(
         self, git_ops: GitOps, config: OrchestratorConfig,
     ) -> None:
-        """_finalizing_head is set during `await entry.verify_task` and cleared in finally.
-
-        RED: _finalize_inflight never assigns self._finalizing_head, so mid-await
-        assertion (worker._finalizing_head is entry) fails immediately.
+        """The finalizing head is discoverable via ``_finalizing_head_entry()``
+        during `await entry.verify_task` and disappears once the entry
+        retires (task 2435 kappa-b: derived from ``_live_items``, not the
+        deleted ``_finalizing_head`` field).
         """
         gate = asyncio.Event()
 
@@ -500,10 +500,9 @@ class TestFinalizingHeadLifecycle:
         fin = asyncio.ensure_future(worker._finalize_inflight(entry))
         await asyncio.sleep(0)   # yield to let _finalize_inflight reach the await
 
-        assert worker._finalizing_head is entry, (  # type: ignore[attr-defined]
-            f"Expected worker._finalizing_head is entry after yield; "
-            f"got {worker._finalizing_head!r}. "  # type: ignore[attr-defined]
-            "RED: _finalize_inflight never assigns _finalizing_head."
+        assert worker._finalizing_head_entry() is entry, (
+            f"Expected worker._finalizing_head_entry() is entry after yield; "
+            f"got {worker._finalizing_head_entry()!r}."
         )
         snap_mid = worker.snapshot()
         assert snap_mid['head_of_line'] == req.task_id, (
@@ -515,9 +514,8 @@ class TestFinalizingHeadLifecycle:
         gate.set()
         await fin
 
-        assert worker._finalizing_head is None, (  # type: ignore[attr-defined]
-            f"Expected worker._finalizing_head is None after _finalize_inflight; "
-            f"got {worker._finalizing_head!r}. "  # type: ignore[attr-defined]
-            "RED: finally clause not added yet."
+        assert worker._finalizing_head_entry() is None, (
+            f"Expected worker._finalizing_head_entry() is None after _finalize_inflight; "
+            f"got {worker._finalizing_head_entry()!r}."
         )
         assert req.result.done(), "Expected req.result to be resolved after FAIL path."

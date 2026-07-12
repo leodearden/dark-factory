@@ -182,7 +182,8 @@ class TestScenario1:
             # Wait for gated verify.  When gate_entered fires:
             #   • _maybe_coalesce_waiting_singles has run — all 3 singles resolved
             #     MergeOutcome('superseded') and the GroupMergeRequest is in _lane_buffers.
-            #   • _do_train_merge has picked up the GroupMergeRequest (_inflight_req set),
+            #   • _do_train_merge has picked up the GroupMergeRequest (registry
+            #     entry at ItemLifecycleState.MERGING),
             #     completed rebase + merge, and is now suspended inside
             #     run_scoped_verification (which is gated).
             await asyncio.wait_for(gate_entered.wait(), timeout=60)
@@ -200,9 +201,10 @@ class TestScenario1:
                 )
 
             # (a) Exactly one GroupMergeRequest dispatched, train_id starts 'coalesce-'.
-            # The GroupMergeRequest is currently _inflight_req (merger loop suspended
-            # inside _do_train_merge at run_scoped_verification).  confirm via snapshot
-            # (depth=1, state='merging') and via the shared train_id from the futures.
+            # The GroupMergeRequest is currently registered at MERGING (merger loop
+            # suspended inside _do_train_merge at run_scoped_verification).  confirm
+            # via snapshot (depth=1, state='merging') and via the shared train_id
+            # from the futures.
             train_id = req1.result.result().superseded_by
             assert train_id is not None and train_id.startswith('coalesce-'), (
                 f'train_id must start with "coalesce-"; got {train_id!r}'
@@ -215,7 +217,7 @@ class TestScenario1:
                 )
 
             # (d) GroupMergeRequest visible in snapshot while gated.
-            # When gate_entered fires the train is _inflight_req (state='merging').
+            # When gate_entered fires the train is registered at MERGING (state='merging').
             snapshot = worker.snapshot()
             assert snapshot['depth'] >= 1, (
                 f'Expected >= 1 entry in snapshot; depth={snapshot["depth"]}'
@@ -679,10 +681,12 @@ class TestScenario4:
       not req.result.done()    — absorbed or otherwise resolved
       not req.result.cancelled()  — detached waiter
       not isinstance(req, GroupMergeRequest)
-    Plus structural exclusion: _inflight_req is absent from _lane_buffers.
+    Plus structural exclusion: a MERGING-registered request is absent from
+    _lane_buffers.
 
     Setup:
-      req_in_flight: MergeRequest set on worker._inflight_req (absent from buffer)
+      req_in_flight: MergeRequest registered at ItemLifecycleState.MERGING
+        (absent from buffer)
       req_cancelled: MergeRequest whose future is pre-cancelled (remains in buffer)
       req4a, req4b: two live disjoint stackable singles (eligible)
 
@@ -691,7 +695,7 @@ class TestScenario4:
     direct _maybe_coalesce_waiting_singles() call level with real EventStore +
     factory, establishing that the pass correctly classifies each candidate type.
 
-    Driver: direct _inflight_req + _lane_buffers manipulation → call
+    Driver: direct registry-registration + _lane_buffers manipulation → call
     _maybe_coalesce_waiting_singles() with real EventStore + factory.
 
     Assertions:
@@ -702,7 +706,7 @@ class TestScenario4:
       (e) train forms from req4a + req4b only; exactly 2 members
       (f) train_coalesced event records only req4a + req4b in member_task_ids
 
-    GREEN (step-8): req_in_flight is set on worker._inflight_req and NOT placed
+    GREEN (step-8): req_in_flight is registered at MERGING and NOT placed
     in _lane_buffers (structural exclusion: absent from buffer).
     req_cancelled.result.cancel() is called before the pass so the cancelled()
     check filters it out.  Only req4a+req4b are eligible → 2-member train.
@@ -716,7 +720,11 @@ class TestScenario4:
     ):
         from orchestrator.event_store import EventStore
         from orchestrator.harness import build_train_callback_factory
-        from orchestrator.merge_queue import GroupMergeRequest, SpeculativeMergeWorker
+        from orchestrator.merge_queue import (
+            GroupMergeRequest,
+            ItemLifecycleState,
+            SpeculativeMergeWorker,
+        )
 
         # Four disjoint-file branches (all mutually line-stackable).
         wt_inf = await _make_branch_with_file(git_ops, 'ig_inf', 'file_inf.py',   'inf = 0\n')
@@ -742,10 +750,10 @@ class TestScenario4:
         req4a         = _make_req('ig_s4a', 'ig_s4a', wt_4a,  coalesce_config)
         req4b         = _make_req('ig_s4b', 'ig_s4b', wt_4b,  coalesce_config)
 
-        # GREEN (step-8): req_in_flight is in _inflight_req — NOT in the buffer.
+        # GREEN (step-8): req_in_flight is registered at MERGING — NOT in the buffer.
         # Structural exclusion: _maybe_coalesce_waiting_singles only scans
-        # _lane_buffers['normal']; _inflight_req is invisible to the pass.
-        worker._inflight_req = req_in_flight
+        # _lane_buffers['normal']; a MERGING-registered request is invisible to the pass.
+        worker._register_item(req_in_flight, initial=ItemLifecycleState.MERGING)
 
         # Simulate a detached waiter: cancel req_cancelled's future before
         # adding it to the buffer.  The cancelled() filter skips it during

@@ -3255,11 +3255,14 @@ class TestSpeculativeMergeWorker:
         log, never raise into the loop body).  A plain "raise on the first call"
         fault is therefore swallowed there and never reaches the merger-loop body
         that this test means to exercise.  We instead fault get_main_sha ONLY when an
-        in-flight request is set (worker._inflight_req is not None) — i.e. when called
-        from the loop body at the merge step (merge_queue.py:8271), after
-        _inflight_req=req is set (:8243) but before the SpeculativeItem is enqueued —
-        which is exactly the regression point.
+        in-flight request is set (a registry entry at ItemLifecycleState.MERGING —
+        formerly worker._inflight_req is not None, task 2435 kappa-b) — i.e. when
+        called from the loop body at the merge step, after the dequeue-time
+        MERGING transition but before the SpeculativeItem is enqueued — which is
+        exactly the regression point.
         """
+        from orchestrator.merge_queue import ItemLifecycleState
+
         wt_n = await _make_branch_with_file(
             git_ops, 'mef-n', 'file_mef_n.py', 'n = 1\n',
         )
@@ -3271,16 +3274,24 @@ class TestSpeculativeMergeWorker:
         worker = SpeculativeMergeWorker(git_ops, queue)
         worker_task = asyncio.create_task(worker.run())
 
+        def _merger_has_inflight_request() -> bool:
+            """True while some registry entry is at MERGING (task 2435 kappa-b:
+            replaces the deleted worker._inflight_req is not None gate)."""
+            return any(
+                state == ItemLifecycleState.MERGING
+                for state in worker._lifecycle.non_terminal_items().values()
+            )
+
         # get_main_sha raises RuntimeError on the FIRST loop-body call (i.e. once an
-        # in-flight request is set), and succeeds otherwise.  Gating on
-        # worker._inflight_req keeps the fail-open recompute/bounce calls (which run
-        # before _inflight_req is set) from absorbing the fault.
+        # in-flight request is set), and succeeds otherwise.  Gating on the registry's
+        # MERGING state keeps the fail-open recompute/bounce calls (which run before
+        # the dequeue-time MERGING transition) from absorbing the fault.
         original_get_main_sha = git_ops.get_main_sha
         loop_body_fault_fired = False
 
         async def failing_get_main_sha():  # type: ignore[no-untyped-def]
             nonlocal loop_body_fault_fired
-            if worker._inflight_req is not None and not loop_body_fault_fired:
+            if _merger_has_inflight_request() and not loop_body_fault_fired:
                 loop_body_fault_fired = True
                 raise RuntimeError('Simulated get_main_sha failure')
             return await original_get_main_sha()
@@ -3380,10 +3391,12 @@ class TestSpeculativeMergeWorker:
         eventually resumes and pushes a SpeculativeItem, the verifier is gone —
         the caller's Future is never resolved.
 
-        With fix (step-35): after asyncio.wait() returns, stop() checks
-        self._inflight_req.  If set and Future not done, resolves it as 'blocked'.
-        The caller's Future is guaranteed to be resolved even if the merger was
-        mid-operation when stop() was called.
+        With fix (step-35): after asyncio.wait() returns, stop() scans the
+        registry (_live_items) for a MergeRequest still at ItemLifecycleState.MERGING
+        (task 2435 kappa-b: formerly a self._inflight_req field check). If found
+        and Future not done, resolves it as 'blocked'. The caller's Future is
+        guaranteed to be resolved even if the merger was mid-operation when
+        stop() was called.
 
         Covers review issue [race_condition_unresolved_future] at stop() ~line 350.
         """
@@ -3419,11 +3432,11 @@ class TestSpeculativeMergeWorker:
 
             # stop() will time out (asyncio.wait) since merger is blocked.
             # Without fix: req.result is NOT done after stop() returns.
-            # With fix: stop() checks _inflight_req and resolves it.
+            # With fix: stop() scans the registry for a MERGING entry and resolves it.
             await worker.stop()
 
         assert req.result.done(), (
-            'Future must be resolved by stop() via _inflight_req check, '
+            'Future must be resolved by stop() via the registry MERGING scan, '
             'even when merger was mid-operation'
         )
         assert req.result.result().status == 'blocked'

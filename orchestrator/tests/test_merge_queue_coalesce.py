@@ -429,11 +429,16 @@ class TestExclusionIdempotency:
     ):
         """(a) IN-FLIGHT NEVER ABSORBED.
 
-        A request that lives in _inflight_req (not in _lane_buffers) must never
-        be touched by the pass — its future remains unresolved and its task_id
-        does not appear in the train's member_task_ids.
+        A request registered at ItemLifecycleState.MERGING (not in
+        _lane_buffers) must never be touched by the pass — its future remains
+        unresolved and its task_id does not appear in the train's
+        member_task_ids.
         """
-        from orchestrator.merge_queue import GroupMergeRequest, SpeculativeMergeWorker
+        from orchestrator.merge_queue import (
+            GroupMergeRequest,
+            ItemLifecycleState,
+            SpeculativeMergeWorker,
+        )
 
         # Three disjoint-file branches so all are line-stackable.
         wt0 = await _make_branch_with_file(git_ops, 'in0', 'inflight.py', 'x = 0\n')
@@ -453,7 +458,7 @@ class TestExclusionIdempotency:
 
         # Simulate req0 being in-flight (currently merging/verifying).
         # It is NOT in the lane buffer — that is the structural invariant.
-        worker._inflight_req = req0
+        worker._register_item(req0, initial=ItemLifecycleState.MERGING)
 
         # Only req1 and req2 are in the buffer.
         worker._lane_buffers['normal'].extend([req1, req2])

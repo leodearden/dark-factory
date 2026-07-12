@@ -801,7 +801,7 @@ class TestFinalizingHeadInFrozenPrefix:
         entry_d = _make_inflight_entry(item_d, verifying=True)  # phase='verifying'
         entry_e = _make_inflight_entry(item_e, verifying=True)
 
-        worker._finalizing_head = entry_d
+        worker._register_item(entry_d, initial=ItemLifecycleState.VERIFYING)
         worker._inflight.append(entry_e)
 
         fp = worker.frozen_prefix()
@@ -831,7 +831,7 @@ class TestFinalizingHeadInFrozenPrefix:
         entry_d = _make_inflight_entry(item_d, verifying=True)
         entry_e = _make_inflight_entry(item_e, verifying=True)
 
-        worker._finalizing_head = entry_d
+        worker._register_item(entry_d, initial=ItemLifecycleState.VERIFYING)
         worker._inflight.append(entry_e)
 
         tip = worker.frozen_prefix_tip('main0')
@@ -855,9 +855,7 @@ class TestFinalizingHeadInFrozenPrefix:
         _, item_p = _make_fake_item('t-p', base_sha='main0', merge_commit='sha-Pc',
                                     config=config, git_repo=git_repo)
         entry_p = _make_inflight_entry(item_p, verifying=True)
-        worker._register_item(item_p, initial=ItemLifecycleState.DISPATCHING)  # non-qualifying phase
-
-        worker._finalizing_head = entry_p
+        worker._register_item(entry_p, initial=ItemLifecycleState.DISPATCHING)  # non-qualifying phase
 
         fp = worker.frozen_prefix()
         assert fp == (), (
@@ -879,12 +877,10 @@ class TestFinalizingHeadInFrozenPrefix:
         _, item_g = _make_fake_item('t-g', base_sha='main0', merge_commit='sha-Gc',
                                     config=config, git_repo=git_repo)
         entry_g = _make_inflight_entry(item_g, verifying=True)
-        worker._register_item(item_g, initial=ItemLifecycleState.VERIFYING)
+        worker._register_item(entry_g, initial=ItemLifecycleState.VERIFYING)
         worker._note_transition(
             item_g.request.request_id, ItemLifecycleState.VERIFYING, ItemLifecycleState.GATE_REVERIFY,
         )  # a qualifying phase distinct from 'verifying'
-
-        worker._finalizing_head = entry_g
 
         fp = worker.frozen_prefix()
         assert item_g.request.request_id in fp, (
