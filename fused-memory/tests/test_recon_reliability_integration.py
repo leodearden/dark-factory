@@ -550,3 +550,48 @@ class TestSuppressionRoundTrip:
             flag_types=None,
         )
         return await filter_suppressed(recon_service, self._PROJECT, self._candidate_flags())
+
+
+# ---------------------------------------------------------------------------
+# L4 — GC terminal-referenced marker, single DELETE pass [κ=2228]
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestGcTerminalReferenced:
+    """L4 (κ=2228): one ``_gc_recon_markers`` pass deletes ONLY the
+    terminal-referenced marker and KEEPS the live-referenced marker.
+
+    Driving harness (``_drive_gc_pass``) lands in step-6 — this step only
+    declares the §9 postcondition, so it is RED until then (the harness
+    method referenced below doesn't exist yet).
+    """
+
+    _PROJECT = 'proj-l4-gc-terminal-referenced'
+    _TERMINAL_TASK_ID = 'T-done'
+    _LIVE_TASK_ID = 'T-live'
+
+    async def test_gc_pass_deletes_only_terminal_referenced_marker(
+        self, ledger,
+    ) -> None:
+        """Given a marker referencing a now-terminal task and a marker
+        referencing a still-live task, one GC pass deletes only the
+        terminal-referenced marker, keeps the live-referenced marker, and
+        its swept-count return value reflects exactly the one deleted row
+        (proving the deletion happened in the single collapsed pass, not
+        some other path)."""
+        swept = await self._drive_gc_pass(ledger)
+
+        assert swept == 1, f'Expected exactly 1 row swept (the terminal marker), got {swept}'
+
+        terminal_marker = await ledger.get_by_identity(
+            self._PROJECT, 'stage1_flag_marker',
+            task_id=self._TERMINAL_TASK_ID, flag_type='flag_terminal', run_id='',
+        )
+        assert terminal_marker is None, 'Expected the terminal-referenced marker to be deleted'
+
+        live_marker = await ledger.get_by_identity(
+            self._PROJECT, 'stage1_flag_marker',
+            task_id=self._LIVE_TASK_ID, flag_type='flag_live', run_id='',
+        )
+        assert live_marker is not None, 'Expected the live-referenced marker to be kept'
