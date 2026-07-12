@@ -1531,6 +1531,37 @@ def _discover_module_configs(project_root: Path) -> dict[str, ModuleConfig]:
     return configs
 
 
+_DEFAULT_PRICES: dict[str, dict[str, float]] = {
+    # Per-model USD cost per 1M tokens, for backends without native cost
+    # reporting (codex, gemini, pi). Migrated from the former invoke.py
+    # `_MODEL_COSTS` constant (task 2459). defaults.yaml's `prices:` block is
+    # the operator-editable seed source; this constant is the safety-net
+    # default for OrchestratorConfig.prices and backs default_price_table(),
+    # which orchestrator.agents.invoke's cost estimator falls back to when no
+    # config is threaded in.
+    'gpt-5.4': {'input_per_1m': 2.50, 'output_per_1m': 10.00},
+    'o4-mini': {'input_per_1m': 1.10, 'output_per_1m': 4.40},
+    'gemini-3.1-pro-preview': {'input_per_1m': 1.25, 'output_per_1m': 5.00},
+    'gemini-3-flash': {'input_per_1m': 0.075, 'output_per_1m': 0.30},
+}
+
+
+class PriceEntry(BaseModel):
+    """Per-model USD price, in dollars per 1M tokens.
+
+    Used by cost estimation for backends without native cost reporting
+    (codex, gemini, pi) — see orchestrator.agents.invoke._estimate_cost.
+    """
+
+    input_per_1m: float = Field(ge=0, description='USD per 1M input tokens.')
+    output_per_1m: float = Field(ge=0, description='USD per 1M output tokens.')
+
+
+def default_price_table() -> dict[str, dict[str, float]]:
+    """Return a fresh copy of the packaged default per-model price seeds."""
+    return {model: dict(rates) for model, rates in _DEFAULT_PRICES.items()}
+
+
 # --- Top-level ---
 
 
@@ -1846,6 +1877,19 @@ class OrchestratorConfig(BaseSettings):
     # ``cargo --workspace`` → ``cargo -p <crate>`` for the touched crates.
     # Post-merge verify always runs workspace-wide regardless.
     scope_cargo: bool = Field(default=True)
+
+    # Per-model USD/1M-token prices for backends without native cost
+    # reporting (codex, pi). Seeded from defaults.yaml's `prices:` block
+    # (task 2459; migrated off invoke.py's former hardcoded _MODEL_COSTS).
+    # Green-tier hot-reloadable (see RELOADABLE_FIELDS) — an operator can
+    # retune per-model rates without a process restart.
+    prices: dict[str, PriceEntry] = Field(
+        default_factory=lambda: {k: PriceEntry(**v) for k, v in _DEFAULT_PRICES.items()},
+        description=(
+            'Per-model USD/1M token prices for backends without native cost '
+            'reporting (codex, pi).'
+        ),
+    )
 
     # ── Merge-verify scoping & fan-out bounds (storm guard) ──────────────
     # When True, post-merge verify bypasses per-subproject scoping/fan-out and

@@ -122,6 +122,25 @@ verify_env: {}
 # all task files live in one (or a few) workspace crates.
 scope_cargo: true
 
+# Per-model USD price per 1M tokens, for backends without native cost
+# reporting (codex, pi). Migrated from invoke.py's former hardcoded
+# _MODEL_COSTS (task 2459); seeds OrchestratorConfig.prices (config.py's
+# _DEFAULT_PRICES mirrors this block as a safety-net default). Green-tier
+# hot-reloadable — retune a rate here and reload without a restart.
+prices:
+  gpt-5.4:
+    input_per_1m: 2.50
+    output_per_1m: 10.00
+  o4-mini:
+    input_per_1m: 1.10
+    output_per_1m: 4.40
+  gemini-3.1-pro-preview:
+    input_per_1m: 1.25
+    output_per_1m: 5.00
+  gemini-3-flash:
+    input_per_1m: 0.075
+    output_per_1m: 0.30
+
 # Steward lifecycle
 steward_lifetime_budget: 12.0
 steward_max_attempts: 1
