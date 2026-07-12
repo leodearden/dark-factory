@@ -136,3 +136,66 @@ class TestBackfillDepStatusPhase:
         # over the pending (task, dep) pairs — proves the shared helper is consumed,
         # not a re-collapsed hand loop.
         assert scheduler._streak_local_backfill.counts[('T', '9')] == 1
+
+
+class TestPolicySelectionPrepPhases:
+    """Isolation tests for the Policy/selection-prep phases (external_dep_policy,
+    build_candidates, starvation) — each calls its ``_phase_*`` method directly
+    against a hand-built ``TickContext``, no full-tick orchestration."""
+
+    @pytest.mark.asyncio
+    async def test_phase_external_dep_policy_runs_gate_exactly_once(
+        self, scheduler: Scheduler
+    ):
+        task = {
+            'id': 'T', 'status': 'pending', 'dependencies': [],
+            'metadata': {'external_deps': ['other:5']},
+        }
+        ctx = TickContext(tasks=[task], status_map={'T': 'pending'}, tasks_by_id={'T': task})
+        scheduler.get_external_statuses = AsyncMock(
+            return_value=({'other:5': 'done'}, None)
+        )
+
+        result = await scheduler._phase_external_dep_policy(ctx)
+
+        scheduler.get_external_statuses.assert_awaited_once()
+        assert ctx.external_cache == {'other:5': 'done'}
+        assert ctx.external_resolver_failed is False
+        assert result is _CONTINUE
+
+    @pytest.mark.asyncio
+    async def test_phase_build_candidates_fills_ctx(self, scheduler: Scheduler):
+        task = {'id': 'A', 'status': 'pending', 'dependencies': []}
+        ctx = TickContext(
+            tasks=[task],
+            status_map={'A': 'pending'},
+            tasks_by_id={'A': task},
+        )
+
+        result = await scheduler._phase_build_candidates(ctx)
+
+        assert result is _CONTINUE
+        assert any(str(t.get('id')) == 'A' for t in ctx.candidates)
+        assert 'A' in ctx.candidate_signals
+
+    @pytest.mark.asyncio
+    async def test_phase_starvation_scans_candidates(self, scheduler: Scheduler):
+        calls: list[str] = []
+
+        async def _spy(task_id, **kwargs):
+            calls.append(task_id)
+
+        scheduler._callbacks = dataclasses.replace(
+            scheduler._callbacks, on_starvation_warn=_spy
+        )
+        task = {'id': 'A', 'status': 'pending', 'dependencies': []}
+        ctx = TickContext(
+            tasks=[task],
+            status_map={'A': 'pending'},
+            tasks_by_id={'A': task},
+            candidates=[task],
+        )
+
+        result = await scheduler._phase_starvation(ctx)
+
+        assert result is _CONTINUE
