@@ -735,7 +735,16 @@ async def test_burst_coalescing_fires_exactly_once_after_last_merge() -> None:
 
 @pytest.mark.asyncio
 async def test_default_executor_spawns_script_detached() -> None:
-    """Default executor spawns scripts/restart-fused-memory.sh --drain detached."""
+    """Default executor spawns scripts/restart-fused-memory.sh --drain detached.
+
+    task 2237: _default_restart_executor is now a thin
+    proc_supervision.RestartPlan caller — the actual
+    asyncio.create_subprocess_exec call now happens inside RestartPlan.
+    execute()'s leaf plain-spawn path (proc_supervision.py), so the patch
+    target moves there. Byte-identical spawn signature (script path,
+    --drain, start_new_session=True) PLUS an explicit cwd=project_root
+    (RP-3's structural "no implicit cwd").
+    """
     from unittest.mock import MagicMock as MM
     from unittest.mock import patch
 
@@ -759,10 +768,11 @@ async def test_default_executor_spawns_script_detached() -> None:
     current_time[0] = 0.0
     await coord.note_merge('task-1', 'base1', 'head1')
 
-    # Patch asyncio.create_subprocess_exec inside the service_restart module
+    # Patch asyncio.create_subprocess_exec inside proc_supervision — that's
+    # where RestartPlan.execute()'s leaf plain-spawn path now calls it.
     fake_proc = MM()
     with patch(
-        'orchestrator.service_restart.asyncio.create_subprocess_exec',
+        'orchestrator.proc_supervision.asyncio.create_subprocess_exec',
         new_callable=AsyncMock,
         return_value=fake_proc,
     ) as mock_exec:
@@ -777,6 +787,8 @@ async def test_default_executor_spawns_script_detached() -> None:
     assert pos_args[1] == '--drain'
     # Must be spawned detached (fire-and-forget, survives MCP reconnect)
     assert call_args.kwargs.get('start_new_session') is True
+    # RP-3: every spawn now carries an explicit, absolute cwd
+    assert call_args.kwargs.get('cwd') == '/fake/project'
     # The process must NOT be awaited — fake_proc.wait/communicate not called
     fake_proc.wait.assert_not_called()
     fake_proc.communicate.assert_not_called()
@@ -933,7 +945,12 @@ async def test_require_idle_true_defers_when_agents_not_idle() -> None:
 
 @pytest.mark.asyncio
 async def test_default_executor_with_empty_script_args_omits_drain() -> None:
-    """Default executor with script_args=[] spawns script with NO --drain flag."""
+    """Default executor with script_args=[] spawns script with NO --drain flag.
+
+    task 2237: patch target moves to proc_supervision.asyncio.
+    create_subprocess_exec (see test_default_executor_spawns_script_detached
+    above) — same conversion, dashboard leaf shape (no --drain).
+    """
     from unittest.mock import MagicMock as MM
     from unittest.mock import patch
 
@@ -960,7 +977,7 @@ async def test_default_executor_with_empty_script_args_omits_drain() -> None:
 
     fake_proc = MM()
     with patch(
-        'orchestrator.service_restart.asyncio.create_subprocess_exec',
+        'orchestrator.proc_supervision.asyncio.create_subprocess_exec',
         new_callable=AsyncMock,
         return_value=fake_proc,
     ) as mock_exec:
@@ -974,8 +991,49 @@ async def test_default_executor_with_empty_script_args_omits_drain() -> None:
     assert str(pos_args[0]).endswith('scripts/restart-dashboard.sh')
     assert len(pos_args) == 1  # script path only, no extra args
     assert call_args.kwargs.get('start_new_session') is True
+    # RP-3: every spawn now carries an explicit, absolute cwd
+    assert call_args.kwargs.get('cwd') == '/fake/project'
     fake_proc.wait.assert_not_called()
     fake_proc.communicate.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_default_executor_filenotfound_propagates_to_permanent_failure_branch() -> None:
+    """A FileNotFoundError raised by the underlying spawn propagates all the
+    way through _default_restart_executor's RestartPlan.execute() call
+    (proc_supervision's leaf plain-spawn path does NOT catch it — task 2237
+    step-16) and out to maybe_restart's existing permanent-failure branch:
+    fail-open (result False) and pending cleared so a subsequent idle tick
+    does not retry and crash-loop."""
+    from unittest.mock import patch
+
+    git_ops = MagicMock()
+    git_ops.get_merge_diff_files = AsyncMock(return_value=(['fused-memory/src/server/main.py'], None))
+    event_store = MagicMock()
+    current_time: list[float] = [0.0]
+
+    coord = StaleServiceRestartCoordinator(
+        git_ops=git_ops,
+        event_store=event_store,
+        watch_prefixes=['fused-memory/src/'],
+        debounce_secs=0.0,
+        enabled=True,
+        project_root='/fake/project',
+        script_path='scripts/restart-fused-memory.sh',
+        clock=lambda: current_time[0],
+    )
+
+    await coord.note_merge('task-1', 'base1', 'head1')
+
+    with patch(
+        'orchestrator.proc_supervision.asyncio.create_subprocess_exec',
+        new_callable=AsyncMock,
+        side_effect=FileNotFoundError('restart-fused-memory.sh not found'),
+    ):
+        result = await coord.maybe_restart(agents_idle=True)
+
+    assert result is False, 'fail-open: the executor exception must not propagate out of maybe_restart'
+    assert coord.is_pending is False, 'permanent failure clears pending — no retry on the next idle tick'
 
 
 # ---------------------------------------------------------------------------
