@@ -147,3 +147,32 @@ class TestResolveFallback:
         assert resolved.text == spec.in_code_constant
         assert resolved.provenance is None
         assert resolved.source == 'in_code'
+
+
+class TestPinAndResolve:
+    def test_pin_then_resolve_composes_contract_and_artifact_heuristics(self, tmp_path):
+        store = PromptArtifactStore(tmp_path)
+        spec = _make_spec()
+        heuristics = 'PINNED HEURISTIC: prefer X.'
+        provenance = ArtifactProvenance(**_provenance_kwargs(harness_version='v1'))
+
+        store.pin(
+            'reviewer', 'claude-opus-4', 'v1', heuristics=heuristics, provenance=provenance
+        )
+        resolved = store.resolve(spec, executor_model='claude-opus-4', harness_version='v1')
+
+        assert resolved.text == compose_prompt(spec.contract, heuristics)
+        assert resolved.text[: len(spec.contract)] == spec.contract
+        assert resolved.provenance == provenance
+        assert resolved.source == 'artifact'
+
+        assert store.read_provenance('reviewer', 'claude-opus-4', 'v1') == provenance
+
+    def test_pin_rejects_provenance_harness_version_mismatch(self, tmp_path):
+        store = PromptArtifactStore(tmp_path)
+        provenance = ArtifactProvenance(**_provenance_kwargs(harness_version='v1'))
+
+        with pytest.raises(ValueError):
+            store.pin(
+                'reviewer', 'claude-opus-4', 'v2', heuristics='h', provenance=provenance
+            )
