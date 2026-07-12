@@ -1,0 +1,222 @@
+diff --git a/fused-memory/src/fused_memory/reconciliation/prompts/stage1.py b/fused-memory/src/fused_memory/reconciliation/prompts/stage1.py
+index eeefe2f749..384dd76283 100644
+--- a/fused-memory/src/fused_memory/reconciliation/prompts/stage1.py
++++ b/fused-memory/src/fused_memory/reconciliation/prompts/stage1.py
+@@ -180,36 +180,46 @@ should always use both to fully prevent temporal contamination.
+ 
+ ## Snapshot Discipline
+ Recurring temporal-fact snapshots (task-count, task-status, run summaries, system stats) \
+-are written every reconciliation cycle. Every cycle the values change, but prior snapshot \
+-edges from older episodes stay valid and accumulate as contradictions.
++are written every reconciliation cycle. Every cycle the values change; prior snapshot \
++edges from older episodes stay valid in storage, but **accumulation is acceptable**: \
++Graphiti's `valid_at`-descending search ordering guarantees every downstream reader \
++(`search`, `get_entity`) sees the most recent snapshot first, so older edges are \
++naturally superseded without you invalidating them.
++
++**Async-queue indexing latency**: snapshot writes via `add_memory(category='temporal_facts')` \
++are async-enqueued through the durable queue (see `## Graphiti Queued Writes` for the \
++`memory_ids: []` invariant). Graphiti embedding indexing trails Stage 1's search window, \
++so a pre-write `search()` CANNOT return the current cycle's own snapshot writes. Searching \
++for your own snapshot before writing it is a provable no-op — do not do it. Rely instead \
++on temporal supersession: each fresh snapshot carries a newer `valid_at`, so readers \
++querying by `valid_at` desc always see the most recent value without you needing to \
++invalidate prior edges.
+ 
+ **Never use `add_episode` for recurring temporal-fact snapshot writes.** `add_episode` \
+ triggers Graphiti's extraction pipeline, which produces 4 identical edges per write that \
+ dedup loops must clean up next cycle. Do not use `add_episode` for task-count, task-status, \
+-run summary, or system-stat snapshots. Use the mandatory two-step workaround below instead.
+-
+-If you write any recurring temporal-fact snapshot (task counts, task status, run summaries, \
+-system stats), follow this discipline for each snapshot fact:
+-
+-1. First, search for existing snapshot edges for this project \
+-   (e.g. `search(query="task counts total done blocked", project_id=..., limit=5)` or \
+-   `search(query="task status in_progress blocked", project_id=..., limit=5)`).
+-2. To update the snapshot, use the **mandatory two-step workaround** (see \
+-   `## update_edge Temporal Limitation` below): (a) call `update_edge(invalid_at=now)` \
+-   on the old edge to mark it superseded, then (b) call \
+-   `add_memory(category='temporal_facts')` with the new fact text. Do NOT use `update_edge` \
+-   alone to overwrite snapshot fact text — the edge's `valid_at` stays pinned at its \
+-   original creation date, creating misleading temporal provenance.
+-3. When several stale edges exist from a single older snapshot episode, either:
+-   (a) `delete_memory` each stale edge UUID and call `refresh_entity_summary` on the \
+-       affected project entity, OR
+-   (b) prefer a single composite edge ("reify task counts as of {{ISO_date}}: total=N, \
+-       done=M, in_progress=K, blocked=J") over multiple sibling edges — fewer surfaces \
+-       means fewer stale facts next cycle.
++run summary, or system-stat snapshots.
++
++For each recurring snapshot write, follow this discipline:
++
++1. Call `add_memory(category='temporal_facts')` directly with the new fact text. \
++   Encode the effective ISO date in the fact text itself \
++   (e.g. `"As of 2026-05-13: project dark_factory has 3 blocked, 18 done, 42 total."`). \
++   Each write carries the current ingestion time as `valid_at`; newer writes naturally \
++   supersede older ones in temporal queries.
++2. Prefer a single composite edge ("reify task counts as of {{ISO_date}}: total=N, \
++   done=M, in_progress=K, blocked=J") over multiple sibling edges — fewer surfaces \
++   means fewer stale facts next cycle.
+ 
+ Do not write four sibling edges (one per count field) — that multiplies the stale-edge \
+ surface you or a later cycle will have to clean up.
+ 
++**Note**: the `## update_edge Temporal Limitation` two-step workaround (invalidate + \
++add_memory) still applies to NON-snapshot temporal edge updates (status flips, decision \
++retractions, etc.) where you are updating a specific known edge. The snapshot simplification \
++above (write-fresh, skip pre-search) applies only to recurring snapshot writes where \
++temporal supersession via `valid_at` is sufficient.
++
+ ## update_edge Temporal Limitation (Task 1145 Guard 3 workaround)
+ `mcp__fused-memory__update_edge` does NOT expose a `valid_at` parameter. When you update \
+ a temporal or snapshot edge's fact text via `update_edge`, the edge's `valid_at` timestamp \
+@@ -226,7 +236,7 @@ Task 1145 Guard 3 is shipped):
+ `add_memory(category='temporal_facts')`, encode the effective ISO date directly in the \
+ fact text itself so the temporal anchor is human-readable even if `valid_at` metadata \
+ is not surfaced by the search caller. Example fact text: \
+-`"As of 2026-05-09: project dark_factory has 42 total tasks, 18 done, 3 blocked."` \
++`"As of 2026-05-09: project dark_factory has 3 blocked, 18 done, 42 total."` \
+ This is especially important for task-count, task-status, run summary, and system-stat \
+ snapshots where the date of the reading is part of the fact's meaning.
+ 
+diff --git a/fused-memory/src/fused_memory/reconciliation/stages/memory_consolidator.py b/fused-memory/src/fused_memory/reconciliation/stages/memory_consolidator.py
+index d351f33fb3..1faa60061f 100644
+--- a/fused-memory/src/fused_memory/reconciliation/stages/memory_consolidator.py
++++ b/fused-memory/src/fused_memory/reconciliation/stages/memory_consolidator.py
+@@ -402,3 +402,50 @@ def _format_watermark(watermark: Watermark) -> str:
+         f'Last full run: {watermark.last_full_run_id} '
+         f'at {watermark.last_full_run_completed.isoformat()}'
+     )
++
++
++def format_snapshot_fact(
++    *,
++    as_of: datetime,
++    project_id: str,
++    counts: dict[str, int],
++) -> str:
++    """Return a canonical temporal-fact snapshot string for task-count snapshots.
++
++    The returned string encodes the effective ISO date directly in the fact text
++    so the temporal anchor is human-readable even if ``valid_at`` metadata is not
++    surfaced by the search caller.  Example output (keys alphabetised)::
++
++        As of 2026-05-13: project dark_factory has 3 blocked, 18 done, 5 in_progress, 42 total.
++
++    Args:
++        as_of: Timezone-aware datetime representing the effective date of the snapshot.
++            Raises ``ValueError`` for tz-naive datetimes to prevent ambiguous timestamps.
++        project_id: Project identifier (e.g. ``"dark_factory"``).
++        counts: Mapping of label → count (e.g. ``{"total": 42, "done": 18}``).
++            All keys present in *counts* appear in the output in alphabetical order
++            so that cycle-over-cycle diffs are stable.  Zero values are included.
++
++    Returns:
++        Canonical fact string ending with a period.
++
++    Raises:
++        ValueError: If *as_of* is timezone-naive.
++
++    Note:
++        This helper has no in-tree caller yet — it is exported for future harness-side
++        snapshot writers (e.g. a MemoryConsolidator post-cycle hook) and keeps the LLM
++        prompt and downstream readers aligned on fact-text format.
++        TODO(task-1225): wire into the snapshot-emit code path once a deterministic
++        harness-side writer is added to MemoryConsolidator.
++    """
++    if as_of.tzinfo is None:
++        raise ValueError(
++            'format_snapshot_fact requires tz-aware as_of; got a naive datetime. '
++            'Pass e.g. datetime(..., tzinfo=UTC).'
++        )
++    iso_date = as_of.date().isoformat()
++    count_parts = ', '.join(
++        f'{v} {k}' for k, v in sorted(counts.items())
++    )
++    return f'As of {iso_date}: project {project_id} has {count_parts}.'
+diff --git a/fused-memory/tests/test_stages.py b/fused-memory/tests/test_stages.py
+index 1a6d948c1e..89b13626b7 100644
+--- a/fused-memory/tests/test_stages.py
++++ b/fused-memory/tests/test_stages.py
+@@ -7431,3 +7431,80 @@ class TestPropagateEscalationQueueHelper:
+                 'Helper must not overwrite _escalation_url when harness has no URL'
+             )
+ 
++
++# ---------------------------------------------------------------------------
++# step-3: format_snapshot_fact deterministic helper
++# ---------------------------------------------------------------------------
++
++
++class TestFormatSnapshotFact:
++    """Unit tests for the format_snapshot_fact helper in memory_consolidator."""
++
++    def _import_helper(self):
++        from fused_memory.reconciliation.stages.memory_consolidator import (
++            format_snapshot_fact,
++        )
++
++        return format_snapshot_fact
++
++    def test_canonical_format_with_iso_date_and_counts(self):
++        """Helper returns canonical text with ISO date, project_id, and all count values."""
++        format_snapshot_fact = self._import_helper()
++        result = format_snapshot_fact(
++            as_of=datetime(2026, 5, 13, tzinfo=UTC),
++            project_id='dark_factory',
++            counts={'total': 42, 'done': 18, 'blocked': 3, 'in_progress': 5},
++        )
++        assert result.startswith('As of 2026-05-13'), (
++            f'Expected result to start with "As of 2026-05-13", got: {result!r}'
++        )
++        assert 'project dark_factory' in result, (
++            f'Expected "project dark_factory" in result, got: {result!r}'
++        )
++        assert '42 total' in result, f'Expected "42 total" in result, got: {result!r}'
++        assert '18 done' in result, f'Expected "18 done" in result, got: {result!r}'
++        assert '3 blocked' in result, f'Expected "3 blocked" in result, got: {result!r}'
++        assert '5 in_progress' in result, (
++            f'Expected "5 in_progress" in result, got: {result!r}'
++        )
++
++    def test_keeps_all_fields_in_deterministic_order(self):
++        """Zero-value fields are included; output is alphabetically ordered and stable."""
++        format_snapshot_fact = self._import_helper()
++        # Same logical mapping, different insertion order — output must be identical
++        result_abc = format_snapshot_fact(
++            as_of=datetime(2026, 5, 13, tzinfo=UTC),
++            project_id='proj',
++            counts={'blocked': 0, 'done': 0, 'total': 10},
++        )
++        result_cba = format_snapshot_fact(
++            as_of=datetime(2026, 5, 13, tzinfo=UTC),
++            project_id='proj',
++            counts={'total': 10, 'done': 0, 'blocked': 0},
++        )
++        assert result_abc == result_cba, (
++            f'Different insertion orders must produce identical output.\n'
++            f'  abc order: {result_abc!r}\n'
++            f'  cba order: {result_cba!r}'
++        )
++        # Zero values are included so cycle-over-cycle diffs are meaningful
++        assert '0 done' in result_abc, (
++            f'Zero-value fields must appear in output, got: {result_abc!r}'
++        )
++        assert '0 blocked' in result_abc, (
++            f'Zero-value fields must appear in output, got: {result_abc!r}'
++        )
++        # Alphabetical ordering: 'blocked' < 'done' < 'total'
++        assert result_abc.index('blocked') < result_abc.index('done') < result_abc.index('total'), (
++            f'Keys must appear in alphabetical order, got: {result_abc!r}'
++        )
++
++    def test_naive_datetime_raises_value_error(self):
++        """Tz-naive as_of must raise ValueError to prevent ambiguous timestamps."""
++        format_snapshot_fact = self._import_helper()
++        with pytest.raises(ValueError, match='tz-aware'):
++            format_snapshot_fact(
++                as_of=datetime(2026, 5, 13),  # naive — no tzinfo
++                project_id='proj',
++                counts={'total': 1},
++            )

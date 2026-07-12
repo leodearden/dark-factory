@@ -1,0 +1,188 @@
+diff --git a/dashboard/src/dashboard/data/redux_api.py b/dashboard/src/dashboard/data/redux_api.py
+index c28b802444..8cd6f4be63 100644
+--- a/dashboard/src/dashboard/data/redux_api.py
++++ b/dashboard/src/dashboard/data/redux_api.py
+@@ -147,6 +147,8 @@ def shape_memory(
+             'wal': _shape_wal_status(wal),
+             'offline': True,
+             'error': status.get('error'),
++            'uptime_seconds': None,
++            'started_at': None,
+         }}
+ 
+     graphiti = dict(status.get('graphiti') or {})
+@@ -193,6 +195,8 @@ def shape_memory(
+         'queue': queue_block,
+         'projects': enriched_projects,
+         'wal': wal_block,
++        'uptime_seconds': status.get('uptime_seconds'),
++        'started_at': status.get('started_at'),
+     }}
+ 
+ 
+diff --git a/dashboard/src/dashboard/static/redux/index.html b/dashboard/src/dashboard/static/redux/index.html
+index ccade6d9e7..4902d594e3 100644
+--- a/dashboard/src/dashboard/static/redux/index.html
++++ b/dashboard/src/dashboard/static/redux/index.html
+@@ -8,7 +8,7 @@
+ <link rel="preconnect" href="https://fonts.googleapis.com">
+ <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+ <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet">
+-<link rel="stylesheet" href="/static/redux/styles.css?v=22" />
++<link rel="stylesheet" href="/static/redux/styles.css?v=23" />
+ </head>
+ <body>
+ <div id="root"></div>
+@@ -19,19 +19,19 @@
+ <script src="https://unpkg.com/marked@12.0.0/marked.min.js" integrity="sha384-NNQgBjjuhtXzPmmy4gurS5X7P4uTt1DThyevz4Ua0IVK5+kazYQI1W27JHjbbxQz" crossorigin="anonymous"></script>
+ <script src="https://unpkg.com/dompurify@3.2.4/dist/purify.min.js" integrity="sha384-eEu5CTj3qGvu9PdJuS+YlkNi7d2XxQROAFYOr59zgObtlcux1ae1Il3u7jvdCSWu" crossorigin="anonymous"></script>
+ 
+-<script src="/static/redux/data.js?v=22"></script>
+-<script type="text/babel" src="/static/redux/tweaks-panel.jsx?v=22"></script>
+-<script type="text/babel" src="/static/redux/charts.jsx?v=22"></script>
+-<script type="text/babel" src="/static/redux/shell.jsx?v=22"></script>
+-<script type="text/babel" src="/static/redux/scheduler_utils.jsx?v=22"></script>
+-<script type="text/babel" src="/static/redux/tab_overview.jsx?v=22"></script>
+-<script type="text/babel" src="/static/redux/tabs.jsx?v=22"></script>
+-<script type="text/babel" src="/static/redux/tab_tasks.jsx?v=22"></script>
+-<script type="text/babel" src="/static/redux/tab_curator.jsx?v=22"></script>
+-<script type="text/babel" src="/static/redux/scheduler_heatmap.jsx?v=22"></script>
+-<script type="text/babel" src="/static/redux/scheduler_drawer.jsx?v=22"></script>
+-<script type="text/babel" src="/static/redux/tab_scheduler.jsx?v=22"></script>
+-<script type="text/babel" src="/static/redux/tab_escalations.jsx?v=22"></script>
+-<script type="text/babel" src="/static/redux/app.jsx?v=22"></script>
++<script src="/static/redux/data.js?v=23"></script>
++<script type="text/babel" src="/static/redux/tweaks-panel.jsx?v=23"></script>
++<script type="text/babel" src="/static/redux/charts.jsx?v=23"></script>
++<script type="text/babel" src="/static/redux/shell.jsx?v=23"></script>
++<script type="text/babel" src="/static/redux/scheduler_utils.jsx?v=23"></script>
++<script type="text/babel" src="/static/redux/tab_overview.jsx?v=23"></script>
++<script type="text/babel" src="/static/redux/tabs.jsx?v=23"></script>
++<script type="text/babel" src="/static/redux/tab_tasks.jsx?v=23"></script>
++<script type="text/babel" src="/static/redux/tab_curator.jsx?v=23"></script>
++<script type="text/babel" src="/static/redux/scheduler_heatmap.jsx?v=23"></script>
++<script type="text/babel" src="/static/redux/scheduler_drawer.jsx?v=23"></script>
++<script type="text/babel" src="/static/redux/tab_scheduler.jsx?v=23"></script>
++<script type="text/babel" src="/static/redux/tab_escalations.jsx?v=23"></script>
++<script type="text/babel" src="/static/redux/app.jsx?v=23"></script>
+ </body>
+ </html>
+diff --git a/dashboard/src/dashboard/static/redux/shell.jsx b/dashboard/src/dashboard/static/redux/shell.jsx
+index c2973e9788..7f3ca687e4 100644
+--- a/dashboard/src/dashboard/static/redux/shell.jsx
++++ b/dashboard/src/dashboard/static/redux/shell.jsx
+@@ -51,6 +51,22 @@ function timeago(iso) {
+   return `${d}d`;
+ }
+ 
++// Format a duration in seconds as a compact two-unit string: "3d 7h" (>=1 day),
++// "7h 4m" (>=1 hour), "4m" (>=1 minute), "30s" otherwise.
++// Returns "—" for null/undefined/NaN/negative input.
++function fmtUptime(seconds) {
++  if (seconds == null || isNaN(seconds) || seconds < 0) return '—';
++  const s = Math.floor(seconds);
++  const d = Math.floor(s / 86400);
++  const h = Math.floor((s % 86400) / 3600);
++  const m = Math.floor((s % 3600) / 60);
++  const rem = s % 60;
++  if (d >= 1) return `${d}d ${h}h`;
++  if (h >= 1) return `${h}h ${m}m`;
++  if (m >= 1) return `${m}m`;
++  return `${rem}s`;
++}
++
+ // Replace any ISO8601 timestamps embedded inside a free-form string with the
+ // minute-precision UTC form. Used for fields like cost-event `detail` where
+ // the API returns a stringified JSON blob containing raw timestamps.
+@@ -433,4 +449,4 @@ function Segmented({ options, value, onChange }) {
+   );
+ }
+ 
+-window.DF_SHELL = { Glyph, StatStrip, ChipGroup, ProjectChips, MultiSelect, Toolbar, LiveFeed, Rail, ProjectGroup, Segmented, timeago, fmtDateTime, scrubIsos, taskId, dailyDeltas };
++window.DF_SHELL = { Glyph, StatStrip, ChipGroup, ProjectChips, MultiSelect, Toolbar, LiveFeed, Rail, ProjectGroup, Segmented, timeago, fmtUptime, fmtDateTime, scrubIsos, taskId, dailyDeltas };
+diff --git a/dashboard/src/dashboard/static/redux/tab_overview.jsx b/dashboard/src/dashboard/static/redux/tab_overview.jsx
+index 73e769b4e3..e9eaa41331 100644
+--- a/dashboard/src/dashboard/static/redux/tab_overview.jsx
++++ b/dashboard/src/dashboard/static/redux/tab_overview.jsx
+@@ -244,6 +244,7 @@ function OverviewTab({ paused }) {
+             { l: 'Graphiti', sub: `${D.MEMORY_STATUS.graphiti.node_count.toLocaleString()} nodes · ${D.MEMORY_STATUS.graphiti.edge_count.toLocaleString()} edges`, ok: true },
+             { l: 'Mem0',     sub: `${D.MEMORY_STATUS.mem0.memory_count.toLocaleString()} memories`, ok: true },
+             { l: 'Taskmaster', sub: 'mcp v0.18 · responsive', ok: true },
++            { l: 'fused-memory', sub: `up ${window.DF_SHELL.fmtUptime(D.MEMORY_STATUS.uptime_seconds)}`, ok: !D.MEMORY_STATUS.offline, title: D.MEMORY_STATUS.started_at || undefined },
+             { l: 'Write queue', sub: `${queue.pending} pending · ${queue.retry} retry · ${queue.dead} dead`, ok: queue.dead === 0, warn: queue.pending > 5 || queue.retry > 0 },
+             (() => {
+               const v = D.RECON_STATE.verdict;
+diff --git a/dashboard/src/dashboard/static/redux/tabs.jsx b/dashboard/src/dashboard/static/redux/tabs.jsx
+index 44d6da60bf..52dc48ae3a 100644
+--- a/dashboard/src/dashboard/static/redux/tabs.jsx
++++ b/dashboard/src/dashboard/static/redux/tabs.jsx
+@@ -556,7 +556,7 @@ function MemoryTab({ projectFilter }) {
+   const ts = DF.MEMORY_TIMESERIES;
+   return (
+     <div className="grid cols-12" style={{ gap: 12 }}>
+-      <div className="col-span-12 grid cols-4">
++      <div className="col-span-12 grid cols-5">
+         <ST label="Graphiti nodes" value={DF.MEMORY_STATUS.graphiti.node_count.toLocaleString()}
+             hint={`${DF.MEMORY_STATUS.graphiti.edge_count.toLocaleString()} edges`}
+             spark={(DF.MEMORY_STATUS.graphiti.spark?.values || []).slice(-30)} sparkColor={CP.accent} />
+@@ -577,6 +577,9 @@ function MemoryTab({ projectFilter }) {
+                 spark={combined} sparkColor={CP.accent} hint="last 24h" />
+           );
+         })()}
++        <ST label="fused-memory"
++            value={`up ${window.DF_SHELL.fmtUptime(DF.MEMORY_STATUS.uptime_seconds)}`}
++            hint={DF.MEMORY_STATUS.started_at || '—'} />
+       </div>
+ 
+       <div className="col-span-8 panel">
+diff --git a/dashboard/tests/test_redux_api.py b/dashboard/tests/test_redux_api.py
+index 98c8f3dd80..27c3810251 100644
+--- a/dashboard/tests/test_redux_api.py
++++ b/dashboard/tests/test_redux_api.py
+@@ -100,6 +100,46 @@ def test_shape_memory_offline_keeps_required_keys():
+     assert ms['offline'] is True
+ 
+ 
++def test_shape_memory_uptime_threaded_when_present():
++    """online status with uptime fields → both appear in MEMORY_STATUS."""
++    body = redux_api.shape_memory(
++        {
++            'graphiti': {'node_count': 10},
++            'mem0': {'memory_count': 5},
++            'uptime_seconds': 277020,
++            'started_at': '2026-06-12T10:00:00+00:00',
++        },
++        {'counts': {'pending': 0}, 'oldest_pending_age_seconds': None},
++    )
++    ms = body['MEMORY_STATUS']
++    assert ms['uptime_seconds'] == 277020
++    assert ms['started_at'] == '2026-06-12T10:00:00+00:00'
++
++
++def test_shape_memory_uptime_none_when_absent():
++    """online status missing uptime fields → keys present but None."""
++    body = redux_api.shape_memory(
++        {'graphiti': {'node_count': 1}, 'mem0': {'memory_count': 1}},
++        {'counts': {'pending': 0}, 'oldest_pending_age_seconds': None},
++    )
++    ms = body['MEMORY_STATUS']
++    assert ms['uptime_seconds'] is None
++    assert ms['started_at'] is None
++
++
++def test_shape_memory_offline_uptime_keys_none():
++    """offline status → uptime_seconds and started_at present and None."""
++    body = redux_api.shape_memory(
++        {'offline': True, 'error': 'unreachable'},
++        {'counts': {'pending': 0}, 'oldest_pending_age_seconds': None},
++    )
++    ms = body['MEMORY_STATUS']
++    assert 'uptime_seconds' in ms
++    assert ms['uptime_seconds'] is None
++    assert 'started_at' in ms
++    assert ms['started_at'] is None
++
++
+ def test_shape_memory_online_passes_through_plus_defaults():
+     body = redux_api.shape_memory(
+         {'graphiti': {'node_count': 100}, 'mem0': {'memory_count': 50},

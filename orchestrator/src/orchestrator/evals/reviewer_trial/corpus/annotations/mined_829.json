@@ -1,0 +1,28 @@
+{
+  "diff_id": "mined_829",
+  "ground_truth": [
+    {
+      "id": "frontier_1",
+      "location": "fused-memory/tests/test_rebuild_entity_summaries.py:L79-L88",
+      "category": "dead_complexity",
+      "severity": "suggestion",
+      "description": "The inspect.markcoroutinefunction(self) marking is unnecessary. AsyncMock awaits any side_effect return value for which asyncio.iscoroutine() is true, and __call__ is async def so it always returns a coroutine; the marker changes no behavior on any Python version (as the inline comment itself notes). It adds complexity without functional effect.",
+      "mutation_type": "style"
+    }
+  ],
+  "provenance": {
+    "kind": "mined",
+    "task_id": "829",
+    "project_id": "dark_factory",
+    "outcome": "done",
+    "review_cycles": 1,
+    "verify_attempts": 1,
+    "signal_reason": [
+      "escalation_created event"
+    ],
+    "merge_sha": "adab582bac01b7ea6846de353a30a4aaa10776d9",
+    "runs_db_path": "/home/leo/src/dark-factory/data/orchestrator/runs.db",
+    "runs_db_query": "SELECT task_id, project_id, outcome, review_cycles, verify_attempts FROM task_results WHERE review_cycles >= 1, cross-referenced with events (escalation_created, merge_finalized) -- see mining.mine_fn_candidates.",
+    "escalation_refs": []
+  }
+}

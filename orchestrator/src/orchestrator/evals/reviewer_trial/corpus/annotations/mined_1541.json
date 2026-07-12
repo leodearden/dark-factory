@@ -1,0 +1,52 @@
+{
+  "diff_id": "mined_1541",
+  "ground_truth": [
+    {
+      "id": "frontier_1",
+      "location": "fused-memory/src/fused_memory/reconciliation/cli_stage_runner.py:54-60",
+      "category": "ineffective_guard",
+      "severity": "blocking",
+      "description": "DISALLOW_SUBTASK_CREATE = ['mcp__fused-memory__add_subtask'] blocks a tool that no longer exists. Task 1543 (DF-D) unregistered the add_subtask MCP tool and deleted SqliteTaskBackend.add_subtask / TaskInterceptor.add_subtask / AddSubtaskResult (see test_task_tools.py::test_add_subtask_mcp_tool_not_registered). Disallowing a tool that isn't registered is a no-op, so this guard gives false assurance that Stage-2 subtask creation is 'blocked' while doing nothing \u2014 the exact false-negative flagged for this task.",
+      "mutation_type": "api_misuse"
+    },
+    {
+      "id": "frontier_2",
+      "location": "fused-memory/tests/test_stages.py:164-171",
+      "category": "test_gap",
+      "severity": "blocking",
+      "description": "The added test test_stage2_blocks_add_subtask asserts `'mcp__fused-memory__add_subtask' in STAGE2_DISALLOWED`, which directly contradicts the repo's existing test_stage2_no_add_subtask_in_disallowed (asserts NOT in) and test_stage2_disallows_builtins_only (asserts STAGE2_DISALLOWED == DISALLOW_BUILTIN). These assertions are mutually exclusive; once integrated with the already-merged DF-D changes the test suite cannot pass \u2014 the likely source of the escalation_created event.",
+      "mutation_type": "logic"
+    },
+    {
+      "id": "frontier_3",
+      "location": "fused-memory/src/fused_memory/reconciliation/prompts/__init__.py:22-26",
+      "category": "inconsistency",
+      "severity": "suggestion",
+      "description": "stage2.py adds `mcp__fused-memory__commit_planning` to its documented Available Tools list (and the new flatten recipe depends on it), but _STAGE2_PROJECT_ID_GUIDELINE's tools string in __init__.py was only edited to remove add_subtask and was not updated to include commit_planning, leaving the two tool descriptions inconsistent.",
+      "mutation_type": "style"
+    },
+    {
+      "id": "frontier_4",
+      "location": "fused-memory/tests/test_stages.py:1760",
+      "category": "style",
+      "severity": "suggestion",
+      "description": "Stray extra blank line added before class TestStagePayloadProjectIdGuideline with no functional purpose.",
+      "mutation_type": "style"
+    }
+  ],
+  "provenance": {
+    "kind": "mined",
+    "task_id": "1541",
+    "project_id": "dark_factory",
+    "outcome": "done",
+    "review_cycles": 1,
+    "verify_attempts": 1,
+    "signal_reason": [
+      "escalation_created event"
+    ],
+    "merge_sha": "5ec4bb48042e27116d7d32c06f1f780d3df7a467",
+    "runs_db_path": "/home/leo/src/dark-factory/data/orchestrator/runs.db",
+    "runs_db_query": "SELECT task_id, project_id, outcome, review_cycles, verify_attempts FROM task_results WHERE review_cycles >= 1, cross-referenced with events (escalation_created, merge_finalized) -- see mining.mine_fn_candidates.",
+    "escalation_refs": []
+  }
+}

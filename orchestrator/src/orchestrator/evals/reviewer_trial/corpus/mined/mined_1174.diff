@@ -1,0 +1,249 @@
+diff --git a/fused-memory/src/fused_memory/reconciliation/prompts/stage1.py b/fused-memory/src/fused_memory/reconciliation/prompts/stage1.py
+index 89f1f4688a..1af569ad5c 100644
+--- a/fused-memory/src/fused_memory/reconciliation/prompts/stage1.py
++++ b/fused-memory/src/fused_memory/reconciliation/prompts/stage1.py
+@@ -30,7 +30,7 @@ You have access to fused-memory MCP tools for reading and writing memories:
+ from its remaining valid edges (call after deleting edges from an entity)
+ 
+ You do not have access to task *write* tools — task reconciliation is Stage 2's job. \
+-`get_task` is permitted as a read-only verification call (see \
++`mcp__fused-memory__get_task` is permitted as a read-only verification call (see \
+ ## Terminal-State Pre-Check Discipline below).
+ 
+ ## Your Consolidation Tasks
+@@ -66,10 +66,10 @@ that don't correspond to any existing edge.
+ Before calling `delete_memory` for any Graphiti edge or Mem0 vector entry, follow this \
+ mandatory two-step verification:
+ 
+-1. Call `search()` with the edge content or entity name to retrieve the memory record.
++1. Call `mcp__fused-memory__search` with the edge content or entity name to retrieve the memory record.
+ 2. Extract the full 36-character UUID from the result's `id` field \
+    (format: `xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx`).
+-3. Only then call `delete_memory(id=<full_uuid>)` with the complete UUID.
++3. Only then call `mcp__fused-memory__delete_memory` with `id=<full_uuid>` — the complete UUID.
+ 
+ **Never construct IDs from truncated sources.** 8-char hex prefixes (e.g. `'2531b4d8'`) \
+ appear in search-result snippets and edge reference text but are NOT valid `delete_memory` \
+@@ -81,14 +81,18 @@ this section is the canonical enforcement point for UUID resolution.
+ Before writing a `temporal_fact` whose content states or implies that a task reached a \
+ terminal state (done / cancelled / deferred / blocked), follow this verification:
+ 
+-1. Call `get_task(id=<task_id>, project_root=<project_root>)` to read the live status \
+-   from Taskmaster.
++1. Call `mcp__fused-memory__get_task` with `id=<task_id>` and `project_root=<project_root>` to read the live \
++   status from Taskmaster.
+ 2. Only persist the temporal_fact if the live status matches the claimed terminal state.
+ 3. If they disagree, SKIP the write and flag for Stage 2 review instead — set `task_id` \
+-   and `flag_type` on the flagged item per the existing Flag Deduplication and \
+-   Stage 2 Flag Relay (FIX B) conventions.
++   and `flag_type='terminal_state_pre_check'` on the flagged item per the existing \
++   Flag Deduplication and Stage 2 Flag Relay (FIX B) conventions.
+ 
+-**`get_task` is a permitted read-only verification call — it does not write task state \
++If `mcp__fused-memory__get_task` returns an `error` field \
++(e.g. `{{'error': ..., 'error_type': ...}}`), treat verification as inconclusive — \
++skip the terminal-state write without flagging.
++
++**`mcp__fused-memory__get_task` is a permitted read-only verification call — it does not write task state \
+ and does not violate the Stage 1 / Stage 2 separation.**
+ 
+ Skipping this check risks persisting temporal facts that contradict Taskmaster's live \
+diff --git a/fused-memory/src/fused_memory/reconciliation/stages/memory_consolidator.py b/fused-memory/src/fused_memory/reconciliation/stages/memory_consolidator.py
+index 7f844a4513..abd1c61a44 100644
+--- a/fused-memory/src/fused_memory/reconciliation/stages/memory_consolidator.py
++++ b/fused-memory/src/fused_memory/reconciliation/stages/memory_consolidator.py
+@@ -194,8 +194,7 @@ Review the above data and perform memory consolidation:
+ 4. Flag any items that are relevant to task planning for Stage 2.
+ 5. When you have completed your work, produce your final structured report as your response.
+ 
+-{_STAGE1_PROJECT_ID_GUIDELINE.format(project_id=self.project_id)}
+-"""
++{_STAGE1_PROJECT_ID_GUIDELINE.format(project_id=self.project_id)}{self._build_project_root_directive()}"""
+ 
+     async def _format_assembled_payload(self, watermark: Watermark) -> str:
+         """Format a payload from ContextAssembler output — event-driven context."""
+@@ -257,8 +256,20 @@ Review the above data and perform memory consolidation:
+ 4. Flag any items that are relevant to task planning for Stage 2.
+ 5. When you have completed your work, produce your final structured report as your response.
+ 
+-{_STAGE1_PROJECT_ID_GUIDELINE.format(project_id=self.project_id)}
+-"""
++{_STAGE1_PROJECT_ID_GUIDELINE.format(project_id=self.project_id)}{self._build_project_root_directive()}"""
++
++    def _build_project_root_directive(self) -> str:
++        """Return the project_root directive line for payload footers, or empty string.
++
++        When ``self.project_root`` is falsy (the BaseStage default ``''``), returns
++        ``''`` so the payload ends immediately after the project_id guideline with no
++        trailing newline.  When set, returns ``'\\nUse project_root=...'`` (leading
++        newline keeps it on its own line after the preceding guideline).  Both payload
++        methods call this helper so the f-string fragment stays in a single place.
++        """
++        if not self.project_root:
++            return ''
++        return f'\nUse project_root="{self.project_root}" for tasks scoped to this project.'
+ 
+     def _build_task_tree_section(self) -> str:
+         """Return the Active Task Tree prompt section, or empty string if no tree set.
+diff --git a/fused-memory/tests/reconciliation/__init__.py b/fused-memory/tests/reconciliation/__init__.py
+new file mode 100644
+index 0000000000..e69de29bb2
+diff --git a/fused-memory/tests/reconciliation/test_stage1.py b/fused-memory/tests/reconciliation/test_stage1.py
+new file mode 100644
+index 0000000000..38d48c1de1
+--- /dev/null
++++ b/fused-memory/tests/reconciliation/test_stage1.py
+@@ -0,0 +1,153 @@
++"""Tests for Stage 1 Memory Consolidator payload behaviour — task 1174.
++
++Covers:
++- project_root threading through assemble_payload / _format_assembled_payload
++  (TestStage1PayloadThreadsProjectRootLegacy, TestStage1PayloadThreadsProjectRootAssembled)
++- project_root omitted when empty (TestStage1PayloadOmitsProjectRootWhenUnset)
++"""
++
++from __future__ import annotations
++
++from unittest.mock import AsyncMock
++
++import pytest
++
++from fused_memory.config.schema import ReconciliationConfig
++from fused_memory.models.reconciliation import (
++    AssembledPayload,
++    StageId,
++    Watermark,
++)
++from fused_memory.reconciliation.stages.memory_consolidator import MemoryConsolidator
++
++
++def _make_consolidator(project_root: str = '') -> MemoryConsolidator:
++    """Build a MemoryConsolidator with mocked deps — mirrors test_stages.py ~L1418."""
++    config = ReconciliationConfig()
++    memory_mock = AsyncMock()
++    memory_mock.get_episodes = AsyncMock(return_value=[])
++    memory_mock.mem0 = AsyncMock()
++    memory_mock.mem0.get_all = AsyncMock(return_value={'results': []})
++    memory_mock.get_status = AsyncMock(return_value={})
++
++    stage = MemoryConsolidator(
++        StageId.memory_consolidator,
++        memory_mock,
++        AsyncMock(),  # taskmaster
++        AsyncMock(),  # journal
++        config,
++    )
++    stage.project_id = 'test_project'
++    stage.project_root = project_root
++    stage.episode_limit = 5
++    stage.memory_limit = 10
++    return stage
++
++
++# ---------------------------------------------------------------------------
++# project_root in legacy (time-windowed) assemble_payload
++# ---------------------------------------------------------------------------
++
++
++class TestStage1PayloadThreadsProjectRootLegacy:
++    """assemble_payload includes project_root directive when project_root is set."""
++
++    @pytest.mark.asyncio
++    async def test_assemble_payload_includes_project_root(self):
++        """Legacy assemble_payload emits 'Use project_root=...' when project_root is set."""
++        stage = _make_consolidator(project_root='/home/leo/src/test_proj')
++        watermark = Watermark(project_id='test_project')
++
++        result = await stage.assemble_payload(
++            events=[], watermark=watermark, prior_reports=[]
++        )
++
++        assert 'Use project_root="/home/leo/src/test_proj"' in result, (
++            'assemble_payload should emit project_root directive when project_root is set'
++        )
++        assert result.rstrip().endswith(
++            'Use project_root="/home/leo/src/test_proj" for tasks scoped to this project.'
++        ), 'project_root directive should be the last line of the payload'
++        assert result.count('Use project_root=') == 1, (
++            'project_root directive should appear exactly once in the payload'
++        )
++
++
++# ---------------------------------------------------------------------------
++# project_root in assembled-payload branch (_format_assembled_payload)
++# ---------------------------------------------------------------------------
++
++
++class TestStage1PayloadThreadsProjectRootAssembled:
++    """_format_assembled_payload includes project_root directive when project_root is set."""
++
++    @pytest.mark.asyncio
++    async def test_format_assembled_payload_includes_project_root(self):
++        """Assembled-payload branch emits 'Use project_root=...' when project_root is set."""
++        stage = _make_consolidator(project_root='/home/leo/src/test_proj')
++
++        # Set assembled_payload to trigger the ContextAssembler branch
++        stage.assembled_payload = AssembledPayload(
++            events=[],
++            context_items={},
++        )
++
++        watermark = Watermark(project_id='test_project')
++        result = await stage.assemble_payload(
++            events=[], watermark=watermark, prior_reports=[]
++        )
++
++        assert 'Use project_root="/home/leo/src/test_proj"' in result, (
++            '_format_assembled_payload should emit project_root directive when project_root is set'
++        )
++        assert result.rstrip().endswith(
++            'Use project_root="/home/leo/src/test_proj" for tasks scoped to this project.'
++        ), 'project_root directive should be the last line of the payload'
++        assert result.count('Use project_root=') == 1, (
++            'project_root directive should appear exactly once in the payload'
++        )
++
++
++# ---------------------------------------------------------------------------
++# project_root omitted when empty (BaseStage default '')
++# ---------------------------------------------------------------------------
++
++
++class TestStage1PayloadOmitsProjectRootWhenUnset:
++    """When project_root is '' (BaseStage default), no project_root line is emitted."""
++
++    @pytest.mark.asyncio
++    async def test_assemble_payload_omits_project_root_when_empty(self):
++        """Legacy assemble_payload does NOT emit project_root line when project_root=''."""
++        stage = _make_consolidator(project_root='')
++        watermark = Watermark(project_id='test_project')
++
++        result = await stage.assemble_payload(
++            events=[], watermark=watermark, prior_reports=[]
++        )
++
++        assert 'Use project_root=' not in result, (
++            'assemble_payload should omit project_root directive when project_root is empty'
++        )
++        assert 'Use project_root=""' not in result
++
++    @pytest.mark.asyncio
++    async def test_format_assembled_payload_omits_project_root_when_empty(self):
++        """Assembled-payload branch does NOT emit project_root line when project_root=''."""
++        stage = _make_consolidator(project_root='')
++        stage.assembled_payload = AssembledPayload(
++            events=[],
++            context_items={},
++        )
++
++        watermark = Watermark(project_id='test_project')
++        result = await stage.assemble_payload(
++            events=[], watermark=watermark, prior_reports=[]
++        )
++
++        assert 'Use project_root=' not in result, (
++            '_format_assembled_payload should omit project_root directive when project_root is empty'
++        )
++        assert 'Use project_root=""' not in result
++
++

@@ -1,0 +1,37 @@
+{
+  "diff_id": "mined_1751",
+  "ground_truth": [
+    {
+      "id": "frontier_1",
+      "location": "dashboard/tests/test_orchestrator.py:37",
+      "category": "test_gap",
+      "severity": "suggestion",
+      "description": "The test's local `_shape_task` helper copies the recency key from `task.get('updated_at')` (snake_case), whereas production `tasks.py:_shape_task` reads `task.get('updatedAt')` (camelCase, the actual MCP/Taskmaster field name). The three new tests feed already-snake_cased fake tasks, so they exercise the max/None logic but never validate the real camelCase\u2192snake_case conversion; a regression in that field mapping would silently make `last_update` always None and go uncaught.",
+      "mutation_type": "test_gap"
+    }
+  ],
+  "provenance": {
+    "kind": "mined",
+    "task_id": "1751",
+    "project_id": "dark_factory",
+    "outcome": "done",
+    "review_cycles": 1,
+    "verify_attempts": 0,
+    "signal_reason": [
+      "escalation_created event"
+    ],
+    "merge_sha": "715f569e6acb53dbda6db9ef5ef4e4f4abd10004",
+    "runs_db_path": "/home/leo/src/dark-factory/data/orchestrator/runs.db",
+    "runs_db_query": "SELECT task_id, project_id, outcome, review_cycles, verify_attempts FROM task_results WHERE review_cycles >= 1, cross-referenced with events (escalation_created, merge_finalized) -- see mining.mine_fn_candidates.",
+    "escalation_refs": [
+      {
+        "task_id": "1751",
+        "category": "review_issues",
+        "severity": "blocking",
+        "summary": "Review cycles exhausted with 2 blocking issue(s) and 0 suggestion(s)",
+        "level": 0,
+        "path": "/home/leo/src/dark-factory/data/escalations/archive/2026-06-15/esc-1751-10.json"
+      }
+    ]
+  }
+}

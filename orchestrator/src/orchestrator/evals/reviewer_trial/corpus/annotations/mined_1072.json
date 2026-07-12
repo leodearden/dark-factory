@@ -1,0 +1,28 @@
+{
+  "diff_id": "mined_1072",
+  "ground_truth": [
+    {
+      "id": "frontier_1",
+      "location": "fused-memory/tests/test_harness.py:3600-3690",
+      "category": "test_gap",
+      "severity": "suggestion",
+      "description": "The added tests only cover the idle-drain path where drain() emits the marker synchronously. The coupled active-loops path \u2014 where drain() is called while a project loop is still running (flag stays False, no emit) and the run_loop drain block must emit 'Harness fully drained' exactly once after loops finish and stay silent thereafter \u2014 is untested, despite being the primary path the one-shot flag was introduced to guard.",
+      "mutation_type": "test_gap"
+    }
+  ],
+  "provenance": {
+    "kind": "mined",
+    "task_id": "1072",
+    "project_id": "dark_factory",
+    "outcome": "done",
+    "review_cycles": 1,
+    "verify_attempts": 0,
+    "signal_reason": [
+      "escalation_created event"
+    ],
+    "merge_sha": "f47d9e286b1ff195597eb481f29621fc37dba4de",
+    "runs_db_path": "/home/leo/src/dark-factory/data/orchestrator/runs.db",
+    "runs_db_query": "SELECT task_id, project_id, outcome, review_cycles, verify_attempts FROM task_results WHERE review_cycles >= 1, cross-referenced with events (escalation_created, merge_finalized) -- see mining.mine_fn_candidates.",
+    "escalation_refs": []
+  }
+}

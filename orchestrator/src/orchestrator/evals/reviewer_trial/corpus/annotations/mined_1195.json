@@ -1,0 +1,36 @@
+{
+  "diff_id": "mined_1195",
+  "ground_truth": [
+    {
+      "id": "frontier_1",
+      "location": "orchestrator/tests/test_workflow_e2e.py:17",
+      "category": "import_collision",
+      "severity": "blocking",
+      "description": "The helpers are imported by the bare top-level module name `from _workflow_helpers import ...`. Under root-level pytest with `--import-mode=importlib` (the exact scenario the module docstring cites), this registers `sys.modules['_workflow_helpers']` as a non-namespaced top-level name. If any other subproject also has a `_workflow_helpers.py`, this reintroduces the same cross-subproject module collision the extraction was meant to avoid, and bare-name resolution of a sibling module is not guaranteed without the tests dir on sys.path, risking a ModuleNotFoundError at collection time in root-level runs.",
+      "mutation_type": "api_misuse"
+    },
+    {
+      "id": "frontier_2",
+      "location": "orchestrator/tests/_workflow_helpers.py:129-150",
+      "category": "test_gap",
+      "severity": "suggestion",
+      "description": "`_make_status_setting_steward` resolves pending L0 escalations without asserting any exist (unlike `_make_resolving_steward`, which asserts `pending`). If the queue has no pending L0 for the task, the loop silently no-ops and the steward still sets `final_status`, potentially masking a setup regression where the escalation path was never exercised.",
+      "mutation_type": "test_gap"
+    }
+  ],
+  "provenance": {
+    "kind": "mined",
+    "task_id": "1195",
+    "project_id": "dark_factory",
+    "outcome": "done",
+    "review_cycles": 1,
+    "verify_attempts": 1,
+    "signal_reason": [
+      "escalation_created event"
+    ],
+    "merge_sha": "754c0e32be21f8314948f8d9f9924e70e612ca6a",
+    "runs_db_path": "/home/leo/src/dark-factory/data/orchestrator/runs.db",
+    "runs_db_query": "SELECT task_id, project_id, outcome, review_cycles, verify_attempts FROM task_results WHERE review_cycles >= 1, cross-referenced with events (escalation_created, merge_finalized) -- see mining.mine_fn_candidates.",
+    "escalation_refs": []
+  }
+}

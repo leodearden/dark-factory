@@ -1,0 +1,346 @@
+diff --git a/orchestrator/tests/test_invoke.py b/orchestrator/tests/test_invoke.py
+index 1c9500d8d4..a49ed5bd71 100644
+--- a/orchestrator/tests/test_invoke.py
++++ b/orchestrator/tests/test_invoke.py
+@@ -82,6 +82,29 @@ def _make_slot(*, token='token-a', account_name='acct-a', cap_hit=False):
+     return slot
+ 
+ 
++def _make_gate(**overrides) -> MagicMock:
++    """Build a MagicMock UsageGate with all required attribute defaults initialised.
++
++    Ensures every gate attribute that UsageGate exposes is set to a sensible
++    default so that a new attribute added to UsageGate only needs to be updated
++    here rather than at every construction site.  Accepts ``**overrides`` so
++    callers can pin specific values without re-specifying the rest.
++
++    Mirrors the ``_mock_gate`` helper in ``shared/tests/test_cap_retry.py``.
++    """
++    gate = MagicMock()
++    gate.account_count = overrides.pop('account_count', 1)
++    gate.before_invoke = overrides.pop('before_invoke', AsyncMock(return_value='tok-a'))
++    gate.active_account_name = overrides.pop('active_account_name', 'acct-a')
++    gate.on_agent_complete = overrides.pop('on_agent_complete', MagicMock())
++    gate.confirm_account_ok = overrides.pop('confirm_account_ok', MagicMock())
++    gate.release_probe_slot = overrides.pop('release_probe_slot', MagicMock())
++    gate.soonest_resets_at = overrides.pop('soonest_resets_at', None)
++    for k, v in overrides.items():
++        setattr(gate, k, v)
++    return gate
++
++
+ def _make_gate_yielding(slots, *, active_account_name=None):
+     """UsageGate mock whose successive invoke_slot() calls yield the given slots.
+ 
+@@ -98,18 +121,15 @@ def _make_gate_yielding(slots, *, active_account_name=None):
+         cm.__aexit__ = AsyncMock(return_value=False)
+         return cm
+ 
+-    gate = MagicMock()
+-    gate.invoke_slot = MagicMock(side_effect=_new_cm)
+-    gate.account_count = len(slots)
+-    gate.active_account_name = (
+-        active_account_name if active_account_name is not None
+-        else slots[0].account_name
++    gate = _make_gate(
++        account_count=len(slots),
++        active_account_name=(
++            active_account_name if active_account_name is not None
++            else slots[0].account_name
++        ),
++        before_invoke=AsyncMock(return_value=slots[0].token),
+     )
+-    gate.before_invoke = AsyncMock(return_value=slots[0].token)
+-    gate.on_agent_complete = MagicMock()
+-    gate.confirm_account_ok = MagicMock()
+-    gate.release_probe_slot = MagicMock()
+-    gate.soonest_resets_at = None
++    gate.invoke_slot = MagicMock(side_effect=_new_cm)
+     return gate
+ 
+ 
+@@ -466,15 +486,7 @@ class TestReleaseProbeSlotOnException:
+ 
+     async def test_release_probe_slot_called_on_runtime_error(self):
+         """release_probe_slot is called with oauth_token when invoke raises."""
+-        gate = MagicMock()
+-        gate.account_count = 1
+-        gate.before_invoke = AsyncMock(return_value='tok-a')
+-        gate.detect_cap_hit = MagicMock(return_value=False)
+-        gate.active_account_name = 'acct-a'
+-        gate.on_agent_complete = MagicMock()
+-        gate.confirm_account_ok = MagicMock()
+-        gate.release_probe_slot = MagicMock()
+-        gate.soonest_resets_at = None
++        gate = _make_gate(before_invoke=AsyncMock(return_value='tok-a'))
+         _attach_invoke_slot(gate)
+ 
+         fake_invoke = AsyncMock(side_effect=RuntimeError('subprocess failed'))
+@@ -489,12 +501,7 @@ class TestReleaseProbeSlotOnException:
+ 
+     async def test_runtime_error_propagates(self):
+         """RuntimeError raised by invoke propagates with its message intact."""
+-        gate = MagicMock()
+-        gate.account_count = 1
+-        gate.before_invoke = AsyncMock(return_value='tok-a')
+-        gate.active_account_name = 'acct-a'
+-        gate.release_probe_slot = MagicMock()
+-        gate.soonest_resets_at = None
++        gate = _make_gate(before_invoke=AsyncMock(return_value='tok-a'))
+         _attach_invoke_slot(gate)
+ 
+         fake_invoke = AsyncMock(side_effect=RuntimeError('crash'))
+@@ -508,13 +515,7 @@ class TestReleaseProbeSlotOnException:
+ 
+     async def test_confirm_account_ok_not_called_when_invoke_raises(self):
+         """confirm_account_ok is NOT called when invoke raises."""
+-        gate = MagicMock()
+-        gate.account_count = 1
+-        gate.before_invoke = AsyncMock(return_value='tok-a')
+-        gate.active_account_name = 'acct-a'
+-        gate.confirm_account_ok = MagicMock()
+-        gate.release_probe_slot = MagicMock()
+-        gate.soonest_resets_at = None
++        gate = _make_gate(before_invoke=AsyncMock(return_value='tok-a'))
+         _attach_invoke_slot(gate)
+ 
+         fake_invoke = AsyncMock(side_effect=RuntimeError('crash'))
+@@ -528,12 +529,7 @@ class TestReleaseProbeSlotOnException:
+ 
+     async def test_cancelled_error_release_probe_slot(self):
+         """CancelledError (BaseException, not Exception) triggers release_probe_slot."""
+-        gate = MagicMock()
+-        gate.account_count = 1
+-        gate.before_invoke = AsyncMock(return_value='tok-a')
+-        gate.active_account_name = 'acct-a'
+-        gate.release_probe_slot = MagicMock()
+-        gate.soonest_resets_at = None
++        gate = _make_gate(before_invoke=AsyncMock(return_value='tok-a'))
+         _attach_invoke_slot(gate)
+ 
+         fake_invoke = AsyncMock(side_effect=asyncio.CancelledError())
+@@ -575,5 +571,39 @@ class TestRunSubprocessLocalProcessGroup:
+                 ['echo', 'hi'], cwd=tmp_path, env={},
+                 backend='codex', model='gpt-5.4', max_budget_usd=1.0,
+             )
+-
+         assert captured_kwargs.get('start_new_session') is True
++
++
++# ── _make_gate factory contract ───────────────────────────────────────────────
++
++
++class TestMakeGateFactory:
++    """Regression: _make_gate must set every UsageGate attribute in one place.
++
++    Prior bare-MagicMock() drift caused a 122-error cascade (tasks 1313/1339)
++    when a new attribute (soonest_resets_at) was added to UsageGate but not
++    propagated to every construction site.  This test pins the factory contract
++    so a new attribute addition only requires one edit here.
++    """
++
++    def test_make_gate_defaults(self):
++        """_make_gate() returns a MagicMock with all required attribute defaults."""
++        gate = _make_gate()
++        assert isinstance(gate, MagicMock)
++        assert gate.account_count == 1
++        assert gate.active_account_name == 'acct-a'
++        assert gate.soonest_resets_at is None
++
++    def test_make_gate_override_and_passthrough(self):
++        """Named overrides are applied; arbitrary kwargs are set via setattr."""
++        gate = _make_gate(soonest_resets_at=123, account_count=3, custom_attr='x')
++        assert gate.soonest_resets_at == 123
++        assert gate.account_count == 3
++        assert gate.custom_attr == 'x'
++        # Non-overridden defaults remain
++        assert gate.active_account_name == 'acct-a'
++
++    def test_make_gate_yielding_routes_through_factory(self):
++        """_make_gate_yielding builds its gate via _make_gate (soonest_resets_at set)."""
++        gate = _make_gate_yielding([_make_slot()])
++        assert gate.soonest_resets_at is None
+diff --git a/orchestrator/tests/test_steward.py b/orchestrator/tests/test_steward.py
+index 0853baac80..c4d9ab8cc6 100644
+--- a/orchestrator/tests/test_steward.py
++++ b/orchestrator/tests/test_steward.py
+@@ -192,6 +192,29 @@ def _make_slot(*, token='token-a', account_name='acct-a', cap_hit=False):
+     return slot
+ 
+ 
++def _make_gate(**overrides) -> MagicMock:
++    """Build a MagicMock UsageGate with all required attribute defaults initialised.
++
++    Ensures every gate attribute that UsageGate exposes is set to a sensible
++    default so that a new attribute added to UsageGate only needs to be updated
++    here rather than at every construction site.  Accepts ``**overrides`` so
++    callers can pin specific values without re-specifying the rest.
++
++    Mirrors the ``_mock_gate`` helper in ``shared/tests/test_cap_retry.py``.
++    """
++    gate = MagicMock()
++    gate.account_count = overrides.pop('account_count', 1)
++    gate.before_invoke = overrides.pop('before_invoke', AsyncMock(return_value='tok-a'))
++    gate.active_account_name = overrides.pop('active_account_name', 'acct-a')
++    gate.on_agent_complete = overrides.pop('on_agent_complete', MagicMock())
++    gate.confirm_account_ok = overrides.pop('confirm_account_ok', MagicMock())
++    gate.release_probe_slot = overrides.pop('release_probe_slot', MagicMock())
++    gate.soonest_resets_at = overrides.pop('soonest_resets_at', None)
++    for k, v in overrides.items():
++        setattr(gate, k, v)
++    return gate
++
++
+ def _make_gate_yielding(slots):
+     """Build a mock UsageGate whose successive invoke_slot() calls yield the
+     given slots in order (one per iteration of the while-loop in production).
+@@ -211,13 +234,11 @@ def _make_gate_yielding(slots):
+         cm.__aexit__ = AsyncMock(return_value=False)
+         return cm
+ 
+-    gate = MagicMock()
++    gate = _make_gate(
++        active_account_name=slots[0].account_name,
++        before_invoke=AsyncMock(return_value=slots[0].token),
++    )
+     gate.invoke_slot = MagicMock(side_effect=_new_cm)
+-    gate.active_account_name = slots[0].account_name
+-    gate.before_invoke = AsyncMock(return_value=slots[0].token)
+-    gate.on_agent_complete = MagicMock()
+-    gate.confirm_account_ok = MagicMock()
+-    gate.soonest_resets_at = None
+     return gate
+ 
+ 
+@@ -1644,12 +1665,7 @@ class TestStewardReleaseProbeSlotOnException:
+         self, steward, worktree, mock_mcp,
+     ):
+         """release_probe_slot is called with oauth_token when invoke_agent raises."""
+-        gate = MagicMock()
+-        gate.before_invoke = AsyncMock(return_value='tok-a')
+-        gate.active_account_name = 'acct-a'
+-        gate.confirm_account_ok = MagicMock()
+-        gate.release_probe_slot = MagicMock()
+-        gate.soonest_resets_at = None
++        gate = _make_gate(before_invoke=AsyncMock(return_value='tok-a'))
+         _attach_invoke_slot(gate)
+         steward.usage_gate = gate
+ 
+@@ -1669,11 +1685,7 @@ class TestStewardReleaseProbeSlotOnException:
+ 
+     async def test_exception_propagates(self, steward, worktree):
+         """RuntimeError from invoke_agent propagates out of _invoke_with_session."""
+-        gate = MagicMock()
+-        gate.before_invoke = AsyncMock(return_value='tok-a')
+-        gate.active_account_name = 'acct-a'
+-        gate.release_probe_slot = MagicMock()
+-        gate.soonest_resets_at = None
++        gate = _make_gate(before_invoke=AsyncMock(return_value='tok-a'))
+         _attach_invoke_slot(gate)
+         steward.usage_gate = gate
+ 
+@@ -1692,12 +1704,7 @@ class TestStewardReleaseProbeSlotOnException:
+         self, steward, worktree,
+     ):
+         """confirm_account_ok is NOT called when invoke_agent raises."""
+-        gate = MagicMock()
+-        gate.before_invoke = AsyncMock(return_value='tok-a')
+-        gate.active_account_name = 'acct-a'
+-        gate.confirm_account_ok = MagicMock()
+-        gate.release_probe_slot = MagicMock()
+-        gate.soonest_resets_at = None
++        gate = _make_gate(before_invoke=AsyncMock(return_value='tok-a'))
+         _attach_invoke_slot(gate)
+         steward.usage_gate = gate
+ 
+@@ -1718,11 +1725,7 @@ class TestStewardReleaseProbeSlotOnException:
+         self, steward, worktree,
+     ):
+         """CancelledError (BaseException, not Exception) triggers release_probe_slot."""
+-        gate = MagicMock()
+-        gate.before_invoke = AsyncMock(return_value='tok-a')
+-        gate.active_account_name = 'acct-a'
+-        gate.release_probe_slot = MagicMock()
+-        gate.soonest_resets_at = None
++        gate = _make_gate(before_invoke=AsyncMock(return_value='tok-a'))
+         _attach_invoke_slot(gate)
+         steward.usage_gate = gate
+ 
+@@ -1779,19 +1782,14 @@ class TestPreTriageUsageGateCleanup:
+ 
+     @staticmethod
+     def _gate(token: str = 'tok-a', cap_effects=None) -> MagicMock:
+-        gate = MagicMock()
+-        gate.account_count = 1
+-        gate.before_invoke = AsyncMock(return_value=token)
+-        gate.active_account_name = 'acct-a'
+-        gate.confirm_account_ok = MagicMock()
+-        gate.release_probe_slot = MagicMock()
+-        gate.on_agent_complete = MagicMock()
+-        gate.detect_cap_hit = (
+-            MagicMock(side_effect=cap_effects)
+-            if cap_effects is not None
+-            else MagicMock(return_value=False)
++        gate = _make_gate(
++            before_invoke=AsyncMock(return_value=token),
++            detect_cap_hit=(
++                MagicMock(side_effect=cap_effects)
++                if cap_effects is not None
++                else MagicMock(return_value=False)
++            ),
+         )
+-        gate.soonest_resets_at = None
+         return _attach_invoke_slot(gate)
+ 
+     async def test_confirm_account_ok_called_on_success(self, steward: TaskSteward):
+@@ -2499,3 +2497,50 @@ class TestStewardEmptyOutputRecovery:
+         assert steward.metrics.empty_outputs_recovered == 0
+         # Retry budget not consumed by either carve-out
+         assert steward._retry_counts.get('esc-42-1', 0) == 0
++
++
++# ── _make_gate factory contract ───────────────────────────────────────────────
++
++
++class TestMakeGateFactory:
++    """Regression: _make_gate must set every UsageGate attribute in one place.
++
++    Prior bare-MagicMock() drift caused a 122-error cascade (tasks 1313/1339)
++    when a new attribute (soonest_resets_at) was added to UsageGate but not
++    propagated to every construction site.  This test pins the factory contract
++    so a new attribute addition only requires one edit here.
++    """
++
++    def test_make_gate_defaults(self):
++        """_make_gate() returns a MagicMock with all required attribute defaults."""
++        gate = _make_gate()
++        assert isinstance(gate, MagicMock)
++        assert gate.account_count == 1
++        assert gate.active_account_name == 'acct-a'
++        assert gate.soonest_resets_at is None
++
++    def test_make_gate_override_and_passthrough(self):
++        """Named overrides are applied; arbitrary kwargs are set via setattr."""
++        gate = _make_gate(soonest_resets_at=123, account_count=3, custom_attr='x')
++        assert gate.soonest_resets_at == 123
++        assert gate.account_count == 3
++        assert gate.custom_attr == 'x'
++        assert gate.active_account_name == 'acct-a'
++
++    def test_make_gate_yielding_routes_through_factory(self):
++        """_make_gate_yielding builds its gate via _make_gate (soonest_resets_at set)."""
++        gate = _make_gate_yielding([_make_slot()])
++        assert gate.soonest_resets_at is None
++
++    def test_pre_triage_gate_default_detect_cap_hit(self):
++        """TestPreTriageUsageGateCleanup._gate() routes through _make_gate."""
++        gate = TestPreTriageUsageGateCleanup._gate()
++        assert gate.soonest_resets_at is None
++        # default detect_cap_hit returns False
++        assert gate.detect_cap_hit() is False
++
++    def test_pre_triage_gate_cap_effects_side_effect(self):
++        """cap_effects sequence is wired as side_effect on detect_cap_hit."""
++        gate = TestPreTriageUsageGateCleanup._gate(cap_effects=[True, False])
++        assert gate.detect_cap_hit() is True
++        assert gate.detect_cap_hit() is False

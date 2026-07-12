@@ -1,0 +1,131 @@
+diff --git a/fused-memory/src/fused_memory/config/schema.py b/fused-memory/src/fused_memory/config/schema.py
+index 4c11e6b75c..e05954492c 100644
+--- a/fused-memory/src/fused_memory/config/schema.py
++++ b/fused-memory/src/fused_memory/config/schema.py
+@@ -286,20 +286,6 @@ class ReconciliationConfig(BaseModel):
+             'Restores the pre-881 hard-coded 600s ceiling.'
+         ),
+     )
+-    # Claim-scale recovery window — intentionally an order of magnitude shorter
+-    # than stale_run_recovery_seconds (600s).  Deferred-write claims are typically
+-    # held for seconds; 60s is a conservative cutoff that prevents a crashed prior
+-    # process from leaving claims stuck for ten minutes.
+-    stale_claim_recovery_seconds: int = Field(
+-        default=60,
+-        gt=0,
+-        description=(
+-            'Deferred-write claims older than this are re-queued on startup. '
+-            'Claims are held for seconds; use a much shorter horizon than '
+-            'stale_run_recovery_seconds (600s, for minute-scale run recovery).'
+-        ),
+-    )
+-
+     @model_validator(mode='after')
+     def _validate_cli_timeouts_within_stage(self) -> 'ReconciliationConfig':
+         """Enforce timeout hierarchy: per-CLI budgets ≤ stage guard ≤ cycle guard."""
+diff --git a/fused-memory/src/fused_memory/reconciliation/harness.py b/fused-memory/src/fused_memory/reconciliation/harness.py
+index b8cf0abf42..abbe835918 100644
+--- a/fused-memory/src/fused_memory/reconciliation/harness.py
++++ b/fused-memory/src/fused_memory/reconciliation/harness.py
+@@ -430,11 +430,10 @@ class ReconciliationHarness:
+         await self._start_escalation_server()
+ 
+         # Re-queue any deferred writes left in-progress by a crashed prior process.
+-        # Cutoff is 0 (release *every* currently-claimed row) rather than
+-        # stale_claim_recovery_seconds.  This closes the fast-restart edge case:
+-        # if a supervisor restarts the harness within stale_claim_recovery_seconds
+-        # of the previous crash, a time-based cutoff would miss rows whose
+-        # claimed_at is younger than the horizon, silently stalling those writes.
++        # Cutoff is 0 (release every currently-claimed row) rather than a
++        # time-based horizon.  A time-based horizon would miss rows whose
++        # claimed_at falls within that horizon on a fast restart, silently
++        # stalling those writes.
+         # Safety: the per-project reconciliation lock (EventBuffer._is_run_locked /
+         # mark_run_active) serialises replay — at startup no project loop has
+         # spawned yet, so there is nothing to race with.
+diff --git a/fused-memory/tests/test_config_schema.py b/fused-memory/tests/test_config_schema.py
+index 0602d07c61..65174717d5 100644
+--- a/fused-memory/tests/test_config_schema.py
++++ b/fused-memory/tests/test_config_schema.py
+@@ -377,18 +377,12 @@ class TestReconciliationConfigTimeouts:
+     def test_default_judge_cli_timeout_is_600(self):
+         assert ReconciliationConfig().judge_cli_timeout_seconds == 600
+ 
+-    def test_default_stale_claim_recovery_is_60(self):
+-        assert ReconciliationConfig().stale_claim_recovery_seconds == 60
+-
+     def test_explicit_agent_cli_timeout_override_accepted(self):
+         assert ReconciliationConfig(agent_cli_timeout_seconds=30).agent_cli_timeout_seconds == 30
+ 
+     def test_explicit_judge_cli_timeout_override_accepted(self):
+         assert ReconciliationConfig(judge_cli_timeout_seconds=120).judge_cli_timeout_seconds == 120
+ 
+-    def test_explicit_stale_claim_recovery_override_accepted(self):
+-        assert ReconciliationConfig(stale_claim_recovery_seconds=10).stale_claim_recovery_seconds == 10
+-
+     # --- gt=0 bounds: agent_cli_timeout_seconds ---
+ 
+     def test_agent_cli_timeout_zero_rejected(self):
+@@ -418,16 +412,6 @@ class TestReconciliationConfigTimeouts:
+         """
+         assert 'stale_claim_recovery_seconds' not in ReconciliationConfig.model_fields
+ 
+-    # --- gt=0 bounds: stale_claim_recovery_seconds ---
+-
+-    def test_stale_claim_recovery_zero_rejected(self):
+-        with pytest.raises(ValidationError):
+-            ReconciliationConfig(stale_claim_recovery_seconds=0)
+-
+-    def test_stale_claim_recovery_negative_rejected(self):
+-        with pytest.raises(ValidationError):
+-            ReconciliationConfig(stale_claim_recovery_seconds=-5)
+-
+     # --- gt=0 bounds: stage_timeout_seconds (consistency extension) ---
+ 
+     def test_stage_timeout_zero_rejected(self):
+diff --git a/fused-memory/tests/test_harness.py b/fused-memory/tests/test_harness.py
+index cb28c10463..48878402fb 100644
+--- a/fused-memory/tests/test_harness.py
++++ b/fused-memory/tests/test_harness.py
+@@ -2359,8 +2359,8 @@ async def test_run_loop_releases_stale_claims_on_startup(
+ ):
+     """run_loop() calls release_stale_claims(0) once at startup (fast-restart safe).
+ 
+-    Cutoff is 0 (not stale_claim_recovery_seconds) so every currently-claimed row
+-    is released unconditionally.  The per-project reconciliation lock guarantees
++    Cutoff is 0 (not a time-based horizon) so every currently-claimed row is
++    released unconditionally.  The per-project reconciliation lock guarantees
+     at most one active replayer per project, so there is nothing to race with at
+     startup before any project loop has spawned.
+     """
+@@ -2391,15 +2391,11 @@ async def test_run_loop_releases_stale_claims_on_startup(
+ async def test_run_loop_fast_restart_releases_recent_claims(
+     journal, event_buffer, mock_memory_service
+ ):
+-    """A freshly-claimed row (simulating a crashed process) is re-queued on startup.
++    """A freshly-claimed row (claimed_at≈now) is still released on startup.
+ 
+-    Regression test for the fast-restart edge case: if the harness is restarted
+-    within stale_claim_recovery_seconds of the previous crash, the claimed row
+-    would NOT be released when the cutoff is stale_claim_recovery_seconds, because
+-    the row's claimed_at is younger than the cutoff.
+-
+-    With cutoff=0, every currently-claimed row is released unconditionally, so the
+-    row is always available for the new process to pick up.
++    cutoff=0 unconditionally re-queues every currently-claimed row, so a row
++    claimed immediately before a crash is always available for the new process
++    to pick up — a time-based cutoff would silently skip it.
+     """
+     import asyncio
+     from unittest.mock import AsyncMock
+@@ -2407,8 +2403,8 @@ async def test_run_loop_fast_restart_releases_recent_claims(
+     harness = _make_test_harness(journal, event_buffer, mock_memory_service)
+ 
+     # Defer a write and immediately claim it — simulating what a dead process left
+-    # behind.  The row is claimed_at≈now, which is well within the 60s default
+-    # stale_claim_recovery_seconds horizon (i.e. current code would NOT release it).
++    # behind.  The row is claimed_at≈now; a time-based cutoff would not release
++    # it, but cutoff=0 does.
+     await event_buffer.defer_write('test-project', 'payload-a', 'cat', {})
+     claimed_before = await event_buffer.claim_deferred_writes('test-project')
+     assert len(claimed_before) == 1, 'precondition: row should be claimed'

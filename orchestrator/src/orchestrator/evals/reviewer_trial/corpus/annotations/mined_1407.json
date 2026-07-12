@@ -1,0 +1,44 @@
+{
+  "diff_id": "mined_1407",
+  "ground_truth": [
+    {
+      "id": "frontier_1",
+      "location": "orchestrator/tests/test_invoke.py:489",
+      "category": "test_fidelity",
+      "severity": "blocking",
+      "description": "The refactor of test_release_probe_slot_called_on_runtime_error replaces the explicit `gate.detect_cap_hit = MagicMock(return_value=False)` with `_make_gate(...)`, but the new `_make_gate` factory does not set `detect_cap_hit`. As a bare MagicMock auto-attribute, `gate.detect_cap_hit(...)` now returns a truthy MagicMock instead of False, so any production branch that checks `detect_cap_hit` takes the opposite path (cap-hit detected), likely driving the escalation_created event and changing what the test actually exercises.",
+      "mutation_type": "test_gap"
+    },
+    {
+      "id": "frontier_2",
+      "location": "orchestrator/tests/test_invoke.py:85-104",
+      "category": "test_coverage",
+      "severity": "suggestion",
+      "description": "The `_make_gate` factory intentionally omits `detect_cap_hit` from its default attribute set, so it does not fully cover every UsageGate attribute a construction site may need; call sites that relied on `detect_cap_hit` returning a concrete False (rather than a truthy auto-mock) silently lose that behavior after routing through the factory.",
+      "mutation_type": "test_gap"
+    },
+    {
+      "id": "frontier_3",
+      "location": "orchestrator/tests/test_invoke.py:558-561",
+      "category": "test_gap",
+      "severity": "suggestion",
+      "description": "TestMakeGateFactory pins account_count/active_account_name/soonest_resets_at/override passthrough but does not assert that the mock-driven branches (e.g. detect_cap_hit / cap-hit path) behave as the callers expect, so the contract test would not catch the missing detect_cap_hit default that changed runtime-error test behavior.",
+      "mutation_type": "test_gap"
+    }
+  ],
+  "provenance": {
+    "kind": "mined",
+    "task_id": "1407",
+    "project_id": "dark_factory",
+    "outcome": "done",
+    "review_cycles": 1,
+    "verify_attempts": 0,
+    "signal_reason": [
+      "escalation_created event"
+    ],
+    "merge_sha": "a6b7576fab0bf539697dd014a1ab705bbcdd4c55",
+    "runs_db_path": "/home/leo/src/dark-factory/data/orchestrator/runs.db",
+    "runs_db_query": "SELECT task_id, project_id, outcome, review_cycles, verify_attempts FROM task_results WHERE review_cycles >= 1, cross-referenced with events (escalation_created, merge_finalized) -- see mining.mine_fn_candidates.",
+    "escalation_refs": []
+  }
+}

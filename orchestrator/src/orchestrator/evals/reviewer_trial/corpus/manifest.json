@@ -215,7 +215,7 @@
       "source": "mined",
       "description": "Task 924 (dark_factory): Batched curator prompt for ticket worker. Flagged as a false-negative candidate -- review passed but verify_attempts>=2 (actual=4); escalation_created event.",
       "project": "dark-factory",
-      "split": "test"
+      "split": "selection"
     },
     {
       "diff_id": "mined_1538",
@@ -302,6 +302,126 @@
       "language": "python",
       "source": "mined",
       "description": "Task 1653 (dark_factory): Fix stage1.py (memory_consolidator): add metadata.stage='memory_consolidator' to cycle summary writes. Flagged as a false-negative candidate -- review passed but escalation_created event.",
+      "project": "dark-factory",
+      "split": "test"
+    },
+    {
+      "diff_id": "mined_1753",
+      "language": "python",
+      "source": "mined",
+      "description": "Task 1753 (dark_factory): Dashboard Memory panel: show fused-memory uptime. Flagged as a false-negative candidate -- review passed but escalation_created event.",
+      "project": "dark-factory",
+      "split": "train"
+    },
+    {
+      "diff_id": "mined_909",
+      "language": "python",
+      "source": "mined",
+      "description": "Task 909 (dark_factory): Remove dead stale_claim_recovery_seconds config field. Flagged as a false-negative candidate -- review passed but escalation_created event.",
+      "project": "dark-factory",
+      "split": "test"
+    },
+    {
+      "diff_id": "mined_1072",
+      "language": "python",
+      "source": "mined",
+      "description": "Task 1072 (dark_factory): Harness drain: gate 'fully drained' marker behind one-shot flag. Flagged as a false-negative candidate -- review passed but escalation_created event.",
+      "project": "dark-factory",
+      "split": "test"
+    },
+    {
+      "diff_id": "mined_1541",
+      "language": "python",
+      "source": "mined",
+      "description": "Task 1541 (dark_factory): Block new subtask creation: remove add_subtask from Stage 2 reconciliation tool surface. Flagged as a false-negative candidate -- review passed but escalation_created event.",
+      "project": "dark-factory",
+      "split": "selection"
+    },
+    {
+      "diff_id": "mined_874",
+      "language": "python",
+      "source": "mined",
+      "description": "Task 874 (dark_factory): Fix AsyncMock setup in merge_queue verification tests. Flagged as a false-negative candidate -- review passed but escalation_created event.",
+      "project": "dark-factory",
+      "split": "test"
+    },
+    {
+      "diff_id": "mined_643",
+      "language": "python",
+      "source": "mined",
+      "description": "Task 643 (dark_factory): Fix proactive sample pool and remove dead Recently Completed elif branch. Flagged as a false-negative candidate -- review passed but escalation_created event.",
+      "project": "dark-factory",
+      "split": "test"
+    },
+    {
+      "diff_id": "mined_639",
+      "language": "python",
+      "source": "mined",
+      "description": "Task 639 (dark_factory): Clean up _SchedulerLike Protocol: replace _status_cache with method + static conformance tests. Flagged as a false-negative candidate -- review passed but verify_attempts>=2 (actual=2); escalation_created event.",
+      "project": "dark-factory",
+      "split": "test"
+    },
+    {
+      "diff_id": "mined_920",
+      "language": "python",
+      "source": "mined",
+      "description": "Task 920 (dark_factory): Migrate orchestrator add_task callers to submit_task + resolve_ticket. Flagged as a false-negative candidate -- review passed but verify_attempts>=2 (actual=2); escalation_created event.",
+      "project": "dark-factory",
+      "split": "train"
+    },
+    {
+      "diff_id": "mined_1225",
+      "language": "python",
+      "source": "mined",
+      "description": "Task 1225 (dark_factory): Investigate Graphiti async-queue embedding indexing latency for temporal_fact writes. Flagged as a false-negative candidate -- review passed but escalation_created event.",
+      "project": "dark-factory",
+      "split": "test"
+    },
+    {
+      "diff_id": "mined_1407",
+      "language": "python",
+      "source": "mined",
+      "description": "Task 1407 (dark_factory): Extract a shared MagicMock-gate factory for orchestrator tests (mirror shared/tests _mock_gate). Flagged as a false-negative candidate -- review passed but escalation_created event.",
+      "project": "dark-factory",
+      "split": "test"
+    },
+    {
+      "diff_id": "mined_829",
+      "language": "python",
+      "source": "mined",
+      "description": "Task 829 (dark_factory): Enhance _uuid_dispatch with dispatch tracking and exception support. Flagged as a false-negative candidate -- review passed but escalation_created event.",
+      "project": "dark-factory",
+      "split": "test"
+    },
+    {
+      "diff_id": "mined_1328",
+      "language": "python",
+      "source": "mined",
+      "description": "Task 1328 (dark_factory): Discover nested orchestrator.yaml at any depth (robust to symlink loops). Flagged as a false-negative candidate -- review passed but escalation_created event.",
+      "project": "dark-factory",
+      "split": "train"
+    },
+    {
+      "diff_id": "mined_1751",
+      "language": "python",
+      "source": "mined",
+      "description": "Task 1751 (dark_factory): Dashboard Orchestrators panel: per-orchestrator last-update timestamp. Flagged as a false-negative candidate -- review passed but escalation_created event.",
+      "project": "dark-factory",
+      "split": "test"
+    },
+    {
+      "diff_id": "mined_1195",
+      "language": "python",
+      "source": "mined",
+      "description": "Task 1195 (dark_factory): Extract shared test fixtures from test_workflow_e2e.py to a helpers module. Flagged as a false-negative candidate -- review passed but escalation_created event.",
+      "project": "dark-factory",
+      "split": "test"
+    },
+    {
+      "diff_id": "mined_1174",
+      "language": "python",
+      "source": "mined",
+      "description": "Task 1174 (dark_factory): Stage 1 Terminal-State Pre-Check: use FQN tool names, thread project_root, handle get_task error envelope, pin concrete flag_type. Flagged as a false-negative candidate -- review passed but escalation_created event.",
       "project": "dark-factory",
       "split": "test"
     }
