@@ -173,6 +173,17 @@ class FreshPidVerify:
     CALLER-PERSISTED field, not a local re-inspect captured inside
     ``execute()`` (the 2074 caveat) — the caller must inspect the target
     unit and persist the baseline BEFORE invoking the restart.
+
+    Both baseline fields participate in ``_execute_cross_unit_blocking``'s
+    freshness check: a re-inspected unit counts as "fresh" only when its new
+    MainPID is live (``> 0``) AND differs from ``baseline_main_pid`` AND its
+    ``ActiveEnterTimestampMonotonic`` is strictly later than
+    ``baseline_active_enter_monotonic``. Comparing the persisted PID is a
+    genuinely stronger identity signal than the monotonic timestamp alone
+    (deterministic_runner.py:1624-1630's reference check uses monotonic only,
+    since it never captures a baseline PID to compare) — it requires the
+    process identity to have actually changed, not merely the unit's
+    activation clock.
     """
 
     baseline_active_enter_monotonic: int
@@ -313,13 +324,22 @@ class RestartPlan:
         here can never SIGKILL the caller.
 
         Models deterministic_runner.py:1546-1652's blocking-deploy-then-verify
-        shape: run to completion, re-inspect, then
-        ``fresh = isinstance(pid, int) and pid > 0 and new_monotonic > baseline_monotonic``
-        (deterministic_runner.py:1624-1630). A script failure (rc != 0) or a
-        non-fresh re-inspect never falsely reports DEPLOYED_AND_VERIFIED —
-        both escalate via the shared ``_file_inprocess_escalation`` filing
-        routine (skipped, with a logged warning, when no
-        ``on_failure_escalation`` was configured for this plan).
+        shape: run to completion, re-inspect, then check freshness. This seam
+        deliberately checks a stronger condition than
+        deterministic_runner.py:1624-1630's reference
+        ``fresh = isinstance(pid, int) and pid > 0 and new_monotonic > baseline_monotonic``:
+        because ``FreshPidVerify`` carries a persisted ``baseline_main_pid``
+        (which deterministic_runner.py's local baseline dict never captures),
+        this method also requires the re-inspected MainPID to differ from
+        that baseline — ``fresh = isinstance(pid, int) and pid > 0 and pid !=
+        baseline_main_pid and new_monotonic > baseline_monotonic`` — so a
+        "fresh" verdict requires the process identity to have actually
+        changed, not just the unit's activation clock ticking forward. A
+        script failure (rc != 0) or a non-fresh re-inspect never falsely
+        reports DEPLOYED_AND_VERIFIED — both escalate via the shared
+        ``_file_inprocess_escalation`` filing routine (skipped, with a logged
+        warning, when no ``on_failure_escalation`` was configured for this
+        plan).
         """
         assert self.verify is not None, 'router only calls this when wants_blocking'
 
@@ -355,18 +375,22 @@ class RestartPlan:
         pid = new_state.get('MainPID', 0)
         new_monotonic = new_state.get('ActiveEnterTimestampMonotonic', 0)
         baseline_monotonic = self.verify.baseline_active_enter_monotonic
+        baseline_pid = self.verify.baseline_main_pid
         fresh = (
             isinstance(pid, int)
             and pid > 0
+            and pid != baseline_pid
             and new_monotonic > baseline_monotonic
         )
         if not fresh:
             detail = (
                 f'Cross-unit restart verify failed for {self.target_unit!r}: '
-                f'new MainPID={pid!r} new_monotonic={new_monotonic} '
+                f'new MainPID={pid!r} baseline_pid={baseline_pid} '
+                f'new_monotonic={new_monotonic} '
                 f'baseline_monotonic={baseline_monotonic}. Expected a fresh '
-                f'non-sentinel MainPID (>0) and a strictly-later '
-                f'ActiveEnterTimestampMonotonic after the restart.'
+                f'non-sentinel MainPID (>0, and different from baseline_pid) '
+                f'and a strictly-later ActiveEnterTimestampMonotonic after '
+                f'the restart.'
             )
             escalated = self._file_verify_stage_escalation(
                 summary=f'Restart verify failed: {self.target_unit}',

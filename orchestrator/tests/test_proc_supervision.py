@@ -484,11 +484,14 @@ class TestCrossUnitBlockingVerifyPass:
 class TestCrossUnitBlockingVerifyFail:
     """RP-5: a cross-unit blocking restart that does NOT produce a provably
     fresh target process must never report DEPLOYED_AND_VERIFIED — it
-    escalates instead. Three sub-cases: a stale-sentinel MainPID, a monotonic
-    timestamp that is not strictly later than the persisted baseline, and a
+    escalates instead. Four sub-cases: a stale-sentinel MainPID, a monotonic
+    timestamp that is not strictly later than the persisted baseline, a
     restart script that itself exits non-zero (in which case the inspector is
     never even consulted — no point verifying freshness after a failed
-    restart)."""
+    restart), and a re-inspected MainPID identical to the persisted
+    ``baseline_main_pid`` despite a strictly-later monotonic timestamp (the
+    process identity never actually changed, so a ticked-forward activation
+    clock alone must not count as fresh)."""
 
     async def test_stale_pid_sentinel_is_verify_failed(self, tmp_queue_dir: Path) -> None:
         from orchestrator.proc_supervision import RestartDisposition
@@ -538,6 +541,30 @@ class TestCrossUnitBlockingVerifyFail:
             }),
             inspector_called=False,
             expected_disposition=RestartDisposition.RESTART_FAILED,
+        )
+
+    async def test_same_pid_as_baseline_is_verify_failed_despite_fresh_monotonic(
+        self, tmp_queue_dir: Path,
+    ) -> None:
+        """``baseline_main_pid`` is a real signal in the freshness check, not
+        a dead field: a re-inspected MainPID identical to the persisted
+        baseline (42, per ``_assert_not_deployed_and_escalates`` below) means
+        the process identity never actually changed, even though the
+        monotonic timestamp ticked forward past the baseline — this must not
+        be reported fresh."""
+        from orchestrator.proc_supervision import RestartDisposition
+
+        await self._assert_not_deployed_and_escalates(
+            tmp_queue_dir,
+            task_id='task-204',
+            runner=FakeRunner(returncode=0),
+            inspector=make_fake_inspector({
+                'MainPID': 42,  # == baseline_main_pid: no identity change
+                'ActiveState': 'active',
+                'ActiveEnterTimestampMonotonic': 2000,  # > baseline 1000
+            }),
+            inspector_called=True,
+            expected_disposition=RestartDisposition.VERIFY_FAILED,
         )
 
     async def _assert_not_deployed_and_escalates(
