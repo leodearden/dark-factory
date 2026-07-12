@@ -73,6 +73,7 @@ from orchestrator.merge_queue import (
     NEEDS_REBASE_REASON_PREFIX,
     DecidedItem,
     InflightEntry,
+    InflightVerifyResult,
     MergeOutcome,
     MergeRequest,
     NoLandingsCircuitBreaker,
@@ -82,6 +83,7 @@ from orchestrator.merge_queue import (
     SuffixConflictGraph,
 )
 from orchestrator.run_store import RunStore
+from orchestrator.verify_runner import HostLease
 
 # ── Module-level sentinel ─────────────────────────────────────────────────────
 
@@ -1809,4 +1811,163 @@ class TestScenario9CircuitBreaker:
         ]
         assert len(all_pending) == 1, (
             f'Expected exactly 1 breaker INFO escalation (dedup), got {len(all_pending)}'
+        )
+
+
+# ── DEFECT 2 (task 2357) RED: land-time refresh of _last_known_main_sha ──────
+
+
+async def _make_merged_item(
+    git_ops: GitOps,
+    config: OrchestratorConfig,
+    branch: str,
+    filename: str,
+    content: str,
+    *,
+    speculative: bool = False,
+) -> tuple[MergeRequest, RealMergeItem]:
+    """Create a REAL merged RealMergeItem on a fresh branch (style C driving).
+
+    Ported from test_merge_queue_invariant_integration_gate.py's helper of the
+    same name (itself ported from test_merge_queue_concurrent_verify.py) —
+    merges *branch* to main via a real ``git_ops.merge_to_main`` call (no
+    queue/dispatch involved) so the land test below can drive
+    ``_finalize_inflight`` directly against a real merge commit.  Does NOT
+    advance main — the caller decides whether/how to finalize.
+    """
+    wt = await _make_branch_with_file(git_ops, branch, filename, content)
+    loop = asyncio.get_running_loop()
+    req = MergeRequest(
+        task_id=branch, branch=branch, worktree=wt,
+        pre_rebased=False, task_files=None, module_configs=[],
+        config=config, result=loop.create_future(), lane='normal',
+    )
+    merge_result = await git_ops.merge_to_main(wt, branch)
+    assert merge_result.success and merge_result.merge_commit
+    assert merge_result.merge_worktree is not None
+    base_sha = await git_ops.get_main_sha()
+    item = RealMergeItem(
+        request=req,
+        merge_result=merge_result,
+        merge_wt=merge_result.merge_worktree,
+        base_sha=base_sha,
+        speculative=speculative,
+    )
+    return req, item
+
+
+def _wrap_verify_result(vr: InflightVerifyResult) -> asyncio.Task:  # type: ignore[type-arg]
+    """Wrap a pre-computed InflightVerifyResult in an already-resolved Task.
+
+    Ported from test_merge_queue_invariant_integration_gate.py — lets the
+    land test build the InflightEntry ``_finalize_inflight`` expects without
+    re-running a real verify.
+    """
+
+    async def _resolved() -> InflightVerifyResult:
+        return vr
+
+    return asyncio.ensure_future(_resolved())
+
+
+async def _make_branch_with_file(
+    git_ops: GitOps,
+    branch_name: str,
+    filename: str,
+    content: str,
+) -> Path:
+    """Create a worktree branch with one committed file and return its path.
+
+    Ported from test_merge_queue_invariant_integration_gate.py (itself ported
+    from test_merge_queue_concurrent_verify.py, per-file duplication
+    convention) — complements ``_create_branch_editing`` above for scenarios
+    that need a real materialised worktree rather than just a branch SHA.
+    """
+    worktree = (await git_ops.create_worktree(branch_name)).path
+    (worktree / filename).write_text(content)
+    await git_ops.commit(worktree, f'Add {filename}')
+    return worktree
+
+
+@pytest.mark.asyncio
+class TestFinalizeInflightRefreshesLastKnownMainSha:
+    """A clean land through ``_finalize_inflight`` must refresh
+    ``worker._last_known_main_sha`` to the newly-landed commit, so
+    ``snapshot()['two_layer_invariants']`` never lags a land that happens
+    while the merger is otherwise idle (task 2357 DEFECT 2).
+
+    RED until the GREEN step adds the one-line cache write to
+    ``_finalize_inflight``'s clean-landing branch (merge_queue.py, inside
+    ``if outcome.status == 'done':``).
+    """
+
+    async def test_land_refreshes_last_known_main_sha(
+        self, git_ops: GitOps, config: OrchestratorConfig, git_repo: Path,
+    ) -> None:
+        """A clean land must update worker._last_known_main_sha to the new tip."""
+        worker = _make_worker(git_ops)
+        worker._last_known_main_sha = 'OLD_STALE'
+
+        _, item = await _make_merged_item(
+            git_ops, config, 'task/land-refresh', 'land_refresh.py', 'x = 1\n',
+        )
+        lease = HostLease(name='local', runner=MagicMock(), is_local=True)
+        vr = InflightVerifyResult(outcome=None, merge_wt=item.merge_wt)
+        entry = InflightEntry(
+            item=item, lease=lease, verify_task=_wrap_verify_result(vr),
+            merge_wt=None, was_speculative=False,
+        )
+
+        advanced = await worker._finalize_inflight(entry)
+
+        assert advanced is True, 'expected a clean PASS land to advance main'
+        real_main = await git_ops.get_main_sha()
+        assert item.merge_result.merge_commit is not None
+        assert worker._last_known_main_sha == real_main == item.merge_result.merge_commit, (
+            f'expected _last_known_main_sha to be refreshed to the newly-landed '
+            f'commit {item.merge_result.merge_commit!r}, got '
+            f'{worker._last_known_main_sha!r} (real main={real_main!r}) — '
+            f'the DEFECT 2 land refresh is not wired into _finalize_inflight yet'
+        )
+
+    async def test_land_refresh_closes_snapshot_false_positive(
+        self, git_ops: GitOps, config: OrchestratorConfig, git_repo: Path,
+    ) -> None:
+        """Companion snapshot check: with the merger deliberately idle (no
+        recompute_suffix_conflict_graph call anywhere in this test), a
+        healthy frozen head chained onto the just-landed commit must show
+        two_layer_invariants() == [] once the land refresh has fired — the
+        land refresh ALONE closes the stale window (mirrors
+        test_snapshot_uses_real_main_not_frozen_tip's surface).
+        """
+        worker = _make_worker(git_ops)
+        worker._last_known_main_sha = 'OLD_STALE'
+
+        _, item = await _make_merged_item(
+            git_ops, config, 'task/land-refresh-2', 'land_refresh_2.py', 'x = 1\n',
+        )
+        lease = HostLease(name='local', runner=MagicMock(), is_local=True)
+        vr = InflightVerifyResult(outcome=None, merge_wt=item.merge_wt)
+        entry = InflightEntry(
+            item=item, lease=lease, verify_task=_wrap_verify_result(vr),
+            merge_wt=None, was_speculative=False,
+        )
+
+        advanced = await worker._finalize_inflight(entry)
+        assert advanced is True, 'precondition: the land must succeed'
+        assert item.merge_result.merge_commit is not None
+
+        # A second, still-verifying frozen head chained onto the just-landed
+        # commit — a healthy stack IFF the cache is fresh.
+        _, head_item = _make_fake_item(
+            't-head-after-land', base_sha=item.merge_result.merge_commit,
+            merge_commit='c-head-after-land',
+            config=config, git_repo=git_repo,
+        )
+        worker._inflight.append(_make_inflight_entry(head_item, verifying=True))
+
+        violations = worker.snapshot()['two_layer_invariants']
+        assert violations == [], (
+            f'expected the land refresh alone to close the stale-cache false '
+            f'positive for a healthy post-land frozen stack, got: {violations!r}'
         )

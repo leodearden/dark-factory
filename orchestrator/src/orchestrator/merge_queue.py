@@ -10624,6 +10624,15 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                     if outcome.status == 'done':
                         # ι=1894: record clean landing, pop drift base for this req
                         self._note_merge_landing(req.request_id)
+                        # Task 2357 DEFECT 2: refresh the observation-only
+                        # _last_known_main_sha cache here too — this land IS the
+                        # new main tip.  Without this, an idle merger (blocked in
+                        # _acquire_next_request, the cache's only other write
+                        # site) leaves snapshot()'s two_layer_invariants() fed a
+                        # stale SHA while the verifier keeps landing, producing
+                        # false §5.3 verify-base⊄frozen-tip positives.
+                        if outcome.merge_sha is not None:
+                            self._last_known_main_sha = outcome.merge_sha
                         if (
                             outcome.merge_sha is not None
                             and self._on_merge_landed is not None
@@ -11136,9 +11145,14 @@ class SpeculativeMergeWorker(_WipHaltMixin):
         # (the compat shim used by direct-call tests) to keep shim tests green.
         try:
             _guard_main_sha = await self._git_ops.get_main_sha()
+            # DEFECT 2 (task 2357): refresh the §5.3 snapshot cache from the
+            # guard's own fresh SHA so snapshot()['two_layer_invariants'] never
+            # lags behind this dispatch's view of main (piggybacks the fetch
+            # above; no extra git round-trip).
+            self._last_known_main_sha = _guard_main_sha
             self._warn_if_verify_base_not_frozen_tip(item, _guard_main_sha)
         except Exception:
-            pass  # fail-open: skip the check on any git error
+            pass  # fail-open: skip the check (and the refresh) on any git error
 
         # ── Launch background verify task ────────────────────────────────────
         # depth (task 2340) is computed synchronously HERE — before
