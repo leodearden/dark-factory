@@ -1147,6 +1147,16 @@ class SqliteTaskBackend:
         None)`` + ``apply_wal_pragmas``), but caches the result per
         ``project_root`` so repeated hot-path calls don't pay a per-call
         connection-open cost.
+
+        Guardrail: the "never pinned" invariant holds only because every
+        reader fully drains its cursor via ``fetchall()`` (see
+        :meth:`_statuses_from_conn`, the sole current caller) before
+        returning. A future caller that leaves a ``SELECT`` cursor
+        partially stepped — or raises mid-iteration before the statement is
+        exhausted — would keep an implicit WAL read transaction open on
+        *this* connection and re-introduce the task-2388 stale-snapshot pin,
+        this time on the cached read connection. Always fully consume the
+        cursor (or explicitly close it) before returning.
         """
         if self._closed:
             raise RuntimeError('SqliteTaskBackend is closed')
@@ -1156,19 +1166,31 @@ class SqliteTaskBackend:
         if project_root in self._read_connections:
             return self._read_connections[project_root]
 
+        # Mirror _get_connection's locking (see above): hold the global
+        # lock only briefly to fetch/create the per-project lock, then do
+        # the actual (disk/IO-bound) connect + pragma work under that
+        # per-project lock. Holding the global lock across the open would
+        # serialize project A's first read-connection bring-up against
+        # project B's bring-up and against close()'s map-drain snapshot —
+        # undercutting the hot-path motivation for this connection.
         async with self._connect_locks_lock:
-            # Re-check after acquiring lock — another caller may have raced us.
+            lock = self._connect_locks.setdefault(project_root, asyncio.Lock())
+
+        async with lock:
+            # Re-check after acquiring the lock — another caller may have
+            # raced us to open this project's read connection.
             conn = self._read_connections.get(project_root)
             if conn is not None:
                 return conn
-            # Re-check _closed too (not just the map): close() sets
-            # self._closed BEFORE acquiring this same lock to drain the map,
-            # so a close() that flips the flag and completes its drain during
-            # the window between our first _closed check above (before the
-            # `await self._get_connection(...)` bring-up call) and this lock
-            # acquisition would otherwise let us open-and-cache a brand new
-            # connection that close() has already stopped watching for — a
-            # leaked file handle / WAL reader past shutdown.
+            # Re-check _closed too (not just the map): close() drains
+            # _read_connections under the *global* lock, not this
+            # per-project one, and sets self._closed before that drain even
+            # starts — so a close() that runs (and finishes) anywhere up to
+            # this point (e.g. during the `await self._get_connection(...)`
+            # bring-up call above, or while we waited for this lock) would
+            # otherwise let us open-and-cache a brand new connection that
+            # close() has already stopped watching for — a leaked file
+            # handle / WAL reader past shutdown.
             if self._closed:
                 raise RuntimeError('SqliteTaskBackend is closed')
 
@@ -1301,6 +1323,12 @@ class SqliteTaskBackend:
         connection) — a single source of truth for the ``ids`` filtering
         and the ``NULL`` → ``'unknown'`` coercion rule, so both read paths
         stay identical apart from which connection they run on.
+
+        Always fully drains the cursor via ``fetchall()`` below before
+        returning — required to keep :meth:`_get_read_connection`'s cached
+        AUTOCOMMIT connection unpinnable (see its docstring's Guardrail
+        note); a partially-stepped cursor would leave an implicit WAL read
+        transaction open on that shared connection.
 
         Args:
             conn: An open connection with ``row_factory`` already set to
