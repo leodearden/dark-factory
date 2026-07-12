@@ -235,3 +235,101 @@ def _make_stage_report(**overrides) -> StageReport:
     }
     defaults.update(overrides)
     return StageReport(**defaults)
+
+
+# ---------------------------------------------------------------------------
+# L1 + L2 — ReconLedgerStore UPSERT idempotency + writer-vs-GC race [α=2219]
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestLedgerUpsertAndRace:
+    """L1 + L2 (α=2219): ReconLedgerStore UPSERT idempotency + writer-vs-GC race.
+
+    Integration delta over test_recon_ledger.py's sequential UPSERT/gc
+    coverage: L1 drives a CONCURRENT asyncio.gather() interleave of
+    same-identity UPSERTs against an in-flight gc() pass — no existing
+    per-seam unit test exercises this interleaving. The 5-column primary
+    key plus aiosqlite's single-connection write serialization together
+    guarantee the invariants below regardless of task-scheduling order.
+
+    Driving harness (``_drive_l2_sequential_upserts`` /
+    ``_drive_l1_concurrent_race`` / ``_count_rows``) lands in step-2 —
+    this step only declares the §9 postconditions, so it is RED until
+    then (the harness methods referenced below don't exist yet).
+    """
+
+    _PROJECT_L2 = 'proj-l2-upsert-idempotency'
+    _PROJECT_L1 = 'proj-l1-writer-gc-race'
+
+    async def test_l2_repeated_upsert_same_identity_leaves_one_row_last_write_wins(
+        self, ledger,
+    ) -> None:
+        """L2: N upserts of the same 5-part identity leave exactly one row
+        (SELECT COUNT(*)==1), whose payload_json/state equal the LAST
+        upsert's values."""
+        last_record = await self._drive_l2_sequential_upserts(ledger)
+
+        count = await self._count_rows(ledger, self._PROJECT_L2)
+        assert count == 1, f'Expected exactly one row after N upserts, got {count}'
+
+        fetched = await ledger.get_by_identity(
+            self._PROJECT_L2, 'stage1_flag_marker',
+            task_id='T-idempotent', flag_type='flag_idempotent', run_id='',
+        )
+        assert fetched is not None, 'Expected the upserted identity to be readable back'
+        assert fetched.payload_json == last_record.payload_json, (
+            f'Expected last-write-wins payload {last_record.payload_json!r}, '
+            f'got {fetched.payload_json!r}'
+        )
+        assert fetched.state == last_record.state, (
+            f'Expected last-write-wins state {last_record.state!r}, got {fetched.state!r}'
+        )
+
+    async def test_l1_concurrent_upsert_interleaved_with_gc_preserves_live_marker(
+        self, ledger,
+    ) -> None:
+        """L1: two concurrent same-identity UPSERTs interleaved with a
+        gc() pass (via asyncio.gather) leave exactly one row for the
+        racing identity, last-writer-wins on payload, AND a co-resident
+        still-active, non-expired, non-terminal marker is NEVER deleted
+        by the interleaved GC."""
+        candidates, terminal_task_id, live_task_id = await self._drive_l1_concurrent_race(ledger)
+
+        fetched_race = await ledger.get_by_identity(
+            self._PROJECT_L1, 'stage1_flag_marker',
+            task_id='T-race', flag_type='flag_race', run_id='',
+        )
+        assert fetched_race is not None, 'Expected the racing identity to survive the interleave'
+        candidate_payloads = {c.payload_json for c in candidates}
+        assert fetched_race.payload_json in candidate_payloads, (
+            f'Expected the surviving row to match one of the concurrent '
+            f'writers {candidate_payloads!r}, got {fetched_race.payload_json!r}'
+        )
+
+        terminal_marker = await ledger.get_by_identity(
+            self._PROJECT_L1, 'stage1_flag_marker',
+            task_id=terminal_task_id, flag_type='flag_terminal', run_id='',
+        )
+        assert terminal_marker is None, (
+            'gc() must have actually run its terminal-delete pass during the '
+            'interleave (precondition proving the live-marker survival below '
+            'is not just a GC no-op)'
+        )
+
+        live_marker = await ledger.get_by_identity(
+            self._PROJECT_L1, 'stage1_flag_marker',
+            task_id=live_task_id, flag_type='flag_live', run_id='',
+        )
+        assert live_marker is not None, (
+            'A co-resident still-active, non-expired, non-terminal marker '
+            'must NEVER be deleted by an interleaved GC pass'
+        )
+
+        # Total surviving rows for the project: racing identity + live
+        # marker (terminal marker was collected by the interleaved gc()).
+        count = await self._count_rows(ledger, self._PROJECT_L1)
+        assert count == 2, (
+            f'Expected exactly 2 surviving rows (race + live) after the '
+            f'interleaved gc() collected the terminal marker, got {count}'
+        )
