@@ -77,6 +77,27 @@ class TestVerdict:
         assert error_dict['op'] == 'update_task'
         assert error_dict['live_status'] == 'done'
 
+    def test_ok_verdict_corrective_path_defaults_empty(self):
+        verdict = recon_write_policy.Verdict(outcome='ok')
+        assert verdict.corrective_path == ''
+        assert verdict.to_error_dict() == {}
+
+    def test_rejection_verdict_corrective_path_surfaces_in_error_dict(self):
+        verdict = recon_write_policy.Verdict(
+            outcome='rejection',
+            op='update_task',
+            task_id='1',
+            agent_id='recon-stage-x',
+            error_type='ReconTerminalWriteRejected',
+            reason='task is done',
+            live_status='done',
+            corrective_path='set_task_status_done_provenance_repair',
+        )
+        assert (
+            verdict.to_error_dict()['corrective_path']
+            == 'set_task_status_done_provenance_repair'
+        )
+
 
 # ---------------------------------------------------------------------------
 # check() helper
