@@ -24,6 +24,12 @@ from orchestrator.steward import (
     _is_empty_output,
     _is_timeout_kill,
 )
+from orchestrator.workflow_types import (
+    StewardBudgetExhausted,
+    StewardInterrupted,
+    StewardReescalatedL1,
+    StewardResolved,
+)
 
 
 def _attach_invoke_slot(gate: MagicMock) -> MagicMock:
@@ -2908,3 +2914,42 @@ class TestPatchResolutionMetadataDefect2:
         with caplog.at_level(logging.WARNING):
             steward._patch_resolution_metadata('esc-42-1', _make_result(turns=3))
         assert 'Failed to patch steward metadata on esc-42-1' in caplog.text
+
+
+# ---------------------------------------------------------------------------
+# StewardOutcome publish channel (task 2248 / W9-delta)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestStewardOutcomeChannelResolved:
+    """The steward publishes StewardResolved on the in-process channel when
+    it clears a level-0 escalation itself (no re-escalation)."""
+
+    async def test_publishes_resolved_outcome_on_success(self, steward):
+        channel = asyncio.Queue()
+        steward.set_outcome_channel(channel)
+        esc = _make_escalation()
+        steward.escalation_queue.get.return_value = _make_escalation(
+            status='resolved', resolution='the fix',
+        )
+
+        with patch('orchestrator.steward.invoke_agent', new_callable=AsyncMock) as mock_invoke:
+            mock_invoke.return_value = _make_result(session_id='sess-abc')
+            await steward._handle_escalation(esc)
+
+        outcome = channel.get_nowait()
+        assert outcome == StewardResolved(resolution_text='the fix')
+
+    async def test_no_channel_set_is_a_back_compat_noop(self, steward):
+        """A steward with no channel wired (the default) must still run
+        _handle_escalation without error — publish is a no-op when the
+        channel is None."""
+        esc = _make_escalation()
+        steward.escalation_queue.get.return_value = _make_escalation(
+            status='resolved', resolution='the fix',
+        )
+
+        with patch('orchestrator.steward.invoke_agent', new_callable=AsyncMock) as mock_invoke:
+            mock_invoke.return_value = _make_result(session_id='sess-abc')
+            await steward._handle_escalation(esc)  # must not raise
