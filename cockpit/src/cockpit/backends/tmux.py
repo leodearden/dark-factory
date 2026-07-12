@@ -21,6 +21,17 @@ logger = logging.getLogger(__name__)
 _REORDER_SCRATCH_BASE = 9000
 
 
+def _current_index(tmux_target: str) -> int | None:
+    """Parse the numeric window index out of a 'session:index'-shaped target.
+
+    Returns None if the part after the first ':' isn't a plain non-negative
+    integer, so a target with an unexpected shape safely fails reorder()'s
+    no-op comparison (falls through to the normal path) rather than raising.
+    """
+    _, _, index_str = tmux_target.partition(':')
+    return int(index_str) if index_str.isdigit() else None
+
+
 class TmuxBackend:
     """Focus/arrange sessions running inside tmux."""
 
@@ -63,23 +74,84 @@ class TmuxBackend:
         (_REORDER_SCRATCH_BASE + its position among valid targets, which
         never collides with the final 0..N-1 destination range); phase 2
         moves each target from its scratch index to its final compacted
-        index. Focus-preserving throughout: only move-window is issued, never
-        select-window/switch-client.
+        index.
+
+        Signal-don't-move (the invariant PRD boundary B4/B6 guards live): a
+        reorder must never change which window the operator is actually
+        looking at. move-window can't be made focus-neutral on its own -- a
+        bare `move-window` *selects* the window it touches (stealing "current"
+        for any window, active or not), while `move-window -d` on the window
+        that *was* current forces tmux to pick some other window as current.
+        So there is no flag combination of pure move-window that leaves a
+        session's current window untouched when the active window is among
+        those relocated. Instead we snapshot each involved session's active
+        window by its move-stable @id up front, do every move with -d (to
+        minimize intermediate churn on an attached session), then re-select
+        exactly that window at the end. Re-selecting the window that was
+        already current is a net no-op for operator focus -- it restores the
+        invariant regardless of how indices were shuffled -- and is the only
+        select-window reorder ever issues (never switch-client).
+
+        Short-circuit: app._update_attention calls reorder() on every
+        attention refresh tick, and most ticks don't actually change any
+        target's position. If every valid target is already at its final
+        index, the park-then-place moves and the focus snapshot/restore
+        would accomplish nothing, so this returns immediately without
+        issuing any command. A single target out of place still runs the
+        full path below.
         """
-        # (index, tmux_target) — captured as a plain str (not target.tmux_target,
-        # which stays str | None) so the loop below is narrowing-clean for pyright.
+        # (index, tmux_target) — index is each target's priority-order position
+        # WITHIN ITS OWN SESSION (a running per-session counter), matching the
+        # "within its own session" contract above — NOT its global position
+        # across every target in this call, which would misplace a session's
+        # sole target at a gap-leaving cross-session index (e.g. two targets
+        # [s1:_, s2:_] would wrongly send s2's target to index 1 instead of
+        # its own session's index 0). tmux_target is captured as a plain str
+        # (not target.tmux_target, which stays str | None) so the loop below
+        # is narrowing-clean for pyright.
         valid: list[tuple[int, str]] = []
-        for index, target in enumerate(targets):
+        session_positions: dict[str, int] = {}
+        for target in targets:
             if not target.tmux_target:
                 logger.warning('TmuxBackend.reorder: target has no tmux_target: %r', target)
                 continue
+            session = target.tmux_target.split(':', 1)[0]
+            index = session_positions.get(session, 0)
+            session_positions[session] = index + 1
             valid.append((index, target.tmux_target))
+
+        if valid and all(_current_index(tmux_target) == index for index, tmux_target in valid):
+            logger.debug('TmuxBackend.reorder: no-op — every target already at its final index')
+            return
+
+        # Snapshot each involved session's currently-active window by its stable
+        # @id, in first-seen order, so we can restore focus after the moves.
+        sessions: list[str] = []
+        for _, tmux_target in valid:
+            session = tmux_target.split(':', 1)[0]
+            if session not in sessions:
+                sessions.append(session)
+        active_before: list[tuple[str, str]] = []  # (session, active window @id)
+        for session in sessions:
+            result = self._run(
+                ['tmux', 'display-message', '-p', '-t', session, '#{window_id}']
+            )
+            active_id = result.stdout.strip()
+            if result.returncode == 0 and active_id:
+                active_before.append((session, active_id))
+            else:
+                logger.warning(
+                    'TmuxBackend.reorder: could not read active window for session %r '
+                    '(rc=%s); focus will not be restored for it',
+                    session,
+                    result.returncode,
+                )
 
         parked: list[tuple[int, str, str]] = []  # (final_index, session, scratch_target)
         for position, (index, tmux_target) in enumerate(valid):
             session = tmux_target.split(':', 1)[0]
             scratch = f'{session}:{_REORDER_SCRATCH_BASE + position}'
-            result = self._run(['tmux', 'move-window', '-s', tmux_target, '-t', scratch])
+            result = self._run(['tmux', 'move-window', '-d', '-s', tmux_target, '-t', scratch])
             if result.returncode != 0:
                 logger.warning(
                     'TmuxBackend.reorder: move-window %r -> %r failed (rc=%s): %s',
@@ -93,12 +165,27 @@ class TmuxBackend:
 
         for index, session, scratch in parked:
             dst = f'{session}:{index}'
-            result = self._run(['tmux', 'move-window', '-s', scratch, '-t', dst])
+            result = self._run(['tmux', 'move-window', '-d', '-s', scratch, '-t', dst])
             if result.returncode != 0:
                 logger.warning(
                     'TmuxBackend.reorder: move-window %r -> %r failed (rc=%s): %s',
                     scratch,
                     dst,
+                    result.returncode,
+                    result.stderr,
+                )
+
+        # Restore each session's originally-active window by its stable @id. This
+        # is a no-op for operator focus (the window was already current before the
+        # reorder) but undoes the current-window churn move-window causes.
+        for session, active_id in active_before:
+            result = self._run(['tmux', 'select-window', '-t', active_id])
+            if result.returncode != 0:
+                logger.warning(
+                    'TmuxBackend.reorder: restore select-window %r for session %r failed '
+                    '(rc=%s): %s',
+                    active_id,
+                    session,
                     result.returncode,
                     result.stderr,
                 )

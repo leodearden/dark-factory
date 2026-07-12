@@ -134,10 +134,11 @@ class TestTmuxBackendReorder:
         backend.reorder(targets)
 
         assert runner.calls == [
-            ['tmux', 'move-window', '-s', 's:2', '-t', 's:9000'],
-            ['tmux', 'move-window', '-s', 's:0', '-t', 's:9001'],
-            ['tmux', 'move-window', '-s', 's:9000', '-t', 's:0'],
-            ['tmux', 'move-window', '-s', 's:9001', '-t', 's:1'],
+            ['tmux', 'display-message', '-p', '-t', 's', '#{window_id}'],
+            ['tmux', 'move-window', '-d', '-s', 's:2', '-t', 's:9000'],
+            ['tmux', 'move-window', '-d', '-s', 's:0', '-t', 's:9001'],
+            ['tmux', 'move-window', '-d', '-s', 's:9000', '-t', 's:0'],
+            ['tmux', 'move-window', '-d', '-s', 's:9001', '-t', 's:1'],
         ]
 
     def test_reorder_succeeds_against_a_live_occupied_destination_index(self):
@@ -160,8 +161,13 @@ class TestTmuxBackendReorder:
 
         assert table.windows == {'s:0': 'w2', 's:1': 'w0'}
 
-    def test_reorder_issues_zero_focus_commands(self):
-        """Focus-preserving shape: reorder never touches select-window/switch-client."""
+    def test_reorder_is_a_full_noop_when_the_sole_target_is_already_at_its_final_index(self):
+        """Efficiency: app._update_attention calls reorder() on every attention
+        refresh tick, and most ticks don't move anything. When the (only)
+        target already sits at its final index, reorder must issue ZERO
+        commands -- no display-message snapshot, no park-then-place moves,
+        no restore select-window -- rather than doing free work for no effect.
+        """
         from cockpit.backends.base import DisplayTarget
         from cockpit.backends.tmux import TmuxBackend
 
@@ -171,7 +177,195 @@ class TestTmuxBackendReorder:
 
         backend.reorder(targets)
 
-        assert not any(argv[1] in ('select-window', 'switch-client') for argv in runner.calls)
+        assert runner.calls == []
+
+    def test_reorder_is_a_full_noop_when_multiple_targets_are_already_in_order(self):
+        """The no-op short-circuit isn't limited to a single target: when
+        EVERY target in a multi-target reorder already sits at its final
+        index (the set is already fully sorted), nothing would move and
+        reorder issues zero commands.
+        """
+        from cockpit.backends.base import DisplayTarget
+        from cockpit.backends.tmux import TmuxBackend
+
+        runner = ScriptedRunner()
+        backend = TmuxBackend(run=runner)
+        targets = [
+            DisplayTarget(kind='tmux', tmux_target='s:0'),
+            DisplayTarget(kind='tmux', tmux_target='s:1'),
+        ]
+
+        backend.reorder(targets)
+
+        assert runner.calls == []
+
+    def test_reorder_does_not_short_circuit_when_only_some_targets_are_in_place(self):
+        """Conservative: a partial match must not trigger the no-op skip. If
+        even one target needs to move, the full park-then-place plus focus
+        restore machinery still runs for the whole batch.
+        """
+        from cockpit.backends.base import DisplayTarget
+        from cockpit.backends.tmux import TmuxBackend
+
+        runner = ScriptedRunner()
+        backend = TmuxBackend(run=runner)
+        targets = [
+            DisplayTarget(kind='tmux', tmux_target='s:0'),  # already at index 0
+            DisplayTarget(kind='tmux', tmux_target='s:5'),  # wants index 1, currently at 5
+        ]
+
+        backend.reorder(targets)
+
+        assert any(argv[:2] == ['tmux', 'move-window'] for argv in runner.calls)
+
+    def test_reorder_restores_active_window_and_never_switch_client(self):
+        """Signal-don't-move shape: move-window inevitably churns a session's
+        current window, so reorder snapshots the active window by its stable
+        @id up front and re-selects exactly that window at the end (restoring
+        operator focus to where it already was). The only focus command it may
+        issue is that restoring select-window -- never switch-client, and never
+        a select-window for any window other than the one that was active.
+        """
+        from cockpit.backends.base import CommandResult, DisplayTarget
+        from cockpit.backends.tmux import TmuxBackend
+
+        runner = ScriptedRunner(
+            results={
+                ('tmux', 'display-message', '-p', '-t', 's', '#{window_id}'): CommandResult(
+                    returncode=0, stdout='@7\n'
+                )
+            }
+        )
+        backend = TmuxBackend(run=runner)
+        # tmux_target is 's:5' (not the sole target's final index, 0) so this
+        # is a genuine move, not the no-op short-circuit -- otherwise reorder
+        # would return before issuing any command and there'd be nothing here
+        # to observe.
+        targets = [DisplayTarget(kind='tmux', tmux_target='s:5')]
+
+        backend.reorder(targets)
+
+        assert not any(argv[1] == 'switch-client' for argv in runner.calls)
+        select_calls = [argv for argv in runner.calls if argv[1] == 'select-window']
+        assert select_calls == [['tmux', 'select-window', '-t', '@7']]
+        # ...and the restore is the LAST thing reorder does, after every move.
+        assert runner.calls[-1] == ['tmux', 'select-window', '-t', '@7']
+
+    def test_reorder_restores_active_window_per_session_when_targets_span_sessions(self):
+        """Multi-session snapshot/restore: reorder() snapshots and restores
+        each involved session's active window INDEPENDENTLY -- exactly one
+        select-window per session, each using that session's own @id -- not
+        just a single session's worth of restore logic (every other
+        reorder() test here drives one session, 's').
+
+        Also locks down each target's *destination* index: it is computed
+        WITHIN ITS OWN SESSION (a per-session compacted position), not as a
+        global position across every target in the call. s2's sole target
+        here must land at s2:0 (its own session's index 0) -- a
+        global-position bug would instead send it to s2:1, since it's the
+        second target overall, leaving a gap and contradicting reorder()'s
+        own docstring ("within its own session").
+        """
+        from cockpit.backends.base import CommandResult, DisplayTarget
+        from cockpit.backends.tmux import TmuxBackend
+
+        runner = ScriptedRunner(
+            results={
+                ('tmux', 'display-message', '-p', '-t', 's1', '#{window_id}'): CommandResult(
+                    returncode=0, stdout='@11\n'
+                ),
+                ('tmux', 'display-message', '-p', '-t', 's2', '#{window_id}'): CommandResult(
+                    returncode=0, stdout='@22\n'
+                ),
+            }
+        )
+        backend = TmuxBackend(run=runner)
+        # Neither target sits at index 0 -- each is the SOLE target in its own
+        # session, so each belongs at that session's own compacted index 0
+        # (not the global positions 0/1 a cross-session bug would produce).
+        targets = [
+            DisplayTarget(kind='tmux', tmux_target='s1:5'),
+            DisplayTarget(kind='tmux', tmux_target='s2:7'),
+        ]
+
+        backend.reorder(targets)
+
+        assert runner.calls == [
+            ['tmux', 'display-message', '-p', '-t', 's1', '#{window_id}'],
+            ['tmux', 'display-message', '-p', '-t', 's2', '#{window_id}'],
+            ['tmux', 'move-window', '-d', '-s', 's1:5', '-t', 's1:9000'],
+            ['tmux', 'move-window', '-d', '-s', 's2:7', '-t', 's2:9001'],
+            ['tmux', 'move-window', '-d', '-s', 's1:9000', '-t', 's1:0'],
+            # s2's target lands at s2:0 -- its OWN session's compacted index --
+            # not s2:1, which is what a global (cross-session) position would
+            # have produced for the second target overall.
+            ['tmux', 'move-window', '-d', '-s', 's2:9001', '-t', 's2:0'],
+            ['tmux', 'select-window', '-t', '@11'],
+            ['tmux', 'select-window', '-t', '@22'],
+        ]
+
+    def test_reorder_skips_restore_for_session_when_display_message_fails(self, caplog):
+        """If a session's pre-reorder active-window snapshot can't be read
+        (display-message returns a nonzero rc, e.g. the session vanished),
+        reorder must not guess -- it skips restoring that session's focus
+        entirely (no select-window at all) rather than issuing one with a
+        bogus/empty target, and it warns so the skip is observable.
+        """
+        from cockpit.backends.base import CommandResult, DisplayTarget
+        from cockpit.backends.tmux import TmuxBackend
+
+        runner = ScriptedRunner(
+            results={
+                ('tmux', 'display-message', '-p', '-t', 's', '#{window_id}'): CommandResult(
+                    returncode=1, stderr='session not found: s'
+                ),
+            }
+        )
+        backend = TmuxBackend(run=runner)
+        # 's:5', not the sole target's final index 0 -- a genuine move, so the
+        # no-op short-circuit doesn't return before display-message is ever
+        # attempted.
+        targets = [DisplayTarget(kind='tmux', tmux_target='s:5')]
+
+        with caplog.at_level(logging.WARNING):
+            backend.reorder(targets)
+
+        assert not any(argv[1] == 'select-window' for argv in runner.calls)
+        assert not any(argv[1] == 'switch-client' for argv in runner.calls)
+        assert any(r.levelno == logging.WARNING for r in caplog.records)
+
+    def test_reorder_warns_when_restore_select_window_fails(self, caplog):
+        """If the final restore select-window fails (e.g. the snapshotted window
+        vanished mid-reorder), reorder must not silently no-op -- it warns so a
+        failed focus restoration is observable, mirroring every other _run call
+        in this method (move-window and the display-message snapshot read both
+        already warn on a nonzero rc).
+        """
+        from cockpit.backends.base import CommandResult, DisplayTarget
+        from cockpit.backends.tmux import TmuxBackend
+
+        runner = ScriptedRunner(
+            results={
+                ('tmux', 'display-message', '-p', '-t', 's', '#{window_id}'): CommandResult(
+                    returncode=0, stdout='@7\n'
+                ),
+                ('tmux', 'select-window', '-t', '@7'): CommandResult(
+                    returncode=1, stderr='window not found: @7'
+                ),
+            }
+        )
+        backend = TmuxBackend(run=runner)
+        # 's:5', not the sole target's final index 0 -- a genuine move, so the
+        # no-op short-circuit doesn't return before the restore is attempted.
+        targets = [DisplayTarget(kind='tmux', tmux_target='s:5')]
+
+        with caplog.at_level(logging.WARNING):
+            backend.reorder(targets)
+
+        # The restore is still attempted (and is still the last call reorder
+        # issues) even though it fails -- only the diagnostic changes.
+        assert runner.calls[-1] == ['tmux', 'select-window', '-t', '@7']
+        assert any(r.levelno == logging.WARNING for r in caplog.records)
 
     def test_reorder_skips_target_with_missing_tmux_target_and_warns(self, caplog):
         from cockpit.backends.base import DisplayTarget
@@ -179,15 +373,22 @@ class TestTmuxBackendReorder:
 
         runner = ScriptedRunner()
         backend = TmuxBackend(run=runner)
-        targets = [DisplayTarget(kind='tmux'), DisplayTarget(kind='tmux', tmux_target='s:0')]
+        # 's:5', not 's:0' -- a target with no tmux_target contributes no
+        # session/position (it has no session to belong to), so the
+        # remaining valid target is alone in session 's' and belongs at
+        # THAT session's own index 0 regardless of the skipped target;
+        # starting it at 's:0' already would trigger the no-op short-circuit
+        # and this test would exercise no move at all.
+        targets = [DisplayTarget(kind='tmux'), DisplayTarget(kind='tmux', tmux_target='s:5')]
 
         with caplog.at_level(logging.WARNING):
             backend.reorder(targets)
 
         assert any(r.levelno == logging.WARNING for r in caplog.records)
         assert runner.calls == [
-            ['tmux', 'move-window', '-s', 's:0', '-t', 's:9000'],
-            ['tmux', 'move-window', '-s', 's:9000', '-t', 's:1'],
+            ['tmux', 'display-message', '-p', '-t', 's', '#{window_id}'],
+            ['tmux', 'move-window', '-d', '-s', 's:5', '-t', 's:9000'],
+            ['tmux', 'move-window', '-d', '-s', 's:9000', '-t', 's:0'],
         ]
 
 

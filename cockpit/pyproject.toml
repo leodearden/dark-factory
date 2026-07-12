@@ -49,4 +49,8 @@ quote-style = "single"
 indent-style = "space"
 
 [tool.pytest.ini_options]
+markers = [
+    "smoke: live smoke tests requiring a real X11/tmux host (DISPLAY, wmctrl/xdotool/xprop/tmux, python3-tk); deselect: -m 'not smoke'",
+]
+addopts = "-m 'not smoke'"
 asyncio_mode = "auto"
