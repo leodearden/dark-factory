@@ -22,9 +22,22 @@ from __future__ import annotations
 
 import enum
 from dataclasses import dataclass
+from datetime import UTC, datetime, timedelta
+from typing import TYPE_CHECKING
 
 from shared.deploy_state import DeployPhase
 from shared.task_statuses import TaskStatus
+
+from orchestrator.landed_outbox import MergeProvenance
+
+if TYPE_CHECKING:
+    from collections.abc import Callable
+    from pathlib import Path
+
+    from escalation.queue import EscalationQueue
+
+    from orchestrator.git_ops import GitOps
+    from orchestrator.scheduler import Scheduler
 
 __all__ = [
     'BranchState',
@@ -33,6 +46,7 @@ __all__ = [
     'ClaimantSource',
     'EscalationRef',
     'RecoveryAction',
+    'TaskGroundTruth',
     'TruthReport',
     'classify_recovery',
 ]
@@ -113,6 +127,81 @@ class TruthReport:
     worktree_present: bool
     open_escalations: list[EscalationRef]
     deploy_phase: DeployPhase | None
+
+
+def _utc_now() -> datetime:
+    """Default ``now_fn`` — real wall-clock UTC time."""
+    return datetime.now(UTC)
+
+
+# Default staleness threshold for the W2 db claimant signal (TG-3 / step-10).
+# Callers that care about the exact TTL (e.g. harness wiring in θ2) pass
+# their own value explicitly; this default only matters for callers that
+# don't.
+_DEFAULT_HEARTBEAT_TTL = timedelta(minutes=10)
+
+
+class TaskGroundTruth:
+    """Composes one task's DB/git/liveness/escalation/deploy signals into a
+    single frozen :class:`TruthReport` (PRD §5.4).
+
+    Collaborators are injected so :meth:`derive_truth` stays unit-testable
+    with lightweight fakes — no reach-ins into any collaborator's private
+    state (TG-3: ``scheduler.is_actively_held``/``is_dispatched`` are the
+    only Scheduler liveness surface consulted). ``MergeProvenance`` is
+    deliberately NOT injected — its own contract is a process-global façade
+    (see ``landed_outbox.py``), consumed as such via ``MergeProvenance.lookup``.
+    """
+
+    def __init__(
+        self,
+        git_ops: GitOps,
+        scheduler: Scheduler,
+        escalation_queue: EscalationQueue | None,
+        worktree_resolver: Callable[[str], Path],
+        *,
+        now_fn: Callable[[], datetime] = _utc_now,
+        heartbeat_ttl: timedelta = _DEFAULT_HEARTBEAT_TTL,
+    ) -> None:
+        self.git_ops = git_ops
+        self.scheduler = scheduler
+        self.escalation_queue = escalation_queue
+        self.worktree_resolver = worktree_resolver
+        self.now_fn = now_fn
+        self.heartbeat_ttl = heartbeat_ttl
+
+    async def derive_truth(self, tid: str) -> TruthReport:
+        """Compose a fresh :class:`TruthReport` for *tid* (PRD §5.4).
+
+        TG-1: ``branch_state`` resolves journal-first — see
+        :meth:`_resolve_branch_state`. The remaining fields are populated
+        incrementally as θ1 proceeds (db_status/worktree_present/
+        open_escalations/deploy_phase; live_claimant); until then they carry
+        placeholder values that no meaningful shape maps onto in
+        ``_RECOVERY`` below.
+        """
+        branch_state = await self._resolve_branch_state(tid)
+        return TruthReport(
+            db_status='',
+            live_claimant=None,
+            branch_state=branch_state,
+            worktree_present=False,
+            open_escalations=[],
+            deploy_phase=None,
+        )
+
+    async def _resolve_branch_state(self, tid: str) -> BranchState:
+        """Resolve *tid*'s branch state (TG-1: journal-first).
+
+        ``MergeProvenance.lookup`` is consulted FIRST — a journal hit is
+        authoritative and returns without any git I/O at all. Git
+        archaeology only runs as a fallback on a journal miss.
+        """
+        row = MergeProvenance.lookup(tid)
+        if row is not None:
+            return BranchState(BranchStateKind.ON_MAIN, row.advanced_sha)
+        # Git-archaeology fallback (journal miss) — added in step-8.
+        return BranchState(BranchStateKind.GONE_NO_MARKER)
 
 
 # ---------------------------------------------------------------------------
