@@ -10,8 +10,8 @@ built and merged by one of the seven W5 dependencies below.
 Fake/instrumented boundaries only:
   - The LLM/agent turn itself (never invoked — every scenario drives a
     deterministic Python entry point directly).
-  - The Mem0/Qdrant network (AsyncMock services; an optional real-Qdrant
-    delta check in P4 self-skips via qdrant_skipif()).
+  - The Mem0/Qdrant network (AsyncMock services throughout; no live
+    Neo4j/Qdrant backend is exercised by this suite).
 
 Expected GREEN-on-arrival: all 7 dependencies (α/δ/ζ/η/ι/κ/λ =
 2219/2222/2224/2225/2227/2228/2229) are status=done and merged, and each
@@ -67,9 +67,10 @@ decisions for the full rationale):
 xdist-safety: every fixture below is keyed off a per-test ``tmp_path``
 with no shared global/module state, so the suite is safe under this
 project's ``-n auto --dist loadgroup`` addopts (pyproject.toml) without
-needing per-test ``xdist_group`` markers. No live Neo4j/Qdrant is
-required; an optional real-Qdrant delta check self-skips via
-qdrant_skipif() (see test_recon_dedup_premise.py's precedent).
+needing per-test ``xdist_group`` markers. No live Neo4j/Qdrant backend
+is required or exercised by this suite (see test_recon_dedup_premise.py
+for the repo's separate real-backend dedup-premise check, guarded by
+qdrant_skipif()).
 ``asyncio_mode = "strict"``: every async test carries an explicit
 ``@pytest.mark.asyncio`` and every async fixture uses
 ``@pytest_asyncio.fixture``.
