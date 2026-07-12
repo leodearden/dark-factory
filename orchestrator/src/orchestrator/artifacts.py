@@ -750,6 +750,14 @@ class TaskArtifacts:
             logger.warning('Corrupt verdicts/%s.json at %s: %s', role, path, exc)
             return None
 
+    def clear_verdict(self, role: str) -> None:
+        """Remove ``.task/verdicts/{role}.json`` if present (idempotent).
+
+        Called before spawning a role's agent so a stale verdict from a
+        prior invocation never masquerades as this run's output.
+        """
+        self._clear_path(f'verdicts/{role}.json')
+
     def lock_plan(self, session_id: str) -> bool:
         """Atomically acquire the plan lock.
 
