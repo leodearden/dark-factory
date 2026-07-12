@@ -15,7 +15,8 @@ from _recording_event_store import _RecordingEventStore
 
 from orchestrator.config import OrchestratorConfig
 from orchestrator.event_store import EventType
-from orchestrator.scheduler import _CONTINUE, Scheduler, TickContext
+from orchestrator.overrides import OverrideRow, OverrideStore
+from orchestrator.scheduler import _CONTINUE, Scheduler, TickContext, TickOutcome
 
 
 @pytest.fixture
@@ -199,3 +200,145 @@ class TestPolicySelectionPrepPhases:
         result = await scheduler._phase_starvation(ctx)
 
         assert result is _CONTINUE
+
+
+class TestSelectionPhases:
+    """Isolation tests for the Selection phases (empty_candidate_gate,
+    select_pins, select_scored) — each calls its ``_phase_*`` method
+    directly against a hand-built ``TickContext``, no full-tick
+    orchestration."""
+
+    @pytest.mark.asyncio
+    async def test_phase_empty_candidate_gate_returns_none(self, scheduler: Scheduler):
+        ctx = TickContext(tasks=[], status_map={}, tasks_by_id={}, candidates=[])
+
+        result = await scheduler._phase_empty_candidate_gate(ctx)
+
+        assert isinstance(result, TickOutcome)
+        assert result.assignment is None
+
+    @pytest.mark.asyncio
+    async def test_phase_empty_candidate_gate_continues_when_nonempty(
+        self, scheduler: Scheduler
+    ):
+        task = {'id': 'A', 'status': 'pending', 'dependencies': []}
+        ctx = TickContext(
+            tasks=[task], status_map={'A': 'pending'}, tasks_by_id={'A': task},
+            candidates=[task],
+        )
+
+        result = await scheduler._phase_empty_candidate_gate(ctx)
+
+        assert result is _CONTINUE
+
+    @pytest.mark.asyncio
+    async def test_phase_select_scored_dispatches_top(self, scheduler: Scheduler):
+        task = {
+            'id': 'A', 'status': 'pending', 'dependencies': [],
+            'metadata': {'files': ['mod_a/x.py']}, 'priority': 'medium',
+        }
+        ctx = TickContext(
+            tasks=[task],
+            status_map={'A': 'pending'},
+            tasks_by_id={'A': task},
+            candidates=[task],
+            candidate_signals={'A': None},
+            effective_priorities={'A': 'medium'},
+            transitive_counts={'A': 0},
+        )
+
+        result = await scheduler._phase_select_scored(ctx)
+
+        assert isinstance(result, TickOutcome)
+        assert result.assignment is not None
+        assert result.assignment.task_id == 'A'
+        assert scheduler.lock_table.is_held('A')
+
+    @pytest.mark.asyncio
+    async def test_phase_select_scored_lock_conflict_returns_none(
+        self, scheduler: Scheduler
+    ):
+        task = {
+            'id': 'A', 'status': 'pending', 'dependencies': [],
+            'metadata': {'files': ['mod_a/x.py']}, 'priority': 'medium',
+        }
+        # Pre-acquire A's module for a different owner so A's try_acquire fails.
+        modules = scheduler._get_modules(task)
+        scheduler.lock_table._held['other'] = set(modules)
+        ctx = TickContext(
+            tasks=[task],
+            status_map={'A': 'pending'},
+            tasks_by_id={'A': task},
+            candidates=[task],
+            candidate_signals={'A': None},
+            effective_priorities={'A': 'medium'},
+            transitive_counts={'A': 0},
+        )
+
+        result = await scheduler._phase_select_scored(ctx)
+
+        assert isinstance(result, TickOutcome)
+        assert result.assignment is None
+        assert scheduler._skip_count.get('A') == 1
+
+    @pytest.mark.asyncio
+    async def test_phase_select_pins_dispatches_pinned(self, tmp_path):
+        config = OrchestratorConfig(max_per_module=1)
+        store = OverrideStore(tmp_path / 'o.db')
+        scheduler = Scheduler(config, override_store=store)
+        scheduler.finish_startup()
+        scheduler._project_root = '/proj'
+
+        task = {
+            'id': 'A', 'status': 'pending', 'dependencies': [],
+            'metadata': {'files': ['mod_a/x.py']}, 'priority': 'medium',
+        }
+        pinned_row = OverrideRow(
+            boost_tier=None, pinned=True, pin_order=0, reserve_now=False,
+            ttl_until=None,
+        )
+        ctx = TickContext(
+            tasks=[task],
+            status_map={'A': 'pending'},
+            tasks_by_id={'A': task},
+            candidates=[task],
+            overrides={'A': pinned_row},
+            effective_priorities={'A': 'medium'},
+        )
+
+        result = await scheduler._phase_select_pins(ctx)
+
+        assert isinstance(result, TickOutcome)
+        assert result.assignment is not None
+        assert result.assignment.task_id == 'A'
+        assert scheduler.lock_table.is_held('A')
+
+    @pytest.mark.asyncio
+    async def test_phase_select_pins_continues_when_not_pinned(self, tmp_path):
+        config = OrchestratorConfig(max_per_module=1)
+        store = OverrideStore(tmp_path / 'o.db')
+        scheduler = Scheduler(config, override_store=store)
+        scheduler.finish_startup()
+        scheduler._project_root = '/proj'
+
+        task = {
+            'id': 'A', 'status': 'pending', 'dependencies': [],
+            'metadata': {'files': ['mod_a/x.py']}, 'priority': 'medium',
+        }
+        unpinned_row = OverrideRow(
+            boost_tier=None, pinned=False, pin_order=None, reserve_now=False,
+            ttl_until=None,
+        )
+        ctx = TickContext(
+            tasks=[task],
+            status_map={'A': 'pending'},
+            tasks_by_id={'A': task},
+            candidates=[task],
+            overrides={'A': unpinned_row},
+            effective_priorities={'A': 'medium'},
+        )
+
+        result = await scheduler._phase_select_pins(ctx)
+
+        assert result is _CONTINUE
+        assert not scheduler.lock_table.is_held('A')
