@@ -33,7 +33,12 @@ from shared.proc_group import terminate_process_group
 from orchestrator.agents.invoke import invoke_agent
 from orchestrator.agents.roles import STEWARD
 from orchestrator.event_store import EventStore, EventType
-from orchestrator.workflow_types import StewardResolved
+from orchestrator.workflow_types import (
+    StewardBudgetExhausted,
+    StewardInterrupted,
+    StewardReescalatedL1,
+    StewardResolved,
+)
 
 if TYPE_CHECKING:
     from collections.abc import Awaitable, Callable
@@ -362,25 +367,42 @@ class TaskSteward:
                 escalation, 'Steward lifetime budget exhausted '
                 f'(${self.metrics.total_cost_usd:.2f} / '
                 f'${self.config.steward_lifetime_budget:.2f})',
+                outcome=StewardBudgetExhausted(),
             )
             return
 
         # Guard: per-escalation retry limit
         retry_count = self._retry_counts.get(escalation.id, 0)
         if retry_count >= self.config.steward_max_attempts:
-            self._auto_escalate_to_human(
-                escalation,
-                f'Failed after {retry_count} attempt{"s" if retry_count != 1 else ""}: {escalation.summary}',
-            )
+            wip = await self._wip_probe() if self._wip_probe else False
+            outcome = StewardInterrupted(reason='attempt_cap', wip_commits_present=wip)
+            if wip:
+                # Task-2060 lesson: a wall-clock kill with partial WIP commits
+                # must resume the plan, not be triaged as "steward failed" via
+                # an L1. Skip _auto_escalate_to_human entirely — the workflow's
+                # _mark_blocked dismisses the still-pending L0 and re-pends.
+                self._publish_outcome(outcome)
+            else:
+                self._auto_escalate_to_human(
+                    escalation,
+                    f'Failed after {retry_count} attempt{"s" if retry_count != 1 else ""}: {escalation.summary}',
+                    outcome=outcome,
+                )
             return
 
         # Guard: per-escalation timeout-kill cap
         timeout_count = self._timeout_counts.get(escalation.id, 0)
         if timeout_count >= self.config.steward_max_timeouts_per_escalation:
-            self._auto_escalate_to_human(
-                escalation,
-                f'Invocation repeatedly timed out ({timeout_count}/{self.config.steward_max_timeouts_per_escalation})',
-            )
+            wip = await self._wip_probe() if self._wip_probe else False
+            outcome = StewardInterrupted(reason='timeout', wip_commits_present=wip)
+            if wip:
+                self._publish_outcome(outcome)
+            else:
+                self._auto_escalate_to_human(
+                    escalation,
+                    f'Invocation repeatedly timed out ({timeout_count}/{self.config.steward_max_timeouts_per_escalation})',
+                    outcome=outcome,
+                )
             return
 
         # Guard: per-escalation empty-output cap
@@ -724,8 +746,18 @@ class TaskSteward:
 
     def _auto_escalate_to_human(
         self, escalation: Escalation, reason: str,
+        outcome: StewardOutcome | None = None,
     ) -> None:
-        """Re-escalate to level-1 and dismiss the original level-0."""
+        """Re-escalate to level-1 and dismiss the original level-0.
+
+        Publishes *outcome* on the outcome channel (see :meth:`_publish_outcome`)
+        once the L1 has been submitted — the single choke point for every
+        give-up path that routes through here. Callers with a more specific
+        outcome (``StewardBudgetExhausted``, a wip-gated ``StewardInterrupted``)
+        pass it explicitly; every other caller (empty-output cap,
+        worktree-missing preflight, the generic run-loop give-up paths) omits
+        it and gets the default ``StewardReescalatedL1(esc_id=reesc.id)``.
+        """
         from escalation.models import Escalation as EscModel
 
         reesc = EscModel(
@@ -763,6 +795,9 @@ class TaskSteward:
         logger.warning(
             f'Steward for task {self.task_id}: re-escalated {escalation.id} '
             f'to level 1: {reason}'
+        )
+        self._publish_outcome(
+            outcome if outcome is not None else StewardReescalatedL1(esc_id=reesc.id),
         )
 
     # ------------------------------------------------------------------
