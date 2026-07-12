@@ -211,6 +211,46 @@ async def enumerate_graph_entity_nodes(
     return [{'uuid': row[0], 'name': row[1]} for row in rows]
 
 
+async def enumerate_graph_episodic_nodes(
+    graphiti: Any,
+    key: str,
+    *,
+    limit: int = 1000,
+) -> list[dict]:
+    """Read-only enumeration of every :Episodic node in the *key* FalkorDB graph.
+
+    Mirrors ``enumerate_graph_entity_nodes``, scoped to :Episodic instead of
+    :Entity. Every sibling-resident Episodic node must be discovered here so
+    ``merge_graph_family`` can relocate it (``create_moved_episode``) into
+    the canonical graph BEFORE Phase B recreates its MENTIONS links --
+    otherwise the episode stays behind in the sibling and every MENTIONS
+    link onto a moved Entity is silently dropped (Phase B's episode-present
+    MATCH finds nothing).
+
+    Single-page fetch: this issues exactly ONE ``LIMIT $limit`` query and
+    never follows up with a second page, so a graph with more than *limit*
+    Episodic nodes is permanently reported UNRESOLVED at the given --limit --
+    the same no-silent-caps convention as ``enumerate_graph_entity_nodes``.
+    Callers must pass a *limit* larger than the true Episodic-node count of
+    every graph they intend to migrate in this run.
+    """
+    graph = graphiti._graph_for(key)
+    result = await graph.ro_query(
+        'MATCH (n:Episodic) RETURN n.uuid LIMIT $limit',
+        {'limit': limit},
+    )
+    rows = result.result_set or []
+    if len(rows) >= limit:
+        logger.warning(
+            "consolidate_namespace_families: enumerated %d Episodic node(s) in "
+            "graph '%s', which hit limit=%d -- enumeration may be incomplete. "
+            "Re-run with a higher --limit value to ensure the full graph is "
+            "covered.",
+            len(rows), key, limit,
+        )
+    return [{'uuid': row[0]} for row in rows]
+
+
 async def count_graph_nodes(graphiti: Any, key: str) -> int:
     """Read-only total node count (every label) for the *key* FalkorDB graph.
 
