@@ -10,6 +10,7 @@ from orchestrator.mcp.verdict_tools import (
     _submit_merge_disposition,
     _submit_review_verdict,
     _submit_triage,
+    create_server,
 )
 
 
@@ -158,3 +159,45 @@ class TestSubmitMergeDisposition:
         assert envelope is not None
         assert envelope['role'] == 'merger'
         assert envelope['verdict'] == {'blocked': True, 'reason': 'conflict'}
+
+
+# ---------------------------------------------------------------------------
+# create_server tool-selection + async MCP tool.run boundary tests
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestCreateServer:
+    """``create_server(artifacts, role)`` registers EXACTLY ONE tool,
+    selected by role: judge/triage/merger are singleton roles; any other
+    role string is treated as a reviewer-panel member and gets
+    ``submit_review_verdict``.
+    """
+
+    @pytest.mark.parametrize(
+        ('role', 'expected_tool'),
+        [
+            ('judge', 'submit_completion_verdict'),
+            ('triage', 'submit_triage'),
+            ('merger', 'submit_merge_disposition'),
+            ('test_analyst', 'submit_review_verdict'),
+        ],
+    )
+    async def test_registers_exactly_one_tool_for_role(
+        self, artifacts, role, expected_tool
+    ):
+        server = create_server(artifacts, role)
+        tools = await server.list_tools()
+        assert sorted(tool.name for tool in tools) == [expected_tool]
+
+    async def test_merger_tool_run_writes_envelope_via_wrapper(self, artifacts):
+        server = create_server(artifacts, 'merger')
+        tool = await server.get_tool('submit_merge_disposition')
+        assert tool is not None
+
+        await tool.run({'blocked': True, 'reason': 'x'})
+
+        envelope = artifacts.read_verdict('merger')
+        assert envelope is not None
+        assert envelope['role'] == 'merger'
+        assert envelope['verdict'] == {'blocked': True, 'reason': 'x'}
