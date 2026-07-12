@@ -83,6 +83,14 @@ def _make_point(
     return point
 
 
+def _make_count_result(count: int) -> MagicMock:
+    """Qdrant CountResult stand-in exposing .count -- the shape returned by
+    AsyncQdrantClient.count(...)."""
+    result = MagicMock()
+    result.count = count
+    return result
+
+
 # ===========================================================================
 # Tests: reviewable-config constants
 # ===========================================================================
@@ -113,6 +121,7 @@ class TestCollectionMerges:
         assert _mod.COLLECTION_MERGES['fused_dark-factory'] == 'fused_dark_factory'
         assert _mod.COLLECTION_MERGES['reify_reify'] == 'fused_reify'
         assert _mod.COLLECTION_MERGES['autopilot_video_autopilot_video'] == 'fused_autopilot_video'
+        assert _mod.COLLECTION_MERGES['fused_pump-web-ui'] == 'fused_pump_web_ui'
 
     def test_does_not_auto_merge_ambiguous_collections(self):
         """PRD Open Q2 defers reify_ (empty project id) and fused_fused_memory
@@ -133,6 +142,27 @@ class TestJunkKeys:
         assert expected <= set(_mod.JUNK_KEYS)
 
 
+class TestEmptyCollectionCleanup:
+    """Tests for the module constant EMPTY_COLLECTION_CLEANUP."""
+
+    def test_contains_exactly_the_seven_empty_strays(self):
+        """EMPTY_COLLECTION_CLEANUP contains exactly the 7 known-empty
+        divergent/junk Qdrant collections."""
+        expected = {
+            'fused_knowlive', 'fused_know-live', 'fused_autopilot-video',
+            'fused_my-project', 'fused_1098', 'fused_default',
+            'fused_-home-leo-src-dark-factory',
+        }
+        assert set(_mod.EMPTY_COLLECTION_CLEANUP) == expected
+
+    def test_does_not_include_ambiguous_collections(self):
+        """PRD Open Q2 defers reify_ (empty project id) and
+        fused_fused_memory to ι human review -- neither appears here, same
+        as COLLECTION_MERGES."""
+        assert 'reify_' not in _mod.EMPTY_COLLECTION_CLEANUP
+        assert 'fused_fused_memory' not in _mod.EMPTY_COLLECTION_CLEANUP
+
+
 # ===========================================================================
 # Tests: build_consolidation_report
 # ===========================================================================
@@ -141,17 +171,18 @@ class TestBuildConsolidationReport:
     """Tests for the pure function build_consolidation_report(...)."""
 
     def test_report_shape(self):
-        """Returned dict has exactly the four top-level manifest keys."""
-        report = _mod.build_consolidation_report([], [], [], dry_run=True)
+        """Returned dict has exactly the five top-level manifest keys."""
+        report = _mod.build_consolidation_report([], [], [], [], dry_run=True)
 
         assert set(report.keys()) == {
-            'dry_run', 'graph_family_merges', 'collection_merges', 'junk_key_deletions',
+            'dry_run', 'graph_family_merges', 'collection_merges',
+            'junk_key_deletions', 'empty_collection_deletions',
         }
 
     def test_dry_run_passed_through_verbatim(self):
         """dry_run is passed through verbatim, not hardcoded, in either direction."""
-        report_true = _mod.build_consolidation_report([], [], [], dry_run=True)
-        report_false = _mod.build_consolidation_report([], [], [], dry_run=False)
+        report_true = _mod.build_consolidation_report([], [], [], [], dry_run=True)
+        report_false = _mod.build_consolidation_report([], [], [], [], dry_run=False)
 
         assert report_true['dry_run'] is True
         assert report_false['dry_run'] is False
@@ -161,22 +192,27 @@ class TestBuildConsolidationReport:
         graph_items = [{'sibling': 'know-live', 'canonical': 'know_live', 'disposition': 'MERGE'}]
         collection_items = [{'source': 'reify_reify', 'target': 'fused_reify', 'disposition': 'MERGE'}]
         junk_items = [{'key': 'my-project', 'node_count': 0, 'disposition': 'DELETE'}]
+        empty_collection_items = [
+            {'collection': 'fused_knowlive', 'point_count': 0, 'disposition': 'DELETE'},
+        ]
 
         report = _mod.build_consolidation_report(
-            graph_items, collection_items, junk_items, dry_run=True,
+            graph_items, collection_items, junk_items, empty_collection_items, dry_run=True,
         )
 
         assert report['graph_family_merges'] == graph_items
         assert report['collection_merges'] == collection_items
         assert report['junk_key_deletions'] == junk_items
+        assert report['empty_collection_deletions'] == empty_collection_items
 
     def test_empty_inputs_produce_empty_lists(self):
-        """Empty inputs for all three sections produce empty lists, with dry_run preserved."""
-        report = _mod.build_consolidation_report([], [], [], dry_run=False)
+        """Empty inputs for all four sections produce empty lists, with dry_run preserved."""
+        report = _mod.build_consolidation_report([], [], [], [], dry_run=False)
 
         assert report['graph_family_merges'] == []
         assert report['collection_merges'] == []
         assert report['junk_key_deletions'] == []
+        assert report['empty_collection_deletions'] == []
         assert report['dry_run'] is False
 
     def test_no_io_pure_function(self):
@@ -185,9 +221,16 @@ class TestBuildConsolidationReport:
         graph_items = [{'sibling': 'knowlive', 'canonical': 'know_live', 'disposition': 'MERGE'}]
         collection_items = [{'source': 'fused_dark-factory', 'target': 'fused_dark_factory'}]
         junk_items = [{'key': 'default', 'node_count': 0, 'disposition': 'DELETE'}]
+        empty_collection_items = [
+            {'collection': 'fused_default', 'point_count': 0, 'disposition': 'DELETE'},
+        ]
 
-        r1 = _mod.build_consolidation_report(graph_items, collection_items, junk_items, dry_run=True)
-        r2 = _mod.build_consolidation_report(graph_items, collection_items, junk_items, dry_run=True)
+        r1 = _mod.build_consolidation_report(
+            graph_items, collection_items, junk_items, empty_collection_items, dry_run=True,
+        )
+        r2 = _mod.build_consolidation_report(
+            graph_items, collection_items, junk_items, empty_collection_items, dry_run=True,
+        )
 
         assert r1 == r2
 
@@ -201,7 +244,7 @@ class TestHasUnresolved:
 
     def test_all_clean_empty_sections_returns_false(self):
         """An all-clean report with empty sections returns False."""
-        report = _mod.build_consolidation_report([], [], [], dry_run=True)
+        report = _mod.build_consolidation_report([], [], [], [], dry_run=True)
 
         assert _mod.has_unresolved(report) is False
 
@@ -211,8 +254,11 @@ class TestHasUnresolved:
         graph_items = [{'sibling': 'know-live', 'canonical': 'know_live', 'disposition': 'MERGE'}]
         collection_items = [{'source': 'reify_reify', 'target': 'fused_reify', 'disposition': 'MERGE'}]
         junk_items = [{'key': 'my-project', 'node_count': 0, 'disposition': 'DELETE'}]
+        empty_collection_items = [
+            {'collection': 'fused_knowlive', 'point_count': 0, 'disposition': 'DELETE'},
+        ]
         report = _mod.build_consolidation_report(
-            graph_items, collection_items, junk_items, dry_run=True,
+            graph_items, collection_items, junk_items, empty_collection_items, dry_run=True,
         )
 
         assert _mod.has_unresolved(report) is False
@@ -220,7 +266,7 @@ class TestHasUnresolved:
     def test_unresolved_in_graph_family_merges_returns_true(self):
         """A single UNRESOLVED disposition in graph_family_merges returns True."""
         graph_items = [{'sibling': 'know-live', 'canonical': 'know_live', 'disposition': 'UNRESOLVED'}]
-        report = _mod.build_consolidation_report(graph_items, [], [], dry_run=True)
+        report = _mod.build_consolidation_report(graph_items, [], [], [], dry_run=True)
 
         assert _mod.has_unresolved(report) is True
 
@@ -229,14 +275,23 @@ class TestHasUnresolved:
         collection_items = [
             {'source': 'fused_dark-factory', 'target': 'fused_dark_factory', 'disposition': 'UNRESOLVED'},
         ]
-        report = _mod.build_consolidation_report([], collection_items, [], dry_run=True)
+        report = _mod.build_consolidation_report([], collection_items, [], [], dry_run=True)
 
         assert _mod.has_unresolved(report) is True
 
     def test_unresolved_in_junk_key_deletions_returns_true(self):
         """A single UNRESOLVED disposition in junk_key_deletions returns True."""
         junk_items = [{'key': 'my-project', 'node_count': 3, 'disposition': 'UNRESOLVED'}]
-        report = _mod.build_consolidation_report([], [], junk_items, dry_run=True)
+        report = _mod.build_consolidation_report([], [], junk_items, [], dry_run=True)
+
+        assert _mod.has_unresolved(report) is True
+
+    def test_unresolved_in_empty_collection_deletions_returns_true(self):
+        """A single UNRESOLVED disposition in empty_collection_deletions returns True."""
+        empty_collection_items = [
+            {'collection': 'fused_knowlive', 'point_count': 3, 'disposition': 'UNRESOLVED'},
+        ]
+        report = _mod.build_consolidation_report([], [], [], empty_collection_items, dry_run=True)
 
         assert _mod.has_unresolved(report) is True
 
@@ -254,8 +309,11 @@ class TestHasUnresolved:
             {'key': 'default', 'node_count': 0, 'disposition': 'DELETE'},
             {'key': 'my-project', 'node_count': 3, 'disposition': 'UNRESOLVED'},
         ]
+        empty_collection_items = [
+            {'collection': 'fused_knowlive', 'point_count': 0, 'disposition': 'DELETE'},
+        ]
         report = _mod.build_consolidation_report(
-            graph_items, collection_items, junk_items, dry_run=False,
+            graph_items, collection_items, junk_items, empty_collection_items, dry_run=False,
         )
 
         assert _mod.has_unresolved(report) is True
@@ -991,6 +1049,84 @@ class TestDeleteJunkKey:
 
 
 # ===========================================================================
+# Tests: count_collection_points
+# ===========================================================================
+
+class TestCountCollectionPoints:
+    """Tests for async count_collection_points(qdrant_client, collection)."""
+
+    @pytest.mark.asyncio
+    async def test_calls_count_with_collection_name(self):
+        """qdrant_client.count is called with collection_name=collection."""
+        client = AsyncMock()
+        client.count = AsyncMock(return_value=_make_count_result(0))
+
+        await _mod.count_collection_points(client, 'fused_knowlive')
+
+        client.count.assert_called_once_with(collection_name='fused_knowlive')
+
+    @pytest.mark.asyncio
+    async def test_returns_the_qdrant_count(self):
+        """Returns the .count value from the Qdrant CountResult."""
+        client = AsyncMock()
+        client.count = AsyncMock(return_value=_make_count_result(5))
+
+        result = await _mod.count_collection_points(client, 'fused_knowlive')
+
+        assert result == 5
+
+    @pytest.mark.asyncio
+    async def test_returns_zero_for_empty_collection(self):
+        """A collection with no points returns 0."""
+        client = AsyncMock()
+        client.count = AsyncMock(return_value=_make_count_result(0))
+
+        result = await _mod.count_collection_points(client, 'fused_default')
+
+        assert result == 0
+
+
+# ===========================================================================
+# Tests: delete_empty_collection
+# ===========================================================================
+
+class TestDeleteEmptyCollection:
+    """Tests for async delete_empty_collection(qdrant_client, collection, point_count)."""
+
+    @pytest.mark.asyncio
+    async def test_zero_count_deletes_and_returns_delete_disposition(self):
+        """point_count==0 -> delete_collection() is called, disposition DELETE."""
+        client = _make_qdrant_mock()
+
+        disposition = await _mod.delete_empty_collection(client, 'fused_knowlive', 0)
+
+        client.delete_collection.assert_called_once_with('fused_knowlive')
+        assert disposition == 'DELETE'
+
+    @pytest.mark.asyncio
+    async def test_nonzero_count_does_not_delete_and_returns_unresolved(self):
+        """point_count>0 -> delete_collection() is NEVER called, disposition
+        UNRESOLVED (deletion blocked -- no data loss)."""
+        client = _make_qdrant_mock()
+
+        disposition = await _mod.delete_empty_collection(client, 'fused_knowlive', 5)
+
+        client.delete_collection.assert_not_called()
+        assert disposition == 'UNRESOLVED'
+
+    @pytest.mark.asyncio
+    async def test_raising_delete_returns_unresolved(self):
+        """A raising delete_collection() is caught and reported UNRESOLVED
+        rather than propagating -- best-effort, mirrors delete_junk_key."""
+        client = _make_qdrant_mock()
+        client.delete_collection = AsyncMock(side_effect=RuntimeError('boom'))
+
+        disposition = await _mod.delete_empty_collection(client, 'fused_knowlive', 0)
+
+        assert disposition == 'UNRESOLVED'
+
+
+# ===========================================================================
 # Helpers: run() fixtures
 #
 # run() queries the SAME graph key for THREE distinct purposes -- Entity
@@ -1064,16 +1200,26 @@ def _make_run_graphiti_mock(
     return graphiti
 
 
-def _make_run_qdrant_mock(points_by_collection: dict[str, list] | None = None) -> AsyncMock:
-    """AsyncMock qdrant client whose scroll() dispatches on collection_name;
-    unlisted collections scroll as empty."""
+def _make_run_qdrant_mock(
+    points_by_collection: dict[str, list] | None = None,
+    counts_by_collection: dict[str, int] | None = None,
+) -> AsyncMock:
+    """AsyncMock qdrant client whose scroll()/count() dispatch on
+    collection_name; unlisted collections scroll as empty and count as 0 --
+    the same 'clean by default' convention as _make_run_graphiti_mock's
+    per-key graphs."""
     points_by_collection = points_by_collection or {}
+    counts_by_collection = counts_by_collection or {}
 
     async def _scroll(*, collection_name: str, **_kwargs):
         return (points_by_collection.get(collection_name, []), None)
 
+    async def _count(*, collection_name: str, **_kwargs):
+        return _make_count_result(counts_by_collection.get(collection_name, 0))
+
     client = AsyncMock()
     client.scroll = AsyncMock(side_effect=_scroll)
+    client.count = AsyncMock(side_effect=_count)
     client.upsert = AsyncMock(return_value=None)
     client.delete_collection = AsyncMock(return_value=None)
     return client
@@ -1271,6 +1417,28 @@ class TestRunDryRun:
 
         graph_by_sibling = {item['sibling']: item for item in report['graph_family_merges']}
         assert graph_by_sibling['know-live']['disposition'] == 'UNRESOLVED'
+
+    @pytest.mark.asyncio
+    async def test_dry_run_empty_collection_deletions_populated_without_deleting(self):
+        """empty_collection_deletions previews DELETE for a count-0 stray
+        and UNRESOLVED for a non-empty one, WITHOUT calling
+        delete_collection -- dry-run previews, never deletes."""
+        graphiti = _make_run_graphiti_mock()
+        qdrant_client = _make_run_qdrant_mock(
+            counts_by_collection={'fused_knowlive': 0, 'fused_my-project': 4},
+        )
+        memory_service = _make_run_memory_service(graphiti, qdrant_client)
+
+        report = await _mod.run(_run_args(apply=False), memory_service, limit=1000)
+
+        empty_by_collection = {
+            item['collection']: item for item in report['empty_collection_deletions']
+        }
+        assert empty_by_collection['fused_knowlive']['point_count'] == 0
+        assert empty_by_collection['fused_knowlive']['disposition'] == 'DELETE'
+        assert empty_by_collection['fused_my-project']['point_count'] == 4
+        assert empty_by_collection['fused_my-project']['disposition'] == 'UNRESOLVED'
+        qdrant_client.delete_collection.assert_not_called()
 
 
 # ===========================================================================
@@ -1573,3 +1741,32 @@ class TestRunApply:
 
         collection_by_source = {item['source']: item for item in report['collection_merges']}
         assert collection_by_source['fused_dark-factory']['disposition'] == 'UNRESOLVED'
+
+    @pytest.mark.asyncio
+    async def test_apply_deletes_zero_count_empty_collection_and_leaves_nonzero_unresolved(self, monkeypatch):
+        """delete_empty_collection deletes the zero-count stray
+        (fused_knowlive, disposition DELETE) but leaves the non-empty one
+        (fused_my-project, disposition UNRESOLVED) untouched --
+        delete_collection is never called on it."""
+        _patch_merge_primitives(monkeypatch)
+        graphiti = _make_run_graphiti_mock()
+        qdrant_client = _make_run_qdrant_mock(
+            counts_by_collection={'fused_knowlive': 0, 'fused_my-project': 4},
+        )
+        memory_service = _make_run_memory_service(graphiti, qdrant_client)
+
+        report = await _mod.run(_run_args(apply=True), memory_service, limit=1000)
+
+        qdrant_client.delete_collection.assert_any_call('fused_knowlive')
+        no_delete_calls = [
+            c for c in qdrant_client.delete_collection.call_args_list
+            if c.args and c.args[0] == 'fused_my-project'
+        ]
+        assert no_delete_calls == []
+
+        empty_by_collection = {
+            item['collection']: item for item in report['empty_collection_deletions']
+        }
+        assert empty_by_collection['fused_knowlive']['disposition'] == 'DELETE'
+        assert empty_by_collection['fused_my-project']['disposition'] == 'UNRESOLVED'
+        assert _mod.has_unresolved(report) is True
