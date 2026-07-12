@@ -230,7 +230,8 @@ class RestartPlan:
         1. wants_blocking and not own -> RP-1 fail-closed REFUSE (implemented
            below, step-8).
         2. wants_blocking and not self_target -> RP-2 cross-unit BLOCKING +
-           RP-5 verify (step-9/10/11/12; not yet implemented here).
+           RP-5 verify (happy path implemented below, step-10; rc!=0/
+           not-fresh escalation branches are step-12 stubs for now).
         3. transient_unit set -> DETACHED systemd-run (RP-3/RP-4; implemented
            below, step-4).
         4. else -> DETACHED leaf plain-spawn (step-15/16; not yet implemented
@@ -274,14 +275,66 @@ class RestartPlan:
             )
 
         if wants_blocking and not self_target:
-            # RP-2 cross-unit blocking + RP-5 verify — implemented in step-10/12.
-            raise NotImplementedError
+            return await self._execute_cross_unit_blocking(runner, inspector)
 
         if self.transient_unit:
             return await self._execute_detached_systemd_run(runner)
 
         # Leaf plain-spawn path — implemented in step-16.
         raise NotImplementedError
+
+    async def _execute_cross_unit_blocking(self, runner, inspector) -> RestartOutcome:
+        """RP-2/RP-5: run a BLOCKING restart against a provably different unit.
+
+        Unlike the detached systemd-run path, this runs the restart script to
+        completion in-process (no ``/bin/sh`` wrapper, no transient unit) and
+        then re-inspects the target unit for a fresh MainPID and a
+        strictly-later monotonic timestamp than the caller-persisted
+        ``self.verify.baseline_active_enter_monotonic`` (RP-5 — the 2074
+        caveat: the baseline is a FIELD on ``FreshPidVerify``, never a local
+        re-inspect captured inside this call). This method is only reachable
+        when ``self_target`` is False, i.e. ``own_unit`` is known AND
+        provably differs from ``target_unit`` (RP-1 already refused the
+        unknown-own case in ``execute()`` above) — so a synchronous restart
+        here can never SIGKILL the caller.
+
+        Models deterministic_runner.py:1546-1652's blocking-deploy-then-verify
+        shape: run to completion, re-inspect, then
+        ``fresh = isinstance(pid, int) and pid > 0 and new_monotonic > baseline_monotonic``
+        (deterministic_runner.py:1624-1630).
+
+        rc != 0 and "not fresh" are handled in step-12 (currently stubs —
+        this method only implements the happy path, step-10's scope).
+        """
+        assert self.verify is not None, 'router only calls this when wants_blocking'
+
+        proc = await runner(
+            str(self.script), *self.args,
+            cwd=str(self.cwd),
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.STDOUT,
+        )
+        await proc.communicate()
+        rc = proc.returncode or 0
+        if rc != 0:
+            # RESTART_FAILED + escalation — implemented in step-12.
+            raise NotImplementedError
+
+        new_state = await inspector(
+            self.target_unit, timeout_secs=self.verify.inspect_timeout_secs,
+        )
+        pid = new_state.get('MainPID', 0)
+        new_monotonic = new_state.get('ActiveEnterTimestampMonotonic', 0)
+        fresh = (
+            isinstance(pid, int)
+            and pid > 0
+            and new_monotonic > self.verify.baseline_active_enter_monotonic
+        )
+        if not fresh:
+            # VERIFY_FAILED + escalation — implemented in step-12.
+            raise NotImplementedError
+
+        return RestartOutcome(disposition=RestartDisposition.DEPLOYED_AND_VERIFIED)
 
     async def _execute_detached_systemd_run(self, runner) -> RestartOutcome:
         """RP-3/RP-4: register a deferred ``systemd-run --user`` transient unit.
