@@ -28,6 +28,9 @@ class TestInit:
         assert (artifacts.root / 'metadata.json').exists()
         assert (artifacts.root / 'reviews').is_dir()
 
+    def test_creates_verdicts_directory(self, artifacts: TaskArtifacts):
+        assert (artifacts.root / 'verdicts').is_dir()
+
     def test_init_writes_no_gitignore(self, artifacts: TaskArtifacts):
         """W11-ι: init() no longer writes a .gitignore — .task-meta/ lives
         outside the worktree, so there's nothing for git to ignore.
