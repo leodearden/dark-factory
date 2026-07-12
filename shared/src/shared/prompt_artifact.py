@@ -19,9 +19,16 @@ strict ``__all__`` union assertion untouched.
 
 from __future__ import annotations
 
+from dataclasses import dataclass
+
 from pydantic import BaseModel, ConfigDict
 
-__all__ = ['ArtifactProvenance']
+__all__ = ['ArtifactProvenance', 'compose_prompt', 'PromptSpec']
+
+# Fixed separator between the in-code CONTRACT and the (baseline or pinned)
+# heuristics block. Part of compose_prompt's contract: changing this value
+# changes every composed prompt's text, so it lives in exactly one place.
+_SEPARATOR = '\n\n---\n\n'
 
 
 class ArtifactProvenance(BaseModel):
@@ -46,3 +53,35 @@ class ArtifactProvenance(BaseModel):
     git_sha: str
     date: str
     harness_version: str
+
+
+def compose_prompt(contract: str, heuristics: str) -> str:
+    """The single composition chokepoint for every resolved prompt.
+
+    Emits *contract* verbatim, then a fixed separator, then *heuristics*.
+    Both the pinned-artifact path and the in-code-fallback path route through
+    this one function, so the contract prefix of the returned text is always
+    byte-identical to *contract* regardless of what *heuristics* contains
+    (D-3: the CONTRACT is un-editable by construction, not by a fallible
+    post-edit validator).
+    """
+    return f'{contract}{_SEPARATOR}{heuristics}'
+
+
+@dataclass(frozen=True)
+class PromptSpec:
+    """The in-code definition of a prompt: its id, CONTRACT, and baseline heuristics.
+
+    ``in_code_constant`` is the text every caller treats as "the prompt when
+    nothing is pinned" — it is produced by the exact same :func:`compose_prompt`
+    rule used for a pinned artifact, so the baseline and a pinned candidate are
+    always compared like-for-like (no composition drift).
+    """
+
+    prompt_id: str
+    contract: str
+    baseline_heuristics: str
+
+    @property
+    def in_code_constant(self) -> str:
+        return compose_prompt(self.contract, self.baseline_heuristics)
