@@ -14,6 +14,7 @@ truth for pass/fail.
 
 from __future__ import annotations
 
+import asyncio
 from pathlib import Path
 from typing import cast
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -2089,3 +2090,93 @@ class TestWorktreeConflictErrorRouting:
         assert 'foo.py' in reason, (
             f'reason should name the conflicted path for operator triage, got {reason!r}'
         )
+
+
+# ---------------------------------------------------------------------------
+# StewardOutcome channel wiring (task 2248 / W9-delta, step-7/8)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestWorktreeHasWipCommits:
+    """_worktree_has_wip_commits wraps git_ops.worktree_has_unsaved_work — the
+    single wip-derivation primitive shared with the steward's own
+    ``_wip_probe`` (injected by ``_ensure_steward_started``), so wip is
+    derived once rather than guessed independently on each side."""
+
+    @pytest.mark.parametrize('unsaved', [True, False])
+    async def test_delegates_to_git_ops_and_returns_passthrough(
+        self, tmp_path: Path, unsaved: bool,
+    ):
+        wf = _make_workflow(tmp_path=tmp_path)
+        wf.git_ops.worktree_has_unsaved_work = AsyncMock(return_value=unsaved)
+
+        result = await wf._worktree_has_wip_commits()
+
+        wf.git_ops.worktree_has_unsaved_work.assert_awaited_once_with(
+            wf.worktree, wf.task_id,
+        )
+        assert result is unsaved
+
+    async def test_returns_false_when_worktree_is_none(self, tmp_path: Path):
+        wf = _make_workflow(tmp_path=tmp_path)
+        wf.worktree = None
+        wf.git_ops.worktree_has_unsaved_work = AsyncMock(return_value=True)
+
+        result = await wf._worktree_has_wip_commits()
+
+        assert result is False
+        wf.git_ops.worktree_has_unsaved_work.assert_not_called()
+
+    async def test_returns_false_when_git_ops_is_none(self, tmp_path: Path):
+        wf = _make_workflow(tmp_path=tmp_path)
+        wf.git_ops = None
+
+        result = await wf._worktree_has_wip_commits()
+
+        assert result is False
+
+
+class _RecordingFakeSteward:
+    """Local fake steward (kept in this module, not ``_workflow_helpers.py``
+    — that shared file's ``_make_resolving_steward`` / ``_make_status_setting_steward``
+    extension is step-8's own concern): records ``set_outcome_channel`` /
+    ``set_wip_probe`` calls so the wiring can be asserted directly.
+    """
+
+    instances: list['_RecordingFakeSteward'] = []
+
+    def __init__(self, wt_path, cfg_dir):  # noqa: ARG002
+        self.outcome_channel = None
+        self.wip_probe = None
+        type(self).instances.append(self)
+
+    def set_outcome_channel(self, channel) -> None:
+        self.outcome_channel = channel
+
+    def set_wip_probe(self, probe) -> None:
+        self.wip_probe = probe
+
+    async def start(self) -> None:
+        pass
+
+
+@pytest.mark.asyncio
+class TestEnsureStewardStartedWiresOutcomeChannel:
+    """_ensure_steward_started must create a per-task asyncio.Queue and
+    register it — plus the workflow's own wip probe — on the newly-built
+    steward (SO-1's in-process channel, replacing the escalation-queue
+    forensic re-read)."""
+
+    async def test_wires_channel_and_wip_probe_on_new_steward(self, tmp_path: Path):
+        _RecordingFakeSteward.instances = []
+        wf = _make_workflow(tmp_path=tmp_path)
+        wf._steward_factory = _RecordingFakeSteward
+
+        await wf._ensure_steward_started()
+
+        assert len(_RecordingFakeSteward.instances) == 1
+        fake = _RecordingFakeSteward.instances[0]
+        assert isinstance(wf._steward_outcome_channel, asyncio.Queue)
+        assert fake.outcome_channel is wf._steward_outcome_channel
+        assert fake.wip_probe == wf._worktree_has_wip_commits
