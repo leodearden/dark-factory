@@ -88,6 +88,7 @@ import pytest_asyncio
 from fused_memory.middleware.task_interceptor import TaskInterceptor
 from fused_memory.models.reconciliation import StageId, StageReport
 from fused_memory.reconciliation.event_buffer import EventBuffer
+from fused_memory.reconciliation.flag_dedup import filter_suppressed, write_suppression_record
 from fused_memory.reconciliation.recon_ledger import ReconLedgerRecord, ReconLedgerStore
 from fused_memory.services.write_journal import WriteJournal
 
@@ -513,3 +514,39 @@ class TestSuppressionRoundTrip:
             "dropped, keeping only the other task's flag"
         )
         recon_service.search.assert_not_called()
+
+    # -- driving harness (task 2232 step-4) ---------------------------------
+
+    def _candidate_flags(self) -> list[dict]:
+        """Three flags shared by both scenarios: the (task_id,
+        suppressed-flag-type) pair under test, a differently-typed flag for
+        the same task, and the same flag_type for a different task."""
+        return [
+            {'task_id': self._TASK_ID, 'flag_type': self._SUPPRESSED_FLAG_TYPE},
+            {'task_id': self._TASK_ID, 'flag_type': self._SURVIVING_FLAG_TYPE},
+            {'task_id': self._OTHER_TASK_ID, 'flag_type': self._SUPPRESSED_FLAG_TYPE},
+        ]
+
+    async def _drive_scoped_round_trip(self, recon_service) -> list[dict]:
+        """Producer: write a SCOPED suppression for (_TASK_ID,
+        _SUPPRESSED_FLAG_TYPE) via the real write_suppression_record.
+        Consumer: filter_suppressed over the three candidate flags."""
+        await write_suppression_record(
+            recon_service,
+            project_id=self._PROJECT,
+            task_id=self._TASK_ID,
+            flag_types=[self._SUPPRESSED_FLAG_TYPE],
+        )
+        return await filter_suppressed(recon_service, self._PROJECT, self._candidate_flags())
+
+    async def _drive_blanket_round_trip(self, recon_service) -> list[dict]:
+        """Producer: write a BLANKET suppression (flag_types=None) for
+        _TASK_ID via the real write_suppression_record. Consumer:
+        filter_suppressed over the three candidate flags."""
+        await write_suppression_record(
+            recon_service,
+            project_id=self._PROJECT,
+            task_id=self._TASK_ID,
+            flag_types=None,
+        )
+        return await filter_suppressed(recon_service, self._PROJECT, self._candidate_flags())
