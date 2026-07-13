@@ -207,6 +207,21 @@ class WeightEditorScreen(ModalScreen[None]):
         self._submit()
 
     def _submit(self) -> None:
+        """Read every Input, merge, dismiss, then hand off to *on_submit*.
+
+        A category or project Input holding an unparseable/empty/non-finite
+        value is fail-soft dropped by merge_weight_edits (base's prior value
+        is kept, never raised -- see its docstring). That drop is currently
+        SILENT: dismiss() (below) tears this screen down immediately after,
+        before the operator could see any re-seeded/restyled Input, so
+        visible feedback for a rejected edit would need to land somewhere
+        that outlives the modal (e.g. an app-level notification) rather
+        than on the Input itself -- a new Textual pattern with no existing
+        precedent in this codebase. Reviewed and intentionally deferred as
+        a UX nicety, not a correctness gap: see
+        test_submit_keeps_prior_value_for_a_rejected_category_edit in
+        test_app.py for the pinned current behavior.
+        """
         category_edits = {
             name: self.query_one(f'#cat-{index}', Input).value
             for index, name in enumerate(self._priorities.category_weights)

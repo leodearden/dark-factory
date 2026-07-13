@@ -1338,6 +1338,92 @@ class TestWeightEditor:
         assert received[0].category_weights == expected_category_weights
         assert received[0].project_weights == {}
 
+    @pytest.mark.timeout(10)
+    async def test_escape_cancels_without_invoking_on_submit(self, tmp_path):
+        """Escape (action_cancel) dismisses WITHOUT submitting -- mirrors
+        test_escape_closes_the_open_tree's escape-to-dismiss coverage for
+        SpawnTreeScreen. Pushed with an injected on_submit collecting into
+        *received* (same shape as the submit-path tests above), so this
+        pins BOTH halves of the cancel contract at once: the screen is
+        popped, AND on_submit is never called -- a regression that made
+        cancel accidentally submit (or fail to dismiss) would leave
+        *received* non-empty, or leave the screen on top, respectively.
+        """
+        from cockpit.app import CockpitApp
+        from cockpit.panes.weight_editor import WeightEditorScreen
+        from cockpit.priority import Priorities
+
+        received: list[Priorities] = []
+        base = Priorities.default()
+
+        app = CockpitApp(fleet_root=tmp_path, poll_interval=0.05)
+        async with app.run_test() as pilot:
+            await pilot.pause()
+
+            screen = WeightEditorScreen(base, ['alpha', 'beta'], received.append)
+            await app.push_screen(screen)
+            await pilot.pause()
+            assert isinstance(app.screen, WeightEditorScreen)
+
+            await pilot.press('escape')
+            await pilot.pause()
+
+            assert not isinstance(app.screen, WeightEditorScreen)
+
+        assert received == []
+
+    @pytest.mark.timeout(10)
+    async def test_submit_keeps_prior_value_for_a_rejected_category_edit(self, tmp_path):
+        """A category Input made unparseable (garbage text) is silently
+        dropped -- merge_weight_edits keeps *base*'s value for that key,
+        never raises (see merge_weight_edits' own docstring: 'a weight is
+        cleared by typing 0, not by blanking a field'). This pins that
+        fail-soft contract through the FULL compose->_submit pipeline (not
+        just the pure-helper coverage in TestMergeWeightEdits), symmetric
+        with test_submit_reads_edited_category_input_into_new_priorities'
+        coverage of the valid-edit path.
+
+        Visible operator feedback for a rejected edit (e.g. re-seeding the
+        Input to its prior value, a style change) was considered and
+        intentionally deferred: _submit() dismisses the screen immediately
+        after building new_priorities, so any Input-value reset would land
+        on an already-torn-down widget and never be seen, and this
+        narrowly-scoped persistence task is not the place to introduce a
+        new Textual validation/notification pattern with no existing
+        precedent in this codebase. See WeightEditorScreen._submit's
+        docstring.
+        """
+        from textual.widgets import Input
+
+        from cockpit.app import CockpitApp
+        from cockpit.panes.weight_editor import WeightEditorScreen
+        from cockpit.priority import Priorities
+
+        received: list[Priorities] = []
+        base = Priorities.default()
+
+        app = CockpitApp(fleet_root=tmp_path, poll_interval=0.05)
+        async with app.run_test() as pilot:
+            await pilot.pause()
+
+            screen = WeightEditorScreen(base, [], received.append)
+            await app.push_screen(screen)
+            await pilot.pause()
+
+            # base.category_weights == {'security': 2.0, 'bug': 1.0,
+            # 'feature': 0.5, 'chore': 0.2} (dict insertion order) ->
+            # compose() assigns id 'cat-1' to 'bug'.
+            bug_input = screen.query_one('#cat-1', Input)
+            bug_input.value = 'not-a-number'
+            await pilot.pause()
+
+            await pilot.click('#weight-submit')
+            await pilot.pause()
+
+        assert len(received) == 1
+        assert received[0].category_weights == base.category_weights
+        assert received[0].project_weights == {}
+
 
 class TestSpawnBar:
     @pytest.mark.timeout(10)
