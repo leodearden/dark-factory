@@ -13,9 +13,15 @@ regression rather than an optional dependency.
 
 from __future__ import annotations
 
+import re
 import shutil
 import subprocess
 from pathlib import Path
+
+# node's TAP reporter emits a `# tests N` summary line. Matched against
+# stdout to confirm the suite actually executed tests — see the docstring
+# below for why returncode alone can't be trusted for that.
+_TESTS_SUMMARY_RE = re.compile(r'^# tests (\d+)$', re.MULTILINE)
 
 _JS_TESTS_DIR = Path(__file__).parent / 'js'
 
@@ -53,4 +59,23 @@ def test_graph_layout_js_suite_passes() -> None:
         f'node --test {_JS_TESTS_GLOB} exited {result.returncode}\n'
         f'--- stdout ---\n{result.stdout}\n'
         f'--- stderr ---\n{result.stderr}'
+    )
+
+    # A zero-match glob (e.g. from a rename to .test.js, a moved js/ dir, or a
+    # path-resolution change) makes `node --test` run zero tests and still
+    # exit 0 — verified empirically: `# tests 0` / returncode 0. Without this
+    # check, that failure mode would pass silently forever. Require at least
+    # one test to actually have run.
+    tests_summary = _TESTS_SUMMARY_RE.search(result.stdout)
+    assert tests_summary is not None, (
+        f"could not find a '# tests N' summary line in node --test output — "
+        f'unable to confirm the suite actually ran\n'
+        f'--- stdout ---\n{result.stdout}'
+    )
+    tests_run = int(tests_summary.group(1))
+    assert tests_run > 0, (
+        f'node --test {_JS_TESTS_GLOB} exited 0 but reported 0 tests — the '
+        f'glob likely matched no test files, which would silently drop all '
+        f'JS layout coverage from CI\n'
+        f'--- stdout ---\n{result.stdout}'
     )
