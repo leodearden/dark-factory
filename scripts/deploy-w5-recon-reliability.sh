@@ -117,11 +117,28 @@ if ! $healthy; then
 fi
 echo " OK"
 
-# 2. Serving-sanity gate (placeholder single-attempt check -- upgraded to a
-# real bounded polling loop with pass/fail handling in step-8; for now this
-# only wires the restart-then-health-then-serving ordering, it does not yet
-# act on the outcome).
-journalctl --user -u "$SERVICE" --since "@${restart_start}" --no-pager -q \
-    | grep -q "$RECON_MARKER" || true
+# 2. Serving-sanity gate: bounded poll of the journal for RECON_MARKER,
+# proving the restarted process is actively cycling reconciliation (not
+# merely alive) -- reuses restart-fused-memory.sh:28-40's journalctl-grep
+# idiom.
+echo -n "Waiting for recon-serving marker..."
+deadline=$((SECONDS + RECON_VERIFY_TIMEOUT))
+serving=false
+while [[ $SECONDS -lt $deadline ]]; do
+    if journalctl --user -u "$SERVICE" --since "@${restart_start}" --no-pager -q 2>/dev/null \
+            | grep -q "$RECON_MARKER"; then
+        serving=true
+        break
+    fi
+    echo -n "."
+    sleep 1
+done
+
+if ! $serving; then
+    echo " FAILED"
+    echo "ERROR: fused-memory did not show ledger-backed recon serving (marker '${RECON_MARKER}') within ${RECON_VERIFY_TIMEOUT}s" >&2
+    exit 1
+fi
+echo " OK"
 
 exit 0
