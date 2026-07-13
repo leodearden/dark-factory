@@ -835,12 +835,17 @@ class SubgraphEdgeResult:
             dict with ``kind`` (``'edge'`` or ``'mention'``), the item's own
             ``uuid``, a human-readable ``reason`` (``str(exc)``), and
             ``node_uuids`` (the incident node uuid(s): both endpoints for a
-            RELATES_TO edge, the entity uuid for a MENTIONS link). Per-item
-            isolation (CGL-η follow-up, task 2451) means a single bad
-            edge/mention costs only itself -- the batch continues and this
-            item is surfaced here for human review, same "never silently
-            lost" convention as ``dropped_cross_target``, rather than
-            aborting the whole batch the way it used to (see this
+            RELATES_TO edge, the entity uuid for a MENTIONS link). A
+            ``'mention'``-kind item ADDITIONALLY carries ``episode_uuid`` --
+            the source-resident Episodic node whose MENTIONS link was not
+            recreated -- so a caller MUST withhold THAT episode's Phase-C
+            deletion too, not just the mentioned entity's (a ``'edge'``-kind
+            item never carries this key -- only a MENTIONS link involves an
+            episode). Per-item isolation (CGL-η follow-up, task 2451) means a
+            single bad edge/mention costs only itself -- the batch continues
+            and this item is surfaced here for human review, same "never
+            silently lost" convention as ``dropped_cross_target``, rather
+            than aborting the whole batch the way it used to (see this
             function's docstring). A caller MUST withhold Phase C
             source-deletion for every uuid named here, or the un-recreated
             edge/mention -- which still exists only in source -- would be
@@ -1266,6 +1271,7 @@ async def _recreate_subgraph_relationships_batch(
                 'uuid': mention_uuid,
                 'reason': str(exc),
                 'node_uuids': [entity_uuid],
+                'episode_uuid': episode_uuid,
             })
             # error + exc_info: see the RELATES_TO MOVE-edge pass's matching
             # comment above -- keeps a programming-error traceback visible
