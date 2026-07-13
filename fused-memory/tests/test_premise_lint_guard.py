@@ -211,6 +211,74 @@ class TestPremiseLintErrorInvariantMatrix:
         )
         assert result is None
 
+    def test_recon_stage_marker_purges_paraphrase_rejects(self):
+        """"purges" is likewise caught — it was added to the marker-deletion
+        verb alternation alongside removes/clears but had no dedicated
+        test."""
+        result = premise_lint_error(
+            'Stage 3 remediation purges the flag_for_stage2 marker once resolved.',
+            'recon-stage-task_knowledge_sync',
+            '/proj',
+        )
+        assert result is not None
+        assert 'markers_deleted_only_by_gc' in result['error']
+
+    def test_recon_stage_marker_deletion_cross_clause_false_positive_accepts(self):
+        """A benign description that mentions "Stage 3" in one clause and a
+        correct "GC ... deletes the marker" in a separate clause — split by
+        a semicolon — must NOT be flagged. Regression guard for the
+        tempered-dot gap (`_GAP_NO_NEGATION`) spanning a clause terminator
+        and combining an unrelated "Stage 3" mention with a later, correct
+        "GC deletes" clause into a spurious subject/verb/object match; the
+        sentence never asserts that Stage 3 deletes the marker."""
+        result = premise_lint_error(
+            'Stage 3 processes the flag_for_stage2 marker; '
+            'GC later deletes the marker on terminal task.',
+            'recon-stage-task_knowledge_sync',
+            '/proj',
+        )
+        assert result is None
+
+    def test_recon_stage_two_distinct_invariants_across_fields_both_named(self):
+        """A run_id-persistence premise in `description` plus a
+        marker-deletion premise in `details` trigger TWO distinct
+        invariants in one submission. The error must name both — sorted
+        and deduped via `invariants = ', '.join(sorted({...}))` — and
+        carry both violations' detail text; this aggregation path was
+        previously only exercised with a single violation."""
+        result = premise_lint_error(
+            'Fix the bug where run_id persists across cycles in the ledger.',
+            'recon-stage-task_knowledge_sync',
+            '/proj',
+            prompt='Reconcile task 7',
+            details='Stage 3 remediation deletes the flag marker once resolved.',
+        )
+        assert result is not None
+        assert result.get('error_type') == 'ValidationError'
+        error = result['error']
+        # Sorted alphabetically: markers_deleted_only_by_gc < run_id_is_fresh_per_run.
+        assert 'invariant(s): markers_deleted_only_by_gc, run_id_is_fresh_per_run' in error
+        assert 'never persisted across cycles' in error
+        assert 'deleted only by GC' in error
+
+    def test_recon_stage_duplicate_violation_across_fields_deduped(self):
+        """The SAME false premise stated in two different fields
+        (`description` and `title`) produces two Violations sharing one
+        invariant AND one identical detail text. The combined error must
+        not repeat that detail text twice — `detail_texts` dedup by exact
+        text is a distinct code path from the `invariants` set dedup, and
+        was previously untested."""
+        result = premise_lint_error(
+            'Fix the bug where run_id persists across cycles in the ledger.',
+            'recon-stage-task_knowledge_sync',
+            '/proj',
+            prompt='Reconcile task 7',
+            title='Bug: run_id persists across cycles',
+        )
+        assert result is not None
+        error = result['error']
+        assert error.count('never persisted across cycles') == 1
+
     def test_recon_stage_premise_split_across_fields_does_not_combine(self):
         """A false premise assembled only by JOINING two clean fields must
         NOT be flagged: each field is linted independently, so a match
