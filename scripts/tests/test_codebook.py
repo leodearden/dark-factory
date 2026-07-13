@@ -434,3 +434,71 @@ def test_apply_coding_record_does_not_mutate_input():
     mod.apply_coding_record(codebook, record)
 
     assert codebook == original
+
+
+# ---------------------------------------------------------------------------
+# step-11: RED (§8.3 candidate append) — apply_coding_record() candidates
+# ---------------------------------------------------------------------------
+
+def _candidate_record(title="novel shape", session="sess-1", date="2026-07-14"):
+    return {
+        "session": session,
+        "date": date,
+        "project": "dark_factory",
+        "agent_class": "orchestrated-task",
+        "candidates": [
+            {
+                "title": title,
+                "cause": "...",
+                "area": "...",
+                "origin_phase": "architect",
+                "manifested_phase": "verify",
+                "evidence_quote": "...",
+            }
+        ],
+    }
+
+
+def test_apply_coding_record_appends_one_candidate():
+    codebook = _codebook_with_entry_a()
+    record = _candidate_record()
+
+    result, stats = mod.apply_coding_record(codebook, record)
+
+    assert len(result["candidates"]) == 1
+    candidate = result["candidates"][0]
+    assert candidate["id"] == "cand-20260714-1"
+    assert candidate["first_seen"] == "2026-07-14"
+    assert candidate["disposition"] == "pending"
+    assert candidate["title"] == "novel shape"
+    assert len(candidate["sightings"]) == 1
+    assert candidate["sightings"][0]["session"] == "sess-1"
+    assert stats["candidates_applied"] == 1
+    assert mod.validate(result) == []
+
+
+def test_apply_coding_record_candidate_is_idempotent_on_session_and_title():
+    codebook = _codebook_with_entry_a()
+    record = _candidate_record()
+
+    once, _ = mod.apply_coding_record(codebook, record)
+    twice, _ = mod.apply_coding_record(once, record)
+
+    assert len(twice["candidates"]) == 1
+    assert len(twice["candidates"][0]["sightings"]) == 1
+    assert mod.validate(twice) == []
+
+
+def test_apply_coding_record_different_candidate_same_day_increments_id():
+    codebook = _codebook_with_entry_a()
+    record_a = _candidate_record(title="novel shape")
+    once, _ = mod.apply_coding_record(codebook, record_a)
+
+    record_b = _candidate_record(title="a different shape")
+    twice, _ = mod.apply_coding_record(once, record_b)
+
+    assert len(twice["candidates"]) == 2
+    ids = {c["title"]: c["id"] for c in twice["candidates"]}
+    assert ids["novel shape"] == "cand-20260714-1"
+    assert ids["a different shape"] == "cand-20260714-2"
+    assert mod.validate(twice) == []
