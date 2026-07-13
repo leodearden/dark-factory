@@ -17,16 +17,19 @@ from pathlib import Path
 
 import pytest
 import yaml
-from pydantic import ValidationError
+from pydantic import BaseModel, ValidationError
 
+import shared.task_metadata as task_metadata_module
 from shared.capability_manifest import (
     CapabilityManifestDoc,
     DeliveredCheck,
+    DeliveredCheckMeta,
     ManifestCapability,
     ManifestTask,
     load_capability_manifest,
     parse_capability_manifest,
 )
+from shared.task_metadata import parse_metadata
 
 
 def _task_dict(label='α', **overrides):
@@ -407,3 +410,114 @@ tasks:
         ]
         assert len(manual_caps) == 1
         assert manual_caps[0].delivered_check.reason
+
+
+class TestDeliveredCheckMeta:
+    def test_grep_entry_with_name_constructs(self):
+        check = DeliveredCheckMeta(name='cap-one', kind='grep', pattern='foo', expect='present')
+        assert check.name == 'cap-one'
+        assert check.kind == 'grep'
+        assert check.pattern == 'foo'
+        assert check.expect == 'present'
+
+    def test_script_entry_with_name_constructs(self):
+        check = DeliveredCheckMeta(
+            name='cap-two', kind='script', script='scripts/x.sh', timeout_secs=30
+        )
+        assert check.name == 'cap-two'
+        assert check.kind == 'script'
+        assert check.script == 'scripts/x.sh'
+        assert check.timeout_secs == 30
+
+    def test_manual_kind_rejected(self):
+        with pytest.raises(ValidationError):
+            DeliveredCheckMeta(name='cap-one', kind='manual')  # type: ignore[arg-type]
+
+    def test_missing_name_rejected(self):
+        with pytest.raises(ValidationError):
+            DeliveredCheckMeta(kind='grep', pattern='foo', expect='present')  # type: ignore[call-arg]
+
+    def test_grep_missing_pattern_rejected(self):
+        # Parity with DeliveredCheck's grep/script cross-field rules.
+        with pytest.raises(ValidationError):
+            DeliveredCheckMeta(name='cap-one', kind='grep', expect='present')
+
+    def test_grep_with_script_field_rejected(self):
+        with pytest.raises(ValidationError):
+            DeliveredCheckMeta(
+                name='cap-one',
+                kind='grep',
+                pattern='foo',
+                expect='present',
+                script='scripts/x.sh',
+            )
+
+    def test_script_missing_timeout_secs_rejected(self):
+        with pytest.raises(ValidationError):
+            DeliveredCheckMeta(name='cap-one', kind='script', script='scripts/x.sh')
+
+    def test_script_with_pattern_field_rejected(self):
+        with pytest.raises(ValidationError):
+            DeliveredCheckMeta(
+                name='cap-one',
+                kind='script',
+                script='scripts/x.sh',
+                timeout_secs=30,
+                pattern='foo',
+            )
+
+    def test_unknown_field_rejected(self):
+        with pytest.raises(ValidationError):
+            DeliveredCheckMeta(name='cap-one', kind='manual', typo='x')  # type: ignore[call-arg]
+
+
+class TestMetadataRegistration:
+    def test_registered_under_delivered_checks_key(self):
+        assert task_metadata_module._SUBMODEL_REGISTRY['delivered_checks'] is DeliveredCheckMeta
+
+    def test_parse_metadata_write_enforce_accepts_typed_list_and_round_trips(self):
+        grep_entry = {'name': 'cap-one', 'kind': 'grep', 'pattern': 'foo', 'expect': 'present'}
+        script_entry = {
+            'name': 'cap-two',
+            'kind': 'script',
+            'script': 'scripts/x.sh',
+            'timeout_secs': 30,
+        }
+        model, warnings = parse_metadata(
+            {'delivered_checks': [grep_entry, script_entry]},
+            direction='write',
+            enforce=True,
+        )
+        assert warnings == []
+        slice_value = model.delivered_checks  # type: ignore[attr-defined]
+        assert isinstance(slice_value, list)
+        assert all(isinstance(item, DeliveredCheckMeta) for item in slice_value)
+        assert [item.name for item in slice_value] == ['cap-one', 'cap-two']
+        dumped = model.model_dump()['delivered_checks']
+        assert dumped == [grep_entry, script_entry]
+        assert all(not isinstance(item, BaseModel) for item in dumped)
+
+    def test_no_unknown_key_warning_for_delivered_checks(self):
+        grep_entry = {'name': 'cap-one', 'kind': 'grep', 'pattern': 'foo', 'expect': 'present'}
+        _model, warnings = parse_metadata(
+            {'delivered_checks': [grep_entry]}, direction='write', enforce=True
+        )
+        assert not any(w.code == 'unknown_key' for w in warnings)
+
+    def test_manual_kind_in_metadata_read_warns(self):
+        model, warnings = parse_metadata(
+            {'delivered_checks': [{'name': 'cap-one', 'kind': 'manual'}]},
+            direction='read',
+        )
+        assert len(warnings) == 1
+        assert warnings[0].field == 'delivered_checks'
+        assert warnings[0].code == 'invalid_submodel'
+        assert model.model_dump()['delivered_checks'] == [{'name': 'cap-one', 'kind': 'manual'}]
+
+    def test_manual_kind_in_metadata_write_enforce_raises(self):
+        with pytest.raises(ValidationError):
+            parse_metadata(
+                {'delivered_checks': [{'name': 'cap-one', 'kind': 'manual'}]},
+                direction='write',
+                enforce=True,
+            )
