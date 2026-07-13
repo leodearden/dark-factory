@@ -1910,6 +1910,31 @@ class TestIsRateLimitOrQuotaError:
         """
         assert _is_rate_limit_or_quota_error(asyncio.CancelledError()) is False
 
+    def test_message_substring_does_not_match_when_status_code_contradicts(self):
+        """A message merely quoting 'insufficient_quota' must NOT match when the
+        exception also carries a concrete, non-429 status_code — a definitive
+        status code contradicts the fuzzy message-substring fallback (e.g. a
+        wrapped/log-echo error that quotes an upstream message verbatim but is
+        itself a distinct, non-rate-limit failure) (task 2448 review)."""
+
+        class WrappedError(Exception):
+            status_code = 500
+
+        exc = WrappedError('upstream said: insufficient_quota, but this is a 500')
+        assert _is_rate_limit_or_quota_error(exc) is False
+
+    def test_message_substring_does_not_match_when_code_attribute_present(self):
+        """A message merely quoting 'insufficient_quota' must NOT match when the
+        exception already carries an unrelated, non-empty `code` attribute — a
+        concrete (even if non-matching) code classification takes precedence
+        over the fuzzy message-substring fallback (task 2448 review)."""
+
+        class WrappedError(Exception):
+            code = 'some_other_code'
+
+        exc = WrappedError('upstream said: insufficient_quota, but this is unrelated')
+        assert _is_rate_limit_or_quota_error(exc) is False
+
 
 class TestGetEntity:
     # ------------------------------------------------------------------
