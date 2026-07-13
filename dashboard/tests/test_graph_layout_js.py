@@ -19,6 +19,14 @@ from pathlib import Path
 
 _JS_TESTS_DIR = Path(__file__).parent / 'js'
 
+# node v22.22.3 does NOT recursively discover test files when given a bare
+# directory path as a CLI argument — it tries to `require()` the directory
+# itself and fails with MODULE_NOT_FOUND regardless of what's inside (verified
+# empirically: only an argument-less cwd walk or an explicit glob pattern
+# triggers node's test-file discovery). Passing an explicit "**/*.test.mjs"
+# glob makes node's own glob engine find and run the suite's files.
+_JS_TESTS_GLOB = str(_JS_TESTS_DIR / '**' / '*.test.mjs')
+
 
 def test_graph_layout_js_suite_passes() -> None:
     """Run `node --test` over dashboard/tests/js/ and assert a clean exit.
@@ -35,14 +43,14 @@ def test_graph_layout_js_suite_passes() -> None:
     )
 
     result = subprocess.run(
-        [node, '--test', str(_JS_TESTS_DIR)],
+        [node, '--test', _JS_TESTS_GLOB],
         capture_output=True,
         text=True,
         cwd=str(_JS_TESTS_DIR.parent),
     )
 
     assert result.returncode == 0, (
-        f'node --test {_JS_TESTS_DIR} exited {result.returncode}\n'
+        f'node --test {_JS_TESTS_GLOB} exited {result.returncode}\n'
         f'--- stdout ---\n{result.stdout}\n'
         f'--- stderr ---\n{result.stderr}'
     )

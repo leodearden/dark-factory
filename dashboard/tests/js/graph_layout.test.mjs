@@ -30,22 +30,30 @@ test('default-imported module exposes the four layout functions', () => {
 
 test('module also assigns window.DF_GRAPH_LAYOUT (browser dual-export)', () => {
   // Shim a bare browser-like global before requiring the module fresh via
-  // CommonJS require (a separate module registry from the ESM import
-  // above), so the module body's `if (typeof window !== 'undefined')`
+  // CommonJS require, so the module body's `if (typeof window !== 'undefined')`
   // branch executes against our shim.
   globalThis.window = {};
   try {
     const require = createRequire(import.meta.url);
+    // Node's ESM loader resolves a CommonJS module (no package.json/type in
+    // this repo) by delegating to the CJS loader and populating the shared
+    // require.cache — so by the time this test runs, the top-level `import
+    // layout from ...` above has ALREADY cached this exact file. A plain
+    // require() here would return that cached module.exports without
+    // re-running the module body, meaning the dual-export line would never
+    // see our globalThis.window shim. Busting the cache entry forces a
+    // fresh execution against the now-shimmed window.
+    const resolved = require.resolve(MODULE_SPECIFIER);
+    delete require.cache[resolved];
     const required = require(MODULE_SPECIFIER);
 
     assert.ok(globalThis.window.DF_GRAPH_LAYOUT, 'window.DF_GRAPH_LAYOUT was not set');
 
-    // The require() and import() calls load the module through two
-    // independent module registries (CJS require cache vs. ESM import
-    // cache), so the module body executes twice and produces two distinct
-    // API object instances. We therefore compare structurally — same set
-    // of exported names, each a function — rather than asserting
-    // reference/deep equality against the ESM-imported `layout`.
+    // The fresh require() and the top-level import() produce two distinct
+    // API object instances (separate module executions), so we compare
+    // structurally — same set of exported names, each a function — rather
+    // than asserting reference/deep equality against the ESM-imported
+    // `layout`.
     assert.deepEqual(
       Object.keys(globalThis.window.DF_GRAPH_LAYOUT).sort(),
       EXPECTED_FUNCTION_NAMES.slice().sort(),
