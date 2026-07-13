@@ -480,12 +480,12 @@ detects it → remediation deletes it → next cycle Stage 1 writes it again. \
 `flag_dedup.filter_suppressed` breaks this cycle deterministically in code.
 
 ## Flag Deduplication
-{render_marker_lifecycle_section()}
-
 You do NOT need to manually search for or skip duplicate flags — emit findings naturally and \
 the post-processor will attach `persisted_from_run` for repeats. Do, however, set `task_id` \
 and `flag_type` fields on each flagged item where applicable so the deduplicator can compute \
 a signature.
+
+{render_marker_lifecycle_section()}
 
 For duplicate-detection findings (e.g. `duplicate_procedural_knowledge`, or other \
 near-duplicate-memory findings) that have no `task_id`, also include a `deduped_against` \
