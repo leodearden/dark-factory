@@ -1257,6 +1257,51 @@ class TaskInterceptor:
         except Exception:
             logger.warning('task_curator: _maybe_backfill_corpus raised', exc_info=True)
 
+    async def index_committed_tasks(self, tasks: list[dict], project_root: str) -> None:
+        """Best-effort write-time indexing seam for ``commit_planning``.
+
+        ``planning_mode`` tasks (see ``_submit_task_planning_mode``) are
+        created via ``tm.add_task(status='deferred')`` directly, bypassing
+        the ticket/curator record path entirely — they never flow through
+        ``_dispatch_ticket_decision``, so ``curator.record_task`` is never
+        called for them. ``commit_planning`` calls this method when it flips
+        a batch from ``deferred`` to ``pending`` so those tasks become
+        visible to ``search_tasks`` immediately, mirroring the indexing the
+        normal ticketed path already gets, instead of waiting on the
+        one-shot empty-corpus ``_maybe_backfill_corpus`` check.
+
+        ``tasks`` is a list of get_task-shaped dicts (``{id, title,
+        description, details, priority, metadata, ...}``). Each is converted
+        to a ``CandidateTask`` via :meth:`_build_candidate`; entries with no
+        title are skipped (the curator cannot embed a candidate it cannot
+        read a title from) as are non-dict entries and entries with no
+        usable id. Every ``record_task`` call is independently guarded — a
+        single failure is logged and does not prevent the remaining tasks in
+        the batch from being recorded. This method never raises: if the
+        curator is disabled/unavailable, it is a no-op.
+        """
+        curator = await self._get_curator()
+        if curator is None:
+            return
+        project_id = resolve_project_id(project_root)
+        for task in tasks:
+            if not isinstance(task, dict):
+                continue
+            candidate = TaskInterceptor._build_candidate(task)
+            if candidate is None:
+                continue
+            task_id = str(task.get('id') or '')
+            if not task_id:
+                continue
+            try:
+                await curator.record_task(task_id, candidate, project_id)
+            except Exception:
+                logger.warning(
+                    'index_committed_tasks: record_task failed for %s',
+                    task_id,
+                    exc_info=True,
+                )
+
     @staticmethod
     def _parse_metadata(kwargs: dict[str, Any]) -> dict:
         """Parse and normalise ``kwargs['metadata']`` to a plain dict.
