@@ -259,7 +259,7 @@ class TestCapabilityManifestDoc:
         doc = CapabilityManifestDoc(
             prd='plans/example-prd.md',
             schema_version=1,
-            tasks=[_task_dict('α'), _task_dict('β')],
+            tasks=[_task_dict('α'), _task_dict('β')],  # type: ignore[arg-type]
         )
         assert doc.prd == 'plans/example-prd.md'
         assert doc.schema_version == 1
@@ -276,7 +276,7 @@ class TestCapabilityManifestDoc:
             CapabilityManifestDoc(
                 prd='plans/example-prd.md',
                 schema_version=1,
-                tasks=[_task_dict('α'), _task_dict('α')],
+                tasks=[_task_dict('α'), _task_dict('α')],  # type: ignore[arg-type]
             )
         assert 'α' in str(exc_info.value)
 
@@ -285,15 +285,15 @@ class TestCapabilityManifestDoc:
             CapabilityManifestDoc(
                 prd='plans/example-prd.md',
                 schema_version=1,
-                tasks=[_task_dict('')],
+                tasks=[_task_dict('')],  # type: ignore[arg-type]
             )
 
     def test_schema_version_not_one_rejected(self):
         with pytest.raises(ValidationError):
             CapabilityManifestDoc(
                 prd='plans/example-prd.md',
-                schema_version=2,
-                tasks=[_task_dict('α')],
+                schema_version=2,  # type: ignore[arg-type]
+                tasks=[_task_dict('α')],  # type: ignore[arg-type]
             )
 
     def test_unknown_top_level_field_rejected(self):
@@ -302,8 +302,8 @@ class TestCapabilityManifestDoc:
                 prd='plans/example-prd.md',
                 schema_version=1,
                 tasks=[_task_dict('α')],
-                typo='x',
-            )  # type: ignore[call-arg]
+                typo='x',  # type: ignore[call-arg]
+            )
 
 
 class TestLoader:
@@ -409,7 +409,9 @@ tasks:
             if cap.delivered_check is not None and cap.delivered_check.kind == 'manual'
         ]
         assert len(manual_caps) == 1
-        assert manual_caps[0].delivered_check.reason
+        manual_check = manual_caps[0].delivered_check
+        assert manual_check is not None
+        assert manual_check.reason
 
 
 class TestDeliveredCheckMeta:
