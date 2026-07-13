@@ -2231,6 +2231,14 @@ class GitOps:
         The script lives in the LANE's own scripts dir (the lane's checked-out
         tree provides it, consistent with the debug-port script pattern).
 
+        **Does NOT take ``<lane_dir>.lock``**: the only flock this method (or
+        the ``seed-warm-lane.sh`` it invokes) acquires is the *shared*
+        per-gen-dir lock above, scoped to protecting the shared CoW base
+        during copy — never the lane's own lock file. See
+        :meth:`_run_thin_warm_lane`'s "Lane-lock coupling gap" docstring
+        note for why that matters (a concurrent release-thin does not
+        actually contend with a re-acquire on ``<lane_dir>.lock``).
+
         Returns:
             0   — script ran and exited 0 (seed succeeded, lane is warm).
             75  — script exited 75 (EX_TEMPFAIL, disk-pressure discriminant).
@@ -2589,6 +2597,35 @@ class GitOps:
         ``TestRunThinWarmLaneFlockContention`` in ``test_git_ops.py`` for a
         unit test that exercises this against a real held flock (not just a
         scripted exit code).
+
+        **Lane-lock coupling gap (task 2442 review — CONFIRMED, not just
+        theoretical)**: the mutual exclusion above additionally requires the
+        OTHER party in a concurrent re-acquire — reify's
+        ``<lane_dir>/scripts/seed-warm-lane.sh``, invoked by
+        :meth:`_seed_warm_lane` — to ALSO take ``<lane_dir>.lock`` before
+        writing into ``target/``. As of this writing it does not:
+        ``seed-warm-lane.sh`` takes only a *shared* flock on the separate
+        per-gen-dir lock file for the duration of its ``cp --reflink`` from
+        the shared CoW base (mirrored on the DF side by
+        :meth:`_seed_warm_lane`'s own gen-dir flock, above) — it contains no
+        ``<lane_dir>.lock`` reference at all. DF's own
+        :class:`WarmLanePool` does not fill the gap either: its ASSIGNED/FREE
+        bookkeeping is purely in-memory, guarded by a single ``asyncio.Lock``
+        (see its class docstring) that serializes the fast state-dict flip
+        only — NOT the slow subprocess calls either side makes. This
+        method's ``rm -rf`` and :meth:`_seed_warm_lane`'s ``cp --reflink``
+        both run as real OS subprocesses that can genuinely overlap in
+        wall-clock time across an ``await``, even within a single
+        orchestrator process. So today, a concurrent re-acquire of a
+        just-released lane does NOT contend on ``<lane_dir>.lock`` — thin's
+        ``flock -n`` is uncontested and proceeds, meaning the rc=75
+        benign-skip path is reachable only when something ELSE (another
+        thin or GC invocation) holds the lock, not when a genuine re-acquire
+        is racing this call. ``TestSeedWarmLaneDoesNotTakeLaneLock`` in
+        ``test_git_ops.py`` pins this current behavior down against a real
+        held flock. Teaching either side to take ``<lane_dir>.lock`` for
+        real is a locking-design change out of scope for task 2442 (η) —
+        flagged as a follow-up rather than fixed here.
 
         Exit-code taxonomy (per the reify δ contract):
             0   — thinned (``target/`` removed).

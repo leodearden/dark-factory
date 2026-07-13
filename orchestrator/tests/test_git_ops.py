@@ -9416,3 +9416,72 @@ class TestRunThinWarmLaneFlockContention:
             'with no concurrent holder, the flock-real stub must acquire '
             'the lock and exit 0 (thinned)'
         )
+
+
+# ---------------------------------------------------------------------------
+# Task 2442 amend (round 2) — pin that _seed_warm_lane does NOT take
+# <lane_dir>.lock (review: git_ops.py:2570 — the "never thinned while
+# ASSIGNED" safety argument holds only if the re-acquire side ALSO honors
+# the lane-lock contract; this proves the current DF Python layer provides
+# no such defense, so the coupling is auditable rather than assumed)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestSeedWarmLaneDoesNotTakeLaneLock:
+    """Pins the lane-lock coupling gap flagged by the task 2442 code review.
+
+    ``_run_thin_warm_lane``'s rc=75 benign-skip protection (see its
+    "Lane-lock coupling gap" docstring note) only actually serializes a
+    concurrent re-acquire against release-thin if the re-acquire side ALSO
+    takes ``<lane_dir>.lock``. ``_seed_warm_lane`` (the re-acquire side's
+    CoW-seed step) does not: it only takes a *shared* flock on the separate
+    per-gen-dir lock file, scoped to protecting the shared CoW base during
+    copy. This test proves that concretely — a real, externally-held
+    ``<lane_dir>.lock`` does not block or influence ``_seed_warm_lane``'s
+    own progress at all — so nobody mistakes ``_run_thin_warm_lane``'s
+    "Flock contract (pinned)" note for DF-side enforcement it does not
+    provide. If this test ever starts failing, ``_seed_warm_lane``'s
+    locking model changed and the coupling-gap docstring note on both
+    methods must be revisited (the gap may be closed).
+    """
+
+    async def test_seed_proceeds_even_when_lane_lock_is_held(
+        self, git_ops: GitOps, git_repo: Path,
+    ):
+        lane = git_repo / '_lane-0'
+        scripts_dir = lane / 'scripts'
+        scripts_dir.mkdir(parents=True)
+        marker = lane / 'seeded.marker'
+        script = scripts_dir / 'seed-warm-lane.sh'
+        script.write_text(
+            f'#!/usr/bin/env bash\nset -euo pipefail\necho seeded > {marker}\nexit 0\n'
+        )
+        script.chmod(0o755)
+
+        # Simulate a concurrent release-thin holding <lane_dir>.lock for the
+        # duration of its rm -rf — the exact lock _run_thin_warm_lane's real
+        # script contends on (see TestRunThinWarmLaneFlockContention above).
+        lock_path = Path(f'{lane}.lock')
+        lock_fd = os.open(str(lock_path), os.O_RDWR | os.O_CREAT, 0o644)
+        try:
+            fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+
+            rc = await git_ops._seed_warm_lane(lane, '--fresh-checkout')
+
+            assert rc == 0, (
+                f'_seed_warm_lane must succeed regardless of <lane_dir>.lock '
+                f'contention (it never checks that lock), got rc={rc!r}'
+            )
+            assert marker.exists(), (
+                "seed-warm-lane.sh ran and wrote into the lane despite "
+                "<lane_dir>.lock being held by another process — proving "
+                "DF's Python layer provides no lane-lock defense of its "
+                "own; the entire \"never thinned while ASSIGNED\" argument "
+                "is delegated to a cross-repo contract this file cannot "
+                "verify (see _run_thin_warm_lane's \"Lane-lock coupling "
+                "gap\" note)"
+            )
+        finally:
+            fcntl.flock(lock_fd, fcntl.LOCK_UN)
+            os.close(lock_fd)
