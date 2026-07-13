@@ -2167,6 +2167,14 @@ class GitOps:
                 # writable — the ONE chokepoint where the .pool-root sentinel
                 # is safe to (re-)write. See mark_pool_storage_present().
                 self.mark_pool_storage_present()
+                # task 2315 (BUG 3): rc == 0 also means the lane's target/ was
+                # just CoW-seeded from the shared base, which may carry
+                # forward stale baked-in absolute OUT_DIR paths. Scrub the
+                # configured subtrees so they regenerate per-lane. Order vs.
+                # mark_pool_storage_present() is irrelevant — scrub is
+                # idempotent/best-effort and never raises. Covers every seed
+                # site (create-once, reset-in-place, recycle) uniformly.
+                self._scrub_seeded_lane_target(lane_dir)
             return rc
         except Exception:
             logger.warning(
