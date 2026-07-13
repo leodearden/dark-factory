@@ -1060,12 +1060,22 @@ async def _run_deferred_main_health_probe(
     - ``verify.category`` is in :data:`PREEXISTING_BREAK_SKIP_CATEGORIES`
 
     Calls :func:`verify_failure_is_preexisting_on_main` directly (rather than
-    :func:`_classify_main_health_red`) so it can capture ``probe_sha`` for a
-    future staleness check (task 2564 step-12).  A raising probe is caught
-    and logged — this is a detached background task with no awaiter, so a
-    swallowed exception here is the ONLY way it would ever be observed.
+    :func:`_classify_main_health_red`) so it can capture ``probe_sha`` for
+    the staleness check below.  A raising probe is caught and logged — this
+    is a detached background task with no awaiter, so a swallowed exception
+    here is the ONLY way it would ever be observed.
 
-    On a confirmed pre-existing break: builds the outcome via
+    Staleness re-check: the probe can run for minutes off the critical
+    path, during which main may have advanced (e.g. a hotfix that already
+    fixed the break).  ``probe_sha`` is the exact bare-main HEAD the probe
+    actually tested against, so equality against a freshly-resolved
+    ``git_ops.get_main_sha()`` is the precise freshness predicate.  Fails
+    safe (skips the escalation, logging at ``info``) when the re-resolve
+    raises, comes back empty, or disagrees with ``probe_sha`` — a
+    genuinely-still-broken main will simply be re-probed and re-surfaced by
+    the next failing merge.
+
+    On a confirmed, still-fresh pre-existing break: builds the outcome via
     :func:`_build_main_health_outcome`, emits the ``main_health_red``
     merge-attempt signal, and files the dedup'd escalation via
     :func:`_file_main_health_escalation`.
@@ -1089,6 +1099,26 @@ async def _run_deferred_main_health_probe(
         return
     if not is_preexisting:
         return
+
+    try:
+        current_main_sha = await git_ops.get_main_sha()
+    except Exception:
+        logger.info(
+            'Task %s: deferred main-health probe: get_main_sha() re-resolve '
+            'failed; skipping escalation (stale-check fail safe)',
+            req.task_id,
+            exc_info=True,
+        )
+        return
+    if not current_main_sha or current_main_sha != probe_sha:
+        logger.info(
+            'Task %s: deferred main-health probe: main advanced since the '
+            'probe ran (probe_sha=%s, current=%s); skipping escalation '
+            '(stale-check fail safe)',
+            req.task_id, probe_sha, current_main_sha,
+        )
+        return
+
     outcome = _build_main_health_outcome(verify, probe_sha)
     _emit_merge_attempt(event_store, req.task_id, OutcomeKind.main_health_red)
     _file_main_health_escalation(escalation_queue, req, outcome)
