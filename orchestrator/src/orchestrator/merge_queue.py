@@ -1075,6 +1075,23 @@ def _spawn_main_health_probe(
     ``_run_post_merge_verify`` callers (which pass no handles) are guaranteed
     no-ops.
 
+    Applies the SAME three cheap guards :func:`_classify_main_health_red`
+    applies before probing (task 2564 step-6 — kept byte-identical to that
+    function's guard block so the deferred path never probes a case the
+    synchronous path would have skipped):
+
+    - ``req.config.escalate_preexisting_main_break`` is ``False``
+    - ``verify.timed_out`` is ``True`` (non-deterministic; re-probing is wasteful)
+    - ``verify.category`` is in :data:`PREEXISTING_BREAK_SKIP_CATEGORIES`
+      (infra_timeout / flock_error — inherently flaky)
+
+    Also dedupes in-flight: skips the spawn when a not-done task named
+    ``f'main-health-probe-{req.task_id}'`` is already registered in
+    ``handles.background_tasks`` (mirrors
+    :func:`_spawn_merge_verify_dry_run`'s in-flight dedup guard) — a rapid
+    sequence of failing merges for the same task must not pile up duplicate
+    probes.
+
     Registers the spawned task into ``handles.background_tasks`` with a
     discard done-callback, named ``f'main-health-probe-{req.task_id}'`` so
     :class:`SpeculativeMergeWorker`'s existing ``self._background_tasks``
@@ -1083,7 +1100,23 @@ def _spawn_main_health_probe(
     """
     if handles is None:
         return
+    if not req.config.escalate_preexisting_main_break:
+        return
+    if verify.timed_out:
+        return
+    if (verify.category or '') in PREEXISTING_BREAK_SKIP_CATEGORIES:
+        return
     task_name = f'main-health-probe-{req.task_id}'
+    if any(
+        t.get_name() == task_name and not t.done()
+        for t in handles.background_tasks
+    ):
+        logger.debug(
+            'Task %s: main-health probe already in progress, skipping '
+            'duplicate spawn',
+            req.task_id,
+        )
+        return
     try:
         task = asyncio.create_task(
             _run_deferred_main_health_probe(
