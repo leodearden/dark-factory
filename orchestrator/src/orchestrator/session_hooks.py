@@ -32,7 +32,8 @@ import os
 import subprocess
 import sys
 import tempfile
-from collections.abc import Mapping
+import time
+from collections.abc import Callable, Mapping
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -199,6 +200,69 @@ def _resolve_parent_session_id(env: Mapping[str, str]) -> str | None:
     (Fleet Cockpit C1, PRD §6.1).
     """
     return env.get('CLAUDE_SPAWN_PARENT_ID') or None
+
+
+_WM_WINDOW_ID_ATTEMPTS = 5
+_WM_WINDOW_ID_RETRY_SLEEP_SECS = 0.2
+_WMCTRL_TIMEOUT_SECS = 2
+
+
+def _wmctrl_list(argv: list[str]) -> subprocess.CompletedProcess[str]:
+    """Fail-soft default runner for ``_resolve_wm_window_id``.
+
+    Wraps ``subprocess.run(['wmctrl', '-l'], ...)``; a missing ``wmctrl``
+    binary (or any other ``OSError``/``SubprocessError``, e.g. a timeout)
+    yields a rc=127 empty-stdout sentinel rather than raising -- the caller
+    (``_resolve_wm_window_id``) must degrade to a retry/None outcome, never a
+    fault, on a host with no ``wmctrl`` installed.
+    """
+    try:
+        return subprocess.run(argv, capture_output=True, text=True, timeout=_WMCTRL_TIMEOUT_SECS)
+    except (OSError, subprocess.SubprocessError):
+        return subprocess.CompletedProcess(argv, returncode=127, stdout='')
+
+
+def _resolve_wm_window_id(
+    title: str,
+    *,
+    run: Callable[[list[str]], subprocess.CompletedProcess[str]] = _wmctrl_list,
+    attempts: int = _WM_WINDOW_ID_ATTEMPTS,
+    sleep: Callable[[float], None] = time.sleep,
+) -> str | None:
+    """Best-effort resolve *title*'s live X11 window id via ``wmctrl -l``.
+
+    Terminals map their X11 window asynchronously, so the window may not yet
+    appear in ``wmctrl -l`` on the first probe right after spawn -- this
+    retries up to *attempts* times, sleeping ``_WM_WINDOW_ID_RETRY_SLEEP_SECS``
+    between attempts (never after the last one). Each ``wmctrl -l`` line is
+    parsed via ``split(None, 3)`` into ``(window_id, desktop, host, title)`` --
+    identical to ``WmBackend.is_alive``'s proven parse
+    (cockpit/src/cockpit/backends/wm.py) -- and this returns the window id of
+    the line whose title field matches *title* EXACTLY, never as a substring,
+    so a short marker can't false-positive against an unrelated longer window
+    title.
+
+    Fully fail-soft: a missing ``wmctrl``, a nonzero return code on every
+    attempt, no matching line, or any unexpected exception (from *run*,
+    parsing, or *sleep*) all return ``None`` rather than raising -- a
+    resolution miss must degrade cleanly to ``display=None``, never worse.
+    """
+    try:
+        for attempt in range(attempts):
+            result = run(['wmctrl', '-l'])
+            if result.returncode == 0:
+                for line in result.stdout.splitlines():
+                    columns = line.split(None, 3)
+                    if len(columns) < 4:
+                        continue
+                    window_id, _desktop, _host, line_title = columns
+                    if line_title == title:
+                        return window_id
+            if attempt < attempts - 1:
+                sleep(_WM_WINDOW_ID_RETRY_SLEEP_SECS)
+    except Exception:
+        return None
+    return None
 
 
 def _resolve_display(env: Mapping[str, str], title: str) -> session_registry.Display | None:
