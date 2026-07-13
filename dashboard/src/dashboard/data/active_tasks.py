@@ -168,6 +168,26 @@ def _build_task_row(
     }
 
 
+def _resolve_deps(task: dict, by_id: dict[int, dict], project: str) -> list[dict]:
+    """Resolve *task*'s ``dependencies`` ids into ``{id, title, done}`` dicts.
+
+    *by_id* is the full project task lookup (built over every fetched task,
+    regardless of status bucket), so a dependency resolves whether it lives
+    in an active status or a terminal one.
+    """
+    deps: list[dict] = []
+    for dep_id in task.get('dependencies') or []:
+        dep_task = by_id.get(dep_id)
+        if dep_task is None:
+            continue
+        deps.append({
+            'id': _task_uid(project, dep_id),
+            'title': dep_task.get('title') or '',
+            'done': dep_task.get('status') == 'done',
+        })
+    return deps
+
+
 async def _shape_one_project(
     client: httpx.AsyncClient,
     config: DashboardConfig,
@@ -226,23 +246,17 @@ async def _shape_one_project(
         wt = worktrees.get(task_id) or {}
         meta = wt.get('metadata') or {}
 
-        deps: list[dict] = []
-        for dep_id in task.get('dependencies') or []:
-            dep_task = by_id.get(dep_id)
-            if dep_task is None:
-                continue
-            deps.append({
-                'id': _task_uid(project, dep_id),
-                'title': dep_task.get('title') or '',
-                'done': dep_task.get('status') == 'done',
-            })
-
         uid = _task_uid(project, task_id)
         row = _build_task_row(project, task, task_id, wt, uid)
         # active rows: started from worktree creation time; deps from task tree.
         row['started'] = _minutes_since(meta.get('created_at'), now=now)
-        row['deps'] = deps
+        row['deps'] = _resolve_deps(task, by_id, project)
         active.append(row)
+
+    # PRDs with at least one member still in an active status. Done/cancelled
+    # members of these "live" PRDs are exempt from the terminal-bucket cap —
+    # see Contract: task-row prd field in plans/dashboard-taskgraph-legibility-prd.md.
+    live_prds = {row['prd'] for row in active if row.get('prd')}
 
     # Bounded terminal buckets: iterate over (status, cap) pairs so done stays
     # byte-identical and cancelled gets the same treatment.
@@ -258,14 +272,20 @@ async def _shape_one_project(
             key=lambda t: (t.get('updated_at') or '', t.get('id') or 0),
             reverse=True,
         )
-        for task in bucket_tasks[:_bkt_cap]:
+        capped_ids = {t['id'] for t in bucket_tasks[:_bkt_cap]}
+        for task in bucket_tasks:
             task_id = task['id']
+            prd = _coalesce_prd(task.get('metadata') or {})
+            is_live_member = prd is not None and prd in live_prds
+            if task_id not in capped_ids and not is_live_member:
+                continue
             uid = _task_uid(project, task_id)
             wt = worktrees.get(task_id) or {}
             row = _build_task_row(project, task, task_id, wt, uid)
-            # terminal rows: no meaningful start time; no deps surfaced.
+            # terminal rows: no meaningful start time; deps only for live-PRD
+            # members (the terminal-member exemption), else unsurfaced.
             row['started'] = 0
-            row['deps'] = []
+            row['deps'] = _resolve_deps(task, by_id, project) if is_live_member else []
             row['completed'] = task.get('updated_at') or ''
             active.append(row)
 
