@@ -54,6 +54,40 @@ def _snapshot_tree(base: Path) -> dict[str, tuple[int, bytes]]:
     }
 
 
+class _BlockingScanner:
+    """Fake SessionScanner for TestNonBlockingPoll: pins the exact moment a
+    threaded poll scan is in-flight, deterministically and without needing
+    10k real session dirs to make a scan slow.
+
+    The FIRST scan() call (on_mount's synchronous initial scan, made before
+    a CockpitApp ever launches a threaded poll worker) returns immediately
+    with no records -- if it blocked too, mounting the app would deadlock
+    the single-threaded event loop it runs on. Every call after that
+    records the calling thread's ident, signals `started`, and blocks on
+    `_release` until the test calls release() -- letting a test observe the
+    app's event loop staying responsive while a slow scan is still
+    in-flight on its own (non-UI) thread.
+    """
+
+    def __init__(self) -> None:
+        self.scan_idents: list[int] = []
+        self.started = threading.Event()
+        self._release = threading.Event()
+        self._armed = False
+
+    def scan(self) -> list:
+        self.scan_idents.append(threading.get_ident())
+        if not self._armed:
+            self._armed = True
+            return []
+        self.started.set()
+        self._release.wait()
+        return []
+
+    def release(self) -> None:
+        self._release.set()
+
+
 class TestInitialRender:
     @pytest.mark.timeout(10)
     async def test_seeded_records_render_as_rows(self, tmp_path):
@@ -1153,3 +1187,45 @@ class TestRefreshWriteDiscipline:
                 )
         new_paths = set(after) - set(before)
         assert not any(path.startswith(('sessions/', 'decisions/')) for path in new_paths)
+
+
+class TestNonBlockingPoll:
+    """Fixes the C10 tour F1 / esc-2303-1 freeze: at 10k+ sessions,
+    scan_sessions()+list_decisions() ran synchronously on the poll timer and
+    froze all input for ~4.5s. The threaded poll worker
+    (_scan_registry_worker, @work(thread=True)) moves that I/O off the
+    event-loop thread -- proven here without needing 10k real session dirs,
+    by injecting a scanner that blocks on command and records which thread
+    actually called it.
+    """
+
+    @pytest.mark.timeout(10)
+    async def test_poll_scan_runs_off_thread_and_event_loop_stays_responsive(self, tmp_path):
+        from cockpit.app import CockpitApp
+        from cockpit.panes.spawn_tree import SpawnTreeScreen
+
+        scanner = _BlockingScanner()
+        # A large poll_interval keeps on_mount's own set_interval timer from
+        # firing (and launching a second, uncontrolled worker) during this
+        # test -- the only scan driven here is the explicit
+        # _scan_registry_worker() call below.
+        app = CockpitApp(fleet_root=tmp_path, poll_interval=60, scanner=scanner)
+        async with app.run_test() as pilot:
+            await pilot.pause()  # on_mount's synchronous scan: call #1, non-blocking
+
+            app._scan_registry_worker()
+            while not scanner.started.is_set():
+                await asyncio.sleep(0.01)
+
+            # The event loop is still alive and responsive while the scan
+            # sits blocked on its own thread -- the user-observable half of
+            # this fix: a keypress still opens the spawn-tree modal.
+            await pilot.press('t')
+            await pilot.pause()
+            assert isinstance(app.screen, SpawnTreeScreen)
+
+            # The scan actually executed off the main/UI thread.
+            assert scanner.scan_idents[-1] != threading.main_thread().ident
+
+            scanner.release()
+            await app.workers.wait_for_complete()
