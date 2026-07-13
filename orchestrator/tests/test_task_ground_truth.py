@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import dataclasses
 import json
+import os
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock
@@ -593,6 +594,38 @@ class TestDeriveTruthLiveClaimant:
         resolver = _make_ground_truth(scheduler=scheduler, worktree_resolver=lambda tid: tmp_path)
 
         report = await resolver.derive_truth('26')
+
+        assert report.live_claimant is None
+
+    async def test_plan_lock_alive_owner_pid_but_stale_locked_at_returns_none(
+        self, tmp_path: Path,
+    ) -> None:
+        # owner_pid alone isn't sufficient: PID reuse means a dead
+        # orchestrator's pid can be recycled by an unrelated, genuinely
+        # alive process. Cross-checking locked_at age against the injected
+        # heartbeat_ttl (mirroring TaskArtifacts.clear_stale_plan_lock's own
+        # staleness check) catches this — a stale lock with a
+        # coincidentally-alive owner_pid must not read as a phantom-live
+        # claimant, or it would silently block recovery of a genuinely
+        # stranded task (review finding).
+        TaskArtifacts(tmp_path).root.mkdir(parents=True)
+        lock_path = TaskArtifacts(tmp_path).root / 'plan.lock'
+        lock_path.write_text(json.dumps({
+            'session_id': 'sess-reused-pid-abc123',
+            'locked_at': '2026-07-01T00:00:00+00:00',
+            'owner_pid': os.getpid(),  # definitely alive: this is the test process
+        }))
+        fixed_now = datetime(2026, 7, 12, 12, 0, 0, tzinfo=UTC)
+        task = {'status': 'pending', 'claimant_run_id': None, 'heartbeat_at': None}
+        scheduler = _fake_scheduler(is_actively_held=False, task=task)
+        resolver = _make_ground_truth(
+            scheduler=scheduler,
+            worktree_resolver=lambda tid: tmp_path,
+            now_fn=lambda: fixed_now,
+            heartbeat_ttl=timedelta(minutes=10),
+        )
+
+        report = await resolver.derive_truth('36')
 
         assert report.live_claimant is None
 

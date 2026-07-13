@@ -173,6 +173,34 @@ def _pid_alive(pid: int) -> bool:
         return False
 
 
+def _lock_fresh(locked_at: object, now: datetime, ttl: timedelta) -> bool:
+    """Return True if a plan.lock's ``locked_at`` is within *ttl* of *now*.
+
+    Mirrors ``TaskArtifacts.clear_stale_plan_lock``'s own age-based
+    staleness check (its 600s default equals ``_DEFAULT_HEARTBEAT_TTL``
+    here) so a plan.lock owner_pid that happens to be alive isn't honored
+    as a live claimant on that basis alone — under PID reuse, a dead
+    orchestrator's pid can be recycled by an unrelated, genuinely-alive
+    process, which would otherwise read as a phantom-live claimant and
+    silently block recovery of a genuinely stranded task (review finding).
+    ``read_plan_lock`` itself does no staleness eviction (that lives only
+    in ``clear_stale_plan_lock``), so this resolver applies its own check
+    rather than assuming a stale lock was already evicted.
+
+    A missing/non-string/unparseable *locked_at* degrades to "not fresh" —
+    the same conservative default the ``owner_pid`` guard below uses for
+    malformed data, and mirrors ``clear_stale_plan_lock`` treating an
+    unparseable timestamp as stale.
+    """
+    if not isinstance(locked_at, str):
+        return False
+    try:
+        age = now - datetime.fromisoformat(locked_at)
+    except (ValueError, TypeError):
+        return False
+    return age <= ttl
+
+
 class TaskGroundTruth:
     """Composes one task's DB/git/liveness/escalation/deploy signals into a
     single frozen :class:`TruthReport` (PRD §5.4).
@@ -301,9 +329,12 @@ class TaskGroundTruth:
         2. A fresh W2 db claimant: ``claimant_run_id`` present AND NOT
            ``shared.task_claimant.is_stranded`` against the injected
            ``now_fn``/``heartbeat_ttl``.
-        3. A live ``plan.lock`` (owner_pid alive) — consulted ONLY when the
-           db claimant is genuinely absent (pre-2182 rows predating the
-           claimant_run_id/heartbeat_at columns).
+        3. A live ``plan.lock`` (owner_pid alive AND ``locked_at`` within
+           ``heartbeat_ttl`` of ``now_fn()`` — see :func:`_lock_fresh`; the
+           staleness cross-check guards against a PID-reuse false-live read,
+           review finding) — consulted ONLY when the db claimant is
+           genuinely absent (pre-2182 rows predating the claimant_run_id/
+           heartbeat_at columns).
 
         A present-but-stale db claimant (``is_stranded`` True) collapses
         straight to ``None`` — it deliberately does NOT fall through to the
@@ -365,7 +396,8 @@ class TaskGroundTruth:
                 owner_alive = owner_pid is not None and _pid_alive(int(owner_pid))
             except (TypeError, ValueError):
                 owner_alive = False
-            if owner_alive:
+            lock_fresh = _lock_fresh(lock_data.get('locked_at'), self.now_fn(), self.heartbeat_ttl)
+            if owner_alive and lock_fresh:
                 return Claimant(
                     run_id=lock_data.get('session_id'),
                     heartbeat_at=lock_data.get('locked_at'),
