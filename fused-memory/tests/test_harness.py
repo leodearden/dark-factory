@@ -752,6 +752,36 @@ class TestStage1CycleSummaryHarnessBackstop:
         )
 
     @pytest.mark.asyncio
+    async def test_stage1_raise_with_recon_ledger_unwired_stamps_false_breadcrumb(
+        self, journal, event_buffer, mock_memory_service
+    ):
+        """recon_ledger_enabled=False is a supported production config (see
+        write_cycle_summary's docstring): memory_service exposes no
+        recon_ledger, so write_stage1_cycle_summary's ledger upsert is
+        skipped and it returns False — the one config where the backstop's
+        return value diverges from the ledger-wired tests above. The
+        backstop must still complete without crashing, the original Stage 1
+        exception must still propagate, and the _error breadcrumb must be
+        stamped False (not True) rather than assuming the write succeeded."""
+        mock_memory_service.recon_ledger = None
+        mock_memory_service.get_memories_by_metadata = AsyncMock(return_value=[])
+        harness = _make_test_harness(journal, event_buffer, mock_memory_service)
+        harness.stages[0].run = AsyncMock(side_effect=RuntimeError('stage1 exploded'))
+
+        with pytest.raises(RuntimeError, match='stage1 exploded'):
+            await harness.run_full_cycle('test-project', 'buffer_size:2')
+
+        recent = await journal.get_recent_runs('test-project', limit=1)
+        assert recent, 'expected the failed run to still be persisted by the journal'
+
+        err = recent[0].stage_reports.get('_error')
+        assert isinstance(err, dict)
+        assert err['stage1_cycle_summary_backstop_written'] is False, (
+            'with no recon_ledger wired, write_stage1_cycle_summary returns False; the '
+            'breadcrumb must reflect that rather than assuming the write succeeded'
+        )
+
+    @pytest.mark.asyncio
     async def test_stage1_cancelled_error_triggers_degraded_backstop_and_still_propagates(
         self, journal, event_buffer, mock_memory_service, ledger_store
     ):
