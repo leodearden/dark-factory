@@ -79,11 +79,19 @@ class Priorities:
     def default(cls) -> Priorities:
         """Sane, non-negative hardcoded defaults (mirrored in priorities.default.yaml)."""
         return cls(
-            severity_weights={'critical': 5.0, 'high': 3.0, 'medium': 1.5, 'low': 0.5},
+            severity_weights={
+                'urgent': 6.0,
+                'critical': 5.0,
+                'high': 3.0,
+                'blocking': 2.5,
+                'medium': 1.5,
+                'low': 0.5,
+                'info': 0.25,
+            },
             category_weights={'security': 2.0, 'bug': 1.0, 'feature': 0.5, 'chore': 0.2},
             project_weights={},
             defaults=Defaults(severity=1.0, category=0.5, project=0.0),
-            age_curve=AgeCurve(max_bonus=2.0, saturation_seconds=float(7 * 24 * 3600)),
+            age_curve=AgeCurve(max_bonus=0.75, saturation_seconds=float(7 * 24 * 3600)),
             manual_boost=ManualBoostConfig(weight=1.0, min=-5, max=5),
         )
 
