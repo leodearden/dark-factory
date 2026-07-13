@@ -423,3 +423,76 @@ class TestOneBestEffort:
         result = await _mod._one('dark_factory', 'http://127.0.0.1:8102', 'halt_scheduler', 'x')
 
         assert result is True
+
+
+class TestEndpointsParsing:
+    """`_endpoints()` parses $CGL_SCHED_ENDPOINTS as a comma list of
+    "name=url" pairs, falling back to DEFAULT_ENDPOINTS when unset/blank."""
+
+    def test_defaults_when_unset(self, monkeypatch):
+        monkeypatch.delenv('CGL_SCHED_ENDPOINTS', raising=False)
+
+        assert _mod._endpoints() == _mod.DEFAULT_ENDPOINTS
+
+    def test_defaults_when_blank(self, monkeypatch):
+        monkeypatch.setenv('CGL_SCHED_ENDPOINTS', '   ')
+
+        assert _mod._endpoints() == _mod.DEFAULT_ENDPOINTS
+
+    def test_parses_custom_comma_list(self, monkeypatch):
+        monkeypatch.setenv(
+            'CGL_SCHED_ENDPOINTS',
+            'foo=http://127.0.0.1:9100,bar=http://127.0.0.1:9200',
+        )
+
+        assert _mod._endpoints() == {
+            'foo': 'http://127.0.0.1:9100',
+            'bar': 'http://127.0.0.1:9200',
+        }
+
+    def test_skips_blank_entries_and_tolerates_a_malformed_pair(self, monkeypatch):
+        """A blank entry (e.g. a stray/trailing comma) is skipped outright;
+        a pair with no '=' is kept with an empty url rather than raising --
+        `_endpoints()` never crashes the CLI over a malformed env var."""
+        monkeypatch.setenv('CGL_SCHED_ENDPOINTS', 'foo=http://127.0.0.1:9100,,bar')
+
+        assert _mod._endpoints() == {
+            'foo': 'http://127.0.0.1:9100',
+            'bar': '',
+        }
+
+
+class TestMainAsyncBestEffort:
+    """`main_async` aggregates every endpoint's `_one` result but its
+    contract is best-effort: it ALWAYS returns 0, even when some (or all)
+    endpoints fail, so a wrapper `trap` can call `resume` unconditionally on
+    any exit path without the cleanup call itself aborting."""
+
+    @pytest.mark.asyncio
+    async def test_returns_zero_when_some_endpoints_fail(self, monkeypatch):
+        monkeypatch.setattr(
+            _mod, '_endpoints',
+            lambda: {'reify': 'http://127.0.0.1:8100', 'dark_factory': 'http://127.0.0.1:8102'},
+        )
+
+        async def fake_one(name, url, tool, reason):
+            return name == 'reify'  # one endpoint ok, one fails
+
+        monkeypatch.setattr(_mod, '_one', fake_one)
+
+        rc = await _mod.main_async('resume', 'x')
+
+        assert rc == 0
+
+    @pytest.mark.asyncio
+    async def test_returns_zero_when_all_endpoints_fail(self, monkeypatch):
+        monkeypatch.setattr(_mod, '_endpoints', lambda: {'reify': 'http://127.0.0.1:8100'})
+
+        async def fake_one(name, url, tool, reason):
+            return False
+
+        monkeypatch.setattr(_mod, '_one', fake_one)
+
+        rc = await _mod.main_async('halt', 'x')
+
+        assert rc == 0
