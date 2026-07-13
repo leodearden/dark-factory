@@ -421,6 +421,25 @@ def test_resolve_wm_window_id_exhausts_attempts_then_none() -> None:
     assert len(calls) == 4
 
 
+def test_resolve_wm_window_id_short_circuits_on_missing_binary_sentinel() -> None:
+    """rc=127 is ``_wmctrl_list``'s sentinel for a missing ``wmctrl`` binary
+    (see its docstring) -- a permanent failure, not the transient
+    window-mapping race the retry loop exists for. It must fail fast on the
+    first probe rather than retrying with sleeps in between."""
+    calls: list[list[str]] = []
+
+    def fake_run(argv: list[str]) -> subprocess.CompletedProcess[str]:
+        calls.append(argv)
+        return subprocess.CompletedProcess(argv, returncode=127, stdout='')
+
+    result = sh._resolve_wm_window_id(
+        'focus:df#2510 alpha', run=fake_run, attempts=5, sleep=lambda _s: None
+    )
+
+    assert result is None
+    assert len(calls) == 1
+
+
 def test_resolve_wm_window_id_run_raising_is_caught_as_none() -> None:
     def fake_run(argv: list[str]) -> subprocess.CompletedProcess[str]:
         raise OSError('wmctrl not found')
