@@ -379,16 +379,27 @@ Phase 4 — adaptive interventions (survey Tier 3):
   Signal: boundary tests 7, 10 + an override-pinned architect invocation row showing
   claude-fable-5 within ceiling. Prereqs: β, ζ, μ.
 
-Companion:
+Integration gate + companion:
 
+- **σ — Routing integration gate (B+H boundary suite)**
+  Modules: orchestrator/tests (workflow test rig, injectable `invoke_fn` seam).
+  Drives boundary tests 1–9, 11, 12 end-to-end through the workflow rig with a fake
+  agent runner: override wins/falls-through, byte-equivalence fixture, reload rule
+  install, tier bump on re-dispatch (and NOT on verify loops), ceiling fallback,
+  saturation stamp, out-of-band parity, unknown-rule-key rejection, rollup rows.
+  (Test 10 — probe gating — lives in β/ξ, fable-specific.) Signal: the boundary suite
+  green against a real workflow-rig run — the C-as-integration-gate leaf closing G2
+  for the intermediates. Prereqs: ε, ζ, η, μ, ν, δ.
 - **ρ — Docs + operator surface**
   Modules: CLAUDE.md, skills/orchestrate/SKILL.md, plans/. Document model_overrides
   contract, routing config block, probe subcommand, rollup reading. Signal: docs
   committed; `/orchestrate` skill section names the new knobs. Prereqs: ζ, ε.
 
-Leaf/intermediate: α, β, γ are intermediates unlocking ε/δ/ξ (each names its consumers
-above); δ, ζ, η, θ, ι, κ, λ, μ, ν, ξ, ρ are leaves with the operator-observable signals
-stated. G2 hard-check + capability manifest at decompose time.
+Leaf/intermediate: α, β, γ, δ, ε, ζ, η, λ, μ, ν are intermediates (each names its
+in-batch consumers above; σ is the integration-gate leaf that ropes the resolver-path
+intermediates per the G2 escape hatch); θ, ι, κ, ξ, ρ, σ are leaves with the
+operator-observable signals stated. G2 hard-check + capability manifest at decompose
+time.
 
 ## Out of scope
 
