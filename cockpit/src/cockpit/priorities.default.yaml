@@ -10,8 +10,9 @@ severity_weights:
   # The escalation vocabulary (info|blocking|critical|urgent, see
   # escalation/src/escalation/models.py) is ordered urgent>=critical>
   # blocking>info so a C8-filed decision's real severity actually
-  # differentiates the queue (Fleet Cockpit F7). high/medium/low are kept
-  # for other callers/tests.
+  # differentiates the queue (Fleet Cockpit F7). high/medium/low are
+  # legacy/test-only buckets -- no production caller emits them -- kept
+  # only for backward compatibility with existing tests/hand-edited files.
   urgent: 6.0
   critical: 5.0
   high: 3.0

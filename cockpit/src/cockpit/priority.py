@@ -93,6 +93,15 @@ class Priorities:
         """Sane, non-negative hardcoded defaults (mirrored in priorities.default.yaml)."""
         return cls(
             severity_weights={
+                # 'urgent'/'critical'/'blocking'/'info' are the escalation
+                # vocabulary (escalation/src/escalation/models.py) a real
+                # DecisionRecord.severity carries end to end via
+                # decision_to_scoring_item. 'high'/'medium'/'low' are
+                # legacy/test-only buckets: no production caller emits them
+                # (session_to_scoring_item always uses '', and no watcher
+                # files these) -- kept only so existing tests that construct
+                # a ScoringItem/priorities.yaml with them keep working. See
+                # priorities.default.yaml's mirrored comment.
                 'urgent': 6.0,
                 'critical': 5.0,
                 'high': 3.0,
