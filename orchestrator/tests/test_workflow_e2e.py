@@ -3892,6 +3892,104 @@ class TestMarkBlockedStewardOutcomeRouting:
             'Budget exhaustion must file an L1'
         )
 
+    async def test_grace_timeout_synthesis_dismisses_orphan_l0(
+        self, config, git_ops, task_assignment, tmp_path,
+    ):
+        """FAITHFUL grace-timeout synthesis (incident esc-3576-234): when the
+        REAL ``_await_steward_completion`` hits its grace deadline with an
+        empty channel and no WIP, it synthesizes
+        ``StewardInterrupted('timeout', wip_commits_present=False)`` —
+        ``_mark_blocked`` must dismiss the still-pending L0 it submitted
+        itself, not merely file an L1 and leave the L0 stranded for the
+        orphan-L0 reaper to promote into a duplicate L1.
+        """
+        workflow, scheduler, queue = await self._build(
+            config, git_ops, task_assignment, tmp_path,
+        )
+        tid = task_assignment.task_id
+        # Do NOT mock _await_steward_completion — drive the real grace-timeout
+        # synthesis path (workflow.py:9635-9637) with a short deadline.
+        workflow._steward_outcome_channel = asyncio.Queue()
+        workflow.config.steward_completion_timeout = 0.05
+        workflow._worktree_has_wip_commits = AsyncMock(return_value=False)
+
+        outcome = await workflow._mark_blocked('synthetic failure')
+
+        assert outcome == WorkflowOutcome.BLOCKED, (
+            f'Expected BLOCKED but got {outcome!r}'
+        )
+        assert queue.get_by_task(tid, status='pending', level=0) == [], (
+            'The L0 _mark_blocked submitted must not be left stranded pending'
+        )
+        assert len(queue.get_by_task(tid, status='dismissed', level=0)) == 1, (
+            'The L0 must be dismissed (preserved on disk for audit), not deleted'
+        )
+        assert len(queue.get_by_task(tid, status='pending', level=1)) == 1, (
+            'Expected exactly one human-facing L1 — no duplicate'
+        )
+
+    async def test_interrupted_without_wip_dismisses_orphan_l0(
+        self, config, git_ops, task_assignment, tmp_path,
+    ):
+        """DIRECT-branch belt-and-suspenders: pins the _mark_blocked branch
+        itself (independent of the grace-timeout synthesis path) — a no-wip
+        StewardInterrupted must dismiss the pending L0, not just file an L1.
+        """
+        workflow, scheduler, queue = await self._build(
+            config, git_ops, task_assignment, tmp_path,
+        )
+        tid = task_assignment.task_id
+        workflow._await_steward_completion = AsyncMock(
+            return_value=StewardInterrupted(
+                reason='timeout', wip_commits_present=False,
+            ),
+        )
+
+        outcome = await workflow._mark_blocked('synthetic failure')
+
+        assert outcome == WorkflowOutcome.BLOCKED, (
+            f'Expected BLOCKED but got {outcome!r}'
+        )
+        assert queue.get_by_task(tid, status='pending', level=0) == [], (
+            'The L0 _mark_blocked submitted must not be left stranded pending'
+        )
+        assert len(queue.get_by_task(tid, status='dismissed', level=0)) == 1, (
+            'The L0 must be dismissed (preserved on disk for audit), not deleted'
+        )
+        assert len(queue.get_by_task(tid, status='pending', level=1)) == 1, (
+            'Expected exactly one human-facing L1 — no duplicate'
+        )
+
+    async def test_budget_exhausted_dismisses_orphan_l0(
+        self, config, git_ops, task_assignment, tmp_path,
+    ):
+        """SYMMETRY for budget: StewardBudgetExhausted must also dismiss the
+        pending L0 it stranded, not just file an L1 (same orphan-L0 leak as
+        the no-wip StewardInterrupted branch).
+        """
+        workflow, scheduler, queue = await self._build(
+            config, git_ops, task_assignment, tmp_path,
+        )
+        tid = task_assignment.task_id
+        workflow._await_steward_completion = AsyncMock(
+            return_value=StewardBudgetExhausted(),
+        )
+
+        outcome = await workflow._mark_blocked('synthetic failure')
+
+        assert outcome == WorkflowOutcome.BLOCKED, (
+            f'Expected BLOCKED but got {outcome!r}'
+        )
+        assert queue.get_by_task(tid, status='pending', level=0) == [], (
+            'The L0 _mark_blocked submitted must not be left stranded pending'
+        )
+        assert len(queue.get_by_task(tid, status='dismissed', level=0)) == 1, (
+            'The L0 must be dismissed (preserved on disk for audit), not deleted'
+        )
+        assert len(queue.get_by_task(tid, status='pending', level=1)) == 1, (
+            'Expected exactly one human-facing L1 — no duplicate'
+        )
+
 
 # ---------------------------------------------------------------------------
 # Tests: _check_branch_on_main helper unit tests
