@@ -4128,6 +4128,221 @@ class TestDetachedRestartWorkingDirectory:
 
 
 # ---------------------------------------------------------------------------
+# Task 2238 (W10-δ), step-1: _default_schedule_detached_restart delegates to
+# proc_supervision.RestartPlan.execute() instead of building systemd-run argv
+# inline (mirrors task 2237/γ's service_restart.py conversion).
+# (RED until step-2 rewrites _default_schedule_detached_restart's body)
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+class TestDetachedRestartDelegatesToRestartPlan:
+    """_default_schedule_detached_restart delegates to
+    proc_supervision.RestartPlan.execute() (task 2238/δ)."""
+
+    async def test_execute_awaited_once_with_detached_self_target_plan(self, tmp_path: Path):
+        """RestartPlan.execute() is awaited exactly once, on a DETACHED
+        self-target plan (target_unit == own_unit == transient_unit,
+        verify=None, transient_unit set, on_active_secs forwarded), carrying
+        an EscalationSpec with the fire-time summary/detail."""
+        from unittest.mock import patch
+
+        from orchestrator.deterministic_runner import DeterministicRunner
+        from orchestrator.proc_supervision import (
+            EscalationSpec, RestartDisposition, RestartOutcome, RestartPlan,
+        )
+
+        queue = EscalationQueue(tmp_path)
+        runner = DeterministicRunner(scheduler=MagicMock(), escalation_queue=queue)
+
+        before_done = {
+            'script': '/usr/local/bin/restart-deploy.sh',
+            'args': ['--flag'],
+            'cwd': '/home/leo/src/dark-factory',
+            'target_unit': 'orchestrator-reify.service',
+        }
+
+        captured_plans: list = []
+        canned = RestartOutcome(disposition=RestartDisposition.SCHEDULED)
+
+        async def _fake_execute(self, *, runner=None, inspector=None):
+            captured_plans.append(self)
+            return canned
+
+        with patch.object(RestartPlan, 'execute', _fake_execute):
+            rc, tail = await runner._default_schedule_detached_restart(
+                before_done,
+                transient_unit='orch-redeploy-restart-950.service',
+                on_active_secs=60,
+                task_id='950',
+            )
+
+        assert len(captured_plans) == 1, 'RestartPlan.execute must be awaited exactly once'
+        plan = captured_plans[0]
+
+        assert plan.target_unit == 'orch-redeploy-restart-950.service'
+        assert plan.own_unit == 'orch-redeploy-restart-950.service'
+        assert plan.target_unit == plan.own_unit == plan.transient_unit
+        assert plan.verify is None
+        assert plan.on_active_secs == 60
+
+        spec = plan.on_failure_escalation
+        assert isinstance(spec, EscalationSpec)
+        assert spec.task_id == '950'
+        assert spec.category == 'infra_issue'
+        assert spec.agent_role == 'orchestrator-deterministic'
+        assert spec.summary == 'Self-restart fire-time failure: orchestrator-reify.service'
+        assert 'orch-redeploy-restart-950.service' in spec.detail
+
+        assert rc == 0
+        assert tail == ''
+
+    async def test_explicit_summary_forwarded_to_escalation_spec(self, tmp_path: Path):
+        """A caller-supplied summary overrides the default fire-time summary."""
+        from unittest.mock import patch
+
+        from orchestrator.deterministic_runner import DeterministicRunner
+        from orchestrator.proc_supervision import RestartDisposition, RestartOutcome, RestartPlan
+
+        queue = EscalationQueue(tmp_path)
+        runner = DeterministicRunner(scheduler=MagicMock(), escalation_queue=queue)
+
+        before_done = {
+            'script': '/usr/local/bin/restart-deploy.sh',
+            'args': [],
+            'target_unit': 'orchestrator-reify.service',
+        }
+        captured_plans: list = []
+        canned = RestartOutcome(disposition=RestartDisposition.SCHEDULED)
+
+        async def _fake_execute(self, *, runner=None, inspector=None):
+            captured_plans.append(self)
+            return canned
+
+        with patch.object(RestartPlan, 'execute', _fake_execute):
+            await runner._default_schedule_detached_restart(
+                before_done,
+                transient_unit='orch-redeploy-restart-951.service',
+                on_active_secs=60,
+                task_id='951',
+                summary='Custom fire-time summary',
+            )
+
+        assert captured_plans[0].on_failure_escalation.summary == 'Custom fire-time summary'
+
+    async def test_disposition_scheduled_maps_to_rc_zero(self, tmp_path: Path):
+        """RestartDisposition.SCHEDULED maps to (0, '')."""
+        from unittest.mock import patch
+
+        from orchestrator.deterministic_runner import DeterministicRunner
+        from orchestrator.proc_supervision import RestartDisposition, RestartOutcome, RestartPlan
+
+        queue = EscalationQueue(tmp_path)
+        runner = DeterministicRunner(scheduler=MagicMock(), escalation_queue=queue)
+
+        before_done = {
+            'script': '/usr/local/bin/restart-deploy.sh',
+            'args': [],
+            'target_unit': 'orchestrator-reify.service',
+        }
+        canned = RestartOutcome(disposition=RestartDisposition.SCHEDULED)
+
+        async def _fake_execute(self, *, runner=None, inspector=None):
+            return canned
+
+        with patch.object(RestartPlan, 'execute', _fake_execute):
+            rc, tail = await runner._default_schedule_detached_restart(
+                before_done,
+                transient_unit='orch-redeploy-restart-952.service',
+                on_active_secs=60,
+                task_id='952',
+            )
+
+        assert (rc, tail) == (0, '')
+
+    async def test_disposition_registration_failed_maps_to_rc_one_with_detail(self, tmp_path: Path):
+        """RestartDisposition.REGISTRATION_FAILED maps to (1, outcome.detail)."""
+        from unittest.mock import patch
+
+        from orchestrator.deterministic_runner import DeterministicRunner
+        from orchestrator.proc_supervision import RestartDisposition, RestartOutcome, RestartPlan
+
+        queue = EscalationQueue(tmp_path)
+        runner = DeterministicRunner(scheduler=MagicMock(), escalation_queue=queue)
+
+        before_done = {
+            'script': '/usr/local/bin/restart-deploy.sh',
+            'args': [],
+            'target_unit': 'orchestrator-reify.service',
+        }
+        canned = RestartOutcome(
+            disposition=RestartDisposition.REGISTRATION_FAILED,
+            detail='systemd-run registration failed: rc=1: boom',
+        )
+
+        async def _fake_execute(self, *, runner=None, inspector=None):
+            return canned
+
+        with patch.object(RestartPlan, 'execute', _fake_execute):
+            rc, tail = await runner._default_schedule_detached_restart(
+                before_done,
+                transient_unit='orch-redeploy-restart-953.service',
+                on_active_secs=60,
+                task_id='953',
+            )
+
+        assert rc == 1
+        assert tail == 'systemd-run registration failed: rc=1: boom'
+
+    async def test_behaviour_identity_argv_and_gated_escalation_via_real_execute(self, tmp_path: Path):
+        """Behaviour-identity: a REAL execute() (fake create_subprocess_exec
+        runner) still produces the systemd-run argv shape and the gated
+        on-failure escalation wrapper."""
+        from unittest.mock import patch
+
+        from orchestrator.deterministic_runner import DeterministicRunner
+
+        queue = EscalationQueue(tmp_path)
+        runner = DeterministicRunner(scheduler=MagicMock(), escalation_queue=queue)
+
+        before_done = {
+            'script': '/usr/local/bin/restart-deploy.sh',
+            'args': [],
+            'cwd': '/home/leo/src/dark-factory',
+            'target_unit': 'orchestrator-reify.service',
+        }
+
+        mock_proc = AsyncMock()
+        mock_proc.communicate = AsyncMock(return_value=(b'', b''))
+        mock_proc.returncode = 0
+
+        with patch('asyncio.create_subprocess_exec', return_value=mock_proc) as mock_exec:
+            rc, tail = await runner._default_schedule_detached_restart(
+                before_done,
+                transient_unit='orch-redeploy-restart-954.service',
+                on_active_secs=60,
+                task_id='954',
+            )
+
+        assert rc == 0
+        assert tail == ''
+        argv = mock_exec.call_args_list[0].args
+        all_argv = ' '.join(str(a) for a in argv)
+        assert 'systemd-run' in all_argv
+        assert '--user' in all_argv
+        assert '--on-active' in all_argv
+        assert '--collect' in all_argv
+        assert '--working-directory=/home/leo/src/dark-factory' in all_argv
+        assert 'orch-redeploy-restart-954.service' in all_argv
+        assert argv[-3] == '/bin/sh' and argv[-2] == '-c', (
+            f'expected a /bin/sh -c wrapper payload, got {argv!r}'
+        )
+        wrapped = argv[-1]
+        assert '/usr/local/bin/restart-deploy.sh' in wrapped
+        assert '-ne 0' in wrapped, f'escalation must be gated behind a non-zero exit check: {wrapped!r}'
+        assert 'escalation' in wrapped and 'submit' in wrapped
+
+
+# ---------------------------------------------------------------------------
 # Step-9 (ε): own-unit resolution from ORCH_UNIT env var + end-to-end
 # self-detection without injected resolver
 # (RED until step-10 finalises _default_resolve_own_unit + docstring)
