@@ -169,7 +169,7 @@ Branches 1 and 2 are **domain-weighted**: they fire heavily for numerical/scient
 
 **Resolution.** Redesign the task (add the streak counter, move the contract to a schema field/lint, add the corroboration step, extract the helper) — or **waive**: record `G7 waiver: <slug> — <rationale>` in the PRD's decomposition-plan row AND stamp `metadata.g7_waivers: [{"invariant": <slug>, "rationale": <text>}]` on the filed task. An unresolved, unwaived hit blocks the batch.
 
-**Calibration:** `docs/legibility/design-invariants-fixtures.md`.
+**Calibration:** seeded-violation fixtures + rehearsal verdict table will live at `docs/legibility/design-invariants-fixtures.md` once sibling task ε lands (file not yet present as of this doc's landing).
 
 ---
 
