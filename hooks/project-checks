@@ -9,6 +9,11 @@ echo "pre-commit: linting (main branch)..."
 ALL_PACKAGES=(shared escalation fused-memory orchestrator dashboard)
 # Packages with [tool.pyright] config (pyright runs per-package from its directory)
 PYRIGHT_PACKAGES=(fused-memory orchestrator dashboard)
+# Shared dependency packages imported by every PYRIGHT_PACKAGES package. These
+# aren't pyright-configured themselves, so a staged change here can't be
+# caught by the per-package prefix filter below — it must instead force a
+# full pyright sweep across all PYRIGHT_PACKAGES. See task 2551.
+DEP_PACKAGES=(shared escalation)
 
 DIRS=()
 for pkg in "${ALL_PACKAGES[@]}"; do
@@ -59,15 +64,26 @@ fi
 # pyright (must run from each package directory to pick up [tool.pyright] config)
 # Path-filtered: only run for packages with staged .py changes, so docs/plans-only
 # commits (and commits scoped to a single package) don't pay for an unconditional
-# 3x pyright run. See task 2551.
+# 3x pyright run. A staged change under a DEP_PACKAGES dependency (shared,
+# escalation) forces a full sweep across all PYRIGHT_PACKAGES instead: those
+# packages aren't in PYRIGHT_PACKAGES themselves, so the per-package prefix
+# filter would otherwise match nothing and skip pyright everywhere, even
+# though fused-memory/orchestrator/dashboard all import from them. See task 2551.
 staged_py_all="$(cd "$ROOT" && git diff --cached --name-only --diff-filter=ACMR | grep -E '\.py$' || true)"
 if [ -z "$staged_py_all" ]; then
     echo "pre-commit: pyright skipped (no Python changes)"
 else
+    run_all=false
+    for dep in "${DEP_PACKAGES[@]}"; do
+        if printf '%s\n' "$staged_py_all" | grep -q "^${dep}/"; then
+            run_all=true
+            break
+        fi
+    done
     for pkg in "${PYRIGHT_PACKAGES[@]}"; do
         dir="$ROOT/$pkg"
         [ -d "$dir" ] || continue
-        if ! printf '%s\n' "$staged_py_all" | grep -q "^${pkg}/"; then
+        if [ "$run_all" = false ] && ! printf '%s\n' "$staged_py_all" | grep -q "^${pkg}/"; then
             continue
         fi
         echo "  pyright: $pkg"
