@@ -10,9 +10,11 @@ append-only, never-delete.
 """
 from __future__ import annotations
 
+import os
 import re
 
 import jsonschema
+import yaml
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -170,3 +172,37 @@ def validate(codebook: dict) -> list[str]:
                 seen_cand_ids.add(cand_id)
 
     return errors
+
+
+# ---------------------------------------------------------------------------
+# load / dump — deterministic canonical YAML I/O
+# ---------------------------------------------------------------------------
+
+def load(path: str | os.PathLike) -> dict:
+    """Load a codebook YAML file into a plain dict via yaml.safe_load."""
+    with open(path, "r", encoding="utf-8") as f:
+        return yaml.safe_load(f)
+
+
+def dump(codebook: dict, path: str | os.PathLike) -> None:
+    """Write `codebook` to `path` in canonical, deterministic form.
+
+    ruamel.yaml (comment-preserving round-trip) is NOT available in this
+    environment, so — per PRD decision 1 (merger is the sole writer) — this
+    normalizes to a fixed canonical block-style form: sort_keys=False
+    (preserve dict insertion order), default_flow_style=False (block style,
+    no inline `{...}`), allow_unicode=True, a wide width (avoid
+    nondeterministic line wrapping), prefixed with the fixed HEADER comment.
+    Byte-stable given byte-stable input, so a no-change night commits
+    nothing (PRD §6.7).
+    """
+    body = yaml.safe_dump(
+        codebook,
+        sort_keys=False,
+        default_flow_style=False,
+        allow_unicode=True,
+        width=4096,
+    )
+    with open(path, "w", encoding="utf-8") as f:
+        f.write(HEADER)
+        f.write(body)
