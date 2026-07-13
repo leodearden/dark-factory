@@ -69,7 +69,16 @@ fi
 # packages aren't in PYRIGHT_PACKAGES themselves, so the per-package prefix
 # filter would otherwise match nothing and skip pyright everywhere, even
 # though fused-memory/orchestrator/dashboard all import from them. See task 2551.
-staged_py_all="$(cd "$ROOT" && git diff --cached --name-only --diff-filter=ACMR | grep -E '\.py$' || true)"
+# -c core.quotepath=false stops git from quoting/escaping non-ASCII path
+# bytes (its default quoting only covers bytes >= 0x80; control characters and
+# literal quote/backslash bytes are always escaped regardless of this
+# setting). A path with an embedded newline or a leading double-quote could
+# still fail the ^${dep}/ / ^${pkg}/ prefix matches below and silently skip
+# pyright for a package that was actually staged — a pre-existing limitation
+# shared by the ruff/asyncmock/magicmock staged-file filters elsewhere in this
+# script (not a regression), accepted as low-likelihood given this repo's
+# file-naming conventions. See task 2551.
+staged_py_all="$(cd "$ROOT" && git -c core.quotepath=false diff --cached --name-only --diff-filter=ACMR | grep -E '\.py$' || true)"
 if [ -z "$staged_py_all" ]; then
     echo "pre-commit: pyright skipped (no Python changes)"
 else
@@ -80,6 +89,13 @@ else
             break
         fi
     done
+    # Note: a staged .py file that lives outside every DEP_PACKAGES and
+    # PYRIGHT_PACKAGES prefix (e.g. a repo-root script) leaves run_all=false
+    # and matches no ^${pkg}/ prefix below, so pyright is skipped everywhere
+    # for that commit. Accepted as an over-narrowing given this repo's layout
+    # (root-level Python is rare and itself unconfigured for pyright); if that
+    # changes, treat "staged .py matching no known package prefix" as its own
+    # run_all trigger. See task 2551.
     for pkg in "${PYRIGHT_PACKAGES[@]}"; do
         dir="$ROOT/$pkg"
         [ -d "$dir" ] || continue
