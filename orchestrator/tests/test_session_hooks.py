@@ -541,6 +541,148 @@ def test_run_session_start_display_stamping_applies_on_refresh_path(tmp_path: Pa
 
 
 # ---------------------------------------------------------------------------
+# Task 2510 step-3: SessionStart marker-search display stamping (Fleet Cockpit C10 fix)
+# ---------------------------------------------------------------------------
+
+
+def test_run_session_start_marker_title_env_stamps_wm_display_via_resolver(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    hook_input = {'session_id': 'sess-m1', 'cwd': '/home/leo/src/dark-factory'}
+    env = {'CLAUDE_SPAWN_WM_TITLE': 'focus:df#2510 alpha'}
+    monkeypatch.setattr(sh, '_resolve_wm_window_id', lambda title: '0x03200007')
+
+    sh.run_session_start(hook_input, env, root=tmp_path)
+
+    slug = sh.hook_session_slug(hook_input, env)
+    record = sr.read_record(slug, root=tmp_path)
+    assert record.display is not None
+    assert record.display.kind == 'wm'
+    assert record.display.wm_window_id == '0x03200007'
+    assert record.display.wm_title == 'focus:df#2510 alpha'
+
+
+def test_run_session_start_marker_title_resolver_miss_leaves_display_none(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Best-effort: a resolution miss must be no worse than today -- record.display
+    # stays None, exactly like the no-tmux/no-windowid case.
+    hook_input = {'session_id': 'sess-m2', 'cwd': '/home/leo/src/dark-factory'}
+    env = {'CLAUDE_SPAWN_WM_TITLE': 'focus:df#2510 alpha'}
+    monkeypatch.setattr(sh, '_resolve_wm_window_id', lambda title: None)
+
+    sh.run_session_start(hook_input, env, root=tmp_path)
+
+    slug = sh.hook_session_slug(hook_input, env)
+    record = sr.read_record(slug, root=tmp_path)
+    assert record.display is None
+
+
+def test_run_session_start_windowid_wins_over_marker_title_resolver_not_called(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    hook_input = {'session_id': 'sess-m3', 'cwd': '/home/leo/src/dark-factory'}
+    env = {'WINDOWID': '0x3200007', 'CLAUDE_SPAWN_WM_TITLE': 'focus:df#2510 alpha'}
+
+    def _boom(title: str) -> str | None:
+        raise AssertionError('resolver must not be called when WINDOWID is present')
+
+    monkeypatch.setattr(sh, '_resolve_wm_window_id', _boom)
+
+    sh.run_session_start(hook_input, env, root=tmp_path)
+
+    slug = sh.hook_session_slug(hook_input, env)
+    record = sr.read_record(slug, root=tmp_path)
+    assert record.display is not None
+    assert record.display.kind == 'wm'
+    assert record.display.wm_window_id == '0x3200007'
+
+
+def test_run_session_start_tmux_wins_over_marker_title_resolver_not_called(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    hook_input = {'session_id': 'sess-m4', 'cwd': '/home/leo/src/dark-factory'}
+    env = {
+        'TMUX': '/tmp/tmux-1000/default,123,0',
+        'TMUX_PANE': '%3',
+        'CLAUDE_SPAWN_WM_TITLE': 'focus:df#2510 alpha',
+    }
+
+    def _boom(title: str) -> str | None:
+        raise AssertionError('resolver must not be called when TMUX is present')
+
+    monkeypatch.setattr(sh, '_resolve_wm_window_id', _boom)
+
+    sh.run_session_start(hook_input, env, root=tmp_path)
+
+    slug = sh.hook_session_slug(hook_input, env)
+    record = sr.read_record(slug, root=tmp_path)
+    assert record.display is not None
+    assert record.display.kind == 'tmux'
+
+
+def test_run_session_start_marker_title_stamping_applies_on_refresh_path(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    hook_input = {'session_id': 'sess-m5', 'cwd': '/home/leo/src/dark-factory'}
+    env = {'CLAUDE_SPAWN_WM_TITLE': 'focus:df#2510 alpha'}
+    monkeypatch.setattr(sh, '_resolve_wm_window_id', lambda title: '0x03200007')
+    slug = sh.hook_session_slug(hook_input, env)
+    existing = sr.SessionRecord(
+        session_slug=slug,
+        status=sr.Status.LAUNCHING,
+        title='unblock:df#2085 routing-mechanism',
+        role='unblock',
+        project='df',
+        task_id='2085',
+        cwd='/home/leo/src/dark-factory',
+        prompt='/unblock 2085',
+    )
+    sr.write_record(existing, root=tmp_path)
+
+    sh.run_session_start(hook_input, env, root=tmp_path)
+
+    record = sr.read_record(slug, root=tmp_path)
+    assert record.status == sr.Status.RUNNING
+    assert record.display is not None
+    assert record.display.kind == 'wm'
+    assert record.display.wm_window_id == '0x03200007'
+    assert record.display.wm_title == 'focus:df#2510 alpha'
+    # Previously-populated fields survive.
+    assert record.role == 'unblock'
+    assert record.project == 'df'
+    assert record.task_id == '2085'
+    assert record.prompt == '/unblock 2085'
+
+
+def test_run_session_start_no_marker_title_resolver_never_invoked(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # No TMUX/WINDOWID/CLAUDE_SPAWN_WM_TITLE -> display stays None (matches
+    # test_run_session_start_no_tmux_or_windowid_leaves_display_none) AND the
+    # resolver is never invoked -- no fallback to a churny derived title.
+    hook_input = {'session_id': 'sess-m6', 'cwd': '/home/leo/src/dark-factory'}
+    env: dict[str, str] = {}
+
+    def _boom(title: str) -> str | None:
+        raise AssertionError('resolver must not be called when no marker is set')
+
+    monkeypatch.setattr(sh, '_resolve_wm_window_id', _boom)
+
+    sh.run_session_start(hook_input, env, root=tmp_path)
+
+    slug = sh.hook_session_slug(hook_input, env)
+    record = sr.read_record(slug, root=tmp_path)
+    assert record.display is None
+
+
+# ---------------------------------------------------------------------------
 # Step-7: run_notification / run_stop (status flip + OSC return)
 # ---------------------------------------------------------------------------
 
