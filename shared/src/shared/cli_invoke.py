@@ -1252,31 +1252,33 @@ async def invoke_with_cap_retry(
     return result
 
 
-async def _invoke_claude(
-    prompt: str,
-    system_prompt: str,
-    cwd: Path,
+def build_claude_argv(
+    *,
     model: str,
-    max_turns: int,
     max_budget_usd: float,
+    system_prompt: str,
+    max_turns: int,
+    permission_mode: str,
     allowed_tools: list[str] | None,
     disallowed_tools: list[str] | None,
     mcp_config: dict | None,
     output_schema: dict | None,
-    permission_mode: str,
     effort: str | None,
-    oauth_token: str | None = None,
-    timeout_seconds: float | None = None,
-    resume_session_id: str | None = None,
-    session_id: str | None = None,
-    config_dir: Path | None = None,
-    env_overrides: dict[str, str] | None = None,
-    startup_grace_secs: float = 120.0,
-    sandbox_wrap: Callable[[list[str]], list[str]] | None = None,
-    working_idle_secs: float | None = None,
-    absolute_cap_secs: float | None = None,
-) -> AgentResult:
-    """Invoke Claude Code CLI."""
+    resume_session_id: str | None,
+    session_id: str | None,
+) -> tuple[list[str], list[str]]:
+    """Assemble the Claude CLI argv — the single source of truth shared by the
+    non-sandbox (``_invoke_claude``) and sandbox (``_invoke_claude_with_sandbox``)
+    invocation paths (task 2465 dedup).
+
+    Builds the argv up to (but NOT including) any sandbox wrap, creating the
+    on-disk system-prompt / mcp-config temp files it references along the way.
+
+    Returns ``(cmd, temp_files)``: ``cmd`` is the assembled argv list;
+    ``temp_files`` lists the temp file paths created (empty when resuming and
+    no ``mcp_config`` is set).  The caller owns cleanup, typically via
+    ``finally: for p in temp_files: Path(p).unlink(missing_ok=True)``.
+    """
     cmd = ['claude', '--print', '--output-format', 'json']
 
     cmd.extend(['--model', model])
@@ -1331,6 +1333,49 @@ async def _invoke_claude(
 
     if output_schema:
         cmd.extend(['--json-schema', json.dumps(output_schema)])
+
+    return cmd, temp_files
+
+
+async def _invoke_claude(
+    prompt: str,
+    system_prompt: str,
+    cwd: Path,
+    model: str,
+    max_turns: int,
+    max_budget_usd: float,
+    allowed_tools: list[str] | None,
+    disallowed_tools: list[str] | None,
+    mcp_config: dict | None,
+    output_schema: dict | None,
+    permission_mode: str,
+    effort: str | None,
+    oauth_token: str | None = None,
+    timeout_seconds: float | None = None,
+    resume_session_id: str | None = None,
+    session_id: str | None = None,
+    config_dir: Path | None = None,
+    env_overrides: dict[str, str] | None = None,
+    startup_grace_secs: float = 120.0,
+    sandbox_wrap: Callable[[list[str]], list[str]] | None = None,
+    working_idle_secs: float | None = None,
+    absolute_cap_secs: float | None = None,
+) -> AgentResult:
+    """Invoke Claude Code CLI."""
+    cmd, temp_files = build_claude_argv(
+        model=model,
+        max_budget_usd=max_budget_usd,
+        system_prompt=system_prompt,
+        max_turns=max_turns,
+        permission_mode=permission_mode,
+        allowed_tools=allowed_tools,
+        disallowed_tools=disallowed_tools,
+        mcp_config=mcp_config,
+        output_schema=output_schema,
+        effort=effort,
+        resume_session_id=resume_session_id,
+        session_id=session_id,
+    )
 
     # User prompt is piped via stdin to avoid ARG_MAX on large payloads
     stdin_data = prompt.encode()
