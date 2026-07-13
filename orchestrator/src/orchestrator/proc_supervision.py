@@ -34,6 +34,19 @@ systemd_inspect.py's statelessness. Escalations are filed from an
 (RP-1/RP-5) via ``EscalationQueue(Path(spec.queue_dir)).submit(spec.to_escalation(queue))``,
 and in the RP-4 shell branch via ``spec.to_submit_argv(sys.executable)``
 (``python -m escalation submit ...``).
+
+RP-2/RP-5's cross-unit BLOCKING verify path (``_execute_cross_unit_blocking``,
+``FreshPidVerify``, the ``DEPLOYED_AND_VERIFIED``/``VERIFY_FAILED``/
+``RESTART_FAILED`` dispositions) has no production caller in this task —
+every caller converted here (``service_restart.py``'s two mechanisms) passes
+``verify=None``. This is not speculative: it is the full RP-1..5 contract
+this module is scoped to provide (PRD Sec 5.1), and its first real caller is
+already filed and tracked — task 2238 (W10-delta, "DeterministicRunner
+detached + blocking-verify restart paths delegate to RestartPlan.execute()"),
+which converts ``deterministic_runner.py``'s existing blocking cross-unit
+run + inline fresh-PID verify (:1267, :1310-1347) to build a ``FreshPidVerify``
+and delegate here. Kept correct by the RP-2/RP-4/RP-5 test cells in
+test_proc_supervision.py pending that conversion landing.
 """
 
 from __future__ import annotations
