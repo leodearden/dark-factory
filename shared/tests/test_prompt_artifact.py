@@ -20,6 +20,7 @@ from typing import Any
 import pytest
 from pydantic import ValidationError
 
+from shared import prompt_artifact
 from shared.prompt_artifact import (
     ArtifactProvenance,
     PromptArtifactStore,
@@ -184,6 +185,84 @@ class TestPinAndResolve:
             store.pin(
                 'reviewer', 'claude-opus-4', 'v2', heuristics='h', provenance=provenance
             )
+
+    def test_read_provenance_returns_none_when_nothing_pinned(self, tmp_path):
+        store = PromptArtifactStore(tmp_path)
+
+        assert store.read_provenance('reviewer', 'claude-opus-4', 'v1') is None
+
+    def test_repin_overwrites_previous_heuristics_and_provenance(self, tmp_path):
+        store = PromptArtifactStore(tmp_path)
+        spec = _make_spec()
+        old_provenance = ArtifactProvenance(
+            **_provenance_kwargs(harness_version='v1', git_sha='old-sha')
+        )
+        store.pin(
+            'reviewer', 'claude-opus-4', 'v1', heuristics='old heuristics',
+            provenance=old_provenance,
+        )
+
+        new_provenance = ArtifactProvenance(
+            **_provenance_kwargs(harness_version='v1', git_sha='new-sha')
+        )
+        store.pin(
+            'reviewer', 'claude-opus-4', 'v1', heuristics='new heuristics',
+            provenance=new_provenance,
+        )
+
+        resolved = store.resolve(spec, executor_model='claude-opus-4', harness_version='v1')
+
+        # The second pin's heuristics + provenance win outright — no trace of
+        # the first pin survives.
+        assert resolved.text == compose_prompt(spec.contract, 'new heuristics')
+        assert resolved.provenance == new_provenance
+        assert resolved.source == 'artifact'
+        assert store.read_provenance('reviewer', 'claude-opus-4', 'v1') == new_provenance
+
+    def test_repin_never_exposes_new_heuristics_with_stale_provenance(self, tmp_path, monkeypatch):
+        """Regression for the re-pin race: a reader interleaved between the
+        two writes of a re-pin must never see NEW heuristics stitched to the
+        OLD provenance sidecar — it must see the fail-safe in-code fallback
+        instead (pin() now drops the stale provenance.json before writing the
+        new heuristics.txt).
+        """
+        store = PromptArtifactStore(tmp_path)
+        spec = _make_spec()
+        old_provenance = ArtifactProvenance(
+            **_provenance_kwargs(harness_version='v1', git_sha='old-sha')
+        )
+        store.pin(
+            'reviewer', 'claude-opus-4', 'v1', heuristics='old heuristics',
+            provenance=old_provenance,
+        )
+
+        observed = []
+        real_atomic_write_text = prompt_artifact._atomic_write_text
+
+        def spying_write(path, text):
+            real_atomic_write_text(path, text)
+            if path.name == 'heuristics.txt':
+                # Snapshot resolve() right after the new heuristics land but
+                # before the new provenance.json is written.
+                observed.append(
+                    store.resolve(spec, executor_model='claude-opus-4', harness_version='v1')
+                )
+
+        monkeypatch.setattr(prompt_artifact, '_atomic_write_text', spying_write)
+
+        new_provenance = ArtifactProvenance(
+            **_provenance_kwargs(harness_version='v1', git_sha='new-sha')
+        )
+        store.pin(
+            'reviewer', 'claude-opus-4', 'v1', heuristics='new heuristics',
+            provenance=new_provenance,
+        )
+
+        assert len(observed) == 1
+        mid_write = observed[0]
+        assert mid_write.source == 'in_code'
+        assert mid_write.text == spec.in_code_constant
+        assert mid_write.provenance is None
 
 
 class TestUnpinRollback:

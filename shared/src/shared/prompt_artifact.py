@@ -236,6 +236,16 @@ class PromptArtifactStore:
         Writes atomically, ``provenance.json`` LAST: a crash between the two
         writes leaves at most a heuristics-only directory, which resolve()
         treats as not-pinned (fail-safe).
+
+        On a **re-pin** of an already-pinned key, the stale
+        ``provenance.json`` is removed *before* the new ``heuristics.txt`` is
+        written. Without that, "provenance last" alone only protects a
+        first-time pin: on overwrite, a resolve() racing this call could
+        observe the NEW heuristics text paired with the OLD provenance
+        sidecar (a mismatched pair, still reported as ``source='artifact'``).
+        Dropping the old sidecar first means any interleaved reader instead
+        sees the same heuristics-without-provenance state a first-time pin
+        passes through, which resolve() already treats as not-pinned.
         """
         if provenance.harness_version != harness_version:
             raise ValueError(
@@ -244,8 +254,10 @@ class PromptArtifactStore:
             )
         key_dir = self._key_dir(prompt_id, executor_model, harness_version)
         key_dir.mkdir(parents=True, exist_ok=True)
+        provenance_path = key_dir / _PROVENANCE_FILENAME
+        provenance_path.unlink(missing_ok=True)
         _atomic_write_text(key_dir / _HEURISTICS_FILENAME, heuristics)
-        _atomic_write_text(key_dir / _PROVENANCE_FILENAME, provenance.model_dump_json())
+        _atomic_write_text(provenance_path, provenance.model_dump_json())
 
     def read_provenance(
         self, prompt_id: str, executor_model: str, harness_version: str
