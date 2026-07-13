@@ -220,6 +220,46 @@ class TestPinAndResolve:
         assert resolved.source == 'artifact'
         assert store.read_provenance('reviewer', 'claude-opus-4', 'v1') == new_provenance
 
+    def test_first_pin_never_exposes_heuristics_before_provenance_lands(
+        self, tmp_path, monkeypatch
+    ):
+        """Regression locking in "provenance written last" for a *first-time*
+        pin, not just a re-pin: if a reader observes the key dir right after
+        heuristics.txt lands but before provenance.json is written, it must
+        see the fail-safe in-code fallback — never an orphan heuristics file
+        treated as pinned.
+        """
+        store = PromptArtifactStore(tmp_path)
+        spec = _make_spec()
+
+        observed = []
+        real_atomic_write_text = prompt_artifact._atomic_write_text
+
+        def spying_write(path, text):
+            real_atomic_write_text(path, text)
+            if path.name == 'heuristics.txt':
+                # Snapshot resolve() right after heuristics.txt lands but
+                # before provenance.json is written. There is no prior pin
+                # at this key, so an interrupted first pin must resolve to
+                # in_code, not merely "the previous artifact".
+                observed.append(
+                    store.resolve(spec, executor_model='claude-opus-4', harness_version='v1')
+                )
+
+        monkeypatch.setattr(prompt_artifact, '_atomic_write_text', spying_write)
+
+        provenance = ArtifactProvenance(**_provenance_kwargs(harness_version='v1'))
+        store.pin(
+            'reviewer', 'claude-opus-4', 'v1', heuristics='first heuristics',
+            provenance=provenance,
+        )
+
+        assert len(observed) == 1
+        mid_write = observed[0]
+        assert mid_write.source == 'in_code'
+        assert mid_write.text == spec.in_code_constant
+        assert mid_write.provenance is None
+
     def test_repin_never_exposes_new_heuristics_with_stale_provenance(self, tmp_path, monkeypatch):
         """Regression for the re-pin race: a reader interleaved between the
         two writes of a re-pin must never see NEW heuristics stitched to the
