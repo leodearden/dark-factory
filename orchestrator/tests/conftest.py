@@ -207,6 +207,28 @@ def _isolate_orch_config(monkeypatch, tmp_path):
     monkeypatch.setenv("ORCH_PROJECT_ROOT", str(tmp_path))
 
 
+def pytest_configure(config: pytest.Config) -> None:
+    """Register the ``real_psi_reader`` opt-out marker (task 2418).
+
+    ``orchestrator/pyproject.toml``'s ``[tool.pytest.ini_options] markers``
+    list is outside this task's locked scope, so the marker used by the
+    ``_hermetic_psi_reader`` fixture below is registered here instead, via
+    the standard ``addinivalue_line`` hook. Without one of the two
+    registration paths, applying ``@pytest.mark.real_psi_reader`` would
+    raise ``PytestUnknownMarkWarning`` under a future ``--strict-markers``
+    addopts change, silently defeating the escape hatch — today's
+    ``addopts`` doesn't set that flag, so this is precautionary rather than
+    load-bearing yet.
+    """
+    config.addinivalue_line(
+        'markers',
+        'real_psi_reader: opt a test OUT of the autouse `_hermetic_psi_reader` '
+        'patch so it exercises the REAL `shared.psi.read_psi_sample` bound at '
+        'Scheduler construction instead of the deterministic idle-sample stub. '
+        'Default: autouse idle-PSI patch installed in conftest.py (task 2418).',
+    )
+
+
 @pytest.fixture(autouse=True)
 def _hermetic_psi_reader(monkeypatch, request):
     """Default every Scheduler's PSI reader to a deterministic idle sample.
@@ -254,12 +276,15 @@ def _hermetic_psi_reader(monkeypatch, request):
     assert reader identity, or to exercise genuine ``/proc/pressure/*``
     reads — mark themselves with ``@pytest.mark.real_psi_reader`` to skip
     the monkeypatch, restoring the real binding. Mirrors the
-    ``exercise_merge_verify`` opt-out pattern elsewhere in this file. Not yet
-    registered in ``orchestrator/pyproject.toml``'s ``markers = [...]`` list
-    (outside this task's locked scope); harmless since this project's
-    ``addopts`` does not set ``--strict-markers``. A test may instead
-    reassign ``scheduler._read_psi_sample`` post-construction, as the
-    saturation tests do.
+    ``exercise_merge_verify`` opt-out pattern elsewhere in this file.
+    Registered via this file's ``pytest_configure`` hook above (not in
+    ``orchestrator/pyproject.toml``'s ``markers = [...]`` list, which
+    remains outside this task's locked scope), so the marker survives a
+    future ``--strict-markers`` addopts change instead of erroring at
+    collection. Guard test for this opt-out branch:
+    ``test_scheduler_hermetic_psi.py::test_real_psi_reader_marker_restores_real_reader``.
+    A test may instead reassign ``scheduler._read_psi_sample``
+    post-construction, as the saturation tests do.
     """
     if request.node.get_closest_marker('real_psi_reader'):
         return
