@@ -8,15 +8,25 @@ mcp_config_json() regression guard (step-3/step-4).
 
 TestInvokeInjectsMcpStartupTimeout — _invoke_claude_with_sandbox injects
 MCP_TIMEOUT into env_overrides (step-5/step-6).
+
+TestManagedRuntimeDataDirs — managed_runtime_data_dirs() pure helper: XDG
+override, home fallback, and not-under-project-root (task 2439 step-1/step-2).
+
+TestManagedSpawnEnvInjection — McpLifecycle.start()'s managed-spawn branch
+injects QUEUE_DATA_DIR/RECONCILIATION_DATA_DIR out-of-tree, honoring an
+operator-preset override (task 2439 step-3/step-4).
 """
 
 from __future__ import annotations
 
+import tempfile
 from pathlib import Path
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+from _orch_helpers import pydantic_spec
 
+from orchestrator.config import OrchestratorConfig
 from orchestrator.mcp_lifecycle import plan_tools_mcp_server
 
 # ---------------------------------------------------------------------------
@@ -419,3 +429,257 @@ class TestPlanToolsLaunchMetaRoot:
             python_executable='/venv/bin/python',
         )
         assert '--meta-root' not in cfg['args']
+
+
+# ---------------------------------------------------------------------------
+# Step-1/Step-2 (task 2439): managed_runtime_data_dirs() pure helper
+# ---------------------------------------------------------------------------
+
+
+class TestManagedRuntimeDataDirs:
+    """managed_runtime_data_dirs(project_id) — pure helper computing the
+    out-of-tree queue/reconciliation runtime dirs for a managed fused-memory
+    spawn, keeping its runtime SQLite state out of a watched project's
+    tracked tree (task 2439)."""
+
+    def test_xdg_state_home_set_returns_dark_factory_project_subdirs(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """With XDG_STATE_HOME set, both dirs nest under it as
+        dark-factory/<project_id>/{queue,reconciliation}."""
+        monkeypatch.setenv('XDG_STATE_HOME', str(tmp_path))
+        from orchestrator.mcp_lifecycle import managed_runtime_data_dirs
+
+        queue_dir, recon_dir = managed_runtime_data_dirs('reify')
+
+        assert queue_dir == tmp_path / 'dark-factory' / 'reify' / 'queue'
+        assert recon_dir == tmp_path / 'dark-factory' / 'reify' / 'reconciliation'
+
+    def test_xdg_state_home_unset_falls_back_to_home_local_state(
+        self, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """With XDG_STATE_HOME unset, the base falls back to ~/.local/state."""
+        monkeypatch.delenv('XDG_STATE_HOME', raising=False)
+        from orchestrator.mcp_lifecycle import managed_runtime_data_dirs
+
+        queue_dir, recon_dir = managed_runtime_data_dirs('reify')
+
+        expected_root = Path.home() / '.local' / 'state' / 'dark-factory' / 'reify'
+        assert queue_dir == expected_root / 'queue'
+        assert recon_dir == expected_root / 'reconciliation'
+
+    def test_neither_path_is_under_a_sample_project_root(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Regression guard: with the process cwd set to a watched
+        project's root — exactly how McpLifecycle.start() spawns fused-memory
+        (cwd=str(project_root)) — the returned dirs must still resolve under
+        the XDG state root, not fall back to a CWD-relative path that would
+        nest them inside the project (the pollution this task fixes).
+
+        project_root and XDG_STATE_HOME are both siblings under tmp_path (not
+        an unrelated hard-coded path), and we actually chdir into
+        project_root, so a regression to a relative './data/...' default —
+        which the OS would resolve against cwd — is caught instead of
+        trivially passing."""
+        xdg_home = tmp_path / 'xdg-state'
+        project_root = tmp_path / 'watched-project'
+        project_root.mkdir()
+        monkeypatch.setenv('XDG_STATE_HOME', str(xdg_home))
+        monkeypatch.chdir(project_root)
+        from orchestrator.mcp_lifecycle import managed_runtime_data_dirs
+
+        queue_dir, recon_dir = managed_runtime_data_dirs('reify')
+
+        # Absolute — never susceptible to CWD-relative resolution (the
+        # actual historical pollution vector: cwd=project_root + a relative
+        # env var default).
+        assert queue_dir.is_absolute()
+        assert recon_dir.is_absolute()
+        # Not nested under the project root the managed spawn's cwd is set to.
+        assert not queue_dir.is_relative_to(project_root)
+        assert not recon_dir.is_relative_to(project_root)
+        # Positively pinned to the XDG root — not merely "some absolute
+        # path elsewhere", closing the tautology gap.
+        assert queue_dir.is_relative_to(xdg_home)
+        assert recon_dir.is_relative_to(xdg_home)
+
+    def test_home_resolution_failure_falls_back_to_tempdir(
+        self, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Path.home() raises RuntimeError when it cannot resolve a home
+        directory (e.g. HOME unset in a stripped daemon/CI environment).
+        McpLifecycle.start() calls managed_runtime_data_dirs() unconditionally
+        on its managed-spawn path, so an unguarded RuntimeError here would
+        crash orchestrator startup instead of degrading gracefully. The
+        helper must catch it and fall back to the OS temp dir rather than
+        propagating (task 2439 amendment)."""
+        monkeypatch.delenv('XDG_STATE_HOME', raising=False)
+
+        def _raise_no_home() -> Path:
+            raise RuntimeError('Could not determine home directory.')
+
+        monkeypatch.setattr(Path, 'home', _raise_no_home)
+        from orchestrator.mcp_lifecycle import managed_runtime_data_dirs
+
+        # Must not raise.
+        queue_dir, recon_dir = managed_runtime_data_dirs('reify')
+
+        assert queue_dir.is_absolute()
+        assert recon_dir.is_absolute()
+        assert queue_dir.is_relative_to(Path(tempfile.gettempdir()))
+        assert recon_dir.is_relative_to(Path(tempfile.gettempdir()))
+        root = queue_dir.parent
+        assert root == recon_dir.parent
+        assert root.name == 'reify'
+        assert root.parent.name == 'dark-factory'
+
+
+# ---------------------------------------------------------------------------
+# Step-3/Step-4 (task 2439): McpLifecycle.start() managed-spawn env injection
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestManagedSpawnEnvInjection:
+    """McpLifecycle.start()'s managed-spawn branch injects
+    QUEUE_DATA_DIR/RECONCILIATION_DATA_DIR pointing out-of-tree, so the
+    managed fused-memory's runtime SQLite state never dirties the watched
+    project's tracked tree (task 2439). Mirrors
+    TestMcpLifecycleProcessGroup's mock/patch idiom in test_mcp_retry.py."""
+
+    @pytest.fixture
+    def mock_config(self, tmp_path: Path) -> MagicMock:
+        """Config-shaped mock for McpLifecycle: non-empty server_command
+        (managed mode), a real project_id, and project_root=tmp_path."""
+        cfg = MagicMock(spec_set=pydantic_spec(OrchestratorConfig))
+        cfg.fused_memory.server_command = ['echo', 'ok']
+        cfg.fused_memory.url = 'http://localhost:8002'
+        cfg.fused_memory.config_path = 'fused-memory/config/config.yaml'
+        cfg.fused_memory.project_id = 'reify'
+        cfg.project_root = tmp_path
+        return cfg
+
+    async def test_start_injects_out_of_tree_queue_and_reconciliation_dirs(
+        self, mock_config: MagicMock, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """No operator override present -> env carries the computed
+        managed_runtime_data_dirs() paths, neither of which is under
+        project_root; cwd stays project_root (unchanged by this task)."""
+        monkeypatch.delenv('QUEUE_DATA_DIR', raising=False)
+        monkeypatch.delenv('RECONCILIATION_DATA_DIR', raising=False)
+
+        from orchestrator.mcp_lifecycle import McpLifecycle, managed_runtime_data_dirs
+
+        captured_kwargs: dict = {}
+
+        async def fake_exec(*args: object, **kwargs: object) -> MagicMock:
+            captured_kwargs.update(kwargs)
+            proc = MagicMock()
+            proc.returncode = None
+            proc.stdout = MagicMock()
+            proc.stderr = MagicMock()
+            return proc
+
+        with (
+            patch(
+                'orchestrator.mcp_lifecycle.asyncio.create_subprocess_exec',
+                side_effect=fake_exec,
+            ),
+            patch.object(
+                McpLifecycle, '_wait_for_health', new=AsyncMock(return_value=True)
+            ),
+            patch('orchestrator.mcp_lifecycle.McpSession') as mock_session_cls,
+        ):
+            mock_session_cls.return_value.initialize = AsyncMock()
+            mcp = McpLifecycle(mock_config)
+            await mcp.start()
+
+        env = captured_kwargs.get('env')
+        assert env is not None, 'create_subprocess_exec must be called with env='
+        expected_queue, expected_recon = managed_runtime_data_dirs('reify')
+        assert env['QUEUE_DATA_DIR'] == str(expected_queue)
+        assert env['RECONCILIATION_DATA_DIR'] == str(expected_recon)
+        assert not Path(env['QUEUE_DATA_DIR']).is_relative_to(tmp_path)
+        assert not Path(env['RECONCILIATION_DATA_DIR']).is_relative_to(tmp_path)
+        # cwd is unchanged by this task
+        assert captured_kwargs.get('cwd') == str(tmp_path)
+
+    async def test_start_honors_operator_preset_queue_data_dir(
+        self, mock_config: MagicMock, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """An operator-preset QUEUE_DATA_DIR in the environment survives —
+        setdefault() must not clobber it."""
+        monkeypatch.setenv('QUEUE_DATA_DIR', '/custom/q')
+        monkeypatch.delenv('RECONCILIATION_DATA_DIR', raising=False)
+
+        from orchestrator.mcp_lifecycle import McpLifecycle
+
+        captured_kwargs: dict = {}
+
+        async def fake_exec(*args: object, **kwargs: object) -> MagicMock:
+            captured_kwargs.update(kwargs)
+            proc = MagicMock()
+            proc.returncode = None
+            proc.stdout = MagicMock()
+            proc.stderr = MagicMock()
+            return proc
+
+        with (
+            patch(
+                'orchestrator.mcp_lifecycle.asyncio.create_subprocess_exec',
+                side_effect=fake_exec,
+            ),
+            patch.object(
+                McpLifecycle, '_wait_for_health', new=AsyncMock(return_value=True)
+            ),
+            patch('orchestrator.mcp_lifecycle.McpSession') as mock_session_cls,
+        ):
+            mock_session_cls.return_value.initialize = AsyncMock()
+            mcp = McpLifecycle(mock_config)
+            await mcp.start()
+
+        env = captured_kwargs.get('env')
+        assert env is not None
+        assert env['QUEUE_DATA_DIR'] == '/custom/q'
+
+    async def test_start_honors_operator_preset_reconciliation_data_dir(
+        self, mock_config: MagicMock, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """An operator-preset RECONCILIATION_DATA_DIR in the environment
+        survives — setdefault() must not clobber it. Mirrors
+        test_start_honors_operator_preset_queue_data_dir: the two env vars
+        are set via separate setdefault() calls, so each needs its own
+        override assertion or a regression to one could go unnoticed."""
+        monkeypatch.delenv('QUEUE_DATA_DIR', raising=False)
+        monkeypatch.setenv('RECONCILIATION_DATA_DIR', '/custom/r')
+
+        from orchestrator.mcp_lifecycle import McpLifecycle
+
+        captured_kwargs: dict = {}
+
+        async def fake_exec(*args: object, **kwargs: object) -> MagicMock:
+            captured_kwargs.update(kwargs)
+            proc = MagicMock()
+            proc.returncode = None
+            proc.stdout = MagicMock()
+            proc.stderr = MagicMock()
+            return proc
+
+        with (
+            patch(
+                'orchestrator.mcp_lifecycle.asyncio.create_subprocess_exec',
+                side_effect=fake_exec,
+            ),
+            patch.object(
+                McpLifecycle, '_wait_for_health', new=AsyncMock(return_value=True)
+            ),
+            patch('orchestrator.mcp_lifecycle.McpSession') as mock_session_cls,
+        ):
+            mock_session_cls.return_value.initialize = AsyncMock()
+            mcp = McpLifecycle(mock_config)
+            await mcp.start()
+
+        env = captured_kwargs.get('env')
+        assert env is not None
+        assert env['RECONCILIATION_DATA_DIR'] == '/custom/r'

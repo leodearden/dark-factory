@@ -139,6 +139,50 @@ class TestConfigEnvOverrides:
         assert cfg.worktrees_dir == Path('/tmp/test/.worktrees')
 
 
+class TestManagedRuntimeEnvOverrides:
+    """DashboardConfig must honor the same QUEUE_DATA_DIR / RECONCILIATION_DATA_DIR
+    env vars that the orchestrator's managed fused-memory spawn injects (task 2439),
+    so the dashboard reader stays in lockstep with the managed writer instead of
+    reading now-empty project-relative paths.
+    """
+
+    def test_env_overrides_relocate_runtime_paths(self, tmp_path, monkeypatch):
+        monkeypatch.setenv('RECONCILIATION_DATA_DIR', str(tmp_path / 'recon'))
+        monkeypatch.setenv('QUEUE_DATA_DIR', str(tmp_path / 'q'))
+
+        cfg = DashboardConfig(project_root=tmp_path / 'proj')
+
+        assert cfg.reconciliation_db == tmp_path / 'recon' / 'reconciliation.db'
+        assert cfg.tickets_db == tmp_path / 'recon' / 'tickets.db'
+        assert cfg.write_journal_db == tmp_path / 'recon' / 'write_journal.db'
+        assert cfg.reconciliation_escalations_dir == tmp_path / 'recon' / 'escalations'
+        assert cfg.write_queue_db == tmp_path / 'q' / 'write_queue.db'
+        # Override must win over project_root — the relocated queue path must
+        # NOT be nested under it.
+        assert not cfg.write_queue_db.is_relative_to(cfg.project_root)
+
+    def test_env_unset_falls_back_to_project_root(self, tmp_path, monkeypatch):
+        monkeypatch.delenv('RECONCILIATION_DATA_DIR', raising=False)
+        monkeypatch.delenv('QUEUE_DATA_DIR', raising=False)
+
+        cfg = DashboardConfig(project_root=tmp_path / 'proj')
+
+        assert (
+            cfg.reconciliation_db
+            == cfg.project_root / 'data' / 'reconciliation' / 'reconciliation.db'
+        )
+        assert cfg.tickets_db == cfg.project_root / 'data' / 'reconciliation' / 'tickets.db'
+        assert (
+            cfg.write_journal_db
+            == cfg.project_root / 'data' / 'reconciliation' / 'write_journal.db'
+        )
+        assert (
+            cfg.reconciliation_escalations_dir
+            == cfg.project_root / 'data' / 'reconciliation' / 'escalations'
+        )
+        assert cfg.write_queue_db == cfg.project_root / 'data' / 'queue' / 'write_queue.db'
+
+
 class TestHealthEndpoint:
     def test_health_endpoint(self):
         from starlette.testclient import TestClient

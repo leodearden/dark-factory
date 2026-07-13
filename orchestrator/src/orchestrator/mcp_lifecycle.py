@@ -7,6 +7,7 @@ import json
 import logging
 import os
 import sys
+import tempfile
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -579,6 +580,72 @@ async def mcp_call(
     return await session._raw_call(method, params, timeout=timeout)
 
 
+# ---------------------------------------------------------------------------
+# Managed-spawn runtime data dirs (task 2439)
+# ---------------------------------------------------------------------------
+
+
+def managed_runtime_data_dirs(project_id: str) -> tuple[Path, Path]:
+    """Return (queue_dir, recon_dir) for a managed fused-memory spawn.
+
+    Keeps the managed fused-memory server's runtime SQLite state — the
+    write_queue.db (+ -shm/-wal) and reconciliation.db/tickets.db — out of the
+    watched project's git-tracked tree. A prior CWD-relative default (the
+    fused-memory config default is ``./data/queue`` /
+    ``./data/reconciliation``) let this state land inside the project root
+    that ``McpLifecycle.start()`` spawns fused-memory in, dirtying the tree
+    and poisoning the startup dirty-tree-guard and warm-lane GC (task 2439).
+
+    Rooted under ``${XDG_STATE_HOME:-~/.local/state}/dark-factory/<project_id>/``
+    — outside any watched project's tree — and keyed by project_id so
+    multiple managed instances never collide.
+
+    Wider blast radius, intentionally: fused-memory derives its
+    reconciliation *escalation* queue from the same var —
+    ``escalation_queue_dir: "${RECONCILIATION_DATA_DIR:./data/reconciliation}/escalations"``
+    (fused-memory/config/config.yaml) — so ``recon_dir`` here also relocates
+    that escalation queue out of ``<project>/data/reconciliation/escalations``
+    and into the XDG-rooted path. This is deliberate (task 2439's scope
+    treats reconciliation.db/tickets.db/escalations as one pollution class,
+    not just the queue DB); any tooling that globs the old project-relative
+    escalations path needs to point at the new XDG-rooted one instead.
+
+    Lockstep consumer: ``dashboard/src/dashboard/config.py``'s
+    ``reconciliation_db`` / ``tickets_db`` / ``write_journal_db`` /
+    ``write_queue_db`` / ``reconciliation_escalations_dir`` properties read
+    this same runtime state and honor the same ``QUEUE_DATA_DIR`` /
+    ``RECONCILIATION_DATA_DIR`` env vars (falling back to
+    ``project_root/data/...`` when unset) — task 2439. If this function's
+    rooting scheme ever changes, that dashboard consumer must move in
+    lockstep, or its queue / reconciliation / tickets / journal /
+    recon-escalation panels will silently go blank or stale reading a path
+    the managed spawn no longer writes to.
+
+    Degrades instead of crashing when ``$HOME`` can't be resolved: with
+    ``XDG_STATE_HOME`` unset, ``Path.home()`` raises ``RuntimeError`` in a
+    stripped daemon/CI environment with no ``HOME`` (and no ``pwd`` entry).
+    Since this helper is called unconditionally on ``McpLifecycle.start()``'s
+    managed-spawn path, an unguarded raise here would take down orchestrator
+    startup; instead this falls back to the OS temp dir (task 2439
+    amendment).
+    """
+    xdg_state_home = os.environ.get('XDG_STATE_HOME')
+    if xdg_state_home:
+        base = Path(xdg_state_home)
+    else:
+        try:
+            base = Path.home() / '.local' / 'state'
+        except RuntimeError:
+            logger.warning(
+                'managed_runtime_data_dirs: could not resolve a home '
+                'directory (HOME unset?); falling back to the OS temp dir '
+                'for managed fused-memory runtime state (task 2439)'
+            )
+            base = Path(tempfile.gettempdir())
+    root = base / 'dark-factory' / project_id
+    return root / 'queue', root / 'reconciliation'
+
+
 class McpLifecycle:
     """Manages the fused-memory MCP HTTP server process."""
 
@@ -616,10 +683,21 @@ class McpLifecycle:
             config_path = (self.project_root / self.config.config_path).resolve()
             cmd = [*cmd, '--config', str(config_path)]
 
+            # Redirect the managed fused-memory's runtime queue/reconciliation
+            # SQLite state out of this (watched) project's tracked tree — task
+            # 2439. env.setdefault() honors an operator-preset override.
+            # RECONCILIATION_DATA_DIR also relocates the recon *escalation*
+            # queue (see managed_runtime_data_dirs() docstring) — intentional.
+            q_dir, r_dir = managed_runtime_data_dirs(self.config.project_id)
+            env = dict(os.environ)
+            env.setdefault('QUEUE_DATA_DIR', str(q_dir))
+            env.setdefault('RECONCILIATION_DATA_DIR', str(r_dir))
+
             logger.info(f'Starting fused-memory HTTP server: {" ".join(cmd)}')
             self._process = await asyncio.create_subprocess_exec(
                 *cmd,
                 cwd=str(self.project_root),
+                env=env,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
                 start_new_session=True,
