@@ -8692,50 +8692,56 @@ Update the plan to address the blocking issues. You may add new steps to the `st
                     )
                     return _record(WorkflowOutcome.ESCALATED)
 
-                if isinstance(outcome, StewardInterrupted):
-                    if outcome.wip_commits_present:
-                        # Task-2060 fix: a steward interruption (attempt-cap
-                        # or timeout) with real work already committed must
-                        # resume the plan, not be triaged as "steward
-                        # failed".  Dismiss the still-pending L0 — its only
-                        # consumer (the steward) is done — and re-pend.
-                        if self.escalation_queue:
-                            orphan_l0 = self.escalation_queue.get_by_task(
-                                self.task_id, status='pending', level=0,
+                if isinstance(outcome, StewardInterrupted) and outcome.wip_commits_present:
+                    # Task-2060 fix: a steward interruption (attempt-cap
+                    # or timeout) with real work already committed must
+                    # resume the plan, not be triaged as "steward
+                    # failed".  Dismiss the still-pending L0 — its only
+                    # consumer (the steward) is done — and re-pend.
+                    if self.escalation_queue:
+                        orphan_l0 = self.escalation_queue.get_by_task(
+                            self.task_id, status='pending', level=0,
+                        )
+                        for esc in orphan_l0:
+                            self.escalation_queue.resolve(
+                                esc.id,
+                                'Auto-dismissed: steward interrupted '
+                                f'({outcome.reason}) with WIP present — '
+                                'resuming plan, not escalating (task '
+                                '2060 fix)',
+                                dismiss=True, resolved_by='auto-dismissed',
                             )
-                            for esc in orphan_l0:
-                                self.escalation_queue.resolve(
-                                    esc.id,
-                                    'Auto-dismissed: steward interrupted '
-                                    f'({outcome.reason}) with WIP present — '
-                                    'resuming plan, not escalating (task '
-                                    '2060 fix)',
-                                    dismiss=True, resolved_by='auto-dismissed',
-                                )
-                            if orphan_l0:
-                                logger.info(
-                                    'Task %s: dismissed %d pending L0(s) — '
-                                    'steward interrupted (%s) with WIP '
-                                    'present, resuming plan',
-                                    self.task_id, len(orphan_l0), outcome.reason,
-                                )
-                        return await _requeue()
+                        if orphan_l0:
+                            logger.info(
+                                'Task %s: dismissed %d pending L0(s) — '
+                                'steward interrupted (%s) with WIP '
+                                'present, resuming plan',
+                                self.task_id, len(orphan_l0), outcome.reason,
+                            )
+                    return await _requeue()
+                # A StewardInterrupted with no WIP (checked above; falls
+                # through when the combined condition is False) — and a
+                # StewardBudgetExhausted (never matches any isinstance check
+                # above) — both fall through to the shared BLOCKED
+                # fall-through below (outside this `if self._steward:` block)
+                # instead of returning here.  That shared block files the
+                # same deduped L1 AND dismisses this still-pending L0 in one
+                # place — fixing the orphan-L0 leak (task 2248 review fix /
+                # incident esc-3576-234) where a workflow-synthesized
+                # grace-timeout StewardInterrupted('timeout', wip=False) (the
+                # steward was killed before its own _auto_escalate_to_human
+                # could dismiss the L0) used to file an L1 and return without
+                # dismissing the L0, stranding it for the orphan-L0 reaper to
+                # promote into a duplicate L1.  For a steward-PUBLISHED
+                # no-wip outcome the L0 is already dismissed by
+                # _auto_escalate_to_human, so the shared block's dismissal
+                # loop is a harmless no-op there.
 
-                    await self._ensure_l1_escalation_for_blocked(
-                        reason, detail or reason, category=category,
-                    )
-                    return _record(WorkflowOutcome.BLOCKED)
-
-                # StewardBudgetExhausted: the steward cannot make further
-                # progress at all, wip or not — always L1.
-                await self._ensure_l1_escalation_for_blocked(
-                    reason, detail or reason, category=category,
-                )
-                return _record(WorkflowOutcome.BLOCKED)
-
-        # Fall-through BLOCKED: either no escalation queue, or the steward
-        # never resolved the L0.  Either way a human should know — submit
-        # an L1 (deduped) so the task isn't silently parked.
+        # Fall-through BLOCKED: either no escalation queue, the steward
+        # never resolved the L0, or a StewardInterrupted(wip=False) /
+        # StewardBudgetExhausted outcome fell through from above.  Either
+        # way a human should know — submit an L1 (deduped) so the task
+        # isn't silently parked.
         await self._ensure_l1_escalation_for_blocked(reason, detail or reason, category=category)
 
         # Fix #2 — dismiss any still-pending L0 now that we are exiting BLOCKED.
