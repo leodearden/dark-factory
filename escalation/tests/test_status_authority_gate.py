@@ -30,7 +30,6 @@ escalation package's own read path), not an internal mock assertion.
 from __future__ import annotations
 
 import asyncio
-import contextlib
 import socket
 import threading
 import time
@@ -106,6 +105,23 @@ def _free_port() -> int:
         return s.getsockname()[1]
 
 
+async def _mcp_handshake_ready(base_url: str) -> bool:
+    """True iff a real MCP client completes initialize+ping against
+    ``{base_url}/mcp/``.
+
+    A bare TCP connect only proves the OS accept queue is up; it does not
+    prove the FastMCP ASGI app has finished mounting the ``/mcp/`` route.
+    Polling a real handshake instead of a TCP probe closes that window — the
+    first C1-C4 call racing a 404/hang before the route is live."""
+    transport = StreamableHttpTransport(f'{base_url}/mcp/')
+    try:
+        async with Client(transport) as client:
+            await client.ping()
+    except Exception:  # noqa: BLE001 - any failure just means "not ready yet"
+        return False
+    return True
+
+
 @pytest.fixture(scope='module')
 def http_server(
     tmp_path_factory: pytest.TempPathFactory,
@@ -129,36 +145,52 @@ def http_server(
     queue = EscalationQueue(queue_dir)
     mcp = create_server(queue, startup_sweep=False)
     port = _free_port()
+    # _free_port() binds-then-closes to find a free port, then the real bind
+    # happens below — a TOCTOU another process (or a concurrent xdist worker)
+    # could win. serve_error surfaces that as the actual OSError on timeout
+    # below, instead of only the generic "did not become ready" message.
+    serve_error: BaseException | None = None
 
     def _serve_forever() -> None:
-        loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(loop)
-        loop.run_until_complete(
-            mcp.run_http_async(
-                host='127.0.0.1', port=port, show_banner=False, log_level='error',
+        nonlocal serve_error
+        try:
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
+            loop.run_until_complete(
+                mcp.run_http_async(
+                    host='127.0.0.1', port=port, show_banner=False, log_level='error',
+                )
             )
-        )
+        except BaseException as exc:  # noqa: BLE001 - surfaced on timeout below
+            serve_error = exc
 
     thread = threading.Thread(
         target=_serve_forever, name='status-authority-gate-http', daemon=True,
     )
     thread.start()
 
+    # Gate readiness on a real MCP handshake (initialize+ping), not a bare
+    # TCP connect: a successful connect only proves the OS accept queue is
+    # up, not that the FastMCP ASGI app has finished mounting /mcp/. Every
+    # poll implicitly re-probes the TCP layer too (a refused/reset connect
+    # just fails the handshake and retries), so no separate TCP wait is
+    # needed.
+    base_url = f'http://127.0.0.1:{port}'
     deadline = time.monotonic() + 10.0
     ready = False
     while time.monotonic() < deadline:
-        with contextlib.suppress(OSError), socket.create_connection(('127.0.0.1', port), timeout=0.2):
+        if asyncio.run(_mcp_handshake_ready(base_url)):
             ready = True
-        if ready:
             break
         time.sleep(0.05)
     if not ready:
+        detail = f' (server thread raised: {serve_error!r})' if serve_error else ''
         raise RuntimeError(
-            f'status-authority-gate HTTP test server did not become ready on '
-            f'127.0.0.1:{port} within 10s'
+            f'status-authority-gate HTTP test server did not complete an MCP '
+            f'handshake on 127.0.0.1:{port} within 10s{detail}'
         )
 
-    yield f'http://127.0.0.1:{port}', queue
+    yield base_url, queue
 
 
 async def _resolve_over_http(
