@@ -466,22 +466,32 @@ def _read_latest_proposal(
     project_root: str | Path,
     *,
     tag: str = DEFAULT_TAG,
+    conn: sqlite3.Connection | None = None,
 ) -> dict[str, Any] | None:
     """Read the latest dry_run_proposals entry from tasks.db for the given task.
 
     Returns None on any error (missing db, missing row, empty proposals list).
     Uses stdlib sqlite3 only — no fused_memory dependency.
+
+    *conn*: reuse an already-open read-only connection instead of opening a
+    fresh one (task 2509 review amendment) — lets ``run_check`` share a
+    single connection with ``_read_task_description`` instead of opening
+    tasks.db twice per invocation. Defaults to None: opens (and closes) its
+    own connection exactly as before. A caller-supplied *conn* is never
+    closed here — the caller retains ownership of its lifecycle.
     """
     try:
-        db_path = Path(project_root) / '.taskmaster' / 'tasks' / 'tasks.db'
-        if not db_path.exists():
-            return None
-        # Open read-only via URI
-        uri = f'file:{db_path}?mode=ro'
-        try:
-            conn = sqlite3.connect(uri, uri=True)
-        except sqlite3.OperationalError:
-            return None
+        owns_conn = conn is None
+        if owns_conn:
+            db_path = Path(project_root) / '.taskmaster' / 'tasks' / 'tasks.db'
+            if not db_path.exists():
+                return None
+            # Open read-only via URI
+            uri = f'file:{db_path}?mode=ro'
+            try:
+                conn = sqlite3.connect(uri, uri=True)
+            except sqlite3.OperationalError:
+                return None
         try:
             cursor = conn.execute(
                 'SELECT metadata FROM tasks WHERE tag=? AND id=?',
@@ -489,7 +499,8 @@ def _read_latest_proposal(
             )
             row = cursor.fetchone()
         finally:
-            conn.close()
+            if owns_conn:
+                conn.close()
         if row is None:
             return None
         data = json.loads(row[0])
@@ -510,6 +521,7 @@ def _read_task_description(
     project_root: str | Path,
     *,
     tag: str = DEFAULT_TAG,
+    conn: sqlite3.Connection | None = None,
 ) -> str | None:
     """Read the task's description column from tasks.db for the given task.
 
@@ -518,16 +530,23 @@ def _read_task_description(
     can pass the result straight through to check_proposal's extra_texts
     without a separate truthiness check. Read-only (mode=ro), stdlib sqlite3
     only — sibling pattern to _read_latest_proposal above.
+
+    *conn*: reuse an already-open read-only connection instead of opening a
+    fresh one (task 2509 review amendment) — see _read_latest_proposal's
+    *conn* doc. Defaults to None: opens (and closes) its own connection
+    exactly as before; a caller-supplied *conn* is never closed here.
     """
     try:
-        db_path = Path(project_root) / '.taskmaster' / 'tasks' / 'tasks.db'
-        if not db_path.exists():
-            return None
-        uri = f'file:{db_path}?mode=ro'
-        try:
-            conn = sqlite3.connect(uri, uri=True)
-        except sqlite3.OperationalError:
-            return None
+        owns_conn = conn is None
+        if owns_conn:
+            db_path = Path(project_root) / '.taskmaster' / 'tasks' / 'tasks.db'
+            if not db_path.exists():
+                return None
+            uri = f'file:{db_path}?mode=ro'
+            try:
+                conn = sqlite3.connect(uri, uri=True)
+            except sqlite3.OperationalError:
+                return None
         try:
             cursor = conn.execute(
                 'SELECT description FROM tasks WHERE tag=? AND id=?',
@@ -535,7 +554,8 @@ def _read_task_description(
             )
             row = cursor.fetchone()
         finally:
-            conn.close()
+            if owns_conn:
+                conn.close()
         if row is None or not row[0]:
             return None
         return row[0]
@@ -601,9 +621,26 @@ def run_check(args: argparse.Namespace) -> None:
     state, state_ok = _load_state_checked(sp)
 
     tag = getattr(args, 'tag', DEFAULT_TAG)
-    entry = _read_latest_proposal(args.task_id, args.project_root, tag=tag)
+
+    # Single shared read-only connection for both the proposal and
+    # description reads (task 2509 review amendment — this used to open
+    # tasks.db twice per invocation, once per reader). Falls back to each
+    # reader's own independent open (and its existing fail-closed-to-None
+    # behavior) when this shared connection can't be established.
+    db_path = Path(args.project_root) / '.taskmaster' / 'tasks' / 'tasks.db'
+    shared_conn: sqlite3.Connection | None = None
+    if db_path.exists():
+        try:
+            shared_conn = sqlite3.connect(f'file:{db_path}?mode=ro', uri=True)
+        except sqlite3.OperationalError:
+            shared_conn = None
+    try:
+        entry = _read_latest_proposal(args.task_id, args.project_root, tag=tag, conn=shared_conn)
+        description = _read_task_description(args.task_id, args.project_root, tag=tag, conn=shared_conn)
+    finally:
+        if shared_conn is not None:
+            shared_conn.close()
     category = getattr(args, 'category', None)
-    description = _read_task_description(args.task_id, args.project_root, tag=tag)
 
     result = check_proposal(
         entry,

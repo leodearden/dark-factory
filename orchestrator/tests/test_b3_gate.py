@@ -1612,3 +1612,72 @@ class TestRunCheckStopInstruction:
 
         data = json.loads(capsys.readouterr().out.strip())
         assert data['verdict'] == 'fresh', f'expected fresh, got {data}'
+
+
+# ---------------------------------------------------------------------------
+# review amendment: run_check shares one sqlite connection (efficiency)
+# ---------------------------------------------------------------------------
+
+class TestRunCheckSharedConnection:
+    """run_check must open tasks.db at most once per invocation — the proposal
+    and description reads share a single connection (task 2509 review
+    amendment) rather than each opening (and closing) its own.
+    """
+
+    _NOW_ISO = '2026-06-04T12:00:00+00:00'
+
+    def test_run_check_opens_tasks_db_exactly_once(self, tmp_path, capsys, monkeypatch):
+        from orchestrator import b3_gate
+        from orchestrator.b3_gate import main
+
+        repo = tmp_path / 'repo'
+        repo.mkdir()
+        _init_git_repo(repo)
+        head_sha = _diverge_feature_branch(repo)
+        main_sha = subprocess.run(
+            ['git', '-C', str(repo), 'rev-parse', 'main'],
+            check=True, capture_output=True, text=True,
+        ).stdout.strip()
+
+        root = tmp_path / 'root'
+        root.mkdir()
+        entry = {
+            'proposal_text': 'Fix the bug',
+            'risk_label': 'low',
+            'files_referenced': [],
+            'block_reason': 'test blocked',
+            'investigated_at': '2026-06-04T10:00:00+00:00',
+            'head_sha': head_sha,
+            'main_sha': main_sha,
+        }
+        _seed_tasks_db(root, 42, [entry], description='benign description')
+
+        real_connect = sqlite3.connect
+        connect_calls: list[str] = []
+
+        def _counting_connect(database, *args, **kwargs):
+            connect_calls.append(database)
+            return real_connect(database, *args, **kwargs)
+
+        monkeypatch.setattr(b3_gate.sqlite3, 'connect', _counting_connect)
+
+        rc = main([
+            'check',
+            '--task-id', '42',
+            '--worktree', str(repo),
+            '--project-root', str(root),
+            '--category', 'task_failure',
+            '--now', self._NOW_ISO,
+        ])
+        assert rc == 0, f'expected exit 0, got {rc}'
+
+        # tasks.db-targeted opens only — the state-file path (b3-state.json)
+        # never goes through sqlite3.connect, so any hit here is a tasks.db read.
+        tasks_db_opens = [c for c in connect_calls if 'tasks.db' in c]
+        assert len(tasks_db_opens) == 1, (
+            f'expected exactly one tasks.db connection, got {len(tasks_db_opens)}: '
+            f'{tasks_db_opens!r}'
+        )
+
+        data = json.loads(capsys.readouterr().out.strip())
+        assert data['verdict'] == 'fresh', f'expected fresh, got {data}'
