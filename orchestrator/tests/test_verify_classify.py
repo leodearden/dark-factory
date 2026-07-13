@@ -199,3 +199,135 @@ class TestReturnContract:
         assert isinstance(result, FailureCategory)
         assert result == expected
         assert json.dumps({'category': result}) == json.dumps({'category': expected})
+
+
+# Grounded shared-venv-mutation signatures (task 2048, re-grounded here for
+# the PYTEST table): a concurrent `uv sync` from another orchestrator process
+# on the shared .venv can transiently remove-then-readd packages WHILE a
+# consumer is mid-pytest against it. See test_verify_env_transient.py's
+# module docstring for the full task-2045 grounding narrative.
+_XDIST_USAGE_ERROR_OUTPUT = (
+    'usage: pytest [options] [file_or_dir] [file_or_dir] [...]\n'
+    'pytest: error: unrecognized arguments: -n --dist --max-worker-restart=0\n'
+)
+_PIP_ABSENT_RUNPY_OUTPUT = '/home/leo/src/dark-factory/.venv/bin/python3.12: No module named pip\n'
+_MODULENOTFOUND_XDIST_OUTPUT = (
+    'Traceback (most recent call last):\n'
+    '  File "<string>", line 1, in <module>\n'
+    "ModuleNotFoundError: No module named 'xdist'\n"
+)
+_MODULENOTFOUND_PYTEST_XDIST_OUTPUT = (
+    'Traceback (most recent call last):\n'
+    '  File "<string>", line 1, in <module>\n'
+    "ModuleNotFoundError: No module named 'pytest_xdist'\n"
+)
+
+
+class TestPytestTable:
+    """step-3: classify_failure(ToolKind.PYTEST, …) — env_transient checked
+    FIRST (Invariant C1: consulted ONLY under PYTEST — see
+    TestEnvTransientIsPytestScopedC1 below), then INTERNALERROR, then FAILED,
+    then the unknown_test_failure fallback (covers pytest rc=5).
+
+    RED today (pre step-4): the PYTEST branch doesn't exist yet, so every
+    call here falls through to the shared OPAQUE placeholder in
+    classify_failure. The env_transient assertions genuinely fail (the
+    OPAQUE ladder never produces env_transient); the INTERNALERROR/FAILED
+    assertions may already pass incidentally (their patterns are also part
+    of today's OPAQUE placeholder ladder) but are asserted here regardless
+    to pin the PYTEST table's own contract once step-4 gives PYTEST its own
+    table.
+    """
+
+    def test_pytest_internalerror_wins_over_collateral_failed(self):
+        output = (
+            'FAILED orchestrator/tests/test_scheduler.py::TestScheduler::test_dispatch - '
+            'collected err\n'
+            'INTERNALERROR> Traceback (most recent call last):\n'
+            'INTERNALERROR>     KeyError: <WorkerController gw3>\n'
+        )
+        assert _classify(ToolKind.PYTEST, output, 3, False) == FailureCategory.PYTEST_INTERNALERROR
+
+    def test_test_failure_failed_line(self):
+        output = 'FAILED tests/test_foo.py::test_bar - AssertionError\n'
+        assert _classify(ToolKind.PYTEST, output, 1, False) == FailureCategory.TEST_FAILURE
+
+    def test_xdist_usage_error_is_env_transient(self):
+        assert (
+            _classify(ToolKind.PYTEST, _XDIST_USAGE_ERROR_OUTPUT, 4, False)
+            == FailureCategory.ENV_TRANSIENT
+        )
+
+    def test_pip_absent_runpy_line_is_env_transient(self):
+        assert (
+            _classify(ToolKind.PYTEST, _PIP_ABSENT_RUNPY_OUTPUT, 1, False)
+            == FailureCategory.ENV_TRANSIENT
+        )
+
+    def test_modulenotfounderror_xdist_is_env_transient(self):
+        assert (
+            _classify(ToolKind.PYTEST, _MODULENOTFOUND_XDIST_OUTPUT, 1, False)
+            == FailureCategory.ENV_TRANSIENT
+        )
+
+    def test_modulenotfounderror_pytest_xdist_is_env_transient(self):
+        assert (
+            _classify(ToolKind.PYTEST, _MODULENOTFOUND_PYTEST_XDIST_OUTPUT, 1, False)
+            == FailureCategory.ENV_TRANSIENT
+        )
+
+    def test_quoted_pip_forms_still_env_transient(self):
+        for output in (
+            "ModuleNotFoundError: No module named 'pip'\n",
+            'ModuleNotFoundError: No module named "pip"\n',
+        ):
+            assert _classify(ToolKind.PYTEST, output, 1, False) == FailureCategory.ENV_TRANSIENT, (
+                output
+            )
+
+    def test_rc5_no_tests_ran_is_unknown_test_failure(self):
+        """Invariant (b, task 1852): pytest rc=5 must stay RED, not PASSED."""
+        output = '===== no tests ran in 0.01s =====\n'
+        assert _classify(ToolKind.PYTEST, output, 5, False) == FailureCategory.UNKNOWN_TEST_FAILURE
+
+    @pytest.mark.parametrize('module_name', ['pipx', 'pipenv', 'pip_audit', 'pip-tools'])
+    def test_pip_prefixed_module_name_not_env_transient(self, module_name):
+        """A module name that merely STARTS with 'pip' is a real import/code
+        regression, not the pip-absence signature — word-boundary guard."""
+        output = f"ModuleNotFoundError: No module named '{module_name}'\n"
+        assert _classify(ToolKind.PYTEST, output, 1, False) != FailureCategory.ENV_TRANSIENT
+
+    def test_pipeline_module_not_found_is_unknown_test_failure(self):
+        output = "ModuleNotFoundError: No module named 'pipeline'\n"
+        assert _classify(ToolKind.PYTEST, output, 1, False) == FailureCategory.UNKNOWN_TEST_FAILURE
+
+    def test_non_pytest_unrecognized_arguments_not_env_transient(self):
+        """A different CLI tool's usage error captured in pytest's own output
+        must not be swept into env_transient — anchored to the literal
+        'pytest: error:' prefix argparse emits for pytest's own CLI."""
+        output = (
+            'usage: sometool [options]\n'
+            'sometool: error: unrecognized arguments: -n --dist --max-worker-restart=0\n'
+        )
+        assert _classify(ToolKind.PYTEST, output, 4, False) == FailureCategory.UNKNOWN_TEST_FAILURE
+
+
+class TestEnvTransientIsPytestScopedC1:
+    """CRITICAL C1: env_transient is consulted ONLY under ToolKind.PYTEST —
+    the structural win of per-tool dispatch. A pip/xdist-absence signature
+    appearing in a NON-pytest tool's output must never classify env_transient,
+    even though the exact same text would under ToolKind.PYTEST."""
+
+    def test_cargo_output_with_pip_absence_is_not_env_transient(self):
+        output = 'error: could not compile `my-crate`\nNo module named pip\n'
+        result = _classify(ToolKind.CARGO_TEST, output, 1, False)
+        assert result != FailureCategory.ENV_TRANSIENT, (
+            f'cargo output must never classify env_transient (PYTEST-only), got {result!r}'
+        )
+
+    def test_pyright_output_with_pip_absence_is_not_env_transient(self):
+        output = 'No module named pip\n'
+        result = _classify(ToolKind.PYRIGHT, output, 1, False)
+        assert result != FailureCategory.ENV_TRANSIENT, (
+            f'pyright output must never classify env_transient (PYTEST-only), got {result!r}'
+        )
