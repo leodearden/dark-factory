@@ -279,3 +279,18 @@ class TestArtifactsFromArgs:
         ])
 
         assert sid == ''
+
+    def test_invalid_verdict_role_exits_at_startup(self, tmp_path):
+        """An unsafe ``--verdict-role`` must abort server startup (fail
+        fast) rather than construct a ``TaskArtifacts`` that would only
+        raise ``ValueError`` deep inside the first tool call.
+        """
+        wt = tmp_path / 'wt'
+        wt.mkdir()
+        (wt / '.task').mkdir()
+
+        with pytest.raises(SystemExit):
+            _artifacts_from_args([
+                '--worktree', str(wt),
+                '--verdict-role', '../escape',
+            ])

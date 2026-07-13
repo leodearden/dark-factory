@@ -27,7 +27,7 @@ from typing import Any
 
 from fastmcp import FastMCP
 
-from orchestrator.artifacts import TaskArtifacts
+from orchestrator.artifacts import TaskArtifacts, _validate_verdict_role
 
 logger = logging.getLogger(__name__)
 
@@ -261,7 +261,10 @@ def _artifacts_from_args(
     ``_artifacts_from_args`` byte-identically (parity signal) so both sides
     resolve the IDENTICAL meta_root for a given worktree. When
     ``--meta-root`` is omitted, the root dir checked for existence is the
-    legacy ``<worktree>/.task``.
+    legacy ``<worktree>/.task``. ``--verdict-role`` is validated eagerly
+    here (``_validate_verdict_role``) so a malformed role aborts server
+    startup with a clear message, instead of surfacing as an opaque
+    ValueError on every subsequent tool call.
     """
     parser = argparse.ArgumentParser(description='Verdict-tools MCP server (stdio)')
     parser.add_argument(
@@ -287,6 +290,12 @@ def _artifacts_from_args(
         help='Optional session id recorded in the verdict envelope.',
     )
     args = parser.parse_args(argv)
+
+    try:
+        _validate_verdict_role(args.verdict_role)
+    except ValueError as exc:
+        print(f'Error: {exc}', file=sys.stderr)
+        sys.exit(1)
 
     worktree = args.worktree.resolve()
     meta_root = args.meta_root.resolve() if args.meta_root is not None else None
