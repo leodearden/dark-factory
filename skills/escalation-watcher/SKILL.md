@@ -214,7 +214,8 @@ already reads it breaks.
 ```bash
 python3 $DARK_FACTORY_ROOT/orchestrator/src/orchestrator/session_registry.py write-decision \
   --id <stable-id> --project <project> --text "<one-line question>" \
-  [--task-id <task_id>] [--escalation-id <escalation_id>] [--session-id watcher-<project>-$$]
+  [--task-id <task_id>] [--escalation-id <escalation_id>] [--session-id watcher-<project>-$$] \
+  [--severity <esc.severity>]
 ```
 
 - **`--id`**: a stable id you can recompute idempotently for the same pending item — the
@@ -225,6 +226,10 @@ python3 $DARK_FACTORY_ROOT/orchestrator/src/orchestrator/session_registry.py wri
 - **`--task-id` / `--escalation-id` / `--session-id`**: thread through whatever you have — the
   blocked task, the escalation this resolves, and this watcher's own session slug (see "Claiming
   the Watcher Lease" above) — so the cockpit can cross-link the decision to its source.
+- **`--severity`**: pass through the parked escalation's own severity (`esc.severity` —
+  `info`/`blocking`/`critical`/`urgent`). This now weights the cockpit decision-queue rank, so a
+  freshly-filed `critical`/`urgent` park surfaces at the top of the queue instead of being buried
+  under stale awaiting-input sessions.
 - The verb always files `state=open` and prints the filed id on success for your own cross-link
   (e.g. into the digest line). It is fail-soft — a registry fault is logged and swallowed, never
   raised, so filing a decision can never crash the watch loop or block the park itself.

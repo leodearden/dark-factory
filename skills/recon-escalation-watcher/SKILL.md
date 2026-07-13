@@ -216,7 +216,7 @@ the primary return-triage surface across both watchers:
 ```bash
 python3 $DARK_FACTORY_ROOT/orchestrator/src/orchestrator/session_registry.py write-decision \
   --id <stable-id> --project <project> --text "<one-line question>" \
-  [--task-id <task_id>] [--escalation-id <escalation_id>]
+  [--task-id <task_id>] [--escalation-id <escalation_id>] [--severity <esc.severity>]
 ```
 
 - **`--id`**: a stable id you can recompute idempotently for the same pending item — the
@@ -225,6 +225,10 @@ python3 $DARK_FACTORY_ROOT/orchestrator/src/orchestrator/session_registry.py wri
 - **`--text`**: the one-line question a human needs to answer.
 - **`--task-id` / `--escalation-id`**: thread through the synthetic `recon-<runid>` task id (if
   any) and the escalation id, so the cockpit can cross-link the decision to its source.
+- **`--severity`**: pass through the parked escalation's own severity (`esc.severity` —
+  `info`/`blocking`/`critical`/`urgent`). This now weights the cockpit decision-queue rank, so a
+  freshly-filed `critical`/`urgent` park surfaces at the top of the queue instead of being buried
+  under stale awaiting-input sessions.
 - The verb always files `state=open` and is fail-soft (a registry fault is logged and swallowed,
   never raised) — filing a decision can never crash the watch loop or block the "leave pending"
   action itself.
