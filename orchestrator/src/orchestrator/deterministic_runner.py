@@ -43,9 +43,20 @@ Phase γ adds the **before_done blocking cross-unit deploy** path
    the other escalations in this section, ``gate_escalated_at`` is
    deliberately NOT stamped — this is a re-checkable HALT (mirrors task
    2273's SIGTERM-kill on its human-rehearsal mandate as a self-halt rather
-   than an external kill), not a resolve-to-done gate: removing the stop
-   instruction from the description lets a later dispatch proceed normally,
-   and there is no auto-resolve path that could silently bypass the halt.
+   than an external kill), not a resolve-to-done gate: it guarantees the
+   NEXT dispatch re-evaluates this guard from scratch instead of taking
+   section 1's ``if gate_escalated_at:`` resume-to-done branch (which would
+   either raise ``NotImplementedError`` — no ``before_done_ran_at`` proof —
+   or wrongly drive to done without the action ever running).  That
+   re-evaluation only happens once the task is back in ``pending``, though:
+   a ``blocked`` task holding this open pending escalation is NOT
+   re-dispatched automatically, so removing the stop instruction from the
+   description is necessary but not sufficient — full recovery needs BOTH
+   (1) editing the description (else the guard re-fires and re-escalates on
+   the very next dispatch) AND (2) resolving the ``stop_instruction``
+   escalation itself (e.g. ``resolve_issue`` action ``resume``/``restart``,
+   which is what actually flips the task's status back to ``pending`` — see
+   ``escalation.server.resolve_issue`` Table B), or cancelling the task.
    Excludes predicates (read-only, apply nothing — see the predicate
    sub-path below) and excludes every resume/idempotency branch above (those
    already have ``before_done_ran_at`` or ``gate_escalated_at`` set, so they
@@ -691,10 +702,25 @@ class DeterministicRunner:
         'stop_instruction'`` so the halt is distinguishable from an infra
         fault — and, critically, does NOT stamp ``metadata.gate_escalated_at``.
         This is a re-checkable HALT, not a resolve-to-done gate: leaving
-        ``gate_escalated_at`` unset means a human who edits the description to
-        remove the stop instruction (rather than resolving the escalation)
-        lets the next dispatch re-evaluate from scratch and proceed normally,
-        with no auto-resolve path that could silently bypass the halt.
+        ``gate_escalated_at`` unset means the next dispatch re-evaluates the
+        stop-instruction guard from scratch — section 1's
+        ``if gate_escalated_at:`` resume-to-done branch is never taken —
+        rather than silently driving to done with no proof the deploy ran.
+
+        That re-evaluation only happens once the task is back in
+        ``pending``, though: a task in ``blocked`` holding this open pending
+        escalation is NOT re-dispatched automatically (reviewer amendment —
+        see task 2509 review). So the full recovery is two steps, not one:
+        (1) edit the task description to remove the stop instruction — if
+        left in place, the guard simply re-fires and re-escalates on the
+        very next dispatch, since it re-reads the description fresh every
+        time — and (2) resolve this escalation (e.g. ``resolve_issue``
+        action ``resume`` or ``restart``, either of which flips the task's
+        status back to ``pending`` per ``escalation.server.resolve_issue``'s
+        Table B — this runner has no live agent to resume, so both actions
+        have the same practical effect here: a fresh dispatch). Editing the
+        description alone, with the escalation left pending, does NOT
+        re-enable dispatch. A human may instead cancel the task outright.
 
         Returns:
             WorkflowOutcome.BLOCKED
@@ -1471,9 +1497,14 @@ class DeterministicRunner:
                     f'Target unit: {target_unit}',
                     f'Explicit stop instruction detected: {stop_phrase!r}.',
                     'The deploy was NOT run and before_done_ran_at was NOT '
-                    'stamped.  A human must clear the stop instruction from the '
-                    'task description (to let the next dispatch proceed) or '
-                    'cancel the task.',
+                    'stamped.  Recovery needs BOTH steps: (1) edit the task '
+                    'description to remove the stop instruction — otherwise '
+                    'the guard re-fires and re-escalates on the very next '
+                    "dispatch — and (2) resolve this escalation (e.g. "
+                    "resolve_issue action='resume' or 'restart') to move the "
+                    'task back to pending; a blocked task is not '
+                    're-dispatched automatically.  Alternatively, cancel the '
+                    'task outright.',
                 ])
                 return await self._file_stop_instruction_and_block(
                     task_id,
