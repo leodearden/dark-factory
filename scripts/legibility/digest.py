@@ -74,6 +74,101 @@ def _user_turn_text(content: Any) -> str | None:
     return None
 
 
+def _content_to_text(content: Any) -> str:
+    """Best-effort flatten of a tool_result/message 'content' field to text.
+
+    ``content`` is either a plain string (the common case) or a list of
+    content blocks (dicts). Blocks without a 'text' field (e.g. the
+    ``tool_reference`` blocks ToolSearch results carry) contribute nothing
+    rather than being guessed at.
+    """
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        parts = [
+            block.get('text') for block in content
+            if isinstance(block, dict) and isinstance(block.get('text'), str)
+        ]
+        return '\n'.join(parts)
+    return ''
+
+
+def _summarize_input(tool_input: Any, *, limit: int = 200) -> str:
+    """Canonical, size-capped string summary of a tool_use ``input`` dict."""
+    try:
+        summary = json.dumps(tool_input, sort_keys=True)
+    except TypeError:
+        summary = str(tool_input)
+    if len(summary) > limit:
+        summary = summary[:limit] + '...'
+    return summary
+
+
+def _iter_tool_use_blocks(
+    records: list[dict[str, Any]],
+) -> list[tuple[int, dict[str, Any]]]:
+    """Return (record_index, block) for every assistant tool_use block."""
+    found = []
+    for index, record in enumerate(records):
+        if record.get('type') != 'assistant':
+            continue
+        content = _message_content(record)
+        if not isinstance(content, list):
+            continue
+        for block in content:
+            if isinstance(block, dict) and block.get('type') == 'tool_use':
+                found.append((index, block))
+    return found
+
+
+def _iter_tool_result_blocks(
+    records: list[dict[str, Any]],
+) -> list[tuple[int, dict[str, Any]]]:
+    """Return (record_index, block) for every user tool_result block."""
+    found = []
+    for index, record in enumerate(records):
+        if record.get('type') != 'user':
+            continue
+        content = _message_content(record)
+        if not isinstance(content, list):
+            continue
+        for block in content:
+            if isinstance(block, dict) and block.get('type') == 'tool_result':
+                found.append((index, block))
+    return found
+
+
+def iter_error_neighborhoods(records: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Pair each structured-error tool_result with its preceding attempt.
+
+    Only tool_result blocks carrying a truthy ``is_error`` flag count --
+    never a substring match on the result content (the core of the
+    decoy-FAIL suppression decision, PRD Sec 13.2). Matching to the
+    assistant's attempt is via ``tool_use_id``; an unmatched id (e.g. the
+    attempt was truncated off the front of the transcript window) degrades
+    to None attempt fields rather than raising.
+    """
+    attempts_by_id = {
+        block.get('id'): block
+        for _, block in _iter_tool_use_blocks(records)
+    }
+
+    neighborhoods = []
+    for index, block in _iter_tool_result_blocks(records):
+        if not block.get('is_error'):
+            continue
+        attempt = attempts_by_id.get(block.get('tool_use_id'))
+        neighborhoods.append({
+            'index': index,
+            'attempt_tool': attempt.get('name') if attempt else None,
+            'attempt_input_summary': (
+                _summarize_input(attempt.get('input')) if attempt else None
+            ),
+            'error_content': _content_to_text(block.get('content')),
+        })
+    return neighborhoods
+
+
 def iter_user_turns(records: list[dict[str, Any]]) -> list[dict[str, Any]]:
     """Return genuine non-sidechain, non-meta human user turns.
 
