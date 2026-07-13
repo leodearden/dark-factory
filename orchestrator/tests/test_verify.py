@@ -8,7 +8,7 @@ from unittest.mock import AsyncMock, MagicMock, call, patch
 
 import pytest
 
-from orchestrator import verify
+from orchestrator import verify, verify_plan
 from orchestrator.config import ModuleConfig, OrchestratorConfig
 from orchestrator.verify import (
     _CATEGORY_PRIORITY,
@@ -7230,3 +7230,179 @@ class TestMarkVerifyWarmInfraError:
         # Should not raise and should not call touch
         verify._mark_verify_warm(tmp_path)
         assert not touch_called
+
+
+# ---------------------------------------------------------------------------
+# Task 2126 step-15: run_scoped_verification attaches a VerifyPlan (PRD task γ,
+# verify_plan.py) to VerifyResult.plan, logs it, and — via the classification
+# delegation to verify_plan.classify_file — closes the D2 (structural →
+# unscoped pyright) gap in the FALLBACK path (_build_fallback_config), which
+# never widened before. run_verification is patched to an AsyncMock so these
+# tests never spawn a real subprocess.
+# ---------------------------------------------------------------------------
+
+
+def _canned_passing_result() -> VerifyResult:
+    return verify.VerifyResult(
+        passed=True, test_output='', lint_output='', type_output='',
+        summary='ok',
+    )
+
+
+def _real_worktree_reader(worktree: Path):
+    """A worktree_reader matching the one run_scoped_verification must supply.
+
+    Mirrors scope_module_config's own inline content-reading (is_file guard +
+    read_text(encoding='utf-8', errors='replace')) so a test's expected-plan
+    computation reads files exactly like production will.
+    """
+    def _read(path: str) -> str | None:
+        full = worktree / path
+        if not full.is_file():
+            return None
+        return full.read_text(encoding='utf-8', errors='replace')
+    return _read
+
+
+class TestRunScopedVerificationPlan:
+    """run_scoped_verification attaches derive_verify_plan's VerifyPlan to VerifyResult.plan."""
+
+    @pytest.mark.asyncio
+    async def test_plan_matches_derive_verify_plan_for_file_scoped_module(
+        self, tmp_path: Path,
+    ):
+        """result.plan == derive_verify_plan(...).to_dict() for a representative file-scoped run."""
+        (tmp_path / 'mymod' / 'tests').mkdir(parents=True)
+        touched = tmp_path / 'mymod' / 'tests' / 'test_thing.py'
+        touched.write_text('def test_thing(): pass\n')
+
+        config = OrchestratorConfig(project_root=tmp_path)
+        module_configs = [
+            ModuleConfig(
+                prefix='mymod',
+                test_command='uv run --directory mymod pytest tests/',
+                lint_command='uv run --directory mymod ruff check .',
+                type_check_command='uv run --directory mymod pyright',
+            ),
+        ]
+        task_files = ['mymod/tests/test_thing.py']
+        existing_files = [f for f in task_files if (tmp_path / f).exists()]
+
+        with patch.object(verify, 'run_verification', new=AsyncMock(return_value=_canned_passing_result())):
+            result = await run_scoped_verification(
+                tmp_path, config, module_configs, task_files=task_files,
+            )
+
+        expected_plan = verify_plan.derive_verify_plan(
+            existing_files, module_configs, config, _real_worktree_reader(tmp_path),
+        ).to_dict()
+        assert result.plan == expected_plan
+        assert result.plan is not None
+        # Sanity: this really is the "representative file-scoped" shape the
+        # step description asks for, not an accidental SKIPPED/TRIVIAL plan.
+        assert any(r['scope_kind'] == 'file_scoped' for r in result.plan['runs'])
+
+    @pytest.mark.asyncio
+    async def test_plan_is_logged_per_invocation(self, tmp_path: Path, caplog):
+        """The derived plan is logged (caplog) on every run_scoped_verification call."""
+        (tmp_path / 'mymod').mkdir()
+        touched = tmp_path / 'mymod' / 'test_thing.py'
+        touched.write_text('def test_thing(): pass\n')
+
+        config = OrchestratorConfig(project_root=tmp_path)
+        module_configs = [
+            ModuleConfig(
+                prefix='mymod', test_command='pytest', lint_command='ruff check',
+                type_check_command='pyright',
+            ),
+        ]
+
+        with (
+            patch.object(verify, 'run_verification', new=AsyncMock(return_value=_canned_passing_result())),
+            caplog.at_level(logging.INFO, logger='orchestrator.verify'),
+        ):
+            await run_scoped_verification(
+                tmp_path, config, module_configs, task_files=['mymod/test_thing.py'],
+            )
+
+        # needs_pipeline_guard_check is a distinctive VerifyPlan.to_dict() key
+        # — its presence in the log text proves the plan (not just a summary
+        # string) was logged, not merely that *some* log line fired.
+        assert 'needs_pipeline_guard_check' in caplog.text
+
+    @pytest.mark.asyncio
+    async def test_fallback_path_closes_d2_gap_end_to_end(self, tmp_path: Path):
+        """A Protocol-defining source file with module_configs=[] widens pyright to FULL_SUITE.
+
+        This is the D2 gap the old _build_fallback_config lacked (it never
+        checked for structural files at all). Verified two ways: (1) the
+        attached plan records FULL_SUITE for the pyright run, and (2) that's
+        actually ENFORCED — the ModuleConfig run_verification received
+        carries an unscoped type_check_command, not one scoped down to
+        `structural.py`.
+        """
+        (tmp_path / 'structural.py').write_text(
+            'from typing import Protocol\n\n\nclass Foo(Protocol):\n    def method(self) -> None: ...\n'
+        )
+
+        # Explicit commands: OrchestratorConfig is a pydantic-settings
+        # BaseSettings — an unset type_check_command/lint_command can pick up
+        # this repo's real orchestrator.yaml (via its settings sources) even
+        # with project_root=tmp_path, which would make cmd.tool OPAQUE
+        # instead of PYRIGHT for reasons unrelated to what this test checks.
+        config = OrchestratorConfig(
+            project_root=tmp_path,
+            test_command='pytest', lint_command='ruff check', type_check_command='pyright',
+        )
+        mock_run_verification = AsyncMock(return_value=_canned_passing_result())
+
+        with patch.object(verify, 'run_verification', new=mock_run_verification):
+            result = await run_scoped_verification(
+                tmp_path, config, [], task_files=['structural.py'],
+            )
+
+        assert result.plan is not None
+        pyright_runs = [
+            r for r in result.plan['runs']
+            if r['cmd'] is not None and r['cmd']['tool'] == 'pyright'
+        ]
+        assert pyright_runs, f'expected a pyright run in plan: {result.plan}'
+        assert pyright_runs[0]['scope_kind'] == 'full_suite', (
+            f"D2 gap not closed in the plan: {pyright_runs[0]}"
+        )
+
+        assert mock_run_verification.await_count == 1
+        assert mock_run_verification.await_args is not None
+        called_module_config = mock_run_verification.await_args.args[2]
+        assert 'structural.py' not in (called_module_config.type_check_command or ''), (
+            'D2 gap not closed end-to-end — _build_fallback_config scoped pyright to '
+            f'the structural file instead of widening: {called_module_config.type_check_command!r}'
+        )
+
+
+class TestVerifyPlanClassificationDelegation:
+    """scope_module_config/_build_fallback_config source ALL file classification from
+    verify_plan.classify_file — classification happens exactly once (task γ)."""
+
+    def test_is_conftest_delegates_to_verify_plan(self):
+        assert verify._is_conftest is verify_plan._is_conftest
+
+    def test_is_collectable_test_file_delegates_to_verify_plan(self):
+        assert verify._is_collectable_test_file is verify_plan._is_collectable_test_file
+
+    def test_is_test_file_delegates_to_verify_plan(self):
+        assert verify._is_test_file is verify_plan._is_test_file
+
+    @pytest.mark.parametrize('path,content', [
+        ('orchestrator/src/orchestrator/interfaces.py', 'class Foo(Protocol):\n    ...\n'),
+        ('orchestrator/src/orchestrator/foo.py', 'class Foo:\n    pass\n'),
+        # A collectable test file that ALSO defines a Protocol is never
+        # STRUCTURAL — CONFTEST/COLLECTABLE_TEST/TEST_DATA outrank STRUCTURAL
+        # in classify_file's precedence ladder (task γ design decision).
+        ('a/tests/test_x.py', 'class Foo(Protocol):\n    ...\n'),
+        ('a/conftest.py', 'class Foo(Protocol):\n    ...\n'),
+    ])
+    def test_is_structural_python_file_matches_classify_file(self, path, content):
+        assert verify._is_structural_python_file(path, content) == (
+            verify_plan.classify_file(path, content) is verify_plan.FileKind.STRUCTURAL
+        )

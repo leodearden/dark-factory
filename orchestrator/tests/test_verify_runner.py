@@ -293,6 +293,78 @@ class TestVerifyResultContention:
 
 
 # ---------------------------------------------------------------------------
+# Task 2126 step-13: VerifyResult.plan — machine-readable VerifyPlan.to_dict()
+# payload (JSON-native dict, not a nested dataclass) that round-trips losslessly.
+# Mirrors TestVerifyResultContention above (task 2306 α precedent).
+# ---------------------------------------------------------------------------
+
+
+_SAMPLE_PLAN_DICT = {
+    "runs": [
+        {
+            "module_prefix": "orchestrator",
+            "cmd": None,
+            "scope_kind": "skipped",
+            "reason": "no files under prefix",
+        },
+    ],
+    "needs_pipeline_guard_check": False,
+}
+
+
+class TestVerifyResultPlan:
+    """VerifyResult carries an optional `plan` dict that survives the wire codec."""
+
+    def test_plan_round_trips_via_json_codec(self):
+        vr = VerifyResult(
+            passed=True,
+            test_output="",
+            lint_output="",
+            type_output="",
+            summary="all good",
+            plan=_SAMPLE_PLAN_DICT,
+        )
+        restored = result_from_json(result_to_json(vr))
+        assert restored.plan == _SAMPLE_PLAN_DICT
+
+    def test_plan_round_trips_via_dict_codec(self):
+        vr = VerifyResult(
+            passed=True,
+            test_output="",
+            lint_output="",
+            type_output="",
+            summary="all good",
+            plan=_SAMPLE_PLAN_DICT,
+        )
+        restored = result_from_dict(result_to_dict(vr))
+        assert restored.plan == _SAMPLE_PLAN_DICT
+        assert restored == vr
+
+    def test_plan_dict_is_json_dumpable(self):
+        vr = VerifyResult(
+            passed=True,
+            test_output="",
+            lint_output="",
+            type_output="",
+            summary="all good",
+            plan={"runs": [], "needs_pipeline_guard_check": True},
+        )
+        # Should round-trip through json without error — plan must be a plain
+        # JSON-native dict, not a nested dataclass (mirrors `contention`).
+        json.dumps(result_to_dict(vr))
+
+    def test_default_plan_is_none(self):
+        vr = VerifyResult(
+            passed=True,
+            test_output="",
+            lint_output="",
+            type_output="",
+            summary="all good",
+        )
+        assert vr.plan is None
+
+
+# ---------------------------------------------------------------------------
 # Task 2306 step-3: FLOCK_CONTENTION_CATEGORY + make_flock_contention_result —
 # the contention-result builder consumed by task beta (workstation side).
 # ---------------------------------------------------------------------------
