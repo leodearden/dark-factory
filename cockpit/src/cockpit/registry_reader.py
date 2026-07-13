@@ -55,6 +55,55 @@ def scan_sessions(root: Path | str | None = None) -> list[session_registry.Sessi
     return records
 
 
+class SessionScanner:
+    """Stateful, cache-aware counterpart to scan_sessions (above).
+
+    A poll loop calling scan_sessions() every tick pays a full read_text() +
+    JSON parse for every session slug, every tick, even when nothing on disk
+    changed -- at 10k+ sessions this is the multi-second cost this class
+    exists to eliminate (see registry_reader/app.py module docstrings). A
+    SessionScanner owns a per-slug cache keyed on record.json's
+    st_mtime_ns, so a later scan() call reuses a cached SessionRecord for
+    any slug whose record.json mtime is unchanged since the last scan --
+    iterdir() is cheap and always runs (still needed to detect added/removed
+    slugs), but the parse-heavy read_record() call is skipped for an
+    unchanged slug. A stateful, constructed object (rather than a free
+    function) gives the cache an obvious owner/lifecycle: each CockpitApp
+    instance (or test) gets its own SessionScanner with its own independent
+    cache; scan_sessions itself is left untouched as the stateless reader.
+    """
+
+    def __init__(self, root: Path | str | None = None) -> None:
+        self._root = root
+
+    def scan(self) -> list[session_registry.SessionRecord]:
+        """Return every readable SessionRecord under sessions_dir(root).
+
+        Mirrors scan_sessions' fail-soft iterdir + read_record loop exactly
+        (see its docstring): an absent sessions/ dir returns [], and a
+        corrupt or vanished record.json is logged and skipped rather than
+        aborting the scan of the remaining slugs.
+        """
+        base = session_registry.sessions_dir(self._root)
+        if not base.is_dir():
+            return []
+
+        records: list[session_registry.SessionRecord] = []
+        for slug_dir in sorted(base.iterdir()):
+            if not slug_dir.is_dir():
+                continue
+            slug = slug_dir.name
+            try:
+                record = session_registry.read_record(slug, root=self._root)
+            except (FileNotFoundError, session_registry.CorruptSessionRecord):
+                logger.warning(
+                    'SessionScanner.scan: skipping unreadable record for %s', slug, exc_info=True
+                )
+                continue
+            records.append(record)
+        return records
+
+
 def build_snapshot(
     records: list[session_registry.SessionRecord],
 ) -> dict[str, tuple]:
