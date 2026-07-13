@@ -449,6 +449,27 @@ class TestFailSafeUnverifiablePin:
         assert resolved.provenance is None
         assert resolved.source == 'in_code'
 
+    def test_provenance_without_heuristics_falls_back_to_in_code(self, tmp_path):
+        """The symmetric orphan to the heuristics-without-provenance case: a
+        schema-valid provenance.json with NO heuristics.txt. resolve() short
+        -circuits on heuristics_path.exists() before ever loading provenance,
+        so this is a distinct code path that must independently fail safe.
+        """
+        store = PromptArtifactStore(tmp_path)
+        spec = _make_spec()
+        key_dir = store._key_dir('reviewer', 'claude-opus-4', 'v1')
+        key_dir.mkdir(parents=True)
+        (key_dir / 'provenance.json').write_text(
+            json.dumps(_provenance_kwargs(harness_version='v1')), encoding='utf-8'
+        )
+        # No heuristics.txt written.
+
+        resolved = store.resolve(spec, executor_model='claude-opus-4', harness_version='v1')
+
+        assert resolved.text == spec.in_code_constant
+        assert resolved.provenance is None
+        assert resolved.source == 'in_code'
+
     def test_corrupt_provenance_json_falls_back_to_in_code(self, tmp_path):
         store = PromptArtifactStore(tmp_path)
         spec = _make_spec()
