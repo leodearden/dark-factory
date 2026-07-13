@@ -36,6 +36,7 @@ ALL_TOOL_KINDS = list(ToolKind)
 
 def _classify(tool: ToolKind, output: str, rc: int, timed_out: bool) -> FailureCategory:
     from orchestrator.verify_classify import classify_failure  # noqa: PLC0415
+
     return classify_failure(tool, rc, output, timed_out)
 
 
@@ -75,9 +76,7 @@ class TestOpaqueReproducesLegacyGenericLadder:
     # compile_error: rustc diagnostic error codes / generic 'compile error'
     def test_compile_error_rustc_code(self):
         output = (
-            'Compiling my-crate v0.1.0\n'
-            'error[E0308]: mismatched types\n'
-            '  --> src/lib.rs:10:5\n'
+            'Compiling my-crate v0.1.0\nerror[E0308]: mismatched types\n  --> src/lib.rs:10:5\n'
         )
         assert _classify(ToolKind.OPAQUE, output, 1, False) == FailureCategory.COMPILE_ERROR
 
@@ -143,11 +142,7 @@ class TestOpaqueReproducesLegacyGenericLadder:
 
     # test_failure: rust test runner / pytest FAILED lines
     def test_test_failure_rust_test_runner(self):
-        output = (
-            'running 3 tests\n'
-            'test my::mod::it FAILED\n'
-            'test my::mod::another ... ok\n'
-        )
+        output = 'running 3 tests\ntest my::mod::it FAILED\ntest my::mod::another ... ok\n'
         assert _classify(ToolKind.OPAQUE, output, 1, False) == FailureCategory.TEST_FAILURE
 
     def test_test_failure_pytest_failed(self):
