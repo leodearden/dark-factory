@@ -2678,6 +2678,13 @@ def create_mcp_server(
             ids: Optional list of task ids to filter to (unknown ids silently omitted).
                  Omit or pass null for all tasks.
             tag: Tag context (optional)
+
+        Shape note (deliberate asymmetry): this tool WRAPS its result under a
+        top-level ``'statuses'`` key (``{'statuses': {id: status}}``), unlike
+        ``get_external_statuses`` which intentionally returns a FLAT
+        ``{dep: status}`` dict for its scheduler contract (see CLAUDE.md's
+        "Cross-project task dependencies"; tasks 1799/1807). Do not assume the
+        two tools share an envelope shape.
         """
         _normalized = _normalize_project_root(project_root)
         if isinstance(_normalized, dict):
@@ -2708,6 +2715,13 @@ def create_mcp_server(
         - ``"unknown_project"`` — project_id not in the registry
         - ``"unknown_task"``    — project known, but no top-level task with that id
         - ``"malformed"``       — dep cannot be parsed as ``<project_id>:<int>``
+
+        Shape note (deliberate asymmetry): this tool returns a FLAT
+        ``{dep: status}`` dict — deliberately NOT wrapped, unlike
+        ``get_statuses`` which wraps its result under a top-level
+        ``'statuses'`` key (``{'statuses': {id: status}}``). This asymmetry is
+        deliberate and guard-defused (tasks 1799/1807); callers must not
+        assume a shared envelope shape between the two tools.
 
         Read-only: no reconciliation, no event emission, no task mutation.
 
