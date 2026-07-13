@@ -10,6 +10,7 @@ append-only, never-delete.
 """
 from __future__ import annotations
 
+import copy
 import os
 import re
 
@@ -206,3 +207,33 @@ def dump(codebook: dict, path: str | os.PathLike) -> None:
     with open(path, "w", encoding="utf-8") as f:
         f.write(HEADER)
         f.write(body)
+
+
+# ---------------------------------------------------------------------------
+# migrate_v1_to_v2 — in-place-shaped v1 → v2 upgrade
+# ---------------------------------------------------------------------------
+
+def migrate_v1_to_v2(codebook: dict) -> dict:
+    """Return a v2-shaped copy of `codebook` (does not mutate the input).
+
+    version -> 2; each entry gains origin_phase/manifested_phase='unknown'
+    and sightings=[] (only if absent — idempotent on already-migrated
+    input); status 'yes' (not a v2 enum member) maps to 'open' (the v1
+    'yes' entries are verified-real-but-unfixed causes, which is exactly
+    'open' semantics); every other v1 field, including sightings_2026_06,
+    is retained verbatim; entry order is preserved. Top-level candidates
+    defaults to [] (only if absent). Output passes validate().
+    """
+    result = copy.deepcopy(codebook)
+    result["version"] = 2
+
+    for entry in result.get("entries", []):
+        entry.setdefault("origin_phase", "unknown")
+        entry.setdefault("manifested_phase", "unknown")
+        entry.setdefault("sightings", [])
+        if entry.get("status") == "yes":
+            entry["status"] = "open"
+
+    result.setdefault("candidates", [])
+
+    return result
