@@ -409,3 +409,65 @@ def test_apply_fails_when_health_never_ready(tmp_path):
         f"Expected the recon-serving gate to never run when the health gate "
         f"fails first; state={state!r}"
     )
+
+
+def test_apply_confirms_recon_serving(tmp_path):
+    """When fused-memory's journal shows the RECON_MARKER after a restart,
+    the serving-sanity gate observes it and the run exits 0 -- and the
+    recon-serving check must run only after the health gate has already
+    passed at least once (restart -> health -> recon-serving ordering)."""
+    result = _run_script(tmp_path, curl_fail_remaining=0, journalctl_marker=RECON_MARKER)
+
+    assert result.returncode == 0, (
+        f"Expected apply to exit 0 once recon-serving is confirmed; got "
+        f"{result.returncode}\nstdout={result.stdout!r} stderr={result.stderr!r}"
+    )
+    state = _state(tmp_path)
+    assert state["journalctl_calls"], (
+        f"Expected at least one journalctl call observing the recon-serving "
+        f"marker; state={state!r}"
+    )
+    assert state.get("health_passed_before_first_journalctl") is True, (
+        f"Expected the recon-serving check to run only after the health "
+        f"gate had already passed; state={state!r}"
+    )
+    assert state.get("restart_called_before_first_journalctl") is True, (
+        f"Expected the recon-serving check to run only after the restart; "
+        f"state={state!r}"
+    )
+
+
+def test_apply_fails_when_recon_marker_absent(tmp_path):
+    """When the journal never shows the RECON_MARKER, with a short injected
+    RECON_VERIFY_TIMEOUT the script must exit non-zero with a diagnostic on
+    stderr (so the DeterministicRunner escalates) -- while the restart and
+    health gate must still have occurred; the failure belongs to the
+    recon-serving gate alone."""
+    result = _run_script(
+        tmp_path,
+        curl_fail_remaining=0,
+        journalctl_marker="",
+        env={"RECON_VERIFY_TIMEOUT": "1"},
+    )
+
+    assert result.returncode != 0, (
+        f"Expected a non-zero exit when the recon-serving marker never "
+        f"appears; got 0\nstdout={result.stdout!r} stderr={result.stderr!r}"
+    )
+    assert result.stderr.strip(), (
+        f"Expected a diagnostic on stderr; stdout={result.stdout!r} "
+        f"stderr={result.stderr!r}"
+    )
+    state = _state(tmp_path)
+    assert ["restart", UNIT] in state["systemctl_calls"], (
+        f"Expected the restart to still have occurred despite the "
+        f"recon-serving gate failing; state={state!r}"
+    )
+    assert state.get("curl_success_count", 0) > 0, (
+        f"Expected the health gate to still have passed despite the "
+        f"recon-serving gate failing; state={state!r}"
+    )
+    assert state["journalctl_calls"], (
+        f"Expected the recon-serving gate to have polled at least once "
+        f"before timing out; state={state!r}"
+    )
