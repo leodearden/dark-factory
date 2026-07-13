@@ -20,6 +20,7 @@ in :meth:`TaskGroundTruth.derive_truth` and :func:`classify_recovery` below.
 
 from __future__ import annotations
 
+import asyncio
 import enum
 import os
 from dataclasses import dataclass
@@ -213,9 +214,20 @@ class TaskGroundTruth:
         ``worktree_resolver(tid)`` is called exactly ONCE here and the
         resulting path is shared with ``_resolve_live_claimant``'s
         plan.lock read — no second resolve (review finding #2).
+
+        ``_resolve_branch_state`` (git archaeology on a journal miss) and
+        ``scheduler.get_task`` (the db row fetch) are mutually independent
+        — neither reads the other's result — so they run concurrently via
+        ``asyncio.gather`` rather than one after the other. θ2 calls
+        ``derive_truth`` once per stranded task across seven reconcile
+        sweeps, so serializing two independent awaits would needlessly
+        double the per-task wall-clock in that hot path (review finding).
         """
-        branch_state = await self._resolve_branch_state(tid)
-        task = await self.scheduler.get_task(tid) or {}
+        branch_state, task = await asyncio.gather(
+            self._resolve_branch_state(tid),
+            self.scheduler.get_task(tid),
+        )
+        task = task or {}
         worktree_path = self.worktree_resolver(tid)
         return TruthReport(
             db_status=task.get('status') or '',
