@@ -43,3 +43,55 @@ def load_transcript(path: Any) -> list[dict[str, Any]]:
             except json.JSONDecodeError:
                 continue
     return records
+
+
+def _message_content(record: dict[str, Any]) -> Any:
+    """Return a record's ``message.content``, or None if absent/malformed."""
+    message = record.get('message')
+    if not isinstance(message, dict):
+        return None
+    return message.get('content')
+
+
+def _user_turn_text(content: Any) -> str | None:
+    """Extract genuine human-typed text from a user record's content.
+
+    ``content`` is either a plain string (the common case) or a list of
+    content blocks. A list contributes only its 'text' blocks -- a user
+    record whose content is entirely tool_result blocks (an answer TO the
+    agent, not a human speaking) yields no text and is excluded.
+    """
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        texts = [
+            block.get('text') for block in content
+            if isinstance(block, dict) and block.get('type') == 'text'
+            and isinstance(block.get('text'), str)
+        ]
+        if texts:
+            return '\n'.join(texts)
+    return None
+
+
+def iter_user_turns(records: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Return genuine non-sidechain, non-meta human user turns.
+
+    Excludes: non-'user' records, isSidechain=True (subagent) turns,
+    isMeta=True (system-injected) turns, and user records whose content is
+    entirely tool_result blocks. User corrections are gold (PRD Sec 5) --
+    this is the highest-priority digest section.
+    """
+    turns = []
+    for index, record in enumerate(records):
+        if record.get('type') != 'user':
+            continue
+        if record.get('isSidechain'):
+            continue
+        if record.get('isMeta'):
+            continue
+        text = _user_turn_text(_message_content(record))
+        if text is None:
+            continue
+        turns.append({'index': index, 'text': text})
+    return turns
