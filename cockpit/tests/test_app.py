@@ -1205,6 +1205,78 @@ class TestWeightEditorReordersAndPersists:
         persisted = load_priorities(tmp_path / 'priorities.yaml')
         assert persisted.project_weights['beta'] == 100.0
 
+    @pytest.mark.timeout(10)
+    async def test_reorder_survives_a_silently_failed_persist(self, tmp_path, monkeypatch):
+        """apply_priorities' persist half is fail-soft, by contract, all the
+        way down: save_priorities never raises (see
+        TestSavePriorities::test_write_failure_is_fail_soft_and_warns /
+        test_non_os_error_during_write_is_fail_soft_and_warns in
+        test_priorities_config.py). This pins the SAME guarantee at the app
+        boundary apply_priorities itself relies on: self._priorities is
+        already swapped and save_priorities is called before
+        _rebuild_queue() runs, so if a persist attempt were ever to become a
+        silent no-op (the worst case save_priorities' own fail-soft
+        contract allows), the live reorder must still happen with no
+        exception escaping apply_priorities -- an operator's in-session view
+        must never be held hostage by a write fault (PRD §2). No production
+        code change -- cockpit.app.save_priorities is monkeypatched here to
+        a no-op stand-in for the worst case, not to prove a NEW behavior.
+        """
+        from cockpit.app import CockpitApp
+        from cockpit.backends import FakeBackend
+        from cockpit.panes.decision_queue import DecisionQueue
+        from cockpit.panes.weight_editor import merge_weight_edits
+        from cockpit.priority import Priorities
+
+        fixed_now = datetime.fromisoformat('2026-07-07T00:00:00+00:00')
+
+        alpha = sr.DecisionRecord(
+            id='alpha',
+            project='alpha',
+            text='Alpha?',
+            filed_at='2026-07-07T00:00:00+00:00',
+            manual_boost=0,
+        )
+        beta = sr.DecisionRecord(
+            id='beta',
+            project='beta',
+            text='Beta?',
+            filed_at='2026-07-07T00:00:00+00:00',
+            manual_boost=0,
+        )
+        for d in (alpha, beta):
+            assert sr.write_decision(d, root=tmp_path)
+
+        monkeypatch.setattr('cockpit.app.save_priorities', lambda *args, **kwargs: None)
+
+        backend = FakeBackend()
+        app = CockpitApp(
+            fleet_root=tmp_path,
+            backend=backend,
+            poll_interval=0.05,
+            now_fn=lambda: fixed_now,
+            priorities=Priorities.default(),
+        )
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            queue = app.query_one(DecisionQueue)
+            assert queue.get_row_index('decision:alpha') < queue.get_row_index('decision:beta')
+
+            new_priorities = merge_weight_edits(
+                app._priorities, category_edits={}, project_edits={'beta': '100'}
+            )
+            app.apply_priorities(new_priorities)
+            await pilot.pause()
+
+            # Live reorder happened despite the no-op'd save_priorities --
+            # apply_priorities never propagated an exception (this pilot
+            # session would have errored out already if it had).
+            assert queue.get_row_index('decision:beta') < queue.get_row_index('decision:alpha')
+
+        # Nothing was ever written -- the no-op stand-in is a faithful
+        # stand-in for a real, silently-swallowed write fault.
+        assert not (tmp_path / 'priorities.yaml').exists()
+
 
 class TestPrioritiesPathResolution:
     @pytest.mark.timeout(10)
