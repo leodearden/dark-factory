@@ -21,6 +21,8 @@ from orchestrator.merge_queue import (
     MAIN_HEALTH_RED_REASON_PREFIX,
     MergeOutcome,
     MergeRequest,
+    _build_main_health_outcome,
+    _main_health_fingerprint,
     _run_post_merge_verify,
 )
 from orchestrator.verify import _PROBE_CACHE, VerifyResult
@@ -138,6 +140,46 @@ def test_make_req_works_with_no_current_event_loop(tmp_path: Path) -> None:
         # Restore None (the realistic post-asyncio.run() state) so this test
         # does not mutate loop state for other tests on the same xdist worker.
         asyncio.set_event_loop(None)
+
+
+# ---------------------------------------------------------------------------
+# Step-1/2: _build_main_health_outcome pure helper (task 2564)
+# ---------------------------------------------------------------------------
+
+
+class TestBuildMainHealthOutcomeHelper:
+    """Step-1 (RED): _build_main_health_outcome(verify, probe_sha) must produce
+    a MergeOutcome with parity to the inline construction previously in
+    _classify_main_health_red (merge_queue.py:746-762) — task 2564 extracts it
+    into a pure helper so the synchronous and deferred probe paths cannot
+    diverge in their reason/fingerprint/failure_category/failure_cause_hint
+    composition."""
+
+    def test_build_main_health_outcome_parity(self) -> None:
+        outcome = _build_main_health_outcome(COMPILE_ERROR_RESULT, MAIN_SHA)
+
+        assert isinstance(outcome, MergeOutcome)
+        assert outcome.status == 'blocked', f'Expected blocked; got {outcome.status}'
+        assert outcome.reason.startswith(MAIN_HEALTH_RED_REASON_PREFIX), (
+            f'Expected reason to start with MAIN_HEALTH_RED_REASON_PREFIX; '
+            f'got: {outcome.reason!r}'
+        )
+        assert outcome.failure_category == COMPILE_ERROR_RESULT.category, (
+            f'Expected failure_category={COMPILE_ERROR_RESULT.category!r}; '
+            f'got {outcome.failure_category!r}'
+        )
+        assert outcome.failure_cause_hint == COMPILE_ERROR_RESULT.cause_hint, (
+            f'Expected failure_cause_hint={COMPILE_ERROR_RESULT.cause_hint!r}; '
+            f'got {outcome.failure_cause_hint!r}'
+        )
+        expected_fp = _main_health_fingerprint(
+            COMPILE_ERROR_RESULT.category or '', COMPILE_ERROR_RESULT.cause_hint, MAIN_SHA,
+        )
+        assert outcome.dedupe_fingerprint == expected_fp, (
+            f'Expected dedupe_fingerprint={expected_fp!r}; '
+            f'got {outcome.dedupe_fingerprint!r}'
+        )
+        assert outcome.dedupe_fingerprint, 'dedupe_fingerprint must be non-empty'
 
 
 # ---------------------------------------------------------------------------
