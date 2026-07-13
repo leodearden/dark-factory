@@ -23,7 +23,7 @@ from __future__ import annotations
 
 import json
 
-import digest as mod  # noqa: F401  (unused until the first RED test lands)
+import digest as mod
 
 
 def _assistant(*blocks):
@@ -106,3 +106,32 @@ def _write_jsonl(tmp_path, records):
             f.write(json.dumps(r))
             f.write('\n')
     return path
+
+
+# ---------------------------------------------------------------------------
+# load_transcript — ordered parse; blank/malformed lines degrade (skip)
+# rather than raise (mirrors analyze_speculation_depth.load_events).
+# ---------------------------------------------------------------------------
+
+class TestLoadTranscript:
+    def test_parses_ordered_records(self, tmp_path):
+        records = [_user_text('first'), _assistant(_text('second')), _user_text('third')]
+        path = _write_jsonl(tmp_path, records)
+
+        loaded = mod.load_transcript(path)
+
+        assert [r['message']['content'] for r in loaded] == [
+            'first', [{'type': 'text', 'text': 'second'}], 'third',
+        ]
+
+    def test_skips_blank_and_malformed_lines_without_raising(self, tmp_path):
+        path = tmp_path / 'transcript.jsonl'
+        with path.open('w', encoding='utf-8') as f:
+            f.write(json.dumps(_user_text('one')) + '\n')
+            f.write('\n')  # blank line
+            f.write('{not valid json,,,\n')  # malformed line
+            f.write(json.dumps(_user_text('two')) + '\n')
+
+        loaded = mod.load_transcript(path)  # must not raise
+
+        assert [r['message']['content'] for r in loaded] == ['one', 'two']
