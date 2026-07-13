@@ -13,13 +13,18 @@ full owning-package suite fallback at merge-verify time).
 
 from __future__ import annotations
 
-from shared.cli_invoke import AgentResult
+from shared.cli_invoke import AgentFailureKind, AgentResult, classify_agent_failure
 from shared.invocation_outcome import (
     OK,
     CapHit,
     Failure,
     ModelNotFound,
     classify_invocation,
+)
+
+NOT_FOUND_ERROR_BODY = (
+    '{"type":"error","error":{"type":"not_found_error",'
+    '"message":"model: bogus-model-9"}}'
 )
 
 
@@ -86,3 +91,36 @@ class TestClassifyInvocationModelNotFound:
         outcome = classify_invocation(result, strict_confirm=True)
         assert isinstance(outcome, Failure)
         assert not isinstance(outcome, ModelNotFound)
+
+
+class TestClassifyAgentFailureModelNotFound:
+    """classify_agent_failure must map a model-not-found result to the
+    distinct TERMINAL AgentFailureKind.MODEL_NOT_FOUND, NOT the transient
+    API_ERROR kind -- a 404 sets api_error_status and would otherwise be
+    mis-tagged transient by the existing api_error_status->API_ERROR rule
+    (cli_invoke.py's decision-rule #4)."""
+
+    def test_model_not_found_is_agent_failure_kind_member(self):
+        assert AgentFailureKind.MODEL_NOT_FOUND.value == 'model_not_found'
+
+    def test_404_not_found_error_maps_to_model_not_found_kind_not_api_error(self):
+        result = AgentResult(success=False, api_error_status=404, output=NOT_FOUND_ERROR_BODY)
+        classified = classify_agent_failure(result)
+        assert classified.kind == AgentFailureKind.MODEL_NOT_FOUND
+        assert classified.kind != AgentFailureKind.API_ERROR
+
+    def test_summary_conveys_terminal_no_retry_semantics(self):
+        result = AgentResult(success=False, api_error_status=404, output=NOT_FOUND_ERROR_BODY)
+        classified = classify_agent_failure(result)
+        summary_lower = classified.summary.lower()
+        assert 'terminal' in summary_lower or 'no retry' in summary_lower or 'no-retry' in summary_lower
+
+    def test_genuine_transient_500_still_maps_to_api_error(self):
+        """Regression guard: the new branch must not swallow real transient
+        API errors -- only a model-not-found outcome should divert away from
+        the API_ERROR rule."""
+        result = AgentResult(
+            success=False, api_error_status=500, output='internal server error, please retry'
+        )
+        classified = classify_agent_failure(result)
+        assert classified.kind == AgentFailureKind.API_ERROR
