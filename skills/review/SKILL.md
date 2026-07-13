@@ -120,8 +120,9 @@ Read `references/phase2-architecture.md` for the detailed step-by-step process.
 3. Critical path tracing — follow each critical path from the briefing through actual code, checking wiring at every module boundary
 4. Deep read of high-risk modules — read server startup, config loading, pipeline stages, Dockerfiles, and shared utilities line by line. This is where you find behavioral bugs that structural scanning misses: wrong variables passed, hardcoded assumptions, missing initialization, port/path drift. Prioritise module selection with the latest `/hotspot-survey` report when one exists (reference Step 1.5)
 5. Cross-module consistency — API naming, data flow across boundaries, config coherence, import health
-6. Dead code and orphan detection
-7. Test coverage analysis (qualitative — are critical paths tested end-to-end?)
+6. Design-invariants audit — audit against docs/legibility/design-invariants.md when present; findings keyed by invariant slug.
+7. Dead code and orphan detection
+8. Test coverage analysis (qualitative — are critical paths tested end-to-end?)
 
 **Agent allocation:**
 - Spawn Sonnet agents for: stub scanning (grep patterns), import graph mapping, dead code enumeration
