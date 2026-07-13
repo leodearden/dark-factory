@@ -203,6 +203,13 @@ class CockpitApp(App):
         self._snapshot: dict[str, tuple] = {}
         self._decisions_snapshot: dict[str, tuple] = {}
         self._has_scanned = False
+        # Drop-tick backpressure for the threaded poll path (see
+        # _poll_registry/_scan_registry_worker): True while a scan launched
+        # by _poll_registry is still running. Only ever read/written on the
+        # main thread (set in _poll_registry, cleared by
+        # _clear_scan_in_flight via call_from_thread), so the check-then-set
+        # in _poll_registry is race-free without needing a lock.
+        self._scan_in_flight = False
         self._selected_slug: str | None = None
         # Keyed by resolved DisplayTarget, NOT by item key -- see
         # _update_attention's docstring: a decision and the AWAITING_INPUT
@@ -313,10 +320,25 @@ class CockpitApp(App):
         Never scans synchronously itself -- see _scan_registry_worker, which
         runs the actual I/O off the UI thread so a slow scan (10k+ sessions,
         ~4.5s) never freezes input (C10 tour F1, esc-2303-1).
+
+        Drops an overlapping tick instead of piling up worker threads: in
+        production poll_interval (1.5s) is routinely shorter than a full
+        scan over 10k+ sessions (~4.5s), so an unguarded launch here would
+        start one thread per tick for the scan's entire duration. Checking
+        and setting _scan_in_flight here (both on the main thread, same as
+        the timer callback that invokes this method) makes the
+        check-then-set race-free without needing a lock or introspecting
+        Textual's worker registry. _scan_registry_worker's own try/finally
+        clears the flag -- via call_from_thread, also on the main thread --
+        even when the scan raises, so one bad tick never wedges every
+        later poll.
         """
+        if self._scan_in_flight:
+            return
+        self._scan_in_flight = True
         self._scan_registry_worker()
 
-    @work(thread=True, group='registry-scan')
+    @work(thread=True, group='registry-scan', exit_on_error=False)
     def _scan_registry_worker(self) -> None:
         """Threaded poll worker: run the scan off-thread, marshal the UI update back.
 
@@ -324,9 +346,28 @@ class CockpitApp(App):
         thread via Textual's @work(thread=True), then hands the result to
         _apply_scan on the main/UI thread via call_from_thread -- Textual
         widgets are never safe to touch directly from a worker thread.
+
+        exit_on_error=False: a scan that raises (e.g. a transient disk
+        error) must only fail this one tick, never take down the whole app
+        -- Textual's default would treat an unhandled worker exception as
+        fatal and close the app. The finally clause below still clears
+        _scan_in_flight when the scan raises, so _poll_registry's very next
+        tick starts a fresh scan instead of being dropped forever.
         """
-        records, decisions = self._scan_registry()
-        self.call_from_thread(self._apply_scan, records, decisions)
+        try:
+            records, decisions = self._scan_registry()
+            self.call_from_thread(self._apply_scan, records, decisions)
+        finally:
+            self.call_from_thread(self._clear_scan_in_flight)
+
+    def _clear_scan_in_flight(self) -> None:
+        """Main-thread-only: clear the drop-tick backpressure flag.
+
+        Only ever invoked via call_from_thread from _scan_registry_worker
+        (see _poll_registry's docstring), so this always runs on the main
+        thread, same as the _poll_registry read/set.
+        """
+        self._scan_in_flight = False
 
     def _rebuild_queue(self) -> None:
         """Re-score and re-render the DecisionQueue from current in-memory state, right now.
