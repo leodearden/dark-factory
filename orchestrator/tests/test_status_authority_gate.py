@@ -32,9 +32,11 @@ from escalation.action_effects import effect_for
 from escalation.models import Escalation
 
 from orchestrator.harness import Harness
-from orchestrator.task_status import is_infra_held
 
-__all__ = ['effect_for', 'is_infra_held']
+# B6 exercises is_infra_held indirectly (through the harness's own
+# _cascade_unblock_member / _reconcile_stranded_in_progress guards); kept as
+# a direct import to document the guard under test.
+from orchestrator.task_status import is_infra_held  # noqa: F401
 
 _BASE_SHA = 'a' * 40  # branch_base_sha in metadata — non-degenerate-branch fixtures
 _TIP_SHA = 'b' * 40   # tip SHA different from base -> non-degenerate
