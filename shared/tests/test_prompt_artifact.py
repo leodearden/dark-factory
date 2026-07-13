@@ -178,6 +178,36 @@ class TestPinAndResolve:
 
         assert store.read_provenance('reviewer', 'claude-opus-4', 'v1') == provenance
 
+    def test_extra_provenance_field_survives_pin_disk_round_trip(self, tmp_path):
+        """test_unknown_extra_field_is_preserved (TestArtifactProvenance) only
+        checks in-memory model_dump() preservation. This locks the same
+        guarantee through a full pin() -> on-disk provenance.json -> fresh
+        PromptArtifactStore -> resolve()/read_provenance() round trip, so a
+        future change to how the sidecar is serialized/reloaded (e.g.
+        switching model_dump_json args, or adding a field filter) cannot
+        silently drop forward-compat fields without failing a test.
+        """
+        store = PromptArtifactStore(tmp_path)
+        spec = _make_spec()
+        provenance = ArtifactProvenance(
+            **_provenance_kwargs(harness_version='v1', candidate_id='cand-7')
+        )  # type: ignore[call-arg]
+        store.pin('reviewer', 'claude-opus-4', 'v1', heuristics='h', provenance=provenance)
+
+        # A fresh store instance -- nothing carried over in memory -- so both
+        # reads below come purely from what pin() persisted to disk.
+        reloaded_store = PromptArtifactStore(tmp_path)
+
+        reloaded_provenance = reloaded_store.read_provenance('reviewer', 'claude-opus-4', 'v1')
+        assert reloaded_provenance is not None
+        assert reloaded_provenance.model_dump()['candidate_id'] == 'cand-7'
+
+        resolved = reloaded_store.resolve(
+            spec, executor_model='claude-opus-4', harness_version='v1'
+        )
+        assert resolved.provenance is not None
+        assert resolved.provenance.model_dump()['candidate_id'] == 'cand-7'
+
     def test_pin_rejects_provenance_harness_version_mismatch(self, tmp_path):
         store = PromptArtifactStore(tmp_path)
         provenance = ArtifactProvenance(**_provenance_kwargs(harness_version='v1'))

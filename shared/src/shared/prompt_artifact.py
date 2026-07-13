@@ -239,6 +239,16 @@ class PromptArtifactStore:
         relocated/tampered sidecar), or a heuristics.txt that vanishes
         between the provenance check below and the read (e.g. a concurrent
         :meth:`unpin` racing this call).
+
+        Performance note: this does disk I/O — an ``exists()`` check, a JSON
+        load + schema validation, and a text read — on every call, with no
+        memoization. On-disk state here only changes via :meth:`pin`/
+        :meth:`unpin`, so a cache keyed on e.g. ``heuristics.txt``'s
+        mtime/size would be safe to add, but is intentionally not
+        implemented without profiling data showing it is needed. Callers are
+        expected to call this at agent-spawn/prompt-assembly granularity
+        (once per invocation), not from a per-token or otherwise tight inner
+        loop.
         """
         key_dir = self._key_dir(spec.prompt_id, executor_model, harness_version)
         heuristics_path = key_dir / _HEURISTICS_FILENAME
