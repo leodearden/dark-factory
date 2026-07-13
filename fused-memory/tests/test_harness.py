@@ -827,7 +827,9 @@ class TestStage1CycleSummaryHarnessBackstop:
         payload = json.loads(record.payload_json)
         assert payload['stats'].get('stage1_cycle_summary_degraded_backstop') is True
 
-        assert run.stage_reports['_error']['stage1_cycle_summary_backstop_written'] is True, (
+        err = run.stage_reports.get('_error')
+        assert isinstance(err, dict)
+        assert err['stage1_cycle_summary_backstop_written'] is True, (
             'the breadcrumb must be stamped on the deferral (return, not raise) '
             'exit path too'
         )
