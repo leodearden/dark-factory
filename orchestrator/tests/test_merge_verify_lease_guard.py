@@ -28,6 +28,7 @@ import pytest
 from orchestrator.config import GitConfig
 from orchestrator.git_ops import GitOps, _run
 from orchestrator.verify_cancel import read_lock_holder_pgid, write_lock_holder_pgid
+from orchestrator.warm_lane_pool import WarmLanePool
 
 
 def _git_config(**overrides) -> GitConfig:
@@ -208,4 +209,72 @@ class TestResetPersistentMergeWorktreeLeaseGuard:
         _, head_sha, _ = await _run(['git', 'rev-parse', 'HEAD'], cwd=warm_path)
         assert head_sha.strip() == merge_commit_b.strip(), (
             'self-held lease: reset must proceed (self excluded from the guard)'
+        )
+
+
+def _write_warm_lane_gc_stub(project_root: Path) -> Path:
+    """Write a minimal ``warm-lane-gc.sh`` stub at ``<project_root>/scripts/``.
+
+    Mirrors test_pool_storage_guard.py's ``_write_warm_lane_gc_stub`` —
+    existence is all ``_run_warm_lane_gc_reclaim``'s ``script.exists()``
+    check cares about; ``_run`` is mocked in these tests so the stub body
+    never actually runs.
+    """
+    scripts_dir = project_root / 'scripts'
+    scripts_dir.mkdir(parents=True, exist_ok=True)
+    script = scripts_dir / 'warm-lane-gc.sh'
+    script.write_text('#!/usr/bin/env bash\nexit 0\n')
+    script.chmod(0o755)
+    return script
+
+
+@pytest.mark.asyncio
+class TestGcReclaimDefersOnMergeVerifyLease:
+    """_run_warm_lane_gc_reclaim defers (127, fail-soft) while ANY
+    merge-verify lease is held — INCLUDING our own (step-15/16).
+
+    Unlike the reset guard (which excludes self so the normal
+    reset-then-verify flow works), the GC cadence must defer to an
+    in-process local verify just as much as to a foreign one, so self is
+    NOT excluded here.
+
+    Sentinel/base setup uses ``mark_pool_storage_present()`` directly (the
+    simplest way to make the BUG-2 ``_reconcile_pool_storage_before_sweep``
+    gate pass) so a skip in these tests is attributable ONLY to the lease,
+    never to the sentinel.
+    """
+
+    async def test_lease_held_defers_script_never_spawned(self, tmp_path: Path):
+        git_ops = _git_ops(tmp_path)
+        git_ops.mark_pool_storage_present()
+        git_ops.warm_lane_pool = WarmLanePool(worktree_base=git_ops.worktree_base, size=1)
+        script = _write_warm_lane_gc_stub(git_ops.project_root)
+        assert script.exists()
+
+        write_lock_holder_pgid(git_ops.worktree_base, os.getpgrp())  # live lease held
+
+        mock_run = AsyncMock(return_value=(0, '', ''))
+        with patch('orchestrator.git_ops._run', mock_run):
+            rc = await git_ops._run_warm_lane_gc_reclaim()
+
+        assert rc == 127, f'expected fail-soft defer sentinel while a lease is held, got {rc}'
+        mock_run.assert_not_awaited()
+
+    async def test_no_lease_reclaim_proceeds_control(self, tmp_path: Path):
+        """Control: with no holder-pgid recorded, the reclaim script IS spawned."""
+        git_ops = _git_ops(tmp_path)
+        git_ops.mark_pool_storage_present()
+        git_ops.warm_lane_pool = WarmLanePool(worktree_base=git_ops.worktree_base, size=1)
+        script = _write_warm_lane_gc_stub(git_ops.project_root)
+
+        assert read_lock_holder_pgid(git_ops.worktree_base) is None
+
+        mock_run = AsyncMock(return_value=(0, '', ''))
+        with patch('orchestrator.git_ops._run', mock_run):
+            rc = await git_ops._run_warm_lane_gc_reclaim()
+
+        assert rc == 0
+        mock_run.assert_awaited_once_with(
+            [str(script), 'reclaim', '--mount', str(git_ops.worktree_base)],
+            cwd=git_ops.project_root,
         )
