@@ -34,6 +34,8 @@ from escalation.queue import EscalationQueue
 from orchestrator.event_store import EventStore
 from orchestrator.merge_queue import (
     MAIN_HEALTH_RED_REASON_PREFIX,
+    RealMergeItem,
+    SpeculativeMergeWorker,
     _MainHealthProbeHandles,
     _main_health_fingerprint,
     _run_deferred_main_health_probe,
@@ -41,6 +43,7 @@ from orchestrator.merge_queue import (
     _spawn_main_health_probe,
 )
 from orchestrator.verify import _PROBE_CACHE, VerifyResult
+from orchestrator.verify_runner import HostLease
 
 
 @pytest.fixture(autouse=True)
@@ -489,4 +492,107 @@ class TestDeferredProbeDedupeFold:
         assert len(pending[0].dedupe_children) == 1, (
             f'Expected exactly one dedupe child attached to the parent; '
             f'got {pending[0].dedupe_children}'
+        )
+
+
+# ---------------------------------------------------------------------------
+# Step-15 (RED): production wiring — the SpeculativeMergeWorker
+# ._run_inflight_verify call site must pass a live main_health_probe_handles,
+# bound to self._background_tasks, into _run_post_merge_verify (mirrors
+# test_merge_queue_dry_run_unblock.py's TestRunInflightVerifyPassesHandles,
+# which pins the same call-site-threading shape for dry_run_handles). Also
+# pins that the worker's EXISTING _background_tasks shutdown drain already
+# cancels a task named main-health-probe-<id> — no new drain code needed
+# once the call site is wired (step-16).
+# ---------------------------------------------------------------------------
+
+
+class TestRunInflightVerifyPassesMainHealthProbeHandles:
+    """Step-15 (RED): _run_inflight_verify must thread a live
+    main_health_probe_handles — bound to self._background_tasks — into
+    _run_post_merge_verify, so a spawned probe task shares the SAME
+    background-task lifetime/drain as the dry-run investigation handles.
+    """
+
+    def test_run_inflight_verify_passes_main_health_probe_handles(
+        self, tmp_path: Path,
+    ) -> None:
+        git_ops = _make_git_ops(tmp_path)
+        config = _make_config(tmp_path)
+        worker = SpeculativeMergeWorker(git_ops, asyncio.Queue())
+
+        req = _make_req('99', tmp_path / 'task-wt', config)
+        (tmp_path / 'task-wt').mkdir()
+        merge_wt = tmp_path / 'merge-wt'
+        merge_wt.mkdir()
+        merge_result = MagicMock()
+        merge_result.merge_commit = 'abc123def456789abc1'
+        item = RealMergeItem(
+            request=req,
+            merge_result=merge_result,
+            merge_wt=merge_wt,
+            base_sha='base123',
+            speculative=False,
+        )
+
+        # REMOTE lease — bypasses the local warm-swap path, keeping this
+        # test focused on the main_health_probe_handles kwarg (mirrors
+        # test_merge_queue_dry_run_unblock.py's REMOTE-lease builder).
+        fake_runner = MagicMock()
+        fake_runner.name = 'leo-laptop'
+        fake_runner.is_local = False
+        lease = HostLease(name='leo-laptop', runner=fake_runner, is_local=False)
+
+        spy = AsyncMock(return_value=None)
+
+        async def _run() -> None:
+            with patch('orchestrator.merge_queue._run_post_merge_verify', new=spy):
+                await worker._run_inflight_verify(item, lease)
+
+        asyncio.run(_run())
+
+        assert spy.await_args is not None, '_run_post_merge_verify was not called'
+        handles = spy.await_args.kwargs.get('main_health_probe_handles')
+        assert handles is not None, (
+            '_run_inflight_verify must pass a live main_health_probe_handles '
+            'into _run_post_merge_verify — the call site has not been wired'
+        )
+        assert handles.background_tasks is worker._background_tasks, (
+            '_run_inflight_verify must pass main_health_probe_handles bound '
+            'to the SAME set instance as worker._background_tasks — a '
+            'spawned probe task strong-ref must live exactly as long as the '
+            'worker and be drained by its existing shutdown drain'
+        )
+
+
+class TestShutdownDrainsMainHealthProbeTask:
+    """A task named main-health-probe-<id> registered in
+    worker._background_tasks must be cancelled by the worker's existing
+    shutdown drain (SpeculativeMergeWorker.stop()'s generic
+    _background_tasks drain, added for the dry-run investigation, task η) —
+    no new drain code needed once step-16 wires the probe's task set to
+    worker._background_tasks.
+    """
+
+    def test_stop_cancels_pending_main_health_probe_task(
+        self, tmp_path: Path,
+    ) -> None:
+        git_ops = _make_git_ops(tmp_path)
+        worker = SpeculativeMergeWorker(git_ops, asyncio.Queue())
+
+        async def _never_done() -> None:
+            await asyncio.Event().wait()
+
+        async def _run() -> asyncio.Task:
+            task = asyncio.create_task(_never_done(), name='main-health-probe-42')
+            worker._background_tasks.add(task)
+            task.add_done_callback(worker._background_tasks.discard)
+            await worker.stop()
+            return task
+
+        task = asyncio.run(_run())
+        assert task.cancelled(), (
+            'A main-health-probe-<id> task registered in '
+            'worker._background_tasks must be cancelled by the worker '
+            'shutdown drain'
         )
