@@ -123,8 +123,8 @@ _UNSCOPED_SENTINEL_CATEGORIES = frozenset({
 
 # Fail-loud import-time guard (mirrors verify_categories._validate_exhaustive):
 # these sentinels are a deliberately separate, out-of-band gate namespace —
-# never produced by verify._classify_failure — so they must never collide
-# with a real FailureCategory value.  See plans/verify-plan-prd.md task α.
+# never produced by verify_classify.classify_failure — so they must never
+# collide with a real FailureCategory value.  See plans/verify-plan-prd.md task α.
 _assert_sentinels_disjoint(_UNSCOPED_SENTINEL_CATEGORIES, FailureCategory)
 
 # Sentinel category for a laptop-side flock-contention outcome (task 2306 α,
