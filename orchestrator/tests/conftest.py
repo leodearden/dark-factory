@@ -226,82 +226,40 @@ def _hermetic_psi_reader(monkeypatch, request):
     default — to ``idle_psi_sample`` (``_orch_helpers.py``), a non-saturating
     PsiSample (all metrics 0.0, ``read_ok=True``).  Every ``Scheduler``
     constructed during a test therefore defaults to a deterministic,
-    non-saturating PSI reading regardless of host load.
+    non-saturating PSI reading regardless of host load. ``monkeypatch``
+    auto-reverts at teardown, so production is never touched.
 
     Saturation tests (``test_scheduler_dispatch_admission.py``,
     ``test_scheduler_psi_saturation_transition.py``) reassign
     ``scheduler._read_psi_sample`` post-construction and are unaffected —
     that per-instance assignment overrides this constructor-time default.
 
-    ``monkeypatch`` auto-reverts at teardown, so production
-    (``orchestrator.scheduler.read_psi_sample``) is never touched.
-
     Mirrors ``_isolate_orch_config`` immediately above: both neutralize a
     host/global dependency (project_root / PSI) so the suite is hermetic
     under parallel execution.  Guard test:
     ``test_scheduler_hermetic_psi.py::TestAutouseFixtureDefaultsToIdlePsi``.
 
-    Blast radius: this fixture is autouse at the top-level orchestrator
-    conftest, so it applies suite-wide, not just to scheduler tests. Verified
-    (task 2418 amendment pass) by running the full orchestrator suite
-    (``pytest -n auto --dist loadgroup``, 8171 tests) with this fixture
-    active: no test outside the PSI/scheduler files asserts identity against
-    the real ``shared.psi.read_psi_sample``, and no ``Scheduler`` is
-    constructed anywhere outside ``orchestrator/tests/``. The suite was
-    otherwise green (the sole failure was the pre-existing, unrelated,
-    independently-flaky aiosqlite thread-teardown race in
-    ``test_aiosqlite_leak_isolation.py`` — task 2413's domain, reproduces
-    solo with this fixture unloaded). If a future test needs the real
-    reader bound at construction, it can mark itself ``real_psi_reader``
-    (see below) or reassign ``scheduler._read_psi_sample`` post-construction
-    (as the saturation tests already do) rather than removing this fixture.
+    **Suite-wide, not scheduler-scoped**: this fixture lives in the
+    top-level orchestrator conftest (like its siblings above/below —
+    ``_isolate_orch_config``, ``_no_dry_run_unblock``, etc.), so it patches
+    every test, not just scheduler ones. Narrowing it to an allowlist would
+    mean auditing every one of the ~28 files that call ``acquire_next()`` or
+    construct a ``Scheduler`` — most of which this task does not hold locks
+    for — so it stays broad-by-default with the escape hatches below; a full
+    opt-in restructuring remains a follow-up outside this task's locked
+    scope.
 
-    Why not scope this down instead (task 2418 amendment pass, round 2)?
-    A code-review pass suggested narrowing this fixture to an opt-in
-    allowlist or a scheduler-specific conftest, so the neutralization is
-    "visible at the call site" instead of applied globally, since a docstring
-    documenting a one-time audit isn't enforcement and could rot as tests are
-    added. Re-checked against the *actual* blast radius rather than the ~11
-    tests this task's plan named: ``grep -rl 'Scheduler(' orchestrator/tests``
-    matches 34 files and ``grep -rl 'acquire_next' orchestrator/tests``
-    matches 28 — spanning ``test_harness_*.py``, ``test_workflow_*.py``,
-    ``test_merge_queue_*.py`` and more, none of which reassign
-    ``_read_psi_sample`` themselves. Only 5 files touch
-    ``_read_psi_sample`` directly at all (the two saturation-test files
-    named above, this file, and the two other files task 2418 holds locks
-    for). Properly scoping down would therefore mean auditing and editing
-    roughly two dozen test files this task does not hold locks for — and for
-    any file missed, it would silently re-admit the exact real-host-PSI
-    nondeterminism this fixture exists to prevent, in files nobody was
-    watching for it. That cost/risk is why the fixture stays suite-wide
-    autouse (matching this conftest's other host/global-state neutralizers
-    — ``_isolate_orch_config``, ``_no_dry_run_unblock``, etc. — all of which
-    are also broad-by-default rather than opt-in) with the post-construction
-    reassignment escape hatch above, rather than being narrowed here. A full
-    opt-in restructuring (auditing and editing every one of those ~28 files
-    to an allowlist model) remains open as a follow-up outside this task's
-    locked scope.
-
-    **Opt-out via ``real_psi_reader`` marker** (task 2418 amendment pass,
-    round 3): tests that specifically need the real
-    ``shared.psi.read_psi_sample`` bound at construction — e.g. to assert
-    reader identity, or to exercise genuine ``/proc/pressure/*`` reads —
-    mark themselves with ``@pytest.mark.real_psi_reader`` to restore the
-    real binding, causing this fixture to return early (skip the
-    monkeypatch). Mirrors the ``real_verify_admission`` /
-    ``exercise_merge_verify`` opt-out pattern elsewhere in this file
-    (conftest.py). This is the lightweight, call-site-visible enforcement a
-    follow-up review round asked for, short of the full opt-in
-    restructuring described above — it does not require auditing the ~28
-    files, it just gives any *future* test an explicit, discoverable way to
-    declare "I need the real reader" instead of silently inheriting one.
-    Not yet added to ``orchestrator/pyproject.toml``'s ``markers = [...]``
-    registry — that file is outside task 2418's locked scope. pytest treats
-    an unregistered marker as a harmless no-op here (this project's
-    ``addopts`` does not set ``--strict-markers``), so the opt-out is fully
-    functional without that registration; adding the registry entry (to
-    silence pytest's unknown-marker warning once a test actually uses it)
-    remains a follow-up.
+    **Opt-out via ``real_psi_reader`` marker**: tests that specifically need
+    the real ``shared.psi.read_psi_sample`` bound at construction — e.g. to
+    assert reader identity, or to exercise genuine ``/proc/pressure/*``
+    reads — mark themselves with ``@pytest.mark.real_psi_reader`` to skip
+    the monkeypatch, restoring the real binding. Mirrors the
+    ``exercise_merge_verify`` opt-out pattern elsewhere in this file. Not yet
+    registered in ``orchestrator/pyproject.toml``'s ``markers = [...]`` list
+    (outside this task's locked scope); harmless since this project's
+    ``addopts`` does not set ``--strict-markers``. A test may instead
+    reassign ``scheduler._read_psi_sample`` post-construction, as the
+    saturation tests do.
     """
     if request.node.get_closest_marker('real_psi_reader'):
         return
