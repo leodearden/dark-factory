@@ -2,6 +2,18 @@
 
 Software factory with unified memory + task management. Three subsystems — Graphiti (temporal knowledge graph), Mem0 (vector memory), Taskmaster AI (task management) — unified behind the **fused-memory** MCP server.
 
+## Repo Map
+
+Package dirs follow a `<pkg>/src/<pkg>/` double-nesting convention:
+`orchestrator/src/orchestrator/`, `fused-memory/src/fused_memory/`,
+`escalation/src/escalation/`, `shared/src/shared/`. `skills/` is the
+**in-repo** skill source (distinct from `~/.claude/skills`). Other
+top-level dirs: `dashboard/` — web UI for task/escalation state;
+`scripts/` — operator and CI helper scripts; `hooks/` — git hooks
+(pre-commit, pre-merge-commit); `plans/` — design docs and PRDs for
+in-flight/past work; `docs/` — reference docs (see `docs/legibility/` for
+the confusion codebook).
+
 ## Prerequisites
 
 ```bash
@@ -353,8 +365,25 @@ merge-lane `git.*` structural fields.
 allowlist and `skills/orchestrate/SKILL.md`'s "Reload Config (vs Restart)"
 section for the operator workflow.
 
+## Working in the main checkout
+
+The `project_root` checkout (`/home/leo/src/dark-factory`) is **machine-operated**
+— the merge worker, the startup reconciler, and git hooks all act on it
+directly, not just interactive agents.
+
+- For a direct-to-main commit under contention, use `git commit --only <path>`
+  (not a bare `git commit`) so you don't sweep up unrelated staged/dirty state
+  from a concurrent process.
+- `pre-commit` runs pyright 3x — pass `timeout: 300000` (or higher) to `Bash`
+  for commit commands, or run detached via `setsid` and poll, rather than
+  letting the default timeout kill it mid-hook.
+- **Never** run `git stash` in `project_root`: the stash stack is consumed by
+  the merge worker's advance path (incident `13674d3c68`), so a stash you push
+  can be popped out from under you by an unrelated process. Park WIP as
+  commits on a branch instead.
+
 ## Reference
 
-- **Design docs**: `DESIGN.md` (architecture), `fused-memory/docs/reconciliation/` (reconciliation system)
+- **Design docs**: `DESIGN.md` (architecture), `fused-memory/src/fused_memory/reconciliation/prompts/` (reconciliation stage/judge prompt sources)
 - **Memory skill**: `/memory` — detailed reference for memory operations, categories, search patterns
 - **Config**: `fused-memory/config/config.yaml`, `.mcp.json`
