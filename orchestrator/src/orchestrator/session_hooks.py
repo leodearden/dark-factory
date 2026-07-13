@@ -210,16 +210,26 @@ _WMCTRL_TIMEOUT_SECS = 2
 def _wmctrl_list(argv: list[str]) -> subprocess.CompletedProcess[str]:
     """Fail-soft default runner for ``_resolve_wm_window_id``.
 
-    Wraps ``subprocess.run(['wmctrl', '-l'], ...)``; a missing ``wmctrl``
-    binary (or any other ``OSError``/``SubprocessError``, e.g. a timeout)
-    yields a rc=127 empty-stdout sentinel rather than raising -- the caller
-    (``_resolve_wm_window_id``) must degrade to a retry/None outcome, never a
-    fault, on a host with no ``wmctrl`` installed.
+    Wraps ``subprocess.run(['wmctrl', '-l'], ...)`` and never raises, but
+    distinguishes *why* it failed so the caller can react differently:
+
+    - A genuinely-missing ``wmctrl`` binary (``FileNotFoundError``) is a
+      permanent failure -- yields the rc=127 sentinel
+      ``_resolve_wm_window_id`` short-circuits on (no point retrying a
+      binary that will never appear).
+    - Any other ``OSError``/``SubprocessError`` -- notably
+      ``subprocess.TimeoutExpired`` from a momentarily-hung ``wmctrl`` -- is
+      transient, not permanent, so it yields a distinct rc=124 sentinel that
+      the retry loop keeps riding out exactly like a nonzero/empty probe.
+      Conflating the two would abort all remaining attempts on a single
+      slow probe instead of retrying it.
     """
     try:
         return subprocess.run(argv, capture_output=True, text=True, timeout=_WMCTRL_TIMEOUT_SECS)
-    except (OSError, subprocess.SubprocessError):
+    except FileNotFoundError:
         return subprocess.CompletedProcess(argv, returncode=127, stdout='')
+    except (OSError, subprocess.SubprocessError):
+        return subprocess.CompletedProcess(argv, returncode=124, stdout='')
 
 
 def _resolve_wm_window_id(
@@ -240,18 +250,29 @@ def _resolve_wm_window_id(
     (cockpit/src/cockpit/backends/wm.py) -- and this returns the window id of
     the line whose title field matches *title* EXACTLY, never as a substring,
     so a short marker can't false-positive against an unrelated longer window
-    title.
+    title. NOTE: this parse is intentionally duplicated (not shared/imported)
+    across the orchestrator/cockpit package boundary -- keep the two in sync
+    if either changes (see WmBackend.is_alive's matching note).
 
     Fully fail-soft: a missing ``wmctrl``, a nonzero return code on every
     attempt, no matching line, or any unexpected exception (from *run*,
     parsing, or *sleep*) all return ``None`` rather than raising -- a
     resolution miss must degrade cleanly to ``display=None``, never worse.
 
-    A returncode of 127 -- ``_wmctrl_list``'s sentinel for a missing
-    ``wmctrl`` binary -- is a permanent failure, not the transient
-    window-mapping race the retry loop exists for, so it short-circuits on
-    the first probe instead of paying the full *attempts* x sleep cost
-    (this runs synchronously inside the SessionStart hook).
+    ``_wmctrl_list``'s two failure sentinels are handled distinctly:
+    a returncode of 127 (genuinely-missing ``wmctrl`` binary) is a permanent
+    failure, so it short-circuits on the first probe instead of paying the
+    full *attempts* x sleep cost; a returncode of 124 (transient failure,
+    e.g. a ``wmctrl`` invocation that timed out) is treated exactly like any
+    other non-matching probe and retried.
+
+    Worst-case added SessionStart latency (this runs synchronously inside
+    the hook): the common "window not mapped yet" miss costs
+    ``(attempts - 1) * _WM_WINDOW_ID_RETRY_SLEEP_SECS`` of sleeping plus
+    *attempts* fast ``wmctrl -l`` calls (~0.8s at the current defaults); the
+    pathological case of ``wmctrl`` itself repeatedly timing out costs up to
+    ``attempts * _WMCTRL_TIMEOUT_SECS`` on top of that (~10.8s at the current
+    defaults) before giving up and leaving ``display=None``.
     """
     try:
         for attempt in range(attempts):
