@@ -150,9 +150,10 @@ async def _one(name: str, url: str, tool: str, reason: str) -> bool:
     try:
         async with McpClient(url) as client:
             res = await client.call_tool(tool, {'reason': reason})
-        if res.get('error'):
-            _log(f'{name} ({url}): {tool} -> error: {res["error"]}')
-            return False
+        # NOTE: call_tool() already raises RuntimeError when the JSON-RPC
+        # result carries an 'error' key (see McpClient.call_tool), so a
+        # successfully-returned `res` here can never contain one — that
+        # failure mode is handled by the `except Exception` clause below.
         key = 'halted' if tool == 'halt_scheduler' else 'resumed'
         _log(f'{name} ({url}): {tool} ok ({key}={res.get(key)}, was_paused={res.get("was_paused")})')
         return bool(res.get(key))

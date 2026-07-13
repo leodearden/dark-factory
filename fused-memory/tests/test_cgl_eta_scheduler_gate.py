@@ -339,6 +339,11 @@ class TestOneBestEffort:
 
     @pytest.mark.asyncio
     async def test_one_returns_false_on_json_rpc_tool_error(self, monkeypatch):
+        """A JSON-RPC error result makes `call_tool` raise RuntimeError (see
+        TestCallToolErrorHandling above), so this exercises `_one`'s
+        `except Exception` swallow path, not a separate `res.get('error')`
+        branch inside `_one` -- `res` returned to `_one` can never itself
+        carry an 'error' key, since `call_tool` already raises on that."""
         real_mcp_client = _mod.McpClient  # capture before patching to avoid recursion
 
         def tool_call_response(body: dict) -> httpx.Response:
