@@ -116,23 +116,19 @@ class TestAutouseFixtureDefaultsToIdlePsi:
         """
         scheduler = Scheduler(OrchestratorConfig(max_per_module=1))
 
-        # Primary, behavior-level contract: the bound reader returns a
+        # Behavior-level contract only: the bound reader returns a
         # non-saturating, successful sample regardless of host load. This is
-        # the meaningful guarantee callers of _read_psi_sample rely on.
+        # the meaningful guarantee callers of _read_psi_sample rely on, and
+        # it already fully covers the contract this guard test exists to
+        # pin. Deliberately NOT asserting `scheduler._read_psi_sample is
+        # idle_psi_sample` (implementation-coupled identity) — a harmless
+        # refactor of the fixture (e.g. wrapping idle_psi_sample in a
+        # lambda/partial) would break an identity check with no behavioral
+        # regression, so it would add fragility without proportional
+        # coverage.
         sample = scheduler._read_psi_sample()
         assert sample.read_ok is True
         assert sample.cpu_some10 == 0.0
         assert sample.mem_some10 == 0.0
         assert sample.mem_full10 == 0.0
         assert sample.io_some10 == 0.0
-
-        # Secondary, implementation-coupled check: pins the fixture to the
-        # exact `idle_psi_sample` object. Lower value than the behavior
-        # assertions above — a harmless refactor of the fixture (e.g.
-        # wrapping idle_psi_sample in a lambda/partial) would break this
-        # specific line with no behavioral regression; if that happens,
-        # update this assertion rather than treating it as a real failure.
-        assert scheduler._read_psi_sample is idle_psi_sample, (
-            'expected the autouse _hermetic_psi_reader fixture to default '
-            f'_read_psi_sample to idle_psi_sample; got {scheduler._read_psi_sample!r}'
-        )
