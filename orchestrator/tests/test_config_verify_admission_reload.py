@@ -9,7 +9,9 @@ test_config_psi_admission_reload.py's stated rationale).
 
 from __future__ import annotations
 
+import hashlib
 import os
+from pathlib import Path
 
 import pytest
 from pydantic import ValidationError
@@ -33,7 +35,15 @@ class TestVerifyAdmissionConfigDefaults:
         cfg = OrchestratorConfig()
         assert cfg.verify_admission_enabled is True
         assert cfg.verify_admission_task_slots == 1
-        assert cfg.verify_admission_slots_dir == f'/tmp/df-verify-slots-{os.getuid()}'
+        # task 2501: the default is now per-project (uid + a short hash of
+        # the resolved project_root), not the old UID-only host-global path
+        # that let co-tenant projects collide on one shared slots dir.
+        expected = (
+            f'/tmp/df-verify-slots-{os.getuid()}-'
+            + hashlib.sha256(str(Path(tmp_path).resolve()).encode()).hexdigest()[:12]
+        )
+        assert cfg.verify_admission_slots_dir == expected
+        assert cfg.verify_admission_slots_dir != f'/tmp/df-verify-slots-{os.getuid()}'
         assert cfg.verify_admission_nice_merge == ''
         assert cfg.verify_admission_nice_task == ''
         assert cfg.verify_admission_nice_background == ''
@@ -100,3 +110,37 @@ class TestVerifyAdmissionReloadDisposition:
         }
         assert 'verify_admission_task_slots' not in report['restart_required']
         assert live.verify_admission_task_slots == 2
+
+
+class TestVerifyAdmissionSlotsDirReload:
+    """task 2501: the per-project derived default must survive an
+    apply_reload round-trip (model_validate(model_dump()) re-runs the
+    idempotent _default_verify_admission_slots_dir validator against an
+    already-derived, non-empty value), and an explicit override must still
+    hot-apply — the field stays on the green-tier RELOADABLE_FIELDS
+    allowlist (I3 under reload).
+    """
+
+    def test_reload_of_sibling_field_preserves_derived_default(self, monkeypatch, tmp_path):
+        monkeypatch.chdir(tmp_path)
+        monkeypatch.setenv('ORCH_CONFIG_PATH', '')
+        live = OrchestratorConfig()
+        fresh = OrchestratorConfig(verify_admission_task_slots=2)
+        before = live.verify_admission_slots_dir
+
+        report = apply_reload(live, fresh)
+
+        assert report['reloaded'] is True
+        assert live.verify_admission_slots_dir == before
+        assert live.verify_admission_slots_dir != f'/tmp/df-verify-slots-{os.getuid()}'
+
+    def test_reload_applies_explicit_override(self, monkeypatch, tmp_path):
+        monkeypatch.chdir(tmp_path)
+        monkeypatch.setenv('ORCH_CONFIG_PATH', '')
+        live = OrchestratorConfig()
+        fresh2 = OrchestratorConfig(verify_admission_slots_dir='/data/x/slots')
+
+        report = apply_reload(live, fresh2)
+
+        assert 'verify_admission_slots_dir' in report['applied']
+        assert live.verify_admission_slots_dir == '/data/x/slots'

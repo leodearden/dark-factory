@@ -1,5 +1,6 @@
 """Configuration schema for the orchestrator."""
 
+import hashlib
 import importlib.resources
 import logging
 import os
@@ -1861,9 +1862,13 @@ class OrchestratorConfig(BaseSettings):
     # a missing directory always fails open and never gates) — and only for
     # roles that can actually hold a slot ('task'/'background'); 'merge'
     # verifies never touch this directory (C-merge-priority).
-    verify_admission_slots_dir: str = Field(
-        default_factory=lambda: f'/tmp/df-verify-slots-{os.getuid()}',
-    )
+    # Sentinel default '' — a default_factory lambda cannot see the sibling
+    # project_root field, so the real per-project default (uid + a short
+    # hash of the resolved project_root, so co-tenant projects running as
+    # the same uid no longer collide on one shared slots dir) is filled in
+    # by _default_verify_admission_slots_dir below, post-construction. An
+    # explicit non-empty override (config/env/yaml) is preserved verbatim.
+    verify_admission_slots_dir: str = Field(default='')
     # Per-role nice/ionice argv override, shlex-split when non-empty. Empty
     # (default) defers to shared.verify_admission.nice_prefix(role) — the
     # canonical tier table — so these only need setting to deviate from it.
@@ -2524,6 +2529,32 @@ class OrchestratorConfig(BaseSettings):
     @classmethod
     def _resolve_project_root(cls, v: Path) -> Path:
         return v.resolve()
+
+    @model_validator(mode='after')
+    def _default_verify_admission_slots_dir(self) -> 'OrchestratorConfig':
+        """Fill the per-project verify-admission slots dir when unset.
+
+        ``verify_admission_slots_dir`` defaults to the sentinel ``''`` (see
+        the field above) because a ``default_factory`` cannot see sibling
+        fields — so the real default is derived here, post-construction,
+        from the already-resolved ``project_root`` (the field_validator
+        above runs first, before any model-after validator). Guarding on
+        ``not self.verify_admission_slots_dir`` makes this idempotent: it
+        no-ops both on an explicit override (I3) and when re-validating an
+        already-derived value (e.g. inside ``apply_reload``'s
+        ``model_validate(model_dump())`` round-trip). Written via
+        ``object.__setattr__`` — the same bypass ``_set_leaf`` uses below —
+        because ``validate_assignment=True`` would otherwise re-enter
+        validation from inside this after-validator.
+        """
+        if not self.verify_admission_slots_dir:
+            digest = hashlib.sha256(str(self.project_root).encode()).hexdigest()[:12]
+            object.__setattr__(
+                self,
+                'verify_admission_slots_dir',
+                f'/tmp/df-verify-slots-{os.getuid()}-{digest}',
+            )
+        return self
 
     @model_validator(mode='after')
     def _validate_clock_stop_markers(self) -> 'OrchestratorConfig':

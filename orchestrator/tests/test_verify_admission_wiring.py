@@ -23,6 +23,8 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import hashlib
+import os
 import shlex
 from typing import Any
 from unittest.mock import patch
@@ -409,3 +411,63 @@ class TestNicePrefixIntegration:
         assert captured_cmds[0] == _TEST_CMD, 'disabled admission must never nice/bash-c wrap the test leg'
         assert captured_cmds[1] == _LINT_CMD
         assert captured_cmds[2] == _TYPE_CMD
+
+
+class TestVerifyAdmissionSlotsDirDefault:
+    """Golden construction invariants for the per-project default of
+    ``verify_admission_slots_dir`` (task 2501).
+
+    Before this task the field defaulted via a UID-only
+    ``default_factory`` (``/tmp/df-verify-slots-{uid}``), so every
+    orchestrator running as the same uid shared the SAME flock slot files —
+    turning the per-pytest admission semaphore into an unintended HOST-WIDE
+    mutex across co-tenant projects (task-2126 pytest starved ~6h behind
+    another project's held slot-1). The gate must bound WITHIN-project
+    verify oversubscription, not serialize across independent projects.
+    """
+
+    @staticmethod
+    def _expected_slots_dir(project_root) -> str:
+        digest = hashlib.sha256(str(project_root.resolve()).encode()).hexdigest()[:12]
+        return f'/tmp/df-verify-slots-{os.getuid()}-{digest}'
+
+    def test_distinct_project_roots_yield_distinct_slots_dirs(self, monkeypatch, tmp_path):
+        monkeypatch.chdir(tmp_path)
+        monkeypatch.setenv('ORCH_CONFIG_PATH', '')
+        proj_a = tmp_path / 'proj_a'
+        proj_b = tmp_path / 'proj_b'
+        config_a = OrchestratorConfig(project_root=proj_a)
+        config_b = OrchestratorConfig(project_root=proj_b)
+
+        assert config_a.verify_admission_slots_dir != config_b.verify_admission_slots_dir
+        assert config_a.verify_admission_slots_dir == self._expected_slots_dir(proj_a)
+        assert config_b.verify_admission_slots_dir == self._expected_slots_dir(proj_b)
+
+    def test_same_project_root_yields_identical_slots_dir(self, monkeypatch, tmp_path):
+        monkeypatch.chdir(tmp_path)
+        monkeypatch.setenv('ORCH_CONFIG_PATH', '')
+        proj = tmp_path / 'proj'
+        config_1 = OrchestratorConfig(project_root=proj)
+        config_2 = OrchestratorConfig(project_root=proj)
+
+        assert config_1.verify_admission_slots_dir == config_2.verify_admission_slots_dir
+        assert config_1.verify_admission_slots_dir == self._expected_slots_dir(proj)
+
+    def test_explicit_override_preserved_verbatim(self, monkeypatch, tmp_path):
+        monkeypatch.chdir(tmp_path)
+        monkeypatch.setenv('ORCH_CONFIG_PATH', '')
+        config = OrchestratorConfig(
+            project_root=tmp_path / 'proj',
+            verify_admission_slots_dir='/explicit/override',
+        )
+
+        assert config.verify_admission_slots_dir == '/explicit/override'
+
+    def test_default_is_not_host_global_and_stays_uid_scoped(self, monkeypatch, tmp_path):
+        monkeypatch.chdir(tmp_path)
+        monkeypatch.setenv('ORCH_CONFIG_PATH', '')
+        config = OrchestratorConfig(project_root=tmp_path / 'proj')
+        old_host_global = f'/tmp/df-verify-slots-{os.getuid()}'
+
+        assert config.verify_admission_slots_dir != old_host_global
+        assert config.verify_admission_slots_dir.startswith(f'{old_host_global}-')
