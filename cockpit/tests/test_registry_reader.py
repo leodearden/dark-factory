@@ -186,6 +186,94 @@ class TestScanChangeShortCircuit:
         assert call_count == 1
         assert {r.session_slug: r for r in second} == {r.session_slug: r for r in first}
 
+    def test_changed_mtime_reparses_and_reflects_new_value(self, tmp_path):
+        """A genuine rewrite (write_record/update_status, which always goes
+        through os.replace and so always bumps record.json's mtime) must be
+        picked up by the very next scan() -- the cache never masks a real
+        change."""
+        from cockpit.registry_reader import SessionScanner
+
+        record = _make_record(session_slug='a-1', status=sr.Status.RUNNING)
+        sr.write_record(record, root=tmp_path)
+
+        scanner = SessionScanner(root=tmp_path)
+        first = scanner.scan()
+        assert len(first) == 1
+        assert first[0].status == sr.Status.RUNNING
+
+        sr.update_status('a-1', root=tmp_path, status=sr.Status.IDLE)
+
+        second = scanner.scan()
+        assert len(second) == 1
+        assert second[0].status == sr.Status.IDLE
+
+    def test_removed_slug_leaves_no_stale_entry_for_a_different_record_at_same_slug(
+        self, tmp_path
+    ):
+        """A slug removed from disk is absent from the next scan() result and
+        leaves no stale cache entry behind: re-adding a DIFFERENT record at
+        the exact same slug is picked up fresh, even in the adversarial case
+        where its record.json is coincidentally stamped with the very same
+        mtime the removed record's cache entry was keyed on -- proving the
+        cache is keyed on the CURRENT dir set (evicted every scan), not just
+        "mtime happened to differ this time."
+        """
+        import shutil
+
+        from cockpit.registry_reader import SessionScanner
+
+        first_record = _make_record(session_slug='a-1', status=sr.Status.RUNNING)
+        sr.write_record(first_record, root=tmp_path)
+        path = sr.record_path_for_slug('a-1', root=tmp_path)
+        os.utime(path, ns=(self._FIXED_NS, self._FIXED_NS))
+
+        scanner = SessionScanner(root=tmp_path)
+        first = scanner.scan()
+        assert {r.session_slug for r in first} == {'a-1'}
+
+        shutil.rmtree(sr.sessions_dir(tmp_path) / 'a-1')
+        assert scanner.scan() == []
+
+        second_record = _make_record(session_slug='a-1', status=sr.Status.AWAITING_INPUT)
+        sr.write_record(second_record, root=tmp_path)
+        os.utime(path, ns=(self._FIXED_NS, self._FIXED_NS))  # coincidentally the same mtime
+
+        second = scanner.scan()
+        assert len(second) == 1
+        assert second[0].status == sr.Status.AWAITING_INPUT
+
+    def test_slug_unreadable_after_caching_is_skipped_not_stale_or_crashing(self, tmp_path):
+        """Once a slug has been cached, its record.json can later become
+        unreadable in two ways -- removed outright (the slug dir remains, so
+        stat() itself raises) or overwritten with invalid JSON (read_record
+        raises CorruptSessionRecord). Either way, scan() must fail-soft skip
+        it: no crash from an unguarded stat(), and no stale cached record
+        served in its place.
+        """
+        from cockpit.registry_reader import SessionScanner
+
+        r1 = _make_record(session_slug='a-1', status=sr.Status.RUNNING)
+        r2 = _make_record(session_slug='b-2', status=sr.Status.RUNNING)
+        for r in (r1, r2):
+            sr.write_record(r, root=tmp_path)
+
+        scanner = SessionScanner(root=tmp_path)
+        first = scanner.scan()
+        assert {r.session_slug for r in first} == {'a-1', 'b-2'}
+
+        # a-1: record.json vanishes but the slug directory remains.
+        path_a = sr.record_path_for_slug('a-1', root=tmp_path)
+        path_a.unlink()
+        assert path_a.parent.is_dir()
+
+        # b-2: record.json is overwritten with invalid JSON (a genuine
+        # rewrite, so its mtime naturally advances).
+        path_b = sr.record_path_for_slug('b-2', root=tmp_path)
+        path_b.write_text('{not valid json')
+
+        second = scanner.scan()
+        assert second == []
+
 
 class TestBuildSnapshot:
     def test_keyed_by_session_slug(self):
