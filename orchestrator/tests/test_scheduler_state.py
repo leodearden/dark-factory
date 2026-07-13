@@ -833,17 +833,28 @@ class TestWriteStateSnapshot:
         target from the OverrideStore lookup key.
 
         Simulates the realistic scenario where ``_project_root`` is set to a
-        non-writable OverrideStore key (e.g. ``'/proj'``, as
-        ``TestGetStateSnapshotPopulated`` does) while the write itself must
-        land in a writable tmp path: with ``state_snapshot_path`` set, the
-        write goes there instead of under ``/proj``, and the no-project-root
-        guard is bypassed since an explicit path is always honored.
+        non-writable-in-production OverrideStore key (as
+        ``TestGetStateSnapshotPopulated`` does with ``'/proj'``) while the
+        write itself must land in a writable tmp path: with
+        ``state_snapshot_path`` set, the write goes there instead of the
+        ``_project_root``-derived path, and the no-project-root guard is
+        bypassed since an explicit path is always honored.
+
+        The negative assertion below points ``_project_root`` at a *writable*
+        ``tmp_path`` subdirectory rather than a literal ``'/proj'``: a
+        non-existent/non-writable host path would make "nothing written
+        there" trivially true regardless of whether the redirect actually
+        works (a broken bypass would just hit a swallowed PermissionError).
+        Anchoring the derived path under ``tmp_path`` means the negative
+        assertion actually fails if the bypass regresses, because the
+        fallback write would then succeed there.
         """
+        derived_root = tmp_path / 'proj'
         sched = Scheduler(
             OrchestratorConfig(max_per_module=1),
             state_snapshot_path=tmp_path / 'scheduler_state.json',
         )
-        sched._project_root = '/proj'
+        sched._project_root = str(derived_root)
 
         await sched._write_snapshot_best_effort(force=True)
 
@@ -853,9 +864,9 @@ class TestWriteStateSnapshot:
         assert set(data.keys()) == _SNAPSHOT_KEYS, (
             f'Expected keys {_SNAPSHOT_KEYS}, got {set(data.keys())}'
         )
-        assert not Path('/proj/data/orchestrator/scheduler_state.json').exists(), (
+        assert not (derived_root / 'data' / 'orchestrator' / 'scheduler_state.json').exists(), (
             'state_snapshot_path must bypass the _project_root-derived write '
-            'target entirely — nothing should be written under /proj'
+            'target entirely — nothing should be written under the derived path'
         )
 
 
