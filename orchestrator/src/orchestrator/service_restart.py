@@ -200,7 +200,15 @@ class StaleServiceRestartCoordinator:
     script_path:
         Path to the restart script, relative to ``project_root``.
     project_root:
-        Absolute root of the project repo.
+        Root of the project repo.  Resolved to an absolute path at
+        construction time (``Path(project_root).resolve()``) regardless of
+        what is passed in — ``RestartPlan.__post_init__`` (task 2237) raises
+        ``ValueError`` on a non-absolute ``cwd``, and ``_default_restart_executor``
+        builds its ``RestartPlan`` from ``self._project_root`` directly, so a
+        relative or default (``'.'``) ``project_root`` must never reach it
+        unresolved — that would turn every restart attempt into a permanent
+        ``ValueError`` that ``maybe_restart`` misclassifies as transient and
+        retries forever.
     restart_executor:
         Optional injectable async callable (no args, no return value) that
         performs the actual restart.  When None (the default) a fire-and-forget
@@ -295,7 +303,11 @@ class StaleServiceRestartCoordinator:
         self._debounce_secs = debounce_secs
         self._enabled = enabled
         self._script_path = script_path
-        self._project_root = Path(project_root)
+        # .resolve() (not a bare Path(...)) so a relative or default ('.')
+        # project_root can never reach RestartPlan.__post_init__, which raises
+        # ValueError on a non-absolute cwd (task 2237) — see the project_root
+        # docstring above.
+        self._project_root = Path(project_root).resolve()
         self._restart_executor = restart_executor
         self._clock = clock
         self._service_name = service_name

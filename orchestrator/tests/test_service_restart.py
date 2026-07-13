@@ -794,6 +794,62 @@ async def test_default_executor_spawns_script_detached() -> None:
     fake_proc.communicate.assert_not_called()
 
 
+@pytest.mark.asyncio
+async def test_relative_project_root_is_resolved_to_absolute() -> None:
+    """A relative (or default '.') project_root must not reach RestartPlan.
+
+    RestartPlan.__post_init__ (task 2237) raises ValueError on a
+    non-absolute cwd, and _default_restart_executor builds its RestartPlan
+    straight from self._project_root. Without normalizing at construction,
+    the coordinator's own default (project_root='.', relative) would make
+    EVERY restart attempt raise ValueError — which maybe_restart's `except
+    Exception` branch misclassifies as a TRANSIENT executor failure and
+    retries forever, never actually restarting (amendment: reviewer_comprehensive).
+    """
+    from unittest.mock import MagicMock as MM
+    from unittest.mock import patch
+
+    git_ops = MagicMock()
+    git_ops.get_merge_diff_files = AsyncMock(
+        return_value=(['fused-memory/src/server/main.py'], None)
+    )
+    event_store = MagicMock()
+    current_time: list[float] = [0.0]
+
+    # Construct with the class DEFAULT project_root='.' (relative) and no
+    # restart_executor override, so _default_restart_executor's real
+    # RestartPlan is exercised — the exact shape the reviewer flagged.
+    coord = StaleServiceRestartCoordinator(
+        git_ops=git_ops,
+        event_store=event_store,
+        watch_prefixes=['fused-memory/src/'],
+        debounce_secs=0.0,
+        enabled=True,
+        clock=lambda: current_time[0],
+    )
+    assert coord._project_root.is_absolute(), (
+        'project_root must be normalized to absolute at construction — a '
+        'relative cwd would make every _default_restart_executor RestartPlan() '
+        'raise ValueError'
+    )
+
+    await coord.note_merge('task-1', 'base1', 'head1')
+
+    fake_proc = MM()
+    with patch(
+        'orchestrator.proc_supervision.asyncio.create_subprocess_exec',
+        new_callable=AsyncMock,
+        return_value=fake_proc,
+    ) as mock_exec:
+        r = await coord.maybe_restart(agents_idle=True)
+
+    # Must actually fire — not silently retry forever on a ValueError
+    # misclassified as a transient executor failure.
+    assert r is True
+    mock_exec.assert_awaited_once()
+    assert coord.is_pending is False
+
+
 # ---------------------------------------------------------------------------
 # service_name parameterization tests (step-3)
 # ---------------------------------------------------------------------------
