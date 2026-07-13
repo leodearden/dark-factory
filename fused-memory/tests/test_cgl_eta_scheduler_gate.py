@@ -273,6 +273,63 @@ class TestCallToolErrorHandling:
                 await client.call_tool('resume_scheduler', {'reason': 'x'})
 
 
+class TestCallToolTextContentFallback:
+    """When a tool result carries no `structuredContent`, `call_tool` must
+    fall back to the `content` list: JSON-decode a `type == 'text'` entry's
+    `text`, or wrap it as `{'_raw': ...}` if it isn't valid JSON. Real
+    FastMCP tool responses can take this shape instead of returning
+    `structuredContent` directly, so this fallback branch must be exercised
+    on its own (not just implied by the structuredContent-only mock)."""
+
+    @pytest.mark.asyncio
+    async def test_call_tool_parses_json_text_content(self):
+        def tool_call_response(body: dict) -> httpx.Response:
+            return httpx.Response(
+                200,
+                json={
+                    'jsonrpc': '2.0', 'id': body.get('id'),
+                    'result': {
+                        'content': [
+                            {'type': 'text', 'text': json.dumps({'resumed': True, 'was_paused': False})},
+                        ],
+                    },
+                },
+            )
+
+        transport = httpx.MockTransport(
+            _make_stateful_handler([], tool_call_response=tool_call_response)
+        )
+        client = _mod.McpClient('http://127.0.0.1:8102', transport=transport)
+        async with client:
+            res = await client.call_tool('resume_scheduler', {'reason': 'x'})
+
+        assert res == {'resumed': True, 'was_paused': False}
+
+    @pytest.mark.asyncio
+    async def test_call_tool_wraps_non_json_text_content_as_raw(self):
+        def tool_call_response(body: dict) -> httpx.Response:
+            return httpx.Response(
+                200,
+                json={
+                    'jsonrpc': '2.0', 'id': body.get('id'),
+                    'result': {
+                        'content': [
+                            {'type': 'text', 'text': 'not json'},
+                        ],
+                    },
+                },
+            )
+
+        transport = httpx.MockTransport(
+            _make_stateful_handler([], tool_call_response=tool_call_response)
+        )
+        client = _mod.McpClient('http://127.0.0.1:8102', transport=transport)
+        async with client:
+            res = await client.call_tool('resume_scheduler', {'reason': 'x'})
+
+        assert res == {'_raw': 'not json'}
+
+
 class TestOneBestEffort:
     """`_one` is the wrapper's best-effort, non-fatal entry point: a halt/
     resume miss (JSON-RPC error, unreachable/erroring server) must never
