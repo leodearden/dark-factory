@@ -26,7 +26,29 @@ Two instances are used in production:
 
 from __future__ import annotations
 
-import asyncio
+# noqa: F401 below — no direct call site in this module (the actual
+# asyncio.create_subprocess_exec now lives in proc_supervision.RestartPlan.
+# execute()), but this binding is load-bearing: some tests OUTSIDE this
+# task's locked scope patch it via the
+# 'orchestrator.service_restart.asyncio.create_subprocess_exec' dotted path,
+# which requires the 'asyncio' module object to be reachable as an attribute
+# of this module (patching an attribute on that shared module object patches
+# it for every importer, including proc_supervision). Removing this import
+# breaks that patch path with AttributeError for every such test.
+#
+# This task's OWN locked test file (test_service_restart.py) no longer needs
+# it — its tests were converted to either pass an explicit `runner=` fake
+# through the injectable seam, or patch
+# 'orchestrator.proc_supervision.asyncio.create_subprocess_exec' directly
+# (where the call actually lives; see test_default_executor_spawns_script_
+# detached). The remaining coupling is isolated to two files task 2237 does
+# NOT hold a lock for: test_harness_service_restart.py (3 call sites) and
+# test_fleet_staleness_composition.py (2 call sites). Retiring this
+# re-export requires converting those patch sites too — tracked as
+# follow-up work for whichever task next holds a lock on them, not done
+# here (amendment: reviewer_comprehensive flagged this coupling as
+# low-priority test-infra debt).
+import asyncio  # noqa: F401
 import json
 import logging
 import time
@@ -38,8 +60,10 @@ from typing import TYPE_CHECKING
 if TYPE_CHECKING:
     from orchestrator.event_store import EventStore
     from orchestrator.git_ops import GitOps
+    from orchestrator.proc_supervision import EscalationSpec
 
 from orchestrator.event_store import EventType
+from orchestrator.proc_supervision import RestartDisposition, RestartPlan
 
 logger = logging.getLogger(__name__)
 
@@ -84,24 +108,21 @@ async def schedule_detached_systemd_restart(
     project_root: str | Path,
     transient_unit: str,
     on_active_secs: int,
+    on_failure_escalation: EscalationSpec | None = None,
     runner=None,
 ):
     """Schedule a detached, cgroup-escaping self-restart via ``systemd-run --user``.
 
-    Mirrors ``DeterministicRunner._default_schedule_detached_restart``'s argv
-    pattern but WITHOUT its ``/bin/sh`` on-failure escalation wrapper — an
-    accepted gap for this operator-gated rollout (see config.py's
-    ``orchestrator_restart_on_merge_enabled`` comment). Concretely: this
-    coroutine raises ONLY when the ``systemd-run`` *registration* itself
-    fails (rc != 0). Once registration succeeds it returns immediately (per
-    ``--on-active``, before the deferred payload has run), and the
-    coordinator's ``maybe_restart`` treats the fire as successful — it emits
-    the restart event and clears pending right away. A LATER fire-time
-    failure of ``scripts/restart-orchestrator.sh`` itself (e.g. a failed
-    MainPID/timestamp verify) is therefore NOT escalated anywhere
-    in-process; its only trace is the transient unit's journald output
-    (``journalctl --user -u <transient_unit>``). During the soak period,
-    operators should watch that log rather than relying on escalations.
+    Thin ``proc_supervision.RestartPlan`` caller (M1, task 2237) — the gap is
+    closed by RP-4: builds a same-unit plan (``own_unit=target_unit=
+    transient_unit``, ``verify=None``) which routes ``RestartPlan.execute()``
+    to the DETACHED systemd-run path, carrying ``--working-directory=<cwd>``
+    (RP-3) and, when *on_failure_escalation* is supplied, a ``/bin/sh -c``
+    on-failure escalation-submit wrapper (RP-4) so a LATER fire-time failure
+    of the deferred payload (e.g. a failed MainPID/timestamp verify inside
+    ``scripts/restart-orchestrator.sh``) files a born-at-L2 escalation
+    instead of being traceable only via journald
+    (``journalctl --user -u <transient_unit>``).
 
     ``--on-active=<on_active_secs>`` defers execution so this call returns
     immediately after *registering* the transient unit; the restart payload
@@ -118,14 +139,27 @@ async def schedule_detached_systemd_restart(
     script_args:
         Extra positional args appended after the script path (e.g. ``['--drain']``).
     project_root:
-        Absolute root of the project repo (``str`` or ``Path`` — e.g.
-        ``Config.project_root`` is a ``Path``); the script path is resolved
-        as ``Path(project_root) / script``.
+        Root of the project repo (``str`` or ``Path`` — e.g.
+        ``Config.project_root`` is a ``Path``). Resolved to an absolute path
+        here (``Path(project_root).resolve()``) regardless of what is passed
+        in — ``RestartPlan.__post_init__`` (task 2237) raises ``ValueError``
+        on a non-absolute ``cwd``, so a relative *project_root* must never
+        reach it unresolved (mirrors ``StaleServiceRestartCoordinator``'s own
+        ``project_root`` normalization for the same reason: an unresolved
+        relative value would turn every registration attempt into a
+        permanent ``ValueError`` that ``maybe_restart`` misclassifies as
+        transient and retries forever). The script path is then resolved as
+        ``resolved_project_root / script``.
     transient_unit:
         Name of the transient systemd-run unit (e.g.
         ``orch-selfrestart-on-merge-3.service``).
     on_active_secs:
         Seconds to defer before the transient unit fires.
+    on_failure_escalation:
+        Optional ``EscalationSpec`` filed (via the RP-4 ``/bin/sh -c``
+        on-failure branch) if the deferred payload itself exits non-zero at
+        fire time. ``None`` (default) builds a valid, unbranched payload —
+        no on-failure reporting.
     runner:
         Optional injectable async callable with the same signature as
         ``asyncio.create_subprocess_exec`` (for testing). Defaults to
@@ -134,30 +168,32 @@ async def schedule_detached_systemd_restart(
     Raises
     ------
     RuntimeError:
-        When the ``systemd-run`` registration itself exits non-zero. The
-        error carries the last 2000 characters of combined stdout/stderr.
+        When the ``systemd-run`` *registration* itself exits non-zero (a
+        ``RestartDisposition.REGISTRATION_FAILED`` outcome). The error
+        carries the last 2000 characters of combined stdout/stderr —
+        preserves the coordinator's transient-retry contract
+        (``StaleServiceRestartCoordinator.maybe_restart`` treats any
+        non-FileNotFoundError/PermissionError exception as retryable).
     """
-    target = Path(project_root) / script
-    argv = [
-        'systemd-run', '--user',
-        f'--on-active={on_active_secs}',
-        f'--unit={transient_unit}',
-        '--collect',
-        str(target),
-        *script_args,
-    ]
-    spawn = runner or asyncio.create_subprocess_exec
-    proc = await spawn(
-        *argv,
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.STDOUT,
+    plan = RestartPlan(
+        script=Path(script),
+        args=list(script_args),
+        # .resolve() (not a bare Path(...)) so a relative project_root can
+        # never reach RestartPlan.__post_init__, which raises ValueError on
+        # a non-absolute cwd (task 2237) — see the project_root docstring
+        # above (amendment: reviewer_comprehensive).
+        cwd=Path(project_root).resolve(),
+        target_unit=transient_unit,
+        own_unit=transient_unit,
+        on_failure_escalation=on_failure_escalation,
+        verify=None,
+        transient_unit=transient_unit,
+        on_active_secs=on_active_secs,
     )
-    stdout, _ = await proc.communicate()
-    rc = proc.returncode or 0
-    tail = (stdout or b'').decode(errors='replace')[-2000:]
-    if rc != 0:
+    outcome = await plan.execute(runner=runner)
+    if outcome.disposition == RestartDisposition.REGISTRATION_FAILED:
         raise RuntimeError(
-            f'systemd-run registration of {transient_unit} failed (rc={rc}): {tail}'
+            f'systemd-run registration of {transient_unit} failed: {outcome.detail}'
         )
 
 
@@ -190,7 +226,15 @@ class StaleServiceRestartCoordinator:
     script_path:
         Path to the restart script, relative to ``project_root``.
     project_root:
-        Absolute root of the project repo.
+        Root of the project repo.  Resolved to an absolute path at
+        construction time (``Path(project_root).resolve()``) regardless of
+        what is passed in — ``RestartPlan.__post_init__`` (task 2237) raises
+        ``ValueError`` on a non-absolute ``cwd``, and ``_default_restart_executor``
+        builds its ``RestartPlan`` from ``self._project_root`` directly, so a
+        relative or default (``'.'``) ``project_root`` must never reach it
+        unresolved — that would turn every restart attempt into a permanent
+        ``ValueError`` that ``maybe_restart`` misclassifies as transient and
+        retries forever.
     restart_executor:
         Optional injectable async callable (no args, no return value) that
         performs the actual restart.  When None (the default) a fire-and-forget
@@ -285,7 +329,11 @@ class StaleServiceRestartCoordinator:
         self._debounce_secs = debounce_secs
         self._enabled = enabled
         self._script_path = script_path
-        self._project_root = Path(project_root)
+        # .resolve() (not a bare Path(...)) so a relative or default ('.')
+        # project_root can never reach RestartPlan.__post_init__, which raises
+        # ValueError on a non-absolute cwd (task 2237) — see the project_root
+        # docstring above.
+        self._project_root = Path(project_root).resolve()
         self._restart_executor = restart_executor
         self._clock = clock
         self._service_name = service_name
@@ -546,17 +594,29 @@ class StaleServiceRestartCoordinator:
     async def _default_restart_executor(self) -> None:
         """Fire-and-forget: spawn the restart script detached.
 
-        Positional args after the script path are taken from ``self._script_args``
-        (e.g. ``['--drain']`` for fused-memory, ``[]`` for the dashboard).
+        Thin ``proc_supervision.RestartPlan`` caller (M1, task 2237) —
+        fused-memory/dashboard LEAF restart. Positional args after the
+        script path are taken from ``self._script_args`` (e.g. ``['--drain']``
+        for fused-memory, ``[]`` for the dashboard). ``target_unit``/
+        ``own_unit`` are both ``''`` (unused for this shape: ``verify=None``
+        and ``transient_unit=None`` route ``RestartPlan.execute()`` straight
+        to the leaf plain-spawn path, which never consults them).
         """
-        script = self._project_root / self._script_path
-        await asyncio.create_subprocess_exec(
-            str(script),
-            *self._script_args,
-            start_new_session=True,
+        plan = RestartPlan(
+            script=self._project_root / self._script_path,
+            args=list(self._script_args),
+            cwd=self._project_root,
+            target_unit='',
+            own_unit='',
+            on_failure_escalation=None,
+            verify=None,
+            transient_unit=None,
         )
+        await plan.execute()
         # Intentionally NOT awaiting the process exit — the script runs
         # detached so its health-poll never blocks the orchestrator event loop.
+        # (RestartPlan.execute()'s leaf plain-spawn path does not await it
+        # either — see proc_supervision._execute_detached_leaf_plain_spawn.)
 
     # ------------------------------------------------------------------
     # Min-interval rate-cap persistence (restart-safe)
