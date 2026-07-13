@@ -2582,7 +2582,20 @@ class GitOps:
         a pool is configured (:meth:`pool_in_use`) but
         :meth:`pool_storage_present` is False — an unmounted mountpoint must
         never let this script operate against a lane it can only see as
-        missing. Mirrors :meth:`_run_warm_lane_gc_reclaim`'s guard exactly.
+        missing. This is the RAW refuse-only check (``pool_in_use() and not
+        pool_storage_present()``) — it does NOT route through
+        :meth:`_reconcile_pool_storage_before_sweep`, the self-healing
+        variant :meth:`_run_warm_lane_gc_reclaim` uses, which recreates a
+        merely-lost ``.pool-root`` sentinel on a provably-healthy mount
+        instead of refusing forever. The raw check is sufficient here:
+        release-thin is a purely optional, fail-open reclaim that nothing
+        else depends on for forward progress, and this method never writes
+        the sentinel itself (:meth:`_seed_warm_lane`'s ``rc == 0`` is the
+        only writer) — so there is nothing for it to self-heal. A spurious
+        refusal here just idle-holds ``target/`` for one more cycle until
+        the sentinel is recreated elsewhere, never the chicken-and-egg
+        deadlock :meth:`_reconcile_pool_storage_before_sweep` exists to
+        break (see that method's docstring).
 
         **Flock contract (pinned — this wrapper holds no lock of its own)**:
         safety against a concurrent re-acquire racing this call rests
