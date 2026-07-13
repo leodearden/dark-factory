@@ -264,3 +264,93 @@ def test_migrate_v1_to_v2_does_not_mutate_input():
     original = copy.deepcopy(v1)
     mod.migrate_v1_to_v2(v1)
     assert v1 == original
+
+
+# ---------------------------------------------------------------------------
+# step-7: RED — validate_coding_record() against §7.3 schema
+# ---------------------------------------------------------------------------
+
+def _well_formed_record() -> dict:
+    return {
+        "session": "sess-1",
+        "date": "2026-07-14",
+        "project": "dark_factory",
+        "agent_class": "orchestrated-task",
+        "matches": [
+            {
+                "entry_id": "entry-a",
+                "origin_phase": "implement",
+                "manifested_phase": "merge",
+                "invariant_violated": None,
+                "note": "matched on X",
+            }
+        ],
+        "candidates": [
+            {
+                "title": "novel shape",
+                "cause": "...",
+                "area": "...",
+                "origin_phase": "architect",
+                "manifested_phase": "verify",
+                "evidence_quote": "...",
+            }
+        ],
+    }
+
+
+def test_validate_coding_record_well_formed_is_valid():
+    assert mod.validate_coding_record(_well_formed_record()) == []
+
+
+def test_validate_coding_record_missing_session():
+    record = _well_formed_record()
+    del record["session"]
+    assert mod.validate_coding_record(record) != []
+
+
+def test_validate_coding_record_missing_date():
+    record = _well_formed_record()
+    del record["date"]
+    assert mod.validate_coding_record(record) != []
+
+
+def test_validate_coding_record_match_out_of_enum_origin_phase():
+    record = _well_formed_record()
+    record["matches"][0]["origin_phase"] = "not-a-phase"
+    assert mod.validate_coding_record(record) != []
+
+
+def test_validate_coding_record_match_missing_entry_id():
+    record = _well_formed_record()
+    del record["matches"][0]["entry_id"]
+    assert mod.validate_coding_record(record) != []
+
+
+def test_validate_coding_record_candidate_missing_title():
+    record = _well_formed_record()
+    del record["candidates"][0]["title"]
+    assert mod.validate_coding_record(record) != []
+
+
+def test_validate_coding_record_matches_not_a_list():
+    record = _well_formed_record()
+    record["matches"] = "not-a-list"
+    assert mod.validate_coding_record(record) != []
+
+
+def test_validate_coding_record_candidates_not_a_list():
+    record = _well_formed_record()
+    record["candidates"] = "not-a-list"
+    assert mod.validate_coding_record(record) != []
+
+
+def test_validate_coding_record_invariant_violated_accepts_string():
+    record = _well_formed_record()
+    record["matches"][0]["invariant_violated"] = "corroborate-before-acting"
+    assert mod.validate_coding_record(record) == []
+
+
+def test_validate_coding_record_invariant_violated_accepts_null():
+    record = _well_formed_record()
+    record["matches"][0]["invariant_violated"] = None
+    assert mod.validate_coding_record(record) == []
