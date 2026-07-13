@@ -500,6 +500,13 @@ _RECOVERY: dict[_RecoveryShape, RecoveryAction] = {
     # shape is absent from this table and falls through to the LEAVE
     # default — re-filing over an already-open escalation would risk a
     # duplicate/competing one (review finding #1).
+    # NOTE (θ2 visibility): unreachable for a 'blocked' task that still
+    # carries a stale-but-present db claimant_run_id — is_stranded is
+    # in-progress-only, so that shape resolves live_claimant=True and hits
+    # the LEAVE default instead of this row. Accepted, intentionally scoped
+    # blind spot — see the NOTE in _resolve_live_claimant's docstring for
+    # the full rationale and the follow-up path if it bites in practice
+    # (review finding).
     (TaskStatus.BLOCKED, False, BranchStateKind.GONE_NO_MARKER, False, None):
         RecoveryAction.RE_FILE_ESCALATION,
     # (h) D1: a deterministic deploy crashed between 'ran' and 'verified',
