@@ -88,37 +88,23 @@ def premise_lint_error(
     title: str | None = None,
     details: str | None = None,
 ) -> dict[str, Any] | None:
-    """Validate every recon-stage free-text content field against
-    known-false premises.
+    """Lint ``description``/``prompt``/``title``/``details`` for known-false
+    premises; see the module docstring for the full rationale.
 
     Returns a structured error dict (``{'error': ..., 'error_type':
-    'ValidationError', 'hint': ...}``) when a recon-stage caller's
-    description, prompt, title, or details asserts a known-false premise
-    about recon's control-plane mechanics, or ``None`` when all four are
-    clean — including for every non-recon caller, which is never enforced.
+    'ValidationError', 'hint': ...}``) on a match for a recon-stage caller,
+    else ``None``.
 
     Args:
-        description: The task description text to lint. ``None`` is
-            treated as empty (never matches any premise rule).
+        description: Task description text. ``None`` is treated as empty
+            (never matches any premise rule).
         agent_id: The resolved caller identity. Enforcement fires only when
             this is a string starting with ``'recon-stage-'``.
-        project_root: Absolute path to the project root. Unused — the lint
-            is pure text matching with no filesystem check — but kept to
-            mirror ``execution_class_error``'s signature (PRD §8.5) so the
-            two guards read as a matched pair, wired at the same submit_task
-            seam.
-        prompt: The task ``prompt`` text — submit_task's own docstring
-            names this "Task description for AI generation", its primary
-            content field. ``None`` is treated as empty.
-        title: The task ``title`` text. ``None`` is treated as empty.
-        details: The task ``details`` text — submit_task's own docstring
-            names this "Task details / implementation notes"; recon-authored
-            remediation tasks commonly carry substantial mechanism prose
-            here, so it is linted on equal footing with the other three
-            fields. ``None`` is treated as empty.
-
-    Each field is linted independently (see module docstring) so a match
-    can never straddle the boundary between two fields.
+        project_root: Absolute path to the project root. Unused — kept to
+            mirror ``execution_class_error``'s signature (PRD §8.5).
+        prompt: Task ``prompt`` text. ``None`` is treated as empty.
+        title: Task ``title`` text. ``None`` is treated as empty.
+        details: Task ``details`` text. ``None`` is treated as empty.
     """
     if not (isinstance(agent_id, str) and agent_id.startswith('recon-stage-')):
         return None
