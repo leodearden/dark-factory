@@ -19,6 +19,7 @@ operator-preset override (task 2439 step-3/step-4).
 
 from __future__ import annotations
 
+import tempfile
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -502,6 +503,36 @@ class TestManagedRuntimeDataDirs:
         # path elsewhere", closing the tautology gap.
         assert queue_dir.is_relative_to(xdg_home)
         assert recon_dir.is_relative_to(xdg_home)
+
+    def test_home_resolution_failure_falls_back_to_tempdir(
+        self, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Path.home() raises RuntimeError when it cannot resolve a home
+        directory (e.g. HOME unset in a stripped daemon/CI environment).
+        McpLifecycle.start() calls managed_runtime_data_dirs() unconditionally
+        on its managed-spawn path, so an unguarded RuntimeError here would
+        crash orchestrator startup instead of degrading gracefully. The
+        helper must catch it and fall back to the OS temp dir rather than
+        propagating (task 2439 amendment)."""
+        monkeypatch.delenv('XDG_STATE_HOME', raising=False)
+
+        def _raise_no_home() -> Path:
+            raise RuntimeError('Could not determine home directory.')
+
+        monkeypatch.setattr(Path, 'home', _raise_no_home)
+        from orchestrator.mcp_lifecycle import managed_runtime_data_dirs
+
+        # Must not raise.
+        queue_dir, recon_dir = managed_runtime_data_dirs('reify')
+
+        assert queue_dir.is_absolute()
+        assert recon_dir.is_absolute()
+        assert queue_dir.is_relative_to(Path(tempfile.gettempdir()))
+        assert recon_dir.is_relative_to(Path(tempfile.gettempdir()))
+        root = queue_dir.parent
+        assert root == recon_dir.parent
+        assert root.name == 'reify'
+        assert root.parent.name == 'dark-factory'
 
 
 # ---------------------------------------------------------------------------
