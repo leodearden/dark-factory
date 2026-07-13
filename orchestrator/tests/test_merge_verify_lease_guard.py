@@ -18,13 +18,15 @@ the bottom:
 """
 from __future__ import annotations
 
+import asyncio
 import os
 from pathlib import Path
+from unittest.mock import AsyncMock, patch
 
 import pytest
 
 from orchestrator.config import GitConfig
-from orchestrator.git_ops import GitOps
+from orchestrator.git_ops import GitOps, _run
 from orchestrator.verify_cancel import read_lock_holder_pgid, write_lock_holder_pgid
 
 
@@ -92,3 +94,118 @@ class TestMergeVerifyLeaseContextManager:
             'holder-pgid must be cleared and the flock released on exit'
         )
         assert read_lock_holder_pgid(git_ops.worktree_base) is None
+
+
+# ---------------------------------------------------------------------------
+# Real-git fixtures (mirroring test_git_ops.py's TestPersistentMergeWorktree)
+# ---------------------------------------------------------------------------
+
+
+async def _setup_repo(repo: Path) -> None:
+    await _run(['git', 'init', '-b', 'main'], cwd=repo)
+    await _run(['git', 'config', 'user.email', 'test@test.com'], cwd=repo)
+    await _run(['git', 'config', 'user.name', 'Test'], cwd=repo)
+    (repo / 'README.md').write_text('# Test\n')
+    await _run(['git', 'add', '-A'], cwd=repo)
+    await _run(['git', 'commit', '-m', 'Initial commit'], cwd=repo)
+
+
+async def _get_merge_commit(git_ops: GitOps, branch_name: str, filename: str) -> str:
+    """Create a feature branch, commit a file, merge to main, return merge_commit."""
+    wt_info = await git_ops.create_worktree(branch_name)
+    (wt_info.path / filename).write_text(f'{branch_name} = True\n')
+    await git_ops.commit(wt_info.path, f'Add {filename}')
+    result = await git_ops.merge_to_main(wt_info.path, branch_name)
+    assert result.success and result.merge_commit
+    return result.merge_commit
+
+
+@pytest.fixture
+def git_repo(tmp_path: Path) -> Path:
+    """A real temporary git repository with an initial commit (step-13+)."""
+    repo = tmp_path / 'repo'
+    repo.mkdir()
+    asyncio.run(_setup_repo(repo))
+    return repo
+
+
+@pytest.fixture
+def real_git_ops(git_repo: Path) -> GitOps:
+    """A real-git-backed GitOps for tests exercising reset_persistent_merge_worktree
+    end to end (unlike the pure-FS ``_git_ops`` helper above, which never shells
+    out to git)."""
+    return GitOps(_git_config(), git_repo)
+
+
+@pytest.mark.asyncio
+class TestResetPersistentMergeWorktreeLeaseGuard:
+    """reset_persistent_merge_worktree refuses to clobber a live foreign
+    merge-verify lease (step-13/14).
+
+    Each test first registers the persistent ``_merge-verify`` worktree for
+    real (a create-once call), so the call under test takes the
+    reset-in-place branch — the one an in-flight verify would actually be
+    sitting in when the clobber incident happens.
+    """
+
+    async def test_foreign_live_holder_refuses_reset(
+        self, real_git_ops: GitOps, monkeypatch: pytest.MonkeyPatch,
+    ):
+        from orchestrator.git_ops import MergeVerifyLeaseHeld  # noqa: PLC0415
+
+        merge_commit_a = await _get_merge_commit(real_git_ops, 'lease-a1', 'a1.py')
+        await real_git_ops.reset_persistent_merge_worktree(merge_commit_a)
+        merge_commit_b = await _get_merge_commit(real_git_ops, 'lease-a2', 'a2.py')
+
+        # A genuinely LIVE pgid (our own test process's real pgid) recorded as
+        # the holder, so the lease reads as held by a live process. To make
+        # it read as FOREIGN (not self), make GitOps see a different "self"
+        # pgid at compare time.
+        foreign_holder = os.getpgrp()
+        write_lock_holder_pgid(real_git_ops.worktree_base, foreign_holder)
+        monkeypatch.setattr(os, 'getpgrp', lambda: foreign_holder + 1)
+
+        with patch('orchestrator.git_ops._run', new_callable=AsyncMock) as mock_run:
+            with pytest.raises(MergeVerifyLeaseHeld):
+                await real_git_ops.reset_persistent_merge_worktree(merge_commit_b)
+        mock_run.assert_not_awaited()
+
+        # Worktree must be untouched: HEAD still at merge_commit_a.
+        _, head_sha, _ = await _run(
+            ['git', 'rev-parse', 'HEAD'], cwd=real_git_ops.persistent_merge_worktree_path,
+        )
+        assert head_sha.strip() == merge_commit_a.strip(), (
+            'a foreign live lease holder must block the reset entirely'
+        )
+
+    async def test_no_holder_reset_proceeds(self, real_git_ops: GitOps):
+        merge_commit_a = await _get_merge_commit(real_git_ops, 'lease-b1', 'b1.py')
+        await real_git_ops.reset_persistent_merge_worktree(merge_commit_a)
+        merge_commit_b = await _get_merge_commit(real_git_ops, 'lease-b2', 'b2.py')
+
+        assert read_lock_holder_pgid(real_git_ops.worktree_base) is None, (
+            'sanity: no holder-pgid file recorded'
+        )
+
+        warm_path = await real_git_ops.reset_persistent_merge_worktree(merge_commit_b)
+
+        assert warm_path == real_git_ops.persistent_merge_worktree_path
+        _, head_sha, _ = await _run(['git', 'rev-parse', 'HEAD'], cwd=warm_path)
+        assert head_sha.strip() == merge_commit_b.strip(), (
+            'no holder: reset must proceed (HEAD must advance to merge_commit_b)'
+        )
+
+    async def test_self_held_lease_reset_proceeds(self, real_git_ops: GitOps):
+        merge_commit_a = await _get_merge_commit(real_git_ops, 'lease-c1', 'c1.py')
+        await real_git_ops.reset_persistent_merge_worktree(merge_commit_a)
+        merge_commit_b = await _get_merge_commit(real_git_ops, 'lease-c2', 'c2.py')
+
+        write_lock_holder_pgid(real_git_ops.worktree_base, os.getpgrp())  # self-held
+
+        warm_path = await real_git_ops.reset_persistent_merge_worktree(merge_commit_b)
+
+        assert warm_path == real_git_ops.persistent_merge_worktree_path
+        _, head_sha, _ = await _run(['git', 'rev-parse', 'HEAD'], cwd=warm_path)
+        assert head_sha.strip() == merge_commit_b.strip(), (
+            'self-held lease: reset must proceed (self excluded from the guard)'
+        )
