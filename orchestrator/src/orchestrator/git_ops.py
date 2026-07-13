@@ -7397,51 +7397,42 @@ class GitOps:
                 threaded into every log line so operators can attribute
                 which caller asked for the prune.
 
-        **Pool-storage guard (task 2099)**: refuses to run when a pool is
-        configured (:meth:`pool_in_use`) but :meth:`pool_storage_present` is
-        False.  An unmounted mountpoint dir makes every mount-resident
-        worktree APPEAR removed off-band, so an unguarded prune would wipe
-        every registered lane + ``_merge-verify`` admin entry the instant
-        the mount comes back — exactly the Jul-3 incident this guards
-        against.  Skipped entirely when no pool is in use:
-        ``pool_storage_present()`` is permanently False on a pool-less host
-        (its only writer never runs without a pool), so that alone must
-        never disable ``git worktree prune`` on every default host.
+        **Pool-storage guard (task 2099, self-heal task 2315)**: routes
+        through :meth:`_reconcile_pool_storage_before_sweep`, which refuses
+        to run when a pool is configured (:meth:`pool_in_use`) but
+        :meth:`pool_storage_present` is False AND that absence is not
+        provably a first-seed bootstrap.  An unmounted mountpoint dir makes
+        every mount-resident worktree APPEAR removed off-band, so an
+        unguarded prune would wipe every registered lane + ``_merge-verify``
+        admin entry the instant the mount comes back — exactly the Jul-3
+        incident this guards against.  Skipped entirely when no pool is in
+        use: ``pool_storage_present()`` is permanently False on a pool-less
+        host (its only writer never runs without a pool), so that alone
+        must never disable ``git worktree prune`` on every default host.
 
-        **Pre-first-seed bootstrap (review-fix)**: a freshly-provisioned
-        pool-configured host that has created ``worktree_base`` (e.g. pool
-        warmup ``mkdir``) but has not yet run a successful seed also has no
-        ``.pool-root`` sentinel — indistinguishable from an unmounted mount
-        by the sentinel alone.  When :meth:`_pool_storage_bootstrap_ok`
-        confirms this is the benign pre-first-seed case (the CoW seed base
-        already resolves under ``worktree_base``), the prune is still
-        skipped (there is nothing to prune yet) but the escalation callback
-        is suppressed so a legitimate cold start does not file operator
-        noise; the sentinel appears for real once the first seed runs.
+        **Pre-first-seed bootstrap / self-heal (task 2099 + 2315)**: a
+        freshly-provisioned pool-configured host that has created
+        ``worktree_base`` (e.g. pool warmup ``mkdir``) but has not yet run a
+        successful seed — or a previously-healthy host that simply lost its
+        ``.pool-root`` sentinel — also has no sentinel, indistinguishable
+        from an unmounted mount by the sentinel alone.  When
+        :meth:`_pool_storage_bootstrap_ok` confirms this is the benign case
+        (the CoW seed base already resolves under ``worktree_base``), the
+        shared helper RECREATES the sentinel and the prune PROCEEDS
+        normally (task 2315: previously this only skipped without
+        recreating the sentinel, a chicken-and-egg that suppressed
+        self-heal forever); the escalation callback is suppressed either
+        way so a legitimate cold start/self-heal does not file operator
+        noise.
 
-        **Escalation debounce**: the refusal branch below calls
-        :meth:`_note_pool_storage_absent` unconditionally on every refusal —
-        see that method's docstring for why repeated calls from hot sweep
-        sites (e.g. ``create_worktree``, ``reap_interactive_worktrees``) do
-        not multiply operator-visible escalations.
+        **Escalation debounce**: the refusal branch (routed through
+        :meth:`_reconcile_pool_storage_before_sweep`) calls
+        :meth:`_note_pool_storage_absent` unconditionally on every TRUE
+        refusal — see that method's docstring for why repeated calls from
+        hot sweep sites (e.g. ``create_worktree``, ``reap_interactive_worktrees``)
+        do not multiply operator-visible escalations.
         """
-        if self.pool_in_use() and not self.pool_storage_present():
-            if self._pool_storage_bootstrap_ok():
-                logger.info(
-                    '%s: pool storage sentinel absent at %s but '
-                    'the CoW seed base already resolves underneath it — '
-                    'pre-first-seed cold start, not an unmounted mount; '
-                    'skipping prune without escalating',
-                    context, self.worktree_base,
-                )
-                return
-            logger.warning(
-                '%s: pool storage absent/unmounted at %s — '
-                'refusing to run `git worktree prune` (would wipe '
-                '.git/worktrees admin entries for every mount-resident lane)',
-                context, self.worktree_base,
-            )
-            self._note_pool_storage_absent()
+        if not self._reconcile_pool_storage_before_sweep(context):
             return
         try:
             rc, _, err = await _run(
