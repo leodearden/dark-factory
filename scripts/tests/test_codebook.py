@@ -115,3 +115,52 @@ def test_validate_permissive_on_v1_free_form_fields():
     codebook["entries"][0]["filed_tasks"] = "2547, 2548"
     # deliberately no area/cause/fix/fix_where/known_cause_match
     assert mod.validate(codebook) == []
+
+
+# ---------------------------------------------------------------------------
+# step-3: RED — load()/dump() round-trip + deterministic serialization
+# ---------------------------------------------------------------------------
+
+def test_dump_load_roundtrip(tmp_path):
+    codebook = _minimal_v2()
+    path = tmp_path / "codebook.yaml"
+    mod.dump(codebook, path)
+    assert mod.load(path) == codebook
+
+
+def test_dump_is_byte_stable_across_calls(tmp_path):
+    """Dumping the same dict twice yields byte-identical file contents —
+    a no-change night must produce zero diff (PRD §6.7)."""
+    codebook = _minimal_v2()
+    path_a = tmp_path / "a.yaml"
+    path_b = tmp_path / "b.yaml"
+    mod.dump(codebook, path_a)
+    mod.dump(codebook, path_b)
+    assert path_a.read_bytes() == path_b.read_bytes()
+
+
+def test_dump_starts_with_canonical_header(tmp_path):
+    codebook = _minimal_v2()
+    path = tmp_path / "codebook.yaml"
+    mod.dump(codebook, path)
+    assert path.read_text(encoding="utf-8").startswith(mod.HEADER)
+
+
+def test_dump_uses_block_style_not_flow_style(tmp_path):
+    """The emitted file must use block style for entries — no inline
+    `{...}` flow mappings."""
+    codebook = _minimal_v2()
+    codebook["entries"][0]["sightings"].append(
+        {
+            "date": "2026-07-14",
+            "project": "dark_factory",
+            "session": "sess-1",
+            "origin_phase": "implement",
+            "manifested_phase": "merge",
+        }
+    )
+    path = tmp_path / "codebook.yaml"
+    mod.dump(codebook, path)
+    text = path.read_text(encoding="utf-8")
+    assert "{" not in text
+    assert "}" not in text
