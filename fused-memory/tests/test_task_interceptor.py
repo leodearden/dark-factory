@@ -6297,6 +6297,115 @@ async def test_planning_mode_candidate_key_collision_returns_combined(
 
 
 # ─────────────────────────────────────────────────────────────────────
+# index_committed_tasks — write-time curator indexing for commit_planning
+# (task 2562 item 1: planning_mode tasks bypass the ticket/curator record
+# path entirely, so commit_planning calls this seam to index a batch into
+# the curator corpus the moment it flips deferred -> pending.)
+# ─────────────────────────────────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_index_committed_tasks_records_each_task(curator_interceptor):
+    """Each get_task-shaped dict is turned into a CandidateTask and recorded once."""
+    curator_mock = _mock_curator(CuratorDecision(action='create'))
+    curator_interceptor._curator = curator_mock
+
+    t1 = {
+        'id': 1,
+        'title': 'Fix parser',
+        'description': 'd1',
+        'details': '',
+        'priority': 'high',
+        'metadata': {},
+    }
+    t2 = {
+        'id': 2,
+        'title': 'Add feature',
+        'description': 'd2',
+        'details': '',
+        'priority': 'medium',
+        'metadata': {},
+    }
+
+    await curator_interceptor.index_committed_tasks([t1, t2], '/project')
+
+    assert curator_mock.record_task.await_count == 2
+    calls_by_id = {c.args[0]: c.args for c in curator_mock.record_task.await_args_list}
+    assert set(calls_by_id) == {'1', '2'}
+
+    task_id_1, candidate_1, project_id_1 = calls_by_id['1']
+    assert task_id_1 == '1'
+    assert candidate_1.title == 'Fix parser'
+    assert project_id_1 == resolve_project_id('/project')
+
+    task_id_2, candidate_2, project_id_2 = calls_by_id['2']
+    assert candidate_2.title == 'Add feature'
+    assert project_id_2 == resolve_project_id('/project')
+
+
+@pytest.mark.asyncio
+async def test_index_committed_tasks_skips_title_less_task(curator_interceptor):
+    """A task dict without a title is skipped — no record_task call for it.
+
+    The curator cannot judge/embed a candidate it cannot read a title from
+    (mirrors _build_candidate's None-return contract for title-less kwargs).
+    """
+    curator_mock = _mock_curator(CuratorDecision(action='create'))
+    curator_interceptor._curator = curator_mock
+
+    good = {'id': 1, 'title': 'Has a title', 'metadata': {}}
+    bad = {'id': 2, 'title': '', 'metadata': {}}
+
+    await curator_interceptor.index_committed_tasks([good, bad], '/project')
+
+    assert curator_mock.record_task.await_count == 1
+    (only_call,) = curator_mock.record_task.await_args_list
+    assert only_call.args[0] == '1'
+
+
+@pytest.mark.asyncio
+async def test_index_committed_tasks_noop_when_curator_disabled(interceptor):
+    """When the curator is disabled (default config), the method is a no-op
+    and never raises.
+
+    Uses the plain `interceptor` fixture, constructed with no config so
+    `_get_curator()` returns None per its documented contract.
+    """
+    tasks = [{'id': 1, 'title': 'X', 'metadata': {}}]
+
+    # Must not raise.
+    result = await interceptor.index_committed_tasks(tasks, '/project')
+    assert result is None
+
+
+@pytest.mark.asyncio
+async def test_index_committed_tasks_per_task_failure_does_not_abort_batch(
+    curator_interceptor,
+):
+    """A record_task failure for one task must not prevent the others in the
+    same batch from being recorded, and the method itself never raises."""
+    curator_mock = _mock_curator(CuratorDecision(action='create'))
+    curator_interceptor._curator = curator_mock
+
+    attempted: list[str] = []
+
+    async def flaky_record_task(task_id, candidate, project_id):
+        attempted.append(task_id)
+        if task_id == '1':
+            raise RuntimeError('qdrant hiccup')
+
+    curator_mock.record_task = AsyncMock(side_effect=flaky_record_task)
+
+    t1 = {'id': 1, 'title': 'Flaky', 'metadata': {}}
+    t2 = {'id': 2, 'title': 'Fine', 'metadata': {}}
+
+    # Must not raise even though task 1's record_task call raises.
+    await curator_interceptor.index_committed_tasks([t1, t2], '/project')
+
+    assert attempted == ['1', '2']
+
+
+# ─────────────────────────────────────────────────────────────────────
 # _looks_like_task_id helper
 # ─────────────────────────────────────────────────────────────────────
 
