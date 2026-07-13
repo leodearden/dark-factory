@@ -15,6 +15,12 @@ resolve_issue — the script's documented "order matters" invariant), a test
 for the best-effort failure path (set_task_status raises -> exit 0, no
 resolve_issue call), and a `finalize_module` fixture that centralizes the
 sys.path dance previously duplicated in each test.
+
+Second amendment pass: pinned resolve_issue's `action='close_only'` and
+`escalation_id` (a 'resume'/'restart'/'abandon' action would silently
+regress the gate's terminal state), and pinned the happy-path
+set_task_status call's `id`/`status` for symmetry with the existing
+resolve_issue-failure-leg assertions.
 """
 
 from __future__ import annotations
@@ -117,6 +123,12 @@ def test_finalize_sends_deterministic_gate_provenance(monkeypatch, finalize_modu
     _, set_status_args = calls[0]
     _, resolve_args = calls[1]
 
+    # Pin the primary write's target and terminal status, not just its
+    # done_provenance shape — guards against a regression that sends the
+    # right provenance to the wrong task id or a non-terminal status.
+    assert set_status_args['id'] == finalize_module.GATE_TASK
+    assert set_status_args['status'] == 'done'
+
     # resolve_issue's `resolution` carries the same `note` local variable
     # main_async passes into done_provenance — comparing against it proves
     # the note text is unchanged by the fix, without hardcoding the (long,
@@ -127,6 +139,15 @@ def test_finalize_sends_deterministic_gate_provenance(monkeypatch, finalize_modu
         'note': expected_note,
     }
     assert DoneProvenance(**set_status_args['done_provenance']).kind == 'deterministic-gate'
+
+    # The module docstring's close_only invariant: resolve_issue must use
+    # action='close_only' (no status effect) on the correct escalation id.
+    # A 'resume'/'restart' action maps to pending and 'abandon' to
+    # cancelled — either would regress the gate's terminal state after the
+    # done write above, and a regression swapping the action would
+    # otherwise pass every other assertion in this test.
+    assert resolve_args['action'] == 'close_only'
+    assert resolve_args['escalation_id'] == finalize_module.GATE_ESC
 
 
 def test_finalize_exits_zero_and_skips_resolve_when_set_task_status_fails(monkeypatch, finalize_module):
