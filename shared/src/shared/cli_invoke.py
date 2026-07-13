@@ -431,6 +431,7 @@ class AgentFailureKind(enum.StrEnum):
     MAX_TURNS = 'max_turns'
     EMPTY_OUTPUT = 'empty_output'
     API_ERROR = 'api_error'
+    MODEL_NOT_FOUND = 'model_not_found'
     TIMED_OUT = 'timed_out'
     STRUCTURAL = 'structural'
     UNKNOWN = 'unknown'
@@ -464,19 +465,23 @@ def classify_agent_failure(result: AgentResult) -> AgentFailureClass:
        see ``is_timed_out_with_progress``/reify-4827).
     3. ``result.subtype == 'error_max_turns'`` → ``MAX_TURNS``
        (high ``turns`` + non-zero ``output_tokens`` but empty ``output``).
-    4. ``result.api_error_status`` set, OR the outcome is ``AuthFailed`` →
+    4. the outcome is ``ModelNotFound`` → ``MODEL_NOT_FOUND`` (TERMINAL —
+       no cross-account retry; placed ABOVE the ``api_error_status`` rule
+       below because a 404 also sets ``api_error_status`` and would
+       otherwise be mis-tagged as transient ``API_ERROR``).
+    5. ``result.api_error_status`` set, OR the outcome is ``AuthFailed`` →
        ``API_ERROR`` (includes status code in the summary; transient — worth
        retrying against another account). ``AuthFailed`` ({401, 403}) is a
        strict subset of "api_error_status is not None", so the ``OR`` never
        changes the verdict — it keeps this rule visibly tied to the
        InvocationOutcome contract without narrowing API_ERROR away from
        429/5xx, which InvocationOutcome does not model.
-    5. ``result.subtype == 'error_empty_output'`` → ``EMPTY_OUTPUT``
+    6. ``result.subtype == 'error_empty_output'`` → ``EMPTY_OUTPUT``
        (may be transient).
-    6. ``result.schema_salvaged`` → ``STRUCTURAL`` (schema-salvage: the
+    7. ``result.schema_salvaged`` → ``STRUCTURAL`` (schema-salvage: the
        subtype looked like an error but a valid structured output was
        recovered; callers usually treat as success).
-    7. otherwise → ``UNKNOWN``.
+    8. otherwise → ``UNKNOWN``.
 
     ``diagnostic_detail`` always includes: subtype, turns, cost_usd,
     duration_ms, timed_out, transcript_turns, api_error_status, output
@@ -485,7 +490,7 @@ def classify_agent_failure(result: AgentResult) -> AgentFailureClass:
     # Lazy (function-local) import — see the identical note in
     # invoke_with_cap_retry: a module-top import here would create a
     # cli_invoke<->invocation_outcome circular import.
-    from shared.invocation_outcome import OK, AuthFailed, classify_invocation
+    from shared.invocation_outcome import OK, AuthFailed, ModelNotFound, classify_invocation
 
     outcome = classify_invocation(result, strict_confirm=True)
 
@@ -536,6 +541,15 @@ def classify_agent_failure(result: AgentResult) -> AgentFailureClass:
             summary=(
                 f'agent hit max_turns ({result.turns} turns, '
                 f'output_tokens={result.output_tokens})'
+            ),
+            diagnostic_detail=diagnostic_detail,
+        )
+    if isinstance(outcome, ModelNotFound):
+        return AgentFailureClass(
+            kind=AgentFailureKind.MODEL_NOT_FOUND,
+            summary=(
+                f'agent model not available / not found ({outcome.reason}) — '
+                f'terminal, no cross-account retry'
             ),
             diagnostic_detail=diagnostic_detail,
         )
