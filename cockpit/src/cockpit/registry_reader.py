@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import logging
 from pathlib import Path
+from typing import Protocol, runtime_checkable
 
 from orchestrator import session_registry
 
@@ -135,6 +136,23 @@ class SessionScanner:
             records.append(record)
         self._cache = new_cache
         return records
+
+
+@runtime_checkable
+class SessionScannerProtocol(Protocol):
+    """Structural shape of SessionScanner's scan() -- CockpitApp's `scanner` DI seam.
+
+    Mirrors cockpit.backends.base.FocusArrangeBackend's Protocol-for-DI
+    pattern: typing the seam structurally (rather than as the concrete
+    SessionScanner class) lets a test's fake scanner satisfy it by
+    implementing scan() directly, with no need to subclass the real
+    SessionScanner -- which would drag in its mtime cache and disk-scanning
+    internals for no reason.
+    """
+
+    def scan(self) -> list[session_registry.SessionRecord]:
+        """Return the current readable SessionRecord set."""
+        ...
 
 
 def build_snapshot(

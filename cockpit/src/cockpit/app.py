@@ -38,6 +38,7 @@ from orchestrator.session_registry import (
     set_manual_boost,
     update_decision_state,
 )
+from textual import work
 from textual.app import App, ComposeResult
 from textual.binding import Binding
 from textual.containers import Horizontal, Vertical
@@ -56,7 +57,12 @@ from cockpit.panes.session_table import SessionTable, order_sessions
 from cockpit.panes.spawn_bar import SpawnScreen, build_spawn_argv
 from cockpit.panes.spawn_tree import SpawnTreeScreen
 from cockpit.priority import Priorities, load_priorities
-from cockpit.registry_reader import build_snapshot, scan_sessions, snapshot_changed
+from cockpit.registry_reader import (
+    SessionScanner,
+    SessionScannerProtocol,
+    build_snapshot,
+    snapshot_changed,
+)
 from cockpit.ui_config import CockpitUIConfig, load_ui_config, save_ui_config
 
 _log = logging.getLogger(__name__)
@@ -170,6 +176,7 @@ class CockpitApp(App):
         *,
         fleet_root: Path | str | None = None,
         poll_interval: float = 1.5,
+        scanner: SessionScannerProtocol | None = None,
         now_fn: Callable[[], datetime] | None = None,
         backend: FocusArrangeBackend | None = None,
         spawn_runner: Callable[[list[str]], None] | None = None,
@@ -180,6 +187,7 @@ class CockpitApp(App):
         super().__init__(**kwargs)
         self.fleet_root = fleet_root
         self.poll_interval = poll_interval
+        self._scanner = scanner if scanner is not None else SessionScanner(self.fleet_root)
         self._now_fn = now_fn if now_fn is not None else lambda: datetime.now(UTC)
         self._backend = backend
         self._default_backends: dict[str, FocusArrangeBackend] = {
@@ -224,22 +232,50 @@ class CockpitApp(App):
         self.refresh_registry()
         if selected_slug is not None:
             self.query_one('#session-table', SessionTable).select_slug(selected_slug)
-        self.set_interval(self.poll_interval, self.refresh_registry)
+        self.set_interval(self.poll_interval, self._poll_registry)
 
     def on_unmount(self) -> None:
         self._persist_ui_config()
 
     def refresh_registry(self) -> None:
-        """Scan the registry and rebuild the SessionTable/DecisionQueue only when something changed.
+        """Scan the registry and rebuild the SessionTable/DecisionQueue, synchronously.
+
+        A thin synchronous wrapper around _scan_registry (the I/O half) and
+        _apply_scan (the UI half) -- used for on_mount's initial paint and
+        by every test that calls it directly, so a same-tick rebuild stays
+        deterministic. The recurring poll timer goes through _poll_registry
+        instead, which runs the scan on a background thread (see
+        _scan_registry_worker) so a slow scan never blocks the event loop
+        (C10 tour F1, esc-2303-1).
+        """
+        self._apply_scan(*self._scan_registry())
+
+    def _scan_registry(self) -> tuple[list[SessionRecord], list[DecisionRecord]]:
+        """I/O half of a refresh: scan disk for the current records/decisions.
+
+        Touches only self._scanner/self.fleet_root -- no widget access -- so
+        this is safe to call off the main/UI thread (see
+        _scan_registry_worker, which does exactly that).
+        """
+        records = self._scanner.scan()
+        decisions = list_decisions(self.fleet_root)
+        return records, decisions
+
+    def _apply_scan(
+        self, records: list[SessionRecord], decisions: list[DecisionRecord]
+    ) -> None:
+        """UI half of a refresh: rebuild the SessionTable/DecisionQueue only when something changed.
 
         The in-memory snapshot diff (build_snapshot/snapshot_changed plus
         _decisions_snapshot) keys on substantive fields only (never
         start_ts/age), so a purely-time-passing poll tick is a no-op -- no
         flicker, and each table's own replace_rows() re-locates the
-        previously-highlighted key so the cursor survives a rebuild.
+        previously-highlighted key so the cursor survives a rebuild. This
+        method touches widgets, so it must only ever run on the main/UI
+        thread: refresh_registry calls it directly (already on that
+        thread); _scan_registry_worker marshals back onto it via
+        call_from_thread instead of calling it directly.
         """
-        records = scan_sessions(self.fleet_root)
-        decisions = list_decisions(self.fleet_root)
         new_snapshot = build_snapshot(records)
         new_decisions_snapshot = _decisions_snapshot(decisions)
         if (
@@ -257,6 +293,27 @@ class CockpitApp(App):
         table.replace_rows(self._records, self._now_fn())
         self._sync_detail_pane(table.highlighted_slug())
         self._rebuild_queue()
+
+    def _poll_registry(self) -> None:
+        """on_mount's set_interval callback: launch the threaded scan worker.
+
+        Never scans synchronously itself -- see _scan_registry_worker, which
+        runs the actual I/O off the UI thread so a slow scan (10k+ sessions,
+        ~4.5s) never freezes input (C10 tour F1, esc-2303-1).
+        """
+        self._scan_registry_worker()
+
+    @work(thread=True, group='registry-scan')
+    def _scan_registry_worker(self) -> None:
+        """Threaded poll worker: run the scan off-thread, marshal the UI update back.
+
+        Runs _scan_registry() (pure I/O, no widget access) on a background
+        thread via Textual's @work(thread=True), then hands the result to
+        _apply_scan on the main/UI thread via call_from_thread -- Textual
+        widgets are never safe to touch directly from a worker thread.
+        """
+        records, decisions = self._scan_registry()
+        self.call_from_thread(self._apply_scan, records, decisions)
 
     def _rebuild_queue(self) -> None:
         """Re-score and re-render the DecisionQueue from current in-memory state, right now.
