@@ -2933,6 +2933,15 @@ RELOADABLE_FIELDS: frozenset[str] = frozenset().union(
     # fairness/starvation_watchdog submodel-group pattern: every threshold
     # is green-tier hot-reloadable.
     _submodel_leaf_paths('psi_admission', PsiAdmissionConfig),
+    # Model allowlist (task beta, plans/adaptive-model-routing-prd.md):
+    # green-tier hot-reloadable. apply_reload()'s existing post-apply
+    # model_validate re-check already enforces
+    # _validate_models_in_allowlist as a hybrid invariant, so a tightened
+    # allowlist (or a typo'd models.<role>) that conflicts with the live
+    # config's models/unblock_auto leaves fails closed with a
+    # {reloaded: False, error: 'hybrid-invariant: ...'} + rollback — no
+    # new reload code needed.
+    _submodel_leaf_paths('routing', RoutingConfig),
     {
         # Steward grace
         'steward_completion_timeout',
