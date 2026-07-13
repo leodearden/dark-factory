@@ -164,3 +164,103 @@ def test_dump_uses_block_style_not_flow_style(tmp_path):
     text = path.read_text(encoding="utf-8")
     assert "{" not in text
     assert "}" not in text
+
+
+# ---------------------------------------------------------------------------
+# step-5: RED — migrate_v1_to_v2()
+# ---------------------------------------------------------------------------
+
+def _v1_fixture() -> dict:
+    return {
+        "version": 1,
+        "updated": "2026-07-13",
+        "entries": [
+            {
+                "id": "one-shot-subagent-contract",
+                "title": "Full entry",
+                "severity": "high",
+                "area": "orchestrator-prompt",
+                "cause": "...",
+                "status": "partially",
+                "sightings_2026_06": 17,
+                "affected": ["a", "b"],
+                "fix": "...",
+                "fix_where": ["x.py:1"],
+                "fix_effort": "S",
+                "known_cause_match": "...",
+                "filed_tasks": "2547, 2548",
+            },
+            {
+                "id": "recon-prompt-schema-drift",
+                "title": "Yes-status entry",
+                "severity": "medium",
+                "status": "yes",
+                "sightings_2026_06": 16,
+                "filed_tasks": [2559],
+            },
+            {
+                # Minimal oneoff shape: only id/title/severity/status/sightings_2026_06
+                "id": "oneoff-2026-07-01",
+                "title": "A one-off",
+                "severity": "low",
+                "status": "mined-unverified",
+                "sightings_2026_06": 1,
+            },
+        ],
+    }
+
+
+def test_migrate_v1_to_v2_sets_version_and_defaults():
+    v1 = _v1_fixture()
+    result = mod.migrate_v1_to_v2(v1)
+    assert result["version"] == 2
+    for entry in result["entries"]:
+        assert entry["origin_phase"] == "unknown"
+        assert entry["manifested_phase"] == "unknown"
+        assert entry["sightings"] == []
+    assert result["candidates"] == []
+
+
+def test_migrate_v1_to_v2_maps_yes_status_to_open():
+    v1 = _v1_fixture()
+    result = mod.migrate_v1_to_v2(v1)
+    by_id = {e["id"]: e for e in result["entries"]}
+    assert by_id["recon-prompt-schema-drift"]["status"] == "open"
+    # unchanged statuses stay as-is
+    assert by_id["one-shot-subagent-contract"]["status"] == "partially"
+    assert by_id["oneoff-2026-07-01"]["status"] == "mined-unverified"
+
+
+def test_migrate_v1_to_v2_retains_all_v1_fields_and_order():
+    v1 = _v1_fixture()
+    result = mod.migrate_v1_to_v2(v1)
+    assert [e["id"] for e in result["entries"]] == [e["id"] for e in v1["entries"]]
+    full_entry = next(e for e in result["entries"] if e["id"] == "one-shot-subagent-contract")
+    assert full_entry["sightings_2026_06"] == 17
+    assert full_entry["filed_tasks"] == "2547, 2548"
+    assert full_entry["affected"] == ["a", "b"]
+    assert full_entry["fix_where"] == ["x.py:1"]
+    oneoff = next(e for e in result["entries"] if e["id"] == "oneoff-2026-07-01")
+    assert oneoff["sightings_2026_06"] == 1
+    assert "area" not in oneoff
+    assert "cause" not in oneoff
+
+
+def test_migrate_v1_to_v2_output_validates_green():
+    v1 = _v1_fixture()
+    result = mod.migrate_v1_to_v2(v1)
+    assert mod.validate(result) == []
+
+
+def test_migrate_v1_to_v2_is_idempotent():
+    v1 = _v1_fixture()
+    once = mod.migrate_v1_to_v2(v1)
+    twice = mod.migrate_v1_to_v2(once)
+    assert once == twice
+
+
+def test_migrate_v1_to_v2_does_not_mutate_input():
+    v1 = _v1_fixture()
+    original = copy.deepcopy(v1)
+    mod.migrate_v1_to_v2(v1)
+    assert v1 == original
