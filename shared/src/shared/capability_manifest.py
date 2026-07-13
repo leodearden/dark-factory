@@ -27,6 +27,8 @@ from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 __all__ = [
     'DeliveredCheck',
+    'ManifestCapability',
+    'ManifestTask',
 ]
 
 
@@ -123,3 +125,36 @@ class DeliveredCheck(BaseModel):
             timeout_secs=self.timeout_secs,
         )
         return self
+
+
+class ManifestCapability(BaseModel):
+    """A single capability asserted for a manifest task (PRD §Contract).
+
+    ``verdict`` is the authoring-time G3/G6 verdict; PASS is required to
+    queue (enforced upstream of this schema, not here). ``delivered_check``
+    is optional — omitted (or ``kind='manual'``) excludes the capability
+    from the automated gate.
+    """
+
+    model_config = ConfigDict(extra='forbid')
+
+    name: str = Field(min_length=1)
+    binding: str
+    verdict: Literal['PASS', 'FAIL']
+    delivered_check: DeliveredCheck | None = None
+
+
+class ManifestTask(BaseModel):
+    """A single manifest task block — one per PRD Greek-label task (PRD §Contract).
+
+    ``task_id`` is ``int | None``: ``None`` at authoring time, stamped by
+    ``commit_planning`` — never author-supplied for a real batch. ``title``
+    is a human aid, not load-bearing.
+    """
+
+    model_config = ConfigDict(extra='forbid')
+
+    label: str = Field(min_length=1)
+    task_id: int | None = None
+    title: str | None = None
+    capabilities: list[ManifestCapability]
