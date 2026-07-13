@@ -331,3 +331,163 @@ class TestEnvTransientIsPytestScopedC1:
         assert result != FailureCategory.ENV_TRANSIENT, (
             f'pyright output must never classify env_transient (PYTEST-only), got {result!r}'
         )
+
+
+# GOLDEN corpus: re-grounded from the historical cargo_cli_error allowlist
+# fix commits 1703f86f95 (drop `package `), 18f57fe922 (drop `invalid `),
+# 1aed67cd56 (tighten the allowlist), 264d5b5e8a (drop `find`, ground
+# `compile`) — the cargo re-groundings of tasks 1103/1109/1116, already
+# encoded as passing cases in test_verify.py's TestClassifyFailure. Re-
+# asserted here through the tool-dispatched classifier with the SAME
+# expected categories (not invented strings).
+_CARGO_TOOL_KINDS = [ToolKind.CARGO_TEST, ToolKind.CARGO_CLIPPY]
+
+
+class TestCargoTable:
+    """step-5: classify_failure(ToolKind.CARGO_TEST / CARGO_CLIPPY, …) — the
+    GOLDEN cargo corpus.
+
+    Most assertions here already hold via the shared OPAQUE placeholder
+    fallthrough (step-2), since the placeholder ladder is a superset of the
+    eventual cargo table's patterns — genuinely RED only once the cargo
+    table stops reaching patterns that don't belong to it (see
+    TestCargoTableIsolationC1 below). Kept here regardless to pin the
+    CARGO_TEST/CARGO_CLIPPY table's full positive/negative contract once
+    step-6 gives it its own table.
+    """
+
+    @pytest.mark.parametrize('tool', _CARGO_TOOL_KINDS)
+    def test_cargo_cli_error_exclude_pattern(self, tool):
+        output = (
+            'Compiling my-crate v0.1.0\n'
+            'error: --exclude can only be used together with --workspace\n'
+        )
+        assert _classify(tool, output, 1, False) == FailureCategory.CARGO_CLI_ERROR
+
+    @pytest.mark.parametrize('tool', _CARGO_TOOL_KINDS)
+    def test_cargo_cli_error_no_such_subcommand(self, tool):
+        output = 'error: no such subcommand: `tset`\n'
+        assert _classify(tool, output, 1, False) == FailureCategory.CARGO_CLI_ERROR
+
+    @pytest.mark.parametrize('tool', _CARGO_TOOL_KINDS)
+    def test_cargo_cli_error_failed_to_parse_manifest(self, tool):
+        output = 'error: failed to parse manifest at `/x/Cargo.toml`\n'
+        assert _classify(tool, output, 1, False) == FailureCategory.CARGO_CLI_ERROR
+
+    @pytest.mark.parametrize('tool', _CARGO_TOOL_KINDS)
+    def test_cargo_cli_error_failed_to_compile(self, tool):
+        output = 'error: failed to compile `proc-macro-foo`\n'
+        assert _classify(tool, output, 1, False) == FailureCategory.CARGO_CLI_ERROR
+
+    @pytest.mark.parametrize('tool', _CARGO_TOOL_KINDS)
+    def test_cargo_cli_error_could_not_find(self, tool):
+        output = 'error: could not find `Cargo.toml` in `/path` or any parent directory\n'
+        assert _classify(tool, output, 1, False) == FailureCategory.CARGO_CLI_ERROR
+
+    @pytest.mark.parametrize('tool', _CARGO_TOOL_KINDS)
+    def test_rustc_top_level_diagnostics_not_cargo_cli_error(self, tool):
+        output = (
+            'Compiling my-crate v0.1.0\n'
+            'error: aborting due to previous errors\n'
+            'error: could not compile `my-crate` (lib) due to previous error\n'
+        )
+        assert _classify(tool, output, 1, False) == FailureCategory.UNKNOWN_TEST_FAILURE
+
+    @pytest.mark.parametrize('tool', _CARGO_TOOL_KINDS)
+    def test_rustc_invalid_diagnostic_not_cargo_cli_error(self, tool):
+        output = 'Compiling my-crate v0.1.0\nerror: invalid attribute value\n'
+        assert _classify(tool, output, 1, False) == FailureCategory.UNKNOWN_TEST_FAILURE
+
+    @pytest.mark.parametrize('tool', _CARGO_TOOL_KINDS)
+    def test_failed_to_find_alone_not_cargo_cli_error(self, tool):
+        output = 'error: failed to find some-bin\n'
+        assert _classify(tool, output, 1, False) == FailureCategory.UNKNOWN_TEST_FAILURE
+
+    @pytest.mark.parametrize('tool', _CARGO_TOOL_KINDS)
+    def test_package_prefix_not_cargo_cli_error(self, tool):
+        output = 'error: package `foo` cannot be found\n'
+        assert _classify(tool, output, 1, False) == FailureCategory.UNKNOWN_TEST_FAILURE
+
+    @pytest.mark.parametrize('tool', _CARGO_TOOL_KINDS)
+    def test_compile_error_rustc_code(self, tool):
+        output = 'error[E0308]: mismatched types\n  --> src/lib.rs:10:5\n'
+        assert _classify(tool, output, 1, False) == FailureCategory.COMPILE_ERROR
+
+    def test_test_failure_rust_test_runner(self):
+        output = 'running 3 tests\ntest my::mod::it FAILED\ntest my::mod::another ... ok\n'
+        assert _classify(ToolKind.CARGO_TEST, output, 1, False) == FailureCategory.TEST_FAILURE
+
+
+class TestCargoTableIsolationC1:
+    """CRITICAL C1: patterns that belong to OTHER tools' tables (pytest
+    INTERNALERROR, npm errors) must not be reachable via ToolKind.CARGO_TEST
+    — proving the cargo table is its own narrow list, not a continuation of
+    the shared OPAQUE placeholder ladder.
+
+    RED today (pre step-6): CARGO_TEST still falls through to the shared
+    OPAQUE placeholder (step-2), which DOES contain these patterns.
+    """
+
+    def test_internalerror_not_reachable_via_cargo(self):
+        output = 'INTERNALERROR> pytest crashed unexpectedly\n'
+        result = _classify(ToolKind.CARGO_TEST, output, 1, False)
+        assert result == FailureCategory.UNKNOWN_TEST_FAILURE, (
+            f'pytest INTERNALERROR must not leak into the cargo table, got {result!r}'
+        )
+
+    def test_npm_error_not_reachable_via_cargo(self):
+        output = 'npm ERR! code ELIFECYCLE\n'
+        result = _classify(ToolKind.CARGO_TEST, output, 1, False)
+        assert result == FailureCategory.UNKNOWN_TEST_FAILURE, (
+            f'npm errors must not leak into the cargo table, got {result!r}'
+        )
+
+
+class TestNpxTable:
+    """step-5: classify_failure(ToolKind.NPX, …) — npm_error, else fallback."""
+
+    def test_npm_err_exclamation(self):
+        output = 'npm ERR! code ELIFECYCLE\nnpm ERR! errno 1\n'
+        assert _classify(ToolKind.NPX, output, 1, False) == FailureCategory.NPM_ERROR
+
+    def test_npm_error_lowercase(self):
+        output = 'npm error peer dep missing: react@^18\n'
+        assert _classify(ToolKind.NPX, output, 1, False) == FailureCategory.NPM_ERROR
+
+    def test_unrelated_output_is_unknown_test_failure(self):
+        output = 'Something went wrong but no recognizable pattern\n'
+        assert _classify(ToolKind.NPX, output, 1, False) == FailureCategory.UNKNOWN_TEST_FAILURE
+
+
+class TestNpxTableIsolationC1:
+    """CRITICAL C1: a rustc-shaped compile_error pattern must not be
+    reachable via ToolKind.NPX — only npm_error/fallback belong there.
+
+    RED today (pre step-6): NPX still falls through to the shared OPAQUE
+    placeholder, which DOES contain the rustc error[Exxxx] pattern.
+    """
+
+    def test_rustc_style_error_not_reachable_via_npx(self):
+        output = 'error[E0308]: mismatched types\n'
+        result = _classify(ToolKind.NPX, output, 1, False)
+        assert result == FailureCategory.UNKNOWN_TEST_FAILURE, (
+            f'a rustc-shaped pattern must not leak into the NPX table, got {result!r}'
+        )
+
+
+class TestHeadlineC1ReverseSignal:
+    """The PRD's headline C1 example: a cargo token embedded in PYTEST
+    output can no longer swallow a pytest FAILED line, because
+    ToolKind.PYTEST dispatches to its own table (step-4) which never
+    consults the cargo_cli_error allowlist at all. Already green since
+    step-4 — re-asserted here alongside the CARGO_TEST/NPX tables this step
+    introduces, for symmetry with TestCargoTableIsolationC1/TestNpxTableIsolationC1.
+    """
+
+    def test_cargo_token_in_pytest_output_still_classifies_test_failure(self):
+        output = 'error: no such subcommand: `tset`\nFAILED tests/test_x.py::test_y\n'
+        result = _classify(ToolKind.PYTEST, output, 1, False)
+        assert result == FailureCategory.TEST_FAILURE, (
+            f'a cargo CLI token in pytest output must not swallow the FAILED line '
+            f'into cargo_cli_error, got {result!r}'
+        )
