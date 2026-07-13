@@ -102,6 +102,26 @@ def _attempts_from_review_summary(summary: str) -> int:
         return 0
 
 
+def _coalesce_prd(metadata: dict) -> str | None:
+    """Coalesce PRD provenance from *metadata* into a single normalized string.
+
+    Checks ``prd_path``, then ``prd``, then ``prd_ref`` (in that precedence
+    order); the first value that is a non-empty string after stripping a
+    trailing ``#anchor`` or ``§section`` suffix and surrounding whitespace
+    wins. Non-string values are skipped. A value that cleans to ``''`` (e.g.
+    it was only a suffix) falls through to the next key. Returns ``None``
+    when no key yields a non-empty result.
+    """
+    for key in ('prd_path', 'prd', 'prd_ref'):
+        raw = metadata.get(key)
+        if not isinstance(raw, str):
+            continue
+        cleaned = raw.split('#', 1)[0].split('§', 1)[0].strip()
+        if cleaned:
+            return cleaned
+    return None
+
+
 def _build_task_row(
     project: str,
     task: dict,
@@ -144,6 +164,7 @@ def _build_task_row(
         'meta_files': meta_files,
         'train': train,
         'external_deps': external_deps,
+        'prd': _coalesce_prd(metadata),
     }
 
 
