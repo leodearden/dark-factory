@@ -349,3 +349,63 @@ def test_unknown_argument_is_rejected_without_restarting(tmp_path):
     assert state["systemctl_calls"] == [], f"state={state!r}"
     assert state["curl_calls"] == [], f"state={state!r}"
     assert state["journalctl_calls"] == [], f"state={state!r}"
+
+
+# ---------------------------------------------------------------------------
+# step-5: RED -- post-restart health gate (both directions)
+# ---------------------------------------------------------------------------
+
+def test_apply_waits_for_health(tmp_path):
+    """When fused-memory's /health is not yet ready, the script must keep
+    polling `$HEALTH_URL` (rather than giving up after one failed attempt)
+    and exit 0 once it reports healthy -- and the health poll(s) must have
+    started only after the restart."""
+    result = _run_script(
+        tmp_path,
+        curl_fail_remaining=2,
+        journalctl_marker=RECON_MARKER,
+        env={"HEALTH_TIMEOUT": "10"},
+    )
+
+    assert result.returncode == 0, (
+        f"Expected apply to eventually exit 0 once healthy; got {result.returncode}\n"
+        f"stdout={result.stdout!r} stderr={result.stderr!r}"
+    )
+    state = _state(tmp_path)
+    assert len(state["curl_calls"]) >= 3, (
+        f"Expected the script to retry curl past the first 2 failures "
+        f"(3+ calls total); state={state!r}"
+    )
+    assert state.get("restart_called_before_first_curl") is True, (
+        f"Expected polling to have started only after the restart; state={state!r}"
+    )
+
+
+def test_apply_fails_when_health_never_ready(tmp_path):
+    """When /health never becomes ready, with a short injected
+    HEALTH_TIMEOUT the script must exit non-zero with a diagnostic on
+    stderr -- and the restart must still have occurred (the failure belongs
+    to the verify gate, not the restart)."""
+    result = _run_script(
+        tmp_path,
+        curl_fail_remaining=10_000,
+        env={"HEALTH_TIMEOUT": "1"},
+    )
+
+    assert result.returncode != 0, (
+        f"Expected a non-zero exit when health never becomes ready; got 0\n"
+        f"stdout={result.stdout!r} stderr={result.stderr!r}"
+    )
+    assert result.stderr.strip(), (
+        f"Expected a diagnostic on stderr; stdout={result.stdout!r} "
+        f"stderr={result.stderr!r}"
+    )
+    state = _state(tmp_path)
+    assert ["restart", UNIT] in state["systemctl_calls"], (
+        f"Expected the restart to still have occurred despite the health "
+        f"gate failing; state={state!r}"
+    )
+    assert state["journalctl_calls"] == [], (
+        f"Expected the recon-serving gate to never run when the health gate "
+        f"fails first; state={state!r}"
+    )
