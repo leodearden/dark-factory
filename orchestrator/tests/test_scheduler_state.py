@@ -672,7 +672,15 @@ class TestGetStateSnapshotPopulated:
 
         event_store = _RecordingEventStore()
         scheduler = Scheduler(
-            config, override_store=store, event_store=event_store  # type: ignore[arg-type]
+            config,
+            override_store=store,
+            event_store=event_store,  # type: ignore[arg-type]
+            # task 2418: redirect the real-tick snapshot writes below to a
+            # writable tmp path instead of the forbidden /proj tree — see
+            # the _project_root assignment immediately below, which is still
+            # required as the OverrideStore lookup key for set_override
+            # ('/proj', ...) above.
+            state_snapshot_path=tmp_path / 'scheduler_state.json',
         )
         scheduler.finish_startup()
         scheduler._project_root = '/proj'
@@ -817,6 +825,49 @@ class TestWriteStateSnapshot:
 
         with pytest.raises(OSError):
             scheduler._write_state_snapshot_raw(path)
+
+    @pytest.mark.asyncio
+    async def test_write_snapshot_best_effort_honors_state_snapshot_path(self, tmp_path):
+        """state_snapshot_path (task 2418) redirects the best-effort write off
+        the ``_project_root``-derived path, decoupling the on-disk write
+        target from the OverrideStore lookup key.
+
+        Simulates the realistic scenario where ``_project_root`` is set to a
+        non-writable-in-production OverrideStore key (as
+        ``TestGetStateSnapshotPopulated`` does with ``'/proj'``) while the
+        write itself must land in a writable tmp path: with
+        ``state_snapshot_path`` set, the write goes there instead of the
+        ``_project_root``-derived path, and the no-project-root guard is
+        bypassed since an explicit path is always honored.
+
+        The negative assertion below points ``_project_root`` at a *writable*
+        ``tmp_path`` subdirectory rather than a literal ``'/proj'``: a
+        non-existent/non-writable host path would make "nothing written
+        there" trivially true regardless of whether the redirect actually
+        works (a broken bypass would just hit a swallowed PermissionError).
+        Anchoring the derived path under ``tmp_path`` means the negative
+        assertion actually fails if the bypass regresses, because the
+        fallback write would then succeed there.
+        """
+        derived_root = tmp_path / 'proj'
+        sched = Scheduler(
+            OrchestratorConfig(max_per_module=1),
+            state_snapshot_path=tmp_path / 'scheduler_state.json',
+        )
+        sched._project_root = str(derived_root)
+
+        await sched._write_snapshot_best_effort(force=True)
+
+        snap_path = tmp_path / 'scheduler_state.json'
+        assert snap_path.exists(), 'Expected snapshot file at state_snapshot_path'
+        data = json.loads(snap_path.read_text())
+        assert set(data.keys()) == _SNAPSHOT_KEYS, (
+            f'Expected keys {_SNAPSHOT_KEYS}, got {set(data.keys())}'
+        )
+        assert not (derived_root / 'data' / 'orchestrator' / 'scheduler_state.json').exists(), (
+            'state_snapshot_path must bypass the _project_root-derived write '
+            'target entirely — nothing should be written under the derived path'
+        )
 
 
 # ===========================================================================
