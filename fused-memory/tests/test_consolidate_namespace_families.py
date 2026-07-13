@@ -1238,7 +1238,15 @@ def _make_run_graph_mock(
 
     async def _ro_query(cypher: str, params: dict | None = None):
         result = MagicMock()
-        if 'Episodic' in cypher:
+        if 'MENTIONS' in cypher:
+            # merge_graph_family's guarded create-failed-entity
+            # MENTIONS-topology probe (task 2502 step-16) -- a dual-label
+            # query ('Episodic' AND 'Entity' both appear in its MATCH), so it
+            # MUST be routed here, before the single-label branches below,
+            # or it would be misrouted to the full per-key episode/entity
+            # list instead of this (unseeded-by-default) topology read.
+            result.result_set = []
+        elif 'Episodic' in cypher:
             result.result_set = episode_rows
         elif 'Entity' in cypher:
             result.result_set = entity_rows
