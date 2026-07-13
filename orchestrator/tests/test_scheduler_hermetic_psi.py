@@ -71,6 +71,7 @@ class TestIdlePsiSampleNeutralizesAdmissionGate:
         # sampled from the host — defers the non-deterministic candidate.
         # mem_some10=99.0 is over the default mem_some_avg10=15.0 threshold.
         scheduler = Scheduler(OrchestratorConfig(max_per_module=1))
+        scheduler.finish_startup()
         scheduler._dispatched.add('inflight')  # meets default min_inflight_floor=1
         scheduler._read_psi_sample = lambda: PsiSample(
             cpu_some10=0.0, mem_some10=99.0, mem_full10=0.0, io_some10=0.0,
@@ -89,6 +90,7 @@ class TestIdlePsiSampleNeutralizesAdmissionGate:
         # dispatch would succeed merely because the floor wasn't met, and
         # this phase would prove nothing about idle_psi_sample specifically.
         scheduler2 = Scheduler(OrchestratorConfig(max_per_module=1))
+        scheduler2.finish_startup()
         scheduler2._dispatched.add('inflight')  # meets default min_inflight_floor=1
         scheduler2._read_psi_sample = idle_psi_sample
         scheduler2.get_tasks = AsyncMock(return_value=[task])
