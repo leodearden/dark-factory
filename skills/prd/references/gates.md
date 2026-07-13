@@ -159,6 +159,20 @@ Branches 1 and 2 are **domain-weighted**: they fire heavily for numerical/scient
 
 ---
 
+## G7 — Design invariants pass
+
+**Level:** **block** (decompose); advisory in author mode (walk the sketch against the questions early — cheapest fix point).
+
+**What it catches.** Designs that re-introduce the agent-legibility survey's five cross-cutting root causes (§3): prose contracts, log-scraped stories, uncorroborated action, silent fail-soft, lock-step duplication.
+
+**Application (decompose).** After the G6 re-check, Read `docs/legibility/design-invariants.md` — it is the single normative list; do **not** restate the invariants in this section beyond their slugs, per INV-5 (`no-lockstep-duplication`). Walk **every task in the batch** (not only leaves — violations attach to mechanisms, which intermediates introduce too) against each invariant's checkable question. Trigger shapes: adds a detector/suppressor/fallback without a storm escape (`storm-escape-required`)? a tool without a declared filter/envelope convention (`contracts-machine-checked`)? a contract in prose (`contracts-machine-checked`)? a log-scrape of emitter-known facts (`structured-facts-at-failure`)? action on snapshot state without corroboration (`corroborate-before-acting`)? duplicated lock-step logic (`no-lockstep-duplication`)?
+
+**Resolution.** Redesign the task (add the streak counter, move the contract to a schema field/lint, add the corroboration step, extract the helper) — or **waive**: record `G7 waiver: <slug> — <rationale>` in the PRD's decomposition-plan row AND stamp `metadata.g7_waivers: [{"invariant": <slug>, "rationale": <text>}]` on the filed task. An unresolved, unwaived hit blocks the batch.
+
+**Calibration:** seeded-violation fixtures + rehearsal verdict table will live at `docs/legibility/design-invariants-fixtures.md` once sibling task ε lands (file not yet present as of this doc's landing).
+
+---
+
 ## Capability Manifest — mechanizing G3 + G6 per leaf
 
 **Level:** **block** (decompose; drafted in author mode alongside the per-task signals).
@@ -212,13 +226,15 @@ Walk in this rough order; iterate freely as discussion surfaces new mechanisms:
 4. **G5 fourth.** Decide B vs B+H; if H, draft contract + boundary-test sketch now (they shape the decomposition).
 5. **G2 in the decomposition plan** — name an observable signal per task even though the hard check is at decompose time.
 6. **G6 alongside the G2 draft** — validate each drafted leaf signal's substantive premise; draft the **capability-manifest** bindings here so decompose only re-checks them.
-7. **META last.** Final sanity check before save.
+7. **G7 alongside the G2/G6 draft walk** — advisory walk of the sketch against `docs/legibility/design-invariants.md`'s checkable questions; the cheapest point to redesign or record a waiver.
+8. **META last.** Final sanity check before save.
 
 ## Gate-application order (decompose mode)
 
 1. **G1, G3, G4 re-check** against the saved PRD (fast; mostly drift detection).
 2. **G2 walk** — enumerate every task, classify leaf/intermediate, attach `user_observable_signal` / `consumer_ref`.
 3. **G6 re-check** — validate each leaf signal's premise. Escalate before filing if one can't be substantiated (cheaper than an implementer discovering it against a RED test).
-4. **Capability manifest** — build the per-leaf manifest (capability→producer, DAG-direction, field-population, grammar-fixture, numeric-floor) and **commit it beside the PRD**; any FAIL binding blocks the batch until resolved.
-5. **G5 informational** — note B vs B+H; if B+H, verify the integration-gate task exists and points at the boundary-test sketch.
-6. File the batch (see `decompose-mode.md`).
+4. **G7 walk** — load `docs/legibility/design-invariants.md`, walk every task in the batch (not only leaves) against each invariant's checkable question; resolve or record waivers (`G7 waiver: <slug> — <rationale>` in the PRD row + `metadata.g7_waivers` on the filed task). An unresolved, unwaived hit blocks the batch.
+5. **Capability manifest** — build the per-leaf manifest (capability→producer, DAG-direction, field-population, grammar-fixture, numeric-floor) and **commit it beside the PRD**; any FAIL binding blocks the batch until resolved.
+6. **G5 informational** — note B vs B+H; if B+H, verify the integration-gate task exists and points at the boundary-test sketch.
+7. File the batch (see `decompose-mode.md`).
