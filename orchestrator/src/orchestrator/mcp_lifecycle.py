@@ -7,6 +7,7 @@ import json
 import logging
 import os
 import sys
+import tempfile
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -619,8 +620,28 @@ def managed_runtime_data_dirs(project_id: str) -> tuple[Path, Path]:
     lockstep, or its queue / reconciliation / tickets / journal /
     recon-escalation panels will silently go blank or stale reading a path
     the managed spawn no longer writes to.
+
+    Degrades instead of crashing when ``$HOME`` can't be resolved: with
+    ``XDG_STATE_HOME`` unset, ``Path.home()`` raises ``RuntimeError`` in a
+    stripped daemon/CI environment with no ``HOME`` (and no ``pwd`` entry).
+    Since this helper is called unconditionally on ``McpLifecycle.start()``'s
+    managed-spawn path, an unguarded raise here would take down orchestrator
+    startup; instead this falls back to the OS temp dir (task 2439
+    amendment).
     """
-    base = Path(os.environ.get('XDG_STATE_HOME') or (Path.home() / '.local' / 'state'))
+    xdg_state_home = os.environ.get('XDG_STATE_HOME')
+    if xdg_state_home:
+        base = Path(xdg_state_home)
+    else:
+        try:
+            base = Path.home() / '.local' / 'state'
+        except RuntimeError:
+            logger.warning(
+                'managed_runtime_data_dirs: could not resolve a home '
+                'directory (HOME unset?); falling back to the OS temp dir '
+                'for managed fused-memory runtime state (task 2439)'
+            )
+            base = Path(tempfile.gettempdir())
     root = base / 'dark-factory' / project_id
     return root / 'queue', root / 'reconciliation'
 
