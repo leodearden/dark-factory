@@ -3961,6 +3961,76 @@ async def test_get_statuses_hot_path_fresh_despite_pinned_write_connection(
 
 
 @pytest.mark.asyncio
+async def test_get_statuses_hot_path_fresh_on_reused_warm_connection(
+    backend, project_root,
+):
+    """The cached read connection :meth:`_get_read_connection` hands back
+    must stay fresh across REUSE, not just at the moment it is first opened.
+
+    ``test_get_statuses_hot_path_fresh_despite_pinned_write_connection``
+    (above) only calls ``get_statuses`` AFTER the out-of-band commit, so it
+    always opens the cached read connection for the first time post-commit
+    — a freshly-opened connection trivially observes the latest committed
+    row, so that test would still pass even if the cache were silently
+    reopening a new connection on every call (defeating the whole point of
+    caching one per project) or otherwise mishandling reuse. This test
+    instead warms the connection with a pre-commit read, then asserts BOTH
+    that a later call through that same cached slot reflects the
+    out-of-band commit AND that the connection object backing that slot is
+    still the identical one captured at warm-up (genuine reuse, not a quiet
+    reopen) — the actual "cached across calls but never pinned" contract
+    the docstring promises.
+    """
+    from shared.async_sqlite_base import apply_wal_pragmas, connect_daemon
+
+    await backend.add_task(project_root=project_root, title='T1')  # id=1
+    await backend.set_task_status('1', 'done', project_root)
+
+    # Warm the cached read connection with a pre-commit read.
+    warm = await backend.get_statuses(project_root)
+    assert warm['1'] == 'done', (
+        f"Expected the warm-up read to see 'done', got: {warm}"
+    )
+    warm_conn = backend._read_connections.get(project_root)
+    assert warm_conn is not None, (
+        'Expected get_statuses to have cached a read connection for project_root'
+    )
+
+    # Commit a status change out-of-band via a separate autocommit
+    # connection — simulating a second process writing to the same DB file
+    # while the cached read connection sits idle in between calls.
+    db_path = SqliteTaskBackend._db_path(project_root)
+    writer = await connect_daemon(str(db_path), isolation_level=None)
+    try:
+        await apply_wal_pragmas(writer, busy_timeout_ms=5000)
+        await writer.execute("UPDATE tasks SET status='cancelled' WHERE id=1")
+        await writer.commit()
+    finally:
+        await writer.close()
+
+    # Reading again (bulk and scoped) must observe the post-commit state,
+    # despite having already read this same row once before the commit.
+    bulk = await backend.get_statuses(project_root)
+    assert bulk['1'] == 'cancelled', (
+        f"Expected the reused warm connection to see fresh 'cancelled', got: {bulk}"
+    )
+
+    scoped = await backend.get_statuses(project_root, ids=['1'])
+    assert scoped['1'] == 'cancelled', (
+        f"Expected the reused warm connection (scoped) to see fresh 'cancelled', got: {scoped}"
+    )
+
+    # ...and the cache must still hold the SAME connection object used for
+    # the warm-up read (genuine reuse across both later calls, not a quiet
+    # reopen) — checked AFTER the reuse, not just before it, since nothing
+    # would have triggered a reopen yet at that earlier point.
+    assert backend._read_connections.get(project_root) is warm_conn, (
+        'Expected _get_read_connection to have reused the cached connection '
+        'across both calls above, not opened a new one'
+    )
+
+
+@pytest.mark.asyncio
 async def test_close_drains_cached_read_connections(backend, project_root):
     """close() must drain the cached read connections opened by
     :meth:`~SqliteTaskBackend._get_read_connection` (task 2455), not just
