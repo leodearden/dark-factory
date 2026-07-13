@@ -75,18 +75,25 @@ class McpClient:
         self._client = httpx.AsyncClient(
             timeout=30.0, follow_redirects=True, transport=self._transport,
         )
-        # No session id on the FIRST request: the MCP streamable-HTTP contract
-        # requires `initialize` to be sent session-less. A STATEFUL server
-        # (e.g. the escalation servers) 404s "Session not found" if a client
-        # invents its own id here. The server-assigned id is captured from the
-        # initialize response in `_post` below and reused from then on.
-        await self._post({
-            'jsonrpc': '2.0', 'id': 1, 'method': 'initialize',
-            'params': {'protocolVersion': '2024-11-05',
-                       'clientInfo': {'name': 'cgl-sched-gate', 'version': '1.0'},
-                       'capabilities': {}},
-        })
-        await self._post({'jsonrpc': '2.0', 'method': 'notifications/initialized', 'params': {}})
+        try:
+            # No session id on the FIRST request: the MCP streamable-HTTP contract
+            # requires `initialize` to be sent session-less. A STATEFUL server
+            # (e.g. the escalation servers) 404s "Session not found" if a client
+            # invents its own id here. The server-assigned id is captured from the
+            # initialize response in `_post` below and reused from then on.
+            await self._post({
+                'jsonrpc': '2.0', 'id': 1, 'method': 'initialize',
+                'params': {'protocolVersion': '2024-11-05',
+                           'clientInfo': {'name': 'cgl-sched-gate', 'version': '1.0'},
+                           'capabilities': {}},
+            })
+            await self._post({'jsonrpc': '2.0', 'method': 'notifications/initialized', 'params': {}})
+        except Exception:
+            # __aexit__ is never called if __aenter__ raises, so close the
+            # just-created client ourselves to avoid leaking the connection
+            # pool (e.g. when initialize 404s against a stateful server).
+            await self._client.aclose()
+            raise
         return self
 
     async def __aexit__(self, *exc) -> None:
