@@ -10450,6 +10450,9 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                 runner=None if lease.is_local else lease.runner,
                 escalation_queue=self._escalation_queue,
                 dry_run_handles=self._dry_run_handles,
+                main_health_probe_handles=_MainHealthProbeHandles(
+                    background_tasks=self._background_tasks,
+                ),
                 depth=depth,
                 speculative=item.speculative,
             ))
