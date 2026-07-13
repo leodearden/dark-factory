@@ -1104,6 +1104,60 @@ class GitOps:
         except (OSError, ValueError):
             return False
 
+    def _reconcile_pool_storage_before_sweep(self, context: str) -> bool:
+        """Shared pre-sweep gate for the two destructive-sweep sites (task 2315, BUG 2).
+
+        Both :meth:`_run_warm_lane_gc_reclaim` and :meth:`_prune_registrations`
+        must refuse to run against an unmounted mountpoint (the Jul-3 task
+        2099 incident), but a HEALTHY mount that merely lost its
+        ``.pool-root`` sentinel must self-heal rather than refuse forever.
+        Pre-2315, one sweep site had no bootstrap escape at all and the
+        other only SKIPPED without recreating the sentinel — a
+        chicken-and-egg deadlock (sweeps refused -> stale lanes never
+        reseeded -> the only sentinel writer, :meth:`_seed_warm_lane` on
+        ``rc == 0``, never runs -> sentinel stays missing forever). This
+        helper lifts the acquire-side create-once "bootstrap-ok => mark
+        sentinel + proceed" pattern (see :meth:`acquire_warm_lane` /
+        :meth:`acquire_spec_lane`) into both sweep sites uniformly.
+
+        Args:
+            context: Short identifier for the calling sweep, threaded into
+                the refusal WARNING so operators can attribute which caller
+                asked (mirrors the ``context`` argument already threaded
+                through :meth:`_prune_registrations`).
+
+        Returns:
+            True  — safe to proceed with the sweep. Either pool storage
+                    was never in play (:meth:`pool_in_use` False), the
+                    sentinel was already present, or the sentinel was
+                    absent but provably a first-seed bootstrap
+                    (:meth:`_pool_storage_bootstrap_ok` True) — in that
+                    last case the sentinel is recreated
+                    (:meth:`mark_pool_storage_present`) before returning.
+            False — refuse. The sentinel is absent and NOT provably a
+                    bootstrap (a suspected unmount) — :meth:`_note_pool_storage_absent`
+                    is invoked to notify the installed callback.
+
+        Pure predicate plus best-effort sentinel recreation; never raises.
+        """
+        if not (self.pool_in_use() and not self.pool_storage_present()):
+            return True
+        if self._pool_storage_bootstrap_ok():
+            logger.info(
+                '%s: .pool-root absent but mount confirmed present at %s '
+                '(CoW seed base already resolves underneath it) — '
+                'recreating sentinel and proceeding',
+                context, self.worktree_base,
+            )
+            self.mark_pool_storage_present()
+            return True
+        logger.warning(
+            '%s: pool storage absent/unmounted at %s — refusing sweep',
+            context, self.worktree_base,
+        )
+        self._note_pool_storage_absent()
+        return False
+
     async def _is_registered_worktree(self, path: Path) -> bool:
         """Check if *path* is a registered git worktree.
 
