@@ -1,15 +1,16 @@
 # Design invariants
 
-A gate checklist, not an essay. These five invariants encode the
-agent-legibility survey's cross-cutting root causes
-(`plans/agent-legibility-survey-2026-07-13.md` §3) as named, checkable
-design-time questions. They gate `/prd` decompose (G7,
-`skills/prd/references/gates.md`) and `/review` phase 2's cross-module audit
-— both consumers Read this doc at run time; it is the single normative copy
-(no restatement, per INV-5). Stable slug ids are load-bearing: G7 waivers,
-`/review`'s `invariant_findings`, and the confusion census's optional
-`invariant_violated` field all reference them. Numeric aliases INV-1..INV-5
-are prose convenience only.
+A gate checklist, not an essay. These five invariants encode
+the agent-legibility survey's cross-cutting root causes
+(`plans/agent-legibility-survey-2026-07-13.md` §3) as named,
+checkable design-time questions. They will gate `/prd` decompose (G7,
+`skills/prd/references/gates.md`) and `/review` phase 2's cross-module
+audit — both consumers Read this doc at run time once sibling tasks
+β/γ wire the G7 section and phase-2 step (neither lands with this doc);
+it is the single normative copy (no restatement, per INV-5). Stable slug
+ids are load-bearing: G7 waivers, `/review`'s `invariant_findings`, and
+the confusion census's optional `invariant_violated` field all reference
+them. Numeric aliases INV-1..INV-5 are prose convenience only.
 
 ## INV-1 `contracts-machine-checked`
 
@@ -111,6 +112,6 @@ batches is an enforcement gap: file a guard task.
 ## Fixtures
 
 Calibration fixtures — two seeded violations per invariant plus a rehearsal
-verdict table exercising the as-landed G7 and `/review` phase-2 text — live
-at `docs/legibility/design-invariants-fixtures.md` (authored by sibling task
-ε).
+verdict table exercising the as-landed G7 and `/review` phase-2 text — will
+live at `docs/legibility/design-invariants-fixtures.md` once sibling task ε
+lands (file not yet present as of this doc's landing).
