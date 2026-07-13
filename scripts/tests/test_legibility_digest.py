@@ -195,3 +195,61 @@ class TestIterUserTurns:
 
         assert [t['text'] for t in turns] == ['first', 'second']
         assert [t['index'] for t in turns] == [0, 3]
+
+
+# ---------------------------------------------------------------------------
+# iter_error_neighborhoods — is_error tool_result blocks ONLY (never a
+# substring "FAIL" match -- the core of the decoy-FAIL decision), paired
+# with the preceding assistant attempt via tool_use_id.
+# ---------------------------------------------------------------------------
+
+class TestIterErrorNeighborhoods:
+    def test_pairs_error_result_with_preceding_attempt(self):
+        records = [
+            _assistant(_tool_use('Bash', {'command': 'false'}, id='tu-1')),
+            _tool_result('tu-1', 'Exit code 1', is_error=True),
+        ]
+
+        neighborhoods = mod.iter_error_neighborhoods(records)
+
+        assert len(neighborhoods) == 1
+        n = neighborhoods[0]
+        assert n['attempt_tool'] == 'Bash'
+        assert n['attempt_input_summary'] == json.dumps({'command': 'false'}, sort_keys=True)
+        assert n['error_content'] == 'Exit code 1'
+        assert n['index'] == 1
+
+    def test_ignores_non_error_result(self):
+        records = [
+            _assistant(_tool_use('Read', {'file_path': '/tmp/x'}, id='tu-2')),
+            _tool_result('tu-2', 'file contents', is_error=False),
+        ]
+
+        assert mod.iter_error_neighborhoods(records) == []
+
+    def test_only_error_result_returned_among_mixed(self):
+        records = [
+            _assistant(
+                _tool_use('Bash', {'command': 'false'}, id='tu-1'),
+                _tool_use('Read', {'file_path': '/tmp/x'}, id='tu-2'),
+            ),
+            _tool_result('tu-2', 'file contents', is_error=False),
+            _tool_result('tu-1', 'Exit code 1', is_error=True),
+        ]
+
+        neighborhoods = mod.iter_error_neighborhoods(records)
+
+        assert len(neighborhoods) == 1
+        assert neighborhoods[0]['attempt_tool'] == 'Bash'
+
+    def test_unmatched_tool_use_id_does_not_crash(self):
+        # No preceding tool_use carries this tool_use_id (e.g. the attempt
+        # record was truncated off the front of the transcript window).
+        records = [_tool_result('orphan-id', 'boom', is_error=True)]
+
+        neighborhoods = mod.iter_error_neighborhoods(records)
+
+        assert len(neighborhoods) == 1
+        assert neighborhoods[0]['attempt_tool'] is None
+        assert neighborhoods[0]['attempt_input_summary'] is None
+        assert neighborhoods[0]['error_content'] == 'boom'
