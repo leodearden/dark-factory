@@ -4146,6 +4146,114 @@ async def test_get_read_connection_does_not_leak_when_closed_during_open(
     )
 
 
+@pytest.mark.asyncio
+async def test_get_statuses_concurrent_cold_open_opens_single_read_connection(
+    backend, project_root, monkeypatch,
+):
+    """Two concurrent ``get_statuses`` calls racing to open the COLD cached
+    read connection for the same project must converge on a single opened
+    connection — not one per caller.
+
+    Regression test for the "another caller raced us to open" branch inside
+    :meth:`_get_read_connection` (task 2455 review): both coroutines pass
+    the initial ``project_root in self._read_connections`` fast-path check
+    (miss — cold read cache) and both reach the per-project lock via
+    ``asyncio.gather``, but only the winner should actually call
+    ``connect_daemon``; the loser must hit the in-lock re-check
+    (``conn = self._read_connections.get(project_root); if conn is not
+    None: return conn``) and get back the winner's connection instead of
+    opening a second one. A bare ``len(backend._read_connections) == 1``
+    check can't distinguish "opened once" from "opened twice, second one
+    silently overwritten/leaked" — both leave exactly one entry in the
+    dict — so this counts actual ``connect_daemon`` invocations via a spy
+    that still delegates to the real implementation.
+
+    The WRITE connection is warmed first (via ``add_task``) so the only
+    cold cache in play when the race starts is the READ connection —
+    isolating this test to :meth:`_get_read_connection`'s own lock, rather
+    than :meth:`_get_connection`'s (already covered by the
+    close()-during-bring-up/open regression tests above).
+    """
+    from fused_memory.backends import sqlite_task_backend as _sb
+
+    await backend.add_task(project_root=project_root, title='T1')  # id=1, pending
+    assert project_root not in backend._read_connections, (
+        'Expected the read-connection cache to still be cold before the race'
+    )
+
+    real_connect_daemon = _sb.connect_daemon
+    call_count = 0
+
+    async def _counting_connect_daemon(*args, **kwargs):
+        nonlocal call_count
+        call_count += 1
+        return await real_connect_daemon(*args, **kwargs)
+
+    monkeypatch.setattr(_sb, 'connect_daemon', _counting_connect_daemon)
+
+    results = await asyncio.gather(
+        backend.get_statuses(project_root),
+        backend.get_statuses(project_root),
+    )
+
+    assert results[0] == {'1': 'pending'}
+    assert results[1] == {'1': 'pending'}
+    assert call_count == 1, (
+        'Expected exactly one connect_daemon call for the read connection '
+        "(the second caller should reuse the winner's cached connection via "
+        f'the in-lock re-check), got {call_count}'
+    )
+    assert list(backend._read_connections) == [project_root], (
+        f'Expected a single cached read connection for project_root, got: '
+        f'{backend._read_connections}'
+    )
+
+
+@pytest.mark.asyncio
+async def test_get_statuses_raw_propagates_when_read_connection_open_raises(
+    backend, project_root, monkeypatch,
+):
+    """get_statuses_raw (and get_statuses) must PROPAGATE an error raised
+    while opening the cached read connection — NOT fail open to ``{}`` the
+    way get_statuses_fresh does.
+
+    Contrasts with
+    ``test_get_statuses_fresh_returns_empty_when_connection_open_raises``:
+    get_statuses_fresh's fail-open-to-``{}`` behavior is safe for its
+    best-effort census caller, but get_statuses/get_statuses_raw feed the
+    scheduler dispatch gate and ``get_external_statuses``, which must see a
+    failure surface as an error rather than silently misreading ``{}`` as
+    "no tasks" (see get_statuses_raw's and _get_read_connection's
+    docstrings). Pins that _get_read_connection's error surface survived
+    task 2455's move of get_statuses_raw onto it — a future refactor of
+    _get_read_connection that accidentally swallowed a
+    connect_daemon/apply_wal_pragmas failure into ``{}`` would be caught
+    here.
+    """
+    from fused_memory.backends import sqlite_task_backend as _sb
+
+    # Seed via the real connect_daemon first so the DB file and the WRITE
+    # connection already exist — isolates the simulated failure to the
+    # READ connection's own (still cold) open sequence.
+    await backend.add_task(project_root=project_root, title='T1')
+    assert project_root not in backend._read_connections, (
+        'Expected the read-connection cache to still be cold'
+    )
+
+    def _boom(*_args, **_kwargs):
+        raise OSError('simulated connection-open failure')
+
+    monkeypatch.setattr(_sb, 'connect_daemon', _boom)
+
+    with pytest.raises(OSError, match='simulated connection-open failure'):
+        await backend.get_statuses_raw(project_root)
+
+    # get_statuses is a thin delegator onto get_statuses_raw — must
+    # propagate identically rather than swallowing the error.
+    with pytest.raises(OSError, match='simulated connection-open failure'):
+        await backend.get_statuses(project_root)
+
+
 # ── Corrupt-blob refusal tests (task 1813) ──────────────────────────────
 
 
