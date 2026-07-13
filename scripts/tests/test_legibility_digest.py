@@ -302,3 +302,81 @@ class TestIterSelfCorrections:
         records = [_assistant(_thinking('actually, this approach is wrong'))]
 
         assert mod.iter_self_corrections(records) == []
+
+
+# ---------------------------------------------------------------------------
+# iter_not_found / iter_df_guards / iter_interrupts — secondary scalar
+# signals, each carrier-scoped.
+# ---------------------------------------------------------------------------
+
+class TestSecondarySignals:
+    def test_not_found_detects_pattern_in_tool_result(self):
+        records = [_tool_result('tu-1', 'bash: foo: command not found', is_error=True)]
+
+        hits = mod.iter_not_found(records)
+
+        assert len(hits) == 1
+        assert hits[0]['pattern'] == 'command not found'
+
+    def test_not_found_ignores_assistant_text(self):
+        records = [_assistant(_text('The file does not exist yet, I will create it.'))]
+
+        assert mod.iter_not_found(records) == []
+
+    def test_not_found_ignores_write_tool_use_input(self):
+        records = [_assistant(_tool_use(
+            'Write', {'file_path': '/tmp/x', 'content': 'No such file or directory'},
+        ))]
+
+        assert mod.iter_not_found(records) == []
+
+    def test_df_guard_detects_trip_context_in_tool_result(self):
+        # Real PathGuardVerdict trip literal (fused_memory path_scope_guard.py)
+        records = [_tool_result(
+            'tu-1',
+            "DarkFactoryPathScopeViolation: task references paths owned by "
+            "another project ('foo/bar.py',) but was filed under project 'x'.",
+            is_error=True,
+        )]
+
+        hits = mod.iter_df_guards(records)
+
+        assert len(hits) == 1
+        assert hits[0]['pattern'] == 'darkfactorypathscopeviolation'
+
+    def test_df_guard_detects_phantom_done_gate_error_code(self):
+        # Real phantom-done gate trip literal (task_interceptor.py/scheduler.py)
+        records = [_tool_result(
+            'tu-1', "error: done_gate_missing_files -- cannot mark done", is_error=True,
+        )]
+
+        hits = mod.iter_df_guards(records)
+
+        assert len(hits) == 1
+        assert hits[0]['pattern'] == 'done_gate_missing_files'
+
+    def test_df_guard_ignores_bare_category_mention(self):
+        # scope_violation/phantom-done are common CATEGORY NAMES mentioned in
+        # prose (task descriptions, skill instructions) -- not a real trip.
+        # The bare, lowercase-underscore label never matches: only the real
+        # trip literals (the camelCase error_type, the gate's error code, or
+        # premise-lint's fixed prefix) count.
+        records = [_tool_result(
+            'tu-1',
+            'This task should file category="scope_violation" if the '
+            'phantom-done gate is relevant.',
+        )]
+
+        assert mod.iter_df_guards(records) == []
+
+    def test_interrupt_detects_marker_in_injected_user_text(self):
+        records = [_user_text('[Request interrupted by user for tool use]')]
+
+        hits = mod.iter_interrupts(records)
+
+        assert len(hits) == 1
+
+    def test_interrupt_ignores_sidechain(self):
+        records = [_sidechain(_user_text('[Request interrupted by user for tool use]'))]
+
+        assert mod.iter_interrupts(records) == []
