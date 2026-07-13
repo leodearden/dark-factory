@@ -14,7 +14,7 @@ from __future__ import annotations
 
 import json
 from collections.abc import Iterable
-from dataclasses import asdict, dataclass, field, is_dataclass
+from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any
 
@@ -50,7 +50,17 @@ def _proposal_to_dicts(frontier_proposal: Iterable[Any]) -> list[dict]:
     dicts) into plain dicts, so AdjudicationEntry is always JSON-serializable."""
     result = []
     for issue in frontier_proposal:
-        result.append(asdict(issue) if is_dataclass(issue) else dict(issue))
+        # Dispatch on `isinstance(issue, dict)` rather than `is_dataclass(issue)`:
+        # is_dataclass()'s TypeGuard covers both dataclass *instances* and
+        # dataclass *classes*, so narrowing on it (even combined with
+        # `not isinstance(issue, type)`) leaves pyright unable to prove
+        # `issue` is a plain DataclassInstance in either branch. Checking for
+        # the dict case directly sidesteps that and matches this function's
+        # actual contract (GroundTruthIssue instances or plain dicts).
+        if isinstance(issue, dict):
+            result.append(dict(issue))
+        else:
+            result.append(asdict(issue))
     return result
 
 

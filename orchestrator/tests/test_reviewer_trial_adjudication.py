@@ -14,7 +14,6 @@ from orchestrator.evals.reviewer_trial.adjudication import (
     AdjudicationEntry,
     AdjudicationLog,
 )
-
 from orchestrator.evals.reviewer_trial.corpus import GroundTruthIssue
 
 
