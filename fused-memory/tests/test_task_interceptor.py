@@ -14,7 +14,7 @@ from _fm_helpers import make_8df8_scenario
 from _fm_helpers import submit_and_resolve as _submit_and_resolve
 
 from fused_memory.config.schema import CuratorConfig, FusedMemoryConfig
-from fused_memory.middleware.task_curator import CuratorDecision, RewrittenTask
+from fused_memory.middleware.task_curator import CandidateTask, CuratorDecision, RewrittenTask
 from fused_memory.middleware.task_interceptor import TaskInterceptor
 from fused_memory.models.scope import resolve_project_id
 from fused_memory.reconciliation.event_buffer import EventBuffer
@@ -6403,6 +6403,174 @@ async def test_index_committed_tasks_per_task_failure_does_not_abort_batch(
     await curator_interceptor.index_committed_tasks([t1, t2], '/project')
 
     assert attempted == ['1', '2']
+
+
+# ─────────────────────────────────────────────────────────────────────
+# commit_planning -> search_tasks acceptance (task 2562 item 1, step-3)
+#
+# Drives the REAL commit_planning + search_tasks MCP tools (not the bare
+# interceptor method exercised above) over the real curator_interceptor
+# with an injected fake in-memory curator, proving the write-time
+# indexing seam end-to-end through the actual tool wiring commit_planning
+# uses in production.
+# ─────────────────────────────────────────────────────────────────────
+
+
+class _FakeCorpusCurator:
+    """Dict-backed stand-in for TaskCurator: record_task stores, search_corpus
+    substring-matches title/description.
+
+    Gives a deterministic record -> search round-trip without Qdrant/OpenAI.
+    Only the two methods index_committed_tasks/search_tasks actually call
+    are implemented.
+    """
+
+    def __init__(self) -> None:
+        self._by_project: dict[str, dict[str, CandidateTask]] = {}
+
+    async def record_task(self, task_id: str, candidate: CandidateTask, project_id: str) -> None:
+        self._by_project.setdefault(project_id, {})[task_id] = candidate
+
+    async def search_corpus(
+        self,
+        query: str,
+        project_id: str,
+        *,
+        limit: int = 10,
+        score_threshold: float = 0.3,
+    ) -> list[dict]:
+        needle = query.lower()
+        hits = []
+        for task_id, candidate in self._by_project.get(project_id, {}).items():
+            haystack = f'{candidate.title} {candidate.description}'.lower()
+            if needle in haystack:
+                hits.append(
+                    {
+                        'task_id': task_id,
+                        'title': candidate.title,
+                        'description': candidate.description,
+                        'files_to_modify': candidate.files_to_modify,
+                        'priority': candidate.priority,
+                        'updated_at': None,
+                        'score': 1.0,
+                    }
+                )
+        return hits[:limit]
+
+    async def close(self) -> None:
+        pass
+
+
+def _committed_task_get_task_side_effect(titles: dict[str, str]):
+    """taskmaster.get_task side_effect returning a distinct title per id.
+
+    ``metadata.files=[]`` keeps commit_planning's lock-charter guard a
+    no-op (it only rejects directory-shaped paths); ``status='deferred'``
+    mirrors a real planning_mode-created row so the deferred -> target
+    transition commit_planning drives is a genuine (non no-op) change.
+    """
+
+    async def _get_task(task_id, project_root=None, tag=None):
+        return {
+            'id': task_id,
+            'status': 'deferred',
+            'title': titles[str(task_id)],
+            'description': '',
+            'details': '',
+            'priority': 'medium',
+            'metadata': {'files': []},
+        }
+
+    return _get_task
+
+
+@pytest.mark.asyncio
+async def test_commit_planning_pending_indexes_batch_findable_via_search_tasks(
+    curator_interceptor, taskmaster, monkeypatch,
+):
+    """Acceptance: committing a planning_mode batch to 'pending' makes it
+    immediately findable via search_tasks — the regression this task fixes
+    (planning_mode tasks were invisible until the one-shot empty-corpus
+    backfill, which never re-runs once the corpus is non-empty).
+    """
+    from fused_memory.server.tools import create_mcp_server
+
+    monkeypatch.setattr(
+        'fused_memory.server.tools.resolve_main_checkout',
+        lambda p: str(p),
+    )
+
+    fake_curator = _FakeCorpusCurator()
+    curator_interceptor._curator = fake_curator
+
+    taskmaster.get_task = AsyncMock(
+        side_effect=_committed_task_get_task_side_effect(
+            {'101': 'Reticulate the splines subsystem', '102': 'Add unrelated widget'},
+        ),
+    )
+    taskmaster.set_task_status = AsyncMock(return_value={'success': True})
+    taskmaster.get_statuses_raw = AsyncMock(return_value={'101': 'pending', '102': 'pending'})
+
+    server = create_mcp_server(AsyncMock(), task_interceptor=curator_interceptor)
+
+    commit_result = await server._tool_manager.call_tool(
+        'commit_planning',
+        {'project_root': '/project', 'task_ids': '101,102', 'target_status': 'pending'},
+    )
+    assert 'error' not in commit_result
+    assert commit_result['success'] is True
+
+    search_result = await server._tool_manager.call_tool(
+        'search_tasks',
+        {'project_root': '/project', 'query': 'Reticulate the splines'},
+    )
+    assert 'error' not in search_result
+    found_ids = {hit['task_id'] for hit in search_result['results']}
+    assert '101' in found_ids
+    assert '102' not in found_ids  # unrelated title never matched the query
+
+
+@pytest.mark.asyncio
+async def test_commit_planning_cancelled_does_not_index(
+    curator_interceptor, taskmaster, monkeypatch,
+):
+    """Negative: a batch committed with target_status='cancelled' is never
+    indexed — abandoned/discarded planning batches must not pollute the
+    corpus (item-1 design decision: index only on the pending flip).
+    """
+    from fused_memory.server.tools import create_mcp_server
+
+    monkeypatch.setattr(
+        'fused_memory.server.tools.resolve_main_checkout',
+        lambda p: str(p),
+    )
+
+    fake_curator = _FakeCorpusCurator()
+    curator_interceptor._curator = fake_curator
+
+    taskmaster.get_task = AsyncMock(
+        side_effect=_committed_task_get_task_side_effect(
+            {'201': 'Abandoned refactor of the frobnicator'},
+        ),
+    )
+    taskmaster.set_task_status = AsyncMock(return_value={'success': True})
+    taskmaster.get_statuses_raw = AsyncMock(return_value={'201': 'cancelled'})
+
+    server = create_mcp_server(AsyncMock(), task_interceptor=curator_interceptor)
+
+    commit_result = await server._tool_manager.call_tool(
+        'commit_planning',
+        {'project_root': '/project', 'task_ids': '201', 'target_status': 'cancelled'},
+    )
+    assert 'error' not in commit_result
+    assert commit_result['success'] is True
+
+    search_result = await server._tool_manager.call_tool(
+        'search_tasks',
+        {'project_root': '/project', 'query': 'Abandoned refactor of the frobnicator'},
+    )
+    assert 'error' not in search_result
+    assert search_result['results'] == []
 
 
 # ─────────────────────────────────────────────────────────────────────
