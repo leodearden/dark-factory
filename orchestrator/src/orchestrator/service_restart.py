@@ -26,15 +26,29 @@ Two instances are used in production:
 
 from __future__ import annotations
 
-import asyncio  # noqa: F401 — no direct call site in this module (the actual
-
-# asyncio.create_subprocess_exec now lives in proc_supervision.RestartPlan.execute()),
-# but this binding is load-bearing: tests patch it via the
+# noqa: F401 below — no direct call site in this module (the actual
+# asyncio.create_subprocess_exec now lives in proc_supervision.RestartPlan.
+# execute()), but this binding is load-bearing: some tests OUTSIDE this
+# task's locked scope patch it via the
 # 'orchestrator.service_restart.asyncio.create_subprocess_exec' dotted path,
 # which requires the 'asyncio' module object to be reachable as an attribute
 # of this module (patching an attribute on that shared module object patches
 # it for every importer, including proc_supervision). Removing this import
-# breaks that patch path with AttributeError — see test_fleet_staleness_composition.py.
+# breaks that patch path with AttributeError for every such test.
+#
+# This task's OWN locked test file (test_service_restart.py) no longer needs
+# it — its tests were converted to either pass an explicit `runner=` fake
+# through the injectable seam, or patch
+# 'orchestrator.proc_supervision.asyncio.create_subprocess_exec' directly
+# (where the call actually lives; see test_default_executor_spawns_script_
+# detached). The remaining coupling is isolated to two files task 2237 does
+# NOT hold a lock for: test_harness_service_restart.py (3 call sites) and
+# test_fleet_staleness_composition.py (2 call sites). Retiring this
+# re-export requires converting those patch sites too — tracked as
+# follow-up work for whichever task next holds a lock on them, not done
+# here (amendment: reviewer_comprehensive flagged this coupling as
+# low-priority test-infra debt).
+import asyncio  # noqa: F401
 import json
 import logging
 import time
