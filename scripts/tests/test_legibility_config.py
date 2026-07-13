@@ -174,3 +174,37 @@ class TestMalformedConfigRaises:
             """)
         with pytest.raises(ValidationError):
             mod.load_config(_write(tmp_path, text))
+
+
+class TestShippedDarkFactoryConfig:
+    """The committed docs/legibility/legibility.yaml — dark_factory's own
+    per-project §7.4 config — loads and validates through config.load_config.
+
+    Resolved relative to this test file (scripts/tests/../.. == repo root)
+    so the test works regardless of cwd.
+    """
+
+    SHIPPED_CONFIG_PATH = (
+        Path(__file__).resolve().parents[2] / 'docs' / 'legibility' / 'legibility.yaml'
+    )
+
+    def test_shipped_config_top_level(self):
+        cfg = mod.load_config(self.SHIPPED_CONFIG_PATH)
+        assert cfg.project_id == 'dark_factory'
+        assert cfg.project_root == '/home/leo/src/dark-factory'
+        assert cfg.cwd_prefixes == ['/home/leo/src/dark-factory']
+
+    def test_shipped_config_budgets_and_sampling(self):
+        cfg = mod.load_config(self.SHIPPED_CONFIG_PATH)
+        assert cfg.budgets.max_daily_digest_bytes == 300000
+        assert cfg.sampling.top_fraction == 0.12
+        assert cfg.sampling.per_stratum_min == 2
+
+    def test_shipped_config_census_and_models_nonempty(self):
+        cfg = mod.load_config(self.SHIPPED_CONFIG_PATH)
+        assert cfg.census.max_interval_days > 0
+        assert cfg.census.tasks_landed_threshold > 0
+        assert cfg.models.trickle
+        assert cfg.models.census_miner
+        assert cfg.models.census_verify
+        assert cfg.models.census_synthesis
