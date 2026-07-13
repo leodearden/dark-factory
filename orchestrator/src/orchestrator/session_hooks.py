@@ -275,8 +275,17 @@ def _resolve_display(env: Mapping[str, str], title: str) -> session_registry.Dis
     pane spec from ``TMUX_PANE`` when present, else ``None`` (best-effort,
     never guessed). The 'wm' case carries *title* as ``wm_title`` -- the
     primary focus key (PRD §6.1: wmctrl -a by title) -- alongside the
-    best-effort ``WINDOWID`` optimization. Returns None when neither marker
-    is present.
+    best-effort ``WINDOWID`` optimization.
+
+    Third and last, when neither TMUX nor WINDOWID is present (the common
+    case for konsole/gnome-terminal spawns, which do not export WINDOWID --
+    task 2510 / Fleet Cockpit C10 fix): if ``CLAUDE_SPAWN_WM_TITLE`` is set,
+    resolve its live X11 window id via ``_resolve_wm_window_id`` and, on a
+    hit, stamp a 'wm' Display carrying that EXACT marker as ``wm_title``
+    (never the possibly-since-churned *title* param). Gated strictly on this
+    explicit env var -- no fallback to *title* itself -- so a hand-launched
+    session (no CLAUDE_SPAWN_WM_TITLE) never invokes wmctrl here, and a
+    resolver miss (or no marker at all) returns None exactly like today.
     """
     if env.get('TMUX'):
         return session_registry.Display(
@@ -289,6 +298,15 @@ def _resolve_display(env: Mapping[str, str], title: str) -> session_registry.Dis
             wm_title=title,
             wm_window_id=env.get('WINDOWID'),
         )
+    marker = env.get('CLAUDE_SPAWN_WM_TITLE')
+    if marker:
+        window_id = _resolve_wm_window_id(marker)
+        if window_id is not None:
+            return session_registry.Display(
+                kind=session_registry.DisplayKind.WM.value,
+                wm_title=marker,
+                wm_window_id=window_id,
+            )
     return None
 
 
