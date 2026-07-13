@@ -579,6 +579,18 @@ def _tool_for_cmd(cmd: str | None) -> ToolKind:
     by ``classify_failure``: every caller checks ``rc == 0`` before
     classifying, and a ``None`` command's check is always skipped (rc stays
     0) — so a failing check always has a real, non-``None`` command string.
+
+    NOTE: this resolution is also what gates env_transient auto-recovery
+    (below, ``category == FailureCategory.ENV_TRANSIENT``) — that category is
+    only ever produced when a command resolves here to ``ToolKind.PYTEST``
+    (see verify_classify.py's "BEHAVIORAL NARROWING" note above
+    ``_ENV_TRANSIENT_PATTERNS``). A test command wrapped such that
+    ``parse_config_command`` can't see a literal ``pytest`` token (e.g. a
+    ``make test`` / shell-script / bare tox-nox indirection) resolves to
+    ``ToolKind.OPAQUE`` here and so cannot trigger env_transient recovery,
+    even if the underlying tool is in fact pytest. Not a concern for any
+    test_cmd shape in production today (all contain a literal ``pytest``
+    token).
     """
     if not cmd:
         return ToolKind.OPAQUE
@@ -3040,6 +3052,12 @@ async def run_verification(
     # recovery still hitting env_transient means it stays environmental
     # (NOT misattributed to test_failure/unknown_test_failure); recovery
     # surfacing a different category means that real signal is reported.
+    #
+    # This branch can only fire when test_cmd resolves to ToolKind.PYTEST via
+    # _tool_for_cmd (see that function's docstring) — a test command wrapped
+    # such that the parser can't see a literal `pytest` token never produces
+    # ENV_TRANSIENT and so never reaches this retry, even on a genuine
+    # shared-venv mutation. True of every production test_cmd today.
     if category == FailureCategory.ENV_TRANSIENT and test_cmd is not None:
         logger.warning(
             'Verification hit an environmental shared-venv transient '

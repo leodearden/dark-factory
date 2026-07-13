@@ -101,7 +101,10 @@ def classify_failure(tool: ToolKind, rc: int, output: str, timed_out: bool) -> F
     C1: a tool-T pattern lives ONLY in tool-T's table, so a cargo token can
     no longer swallow a pytest/rustc line by construction):
     - ``ToolKind.PYTEST`` -> ``_classify_pytest`` (notably the env_transient
-      shared-venv-mutation signatures, consulted ONLY here).
+      shared-venv-mutation signatures, consulted ONLY here — see the
+      "BEHAVIORAL NARROWING" note above ``_ENV_TRANSIENT_PATTERNS`` below for
+      the resulting constraint: the caller must resolve a command to
+      ``ToolKind.PYTEST`` for env_transient auto-recovery to ever fire).
     - ``ToolKind.CARGO_TEST`` / ``ToolKind.CARGO_CLIPPY`` -> a structured
       NDJSON parse (``_parse_cargo_json``) is attempted FIRST (Invariant C2);
       when *output* isn't detected as cargo's ``--message-format json`` NDJSON
@@ -164,6 +167,29 @@ def classify_failure(tool: ToolKind, rc: int, output: str, timed_out: bool) -> F
 # falling through to UNKNOWN_TEST_FAILURE — which also covers pytest rc=5
 # ("no tests ran", kept RED per task 1852 — see _classify_opaque's docstring
 # for the same rc=5-stays-RED contract, which applies here identically).
+#
+# BEHAVIORAL NARROWING vs. the pre-δ tool-blind ladder (intentional, tracked
+# here rather than reverted): env_transient auto-recovery is now reachable
+# ONLY when the failing check's config command lexically resolves to
+# ToolKind.PYTEST via `parse_config_command` (see verify.py's
+# `_tool_for_cmd`) — the tool-blind `_classify_failure` used to consult these
+# patterns unconditionally, for every check. A test command the parser
+# cannot identify as pytest (invoked indirectly through e.g. `make test`, a
+# shell wrapper script, or a bare tox/nox target with no literal `pytest`
+# token in the config string) resolves to ToolKind.OPAQUE instead, whose
+# ladder deliberately does NOT include these patterns (see
+# TestEnvTransientIsPytestScopedC1 in test_verify_classify.py) — so a
+# genuine mid-run shared-venv mutation behind such a wrapper would classify
+# as UNKNOWN_TEST_FAILURE rather than ENV_TRANSIENT, losing run_verification's
+# single-serial-retry auto-recovery (verify.py, gated on
+# `category == FailureCategory.ENV_TRANSIENT`) and attributing an infra
+# transient to a code regression instead. Today every production test_cmd
+# (`uv run pytest ...`, `cd sub && uv run pytest ...`, `python -m pytest`)
+# contains a literal `pytest` token and correctly resolves to PYTEST, so this
+# is a latent constraint on future config-command shapes, not a currently
+# active gap; if a wrapped/indirect test command shape is ever introduced,
+# either extend `parse_config_command` to see through the wrapper to PYTEST,
+# or revisit whether these patterns belong in the OPAQUE ladder too.
 # ---------------------------------------------------------------------------
 
 # Shared-venv mutation signatures (task 2048): a concurrent `uv sync` from
