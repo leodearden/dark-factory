@@ -76,6 +76,7 @@ def _deploy_task(
     before_done_verified_at: str | None = None,
     before_done_verified_pid: int | None = None,
     before_done_scheduled_at: dict | None = None,
+    description: str = 'Cross-unit deploy of the reify worker',
 ) -> dict:
     """Build a deterministic deploy task dict (before_done set, always_escalates=False)."""
     before_done: dict = {
@@ -102,7 +103,7 @@ def _deploy_task(
     return {
         'id': task_id,
         'title': 'Deploy orchestrator-reify',
-        'description': 'Cross-unit deploy of the reify worker',
+        'description': description,
         'metadata': metadata,
     }
 
@@ -5390,4 +5391,193 @@ class TestPredicateModeResume:
         pending = queue.get_by_task('703', status='pending')
         assert len(pending) == 1, f'Expected exactly 1 pending escalation, got {len(pending)}'
 
-        scheduler.set_task_status.assert_not_awaited()
+
+# ---------------------------------------------------------------------------
+# Step-7 (task 2509): explicit stop-instruction guard on the FIRST dispatch of
+# a non-predicate before_done (act-then-ask/deploy) task — reconciliation
+# finding 0aac21b4 (task 2407 self-authorized an irreversible mutation past an
+# explicit "do not apply" instruction).  (RED until step-8 adds the guard in
+# run()'s section 2, after the predicate dispatch and after the
+# before_done_ran_at idempotency block, BEFORE before_done_ran_at is stamped.)
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+class TestStopInstructionGuard:
+    """DeterministicRunner — hard-abort a non-predicate before_done deploy on
+    an explicit stop instruction found in the task description, mirroring the
+    task 2273 SIGTERM-kill-on-human-rehearsal-mandate precedent as a
+    self-halt rather than relying on an external kill.
+    """
+
+    async def test_stop_instruction_blocks_before_running_deploy(self, tmp_path: Path):
+        """Case A: description contains 'do not apply' -> BLOCKED, script_runner
+        and unit_inspector are NEVER awaited, no before_done_ran_at stamp."""
+        from orchestrator.deterministic_runner import DeterministicRunner
+        from orchestrator.workflow import WorkflowOutcome
+
+        task = _deploy_task(
+            task_id='400',
+            description='Investigate the failure, but do not apply any fix yet.',
+        )
+        assignment = _make_assignment(task)
+        queue = EscalationQueue(tmp_path)
+        scheduler = _mock_scheduler(task)
+
+        unit_inspector = AsyncMock()
+        script_runner = AsyncMock()
+
+        runner = DeterministicRunner(
+            scheduler=scheduler,
+            escalation_queue=queue,
+            unit_inspector=unit_inspector,
+            script_runner=script_runner,
+        )
+        outcome = await runner.run(assignment)
+
+        assert outcome == WorkflowOutcome.BLOCKED
+        script_runner.assert_not_awaited()
+        unit_inspector.assert_not_awaited()
+
+        stamp_calls = [
+            c for c in scheduler.update_task.call_args_list
+            if len(c.args) > 1 and c.args[1].get('before_done_ran_at')
+        ]
+        assert not stamp_calls, (
+            f'before_done_ran_at must NOT be stamped when the stop-instruction '
+            f'guard fires: {stamp_calls!r}'
+        )
+
+    async def test_stop_instruction_files_born_at_l2_escalation(self, tmp_path: Path):
+        """Filed escalation: category='stop_instruction', level=2, severity='critical',
+        agent_role='orchestrator-deterministic' (born-at-L2, task 2509)."""
+        from orchestrator.deterministic_runner import DeterministicRunner
+
+        task = _deploy_task(
+            task_id='400',
+            description='Investigate the failure, but do not apply any fix yet.',
+        )
+        assignment = _make_assignment(task)
+        queue = EscalationQueue(tmp_path)
+        scheduler = _mock_scheduler(task)
+
+        unit_inspector = AsyncMock()
+        script_runner = AsyncMock()
+
+        runner = DeterministicRunner(
+            scheduler=scheduler,
+            escalation_queue=queue,
+            unit_inspector=unit_inspector,
+            script_runner=script_runner,
+        )
+        await runner.run(assignment)
+
+        pending = queue.get_by_task(
+            '400', status='pending', agent_role='orchestrator-deterministic',
+        )
+        assert len(pending) == 1, f'Expected exactly 1 pending escalation, got {len(pending)}'
+        esc = pending[0]
+        assert esc.category == 'stop_instruction'
+        assert esc.level == 2
+        assert esc.severity == 'critical'
+        assert esc.agent_role == 'orchestrator-deterministic'
+
+    async def test_stop_instruction_sets_task_blocked(self, tmp_path: Path):
+        """set_task_status is called with 'blocked' (never 'done') when the
+        guard fires."""
+        from orchestrator.deterministic_runner import DeterministicRunner
+
+        task = _deploy_task(
+            task_id='400',
+            description='Investigate the failure, but do not apply any fix yet.',
+        )
+        assignment = _make_assignment(task)
+        queue = EscalationQueue(tmp_path)
+        scheduler = _mock_scheduler(task)
+
+        unit_inspector = AsyncMock()
+        script_runner = AsyncMock()
+
+        runner = DeterministicRunner(
+            scheduler=scheduler,
+            escalation_queue=queue,
+            unit_inspector=unit_inspector,
+            script_runner=script_runner,
+        )
+        await runner.run(assignment)
+
+        blocked_calls = [
+            c for c in scheduler.set_task_status.call_args_list
+            if c.args[1] == 'blocked'
+        ]
+        assert len(blocked_calls) == 1, 'set_task_status must be called once with blocked'
+        done_calls = [
+            c for c in scheduler.set_task_status.call_args_list
+            if c.args[1] == 'done'
+        ]
+        assert not done_calls, 'set_task_status must NEVER be called with done'
+
+    async def test_benign_description_regression_reaches_verified_done(self, tmp_path: Path):
+        """Case B (regression): identical task shape with a benign description
+        runs the script and reaches the normal verified-deploy done path,
+        unchanged from the pre-guard behaviour."""
+        from orchestrator.deterministic_runner import DeterministicRunner
+        from orchestrator.workflow import WorkflowOutcome
+
+        task = _deploy_task(
+            task_id='401',
+            description='Cross-unit deploy of the reify worker — routine rollout.',
+        )
+        assignment = _make_assignment(task)
+        queue = EscalationQueue(tmp_path)
+        scheduler = _mock_scheduler(task)
+
+        unit_inspector = AsyncMock(side_effect=[_BASELINE_UNIT_STATE, _FRESH_UNIT_STATE])
+        script_runner = AsyncMock(return_value=(0, 'ok'))
+
+        runner = DeterministicRunner(
+            scheduler=scheduler,
+            escalation_queue=queue,
+            unit_inspector=unit_inspector,
+            script_runner=script_runner,
+        )
+        outcome = await runner.run(assignment)
+
+        assert outcome == WorkflowOutcome.DONE
+        script_runner.assert_awaited_once_with(task['metadata']['before_done'])
+
+        pending = queue.get_by_task('401', status='pending')
+        assert len(pending) == 0, f'No escalation should be filed on a benign description: {pending}'
+
+    async def test_predicate_with_stop_instruction_still_runs(self, tmp_path: Path):
+        """Case C (predicate exclusion): a before_done.kind=='predicate' task
+        whose description contains 'do not apply' still runs the predicate —
+        the guard does not fire on read-only checks."""
+        from orchestrator.deterministic_runner import DeterministicRunner
+        from orchestrator.workflow import WorkflowOutcome
+
+        task = _predicate_task(
+            task_id='701',
+            description='Milestone predicate check — do not apply any fix without review.',
+        )
+        assignment = _make_assignment(task)
+        queue = EscalationQueue(tmp_path)
+        scheduler = _mock_scheduler(task)
+
+        script_runner = AsyncMock(return_value=(0, 'check ok: 0 flakes'))
+        unit_inspector = AsyncMock()
+
+        runner = DeterministicRunner(
+            scheduler=scheduler,
+            escalation_queue=queue,
+            unit_inspector=unit_inspector,
+            script_runner=script_runner,
+        )
+        outcome = await runner.run(assignment)
+
+        assert outcome == WorkflowOutcome.DONE
+        script_runner.assert_awaited_once_with(task['metadata']['before_done'])
+
+        pending = queue.get_by_task('701', status='pending')
+        assert len(pending) == 0, (
+            f'A predicate must not be blocked by the stop-instruction guard: {pending}'
+        )
