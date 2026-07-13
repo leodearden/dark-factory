@@ -419,14 +419,23 @@ class Violation:
 
 
 # Tempered-dot gap that refuses to cross a negation cue (not/never/n't)
-# between a rule's subject and verb — used in place of a bare `[^.]*`
-# wildcard so a CORRECTLY negated statement (e.g. "Stage 3 remediation
-# does NOT delete the flag marker") does not match as a false-premise
-# violation. premise_lint exists to flag FALSE premises; a true statement
-# of the invariant — even phrased as a negation — is not one, and matching
-# it anyway would be a false positive that rejects a correct task
-# description once wired at task ξ.
-_GAP_NO_NEGATION = r"(?:(?!\bnot\b|\bnever\b|n['’]t\b).)*"
+# OR a clause terminator (./;) between a rule's subject and verb — used in
+# place of a bare `[^.]*` wildcard so:
+#   (a) a CORRECTLY negated statement (e.g. "Stage 3 remediation does NOT
+#       delete the flag marker") does not match as a false-premise
+#       violation. premise_lint exists to flag FALSE premises; a true
+#       statement of the invariant — even phrased as a negation — is not
+#       one, and matching it anyway would be a false positive that rejects
+#       a correct task description once wired at task ξ.
+#   (b) the gap does not span across unrelated clauses in a multi-clause
+#       field. Without the `.`/`;` exclusion, a benign description like
+#       "Stage 3 processes the flag_for_stage2 marker; GC later deletes
+#       the marker on terminal task" would spuriously match ("Stage 3" ...
+#       "deletes" ... "marker") even though the sentence never asserts the
+#       false premise — the "Stage 3" and "deletes" clauses are unrelated.
+#       Stopping the gap at a clause terminator keeps subject/verb/object
+#       matches confined to a single clause.
+_GAP_NO_NEGATION = r"(?:(?!\bnot\b|\bnever\b|n['’]t\b|[.;]).)*"
 
 # Module-level rule table for premise_lint: (compiled case-insensitive
 # regex, invariant_name, detail). Each rule encodes one known-false premise
