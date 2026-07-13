@@ -237,6 +237,82 @@ def iter_self_corrections(records: list[dict[str, Any]]) -> list[dict[str, Any]]
     return hits
 
 
+NOT_FOUND_PATTERNS: tuple[str, ...] = (
+    'no such file or directory',
+    'modulenotfounderror',
+    'command not found',
+    'does not exist',
+    'not found in',
+)
+"""Matched case-insensitively against tool_result content only."""
+
+DF_GUARD_PATTERNS: tuple[str, ...] = (
+    'blocked:',
+    'darkfactorypathscopeviolation',
+    'done_gate_missing_files',
+    'known-false premise about recon internals',
+)
+"""Real dark-factory guard TRIP literals -- never the bare, lowercase
+category-name mention (e.g. ``category="scope_violation"``). Grounded in
+the actual enforcement code: PathGuardVerdict's ``DarkFactoryPathScopeViolation``
+error_type (fused_memory/middleware/path_scope_guard.py), the phantom-done
+gate's ``done_gate_missing_files`` error code
+(fused_memory/middleware/task_interceptor.py, orchestrator/scheduler.py),
+and premise_lint_guard's fixed error-message prefix. ``scope_violation`` and
+``phantom-done`` alone are common bare mentions (category labels, design-intent
+prose/docstrings) and are deliberately NOT matched."""
+
+INTERRUPT_PATTERN = 'request interrupted by user'
+"""The literal Claude-Code-injected marker for a user-interrupted tool call
+(e.g. "[Request interrupted by user for tool use]")."""
+
+
+def iter_not_found(records: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Detect NOT_FOUND_PATTERNS in tool_result content only."""
+    hits = []
+    for index, block in _iter_tool_result_blocks(records):
+        lowered = _content_to_text(block.get('content')).lower()
+        for pattern in NOT_FOUND_PATTERNS:
+            if pattern in lowered:
+                hits.append({'index': index, 'pattern': pattern})
+    return hits
+
+
+def iter_df_guards(records: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Detect DF_GUARD_PATTERNS (real trip literals) in their native carriers:
+    tool_result content, assistant text, and user-turn text (incl. isMeta
+    system injections, excluding isSidechain subagent turns)."""
+    sources: list[tuple[int, str]] = []
+    for index, block in _iter_tool_result_blocks(records):
+        sources.append((index, _content_to_text(block.get('content'))))
+    sources.extend(_assistant_text_blocks(records))
+    for index, record in enumerate(records):
+        if record.get('type') == 'user' and not record.get('isSidechain'):
+            text = _user_turn_text(_message_content(record))
+            if text:
+                sources.append((index, text))
+
+    hits = []
+    for index, text in sources:
+        lowered = text.lower()
+        for pattern in DF_GUARD_PATTERNS:
+            if pattern in lowered:
+                hits.append({'index': index, 'pattern': pattern})
+    return hits
+
+
+def iter_interrupts(records: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Detect the injected interrupt marker in non-sidechain user turns."""
+    hits = []
+    for index, record in enumerate(records):
+        if record.get('type') != 'user' or record.get('isSidechain'):
+            continue
+        text = _user_turn_text(_message_content(record))
+        if text and INTERRUPT_PATTERN in text.lower():
+            hits.append({'index': index, 'pattern': INTERRUPT_PATTERN})
+    return hits
+
+
 def iter_user_turns(records: list[dict[str, Any]]) -> list[dict[str, Any]]:
     """Return genuine non-sidechain, non-meta human user turns.
 
