@@ -1276,8 +1276,13 @@ def build_claude_argv(
 
     Returns ``(cmd, temp_files)``: ``cmd`` is the assembled argv list;
     ``temp_files`` lists the temp file paths created (empty when resuming and
-    no ``mcp_config`` is set).  The caller owns cleanup, typically via
+    no ``mcp_config`` is set).  The caller owns cleanup of a successful
+    return, typically via
     ``finally: for p in temp_files: Path(p).unlink(missing_ok=True)``.
+
+    On exception (e.g. a non-serializable ``mcp_config``), any temp files
+    already created during this call are unlinked before the exception
+    propagates — callers never need to clean up after a raised call.
     """
     cmd = ['claude', '--print', '--output-format', 'json']
 
@@ -1286,53 +1291,64 @@ def build_claude_argv(
 
     temp_files: list[str] = []
 
-    if resume_session_id:
-        # Resume an existing session — skip --system-prompt (incompatible)
-        cmd.extend(['--resume', resume_session_id])
-    else:
-        # Write system prompt to temp file to avoid ARG_MAX on large payloads
-        fd, sysprompt_path = tempfile.mkstemp(suffix='.txt', prefix='sysprompt_')
-        with open(fd, 'w') as f:
-            f.write(system_prompt)
-        temp_files.append(sysprompt_path)
-        cmd.extend(['--system-prompt-file', sysprompt_path])
-        # Pre-allocate the session UUID so future --resume can find it.
-        # --session-id and --resume are mutually exclusive at the CLI level.
-        if session_id:
-            cmd.extend(['--session-id', session_id])
+    # Everything below may create on-disk temp files before raising (e.g. a
+    # non-serializable mcp_config blowing up json.dump after the sysprompt
+    # file already exists). Track each temp file in `temp_files` the instant
+    # it's created — before writing to it — so any exception can be traced
+    # back to a clean unlink of everything created so far, leaving no
+    # orphaned temp files for the caller to worry about.
+    try:
+        if resume_session_id:
+            # Resume an existing session — skip --system-prompt (incompatible)
+            cmd.extend(['--resume', resume_session_id])
+        else:
+            # Write system prompt to temp file to avoid ARG_MAX on large payloads
+            fd, sysprompt_path = tempfile.mkstemp(suffix='.txt', prefix='sysprompt_')
+            temp_files.append(sysprompt_path)
+            with open(fd, 'w') as f:
+                f.write(system_prompt)
+            cmd.extend(['--system-prompt-file', sysprompt_path])
+            # Pre-allocate the session UUID so future --resume can find it.
+            # --session-id and --resume are mutually exclusive at the CLI level.
+            if session_id:
+                cmd.extend(['--session-id', session_id])
 
-    cmd.extend(['--permission-mode', permission_mode])
-    cmd.extend(['--max-turns', str(max_turns)])
+        cmd.extend(['--permission-mode', permission_mode])
+        cmd.extend(['--max-turns', str(max_turns)])
 
-    if effort:
-        cmd.extend(['--effort', effort])
+        if effort:
+            cmd.extend(['--effort', effort])
 
-    if allowed_tools:
-        cmd.extend(['--allowed-tools', *allowed_tools])
-    if disallowed_tools:
-        # CLI 2.1.168: ``--json-schema`` is delivered via a synthetic
-        # ``StructuredOutput`` tool that a ``'*'`` deny wildcard would block,
-        # failing every structured-output call.  When a schema IS requested,
-        # expand the wildcard into an explicit real-builtins deny-list that omits
-        # ``StructuredOutput`` — keeping "no real tool access" while letting the
-        # schema tool through.  Callers without an output_schema (e.g. judge.py)
-        # keep ``'*'`` verbatim, so all tools stay blocked.  See the deny-list
-        # constant above for the keep-in-sync caveat.
-        if output_schema and '*' in disallowed_tools:
-            disallowed_tools = [
-                t for t in disallowed_tools if t != '*'
-            ] + _REAL_BUILTIN_TOOLS_DENYLIST
-        cmd.extend(['--disallowed-tools', *disallowed_tools])
+        if allowed_tools:
+            cmd.extend(['--allowed-tools', *allowed_tools])
+        if disallowed_tools:
+            # CLI 2.1.168: ``--json-schema`` is delivered via a synthetic
+            # ``StructuredOutput`` tool that a ``'*'`` deny wildcard would block,
+            # failing every structured-output call.  When a schema IS requested,
+            # expand the wildcard into an explicit real-builtins deny-list that omits
+            # ``StructuredOutput`` — keeping "no real tool access" while letting the
+            # schema tool through.  Callers without an output_schema (e.g. judge.py)
+            # keep ``'*'`` verbatim, so all tools stay blocked.  See the deny-list
+            # constant above for the keep-in-sync caveat.
+            if output_schema and '*' in disallowed_tools:
+                disallowed_tools = [
+                    t for t in disallowed_tools if t != '*'
+                ] + _REAL_BUILTIN_TOOLS_DENYLIST
+            cmd.extend(['--disallowed-tools', *disallowed_tools])
 
-    if mcp_config:
-        fd, mcp_config_path = tempfile.mkstemp(suffix='.json', prefix='mcp_')
-        with open(fd, 'w') as f:
-            json.dump(mcp_config, f)
-        temp_files.append(mcp_config_path)
-        cmd.extend(['--mcp-config', mcp_config_path])
+        if mcp_config:
+            fd, mcp_config_path = tempfile.mkstemp(suffix='.json', prefix='mcp_')
+            temp_files.append(mcp_config_path)
+            with open(fd, 'w') as f:
+                json.dump(mcp_config, f)
+            cmd.extend(['--mcp-config', mcp_config_path])
 
-    if output_schema:
-        cmd.extend(['--json-schema', json.dumps(output_schema)])
+        if output_schema:
+            cmd.extend(['--json-schema', json.dumps(output_schema)])
+    except Exception:
+        for path in temp_files:
+            Path(path).unlink(missing_ok=True)
+        raise
 
     return cmd, temp_files
 
