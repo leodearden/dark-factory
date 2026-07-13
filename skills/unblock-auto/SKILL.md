@@ -45,9 +45,10 @@ Also scan `<worktree>/.task/reviews/` for reviewer verdict files (`*.json`).
 ### 1b. Git state (read-only commands only)
 ```bash
 git -C <worktree> log --oneline -15
-git -C <worktree> diff main..HEAD --stat
+git -C <worktree> diff $(git -C <worktree> merge-base main HEAD)..HEAD --stat
 git -C <worktree> status --porcelain
 ```
+Use the merge-base/three-dot form, not two-dot `main..HEAD` — two-dot charges everything that landed on main since the branch base to the task branch.
 
 ### 1c. Task metadata
 ```

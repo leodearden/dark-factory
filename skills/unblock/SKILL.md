@@ -89,7 +89,7 @@ get_task(id="<TASK_ID>", project_root="<PROJECT_ROOT>")
 ### 1d. Git state
 In the worktree:
 - `git log --oneline -10` — recent commits on the task branch
-- `git diff main..HEAD --stat` — scope of changes
+- `git diff $(git merge-base main HEAD)..HEAD --stat` (equivalently `git diff main...HEAD --stat`) — scope of changes; use the merge-base/three-dot form, not two-dot `main..HEAD`, which charges everything that landed on main since the branch base to the task branch
 - Whether the branch can cleanly rebase on current main
 
 ---
