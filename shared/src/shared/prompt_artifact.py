@@ -271,12 +271,35 @@ class PromptArtifactStore:
         Returns ``True`` when a pin was removed, ``False`` when there was
         nothing pinned (idempotent). Either way, the next :meth:`resolve` for
         this key returns the in-code constant.
+
+        Also prunes now-empty ancestor directories (the per-``executor_model``
+        and per-``prompt_id`` levels) up to but not including ``root``, so
+        repeated pin/unpin cycles across many models and harness versions
+        don't leave an ever-growing tree of empty directories on disk.
         """
         key_dir = self._key_dir(prompt_id, executor_model, harness_version)
-        if key_dir.exists():
-            shutil.rmtree(key_dir)
-            return True
-        return False
+        if not key_dir.exists():
+            return False
+        shutil.rmtree(key_dir)
+        self._prune_empty_ancestors(key_dir.parent)
+        return True
+
+    def _prune_empty_ancestors(self, start: Path) -> None:
+        """Remove *start* and its ancestors while empty, stopping at (not including) ``root``.
+
+        Best-effort: an ``OSError`` (directory not empty — e.g. a sibling key
+        is still pinned under it) stops the climb immediately. Pruning is
+        on-disk housekeeping, not part of :meth:`unpin`'s correctness
+        contract.
+        """
+        root = self.root.resolve()
+        current = start.resolve()
+        while current != root and root in current.parents:
+            try:
+                current.rmdir()
+            except OSError:
+                break
+            current = current.parent
 
 
 def default_artifacts_root() -> Path:

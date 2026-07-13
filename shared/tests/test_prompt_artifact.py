@@ -282,6 +282,38 @@ class TestUnpinRollback:
         # Idempotent: nothing left to unpin the second time.
         assert store.unpin('reviewer', 'claude-opus-4', 'v1') is False
 
+    def test_unpin_prunes_now_empty_parent_directories(self, tmp_path):
+        store = PromptArtifactStore(tmp_path)
+        provenance = ArtifactProvenance(**_provenance_kwargs(harness_version='v1'))
+        store.pin('reviewer', 'claude-opus-4', 'v1', heuristics='h', provenance=provenance)
+        key_dir = store._key_dir('reviewer', 'claude-opus-4', 'v1')
+        model_dir = key_dir.parent
+        prompt_dir = key_dir.parent.parent
+        assert model_dir.exists()
+        assert prompt_dir.exists()
+
+        store.unpin('reviewer', 'claude-opus-4', 'v1')
+
+        # The per-model and per-prompt_id levels are pruned once empty...
+        assert not model_dir.exists()
+        assert not prompt_dir.exists()
+        # ...but root itself is left alone.
+        assert tmp_path.exists()
+
+    def test_unpin_does_not_prune_a_directory_still_holding_a_sibling_key(self, tmp_path):
+        store = PromptArtifactStore(tmp_path)
+        provenance = ArtifactProvenance(**_provenance_kwargs(harness_version='v1'))
+        store.pin('reviewer', 'opus', 'v1', heuristics='opus-h', provenance=provenance)
+        store.pin('reviewer', 'sonnet', 'v1', heuristics='sonnet-h', provenance=provenance)
+
+        store.unpin('reviewer', 'opus', 'v1')
+
+        # 'reviewer' survives because 'sonnet' is still pinned under it.
+        prompt_dir = store._key_dir('reviewer', 'opus', 'v1').parent.parent
+        assert prompt_dir.exists()
+        sonnet_key_dir = store._key_dir('reviewer', 'sonnet', 'v1')
+        assert sonnet_key_dir.exists()
+
 
 class TestKeyIsolationAndPathSafety:
     def test_pin_is_isolated_per_model_and_per_harness(self, tmp_path):
