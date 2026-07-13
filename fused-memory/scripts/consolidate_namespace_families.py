@@ -680,12 +680,29 @@ async def count_collection_points(qdrant_client: Any, collection: str) -> int:
     """Read-only exact point count for *collection* via Qdrant's count API.
 
     Used as the guard for ``delete_empty_collection``: deletion is only
-    safe when this is exactly 0. Defensively treats a missing/falsy
-    ``.count`` as 0 rather than raising, mirroring ``count_graph_nodes``'s
-    ``result.result_set or []`` guard.
+    safe when this is exactly 0. An INDETERMINATE result -- a response
+    object with no ``.count`` attribute at all, or an explicit ``.count is
+    None`` -- RAISES (``ValueError``) rather than defaulting to 0
+    (reviewer follow-up: for a deletion guard, an unreadable count must
+    fail CLOSED and block the delete, not fail OPEN and authorize one).
+    ``run()``'s empty-collection loop already catches a raising call here
+    and reports that item UNRESOLVED, exactly like its sibling
+    ``count_graph_nodes``/``delete_junk_key`` guard, so raising is both
+    consistent with that existing handler and strictly safer than the old
+    silent-0 default. A genuine empty collection (``.count == 0``) is
+    unaffected -- 0 is a valid, DETERMINATE count, not treated as missing.
+    In practice Qdrant's count API always returns an int ``.count``, so
+    this is defensive-only.
     """
     result = await qdrant_client.count(collection_name=collection)
-    return getattr(result, 'count', 0) or 0
+    count = getattr(result, 'count', None)
+    if count is None:
+        raise ValueError(
+            f"count_collection_points: Qdrant count() for collection "
+            f"'{collection}' returned no usable .count (got {result!r}) -- "
+            'refusing to treat an indeterminate count as empty.',
+        )
+    return int(count)
 
 
 async def delete_empty_collection(qdrant_client: Any, collection: str, point_count: int) -> str:

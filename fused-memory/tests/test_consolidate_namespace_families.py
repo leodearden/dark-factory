@@ -83,9 +83,10 @@ def _make_point(
     return point
 
 
-def _make_count_result(count: int) -> MagicMock:
+def _make_count_result(count: int | None) -> MagicMock:
     """Qdrant CountResult stand-in exposing .count -- the shape returned by
-    AsyncQdrantClient.count(...)."""
+    AsyncQdrantClient.count(...). *count* may be None to simulate the
+    indeterminate-count case (see TestCountCollectionPoints)."""
     result = MagicMock()
     result.count = count
     return result
@@ -1221,6 +1222,28 @@ class TestCountCollectionPoints:
         result = await _mod.count_collection_points(client, 'fused_default')
 
         assert result == 0
+
+    @pytest.mark.asyncio
+    async def test_none_count_raises(self):
+        """An explicit .count is None (indeterminate) -- reviewer follow-up:
+        a deletion guard must fail CLOSED (raise, block the delete) rather
+        than silently defaulting to 0 (which would fail OPEN and authorize
+        delete_empty_collection on an unreadable count)."""
+        client = AsyncMock()
+        client.count = AsyncMock(return_value=_make_count_result(None))
+
+        with pytest.raises(ValueError):
+            await _mod.count_collection_points(client, 'fused_knowlive')
+
+    @pytest.mark.asyncio
+    async def test_missing_count_attribute_raises(self):
+        """A CountResult with no .count attribute at all is likewise
+        indeterminate -- raises rather than silently treating it as 0."""
+        client = AsyncMock()
+        client.count = AsyncMock(return_value=MagicMock(spec=[]))
+
+        with pytest.raises(ValueError):
+            await _mod.count_collection_points(client, 'fused_knowlive')
 
 
 # ===========================================================================
