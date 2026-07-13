@@ -4,8 +4,10 @@ from __future__ import annotations
 
 import pytest
 
+from orchestrator.agents.roles import ALL_REVIEWERS
 from orchestrator.artifacts import TaskArtifacts
 from orchestrator.mcp.verdict_tools import (
+    _SINGLETON_ROLE_TOOLS,
     _artifacts_from_args,
     _submit_completion_verdict,
     _submit_merge_disposition,
@@ -222,6 +224,29 @@ class TestCreateServer:
         assert envelope is not None
         assert envelope['role'] == 'merger'
         assert envelope['verdict'] == {'blocked': True, 'reason': 'x'}
+
+
+class TestSingletonRoleToolsDisjointFromReviewerNames:
+    """``create_server`` decides tool selection purely from
+    ``_SINGLETON_ROLE_TOOLS`` vs. "anything else" — it does not import
+    roles.py, by design (see the comment above ``_SINGLETON_ROLE_TOOLS``).
+    That decoupling means a future rename in roles.py could silently give a
+    reviewer-panel member one of the three reserved names, and
+    ``create_server`` would register the singleton tool for it instead of
+    ``submit_review_verdict`` — the ``assert role not in _SINGLETON_ROLE_TOOLS``
+    in create_server's ``else`` branch would then simply never fire for that
+    role. This test is the guard: it fails loudly at test time instead.
+    """
+
+    def test_reviewer_names_disjoint_from_singleton_roles(self):
+        reviewer_names = {reviewer.name for reviewer in ALL_REVIEWERS}
+        collisions = reviewer_names & _SINGLETON_ROLE_TOOLS
+        assert not collisions, (
+            f'reviewer-panel name(s) {collisions} collide with '
+            f'_SINGLETON_ROLE_TOOLS {set(_SINGLETON_ROLE_TOOLS)}; '
+            'create_server would silently misroute submit_review_verdict '
+            'for them'
+        )
 
 
 # ---------------------------------------------------------------------------
