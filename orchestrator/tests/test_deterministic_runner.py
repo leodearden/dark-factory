@@ -847,7 +847,10 @@ class TestCrossUnitDeployDelegatesToRestartPlan:
         from unittest.mock import patch
 
         from orchestrator.proc_supervision import (
-            FreshPidVerify, RestartDisposition, RestartOutcome, RestartPlan,
+            FreshPidVerify,
+            RestartDisposition,
+            RestartOutcome,
+            RestartPlan,
         )
 
         task = _deploy_task(task_id='960', target_unit='orchestrator-reify.service')
@@ -4365,7 +4368,10 @@ class TestDetachedRestartDelegatesToRestartPlan:
 
         from orchestrator.deterministic_runner import DeterministicRunner
         from orchestrator.proc_supervision import (
-            EscalationSpec, RestartDisposition, RestartOutcome, RestartPlan,
+            EscalationSpec,
+            RestartDisposition,
+            RestartOutcome,
+            RestartPlan,
         )
 
         queue = EscalationQueue(tmp_path)
