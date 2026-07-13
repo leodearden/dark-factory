@@ -2272,16 +2272,20 @@ class GitOps:
         never raises.  A non-zero exit is logged at WARNING and treated as
         'nothing reclaimed' by the caller (``_warm_lane_disk_admission_blocked``).
 
-        **Pool-storage guard (task 2099)**: refuses to spawn the script when
-        a pool is configured (:meth:`pool_in_use`) but :meth:`pool_storage_present`
-        is False — an unmounted mountpoint must never let the GC script
-        reclaim/reset lanes it can only see as missing.  Skipped entirely
-        when no pool is in use: ``pool_storage_present()`` is permanently
-        False on a pool-less host (its only writer never runs without a
-        pool), so that alone must never be treated as a mount-down
-        incident.  Returns the same 127 fail-soft sentinel used for an
-        absent script, so callers treat it identically to 'nothing
-        reclaimed'.
+        **Pool-storage guard (task 2099, self-heal task 2315)**: routes
+        through :meth:`_reconcile_pool_storage_before_sweep`, which refuses
+        to spawn the script when a pool is configured
+        (:meth:`pool_in_use`) but :meth:`pool_storage_present` is False AND
+        that absence is not provably a first-seed bootstrap — an unmounted
+        mountpoint must never let the GC script reclaim/reset lanes it can
+        only see as missing.  A HEALTHY mount that merely lost its sentinel
+        (:meth:`_pool_storage_bootstrap_ok` True) self-heals: the sentinel
+        is recreated and the reclaim proceeds.  Skipped entirely when no
+        pool is in use: ``pool_storage_present()`` is permanently False on
+        a pool-less host (its only writer never runs without a pool), so
+        that alone must never be treated as a mount-down incident.
+        Returns the same 127 fail-soft sentinel used for an absent script,
+        so callers treat it identically to 'nothing reclaimed'.
 
         Returns:
             0   — reclaim succeeded.
@@ -2289,13 +2293,7 @@ class GitOps:
                 sentinel).
             other non-zero — reclaim script error (caller still re-checks).
         """
-        if self.pool_in_use() and not self.pool_storage_present():
-            logger.warning(
-                '_run_warm_lane_gc_reclaim: pool storage absent/unmounted at '
-                '%s — refusing to spawn warm-lane-gc.sh reclaim',
-                self.worktree_base,
-            )
-            self._note_pool_storage_absent()
+        if not self._reconcile_pool_storage_before_sweep('_run_warm_lane_gc_reclaim'):
             return 127
         try:
             script = self.project_root / 'scripts' / 'warm-lane-gc.sh'
