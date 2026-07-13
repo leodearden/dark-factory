@@ -14,7 +14,7 @@ import { createRequire } from 'node:module';
 
 import layout from '../../src/dashboard/static/redux/graph_layout.js';
 
-const { computeTiers, countCrossings } = layout;
+const { computeTiers, partitionComponents, countCrossings } = layout;
 
 const MODULE_SPECIFIER = '../../src/dashboard/static/redux/graph_layout.js';
 const EXPECTED_FUNCTION_NAMES = [
@@ -168,4 +168,88 @@ test('countCrossings: crossings across two adjacent tier pairs sum together', ()
     { from: 'B2', to: 'C1' },
   ];
   assert.equal(countCrossings(rows, edges), 2);
+});
+
+// ---------------------------------------------------------------------------
+// partitionComponents — weakly-connected components over the in-list deps
+// edge list, plus singletons (nodes with zero in-list deps either direction).
+// Components are ordered by the earliest input index of any member; members
+// within a component (and singletons) preserve input order.
+// ---------------------------------------------------------------------------
+
+function idsOf(taskArray) {
+  return taskArray.map(t => t.id);
+}
+
+test('partitionComponents: exact partition — multi-component fixture plus isolated singletons', () => {
+  // Component X: A -> B -> C (chain). Component Y: D -> E. F, G are isolated.
+  const tasks = [
+    mkTask('A'),
+    mkTask('B', ['A']),
+    mkTask('C', ['B']),
+    mkTask('D'),
+    mkTask('E', ['D']),
+    mkTask('F'),
+    mkTask('G'),
+  ];
+  const result = partitionComponents(tasks);
+
+  assert.equal(result.components.length, 2);
+  assert.deepEqual(idsOf(result.components[0]).slice().sort(), ['A', 'B', 'C']);
+  assert.deepEqual(idsOf(result.components[1]).slice().sort(), ['D', 'E']);
+  assert.deepEqual(idsOf(result.singletons), ['F', 'G']);
+
+  // Every input task appears in exactly one bucket (exact partition).
+  const allBucketedIds = [...result.components.flatMap(idsOf), ...idsOf(result.singletons)];
+  assert.deepEqual(allBucketedIds.slice().sort(), tasks.map(t => t.id).slice().sort());
+  assert.equal(new Set(allBucketedIds).size, tasks.length);
+});
+
+test('partitionComponents: components ordered by earliest input index; members/singletons preserve input order', () => {
+  const tasks = [
+    mkTask('A'),
+    mkTask('B', ['A']),
+    mkTask('C', ['B']),
+    mkTask('D'),
+    mkTask('E', ['D']),
+    mkTask('F'),
+    mkTask('G'),
+  ];
+  const result = partitionComponents(tasks);
+
+  // Component X (earliest member A at index 0) sorts before component Y
+  // (earliest member D at index 3), and each component's members — plus the
+  // singletons list — preserve their original input order.
+  assert.deepEqual(idsOf(result.components[0]), ['A', 'B', 'C']);
+  assert.deepEqual(idsOf(result.components[1]), ['D', 'E']);
+  assert.deepEqual(idsOf(result.singletons), ['F', 'G']);
+});
+
+test('partitionComponents: deterministic across repeated calls on identical input', () => {
+  const tasks = [
+    mkTask('A'),
+    mkTask('B', ['A']),
+    mkTask('C', ['B']),
+    mkTask('D'),
+    mkTask('E', ['D']),
+    mkTask('F'),
+    mkTask('G'),
+  ];
+  const first = partitionComponents(tasks);
+  const second = partitionComponents(tasks);
+  assert.deepEqual(JSON.stringify(first), JSON.stringify(second));
+});
+
+test('partitionComponents: singleton-only input — no components, every task a singleton', () => {
+  const tasks = [mkTask('H'), mkTask('I')];
+  const result = partitionComponents(tasks);
+  assert.deepEqual(result.components, []);
+  assert.deepEqual(idsOf(result.singletons), ['H', 'I']);
+});
+
+test('partitionComponents: single-node input yields exactly one singleton', () => {
+  const tasks = [mkTask('Z')];
+  const result = partitionComponents(tasks);
+  assert.deepEqual(result.components, []);
+  assert.deepEqual(idsOf(result.singletons), ['Z']);
 });
