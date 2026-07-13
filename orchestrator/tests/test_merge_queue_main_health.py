@@ -21,6 +21,7 @@ from orchestrator.merge_queue import (
     MAIN_HEALTH_RED_REASON_PREFIX,
     MergeOutcome,
     MergeRequest,
+    _MainHealthProbeHandles,
     _build_main_health_outcome,
     _main_health_fingerprint,
     _run_post_merge_verify,
@@ -757,3 +758,96 @@ class TestMainHealthFingerprintWarning:
         assert any(
             'fingerprint' in t.lower() for t in warning_texts
         ), f'Expected WARNING to mention fingerprint; got: {warning_texts}'
+
+
+# ---------------------------------------------------------------------------
+# Task 2564 step-3: main_health_probe_handles deferral core.
+#
+# _run_post_merge_verify must return PROMPTLY with the provisional
+# task-fault outcome (not wait on the main-health probe) when
+# main_health_probe_handles is supplied, and register a live detached probe
+# task in handles.background_tasks — the fix for the reify 5067 merge-slot
+# stall (a slow synchronous probe holding verify_task, hence the merge slot
+# / host lease, for its full run).
+# ---------------------------------------------------------------------------
+
+
+class TestMainHealthDeferralCore:
+    """Step-3 (RED): main_health_probe_handles gates deferred vs synchronous
+    probing.  A never-resolving probe must not block _run_post_merge_verify's
+    return when handles are supplied."""
+
+    def test_deferred_returns_promptly_with_provisional_outcome(
+        self, tmp_path: Path,
+    ) -> None:
+        config = _make_config(tmp_path)
+        git_ops = _make_git_ops(tmp_path)
+        merge_wt = tmp_path / 'merge-wt'
+        merge_wt.mkdir()
+        req = _make_req('99', tmp_path / 'task-wt', config)
+        (tmp_path / 'task-wt').mkdir()
+
+        blocker = asyncio.Event()  # never set — the probe must not be awaited
+
+        async def _blocked_probe(*_args: object, **_kwargs: object) -> tuple[bool, str]:
+            await blocker.wait()
+            return (True, MAIN_SHA)  # pragma: no cover - never reached in this test
+
+        handles = _MainHealthProbeHandles(background_tasks=set())
+
+        async def _run() -> MergeOutcome | None:
+            with (
+                patch(
+                    'orchestrator.merge_queue.run_scoped_verification',
+                    new=AsyncMock(return_value=COMPILE_ERROR_RESULT),
+                ),
+                patch(
+                    'orchestrator.merge_queue.verify_failure_is_preexisting_on_main',
+                    new=AsyncMock(side_effect=_blocked_probe),
+                ),
+            ):
+                return await asyncio.wait_for(
+                    _run_post_merge_verify(
+                        git_ops, req, merge_wt,
+                        timeouts={},
+                        enospc_retries={},
+                        max_timeouts=3,
+                        max_enospc=1,
+                        main_health_probe_handles=handles,
+                    ),
+                    timeout=5,
+                )
+
+        try:
+            outcome = asyncio.run(_run())
+        finally:
+            # Cleanup: release + cancel the detached probe task so it doesn't
+            # leak across tests or emit an "exception never retrieved" warning.
+            for t in handles.background_tasks:
+                t.cancel()
+            blocker.set()
+
+        assert outcome is not None
+        assert outcome.reason.startswith('Post-merge verification failed'), (
+            f'Expected the prompt provisional task-fault outcome; '
+            f'got: {outcome.reason!r}'
+        )
+        assert not outcome.reason.startswith(MAIN_HEALTH_RED_REASON_PREFIX), (
+            f'Deferred mode must never return the main-health-red outcome '
+            f'inline (the probe has not resolved yet); got: {outcome.reason!r}'
+        )
+        assert outcome.failure_category == 'compile_error', (
+            f'Expected failure_category=compile_error; got {outcome.failure_category!r}'
+        )
+        assert outcome.failure_cause_hint == 'error TS2322: StatusBar.tsx', (
+            f'Expected failure_cause_hint set; got {outcome.failure_cause_hint!r}'
+        )
+
+        live_probe_tasks = [
+            t for t in handles.background_tasks
+            if t.get_name() == 'main-health-probe-99' and not t.done()
+        ]
+        assert len(live_probe_tasks) == 1, (
+            f'Expected exactly one live main-health-probe task registered in '
+            f'handles.background_tasks; got {handles.background_tasks}'
+        )
