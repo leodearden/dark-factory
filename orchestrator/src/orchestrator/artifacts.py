@@ -142,7 +142,7 @@ def _validate_verdict_role(role: str) -> None:
         ValueError: if *role* contains anything other than letters, digits,
             underscores, or hyphens.
     """
-    if not _VALID_VERDICT_ROLE_RE.match(role):
+    if not _VALID_VERDICT_ROLE_RE.fullmatch(role):
         raise ValueError(
             f'invalid verdict role {role!r}: must match '
             f'{_VALID_VERDICT_ROLE_RE.pattern!r}'

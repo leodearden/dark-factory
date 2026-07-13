@@ -560,7 +560,7 @@ class TestVerdicts:
         artifacts.clear_verdict('judge')  # must not raise
         artifacts.clear_verdict('judge')  # still idempotent
 
-    @pytest.mark.parametrize('bad_role', ['../escape', 'a/b', '..', '.', '/etc/passwd'])
+    @pytest.mark.parametrize('bad_role', ['../escape', 'a/b', '..', '.', '/etc/passwd', 'judge\n'])
     def test_write_verdict_rejects_unsafe_role(self, artifacts: TaskArtifacts, bad_role):
         with pytest.raises(ValueError, match='invalid verdict role'):
             artifacts.write_verdict(bad_role, {'role': bad_role})
@@ -568,12 +568,12 @@ class TestVerdicts:
         assert not any(artifacts.root.rglob('escape*'))
         assert not any(artifacts.root.rglob('passwd*'))
 
-    @pytest.mark.parametrize('bad_role', ['../escape', 'a/b', '..', '.', '/etc/passwd'])
+    @pytest.mark.parametrize('bad_role', ['../escape', 'a/b', '..', '.', '/etc/passwd', 'judge\n'])
     def test_read_verdict_rejects_unsafe_role(self, artifacts: TaskArtifacts, bad_role):
         with pytest.raises(ValueError, match='invalid verdict role'):
             artifacts.read_verdict(bad_role)
 
-    @pytest.mark.parametrize('bad_role', ['../escape', 'a/b', '..', '.', '/etc/passwd'])
+    @pytest.mark.parametrize('bad_role', ['../escape', 'a/b', '..', '.', '/etc/passwd', 'judge\n'])
     def test_clear_verdict_rejects_unsafe_role(self, artifacts: TaskArtifacts, bad_role):
         with pytest.raises(ValueError, match='invalid verdict role'):
             artifacts.clear_verdict(bad_role)
