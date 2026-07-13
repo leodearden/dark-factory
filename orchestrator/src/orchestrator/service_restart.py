@@ -139,9 +139,17 @@ async def schedule_detached_systemd_restart(
     script_args:
         Extra positional args appended after the script path (e.g. ``['--drain']``).
     project_root:
-        Absolute root of the project repo (``str`` or ``Path`` — e.g.
-        ``Config.project_root`` is a ``Path``); the script path is resolved
-        as ``Path(project_root) / script``.
+        Root of the project repo (``str`` or ``Path`` — e.g.
+        ``Config.project_root`` is a ``Path``). Resolved to an absolute path
+        here (``Path(project_root).resolve()``) regardless of what is passed
+        in — ``RestartPlan.__post_init__`` (task 2237) raises ``ValueError``
+        on a non-absolute ``cwd``, so a relative *project_root* must never
+        reach it unresolved (mirrors ``StaleServiceRestartCoordinator``'s own
+        ``project_root`` normalization for the same reason: an unresolved
+        relative value would turn every registration attempt into a
+        permanent ``ValueError`` that ``maybe_restart`` misclassifies as
+        transient and retries forever). The script path is then resolved as
+        ``resolved_project_root / script``.
     transient_unit:
         Name of the transient systemd-run unit (e.g.
         ``orch-selfrestart-on-merge-3.service``).
@@ -170,7 +178,11 @@ async def schedule_detached_systemd_restart(
     plan = RestartPlan(
         script=Path(script),
         args=list(script_args),
-        cwd=Path(project_root),
+        # .resolve() (not a bare Path(...)) so a relative project_root can
+        # never reach RestartPlan.__post_init__, which raises ValueError on
+        # a non-absolute cwd (task 2237) — see the project_root docstring
+        # above (amendment: reviewer_comprehensive).
+        cwd=Path(project_root).resolve(),
         target_unit=transient_unit,
         own_unit=transient_unit,
         on_failure_escalation=on_failure_escalation,

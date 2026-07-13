@@ -1318,6 +1318,45 @@ async def test_schedule_detached_systemd_restart_without_escalation_builds_unbra
     assert 'escalation submit' not in wrapped
 
 
+@pytest.mark.asyncio
+async def test_schedule_detached_systemd_restart_resolves_relative_project_root() -> None:
+    """A relative project_root must not reach RestartPlan unresolved.
+
+    RestartPlan.__post_init__ (task 2237) raises ValueError on a
+    non-absolute cwd. schedule_detached_systemd_restart previously passed
+    cwd=Path(project_root) straight through unresolved — a relative or
+    mis-set project_root would turn every self-restart registration into a
+    raised ValueError, which maybe_restart's `except Exception` branch
+    misclassifies as a transient executor failure and retries forever,
+    never actually restarting. This is the same trap
+    StaleServiceRestartCoordinator was hardened against (see
+    test_relative_project_root_is_resolved_to_absolute above) — this is the
+    sibling module-level entry point (amendment: reviewer_comprehensive).
+    """
+    from orchestrator.service_restart import schedule_detached_systemd_restart
+
+    runner = _RecordingRunner(returncode=0)
+
+    # Must not raise — a relative project_root is resolved defensively at
+    # the seam, mirroring the coordinator's Path(...).resolve() fix.
+    await schedule_detached_systemd_restart(
+        script='scripts/restart-orchestrator.sh',
+        script_args=[],
+        project_root='relative/project/dir',
+        transient_unit='orch-selfrestart-on-merge-4.service',
+        on_active_secs=10,
+        runner=runner,
+    )
+
+    assert len(runner.calls) == 1
+    argv, _kwargs = runner.calls[0]
+    resolved = Path('relative/project/dir').resolve()
+    working_dir_arg = next(a for a in argv if str(a).startswith('--working-directory='))
+    assert working_dir_arg == f'--working-directory={resolved}'
+    wrapped = argv[-1]
+    assert wrapped.startswith(str(resolved / 'scripts/restart-orchestrator.sh'))
+
+
 # ---------------------------------------------------------------------------
 # U2 (task 1973): restart_precondition gate on StaleServiceRestartCoordinator
 # ---------------------------------------------------------------------------
