@@ -7,10 +7,19 @@
 # C9b weight editor. Keep the two in sync.
 
 severity_weights:
+  # The escalation vocabulary (info|blocking|critical|urgent, see
+  # escalation/src/escalation/models.py) is ordered urgent>=critical>
+  # blocking>info so a C8-filed decision's real severity actually
+  # differentiates the queue (Fleet Cockpit F7). high/medium/low are
+  # legacy/test-only buckets -- no production caller emits them -- kept
+  # only for backward compatibility with existing tests/hand-edited files.
+  urgent: 6.0
   critical: 5.0
   high: 3.0
+  blocking: 2.5
   medium: 1.5
   low: 0.5
+  info: 0.25
 
 category_weights:
   security: 2.0
@@ -21,12 +30,26 @@ category_weights:
 project_weights: {}
 
 defaults:
+  # severity is the fallback used whenever an item's severity is '' /
+  # unmapped -- every session (session scoring never carries a severity,
+  # even for a session with a real pending question) and any legacy
+  # decision filed before the F7 --severity flag existed. It's placed
+  # deliberately ABOVE severity_weights.info (0.25): missing severity data
+  # is not the same signal as an operator explicitly tagging a decision
+  # 'info' (a deliberate "this is lowest-priority" park), so "unknown"
+  # intentionally outranks an explicit "info" tag. See
+  # cockpit.priority.Defaults' docstring and
+  # test_priority.py::TestSeverityVocabulary's ordering pin.
   severity: 1.0
   category: 0.5
   project: 0.0
 
 age_curve:
-  max_bonus: 2.0
+  # max_bonus is capped below the severity spread so age is a same-severity
+  # tiebreaker, not a term that can swamp a real severity signal (Fleet
+  # Cockpit F7 fix 3) -- a 5-day-old zombie must not outrank a fresh
+  # blocking/critical/urgent ask.
+  max_bonus: 0.75
   saturation_seconds: 604800  # 7 days
 
 manual_boost:

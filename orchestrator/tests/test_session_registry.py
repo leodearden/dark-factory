@@ -268,6 +268,7 @@ def _make_decision(**overrides: object) -> sr.DecisionRecord:
         'options': ['yes', 'no'],
         'manual_boost': 2,
         'state': 'answered',
+        'severity': 'critical',
     }
     fields.update(overrides)
     return sr.DecisionRecord(**fields)
@@ -311,6 +312,34 @@ def test_decision_record_defaults() -> None:
     )
     assert d.manual_boost == 0
     assert d.state == sr.DecisionState.OPEN
+    assert d.severity == ''
+
+
+def test_decision_record_to_dict_includes_severity() -> None:
+    d = _make_decision(severity='blocking')
+    assert d.to_dict()['severity'] == 'blocking'
+
+
+def test_decision_record_parses_pre_severity_dict_additive() -> None:
+    """A decision dict written before the severity field existed -- containing
+    none of the severity key -- must still parse via from_dict without
+    raising, defaulting severity to '' (migration-free additive contract,
+    mirrors test_session_record_parses_rail_vintage_dict_migration_free).
+    """
+    pre_severity = {
+        'id': 'dec-1',
+        'project': 'df',
+        'text': 'approve?',
+        'filed_at': '2026-07-07T00:00:00+00:00',
+        'session_id': 'unblock-df-2085-4242',
+        'task_id': '2085',
+        'escalation_id': 'esc-1',
+        'options': ['yes', 'no'],
+        'manual_boost': 2,
+        'state': 'answered',
+    }
+    record = sr.DecisionRecord.from_dict(pre_severity)
+    assert record.severity == ''
 
 
 def test_decision_path_for_id_under_decisions_dir(tmp_path: Path) -> None:
@@ -1859,6 +1888,52 @@ def test_main_write_decision_files_open_record(
     assert rec.session_id == 'watcher-df-99'
     assert rec.state == sr.DecisionState.OPEN
     assert rec.filed_at != ''
+
+
+def test_main_write_decision_stamps_severity(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """A watcher's park moment supplies the escalation's severity so the
+    cockpit decision queue can weight this ask (Fleet Cockpit F7 fix 1).
+    """
+    monkeypatch.setenv('CLAUDE_FLEET_ROOT', str(tmp_path))
+
+    rc = sr.main(
+        [
+            'write-decision',
+            '--id',
+            'dec-sev',
+            '--project',
+            'df',
+            '--text',
+            'q',
+            '--severity',
+            'critical',
+        ]
+    )
+
+    assert rc == 0
+    listed = sr.list_decisions(root=tmp_path)
+    assert len(listed) == 1
+    assert listed[0].severity == 'critical'
+
+
+def test_main_write_decision_severity_defaults_empty(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """Omitting --severity yields severity='' on the filed record (a watcher
+    that doesn't know/supply a severity still files a well-formed decision).
+    """
+    monkeypatch.setenv('CLAUDE_FLEET_ROOT', str(tmp_path))
+
+    rc = sr.main(['write-decision', '--id', 'dec-nosev', '--project', 'df', '--text', 'q'])
+
+    assert rc == 0
+    listed = sr.list_decisions(root=tmp_path)
+    assert len(listed) == 1
+    assert listed[0].severity == ''
 
 
 def test_main_write_decision_prints_filed_id(

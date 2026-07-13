@@ -335,6 +335,12 @@ class DecisionRecord:
     manual_boost: an operator-assigned priority nudge; defaults to 0.
     state: current lifecycle state; see DecisionState. Defaults to
         ``DecisionState.OPEN``.
+    severity: the parked escalation's severity (info|blocking|critical|
+        urgent), used by the cockpit decision queue to weight this ask
+        relative to other rows. Defaults to '' (unknown/unset) when the
+        filer doesn't supply one or the record predates this field; ''
+        falls back to the scoring defaults.severity weight rather than
+        raising or coercing to a recognized value.
 
     Concurrency: unlike SessionRecord (single-writer-per-slug -- only the
     spawning session ever mutates its own record), a single decision id's
@@ -359,6 +365,7 @@ class DecisionRecord:
     options: list[str] | None = field(default=None, kw_only=True)
     manual_boost: int = field(default=0, kw_only=True)
     state: str = field(default=DecisionState.OPEN, kw_only=True)
+    severity: str = field(default='', kw_only=True)
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -372,6 +379,7 @@ class DecisionRecord:
             'options': self.options,
             'manual_boost': self.manual_boost,
             'state': str(self.state),
+            'severity': self.severity,
         }
 
     @classmethod
@@ -387,6 +395,7 @@ class DecisionRecord:
             options=data.get('options'),
             manual_boost=data.get('manual_boost', 0),
             state=data.get('state', DecisionState.OPEN),
+            severity=data.get('severity', ''),
         )
 
     def to_json(self) -> str:
@@ -1487,6 +1496,7 @@ def _run_write_decision(
     task_id: str | None,
     escalation_id: str | None,
     session_id: str | None,
+    severity: str = '',
 ) -> None:
     """Run the ``write-decision`` verb (Fleet Cockpit C8: park-to-registry).
 
@@ -1497,6 +1507,11 @@ def _run_write_decision(
     files open decisions; state transitions are the cockpit's job via
     update_decision_state). Root resolves via $CLAUDE_FLEET_ROOT, same as
     every other verb.
+
+    ``severity`` threads the parked escalation's severity (info|blocking|
+    critical|urgent) onto the record so the cockpit decision queue can
+    weight this ask (Fleet Cockpit F7 fix 1); defaults to '' when the
+    caller doesn't supply one.
 
     On success, prints the filed record's id (mirrors `launching` printing
     the record dir and `lease-claim` printing `decision=`) so the caller can
@@ -1519,6 +1534,7 @@ def _run_write_decision(
         task_id=task_id,
         escalation_id=escalation_id,
         session_id=session_id,
+        severity=severity,
     )
     if write_decision(record):
         print(record.id)
@@ -1580,6 +1596,11 @@ def _build_parser() -> argparse.ArgumentParser:
     write_decision_p.add_argument('--task-id', default=None)
     write_decision_p.add_argument('--escalation-id', default=None)
     write_decision_p.add_argument('--session-id', default=None)
+    write_decision_p.add_argument(
+        '--severity',
+        default='',
+        help='escalation severity to weight this ask (info|blocking|critical|urgent)',
+    )
 
     return parser
 
@@ -1616,7 +1637,13 @@ def main(argv: list[str] | None = None) -> int:
             _run_lease_reap()
         elif args.verb == 'write-decision':
             _run_write_decision(
-                args.id, args.project, args.text, args.task_id, args.escalation_id, args.session_id
+                args.id,
+                args.project,
+                args.text,
+                args.task_id,
+                args.escalation_id,
+                args.session_id,
+                args.severity,
             )
     except Exception:
         logger.error('session_registry %s failed', args.verb, exc_info=True)

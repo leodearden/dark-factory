@@ -9,9 +9,11 @@ every later implementation step.
 
 from __future__ import annotations
 
+import logging
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 
+import yaml
 from hypothesis import given
 from hypothesis import strategies as st
 
@@ -267,6 +269,28 @@ class TestMonotonicAge:
 
         assert score(skewed, weights, _NOW) == score(zero_age, weights, _NOW)
 
+    def test_session_vs_session_age_ordering_still_monotonic_under_reduced_max_bonus(self):
+        """F7 amendment: age_curve.max_bonus was cut 2.0 -> 0.75 globally
+        (score() has no decision-vs-session branch, so every scoreable item
+        is affected, not just the decision-vs-stale-session case the fix
+        targeted). Pin that pure session-vs-session age ordering -- both
+        items share session_to_scoring_item's severity='' / category=''
+        mapping, differing only in age -- is still strictly monotonic under
+        the new, smaller max_bonus.
+        """
+        from cockpit.priority import Priorities, score
+
+        weights = Priorities.default()
+        assert weights.age_curve.max_bonus == 0.75  # guards the value this test pins against
+        older_session = _make_item(
+            severity='', category='', state='open', filed_at=_NOW - timedelta(days=8)
+        )
+        newer_session = _make_item(
+            severity='', category='', state='open', filed_at=_NOW - timedelta(hours=1)
+        )
+
+        assert score(older_session, weights, _NOW) > score(newer_session, weights, _NOW)
+
 
 class TestTimezoneHandling:
     def test_naive_filed_at_assumed_utc(self):
@@ -382,3 +406,127 @@ class TestDroppedBelowOpen:
         )
 
         assert score(dropped, weights, _NOW) < score(near_zero_open, weights, _NOW)
+
+
+class TestSeverityVocabulary:
+    """Fleet Cockpit F7 fix 2: severity_weights must cover the escalation
+    vocabulary (info|blocking|critical|urgent, escalation/src/escalation/
+    models.py) so a real decision severity actually differentiates score(),
+    and fix 3: the age term must no longer be able to swamp that signal.
+    """
+
+    def test_default_severity_weights_cover_escalation_vocabulary(self):
+        from cockpit.priority import Priorities
+
+        weights = Priorities.default().severity_weights
+
+        assert 'urgent' in weights
+        assert 'critical' in weights
+        assert 'blocking' in weights
+        assert 'info' in weights
+        assert weights['urgent'] >= weights['critical']
+        assert weights['critical'] > weights['blocking']
+        assert weights['blocking'] > weights['info']
+        assert weights['info'] > 0
+
+    def test_fresh_high_severity_outscores_saturated_default_severity(self):
+        """A brand-new 'blocking' ask must outscore a no-severity item that has
+        fully saturated the age bonus -- proving the age term can no longer
+        swamp a real severity signal (the F7 root cause).
+        """
+        from cockpit.priority import Priorities, score
+
+        weights = Priorities.default()
+        fresh_blocking = _make_item(severity='blocking', state='open', filed_at=_NOW)
+        saturated_default = _make_item(
+            severity='', state='open', filed_at=_NOW - timedelta(days=30)
+        )
+
+        assert score(fresh_blocking, weights, _NOW) > score(saturated_default, weights, _NOW)
+
+    def test_unmapped_severity_ranks_above_explicit_info_by_design(self):
+        """Defaults.severity (used when severity is '' / unmapped -- every
+        session via session_to_scoring_item, even one with a real pending
+        question, or a legacy no-severity decision) intentionally sits
+        ABOVE severity_weights['info'], the lowest rung of the explicit
+        escalation vocabulary. Absence of severity data is a missing-data
+        signal, not the same thing as an operator explicitly tagging a
+        decision 'info' (a deliberate "this is lowest-priority" park) --
+        so "unknown" must not be treated as even less urgent than an
+        explicit low-priority tag. Pins the ordering (F7 amendment review)
+        so a future weight edit can't silently invert it.
+        """
+        from cockpit.priority import Priorities
+
+        weights = Priorities.default()
+
+        assert weights.defaults.severity > weights.severity_weights['info']
+
+
+class TestSeverityWeightsVocabularyWarning:
+    """F7 amendment (reviewer_comprehensive robustness suggestion): an
+    operator's own already-materialized priorities.yaml is never migrated
+    (ensure_priorities_file never rewrites an existing file, and
+    _weight_table uses an explicit severity_weights section verbatim -- see
+    both docstrings). If that file predates the F7 vocabulary, load_priorities
+    can't fix it silently, but it must at least warn instead of letting
+    urgent/critical/blocking/info silently fall back to defaults.severity.
+    """
+
+    def test_warns_when_existing_severity_weights_missing_escalation_vocabulary(
+        self, tmp_path, caplog
+    ):
+        from cockpit.priority import load_priorities
+
+        custom_path = tmp_path / 'priorities.yaml'
+        # A pre-F7 file: an explicit severity_weights section with none of
+        # the newly-added escalation-vocabulary keys.
+        custom_path.write_text(
+            yaml.safe_dump({'severity_weights': {'high': 3.0, 'medium': 1.5, 'low': 0.5}})
+        )
+
+        with caplog.at_level(logging.WARNING):
+            load_priorities(custom_path)
+
+        warnings = [r.message for r in caplog.records if r.levelno == logging.WARNING]
+        assert any('severity_weights' in msg and 'urgent' in msg for msg in warnings), (
+            f'Expected a WARNING naming the missing escalation vocabulary; got: {warnings}'
+        )
+
+    def test_does_not_warn_when_severity_weights_section_absent(self, tmp_path, caplog):
+        """No severity_weights section at all falls back wholesale to the
+        bundled (vocabulary-complete) table -- see _weight_table -- so no
+        warning should fire."""
+        from cockpit.priority import load_priorities
+
+        custom_path = tmp_path / 'priorities.yaml'
+        custom_path.write_text(yaml.safe_dump({'category_weights': {'bug': 1.0}}))
+
+        with caplog.at_level(logging.WARNING):
+            load_priorities(custom_path)
+
+        assert not any(r.levelno == logging.WARNING for r in caplog.records)
+
+    def test_does_not_warn_when_full_vocabulary_present(self, tmp_path, caplog):
+        """An operator file already covering the full vocabulary (whatever the
+        actual weights) must not trip the warning."""
+        from cockpit.priority import load_priorities
+
+        custom_path = tmp_path / 'priorities.yaml'
+        custom_path.write_text(
+            yaml.safe_dump(
+                {
+                    'severity_weights': {
+                        'urgent': 6.0,
+                        'critical': 5.0,
+                        'blocking': 2.5,
+                        'info': 0.25,
+                    }
+                }
+            )
+        )
+
+        with caplog.at_level(logging.WARNING):
+            load_priorities(custom_path)
+
+        assert not any(r.levelno == logging.WARNING for r in caplog.records)

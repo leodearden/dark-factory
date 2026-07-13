@@ -54,12 +54,16 @@ def _parse_timestamp(raw: str | None, now: datetime) -> datetime:
 def decision_to_scoring_item(decision: DecisionRecord, *, now: datetime) -> ScoringItem:
     """Map a C1 DecisionRecord onto a C3 ScoringItem.
 
-    severity/category are left as '' (DecisionRecord carries neither) so
-    score() falls back to its configured defaults for both. state is copied
-    through verbatim -- order_queue is what filters to state=='open'.
+    severity is threaded through from decision.severity (the parked
+    escalation's severity -- info|blocking|critical|urgent, or '' when
+    unknown) so score() weights a real ask instead of always falling back
+    to its default (Fleet Cockpit F7). category is left as '' (DecisionRecord
+    carries no category) so score() falls back to its configured default
+    there. state is copied through verbatim -- order_queue is what filters
+    to state=='open'.
     """
     return ScoringItem(
-        severity='',
+        severity=decision.severity,
         category='',
         project=decision.project,
         filed_at=_parse_timestamp(decision.filed_at, now),
