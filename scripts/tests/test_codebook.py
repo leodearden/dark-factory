@@ -354,3 +354,83 @@ def test_validate_coding_record_invariant_violated_accepts_null():
     record = _well_formed_record()
     record["matches"][0]["invariant_violated"] = None
     assert mod.validate_coding_record(record) == []
+
+
+# ---------------------------------------------------------------------------
+# step-9: RED (§8.2 idempotency, match path) — apply_coding_record()
+# ---------------------------------------------------------------------------
+
+def _codebook_with_entry_a() -> dict:
+    codebook = _minimal_v2()
+    codebook["entries"][0]["id"] = "entry-a"
+    return codebook
+
+
+def _match_record(entry_id="entry-a", session="sess-1", date="2026-07-14"):
+    return {
+        "session": session,
+        "date": date,
+        "project": "dark_factory",
+        "agent_class": "orchestrated-task",
+        "matches": [
+            {
+                "entry_id": entry_id,
+                "origin_phase": "implement",
+                "manifested_phase": "merge",
+                "invariant_violated": None,
+            }
+        ],
+    }
+
+
+def test_apply_coding_record_appends_one_sighting():
+    codebook = _codebook_with_entry_a()
+    record = _match_record()
+
+    result, stats = mod.apply_coding_record(codebook, record)
+
+    entry = next(e for e in result["entries"] if e["id"] == "entry-a")
+    assert entry["sightings"] == [
+        {
+            "date": "2026-07-14",
+            "project": "dark_factory",
+            "session": "sess-1",
+            "origin_phase": "implement",
+            "manifested_phase": "merge",
+        }
+    ]
+    assert mod.validate(result) == []
+
+
+def test_apply_coding_record_match_is_idempotent_on_session_and_entry():
+    codebook = _codebook_with_entry_a()
+    record = _match_record()
+
+    once, _ = mod.apply_coding_record(codebook, record)
+    twice, _ = mod.apply_coding_record(once, record)
+
+    entry = next(e for e in twice["entries"] if e["id"] == "entry-a")
+    assert len(entry["sightings"]) == 1
+    assert mod.validate(twice) == []
+
+
+def test_apply_coding_record_unknown_entry_id_is_skipped_and_counted():
+    codebook = _codebook_with_entry_a()
+    record = _match_record(entry_id="entry-zzz")
+
+    result, stats = mod.apply_coding_record(codebook, record)
+
+    assert len(result["entries"]) == 1  # no entry fabricated
+    assert result["entries"][0]["sightings"] == []
+    assert stats["skipped_unknown_entry"] == 1
+    assert mod.validate(result) == []
+
+
+def test_apply_coding_record_does_not_mutate_input():
+    codebook = _codebook_with_entry_a()
+    original = copy.deepcopy(codebook)
+    record = _match_record()
+
+    mod.apply_coding_record(codebook, record)
+
+    assert codebook == original
