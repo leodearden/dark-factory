@@ -9,9 +9,11 @@ every later implementation step.
 
 from __future__ import annotations
 
+import logging
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 
+import yaml
 from hypothesis import given
 from hypothesis import strategies as st
 
@@ -459,3 +461,72 @@ class TestSeverityVocabulary:
         weights = Priorities.default()
 
         assert weights.defaults.severity > weights.severity_weights['info']
+
+
+class TestSeverityWeightsVocabularyWarning:
+    """F7 amendment (reviewer_comprehensive robustness suggestion): an
+    operator's own already-materialized priorities.yaml is never migrated
+    (ensure_priorities_file never rewrites an existing file, and
+    _weight_table uses an explicit severity_weights section verbatim -- see
+    both docstrings). If that file predates the F7 vocabulary, load_priorities
+    can't fix it silently, but it must at least warn instead of letting
+    urgent/critical/blocking/info silently fall back to defaults.severity.
+    """
+
+    def test_warns_when_existing_severity_weights_missing_escalation_vocabulary(
+        self, tmp_path, caplog
+    ):
+        from cockpit.priority import load_priorities
+
+        custom_path = tmp_path / 'priorities.yaml'
+        # A pre-F7 file: an explicit severity_weights section with none of
+        # the newly-added escalation-vocabulary keys.
+        custom_path.write_text(
+            yaml.safe_dump({'severity_weights': {'high': 3.0, 'medium': 1.5, 'low': 0.5}})
+        )
+
+        with caplog.at_level(logging.WARNING):
+            load_priorities(custom_path)
+
+        warnings = [r.message for r in caplog.records if r.levelno == logging.WARNING]
+        assert any('severity_weights' in msg and 'urgent' in msg for msg in warnings), (
+            f'Expected a WARNING naming the missing escalation vocabulary; got: {warnings}'
+        )
+
+    def test_does_not_warn_when_severity_weights_section_absent(self, tmp_path, caplog):
+        """No severity_weights section at all falls back wholesale to the
+        bundled (vocabulary-complete) table -- see _weight_table -- so no
+        warning should fire."""
+        from cockpit.priority import load_priorities
+
+        custom_path = tmp_path / 'priorities.yaml'
+        custom_path.write_text(yaml.safe_dump({'category_weights': {'bug': 1.0}}))
+
+        with caplog.at_level(logging.WARNING):
+            load_priorities(custom_path)
+
+        assert not any(r.levelno == logging.WARNING for r in caplog.records)
+
+    def test_does_not_warn_when_full_vocabulary_present(self, tmp_path, caplog):
+        """An operator file already covering the full vocabulary (whatever the
+        actual weights) must not trip the warning."""
+        from cockpit.priority import load_priorities
+
+        custom_path = tmp_path / 'priorities.yaml'
+        custom_path.write_text(
+            yaml.safe_dump(
+                {
+                    'severity_weights': {
+                        'urgent': 6.0,
+                        'critical': 5.0,
+                        'blocking': 2.5,
+                        'info': 0.25,
+                    }
+                }
+            )
+        )
+
+        with caplog.at_level(logging.WARNING):
+            load_priorities(custom_path)
+
+        assert not any(r.levelno == logging.WARNING for r in caplog.records)

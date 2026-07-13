@@ -242,6 +242,41 @@ def _priorities_from_dict(data: dict[str, Any]) -> Priorities:
     )
 
 
+_ESCALATION_SEVERITIES = ('urgent', 'critical', 'blocking', 'info')
+
+
+def _warn_if_severity_weights_missing_escalation_vocabulary(
+    severity_weights: dict[str, float], source: Path
+) -> None:
+    """Log a WARNING if *severity_weights* (as loaded from *source*) omits any
+    of the escalation vocabulary (urgent/critical/blocking/info).
+
+    ``_weight_table`` only substitutes the bundled table when a section is
+    absent/non-mapping (see its docstring) -- an operator's own
+    already-materialized ``~/.claude/fleet/priorities.yaml``, written before
+    this vocabulary was added to ``Priorities.default()``, has its OWN
+    explicit ``severity_weights`` mapping, used verbatim, so the newly-added
+    keys are never top-up-merged into it. A decision carrying one of those
+    severities then silently falls back to ``defaults.severity``, so the
+    Fleet Cockpit F7 symptom (a stale content-less row swamping a real ask)
+    persists for that install even though the bundled defaults/code were
+    fixed. ``ensure_priorities_file`` never rewrites an existing file (by
+    design -- it must never clobber operator edits), so there is no
+    automatic migration; this warning is the stopgap that surfaces the gap.
+    """
+    missing = [s for s in _ESCALATION_SEVERITIES if s not in severity_weights]
+    if missing:
+        logger.warning(
+            'load_priorities: %s severity_weights is missing escalation-vocabulary '
+            'key(s) %s -- decisions with those severities fall back to '
+            'defaults.severity and may be outranked by stale content-less rows. '
+            'Add these keys (see priorities.default.yaml) to pick up the Fleet '
+            'Cockpit F7 ranking fix.',
+            source,
+            missing,
+        )
+
+
 def load_priorities(path: Path | None = None) -> Priorities:
     """Load Priorities from *path* (default ``~/.claude/fleet/priorities.yaml``).
 
@@ -249,6 +284,15 @@ def load_priorities(path: Path | None = None) -> Priorities:
     dependency): a missing user file silently falls back to the
     package-bundled defaults; a malformed user file falls back to the same
     defaults with a logged WARNING. This function never raises.
+
+    An existing user file is never migrated: its own explicit
+    ``severity_weights`` section (if present) is used verbatim (see
+    ``_weight_table``), not top-up-merged with newly-added bundled keys. If
+    that section is missing any of the escalation vocabulary
+    (urgent/critical/blocking/info), this logs a WARNING -- see
+    ``_warn_if_severity_weights_missing_escalation_vocabulary`` -- since a
+    decision with one of those severities would otherwise silently score at
+    ``defaults.severity`` instead of its real weight.
     """
     target = path if path is not None else _default_priorities_path()
 
@@ -268,7 +312,9 @@ def load_priorities(path: Path | None = None) -> Priorities:
             )
             return Priorities.default()
 
-        return _priorities_from_dict(data)
+        priorities = _priorities_from_dict(data)
+        _warn_if_severity_weights_missing_escalation_vocabulary(priorities.severity_weights, target)
+        return priorities
 
     return _priorities_from_dict(_load_bundled_defaults())
 
