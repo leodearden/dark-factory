@@ -19,6 +19,7 @@ from orchestrator.event_store import EventStore
 from orchestrator.git_ops import GitOps
 from orchestrator.merge_queue import (
     MAIN_HEALTH_RED_REASON_PREFIX,
+    TRANSIENT_INFRA_REASON_PREFIX,
     MergeOutcome,
     MergeRequest,
     _MainHealthProbeHandles,
@@ -27,6 +28,10 @@ from orchestrator.merge_queue import (
     _run_post_merge_verify,
 )
 from orchestrator.verify import _PROBE_CACHE, VerifyResult
+from orchestrator.verify_runner import (
+    FLOCK_CONTENTION_CATEGORY,
+    UNSCOPED_TYPECHECK_FAILED_CATEGORY,
+)
 
 MAIN_SHA = 'cafecafe1234567890deadbeef'
 
@@ -853,4 +858,164 @@ class TestMainHealthDeferralCore:
         assert len(live_probe_tasks) == 1, (
             f'Expected exactly one live main-health-probe task registered in '
             f'handles.background_tasks; got {live_probe_tasks}'
+        )
+
+
+# ---------------------------------------------------------------------------
+# Step-7: sync-path byte-identity + sentinel-branch preservation with
+# main_health_probe_handles supplied.
+# ---------------------------------------------------------------------------
+
+
+# Mirror test_merge_queue_dry_run_unblock.py's sentinel VerifyResult fixtures
+# (cannot import them directly — that module imports FROM this one, so a
+# reverse import would be circular).
+FLOCK_CONTENTION_RESULT = VerifyResult(
+    passed=False,
+    test_output='',
+    lint_output='',
+    type_output='',
+    summary='flock contention',
+    category=FLOCK_CONTENTION_CATEGORY,
+    contention={'host': 'laptop1', 'holder_pgid': 123, 'waiter_pgid': 456},
+)
+
+UNSCOPED_TYPECHECK_FAILED_RESULT = VerifyResult(
+    passed=False,
+    test_output='',
+    lint_output='',
+    type_output='error TS2322: some type error',
+    summary='frontend',
+    category=UNSCOPED_TYPECHECK_FAILED_CATEGORY,
+)
+
+PERSISTENT_ENOSPC_RESULT = VerifyResult(
+    passed=False,
+    test_output='',
+    lint_output='',
+    type_output='',
+    summary='no space left on device',
+    category='',
+)
+
+
+class TestSyncPathAndSentinelPreservation:
+    """Step-7 (RED if branch ordering regresses): (a) the SYNCHRONOUS path
+    (main_health_probe_handles=None) still returns the main-health-red
+    outcome INLINE — proving train/solo/gate paths stay byte-identical; (b)
+    the flock-contention, unscoped-gate, and persistent-ENOSPC sentinel
+    branches return their existing outcome AND register NO main-health probe
+    even when handles ARE provided, because they return before the
+    main-health branch is ever reached."""
+
+    def test_sync_path_returns_main_red_inline(self, tmp_path: Path) -> None:
+        config = _make_config(tmp_path, escalate_preexisting=True)
+        git_ops = _make_git_ops(tmp_path)
+        merge_wt = tmp_path / 'merge-wt'
+        merge_wt.mkdir()
+        req = _make_req('99', tmp_path / 'task-wt', config)
+        (tmp_path / 'task-wt').mkdir()
+
+        async def _run() -> MergeOutcome | None:
+            with (
+                patch(
+                    'orchestrator.merge_queue.run_scoped_verification',
+                    new=AsyncMock(return_value=COMPILE_ERROR_RESULT),
+                ),
+                patch(
+                    'orchestrator.merge_queue.verify_failure_is_preexisting_on_main',
+                    new=AsyncMock(return_value=(True, MAIN_SHA)),
+                ),
+            ):
+                return await _run_post_merge_verify(
+                    git_ops, req, merge_wt,
+                    timeouts={},
+                    enospc_retries={},
+                    max_timeouts=3,
+                    max_enospc=1,
+                    main_health_probe_handles=None,
+                )
+
+        outcome = asyncio.run(_run())
+        assert outcome is not None
+        assert outcome.reason.startswith(MAIN_HEALTH_RED_REASON_PREFIX), (
+            f'Expected the main-health-red outcome INLINE when handles=None '
+            f'(byte-identical sync path); got: {outcome.reason!r}'
+        )
+
+    @pytest.mark.parametrize('verify_result,expected_prefix,label', [
+        (
+            FLOCK_CONTENTION_RESULT,
+            'Post-merge verification blocked:',
+            'flock_contention',
+        ),
+        (
+            UNSCOPED_TYPECHECK_FAILED_RESULT,
+            'Post-merge verification failed: unscoped type-check failed',
+            'unscoped_gate',
+        ),
+        (
+            PERSISTENT_ENOSPC_RESULT,
+            TRANSIENT_INFRA_REASON_PREFIX,
+            'persistent_enospc',
+        ),
+    ])
+    def test_sentinel_branches_preserved_with_handles_provided(
+        self,
+        tmp_path: Path,
+        verify_result: VerifyResult,
+        expected_prefix: str,
+        label: str,
+    ) -> None:
+        config = _make_config(tmp_path, escalate_preexisting=True)
+        git_ops = _make_git_ops(tmp_path)
+        merge_wt = tmp_path / 'merge-wt'
+        merge_wt.mkdir()
+        req = _make_req('99', tmp_path / 'task-wt', config)
+        (tmp_path / 'task-wt').mkdir()
+
+        handles = _MainHealthProbeHandles(background_tasks=set())
+        probe_spy = AsyncMock(return_value=(True, MAIN_SHA))
+
+        async def _run() -> tuple[MergeOutcome | None, set[asyncio.Task]]:
+            with (
+                patch(
+                    'orchestrator.merge_queue.run_scoped_verification',
+                    new=AsyncMock(return_value=verify_result),
+                ),
+                patch(
+                    'orchestrator.merge_queue.verify_failure_is_preexisting_on_main',
+                    new=probe_spy,
+                ),
+            ):
+                outcome = await _run_post_merge_verify(
+                    git_ops, req, merge_wt,
+                    timeouts={},
+                    enospc_retries={},
+                    max_timeouts=3,
+                    max_enospc=1,
+                    main_health_probe_handles=handles,
+                )
+            # Snapshot while the loop is alive (see TestMainHealthDeferralCore
+            # above) — irrelevant here since nothing should ever be spawned,
+            # but kept for parity/defensiveness.
+            snapshot = set(handles.background_tasks)
+            for t in snapshot:
+                t.cancel()
+            return outcome, snapshot
+
+        outcome, spawned = asyncio.run(_run())
+
+        assert outcome is not None
+        assert outcome.reason.startswith(expected_prefix), (
+            f'[{label}] Expected sentinel outcome reason to start with '
+            f'{expected_prefix!r}; got {outcome.reason!r}'
+        )
+        assert probe_spy.call_count == 0, (
+            f'[{label}] Main-health probe must NOT be called for a sentinel '
+            f'outcome; call_count={probe_spy.call_count}'
+        )
+        assert spawned == set(), (
+            f'[{label}] Expected no main-health probe task to be spawned '
+            f'even though handles were provided; got {spawned}'
         )
