@@ -18,6 +18,10 @@ Test coverage:
           (re-grounded from the historical 1103/1109/1116 fix commits) plus
           the headline C1 reverse signal.
   step-7: structured-output parsing (C2) — cargo/pyright/ruff JSON.
+  step-9: verify._summarize_checks threads per-check tool identity (the
+          config test_cmd/lint_cmd/type_cmd) into classify_failure, instead
+          of discarding it — the same C1 signal one layer up the stack, at
+          the real run_verification integration point.
 """
 
 from __future__ import annotations
@@ -676,3 +680,63 @@ class TestStructuredOutputParsingC2:
             'error: no such subcommand: `tset`\n'
         )
         assert _classify(ToolKind.CARGO_TEST, output, 1, False) == FailureCategory.CARGO_CLI_ERROR
+
+
+# step-9: verify._summarize_checks must thread the per-check config command
+# (test_cmd/lint_cmd/type_cmd) into classify_failure as that check's
+# ToolKind, instead of discarding tool identity (today's tool-blind
+# `_classify_failure(out, rc, to)` call). RED today: the OLD
+# `_summarize_checks` takes exactly 9 positional args (test_rc, test_out,
+# test_timed_out, lint_rc, lint_out, lint_timed_out, type_rc, type_out,
+# type_timed_out) — no `*_cmd` params — so calling it with the NEW 12-arg
+# signature (each check's rc/out/timed_out immediately followed by that
+# check's cmd) raises TypeError before the body even runs.
+
+
+def _summarize(*args):
+    from orchestrator.verify import _summarize_checks  # noqa: PLC0415
+
+    return _summarize_checks(*args)
+
+
+class TestSummarizeChecksThreadsToolIdentity:
+    """step-9: `_summarize_checks` (verify.py) must resolve each check's
+    ToolKind from its config command (via `_tool_for_cmd`/
+    `parse_config_command` — step-10) and thread it into `classify_failure`,
+    rather than calling the tool-blind classifier. Proves the CRITICAL C1
+    signal one layer up the stack from TestHeadlineC1ReverseSignal: a REAL
+    run_verification call site, not just the bare classifier.
+    """
+
+    def test_pytest_tool_identity_c1_cargo_token_does_not_swallow_pytest_failure(self):
+        """A failing test leg whose output mixes a cargo CLI token and a
+        pytest FAILED line must classify as test_failure (NOT
+        cargo_cli_error): `_summarize_checks` must resolve `test_cmd` to
+        ToolKind.PYTEST and thread it into classify_failure, so the
+        cargo_cli_error allowlist (only reachable via CARGO_TEST/CARGO_CLIPPY/
+        OPAQUE) is never consulted for this check."""
+        test_cmd = 'uv run --project orchestrator --directory orchestrator pytest tests/'
+        test_out = 'error: no such subcommand: `tset`\nFAILED tests/test_x.py::test_y\n'
+        passed, category, cause_hint, summary = _summarize(
+            1, test_out, False, test_cmd,
+            0, '', False, None,
+            0, '', False, None,
+        )
+        assert not passed
+        assert category == FailureCategory.TEST_FAILURE
+
+    def test_lint_chain_dispatches_opaque_generic_ladder(self):
+        """A lint command that is a raw-retained `&&`-chain (neither pytest
+        nor a cargo test/clippy chain) resolves to ToolKind.OPAQUE via
+        `_tool_for_cmd` — `_summarize_checks` still classifies its failure
+        through the full legacy generic ladder, byte-identical to today's
+        tool-blind `_classify_failure`."""
+        lint_cmd = 'ruff check . && mypy src/'
+        lint_out = 'flock: failed to acquire lock on /var/lock/mylock\n'
+        passed, category, cause_hint, summary = _summarize(
+            0, '', False, None,
+            1, lint_out, False, lint_cmd,
+            0, '', False, None,
+        )
+        assert not passed
+        assert category == FailureCategory.FLOCK_ERROR
