@@ -28,7 +28,7 @@ from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
-from escalation.action_effects import effect_for
+from escalation.action_effects import ACTION_EFFECTS, ANY, effect_for
 from escalation.models import Escalation
 
 from orchestrator.harness import Harness
@@ -195,9 +195,13 @@ class TestB1MemberlessBornAtL2Resume:
 @pytest.mark.asyncio
 class TestB3HarnessParkSetsBlocked:
     """B3, harness-side face: resolution_action='park' ->
-    scheduler.set_task_status(task_id, 'blocked') via
-    _action_teardown_and_set_status (harness.py:8970-8985) — NEVER
-    'deferred'."""
+    scheduler.set_task_status(task_id, <Table B's park target>) via
+    _action_teardown_and_set_status (harness.py:8970-8985). Asserted against
+    ``ACTION_EFFECTS[('park', ANY, ANY)].target_status`` rather than a
+    hardcoded 'blocked' literal, so this test and the escalation-side
+    ``TestB3ServerParkKeepsL2Open``
+    (escalation/tests/test_status_authority_gate.py) stay coupled to the
+    single source of truth — NEVER 'deferred'."""
 
     async def test_park_sets_blocked_not_deferred(self, harness: Harness) -> None:
         task_id = 'zeta-b3-park'
@@ -210,12 +214,13 @@ class TestB3HarnessParkSetsBlocked:
         )
         harness.scheduler.get_status = AsyncMock(return_value='blocked')
         harness.is_workflow_active = MagicMock(return_value=False)
+        park_target = ACTION_EFFECTS[('park', ANY, ANY)].target_status
 
         harness._on_escalation_resolved(esc)
         await asyncio.gather(*list(harness._background_tasks))
 
         harness.scheduler.set_task_status.assert_awaited_once_with(  # type: ignore[attr-defined]
-            task_id, 'blocked',
+            task_id, park_target,
         )
         written = {
             a.args[1] for a in harness.scheduler.set_task_status.await_args_list  # type: ignore[attr-defined]
