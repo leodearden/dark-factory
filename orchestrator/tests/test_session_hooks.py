@@ -466,6 +466,63 @@ def test_resolve_wm_window_id_only_ever_calls_wmctrl_list() -> None:
     assert all(call == ['wmctrl', '-l'] for call in calls)
 
 
+def test_wmctrl_list_missing_binary_returns_rc_127(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A genuinely-missing ``wmctrl`` binary (``FileNotFoundError``) is the
+    permanent-failure sentinel _resolve_wm_window_id short-circuits on."""
+
+    def _fake_run(argv: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
+        raise FileNotFoundError('wmctrl not found')
+
+    monkeypatch.setattr(subprocess, 'run', _fake_run)
+
+    result = sh._wmctrl_list(['wmctrl', '-l'])
+
+    assert result.returncode == 127
+
+
+def test_wmctrl_list_timeout_returns_distinct_transient_sentinel(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Reviewer finding: ``_wmctrl_list`` used to map every ``OSError`` /
+    ``SubprocessError`` -- including a ``subprocess.TimeoutExpired`` from a
+    momentarily-hung ``wmctrl`` -- to the same rc=127 sentinel that
+    ``_resolve_wm_window_id`` treats as a permanent missing-binary failure
+    and short-circuits on. A timeout is transient, not permanent, so it must
+    map to a distinct sentinel the retry loop keeps riding out."""
+
+    def _fake_run(argv: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
+        raise subprocess.TimeoutExpired(cmd=argv, timeout=sh._WMCTRL_TIMEOUT_SECS)
+
+    monkeypatch.setattr(subprocess, 'run', _fake_run)
+
+    result = sh._wmctrl_list(['wmctrl', '-l'])
+
+    assert result.returncode == 124
+    assert result.returncode != 127
+
+
+def test_resolve_wm_window_id_retries_through_transient_timeout_sentinel() -> None:
+    """rc=124 (the transient-timeout sentinel) must still be retried by the
+    loop, unlike rc=127 which short-circuits immediately -- the two failure
+    modes _wmctrl_list now distinguishes are handled distinctly end-to-end."""
+    calls: list[list[str]] = []
+
+    def fake_run(argv: list[str]) -> subprocess.CompletedProcess[str]:
+        calls.append(argv)
+        if len(calls) < 3:
+            return subprocess.CompletedProcess(argv, returncode=124, stdout='')
+        return subprocess.CompletedProcess(
+            argv, returncode=0, stdout='0x03200007 0 host focus:df#2510 alpha\n'
+        )
+
+    result = sh._resolve_wm_window_id(
+        'focus:df#2510 alpha', run=fake_run, attempts=5, sleep=lambda _s: None
+    )
+
+    assert result == '0x03200007'
+    assert len(calls) == 3
+
+
 # ---------------------------------------------------------------------------
 # Task 2292 step-5: SessionStart best-effort display stamping (Fleet Cockpit C2)
 # ---------------------------------------------------------------------------
