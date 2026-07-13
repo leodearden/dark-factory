@@ -1046,14 +1046,105 @@ async def _run_deferred_main_health_probe(
 ) -> None:
     """Off-critical-path main-health classification (task 2564).
 
-    Placeholder — the real body (probe + stale-check + escalation filing) is
-    implemented across steps 10/12.  Spawned by
-    :func:`_spawn_main_health_probe` as a DETACHED task with no awaiter, so
-    every externally-visible effect must come from what this coroutine does
-    internally (emitting the ``main_health_red`` signal, filing a dedup'd
-    escalation) — its return value is always discarded.
+    Spawned by :func:`_spawn_main_health_probe` as a DETACHED task with no
+    awaiter, so every externally-visible effect must come from what this
+    coroutine does internally (emitting the ``main_health_red`` signal,
+    filing a dedup'd escalation) — its return value is always discarded.
+
+    Re-applies the SAME three cheap guards :func:`_spawn_main_health_probe`
+    already applied before spawning (defense in depth for any future direct
+    caller — mirrors :func:`_classify_main_health_red`'s guard block):
+
+    - ``req.config.escalate_preexisting_main_break`` is ``False``
+    - ``verify.timed_out`` is ``True``
+    - ``verify.category`` is in :data:`PREEXISTING_BREAK_SKIP_CATEGORIES`
+
+    Calls :func:`verify_failure_is_preexisting_on_main` directly (rather than
+    :func:`_classify_main_health_red`) so it can capture ``probe_sha`` for a
+    future staleness check (task 2564 step-12).  A raising probe is caught
+    and logged — this is a detached background task with no awaiter, so a
+    swallowed exception here is the ONLY way it would ever be observed.
+
+    On a confirmed pre-existing break: builds the outcome via
+    :func:`_build_main_health_outcome`, emits the ``main_health_red``
+    merge-attempt signal, and files the dedup'd escalation via
+    :func:`_file_main_health_escalation`.
     """
-    return
+    if not req.config.escalate_preexisting_main_break:
+        return
+    if verify.timed_out:
+        return
+    if (verify.category or '') in PREEXISTING_BREAK_SKIP_CATEGORIES:
+        return
+    try:
+        is_preexisting, probe_sha = await verify_failure_is_preexisting_on_main(
+            req.worktree, req.config, req.module_configs, req.task_files,
+            verify, git_ops,
+        )
+    except Exception:
+        logger.warning(
+            'Task %s: deferred main-health probe failed', req.task_id,
+            exc_info=True,
+        )
+        return
+    if not is_preexisting:
+        return
+    outcome = _build_main_health_outcome(verify, probe_sha)
+    _emit_merge_attempt(event_store, req.task_id, OutcomeKind.main_health_red)
+    _file_main_health_escalation(escalation_queue, req, outcome)
+
+
+def _file_main_health_escalation(
+    escalation_queue: Any,
+    req: MergeRequest,
+    outcome: MergeOutcome,
+) -> None:
+    """File (or fold) a dedup'd ``preexisting_main_break`` escalation for a
+    confirmed pre-existing main-red *outcome* (task 2564).
+
+    None-safe: returns immediately when *escalation_queue* is None.
+
+    Folds via ``submit_or_dedupe`` using the SAME inf-window
+    content-fingerprint :class:`~escalation.dedupe.DedupeConfig`
+    ``workflow.py``'s ``_auto_heal_main_health`` uses (categories=
+    ``('preexisting_main_break',)``), so a worker-filed and a (legacy)
+    workflow-filed main-red escalation for the same
+    ``(category, cause_hint, probe_sha)`` signature collapse into one
+    parent — race-free against sibling probes/tasks. Falls back to a plain
+    ``queue.submit`` when *outcome* carries no fingerprint (the fail-safe
+    ``''`` path of :func:`_main_health_fingerprint`).
+    """
+    if escalation_queue is None:
+        return
+
+    from escalation.dedupe import DedupeConfig, content_fingerprint_key, submit_or_dedupe
+    from escalation.models import Escalation  # local import — escalation optional dep
+
+    fp = outcome.dedupe_fingerprint or None
+    esc = Escalation(
+        id=escalation_queue.make_id(req.task_id),
+        task_id=req.task_id,
+        agent_role='orchestrator',
+        severity='blocking',
+        category='preexisting_main_break',
+        summary=outcome.reason[:200],
+        detail=outcome.reason,
+        suggested_action='await_preexisting_main_hotfix',
+        dedupe_fingerprint=fp,
+    )
+    if fp:
+        submit_or_dedupe(
+            escalation_queue,
+            esc,
+            DedupeConfig(
+                infra_dedupe_enabled=True,
+                infra_dedupe_window_secs=float('inf'),
+                infra_dedupe_categories=('preexisting_main_break',),
+                key_fn=content_fingerprint_key,
+            ),
+        )
+    else:
+        escalation_queue.submit(esc)
 
 
 def _spawn_main_health_probe(
