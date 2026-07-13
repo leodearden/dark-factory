@@ -46,8 +46,39 @@ function orderRows(componentTasks, tiers) {
 }
 
 // ── Count edge-crossing inversions between adjacent tiers ──
+// rows: array of per-tier arrays of task-like objects (keyed by t.id).
+// edges: [{from: <upper/parentId>, to: <lower/childId>}, ...].
+// Only edges whose endpoints lie in an ADJACENT tier pair are considered —
+// multi-tier ("long") edges are not decomposed (v1 has no dummy/virtual
+// nodes). Two edges in the same adjacent pair cross when their upper-row
+// position delta and lower-row position delta have opposite (nonzero) signs;
+// edges sharing an endpoint (a zero delta on either side) never cross.
 function countCrossings(rows, edges) {
-  return 0;
+  const posOf = new Map(); // id -> {tier, pos}
+  rows.forEach((row, tier) => {
+    row.forEach((node, pos) => posOf.set(node.id, { tier, pos }));
+  });
+
+  let total = 0;
+  for (let tier = 0; tier < rows.length - 1; tier++) {
+    const pairEdges = edges.filter(e => {
+      const upper = posOf.get(e.from);
+      const lower = posOf.get(e.to);
+      return upper && lower && upper.tier === tier && lower.tier === tier + 1;
+    });
+    for (let i = 0; i < pairEdges.length; i++) {
+      const upperA = posOf.get(pairEdges[i].from).pos;
+      const lowerA = posOf.get(pairEdges[i].to).pos;
+      for (let j = i + 1; j < pairEdges.length; j++) {
+        const upperB = posOf.get(pairEdges[j].from).pos;
+        const lowerB = posOf.get(pairEdges[j].to).pos;
+        const upperSign = Math.sign(upperA - upperB);
+        const lowerSign = Math.sign(lowerA - lowerB);
+        if (upperSign !== 0 && lowerSign !== 0 && upperSign !== lowerSign) total++;
+      }
+    }
+  }
+  return total;
 }
 
 const API = { computeTiers, partitionComponents, orderRows, countCrossings };
