@@ -165,6 +165,41 @@ Finish with a numbered list of every decision the user needs to make:
 
 ---
 
+## Step 3.5: Hard-abort on an explicit stop instruction
+
+Before executing anything in Step 4, check every source gathered so far — the task
+description (1a/1c), the escalation text (1b), prior turns in this session, the runbook
+itself, or any instruction the user has given — for an explicit stop instruction: "do not
+apply", "do not merge", "do not proceed", "do not run", "do not execute", "do not
+self-authorize", "human rehearsal", "hold for human", "awaiting human", or any phrase in
+the shared `orchestrator.stop_instruction.STOP_INSTRUCTION_PHRASES` family
+(`orchestrator/src/orchestrator/stop_instruction.py` — the single source of truth for this
+phrase set, also used by `b3_gate` and `DeterministicRunner`).
+
+**If a stop instruction is present anywhere: HARD ABORT.** Leave the task and any pending
+escalation exactly as they are (still `blocked` / still pending) for a human to act on. Do
+NOT fix it yourself, do NOT resolve the escalation, do NOT merge, and do NOT narrate the
+result as human-authorized — a stop instruction overrides an otherwise-safe, obviously-
+correct fix. Tell the user plainly that a stop instruction was found and that you stopped
+because of it.
+
+This precondition closes reconciliation finding 0aac21b4 (task 2509): an autonomous
+`/unblock` session on task 2407 self-authorized an irreversible Mem0 mutation despite an
+explicit "do not apply" instruction, then narrated the result as human-authorized. Its
+sibling session on task 2273, audited in the same episode, is what right looks like — it
+honored its runbook's human-rehearsal mandate and was SIGTERM-killed before it could
+auto-apply. This step turns that external kill into a self-halt: don't wait to be killed —
+stop yourself.
+
+A mechanical backstop exists on the autonomous path (`unblock-low-risk`'s `b3_gate check`
+now hard-aborts on the same phrase family read from the task description and proposal
+text — see `skills/unblock-low-risk/SKILL.md`), but the mechanical gate can only see text
+already persisted to the task. This prose check is the only guard for a stop instruction
+that lives solely in this session's context (a prior turn, a runbook mandate, something
+the user just said) — never rely on the mechanical gate alone to catch it.
+
+---
+
 ## Step 4: Execute
 
 When the user approves, proceed in this order:
