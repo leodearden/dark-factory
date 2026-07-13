@@ -20,6 +20,7 @@ sys.path dance previously duplicated in each test.
 from __future__ import annotations
 
 import asyncio
+import inspect
 import os
 import sys
 
@@ -149,3 +150,50 @@ def test_finalize_exits_zero_and_skips_resolve_when_set_task_status_fails(monkey
 
     assert exit_code == 0
     assert calls == []
+
+
+def test_finalize_exits_zero_and_leaves_task_done_when_resolve_issue_fails(monkeypatch, finalize_module):
+    """Best-effort contract: a raising resolve_issue still exits 0 and the done write stands.
+
+    Covers the other failure leg (mirrors
+    test_finalize_exits_zero_and_skips_resolve_when_set_task_status_fails above,
+    which pins the set_task_status-fails leg). Module docstring: if
+    resolve_issue fails, "task {GATE_TASK} is done; a watcher self-heals the
+    stale L2" — i.e. set_task_status must have already succeeded and recorded
+    (the task is done) *before* resolve_issue's exception is swallowed, and
+    main_async must still return 0 rather than let the exception propagate
+    into a spurious non-zero exit for an otherwise-successful migration.
+    """
+    calls: list = []
+    monkeypatch.setattr(
+        finalize_module,
+        'McpClient',
+        _make_recording_mcp_client(calls, raise_on='resolve_issue'),
+    )
+
+    exit_code = asyncio.run(finalize_module.main_async())
+
+    assert exit_code == 0
+    # set_task_status recorded (the task is done); resolve_issue was
+    # attempted and its exception swallowed rather than propagated.
+    assert [c[0] for c in calls] == ['set_task_status']
+    assert calls[0][1]['status'] == 'done'
+
+
+def test_recording_fake_mirrors_real_mcp_client_shape(finalize_module):
+    """Guard against drift between the recording fake and the real McpClient.
+
+    _make_recording_mcp_client's docstring documents its shape assumption —
+    an async context manager built from a single positional `url` arg,
+    exposing `async call_tool(name, arguments)` — as mirroring
+    cgl_eta_scheduler_gate.McpClient (imported into this module as
+    `McpClient`). This is a fidelity guard, not a behavioral test of the fix
+    itself: if the real client's constructor or call_tool signature ever
+    changes, this fails loudly instead of the fake silently diverging while
+    every other test in this module keeps passing against stale assumptions.
+    """
+    real_init_params = list(inspect.signature(finalize_module.McpClient.__init__).parameters)
+    assert real_init_params == ['self', 'url']
+
+    real_call_tool_params = list(inspect.signature(finalize_module.McpClient.call_tool).parameters)
+    assert real_call_tool_params == ['self', 'name', 'arguments']
