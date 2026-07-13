@@ -253,3 +253,52 @@ class TestIterErrorNeighborhoods:
         assert neighborhoods[0]['attempt_tool'] is None
         assert neighborhoods[0]['attempt_input_summary'] is None
         assert neighborhoods[0]['error_content'] == 'boom'
+
+
+# ---------------------------------------------------------------------------
+# iter_self_corrections — curated markers in assistant TEXT blocks only.
+# Native-carrier scoping: the same phrase inside a tool_result or inside a
+# Write/Edit tool_use input (an agent authoring test data) is not a signal.
+# ---------------------------------------------------------------------------
+
+class TestIterSelfCorrections:
+    def test_detects_marker_in_assistant_text(self):
+        records = [_assistant(_text("Wait, that's wrong — I need to redo this."))]
+
+        hits = mod.iter_self_corrections(records)
+
+        assert len(hits) == 1
+        assert hits[0]['pattern'] == "that's wrong"
+        assert "that's wrong" in hits[0]['context'].lower()
+
+    def test_detects_multiple_distinct_patterns_across_records(self):
+        records = [
+            _assistant(_text('My mistake, I misread the file.')),
+            _assistant(_text('Actually, the fix belongs elsewhere.')),
+        ]
+
+        hits = mod.iter_self_corrections(records)
+
+        assert [h['pattern'] for h in hits] == ['my mistake', 'actually,']
+
+    def test_ignores_marker_in_tool_result_content(self):
+        records = [_tool_result('tu-1', "that's wrong, retry", is_error=False)]
+
+        assert mod.iter_self_corrections(records) == []
+
+    def test_ignores_marker_inside_write_tool_use_input(self):
+        records = [
+            _assistant(_tool_use(
+                'Write', {'file_path': '/tmp/x.py', 'content': '# my mistake\n'},
+            )),
+        ]
+
+        assert mod.iter_self_corrections(records) == []
+
+    def test_ignores_thinking_blocks(self):
+        # Only genuine assistant TEXT blocks are the self-correction
+        # carrier -- thinking is internal deliberation, never shown to the
+        # user, so it is not scoped in.
+        records = [_assistant(_thinking('actually, this approach is wrong'))]
+
+        assert mod.iter_self_corrections(records) == []
