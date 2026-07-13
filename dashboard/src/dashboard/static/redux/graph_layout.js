@@ -96,9 +96,160 @@ function partitionComponents(tasks) {
   return { components, singletons };
 }
 
+// Status-priority order for orderRows' initial per-tier permutation (module
+// constant, copied from tab_tasks.jsx:137's current within-tier sort).
+const STATUS_ORDER = {
+  blocked: 0,
+  'in-progress': 1,
+  'merge-deferred': 1.5,
+  pending: 2,
+  deferred: 3,
+  done: 4,
+  cancelled: 5,
+};
+
+function statusRank(status) {
+  return Object.prototype.hasOwnProperty.call(STATUS_ORDER, status) ? STATUS_ORDER[status] : 9;
+}
+
+// Normalizes a position within a row to [0,1] so barycenters computed
+// against rows of different lengths are comparable. A row of length <= 1
+// has no meaningful spread, so its sole occupant normalizes to the midpoint.
+function normalizedPosition(pos, rowLength) {
+  return rowLength <= 1 ? 0.5 : pos / (rowLength - 1);
+}
+
+// Derives the internal {from, to} edge list from componentTasks' in-set deps
+// (from = the upstream/parent id, to = the downstream/child id) — the same
+// shape countCrossings consumes.
+function deriveEdges(componentTasks) {
+  const ids = new Set(componentTasks.map(t => t.id));
+  const edges = [];
+  for (const t of componentTasks) {
+    for (const d of t.deps || []) {
+      if (ids.has(d.id) && d.id !== t.id) {
+        edges.push({ from: d.id, to: t.id });
+      }
+    }
+  }
+  return edges;
+}
+
+function cloneRows(rows) {
+  return rows.map(row => row.slice());
+}
+
+// Runs a single barycenter sweep over `rows` in place. direction 'down'
+// visits tiers 1..N-1 top-to-bottom, keying each node on the mean normalized
+// position of its parents in the (already-updated-this-sweep) row above;
+// direction 'up' visits tiers N-2..0 bottom-to-top, keying on children in
+// the row below. A node with no neighbor in the reference row keeps its
+// current position (its key is its own current normalized position, so a
+// row where nothing has a reference-row neighbor sorts back to itself).
+function barycenterSweep(rows, edges, direction) {
+  const parentsByChild = new Map();
+  const childrenByParent = new Map();
+  for (const e of edges) {
+    if (!parentsByChild.has(e.to)) parentsByChild.set(e.to, []);
+    parentsByChild.get(e.to).push(e.from);
+    if (!childrenByParent.has(e.from)) childrenByParent.set(e.from, []);
+    childrenByParent.get(e.from).push(e.to);
+  }
+  const neighborsOf = direction === 'down' ? parentsByChild : childrenByParent;
+
+  const tierIndices = [];
+  if (direction === 'down') {
+    for (let t = 1; t < rows.length; t++) tierIndices.push(t);
+  } else {
+    for (let t = rows.length - 2; t >= 0; t--) tierIndices.push(t);
+  }
+
+  for (const t of tierIndices) {
+    const refRow = direction === 'down' ? rows[t - 1] : rows[t + 1];
+    const refPos = new Map(refRow.map((node, i) => [node.id, i]));
+    const refLength = refRow.length;
+
+    const row = rows[t];
+    const keyed = row.map((node, currentPos) => {
+      const neighborIds = (neighborsOf.get(node.id) || []).filter(id => refPos.has(id));
+      const key = neighborIds.length > 0
+        ? neighborIds.reduce((sum, id) => sum + normalizedPosition(refPos.get(id), refLength), 0) / neighborIds.length
+        : normalizedPosition(currentPos, row.length);
+      return { node, key };
+    });
+    keyed.sort((a, b) => a.key - b.key); // stable: equal keys preserve current order
+    rows[t] = keyed.map(k => k.node);
+  }
+}
+
+// Greedily swaps adjacent same-tier pairs whenever doing so strictly reduces
+// total crossings, repeating full passes until none improve. Mutates `rows`
+// in place; never accepts a swap that doesn't strictly help, so it can only
+// hold or reduce the crossing count it started with.
+function transposePass(rows, edges) {
+  let improved = true;
+  while (improved) {
+    improved = false;
+    for (const row of rows) {
+      for (let i = 0; i < row.length - 1; i++) {
+        const before = countCrossings(rows, edges);
+        [row[i], row[i + 1]] = [row[i + 1], row[i]];
+        const after = countCrossings(rows, edges);
+        if (after < before) {
+          improved = true;
+        } else {
+          [row[i], row[i + 1]] = [row[i + 1], row[i]]; // revert — no strict improvement
+        }
+      }
+    }
+  }
+}
+
 // ── Order each tier's rows to minimize edge crossings (barycenter + transpose) ──
+// 1. Bucket componentTasks by tier, stable-sorting each bucket by
+//    STATUS_ORDER (input order as tiebreak) — this is candidate 0.
+// 2. Run 4 fixed alternating barycenter sweeps (down, up, down, up) over a
+//    working copy, keeping the best (fewest-crossings) arrangement seen,
+//    candidate 0 included — so the result can never be worse than the
+//    status-sort baseline.
+// 3. Run a greedy adjacent-transpose pass on the best arrangement, which can
+//    only further reduce (never increase) crossings.
+// No randomness anywhere, and every sort is stable, so the result is
+// deterministic across calls on identical input.
 function orderRows(componentTasks, tiers) {
-  return [];
+  const maxTier = componentTasks.reduce((max, t) => Math.max(max, tiers.get(t.id) || 0), 0);
+  const initial = Array.from({ length: componentTasks.length > 0 ? maxTier + 1 : 0 }, () => []);
+  componentTasks.forEach((t, index) => {
+    initial[tiers.get(t.id) || 0].push({ t, index });
+  });
+  const rows = initial.map(row =>
+    row
+      .slice()
+      .sort((a, b) => {
+        const rankDiff = statusRank(a.t.status) - statusRank(b.t.status);
+        return rankDiff !== 0 ? rankDiff : a.index - b.index; // stable input-order tiebreak
+      })
+      .map(entry => entry.t),
+  );
+
+  const edges = deriveEdges(componentTasks);
+
+  let best = cloneRows(rows);
+  let bestCrossings = countCrossings(best, edges);
+
+  const current = cloneRows(rows);
+  for (const direction of ['down', 'up', 'down', 'up']) {
+    barycenterSweep(current, edges, direction);
+    const crossings = countCrossings(current, edges);
+    if (crossings < bestCrossings) {
+      best = cloneRows(current);
+      bestCrossings = crossings;
+    }
+  }
+
+  transposePass(best, edges);
+
+  return best;
 }
 
 // ── Count edge-crossing inversions between adjacent tiers ──
