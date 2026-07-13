@@ -420,3 +420,73 @@ class TestDeferredProbeStaleCheck:
             'An empty get_main_sha() re-resolve must file no escalation '
             '(fail safe)'
         )
+
+
+# ---------------------------------------------------------------------------
+# Step-13 (RED): dedup-fold — a probe outcome whose fingerprint matches an
+# ALREADY-PENDING preexisting_main_break escalation must fold into that
+# parent (submit_or_dedupe's real attach_dedupe_child path) rather than
+# create a second top-level parent. Pins that _file_main_health_escalation
+# routes through submit_or_dedupe (not a plain queue.submit).
+# ---------------------------------------------------------------------------
+
+
+class TestDeferredProbeDedupeFold:
+    def test_matching_fingerprint_folds_into_existing_parent(
+        self, tmp_path: Path,
+    ) -> None:
+        from escalation.models import Escalation
+
+        config = _make_config(tmp_path, escalate_preexisting=True)
+        git_ops = _make_git_ops(tmp_path)  # get_main_sha AsyncMock -> MAIN_SHA
+        req = _make_req('99', tmp_path / 'task-wt', config)
+        (tmp_path / 'task-wt').mkdir()
+        escalation_queue = EscalationQueue(tmp_path / 'escalations')
+
+        # Pre-seed a pending parent whose fingerprint equals what THIS probe's
+        # outcome will compute (same category/cause_hint/probe_sha) — as if a
+        # sibling task's probe already surfaced this exact main-red signature.
+        fp = _main_health_fingerprint(
+            COMPILE_ERROR_RESULT.category or '', COMPILE_ERROR_RESULT.cause_hint, MAIN_SHA,
+        )
+        parent = Escalation(
+            id=escalation_queue.make_id('other-task'),
+            task_id='other-task',
+            agent_role='orchestrator',
+            severity='blocking',
+            category='preexisting_main_break',
+            summary='Pre-existing main-red (sibling probe)',
+            dedupe_fingerprint=fp,
+        )
+        escalation_queue.submit(parent)
+
+        async def _run() -> None:
+            with patch(
+                'orchestrator.merge_queue.verify_failure_is_preexisting_on_main',
+                new=AsyncMock(return_value=(True, MAIN_SHA)),
+            ):
+                await _run_deferred_main_health_probe(
+                    git_ops, req, COMPILE_ERROR_RESULT,
+                    escalation_queue=escalation_queue,
+                )
+
+        asyncio.run(_run())
+
+        pending = escalation_queue.get_pending()
+        assert len(pending) == 1, (
+            f'Expected the new escalation to FOLD into the pre-seeded parent '
+            f'(exactly one pending top-level escalation, not a second '
+            f'parent); got {pending}'
+        )
+        assert pending[0].id == parent.id, (
+            f'Expected the surviving pending escalation to be the pre-seeded '
+            f'parent {parent.id!r}; got {pending[0].id!r}'
+        )
+        assert pending[0].dedupe_count == 1, (
+            f'Expected the parent dedupe_count to increment for the folded '
+            f'child; got {pending[0].dedupe_count}'
+        )
+        assert len(pending[0].dedupe_children) == 1, (
+            f'Expected exactly one dedupe child attached to the parent; '
+            f'got {pending[0].dedupe_children}'
+        )
