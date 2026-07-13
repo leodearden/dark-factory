@@ -40,7 +40,20 @@ class ScoringItem:
 
 @dataclass(frozen=True)
 class Defaults:
-    """Fallback weights used when a severity/category/project key is unmapped."""
+    """Fallback weights used when a severity/category/project key is unmapped.
+
+    `severity` in particular is deliberately placed ABOVE the lowest rungs of
+    the bundled escalation vocabulary (severity_weights['info']/['low']),
+    not at or below them: an *unmapped* severity (every session, via
+    session_to_scoring_item -- including ones with a real pending question;
+    or a legacy decision filed before the F7 --severity flag existed) is a
+    missing-data signal, not the same thing as an operator explicitly
+    tagging a decision `severity='info'` (a deliberate "this is
+    lowest-priority" signal). Treating "unknown" as more urgent than an
+    explicit "info" park is intentional -- see priorities.default.yaml's
+    `defaults:` comment and TestSeverityVocabulary's ordering pin in
+    test_priority.py.
+    """
 
     severity: float
     category: float
@@ -90,6 +103,8 @@ class Priorities:
             },
             category_weights={'security': 2.0, 'bug': 1.0, 'feature': 0.5, 'chore': 0.2},
             project_weights={},
+            # severity=1.0 sits between 'low' (0.5) and 'medium' (1.5) --
+            # above 'info' (0.25) by design. See Defaults' docstring.
             defaults=Defaults(severity=1.0, category=0.5, project=0.0),
             age_curve=AgeCurve(max_bonus=0.75, saturation_seconds=float(7 * 24 * 3600)),
             manual_boost=ManualBoostConfig(weight=1.0, min=-5, max=5),

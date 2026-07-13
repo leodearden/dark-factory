@@ -267,6 +267,28 @@ class TestMonotonicAge:
 
         assert score(skewed, weights, _NOW) == score(zero_age, weights, _NOW)
 
+    def test_session_vs_session_age_ordering_still_monotonic_under_reduced_max_bonus(self):
+        """F7 amendment: age_curve.max_bonus was cut 2.0 -> 0.75 globally
+        (score() has no decision-vs-session branch, so every scoreable item
+        is affected, not just the decision-vs-stale-session case the fix
+        targeted). Pin that pure session-vs-session age ordering -- both
+        items share session_to_scoring_item's severity='' / category=''
+        mapping, differing only in age -- is still strictly monotonic under
+        the new, smaller max_bonus.
+        """
+        from cockpit.priority import Priorities, score
+
+        weights = Priorities.default()
+        assert weights.age_curve.max_bonus == 0.75  # guards the value this test pins against
+        older_session = _make_item(
+            severity='', category='', state='open', filed_at=_NOW - timedelta(days=8)
+        )
+        newer_session = _make_item(
+            severity='', category='', state='open', filed_at=_NOW - timedelta(hours=1)
+        )
+
+        assert score(older_session, weights, _NOW) > score(newer_session, weights, _NOW)
+
 
 class TestTimezoneHandling:
     def test_naive_filed_at_assumed_utc(self):
@@ -419,3 +441,21 @@ class TestSeverityVocabulary:
         )
 
         assert score(fresh_blocking, weights, _NOW) > score(saturated_default, weights, _NOW)
+
+    def test_unmapped_severity_ranks_above_explicit_info_by_design(self):
+        """Defaults.severity (used when severity is '' / unmapped -- every
+        session via session_to_scoring_item, even one with a real pending
+        question, or a legacy no-severity decision) intentionally sits
+        ABOVE severity_weights['info'], the lowest rung of the explicit
+        escalation vocabulary. Absence of severity data is a missing-data
+        signal, not the same thing as an operator explicitly tagging a
+        decision 'info' (a deliberate "this is lowest-priority" park) --
+        so "unknown" must not be treated as even less urgent than an
+        explicit low-priority tag. Pins the ordering (F7 amendment review)
+        so a future weight edit can't silently invert it.
+        """
+        from cockpit.priority import Priorities
+
+        weights = Priorities.default()
+
+        assert weights.defaults.severity > weights.severity_weights['info']

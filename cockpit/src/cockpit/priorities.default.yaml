@@ -29,6 +29,16 @@ category_weights:
 project_weights: {}
 
 defaults:
+  # severity is the fallback used whenever an item's severity is '' /
+  # unmapped -- every session (session scoring never carries a severity,
+  # even for a session with a real pending question) and any legacy
+  # decision filed before the F7 --severity flag existed. It's placed
+  # deliberately ABOVE severity_weights.info (0.25): missing severity data
+  # is not the same signal as an operator explicitly tagging a decision
+  # 'info' (a deliberate "this is lowest-priority" park), so "unknown"
+  # intentionally outranks an explicit "info" tag. See
+  # cockpit.priority.Defaults' docstring and
+  # test_priority.py::TestSeverityVocabulary's ordering pin.
   severity: 1.0
   category: 0.5
   project: 0.0
