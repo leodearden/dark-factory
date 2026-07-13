@@ -335,6 +335,56 @@ class TestPinAndResolve:
         assert mid_write.text == spec.in_code_constant
         assert mid_write.provenance is None
 
+    def test_failed_repin_provenance_write_reverts_to_baseline(self, tmp_path, monkeypatch):
+        """Documents pin()'s "failed re-pin can silently revert to baseline"
+        hazard as an intentional, locked contract: if the *second* atomic
+        write of a re-pin (provenance.json) raises after the first
+        (heuristics.txt) already landed, the key is left holding the NEW
+        heuristics with NO provenance -- the same on-disk shape resolve()
+        treats as not-pinned. The previously-good pin is therefore silently
+        replaced by the in-code fallback rather than preserved. Pairs with
+        the TOCTOU/race regression tests above; this one exercises the
+        write-failure path instead of a reader interleaving.
+        """
+        store = PromptArtifactStore(tmp_path)
+        spec = _make_spec()
+        old_provenance = ArtifactProvenance(
+            **_provenance_kwargs(harness_version='v1', git_sha='old-sha')
+        )
+        store.pin(
+            'reviewer', 'claude-opus-4', 'v1', heuristics='old heuristics',
+            provenance=old_provenance,
+        )
+        # Sanity: the pin from setup resolves as a genuine artifact before
+        # the failure injection below.
+        before = store.resolve(spec, executor_model='claude-opus-4', harness_version='v1')
+        assert before.source == 'artifact'
+
+        real_atomic_write_text = prompt_artifact._atomic_write_text
+
+        def failing_on_provenance_write(path, text):
+            if path.name == 'provenance.json':
+                raise OSError('simulated disk-full on provenance write')
+            real_atomic_write_text(path, text)
+
+        monkeypatch.setattr(prompt_artifact, '_atomic_write_text', failing_on_provenance_write)
+
+        new_provenance = ArtifactProvenance(
+            **_provenance_kwargs(harness_version='v1', git_sha='new-sha')
+        )
+        with pytest.raises(OSError):
+            store.pin(
+                'reviewer', 'claude-opus-4', 'v1', heuristics='new heuristics',
+                provenance=new_provenance,
+            )
+
+        monkeypatch.setattr(prompt_artifact, '_atomic_write_text', real_atomic_write_text)
+        resolved = store.resolve(spec, executor_model='claude-opus-4', harness_version='v1')
+
+        assert resolved.source == 'in_code'
+        assert resolved.text == spec.in_code_constant
+        assert resolved.provenance is None
+
 
 class TestUnpinRollback:
     def test_unpin_after_pin_restores_in_code_constant_and_is_idempotent(self, tmp_path):
