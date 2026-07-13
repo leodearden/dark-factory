@@ -380,3 +380,86 @@ class TestSecondarySignals:
         records = [_sidechain(_user_text('[Request interrupted by user for tool use]'))]
 
         assert mod.iter_interrupts(records) == []
+
+
+# ---------------------------------------------------------------------------
+# find_retry_loops — same tool name + canonical (sort_keys) input signature
+# recurring >= RETRY_MIN (3) times across the session. Deterministic,
+# dependency-free grouping -- no fuzzy string similarity.
+# ---------------------------------------------------------------------------
+
+class TestFindRetryLoops:
+    def test_detects_group_repeated_at_least_three_times(self):
+        records = [
+            _assistant(_tool_use('Bash', {'command': 'pytest'}, id='tu-1')),
+            _assistant(_tool_use('Bash', {'command': 'pytest'}, id='tu-2')),
+            _assistant(_tool_use('Bash', {'command': 'pytest'}, id='tu-3')),
+        ]
+
+        loops = mod.find_retry_loops(records)
+
+        assert len(loops) == 1
+        loop = loops[0]
+        assert loop['tool'] == 'Bash'
+        assert loop['signature'] == json.dumps({'command': 'pytest'}, sort_keys=True)
+        assert loop['count'] == 3
+
+    def test_two_occurrences_not_yet_a_loop(self):
+        records = [
+            _assistant(_tool_use('Bash', {'command': 'pytest'}, id='tu-1')),
+            _assistant(_tool_use('Bash', {'command': 'pytest'}, id='tu-2')),
+        ]
+
+        assert mod.find_retry_loops(records) == []
+
+    def test_single_call_is_not_a_loop(self):
+        records = [_assistant(_tool_use('Read', {'file_path': '/tmp/x'}, id='tu-1'))]
+
+        assert mod.find_retry_loops(records) == []
+
+    def test_distinct_inputs_are_not_grouped(self):
+        records = [
+            _assistant(_tool_use('Bash', {'command': 'ls'}, id='tu-1')),
+            _assistant(_tool_use('Bash', {'command': 'pwd'}, id='tu-2')),
+        ]
+
+        assert mod.find_retry_loops(records) == []
+
+    def test_normalizes_input_key_order_for_grouping(self):
+        # Same logical input, keys serialized in a different order each
+        # time -- canonical sort_keys=True signature must still group them.
+        records = [
+            _assistant(_tool_use(
+                'Edit', {'file_path': '/tmp/x', 'old': 'a', 'new': 'b'}, id='tu-1',
+            )),
+            _assistant(_tool_use(
+                'Edit', {'new': 'b', 'old': 'a', 'file_path': '/tmp/x'}, id='tu-2',
+            )),
+            _assistant(_tool_use(
+                'Edit', {'old': 'a', 'file_path': '/tmp/x', 'new': 'b'}, id='tu-3',
+            )),
+        ]
+
+        loops = mod.find_retry_loops(records)
+
+        assert len(loops) == 1
+        assert loops[0]['count'] == 3
+
+    def test_mixed_fixture_returns_only_the_loop_group(self):
+        records = [
+            # loop: same tool+input, 3x
+            _assistant(_tool_use('Bash', {'command': 'pytest'}, id='tu-1')),
+            _assistant(_tool_use('Bash', {'command': 'pytest'}, id='tu-2')),
+            _assistant(_tool_use('Bash', {'command': 'pytest'}, id='tu-3')),
+            # one-off, not a loop
+            _assistant(_tool_use('Read', {'file_path': '/tmp/x'}, id='tu-4')),
+            # two distinct inputs, not grouped together
+            _assistant(_tool_use('Bash', {'command': 'ls'}, id='tu-5')),
+            _assistant(_tool_use('Bash', {'command': 'pwd'}, id='tu-6')),
+        ]
+
+        loops = mod.find_retry_loops(records)
+
+        assert len(loops) == 1
+        assert loops[0]['tool'] == 'Bash'
+        assert loops[0]['count'] == 3
