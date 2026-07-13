@@ -2046,6 +2046,52 @@ class GitOps:
             path=path, branch=full_branch, warm=warm, base_ref=base_ref,
         )
 
+    def _scrub_seeded_lane_target(self, lane_dir: Path) -> None:
+        """Delete configured glob-matched subtrees under a seeded lane's
+        build-artifact dir so they regenerate fresh, per-lane (task 2315, BUG 3).
+
+        The warm-lane CoW seed base's build-artifact dir (``target/`` by
+        default) can contain generated artifacts that embed an ABSOLUTE
+        path pointing back at the shared ``_merge-verify/target`` OUT_DIR
+        they were originally generated under (e.g. tauri permission autogen
+        files). ``cp -a --reflink``-seeding that base into a lane
+        (:meth:`_seed_warm_lane`) copies those baked-in paths verbatim into
+        every lane. Rather than rewriting the baked paths in place (fragile
+        across TOML/binary formats), this deletes the configured subtrees
+        so they regenerate fresh on first use.
+
+        Args:
+            lane_dir: The seeded lane's worktree root (build-artifact dir
+                is resolved as ``lane_dir / reap_build_artifact_dirs[0]``,
+                defaulting to ``lane_dir / 'target'``).
+
+        No-op when :attr:`GitConfig.warm_lane_seed_scrub_globs` is empty
+        (the default — opt-in, byte-identical). Best-effort: a glob
+        matching nothing is a silent no-op, and any ``OSError`` during
+        deletion is logged at WARNING and swallowed — never raises.
+        """
+        globs = self.config.warm_lane_seed_scrub_globs
+        if not globs:
+            return
+        artifact_dir_name = (
+            self.config.reap_build_artifact_dirs[0]
+            if self.config.reap_build_artifact_dirs
+            else 'target'
+        )
+        artifact_dir = lane_dir / artifact_dir_name
+        try:
+            for pattern in globs:
+                for match in artifact_dir.glob(pattern):
+                    if match.is_dir() and not match.is_symlink():
+                        shutil.rmtree(match, ignore_errors=True)
+                    else:
+                        match.unlink(missing_ok=True)
+        except OSError:
+            logger.warning(
+                '_scrub_seeded_lane_target: failed to scrub %s under %s',
+                globs, artifact_dir, exc_info=True,
+            )
+
     async def _seed_warm_lane(self, lane_dir: Path, mode: str) -> int:
         """Run seed-warm-lane.sh to CoW-seed the lane's target/ from the warm base.
 
