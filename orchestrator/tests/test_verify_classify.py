@@ -491,3 +491,188 @@ class TestHeadlineC1ReverseSignal:
             f'a cargo CLI token in pytest output must not swallow the FAILED line '
             f'into cargo_cli_error, got {result!r}'
         )
+
+
+# step-7: structured-output parsing (Invariant C2). Fixtures are built from
+# the documented JSON schemas, hand-verified against the pinned tool
+# versions in this worktree (cargo 1.96.0 `--message-format json` NDJSON,
+# pyright 1.1.408 `--outputjson`, ruff `--output-format json`) rather than
+# invented shapes.
+
+
+def _cargo_ndjson(*records: dict) -> str:
+    """Join dict records as cargo-shaped NDJSON (one compact JSON object per line)."""
+    return '\n'.join(json.dumps(r) for r in records)
+
+
+# A `reason: compiler-message` record whose `message.level == 'error'` — but
+# whose human-readable `rendered`/`message` text is deliberately chosen to
+# match NONE of `_CARGO_PATTERNS` (no `error[E\d+]:` bracket form, no
+# cargo-CLI allowlist prefix, no `FAILED`/npm/flock/tree-sitter token). This
+# is the genuinely RED fixture: today it falls through the text table to
+# unknown_test_failure — only a parser that reads the structured `level`
+# field can classify it compile_error, which is the entire point of C2
+# (structured output catches what the regex ladder would miss).
+_CARGO_JSON_COMPILER_ERROR = _cargo_ndjson(
+    {
+        'reason': 'compiler-message',
+        'package_id': 'path+file:///workspace/my_crate#0.1.0',
+        'manifest_path': 'Cargo.toml',
+        'target': {
+            'kind': ['lib'],
+            'crate_types': ['lib'],
+            'name': 'my_crate',
+            'src_path': 'src/lib.rs',
+            'edition': '2021',
+            'doc': True,
+            'doctest': True,
+            'test': True,
+        },
+        'message': {
+            'rendered': 'error: cannot find value `x` in this scope\n --> src/lib.rs:2:5\n',
+            '$message_type': 'diagnostic',
+            'children': [],
+            'level': 'error',
+            'message': 'cannot find value `x` in this scope',
+            'spans': [
+                {
+                    'file_name': 'src/lib.rs',
+                    'line_start': 2,
+                    'line_end': 2,
+                    'column_start': 5,
+                    'column_end': 6,
+                    'is_primary': True,
+                    'label': 'not found in this scope',
+                }
+            ],
+            'code': {'code': 'E0425', 'explanation': None},
+        },
+    },
+    {'reason': 'build-finished', 'success': False},
+)
+
+# pyright --outputjson (verified schema, pyright 1.1.408): a top-level object
+# with a `generalDiagnostics` array; each entry's `severity` is 'error' /
+# 'warning' / 'information'.
+_PYRIGHT_JSON_ERROR_DIAGNOSTIC = json.dumps(
+    {
+        'version': '1.1.408',
+        'time': '1783914788715',
+        'generalDiagnostics': [
+            {
+                'file': '/workspace/bad.py',
+                'severity': 'error',
+                'message': (
+                    'Type "Literal[\'not an int\']" is not assignable to return type "int"'
+                ),
+                'range': {
+                    'start': {'line': 1, 'character': 11},
+                    'end': {'line': 1, 'character': 23},
+                },
+                'rule': 'reportReturnType',
+            }
+        ],
+        'summary': {
+            'filesAnalyzed': 1,
+            'errorCount': 1,
+            'warningCount': 0,
+            'informationCount': 0,
+            'timeInSec': 0.5,
+        },
+    }
+)
+
+# ruff --output-format json (verified schema): a top-level ARRAY of violation
+# objects (not wrapped in an object) — each entry carries its own 'severity'.
+_RUFF_JSON_VIOLATIONS = json.dumps(
+    [
+        {
+            'cell': None,
+            'code': 'F821',
+            'end_location': {'column': 15, 'row': 4},
+            'filename': '/workspace/bad.py',
+            'fix': None,
+            'location': {'column': 1, 'row': 4},
+            'message': 'Undefined name `undefined_name`',
+            'noqa_row': 4,
+            'severity': 'error',
+            'url': 'https://docs.astral.sh/ruff/rules/undefined-name',
+        }
+    ]
+)
+
+
+class TestStructuredOutputParsingC2:
+    """step-7: Invariant C2 — where a tool offers structured output, the
+    classifier parses it directly instead of regex-matching human text.
+
+    The genuinely RED assertion (pre step-8) is
+    ``test_cargo_json_compiler_message_error_is_compile_error``: its fixture
+    is a `reason: compiler-message` / `level: error` record whose human text
+    matches none of `_CARGO_PATTERNS`, so today it falls through to
+    unknown_test_failure — only a JSON-aware parser that reads the
+    structured `level` field can classify it compile_error. The pyright/ruff
+    'preserved mapping' assertions and the non-JSON-fallback assertions
+    already hold today (PYRIGHT/RUFF have no dedicated text table yet, so
+    they fall through the shared OPAQUE placeholder to unknown_test_failure
+    regardless of JSON-awareness — see classify_failure's docstring); kept
+    here to pin the full JSON-first contract once step-8 adds the parsers,
+    per Invariant C2's "falls back to the text table otherwise" / exception-
+    safety requirements.
+    """
+
+    def test_cargo_json_compiler_message_error_is_compile_error(self):
+        assert (
+            _classify(ToolKind.CARGO_TEST, _CARGO_JSON_COMPILER_ERROR, 1, False)
+            == FailureCategory.COMPILE_ERROR
+        )
+
+    def test_pyright_json_error_diagnostic_is_unknown_test_failure(self):
+        """Preserved mapping: no dedicated PYRIGHT category exists (out of
+        scope for this task) — an error-severity generalDiagnostic still maps
+        to unknown_test_failure, matching today's on-the-wire category."""
+        assert (
+            _classify(ToolKind.PYRIGHT, _PYRIGHT_JSON_ERROR_DIAGNOSTIC, 1, False)
+            == FailureCategory.UNKNOWN_TEST_FAILURE
+        )
+
+    def test_ruff_json_violation_is_unknown_test_failure(self):
+        """Preserved mapping: no dedicated RUFF category exists (out of scope
+        for this task) — a violations array still maps to
+        unknown_test_failure, matching today's on-the-wire category."""
+        assert (
+            _classify(ToolKind.RUFF, _RUFF_JSON_VIOLATIONS, 1, False)
+            == FailureCategory.UNKNOWN_TEST_FAILURE
+        )
+
+    def test_cargo_non_json_output_still_uses_text_table(self):
+        """A plain-text (non-JSON) cargo failure must still classify via the
+        existing _CARGO_PATTERNS text table — the JSON-first codepath must
+        not break the text fallback."""
+        output = 'error: no such subcommand: `tset`\n'
+        assert _classify(ToolKind.CARGO_TEST, output, 1, False) == FailureCategory.CARGO_CLI_ERROR
+
+    def test_pyright_non_json_output_falls_back_without_crash(self):
+        output = (
+            '/workspace/bad.py:2:12 - error: Type "Literal[\'not an int\']" is not '
+            'assignable to return type "int" (reportReturnType)\n'
+            '1 error, 0 warnings, 0 informations\n'
+        )
+        assert (
+            _classify(ToolKind.PYRIGHT, output, 1, False) == FailureCategory.UNKNOWN_TEST_FAILURE
+        )
+
+    def test_ruff_non_json_output_falls_back_without_crash(self):
+        output = 'bad.py:4:1: F821 Undefined name `undefined_name`\nFound 1 error.\n'
+        assert _classify(ToolKind.RUFF, output, 1, False) == FailureCategory.UNKNOWN_TEST_FAILURE
+
+    def test_cargo_malformed_json_falls_back_to_text_table(self):
+        """A JSON-shaped-but-invalid cargo output (e.g. truncated mid-stream)
+        must not crash the classifier — parsing is best-effort and
+        exception-safe (Invariant C2), falling back to the text table."""
+        output = (
+            '{"reason": "compiler-message", "message": {"level": "error", '
+            'THIS IS NOT VALID JSON\n'
+            'error: no such subcommand: `tset`\n'
+        )
+        assert _classify(ToolKind.CARGO_TEST, output, 1, False) == FailureCategory.CARGO_CLI_ERROR
