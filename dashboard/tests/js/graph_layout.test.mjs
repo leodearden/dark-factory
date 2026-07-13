@@ -14,7 +14,7 @@ import { createRequire } from 'node:module';
 
 import layout from '../../src/dashboard/static/redux/graph_layout.js';
 
-const { computeTiers, partitionComponents, countCrossings } = layout;
+const { computeTiers, partitionComponents, orderRows, countCrossings } = layout;
 
 const MODULE_SPECIFIER = '../../src/dashboard/static/redux/graph_layout.js';
 const EXPECTED_FUNCTION_NAMES = [
@@ -27,9 +27,73 @@ const EXPECTED_FUNCTION_NAMES = [
 // Builds a minimal task fixture matching the dep edge shape the dashboard
 // already ships (t.deps = [{id, done, title}, ...]) — see
 // tab_tasks.jsx:20,30,268. Only `id` is populated here; computeTiers only
-// reads d.id.
-function mkTask(id, depIds = []) {
-  return { id, deps: depIds.map(depId => ({ id: depId })) };
+// reads d.id. `status` is omitted entirely (not just `undefined`-valued)
+// when not passed, so fixtures used by tests that don't care about status
+// keep the exact same object shape as before orderRows needed one.
+function mkTask(id, depIds = [], status) {
+  return {
+    id,
+    ...(status !== undefined ? { status } : {}),
+    deps: depIds.map(depId => ({ id: depId })),
+  };
+}
+
+function idsOf(taskArray) {
+  return taskArray.map(t => t.id);
+}
+
+// Independent oracle for orderRows' initial per-tier permutation, mirroring
+// the STATUS_ORDER map documented in the plan (and copied from
+// tab_tasks.jsx:137) — deliberately re-implemented here rather than reusing
+// any graph_layout.js internal, since STATUS_ORDER itself isn't part of the
+// module's four-function export contract.
+const TEST_STATUS_ORDER = {
+  blocked: 0,
+  'in-progress': 1,
+  'merge-deferred': 1.5,
+  pending: 2,
+  deferred: 3,
+  done: 4,
+  cancelled: 5,
+};
+
+function testStatusRank(status) {
+  return Object.prototype.hasOwnProperty.call(TEST_STATUS_ORDER, status) ? TEST_STATUS_ORDER[status] : 9;
+}
+
+// Buckets componentTasks by tier and stable-sorts each bucket by status rank
+// (input order as tiebreak) — the same initial permutation orderRows itself
+// is specified to start from.
+function statusSortBaseline(componentTasks, tiers) {
+  const rows = [];
+  componentTasks.forEach((t, index) => {
+    const tier = tiers.get(t.id) || 0;
+    if (!rows[tier]) rows[tier] = [];
+    rows[tier].push({ t, index });
+  });
+  return rows.map(row =>
+    row
+      .slice()
+      .sort((a, b) => {
+        const rankDiff = testStatusRank(a.t.status) - testStatusRank(b.t.status);
+        return rankDiff !== 0 ? rankDiff : a.index - b.index;
+      })
+      .map(entry => entry.t),
+  );
+}
+
+// Derives the {from, to} internal edge list from componentTasks' in-set deps
+// (from = the upstream/parent id, to = the downstream/child id) — the same
+// derivation orderRows itself is specified to use.
+function edgesFromDeps(componentTasks) {
+  const ids = new Set(componentTasks.map(t => t.id));
+  const edges = [];
+  for (const t of componentTasks) {
+    for (const d of t.deps || []) {
+      if (ids.has(d.id) && d.id !== t.id) edges.push({ from: d.id, to: t.id });
+    }
+  }
+  return edges;
 }
 
 test('default-imported module exposes the four layout functions', () => {
@@ -177,10 +241,6 @@ test('countCrossings: crossings across two adjacent tier pairs sum together', ()
 // within a component (and singletons) preserve input order.
 // ---------------------------------------------------------------------------
 
-function idsOf(taskArray) {
-  return taskArray.map(t => t.id);
-}
-
 test('partitionComponents: exact partition — multi-component fixture plus isolated singletons', () => {
   // Component X: A -> B -> C (chain). Component Y: D -> E. F, G are isolated.
   const tasks = [
@@ -252,4 +312,121 @@ test('partitionComponents: single-node input yields exactly one singleton', () =
   const result = partitionComponents(tasks);
   assert.deepEqual(result.components, []);
   assert.deepEqual(idsOf(result.singletons), ['Z']);
+});
+
+// ---------------------------------------------------------------------------
+// orderRows — initial status-sort permutation, then barycenter sweeps +
+// transpose pass to reduce edge crossings. The user-observable signal is
+// crossings(orderRows(...)) <= crossings(status-sort baseline), strictly <
+// on a tangled fixture, and deterministic across repeated calls.
+// ---------------------------------------------------------------------------
+
+// Flattens orderRows' per-tier output back into a single id array — used to
+// assert the result is an exact re-permutation of the input (every task
+// appears exactly once), independent of crossings.
+function flattenedIds(rows) {
+  return rows.flat().map(t => t.id);
+}
+
+test('orderRows: returns one row per tier, each containing exactly that tier\'s tasks', () => {
+  const componentTasks = [
+    mkTask('P1', [], 'pending'),
+    mkTask('P2', [], 'pending'),
+    mkTask('C1', ['P2'], 'pending'),
+    mkTask('C2', ['P1'], 'pending'),
+  ];
+  const tiers = computeTiers(componentTasks);
+  const ordered = orderRows(componentTasks, tiers);
+
+  assert.equal(ordered.length, 2, 'expected one row per tier (tier 0 and tier 1)');
+  assert.deepEqual(idsOf(ordered[0]).slice().sort(), ['P1', 'P2']);
+  assert.deepEqual(idsOf(ordered[1]).slice().sort(), ['C1', 'C2']);
+  assert.deepEqual(
+    flattenedIds(ordered).sort(),
+    idsOf(componentTasks).slice().sort(),
+    'every input task should appear exactly once across the returned rows',
+  );
+});
+
+test('orderRows: barycenter+transpose strictly reduces crossings below the status-sort baseline (tangled fixture)', () => {
+  // Parents P1,P2 (tier0), children C1,C2 (tier1); edges P1->C2 & P2->C1;
+  // all four share one status, so the status-sort init ties and falls back
+  // to input order.
+  const componentTasks = [
+    mkTask('P1', [], 'pending'),
+    mkTask('P2', [], 'pending'),
+    mkTask('C1', ['P2'], 'pending'),
+    mkTask('C2', ['P1'], 'pending'),
+  ];
+  const tiers = computeTiers(componentTasks);
+  const edges = edgesFromDeps(componentTasks);
+
+  const baseline = statusSortBaseline(componentTasks, tiers);
+  assert.deepEqual(idsOf(baseline[0]), ['P1', 'P2']);
+  assert.deepEqual(idsOf(baseline[1]), ['C1', 'C2']);
+  const baselineCrossings = countCrossings(baseline, edges);
+  assert.equal(baselineCrossings, 1, 'status-tied, input-order baseline should have exactly 1 crossing');
+
+  const ordered = orderRows(componentTasks, tiers);
+  assert.deepEqual(
+    flattenedIds(ordered).sort(),
+    idsOf(componentTasks).slice().sort(),
+    'orderRows must return an exact re-permutation of its input',
+  );
+
+  const orderedCrossings = countCrossings(ordered, edges);
+  assert.equal(orderedCrossings, 0);
+  assert.ok(orderedCrossings < baselineCrossings, 'orderRows should strictly reduce crossings below the baseline');
+});
+
+test('orderRows: crossings never exceed the status-sort baseline (tangled + chain components)', () => {
+  const tangled = [
+    mkTask('P1', [], 'pending'),
+    mkTask('P2', [], 'pending'),
+    mkTask('C1', ['P2'], 'pending'),
+    mkTask('C2', ['P1'], 'pending'),
+  ];
+  // Component X (chain, one node per tier) and component Y (chain) from the
+  // partitionComponents multi-component fixture — a single node per tier
+  // means the baseline is already crossing-free.
+  const componentX = [mkTask('A', [], 'pending'), mkTask('B', ['A'], 'pending'), mkTask('C', ['B'], 'pending')];
+  const componentY = [mkTask('D', [], 'pending'), mkTask('E', ['D'], 'pending')];
+
+  for (const componentTasks of [tangled, componentX, componentY]) {
+    const tiers = computeTiers(componentTasks);
+    const edges = edgesFromDeps(componentTasks);
+    const ordered = orderRows(componentTasks, tiers);
+    assert.deepEqual(
+      flattenedIds(ordered).sort(),
+      idsOf(componentTasks).slice().sort(),
+      'orderRows must return an exact re-permutation of its input',
+    );
+
+    const baselineCrossings = countCrossings(statusSortBaseline(componentTasks, tiers), edges);
+    const orderedCrossings = countCrossings(ordered, edges);
+    assert.ok(
+      orderedCrossings <= baselineCrossings,
+      `expected orderRows crossings (${orderedCrossings}) <= baseline (${baselineCrossings})`,
+    );
+  }
+});
+
+test('orderRows: deterministic across repeated calls on identical input', () => {
+  const componentTasks = [
+    mkTask('P1', [], 'pending'),
+    mkTask('P2', [], 'pending'),
+    mkTask('C1', ['P2'], 'pending'),
+    mkTask('C2', ['P1'], 'pending'),
+  ];
+  const tiers = computeTiers(componentTasks);
+  const first = orderRows(componentTasks, tiers);
+  const second = orderRows(componentTasks, tiers);
+
+  assert.deepEqual(
+    flattenedIds(first).sort(),
+    idsOf(componentTasks).slice().sort(),
+    'orderRows must return an exact re-permutation of its input',
+  );
+  assert.deepEqual(first, second);
+  assert.equal(JSON.stringify(first), JSON.stringify(second));
 });
