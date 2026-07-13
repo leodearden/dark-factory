@@ -22,6 +22,12 @@ flake (the snapshot-path half is covered by
 Mirrors test_scheduler_dispatch_admission.py's conventions: module-local
 task-dict helper, ``scheduler.get_tasks = AsyncMock(return_value=[...])``,
 driving ``acquire_next()`` directly.
+
+Amendment (post-verification review): ``test_real_psi_reader_marker_restores_real_reader``
+below is a companion guard for the ``real_psi_reader`` opt-out branch of
+``_hermetic_psi_reader`` — the fixture's default (patched) branch is covered
+by ``TestAutouseFixtureDefaultsToIdlePsi`` above, but the opt-out branch had
+no test exercising it.
 """
 
 from __future__ import annotations
@@ -132,3 +138,22 @@ class TestAutouseFixtureDefaultsToIdlePsi:
         assert sample.mem_some10 == 0.0
         assert sample.mem_full10 == 0.0
         assert sample.io_some10 == 0.0
+
+
+@pytest.mark.real_psi_reader
+def test_real_psi_reader_marker_restores_real_reader() -> None:
+    """With the marker, the real ``shared.psi.read_psi_sample`` binding is in place.
+
+    Companion guard for the opt-out branch of conftest's autouse
+    ``_hermetic_psi_reader`` fixture (the default, patched branch is covered
+    by ``TestAutouseFixtureDefaultsToIdlePsi`` above). We don't actually call
+    the bound reader — that would read real, and therefore non-deterministic,
+    ``/proc/pressure/*`` values, reintroducing exactly the host dependence
+    task 2418 removes. Identity to the unpatched module attribute is the only
+    host-independent way to confirm the marker skipped the monkeypatch.
+    Mirrors ``test_dry_run_unblock_autouse.py::test_exercise_dry_run_unblock_marker_disables_noop``.
+    """
+    import orchestrator.scheduler as scheduler_module
+
+    scheduler = Scheduler(OrchestratorConfig(max_per_module=1))
+    assert scheduler._read_psi_sample is scheduler_module.read_psi_sample
