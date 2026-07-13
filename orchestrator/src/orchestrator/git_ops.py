@@ -2444,6 +2444,15 @@ class GitOps:
         never raises.  A non-zero exit is logged at WARNING and treated as
         'nothing reclaimed' by the caller (``_warm_lane_disk_admission_blocked``).
 
+        **Merge-verify lease guard (task 2315, BUG 1)**: defers (127) while
+        ANY merge-verify lease is held — INCLUDING our own.  The reclaim
+        script operates over the whole pool mount (which CONTAINS
+        ``_merge-verify``), so an in-process local verify must be deferred
+        to just as much as a foreign one; unlike
+        :meth:`reset_persistent_merge_worktree`'s lease guard, self is NOT
+        excluded here.  Checked BEFORE the pool-storage guard below so the
+        skip is attributable to the lease even when the sentinel is fine.
+
         **Pool-storage guard (task 2099, self-heal task 2315)**: routes
         through :meth:`_reconcile_pool_storage_before_sweep`, which refuses
         to spawn the script when a pool is configured
@@ -2461,10 +2470,16 @@ class GitOps:
 
         Returns:
             0   — reclaim succeeded.
-            127 — script absent, pool storage absent, or exception (fail-soft
-                sentinel).
+            127 — script absent, pool storage absent, merge-verify lease
+                held, or exception (fail-soft sentinel).
             other non-zero — reclaim script error (caller still re-checks).
         """
+        if self._merge_verify_lease_active():
+            logger.info(
+                '_run_warm_lane_gc_reclaim: merge-verify in flight (lease '
+                'held) — deferring reclaim',
+            )
+            return 127
         if not self._reconcile_pool_storage_before_sweep('_run_warm_lane_gc_reclaim'):
             return 127
         try:
