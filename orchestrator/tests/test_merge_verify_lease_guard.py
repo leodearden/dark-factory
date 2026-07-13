@@ -166,9 +166,11 @@ class TestResetPersistentMergeWorktreeLeaseGuard:
         write_lock_holder_pgid(real_git_ops.worktree_base, foreign_holder)
         monkeypatch.setattr(os, 'getpgrp', lambda: foreign_holder + 1)
 
-        with patch('orchestrator.git_ops._run', new_callable=AsyncMock) as mock_run:
-            with pytest.raises(MergeVerifyLeaseHeld):
-                await real_git_ops.reset_persistent_merge_worktree(merge_commit_b)
+        with (
+            patch('orchestrator.git_ops._run', new_callable=AsyncMock) as mock_run,
+            pytest.raises(MergeVerifyLeaseHeld),
+        ):
+            await real_git_ops.reset_persistent_merge_worktree(merge_commit_b)
         mock_run.assert_not_awaited()
 
         # Worktree must be untouched: HEAD still at merge_commit_a.
