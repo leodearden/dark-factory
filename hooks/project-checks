@@ -57,14 +57,25 @@ if [ -n "$staged_mm" ]; then
 fi
 
 # pyright (must run from each package directory to pick up [tool.pyright] config)
-for pkg in "${PYRIGHT_PACKAGES[@]}"; do
-    dir="$ROOT/$pkg"
-    [ -d "$dir" ] || continue
-    echo "  pyright: $pkg"
-    if ! (cd "$dir" && uv run pyright); then
-        echo "pre-commit: pyright failed in $pkg. Fix type errors before committing to main."
-        exit 1
-    fi
-done
+# Path-filtered: only run for packages with staged .py changes, so docs/plans-only
+# commits (and commits scoped to a single package) don't pay for an unconditional
+# 3x pyright run. See task 2551.
+staged_py_all="$(cd "$ROOT" && git diff --cached --name-only --diff-filter=ACMR | grep -E '\.py$' || true)"
+if [ -z "$staged_py_all" ]; then
+    echo "pre-commit: pyright skipped (no Python changes)"
+else
+    for pkg in "${PYRIGHT_PACKAGES[@]}"; do
+        dir="$ROOT/$pkg"
+        [ -d "$dir" ] || continue
+        if ! printf '%s\n' "$staged_py_all" | grep -q "^${pkg}/"; then
+            continue
+        fi
+        echo "  pyright: $pkg"
+        if ! (cd "$dir" && uv run pyright); then
+            echo "pre-commit: pyright failed in $pkg. Fix type errors before committing to main."
+            exit 1
+        fi
+    done
+fi
 
 echo "pre-commit: all checks passed."
