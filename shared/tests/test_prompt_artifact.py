@@ -472,6 +472,25 @@ class TestAtomicWriteText:
         assert leftover == []
 
 
+def _build_fake_monorepo_module_file(root: Path) -> Path:
+    """Create a fake ``orchestrator/``, ``fused-memory/``, ``shared/`` tree under
+    *root* and return the path a ``shared/src/shared/prompt_artifact.py`` would
+    live at inside it.
+
+    Lets tests drive :func:`default_artifacts_root`'s walk-up deterministically
+    (via monkeypatching the module's ``__file__``) instead of depending on the
+    real checkout's physical layout, which breaks when the package is
+    installed/tested outside the monorepo (e.g. a wheel install).
+    """
+    (root / 'orchestrator').mkdir(parents=True)
+    (root / 'fused-memory').mkdir(parents=True)
+    package_dir = root / 'shared' / 'src' / 'shared'
+    package_dir.mkdir(parents=True)
+    module_file = package_dir / 'prompt_artifact.py'
+    module_file.write_text('', encoding='utf-8')
+    return module_file
+
+
 class TestDefaultArtifactsRoot:
     def test_env_override_wins(self, monkeypatch, tmp_path):
         custom = tmp_path / 'custom-artifacts'
@@ -479,17 +498,40 @@ class TestDefaultArtifactsRoot:
 
         assert default_artifacts_root() == Path(custom)
 
-    def test_unset_env_anchors_at_monorepo_root(self, monkeypatch):
+    def test_unset_env_anchors_at_monorepo_root(self, monkeypatch, tmp_path):
         monkeypatch.delenv('DARK_FACTORY_PROMPT_ARTIFACTS', raising=False)
+        fake_monorepo = tmp_path / 'fake-monorepo'
+        module_file = _build_fake_monorepo_module_file(fake_monorepo)
+        monkeypatch.setattr(prompt_artifact, '__file__', str(module_file))
 
         root = default_artifacts_root()
 
-        # Ends in data/prompt_artifacts...
-        assert root.name == 'prompt_artifacts'
-        assert root.parent.name == 'data'
-        # ...anchored at a directory that contains orchestrator/, fused-memory/,
-        # and shared/ (the monorepo root marker).
-        monorepo_root = root.parent.parent
-        assert (monorepo_root / 'orchestrator').is_dir()
-        assert (monorepo_root / 'fused-memory').is_dir()
-        assert (monorepo_root / 'shared').is_dir()
+        assert root == fake_monorepo / 'data' / 'prompt_artifacts'
+
+    def test_empty_string_env_override_falls_through_to_walkup(self, monkeypatch, tmp_path):
+        # An empty string is falsy -> treated the same as "unset", not as an
+        # explicit override of "use this (empty) path".
+        monkeypatch.setenv('DARK_FACTORY_PROMPT_ARTIFACTS', '')
+        fake_monorepo = tmp_path / 'fake-monorepo'
+        module_file = _build_fake_monorepo_module_file(fake_monorepo)
+        monkeypatch.setattr(prompt_artifact, '__file__', str(module_file))
+
+        root = default_artifacts_root()
+
+        assert root == fake_monorepo / 'data' / 'prompt_artifacts'
+
+    def test_no_monorepo_marker_falls_back_to_cwd(self, monkeypatch, tmp_path):
+        monkeypatch.delenv('DARK_FACTORY_PROMPT_ARTIFACTS', raising=False)
+        # A module location with no orchestrator/fused-memory/shared marker
+        # anywhere above it -> the walk-up exhausts every parent unsatisfied.
+        isolated_module_file = tmp_path / 'isolated' / 'nested' / 'prompt_artifact.py'
+        isolated_module_file.parent.mkdir(parents=True)
+        isolated_module_file.write_text('', encoding='utf-8')
+        monkeypatch.setattr(prompt_artifact, '__file__', str(isolated_module_file))
+        fake_cwd = tmp_path / 'cwd-anchor'
+        fake_cwd.mkdir()
+        monkeypatch.chdir(fake_cwd)
+
+        root = default_artifacts_root()
+
+        assert root == fake_cwd / 'data' / 'prompt_artifacts'
