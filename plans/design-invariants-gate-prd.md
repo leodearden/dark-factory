@@ -215,7 +215,7 @@ No novel substrate; no G3 prerequisite tasks.
 
 | Other PRD / task | Direction | Seam mechanism | Owner | Status |
 |---|---|---|---|---|
-| Continuous-confusion-reduction PRD (sibling session, uncommitted at authoring) | consumes | `invariant_violated: <slug>` optional codebook field; slug vocabulary = design-invariants.md | field+pipeline: census PRD; vocabulary: **this PRD** | coordinated by brief-level convention; census PRD conforms to the slugs |
+| `plans/confusion-reduction-prd.md` (sibling; committed 3001e94d7a same day) | consumes | `invariant_violated: <slug>` optional codebook field; slug vocabulary = design-invariants.md | field+pipeline: census PRD (ships in its γ); vocabulary: **this PRD** | wired — census PRD §10 names this PRD reciprocally; no contested ownership |
 | Task **2563** (routing-intent lint) | precedent | point enforcement of INV-1 | 2563 | pending — cited, not re-filed |
 | Task **2558** (structured evidence + streak gate) | precedent | point enforcement of INV-2/INV-4 | 2558 | pending — cited, not re-filed |
 | Task 1746 (done) | precedent | gate-prose edits to skills/prd/references/gates.md flow through the orchestrator | — | landed 2026-06-15 |
