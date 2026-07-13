@@ -1229,3 +1229,56 @@ class TestNonBlockingPoll:
 
             scanner.release()
             await app.workers.wait_for_complete()
+
+
+class TestThreadedScanReachesUI:
+    """Extends TestRefreshWriteDiscipline to the threaded poll path
+    (_scan_registry_worker, see TestNonBlockingPoll): the off-thread scan's
+    result must actually reach the UI via the call_from_thread(_apply_scan)
+    hand-off, and that hand-off must remain a pure reader -- writing
+    nothing under sessions/ or decisions/, exactly like the synchronous
+    refresh_registry path. Uses the real (default) SessionScanner, not an
+    injected fake, to prove the actual production wiring end-to-end.
+    """
+
+    @pytest.mark.timeout(10)
+    async def test_worker_result_reaches_table_and_writes_nothing(self, tmp_path):
+        from cockpit.app import CockpitApp
+        from cockpit.panes.session_table import SessionTable
+
+        first = _make_record(session_slug='thread-1', status=sr.Status.RUNNING)
+        sr.write_record(first, root=tmp_path)
+
+        # A large poll_interval keeps on_mount's own set_interval timer from
+        # firing a second, uncontrolled worker mid-test -- the only scan
+        # driven here is the explicit _scan_registry_worker() call below.
+        app = CockpitApp(fleet_root=tmp_path, poll_interval=60)
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            table = app.query_one(SessionTable)
+            assert table.row_count == 1
+
+            second = _make_record(session_slug='thread-2', status=sr.Status.AWAITING_INPUT)
+            sr.write_record(second, root=tmp_path)
+
+            before = _snapshot_tree(tmp_path)
+            # sanity: prove the snapshot actually captured the seeded files,
+            # so the "unchanged" assertion below isn't vacuously true.
+            assert any(path.startswith('sessions/') for path in before)
+
+            worker = app._scan_registry_worker()
+            await worker.wait()
+            await pilot.pause()
+
+            # proves the off-thread -> call_from_thread(_apply_scan)
+            # hand-off actually reached the live SessionTable.
+            assert table.row_count == 2
+
+        after = _snapshot_tree(tmp_path)
+        for path, value in before.items():
+            if path.startswith(('sessions/', 'decisions/')):
+                assert after.get(path) == value, (
+                    f'{path} was created/modified/removed by the threaded refresh'
+                )
+        new_paths = set(after) - set(before)
+        assert not any(path.startswith(('sessions/', 'decisions/')) for path in new_paths)
