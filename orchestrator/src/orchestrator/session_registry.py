@@ -335,6 +335,12 @@ class DecisionRecord:
     manual_boost: an operator-assigned priority nudge; defaults to 0.
     state: current lifecycle state; see DecisionState. Defaults to
         ``DecisionState.OPEN``.
+    severity: the parked escalation's severity (info|blocking|critical|
+        urgent), used by the cockpit decision queue to weight this ask
+        relative to other rows. Defaults to '' (unknown/unset) when the
+        filer doesn't supply one or the record predates this field; ''
+        falls back to the scoring defaults.severity weight rather than
+        raising or coercing to a recognized value.
 
     Concurrency: unlike SessionRecord (single-writer-per-slug -- only the
     spawning session ever mutates its own record), a single decision id's
@@ -359,6 +365,7 @@ class DecisionRecord:
     options: list[str] | None = field(default=None, kw_only=True)
     manual_boost: int = field(default=0, kw_only=True)
     state: str = field(default=DecisionState.OPEN, kw_only=True)
+    severity: str = field(default='', kw_only=True)
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -372,6 +379,7 @@ class DecisionRecord:
             'options': self.options,
             'manual_boost': self.manual_boost,
             'state': str(self.state),
+            'severity': self.severity,
         }
 
     @classmethod
@@ -387,6 +395,7 @@ class DecisionRecord:
             options=data.get('options'),
             manual_boost=data.get('manual_boost', 0),
             state=data.get('state', DecisionState.OPEN),
+            severity=data.get('severity', ''),
         )
 
     def to_json(self) -> str:
