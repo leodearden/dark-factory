@@ -92,6 +92,24 @@ class TestDetectStopInstructionMatching:
         assert detect_stop_instruction() is None
 
 
+class TestDetectStopInstructionDeterminism:
+    """When a text matches more than one phrase, the reported phrase must be
+    stable/reproducible (task 2509 review amendment) rather than depend on
+    frozenset iteration order, which is not guaranteed stable across
+    processes."""
+
+    def test_multiple_matches_return_the_same_phrase_every_call(self):
+        from orchestrator.stop_instruction import detect_stop_instruction
+        text = 'Please do not run this step, and also do not execute that one.'
+        # Both 'do not run' and 'do not execute' are present. Sorted order
+        # ('do not execute' < 'do not run') must pick the same phrase on
+        # every call, in-process and across processes.
+        results = {detect_stop_instruction(text) for _ in range(10)}
+        assert results == {'do not execute'}, (
+            f'expected a single stable phrase across repeated calls, got {results!r}'
+        )
+
+
 class TestDetectStopInstructionVarargs:
     """detect_stop_instruction(*texts) matches if ANY positional text matches."""
 

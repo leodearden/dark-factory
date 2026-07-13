@@ -37,6 +37,31 @@ Design (see task 2509 plan design decisions):
   - A false positive here is fail-safe: it only routes work to a human,
     exactly as if the session had never run.
 
+KNOWN LIMITATIONS (non-blocking, task 2509 review amendment):
+  - Exact-spelling matching only. This is normalized SUBSTRING matching over
+    a curated phrase list, not natural-language understanding: a paraphrase
+    that interposes extra words — "do not, under any circumstances, apply",
+    "do not ever apply" — will NOT match 'do not apply' and will NOT be
+    caught here. For the mechanical surfaces (``b3_gate``,
+    ``DeterministicRunner``) this module IS the complete mechanical defense
+    and it is deliberately best-effort, not exhaustive — there is no prose
+    backstop underneath it the way the runbooks have. The ``/unblock`` and
+    ``unblock-low-risk`` runbook PROSE remains the primary defense against a
+    paraphrase, or against a stop instruction that was never persisted to
+    the task at all (a prior turn, live session context) — a human/agent
+    reading prose can recognize intent that substring matching cannot. Treat
+    this detector as defense-in-depth for the curated exact spellings, never
+    as a complete stop-instruction defense on its own.
+  - Some phrases ('do not run', 'do not execute', 'do not proceed') are
+    broad enough to plausibly appear in benign deploy/rollback prose (e.g.
+    "do not run this step manually") and could false-trigger
+    ``DeterministicRunner``'s guard on an otherwise-valid auto-deploy. This
+    is an accepted, deliberate tradeoff (see the task 2509 plan's FALSE-
+    POSITIVE POSTURE): a false positive here only routes the task to a
+    human — fail-safe, never an incorrect automated action — so erring
+    toward broader phrases is preferred over a narrower set that risks
+    silently missing a genuine stop instruction.
+
 This module is intentionally stdlib-only with no orchestrator imports, so
 that ``b3_gate`` (which stays dependency-light — stdlib ``sqlite3`` plus a
 lazily-imported config) can import it at module load with no new transitive
@@ -66,6 +91,16 @@ STOP_INSTRUCTION_PHRASES: frozenset[str] = frozenset({
 
 _WHITESPACE_RE = re.compile(r'\s+')
 
+# Deterministic scan order for detect_stop_instruction (task 2509 review
+# amendment): frozenset iteration order is not guaranteed stable across
+# processes/runs. When a scanned text contains more than one stop phrase,
+# the ORDER searched determines which canonical phrase is reported in the
+# abort reason / escalation detail. Sorting once at import time makes that
+# choice deterministic and reproducible instead of varying between
+# invocations — the verdict/outcome is unaffected either way, only the
+# reported phrase text.
+_SORTED_PHRASES: tuple[str, ...] = tuple(sorted(STOP_INSTRUCTION_PHRASES))
+
 
 def _normalize(text: str) -> str:
     """Casefold *text*, replace hyphens with spaces, collapse whitespace runs.
@@ -92,7 +127,7 @@ def detect_stop_instruction(*texts: str | None) -> str | None:
         if not text:
             continue
         normalized_text = _normalize(text)
-        for phrase in STOP_INSTRUCTION_PHRASES:
+        for phrase in _SORTED_PHRASES:
             if _normalize(phrase) in normalized_text:
                 return phrase
     return None
