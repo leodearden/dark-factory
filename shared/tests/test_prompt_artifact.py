@@ -447,6 +447,41 @@ class TestFailSafeUnverifiablePin:
 
         assert store.read_provenance('reviewer', 'claude-opus-4', 'v1') is None
 
+    def test_resolve_falls_back_when_heuristics_vanishes_after_provenance_check(
+        self, tmp_path, monkeypatch
+    ):
+        """Regression for a resolve() TOCTOU: heuristics.txt can vanish (e.g. a
+        concurrent unpin(), or an external deletion) between the provenance
+        validation and the heuristics read. resolve() must fail safe to the
+        in-code constant rather than let FileNotFoundError propagate — it is
+        documented to never raise.
+        """
+        store = PromptArtifactStore(tmp_path)
+        spec = _make_spec()
+        provenance = ArtifactProvenance(**_provenance_kwargs(harness_version='v1'))
+        store.pin('reviewer', 'claude-opus-4', 'v1', heuristics='h', provenance=provenance)
+        heuristics_path = store._key_dir('reviewer', 'claude-opus-4', 'v1') / 'heuristics.txt'
+
+        real_load_valid_provenance = prompt_artifact._load_valid_provenance
+
+        def racing_load_valid_provenance(path):
+            result = real_load_valid_provenance(path)
+            # Simulate a concurrent unpin()/external deletion landing right
+            # after the provenance check succeeds but before resolve() reads
+            # the heuristics file.
+            heuristics_path.unlink()
+            return result
+
+        monkeypatch.setattr(
+            prompt_artifact, '_load_valid_provenance', racing_load_valid_provenance
+        )
+
+        resolved = store.resolve(spec, executor_model='claude-opus-4', harness_version='v1')
+
+        assert resolved.source == 'in_code'
+        assert resolved.text == spec.in_code_constant
+        assert resolved.provenance is None
+
 
 class TestAtomicWriteText:
     """Direct coverage of the private write-then-replace helper's failure path."""

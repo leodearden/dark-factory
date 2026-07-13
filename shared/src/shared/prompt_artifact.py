@@ -216,13 +216,27 @@ class PromptArtifactStore:
     def resolve(
         self, spec: PromptSpec, executor_model: str, harness_version: str
     ) -> ResolvedPrompt:
+        """Resolve *spec* to a pinned artifact for this key, or the in-code fallback.
+
+        Never raises: any unverifiable on-disk state falls back to the
+        in-code constant — nothing pinned, an orphan heuristics file, a
+        corrupt/incomplete provenance sidecar, or a heuristics.txt that
+        vanishes between the provenance check below and the read (e.g. a
+        concurrent :meth:`unpin` racing this call).
+        """
         key_dir = self._key_dir(spec.prompt_id, executor_model, harness_version)
         heuristics_path = key_dir / _HEURISTICS_FILENAME
         provenance_path = key_dir / _PROVENANCE_FILENAME
         if heuristics_path.exists():
             provenance = _load_valid_provenance(provenance_path)
             if provenance is not None:
-                heuristics = heuristics_path.read_text(encoding='utf-8')
+                try:
+                    heuristics = heuristics_path.read_text(encoding='utf-8')
+                except OSError:
+                    # Concurrent unpin()/external deletion raced in between
+                    # the provenance check above and this read — fail safe
+                    # rather than let the error propagate.
+                    return ResolvedPrompt(spec.in_code_constant, None, 'in_code')
                 return ResolvedPrompt(
                     compose_prompt(spec.contract, heuristics), provenance, 'artifact'
                 )
