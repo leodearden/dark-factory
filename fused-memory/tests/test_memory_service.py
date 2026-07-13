@@ -2494,6 +2494,37 @@ class TestGetEntity:
         assert service.graphiti.search.call_args.kwargs['num_results'] == 10
 
     # ------------------------------------------------------------------
+    # exact-match-with-edges happy path through the restructured try/except
+    # (task 2448 review) — the degraded-fallback wrap below (test_degraded_
+    # fallback_on_exact_match_edge_fetch_quota_error) covers the failure
+    # branch of this exact same concurrent-edge code path; this test covers
+    # its success branch so a regression that silently dropped edges (or
+    # leaked degraded keys onto the clean path) inside the reworked
+    # `if exact:` block would be caught.
+    # ------------------------------------------------------------------
+
+    @pytest.mark.asyncio
+    async def test_exact_match_with_edges_happy_path_omits_degraded_keys(self, service):
+        """An exact-name hit whose edge fetch succeeds still returns real
+        nodes/edges through the try/except-wrapped exact-match branch, with
+        no 'degraded' or 'failed_stores' keys on the clean path."""
+        service.graphiti.get_nodes_by_exact_name = AsyncMock(
+            return_value=[{'uuid': 'u-115', 'name': 'Task 115', 'summary': 's', 'labels': []}]
+        )
+        service.graphiti.get_valid_edges_for_node = AsyncMock(
+            return_value=[{'uuid': 'e-1', 'fact': 'Task 115 depends on Task 5', 'name': 'DEPENDS_ON'}]
+        )
+
+        result = await service.get_entity('Task 115', project_id='test')
+
+        assert 'degraded' not in result
+        assert 'failed_stores' not in result
+        assert result == {
+            'nodes': [{'uuid': 'u-115', 'name': 'Task 115', 'summary': 's', 'labels': []}],
+            'edges': [{'uuid': 'e-1', 'fact': 'Task 115 depends on Task 5', 'temporal': None}],
+        }
+
+    # ------------------------------------------------------------------
     # degraded fallback on embedding-provider rate-limit/quota errors
     # (task 2448) — response SHAPE mirrors search()'s degraded/failed_stores
     # convention, but the TRIGGER is narrower: search() degrades on any
