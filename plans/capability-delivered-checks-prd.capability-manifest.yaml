@@ -8,7 +8,7 @@ prd: plans/capability-delivered-checks-prd.md
 schema_version: 1
 tasks:
   - label: "α"
-    task_id: null
+    task_id: 2574
     title: "Shared capability-manifest sidecar schema + delivered-check models"
     capabilities:
       - name: "delivered-checks-metadata-submodel-registered"
@@ -34,7 +34,7 @@ tasks:
           kind: manual
           reason: "rejection quality is judged by α's own test fixtures, not a grep"
   - label: "β"
-    task_id: null
+    task_id: 2576
     title: "/prd skill emits the YAML sidecar; exemplar committed"
     capabilities:
       - name: "decompose-step-2.5-names-the-yaml-sidecar"
@@ -46,7 +46,7 @@ tasks:
           paths: ["skills/prd/references/"]
           expect: present
   - label: "γ"
-    task_id: null
+    task_id: 2578
     title: "commit_planning stamps sidecar + copies delivered_checks"
     capabilities:
       - name: "manifest-stamping-report-in-commit-planning-response"
@@ -64,7 +64,7 @@ tasks:
           kind: manual
           reason: "merge-safety is a test property, not mechanically greppable"
   - label: "δ"
-    task_id: null
+    task_id: 2580
     title: "Scheduler delivered-check gate + runner + per-SHA cache"
     capabilities:
       - name: "deps-satisfied-consumes-delivered-check-cache"
@@ -76,7 +76,7 @@ tasks:
           paths: ["orchestrator/src/orchestrator/scheduler.py"]
           expect: present
   - label: "ε"
-    task_id: null
+    task_id: 2583
     title: "Grace-streak escalation + config knobs + ops docs"
     capabilities:
       - name: "l2-escalation-names-the-failed-check"
@@ -88,7 +88,7 @@ tasks:
           paths: ["orchestrator/src/orchestrator/"]
           expect: present
   - label: "ζ"
-    task_id: null
+    task_id: 2586
     title: "End-to-end integration gate"
     capabilities:
       - name: "boundary-sketch-green-e2e"
