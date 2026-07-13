@@ -494,8 +494,31 @@ class TestMetadataRegistration:
         assert all(isinstance(item, DeliveredCheckMeta) for item in slice_value)
         assert [item.name for item in slice_value] == ['cap-one', 'cap-two']
         dumped = model.model_dump()['delivered_checks']
-        assert dumped == [grep_entry, script_entry]
         assert all(not isinstance(item, BaseModel) for item in dumped)
+        # Full dump includes every field (defaults included), not just the
+        # sparse input — pins the round-tripped shape.
+        assert dumped == [
+            {
+                'name': 'cap-one',
+                'kind': 'grep',
+                'pattern': 'foo',
+                'expect': 'present',
+                'paths': [],
+                'script': None,
+                'args': [],
+                'timeout_secs': None,
+            },
+            {
+                'name': 'cap-two',
+                'kind': 'script',
+                'pattern': None,
+                'expect': None,
+                'paths': [],
+                'script': 'scripts/x.sh',
+                'args': [],
+                'timeout_secs': 30,
+            },
+        ]
 
     def test_no_unknown_key_warning_for_delivered_checks(self):
         grep_entry = {'name': 'cap-one', 'kind': 'grep', 'pattern': 'foo', 'expect': 'present'}

@@ -27,9 +27,12 @@ from typing import Literal
 import yaml
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
+from shared.task_metadata import register_metadata_submodel
+
 __all__ = [
     'CapabilityManifestDoc',
     'DeliveredCheck',
+    'DeliveredCheckMeta',
     'ManifestCapability',
     'ManifestTask',
     'load_capability_manifest',
@@ -218,3 +221,53 @@ def load_capability_manifest(path: str | Path) -> CapabilityManifestDoc:
     with open(path, encoding='utf-8') as fh:
         data = yaml.safe_load(fh)
     return parse_capability_manifest(data)
+
+
+class DeliveredCheckMeta(BaseModel):
+    """A single ``metadata.delivered_checks`` entry (PRD §Contract).
+
+    The registered shape for the W10 ``metadata.delivered_checks`` slice
+    (see this module's docstring): ``commit_planning``'s per-capability copy
+    of a sidecar :class:`DeliveredCheck`, minus the ``'manual'`` kind (a
+    manual check is never copied to metadata — it stays sidecar-only and
+    excluded from the automated gate) plus a required ``name`` (the
+    capability name, so a gate-failure escalation can name which capability
+    failed). Shares :class:`DeliveredCheck`'s grep/script cross-field
+    validation via :func:`_check_kind_conditional_fields`.
+    """
+
+    model_config = ConfigDict(extra='forbid')
+
+    name: str = Field(min_length=1)
+    kind: Literal['grep', 'script']
+    pattern: str | None = None
+    expect: Literal['present', 'absent'] | None = None
+    paths: list[str] = Field(default_factory=list)
+    script: str | None = None
+    args: list[str] = Field(default_factory=list)
+    timeout_secs: int | None = None
+
+    @model_validator(mode='after')
+    def _check_fields(self) -> DeliveredCheckMeta:
+        _check_kind_conditional_fields(
+            kind=self.kind,
+            pattern=self.pattern,
+            expect=self.expect,
+            paths=self.paths,
+            script=self.script,
+            args=self.args,
+            timeout_secs=self.timeout_secs,
+        )
+        return self
+
+
+# The one sanctioned shared/ registration call (deploy_state.py precedent):
+# importing this module registers DeliveredCheckMeta into
+# shared.task_metadata's per-process _SUBMODEL_REGISTRY, so parse_metadata
+# validates and types a `delivered_checks` slice and never emits an
+# `unknown_key` SchemaWarning for it. Deliberately NOT done at
+# shared.task_metadata import time — would collide with
+# shared/tests/test_task_metadata.py's TestSubmodelRegistry stub
+# registrations (see this module's docstring, and deploy_state.py's own
+# docstring for the same reasoning).
+register_metadata_submodel('delivered_checks', DeliveredCheckMeta)
