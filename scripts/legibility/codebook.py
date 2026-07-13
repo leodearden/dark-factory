@@ -218,6 +218,82 @@ def validate(codebook: dict) -> list[str]:
     return errors
 
 
+def _build_sighting(payload: dict, *, session: str, date: str, project: str) -> dict:
+    """Build a sighting dict from a match/candidate payload + record header
+    fields. invariant_violated/note/evidence_quote are included only when
+    truthy (never emitted as an explicit null/empty key)."""
+    sighting = {
+        "date": date,
+        "project": project,
+        "session": session,
+        "origin_phase": payload.get("origin_phase", "unknown"),
+        "manifested_phase": payload.get("manifested_phase", "unknown"),
+    }
+    invariant_violated = payload.get("invariant_violated")
+    if invariant_violated:
+        sighting["invariant_violated"] = invariant_violated
+    note = payload.get("note")
+    if note:
+        sighting["note"] = note
+    evidence_quote = payload.get("evidence_quote")
+    if evidence_quote:
+        sighting["evidence_quote"] = evidence_quote
+    return sighting
+
+
+def apply_coding_record(codebook: dict, record: dict) -> tuple[dict, dict]:
+    """Apply one §7.3 coding record to a v2 codebook. Sole-writer merge.
+
+    Operates on a deep copy — never mutates `codebook` in place. Returns
+    `(new_codebook, stats)` where stats has keys `matched`,
+    `skipped_unknown_entry`, `candidates_applied`, `record_invalid`.
+
+    A record that fails `validate_coding_record()` is skipped WHOLE (never
+    partially applied): the input codebook comes back unchanged (deep
+    copy) and `stats['record_invalid']` is True.
+
+    Match handling: an entry_id that doesn't resolve to an existing entry
+    is counted as skipped and never fabricated into a new entry — only the
+    census promotes candidates to entries. A sighting is appended to the
+    matched entry only if no existing sighting on that entry already
+    carries this session (dedup key: (session, entry_id), the entry being
+    implicit in "that entry's sightings list").
+    """
+    stats = {
+        "matched": 0,
+        "skipped_unknown_entry": 0,
+        "candidates_applied": 0,
+        "record_invalid": False,
+    }
+
+    result = copy.deepcopy(codebook)
+
+    record_errors = validate_coding_record(record)
+    if record_errors:
+        stats["record_invalid"] = True
+        return result, stats
+
+    session = record["session"]
+    date = record["date"]
+    project = record["project"]
+
+    entries_by_id = {e["id"]: e for e in result.get("entries", [])}
+
+    for match in record.get("matches", []) or []:
+        entry = entries_by_id.get(match.get("entry_id"))
+        if entry is None:
+            stats["skipped_unknown_entry"] += 1
+            continue
+        sightings = entry.setdefault("sightings", [])
+        existing_sessions = {s.get("session") for s in sightings}
+        if session in existing_sessions:
+            continue
+        sightings.append(_build_sighting(match, session=session, date=date, project=project))
+        stats["matched"] += 1
+
+    return result, stats
+
+
 def validate_coding_record(record: dict) -> list[str]:
     """Validate a §7.3 coding record (coder output -> merger input).
 
