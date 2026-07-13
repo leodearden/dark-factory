@@ -65,21 +65,35 @@ def _log(msg: str) -> None:
 class McpClient:
     """Minimal HTTP/JSON-RPC client for an escalation MCP server."""
 
-    def __init__(self, url: str):
+    def __init__(self, url: str, transport: httpx.AsyncBaseTransport | None = None):
         self._url = url.rstrip('/')
         self._client: httpx.AsyncClient | None = None
         self._session_id: str | None = None
+        self._transport = transport
 
     async def __aenter__(self) -> McpClient:
-        self._client = httpx.AsyncClient(timeout=30.0, follow_redirects=True)
-        self._session_id = uuid.uuid4().hex
-        await self._post({
-            'jsonrpc': '2.0', 'id': 1, 'method': 'initialize',
-            'params': {'protocolVersion': '2024-11-05',
-                       'clientInfo': {'name': 'cgl-sched-gate', 'version': '1.0'},
-                       'capabilities': {}},
-        })
-        await self._post({'jsonrpc': '2.0', 'method': 'notifications/initialized', 'params': {}})
+        self._client = httpx.AsyncClient(
+            timeout=30.0, follow_redirects=True, transport=self._transport,
+        )
+        try:
+            # No session id on the FIRST request: the MCP streamable-HTTP contract
+            # requires `initialize` to be sent session-less. A STATEFUL server
+            # (e.g. the escalation servers) 404s "Session not found" if a client
+            # invents its own id here. The server-assigned id is captured from the
+            # initialize response in `_post` below and reused from then on.
+            await self._post({
+                'jsonrpc': '2.0', 'id': 1, 'method': 'initialize',
+                'params': {'protocolVersion': '2024-11-05',
+                           'clientInfo': {'name': 'cgl-sched-gate', 'version': '1.0'},
+                           'capabilities': {}},
+            })
+            await self._post({'jsonrpc': '2.0', 'method': 'notifications/initialized', 'params': {}})
+        except Exception:
+            # __aexit__ is never called if __aenter__ raises, so close the
+            # just-created client ourselves to avoid leaking the connection
+            # pool (e.g. when initialize 404s against a stateful server).
+            await self._client.aclose()
+            raise
         return self
 
     async def __aexit__(self, *exc) -> None:
@@ -91,10 +105,18 @@ class McpClient:
         headers = {
             'Content-Type': 'application/json',
             'Accept': 'application/json, text/event-stream',
-            'mcp-session-id': self._session_id or '',
         }
-        resp = await self._client.post(f'{self._url}/mcp/', json=payload, headers=headers)
+        if self._session_id is not None:
+            headers['mcp-session-id'] = self._session_id
+        resp = await self._client.post(f'{self._url}/mcp', json=payload, headers=headers)
         resp.raise_for_status()
+        # Capture the server-assigned session id (returned on `initialize`) so
+        # it can be reused on every subsequent request. Must happen before the
+        # 202/empty-content early return below, since `initialize` responses
+        # carry a JSON body but `notifications/initialized` may not.
+        sid = resp.headers.get('mcp-session-id')
+        if sid:
+            self._session_id = sid
         if resp.status_code == 202 or not resp.content:
             return {}
         if 'text/event-stream' in resp.headers.get('content-type', ''):
@@ -128,9 +150,10 @@ async def _one(name: str, url: str, tool: str, reason: str) -> bool:
     try:
         async with McpClient(url) as client:
             res = await client.call_tool(tool, {'reason': reason})
-        if res.get('error'):
-            _log(f'{name} ({url}): {tool} -> error: {res["error"]}')
-            return False
+        # NOTE: call_tool() already raises RuntimeError when the JSON-RPC
+        # result carries an 'error' key (see McpClient.call_tool), so a
+        # successfully-returned `res` here can never contain one — that
+        # failure mode is handled by the `except Exception` clause below.
         key = 'halted' if tool == 'halt_scheduler' else 'resumed'
         _log(f'{name} ({url}): {tool} ok ({key}={res.get(key)}, was_paused={res.get("was_paused")})')
         return bool(res.get(key))
