@@ -1645,18 +1645,26 @@ class DeterministicRunner:
                         timeout=outer_timeout,
                     )
                 except TimeoutError:
+                    # This guard now bounds the delegated plan.execute() call,
+                    # which runs BOTH the deploy subprocess and the post-deploy
+                    # verify re-inspect (_capturing_inspector -> inspect_fn) —
+                    # asyncio.wait_for cannot tell which of the two was still
+                    # pending when the timeout fired, so the message must not
+                    # pin the blame solely on "the subprocess".
                     timeout_detail = '\n'.join([
                         description,
                         f'Target unit: {target_unit}',
-                        f'Deploy run_fn exceeded the outer guard timeout ({outer_timeout}s = '
+                        f'Deploy run+verify exceeded the outer guard timeout ({outer_timeout}s = '
                         f"before_done['timeout_secs'] + run_timeout_grace_secs).",
-                        'The subprocess may be detached/unkillable — check the unit out-of-band '
-                        '(e.g. systemctl --user status, ps) before taking further action.',
+                        'The hang may be in the deploy subprocess itself or in the post-deploy '
+                        'unit inspect (verify) — the outer guard wraps both and cannot '
+                        'distinguish which was pending. Check the unit out-of-band (e.g. '
+                        'systemctl --user status, ps) before taking further action.',
                         'before_done_ran_at is already stamped (I1) — the deploy is NOT re-run.',
                     ])
                     return await self._file_infra_issue_and_block(
                         task_id,
-                        summary=f'Deploy run_fn timed out (subprocess hung): {target_unit}',
+                        summary=f'Deploy run+verify exceeded outer guard: {target_unit}',
                         detail=timeout_detail,
                     )
                 except Exception as exc:

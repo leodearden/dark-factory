@@ -1016,7 +1016,7 @@ class TestCrossUnitDeployDelegatesToRestartPlan:
         assert outcome == WorkflowOutcome.BLOCKED
         pending = queue.get_by_task('965', status='pending')
         assert len(pending) == 1
-        assert pending[0].summary.startswith('Deploy run_fn timed out')
+        assert pending[0].summary.startswith('Deploy run+verify exceeded outer guard')
 
 
 # ---------------------------------------------------------------------------
