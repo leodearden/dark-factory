@@ -502,6 +502,48 @@ def _read_latest_proposal(
 
 
 # ---------------------------------------------------------------------------
+# _read_task_description
+# ---------------------------------------------------------------------------
+
+def _read_task_description(
+    task_id: int | str,
+    project_root: str | Path,
+    *,
+    tag: str = DEFAULT_TAG,
+) -> str | None:
+    """Read the task's description column from tasks.db for the given task.
+
+    Returns None on any error (missing db, missing row, missing/empty
+    description) — an empty string is treated as "no description" so callers
+    can pass the result straight through to check_proposal's extra_texts
+    without a separate truthiness check. Read-only (mode=ro), stdlib sqlite3
+    only — sibling pattern to _read_latest_proposal above.
+    """
+    try:
+        db_path = Path(project_root) / '.taskmaster' / 'tasks' / 'tasks.db'
+        if not db_path.exists():
+            return None
+        uri = f'file:{db_path}?mode=ro'
+        try:
+            conn = sqlite3.connect(uri, uri=True)
+        except sqlite3.OperationalError:
+            return None
+        try:
+            cursor = conn.execute(
+                'SELECT description FROM tasks WHERE tag=? AND id=?',
+                (tag, int(task_id)),
+            )
+            row = cursor.fetchone()
+        finally:
+            conn.close()
+        if row is None or not row[0]:
+            return None
+        return row[0]
+    except Exception:
+        return None
+
+
+# ---------------------------------------------------------------------------
 # _resolve_cap
 # ---------------------------------------------------------------------------
 
@@ -561,12 +603,14 @@ def run_check(args: argparse.Namespace) -> None:
     tag = getattr(args, 'tag', DEFAULT_TAG)
     entry = _read_latest_proposal(args.task_id, args.project_root, tag=tag)
     category = getattr(args, 'category', None)
+    description = _read_task_description(args.task_id, args.project_root, tag=tag)
 
     result = check_proposal(
         entry,
         worktree=args.worktree,
         category=category,
         now=now,
+        extra_texts=[description] if description else None,
     )
 
     # Add state-derived fields — fail CLOSED on corrupt state
