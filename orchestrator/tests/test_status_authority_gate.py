@@ -15,6 +15,18 @@ call that schedules background coros into ``harness._background_tasks``)
 followed by draining those coros, then asserts the scheduler's
 ``set_task_status`` target — the product's own read path on the harness
 side (mirrors test_harness_action_dispatch.py / test_harness_infra_hold_repend.py).
+
+Deliberate mock-assertion style, unlike the fused-memory/escalation ζ gate
+modules: these cells assert via a ``MagicMock`` scheduler's
+``set_task_status.assert_awaited_once_with(...)``, not a persisted row read
+back through a real store — driving ``_on_escalation_resolved`` against a
+real ``Scheduler`` is impractical here (it would need a live dispatch loop
+and backing store this module has no other reason to stand up). This is the
+intentionally-mocked "harness face" that complements the two-way
+store/server read-path rows in the fused-memory and escalation suites:
+together they cover both sides of the escalation<->harness seam, even
+though this side confirms only "the harness issued the call", not "a row
+landed in the intended state".
 """
 
 from __future__ import annotations
