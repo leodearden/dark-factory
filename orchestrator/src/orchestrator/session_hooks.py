@@ -246,10 +246,18 @@ def _resolve_wm_window_id(
     attempt, no matching line, or any unexpected exception (from *run*,
     parsing, or *sleep*) all return ``None`` rather than raising -- a
     resolution miss must degrade cleanly to ``display=None``, never worse.
+
+    A returncode of 127 -- ``_wmctrl_list``'s sentinel for a missing
+    ``wmctrl`` binary -- is a permanent failure, not the transient
+    window-mapping race the retry loop exists for, so it short-circuits on
+    the first probe instead of paying the full *attempts* x sleep cost
+    (this runs synchronously inside the SessionStart hook).
     """
     try:
         for attempt in range(attempts):
             result = run(['wmctrl', '-l'])
+            if result.returncode == 127:
+                return None
             if result.returncode == 0:
                 for line in result.stdout.splitlines():
                     columns = line.split(None, 3)
