@@ -14,7 +14,7 @@ import { createRequire } from 'node:module';
 
 import layout from '../../src/dashboard/static/redux/graph_layout.js';
 
-const { computeTiers } = layout;
+const { computeTiers, countCrossings } = layout;
 
 const MODULE_SPECIFIER = '../../src/dashboard/static/redux/graph_layout.js';
 const EXPECTED_FUNCTION_NAMES = [
@@ -115,4 +115,57 @@ test('computeTiers: a 2-cycle does not infinite-loop and returns finite tiers', 
 test('computeTiers: empty input yields an empty Map', () => {
   const tiers = computeTiers([]);
   assert.equal(tiers.size, 0);
+});
+
+// ---------------------------------------------------------------------------
+// countCrossings — pairwise inversion count between ADJACENT tiers only.
+// rows is an array of per-tier arrays of task objects (the shape orderRows
+// produces); countCrossings keys on each row entry's `t.id` to match against
+// edges, whose shape is {from: <upper/parentId>, to: <lower/childId>}.
+// Multi-tier ("long") edges whose endpoints are not in an adjacent tier pair
+// are not counted (documented v1 no-dummy-node limitation).
+// ---------------------------------------------------------------------------
+
+test('countCrossings: single inversion between two tiers returns 1', () => {
+  const rows = [[mkTask('P1'), mkTask('P2')], [mkTask('C1'), mkTask('C2')]];
+  const edges = [
+    { from: 'P1', to: 'C2' },
+    { from: 'P2', to: 'C1' },
+  ];
+  assert.equal(countCrossings(rows, edges), 1);
+});
+
+test('countCrossings: reordering the lower tier to uncross yields 0', () => {
+  const rows = [[mkTask('P1'), mkTask('P2')], [mkTask('C2'), mkTask('C1')]];
+  const edges = [
+    { from: 'P1', to: 'C2' },
+    { from: 'P2', to: 'C1' },
+  ];
+  assert.equal(countCrossings(rows, edges), 0);
+});
+
+test('countCrossings: parallel (non-crossing) edges return 0', () => {
+  const rows = [[mkTask('P1'), mkTask('P2')], [mkTask('C1'), mkTask('C2')]];
+  const edges = [
+    { from: 'P1', to: 'C1' },
+    { from: 'P2', to: 'C2' },
+  ];
+  assert.equal(countCrossings(rows, edges), 0);
+});
+
+test('countCrossings: crossings across two adjacent tier pairs sum together', () => {
+  const rows = [
+    [mkTask('A1'), mkTask('A2')],
+    [mkTask('B1'), mkTask('B2')],
+    [mkTask('C1'), mkTask('C2')],
+  ];
+  const edges = [
+    // tier0 -> tier1: one inversion
+    { from: 'A1', to: 'B2' },
+    { from: 'A2', to: 'B1' },
+    // tier1 -> tier2: one inversion
+    { from: 'B1', to: 'C2' },
+    { from: 'B2', to: 'C1' },
+  ];
+  assert.equal(countCrossings(rows, edges), 2);
 });
