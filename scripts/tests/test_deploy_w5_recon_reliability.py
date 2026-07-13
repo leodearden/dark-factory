@@ -297,3 +297,55 @@ def test_check_mode_is_noop(tmp_path, flag):
     assert state["systemctl_calls"] == [], f"state={state!r}"
     assert state["curl_calls"] == [], f"state={state!r}"
     assert state["journalctl_calls"] == [], f"state={state!r}"
+
+
+# ---------------------------------------------------------------------------
+# step-3: RED -- apply restarts the correct unit BEFORE verifying, and
+# rejects unknown args without restarting
+# ---------------------------------------------------------------------------
+
+def test_apply_restarts_fused_memory_then_verifies(tmp_path):
+    """A full apply run (no flags), with fake curl answering /health 200 and
+    fake journalctl emitting the RECON_MARKER, must exit 0 and record a
+    `systemctl --user restart fused-memory.service` call. The ordering
+    witnesses prove verify runs strictly AFTER restart -- not merely that
+    both happened somewhere in the run."""
+    result = _run_script(tmp_path, curl_fail_remaining=0, journalctl_marker=RECON_MARKER)
+
+    assert result.returncode == 0, (
+        f"Expected apply to exit 0; got {result.returncode}\n"
+        f"stdout={result.stdout!r} stderr={result.stderr!r}"
+    )
+
+    state = _state(tmp_path)
+    assert ["restart", UNIT] in state["systemctl_calls"], (
+        f"Expected a `systemctl --user restart {UNIT}` call; state={state!r}"
+    )
+    assert state.get("restart_called_before_first_curl") is True, (
+        f"Expected the restart to already have run by the first curl call "
+        f"(health verify strictly after restart); state={state!r}"
+    )
+    assert state.get("restart_called_before_first_journalctl") is True, (
+        f"Expected the restart to already have run by the first journalctl "
+        f"call (serving-sanity verify strictly after restart); state={state!r}"
+    )
+
+
+def test_unknown_argument_is_rejected_without_restarting(tmp_path):
+    """An unrecognized argument (e.g. --bogus) exits non-zero with a stderr
+    message and performs no restart or verify call at all."""
+    result = _run_script(tmp_path, "--bogus")
+
+    assert result.returncode != 0, (
+        f"Expected --bogus to be rejected with a non-zero exit; got 0\n"
+        f"stdout={result.stdout!r} stderr={result.stderr!r}"
+    )
+    assert result.stderr.strip(), (
+        f"Expected a non-empty stderr message for the rejected argument; "
+        f"stdout={result.stdout!r} stderr={result.stderr!r}"
+    )
+
+    state = _state(tmp_path)
+    assert state["systemctl_calls"] == [], f"state={state!r}"
+    assert state["curl_calls"] == [], f"state={state!r}"
+    assert state["journalctl_calls"] == [], f"state={state!r}"
