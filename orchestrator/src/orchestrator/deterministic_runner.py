@@ -158,11 +158,18 @@ import logging
 import os
 import signal
 from datetime import UTC, datetime
+from pathlib import Path
 from typing import TYPE_CHECKING
 
 from shared.task_metadata import DoneProvenance
 
 from orchestrator import systemd_inspect
+from orchestrator.proc_supervision import (
+    EscalationSpec,
+    FreshPidVerify,
+    RestartDisposition,
+    RestartPlan,
+)
 from orchestrator.systemd_inspect import inspect_systemd_unit
 from orchestrator.workflow import WorkflowOutcome
 
@@ -219,6 +226,20 @@ _INSPECT_TIMEOUT_SECS: float = systemd_inspect._INSPECT_TIMEOUT_SECS
 # same task_id (e.g. a starvation-watchdog filing) must never alias as this
 # runner's own dedup/quiescence/resolution-proof signal.
 DETERMINISTIC_AGENT_ROLE: str = 'orchestrator-deterministic'
+
+# Task 2238 (W10-δ): a guaranteed-non-self placeholder `own_unit` fed to
+# proc_supervision.RestartPlan.execute() on the cross-unit blocking deploy
+# path when the runner's own ORCH_UNIT-derived own_unit is falsy (the
+# fail-open case, ORCH_UNIT unset).  RestartPlan.execute()'s RP-1 fail-closed
+# guard refuses a blocking restart whenever own_unit is falsy — but the
+# runner only reaches the cross-unit branch AFTER its own `self_target` check
+# above has already ruled out a same-unit restart, so forcing a truthy,
+# provably-non-target own_unit here routes execute() into RP-2 (cross-unit
+# blocking + verify) instead of RP-1 (refuse), preserving the existing
+# fail-open-to-cross-unit behaviour (see test_env_unset_takes_cross_unit_path).
+# Not a valid systemd unit name (unit names never contain angle brackets), so
+# it can never collide with a real target_unit.
+_CROSS_UNIT_OWN_UNIT_SENTINEL: str = '<no-self-target-known>'
 
 
 def _build_done_provenance(kind: str, **fields: object) -> dict:
@@ -346,10 +367,18 @@ class DeterministicRunner:
     ) -> tuple[int, str]:
         """Schedule a detached systemd-run transient unit for a self-restart.
 
-        Uses a SINGLE ``--on-active`` transient unit whose payload is a
-        ``/bin/sh -c`` wrapper that runs the restart script and, *only if it
-        exits non-zero*, fires δ's escalation-submit CLI before re-raising the
-        original exit code (so journald records the unit as failed):
+        Thin ``proc_supervision.RestartPlan`` caller (task 2238/δ) — mirrors
+        ``service_restart.schedule_detached_systemd_restart``'s conversion
+        (task 2237/γ). Builds a same-unit, DETACHED ``RestartPlan``
+        (``target_unit == own_unit == transient_unit``, ``verify=None``,
+        ``transient_unit`` set) carrying an ``EscalationSpec`` for the RP-4
+        on-failure wrapper, and delegates the actual systemd-run registration
+        to ``plan.execute()``. ``RestartPlan.execute()``'s detached path
+        (``_execute_detached_systemd_run``) builds a SINGLE ``--on-active``
+        transient unit whose payload is a ``/bin/sh -c`` wrapper that runs the
+        restart script and, *only if it exits non-zero*, fires δ's
+        escalation-submit CLI before re-raising the original exit code (so
+        journald records the unit as failed):
 
             <script> <args>
             __rc=$?
@@ -373,13 +402,8 @@ class DeterministicRunner:
 
         Returns:
             (rc, tail) — rc=0 on successful registration; rc≠0 if registration
-            fails (tail carries the error output).
+            fails (tail carries the error detail).
         """
-        import shlex
-        import sys
-        from pathlib import Path
-
-        queue_dir = str(self.escalation_queue.queue_dir)
         target_unit = before_done.get('target_unit', 'unknown')
         script = before_done['script']
         args = before_done.get('args') or []
@@ -391,16 +415,20 @@ class DeterministicRunner:
         # before_done['cwd'] when the caller supplied one; otherwise fall back
         # to this process's own os.getcwd(), which is project_root because the
         # orchestrator's own systemd unit pins WorkingDirectory=project_root.
+        # RestartPlan.__post_init__ absolutizes a relative `script` against
+        # this `cwd` (RP-3), byte-identical to this method's prior inline
+        # absolutization.
         cwd = before_done.get('cwd') or os.getcwd()
 
         esc_summary = summary or (
             f'Self-restart fire-time failure: {target_unit}'
         )
 
-        # δ's escalation-submit CLI, run ONLY when the restart fails at fire time.
-        # sys.executable → python -m escalation submit (robust against PATH in the
-        # detached systemd user environment).  agent-role keeps the sentinel
-        # prefix so the file-backed CLI stamps a real born-at-L2 record.
+        # δ's escalation-submit CLI, fired ONLY when the restart fails at fire
+        # time — built here as data and handed to RestartPlan/EscalationSpec,
+        # which owns the RP-4 on-failure ``/bin/sh -c`` wrapper + the
+        # ``python -m escalation submit`` argv construction (byte-identical to
+        # this method's prior inline argv — see EscalationSpec.to_submit_argv).
         #
         # Deployment assumption: the `escalation` package must be importable from
         # sys.executable's interpreter (i.e. installed into site-packages, not
@@ -411,65 +439,40 @@ class DeterministicRunner:
         #   <sys.executable> -c "import escalation"
         # before deploying.  A marker-file fallback is intentionally not
         # implemented here to keep the failure path auditable via journald.
-        escalation_cmd = [
-            sys.executable, '-m', 'escalation', 'submit',
-            '--queue-dir', queue_dir,
-            '--task', task_id,
-            '--severity', 'critical',
-            '--category', 'infra_issue',
-            '--summary', esc_summary[:200],
-            '--agent-role', 'orchestrator-deterministic',
-            '--detail', (
+        escalation_spec = EscalationSpec(
+            queue_dir=str(self.escalation_queue.queue_dir),
+            task_id=task_id,
+            summary=esc_summary,
+            detail=(
                 f'Transient unit {transient_unit} fired and failed (task {task_id}). '
                 f'Check journald for restart output: '
                 f'journalctl --user -u {transient_unit}'
             ),
-        ]
-
-        # Wrap the restart payload so the escalation fires only on failure.  The
-        # exit code is preserved (`exit "$__rc"`) so journald records the failure.
-        # Note: --collect removes the unit from `systemctl --failed` after it
-        # exits (whether success or failure); journald retains the full log.
-        #
-        # Absolutize a relative script against cwd (mirrors service_restart.py's
-        # `target = Path(project_root) / script`): defense-in-depth so the script
-        # is still found even if --working-directory were ever ignored. Scripts
-        # already absolute are left unchanged (no double-join under cwd).
-        script_abs = script if Path(script).is_absolute() else str(Path(cwd) / script)
-        payload = ' '.join(shlex.quote(p) for p in [script_abs, *args])
-        on_failure = ' '.join(shlex.quote(p) for p in escalation_cmd)
-        wrapped = (
-            f'{payload}; __rc=$?; '
-            f'if [ "$__rc" -ne 0 ]; then {on_failure}; fi; '
-            f'exit "$__rc"'
+            severity='critical',
+            category='infra_issue',
+            agent_role=DETERMINISTIC_AGENT_ROLE,
         )
 
-        # --on-active=<N>: fires N seconds after this run() returns (manifest §53)
-        # and, crucially, does NOT execute at registration time — so the failure
-        # branch (and its escalation) is never reached on the success path.
-        main_argv = [
-            'systemd-run', '--user',
-            f'--on-active={on_active_secs}',
-            f'--unit={transient_unit}',
-            '--collect',
-            f'--working-directory={cwd}',
-            '/bin/sh', '-c', wrapped,
-        ]
-        proc = await asyncio.create_subprocess_exec(
-            *main_argv,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.STDOUT,
+        plan = RestartPlan(
+            script=Path(script),
+            args=list(args),
+            cwd=Path(cwd),
+            target_unit=transient_unit,
+            own_unit=transient_unit,
+            on_failure_escalation=escalation_spec,
+            verify=None,
+            transient_unit=transient_unit,
+            on_active_secs=on_active_secs,
         )
-        stdout, _ = await proc.communicate()
-        rc = proc.returncode or 0
-        tail = (stdout or b'').decode(errors='replace')[-2000:]
-        if rc != 0:
+        outcome = await plan.execute()
+        if outcome.disposition == RestartDisposition.REGISTRATION_FAILED:
             logger.warning(
                 'DeterministicRunner: failed to register restart transient unit %s '
-                '(rc=%d) for task %s',
-                transient_unit, rc, task_id,
+                'for task %s: %s',
+                transient_unit, task_id, outcome.detail,
             )
-        return rc, tail
+            return 1, outcome.detail
+        return 0, ''
 
     async def _default_inspect_unit(self, unit: str) -> dict:
         """Query systemctl for unit state fields needed for fresh-PID verify.
