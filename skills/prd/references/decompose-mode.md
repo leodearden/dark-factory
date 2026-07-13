@@ -35,7 +35,7 @@ Enumerate every task in the PRD's decomposition plan. For each:
 
 If any leaf task lacks a user-observable signal, **stop** and surface to the user. If any intermediate task has no named downstream consumer, surface it — typically the decomposition is missing an integration-gate task.
 
-### Step 2.7 — G7 walk (design invariants)
+### Step 2.3 — G7 walk (design invariants)
 
 Read `docs/legibility/design-invariants.md` — the single normative list; do not restate the invariants here beyond their slugs, per INV-5 (`no-lockstep-duplication`). Walk **every task in the batch** (not only leaves — violations attach to mechanisms, which intermediates introduce too) against each invariant's checkable question.
 
