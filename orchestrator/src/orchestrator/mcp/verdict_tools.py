@@ -63,6 +63,17 @@ def _envelope(role: str, session_id: str, payload: dict) -> dict:
 # ---------------------------------------------------------------------------
 
 
+def _write_and_ack(
+    artifacts: TaskArtifacts, role: str, session_id: str, payload: dict
+) -> dict[str, Any]:
+    """Envelope *payload*, write it to ``verdicts/<role>.json``, and return
+    the ``{'status': 'ok', 'role': role}`` acknowledgement shared by all
+    four ``_submit_*`` functions below.
+    """
+    artifacts.write_verdict(role, _envelope(role, session_id, payload))
+    return {'status': 'ok', 'role': role}
+
+
 def _submit_review_verdict(
     artifacts: TaskArtifacts,
     role: str,
@@ -92,8 +103,7 @@ def _submit_review_verdict(
         'issues': issues,
         'summary': summary,
     }
-    artifacts.write_verdict(role, _envelope(role, session_id, payload))
-    return {'status': 'ok', 'role': role}
+    return _write_and_ack(artifacts, role, session_id, payload)
 
 
 def _submit_completion_verdict(
@@ -111,8 +121,7 @@ def _submit_completion_verdict(
         'uncovered_plan_steps': uncovered_plan_steps,
         'substantive_work': substantive_work,
     }
-    artifacts.write_verdict(role, _envelope(role, session_id, payload))
-    return {'status': 'ok', 'role': role}
+    return _write_and_ack(artifacts, role, session_id, payload)
 
 
 def _submit_triage(
@@ -128,8 +137,7 @@ def _submit_triage(
         'skipped': skipped,
         'proposed_task_groups': proposed_task_groups,
     }
-    artifacts.write_verdict(role, _envelope(role, session_id, payload))
-    return {'status': 'ok', 'role': role}
+    return _write_and_ack(artifacts, role, session_id, payload)
 
 
 def _submit_merge_disposition(
@@ -143,8 +151,7 @@ def _submit_merge_disposition(
         'blocked': blocked,
         'reason': reason,
     }
-    artifacts.write_verdict(role, _envelope(role, session_id, payload))
-    return {'status': 'ok', 'role': role}
+    return _write_and_ack(artifacts, role, session_id, payload)
 
 
 # ---------------------------------------------------------------------------
