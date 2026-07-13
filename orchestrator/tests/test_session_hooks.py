@@ -332,6 +332,122 @@ def test_run_session_start_no_parent_id_env_leaves_parent_session_id_none(tmp_pa
 
 
 # ---------------------------------------------------------------------------
+# Task 2510 step-1: _resolve_wm_window_id resolver (Fleet Cockpit C10 fix)
+# ---------------------------------------------------------------------------
+
+
+def test_resolve_wm_window_id_matches_exact_title() -> None:
+    calls: list[list[str]] = []
+
+    def fake_run(argv: list[str]) -> subprocess.CompletedProcess[str]:
+        calls.append(argv)
+        return subprocess.CompletedProcess(
+            argv, returncode=0, stdout='0x03200007 0 host focus:df#2510 alpha\n'
+        )
+
+    result = sh._resolve_wm_window_id(
+        'focus:df#2510 alpha', run=fake_run, attempts=3, sleep=lambda _s: None
+    )
+
+    assert result == '0x03200007'
+    assert calls == [['wmctrl', '-l']]
+
+
+def test_resolve_wm_window_id_returns_none_when_no_match() -> None:
+    def fake_run(argv: list[str]) -> subprocess.CompletedProcess[str]:
+        return subprocess.CompletedProcess(
+            argv, returncode=0, stdout='0x03200007 0 host some-other-window\n'
+        )
+
+    result = sh._resolve_wm_window_id(
+        'focus:df#2510 alpha', run=fake_run, attempts=1, sleep=lambda _s: None
+    )
+
+    assert result is None
+
+
+def test_resolve_wm_window_id_does_not_match_as_substring() -> None:
+    """A marker that is only a PREFIX of a longer, unrelated window title must
+    not match -- mirrors WmBackend.is_alive's exact-field guard."""
+
+    def fake_run(argv: list[str]) -> subprocess.CompletedProcess[str]:
+        return subprocess.CompletedProcess(
+            argv, returncode=0, stdout='0x03200007 0 host focus:df#2510 alpha extra\n'
+        )
+
+    result = sh._resolve_wm_window_id(
+        'focus:df#2510 alpha', run=fake_run, attempts=1, sleep=lambda _s: None
+    )
+
+    assert result is None
+
+
+def test_resolve_wm_window_id_retries_with_sleep_between_attempts() -> None:
+    calls: list[list[str]] = []
+    sleeps: list[float] = []
+
+    def fake_run(argv: list[str]) -> subprocess.CompletedProcess[str]:
+        calls.append(argv)
+        if len(calls) < 3:
+            return subprocess.CompletedProcess(argv, returncode=1, stdout='')
+        return subprocess.CompletedProcess(
+            argv, returncode=0, stdout='0x03200007 0 host focus:df#2510 alpha\n'
+        )
+
+    result = sh._resolve_wm_window_id(
+        'focus:df#2510 alpha',
+        run=fake_run,
+        attempts=5,
+        sleep=lambda s: sleeps.append(s),
+    )
+
+    assert result == '0x03200007'
+    assert len(calls) == 3
+    assert len(sleeps) == 2  # one sleep between each of the first 3 attempts, none after success
+
+
+def test_resolve_wm_window_id_exhausts_attempts_then_none() -> None:
+    calls: list[list[str]] = []
+
+    def fake_run(argv: list[str]) -> subprocess.CompletedProcess[str]:
+        calls.append(argv)
+        return subprocess.CompletedProcess(argv, returncode=1, stdout='')
+
+    result = sh._resolve_wm_window_id(
+        'focus:df#2510 alpha', run=fake_run, attempts=4, sleep=lambda _s: None
+    )
+
+    assert result is None
+    assert len(calls) == 4
+
+
+def test_resolve_wm_window_id_run_raising_is_caught_as_none() -> None:
+    def fake_run(argv: list[str]) -> subprocess.CompletedProcess[str]:
+        raise OSError('wmctrl not found')
+
+    result = sh._resolve_wm_window_id(
+        'focus:df#2510 alpha', run=fake_run, attempts=3, sleep=lambda _s: None
+    )
+
+    assert result is None
+
+
+def test_resolve_wm_window_id_only_ever_calls_wmctrl_list() -> None:
+    """Never issues a focus/activate command -- read-only probing only."""
+    calls: list[list[str]] = []
+
+    def fake_run(argv: list[str]) -> subprocess.CompletedProcess[str]:
+        calls.append(argv)
+        return subprocess.CompletedProcess(argv, returncode=1, stdout='')
+
+    sh._resolve_wm_window_id(
+        'focus:df#2510 alpha', run=fake_run, attempts=3, sleep=lambda _s: None
+    )
+
+    assert all(call == ['wmctrl', '-l'] for call in calls)
+
+
+# ---------------------------------------------------------------------------
 # Task 2292 step-5: SessionStart best-effort display stamping (Fleet Cockpit C2)
 # ---------------------------------------------------------------------------
 
