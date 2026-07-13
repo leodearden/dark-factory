@@ -470,6 +470,28 @@ class TestFailSafeUnverifiablePin:
         assert resolved.provenance is None
         assert resolved.source == 'in_code'
 
+    def test_provenance_with_mismatched_harness_version_falls_back_to_in_code(self, tmp_path):
+        """A schema-valid provenance.json recorded for a different
+        harness_version than this key (e.g. a sidecar manually relocated or
+        hand-crafted outside pin(), which always enforces this equality)
+        must not be trusted — both resolve() and read_provenance() fail safe.
+        """
+        store = PromptArtifactStore(tmp_path)
+        spec = _make_spec()
+        key_dir = store._key_dir('reviewer', 'claude-opus-4', 'v1')
+        key_dir.mkdir(parents=True)
+        (key_dir / 'heuristics.txt').write_text('some heuristics', encoding='utf-8')
+        (key_dir / 'provenance.json').write_text(
+            json.dumps(_provenance_kwargs(harness_version='v2')), encoding='utf-8'
+        )
+
+        resolved = store.resolve(spec, executor_model='claude-opus-4', harness_version='v1')
+
+        assert resolved.text == spec.in_code_constant
+        assert resolved.provenance is None
+        assert resolved.source == 'in_code'
+        assert store.read_provenance('reviewer', 'claude-opus-4', 'v1') is None
+
     def test_corrupt_provenance_json_falls_back_to_in_code(self, tmp_path):
         store = PromptArtifactStore(tmp_path)
         spec = _make_spec()
@@ -525,8 +547,10 @@ class TestFailSafeUnverifiablePin:
 
         real_load_valid_provenance = prompt_artifact._load_valid_provenance
 
-        def racing_load_valid_provenance(path):
-            result = real_load_valid_provenance(path)
+        def racing_load_valid_provenance(path, *, expected_harness_version=None):
+            result = real_load_valid_provenance(
+                path, expected_harness_version=expected_harness_version
+            )
             # Simulate a concurrent unpin()/external deletion landing right
             # after the provenance check succeeds but before resolve() reads
             # the heuristics file.

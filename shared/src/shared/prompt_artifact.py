@@ -156,22 +156,36 @@ def _encode_segment(segment: str) -> str:
     return urllib.parse.quote(segment, safe='').replace('.', '%2E')
 
 
-def _load_valid_provenance(path: Path) -> ArtifactProvenance | None:
+def _load_valid_provenance(
+    path: Path, *, expected_harness_version: str | None = None
+) -> ArtifactProvenance | None:
     """Load *path* as a schema-valid :class:`ArtifactProvenance`, fail-safe.
 
     Returns ``None`` — never raises — when *path* is absent, when it is
-    present but corrupt/non-JSON, or when it parses as JSON but does not
-    satisfy :class:`ArtifactProvenance`'s required fields (e.g. a half-written
-    or hand-edited sidecar). Callers treat ``None`` identically to "nothing
-    pinned": an unverifiable artifact must never be surfaced as a pinned one.
+    present but corrupt/non-JSON, when it parses as JSON but does not satisfy
+    :class:`ArtifactProvenance`'s required fields (e.g. a half-written or
+    hand-edited sidecar), or — when *expected_harness_version* is given —
+    when the loaded provenance's ``harness_version`` does not equal it.
+    :meth:`PromptArtifactStore.pin` always enforces that equality itself, so
+    this last check only guards against a sidecar written or relocated
+    outside the public API (e.g. a directory moved on disk, or a
+    hand-crafted ``provenance.json``). Callers treat ``None`` identically to
+    "nothing pinned": an unverifiable artifact must never be surfaced as a
+    pinned one.
     """
     parsed, _ok = load_json_or_warn(path, default=None)
     if parsed is None:
         return None
     try:
-        return ArtifactProvenance.model_validate(parsed)
+        provenance = ArtifactProvenance.model_validate(parsed)
     except ValidationError:
         return None
+    if (
+        expected_harness_version is not None
+        and provenance.harness_version != expected_harness_version
+    ):
+        return None
+    return provenance
 
 
 def _atomic_write_text(path: Path, text: str) -> None:
@@ -220,15 +234,19 @@ class PromptArtifactStore:
 
         Never raises: any unverifiable on-disk state falls back to the
         in-code constant — nothing pinned, an orphan heuristics file, a
-        corrupt/incomplete provenance sidecar, or a heuristics.txt that
-        vanishes between the provenance check below and the read (e.g. a
-        concurrent :meth:`unpin` racing this call).
+        corrupt/incomplete provenance sidecar, a provenance sidecar recorded
+        for a different ``harness_version`` than this key (e.g. a manually
+        relocated/tampered sidecar), or a heuristics.txt that vanishes
+        between the provenance check below and the read (e.g. a concurrent
+        :meth:`unpin` racing this call).
         """
         key_dir = self._key_dir(spec.prompt_id, executor_model, harness_version)
         heuristics_path = key_dir / _HEURISTICS_FILENAME
         provenance_path = key_dir / _PROVENANCE_FILENAME
         if heuristics_path.exists():
-            provenance = _load_valid_provenance(provenance_path)
+            provenance = _load_valid_provenance(
+                provenance_path, expected_harness_version=harness_version
+            )
             if provenance is not None:
                 try:
                     heuristics = heuristics_path.read_text(encoding='utf-8')
@@ -299,7 +317,9 @@ class PromptArtifactStore:
         self, prompt_id: str, executor_model: str, harness_version: str
     ) -> ArtifactProvenance | None:
         key_dir = self._key_dir(prompt_id, executor_model, harness_version)
-        return _load_valid_provenance(key_dir / _PROVENANCE_FILENAME)
+        return _load_valid_provenance(
+            key_dir / _PROVENANCE_FILENAME, expected_harness_version=harness_version
+        )
 
     def unpin(self, prompt_id: str, executor_model: str, harness_version: str) -> bool:
         """Remove the pin for this key — the sole rollback lever (no separate revert path).
