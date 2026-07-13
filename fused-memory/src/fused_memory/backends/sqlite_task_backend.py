@@ -1148,20 +1148,33 @@ class SqliteTaskBackend:
         ``project_root`` so repeated hot-path calls don't pay a per-call
         connection-open cost.
 
-        Guardrail: the "never pinned" invariant holds only because every
-        reader fully drains its cursor via ``fetchall()`` (see
-        :meth:`_statuses_from_conn`, the sole current caller) before
-        returning. A future caller that leaves a ``SELECT`` cursor
-        partially stepped — or raises mid-iteration before the statement is
-        exhausted — would keep an implicit WAL read transaction open on
-        *this* connection and re-introduce the task-2388 stale-snapshot pin,
-        this time on the cached read connection. Always fully consume the
-        cursor (or explicitly close it) before returning.
+        Guardrail: the "never pinned" invariant depends on every reader
+        closing its cursor before returning — a ``SELECT`` cursor left
+        partially stepped (or abandoned mid-iteration because something
+        raised before the statement was exhausted) would keep an implicit
+        WAL read transaction open on *this* connection and re-introduce the
+        task-2388 stale-snapshot pin, this time on the cached read
+        connection. :meth:`_statuses_from_conn` (the sole current caller)
+        enforces this deterministically via ``async with conn.execute(...)
+        as cursor:``, which closes the cursor even if ``fetchall()`` or the
+        row-coercion step raises — so the invariant no longer depends on a
+        reader happening to fully drain the cursor by convention. A future
+        caller that queries this connection directly should use the same
+        pattern (or otherwise guarantee the cursor is closed) rather than
+        assume it's automatic.
         """
         if self._closed:
             raise RuntimeError('SqliteTaskBackend is closed')
+        # Fast path: a cached read connection implies the DB file/schema/
+        # migrations already exist (the slow path below always calls
+        # _get_connection before caching one), so a cache hit can return
+        # immediately and skip the _get_connection await + write-connection
+        # dict lookup entirely — pure overhead on this hot get_statuses/
+        # get_statuses_raw path once a project's connection is warm.
+        if project_root in self._read_connections:
+            return self._read_connections[project_root]
         # Ensure the DB file + schema + migrations exist before opening our
-        # own connection onto the same file.
+        # own connection onto the same file. Only reached on a cache miss.
         await self._get_connection(project_root)
         if project_root in self._read_connections:
             return self._read_connections[project_root]
@@ -1336,11 +1349,15 @@ class SqliteTaskBackend:
         and the ``NULL`` → ``'unknown'`` coercion rule, so both read paths
         stay identical apart from which connection they run on.
 
-        Always fully drains the cursor via ``fetchall()`` below before
-        returning — required to keep :meth:`_get_read_connection`'s cached
-        AUTOCOMMIT connection unpinnable (see its docstring's Guardrail
-        note); a partially-stepped cursor would leave an implicit WAL read
-        transaction open on that shared connection.
+        Deterministically closes its cursor via ``async with conn.execute(
+        ...) as cursor:`` below before returning — required to keep
+        :meth:`_get_read_connection`'s cached AUTOCOMMIT connection
+        unpinnable (see its docstring's Guardrail note). Closing the cursor
+        this way, rather than relying on ``fetchall()`` alone to drain it,
+        guarantees the implicit WAL read transaction ends even if
+        ``fetchall()`` or the row-coercion step below raises, so the
+        invariant holds regardless of what happens after the query
+        executes.
 
         Args:
             conn: An open connection with ``row_factory`` already set to
@@ -1366,17 +1383,19 @@ class SqliteTaskBackend:
             if not int_ids:
                 return {}
             placeholders = ','.join('?' * len(int_ids))
-            cursor = await conn.execute(
-                f'SELECT id, status FROM tasks WHERE tag = ? AND id IN ({placeholders})',
-                (tag, *int_ids),
-            )
+            sql = f'SELECT id, status FROM tasks WHERE tag = ? AND id IN ({placeholders})'
+            params: tuple = (tag, *int_ids)
         else:
-            cursor = await conn.execute(
-                'SELECT id, status FROM tasks WHERE tag = ?',
-                (tag,),
-            )
+            sql = 'SELECT id, status FROM tasks WHERE tag = ?'
+            params = (tag,)
 
-        rows = await cursor.fetchall()
+        # `async with ... as cursor:` (rather than a bare `await
+        # conn.execute(...)`) guarantees cursor.close() runs even if
+        # fetchall() or the comprehension below raises, so the implicit
+        # WAL read transaction this SELECT opens is always released — see
+        # the Guardrail note on _get_read_connection's docstring.
+        async with conn.execute(sql, params) as cursor:
+            rows = await cursor.fetchall()
         return {
             str(row['id']): (row['status'] if row['status'] is not None else 'unknown')
             for row in rows
