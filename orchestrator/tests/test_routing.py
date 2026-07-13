@@ -144,9 +144,15 @@ class TestRoutingAllowlistReloadDisposition:
             models=ModelsConfig(architect='opus'),
             routing=RoutingConfig(allowed_models=['haiku', 'sonnet', 'opus']),
         )
-        # fresh is valid on its own: architect='sonnet' is in ['sonnet'].
+        # fresh is valid on its own: EVERY ModelsConfig role (not just
+        # architect) must be pinned to 'sonnet', the sole entry in
+        # fresh.routing.allowed_models -- ModelsConfig has other roles that
+        # default to 'opus' (implementer, debugger, merger, steward,
+        # deep_reviewer), which would otherwise fail the allowlist
+        # invariant during construction of `fresh` itself, before
+        # apply_reload is ever reached.
         fresh = OrchestratorConfig(
-            models=ModelsConfig(architect='sonnet'),
+            models=ModelsConfig(**{role: 'sonnet' for role in ModelsConfig.model_fields}),
             routing=RoutingConfig(allowed_models=['sonnet']),
         )
         live_dump_before = live.model_dump()
