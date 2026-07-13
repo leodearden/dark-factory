@@ -16,7 +16,7 @@ from __future__ import annotations
 import pytest
 from pydantic import ValidationError
 
-from shared.capability_manifest import DeliveredCheck
+from shared.capability_manifest import DeliveredCheck, ManifestCapability, ManifestTask
 
 
 class TestDeliveredCheck:
@@ -148,3 +148,85 @@ class TestDeliveredCheck:
         message = str(exc_info.value)
         assert 'script' in message
         assert 'pattern' in message
+
+
+class TestManifestCapability:
+    def test_constructs_with_required_fields_only(self):
+        cap = ManifestCapability(
+            name='foo', binding='capability→producer (wired)', verdict='PASS'
+        )
+        assert cap.name == 'foo'
+        assert cap.binding == 'capability→producer (wired)'
+        assert cap.verdict == 'PASS'
+        assert cap.delivered_check is None
+
+    def test_constructs_with_delivered_check_instance(self):
+        check = DeliveredCheck(kind='grep', pattern='foo', expect='present')
+        cap = ManifestCapability(name='foo', binding='b', verdict='PASS', delivered_check=check)
+        assert cap.delivered_check is check
+
+    def test_delivered_check_coerces_from_dict(self):
+        cap = ManifestCapability(
+            name='foo',
+            binding='b',
+            verdict='PASS',
+            delivered_check={  # type: ignore[arg-type]
+                'kind': 'grep',
+                'pattern': 'foo',
+                'expect': 'present',
+            },
+        )
+        assert isinstance(cap.delivered_check, DeliveredCheck)
+        assert cap.delivered_check.pattern == 'foo'
+
+    def test_verdict_fail_accepted(self):
+        cap = ManifestCapability(name='foo', binding='b', verdict='FAIL')
+        assert cap.verdict == 'FAIL'
+
+    def test_verdict_outside_vocab_rejected(self):
+        with pytest.raises(ValidationError):
+            ManifestCapability(name='foo', binding='b', verdict='MAYBE')  # type: ignore[arg-type]
+
+    def test_empty_name_rejected(self):
+        with pytest.raises(ValidationError):
+            ManifestCapability(name='', binding='b', verdict='PASS')
+
+    def test_unknown_field_rejected(self):
+        with pytest.raises(ValidationError):
+            ManifestCapability(name='foo', binding='b', verdict='PASS', typo='x')  # type: ignore[call-arg]
+
+
+class TestManifestTask:
+    def test_constructs_with_all_fields(self):
+        task = ManifestTask(
+            label='α',
+            task_id=2574,
+            title='Shared capability-manifest sidecar schema',
+            capabilities=[ManifestCapability(name='foo', binding='b', verdict='PASS')],
+        )
+        assert task.label == 'α'
+        assert task.task_id == 2574
+        assert task.title == 'Shared capability-manifest sidecar schema'
+        assert len(task.capabilities) == 1
+        assert isinstance(task.capabilities[0], ManifestCapability)
+
+    def test_task_id_none_ok(self):
+        task = ManifestTask(label='α', capabilities=[])
+        assert task.task_id is None
+
+    def test_title_omitted_ok(self):
+        task = ManifestTask(label='α', capabilities=[])
+        assert task.title is None
+
+    def test_task_id_non_int_string_rejected(self):
+        with pytest.raises(ValidationError):
+            ManifestTask(label='α', task_id='not-an-int', capabilities=[])  # type: ignore[arg-type]
+
+    def test_empty_label_rejected(self):
+        with pytest.raises(ValidationError) as exc_info:
+            ManifestTask(label='', capabilities=[])
+        assert 'label' in str(exc_info.value)
+
+    def test_unknown_field_rejected(self):
+        with pytest.raises(ValidationError):
+            ManifestTask(label='α', capabilities=[], typo='x')  # type: ignore[call-arg]
