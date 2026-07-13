@@ -79,7 +79,7 @@ Modules touched: <list>
         "consumer_ref": "<consumer_ref>",
         "grammar_confirmed": True,   # or the overlay's substrate-confirmed flag name
         "modules": ["<module_path>", ...],
-        # "g7_waivers": [{"invariant": "<slug>", "rationale": "<text>"}],  # only if Step 2.7 recorded a waiver for this task
+        # "g7_waivers": [{"invariant": "<slug>", "rationale": "<text>"}],  # only if Step 2.3 recorded a waiver for this task
     },
 )
 task_id = result["task_id"]   # status == "deferred", planning_mode == True
