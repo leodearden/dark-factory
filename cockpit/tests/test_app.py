@@ -1496,6 +1496,53 @@ class TestWeightEditor:
         assert received[0].category_weights == base.category_weights
         assert received[0].project_weights == {}
 
+    @pytest.mark.timeout(10)
+    async def test_submit_skips_project_input_retyped_to_its_seeded_value(self, tmp_path):
+        """A project Input explicitly retyped to exactly its already-displayed
+        seeded value must NOT materialize a project_weights entry either --
+        this directly pins the `value == seeded` half of _submit()'s skip
+        branch (`if value is None or value == seeded: continue`), symmetric
+        with the `value is None` half pinned by
+        test_submit_keeps_prior_value_for_a_rejected_category_edit above.
+
+        test_submit_reads_edited_input_into_new_priorities' untouched
+        'alpha' Input happens to hit this same branch too (an Input's value
+        never changes from its compose()-time seed if nothing sets it), but
+        only incidentally -- this test exercises the comparison directly by
+        assigning the Input's value explicitly, the same observable state a
+        real retype-then-revert would leave it in.
+        """
+        from textual.widgets import Input
+
+        from cockpit.app import CockpitApp
+        from cockpit.panes.weight_editor import WeightEditorScreen
+        from cockpit.priority import Priorities
+
+        received: list[Priorities] = []
+        base = Priorities.default()
+
+        app = CockpitApp(fleet_root=tmp_path, poll_interval=0.05)
+        async with app.run_test() as pilot:
+            await pilot.pause()
+
+            screen = WeightEditorScreen(base, ['alpha'], received.append)
+            await app.push_screen(screen)
+            await pilot.pause()
+
+            # project_names == ['alpha'] -> compose() assigns id 'proj-0',
+            # seeded from base.project_weights.get('alpha', base.defaults.project)
+            # == base.defaults.project (base.project_weights is {}).
+            seeded = base.project_weights.get('alpha', base.defaults.project)
+            alpha_input = screen.query_one('#proj-0', Input)
+            alpha_input.value = str(seeded)
+            await pilot.pause()
+
+            await pilot.click('#weight-submit')
+            await pilot.pause()
+
+        assert len(received) == 1
+        assert received[0].project_weights == {}
+
 
 class TestSpawnBar:
     @pytest.mark.timeout(10)
