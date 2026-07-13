@@ -1334,6 +1334,85 @@ class TestPostMergeRedMainAbort:
 
 
 # ---------------------------------------------------------------------------
+# step-3 (task 2509): explicit stop-instruction hard-abort in check_proposal
+# ---------------------------------------------------------------------------
+
+class TestStopInstructionAbort:
+    """check_proposal hard-ABORTs any entry whose proposal_text, block_reason,
+    or extra_texts carries an explicit stop instruction — before risk_label
+    and git checks (task 2509, reconciliation finding 0aac21b4: an autonomous
+    /unblock session self-authorized around an explicit "do not apply"
+    instruction; this mechanical gate closes that hole).
+    """
+
+    _NOW = datetime(2026, 6, 4, 12, 0, 0, tzinfo=UTC)
+
+    def test_stop_instruction_in_proposal_text_aborts_without_git(self):
+        """Case (a): proposal_text carries 'do not apply' -> ABORT, no git called."""
+        from orchestrator.b3_gate import ABORT, check_proposal
+        entry = {**_LOW_RISK_ENTRY, 'proposal_text': 'Fix it — do not apply until reviewed'}
+        result = check_proposal(
+            entry, worktree='/tmp', category='task_failure',
+            run_git=_fake_git_never_called, now=self._NOW,
+        )
+        assert result['verdict'] == ABORT, f'expected ABORT, got {result}'
+        assert 'stop instruction' in result['reason'].lower(), (
+            f'expected "stop instruction" in reason: {result["reason"]!r}'
+        )
+
+    def test_stop_instruction_in_block_reason_aborts_without_git(self):
+        """Case (b): block_reason carries 'human rehearsal' -> ABORT, no git called."""
+        from orchestrator.b3_gate import ABORT, check_proposal
+        entry = {**_LOW_RISK_ENTRY, 'block_reason': 'this fix requires human rehearsal before merging'}
+        result = check_proposal(
+            entry, worktree='/tmp', category='task_failure',
+            run_git=_fake_git_never_called, now=self._NOW,
+        )
+        assert result['verdict'] == ABORT, f'expected ABORT, got {result}'
+        assert 'stop instruction' in result['reason'].lower(), (
+            f'expected "stop instruction" in reason: {result["reason"]!r}'
+        )
+
+    def test_stop_instruction_in_extra_texts_aborts_without_git(self):
+        """Case (c): a new extra_texts kwarg carries the phrase (proposal_text/
+        block_reason are benign) -> ABORT, no git called."""
+        from orchestrator.b3_gate import ABORT, check_proposal
+        result = check_proposal(
+            _LOW_RISK_ENTRY, worktree='/tmp', category='task_failure',
+            run_git=_fake_git_never_called, now=self._NOW,
+            extra_texts=['Task description: please do not apply this change yet.'],
+        )
+        assert result['verdict'] == ABORT, f'expected ABORT, got {result}'
+        assert 'stop instruction' in result['reason'].lower(), (
+            f'expected "stop instruction" in reason: {result["reason"]!r}'
+        )
+
+    def test_stop_instruction_wins_over_otherwise_fresh_entry(self):
+        """Precedence: an otherwise-FRESH low-risk entry that ALSO carries a stop
+        phrase in proposal_text -> ABORT (stop wins over fresh), and still consumes
+        no git (fires before the P1/P2 freshness checks)."""
+        from orchestrator.b3_gate import ABORT, check_proposal
+        entry = {**_LOW_RISK_ENTRY, 'proposal_text': 'Fix it — do not apply until reviewed'}
+        result = check_proposal(
+            entry, worktree='/tmp', category=None,
+            run_git=_fake_git_never_called, now=self._NOW,
+        )
+        assert result['verdict'] == ABORT, (
+            f'stop instruction must win over an otherwise-fresh entry: {result}'
+        )
+
+    def test_benign_extra_texts_does_not_abort_regression(self):
+        """Regression: benign extra_texts under a fresh low-risk entry -> FRESH (unchanged)."""
+        from orchestrator.b3_gate import FRESH, check_proposal
+        result = check_proposal(
+            _LOW_RISK_ENTRY, worktree='/tmp', category=None,
+            run_git=_fake_git_fresh, now=self._NOW,
+            extra_texts=['deploy the service'],
+        )
+        assert result['verdict'] == FRESH, f'expected FRESH, got {result}'
+
+
+# ---------------------------------------------------------------------------
 # step-3 (task 2138): typed block_class dual-read path
 # ---------------------------------------------------------------------------
 
