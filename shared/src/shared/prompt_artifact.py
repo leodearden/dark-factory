@@ -271,6 +271,17 @@ class PromptArtifactStore:
         Dropping the old sidecar first means any interleaved reader instead
         sees the same heuristics-without-provenance state a first-time pin
         passes through, which resolve() already treats as not-pinned.
+
+        Caution — a **failed re-pin can silently revert to baseline**: if
+        the new ``heuristics.txt`` write above succeeds but the following
+        ``provenance.json`` write then raises (disk full, a permission flip
+        mid-call, etc.), the key is left holding new heuristics with no
+        provenance — the same on-disk shape :meth:`resolve` treats as
+        not-pinned. A previously-good pin is then silently replaced by the
+        in-code fallback rather than preserved, with no signal beyond the
+        raised exception. Callers must not assume a prior pin survived a
+        failed re-pin; re-check :meth:`resolve` or :meth:`read_provenance`
+        for this key after catching an exception from this method.
         """
         if provenance.harness_version != harness_version:
             raise ValueError(
