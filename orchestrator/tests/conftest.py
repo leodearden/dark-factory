@@ -208,7 +208,7 @@ def _isolate_orch_config(monkeypatch, tmp_path):
 
 
 @pytest.fixture(autouse=True)
-def _hermetic_psi_reader(monkeypatch):
+def _hermetic_psi_reader(monkeypatch, request):
     """Default every Scheduler's PSI reader to a deterministic idle sample.
 
     Task 2418 — fix for the scheduler-test xdist flake where the dispatch-
@@ -252,9 +252,9 @@ def _hermetic_psi_reader(monkeypatch):
     independently-flaky aiosqlite thread-teardown race in
     ``test_aiosqlite_leak_isolation.py`` — task 2413's domain, reproduces
     solo with this fixture unloaded). If a future test needs the real
-    reader bound at construction, it can reassign
-    ``scheduler._read_psi_sample`` post-construction (as the saturation
-    tests already do) rather than removing this fixture.
+    reader bound at construction, it can mark itself ``real_psi_reader``
+    (see below) or reassign ``scheduler._read_psi_sample`` post-construction
+    (as the saturation tests already do) rather than removing this fixture.
 
     Why not scope this down instead (task 2418 amendment pass, round 2)?
     A code-review pass suggested narrowing this fixture to an opt-in
@@ -278,9 +278,33 @@ def _hermetic_psi_reader(monkeypatch):
     — ``_isolate_orch_config``, ``_no_dry_run_unblock``, etc. — all of which
     are also broad-by-default rather than opt-in) with the post-construction
     reassignment escape hatch above, rather than being narrowed here. A full
-    opt-in restructuring remains open as a follow-up outside this task's
+    opt-in restructuring (auditing and editing every one of those ~28 files
+    to an allowlist model) remains open as a follow-up outside this task's
     locked scope.
+
+    **Opt-out via ``real_psi_reader`` marker** (task 2418 amendment pass,
+    round 3): tests that specifically need the real
+    ``shared.psi.read_psi_sample`` bound at construction — e.g. to assert
+    reader identity, or to exercise genuine ``/proc/pressure/*`` reads —
+    mark themselves with ``@pytest.mark.real_psi_reader`` to restore the
+    real binding, causing this fixture to return early (skip the
+    monkeypatch). Mirrors the ``real_verify_admission`` /
+    ``exercise_merge_verify`` opt-out pattern elsewhere in this file
+    (conftest.py). This is the lightweight, call-site-visible enforcement a
+    follow-up review round asked for, short of the full opt-in
+    restructuring described above — it does not require auditing the ~28
+    files, it just gives any *future* test an explicit, discoverable way to
+    declare "I need the real reader" instead of silently inheriting one.
+    Not yet added to ``orchestrator/pyproject.toml``'s ``markers = [...]``
+    registry — that file is outside task 2418's locked scope. pytest treats
+    an unregistered marker as a harmless no-op here (this project's
+    ``addopts`` does not set ``--strict-markers``), so the opt-out is fully
+    functional without that registration; adding the registry entry (to
+    silence pytest's unknown-marker warning once a test actually uses it)
+    remains a follow-up.
     """
+    if request.node.get_closest_marker('real_psi_reader'):
+        return
     monkeypatch.setattr('orchestrator.scheduler.read_psi_sample', idle_psi_sample)
 
 
