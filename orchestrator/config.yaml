@@ -59,6 +59,16 @@ type_check_command: "cd fused-memory && npx pyright && cd ../orchestrator && npx
 verify_command_timeout_secs: 1800
 verify_cold_command_timeout_secs: 3600
 
+# TEMPORARY manual override (watcher, 2026-07-13) to break the cross-project
+# verify-admission-slot contention with reify while task 2501 (per-project
+# slots-dir default) lands. Without this, verify_admission_slots_dir defaults to
+# the host-global /tmp/df-verify-slots-<uid>, which reify's long cargo verifies
+# monopolize — stalling dark_factory's whole verify/merge pipeline. This gives
+# dark_factory its own slot dir. REMOVE once 2501 is on main + the orch has
+# restarted onto it (2501's code default derives a per-project path itself;
+# invariant I3 preserves this explicit override until then).
+verify_admission_slots_dir: "/tmp/df-verify-slots-1000-dark_factory"
+
 # Fused memory HTTP server — port 8002
 # Port scheme: reify=xxx0, autopilot-video=xxx1, dark-factory=xxx2
 fused_memory:
