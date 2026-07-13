@@ -147,6 +147,24 @@ class TestDeliveredCheck:
             pytest.param({'kind': 'manual', 'args': ['--flag']}, id='manual_with_args'),
             pytest.param({'kind': 'manual', 'timeout_secs': 30}, id='manual_with_timeout_secs'),
             pytest.param({'kind': 'bogus'}, id='kind_not_in_vocab'),
+            pytest.param(
+                {
+                    'kind': 'grep',
+                    'pattern': 'foo',
+                    'expect': 'present',
+                    'reason': 'nope',
+                },
+                id='grep_with_reason',
+            ),
+            pytest.param(
+                {
+                    'kind': 'script',
+                    'script': 'scripts/x.sh',
+                    'timeout_secs': 30,
+                    'reason': 'nope',
+                },
+                id='script_with_reason',
+            ),
         ],
     )
     def test_invalid_specs_rejected(self, kwargs):
@@ -170,6 +188,15 @@ class TestDeliveredCheck:
         message = str(exc_info.value)
         assert 'script' in message
         assert 'pattern' in message
+
+    def test_error_names_kind_and_field_for_grep_with_reason(self):
+        # reason is documented as manual-only free text; grep/script must
+        # reject it explicitly rather than silently accepting it.
+        with pytest.raises(ValidationError) as exc_info:
+            DeliveredCheck(kind='grep', pattern='foo', expect='present', reason='nope')
+        message = str(exc_info.value)
+        assert 'grep' in message
+        assert 'reason' in message
 
 
 class TestManifestCapability:
@@ -304,6 +331,21 @@ class TestCapabilityManifestDoc:
                 tasks=[_task_dict('α')],
                 typo='x',  # type: ignore[call-arg]
             )
+
+    def test_check_labels_rejects_empty_label_reached_directly(self):
+        # ManifestTask.label already enforces min_length=1 at the field
+        # level, so an empty label can never reach CapabilityManifestDoc's
+        # own defense-in-depth `if not task.label` branch via normal (dict)
+        # construction — model_construct() bypasses ManifestTask's field
+        # validators to actually exercise that doc-level branch.
+        bad_task = ManifestTask.model_construct(label='', capabilities=[])
+        with pytest.raises(ValidationError) as exc_info:
+            CapabilityManifestDoc(
+                prd='plans/example-prd.md',
+                schema_version=1,
+                tasks=[bad_task],
+            )
+        assert 'task label must be non-empty' in str(exc_info.value)
 
 
 class TestLoader:
@@ -471,6 +513,15 @@ class TestDeliveredCheckMeta:
     def test_unknown_field_rejected(self):
         with pytest.raises(ValidationError):
             DeliveredCheckMeta(name='cap-one', kind='manual', typo='x')  # type: ignore[call-arg]
+
+    def test_error_names_deliveredcheckmeta_not_deliveredcheck(self):
+        # A DeliveredCheckMeta failure must name itself, not the sidecar
+        # DeliveredCheck model — they share validation via
+        # _check_kind_conditional_fields, which threads a model_name.
+        with pytest.raises(ValidationError) as exc_info:
+            DeliveredCheckMeta(name='cap-one', kind='grep', expect='present')
+        message = str(exc_info.value)
+        assert 'DeliveredCheckMeta: pattern is required' in message
 
 
 class TestMetadataRegistration:
