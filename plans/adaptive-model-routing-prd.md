@@ -108,10 +108,30 @@ retry ladder's final rung.
     architect effort trial, simple_task turns) are single tasks that run the trial,
     apply the flip on a clear pass, and escalate only on a marginal band — never
     standalone no-code decision tasks (orchestrator-churn lesson).
+11. **Measurement/adoption split with eval-framework-revival (reconciled
+    2026-07-13)**: eval-revival OWNS the measurement instrument (profile 2466,
+    architect coverage 2475, OFAT→matrix→confirm driver 2478) and explicitly
+    leaves production config adoption out of its scope; THIS PRD owns adoption
+    (tasks ι, κ). This PRD makes NO edits to `evals/runner.py`, the benchmark
+    suite, or the judge/Elo machinery. The earlier draft's "un-hardcode
+    build_eval_orch_config" is withdrawn — that is eval-revival β=2466.
+12. **Resolution precedes prompt assembly** (tier1-prompt-optimization seam,
+    its P-4): `resolve_route` runs before the role system prompt is built in
+    `_invoke`, and the resolved model is available at the prompt-build point —
+    the tier1 prompt-artifact loader keys heuristics artifacts on the
+    router-resolved executor model. Owned here (invariant 9); tier1's loader
+    call site consumes it.
 
 ## Pre-conditions for activating
 
-- None external. All prerequisites are Phase-1 tasks inside this PRD's DAG.
+- Phase 1–2 have no external pre-conditions beyond this PRD's own Phase-1 tasks.
+- Cross-PRD task deps (all intra-`dark_factory`, bare-integer, wired at
+  decompose): δ → **2461** (harness-backend T6: steward/triage CostStore rows —
+  the judge already records, per 2461's correction); ι → **2475** + **2478**
+  (eval-revival architect coverage + OFAT/confirm driver); κ → **2472**
+  (eval-revival Phase-1 validity gate — the framework currently grades empty
+  diffs), **2486** + **2485** (mcp-verdict judge/triage contract migrations —
+  trial on the post-migration transport, not the dying one).
 - Assumed-substrate verified during authoring: `_invoke` chokepoint
   (workflow.py:7351-7359), plan shape available at selection time (workflow.py:7295),
   `retry_ledger`/typed-metadata pattern (shared/src/shared/task_metadata.py), event
@@ -124,14 +144,23 @@ retry ladder's final rung.
 
 ## Cross-PRD relationship
 
+Reconciled 2026-07-13 against the four sibling PRDs committed 2026-07-12
+(all decomposed with live task ids).
+
 | Other PRD | Direction | Seam mechanism | Owner | Status |
 |---|---|---|---|---|
 | `plans/config-hot-reload-prd.md` (shipped) | extends | new `routing.*` config block joins green-tier `RELOADABLE_FIELDS` | this-prd | queued (task ε) |
 | `plans/author-declared-complexity-prd.md` (shipped) | extends | simple-path fallback story gains saturation stamp; declared-complexity semantics unchanged | this-prd | queued (task ν) |
-| future backends/Tier-4 PRD (unfiled) | boundary only | `backends.*` forwarding + provider credential pools stay untouched here; resolver returns model/effort/budget/turns only | other-prd (future) | out of scope |
+| `plans/harness-backend-reconnect-pi-prd.md` (T1=2457 **done**, T5=2460, T6=2461, pi=2463) | consumes 2461; boundary on the rest | δ consumes 2461's steward/triage CostStore rows (judge already records — do NOT re-instrument). Backend axis stays theirs: the resolver returns model/effort/budget/turns, NEVER backend; `backends.<role>` selection + provider pools + `_MODEL_COSTS`→prices are that PRD's. 2460 co-edits `_build_agent_env` (workflow.py:7304-7333) adjacent to ε — lock-serialized, no semantic overlap | each PRD its axis; **2461** owns steward/triage cost threading | δ dep wired at decompose |
+| `plans/eval-framework-revival-prd.md` (β=2466, ι=2472, ζ=2473, θ=2475, λ=2477, μ=2478, ν=2479, ξ=2480) | consumes | measurement/adoption split (decision 11): they measure, this PRD adopts. ι deps 2475+2478; κ deps 2472. This PRD never edits `evals/runner.py`/benchmark/judge machinery. Endpoint-swapped model bundles (per-role ANTHROPIC_BASE_URL) are their ν/ξ — a separate widening axis composing with this PRD's model axis | **eval-revival** owns the instrument; **this-prd** owns adoption flips | ι/κ deps wired at decompose |
+| `plans/mcp-verdict-servers-prd.md` (α=2481 in-progress, β=2482, ε=2485, ζ=2486) | consumes (contract stability) | κ trials judge/triage on the POST-migration verdict-tool transport → κ deps 2486 (judge) + 2485 (triage). 2482 injects verdict-tools at the `_invoke` spawn site; η co-edits steward.py near 2485 — lock-serialized | **mcp-verdict** owns the transport | κ deps wired at decompose |
+| `plans/tier1-prompt-optimization-prd.md` (loader keys artifacts on executor model; its P-4 names this PRD) | produces | invariant 9 / decision 12: `resolve_route` completes before prompt assembly; the resolved model is available to the prompt-artifact loader call site. Per-model artifact sets make a routed reviewer/curator load the right heuristics block by construction | **this-prd** owns exposing the resolved model; **tier1** owns the loader + call site | no hard dep either way (their analysis, concurred) |
+| `plans/dashboard-taskgraph-legibility-prd.md` | none | disjoint dashboard surfaces (`tab_tasks.jsx` vs δ's new cost/routing panel) | — | no seam |
 | `plans/afk-digest.md` | produces | rollup + routing sections consumed by digest | this-prd | queued (task δ) |
 
-No contested ownership: both shipped PRDs are landed; this PRD owns its extensions.
+No contested ownership; the one bidirectional-looking seam (tier1 loader ↔
+resolver) is split by mechanism: resolution-ordering owned here, loader owned
+there.
 
 ## Contract — route resolution seam (approach B+H)
 
@@ -213,6 +242,11 @@ load/reload (never silently ignored). `set` may carry any of
 8. **Tier monotonicity**: `routing_tier` only increments (per decision 6 triggers) and
    never resets within a task's lifetime; stamped via the same metadata write path the
    harness already owns (never author-supplied).
+9. **Resolution-before-prompt**: within `_invoke`, `resolve_route` completes before the
+   role system prompt is assembled, and the `RoutingDecision` (specifically `.model`) is
+   in scope at the prompt-build point — the tier1 prompt-artifact loader keys heuristics
+   artifacts on the resolved executor model and must never compose against a stale
+   static-config model.
 
 ### Boundary-test sketch
 
@@ -259,8 +293,12 @@ Phase 1 — substrate (survey Tier 0):
 - **δ — Per-(model×role) outcome rollup**
   Modules: orchestrator (digest.py), dashboard. Rollup from `invocations` ×
   `task_results` × routing_decision events: counts, done/blocked/cap-hit rates, $/done,
-  turn-cap saturation rate per role. Signal: boundary test 12 (digest section renders;
-  dashboard panel renders). Prereqs: γ.
+  turn-cap saturation rate per role. Steward/triage invocation rows come from **2461**
+  (harness-backend T6) — do NOT re-instrument those sites, and the judge already
+  records via `_invoke`. In scope here: verify-and-thread `cost_store` for any
+  remaining uncosted sites 2461 does not own (module_tagger harness.py:1919,
+  unblock_auto) if actually missing. Signal: boundary test 12 (digest section renders;
+  dashboard panel renders, incl. steward/triage rows). Prereqs: γ; cross-PRD **2461**.
 
 Phase 2 — resolver (vertical slice):
 
@@ -292,21 +330,29 @@ Phase 3 — fleet rebalancing (survey Tier 1) + plan-shape generalization:
   hot-reload on dark_factory first, then defaults.yaml. Signal: a non-Rust ≥12-step
   plan's implementer invocation resolves opus with `rule_id` naming the new rule
   (routing_decision + invocation row). Prereqs: ε, δ.
-- **ι — Eval-harness role targeting + architect effort decide-and-act**
-  Modules: orchestrator (evals/runner.py build_eval_orch_config un-hardcode;
-  evals/configs.py), committed trial report. Run architect max-vs-high trial on the
-  eval corpus; clear pass → flip `effort.architect` (hot-reload + defaults.yaml);
-  marginal → escalate with the report. Signal: committed report artifact under
-  evals/results/ + either the applied config change (reload disposition) or the filed
-  escalation. Prereqs: β, δ.
+- **ι — Architect effort/model decide-and-act (adoption of an eval-revival verdict)**
+  Modules: orchestrator (defaults.yaml / per-project yaml config only), committed
+  decision record. NO eval-machinery edits (decision 11) — runs the architect
+  max-vs-high (and sonnet-architect-for-small-tasks candidate) trial THROUGH the
+  revived framework's OFAT→confirm methodology (2478) with architect coverage from
+  2475; clear pass → flip `effort.architect`/rule via hot-reload then defaults.yaml;
+  marginal → escalate with the report. Signal: committed decision record referencing
+  the eval report + either the applied config change (reload disposition) or the filed
+  escalation. Prereqs: β, δ; cross-PRD **2475**, **2478**.
 - **κ — Haiku decide-and-act pilots: judge, triage, module_tagger**
-  Modules: orchestrator (evals/, defaults.yaml), committed trial reports. Per-role
-  trial (reviewer_trial-style where role-shaped, else eval-runner); pass → flip that
-  role to haiku on dark_factory via hot-reload, watch rollup for a fixed window, then
-  defaults.yaml; fail/marginal → report + escalate. Thresholds derive from δ's measured
-  per-role baseline (not guessed). Signal: per-role committed report + applied flips
-  visible in reload disposition + rollup rows showing haiku invocations for flipped
-  roles. Prereqs: δ, ι (role-targeting).
+  Modules: orchestrator (defaults.yaml / config; per-role trial scripts under
+  scripts/ or evals/results/ artifacts — no eval-machinery restructuring), committed
+  trial reports. Per-role method: **judge** via OFAT single-role substitution
+  (`models.judge` override) on the revived framework over its fixtures — on the
+  post-2486 verdict-tool contract; **triage** + **module_tagger** via offline
+  replay-agreement trials (historical inputs, haiku-vs-sonnet output agreement,
+  frontier-adjudicated on disagreements — tier1's D-6 protocol shape, self-contained)
+  — triage on the post-2485 contract. Pass → flip that role to haiku on dark_factory
+  via hot-reload, watch δ's rollup for a fixed window, then defaults.yaml;
+  fail/marginal → report + escalate. Thresholds derive from δ's measured per-role
+  baseline (not guessed). Signal: per-role committed report + applied flips visible in
+  reload disposition + rollup rows showing haiku invocations for flipped roles.
+  Prereqs: δ; cross-PRD **2472**, **2485**, **2486**.
 - **λ — simple_task tuning**
   Modules: orchestrator (defaults.yaml / config). Turns 30→50 + budget via α's now-live
   fields; saturation-rate metric (from δ) becomes the tracked indicator. Signal:
@@ -346,8 +392,11 @@ stated. G2 hard-check + capability manifest at decompose time.
 
 ## Out of scope
 
-- Non-Anthropic backends: the `backends` forwarding fix, provider credential pools,
-  per-provider cap semantics, codex/gemini trials (survey Tier 4; future PRD).
+- The backend axis: `backends.<role>` selection (forwarding landed as 2457),
+  codex/pi hardening, provider credential pools, per-provider cap semantics, the
+  config price table — all owned by `plans/harness-backend-reconnect-pi-prd.md`;
+  endpoint-swapped model bundles by eval-revival ν=2479/ξ=2480. The resolver never
+  returns a backend.
 - Per-(account,model) UsageGate cap states (fable cap = whole-account CAP stands).
 - Implementer-saturation → automatic architect decomposition (decomposition machinery,
   not routing; separate PRD if wanted).
