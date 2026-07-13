@@ -24,13 +24,19 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 from test_merge_queue_main_health import (
     COMPILE_ERROR_RESULT,
+    MAIN_SHA,
     _make_config,
     _make_git_ops,
     _make_req,
 )
 
+from escalation.queue import EscalationQueue
+from orchestrator.event_store import EventStore
 from orchestrator.merge_queue import (
+    MAIN_HEALTH_RED_REASON_PREFIX,
     _MainHealthProbeHandles,
+    _main_health_fingerprint,
+    _run_deferred_main_health_probe,
     _run_post_merge_verify,
     _spawn_main_health_probe,
 )
@@ -216,4 +222,114 @@ class TestNoneHandlesSpawnsNothing:
         assert create_task_spy.call_count == 0, (
             f'main_health_probe_handles=None must spawn nothing; '
             f'asyncio.create_task called {create_task_spy.call_count} time(s)'
+        )
+
+
+# ---------------------------------------------------------------------------
+# Step-9 (RED): _run_deferred_main_health_probe happy path — files a dedup'd
+# preexisting_main_break escalation and emits the main_health_red signal for
+# a confirmed pre-existing break; a negative or raising probe files nothing.
+# ---------------------------------------------------------------------------
+
+
+class TestDeferredProbeHappyPath:
+    def test_confirmed_break_files_escalation_and_emits_signal(
+        self, tmp_path: Path,
+    ) -> None:
+        config = _make_config(tmp_path, escalate_preexisting=True)
+        git_ops = _make_git_ops(tmp_path)  # get_main_sha AsyncMock -> MAIN_SHA
+        req = _make_req('99', tmp_path / 'task-wt', config)
+        (tmp_path / 'task-wt').mkdir()
+
+        event_store = MagicMock(spec=EventStore)
+        escalation_queue = EscalationQueue(tmp_path / 'escalations')
+
+        async def _run() -> None:
+            with patch(
+                'orchestrator.merge_queue.verify_failure_is_preexisting_on_main',
+                new=AsyncMock(return_value=(True, MAIN_SHA)),
+            ):
+                await _run_deferred_main_health_probe(
+                    git_ops, req, COMPILE_ERROR_RESULT,
+                    escalation_queue=escalation_queue, event_store=event_store,
+                )
+
+        asyncio.run(_run())
+
+        pending = escalation_queue.get_pending()
+        assert len(pending) == 1, (
+            f'Expected exactly one pending escalation; got {pending}'
+        )
+        esc = pending[0]
+        assert esc.category == 'preexisting_main_break', (
+            f'Expected category=preexisting_main_break; got {esc.category!r}'
+        )
+        expected_fp = _main_health_fingerprint(
+            'compile_error', COMPILE_ERROR_RESULT.cause_hint, MAIN_SHA,
+        )
+        assert esc.dedupe_fingerprint == expected_fp, (
+            f'Expected dedupe_fingerprint={expected_fp!r}; '
+            f'got {esc.dedupe_fingerprint!r}'
+        )
+        assert esc.summary.startswith(MAIN_HEALTH_RED_REASON_PREFIX), (
+            f'Expected summary derived from the main-red reason; '
+            f'got {esc.summary!r}'
+        )
+        assert esc.detail.startswith(MAIN_HEALTH_RED_REASON_PREFIX), (
+            f'Expected detail derived from the main-red reason; '
+            f'got {esc.detail!r}'
+        )
+
+        calls = event_store.emit.call_args_list
+        main_health_calls = [
+            c for c in calls
+            if c.kwargs.get('data', {}).get('outcome') == 'main_health_red'
+        ]
+        assert len(main_health_calls) >= 1, (
+            f'Expected at least one main_health_red event; '
+            f'event_store.emit calls: {calls}'
+        )
+
+    def test_negative_probe_files_no_escalation(self, tmp_path: Path) -> None:
+        config = _make_config(tmp_path, escalate_preexisting=True)
+        git_ops = _make_git_ops(tmp_path)
+        req = _make_req('99', tmp_path / 'task-wt', config)
+        (tmp_path / 'task-wt').mkdir()
+        escalation_queue = EscalationQueue(tmp_path / 'escalations')
+
+        async def _run() -> None:
+            with patch(
+                'orchestrator.merge_queue.verify_failure_is_preexisting_on_main',
+                new=AsyncMock(return_value=(False, '')),
+            ):
+                await _run_deferred_main_health_probe(
+                    git_ops, req, COMPILE_ERROR_RESULT,
+                    escalation_queue=escalation_queue,
+                )
+
+        asyncio.run(_run())
+        assert escalation_queue.get_pending() == [], (
+            'A negative (non-preexisting) probe must file no escalation'
+        )
+
+    def test_raising_probe_files_no_escalation(self, tmp_path: Path) -> None:
+        config = _make_config(tmp_path, escalate_preexisting=True)
+        git_ops = _make_git_ops(tmp_path)
+        req = _make_req('99', tmp_path / 'task-wt', config)
+        (tmp_path / 'task-wt').mkdir()
+        escalation_queue = EscalationQueue(tmp_path / 'escalations')
+
+        async def _run() -> None:
+            with patch(
+                'orchestrator.merge_queue.verify_failure_is_preexisting_on_main',
+                new=AsyncMock(side_effect=RuntimeError('boom')),
+            ):
+                await _run_deferred_main_health_probe(
+                    git_ops, req, COMPILE_ERROR_RESULT,
+                    escalation_queue=escalation_queue,
+                )
+
+        asyncio.run(_run())  # must not raise
+        assert escalation_queue.get_pending() == [], (
+            'A raising probe must file no escalation'
         )
