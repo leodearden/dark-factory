@@ -116,6 +116,12 @@ class WmBackend:
         fixed columns and compare the title field exactly (or the window id,
         when known) rather than a raw substring, so e.g. title 'a' can't
         false-positive against a longer title like 'session-a'.
+
+        NOTE: this exact `split(None, 3)` parse is duplicated (not
+        shared/imported, since this is a cross-package boundary) in
+        `orchestrator/src/orchestrator/session_hooks.py::_resolve_wm_window_id`
+        -- if the column layout or matching rule here ever changes, mirror
+        the change there too.
         """
         if not target.wm_title and not target.wm_window_id:
             logger.warning(
