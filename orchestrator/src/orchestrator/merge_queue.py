@@ -1151,28 +1151,52 @@ async def _run_post_merge_verify(
     # classifying them as warm.  The per-command cold timeout used here
     # is `merge_verify_cold_command_timeout_secs` (config default 7200 s)
     # if set, falling back to `verify_cold_command_timeout_secs` then warm.
-    verify = await pool.dispatch(merge_sha, spec, depth=depth, speculative=speculative)
+    #
+    # Merge-verify lease (task 2315, BUG 1): record the SAME
+    # ``.merge_verify.lock`` + holder-pgid lease the host verify-merge CLI
+    # already records (cli.py:444-512) around this dispatch span — but ONLY
+    # for a LOCAL in-process verify (runner is None) on the persistent warm
+    # lane (``git.persistent_merge_worktree`` on AND *merge_wt* resolves to
+    # ``persistent_merge_worktree_path``). Every other combination (remote
+    # runner, ephemeral worktree, knob off) leaves the AsyncExitStack empty
+    # — no lease recorded, byte-identical to before. Holding this lease lets
+    # :meth:`GitOps.reset_persistent_merge_worktree` and
+    # :meth:`GitOps._run_warm_lane_gc_reclaim` detect the in-flight verify
+    # and avoid clobbering/reclaiming the worktree out from under it. Known
+    # limitation: there is a small residual window between
+    # ``reset_persistent_merge_worktree`` returning *merge_wt* (above the
+    # caller of this function) and the lease being acquired here, during
+    # which the worktree is unprotected.
+    async with contextlib.AsyncExitStack() as stack:
+        if (
+            runner is None
+            and req.config.git.persistent_merge_worktree
+            and merge_wt.resolve() == git_ops.persistent_merge_worktree_path.resolve()
+        ):
+            await stack.enter_async_context(git_ops.merge_verify_lease())
 
-    # Transient-infra (disk pressure) retry: an ENOSPC failure is
-    # often a self-healing host condition.  Prune stale _merge-*
-    # worktrees (never task worktrees) and retry the verify once in
-    # the same merge_wt before escalating.
-    # ENOSPC always comes from the scoped phase (before the unscoped gate
-    # runs), so the sentinel check is not needed here.
-    if not verify.passed and _verify_hit_enospc(verify):
-        prior_enospc = enospc_retries.get(req.task_id, 0)
-        if prior_enospc < max_enospc:
-            enospc_retries[req.task_id] = prior_enospc + 1
-            enospc_keep = {merge_wt, *(keep_worktrees or ())}
-            pruned = await git_ops.prune_stale_merge_worktrees(keep=enospc_keep)
-            logger.warning(
-                'Task %s: post-merge verify hit ENOSPC; pruned %d '
-                'stale merge worktree(s), retrying verify once',
-                req.task_id, len(pruned),
-            )
-            verify = await pool.dispatch(
-                merge_sha, spec, attempt=1, depth=depth, speculative=speculative,
-            )
+        verify = await pool.dispatch(merge_sha, spec, depth=depth, speculative=speculative)
+
+        # Transient-infra (disk pressure) retry: an ENOSPC failure is
+        # often a self-healing host condition.  Prune stale _merge-*
+        # worktrees (never task worktrees) and retry the verify once in
+        # the same merge_wt before escalating.
+        # ENOSPC always comes from the scoped phase (before the unscoped gate
+        # runs), so the sentinel check is not needed here.
+        if not verify.passed and _verify_hit_enospc(verify):
+            prior_enospc = enospc_retries.get(req.task_id, 0)
+            if prior_enospc < max_enospc:
+                enospc_retries[req.task_id] = prior_enospc + 1
+                enospc_keep = {merge_wt, *(keep_worktrees or ())}
+                pruned = await git_ops.prune_stale_merge_worktrees(keep=enospc_keep)
+                logger.warning(
+                    'Task %s: post-merge verify hit ENOSPC; pruned %d '
+                    'stale merge worktree(s), retrying verify once',
+                    req.task_id, len(pruned),
+                )
+                verify = await pool.dispatch(
+                    merge_sha, spec, attempt=1, depth=depth, speculative=speculative,
+                )
 
     # Invoke the optional result-capture callback (PRD §10 invariant 6(b)):
     # called with the FINAL VerifyResult (after any ENOSPC retry) so the

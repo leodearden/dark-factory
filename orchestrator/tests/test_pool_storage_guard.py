@@ -197,6 +197,98 @@ class TestPoolStorageBootstrapOk:
         assert git_ops._pool_storage_bootstrap_ok() is False
 
 
+class TestReconcilePoolStorageBeforeSweep:
+    """GitOps._reconcile_pool_storage_before_sweep(context) (task 2315, BUG 2).
+
+    Shared predicate + best-effort sentinel-recreation helper that both
+    destructive-sweep sites (``_run_warm_lane_gc_reclaim``,
+    ``_prune_registrations``) route through, so a HEALTHY mount that merely
+    lost its ``.pool-root`` sentinel (active lanes, populated
+    ``_merge-verify/target``) self-heals — recreates the sentinel and
+    proceeds — instead of refusing the sweep forever (the chicken-and-egg
+    described in the task 2315 analysis: sweeps refused -> stale lanes never
+    reseeded -> the only sentinel writer never runs -> sentinel stays
+    missing).
+    """
+
+    def test_healthy_mount_missing_sentinel_recreates_and_proceeds(
+        self, git_ops: GitOps,
+    ):
+        """Case A: bootstrap-ok True (mount provably healthy) but the
+        sentinel is absent -- helper must recreate it and return True
+        without escalating."""
+        git_ops.warm_lane_pool = WarmLanePool(worktree_base=git_ops.worktree_base, size=1)
+        base = git_ops.worktree_base / '_merge-verify' / 'target'
+        base.mkdir(parents=True, exist_ok=True)
+        (base / '.keep').write_text('warm base\n')
+        assert not git_ops.pool_storage_present()
+        assert git_ops._pool_storage_bootstrap_ok()
+
+        callback = Mock()
+        git_ops._on_pool_storage_absent = callback
+
+        result = git_ops._reconcile_pool_storage_before_sweep('unit-test-ctx')
+
+        assert result is True
+        assert git_ops.pool_storage_present() is True, (
+            'expected the sentinel to be recreated on the healthy-mount path'
+        )
+        callback.assert_not_called()
+
+    def test_suspected_unmount_refuses_and_escalates(self, git_ops: GitOps):
+        """Case B: bootstrap-ok False (base absent/empty -- the genuine
+        unmounted-mountpoint case) -- helper must refuse (False), leave the
+        sentinel absent, and escalate exactly once."""
+        git_ops.warm_lane_pool = WarmLanePool(worktree_base=git_ops.worktree_base, size=1)
+        git_ops.worktree_base.mkdir(parents=True, exist_ok=True)
+        assert not git_ops.pool_storage_present()
+        assert not git_ops._pool_storage_bootstrap_ok()
+
+        callback = Mock()
+        git_ops._on_pool_storage_absent = callback
+
+        result = git_ops._reconcile_pool_storage_before_sweep('unit-test-ctx')
+
+        assert result is False
+        assert git_ops.pool_storage_present() is False
+        callback.assert_called_once()
+
+    def test_sentinel_present_returns_true_without_touching_callback(
+        self, git_ops: GitOps,
+    ):
+        """Case C: sentinel already present -- normal proceed, callback untouched."""
+        git_ops.warm_lane_pool = WarmLanePool(worktree_base=git_ops.worktree_base, size=1)
+        git_ops.mark_pool_storage_present()
+        assert git_ops.pool_storage_present()
+
+        callback = Mock()
+        git_ops._on_pool_storage_absent = callback
+
+        result = git_ops._reconcile_pool_storage_before_sweep('unit-test-ctx')
+
+        assert result is True
+        callback.assert_not_called()
+
+    def test_pool_not_in_use_returns_true_without_touching_callback(
+        self, git_ops: GitOps,
+    ):
+        """Case D: no pool configured at all (pool_in_use() False) --
+        pool_storage_present() is permanently False by design on a
+        pool-less host, so it must never be mistaken for a mount-down
+        incident."""
+        assert git_ops.warm_lane_pool is None
+        assert git_ops.spec_warm_lane_pool is None
+        assert not git_ops.pool_in_use()
+
+        callback = Mock()
+        git_ops._on_pool_storage_absent = callback
+
+        result = git_ops._reconcile_pool_storage_before_sweep('unit-test-ctx')
+
+        assert result is True
+        callback.assert_not_called()
+
+
 @pytest.mark.asyncio
 class TestPruneWorktreesGuard:
     """prune_worktrees() refuses ``git worktree prune`` when pool storage is
@@ -267,6 +359,36 @@ class TestPruneWorktreesGuard:
 
         mock_run.assert_awaited_once_with(
             ['git', 'worktree', 'prune'], cwd=git_ops.project_root,
+        )
+        callback.assert_not_called()
+
+    async def test_prune_runs_and_recreates_sentinel_when_bootstrap_ok(
+        self, git_ops: GitOps,
+    ):
+        """Task 2315, BUG 2: a HEALTHY mount that merely lost its
+        `.pool-root` sentinel (bootstrap-ok True) must RUN `git worktree
+        prune` and recreate the sentinel, not merely skip. Fails today: the
+        pre-2315 bootstrap-ok branch (git_ops.py:7376-7377) logged and
+        returned WITHOUT running prune and WITHOUT recreating the sentinel."""
+        base = git_ops.worktree_base / '_merge-verify' / 'target'
+        base.mkdir(parents=True, exist_ok=True)
+        (base / '.keep').write_text('warm base\n')
+        git_ops.warm_lane_pool = WarmLanePool(worktree_base=git_ops.worktree_base, size=1)
+        assert not git_ops.pool_storage_present()
+        assert git_ops._pool_storage_bootstrap_ok()
+
+        callback = Mock()
+        git_ops._on_pool_storage_absent = callback
+        mock_run = AsyncMock(return_value=(0, '', ''))
+
+        with patch('orchestrator.git_ops._run', mock_run):
+            await git_ops.prune_worktrees()
+
+        mock_run.assert_awaited_once_with(
+            ['git', 'worktree', 'prune'], cwd=git_ops.project_root,
+        )
+        assert git_ops.pool_storage_present() is True, (
+            'expected the sentinel to be recreated on the healthy-mount path'
         )
         callback.assert_not_called()
 
@@ -360,6 +482,40 @@ class TestWarmLaneGcReclaimGuard:
         mock_run.assert_awaited_once_with(
             [str(script), 'reclaim', '--mount', str(git_ops.worktree_base)],
             cwd=git_ops.project_root,
+        )
+        callback.assert_not_called()
+
+    async def test_reclaim_runs_and_recreates_sentinel_when_bootstrap_ok(
+        self, git_ops: GitOps,
+    ):
+        """Task 2315, BUG 2: a HEALTHY mount that merely lost its
+        `.pool-root` sentinel (bootstrap-ok True — a populated
+        _merge-verify/target proves the mount is up) must PROCEED with the
+        reclaim and recreate the sentinel, not refuse forever. Fails today:
+        the old inline guard (git_ops.py:2238, pre-2315) had no bootstrap
+        escape at all."""
+        base = git_ops.worktree_base / '_merge-verify' / 'target'
+        base.mkdir(parents=True, exist_ok=True)
+        (base / '.keep').write_text('warm base\n')
+        script = _write_warm_lane_gc_stub(git_ops.project_root)
+        git_ops.warm_lane_pool = WarmLanePool(worktree_base=git_ops.worktree_base, size=1)
+        assert not git_ops.pool_storage_present()
+        assert git_ops._pool_storage_bootstrap_ok()
+
+        callback = Mock()
+        git_ops._on_pool_storage_absent = callback
+        mock_run = AsyncMock(return_value=(0, '', ''))
+
+        with patch('orchestrator.git_ops._run', mock_run):
+            rc = await git_ops._run_warm_lane_gc_reclaim()
+
+        assert rc == 0
+        mock_run.assert_awaited_once_with(
+            [str(script), 'reclaim', '--mount', str(git_ops.worktree_base)],
+            cwd=git_ops.project_root,
+        )
+        assert git_ops.pool_storage_present() is True, (
+            'expected the sentinel to be recreated on the healthy-mount path'
         )
         callback.assert_not_called()
 

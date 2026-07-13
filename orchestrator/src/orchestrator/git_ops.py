@@ -39,6 +39,7 @@ No .task-specific guards remain in this module.
 """
 
 import asyncio
+import contextlib
 import json
 import logging
 import os
@@ -61,6 +62,14 @@ from orchestrator.lane_lifecycle import (
     AcquireRoute,
     LaneLifecycle,
     LaneState,
+)
+from orchestrator.verify_cancel import (
+    acquire_merge_verify_flock,
+    merge_verify_lock_path,
+    read_lock_holder_pgid,
+    release_merge_verify_flock,
+    remove_lock_holder_pgid,
+    write_lock_holder_pgid,
 )
 from orchestrator.worktree_identity import identities_match, read_worktree_title
 
@@ -181,6 +190,15 @@ DEFAULT_COMMIT_CITATION_PATTERN: str = (
 # Lives at <worktree_base>/_merge-verify.  Excluded from prune and
 # find_inflight enumeration (see _iter_merge_worktrees).
 PERSISTENT_MERGE_WORKTREE_NAME: str = '_merge-verify'
+
+# Bounded-wait timeout (seconds) for GitOps.merge_verify_lease()'s
+# acquire_merge_verify_flock() call (task 2315, BUG 1). A LOCAL constant
+# rather than importing cli.MERGE_VERIFY_FLOCK_WAIT_SECS: cli.py imports
+# GitOps, so a git_ops -> cli import would be architecturally backwards.
+# Mirrors cli.py:53's default (env-overridable there via
+# ORCH_MERGE_VERIFY_FLOCK_WAIT_SECS — this constant is git_ops' own,
+# independently defaulted copy of the same value, not env-overridable here).
+_MERGE_VERIFY_FLOCK_WAIT_SECS: float = 10.0
 
 # Fixed name for the SECOND persistent warm worktree (task 1952, PRD δ /
 # §5 C5), dedicated to the offline-deep lane worker (β2).  Lives at
@@ -608,6 +626,35 @@ class WorktreeConflictError(RuntimeError):
             f'unresolved conflict(s) in the index: '
             f'{", ".join(conflicted_paths[:10])}. Resolve the conflict(s) '
             f'(or abort the operation that caused them) before committing.'
+        )
+
+
+class MergeVerifyLeaseHeld(RuntimeError):
+    """Raised by :meth:`GitOps.reset_persistent_merge_worktree` when a
+    DIFFERENT live process holds the merge-verify lease (task 2315, BUG 1).
+
+    Incident: the persistent ``_merge-verify`` worktree was clobbered (a
+    reset-in-place ``git reset --hard`` or a create-once stale-dir
+    ``shutil.rmtree``) while a verify was still running in it, racing the
+    in-flight build out from under itself. The merge-verify flock +
+    holder-pgid lease (task 2306) already records who is running a verify
+    there — this guard refuses to reset when that lease is held by a pgid
+    other than our own (fail-CLOSED). Lease *detection*
+    (:meth:`GitOps._merge_verify_lease_active`) is fail-OPEN — a stale,
+    dead, or unreadable holder is never treated as held — so this guard can
+    never permanently wedge a legitimate reset.
+
+    A caller hitting this should back off and retry once the in-flight
+    verify completes and releases the lease.
+    """
+
+    def __init__(self, warm_path: Path, holder_pgid: int | None):
+        self.warm_path = warm_path
+        self.holder_pgid = holder_pgid
+        super().__init__(
+            f'Refusing to reset persistent merge worktree {warm_path}: '
+            f'merge-verify lease is held by a different live process '
+            f'(holder pgid={holder_pgid}, self pgid={os.getpgrp()})'
         )
 
 
@@ -1103,6 +1150,131 @@ class GitOps:
             return self.warm_lane_base_target_path.is_relative_to(self.worktree_base)
         except (OSError, ValueError):
             return False
+
+    def _reconcile_pool_storage_before_sweep(self, context: str) -> bool:
+        """Shared pre-sweep gate for the two destructive-sweep sites (task 2315, BUG 2).
+
+        Both :meth:`_run_warm_lane_gc_reclaim` and :meth:`_prune_registrations`
+        must refuse to run against an unmounted mountpoint (the Jul-3 task
+        2099 incident), but a HEALTHY mount that merely lost its
+        ``.pool-root`` sentinel must self-heal rather than refuse forever.
+        Pre-2315, one sweep site had no bootstrap escape at all and the
+        other only SKIPPED without recreating the sentinel — a
+        chicken-and-egg deadlock (sweeps refused -> stale lanes never
+        reseeded -> the only sentinel writer, :meth:`_seed_warm_lane` on
+        ``rc == 0``, never runs -> sentinel stays missing forever). This
+        helper lifts the acquire-side create-once "bootstrap-ok => mark
+        sentinel + proceed" pattern (see :meth:`acquire_warm_lane` /
+        :meth:`acquire_spec_lane`) into both sweep sites uniformly.
+
+        Args:
+            context: Short identifier for the calling sweep, threaded into
+                the refusal WARNING so operators can attribute which caller
+                asked (mirrors the ``context`` argument already threaded
+                through :meth:`_prune_registrations`).
+
+        Returns:
+            True  — safe to proceed with the sweep. Either pool storage
+                    was never in play (:meth:`pool_in_use` False), the
+                    sentinel was already present, or the sentinel was
+                    absent but provably a first-seed bootstrap
+                    (:meth:`_pool_storage_bootstrap_ok` True) — in that
+                    last case the sentinel is recreated
+                    (:meth:`mark_pool_storage_present`) before returning.
+            False — refuse. The sentinel is absent and NOT provably a
+                    bootstrap (a suspected unmount) — :meth:`_note_pool_storage_absent`
+                    is invoked to notify the installed callback.
+
+        Pure predicate plus best-effort sentinel recreation; never raises.
+        """
+        if not (self.pool_in_use() and not self.pool_storage_present()):
+            return True
+        if self._pool_storage_bootstrap_ok():
+            logger.info(
+                '%s: .pool-root absent but mount confirmed present at %s '
+                '(CoW seed base already resolves underneath it) — '
+                'recreating sentinel and proceeding',
+                context, self.worktree_base,
+            )
+            self.mark_pool_storage_present()
+            return True
+        logger.warning(
+            '%s: pool storage absent/unmounted at %s — refusing sweep',
+            context, self.worktree_base,
+        )
+        self._note_pool_storage_absent()
+        return False
+
+    def _merge_verify_lease_active(self) -> bool:
+        """True iff a merge-verify lease is currently held by a LIVE holder
+        (task 2315, BUG 1).
+
+        Reads the holder-pgid rendezvous key recorded by either
+        :meth:`merge_verify_lease` (the local in-process span) or the host
+        verify-merge CLI (``cli.py:444-512`` — the SAME
+        ``write_lock_holder_pgid`` key), then liveness-checks it via
+        ``os.killpg(pgid, 0)``.
+
+        Fail-OPEN: a missing, stale (dead), or unreadable holder-pgid is
+        treated as NOT held, so a lease can never permanently wedge a
+        legitimate caller merely because a prior holder died without
+        cleanup. Contrast with the fail-CLOSED *use* of this predicate in
+        :meth:`reset_persistent_merge_worktree` (refuses when a DIFFERENT
+        live holder holds the lease).
+        """
+        pgid = read_lock_holder_pgid(self.worktree_base)
+        if pgid is None:
+            return False
+        try:
+            os.killpg(pgid, 0)
+        except ProcessLookupError:
+            return False  # holder is dead — stale lease, ignore it
+        except PermissionError:
+            return True  # process exists but we can't signal it — still alive
+        except OSError:
+            return False  # any other signal failure — fail-open, not held
+        return True
+
+    @contextlib.asynccontextmanager
+    async def merge_verify_lease(self):
+        """Async context manager recording the merge-verify lease for the
+        duration of a span (task 2315, BUG 1).
+
+        Mirrors the host verify-merge CLI's acquire -> write-holder-pgid ->
+        finally-release-and-clear span (``cli.py:444-512``) so that
+        :meth:`reset_persistent_merge_worktree` and
+        :meth:`_run_warm_lane_gc_reclaim` can consult the SAME lease
+        (:meth:`_merge_verify_lease_active`) regardless of whether the
+        in-flight verify is dispatched locally (in-process, via this ctx
+        mgr) or remotely (via the CLI, which already records it). No new
+        lock is introduced — this reuses the existing
+        ``.merge_verify.lock`` flock + holder-pgid rendezvous (task 2306).
+
+        On a contended flock (the bounded wait in
+        :func:`acquire_merge_verify_flock` times out), yields WITHOUT
+        recording a lease — logs a WARNING and proceeds unrecorded, so a
+        contended lease can never deadlock a verify. The bounded-wait
+        flock remains the primary cross-process serialization; this lease
+        is defense-in-depth on top of it for the DF-side teardown/GC
+        actors.
+        """
+        fd = acquire_merge_verify_flock(
+            merge_verify_lock_path(self.worktree_base), _MERGE_VERIFY_FLOCK_WAIT_SECS,
+        )
+        if fd is None:
+            logger.warning(
+                'merge_verify_lease: flock contended (bounded wait timed '
+                'out) at %s — proceeding WITHOUT recording a lease',
+                self.worktree_base,
+            )
+            yield
+            return
+        write_lock_holder_pgid(self.worktree_base, os.getpgrp())
+        try:
+            yield
+        finally:
+            remove_lock_holder_pgid(self.worktree_base)
+            release_merge_verify_flock(fd)
 
     async def _is_registered_worktree(self, path: Path) -> bool:
         """Check if *path* is a registered git worktree.
@@ -1992,6 +2164,52 @@ class GitOps:
             path=path, branch=full_branch, warm=warm, base_ref=base_ref,
         )
 
+    def _scrub_seeded_lane_target(self, lane_dir: Path) -> None:
+        """Delete configured glob-matched subtrees under a seeded lane's
+        build-artifact dir so they regenerate fresh, per-lane (task 2315, BUG 3).
+
+        The warm-lane CoW seed base's build-artifact dir (``target/`` by
+        default) can contain generated artifacts that embed an ABSOLUTE
+        path pointing back at the shared ``_merge-verify/target`` OUT_DIR
+        they were originally generated under (e.g. tauri permission autogen
+        files). ``cp -a --reflink``-seeding that base into a lane
+        (:meth:`_seed_warm_lane`) copies those baked-in paths verbatim into
+        every lane. Rather than rewriting the baked paths in place (fragile
+        across TOML/binary formats), this deletes the configured subtrees
+        so they regenerate fresh on first use.
+
+        Args:
+            lane_dir: The seeded lane's worktree root (build-artifact dir
+                is resolved as ``lane_dir / reap_build_artifact_dirs[0]``,
+                defaulting to ``lane_dir / 'target'``).
+
+        No-op when :attr:`GitConfig.warm_lane_seed_scrub_globs` is empty
+        (the default — opt-in, byte-identical). Best-effort: a glob
+        matching nothing is a silent no-op, and any ``OSError`` during
+        deletion is logged at WARNING and swallowed — never raises.
+        """
+        globs = self.config.warm_lane_seed_scrub_globs
+        if not globs:
+            return
+        artifact_dir_name = (
+            self.config.reap_build_artifact_dirs[0]
+            if self.config.reap_build_artifact_dirs
+            else 'target'
+        )
+        artifact_dir = lane_dir / artifact_dir_name
+        try:
+            for pattern in globs:
+                for match in artifact_dir.glob(pattern):
+                    if match.is_dir() and not match.is_symlink():
+                        shutil.rmtree(match, ignore_errors=True)
+                    else:
+                        match.unlink(missing_ok=True)
+        except OSError:
+            logger.warning(
+                '_scrub_seeded_lane_target: failed to scrub %s under %s',
+                globs, artifact_dir, exc_info=True,
+            )
+
     async def _seed_warm_lane(self, lane_dir: Path, mode: str) -> int:
         """Run seed-warm-lane.sh to CoW-seed the lane's target/ from the warm base.
 
@@ -2067,6 +2285,14 @@ class GitOps:
                 # writable — the ONE chokepoint where the .pool-root sentinel
                 # is safe to (re-)write. See mark_pool_storage_present().
                 self.mark_pool_storage_present()
+                # task 2315 (BUG 3): rc == 0 also means the lane's target/ was
+                # just CoW-seeded from the shared base, which may carry
+                # forward stale baked-in absolute OUT_DIR paths. Scrub the
+                # configured subtrees so they regenerate per-lane. Order vs.
+                # mark_pool_storage_present() is irrelevant — scrub is
+                # idempotent/best-effort and never raises. Covers every seed
+                # site (create-once, reset-in-place, recycle) uniformly.
+                self._scrub_seeded_lane_target(lane_dir)
             return rc
         except Exception:
             logger.warning(
@@ -2218,30 +2444,43 @@ class GitOps:
         never raises.  A non-zero exit is logged at WARNING and treated as
         'nothing reclaimed' by the caller (``_warm_lane_disk_admission_blocked``).
 
-        **Pool-storage guard (task 2099)**: refuses to spawn the script when
-        a pool is configured (:meth:`pool_in_use`) but :meth:`pool_storage_present`
-        is False — an unmounted mountpoint must never let the GC script
-        reclaim/reset lanes it can only see as missing.  Skipped entirely
-        when no pool is in use: ``pool_storage_present()`` is permanently
-        False on a pool-less host (its only writer never runs without a
-        pool), so that alone must never be treated as a mount-down
-        incident.  Returns the same 127 fail-soft sentinel used for an
-        absent script, so callers treat it identically to 'nothing
-        reclaimed'.
+        **Merge-verify lease guard (task 2315, BUG 1)**: defers (127) while
+        ANY merge-verify lease is held — INCLUDING our own.  The reclaim
+        script operates over the whole pool mount (which CONTAINS
+        ``_merge-verify``), so an in-process local verify must be deferred
+        to just as much as a foreign one; unlike
+        :meth:`reset_persistent_merge_worktree`'s lease guard, self is NOT
+        excluded here.  Checked BEFORE the pool-storage guard below so the
+        skip is attributable to the lease even when the sentinel is fine.
+
+        **Pool-storage guard (task 2099, self-heal task 2315)**: routes
+        through :meth:`_reconcile_pool_storage_before_sweep`, which refuses
+        to spawn the script when a pool is configured
+        (:meth:`pool_in_use`) but :meth:`pool_storage_present` is False AND
+        that absence is not provably a first-seed bootstrap — an unmounted
+        mountpoint must never let the GC script reclaim/reset lanes it can
+        only see as missing.  A HEALTHY mount that merely lost its sentinel
+        (:meth:`_pool_storage_bootstrap_ok` True) self-heals: the sentinel
+        is recreated and the reclaim proceeds.  Skipped entirely when no
+        pool is in use: ``pool_storage_present()`` is permanently False on
+        a pool-less host (its only writer never runs without a pool), so
+        that alone must never be treated as a mount-down incident.
+        Returns the same 127 fail-soft sentinel used for an absent script,
+        so callers treat it identically to 'nothing reclaimed'.
 
         Returns:
             0   — reclaim succeeded.
-            127 — script absent, pool storage absent, or exception (fail-soft
-                sentinel).
+            127 — script absent, pool storage absent, merge-verify lease
+                held, or exception (fail-soft sentinel).
             other non-zero — reclaim script error (caller still re-checks).
         """
-        if self.pool_in_use() and not self.pool_storage_present():
-            logger.warning(
-                '_run_warm_lane_gc_reclaim: pool storage absent/unmounted at '
-                '%s — refusing to spawn warm-lane-gc.sh reclaim',
-                self.worktree_base,
+        if self._merge_verify_lease_active():
+            logger.info(
+                '_run_warm_lane_gc_reclaim: merge-verify in flight (lease '
+                'held) — deferring reclaim',
             )
-            self._note_pool_storage_absent()
+            return 127
+        if not self._reconcile_pool_storage_before_sweep('_run_warm_lane_gc_reclaim'):
             return 127
         try:
             script = self.project_root / 'scripts' / 'warm-lane-gc.sh'
@@ -5664,9 +5903,18 @@ class GitOps:
 
         Returns the fixed path (:attr:`persistent_merge_worktree_path`).
         Raises :exc:`RuntimeError` on git failure (mirrors
-        :meth:`_create_merge_worktree`).
+        :meth:`_create_merge_worktree`). Raises
+        :exc:`MergeVerifyLeaseHeld` (task 2315, BUG 1) BEFORE touching the
+        tree at all when a DIFFERENT live process holds the merge-verify
+        lease — self pgid is excluded so the normal reset-then-verify flow
+        (this orchestrator resetting the worktree it is about to verify)
+        is unaffected.
         """
         warm_path = self.persistent_merge_worktree_path
+
+        holder_pgid = read_lock_holder_pgid(self.worktree_base)
+        if self._merge_verify_lease_active() and holder_pgid != os.getpgrp():
+            raise MergeVerifyLeaseHeld(warm_path, holder_pgid)
 
         if not await self._is_registered_worktree(warm_path):
             # Create-once branch — self-heal a stale unregistered directory first.
@@ -7345,51 +7593,42 @@ class GitOps:
                 threaded into every log line so operators can attribute
                 which caller asked for the prune.
 
-        **Pool-storage guard (task 2099)**: refuses to run when a pool is
-        configured (:meth:`pool_in_use`) but :meth:`pool_storage_present` is
-        False.  An unmounted mountpoint dir makes every mount-resident
-        worktree APPEAR removed off-band, so an unguarded prune would wipe
-        every registered lane + ``_merge-verify`` admin entry the instant
-        the mount comes back — exactly the Jul-3 incident this guards
-        against.  Skipped entirely when no pool is in use:
-        ``pool_storage_present()`` is permanently False on a pool-less host
-        (its only writer never runs without a pool), so that alone must
-        never disable ``git worktree prune`` on every default host.
+        **Pool-storage guard (task 2099, self-heal task 2315)**: routes
+        through :meth:`_reconcile_pool_storage_before_sweep`, which refuses
+        to run when a pool is configured (:meth:`pool_in_use`) but
+        :meth:`pool_storage_present` is False AND that absence is not
+        provably a first-seed bootstrap.  An unmounted mountpoint dir makes
+        every mount-resident worktree APPEAR removed off-band, so an
+        unguarded prune would wipe every registered lane + ``_merge-verify``
+        admin entry the instant the mount comes back — exactly the Jul-3
+        incident this guards against.  Skipped entirely when no pool is in
+        use: ``pool_storage_present()`` is permanently False on a pool-less
+        host (its only writer never runs without a pool), so that alone
+        must never disable ``git worktree prune`` on every default host.
 
-        **Pre-first-seed bootstrap (review-fix)**: a freshly-provisioned
-        pool-configured host that has created ``worktree_base`` (e.g. pool
-        warmup ``mkdir``) but has not yet run a successful seed also has no
-        ``.pool-root`` sentinel — indistinguishable from an unmounted mount
-        by the sentinel alone.  When :meth:`_pool_storage_bootstrap_ok`
-        confirms this is the benign pre-first-seed case (the CoW seed base
-        already resolves under ``worktree_base``), the prune is still
-        skipped (there is nothing to prune yet) but the escalation callback
-        is suppressed so a legitimate cold start does not file operator
-        noise; the sentinel appears for real once the first seed runs.
+        **Pre-first-seed bootstrap / self-heal (task 2099 + 2315)**: a
+        freshly-provisioned pool-configured host that has created
+        ``worktree_base`` (e.g. pool warmup ``mkdir``) but has not yet run a
+        successful seed — or a previously-healthy host that simply lost its
+        ``.pool-root`` sentinel — also has no sentinel, indistinguishable
+        from an unmounted mount by the sentinel alone.  When
+        :meth:`_pool_storage_bootstrap_ok` confirms this is the benign case
+        (the CoW seed base already resolves under ``worktree_base``), the
+        shared helper RECREATES the sentinel and the prune PROCEEDS
+        normally (task 2315: previously this only skipped without
+        recreating the sentinel, a chicken-and-egg that suppressed
+        self-heal forever); the escalation callback is suppressed either
+        way so a legitimate cold start/self-heal does not file operator
+        noise.
 
-        **Escalation debounce**: the refusal branch below calls
-        :meth:`_note_pool_storage_absent` unconditionally on every refusal —
-        see that method's docstring for why repeated calls from hot sweep
-        sites (e.g. ``create_worktree``, ``reap_interactive_worktrees``) do
-        not multiply operator-visible escalations.
+        **Escalation debounce**: the refusal branch (routed through
+        :meth:`_reconcile_pool_storage_before_sweep`) calls
+        :meth:`_note_pool_storage_absent` unconditionally on every TRUE
+        refusal — see that method's docstring for why repeated calls from
+        hot sweep sites (e.g. ``create_worktree``, ``reap_interactive_worktrees``)
+        do not multiply operator-visible escalations.
         """
-        if self.pool_in_use() and not self.pool_storage_present():
-            if self._pool_storage_bootstrap_ok():
-                logger.info(
-                    '%s: pool storage sentinel absent at %s but '
-                    'the CoW seed base already resolves underneath it — '
-                    'pre-first-seed cold start, not an unmounted mount; '
-                    'skipping prune without escalating',
-                    context, self.worktree_base,
-                )
-                return
-            logger.warning(
-                '%s: pool storage absent/unmounted at %s — '
-                'refusing to run `git worktree prune` (would wipe '
-                '.git/worktrees admin entries for every mount-resident lane)',
-                context, self.worktree_base,
-            )
-            self._note_pool_storage_absent()
+        if not self._reconcile_pool_storage_before_sweep(context):
             return
         try:
             rc, _, err = await _run(

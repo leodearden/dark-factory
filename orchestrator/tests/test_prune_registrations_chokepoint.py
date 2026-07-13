@@ -10,8 +10,10 @@ mount-down incident. This module confirms:
 
   1. A converted call site (``delete_solo_branch``) refuses to run
      ``git worktree prune`` when pool storage is absent, logs a
-     context-tagged 'refusing to run `git worktree prune`' warning, and
-     fires ``_note_pool_storage_absent``.
+     context-tagged 'refusing sweep' warning (the generic refusal text
+     shared with ``_run_warm_lane_gc_reclaim`` via
+     ``_reconcile_pool_storage_before_sweep``, task 2315), and fires
+     ``_note_pool_storage_absent``.
   2. When pool storage is present, the same call site runs the prune
      subprocess identically to today (same argv/cwd).
   3. The ``context`` argument threaded through ``_prune_registrations``
@@ -102,7 +104,7 @@ class TestPruneRegistrationsChokepoint:
 
         refusal_records = [
             r for r in caplog.records
-            if 'refusing to run `git worktree prune`' in r.message
+            if 'refusing sweep' in r.message
         ]
         assert refusal_records, (
             f'Expected a refusal WARNING; got {[r.message for r in caplog.records]}'
@@ -202,7 +204,7 @@ class TestPruneRegistrationsChokepoint:
 
         refusal_records = [
             r for r in caplog.records
-            if 'refusing to run `git worktree prune`' in r.message
+            if 'refusing sweep' in r.message
         ]
         assert any(
             r.message.startswith('prune_stale_merge_worktrees:')
