@@ -1,0 +1,35 @@
+# dark_factory's own per-project legibility config (PRD §7.4).
+#
+# Opts dark_factory into the nightly confusion-reduction trickle (ε) and
+# periodic census (η): plans/confusion-reduction-prd.md. Consumed by
+# scripts/legibility/config.load_config via scripts/legibility/sampling.py's
+# CLI (--config defaults to this path).
+project_id: dark_factory
+project_root: /home/leo/src/dark-factory
+escalation_port: 8103
+# reify adds warm-lane + worktree roots; the inventory pre-filters
+# ~/.claude/projects encoded dir names by these prefixes (57 encodings for
+# dark-factory today: main checkout + .worktrees/.claude-worktrees children).
+cwd_prefixes:
+  - /home/leo/src/dark-factory
+budgets:
+  max_daily_digest_bytes: 300000
+sampling:
+  top_fraction: 0.12
+  per_stratum_min: 2
+census:
+  max_interval_days: 10
+  tasks_landed_threshold: 120
+  tasks_landed_min_days: 7
+  novelty_spike:
+    count: 4
+    window_hours: 72
+  floor_days: 5
+  saturation:
+    dup_rate: 0.9
+    consecutive_batches: 2
+models:
+  trickle: haiku
+  census_miner: sonnet
+  census_verify: sonnet
+  census_synthesis: fable
