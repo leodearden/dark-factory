@@ -31,17 +31,24 @@ set -euo pipefail
 # up, graphiti+mem0 reachable -- fused_memory/server/tools.py's
 # health_check), THEN (2) polls `journalctl --user -u fused-memory.service`
 # for a recon-serving readiness marker -- proof the restarted process is
-# actively cycling reconciliation, not merely alive. The default
+# actively serving ledger-backed recon, not merely alive. The default
 # RECON_MARKER ("Project reconciliation loop started for dark_factory") is
 # the `_project_loop` startup log line in
-# fused_memory/reconciliation/harness.py; confirmed against the live
-# fused-memory.service journal on this host (task 2233 prerequisite) to
-# recur roughly once a minute during normal activity, so it reliably
-# reappears well within the default RECON_VERIFY_TIMEOUT after a clean
-# restart -- no health-only fallback was needed. Combined with the runner's
-# own fresh-MainPID/ActiveEnterTimestampMonotonic verify (proving THIS
-# process is new), an observed marker proves the new process is actively
-# serving ledger-backed recon, not merely up.
+# fused_memory/reconciliation/harness.py (the logger.info call sits BEFORE
+# that function's `while True:`), so it is emitted EXACTLY ONCE per
+# project-loop (re)spawn -- i.e. once shortly after a restart -- and does
+# NOT recur periodically during steady-state activity. The gate therefore
+# relies on this single post-restart startup emission landing in the
+# journal within RECON_VERIFY_TIMEOUT, not on a recurring heartbeat;
+# confirmed present on this host's live journal immediately following a
+# restart (task 2233 prerequisite), so no health-only fallback was needed.
+# Combined with the runner's own fresh-MainPID/ActiveEnterTimestampMonotonic
+# verify (proving THIS process is new), an observed marker proves the new
+# process is actively serving ledger-backed recon, not merely up. Should
+# this single-emission coupling prove too fragile in practice (log message
+# wording/level changes, journald buffering), fall back to treating the
+# health gate alone as the serving proof -- the runner's fresh-MainPID
+# verify still independently proves the restart.
 #
 # Usage:
 #   deploy-w5-recon-reliability.sh [--check|--dry-run]
@@ -96,8 +103,20 @@ restart_start="$(date +%s)"
 echo "Restarting ${SERVICE}..."
 systemctl --user restart "$SERVICE"
 
+# NOTE (duplication): the two bounded-poll loops below are intentionally
+# copy-adapted from restart-fused-memory.sh's idioms rather than factored
+# into a shared helper (e.g. a sourced scripts/lib/poll.sh). This script
+# deliberately does not delegate TO restart-fused-memory.sh (see the "does
+# NOT delegate" rationale in the header), and extracting a shared snippet
+# would mean editing that script too, which is out of scope here; left as a
+# low-priority follow-up. Watch for drift if touching either script:
+# restart-fused-memory.sh uses SERVICE="fused-memory" (bare systemd unit
+# alias) while this script uses the fully-qualified SERVICE
+# "fused-memory.service" above -- both resolve to the same unit but are NOT
+# interchangeable string constants.
 # 1. Health gate: wait for /health to report ready (reuses
-# restart-fused-memory.sh:47-65's curl -sf polling idiom).
+# restart-fused-memory.sh:47-65's curl -sf polling idiom; see duplication
+# NOTE above).
 echo -n "Waiting for health..."
 deadline=$((SECONDS + HEALTH_TIMEOUT))
 healthy=false
@@ -120,7 +139,7 @@ echo " OK"
 # 2. Serving-sanity gate: bounded poll of the journal for RECON_MARKER,
 # proving the restarted process is actively cycling reconciliation (not
 # merely alive) -- reuses restart-fused-memory.sh:28-40's journalctl-grep
-# idiom.
+# idiom (see duplication NOTE above).
 echo -n "Waiting for recon-serving marker..."
 deadline=$((SECONDS + RECON_VERIFY_TIMEOUT))
 serving=false
