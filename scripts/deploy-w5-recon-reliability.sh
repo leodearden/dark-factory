@@ -90,3 +90,18 @@ if [[ "$MODE" == "check" ]]; then
     echo "Would then verify: /health at ${HEALTH_URL} (timeout ${HEALTH_TIMEOUT}s), then recon-serving marker '${RECON_MARKER}' via journalctl (timeout ${RECON_VERIFY_TIMEOUT}s)"
     exit 0
 fi
+
+restart_start="$(date +%s)"
+
+echo "Restarting ${SERVICE}..."
+systemctl --user restart "$SERVICE"
+
+# Verify (placeholder single-attempt checks -- upgraded to real bounded
+# polling loops with pass/fail handling in step-6 [health gate] and step-8
+# [recon-serving gate]; for now this only wires the restart-then-verify
+# ordering, it does not yet act on either check's outcome).
+curl -sf "$HEALTH_URL" > /dev/null 2>&1 || true
+journalctl --user -u "$SERVICE" --since "@${restart_start}" --no-pager -q \
+    | grep -q "$RECON_MARKER" || true
+
+exit 0
