@@ -426,6 +426,11 @@ def corpus_sanity(max_parallel: int, stagger: float, report_dir: Path | None) ->
 
 _ADJUDICATION_LOG_PATH = _PKG_DIR / 'corpus' / 'adjudication_log.jsonl'
 
+# Shared default floor for both `corpus-audit --min-diffs` and `mine`'s
+# post-run audit, so the two paths can't silently disagree on what "enough
+# diffs" means.
+_DEFAULT_MIN_DIFFS = 50
+
 # (check key, human-readable description) — order matches mining.audit_corpus's
 # check ordering so PASS/FAIL output reads top-to-bottom in the same sequence
 # the report's `failures` reasons would appear in.
@@ -440,7 +445,7 @@ _AUDIT_CHECKS = (
 
 
 @cli.command('corpus-audit')
-@click.option('--min-diffs', default=50, type=int, help='Minimum required diff count')
+@click.option('--min-diffs', default=_DEFAULT_MIN_DIFFS, type=int, help='Minimum required diff count')
 def corpus_audit(min_diffs: int) -> None:
     """Audit corpus integrity: size, split ratios, provenance, adjudication coverage, spot-check subset."""
     from .adjudication import AdjudicationLog
@@ -475,6 +480,8 @@ _MINE_DEFAULT_DB = Path('/home/leo/src/dark-factory/data/orchestrator/runs.db')
 _MINE_DEFAULT_ESC_DIR = Path('/home/leo/src/dark-factory/data/escalations')
 _MINE_DEFAULT_REPO = Path('/home/leo/src/dark-factory')
 _MINE_SPLIT_SEED = 'reviewer_trial-2495-fn-mining'
+_RESAVE_BATCH_SIZE = 10  # persist every K successfully-labeled diffs (not every 1) to bound
+                          # the O(n^2) full-corpus manifest+adjudication-log rewrite cost
 
 _LANG_EXTENSIONS = {
     'python': {'.py', '.pyi'},
@@ -504,23 +511,36 @@ def _infer_language(diff_text: str) -> str:
     return counts.most_common(1)[0][0]
 
 
+_FETCH_TITLES_CHUNK_SIZE = 500  # stay well under SQLite's SQLITE_MAX_VARIABLE_NUMBER
+                                  # (999 on older builds, 32766 on modern ones) -- the
+                                  # candidate set scales with run history and is unbounded.
+
+
 def _fetch_titles(db_path: Path, task_ids: list[str]) -> dict[str, str]:
     """Supplementary read-only lookup of ``task_results.title``, keyed by task_id.
 
     Kept separate from ``mining.mine_fn_candidates`` (whose FnCandidate field
     set is unit-tested) -- this is CLI-only convenience for building a
     human-readable frontier-prompt description.
+
+    Queries in chunks of ``_FETCH_TITLES_CHUNK_SIZE`` task_ids rather than one
+    giant ``IN (...)`` so an unbounded candidate set never risks a
+    ``sqlite3.OperationalError`` from exceeding SQLite's placeholder limit.
     """
     if not task_ids:
         return {}
     conn = sqlite3.connect(str(db_path))
     try:
-        placeholders = ','.join('?' for _ in task_ids)
-        rows = conn.execute(
-            f'SELECT task_id, title FROM task_results WHERE task_id IN ({placeholders})',
-            task_ids,
-        ).fetchall()
-        return {row[0]: row[1] or '' for row in rows}
+        titles: dict[str, str] = {}
+        for i in range(0, len(task_ids), _FETCH_TITLES_CHUNK_SIZE):
+            chunk = task_ids[i:i + _FETCH_TITLES_CHUNK_SIZE]
+            placeholders = ','.join('?' for _ in chunk)
+            rows = conn.execute(
+                f'SELECT task_id, title FROM task_results WHERE task_id IN ({placeholders})',
+                chunk,
+            ).fetchall()
+            titles.update((row[0], row[1] or '') for row in rows)
+        return titles
     finally:
         conn.close()
 
@@ -553,18 +573,22 @@ def _select_spot_check_subset(diff_ids: list[str], fraction: float = 0.1, minimu
 @click.option('--oauth-token-env', default='CLAUDE_OAUTH_TOKEN_A',
               help='Env var holding the OAuth token for frontier calls (multi-account pool)')
 @click.option('--limit', default=None, type=int, help='Cap the number of NEW candidates attempted this run')
+@click.option('--min-diffs', default=_DEFAULT_MIN_DIFFS, type=int,
+              help="Minimum required diff count for the post-run audit (kept consistent with corpus-audit's --min-diffs)")
 def mine(
     runs_db: Path, escalations_dir: Path, repo_path: Path, target_total: int,
     max_parallel: int, model: str, max_turns: int, seed: str, oauth_token_env: str,
-    limit: int | None,
+    limit: int | None, min_diffs: int,
 ) -> None:
     """Mine FN-candidate diffs from runs.db/escalations, frontier-label them, and
     expand + re-split the committed corpus (task 2495 / PRD D-6).
 
     Idempotent and resumable: re-running skips diff_ids already present in the
     corpus, and persists (manifest + adjudication log, re-split every time)
-    after every successfully-labeled diff -- an interrupted run loses at most
-    the in-flight batch.
+    every ``_RESAVE_BATCH_SIZE`` successfully-labeled diffs (plus once more at
+    the end of the run) -- bounding the full-corpus rewrite cost to roughly
+    ``total_added / _RESAVE_BATCH_SIZE`` saves instead of one per diff. An
+    interrupted run loses at most the current in-progress batch.
     """
 
     async def _run() -> int:
@@ -599,9 +623,12 @@ def mine(
         def _resave() -> None:
             """Persist manifest + adjudication log, re-deriving split + the
             spot-check subset from the CURRENT full diff set. Synchronous (no
-            ``await`` inside) so it's safe to call after every successful
-            mine -- an interrupted run leaves a fully consistent, resumable
-            on-disk corpus."""
+            ``await`` inside) so it's safe to call from within a worker's
+            critical section -- called every ``_RESAVE_BATCH_SIZE`` successful
+            mines (plus a final flush after the batch completes, including on
+            interrupt/error) rather than after every single one, bounding the
+            full-corpus rewrite cost; an interrupted run leaves a fully
+            consistent, resumable on-disk corpus as of the last save."""
             mined_ids = sorted(d.diff_id for d in manifest.diffs if d.source == 'mined')
             subset = _select_spot_check_subset(mined_ids) if mined_ids else set()
             entries_by_id = {e.diff_id: e for e in log.entries}
