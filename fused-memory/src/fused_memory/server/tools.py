@@ -1203,10 +1203,12 @@ def create_mcp_server(
         procedural_knowledge). It does NOT query Graphiti.
 
         **Bounded enumeration:** Results are capped at *limit* records (default 1000).
-        If the total matching record count (from ``count_memories_by_metadata``) exceeds
-        *limit*, this tool silently returns only the first *limit* records.  Pass an
-        explicit *limit* value or cross-check the returned list length against the count
-        tool to detect truncation.
+        If the total matching record count exceeds *limit*, this tool still returns only
+        the first *limit* records — but the response now self-discloses this via
+        ``truncated`` (bool) and ``total`` (the true matching count).
+        ``count_memories_by_metadata`` is consulted to compute ``total`` only when the
+        returned list hits the *limit* cap (the only case truncation is possible), so
+        the common non-truncated path incurs no extra Qdrant round-trip.
 
         Primary use-case: enumerating stage1_flag_markers to detect orphans that have
         ``source='stage1_flag_marker'`` but are missing ``kind='stage1_flag_marker'``.
@@ -1228,8 +1230,9 @@ def create_mcp_server(
             limit: Maximum records to return (default 1000; service-level cap).
 
         Returns:
-            {'memories': [...], 'project_id': ..., 'filters': ..., 'limit': ...} on success,
-            or {'error': ..., 'error_type': ...} on failure.
+            {'memories': [...], 'project_id': ..., 'filters': ..., 'limit': ...,
+            'truncated': bool, 'total': int} on success, or {'error': ..., 'error_type': ...}
+            on failure.
         """
         project_id, err = _canonicalize_project_id_arg(project_id)
         if err:
@@ -1241,11 +1244,22 @@ def create_mcp_server(
             filters=filters,
             limit=limit,
         )
+        returned = len(memories) if isinstance(memories, list) else 0
+        if returned >= limit:
+            total = await memory_service.count_memories_by_metadata(
+                project_id=project_id,
+                filters=filters,
+            )
+        else:
+            total = returned
+        truncated = total > returned
         return {
             'memories': memories,
             'project_id': project_id,
             'filters': filters,
             'limit': limit,
+            'truncated': truncated,
+            'total': total,
         }
 
     @mcp.tool()
