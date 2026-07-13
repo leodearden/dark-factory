@@ -2575,6 +2575,28 @@ class TestGetEntity:
         }
 
     @pytest.mark.asyncio
+    async def test_degraded_fallback_on_message_substring_quota_error(self, service):
+        """A quota error classified ONLY via the message-substring fallback (no
+        status_code, no code attribute) also degrades through get_entity
+        end-to-end. The other degraded-fallback tests here all use either a
+        real openai.RateLimitError or a duck-typed status_code==429, leaving
+        this third classification branch of _is_rate_limit_or_quota_error
+        untested through get_entity itself (task 2448 review)."""
+        service.graphiti.search_nodes = AsyncMock(return_value=[])
+        service.graphiti.search = AsyncMock(
+            side_effect=Exception('insufficient_quota: no credits')
+        )
+
+        result = await service.get_entity('entity', project_id='test')
+
+        assert result == {
+            'nodes': [],
+            'edges': [],
+            'degraded': True,
+            'failed_stores': ['graphiti'],
+        }
+
+    @pytest.mark.asyncio
     async def test_degraded_fallback_on_fuzzy_search_nodes_duck_typed_quota_error(self, service):
         """A duck-typed (non-openai) quota error from search_nodes also degrades —
         the predicate isn't limited to the concrete openai.RateLimitError type."""
