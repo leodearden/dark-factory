@@ -135,3 +135,63 @@ class TestLoadTranscript:
         loaded = mod.load_transcript(path)  # must not raise
 
         assert [r['message']['content'] for r in loaded] == ['one', 'two']
+
+
+# ---------------------------------------------------------------------------
+# iter_user_turns — genuine non-sidechain, non-meta human turns only.
+# User corrections are gold (PRD Sec 5): this is the highest-priority section.
+# ---------------------------------------------------------------------------
+
+class TestIterUserTurns:
+    def test_includes_string_content_turn(self):
+        turns = mod.iter_user_turns([_user_text('hello there')])
+
+        assert len(turns) == 1
+        assert turns[0]['text'] == 'hello there'
+        assert turns[0]['index'] == 0
+
+    def test_includes_text_block_content_turn(self):
+        rec = {
+            'type': 'user',
+            'message': {'role': 'user', 'content': [_text('typed message')]},
+            'isSidechain': False,
+            'isMeta': False,
+        }
+
+        turns = mod.iter_user_turns([rec])
+
+        assert len(turns) == 1
+        assert turns[0]['text'] == 'typed message'
+
+    def test_excludes_tool_result_only_content(self):
+        records = [_tool_result('tool-1', 'some result content')]
+
+        assert mod.iter_user_turns(records) == []
+
+    def test_excludes_meta_user_turns(self):
+        records = [_meta_user('Continue from where you left off.')]
+
+        assert mod.iter_user_turns(records) == []
+
+    def test_excludes_sidechain_turns(self):
+        records = [_sidechain(_user_text('subagent instructions'))]
+
+        assert mod.iter_user_turns(records) == []
+
+    def test_excludes_assistant_and_other_record_types(self):
+        records = [_assistant(_text('hi')), {'type': 'attachment'}]
+
+        assert mod.iter_user_turns(records) == []
+
+    def test_preserves_order_and_position_across_mixed_records(self):
+        records = [
+            _user_text('first'),
+            _assistant(_text('assistant reply')),
+            _meta_user('system injected'),
+            _user_text('second'),
+        ]
+
+        turns = mod.iter_user_turns(records)
+
+        assert [t['text'] for t in turns] == ['first', 'second']
+        assert [t['index'] for t in turns] == [0, 3]
