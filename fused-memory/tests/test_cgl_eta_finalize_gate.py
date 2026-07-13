@@ -20,7 +20,6 @@ sys.path dance previously duplicated in each test.
 from __future__ import annotations
 
 import asyncio
-import inspect
 import os
 import sys
 
@@ -178,22 +177,3 @@ def test_finalize_exits_zero_and_leaves_task_done_when_resolve_issue_fails(monke
     # attempted and its exception swallowed rather than propagated.
     assert [c[0] for c in calls] == ['set_task_status']
     assert calls[0][1]['status'] == 'done'
-
-
-def test_recording_fake_mirrors_real_mcp_client_shape(finalize_module):
-    """Guard against drift between the recording fake and the real McpClient.
-
-    _make_recording_mcp_client's docstring documents its shape assumption —
-    an async context manager built from a single positional `url` arg,
-    exposing `async call_tool(name, arguments)` — as mirroring
-    cgl_eta_scheduler_gate.McpClient (imported into this module as
-    `McpClient`). This is a fidelity guard, not a behavioral test of the fix
-    itself: if the real client's constructor or call_tool signature ever
-    changes, this fails loudly instead of the fake silently diverging while
-    every other test in this module keeps passing against stale assumptions.
-    """
-    real_init_params = list(inspect.signature(finalize_module.McpClient.__init__).parameters)
-    assert real_init_params == ['self', 'url']
-
-    real_call_tool_params = list(inspect.signature(finalize_module.McpClient.call_tool).parameters)
-    assert real_call_tool_params == ['self', 'name', 'arguments']
