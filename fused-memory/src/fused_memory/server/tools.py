@@ -33,6 +33,7 @@ from fused_memory.middleware.lock_charter_guard import (
     extract_files,
     lock_charter_error,
 )
+from fused_memory.middleware.premise_lint_guard import premise_lint_error
 from fused_memory.middleware.task_interceptor import (
     TERMINAL_STATUSES,
     _is_ticket_id,
@@ -3083,6 +3084,13 @@ def create_mcp_server(
         if _exec_err is not None:
             return _exec_err
         metadata = inject_execution_class(metadata)
+
+        # Premise-lint guard xi (task 2231/W5-xi) — see premise_lint_guard.py.
+        _premise_err = premise_lint_error(
+            description, agent_id, project_root, prompt=prompt, title=title, details=details
+        )
+        if _premise_err is not None:
+            return _premise_err
 
         return await task_interceptor.submit_task(
             project_root=project_root,

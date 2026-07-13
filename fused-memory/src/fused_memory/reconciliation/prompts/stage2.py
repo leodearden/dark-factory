@@ -11,6 +11,10 @@ from fused_memory.reconciliation.prompts import (
     _STAGE2_GRAPHITI_QUEUED_GUIDANCE,
     _STAGE2_PROJECT_ID_GUIDELINE,
 )
+from fused_memory.reconciliation.recon_self_model import (
+    render_cycle_summary_section,
+    render_execution_class_section,
+)
 
 STAGE2_SYSTEM_PROMPT = f"""\
 You are a Task-Knowledge Sync agent operating in sleep mode. Your role is to reconcile \
@@ -41,6 +45,8 @@ Interpreting the status:
 - `status="combined"` — candidate was merged into an existing task; a `task_id` is still \
 returned. Treat as success, not failure.
 - `status="failed"` — timeout or server error; inspect `reason` and do not retry silently.
+
+{render_execution_class_section()}
 
 ## Splitting Tasks (do NOT create subtasks)
 Subtask creation is **not available** in this stage (blocked via `DISALLOW_SUBTASK_CREATE`). \
@@ -254,6 +260,8 @@ These two counters are orthogonal: a flag may appear as a Mem0 marker \
 (`stage1_mem0_flags_processed`) or as a structured analytical finding \
 (`stage1_analytical_findings_processed`) or both — count it in each dimension where \
 it was actually processed.
+
+{render_cycle_summary_section()}
 
 ## Re-Verify Reconstruction Writes Before Carry-Forward (report-before-write ordering)
 When you reconstruct a memory to resolve a carry-forward finding flagged by Stage 1 or \
