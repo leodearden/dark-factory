@@ -26,6 +26,7 @@ from typing import Any
 
 from shared.safe_io import load_json_or_warn
 
+from orchestrator.stop_instruction import detect_stop_instruction
 from orchestrator.unblock_types import BlockClass
 
 logger = logging.getLogger(__name__)
@@ -288,6 +289,7 @@ def check_proposal(
     category: str | None,
     run_git: Any = None,
     now: datetime | None = None,
+    extra_texts: list[str] | None = None,
 ) -> dict[str, Any]:
     """Classify a proposal entry and return a verdict dict.
 
@@ -305,6 +307,18 @@ def check_proposal(
           falls through to the checks below rather than re-enabling the
           legacy prose/status sniffs (those stay gated on `block_class is
           None`, not on validity).
+      1c. EXPLICIT STOP INSTRUCTION (task 2509, reconciliation finding
+          0aac21b4): if entry['proposal_text'], entry['block_reason'], or any
+          string in extra_texts (e.g. the task description — see
+          b3_gate.run_check) contains a phrase from
+          orchestrator.stop_instruction.STOP_INSTRUCTION_PHRASES -> abort.
+          Hard-aborted before risk_label/git checks, same shape as 1b, and
+          takes precedence even over an otherwise-fresh low-risk entry — a
+          stop instruction is the highest-authority human directive and must
+          never be self-authorized around (task 2407's autonomous /unblock
+          session did exactly that; task 2273's SIGTERM-killed sibling
+          session is the "what right looks like" precedent this gate makes
+          mechanical rather than relying on an external kill).
       2. risk_label != 'low' -> abort
       3. LEGACY-ONLY (B3): 'block_class' absent AND 'status' key present
           (failure entry) -> abort. When 'block_class' is present, every
@@ -383,6 +397,24 @@ def check_proposal(
             ABORT,
             'post-merge red-main fix-forward class — highest-blast-radius '
             'unattended-edit scenario; routed to human (B3 never auto-acts on this class)',
+        )
+
+    # --- (1c) Explicit stop instruction (task 2509) ---
+    # Hard-abort regardless of risk_label/freshness — a stop instruction is the
+    # highest-authority human directive.  Checked before any git call so it
+    # consumes no git and cannot be bypassed by an otherwise-fresh proposal
+    # (mirrors 1b's placement and shape).  orchestrator.stop_instruction is the
+    # single source of truth for the phrase set — also reused by
+    # DeterministicRunner's before_done guard and the /unblock +
+    # unblock-low-risk runbook prose, so it cannot drift between surfaces.
+    stop_phrase = detect_stop_instruction(
+        entry.get('proposal_text'), entry.get('block_reason'), *(extra_texts or []),
+    )
+    if stop_phrase:
+        return _result(
+            ABORT,
+            f'explicit stop instruction present: {stop_phrase!r} — routed to human '
+            f'(no self-authorization; task 2509)',
         )
 
     # --- (2) Risk label ---
