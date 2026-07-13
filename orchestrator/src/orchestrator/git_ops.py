@@ -629,6 +629,35 @@ class WorktreeConflictError(RuntimeError):
         )
 
 
+class MergeVerifyLeaseHeld(RuntimeError):
+    """Raised by :meth:`GitOps.reset_persistent_merge_worktree` when a
+    DIFFERENT live process holds the merge-verify lease (task 2315, BUG 1).
+
+    Incident: the persistent ``_merge-verify`` worktree was clobbered (a
+    reset-in-place ``git reset --hard`` or a create-once stale-dir
+    ``shutil.rmtree``) while a verify was still running in it, racing the
+    in-flight build out from under itself. The merge-verify flock +
+    holder-pgid lease (task 2306) already records who is running a verify
+    there — this guard refuses to reset when that lease is held by a pgid
+    other than our own (fail-CLOSED). Lease *detection*
+    (:meth:`GitOps._merge_verify_lease_active`) is fail-OPEN — a stale,
+    dead, or unreadable holder is never treated as held — so this guard can
+    never permanently wedge a legitimate reset.
+
+    A caller hitting this should back off and retry once the in-flight
+    verify completes and releases the lease.
+    """
+
+    def __init__(self, warm_path: Path, holder_pgid: int | None):
+        self.warm_path = warm_path
+        self.holder_pgid = holder_pgid
+        super().__init__(
+            f'Refusing to reset persistent merge worktree {warm_path}: '
+            f'merge-verify lease is held by a different live process '
+            f'(holder pgid={holder_pgid}, self pgid={os.getpgrp()})'
+        )
+
+
 async def _run(cmd: list[str], cwd: Path | None = None) -> tuple[int, str, str]:
     """Run an arbitrary subprocess command and return (returncode, stdout, stderr).
 
@@ -5859,9 +5888,18 @@ class GitOps:
 
         Returns the fixed path (:attr:`persistent_merge_worktree_path`).
         Raises :exc:`RuntimeError` on git failure (mirrors
-        :meth:`_create_merge_worktree`).
+        :meth:`_create_merge_worktree`). Raises
+        :exc:`MergeVerifyLeaseHeld` (task 2315, BUG 1) BEFORE touching the
+        tree at all when a DIFFERENT live process holds the merge-verify
+        lease — self pgid is excluded so the normal reset-then-verify flow
+        (this orchestrator resetting the worktree it is about to verify)
+        is unaffected.
         """
         warm_path = self.persistent_merge_worktree_path
+
+        holder_pgid = read_lock_holder_pgid(self.worktree_base)
+        if self._merge_verify_lease_active() and holder_pgid != os.getpgrp():
+            raise MergeVerifyLeaseHeld(warm_path, holder_pgid)
 
         if not await self._is_registered_worktree(warm_path):
             # Create-once branch — self-heal a stale unregistered directory first.
