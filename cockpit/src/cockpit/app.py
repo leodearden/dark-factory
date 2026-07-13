@@ -42,6 +42,7 @@ from textual import work
 from textual.app import App, ComposeResult
 from textual.binding import Binding
 from textual.containers import Horizontal, Vertical
+from textual.css.query import NoMatches
 from textual.widgets import DataTable
 
 from cockpit.backends import DisplayTarget, FocusArrangeBackend, TmuxBackend, WmBackend
@@ -275,7 +276,16 @@ class CockpitApp(App):
         thread: refresh_registry calls it directly (already on that
         thread); _scan_registry_worker marshals back onto it via
         call_from_thread instead of calling it directly.
+
+        Safe to invoke as a call_from_thread-marshaled callback that lands
+        after the app has started shutting down: a scan that was in-flight
+        when the operator quit must never crash the shutdown sequence.
+        Bails out immediately if the app is no longer running, and no-ops
+        (rather than raising) if a widget lookup still finds the DOM
+        already torn down -- the threaded hand-off's shutdown-race hazard.
         """
+        if not self.is_running:
+            return
         new_snapshot = build_snapshot(records)
         new_decisions_snapshot = _decisions_snapshot(decisions)
         if (
@@ -289,10 +299,13 @@ class CockpitApp(App):
         self._decisions_snapshot = new_decisions_snapshot
         self._decisions = decisions
         self._records = order_sessions(records)
-        table = self.query_one('#session-table', SessionTable)
-        table.replace_rows(self._records, self._now_fn())
-        self._sync_detail_pane(table.highlighted_slug())
-        self._rebuild_queue()
+        try:
+            table = self.query_one('#session-table', SessionTable)
+            table.replace_rows(self._records, self._now_fn())
+            self._sync_detail_pane(table.highlighted_slug())
+            self._rebuild_queue()
+        except NoMatches:
+            return
 
     def _poll_registry(self) -> None:
         """on_mount's set_interval callback: launch the threaded scan worker.
