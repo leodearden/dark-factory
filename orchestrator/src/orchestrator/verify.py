@@ -237,6 +237,14 @@ def _is_structural_python_file(path: str, content: str) -> bool:
     ``_build_fallback_config``'s) sees identical results, including the
     documented ``.pyi``-exclusion and type-argument false-positive behavior
     (``TestIsStructuralPythonFile``).
+
+    Coverage trade-off, signed off (task γ review, robustness finding #1): a
+    test-tree file that defines a Protocol/TypedDict implemented by non-test
+    source elsewhere no longer widens pyright to a package-wide run on its
+    own change — narrower than the pre-task-γ content-only check for that
+    case. See :class:`verify_plan.FileKind`'s docstring for the full
+    rationale and the pinning test (``TestVerifyPlanClassificationDelegation
+    .test_is_structural_python_file_matches_classify_file``).
     """
     return verify_plan.classify_file(path, content) is verify_plan.FileKind.STRUCTURAL
 

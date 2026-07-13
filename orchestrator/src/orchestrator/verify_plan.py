@@ -27,6 +27,21 @@ class FileKind(Enum):
     Protocol-defining data module under ``tests/`` still triggers the full
     suite (D1) rather than merely widening pyright — the structural widening
     (D2) only matters for real source files outside the test tree.
+
+    Signed-off coverage trade-off (task γ review, robustness finding #1):
+    CONFTEST/COLLECTABLE_TEST/TEST_DATA outranking STRUCTURAL means a
+    Protocol/TypedDict *defined inside* a conftest.py, test_*.py/*_test.py,
+    or a tests/ data module is never STRUCTURAL, so touching it alone no
+    longer widens pyright to a package-wide run. If that same Protocol is
+    also implemented by non-test source elsewhere, a change to its shape
+    could previously trigger a full pyright pass that catches a now-broken
+    implementor; it is now file-scoped (or skipped) and can miss that
+    breakage. Accepted: production Protocol/TypedDict contracts are not
+    expected to live inside a test tree, and D1 already prioritizes the
+    pytest-side signal over the pyright-side one for test-tree files. Pinned
+    by ``TestVerifyPlanClassificationDelegation
+    .test_is_structural_python_file_matches_classify_file`` (test_verify.py,
+    the ``'a/tests/test_x.py'`` case).
     """
 
     CONFTEST = 'conftest'
