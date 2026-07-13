@@ -193,6 +193,20 @@ Trace how data structures transform as they cross module boundaries:
 - Missing transitive dependencies in `pyproject.toml`
 - Modules that import from internal paths of other packages (fragile coupling)
 
+## Step 5.5: Design-invariants audit
+
+### Detect and audit
+
+1. **Detect.** Check whether `docs/legibility/design-invariants.md` exists at project root. If absent, skip this step.
+
+2. **Read and audit.** If present, Read it and audit the modules in scope against each invariant's checkable question. The doc is normative — reference invariant slugs only; do not restate the invariant list here.
+
+3. **Classify severity.** Classify findings like stub findings in Step 2 (by blast radius).
+
+### Record findings
+
+Record findings under `invariant_findings` in the phase-2 JSON (schema in Step 8): `{"invariant": <slug>, "file": ..., "line": ..., "issue": ..., "severity": ...}`.
+
 ## Step 6: Dead code and orphan detection
 
 ### Delegate scanning to Sonnet agent
