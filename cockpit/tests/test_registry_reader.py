@@ -12,6 +12,8 @@ so a purely-time-passing tick is a no-op diff.
 
 from __future__ import annotations
 
+import os
+
 from orchestrator import session_registry as sr
 
 
@@ -143,6 +145,46 @@ class TestSessionScanner:
 
         second = scanner.scan()
         assert {r.session_slug for r in second} == {'b-2'}
+
+
+class TestScanChangeShortCircuit:
+    """Proves SessionScanner's mtime cache: a scan() call must not re-parse
+    (call session_registry.read_record for) a slug whose record.json mtime
+    is unchanged since the previous scan() -- this is the ~4.5s-at-10k-
+    sessions cost this task exists to eliminate (see the module docstring).
+    """
+
+    _FIXED_NS = 1_700_000_000_000_000_000
+
+    def test_unchanged_mtime_skips_reparse(self, tmp_path, monkeypatch):
+        from cockpit import registry_reader
+        from cockpit.registry_reader import SessionScanner
+
+        record = _make_record(session_slug='a-1', status=sr.Status.RUNNING)
+        sr.write_record(record, root=tmp_path)
+        path = sr.record_path_for_slug('a-1', root=tmp_path)
+        os.utime(path, ns=(self._FIXED_NS, self._FIXED_NS))
+
+        call_count = 0
+        original_read_record = registry_reader.session_registry.read_record
+
+        def counting_read_record(slug, root=None):
+            nonlocal call_count
+            call_count += 1
+            return original_read_record(slug, root=root)
+
+        monkeypatch.setattr(registry_reader.session_registry, 'read_record', counting_read_record)
+
+        scanner = SessionScanner(root=tmp_path)
+        first = scanner.scan()
+        assert call_count == 1
+        assert {r.session_slug for r in first} == {'a-1'}
+
+        # record.json's mtime is untouched -- the second scan must reuse the
+        # cached SessionRecord rather than calling read_record again.
+        second = scanner.scan()
+        assert call_count == 1
+        assert {r.session_slug: r for r in second} == {r.session_slug: r for r in first}
 
 
 class TestBuildSnapshot:
