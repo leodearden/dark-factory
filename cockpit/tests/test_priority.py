@@ -382,3 +382,40 @@ class TestDroppedBelowOpen:
         )
 
         assert score(dropped, weights, _NOW) < score(near_zero_open, weights, _NOW)
+
+
+class TestSeverityVocabulary:
+    """Fleet Cockpit F7 fix 2: severity_weights must cover the escalation
+    vocabulary (info|blocking|critical|urgent, escalation/src/escalation/
+    models.py) so a real decision severity actually differentiates score(),
+    and fix 3: the age term must no longer be able to swamp that signal.
+    """
+
+    def test_default_severity_weights_cover_escalation_vocabulary(self):
+        from cockpit.priority import Priorities
+
+        weights = Priorities.default().severity_weights
+
+        assert 'urgent' in weights
+        assert 'critical' in weights
+        assert 'blocking' in weights
+        assert 'info' in weights
+        assert weights['urgent'] >= weights['critical']
+        assert weights['critical'] > weights['blocking']
+        assert weights['blocking'] > weights['info']
+        assert weights['info'] > 0
+
+    def test_fresh_high_severity_outscores_saturated_default_severity(self):
+        """A brand-new 'blocking' ask must outscore a no-severity item that has
+        fully saturated the age bonus -- proving the age term can no longer
+        swamp a real severity signal (the F7 root cause).
+        """
+        from cockpit.priority import Priorities, score
+
+        weights = Priorities.default()
+        fresh_blocking = _make_item(severity='blocking', state='open', filed_at=_NOW)
+        saturated_default = _make_item(
+            severity='', state='open', filed_at=_NOW - timedelta(days=30)
+        )
+
+        assert score(fresh_blocking, weights, _NOW) > score(saturated_default, weights, _NOW)
