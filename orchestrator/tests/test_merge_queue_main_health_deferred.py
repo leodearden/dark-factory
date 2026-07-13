@@ -333,3 +333,90 @@ class TestDeferredProbeHappyPath:
         assert escalation_queue.get_pending() == [], (
             'A raising probe must file no escalation'
         )
+
+
+# ---------------------------------------------------------------------------
+# Step-11 (RED): stale-check — a probe verdict against a main SHA that has
+# since moved (or whose re-resolution fails/empties) must file NO escalation
+# (fail safe). Step-10 files unconditionally on any (True, probe_sha)
+# verdict without re-resolving git_ops.get_main_sha() at all, so each of
+# these currently fails until step-12 adds the re-resolve + equality check.
+# ---------------------------------------------------------------------------
+
+# Deliberately distinct from MAIN_SHA (test_merge_queue_main_health's
+# default _make_git_ops().get_main_sha() return value) so a probe verdict
+# carrying this sha simulates main having advanced since the probe ran.
+STALE_PROBE_SHA = 'deadbeef00001111222233334444555566667777'
+
+
+class TestDeferredProbeStaleCheck:
+    def test_moved_main_files_no_escalation(self, tmp_path: Path) -> None:
+        config = _make_config(tmp_path, escalate_preexisting=True)
+        git_ops = _make_git_ops(tmp_path)  # get_main_sha AsyncMock -> MAIN_SHA
+        req = _make_req('99', tmp_path / 'task-wt', config)
+        (tmp_path / 'task-wt').mkdir()
+        escalation_queue = EscalationQueue(tmp_path / 'escalations')
+
+        async def _run() -> None:
+            with patch(
+                'orchestrator.merge_queue.verify_failure_is_preexisting_on_main',
+                new=AsyncMock(return_value=(True, STALE_PROBE_SHA)),
+            ):
+                await _run_deferred_main_health_probe(
+                    git_ops, req, COMPILE_ERROR_RESULT,
+                    escalation_queue=escalation_queue,
+                )
+
+        asyncio.run(_run())
+        assert escalation_queue.get_pending() == [], (
+            'A probe verdict against a main SHA that has since moved '
+            '(git_ops.get_main_sha() != probe_sha) must file no escalation'
+        )
+
+    def test_get_main_sha_raising_files_no_escalation(self, tmp_path: Path) -> None:
+        config = _make_config(tmp_path, escalate_preexisting=True)
+        git_ops = _make_git_ops(tmp_path)
+        git_ops.get_main_sha = AsyncMock(side_effect=RuntimeError('boom'))
+        req = _make_req('99', tmp_path / 'task-wt', config)
+        (tmp_path / 'task-wt').mkdir()
+        escalation_queue = EscalationQueue(tmp_path / 'escalations')
+
+        async def _run() -> None:
+            with patch(
+                'orchestrator.merge_queue.verify_failure_is_preexisting_on_main',
+                new=AsyncMock(return_value=(True, MAIN_SHA)),
+            ):
+                await _run_deferred_main_health_probe(
+                    git_ops, req, COMPILE_ERROR_RESULT,
+                    escalation_queue=escalation_queue,
+                )
+
+        asyncio.run(_run())  # must not raise
+        assert escalation_queue.get_pending() == [], (
+            'A raising get_main_sha() re-resolve must file no escalation '
+            '(fail safe)'
+        )
+
+    def test_get_main_sha_empty_files_no_escalation(self, tmp_path: Path) -> None:
+        config = _make_config(tmp_path, escalate_preexisting=True)
+        git_ops = _make_git_ops(tmp_path)
+        git_ops.get_main_sha = AsyncMock(return_value='')
+        req = _make_req('99', tmp_path / 'task-wt', config)
+        (tmp_path / 'task-wt').mkdir()
+        escalation_queue = EscalationQueue(tmp_path / 'escalations')
+
+        async def _run() -> None:
+            with patch(
+                'orchestrator.merge_queue.verify_failure_is_preexisting_on_main',
+                new=AsyncMock(return_value=(True, MAIN_SHA)),
+            ):
+                await _run_deferred_main_health_probe(
+                    git_ops, req, COMPILE_ERROR_RESULT,
+                    escalation_queue=escalation_queue,
+                )
+
+        asyncio.run(_run())
+        assert escalation_queue.get_pending() == [], (
+            'An empty get_main_sha() re-resolve must file no escalation '
+            '(fail safe)'
+        )
