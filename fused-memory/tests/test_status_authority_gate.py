@@ -38,20 +38,13 @@ from datetime import UTC, datetime, timedelta
 import pytest
 import pytest_asyncio
 from shared.task_claimant import compose_claimant_run_id, is_stranded
-from shared.task_statuses import TaskStatus
+from shared.task_statuses import TaskStatus  # noqa: F401 -- A-row vocabulary under test
 
 from fused_memory.backends.sqlite_task_backend import SqliteTaskBackend
 from fused_memory.backends.task_backend_errors import TaskmasterError
 from fused_memory.config.schema import FusedMemoryConfig, TaskmasterConfig
 from fused_memory.middleware.task_interceptor import TaskInterceptor
 from fused_memory.reconciliation.event_buffer import EventBuffer
-
-__all__ = [
-    'TaskmasterError',
-    'TaskStatus',
-    'compose_claimant_run_id',
-    'is_stranded',
-]
 
 
 async def _fresh_stack(tmp_path, *, enforce: bool = False):
@@ -179,6 +172,12 @@ async def test_a3_reconciliation_illegal_transition_log_mode_warns_and_proceeds(
     (Table A) — in-progress->pending is illegal FOR IT ALONE. In log-mode
     (enforce=False, the default) the gate logs a grep-stable WARNING but the
     write still proceeds: get_statuses shows 'pending' after the call.
+
+    The WARNING assertion pins only the invariant token
+    ('illegal_transition would-reject'), not the full sentence (transition/
+    actor suffix) — so the test survives a benign log-message rewording
+    instead of coupling to free-text prose (the log call has no structured
+    ``extra=`` field to assert on instead; see task_interceptor.py:1049-1054).
     """
     interceptor, backend, project_root, event_buffer = await _fresh_stack(tmp_path, enforce=False)
     try:
@@ -191,8 +190,7 @@ async def test_a3_reconciliation_illegal_transition_log_mode_warns_and_proceeds(
             )
         assert 'error' not in result, result
         assert any(
-            'illegal_transition would-reject in-progress->pending actor=reconciliation' in r.message
-            for r in caplog.records
+            'illegal_transition would-reject' in r.message for r in caplog.records
         ), [r.message for r in caplog.records]
 
         statuses = await backend.get_statuses(project_root)
