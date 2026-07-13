@@ -18,7 +18,6 @@ from typing import Any
 from unittest.mock import patch
 
 import pytest
-
 from shared.cli_invoke import _SubprocessResult, invoke_claude_agent
 
 from orchestrator.agents.invoke import _invoke_claude_with_sandbox
