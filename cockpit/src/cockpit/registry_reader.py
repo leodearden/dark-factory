@@ -87,22 +87,42 @@ class SessionScanner:
         st_mtime_ns is unchanged since the last scan() call reuses the
         cached SessionRecord instead of paying read_record's read_text() +
         JSON parse again.
+
+        The cache is rebuilt from scratch every call from exactly the slugs
+        seen THIS scan, and only assigned to self._cache at the end -- a
+        slug that vanished since the last scan is dropped from the cache
+        even if it never resurfaces, so a later, unrelated record written at
+        the same slug is always read fresh rather than risking a match
+        against a stale leftover cache entry (e.g. a coincidentally-repeated
+        mtime). A stat() failure (record.json vanished between iterdir() and
+        stat(), or any other OSError) is treated as a cache miss -- it falls
+        back to read_record(), which raises FileNotFoundError/
+        CorruptSessionRecord in turn and is fail-soft skipped exactly like
+        scan_sessions, rather than propagating out of scan() uncaught.
         """
         base = session_registry.sessions_dir(self._root)
         if not base.is_dir():
+            self._cache = {}
             return []
 
         records: list[session_registry.SessionRecord] = []
+        new_cache: dict[str, tuple[int, session_registry.SessionRecord]] = {}
         for slug_dir in sorted(base.iterdir()):
             if not slug_dir.is_dir():
                 continue
             slug = slug_dir.name
             record_path = session_registry.record_path_for_slug(slug, root=self._root)
-            mtime_ns = record_path.stat().st_mtime_ns
+            try:
+                mtime_ns: int | None = record_path.stat().st_mtime_ns
+            except OSError:
+                mtime_ns = None
+
             cached = self._cache.get(slug)
-            if cached is not None and cached[0] == mtime_ns:
+            if mtime_ns is not None and cached is not None and cached[0] == mtime_ns:
+                new_cache[slug] = cached
                 records.append(cached[1])
                 continue
+
             try:
                 record = session_registry.read_record(slug, root=self._root)
             except (FileNotFoundError, session_registry.CorruptSessionRecord):
@@ -110,8 +130,10 @@ class SessionScanner:
                     'SessionScanner.scan: skipping unreadable record for %s', slug, exc_info=True
                 )
                 continue
-            self._cache[slug] = (mtime_ns, record)
+            if mtime_ns is not None:
+                new_cache[slug] = (mtime_ns, record)
             records.append(record)
+        self._cache = new_cache
         return records
 
 
