@@ -186,16 +186,26 @@ function barycenterSweep(rows, edges, direction) {
 // total crossings, repeating full passes until none improve. Mutates `rows`
 // in place; never accepts a swap that doesn't strictly help, so it can only
 // hold or reduce the crossing count it started with.
+//
+// Tracks the current crossing count in `currentCrossings` instead of
+// recomputing the pre-swap count on every candidate: the "before" value for
+// any candidate is always exactly the last-computed count (either the
+// `after` of the previous accepted swap, or the unchanged count from the
+// previous rejected/reverted swap), so recomputing it via a second
+// countCrossings(rows, edges) call was redundant — this halves the number of
+// (O(edges^2)-per-tier-pair) countCrossings calls in this pass without
+// changing which swaps are accepted.
 function transposePass(rows, edges) {
+  let currentCrossings = countCrossings(rows, edges);
   let improved = true;
   while (improved) {
     improved = false;
     for (const row of rows) {
       for (let i = 0; i < row.length - 1; i++) {
-        const before = countCrossings(rows, edges);
         [row[i], row[i + 1]] = [row[i + 1], row[i]];
         const after = countCrossings(rows, edges);
-        if (after < before) {
+        if (after < currentCrossings) {
+          currentCrossings = after;
           improved = true;
         } else {
           [row[i], row[i + 1]] = [row[i + 1], row[i]]; // revert — no strict improvement
