@@ -3320,6 +3320,12 @@ def create_mcp_server(
                 ``deferred`` to leave them parked, or ``cancelled`` to discard
                 the planned batch.  Other status values are rejected.
 
+        A ``pending`` commit also indexes the batch into the curator corpus
+        (best-effort) so ``search_tasks``/dup-detection can see these
+        planning_mode tasks immediately, instead of waiting on the one-shot
+        empty-corpus backfill. ``deferred``/``cancelled`` commits are never
+        indexed — an abandoned or discarded batch must not pollute the corpus.
+
         Returns ``{success, results: [{task_id, result: ...}, ...]}`` matching
         the multi-id ``set_task_status`` response shape.
         """
@@ -3380,11 +3386,16 @@ def create_mcp_server(
             if dirs:
                 return lock_charter_error(dirs, task_id=tid)
 
-        return await task_interceptor.set_task_status(
+        result = await task_interceptor.set_task_status(
             task_id=','.join(ids),
             status=target_status,
             project_root=project_root,
         )
+        if target_status == 'pending':
+            # Best-effort/never-raising (see index_committed_tasks docstring) —
+            # no extra guard needed here, and it must not alter the returned result.
+            await task_interceptor.index_committed_tasks(list(tasks_data), project_root)
+        return result
 
     @mcp.tool()
     @mcp_tool_errors()
