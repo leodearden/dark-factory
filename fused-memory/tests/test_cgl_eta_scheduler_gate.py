@@ -376,3 +376,45 @@ class TestOneBestEffort:
         result = await _mod._one('dark_factory', 'http://127.0.0.1:8102', 'resume_scheduler', 'x')
 
         assert result is False
+
+    @pytest.mark.asyncio
+    async def test_one_returns_true_on_clean_resume(self, monkeypatch):
+        """Happy path: a clean `resume_scheduler` apply reads the `resumed`
+        key from the result and returns True."""
+        real_mcp_client = _mod.McpClient  # capture before patching to avoid recursion
+
+        # Default handler's tools/call response is {'resumed': True, 'was_paused': False}.
+        transport = httpx.MockTransport(_make_stateful_handler([]))
+        monkeypatch.setattr(
+            _mod, 'McpClient', lambda url, *a, **kw: real_mcp_client(url, transport=transport)
+        )
+
+        result = await _mod._one('dark_factory', 'http://127.0.0.1:8102', 'resume_scheduler', 'x')
+
+        assert result is True
+
+    @pytest.mark.asyncio
+    async def test_one_returns_true_on_clean_halt(self, monkeypatch):
+        """Happy path: a clean `halt_scheduler` apply reads the `halted`
+        key (not `resumed`) from the result and returns True."""
+        real_mcp_client = _mod.McpClient  # capture before patching to avoid recursion
+
+        def tool_call_response(body: dict) -> httpx.Response:
+            return httpx.Response(
+                200,
+                json={
+                    'jsonrpc': '2.0', 'id': body.get('id'),
+                    'result': {'structuredContent': {'halted': True, 'was_paused': False}},
+                },
+            )
+
+        transport = httpx.MockTransport(
+            _make_stateful_handler([], tool_call_response=tool_call_response)
+        )
+        monkeypatch.setattr(
+            _mod, 'McpClient', lambda url, *a, **kw: real_mcp_client(url, transport=transport)
+        )
+
+        result = await _mod._one('dark_factory', 'http://127.0.0.1:8102', 'halt_scheduler', 'x')
+
+        assert result is True
