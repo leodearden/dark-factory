@@ -216,6 +216,12 @@ fi
 
 flags=""
 [ "$skip_perms" = "true" ] && flags="--dangerously-skip-permissions"
+# Optional extra claude CLI args (e.g. CLAUDE_SPAWN_CLAUDE_ARGS='--model
+# claude-fable-5'). Baked into the payload string at construction time —
+# like $flags itself — so they reach claude even under daemon-owned
+# emulators (gnome-terminal server) that do not inherit this caller's
+# environment. Default-empty: no behavior change for existing callers.
+[ -n "${CLAUDE_SPAWN_CLAUDE_ARGS:-}" ] && flags="$flags $CLAUDE_SPAWN_CLAUDE_ARGS"
 
 sentinel="$(mktemp -u -t spawn-claude-XXXXXX.done)"
 
