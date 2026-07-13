@@ -169,6 +169,74 @@ def iter_error_neighborhoods(records: list[dict[str, Any]]) -> list[dict[str, An
     return neighborhoods
 
 
+SELF_CORRECTION_PATTERNS: tuple[str, ...] = (
+    "that's wrong",
+    'let me fix',
+    'my mistake',
+    'i was wrong',
+    'actually,',
+    'correction:',
+)
+"""Curated self-correction markers, matched case-insensitively against
+assistant TEXT blocks only (native-carrier scoping)."""
+
+
+def _line_context(text: str, pos: int) -> str:
+    """Return the newline-delimited line of *text* containing offset *pos*."""
+    start = text.rfind('\n', 0, pos) + 1  # rfind returns -1 when absent -> 0
+    end = text.find('\n', pos)
+    if end == -1:
+        end = len(text)
+    return text[start:end].strip()
+
+
+def _assistant_text_blocks(
+    records: list[dict[str, Any]],
+) -> list[tuple[int, str]]:
+    """Return (record_index, text) for every assistant 'text' content block.
+
+    Excludes 'thinking' and 'tool_use' blocks -- only genuine assistant
+    text shown to the user is the self-correction carrier.
+    """
+    found = []
+    for index, record in enumerate(records):
+        if record.get('type') != 'assistant':
+            continue
+        content = _message_content(record)
+        if not isinstance(content, list):
+            continue
+        for block in content:
+            if isinstance(block, dict) and block.get('type') == 'text':
+                text = block.get('text')
+                if isinstance(text, str):
+                    found.append((index, text))
+    return found
+
+
+def iter_self_corrections(records: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Detect curated self-correction markers in assistant TEXT blocks only.
+
+    Native-carrier scoping: the same phrase inside a tool_result or inside
+    a Write/Edit/MultiEdit/NotebookEdit tool_use input (an agent authoring
+    test data, not a real correction) is never scanned -- restricting the
+    scan to assistant 'text' blocks (see :func:`_assistant_text_blocks`)
+    structurally excludes both.
+    """
+    hits = []
+    for index, text in _assistant_text_blocks(records):
+        lowered = text.lower()
+        for pattern in SELF_CORRECTION_PATTERNS:
+            pos = lowered.find(pattern)
+            if pos == -1:
+                continue
+            hits.append({
+                'index': index,
+                'pattern': pattern,
+                'context': _line_context(text, pos),
+            })
+    return hits
+
+
 def iter_user_turns(records: list[dict[str, Any]]) -> list[dict[str, Any]]:
     """Return genuine non-sidechain, non-meta human user turns.
 
