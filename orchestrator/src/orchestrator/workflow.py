@@ -9546,10 +9546,18 @@ Update the plan to address the blocking issues. You may add new steps to the `st
         status ALWAYS overrides, preserving the pre-W9-delta ordering where
         the terminal check preceded the L0-resolved check.  Absent an
         override, the published outcome (if any) is returned as-is;
-        otherwise (grace-timeout/cancel with nothing published) a
-        synthesized ``StewardInterrupted('timeout', wip=...)`` is returned —
-        wip/no-wip routing is resolved later, by ``_mark_blocked``'s single
-        branch (the task-2060 fix), not here.
+        otherwise (nothing published) a synthesized
+        ``StewardInterrupted('timeout', wip=...)`` is returned — wip/no-wip
+        routing is resolved later, by ``_mark_blocked``'s single branch (the
+        task-2060 fix), not here.  **Cancel-safety amendment**: when
+        ``self._cancel_event`` is (or becomes) set — whether already set on
+        entry, skipping the wait outright, or fired mid-wait — the
+        synthesized outcome always carries ``wip_commits_present=False``,
+        never the derived probe value.  A soft-cancel/preemption of this
+        workflow slot must not be routed into the task-2060 resume-plan
+        branch (requeue + L0 dismissal): that branch is reserved for a
+        genuine steward give-up, not for this slot being told to stop.  A
+        real (non-cancel) grace-timeout still derives wip normally.
 
         Two extra layers close the multi-outcome silent-requeue gap (review
         fix): (1) once an outcome is obtained, any further outcomes already
@@ -9560,7 +9568,11 @@ Update the plan to address the blocking issues. You may add new steps to the `st
         escalation queue's ``has_open_l1`` is re-checked as a source-of-truth
         backstop — catching the publish-timing race where a follow-on L1 was
         filed but its outcome has not yet landed on the channel — and
-        ``StewardReescalatedL1`` is returned instead when one is open.
+        ``StewardReescalatedL1`` is returned instead when one is open (and,
+        when the overridden outcome was a wip-present ``StewardInterrupted``,
+        the still-pending L0 it never dismissed is dismissed here too — that
+        publisher deliberately skips ``_auto_escalate_to_human``, so the
+        override's ``StewardReescalatedL1`` would otherwise strand it).
         """
         channel = self._steward_outcome_channel
         if channel is None:
@@ -9634,10 +9646,48 @@ Update the plan to address the blocking issues. You may add new steps to the `st
                 open_l1 = self.escalation_queue.get_by_task(
                     self.task_id, status='pending', level=1,
                 )
+                if isinstance(outcome, StewardInterrupted) and outcome.wip_commits_present:
+                    # Amendment (review fix — orphan_resource_leak): the
+                    # wip-present StewardInterrupted publisher deliberately
+                    # skips _auto_escalate_to_human (task-2060 fix — no L1
+                    # for a resumable interruption), so it never dismisses
+                    # the L0 it was handling.  _mark_blocked's
+                    # StewardReescalatedL1 branch assumes
+                    # _auto_escalate_to_human already dismissed the L0 —
+                    # true only for a steward-PUBLISHED StewardReescalatedL1,
+                    # not for this override-synthesized substitution.
+                    # Dismiss it here, in the single choke point that made
+                    # the substitution, mirroring the shared BLOCKED
+                    # fall-through's dismissal loop — otherwise it strands
+                    # for the orphan-L0 reaper to later promote into a
+                    # duplicate L1.
+                    orphan_l0 = self.escalation_queue.get_by_task(
+                        self.task_id, status='pending', level=0,
+                    )
+                    for esc in orphan_l0:
+                        self.escalation_queue.resolve(
+                            esc.id,
+                            'Auto-dismissed: steward interrupted with WIP '
+                            'present but a concurrent L1 is already open — '
+                            'deferring to that hand-off instead of resuming '
+                            'the plan',
+                            dismiss=True, resolved_by='auto-dismissed',
+                        )
+                    if orphan_l0:
+                        logger.info(
+                            'Task %s: dismissed %d pending L0(s) — '
+                            'wip-present interruption overridden to '
+                            'ESCALATED by an already-open L1',
+                            self.task_id, len(orphan_l0),
+                        )
                 return StewardReescalatedL1(
                     esc_id=open_l1[0].id if open_l1 else '',
                 )
             return outcome
         return StewardInterrupted(
-            'timeout', wip_commits_present=await self._worktree_has_wip_commits(),
+            'timeout',
+            wip_commits_present=(
+                False if self._cancel_event.is_set()
+                else await self._worktree_has_wip_commits()
+            ),
         )
