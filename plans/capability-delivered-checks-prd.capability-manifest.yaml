@@ -1,0 +1,99 @@
+# Machine-readable twin of capability-delivered-checks-prd.capability-manifest.md
+# Schema: PRD §Contract (this PRD's α task implements the validating loader).
+# NOTE: exemplar/fixture for THIS batch — the γ stamper does not exist yet, so
+# task_id values are hand-stamped at decompose and no task in this batch
+# carries metadata.delivered_checks. The delivered_check entries below become
+# live only for batches committed after γ+δ+ε land.
+prd: plans/capability-delivered-checks-prd.md
+schema_version: 1
+tasks:
+  - label: "α"
+    task_id: null
+    title: "Shared capability-manifest sidecar schema + delivered-check models"
+    capabilities:
+      - name: "delivered-checks-metadata-submodel-registered"
+        binding: "capability→producer (wired) — grep:shared/src/shared/task_metadata.py:305 register_metadata_submodel"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "register_metadata_submodel\\(\\s*['\"]delivered_checks['\"]"
+          paths: ["shared/src/shared/"]
+          expect: present
+      - name: "sidecar-loader-models-exist"
+        binding: "capability→producer (wired) — pydantic/pyyaml in shared/pyproject.toml:14,20"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "class CapabilityManifestDoc"
+          paths: ["shared/src/shared/"]
+          expect: present
+      - name: "malformed-doc-rejection"
+        binding: "rejection-mechanism — built+bound by α (validator fixtures observe each rule fire)"
+        verdict: PASS
+        delivered_check:
+          kind: manual
+          reason: "rejection quality is judged by α's own test fixtures, not a grep"
+  - label: "β"
+    task_id: null
+    title: "/prd skill emits the YAML sidecar; exemplar committed"
+    capabilities:
+      - name: "decompose-step-2.5-names-the-yaml-sidecar"
+        binding: "capability→producer (wired) — grep:skills/prd/references/decompose-mode.md:38-42 Step 2.5"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "capability-manifest\\.yaml"
+          paths: ["skills/prd/references/"]
+          expect: present
+  - label: "γ"
+    task_id: null
+    title: "commit_planning stamps sidecar + copies delivered_checks"
+    capabilities:
+      - name: "manifest-stamping-report-in-commit-planning-response"
+        binding: "capability→producer (wired) — grep:fused-memory/src/fused_memory/server/tools.py:3289,3366 commit_planning batch-read"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "manifest_stamping"
+          paths: ["fused-memory/src/fused_memory/"]
+          expect: present
+      - name: "metadata-merge-safe-stamp"
+        binding: "rejection-mechanism — 1827/1828 landed; γ's tests assert sibling metadata keys survive"
+        verdict: PASS
+        delivered_check:
+          kind: manual
+          reason: "merge-safety is a test property, not mechanically greppable"
+  - label: "δ"
+    task_id: null
+    title: "Scheduler delivered-check gate + runner + per-SHA cache"
+    capabilities:
+      - name: "deps-satisfied-consumes-delivered-check-cache"
+        binding: "capability→producer (wired) — grep:orchestrator/src/orchestrator/scheduler.py:2930-3019 external_status_cache pattern"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "delivered_check_cache"
+          paths: ["orchestrator/src/orchestrator/scheduler.py"]
+          expect: present
+  - label: "ε"
+    task_id: null
+    title: "Grace-streak escalation + config knobs + ops docs"
+    capabilities:
+      - name: "l2-escalation-names-the-failed-check"
+        binding: "capability→producer (wired) — grep:escalation/server.py:303,333 born-at-L2; harness.py:4244 callback shape"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "DEP_CAPABILITY_NOT_DELIVERED"
+          paths: ["orchestrator/src/orchestrator/"]
+          expect: present
+  - label: "ζ"
+    task_id: null
+    title: "End-to-end integration gate"
+    capabilities:
+      - name: "boundary-sketch-green-e2e"
+        binding: "DAG-direction — all legs produced upstream (γ stamp, δ gate, ε escalate)"
+        verdict: PASS
+        delivered_check:
+          kind: manual
+          reason: "the task IS the check suite; its signal is the CI-green boundary matrix"
