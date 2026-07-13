@@ -1,0 +1,163 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# deploy-w5-recon-reliability.sh
+#
+# RESTART + VERIFY deploy capstone for the W5 recon-reliability batch
+# (ReconLedgerStore control-plane ledger + write-both/read-new cutover --
+# plans/recon-reliability-prd.md, tasks alpha..omicron / 2219-2232, all
+# merged to main ahead of this script).
+#
+# INTENDED CALLER: a task_kind='deterministic' deploy task's
+# `before_done.script`, with `target_unit` set to fused-memory.service -- a
+# DIFFERENT unit than the orchestrator's own, so deterministic_runner.py
+# takes the CROSS-UNIT blocking path (module docstring section gamma):
+# baseline-inspect fused-memory.service -> run this script BLOCKING ->
+# re-inspect and verify a fresh MainPID + later ActiveEnterTimestampMonotonic
+# -> done=deployed-and-verified. This script's own `systemctl restart` below
+# is therefore load-bearing for that verify -- it must actually BE the
+# thing that restarts the unit, not a delegate that merely signals it.
+#
+# RESTART CONVENTION (program decision #6): a plain, blocking
+# `systemctl --user restart fused-memory.service` -- NOT
+# restart-fused-memory.sh's `--drain` path (SIGUSR1 + journal-wait for
+# "Harness fully drained"), which hung per task 2090. This script performs
+# its own self-contained restart+verify rather than delegating to
+# restart-fused-memory.sh, so that risky option is never reachable from a
+# deterministic deploy.
+#
+# SERVING-SANITY: after the restart, this script (1) polls `curl -sf
+# $HEALTH_URL` until fused-memory's /health endpoint reports ready (process
+# up, graphiti+mem0 reachable -- fused_memory/server/tools.py's
+# health_check), THEN (2) polls `journalctl --user -u fused-memory.service`
+# for a recon-serving readiness marker -- proof the restarted process is
+# actively serving ledger-backed recon, not merely alive. The default
+# RECON_MARKER ("Project reconciliation loop started for dark_factory") is
+# the `_project_loop` startup log line in
+# fused_memory/reconciliation/harness.py (the logger.info call sits BEFORE
+# that function's `while True:`), so it is emitted EXACTLY ONCE per
+# project-loop (re)spawn -- i.e. once shortly after a restart -- and does
+# NOT recur periodically during steady-state activity. The gate therefore
+# relies on this single post-restart startup emission landing in the
+# journal within RECON_VERIFY_TIMEOUT, not on a recurring heartbeat;
+# confirmed present on this host's live journal immediately following a
+# restart (task 2233 prerequisite), so no health-only fallback was needed.
+# Combined with the runner's own fresh-MainPID/ActiveEnterTimestampMonotonic
+# verify (proving THIS process is new), an observed marker proves the new
+# process is actively serving ledger-backed recon, not merely up. Should
+# this single-emission coupling prove too fragile in practice (log message
+# wording/level changes, journald buffering), fall back to treating the
+# health gate alone as the serving proof -- the runner's fresh-MainPID
+# verify still independently proves the restart.
+#
+# Usage:
+#   deploy-w5-recon-reliability.sh [--check|--dry-run]
+#
+# --check / --dry-run: print the intended restart+verify plan and exit 0
+# WITHOUT restarting anything and WITHOUT any systemctl/curl/journalctl call.
+#
+# Env overrides (test-only knobs; production runs with the defaults):
+#   HEALTH_URL            - fused-memory /health URL (default:
+#                            http://localhost:8002/health).
+#   HEALTH_TIMEOUT         - seconds to poll for a healthy /health before
+#                            failing (default: 30).
+#   RECON_MARKER           - journal substring proving recon is actively
+#                            cycling (default: "Project reconciliation loop
+#                            started for dark_factory").
+#   RECON_VERIFY_TIMEOUT   - seconds to poll the journal for RECON_MARKER
+#                            before failing (default: 180).
+#
+# This script is cwd-independent (pure systemctl/curl/journalctl, no
+# repo-relative paths) -- it runs cleanly regardless of the caller's cwd
+# (the detached out-of-cgroup context the cross-unit runner invokes it from
+# defaults its cwd to $HOME, not project_root).
+
+SERVICE="fused-memory.service"
+HEALTH_URL="${HEALTH_URL:-http://localhost:8002/health}"
+HEALTH_TIMEOUT="${HEALTH_TIMEOUT:-30}"
+RECON_MARKER="${RECON_MARKER:-Project reconciliation loop started for dark_factory}"
+RECON_VERIFY_TIMEOUT="${RECON_VERIFY_TIMEOUT:-180}"
+
+MODE="apply"
+
+for arg in "$@"; do
+    case "$arg" in
+        --check|--dry-run)
+            MODE="check"
+            ;;
+        *)
+            echo "ERROR: unexpected argument: $arg" >&2
+            exit 1
+            ;;
+    esac
+done
+
+if [[ "$MODE" == "check" ]]; then
+    echo "Would restart ${SERVICE} (systemctl --user restart ${SERVICE})"
+    echo "Would then verify: /health at ${HEALTH_URL} (timeout ${HEALTH_TIMEOUT}s), then recon-serving marker '${RECON_MARKER}' via journalctl (timeout ${RECON_VERIFY_TIMEOUT}s)"
+    exit 0
+fi
+
+restart_start="$(date +%s)"
+
+echo "Restarting ${SERVICE}..."
+systemctl --user restart "$SERVICE"
+
+# NOTE (duplication): the two bounded-poll loops below are intentionally
+# copy-adapted from restart-fused-memory.sh's idioms rather than factored
+# into a shared helper (e.g. a sourced scripts/lib/poll.sh). This script
+# deliberately does not delegate TO restart-fused-memory.sh (see the "does
+# NOT delegate" rationale in the header), and extracting a shared snippet
+# would mean editing that script too, which is out of scope here; left as a
+# low-priority follow-up. Watch for drift if touching either script:
+# restart-fused-memory.sh uses SERVICE="fused-memory" (bare systemd unit
+# alias) while this script uses the fully-qualified SERVICE
+# "fused-memory.service" above -- both resolve to the same unit but are NOT
+# interchangeable string constants.
+# 1. Health gate: wait for /health to report ready (reuses
+# restart-fused-memory.sh:47-65's curl -sf polling idiom; see duplication
+# NOTE above).
+echo -n "Waiting for health..."
+deadline=$((SECONDS + HEALTH_TIMEOUT))
+healthy=false
+while [[ $SECONDS -lt $deadline ]]; do
+    if curl -sf "$HEALTH_URL" > /dev/null 2>&1; then
+        healthy=true
+        break
+    fi
+    echo -n "."
+    sleep 1
+done
+
+if ! $healthy; then
+    echo " FAILED"
+    echo "ERROR: fused-memory did not become healthy within ${HEALTH_TIMEOUT}s" >&2
+    exit 1
+fi
+echo " OK"
+
+# 2. Serving-sanity gate: bounded poll of the journal for RECON_MARKER,
+# proving the restarted process is actively cycling reconciliation (not
+# merely alive) -- reuses restart-fused-memory.sh:28-40's journalctl-grep
+# idiom (see duplication NOTE above).
+echo -n "Waiting for recon-serving marker..."
+deadline=$((SECONDS + RECON_VERIFY_TIMEOUT))
+serving=false
+while [[ $SECONDS -lt $deadline ]]; do
+    if journalctl --user -u "$SERVICE" --since "@${restart_start}" --no-pager -q 2>/dev/null \
+            | grep -q "$RECON_MARKER"; then
+        serving=true
+        break
+    fi
+    echo -n "."
+    sleep 1
+done
+
+if ! $serving; then
+    echo " FAILED"
+    echo "ERROR: fused-memory did not show ledger-backed recon serving (marker '${RECON_MARKER}') within ${RECON_VERIFY_TIMEOUT}s" >&2
+    exit 1
+fi
+echo " OK"
+
+exit 0
