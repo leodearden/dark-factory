@@ -38,7 +38,7 @@ from datetime import UTC, datetime, timedelta
 import pytest
 import pytest_asyncio
 from shared.task_claimant import compose_claimant_run_id, is_stranded
-from shared.task_statuses import TaskStatus  # noqa: F401 -- A-row vocabulary under test
+from shared.task_statuses import TaskStatus
 
 from fused_memory.backends.sqlite_task_backend import SqliteTaskBackend
 from fused_memory.backends.task_backend_errors import TaskmasterError
@@ -101,6 +101,21 @@ async def backend(tmp_path):
 @pytest_asyncio.fixture
 async def project_root(tmp_path):
     return str(tmp_path / 'proj')
+
+
+def test_taskstatus_vocabulary_includes_a_row_status_literals() -> None:
+    """Not a boundary cell itself — ties the status string literals A1-A6
+    assert against ('pending', 'in-progress', 'infra-hold', 'done') to the
+    real ``shared.task_statuses.TaskStatus`` vocabulary, so a future rename
+    of a member is caught here instead of leaving this module's asserts
+    silently comparing against a stale string.
+    """
+    values = {s.value for s in TaskStatus}
+    for status in ('pending', 'in-progress', 'infra-hold', 'done'):
+        assert status in values, (
+            f'{status!r} is asserted on throughout this module but is not a '
+            f'TaskStatus member: {sorted(values)}'
+        )
 
 
 # ── A1-A4: vocabulary rejection + transition-legality (log/enforce) ────

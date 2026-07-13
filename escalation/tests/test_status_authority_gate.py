@@ -48,9 +48,10 @@ from shared.task_transitions import ActorClass, is_legal_transition
 from escalation.action_effects import ACTION_EFFECTS, ANY, TaskEffect, effect_for
 
 # PROMOTE_ALLOWED/ROLE_LEVEL_ALLOWLIST are the C2-C4 authority tables under
-# test, but the tests below drive them indirectly over HTTP (by identity
-# string) rather than referencing the tables directly.
-from escalation.authority import PROMOTE_ALLOWED, ROLE_LEVEL_ALLOWLIST  # noqa: F401
+# test; C2-C4 mostly drive them indirectly over HTTP (by identity string),
+# and TestAuthorityTablesMatchDrivenIdentities below asserts the tables
+# directly so this import is genuine coupling, not documentation-only.
+from escalation.authority import PROMOTE_ALLOWED, ROLE_LEVEL_ALLOWLIST
 from escalation.models import Escalation
 from escalation.queue import EscalationQueue
 from escalation.server import create_server
@@ -580,6 +581,32 @@ class TestC4PromoteToL2IdentityGate:
 
         assert result.get('status') in {'created', 'updated'}, (
             f"Expected status in {{'created','updated'}}; got: {result}"
+        )
+
+
+# ---------------------------------------------------------------------------
+# C2-C4 authority tables, asserted directly (not just driven indirectly by
+# identity string over HTTP above) — ties ROLE_LEVEL_ALLOWLIST/PROMOTE_ALLOWED
+# to the exact identity/ceiling C2-C4 exercise.
+# ---------------------------------------------------------------------------
+
+
+class TestAuthorityTablesMatchDrivenIdentities:
+    """C2/C3 drive identity='orchestrator-escalation-watcher-auto' expecting
+    an {0,1} ceiling; C4 drives 'some-other-agent' expecting denial. These
+    assertions tie ROLE_LEVEL_ALLOWLIST/PROMOTE_ALLOWED to those exact
+    strings directly, so a future edit to either table is caught here
+    alongside (not merely implied by) the behavioural C-row HTTP cells."""
+
+    def test_watcher_auto_identity_ceiling_is_zero_and_one(self) -> None:
+        assert ROLE_LEVEL_ALLOWLIST['orchestrator-escalation-watcher-auto'] == frozenset({0, 1}), (
+            'C2/C3 drive this exact identity expecting an {0,1} ceiling'
+        )
+
+    def test_promote_allowed_contains_only_the_watcher_auto_identity(self) -> None:
+        assert frozenset({'orchestrator-escalation-watcher-auto'}) == PROMOTE_ALLOWED, (
+            "C4's disallowed-identity case ('some-other-agent') relies on "
+            'PROMOTE_ALLOWED containing exactly this identity and no other'
         )
 
 
