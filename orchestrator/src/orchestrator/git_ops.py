@@ -39,6 +39,7 @@ No .task-specific guards remain in this module.
 """
 
 import asyncio
+import contextlib
 import json
 import logging
 import os
@@ -61,6 +62,14 @@ from orchestrator.lane_lifecycle import (
     AcquireRoute,
     LaneLifecycle,
     LaneState,
+)
+from orchestrator.verify_cancel import (
+    acquire_merge_verify_flock,
+    merge_verify_lock_path,
+    read_lock_holder_pgid,
+    release_merge_verify_flock,
+    remove_lock_holder_pgid,
+    write_lock_holder_pgid,
 )
 from orchestrator.worktree_identity import identities_match, read_worktree_title
 
@@ -181,6 +190,15 @@ DEFAULT_COMMIT_CITATION_PATTERN: str = (
 # Lives at <worktree_base>/_merge-verify.  Excluded from prune and
 # find_inflight enumeration (see _iter_merge_worktrees).
 PERSISTENT_MERGE_WORKTREE_NAME: str = '_merge-verify'
+
+# Bounded-wait timeout (seconds) for GitOps.merge_verify_lease()'s
+# acquire_merge_verify_flock() call (task 2315, BUG 1). A LOCAL constant
+# rather than importing cli.MERGE_VERIFY_FLOCK_WAIT_SECS: cli.py imports
+# GitOps, so a git_ops -> cli import would be architecturally backwards.
+# Mirrors cli.py:53's default (env-overridable there via
+# ORCH_MERGE_VERIFY_FLOCK_WAIT_SECS — this constant is git_ops' own,
+# independently defaulted copy of the same value, not env-overridable here).
+_MERGE_VERIFY_FLOCK_WAIT_SECS: float = 10.0
 
 # Fixed name for the SECOND persistent warm worktree (task 1952, PRD δ /
 # §5 C5), dedicated to the offline-deep lane worker (β2).  Lives at
@@ -1157,6 +1175,77 @@ class GitOps:
         )
         self._note_pool_storage_absent()
         return False
+
+    def _merge_verify_lease_active(self) -> bool:
+        """True iff a merge-verify lease is currently held by a LIVE holder
+        (task 2315, BUG 1).
+
+        Reads the holder-pgid rendezvous key recorded by either
+        :meth:`merge_verify_lease` (the local in-process span) or the host
+        verify-merge CLI (``cli.py:444-512`` — the SAME
+        ``write_lock_holder_pgid`` key), then liveness-checks it via
+        ``os.killpg(pgid, 0)``.
+
+        Fail-OPEN: a missing, stale (dead), or unreadable holder-pgid is
+        treated as NOT held, so a lease can never permanently wedge a
+        legitimate caller merely because a prior holder died without
+        cleanup. Contrast with the fail-CLOSED *use* of this predicate in
+        :meth:`reset_persistent_merge_worktree` (refuses when a DIFFERENT
+        live holder holds the lease).
+        """
+        pgid = read_lock_holder_pgid(self.worktree_base)
+        if pgid is None:
+            return False
+        try:
+            os.killpg(pgid, 0)
+        except ProcessLookupError:
+            return False  # holder is dead — stale lease, ignore it
+        except PermissionError:
+            return True  # process exists but we can't signal it — still alive
+        except OSError:
+            return False  # any other signal failure — fail-open, not held
+        return True
+
+    @contextlib.asynccontextmanager
+    async def merge_verify_lease(self):
+        """Async context manager recording the merge-verify lease for the
+        duration of a span (task 2315, BUG 1).
+
+        Mirrors the host verify-merge CLI's acquire -> write-holder-pgid ->
+        finally-release-and-clear span (``cli.py:444-512``) so that
+        :meth:`reset_persistent_merge_worktree` and
+        :meth:`_run_warm_lane_gc_reclaim` can consult the SAME lease
+        (:meth:`_merge_verify_lease_active`) regardless of whether the
+        in-flight verify is dispatched locally (in-process, via this ctx
+        mgr) or remotely (via the CLI, which already records it). No new
+        lock is introduced — this reuses the existing
+        ``.merge_verify.lock`` flock + holder-pgid rendezvous (task 2306).
+
+        On a contended flock (the bounded wait in
+        :func:`acquire_merge_verify_flock` times out), yields WITHOUT
+        recording a lease — logs a WARNING and proceeds unrecorded, so a
+        contended lease can never deadlock a verify. The bounded-wait
+        flock remains the primary cross-process serialization; this lease
+        is defense-in-depth on top of it for the DF-side teardown/GC
+        actors.
+        """
+        fd = acquire_merge_verify_flock(
+            merge_verify_lock_path(self.worktree_base), _MERGE_VERIFY_FLOCK_WAIT_SECS,
+        )
+        if fd is None:
+            logger.warning(
+                'merge_verify_lease: flock contended (bounded wait timed '
+                'out) at %s — proceeding WITHOUT recording a lease',
+                self.worktree_base,
+            )
+            yield
+            return
+        write_lock_holder_pgid(self.worktree_base, os.getpgrp())
+        try:
+            yield
+        finally:
+            remove_lock_holder_pgid(self.worktree_base)
+            release_merge_verify_flock(fd)
 
     async def _is_registered_worktree(self, path: Path) -> bool:
         """Check if *path* is a registered git worktree.
