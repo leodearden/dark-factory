@@ -255,14 +255,66 @@ def _scope(project_id: str, project_root: str) -> ProjectScope:
     return ProjectScope(ProjectId(project_id), ProjectRoot(project_root))
 
 
+# Canonical zero-padded UTC ISO-8601 timestamps shared by every
+# _make_ledger_record call below — ReconLedgerStore.gc() compares
+# expires_at as lexicographic SQLite TEXT, so every timestamp in this
+# suite must share this exact format/width/offset.
+_SEEDED_AT = '2026-07-01T00:00:00+00:00'
+_FAR_FUTURE_EXPIRES_AT = '2099-01-01T00:00:00+00:00'  # never TTL-expires in these tests
+
+
+def _make_ledger_record(
+    project_id: str,
+    task_id: str,
+    flag_type: str,
+    *,
+    record_kind: str = 'stage1_flag_marker',
+    payload_json: str = '{}',
+    state: str = 'active',
+    created_at: str = _SEEDED_AT,
+    run_id: str = '',
+    expires_at: str | None = _FAR_FUTURE_EXPIRES_AT,
+) -> ReconLedgerRecord:
+    """Build a ReconLedgerRecord with this suite's canonical marker
+    defaults (an 'active' stage1_flag_marker seeded at ``_SEEDED_AT`` that
+    never TTL-expires). Callers pass only the varying identity
+    (*project_id*/*task_id*/*flag_type*) plus whichever keyword(s) their
+    scenario actually varies (e.g. *payload_json*/*state*), so the
+    override — the point of each call site — is what stands out. Shared
+    by L2's sequential-upsert drive, L1's terminal/live/interleaved
+    markers, and L4's GC-pass seed. (D1 never constructs a record
+    directly — it drives the write_cycle_summary producer instead.)"""
+    return ReconLedgerRecord(
+        project_id=project_id,
+        record_kind=record_kind,
+        payload_json=payload_json,
+        state=state,
+        created_at=created_at,
+        task_id=task_id,
+        flag_type=flag_type,
+        run_id=run_id,
+        expires_at=expires_at,
+    )
+
+
 async def _count_ledger_rows(
     ledger: ReconLedgerStore, project_id: str, *, record_kind: str | None = None,
 ) -> int:
     """Raw SELECT COUNT(*) over recon_ledger for *project_id*, optionally
     filtered to a single *record_kind* — a direct check on the store's own
     connection, independent of get_by_identity's per-identity read path.
-    Shared by L1/L2 (all record_kinds) and D1 (record_kind='cycle_summary')."""
-    db = ledger._db  # noqa: SLF001 — intentional direct-connection check
+    Shared by L1/L2 (all record_kinds) and D1 (record_kind='cycle_summary').
+
+    ReconLedgerStore exposes only identity-scoped public reads
+    (get_by_identity/list_suppressions/marker_task_ids) — no public
+    row-count/list-by-project API — so this deliberately reaches into the
+    store's private `_db` connection (noqa SLF001) and duplicates the
+    `recon_ledger` table/column names owned by TABLE_SQL in
+    reconciliation/recon_ledger.py. If either the `_db` attribute or that
+    schema is ever renamed, this is the one place (and the only place in
+    this suite) that needs updating to match.
+    """
+    db = ledger._db  # noqa: SLF001 — intentional direct-connection check; see docstring
     assert db is not None, 'Expected an initialized store with an open connection'
     if record_kind is None:
         cursor = await db.execute(
@@ -389,20 +441,12 @@ class TestLedgerUpsertAndGcInterleave:
         Sequential (not concurrent) — ordering is deterministic, so the
         "last write" is unambiguous, unlike the L1 interleave below.
         """
-        created_at = '2026-07-01T00:00:00+00:00'
-        expires_at = '2099-01-01T00:00:00+00:00'
         last_record: ReconLedgerRecord | None = None
         for seq in range(4):
-            last_record = ReconLedgerRecord(
-                project_id=self._PROJECT_L2,
-                record_kind='stage1_flag_marker',
+            last_record = _make_ledger_record(
+                self._PROJECT_L2, 'T-idempotent', 'flag_idempotent',
                 payload_json=json.dumps({'seq': seq}),
                 state='active' if seq % 2 == 0 else 'addressed',
-                created_at=created_at,
-                task_id='T-idempotent',
-                flag_type='flag_idempotent',
-                run_id='',
-                expires_at=expires_at,
             )
             await ledger.upsert(last_record)
         assert last_record is not None
@@ -420,58 +464,22 @@ class TestLedgerUpsertAndGcInterleave:
 
         Returns ([interleave_v1, interleave_v2], terminal_task_id, live_task_id).
         """
-        seeded_at = '2026-07-01T00:00:00+00:00'
-        far_future = '2099-01-01T00:00:00+00:00'  # never TTL-expires in this test
         now_iso = '2026-07-09T00:00:00+00:00'  # canonical zero-padded UTC ISO-8601
 
-        terminal_marker = ReconLedgerRecord(
-            project_id=self._PROJECT_L1,
-            record_kind='stage1_flag_marker',
-            payload_json='{}',
-            state='active',
-            created_at=seeded_at,
-            task_id='T-done',
-            flag_type='flag_terminal',
-            run_id='',
-            expires_at=far_future,
-        )
-        live_marker = ReconLedgerRecord(
-            project_id=self._PROJECT_L1,
-            record_kind='stage1_flag_marker',
-            payload_json='{}',
-            state='active',
-            created_at=seeded_at,
-            task_id='T-live',
-            flag_type='flag_live',
-            run_id='',
-            expires_at=far_future,
-        )
+        terminal_marker = _make_ledger_record(self._PROJECT_L1, 'T-done', 'flag_terminal')
+        live_marker = _make_ledger_record(self._PROJECT_L1, 'T-live', 'flag_live')
         # Seed BEFORE the interleave so the interleaved gc() has real rows
         # to evaluate — these two are not part of the concurrent gather().
         await ledger.upsert(terminal_marker)
         await ledger.upsert(live_marker)
 
-        interleave_v1 = ReconLedgerRecord(
-            project_id=self._PROJECT_L1,
-            record_kind='stage1_flag_marker',
+        interleave_v1 = _make_ledger_record(
+            self._PROJECT_L1, 'T-interleave', 'flag_interleave',
             payload_json=json.dumps({'writer': 1}),
-            state='active',
-            created_at=seeded_at,
-            task_id='T-interleave',
-            flag_type='flag_interleave',
-            run_id='',
-            expires_at=far_future,
         )
-        interleave_v2 = ReconLedgerRecord(
-            project_id=self._PROJECT_L1,
-            record_kind='stage1_flag_marker',
+        interleave_v2 = _make_ledger_record(
+            self._PROJECT_L1, 'T-interleave', 'flag_interleave',
             payload_json=json.dumps({'writer': 2}),
-            state='active',
-            created_at=seeded_at,
-            task_id='T-interleave',
-            flag_type='flag_interleave',
-            run_id='',
-            expires_at=far_future,
         )
 
         # The two concurrently-issued UPSERTs interleave with a gc() pass
@@ -629,31 +637,8 @@ class TestGcTerminalReferenced:
         directly on the real ledger, wire a taskmaster whose get_statuses
         reports the terminal/live split, and drive the real consumer
         _gc_recon_markers(memory_service, taskmaster, scope, run_id, now=)."""
-        seeded_at = '2026-07-01T00:00:00+00:00'
-        far_future = '2099-01-01T00:00:00+00:00'  # never TTL-expires in this test
-
-        await ledger.upsert(ReconLedgerRecord(
-            project_id=self._PROJECT,
-            record_kind='stage1_flag_marker',
-            payload_json='{}',
-            state='active',
-            created_at=seeded_at,
-            task_id=self._TERMINAL_TASK_ID,
-            flag_type='flag_terminal',
-            run_id='',
-            expires_at=far_future,
-        ))
-        await ledger.upsert(ReconLedgerRecord(
-            project_id=self._PROJECT,
-            record_kind='stage1_flag_marker',
-            payload_json='{}',
-            state='active',
-            created_at=seeded_at,
-            task_id=self._LIVE_TASK_ID,
-            flag_type='flag_live',
-            run_id='',
-            expires_at=far_future,
-        ))
+        await ledger.upsert(_make_ledger_record(self._PROJECT, self._TERMINAL_TASK_ID, 'flag_terminal'))
+        await ledger.upsert(_make_ledger_record(self._PROJECT, self._LIVE_TASK_ID, 'flag_live'))
 
         memory_service = AsyncMock()
         memory_service.recon_ledger = ledger
