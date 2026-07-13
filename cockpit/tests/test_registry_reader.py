@@ -85,6 +85,66 @@ class TestScanSessions:
         assert result == []
 
 
+class TestSessionScanner:
+    """SessionScanner is the stateful, cache-aware counterpart to scan_sessions
+    (registry_reader.py's plain free function) -- see TestScanChangeShortCircuit
+    below for the mtime-cache behavior itself. This class only pins parity
+    with scan_sessions and correct on-disk-set tracking across calls.
+    """
+
+    def test_scan_matches_scan_sessions_for_seeded_dir(self, tmp_path):
+        from cockpit.registry_reader import SessionScanner, scan_sessions
+
+        r1 = _make_record(session_slug='a-1', status=sr.Status.RUNNING)
+        r2 = _make_record(session_slug='b-2', status=sr.Status.AWAITING_INPUT)
+        r3 = _make_record(session_slug='c-3', status=sr.Status.IDLE)
+        for r in (r1, r2, r3):
+            sr.write_record(r, root=tmp_path)
+
+        scanner = SessionScanner(root=tmp_path)
+        result = scanner.scan()
+
+        expected = scan_sessions(tmp_path)
+        assert {r.session_slug: r for r in result} == {r.session_slug: r for r in expected}
+
+    def test_scan_reflects_slug_added_since_last_scan(self, tmp_path):
+        from cockpit.registry_reader import SessionScanner
+
+        r1 = _make_record(session_slug='a-1', status=sr.Status.RUNNING)
+        sr.write_record(r1, root=tmp_path)
+
+        scanner = SessionScanner(root=tmp_path)
+        first = scanner.scan()
+        assert {r.session_slug for r in first} == {'a-1'}
+
+        r2 = _make_record(session_slug='b-2', status=sr.Status.AWAITING_INPUT)
+        sr.write_record(r2, root=tmp_path)
+
+        second = scanner.scan()
+        assert {r.session_slug for r in second} == {'a-1', 'b-2'}
+
+    def test_scan_drops_slug_removed_since_last_scan(self, tmp_path):
+        """The second scan() reflects the CURRENT on-disk set, not a stale
+        union of everything ever seen."""
+        import shutil
+
+        from cockpit.registry_reader import SessionScanner
+
+        r1 = _make_record(session_slug='a-1', status=sr.Status.RUNNING)
+        r2 = _make_record(session_slug='b-2', status=sr.Status.AWAITING_INPUT)
+        for r in (r1, r2):
+            sr.write_record(r, root=tmp_path)
+
+        scanner = SessionScanner(root=tmp_path)
+        first = scanner.scan()
+        assert {r.session_slug for r in first} == {'a-1', 'b-2'}
+
+        shutil.rmtree(sr.sessions_dir(tmp_path) / 'a-1')
+
+        second = scanner.scan()
+        assert {r.session_slug for r in second} == {'b-2'}
+
+
 class TestBuildSnapshot:
     def test_keyed_by_session_slug(self):
         from cockpit.registry_reader import build_snapshot
