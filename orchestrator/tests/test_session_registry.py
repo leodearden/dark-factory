@@ -1890,6 +1890,52 @@ def test_main_write_decision_files_open_record(
     assert rec.filed_at != ''
 
 
+def test_main_write_decision_stamps_severity(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """A watcher's park moment supplies the escalation's severity so the
+    cockpit decision queue can weight this ask (Fleet Cockpit F7 fix 1).
+    """
+    monkeypatch.setenv('CLAUDE_FLEET_ROOT', str(tmp_path))
+
+    rc = sr.main(
+        [
+            'write-decision',
+            '--id',
+            'dec-sev',
+            '--project',
+            'df',
+            '--text',
+            'q',
+            '--severity',
+            'critical',
+        ]
+    )
+
+    assert rc == 0
+    listed = sr.list_decisions(root=tmp_path)
+    assert len(listed) == 1
+    assert listed[0].severity == 'critical'
+
+
+def test_main_write_decision_severity_defaults_empty(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """Omitting --severity yields severity='' on the filed record (a watcher
+    that doesn't know/supply a severity still files a well-formed decision).
+    """
+    monkeypatch.setenv('CLAUDE_FLEET_ROOT', str(tmp_path))
+
+    rc = sr.main(['write-decision', '--id', 'dec-nosev', '--project', 'df', '--text', 'q'])
+
+    assert rc == 0
+    listed = sr.list_decisions(root=tmp_path)
+    assert len(listed) == 1
+    assert listed[0].severity == ''
+
+
 def test_main_write_decision_prints_filed_id(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
