@@ -21,8 +21,10 @@ import time, so ``shared/tests/test_task_metadata.py``'s
 
 from __future__ import annotations
 
+from pathlib import Path
 from typing import Literal
 
+import yaml
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 __all__ = [
@@ -30,6 +32,8 @@ __all__ = [
     'DeliveredCheck',
     'ManifestCapability',
     'ManifestTask',
+    'load_capability_manifest',
+    'parse_capability_manifest',
 ]
 
 
@@ -189,3 +193,28 @@ class CapabilityManifestDoc(BaseModel):
                 raise ValueError(f'CapabilityManifestDoc: duplicate task label {task.label!r}.')
             seen.add(task.label)
         return self
+
+
+def parse_capability_manifest(data: dict) -> CapabilityManifestDoc:
+    """Validate a raw ``dict`` (already YAML/JSON-decoded) as a manifest doc.
+
+    A thin ``model_validate`` delegator — the convenience entry point for a
+    caller that already holds the decoded mapping (e.g. ``commit_planning``,
+    which reads the sidecar off disk itself). Raises ``pydantic.ValidationError``
+    on any malformed shape; never swallows.
+    """
+    return CapabilityManifestDoc.model_validate(data)
+
+
+def load_capability_manifest(path: str | Path) -> CapabilityManifestDoc:
+    """Load and validate a capability-manifest sidecar YAML file.
+
+    Errors propagate uncaught — a missing file raises ``FileNotFoundError``,
+    malformed YAML syntax raises ``yaml.YAMLError``, and a malformed document
+    (per PRD §Contract) raises ``pydantic.ValidationError`` naming the
+    offending entry. No silent swallow: callers (the commit_planning
+    stamper, this PRD's own CI fixture test) must observe every failure.
+    """
+    with open(path, encoding='utf-8') as fh:
+        data = yaml.safe_load(fh)
+    return parse_capability_manifest(data)
