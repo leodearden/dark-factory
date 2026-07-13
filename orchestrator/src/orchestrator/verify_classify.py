@@ -23,11 +23,67 @@ import re
 from orchestrator.verify_categories import FailureCategory
 from orchestrator.verify_cmd import ToolKind
 
-# pytest INTERNALERROR marker — shared by the PYTEST and OPAQUE tables below
-# (an internal dedup within this one self-contained module; this module
-# avoids importing from verify.py to sidestep a verify <-> verify_classify
-# import cycle, not internal sharing between its own two ladders).
+# ---------------------------------------------------------------------------
+# Shared regex primitives — patterns that legitimately belong to more than
+# one tool's table (e.g. a rustc compile_error diagnostic is meaningful for
+# both ToolKind.CARGO_TEST/CARGO_CLIPPY and the ToolKind.OPAQUE generic
+# ladder, which must keep classifying byte-identically for any output it
+# still receives). Hoisted once here and referenced by every table that
+# needs them, rather than duplicated per table — so a future grounding fix
+# (in the spirit of the historical cargo_cli_error allowlist tightening
+# commits — tasks 1103/1109/1116) lands in one place instead of risking
+# re-diverging two copies of "the same" rule, which is the exact
+# same-bug-fixed-in-two-places hazard this per-tool-dispatch refactor exists
+# to close for the tool-blind ladder itself.
+# ---------------------------------------------------------------------------
+
 _PYTEST_INTERNALERROR_RE = re.compile(r'^INTERNALERROR>.+$', re.MULTILINE)
+_COMPILE_ERROR_RUSTC_CODE_RE = re.compile(r'error\[E\d+\]:', re.MULTILINE)
+_COMPILE_ERROR_STRING_RE = re.compile(r'compile error', re.MULTILINE | re.IGNORECASE)
+
+# cargo CLI errors — narrow allowlist of cargo-only prefixes so rustc
+# top-level diagnostics ('error: aborting due to previous errors',
+# 'error: could not compile `…`') fall through to unknown_test_failure.
+# Intentionally conservative: novel cargo CLI messages not listed here
+# (e.g. 'error: unexpected argument', 'error: the manifest-path must be …',
+# 'error: manifest path … does not exist') will fall through to
+# unknown_test_failure until added to the allowlist. Extend when a new
+# cargo CLI failure mode appears in production and needs its own bucket.
+#
+# Each retained token is grounded in a real observed cargo CLI log line:
+#   --              → 'error: --exclude can only be used together with --workspace'
+#   no such subcommand
+#                   → 'error: no such subcommand: `tset`'
+#   failed to (parse|compile|read)
+#                   → 'error: failed to parse manifest at `/path/Cargo.toml`'
+#                     'error: failed to compile `<name>` (lib), intermediates ...'
+#                       (cargo_rustc / compiler job-queue orchestrator)
+#                     'error: failed to read `/path/Cargo.toml`'
+#   could not find  → 'error: could not find `Cargo.toml` in `/path` or any parent directory'
+#
+# Dropped tokens — no grounded cargo CLI sample available:
+#   `invalid `  — see test_rustc_invalid_diagnostic_not_cargo_cli_error.
+#   `package `  — re-add with a tighter suffix (e.g. 'package \`') once a
+#                 real cargo log line is observed.
+#   `find`      — 'failed to find' (without 'could not' prefix) has no verified
+#                 cargo CLI sample; cargo uses 'could not find' for its typical
+#                 find-failure case, covered by the top-level alternative above.
+#                 See test_failed_to_find_alone_not_cargo_cli_error.
+_CARGO_CLI_ERROR_RE = re.compile(
+    r'^error: (--|no such subcommand|failed to (parse|compile|read)|could not find)',
+    re.MULTILINE,
+)
+
+# Rust test runner / pytest FAILED lines — the trailing form ('test NAME ...
+# FAILED') is cargo's own test runner shape and also matches a pytest FAILED
+# line; the leading form ('FAILED test::name') is pytest-report-shaped only
+# and is NOT part of the cargo table (see _CARGO_PATTERNS below).
+_TEST_FAILURE_TRAILING_RE = re.compile(r'^.+\s+FAILED\s*$', re.MULTILINE)
+_TEST_FAILURE_LEADING_RE = re.compile(r'^FAILED\s', re.MULTILINE)
+
+_NPM_ERROR_RE = re.compile(r'npm\s+(ERR!|error)', re.MULTILINE)
+_FLOCK_ERROR_RE = re.compile(r'^flock:', re.MULTILINE)
+_TREE_SITTER_GENERATE_RE = re.compile(r'tree-sitter generate', re.MULTILINE)
 
 
 def classify_failure(tool: ToolKind, rc: int, output: str, timed_out: bool) -> FailureCategory:
@@ -42,16 +98,18 @@ def classify_failure(tool: ToolKind, rc: int, output: str, timed_out: bool) -> F
 
     Then dispatches on *tool* to a per-tool classification table (Invariant
     C1: a tool-T pattern lives ONLY in tool-T's table, so a cargo token can
-    no longer swallow a pytest/rustc line by construction). ``ToolKind.PYTEST``
-    gets its own table (see ``_classify_pytest``) — notably the env_transient
-    shared-venv-mutation signatures, consulted ONLY here. ``ToolKind.OPAQUE``
-    carries the FULL legacy generic ladder (moved verbatim from verify.py's
-    ``_CLASSIFY_PATTERNS`` — see ``_classify_opaque``) — the ONLY survivor of
-    the tool-blind ladder. Every other recognised ``ToolKind`` currently
-    falls through to that same generic ladder as a placeholder; dedicated
-    tables (CARGO_TEST/CARGO_CLIPPY, NPX, PYRIGHT, RUFF) are added by later
-    steps of this task (PRD task δ), each peeling its tool off this
-    fallthrough with its own branch ahead of it.
+    no longer swallow a pytest/rustc line by construction):
+    - ``ToolKind.PYTEST`` -> ``_classify_pytest`` (notably the env_transient
+      shared-venv-mutation signatures, consulted ONLY here).
+    - ``ToolKind.CARGO_TEST`` / ``ToolKind.CARGO_CLIPPY`` -> ``_classify_cargo``.
+    - ``ToolKind.NPX`` -> ``_classify_npx``.
+    - ``ToolKind.OPAQUE`` -> ``_classify_opaque``, the FULL legacy generic
+      ladder (moved verbatim from verify.py's ``_CLASSIFY_PATTERNS``) — the
+      ONLY survivor of the tool-blind ladder.
+    - Every other recognised ``ToolKind`` (PYRIGHT, RUFF) currently falls
+      through to that same generic ladder as a placeholder; dedicated
+      structured-output parsing for them is added by a later step of this
+      task (PRD task δ, Invariant C2).
 
     CLOSED DOMAIN: the return value is always a ``FailureCategory`` member —
     see that enum's docstring for the closed 12-value output domain its
@@ -64,6 +122,10 @@ def classify_failure(tool: ToolKind, rc: int, output: str, timed_out: bool) -> F
 
     if tool is ToolKind.PYTEST:
         return _classify_pytest(output)
+    if tool in (ToolKind.CARGO_TEST, ToolKind.CARGO_CLIPPY):
+        return _classify_cargo(output)
+    if tool is ToolKind.NPX:
+        return _classify_npx(output)
 
     return _classify_opaque(output)
 
@@ -117,25 +179,23 @@ _ENV_TRANSIENT_PATTERNS: list[re.Pattern[str]] = [
     # line '<executable>: No module named pip' and the quoted 'pip'/"pip"
     # forms) still match since the boundary follows the closing quote (or
     # end of line) in each case.
-    re.compile(r"""No module named ['"]?pip['"]?(?![\w-])""", re.MULTILINE),
+    re.compile(r'''No module named ['"]?pip['"]?(?![\w-])''', re.MULTILINE),
     # `import xdist` / `import pytest_xdist` when the plugin vanished.
     re.compile(
-        r"""ModuleNotFoundError: No module named ['"](xdist|pytest_xdist)['"]""",
+        r'''ModuleNotFoundError: No module named ['"](xdist|pytest_xdist)['"]''',
         re.MULTILINE,
     ),
 ]
 
-# Compiled regex patterns for the PYTEST table (checked after env_transient
-# above). Order matters: INTERNALERROR before FAILED so a worker-death run
-# (which has both INTERNALERROR> lines and collateral FAILED lines from the
-# dead worker) classifies as pytest_internalerror, not test_failure. Reuses
-# the module-level _PYTEST_INTERNALERROR_RE, shared with the OPAQUE ladder.
+# Order matters: INTERNALERROR before FAILED so a worker-death run (which has
+# both INTERNALERROR> lines and collateral FAILED lines from the dead worker)
+# classifies as pytest_internalerror, not test_failure.
 _PYTEST_PATTERNS: list[tuple[re.Pattern[str], FailureCategory]] = [
     (_PYTEST_INTERNALERROR_RE, FailureCategory.PYTEST_INTERNALERROR),
-    (re.compile(r'^.+\s+FAILED\s*$', re.MULTILINE), FailureCategory.TEST_FAILURE),
-    (re.compile(r'^FAILED\s', re.MULTILINE), FailureCategory.TEST_FAILURE),
+    (_TEST_FAILURE_TRAILING_RE, FailureCategory.TEST_FAILURE),
+    (_TEST_FAILURE_LEADING_RE, FailureCategory.TEST_FAILURE),
     # flock lock failures — the test leg is flock-admission-wrapped.
-    (re.compile(r'^flock:', re.MULTILINE), FailureCategory.FLOCK_ERROR),
+    (_FLOCK_ERROR_RE, FailureCategory.FLOCK_ERROR),
 ]
 
 
@@ -153,69 +213,72 @@ def _classify_pytest(output: str) -> FailureCategory:
 
 
 # ---------------------------------------------------------------------------
-# ToolKind.OPAQUE — the full legacy generic ladder, moved verbatim from
-# verify.py's _CLASSIFY_PATTERNS (with its grounding comments). The ONLY
-# surviving dispatch target for the tool-blind ladder — every other ToolKind
-# gets its own narrower table so a tool-T pattern can only ever match tool-T
-# output (Invariant C1).
+# ToolKind.CARGO_TEST / ToolKind.CARGO_CLIPPY — share one table: compile_error,
+# then the cargo-CLI allowlist, then the (trailing-form only) FAILED line,
+# then tree-sitter generate failures, falling through to
+# UNKNOWN_TEST_FAILURE. No INTERNALERROR/npm_error/flock_error/leading-FAILED
+# branch here (Invariant C1) — those belong to the PYTEST/NPX/OPAQUE tables
+# only, so a stray pytest or npm token in cargo output can never be
+# misclassified as a cargo-specific category.
 # ---------------------------------------------------------------------------
 
-# Compiled regex patterns for the OPAQUE generic ladder — hoisted to module
-# scope so re.compile() runs once at import time rather than on every call.
-# Order matters: rustc diagnostic codes (error[E0308]) appear before plain
-# 'error:' so compile errors are distinguished from cargo CLI errors.
+_CARGO_PATTERNS: list[tuple[re.Pattern[str], FailureCategory]] = [
+    (_COMPILE_ERROR_RUSTC_CODE_RE, FailureCategory.COMPILE_ERROR),
+    (_COMPILE_ERROR_STRING_RE, FailureCategory.COMPILE_ERROR),
+    (_CARGO_CLI_ERROR_RE, FailureCategory.CARGO_CLI_ERROR),
+    (_TEST_FAILURE_TRAILING_RE, FailureCategory.TEST_FAILURE),
+    (_TREE_SITTER_GENERATE_RE, FailureCategory.TREE_SITTER_GENERATE_ERROR),
+]
+
+
+def _classify_cargo(output: str) -> FailureCategory:
+    """The CARGO_TEST/CARGO_CLIPPY table, falling through to UNKNOWN_TEST_FAILURE."""
+    for pattern, category in _CARGO_PATTERNS:
+        if pattern.search(output):
+            return category
+    return FailureCategory.UNKNOWN_TEST_FAILURE
+
+
+# ---------------------------------------------------------------------------
+# ToolKind.NPX — npm_error only, falling through to UNKNOWN_TEST_FAILURE.
+# ---------------------------------------------------------------------------
+
+_NPX_PATTERNS: list[tuple[re.Pattern[str], FailureCategory]] = [
+    (_NPM_ERROR_RE, FailureCategory.NPM_ERROR),
+]
+
+
+def _classify_npx(output: str) -> FailureCategory:
+    """The NPX table: npm_error, falling through to UNKNOWN_TEST_FAILURE."""
+    for pattern, category in _NPX_PATTERNS:
+        if pattern.search(output):
+            return category
+    return FailureCategory.UNKNOWN_TEST_FAILURE
+
+
+# ---------------------------------------------------------------------------
+# ToolKind.OPAQUE — the full legacy generic ladder, moved verbatim from
+# verify.py's _CLASSIFY_PATTERNS (with its grounding comments, now hoisted
+# above as shared primitives). The ONLY surviving dispatch target for the
+# tool-blind ladder — every other ToolKind gets its own narrower table so a
+# tool-T pattern can only ever match tool-T output (Invariant C1).
+# ---------------------------------------------------------------------------
+
+# Compiled regex patterns for the OPAQUE generic ladder — order matters:
+# rustc diagnostic codes (error[E0308]) appear before plain 'error:' so
+# compile errors are distinguished from cargo CLI errors; INTERNALERROR
+# before FAILED so a worker-death run classifies as pytest_internalerror
+# rather than test_failure.
 _CLASSIFY_PATTERNS: list[tuple[re.Pattern[str], FailureCategory]] = [
-    (re.compile(r'error\[E\d+\]:', re.MULTILINE), FailureCategory.COMPILE_ERROR),
-    (re.compile(r'compile error', re.MULTILINE | re.IGNORECASE), FailureCategory.COMPILE_ERROR),
-    # cargo CLI errors — narrow allowlist of cargo-only prefixes so rustc
-    # top-level diagnostics ('error: aborting due to previous errors',
-    # 'error: could not compile `…`') fall through to unknown_test_failure.
-    # Intentionally conservative: novel cargo CLI messages not listed here
-    # (e.g. 'error: unexpected argument', 'error: the manifest-path must be …',
-    # 'error: manifest path … does not exist') will fall through to
-    # unknown_test_failure until added to the allowlist. Extend when a new
-    # cargo CLI failure mode appears in production and needs its own bucket.
-    #
-    # Each retained token is grounded in a real observed cargo CLI log line:
-    #   --              → 'error: --exclude can only be used together with --workspace'
-    #   no such subcommand
-    #                   → 'error: no such subcommand: `tset`'
-    #   failed to (parse|compile|read)
-    #                   → 'error: failed to parse manifest at `/path/Cargo.toml`'
-    #                     'error: failed to compile `<name>` (lib), intermediates ...'
-    #                       (cargo_rustc / compiler job-queue orchestrator)
-    #                     'error: failed to read `/path/Cargo.toml`'
-    #   could not find  → 'error: could not find `Cargo.toml` in `/path` or any parent directory'
-    #
-    # Dropped tokens — no grounded cargo CLI sample available:
-    #   `invalid `  — see test_rustc_invalid_diagnostic_not_cargo_cli_error.
-    #   `package `  — re-add with a tighter suffix (e.g. 'package \`') once a
-    #                 real cargo log line is observed.
-    #   `find`      — 'failed to find' (without 'could not' prefix) has no verified
-    #                 cargo CLI sample; cargo uses 'could not find' for its typical
-    #                 find-failure case, covered by the top-level alternative above.
-    #                 See test_failed_to_find_alone_not_cargo_cli_error.
-    (
-        re.compile(
-            r'^error: (--|no such subcommand|failed to (parse|compile|read)|could not find)',
-            re.MULTILINE,
-        ),
-        FailureCategory.CARGO_CLI_ERROR,
-    ),
-    # pytest INTERNALERROR — must be checked BEFORE the FAILED patterns so that
-    # a worker-death run (which has both INTERNALERROR> lines and collateral
-    # FAILED lines from the dead worker) classifies as pytest_internalerror
-    # rather than test_failure.
+    (_COMPILE_ERROR_RUSTC_CODE_RE, FailureCategory.COMPILE_ERROR),
+    (_COMPILE_ERROR_STRING_RE, FailureCategory.COMPILE_ERROR),
+    (_CARGO_CLI_ERROR_RE, FailureCategory.CARGO_CLI_ERROR),
     (_PYTEST_INTERNALERROR_RE, FailureCategory.PYTEST_INTERNALERROR),
-    # Rust test runner / pytest FAILED lines
-    (re.compile(r'^.+\s+FAILED\s*$', re.MULTILINE), FailureCategory.TEST_FAILURE),
-    (re.compile(r'^FAILED\s', re.MULTILINE), FailureCategory.TEST_FAILURE),
-    # npm errors
-    (re.compile(r'npm\s+(ERR!|error)', re.MULTILINE), FailureCategory.NPM_ERROR),
-    # flock lock failures
-    (re.compile(r'^flock:', re.MULTILINE), FailureCategory.FLOCK_ERROR),
-    # tree-sitter generate failures
-    (re.compile(r'tree-sitter generate', re.MULTILINE), FailureCategory.TREE_SITTER_GENERATE_ERROR),
+    (_TEST_FAILURE_TRAILING_RE, FailureCategory.TEST_FAILURE),
+    (_TEST_FAILURE_LEADING_RE, FailureCategory.TEST_FAILURE),
+    (_NPM_ERROR_RE, FailureCategory.NPM_ERROR),
+    (_FLOCK_ERROR_RE, FailureCategory.FLOCK_ERROR),
+    (_TREE_SITTER_GENERATE_RE, FailureCategory.TREE_SITTER_GENERATE_ERROR),
 ]
 
 
