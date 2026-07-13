@@ -387,3 +387,4 @@ directly, not just interactive agents.
 - **Design docs**: `DESIGN.md` (architecture), `fused-memory/src/fused_memory/reconciliation/prompts/` (reconciliation stage/judge prompt sources)
 - **Memory skill**: `/memory` — detailed reference for memory operations, categories, search patterns
 - **Config**: `fused-memory/config/config.yaml`, `.mcp.json`
+- **Design invariants**: docs/legibility/design-invariants.md — five checkable invariants gating /prd decompose (G7) and /review phase 2
