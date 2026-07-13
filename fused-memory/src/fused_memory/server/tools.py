@@ -3422,6 +3422,13 @@ def create_mcp_server(
         if target_status == 'pending':
             # Best-effort/never-raising (see index_committed_tasks docstring) —
             # no extra guard needed here, and it must not alter the returned result.
+            # Indexes the whole tasks_data batch (fetched above, pre-flip)
+            # unconditionally — even if set_task_status failed to transition
+            # some ids — rather than intersecting with per-id success from
+            # `result`. This is intentional, not an oversight: search_tasks
+            # re-enriches every hit with its live status (see search_tasks),
+            # so a task whose flip failed merely becomes findable early; it
+            # is never reported with an incorrect status.
             await task_interceptor.index_committed_tasks(list(tasks_data), project_root)
         return result
 

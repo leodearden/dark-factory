@@ -1293,6 +1293,19 @@ class TaskInterceptor:
             task_id = str(task.get('id') or '')
             if not task_id:
                 continue
+            # Unlike the ticket path (_dispatch_ticket_decision, which pairs
+            # note_created + record_task under _curator_lock(project_id) to
+            # preserve the R3 in-memory dedup invariant — see the
+            # _curator_locks note in __init__), this seam intentionally
+            # skips both the lock and note_created. record_task is an
+            # idempotent UUID5-keyed upsert (task_curator.py), so corpus
+            # visibility — the goal here — is achieved regardless. The
+            # trade-off: these committed tasks never land in curate()'s
+            # in-memory recent-created snapshot, so a concurrent add_task
+            # for a near-duplicate falls back to the (now up to date)
+            # corpus search instead of the in-memory pre-LLM check. A minor
+            # consistency gap, not a correctness break — deliberate, not an
+            # oversight.
             try:
                 await curator.record_task(task_id, candidate, project_id)
             except Exception:
