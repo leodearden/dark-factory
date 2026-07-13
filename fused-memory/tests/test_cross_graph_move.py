@@ -2596,6 +2596,9 @@ class TestRecreateSubgraphRelationships:
         # caller can withhold Phase C deletion for whichever of them is
         # actually a migrating spec in this batch.
         assert set(blocked['node_uuids']) == {NODE_UUID_FIXTURE, OTHER_NODE_UUID_FIXTURE}
+        # only a MENTIONS link involves an episode -- a blocked RELATES_TO
+        # edge item must not carry an episode_uuid key at all.
+        assert 'episode_uuid' not in blocked
 
     @pytest.mark.asyncio
     async def test_mentions_create_failure_is_isolated_not_batch_aborting(
@@ -2647,6 +2650,10 @@ class TestRecreateSubgraphRelationships:
         assert blocked['uuid'] == MENTION_UUID_FIXTURE
         assert 'simulated transient FalkorDB mentions error' in blocked['reason']
         assert blocked['node_uuids'] == [NODE_UUID_FIXTURE]
+        # the source-resident Episodic node whose MENTIONS recreate raised --
+        # a caller MUST withhold ITS Phase-C deletion too, not just the
+        # entity's (see SubgraphEdgeResult.blocked's docstring).
+        assert blocked['episode_uuid'] == EPISODE_UUID_FIXTURE
 
     @pytest.mark.asyncio
     async def test_gather_read_failure_still_propagates_with_partial_result(
