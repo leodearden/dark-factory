@@ -345,6 +345,17 @@ Write to `review/reports/phase2-{timestamp}.json`:
   },
   "test_coverage_gaps": {
     "findings": []
+  },
+  "invariant_findings": {
+    "findings": [
+      {
+        "invariant": "no-lockstep-duplication",
+        "file": "fused_memory/routing/classifier.py",
+        "line": 88,
+        "issue": "category table duplicated in classifier.py and router.py — no single source of truth",
+        "severity": "high"
+      }
+    ]
   }
 }
 ```
@@ -357,6 +368,7 @@ Write to `review/reports/phase2-{timestamp}.json`:
 - Stubs: 3 unintended (tasks claimed done), 2 known gaps, 1 accepted
 - Critical paths: 1 issue — classifier returns without calling Mem0 store
 - Cross-module: no issues
+- Design invariants: 1 finding (no-lockstep-duplication)
 - Dead code: 2 orphan modules
 - Test gaps: no integration test for cross-store search
 ```
