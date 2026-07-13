@@ -809,6 +809,89 @@ class TestMergeGraphFamily:
         assert summary['nodes_moved'] == 1
 
     @pytest.mark.asyncio
+    async def test_withholds_episode_deletion_for_phase_b_blocked_mention(self, monkeypatch):
+        """A Phase-B blocked MENTIONS item carries episode_uuid (the
+        source-resident Episodic node whose MENTIONS recreate raised) --
+        that episode's Phase-C deletion must be WITHHELD too, or the
+        un-recreated MENTIONS link (which now exists only in source) would
+        be destroyed. Regression for the data-loss-barrier-gap reviewer
+        finding: today only entities named in blocked['node_uuids'] are
+        withheld, so this episode was deleted anyway. No create_failed
+        entity here, so the guarded MENTIONS-topology read (Scenario 2)
+        never fires and a bare MagicMock graphiti suffices.
+        """
+        blocked_result = SubgraphEdgeResult(
+            blocked=[{
+                'kind': 'mention', 'uuid': 'm1', 'reason': 'boom',
+                'node_uuids': ['entity-1'], 'episode_uuid': 'episode-1',
+            }],
+        )
+        mocks = self._patch_primitives(monkeypatch, recreate_result=blocked_result)
+        entity_rows = [{'uuid': 'entity-1'}]
+        episode_rows = [{'uuid': 'episode-1'}, {'uuid': 'episode-2'}]
+
+        summary = await _mod.merge_graph_family(
+            MagicMock(), 'know-live', 'know_live', entity_rows, episode_rows,
+        )
+
+        deleted_episode_uuids = {c.args[1] for c in mocks['delete_episode'].call_args_list}
+        assert 'episode-1' not in deleted_episode_uuids
+        assert 'episode-2' in deleted_episode_uuids
+        assert summary['episodes_blocked'] == 1
+        assert summary['episodes_moved'] == 1
+
+    @pytest.mark.asyncio
+    async def test_withholds_episode_deletion_for_entity_create_failure_mentioned_by_episode(
+        self, monkeypatch,
+    ):
+        """An entity whose Phase-A create_moved_node RAISES is dropped from
+        entity_specs, so Phase B never reads/recreates its incident
+        MENTIONS at all -- not counted in blocked, not in mentions_skipped.
+        The mentioning episode's OWN Phase-A create succeeded (so it is not
+        in episode_create_failed) and it is not named in Phase B's blocked
+        list either. Without a guarded sibling MENTIONS-topology probe, its
+        Phase-C deletion would proceed and destroy the un-recreated
+        source-only MENTIONS link -- the second data-loss-barrier-gap
+        scenario. The probe MUST be read-only (ro_query, never .query).
+        """
+        def _create_node_side_effect(graphiti_arg, uuid, *rest, **kwargs):
+            if uuid == 'entity-1':
+                raise RuntimeError('boom')
+
+        mocks = self._patch_primitives(
+            monkeypatch, create_node_side_effect=_create_node_side_effect,
+        )
+
+        graph_mock = _make_graph_mock([])
+
+        async def _ro_query(cypher, params=None):
+            params = params or {}
+            if 'MENTIONS' in cypher and params.get('uuid') == 'entity-1':
+                return MagicMock(result_set=[['episode-1']])
+            return MagicMock(result_set=[])
+
+        graph_mock.ro_query = AsyncMock(side_effect=_ro_query)
+
+        graphiti = MagicMock()
+        graphiti._graph_for = MagicMock(return_value=graph_mock)
+
+        entity_rows = [{'uuid': 'entity-1'}, {'uuid': 'entity-2'}]
+        episode_rows = [{'uuid': 'episode-1'}, {'uuid': 'episode-2'}]
+
+        summary = await _mod.merge_graph_family(
+            graphiti, 'know-live', 'know_live', entity_rows, episode_rows,
+        )
+
+        deleted_episode_uuids = {c.args[1] for c in mocks['delete_episode'].call_args_list}
+        assert 'episode-1' not in deleted_episode_uuids
+        assert 'episode-2' in deleted_episode_uuids
+        assert summary['episodes_blocked'] >= 1
+
+        graphiti._graph_for.assert_any_call('know-live')
+        graph_mock.ro_query.assert_awaited()
+        graph_mock.query.assert_not_called()
+
+    @pytest.mark.asyncio
     async def test_summary_tallies_and_surfaces_dropped_and_blocked(self, monkeypatch):
         """The returned summary tallies nodes_moved/episodes_moved/
         edges_recreated/edges_skipped/mentions_recreated/mentions_skipped
