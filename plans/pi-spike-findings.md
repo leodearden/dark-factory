@@ -15,7 +15,7 @@ host and reading its real stdout / exit codes / on-disk session files (not docs)
 | `pi-mcp-adapter` (nicobailon, MIT) | **2.11.0** (PRD pin 2.11.x ✓) |
 | node / npm | v22.22.3 / 10.9.8 (host; DF task sandbox is disabled) |
 | provider used for *successful* runs | `google` / `gemini-3-flash` (cheap, provider-agnostic for the 7 questions) |
-| Claude OAuth path | **validated** separately: pi accepted the live `~/.claude` OAuth token as an Anthropic bearer (progressed past 401 → a 400 "out of extra usage" billing error), i.e. auth plumbing works; only that account's quota blocked a completion |
+| Claude OAuth path | **validated** separately: pi accepted the live `~/.claude` OAuth token as an Anthropic bearer (progressed past 401 → a 400 "out of extra usage" error), i.e. auth plumbing works. The 400 is a **separate pay-as-you-go "extra usage" API bucket** hit by passing the OAuth token as a raw bearer from a third-party client — **not** the Claude Code subscription (which is healthy), so it says nothing about account/subscription state. Successful runs simply used Gemini. T4 note: how Anthropic meters OAuth-token API calls made *outside* the official client is worth confirming when wiring pi's Claude-OAuth path. |
 
 Install + all probes are throwaway (a scratch `node_modules`, never committed; `node_modules/` is
 already gitignored). The seven questions are PRD Appendix B.
