@@ -119,6 +119,49 @@ V2_SCHEMA = {
     "required": ["version", "entries"],
 }
 
+# ---------------------------------------------------------------------------
+# §7.3 coding-record schema (coder output -> merger input)
+# ---------------------------------------------------------------------------
+
+_MATCH_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "entry_id": {"type": "string"},
+        "origin_phase": {"enum": PHASES},
+        "manifested_phase": {"enum": PHASES},
+        "invariant_violated": {"type": ["string", "null"]},
+        "note": {"type": "string"},
+    },
+    "required": ["entry_id"],
+}
+
+_CANDIDATE_RECORD_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "title": {"type": "string"},
+        "cause": {"type": "string"},
+        "area": {"type": "string"},
+        "origin_phase": {"enum": PHASES},
+        "manifested_phase": {"enum": PHASES},
+        "evidence_quote": {"type": "string"},
+    },
+    "required": ["title"],
+}
+
+CODING_RECORD_SCHEMA = {
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "type": "object",
+    "properties": {
+        "session": {"type": "string"},
+        "date": {"type": "string"},
+        "project": {"type": "string"},
+        "agent_class": {"type": "string"},
+        "matches": {"type": "array", "items": _MATCH_SCHEMA},
+        "candidates": {"type": "array", "items": _CANDIDATE_RECORD_SCHEMA},
+    },
+    "required": ["session", "date", "project", "agent_class"],
+}
+
 
 def _schema_errors(instance: dict, schema: dict) -> list[str]:
     validator = jsonschema.Draft202012Validator(schema)
@@ -173,6 +216,17 @@ def validate(codebook: dict) -> list[str]:
                 seen_cand_ids.add(cand_id)
 
     return errors
+
+
+def validate_coding_record(record: dict) -> list[str]:
+    """Validate a §7.3 coding record (coder output -> merger input).
+
+    Returns a list of human-readable error strings; an empty list means the
+    record is valid. Required: session/date/project/agent_class (strings).
+    matches/candidates are optional lists; invariant_violated accepts null
+    or any string (not slug-checked — see PHASES/HEADER module docstring).
+    """
+    return _schema_errors(record, CODING_RECORD_SCHEMA)
 
 
 # ---------------------------------------------------------------------------
