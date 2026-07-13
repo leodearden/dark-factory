@@ -1010,6 +1010,97 @@ def _spawn_merge_verify_dry_run(
         )
 
 
+@dataclasses.dataclass(frozen=True)
+class _MainHealthProbeHandles:
+    """Opaque bundle carrying the worker's ``background_tasks`` set so the
+    deferred main-health probe survives ``_run_post_merge_verify`` returning
+    (task 2564, reify 5067 merge-slot-stall fix).
+
+    A DISTINCT bundle from :class:`_DryRunInvestigationHandles` (not reused)
+    — the main-health probe's ownership is independent of the dry-run
+    investigation's, which keeps the shape minimal and future-friendly for
+    the sibling host-affinity / warm-probe work.  ``background_tasks`` is the
+    SAME ``set`` instance the worker stores at ``self._background_tasks`` —
+    a spawned probe task's strong ref lives exactly as long as the worker
+    and is drained by the worker's existing shutdown drain
+    (``SpeculativeMergeWorker.stop``).
+
+    Only the production ``SpeculativeMergeWorker._run_inflight_verify`` call
+    site passes a live instance (task 2564 step-16).  The solo-reverify,
+    train, and merge_gates module-level callers — and any bare test-local
+    caller — pass ``None`` (the default), so ``_run_post_merge_verify`` keeps
+    running the main-health probe SYNCHRONOUSLY exactly as it did before
+    this task.
+    """
+
+    background_tasks: set[asyncio.Task] = dataclasses.field(default_factory=set)
+
+
+async def _run_deferred_main_health_probe(
+    git_ops: GitOps,
+    req: MergeRequest,
+    verify: VerifyResult,
+    *,
+    escalation_queue: Any = None,
+    event_store: EventStore | None = None,
+) -> None:
+    """Off-critical-path main-health classification (task 2564).
+
+    Placeholder — the real body (probe + stale-check + escalation filing) is
+    implemented across steps 10/12.  Spawned by
+    :func:`_spawn_main_health_probe` as a DETACHED task with no awaiter, so
+    every externally-visible effect must come from what this coroutine does
+    internally (emitting the ``main_health_red`` signal, filing a dedup'd
+    escalation) — its return value is always discarded.
+    """
+    return
+
+
+def _spawn_main_health_probe(
+    handles: _MainHealthProbeHandles | None,
+    git_ops: GitOps,
+    req: MergeRequest,
+    verify: VerifyResult,
+    *,
+    escalation_queue: Any = None,
+    event_store: EventStore | None = None,
+) -> None:
+    """Fire-and-forget: spawn the deferred (off-critical-path) main-health
+    classification for a post-merge-verify failure.
+
+    None-safe: no-ops when *handles* is ``None`` (mirrors
+    :func:`_spawn_merge_verify_dry_run`'s ``handles is None`` guard) — every
+    call site invokes this unconditionally and relies on this internal check,
+    so the solo-reverify, train, and merge_gates module-level
+    ``_run_post_merge_verify`` callers (which pass no handles) are guaranteed
+    no-ops.
+
+    Registers the spawned task into ``handles.background_tasks`` with a
+    discard done-callback, named ``f'main-health-probe-{req.task_id}'`` so
+    :class:`SpeculativeMergeWorker`'s existing ``self._background_tasks``
+    shutdown drain cancels it deterministically on stop — no new drain code
+    is needed.
+    """
+    if handles is None:
+        return
+    task_name = f'main-health-probe-{req.task_id}'
+    try:
+        task = asyncio.create_task(
+            _run_deferred_main_health_probe(
+                git_ops, req, verify,
+                escalation_queue=escalation_queue, event_store=event_store,
+            ),
+            name=task_name,
+        )
+        handles.background_tasks.add(task)
+        task.add_done_callback(handles.background_tasks.discard)
+    except Exception as exc:
+        logger.warning(
+            'Task %s: failed to spawn main-health probe: %s',
+            req.task_id, exc,
+        )
+
+
 async def _run_post_merge_verify(
     git_ops: GitOps,
     req: MergeRequest,
@@ -1027,6 +1118,7 @@ async def _run_post_merge_verify(
     runner: VerifyRunner | None = None,
     escalation_queue: Any = None,
     dry_run_handles: _DryRunInvestigationHandles | None = None,
+    main_health_probe_handles: _MainHealthProbeHandles | None = None,
     depth: int | None = None,
     speculative: bool | None = None,
 ) -> MergeOutcome | None:
@@ -1079,6 +1171,21 @@ async def _run_post_merge_verify(
             (generic task-fault or unscoped-typecheck-FAILED) fires a
             fire-and-forget dry-run investigation via
             :func:`_spawn_merge_verify_dry_run`.
+        main_health_probe_handles: Opaque bundle carrying the worker's
+            ``background_tasks`` set (task 2564, reify 5067 merge-slot-stall
+            fix).  ``None`` (default) keeps the solo-reverify, train, and
+            merge_gates module-level callers — and any bare test-local
+            caller — running the main-health probe SYNCHRONOUSLY exactly as
+            before this task (byte-identical).  Only the production
+            ``SpeculativeMergeWorker._run_inflight_verify`` call site passes
+            a live bundle, at which point a main-health-eligible failure
+            SKIPS the synchronous ``_classify_main_health_red`` probe,
+            returns the provisional task-fault outcome immediately, and
+            spawns the classification as a detached background task via
+            :func:`_spawn_main_health_probe` — so the caller's
+            ``verify_task`` (and the merge slot / host lease it holds) is
+            freed within seconds of the verdict instead of blocking on a
+            full local verify build bounded only by the cold timeout.
         depth: Verify-frontier stack height (task 2340, ε=1890) at dispatch
             time; threaded straight into ``pool.dispatch`` for the
             ``merge_verify`` event.  ``None`` (default) keeps every existing
@@ -1297,11 +1404,27 @@ async def _run_post_merge_verify(
         # the generic task-fault build so all 4 merge paths are covered uniformly.
         # merge_wt is already cleaned up; the probe builds its own _mainprobe-
         # worktree and always cleans it in a finally block.
-        main_health_outcome = await _classify_main_health_red(
-            git_ops, req, verify, event_store,
-        )
-        if main_health_outcome is not None:
-            return main_health_outcome
+        #
+        # DEFERRED mode (main_health_probe_handles is not None — only the
+        # production SpeculativeMergeWorker._run_inflight_verify call site):
+        # SKIP the synchronous probe entirely.  It can run for minutes
+        # (bounded only by the cold verify timeout) and would otherwise hold
+        # the caller's verify_task — hence the merge slot / host lease — for
+        # its full duration (task 2564, the reify 5067 stall).  Fall through
+        # to the provisional task-fault outcome below and spawn the
+        # classification as a detached background task; a confirmed
+        # pre-existing break is escalated separately, off the critical path,
+        # by _run_deferred_main_health_probe once it completes.
+        #
+        # SYNCHRONOUS mode (handles is None — solo-reverify, train,
+        # merge_gates, and test-local callers): unchanged, byte-identical
+        # behaviour to before this task.
+        if main_health_probe_handles is None:
+            main_health_outcome = await _classify_main_health_red(
+                git_ops, req, verify, event_store,
+            )
+            if main_health_outcome is not None:
+                return main_health_outcome
         detail = verify.failure_report()
         reason = f'Post-merge verification failed: {verify.summary}'
         # Append the failure category so the timeout-vs-real-failure
@@ -1331,6 +1454,13 @@ async def _run_post_merge_verify(
                 dry_run_handles, req, reason, detail,
                 event_store=event_store,
             )
+        # DEFERRED mode: spawn the off-critical-path main-health
+        # classification now that the provisional outcome is fully built.
+        # None-safe no-op in SYNCHRONOUS mode (handles is None).
+        _spawn_main_health_probe(
+            main_health_probe_handles, git_ops, req, verify,
+            escalation_queue=escalation_queue, event_store=event_store,
+        )
         return MergeOutcome(
             'blocked', reason=reason,
             failure_category=verify.category,

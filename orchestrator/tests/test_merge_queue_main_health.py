@@ -795,7 +795,7 @@ class TestMainHealthDeferralCore:
 
         handles = _MainHealthProbeHandles(background_tasks=set())
 
-        async def _run() -> MergeOutcome | None:
+        async def _run() -> tuple[MergeOutcome | None, list[asyncio.Task]]:
             with (
                 patch(
                     'orchestrator.merge_queue.run_scoped_verification',
@@ -806,7 +806,7 @@ class TestMainHealthDeferralCore:
                     new=AsyncMock(side_effect=_blocked_probe),
                 ),
             ):
-                return await asyncio.wait_for(
+                outcome = await asyncio.wait_for(
                     _run_post_merge_verify(
                         git_ops, req, merge_wt,
                         timeouts={},
@@ -817,15 +817,22 @@ class TestMainHealthDeferralCore:
                     ),
                     timeout=5,
                 )
-
-        try:
-            outcome = asyncio.run(_run())
-        finally:
-            # Cleanup: release + cancel the detached probe task so it doesn't
-            # leak across tests or emit an "exception never retrieved" warning.
+            # Snapshot background_tasks state WHILE the loop is still alive —
+            # asyncio.run()'s post-return cleanup cancels + discards any
+            # still-pending task, so checking after it returns would always
+            # observe an empty set regardless of whether the spawn happened.
+            live_probe_tasks = [
+                t for t in handles.background_tasks
+                if t.get_name() == 'main-health-probe-99' and not t.done()
+            ]
+            # Release + cancel the detached probe task so it doesn't leak
+            # across tests or emit an "exception never retrieved" warning.
             for t in handles.background_tasks:
                 t.cancel()
             blocker.set()
+            return outcome, live_probe_tasks
+
+        outcome, live_probe_tasks = asyncio.run(_run())
 
         assert outcome is not None
         assert outcome.reason.startswith('Post-merge verification failed'), (
@@ -843,11 +850,7 @@ class TestMainHealthDeferralCore:
             f'Expected failure_cause_hint set; got {outcome.failure_cause_hint!r}'
         )
 
-        live_probe_tasks = [
-            t for t in handles.background_tasks
-            if t.get_name() == 'main-health-probe-99' and not t.done()
-        ]
         assert len(live_probe_tasks) == 1, (
             f'Expected exactly one live main-health-probe task registered in '
-            f'handles.background_tasks; got {handles.background_tasks}'
+            f'handles.background_tasks; got {live_probe_tasks}'
         )
