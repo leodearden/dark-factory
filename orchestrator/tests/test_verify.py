@@ -17,7 +17,6 @@ from orchestrator.verify import (
     _aggregate_results,
     _apply_cargo_scope,
     _build_fallback_config,
-    _classify_failure,
     _extract_cause_hint,
     _is_collectable_test_file,
     _is_structural_python_file,
@@ -33,6 +32,8 @@ from orchestrator.verify import (
     run_verification,
     scope_module_config,
 )
+from orchestrator.verify_classify import classify_failure
+from orchestrator.verify_cmd import ToolKind
 
 
 class TestKillCgroupScope:
@@ -884,20 +885,21 @@ class TestRc5NoTestsStaysRed:
     """Invariant (b): pytest rc=5 ("no tests ran") from a real target must stay RED.
 
     The false-RED for data modules is fixed in the scoping layer (task 1852),
-    NOT by mapping rc=5 → pass in _classify_failure.  A real test target that
+    NOT by mapping rc=5 → pass in classify_failure.  A real test target that
     unexpectedly collects zero tests must still be classified RED so the
     merge gate catches "tests vanished" regressions.
 
     This is a characterization / regression guard: it asserts the existing
-    (unchanged) behavior of _classify_failure, locking it against any future
-    blanket rc=5 → pass shortcut.
+    (unchanged) behavior of classify_failure(ToolKind.PYTEST, ...) (re-homed
+    from the pre-δ tool-blind _classify_failure — task 2131 step-11), locking
+    it against any future blanket rc=5 → pass shortcut.
     """
 
     _NO_TESTS_OUTPUT = '===== no tests ran in 0.01s ====='
 
     def test_rc5_no_tests_classifies_red(self):
-        """_classify_failure(rc=5, no-tests output) must return a non-passed category."""
-        result = _classify_failure(self._NO_TESTS_OUTPUT, 5, False)
+        """classify_failure(PYTEST, rc=5, no-tests output) must return a non-passed category."""
+        result = classify_failure(ToolKind.PYTEST, 5, self._NO_TESTS_OUTPUT, False)
         assert result != 'passed', (
             f'rc=5 "no tests ran" must NOT score passed, got {result!r} — '
             'the data-module false-RED is fixed in scoping (task 1852), '
@@ -911,7 +913,7 @@ class TestRc5NoTestsStaysRed:
         proving a real zero-collect target can never be scored GREEN by mixing
         it with a passed result.
         """
-        rc5_category = _classify_failure(self._NO_TESTS_OUTPUT, 5, False)
+        rc5_category = classify_failure(ToolKind.PYTEST, 5, self._NO_TESTS_OUTPUT, False)
         assert rc5_category in _CATEGORY_PRIORITY, (
             f'{rc5_category!r} not in _CATEGORY_PRIORITY — ranking is undefined'
         )
@@ -2872,16 +2874,18 @@ class TestFailureReportLogPaths:
 
 
 class TestClassifyFailure:
-    """Tests for ``_classify_failure(output, rc, timed_out) -> str``.
+    """Tests for ``classify_failure(ToolKind.OPAQUE, rc, output, timed_out) ->
+    FailureCategory`` — the full legacy generic ladder (PRD task δ; re-homed
+    from the pre-δ tool-blind ``_classify_failure(output, rc, timed_out)``,
+    which these tests originally targeted — task 2131 step-11).
 
-    Each test imports ``_classify_failure`` locally so that existing tests in
-    this file are not disrupted by the missing function during step 1.  Tests
-    will fail with ImportError until step 2 implements the function.
+    Each test imports ``classify_failure`` locally, mirroring the original
+    convention.
     """
 
     def _classify(self, output: str, rc: int, timed_out: bool) -> str:
-        from orchestrator.verify import _classify_failure  # noqa: PLC0415
-        return _classify_failure(output, rc, timed_out)
+        from orchestrator.verify_classify import classify_failure  # noqa: PLC0415
+        return classify_failure(ToolKind.OPAQUE, rc, output, timed_out)
 
     # (a) rc == 0 → 'passed' regardless of output content
     def test_passed_when_rc_zero(self):

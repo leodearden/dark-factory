@@ -36,6 +36,7 @@ from orchestrator.verify_categories import (
     FailureCategory,
     should_archive,
 )
+from orchestrator.verify_classify import classify_failure
 from orchestrator.verify_cmd import (
     ToolKind,
     cargo_scope,
@@ -488,167 +489,6 @@ def _extract_cause_hint(output: str) -> str:
     return meaningful[0].strip()[:200]
 
 
-# Shared-venv mutation signatures (task 2048): a concurrent `uv sync` from
-# another orchestrator process on the shared .venv can transiently
-# remove-then-readd packages WHILE a consumer is mid-pytest against it (a
-# non-atomic install window).  Grounded in task 2045's observation: an
-# identical `pytest -n auto` that had just passed failed with a pytest usage
-# error naming -n/--dist/--max-worker-restart (the xdist plugin vanished),
-# `python -c "import xdist"` raised ModuleNotFoundError, and `python -m pip`
-# reported "No module named pip".  Checked BEFORE _CLASSIFY_PATTERNS in
-# _classify_failure so these harness-infrastructure-absence signatures are
-# never misattributed as a code regression (compile_error /
-# pytest_internalerror / test_failure).  Deliberately narrow: application
-# code does not normally emit these exact xdist/pip-absence strings, so a
-# genuine code failure is not silently relabelled environmental.
-_ENV_TRANSIENT_PATTERNS: list[re.Pattern[str]] = [
-    # pytest usage error (rc=4) when the xdist plugin vanished mid-run:
-    # "pytest: error: unrecognized arguments: -n --dist --max-worker-restart=0"
-    # Anchored to the literal "pytest: error: unrecognized arguments:" prefix
-    # that argparse emits for pytest's own CLI (prog='pytest') rather than a
-    # bare "unrecognized arguments:" substring, so an unrelated tool's usage
-    # error that happens to mention -n/--dist/--max-worker-restart cannot
-    # false-positive into env_transient — the same inverse-misattribution
-    # hazard the pip pattern below is hardened against with its word-boundary
-    # lookahead.
-    re.compile(
-        r'^.*pytest: error: unrecognized arguments:.*(?:-n\b|--dist\b|--max-worker-restart\b).*$',
-        re.MULTILINE,
-    ),
-    # `python -m pip` when pip itself vanished from the venv.  The trailing
-    # negative lookahead (?![\w-]) requires 'pip' to be followed by a
-    # non-word, non-hyphen boundary so a ModuleNotFoundError whose module
-    # name merely STARTS with 'pip' (pipeline, pipx, pipenv, pip_audit,
-    # pip-tools) does not false-positive into env_transient — that would be
-    # the exact inverse misattribution this feature forbids (a genuine
-    # import/code regression silently relabelled environmental, auto-retried,
-    # and archive-denied).  Grounded positives (task 2045's unquoted runpy
-    # line '<executable>: No module named pip' and the quoted 'pip'/"pip"
-    # forms) still match since the boundary follows the closing quote (or
-    # end of line) in each case.
-    re.compile(r'''No module named ['"]?pip['"]?(?![\w-])''', re.MULTILINE),
-    # `import xdist` / `import pytest_xdist` when the plugin vanished.
-    re.compile(
-        r'''ModuleNotFoundError: No module named ['"](xdist|pytest_xdist)['"]''',
-        re.MULTILINE,
-    ),
-]
-
-
-# Compiled regex patterns for _classify_failure — hoisted to module scope so
-# re.compile() runs once at import time rather than on every call.
-# Order matters: rustc diagnostic codes (error[E0308]) appear before plain
-# 'error:' so compile errors are distinguished from cargo CLI errors.
-_CLASSIFY_PATTERNS: list[tuple[re.Pattern[str], str]] = [
-    (re.compile(r'error\[E\d+\]:', re.MULTILINE), 'compile_error'),
-    (re.compile(r'compile error', re.MULTILINE | re.IGNORECASE), 'compile_error'),
-    # cargo CLI errors — narrow allowlist of cargo-only prefixes so rustc
-    # top-level diagnostics ('error: aborting due to previous errors',
-    # 'error: could not compile `…`') fall through to unknown_test_failure.
-    # Intentionally conservative: novel cargo CLI messages not listed here
-    # (e.g. 'error: unexpected argument', 'error: the manifest-path must be …',
-    # 'error: manifest path … does not exist') will fall through to
-    # unknown_test_failure until added to the allowlist.  Extend when a new
-    # cargo CLI failure mode appears in production and needs its own bucket.
-    #
-    # Each retained token is grounded in a real observed cargo CLI log line:
-    #   --              → 'error: --exclude can only be used together with --workspace'
-    #   no such subcommand
-    #                   → 'error: no such subcommand: `tset`'
-    #   failed to (parse|compile|read)
-    #                   → 'error: failed to parse manifest at `/path/Cargo.toml`'
-    #                     'error: failed to compile `<name>` (lib), intermediates ...'
-    #                       (cargo_rustc / compiler job-queue orchestrator)
-    #                     'error: failed to read `/path/Cargo.toml`'
-    #   could not find  → 'error: could not find `Cargo.toml` in `/path` or any parent directory'
-    #
-    # Dropped tokens — no grounded cargo CLI sample available:
-    #   `invalid `  — see test_rustc_invalid_diagnostic_not_cargo_cli_error.
-    #   `package `  — re-add with a tighter suffix (e.g. 'package \`') once a
-    #                 real cargo log line is observed.
-    #   `find`      — 'failed to find' (without 'could not' prefix) has no verified
-    #                 cargo CLI sample; cargo uses 'could not find' for its typical
-    #                 find-failure case, covered by the top-level alternative above.
-    #                 See test_failed_to_find_alone_not_cargo_cli_error.
-    (re.compile(
-        r'^error: (--|no such subcommand|failed to (parse|compile|read)|could not find)',
-        re.MULTILINE,
-    ), 'cargo_cli_error'),
-    # pytest INTERNALERROR — must be checked BEFORE the FAILED patterns so that
-    # a worker-death run (which has both INTERNALERROR> lines and collateral
-    # FAILED lines from the dead worker) classifies as pytest_internalerror
-    # rather than test_failure.  Reuses _PYTEST_INTERNALERROR_RE (hoisted above).
-    (_PYTEST_INTERNALERROR_RE, 'pytest_internalerror'),
-    # Rust test runner / pytest FAILED lines
-    (re.compile(r'^.+\s+FAILED\s*$', re.MULTILINE), 'test_failure'),
-    (re.compile(r'^FAILED\s', re.MULTILINE), 'test_failure'),
-    # npm errors
-    (re.compile(r'npm\s+(ERR!|error)', re.MULTILINE), 'npm_error'),
-    # flock lock failures
-    (re.compile(r'^flock:', re.MULTILINE), 'flock_error'),
-    # tree-sitter generate failures
-    (re.compile(r'tree-sitter generate', re.MULTILINE), 'tree_sitter_generate_error'),
-]
-
-
-def _classify_failure(output: str, rc: int, timed_out: bool) -> str:
-    """Classify a command failure into a named category bucket.
-
-    Uses a pattern ladder (first match wins):
-    1. ``rc == 0``                              → ``'passed'``
-    2. ``timed_out``                            → ``'infra_timeout'``
-    3. xdist/pip absence (shared-venv mutation) → ``'env_transient'`` (checked BEFORE every other output pattern — see ``_ENV_TRANSIENT_PATTERNS`` — so a concurrent ``uv sync`` window that killed xdist/pip mid-run is never misattributed as a code regression)
-    4. ``error[E\\d+]:``                        → ``'compile_error'``
-    5. ``compile error``                         → ``'compile_error'``
-    6. ``error: <cargo CLI prefix>``             → ``'cargo_cli_error'`` (allowlist of cargo CLI prefixes; rustc top-level ``error: aborting…`` / ``error: could not compile`` fall through)
-    7. ``INTERNALERROR>``                        → ``'pytest_internalerror'`` (checked BEFORE FAILED so a worker-death run with collateral FAILED lines classifies as infra, not drift)
-    8. ``… FAILED``                              → ``'test_failure'``
-    9. ``npm (ERR!|error)``                      → ``'npm_error'``
-    10. ``flock:``                                → ``'flock_error'``
-    11. ``tree-sitter generate``                 → ``'tree_sitter_generate_error'``
-    12. fallback (rc != 0)                       → ``'unknown_test_failure'``
-
-    The ``timed_out`` flag wins over any output pattern because the root
-    cause is the wall-clock limit, not the command output.
-
-    CLOSED DOMAIN: every string returned here must be a member of
-    ``orchestrator.verify_categories.FailureCategory`` — that enum, not this
-    function, is the authoritative closed 12-value output domain, and
-    ``_validate_exhaustive`` only enforces it at ``verify_categories`` import
-    time. Adding a new category literal here without also adding a matching
-    ``FailureCategory`` member (+ its ``CATEGORY_POLICY`` row) does NOT fail
-    loud: ``should_archive`` and every other table lookup silently treat an
-    unrecognized string as non-archival/lowest-priority rather than raising.
-    Add the enum member first — the import-time guard then forces the
-    matching policy row.
-    """
-    if rc == 0:
-        return 'passed'
-    if timed_out:
-        return 'infra_timeout'
-
-    for env_pattern in _ENV_TRANSIENT_PATTERNS:
-        if env_pattern.search(output):
-            return 'env_transient'
-
-    for pattern, category in _CLASSIFY_PATTERNS:
-        if pattern.search(output):
-            return category
-
-    # Fallback — covers pytest rc=5 ("no tests ran") among other non-zero exits.
-    # INVARIANT (b, task 1852): pytest rc=5 is intentionally classified RED here
-    # ('unknown_test_failure', ranked above 'passed' in _CATEGORY_PRIORITY).
-    # A real test target that unexpectedly collects zero tests must stay RED so
-    # the merge gate catches "tests vanished" regressions.
-    #
-    # The data-module false-RED (e.g. shared/tests/silent_fallthrough_allowlist.py
-    # producing rc=5) is fixed in the SCOPING layer — scope_module_config and
-    # _build_fallback_config use _is_collectable_test_file to exclude non-test
-    # data files from pytest targets.  DO NOT map rc=5 → 'passed' here: that
-    # would silently green-light a real "tests vanished" regression.
-    return 'unknown_test_failure'
-
-
 # _ARCHIVE_DENY_LIST, _CATEGORY_PRIORITY, and PREEXISTING_BREAK_SKIP_CATEGORIES
 # are re-exported (imported above) from orchestrator.verify_categories, the
 # single source of truth for the per-category policy (archive / priority /
@@ -731,10 +571,43 @@ def _serial_pytest_str(cmd: str | None) -> str | None:
     return render(rewritten)
 
 
+def _tool_for_cmd(cmd: str | None) -> ToolKind:
+    """Resolve *cmd*'s ``ToolKind`` for ``classify_failure`` dispatch (task δ).
+
+    ``None`` (the module doesn't define this check) resolves to
+    ``ToolKind.OPAQUE``. In practice this default is never actually consulted
+    by ``classify_failure``: every caller checks ``rc == 0`` before
+    classifying, and a ``None`` command's check is always skipped (rc stays
+    0) — so a failing check always has a real, non-``None`` command string.
+
+    NOTE: this resolution is also what gates env_transient auto-recovery
+    (below, ``category == FailureCategory.ENV_TRANSIENT``) — that category is
+    only ever produced when a command resolves here to ``ToolKind.PYTEST``
+    (see verify_classify.py's "BEHAVIORAL NARROWING" note above
+    ``_ENV_TRANSIENT_PATTERNS``). A test command wrapped such that
+    ``parse_config_command`` can't see a literal ``pytest`` token (e.g. a
+    ``make test`` / shell-script / bare tox-nox indirection) resolves to
+    ``ToolKind.OPAQUE`` here and so cannot trigger env_transient recovery,
+    even if the underlying tool is in fact pytest. Not a concern for any
+    test_cmd shape in production today (all contain a literal ``pytest``
+    token).
+
+    The same gating applies unconditionally to the lint/type checks: their
+    commands never resolve here to ``ToolKind.PYTEST``, so their outputs can
+    never classify as env_transient either — unlike the pre-δ tool-blind
+    ladder, which consulted these signatures for every check's output (see
+    the env-recovery retry's comment in ``run_verification`` for the fuller
+    note on this narrowing).
+    """
+    if not cmd:
+        return ToolKind.OPAQUE
+    return parse_config_command(cmd).tool
+
+
 def _summarize_checks(
-    test_rc: int, test_out: str, test_timed_out: bool,
-    lint_rc: int, lint_out: str, lint_timed_out: bool,
-    type_rc: int, type_out: str, type_timed_out: bool,
+    test_rc: int, test_out: str, test_timed_out: bool, test_cmd: str | None,
+    lint_rc: int, lint_out: str, lint_timed_out: bool, lint_cmd: str | None,
+    type_rc: int, type_out: str, type_timed_out: bool, type_cmd: str | None,
 ) -> tuple[bool, str, str, str]:
     """Classify the three check results into (passed, category, cause_hint, summary).
 
@@ -743,6 +616,14 @@ def _summarize_checks(
     logic — worst-category selection via ``_worst_category`` plus cause-hint
     and summary-parts assembly — lives in exactly one place instead of being
     duplicated per call site.
+
+    Each check's config command (``test_cmd``/``lint_cmd``/``type_cmd`` — the
+    ungoverned, un-scoped command string, already in scope at both
+    ``run_verification`` call sites) is resolved to a ``ToolKind`` via
+    ``_tool_for_cmd`` and threaded into ``classify_failure`` (PRD task δ,
+    Invariant C1): a tool-T pattern can only ever match tool-T output, so a
+    cargo token embedded in pytest's own captured output (or vice versa) can
+    no longer swallow the wrong check's failure line.
 
     Does NOT compute the ``timed_out`` bookkeeping flag (pure-timeout-retry
     eligibility / consistency) — that stays with the caller, which alone
@@ -755,17 +636,17 @@ def _summarize_checks(
         return True, 'passed', '', 'All checks passed'
 
     hint_parts = []
-    per_check_categories = []
-    for rc, out, to in (
-        (test_rc, test_out, test_timed_out),
-        (lint_rc, lint_out, lint_timed_out),
-        (type_rc, type_out, type_timed_out),
+    per_check_categories: list[str] = []
+    for rc, out, to, cmd in (
+        (test_rc, test_out, test_timed_out, test_cmd),
+        (lint_rc, lint_out, lint_timed_out, lint_cmd),
+        (type_rc, type_out, type_timed_out, type_cmd),
     ):
         if rc != 0:
             h = _extract_cause_hint(out)
             if h:
                 hint_parts.append(h)
-            per_check_categories.append(_classify_failure(out, rc, to))
+            per_check_categories.append(classify_failure(_tool_for_cmd(cmd), rc, out, to))
     cause_hint = ' | '.join(hint_parts)
     category = _worst_category(per_check_categories) if per_check_categories else 'unknown_test_failure'
 
@@ -1481,7 +1362,8 @@ def scope_module_config(
     # A data module under tests/ (e.g. silent_fallthrough_allowlist.py) is in
     # the test tree (_is_test_file) but NOT collectable — passing it to pytest
     # produces rc=5 ("no tests ran") → RED.  Task 1852 fixes this at the
-    # scoping layer; the classifier (_classify_failure) is left untouched.
+    # scoping layer; the classifier (verify_classify.classify_failure) is
+    # left untouched.
     collectable_tests = [f for f in scoped if _is_collectable_test_file(f)]
     # has_test_data: in-tree (test-tree member) but not collectable — mirrors
     # has_conftest: fall back to the full owning-package suite (mc.test_command).
@@ -3160,9 +3042,9 @@ async def run_verification(
     # Build summary/category/cause_hint (shared with the env-recovery retry
     # below via _summarize_checks — see task 2048 code_duplication fix).
     passed, category, cause_hint, summary = _summarize_checks(
-        test_rc, test_out, test_timed_out,
-        lint_rc, lint_out, lint_timed_out,
-        type_rc, type_out, type_timed_out,
+        test_rc, test_out, test_timed_out, test_cmd,
+        lint_rc, lint_out, lint_timed_out, lint_cmd,
+        type_rc, type_out, type_timed_out, type_cmd,
     )
     if timed_out:
         summary = f'Verification timed out after {max_retries} retries' if max_retries > 0 else 'Verification timed out'
@@ -3177,6 +3059,24 @@ async def run_verification(
     # recovery still hitting env_transient means it stays environmental
     # (NOT misattributed to test_failure/unknown_test_failure); recovery
     # surfacing a different category means that real signal is reported.
+    #
+    # This branch can only fire when test_cmd resolves to ToolKind.PYTEST via
+    # _tool_for_cmd (see that function's docstring) — a test command wrapped
+    # such that the parser can't see a literal `pytest` token never produces
+    # ENV_TRANSIENT and so never reaches this retry, even on a genuine
+    # shared-venv mutation. True of every production test_cmd today.
+    #
+    # This PYTEST-only narrowing is broader than just that wrapped-test-cmd
+    # case: the pre-δ tool-blind ladder also consulted these env_transient
+    # signatures against the LINT and TYPE check outputs (it classified
+    # whatever output it was handed, uniformly across all three checks),
+    # whereas the RUFF/PYRIGHT tables and the OPAQUE fallback never do now —
+    # so a lint or type-check failure cannot classify as env_transient by
+    # construction, only the test leg can. A conscious tradeoff, not an
+    # unnoticed side effect: the signatures are pytest/xdist-specific text
+    # ruff/pyright would not emit, and this retry only ever re-runs the test
+    # command regardless (lint/type don't exercise xdist/pip — see above),
+    # so there is no observable behavior change from this narrowing.
     if category == FailureCategory.ENV_TRANSIENT and test_cmd is not None:
         logger.warning(
             'Verification hit an environmental shared-venv transient '
@@ -3214,9 +3114,9 @@ async def run_verification(
         timed_out = (not passed) and pure_timeout_failure
 
         passed, category, cause_hint, summary = _summarize_checks(
-            test_rc, test_out, test_timed_out,
-            lint_rc, lint_out, lint_timed_out,
-            type_rc, type_out, type_timed_out,
+            test_rc, test_out, test_timed_out, test_cmd,
+            lint_rc, lint_out, lint_timed_out, lint_cmd,
+            type_rc, type_out, type_timed_out, type_cmd,
         )
         if timed_out:
             # Distinct wording from the first-pass timeout summary: this
