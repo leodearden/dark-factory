@@ -819,7 +819,7 @@ class TestMergeGraphFamily:
             mentions_recreated=1, mentions_skipped=0,
             dropped_cross_target=[{'edge_uuid': 'edge-2', 'reason': 'cross-target'}],
         )
-        mocks = self._patch_primitives(monkeypatch, recreate_result=recreate_result)
+        self._patch_primitives(monkeypatch, recreate_result=recreate_result)
         entity_rows = [{'uuid': 'entity-1', 'name': 'Alice'}, {'uuid': 'entity-2', 'name': 'Bob'}]
         episode_rows = [{'uuid': 'episode-1'}]
 
