@@ -64,6 +64,20 @@ decisions for the full rationale):
     scoped to η's ratified declaration layer (reject invalid, accept +
     persist valid).
 
+Why the single-seam classes still exist despite per-module unit coverage:
+L2, L3, L4, P4, D1, S1, and E1 each drive one seam end-to-end in ways that
+seam's own unit suite (test_recon_ledger.py, test_recon_write_policy.py,
+test_stats_verifier.py, etc.) already covers at comparable granularity —
+only L1 composes two seams (upsert + gc()) concurrently. That overlap is
+intentional, not oversight: the ο deliverable (PRD §9) is ONE module that
+independently asserts every §9 boundary postcondition against the real,
+merged code, so this file's own correctness never depends on a per-seam
+suite continuing to assert the same thing on its own. Trimming a class
+down to "only the delta over its unit suite" would leave this file an
+incomplete map of §9 and reopen the gap the gate exists to close: a
+passing per-module suite whose seam nonetheless regresses at the
+integration boundary, with nothing here left to catch it.
+
 xdist-safety: every fixture below is keyed off a per-test ``tmp_path``
 with no shared global/module state, so the suite is safe under this
 project's ``-n auto --dist loadgroup`` addopts (pyproject.toml) without
@@ -297,38 +311,34 @@ def _make_ledger_record(
     )
 
 
-async def _count_ledger_rows(
-    ledger: ReconLedgerStore, project_id: str, *, record_kind: str | None = None,
+async def _count_surviving_identities(
+    ledger: ReconLedgerStore,
+    project_id: str,
+    record_kind: str,
+    identities: list[tuple[str, str, str]],
 ) -> int:
-    """Raw SELECT COUNT(*) over recon_ledger for *project_id*, optionally
-    filtered to a single *record_kind* — a direct check on the store's own
-    connection, independent of get_by_identity's per-identity read path.
-    Shared by L1/L2 (all record_kinds) and D1 (record_kind='cycle_summary').
+    """Count how many of *identities* (task_id, flag_type, run_id triples)
+    still resolve to a row, via the store's public `get_by_identity` read
+    path only. Shared by L1/L2's marker checks and D1's cycle_summary
+    checks.
 
-    ReconLedgerStore exposes only identity-scoped public reads
-    (get_by_identity/list_suppressions/marker_task_ids) — no public
-    row-count/list-by-project API — so this deliberately reaches into the
-    store's private `_db` connection (noqa SLF001) and duplicates the
-    `recon_ledger` table/column names owned by TABLE_SQL in
-    reconciliation/recon_ledger.py. If either the `_db` attribute or that
-    schema is ever renamed, this is the one place (and the only place in
-    this suite) that needs updating to match.
+    Each call site below passes the FULL set of identities it ever wrote
+    for this (project_id, record_kind) — never an arbitrary/partial
+    sample. ReconLedgerStore's five-column PRIMARY KEY (project_id,
+    record_kind, task_id, flag_type, run_id) guarantees at most one row
+    per identity, so "how many of this closed set of known identities
+    resolve" is equivalent to a raw row count over the project, without
+    reaching into the store's connection or duplicating the schema owned
+    by TABLE_SQL in reconciliation/recon_ledger.py.
     """
-    db = ledger._db  # noqa: SLF001 — intentional direct-connection check; see docstring
-    assert db is not None, 'Expected an initialized store with an open connection'
-    if record_kind is None:
-        cursor = await db.execute(
-            'SELECT COUNT(*) FROM recon_ledger WHERE project_id = ?',
-            (project_id,),
+    hits = 0
+    for task_id, flag_type, run_id in identities:
+        record = await ledger.get_by_identity(
+            project_id, record_kind, task_id=task_id, flag_type=flag_type, run_id=run_id,
         )
-    else:
-        cursor = await db.execute(
-            'SELECT COUNT(*) FROM recon_ledger WHERE project_id = ? AND record_kind = ?',
-            (project_id, record_kind),
-        )
-    row = await cursor.fetchone()
-    assert row is not None
-    return row[0]
+        if record is not None:
+            hits += 1
+    return hits
 
 
 # ---------------------------------------------------------------------------
@@ -366,7 +376,10 @@ class TestLedgerUpsertAndGcInterleave:
         upsert's values."""
         last_record = await self._drive_l2_sequential_upserts(ledger)
 
-        count = await _count_ledger_rows(ledger, self._PROJECT_L2)
+        count = await _count_surviving_identities(
+            ledger, self._PROJECT_L2, 'stage1_flag_marker',
+            [('T-idempotent', 'flag_idempotent', '')],
+        )
         assert count == 1, f'Expected exactly one row after N upserts, got {count}'
 
         fetched = await ledger.get_by_identity(
@@ -426,7 +439,14 @@ class TestLedgerUpsertAndGcInterleave:
 
         # Total surviving rows for the project: interleaved identity + live
         # marker (terminal marker was collected by the interleaved gc()).
-        count = await _count_ledger_rows(ledger, self._PROJECT_L1)
+        count = await _count_surviving_identities(
+            ledger, self._PROJECT_L1, 'stage1_flag_marker',
+            [
+                ('T-interleave', 'flag_interleave', ''),
+                (terminal_task_id, 'flag_terminal', ''),
+                (live_task_id, 'flag_live', ''),
+            ],
+        )
         assert count == 2, (
             f'Expected exactly 2 surviving rows (interleaved + live) after the '
             f'interleaved gc() collected the terminal marker, got {count}'
@@ -901,8 +921,9 @@ class TestDeterministicCycleSummary:
         report, wrote = await self._drive_single_write(recon_service)
 
         assert wrote is True, 'Expected write_cycle_summary to report the ledger upsert succeeded'
-        count = await _count_ledger_rows(
-            recon_service.recon_ledger, self._PROJECT, record_kind='cycle_summary',
+        count = await _count_surviving_identities(
+            recon_service.recon_ledger, self._PROJECT, 'cycle_summary',
+            [('', self._STAGE, self._RUN_ID)],
         )
         assert count == 1, f'Expected exactly one cycle_summary row to exist, got {count}'
 
@@ -932,8 +953,9 @@ class TestDeterministicCycleSummary:
         an idempotent UPSERT, not an accumulating insert."""
         second_report = await self._drive_repeat_write(recon_service)
 
-        count = await _count_ledger_rows(
-            recon_service.recon_ledger, self._PROJECT, record_kind='cycle_summary',
+        count = await _count_surviving_identities(
+            recon_service.recon_ledger, self._PROJECT, 'cycle_summary',
+            [('', self._STAGE, self._RUN_ID)],
         )
         assert count == 1, f'Expected exactly one row after a repeat write, got {count}'
 
