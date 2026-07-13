@@ -32,7 +32,8 @@ import os
 import subprocess
 import sys
 import tempfile
-from collections.abc import Mapping
+import time
+from collections.abc import Callable, Mapping
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -201,6 +202,98 @@ def _resolve_parent_session_id(env: Mapping[str, str]) -> str | None:
     return env.get('CLAUDE_SPAWN_PARENT_ID') or None
 
 
+_WM_WINDOW_ID_ATTEMPTS = 5
+_WM_WINDOW_ID_RETRY_SLEEP_SECS = 0.2
+_WMCTRL_TIMEOUT_SECS = 2
+
+
+def _wmctrl_list(argv: list[str]) -> subprocess.CompletedProcess[str]:
+    """Fail-soft default runner for ``_resolve_wm_window_id``.
+
+    Wraps ``subprocess.run(['wmctrl', '-l'], ...)`` and never raises, but
+    distinguishes *why* it failed so the caller can react differently:
+
+    - A genuinely-missing ``wmctrl`` binary (``FileNotFoundError``) is a
+      permanent failure -- yields the rc=127 sentinel
+      ``_resolve_wm_window_id`` short-circuits on (no point retrying a
+      binary that will never appear).
+    - Any other ``OSError``/``SubprocessError`` -- notably
+      ``subprocess.TimeoutExpired`` from a momentarily-hung ``wmctrl`` -- is
+      transient, not permanent, so it yields a distinct rc=124 sentinel that
+      the retry loop keeps riding out exactly like a nonzero/empty probe.
+      Conflating the two would abort all remaining attempts on a single
+      slow probe instead of retrying it.
+    """
+    try:
+        return subprocess.run(argv, capture_output=True, text=True, timeout=_WMCTRL_TIMEOUT_SECS)
+    except FileNotFoundError:
+        return subprocess.CompletedProcess(argv, returncode=127, stdout='')
+    except (OSError, subprocess.SubprocessError):
+        return subprocess.CompletedProcess(argv, returncode=124, stdout='')
+
+
+def _resolve_wm_window_id(
+    title: str,
+    *,
+    run: Callable[[list[str]], subprocess.CompletedProcess[str]] = _wmctrl_list,
+    attempts: int = _WM_WINDOW_ID_ATTEMPTS,
+    sleep: Callable[[float], None] = time.sleep,
+) -> str | None:
+    """Best-effort resolve *title*'s live X11 window id via ``wmctrl -l``.
+
+    Terminals map their X11 window asynchronously, so the window may not yet
+    appear in ``wmctrl -l`` on the first probe right after spawn -- this
+    retries up to *attempts* times, sleeping ``_WM_WINDOW_ID_RETRY_SLEEP_SECS``
+    between attempts (never after the last one). Each ``wmctrl -l`` line is
+    parsed via ``split(None, 3)`` into ``(window_id, desktop, host, title)`` --
+    identical to ``WmBackend.is_alive``'s proven parse
+    (cockpit/src/cockpit/backends/wm.py) -- and this returns the window id of
+    the line whose title field matches *title* EXACTLY, never as a substring,
+    so a short marker can't false-positive against an unrelated longer window
+    title. NOTE: this parse is intentionally duplicated (not shared/imported)
+    across the orchestrator/cockpit package boundary -- keep the two in sync
+    if either changes (see WmBackend.is_alive's matching note).
+
+    Fully fail-soft: a missing ``wmctrl``, a nonzero return code on every
+    attempt, no matching line, or any unexpected exception (from *run*,
+    parsing, or *sleep*) all return ``None`` rather than raising -- a
+    resolution miss must degrade cleanly to ``display=None``, never worse.
+
+    ``_wmctrl_list``'s two failure sentinels are handled distinctly:
+    a returncode of 127 (genuinely-missing ``wmctrl`` binary) is a permanent
+    failure, so it short-circuits on the first probe instead of paying the
+    full *attempts* x sleep cost; a returncode of 124 (transient failure,
+    e.g. a ``wmctrl`` invocation that timed out) is treated exactly like any
+    other non-matching probe and retried.
+
+    Worst-case added SessionStart latency (this runs synchronously inside
+    the hook): the common "window not mapped yet" miss costs
+    ``(attempts - 1) * _WM_WINDOW_ID_RETRY_SLEEP_SECS`` of sleeping plus
+    *attempts* fast ``wmctrl -l`` calls (~0.8s at the current defaults); the
+    pathological case of ``wmctrl`` itself repeatedly timing out costs up to
+    ``attempts * _WMCTRL_TIMEOUT_SECS`` on top of that (~10.8s at the current
+    defaults) before giving up and leaving ``display=None``.
+    """
+    try:
+        for attempt in range(attempts):
+            result = run(['wmctrl', '-l'])
+            if result.returncode == 127:
+                return None
+            if result.returncode == 0:
+                for line in result.stdout.splitlines():
+                    columns = line.split(None, 3)
+                    if len(columns) < 4:
+                        continue
+                    window_id, _desktop, _host, line_title = columns
+                    if line_title == title:
+                        return window_id
+            if attempt < attempts - 1:
+                sleep(_WM_WINDOW_ID_RETRY_SLEEP_SECS)
+    except Exception:
+        return None
+    return None
+
+
 def _resolve_display(env: Mapping[str, str], title: str) -> session_registry.Display | None:
     """Resolve this session's best-effort focus target from env (Fleet Cockpit C2).
 
@@ -211,8 +304,17 @@ def _resolve_display(env: Mapping[str, str], title: str) -> session_registry.Dis
     pane spec from ``TMUX_PANE`` when present, else ``None`` (best-effort,
     never guessed). The 'wm' case carries *title* as ``wm_title`` -- the
     primary focus key (PRD §6.1: wmctrl -a by title) -- alongside the
-    best-effort ``WINDOWID`` optimization. Returns None when neither marker
-    is present.
+    best-effort ``WINDOWID`` optimization.
+
+    Third and last, when neither TMUX nor WINDOWID is present (the common
+    case for konsole/gnome-terminal spawns, which do not export WINDOWID --
+    task 2510 / Fleet Cockpit C10 fix): if ``CLAUDE_SPAWN_WM_TITLE`` is set,
+    resolve its live X11 window id via ``_resolve_wm_window_id`` and, on a
+    hit, stamp a 'wm' Display carrying that EXACT marker as ``wm_title``
+    (never the possibly-since-churned *title* param). Gated strictly on this
+    explicit env var -- no fallback to *title* itself -- so a hand-launched
+    session (no CLAUDE_SPAWN_WM_TITLE) never invokes wmctrl here, and a
+    resolver miss (or no marker at all) returns None exactly like today.
     """
     if env.get('TMUX'):
         return session_registry.Display(
@@ -225,6 +327,15 @@ def _resolve_display(env: Mapping[str, str], title: str) -> session_registry.Dis
             wm_title=title,
             wm_window_id=env.get('WINDOWID'),
         )
+    marker = env.get('CLAUDE_SPAWN_WM_TITLE')
+    if marker:
+        window_id = _resolve_wm_window_id(marker)
+        if window_id is not None:
+            return session_registry.Display(
+                kind=session_registry.DisplayKind.WM.value,
+                wm_title=marker,
+                wm_window_id=window_id,
+            )
     return None
 
 

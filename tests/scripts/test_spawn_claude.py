@@ -288,9 +288,10 @@ def _run_spawn(
     cwd: pathlib.Path,
     *,
     timeout: int = 30,
+    title: str = "",
 ) -> subprocess.CompletedProcess[bytes]:
     return subprocess.run(
-        [str(SPAWN_SCRIPT), str(cwd), "false", "", "test prompt"],
+        [str(SPAWN_SCRIPT), str(cwd), "false", title, "test prompt"],
         env=env,
         capture_output=True,
         timeout=timeout,
@@ -1245,12 +1246,14 @@ def test_spawn_fail_soft_skips_result_handback_when_registry_faults(
 def _write_fake_claude_capturing_env(
     bin_dir: pathlib.Path, capture_file: pathlib.Path
 ) -> None:
-    """Write a fake ``claude`` that captures its own CLAUDE_SPAWN_SESSION_ID
-    and CLAUDE_SPAWN_PARENT_ID env vars to *capture_file*, then exits 0.
+    """Write a fake ``claude`` that captures its own CLAUDE_SPAWN_SESSION_ID,
+    CLAUDE_SPAWN_PARENT_ID, and CLAUDE_SPAWN_WM_TITLE env vars to
+    *capture_file*, then exits 0.
 
     Modeled on ``_write_fake_claude_capturing_prompt`` -- lets a test inspect
-    exactly what the two Fleet Cockpit C1 identity exports resolved to for
-    the spawned child process.
+    exactly what the Fleet Cockpit C1 identity exports (and, since task 2510,
+    the C10-fix window-title marker export) resolved to for the spawned
+    child process.
     """
     p = bin_dir / "claude"
     p.write_text(
@@ -1258,6 +1261,7 @@ def _write_fake_claude_capturing_env(
         "{\n"
         '  echo "SESSION=${CLAUDE_SPAWN_SESSION_ID:-}"\n'
         '  echo "PARENT=${CLAUDE_SPAWN_PARENT_ID:-}"\n'
+        '  echo "CLAUDE_SPAWN_WM_TITLE=${CLAUDE_SPAWN_WM_TITLE:-}"\n'
         f"}} > {capture_file!s}\n"
         "exit 0\n"
     )
@@ -1378,6 +1382,57 @@ def test_spawn_id_exports_fail_soft_when_registry_faults(tmp_path: pathlib.Path)
     captured = _parse_captured_env(capture_file)
     assert captured.get("SESSION") == "", f"expected a clean no-op export, got {captured!r}"
     assert captured.get("PARENT") == "", f"expected a clean no-op export, got {captured!r}"
+
+
+# ===========================================================================
+# task-2510 (Fleet Cockpit C10 fix): CLAUDE_SPAWN_WM_TITLE export
+# ===========================================================================
+# The spawned session's own SessionStart hook (orchestrator rail C2,
+# session_hooks._resolve_display) needs the EXACT window title this script
+# handed the terminal emulator to resolve the live X11 window id via
+# `wmctrl -l` -- this script keys its own LAUNCHING record on launcher_pid
+# while the hook keys on session_id (a different record), so the marker must
+# travel through the environment, mirroring CLAUDE_SPAWN_SESSION_ID/
+# PARENT_ID/RESULT_FILE above.
+
+
+def test_spawn_exports_wm_title_when_title_nonempty(tmp_path: pathlib.Path) -> None:
+    """A non-empty title arg is exported into the spawned session as
+    CLAUDE_SPAWN_WM_TITLE, byte-identical to the title handed to the
+    emulator.
+    """
+    bin_dir = _make_bin_dir(tmp_path)
+    capture_file = tmp_path / "captured_env.txt"
+    _write_fake_claude_capturing_env(bin_dir, capture_file)
+    _write_foreground_terminal(bin_dir, "xterm")
+    env = _base_env(bin_dir, "xterm")
+
+    result = _run_spawn(env, tmp_path, title="focus:df#2510 alpha")
+    assert result.returncode == 0, f"stderr: {result.stderr.decode()}"
+
+    captured = _parse_captured_env(capture_file)
+    assert captured.get("CLAUDE_SPAWN_WM_TITLE") == "focus:df#2510 alpha"
+
+
+def test_spawn_omits_wm_title_export_when_title_empty(tmp_path: pathlib.Path) -> None:
+    """Additive, no-op behavior: an empty title (the pre-task-2510 default,
+    e.g. every existing caller in this suite) must not export
+    CLAUDE_SPAWN_WM_TITLE at all -- it comes through empty in the captured
+    env, exactly like the fail-soft PARENT/SESSION no-op cases above.
+    """
+    bin_dir = _make_bin_dir(tmp_path)
+    capture_file = tmp_path / "captured_env.txt"
+    _write_fake_claude_capturing_env(bin_dir, capture_file)
+    _write_foreground_terminal(bin_dir, "xterm")
+    env = _base_env(bin_dir, "xterm")
+
+    result = _run_spawn(env, tmp_path, title="")
+    assert result.returncode == 0, f"stderr: {result.stderr.decode()}"
+
+    captured = _parse_captured_env(capture_file)
+    assert captured.get("CLAUDE_SPAWN_WM_TITLE", "") == "", (
+        f"expected no wm-title export for an empty title, got {captured!r}"
+    )
 
 
 # ===========================================================================

@@ -175,6 +175,25 @@ if [ -n "$SESSION_RECORD_DIR" ]; then
   fi
 fi
 
+# Task 2510 (Fleet Cockpit C10 fix): export the exact window-title marker
+# handed to the terminal emulator below, so the spawned session's own
+# SessionStart hook (orchestrator rail C2, session_hooks._resolve_display)
+# knows what string to search `wmctrl -l` for when resolving the live X11
+# window id. This script keys its own LAUNCHING record on launcher_pid while
+# the hook keys on session_id -- a different record (see session_hooks
+# module docstring) -- so the marker must travel through the environment,
+# mirroring spawn_id_export/parent_id_export/result_export above. Guarded on
+# non-empty $title ALONE -- unlike the identity exports above, this has
+# nothing to do with the session registry, only with what title was actually
+# given to the emulator (see the case dispatch further below) -- so it is
+# purely additive: an empty title (every pre-task-2510 caller) exports
+# nothing, leaving the exit-code/quoting contract untouched.
+wm_title_export=""
+if [ -n "$title" ]; then
+  q_wm_title=$(printf %q "$title")
+  wm_title_export="export CLAUDE_SPAWN_WM_TITLE=$q_wm_title; "
+fi
+
 # Result-handback trailer (Attention Rail T5): appended to the prompt itself
 # so the spawned session is told, in-band, to write its outcome before
 # ending. Gated on the same non-empty check as result_export above -- a
@@ -253,7 +272,7 @@ q_sentinel=$(printf %q "$sentinel")
 inner="trap 'echo \"\${ec:-\$?}\" > $q_sentinel' EXIT; \
 trap 'exit 129' HUP; \
 trap 'exit 143' TERM; \
-${spawn_id_export}${parent_id_export}${result_export}cd $q_cwd && claude $flags $q_prompt; ec=\$?; exit \$ec"
+${spawn_id_export}${parent_id_export}${result_export}${wm_title_export}cd $q_cwd && claude $flags $q_prompt; ec=\$?; exit \$ec"
 
 # How long to wait for the sentinel to appear after the launcher returns
 # (covers a hair-late write or a very fast emulator).  Tests can shrink this.

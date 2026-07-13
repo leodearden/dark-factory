@@ -22,10 +22,33 @@ class WmBackend:
         self._run = run
 
     def focus(self, target: DisplayTarget) -> FocusResult:
-        """Raise target's window via `wmctrl -a`, falling back to `xdotool windowactivate`."""
+        """Raise target's window.
+
+        Prefers the stable `wm_window_id` (`wmctrl -i -a <id>`) over
+        `wm_title`, since a spawned terminal's title churns during launch
+        and thereafter carries status glyphs from OSC retitling, making a
+        captured title snapshot unreliable within seconds. Falls back to
+        `wmctrl -a <title>` then `xdotool windowactivate` when no id is
+        available or activating by id fails.
+        """
+        if not target.wm_window_id and not target.wm_title:
+            logger.warning(
+                'WmBackend.focus: target has no wm_title or wm_window_id: %r', target
+            )
+            return FocusResult(ok=False, note='no target')
+
+        if target.wm_window_id:
+            id_result = self._run(['wmctrl', '-i', '-a', target.wm_window_id])
+            if id_result.returncode == 0:
+                return FocusResult(ok=True)
+
         if not target.wm_title:
-            logger.warning('WmBackend.focus: target has no wm_title: %r', target)
-            return FocusResult(ok=False, note='no wm_title')
+            logger.warning(
+                'WmBackend.focus: could not focus window id %r (wmctrl rc=%s)',
+                target.wm_window_id,
+                id_result.returncode,
+            )
+            return FocusResult(ok=False, note='window not found')
 
         result = self._run(['wmctrl', '-a', target.wm_title])
         if result.returncode == 0:
@@ -93,6 +116,12 @@ class WmBackend:
         fixed columns and compare the title field exactly (or the window id,
         when known) rather than a raw substring, so e.g. title 'a' can't
         false-positive against a longer title like 'session-a'.
+
+        NOTE: this exact `split(None, 3)` parse is duplicated (not
+        shared/imported, since this is a cross-package boundary) in
+        `orchestrator/src/orchestrator/session_hooks.py::_resolve_wm_window_id`
+        -- if the column layout or matching rule here ever changes, mirror
+        the change there too.
         """
         if not target.wm_title and not target.wm_window_id:
             logger.warning(
