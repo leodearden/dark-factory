@@ -268,6 +268,7 @@ def _make_decision(**overrides: object) -> sr.DecisionRecord:
         'options': ['yes', 'no'],
         'manual_boost': 2,
         'state': 'answered',
+        'severity': 'critical',
     }
     fields.update(overrides)
     return sr.DecisionRecord(**fields)
@@ -311,6 +312,34 @@ def test_decision_record_defaults() -> None:
     )
     assert d.manual_boost == 0
     assert d.state == sr.DecisionState.OPEN
+    assert d.severity == ''
+
+
+def test_decision_record_to_dict_includes_severity() -> None:
+    d = _make_decision(severity='blocking')
+    assert d.to_dict()['severity'] == 'blocking'
+
+
+def test_decision_record_parses_pre_severity_dict_additive() -> None:
+    """A decision dict written before the severity field existed -- containing
+    none of the severity key -- must still parse via from_dict without
+    raising, defaulting severity to '' (migration-free additive contract,
+    mirrors test_session_record_parses_rail_vintage_dict_migration_free).
+    """
+    pre_severity = {
+        'id': 'dec-1',
+        'project': 'df',
+        'text': 'approve?',
+        'filed_at': '2026-07-07T00:00:00+00:00',
+        'session_id': 'unblock-df-2085-4242',
+        'task_id': '2085',
+        'escalation_id': 'esc-1',
+        'options': ['yes', 'no'],
+        'manual_boost': 2,
+        'state': 'answered',
+    }
+    record = sr.DecisionRecord.from_dict(pre_severity)
+    assert record.severity == ''
 
 
 def test_decision_path_for_id_under_decisions_dir(tmp_path: Path) -> None:
