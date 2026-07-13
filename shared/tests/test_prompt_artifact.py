@@ -8,6 +8,7 @@ Built bottom-up in TDD order (see task 2492's plan.json):
   - TestUnpinRollback: unpin() is the rollback lever, restores the in-code constant.
   - TestKeyIsolationAndPathSafety: per-model/per-harness isolation + traversal safety.
   - TestFailSafeUnverifiablePin: half-written/corrupt pins fall back to in-code.
+  - TestAtomicWriteText: _atomic_write_text's failure/cleanup path.
   - TestDefaultArtifactsRoot: default_artifacts_root() env override + monorepo walk-up.
 """
 
@@ -437,6 +438,38 @@ class TestFailSafeUnverifiablePin:
         assert resolved.text == spec.in_code_constant
         assert resolved.provenance is None
         assert resolved.source == 'in_code'
+
+    def test_read_provenance_returns_none_for_corrupt_provenance(self, tmp_path):
+        store = PromptArtifactStore(tmp_path)
+        key_dir = store._key_dir('reviewer', 'claude-opus-4', 'v1')
+        key_dir.mkdir(parents=True)
+        (key_dir / 'provenance.json').write_text('{not valid json', encoding='utf-8')
+
+        assert store.read_provenance('reviewer', 'claude-opus-4', 'v1') is None
+
+
+class TestAtomicWriteText:
+    """Direct coverage of the private write-then-replace helper's failure path."""
+
+    def test_cleans_up_temp_file_and_leaves_original_untouched_on_failure(
+        self, tmp_path, monkeypatch
+    ):
+        target = tmp_path / 'out.txt'
+        target.write_text('original', encoding='utf-8')
+
+        def boom(*_args, **_kwargs):
+            raise OSError('simulated write failure')
+
+        monkeypatch.setattr('shared.prompt_artifact.os.replace', boom)
+
+        with pytest.raises(OSError):
+            prompt_artifact._atomic_write_text(target, 'new content')
+
+        # The failed replace never landed: original contents survive...
+        assert target.read_text(encoding='utf-8') == 'original'
+        # ...and no leftover temp file was left behind next to it.
+        leftover = [p.name for p in tmp_path.iterdir() if p.name != 'out.txt']
+        assert leftover == []
 
 
 class TestDefaultArtifactsRoot:

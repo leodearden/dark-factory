@@ -27,8 +27,10 @@ same on-disk state.
 
 from __future__ import annotations
 
+import contextlib
 import os
 import shutil
+import tempfile
 import urllib.parse
 from dataclasses import dataclass
 from pathlib import Path
@@ -175,15 +177,24 @@ def _load_valid_provenance(path: Path) -> ArtifactProvenance | None:
 def _atomic_write_text(path: Path, text: str) -> None:
     """Write *text* to *path* via temp-in-dir + os.replace (safe_io.py's pattern).
 
+    The temp file comes from :func:`tempfile.mkstemp` — an OS-guaranteed
+    fresh, exclusively-created name — rather than a name derived only from
+    ``os.getpid()``. Two threads in the same process (e.g. a T6 optimization
+    loop evaluating candidates concurrently) pinning the same key at the same
+    time would otherwise share one ``<name>.<pid>.tmp`` path and could
+    clobber each other's in-flight write.
+
     A reader never observes a half-written file: either the old contents (if
     any) or the complete new contents, never a truncated partial write.
     """
-    tmp = path.with_name(f'{path.name}.{os.getpid()}.tmp')
+    fd, tmp_name = tempfile.mkstemp(suffix='.tmp', prefix=f'{path.name}.', dir=str(path.parent))
     try:
-        tmp.write_text(text, encoding='utf-8')
-        os.replace(tmp, path)
+        with os.fdopen(fd, 'w', encoding='utf-8') as f:
+            f.write(text)
+        os.replace(tmp_name, path)
     except BaseException:
-        tmp.unlink(missing_ok=True)
+        with contextlib.suppress(OSError):
+            os.unlink(tmp_name)
         raise
 
 
