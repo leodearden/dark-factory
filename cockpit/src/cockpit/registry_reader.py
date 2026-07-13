@@ -75,14 +75,18 @@ class SessionScanner:
 
     def __init__(self, root: Path | str | None = None) -> None:
         self._root = root
+        self._cache: dict[str, tuple[int, session_registry.SessionRecord]] = {}
 
     def scan(self) -> list[session_registry.SessionRecord]:
         """Return every readable SessionRecord under sessions_dir(root).
 
-        Mirrors scan_sessions' fail-soft iterdir + read_record loop exactly
-        (see its docstring): an absent sessions/ dir returns [], and a
-        corrupt or vanished record.json is logged and skipped rather than
-        aborting the scan of the remaining slugs.
+        Mirrors scan_sessions' fail-soft iterdir + read_record loop (see its
+        docstring): an absent sessions/ dir returns [], and a corrupt or
+        vanished record.json is logged and skipped rather than aborting the
+        scan of the remaining slugs. Additionally: a slug whose record.json
+        st_mtime_ns is unchanged since the last scan() call reuses the
+        cached SessionRecord instead of paying read_record's read_text() +
+        JSON parse again.
         """
         base = session_registry.sessions_dir(self._root)
         if not base.is_dir():
@@ -93,6 +97,12 @@ class SessionScanner:
             if not slug_dir.is_dir():
                 continue
             slug = slug_dir.name
+            record_path = session_registry.record_path_for_slug(slug, root=self._root)
+            mtime_ns = record_path.stat().st_mtime_ns
+            cached = self._cache.get(slug)
+            if cached is not None and cached[0] == mtime_ns:
+                records.append(cached[1])
+                continue
             try:
                 record = session_registry.read_record(slug, root=self._root)
             except (FileNotFoundError, session_registry.CorruptSessionRecord):
@@ -100,6 +110,7 @@ class SessionScanner:
                     'SessionScanner.scan: skipping unreadable record for %s', slug, exc_info=True
                 )
                 continue
+            self._cache[slug] = (mtime_ns, record)
             records.append(record)
         return records
 
