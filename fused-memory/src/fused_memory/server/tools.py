@@ -3086,15 +3086,20 @@ def create_mcp_server(
         metadata = inject_execution_class(metadata)
 
         # Premise-lint guard xi (task 2231/W5-xi): for recon-stage callers,
-        # reject a description OR prompt asserting a known-false premise
-        # about recon's control-plane mechanics (the 2083/2092/2093
-        # false-premise batch, e.g. "run_id persists across cycles") BEFORE
-        # the task is filed. Both fields are linted — `prompt` is this
-        # tool's primary AI-generation content field per its own docstring,
-        # so a false premise stated there (with a clean `description`)
+        # reject a description, prompt, title, or details asserting a
+        # known-false premise about recon's control-plane mechanics (the
+        # 2083/2092/2093 false-premise batch, e.g. "run_id persists across
+        # cycles") BEFORE the task is filed. All four free-text content
+        # fields are linted INDEPENDENTLY (never joined into one string —
+        # see premise_lint_guard.py's docstring for why) — `prompt` is this
+        # tool's primary AI-generation content field per its own docstring
+        # and `details` commonly carries substantial implementation prose,
+        # so a false premise stated in either (with a clean `description`)
         # must be caught too. Sourced from recon_self_model.premise_lint —
         # see premise_lint_guard.py.
-        _premise_err = premise_lint_error(description, agent_id, project_root, prompt=prompt)
+        _premise_err = premise_lint_error(
+            description, agent_id, project_root, prompt=prompt, title=title, details=details
+        )
         if _premise_err is not None:
             return _premise_err
 

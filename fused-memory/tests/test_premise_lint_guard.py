@@ -27,7 +27,17 @@ class TestPremiseLintErrorInvariantMatrix:
     def test_recon_stage_run_id_persistence_premise_rejects(self):
         """recon-stage agent_id + a description asserting run_id persists
         across cycles -> reject, naming the run_id_is_fresh_per_run
-        invariant and carrying the Violation detail."""
+        invariant and carrying the Violation detail.
+
+        NOTE (reviewer_comprehensive: false_positive_design): this
+        description is phrased as a "fix the bug where..." remediation
+        task. The guard intentionally does NOT exempt this framing — see
+        premise_lint_guard.py's "Known limitation: remediation framing is
+        not exempted" docstring section. Since the premise is false by
+        construction, a task claiming to fix it is restating the exact
+        confusion the guard exists to reject; this rejection is the
+        intended behavior, not a false-positive bug in the guard.
+        """
         result = premise_lint_error(
             'Fix the bug where run_id persists across cycles in the ledger.',
             'recon-stage-task_knowledge_sync',
@@ -154,3 +164,66 @@ class TestPremiseLintErrorInvariantMatrix:
         )
         assert result is not None
         assert 'markers_deleted_only_by_gc' in result['error']
+
+    def test_recon_stage_false_premise_in_details_only_rejects(self):
+        """A false premise stated ONLY in `details` (submit_task's own
+        docstring names this "Task details / implementation notes",
+        commonly carrying substantial mechanism prose for recon-authored
+        remediation tasks) is caught even when `description` and `prompt`
+        are both clean — `details` is linted on equal footing with the
+        other three free-text fields, closing the coverage gap where a
+        false premise could otherwise dodge the guard by choosing that
+        channel."""
+        result = premise_lint_error(
+            'Reconcile task 7 status against the knowledge graph.',
+            'recon-stage-task_knowledge_sync',
+            '/proj',
+            prompt='Reconcile task 7',
+            details='Implementation note: run_id persists across cycles in this subsystem.',
+        )
+        assert result is not None
+        assert result.get('error_type') == 'ValidationError'
+        assert 'run_id_is_fresh_per_run' in result['error']
+
+    def test_recon_stage_false_premise_in_title_only_rejects(self):
+        """A false premise stated ONLY in `title` is likewise caught."""
+        result = premise_lint_error(
+            'Reconcile task 7 status against the knowledge graph.',
+            'recon-stage-task_knowledge_sync',
+            '/proj',
+            prompt='Reconcile task 7',
+            title='Bug: run_id persists across cycles',
+        )
+        assert result is not None
+        assert result.get('error_type') == 'ValidationError'
+        assert 'run_id_is_fresh_per_run' in result['error']
+
+    def test_recon_stage_all_four_fields_clean_accepts(self):
+        """A clean description, prompt, title, AND details together ->
+        accept (None)."""
+        result = premise_lint_error(
+            'Reconcile task 7 status against the knowledge graph.',
+            'recon-stage-task_knowledge_sync',
+            '/proj',
+            prompt='Reconcile task 7',
+            title='Reconcile task 7',
+            details='No special implementation notes.',
+        )
+        assert result is None
+
+    def test_recon_stage_premise_split_across_fields_does_not_combine(self):
+        """A false premise assembled only by JOINING two clean fields must
+        NOT be flagged: each field is linted independently, so a match
+        cannot straddle the boundary between an otherwise-clean `prompt`
+        and an otherwise-clean `description`. Regression guard for the
+        false-positive risk in the prior join-then-lint implementation
+        (`f'{prompt}\\n{description}'`), where `prompt` ending "...the
+        run_id" and `description` beginning "persists across cycles..."
+        would spuriously combine into a match neither field makes alone."""
+        result = premise_lint_error(
+            'persists across cycles when read after a crash.',
+            'recon-stage-task_knowledge_sync',
+            '/proj',
+            prompt='Investigate why the ledger references the run_id',
+        )
+        assert result is None

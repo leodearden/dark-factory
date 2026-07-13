@@ -394,6 +394,67 @@ class TestSubmitTaskPremiseLintGuard:
         mock_task_interceptor.submit_task.assert_not_called()
 
     @pytest.mark.asyncio
+    async def test_submit_task_recon_stage_false_premise_in_details_rejected(self, monkeypatch):
+        """A recon-stage submit_task whose `details` (not `description` or
+        `prompt`) asserts a known-false premise is rejected before the
+        interceptor is reached. `details` is submit_task's own
+        docstring-named "Task details / implementation notes" field, which
+        recon-authored remediation tasks commonly use to carry substantial
+        mechanism prose — linting only description/prompt would leave this
+        channel unchecked (reviewer_comprehensive: robustness_coverage_gap)."""
+        monkeypatch.setattr(
+            'fused_memory.server.tools.resolve_main_checkout', lambda p: str(p),
+        )
+        mock_service = AsyncMock()
+        mock_task_interceptor = AsyncMock()
+        server = create_mcp_server(mock_service, task_interceptor=mock_task_interceptor)
+
+        result = await server._tool_manager.call_tool(
+            'submit_task',
+            {
+                'project_root': '/project',
+                'prompt': 'Reconcile task 7',
+                'description': 'Reconcile task 7 status against the knowledge graph.',
+                'details': 'Implementation note: run_id persists across cycles in this subsystem.',
+                'agent_id': 'recon-stage-task_knowledge_sync',
+                'metadata': {'execution_class': 'code_tdd'},
+            },
+        )
+
+        parsed = _parse_tool_result(result)
+        assert parsed.get('error_type') == 'ValidationError', f'got {parsed!r}'
+        assert 'run_id_is_fresh_per_run' in parsed.get('error', ''), f'got {parsed!r}'
+        mock_task_interceptor.submit_task.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_submit_task_recon_stage_false_premise_in_title_rejected(self, monkeypatch):
+        """A recon-stage submit_task whose `title` asserts a known-false
+        premise is rejected before the interceptor is reached."""
+        monkeypatch.setattr(
+            'fused_memory.server.tools.resolve_main_checkout', lambda p: str(p),
+        )
+        mock_service = AsyncMock()
+        mock_task_interceptor = AsyncMock()
+        server = create_mcp_server(mock_service, task_interceptor=mock_task_interceptor)
+
+        result = await server._tool_manager.call_tool(
+            'submit_task',
+            {
+                'project_root': '/project',
+                'prompt': 'Reconcile task 7',
+                'title': 'Bug: run_id persists across cycles',
+                'description': 'Reconcile task 7 status against the knowledge graph.',
+                'agent_id': 'recon-stage-task_knowledge_sync',
+                'metadata': {'execution_class': 'code_tdd'},
+            },
+        )
+
+        parsed = _parse_tool_result(result)
+        assert parsed.get('error_type') == 'ValidationError', f'got {parsed!r}'
+        assert 'run_id_is_fresh_per_run' in parsed.get('error', ''), f'got {parsed!r}'
+        mock_task_interceptor.submit_task.assert_not_called()
+
+    @pytest.mark.asyncio
     async def test_submit_task_recon_stage_clean_description_accepted(self, monkeypatch):
         """A recon-stage submit_task with a clean description (no known
         false premise) is accepted and reaches the interceptor — premise-lint
