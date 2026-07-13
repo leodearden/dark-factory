@@ -36,6 +36,7 @@ from orchestrator.verify_categories import (
     FailureCategory,
     should_archive,
 )
+from orchestrator.verify_classify import classify_failure
 from orchestrator.verify_cmd import (
     ToolKind,
     cargo_scope,
@@ -731,10 +732,24 @@ def _serial_pytest_str(cmd: str | None) -> str | None:
     return render(rewritten)
 
 
+def _tool_for_cmd(cmd: str | None) -> ToolKind:
+    """Resolve *cmd*'s ``ToolKind`` for ``classify_failure`` dispatch (task δ).
+
+    ``None`` (the module doesn't define this check) resolves to
+    ``ToolKind.OPAQUE``. In practice this default is never actually consulted
+    by ``classify_failure``: every caller checks ``rc == 0`` before
+    classifying, and a ``None`` command's check is always skipped (rc stays
+    0) — so a failing check always has a real, non-``None`` command string.
+    """
+    if not cmd:
+        return ToolKind.OPAQUE
+    return parse_config_command(cmd).tool
+
+
 def _summarize_checks(
-    test_rc: int, test_out: str, test_timed_out: bool,
-    lint_rc: int, lint_out: str, lint_timed_out: bool,
-    type_rc: int, type_out: str, type_timed_out: bool,
+    test_rc: int, test_out: str, test_timed_out: bool, test_cmd: str | None,
+    lint_rc: int, lint_out: str, lint_timed_out: bool, lint_cmd: str | None,
+    type_rc: int, type_out: str, type_timed_out: bool, type_cmd: str | None,
 ) -> tuple[bool, str, str, str]:
     """Classify the three check results into (passed, category, cause_hint, summary).
 
@@ -743,6 +758,14 @@ def _summarize_checks(
     logic — worst-category selection via ``_worst_category`` plus cause-hint
     and summary-parts assembly — lives in exactly one place instead of being
     duplicated per call site.
+
+    Each check's config command (``test_cmd``/``lint_cmd``/``type_cmd`` — the
+    ungoverned, un-scoped command string, already in scope at both
+    ``run_verification`` call sites) is resolved to a ``ToolKind`` via
+    ``_tool_for_cmd`` and threaded into ``classify_failure`` (PRD task δ,
+    Invariant C1): a tool-T pattern can only ever match tool-T output, so a
+    cargo token embedded in pytest's own captured output (or vice versa) can
+    no longer swallow the wrong check's failure line.
 
     Does NOT compute the ``timed_out`` bookkeeping flag (pure-timeout-retry
     eligibility / consistency) — that stays with the caller, which alone
@@ -755,17 +778,17 @@ def _summarize_checks(
         return True, 'passed', '', 'All checks passed'
 
     hint_parts = []
-    per_check_categories = []
-    for rc, out, to in (
-        (test_rc, test_out, test_timed_out),
-        (lint_rc, lint_out, lint_timed_out),
-        (type_rc, type_out, type_timed_out),
+    per_check_categories: list[str] = []
+    for rc, out, to, cmd in (
+        (test_rc, test_out, test_timed_out, test_cmd),
+        (lint_rc, lint_out, lint_timed_out, lint_cmd),
+        (type_rc, type_out, type_timed_out, type_cmd),
     ):
         if rc != 0:
             h = _extract_cause_hint(out)
             if h:
                 hint_parts.append(h)
-            per_check_categories.append(_classify_failure(out, rc, to))
+            per_check_categories.append(classify_failure(_tool_for_cmd(cmd), rc, out, to))
     cause_hint = ' | '.join(hint_parts)
     category = _worst_category(per_check_categories) if per_check_categories else 'unknown_test_failure'
 
@@ -3160,9 +3183,9 @@ async def run_verification(
     # Build summary/category/cause_hint (shared with the env-recovery retry
     # below via _summarize_checks — see task 2048 code_duplication fix).
     passed, category, cause_hint, summary = _summarize_checks(
-        test_rc, test_out, test_timed_out,
-        lint_rc, lint_out, lint_timed_out,
-        type_rc, type_out, type_timed_out,
+        test_rc, test_out, test_timed_out, test_cmd,
+        lint_rc, lint_out, lint_timed_out, lint_cmd,
+        type_rc, type_out, type_timed_out, type_cmd,
     )
     if timed_out:
         summary = f'Verification timed out after {max_retries} retries' if max_retries > 0 else 'Verification timed out'
@@ -3214,9 +3237,9 @@ async def run_verification(
         timed_out = (not passed) and pure_timeout_failure
 
         passed, category, cause_hint, summary = _summarize_checks(
-            test_rc, test_out, test_timed_out,
-            lint_rc, lint_out, lint_timed_out,
-            type_rc, type_out, type_timed_out,
+            test_rc, test_out, test_timed_out, test_cmd,
+            lint_rc, lint_out, lint_timed_out, lint_cmd,
+            type_rc, type_out, type_timed_out, type_cmd,
         )
         if timed_out:
             # Distinct wording from the first-pass timeout summary: this
