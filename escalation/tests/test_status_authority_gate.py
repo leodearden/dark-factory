@@ -46,22 +46,14 @@ from shared.task_statuses import TaskStatus
 from shared.task_transitions import ActorClass, is_legal_transition
 
 from escalation.action_effects import ACTION_EFFECTS, ANY, TaskEffect, effect_for
-from escalation.authority import PROMOTE_ALLOWED, ROLE_LEVEL_ALLOWLIST
+
+# PROMOTE_ALLOWED/ROLE_LEVEL_ALLOWLIST are the C2-C4 authority tables under
+# test, but the tests below drive them indirectly over HTTP (by identity
+# string) rather than referencing the tables directly.
+from escalation.authority import PROMOTE_ALLOWED, ROLE_LEVEL_ALLOWLIST  # noqa: F401
 from escalation.models import Escalation
 from escalation.queue import EscalationQueue
 from escalation.server import create_server
-
-__all__ = [
-    'ACTION_EFFECTS',
-    'ANY',
-    'PROMOTE_ALLOWED',
-    'ROLE_LEVEL_ALLOWLIST',
-    'ActorClass',
-    'TaskEffect',
-    'TaskStatus',
-    'effect_for',
-    'is_legal_transition',
-]
 
 # ---------------------------------------------------------------------------
 # In-process (header-less) drive harness — B5, B3-server, D1.
@@ -124,6 +116,13 @@ def http_server(
     ``X-Escalation-Levels``/``X-Escalation-Identity`` via
     ``get_http_headers()`` — an in-process ``tool.fn(...)`` call always sees
     ``{}``, which would make the C1-C4 capability-guard cells untestable.
+
+    Module-scoped: every C1-C4 test shares this ONE ``EscalationQueue``.
+    Isolation contract — each test MUST seed its escalation(s) under a
+    unique ``task_id`` (the existing ``zeta-c1-*``/``zeta-c2-*``/... prefixes
+    below); do not reuse a ``task_id`` across tests or depend on
+    ``make_id`` sequencing, or tests can silently interfere via shared
+    queue state.
     """
     queue_dir = tmp_path_factory.mktemp('status_authority_gate_http')
     queue = EscalationQueue(queue_dir)
