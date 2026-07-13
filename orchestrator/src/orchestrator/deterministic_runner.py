@@ -1545,19 +1545,23 @@ class DeterministicRunner:
                         detail=baseline_detail,
                     )
 
-                # Run the deploy script to completion (blocking, cross-unit).
-                # Task 2090 Layer B: wrap the call in an outer wall-clock guard
-                # that is UNCONDITIONAL — it does not depend on run_fn (or the
-                # subprocess it spawns) ever dying.  Layer A hardens the
-                # DEFAULT script_runner's own timeout handling, but an
-                # injected/custom seam could still hang forever or raise
-                # something unexpected; either way run() must reach
-                # _file_infra_issue_and_block rather than stranding the task
-                # with before_done_ran_at stamped and zero escalations filed
-                # (the exact task-2087 evidence).  The outer bound is strictly
-                # greater than before_done['timeout_secs'] so a well-behaved
-                # seam always flows through the rc!=0 path below first — this
-                # is a pure backstop, not a replacement for it.
+                # Run the deploy script + fresh-PID verify by delegating to
+                # proc_supervision.RestartPlan.execute() (task 2238/δ, RP-2/
+                # RP-5) instead of an inline run-then-reinspect block.  The
+                # runner still owns: the pre-flight baseline above, the outer
+                # wall-clock guard below (task 2090 Layer B — now bounding the
+                # WHOLE execute() call, run + verify, rather than only the
+                # run), and the disposition -> outcome mapping.
+                # proc_supervision owns the RP-2 blocking-run/RP-5 fresh-PID-
+                # verify mechanics.
+                #
+                # The subprocess RUN itself is routed through the runner's own
+                # task-2090-hardened script_runner/_default_run_script seam
+                # via a create_subprocess_exec-compatible SHIM below — NOT
+                # through execute()'s own bare (untimed, non-process-group-
+                # aware) spawn — so Layer A (process-group kill of leaked
+                # grandchildren) and the (before_done)->(rc, tail) seam
+                # contract are both preserved.
                 run_fn = self._script_runner or self._default_run_script
                 outer_timeout = before_done.get('timeout_secs', 60) + self._run_timeout_grace_secs
 
@@ -1580,8 +1584,66 @@ class DeterministicRunner:
                             f'outer guard): {exc!r}'
                         ) from exc
 
+                class _RunFnProcShim:
+                    """Adapts a (rc, tail) pair from run_fn into a
+                    create_subprocess_exec-compatible object for
+                    RestartPlan._execute_cross_unit_blocking's injectable
+                    `runner` seam (exposes .returncode + async communicate())."""
+
+                    def __init__(self, rc: int, tail: str) -> None:
+                        self.returncode = rc
+                        self._tail = tail
+
+                    async def communicate(self) -> tuple[bytes, None]:
+                        return self._tail.encode(errors='replace'), None
+
+                async def _shim_runner(*_args, **_kwargs):
+                    rc, tail = await _invoke_run_fn()
+                    return _RunFnProcShim(rc, tail)
+
+                # RestartOutcome carries only disposition/escalated/detail —
+                # not the verified MainPID/timestamp _writeback_deploy_success
+                # needs for done_provenance.  This wrapper stashes execute()'s
+                # single post-deploy re-inspect (via the SAME inspect_fn used
+                # for the baseline above) so the fresh unit state survives
+                # past plan.execute() without a second, wasteful/racy inspect.
+                captured: dict = {}
+
+                async def _capturing_inspector(unit: str, **_kwargs) -> dict:
+                    state = await inspect_fn(unit)
+                    captured['new_state'] = state
+                    return state
+
+                verify = FreshPidVerify(
+                    baseline_active_enter_monotonic=baseline.get(
+                        'ActiveEnterTimestampMonotonic', 0,
+                    ),
+                    baseline_main_pid=baseline.get('MainPID', 0),
+                    inspect_timeout_secs=self._inspect_timeout_secs,
+                )
+                plan = RestartPlan(
+                    script=Path(before_done['script']),
+                    args=list(before_done.get('args') or []),
+                    cwd=Path(before_done.get('cwd') or os.getcwd()).resolve(),
+                    target_unit=target_unit,
+                    # own_unit must be truthy and provably non-self here (this
+                    # branch is only reached when the runner's OWN self_target
+                    # check above already ruled out self-target), so
+                    # RestartPlan.execute() takes the RP-2 cross-unit-blocking
+                    # path — never RP-1's fail-closed refuse — even when
+                    # ORCH_UNIT is unset (own_unit == ''), preserving the
+                    # existing fail-open-to-cross-unit behaviour.
+                    own_unit=own_unit or _CROSS_UNIT_OWN_UNIT_SENTINEL,
+                    on_failure_escalation=None,
+                    verify=verify,
+                    transient_unit=None,
+                )
+
                 try:
-                    rc, out = await asyncio.wait_for(_invoke_run_fn(), timeout=outer_timeout)
+                    outcome = await asyncio.wait_for(
+                        plan.execute(runner=_shim_runner, inspector=_capturing_inspector),
+                        timeout=outer_timeout,
+                    )
                 except TimeoutError:
                     timeout_detail = '\n'.join([
                         description,
@@ -1610,13 +1672,12 @@ class DeterministicRunner:
                         detail=error_detail,
                     )
 
-                if rc != 0:
+                if outcome.disposition == RestartDisposition.RESTART_FAILED:
                     # B7a: script failed — file infra_issue escalation, set blocked (B7a)
                     deploy_detail = '\n'.join([
                         description,
                         f'Target unit: {target_unit}',
-                        f'Script exit code: rc={rc}',
-                        f'Output:\n{out}',
+                        outcome.detail,
                     ])
                     return await self._file_infra_issue_and_block(
                         task_id,
@@ -1624,35 +1685,38 @@ class DeterministicRunner:
                         detail=deploy_detail,
                     )
 
-                # Re-inspect to verify a fresh MainPID + strictly-later monotonic timestamp
-                new_state = await inspect_fn(target_unit)
-                pid: int = new_state.get('MainPID', 0)
-                new_monotonic: int = new_state.get('ActiveEnterTimestampMonotonic', 0)
-                baseline_monotonic: int = baseline.get('ActiveEnterTimestampMonotonic', 0)
-                fresh: bool = (
-                    isinstance(pid, int)
-                    and pid > 0
-                    and new_monotonic > baseline_monotonic
-                )
-
-                if not fresh:
+                if outcome.disposition == RestartDisposition.VERIFY_FAILED:
                     # B7b: verify failed — file infra_issue escalation, set blocked
                     verify_detail = '\n'.join([
                         description,
                         f'Target unit: {target_unit}',
-                        (
-                            f'Verify failed: new MainPID={pid!r} '
-                            f'new_monotonic={new_monotonic} '
-                            f'baseline_monotonic={baseline_monotonic}'
-                        ),
-                        'Expected a fresh non-sentinel MainPID (>0) and a strictly-later '
-                        'ActiveEnterTimestampMonotonic after the deploy.',
+                        outcome.detail,
                     ])
                     return await self._file_infra_issue_and_block(
                         task_id,
                         summary=f'Deploy verify failed: {target_unit}',
                         detail=verify_detail,
                     )
+
+                if outcome.disposition != RestartDisposition.DEPLOYED_AND_VERIFIED:
+                    # Defensive: REFUSED is structurally unreachable from this
+                    # call site (own_unit is always forced truthy+non-self
+                    # above, so RP-1 never refuses here) — never silently
+                    # swallow an unexpected disposition rather than surfacing
+                    # it as an infra_issue.
+                    refused_detail = '\n'.join([
+                        description,
+                        f'Target unit: {target_unit}',
+                        f'Unexpected RestartPlan disposition: {outcome.disposition!r}',
+                        outcome.detail,
+                    ])
+                    return await self._file_infra_issue_and_block(
+                        task_id,
+                        summary=f'Deploy refused unexpectedly: {target_unit}',
+                        detail=refused_detail,
+                    )
+
+                new_state = captured.get('new_state', {})
 
                 if not always_escalates:
                     # Pure cross-unit deploy (B6): verified → set done with provenance.
