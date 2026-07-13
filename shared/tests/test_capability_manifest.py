@@ -13,7 +13,10 @@ convention (see plans/capability-delivered-checks-prd.md §Contract):
 
 from __future__ import annotations
 
+from pathlib import Path
+
 import pytest
+import yaml
 from pydantic import ValidationError
 
 from shared.capability_manifest import (
@@ -21,6 +24,8 @@ from shared.capability_manifest import (
     DeliveredCheck,
     ManifestCapability,
     ManifestTask,
+    load_capability_manifest,
+    parse_capability_manifest,
 )
 
 
@@ -296,3 +301,109 @@ class TestCapabilityManifestDoc:
                 tasks=[_task_dict('α')],
                 typo='x',
             )  # type: ignore[call-arg]
+
+
+class TestLoader:
+    _VALID_YAML = """\
+prd: plans/example-prd.md
+schema_version: 1
+tasks:
+  - label: "α"
+    task_id: 1
+    title: "Example task"
+    capabilities:
+      - name: "cap-one"
+        binding: "capability→producer (wired)"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "foo"
+          expect: present
+"""
+
+    _MALFORMED_YAML_DUP_LABEL = """\
+prd: plans/example-prd.md
+schema_version: 1
+tasks:
+  - label: "α"
+    capabilities: []
+  - label: "α"
+    capabilities: []
+"""
+
+    def test_parse_capability_manifest_from_dict(self):
+        data = {
+            'prd': 'plans/example-prd.md',
+            'schema_version': 1,
+            'tasks': [_task_dict('α')],
+        }
+        doc = parse_capability_manifest(data)
+        assert isinstance(doc, CapabilityManifestDoc)
+        assert doc.tasks[0].label == 'α'
+
+    def test_load_valid_sidecar_round_trips(self, tmp_path):
+        sidecar = tmp_path / 'example-prd.capability-manifest.yaml'
+        sidecar.write_text(self._VALID_YAML)
+        doc = load_capability_manifest(sidecar)
+        assert isinstance(doc, CapabilityManifestDoc)
+        assert doc.prd == 'plans/example-prd.md'
+        assert doc.schema_version == 1
+        assert len(doc.tasks) == 1
+        task = doc.tasks[0]
+        assert task.label == 'α'
+        assert task.task_id == 1
+        cap = task.capabilities[0]
+        assert cap.name == 'cap-one'
+        assert isinstance(cap.delivered_check, DeliveredCheck)
+        assert cap.delivered_check.kind == 'grep'
+        assert cap.delivered_check.pattern == 'foo'
+
+    def test_load_capability_manifest_accepts_str_path(self, tmp_path):
+        sidecar = tmp_path / 'example-prd.capability-manifest.yaml'
+        sidecar.write_text(self._VALID_YAML)
+        doc = load_capability_manifest(str(sidecar))
+        assert doc.prd == 'plans/example-prd.md'
+
+    def test_malformed_duplicate_label_raises_naming_the_entry(self, tmp_path):
+        sidecar = tmp_path / 'bad.capability-manifest.yaml'
+        sidecar.write_text(self._MALFORMED_YAML_DUP_LABEL)
+        with pytest.raises(ValidationError) as exc_info:
+            load_capability_manifest(sidecar)
+        assert 'α' in str(exc_info.value)
+
+    def test_missing_file_raises(self, tmp_path):
+        with pytest.raises(FileNotFoundError):
+            load_capability_manifest(tmp_path / 'does-not-exist.yaml')
+
+    def test_malformed_yaml_syntax_raises(self, tmp_path):
+        sidecar = tmp_path / 'bad-syntax.capability-manifest.yaml'
+        sidecar.write_text('prd: [unterminated')
+        with pytest.raises(yaml.YAMLError):
+            load_capability_manifest(sidecar)
+
+    def test_committed_exemplar_sidecar_validates(self):
+        # CI fixture: this PRD's own committed exemplar sidecar (PRD
+        # §Contract signal for task α — "this PRD's own committed exemplar
+        # sidecar parses and validates in a CI test").
+        repo_root = Path(__file__).resolve().parents[2]
+        sidecar_path = (
+            repo_root / 'plans' / 'capability-delivered-checks-prd.capability-manifest.yaml'
+        )
+        doc = load_capability_manifest(sidecar_path)
+        assert doc.prd == 'plans/capability-delivered-checks-prd.md'
+        assert doc.schema_version == 1
+        labels = [task.label for task in doc.tasks]
+        assert labels == ['α', 'β', 'γ', 'δ', 'ε', 'ζ']
+        alpha = doc.tasks[0]
+        assert alpha.task_id == 2574
+        first_cap = alpha.capabilities[0]
+        assert first_cap.delivered_check is not None
+        assert first_cap.delivered_check.kind == 'grep'
+        assert first_cap.delivered_check.expect == 'present'
+        manual_caps = [
+            cap
+            for cap in alpha.capabilities
+            if cap.delivered_check is not None and cap.delivered_check.kind == 'manual'
+        ]
+        assert len(manual_caps) == 1
+        assert manual_caps[0].delivered_check.reason
