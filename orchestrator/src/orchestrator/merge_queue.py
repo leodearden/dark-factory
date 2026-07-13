@@ -700,6 +700,39 @@ def _main_health_fingerprint(category: str, cause_hint: str, probe_sha: str) -> 
         return ''
 
 
+def _build_main_health_outcome(verify: VerifyResult, probe_sha: str) -> MergeOutcome:
+    """Build the main-health-red ``MergeOutcome`` for a confirmed pre-existing break.
+
+    Pure function — no I/O, no side effects, no event emission.  Extracted
+    (task 2564) from :func:`_classify_main_health_red` so the reason /
+    fingerprint / ``failure_category`` / ``failure_cause_hint`` composition is
+    shared verbatim between the synchronous probe path
+    (``_classify_main_health_red``) and the deferred off-critical-path probe
+    (``_run_deferred_main_health_probe``) — the two can never diverge.
+
+    *probe_sha* is the bare-main SHA the probe actually tested against (fed
+    into the dedupe fingerprint so concurrent failing merges against the same
+    main HEAD fold to one escalation parent).
+    """
+    detail = verify.failure_report()
+    suffix = (verify.cause_hint or verify.summary or '')[:160]
+    reason = (
+        f'{MAIN_HEALTH_RED_REASON_PREFIX} '
+        f'(category={verify.category!r}): {suffix}'
+    )
+    if detail:
+        reason = f'{reason}\n\n{detail}'
+    return MergeOutcome(
+        'blocked',
+        reason=reason,
+        failure_category=verify.category,
+        failure_cause_hint=verify.cause_hint,
+        dedupe_fingerprint=_main_health_fingerprint(
+            verify.category or '', verify.cause_hint, probe_sha,
+        ),
+    )
+
+
 async def _classify_main_health_red(
     git_ops: GitOps,
     req: MergeRequest,
@@ -743,23 +776,7 @@ async def _classify_main_health_red(
         return None
     if not is_preexisting:
         return None
-    detail = verify.failure_report()
-    suffix = (verify.cause_hint or verify.summary or '')[:160]
-    reason = (
-        f'{MAIN_HEALTH_RED_REASON_PREFIX} '
-        f'(category={verify.category!r}): {suffix}'
-    )
-    if detail:
-        reason = f'{reason}\n\n{detail}'
-    outcome = MergeOutcome(
-        'blocked',
-        reason=reason,
-        failure_category=verify.category,
-        failure_cause_hint=verify.cause_hint,
-        dedupe_fingerprint=_main_health_fingerprint(
-            verify.category or '', verify.cause_hint, probe_sha,
-        ),
-    )
+    outcome = _build_main_health_outcome(verify, probe_sha)
     _emit_merge_attempt(event_store, req.task_id, OutcomeKind.main_health_red)
     return outcome
 
