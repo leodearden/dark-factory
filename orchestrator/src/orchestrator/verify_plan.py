@@ -487,11 +487,28 @@ def _derive_fallback_runs(
                 '"no tests ran" (task 1852)',
             ))
     elif collectable_tests:
-        test_cmd = scope_to(parse_config_command(test_command or 'pytest'), collectable_tests)
-        runs.append(PlannedRun(
-            _FALLBACK_PREFIX, test_cmd, ScopeKind.FILE_SCOPED,
-            'pytest: file-scoped to touched test file(s)',
-        ))
+        if has_real_suite:
+            # Fidelity fix (task γ review, correctness finding): mirrors
+            # _build_fallback_config's `config.test_command != 'pytest'`
+            # branch, which returns the configured suite VERBATIM (unscoped)
+            # whenever ANY trigger is present — collectable tests alone
+            # included, not just conftest/test-data. Recording FILE_SCOPED
+            # here (as the else branch below does for the bare-default case)
+            # would misrepresent what actually executes: a real configured
+            # suite is never file-scoped by _build_fallback_config, only
+            # ever run verbatim or skipped entirely.
+            test_cmd = parse_config_command(test_command)
+            runs.append(PlannedRun(
+                _FALLBACK_PREFIX, test_cmd, ScopeKind.FULL_SUITE,
+                'pytest: configured suite runs verbatim for touched test file(s) '
+                '(non-default test_command is never file-scoped)',
+            ))
+        else:
+            test_cmd = scope_to(parse_config_command(test_command or 'pytest'), collectable_tests)
+            runs.append(PlannedRun(
+                _FALLBACK_PREFIX, test_cmd, ScopeKind.FILE_SCOPED,
+                'pytest: file-scoped to touched test file(s)',
+            ))
     else:
         runs.append(PlannedRun(
             _FALLBACK_PREFIX, None, ScopeKind.SKIPPED,
