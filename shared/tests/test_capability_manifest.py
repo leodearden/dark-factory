@@ -16,7 +16,21 @@ from __future__ import annotations
 import pytest
 from pydantic import ValidationError
 
-from shared.capability_manifest import DeliveredCheck, ManifestCapability, ManifestTask
+from shared.capability_manifest import (
+    CapabilityManifestDoc,
+    DeliveredCheck,
+    ManifestCapability,
+    ManifestTask,
+)
+
+
+def _task_dict(label='α', **overrides):
+    payload = {
+        'label': label,
+        'capabilities': [{'name': 'c', 'binding': 'b', 'verdict': 'PASS'}],
+    }
+    payload.update(overrides)
+    return payload
 
 
 class TestDeliveredCheck:
@@ -230,3 +244,55 @@ class TestManifestTask:
     def test_unknown_field_rejected(self):
         with pytest.raises(ValidationError):
             ManifestTask(label='α', capabilities=[], typo='x')  # type: ignore[call-arg]
+
+
+class TestCapabilityManifestDoc:
+    def test_constructs_with_valid_tasks(self):
+        doc = CapabilityManifestDoc(
+            prd='plans/example-prd.md',
+            schema_version=1,
+            tasks=[_task_dict('α'), _task_dict('β')],
+        )
+        assert doc.prd == 'plans/example-prd.md'
+        assert doc.schema_version == 1
+        assert len(doc.tasks) == 2
+        assert isinstance(doc.tasks[0], ManifestTask)
+        assert isinstance(doc.tasks[0].capabilities[0], ManifestCapability)
+
+    def test_empty_tasks_list_ok(self):
+        doc = CapabilityManifestDoc(prd='plans/example-prd.md', schema_version=1, tasks=[])
+        assert doc.tasks == []
+
+    def test_duplicate_label_rejected_names_the_label(self):
+        with pytest.raises(ValidationError) as exc_info:
+            CapabilityManifestDoc(
+                prd='plans/example-prd.md',
+                schema_version=1,
+                tasks=[_task_dict('α'), _task_dict('α')],
+            )
+        assert 'α' in str(exc_info.value)
+
+    def test_empty_label_rejected(self):
+        with pytest.raises(ValidationError):
+            CapabilityManifestDoc(
+                prd='plans/example-prd.md',
+                schema_version=1,
+                tasks=[_task_dict('')],
+            )
+
+    def test_schema_version_not_one_rejected(self):
+        with pytest.raises(ValidationError):
+            CapabilityManifestDoc(
+                prd='plans/example-prd.md',
+                schema_version=2,
+                tasks=[_task_dict('α')],
+            )
+
+    def test_unknown_top_level_field_rejected(self):
+        with pytest.raises(ValidationError):
+            CapabilityManifestDoc(
+                prd='plans/example-prd.md',
+                schema_version=1,
+                tasks=[_task_dict('α')],
+                typo='x',
+            )  # type: ignore[call-arg]
