@@ -32,6 +32,25 @@ Phase γ adds the **before_done blocking cross-unit deploy** path
        (infra_issue, blocked); never phantom-done, never re-run (I1).
 
 2. **before_done execution** (γ: ``before_done`` is not None):
+   **Stop-instruction guard** (task 2509, reconciliation finding 0aac21b4):
+   on the FIRST dispatch of a non-predicate ``before_done`` task — after the
+   predicate dispatch below and after the ``before_done_ran_at`` idempotency
+   block above, but BEFORE the ``before_done_ran_at`` stamp is written —
+   ``orchestrator.stop_instruction.detect_stop_instruction`` scans the task
+   description for an explicit stop instruction (e.g. "do not apply").  If
+   found: file a born-at-L2 ``stop_instruction`` escalation and block WITHOUT
+   running the deploy and WITHOUT stamping ``before_done_ran_at``.  Unlike
+   the other escalations in this section, ``gate_escalated_at`` is
+   deliberately NOT stamped — this is a re-checkable HALT (mirrors task
+   2273's SIGTERM-kill on its human-rehearsal mandate as a self-halt rather
+   than an external kill), not a resolve-to-done gate: removing the stop
+   instruction from the description lets a later dispatch proceed normally,
+   and there is no auto-resolve path that could silently bypass the halt.
+   Excludes predicates (read-only, apply nothing — see the predicate
+   sub-path below) and excludes every resume/idempotency branch above (those
+   already have ``before_done_ran_at`` or ``gate_escalated_at`` set, so they
+   never reach this first-dispatch check).
+
    The ``before_done_ran_at`` stamp is written FIRST (crash-safe I1) and is
    SHARED between the self-target (ε) and cross-unit sub-paths below.
 
@@ -163,6 +182,7 @@ from typing import TYPE_CHECKING
 from shared.task_metadata import DoneProvenance
 
 from orchestrator import systemd_inspect
+from orchestrator.stop_instruction import detect_stop_instruction
 from orchestrator.systemd_inspect import inspect_systemd_unit
 from orchestrator.workflow import WorkflowOutcome
 
@@ -651,6 +671,73 @@ class DeterministicRunner:
             logger.warning(
                 'DeterministicRunner: task %s blocked-status writeback failed '
                 '(connection may still be severed): %s: %s — the infra_issue '
+                'escalation is already durable on local disk, so returning '
+                'BLOCKED regardless',
+                task_id, type(exc).__name__, exc,
+            )
+        return WorkflowOutcome.BLOCKED
+
+    async def _file_stop_instruction_and_block(
+        self,
+        task_id: str,
+        summary: str,
+        detail: str,
+    ) -> WorkflowOutcome:
+        """File a born-at-L2 stop_instruction escalation and set the task to blocked.
+
+        Task 2509 (reconciliation finding 0aac21b4): mirrors
+        ``_file_infra_issue_and_block``'s dedup guard, escalation construction,
+        and best-effort blocked-status writeback, but uses ``category=
+        'stop_instruction'`` so the halt is distinguishable from an infra
+        fault — and, critically, does NOT stamp ``metadata.gate_escalated_at``.
+        This is a re-checkable HALT, not a resolve-to-done gate: leaving
+        ``gate_escalated_at`` unset means a human who edits the description to
+        remove the stop instruction (rather than resolving the escalation)
+        lets the next dispatch re-evaluate from scratch and proceed normally,
+        with no auto-resolve path that could silently bypass the halt.
+
+        Returns:
+            WorkflowOutcome.BLOCKED
+        """
+        from escalation.models import Escalation
+
+        existing_pending = self.escalation_queue.get_by_task(
+            task_id, status='pending', agent_role=DETERMINISTIC_AGENT_ROLE,
+        )
+        if existing_pending:
+            logger.info(
+                'DeterministicRunner: task %s already has %d pending escalation(s) — '
+                'skipping re-file (stop_instruction dedup guard)',
+                task_id, len(existing_pending),
+            )
+        else:
+            esc = Escalation(
+                id=self.escalation_queue.make_id(task_id),
+                task_id=task_id,
+                agent_role=DETERMINISTIC_AGENT_ROLE,
+                severity='critical',
+                category='stop_instruction',
+                summary=summary[:200],
+                detail=detail,
+                level=2,
+            )
+            self.escalation_queue.submit(esc)
+            logger.info(
+                'DeterministicRunner: filed L2 stop_instruction escalation %s for task %s',
+                esc.id, task_id,
+            )
+
+        try:
+            await self.scheduler.set_task_status(task_id, 'blocked')
+            logger.info('DeterministicRunner: task %s blocked — stop_instruction', task_id)
+        except Exception as exc:
+            # Same rationale as _file_infra_issue_and_block: a still-severed
+            # connection must not turn this into a propagated exception — the
+            # escalation is already durable on local disk, so return BLOCKED
+            # regardless.
+            logger.warning(
+                'DeterministicRunner: task %s blocked-status writeback failed '
+                '(connection may still be severed): %s: %s — the stop_instruction '
                 'escalation is already durable on local disk, so returning '
                 'BLOCKED regardless',
                 task_id, type(exc).__name__, exc,
@@ -1364,6 +1451,34 @@ class DeterministicRunner:
                     task_id,
                     summary=f'Deploy state unknown after crash: {target_unit}',
                     detail=crash_detail,
+                )
+
+            # ── Stop-instruction guard (task 2509) ───────────────────────────
+            # First dispatch of a non-predicate before_done task (reached here
+            # only when before_done_ran_at was falsy above — a resume/idempotency
+            # dispatch never reaches this point).  Scan the task description for
+            # an explicit stop instruction BEFORE running the deploy and BEFORE
+            # stamping before_done_ran_at — a stop instruction is the
+            # highest-authority human directive and must never be self-
+            # authorized around (task 2407's autonomous /unblock session did
+            # exactly that; task 2273's SIGTERM-killed sibling session is the
+            # "what right looks like" precedent this guard makes a self-halt
+            # rather than relying on an external kill).
+            stop_phrase = detect_stop_instruction(description)
+            if stop_phrase:
+                stop_detail = '\n'.join([
+                    description,
+                    f'Target unit: {target_unit}',
+                    f'Explicit stop instruction detected: {stop_phrase!r}.',
+                    'The deploy was NOT run and before_done_ran_at was NOT '
+                    'stamped.  A human must clear the stop instruction from the '
+                    'task description (to let the next dispatch proceed) or '
+                    'cancel the task.',
+                ])
+                return await self._file_stop_instruction_and_block(
+                    task_id,
+                    summary=f'Explicit stop instruction — deploy withheld: {target_unit}',
+                    detail=stop_detail,
                 )
 
             # Stamp before_done_ran_at FIRST (crash-safe I1: stamp-before-run means a
