@@ -9,7 +9,7 @@ _make_record convention: a fields dict + .update(overrides).
 
 from __future__ import annotations
 
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
 from typing import cast
 
@@ -88,6 +88,16 @@ class TestScoringAdapters:
         assert item.severity == ''
         assert item.category == ''
         assert item.filed_at == datetime(2026, 7, 1, tzinfo=UTC)
+
+    def test_decision_to_scoring_item_threads_severity(self):
+        """A DecisionRecord's real severity flows into ScoringItem.severity (not '')."""
+        from cockpit.panes.decision_queue import decision_to_scoring_item
+
+        decision = _make_decision(severity='critical')
+
+        item = decision_to_scoring_item(decision, now=_NOW)
+
+        assert item.severity == 'critical'
 
     def test_decision_to_scoring_item_state_copied_through_for_non_open(self):
         """state is copied through verbatim -- order_queue is what filters to 'open'."""
@@ -407,6 +417,55 @@ class TestOrderQueue:
         items = order_queue([decision], [], Priorities.default(), _NOW, handling={'decision:dec-1'})
 
         assert items[0].handling is True
+
+    def test_fresh_critical_decision_outranks_week_old_content_less_session(self):
+        """USER-OBSERVABLE SIGNAL (F7): a freshly-filed critical ask ranks at
+        the top of the queue -- a week-old idle awaiting-input session (no
+        question, so content-less) must not outrank it on age alone."""
+        from cockpit.panes.decision_queue import order_queue
+        from cockpit.priority import Priorities
+
+        decision = _make_decision(
+            id='dec-critical',
+            severity='critical',
+            state=sr.DecisionState.OPEN,
+            filed_at=_NOW.isoformat(),
+        )
+        stale_session = _make_session(
+            session_slug='stale-1',
+            status=sr.Status.AWAITING_INPUT,
+            question=None,
+            start_ts=(_NOW - timedelta(days=8)).isoformat(),
+        )
+
+        items = order_queue([decision], [stale_session], Priorities.default(), _NOW)
+
+        assert items[0].kind == 'decision'
+        assert items[0].decision_id == 'dec-critical'
+
+    def test_fresh_blocking_decision_outranks_week_old_content_less_session(self):
+        """Same as above with severity='blocking' -- the realistic, non-critical
+        escalate_blocker default (fix 2) also outranks a stale content-less session."""
+        from cockpit.panes.decision_queue import order_queue
+        from cockpit.priority import Priorities
+
+        decision = _make_decision(
+            id='dec-blocking',
+            severity='blocking',
+            state=sr.DecisionState.OPEN,
+            filed_at=_NOW.isoformat(),
+        )
+        stale_session = _make_session(
+            session_slug='stale-1',
+            status=sr.Status.AWAITING_INPUT,
+            question=None,
+            start_ts=(_NOW - timedelta(days=8)).isoformat(),
+        )
+
+        items = order_queue([decision], [stale_session], Priorities.default(), _NOW)
+
+        assert items[0].kind == 'decision'
+        assert items[0].decision_id == 'dec-blocking'
 
 
 class TestKnownProjectRoots:
