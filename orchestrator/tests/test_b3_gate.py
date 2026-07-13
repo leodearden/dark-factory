@@ -97,12 +97,17 @@ def _make_agent_result(*, success=True, cost_usd=0.50, structured_output=None,
     return r
 
 
-def _seed_tasks_db(project_root: Path, task_id: int, proposals: list) -> None:
+def _seed_tasks_db(
+    project_root: Path, task_id: int, proposals: list, *, description: str = '',
+) -> None:
     """Seed a minimal tasks.db at <project_root>/.taskmaster/tasks/tasks.db.
 
-    Creates the table with columns: tag, id, status, priority, metadata, updated_at.
-    Inserts one row with tag='master', the given task_id, and the proposals list
-    serialised into metadata JSON as {'dry_run_proposals': proposals}.
+    Creates the table with columns: tag, id, status, priority, metadata,
+    updated_at, description. Inserts one row with tag='master', the given
+    task_id, and the proposals list serialised into metadata JSON as
+    {'dry_run_proposals': proposals}. `description` defaults to '' — every
+    pre-task-2509 call site omits it and gets the same empty-description row
+    as before (b3_gate._read_task_description treats '' as "no description").
     """
     db_dir = project_root / '.taskmaster' / 'tasks'
     db_dir.mkdir(parents=True, exist_ok=True)
@@ -116,14 +121,17 @@ def _seed_tasks_db(project_root: Path, task_id: int, proposals: list) -> None:
             priority TEXT,
             metadata TEXT,
             updated_at TEXT,
+            description TEXT,
             PRIMARY KEY (tag, id)
         )
     """)
     metadata = json.dumps({'dry_run_proposals': proposals})
     conn.execute(
-        "INSERT OR REPLACE INTO tasks (tag, id, status, priority, metadata, updated_at) "
-        "VALUES (?, ?, ?, ?, ?, ?)",
-        ('master', task_id, 'blocked', 'medium', metadata, '2026-06-04T00:00:00+00:00'),
+        "INSERT OR REPLACE INTO tasks "
+        "(tag, id, status, priority, metadata, updated_at, description) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?)",
+        ('master', task_id, 'blocked', 'medium', metadata,
+         '2026-06-04T00:00:00+00:00', description),
     )
     conn.commit()
     conn.close()
@@ -1516,3 +1524,91 @@ class TestCheckProposalBlockClass:
             run_git=_fake_git_fresh, now=self._NOW,
         )
         assert result['verdict'] == FRESH, f'expected FRESH, got {result}'
+
+
+# ---------------------------------------------------------------------------
+# step-5 (task 2509): run_check reads the task description and gates on it
+# ---------------------------------------------------------------------------
+
+class TestRunCheckStopInstruction:
+    """run_check must READ the task's description from tasks.db and forward
+    it to check_proposal as extra_texts — an explicit stop instruction in
+    the description hard-aborts even an otherwise-fresh low-risk proposal
+    (task 2509). Mirrors TestCLIMain._setup_repo_and_db's git-repo + seeded
+    tasks.db harness.
+    """
+
+    _NOW_ISO = '2026-06-04T12:00:00+00:00'
+
+    def _setup_repo_and_db(self, tmp_path, *, description):
+        """Create a git repo + seeded tasks.db with a fresh low-risk proposal
+        whose task row carries *description*. Returns (repo_path, project_root).
+        """
+        repo = tmp_path / 'repo'
+        repo.mkdir()
+        _init_git_repo(repo)
+        head_sha = _diverge_feature_branch(repo)
+        main_sha = subprocess.run(
+            ['git', '-C', str(repo), 'rev-parse', 'main'],
+            check=True, capture_output=True, text=True,
+        ).stdout.strip()
+
+        root = tmp_path / 'root'
+        root.mkdir()
+
+        entry = {
+            'proposal_text': 'Fix the bug',
+            'risk_label': 'low',
+            'files_referenced': [],
+            'block_reason': 'test blocked',
+            'investigated_at': '2026-06-04T10:00:00+00:00',
+            'head_sha': head_sha,
+            'main_sha': main_sha,
+        }
+        _seed_tasks_db(root, 42, [entry], description=description)
+        return repo, root
+
+    def test_stop_instruction_in_description_aborts(self, tmp_path, capsys):
+        """Case A: description contains 'do not apply' -> run_check prints
+        verdict=='abort' with a stop-instruction reason."""
+        from orchestrator.b3_gate import main
+        repo, root = self._setup_repo_and_db(
+            tmp_path, description='Investigate the failure, but do not apply any fix yet.',
+        )
+
+        rc = main([
+            'check',
+            '--task-id', '42',
+            '--worktree', str(repo),
+            '--project-root', str(root),
+            '--category', 'task_failure',
+            '--now', self._NOW_ISO,
+        ])
+        assert rc == 0, f'expected exit 0, got {rc}'
+
+        data = json.loads(capsys.readouterr().out.strip())
+        assert data['verdict'] == 'abort', f'expected abort, got {data}'
+        assert 'stop instruction' in data['reason'].lower(), (
+            f'expected "stop instruction" in reason: {data["reason"]!r}'
+        )
+
+    def test_benign_description_verdict_unchanged(self, tmp_path, capsys):
+        """Case B (regression): a benign description leaves the verdict exactly
+        what the proposal+git would yield today (fresh)."""
+        from orchestrator.b3_gate import main
+        repo, root = self._setup_repo_and_db(
+            tmp_path, description='This task is blocked on a flaky integration test.',
+        )
+
+        rc = main([
+            'check',
+            '--task-id', '42',
+            '--worktree', str(repo),
+            '--project-root', str(root),
+            '--category', 'task_failure',
+            '--now', self._NOW_ISO,
+        ])
+        assert rc == 0, f'expected exit 0, got {rc}'
+
+        data = json.loads(capsys.readouterr().out.strip())
+        assert data['verdict'] == 'fresh', f'expected fresh, got {data}'
