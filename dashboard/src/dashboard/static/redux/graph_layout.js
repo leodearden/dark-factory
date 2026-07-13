@@ -12,8 +12,27 @@
 // environment it's actually running in.
 
 // ── Compute dep tiers for a task list (Kahn's algorithm style; tier = max(deps' tier)+1) ──
+// Verbatim copy of tab_tasks.jsx:19-38 (TaskGraph's computeTiers). Kept in
+// sync intentionally by duplication — see graph_layout.js module header.
 function computeTiers(tasks) {
-  return new Map();
+  const byId = new Map(tasks.map(t => [t.id, t]));
+  const tiers = new Map(); // id -> tier
+  const visiting = new Set();
+
+  function tierOf(id) {
+    if (tiers.has(id)) return tiers.get(id);
+    const t = byId.get(id);
+    if (!t) return 0;             // dep references a task outside the project list — ignore
+    if (visiting.has(id)) return 0; // cycle guard
+    visiting.add(id);
+    const inProject = (t.deps || []).filter(d => byId.has(d.id));
+    const tier = inProject.length === 0 ? 0 : 1 + Math.max(...inProject.map(d => tierOf(d.id)));
+    tiers.set(id, tier);
+    visiting.delete(id);
+    return tier;
+  }
+  for (const t of tasks) tierOf(t.id);
+  return tiers;
 }
 
 // ── Partition a task list into weakly-connected components + singletons ──
