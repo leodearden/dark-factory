@@ -1282,3 +1282,115 @@ class TestThreadedScanReachesUI:
                 )
         new_paths = set(after) - set(before)
         assert not any(path.startswith(('sessions/', 'decisions/')) for path in new_paths)
+
+
+class _BlockingCountingScanner:
+    """Fake SessionScanner for TestScanBackpressure's drop-tick case: counts
+    poll-tick scan() calls and blocks on command, so the assertion that an
+    overlapping tick is dropped doesn't need 10k real session dirs or a
+    wall-clock race against an actually-slow scan.
+
+    The FIRST scan() call (on_mount's synchronous initial scan) returns
+    immediately, uncounted -- mirrors _BlockingScanner's mount-call carve
+    out so mounting the app can never deadlock the event loop. Every call
+    after that increments `poll_calls`, signals `started`, and blocks on
+    `_release` until the test calls release().
+    """
+
+    def __init__(self) -> None:
+        self.poll_calls = 0
+        self.started = threading.Event()
+        self._release = threading.Event()
+        self._armed = False
+
+    def scan(self) -> list:
+        if not self._armed:
+            self._armed = True
+            return []
+        self.poll_calls += 1
+        self.started.set()
+        self._release.wait()
+        return []
+
+    def release(self) -> None:
+        self._release.set()
+
+
+class _RaisingThenOkScanner:
+    """Fake SessionScanner for TestScanBackpressure's wedge-safety case: the
+    mount's initial scan succeeds, the next call (the poll tick under test)
+    raises, and every call after that succeeds again. Proves a raising scan
+    still clears _scan_in_flight, so the very next poll tick launches a
+    fresh scan instead of being dropped forever.
+    """
+
+    def __init__(self) -> None:
+        self.calls = 0
+
+    def scan(self) -> list:
+        self.calls += 1
+        if self.calls == 2:
+            raise RuntimeError('boom')
+        return []
+
+
+class TestScanBackpressure:
+    """C10 tour F1 / esc-2303-1 follow-through: _scan_in_flight (step-12)
+    drops an overlapping poll tick instead of piling up worker threads --
+    in production poll_interval (1.5s) is routinely shorter than a full
+    10k+-session scan (~4.5s), so an unguarded _poll_registry would launch
+    one thread per tick for the scan's entire duration. It also proves a
+    raising scan still clears the flag afterward, so a single bad tick
+    never wedges every later poll.
+    """
+
+    @pytest.mark.timeout(10)
+    async def test_overlapping_tick_is_dropped_while_scan_in_flight(self, tmp_path):
+        from cockpit.app import CockpitApp
+
+        scanner = _BlockingCountingScanner()
+        # A large poll_interval keeps on_mount's own set_interval timer from
+        # firing an uncontrolled worker mid-test -- the only ticks driven
+        # here are the explicit _poll_registry() calls below.
+        app = CockpitApp(fleet_root=tmp_path, poll_interval=60, scanner=scanner)
+        async with app.run_test() as pilot:
+            await pilot.pause()  # mount's synchronous scan: call #1, non-blocking
+
+            app._poll_registry()
+            while not scanner.started.is_set():
+                await asyncio.sleep(0.01)
+            assert scanner.poll_calls == 1
+
+            try:
+                app._poll_registry()  # overlapping tick: must be dropped, not queued
+                await asyncio.sleep(0.1)
+                assert scanner.poll_calls == 1, 'a second scan started while one was in flight'
+            finally:
+                # Always unblock every scan() call this test may have started
+                # -- including a second one the pre-fix code wrongly lets
+                # through -- so a failed assertion above can never leave a
+                # worker thread parked on _release forever (which would hang
+                # the whole test run at interpreter shutdown, not just this
+                # test's own timeout).
+                scanner.release()
+                await app.workers.wait_for_complete()
+
+    @pytest.mark.timeout(10)
+    async def test_scan_in_flight_clears_after_a_raising_scan(self, tmp_path):
+        from textual.worker import WorkerFailed
+
+        from cockpit.app import CockpitApp
+
+        scanner = _RaisingThenOkScanner()
+        app = CockpitApp(fleet_root=tmp_path, poll_interval=60, scanner=scanner)
+        async with app.run_test() as pilot:
+            await pilot.pause()  # mount's synchronous scan: call #1, succeeds
+
+            app._poll_registry()  # call #2: raises inside the threaded worker
+            with pytest.raises(WorkerFailed):
+                await app.workers.wait_for_complete()
+
+            app._poll_registry()  # call #3: only runs if the flag was cleared
+            await app.workers.wait_for_complete()
+
+            assert scanner.calls == 3
