@@ -892,6 +892,60 @@ class TestMergeGraphFamily:
         graph_mock.query.assert_not_called()
 
     @pytest.mark.asyncio
+    async def test_withholds_node_deletion_for_episode_create_failure_mentioning_entity(
+        self, monkeypatch,
+    ):
+        """The MIRROR IMAGE of the scenario above (reviewer follow-up,
+        data-loss-barrier-gap case (3)): an episode whose Phase-A
+        create_moved_episode RAISES is correctly withheld via
+        episode_create_failed -- but any entity it MENTIONS is unaffected by
+        THAT failure: the entity's OWN Phase-A create succeeded, so it is
+        offered to Phase B, whose MENTIONS CREATE MATCHes the
+        never-created-in-target episode and finds nothing -- silently
+        counted in mentions_skipped, NOT blocked (only a raising CREATE
+        lands in blocked; a no-op MATCH does not raise). Without a guarded
+        REVERSE-direction sibling MENTIONS-topology probe, the entity's
+        Phase-C deletion would proceed and destroy the source-only MENTIONS
+        link. The probe MUST be read-only (ro_query, never .query).
+        """
+        def _create_episode_side_effect(graphiti_arg, uuid, *rest, **kwargs):
+            if uuid == 'episode-1':
+                raise RuntimeError('boom')
+
+        mocks = self._patch_primitives(
+            monkeypatch, create_episode_side_effect=_create_episode_side_effect,
+        )
+
+        graph_mock = _make_graph_mock([])
+
+        async def _ro_query(cypher, params=None):
+            params = params or {}
+            if 'MENTIONS' in cypher and params.get('uuid') == 'episode-1':
+                return MagicMock(result_set=[['entity-1']])
+            return MagicMock(result_set=[])
+
+        graph_mock.ro_query = AsyncMock(side_effect=_ro_query)
+
+        graphiti = MagicMock()
+        graphiti._graph_for = MagicMock(return_value=graph_mock)
+
+        entity_rows = [{'uuid': 'entity-1'}, {'uuid': 'entity-2'}]
+        episode_rows = [{'uuid': 'episode-1'}, {'uuid': 'episode-2'}]
+
+        summary = await _mod.merge_graph_family(
+            graphiti, 'know-live', 'know_live', entity_rows, episode_rows,
+        )
+
+        deleted_node_uuids = {c.args[1] for c in mocks['delete_node'].call_args_list}
+        assert 'entity-1' not in deleted_node_uuids
+        assert 'entity-2' in deleted_node_uuids
+        assert summary['nodes_blocked'] >= 1
+
+        graphiti._graph_for.assert_any_call('know-live')
+        graph_mock.ro_query.assert_awaited()
+        graph_mock.query.assert_not_called()
+
+    @pytest.mark.asyncio
     async def test_summary_tallies_and_surfaces_dropped_and_blocked(self, monkeypatch):
         """The returned summary tallies nodes_moved/episodes_moved/
         edges_recreated/edges_skipped/mentions_recreated/mentions_skipped
@@ -1239,12 +1293,15 @@ def _make_run_graph_mock(
     async def _ro_query(cypher: str, params: dict | None = None):
         result = MagicMock()
         if 'MENTIONS' in cypher:
-            # merge_graph_family's guarded create-failed-entity
-            # MENTIONS-topology probe (task 2502 step-16) -- a dual-label
-            # query ('Episodic' AND 'Entity' both appear in its MATCH), so it
-            # MUST be routed here, before the single-label branches below,
-            # or it would be misrouted to the full per-key episode/entity
-            # list instead of this (unseeded-by-default) topology read.
+            # merge_graph_family's guarded MENTIONS-topology probes -- BOTH
+            # directions: create-failed-entity -> mentioning episodes (task
+            # 2502 step-16) and create-failed-episode -> mentioned entities
+            # (reviewer follow-up, data-loss-barrier-gap case (3)). Each is a
+            # dual-label query ('Episodic' AND 'Entity' both appear in its
+            # MATCH), so this branch MUST be routed here, before the
+            # single-label branches below, or it would be misrouted to the
+            # full per-key episode/entity list instead of this
+            # (unseeded-by-default) topology read.
             result.result_set = []
         elif 'Episodic' in cypher:
             result.result_set = episode_rows
