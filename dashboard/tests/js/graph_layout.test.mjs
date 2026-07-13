@@ -348,6 +348,41 @@ test('orderRows: returns one row per tier, each containing exactly that tier\'s 
   );
 });
 
+test('orderRows: initial status-sort permutation ranks by STATUS_ORDER within an edge-free tier', () => {
+  // All eight nodes are deliberately dep-free, so they all land in tier 0
+  // with zero edges — no barycenter sweep or transpose swap can ever move a
+  // node with no cross-tier neighbor (see barycenterSweep's "keeps its
+  // current position" fallback and transposePass's strictly-reducing-only
+  // acceptance), so the returned order is entirely determined by the
+  // initial STATUS_ORDER sort. Statuses are listed in scrambled input order
+  // so a passing assertion actually exercises the ranking rather than
+  // coinciding with an identity permutation.
+  const componentTasks = [
+    mkTask('done-1', [], 'done'),
+    mkTask('unknown-1', [], 'some-unrecognized-status'),
+    mkTask('blocked-1', [], 'blocked'),
+    mkTask('cancelled-1', [], 'cancelled'),
+    mkTask('pending-1', [], 'pending'),
+    mkTask('inprogress-1', [], 'in-progress'),
+    mkTask('deferred-1', [], 'deferred'),
+    mkTask('mergedeferred-1', [], 'merge-deferred'),
+  ];
+  const tiers = computeTiers(componentTasks);
+  const ordered = orderRows(componentTasks, tiers);
+
+  assert.equal(ordered.length, 1, 'all nodes are dep-free and share tier 0');
+  assert.deepEqual(idsOf(ordered[0]), [
+    'blocked-1',
+    'inprogress-1',
+    'mergedeferred-1',
+    'pending-1',
+    'deferred-1',
+    'done-1',
+    'cancelled-1',
+    'unknown-1',
+  ], 'expected blocked < in-progress < merge-deferred < pending < deferred < done < cancelled < unknown');
+});
+
 test('orderRows: barycenter+transpose strictly reduces crossings below the status-sort baseline (tangled fixture)', () => {
   // Parents P1,P2 (tier0), children C1,C2 (tier1); edges P1->C2 & P2->C1;
   // all four share one status, so the status-sort init ties and falls back
@@ -409,6 +444,123 @@ test('orderRows: crossings never exceed the status-sort baseline (tangled + chai
       `expected orderRows crossings (${orderedCrossings}) <= baseline (${baselineCrossings})`,
     );
   }
+});
+
+test('orderRows: 3-tier component with multiple nodes per tier and differing row lengths reduces crossings at both adjacent tier pairs', () => {
+  // 2/3/2 nodes across three tiers (differing row lengths), all sharing one
+  // status so the status-sort baseline ties to input order. The edges are
+  // deliberately tangled at BOTH adjacent tier pairs (mirrors the
+  // countCrossings "crossings across two adjacent tier pairs sum together"
+  // fixture, run through orderRows instead): P1/P2's children are wired
+  // crosswise (P2->M1, P1->M2, P1->M3), and M1..M3's children are wired
+  // crosswise again (M2,M3->C1, M1->C2) — this exercises the interaction of
+  // alternating down/up sweeps across more than two tiers, which the
+  // 2-tier tangled fixture above can't.
+  const componentTasks = [
+    mkTask('P1', [], 'pending'),
+    mkTask('P2', [], 'pending'),
+    mkTask('M1', ['P2'], 'pending'),
+    mkTask('M2', ['P1'], 'pending'),
+    mkTask('M3', ['P1'], 'pending'),
+    mkTask('C1', ['M2', 'M3'], 'pending'),
+    mkTask('C2', ['M1'], 'pending'),
+  ];
+  const tiers = computeTiers(componentTasks);
+  const edges = edgesFromDeps(componentTasks);
+
+  const baseline = statusSortBaseline(componentTasks, tiers);
+  assert.deepEqual(idsOf(baseline[0]), ['P1', 'P2']);
+  assert.deepEqual(idsOf(baseline[1]), ['M1', 'M2', 'M3']);
+  assert.deepEqual(idsOf(baseline[2]), ['C1', 'C2']);
+  const baselineCrossings = countCrossings(baseline, edges);
+  assert.equal(baselineCrossings, 4, 'input-order baseline should cross at both adjacent tier pairs (2 + 2)');
+
+  const ordered = orderRows(componentTasks, tiers);
+  assert.equal(ordered.length, 3, 'expected one row per tier');
+  assert.deepEqual(
+    flattenedIds(ordered).sort(),
+    idsOf(componentTasks).slice().sort(),
+    'orderRows must return an exact re-permutation of its input',
+  );
+
+  const orderedCrossings = countCrossings(ordered, edges);
+  assert.ok(
+    orderedCrossings < baselineCrossings,
+    `expected orderRows to strictly reduce crossings (got ${orderedCrossings}, baseline ${baselineCrossings})`,
+  );
+});
+
+test('orderRows: a long (tier0->tier2) edge never contributes to crossings, regardless of arrangement (no-dummy-node limitation)', () => {
+  // A (tier0) -> B (tier1) -> C (tier2) is a normal adjacent chain. D also
+  // lands in tier2 (1 + max(tier(A)=0, tier(B)=1) = 2) but has a direct dep
+  // on A as well as B, so its edge list includes one adjacent edge (B->D)
+  // and one long, skip-level edge (A->D) spanning tier0 to tier2. Per the
+  // documented v1 no-dummy-node limitation, countCrossings only considers
+  // edges whose endpoints lie in an ADJACENT tier pair, so A->D should never
+  // affect the crossing count — pinned here by comparing with/without that
+  // edge, both on orderRows' own output and after manually swapping C/D.
+  const componentTasks = [
+    mkTask('A', [], 'pending'),
+    mkTask('B', ['A'], 'pending'),
+    mkTask('C', ['B'], 'pending'),
+    mkTask('D', ['A', 'B'], 'pending'),
+  ];
+  const tiers = computeTiers(componentTasks);
+  assert.equal(tiers.get('D'), 2, 'D should land in tier2 via its longest path (through B), not tier1 via A directly');
+
+  const edgesWithLongEdge = edgesFromDeps(componentTasks);
+  const edgesWithoutLongEdge = edgesWithLongEdge.filter(e => !(e.from === 'A' && e.to === 'D'));
+
+  const ordered = orderRows(componentTasks, tiers);
+  assert.deepEqual(idsOf(ordered[0]), ['A']);
+  assert.deepEqual(idsOf(ordered[1]), ['B']);
+  assert.deepEqual(idsOf(ordered[2]).slice().sort(), ['C', 'D']);
+
+  assert.equal(
+    countCrossings(ordered, edgesWithLongEdge),
+    countCrossings(ordered, edgesWithoutLongEdge),
+    'the long A->D edge should not change the crossing count on orderRows\' own arrangement',
+  );
+
+  // Manually swap the tier2 row and re-check both edge sets — the long edge
+  // must stay inert regardless of C/D's relative position.
+  const swapped = ordered.map(row => row.slice());
+  const lastTier = swapped[swapped.length - 1];
+  [lastTier[0], lastTier[1]] = [lastTier[1], lastTier[0]];
+  assert.equal(
+    countCrossings(swapped, edgesWithLongEdge),
+    countCrossings(swapped, edgesWithoutLongEdge),
+    'the long A->D edge should not change the crossing count after swapping C/D either',
+  );
+});
+
+test('orderRows: falls back to the status-sort baseline above the optimization size cap (large tangled component)', () => {
+  // Builds a component with more nodes than graph_layout.js's internal
+  // MAX_LAYOUT_OPTIMIZATION_NODES cap so the barycenter+transpose pipeline
+  // short-circuits and the status-sort baseline is returned unchanged. The
+  // parent/child pairing is a full crosswise reversal (child i depends on
+  // parent at the mirrored index) — the same shape as the small tangled
+  // fixture, scaled up — so if the optimization pipeline DID run despite the
+  // cap, it would visibly reorder tier1 and reduce crossings; this pins
+  // that it does not.
+  const PAIR_COUNT = 76; // 152 nodes total, above the 150-node cap
+  const parents = Array.from({ length: PAIR_COUNT }, (_, i) => mkTask(`P${i}`, [], 'pending'));
+  const children = Array.from({ length: PAIR_COUNT }, (_, i) =>
+    mkTask(`C${i}`, [`P${PAIR_COUNT - 1 - i}`], 'pending'),
+  );
+  const componentTasks = [...parents, ...children];
+  const tiers = computeTiers(componentTasks);
+  const edges = edgesFromDeps(componentTasks);
+
+  const baseline = statusSortBaseline(componentTasks, tiers);
+  const ordered = orderRows(componentTasks, tiers);
+
+  assert.deepEqual(
+    flattenedIds(ordered),
+    flattenedIds(baseline),
+    'above the optimization cap, orderRows should return the status-sort baseline unchanged (same order, not just same count)',
+  );
+  assert.equal(countCrossings(ordered, edges), countCrossings(baseline, edges));
 });
 
 test('orderRows: deterministic across repeated calls on identical input', () => {
