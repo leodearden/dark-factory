@@ -18,6 +18,7 @@ verify.py).
 
 from __future__ import annotations
 
+import json
 import re
 
 from orchestrator.verify_categories import FailureCategory
@@ -101,15 +102,30 @@ def classify_failure(tool: ToolKind, rc: int, output: str, timed_out: bool) -> F
     no longer swallow a pytest/rustc line by construction):
     - ``ToolKind.PYTEST`` -> ``_classify_pytest`` (notably the env_transient
       shared-venv-mutation signatures, consulted ONLY here).
-    - ``ToolKind.CARGO_TEST`` / ``ToolKind.CARGO_CLIPPY`` -> ``_classify_cargo``.
+    - ``ToolKind.CARGO_TEST`` / ``ToolKind.CARGO_CLIPPY`` -> a structured
+      NDJSON parse (``_parse_cargo_json``) is attempted FIRST (Invariant C2);
+      when *output* isn't detected as cargo's ``--message-format json`` NDJSON
+      (or carries no error-level compiler-message), falls back to
+      ``_classify_cargo``, the text table.
     - ``ToolKind.NPX`` -> ``_classify_npx``.
+    - ``ToolKind.PYRIGHT`` -> a structured ``--outputjson`` parse
+      (``_parse_pyright_json``) is attempted FIRST (Invariant C2); otherwise
+      falls back to ``_classify_opaque`` (no dedicated PYRIGHT text table —
+      preserves today's on-the-wire mapping).
+    - ``ToolKind.RUFF`` -> a structured ``--output-format json`` parse
+      (``_parse_ruff_json``) is attempted FIRST (Invariant C2); otherwise
+      falls back to ``_classify_opaque`` (no dedicated RUFF text table —
+      preserves today's on-the-wire mapping).
     - ``ToolKind.OPAQUE`` -> ``_classify_opaque``, the FULL legacy generic
       ladder (moved verbatim from verify.py's ``_CLASSIFY_PATTERNS``) — the
       ONLY survivor of the tool-blind ladder.
-    - Every other recognised ``ToolKind`` (PYRIGHT, RUFF) currently falls
-      through to that same generic ladder as a placeholder; dedicated
-      structured-output parsing for them is added by a later step of this
-      task (PRD task δ, Invariant C2).
+
+    Every structured parser is best-effort and exception-safe: *output* that
+    isn't valid JSON (or isn't shaped as that tool's schema) yields ``None``
+    rather than raising, so the classifier always falls back to the text
+    table (Invariant C2's "falls back … does not crash"). The verify COMMANDS
+    themselves are unchanged by this — they still emit human text — so the
+    human log is unchanged by construction.
 
     CLOSED DOMAIN: the return value is always a ``FailureCategory`` member —
     see that enum's docstring for the closed 12-value output domain its
@@ -123,9 +139,19 @@ def classify_failure(tool: ToolKind, rc: int, output: str, timed_out: bool) -> F
     if tool is ToolKind.PYTEST:
         return _classify_pytest(output)
     if tool in (ToolKind.CARGO_TEST, ToolKind.CARGO_CLIPPY):
-        return _classify_cargo(output)
+        # `is not None` (not `or`): FailureCategory.NONE == '' is falsy, so an
+        # `or` fallback would wrongly skip a genuine (if currently unused)
+        # NONE result from the parser.
+        cargo_category = _parse_cargo_json(output)
+        return cargo_category if cargo_category is not None else _classify_cargo(output)
     if tool is ToolKind.NPX:
         return _classify_npx(output)
+    if tool is ToolKind.PYRIGHT:
+        pyright_category = _parse_pyright_json(output)
+        return pyright_category if pyright_category is not None else _classify_opaque(output)
+    if tool is ToolKind.RUFF:
+        ruff_category = _parse_ruff_json(output)
+        return ruff_category if ruff_category is not None else _classify_opaque(output)
 
     return _classify_opaque(output)
 
@@ -213,14 +239,54 @@ def _classify_pytest(output: str) -> FailureCategory:
 
 
 # ---------------------------------------------------------------------------
-# ToolKind.CARGO_TEST / ToolKind.CARGO_CLIPPY — share one table: compile_error,
-# then the cargo-CLI allowlist, then the (trailing-form only) FAILED line,
-# then tree-sitter generate failures, falling through to
-# UNKNOWN_TEST_FAILURE. No INTERNALERROR/npm_error/flock_error/leading-FAILED
-# branch here (Invariant C1) — those belong to the PYTEST/NPX/OPAQUE tables
-# only, so a stray pytest or npm token in cargo output can never be
-# misclassified as a cargo-specific category.
+# ToolKind.CARGO_TEST / ToolKind.CARGO_CLIPPY — a structured NDJSON parse
+# (Invariant C2) is attempted FIRST; when that finds no error-level
+# compiler-message, share one text table: compile_error, then the cargo-CLI
+# allowlist, then the (trailing-form only) FAILED line, then tree-sitter
+# generate failures, falling through to UNKNOWN_TEST_FAILURE. No
+# INTERNALERROR/npm_error/flock_error/leading-FAILED branch here (Invariant
+# C1) — those belong to the PYTEST/NPX/OPAQUE tables only, so a stray pytest
+# or npm token in cargo output can never be misclassified as a
+# cargo-specific category.
 # ---------------------------------------------------------------------------
+
+
+def _parse_cargo_json(output: str) -> FailureCategory | None:
+    """Best-effort NDJSON parse of ``cargo … --message-format json`` output.
+
+    cargo's ``--message-format json`` emits one compact JSON object per
+    line (NDJSON) — verified against the pinned cargo 1.96.0 binary in this
+    worktree, e.g.::
+
+        {"reason":"compiler-message","message":{"level":"error",...}}
+        {"reason":"build-finished","success":false}
+
+    Scans line by line for a ``"reason": "compiler-message"`` record whose
+    ``message.level == "error"`` -> ``COMPILE_ERROR`` (the structured signal
+    Invariant C2 exists to catch — a diagnostic whose rendered human text
+    doesn't happen to match any text-table pattern is still correctly
+    classified). A line that isn't valid JSON (plain non-JSON text, or a
+    JSON-shaped-but-malformed fragment) is skipped rather than raised —
+    parsing is best-effort and exception-safe. Returns ``None`` (the caller
+    falls back to ``_classify_cargo``, the text table) when no line parses as
+    an error-level compiler-message, including when *output* isn't NDJSON at
+    all.
+    """
+    for line in output.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            record = json.loads(line)
+        except (json.JSONDecodeError, ValueError):
+            continue
+        if not isinstance(record, dict) or record.get('reason') != 'compiler-message':
+            continue
+        message = record.get('message')
+        if isinstance(message, dict) and message.get('level') == 'error':
+            return FailureCategory.COMPILE_ERROR
+    return None
+
 
 _CARGO_PATTERNS: list[tuple[re.Pattern[str], FailureCategory]] = [
     (_COMPILE_ERROR_RUSTC_CODE_RE, FailureCategory.COMPILE_ERROR),
@@ -253,6 +319,84 @@ def _classify_npx(output: str) -> FailureCategory:
     for pattern, category in _NPX_PATTERNS:
         if pattern.search(output):
             return category
+    return FailureCategory.UNKNOWN_TEST_FAILURE
+
+
+# ---------------------------------------------------------------------------
+# ToolKind.PYRIGHT — structured JSON only (Invariant C2); no dedicated text
+# table exists — non-JSON PYRIGHT output falls through to the OPAQUE
+# placeholder ladder (see classify_failure's docstring), preserving today's
+# on-the-wire mapping. Adding a dedicated PYRIGHT/type-check FailureCategory
+# is out of scope for this task.
+# ---------------------------------------------------------------------------
+
+
+def _parse_pyright_json(output: str) -> FailureCategory | None:
+    """Best-effort parse of ``pyright --outputjson`` output.
+
+    pyright's ``--outputjson`` emits one JSON object with a top-level
+    ``generalDiagnostics`` array — verified against the pinned pyright
+    1.1.408 binary in this worktree, e.g.::
+
+        {"version": "1.1.408", "generalDiagnostics": [
+            {"file": "...", "severity": "error", "message": "...", ...}
+        ], "summary": {...}}
+
+    A ``generalDiagnostics`` entry with ``severity == "error"`` maps to
+    ``UNKNOWN_TEST_FAILURE`` — the preserved on-the-wire category (no
+    dedicated PYRIGHT category exists — see module docstring). Exception-safe:
+    *output* that isn't valid JSON, or isn't shaped like this schema, returns
+    ``None`` rather than raising, so the caller falls back to
+    ``_classify_opaque``, the text table.
+    """
+    try:
+        payload = json.loads(output)
+    except (json.JSONDecodeError, ValueError):
+        return None
+    if not isinstance(payload, dict):
+        return None
+    diagnostics = payload.get('generalDiagnostics')
+    if not isinstance(diagnostics, list):
+        return None
+    for diagnostic in diagnostics:
+        if isinstance(diagnostic, dict) and diagnostic.get('severity') == 'error':
+            return FailureCategory.UNKNOWN_TEST_FAILURE
+    return None
+
+
+# ---------------------------------------------------------------------------
+# ToolKind.RUFF — structured JSON only (Invariant C2); no dedicated text
+# table exists — non-JSON RUFF output falls through to the OPAQUE placeholder
+# ladder (see classify_failure's docstring), preserving today's on-the-wire
+# mapping. Adding a dedicated RUFF/lint FailureCategory is out of scope for
+# this task.
+# ---------------------------------------------------------------------------
+
+
+def _parse_ruff_json(output: str) -> FailureCategory | None:
+    """Best-effort parse of ``ruff check --output-format json`` output.
+
+    ruff's ``--output-format json`` emits a top-level JSON ARRAY of
+    violation objects (not wrapped in an object) — verified against the
+    pinned ruff binary in this worktree, e.g.::
+
+        [{"cell": null, "code": "F821", "filename": "...",
+          "message": "...", "severity": "error", ...}]
+
+    A non-empty violations array maps to ``UNKNOWN_TEST_FAILURE`` — the
+    preserved on-the-wire category (no dedicated RUFF category exists — see
+    module docstring). Exception-safe: *output* that isn't valid JSON, or
+    isn't shaped like this schema, returns ``None`` rather than raising, so
+    the caller falls back to ``_classify_opaque``, the text table.
+    """
+    try:
+        payload = json.loads(output)
+    except (json.JSONDecodeError, ValueError):
+        return None
+    if not isinstance(payload, list) or not payload:
+        return None
+    if not any(isinstance(item, dict) for item in payload):
+        return None
     return FailureCategory.UNKNOWN_TEST_FAILURE
 
 
