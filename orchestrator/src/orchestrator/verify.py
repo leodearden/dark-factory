@@ -591,6 +591,13 @@ def _tool_for_cmd(cmd: str | None) -> ToolKind:
     even if the underlying tool is in fact pytest. Not a concern for any
     test_cmd shape in production today (all contain a literal ``pytest``
     token).
+
+    The same gating applies unconditionally to the lint/type checks: their
+    commands never resolve here to ``ToolKind.PYTEST``, so their outputs can
+    never classify as env_transient either — unlike the pre-δ tool-blind
+    ladder, which consulted these signatures for every check's output (see
+    the env-recovery retry's comment in ``run_verification`` for the fuller
+    note on this narrowing).
     """
     if not cmd:
         return ToolKind.OPAQUE
@@ -3058,6 +3065,18 @@ async def run_verification(
     # such that the parser can't see a literal `pytest` token never produces
     # ENV_TRANSIENT and so never reaches this retry, even on a genuine
     # shared-venv mutation. True of every production test_cmd today.
+    #
+    # This PYTEST-only narrowing is broader than just that wrapped-test-cmd
+    # case: the pre-δ tool-blind ladder also consulted these env_transient
+    # signatures against the LINT and TYPE check outputs (it classified
+    # whatever output it was handed, uniformly across all three checks),
+    # whereas the RUFF/PYRIGHT tables and the OPAQUE fallback never do now —
+    # so a lint or type-check failure cannot classify as env_transient by
+    # construction, only the test leg can. A conscious tradeoff, not an
+    # unnoticed side effect: the signatures are pytest/xdist-specific text
+    # ruff/pyright would not emit, and this retry only ever re-runs the test
+    # command regardless (lint/type don't exercise xdist/pip — see above),
+    # so there is no observable behavior change from this narrowing.
     if category == FailureCategory.ENV_TRANSIENT and test_cmd is not None:
         logger.warning(
             'Verification hit an environmental shared-venv transient '
