@@ -29,6 +29,7 @@ from fused_memory.models.reconciliation import (
     RunStatus,
     RunType,
     StageId,
+    StageReport,
 )
 from fused_memory.models.scope import (
     ProjectId,
@@ -43,7 +44,10 @@ from fused_memory.reconciliation.judge import Judge
 from fused_memory.reconciliation.mem0_dedup import find_prior_memory
 from fused_memory.reconciliation.policies import is_snapshot_write_blocked
 from fused_memory.reconciliation.queue_health import summarize_graphiti_queue_health
-from fused_memory.reconciliation.stages.memory_consolidator import MemoryConsolidator
+from fused_memory.reconciliation.stages.memory_consolidator import (
+    MemoryConsolidator,
+    write_stage1_cycle_summary,
+)
 from fused_memory.reconciliation.stages.task_knowledge_sync import (
     IntegrityCheck,
     TaskKnowledgeSync,
@@ -2009,7 +2013,101 @@ class ReconciliationHarness:
             )
             raise
         finally:
+            await self._ensure_stage1_cycle_summary(
+                run, run_id, project_id, current_stage_name, cycle_start_time,
+            )
             await self.journal.update_run_stage_reports(run_id, run.stage_reports)
+
+    async def _ensure_stage1_cycle_summary(
+        self,
+        run: ReconciliationRun,
+        run_id: str,
+        project_id: str,
+        current_stage_name: str | None,
+        cycle_start_time: datetime,
+    ) -> None:
+        """Guarantee a Stage 1 ``cycle_summary`` ledger row exists for *run_id* (task 2440).
+
+        Structural backstop for the in-stage deterministic write
+        (``write_stage1_cycle_summary``, called from
+        :meth:`~fused_memory.reconciliation.stages.memory_consolidator.MemoryConsolidator.run`,
+        task 2229 W5-λ), which is the last statement of Stage 1's ``run()``
+        and so is skipped whenever the Stage 1 turn raises before
+        completing. Called from :meth:`run_full_cycle`'s ``finally`` block,
+        so this runs on every exit path regardless of whether Stage 1
+        completed; it fires only when Stage 1 started but recorded no report
+        (the happy path and a Stage-2/3 failure both no-op). See task 2440's
+        plan for the proof that this gate is exactly equivalent to "Stage 1
+        raised before its own write".
+
+        The synthesized report is honestly degraded, not fabricated:
+        ``llm_calls``/``tokens_used`` are 0 and ``started_at`` is the
+        whole-cycle anchor rather than Stage 1's real start — both are
+        unrecoverable once ``run()`` raised without returning a report — so
+        the implied duration is an upper bound, not a measurement. The
+        ``stage1_cycle_summary_degraded_backstop`` stat self-identifies the
+        row as harness-synthesized.
+
+        Must never raise: awaited unshielded in the ``finally``, immediately
+        before ``update_run_stage_reports``. An exception here would replace
+        whatever exception is already propagating and skip that persistence
+        call, so the body swallows ``BaseException`` and the write itself
+        runs under ``asyncio.shield`` to survive a second cancellation
+        arriving mid-write.
+        """
+        if not (
+            current_stage_name == StageId.memory_consolidator.value
+            and StageId.memory_consolidator.value not in run.stage_reports
+        ):
+            return
+
+        try:
+            degraded_report = StageReport(
+                stage=StageId.memory_consolidator,
+                # Whole-cycle anchor, not Stage 1's real start (see docstring).
+                started_at=cycle_start_time,
+                completed_at=datetime.now(UTC),
+                items_flagged=[],
+                stats={'stage1_cycle_summary_degraded_backstop': True},
+                # Zeroed, not "no work happened" (see docstring). Dashboards summing
+                # llm_calls/tokens across cycles should filter out
+                # stats['stage1_cycle_summary_degraded_backstop'] rows first, or they
+                # will silently undercount.
+                llm_calls=0,
+                tokens_used=0,
+            )
+            # Shielded against a second cancellation arriving mid-write (see
+            # docstring); the write keeps running to completion in its own Task.
+            ledger_written = await asyncio.shield(
+                write_stage1_cycle_summary(
+                    self.memory, project_id, degraded_report, run_id,
+                )
+            )
+            logger.warning(
+                'reconciliation.stage1_cycle_summary_backstop_fired',
+                extra={
+                    'run_id': run_id,
+                    'project_id': project_id,
+                    'ledger_written': ledger_written,
+                },
+            )
+            # Breadcrumb on the existing _error record (when present) rather than
+            # a new top-level stage_reports key — keeps this observable from the
+            # same place operators already look for a failed cycle's diagnosis.
+            error_record = run.stage_reports.get('_error')
+            if isinstance(error_record, dict):
+                error_record['stage1_cycle_summary_backstop_written'] = ledger_written
+        except BaseException:
+            # BaseException (not Exception): also catches a second cancellation
+            # and, deliberately, SystemExit/KeyboardInterrupt — this is a single
+            # narrow, bounded best-effort upsert, and letting any of those
+            # interrupt the finally risks skipping the update_run_stage_reports
+            # call that follows (see docstring).
+            logger.warning(
+                'reconciliation.stage1_cycle_summary_backstop_failed',
+                exc_info=True,
+                extra={'run_id': run_id, 'project_id': project_id},
+            )
 
     # ── Remediation support ───────────────────────────────────────────
 

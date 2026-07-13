@@ -6,6 +6,7 @@ import asyncio
 import json
 import logging
 from datetime import datetime
+from typing import TYPE_CHECKING
 
 from fused_memory.models.reconciliation import (
     AssembledPayload,
@@ -55,6 +56,9 @@ from fused_memory.reconciliation.task_filter import (
     strip_snapshot_lines,
 )
 
+if TYPE_CHECKING:
+    from fused_memory.services.memory_service import MemoryService
+
 logger = logging.getLogger(__name__)
 
 # Stage 1 per-cycle summary pool cap and related constants.
@@ -66,6 +70,43 @@ logger = logging.getLogger(__name__)
 # deleting the OLDEST entries — deterministically via Qdrant scroll, NOT semantic search.
 STAGE1_CYCLE_SUMMARY_POOL_CAP: int = 2
 _STAGE1_CYCLE_SUMMARY_TRIM_SOURCE = 'stage1_cycle_summary_trim'
+
+
+async def write_stage1_cycle_summary(
+    memory_service: MemoryService,
+    project_id: str,
+    report: StageReport,
+    run_id: str,
+) -> bool:
+    """Write Stage 1's authoritative per-cycle ``cycle_summary`` ledger row.
+
+    Thin Stage-1-parametrized wrapper around
+    :func:`~fused_memory.reconciliation.summary_pool.write_cycle_summary`,
+    binding the four Stage-1-specific values (``stage='memory_consolidator'``,
+    ``recon_pool``, ``trim_source``, ``cap``) in exactly one place (task 2440).
+    Extracted from the call formerly inlined in :meth:`MemoryConsolidator.run`
+    (task 2229 W5-λ) so both the in-stage fast-path write (``run()`` below)
+    and the harness-level raise-path backstop
+    (``ReconciliationHarness._ensure_stage1_cycle_summary``, task 2440) share
+    the identical binding — a future change to any of the four constants can
+    never silently diverge between the two call sites.
+
+    Returns:
+        ``True`` when the authoritative ledger upsert succeeded, ``False``
+        otherwise — see :func:`~fused_memory.reconciliation.summary_pool.write_cycle_summary`'s
+        "Returns" section for the full contract (the Mem0 mirror and pool-cap
+        trim run unconditionally regardless of this return value).
+    """
+    return await write_cycle_summary(
+        memory_service,
+        project_id,
+        report,
+        run_id,
+        stage='memory_consolidator',
+        recon_pool=_STAGE1_CYCLE_SUMMARY_RECON_POOL,
+        trim_source=_STAGE1_CYCLE_SUMMARY_TRIM_SOURCE,
+        cap=STAGE1_CYCLE_SUMMARY_POOL_CAP,
+    )
 
 
 class MemoryConsolidator(BaseStage):
@@ -421,15 +462,8 @@ class MemoryConsolidator(BaseStage):
         # fabricate a spurious summary every remediation pass. The stat set
         # below overwrites the `= 0` default assigned before the
         # remediation early-return above.
-        ledger_written = await write_cycle_summary(
-            self.memory,
-            self.project_id,
-            report,
-            run_id,
-            stage='memory_consolidator',
-            recon_pool=_STAGE1_CYCLE_SUMMARY_RECON_POOL,
-            trim_source=_STAGE1_CYCLE_SUMMARY_TRIM_SOURCE,
-            cap=STAGE1_CYCLE_SUMMARY_POOL_CAP,
+        ledger_written = await write_stage1_cycle_summary(
+            self.memory, self.project_id, report, run_id,
         )
         # Reflects the ledger upsert only — see the "_ledger_written" naming
         # note above the `= 0` default earlier in this method.

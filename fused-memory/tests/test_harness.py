@@ -679,6 +679,358 @@ async def test_mock_stage_run_before_return_callback(journal, event_buffer, mock
     )
 
 
+# ---------------------------------------------------------------------------
+# Task 2440: harness-level backstop for the Stage 1 cycle_summary write.
+#
+# Guarantees the deterministic write_cycle_summary(...) ledger row exists
+# even when Stage 1's run() raises before reaching its own in-stage write
+# (task 2229 W5-λ) — the gap left open by that task's in-stage-only write.
+# Mirrors test_run_full_cycle_restores_events_on_failure's harness scaffolding
+# (pinned stages via the _make_test_harness / _make_stages shim) and
+# TestMemoryConsolidatorDeterministicCycleSummaryWrite's ledger_store fixture
+# pattern (tests/reconciliation/test_stage1.py).
+#
+# RED — no backstop / no _ensure_stage1_cycle_summary yet.
+# ---------------------------------------------------------------------------
+
+
+class TestStage1CycleSummaryHarnessBackstop:
+    """run_full_cycle's finally block guarantees a Stage 1 cycle_summary
+    ledger row on every exit path, even when the Stage 1 turn raises."""
+
+    @pytest_asyncio.fixture
+    async def ledger_store(self, tmp_path):
+        from fused_memory.reconciliation.recon_ledger import ReconLedgerStore
+
+        s = ReconLedgerStore(tmp_path / 'harness_backstop_ledger.db')
+        await s.initialize()
+        yield s
+        await s.close()
+
+    @pytest.mark.asyncio
+    async def test_stage1_raise_triggers_degraded_backstop_ledger_write(
+        self, journal, event_buffer, mock_memory_service, ledger_store
+    ):
+        """Stage 1's run() raising still re-raises out of run_full_cycle, but
+        the harness backstop writes a degraded cycle_summary ledger row so a
+        Stage-1 cycle always leaves a breadcrumb (task 2440)."""
+        import json
+
+        mock_memory_service.recon_ledger = ledger_store
+        mock_memory_service.get_memories_by_metadata = AsyncMock(return_value=[])
+        harness = _make_test_harness(journal, event_buffer, mock_memory_service)
+        harness.stages[0].run = AsyncMock(side_effect=RuntimeError('stage1 exploded'))
+
+        with pytest.raises(RuntimeError, match='stage1 exploded'):
+            await harness.run_full_cycle('test-project', 'buffer_size:2')
+
+        recent = await journal.get_recent_runs('test-project', limit=1)
+        assert recent, 'expected the failed run to be persisted by the journal'
+        run_id = recent[0].id
+
+        record = await ledger_store.get_by_identity(
+            'test-project', 'cycle_summary', flag_type='memory_consolidator', run_id=run_id,
+        )
+        assert record is not None, (
+            'harness backstop must write a cycle_summary ledger row when Stage 1 '
+            'raises before completing its own in-stage write'
+        )
+        assert record.record_kind == 'cycle_summary'
+        assert record.task_id == ''
+        assert record.flag_type == 'memory_consolidator'
+
+        payload = json.loads(record.payload_json)
+        assert payload['llm_calls'] == 0, (
+            'degraded synthesis cannot know the real llm_calls count once Stage 1 raised'
+        )
+        assert payload['stats'].get('stage1_cycle_summary_degraded_backstop') is True
+
+        assert recent[0].stage_reports['_error']['stage1_cycle_summary_backstop_written'] is True, (
+            'the harness must stamp the operator-facing breadcrumb onto the persisted '
+            "run's _error record once the backstop ledger write succeeds, so the "
+            'observability signal is pinned to actual behavior'
+        )
+
+    @pytest.mark.asyncio
+    async def test_stage1_raise_with_recon_ledger_unwired_stamps_false_breadcrumb(
+        self, journal, event_buffer, mock_memory_service
+    ):
+        """recon_ledger_enabled=False is a supported production config (see
+        write_cycle_summary's docstring): memory_service exposes no
+        recon_ledger, so write_stage1_cycle_summary's ledger upsert is
+        skipped and it returns False — the one config where the backstop's
+        return value diverges from the ledger-wired tests above. The
+        backstop must still complete without crashing, the original Stage 1
+        exception must still propagate, and the _error breadcrumb must be
+        stamped False (not True) rather than assuming the write succeeded."""
+        mock_memory_service.recon_ledger = None
+        mock_memory_service.get_memories_by_metadata = AsyncMock(return_value=[])
+        harness = _make_test_harness(journal, event_buffer, mock_memory_service)
+        harness.stages[0].run = AsyncMock(side_effect=RuntimeError('stage1 exploded'))
+
+        with pytest.raises(RuntimeError, match='stage1 exploded'):
+            await harness.run_full_cycle('test-project', 'buffer_size:2')
+
+        recent = await journal.get_recent_runs('test-project', limit=1)
+        assert recent, 'expected the failed run to still be persisted by the journal'
+
+        err = recent[0].stage_reports.get('_error')
+        assert isinstance(err, dict)
+        assert err['stage1_cycle_summary_backstop_written'] is False, (
+            'with no recon_ledger wired, write_stage1_cycle_summary returns False; the '
+            'breadcrumb must reflect that rather than assuming the write succeeded'
+        )
+
+    @pytest.mark.asyncio
+    async def test_stage1_cancelled_error_triggers_degraded_backstop_and_still_propagates(
+        self, journal, event_buffer, mock_memory_service, ledger_store
+    ):
+        """The primary motivating scenario (per this method's docstring) is a
+        CLI timeout surfacing as asyncio.CancelledError — a different except
+        branch (run_full_cycle's `except asyncio.CancelledError`) than the
+        generic RuntimeError case above. The backstop must still fire from
+        the finally block, and CancelledError must still propagate out of
+        run_full_cycle unchanged."""
+        import json
+
+        mock_memory_service.recon_ledger = ledger_store
+        mock_memory_service.get_memories_by_metadata = AsyncMock(return_value=[])
+        harness = _make_test_harness(journal, event_buffer, mock_memory_service)
+        harness.stages[0].run = AsyncMock(side_effect=asyncio.CancelledError())
+
+        with pytest.raises(asyncio.CancelledError):
+            await harness.run_full_cycle('test-project', 'buffer_size:2')
+
+        recent = await journal.get_recent_runs('test-project', limit=1)
+        assert recent, 'expected the cancelled run to be persisted by the journal'
+        run_id = recent[0].id
+
+        record = await ledger_store.get_by_identity(
+            'test-project', 'cycle_summary', flag_type='memory_consolidator', run_id=run_id,
+        )
+        assert record is not None, (
+            'harness backstop must write a cycle_summary ledger row when Stage 1 '
+            'is cancelled before completing its own in-stage write'
+        )
+        payload = json.loads(record.payload_json)
+        assert payload['stats'].get('stage1_cycle_summary_degraded_backstop') is True
+
+        assert recent[0].stage_reports['_error']['stage1_cycle_summary_backstop_written'] is True, (
+            'the breadcrumb must be stamped on this exit path too, not just the '
+            'generic Exception branch'
+        )
+
+    @pytest.mark.asyncio
+    async def test_stage1_all_accounts_capped_triggers_degraded_backstop_without_raising(
+        self, journal, event_buffer, mock_memory_service, ledger_store
+    ):
+        """AllAccountsCappedException takes the deferral branch (`except
+        AllAccountsCappedException`), which RETURNS the run instead of
+        re-raising — an untested control-flow shape where the finally-block
+        backstop still must fire even though run_full_cycle completes
+        normally rather than raising."""
+        import json
+
+        from shared.cli_invoke import AllAccountsCappedException
+
+        mock_memory_service.recon_ledger = ledger_store
+        mock_memory_service.get_memories_by_metadata = AsyncMock(return_value=[])
+        harness = _make_test_harness(journal, event_buffer, mock_memory_service)
+        harness.stages[0].run = AsyncMock(
+            side_effect=AllAccountsCappedException(
+                retries=3, elapsed_secs=200.0, label='Reconciliation stage (sonnet)'
+            )
+        )
+
+        run = await harness.run_full_cycle('test-project', 'buffer_size:2')
+
+        assert run.status in (RunStatus.failed, 'failed')
+
+        record = await ledger_store.get_by_identity(
+            'test-project', 'cycle_summary', flag_type='memory_consolidator', run_id=run.id,
+        )
+        assert record is not None, (
+            'harness backstop must write a cycle_summary ledger row when Stage 1 '
+            'defers via AllAccountsCappedException, even though run_full_cycle '
+            'returns normally instead of raising'
+        )
+        payload = json.loads(record.payload_json)
+        assert payload['stats'].get('stage1_cycle_summary_degraded_backstop') is True
+
+        err = run.stage_reports.get('_error')
+        assert isinstance(err, dict)
+        assert err['stage1_cycle_summary_backstop_written'] is True, (
+            'the breadcrumb must be stamped on the deferral (return, not raise) '
+            'exit path too'
+        )
+
+    @pytest.mark.asyncio
+    async def test_happy_path_does_not_invoke_backstop_write(
+        self, journal, event_buffer, mock_memory_service, ledger_store
+    ):
+        """All three stages succeeding must NOT trigger a second, redundant
+        write_stage1_cycle_summary call from the harness — the in-stage fast
+        path already wrote it, and current_stage_name has moved past Stage 1
+        by the time the finally block runs."""
+        from fused_memory.models.reconciliation import StageId
+
+        mock_memory_service.recon_ledger = ledger_store
+        mock_memory_service.get_memories_by_metadata = AsyncMock(return_value=[])
+        harness = _make_test_harness(journal, event_buffer, mock_memory_service)
+
+        stage1_report = StageReport(
+            stage=StageId.memory_consolidator,
+            started_at=datetime.now(UTC),
+            completed_at=datetime.now(UTC),
+            items_flagged=[],
+            stats={'stage1_cycle_summary_ledger_written': 1},
+            llm_calls=2,
+            tokens_used=100,
+        )
+        harness.stages[0].run = AsyncMock(return_value=stage1_report)
+        _mock_stage_run(harness.stages[1])
+        _mock_stage_run(harness.stages[2])
+
+        with patch(
+            'fused_memory.reconciliation.harness.write_stage1_cycle_summary',
+            AsyncMock(),
+        ) as mock_write:
+            run = await harness.run_full_cycle('test-project', 'test-trigger')
+
+        assert run.status == RunStatus.completed
+        mock_write.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_stage2_failure_leaves_stage1_report_and_skips_backstop(
+        self, journal, event_buffer, mock_memory_service, ledger_store
+    ):
+        """Stage 1 succeeding then Stage 2 raising must leave Stage 1's real
+        report in place and must NOT fire the backstop — current_stage_name
+        is 'task_knowledge_sync' by the time the exception reaches finally,
+        not 'memory_consolidator'."""
+        mock_memory_service.recon_ledger = ledger_store
+        mock_memory_service.get_memories_by_metadata = AsyncMock(return_value=[])
+        harness = _make_test_harness(journal, event_buffer, mock_memory_service)
+
+        _mock_stage_run(harness.stages[0])
+        harness.stages[1].run = AsyncMock(side_effect=RuntimeError('stage2 exploded'))
+
+        with patch(
+            'fused_memory.reconciliation.harness.write_stage1_cycle_summary',
+            AsyncMock(),
+        ) as mock_write, pytest.raises(RuntimeError, match='stage2 exploded'):
+            await harness.run_full_cycle('test-project', 'test-trigger')
+
+        mock_write.assert_not_called()
+
+        recent = await journal.get_recent_runs('test-project', limit=1)
+        assert recent, 'expected the failed run to be persisted by the journal'
+        run = recent[0]
+        assert 'memory_consolidator' in run.stage_reports, (
+            "Stage 1's report must remain present when Stage 2 fails"
+        )
+
+    @pytest.mark.asyncio
+    async def test_stage2_failure_preserves_real_stage1_ledger_row_without_overwrite(
+        self, journal, event_buffer, mock_memory_service, ledger_store
+    ):
+        """Non-regression guard for the design's core invariant (see this
+        method's docstring on the harness): once Stage 1's in-stage write has
+        actually produced a real, non-degraded ledger row,
+        ``run()`` cannot raise afterwards — that write is its last statement —
+        so ``current_stage_name`` has already advanced past Stage 1 by the
+        time any later failure reaches the finally block. This drives a REAL
+        write_stage1_cycle_summary call from Stage 1 (unlike the sibling
+        tests above, which stub .run entirely) and proves the backstop never
+        clobbers that real row with a degraded synthesis when Stage 2 then
+        fails.
+        """
+        import json
+
+        from fused_memory.models.reconciliation import StageId
+        from fused_memory.reconciliation.stages.memory_consolidator import (
+            write_stage1_cycle_summary,
+        )
+
+        mock_memory_service.recon_ledger = ledger_store
+        mock_memory_service.get_memories_by_metadata = AsyncMock(return_value=[])
+        harness = _make_test_harness(journal, event_buffer, mock_memory_service)
+
+        real_report = StageReport(
+            stage=StageId.memory_consolidator,
+            started_at=datetime.now(UTC),
+            completed_at=datetime.now(UTC),
+            items_flagged=[],
+            stats={},
+            llm_calls=7,
+            tokens_used=4242,
+        )
+
+        async def real_stage1_run(events, watermark, prior_reports, run_id, model=None):
+            # Mirrors MemoryConsolidator.run()'s actual last statement: the
+            # real in-stage write completes, and only then is the report
+            # returned — so current_stage_name has already moved to Stage 2
+            # by the time it raises below.
+            written = await write_stage1_cycle_summary(
+                mock_memory_service, 'test-project', real_report, run_id,
+            )
+            real_report.stats['stage1_cycle_summary_ledger_written'] = 1 if written else 0
+            return real_report
+
+        harness.stages[0].run = real_stage1_run
+        harness.stages[1].run = AsyncMock(side_effect=RuntimeError('stage2 exploded'))
+
+        with pytest.raises(RuntimeError, match='stage2 exploded'):
+            await harness.run_full_cycle('test-project', 'test-trigger')
+
+        recent = await journal.get_recent_runs('test-project', limit=1)
+        assert recent, 'expected the failed run to be persisted by the journal'
+        run_id = recent[0].id
+
+        record = await ledger_store.get_by_identity(
+            'test-project', 'cycle_summary', flag_type='memory_consolidator', run_id=run_id,
+        )
+        assert record is not None, 'the real in-stage ledger row must still exist'
+
+        payload = json.loads(record.payload_json)
+        assert payload['llm_calls'] == 7, (
+            "the real row's llm_calls must survive Stage 2 failing afterward — the "
+            'finally-block backstop must not overwrite it with a degraded synthesis'
+        )
+        assert 'stage1_cycle_summary_degraded_backstop' not in payload['stats'], (
+            'a real ledger row must never be replaced by the harness-synthesized '
+            'degraded one'
+        )
+
+    @pytest.mark.asyncio
+    async def test_backstop_failure_does_not_mask_original_exception_or_skip_persistence(
+        self, journal, event_buffer, mock_memory_service, ledger_store
+    ):
+        """A failing backstop write must never mask the real Stage 1 exception
+        nor prevent the finally block's existing update_run_stage_reports
+        persistence step from running (task 2440).
+
+        Without _ensure_stage1_cycle_summary's own try/except, an unhandled
+        exception raised inside a finally block replaces whatever exception
+        was already propagating — so an unguarded backstop failure would
+        both swallow the real 'stage1 exploded' error AND, because it raises
+        before reaching the next statement, skip update_run_stage_reports.
+        """
+        mock_memory_service.recon_ledger = ledger_store
+        mock_memory_service.get_memories_by_metadata = AsyncMock(return_value=[])
+        harness = _make_test_harness(journal, event_buffer, mock_memory_service)
+        harness.stages[0].run = AsyncMock(side_effect=RuntimeError('stage1 exploded'))
+        harness.journal.update_run_stage_reports = AsyncMock()
+
+        with patch(
+            'fused_memory.reconciliation.harness.write_stage1_cycle_summary',
+            AsyncMock(side_effect=RuntimeError('ledger boom')),
+        ), pytest.raises(RuntimeError, match='stage1 exploded'):
+            await harness.run_full_cycle('test-project', 'buffer_size:2')
+
+        harness.journal.update_run_stage_reports.assert_awaited_once()
+
+
 @pytest.mark.asyncio
 async def test_finding_partition_actionable_vs_non_actionable():
     """Partition logic: actionable findings trigger remediation, non-actionable get escalated."""
