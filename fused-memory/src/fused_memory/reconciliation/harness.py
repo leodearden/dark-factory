@@ -2031,57 +2031,29 @@ class ReconciliationHarness:
         Structural backstop for the in-stage deterministic write
         (``write_stage1_cycle_summary``, called from
         :meth:`~fused_memory.reconciliation.stages.memory_consolidator.MemoryConsolidator.run`,
-        task 2229 W5-λ): that write is the last statement of Stage 1's
-        ``run()``, so it is skipped whenever the Stage 1 turn raises before
-        completing — a CLI timeout surfaced as ``asyncio.CancelledError``,
-        ``AllAccountsCappedException``, or any unwrapped post-processing
-        exception. Called from :meth:`run_full_cycle`'s ``finally`` block, so
-        this runs on every exit path regardless of whether Stage 1 completed.
+        task 2229 W5-λ), which is the last statement of Stage 1's ``run()``
+        and so is skipped whenever the Stage 1 turn raises before
+        completing. Called from :meth:`run_full_cycle`'s ``finally`` block,
+        so this runs on every exit path regardless of whether Stage 1
+        completed; it fires only when Stage 1 started but recorded no report
+        (the happy path and a Stage-2/3 failure both no-op). See task 2440's
+        plan for the proof that this gate is exactly equivalent to "Stage 1
+        raised before its own write".
 
-        The gate ``current_stage_name == StageId.memory_consolidator.value``
-        is provably equivalent to "Stage 1 raised before writing its own
-        summary": ``current_stage_name`` is set to Stage 1's id at the start
-        of its loop iteration and only advances to Stage 2's id when Stage 2
-        starts, and ``run()`` cannot raise AFTER its in-stage write (that
-        write is the last statement, and ``write_stage1_cycle_summary`` never
-        raises). The ``StageId.memory_consolidator.value not in
-        run.stage_reports`` clause is defense-in-depth against a future
-        stage-order refactor — derived from the same enum member as the
-        first clause so the two can never silently diverge.
-        Both the happy path (ends at ``integrity_check``) and a Stage-2/3
-        failure (Stage 1's report already recorded) no-op here — so this
-        never depends on the ``stage1_cycle_summary_ledger_written`` stat.
+        The synthesized report is honestly degraded, not fabricated:
+        ``llm_calls``/``tokens_used`` are 0 and ``started_at`` is the
+        whole-cycle anchor rather than Stage 1's real start — both are
+        unrecoverable once ``run()`` raised without returning a report — so
+        the implied duration is an upper bound, not a measurement. The
+        ``stage1_cycle_summary_degraded_backstop`` stat self-identifies the
+        row as harness-synthesized.
 
-        On the raise path there is no captured ``StageReport`` — llm_calls/
-        tokens live inside ``BaseStage.run()`` and are lost with the
-        exception — so a degraded report is synthesized from harness-side
-        timing data alone. This leaves a truthful (not fabricated-metrics)
-        breadcrumb: the ``stage1_cycle_summary_degraded_backstop`` stat
-        self-identifies the row as harness-synthesized rather than a genuine
-        in-stage write. Note ``started_at`` is set to ``cycle_start_time`` —
-        the whole-cycle anchor taken before Stage 0 setup (task-tree fetch,
-        census cross-verify, queue-health read) — not Stage 1's real start,
-        since that is unrecoverable once ``run()`` raised without returning
-        a report. The synthesized ``completed_at - started_at`` therefore
-        *overstates* Stage 1's true elapsed time; treat it as an upper bound
-        for latency diagnosis, not a measured duration.
-
-        This method must never raise: it is awaited unshielded inside
-        ``run_full_cycle``'s ``finally`` block, immediately before the
-        existing ``update_run_stage_reports`` persistence call. An exception
-        raised here (mid-finally, with another exception already
-        propagating) would replace that propagating exception rather than
-        chain alongside it, and would also skip the subsequent
-        ``update_run_stage_reports`` call. A second cancellation arriving
-        while the ledger write is in flight (e.g. server shutdown racing a
-        CLI-timeout-triggered ``CancelledError``) is the sharpest version of
-        this: without protection it would raise ``CancelledError`` out of
-        this method, replacing the original propagating exception. So the
-        write itself runs under ``asyncio.shield`` (mirroring the
-        ``CancelledError`` handler above) and the whole body is wrapped in a
-        blanket ``except BaseException`` — not just ``Exception`` — that logs
-        and swallows, so even that second cancellation can't mask the real
-        error or skip the persistence step that follows.
+        Must never raise: awaited unshielded in the ``finally``, immediately
+        before ``update_run_stage_reports``. An exception here would replace
+        whatever exception is already propagating and skip that persistence
+        call, so the body swallows ``BaseException`` and the write itself
+        runs under ``asyncio.shield`` to survive a second cancellation
+        arriving mid-write.
         """
         if not (
             current_stage_name == StageId.memory_consolidator.value
@@ -2092,25 +2064,20 @@ class ReconciliationHarness:
         try:
             degraded_report = StageReport(
                 stage=StageId.memory_consolidator,
-                # Whole-cycle anchor, not Stage 1's real start — see the
-                # docstring note above; the implied duration is an upper
-                # bound, not a measured Stage-1 elapsed time.
+                # Whole-cycle anchor, not Stage 1's real start (see docstring).
                 started_at=cycle_start_time,
                 completed_at=datetime.now(UTC),
                 items_flagged=[],
                 stats={'stage1_cycle_summary_degraded_backstop': True},
-                # llm_calls/tokens_used are zeroed, not "no work happened" —
-                # Stage 1's real counts live inside BaseStage.run() and are
-                # lost with the exception (see docstring). Any dashboard that
-                # sums llm_calls/tokens across cycles without filtering out
-                # stats['stage1_cycle_summary_degraded_backstop'] is True rows
-                # will silently undercount the work Stage 1 did before raising.
+                # Zeroed, not "no work happened" (see docstring). Dashboards summing
+                # llm_calls/tokens across cycles should filter out
+                # stats['stage1_cycle_summary_degraded_backstop'] rows first, or they
+                # will silently undercount.
                 llm_calls=0,
                 tokens_used=0,
             )
-            # Shielded so a second cancellation arriving while this write is in
-            # flight can't abort it mid-write — it keeps running to completion
-            # in its own Task even if this await itself raises CancelledError.
+            # Shielded against a second cancellation arriving mid-write (see
+            # docstring); the write keeps running to completion in its own Task.
             ledger_written = await asyncio.shield(
                 write_stage1_cycle_summary(
                     self.memory, project_id, degraded_report, run_id,
@@ -2131,16 +2098,11 @@ class ReconciliationHarness:
             if isinstance(error_record, dict):
                 error_record['stage1_cycle_summary_backstop_written'] = ledger_written
         except BaseException:
-            # BaseException (not just Exception) so a second CancelledError —
-            # from the shield above being interrupted, or from any other
-            # BaseException — is logged and swallowed here rather than
-            # propagating out and replacing the exception already unwinding
-            # through run_full_cycle's finally block. This also intentionally
-            # swallows SystemExit/KeyboardInterrupt if either fires during
-            # this narrow, bounded shielded write — acceptable here since the
-            # only work in scope is a single best-effort ledger upsert, and
-            # letting it interrupt the finally would still risk skipping the
-            # update_run_stage_reports call that follows.
+            # BaseException (not Exception): also catches a second cancellation
+            # and, deliberately, SystemExit/KeyboardInterrupt — this is a single
+            # narrow, bounded best-effort upsert, and letting any of those
+            # interrupt the finally risks skipping the update_run_stage_reports
+            # call that follows (see docstring).
             logger.warning(
                 'reconciliation.stage1_cycle_summary_backstop_failed',
                 exc_info=True,
