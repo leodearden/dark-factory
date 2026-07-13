@@ -362,6 +362,36 @@ class TestPruneWorktreesGuard:
         )
         callback.assert_not_called()
 
+    async def test_prune_runs_and_recreates_sentinel_when_bootstrap_ok(
+        self, git_ops: GitOps,
+    ):
+        """Task 2315, BUG 2: a HEALTHY mount that merely lost its
+        `.pool-root` sentinel (bootstrap-ok True) must RUN `git worktree
+        prune` and recreate the sentinel, not merely skip. Fails today: the
+        pre-2315 bootstrap-ok branch (git_ops.py:7376-7377) logged and
+        returned WITHOUT running prune and WITHOUT recreating the sentinel."""
+        base = git_ops.worktree_base / '_merge-verify' / 'target'
+        base.mkdir(parents=True, exist_ok=True)
+        (base / '.keep').write_text('warm base\n')
+        git_ops.warm_lane_pool = WarmLanePool(worktree_base=git_ops.worktree_base, size=1)
+        assert not git_ops.pool_storage_present()
+        assert git_ops._pool_storage_bootstrap_ok()
+
+        callback = Mock()
+        git_ops._on_pool_storage_absent = callback
+        mock_run = AsyncMock(return_value=(0, '', ''))
+
+        with patch('orchestrator.git_ops._run', mock_run):
+            await git_ops.prune_worktrees()
+
+        mock_run.assert_awaited_once_with(
+            ['git', 'worktree', 'prune'], cwd=git_ops.project_root,
+        )
+        assert git_ops.pool_storage_present() is True, (
+            'expected the sentinel to be recreated on the healthy-mount path'
+        )
+        callback.assert_not_called()
+
 
 def _write_warm_lane_gc_stub(project_root: Path) -> Path:
     """Write a minimal ``warm-lane-gc.sh`` stub at ``<project_root>/scripts/``.
