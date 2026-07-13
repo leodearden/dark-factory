@@ -10,6 +10,16 @@
 //
 // Both export paths are guarded so this file has no effect outside the
 // environment it's actually running in.
+//
+// Staging note: this module is intentionally NOT wired into TaskGraph yet.
+// tab_tasks.jsx still uses its own inline computeTiers (tab_tasks.jsx:19-38)
+// and inline within-tier status sort (tab_tasks.jsx:137) — duplicated here
+// on purpose, see the computeTiers/STATUS_ORDER comments below — and no
+// `<script src="/static/redux/graph_layout.js">` tag has been added to
+// index.html. A follow-up task owns switching TaskGraph over to
+// window.DF_GRAPH_LAYOUT (computeTiers/partitionComponents/orderRows) and
+// deleting the inline duplicates once it does; until then, this module's
+// only consumer is its own node --test suite.
 
 // ── Compute dep tiers for a task list (Kahn's algorithm style; tier = max(deps' tier)+1) ──
 // Verbatim copy of tab_tasks.jsx:19-38 (TaskGraph's computeTiers). Kept in
@@ -215,14 +225,30 @@ function transposePass(rows, edges) {
   }
 }
 
+// Above this many nodes in a single weakly-connected component, orderRows
+// skips the barycenter+transpose optimization entirely and returns the
+// status-sort baseline (candidate 0) unchanged. Both passes are worst-case
+// superlinear in the component's edge count — countCrossings is
+// O(pairEdges^2) per adjacent tier pair, and transposePass calls it once per
+// candidate swap across repeated passes, i.e. roughly
+// O(passes * nodes * tiers * edges^2) — so one unusually large, densely
+// connected component could otherwise cause a noticeable client-side hang
+// (the dashboard's get_tasks can return hundreds of tasks). Real
+// task-dependency components are expected to stay well under this size; the
+// cap only guards the pathological case, trading optimization for a bounded
+// worst case (the status-sort baseline is always a valid, if unoptimized,
+// arrangement).
+const MAX_LAYOUT_OPTIMIZATION_NODES = 150;
+
 // ── Order each tier's rows to minimize edge crossings (barycenter + transpose) ──
 // 1. Bucket componentTasks by tier, stable-sorting each bucket by
 //    STATUS_ORDER (input order as tiebreak) — this is candidate 0.
-// 2. Run 4 fixed alternating barycenter sweeps (down, up, down, up) over a
+// 2. Above MAX_LAYOUT_OPTIMIZATION_NODES, stop here and return candidate 0.
+// 3. Run 4 fixed alternating barycenter sweeps (down, up, down, up) over a
 //    working copy, keeping the best (fewest-crossings) arrangement seen,
 //    candidate 0 included — so the result can never be worse than the
 //    status-sort baseline.
-// 3. Run a greedy adjacent-transpose pass on the best arrangement, which can
+// 4. Run a greedy adjacent-transpose pass on the best arrangement, which can
 //    only further reduce (never increase) crossings.
 // No randomness anywhere, and every sort is stable, so the result is
 // deterministic across calls on identical input.
@@ -241,6 +267,10 @@ function orderRows(componentTasks, tiers) {
       })
       .map(entry => entry.t),
   );
+
+  if (componentTasks.length > MAX_LAYOUT_OPTIMIZATION_NODES) {
+    return rows; // see MAX_LAYOUT_OPTIMIZATION_NODES — too large to safely optimize
+  }
 
   const edges = deriveEdges(componentTasks);
 
