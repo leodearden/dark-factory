@@ -26,6 +26,7 @@ from typing import Literal
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 __all__ = [
+    'CapabilityManifestDoc',
     'DeliveredCheck',
     'ManifestCapability',
     'ManifestTask',
@@ -158,3 +159,33 @@ class ManifestTask(BaseModel):
     task_id: int | None = None
     title: str | None = None
     capabilities: list[ManifestCapability]
+
+
+class CapabilityManifestDoc(BaseModel):
+    """The full capability-manifest sidecar document (PRD §Contract).
+
+    ``schema_version`` is pinned to ``1`` — the only version this loader
+    validates today. The doc-level validator enforces label non-empty +
+    uniqueness across ``tasks``: uniqueness can only be checked with the
+    whole task list in view (an individual :class:`ManifestTask`'s own
+    ``min_length=1`` on ``label`` already rejects an empty label on its
+    own, so that branch here is a defense-in-depth restatement of the same
+    rule at doc granularity).
+    """
+
+    model_config = ConfigDict(extra='forbid')
+
+    prd: str
+    schema_version: Literal[1]
+    tasks: list[ManifestTask]
+
+    @model_validator(mode='after')
+    def _check_labels(self) -> CapabilityManifestDoc:
+        seen: set[str] = set()
+        for task in self.tasks:
+            if not task.label:
+                raise ValueError('CapabilityManifestDoc: task label must be non-empty.')
+            if task.label in seen:
+                raise ValueError(f'CapabilityManifestDoc: duplicate task label {task.label!r}.')
+            seen.add(task.label)
+        return self
