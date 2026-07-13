@@ -36,8 +36,64 @@ function computeTiers(tasks) {
 }
 
 // ── Partition a task list into weakly-connected components + singletons ──
+// Builds an undirected adjacency graph from the in-list deps edge list (a
+// task and each dep whose id is present in the input set are connected in
+// both directions, so "in-list deps" covers both parent- and child-side
+// edges). The weakly-connected components of that graph become
+// `components`; a node with zero in-list edges (either direction) is a
+// `singleton`. Every step iterates the input array in order (never a
+// Set/Map's native iteration order) so the result is fully deterministic:
+// components are emitted in the order their earliest-input-index member is
+// first reached, and both component members and singletons preserve their
+// original input order.
 function partitionComponents(tasks) {
-  return { components: [], singletons: [] };
+  const ids = tasks.map(t => t.id);
+  const byId = new Map(tasks.map(t => [t.id, t]));
+  const adjacency = new Map(ids.map(id => [id, new Set()]));
+
+  for (const t of tasks) {
+    for (const d of t.deps || []) {
+      if (byId.has(d.id) && d.id !== t.id) {
+        adjacency.get(t.id).add(d.id);
+        adjacency.get(d.id).add(t.id);
+      }
+    }
+  }
+
+  const visited = new Set();
+  const components = [];
+  const singletons = [];
+
+  for (const id of ids) {
+    if (visited.has(id)) continue;
+
+    if (adjacency.get(id).size === 0) {
+      visited.add(id);
+      singletons.push(byId.get(id));
+      continue;
+    }
+
+    // BFS out from `id` (the earliest-index unvisited member of this
+    // component) to find the rest of the component, then re-derive member
+    // order from `ids` rather than BFS discovery order.
+    const memberIds = new Set([id]);
+    visited.add(id);
+    const queue = [id];
+    while (queue.length > 0) {
+      const current = queue.shift();
+      for (const neighbor of adjacency.get(current)) {
+        if (!memberIds.has(neighbor)) {
+          memberIds.add(neighbor);
+          visited.add(neighbor);
+          queue.push(neighbor);
+        }
+      }
+    }
+
+    components.push(ids.filter(candidate => memberIds.has(candidate)).map(candidate => byId.get(candidate)));
+  }
+
+  return { components, singletons };
 }
 
 // ── Order each tier's rows to minimize edge crossings (barycenter + transpose) ──
