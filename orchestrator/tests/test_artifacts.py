@@ -28,6 +28,9 @@ class TestInit:
         assert (artifacts.root / 'metadata.json').exists()
         assert (artifacts.root / 'reviews').is_dir()
 
+    def test_creates_verdicts_directory(self, artifacts: TaskArtifacts):
+        assert (artifacts.root / 'verdicts').is_dir()
+
     def test_init_writes_no_gitignore(self, artifacts: TaskArtifacts):
         """W11-ι: init() no longer writes a .gitignore — .task-meta/ lives
         outside the worktree, so there's nothing for git to ignore.
@@ -516,6 +519,64 @@ class TestAgentSession:
     def test_read_returns_none_on_corrupt_json(self, artifacts: TaskArtifacts):
         (artifacts.root / 'agent_session.json').write_text('{not valid json')
         assert artifacts.read_agent_session() is None
+
+
+class TestVerdicts:
+    """Verdict artifacts written by the verdict-tools MCP server (task 2481)."""
+
+    def test_write_read_roundtrip(self, artifacts: TaskArtifacts):
+        envelope = {
+            'role': 'judge',
+            'schema_version': 1,
+            'session_id': 's',
+            'emitted_at': 't',
+            'verdict': {'complete': True},
+        }
+        artifacts.write_verdict('judge', envelope)
+        assert (artifacts.root / 'verdicts' / 'judge.json').exists()
+        assert artifacts.read_verdict('judge') == envelope
+
+    def test_read_returns_none_when_missing(self, artifacts: TaskArtifacts):
+        assert artifacts.read_verdict('missing') is None
+
+    def test_read_returns_none_on_corrupt_json(self, artifacts: TaskArtifacts):
+        (artifacts.root / 'verdicts' / 'judge.json').write_text('{not valid json')
+        assert artifacts.read_verdict('judge') is None
+
+    def test_clear_removes_file(self, artifacts: TaskArtifacts):
+        envelope = {
+            'role': 'judge',
+            'schema_version': 1,
+            'session_id': 's',
+            'emitted_at': 't',
+            'verdict': {'complete': True},
+        }
+        artifacts.write_verdict('judge', envelope)
+        artifacts.clear_verdict('judge')
+        assert not (artifacts.root / 'verdicts' / 'judge.json').exists()
+        assert artifacts.read_verdict('judge') is None
+
+    def test_clear_is_idempotent(self, artifacts: TaskArtifacts):
+        artifacts.clear_verdict('judge')  # must not raise
+        artifacts.clear_verdict('judge')  # still idempotent
+
+    @pytest.mark.parametrize('bad_role', ['../escape', 'a/b', '..', '.', '/etc/passwd', 'judge\n'])
+    def test_write_verdict_rejects_unsafe_role(self, artifacts: TaskArtifacts, bad_role):
+        with pytest.raises(ValueError, match='invalid verdict role'):
+            artifacts.write_verdict(bad_role, {'role': bad_role})
+        # Nothing escaped verdicts/ or landed anywhere under root.
+        assert not any(artifacts.root.rglob('escape*'))
+        assert not any(artifacts.root.rglob('passwd*'))
+
+    @pytest.mark.parametrize('bad_role', ['../escape', 'a/b', '..', '.', '/etc/passwd', 'judge\n'])
+    def test_read_verdict_rejects_unsafe_role(self, artifacts: TaskArtifacts, bad_role):
+        with pytest.raises(ValueError, match='invalid verdict role'):
+            artifacts.read_verdict(bad_role)
+
+    @pytest.mark.parametrize('bad_role', ['../escape', 'a/b', '..', '.', '/etc/passwd', 'judge\n'])
+    def test_clear_verdict_rejects_unsafe_role(self, artifacts: TaskArtifacts, bad_role):
+        with pytest.raises(ValueError, match='invalid verdict role'):
+            artifacts.clear_verdict(bad_role)
 
 
 class TestReviews:
@@ -1142,6 +1203,24 @@ class TestWorktreeMissingTolerance:
         ta.write_review('reviewer-x', {'verdict': 'PASS', 'issues': []})
         # And nothing was created
         assert not ta.root.exists()
+
+    def test_write_verdict_skips_when_root_gone(self, tmp_path: Path):
+        worktree = tmp_path / 'gone-verdict'
+        worktree.mkdir()
+        ta = TaskArtifacts(worktree)
+        ta.init('task-v', 'gone', 'desc')
+        import shutil
+        shutil.rmtree(worktree)
+        assert not ta.root.is_dir()
+
+        # Must not raise
+        ta.write_verdict('judge', {
+            'role': 'judge', 'schema_version': 1, 'session_id': 's',
+            'emitted_at': 't', 'verdict': {'complete': True},
+        })
+        # And nothing was created
+        assert not ta.root.exists()
+        assert ta.read_verdict('judge') is None
 
     def test_write_json_skips_when_root_gone(self, tmp_path: Path):
         worktree = tmp_path / 'also-gone'
