@@ -313,6 +313,50 @@ def iter_interrupts(records: list[dict[str, Any]]) -> list[dict[str, Any]]:
     return hits
 
 
+RETRY_MIN = 3
+"""Minimum repeat count for a same-tool/same-input group to count as a
+near-identical retry loop."""
+
+
+def _input_signature(tool_input: Any) -> str:
+    """Canonical, UNTRUNCATED string signature of a tool_use ``input`` dict.
+
+    Used for retry-loop grouping -- unlike :func:`_summarize_input` (a
+    size-capped display string), this must never be truncated: truncating
+    could collapse two distinct long inputs onto the same prefix and
+    produce a false-positive retry-loop group.
+    """
+    try:
+        return json.dumps(tool_input, sort_keys=True)
+    except TypeError:
+        return str(tool_input)
+
+
+def find_retry_loops(records: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Group tool_use calls by (name, canonical input signature) and flag
+    groups recurring >= RETRY_MIN times as near-identical retry loops.
+
+    Deterministic and dependency-free (sibling to the decoy-FAIL decision,
+    PRD Sec 13.2): no fuzzy string similarity, just "same tool, same
+    canonical-JSON input, again".
+    """
+    groups: dict[tuple[str, str], list[int]] = {}
+    for index, block in _iter_tool_use_blocks(records):
+        key = (block.get('name'), _input_signature(block.get('input')))
+        groups.setdefault(key, []).append(index)
+
+    loops = []
+    for (name, signature), indices in groups.items():
+        if len(indices) >= RETRY_MIN:
+            loops.append({
+                'tool': name,
+                'signature': signature,
+                'count': len(indices),
+                'indices': indices,
+            })
+    return loops
+
+
 def iter_user_turns(records: list[dict[str, Any]]) -> list[dict[str, Any]]:
     """Return genuine non-sidechain, non-meta human user turns.
 
