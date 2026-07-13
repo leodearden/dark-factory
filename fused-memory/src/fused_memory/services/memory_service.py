@@ -500,7 +500,7 @@ def _is_rate_limit_or_quota_error(exc: BaseException) -> bool:
     if status_code == 429:
         return True
     code = str(getattr(exc, 'code', '') or '')
-    if 'insufficient_quota' in code:
+    if 'insufficient_quota' in code.lower():
         return True
     if status_code is None and not code:
         return 'insufficient_quota' in str(exc).lower()
@@ -524,6 +524,34 @@ def _graphiti_degraded_entity_result() -> dict:
         'degraded': True,
         'failed_stores': [SourceStore.graphiti.value],
     }
+
+
+def _degrade_or_reraise(exc: Exception, name: str) -> dict:
+    """Classify *exc*: return get_entity's degraded superset dict, or re-raise.
+
+    Shared by get_entity's exact-match and fuzzy-fallback ``except`` blocks
+    (task 2448 review) so the classification guard, warning log, and
+    degraded-dict return can't drift apart between the two call sites.
+    Re-raises *exc* unchanged (same object, so callers still see the
+    original type/traceback) when ``_is_rate_limit_or_quota_error(exc)`` is
+    False.
+
+    The warning log deliberately does not hardcode "429": the
+    message-substring fallback branch of ``_is_rate_limit_or_quota_error``
+    can match an error that carries no ``status_code`` attribute at all, so
+    asserting 429 unconditionally would misdescribe that classification path
+    (task 2448 review). It logs the exception's actual
+    ``getattr(exc, 'status_code', None)`` instead.
+    """
+    if not _is_rate_limit_or_quota_error(exc):
+        raise exc
+    logger.warning(
+        'get_entity degraded: rate-limit/quota error for %r (status_code=%s): %s',
+        name,
+        getattr(exc, 'status_code', None),
+        exc,
+    )
+    return _graphiti_degraded_entity_result()
 
 
 class SearchResults(list):
@@ -2620,14 +2648,7 @@ class MemoryService:
                     logger=logger,
                 )
         except Exception as exc:
-            if not _is_rate_limit_or_quota_error(exc):
-                raise
-            logger.warning(
-                'get_entity degraded: rate-limit/quota error (429) for %r: %s',
-                name,
-                exc,
-            )
-            return _graphiti_degraded_entity_result()
+            return _degrade_or_reraise(exc, name)
 
         if exact:
             edge_lists = cast(list, edge_results)
@@ -2674,14 +2695,7 @@ class MemoryService:
                 logger=logger,
             )
         except Exception as exc:
-            if not _is_rate_limit_or_quota_error(exc):
-                raise
-            logger.warning(
-                'get_entity degraded: rate-limit/quota error (429) for %r: %s',
-                name,
-                exc,
-            )
-            return _graphiti_degraded_entity_result()
+            return _degrade_or_reraise(exc, name)
 
         nodes = cast(list, results[0])
         edges = cast(list, results[1])
