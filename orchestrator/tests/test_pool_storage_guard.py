@@ -455,6 +455,40 @@ class TestWarmLaneGcReclaimGuard:
         )
         callback.assert_not_called()
 
+    async def test_reclaim_runs_and_recreates_sentinel_when_bootstrap_ok(
+        self, git_ops: GitOps,
+    ):
+        """Task 2315, BUG 2: a HEALTHY mount that merely lost its
+        `.pool-root` sentinel (bootstrap-ok True — a populated
+        _merge-verify/target proves the mount is up) must PROCEED with the
+        reclaim and recreate the sentinel, not refuse forever. Fails today:
+        the old inline guard (git_ops.py:2238, pre-2315) had no bootstrap
+        escape at all."""
+        base = git_ops.worktree_base / '_merge-verify' / 'target'
+        base.mkdir(parents=True, exist_ok=True)
+        (base / '.keep').write_text('warm base\n')
+        script = _write_warm_lane_gc_stub(git_ops.project_root)
+        git_ops.warm_lane_pool = WarmLanePool(worktree_base=git_ops.worktree_base, size=1)
+        assert not git_ops.pool_storage_present()
+        assert git_ops._pool_storage_bootstrap_ok()
+
+        callback = Mock()
+        git_ops._on_pool_storage_absent = callback
+        mock_run = AsyncMock(return_value=(0, '', ''))
+
+        with patch('orchestrator.git_ops._run', mock_run):
+            rc = await git_ops._run_warm_lane_gc_reclaim()
+
+        assert rc == 0
+        mock_run.assert_awaited_once_with(
+            [str(script), 'reclaim', '--mount', str(git_ops.worktree_base)],
+            cwd=git_ops.project_root,
+        )
+        assert git_ops.pool_storage_present() is True, (
+            'expected the sentinel to be recreated on the healthy-mount path'
+        )
+        callback.assert_not_called()
+
 
 # ---------------------------------------------------------------------------
 # Real-repo fixtures for the acquire create-once discriminator (step-7/8).
