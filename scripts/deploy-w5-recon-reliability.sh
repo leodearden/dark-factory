@@ -96,11 +96,31 @@ restart_start="$(date +%s)"
 echo "Restarting ${SERVICE}..."
 systemctl --user restart "$SERVICE"
 
-# Verify (placeholder single-attempt checks -- upgraded to real bounded
-# polling loops with pass/fail handling in step-6 [health gate] and step-8
-# [recon-serving gate]; for now this only wires the restart-then-verify
-# ordering, it does not yet act on either check's outcome).
-curl -sf "$HEALTH_URL" > /dev/null 2>&1 || true
+# 1. Health gate: wait for /health to report ready (reuses
+# restart-fused-memory.sh:47-65's curl -sf polling idiom).
+echo -n "Waiting for health..."
+deadline=$((SECONDS + HEALTH_TIMEOUT))
+healthy=false
+while [[ $SECONDS -lt $deadline ]]; do
+    if curl -sf "$HEALTH_URL" > /dev/null 2>&1; then
+        healthy=true
+        break
+    fi
+    echo -n "."
+    sleep 1
+done
+
+if ! $healthy; then
+    echo " FAILED"
+    echo "ERROR: fused-memory did not become healthy within ${HEALTH_TIMEOUT}s" >&2
+    exit 1
+fi
+echo " OK"
+
+# 2. Serving-sanity gate (placeholder single-attempt check -- upgraded to a
+# real bounded polling loop with pass/fail handling in step-8; for now this
+# only wires the restart-then-health-then-serving ordering, it does not yet
+# act on the outcome).
 journalctl --user -u "$SERVICE" --since "@${restart_start}" --no-pager -q \
     | grep -q "$RECON_MARKER" || true
 
