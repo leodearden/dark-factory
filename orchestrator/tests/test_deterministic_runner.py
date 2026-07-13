@@ -800,6 +800,223 @@ class TestBeforeDoneCrossUnitDeploy:
 
 
 # ---------------------------------------------------------------------------
+# Task 2238 (W10-δ), step-3: run()'s cross-unit `if not self_target:` branch
+# delegates run+verify to proc_supervision.RestartPlan.execute() with a
+# FreshPidVerify instead of an inline run-then-reinspect block.
+# (RED until step-4 rewrites the cross-unit branch)
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+class TestCrossUnitDeployDelegatesToRestartPlan:
+    """DeterministicRunner.run()'s cross-unit branch delegates run+verify to
+    proc_supervision.RestartPlan.execute() (task 2238/δ)."""
+
+    def _make_runner(
+        self, tmp_path: Path, task: dict, *,
+        own_unit_resolver=lambda: 'orchestrator.service',
+        script_runner=None,
+        unit_inspector=None,
+        **extra,
+    ):
+        """Build a runner with a KNOWN, non-target own_unit_resolver (so the
+        cross-unit branch is reached with a truthy own_unit, distinct from
+        the ORCH_UNIT-unset fail-open case covered separately below)."""
+        from orchestrator.deterministic_runner import DeterministicRunner
+        queue = EscalationQueue(tmp_path)
+        scheduler = _mock_scheduler(task)
+        runner = DeterministicRunner(
+            scheduler=scheduler,
+            escalation_queue=queue,
+            unit_inspector=(
+                unit_inspector if unit_inspector is not None
+                else AsyncMock(side_effect=[_BASELINE_UNIT_STATE, _FRESH_UNIT_STATE])
+            ),
+            script_runner=(
+                script_runner if script_runner is not None
+                else AsyncMock(return_value=(0, 'ok'))
+            ),
+            own_unit_resolver=own_unit_resolver,
+            **extra,
+        )
+        return runner, queue, scheduler
+
+    async def test_execute_awaited_once_with_cross_unit_fresh_pid_verify_plan(self, tmp_path: Path):
+        """RestartPlan.execute() awaited once; the constructed plan carries a
+        FreshPidVerify built from the persisted baseline, no transient_unit,
+        no on_failure_escalation, and a truthy own_unit != target_unit."""
+        from unittest.mock import patch
+
+        from orchestrator.proc_supervision import (
+            FreshPidVerify, RestartDisposition, RestartOutcome, RestartPlan,
+        )
+
+        task = _deploy_task(task_id='960', target_unit='orchestrator-reify.service')
+        assignment = _make_assignment(task)
+        runner, queue, scheduler = self._make_runner(tmp_path, task)
+
+        captured_plans: list = []
+        canned = RestartOutcome(disposition=RestartDisposition.DEPLOYED_AND_VERIFIED)
+
+        async def _fake_execute(self, *, runner=None, inspector=None):
+            captured_plans.append(self)
+            return canned
+
+        with patch.object(RestartPlan, 'execute', _fake_execute):
+            await runner.run(assignment)
+
+        assert len(captured_plans) == 1, 'RestartPlan.execute must be awaited exactly once'
+        plan = captured_plans[0]
+
+        assert isinstance(plan.verify, FreshPidVerify)
+        assert plan.verify.baseline_main_pid == _BASELINE_UNIT_STATE['MainPID']
+        assert plan.verify.baseline_active_enter_monotonic == (
+            _BASELINE_UNIT_STATE['ActiveEnterTimestampMonotonic']
+        )
+        assert plan.verify.inspect_timeout_secs == runner._inspect_timeout_secs
+        assert plan.transient_unit is None
+        assert plan.on_failure_escalation is None
+        assert plan.target_unit == 'orchestrator-reify.service'
+        assert plan.own_unit, 'own_unit must be truthy'
+        assert plan.own_unit != plan.target_unit
+
+    async def test_deployed_and_verified_happy_path_via_real_execute(self, tmp_path: Path):
+        """A REAL execute() DEPLOYED_AND_VERIFIED disposition drives done with
+        fresh provenance, routes the run through the hardened seam, and
+        re-inspects exactly twice (baseline + the capturing verify)."""
+        from orchestrator.workflow import WorkflowOutcome
+
+        task = _deploy_task(task_id='961', target_unit='orchestrator-reify.service')
+        assignment = _make_assignment(task)
+        unit_inspector = AsyncMock(side_effect=[_BASELINE_UNIT_STATE, _FRESH_UNIT_STATE])
+        script_runner = AsyncMock(return_value=(0, 'ok'))
+        runner, queue, scheduler = self._make_runner(
+            tmp_path, task, unit_inspector=unit_inspector, script_runner=script_runner,
+        )
+
+        outcome = await runner.run(assignment)
+
+        assert outcome == WorkflowOutcome.DONE
+        scheduler.set_task_status.assert_awaited_once()
+        call = scheduler.set_task_status.call_args
+        assert call.args[1] == 'done'
+        provenance = call.kwargs.get('done_provenance')
+        assert provenance['kind'] == 'deterministic-deploy'
+        assert provenance['pid'] == _FRESH_UNIT_STATE['MainPID']
+        assert provenance['active_enter_timestamp'] == _FRESH_UNIT_STATE['ActiveEnterTimestamp']
+
+        script_runner.assert_awaited_once_with(task['metadata']['before_done'])
+        assert unit_inspector.await_count == 2
+
+    async def test_restart_failed_disposition_files_deploy_failed_infra_issue(self, tmp_path: Path):
+        """script_runner rc≠0 -> RestartDisposition.RESTART_FAILED -> blocked,
+        summary 'Deploy failed: {unit}' (unchanged from pre-delegation)."""
+        from orchestrator.workflow import WorkflowOutcome
+
+        task = _deploy_task(task_id='962', target_unit='orchestrator-reify.service')
+        assignment = _make_assignment(task)
+        script_runner = AsyncMock(return_value=(1, 'boom'))
+        runner, queue, scheduler = self._make_runner(
+            tmp_path, task,
+            unit_inspector=AsyncMock(return_value=_BASELINE_UNIT_STATE),
+            script_runner=script_runner,
+        )
+
+        outcome = await runner.run(assignment)
+
+        assert outcome == WorkflowOutcome.BLOCKED
+        pending = queue.get_by_task('962', status='pending')
+        assert len(pending) == 1
+        assert pending[0].summary == 'Deploy failed: orchestrator-reify.service'
+        assert 'boom' in pending[0].detail
+
+    async def test_verify_failed_disposition_files_deploy_verify_failed_infra_issue(self, tmp_path: Path):
+        """Fresh inspect returns the MainPID=0 sentinel -> RestartDisposition.
+        VERIFY_FAILED -> blocked, summary 'Deploy verify failed: {unit}'
+        (unchanged from pre-delegation)."""
+        from orchestrator.workflow import WorkflowOutcome
+
+        task = _deploy_task(task_id='963', target_unit='orchestrator-reify.service')
+        assignment = _make_assignment(task)
+        stale_state = {
+            'MainPID': 0, 'ActiveState': 'failed',
+            'ActiveEnterTimestamp': 'Mon 2026-06-23 10:01:00 UTC',
+            'ActiveEnterTimestampMonotonic': 2_000_000,
+        }
+        unit_inspector = AsyncMock(side_effect=[_BASELINE_UNIT_STATE, stale_state])
+        runner, queue, scheduler = self._make_runner(
+            tmp_path, task, unit_inspector=unit_inspector,
+        )
+
+        outcome = await runner.run(assignment)
+
+        assert outcome == WorkflowOutcome.BLOCKED
+        pending = queue.get_by_task('963', status='pending')
+        assert len(pending) == 1
+        assert pending[0].summary == 'Deploy verify failed: orchestrator-reify.service'
+
+    async def test_fail_open_orch_unit_unset_still_runs_deploy_through_execute(
+        self, tmp_path: Path, monkeypatch,
+    ):
+        """ORCH_UNIT unset (own_unit='') must still RUN the cross-unit deploy
+        via execute()'s RP-2 path (through the non-self sentinel) rather than
+        RP-1 REFUSED — regression lock for test_env_unset_takes_cross_unit_path."""
+        from orchestrator.deterministic_runner import DeterministicRunner
+        from orchestrator.workflow import WorkflowOutcome
+
+        monkeypatch.delenv('ORCH_UNIT', raising=False)
+        task = _deploy_task(task_id='964', target_unit='orchestrator-reify.service')
+        assignment = _make_assignment(task)
+        queue = EscalationQueue(tmp_path)
+        scheduler = _mock_scheduler(task)
+        script_runner = AsyncMock(return_value=(0, 'ok'))
+        unit_inspector = AsyncMock(side_effect=[_BASELINE_UNIT_STATE, _FRESH_UNIT_STATE])
+
+        # Construct WITHOUT own_unit_resolver — ORCH_UNIT (unset) governs.
+        runner = DeterministicRunner(
+            scheduler=scheduler,
+            escalation_queue=queue,
+            unit_inspector=unit_inspector,
+            script_runner=script_runner,
+        )
+
+        outcome = await runner.run(assignment)
+
+        assert outcome == WorkflowOutcome.DONE
+        script_runner.assert_awaited_once()
+        pending = queue.get_by_task('964', status='pending')
+        assert pending == [], 'RP-1 must never REFUSE this fail-open path'
+
+    async def test_hanging_script_runner_trips_outer_guard_infra_issue(self, tmp_path: Path):
+        """A script_runner that hangs forever still trips the outer wait_for
+        guard (task 2090 Layer B) around the delegated execute() call."""
+        import asyncio as _asyncio
+
+        from orchestrator.workflow import WorkflowOutcome
+
+        task = _deploy_task(
+            task_id='965', target_unit='orchestrator-reify.service', timeout_secs=0,
+        )
+        assignment = _make_assignment(task)
+
+        async def _hang(_before_done):
+            await _asyncio.Event().wait()
+
+        runner, queue, scheduler = self._make_runner(
+            tmp_path, task,
+            unit_inspector=AsyncMock(return_value=_BASELINE_UNIT_STATE),
+            script_runner=_hang,
+            run_timeout_grace_secs=0.05,
+        )
+
+        outcome = await _asyncio.wait_for(runner.run(assignment), timeout=5)
+
+        assert outcome == WorkflowOutcome.BLOCKED
+        pending = queue.get_by_task('965', status='pending')
+        assert len(pending) == 1
+        assert pending[0].summary.startswith('Deploy run_fn timed out')
+
+
+# ---------------------------------------------------------------------------
 # Task 2066: cross-unit writeback resilience — severed-then-recovered connection
 # (RED until the _writeback_deploy_success helper + constructor seams land)
 # ---------------------------------------------------------------------------
