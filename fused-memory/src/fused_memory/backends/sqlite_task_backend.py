@@ -936,6 +936,14 @@ class SqliteTaskBackend:
         # production code paths never set this — it stays None.
         self._after_insert_fault_hook: Callable[[], None] | None = None
         self._connections: dict[str, aiosqlite.Connection] = {}
+        # Cached per-project AUTOCOMMIT (isolation_level=None) read
+        # connections for the hot get_statuses/get_statuses_raw path (task
+        # 2455). Distinct from self._connections (the write connection,
+        # opened in Python sqlite3's legacy deferred-transaction mode): an
+        # autocommit connection never holds a read transaction open across
+        # statements, so it can never be pinned to a stale WAL snapshot the
+        # way the write connection can be. See _get_read_connection.
+        self._read_connections: dict[str, aiosqlite.Connection] = {}
         # Guards the connection map AND each project's first-access bring-up
         # (schema + WAL pragmas). Held briefly during open; released before
         # any user-visible call runs.
@@ -1009,6 +1017,8 @@ class SqliteTaskBackend:
         async with self._connect_locks_lock:
             connection_items = list(self._connections.items())
             self._connections.clear()
+            read_connection_items = list(self._read_connections.items())
+            self._read_connections.clear()
         # Final TRUNCATE checkpoint on each connection so a clean shutdown
         # leaves the WAL empty and the main DB up to date — the prod
         # recovery path on next-open then has nothing to replay. Best-effort:
@@ -1019,6 +1029,12 @@ class SqliteTaskBackend:
             with contextlib.suppress(Exception):
                 await conn.close()
             logger.debug('SqliteTaskBackend final-checkpointed and closed %s', root)
+        # Read connections (task 2455) are autocommit and never write, so
+        # there's no WAL checkpoint to run — just close them, best-effort.
+        for root, read_conn in read_connection_items:
+            with contextlib.suppress(Exception):
+                await read_conn.close()
+            logger.debug('SqliteTaskBackend closed read connection for %s', root)
         logger.info('SqliteTaskBackend closed (%d connection(s))', len(connection_items))
 
     async def is_alive(self) -> tuple[bool, str | None]:
@@ -1115,6 +1131,99 @@ class SqliteTaskBackend:
             self._candidate_key_index_cache[project_root] = await _candidate_key_index_present(conn)
             self._connections[project_root] = conn
             logger.info('SqliteTaskBackend opened %s', db_path)
+            return conn
+
+    async def _get_read_connection(self, project_root: str) -> aiosqlite.Connection:
+        """Return a cached per-project AUTOCOMMIT connection for hot status reads.
+
+        Used by :meth:`get_statuses_raw` (task 2455). Unlike
+        :meth:`_get_connection`'s cached connection — opened in Python
+        sqlite3's legacy deferred-transaction mode, so a read transaction
+        left open on it pins a stale WAL snapshot (task 2388) — this
+        connection is opened with ``isolation_level=None`` (autocommit), so
+        it never holds a transaction open across statements and can never
+        be pinned. It uses the exact same open recipe as
+        :meth:`get_statuses_fresh` (``connect_daemon(..., isolation_level=
+        None)`` + ``apply_wal_pragmas``), but caches the result per
+        ``project_root`` so repeated hot-path calls don't pay a per-call
+        connection-open cost.
+
+        Guardrail: the "never pinned" invariant depends on every reader
+        closing its cursor before returning — a ``SELECT`` cursor left
+        partially stepped (or abandoned mid-iteration because something
+        raised before the statement was exhausted) would keep an implicit
+        WAL read transaction open on *this* connection and re-introduce the
+        task-2388 stale-snapshot pin, this time on the cached read
+        connection. :meth:`_statuses_from_conn` (the sole current caller)
+        enforces this deterministically via ``async with conn.execute(...)
+        as cursor:``, which closes the cursor even if ``fetchall()`` or the
+        row-coercion step raises — so the invariant no longer depends on a
+        reader happening to fully drain the cursor by convention. A future
+        caller that queries this connection directly should use the same
+        pattern (or otherwise guarantee the cursor is closed) rather than
+        assume it's automatic.
+        """
+        if self._closed:
+            raise RuntimeError('SqliteTaskBackend is closed')
+        # Fast path: a cached read connection implies the DB file/schema/
+        # migrations already exist (the slow path below always calls
+        # _get_connection before caching one), so a cache hit can return
+        # immediately and skip the _get_connection await + write-connection
+        # dict lookup entirely — pure overhead on this hot get_statuses/
+        # get_statuses_raw path once a project's connection is warm.
+        if project_root in self._read_connections:
+            return self._read_connections[project_root]
+        # Ensure the DB file + schema + migrations exist before opening our
+        # own connection onto the same file. Only reached on a cache miss.
+        await self._get_connection(project_root)
+        if project_root in self._read_connections:
+            return self._read_connections[project_root]
+
+        # Mirror _get_connection's locking (see above): hold the global
+        # lock only briefly to fetch/create the per-project lock, then do
+        # the actual (disk/IO-bound) connect + pragma work under that
+        # per-project lock. Holding the global lock across the open would
+        # serialize project A's first read-connection bring-up against
+        # project B's bring-up and against close()'s map-drain snapshot —
+        # undercutting the hot-path motivation for this connection.
+        async with self._connect_locks_lock:
+            lock = self._connect_locks.setdefault(project_root, asyncio.Lock())
+
+        async with lock:
+            # Re-check after acquiring the lock — another caller may have
+            # raced us to open this project's read connection.
+            conn = self._read_connections.get(project_root)
+            if conn is not None:
+                return conn
+            # Re-check _closed too (not just the map): close() drains
+            # _read_connections under the *global* lock, not this
+            # per-project one, and sets self._closed before that drain even
+            # starts — so a close() that runs (and finishes) anywhere up to
+            # this point (e.g. during the `await self._get_connection(...)`
+            # bring-up call above, or while we waited for this lock) would
+            # otherwise let us open-and-cache a brand new connection that
+            # close() has already stopped watching for — a leaked file
+            # handle / WAL reader past shutdown.
+            if self._closed:
+                raise RuntimeError('SqliteTaskBackend is closed')
+
+            conn = await connect_daemon(str(self._db_path(project_root)), isolation_level=None)
+            await apply_wal_pragmas(conn, busy_timeout_ms=5000)
+            conn.row_factory = aiosqlite.Row
+            # Re-check once more: close() could have run to completion
+            # entirely during the connect_daemon/apply_wal_pragmas awaits
+            # above (it doesn't hold this per-project lock, only the global
+            # one, and only briefly). If so, it already snapshotted-and-
+            # drained self._read_connections — without this conn, since it
+            # wasn't cached yet — and closed everything it saw. Caching it
+            # now would strand a live connection past shutdown, so close it
+            # ourselves and raise instead.
+            if self._closed:
+                with contextlib.suppress(Exception):
+                    await conn.close()
+                raise RuntimeError('SqliteTaskBackend is closed')
+            self._read_connections[project_root] = conn
+            logger.info('SqliteTaskBackend opened read connection for %s', project_root)
             return conn
 
     def _write_lock(self, project_root: str) -> asyncio.Lock:
@@ -1240,6 +1349,16 @@ class SqliteTaskBackend:
         and the ``NULL`` → ``'unknown'`` coercion rule, so both read paths
         stay identical apart from which connection they run on.
 
+        Deterministically closes its cursor via ``async with conn.execute(
+        ...) as cursor:`` below before returning — required to keep
+        :meth:`_get_read_connection`'s cached AUTOCOMMIT connection
+        unpinnable (see its docstring's Guardrail note). Closing the cursor
+        this way, rather than relying on ``fetchall()`` alone to drain it,
+        guarantees the implicit WAL read transaction ends even if
+        ``fetchall()`` or the row-coercion step below raises, so the
+        invariant holds regardless of what happens after the query
+        executes.
+
         Args:
             conn: An open connection with ``row_factory`` already set to
                 :class:`aiosqlite.Row` (callers own connection setup).
@@ -1264,17 +1383,19 @@ class SqliteTaskBackend:
             if not int_ids:
                 return {}
             placeholders = ','.join('?' * len(int_ids))
-            cursor = await conn.execute(
-                f'SELECT id, status FROM tasks WHERE tag = ? AND id IN ({placeholders})',
-                (tag, *int_ids),
-            )
+            sql = f'SELECT id, status FROM tasks WHERE tag = ? AND id IN ({placeholders})'
+            params: tuple = (tag, *int_ids)
         else:
-            cursor = await conn.execute(
-                'SELECT id, status FROM tasks WHERE tag = ?',
-                (tag,),
-            )
+            sql = 'SELECT id, status FROM tasks WHERE tag = ?'
+            params = (tag,)
 
-        rows = await cursor.fetchall()
+        # `async with ... as cursor:` (rather than a bare `await
+        # conn.execute(...)`) guarantees cursor.close() runs even if
+        # fetchall() or the comprehension below raises, so the implicit
+        # WAL read transaction this SELECT opens is always released — see
+        # the Guardrail note on _get_read_connection's docstring.
+        async with conn.execute(sql, params) as cursor:
+            rows = await cursor.fetchall()
         return {
             str(row['id']): (row['status'] if row['status'] is not None else 'unknown')
             for row in rows
@@ -1291,6 +1412,31 @@ class SqliteTaskBackend:
         This is the O(K) status-only path — it never calls
         ``_get_tasks_internal``, ``_row_to_task``, or ``json.loads``,
         so metadata columns are never decoded.
+
+        Reads via the cached per-project AUTOCOMMIT connection returned by
+        :meth:`_get_read_connection` (task 2455) rather than the cached
+        WRITE connection (:meth:`_get_connection`) that :meth:`get_task`/
+        :meth:`get_tasks` use — see :meth:`_get_read_connection` and
+        :meth:`get_statuses_fresh` for why a pinnable connection can go
+        stale here.
+
+        Snapshot consistency: because this reads a different connection —
+        and therefore potentially a different WAL snapshot — than
+        :meth:`get_task`/:meth:`get_tasks`, a caller that reads both is NOT
+        guaranteed to see them agree to the instant; a status committed
+        between the two calls can show up in one and not the other,
+        regardless of call order. No in-tree caller currently depends on
+        the two being snapshot-consistent: the one caller that compares a
+        ``get_tasks`` tree against a status census
+        (``cross_verify_task_counts`` in ``reconciliation/task_filter.py``)
+        is fed by :meth:`get_statuses_fresh`, not this method — see
+        ``reconciliation/harness.py``'s ``_fetch_task_count_census`` — and
+        that comparison already treats single-cycle divergence as an
+        advisory read-skew artifact rather than an error. A future caller
+        that needs single-instant consistency between the tree and the
+        status map should read both from :meth:`get_task`/:meth:`get_tasks`
+        (which still share :meth:`_get_connection`) rather than assume it
+        from this method.
 
         Args:
             project_root: Absolute path to the project root.
@@ -1309,7 +1455,7 @@ class SqliteTaskBackend:
         # safely callable in isolation without relying on the caller to connect first.
         await self.ensure_connected()
         tag = tag or DEFAULT_TAG
-        conn = await self._get_connection(project_root)
+        conn = await self._get_read_connection(project_root)
         return await self._statuses_from_conn(conn, tag, ids)
 
     async def get_statuses(
@@ -1336,33 +1482,47 @@ class SqliteTaskBackend:
     ) -> dict[str, str]:
         """Return a snapshot-fresh ``{id_str: status_str}`` census for *project_root*.
 
-        Unlike :meth:`get_statuses`/:meth:`get_statuses_raw`, which read via
-        the cached per-project connection returned by :meth:`_get_connection`,
-        this method opens a DEDICATED short-lived connection with
-        ``isolation_level=None`` (autocommit) for every call, so its SELECT
-        always sees the latest committed WAL state and can never be pinned.
-
-        Why this exists (task 2388): ``_get_connection``'s cached connection
-        is opened via ``connect_daemon(str(db_path))`` *without*
-        ``isolation_level=None`` — Python sqlite3's legacy deferred
-        transaction mode. If a read transaction is ever left open on that
-        cached connection, every subsequent read on it — including
-        ``get_statuses``/``get_statuses_raw`` and the ``get_tasks`` tree
-        read, since they all share the same cached connection — is pinned
-        to that transaction's WAL snapshot and silently returns stale data,
-        even after other connections/processes have committed newer writes.
-        Because the tree read and the census read went stale *together*,
-        they still agreed with each other, so
-        ``cross_verify_task_counts`` (``reconciliation/task_filter.py``)
-        reported a false ``consistent: true`` instead of surfacing the
-        drift. This method gives the reconciliation harness's authoritative
-        census (``_fetch_task_count_census``) a read that cannot be pinned;
+        As of task 2455, :meth:`get_statuses`/:meth:`get_statuses_raw` no
+        longer read via :meth:`_get_connection`'s cached WRITE connection —
+        they read via :meth:`_get_read_connection`, a dedicated per-project
+        CACHED AUTOCOMMIT connection that can never hold a read transaction
+        open across statements, so it can never be pinned to a stale WAL
+        snapshot either. This method goes one step further: it opens its
+        OWN short-lived autocommit connection for every call — no caching
+        at all — so it never shares a connection with any other reader,
+        including other concurrent callers of this same method. It remains
+        the guaranteed-uncached read the reconciliation harness's
+        authoritative census (``_fetch_task_count_census``) uses for
+        ``cross_verify_task_counts`` (``reconciliation/task_filter.py``);
         the hot compact-status-map callers should keep using
-        ``get_statuses``/``get_statuses_raw`` unchanged.
+        ``get_statuses``/``get_statuses_raw``, which are equally unpinnable
+        now but reuse a cached connection instead of paying a per-call
+        connection-open cost.
+
+        Why "cannot be pinned" matters (task 2388): ``_get_connection``'s
+        cached WRITE connection is opened via ``connect_daemon(str(db_path))``
+        *without* ``isolation_level=None`` — Python sqlite3's legacy
+        deferred transaction mode. If a read transaction is ever left open
+        on that connection, every subsequent read on it — including the
+        ``get_task``/``get_tasks`` tree read, which still uses it (task 2455
+        did not touch it) — is pinned to that transaction's WAL snapshot and
+        silently returns stale data, even after other connections/processes
+        have committed newer writes. Before task 2455,
+        ``get_statuses``/``get_statuses_raw`` also shared that cached write
+        connection, so a pin made the tree read and the census go stale
+        *together* — they still agreed with each other, so
+        ``cross_verify_task_counts`` reported a false ``consistent: true``
+        instead of surfacing the drift. That history is why this method's
+        never-shared connection exists independently of whichever
+        connection ``get_statuses`` happens to use.
 
         Fails open to ``{}`` on any error (including a not-yet-created DB
         file) — this is a best-effort freshness upgrade for a cross-check,
-        never a reason to raise into the reconciliation cycle.
+        never a reason to raise into the reconciliation cycle. Contrast
+        :meth:`get_statuses_raw`, which must propagate errors rather than
+        fail open — see its docstring's "Snapshot consistency" note for the
+        related caveat about reading it alongside :meth:`get_task`/
+        :meth:`get_tasks`.
 
         Args:
             project_root: Absolute path to the project root.
