@@ -1583,7 +1583,7 @@ def create_server(
     # Optional fields that _durable_terminal_state threads into the meta dict
     # when present and non-None.  Add future terminal-metadata fields here so
     # every tier stays in sync automatically.
-    _OPTIONAL_TERMINAL_META_FIELDS: tuple[str, ...] = ('superseded_by',)
+    _OPTIONAL_TERMINAL_META_FIELDS: tuple[str, ...] = ('superseded_by', 'reason')
 
     def _epoch_to_iso8601(ts: float) -> str:
         """Convert an epoch-seconds float to an ISO-8601 UTC string (matches event-store format)."""
@@ -1816,6 +1816,8 @@ def create_server(
             }
             if meta.get('superseded_by') is not None:
                 resp['superseded_by'] = meta['superseded_by']
+            if meta.get('reason') is not None:
+                resp['reason'] = meta['reason']
             return resp
 
         # Tier 3.5: git-authority — probe main directly when no durable record exists.
