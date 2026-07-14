@@ -24,7 +24,7 @@ from __future__ import annotations
 import asyncio
 import logging
 from pathlib import Path
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, call, patch
 
 import pytest
 
@@ -263,7 +263,10 @@ class TestEphemeralWorktreeRetry:
             async with git_ops.ephemeral_worktree(WorktreeKind.MAIN_PROBE, MAIN_SHA):
                 entered = True
 
-        with patch('orchestrator.git_ops._run', side_effect=_make_fake_run([1, 1, 0], calls)):
+        with (
+            patch('orchestrator.git_ops._run', side_effect=_make_fake_run([1, 1, 0], calls)),
+            patch('orchestrator.git_ops.asyncio.sleep', new_callable=AsyncMock) as mock_sleep,
+        ):
             asyncio.run(_body())
 
         add_calls = [c for c in calls if 'worktree' in c and 'add' in c]
@@ -275,6 +278,13 @@ class TestEphemeralWorktreeRetry:
             f'expected all retries to target the same path; got {detach_targets}'
         )
         assert entered, 'expected the CM body to run once add eventually succeeds'
+        # asyncio.sleep is patched so the 2 backoff waits between the 3
+        # attempts don't add real wall-clock time to the suite; still pin
+        # the linear-backoff durations (0.5 * (attempt + 1)) requested for
+        # the 2 failed attempts.
+        assert mock_sleep.await_args_list == [call(0.5), call(1.0)], (
+            f'expected backoff sleeps of 0.5s then 1.0s; got {mock_sleep.await_args_list}'
+        )
 
     def test_raises_ephemeral_worktree_error_after_exhausting_retries(
         self, tmp_path: Path,
@@ -292,6 +302,7 @@ class TestEphemeralWorktreeRetry:
 
         with (
             patch('orchestrator.git_ops._run', side_effect=_make_fake_run([1, 1, 1], calls)),
+            patch('orchestrator.git_ops.asyncio.sleep', new_callable=AsyncMock) as mock_sleep,
             pytest.raises(EphemeralWorktreeError),
         ):
             asyncio.run(_body())
@@ -302,6 +313,12 @@ class TestEphemeralWorktreeRetry:
         remove_calls = [c for c in calls if 'worktree' in c and 'remove' in c]
         assert not remove_calls, (
             f'expected NO git worktree remove when add never succeeded; got {remove_calls}'
+        )
+        # asyncio.sleep is patched to avoid 1.5s of real backoff delay; the
+        # CM only sleeps BETWEEN attempts (2 sleeps for 3 attempts, none
+        # after the final exhausted attempt).
+        assert mock_sleep.await_args_list == [call(0.5), call(1.0)], (
+            f'expected backoff sleeps of 0.5s then 1.0s; got {mock_sleep.await_args_list}'
         )
 
     def test_add_failure_leaves_no_leaked_directory_under_worktree_base(
@@ -338,6 +355,7 @@ class TestEphemeralWorktreeRetry:
 
         with (
             patch('orchestrator.git_ops._run', side_effect=_fake_run_leaves_partial_dir),
+            patch('orchestrator.git_ops.asyncio.sleep', new_callable=AsyncMock) as mock_sleep,
             pytest.raises(EphemeralWorktreeError),
         ):
             asyncio.run(_body())
@@ -347,6 +365,10 @@ class TestEphemeralWorktreeRetry:
         assert not leaked, (
             f'expected no leaked _mainprobe-* directory under worktree_base '
             f'after add exhausts retries; found {leaked}'
+        )
+        # asyncio.sleep is patched to avoid 1.5s of real backoff delay.
+        assert mock_sleep.await_args_list == [call(0.5), call(1.0)], (
+            f'expected backoff sleeps of 0.5s then 1.0s; got {mock_sleep.await_args_list}'
         )
 
 
