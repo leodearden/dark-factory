@@ -1584,6 +1584,17 @@ class SqliteTaskBackend:
         read connection unpinnable (see :meth:`_get_read_connection`'s
         Guardrail note).
 
+        Snapshot consistency: because this reads via :meth:`_get_read_connection`
+        while :meth:`get_task`/:meth:`get_tasks` read via the cached WRITE
+        connection (:meth:`_get_connection`), the two can observe different
+        WAL snapshots — the same cross-connection caveat documented on
+        :meth:`get_statuses_raw`. A caller combining them (e.g.
+        :class:`~fused_memory.maintenance.backfill_curator_corpus.BackfillManager`'s
+        cross-tag prune sweep, which calls this and then ``get_tasks`` once
+        per tag) should treat a tag created concurrently with the read as a
+        benign, self-healing miss for that cycle rather than assume the two
+        calls agree to the instant.
+
         Args:
             project_root: Absolute path to the project root.
 
