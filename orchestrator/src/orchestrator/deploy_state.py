@@ -30,6 +30,9 @@ __all__ = [
 # illegal by construction (is_legal_transition defaults to False). Per the
 # PRD §5.2 chart (scheduled→ran→{verified|failed|escalated}→done) plus the
 # DeterministicRunner field-combo presets (CLAUDE.md "Field-combo presets").
+# ζ (task 2240) finalized the middle transition edges deferred by ε's
+# TestLegalTransitionTable docstring, adding exactly two — ran→scheduled and
+# scheduled→escalated — for the self-restart path (see below).
 #
 # Deliberately a `dict` (not a `frozenset` of legal pairs), even though every
 # stored value is `True`: TestLegalTransitionTable subscripts
@@ -60,6 +63,13 @@ _LEGAL: dict[tuple[DeployPhase, DeployPhase], bool] = {
     (DeployPhase.FAILED, DeployPhase.ESCALATED): True,
     # escalated -> done: the human resolved the gate/failure escalation.
     (DeployPhase.ESCALATED, DeployPhase.DONE): True,
+    # ran -> scheduled: the self-restart sub-path ran the shared
+    # before_done_ran_at write and registered a detached systemd-run unit
+    # now scheduled to fire (before_done_scheduled_at).
+    (DeployPhase.RAN, DeployPhase.SCHEDULED): True,
+    # scheduled -> escalated: an act-then-ask self-restart files its gate
+    # escalation right after the detached restart is scheduled.
+    (DeployPhase.SCHEDULED, DeployPhase.ESCALATED): True,
 }
 
 

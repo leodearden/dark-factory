@@ -194,6 +194,13 @@ from typing import TYPE_CHECKING
 from shared.task_metadata import DoneProvenance
 
 from orchestrator import systemd_inspect
+from orchestrator.deploy_state import (
+    DeployPhase,
+    DeployState,
+    IllegalDeployTransition,
+    VerifyBaseline,
+    enforce_transition,
+)
 from orchestrator.proc_supervision import (
     EscalationSpec,
     FreshPidVerify,
@@ -623,6 +630,8 @@ class DeterministicRunner:
         task_id: str,
         summary: str,
         detail: str,
+        *,
+        metadata: dict | None = None,
     ) -> WorkflowOutcome:
         """File a born-at-L2 infra_issue escalation and set the task to blocked.
 
@@ -642,6 +651,38 @@ class DeterministicRunner:
         must not propagate — doing so would defeat this method's "always
         returns BLOCKED, never a raw exception" contract in exactly the
         scenario it exists to cover.
+
+        ``metadata``, when passed by a DEPLOY-path caller (``before_done``
+        set — every ``run()``-internal call site qualifies; ``_run_predicate``
+        never passes it), best-effort advances ``deploy_state.phase`` to
+        ``ESCALATED`` too (ζ DS-1) — same tolerate-a-severed-connection
+        posture as the trailing blocked-status write below, since the
+        escalation above is already durable regardless. Skipped entirely
+        (reviewer amendment, task 2240) when the CURRENT phase is already
+        ``ESCALATED`` or ``DONE``: on the rare crash-resume edge where the
+        deploy already reached one of those phases but resolution could not
+        be proven (e.g. the runner's own escalation record is missing or
+        expired), a bare re-advance would attempt a pinned-illegal
+        self-loop, filing a spurious ``illegal_deploy_transition`` L2 on top
+        of the ``infra_issue`` one filed above — the skip avoids that noise
+        without weakening DS-2 loudness, since the phase is already at (or
+        past) the target.
+
+        Consequence of that phase advance failing (reviewer amendment, task
+        2240): if it raises transiently — e.g. the SAME severed connection
+        that triggered this escalation in the first place — the disk-backed
+        escalation above is still filed, but ``deploy_state.phase`` stays at
+        its PRE-escalation value (typically ``RAN``) instead of advancing to
+        ``ESCALATED``. Once a human resolves that escalation, the runner's
+        resume path reads ``phase != ESCALATED`` and treats it as a
+        crash-window rather than a resolved gate — re-filing a fresh
+        ``infra_issue`` and blocking again instead of driving to done, i.e.
+        one spurious extra human round-trip. This self-heals: the re-filed
+        escalation's OWN best-effort advance retries the SAME
+        ``RAN -> ESCALATED`` edge, and once the connection recovers it lands,
+        after which the next resolution correctly proves ``phase ==
+        ESCALATED`` and resumes to done. No state is corrupted either way —
+        only convergence is delayed by one extra escalate/resolve cycle.
 
         Returns:
             WorkflowOutcome.BLOCKED
@@ -673,6 +714,42 @@ class DeterministicRunner:
                 'DeterministicRunner: filed L2 infra_issue escalation %s for task %s',
                 esc.id, task_id,
             )
+
+        if metadata is not None and metadata.get('before_done') is not None:
+            _current_deploy_state = DeployState.from_metadata(metadata)
+            if _current_deploy_state is not None and _current_deploy_state.phase in (
+                DeployPhase.ESCALATED, DeployPhase.DONE,
+            ):
+                # Reviewer amendment (task 2240): already at (or past)
+                # ESCALATED — e.g. this is the rare crash-resume edge where
+                # phase==ESCALATED but resolution_proven is false (the
+                # runner's own escalation record is missing/expired), so
+                # execution reaches this unknown-crash infra_issue path
+                # again. A bare re-advance would attempt an illegal
+                # ESCALATED->ESCALATED (or DONE->ESCALATED) self-loop —
+                # neither edge is in _LEGAL — filing a SPURIOUS born-at-L2
+                # illegal_deploy_transition escalation on top of the
+                # infra_issue one just filed above. Skip the redundant
+                # advance; the infra_issue escalation is already the loud
+                # signal for this crash.
+                logger.debug(
+                    'DeterministicRunner: task %s deploy_state already at '
+                    'phase=%s — skipping redundant ESCALATED advance',
+                    task_id, _current_deploy_state.phase,
+                )
+            else:
+                try:
+                    await self._advance_deploy_phase(
+                        task_id, metadata, DeployPhase.ESCALATED,
+                        phase_timestamp=datetime.now(UTC).isoformat(),
+                    )
+                except Exception as exc:
+                    logger.warning(
+                        'DeterministicRunner: task %s deploy_state phase-escalated '
+                        'advance failed (%s: %s) — the infra_issue escalation above '
+                        'is already durable regardless',
+                        task_id, type(exc).__name__, exc,
+                    )
 
         try:
             await self.scheduler.set_task_status(task_id, 'blocked')
@@ -789,9 +866,191 @@ class DeterministicRunner:
             )
         return WorkflowOutcome.BLOCKED
 
+    def _deploy_transition_escalation_sink(
+        self, task_id: str, old: DeployPhase, new: DeployPhase,
+    ) -> None:
+        """DS-2 sink: file a born-at-L2 escalation for an illegal deploy-phase edge.
+
+        Wired into every ``_advance_deploy_phase`` call via
+        ``enforce_transition``'s ``escalation_sink`` — files BEFORE
+        ``enforce_transition`` raises ``IllegalDeployTransition``, so an
+        illegal edge is never silently swallowed (D2).  Mirrors the other
+        escalation-filing helpers' construction (sentinel role keeps level=2
+        past the server downgrade gate) but is unconditional — no dedup
+        guard — since an illegal transition is itself a bug signal that must
+        never be suppressed by an unrelated pending escalation.
+        """
+        from escalation.models import Escalation
+
+        esc = Escalation(
+            id=self.escalation_queue.make_id(task_id),
+            task_id=task_id,
+            agent_role=DETERMINISTIC_AGENT_ROLE,
+            severity='critical',
+            category='illegal_deploy_transition',
+            summary=f'Illegal deploy-phase transition {old} -> {new}'[:200],
+            detail=(
+                f'DeterministicRunner attempted an illegal deploy-phase '
+                f'transition {old!r} -> {new!r} for task {task_id}. This '
+                'indicates a runner bug or corrupted deploy_state metadata — '
+                'investigate before resuming.'
+            ),
+            level=2,
+        )
+        self.escalation_queue.submit(esc)
+        logger.error(
+            'DeterministicRunner: filed L2 illegal_deploy_transition escalation '
+            '%s for task %s (%s -> %s)',
+            esc.id, task_id, old, new,
+        )
+
+    def _compute_deploy_phase_advance(
+        self,
+        task_id: str,
+        metadata: dict,
+        new_phase: DeployPhase,
+        *,
+        verify_baseline: VerifyBaseline | dict | None = None,
+        phase_timestamp: str | None = None,
+    ) -> DeployState:
+        """DS-2: enforce the transition and build the advanced ``DeployState``.
+
+        Pure computation, no I/O — reads the CURRENT phase from *metadata*
+        (the in-memory dict threaded through ``run()``), enforces the
+        transition (files a loud escalation then raises on an illegal edge
+        via ``_deploy_transition_escalation_sink``), and returns the new
+        ``DeployState`` with the OLD ``ran_at``/``verified_at``/
+        ``escalated_at``/``verify_baseline`` evidence carried forward.
+
+        Shared by ``_advance_deploy_phase`` (the single-write path) and
+        ``_writeback_deploy_success`` (which folds the resulting
+        ``to_metadata()`` into its own retry-loop write rather than issuing a
+        second ``update_task`` call — the retry loop needs the RAW boolean
+        ``update_task`` return to detect a transient failure, which
+        ``_advance_deploy_phase`` does not expose).
+
+        ``verify_baseline``, when omitted, carries forward whatever baseline
+        was already recorded — a phase advance must never drop previously
+        persisted DS-3 evidence.
+
+        ``phase_timestamp`` (reviewer amendment, task 2240): when given, is
+        written into whichever ONE of ``ran_at`` / ``verified_at`` /
+        ``escalated_at`` matches *new_phase* (RAN / VERIFIED / ESCALATED
+        respectively — a SCHEDULED advance, or any other, has no matching
+        field and leaves all three untouched). Callers pass the SAME ISO
+        timestamp already being written to the corresponding top-level
+        evidence stamp (e.g. ``before_done_ran_at``), so ``DeployState``
+        stays self-describing instead of emitting these fields as ``null``
+        on every write forever. Omitted (``None``) leaves the OLD
+        carried-forward value in place, exactly as before.
+        """
+        old_state = DeployState.from_metadata(metadata)
+        old_phase = old_state.phase if old_state is not None else None
+        enforce_transition(
+            old_phase, new_phase, task_id=task_id,
+            escalation_sink=self._deploy_transition_escalation_sink,
+        )
+
+        if verify_baseline is not None and not isinstance(verify_baseline, VerifyBaseline):
+            verify_baseline = VerifyBaseline(**verify_baseline)
+        carried_baseline = (
+            verify_baseline if verify_baseline is not None
+            else (old_state.verify_baseline if old_state is not None else None)
+        )
+        ran_at = old_state.ran_at if old_state is not None else None
+        verified_at = old_state.verified_at if old_state is not None else None
+        escalated_at = old_state.escalated_at if old_state is not None else None
+        if phase_timestamp is not None:
+            if new_phase == DeployPhase.RAN:
+                ran_at = phase_timestamp
+            elif new_phase == DeployPhase.VERIFIED:
+                verified_at = phase_timestamp
+            elif new_phase == DeployPhase.ESCALATED:
+                escalated_at = phase_timestamp
+        return DeployState(
+            phase=new_phase,
+            verify_baseline=carried_baseline,
+            ran_at=ran_at,
+            verified_at=verified_at,
+            escalated_at=escalated_at,
+        )
+
+    async def _advance_deploy_phase(
+        self,
+        task_id: str,
+        metadata: dict,
+        new_phase: DeployPhase,
+        *,
+        evidence: dict | None = None,
+        verify_baseline: VerifyBaseline | dict | None = None,
+        phase_timestamp: str | None = None,
+    ) -> DeployState:
+        """DS-1/DS-2: atomically advance ``metadata.deploy_state.phase`` + evidence.
+
+        Persists ``{**new DeployState.to_metadata(), **evidence}`` in ONE
+        ``update_task(metadata_mode='merge')`` call, and refreshes
+        ``metadata['deploy_state']`` in place so a LATER call within the SAME
+        ``run()`` invocation observes the just-written phase as ``old``. See
+        ``_compute_deploy_phase_advance`` for the transition-enforcement +
+        state-construction logic this wraps, including what
+        ``phase_timestamp`` does.
+        """
+        new_state = self._compute_deploy_phase_advance(
+            task_id, metadata, new_phase,
+            verify_baseline=verify_baseline, phase_timestamp=phase_timestamp,
+        )
+        payload = {**new_state.to_metadata(), **(evidence or {})}
+        await self.scheduler.update_task(task_id, payload, metadata_mode='merge')
+        metadata['deploy_state'] = new_state.to_metadata()['deploy_state']
+        return new_state
+
+    async def _enrich_deploy_state_baseline(
+        self, task_id: str, metadata: dict, baseline: dict,
+    ) -> None:
+        """DS-3: persist ``verify_baseline`` WITHOUT a phase transition.
+
+        Bypasses ``enforce_transition`` entirely — this is a same-phase
+        enrichment (advancing RAN -> RAN would hit the pinned-illegal
+        self-loop edge). Best-effort: this is a freshness UPGRADE, never a
+        new failure mode — a crash (or a still-severed connection) before
+        this write lands leaves ``phase==RAN`` with no baseline, which the
+        strand detector still correctly classifies as a RAN-strand and the
+        freshness verdict's no-baseline fallback still handles (see ζ design
+        decision on verify_baseline persistence timing).
+        """
+        old_state = DeployState.from_metadata(metadata)
+        if old_state is None:
+            # Defensive: the shared before_done_ran_at/phase=ran write always
+            # precedes baseline capture — nothing to enrich onto if absent.
+            return
+        verify_baseline = VerifyBaseline(
+            active_enter_timestamp_monotonic=baseline.get('ActiveEnterTimestampMonotonic', 0),
+            main_pid=baseline.get('MainPID', 0),
+        )
+        new_state = DeployState(
+            phase=old_state.phase,
+            verify_baseline=verify_baseline,
+            ran_at=old_state.ran_at,
+            verified_at=old_state.verified_at,
+            escalated_at=old_state.escalated_at,
+        )
+        try:
+            await self.scheduler.update_task(
+                task_id, new_state.to_metadata(), metadata_mode='merge',
+            )
+            metadata['deploy_state'] = new_state.to_metadata()['deploy_state']
+        except Exception as exc:
+            logger.warning(
+                'DeterministicRunner: task %s verify_baseline enrichment failed '
+                '(%s: %s) — freshness will fall back to liveness-only; not a new '
+                'failure mode (phase==ran is still correctly detected as a strand)',
+                task_id, type(exc).__name__, exc,
+            )
+
     async def _writeback_deploy_success(
         self,
         task_id: str,
+        metadata: dict,
         new_state: dict,
         target_unit: str,
         description: str,
@@ -814,6 +1073,20 @@ class DeterministicRunner:
         re-running the deploy script (I1 once-only — this helper only
         persists an already-completed deploy's outcome).
 
+        ζ DS-1: the verified-stamp write also atomically carries
+        ``deploy_state.phase=='verified'`` — folded into the SAME write
+        computed ONCE up front (the pre-write phase does not change across
+        retries within this call), so the shared retry budget stays exactly
+        two writes.  The done-write below intentionally does NOT also advance
+        phase to ``done`` — ``verified -> done`` is a real DS-2-legal edge,
+        but leaving the PERSISTED phase at ``verified`` avoids a third write
+        (verified already proves success; done tasks are never swept). If
+        computing that advance raises ``IllegalDeployTransition`` (reviewer
+        amendment, task 2240 — corrupted/unexpected ``deploy_state``), the
+        writeback falls back to a stamp-only payload (no ``deploy_state``
+        key) so the already-succeeded deploy still converges to done instead
+        of the raise propagating out of ``run()``.
+
         On budget exhaustion (fused-memory never recovers in-window), files a
         durable local ``infra_issue`` escalation (disk-backed, connection-
         independent) and returns BLOCKED — so the task is never silently
@@ -828,6 +1101,34 @@ class DeterministicRunner:
         pid = new_state.get('MainPID', 0)
         active_enter_timestamp = new_state.get('ActiveEnterTimestamp', '')
 
+        # Reviewer amendment (task 2240): _compute_deploy_phase_advance is
+        # pure computation (no I/O) but still enforces DS-2 — an illegal
+        # source phase (metadata.deploy_state corrupted or otherwise
+        # unexpected) makes enforce_transition file a loud L2 escalation and
+        # then raise. This call sits OUTSIDE the retry loop below and the
+        # deploy has ALREADY succeeded by this point, so letting the raise
+        # propagate out of run() would violate the "run() always returns
+        # BLOCKED, never a raw exception" contract at exactly the moment the
+        # task would otherwise land neither done nor cleanly blocked. Fall
+        # back to a stamp-only write (no deploy_state payload) so the
+        # verified deploy still converges to done — the escalation sink
+        # already made the anomaly loud (file-before-raise).
+        try:
+            verified_deploy_state = self._compute_deploy_phase_advance(
+                task_id, metadata, DeployPhase.VERIFIED,
+                phase_timestamp=verified_iso,
+            )
+            deploy_state_payload = verified_deploy_state.to_metadata()
+        except IllegalDeployTransition as exc:
+            logger.warning(
+                'DeterministicRunner: task %s deploy_state phase-advance to '
+                'VERIFIED failed (%s) — an L2 illegal_deploy_transition '
+                'escalation was filed; falling back to a stamp-only '
+                'writeback so the verified deploy still converges to done',
+                task_id, exc,
+            )
+            deploy_state_payload = {}
+
         stamped = False
         for attempt in range(self._writeback_max_attempts):
             if not stamped:
@@ -836,9 +1137,12 @@ class DeterministicRunner:
                     {
                         'before_done_verified_at': verified_iso,
                         'before_done_verified_pid': pid,
+                        **deploy_state_payload,
                     },
                     metadata_mode='merge',
                 ))
+                if stamped and 'deploy_state' in deploy_state_payload:
+                    metadata['deploy_state'] = deploy_state_payload['deploy_state']
                 if not stamped:
                     logger.warning(
                         'DeterministicRunner: task %s verified-stamp writeback failed '
@@ -929,6 +1233,7 @@ class DeterministicRunner:
             task_id,
             summary=f'Deploy verify/writeback stranded (connection severed): {target_unit}',
             detail=detail,
+            metadata=metadata,
         )
 
     async def _file_milestone_gate_and_block(
@@ -993,13 +1298,25 @@ class DeterministicRunner:
                 esc.id, task_id,
             )
 
-        # Stamp gate_escalated_at AFTER successful escalation submit.
+        # Stamp gate_escalated_at AFTER successful escalation submit.  ζ: on the
+        # DEPLOY path (before_done set — this helper is also reached from the
+        # self-restart and cross-unit act-then-ask fallthroughs, and the
+        # self-restart crash-resume re-file), this atomically advances
+        # deploy_state.phase to ESCALATED too (DS-1). A pure gate
+        # (before_done=None) is not a deploy and gets no deploy_state.
         now_iso = datetime.now(UTC).isoformat()
-        await self.scheduler.update_task(
-            task_id,
-            {'gate_escalated_at': now_iso},
-            metadata_mode='merge',
-        )
+        if metadata.get('before_done') is not None:
+            await self._advance_deploy_phase(
+                task_id, metadata, DeployPhase.ESCALATED,
+                evidence={'gate_escalated_at': now_iso},
+                phase_timestamp=now_iso,
+            )
+        else:
+            await self.scheduler.update_task(
+                task_id,
+                {'gate_escalated_at': now_iso},
+                metadata_mode='merge',
+            )
 
         # Set status to blocked — gate awaits human decision.  Best-effort, same
         # as _file_infra_issue_and_block (reviewer amendment): the escalation +
@@ -1393,9 +1710,29 @@ class DeterministicRunner:
                 # unrelated escalation sharing this task_id (e.g. a starvation-
                 # watchdog filing) must never alias as proof a human resolved
                 # THIS runner's failure (task 2120).
-                ever_escalated = bool(self.escalation_queue.get_by_task(
+                own_escalation_resolved = bool(self.escalation_queue.get_by_task(
                     task_id, agent_role=DETERMINISTIC_AGENT_ROLE,
                 ))
+                # ζ D3 (finding 4.0): bare escalation existence is not proof
+                # THIS deploy's own gate/failure is what got resolved — even
+                # role-scoped, a stale or unrelated same-role record could
+                # alias.  When ζ has been tracking this deploy (deploy_state
+                # present), require the RECORDED fact that the runner itself
+                # transitioned to `escalated` when it filed that failure/gate
+                # escalation, in addition to the resolved-record check above.
+                # A task with no deploy_state at all began its deploy before ζ
+                # activated (no phase was ever recorded) — fall back to the
+                # pre-ζ bare-existence check so in-flight legacy deploys don't
+                # spuriously re-escalate the moment ζ ships (backward-compat
+                # migration shim).
+                deploy_state = DeployState.from_metadata(metadata)
+                if deploy_state is not None:
+                    resolution_proven = (
+                        deploy_state.phase == DeployPhase.ESCALATED
+                        and own_escalation_resolved
+                    )
+                else:
+                    resolution_proven = own_escalation_resolved
 
                 if before_done_verified_at:
                     # (a) Deploy verified OK; crash before the done write.
@@ -1456,7 +1793,7 @@ class DeterministicRunner:
                     )
                     return await self._file_milestone_gate_and_block(task_id, task, metadata)
 
-                if ever_escalated:
+                if resolution_proven:
                     # (b) A failure escalation was filed and resolved by a human.
                     logger.info(
                         'DeterministicRunner: task %s before_done ran + escalation '
@@ -1496,6 +1833,7 @@ class DeterministicRunner:
                     task_id,
                     summary=f'Deploy state unknown after crash: {target_unit}',
                     detail=crash_detail,
+                    metadata=metadata,
                 )
 
             # ── Stop-instruction guard (task 2509) ───────────────────────────
@@ -1534,12 +1872,14 @@ class DeterministicRunner:
             # Stamp before_done_ran_at FIRST (crash-safe I1: stamp-before-run means a
             # crash mid-deploy leaves the stamp set → re-dispatch does NOT re-run).
             # This stamp is SHARED for both self-target and cross-unit paths so I1
-            # holds for both (ε design decision 5).
+            # holds for both (ε design decision 5). ζ: this is also the initial
+            # deploy_state.phase write (None -> RAN), atomically merged in the
+            # SAME update_task call (DS-1).
             now_iso = datetime.now(UTC).isoformat()
-            await self.scheduler.update_task(
-                task_id,
-                {'before_done_ran_at': now_iso},
-                metadata_mode='merge',
+            await self._advance_deploy_phase(
+                task_id, metadata, DeployPhase.RAN,
+                evidence={'before_done_ran_at': now_iso},
+                phase_timestamp=now_iso,
             )
 
             # ── ε: self-target detection ─────────────────────────────────────
@@ -1587,6 +1927,7 @@ class DeterministicRunner:
                         task_id,
                         summary=f'Self-restart completion failed: {target_unit}',
                         detail=completion_detail,
+                        metadata=metadata,
                     )
 
                 try:
@@ -1613,6 +1954,7 @@ class DeterministicRunner:
                         task_id,
                         summary=f'Self-restart scheduling failed: {target_unit}',
                         detail=detail,
+                        metadata=metadata,
                     )
 
                 try:
@@ -1620,15 +1962,16 @@ class DeterministicRunner:
                     # was successfully registered.  If the orchestrator crashes between
                     # this stamp and the done write, the resume path (sub-case b-self
                     # above) drives to done with scheduled provenance instead of
-                    # re-escalating as a generic crash-window.
-                    await self.scheduler.update_task(
-                        task_id,
-                        {'before_done_scheduled_at': {
+                    # re-escalating as a generic crash-window.  ζ: this is also the
+                    # ran->scheduled phase advance, atomically merged in the SAME
+                    # update_task call (DS-1).
+                    await self._advance_deploy_phase(
+                        task_id, metadata, DeployPhase.SCHEDULED,
+                        evidence={'before_done_scheduled_at': {
                             'at': datetime.now(UTC).isoformat(),
                             'transient_unit': transient_unit,
                             'fire_delay_secs': on_active_secs,
                         }},
-                        metadata_mode='merge',
                     )
 
                     if not always_escalates:
@@ -1705,7 +2048,14 @@ class DeterministicRunner:
                         task_id,
                         summary=f'Baseline inspect failed before deploy: {target_unit}',
                         detail=baseline_detail,
+                        metadata=metadata,
                     )
+
+                # ζ DS-3: persist the trustworthy baseline into deploy_state as a
+                # same-phase enrichment (phase stays RAN — see
+                # _enrich_deploy_state_baseline). Best-effort; never blocks the
+                # deploy itself.
+                await self._enrich_deploy_state_baseline(task_id, metadata, baseline)
 
                 # Run the deploy script + fresh-PID verify by delegating to
                 # proc_supervision.RestartPlan.execute() (task 2238/δ, RP-2/
@@ -1828,6 +2178,7 @@ class DeterministicRunner:
                         task_id,
                         summary=f'Deploy run+verify exceeded outer guard: {target_unit}',
                         detail=timeout_detail,
+                        metadata=metadata,
                     )
                 except Exception as exc:
                     error_detail = '\n'.join([
@@ -1840,6 +2191,7 @@ class DeterministicRunner:
                         task_id,
                         summary=f'Deploy run_fn failed (unexpected error): {target_unit}',
                         detail=error_detail,
+                        metadata=metadata,
                     )
 
                 if outcome.disposition == RestartDisposition.RESTART_FAILED:
@@ -1853,6 +2205,7 @@ class DeterministicRunner:
                         task_id,
                         summary=f'Deploy failed: {target_unit}',
                         detail=deploy_detail,
+                        metadata=metadata,
                     )
 
                 if outcome.disposition == RestartDisposition.VERIFY_FAILED:
@@ -1866,6 +2219,7 @@ class DeterministicRunner:
                         task_id,
                         summary=f'Deploy verify failed: {target_unit}',
                         detail=verify_detail,
+                        metadata=metadata,
                     )
 
                 if outcome.disposition != RestartDisposition.DEPLOYED_AND_VERIFIED:
@@ -1884,6 +2238,7 @@ class DeterministicRunner:
                         task_id,
                         summary=f'Deploy refused unexpectedly: {target_unit}',
                         detail=refused_detail,
+                        metadata=metadata,
                     )
 
                 new_state = captured.get('new_state', {})
@@ -1895,7 +2250,7 @@ class DeterministicRunner:
                     # backing that connection) — delegate to the connection-resilient
                     # writeback helper rather than a single unguarded write pair.
                     return await self._writeback_deploy_success(
-                        task_id, new_state, target_unit, description,
+                        task_id, metadata, new_state, target_unit, description,
                     )
 
                 # always_escalates=True with before_done (cross-unit act-then-ask):

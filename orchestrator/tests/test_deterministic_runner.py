@@ -77,8 +77,17 @@ def _deploy_task(
     before_done_verified_pid: int | None = None,
     before_done_scheduled_at: dict | None = None,
     description: str = 'Cross-unit deploy of the reify worker',
+    phase: str | None = None,
+    verify_baseline: dict | None = None,
 ) -> dict:
-    """Build a deterministic deploy task dict (before_done set, always_escalates=False)."""
+    """Build a deterministic deploy task dict (before_done set, always_escalates=False).
+
+    ``phase`` (+ optional ``verify_baseline``), when given, seeds a ζ
+    ``metadata['deploy_state']`` slice (``{'phase': phase}``, merging in
+    ``verify_baseline`` when provided). Omitting ``phase`` (the default)
+    keeps the pre-ζ stamp-only shape — no ``deploy_state`` key at all — so
+    existing backward-compat parity tests are unaffected.
+    """
     before_done: dict = {
         'script': script,
         'args': args if args is not None else [],
@@ -100,6 +109,11 @@ def _deploy_task(
         metadata['before_done_verified_pid'] = before_done_verified_pid
     if before_done_scheduled_at is not None:
         metadata['before_done_scheduled_at'] = before_done_scheduled_at
+    if phase is not None:
+        deploy_state: dict = {'phase': phase}
+        if verify_baseline is not None:
+            deploy_state['verify_baseline'] = verify_baseline
+        metadata['deploy_state'] = deploy_state
     return {
         'id': task_id,
         'title': 'Deploy orchestrator-reify',
@@ -799,6 +813,178 @@ class TestBeforeDoneCrossUnitDeploy:
         pending = queue.get_by_task('200', status='pending')
         assert len(pending) == 0, f'No escalation should be filed on success; got {pending}'
 
+    async def test_b6_stamps_deploy_state_phase_ran_atomically_with_before_done_ran_at(
+        self, tmp_path: Path
+    ):
+        """ζ DS-1: the SAME update_task call that stamps before_done_ran_at
+        also carries deploy_state.phase=='ran' (one atomic merge write)."""
+        from orchestrator.deterministic_runner import DeterministicRunner
+
+        task = _deploy_task(task_id='200')
+        assignment = _make_assignment(task)
+        queue = EscalationQueue(tmp_path)
+        scheduler = _mock_scheduler(task)
+
+        unit_inspector = AsyncMock(side_effect=[_BASELINE_UNIT_STATE, _FRESH_UNIT_STATE])
+        script_runner = AsyncMock(return_value=(0, 'ok'))
+
+        runner = DeterministicRunner(
+            scheduler=scheduler,
+            escalation_queue=queue,
+            unit_inspector=unit_inspector,
+            script_runner=script_runner,
+        )
+        await runner.run(assignment)
+
+        stamp_calls = [
+            c for c in scheduler.update_task.call_args_list
+            if len(c.args) > 1 and c.args[1].get('before_done_ran_at')
+        ]
+        assert stamp_calls, 'update_task must be called with a truthy before_done_ran_at stamp'
+        payload = stamp_calls[0].args[1]
+        assert payload.get('deploy_state', {}).get('phase') == 'ran'
+        # Reviewer amendment (task 2240): deploy_state.ran_at must mirror the
+        # SAME timestamp as the top-level before_done_ran_at stamp — not
+        # stay null forever (it previously carried the OLD state's ran_at,
+        # which was always None since nothing ever populated it).
+        assert payload['deploy_state']['ran_at'] == payload['before_done_ran_at']
+
+    async def test_b6_persists_verify_baseline_from_captured_baseline(self, tmp_path: Path):
+        """ζ DS-3: deploy_state.verify_baseline is persisted from the captured
+        pre-deploy baseline (monotonic + MainPID) once it has been inspected."""
+        from orchestrator.deterministic_runner import DeterministicRunner
+
+        task = _deploy_task(task_id='200')
+        assignment = _make_assignment(task)
+        queue = EscalationQueue(tmp_path)
+        scheduler = _mock_scheduler(task)
+
+        unit_inspector = AsyncMock(side_effect=[_BASELINE_UNIT_STATE, _FRESH_UNIT_STATE])
+        script_runner = AsyncMock(return_value=(0, 'ok'))
+
+        runner = DeterministicRunner(
+            scheduler=scheduler,
+            escalation_queue=queue,
+            unit_inspector=unit_inspector,
+            script_runner=script_runner,
+        )
+        await runner.run(assignment)
+
+        baseline_calls = [
+            c for c in scheduler.update_task.call_args_list
+            if len(c.args) > 1 and (c.args[1].get('deploy_state') or {}).get('verify_baseline')
+        ]
+        assert baseline_calls, 'deploy_state.verify_baseline must be persisted somewhere in the call chain'
+        vb = baseline_calls[0].args[1]['deploy_state']['verify_baseline']
+        assert vb['main_pid'] == _BASELINE_UNIT_STATE['MainPID']
+        assert vb['active_enter_timestamp_monotonic'] == (
+            _BASELINE_UNIT_STATE['ActiveEnterTimestampMonotonic']
+        )
+
+    async def test_act_then_ask_advances_deploy_state_phase_ran_to_escalated_at_gate(
+        self, tmp_path: Path,
+    ):
+        """ζ DS-1: cross-unit act-then-ask (always_escalates=True) — the
+        deploy runs and verifies, then falls through to the milestone gate
+        WITHOUT writing done; the gate's update_task call carries
+        deploy_state.phase=='escalated'."""
+        from orchestrator.deterministic_runner import DeterministicRunner
+        from orchestrator.workflow import WorkflowOutcome
+
+        task = _deploy_task(task_id='250', target_unit='orchestrator-reify.service')
+        task['metadata']['always_escalates'] = True
+        assignment = _make_assignment(task)
+        queue = EscalationQueue(tmp_path)
+        scheduler = _mock_scheduler(task)
+
+        unit_inspector = AsyncMock(side_effect=[_BASELINE_UNIT_STATE, _FRESH_UNIT_STATE])
+        script_runner = AsyncMock(return_value=(0, 'ok'))
+
+        runner = DeterministicRunner(
+            scheduler=scheduler,
+            escalation_queue=queue,
+            unit_inspector=unit_inspector,
+            script_runner=script_runner,
+        )
+        outcome = await runner.run(assignment)
+
+        assert outcome == WorkflowOutcome.BLOCKED
+        pending = queue.get_by_task('250', status='pending')
+        assert len(pending) == 1
+        assert pending[0].category == 'milestone_gate'
+
+        deploy_state_calls = [
+            c for c in scheduler.update_task.call_args_list
+            if len(c.args) > 1 and (c.args[1].get('deploy_state') or {}).get('phase')
+        ]
+        assert deploy_state_calls
+        assert deploy_state_calls[-1].args[1]['deploy_state']['phase'] == 'escalated'
+        # Reviewer amendment (task 2240): deploy_state.escalated_at must
+        # mirror the SAME timestamp as the top-level gate_escalated_at
+        # stamp written in this exact call, not stay null forever.
+        assert (
+            deploy_state_calls[-1].args[1]['deploy_state']['escalated_at']
+            == deploy_state_calls[-1].args[1]['gate_escalated_at']
+        )
+
+
+# ---------------------------------------------------------------------------
+# ζ D2 boundary: an illegal deploy-phase transition files a REAL born-at-L2
+# escalation before raising — never a silent write.
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+class TestDeployTransitionEnforcement:
+    """ζ D2: DeterministicRunner._advance_deploy_phase enforces the _LEGAL
+    transition table via a REAL EscalationQueue — an illegal edge (e.g.
+    scheduled->done) files a born-at-L2 escalation observable via
+    get_by_task, THEN raises IllegalDeployTransition."""
+
+    async def test_illegal_transition_files_l2_escalation_before_raising(
+        self, tmp_path: Path,
+    ):
+        """scheduled->done is pinned-illegal (D2 boundary signal): driving
+        _advance_deploy_phase there must file a born-at-L2 escalation into a
+        REAL EscalationQueue AND raise IllegalDeployTransition."""
+        from orchestrator.deploy_state import DeployPhase, IllegalDeployTransition
+        from orchestrator.deterministic_runner import DeterministicRunner
+
+        queue = EscalationQueue(tmp_path)
+        scheduler = _mock_scheduler(_deploy_task(task_id='999'))
+        runner = DeterministicRunner(scheduler=scheduler, escalation_queue=queue)
+
+        metadata = {'deploy_state': {'phase': 'scheduled'}}
+
+        with pytest.raises(IllegalDeployTransition):
+            await runner._advance_deploy_phase('999', metadata, DeployPhase.DONE)
+
+        escs = queue.get_by_task('999')
+        assert len(escs) == 1, f'Expected exactly 1 escalation, got {len(escs)}'
+        esc = escs[0]
+        assert esc.agent_role == 'orchestrator-deterministic'
+        assert esc.level == 2
+        assert esc.severity == 'critical'
+        assert esc.category == 'illegal_deploy_transition'
+
+    async def test_no_update_task_write_occurs_on_illegal_transition(
+        self, tmp_path: Path,
+    ):
+        """D2 file-before-raise: the illegal transition must never reach
+        update_task — no silent write of a bogus phase."""
+        from orchestrator.deploy_state import DeployPhase, IllegalDeployTransition
+        from orchestrator.deterministic_runner import DeterministicRunner
+
+        queue = EscalationQueue(tmp_path)
+        scheduler = _mock_scheduler(_deploy_task(task_id='999'))
+        runner = DeterministicRunner(scheduler=scheduler, escalation_queue=queue)
+
+        metadata = {'deploy_state': {'phase': 'scheduled'}}
+
+        with pytest.raises(IllegalDeployTransition):
+            await runner._advance_deploy_phase('999', metadata, DeployPhase.DONE)
+
+        scheduler.update_task.assert_not_awaited()
+
 
 # ---------------------------------------------------------------------------
 # Task 2238 (W10-δ), step-3: run()'s cross-unit `if not self_target:` branch
@@ -1018,6 +1204,28 @@ class TestCrossUnitDeployDelegatesToRestartPlan:
         pending = queue.get_by_task('965', status='pending')
         assert len(pending) == 1
         assert pending[0].summary.startswith('Deploy run+verify exceeded outer guard')
+
+    async def test_deployed_and_verified_still_stamps_deploy_state_phase_ran(self, tmp_path: Path):
+        """Even routed through the REAL RestartPlan.execute() delegation, the
+        shared before_done_ran_at write still carries deploy_state.phase=='ran'
+        (ζ DS-1 — the phase write happens before the self/cross split, not
+        inside the delegated execute() call)."""
+        task = _deploy_task(task_id='966', target_unit='orchestrator-reify.service')
+        assignment = _make_assignment(task)
+        unit_inspector = AsyncMock(side_effect=[_BASELINE_UNIT_STATE, _FRESH_UNIT_STATE])
+        script_runner = AsyncMock(return_value=(0, 'ok'))
+        runner, queue, scheduler = self._make_runner(
+            tmp_path, task, unit_inspector=unit_inspector, script_runner=script_runner,
+        )
+
+        await runner.run(assignment)
+
+        stamp_calls = [
+            c for c in scheduler.update_task.call_args_list
+            if len(c.args) > 1 and c.args[1].get('before_done_ran_at')
+        ]
+        assert stamp_calls, 'update_task must be called with a truthy before_done_ran_at stamp'
+        assert stamp_calls[0].args[1]['deploy_state']['phase'] == 'ran'
 
 
 # ---------------------------------------------------------------------------
@@ -1373,6 +1581,107 @@ class TestCrossUnitWritebackResilience:
             f'{len(done_calls)}'
         )
         script_runner.assert_awaited_once()
+
+    async def test_verified_stamp_write_advances_deploy_state_phase_to_verified(
+        self, tmp_path: Path,
+    ):
+        """ζ DS-1: the verified-stamp update_task call — the FIRST write of
+        the shared retry-budget pair — also carries
+        deploy_state.phase=='verified', folded into the SAME write. No third
+        write is added to the pair (the retry budget stays exactly two
+        writes: the verified stamp, then the done status write)."""
+        from orchestrator.deterministic_runner import DeterministicRunner
+        from orchestrator.workflow import WorkflowOutcome
+
+        task = _deploy_task(task_id='2066', target_unit='orchestrator-reify.service')
+        assignment = _make_assignment(task)
+        queue = EscalationQueue(tmp_path)
+        scheduler = _mock_scheduler(task)
+
+        unit_inspector = AsyncMock(side_effect=[_BASELINE_UNIT_STATE, _FRESH_UNIT_STATE])
+        script_runner = AsyncMock(return_value=(0, 'ok'))
+
+        runner = DeterministicRunner(
+            scheduler=scheduler,
+            escalation_queue=queue,
+            unit_inspector=unit_inspector,
+            script_runner=script_runner,
+        )
+        outcome = await runner.run(assignment)
+
+        assert outcome == WorkflowOutcome.DONE
+        verified_calls = [
+            c for c in scheduler.update_task.call_args_list
+            if len(c.args) > 1 and c.args[1].get('before_done_verified_at')
+        ]
+        assert len(verified_calls) == 1, (
+            f'phase fold must not add a THIRD write to the shared retry '
+            f'budget; got {len(verified_calls)} verified-stamp write(s)'
+        )
+        assert verified_calls[0].args[1].get('deploy_state', {}).get('phase') == 'verified', (
+            'the verified-stamp write must atomically carry deploy_state.phase==verified'
+        )
+        # Reviewer amendment (task 2240): deploy_state.verified_at must
+        # mirror the SAME timestamp as the top-level before_done_verified_at
+        # stamp written in this exact call, not stay null forever.
+        assert (
+            verified_calls[0].args[1]['deploy_state']['verified_at']
+            == verified_calls[0].args[1]['before_done_verified_at']
+        )
+
+    async def test_illegal_source_phase_falls_back_to_stamp_only_write(
+        self, tmp_path: Path,
+    ):
+        """Reviewer amendment (task 2240, error_handling): the up-front
+        _compute_deploy_phase_advance(...VERIFIED) call sits OUTSIDE the
+        retry loop and is unguarded — if metadata.deploy_state were
+        corrupted/unexpected (an illegal source phase for VERIFIED, e.g.
+        'escalated'), it must not raise straight out of the method. The
+        deploy already succeeded by this point, so the writeback must fall
+        back to a stamp-only payload (no deploy_state key) and still
+        converge to done, with the illegal edge still filed loudly as an L2
+        escalation (file-before-raise, DS-2)."""
+        from orchestrator.deterministic_runner import DeterministicRunner
+        from orchestrator.workflow import WorkflowOutcome
+
+        # 'escalated' is not a legal source phase for VERIFIED (only 'ran'
+        # is) — simulates corrupted/unexpected deploy_state metadata.
+        task = _deploy_task(task_id='2240', target_unit='orchestrator-reify.service', phase='escalated')
+        queue = EscalationQueue(tmp_path)
+        scheduler = _mock_scheduler(task)
+        runner = DeterministicRunner(scheduler=scheduler, escalation_queue=queue)
+
+        outcome = await runner._writeback_deploy_success(
+            '2240',
+            task['metadata'],
+            _FRESH_UNIT_STATE,
+            'orchestrator-reify.service',
+            'Cross-unit deploy of the reify worker',
+        )
+
+        assert outcome == WorkflowOutcome.DONE, (
+            'the deploy already succeeded — an illegal deploy_state advance '
+            'must not strand a successful deploy'
+        )
+        verified_calls = [
+            c for c in scheduler.update_task.call_args_list
+            if len(c.args) > 1 and 'before_done_verified_at' in c.args[1]
+        ]
+        assert len(verified_calls) == 1
+        assert 'deploy_state' not in verified_calls[0].args[1], (
+            'the illegal advance must fall back to a stamp-only write, not a '
+            'deploy_state payload built from a state that never persisted'
+        )
+        # DS-2 loudness: the illegal edge still files a born-at-L2
+        # escalation (file-before-raise), even though the raise itself is
+        # swallowed here.
+        illegal_escs = [
+            e for e in queue.get_by_task('2240')
+            if e.category == 'illegal_deploy_transition'
+        ]
+        assert len(illegal_escs) == 1
+        scheduler.set_task_status.assert_awaited_once()
+        assert scheduler.set_task_status.call_args.args[1] == 'done'
 
 
 # ---------------------------------------------------------------------------
@@ -1796,6 +2105,51 @@ class TestInspectUnitTimeoutHardening:
             'the verify-leg inspect is ever invoked'
         )
 
+    async def test_baseline_inspect_fail_advances_deploy_state_phase_ran_to_escalated(
+        self, tmp_path: Path,
+    ):
+        """ζ DS-1: an untrustworthy baseline (no ActiveState) is detected
+        AFTER the shared before_done_ran_at/phase=ran write (that stamp
+        precedes baseline capture) — the infra_issue filing then advances
+        deploy_state.phase ran->escalated, gated to the deploy path only.
+
+        Uses a direct unit_inspector mock (rather than subprocess-level
+        wedging) since only the ``ActiveState`` == '' branch matters here.
+        """
+        from orchestrator.deterministic_runner import DeterministicRunner
+        from orchestrator.workflow import WorkflowOutcome
+
+        task = _deploy_task(task_id='502', target_unit='orchestrator-reify.service')
+        assignment = _make_assignment(task)
+        queue = EscalationQueue(tmp_path)
+        scheduler = _mock_scheduler(task)
+        script_runner = AsyncMock(return_value=(0, 'ok'))
+        unit_inspector = AsyncMock(return_value={
+            'MainPID': 0, 'ActiveState': '', 'ActiveEnterTimestamp': '',
+            'ActiveEnterTimestampMonotonic': 0,
+        })
+
+        runner = DeterministicRunner(
+            scheduler=scheduler,
+            escalation_queue=queue,
+            unit_inspector=unit_inspector,
+            script_runner=script_runner,
+        )
+        outcome = await runner.run(assignment)
+
+        assert outcome == WorkflowOutcome.BLOCKED
+        pending = queue.get_by_task('502', status='pending')
+        assert len(pending) == 1
+        assert 'Baseline inspect failed' in pending[0].summary
+        script_runner.assert_not_called()
+
+        deploy_state_calls = [
+            c for c in scheduler.update_task.call_args_list
+            if len(c.args) > 1 and (c.args[1].get('deploy_state') or {}).get('phase')
+        ]
+        assert deploy_state_calls
+        assert deploy_state_calls[-1].args[1]['deploy_state']['phase'] == 'escalated'
+
 
 # ---------------------------------------------------------------------------
 # Task 2119 — _default_inspect_unit delegates to systemd_inspect.inspect_systemd_unit
@@ -2062,6 +2416,47 @@ class TestBeforeDoneRunFnOuterGuard:
             'no escalation should be filed on the success path'
         )
 
+    async def test_run_fn_hang_advances_deploy_state_phase_ran_to_escalated(
+        self, tmp_path: Path,
+    ):
+        """ζ DS-1: the outer-guard timeout (Layer B) advances
+        deploy_state.phase ran->escalated via _file_infra_issue_and_block,
+        gated to the deploy path only."""
+        import asyncio
+
+        from orchestrator.deterministic_runner import DeterministicRunner
+        from orchestrator.workflow import WorkflowOutcome
+
+        task = _deploy_task(
+            task_id='300', target_unit='orchestrator-reify.service', timeout_secs=0,
+        )
+        assignment = _make_assignment(task)
+        queue = EscalationQueue(tmp_path)
+        scheduler = _mock_scheduler(task)
+
+        async def _hang(_before_done):
+            await asyncio.Event().wait()
+
+        unit_inspector = AsyncMock(return_value=_BASELINE_UNIT_STATE)
+
+        runner = DeterministicRunner(
+            scheduler=scheduler,
+            escalation_queue=queue,
+            unit_inspector=unit_inspector,
+            script_runner=_hang,
+            run_timeout_grace_secs=0.05,
+        )
+
+        outcome = await asyncio.wait_for(runner.run(assignment), timeout=5)
+        assert outcome == WorkflowOutcome.BLOCKED
+
+        deploy_state_calls = [
+            c for c in scheduler.update_task.call_args_list
+            if len(c.args) > 1 and (c.args[1].get('deploy_state') or {}).get('phase')
+        ]
+        assert deploy_state_calls
+        assert deploy_state_calls[-1].args[1]['deploy_state']['phase'] == 'escalated'
+
 
 # ---------------------------------------------------------------------------
 # Step-3: B7a — script rc ≠ 0 failure (RED until step-4 implements the path)
@@ -2251,6 +2646,202 @@ class TestBeforeDoneRcNonZero:
         outcome = await runner.run(assignment)
 
         assert outcome == WorkflowOutcome.BLOCKED
+
+    async def test_b7a_advances_deploy_state_phase_ran_to_escalated(self, tmp_path: Path):
+        """ζ DS-1: rc ≠ 0 (RESTART_FAILED) advances deploy_state.phase
+        ran->escalated via _file_infra_issue_and_block, gated to the deploy
+        path only (before_done with target_unit)."""
+        from orchestrator.deterministic_runner import DeterministicRunner
+
+        task = _deploy_task(task_id='300')
+        assignment = _make_assignment(task)
+        queue = EscalationQueue(tmp_path)
+        scheduler = _mock_scheduler(task)
+
+        unit_inspector = AsyncMock(return_value=_BASELINE_UNIT_STATE)
+        script_runner = AsyncMock(return_value=(1, 'boom: unit failed to start'))
+
+        runner = DeterministicRunner(
+            scheduler=scheduler,
+            escalation_queue=queue,
+            unit_inspector=unit_inspector,
+            script_runner=script_runner,
+        )
+        await runner.run(assignment)
+
+        deploy_state_calls = [
+            c for c in scheduler.update_task.call_args_list
+            if len(c.args) > 1 and (c.args[1].get('deploy_state') or {}).get('phase')
+        ]
+        assert deploy_state_calls
+        assert deploy_state_calls[-1].args[1]['deploy_state']['phase'] == 'escalated'
+
+
+# ---------------------------------------------------------------------------
+# Reviewer amendment (task 2240): _file_infra_issue_and_block's best-effort
+# ran->escalated phase advance can itself fail transiently (e.g. the SAME
+# severed connection that triggered the escalation). Pin the documented
+# consequence: no state corruption, but a resume sees phase stuck at 'ran'
+# and re-escalates instead of resuming to done — one spurious extra
+# escalate/resolve round-trip that self-heals once the advance lands.
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+class TestFileInfraIssueEscalatedAdvanceFailureConverges:
+    """A transient failure of the best-effort ESCALATED phase advance must
+    not corrupt state, but does cost one extra human round-trip before the
+    task converges to done — see _file_infra_issue_and_block's docstring."""
+
+    async def test_advance_failure_then_resolve_converges_after_extra_round_trip(
+        self, tmp_path: Path,
+    ) -> None:
+        from orchestrator.deterministic_runner import DeterministicRunner
+        from orchestrator.workflow import WorkflowOutcome
+
+        task = _deploy_task(task_id='2240')
+        queue = EscalationQueue(tmp_path)
+        scheduler = _mock_scheduler(task)
+
+        unit_inspector = AsyncMock(return_value=_BASELINE_UNIT_STATE)
+        script_runner = AsyncMock(return_value=(1, 'boom: unit failed to start'))
+
+        # Connection severed ONLY for the ESCALATED phase-advance write
+        # (deploy_state.phase=='escalated'); the RAN stamp write and every
+        # set_task_status call are unaffected — the escalation itself is
+        # still filed durably (EscalationQueue.submit writes to local disk).
+        escalated_advance_should_fail = [True]
+
+        def _update_task_side_effect(_task_id, metadata, **_kwargs):
+            ds = metadata.get('deploy_state') or {}
+            if ds.get('phase') == 'escalated' and escalated_advance_should_fail[0]:
+                raise RuntimeError('connection severed (simulated)')
+            return True
+
+        scheduler.update_task = AsyncMock(side_effect=_update_task_side_effect)
+
+        runner = DeterministicRunner(
+            scheduler=scheduler,
+            escalation_queue=queue,
+            unit_inspector=unit_inspector,
+            script_runner=script_runner,
+        )
+
+        # --- Run 1: deploy fails (rc≠0), escalation filed, but the
+        # best-effort advance to ESCALATED itself fails transiently — phase
+        # stays at 'ran'.
+        outcome1 = await runner.run(_make_assignment(task))
+        assert outcome1 == WorkflowOutcome.BLOCKED
+        assert task['metadata']['deploy_state']['phase'] == 'ran', (
+            'the best-effort advance failed, so phase must stay at its '
+            'pre-escalation value, not silently jump to escalated'
+        )
+        first_pending = queue.get_by_task('2240', status='pending')
+        assert len(first_pending) == 1
+
+        # The runner mirrors deploy_state into `metadata` in place (needed
+        # for same-run multi-advance reads), but a plain top-level evidence
+        # stamp like before_done_ran_at is only ever sent to the (mocked)
+        # scheduler — it does not round-trip back into this dict the way a
+        # real get_task() would on the next dispatch. Simulate that landed
+        # write explicitly, mirroring how every other resume-path test in
+        # this file seeds before_done_ran_at via _deploy_task's kwarg — only
+        # the ESCALATED advance failed, not this one.
+        task['metadata']['before_done_ran_at'] = '2026-07-01T00:00:00+00:00'
+
+        # A human resolves the (only) escalation — but the phase is still
+        # stuck at 'ran', not 'escalated'.
+        queue.resolve(first_pending[0].id, 'human restarted the unit manually')
+
+        # --- Run 2 (resume): connection recovers. The phase==ESCALATED
+        # resolution proof is NOT satisfied (still 'ran'), so this is
+        # indistinguishable from an unresolved crash-window — it
+        # re-escalates instead of resuming to done (the documented spurious
+        # extra round-trip). This time the advance itself succeeds, landing
+        # phase=='escalated'.
+        escalated_advance_should_fail[0] = False
+        outcome2 = await runner.run(_make_assignment(task))
+        assert outcome2 == WorkflowOutcome.BLOCKED, (
+            'phase never reached ESCALATED, so resume must NOT phantom-complete'
+        )
+        assert task['metadata']['deploy_state']['phase'] == 'escalated', (
+            'the connection recovered, so this advance must land'
+        )
+        second_pending = queue.get_by_task('2240', status='pending')
+        assert len(second_pending) == 1
+        assert second_pending[0].id != first_pending[0].id, (
+            'a NEW escalation must be filed — this is the spurious extra '
+            'round-trip, not a re-use of the already-resolved one'
+        )
+
+        # A human resolves the second escalation.
+        queue.resolve(second_pending[0].id, 'human confirmed the unit is healthy')
+
+        # --- Run 3 (resume): phase==ESCALATED + own_escalation_resolved now
+        # both hold — converges to done, no further escalation.
+        outcome3 = await runner.run(_make_assignment(task))
+        assert outcome3 == WorkflowOutcome.DONE, (
+            'once phase==ESCALATED is actually persisted, resolution proof '
+            'holds and the task converges to done'
+        )
+        done_calls = [
+            c for c in scheduler.set_task_status.call_args_list
+            if c.args[1] == 'done'
+        ]
+        assert len(done_calls) == 1
+
+
+# ---------------------------------------------------------------------------
+# Reviewer amendment (task 2240, robustness): _file_infra_issue_and_block's
+# best-effort ESCALATED advance must not attempt a pinned-illegal self-loop
+# (ESCALATED->ESCALATED / DONE->ESCALATED) when the deploy is already at
+# that phase — that would file a spurious born-at-L2
+# illegal_deploy_transition escalation on top of the infra_issue one.
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+class TestFileInfraIssueSkipsRedundantEscalatedAdvance:
+    """On the rare crash-resume edge where deploy_state.phase is already
+    ESCALATED (or DONE) but resolution could not be proven, execution can
+    reach the unknown-crash infra_issue path again. The best-effort advance
+    must skip rather than re-attempt an illegal self-loop."""
+
+    @pytest.mark.parametrize('seeded_phase', ['escalated', 'done'])
+    async def test_no_illegal_transition_escalation_when_already_at_target(
+        self, tmp_path: Path, seeded_phase: str,
+    ) -> None:
+        from orchestrator.deterministic_runner import DeterministicRunner
+        from orchestrator.workflow import WorkflowOutcome
+
+        task = _deploy_task(task_id='2240', phase=seeded_phase)
+        queue = EscalationQueue(tmp_path)
+        scheduler = _mock_scheduler(task)
+        runner = DeterministicRunner(scheduler=scheduler, escalation_queue=queue)
+
+        outcome = await runner._file_infra_issue_and_block(
+            '2240',
+            summary='Deploy state unknown after crash: orchestrator-reify.service',
+            detail='crash detail',
+            metadata=task['metadata'],
+        )
+
+        assert outcome == WorkflowOutcome.BLOCKED
+        # The infra_issue itself is still filed — the skip only affects the
+        # redundant phase advance, not the loud signal for this crash.
+        infra_escs = [e for e in queue.get_by_task('2240') if e.category == 'infra_issue']
+        assert len(infra_escs) == 1
+        # No spurious illegal_deploy_transition escalation was filed.
+        illegal_escs = [
+            e for e in queue.get_by_task('2240')
+            if e.category == 'illegal_deploy_transition'
+        ]
+        assert illegal_escs == []
+        # No redundant deploy_state write was even attempted.
+        deploy_state_calls = [
+            c for c in scheduler.update_task.call_args_list
+            if len(c.args) > 1 and (c.args[1].get('deploy_state') or {}).get('phase')
+        ]
+        assert deploy_state_calls == []
+        assert task['metadata']['deploy_state']['phase'] == seeded_phase
 
 
 # ---------------------------------------------------------------------------
@@ -2442,6 +3033,38 @@ class TestBeforeDoneVerifyFail:
         outcome = await runner.run(assignment)
 
         assert outcome == WorkflowOutcome.BLOCKED
+
+    @pytest.mark.parametrize('post_state', _STALE_POST_STATES)
+    async def test_b7b_advances_deploy_state_phase_ran_to_escalated(
+        self, tmp_path: Path, post_state: dict,
+    ):
+        """ζ DS-1: verify-fail (VERIFY_FAILED) advances deploy_state.phase
+        ran->escalated via _file_infra_issue_and_block, gated to the deploy
+        path only (before_done with target_unit)."""
+        from orchestrator.deterministic_runner import DeterministicRunner
+
+        task = _deploy_task(task_id='400', target_unit='orchestrator-reify.service')
+        assignment = _make_assignment(task)
+        queue = EscalationQueue(tmp_path)
+        scheduler = _mock_scheduler(task)
+
+        unit_inspector = AsyncMock(side_effect=[_BASELINE_UNIT_STATE, post_state])
+        script_runner = AsyncMock(return_value=(0, 'ok'))
+
+        runner = DeterministicRunner(
+            scheduler=scheduler,
+            escalation_queue=queue,
+            unit_inspector=unit_inspector,
+            script_runner=script_runner,
+        )
+        await runner.run(assignment)
+
+        deploy_state_calls = [
+            c for c in scheduler.update_task.call_args_list
+            if len(c.args) > 1 and (c.args[1].get('deploy_state') or {}).get('phase')
+        ]
+        assert deploy_state_calls
+        assert deploy_state_calls[-1].args[1]['deploy_state']['phase'] == 'escalated'
 
 # ---------------------------------------------------------------------------
 # Step-7: B7 reaper / I1 once-only quiescence
@@ -2818,6 +3441,97 @@ class TestDeterministicRunnerResolutionProofAliasing:
         assert pending[0].agent_role == 'orchestrator-deterministic'
         assert outcome == WorkflowOutcome.BLOCKED
 
+    # --- test a2: ζ D3 — phase gate replaces bare escalation-existence ------
+
+    async def test_phase_ran_with_resolved_runner_owned_escalation_does_not_resume_to_done(
+        self, tmp_path: Path,
+    ):
+        """D3 negative (finding 4.0, the driving fix): a deploy stranded at
+        deploy_state.phase=='ran' (NOT escalated) with a RESOLVED
+        runner-owned escalation on record must NOT resume to done — bare
+        escalation existence is not proof THIS deploy's own gate/failure is
+        what got resolved; only phase=='escalated' (the runner's OWN
+        recorded transition when it filed that escalation) is. Falls to
+        the crash-window branch instead: re-escalates its own infra_issue
+        and BLOCKS, exactly as if no escalation existed at all.
+
+        RED against current code: `ever_escalated=bool(get_by_task(...,
+        agent_role=...))` is True here (a resolved runner-owned record
+        exists) and phantom-completes via branch (b) regardless of phase —
+        this is finding 4.0.
+        """
+        from orchestrator.deterministic_runner import DeterministicRunner
+        from orchestrator.workflow import WorkflowOutcome
+
+        task = _deploy_task(
+            task_id='805', before_done_ran_at='2026-06-23T10:00:00+00:00',
+            phase='ran',
+        )
+        assignment = _make_assignment(task)
+        queue = EscalationQueue(tmp_path)
+        _seed_escalation(queue, '805', 'orchestrator-deterministic', resolved=True)
+        scheduler = _mock_scheduler(task)
+
+        unit_inspector = AsyncMock(return_value=_BASELINE_UNIT_STATE)
+        script_runner = AsyncMock(return_value=(0, 'ok'))
+
+        runner = DeterministicRunner(
+            scheduler=scheduler,
+            escalation_queue=queue,
+            unit_inspector=unit_inspector,
+            script_runner=script_runner,
+        )
+        outcome = await runner.run(assignment)
+
+        done_calls = [c for c in scheduler.set_task_status.call_args_list if c.args[1] == 'done']
+        assert not done_calls, (
+            'phase==ran (not escalated) must NEVER resume to done, even with '
+            'a resolved runner-owned escalation on record — bare escalation '
+            'existence is not proof of resolution (finding 4.0)'
+        )
+        assert outcome == WorkflowOutcome.BLOCKED
+        pending = queue.get_by_task('805', status='pending')
+        assert len(pending) == 1, f'must file a fresh crash-window infra_issue, got {len(pending)}'
+        assert pending[0].category == 'infra_issue'
+        script_runner.assert_not_awaited()
+
+    async def test_phase_ran_with_resolved_unrelated_escalation_does_not_resume_to_done(
+        self, tmp_path: Path,
+    ):
+        """D3 negative: same as above but the resolved escalation is the
+        UNRELATED starvation-watchdog role — doubly not proof of THIS
+        runner's resolution. Must also re-escalate and BLOCK, never done."""
+        from orchestrator.deterministic_runner import DeterministicRunner
+        from orchestrator.workflow import WorkflowOutcome
+
+        task = _deploy_task(
+            task_id='806', before_done_ran_at='2026-06-23T10:00:00+00:00',
+            phase='ran',
+        )
+        assignment = _make_assignment(task)
+        queue = EscalationQueue(tmp_path)
+        _seed_escalation(queue, '806', self._UNRELATED_ROLE, resolved=True)
+        scheduler = _mock_scheduler(task)
+
+        unit_inspector = AsyncMock(return_value=_BASELINE_UNIT_STATE)
+        script_runner = AsyncMock(return_value=(0, 'ok'))
+
+        runner = DeterministicRunner(
+            scheduler=scheduler,
+            escalation_queue=queue,
+            unit_inspector=unit_inspector,
+            script_runner=script_runner,
+        )
+        outcome = await runner.run(assignment)
+
+        done_calls = [c for c in scheduler.set_task_status.call_args_list if c.args[1] == 'done']
+        assert not done_calls
+        assert outcome == WorkflowOutcome.BLOCKED
+        pending = queue.get_by_task('806', status='pending')
+        assert len(pending) == 1
+        assert pending[0].category == 'infra_issue'
+        assert pending[0].agent_role == 'orchestrator-deterministic'
+
     # --- run()'s section-1 gate quiescence aliasing -------------------------
 
     async def test_section1_quiescence_ignores_unrelated_pending_escalation(self, tmp_path: Path):
@@ -2892,13 +3606,19 @@ class TestDeterministicRunnerResolutionProofAliasing:
 
     async def test_parity_runner_owned_resolved_escalation_still_resumes(self, tmp_path: Path):
         """Parity: a RESOLVED escalation filed by the runner itself must still
-        prove resolution (branch b). Must stay GREEN regardless of the
-        ever_escalated agent_role scoping.
+        prove resolution (branch b) — ζ D3: the new contract requires
+        deploy_state.phase=='escalated' as the recorded proof the runner
+        itself transitioned there when it filed the failure/gate escalation
+        (see TestDeterministicRunnerResolutionProofAliasing's phase-gate
+        tests for the finding-4.0 fix this narrows against).
         """
         from orchestrator.deterministic_runner import DeterministicRunner
         from orchestrator.workflow import WorkflowOutcome
 
-        task = _deploy_task(task_id='803', before_done_ran_at='2026-06-23T10:00:00+00:00')
+        task = _deploy_task(
+            task_id='803', before_done_ran_at='2026-06-23T10:00:00+00:00',
+            phase='escalated',
+        )
         assignment = _make_assignment(task)
         queue = EscalationQueue(tmp_path)
         _seed_escalation(queue, '803', 'orchestrator-deterministic', resolved=True)
@@ -3641,6 +4361,67 @@ class TestSelfRestartScheduled:
         assert isinstance(stamp_val.get('fire_delay_secs'), int), (
             f'before_done_scheduled_at.fire_delay_secs must be an int; '
             f"got {stamp_val.get('fire_delay_secs')!r}"
+        )
+
+    async def test_b8_stamps_deploy_state_phase_scheduled_atomically(self, tmp_path: Path):
+        """ζ DS-1: the before_done_scheduled_at write also atomically advances
+        deploy_state.phase ran->scheduled (self-restart, always_escalates=False)."""
+        from orchestrator.deterministic_runner import DeterministicRunner
+
+        task = _deploy_task(task_id='852', target_unit='orchestrator-reify.service')
+        assignment = _make_assignment(task)
+        queue = EscalationQueue(tmp_path)
+        scheduler = _mock_scheduler(task)
+
+        restart_scheduler = AsyncMock(return_value=(0, 'scheduled'))
+
+        runner = DeterministicRunner(
+            scheduler=scheduler,
+            escalation_queue=queue,
+            unit_inspector=AsyncMock(return_value=_BASELINE_UNIT_STATE),
+            script_runner=AsyncMock(return_value=(0, 'ok')),
+            own_unit_resolver=lambda: 'orchestrator-reify.service',
+            restart_scheduler=restart_scheduler,
+        )
+        await runner.run(assignment)
+
+        scheduled_stamp_calls = [
+            c for c in scheduler.update_task.call_args_list
+            if len(c.args) > 1 and c.args[1].get('before_done_scheduled_at')
+        ]
+        assert scheduled_stamp_calls
+        assert scheduled_stamp_calls[0].args[1]['deploy_state']['phase'] == 'scheduled'
+
+    async def test_b8_done_write_does_not_advance_deploy_state_past_scheduled(self, tmp_path: Path):
+        """scheduled->done is pinned-illegal: the done write must not attempt a
+        deploy_state phase advance — the LAST deploy_state write observed stays
+        at phase=='scheduled' (task-status done != deploy-phase done)."""
+        from orchestrator.deterministic_runner import DeterministicRunner
+
+        task = _deploy_task(task_id='852', target_unit='orchestrator-reify.service')
+        assignment = _make_assignment(task)
+        queue = EscalationQueue(tmp_path)
+        scheduler = _mock_scheduler(task)
+
+        restart_scheduler = AsyncMock(return_value=(0, 'scheduled'))
+
+        runner = DeterministicRunner(
+            scheduler=scheduler,
+            escalation_queue=queue,
+            unit_inspector=AsyncMock(return_value=_BASELINE_UNIT_STATE),
+            script_runner=AsyncMock(return_value=(0, 'ok')),
+            own_unit_resolver=lambda: 'orchestrator-reify.service',
+            restart_scheduler=restart_scheduler,
+        )
+        await runner.run(assignment)
+
+        deploy_state_calls = [
+            c for c in scheduler.update_task.call_args_list
+            if len(c.args) > 1 and (c.args[1].get('deploy_state') or {}).get('phase')
+        ]
+        assert deploy_state_calls
+        assert deploy_state_calls[-1].args[1]['deploy_state']['phase'] == 'scheduled', (
+            'no update_task call may advance deploy_state past scheduled on this path'
         )
 
 
@@ -4804,6 +5585,61 @@ class TestSelfRestartActThenAskGate:
             f'Expected category "milestone_gate", got "{pending[0].category}"'
         )
 
+    async def test_gate_fallthrough_advances_deploy_state_phase_scheduled_to_escalated(
+        self, tmp_path: Path
+    ):
+        """ζ: self-restart act-then-ask falls through ran->scheduled (self-restart
+        stamp) -> escalated (gate filing) — the gate's update_task call carries
+        deploy_state.phase=='escalated'."""
+        task = self._act_then_ask_task()
+        assignment = _make_assignment(task)
+        queue = EscalationQueue(tmp_path)
+        scheduler = _mock_scheduler(task)
+
+        unit_inspector = AsyncMock(return_value=_BASELINE_UNIT_STATE)
+        script_runner = AsyncMock(return_value=(0, 'ok'))
+        restart_scheduler = AsyncMock(return_value=(0, 'scheduled'))
+
+        runner = self._make_runner(scheduler, queue, unit_inspector, script_runner, restart_scheduler)
+        await runner.run(assignment)
+
+        deploy_state_calls = [
+            c for c in scheduler.update_task.call_args_list
+            if len(c.args) > 1 and (c.args[1].get('deploy_state') or {}).get('phase')
+        ]
+        assert deploy_state_calls
+        assert deploy_state_calls[-1].args[1]['deploy_state']['phase'] == 'escalated'
+
+    async def test_full_phase_sequence_ran_scheduled_escalated(self, tmp_path: Path):
+        """Reviewer amendment (task 2240, test_coverage): the specific reason
+        the two new _LEGAL edges (ran->scheduled, scheduled->escalated) were
+        added — a self-restart act-then-ask deploy traverses BOTH within a
+        single dispatch. Assert the FULL ordered sequence (not just the
+        final call): the shared before_done_ran_at write lands 'ran', the
+        self-restart stamp lands 'scheduled', and the gate filing lands
+        'escalated'."""
+        task = self._act_then_ask_task()
+        assignment = _make_assignment(task)
+        queue = EscalationQueue(tmp_path)
+        scheduler = _mock_scheduler(task)
+
+        unit_inspector = AsyncMock(return_value=_BASELINE_UNIT_STATE)
+        script_runner = AsyncMock(return_value=(0, 'ok'))
+        restart_scheduler = AsyncMock(return_value=(0, 'scheduled'))
+
+        runner = self._make_runner(scheduler, queue, unit_inspector, script_runner, restart_scheduler)
+        await runner.run(assignment)
+
+        deploy_state_calls = [
+            c for c in scheduler.update_task.call_args_list
+            if len(c.args) > 1 and (c.args[1].get('deploy_state') or {}).get('phase')
+        ]
+        phases = [c.args[1]['deploy_state']['phase'] for c in deploy_state_calls]
+        assert phases == ['ran', 'scheduled', 'escalated'], (
+            f'expected the phase machine to traverse ran -> scheduled -> '
+            f'escalated in order within a single dispatch, got {phases}'
+        )
+
 
 # ---------------------------------------------------------------------------
 # Step-13 (ε): robustness_crash_resume + always_escalates=True
@@ -5001,6 +5837,44 @@ class TestSelfRestartScheduledCrashResumeActThenAsk:
         await runner.run(assignment)
 
         unit_inspector.assert_not_awaited()
+
+    async def test_crash_resume_gate_refile_advances_scheduled_to_escalated(self, tmp_path: Path):
+        """ζ: a task resuming with deploy_state.phase=='scheduled' already
+        persisted (the step-6-written shape) advances to 'escalated' when the
+        crash-resume re-files the milestone gate."""
+        from orchestrator.deterministic_runner import DeterministicRunner
+
+        task = _deploy_task(
+            task_id='855',
+            target_unit='orchestrator-reify.service',
+            before_done_ran_at='2026-06-23T10:00:00+00:00',
+            before_done_scheduled_at={
+                'at': '2026-06-23T10:00:01+00:00',
+                'transient_unit': 'orch-redeploy-restart-855.service',
+                'fire_delay_secs': 60,
+            },
+            phase='scheduled',
+        )
+        task['metadata']['always_escalates'] = True
+        assignment = _make_assignment(task)
+        queue = EscalationQueue(tmp_path)
+        scheduler = _mock_scheduler(task)
+
+        runner = DeterministicRunner(
+            scheduler=scheduler,
+            escalation_queue=queue,
+            unit_inspector=AsyncMock(return_value=_BASELINE_UNIT_STATE),
+            script_runner=AsyncMock(return_value=(0, 'ok')),
+            restart_scheduler=AsyncMock(return_value=(0, 'scheduled')),
+        )
+        await runner.run(assignment)
+
+        deploy_state_calls = [
+            c for c in scheduler.update_task.call_args_list
+            if len(c.args) > 1 and (c.args[1].get('deploy_state') or {}).get('phase')
+        ]
+        assert deploy_state_calls
+        assert deploy_state_calls[-1].args[1]['deploy_state']['phase'] == 'escalated'
 
 
 # ---------------------------------------------------------------------------

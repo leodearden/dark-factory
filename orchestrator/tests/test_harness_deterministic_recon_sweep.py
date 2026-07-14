@@ -23,7 +23,9 @@ This file adds a new, cross-cutting background sweep (mirroring
 This file covers:
   step-1:  test_config_defaults_deterministic_recon_sweep
   step-3:  TestDeterministicDeployHealthVerdict / TestRevalidateDeployHealth
-  step-5:  TestIsStrandedDeterministicShape
+  step-5:  TestDeterministicDeployStranded (ζ/task 2240: phase-based
+           classifier replacing the deleted stamp-archaeology
+           TestIsStrandedDeterministicShape)
   step-7:  TestRecoverStrandedDeterministicTask
   step-9:  TestRevalidateOpenDeterministicEscalation
   step-11: TestRunDeterministicReconSweep
@@ -39,6 +41,18 @@ Amendment pass (post-review) additionally covers:
     generic stranded-blocked reaper (_reconcile_one_stranded) now excludes
     task_kind=='deterministic' tasks, delegating them exclusively to this
     sweep so the health check is never bypassed by the generic backstop.
+
+ζ/task 2240 (DS-3 freshness verdict) additionally covers:
+  - TestRevalidateDeployHealth: Harness._revalidate_deterministic_deploy_health
+    reads ``deploy_state.verify_baseline`` and threads it through to
+    ``_deterministic_deploy_health_verdict`` — see test_systemd_inspect.py
+    for the canonical verdict-function coverage of the freshness branch
+    itself (live monotonic advanced past baseline AND MainPID>0).
+  - TestRunDeterministicReconSweep (D1 composition): a FULL sweep pass —
+    Source A's real ``_recover_stranded_deterministic_task``, not mocked
+    out — over a ``deploy_state.phase=='ran'`` strand with a persisted
+    baseline, proving the freshness verdict (not phantom-done) drives the
+    recovery escalation's category end-to-end.
 """
 
 from __future__ import annotations
@@ -51,10 +65,11 @@ from _orch_helpers import _init_harness_state_for_test, wire_scheduler_liveness_
 from escalation.models import Escalation
 
 from orchestrator.config import OrchestratorConfig
+from orchestrator.deploy_state import DeployPhase
 from orchestrator.harness import (
     Harness,
     _deterministic_deploy_health_verdict,
-    _is_stranded_deterministic_shape,
+    _deterministic_deploy_stranded,
     _recon_inspect_unit,
 )
 
@@ -152,6 +167,73 @@ class TestRevalidateDeployHealth:
         assert verdict == 'unconfirmed'
         h._recon_unit_inspector.assert_not_awaited()
 
+    # --- ζ/task 2240 DS-3: deploy_state.verify_baseline pass-through --------
+
+    @pytest.mark.asyncio
+    async def test_revalidate_passes_deploy_state_verify_baseline_to_verdict(self) -> None:
+        """_revalidate_deterministic_deploy_health must read
+        deploy_state.verify_baseline from metadata and thread it through to
+        the verdict fn — proven behaviourally: an inspect result with
+        ActiveState NOT 'active' (so the liveness-only branch would read
+        'unconfirmed') still verdicts 'healthy' once the live monotonic has
+        advanced past a persisted baseline, because the freshness branch
+        does not require ActiveState=='active'."""
+        h = _make_recon_harness()
+        h._recon_unit_inspector = AsyncMock(return_value={
+            'MainPID': 4321, 'ActiveState': 'deactivating',
+            'ActiveEnterTimestampMonotonic': 500,
+        })
+        metadata = {
+            'before_done': {'target_unit': 'fused-memory.service'},
+            'deploy_state': {
+                'phase': 'ran',
+                'verify_baseline': {'active_enter_timestamp_monotonic': 100, 'main_pid': 999},
+            },
+        }
+
+        verdict = await h._revalidate_deterministic_deploy_health(metadata)
+
+        assert verdict == 'healthy'
+
+    @pytest.mark.asyncio
+    async def test_revalidate_unconfirmed_with_baseline_when_monotonic_stale(self) -> None:
+        """The live unit reports 'active' (the OLD liveness-only check would
+        call this 'healthy'), but the freshness branch overrides it to
+        'unconfirmed' because the monotonic did NOT advance past baseline."""
+        h = _make_recon_harness()
+        h._recon_unit_inspector = AsyncMock(return_value={
+            'MainPID': 4321, 'ActiveState': 'active',
+            'ActiveEnterTimestampMonotonic': 100,
+        })
+        metadata = {
+            'before_done': {'target_unit': 'fused-memory.service'},
+            'deploy_state': {
+                'phase': 'ran',
+                'verify_baseline': {'active_enter_timestamp_monotonic': 100, 'main_pid': 999},
+            },
+        }
+
+        verdict = await h._revalidate_deterministic_deploy_health(metadata)
+
+        assert verdict == 'unconfirmed'
+
+    @pytest.mark.asyncio
+    async def test_revalidate_no_baseline_falls_back_to_liveness_only(self) -> None:
+        """When deploy_state has no verify_baseline, the pre-existing
+        liveness-only verdict is used (backward compat)."""
+        h = _make_recon_harness()
+        h._recon_unit_inspector = AsyncMock(return_value={
+            'MainPID': 4321, 'ActiveState': 'active', 'ActiveEnterTimestampMonotonic': 5,
+        })
+        metadata = {
+            'before_done': {'target_unit': 'fused-memory.service'},
+            'deploy_state': {'phase': 'ran'},
+        }
+
+        verdict = await h._revalidate_deterministic_deploy_health(metadata)
+
+        assert verdict == 'healthy'
+
 
 # ---------------------------------------------------------------------------
 # Amendment: _recon_inspect_unit — the real I/O default inspector.
@@ -230,9 +312,19 @@ class TestReconInspectUnit:
 # ---------------------------------------------------------------------------
 
 
-def _strand_metadata(**overrides) -> dict:
-    """Canonical stranded-deterministic-shape metadata (task 2059 EVIDENCE)."""
-    base = {
+def _strand_metadata(
+    phase: str | None = None, verify_baseline: dict | None = None, **overrides
+) -> dict:
+    """Canonical stranded-deterministic-shape metadata (task 2059 EVIDENCE).
+
+    ``phase`` (+ optional ``verify_baseline``), when given, seeds a ζ
+    ``metadata['deploy_state']`` slice (``{'phase': phase}``, merging in
+    ``verify_baseline`` when provided) — the phase-bearing shape used by the
+    phase-based strand classifier tests. Omitting ``phase`` (the default)
+    keeps the pre-ζ stamp-only shape — no ``deploy_state`` key at all — so
+    existing backward-compat parity tests can still build stamp-only tasks.
+    """
+    base: dict = {
         'task_kind': 'deterministic',
         'before_done': {'target_unit': 'fused-memory.service'},
         'before_done_ran_at': '2026-07-01T00:00:00+00:00',
@@ -240,48 +332,110 @@ def _strand_metadata(**overrides) -> dict:
         'gate_escalated_at': None,
         'done_provenance': None,
     }
+    if phase is not None:
+        deploy_state: dict = {'phase': phase}
+        if verify_baseline is not None:
+            deploy_state['verify_baseline'] = verify_baseline
+        base['deploy_state'] = deploy_state
     base.update(overrides)
     return base
 
 
-class TestIsStrandedDeterministicShape:
-    """step-5: harness._is_stranded_deterministic_shape pure classifier."""
+class TestDeterministicDeployStranded:
+    """step-5 (ζ/task 2240): harness._deterministic_deploy_stranded — the
+    phase-based classifier replacing the deleted 4-stamp combinatorial
+    ``_is_stranded_deterministic_shape`` (DS-4). Because ζ writes
+    ``deploy_state.phase`` atomically with every stamp, the old shape
+    collapses to a single enum compare: phase == RAN.
+    """
 
-    def test_true_for_canonical_strand_shape(self) -> None:
-        assert _is_stranded_deterministic_shape(_strand_metadata()) is True
+    # --- phase-authoritative (deploy_state present) --------------------------
+
+    def test_true_when_phase_ran(self) -> None:
+        assert _deterministic_deploy_stranded(_strand_metadata(phase=DeployPhase.RAN)) is True
+
+    def test_false_when_phase_verified(self) -> None:
+        assert _deterministic_deploy_stranded(_strand_metadata(phase=DeployPhase.VERIFIED)) is False
+
+    def test_false_when_phase_scheduled(self) -> None:
+        assert _deterministic_deploy_stranded(_strand_metadata(phase=DeployPhase.SCHEDULED)) is False
+
+    def test_false_when_phase_escalated(self) -> None:
+        assert _deterministic_deploy_stranded(_strand_metadata(phase=DeployPhase.ESCALATED)) is False
+
+    def test_false_when_phase_done(self) -> None:
+        assert _deterministic_deploy_stranded(_strand_metadata(phase=DeployPhase.DONE)) is False
+
+    # --- backward-compat migration shim (no deploy_state at all) -------------
+
+    def test_true_for_legacy_shape_no_deploy_state(self) -> None:
+        """A deploy that began before ζ activated has before_done_ran_at
+        stamped but no deploy_state key at all — treated as a RAN-strand
+        (bounded, documented migration shim) so it isn't silently un-stranded
+        the moment ζ ships."""
+        metadata = _strand_metadata()
+        assert 'deploy_state' not in metadata
+        assert _deterministic_deploy_stranded(metadata) is True
+
+    def test_false_for_legacy_shape_with_verified_at_set(self) -> None:
+        """Reviewer amendment (task 2240): a pre-ζ deploy that already
+        reached VERIFIED (before_done_verified_at stamped) is a terminal
+        outcome, not a RAN-strand, even though it predates deploy_state and
+        still carries before_done_ran_at. Preserves the exclusion the
+        deleted ``_is_stranded_deterministic_shape`` enforced."""
+        metadata = _strand_metadata(before_done_verified_at='2026-07-01T00:05:00+00:00')
+        assert 'deploy_state' not in metadata
+        assert _deterministic_deploy_stranded(metadata) is False
+
+    def test_false_for_legacy_shape_with_gate_escalated_at_set(self) -> None:
+        """Reviewer amendment (task 2240): a pre-ζ act-then-ask deploy
+        blocked at its gate (gate_escalated_at stamped) is a terminal
+        outcome, not a RAN-strand — e.g. its escalation was just resolved
+        but the task has not yet been re-dispatched to done."""
+        metadata = _strand_metadata(gate_escalated_at='2026-07-01T00:05:00+00:00')
+        assert 'deploy_state' not in metadata
+        assert _deterministic_deploy_stranded(metadata) is False
+
+    def test_false_for_legacy_shape_with_done_provenance_set(self) -> None:
+        """Reviewer amendment (task 2240): a pre-ζ deploy that already
+        recorded done_provenance is a terminal outcome, not a RAN-strand."""
+        metadata = _strand_metadata(done_provenance={'kind': 'deterministic-deploy'})
+        assert 'deploy_state' not in metadata
+        assert _deterministic_deploy_stranded(metadata) is False
+
+    def test_false_for_legacy_shape_when_before_done_ran_at_missing(self) -> None:
+        assert _deterministic_deploy_stranded(_strand_metadata(before_done_ran_at=None)) is False
+
+    # --- gating checks unaffected by the phase/stamp swap --------------------
 
     def test_false_when_task_kind_not_deterministic(self) -> None:
-        assert _is_stranded_deterministic_shape(_strand_metadata(task_kind='normal')) is False
-
-    def test_false_when_before_done_ran_at_missing(self) -> None:
-        assert _is_stranded_deterministic_shape(_strand_metadata(before_done_ran_at=None)) is False
-
-    def test_false_when_before_done_verified_at_present(self) -> None:
-        assert _is_stranded_deterministic_shape(
-            _strand_metadata(before_done_verified_at='2026-07-02T00:00:00+00:00')
-        ) is False
-
-    def test_false_when_gate_escalated_at_present(self) -> None:
-        assert _is_stranded_deterministic_shape(
-            _strand_metadata(gate_escalated_at='2026-07-02T00:00:00+00:00')
-        ) is False
-
-    def test_false_when_done_provenance_present(self) -> None:
-        assert _is_stranded_deterministic_shape(
-            _strand_metadata(done_provenance={'kind': 'deterministic-deploy'})
+        assert _deterministic_deploy_stranded(
+            _strand_metadata(phase=DeployPhase.RAN, task_kind='normal')
         ) is False
 
     def test_false_when_before_done_is_none(self) -> None:
-        assert _is_stranded_deterministic_shape(_strand_metadata(before_done=None)) is False
+        assert _deterministic_deploy_stranded(
+            _strand_metadata(phase=DeployPhase.RAN, before_done=None)
+        ) is False
 
     def test_false_when_before_done_lacks_target_unit(self) -> None:
-        assert _is_stranded_deterministic_shape(_strand_metadata(before_done={})) is False
+        assert _deterministic_deploy_stranded(
+            _strand_metadata(phase=DeployPhase.RAN, before_done={})
+        ) is False
 
     def test_false_for_empty_metadata(self) -> None:
-        assert _is_stranded_deterministic_shape({}) is False
+        assert _deterministic_deploy_stranded({}) is False
 
     def test_false_for_none_metadata(self) -> None:
-        assert _is_stranded_deterministic_shape(None) is False
+        assert _deterministic_deploy_stranded(None) is False
+
+
+def test_is_stranded_deterministic_shape_no_longer_exists() -> None:
+    """Grep-delete proof: the old stamp-archaeology classifier is gone from
+    orchestrator.harness — DS-4 collapses it to _deterministic_deploy_stranded."""
+    import orchestrator.harness as harness_module
+
+    assert not hasattr(harness_module, '_is_stranded_deterministic_shape')
 
 
 # ---------------------------------------------------------------------------
@@ -632,6 +786,78 @@ class TestRunDeterministicReconSweep:
         await h._run_deterministic_recon_sweep()  # must not raise
 
         assert calls == ['tid-bad', 'tid-good']
+
+    # -----------------------------------------------------------------------
+    # ζ/task 2240 D1 composition: a FULL sweep pass (Source A's real
+    # _recover_stranded_deterministic_task, NOT mocked out this time) over a
+    # blocked deterministic deploy at deploy_state.phase=='ran' with a
+    # persisted verify_baseline, proving the freshness verdict — not
+    # phantom-done — drives the recovery escalation's category end-to-end.
+    # -----------------------------------------------------------------------
+
+    @pytest.mark.asyncio
+    async def test_d1_ran_phase_with_advanced_baseline_files_stranded_blocked_resume(self) -> None:
+        h = _make_recon_harness()
+        h.event_store = None
+        metadata = _strand_metadata(
+            phase=DeployPhase.RAN,
+            verify_baseline={'active_enter_timestamp_monotonic': 100, 'main_pid': 999},
+        )
+        task = {
+            'id': 'tid-fresh', 'status': 'blocked',
+            'description': 'Deploy fused-memory restart', 'metadata': metadata,
+        }
+        h.scheduler.get_tasks = AsyncMock(return_value=[task])
+        h._escalation_queue.get_by_task = MagicMock(return_value=[])  # type: ignore[union-attr]
+        h._escalation_queue.get_pending = MagicMock(return_value=[])  # type: ignore[union-attr]
+        # ActiveState deliberately NOT 'active' -- proves the FRESHNESS
+        # branch (monotonic advance), not the liveness-only fallback, drove
+        # the verdict.
+        h._recon_unit_inspector = AsyncMock(return_value={
+            'MainPID': 4321, 'ActiveState': 'deactivating',
+            'ActiveEnterTimestampMonotonic': 500,
+        })
+
+        await h._run_deterministic_recon_sweep()
+
+        h._escalation_queue.submit.assert_called_once()  # type: ignore[union-attr, attr-defined]
+        esc = h._escalation_queue.submit.call_args[0][0]  # type: ignore[union-attr, attr-defined]
+        assert esc.category == 'stranded_blocked'
+        assert esc.suggested_action == 'resume'
+        h.scheduler.set_task_status.assert_not_called()  # type: ignore[attr-defined]
+
+    @pytest.mark.asyncio
+    async def test_d1_ran_phase_with_stale_baseline_files_infra_issue_never_done(self) -> None:
+        h = _make_recon_harness()
+        h.event_store = None
+        metadata = _strand_metadata(
+            phase=DeployPhase.RAN,
+            verify_baseline={'active_enter_timestamp_monotonic': 500, 'main_pid': 999},
+        )
+        task = {
+            'id': 'tid-stale', 'status': 'blocked',
+            'description': 'Deploy fused-memory restart', 'metadata': metadata,
+        }
+        h.scheduler.get_tasks = AsyncMock(return_value=[task])
+        h._escalation_queue.get_by_task = MagicMock(return_value=[])  # type: ignore[union-attr]
+        h._escalation_queue.get_pending = MagicMock(return_value=[])  # type: ignore[union-attr]
+        # Live unit reports 'active' -- the OLD liveness-only check would
+        # call this 'healthy'; the freshness branch must override it to
+        # 'unconfirmed' because the monotonic did NOT advance past baseline
+        # (D1: a crash between ran and verified recovers at phase==ran with
+        # the defined re-escalate action, NEVER phantom-done).
+        h._recon_unit_inspector = AsyncMock(return_value={
+            'MainPID': 4321, 'ActiveState': 'active',
+            'ActiveEnterTimestampMonotonic': 500,
+        })
+
+        await h._run_deterministic_recon_sweep()
+
+        h._escalation_queue.submit.assert_called_once()  # type: ignore[union-attr, attr-defined]
+        esc = h._escalation_queue.submit.call_args[0][0]  # type: ignore[union-attr, attr-defined]
+        assert esc.category == 'infra_issue'
+        assert esc.suggested_action == 'manual_intervention'
+        h.scheduler.set_task_status.assert_not_called()  # type: ignore[attr-defined]
 
 
 # ---------------------------------------------------------------------------

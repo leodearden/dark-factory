@@ -23,6 +23,9 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import logging
+from collections.abc import Mapping
+
+from shared.deploy_state import VerifyBaseline
 
 logger = logging.getLogger(__name__)
 
@@ -102,39 +105,67 @@ async def inspect_systemd_unit(
     return result
 
 
-def _deterministic_deploy_health_verdict(inspect_result: dict | None) -> str:
+def _deterministic_deploy_health_verdict(
+    inspect_result: dict | None,
+    verify_baseline: VerifyBaseline | Mapping | None = None,
+) -> str:
     """Classify a systemd unit-inspector result as 'healthy' or 'unconfirmed'.
 
-    'healthy' iff MainPID is a positive int AND ActiveState == 'active' — a
-    conservative liveness signal (task 2074 design decision: brittle
-    wall-clock ActiveEnterTimestamp comparison is deliberately avoided; the
-    escalation still routes through the existing watcher/human path for final
-    adjudication).  None-safe: a missing/malformed result is 'unconfirmed'.
+    Two modes:
 
-    CAVEAT (task 2074 amendment): this is a pure liveness check, NOT a
-    freshness check — it does not confirm that *this* deploy's restart is
+    - **No baseline** (``verify_baseline=None``, the default): 'healthy' iff
+      MainPID is a positive int AND ActiveState == 'active' — a conservative
+      liveness signal (task 2074 design decision: brittle wall-clock
+      ActiveEnterTimestamp comparison is deliberately avoided).  This is the
+      EXACT pre-ζ behaviour, preserved verbatim for backward compat — a
+      deploy stranded from BEFORE task 2240/ζ activated never persisted a
+      baseline, so it always falls into this branch (see the CAVEAT below).
+    - **With baseline** (ζ/task 2240, DS-3): 'healthy' iff MainPID is a
+      positive int AND the live ActiveEnterTimestampMonotonic has advanced
+      STRICTLY PAST the pre-deploy baseline's — real freshness, resolving
+      the CAVEAT below for an always-on unit (a stale/unchanged monotonic
+      now correctly reads 'unconfirmed' even when the unit is currently
+      active, because the restart demonstrably did not happen).
+      ``verify_baseline`` accepts either a ``VerifyBaseline`` instance or a
+      plain ``Mapping`` (the ``to_metadata()``-shaped
+      ``{'active_enter_timestamp_monotonic': ..., 'main_pid': ...}`` dict).
+
+    None-safe throughout: a missing/malformed *inspect_result* is
+    'unconfirmed'.
+
+    CAVEAT (task 2074 amendment; superseded by the freshness branch above
+    whenever a baseline is available): the no-baseline liveness check is NOT
+    a freshness check — it does not confirm that *this* deploy's restart is
     what made the unit active, only that the unit is up right now.  For a
     long-lived/always-on service unit (the common case — e.g.
-    'fused-memory.service'), the verdict is near-constant 'healthy'
-    regardless of whether the triggering restart actually took effect,
-    because the unit was probably already active before the deploy ran too.
-    DeterministicRunner's own in-run verify path avoids this ambiguity by
-    comparing a freshly-observed ActiveEnterTimestampMonotonic against a
-    baseline captured immediately before the restart — but that baseline is
-    a local variable, never persisted to task metadata, so it does not exist
-    for a task stranded by a PAST run (this sweep's Source-A recovery case,
-    e.g. task 2059) and a retroactive freshness comparison is not possible
-    without touching deterministic_runner.py to persist one going forward
-    (out of scope for task 2074). Callers (Source A's stranded_blocked/resume
-    filing and Source B's auto-resolve) accept this weaker signal: it is
-    still strictly better than the prior silent-strand status quo, and both
-    paths RE-FILE/resolve an escalation rather than flipping task status
-    directly, so a wrong verdict surfaces via the normal escalation/watcher
-    machinery rather than silently corrupting state.
+    'fused-memory.service'), the no-baseline verdict is near-constant
+    'healthy' regardless of whether the triggering restart actually took
+    effect, because the unit was probably already active before the deploy
+    ran too.  A deterministic deploy that persisted a ``verify_baseline``
+    (every deploy since ζ/task 2240) gets the real freshness comparison
+    instead; only a deploy stranded from BEFORE ζ activated (no baseline was
+    ever captured for it) falls back to this weaker signal — still strictly
+    better than the prior silent-strand status quo, and both callers
+    (Source A's stranded_blocked/resume filing and Source B's auto-resolve)
+    RE-FILE/resolve an escalation rather than flipping task status directly,
+    so a wrong verdict surfaces via the normal escalation/watcher machinery
+    rather than silently corrupting state.
     """
     if not inspect_result:
         return 'unconfirmed'
     pid = inspect_result.get('MainPID', 0)
-    if isinstance(pid, int) and pid > 0 and inspect_result.get('ActiveState') == 'active':
+    if not (isinstance(pid, int) and pid > 0):
+        return 'unconfirmed'
+    if verify_baseline is not None:
+        baseline_monotonic = (
+            verify_baseline.active_enter_timestamp_monotonic
+            if isinstance(verify_baseline, VerifyBaseline)
+            else verify_baseline.get('active_enter_timestamp_monotonic', 0)
+        )
+        live_monotonic = inspect_result.get('ActiveEnterTimestampMonotonic', 0)
+        if isinstance(live_monotonic, int) and live_monotonic > baseline_monotonic:
+            return 'healthy'
+        return 'unconfirmed'
+    if inspect_result.get('ActiveState') == 'active':
         return 'healthy'
     return 'unconfirmed'
