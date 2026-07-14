@@ -162,3 +162,23 @@ async def probe_models(
         report_accounts[account.name] = statuses
 
     return ProbeReport(models=target_models, accounts=report_accounts)
+
+
+def render_probe_artifact(report: ProbeReport, generated_at: str) -> str:
+    """Render *report* as a deterministic, committable YAML artifact string.
+
+    Pure -- no clock/env reads; *generated_at* is supplied by the caller so
+    the same ``(report, generated_at)`` pair always serializes to the same
+    bytes, safe to commit and diff. Field order is fixed (``generated_at``,
+    ``models``, ``accounts``) via ``sort_keys=False``.
+    """
+    import yaml
+
+    payload = {
+        'generated_at': generated_at,
+        'models': list(report.models),
+        'accounts': {
+            name: dict(statuses) for name, statuses in report.accounts.items()
+        },
+    }
+    return yaml.safe_dump(payload, sort_keys=False)
