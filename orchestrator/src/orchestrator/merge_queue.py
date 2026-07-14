@@ -5994,17 +5994,30 @@ class SpeculativeMergeWorker(_WipHaltMixin):
         fail-safe.
 
         Returns ``None`` when nothing is mid-finalize (the common case).
+
+        A candidate is also skipped if its registry state has already
+        advanced to TERMINAL — e.g. a terminal-but-not-yet-retired window a
+        future edit could introduce between the terminal transition and
+        ``_retire_item``'s ``_live_items`` pop. Today the two are synchronous
+        (single asyncio loop) so this never fires, but the guard mirrors the
+        explicit TERMINAL exclusion in :meth:`ItemLifecycle.non_terminal_items`
+        (the snapshot registry-census loop's source) so both derivations of
+        "non-terminal" stay consistent even if that window is ever
+        introduced.
         """
         if inflight_ids is None:
             inflight_ids = {e.item.request.request_id for e in self._inflight}
         found: InflightEntry | None = None
         extra_rids: list[str] = []
         for rid, obj in self._live_items.items():
-            if isinstance(obj, InflightEntry) and rid not in inflight_ids:
-                if found is None:
-                    found = obj
-                else:
-                    extra_rids.append(rid)
+            if not isinstance(obj, InflightEntry) or rid in inflight_ids:
+                continue
+            if self._lifecycle.current(rid) == ItemLifecycleState.TERMINAL:
+                continue
+            if found is None:
+                found = obj
+            else:
+                extra_rids.append(rid)
         if extra_rids:
             logger.warning(
                 'Invariant violation: %d extra InflightEntry object(s) in '
@@ -7583,12 +7596,21 @@ class SpeculativeMergeWorker(_WipHaltMixin):
         # structurally unreachable here — the only _live_items InflightEntry
         # ever absent from _inflight is the finalize head, already excluded
         # above (ordering invariant: at most one at a time).
-        for _rid, _obj in self._live_items.items():
+        #
+        # Sourced from ItemLifecycle.non_terminal_items() (task 2435 amend)
+        # rather than a bespoke `_live_items.items()` + `_lifecycle.current()`
+        # reconstruction, so this is the one production call site the
+        # accessor's own docstring cites, not a second derivation of the same
+        # census. `_live_items[_rid]` (not `.get`) trusts the invariant that
+        # `_register_item`/`_note_transition`/`_retire_item` are the only
+        # `_lifecycle` mutators and always keep `_live_items` in lockstep with
+        # the registry's non-terminal set — proven by construction, so a
+        # missing key here would mean that invariant broke and a loud
+        # KeyError is preferable to a silently incomplete census.
+        for _rid, _state in self._lifecycle.non_terminal_items().items():
             if _rid in _excluded_ids:
                 continue
-            _state = self._lifecycle.current(_rid)
-            if _state is None or _state == ItemLifecycleState.TERMINAL:
-                continue
+            _obj = self._live_items[_rid]
             if isinstance(_obj, MergeRequest):
                 entries.append(_entry(
                     _obj, _REGISTRY_STATE_TO_WIRE[_state],
