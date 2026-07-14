@@ -591,6 +591,51 @@ def _write_gemini_settings(
 
 
 # ---------------------------------------------------------------------------
+# Pi backend (@earendil-works/pi-coding-agent) — wired from the T2 empirical
+# spike, plans/pi-spike-findings.md. See that doc for the observed evidence
+# behind every divergence from the codex/gemini shape below.
+# ---------------------------------------------------------------------------
+
+_PI_BUILTIN_TOOL_MAP: dict[str, str] = {
+    'Read': 'read',
+    'Write': 'write',
+    'Edit': 'edit',
+    'Bash': 'bash',
+    'Glob': 'glob',
+    'Grep': 'grep',
+}
+
+
+def _pi_tool_name(spec: str) -> str | None:
+    """Map a Claude-style tool spec to pi's direct-tool name (spike Q3).
+
+    Concrete MCP tools (``mcp__<server>__<tool>``) map to
+    ``<server '-'->'_'>_<tool>`` — server-key hyphens become underscores,
+    the tool name is used verbatim. This is pi-mcp-adapter's default
+    ``toolPrefix: "server"`` formula (``formatToolName``/``getServerPrefix``),
+    live-confirmed by the spike (``spike-demo`` + ``echo_it`` ->
+    ``spike_demo_echo_it``).
+
+    A wildcard MCP spec (``mcp__<server>__*``) is not expressible as a
+    single direct-tool name — it returns None; callers must drop it from
+    ``--tools``/``--exclude-tools`` and log a warning (no silent cap).
+
+    Built-in Claude tool names, optionally carrying a ``(...)`` argument
+    suffix (e.g. ``Bash(git:*)`` -> ``Bash``), map to pi's lowercase
+    built-in names; an unrecognized built-in falls through to
+    ``spec.lower()``.
+    """
+    if spec.startswith('mcp__'):
+        remainder = spec[len('mcp__'):]
+        server, _, tool = remainder.partition('__')
+        if not tool or '*' in tool:
+            return None
+        return f"{server.replace('-', '_')}_{tool}"
+    base = spec.split('(', 1)[0]
+    return _PI_BUILTIN_TOOL_MAP.get(base, base.lower())
+
+
+# ---------------------------------------------------------------------------
 # Shared helpers (orchestrator-local, for non-Claude backends)
 # ---------------------------------------------------------------------------
 
