@@ -1184,6 +1184,55 @@ class TestSpawnBar:
         expected_title = f'{role}:{Path(project_root).name}'
         assert spawned[0] == build_spawn_argv(spawn_script, project_root, expected_title, prompt)
 
+    @pytest.mark.timeout(10)
+    async def test_spawn_session_forwards_skip_perms_true(self, tmp_path):
+        """spawn_session(..., skip_perms=True) (F9 fix, task 2518) threads
+        through to build_spawn_argv, so argv[2] is the 'true' literal
+        spawn-claude.sh's positional contract expects."""
+        from cockpit.app import CockpitApp
+
+        spawned: list[list[str]] = []
+        spawn_script = '/repo/skills/spawn/spawn-claude.sh'
+
+        app = CockpitApp(
+            fleet_root=tmp_path,
+            poll_interval=0.05,
+            spawn_runner=spawned.append,
+            spawn_script=spawn_script,
+        )
+        async with app.run_test() as pilot:
+            await pilot.pause()
+
+            app.spawn_session('/home/leo/src/dark-factory', 'unblock', 'Please look at this', skip_perms=True)
+            await pilot.pause()
+
+        assert len(spawned) == 1
+        assert spawned[0][2] == 'true'
+
+    @pytest.mark.timeout(10)
+    async def test_spawn_session_forwards_skip_perms_false(self, tmp_path):
+        """spawn_session(..., skip_perms=False) (F9 fix, task 2518) threads
+        through to build_spawn_argv, so argv[2] is the 'false' literal."""
+        from cockpit.app import CockpitApp
+
+        spawned: list[list[str]] = []
+        spawn_script = '/repo/skills/spawn/spawn-claude.sh'
+
+        app = CockpitApp(
+            fleet_root=tmp_path,
+            poll_interval=0.05,
+            spawn_runner=spawned.append,
+            spawn_script=spawn_script,
+        )
+        async with app.run_test() as pilot:
+            await pilot.pause()
+
+            app.spawn_session('/home/leo/src/dark-factory', 'unblock', 'Please look at this', skip_perms=False)
+            await pilot.pause()
+
+        assert len(spawned) == 1
+        assert spawned[0][2] == 'false'
+
 
 class TestSpawnTree:
     @pytest.mark.timeout(10)
