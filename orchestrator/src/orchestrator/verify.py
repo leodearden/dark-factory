@@ -4658,3 +4658,236 @@ async def run_main_tip_sweep(
     except Exception:
         logger.debug('run_main_tip_sweep: unexpected error', exc_info=True)
         return None
+
+
+# Bound on isolated-rerun attempts per confirm-gate subproject group (task
+# 2370). A PASS on ANY attempt within this bound is treated as a confirmed
+# flake for that group — mirrors run_main_tip_sweep's single-retry heuristic,
+# widened slightly since this re-run is already scoped to just the named
+# tests (cheap) and serial/addopts-cleared (task 2045's proven xdist-
+# contention recovery). No config flag: the gate is a strict fail-safe
+# improvement over the status quo (a bare, unconfirmed alarm), so it is
+# always-on.
+_SWEEP_CONFIRM_MAX_ATTEMPTS = 2
+
+
+async def _run_isolated_confirm_group(
+    worktree: Path,
+    config: 'OrchestratorConfig',
+    module_config: ModuleConfig,
+) -> bool:
+    """Run *module_config* (already scoped + forced-serial) up to
+    ``_SWEEP_CONFIRM_MAX_ATTEMPTS`` times against *worktree*.
+
+    Returns ``True`` as soon as any attempt PASSES (that group is a confirmed
+    flake). Returns ``False`` if every attempt exhausts without a pass —
+    covers a genuine failure, a timeout (``VerifyResult.timed_out`` with
+    ``passed=False``), an infra-sentinel category
+    (``pytest_internalerror``/``env_transient`` — never trusted as
+    confirmation either way), and a raised exception (caught here so a
+    transient error on one attempt doesn't abort the remaining attempts).
+    Never raises.
+    """
+    for attempt in range(_SWEEP_CONFIRM_MAX_ATTEMPTS):
+        try:
+            result = await run_verification(worktree, config, module_config, max_retries=0)
+        except Exception:
+            logger.debug(
+                'confirm_main_tip_failure_is_real: isolated re-run raised '
+                '(attempt %d/%d) for %r',
+                attempt + 1, _SWEEP_CONFIRM_MAX_ATTEMPTS, module_config.test_command,
+                exc_info=True,
+            )
+            continue
+        if result.passed:
+            return True
+    return False
+
+
+async def confirm_main_tip_failure_is_real(
+    config: 'OrchestratorConfig',
+    git_ops: object,
+    failing_result: VerifyResult,
+    *,
+    main_sha: str,
+) -> bool:
+    """Confirm a main-tip-sweep failure is real before the harness files an alarm.
+
+    ``run_main_tip_sweep``'s own full-suite retry runs in the SAME contended
+    worktree, so a load-induced xdist flake reliably fails twice and still
+    reaches the harness as "drift" — the false-positive source behind
+    esc-main-sweep-ea2bd3c95e33-2 and the 2026-07-09 park_stop/symlink-loop
+    incidents. This function is the harness's confirm-before-alarm gate: it
+    extracts the named failing pytest node-ids from *failing_result*, and
+    re-runs JUST those tests, in ISOLATION (serial, addopts cleared — the
+    exact task-2045 recovery), in a FRESH probe worktree pinned at
+    *main_sha* — never the sweep's own contended worktree.
+
+    Returns:
+        ``False`` (suppress the alarm) ONLY when every named failing test
+        demonstrably PASSES on isolated re-run (within
+        ``_SWEEP_CONFIRM_MAX_ATTEMPTS`` attempts per owning subproject). On
+        suppress, logs a non-blocking INFO note and appends an entry to
+        ``_suppressed_flake_records`` (``'suppressed_via': 'isolated_rerun'``)
+        so the flake stays observable for de-flaking.
+
+        ``True`` (file the alarm) for every other path — the hard "never
+        mask a REAL red" constraint:
+          - *failing_result* has no recoverable node-id (a non-test failure
+            such as a lint/type error, or an unparseable worker-crash notice).
+          - A node-id doesn't map to any subproject discovered in the probe
+            worktree.
+          - ``git worktree add --detach`` fails after retries.
+          - Module discovery, the isolated re-run, or any other step raises,
+            times out, or comes back with an infra-sentinel category
+            (``pytest_internalerror``/``env_transient``) on every attempt.
+          - Any unexpected exception during confirmation.
+
+    The probe worktree is created under ``git_ops.worktree_base`` with a
+    ``_mainsweepconfirm-<hex>`` prefix — distinct from ``_mainsweep-``/
+    ``_mainprobe-``/``_merge-`` so the disk-pressure prune never reclaims it
+    mid-run, and distinct from the sweep's own worktree so this confirmation
+    is never contended by the same load that produced the original flake.
+    Cleanup (scoped ``git worktree remove --force`` + ``shutil.rmtree``)
+    always runs in a ``finally`` block; no broad ``git worktree prune`` (DD5
+    guarantee — mirrors ``run_main_tip_sweep``/
+    ``verify_failure_is_preexisting_on_main``).
+
+    Node-id -> subproject mapping: module configs are freshly re-discovered
+    on the probe worktree (never reused from *config* — that snapshot is for
+    a different worktree/SHA). Each node-id's file component is checked for
+    existence as ``<worktree>/<mc.prefix>/<relpath>`` (subproject-relative
+    node-id, the common case for the sweep's aggregated per-subproject
+    output) or ``<worktree>/<relpath>`` (already worktree-root-relative /
+    prefix-qualified). Node-ids owned by the same subproject are grouped into
+    one scoped+serial re-run.
+    """
+    import uuid  # noqa: PLC0415, I001 — lazy, mirrors run_main_tip_sweep/verify_failure_is_preexisting_on_main
+    from orchestrator.config import _discover_module_configs  # noqa: PLC0415
+    from orchestrator.git_ops import _run  # noqa: PLC0415
+
+    _sha_prefix = main_sha[:12] if main_sha else '?'
+
+    # Cheap early-out: no recoverable node-id means nothing to confirm — pay
+    # no worktree-add cost at all.
+    node_ids = _extract_failing_test_ids(failing_result.test_output)
+    if not node_ids:
+        logger.info(
+            'confirm_main_tip_failure_is_real: no recoverable node-id in '
+            'failure output at %s (category=%r) — unconfirmable, filing alarm',
+            _sha_prefix, failing_result.category,
+        )
+        return True
+
+    tmp_path: Path | None = None
+    worktree_added: bool = False
+    try:
+        base: Path = git_ops.worktree_base  # type: ignore[union-attr]
+        base.mkdir(parents=True, exist_ok=True)
+        tmp_path = base / f'_mainsweepconfirm-{uuid.uuid4().hex[:8]}'
+
+        # Retry worktree add on transient git lock contention, mirroring
+        # run_main_tip_sweep / verify_failure_is_preexisting_on_main.
+        _MAX_ADD_RETRIES = 3
+        rc, _, err = 1, '', 'not attempted'
+        for _attempt in range(_MAX_ADD_RETRIES):
+            rc, _, err = await _run(
+                ['git', 'worktree', 'add', '--detach', str(tmp_path), main_sha],
+                cwd=config.project_root,  # type: ignore[union-attr]
+            )
+            if rc == 0:
+                worktree_added = True
+                break
+            if _attempt < _MAX_ADD_RETRIES - 1:
+                await asyncio.sleep(0.5 * (_attempt + 1))
+        if not worktree_added:
+            logger.warning(
+                'confirm_main_tip_failure_is_real: worktree add failed after '
+                '%d retries (rc=%d): %s — cannot confirm, filing alarm',
+                _MAX_ADD_RETRIES, rc, err,
+            )
+            return True
+
+        try:
+            module_configs = _discover_module_configs(tmp_path)
+        except Exception:
+            logger.debug(
+                'confirm_main_tip_failure_is_real: module discovery raised',
+                exc_info=True,
+            )
+            return True
+
+        # Map each node-id to its owning subproject (see docstring). Any
+        # unmapped node-id fails safe to alarm — no guessing which subproject
+        # a node-id belongs to.
+        groups: dict[str, list[str]] = {}
+        for node_id in node_ids:
+            file_part = node_id.split('::', 1)[0]
+            matched_prefix: str | None = None
+            matched_node_id: str = node_id
+            for prefix, _mc in module_configs.items():
+                if (tmp_path / prefix / file_part).exists():
+                    matched_prefix = prefix
+                    matched_node_id = f'{prefix}/{node_id}'
+                    break
+                if file_part.startswith(f'{prefix}/') and (tmp_path / file_part).exists():
+                    matched_prefix = prefix
+                    matched_node_id = node_id
+                    break
+            if matched_prefix is None:
+                logger.info(
+                    'confirm_main_tip_failure_is_real: node-id %r did not map '
+                    'to any discovered subproject at %s — unconfirmable, '
+                    'filing alarm',
+                    node_id, _sha_prefix,
+                )
+                return True
+            groups.setdefault(matched_prefix, []).append(matched_node_id)
+
+        # Each subproject group gets its own scoped + forced-serial isolated
+        # re-run. ALL groups must confirm green to suppress.
+        for prefix, group_node_ids in groups.items():
+            mc = module_configs[prefix]
+            scoped_cmd = _serial_pytest_str(
+                _scope_to_keyword(mc.test_command, 'pytest', group_node_ids),
+            )
+            scoped_mc = replace(
+                mc, test_command=scoped_cmd, lint_command=None, type_check_command=None,
+            )
+            if not await _run_isolated_confirm_group(tmp_path, config, scoped_mc):
+                return True
+
+        logger.info(
+            'confirm_main_tip_failure_is_real: sweep flake suppressed: %s '
+            'failed under load, passed on isolated re-run at %s',
+            node_ids, _sha_prefix,
+        )
+        _suppressed_flake_records.append({
+            'sha': main_sha,
+            'node_ids': node_ids,
+            'first_pass_category': failing_result.category,
+            'first_pass_cause_hint': failing_result.cause_hint,
+            'suppressed_via': 'isolated_rerun',
+        })
+        return False
+
+    except Exception:
+        logger.debug('confirm_main_tip_failure_is_real: unexpected error', exc_info=True)
+        return True
+    finally:
+        # Scoped cleanup: remove only this specific probe worktree.
+        # INTENTIONALLY NO 'git worktree prune' (DD5 guarantee).
+        if worktree_added and tmp_path is not None:
+            try:
+                await _run(
+                    ['git', 'worktree', 'remove', '--force', str(tmp_path)],
+                    cwd=config.project_root,  # type: ignore[union-attr]
+                )
+            except Exception:
+                logger.debug(
+                    'confirm_main_tip_failure_is_real: worktree remove failed',
+                    exc_info=True,
+                )
+        if tmp_path is not None:
+            with contextlib.suppress(Exception):
+                shutil.rmtree(tmp_path, ignore_errors=True)
