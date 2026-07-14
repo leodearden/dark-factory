@@ -718,6 +718,63 @@ def test_run_nightly_fail_loud_on_commit_failure(tmp_path):
 
 
 # ---------------------------------------------------------------------------
+# step-21/22: run_nightly -- no-change night commits nothing (§6.7)
+# ---------------------------------------------------------------------------
+
+def _fake_invoke_empty(prompt: str, model: str) -> str:
+    return json.dumps({'matches': [], 'candidates': []})
+
+
+def test_run_nightly_no_change_night_commits_nothing(tmp_path, caplog):
+    work_cwd = str(tmp_path / 'work')
+    repo, config_path = _init_e2e_repo(tmp_path, work_cwd=work_cwd)
+
+    projects_root = tmp_path / 'projects'
+    session_path = projects_root / _encode_cwd(work_cwd) / 'session-1.jsonl'
+    target_date = date(2026, 7, 13)
+    _write_transcript(
+        session_path, cwd=work_cwd, timestamp='2026-07-13T10:00:00Z', session_id='session-1',
+    )
+
+    codebook_path = repo / 'docs' / 'legibility' / 'confusion-codebook.yaml'
+    before_bytes = codebook_path.read_bytes()
+    before_log = subprocess.run(
+        ['git', 'log', '--oneline'], cwd=repo, check=True, capture_output=True, text=True,
+    ).stdout.splitlines()
+
+    fixed_now = datetime(2026, 7, 14, 3, 0, 0, tzinfo=timezone.utc)
+    escalation_calls = []
+
+    # A valid-but-empty judgment ("coded fine, found nothing") -- a genuine
+    # success, never conflated with a coding failure.
+    with caplog.at_level('INFO', logger='legibility.nightly'):
+        result = nightly.run_nightly(
+            config_path=config_path,
+            projects_root=projects_root,
+            target_date=target_date,
+            now=fixed_now,
+            invoke=_fake_invoke_empty,
+            status_fetcher=None,
+            poster=lambda url, envelope: escalation_calls.append((url, envelope)),
+        )
+
+    assert result.exit_code == 0
+    assert result.commit_made is False
+    assert result.applied == 0
+    assert result.coder_status == 'ok'
+    assert escalation_calls == []
+
+    assert codebook_path.read_bytes() == before_bytes
+    after_log = subprocess.run(
+        ['git', 'log', '--oneline'], cwd=repo, check=True, capture_output=True, text=True,
+    ).stdout.splitlines()
+    assert after_log == before_log
+
+    assert result.census_line is not None and 'NO-FIRE' in result.census_line
+    assert any('no-change night' in record.message for record in caplog.records)
+
+
+# ---------------------------------------------------------------------------
 # step-17/18: run_nightly -- fail-loud on extractor crash (decision 8)
 # ---------------------------------------------------------------------------
 
