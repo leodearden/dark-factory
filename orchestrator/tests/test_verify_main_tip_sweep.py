@@ -490,3 +490,116 @@ class TestRunMainTipSweepRetryOnFlake:
             'git worktree remove --force must run even when retry returns '
             'pytest_internalerror (cleanup-in-finally guarantee)'
         )
+
+
+class TestRunMainTipSweepRoleStamp:
+    """task 2391 (PRD T3): run_main_tip_sweep stamps role='background' on
+    both the first-pass and flake-retry run_full_verification calls.
+
+    RED today: run_main_tip_sweep calls run_full_verification(tmp_path,
+    config) with no role kwarg at either call site.
+    """
+
+    def test_run_main_tip_sweep_stamps_background_role_on_both_calls(
+        self, tmp_path: Path
+    ) -> None:
+        """Both the first-pass and the flake-retry call must receive
+        role='background'.
+
+        Uses the FAILING -> PASSING side_effect (mirrors
+        TestRunMainTipSweepRetryOnFlake) to exercise both call sites in one
+        sweep invocation.
+        """
+        from orchestrator import verify as verify_module
+
+        config = _make_config(tmp_path)
+        git_ops = _make_git_ops(tmp_path)
+
+        async def _fake_run(cmd, **kwargs):
+            return (0, '', '')
+
+        rfv = AsyncMock(side_effect=[FAILING_RESULT, PASSING_RESULT])
+
+        with (
+            patch('orchestrator.git_ops._run', side_effect=_fake_run),
+            patch.object(verify_module, 'run_full_verification', rfv),
+        ):
+            result = asyncio.run(
+                verify_module.run_main_tip_sweep(config, git_ops)
+            )
+
+        assert result is not None, 'Expected (sha, VerifyResult), got None'
+        swept_sha, vr = result
+        assert swept_sha == MAIN_SHA
+        assert vr.passed is True
+
+        assert rfv.call_count == 2, (
+            f'Expected exactly 2 calls to run_full_verification '
+            f'(first-pass + flake-retry), got {rfv.call_count}'
+        )
+        for call_index, one_call in enumerate(rfv.call_args_list):
+            assert one_call.kwargs.get('role') == 'background', (
+                f'Expected call #{call_index} to run_full_verification to receive '
+                f"role='background'; got kwargs={one_call.kwargs!r}"
+            )
+
+    def test_run_main_tip_sweep_role_propagates_through_real_run_full_verification(
+        self, tmp_path: Path
+    ) -> None:
+        """Thin end-to-end seam: role propagates across BOTH hops.
+
+        The other tests here (and TestRunFullVerificationRole in
+        test_verify.py) each mock one hop of the chain
+        ``run_main_tip_sweep -> run_full_verification -> run_verification`` —
+        that's reasonable seam-based coverage, but no single test lets both
+        hops run for real together. This test mocks only the innermost
+        function (``run_verification``) and lets the REAL
+        ``run_full_verification`` run in between, confirming the
+        ``role='background'`` stamp actually threads all the way down rather
+        than merely being asserted at each seam independently.
+
+        The sweep's worktree path is never created on disk (``git worktree
+        add`` is faked via ``orchestrator.git_ops._run``), so the real
+        ``run_full_verification``'s discovery walk
+        (``_discover_module_configs``) silently finds zero subprojects on the
+        nonexistent path (``os.walk`` on a missing dir yields nothing) and
+        takes the no-subproject global-fallback branch — exercising the same
+        single ``run_verification`` call the production sweep hits on a
+        monorepo with no ``orchestrator.yaml`` subprojects.
+        """
+        from orchestrator import verify as verify_module
+
+        config = _make_config(tmp_path)
+        git_ops = _make_git_ops(tmp_path)
+
+        async def _fake_run(cmd, **kwargs):
+            return (0, '', '')
+
+        run_verification_calls: list = []
+
+        async def _fake_run_verification(project_root, cfg, module_config=None, **kwargs):
+            run_verification_calls.append(kwargs)
+            return PASSING_RESULT
+
+        with (
+            patch('orchestrator.git_ops._run', side_effect=_fake_run),
+            patch.object(verify_module, 'run_verification', side_effect=_fake_run_verification),
+        ):
+            result = asyncio.run(
+                verify_module.run_main_tip_sweep(config, git_ops)
+            )
+
+        assert result is not None, 'Expected (sha, VerifyResult), got None'
+        swept_sha, vr = result
+        assert swept_sha == MAIN_SHA
+        assert vr.passed is True
+
+        assert len(run_verification_calls) == 1, (
+            f'Expected exactly 1 run_verification call — PASSING_RESULT on '
+            f'the first pass needs no flake-retry — got '
+            f'{len(run_verification_calls)}'
+        )
+        assert run_verification_calls[0].get('role') == 'background', (
+            "Expected the real run_full_verification to thread role='background' "
+            f'down to run_verification; got kwargs={run_verification_calls[0]!r}'
+        )
