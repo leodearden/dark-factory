@@ -75,6 +75,46 @@ def _build_digest_text(tmp_path, *, session_id=_SESSION_ID, agent_class="interac
     return digest_mod.build_digest(path, agent_class_override=agent_class)
 
 
+def _hand_digest(session_id, body_marker, *, date="2026-07-14", agent_class="interactive"):
+    """Hand-written minimal digest text: a leading frontmatter block with
+    exactly the fields code_digest reads (session/date/agent_class) plus a
+    one-line body. Used where a test's focus is code_digest's own logic
+    (never-fabricate handling, batch tallying), not digest.py's rendering
+    fidelity — that round trip is separately covered by
+    _build_digest_text (steps 3/9/17, per plan.json reuse item 2)."""
+    return (
+        "---\n"
+        f'session: "{session_id}"\n'
+        f'date: "{date}"\n'
+        f'agent_class: "{agent_class}"\n'
+        "---\n\n"
+        f"## User Corrections\n- {body_marker}\n"
+    )
+
+
+def _tiny_codebook():
+    """A minimal but real v2 codebook fixture, distinct from the live
+    docs/legibility/confusion-codebook.yaml used by the step-9 happy-path
+    test — used where a test's focus doesn't require grounding against
+    the live entry set (never-fabricate, batch tallying, CLI plumbing)."""
+    return {
+        "version": 2,
+        "entries": [
+            {
+                "id": "one-shot-subagent-contract",
+                "title": "Silent no-op one-shot subagent contracts",
+                "cause": "Sub-agents are given contracts their runtime cannot honor.",
+                "severity": "high",
+                "status": "open",
+                "origin_phase": "unknown",
+                "manifested_phase": "unknown",
+                "sightings": [],
+            },
+        ],
+        "candidates": [],
+    }
+
+
 # ---------------------------------------------------------------------------
 # step-1: RED — build_codebook_index() compact rendering
 # ---------------------------------------------------------------------------
