@@ -25,6 +25,7 @@ import codebook
 import coder
 import config as config_mod
 import digest as digest_mod
+from legibility import census_trigger
 
 # ---------------------------------------------------------------------------
 # Shared fixture helpers — synthetic transcript -> real digest text, mirrors
@@ -565,3 +566,71 @@ def test_retire_entry_sets_status_retained():
     codebook.assert_no_deletion(before, result)
 
     assert before["entries"][0]["status"] == "open"
+
+
+# ---------------------------------------------------------------------------
+# step-13: RED — advance_census_state() (zeta/2579 MUST-persist contract)
+# ---------------------------------------------------------------------------
+
+def test_advance_census_state_writes_all_three_fields(tmp_path):
+    path = tmp_path / "census-state.json"
+
+    mod.advance_census_state(
+        path,
+        now_iso="2026-07-14T12:00:00+00:00",
+        report_path="plans/confusion-census-2026-07-14.md",
+        done_count=42,
+    )
+
+    data = json.loads(path.read_text(encoding="utf-8"))
+    assert data == {
+        "last_census_at": "2026-07-14T12:00:00+00:00",
+        "last_census_report": "plans/confusion-census-2026-07-14.md",
+        "last_census_done_count": 42,
+    }
+
+
+def test_advance_census_state_done_count_zero_is_written_as_integer_zero(tmp_path):
+    path = tmp_path / "census-state.json"
+
+    mod.advance_census_state(
+        path, now_iso="2026-07-14T12:00:00+00:00", report_path="plans/x.md", done_count=0,
+    )
+
+    data = json.loads(path.read_text(encoding="utf-8"))
+    assert "last_census_done_count" in data, "must never be dropped as falsy"
+    assert data["last_census_done_count"] == 0
+    assert isinstance(data["last_census_done_count"], int)
+
+
+def test_advance_census_state_round_trips_through_census_trigger_load(tmp_path):
+    path = tmp_path / "census-state.json"
+
+    mod.advance_census_state(
+        path,
+        now_iso="2026-07-14T12:00:00+00:00",
+        report_path="plans/confusion-census-2026-07-14.md",
+        done_count=7,
+    )
+
+    status, data = census_trigger.load_census_state(path)
+    assert status == "ok"
+    assert data["last_census_at"] == "2026-07-14T12:00:00+00:00"
+    assert data["last_census_report"] == "plans/confusion-census-2026-07-14.md"
+    assert data["last_census_done_count"] == 7
+
+
+def test_advance_census_state_atomic_replace_no_partial_left_behind(tmp_path):
+    path = tmp_path / "census-state.json"
+    path.write_text(json.dumps({"stale": "data"}), encoding="utf-8")
+
+    mod.advance_census_state(
+        path, now_iso="2026-07-14T12:00:00+00:00", report_path="plans/x.md", done_count=3,
+    )
+
+    data = json.loads(path.read_text(encoding="utf-8"))
+    assert data["last_census_done_count"] == 3
+    assert "stale" not in data, "pre-existing state must be FULLY replaced"
+
+    leftovers = [p for p in tmp_path.iterdir() if p.name != "census-state.json"]
+    assert leftovers == [], "no partial/temp file left behind"
