@@ -40,6 +40,7 @@ No .task-specific guards remain in this module.
 
 import asyncio
 import contextlib
+import fcntl
 import json
 import logging
 import os
@@ -1184,73 +1185,146 @@ class GitOps:
             The minted worktree path, already checked out at *sha*.
 
         Raises:
-            EphemeralWorktreeError: ``git worktree add`` failed on all 3
-                attempts.  Raised BEFORE the yield, so the caller's
-                ``async with`` body never runs.  Because the add never
-                succeeded, no cleanup ``git worktree remove`` is issued
-                (there is nothing registered to remove) — but a belt-and-
-                suspenders ``shutil.rmtree`` of *tmp_path* still runs before
-                the exception propagates, in case a failed add left a
-                partial/empty directory behind (this prefix is
-                :data:`PROTECTED_PREFIXES`-registered, so the reaper would
-                never reclaim a leaked directory itself).
+            EphemeralWorktreeError: either (a) the sibling ``<name>.lock``
+                flock (task 2507 — see below) was already held by another
+                consumer (``fcntl.flock(LOCK_EX|LOCK_NB)`` denied) — raised
+                BEFORE ``git worktree add`` is even attempted, so no
+                worktree is minted and no add argv is issued; or (b)
+                ``git worktree add`` itself failed on all 3 attempts.  In
+                both cases the caller's ``async with`` body never runs.
+                For (b), because the add never succeeded, no cleanup ``git
+                worktree remove`` is issued (there is nothing registered to
+                remove) — but a belt-and-suspenders ``shutil.rmtree`` of
+                *tmp_path* still runs before the exception propagates, in
+                case a failed add left a partial/empty directory behind
+                (this prefix is :data:`PROTECTED_PREFIXES`-registered, so
+                the reaper would never reclaim a leaked directory itself).
+
+        Note:
+            Acquires an exclusive, non-blocking ``fcntl.flock`` on a
+            sibling ``<worktree_base>/<kind.value><hex>.lock`` file BEFORE
+            minting the worktree, and holds it for the CM's entire
+            lifetime (task 2507). This is the exact lock path reify
+            warm-lane-gc.sh derives (``${WORKTREES_DIR}/${name}.lock``,
+            gc.sh:488/564) for its own ``flock -n`` orphan-removal
+            contender, so a live probe/sweep here is correctly seen as a
+            "live consumer" by gc.sh and preserved rather than force-
+            removed mid-verify. The lock file is unlinked on exit ONLY
+            when this call was the one that acquired it (never a foreign
+            holder's lock) — see the ``EphemeralWorktreeError`` case above.
         """
         base = self.worktree_base
         base.mkdir(parents=True, exist_ok=True)
         tmp_path = base / f'{kind.value}{uuid.uuid4().hex[:8]}'
+        # Sibling flock path — EXACTLY the shape reify warm-lane-gc.sh
+        # derives (`${WORKTREES_DIR}/${name}.lock`, gc.sh:488/564). Held
+        # for the CM's entire lifetime so gc.sh's `flock -n` orphan-removal
+        # contender (gc.sh:564-574) sees a live consumer and preserves this
+        # worktree instead of force-removing it out from under a still-
+        # running probe/sweep (task 2507).
+        lock_path = base / f'{tmp_path.name}.lock'
 
         _MAX_ADD_RETRIES = 3
         worktree_added = False
         rc, _, err = 1, '', 'not attempted'
-        try:
-            for attempt in range(_MAX_ADD_RETRIES):
-                rc, _, err = await _run(
-                    ['git', 'worktree', 'add', '--detach', str(tmp_path), sha],
-                    cwd=self.project_root,
-                )
-                if rc == 0:
-                    worktree_added = True
-                    break
-                if attempt < _MAX_ADD_RETRIES - 1:
-                    await asyncio.sleep(0.5 * (attempt + 1))
-            if not worktree_added:
-                raise EphemeralWorktreeError(
-                    f'ephemeral_worktree({kind.name}): git worktree add failed '
-                    f'after {_MAX_ADD_RETRIES} retries (rc={rc}): {err}'
-                )
-        except EphemeralWorktreeError:
-            # Belt-and-suspenders: a failed `git worktree add` may still have
-            # left a partial/empty directory at tmp_path (git creates the
-            # target dir early during add) — and since this prefix is
-            # PROTECTED_PREFIXES-registered, the reaper will NEVER reclaim it.
-            # Clean up here or it leaks under worktree_base permanently.
-            # Restores the pre-extraction probes' unconditional
-            # "rmtree in case ... the worktree add never ran" guarantee.
-            with contextlib.suppress(Exception):
-                shutil.rmtree(tmp_path, ignore_errors=True)
-            raise
 
+        lock_fd = os.open(lock_path, os.O_CREAT | os.O_RDWR, 0o644)
+        acquired = False
         try:
-            yield tmp_path
-        finally:
-            # Scoped cleanup: remove ONLY this specific ephemeral worktree.
-            # INTENTIONALLY NO 'git worktree prune' here (DD5 guarantee) —
-            # see the docstring above / the 2097-2100 incident.
-            if worktree_added:
-                try:
-                    await _run(
-                        ['git', 'worktree', 'remove', '--force', str(tmp_path)],
+            try:
+                fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                acquired = True
+            except (BlockingIOError, OSError) as e:
+                # Someone else already holds this lock — should never
+                # happen in practice (tmp_path's hex is a fresh uuid4 per
+                # call), but fail safe rather than proceed unprotected.
+                # `acquired` stays False, so the outer finally below closes
+                # our fd WITHOUT unlinking the foreign holder's lock file.
+                # Deliberately catches bare OSError too, not just
+                # BlockingIOError/EWOULDBLOCK: ANY flock failure here means
+                # we cannot safely assert liveness, so we fail safe either
+                # way. But a bare OSError (e.g. EINTR/EIO/EBADF) is not
+                # necessarily lock contention, so the message carries the
+                # underlying exception class + text rather than asserting
+                # "live consumer" unconditionally — lets an operator tell
+                # genuine EWOULDBLOCK contention apart from an OS-level fault.
+                raise EphemeralWorktreeError(
+                    f'ephemeral_worktree({kind.name}): flock LOCK_NB denied on '
+                    f'{lock_path} ({e.__class__.__name__}: {e}) — likely a live '
+                    f'consumer holds it (could also be a lock-fault); skipping'
+                ) from e
+
+            try:
+                for attempt in range(_MAX_ADD_RETRIES):
+                    rc, _, err = await _run(
+                        ['git', 'worktree', 'add', '--detach', str(tmp_path), sha],
                         cwd=self.project_root,
                     )
-                except Exception:
-                    logger.debug(
-                        'ephemeral_worktree(%s): worktree remove failed',
-                        kind.name, exc_info=True,
+                    if rc == 0:
+                        worktree_added = True
+                        break
+                    if attempt < _MAX_ADD_RETRIES - 1:
+                        await asyncio.sleep(0.5 * (attempt + 1))
+                if not worktree_added:
+                    raise EphemeralWorktreeError(
+                        f'ephemeral_worktree({kind.name}): git worktree add failed '
+                        f'after {_MAX_ADD_RETRIES} retries (rc={rc}): {err}'
                     )
+            except EphemeralWorktreeError:
+                # Belt-and-suspenders: a failed `git worktree add` may still have
+                # left a partial/empty directory at tmp_path (git creates the
+                # target dir early during add) — and since this prefix is
+                # PROTECTED_PREFIXES-registered, the reaper will NEVER reclaim it.
+                # Clean up here or it leaks under worktree_base permanently.
+                # Restores the pre-extraction probes' unconditional
+                # "rmtree in case ... the worktree add never ran" guarantee.
+                with contextlib.suppress(Exception):
+                    shutil.rmtree(tmp_path, ignore_errors=True)
+                raise
+
+            try:
+                yield tmp_path
+            finally:
+                # Scoped cleanup: remove ONLY this specific ephemeral worktree.
+                # INTENTIONALLY NO 'git worktree prune' here (DD5 guarantee) —
+                # see the docstring above / the 2097-2100 incident.
+                if worktree_added:
+                    try:
+                        await _run(
+                            ['git', 'worktree', 'remove', '--force', str(tmp_path)],
+                            cwd=self.project_root,
+                        )
+                    except Exception:
+                        logger.debug(
+                            'ephemeral_worktree(%s): worktree remove failed',
+                            kind.name, exc_info=True,
+                        )
+                with contextlib.suppress(Exception):
+                    # Belt-and-suspenders: rmtree in case git worktree remove
+                    # left an empty skeleton.
+                    shutil.rmtree(tmp_path, ignore_errors=True)
+        finally:
+            # Release the advisory lock and — ONLY when this call was the
+            # one that acquired it — best-effort unlink the lock file,
+            # mirroring gc.sh's own `rm -f "$orphan_lock"` (gc.sh:606) on
+            # removal. Never unlink a lock we did not acquire: that would
+            # delete a foreign holder's lock file out from under it.
+            #
+            # Unlink BEFORE closing the fd — i.e. while we still hold the
+            # flock — rather than after. This mirrors gc.sh, which performs
+            # its own analogous `rm -f` while still holding ITS flock, and
+            # it closes a window that a close-then-unlink ordering would
+            # leave open: between releasing the flock and removing the
+            # directory entry, a new contender could open+flock the same
+            # (about-to-be-deleted) path, only to have our unlink yank the
+            # file out from under it. Unlinking first means any contender
+            # that opens the path afterward necessarily creates a fresh
+            # inode, so it can never observe a lock we are about to drop.
+            if acquired:
+                with contextlib.suppress(Exception):
+                    os.unlink(lock_path)
             with contextlib.suppress(Exception):
-                # Belt-and-suspenders: rmtree in case git worktree remove
-                # left an empty skeleton.
-                shutil.rmtree(tmp_path, ignore_errors=True)
+                os.close(lock_fd)
 
     def pool_in_use(self) -> bool:
         """True iff a warm or spec lane pool is configured on this host (task 2099).

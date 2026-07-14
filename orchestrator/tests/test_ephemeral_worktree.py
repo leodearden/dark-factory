@@ -18,11 +18,24 @@ Test coverage:
   amend-1: no-leak-on-add-failure regression, both probes' fail-safe
            `except EphemeralWorktreeError` handlers, and the
            EphemeralWorktreeError -> BlockDisposition table row
+  task 2507 step-1: flock-liveness guard — TestEphemeralWorktreeFlock (lock
+           held across the CM body and acquired BEFORE `git worktree add`,
+           modelling reify warm-lane-gc.sh's `flock -n` orphan-removal
+           contender with an independent Python OFD; released+unlinked on
+           normal exit and on a body exception; no lock-file leak when
+           `git worktree add` exhausts its retries)
+  task 2507 step-3: flock-denied path — TestEphemeralWorktreeFlockDenied (a
+           LOCK_NB-denied acquire raises EphemeralWorktreeError BEFORE any
+           `git worktree add`, the CM body never runs, and a pre-existing
+           foreign-held lock file is never unlinked)
 """
 from __future__ import annotations
 
 import asyncio
+import fcntl
 import logging
+import os
+import uuid
 from pathlib import Path
 from unittest.mock import AsyncMock, call, patch
 
@@ -369,6 +382,268 @@ class TestEphemeralWorktreeRetry:
         # asyncio.sleep is patched to avoid 1.5s of real backoff delay.
         assert mock_sleep.await_args_list == [call(0.5), call(1.0)], (
             f'expected backoff sleeps of 0.5s then 1.0s; got {mock_sleep.await_args_list}'
+        )
+
+
+# ---------------------------------------------------------------------------
+# task 2507 step-1: flock-liveness guard on GitOps.ephemeral_worktree
+# ---------------------------------------------------------------------------
+
+
+class TestEphemeralWorktreeFlock:
+    """task 2507 step-1: ephemeral_worktree acquires a sibling ``<name>.lock``
+    flock BEFORE ``git worktree add`` and holds it across the whole worktree
+    lifetime, releasing it (and unlinking the file, only when THIS call was
+    the one to acquire it) on every exit path.
+
+    Models reify warm-lane-gc.sh's Pass-2 orphan-removal contender (``exec
+    8>"$orphan_lock"; flock -n 8``, gc.sh:564-574) with an independent
+    Python open-file-description: a second ``os.open`` + ``fcntl.flock(
+    LOCK_EX|LOCK_NB)`` on the SAME lock path. flock is a kernel advisory
+    lock keyed on the inode, so this reproduces gc.sh's preserve-while-held
+    / reclaim-after-release contract hermetically, with no dependency on
+    the external reify repo (which may be absent in CI).
+
+    RED today: ephemeral_worktree takes no lock at all, so no sibling
+    ``.lock`` file is ever created and a second-OFD ``LOCK_NB`` acquire
+    always SUCCEEDS instead of raising ``BlockingIOError``.
+    """
+
+    @pytest.mark.parametrize('kind', [WorktreeKind.MAIN_PROBE, WorktreeKind.MAIN_SWEEP])
+    def test_lock_held_during_body_and_released_after_normal_exit(
+        self, tmp_path: Path, kind: WorktreeKind,
+    ) -> None:
+        """(a) + (c): while the CM body is running, the sibling lock file
+        exists and is held exclusively (an independent second OFD's
+        non-blocking LOCK_EX acquire raises BlockingIOError — models gc.sh's
+        contender). After NORMAL exit, the lock file is unlinked and a
+        fresh LOCK_EX|LOCK_NB acquire on a recreated file now succeeds."""
+        git_ops = GitOps(GitConfig(), tmp_path)
+        calls: list[list[str]] = []
+        captured: dict[str, Path] = {}
+
+        async def _body() -> None:
+            async with git_ops.ephemeral_worktree(kind, MAIN_SHA) as p:
+                lock_path = p.parent / f'{p.name}.lock'
+                captured['lock_path'] = lock_path
+                assert lock_path.exists(), (
+                    f'expected sibling lock file {lock_path} to exist while '
+                    f'the CM body is running'
+                )
+                fd2 = os.open(lock_path, os.O_RDWR)
+                try:
+                    with pytest.raises(BlockingIOError):
+                        fcntl.flock(fd2, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                finally:
+                    os.close(fd2)
+
+        with patch('orchestrator.git_ops._run', side_effect=_make_fake_run([0], calls)):
+            asyncio.run(_body())
+
+        lock_path = captured['lock_path']
+        assert not lock_path.exists(), (
+            f'expected the sibling lock file {lock_path} to be unlinked '
+            f'after normal CM exit'
+        )
+        # A fresh independent OFD can now acquire the (recreated) lock
+        # file's LOCK_EX|LOCK_NB without contention.
+        fd2 = os.open(lock_path, os.O_CREAT | os.O_RDWR, 0o644)
+        try:
+            fcntl.flock(fd2, fcntl.LOCK_EX | fcntl.LOCK_NB)  # must not raise
+        finally:
+            os.close(fd2)
+
+    @pytest.mark.parametrize('kind', [WorktreeKind.MAIN_PROBE, WorktreeKind.MAIN_SWEEP])
+    def test_lock_acquired_before_worktree_add(
+        self, tmp_path: Path, kind: WorktreeKind,
+    ) -> None:
+        """(b): the lock is already held BEFORE ``git worktree add`` runs.
+        A fake ``_run`` that, on the ``worktree add`` argv, tries a
+        second-OFD LOCK_EX|LOCK_NB acquire on the derived lock path BEFORE
+        creating the ``--detach`` target records whether it was denied —
+        i.e. the lock was present+held before the worktree dir exists."""
+        git_ops = GitOps(GitConfig(), tmp_path)
+        calls: list[list[str]] = []
+        observed: dict[str, bool] = {}
+
+        async def _fake_run(cmd, **kwargs):
+            calls.append(list(cmd))
+            if 'worktree' in cmd and 'add' in cmd:
+                detach_idx = cmd.index('--detach')
+                target = Path(cmd[detach_idx + 1])
+                assert not target.exists(), (
+                    'expected the worktree target to not exist yet at the '
+                    'point the lock contention is probed'
+                )
+                lock_path = target.parent / f'{target.name}.lock'
+                fd2 = os.open(lock_path, os.O_CREAT | os.O_RDWR, 0o644)
+                try:
+                    fcntl.flock(fd2, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                except BlockingIOError:
+                    observed['denied_before_add'] = True
+                else:
+                    observed['denied_before_add'] = False
+                finally:
+                    os.close(fd2)
+                target.mkdir(parents=True, exist_ok=True)
+                return (0, '', '')
+            return (0, '', '')
+
+        async def _body() -> None:
+            async with git_ops.ephemeral_worktree(kind, MAIN_SHA):
+                pass
+
+        with patch('orchestrator.git_ops._run', side_effect=_fake_run):
+            asyncio.run(_body())
+
+        assert observed.get('denied_before_add') is True, (
+            'expected the sibling lock to already be held (LOCK_NB denied) '
+            'by the time `git worktree add` runs — the lock must be '
+            'acquired BEFORE the worktree exists on disk'
+        )
+
+    @pytest.mark.parametrize('kind', [WorktreeKind.MAIN_PROBE, WorktreeKind.MAIN_SWEEP])
+    def test_lock_unlinked_after_body_exception(
+        self, tmp_path: Path, kind: WorktreeKind,
+    ) -> None:
+        """(d): on a body-EXCEPTION exit the lock file is still unlinked
+        (the finally ran)."""
+        git_ops = GitOps(GitConfig(), tmp_path)
+        calls: list[list[str]] = []
+        captured: dict[str, Path] = {}
+
+        async def _body() -> None:
+            async with git_ops.ephemeral_worktree(kind, MAIN_SHA) as p:
+                captured['lock_path'] = p.parent / f'{p.name}.lock'
+                raise RuntimeError('simulated body crash')
+
+        with (
+            patch('orchestrator.git_ops._run', side_effect=_make_fake_run([0], calls)),
+            pytest.raises(RuntimeError, match='simulated body crash'),
+        ):
+            asyncio.run(_body())
+
+        lock_path = captured['lock_path']
+        assert not lock_path.exists(), (
+            f'expected the sibling lock file {lock_path} to be unlinked '
+            f'even when the CM body raises (finally ran)'
+        )
+
+    @pytest.mark.parametrize('kind', [WorktreeKind.MAIN_PROBE, WorktreeKind.MAIN_SWEEP])
+    def test_no_lock_file_leaks_when_add_exhausts_retries(
+        self, tmp_path: Path, kind: WorktreeKind,
+    ) -> None:
+        """(e): when ``git worktree add`` fails on every retry (->
+        EphemeralWorktreeError), no sibling ``<kind.value><hex>.lock`` file
+        leaks under worktree_base either — mirrors the existing
+        no-leak-directory regression (amend-1,
+        test_add_failure_leaves_no_leaked_directory_under_worktree_base) but
+        for the lock file this task adds. A regression here would also flip
+        that existing test's glob('_mainprobe-*') no-leak assertion, since
+        the sibling lock name matches the same glob.
+        """
+        from orchestrator.git_ops import EphemeralWorktreeError
+
+        git_ops = GitOps(GitConfig(), tmp_path)
+
+        async def _fake_run_leaves_partial_dir(cmd, **kwargs):
+            if 'worktree' in cmd and 'add' in cmd:
+                # Simulate real `git worktree add` creating its target
+                # directory before it fails on lock contention.
+                detach_idx = cmd.index('--detach')
+                Path(cmd[detach_idx + 1]).mkdir(parents=True, exist_ok=True)
+                return (1, '', 'lock contention')
+            return (0, '', '')  # pragma: no cover — no other command expected
+
+        async def _body() -> None:
+            async with git_ops.ephemeral_worktree(kind, MAIN_SHA):
+                pass  # pragma: no cover — must never run
+
+        with (
+            patch('orchestrator.git_ops._run', side_effect=_fake_run_leaves_partial_dir),
+            patch('orchestrator.git_ops.asyncio.sleep', new_callable=AsyncMock),
+            pytest.raises(EphemeralWorktreeError),
+        ):
+            asyncio.run(_body())
+
+        leaked_locks = list(git_ops.worktree_base.glob(f'{kind.value}*.lock'))
+        assert not leaked_locks, (
+            f'expected no leaked {kind.value}*.lock file under worktree_base '
+            f'after add exhausts retries; found {leaked_locks}'
+        )
+
+
+# ---------------------------------------------------------------------------
+# task 2507 step-3: flock-denied path raises EphemeralWorktreeError
+# ---------------------------------------------------------------------------
+
+
+class TestEphemeralWorktreeFlockDenied:
+    """task 2507 step-3: a LOCK_NB-denied flock acquire (another live
+    consumer already holds the sibling lock — should never happen in
+    practice, since ephemeral_worktree mints a fresh uuid4 hex per call,
+    but must fail safe if it ever does) converts to
+    ``EphemeralWorktreeError`` BEFORE any ``git worktree add`` is
+    attempted: the CM body never runs, and — critically — a lock file we
+    did not acquire is NEVER unlinked out from under its real holder.
+
+    Patches ``orchestrator.git_ops.fcntl.flock`` directly to raise
+    ``BlockingIOError``, modelling the denial without needing a real
+    second holder process.
+
+    RED today: step-2 leaves the ``fcntl.flock`` acquire un-wrapped, so
+    the raised ``BlockingIOError`` propagates as a bare
+    ``BlockingIOError`` instead of ``EphemeralWorktreeError``.
+    """
+
+    def test_flock_denied_raises_ephemeral_worktree_error_before_add(
+        self, tmp_path: Path,
+    ) -> None:
+        from orchestrator.git_ops import EphemeralWorktreeError
+
+        git_ops = GitOps(GitConfig(), tmp_path)
+        calls: list[list[str]] = []
+        entered = False
+        fixed_uuid = uuid.UUID('11111111-2222-3333-4444-555555555555')
+
+        # Derive the EXACT lock path ephemeral_worktree will compute (by
+        # patching uuid4 to the same fixed value), so a foreign-held lock
+        # file can be pre-created there and asserted untouched afterward.
+        expected_name = f'{WorktreeKind.MAIN_PROBE.value}{fixed_uuid.hex[:8]}'
+        git_ops.worktree_base.mkdir(parents=True, exist_ok=True)
+        lock_path = git_ops.worktree_base / f'{expected_name}.lock'
+        lock_path.write_text('foreign holder')
+
+        async def _body() -> None:
+            nonlocal entered
+            async with git_ops.ephemeral_worktree(WorktreeKind.MAIN_PROBE, MAIN_SHA):
+                entered = True  # must never run
+
+        with (
+            patch('orchestrator.git_ops._run', side_effect=_make_fake_run([0], calls)),
+            patch('orchestrator.git_ops.uuid.uuid4', return_value=fixed_uuid),
+            patch(
+                'orchestrator.git_ops.fcntl.flock',
+                side_effect=BlockingIOError(11, 'Resource temporarily unavailable'),
+            ),
+            pytest.raises(EphemeralWorktreeError),
+        ):
+            asyncio.run(_body())
+
+        assert not entered, (
+            'expected the CM body to NEVER run when the flock acquire is denied'
+        )
+        add_calls = [c for c in calls if 'worktree' in c and 'add' in c]
+        assert not add_calls, (
+            f'expected NO git worktree add when the flock acquire is denied; '
+            f'got {add_calls}'
+        )
+        assert lock_path.exists(), (
+            'expected the pre-existing foreign-held lock file to survive the '
+            'failure untouched — we must never unlink a lock we did not acquire'
+        )
+        assert lock_path.read_text() == 'foreign holder', (
+            'expected the foreign lock file contents to be untouched'
         )
 
 
