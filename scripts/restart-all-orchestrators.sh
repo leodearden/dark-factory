@@ -130,9 +130,18 @@ restart_and_verify() {
 }
 
 drain_check_verdict() {
-    # $1 = unit name.  Prints one of idle/busy/stale/absent to stdout.
+    # $1 = unit name.  Prints one of idle/busy/stale/absent to stdout.  If
+    # the python3 invocation itself fails to exit 0 (e.g. python3 missing
+    # from PATH, or a future drain_check.py change that raises before
+    # printing a verdict), that failure is caught here and treated as
+    # "absent" -- fail-toward-convergence, same as an unreadable heartbeat
+    # file -- rather than aborting the entire restart-all run under
+    # `set -e`.  The drain gate must not become a hard dependency on
+    # python3 always exiting cleanly in the deploy environment.  stderr is
+    # left unsuppressed so a real failure is still visible in the script's
+    # own output.
     python3 "$SCRIPT_DIR/drain_check.py" --unit "$1" --fleet-dir "$FLEET_DIR" \
-        --fresh-window "$DRAIN_FRESH_WINDOW_SECS"
+        --fresh-window "$DRAIN_FRESH_WINDOW_SECS" || echo absent
 }
 
 drain_gate() {
