@@ -173,3 +173,71 @@ def mine_to_saturation(
 
     result.stop_reason = "exhausted"
     return result
+
+
+# ---------------------------------------------------------------------------
+# compute_matrix / render_matrix — origin x manifestation matrix (PRD
+# decision 6: the `unknown` phase is explicit, never inferred)
+# ---------------------------------------------------------------------------
+
+def compute_matrix(sightings: list[dict]) -> dict[str, dict[str, int]]:
+    """Tally *sightings* into an origin x manifestation count structure.
+
+    A sighting with a missing, ``None``, or empty ``origin_phase`` /
+    ``manifested_phase`` is bucketed under the explicit ``"unknown"``
+    phase -- NEVER inferred to a concrete one (PRD decision 6). Returns a
+    nested dict ``{origin: {manifested: count}}`` covering exactly the
+    phases actually observed (rows/cols this sparse by construction --
+    ``"unknown"`` only appears when at least one sighting actually landed
+    there), row/col-ordered per ``codebook.PHASES`` for a stable,
+    deterministic iteration order. Every observed row carries every
+    observed column key (0 for a combination that was never seen), so a
+    caller never needs a ``.get(..., 0)`` fallback. An empty *sightings*
+    list returns ``{}``.
+    """
+    counts: dict[tuple[str, str], int] = {}
+    origins: set[str] = set()
+    manifesteds: set[str] = set()
+
+    for sighting in sightings:
+        origin = sighting.get("origin_phase") or "unknown"
+        manifested = sighting.get("manifested_phase") or "unknown"
+        origins.add(origin)
+        manifesteds.add(manifested)
+        key = (origin, manifested)
+        counts[key] = counts.get(key, 0) + 1
+
+    ordered_origins = [p for p in codebook.PHASES if p in origins]
+    ordered_manifesteds = [p for p in codebook.PHASES if p in manifesteds]
+
+    return {
+        origin: {
+            manifested: counts.get((origin, manifested), 0)
+            for manifested in ordered_manifesteds
+        }
+        for origin in ordered_origins
+    }
+
+
+def render_matrix(matrix: dict[str, dict[str, int]]) -> str:
+    """Render *matrix* (``compute_matrix``'s output shape) as a
+    deterministic markdown table: one row per origin phase, one column
+    per manifestation phase, PHASES-ordered, 0 for any cell with no
+    count. Returns a fixed placeholder (never an empty string or a
+    header-only table) when *matrix* is empty."""
+    if not matrix:
+        return "_No sightings recorded._\n"
+
+    manifesteds_seen: set[str] = set()
+    for row in matrix.values():
+        manifesteds_seen.update(row.keys())
+    manifesteds = [p for p in codebook.PHASES if p in manifesteds_seen]
+    origins = [p for p in codebook.PHASES if p in matrix]
+
+    header = "| origin \\ manifested | " + " | ".join(manifesteds) + " |"
+    separator = "| --- | " + " | ".join("---" for _ in manifesteds) + " |"
+    rows = [
+        "| " + origin + " | " + " | ".join(str(matrix[origin].get(m, 0)) for m in manifesteds) + " |"
+        for origin in origins
+    ]
+    return "\n".join([header, separator, *rows]) + "\n"
