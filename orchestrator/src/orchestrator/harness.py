@@ -392,9 +392,17 @@ def _deterministic_deploy_stranded(metadata: dict | None) -> bool:
             ``DeployPhase.RAN`` (the deploy ran but reached no terminal
             phase), or
           - ``deploy_state`` is ABSENT and ``before_done_ran_at`` is truthy
-            — a bounded, documented migration shim for a deploy that began
-            before ζ activated (no deploy_state was ever written), so it
-            isn't silently un-stranded the moment ζ ships.
+            AND none of ``before_done_verified_at`` / ``gate_escalated_at``
+            / ``done_provenance`` is set — a bounded, documented migration
+            shim for a deploy that began before ζ activated (no
+            deploy_state was ever written), so it isn't silently
+            un-stranded the moment ζ ships. The three exclusions mirror the
+            deleted ``_is_stranded_deterministic_shape``'s terminal-outcome
+            check (reviewer amendment, task 2240): without them, a legacy
+            deploy that already reached a terminal state — e.g. an
+            act-then-ask deploy blocked at its gate whose escalation was
+            just resolved but not yet re-dispatched to done — would be
+            misclassified as a RAN-strand.
 
     None/non-dict *metadata* and a non-dict ``before_done`` are treated as
     non-matching rather than raising.
@@ -409,7 +417,11 @@ def _deterministic_deploy_stranded(metadata: dict | None) -> bool:
     if 'deploy_state' in metadata:
         state = DeployState.from_metadata(metadata)
         return state is not None and state.phase == DeployPhase.RAN
-    return bool(metadata.get('before_done_ran_at'))
+    return bool(metadata.get('before_done_ran_at')) and not (
+        metadata.get('before_done_verified_at')
+        or metadata.get('gate_escalated_at')
+        or metadata.get('done_provenance')
+    )
 
 
 def _acquire_project_lock(project_root: Path) -> IO:

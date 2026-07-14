@@ -377,6 +377,32 @@ class TestDeterministicDeployStranded:
         assert 'deploy_state' not in metadata
         assert _deterministic_deploy_stranded(metadata) is True
 
+    def test_false_for_legacy_shape_with_verified_at_set(self) -> None:
+        """Reviewer amendment (task 2240): a pre-ζ deploy that already
+        reached VERIFIED (before_done_verified_at stamped) is a terminal
+        outcome, not a RAN-strand, even though it predates deploy_state and
+        still carries before_done_ran_at. Preserves the exclusion the
+        deleted ``_is_stranded_deterministic_shape`` enforced."""
+        metadata = _strand_metadata(before_done_verified_at='2026-07-01T00:05:00+00:00')
+        assert 'deploy_state' not in metadata
+        assert _deterministic_deploy_stranded(metadata) is False
+
+    def test_false_for_legacy_shape_with_gate_escalated_at_set(self) -> None:
+        """Reviewer amendment (task 2240): a pre-ζ act-then-ask deploy
+        blocked at its gate (gate_escalated_at stamped) is a terminal
+        outcome, not a RAN-strand — e.g. its escalation was just resolved
+        but the task has not yet been re-dispatched to done."""
+        metadata = _strand_metadata(gate_escalated_at='2026-07-01T00:05:00+00:00')
+        assert 'deploy_state' not in metadata
+        assert _deterministic_deploy_stranded(metadata) is False
+
+    def test_false_for_legacy_shape_with_done_provenance_set(self) -> None:
+        """Reviewer amendment (task 2240): a pre-ζ deploy that already
+        recorded done_provenance is a terminal outcome, not a RAN-strand."""
+        metadata = _strand_metadata(done_provenance={'kind': 'deterministic-deploy'})
+        assert 'deploy_state' not in metadata
+        assert _deterministic_deploy_stranded(metadata) is False
+
     def test_false_for_legacy_shape_when_before_done_ran_at_missing(self) -> None:
         assert _deterministic_deploy_stranded(_strand_metadata(before_done_ran_at=None)) is False
 
