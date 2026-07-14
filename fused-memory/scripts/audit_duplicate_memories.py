@@ -1,0 +1,441 @@
+#!/usr/bin/env python3
+"""One-shot + periodic sweep: find near-duplicate ``procedural_knowledge``
+Mem0 memories for a project and report (or delete) the losers.
+
+Motivation: Stage-1 reconciliation (finding 2cf1b99f) observed the
+worktree-local-venv-vs-shared-checkout-venv gotcha rewritten as a
+near-duplicate ``procedural_knowledge`` memory >=13 times -- task-worker
+agents write the gotcha ad hoc without first ``search()``-ing Mem0 for
+existing coverage, so it recurs faster than any single consolidation pass
+absorbs it. This script is the automated backstop: it enumerates a project's
+``procedural_knowledge`` memories, clusters near-duplicates by CONTENT
+similarity (``difflib.SequenceMatcher.ratio()`` + union-find transitive
+closure), picks a survivor per cluster, and reports (or deletes) the rest.
+
+Structural parallel to ``scripts/audit_duplicate_tasks.py`` (union-find
+near-duplicate clustering + pick_survivor + dry-run/apply split) and the Mem0
+sweep-script family (``scripts/prune_recon_cycle_summaries.py``,
+``scripts/sweep_orphan_flag_markers.py``): enumerate via
+``memory.mem0.scroll_by_metadata``, delete losers via
+``memory.delete_memory`` best-effort.
+
+Safety carve-outs:
+  - Dry-run report is the default; deletion only under explicit ``--apply``.
+  - Only near-duplicate CLUSTERS above a high similarity threshold are
+    actioned; a survivor (canonical-flagged, else oldest) is always retained
+    per cluster.
+  - ``--apply`` refuses to run when the scan looks truncated
+    (``len(records) >= scan_limit``) so a truncated scan never silently
+    reaches deletions.
+  - Missing/unextractable content degrades to ``''``, which never clusters
+    and is never deleted.
+
+Usage
+-----
+  # Dry run (default): print JSON report, change nothing.
+  python scripts/audit_duplicate_memories.py --project-id dark_factory
+
+  # Commit the deletions.
+  python scripts/audit_duplicate_memories.py --project-id dark_factory --apply
+
+  # Tune near-duplicate threshold (default 0.85).
+  python scripts/audit_duplicate_memories.py --project-id dark_factory \\
+      --threshold 0.80
+"""
+
+from __future__ import annotations
+
+import argparse
+import asyncio
+import difflib
+import json
+import logging
+import sys
+from datetime import datetime
+from typing import Any
+
+logger = logging.getLogger('audit_duplicate_memories')
+
+
+# ---------------------------------------------------------------------------
+# Pure-function core (no I/O — fully testable without a live Mem0)
+# ---------------------------------------------------------------------------
+
+def _sort_groups_deterministically(groups: list[list[dict]]) -> list[list[dict]]:
+    """Return a new list of groups in deterministic order without mutating *groups*.
+
+    Members within each returned group are sorted by ``str(id)``; the list of
+    groups is then sorted by the minimum id (as a string) in each group.
+    Unlike Taskmaster task ids (mostly-numeric, handled via ``_id_as_int`` in
+    ``audit_duplicate_tasks.py``), Mem0 memory ids are typically UUIDs, so a
+    plain string sort key is used instead.
+    """
+    sorted_groups = [sorted(g, key=lambda m: str(m.get('id', ''))) for g in groups]
+    sorted_groups.sort(key=lambda g: str(g[0].get('id', '')))
+    return sorted_groups
+
+
+def find_near_duplicate_memory_groups(
+    memories: list[dict],
+    threshold: float = 0.85,
+) -> list[list[dict]]:
+    """Find groups of memories with near-duplicate content using SequenceMatcher.
+
+    Args:
+        memories: Memory dicts (each with at least an ``'id'`` and
+            ``'content'`` key). No category filtering is performed here —
+            the caller (``build_sweep_plan``) is responsible for that.
+        threshold: Minimum ``difflib.SequenceMatcher.ratio()`` to flag a pair.
+
+    Returns:
+        List of groups (each a list of >= 2 memories) formed by transitive
+        closure of all pairs whose content similarity >= threshold. Groups
+        are sorted by the minimum id within the group so output is
+        deterministic. Does not mutate *memories*.
+
+    Complexity:
+        O(n^2) pairs x O(L) per ``SequenceMatcher.ratio()`` call (L = content
+        length) — mirrors ``audit_duplicate_tasks.find_near_duplicate_groups``.
+        Each pair is pre-filtered through ``quick_ratio()``, a documented
+        upper bound on ``ratio()`` that is much cheaper to compute, so
+        obviously-dissimilar pairs skip the expensive exact comparison
+        without changing which pairs end up >= threshold.
+    """
+    n = len(memories)
+    if n < 2:
+        return []
+
+    normalized = [(m.get('content') or '').strip().lower() for m in memories]
+
+    # Union-find (path-compressed) over memory indices.
+    parent = list(range(n))
+
+    def find(x: int) -> int:
+        while parent[x] != x:
+            parent[x] = parent[parent[x]]
+            x = parent[x]
+        return x
+
+    def union(x: int, y: int) -> None:
+        rx, ry = find(x), find(y)
+        if rx != ry:
+            parent[rx] = ry
+
+    for i in range(n):
+        # Empty/blank content never clusters and is never deleted (safe
+        # degradation). Guard here because SequenceMatcher(None, '', '').ratio()
+        # returns 1.0, which would otherwise union two empty-content records
+        # and mark one for deletion — a real memory whose content simply could
+        # not be extracted. See the docstring safety carve-out.
+        if not normalized[i]:
+            continue
+        # Reuse one SequenceMatcher across the inner loop instead of
+        # constructing a fresh one per pair (set_seq1 is fixed per i;
+        # set_seq2 varies per j — identical argument order to the original
+        # difflib.SequenceMatcher(None, normalized[i], normalized[j])).
+        matcher = difflib.SequenceMatcher()
+        matcher.set_seq1(normalized[i])
+        for j in range(i + 1, n):
+            if not normalized[j]:
+                continue
+            matcher.set_seq2(normalized[j])
+            # quick_ratio()/real_quick_ratio() are documented upper bounds on
+            # ratio(), so skipping pairs below threshold here never changes
+            # which pairs end up unioned — only cheaper on obvious misses.
+            if matcher.real_quick_ratio() < threshold or matcher.quick_ratio() < threshold:
+                continue
+            if matcher.ratio() >= threshold:
+                union(i, j)
+
+    # Materialise groups: collect memory lists per root, drop singletons.
+    groups: dict[int, list[dict]] = {}
+    for i in range(n):
+        root = find(i)
+        groups.setdefault(root, []).append(memories[i])
+
+    result = [g for g in groups.values() if len(g) >= 2]
+    return _sort_groups_deterministically(result)
+
+
+def _created_at_sort_key(created_at: Any) -> tuple[int, float]:
+    """Sort key placing parseable ``created_at`` oldest-first, unparseable last.
+
+    Returns ``(0, timestamp)`` for a parseable ISO datetime string (so the
+    oldest instant sorts first), or ``(1, 0.0)`` for ``None``/unparseable
+    values — always after every parseable entry, so a record with no usable
+    timestamp is never mistakenly picked as "the oldest".
+    """
+    if not isinstance(created_at, str) or not created_at:
+        return (1, 0.0)
+    try:
+        return (0, datetime.fromisoformat(created_at).timestamp())
+    except (ValueError, TypeError):
+        return (1, 0.0)
+
+
+def pick_survivor(group: list[dict]) -> tuple[dict, list[dict]]:
+    """Pick the survivor from a near-duplicate memory group.
+
+    Survivor selection (in order):
+      1. A member explicitly flagged canonical (``metadata.get('canonical')``
+         truthy) wins, regardless of age.
+      2. Otherwise, the oldest member by ``created_at`` (ISO string) wins.
+         Records with a missing/unparseable ``created_at`` sort last (see
+         ``_created_at_sort_key``) so they are never chosen as "oldest"
+         unless every member in the group lacks a usable timestamp.
+      3. Ties (equal or absent ``created_at``) are broken by the lowest
+         ``str(id)``.
+
+    Raises ``ValueError`` for groups with < 2 memories.
+
+    Returns ``(survivor, losers)`` with ``losers`` = all non-survivor members.
+    """
+    if len(group) < 2:
+        raise ValueError(f'pick_survivor requires a group of >= 2 memories, got {len(group)}')
+
+    def _sort_key(m: dict) -> tuple[bool, int, float, str]:
+        canonical = bool((m.get('metadata') or {}).get('canonical'))
+        bucket, ts = _created_at_sort_key(m.get('created_at'))
+        # `not canonical` so canonical=True sorts first (False < True);
+        # bucket/ts ascending so the oldest parseable timestamp sorts first;
+        # id ascending so the lowest id wins remaining ties.
+        return (not canonical, bucket, ts, str(m.get('id', '')))
+
+    ordered = sorted(group, key=_sort_key)
+    survivor = ordered[0]
+    losers = [m for m in group if m is not survivor]
+    return survivor, losers
+
+
+def build_sweep_plan(memories: list[dict], threshold: float = 0.85) -> dict[str, Any]:
+    """Orchestrate filtering -> clustering -> survivor selection -> report.
+
+    Args:
+        memories: Raw memory list (any/all categories).
+        threshold: Near-duplicate similarity threshold.
+
+    Returns:
+        JSON-serialisable plan dict with keys: ``clusters_total``,
+        ``near_duplicate_groups`` (each with the survivor's id/content and
+        the full member id list), ``delete_candidates`` (flattened loser ids
+        across all clusters). Mirrors ``audit_duplicate_tasks.build_audit_plan``.
+    """
+    candidates = [m for m in memories if m.get('category') == 'procedural_knowledge']
+    groups = find_near_duplicate_memory_groups(candidates, threshold=threshold)
+
+    near_duplicate_groups: list[dict[str, Any]] = []
+    # Mem0/Qdrant point ids can be int or str (ExtendedPointId), so this is
+    # not narrowed to list[str].
+    delete_candidates: list[Any] = []
+
+    for group in groups:
+        survivor, losers = pick_survivor(group)
+        near_duplicate_groups.append({
+            'survivor_id': survivor.get('id'),
+            'survivor_content': survivor.get('content'),
+            'member_ids': [m.get('id') for m in group],
+        })
+        delete_candidates.extend(m.get('id') for m in losers)
+
+    return {
+        'clusters_total': len(groups),
+        'near_duplicate_groups': near_duplicate_groups,
+        'delete_candidates': delete_candidates,
+    }
+
+
+# ---------------------------------------------------------------------------
+# I/O layer: fetch (thin, mock-tested)
+# ---------------------------------------------------------------------------
+
+# Payload keys tried in order when extracting a Mem0 memory's text content
+# from its scroll_by_metadata() 'metadata' payload dict. 'data' is the
+# canonical scroll-payload key (mirrors prune_recon_cycle_summaries.py, which
+# reads only metadata.get('data')) so it is tried first; 'memory' is a
+# search-result-layer key (memory_service.py's MemoryResult.content, built
+# from Mem0's search API, not scroll) that can appear stale on a scroll
+# payload, so it is only a fallback; 'content' is a defensive third fallback.
+_CONTENT_KEYS: tuple[str, ...] = ('data', 'memory', 'content')
+
+
+async def fetch_procedural_memories(
+    memory: Any,
+    project_id: str,
+    scan_limit: int = 5000,
+) -> list[dict[str, Any]]:
+    """Enumerate a project's ``procedural_knowledge`` memories from Mem0.
+
+    Calls ``memory.mem0.scroll_by_metadata(scope, {'category':
+    'procedural_knowledge'}, limit=scan_limit)`` and normalises each raw
+    record (``{'id', 'created_at', 'metadata'}``) into ``{'id', 'content',
+    'category', 'created_at', 'metadata'}``. The top-level ``'category'`` is
+    lifted out of the payload so ``build_sweep_plan`` (which filters on
+    ``m['category']``) sees the same shape the real fetch path produces —
+    without it, every fetched record's ``m.get('category')`` would be
+    ``None`` and the sweep would be a silent no-op. Content is extracted from
+    the payload by
+    trying ``_CONTENT_KEYS`` in order, falling back to ``''`` when no key
+    yields a usable value — a record with no extractable content therefore
+    normalises to ``content=''``, which never clusters and is never deleted
+    (safe degradation).
+
+    Args:
+        memory: Live (or mock) MemoryService instance.
+        project_id: Project scope to scan.
+        scan_limit: Maximum number of points to enumerate (passed through to
+            ``scroll_by_metadata``).
+
+    Returns:
+        Normalised memory dicts; ``[]`` for an empty/timed-out scan.
+    """
+    from fused_memory.models.scope import Scope  # noqa: PLC0415
+
+    scope = Scope(project_id=project_id)
+    raw_records = await memory.mem0.scroll_by_metadata(
+        scope, {'category': 'procedural_knowledge'}, limit=scan_limit,
+    )
+    if not raw_records:
+        return []
+
+    normalized: list[dict[str, Any]] = []
+    for record in raw_records:
+        payload = record.get('metadata') or {}
+        content = ''
+        for key in _CONTENT_KEYS:
+            value = payload.get(key)
+            if isinstance(value, str) and value:
+                content = value
+                break
+        normalized.append({
+            'id': record.get('id'),
+            'content': content,
+            'category': payload.get('category'),
+            'created_at': record.get('created_at'),
+            'metadata': payload,
+        })
+    return normalized
+
+
+# ---------------------------------------------------------------------------
+# I/O layer: apply (thin, mock-tested)
+# ---------------------------------------------------------------------------
+
+async def apply_deletions(
+    memory: Any,
+    project_id: str,
+    plan: dict[str, Any],
+    *,
+    dry_run: bool,
+) -> dict[str, int]:
+    """Delete the plan's ``delete_candidates`` from Mem0 (best-effort).
+
+    Dry-run performs no ``delete_memory`` calls and returns zero counts.
+    Otherwise, each candidate is deleted individually in a try/except so a
+    single failure does not abort the remaining deletes (best-effort partial
+    progress) — mirrors ``audit_duplicate_tasks.apply_changes``.
+
+    Returns:
+        Dict with ``deleted`` and ``delete_errors`` counts.
+    """
+    if dry_run:
+        return {'deleted': 0, 'delete_errors': 0}
+
+    deleted = 0
+    delete_errors = 0
+    for memory_id in plan.get('delete_candidates', []):
+        try:
+            await memory.delete_memory(memory_id, store='mem0', project_id=project_id)
+            logger.info('Deleted near-duplicate memory %s', memory_id)
+            deleted += 1
+        except Exception as exc:
+            logger.error('Failed to delete memory %s: %s', memory_id, exc)
+            delete_errors += 1
+
+    return {'deleted': deleted, 'delete_errors': delete_errors}
+
+
+# ---------------------------------------------------------------------------
+# CLI / main
+# ---------------------------------------------------------------------------
+
+async def _run(args: argparse.Namespace) -> int:
+    logging.basicConfig(
+        level=logging.INFO, format='%(asctime)s %(levelname)s %(message)s',
+    )
+
+    import os  # noqa: PLC0415
+
+    from fused_memory.config.schema import FusedMemoryConfig  # noqa: PLC0415
+    from fused_memory.services.memory_service import MemoryService  # noqa: PLC0415
+
+    if args.config:
+        os.environ['CONFIG_PATH'] = str(args.config)
+
+    config = FusedMemoryConfig()
+    memory = MemoryService(config)
+    await memory.initialize()
+    try:
+        records = await fetch_procedural_memories(
+            memory, args.project_id, scan_limit=args.scan_limit,
+        )
+        logger.info('Fetched %d procedural_knowledge memory/memories', len(records))
+
+        plan = build_sweep_plan(records, threshold=args.threshold)
+        print(json.dumps(plan, indent=2, default=str))
+
+        if not args.apply:
+            logger.info('Dry run — nothing was modified. Use --apply to commit.')
+            return 0
+
+        # Irreversible-deletion guards: never apply against an empty or
+        # suspected-truncated scan (mirrors prune_recon_cycle_summaries.py's
+        # scan-completeness guard).
+        if not records:
+            logger.error('ABORT: scan returned 0 records — refusing to apply on an empty scan.')
+            return 1
+        if len(records) >= args.scan_limit:
+            logger.error(
+                'ABORT: scan returned %d records >= --scan-limit=%d — scan looks '
+                'truncated; refusing to apply. Re-run with a higher --scan-limit.',
+                len(records), args.scan_limit,
+            )
+            return 1
+
+        result = await apply_deletions(memory, args.project_id, plan, dry_run=False)
+        logger.info(
+            'Applied: deleted %d/%d memory/memories; %d error(s)',
+            result['deleted'], len(plan['delete_candidates']), result['delete_errors'],
+        )
+        return 1 if result['delete_errors'] > 0 else 0
+    finally:
+        await memory.close()
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument(
+        '--project-id', dest='project_id', required=True,
+        help='Project id to scan for near-duplicate procedural_knowledge memories',
+    )
+    parser.add_argument(
+        '--threshold', type=float, default=0.85,
+        help='Near-duplicate similarity threshold (default: 0.85)',
+    )
+    parser.add_argument(
+        '--scan-limit', dest='scan_limit', type=int, default=5000,
+        help='Maximum number of procedural_knowledge memories to scan (default: 5000)',
+    )
+    parser.add_argument(
+        '--apply', action='store_true',
+        help='Commit deletions (default: dry-run, report only)',
+    )
+    parser.add_argument(
+        '--config', default=None,
+        help='Path to fused-memory config file (sets CONFIG_PATH env var)',
+    )
+    args = parser.parse_args()
+    return asyncio.run(_run(args))
+
+
+if __name__ == '__main__':
+    sys.exit(main())
