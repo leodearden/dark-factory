@@ -8,8 +8,12 @@ loop over a pluggable ``(corpus, scorer, executor_model, heuristics_block)``.
 from __future__ import annotations
 
 from orchestrator.evals.prompt_opt.curator_corpus import (
+    AuditReport,
     CuratorCorpusManifest,
     CuratorReplayItem,
+    audit_curator_corpus,
+    build_curator_corpus,
+    propose_curator_label_frontier,
     read_curator_decisions,
     select_spot_check_subset,
 )
@@ -28,6 +32,7 @@ from orchestrator.evals.prompt_opt.variance import (
 
 __all__ = [
     'AcceptanceRecord',
+    'AuditReport',
     'CorpusSplit',
     'CuratorActionScorer',
     'CuratorCorpusManifest',
@@ -37,9 +42,12 @@ __all__ = [
     'RolloutFn',
     'ScoredItem',
     'Scorer',
+    'audit_curator_corpus',
+    'build_curator_corpus',
     'evaluate_acceptance',
     'measure_repeatability_band',
     'paired_delta',
+    'propose_curator_label_frontier',
     'propose_heuristics_edit',
     'read_curator_decisions',
     'run_optimization_loop',

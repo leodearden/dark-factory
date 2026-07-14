@@ -24,6 +24,7 @@ import json
 import logging
 import random
 import sqlite3
+from collections import Counter
 from collections.abc import Awaitable, Callable
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
@@ -35,11 +36,13 @@ from orchestrator.evals.reviewer_trial.mining import assign_split
 logger = logging.getLogger(__name__)
 
 __all__ = [
+    'AuditReport',
     'CuratorCorpusManifest',
     'CuratorReplayItem',
     'FrontierLabel',
     'FrontierProposerFn',
     'RecordedDecision',
+    'audit_curator_corpus',
     'build_curator_corpus',
     'propose_curator_label_frontier',
     'read_curator_decisions',
@@ -563,3 +566,83 @@ justification. Output your decision as JSON.
     if label is None:
         return FrontierLabel(action='create', justification='unparseable-frontier-output')
     return label
+
+
+# ---------------------------------------------------------------------------
+# audit_curator_corpus (mirrors reviewer_trial.mining.audit_corpus)
+# ---------------------------------------------------------------------------
+
+_SPLIT_RATIO_NAMES = ('train', 'selection', 'test')
+
+
+@dataclass
+class AuditReport:
+    """Structured result of :func:`audit_curator_corpus`'s integrity checks.
+
+    ``ok`` is True only when every check passes; otherwise ``failures``
+    names each failing check so a CLI/CI caller can report exactly what's
+    wrong rather than a bare pass/fail.
+    """
+
+    ok: bool
+    item_count: int
+    failures: list[str] = field(default_factory=list)
+
+
+def audit_curator_corpus(
+    manifest: CuratorCorpusManifest,
+    adjudication_log: AdjudicationLog,
+    min_items: int = 50,
+    ratios: tuple[int, int, int] = (2, 1, 7),
+    ratio_tolerance: float = 0.1,
+) -> AuditReport:
+    """Audit curator corpus integrity (mirrors reviewer_trial.mining.audit_corpus).
+
+    Checks, each contributing a named reason to ``AuditReport.failures``
+    when violated:
+
+    - ``item_count``              -- ``len(manifest.items) >= min_items``.
+    - ``missing_split``            -- every item has a non-``None`` ``split``.
+    - ``split_ratio``              -- train/selection/test proportions
+      approximate *ratios* (default 2:1:7) within *ratio_tolerance*.
+    - ``missing_gold_label``       -- every item carries a non-empty
+      ``gold_action``.
+    - ``adjudication_coverage``    -- *adjudication_log* has an entry for
+      every ``ticket_id`` in the manifest.
+    - ``spot_check_subset_empty``  -- *adjudication_log* flags a non-empty
+      documented human spot-check subset.
+
+    Never raises: an empty manifest simply fails ``item_count`` (and, since
+    there's nothing to compute a ratio over, skips the ``split_ratio`` check
+    rather than dividing by zero).
+    """
+    items = manifest.items
+    failures: list[str] = []
+
+    if len(items) < min_items:
+        failures.append('item_count')
+
+    if any(item.split is None for item in items):
+        failures.append('missing_split')
+
+    split_counts = Counter(item.split for item in items if item.split is not None)
+    n_split = sum(split_counts.values())
+    if n_split:
+        total_ratio = sum(ratios)
+        for name, target in zip(_SPLIT_RATIO_NAMES, ratios, strict=True):
+            actual = split_counts.get(name, 0) / n_split
+            if abs(actual - target / total_ratio) > ratio_tolerance:
+                failures.append('split_ratio')
+                break
+
+    if any(not item.gold_action for item in items):
+        failures.append('missing_gold_label')
+
+    coverage = adjudication_log.coverage(item.ticket_id for item in items)
+    if not coverage.ok:
+        failures.append('adjudication_coverage')
+
+    if not adjudication_log.spot_check_subset():
+        failures.append('spot_check_subset_empty')
+
+    return AuditReport(ok=not failures, item_count=len(items), failures=failures)
