@@ -1329,6 +1329,31 @@ class TestSessionTableEnterFocus:
 
             assert backend.focus_calls == [DisplayTarget(kind='wm', wm_title='session-b title')]
 
+    @pytest.mark.timeout(10)
+    async def test_enter_on_session_row_with_no_display_is_fail_soft(self, tmp_path):
+        """A session row with no Display resolves to no focus target --
+        pressing Enter on it must not focus anything and must not raise
+        (PRD §2), mirroring TestSpawnTreeEnterFocus's no-Display guard."""
+        from cockpit.app import CockpitApp
+        from cockpit.backends import FakeBackend
+        from cockpit.panes.session_table import SessionTable
+
+        only_session = _make_record(session_slug='no-display-1', status=sr.Status.RUNNING)
+        sr.write_record(only_session, root=tmp_path)
+
+        backend = FakeBackend()
+        app = CockpitApp(fleet_root=tmp_path, backend=backend, poll_interval=0.05)
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            table = app.query_one(SessionTable)
+            table.focus()
+            await pilot.pause()
+
+            await pilot.press('enter')
+            await pilot.pause()
+
+            assert backend.focus_calls == []
+
 
 class TestSpawnTreeToggle:
     @pytest.mark.timeout(10)
