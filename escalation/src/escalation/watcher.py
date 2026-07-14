@@ -172,14 +172,25 @@ def main() -> None:
         '--exclude-id', action='append', default=None,
         help='esc-id to exclude from initial scan AND event loop; repeatable',
     )
+    parser.add_argument(
+        '--exclude-file', default=None,
+        help=(
+            'path to a newline-delimited esc-id exclude list, re-read each '
+            'poll; repeated ids skip initial scan AND event loop'
+        ),
+    )
     args = parser.parse_args()
 
     queue_dir = Path(args.queue_dir)
     queue_dir.mkdir(parents=True, exist_ok=True)
 
-    exclude_ids = frozenset(
+    static_exclude = frozenset(
         e[:-5] if e.endswith('.json') else e for e in (args.exclude_id or [])
     )
+    exclude_file_path = Path(args.exclude_file) if args.exclude_file else None
+
+    def current_excludes() -> frozenset[str]:
+        return static_exclude | _read_exclude_file(exclude_file_path)
 
     # ARM inotify first so no events are missed between scan and watch.
     inotify = INotify()
@@ -187,7 +198,7 @@ def main() -> None:
     inotify.add_watch(str(queue_dir), watch_flags)
 
     # Initial scan: emit any already-pending escalation and exit immediately.
-    match = _initial_scan(queue_dir, args.task_id, args.level, exclude_ids)
+    match = _initial_scan(queue_dir, args.task_id, args.level, current_excludes())
     if match is not None:
         _emit(match, args.ntfy_url)
         sys.exit(0)
@@ -210,12 +221,14 @@ def main() -> None:
         if deadline is not None and not events:
             sys.exit(124)
 
+        excludes = current_excludes()  # RE-READ each poll (--exclude-file may have changed)
+
         for event in events:
             name = event.name
             if not name or not (name.startswith('esc-') and name.endswith('.json')):
                 continue
 
-            if name[:-5] in exclude_ids:
+            if name[:-5] in excludes:
                 continue
 
             path = queue_dir / name
@@ -224,7 +237,7 @@ def main() -> None:
             except (json.JSONDecodeError, KeyError, OSError, TypeError):
                 continue
 
-            if not _matches(esc, args.task_id, args.level, exclude_ids):
+            if not _matches(esc, args.task_id, args.level, excludes):
                 continue
 
             _emit(esc, args.ntfy_url)
