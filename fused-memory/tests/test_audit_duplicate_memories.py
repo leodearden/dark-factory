@@ -9,6 +9,8 @@ import importlib.util
 import types
 from pathlib import Path
 
+import pytest
+
 SCRIPT_PATH = Path(__file__).parent.parent / 'scripts' / 'audit_duplicate_memories.py'
 
 
@@ -37,6 +39,7 @@ def _load_module() -> types.ModuleType:
 
 _mod = _load_module()
 find_near_duplicate_memory_groups = _mod.find_near_duplicate_memory_groups
+pick_survivor = _mod.pick_survivor
 
 
 # ---------------------------------------------------------------------------
@@ -176,3 +179,110 @@ class TestFindNearDuplicateMemoryGroupsEdgeCases:
     def test_no_pair_above_threshold_returns_empty(self):
         memories = [_memory('m1', _VENV_GOTCHA_A), _memory('m4', _DISTRACTOR)]
         assert find_near_duplicate_memory_groups(memories, threshold=_THRESHOLD) == []
+
+
+# ===========================================================================
+# Step-3: pick_survivor
+# ===========================================================================
+
+class TestPickSurvivorCanonicalFlag:
+    """A metadata.canonical-flagged member always wins, regardless of age."""
+
+    def test_canonical_wins_over_older_non_canonical(self):
+        group = [
+            _memory('m1', _VENV_GOTCHA_A, created_at='2026-07-01T00:00:00+00:00'),
+            _memory(
+                'm2', _VENV_GOTCHA_B, created_at='2026-07-13T00:00:00+00:00',
+                metadata={'canonical': True},
+            ),
+        ]
+        survivor, losers = pick_survivor(group)
+        assert survivor['id'] == 'm2'
+        assert [m['id'] for m in losers] == ['m1']
+
+
+class TestPickSurvivorOldestByCreatedAt:
+    """With no canonical flag, the oldest by created_at wins."""
+
+    def test_oldest_created_at_wins(self):
+        group = [
+            _memory('m1', _VENV_GOTCHA_A, created_at='2026-07-13T00:00:00+00:00'),
+            _memory('m2', _VENV_GOTCHA_B, created_at='2026-07-12T00:00:00+00:00'),
+            _memory('m3', _VENV_GOTCHA_C, created_at='2026-07-13T01:00:00+00:00'),
+        ]
+        survivor, losers = pick_survivor(group)
+        assert survivor['id'] == 'm2'
+        assert {m['id'] for m in losers} == {'m1', 'm3'}
+
+
+class TestPickSurvivorTieBreaks:
+    """Ties (equal or absent created_at) are broken by the lowest id."""
+
+    def test_equal_created_at_lowest_id_wins(self):
+        group = [
+            _memory('m9', _VENV_GOTCHA_A, created_at='2026-07-12T00:00:00+00:00'),
+            _memory('m2', _VENV_GOTCHA_B, created_at='2026-07-12T00:00:00+00:00'),
+        ]
+        survivor, losers = pick_survivor(group)
+        assert survivor['id'] == 'm2'
+        assert [m['id'] for m in losers] == ['m9']
+
+    def test_absent_created_at_both_none_lowest_id_wins(self):
+        group = [
+            _memory('m9', _VENV_GOTCHA_A, created_at=None),
+            _memory('m2', _VENV_GOTCHA_B, created_at=None),
+        ]
+        survivor, losers = pick_survivor(group)
+        assert survivor['id'] == 'm2'
+
+
+class TestPickSurvivorUnparseableCreatedAt:
+    """None/unparseable created_at values sort last -- never picked as oldest
+    unless every member in the group lacks a usable timestamp."""
+
+    def test_unparseable_created_at_loses_to_parseable(self):
+        group = [
+            _memory('m1', _VENV_GOTCHA_A, created_at='not-a-date'),
+            _memory('m2', _VENV_GOTCHA_B, created_at='2026-07-13T00:00:00+00:00'),
+        ]
+        survivor, losers = pick_survivor(group)
+        assert survivor['id'] == 'm2'
+
+    def test_none_created_at_loses_to_parseable(self):
+        group = [
+            _memory('m1', _VENV_GOTCHA_A, created_at=None),
+            _memory('m2', _VENV_GOTCHA_B, created_at='2026-07-13T00:00:00+00:00'),
+        ]
+        survivor, losers = pick_survivor(group)
+        assert survivor['id'] == 'm2'
+
+    def test_all_unparseable_falls_back_to_lowest_id(self):
+        group = [
+            _memory('m9', _VENV_GOTCHA_A, created_at='garbage'),
+            _memory('m2', _VENV_GOTCHA_B, created_at=None),
+        ]
+        survivor, losers = pick_survivor(group)
+        assert survivor['id'] == 'm2'
+
+
+class TestPickSurvivorEdgeCases:
+    """Degenerate input: a group of < 2 memories is invalid."""
+
+    def test_single_memory_raises_value_error(self):
+        with pytest.raises(ValueError):
+            pick_survivor([_memory('m1', _VENV_GOTCHA_A)])
+
+    def test_empty_group_raises_value_error(self):
+        with pytest.raises(ValueError):
+            pick_survivor([])
+
+    def test_losers_are_all_non_survivor_members(self):
+        group = [
+            _memory('m1', _VENV_GOTCHA_A, created_at='2026-07-12T00:00:00+00:00'),
+            _memory('m2', _VENV_GOTCHA_B, created_at='2026-07-13T00:00:00+00:00'),
+            _memory('m3', _VENV_GOTCHA_C, created_at='2026-07-14T00:00:00+00:00'),
+        ]
+        survivor, losers = pick_survivor(group)
+        assert survivor not in losers
+        assert len(losers) == len(group) - 1
+        assert {m['id'] for m in losers} | {survivor['id']} == {m['id'] for m in group}
