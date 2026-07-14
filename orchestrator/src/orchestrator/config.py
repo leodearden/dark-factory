@@ -539,6 +539,34 @@ class PsiAdmissionConfig(BaseModel):
     )
 
 
+class DeliveredChecksConfig(BaseModel):
+    """Delivered-check dep-gate sweep configuration (capability-delivered-
+    checks PRD, plans/capability-delivered-checks-prd.md).
+
+    The scheduler's per-tick sweep (``Scheduler._compute_delivered_check_cache``)
+    evaluates every distinct terminal local dep that carries
+    ``metadata.delivered_checks`` against the committed ``main`` tree.
+    ``max_checks_per_tick`` bounds how many uncached (dep, main_sha) checks
+    that sweep evaluates in a single tick — a worst-case fan-out guard so a
+    burst of newly-terminal deps can't stall tick latency; checks deferred by
+    the budget stay uncached and are retried (fail-safe wait) next tick.
+
+    Task 2580 (delta) owns only this one leaf. Task 2583 (epsilon) extends
+    this sub-model with the grace-streak escalation knobs (enabled,
+    grace_cycles, check_timeout_secs).
+    """
+
+    max_checks_per_tick: int = Field(
+        default=50,
+        ge=1,
+        description=(
+            'Maximum number of uncached (dep_task_id, main_sha) delivered-checks '
+            'evaluated per scheduler tick. Must be >= 1. Checks deferred by this '
+            'budget remain uncached and are retried next tick (fail-safe wait).'
+        ),
+    )
+
+
 class FusedMemoryConfig(BaseModel):
     """Fused-memory HTTP server connection."""
 
@@ -2450,6 +2478,10 @@ class OrchestratorConfig(BaseSettings):
     # in orchestrator.yaml yields the DA-D7 enabled-by-default instance.
     psi_admission: PsiAdmissionConfig = Field(default_factory=PsiAdmissionConfig)
 
+    # Delivered-check dep-gate sweep budget (task 2580, capability-delivered-
+    # checks PRD delta). Task 2583 (epsilon) extends this sub-model further.
+    delivered_checks: DeliveredChecksConfig = Field(default_factory=DeliveredChecksConfig)
+
     # Value/h scheduler scoring (P2/P3 — age boost, CPM weighting).
     age_alpha: float = Field(
         default=10.0,
@@ -2988,6 +3020,10 @@ RELOADABLE_FIELDS: frozenset[str] = frozenset().union(
         # read fresh per run_scoped_verification call, so a live reload
         # lowers the merge fan-out without a restart.
         'merge_verify_max_concurrent_modules',
+        # Delivered-check dep-gate sweep budget (task 2580, capability-
+        # delivered-checks PRD delta) — scheduler tuning, same tier as
+        # fairness.skip_threshold / starvation_watchdog.*.
+        'delivered_checks.max_checks_per_tick',
     },
 )
 

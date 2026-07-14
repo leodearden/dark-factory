@@ -25,6 +25,7 @@ from shared.mcp_envelope import parse_tool_result, resolver_failed
 from shared.psi import PsiSample, read_psi_sample
 from shared.task_metadata import parse_metadata
 
+from orchestrator import git_ops
 from orchestrator.config import (
     DEFAULT_TIER,
     PRIORITY_RANK,
@@ -34,6 +35,7 @@ from orchestrator.config import (
     OrchestratorConfig,
     coerce_tier,
 )
+from orchestrator.delivered_checks import DeliveredCheckResult, run_delivered_check
 from orchestrator.event_store import EventStore, EventType
 from orchestrator.mcp_lifecycle import mcp_call
 from orchestrator.module_charter import derive_modules, sanitize_files_for_persist
@@ -59,6 +61,15 @@ _TRANSIENT_BACKOFF_BASE: float = 1.5
 # harness.py's _PAUSED_IDLE_LOG_SECS so sustained saturation doesn't flood
 # journald while the per-tick dispatch_deferred event still fires every tick.
 _DISPATCH_DEFERRED_LOG_SECS: float = 180.0
+
+# Delivered-check gate (task 2580, reviewer_comprehensive amendment): bounds
+# the WARNING-level diagnostic log for a dep whose check(s) stay ERRORED
+# (git/script error, malformed descriptor) across many consecutive sweeps.
+# Mirrors _DISPATCH_DEFERRED_LOG_SECS's split above — the *log* line is
+# bounded/rate-limited, never the underlying behavior: the runner still
+# re-evaluates an ERRORED dep on EVERY sweep (no backoff), so a fix landing
+# on main is picked up the very next tick (row 7 self-heal).
+_DELIVERED_CHECK_ERROR_LOG_THRESHOLD: int = 20
 
 # Sentinel distinguishing "caller omitted this claimant kwarg" (default,
 # leave the wire argument absent) from "caller explicitly passed None"
@@ -572,6 +583,7 @@ class TickContext:
     max_id: int = 0
     external_cache: dict[str, str] = field(default_factory=dict)
     external_resolver_failed: bool = False
+    delivered_check_cache: dict[str, bool] = field(default_factory=dict)
     overrides: dict[str, OverrideRow] = field(default_factory=dict)
     overrides_for_diff: dict[str, OverrideRow] = field(default_factory=dict)
     effective_priorities: dict[str, str] = field(default_factory=dict)
@@ -1210,6 +1222,7 @@ class Scheduler:
         'stale_sweep',
         'cooldown_gc',
         'external_dep_policy',
+        'delivered_check_gate',
         'stamp_milestone',
         'override_snapshot_gc',
         'reserve_now',
@@ -1357,11 +1370,54 @@ class Scheduler:
         self._streak_hold = StreakCounter()
         self._streak_resolver_degraded = StreakCounter()
         self._streak_starvation = StreakCounter()
+        # Delivered-check dep-gate hold-visibility streak (task 2580, delta
+        # of the capability-delivered-checks PRD). Dedicated counter — kept
+        # separate from _streak_hold (the external-dep gate's own hold
+        # streak) so the two gates' visibility never collide/reset each
+        # other. Bumped by _note_delivered_hold on every tick a dependent is
+        # withheld by a cached-False (ran-and-FAILED) delivered check.
+        self._streak_delivered_hold = StreakCounter()
+        # Persistent per-(dep_task_id, main_sha) delivered-check result cache
+        # (task 2580, delta). Keyed by the SHA the check was evaluated
+        # against so a new commit on main naturally self-heals: stale
+        # entries for the previous SHA are pruned by
+        # _compute_delivered_check_cache once it observes main has moved,
+        # forcing a fresh re-evaluation rather than trusting a result that
+        # predates the capability landing. Process-local — an orchestrator
+        # restart is an acceptable implicit reset (mirrors every other
+        # process-local cache above).
+        self._delivered_check_cache: dict[tuple[str, str], bool] = {}
+        # The main SHA the cache above was last pruned/keyed against. None
+        # before the first sweep that finds at least one checked dep.
+        self._delivered_check_sha: str | None = None
+        # Parallel to _delivered_check_cache, keyed identically
+        # (dep_task_id, main_sha), but ONLY populated for cached-False
+        # (ran-and-FAILED) entries: the {name, dep_id, main_sha, kind} of
+        # the check that actually failed (reviewer_comprehensive amendment).
+        # A cache-hit on a False entry replays this stored detail instead of
+        # reconstructing from the dep's first delivered_checks entry, which
+        # would misname a later check as the failure when an earlier one in
+        # the same dep passed. Pruned in lockstep with _delivered_check_cache
+        # on SHA advance.
+        self._delivered_check_fail_detail: dict[tuple[str, str], dict] = {}
+        # Per-dep_task_id count of CONSECUTIVE sweeps where at least one of
+        # its checks resolved ERRORED (and none FAILED) — i.e. the dep was
+        # left uncached this sweep (reviewer_comprehensive amendment).
+        # Diagnostic-only: bounds the WARNING log at
+        # _DELIVERED_CHECK_ERROR_LOG_THRESHOLD so a persistently-misconfigured
+        # check (bad regex/path, missing/non-executable script) is
+        # observable in logs even though row 7 deliberately withholds the
+        # delivered_check_gate_held EVENT/streak for errored (that stays a
+        # pure fail-safe wait — no dispatch-gate visibility spam). Popped
+        # once the dep resolves definitively (DELIVERED/FAILED cached) so a
+        # later, unrelated error episode starts its own count from zero.
+        self._delivered_check_error_streak: dict[str, int] = {}
         self._streak_registry = StreakRegistry()
         self._streak_registry.register('external_unresolved', self._streak_external_unresolved)
         self._streak_registry.register('local_backfill', self._streak_local_backfill)
         self._streak_registry.register('hold', self._streak_hold)
         self._streak_registry.register('resolver_degraded', self._streak_resolver_degraded)
+        self._streak_registry.register('delivered_hold', self._streak_delivered_hold)
         self._streak_registry.register(
             'starvation', self._streak_starvation, on_gc=self._starvation_gc_resolve
         )
@@ -2311,6 +2367,56 @@ class Scheduler:
                     data={'cause': cause, 'ticks': streak, 'detail': detail},
                 )
 
+    def _note_delivered_hold(
+        self,
+        task_id: str,
+        *,
+        detail: dict | None = None,
+    ) -> None:
+        """Bump the delivered-check hold-streak for ``task_id`` and emit a
+        hold-visibility event.
+
+        Called once per tick a dependent is withheld because a done/
+        cancelled local dep's ``metadata.delivered_checks`` cache entry is
+        cached ``False`` (ran-and-FAILED — never for errored/absent
+        withholds, which are a pure fail-safe wait with no visibility
+        spam). Unlike :meth:`_note_external_hold`, the EVENT has NO
+        threshold gate: task 2580 (delta) has no ``grace_cycles`` config
+        yet, so every held tick both bumps ``_streak_delivered_hold`` and
+        emits ``EventType.delivered_check_gate_held`` with the running
+        streak count — task 2583 (epsilon) layers threshold-gated
+        escalation on top with its own counter, consuming ``detail`` from
+        this event.
+
+        ``detail`` should name the failed check (name/dep_id/main_sha/kind)
+        so epsilon's escalation payload can identify exactly what failed.
+
+        The WARNING *log* line, unlike the event, IS bounded
+        (reviewer_comprehensive amendment): a steady-state hold (a failing
+        check that stays failing until a fix lands on main) would otherwise
+        log one WARNING per tick indefinitely.  Only the first tick of a
+        hold episode (``streak == 1``) logs at WARNING; every subsequent
+        held tick logs the identical message at DEBUG instead — mirrors the
+        module's ``_streak_milestone_malformed`` "warn once" precedent.
+        Durable per-tick visibility (for epsilon and for dashboards) still
+        comes from the event, which is unaffected by this log-level split.
+        """
+        streak = self._streak_delivered_hold.bump(task_id)
+        log = logger.warning if streak == 1 else logger.debug
+        log(
+            'Task %s: delivered-check gate has held dispatch for %d consecutive '
+            'ticks (detail=%r)',
+            task_id,
+            streak,
+            detail,
+        )
+        if self.event_store is not None:
+            self.event_store.emit(
+                EventType.delivered_check_gate_held,
+                task_id=task_id,
+                data={'ticks': streak, 'detail': detail},
+            )
+
     async def _apply_external_dep_policy(
         self,
         pending_tasks: list[dict],
@@ -2540,6 +2646,281 @@ class Scheduler:
                 )
             else:
                 self._streak_hold.clear(task_id)
+
+    async def _resolve_main_sha(self) -> str | None:
+        """Resolve the current commit SHA of ``main`` via ``git rev-parse``.
+
+        Returns ``None`` on any git error (non-zero exit, or the subprocess
+        call itself raising) so :meth:`_compute_delivered_check_cache` can
+        fail-safe to an empty projection for the tick rather than caching a
+        delivered-check result against an unresolved ref.
+        """
+        try:
+            rc, out, err = await git_ops._run(
+                ['git', '-C', self._project_root, 'rev-parse', 'main']
+            )
+        except Exception as e:
+            logger.warning(
+                '_resolve_main_sha: git rev-parse main raised: %s: %s',
+                type(e).__name__, e,
+            )
+            return None
+        if rc != 0:
+            logger.warning(
+                '_resolve_main_sha: git rev-parse main failed rc=%d stderr=%r', rc, err
+            )
+            return None
+        return out.strip() or None
+
+    async def _compute_delivered_check_cache(
+        self,
+        pending_tasks: list[dict],
+        status_map: dict[str, str],
+        tasks_by_id: dict[str, dict],
+    ) -> dict[str, bool]:
+        """Per-tick sweep for the delivered-check dep-gate (capability-
+        delivered-checks PRD, task delta).
+
+        Evaluates every distinct TERMINAL local dep carrying a truthy
+        ``metadata.delivered_checks`` — collected across *pending_tasks* —
+        against the committed ``main`` tree, and returns the
+        ``{dep_task_id: passed}`` projection that :meth:`_deps_satisfied`'s
+        ``delivered_check_cache`` arm consults. Run ONCE per tick from
+        ``_phase_delivered_check_gate``.
+
+        Resolves ``git rev-parse main`` (:meth:`_resolve_main_sha`) AT MOST
+        ONCE, and ONLY when at least one pending task has a checked
+        terminal dep — the common case (no delivered-checks tasks) pays
+        zero git cost. Results are cached persistently on
+        ``self._delivered_check_cache``, keyed ``(dep_task_id, main_sha)``;
+        when main advances, stale-SHA entries are pruned (self-heal — a
+        capability landing on main is picked up the very next tick with no
+        operator action). A per-tick budget
+        (``config.delivered_checks.max_checks_per_tick``) bounds worst-case
+        runner fan-out: a dep whose checks don't all complete within budget
+        is left uncached (fail-safe wait, retried next tick) — EXCEPT the
+        first dep this sweep actually evaluates (i.e. not served from
+        cache), which always runs ALL of its checks to completion
+        regardless of budget (reviewer_comprehensive amendment). Without
+        this guarantee, a dep whose OWN check count is >= budget would hit
+        the cap at the same relative position on every single sweep (since
+        ``used`` resets to 0 each tick and dict iteration order is stable)
+        and could never resolve — permanently starving its dependent even
+        though nothing is actually wrong with the check (the config allows
+        ``max_checks_per_tick=1``, making this easy to trigger). Exceeding
+        the budget this way logs a bounded WARNING so a mis-sized budget is
+        operator-visible; a later (non-first) dep in the same sweep is
+        still deferred exactly as before once the budget is spent.
+
+        Also drives ``_note_delivered_hold`` / ``_streak_delivered_hold``
+        visibility, decided from THIS tick's projection: a dependent with a
+        checked dep that resolved definitively ``False`` (ran-and-FAILED)
+        gets a hold event; a dependent whose every checked dep resolved
+        ``True`` has its hold streak cleared. A dependent with a dep that's
+        absent from the projection this tick (errored / over-budget / not
+        yet evaluated) is left untouched — pure fail-safe wait, no
+        visibility spam (mirrors row 7's "no streak bump" semantics). The
+        identity of the failed check for a cached-False dep is replayed from
+        ``self._delivered_check_fail_detail`` (keyed identically to
+        ``self._delivered_check_cache``) rather than reconstructed, so a
+        multi-check dep's hold detail always names the check that actually
+        failed, not just the dep's first ``delivered_checks`` entry.
+
+        A dep left uncached because at least one check ERRORED (and none
+        FAILED) bumps a separate, diagnostic-only
+        ``self._delivered_check_error_streak[dep_id]`` counter and logs at
+        WARNING once ``_DELIVERED_CHECK_ERROR_LOG_THRESHOLD`` consecutive
+        sweeps are reached (DEBUG below that / after) — reviewer_comprehensive
+        amendment: a persistently-misconfigured check (bad regex/path,
+        missing/non-executable script) would otherwise be silently stuck
+        forever with zero operator-facing signal. This counter/log is
+        SEPARATE from ``_streak_delivered_hold`` /
+        ``delivered_check_gate_held`` — row 7's "no hold event, no streak
+        bump" dispatch-gate contract for errored is unchanged. The runner is
+        NOT backed off while ERRORED: every sweep re-evaluates an uncached
+        dep's checks so a fix landing on main self-heals the very next tick.
+
+        Side-effecting (mutates ``self._delivered_check_cache``, bumps/
+        clears ``self._streak_delivered_hold``) — like
+        ``_apply_external_dep_policy``, this must NOT be called from
+        ``_deps_satisfied`` / ``_eligible_for_dispatch``. Those are pure
+        predicates called per-candidate; side effects here would N-fire.
+        """
+        tasks_by_id = tasks_by_id or {}
+
+        # Collect the distinct terminal local deps carrying delivered_checks
+        # across all pending tasks, and which dependent(s) care about each.
+        checked_deps: dict[str, dict] = {}
+        deps_by_dependent: dict[str, set[str]] = {}
+        for task in pending_tasks:
+            task_id = str(task.get('id', '?'))
+            for d in task.get('dependencies', []):
+                dep_id = str(d.get('id', d) if isinstance(d, dict) else d)
+                if status_map.get(dep_id) not in TERMINAL_STATUSES:
+                    continue
+                dep_task = tasks_by_id.get(dep_id)
+                if dep_task is None:
+                    continue
+                checks = (dep_task.get('metadata') or {}).get('delivered_checks')
+                if not checks:
+                    continue
+                checked_deps[dep_id] = dep_task
+                deps_by_dependent.setdefault(task_id, set()).add(dep_id)
+
+        if not checked_deps:
+            return {}
+
+        main_sha = await self._resolve_main_sha()
+        if main_sha is None:
+            return {}
+
+        if main_sha != self._delivered_check_sha:
+            stale_keys = [k for k in self._delivered_check_cache if k[1] != main_sha]
+            for key in stale_keys:
+                del self._delivered_check_cache[key]
+                self._delivered_check_fail_detail.pop(key, None)
+            self._delivered_check_sha = main_sha
+
+        budget = self.config.delivered_checks.max_checks_per_tick
+        used = 0
+        # Forward-progress guarantee (reviewer_comprehensive amendment):
+        # the first dep this sweep actually evaluates (below) is allowed to
+        # exceed the per-tick budget on its own checks — see the docstring
+        # above. Sticky for the rest of this sweep once consumed.
+        first_dep_this_sweep = True
+        projection: dict[str, bool] = {}
+        # Value is `dict | None`: the cache-hit replay path (below) can find
+        # no persisted detail for a cache entry predating this amendment
+        # (or any other defensive gap) and falls back to None — the
+        # hold-visibility loop and _note_delivered_hold both already accept
+        # detail=None.
+        fail_detail_by_dep: dict[str, dict | None] = {}
+
+        for dep_id, dep_task in checked_deps.items():
+            cache_key = (dep_id, main_sha)
+            if cache_key in self._delivered_check_cache:
+                cached = self._delivered_check_cache[cache_key]
+                projection[dep_id] = cached
+                # Cached (True or False) means this dep resolved definitively
+                # on a prior sweep at this SHA — it can no longer be in the
+                # ERRORED-uncached state, so its diagnostic error streak (if
+                # any, e.g. from an earlier episode before a fix landed) is
+                # stale.
+                self._delivered_check_error_streak.pop(dep_id, None)
+                if cached is False:
+                    # Steady state: this dep already FAILED on a prior tick
+                    # at this same SHA and was served straight from cache —
+                    # no checks re-ran this sweep. Replay the check that
+                    # actually failed from the persisted parallel cache
+                    # (stored alongside the uncached-FAILED branch below)
+                    # rather than reconstructing from the dep's first
+                    # delivered_checks entry, which would misname a LATER
+                    # check as the failure when an earlier one passed.
+                    fail_detail_by_dep[dep_id] = self._delivered_check_fail_detail.get(cache_key)
+                continue
+
+            checks = (dep_task.get('metadata') or {}).get('delivered_checks') or []
+            results: list[tuple[dict, DeliveredCheckResult]] = []
+            over_budget = False
+            # Only the first dep this sweep actually evaluates gets the
+            # forward-progress guarantee; every later dep still respects
+            # the budget exactly as before.
+            guaranteed_dep = first_dep_this_sweep
+            first_dep_this_sweep = False
+            for check in checks:
+                if used >= budget and not guaranteed_dep:
+                    over_budget = True
+                    break
+                used += 1
+                result = await run_delivered_check(
+                    check, project_root=self._project_root, ref=main_sha
+                )
+                results.append((check, result))
+
+            if over_budget:
+                logger.debug(
+                    'Delivered-check sweep: dep %s deferred — per-tick budget '
+                    '(%d) exhausted before all %d checks ran',
+                    dep_id, budget, len(checks),
+                )
+                continue
+
+            if guaranteed_dep and len(checks) > budget:
+                logger.warning(
+                    'Delivered-check sweep: dep %s has %d checks, exceeding '
+                    'max_checks_per_tick (%d) — ran all of them anyway to '
+                    'guarantee per-tick forward progress since it was the '
+                    'first uncached dep this sweep. Consider raising '
+                    'delivered_checks.max_checks_per_tick.',
+                    dep_id, len(checks), budget,
+                )
+
+            if all(r is DeliveredCheckResult.DELIVERED for _c, r in results):
+                self._delivered_check_cache[cache_key] = True
+                projection[dep_id] = True
+                self._delivered_check_error_streak.pop(dep_id, None)
+                continue
+
+            failed = next(
+                ((c, r) for c, r in results if r is DeliveredCheckResult.FAILED), None
+            )
+            if failed is not None:
+                failed_check, _r = failed
+                self._delivered_check_cache[cache_key] = False
+                projection[dep_id] = False
+                detail = {
+                    'name': failed_check.get('name'),
+                    'dep_id': dep_id,
+                    'main_sha': main_sha,
+                    'kind': failed_check.get('kind'),
+                }
+                fail_detail_by_dep[dep_id] = detail
+                # Persist alongside the bool so a later cache-hit sweep can
+                # replay the check that actually failed (see the cache-hit
+                # branch above) instead of guessing.
+                self._delivered_check_fail_detail[cache_key] = detail
+                self._delivered_check_error_streak.pop(dep_id, None)
+                continue
+
+            # else: at least one ERRORED and none FAILED — leave uncached
+            # (fail-safe wait; every check for this dep retries next tick;
+            # no backoff — see the module docstring note above). NOT a
+            # _note_delivered_hold / _streak_delivered_hold event (row 7's
+            # dispatch-gate contract), but bump a separate diagnostic-only
+            # streak so a PERSISTENTLY errored check (as opposed to a
+            # transient git/script blip) still surfaces in the logs.
+            error_streak = self._delivered_check_error_streak.get(dep_id, 0) + 1
+            self._delivered_check_error_streak[dep_id] = error_streak
+            errored_names = [
+                c.get('name') for c, r in results if r is DeliveredCheckResult.ERRORED
+            ]
+            error_log = (
+                logger.warning
+                if error_streak == _DELIVERED_CHECK_ERROR_LOG_THRESHOLD
+                else logger.debug
+            )
+            error_log(
+                'Delivered-check dep %s: at least one check has ERRORED for '
+                '%d consecutive sweep(s) (checks=%r) — left uncached '
+                '(fail-safe wait; no dispatch-gate event/streak per row 7). '
+                'This may indicate a misconfigured check (bad regex/path, '
+                'or a missing/non-executable script).',
+                dep_id, error_streak, errored_names,
+            )
+
+        # Hold-visibility: per dependent, decided from THIS tick's projection.
+        for task_id, dep_ids in deps_by_dependent.items():
+            failed_dep_id = next(
+                (dep_id for dep_id in dep_ids if projection.get(dep_id) is False), None
+            )
+            if failed_dep_id is not None:
+                self._note_delivered_hold(task_id, detail=fail_detail_by_dep.get(failed_dep_id))
+            elif all(projection.get(dep_id) is True for dep_id in dep_ids):
+                self._streak_delivered_hold.clear(task_id)
+            # else: at least one dep absent this tick (errored/over-budget) —
+            # leave the streak untouched, no visibility spam (row 7).
+
+        return projection
 
     async def _apply_starvation_watchdog(self, candidates: list[dict]) -> None:
         """Per-tick starvation watchdog over the dispatch-eligible candidate list.
@@ -2913,6 +3294,7 @@ class Scheduler:
         *,
         external_status_cache: dict[str, str] | None = None,
         external_resolver_failed: bool = False,
+        delivered_check_cache: dict[str, bool] | None = None,
     ) -> bool:
         """Return True if every dependency of *task* is in a terminal status.
 
@@ -2946,10 +3328,23 @@ class Scheduler:
         *external_resolver_failed* is ``True``, all external deps are treated as
         not satisfied regardless of the cache (fail-safe wait).
 
-        Defaulting both new parameters to ``None``/``False`` makes the legacy
-        3-arg call from ``_park_gc`` and all existing tests byte-identical.
-        Side effects (escalation, counter increments) MUST NOT live here — this
-        method is a pure predicate called from multiple sites.
+        **Delivered-check gate (capability-delivered-checks PRD, task delta):**
+        when *delivered_check_cache* is not ``None`` AND *tasks_by_id* is
+        supplied, each TERMINAL (done/cancelled) local dep whose record in
+        *tasks_by_id* carries a truthy ``metadata.delivered_checks`` must
+        also resolve to exactly ``True`` in *delivered_check_cache* (keyed by
+        dep task id) to count as satisfied — this applies to a ``cancelled``
+        dep just as much as a ``done`` one, since the check trusts the state
+        of ``main``, not the status label.  A dep absent from the cache
+        (errored, over budget, or not yet evaluated this tick) is NOT
+        satisfied (fail-safe wait).  A dep whose record carries no
+        ``metadata.delivered_checks`` is never consulted — byte-identical.
+
+        Defaulting all three new parameters to ``None``/``False`` makes the
+        legacy 3-arg call from ``_park_gc`` and all existing tests
+        byte-identical. Side effects (escalation, counter increments) MUST
+        NOT live here — this method is a pure predicate called from
+        multiple sites.
 
         Handles three dependency formats:
           - dict with 'id' key: ``{'id': 1}`` or ``{'id': '1'}``
@@ -3025,6 +3420,34 @@ class Scheduler:
                         task_id,
                         ext_dep,
                         ext_status,
+                    )
+                    return False
+
+        # Delivered-check gate (capability-delivered-checks PRD, task delta).
+        # Only active when the cache is supplied (not None) AND tasks_by_id
+        # is available to look up each dep's metadata — defaults reproduce
+        # byte-identical legacy behaviour.  Only a TERMINAL local dep that
+        # itself carries a truthy metadata.delivered_checks is consulted; a
+        # dep without the metadata is never looked up in the cache.
+        if delivered_check_cache is not None and tasks_by_id is not None:
+            for d in deps:
+                dep_id = str(d.get('id', d) if isinstance(d, dict) else d)
+                dep_status = status_map.get(dep_id, 'unknown')
+                if dep_status not in TERMINAL_STATUSES:
+                    continue
+                dep_task = tasks_by_id.get(dep_id)
+                if dep_task is None:
+                    continue
+                dep_checks = (dep_task.get('metadata') or {}).get('delivered_checks')
+                if not dep_checks:
+                    continue
+                if delivered_check_cache.get(dep_id) is not True:
+                    logger.debug(
+                        'Task %s blocked: dep %s delivered_checks not confirmed on '
+                        'main (cache=%r)',
+                        task_id,
+                        dep_id,
+                        delivered_check_cache.get(dep_id),
                     )
                     return False
         return True
@@ -3385,6 +3808,7 @@ class Scheduler:
         *,
         external_status_cache: dict[str, str] | None = None,
         external_resolver_failed: bool = False,
+        delivered_check_cache: dict[str, bool] | None = None,
     ) -> tuple[bool, str | None]:
         """Check whether *task* passes all eligibility gates for dispatch.
 
@@ -3411,6 +3835,13 @@ class Scheduler:
         The ``_park_gc`` call site does NOT pass these params (preserving
         park-GC semantics, scope containment per design decision 4).
 
+        *delivered_check_cache* is forwarded to :meth:`_deps_satisfied` for
+        the delivered-check dep-gate (capability-delivered-checks PRD, task
+        delta).  When ``None`` (the default), the gate is skipped —
+        byte-identical to the pre-delivered-check implementation.  The
+        ``_park_gc`` call site does NOT pass this param either (same scope
+        containment as the external cache).
+
         Returns ``(True, signal_label)`` when all gates pass.
         Returns ``(False, None)`` when any gate fails.  ``signal_label`` is
         the dispatch-cooldown signal for the task (or None), forwarded so the
@@ -3432,6 +3863,7 @@ class Scheduler:
             task, status_map, tasks_by_id,
             external_status_cache=external_status_cache,
             external_resolver_failed=external_resolver_failed,
+            delivered_check_cache=delivered_check_cache,
         ):
             return False, None
         signal_label = self._dispatch_cooldown_signal(task)
@@ -4275,6 +4707,42 @@ class Scheduler:
         ctx.external_resolver_failed = external_err is not None
         return _CONTINUE
 
+    async def _phase_delivered_check_gate(self, ctx: TickContext) -> object:
+        """Delivered-check dep-gate per-tick sweep (capability-delivered-
+        checks PRD, task delta).
+
+        Reads: ``ctx.tasks``, ``ctx.status_map``, ``ctx.tasks_by_id``.
+        Writes: ``ctx.delivered_check_cache``. Runs immediately after
+        ``external_dep_policy`` and before either candidate-dispatch loop
+        (``build_candidates`` / ``select_pins``), both of which forward the
+        cache into ``_eligible_for_dispatch`` → ``_deps_satisfied``.
+        ``_compute_delivered_check_cache`` already collects the relevant
+        (terminal, checked) deps internally — a dep-free or check-free
+        pending task is a no-op for it — so this phase simply forwards all
+        pending tasks, mirroring how ``_apply_external_dep_policy`` is
+        itself the one that filters for relevant deps.
+
+        The sweep call is wrapped in try/except so a failure (e.g. a
+        transient git error surfacing as an unexpected exception) degrades
+        to a fail-safe EMPTY cache instead of aborting the tick — no task
+        gated by an unverified delivered check dispatches this tick, and
+        the sweep retries next tick. Always continues.
+        """
+        _pending_tasks = [t for t in ctx.tasks if t.get('status') == 'pending']
+        try:
+            cache = await self._compute_delivered_check_cache(
+                _pending_tasks, ctx.status_map, ctx.tasks_by_id
+            )
+        except Exception:
+            logger.warning(
+                'Delivered-check gate sweep raised — degrading to fail-safe '
+                'empty cache this tick',
+                exc_info=True,
+            )
+            cache = {}
+        ctx.delivered_check_cache = cache
+        return _CONTINUE
+
     async def _phase_stamp_milestone(self, ctx: TickContext) -> object:
         """Stamp the frozen-once ``milestone_deps_satisfied_at`` anchor.
 
@@ -4468,7 +4936,8 @@ class Scheduler:
         """Filter tasks to dispatch-eligible candidates.
 
         Reads: ``ctx.tasks``, ``ctx.status_map``, ``ctx.tasks_by_id``,
-        ``ctx.external_cache``, ``ctx.external_resolver_failed``. Writes:
+        ``ctx.external_cache``, ``ctx.external_resolver_failed``,
+        ``ctx.delivered_check_cache``. Writes:
         ``ctx.candidates``, ``ctx.candidate_signals``. Filters to pending
         tasks whose deps are all done and that aren't dispatched or in
         their post-requeue cooldown window. ``_eligible_for_dispatch``
@@ -4485,6 +4954,7 @@ class Scheduler:
                 t, tid_str, ctx.status_map, ctx.tasks_by_id,
                 external_status_cache=ctx.external_cache,
                 external_resolver_failed=ctx.external_resolver_failed,
+                delivered_check_cache=ctx.delivered_check_cache,
             )
             if not eligible:
                 continue
@@ -4658,7 +5128,8 @@ class Scheduler:
 
         Reads: ``ctx.overrides``, ``ctx.tasks_by_id``, ``ctx.status_map``,
         ``ctx.external_cache``, ``ctx.external_resolver_failed``,
-        ``ctx.gated_ids``, ``ctx.psi_hold``, ``ctx.effective_priorities``.
+        ``ctx.delivered_check_cache``, ``ctx.gated_ids``, ``ctx.psi_hold``,
+        ``ctx.effective_priorities``.
         Writes: none on ctx (dispatch bookkeeping lives on ``self``).
         Pinned candidates bypass scoring entirely but still respect lock
         availability and eligibility checks (status, deps, cooldown). On
@@ -4683,6 +5154,7 @@ class Scheduler:
                     pin_task, pin_tid, ctx.status_map, ctx.tasks_by_id,
                     external_status_cache=ctx.external_cache,
                     external_resolver_failed=ctx.external_resolver_failed,
+                    delivered_check_cache=ctx.delivered_check_cache,
                 )
                 if not eligible:
                     continue
