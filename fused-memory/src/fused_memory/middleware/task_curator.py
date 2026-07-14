@@ -46,7 +46,7 @@ from shared.cli_invoke import (
 )
 from shared.locking import files_to_modules
 from shared.neutral_cwd import neutral_cli_cwd
-from shared.prompt_artifact import PromptSpec
+from shared.prompt_artifact import PromptArtifactStore, PromptSpec, default_artifacts_root
 
 from fused_memory.backends.task_backend_errors import TaskNotFoundError
 from fused_memory.middleware.candidate_key import compute_candidate_key
@@ -542,12 +542,14 @@ class TaskCurator:
         usage_gate: UsageGate | None = None,
         cwd: Path | None = None,
         escalator: CuratorEscalator | None = None,
+        prompt_store: PromptArtifactStore | None = None,
     ) -> None:
         self._config = config
         self._taskmaster = taskmaster
         self._usage_gate = usage_gate
         self._cwd = cwd
         self._escalator = escalator
+        self._prompt_store = prompt_store
         self._qdrant_client = None  # AsyncQdrantClient, lazy
         self._embedder = None  # OpenAIEmbedder, lazy
         self._initialized_collections: set[str] = set()
@@ -651,6 +653,23 @@ class TaskCurator:
                     'TaskCurator requires an OpenAI embedder — check config.embedder',
                 )
         return self._embedder
+
+    def _resolve_curator_prompt(self, spec: PromptSpec) -> str:
+        """Resolve *spec* to its composed prompt text via the artifact loader.
+
+        Lazily builds ``self._prompt_store`` from :func:`default_artifacts_root`
+        when no store was injected. :meth:`PromptArtifactStore.resolve` never
+        raises — an absent or unverifiable pin falls back to
+        ``spec.in_code_constant`` — so the curator's best-effort contract is
+        preserved even when the artifacts root is missing.
+        """
+        if self._prompt_store is None:
+            self._prompt_store = PromptArtifactStore(default_artifacts_root())
+        return self._prompt_store.resolve(
+            spec,
+            executor_model=self._config.curator.model,
+            harness_version=_CURATOR_PROMPT_HARNESS_VERSION,
+        ).text
 
     def _collection_name(self, project_id: str) -> str:
         return f'task_curator_{project_id}'
@@ -2168,13 +2187,14 @@ class TaskCurator:
             len(pool),
             self._config.curator.single_call_budget_cap_usd,
         )
+        system_prompt = self._resolve_curator_prompt(CURATOR_SINGLE_SPEC)
 
         agent_result: AgentResult = await invoke_with_cap_retry(
             usage_gate=self._usage_gate,
             label=f'task-curator[{project_id}]',
             project_id=project_id,
             prompt=user_prompt,
-            system_prompt=_SYSTEM_PROMPT,
+            system_prompt=system_prompt,
             cwd=cwd,
             model=self._config.curator.model,
             # ``max_turns=1`` is incompatible with ``--json-schema`` because
