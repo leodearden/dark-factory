@@ -110,6 +110,7 @@ _UNION: frozenset[tuple[TaskStatus, TaskStatus]] = frozenset(
         (TaskStatus.IN_PROGRESS, TaskStatus.DONE),  # merged workflow.py:1380; found_on_main workflow.py:3809/7396/harness.py:3623
         (TaskStatus.MERGE_DEFERRED, TaskStatus.DONE),  # workflow.py:1015/6424, harness.py:619/646
         (TaskStatus.BLOCKED, TaskStatus.DONE),  # train attribution workflow.py:6424
+        (TaskStatus.PENDING, TaskStatus.DONE),  # recon found_on_main; operator direct-complete of a never-dispatched task is an out-of-band manual set_task_status/update_task write with no enumerated call site (unlike the anchored half of this pair)
         # park
         (TaskStatus.IN_PROGRESS, TaskStatus.MERGE_DEFERRED),  # workflow.py:867/896
         # requeue
@@ -121,6 +122,7 @@ _UNION: frozenset[tuple[TaskStatus, TaskStatus]] = frozenset(
         (TaskStatus.IN_PROGRESS, TaskStatus.BLOCKED),  # _mark_blocked workflow.py:7758, retry-cap scheduler.py:4659, substrate harness.py:4687, dep harness.py:3905
         (TaskStatus.MERGE_DEFERRED, TaskStatus.BLOCKED),  # train failer workflow.py:6464
         (TaskStatus.DEFERRED, TaskStatus.BLOCKED),  # recon targeted.py:1041
+        (TaskStatus.PENDING, TaskStatus.BLOCKED),  # deterministic pure-gate born-at-L2 deterministic_runner.py:755/853; human block of a pending task is an out-of-band manual write with no enumerated call site (unlike the anchored half of this pair)
         # cancel — recon's any-non-terminal->cancelled (targeted.py:1001)
         # covers pending/blocked/deferred; harness.py:8417 covers the
         # orchestrator abandon path from in-progress/blocked.
