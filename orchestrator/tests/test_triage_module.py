@@ -122,7 +122,7 @@ class TestExtractTriageVerdict:
     def test_non_dict_envelope_returns_none(self):
         from orchestrator.agents.triage import extract_triage_verdict
 
-        assert extract_triage_verdict('not a dict') is None
+        assert extract_triage_verdict('not a dict') is None  # type: ignore[arg-type]
 
     def test_non_dict_verdict_returns_none(self):
         from orchestrator.agents.triage import extract_triage_verdict
