@@ -26,7 +26,7 @@ import random
 import sqlite3
 from collections import Counter
 from collections.abc import Awaitable, Callable
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, replace
 from pathlib import Path
 from typing import Any
 
@@ -394,12 +394,19 @@ class FrontierLabel:
 
     Never the recorded ticket decision (PRD D-6) -- always produced by the
     injected *frontier_proposer* seam in :func:`build_curator_corpus`.
+
+    ``cost_usd`` defaults to 0.0 (every hermetic test's injected fake
+    proposer leaves it unset) and is only ever populated by
+    :func:`propose_curator_label_frontier`'s real frontier call, which
+    stamps the actual ``invoke_agent`` spend onto the label it returns --
+    see that function's docstring.
     """
 
     action: str
     target_fingerprint: str | None = None
     target_id: str | None = None
     justification: str = ''
+    cost_usd: float = 0.0
 
 
 FrontierProposerFn = Callable[[dict], Awaitable[FrontierLabel]]
@@ -554,13 +561,19 @@ async def propose_curator_label_frontier(
     Build-time only -- never called from a hermetic test (those inject a
     fake ``FrontierProposerFn``). Mirrors
     ``reviewer_trial.mining.propose_labels_frontier``'s ``invoke_agent``
-    pattern: no tools, structured JSON output, cost always reported (see
-    ``result.cost_usd``, surfaced to CLI callers via ``__main__.py``).
+    pattern: no tools, structured JSON output, cost always reported --
+    unlike the reviewer_trial version (which returns a ``(issues, cost_usd)``
+    tuple), ``FrontierProposerFn`` is a plain ``Callable[[dict],
+    Awaitable[FrontierLabel]]``, so the cost is instead stamped onto the
+    returned label's ``FrontierLabel.cost_usd`` field. ``__main__.py``'s
+    ``build-curator-corpus`` command wraps this proposer to accumulate
+    ``cost_usd`` across every sampled candidate and prints the total.
 
     Never raises: an unparseable/malformed response degrades to
     ``action='create'`` -- the live curator's own best-effort fallback
     semantics (a spurious "create" is far cheaper to have in a corpus than
-    silently losing the candidate).
+    silently losing the candidate) -- but ``cost_usd`` is still populated on
+    that fallback label, since the tokens were billed regardless.
     """
     from orchestrator.agents.invoke import invoke_agent
 
@@ -601,6 +614,7 @@ justification. Output your decision as JSON.
         allowed_tools=[],  # no tools needed -- all context is in the prompt
         oauth_token=oauth_token,
     )
+    cost = result.cost_usd
 
     data = result.structured_output
     if not data:
@@ -615,8 +629,10 @@ justification. Output your decision as JSON.
 
     label = _parse_frontier_label(data)
     if label is None:
-        return FrontierLabel(action='create', justification='unparseable-frontier-output')
-    return label
+        return FrontierLabel(
+            action='create', justification='unparseable-frontier-output', cost_usd=cost,
+        )
+    return replace(label, cost_usd=cost)
 
 
 # ---------------------------------------------------------------------------

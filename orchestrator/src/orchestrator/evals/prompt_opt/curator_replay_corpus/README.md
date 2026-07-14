@@ -227,9 +227,12 @@ MAIN repo, not a task worktree). If `--db-path` doesn't point at a real
 file, the command fails fast with a clear error rather than letting
 `sqlite3` silently create an empty database.
 
-The command prints an `audit_curator_corpus` PASS/FAIL summary after
-writing the manifest/annotations/adjudication log, and exits non-zero on
-FAIL. Re-running with a different `--seed` reshuffles the sample and split;
+The command prints the total frontier labeling cost (summed from each
+sampled candidate's `FrontierLabel.cost_usd`, populated by
+`propose_curator_label_frontier`'s real `invoke_agent` call) and an
+`audit_curator_corpus` PASS/FAIL summary after writing the
+manifest/annotations/adjudication log, and exits non-zero on FAIL.
+Re-running with a different `--seed` reshuffles the sample and split;
 this command is a **full rebuild**, not an incremental `mine`-style resume
 (unlike `reviewer_trial mine`, tickets.db is a static historical replay
 source rather than a growing one, so there is no "new decisions since last

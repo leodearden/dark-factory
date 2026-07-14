@@ -14,9 +14,10 @@ module is operator-facing only -- every function it calls
 (build_curator_corpus, propose_curator_label_frontier, audit_curator_corpus)
 is already unit-tested hermetically against synthetic fixtures
 (test_prompt_opt_curator_corpus.py, never the real DB or a real LLM). This
-file adds no new runtime behavior of its own: it is thin wiring that adds
+file adds no new decision logic of its own: it is thin wiring that adds
 real I/O -- a real tickets.db path and real frontier-model calls -- around
-already-tested machinery.
+already-tested machinery, plus a CLI-local cost-accumulator closure (sums
+FrontierLabel.cost_usd across the run for the printed summary).
 """
 
 from __future__ import annotations
@@ -109,6 +110,7 @@ def build_curator_corpus_cmd(db_path: Path, n: int, seed: int, spot_check_size: 
     audit_curator_corpus PASS/FAIL summary and exits non-zero on FAIL.
     """
     from .curator_corpus import (
+        FrontierLabel,
         audit_curator_corpus,
         build_curator_corpus,
         propose_curator_label_frontier,
@@ -130,9 +132,21 @@ def build_curator_corpus_cmd(db_path: Path, n: int, seed: int, spot_check_size: 
         click.echo(click.style(f'Build Curator Corpus: n={n} seed={seed} db={db_path}', bold=True))
         click.echo('=' * 60)
 
+        # propose_curator_label_frontier reports spend on FrontierLabel.cost_usd
+        # rather than as a second return value (FrontierProposerFn's contract is
+        # a plain Callable[[dict], Awaitable[FrontierLabel]]) -- wrap it here to
+        # accumulate the total across every sampled candidate so operator spend
+        # is visible, not just implicitly billed.
+        cost_state = {'usd': 0.0}
+
+        async def _proposer_with_cost_tracking(candidate: dict) -> FrontierLabel:
+            label = await propose_curator_label_frontier(candidate)
+            cost_state['usd'] += label.cost_usd
+            return label
+
         manifest, log = await build_curator_corpus(
             db_path, n=n, seed=seed, spot_check_size=spot_check_size,
-            frontier_proposer=propose_curator_label_frontier,
+            frontier_proposer=_proposer_with_cost_tracking,
         )
 
         out.parent.mkdir(parents=True, exist_ok=True)
@@ -142,6 +156,7 @@ def build_curator_corpus_cmd(db_path: Path, n: int, seed: int, spot_check_size: 
 
         click.echo(f'  {len(manifest.items)} items labeled and written to {out}')
         click.echo(f'  Adjudication log: {adjudication_log_path}')
+        click.echo(f'  Frontier labeling cost: ${cost_state["usd"]:.2f}')
 
         report = audit_curator_corpus(manifest, log)
         click.echo()
