@@ -176,6 +176,9 @@ class QueueItem:
         (a gone/unlinked session) -- see resolve_target.
     handling: whether this item's key is in the app's in-memory "already
         acted on" set (stamped by order_queue's *handling* param).
+    escalation_id: the backing record's escalation_id, or None -- not
+        rendered by format_queue_row, but consumed by format_copy_payload
+        (the copy affordance, task 2517).
     """
 
     key: str
@@ -188,6 +191,7 @@ class QueueItem:
     score: float
     target: DisplayTarget | None
     handling: bool
+    escalation_id: str | None
 
 
 def _to_display_target(display: Display | None) -> DisplayTarget | None:
@@ -305,6 +309,7 @@ def order_queue(
                 score=score(scoring_item, priorities, now),
                 target=resolve_target(decision, sessions_by_slug),
                 handling=key in handling_set,
+                escalation_id=decision.escalation_id,
             )
         )
 
@@ -330,6 +335,7 @@ def order_queue(
                 score=score(scoring_item, priorities, now),
                 target=resolve_target(session, sessions_by_slug),
                 handling=key in handling_set,
+                escalation_id=session.escalation_id,
             )
         )
 
