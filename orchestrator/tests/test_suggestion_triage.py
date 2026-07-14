@@ -1068,6 +1068,27 @@ def _fake_agent_result(*, cost=0.5, turns=3, structured_output=None):
     return result
 
 
+def _write_triage_verdict(worktree: Path, triage_output: dict) -> None:
+    """Simulate the verdict-tools server's submit_triage tool call.
+
+    Writes the verdict envelope to *worktree*'s `.task-meta` meta-root — the
+    identical root _pre_triage_suggestions' read-side TaskArtifacts derives
+    via meta_root_for. Creates the meta-root dir first since
+    TaskArtifacts.write_verdict guards on root.is_dir() (it does not mkdir
+    the root itself, only verdicts/ under an existing root).
+    """
+    meta_root = TaskArtifacts.meta_root_for(worktree.parent, worktree.name)
+    meta_root.mkdir(parents=True, exist_ok=True)
+    envelope = {
+        'role': 'triage',
+        'schema_version': 1,
+        'session_id': 'sess-triage',
+        'emitted_at': '2026-07-14T00:00:00+00:00',
+        'verdict': triage_output,
+    }
+    TaskArtifacts(worktree, meta_root).write_verdict('triage', envelope)
+
+
 class TestPreTriageSuggestions:
     @pytest.mark.asyncio
     async def test_pre_triage_invoked_above_threshold(self):
@@ -1092,8 +1113,13 @@ class TestPreTriageSuggestions:
 
         esc = _make_escalation(detail=json.dumps(suggestions))
 
+        # Simulate the triage agent calling submit_triage: write the verdict
+        # artifact the steward's TaskArtifacts will read after the (mocked)
+        # invocation returns — replaces the old structured_output= kwarg.
+        _write_triage_verdict(steward.worktree, triage_output)
+
         with patch('orchestrator.steward.invoke_with_cap_retry',
-                   return_value=_fake_agent_result(structured_output=triage_output)):
+                   return_value=_fake_agent_result()):
             result = await steward._pre_triage_suggestions(esc)
 
         assert '## Pre-Triaged Results' in result.detail
@@ -1125,11 +1151,10 @@ class TestPreTriageSuggestions:
         suggestions = _make_suggestions(15)
         esc = _make_escalation(detail=json.dumps(suggestions))
 
-        # Triage returns no structured output
-        bad_result = _fake_agent_result(structured_output=None)
-        bad_result.success = False
-
-        with patch('orchestrator.steward.invoke_with_cap_retry', return_value=bad_result):
+        # No verdict written — simulates the agent never calling submit_triage
+        # (or the tool call failing), so read_verdict('triage') returns None.
+        with patch('orchestrator.steward.invoke_with_cap_retry',
+                   return_value=_fake_agent_result()):
             result = await steward._pre_triage_suggestions(esc)
 
         # Original escalation returned unchanged
@@ -1177,8 +1202,10 @@ class TestPreTriageSuggestions:
             ],
         }
 
+        _write_triage_verdict(steward.worktree, triage_output)
+
         with patch('orchestrator.steward.invoke_with_cap_retry',
-                   return_value=_fake_agent_result(structured_output=triage_output)):
+                   return_value=_fake_agent_result()):
             result = await steward._pre_triage_suggestions(esc)
 
         # Detail is replaced with pre-triaged markdown
