@@ -748,10 +748,12 @@ class BranchResetError(RuntimeError):
     unrelated tip) — nothing about the primitive's return value
     distinguishes "clean rebase, work retained" from "branch silently
     zeroed". :meth:`GitOps.rebase_preserving_task_commits` adds the missing
-    POST-CONDITION: if the branch carried commits beyond main before the
-    rebase (*n_before* > 0) and carries none after, the wipe is detected,
-    the pre-rebase HEAD is restored (via ``git reset --hard``) so the work
-    is not lost, and this is raised.
+    POST-CONDITION: if the branch carried commits beyond its rebase
+    baseline before the rebase (*n_before* > 0) and carries none after —
+    and that isn't just a patch-id dedup of work already applied there,
+    see the guard method's docstring — the wipe is detected and a
+    ``git reset --hard`` back to the pre-rebase HEAD is attempted before
+    this is raised.
 
     Subclasses ``RuntimeError`` — like :class:`WorktreeConflictError` — so
     it flows to ``TaskWorkflow.run()``'s shared ``except Exception``
@@ -761,7 +763,12 @@ class BranchResetError(RuntimeError):
     ``'Workflow error:'`` steward-routed path.
 
     ``worktree``/``onto``/``pre_rebase_head``/``n_before`` carry the
-    diagnostic context captured by the guard at raise time.
+    diagnostic context captured by the guard at raise time. ``restore_ok``
+    (default ``True``, kept for back-compat with existing direct
+    constructions e.g. in tests) records whether the recovery
+    ``git reset --hard`` itself actually succeeded — when it did NOT, the
+    work is not confirmed safe, and the message says so explicitly instead
+    of asserting the pre-rebase HEAD was restored.
     """
 
     def __init__(
@@ -770,15 +777,26 @@ class BranchResetError(RuntimeError):
         onto: str | None,
         pre_rebase_head: str,
         n_before: int,
+        restore_ok: bool = True,
     ):
         self.worktree = worktree
         self.onto = onto
         self.pre_rebase_head = pre_rebase_head
         self.n_before = n_before
+        self.restore_ok = restore_ok
+        if restore_ok:
+            restore_note = f'restored pre-rebase HEAD {pre_rebase_head}'
+        else:
+            restore_note = (
+                f'FAILED TO RESTORE pre-rebase HEAD {pre_rebase_head} — the '
+                f"recovery 'git reset --hard' itself failed, so the task's "
+                f'work may still be lost from the worktree; recover '
+                f'manually from git reflog before proceeding'
+            )
         super().__init__(
             f'Refusing requeue/inter-iteration rebase in {worktree}: it '
             f'would collapse the branch from {n_before} commit(s) over main '
-            f'to 0 (onto={onto}); restored pre-rebase HEAD {pre_rebase_head}'
+            f'to 0 (onto={onto}); {restore_note}'
         )
 
 
@@ -5444,15 +5462,26 @@ class GitOps:
 
         Wraps the plain ``rebase_onto_main`` primitive with a
         mechanism-independent POST-CONDITION check: capture how many commits
-        the branch carries beyond ``main`` BEFORE the rebase (*n_before*, via
-        ``rev-list --count <main>..HEAD``) and again AFTER (*n_after*). If the
-        rebase reports success but the branch had committed work that
-        vanished (``n_before > 0`` and ``n_after == 0``), something collapsed
-        the branch onto main's (or an unrelated) tip and silently destroyed
-        that work — restore the pre-rebase HEAD and raise
-        :class:`BranchResetError` instead of returning success.
+        the branch carries beyond a *baseline* ref BEFORE the rebase
+        (*n_before*, via ``rev-list --count <baseline>..HEAD``) and again
+        AFTER (*n_after*). If the rebase reports success but the branch had
+        committed work that vanished (``n_before > 0`` and ``n_after == 0``)
+        and that isn't just a patch-id dedup of work already applied at the
+        baseline (see below), something collapsed the branch onto the
+        baseline's (or an unrelated) tip and silently destroyed that work —
+        restore the pre-rebase HEAD and raise :class:`BranchResetError`
+        instead of returning success.
 
-        This is the ONLY difference from :meth:`rebase_onto_main`:
+        The baseline is ``onto`` when the caller passes one — resolved to a
+        concrete sha *before* the rebase runs, so a moving ref can't skew
+        the pre/post comparison — else ``main``. This matters for stacked
+        train members (``onto=<predecessor sha>``): measuring against main
+        unconditionally would under-count there, since the predecessor's own
+        commits are already ahead of main *before* this branch's commits are
+        added — a wipe of just this branch's own delta would still leave
+        ``n_after`` (over main) > 0 and the guard would never fire.
+
+        This is the difference from :meth:`rebase_onto_main`:
         * A real conflict (``rebase_onto_main`` returns ``False``) is
           returned unchanged — the caller's existing conflict handling is
           untouched.
@@ -5461,6 +5490,16 @@ class GitOps:
           wipe of existing work, never on an empty branch.
         * A partial drop (``n_after > 0`` but less than *n_before*) does NOT
           fire — only the total wipe does.
+        * A total wipe (``n_after == 0``) is still not automatically treated
+          as a reset: if every one of the branch's pre-rebase commits is
+          patch-id-equivalent to a commit already applied at the baseline
+          (per ``git cherry``) — e.g. a re-dispatched task whose work
+          previously landed, or cherry-picked content — ``git rebase``
+          legitimately skipped replaying them; that's a dedup, not a wipe,
+          and the guard returns ``True`` without touching HEAD. Any
+          uncertainty in that determination (the ``git cherry`` call itself
+          failing, or producing no output) fails toward treating it as a
+          wipe rather than silently trusting it.
         * Both commit counts fail-safe to ``0`` on a git error or unparseable
           output (mirroring the ``rev-list --count`` + int-parse idiom used
           by ``get_rebase_distance``/``_branch_has_commits_beyond_main``): an
@@ -5469,6 +5508,11 @@ class GitOps:
           unmeasurable *n_after* is treated the same as a confirmed wipe
           (fail toward restoring + escalating rather than silently trusting
           an unreadable post-state).
+        * The recovery ``git reset --hard`` back to the pre-rebase HEAD is
+          itself best-effort: if it fails too, :class:`BranchResetError` is
+          still raised, but with ``restore_ok=False`` so the resulting
+          escalation says so explicitly rather than asserting the work is
+          safe.
 
         Callers: the three WIP-save requeue/inter-iteration rebase sites
         (``TaskWorkflow._inter_iteration_rebase``, ``GitOps.create_worktree``'s
@@ -5479,11 +5523,17 @@ class GitOps:
         unguarded primitive directly — see this task's design decisions for
         why an unconditional guard on the primitive itself would be wrong.
         """
+        baseline_ref = onto if onto is not None else self.config.main_branch
+        rc, baseline_out, _ = await _run(
+            ['git', 'rev-parse', baseline_ref], cwd=worktree,
+        )
+        baseline_sha = baseline_out.strip() if rc == 0 else baseline_ref
+
         rc, head_out, _ = await _run(['git', 'rev-parse', 'HEAD'], cwd=worktree)
         pre_rebase_head = head_out.strip() if rc == 0 else ''
 
         rc, before_out, _ = await _run(
-            ['git', 'rev-list', '--count', f'{self.config.main_branch}..HEAD'],
+            ['git', 'rev-list', '--count', f'{baseline_sha}..HEAD'],
             cwd=worktree,
         )
         try:
@@ -5497,7 +5547,7 @@ class GitOps:
 
         if n_before > 0:
             rc, after_out, _ = await _run(
-                ['git', 'rev-list', '--count', f'{self.config.main_branch}..HEAD'],
+                ['git', 'rev-list', '--count', f'{baseline_sha}..HEAD'],
                 cwd=worktree,
             )
             try:
@@ -5505,8 +5555,46 @@ class GitOps:
             except ValueError:
                 n_after = 0
             if n_after == 0:
-                await _run(['git', 'reset', '--hard', pre_rebase_head], cwd=worktree)
-                raise BranchResetError(worktree, onto, pre_rebase_head, n_before)
+                # Candidate wipe — but a rebase that legitimately dedups
+                # against patch-equivalent commits already applied at the
+                # baseline also collapses commits-over-baseline to zero.
+                # `git cherry` marks each pre-rebase commit '-' (already
+                # applied at baseline_sha) or '+' (genuinely unique); only
+                # a confirmed all-'-' result exempts this from being
+                # treated as a wipe.
+                rc, cherry_out, _ = await _run(
+                    ['git', 'cherry', baseline_sha, pre_rebase_head], cwd=worktree,
+                )
+                cherry_lines = cherry_out.strip().splitlines() if rc == 0 else []
+                already_landed = bool(cherry_lines) and all(
+                    line.startswith('-') for line in cherry_lines
+                )
+                if already_landed:
+                    logger.info(
+                        'rebase_preserving_task_commits: %s collapsed to 0 '
+                        'commits over baseline %s but all %d pre-rebase '
+                        "commit(s) are patch-id dedups already applied "
+                        'there — treating as a legitimate rebase, not a '
+                        'wipe',
+                        worktree, baseline_sha, n_before,
+                    )
+                    return True
+
+                reset_rc, _, reset_err = await _run(
+                    ['git', 'reset', '--hard', pre_rebase_head], cwd=worktree,
+                )
+                if reset_rc != 0:
+                    logger.error(
+                        'rebase_preserving_task_commits: failed to restore '
+                        'pre-rebase HEAD %s in %s after detecting a wipe '
+                        '(git reset --hard rc=%s: %s) — the task\'s work may '
+                        'be unrecoverable from the worktree; check git reflog',
+                        pre_rebase_head, worktree, reset_rc, reset_err,
+                    )
+                raise BranchResetError(
+                    worktree, onto, pre_rebase_head, n_before,
+                    restore_ok=reset_rc == 0,
+                )
 
         return True
 
