@@ -42,6 +42,7 @@ _mod = _load_module()
 find_near_duplicate_memory_groups = _mod.find_near_duplicate_memory_groups
 pick_survivor = _mod.pick_survivor
 build_sweep_plan = _mod.build_sweep_plan
+fetch_procedural_memories = _mod.fetch_procedural_memories
 
 
 # ---------------------------------------------------------------------------
@@ -379,3 +380,106 @@ class TestBuildSweepPlanJsonSerializable:
         plan = build_sweep_plan(memories, threshold=_THRESHOLD)
         serialized = json.dumps(plan, default=str)
         assert isinstance(serialized, str)
+
+
+# ===========================================================================
+# Step-7: fetch_procedural_memories
+# ===========================================================================
+
+def _raw_record(id: str, created_at: str | None, metadata: dict) -> dict:
+    """Build a scroll_by_metadata()-shaped raw record (mirrors Mem0Backend's
+    {'id', 'created_at', 'metadata'} return shape, where 'metadata' is the
+    full Qdrant payload dict)."""
+    return {'id': id, 'created_at': created_at, 'metadata': metadata}
+
+
+@pytest.mark.asyncio
+class TestFetchProceduralMemoriesCallShape:
+    """scroll_by_metadata is called with the category filter and scan_limit."""
+
+    async def test_called_with_category_filter_and_scan_limit(self):
+        from unittest.mock import AsyncMock, MagicMock  # noqa: PLC0415
+
+        memory = MagicMock()
+        memory.mem0 = MagicMock()
+        memory.mem0.scroll_by_metadata = AsyncMock(return_value=[])
+
+        await fetch_procedural_memories(memory, 'dark_factory', scan_limit=1234)
+
+        memory.mem0.scroll_by_metadata.assert_awaited_once()
+        call = memory.mem0.scroll_by_metadata.call_args
+        assert call.args[0].project_id == 'dark_factory'
+        assert call.args[1] == {'category': 'procedural_knowledge'}
+        assert call.kwargs.get('limit') == 1234
+
+
+@pytest.mark.asyncio
+class TestFetchProceduralMemoriesNormalization:
+    """Raw records are normalized to {'id','content','created_at','metadata'}."""
+
+    async def test_content_extracted_from_memory_key(self):
+        from unittest.mock import AsyncMock, MagicMock  # noqa: PLC0415
+
+        raw = [_raw_record(
+            'm1', '2026-07-12T00:00:00+00:00',
+            {'memory': 'gotcha text', 'category': 'procedural_knowledge'},
+        )]
+        memory = MagicMock()
+        memory.mem0 = MagicMock()
+        memory.mem0.scroll_by_metadata = AsyncMock(return_value=raw)
+
+        result = await fetch_procedural_memories(memory, 'dark_factory', scan_limit=100)
+
+        assert result == [{
+            'id': 'm1',
+            'content': 'gotcha text',
+            'created_at': '2026-07-12T00:00:00+00:00',
+            'metadata': {'memory': 'gotcha text', 'category': 'procedural_knowledge'},
+        }]
+
+    async def test_content_extracted_from_data_key(self):
+        from unittest.mock import AsyncMock, MagicMock  # noqa: PLC0415
+
+        raw = [_raw_record('m2', None, {'data': 'gotcha text v2'})]
+        memory = MagicMock()
+        memory.mem0 = MagicMock()
+        memory.mem0.scroll_by_metadata = AsyncMock(return_value=raw)
+
+        result = await fetch_procedural_memories(memory, 'dark_factory', scan_limit=100)
+
+        assert result[0]['content'] == 'gotcha text v2'
+        assert result[0]['id'] == 'm2'
+        assert result[0]['created_at'] is None
+
+
+@pytest.mark.asyncio
+class TestFetchProceduralMemoriesSafeDegradation:
+    """A record with no extractable content normalizes to content=''."""
+
+    async def test_no_extractable_content_degrades_to_empty_string(self):
+        from unittest.mock import AsyncMock, MagicMock  # noqa: PLC0415
+
+        raw = [_raw_record('m3', '2026-07-12T00:00:00+00:00', {'unrelated_field': 'x'})]
+        memory = MagicMock()
+        memory.mem0 = MagicMock()
+        memory.mem0.scroll_by_metadata = AsyncMock(return_value=raw)
+
+        result = await fetch_procedural_memories(memory, 'dark_factory', scan_limit=100)
+
+        assert result[0]['content'] == ''
+
+
+@pytest.mark.asyncio
+class TestFetchProceduralMemoriesEmptyScan:
+    """An empty/[] scan returns []."""
+
+    async def test_empty_scan_returns_empty_list(self):
+        from unittest.mock import AsyncMock, MagicMock  # noqa: PLC0415
+
+        memory = MagicMock()
+        memory.mem0 = MagicMock()
+        memory.mem0.scroll_by_metadata = AsyncMock(return_value=[])
+
+        result = await fetch_procedural_memories(memory, 'dark_factory', scan_limit=100)
+
+        assert result == []
