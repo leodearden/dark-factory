@@ -430,6 +430,64 @@ def _is_bare_xdist_worker_crash(output: str) -> bool:
     )
 
 
+# Pytest node-id extraction for the main-tip-sweep isolated-rerun confirm gate
+# (task 2370). Two failure surfaces produce a recoverable node-id:
+#   1. A genuine assertion/collection failure: the ``FAILED <nodeid>`` summary
+#      line pytest prints per failing test (optionally followed by a trailing
+#      `` - <reason>``, e.g. `` - AssertionError: ...``).
+#   2. An xdist worker crash (task 1907's --max-worker-restart=0): either an
+#      explicit ``crashed while running '<nodeid>'`` notice, or — when that
+#      phrasing is absent — the in-progress ``<nodeid>`` line pytest-xdist
+#      prints immediately before reporting ``[gwN] node down: Not properly
+#      terminated`` for the worker that was running it.
+# All three patterns are anchored/multiline like the _PYTEST_* patterns above
+# so they don't false-match indented traceback prose.
+_FAILED_LINE_NODEID_RE = re.compile(r'^FAILED\s+(\S+\.py::\S+)', re.MULTILINE)
+_XDIST_CRASH_NODEID_RE = re.compile(
+    r"crashed while running '?([^'\s]+\.py::[^'\s]+)'?", re.MULTILINE,
+)
+_XDIST_NODE_DOWN_PRECEDING_NODEID_RE = re.compile(
+    r'^(\S+\.py::\S+?)\s*\n\[gw\d+\] node down: Not properly terminated',
+    re.MULTILINE,
+)
+
+
+def _extract_failing_test_ids(test_output: str) -> list[str]:
+    """Extract pytest node-ids of failing/crashed tests from *test_output*.
+
+    Scans for the two failure surfaces documented above the module-level
+    patterns: ``FAILED <nodeid>`` summary lines, and xdist worker-crash
+    notices (both the explicit ``crashed while running '<nodeid>'`` phrasing
+    and the in-progress ``<nodeid>`` line immediately preceding a ``node
+    down: Not properly terminated`` marker).
+
+    Returns node-ids in first-seen (leftmost-match) order, de-duplicated.
+    Returns ``[]`` for falsy *test_output* or output with no recoverable
+    node-id (a non-test failure such as a lint/type error block, or a
+    worker-crash notice with no adjacent node-id) — the caller
+    (``confirm_main_tip_failure_is_real``) treats an empty list as
+    "unconfirmable" and fails safe to alarm rather than guessing.
+    """
+    if not test_output:
+        return []
+    matches: list[tuple[int, str]] = []
+    for pattern in (
+        _FAILED_LINE_NODEID_RE,
+        _XDIST_CRASH_NODEID_RE,
+        _XDIST_NODE_DOWN_PRECEDING_NODEID_RE,
+    ):
+        for m in pattern.finditer(test_output):
+            matches.append((m.start(1), m.group(1)))
+    matches.sort(key=lambda item: item[0])
+    seen: set[str] = set()
+    ordered: list[str] = []
+    for _, node_id in matches:
+        if node_id not in seen:
+            seen.add(node_id)
+            ordered.append(node_id)
+    return ordered
+
+
 def _extract_cause_hint(output: str) -> str:
     """Extract a one-line failure hint from command output.
 
