@@ -2977,6 +2977,123 @@ class TestWorkingTreeSync:
             for c in recorded
         ), f'update-ref not called after failed mark; commands: {recorded}'
 
+    async def test_preexisting_user_stash_survives_advance(self, git_ops: GitOps):
+        """A pre-existing human stash entry survives a full merge+advance untouched.
+
+        The merge worker parks its own WIP on MERGE_PARK_REF, never the
+        shared refs/stash stack — a human's stash@{0} (created before the
+        worker ever runs) must be byte-identical before and after.
+        """
+        # Establish a second tracked file on main so the "human" stash and
+        # the "worker" WIP below can dirty two independent tracked files.
+        (git_ops.project_root / 'human_target.py').write_text('human = False\n')
+        await _run(['git', 'add', 'human_target.py'], cwd=git_ops.project_root)
+        await _run(
+            ['git', 'commit', '-m', 'Add human_target.py'], cwd=git_ops.project_root,
+        )
+
+        # Human stashes a change to human_target.py on the SHARED stash stack.
+        (git_ops.project_root / 'human_target.py').write_text('human = True\n')
+        await _run(['git', 'stash', 'push', '-m', 'human'], cwd=git_ops.project_root)
+        _, stash_before, _ = await _run(
+            ['git', 'stash', 'list'], cwd=git_ops.project_root,
+        )
+        assert stash_before.strip(), 'expected the human stash entry to exist'
+
+        # The merge worker now dirties a DIFFERENT, non-overlapping tracked
+        # file (README.md) — this is the WIP the worker will park.
+        (git_ops.project_root / 'README.md').write_text('# worker WIP\n')
+
+        result = await self._merge_and_advance(
+            git_ops, 'human-stash-survives', 'disjoint_merge_file.py', 'merged = True\n',
+        )
+        assert result.result == 'advanced'
+
+        # Merged file landed on main
+        assert (git_ops.project_root / 'disjoint_merge_file.py').exists()
+
+        # Worker WIP restored
+        assert '# worker WIP' in (git_ops.project_root / 'README.md').read_text()
+
+        # The human's stash entry is byte-identical before/after — the
+        # worker never touched the shared stack.
+        _, stash_after, _ = await _run(
+            ['git', 'stash', 'list'], cwd=git_ops.project_root,
+        )
+        assert stash_after.strip() == stash_before.strip(), (
+            'pre-existing human stash entry must survive the merge worker untouched'
+        )
+
+    async def test_worker_wip_roundtrips_via_private_ref(self, git_ops: GitOps):
+        """Worker WIP round-trips exactly via MERGE_PARK_REF, cleaned up afterward."""
+        wip_content = '# exact roundtrip content\n'
+        (git_ops.project_root / 'README.md').write_text(wip_content)
+
+        result = await self._merge_and_advance(
+            git_ops, 'wip-roundtrip', 'roundtrip_file.py', 'roundtrip = True\n',
+        )
+        assert result.result == 'advanced'
+
+        # WIP content restored EXACTLY
+        assert (git_ops.project_root / 'README.md').read_text() == wip_content
+
+        # MERGE_PARK_REF is gone after a successful round-trip
+        rc, _, _ = await _run(
+            ['git', 'rev-parse', '--verify', '--quiet', 'refs/dark-factory/merge-park'],
+            cwd=git_ops.project_root,
+        )
+        assert rc != 0, 'expected refs/dark-factory/merge-park to be absent after advance'
+
+        # The shared stash stack was never touched
+        _, stash_list, _ = await _run(
+            ['git', 'stash', 'list'], cwd=git_ops.project_root,
+        )
+        assert stash_list.strip() == ''
+
+    async def test_advance_stale_merge_park_ref_halts_without_overwrite(
+        self, git_ops: GitOps,
+    ):
+        """A stale MERGE_PARK_REF halts advance_main ('stash_failed') without being overwritten."""
+        _, head_sha, _ = await _run(['git', 'rev-parse', 'HEAD'], cwd=git_ops.project_root)
+        head_sha = head_sha.strip()
+
+        # Pre-create the private ref at a KNOWN sha (simulating a stale
+        # crash-leftover ref from a prior, unrecovered park).
+        await _run(
+            ['git', 'update-ref', 'refs/dark-factory/merge-park', head_sha],
+            cwd=git_ops.project_root,
+        )
+
+        _, main_before, _ = await _run(['git', 'rev-parse', 'main'], cwd=git_ops.project_root)
+
+        # Create a valid merge commit that could be advanced.
+        wt = await git_ops.create_worktree('stale-park-halt')
+        (wt.path / 'stale_park.py').write_text('x = 1\n')
+        await git_ops.commit(wt.path, 'Add stale_park')
+        merge_result = await git_ops.merge_to_main(wt.path, 'stale-park-halt')
+        assert merge_result.success
+        assert merge_result.merge_commit is not None
+        assert merge_result.merge_worktree is not None
+
+        # Dirty a tracked file so the working-tree protection block (and
+        # thus the park attempt) is armed.
+        (git_ops.project_root / 'README.md').write_text('# WIP racing a stale park ref\n')
+
+        result = await git_ops.advance_main(merge_result.merge_commit)
+        await git_ops.cleanup_merge_worktree(merge_result.merge_worktree)
+
+        assert result.result == 'stash_failed'
+
+        # The stale ref must be UNCHANGED — never overwritten.
+        _, ref_after, _ = await _run(
+            ['git', 'rev-parse', 'refs/dark-factory/merge-park'], cwd=git_ops.project_root,
+        )
+        assert ref_after.strip() == head_sha, 'stale merge-park ref must never be overwritten'
+
+        # Main ref must NOT have moved.
+        _, main_after, _ = await _run(['git', 'rev-parse', 'main'], cwd=git_ops.project_root)
+        assert main_before.strip() == main_after.strip()
+
 
 @pytest.mark.asyncio
 class TestAdvanceMainConflictMarkerGate:
