@@ -1924,9 +1924,20 @@ async def _run_post_merge_verify(
         # subsequently-confirmed pre-existing main break would leave this
         # task's blocked outcome misattributing the break to the task
         # itself with no signal that a reclassification is in flight.
+        #
+        # HOST-AFFINITY (task 2565): record — but do not steer by — where
+        # the triggering post-merge verify ran.  `runner` is None for a
+        # local lease and a RemoteRunner (is_local=False) for a remote
+        # lease; getattr's True default covers any future runner-like
+        # object that omits is_local.  The probe itself always classifies
+        # locally (it is leaseless and never remote-affine — see
+        # verify_failure_is_preexisting_on_main); this only makes the
+        # placement decision observable in the main_health_red telemetry.
+        origin_is_local = runner is None or getattr(runner, 'is_local', True)
         probe_pending = _spawn_main_health_probe(
             main_health_probe_handles, git_ops, req, verify,
             escalation_queue=escalation_queue, event_store=event_store,
+            origin_is_local=origin_is_local,
         )
         if probe_pending:
             reason = f'{reason}\n\n[{MAIN_HEALTH_PROBE_PENDING_NOTE}]'
