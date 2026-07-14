@@ -18,12 +18,13 @@ decisions for the point-by-point mirror rationale.
 from __future__ import annotations
 
 from pathlib import Path
+from unittest.mock import AsyncMock
 
 import pytest
 from _recording_event_store import _RecordingEventStore
 from pydantic import ValidationError
 
-from orchestrator.config import DeliveredChecksConfig, OrchestratorConfig, RELOADABLE_FIELDS
+from orchestrator.config import RELOADABLE_FIELDS, DeliveredChecksConfig, OrchestratorConfig
 from orchestrator.delivered_checks import DeliveredCheckResult, run_delivered_check
 from orchestrator.event_store import EventType
 from orchestrator.scheduler import Scheduler, TickContext
@@ -824,3 +825,196 @@ class TestComputeDeliveredCheckCache:
         assert scheduler._streak_delivered_hold.value('10') == 0
         assert ('20', 'sha1') not in scheduler._delivered_check_cache
         assert ('20', 'sha2') in scheduler._delivered_check_cache
+
+
+# ---------------------------------------------------------------------------
+# TestAcquireNextDeliveredGate (task 2580 — step-17 RED / step-18 GREEN)
+# ---------------------------------------------------------------------------
+
+
+class TestAcquireNextDeliveredGate:
+    """``acquire_next`` wires the delivered-check dep-gate end-to-end: one
+    per-tick sweep, correct dispatch decisions.  Mirrors
+    ``TestAcquireNextExternalDepGate`` (test_scheduler.py) but for a LOCAL
+    dep carrying ``metadata.delivered_checks`` instead of a cross-project
+    external dep.
+
+    Boundary rows under test (plans/capability-delivered-checks-prd.md
+    §Boundary):
+    - row 3 (transparent): done dep, check resolves DELIVERED → dispatched.
+    - row 4 (headline): done dep, check resolves FAILED → NOT dispatched,
+      a ``delivered_check_gate_held`` event is recorded, streak bumps.
+    - row 6 (headline): a withheld dep self-heals once main advances to a
+      SHA where the check now resolves DELIVERED → dispatched next tick,
+      hold streak clears.
+    - row 7: a runner ERROR withholds fail-safe with NO hold event/streak
+      bump that tick; once the runner recovers, the dependent dispatches.
+
+    Task delta (2580) has no grace-streak escalation counter or callback
+    yet — task epsilon (2583) layers that on top — so there is no
+    ``on_*_block``-style callback to assert on here; the only per-tick
+    contract is withhold + ``_note_delivered_hold`` visibility.
+    """
+
+    @pytest.fixture
+    def scheduler(self) -> Scheduler:
+        config = OrchestratorConfig(max_per_module=2)
+        scheduler = Scheduler(config, event_store=_RecordingEventStore())  # type: ignore[arg-type]
+        scheduler.finish_startup()
+        return scheduler
+
+    _CHECKS = [{'name': 'cap-one', 'kind': 'grep', 'pattern': 'foo', 'expect': 'present'}]
+
+    def _dep(self, dep_id: str = '20', status: str = 'done') -> dict:
+        return {
+            'id': dep_id,
+            'status': status,
+            'dependencies': [],
+            'metadata': {'delivered_checks': self._CHECKS},
+        }
+
+    def _dependent(self, tid: str = '10', dep_id: str = '20') -> dict:
+        return {
+            'id': tid,
+            'title': f'Task {tid}',
+            'status': 'pending',
+            'dependencies': [{'id': dep_id}],
+            'metadata': {'files': ['backend']},
+        }
+
+    def _held_events(self, scheduler: Scheduler) -> list[tuple[str, dict]]:
+        _event_store = scheduler.event_store
+        assert _event_store is not None
+        return [
+            (evt, data)
+            for evt, data in _event_store.events  # type: ignore[attr-defined]
+            if evt == str(EventType.delivered_check_gate_held)
+        ]
+
+    def _fake_sha(self, sha: str = 'sha1'):
+        async def _resolve():
+            return sha
+
+        return _resolve
+
+    def _fake_runner(self, outcome):
+        """Fake ``run_delivered_check`` returning (or raising) *outcome* for
+        every check it's invoked with."""
+
+        async def _fake(check, *, project_root, ref='main'):
+            if isinstance(outcome, Exception):
+                raise outcome
+            return outcome
+
+        return _fake
+
+    # --- row 3 (transparent): check DELIVERED -> dispatched, no hold -------
+
+    @pytest.mark.asyncio
+    async def test_row3_check_delivered_dispatches(self, scheduler: Scheduler, monkeypatch):
+        scheduler.get_tasks = AsyncMock(return_value=[self._dep(), self._dependent()])
+        scheduler._resolve_main_sha = self._fake_sha('sha1')
+        monkeypatch.setattr(
+            'orchestrator.scheduler.run_delivered_check',
+            self._fake_runner(DeliveredCheckResult.DELIVERED),
+        )
+
+        result = await scheduler.acquire_next()
+
+        assert result is not None and result.task_id == '10', (
+            f'Delivered check → should dispatch; got {result!r}'
+        )
+        assert self._held_events(scheduler) == []
+
+    # --- row 4 (headline): check FAILED -> withheld + hold event -----------
+
+    @pytest.mark.asyncio
+    async def test_row4_check_failed_not_dispatched_holds(
+        self, scheduler: Scheduler, monkeypatch
+    ):
+        scheduler.get_tasks = AsyncMock(return_value=[self._dep(), self._dependent()])
+        scheduler._resolve_main_sha = self._fake_sha('sha1')
+        monkeypatch.setattr(
+            'orchestrator.scheduler.run_delivered_check',
+            self._fake_runner(DeliveredCheckResult.FAILED),
+        )
+
+        result = await scheduler.acquire_next()
+
+        assert result is None, f'Failed check → must NOT dispatch; got {result!r}'
+        assert scheduler._streak_delivered_hold.value('10') == 1
+        held = self._held_events(scheduler)
+        assert len(held) == 1
+        _evt, data = held[0]
+        assert data['task_id'] == '10'
+        assert data['data']['detail'] == {
+            'name': 'cap-one', 'dep_id': '20', 'main_sha': 'sha1', 'kind': 'grep',
+        }
+
+    # --- row 6 (headline): SHA advance self-heals ---------------------------
+
+    @pytest.mark.asyncio
+    async def test_row6_sha_advance_self_heals_dispatches_next_tick(
+        self, scheduler: Scheduler, monkeypatch
+    ):
+        scheduler.get_tasks = AsyncMock(return_value=[self._dep(), self._dependent()])
+        sha_box = {'value': 'sha1'}
+
+        async def _resolve():
+            return sha_box['value']
+
+        scheduler._resolve_main_sha = _resolve
+        monkeypatch.setattr(
+            'orchestrator.scheduler.run_delivered_check',
+            self._fake_runner(DeliveredCheckResult.FAILED),
+        )
+
+        first = await scheduler.acquire_next()
+        assert first is None
+        assert scheduler._streak_delivered_hold.value('10') == 1
+        assert len(self._held_events(scheduler)) == 1
+
+        # Main advances; a new commit makes the check now resolve DELIVERED.
+        sha_box['value'] = 'sha2'
+        monkeypatch.setattr(
+            'orchestrator.scheduler.run_delivered_check',
+            self._fake_runner(DeliveredCheckResult.DELIVERED),
+        )
+
+        second = await scheduler.acquire_next()
+
+        assert second is not None and second.task_id == '10', (
+            f'Self-heal on new main SHA → should dispatch; got {second!r}'
+        )
+        assert scheduler._streak_delivered_hold.value('10') == 0
+
+    # --- row 7: runner ERRORED -> fail-safe withhold, no hold/streak -------
+
+    @pytest.mark.asyncio
+    async def test_row7_runner_errored_withheld_then_dispatches_once_healthy(
+        self, scheduler: Scheduler, monkeypatch
+    ):
+        scheduler.get_tasks = AsyncMock(return_value=[self._dep(), self._dependent()])
+        scheduler._resolve_main_sha = self._fake_sha('sha1')
+        monkeypatch.setattr(
+            'orchestrator.scheduler.run_delivered_check',
+            self._fake_runner(DeliveredCheckResult.ERRORED),
+        )
+
+        first = await scheduler.acquire_next()
+
+        assert first is None, f'Runner error → must NOT dispatch; got {first!r}'
+        assert self._held_events(scheduler) == []
+        assert scheduler._streak_delivered_hold.value('10') == 0
+
+        # The runner recovers on the next tick.
+        monkeypatch.setattr(
+            'orchestrator.scheduler.run_delivered_check',
+            self._fake_runner(DeliveredCheckResult.DELIVERED),
+        )
+
+        second = await scheduler.acquire_next()
+
+        assert second is not None and second.task_id == '10', (
+            f'Runner recovered → should dispatch; got {second!r}'
+        )
