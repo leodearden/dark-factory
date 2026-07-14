@@ -134,18 +134,33 @@ restart_and_verify() {
 }
 
 drain_check_verdict() {
-    # $1 = unit name.  Prints one of idle/busy/stale/absent to stdout.  If
-    # the python3 invocation itself fails to exit 0 (e.g. python3 missing
-    # from PATH, or a future drain_check.py change that raises before
-    # printing a verdict), that failure is caught here and treated as
-    # "absent" -- fail-toward-convergence, same as an unreadable heartbeat
-    # file -- rather than aborting the entire restart-all run under
-    # `set -e`.  The drain gate must not become a hard dependency on
-    # python3 always exiting cleanly in the deploy environment.  stderr is
-    # left unsuppressed so a real failure is still visible in the script's
-    # own output.
-    python3 "$SCRIPT_DIR/drain_check.py" --unit "$1" --fleet-dir "$FLEET_DIR" \
-        --fresh-window "$DRAIN_FRESH_WINDOW_SECS" || echo absent
+    # $1 = unit name.  Prints exactly one of idle/busy/stale/absent to
+    # stdout -- never more, never less -- regardless of what drain_check.py
+    # itself produced.  If the python3 invocation fails to exit 0 (e.g.
+    # python3 missing from PATH, or a future drain_check.py change that
+    # raises before -- or after partially printing -- a verdict), any
+    # output it did produce is discarded and the result is "absent" --
+    # fail-toward-convergence, same as an unreadable heartbeat file --
+    # rather than aborting the entire restart-all run under `set -e`.  If
+    # it exits 0 but the captured output is not exactly one recognized
+    # token (e.g. a future change emits a partial token plus a trailing
+    # line), that is ALSO coerced to "absent" rather than trusted verbatim,
+    # so a malformed or multi-line reading can't silently misclassify the
+    # downstream idle/busy/stale/absent string comparisons.  The drain gate
+    # must not become a hard dependency on drain_check.py always behaving.
+    # stderr is left unsuppressed so a real failure is still visible in the
+    # script's own output.
+    local raw
+    raw="$(python3 "$SCRIPT_DIR/drain_check.py" --unit "$1" --fleet-dir "$FLEET_DIR" \
+        --fresh-window "$DRAIN_FRESH_WINDOW_SECS")" || raw="absent"
+    case "$raw" in
+        idle|busy|stale|absent)
+            printf '%s\n' "$raw"
+            ;;
+        *)
+            printf '%s\n' "absent"
+            ;;
+    esac
 }
 
 drain_await_fresh() {
