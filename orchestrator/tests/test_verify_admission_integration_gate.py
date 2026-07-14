@@ -784,3 +784,107 @@ class TestSelfHeal:
             if holder is not None:
                 holder.kill()
                 holder.wait(timeout=5)
+
+
+# ---------------------------------------------------------------------------
+# Scenario 6 — FAIL-OPEN
+# ---------------------------------------------------------------------------
+
+
+class TestFailOpen:
+    """PRD Boundary-test sketch scenario 6: neither admission being disabled
+    nor a ``slots_dir`` that cannot be created ever blocks a verify —
+    T2's ``_verify_admission_active`` / ``_admission_slot`` fail-open paths
+    (C-fail-open, layered on top of T1's own acquire fail-open contract).
+    """
+
+    @pytest.mark.real_verify_admission
+    @pytest.mark.asyncio
+    async def test_admission_disabled_never_acquires_and_cmd_is_unwrapped(self, tmp_path):
+        slots_dir = tmp_path / 'slots'
+        config = OrchestratorConfig(
+            verify_admission_slots_dir=str(slots_dir),
+            verify_admission_task_slots=1,
+            verify_admission_enabled=False,
+        )
+        worktree = tmp_path / 'wt'
+        worktree.mkdir()
+
+        spy = _RunCmdSpy()
+        with (
+            patch('orchestrator.verify._run_cmd', new=spy),
+            patch('orchestrator.verify.acquire_task_slot') as mock_acquire,
+        ):
+            result = await run_verification(
+                worktree=worktree,
+                config=config,
+                module_config=_module_config(),
+                role='task',
+                attempt_id=None,
+            )
+
+        mock_acquire.assert_not_called()
+        assert not slots_dir.exists(), (
+            'expected slots_dir to never be created when admission is disabled'
+        )
+
+        legs = {c['leg'] for c in spy.calls}
+        assert legs == {'test', 'lint', 'type'}, (
+            f'expected all three legs to run; got legs={legs!r}'
+        )
+        test_calls = [c for c in spy.calls if c['leg'] == 'test']
+        assert len(test_calls) == 1
+        assert test_calls[0]['cmd'] == _TEST_CMD, (
+            f'expected the byte-identical, unwrapped (ungated) test-leg cmd; '
+            f'got {test_calls[0]["cmd"]!r}'
+        )
+        assert result.passed
+
+    @pytest.mark.real_verify_admission
+    @pytest.mark.asyncio
+    async def test_unmkdirable_slots_dir_fails_open_and_verify_still_passes(self, tmp_path):
+        # slots_dir's PARENT path component is a regular file, not a missing
+        # directory — `slots_dir.mkdir(parents=True, exist_ok=True)` inside
+        # _admission_slot raises NotADirectoryError (an OSError), exercising
+        # the same fail-open `except OSError: cm = None` path a real
+        # permission error or read-only filesystem would hit.
+        blocker = tmp_path / 'blocker'
+        blocker.write_text('not a directory')
+        slots_dir = blocker / 'slots'
+        config = OrchestratorConfig(
+            verify_admission_slots_dir=str(slots_dir),
+            verify_admission_task_slots=1,
+        )
+        worktree = tmp_path / 'wt'
+        worktree.mkdir()
+
+        spy = _RunCmdSpy()
+        # REAL acquire_task_slot (not mocked) — only _run_cmd is patched, so
+        # the mkdir failure is exercised against the real _admission_slot
+        # seam, not a stand-in.
+        with patch('orchestrator.verify._run_cmd', new=spy):
+            result = await run_verification(
+                worktree=worktree,
+                config=config,
+                module_config=_module_config(),
+                role='task',
+                attempt_id=None,
+            )
+
+        legs = {c['leg'] for c in spy.calls}
+        assert legs == {'test', 'lint', 'type'}, (
+            f'expected all three legs to still run despite the unmkdirable '
+            f'slots_dir; got legs={legs!r}'
+        )
+        test_calls = [c for c in spy.calls if c['leg'] == 'test']
+        assert len(test_calls) == 1
+        expected_cmd = (
+            shlex.join(['nice', '-n', '15', 'ionice', '-c2', '-n7'])
+            + ' /bin/bash -c '
+            + shlex.quote(_TEST_CMD)
+        )
+        assert test_calls[0]['cmd'] == expected_cmd, (
+            f'expected the task nice-tier wrap to still apply even though '
+            f'acquisition failed open; got {test_calls[0]["cmd"]!r}'
+        )
+        assert result.passed
