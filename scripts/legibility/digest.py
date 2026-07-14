@@ -835,14 +835,15 @@ def render_digest(
     returned unmodified (zero trim iterations).
     """
     cwd = _derive_cwd(records)
+    counts = signal_counts(records)
     meta = {
         'session': _derive_session(records),
         'cwd': cwd,
         'encoded_dir': _derive_encoded_dir(records, cwd, path),
         'agent_class': agent_class,
         'date': _derive_date(records),
-        'score': score_signals(signal_counts(records), len(iter_user_turns(records))),
-        'signal_counts': signal_counts(records),
+        'score': score_signals(counts, len(iter_user_turns(records))),
+        'signal_counts': counts,
     }
 
     sections = _build_sections(records)
