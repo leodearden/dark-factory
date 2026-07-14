@@ -463,3 +463,103 @@ class TestFindRetryLoops:
         assert len(loops) == 1
         assert loops[0]['tool'] == 'Bash'
         assert loops[0]['count'] == 3
+
+
+# ---------------------------------------------------------------------------
+# Decoy-FAIL suppression contract (PRD Sec 13.2, owned by alpha) -- a
+# dedicated test locking the tactical decision explicitly, distinct from the
+# per-detector native-carrier-scoping tests above:
+#   (a) a literal "FAIL:"/"FAILED" string in an assistant text block or
+#       inside a Write/Edit tool_use input never increments tool_error --
+#       only a structured is_error=True tool_result does.
+#   (b) a "not found"-shaped string planted inside a Write tool_use input
+#       never increments not_found.
+#   (c) an inline "# decoy-fail" sentinel on a line suppresses a would-be
+#       match on THAT line only -- other lines/carriers are unaffected.
+# ---------------------------------------------------------------------------
+
+class TestDecoyFailSuppressionContract:
+    def test_fail_text_in_assistant_and_write_input_does_not_inflate_tool_error(self):
+        records = [
+            _assistant(_text('FAIL: this is just narration, not a real error.')),
+            _assistant(_tool_use(
+                'Write',
+                {'file_path': '/tmp/t.py', 'content': 'assert False  # FAILED case'},
+                id='tu-decoy',
+            )),
+            # the one genuine tool_error signal:
+            _assistant(_tool_use('Bash', {'command': 'false'}, id='tu-real')),
+            _tool_result('tu-real', 'Exit code 1', is_error=True),
+        ]
+
+        neighborhoods = mod.iter_error_neighborhoods(records)
+
+        assert len(neighborhoods) == 1
+        assert neighborhoods[0]['attempt_tool'] == 'Bash'
+
+    def test_not_found_text_in_write_input_does_not_inflate_not_found(self):
+        records = [
+            _assistant(_tool_use(
+                'Write',
+                {
+                    'file_path': '/tmp/t.py',
+                    'content': 'raise FileNotFoundError("No such file or directory")',
+                },
+                id='tu-decoy',
+            )),
+            # the one genuine not_found signal:
+            _tool_result('tu-real', 'bash: foo: command not found', is_error=True),
+        ]
+
+        hits = mod.iter_not_found(records)
+
+        assert len(hits) == 1
+        assert hits[0]['pattern'] == 'command not found'
+
+    def test_decoy_marker_suppresses_same_line_not_found_match(self):
+        records = [_tool_result(
+            'tu-1',
+            'ModuleNotFoundError: shhh, this is a fixture literal  # decoy-fail\n'
+            'No such file or directory: bar',
+            is_error=True,
+        )]
+
+        hits = mod.iter_not_found(records)
+
+        assert [h['pattern'] for h in hits] == ['no such file or directory']
+
+    def test_decoy_marker_suppresses_same_line_df_guard_match(self):
+        records = [_tool_result(
+            'tu-1',
+            'BLOCKED: fixture-only value, ignore me  # decoy-fail\n'
+            'error: done_gate_missing_files -- cannot mark done',
+            is_error=True,
+        )]
+
+        hits = mod.iter_df_guards(records)
+
+        assert [h['pattern'] for h in hits] == ['done_gate_missing_files']
+
+    def test_decoy_marker_suppresses_same_line_self_correction_match(self):
+        records = [_assistant(_text(
+            'Actually, this line is just fixture narration.  # decoy-fail\n'
+            'Let me fix the real bug now.'
+        ))]
+
+        hits = mod.iter_self_corrections(records)
+
+        assert [h['pattern'] for h in hits] == ['let me fix']
+
+    def test_decoy_marker_does_not_suppress_other_lines_in_same_block(self):
+        # The marker suppresses only its OWN line -- a real signal on a
+        # different line in the same block/content still counts.
+        records = [_tool_result(
+            'tu-1',
+            'command not found  # decoy-fail\n'
+            'does not exist',
+            is_error=True,
+        )]
+
+        hits = mod.iter_not_found(records)
+
+        assert [h['pattern'] for h in hits] == ['does not exist']
