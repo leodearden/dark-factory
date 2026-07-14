@@ -587,6 +587,17 @@ def run_nightly(
                 )
             commit_made = True
 
+    if not commit_made:
+        # Covers every case that reaches here without committing: an
+        # empty/dedup-only coding run (applied == 0), a merged-but-invalid
+        # codebook (validation_errors, dump skipped), or a merge that
+        # applied but produced a byte-identical dump (git status
+        # unchanged) -- all genuine no-change nights, never conflated with
+        # a coding failure (PRD §6.7).
+        logger.info(
+            'legibility trickle: no-change night: nothing committed (applied=%d)', applied,
+        )
+
     census_line, census_fire = evaluate_census_step(cfg, now=now, status_fetcher=status_fetcher)
 
     return NightlyResult(
