@@ -3742,6 +3742,67 @@ class TestSelfRestartScheduled:
             f"got {stamp_val.get('fire_delay_secs')!r}"
         )
 
+    async def test_b8_stamps_deploy_state_phase_scheduled_atomically(self, tmp_path: Path):
+        """ζ DS-1: the before_done_scheduled_at write also atomically advances
+        deploy_state.phase ran->scheduled (self-restart, always_escalates=False)."""
+        from orchestrator.deterministic_runner import DeterministicRunner
+
+        task = _deploy_task(task_id='852', target_unit='orchestrator-reify.service')
+        assignment = _make_assignment(task)
+        queue = EscalationQueue(tmp_path)
+        scheduler = _mock_scheduler(task)
+
+        restart_scheduler = AsyncMock(return_value=(0, 'scheduled'))
+
+        runner = DeterministicRunner(
+            scheduler=scheduler,
+            escalation_queue=queue,
+            unit_inspector=AsyncMock(return_value=_BASELINE_UNIT_STATE),
+            script_runner=AsyncMock(return_value=(0, 'ok')),
+            own_unit_resolver=lambda: 'orchestrator-reify.service',
+            restart_scheduler=restart_scheduler,
+        )
+        await runner.run(assignment)
+
+        scheduled_stamp_calls = [
+            c for c in scheduler.update_task.call_args_list
+            if len(c.args) > 1 and c.args[1].get('before_done_scheduled_at')
+        ]
+        assert scheduled_stamp_calls
+        assert scheduled_stamp_calls[0].args[1]['deploy_state']['phase'] == 'scheduled'
+
+    async def test_b8_done_write_does_not_advance_deploy_state_past_scheduled(self, tmp_path: Path):
+        """scheduled->done is pinned-illegal: the done write must not attempt a
+        deploy_state phase advance — the LAST deploy_state write observed stays
+        at phase=='scheduled' (task-status done != deploy-phase done)."""
+        from orchestrator.deterministic_runner import DeterministicRunner
+
+        task = _deploy_task(task_id='852', target_unit='orchestrator-reify.service')
+        assignment = _make_assignment(task)
+        queue = EscalationQueue(tmp_path)
+        scheduler = _mock_scheduler(task)
+
+        restart_scheduler = AsyncMock(return_value=(0, 'scheduled'))
+
+        runner = DeterministicRunner(
+            scheduler=scheduler,
+            escalation_queue=queue,
+            unit_inspector=AsyncMock(return_value=_BASELINE_UNIT_STATE),
+            script_runner=AsyncMock(return_value=(0, 'ok')),
+            own_unit_resolver=lambda: 'orchestrator-reify.service',
+            restart_scheduler=restart_scheduler,
+        )
+        await runner.run(assignment)
+
+        deploy_state_calls = [
+            c for c in scheduler.update_task.call_args_list
+            if len(c.args) > 1 and (c.args[1].get('deploy_state') or {}).get('phase')
+        ]
+        assert deploy_state_calls
+        assert deploy_state_calls[-1].args[1]['deploy_state']['phase'] == 'scheduled', (
+            'no update_task call may advance deploy_state past scheduled on this path'
+        )
+
 
 # ---------------------------------------------------------------------------
 # Step-5 (ε): B8 scheduling failure → born-at-L2 infra_issue + blocked
@@ -4903,6 +4964,31 @@ class TestSelfRestartActThenAskGate:
             f'Expected category "milestone_gate", got "{pending[0].category}"'
         )
 
+    async def test_gate_fallthrough_advances_deploy_state_phase_scheduled_to_escalated(
+        self, tmp_path: Path
+    ):
+        """ζ: self-restart act-then-ask falls through ran->scheduled (self-restart
+        stamp) -> escalated (gate filing) — the gate's update_task call carries
+        deploy_state.phase=='escalated'."""
+        task = self._act_then_ask_task()
+        assignment = _make_assignment(task)
+        queue = EscalationQueue(tmp_path)
+        scheduler = _mock_scheduler(task)
+
+        unit_inspector = AsyncMock(return_value=_BASELINE_UNIT_STATE)
+        script_runner = AsyncMock(return_value=(0, 'ok'))
+        restart_scheduler = AsyncMock(return_value=(0, 'scheduled'))
+
+        runner = self._make_runner(scheduler, queue, unit_inspector, script_runner, restart_scheduler)
+        await runner.run(assignment)
+
+        deploy_state_calls = [
+            c for c in scheduler.update_task.call_args_list
+            if len(c.args) > 1 and (c.args[1].get('deploy_state') or {}).get('phase')
+        ]
+        assert deploy_state_calls
+        assert deploy_state_calls[-1].args[1]['deploy_state']['phase'] == 'escalated'
+
 
 # ---------------------------------------------------------------------------
 # Step-13 (ε): robustness_crash_resume + always_escalates=True
@@ -5100,6 +5186,44 @@ class TestSelfRestartScheduledCrashResumeActThenAsk:
         await runner.run(assignment)
 
         unit_inspector.assert_not_awaited()
+
+    async def test_crash_resume_gate_refile_advances_scheduled_to_escalated(self, tmp_path: Path):
+        """ζ: a task resuming with deploy_state.phase=='scheduled' already
+        persisted (the step-6-written shape) advances to 'escalated' when the
+        crash-resume re-files the milestone gate."""
+        from orchestrator.deterministic_runner import DeterministicRunner
+
+        task = _deploy_task(
+            task_id='855',
+            target_unit='orchestrator-reify.service',
+            before_done_ran_at='2026-06-23T10:00:00+00:00',
+            before_done_scheduled_at={
+                'at': '2026-06-23T10:00:01+00:00',
+                'transient_unit': 'orch-redeploy-restart-855.service',
+                'fire_delay_secs': 60,
+            },
+            phase='scheduled',
+        )
+        task['metadata']['always_escalates'] = True
+        assignment = _make_assignment(task)
+        queue = EscalationQueue(tmp_path)
+        scheduler = _mock_scheduler(task)
+
+        runner = DeterministicRunner(
+            scheduler=scheduler,
+            escalation_queue=queue,
+            unit_inspector=AsyncMock(return_value=_BASELINE_UNIT_STATE),
+            script_runner=AsyncMock(return_value=(0, 'ok')),
+            restart_scheduler=AsyncMock(return_value=(0, 'scheduled')),
+        )
+        await runner.run(assignment)
+
+        deploy_state_calls = [
+            c for c in scheduler.update_task.call_args_list
+            if len(c.args) > 1 and (c.args[1].get('deploy_state') or {}).get('phase')
+        ]
+        assert deploy_state_calls
+        assert deploy_state_calls[-1].args[1]['deploy_state']['phase'] == 'escalated'
 
 
 # ---------------------------------------------------------------------------
