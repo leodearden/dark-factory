@@ -7413,8 +7413,26 @@ class GitOps:
         (incident 13674d3c68).
 
         Raises :class:`MergeParkError` if ``git stash create`` fails or
-        produces no commit.
+        produces no commit.  Raises :class:`MergeParkContentionError` if
+        MERGE_PARK_REF already exists — the merge worker is serialized, so a
+        resolvable ref here is either an invariant violation or a
+        crash-leftover holding real, unrecovered WIP; it is never
+        overwritten.
         """
+        # Single-flight guard: explicit pre-check so a stale/contended ref
+        # fails loudly with a clear message rather than via the terser
+        # update-ref rc=128 below (which is a belt-and-braces backstop for
+        # the TOCTOU window, not the primary signal).
+        guard_rc, guard_sha, _ = await _run(
+            ['git', 'rev-parse', '--verify', '--quiet', MERGE_PARK_REF],
+            cwd=self.project_root,
+        )
+        if guard_rc == 0:
+            raise MergeParkContentionError(
+                f'{MERGE_PARK_REF} already exists at {guard_sha.strip()!r} — '
+                'refusing to overwrite (stale or contended park).'
+            )
+
         stash_rc, stash_sha, stash_err = await _run(
             ['git', 'stash', 'create', f'merge-queue: pre-advance for {label}'],
             cwd=self.project_root,
@@ -7426,10 +7444,20 @@ class GitOps:
                 f'stdout={stash_sha!r}, stderr={stash_err!r})'
             )
 
-        await _run(
-            ['git', 'update-ref', MERGE_PARK_REF, stash_sha],
+        # Atomic create-only update-ref: the all-zeros old-value makes this
+        # fail (rc=128) if the ref already exists — a belt-and-braces
+        # backstop closing the TOCTOU window between the guard check above
+        # and this update-ref (the merge worker's serialization precludes
+        # this in practice, but the atomic form costs nothing).
+        update_rc, _, update_err = await _run(
+            ['git', 'update-ref', MERGE_PARK_REF, stash_sha, '0' * 40],
             cwd=self.project_root,
         )
+        if update_rc != 0:
+            raise MergeParkContentionError(
+                f'update-ref {MERGE_PARK_REF} refused (rc={update_rc}) — ref '
+                f'appeared concurrently: {update_err!r}'
+            )
 
         await _run(
             ['git', 'read-tree', '-u', '--reset', 'HEAD'],
