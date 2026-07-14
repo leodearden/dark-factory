@@ -943,12 +943,20 @@ def create_mcp_server(
             isinstance(metadata, dict) and metadata.get('allow_near_duplicate') is True
         )
         if category == 'procedural_knowledge' and not allow_near_duplicate:
-            near_dup_results = await memory_service.search(
-                query=content,
-                project_id=project_id,
-                categories=['procedural_knowledge'],
-                limit=5,
-            )
+            try:
+                near_dup_results = await memory_service.search(
+                    query=content,
+                    project_id=project_id,
+                    categories=['procedural_knowledge'],
+                    limit=5,
+                )
+            except Exception:
+                # Fail-open: a pre-check search failure/timeout must never
+                # block a write. Degrade to the pre-existing behavior.
+                logger.warning(
+                    'near-duplicate pre-check search failed; failing open', exc_info=True
+                )
+                near_dup_results = []
             near_dup_match = find_near_duplicate_memory(
                 near_dup_results, _DEFAULT_NEAR_DUP_THRESHOLD
             )
