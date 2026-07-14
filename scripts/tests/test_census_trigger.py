@@ -16,6 +16,7 @@ import logging
 from datetime import datetime, timedelta, timezone
 
 import pytest
+import yaml
 
 from legibility import census_trigger as ct
 
@@ -416,3 +417,128 @@ def test_default_status_fetcher_raises_status_fetch_unavailable_when_unreachable
 
     with pytest.raises(ct.StatusFetchUnavailable):
         fetcher()
+
+
+# ---------------------------------------------------------------------------
+# step-17: RED — decide_for_project() end-to-end over the full §8.5 matrix
+# ---------------------------------------------------------------------------
+
+def _write_codebook(project_root, entries=None, candidates=None):
+    codebook = {"version": 2, "entries": entries or [], "candidates": candidates or []}
+    legibility_dir = project_root / "docs" / "legibility"
+    legibility_dir.mkdir(parents=True, exist_ok=True)
+    (legibility_dir / "confusion-codebook.yaml").write_text(
+        yaml.safe_dump(codebook), encoding="utf-8"
+    )
+
+
+def _write_census_state(project_root, **fields):
+    legibility_dir = project_root / "docs" / "legibility"
+    legibility_dir.mkdir(parents=True, exist_ok=True)
+    (legibility_dir / "census-state.json").write_text(json.dumps(fields), encoding="utf-8")
+
+
+def _candidates_from_dates(dates):
+    return [
+        {"id": f"cand-{i}", "title": "x", "first_seen": d, "disposition": "pending", "sightings": []}
+        for i, d in enumerate(dates)
+    ]
+
+
+def _done_statuses(count):
+    return {str(i): "done" for i in range(count)}
+
+
+def test_decide_for_project_row1_missing_state_fires_from_earliest_sighting(tmp_path):
+    _write_codebook(
+        tmp_path,
+        entries=[
+            {
+                "id": "entry-a",
+                "title": "t",
+                "severity": "low",
+                "status": "open",
+                "origin_phase": "unknown",
+                "manifested_phase": "unknown",
+                "sightings": [_sighting("2026-07-02")],  # NOW - 12 days
+            }
+        ],
+    )
+    # No census-state.json written -- never censused.
+
+    decision = ct.decide_for_project(tmp_path, now=NOW, status_fetcher=None)
+
+    assert decision.fire is True
+    assert any("max-interval" in r for r in decision.reasons)
+
+
+def test_decide_for_project_row2_day9_no_spike_low_delta_no_fire(tmp_path):
+    _write_codebook(tmp_path)
+    _write_census_state(
+        tmp_path,
+        last_census_at=(NOW - timedelta(days=9)).isoformat(),
+        last_census_report="plans/confusion-census-prior.md",
+        last_census_done_count=500,
+    )
+    fetcher = lambda: {"statuses": _done_statuses(550)}  # delta 50 < 120
+
+    decision = ct.decide_for_project(tmp_path, now=NOW, status_fetcher=fetcher)
+
+    assert decision.fire is False
+
+
+def test_decide_for_project_row3_day7_130_landed_fires(tmp_path):
+    _write_codebook(tmp_path)
+    _write_census_state(
+        tmp_path,
+        last_census_at=(NOW - timedelta(days=7)).isoformat(),
+        last_census_report="plans/confusion-census-prior.md",
+        last_census_done_count=500,
+    )
+    fetcher = lambda: {"statuses": _done_statuses(630)}  # delta 130 >= 120
+
+    decision = ct.decide_for_project(tmp_path, now=NOW, status_fetcher=fetcher)
+
+    assert decision.fire is True
+    assert any("tasks-landed" in r for r in decision.reasons)
+
+
+def test_decide_for_project_row4_day6_novelty_spike_fires(tmp_path):
+    _write_codebook(tmp_path, candidates=_candidates_from_dates(_SPIKE_4_IN_72H))
+    _write_census_state(
+        tmp_path,
+        last_census_at=(NOW - timedelta(days=6)).isoformat(),
+        last_census_report="plans/confusion-census-prior.md",
+    )
+
+    decision = ct.decide_for_project(tmp_path, now=NOW, status_fetcher=None)
+
+    assert decision.fire is True
+    assert any("novelty-spike" in r for r in decision.reasons)
+
+
+def test_decide_for_project_row5_day4_floor_blocks_spike_no_fire(tmp_path):
+    _write_codebook(tmp_path, candidates=_candidates_from_dates(_SPIKE_4_IN_72H))
+    _write_census_state(
+        tmp_path,
+        last_census_at=(NOW - timedelta(days=4)).isoformat(),
+        last_census_report="plans/confusion-census-prior.md",
+    )
+
+    decision = ct.decide_for_project(tmp_path, now=NOW, status_fetcher=None)
+
+    assert decision.fire is False
+    assert any("floor" in r for r in decision.reasons)
+
+
+def test_decide_for_project_row6_malformed_state_no_fire_one_warning(tmp_path, caplog):
+    _write_codebook(tmp_path)
+    legibility_dir = tmp_path / "docs" / "legibility"
+    legibility_dir.mkdir(parents=True, exist_ok=True)
+    (legibility_dir / "census-state.json").write_text("not json{", encoding="utf-8")
+
+    with caplog.at_level(logging.WARNING):
+        decision = ct.decide_for_project(tmp_path, now=NOW, status_fetcher=None)
+
+    assert decision.fire is False
+    assert sum(1 for r in caplog.records if r.levelno == logging.WARNING) == 1
