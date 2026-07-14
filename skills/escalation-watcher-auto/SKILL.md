@@ -227,22 +227,24 @@ Handle only `work_batch` before (re)starting the wait.
 
 ### Waiting for the next L1
 
-After checking rotation limits (step 7), compute `remaining = deadline − now` (seconds) and arm a **foreground-blocking** call with a bounded timeout:
+After checking rotation limits (step 7), compute `remaining = deadline − now` (seconds) and arm a **foreground-blocking** call to the canonical re-arm wrapper with a bounded timeout:
 
 ```bash
-cd $DARK_FACTORY_ROOT && uv run --project escalation python -m escalation.watcher \
+cd $DARK_FACTORY_ROOT && scripts/watcher-rearm.sh \
   --queue-dir <project_root>/data/escalations --level 1 --timeout <min(540, remaining)>
 ```
 
-The `<min(540, remaining)>` clamp sizes the final wait exactly to the remaining rotation time, so the agent regains control at its deadline rather than overshooting.
+The `<min(540, remaining)>` clamp sizes the final wait exactly to the remaining rotation time, so the agent regains control at its deadline rather than overshooting. `scripts/watcher-rearm.sh` is the same canonical bounded-wait + re-arm wrapper around `escalation.watcher` that escalation-watcher (L2) uses (see `skills/escalation-watcher/SKILL.md` §"Starting the watcher").
 
-**Exit-code contract (from `escalation.watcher`):**
-- **exit 0** — one matching L1 escalation was printed as JSON to stdout. Parse it, then go to step 3 and drain ALL pending L1s. The watcher event is a wake signal only; the drain is the authoritative source of work.
-- **exit 124** — timeout expired, stdout is empty. Re-check the deadline: if `remaining > 0`, go to step 8 and re-arm; if `remaining ≤ 0`, emit the digest and exit cleanly.
+**Bash-tool timeout contract:** this is a bounded **foreground** call — the calling Bash tool's own timeout must be set to **≥ 600000ms** (10 min) whenever `--timeout` is close to the 540s default, or the harness's 2-minute default kills the wait before it can return (the 07-09 exit-143 failure mode this wrapper exists to prevent).
 
-**Initial-scan semantics:** the watcher arms inotify first, then scans the queue directory for already-pending matches before blocking. If a matching L1 was filed between skill startup and watcher launch, the watcher fires immediately on that entry (exit 0). Treat instant fires as normal wakes — the drain that follows is authoritative.
+**Exit-code contract (preserved verbatim by `scripts/watcher-rearm.sh` from `escalation.watcher`, plus a `WATCHER_REARM_OUTCOME: <FIRED|CEILING|KILLED|ERROR> exit=<rc>` marker the wrapper emits to stderr on every run):**
+- **exit 0** (`WATCHER_REARM_OUTCOME: FIRED` on stderr) — one matching L1 escalation was printed as JSON to stdout. Parse it, then go to step 3 and drain ALL pending L1s. The watcher event is a wake signal only; the drain is the authoritative source of work. Do not pipe `2>&1` — the stderr outcome line must not land in the stdout JSON you parse.
+- **exit 124** (`WATCHER_REARM_OUTCOME: CEILING` on stderr) — timeout expired, stdout is empty. Re-check the deadline: if `remaining > 0`, go to step 8 and re-arm; if `remaining ≤ 0`, emit the digest and exit cleanly.
 
-**Rationale for foreground blocking:** a single foreground call with a bounded `--timeout` is simpler than managing a background subprocess, and the bounded wait guarantees the agent regains control before the supervisor's force-kill grace window. File-descriptor exhaustion from restart cycles is not expected (historical — no longer expected; see escalation-watcher/SKILL.md §Troubleshooting).
+**Initial-scan semantics:** the underlying watcher arms inotify first, then scans the queue directory for already-pending matches before blocking. If a matching L1 was filed between skill startup and watcher launch, the watcher fires immediately on that entry (exit 0). Treat instant fires as normal wakes — the drain that follows is authoritative.
+
+**Rationale for foreground blocking:** a single foreground call to `scripts/watcher-rearm.sh` with a bounded `--timeout` is simpler than managing a background subprocess, and the bounded wait guarantees the agent regains control before the supervisor's force-kill grace window. This remains a bounded **foreground** call, never a background subprocess — running it via `run_in_background` would violate this skill's "NO terminal spawning" hard constraint. File-descriptor exhaustion from restart cycles is not expected (historical — no longer expected; see escalation-watcher/SKILL.md §Troubleshooting).
 
 ## Per-Category Routing Table
 

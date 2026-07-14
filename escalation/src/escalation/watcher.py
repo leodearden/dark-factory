@@ -105,6 +105,59 @@ def _initial_scan(
     return best
 
 
+def _normalize_esc_id(esc_id: str) -> str:
+    """Strip a trailing `.json` suffix, if present, from an esc-id.
+
+    Shared by the static `--exclude-id` normalization in main() and by
+    `_read_exclude_file` below, so both accept an id with or without the
+    `.json` suffix identically and the rule can't drift between the two.
+    """
+    return esc_id[:-5] if esc_id.endswith('.json') else esc_id
+
+
+def _read_exclude_file(path: Path | None) -> frozenset[str]:
+    """Read a newline-delimited esc-id exclude list, tolerating blank lines
+    and `#`-comments, and normalizing a trailing `.json` suffix via
+    `_normalize_esc_id` (shared with `--exclude-id`'s static-exclude
+    normalization).
+
+    Fails open (returns an empty frozenset) when path is None or the file is
+    missing, unreadable, or undecodable as text — a transient miss is
+    retried on the next poll rather than treated as a fatal error.
+
+    Re-read in full on every poll, so a caller appending a new id mid-run
+    should do so as a single short-line append (e.g. `echo esc-id >> file`),
+    which is atomic on POSIX filesystems. A poll racing a non-atomic,
+    multi-write append could observe a partially-written final line; this is
+    self-healing since the next poll re-reads the completed file.
+    """
+    if path is None:
+        return frozenset()
+
+    try:
+        text = path.read_text()
+    except (OSError, UnicodeDecodeError):
+        return frozenset()
+
+    ids: set[str] = set()
+    for line in text.splitlines():
+        stripped = line.strip()
+        if not stripped or stripped.startswith('#'):
+            continue
+        ids.add(_normalize_esc_id(stripped))
+    return frozenset(ids)
+
+
+def _snapshot_pending_ids(queue_dir: Path) -> frozenset[str]:
+    """Return the set of esc-ids (filename stems) present in queue_dir right now.
+
+    Used by --baseline to freeze a launch-time exclusion snapshot so a
+    watcher run only fires on items filed AFTER it started, instead of
+    hand-listing every already-pending id via --exclude-id.
+    """
+    return frozenset(p.stem for p in queue_dir.glob('esc-*.json'))
+
+
 def _send_ntfy(url: str, escalation: Escalation) -> None:
     """POST an escalation as a push notification to an ntfy.sh endpoint."""
     is_urgent = escalation.severity in (BORN_AT_L2_SEVERITIES | {'blocking'})
@@ -146,22 +199,51 @@ def main() -> None:
         '--exclude-id', action='append', default=None,
         help='esc-id to exclude from initial scan AND event loop; repeatable',
     )
+    parser.add_argument(
+        '--exclude-file', default=None,
+        help=(
+            'path to a newline-delimited esc-id exclude list, re-read each '
+            'poll; repeated ids skip initial scan AND event loop'
+        ),
+    )
+    parser.add_argument(
+        '--baseline', action='store_true',
+        help=(
+            'snapshot pending esc-ids at launch; fire only on items NOT in '
+            'that snapshot, instead of hand-listing every already-pending id'
+        ),
+    )
     args = parser.parse_args()
 
     queue_dir = Path(args.queue_dir)
     queue_dir.mkdir(parents=True, exist_ok=True)
 
-    exclude_ids = frozenset(
-        e[:-5] if e.endswith('.json') else e for e in (args.exclude_id or [])
-    )
+    static_exclude = frozenset(_normalize_esc_id(e) for e in (args.exclude_id or []))
+    exclude_file_path = Path(args.exclude_file) if args.exclude_file else None
 
-    # ARM inotify first so no events are missed between scan and watch.
+    def current_excludes() -> frozenset[str]:
+        return static_exclude | baseline_ids | _read_exclude_file(exclude_file_path)
+
+    # Baseline is frozen ONCE here, BEFORE inotify is armed, so the race
+    # window falls on the safe side: an escalation filed between this
+    # snapshot and add_watch() below is absent from the snapshot (so it is
+    # not permanently excluded) and, since no watch is armed yet, generates
+    # no inotify event either -- but it is still on disk by the time the
+    # initial scan below runs, so the scan's own directory glob picks it up
+    # and fires on it normally. Snapshotting AFTER add_watch() instead would
+    # let such an item be captured by the snapshot (permanently excluded)
+    # while ALSO queuing an inotify event that gets silently dropped as an
+    # excluded id -- i.e. a genuinely new item swallowed for the run's
+    # lifetime. Unlike --exclude-file, the baseline is never re-read.
+    baseline_ids = _snapshot_pending_ids(queue_dir) if args.baseline else frozenset()
+
+    # ARM inotify so no events are missed between the scan and the watch.
     inotify = INotify()
     watch_flags = flags.CREATE | flags.MOVED_TO
     inotify.add_watch(str(queue_dir), watch_flags)
 
     # Initial scan: emit any already-pending escalation and exit immediately.
-    match = _initial_scan(queue_dir, args.task_id, args.level, exclude_ids)
+    match = _initial_scan(queue_dir, args.task_id, args.level, current_excludes())
     if match is not None:
         _emit(match, args.ntfy_url)
         sys.exit(0)
@@ -184,12 +266,14 @@ def main() -> None:
         if deadline is not None and not events:
             sys.exit(124)
 
+        excludes = current_excludes()  # RE-READ each poll (--exclude-file may have changed)
+
         for event in events:
             name = event.name
             if not name or not (name.startswith('esc-') and name.endswith('.json')):
                 continue
 
-            if name[:-5] in exclude_ids:
+            if name[:-5] in excludes:
                 continue
 
             path = queue_dir / name
@@ -198,7 +282,7 @@ def main() -> None:
             except (json.JSONDecodeError, KeyError, OSError, TypeError):
                 continue
 
-            if not _matches(esc, args.task_id, args.level, exclude_ids):
+            if not _matches(esc, args.task_id, args.level, excludes):
                 continue
 
             _emit(esc, args.ntfy_url)
