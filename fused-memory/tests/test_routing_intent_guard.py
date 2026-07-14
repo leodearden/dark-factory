@@ -33,6 +33,35 @@ class TestRoutingIntentFindingDetectionMatrix:
         assert 'do_not_implement' in finding.markers
         assert 'escalate_instead_of_implementing' in finding.markers
 
+    def test_markers_details_alignment_and_field_dedup_ordering(self):
+        """Invariant lock: markers/details stay positionally aligned (same
+        length/order), a marker repeated across fields is counted once (in
+        first-matched order), and fields lists every distinct matched field
+        (deduped) in first-matched order -- even when a field contributes no
+        NEW marker.
+
+        title + description both match 'do_not_implement' (description
+        repeats it); details matches a second, distinct marker
+        ('escalate_instead_of_implementing'). 'do_not_implement' must appear
+        before 'escalate_instead_of_implementing' (title is scanned first),
+        and 'fields' must list all three fields even though 'description'
+        contributes no marker beyond the one title already recorded.
+        """
+        finding = routing_intent_finding(
+            title='DO NOT IMPLEMENT this task.',
+            description='DO NOT IMPLEMENT is repeated here for good measure.',
+            details='Escalate to a human instead of implementing this work.',
+            task_kind='normal',
+            metadata=None,
+        )
+        assert finding is not None
+        assert finding.markers == (
+            'do_not_implement',
+            'escalate_instead_of_implementing',
+        )
+        assert len(finding.markers) == len(finding.details)
+        assert finding.fields == ('title', 'description', 'details')
+
     def test_mined_task_2332_shape_do_not_author_plan(self):
         """The mined task-2332 shape ('do not attempt to author a TDD plan
         for this task') -> finding."""
@@ -287,3 +316,27 @@ class TestRoutingIntentPayloadsAndFlag:
 
         monkeypatch.setenv('FUSED_ROUTING_INTENT_ENFORCE', '1')
         assert routing_intent_enforced() is True
+
+    @pytest.mark.parametrize('raw_value', ['true', 'yes', 'on', ' On ', 'TRUE'])
+    def test_routing_intent_enforced_true_for_every_recognized_truthy_token(
+        self, monkeypatch, raw_value
+    ):
+        """routing_intent_enforced() -> True for every recognized truthy
+        token, locking the case-insensitive + whitespace-stripped
+        normalization contract (not just '1')."""
+        from fused_memory.middleware.routing_intent_guard import routing_intent_enforced
+
+        monkeypatch.setenv('FUSED_ROUTING_INTENT_ENFORCE', raw_value)
+        assert routing_intent_enforced() is True
+
+    @pytest.mark.parametrize('raw_value', ['0', 'no', 'false', ''])
+    def test_routing_intent_enforced_false_for_explicit_falsey_values(
+        self, monkeypatch, raw_value
+    ):
+        """routing_intent_enforced() -> False for explicit falsey/empty
+        values that are SET (not just unset), locking the warn-only default
+        contract for operators who explicitly opt out."""
+        from fused_memory.middleware.routing_intent_guard import routing_intent_enforced
+
+        monkeypatch.setenv('FUSED_ROUTING_INTENT_ENFORCE', raw_value)
+        assert routing_intent_enforced() is False
