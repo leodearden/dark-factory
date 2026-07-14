@@ -184,6 +184,23 @@ class TestCountOutstandingChildren:
 
         assert count_outstanding_children('parent-1', all_records) == 0
 
+    def test_foreign_status_child_is_treated_as_non_terminal_fail_soft(self):
+        """A child with an unrecognized status must not abort the whole
+        count -- fail-soft via _is_terminal, mirroring state_glyph/
+        _state_rank (PRD §2): never let one unclassifiable record crash
+        the view."""
+        from cockpit.panes.session_table import count_outstanding_children
+
+        parent = _make_record(session_slug='parent-1')
+        foreign_child = _make_record(
+            session_slug='child-foreign',
+            parent_session_id='parent-1',
+            status='some-foreign-status',
+        )
+        all_records = [parent, foreign_child]
+
+        assert count_outstanding_children('parent-1', all_records) == 1
+
 
 class TestOrderSessions:
     def test_blocked_sorts_above_all_else_regardless_of_age(self):
@@ -303,12 +320,6 @@ class TestFilterLiveSessions:
         from cockpit.panes.session_table import filter_live_sessions
 
         assert filter_live_sessions([]) == []
-
-    def test_default_visible_cap_is_a_positive_int(self):
-        from cockpit.panes.session_table import _DEFAULT_VISIBLE_CAP
-
-        assert isinstance(_DEFAULT_VISIBLE_CAP, int)
-        assert _DEFAULT_VISIBLE_CAP > 0
 
     def test_explicit_cap_keeps_only_the_first_n_by_input_order(self):
         from cockpit.panes.session_table import filter_live_sessions

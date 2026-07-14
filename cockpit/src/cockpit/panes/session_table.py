@@ -87,12 +87,16 @@ def count_outstanding_children(slug: str, all_records: list[SessionRecord]) -> i
     """Count *slug*'s non-terminal children (records with parent_session_id == slug).
 
     A terminal child (exited/failed-to-start) is not "outstanding" -- it no
-    longer needs attention -- so it's excluded per TERMINAL_STATUSES.
+    longer needs attention -- so it's excluded per TERMINAL_STATUSES. A
+    foreign/unrecognized child status is treated as non-terminal (kept,
+    counted) rather than raising -- fail-soft via _is_terminal, mirroring
+    _state_rank/state_glyph (PRD §2): one unclassifiable child must never
+    abort the whole count.
     """
     return sum(
         1
         for record in all_records
-        if record.parent_session_id == slug and Status(record.status) not in TERMINAL_STATUSES
+        if record.parent_session_id == slug and not _is_terminal(record.status)
     )
 
 
@@ -185,6 +189,27 @@ def filter_live_sessions(
     return [record for record in records if not _is_terminal(record.status)][:cap]
 
 
+def _count_children_by_parent(all_records: list[SessionRecord]) -> dict[str, int]:
+    """Precompute {parent_slug: outstanding-child-count} in a single pass over *all_records*.
+
+    replace_rows previously called count_outstanding_children once per
+    visible row, each call rescanning the full all_records list from
+    scratch -- O(visible_rows * len(all_records)). With the history toggle
+    able to set both to the full ~10k-record set, that's ~10k^2
+    comparisons on every rebuild. Scanning all_records exactly once here
+    and looking counts up by key is O(len(all_records)) regardless of how
+    many rows are visible. Uses the same fail-soft _is_terminal check as
+    count_outstanding_children (which is left in place, still directly
+    tested, as the single-slug primitive).
+    """
+    counts: dict[str, int] = {}
+    for record in all_records:
+        parent = record.parent_session_id
+        if parent and not _is_terminal(record.status):
+            counts[parent] = counts.get(parent, 0) + 1
+    return counts
+
+
 class SessionTable(DataTable):
     """The session-registry table: one row per session, keyed by session_slug.
 
@@ -228,9 +253,12 @@ class SessionTable(DataTable):
         given (the full scanned set), falling back to *records* otherwise --
         so a filtered/capped visible subset never undercounts a visible
         parent's non-terminal children just because those children
-        themselves are hidden from view.
+        themselves are hidden from view. Counted via a single O(all_records)
+        pass (_count_children_by_parent) rather than one full rescan of
+        all_records per visible row.
         """
         counting_set = all_records if all_records is not None else records
+        children_by_parent = _count_children_by_parent(counting_set)
         previous_slug = self.highlighted_slug()
         self.clear()
         for record in records:
@@ -239,7 +267,7 @@ class SessionTable(DataTable):
                 format_title(record),
                 format_age(record.start_ts, now),
                 record.project,
-                str(count_outstanding_children(record.session_slug, counting_set)),
+                str(children_by_parent.get(record.session_slug, 0)),
                 key=record.session_slug,
             )
         if not self.row_count:
