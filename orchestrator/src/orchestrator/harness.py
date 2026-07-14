@@ -3359,19 +3359,25 @@ Output JSON matching the schema. Every task must appear in the output.
         for tid, status in statuses.items():
             if status not in _RECONCILE_SWEEP_STATUSES:
                 continue
-            # is_actively_held folds three liveness signals (dispatched,
-            # module-lock held, recent workflow-cancel stamp — task 2235's
-            # R3 race guard: a workflow soft-cancel set very recently may
-            # still have its finally: block writing state, so skip until the
-            # grace period elapses) into one Scheduler-owned check.
-            if mid_run and self.scheduler.is_actively_held(tid):
-                # Actively held by this run's scheduler — not stranded.
-                continue
-
-            if mid_run:
+            # task 2243, W10-θ2 step-12: the standalone `if mid_run and
+            # is_actively_held(tid): continue` race guard is retired —
+            # is_actively_held (dispatched / module-lock held / recent
+            # workflow-cancel stamp) is folded into recovery_for's
+            # report.live_claimant, and ANY live claimant collapses every
+            # _RECOVERY row to the LEAVE default (see
+            # _reconcile_one_stranded). is_actively_held is still consulted
+            # here (cheap, in-memory, no I/O) purely to decide whether the
+            # cancel-stamp prune below is safe right now — it no longer
+            # gates whether _reconcile_one_stranded runs at all.
+            if mid_run and not self.scheduler.is_actively_held(tid):
                 # Grace window elapsed (or never set) — lazily prune so the
                 # dict stays bounded for tasks that exit terminal and are never
                 # re-dispatched (re-dispatch otherwise clears the stamp).
+                # Gated on is_actively_held being FALSE right now (not merely
+                # "reached this line") so a task still inside its cancel-grace
+                # window isn't pruned out from under recovery_for's own
+                # is_actively_held check a few lines down (which would read
+                # the cleared stamp and wrongly conclude no live claimant).
                 self.scheduler.clear_workflow_cancel(tid)
 
             try:
@@ -3696,25 +3702,40 @@ Output JSON matching the schema. Every task must appear in the output.
                 )
             return None
 
-        # An open L1 escalation is the deliberate human-handoff signal (e.g. an
-        # active /unblock session owns this worktree). Don't reap it — leave the
-        # worktree, branch, and status intact. Mirrors the is_ancestor Guard 1,
-        # extended to the unmerged in-progress path. No revert: reverting to
-        # pending would let the scheduler dispatch a competing agent.
-        if (
-            self._escalation_queue is not None
-            and self._escalation_queue.has_open_l1(tid)
-        ):
-            logger.info(
-                'Reconcile: task %s in-progress with open L1 escalation; '
-                'leaving worktree intact (human-managed)', tid,
-            )
+        # task 2243, W10-θ2 step-12: is_actively_held is the scheduler's own
+        # in-memory dispatch bookkeeping (dispatched / module-lock held /
+        # recent workflow-cancel stamp) — unambiguous, and not something the
+        # applier below independently re-derives (that was the now-deleted
+        # driver-level guard's job). Trust it directly rather than falling
+        # through.
+        if self.scheduler.is_actively_held(tid):
             return None
 
-        # 'in-progress' and not on main, no live-claimant signal yet: classify
-        # by lock state and revert to pending if no live owner.  Shared with the
-        # is_ancestor==True degenerate-provisioning-branch guards above so a
-        # never-advanced branch (the 2992 strand) is recovered, not left to sit.
+        # An open escalation at ANY level (not just L1 — the resolver's row
+        # (f) folds every level) is the deliberate human/automation-handoff
+        # signal: don't reap it. Replaces the old has_open_l1(tid) veto
+        # (L1-only), which missed an L2-only open escalation and fell
+        # through to an incorrect revert.
+        if report.open_escalations:
+            return None
+
+        # Deliberately NOT a blanket `if action == RecoveryAction.LEAVE:
+        # return None` here: report.live_claimant also goes non-None on a
+        # plan.lock-derived claimant (owner_pid alive + fresh timestamp),
+        # which — unlike is_actively_held — the applier below DOES still
+        # independently classify (including the R3 mid-run exception: an
+        # alive owner_pid that isn't in the dispatch table is a workflow
+        # that exited without releasing the lock, and must still be
+        # reaped). That plan.lock re-derivation is only retired once the
+        # applier itself is simplified (plan steps 15/16); until then it
+        # must still run for every case besides the two explicit vetoes
+        # above.
+        #
+        # 'in-progress', not on main, no is_actively_held/open-escalation
+        # signal: classify by plan.lock state and revert to pending if no
+        # live owner.  Shared with the is_ancestor==True
+        # degenerate-provisioning-branch guards above so a never-advanced
+        # branch (the 2992 strand) is recovered, not left to sit.
         return await self._revert_in_progress_if_no_live_claimant(
             tid, mid_run=mid_run, metadata=metadata, status=status,
         )
