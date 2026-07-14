@@ -177,3 +177,38 @@ def pick_survivor(group: list[dict]) -> tuple[dict, list[dict]]:
     survivor = ordered[0]
     losers = [m for m in group if m is not survivor]
     return survivor, losers
+
+
+def build_sweep_plan(memories: list[dict], threshold: float = 0.85) -> dict[str, Any]:
+    """Orchestrate filtering -> clustering -> survivor selection -> report.
+
+    Args:
+        memories: Raw memory list (any/all categories).
+        threshold: Near-duplicate similarity threshold.
+
+    Returns:
+        JSON-serialisable plan dict with keys: ``clusters_total``,
+        ``near_duplicate_groups`` (each with the survivor's id/content and
+        the full member id list), ``delete_candidates`` (flattened loser ids
+        across all clusters). Mirrors ``audit_duplicate_tasks.build_audit_plan``.
+    """
+    candidates = [m for m in memories if m.get('category') == 'procedural_knowledge']
+    groups = find_near_duplicate_memory_groups(candidates, threshold=threshold)
+
+    near_duplicate_groups: list[dict[str, Any]] = []
+    delete_candidates: list[str] = []
+
+    for group in groups:
+        survivor, losers = pick_survivor(group)
+        near_duplicate_groups.append({
+            'survivor_id': survivor.get('id'),
+            'survivor_content': survivor.get('content'),
+            'member_ids': [m.get('id') for m in group],
+        })
+        delete_candidates.extend(m.get('id') for m in losers)
+
+    return {
+        'clusters_total': len(groups),
+        'near_duplicate_groups': near_duplicate_groups,
+        'delete_candidates': delete_candidates,
+    }
