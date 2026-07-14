@@ -378,6 +378,34 @@ def test_build_session_slug_sanitizes_special_chars() -> None:
     assert re.fullmatch(r'[A-Za-z0-9._-]+', slug)
 
 
+# ---------------------------------------------------------------------------
+# Task 2511 step-1: sanitize_slug (shared filesystem-safe-slug normalizer)
+# ---------------------------------------------------------------------------
+
+
+def test_sanitize_slug_leaves_already_safe_slug_unchanged() -> None:
+    assert sr.sanitize_slug('session-cockpit-3215033') == 'session-cockpit-3215033'
+
+
+def test_sanitize_slug_maps_unsafe_chars_to_dash() -> None:
+    # '/' and '#' fall outside [A-Za-z0-9._-] (record_path_for_slug's
+    # path-escape guard) and are mapped to '-'; '.' is itself in the allowed
+    # set (mirrors _SLUG_SANITIZE_RE, the idiom this delegates to), so a
+    # path separator can never escape sessions_dir via record_path_for_slug.
+    slug = sr.sanitize_slug('weird/id#x.y')
+    assert slug == 'weird-id-x.y'
+    assert re.fullmatch(r'[A-Za-z0-9._-]+', slug)
+
+
+def test_sanitize_slug_matches_build_session_slug_regression() -> None:
+    # Pins build_session_slug's output as byte-identical to today once it
+    # delegates to sanitize_slug (step-2's behavior-preserving refactor).
+    assert sr.build_session_slug('unblock', 'df', '2085', 4242) == 'unblock-df-2085-4242'
+    slug = sr.build_session_slug('un block', 'df/prod', '20#85', 4242)
+    assert slug == 'un-block-df-prod-20-85-4242'
+    assert slug == sr.sanitize_slug('un block-df/prod-20#85-4242')
+
+
 def test_fleet_root_defaults_to_dot_claude_fleet(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.delenv('CLAUDE_FLEET_ROOT', raising=False)
     monkeypatch.setenv('HOME', '/home/fakeuser')
