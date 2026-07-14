@@ -21,7 +21,7 @@ import sys
 from pathlib import Path
 
 SCRIPT = Path(__file__).parent.parent / "legibility" / "install-trickle-timer.sh"
-TEMPLATES_DIR = Path(__file__).parent.parent.parent
+TEMPLATES_DIR = Path(__file__).parent.parent  # scripts/tests/../ = scripts/
 
 
 # ---------------------------------------------------------------------------
