@@ -2714,7 +2714,25 @@ class Scheduler:
         for dep_id, dep_task in checked_deps.items():
             cache_key = (dep_id, main_sha)
             if cache_key in self._delivered_check_cache:
-                projection[dep_id] = self._delivered_check_cache[cache_key]
+                cached = self._delivered_check_cache[cache_key]
+                projection[dep_id] = cached
+                if cached is False:
+                    # Steady state: this dep already FAILED on a prior tick
+                    # at this same SHA and was served straight from cache —
+                    # no checks re-ran, so there's no fresh (check, result)
+                    # to name. Reconstruct a best-effort detail from the
+                    # dep's FIRST delivered_checks entry (matching the
+                    # uncached-FAILED branch's shape below) so the hold
+                    # event stays meaningful on every held tick, not just
+                    # the first.
+                    checks = (dep_task.get('metadata') or {}).get('delivered_checks') or []
+                    first_check = checks[0] if checks else {}
+                    fail_detail_by_dep[dep_id] = {
+                        'name': first_check.get('name'),
+                        'dep_id': dep_id,
+                        'main_sha': main_sha,
+                        'kind': first_check.get('kind'),
+                    }
                 continue
 
             checks = (dep_task.get('metadata') or {}).get('delivered_checks') or []
@@ -2765,7 +2783,7 @@ class Scheduler:
                 (dep_id for dep_id in dep_ids if projection.get(dep_id) is False), None
             )
             if failed_dep_id is not None:
-                self._note_delivered_hold(task_id, detail=fail_detail_by_dep[failed_dep_id])
+                self._note_delivered_hold(task_id, detail=fail_detail_by_dep.get(failed_dep_id))
             elif all(projection.get(dep_id) is True for dep_id in dep_ids):
                 self._streak_delivered_hold.clear(task_id)
             # else: at least one dep absent this tick (errored/over-budget) —
