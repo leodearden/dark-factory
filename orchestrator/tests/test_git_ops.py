@@ -1,6 +1,7 @@
 """Tests for git operations — worktree lifecycle."""
 
 import asyncio
+import contextlib
 import fcntl
 import json
 import logging
@@ -9833,11 +9834,11 @@ class TestSeedAndThinMutualExclusion:
 
             try:
                 await asyncio.wait_for(_wait_for_seed_started(), 10)
-            except asyncio.TimeoutError:
+            except TimeoutError as exc:
                 raise AssertionError(
                     'seed-warm-lane.sh stub never started — _seed_warm_lane '
                     'did not acquire <lane_dir>.lock and run the script'
-                )
+                ) from exc
 
             # seed_started existing proves _seed_warm_lane has acquired the
             # outer flock -x <lane_dir>.lock and is now blocking on release.
@@ -9859,7 +9860,5 @@ class TestSeedAndThinMutualExclusion:
         finally:
             seed_release.touch()  # idempotent unblock in case of failure above
             if not seed_task.done():
-                try:
+                with contextlib.suppress(Exception):
                     await asyncio.wait_for(seed_task, 10)
-                except Exception:
-                    pass
