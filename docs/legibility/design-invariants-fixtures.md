@@ -90,6 +90,44 @@ def dispatch_next(tasks):
 
 ## INV-2 `structured-facts-at-failure`
 
+### PRD-leaf-shaped (`INV-2-PRD`)
+
+> Add a `verify_runner` step: on failure it prints `FAIL: step {name}
+> exited {code}` to stdout. The orchestrator's escalation handler regexes
+> that line out of the captured log to recover the step name and exit
+> code for the escalation report.
+
+**Expected disposition**: `flag: structured-facts-at-failure`
+
+**Redesign that clears it**: Emit a structured evidence field at the
+failure point (e.g. `{"step": name, "exit_code": code, "measured_at": ts}`)
+instead of a printed line, separating raw observation from any
+hypothesis, per the structured `evidence` field house pattern (2558).
+
+### Code-snippet-shaped (`INV-2-CODE`)
+
+```python
+def run_step(name, cmd):
+    result = subprocess.run(cmd, capture_output=True, text=True)
+    if result.returncode != 0:
+        print(f"FAIL: step {name} exited {result.returncode}")
+        return False
+    return True
+
+def handle_failure(log_text):
+    # re-derive what failed by regexing the printed line instead of
+    # receiving name/returncode as structured data from run_step
+    m = re.search(r"FAIL: step (\S+) exited (\d+)", log_text)
+    step, code = m.group(1), m.group(2)
+    escalate(f"{step} failed with {code}")
+```
+
+**Expected `invariant_findings` entry**:
+
+```json
+{"invariant": "structured-facts-at-failure", "file": "orchestrator/src/orchestrator/step_reporter.py", "line": 11, "issue": "handle_failure regexes a printed log line to recover the step name and exit code that run_step already held in local variables", "severity": "high"}
+```
+
 ## INV-3 `corroborate-before-acting`
 
 ## INV-4 `storm-escape-required`
