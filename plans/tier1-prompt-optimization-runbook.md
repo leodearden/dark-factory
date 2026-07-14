@@ -176,8 +176,24 @@ rather than relying on these:
 | `mean_verify_attempts_abs_floor` | 1.0 |
 | `min_samples` | 5 (per window) |
 
-The abs-floor value is used **instead of** the relative tolerance whenever a
-metric's baseline reads `0` (avoids flagging on a divide-by-near-zero blip).
+The abs-floor value is a **floor on the threshold**, not just a
+zero-baseline substitute: `threshold = max(baseline × (1 + rel_tol),
+abs_floor)`. This covers a `0` baseline (the relative term is `0`, so the
+floor alone decides) *and* a small-but-nonzero baseline, where a bare
+relative ratio would otherwise carve out a threshold tighter than the
+floor and flag ordinary noise as a regression (e.g. `requeue_rate` baseline
+`0.02` at 20% tolerance would relatively-threshold at `0.024` — well under
+the `0.05` floor — without the `max()`).
+
+**Watch for a `NOTE: ... window has ZERO done rows` line.** A window can
+clear `min_samples` on total row count while having zero `outcome=='done'`
+rows (e.g. a deploy that made everything requeue or fail outright,
+completing nothing) — `cost_per_done_task` is then incomparable and
+`mean_review_cycles`/`mean_verify_attempts` fall back to `0.0`, so the
+verdict quietly reduces to `requeue_rate` alone instead of tripping
+`insufficient_data`. The CLI surfaces this explicitly rather than letting
+it read as a clean `pass`; treat a `NOTE`-flagged `pass` as unverified, not
+confirmed-healthy.
 
 **Verdict is one of three states**, printed with a per-metric `[PASS]` /
 `[REGRESS]` / `[SKIP]` line and a summary; exit code lets a script branch on
