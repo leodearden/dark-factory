@@ -46,10 +46,24 @@ class TestCuratorActionScorerProtocolConformance:
         result = await scorer.score(_item('create'), {'action': 'create'})
         assert result == 1.0
 
-    def test_score_result_is_in_unit_interval(self) -> None:
-        # Sanity on the contract shape shared across every branch below --
-        # exercised concretely per-branch in the test classes that follow.
-        assert 0.0 <= 1.0 <= 1.0
+    @pytest.mark.asyncio
+    async def test_score_result_is_in_unit_interval(self) -> None:
+        # The [0,1] contract, asserted directly against the scorer's actual
+        # output across create/drop/combine-match/combine-mismatch branches
+        # (each branch's exact expected value is pinned separately by the
+        # test classes that follow -- this only pins the shared bound).
+        scorer = CuratorActionScorer()
+        cases: list[tuple[Any, dict[str, Any]]] = [
+            (_item('create'), {'action': 'create'}),
+            (_item('drop'), {'action': 'create'}),
+            (_item('combine', target_fingerprint='Fix the thing'),
+             {'action': 'combine', 'target_fingerprint': 'Fix the thing'}),
+            (_item('combine', target_fingerprint='Fix the thing'),
+             {'action': 'combine', 'target_fingerprint': 'A different task'}),
+        ]
+        for item, rollout in cases:
+            score = await scorer.score(item, rollout)
+            assert 0.0 <= score <= 1.0
 
 
 class TestCuratorActionScorerActionEquality:
