@@ -398,3 +398,62 @@ class TestPlanGoldenDataModule:
         assert run.reason
         assert DATA_MODULE_DIFF[0] in run.reason
         assert '1852' in run.reason
+
+
+# ── step-7/8: Scenario 5 — plan golden: structural file -> unscoped pyright,
+#              module + fallback paths (D2); Boundary-test sketch row 5 ─────
+
+# A Protocol-defining source file (D2): file-scoped pyright cannot verify
+# cross-file Protocol conformance, so a STRUCTURAL file must widen pyright to
+# the unscoped package-wide command in BOTH the module and fallback paths.
+# Reconstructed verbatim from test_verify_plan.py's own golden fixture.
+STRUCTURAL_DIFF: list[str] = ['orchestrator/src/orchestrator/interfaces.py']
+
+
+class TestPlanGoldenStructural:
+    """Scenario 5 — GOLDEN D2: a Protocol-bearing source file widens pyright
+
+    to the unscoped FULL_SUITE command (never file-scoped — cross-file
+    Protocol conformance can't be checked from one file) and skips pytest,
+    in BOTH the module-config path and the fallback path (the latent gap
+    _build_fallback_config never closed).
+
+    RED until step-8 seeds _FAKE_FILE_CONTENTS with STRUCTURAL_DIFF[0]'s
+    Protocol-bearing content — STRUCTURAL is only detected when content is
+    read, and fake_worktree_reader returns None for any unseeded path.
+    """
+
+    def test_structural_file_full_suites_pyright_module_path(self):
+        mc = ModuleConfig(
+            prefix='orchestrator',
+            test_command='uv run --project orchestrator --directory orchestrator pytest tests/',
+            type_check_command=(
+                'uv run --project orchestrator --directory orchestrator pyright src/ tests/'
+            ),
+        )
+        plan = derive_verify_plan(STRUCTURAL_DIFF, [mc], None, fake_worktree_reader)
+
+        pyright_run = _run_for(plan, 'orchestrator', 'pyright:')
+        assert pyright_run is not None
+        assert pyright_run.scope_kind is ScopeKind.FULL_SUITE
+        assert mc.type_check_command is not None
+        assert pyright_run.cmd == parse_config_command(mc.type_check_command)
+        assert STRUCTURAL_DIFF[0] in pyright_run.reason
+
+        pytest_run = _run_for(plan, 'orchestrator', 'pytest:')
+        assert pytest_run is not None
+        assert pytest_run.scope_kind is ScopeKind.SKIPPED
+
+    def test_structural_file_full_suites_pyright_fallback_path(self):
+        config = OrchestratorConfig(project_root=Path('/fake'), test_command='pytest')
+        plan = derive_verify_plan(STRUCTURAL_DIFF, [], config, fake_worktree_reader)
+
+        pyright_run = _run_for(plan, '__fallback__', 'pyright:')
+        assert pyright_run is not None
+        assert pyright_run.scope_kind is ScopeKind.FULL_SUITE
+        assert pyright_run.cmd == parse_config_command(config.type_check_command)
+        assert STRUCTURAL_DIFF[0] in pyright_run.reason
+
+        pytest_run = _run_for(plan, '__fallback__', 'pytest:')
+        assert pytest_run is not None
+        assert pytest_run.scope_kind is ScopeKind.SKIPPED
