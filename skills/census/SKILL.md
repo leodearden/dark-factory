@@ -25,7 +25,7 @@ Before running, confirm there's something worth mining and headroom to mine it:
    ```
    Look for recent successful runs and a logged census-trigger decision line each time. If the trickle unit isn't installed or hasn't run recently, the codebook may be stale or empty — a census can still run, but expect a smaller/duller sweep (more likely to saturate on near-zero novel sightings).
 2. **Fresh codebook sightings exist.** Skim `docs/legibility/confusion-codebook.yaml` for recent `sightings`/`candidates` dates. A census mines fresh ground beyond what's already coded — if the codebook hasn't moved in weeks, mining will spend most of its budget rediscovering what's already known before saturating.
-3. **Usage headroom.** The run itself preflights this (`preflight_headroom` — a cheap probe against the mining model that defers the whole run rather than burning budget mid-sweep on a rate-limited/degraded session), but it's worth a sanity glance yourself first: mining uses Sonnet (`census_miner`), synthesis uses Fable exclusively (`census_synthesis`) — make sure neither is already under heavy load from other concurrent work before kicking off a long saturation-mining sweep.
+3. **Usage headroom.** The run itself preflights this (`preflight_headroom` — a cheap probe against the lightweight trickle model (haiku) that defers the whole run rather than burning budget mid-sweep on a rate-limited/degraded session), but it's worth a sanity glance yourself first: mining uses Sonnet (`census_miner`), synthesis uses Fable exclusively (`census_synthesis`) — make sure neither is already under heavy load from other concurrent work before kicking off a long saturation-mining sweep.
 
 ## Running the census
 
