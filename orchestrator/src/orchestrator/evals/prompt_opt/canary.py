@@ -17,11 +17,13 @@ lever (D-4).
 
 from __future__ import annotations
 
+import sqlite3
 from collections.abc import Iterable
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any
 
-__all__ = ['WindowMetrics', 'compute_window_metrics']
+__all__ = ['Row', 'WindowMetrics', 'compute_window_metrics', 'load_window_rows']
 
 
 def _field(row: Any, name: str) -> Any:
@@ -105,3 +107,53 @@ def compute_window_metrics(rows: Iterable[Any]) -> WindowMetrics:
         mean_review_cycles=mean_review_cycles,
         mean_verify_attempts=mean_verify_attempts,
     )
+
+
+@dataclass(frozen=True)
+class Row:
+    """One ``task_results`` row, narrowed to the five columns
+    :func:`compute_window_metrics` needs."""
+
+    outcome: str
+    cost_usd: float
+    steward_cost_usd: float
+    review_cycles: int
+    verify_attempts: int
+
+
+def load_window_rows(
+    db_path: Path, start_iso: str, end_iso: str, project_id: str,
+) -> list[Row]:
+    """Read ``task_results`` rows for *project_id* in the half-open window
+    ``[start_iso, end_iso)`` from the ``runs.db`` at *db_path*.
+
+    ISO-8601 ``completed_at`` values compare correctly as plain strings
+    (lexicographic == chronological order for zero-padded ISO-8601), the
+    same half-open-range convention
+    ``dashboard.data.performance`` uses. Read-only sync ``sqlite3`` — no
+    durability pragmas needed, mirroring
+    ``reviewer_trial.__main__._fetch_titles`` /
+    ``reviewer_trial.mining.mine_fn_candidates``.
+    """
+    conn = sqlite3.connect(str(db_path))
+    try:
+        cursor = conn.execute(
+            """
+            SELECT outcome, cost_usd, steward_cost_usd, review_cycles, verify_attempts
+            FROM task_results
+            WHERE completed_at >= ? AND completed_at < ? AND project_id = ?
+            """,
+            (start_iso, end_iso, project_id),
+        )
+        return [
+            Row(
+                outcome=outcome,
+                cost_usd=cost_usd,
+                steward_cost_usd=steward_cost_usd,
+                review_cycles=review_cycles,
+                verify_attempts=verify_attempts,
+            )
+            for outcome, cost_usd, steward_cost_usd, review_cycles, verify_attempts in cursor.fetchall()
+        ]
+    finally:
+        conn.close()
