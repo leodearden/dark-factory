@@ -653,10 +653,16 @@ class TestReconcileStrandedInProgress:
                 r'(unreadable|corrupt).*leaving worktree intact',
                 id='non-dict-json',
             ),
-            # (c) Numeric-string owner_pid of a live process → task NOT reverted
-            #     Exercises the int(owner_pid) cast path with a string value
+            # (c) Numeric-string owner_pid of a live process → task IS reverted.
+            #     Task 2243, W10-θ2 step-16: the applier no longer re-derives
+            #     plan.lock owner_pid liveness (formerly this case's live pid
+            #     short-circuited the revert here) — recovery_for's
+            #     live_claimant already ruled out a live claimant (this
+            #     lock's locked_at is far outside heartbeat_ttl, so the
+            #     resolver treats it as stale regardless of pid liveness)
+            #     before REVERT_TO_PENDING reaches the applier.
             pytest.param(
-                'LIVE_PID', 11, False, True, None,
+                'LIVE_PID', 11, True, False, None,
                 id='live-pid-as-string',
             ),
             # (d1) No lock file, id as int → reverted via no-lock branch

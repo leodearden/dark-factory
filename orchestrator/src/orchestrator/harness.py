@@ -71,7 +71,12 @@ from orchestrator.systemd_inspect import (
     _deterministic_deploy_health_verdict,
     inspect_systemd_unit,
 )
-from orchestrator.task_ground_truth import BranchStateKind, RecoveryAction, TaskGroundTruth
+from orchestrator.task_ground_truth import (
+    BranchStateKind,
+    ClaimantSource,
+    RecoveryAction,
+    TaskGroundTruth,
+)
 from orchestrator.task_status import (
     ACTIVE_TASK_STATUSES,
     TERMINAL_STATUSES,
@@ -3586,9 +3591,11 @@ Output JSON matching the schema. Every task must appear in the output.
         # table maps a stranded in-progress task with no live claimant and no
         # on-main landing evidence (branch EXISTS_OFF_MAIN or GONE_NO_MARKER)
         # straight to REVERT_TO_PENDING — retiring the inline branch-state
-        # derivation this dispatch used to require. The applier itself still
-        # owns the actual plan.lock/worktree liveness classification (kept
-        # per the design decision — see _revert_in_progress_if_no_live_claimant).
+        # derivation this dispatch used to require. Step-16 also retired the
+        # applier's own plan.lock owner_pid liveness re-derivation — it now
+        # trusts recovery_for's live_claimant and owns only the worktree
+        # cleanup / lock unlink / retention bookkeeping side effects (see
+        # _revert_in_progress_if_no_live_claimant).
         if action == RecoveryAction.REVERT_TO_PENDING:
             return await self._revert_in_progress_if_no_live_claimant(
                 tid, mid_run=mid_run, metadata=metadata, status=status,
@@ -3707,23 +3714,33 @@ Output JSON matching the schema. Every task must appear in the output.
         if report.open_escalations:
             return None
 
-        # Deliberately NOT a blanket `if action == RecoveryAction.LEAVE:
-        # return None` here: report.live_claimant also goes non-None on a
-        # plan.lock-derived claimant (owner_pid alive + fresh timestamp),
-        # which — unlike is_actively_held — the applier below DOES still
-        # independently classify (including the R3 mid-run exception: an
-        # alive owner_pid that isn't in the dispatch table is a workflow
-        # that exited without releasing the lock, and must still be
-        # reaped). That plan.lock re-derivation is only retired once the
-        # applier itself is simplified (plan steps 15/16); until then it
-        # must still run for every case besides the two explicit vetoes
-        # above.
-        #
-        # 'in-progress', not on main, no is_actively_held/open-escalation
-        # signal: classify by plan.lock state and revert to pending if no
-        # live owner.  Shared with the is_ancestor==True
-        # degenerate-provisioning-branch guards above so a never-advanced
-        # branch (the 2992 strand) is recovered, not left to sit.
+        # A live claimant is a deliberate leave-alone (task 2243, W10-θ2
+        # step-16 — this blanket check replaces the applier's own owner_pid
+        # re-derivation, now retired), EXCEPT the R3 mid-run exception: a
+        # plan.lock's owner_pid is almost always the harness's OWN pid (it
+        # stamps the lock on behalf of whichever workflow it runs), so an
+        # alive owner_pid there proves nothing about whether that workflow
+        # is still running — is_actively_held (already checked above, and
+        # already False here) is the authoritative live signal mid-run, so a
+        # PLAN_LOCK-sourced claimant must still fall through to recovery
+        # mid-run (a workflow that exited without releasing the lock). A
+        # startup sweep (mid_run=False) has no such live-tracking fallback,
+        # so a fresh plan.lock is trusted at face value there. A DB- or
+        # in-memory-sourced claimant has no such false-positive mode and
+        # always leaves alone regardless of mid_run.
+        live_claimant = report.live_claimant
+        if live_claimant is not None:
+            plan_lock_mid_run_exception = (
+                mid_run and live_claimant.source == ClaimantSource.PLAN_LOCK
+            )
+            if not plan_lock_mid_run_exception:
+                return None
+
+        # 'in-progress', not on main, no live claimant (or the mid-run R3
+        # plan.lock exception above): revert to pending.  Shared with the
+        # is_ancestor==True degenerate-provisioning-branch guards above so a
+        # never-advanced branch (the 2992 strand) is recovered, not left to
+        # sit.
         return await self._revert_in_progress_if_no_live_claimant(
             tid, mid_run=mid_run, metadata=metadata, status=status,
         )
@@ -3732,19 +3749,20 @@ Output JSON matching the schema. Every task must appear in the output.
         self, tid: str, *, mid_run: bool, metadata: dict | None = None,
         status: str | None = None,
     ) -> str | None:
-        """Revert a stranded in-progress task to pending when no live claimant.
+        """Revert a stranded in-progress task to pending (REVERT_TO_PENDING applier).
 
         Returns ``'reverted'`` (status flipped to pending) or ``None`` (left
-        intact — a live ``owner_pid`` on a startup sweep, or an unreadable lock
-        failing closed).
+        intact — an infra-held non-degenerate branch, or an unreadable lock
+        failing closed on a startup sweep).
 
-        Extracted from ``_reconcile_one_stranded`` so the is_ancestor==True
-        degenerate-provisioning-branch guards (#1823 / the task-2992 strand)
-        can reuse the exact plan.lock liveness classification instead of
-        returning ``None`` and stranding the task in-progress forever.  Callers
-        guarantee ``status == 'in-progress'`` and that the open-L1 human-handoff
-        veto has already been checked (Guard 1 in the is_ancestor block; the
-        explicit in-progress L1 guard on the not-on-main path).
+        Callers only reach this on the REVERT_TO_PENDING action:
+        ``TaskGroundTruth.recovery_for``'s ``live_claimant`` resolution has
+        already established there is no live claimant (task 2243, W10-θ2
+        step-16 — the plan.lock owner_pid liveness re-derivation formerly
+        performed directly in this function is retired as redundant). This
+        function owns only the physical side effects: worktree cleanup,
+        plan.lock unlink, and the ``_recovered_plans``/``_preserved_worktrees``
+        retention bookkeeping.
 
         For warm tasks the real worktree is the assigned pool lane, not
         ``worktree_base/<tid>``.  ``_resolve_task_worktree`` handles both cases.
@@ -3887,32 +3905,21 @@ Output JSON matching the schema. Every task must appear in the output.
                     ' during mid-run sweep; treating as stale and reaping',
                     tid,
                 )
-                owner_alive = False  # fall through to stale-lock cleanup below
-        else:
-            # Valid dict — use the existing owner_pid liveness logic.
-            owner_alive = False
-            owner_pid = lock_data.get('owner_pid')  # type: ignore[union-attr]
-            if owner_pid is None:
-                logger.warning(
-                    'Reconcile: plan.lock for task %s has no owner_pid;'
-                    ' treating as stale',
-                    tid,
-                )
-            else:
-                try:
-                    owner_alive = _pid_alive(int(owner_pid))
-                except (TypeError, ValueError):
-                    owner_alive = False
+        elif lock_data.get('owner_pid') is None:  # type: ignore[union-attr]
+            # Missing owner_pid: still an observability breadcrumb for which
+            # stale-lock variant triggered the cleanup below, even though the
+            # applier no longer branches on it (see docstring: liveness is
+            # the resolver's call now).
+            logger.warning(
+                'Reconcile: plan.lock for task %s has no owner_pid;'
+                ' treating as stale',
+                tid,
+            )
 
-        # R3: during a mid_run sweep, owner_pid is almost always the harness
-        # PID (which IS alive by definition).  The dispatch-table filter at
-        # the top of the loop already excluded actively-held tasks; if we
-        # made it here, the workflow has exited without releasing the lock.
-        # Treat the lock as stale and fall through to recovery.
-        if owner_alive and not mid_run:
-            return None  # Live claimant outside our run — leave alone.
-
-        # Stale lock (or mid_run-and-not-active) — clear it and revert.
+        # Lock present — recovery_for's live_claimant has already ruled out
+        # a live claimant before dispatching REVERT_TO_PENDING here (task
+        # 2243, W10-θ2 step-16: the owner_pid liveness re-derivation formerly
+        # gating this point is retired as redundant). Clear the lock and revert.
         if (
             tid not in self._recovered_plans
             and tid not in self._preserved_worktrees
