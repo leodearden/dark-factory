@@ -777,6 +777,109 @@ def _parse_pi_output(
     )
 
 
+async def _invoke_pi(
+    prompt: str,
+    system_prompt: str,
+    cwd: Path,
+    model: str,
+    max_budget_usd: float,
+    allowed_tools: list[str] | None,
+    disallowed_tools: list[str] | None,
+    mcp_config: dict | None,
+    sandbox_modules: list[str] | None,
+    effort: str | None,
+    oauth_token: str | None = None,
+    resume_session_id: str | None = None,
+    session_id: str | None = None,
+    timeout_seconds: float | None = None,
+    env_overrides: dict[str, str] | None = None,
+    prices: dict[str, Any] | None = None,
+) -> AgentResult:
+    """Invoke the pi coding agent CLI (@earendil-works/pi-coding-agent).
+
+    Mirrors _invoke_codex's shape; every divergence is wired STRICTLY from
+    the T2 empirical spike (plans/pi-spike-findings.md) — see that doc and
+    the _parse_pi_output/_pi_tool_name docstrings above for the observed
+    evidence behind each choice.
+    """
+    temp_files: list[Path] = []
+    mcp_backup: tuple[Path, Path] | None = None
+    try:
+        # --session-dir: a git-excluded per-task dir (.gitignore already
+        # excludes .task/ wholesale) as the durable JSONL liveness/telemetry
+        # surface (spike Q5). pi writes no instruction file into the
+        # worktree at all, so the codex AGENTS.md-in-diff hazard (T3)
+        # simply does not apply here.
+        session_dir = cwd / '.task' / 'pi-sessions'
+        session_dir.mkdir(parents=True, exist_ok=True)
+
+        cmd = [
+            'pi', '--model', model, '--mode', 'json', '-p',
+            '--session-dir', str(session_dir),
+            '--system-prompt', system_prompt,
+        ]
+
+        if resume_session_id:
+            cmd.extend(['--session', resume_session_id])
+        elif session_id:
+            cmd.extend(['--session-id', session_id])
+
+        tool_names = [_pi_tool_name(t) for t in (allowed_tools or [])]
+        tools_csv = ','.join(name for name in tool_names if name)
+        if tools_csv:
+            cmd.extend(['--tools', tools_csv])
+
+        if mcp_config:
+            # pi (per the spike) reads MCP servers from .mcp.json in its
+            # cwd — no non-cwd config-path flag was observed in the spike
+            # (see _write_pi_mcp_config). Back up any pre-existing
+            # .mcp.json (e.g. the repo's own committed one) and restore it
+            # in `finally` so this run's config never clobbers or leaks
+            # into the worktree.
+            mcp_json_path = cwd / '.mcp.json'
+            if mcp_json_path.exists():
+                backup_path = cwd / '.mcp.json.pi-invoke-backup'
+                mcp_json_path.replace(backup_path)
+                mcp_backup = (mcp_json_path, backup_path)
+            else:
+                temp_files.append(mcp_json_path)
+            _write_pi_mcp_config(mcp_json_path, mcp_config)
+
+        cmd.append(prompt)
+
+        if sandbox_modules is not None:
+            from orchestrator.agents.sandbox_dispatch import wrap_command
+            cmd = wrap_command(cmd, cwd, sandbox_modules)
+
+        env = dict(os.environ)
+        if oauth_token:
+            env['ANTHROPIC_OAUTH_TOKEN'] = oauth_token
+        if env_overrides:
+            env.update(env_overrides)
+
+        result = await _run_subprocess_local(cmd, cwd, env, 'pi', model, max_budget_usd, timeout_seconds)
+        return _parse_pi_output(result, model, prices)
+
+    finally:
+        if mcp_backup is not None:
+            target, backup = mcp_backup
+            target.unlink(missing_ok=True)
+            backup.replace(target)
+        for f in temp_files:
+            f.unlink(missing_ok=True)
+
+
+def _write_pi_mcp_config(config_path: Path, mcp_config: dict) -> None:
+    """Write pi's MCP server config in .mcp.json shape, injecting
+    ``"directTools": true`` on every server (spike Q3 — required so each
+    MCP tool is individually allowlistable via --tools/--exclude-tools;
+    without it, pi-mcp-adapter exposes only the proxy `mcp` tool).
+    """
+    servers = mcp_config.get('mcpServers', {})
+    out_servers = {name: {**cfg, 'directTools': True} for name, cfg in servers.items()}
+    config_path.write_text(json.dumps({'mcpServers': out_servers}, indent=2))
+
+
 # ---------------------------------------------------------------------------
 # Shared helpers (orchestrator-local, for non-Claude backends)
 # ---------------------------------------------------------------------------
