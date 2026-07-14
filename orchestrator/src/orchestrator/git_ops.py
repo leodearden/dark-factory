@@ -7010,10 +7010,11 @@ class GitOps:
 
         # ── Working-tree protection ──────────────────────────────────
         # When project_root has main checked out, update-ref will desync
-        # the working tree from HEAD.  Stash any uncommitted work first,
-        # sync after, then pop.  This prevents silent reverts (see 0ea23cb5c).
+        # the working tree from HEAD.  Park any uncommitted work on the
+        # private MERGE_PARK_REF first, sync after, then restore.  This
+        # prevents silent reverts (see 0ea23cb5c).
         is_on_main = False
-        did_stash = False
+        did_park = False
 
         rc, current_branch, _ = await _run(
             ['git', 'symbolic-ref', '--short', 'HEAD'],
@@ -7076,24 +7077,26 @@ class GitOps:
                         )
                         return AdvanceOutcome('wip_overlap')
 
-                # Only stash if there are tracked dirty files.  Untracked-only
-                # (??) entries survive read-tree without conflict — stashing
-                # them risks spurious pop failures (e.g. .worktrees/).
+                # Only park if there are tracked dirty files.  Untracked-only
+                # (??) entries survive read-tree without conflict — parking
+                # them risks spurious apply failures (e.g. .worktrees/).
                 if dirty_tracked:
-                    stash_rc, _, stash_err = await _run(
-                        ['git', 'stash', 'push', '-m',
-                         f'merge-queue: pre-advance for {branch or merge_sha[:8]}'],
-                        cwd=self.project_root,
-                    )
-                    if stash_rc != 0:
+                    try:
+                        await self._park_wip_on_private_ref(branch or merge_sha[:8])
+                    except MergeParkError as e:
+                        # Covers the create/update-ref infra-failure case.
+                        # A stale/contended ref (MergeParkContentionError, a
+                        # subclass) is also caught here for now — task 2556
+                        # step-8 adds a more specific except clause with a
+                        # distinct CRITICAL message for that case.
                         logger.error(
-                            'CRITICAL: git stash push failed before advance_main '
+                            'CRITICAL: park failed before advance_main '
                             '— halting merge to prevent code loss. error=%s',
-                            stash_err,
+                            e,
                         )
                         return AdvanceOutcome('stash_failed')
-                    did_stash = True
-                    logger.info('Stashed uncommitted changes before advance_main')
+                    did_park = True
+                    logger.info('Parked uncommitted changes before advance_main')
 
         # ── Main-gate mark (best-effort) ─────────────────────────────────
         # Run the project-configurable sentinel command immediately before
@@ -7161,7 +7164,7 @@ class GitOps:
             # does NOT leave UU markers in project_root and is escalated to
             # humans rather than silently cascading to 'stash_failed' on the
             # next cycle.
-            if did_stash:
+            if did_park:
                 pop_ok, recovery = await self._safe_stash_pop_with_recovery(
                     branch or merge_sha[:8],
                 )
@@ -7199,7 +7202,7 @@ class GitOps:
                     'is stale. error=%s', sync_err,
                 )
 
-            if did_stash:
+            if did_park:
                 pop_ok, recovery = await self._safe_stash_pop_with_recovery(
                     branch or merge_sha[:8],
                 )
@@ -7465,11 +7468,13 @@ class GitOps:
         )
 
     async def _create_recovery_branch_from_stash(self, label: str) -> str:
-        """Create a branch from the current stash to preserve WIP, then clean up.
+        """Create a branch from MERGE_PARK_REF to preserve WIP, then clean up.
 
         1. Create a deterministic branch name.
-        2. ``git branch <name> stash@{0}`` — makes the stash commit reachable.
-        3. ``git stash drop`` — safe now (WIP reachable via branch).
+        2. ``git branch <name> MERGE_PARK_REF`` — makes the parked commit
+           reachable from a plain branch.
+        3. ``git update-ref -d MERGE_PARK_REF`` — safe now (WIP reachable
+           via the branch); frees the private ref for the next park.
         4. ``git read-tree -u --reset HEAD`` — clean working tree (removes
            conflict markers and UU state).
 
@@ -7480,13 +7485,13 @@ class GitOps:
         iso = datetime.now(UTC).strftime('%Y%m%dT%H%M%S')
         name = f'wip/recovery-{label}-{iso}'
 
-        # Create branch pointing at the stash commit
+        # Create branch pointing at the parked commit
         await _run(
-            ['git', 'branch', name, 'stash@{0}'],
+            ['git', 'branch', name, MERGE_PARK_REF],
             cwd=self.project_root,
         )
-        # Drop the stash entry (WIP is now reachable via the branch)
-        await _run(['git', 'stash', 'drop'], cwd=self.project_root)
+        # Delete the private ref (WIP is now reachable via the branch)
+        await _run(['git', 'update-ref', '-d', MERGE_PARK_REF], cwd=self.project_root)
         # Reset working tree to HEAD (removes conflict markers / UU state)
         await _run(
             ['git', 'read-tree', '-u', '--reset', 'HEAD'],
@@ -7497,29 +7502,36 @@ class GitOps:
     async def _safe_stash_pop_with_recovery(
         self, label: str,
     ) -> tuple[bool, str | None]:
-        """Pop ``stash@{0}`` and preserve WIP on a recovery branch if it conflicts.
+        """Apply MERGE_PARK_REF and preserve WIP on a recovery branch if it conflicts.
 
-        1. Run ``git stash pop``.
+        1. Run ``git stash apply MERGE_PARK_REF`` — restores WIP from the
+           private ref the merge worker exclusively owns, never the shared
+           stash stack.
         2. Check return code AND ``_detect_unmerged_paths`` — either signal
            is sufficient to declare failure (belt-and-braces).
         3. On failure: call ``_create_recovery_branch_from_stash(label)``
-           which saves the stash to a branch, drops the stash entry, and
-           resets the working tree to HEAD.
-        4. Return ``(True, None)`` on clean pop, or
+           which branches off MERGE_PARK_REF, deletes the ref, and resets
+           the working tree to HEAD.
+        4. On success: delete MERGE_PARK_REF (WIP is now applied to the
+           working tree).
+        5. Return ``(True, None)`` on clean apply, or
            ``(False, recovery_branch_name)`` on conflict.
         """
-        pop_rc, _, pop_err = await _run(['git', 'stash', 'pop'], cwd=self.project_root)
+        pop_rc, _, pop_err = await _run(
+            ['git', 'stash', 'apply', MERGE_PARK_REF], cwd=self.project_root,
+        )
         unmerged = await self._detect_unmerged_paths(self.project_root)
 
         if pop_rc != 0 or unmerged:
             logger.warning(
-                'Stash pop failed (rc=%d, unmerged=%s, err=%s) for label %r — '
+                'Stash apply failed (rc=%d, unmerged=%s, err=%s) for label %r — '
                 'creating recovery branch to preserve WIP.',
                 pop_rc, unmerged or [], pop_err, label,
             )
             recovery = await self._create_recovery_branch_from_stash(label)
             return (False, recovery)
 
+        await _run(['git', 'update-ref', '-d', MERGE_PARK_REF], cwd=self.project_root)
         return (True, None)
 
     async def has_dirty_working_tree(self) -> str:
