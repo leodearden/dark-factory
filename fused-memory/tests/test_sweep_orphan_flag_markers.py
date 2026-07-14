@@ -248,6 +248,61 @@ class TestFindTasklessMarkers:
 
 
 # ===========================================================================
+# Tests: classify_marker_task_id
+# ===========================================================================
+
+class TestClassifyMarkerTaskId:
+    """Tests for the pure function classify_marker_task_id(tid) (task 2596).
+
+    Buckets a marker's ``task_id`` into one of four shapes so the sweep can
+    report per-bucket counts and route the age/terminal predicates. Splits
+    on ',' and validates each sub-id individually — AMENDMENT 1: a naive
+    whole-string ``isdigit()`` would mis-bucket a comma-joined tid like the
+    live record a07972e7's ``'1944,2408'``.
+    """
+
+    @pytest.mark.parametrize('tid', ['2408', '2315'])
+    def test_numeric(self, tid):
+        """A single all-digit task_id string is classified 'numeric'."""
+        assert _mod.classify_marker_task_id(tid) == 'numeric', (
+            f'Expected numeric for {tid!r}'
+        )
+
+    def test_fp_hash(self):
+        """A canonical 'fp:' + 32-hex-char task_id is classified 'fp_hash'."""
+        tid = 'fp:' + 'a' * 32
+        assert _mod.classify_marker_task_id(tid) == 'fp_hash', (
+            f'Expected fp_hash for {tid!r}'
+        )
+
+    @pytest.mark.parametrize('tid', ['1944,2408', '2405, 540'])
+    def test_comma_joined(self, tid):
+        """A comma-joined multi-id string (with or without spaces around
+        components) is classified 'comma_joined'."""
+        assert _mod.classify_marker_task_id(tid) == 'comma_joined', (
+            f'Expected comma_joined for {tid!r}'
+        )
+
+    @pytest.mark.parametrize('tid', [None, '', 'garbage', 'fp:bad', '12,x'])
+    def test_null_or_invalid(self, tid):
+        """None, empty string, non-numeric garbage, a malformed 'fp:'
+        variant, and a comma-joined string with a non-digit component are
+        all classified 'null_or_invalid'."""
+        assert _mod.classify_marker_task_id(tid) == 'null_or_invalid', (
+            f'Expected null_or_invalid for {tid!r}'
+        )
+
+    def test_splits_on_comma_never_naive_isdigit_on_whole_string(self):
+        """Pin that comma-joined classification splits on ',' and validates
+        each sub-id, rather than calling ``.isdigit()`` on the whole string
+        (which is False for any comma-joined value and would otherwise risk
+        mis-bucketing it). Live record a07972e7 carries task_id='1944,2408'.
+        """
+        assert '1944,2408'.isdigit() is False, 'sanity: whole-string isdigit is False'
+        assert _mod.classify_marker_task_id('1944,2408') == 'comma_joined'
+
+
+# ===========================================================================
 # Tests: delete_orphan_markers
 # ===========================================================================
 
