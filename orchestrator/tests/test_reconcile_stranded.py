@@ -18,7 +18,19 @@ from escalation.queue import EscalationQueue
 
 from orchestrator.config import GitConfig, OrchestratorConfig
 from orchestrator.harness import Harness, _pid_alive
+from orchestrator.landed_outbox import LandedOutbox, LandedRow, MergeProvenance
 from orchestrator.warm_lane_pool import WarmLanePool
+
+
+@pytest.fixture(autouse=True)
+def _reset_merge_provenance():
+    """MergeProvenance._outbox is a process-global — never leak a bound
+    outbox into another test (mirrors test_workflow_merge_provenance.py's
+    and test_task_ground_truth.py's identically-named fixture)."""
+    MergeProvenance._outbox = None
+    yield
+    MergeProvenance._outbox = None
+
 
 # ---------------------------------------------------------------------------
 # _pid_alive helper tests
