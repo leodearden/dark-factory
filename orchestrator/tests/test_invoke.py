@@ -700,6 +700,48 @@ class TestInvokePiFlags:
 
 
 @pytest.mark.asyncio
+class TestInvokeAgentPiDispatch:
+    """invoke_agent(backend='pi', ...) dispatches to _invoke_pi, forwarding
+    the backend-relevant fields (deliverable #5); the Unknown-backend guard
+    is unchanged."""
+
+    async def test_dispatches_to_invoke_pi_with_forwarded_kwargs(self, tmp_path):
+        sentinel = AgentResult(success=True, output='ok')
+        prices = {'x': {'input_per_1m': 1.0, 'output_per_1m': 1.0}}
+        mcp_cfg = {'mcpServers': {}}
+        with patch(
+            'orchestrator.agents.invoke._invoke_pi',
+            new_callable=AsyncMock, return_value=sentinel,
+        ) as mock_invoke_pi:
+            result = await invoke_agent(
+                prompt='p', system_prompt='s', cwd=tmp_path,
+                backend='pi', model='anthropic/claude-haiku-4-5',
+                allowed_tools=['Bash'], disallowed_tools=None,
+                mcp_config=mcp_cfg, oauth_token='tok', session_id='sid',
+                prices=prices, timeout_seconds=30.0,
+            )
+
+        assert result is sentinel
+        mock_invoke_pi.assert_awaited_once()
+        kwargs = mock_invoke_pi.call_args.kwargs
+        assert kwargs.get('allowed_tools') == ['Bash']
+        assert kwargs.get('mcp_config') is mcp_cfg
+        assert kwargs.get('oauth_token') == 'tok'
+        assert kwargs.get('session_id') == 'sid'
+        assert kwargs.get('prices') is prices
+        assert kwargs.get('model') == 'anthropic/claude-haiku-4-5'
+        assert kwargs.get('system_prompt') == 's'
+        assert kwargs.get('cwd') == tmp_path
+
+    async def test_unknown_backend_still_raises_value_error(self, tmp_path):
+        with pytest.raises(ValueError):
+            await invoke_agent(
+                prompt='p', system_prompt='s', cwd=tmp_path,
+                backend='totally-unknown',
+            )
+
+
+@pytest.mark.asyncio
 class TestSandboxPathForwardsSessionConfig:
     """_invoke_claude_with_sandbox sandbox path must forward session_id + config_dir to _run_subprocess.
 
