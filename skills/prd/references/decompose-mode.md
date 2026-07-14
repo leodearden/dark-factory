@@ -64,6 +64,8 @@ PRD-decomposition batches are the canonical use case for `planning_mode=True`. *
 
 `planning_mode=True` is **synchronous** and **bypasses the curator**. `submit_task` returns `{task_id, status: "deferred", planning_mode: True}` directly — there is no ticket, no `resolve_ticket` follow-up, no curator `combined` outcome. (The two-phase `submit_task` + `resolve_ticket` pattern applies only to `planning_mode=False`, which decompose mode never uses.)
 
+**Declare every leaf's execution path.** `planning_mode` bypasses the curator-side routing guards (1898/2225/2085) that would otherwise infer `task_kind`/`execution_class` — so the `submit_task` routing-intent lint runs at this boundary instead: a `task_kind="normal"` leaf whose own title/description/details declare a *different* execution path (e.g. "DO NOT IMPLEMENT", "no-code", "deterministic; no worktree", "escalate to a human instead of implementing") gets flagged (or, in enforce mode, rejected) because it carries no matching declaration. Set `task_kind` explicitly on every leaf (`"normal"` for code_tdd work; `"deterministic"` for a deploy/gate leaf — see `CLAUDE.md` "Deterministic task kind"), and set `metadata.execution_class` to `"operational"` or `"decision"` when the leaf is genuinely non-code work, so the lint reads it as an honest declaration rather than a mismatch.
+
 For each task in the plan, in dependency order (roots first):
 
 ```
@@ -80,6 +82,7 @@ Modules touched: <list>
     project_root="<project_root>",
     priority="<medium|high|critical>",
     planning_mode=True,
+    task_kind="normal",   # declare the execution path explicitly — "deterministic" for a deploy/gate leaf
     metadata={
         "source": "prd-decomposition",
         "prd_path": "<prd-path>",
@@ -89,6 +92,7 @@ Modules touched: <list>
         "grammar_confirmed": True,   # or the overlay's substrate-confirmed flag name
         "modules": ["<module_path>", ...],
         # "g7_waivers": [{"invariant": "<slug>", "rationale": "<text>"}],  # only if Step 2.3 recorded a waiver for this task
+        # "execution_class": "operational" | "decision",  # only if this leaf is genuinely non-code work
     },
 )
 task_id = result["task_id"]   # status == "deferred", planning_mode == True
