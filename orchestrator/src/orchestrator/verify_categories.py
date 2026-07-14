@@ -24,9 +24,11 @@ from typing import cast
 
 
 class FailureCategory(StrEnum):
-    """The closed 12-value output domain of ``verify_classify.classify_failure``."""
+    """The closed 14-value output domain of ``verify_classify.classify_failure``."""
 
     INFRA_TIMEOUT = 'infra_timeout'
+    DISK_FULL = 'disk_full'
+    SEMAPHORE_TIMEOUT = 'semaphore_timeout'
     CARGO_CLI_ERROR = 'cargo_cli_error'
     COMPILE_ERROR = 'compile_error'
     TREE_SITTER_GENERATE_ERROR = 'tree_sitter_generate_error'
@@ -43,7 +45,7 @@ class FailureCategory(StrEnum):
 class RetryKind(Enum):
     """How ``run_verification`` recovers from a given category, if at all.
 
-    Populated for all 12 ``CATEGORY_POLICY`` rows per the PRD contract
+    Populated for all 14 ``CATEGORY_POLICY`` rows per the PRD contract
     (plans/verify-plan-prd.md task α item 4: ``CategoryPolicy(severity_rank,
     archive, preexisting_probe, is_infra_transient, retry_kind)``) but NOT
     yet dispatched on. ``run_verification`` still decides retries via two
