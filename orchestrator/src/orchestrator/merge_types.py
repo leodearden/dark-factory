@@ -161,6 +161,8 @@ class TerminalOutcomeRecord:
     """request_id of the gen-(n+1) request that supersedes this one (α1/γ2 provenance)."""
     generation: int = field(default=1, kw_only=True)
     """Generation of the merge request that produced this record (γ2 provenance)."""
+    reason: str | None = field(default=None, kw_only=True)
+    """MergeOutcome.reason for failure outcomes (empty string normalized to None)."""
 
 
 class TerminalOutcomeRetention:

@@ -397,7 +397,7 @@ class EventStore:
 
         The returned dict has keys:
             request_id, task_id, branch, state, snapshot_tip, merge_sha,
-            finished_at (ISO-8601 timestamp string from the events table).
+            reason, finished_at (ISO-8601 timestamp string from the events table).
 
         Returns None on miss, on unknown key, or if all keys are None.
         Errors are logged and return None (read path is fire-safe).
@@ -448,6 +448,7 @@ class EventStore:
                 'snapshot_tip': data.get('snapshot_tip'),
                 'merge_sha': data.get('merge_sha'),
                 'superseded_by': data.get('superseded_by'),
+                'reason': data.get('reason'),
                 'finished_at': timestamp,
             }
         except Exception:
