@@ -196,15 +196,29 @@ class FreshPidVerify:
     unit and persist the baseline BEFORE invoking the restart.
 
     Both baseline fields participate in ``_execute_cross_unit_blocking``'s
-    freshness check: a re-inspected unit counts as "fresh" only when its new
-    MainPID is live (``> 0``) AND differs from ``baseline_main_pid`` AND its
-    ``ActiveEnterTimestampMonotonic`` is strictly later than
-    ``baseline_active_enter_monotonic``. Comparing the persisted PID is a
-    genuinely stronger identity signal than the monotonic timestamp alone
-    (deterministic_runner.py:1624-1630's reference check uses monotonic only,
-    since it never captures a baseline PID to compare) — it requires the
-    process identity to have actually changed, not merely the unit's
-    activation clock.
+    freshness check, which branches on ``baseline_main_pid`` (task 2611):
+
+    - ``baseline_main_pid > 0`` (a persistent-PID daemon was already running
+      at baseline — the common restart-a-long-lived-service case): a
+      re-inspected unit counts as "fresh" only when its new MainPID is live
+      (``> 0``) AND differs from ``baseline_main_pid`` AND its
+      ``ActiveEnterTimestampMonotonic`` is strictly later than
+      ``baseline_active_enter_monotonic``. Comparing the persisted PID is a
+      genuinely stronger identity signal than the monotonic timestamp alone
+      (deterministic_runner.py:1624-1630's reference check uses monotonic
+      only, since it never captures a baseline PID to compare) — it
+      requires the process identity to have actually changed, not merely
+      the unit's activation clock.
+    - ``baseline_main_pid == 0`` (an EMPTY baseline — no persistent main
+      process at inspect-time before the deploy ran, e.g. a ``.timer`` unit
+      or a ``Type=oneshot`` service, both of which ALWAYS report MainPID=0
+      even when genuinely active — esc-2584-1): a persistent PID can never
+      be observed for these, so ``pid > 0`` is the wrong signal. Freshness
+      instead requires ``ActiveEnterTimestampMonotonic`` strictly later than
+      ``baseline_active_enter_monotonic`` AND ``ActiveState`` not in
+      ``('', 'failed')`` — the activation clock advancing, without the unit
+      having ended up failed, is the real "this deploy activated the unit"
+      proof when no persistent PID is possible.
     """
 
     baseline_active_enter_monotonic: int
@@ -451,6 +465,21 @@ class RestartPlan:
         ``_file_inprocess_escalation`` filing routine (skipped, with a logged
         warning, when no ``on_failure_escalation`` was configured for this
         plan).
+
+        Task 2611 (esc-2584-1): the stronger PID-identity check above is only
+        applied when ``baseline_main_pid > 0`` — a persistent-PID daemon was
+        already running at baseline. When ``baseline_main_pid == 0`` (an
+        EMPTY baseline: no persistent main process before the deploy ran),
+        the target is inferred to be a ``.timer`` unit, a ``Type=oneshot``
+        service, or a unit that simply was not running yet — none of which
+        can ever report a live MainPID, even once genuinely active. In that
+        case ``pid > 0`` is the wrong freshness signal entirely, so it is
+        dropped: freshness instead requires ``new_monotonic >
+        baseline_monotonic`` AND ``ActiveState not in ('', 'failed')`` — the
+        activation clock strictly advancing, without the unit ending up
+        failed, is the real "this deploy activated the unit" proof when no
+        persistent PID is possible. See ``FreshPidVerify``'s docstring for
+        the full two-mode contract.
         """
         assert self.verify is not None, 'router only calls this when wants_blocking'
 
@@ -485,24 +514,52 @@ class RestartPlan:
         )
         pid = new_state.get('MainPID', 0)
         new_monotonic = new_state.get('ActiveEnterTimestampMonotonic', 0)
+        active_state = new_state.get('ActiveState')
         baseline_monotonic = self.verify.baseline_active_enter_monotonic
         baseline_pid = self.verify.baseline_main_pid
-        fresh = (
-            isinstance(pid, int)
-            and pid > 0
-            and pid != baseline_pid
-            and new_monotonic > baseline_monotonic
-        )
-        if not fresh:
-            detail = (
-                f'Cross-unit restart verify failed for {self.target_unit!r}: '
-                f'new MainPID={pid!r} baseline_pid={baseline_pid} '
-                f'new_monotonic={new_monotonic} '
-                f'baseline_monotonic={baseline_monotonic}. Expected a fresh '
-                f'non-sentinel MainPID (>0, and different from baseline_pid) '
-                f'and a strictly-later ActiveEnterTimestampMonotonic after '
-                f'the restart.'
+        # Task 2611 (esc-2584-1): baseline_pid==0 means no persistent main
+        # process was observed at the pre-deploy baseline inspect — inferred
+        # to be a .timer/Type=oneshot target (or a unit not yet running),
+        # neither of which can ever report a live MainPID. `pid>0` would be
+        # unsatisfiable there, so it is dropped in favor of the activation
+        # clock advancing without the unit ending up failed. A
+        # persistent-PID baseline (baseline_pid>0) keeps the original,
+        # stronger identity check unchanged.
+        empty_baseline = baseline_pid == 0
+        if empty_baseline:
+            fresh = (
+                isinstance(new_monotonic, int)
+                and new_monotonic > baseline_monotonic
+                and active_state not in ('', 'failed')
             )
+        else:
+            fresh = (
+                isinstance(pid, int)
+                and pid > 0
+                and pid != baseline_pid
+                and new_monotonic > baseline_monotonic
+            )
+        if not fresh:
+            if empty_baseline:
+                detail = (
+                    f'Cross-unit restart verify failed for {self.target_unit!r} '
+                    f'(empty baseline_pid=0 — install-fresh/oneshot/timer mode): '
+                    f'new ActiveState={active_state!r} new_monotonic={new_monotonic} '
+                    f'baseline_monotonic={baseline_monotonic}. Expected a '
+                    f'strictly-later ActiveEnterTimestampMonotonic after the '
+                    f'restart and a non-failed, non-wedged ActiveState (a '
+                    f'persistent MainPID is never required in this mode).'
+                )
+            else:
+                detail = (
+                    f'Cross-unit restart verify failed for {self.target_unit!r}: '
+                    f'new MainPID={pid!r} baseline_pid={baseline_pid} '
+                    f'new_monotonic={new_monotonic} '
+                    f'baseline_monotonic={baseline_monotonic}. Expected a fresh '
+                    f'non-sentinel MainPID (>0, and different from baseline_pid) '
+                    f'and a strictly-later ActiveEnterTimestampMonotonic after '
+                    f'the restart.'
+                )
             escalated = self._file_verify_stage_escalation(
                 summary=f'Restart verify failed: {self.target_unit}',
                 detail=detail,
