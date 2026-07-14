@@ -51,6 +51,7 @@ from fused_memory.middleware.candidate_key import compute_candidate_key
 from fused_memory.reconciliation.context_assembler import estimate_tokens
 
 if TYPE_CHECKING:
+    from qdrant_client.models import ExtendedPointId
     from shared.usage_gate import UsageGate
 
     from fused_memory.backends.task_backend_protocol import TaskBackendProtocol
@@ -1812,7 +1813,9 @@ class TaskCurator:
                     break
 
             live_point_ids = {self._point_id(project_id, tid) for tid in live}
-            orphans = [pid for pid in corpus_ids if pid not in live_point_ids]
+            orphans: list[ExtendedPointId] = [
+                pid for pid in corpus_ids if pid not in live_point_ids
+            ]
 
             if orphans:
                 from qdrant_client.models import PointIdsList
