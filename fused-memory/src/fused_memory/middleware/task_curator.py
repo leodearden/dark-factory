@@ -268,6 +268,17 @@ class BackfillResult:
 
 
 @dataclass
+class PruneResult:
+    """Result of a prune_orphans() call."""
+
+    pruned: int = 0
+    corpus_scanned: int = 0
+    live: int = 0
+    skipped: bool = False
+    reason: str = ''
+
+
+@dataclass
 class CuratorDecision:
     """Result of a curator call. Always returned — never raised."""
 
@@ -1758,6 +1769,51 @@ class TaskCurator:
             project_id, result.upserted, result.skipped, result.errors,
         )
         return result
+
+    async def prune_orphans(self, project_id: str, live_task_ids) -> PruneResult:
+        """Health-gated reconciliation sweep: delete corpus points for tasks
+        that no longer exist in a live snapshot.
+
+        Orphans are computed by mapping ``live_task_ids`` through the same
+        deterministic point-id scheme record_task/backfill_corpus use to
+        write points (_point_id), then diffing against the actual corpus
+        point ids — robust to payload drift, no reliance on payload task_id.
+        """
+        live = {str(t) for t in live_task_ids}
+
+        client = await self._get_qdrant()
+        collection = self._collection_name(project_id)
+        if not await client.collection_exists(collection):
+            return PruneResult(live=len(live))
+
+        corpus_ids: list[str] = []
+        offset = None
+        while True:
+            records, offset = await client.scroll(
+                collection_name=collection,
+                limit=256,
+                offset=offset,
+                with_payload=False,
+                with_vectors=False,
+            )
+            corpus_ids.extend(str(r.id) for r in records)
+            if offset is None:
+                break
+
+        live_point_ids = {self._point_id(project_id, tid) for tid in live}
+        orphans = [pid for pid in corpus_ids if pid not in live_point_ids]
+
+        if orphans:
+            from qdrant_client.models import PointIdsList
+
+            await client.delete(
+                collection_name=collection,
+                points_selector=PointIdsList(points=orphans),
+            )
+
+        return PruneResult(
+            pruned=len(orphans), corpus_scanned=len(corpus_ids), live=len(live),
+        )
 
     async def close(self) -> None:
         if self._qdrant_client is not None:
