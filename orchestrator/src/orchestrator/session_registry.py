@@ -937,15 +937,49 @@ def reap_stale_records(
     return reaped
 
 
-ORPHAN_EXIT_CODE: int = -1
+ORPHAN_EXIT_CODE: int = 200
 """Synthetic exit code stamped by ``mark_orphaned_sessions_exited`` when a
 non-terminal session's ``launcher_pid`` is provably dead but no real exit
 code was ever recorded -- ``finish()`` never ran (SIGKILL, force-closed
 terminal, crash, reboot). Distinct from every real/sentinel code
 spawn-claude.sh can record (0-125 claude exit codes; 126/127/129/143/144
-spawn-claude.sh sentinels) and from ``None`` (no exit_code recorded yet), so
-a downstream consumer can tell an orphan-reaped record from a cleanly-exited
-one."""
+spawn-claude.sh sentinels; 145-199 called out as reserved-free by
+spawn-claude.sh's own exit-codes comment) and from ``None`` (no exit_code
+recorded yet), so a downstream consumer can tell an orphan-reaped record
+from a cleanly-exited one. Deliberately a POSITIVE value at/past 200, not
+-1: by POSIX/subprocess convention a NEGATIVE returncode means "killed by
+signal N" (``returncode == -N``), so -1 could be misread by a consumer
+applying that convention as "killed by SIGHUP". A positive sentinel clear
+of every reserved range avoids that ambiguity."""
+
+
+def _mark_exited_if_still_non_terminal(
+    slug: str, root: Path | str | None, *, exit_code: int
+) -> SessionRecord | None:
+    """TOCTOU-safe terminal stamp used only by the liveness sweep.
+
+    Re-reads *slug* itself -- a second, fresher read than the sweep's own
+    caller-side liveness check -- and, ONLY if status is still non-terminal
+    on THIS read, stamps status=EXITED/exit_code=*exit_code* and writes.
+    Returns the marked record, or ``None`` if a concurrent writer (most
+    plausibly spawn-claude.sh's own ``finish()``) already made the record
+    terminal in the narrow window between the sweep's own liveness check
+    and this call -- in which case nothing is written, so that writer's
+    real exit_code is never clobbered by the orphan sentinel.
+
+    Deliberately a narrow variant rather than a change to ``update_status``
+    itself: ``update_status``'s own ``exit`` CLI subcommand caller is an
+    authoritative, unconditional final report from the exiting process and
+    must stay unconditional; only this sweep's best-effort guess needs to
+    defer to a fresher real write.
+    """
+    record = read_record(slug, root=root)
+    if record.status in TERMINAL_STATUSES:
+        return None
+    record.status = Status.EXITED
+    record.exit_code = exit_code
+    write_record(record, root=root)
+    return record
 
 
 def mark_orphaned_sessions_exited(
@@ -973,14 +1007,21 @@ def mark_orphaned_sessions_exited(
     so it is never swept regardless of how long it has been non-terminal.
 
     Unlike ``reap_stale_records``, this does NOT delete anything -- it marks
-    a matching record EXITED (via ``update_status``, exit_code=
-    ``ORPHAN_EXIT_CODE``), preserving every other field, and leaves its
-    directory in place. ``reap_stale_records``'s existing ``terminal_ttl``
-    rule reclaims it later, unchanged. An already-terminal record is left
-    fully untouched (idempotent -- never re-stamped with the sentinel), and
-    a record whose body is missing or corrupt is skipped here -- that is
+    a matching record EXITED (exit_code=``ORPHAN_EXIT_CODE``), preserving
+    every other field, and leaves its directory in place.
+    ``reap_stale_records``'s existing ``terminal_ttl`` rule reclaims it
+    later, unchanged. An already-terminal record is left fully untouched
+    (idempotent -- never re-stamped with the sentinel), and a record whose
+    body is missing or corrupt is skipped here -- that is
     ``reap_stale_records``'s own ``'corrupt'`` rule's concern, not this
     sweep's.
+
+    The final stamp itself goes through ``_mark_exited_if_still_non_terminal``,
+    which re-reads the record ONE more time immediately before writing: if a
+    concurrent writer (most plausibly ``finish()``) already made it terminal
+    in the window since this sweep's own liveness check above, the sweep
+    backs off instead of clobbering that writer's real exit_code with the
+    orphan sentinel.
 
     A per-record try/except means one bad record (a corrupt body, a
     concurrent-reap race vanishing the file mid-sweep, an unwritable
@@ -1022,8 +1063,8 @@ def mark_orphaned_sessions_exited(
             continue  # heartbeat grace -- not stale enough yet
 
         try:
-            marked_record = update_status(
-                slug, root=root, status=Status.EXITED, exit_code=ORPHAN_EXIT_CODE
+            marked_record = _mark_exited_if_still_non_terminal(
+                slug, root, exit_code=ORPHAN_EXIT_CODE
             )
         except (FileNotFoundError, CorruptSessionRecord, OSError):
             # A single unmarkable record (a concurrent-reap race, an
@@ -1033,6 +1074,8 @@ def mark_orphaned_sessions_exited(
                 'mark_orphaned_sessions_exited: failed to mark %s', slug, exc_info=True
             )
             continue
+        if marked_record is None:
+            continue  # lost the race: a concurrent writer already made this terminal
         marked.append(marked_record)
 
     return marked
