@@ -62,8 +62,12 @@ import sys
 import time
 from pathlib import Path
 from typing import Any
+from unittest.mock import patch
 
-from orchestrator.config import ModuleConfig
+import pytest
+
+from orchestrator.config import ModuleConfig, OrchestratorConfig
+from orchestrator.verify import run_verification
 
 # ---------------------------------------------------------------------------
 # Shared sentinels + labelling (adapted from test_verify_admission_wiring.py)
@@ -216,3 +220,58 @@ def _wait_for_marker(marker_path: Path, timeout: float = 5.0) -> bool:
             return True
         time.sleep(0.02)
     return False
+
+
+# ---------------------------------------------------------------------------
+# Scenario 1 — GLOBAL CAP
+# ---------------------------------------------------------------------------
+
+
+class TestGlobalCap:
+    """PRD Boundary-test sketch scenario 1: dispatching M concurrent
+    task-role verifies against a single N=1 slot never lets more than one
+    'test' leg run at a time — the rest block on the real T1 flock semaphore
+    until it frees up, and all eventually complete successfully.
+    """
+
+    @pytest.mark.real_verify_admission
+    @pytest.mark.asyncio
+    async def test_n1_slot_serializes_m_concurrent_task_verifies(self, tmp_path):
+        m = 3
+        slots_dir = tmp_path / 'slots'
+        config = OrchestratorConfig(
+            verify_admission_slots_dir=str(slots_dir),
+            verify_admission_task_slots=1,
+        )
+        worktrees = []
+        for i in range(m):
+            worktree = tmp_path / f'wt-{i}'
+            worktree.mkdir()
+            worktrees.append(worktree)
+
+        spy = _RunCmdSpy()
+        # REAL acquire_task_slot (not mocked) — only _run_cmd is patched, so
+        # this exercises T1's actual flock semaphore + T2's off-loop wiring,
+        # generalizing the wiring test's 2-verify serialize test to M>=3.
+        with patch('orchestrator.verify._run_cmd', side_effect=spy):
+            results = await asyncio.gather(*(
+                run_verification(
+                    worktree=worktree,
+                    config=config,
+                    module_config=_module_config(),
+                    role='task',
+                    attempt_id=None,
+                )
+                for worktree in worktrees
+            ))
+
+        assert spy.max_seen == 1, (
+            f'expected the N=1 semaphore to serialize all {m} task-role test '
+            f'legs (max concurrently-running test leg == 1); got '
+            f'max_seen={spy.max_seen}'
+        )
+        assert len(results) == m
+        assert all(r.passed for r in results), (
+            f'expected all {m} verifies to pass; got '
+            f'{[r.passed for r in results]!r}'
+        )
