@@ -284,3 +284,49 @@ class TestVerifyCmdRoundTrip:
         assert cmd.tool is ToolKind.OPAQUE
         assert scope_to(cmd, ['orchestrator/src/orchestrator/foo.py']) is cmd
         assert render(parse_config_command(_LINT_CHAIN_RAW)) == _LINT_CHAIN_RAW
+
+
+# ── step-3/4: Scenario 3 — plan golden: root conftest -> FULL_SUITE (D1,
+#              task-1077); Boundary-test sketch row 3 ───────────────────────
+
+# task-1077 (git-verified fix commits d7504d432d + cb7277926d): conftest.py
+# must trigger the full unscoped suite, never be passed directly to pytest as
+# a target (pytest >= 9 exits 1 "no tests ran" on a bare conftest target).
+# Reconstructed verbatim from test_verify_plan.py's own golden fixture.
+ROOT_CONFTEST_DIFF: list[str] = ['orchestrator/tests/conftest.py']
+
+
+class TestPlanGoldenConftest:
+    """Scenario 3 — GOLDEN task-1077: a touched conftest.py widens pytest to
+
+    FULL_SUITE with the verbatim unscoped test_command, and the reason names
+    conftest (D1). Also pins D3: the resulting VerifyPlan is JSON-serialisable.
+
+    RED until step-4 GREEN imports derive_verify_plan/ScopeKind/PlannedRun/
+    VerifyPlan from orchestrator.verify_plan and ports fake_worktree_reader/
+    _run_for from test_verify_plan.py.
+    """
+
+    def test_root_conftest_full_suites_pytest_with_json_serialisable_plan(self):
+        mc = ModuleConfig(
+            prefix='orchestrator',
+            test_command=(
+                'uv run --project orchestrator --directory orchestrator '
+                'pytest tests/ --tb=short -q'
+            ),
+            lint_command='uv run --directory orchestrator ruff check src/',
+        )
+        plan = derive_verify_plan(ROOT_CONFTEST_DIFF, [mc], None, fake_worktree_reader)
+        run = _run_for(plan, 'orchestrator', 'pytest:')
+        assert run is not None
+        assert run.scope_kind is ScopeKind.FULL_SUITE
+        # Structural equality against the same parse_config_command transform
+        # sidesteps render()'s documented cwd_rel-as-leading-`cd`
+        # normalisation (not always byte-identical to a --directory-form
+        # input — see verify_cmd.render's docstring / scenario 1a above).
+        assert mc.test_command is not None
+        assert run.cmd == parse_config_command(mc.test_command)
+        assert 'conftest' in run.reason.lower()
+
+        # D3: VerifyPlan.to_dict() is a plain JSON-native structure.
+        json.dumps(plan.to_dict())
