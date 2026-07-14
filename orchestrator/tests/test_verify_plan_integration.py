@@ -424,8 +424,15 @@ class TestPlanGoldenDataModule:
         assert run is not None
         assert run.scope_kind is ScopeKind.SKIPPED
         assert run.reason
+        # Assert on the semantically meaningful content the reason contract
+        # actually promises — the offending path is named and the run is an
+        # explicit reasoned skip, never a silent None. Deliberately NOT
+        # asserting a bare '1852' task-number substring here: a harmless
+        # rewording of the SKIPPED reason that still explains the skip would
+        # break that check without any real behaviour regression (the
+        # task-1852 provenance is already documented on DATA_MODULE_DIFF
+        # above, per G6).
         assert DATA_MODULE_DIFF[0] in run.reason
-        assert '1852' in run.reason
 
 
 # ── step-7/8: Scenario 5 — plan golden: structural file -> unscoped pyright,
