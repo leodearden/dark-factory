@@ -34,7 +34,9 @@ that is epsilon/gamma's job.
 from __future__ import annotations
 
 import json
+import os
 import re
+import subprocess
 from dataclasses import dataclass
 
 import yaml
@@ -242,6 +244,64 @@ def parse_coder_output(raw: str) -> dict:
     raise CoderParseError(
         f"could not parse a JSON object from coder output: {raw[:200]!r}"
     )
+
+
+# ---------------------------------------------------------------------------
+# _invoke_cli — the ONE real `claude -p --model` subprocess boundary
+# ---------------------------------------------------------------------------
+
+_DEFAULT_INVOKE_TIMEOUT_SECS = 120
+"""Default subprocess timeout (seconds) for a single _invoke_cli call."""
+
+_CLAUDE_BIN_ENV_VAR = "LEGIBILITY_CLAUDE_BIN"
+"""Env var overriding the `claude` binary path; falls back to the bare
+"claude" (PATH-resolved -- /home/leo/.local/bin is on PATH)."""
+
+
+def _invoke_cli(
+    prompt: str,
+    model: str,
+    *,
+    claude_bin: str | None = None,
+    timeout: float = _DEFAULT_INVOKE_TIMEOUT_SECS,
+) -> str:
+    """Invoke the real headless ``claude -p --model <model>`` CLI exactly
+    once, delivering *prompt* via stdin, and return its raw stdout.
+
+    This is the ONE real-subprocess boundary in this module -- every
+    public function accepts an ``invoke`` override (this module's own
+    test suite always injects a fake one; no test ever reaches this
+    function). *claude_bin* resolves, in order: the explicit argument,
+    the ``LEGIBILITY_CLAUDE_BIN`` env var, else the bare ``"claude"``.
+
+    Raises CoderInvocationError on a non-zero exit or a timeout -- never
+    silently swallowed, never a fabricated empty stdout. The error
+    message carries a stderr tail for diagnosis.
+    """
+    resolved_bin = claude_bin or os.environ.get(_CLAUDE_BIN_ENV_VAR) or "claude"
+
+    try:
+        proc = subprocess.run(
+            [resolved_bin, "-p", "--model", model],
+            input=prompt,
+            text=True,
+            capture_output=True,
+            timeout=timeout,
+        )
+    except subprocess.TimeoutExpired as exc:
+        raise CoderInvocationError(
+            f"claude CLI timed out after {timeout}s (model={model!r}, "
+            f"claude_bin={resolved_bin!r})"
+        ) from exc
+
+    if proc.returncode != 0:
+        stderr_tail = (proc.stderr or "")[-2000:]
+        raise CoderInvocationError(
+            f"claude CLI exited {proc.returncode} (model={model!r}, "
+            f"claude_bin={resolved_bin!r}): {stderr_tail}"
+        )
+
+    return proc.stdout
 
 
 # ---------------------------------------------------------------------------
