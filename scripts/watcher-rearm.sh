@@ -44,6 +44,15 @@
 # this marker -- do not grep for the marker to detect a usage error, check
 # for exit code 2 instead.
 #
+# NOTE: escalation.watcher installs its own SIGTERM handler that converts a
+# SIGTERM into a clean `sys.exit(0)` (see the module docstring in
+# escalation/src/escalation/watcher.py) -- so a SIGTERM delivered to the
+# watcher subprocess itself surfaces here as `WATCHER_REARM_OUTCOME: FIRED
+# exit=0` with EMPTY stdout, not as the 137|143|144 KILLED branch below (that
+# branch is reachable via SIGKILL, which cannot be caught, or a signal
+# delivered before the handler installs). Callers MUST treat "exit 0 with
+# empty stdout" as a non-fire, never as proof an escalation was printed.
+#
 # Bash-tool contract: a `--timeout 540` call blocks for up to 540s. The
 # CALLER's Bash tool timeout must be >= 600000ms (10 min), or the bounded
 # wait itself gets killed by the harness's 2-minute default before it can
@@ -130,7 +139,13 @@ fi
 # Wrapper-owned exclude-file: an explicit --exclude-file wins, else default
 # to a per-level path inside the queue dir. Always exists once we proceed
 # past --check, so a caller can append a deliberately-pending id without
-# checking first.
+# checking first. Appended ids are NEVER pruned, so the file grows by one
+# line per resolved escalation over a long-lived orchestrator's lifetime --
+# a deliberate low-priority tradeoff: a stale id just sits inert (no future
+# esc-<id>.json can ever match it again) and the file is tiny text, so
+# unbounded growth is harmless in practice. A future pass could periodically
+# drop lines whose esc-<id>.json no longer exists in the queue dir if this
+# ever becomes a real problem.
 EXCLUDE_FILE="${EXCLUDE_FILE_ARG:-$QUEUE_DIR/.watcher-rearm-exclude-l$LEVEL}"
 
 if [ "$CHECK" -eq 1 ]; then
@@ -167,6 +182,10 @@ rc=$?
 
 case "$rc" in
     0)
+        # NOTE: exit 0 here can also mean the watcher caught a SIGTERM and
+        # exited cleanly with nothing printed -- see the header NOTE above;
+        # callers should check for non-empty stdout before treating this as
+        # a real fire.
         echo "WATCHER_REARM_OUTCOME: FIRED exit=0" >&2
         ;;
     124)
