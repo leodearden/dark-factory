@@ -13,7 +13,6 @@ import asyncio
 import json
 import logging
 import os
-import tempfile
 import time
 from pathlib import Path
 from typing import Any
@@ -26,6 +25,7 @@ from shared.cli_invoke import (  # noqa: F401
     _parse_claude_output,
     _run_subprocess,
     _SubprocessResult,
+    build_claude_argv,
     invoke_claude_agent,
     invoke_with_cap_retry,
 )
@@ -170,42 +170,24 @@ async def _invoke_claude_with_sandbox(
         from orchestrator.agents.sandbox_dispatch import resolve_active_backend, wrap_command
         active = resolve_active_backend()
         if active != 'none':
-            # Build command manually to wrap with the chosen sandbox backend
-            cmd = ['claude', '--print', '--output-format', 'json']
-            cmd.extend(['--model', model])
-            cmd.extend(['--max-budget-usd', str(max_budget_usd)])
-
-            temp_files: list[str] = []
-
-            if resume_session_id:
-                cmd.extend(['--resume', resume_session_id])
-            else:
-                # Write system prompt to temp file to avoid ARG_MAX
-                fd, sysprompt_path = tempfile.mkstemp(suffix='.txt', prefix='sysprompt_')
-                with open(fd, 'w') as f:
-                    f.write(system_prompt)
-                temp_files.append(sysprompt_path)
-                cmd.extend(['--system-prompt-file', sysprompt_path])
-                if session_id:
-                    cmd.extend(['--session-id', session_id])
-
-            cmd.extend(['--permission-mode', permission_mode])
-            cmd.extend(['--max-turns', str(max_turns)])
-            if effort:
-                cmd.extend(['--effort', effort])
-            if allowed_tools:
-                cmd.extend(['--allowed-tools', *allowed_tools])
-            if disallowed_tools:
-                cmd.extend(['--disallowed-tools', *disallowed_tools])
-
-            if mcp_config:
-                fd, mcp_config_path = tempfile.mkstemp(suffix='.json', prefix='mcp_')
-                with open(fd, 'w') as f:
-                    json.dump(mcp_config, f)
-                temp_files.append(mcp_config_path)
-                cmd.extend(['--mcp-config', mcp_config_path])
-            if output_schema:
-                cmd.extend(['--json-schema', json.dumps(output_schema)])
+            # Build command via the shared single source of truth (task 2465
+            # dedup) so this sandboxed path stays in lockstep with the
+            # non-sandbox path in shared.cli_invoke._invoke_claude — including
+            # the CLI-2.1.168 StructuredOutput deny-list expansion.
+            cmd, temp_files = build_claude_argv(
+                model=model,
+                max_budget_usd=max_budget_usd,
+                system_prompt=system_prompt,
+                max_turns=max_turns,
+                permission_mode=permission_mode,
+                allowed_tools=allowed_tools,
+                disallowed_tools=disallowed_tools,
+                mcp_config=mcp_config,
+                output_schema=output_schema,
+                effort=effort,
+                resume_session_id=resume_session_id,
+                session_id=session_id,
+            )
 
             # User prompt piped via stdin to avoid ARG_MAX
             stdin_data = prompt.encode()
