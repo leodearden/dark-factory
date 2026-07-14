@@ -2206,6 +2206,62 @@ class TestWriteSuppressionRecordPreWriteCheck:
         ledger_memory_service.add_memory.assert_not_called()
         assert result == AddMemoryResponse(memory_ids=[])
 
+    # -----------------------------------------------------------------
+    # Fail-open guards on the pre-write coverage query (task 2503 step-9/step-10)
+    # -----------------------------------------------------------------
+
+    @pytest.mark.asyncio
+    async def test_list_suppressions_exception_fails_open_and_writes(
+        self, ledger_memory_service, caplog
+    ):
+        """(f) A raising recon_ledger.list_suppressions must not abort the
+        write -- fail-open: treat as no coverage, proceed with the write, and
+        log a WARNING (mirrors filter_suppressed's fail-open contract)."""
+        import logging
+
+        from fused_memory.reconciliation.flag_dedup import write_suppression_record
+
+        ledger_memory_service.recon_ledger.list_suppressions = AsyncMock(
+            side_effect=RuntimeError('list_suppressions boom')
+        )
+
+        with caplog.at_level(logging.WARNING, logger='fused_memory.reconciliation.flag_dedup'):
+            result = await write_suppression_record(
+                ledger_memory_service, project_id='p', task_id=42, flag_types=['x']
+            )
+
+        ledger_memory_service.add_memory.assert_called_once()
+        assert result.memory_ids == ['mirror-id']
+
+        row = await ledger_memory_service.recon_ledger.get_by_identity(
+            'p', 'stage1_flag_suppression', '42', 'x', ''
+        )
+        assert row is not None
+
+        assert any(
+            'list_suppressions' in record.message and record.levelno == logging.WARNING
+            for record in caplog.records
+        ), f'Expected a WARNING log mentioning list_suppressions, got: {[r.message for r in caplog.records]}'
+
+    @pytest.mark.asyncio
+    async def test_none_ledger_with_would_be_variant_proceeds_to_mirror(self):
+        """(g) memory_service.recon_ledger is None -- the pre-write check
+        degrades to no-coverage without any ledger read, and a write that
+        WOULD be a family variant of some hypothetical prior proceeds to the
+        mirror unconditionally, never raising."""
+        from fused_memory.reconciliation.flag_dedup import write_suppression_record
+
+        svc = AsyncMock()
+        svc.recon_ledger = None
+        svc.add_memory = AsyncMock(return_value=AddMemoryResponse(memory_ids=['supp-1']))
+
+        result = await write_suppression_record(
+            svc, project_id='p', task_id=544, flag_types=['deliverable_missing']
+        )
+
+        svc.add_memory.assert_called_once()
+        assert result.memory_ids == ['supp-1']
+
 
 def test_write_suppression_record_importable_from_canonical_path():
     """Smoke test: write_suppression_record is importable from the path stage1.py advertises.
