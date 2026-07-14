@@ -21,7 +21,9 @@ from pathlib import Path
 
 import pytest
 
+from orchestrator.config import OrchestratorConfig
 from orchestrator.delivered_checks import DeliveredCheckResult, run_delivered_check
+from orchestrator.scheduler import Scheduler
 
 # ---------------------------------------------------------------------------
 # TestRunnerGrepKind (task 2580 — step-1 RED / step-2 GREEN)
