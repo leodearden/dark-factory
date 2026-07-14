@@ -169,3 +169,57 @@ def test_harness_factories_identity() -> None:
 
     assert hw._build_harness is _build_harness
     assert hw._init_git_repo is _init_git_repo
+
+
+# ---------------------------------------------------------------------------
+# Group D: e2e factories (PLAN, _make_review, AgentStub, _build_workflow,
+# _build_workflow_with_escalation, _init_repo, _derive_meta_root_like_production)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_e2e_factories_smoke(tmp_path) -> None:
+    """Behavioral smoke: PLAN/_make_review/AgentStub/_init_repo real invocation checks."""
+    from _workflow_helpers import PLAN, AgentStub, _init_repo, _make_review  # noqa: PLC0415
+
+    assert PLAN['task_id'] == '42'
+    assert len(PLAN['steps']) == 2
+    assert PLAN['_finalized_at']
+
+    assert _make_review('reviewer_comprehensive')['verdict'] == 'PASS'
+
+    assert AgentStub()._detect_role('You are a TDD architect') == 'architect'
+    assert AgentStub()._detect_role('You are the completion judge') == 'judge'
+
+    await _init_repo(tmp_path)
+    assert (tmp_path / 'lib.py').exists()
+    assert (tmp_path / '.git').is_dir()
+
+
+def test_e2e_factories_identity() -> None:
+    """Anti-duplication guard: the producer re-exports the SAME objects as the shared module.
+
+    Does NOT `from _workflow_helpers import _derive_meta_root_like_production` here —
+    that would pull the autouse-fixture NAME into this module's namespace and
+    activate it in every test in this file. Instead the fixture is referenced via
+    module-attribute access (`_workflow_helpers._derive_meta_root_like_production`),
+    which is inert.
+    """
+    import _workflow_helpers  # noqa: PLC0415
+    import test_workflow_e2e as e2e  # noqa: PLC0415
+    from _workflow_helpers import (  # noqa: PLC0415
+        PLAN,
+        AgentStub,
+        _build_workflow,
+        _build_workflow_with_escalation,
+        _init_repo,
+        _make_review,
+    )
+
+    assert e2e.AgentStub is AgentStub
+    assert e2e.PLAN is PLAN
+    assert e2e._make_review is _make_review
+    assert e2e._build_workflow is _build_workflow
+    assert e2e._build_workflow_with_escalation is _build_workflow_with_escalation
+    assert e2e._init_repo is _init_repo
+    assert e2e._derive_meta_root_like_production is _workflow_helpers._derive_meta_root_like_production
