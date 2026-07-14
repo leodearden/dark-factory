@@ -1179,3 +1179,188 @@ class TestEmitMergeAttemptOriginProbeHost:
         data = store.emit.call_args.kwargs['data']
         assert 'origin_host' not in data, f'data={data}'
         assert 'probe_host' not in data, f'data={data}'
+
+
+# ---------------------------------------------------------------------------
+# Task 2565 step-3 (RED): origin_is_local threading through
+# _run_deferred_main_health_probe. On a confirmed still-fresh break, the
+# HOST-AFFINITY placement decision must be RECORDED (origin_host/probe_host)
+# in the main_health_red signal; negative/stale/raising probes must still
+# emit no main_health_red event at all, regardless of origin_is_local.
+# Fails today: origin_is_local is an unknown kwarg of
+# _run_deferred_main_health_probe (TypeError) for every case below.
+# ---------------------------------------------------------------------------
+
+
+class TestDeferredProbeOriginHostTelemetry:
+    """origin_is_local must be recorded as origin_host/probe_host on the
+    main_health_red signal (task 2565) — proven independently of
+    TestEmitMergeAttemptOriginProbeHost's direct-emit unit, this time
+    through the real probe-chain threading."""
+
+    def test_confirmed_break_remote_origin_records_remote_local(
+        self, tmp_path: Path,
+    ) -> None:
+        config = _make_config(tmp_path, escalate_preexisting=True)
+        git_ops = _make_git_ops(tmp_path)  # get_main_sha AsyncMock -> MAIN_SHA
+        req = _make_req('99', tmp_path / 'task-wt', config)
+        (tmp_path / 'task-wt').mkdir()
+
+        event_store = MagicMock(spec=EventStore)
+        escalation_queue = EscalationQueue(tmp_path / 'escalations')
+
+        async def _run() -> None:
+            with patch(
+                'orchestrator.merge_queue.verify_failure_is_preexisting_on_main',
+                new=AsyncMock(return_value=(True, MAIN_SHA)),
+            ):
+                await _run_deferred_main_health_probe(
+                    git_ops, req, COMPILE_ERROR_RESULT,
+                    escalation_queue=escalation_queue, event_store=event_store,
+                    origin_is_local=False,
+                )
+
+        asyncio.run(_run())
+
+        calls = event_store.emit.call_args_list
+        main_health_calls = [
+            c for c in calls
+            if c.kwargs.get('data', {}).get('outcome') == 'main_health_red'
+        ]
+        assert len(main_health_calls) == 1, (
+            f'Expected exactly one main_health_red event; got {calls}'
+        )
+        data = main_health_calls[0].kwargs['data']
+        assert data.get('origin_host') == 'remote', f'data={data}'
+        assert data.get('probe_host') == 'local', f'data={data}'
+
+    def test_confirmed_break_local_origin_records_local_local(
+        self, tmp_path: Path,
+    ) -> None:
+        config = _make_config(tmp_path, escalate_preexisting=True)
+        git_ops = _make_git_ops(tmp_path)  # get_main_sha AsyncMock -> MAIN_SHA
+        req = _make_req('99', tmp_path / 'task-wt', config)
+        (tmp_path / 'task-wt').mkdir()
+
+        event_store = MagicMock(spec=EventStore)
+        escalation_queue = EscalationQueue(tmp_path / 'escalations')
+
+        async def _run() -> None:
+            with patch(
+                'orchestrator.merge_queue.verify_failure_is_preexisting_on_main',
+                new=AsyncMock(return_value=(True, MAIN_SHA)),
+            ):
+                await _run_deferred_main_health_probe(
+                    git_ops, req, COMPILE_ERROR_RESULT,
+                    escalation_queue=escalation_queue, event_store=event_store,
+                    origin_is_local=True,
+                )
+
+        asyncio.run(_run())
+
+        calls = event_store.emit.call_args_list
+        main_health_calls = [
+            c for c in calls
+            if c.kwargs.get('data', {}).get('outcome') == 'main_health_red'
+        ]
+        assert len(main_health_calls) == 1, (
+            f'Expected exactly one main_health_red event; got {calls}'
+        )
+        data = main_health_calls[0].kwargs['data']
+        assert data.get('origin_host') == 'local', f'data={data}'
+        assert data.get('probe_host') == 'local', f'data={data}'
+
+    @pytest.mark.parametrize('origin_is_local', [True, False])
+    def test_negative_probe_emits_no_main_health_event(
+        self, tmp_path: Path, origin_is_local: bool,
+    ) -> None:
+        config = _make_config(tmp_path, escalate_preexisting=True)
+        git_ops = _make_git_ops(tmp_path)
+        req = _make_req('99', tmp_path / 'task-wt', config)
+        (tmp_path / 'task-wt').mkdir()
+        event_store = MagicMock(spec=EventStore)
+        escalation_queue = EscalationQueue(tmp_path / 'escalations')
+
+        async def _run() -> None:
+            with patch(
+                'orchestrator.merge_queue.verify_failure_is_preexisting_on_main',
+                new=AsyncMock(return_value=(False, '')),
+            ):
+                await _run_deferred_main_health_probe(
+                    git_ops, req, COMPILE_ERROR_RESULT,
+                    escalation_queue=escalation_queue, event_store=event_store,
+                    origin_is_local=origin_is_local,
+                )
+
+        asyncio.run(_run())
+        calls = event_store.emit.call_args_list
+        main_health_calls = [
+            c for c in calls
+            if c.kwargs.get('data', {}).get('outcome') == 'main_health_red'
+        ]
+        assert main_health_calls == [], (
+            f'A negative probe must emit no main_health_red event; got {calls}'
+        )
+
+    def test_raising_probe_emits_no_main_health_event(
+        self, tmp_path: Path,
+    ) -> None:
+        config = _make_config(tmp_path, escalate_preexisting=True)
+        git_ops = _make_git_ops(tmp_path)
+        req = _make_req('99', tmp_path / 'task-wt', config)
+        (tmp_path / 'task-wt').mkdir()
+        event_store = MagicMock(spec=EventStore)
+        escalation_queue = EscalationQueue(tmp_path / 'escalations')
+
+        async def _run() -> None:
+            with patch(
+                'orchestrator.merge_queue.verify_failure_is_preexisting_on_main',
+                new=AsyncMock(side_effect=RuntimeError('boom')),
+            ):
+                await _run_deferred_main_health_probe(
+                    git_ops, req, COMPILE_ERROR_RESULT,
+                    escalation_queue=escalation_queue, event_store=event_store,
+                    origin_is_local=False,
+                )
+
+        asyncio.run(_run())  # must not raise
+        calls = event_store.emit.call_args_list
+        main_health_calls = [
+            c for c in calls
+            if c.kwargs.get('data', {}).get('outcome') == 'main_health_red'
+        ]
+        assert main_health_calls == [], (
+            f'A raising probe must emit no main_health_red event; got {calls}'
+        )
+
+    def test_stale_main_emits_no_main_health_event(
+        self, tmp_path: Path,
+    ) -> None:
+        config = _make_config(tmp_path, escalate_preexisting=True)
+        git_ops = _make_git_ops(tmp_path)  # get_main_sha AsyncMock -> MAIN_SHA
+        req = _make_req('99', tmp_path / 'task-wt', config)
+        (tmp_path / 'task-wt').mkdir()
+        event_store = MagicMock(spec=EventStore)
+        escalation_queue = EscalationQueue(tmp_path / 'escalations')
+
+        async def _run() -> None:
+            with patch(
+                'orchestrator.merge_queue.verify_failure_is_preexisting_on_main',
+                new=AsyncMock(return_value=(True, STALE_PROBE_SHA)),
+            ):
+                await _run_deferred_main_health_probe(
+                    git_ops, req, COMPILE_ERROR_RESULT,
+                    escalation_queue=escalation_queue, event_store=event_store,
+                    origin_is_local=False,
+                )
+
+        asyncio.run(_run())
+        calls = event_store.emit.call_args_list
+        main_health_calls = [
+            c for c in calls
+            if c.kwargs.get('data', {}).get('outcome') == 'main_health_red'
+        ]
+        assert main_health_calls == [], (
+            f'A stale-main probe verdict must emit no main_health_red event; '
+            f'got {calls}'
+        )
