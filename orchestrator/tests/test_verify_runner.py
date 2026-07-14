@@ -3931,6 +3931,38 @@ class TestRemoteRunnerRequestId:
 
         assert runner._inflight_request_id is None
 
+    async def test_dispatch_in_flight_false_before_and_after_return(self):
+        """dispatch_in_flight is False before run_merge_verify and False again after it returns."""
+        runner, _ = self._make_runner_and_calls()
+        assert runner.dispatch_in_flight is False
+        await runner.run_merge_verify('abc123', _make_spec())
+        assert runner.dispatch_in_flight is False
+
+    async def test_dispatch_in_flight_true_during_dispatch(self):
+        """dispatch_in_flight is True while the ssh dispatch is live, False once it returns."""
+        recorded = {}
+        expected = VerifyResult(passed=True, test_output='', lint_output='', type_output='', summary='ok')
+
+        async def fake_run(argv, *, cwd=None):
+            if argv[0] == 'ssh':
+                recorded['during_dispatch'] = runner.dispatch_in_flight
+                return (0, result_to_json(expected), '')
+            return (0, '', '')
+
+        runner = RemoteRunner(
+            name='laptop',
+            ssh_host='laptop.local',
+            git_remote='origin',
+            cwd='/repo',
+            run=fake_run,
+            id_factory=lambda: 'req-id',
+        )
+        assert runner.dispatch_in_flight is False
+        await runner.run_merge_verify('abc123', _make_spec())
+
+        assert recorded['during_dispatch'] is True
+        assert runner.dispatch_in_flight is False
+
 
 # ---------------------------------------------------------------------------
 # β step-13: RemoteRunner.cancel_verify() and probe_clean()

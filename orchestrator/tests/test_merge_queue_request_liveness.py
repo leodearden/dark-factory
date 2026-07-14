@@ -824,22 +824,30 @@ class TestDeadInflightVerifyAborts:
         )
         assert q.empty(), 'healthy verify must not be re-dispatched'
 
-    async def test_remote_lease_is_never_progress_aborted(
+    async def test_remote_lease_held_with_no_live_dispatch_is_aborted_and_requeued_within_budget(
         self,
         git_ops: GitOps,
         config: OrchestratorConfig,
+        caplog: pytest.LogCaptureFixture,
     ) -> None:
-        """A REMOTE lease must never be progress-aborted (scope fence): the
-        remote verify-hang facet is owned by task 2362's ssh keepalive, and a
-        remote verify writes to the REMOTE host's worktree, not the local
-        merge_wt — so a local content-mtime budget would false-abort a
-        healthy remote verify.
+        """task 2566: a REMOTE lease coasting with NO live ssh dispatch
+        (dispatch_in_flight=False) must be progress-aborted + re-dispatched
+        within budget — this is the latent gap task 2566 closes (the 7200s
+        cold-timeout coast: nothing watches a remote-lease-held window once
+        the ssh child has exited).  The ssh dispatch itself stays owned by
+        task 2362's keepalive and is never touched here (see
+        test_remote_lease_with_live_dispatch_is_not_progress_aborted below).
+        run_merge_verify hanging simulates the lease-held stall (e.g. the
+        ssh child already exited, or a post-failure local probe hangs) while
+        dispatch_in_flight is driven independently on the fake — mirroring
+        how the real RemoteRunner derives it from _inflight_request_id, not
+        from whether the awaited coroutine has itself returned.
 
-        RED (step-5) until step-6 GREEN gates trigger 3 on lease.is_local:
-        step-4's elapsed-only trigger is lease-agnostic and aborts this dead
-        REMOTE verify exactly like a LOCAL one.
+        RED until step-4 GREEN un-gates trigger 3 for remote leases: today
+        trigger 3 is `if lease.is_local:`-gated and never runs for a remote
+        lease, so this coast is never aborted.
         """
-        from orchestrator.merge_queue import SpeculativeMergeWorker
+        from orchestrator.merge_queue import InflightStatus, SpeculativeMergeWorker
         from orchestrator.verify_runner import HostLease
 
         never_release = asyncio.Event()
@@ -848,10 +856,10 @@ class TestDeadInflightVerifyAborts:
         async def _dead_remote_verify(*args: object, **kwargs: object) -> MagicMock:
             gate_entered.set()
             await never_release.wait()
-            return _pass_result()  # pragma: no cover — never reached in this test
+            raise AssertionError('unreachable — never_release is never set in this test')
 
         req, item = await _make_merged_item(
-            git_ops, config, 'remote-dead-verify-a', 'ra.py', 'x=1\n',
+            git_ops, config, 'remote-coast-verify-a', 'rca.py', 'x=1\n',
         )
         q: asyncio.Queue[MergeRequest] = asyncio.Queue()
         worker = SpeculativeMergeWorker(git_ops, q)
@@ -864,7 +872,78 @@ class TestDeadInflightVerifyAborts:
         fake_remote = MagicMock()
         fake_remote.name = 'remote-host'
         fake_remote.is_local = False
+        fake_remote.dispatch_in_flight = False
         fake_remote.run_merge_verify = AsyncMock(side_effect=_dead_remote_verify)
+        fake_remote.cancel_verify = AsyncMock(return_value=0)
+        lease = HostLease(name='remote-host', runner=fake_remote, is_local=False)
+
+        with caplog.at_level(logging.WARNING, logger='orchestrator.merge_queue'):
+            result = await asyncio.wait_for(
+                worker._run_inflight_verify(item, lease), timeout=5.0,
+            )
+
+        assert result.status == InflightStatus.REQUEUED, (
+            f'expected a remote lease-held coast (no live dispatch) to '
+            f'REQUEUE, got status={result.status!r}'
+        )
+        assert not q.empty(), 'a lease-held coast must re-dispatch the request onto _queue'
+        assert result.merge_wt is None, 'merge_wt must be cleaned on a lease-held coast abort'
+
+        warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
+        assert any(
+            req.task_id in r.message and 'progress' in r.message.lower()
+            for r in warnings
+        ), f'expected a WARNING naming the task + no-progress budget, got: {caplog.text}'
+
+    async def test_remote_lease_with_live_dispatch_is_not_progress_aborted(
+        self,
+        git_ops: GitOps,
+        config: OrchestratorConfig,
+    ) -> None:
+        """A REMOTE lease with a LIVE ssh dispatch (dispatch_in_flight=True)
+        must never be progress-aborted: the remote verify-hang facet of a
+        live dispatch is owned by task 2362's ssh keepalive, and a remote
+        verify writes to the REMOTE host's worktree, not the local
+        merge_wt — so a local content-mtime budget would false-abort a
+        healthy remote verify.  Trigger 3 must treat a live dispatch as
+        progress and keep resetting its no-progress clock for as long as
+        dispatch_in_flight stays True.
+
+        task 2566 revises this from the former BLANKET invariant "a REMOTE
+        lease is NEVER progress-aborted" to this narrower one scoped to a
+        LIVE dispatch — the blanket exemption was exactly the coast gap
+        closed by test_remote_lease_held_with_no_live_dispatch_is_aborted_and_requeued_within_budget
+        above (dispatch_in_flight=False case). This guard pins the
+        still-required protection: a live dispatch is progress and must not
+        be aborted out from under it.
+        """
+        from orchestrator.merge_queue import SpeculativeMergeWorker
+        from orchestrator.verify_runner import HostLease
+
+        never_release = asyncio.Event()
+        gate_entered = asyncio.Event()
+
+        async def _live_dispatch_remote_verify(*args: object, **kwargs: object) -> MagicMock:
+            gate_entered.set()
+            await never_release.wait()
+            return _pass_result()  # pragma: no cover — never reached in this test
+
+        req, item = await _make_merged_item(
+            git_ops, config, 'remote-live-dispatch-a', 'rla.py', 'x=1\n',
+        )
+        q: asyncio.Queue[MergeRequest] = asyncio.Queue()
+        worker = SpeculativeMergeWorker(git_ops, q)
+        worker._register_owned_merge_worktree(item.merge_wt)
+
+        worker.VERIFY_ABANDON_POLL_SECS = 0.02
+        worker.INFLIGHT_VERIFY_PROGRESS_PROBE_SECS = 0.02
+        worker.INFLIGHT_VERIFY_PROGRESS_BUDGET_SECS = 0.2
+
+        fake_remote = MagicMock()
+        fake_remote.name = 'remote-host'
+        fake_remote.is_local = False
+        fake_remote.dispatch_in_flight = True
+        fake_remote.run_merge_verify = AsyncMock(side_effect=_live_dispatch_remote_verify)
         fake_remote.cancel_verify = AsyncMock(return_value=0)
         lease = HostLease(name='remote-host', runner=fake_remote, is_local=False)
 
@@ -872,14 +951,103 @@ class TestDeadInflightVerifyAborts:
         await asyncio.wait_for(gate_entered.wait(), timeout=15.0)
 
         # Wall-clock comfortably exceeds the (tiny) budget several times over
-        # — a LOCAL lease would already have been progress-aborted by now.
+        # — a lease with no live dispatch would already have been
+        # progress-aborted by now.
         await asyncio.sleep(worker.INFLIGHT_VERIFY_PROGRESS_BUDGET_SECS * 5)
 
         assert not verify_future.done(), (
-            'a REMOTE lease must never be progress-aborted (scope fence: remote '
-            'verify-hang is owned by task 2362 ssh keepalive)'
+            'a REMOTE lease with a live ssh dispatch must never be '
+            'progress-aborted (task 2362 owns tearing down a genuinely dead '
+            'dispatch)'
         )
-        assert q.empty(), 'remote lease must not be re-dispatched by the progress budget'
+        assert q.empty(), 'a live-dispatch remote lease must not be re-dispatched by the progress budget'
+
+        verify_future.cancel()
+        with contextlib.suppress(BaseException):
+            await verify_future
+
+    async def test_remote_lease_with_runner_missing_dispatch_in_flight_attr_is_not_progress_aborted(
+        self,
+        git_ops: GitOps,
+        config: OrchestratorConfig,
+    ) -> None:
+        """task 2566 reviewer finding (test-coverage, merge_queue.py:11139):
+        pins the `getattr(lease.runner, 'dispatch_in_flight', True)`
+        fail-safe DEFAULT, which no other test here exercises. Every other
+        remote test sets `fake_remote.dispatch_in_flight` explicitly on a
+        MagicMock — but MagicMock auto-vivifies any attribute on first
+        access, so even reading an unset `fake_remote.dispatch_in_flight`
+        never actually falls through to getattr's third-positional-arg
+        default; it returns the mock's freshly auto-created (truthy) child
+        attribute instead.
+
+        This test uses a plain stub runner class that genuinely has no
+        `dispatch_in_flight` attribute (AttributeError on direct access), so
+        getattr's default is the only thing that can make the no-progress
+        clock keep resetting. Mirrors
+        test_remote_lease_with_live_dispatch_is_not_progress_aborted above:
+        the runner must be treated as "dispatch live" and never
+        progress-aborted.
+        """
+        from orchestrator.merge_queue import SpeculativeMergeWorker
+        from orchestrator.verify_runner import HostLease
+
+        never_release = asyncio.Event()
+        gate_entered = asyncio.Event()
+
+        class _RemoteRunnerMissingDispatchInFlight:
+            """No `dispatch_in_flight` attribute at all — unlike MagicMock,
+            reading it raises AttributeError, so getattr(..., True) in
+            merge_queue's trigger 3 genuinely falls through to its default.
+            """
+
+            name = 'remote-host'
+            is_local = False
+
+            async def run_merge_verify(self, *args: object, **kwargs: object) -> MagicMock:
+                gate_entered.set()
+                await never_release.wait()
+                return _pass_result()  # pragma: no cover — never reached in this test
+
+            async def cancel_verify(self) -> int:
+                return 0
+
+        stub_runner = _RemoteRunnerMissingDispatchInFlight()
+        assert not hasattr(stub_runner, 'dispatch_in_flight'), (
+            'sanity: this stub must genuinely lack the attribute for the '
+            'getattr(..., True) fail-safe default to be exercised'
+        )
+
+        req, item = await _make_merged_item(
+            git_ops, config, 'remote-no-attr-a', 'rna.py', 'x=1\n',
+        )
+        q: asyncio.Queue[MergeRequest] = asyncio.Queue()
+        worker = SpeculativeMergeWorker(git_ops, q)
+        worker._register_owned_merge_worktree(item.merge_wt)
+
+        worker.VERIFY_ABANDON_POLL_SECS = 0.02
+        worker.INFLIGHT_VERIFY_PROGRESS_PROBE_SECS = 0.02
+        worker.INFLIGHT_VERIFY_PROGRESS_BUDGET_SECS = 0.2
+
+        lease = HostLease(name='remote-host', runner=stub_runner, is_local=False)
+
+        verify_future = asyncio.ensure_future(worker._run_inflight_verify(item, lease))
+        await asyncio.wait_for(gate_entered.wait(), timeout=15.0)
+
+        # Wall-clock comfortably exceeds the (tiny) budget several times over
+        # — a lease whose progress signal read False would already have been
+        # progress-aborted by now.
+        await asyncio.sleep(worker.INFLIGHT_VERIFY_PROGRESS_BUDGET_SECS * 5)
+
+        assert not verify_future.done(), (
+            'a REMOTE runner exposing no dispatch_in_flight attribute must '
+            'fail safe to "dispatch live" (getattr default True) and never '
+            'be progress-aborted'
+        )
+        assert q.empty(), (
+            'a runner missing dispatch_in_flight must not be re-dispatched '
+            'by the progress budget'
+        )
 
         verify_future.cancel()
         with contextlib.suppress(BaseException):
@@ -1181,4 +1349,131 @@ class TestRepeatedDeadVerifyBusyLoopCap:
         assert result3.status == InflightStatus.REQUEUED, (
             'a task_id resubmitted right after its blocked resolution must '
             'get a fresh dead-verify-abort budget, not immediately re-block'
+        )
+
+    async def test_repeated_remote_coast_converts_to_blocked_and_success_resets_counter(
+        self,
+        git_ops: GitOps,
+        config: OrchestratorConfig,
+    ) -> None:
+        """task 2566: repeated REMOTE-lease-held coasts (dispatch_in_flight
+        =False, no live ssh dispatch) must convert to terminal 'blocked'
+        after MAX_INFLIGHT_DEAD_VERIFY_ABORTS, exactly mirroring the LOCAL
+        busy-loop guard above (test_repeated_dead_verify_converts_to_blocked_and_success_resets_counter)
+        — and a subsequent successful remote verify must clear the per-task
+        counter.
+
+        RED until step-4 GREEN un-gates trigger 3 for remote leases: today
+        a remote coast is re-queued forever (trigger 3 never runs for a
+        remote lease), so the busy-loop cap never trips.
+        """
+        from orchestrator.merge_queue import InflightStatus, SpeculativeMergeWorker
+        from orchestrator.verify_runner import HostLease
+
+        task_id = 'remote-coast-repeat-task'
+
+        async def _dead_remote_gate(*args: object, **kwargs: object) -> MagicMock:
+            await asyncio.Event().wait()
+            raise AssertionError('unreachable — this Event is never set')  # pragma: no cover
+
+        q: asyncio.Queue[MergeRequest] = asyncio.Queue()
+        worker = SpeculativeMergeWorker(git_ops, q)
+        worker.VERIFY_ABANDON_POLL_SECS = 0.02
+        worker.INFLIGHT_VERIFY_PROGRESS_PROBE_SECS = 0.02
+        worker.INFLIGHT_VERIFY_PROGRESS_BUDGET_SECS = 0.2
+        worker.MAX_INFLIGHT_DEAD_VERIFY_ABORTS = 2
+
+        fake_remote = MagicMock()
+        fake_remote.name = 'remote-host'
+        fake_remote.is_local = False
+        fake_remote.cancel_verify = AsyncMock(return_value=0)
+
+        # ── Attempt 1: remote coast (no live dispatch) -> REQUEUED (counter -> 1, below MAX) ──
+        req1, item1 = await _make_merged_item(
+            git_ops, config, 'remote-coast-repeat-branch-1', 'rcr1.py', 'a=1\n', task_id=task_id,
+        )
+        worker._register_owned_merge_worktree(item1.merge_wt)
+        fake_remote.dispatch_in_flight = False
+        fake_remote.run_merge_verify = AsyncMock(side_effect=_dead_remote_gate)
+        lease1 = HostLease(name='remote-host', runner=fake_remote, is_local=False)
+        result1 = await asyncio.wait_for(
+            worker._run_inflight_verify(item1, lease1), timeout=5.0,
+        )
+        assert result1.status == InflightStatus.REQUEUED
+        assert not req1.result.done()
+        # Drain the re-queued req1 so it doesn't shadow the emptiness checks
+        # below — mirrors the LOCAL variant above.
+        assert q.get_nowait() is req1
+
+        # ── Attempt 2 (MAX-th, same task_id): remote coast -> terminal 'blocked' ──
+        req2, item2 = await _make_merged_item(
+            git_ops, config, 'remote-coast-repeat-branch-2', 'rcr2.py', 'b=2\n', task_id=task_id,
+        )
+        worker._register_owned_merge_worktree(item2.merge_wt)
+        fake_remote.dispatch_in_flight = False
+        fake_remote.run_merge_verify = AsyncMock(side_effect=_dead_remote_gate)
+        lease2 = HostLease(name='remote-host', runner=fake_remote, is_local=False)
+        result2 = await asyncio.wait_for(
+            worker._run_inflight_verify(item2, lease2), timeout=5.0,
+        )
+
+        assert result2.status is None, (
+            f'the MAX-th consecutive remote coast must resolve terminally, '
+            f'not REQUEUED again — got status={result2.status!r}'
+        )
+        assert result2.outcome is not None and result2.outcome.status == 'blocked'
+        reason = result2.outcome.reason.lower()
+        assert 'dead' in reason and 'hung' in reason, (
+            f"expected the blocked reason to mention 'dead'/'hung' verify, got: "
+            f'{result2.outcome.reason!r}'
+        )
+        assert result2.merge_wt is None
+
+        assert req2.result.done(), 'the MAX-th abort must resolve req2.result directly'
+        outcome2 = req2.result.result()
+        assert outcome2.status == 'blocked'
+
+        assert q.empty(), 'the MAX-th remote coast must NOT be re-queued (busy-loop guard)'
+
+        # ── Attempt 3: a SUCCESSFUL remote verify for the SAME task_id clears the counter ──
+        # Patches _run_post_merge_verify directly (not fake_remote.run_merge_verify)
+        # so this test doesn't need to fabricate a scoped VerifyResult that
+        # satisfies every internal gate inside _run_post_merge_verify — mirrors
+        # test_failed_verify_also_clears_dead_verify_abort_counter's Attempt 2
+        # above (same file, same rationale, different outcome: pass not fail).
+        req3, item3 = await _make_merged_item(
+            git_ops, config, 'remote-coast-repeat-branch-3', 'rcr3.py', 'c=3\n', task_id=task_id,
+        )
+        worker._register_owned_merge_worktree(item3.merge_wt)
+        lease3 = HostLease(name='remote-host', runner=fake_remote, is_local=False)
+
+        async def _pass_fast(*args: object, **kwargs: object) -> None:
+            return None
+
+        with patch('orchestrator.merge_queue._run_post_merge_verify', _pass_fast):
+            result3 = await asyncio.wait_for(
+                worker._run_inflight_verify(item3, lease3), timeout=5.0,
+            )
+        assert result3.status is None and result3.outcome is None, (
+            f'expected a clean pass, got {result3!r}'
+        )
+        assert worker._inflight_dead_verify_aborts.get(task_id, 0) == 0, (
+            'a successful remote verify must clear the per-task dead-verify-abort counter'
+        )
+
+        # ── Attempt 4: remote coast again for the SAME task_id starts a FRESH episode ──
+        req4, item4 = await _make_merged_item(
+            git_ops, config, 'remote-coast-repeat-branch-4', 'rcr4.py', 'd=4\n', task_id=task_id,
+        )
+        worker._register_owned_merge_worktree(item4.merge_wt)
+        fake_remote.dispatch_in_flight = False
+        fake_remote.run_merge_verify = AsyncMock(side_effect=_dead_remote_gate)
+        lease4 = HostLease(name='remote-host', runner=fake_remote, is_local=False)
+        result4 = await asyncio.wait_for(
+            worker._run_inflight_verify(item4, lease4), timeout=5.0,
+        )
+        assert result4.status == InflightStatus.REQUEUED, (
+            'after a successful verify clears the counter, the next remote '
+            'coast must start a fresh episode (REQUEUED), not immediately '
+            'resolve blocked'
         )

@@ -1201,6 +1201,20 @@ class RemoteRunner:
         except Exception:
             return False  # fail-safe: stay PARKED on any transport error
 
+    @property
+    def dispatch_in_flight(self) -> bool:
+        """True while an ssh run_merge_verify dispatch is live.
+
+        Derived from ``_inflight_request_id`` (set at the top of
+        run_merge_verify, cleared in its finally): True == the dispatch's
+        death is owned by task 2362's ssh keepalive; False == either no
+        dispatch has started, or it has returned and the lease may still be
+        held for post-dispatch work.  Consumed by merge_queue's abort-poll
+        loop (task 2566) to bound that post-dispatch, remote-lease-held
+        window, which nothing else watches.
+        """
+        return self._inflight_request_id is not None
+
 
 # ---------------------------------------------------------------------------
 # Helpers for merge_queue to branch on unscoped-gate verdicts
