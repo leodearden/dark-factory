@@ -1031,9 +1031,22 @@ class _MainHealthProbeHandles:
     caller — pass ``None`` (the default), so ``_run_post_merge_verify`` keeps
     running the main-health probe SYNCHRONOUSLY exactly as it did before
     this task.
+
+    ``auto_heal`` (task 2564 step-22) is an optional callback threaded
+    through to :func:`_run_deferred_main_health_probe`: when a confirmed,
+    still-fresh pre-existing break is found, the probe routes to it
+    (``await auto_heal(outcome, req)``) INSTEAD of filing the
+    escalation-only fallback.  ``None`` (the default) preserves the
+    escalation-only behaviour for every bare/test caller.  Only the
+    production call site passes
+    ``SpeculativeMergeWorker._auto_heal_main_health_deferred`` (task 2564
+    step-24).
     """
 
     background_tasks: set[asyncio.Task] = dataclasses.field(default_factory=set)
+    auto_heal: (
+        Callable[[MergeOutcome, MergeRequest], Awaitable[None]] | None
+    ) = None
 
 
 async def _run_deferred_main_health_probe(
@@ -1043,6 +1056,7 @@ async def _run_deferred_main_health_probe(
     *,
     escalation_queue: Any = None,
     event_store: EventStore | None = None,
+    auto_heal: Callable[[MergeOutcome, MergeRequest], Awaitable[None]] | None = None,
 ) -> None:
     """Off-critical-path main-health classification (task 2564).
 
@@ -1076,9 +1090,15 @@ async def _run_deferred_main_health_probe(
     the next failing merge.
 
     On a confirmed, still-fresh pre-existing break: builds the outcome via
-    :func:`_build_main_health_outcome`, emits the ``main_health_red``
-    merge-attempt signal, and files the dedup'd escalation via
-    :func:`_file_main_health_escalation`.
+    :func:`_build_main_health_outcome` and emits the ``main_health_red``
+    merge-attempt signal (task 2564 step-22: BEFORE the branch below, so the
+    signal fires whichever branch is taken).  Then, if *auto_heal* is
+    supplied, routes the outcome to it (``await auto_heal(outcome, req)``)
+    INSTEAD of filing an escalation directly — the callback owns filing
+    (see :func:`SpeculativeMergeWorker._auto_heal_main_health_deferred`,
+    which files the halt-owner escalation itself).  Otherwise (the default,
+    every bare/test caller) falls back to the pre-existing escalation-only
+    behaviour via :func:`_file_main_health_escalation`.
     """
     if not req.config.escalate_preexisting_main_break:
         return
@@ -1121,7 +1141,10 @@ async def _run_deferred_main_health_probe(
 
     outcome = _build_main_health_outcome(verify, probe_sha)
     _emit_merge_attempt(event_store, req.task_id, OutcomeKind.main_health_red)
-    _file_main_health_escalation(escalation_queue, req, outcome)
+    if auto_heal is not None:
+        await auto_heal(outcome, req)
+    else:
+        _file_main_health_escalation(escalation_queue, req, outcome)
 
 
 def _file_main_health_escalation(
@@ -1261,6 +1284,7 @@ def _spawn_main_health_probe(
             _run_deferred_main_health_probe(
                 git_ops, req, verify,
                 escalation_queue=escalation_queue, event_store=event_store,
+                auto_heal=handles.auto_heal,
             ),
             name=task_name,
         )
