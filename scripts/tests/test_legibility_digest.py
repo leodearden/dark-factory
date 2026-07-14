@@ -964,3 +964,62 @@ class TestRenderDigestTruncation:
         # Lowest-priority retry_loops (60 groups) is what absorbed the
         # truncation: fewer than all 60 groups survive.
         assert digest.count('Bash x3:') < 60
+
+
+# ---------------------------------------------------------------------------
+# build_digest — PRD Sec 8.1 boundary test, row 1, producer side. The
+# headline acceptance test: load_transcript -> detectors -> classify ->
+# render_digest, end to end from a real JSONL file on disk, with a decoy
+# "FAIL:" planted inside a Write tool_use input that must NOT inflate
+# tool_error (Sec 13.2 decoy-FAIL suppression, owned by alpha).
+# ---------------------------------------------------------------------------
+
+def _boundary_records():
+    """Plants exactly the PRD Sec 8.1 row-1 fixture: a user-correction, an
+    is_error tool_result with its preceding attempt, a self-correction
+    marker, a 3x retry loop, and a decoy "FAIL:" string inside a Write
+    tool_use input that must not be counted as a real tool_error."""
+    return [
+        _with_session_meta(_user_text('This is wrong, please redo it.')),
+        _with_session_meta(_assistant(_tool_use('Bash', {'command': 'false'}, id='tu-err'))),
+        _with_session_meta(_tool_result('tu-err', 'Exit code 1', is_error=True)),
+        _with_session_meta(_assistant(_text('My mistake, let me redo this.'))),
+        _with_session_meta(_assistant(_tool_use('Bash', {'command': 'pytest'}, id='tu-loop-1'))),
+        _with_session_meta(_assistant(_tool_use('Bash', {'command': 'pytest'}, id='tu-loop-2'))),
+        _with_session_meta(_assistant(_tool_use('Bash', {'command': 'pytest'}, id='tu-loop-3'))),
+        # decoy: a Write tool_use input containing a literal "FAIL:" string,
+        # with no matching tool_result -- never a real signal of any kind.
+        _with_session_meta(_assistant(_tool_use(
+            'Write',
+            {'file_path': '/tmp/fixture.py', 'content': 'assert False  # FAIL: decoy, not real'},
+            id='tu-decoy',
+        ))),
+    ]
+
+
+class TestBuildDigestBoundary:
+    def test_boundary_fixture_four_sections_within_cap_decoy_suppressed(self, tmp_path):
+        path = _write_jsonl(tmp_path, _boundary_records())
+
+        digest = mod.build_digest(path)
+
+        for heading in ('User Corrections', 'Error Neighborhoods', 'Self-Corrections', 'Retry Loops'):
+            assert f'## {heading}' in digest, f'missing heading: {heading}'
+
+        assert len(digest.encode('utf-8')) <= 15360
+
+        frontmatter_yaml, _ = _split_frontmatter(digest)
+        meta = yaml.safe_load(frontmatter_yaml)
+        counts = meta['signal_counts']
+
+        # Real planted signals reflected exactly.
+        assert counts['tool_error'] == 1
+        assert counts['self_correct'] == 1
+        assert counts['not_found'] == 0
+        assert counts['df_guard'] == 0
+        assert counts['interrupt'] == 0
+
+        # The decoy never surfaces anywhere in the digest: it has no
+        # matching tool_result, so iter_error_neighborhoods (the only
+        # detector that ever echoes a tool_use input) never touches it.
+        assert 'FAIL:' not in digest
