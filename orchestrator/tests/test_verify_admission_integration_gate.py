@@ -590,3 +590,109 @@ class TestSweepYieldsAndInterleaves:
 
         assert sweep_result.passed
         assert task_result.passed
+
+
+# ---------------------------------------------------------------------------
+# Scenario 4 — UNTIMED WAIT / NO REQUEUE
+# ---------------------------------------------------------------------------
+
+
+class TestUntimedWaitNoRequeue:
+    """PRD Boundary-test sketch scenario 4: slot-wait time is excluded from
+    ``verify_command_timeout_secs`` by construction — ``_run_or_skip_timed``
+    resolves the timeout and starts its clock (``t0``/``started_at``) INSIDE
+    ``_admission_slot``, after acquisition. A task-role verify that must
+    wait a real, nonzero interval for a contended slot therefore receives
+    the exact same timeout budget as one with a free slot, and completes
+    successfully with no timeout/requeue.
+    """
+
+    @pytest.mark.real_verify_admission
+    @pytest.mark.asyncio
+    async def test_contended_wait_gets_same_timeout_budget_as_free_slot(self, tmp_path):
+        slots_dir = tmp_path / 'slots'
+        config = OrchestratorConfig(
+            verify_admission_slots_dir=str(slots_dir),
+            verify_admission_task_slots=1,
+        )
+
+        # --- Baseline: free slot, no contention. ---
+        baseline_worktree = tmp_path / 'wt-baseline'
+        baseline_worktree.mkdir()
+        baseline_spy = _RunCmdSpy()
+        with patch('orchestrator.verify._run_cmd', new=baseline_spy):
+            baseline_result = await run_verification(
+                worktree=baseline_worktree,
+                config=config,
+                module_config=_module_config(),
+                role='task',
+                attempt_id=None,
+            )
+        baseline_test_calls = [c for c in baseline_spy.calls if c['leg'] == 'test']
+        assert len(baseline_test_calls) == 1
+        baseline_timeout = baseline_test_calls[0]['timeout']
+        assert baseline_result.passed
+
+        # --- Contended: a gated holder saturates the sole slot; a second
+        # task verify must wait a real, nonzero interval for it. ---
+        holder_worktree = tmp_path / 'wt-holder'
+        holder_worktree.mkdir()
+        waiter_worktree = tmp_path / 'wt-waiter'
+        waiter_worktree.mkdir()
+
+        spy = _RunCmdSpy()
+        holder_gate = spy.gate('test', 0)
+
+        with patch('orchestrator.verify._run_cmd', new=spy):
+            holder_task = asyncio.create_task(
+                run_verification(
+                    worktree=holder_worktree,
+                    config=config,
+                    module_config=_module_config(),
+                    role='task',
+                    attempt_id=None,
+                )
+            )
+            try:
+                deadline = time.monotonic() + 5.0
+                while len(spy.calls) < 1 and time.monotonic() < deadline:
+                    await asyncio.sleep(0.01)
+                assert len(spy.calls) == 1, (
+                    'expected the holder to acquire the sole slot and reach '
+                    'its gated test leg within 5s'
+                )
+
+                waiter_task = asyncio.create_task(
+                    run_verification(
+                        worktree=waiter_worktree,
+                        config=config,
+                        module_config=_module_config(),
+                        role='task',
+                        attempt_id=None,
+                    )
+                )
+                # Test-side pacing only (never asserted on): give the waiter
+                # a real, nonzero interval to genuinely contend for — and
+                # poll against, per T1's 0.1s poll loop — the still-held
+                # slot before releasing the holder.
+                await asyncio.sleep(0.3)
+            finally:
+                holder_gate.set()
+                holder_result = await holder_task
+            waiter_result = await waiter_task
+
+        assert holder_result.passed
+
+        waiter_test_calls = [
+            c for c in spy.calls if c['leg'] == 'test' and c['cwd'] == waiter_worktree
+        ]
+        assert len(waiter_test_calls) == 1
+        waiter_timeout = waiter_test_calls[0]['timeout']
+        assert waiter_timeout == baseline_timeout, (
+            f'expected the contended waiter to receive the same timeout '
+            f'budget as the free-slot baseline (slot-wait excluded from '
+            f'verify_command_timeout_secs); got waiter={waiter_timeout!r} '
+            f'baseline={baseline_timeout!r}'
+        )
+        assert waiter_result.passed
+        assert not waiter_result.timed_out
