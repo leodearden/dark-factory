@@ -487,7 +487,6 @@ def _build_harness(config: OrchestratorConfig) -> Harness:
 
 
 async def _init_git_repo(repo: Path) -> None:
-    from orchestrator.git_ops import _run
     await _run(['git', 'init', '-b', 'main'], cwd=repo)
     await _run(['git', 'config', 'user.email', 'test@test.com'], cwd=repo)
     await _run(['git', 'config', 'user.name', 'Test'], cwd=repo)
