@@ -14,6 +14,7 @@ from orchestrator.agents.invoke import (
     _parse_gemini_output,
     _parse_pi_output,
     _pi_tool_name,
+    _write_pi_mcp_config,
 )
 from orchestrator.config import PriceEntry
 
@@ -478,3 +479,49 @@ class TestParsePiCostFallback:
             prices={'o4-mini': {'input_per_1m': 100.0, 'output_per_1m': 100.0}},
         )
         assert agent_result.cost_usd == pytest.approx(0.01234)
+
+
+class TestWritePiMcpConfig:
+    """`_write_pi_mcp_config` emits a `.mcp.json`-shaped config with
+    `directTools: true` injected per server (spike Q3 — required so each
+    MCP tool is individually allowlistable via --tools/--exclude-tools;
+    without it pi-mcp-adapter exposes only the proxy `mcp` tool). Only the
+    file CONTENT is pinned here — placement/the non-cwd config-path flag
+    are resolved by _invoke_pi itself (see its docstring/comments)."""
+
+    def test_servers_get_direct_tools_and_preserve_fields(self, tmp_path):
+        config_path = tmp_path / 'pi-mcp-config.json'
+        mcp_config = {
+            'mcpServers': {
+                'fused-memory': {'command': 'x', 'args': ['a'], 'env': {'K': 'V'}},
+                'plan-tools': {'command': 'y', 'args': []},
+            },
+        }
+
+        _write_pi_mcp_config(config_path, mcp_config)
+
+        written = json.loads(config_path.read_text())
+        assert set(written.keys()) == {'mcpServers'}
+        servers = written['mcpServers']
+        assert servers['fused-memory'] == {
+            'command': 'x', 'args': ['a'], 'env': {'K': 'V'}, 'directTools': True,
+        }
+        assert servers['plan-tools'] == {
+            'command': 'y', 'args': [], 'directTools': True,
+        }
+
+    def test_none_mcp_config_writes_empty_servers_without_raising(self, tmp_path):
+        config_path = tmp_path / 'pi-mcp-config.json'
+
+        _write_pi_mcp_config(config_path, None)
+
+        written = json.loads(config_path.read_text())
+        assert written == {'mcpServers': {}}
+
+    def test_empty_mcp_config_writes_empty_servers_without_raising(self, tmp_path):
+        config_path = tmp_path / 'pi-mcp-config.json'
+
+        _write_pi_mcp_config(config_path, {})
+
+        written = json.loads(config_path.read_text())
+        assert written == {'mcpServers': {}}
