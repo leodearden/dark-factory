@@ -57,6 +57,7 @@ from __future__ import annotations
 
 import asyncio
 import shlex
+import subprocess
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -75,6 +76,14 @@ from orchestrator import (
 from orchestrator.config import GitConfig, ModuleConfig, OrchestratorConfig
 from orchestrator.git_ops import GitOps, _run
 from orchestrator.merge_queue import MergeRequest
+from orchestrator.verify_cmd import (
+    ToolKind,
+    VerifyCmd,
+    parse_config_command,
+    render,
+    scope_to,
+    strip_cwd,
+)
 
 # ── Repo seeding (ported from test_merge_queue_two_layer_integration.py) ──────
 
