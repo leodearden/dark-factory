@@ -277,11 +277,21 @@ async def test_interceptor_submit_task_captures_agent_id_without_serializing_int
 async def test_submit_task_handler_resolves_ctx_and_forwards_agent_id(
     mcp_server, task_interceptor,
 ):
-    """The handler resolves agent_id from ctx and forwards it to the interceptor."""
+    """The handler resolves agent_id from ctx and forwards it to the interceptor.
+
+    Passes ``metadata={'execution_class': 'code_tdd'}`` because ``AGENT_ID``
+    carries the ``recon-stage-`` prefix, which trips the execution_class
+    guard (task 2225/eta) added to the submit_task handler after this test
+    was written (task 2223) — without a declared execution_class the guard
+    short-circuits before the interceptor is ever awaited.
+    """
     handler = _raw(mcp_server, 'submit_task')
 
     await handler(
-        project_root='/project', title='x', ctx=_make_ctx(AGENT_ID),
+        project_root='/project',
+        title='x',
+        metadata={'execution_class': 'code_tdd'},
+        ctx=_make_ctx(AGENT_ID),
     )
 
     task_interceptor.submit_task.assert_awaited_once()
