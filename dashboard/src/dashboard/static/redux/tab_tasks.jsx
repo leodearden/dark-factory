@@ -180,6 +180,29 @@ function TaskGraph({ tasks, selectedId, onSelect, onEnterFocus }) {
   );
 }
 
+// Per-project wrapper around TaskGraph: memoizes the focus-mode subset so
+// it isn't recomputed (rebuilding focusSubset's Map + re-walking
+// computeNeighborhood) on every TasksTab render that doesn't actually
+// change this project's filtered tasks, selection, or focus state — e.g.
+// re-renders driven by unrelated live-data ticks elsewhere on the page.
+// This has to be a real component (not an inline computation inside the
+// projects.map() callback below) so the useMemo call follows the Rules of
+// Hooks: one consistent hook per mounted project instance, not a
+// variable-count hook call inside a loop.
+//
+// Guarding on selectedId != null (not just focusMode) keeps the existing
+// immediate-passthrough behavior when a node is deselected by clicking it
+// again — that only clears selectedId, and without this guard the subset
+// would still reflect the stale focusAnchorId for one render until the
+// effect above catches focusMode up to it.
+function ProjectTaskGraph({ filtered, selectedId, focusMode, focusAnchorId, onSelect, onEnterFocus }) {
+  const graphTasks = uM_T(
+    () => (focusMode && selectedId != null ? focusSubset(filtered, focusAnchorId) : filtered),
+    [filtered, focusMode, selectedId, focusAnchorId]
+  );
+  return <TaskGraph tasks={graphTasks} selectedId={selectedId} onSelect={onSelect} onEnterFocus={onEnterFocus} />;
+}
+
 function fmtAge(t) {
   if (t.status === 'done')             return t.completed ? window.DF_SHELL.timeago(t.completed) : '—';
   if (t.status === 'pending')          return 'unstarted';
@@ -342,9 +365,16 @@ function TasksTab({ projectFilter, search }) {
   const [selectedId, setSelectedId] = uS_T(null);
 
   // Focus mode: ephemeral (NOT persisted) — filters the graph down to the
-  // selected task's ancestors+descendants. Never survives a reload.
+  // focus anchor's ancestors+descendants. Never survives a reload.
+  // focusAnchorId is tracked separately from selectedId: single-clicking a
+  // different in-view node while focused only updates the detail-panel
+  // selection (matching the plain onSelect wiring on node clicks below) —
+  // it does NOT silently re-narrow the graph out from under the user.
+  // (Re-)entering focus on a node is the deliberate onEnterFocus action
+  // (double-click / the "focus" button), which sets both together.
   const [focusMode, setFocusMode] = uS_T(false);
-  function enterFocus(id) { setSelectedId(id); setFocusMode(true); }
+  const [focusAnchorId, setFocusAnchorId] = uS_T(null);
+  function enterFocus(id) { setSelectedId(id); setFocusMode(true); setFocusAnchorId(id); }
   function exitFocus() { setFocusMode(false); }
 
   // Deselecting (via the graph, "clear", or otherwise) always drops focus —
@@ -419,10 +449,10 @@ function TasksTab({ projectFilter, search }) {
           <button className={filters.deferred  ? 'on' : ''} onClick={() => flipFilter('deferred')}>deferred</button>
           <button className={filters.cancelled ? 'on' : ''} onClick={() => flipFilter('cancelled')}>cancelled</button>
         </div>
-        <span className={focusMode && selectedId ? 'focus-chip' : ''}
+        <span className={focusMode && focusAnchorId ? 'focus-chip' : ''}
               style={{ marginLeft: 'auto', fontSize: 11, color: 'var(--fg-3)', fontFamily: 'var(--mono)' }}>
-          {focusMode && selectedId
-            ? `focused on ${window.DF_SHELL.taskId(selectedId)} — Esc to exit`
+          {focusMode && focusAnchorId
+            ? `focused on ${window.DF_SHELL.taskId(focusAnchorId)} — Esc to exit`
             : 'click a task to inspect →'}
         </span>
       </div>
@@ -455,10 +485,10 @@ function TasksTab({ projectFilter, search }) {
               </>
             );
 
-            const graphTasks = focusMode ? focusSubset(filtered, selectedId) : filtered;
             return (
               <PG_T key={p.id} id={p.id} label={p.id} open={isOpen} onToggle={() => toggle(p.id)} summary={summary}>
-                <TaskGraph tasks={graphTasks} selectedId={selectedId} onSelect={setSelectedId} onEnterFocus={enterFocus} />
+                <ProjectTaskGraph filtered={filtered} selectedId={selectedId} focusMode={focusMode}
+                                  focusAnchorId={focusAnchorId} onSelect={setSelectedId} onEnterFocus={enterFocus} />
               </PG_T>
             );
           })}
