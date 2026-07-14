@@ -1197,7 +1197,7 @@ class GitOps:
 
     @contextlib.asynccontextmanager
     async def ephemeral_worktree(
-        self, kind: WorktreeKind, sha: str,
+        self, kind: WorktreeKind, sha: str, *, warm_seed: bool = False,
     ) -> AsyncIterator[Path]:
         """Mint a throwaway detached worktree pinned at *sha*, with
         GUARANTEED scoped cleanup on exit (task θ, verify-plan PRD).
@@ -1228,6 +1228,24 @@ class GitOps:
                 :data:`PROTECTED_PREFIXES` key, so the reaper never
                 reclaims it mid-run).
             sha: Commit-ish to pin the detached worktree at.
+            warm_seed: When True AND the warm-lane CoW seed base is
+                resolvable (:meth:`_warm_lane_base_resolvable` returns
+                :attr:`WarmBaseHealth.OK`), CoW-seeds the minted
+                worktree's ``target/`` from the shared warm base via
+                :meth:`_seed_warm_lane` (mode ``'--fresh-checkout'``,
+                ``take_lane_lock=False`` since this CM already holds
+                ``<lane_dir>.lock`` for its own lifetime — see the Note
+                below) after a successful add and BEFORE the body runs,
+                turning a cold from-scratch build into a warm incremental
+                one. Any non-zero seed rc (absent script, disk pressure,
+                generic fault) is logged and the CM proceeds COLD — a
+                seed fault never breaks the probe (fail-soft, mirrors
+                :meth:`create_interactive_worktree`'s
+                seed-then-retain-cold-on-fault contract). A
+                non-resolvable base (ABSENT/INDETERMINATE) skips the seed
+                subprocess entirely. Default ``False`` keeps
+                ``run_main_tip_sweep`` (``MAIN_SWEEP``) byte-identical to
+                before this parameter existed.
 
         Yields:
             The minted worktree path, already checked out at *sha*.
@@ -1329,6 +1347,34 @@ class GitOps:
                 with contextlib.suppress(Exception):
                     shutil.rmtree(tmp_path, ignore_errors=True)
                 raise
+
+            # task 2567: optionally CoW-seed the freshly-added worktree's
+            # target/ from the shared warm-lane base before the body runs,
+            # so a probe/sweep opted into warm_seed starts from a pre-built
+            # main instead of a cold from-scratch recompile. Fail-soft: any
+            # non-zero seed rc just logs and proceeds COLD — never raises,
+            # never removes the worktree. take_lane_lock=False because this
+            # CM already holds <lane_dir>.lock (above) for its entire
+            # lifetime; re-taking it inside _seed_warm_lane would
+            # self-deadlock against the identical path (see that method's
+            # take_lane_lock docstring note).
+            if worktree_added and warm_seed:
+                if self._warm_lane_base_resolvable() is WarmBaseHealth.OK:
+                    seed_rc = await self._seed_warm_lane(
+                        tmp_path, '--fresh-checkout', take_lane_lock=False,
+                    )
+                    if seed_rc != 0:
+                        logger.info(
+                            'ephemeral_worktree(%s): warm seed failed (rc=%d) '
+                            'for %s — proceeding COLD (fail-soft)',
+                            kind.name, seed_rc, tmp_path,
+                        )
+                else:
+                    logger.debug(
+                        'ephemeral_worktree(%s): warm base not resolvable — '
+                        'skipping seed, proceeding COLD for %s',
+                        kind.name, tmp_path,
+                    )
 
             try:
                 yield tmp_path
