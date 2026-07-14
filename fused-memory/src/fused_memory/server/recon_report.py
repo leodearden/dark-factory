@@ -1202,17 +1202,21 @@ class ReconReportState:
            citation (``cited_tasks`` still empty) with a non-null
            ``flag_type`` (a null flag_type can't form a meaningful derived
            signature — every null-flag_type citation of the same task would
-           collide), and only when ``finding.task_id is None`` or already
-           equals this citation's task_id (canonicalized) — a finding citing
-           an unrelated foreign task is never folded (see
-           test_non_null_task_id_finding_is_never_a_fold_anchor). Unlike
-           fold 1, this fold has NO memory_consolidator carve-out: the
-           derived signature lives in the same run-wide, cross-stage index
-           add_finding already consults from every stage, so exempting one
-           stage from registering it would just let that stage's findings
-           silently evade the whole-run fold. (Comma-joined top-level
-           task_id subset-membership eligibility is added in task-2432
-           step-10.)
+           collide), and only when ``finding.task_id is None`` or this
+           citation's task_id (canonicalized) is a MEMBER of
+           ``finding.task_id``'s comma-split parts (:func:`_split_task_id_parts`)
+           — a single-value top-level task_id is a singleton part set, so
+           this subsumes the equality case. A None, a foreign-single, a
+           local-single, and a comma-joined top-level task_id therefore all
+           fold through this ONE path when they share a cited task; a
+           finding citing a task outside its own top-level part set is never
+           folded (see test_non_null_task_id_finding_is_never_a_fold_anchor
+           and test_local_task_id_citing_different_task_is_not_folded).
+           Unlike fold 1, this fold has NO memory_consolidator carve-out:
+           the derived signature lives in the same run-wide, cross-stage
+           index add_finding already consults from every stage, so
+           exempting one stage from registering it would just let that
+           stage's findings silently evade the whole-run fold.
         """
         entry = self._resolve_entry(run_id)
         if entry is None:
@@ -1261,7 +1265,7 @@ class ReconReportState:
             and finding.flag_type is not None
             and (
                 finding.task_id is None
-                or _canonical_sig_field(finding.task_id) == c_cited_task_id
+                or c_cited_task_id in _split_task_id_parts(finding.task_id)
             )
         )
         derived_sig = (c_cited_task_id, finding.flag_type) if entity_fold_eligible else None
