@@ -2304,7 +2304,7 @@ class TestNonBlockingPoll:
         async with app.run_test() as pilot:
             await pilot.pause()  # on_mount's synchronous scan: call #1, non-blocking
 
-            app._scan_registry_worker()
+            app._scan_registry_worker(app._next_scan_seq())
             while not scanner.started.is_set():
                 await asyncio.sleep(0.01)
 
@@ -2357,7 +2357,7 @@ class TestThreadedScanReachesUI:
             # so the "unchanged" assertion below isn't vacuously true.
             assert any(path.startswith('sessions/') for path in before)
 
-            worker = app._scan_registry_worker()
+            worker = app._scan_registry_worker(app._next_scan_seq())
             await worker.wait()
             await pilot.pause()
 
