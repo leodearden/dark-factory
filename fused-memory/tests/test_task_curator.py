@@ -414,6 +414,21 @@ class TestParseDecision:
         assert result.action == 'create'
         assert 'parse-failed' in result.justification
 
+    def test_drop_against_unknown_degrades_to_create(self):
+        """Mirrors TestParseDecisionDict.test_drop_against_unknown_status_degrades_to_create
+        through the AgentResult -> _parse_decision -> _parse_decision_dict path
+        that _call_llm actually uses (the interceptor-facing decision path).
+        """
+        pool = _pool_with_ids(('10', 'pending'), ('11', 'unknown'))
+        result = _parse_decision(
+            _agent_result({
+                'action': 'drop', 'target_id': '11', 'justification': '...',
+            }),
+            pool_sizes={}, latency_ms=10, pool=pool,
+        )
+        assert result.action == 'create'
+        assert 'unknown' in result.justification
+
 
 # ----------------------------------------------------------------------
 # Output schema sanity
@@ -1811,6 +1826,126 @@ class TestParseDecisionDict:
         )
         assert result.action == 'create'
         assert 'ambiguous-drop' in result.justification
+
+    def test_drop_against_unknown_status_degrades_to_create(self):
+        """RC3: a drop targeting a pool entry with status='unknown' (e.g. an
+        unconfirmable thin fallback entry from a TRANSIENT get_task failure)
+        must degrade to 'create' rather than silently discarding a real
+        candidate — the opposite of the prompt's "when in doubt, create" rule.
+        """
+        pool = _pool_with_ids(('10', 'pending'), ('11', 'unknown'))
+        result = self._call(
+            {
+                'action': 'drop',
+                'target_id': '11',
+                'justification': 'looks like a dup of 11',
+            },
+            pool,
+        )
+        assert result.action == 'create'
+        assert 'unknown' in result.justification
+
+    def test_combine_against_unknown_status_degrades_to_create(self):
+        """RC3 defense-in-depth: even if an unknown-status entry were ever
+        wrongly marked combine_eligible=True (otherwise impossible via
+        _to_pool_entry/_fetch_entry_for_neighbor, both of which force
+        combine_eligible=False for status='unknown'), the unknown-status
+        guard must still block the combine — authoritative independent of
+        combine_eligible.
+        """
+        entry = _PoolEntry(
+            task_id='11',
+            title='Mystery task',
+            description='',
+            details='',
+            files_to_modify=[],
+            module_keys=[],
+            status='unknown',
+            priority='medium',
+            source='module',
+            combine_eligible=True,
+        )
+        result = self._call(
+            {
+                'action': 'combine',
+                'target_id': '11',
+                'target_fingerprint': 'Mystery task',
+                'justification': 'looks like a dup of 11',
+                'rewritten_task': {
+                    'title': 'X',
+                    'description': '',
+                    'details': 'd',
+                    'files_to_modify': [],
+                    'priority': 'medium',
+                },
+            },
+            [entry],
+        )
+        assert result.action == 'create'
+        assert 'unknown' in result.justification
+        assert 'invalid-combine-target' not in result.justification
+
+    def test_drop_against_confirmed_non_pending_statuses_still_drops(self):
+        """Regression: the RC3 unknown-status guard must not over-generalize
+        to other non-pending statuses — a drop against a confirmed
+        done/in-progress/blocked entry (a real, resolved pool task) still
+        drops, exactly as before this change.
+        """
+        pool = _pool_with_ids(('11', 'done'), ('12', 'in-progress'), ('13', 'blocked'))
+        for target_id in ('11', '12', '13'):
+            result = self._call(
+                {
+                    'action': 'drop',
+                    'target_id': target_id,
+                    'justification': f'already covered by {target_id}',
+                },
+                pool,
+            )
+            assert result.action == 'drop'
+            assert result.target_id == target_id
+
+    def test_combine_into_pending_still_combines(self):
+        """Regression: a combine against a confirmed pending (combine_eligible)
+        entry with a valid rewritten_task is unaffected by the RC3 guard."""
+        pool = _pool_with_ids(('10', 'pending'))
+        result = self._call(
+            {
+                'action': 'combine',
+                'target_id': '10',
+                'justification': 'same scope',
+                'rewritten_task': {
+                    'title': 'Fixed parser',
+                    'description': 'unified',
+                    'details': 'all the details',
+                    'files_to_modify': ['src/parser.py'],
+                    'priority': 'high',
+                },
+            },
+            pool,
+        )
+        assert result.action == 'combine'
+        assert result.target_id == '10'
+
+    def test_within_batch_drop_unaffected_by_unknown_status_guard(self):
+        """Regression: a within-batch drop (target_id=None, batch_target_index
+        set) references a sibling candidate not yet materialised as a pool
+        task, so there is no status for the RC3 guard to inspect. The guard
+        is gated on `target_id` being truthy — this pins that gating against
+        future refactors of the guard ordering, even when the pool happens
+        to contain an unrelated 'unknown' entry.
+        """
+        pool = _pool_with_ids(('11', 'unknown'))
+        result = self._call(
+            {
+                'action': 'drop',
+                'target_id': None,
+                'batch_target_index': 2,
+                'justification': 'dup of batch item 2',
+            },
+            pool,
+        )
+        assert result.action == 'drop'
+        assert result.batch_target_index == 2
 
 
 # ----------------------------------------------------------------------
