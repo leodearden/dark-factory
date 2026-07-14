@@ -13,6 +13,8 @@ import logging
 import re
 from typing import Any
 
+from orchestrator.agents.roles import AgentRole
+
 logger = logging.getLogger(__name__)
 
 
@@ -229,6 +231,30 @@ TRIAGE_OUTPUT_SCHEMA: dict[str, Any] = {
     },
     'required': ['accepted', 'skipped', 'proposed_task_groups'],
 }
+
+# ---------------------------------------------------------------------------
+# TRIAGE AgentRole — verdict-tools submit_triage tool grant
+#
+# name='triage' is the authoritative --verdict-role passed to
+# _inject_verdict_tools_mcp, which selects the submit_triage tool on the
+# verdict-tools server and the verdicts/triage.json artifact filename.
+# mcp_families declares both families referenced by allowed_tools below:
+# 'orchestrator' for the mcp__fused-memory__ tools, 'verdict_tools' for
+# mcp__verdict-tools__submit_triage — required by AgentRole.__post_init__'s
+# capability assertion (see roles.py _FAMILY_TOOL_PREFIXES). Defined here
+# (not roles.py) to keep triage concerns co-located; roles.py does not
+# import this module, so there is no import cycle.
+# ---------------------------------------------------------------------------
+TRIAGE = AgentRole(
+    name='triage',
+    system_prompt=TRIAGE_SYSTEM_PROMPT,
+    allowed_tools=[
+        'Read', 'Glob', 'Grep',
+        'mcp__fused-memory__get_tasks', 'mcp__fused-memory__search',
+        'mcp__verdict-tools__submit_triage',
+    ],
+    mcp_families=frozenset({'orchestrator', 'verdict_tools'}),
+)
 
 
 def build_triage_prompt(suggestions: list[dict], task: dict) -> str:
