@@ -21,13 +21,17 @@ status flip that called this helper.
 from __future__ import annotations
 
 import json
+import logging
 import re
 from pathlib import Path
 from typing import Any
 
 import yaml
+from pydantic import ValidationError
 
 from shared.capability_manifest import DeliveredCheckMeta, parse_capability_manifest
+
+logger = logging.getLogger(__name__)
 
 _SIDECAR_SUFFIX = '.capability-manifest.yaml'
 
@@ -114,32 +118,59 @@ async def stamp_capability_manifests(
             f'processing {sidecar_rel!r}, ignoring: {extra}'
         )
 
-    # 3. Read + validate the sidecar via the shared α-loader.
+    # 3. Read + validate the sidecar via the shared α-loader. Fail-soft/loud:
+    #    a malformed sidecar (bad YAML syntax, or a doc that fails α's
+    #    pydantic schema) must never raise out of this helper — it's
+    #    recorded in report['errors'] and stamping is skipped entirely for
+    #    this sidecar. Validating BEFORE any mutation below guarantees a
+    #    malformed doc leaves the on-disk file byte-identical.
     sidecar_abs = root / sidecar_rel
-    raw_text = sidecar_abs.read_text(encoding='utf-8')
-    raw = yaml.safe_load(raw_text)
-    doc = parse_capability_manifest(raw)
+    try:
+        raw_text = sidecar_abs.read_text(encoding='utf-8')
+        raw = yaml.safe_load(raw_text)
+        doc = parse_capability_manifest(raw)
+    except (OSError, yaml.YAMLError, ValidationError) as exc:
+        logger.warning(
+            'stamp_capability_manifests: failed to load/validate %s', sidecar_rel, exc_info=True,
+        )
+        report['errors'].append(f'{sidecar_rel}: failed to load/validate sidecar — {exc}')
+        return report
+    except Exception as exc:  # pragma: no cover - defensive fallback, never raise
+        logger.warning(
+            'stamp_capability_manifests: unexpected error loading %s', sidecar_rel, exc_info=True,
+        )
+        report['errors'].append(f'{sidecar_rel}: unexpected error loading sidecar — {exc}')
+        return report
 
     # 4. Stamp task_id onto each matching label entry and write back to disk.
     #    Scoped to batch tasks whose OWN derived rel path is this sidecar
-    #    (relevant only for the unexpected multi-sidecar case above).
+    #    (relevant only for the unexpected multi-sidecar case above). Also
+    #    guarded — an unexpected failure here (e.g. a disk write error)
+    #    must not raise, and must leave report['stamped'] empty since the
+    #    file was not confirmed written.
     label_to_task_id: dict[str, str] = {
         label: tid for tid, label, rel in manifest_tasks if rel == sidecar_rel
     }
     stamped_labels: list[str] = []
-    for entry in raw.get('tasks', []):
-        if not isinstance(entry, dict):
-            continue
-        label = entry.get('label')
-        if label in label_to_task_id:
-            entry['task_id'] = int(label_to_task_id[label])
-            stamped_labels.append(label)
-
-    if stamped_labels:
-        sidecar_abs.write_text(
-            yaml.safe_dump(raw, sort_keys=False, allow_unicode=True),
-            encoding='utf-8',
+    try:
+        for entry in raw.get('tasks', []):
+            if not isinstance(entry, dict):
+                continue
+            label = entry.get('label')
+            if label in label_to_task_id:
+                entry['task_id'] = int(label_to_task_id[label])
+                stamped_labels.append(label)
+        if stamped_labels:
+            sidecar_abs.write_text(
+                yaml.safe_dump(raw, sort_keys=False, allow_unicode=True),
+                encoding='utf-8',
+            )
+    except Exception as exc:
+        logger.warning(
+            'stamp_capability_manifests: failed to stamp/write %s', sidecar_rel, exc_info=True,
         )
+        report['errors'].append(f'{sidecar_rel}: failed to stamp/write sidecar — {exc}')
+        return report
     report['stamped'] = stamped_labels
 
     # 5. For each stamped label, copy only MECHANICAL (grep/script)
@@ -170,11 +201,27 @@ async def stamp_capability_manifests(
         if not mechanical:
             continue
         tid = label_to_task_id[task.label]
-        await task_interceptor.update_task(
-            tid,
-            project_root,
-            metadata=json.dumps({'delivered_checks': mechanical}),
-            agent_id=agent_id,
-        )
+        # Independently guarded per label (mirrors index_committed_tasks'
+        # per-task record_task guard): one label's metadata-write failure
+        # is recorded and skipped without discarding the sidecar stamp
+        # already committed to disk above, nor blocking sibling labels.
+        try:
+            await task_interceptor.update_task(
+                tid,
+                project_root,
+                metadata=json.dumps({'delivered_checks': mechanical}),
+                agent_id=agent_id,
+            )
+        except Exception as exc:
+            logger.warning(
+                'stamp_capability_manifests: update_task failed for label %s (task %s)',
+                task.label,
+                tid,
+                exc_info=True,
+            )
+            report['errors'].append(
+                f'{sidecar_rel}: failed to write delivered_checks for label '
+                f'{task.label!r} (task {tid}) — {exc}'
+            )
 
     return report
