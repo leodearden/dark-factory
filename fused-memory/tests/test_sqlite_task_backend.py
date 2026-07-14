@@ -26,6 +26,7 @@ from fused_memory.backends.task_backend_errors import (
     DoneProvenanceWriteAuthorityError,
     StatusWriteAuthorityError,
     TaskmasterError,
+    TaskNotFoundError,
     done_provenance_via_update_task_error,
     status_via_update_task_error,
 )
@@ -401,6 +402,46 @@ async def test_get_task_not_found_raises(backend, project_root):
         await backend.get_task('999', project_root=project_root)
     assert exc.value.code == 'TASKMASTER_TOOL_ERROR'
     assert 'No tasks found' in exc.value.message
+
+
+@pytest.mark.asyncio
+async def test_get_task_not_found_raises_task_not_found_error(backend, project_root):
+    """A definitive zero-row absence raises TaskNotFoundError specifically —
+    a TaskmasterError subclass, so existing `except TaskmasterError` sites
+    keep working while callers can also discriminate by type (task 2521 RC2)."""
+    await backend.add_task(project_root=project_root, title='one')
+    with pytest.raises(TaskNotFoundError) as exc:
+        await backend.get_task('999', project_root=project_root)
+    assert isinstance(exc.value, TaskmasterError)
+    assert exc.value.code == 'TASKMASTER_TOOL_ERROR'
+    assert 'No tasks found for ID(s)' in exc.value.message
+
+
+@pytest.mark.asyncio
+async def test_get_task_not_found_scoped_to_queried_tag(backend, project_root):
+    """Not-found is scoped to the queried (project, tag), not just the id:
+    a task filed under the default tag is not-found when queried under a
+    different tag (the curator's scope-consistency invariant, task 2521 RC2)."""
+    dto = await backend.add_task(project_root=project_root, title='scoped')
+    with pytest.raises(TaskNotFoundError):
+        await backend.get_task(dto['id'], project_root=project_root, tag='other-tag')
+
+
+@pytest.mark.asyncio
+async def test_get_task_backend_unavailable_is_not_task_not_found_error(
+    backend, project_root, monkeypatch,
+):
+    """A connect/execute outage (raised before the zero-row check runs) must
+    NOT be a TaskNotFoundError — only a successfully-executed zero-row query
+    proves definitive absence (task 2521 RC2)."""
+    async def _boom(self, root):
+        raise TaskmasterError('TASKMASTER_UNAVAILABLE', 'backend not reachable')
+
+    monkeypatch.setattr(SqliteTaskBackend, '_get_connection', _boom)
+
+    with pytest.raises(TaskmasterError) as exc:
+        await backend.get_task('1', project_root=project_root)
+    assert not isinstance(exc.value, TaskNotFoundError)
 
 
 @pytest.mark.asyncio
