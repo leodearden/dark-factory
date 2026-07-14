@@ -1164,9 +1164,14 @@ class GitOps:
         Raises:
             EphemeralWorktreeError: ``git worktree add`` failed on all 3
                 attempts.  Raised BEFORE the yield, so the caller's
-                ``async with`` body never runs and — because the add never
-                succeeded — no cleanup ``git worktree remove`` is issued
-                (there is nothing registered to remove).
+                ``async with`` body never runs.  Because the add never
+                succeeded, no cleanup ``git worktree remove`` is issued
+                (there is nothing registered to remove) — but a belt-and-
+                suspenders ``shutil.rmtree`` of *tmp_path* still runs before
+                the exception propagates, in case a failed add left a
+                partial/empty directory behind (this prefix is
+                :data:`PROTECTED_PREFIXES`-registered, so the reaper would
+                never reclaim a leaked directory itself).
         """
         base = self.worktree_base
         base.mkdir(parents=True, exist_ok=True)
@@ -1175,21 +1180,33 @@ class GitOps:
         _MAX_ADD_RETRIES = 3
         worktree_added = False
         rc, _, err = 1, '', 'not attempted'
-        for attempt in range(_MAX_ADD_RETRIES):
-            rc, _, err = await _run(
-                ['git', 'worktree', 'add', '--detach', str(tmp_path), sha],
-                cwd=self.project_root,
-            )
-            if rc == 0:
-                worktree_added = True
-                break
-            if attempt < _MAX_ADD_RETRIES - 1:
-                await asyncio.sleep(0.5 * (attempt + 1))
-        if not worktree_added:
-            raise EphemeralWorktreeError(
-                f'ephemeral_worktree({kind.name}): git worktree add failed '
-                f'after {_MAX_ADD_RETRIES} retries (rc={rc}): {err}'
-            )
+        try:
+            for attempt in range(_MAX_ADD_RETRIES):
+                rc, _, err = await _run(
+                    ['git', 'worktree', 'add', '--detach', str(tmp_path), sha],
+                    cwd=self.project_root,
+                )
+                if rc == 0:
+                    worktree_added = True
+                    break
+                if attempt < _MAX_ADD_RETRIES - 1:
+                    await asyncio.sleep(0.5 * (attempt + 1))
+            if not worktree_added:
+                raise EphemeralWorktreeError(
+                    f'ephemeral_worktree({kind.name}): git worktree add failed '
+                    f'after {_MAX_ADD_RETRIES} retries (rc={rc}): {err}'
+                )
+        except EphemeralWorktreeError:
+            # Belt-and-suspenders: a failed `git worktree add` may still have
+            # left a partial/empty directory at tmp_path (git creates the
+            # target dir early during add) — and since this prefix is
+            # PROTECTED_PREFIXES-registered, the reaper will NEVER reclaim it.
+            # Clean up here or it leaks under worktree_base permanently.
+            # Restores the pre-extraction probes' unconditional
+            # "rmtree in case ... the worktree add never ran" guarantee.
+            with contextlib.suppress(Exception):
+                shutil.rmtree(tmp_path, ignore_errors=True)
+            raise
 
         try:
             yield tmp_path

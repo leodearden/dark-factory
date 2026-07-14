@@ -15,6 +15,8 @@ Test coverage:
           raise-on-add-failure)
   step-5: E1 — both probes route through the CM and NEVER issue
           ['git', 'worktree', 'prune']
+  amend-1: no-leak-on-add-failure regression (reviewer_comprehensive
+           robustness_resource_leak)
 """
 from __future__ import annotations
 
@@ -298,6 +300,51 @@ class TestEphemeralWorktreeRetry:
         remove_calls = [c for c in calls if 'worktree' in c and 'remove' in c]
         assert not remove_calls, (
             f'expected NO git worktree remove when add never succeeded; got {remove_calls}'
+        )
+
+    def test_add_failure_leaves_no_leaked_directory_under_worktree_base(
+        self, tmp_path: Path,
+    ) -> None:
+        """Amendment (reviewer_comprehensive robustness_resource_leak,
+        git_ops.py:1188): a failed ``git worktree add`` can still leave a
+        partial/empty directory at tmp_path — real git creates the target
+        directory early during add, before it can fail — and because this
+        prefix is PROTECTED_PREFIXES-registered, the reaper will NEVER
+        reclaim it. The CM must clean up tmp_path itself before raising, or
+        the directory leaks under worktree_base permanently. Restores the
+        pre-extraction probes' unconditional 'rmtree in case ... the
+        worktree add never ran' cleanup guarantee.
+        """
+        from orchestrator.git_ops import EphemeralWorktreeError
+
+        git_ops = GitOps(GitConfig(), tmp_path)
+        entered = False
+
+        async def _fake_run_leaves_partial_dir(cmd, **kwargs):
+            if 'worktree' in cmd and 'add' in cmd:
+                # Simulate real `git worktree add` creating its target
+                # directory before it fails on lock contention.
+                detach_idx = cmd.index('--detach')
+                Path(cmd[detach_idx + 1]).mkdir(parents=True, exist_ok=True)
+                return (1, '', 'lock contention')
+            return (0, '', '')  # pragma: no cover — no other command expected
+
+        async def _body() -> None:
+            nonlocal entered
+            async with git_ops.ephemeral_worktree(WorktreeKind.MAIN_PROBE, MAIN_SHA):
+                entered = True  # must never run
+
+        with (
+            patch('orchestrator.git_ops._run', side_effect=_fake_run_leaves_partial_dir),
+            pytest.raises(EphemeralWorktreeError),
+        ):
+            asyncio.run(_body())
+
+        assert not entered, 'expected the CM body to NEVER run when add exhausts retries'
+        leaked = list(git_ops.worktree_base.glob('_mainprobe-*'))
+        assert not leaked, (
+            f'expected no leaked _mainprobe-* directory under worktree_base '
+            f'after add exhausts retries; found {leaked}'
         )
 
 
