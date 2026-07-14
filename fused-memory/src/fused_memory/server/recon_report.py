@@ -97,9 +97,19 @@ def _canonicalize_task_id_string(value: str) -> str:
 
     This ensures a comma-joined task_id whose components are reordered (or
     duplicated) between two ``add_finding`` calls collapses onto the same
-    dedup signature (task-2432 bullet 4) — mirrors
-    ``reconciliation.flag_dedup.compute_flag_signature``'s sorted-comma
-    -joined convention for its ``cited_tasks`` fallback.
+    dedup signature (task-2432 bullet 4).
+
+    Both this helper and ``reconciliation.flag_dedup.compute_flag_signature``'s
+    ``cited_tasks`` union produce a sorted, comma-joined string, but the two
+    sort orders are independent, not mirrored: this one is numeric-aware (see
+    :func:`_task_id_part_sort_key`), while ``flag_dedup``'s is plain
+    lexicographic. Each subsystem is internally consistent among its own
+    callers and neither ever compares its signature against the other's — the
+    in-run (server) and cross-cycle (reconciliation) dedup layers run at
+    different boundaries and each recomputes its own signature fresh — so the
+    differing order is intentional, not a bug. Do not assume the two strings
+    are interchangeable if a future caller ever bridges server/ and
+    reconciliation/.
     """
     parts = _split_task_id_parts(value)
     if not parts:

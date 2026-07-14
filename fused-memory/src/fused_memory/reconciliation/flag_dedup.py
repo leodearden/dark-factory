@@ -913,6 +913,31 @@ def compute_flag_signature(flag: dict[str, Any]) -> tuple[str, str] | None:
     that need precise single-task dedup should always set the top-level
     ``task_id`` explicitly.
 
+    **Sort-order independence (reviewer finding consistency):** the union's
+    comma-join above uses a plain lexicographic ``sorted()``, which is *not*
+    the same ordering as ``recon_report._canonicalize_task_id_string``'s
+    numeric-aware sort (that helper sorts numeric parts by ``int`` value).
+    The two conventions are deliberately independent: each subsystem is
+    internally consistent among its own callers, and a signature computed
+    here is never compared against a canonicalized string from
+    ``recon_report`` — the in-run (server) and cross-cycle (reconciliation)
+    dedup layers run at different boundaries and each recomputes its own
+    signature fresh rather than persisting and cross-comparing. So the
+    differing order is not a correctness bug, only a reminder not to assume
+    the two are interchangeable if a future caller ever bridges them.
+
+    **Upgrade-boundary note (reviewer finding backward_compatibility):**
+    widening this union to apply whenever ``cited_tasks`` is non-empty
+    (rather than only when the top-level ``task_id`` is ``None``) changes
+    the signature for any pre-existing finding that had BOTH a set top-level
+    ``task_id`` and ``cited_tasks`` — e.g. ``task_id='5040', cited=[5040]``
+    and ``task_id='5040', cited=[5040, 5149]`` used to collapse to the same
+    signature and are now distinct. A ledger suppression marker written
+    under the old signature will therefore miss once immediately after
+    deploy; this is self-healing (the very next cycle writes suppression
+    under the new signature), so no marker migration or dual-key lookup is
+    required.
+
     Returns ``None`` for flags without enough signal to deduplicate — these are
     passed through unchanged by :func:`dedup_flags`.
     """
