@@ -204,6 +204,13 @@ class CockpitApp(App):
         self._spawn_runner = spawn_runner if spawn_runner is not None else _default_spawn_runner
         self._spawn_script = spawn_script if spawn_script is not None else _default_spawn_script()
         self._priorities_path = resolve_fleet_root(self.fleet_root) / 'priorities.yaml'
+        # Logged at DEBUG (not WARNING -- this is routine, not a fault) so a
+        # deployment that sets $CLAUDE_FLEET_ROOT can confirm which
+        # priorities.yaml this session is reading/writing: the path is
+        # fleet_root-relative (see TestPrioritiesPathResolution), which
+        # diverges from a fixed ~/.claude/fleet default whenever
+        # fleet_root/$CLAUDE_FLEET_ROOT points elsewhere.
+        _log.debug('CockpitApp: priorities path resolved to %s', self._priorities_path)
         self._priorities = (
             priorities if priorities is not None else load_priorities(self._priorities_path)
         )
