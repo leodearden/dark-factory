@@ -60,6 +60,18 @@ class RecordedDecision:
     See PRD D-6: the recorded action is what the live curator historically
     decided, unverified -- ``build_curator_corpus`` always obtains the GOLD
     label from an injected frontier-adjudication proposer instead.
+
+    ``target_fingerprint`` is expected to be ``None`` on real tickets.db
+    builds: the live curator's persisted ``result_json`` for drop/combine
+    (``task_interceptor._dispatch_ticket_decision``) only carries ``{id,
+    title, deduplicated, action, justification}`` -- it never writes a
+    ``target_fingerprint`` key. Only ``target_id`` (recovered from
+    ``result_json['id']``) is actually recoverable from real data; the
+    fingerprint field exists to recover richer provenance from a
+    ``result_json`` shape that carries it (e.g. hand-annotated fixtures),
+    should one ever exist. This has no scoring impact either way --
+    recorded fields are provenance/weak-signal only and are never read by
+    :class:`~orchestrator.evals.prompt_opt.curator_scorer.CuratorActionScorer`.
     """
 
     ticket_id: str
@@ -85,6 +97,15 @@ def recover_recorded_action(
     ``result_json['target_id']``), falling back to the ticket row's own
     *task_id* column when neither is present -- but only for drop/combine,
     since 'create' has no "target being combined into".
+
+    NOTE: ``target_fingerprint`` recovery (``result_json['target_fingerprint']``)
+    is a best-effort read for a ``result_json`` shape that carries it -- on
+    REAL tickets.db data it will always come back ``None``, since the live
+    curator's persisted drop/combine result (``task_interceptor.py``'s
+    ``_dispatch_ticket_decision``) only writes ``{id, title, deduplicated,
+    action, justification}``. This is harmless: the recovered fields are
+    provenance/weak-signal only (PRD D-6) and are never used as a gold
+    label or read by the scorer.
 
     Returns ``None`` (un-actionable, e.g. ``status='failed'``/``'pending'``,
     or a missing/unparseable *result_json* that isn't rescued by the
@@ -254,6 +275,9 @@ class CuratorReplayItem:
     ``recorded_action``/``recorded_target_fingerprint``/``recorded_target_id``
     are the ticket's historical (unverified) curator decision -- retained
     only as provenance/weak signal (PRD D-6: decisions != ground truth).
+    ``recorded_target_fingerprint`` will be ``None`` for every item built
+    from a real tickets.db (see :func:`recover_recorded_action`'s docstring)
+    -- harmless, since it's provenance-only and never scored.
     ``gold_action``/``gold_target_fingerprint``/``gold_target_id`` are the
     frontier-adjudicated (+ possibly human-spot-checked) label
     :class:`~orchestrator.evals.prompt_opt.curator_scorer.CuratorActionScorer`

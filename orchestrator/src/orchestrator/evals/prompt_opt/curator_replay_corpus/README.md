@@ -77,6 +77,17 @@ is embedded. `status='failed'`/`'pending'` rows (or a missing/unparseable
 `result_json` not rescued by the `'created'` fallback) are un-actionable and
 skipped.
 
+**`recorded_target_fingerprint` is always `None` on real builds.** The live
+curator's persisted `result_json` for drop/combine
+(`task_interceptor.py`'s `_dispatch_ticket_decision`) only ever writes `{id,
+title, deduplicated, action, justification}` -- there is no
+`target_fingerprint` key to recover. `recover_recorded_action()` still reads
+one if present (for a hypothetical richer `result_json` shape), but on the
+real `tickets.db` only `recorded_target_id` (from `result_json['id']`) comes
+back populated. This is harmless: `recorded_*` fields are provenance/weak
+signal only (see "Decisions != ground truth" below) and are never read by
+`CuratorActionScorer` or used as a gold label.
+
 ## Split (train / selection / test, 2:1:7)
 
 Every item carries a `split`, assigned by
