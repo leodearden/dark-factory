@@ -2165,7 +2165,7 @@ class TaskCurator:
             status='unknown',
             priority=str(payload.get('priority', DEFAULT_PRIORITY)),
             source=source,
-            combine_eligible=False,  # unknown status → treat as drop-only
+            combine_eligible=False,  # create-safe: neither combine- nor drop-eligible
         )
 
     # ------------------------------------------------------------------
@@ -2730,6 +2730,24 @@ def _parse_decision_dict(
                 latency_ms=latency_ms,
                 cost_usd=cost_usd,
             )
+        # RC3 create-safe guard: never drop against a pool entry whose status
+        # is unconfirmable ('unknown' — e.g. a thin fallback entry built after
+        # a TRANSIENT get_task failure, see _fetch_entry_for_neighbor).
+        # Placed before the combine_eligible check below so it is authoritative
+        # even if an unknown entry were ever wrongly marked combine_eligible=True.
+        if action == 'drop' and target_id:
+            target_entry = next(e for e in pool if e.task_id == target_id)
+            if target_entry.status == 'unknown':
+                return CuratorDecision(
+                    action='create',
+                    justification=(
+                        f'unknown-status-target: {target_id} status=unknown, '
+                        f'create-safe (RC3)'
+                    ),
+                    pool_sizes=pool_sizes,
+                    latency_ms=latency_ms,
+                    cost_usd=cost_usd,
+                )
         # combine-only tasks must also be combine_eligible (pending status).
         if action == 'combine' and target_id:
             target_entry = next(e for e in pool if e.task_id == target_id)
