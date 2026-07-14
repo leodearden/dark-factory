@@ -1,4 +1,5 @@
-"""Tests for _parse_codex_output and _parse_gemini_output parsers in invoke.py."""
+"""Tests for _parse_codex_output, _parse_gemini_output, and pi-backend parsers
+in invoke.py."""
 
 from __future__ import annotations
 
@@ -8,7 +9,7 @@ import logging
 import pytest
 from shared.cli_invoke import _SubprocessResult
 
-from orchestrator.agents.invoke import _parse_codex_output, _parse_gemini_output
+from orchestrator.agents.invoke import _parse_codex_output, _parse_gemini_output, _pi_tool_name
 from orchestrator.config import PriceEntry
 
 
@@ -217,3 +218,32 @@ class TestParseCodexOutputUnknownModelFallback:
         )
         # _FALLBACK_PRICE: input=2.0/1M, output=8.0/1M
         assert agent_result.cost_usd == pytest.approx((200 * 2.0 + 100 * 8.0) / 1_000_000)
+
+
+class TestPiToolName:
+    """`_pi_tool_name` maps a Claude-style tool spec to pi's direct-tool
+    name (spike Q3, live-confirmed against pi-mcp-adapter's
+    formatToolName/getServerPrefix)."""
+
+    def test_concrete_mcp_tool_uses_server_prefix_formula(self):
+        """Concrete `mcp__<server>__<tool>` specs map to
+        `<server '-'->'_'>_<tool>` — server hyphens become underscores,
+        the tool name is used verbatim."""
+        assert _pi_tool_name('mcp__fused-memory__add_memory') == 'fused_memory_add_memory'
+        assert _pi_tool_name('mcp__escalation__merge_request') == 'escalation_merge_request'
+        assert _pi_tool_name('mcp__plan-tools__create_plan') == 'plan_tools_create_plan'
+
+    def test_builtin_tools_map_to_pi_lowercase_names(self):
+        """Claude's built-in tool names map to pi's lowercase built-ins."""
+        assert _pi_tool_name('Bash') == 'bash'  # verified spike Q6
+        assert _pi_tool_name('Read') == 'read'
+        assert _pi_tool_name('Write') == 'write'
+        assert _pi_tool_name('Edit') == 'edit'
+        assert _pi_tool_name('Glob') == 'glob'
+        assert _pi_tool_name('Grep') == 'grep'
+
+    def test_wildcard_mcp_spec_is_unmappable(self):
+        """A wildcard `mcp__server__*` spec is not expressible as a single
+        direct-tool name — callers drop it from --tools (with a logged
+        warning; see TestInvokePiFlags)."""
+        assert _pi_tool_name('mcp__jcodemunch__*') is None
