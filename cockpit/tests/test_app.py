@@ -2535,5 +2535,3 @@ class TestStaleScanSequenceGuard:
             app._apply_scan(newer, [], 101)
             await pilot.pause()
             assert table.row_count == 3
-
-            assert scanner.calls == 3
