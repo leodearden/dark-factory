@@ -2854,6 +2854,44 @@ class MemoryService:
         return await self.mem0.scroll_by_metadata(scope, filters, limit)
 
     # ------------------------------------------------------------------
+    # Read: cycle_summary ledger presence (task 2436, τ1)
+    # ------------------------------------------------------------------
+
+    async def get_cycle_summary_presence(
+        self,
+        project_id: str,
+        run_id: str,
+        stage: str,
+    ) -> dict:
+        """Report whether the AUTHORITATIVE cycle_summary ReconLedgerStore row exists.
+
+        Thin read against ``ReconLedgerStore.get_by_identity``, mapping
+        ``stage`` to the ledger's ``flag_type`` column to disambiguate the
+        Stage 1 (``memory_consolidator``) vs Stage 2 (``task_knowledge_sync``)
+        rows written under the same ``run_id`` (see
+        ``summary_pool.write_cycle_summary``). This is the definitive presence
+        check Stage 3 uses instead of relying solely on the best-effort Mem0
+        mirror.
+
+        NOTE: this revision assumes a wired ``recon_ledger`` — the
+        unwired/None case is handled by a follow-up guard.
+        """
+        record = await self.recon_ledger.get_by_identity(
+            project_id,
+            record_kind='cycle_summary',
+            task_id='',
+            flag_type=stage,
+            run_id=run_id,
+        )
+        return {
+            'present': record is not None,
+            'ledger_available': True,
+            'project_id': project_id,
+            'run_id': run_id,
+            'stage': stage,
+        }
+
+    # ------------------------------------------------------------------
     # Delete
     # ------------------------------------------------------------------
 

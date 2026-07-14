@@ -1185,6 +1185,54 @@ def create_mcp_server(
 
     @mcp.tool()
     @mcp_tool_errors()
+    async def get_cycle_summary_presence(
+        project_id: str,
+        run_id: str,
+        stage: str,
+        ctx: Context | None = None,
+    ) -> dict[str, Any]:
+        """Report whether the AUTHORITATIVE cycle_summary ReconLedgerStore row exists.
+
+        Unlike ``count_memories_by_metadata`` (which queries the best-effort
+        Mem0 mirror), this tool reads the ReconLedgerStore directly — the
+        source of truth written by ``summary_pool.write_cycle_summary``. Use
+        it to confirm a per-cycle summary is definitively present or absent
+        before concluding it is missing and triggering reconstruction.
+
+        ``stage`` is mapped to the ledger's ``flag_type`` column to
+        disambiguate the Stage 1 (``memory_consolidator``) vs Stage 2
+        (``task_knowledge_sync``) rows written under the same ``run_id``.
+
+        Return shape: ``{'present': bool, 'ledger_available': bool,
+        'project_id': str, 'run_id': str, 'stage': str}``. When the ledger is
+        not wired (``ledger_available: False``), ``present`` is always
+        ``False`` and MUST be treated as inconclusive, not a definitive
+        absence — mirrors ``write_cycle_summary`` returning ``False`` when
+        unwired.
+
+        This tool is intentionally read-only and is NOT included in any
+        DISALLOW_* list, so it is auto-allowed in Stage 3's read-only
+        integrity-check mode.
+
+        Args:
+            project_id: Project scope (required)
+            run_id: The reconciliation run_id to look up
+            stage: Recon stage name, mapped to the ledger's flag_type column
+                (e.g. 'memory_consolidator', 'task_knowledge_sync')
+        """
+        project_id, err = _canonicalize_project_id_arg(project_id)
+        if err:
+            return err
+        if err := validate_project_id(project_id):
+            return err
+        return await memory_service.get_cycle_summary_presence(
+            project_id=project_id,
+            run_id=run_id,
+            stage=stage,
+        )
+
+    @mcp.tool()
+    @mcp_tool_errors()
     async def get_memories_by_metadata(
         project_id: str,
         filters: dict,
