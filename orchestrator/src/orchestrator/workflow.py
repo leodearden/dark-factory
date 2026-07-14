@@ -1709,6 +1709,18 @@ class TaskWorkflow:
             # keys on task_id and reads only data['passed'] — base_sha/branch
             # below are informational only (kept for future telemetry/log
             # correlation; the classifier ignores them today).
+            #
+            # Note (reviewer_comprehensive, amendment round 2): I5 reads
+            # "any-prior-green" (never most-recent-wins), so this row
+            # survives untouched across a later review-bounce. If the branch
+            # is re-executed after REVIEW and reaches this edge again having
+            # introduced its OWN new bug, the stale green from before the
+            # bounce can still cause that genuine BRANCH_BUG to be
+            # misclassified as INTEGRATION_SKEW if an unrelated main landing
+            # happens to overlap the same file. This is a documented I5
+            # tradeoff (merge_disposition.py's any-prior-green keying is out
+            # of this task's module scope to change); pinned by
+            # test_merge_skew_end_to_end.py::TestReviewBounceStaleGreenTradeoff.
             if prev is WorkflowState.VERIFY and new_state is WorkflowState.REVIEW:
                 self.event_store.emit(
                     EventType.workflow_verify,

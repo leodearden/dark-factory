@@ -439,3 +439,119 @@ class TestFirstAttemptSkewMergeAttemptDisposition:
             f"Expected no merge_attempt row carrying a 'disposition' key on "
             f"the INDETERMINATE path; got {rows_with_disposition}"
         )
+
+
+# ---------------------------------------------------------------------------
+# Amendment round 2 [reviewer_comprehensive, workflow.py:1757]: pins the
+# documented I5 "any-prior-green" tradeoff across a review-bounce. This is
+# NOT a new plan step — it's a regression test confirming TODAY's intended
+# (accepted-tradeoff) disposition, so that a future change to the green-fact
+# keying (e.g. keying on (task_id, base_sha) instead of task_id alone,
+# inside merge_disposition.py — out of β's module scope) is a deliberate
+# decision that updates this test, not a silent behavior change.
+# ---------------------------------------------------------------------------
+
+
+def _build_review_bounce_topology(repo: Path) -> dict[str, str]:
+    """A real git repo modeling a review-bounce shape::
+
+        merge_base (creates src/x.py)
+          |-- pre_review_sha (task/9001; unrelated file — the commit state
+          |                    workflow_verify(passed=True) was ACTUALLY
+          |                    emitted for, before the review bounce)
+          |-- post_bounce_sha (task/9001; edits src/x.py — the branch's OWN
+          |                     new bug, introduced AFTER that green record)
+          `-- landing_sha (main; also edits src/x.py — unrelated to the
+                            branch's bug, but overlaps the same file)
+
+    The branch's failing test (``_XPY_FAILURE``) implicates ``src/x.py``,
+    which BOTH the branch's own post-bounce commit and main's unrelated
+    landing touch. ``classify_merge_failure_disposition`` never diffs the
+    branch's own commits against ``merge_base`` — it only (a) reads the I5
+    green fact keyed by task_id (any-prior-green) and (b) greps
+    ``merge_base_sha..main_sha`` (a main-only range) for landings touching a
+    candidate file — so it cannot distinguish "main moved" from "the branch
+    broke itself" here.
+    """
+    _init_git_repo(repo)
+    merge_base_sha = _commit_file(repo, 'src/x.py', 'v1', 'init x (merge-base)')
+    subprocess.run(
+        ['git', 'checkout', '-q', '-b', BRANCH], cwd=repo, check=True, capture_output=True,
+    )
+    pre_review_sha = _commit_file(
+        repo, 'src/branch_only.py', 'v1', 'pre-review work (unrelated file)',
+    )
+    post_bounce_sha = _commit_file(
+        repo, 'src/x.py', 'v2-branch-bug', "post-review-bounce: branch's own bug in x.py",
+    )
+    subprocess.run(['git', 'checkout', '-q', 'main'], cwd=repo, check=True, capture_output=True)
+    landing_sha = _commit_file(
+        repo, 'src/x.py', 'v2-main-landing', 'unrelated main landing, also edits x.py',
+    )
+    return {
+        'merge_base_sha': merge_base_sha,
+        'pre_review_sha': pre_review_sha,
+        'post_bounce_sha': post_bounce_sha,
+        'landing_sha': landing_sha,
+    }
+
+
+class TestReviewBounceStaleGreenTradeoff:
+    """Reviewer finding (amendment round 2): I5's any-prior-green semantics
+    keep a stale ``workflow_verify(passed=True)`` row alive across a review
+    bounce, so a genuine BRANCH_BUG introduced by post-review branch work can
+    be misclassified as INTEGRATION_SKEW when an unrelated main landing
+    happens to overlap the same file. This is a documented I5 tradeoff
+    (``merge_disposition.py``'s any-prior-green keying — out of β's module
+    scope to change); this test pins TODAY's intended behaviour so a future
+    semantics change there is deliberate, not accidental."""
+
+    def test_stale_green_survives_review_bounce_and_yields_skew(
+        self, tmp_path: Path,
+    ) -> None:
+        repo = tmp_path / 'repo'
+        repo.mkdir()
+        topology = _build_review_bounce_topology(repo)
+        store = EventStore(tmp_path / 'runs.db', run_id='run-test')
+        # The stale green: emitted for the PRE-review-bounce commit, exactly
+        # as the real VERIFY->REVIEW edge would (step 12) — keyed ONLY on
+        # task_id per merge_disposition._branch_pre_merge_verify_green, so it
+        # survives the branch's later (buggy) post-bounce commit untouched.
+        _seed_branch_green(store, topology['pre_review_sha'])
+
+        git_ops = _make_git_ops(repo)
+        worker = SpeculativeMergeWorker(
+            git_ops=git_ops, queue=asyncio.Queue(), event_store=store,
+        )
+        lease = HostLease(name='local', runner=MagicMock(), is_local=True)
+
+        async def _run() -> MergeOutcome | None:
+            future: asyncio.Future = asyncio.get_running_loop().create_future()
+            _req, item = _make_item(
+                tmp_path, repo, topology, future,
+                merged_branch_tip=topology['post_bounce_sha'],
+            )
+            p1, p2 = _patched_verify_seams()
+            with p1, p2:
+                result = await worker._run_inflight_verify(item, lease)
+            return result.outcome
+
+        outcome = asyncio.run(_run())
+
+        assert outcome is not None
+        # Documented tradeoff: even though the failure genuinely originates
+        # in the branch's OWN post-bounce commit, the stale any-prior-green
+        # fact plus the overlapping main landing yield INTEGRATION_SKEW, not
+        # BRANCH_BUG. If this assertion starts failing because the
+        # classifier now keys the green fact on (task_id, base_sha) or
+        # otherwise distinguishes this case, update it to assert BRANCH_BUG
+        # instead — that's the deliberate fix the reviewer's suggested_fix
+        # named, not a regression.
+        assert outcome.disposition == MergeFailureDisposition.INTEGRATION_SKEW, (
+            f'Expected the documented stale-green/review-bounce tradeoff to '
+            f'yield INTEGRATION_SKEW; got {outcome.disposition!r}.'
+        )
+        assert outcome.failure_diagnostic is not None
+        diag_joined = ' '.join(outcome.failure_diagnostic.values())
+        assert topology['landing_sha'] in diag_joined, diag_joined
+        assert 'src/x.py' in diag_joined, diag_joined
