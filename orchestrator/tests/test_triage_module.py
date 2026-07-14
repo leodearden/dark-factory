@@ -56,6 +56,24 @@ class TestBuildTriagePrompt:
         assert '[0]' in prompt
         assert 'something' in prompt
 
+    def test_instructs_agent_to_call_submit_triage(self):
+        """The prompt must name the submit_triage tool and its three params
+        so the agent knows to emit its verdict via the verdict-tools MCP
+        server instead of (the now-removed) --json-schema structured output.
+        """
+        suggestions = [
+            {'reviewer': 'test_analyst', 'location': 'a.py:1',
+             'category': 'coverage', 'description': 'Missing test',
+             'suggested_fix': 'Add test'},
+        ]
+        task = {'id': '42', 'title': 'Test Task', 'description': 'A test'}
+        prompt = build_triage_prompt(suggestions, task)
+
+        assert 'submit_triage' in prompt
+        assert 'accepted' in prompt
+        assert 'skipped' in prompt
+        assert 'proposed_task_groups' in prompt
+
 
 # ---------------------------------------------------------------------------
 # parse_triage_result
