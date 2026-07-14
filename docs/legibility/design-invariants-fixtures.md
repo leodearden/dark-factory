@@ -130,6 +130,37 @@ def handle_failure(log_text):
 
 ## INV-3 `corroborate-before-acting`
 
+### PRD-leaf-shaped (`INV-3-PRD`)
+
+> Add a nightly sweep that reads `task.status` from the last
+> reconciliation snapshot and calls `remove_task` on every row still
+> showing `status: cancelled` — no re-read of the live task store
+> immediately before deleting.
+
+**Expected disposition**: `flag: corroborate-before-acting`
+
+**Redesign that clears it**: Re-fetch live task status (`get_task`)
+immediately before the delete call and abort if it no longer reads
+`cancelled`, per the Merge Tier-3.5 / `already_merged` genuine-check house
+pattern.
+
+### Code-snippet-shaped (`INV-3-CODE`)
+
+```python
+def nightly_cleanup(snapshot):
+    for row in snapshot.cached_rows:
+        if row.status == "cancelled":
+            # acts on the cached snapshot value; no live re-read of
+            # the task's current status immediately before deleting
+            remove_task(row.task_id)
+```
+
+**Expected `invariant_findings` entry**:
+
+```json
+{"invariant": "corroborate-before-acting", "file": "scripts/nightly_task_sweep.py", "line": 6, "issue": "remove_task is called from a cached snapshot row with no re-read of live task status immediately before the delete", "severity": "high"}
+```
+
 ## INV-4 `storm-escape-required`
 
 ## INV-5 `no-lockstep-duplication`
