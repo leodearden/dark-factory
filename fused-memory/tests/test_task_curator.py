@@ -1812,6 +1812,24 @@ class TestParseDecisionDict:
         assert result.action == 'create'
         assert 'ambiguous-drop' in result.justification
 
+    def test_drop_against_unknown_status_degrades_to_create(self):
+        """RC3: a drop targeting a pool entry with status='unknown' (e.g. an
+        unconfirmable thin fallback entry from a TRANSIENT get_task failure)
+        must degrade to 'create' rather than silently discarding a real
+        candidate — the opposite of the prompt's "when in doubt, create" rule.
+        """
+        pool = _pool_with_ids(('10', 'pending'), ('11', 'unknown'))
+        result = self._call(
+            {
+                'action': 'drop',
+                'target_id': '11',
+                'justification': 'looks like a dup of 11',
+            },
+            pool,
+        )
+        assert result.action == 'create'
+        assert 'unknown' in result.justification
+
 
 # ----------------------------------------------------------------------
 # _parse_batch_decisions
