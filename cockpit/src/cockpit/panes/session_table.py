@@ -165,13 +165,24 @@ def _is_terminal(status: Status | str) -> bool:
     return resolved in TERMINAL_STATUSES
 
 
-def filter_live_sessions(records: list[SessionRecord]) -> list[SessionRecord]:
+# Hard ceiling on the default live band so ~10k scanned records never
+# drown the view. Callers pass an already blocked-first-ordered list (see
+# order_sessions), so slicing to the first `cap` retains the top-N most
+# important sessions, not an arbitrary subset.
+_DEFAULT_VISIBLE_CAP = 200
+
+
+def filter_live_sessions(
+    records: list[SessionRecord], *, cap: int = _DEFAULT_VISIBLE_CAP
+) -> list[SessionRecord]:
     """Drop terminal-status (exited/failed-to-start) records, preserving order.
 
-    Pure and total: an empty input returns [] and a foreign status is kept
-    (see _is_terminal), never raising.
+    Then slices to the first `cap` of what remains -- pass an
+    already-ordered list (see order_sessions) so the cap keeps the top-N
+    of that order. Pure and total: an empty input returns [] and a
+    foreign status is kept (see _is_terminal), never raising.
     """
-    return [record for record in records if not _is_terminal(record.status)]
+    return [record for record in records if not _is_terminal(record.status)][:cap]
 
 
 class SessionTable(DataTable):
