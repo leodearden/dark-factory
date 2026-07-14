@@ -175,6 +175,11 @@ class CanaryThresholds:
     (used instead of the relative ratio when a metric's baseline == 0, to
     avoid dividing by zero on a tiny/zero baseline).
 
+    ``min_samples`` guards against a thin window producing a false
+    pass/regress verdict: when either window's ``n_rows`` is below
+    ``min_samples``, `compare_windows` short-circuits to the
+    ``'insufficient_data'`` verdict instead of trusting the ratio.
+
     The defaults below are PRD §9 calibration STARTING points — to be
     tuned against real ``runs.db`` baseline variance once collected. They
     are NOT asserted as numeric guarantees anywhere in this module's test
@@ -189,6 +194,7 @@ class CanaryThresholds:
     mean_review_cycles_abs_floor: float = 1.0
     mean_verify_attempts_rel_tol: float = 0.2
     mean_verify_attempts_abs_floor: float = 1.0
+    min_samples: int = 5
 
 
 @dataclass(frozen=True)
@@ -220,9 +226,12 @@ class CanaryVerdict:
     """The overall pass/regress verdict from :func:`compare_windows`.
 
     ``verdict`` is ``'regress'`` when ``regressed_metrics`` is non-empty,
-    else ``'pass'``. (A third value, ``'insufficient_data'``, is added by
-    the insufficient-data guard.) ``baseline_n``/``post_n`` carry each
-    window's row count through for display/logging.
+    ``'pass'`` when empty — UNLESS either window's row count is below
+    ``thresholds.min_samples``, in which case ``verdict`` is
+    ``'insufficient_data'`` regardless of what the (still-computed, still
+    inspectable) ``comparisons``/``regressed_metrics`` show: a thin window
+    must not produce a false pass/regress. ``baseline_n``/``post_n`` carry
+    each window's row count through for display/logging.
     """
 
     verdict: str
@@ -264,7 +273,14 @@ def compare_windows(
     baseline: WindowMetrics, post: WindowMetrics, thresholds: CanaryThresholds,
 ) -> CanaryVerdict:
     """Compare *baseline* against *post* across all four T8/D-7 metrics and
-    emit a :class:`CanaryVerdict`."""
+    emit a :class:`CanaryVerdict`.
+
+    Comparisons are always computed (so the numbers stay inspectable even
+    when the verdict is inconclusive), but if either window has fewer than
+    ``thresholds.min_samples`` rows the verdict is forced to
+    ``'insufficient_data'`` — a thin post-deploy window (or a thin rolling
+    baseline) must not be trusted to call a pass or a regression.
+    """
     comparisons = [
         _compare_metric(
             'cost_per_done_task', baseline.cost_per_done_task, post.cost_per_done_task,
@@ -285,8 +301,13 @@ def compare_windows(
     ]
     regressed_metrics = [c.metric for c in comparisons if c.regressed]
 
+    if baseline.n_rows < thresholds.min_samples or post.n_rows < thresholds.min_samples:
+        verdict = 'insufficient_data'
+    else:
+        verdict = 'regress' if regressed_metrics else 'pass'
+
     return CanaryVerdict(
-        verdict='regress' if regressed_metrics else 'pass',
+        verdict=verdict,
         comparisons=comparisons,
         regressed_metrics=regressed_metrics,
         baseline_n=baseline.n_rows,
