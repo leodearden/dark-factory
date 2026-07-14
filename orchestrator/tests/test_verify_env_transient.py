@@ -32,12 +32,13 @@ from __future__ import annotations
 import asyncio
 import json
 from pathlib import Path
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import AsyncMock, patch
 
 import pytest
 
 from orchestrator import verify
 from orchestrator.config import GitConfig, OrchestratorConfig
+from orchestrator.git_ops import GitOps
 from orchestrator.verify import VerifyResult
 from orchestrator.verify_classify import classify_failure
 from orchestrator.verify_cmd import ToolKind
@@ -457,13 +458,14 @@ class TestRunMainTipSweepEnvTransient:
             ),
         )
 
-    def _make_git_ops(self, tmp_path: Path) -> MagicMock:
-        mock = MagicMock()
-        mock.get_main_sha = AsyncMock(return_value=self.MAIN_SHA)
-        worktree_base = tmp_path / '.worktrees'
-        worktree_base.mkdir(parents=True, exist_ok=True)
-        mock.worktree_base = worktree_base
-        return mock
+    def _make_git_ops(self, tmp_path: Path) -> GitOps:
+        """Real GitOps with get_main_sha patched (behavior-preserving swap
+        from MagicMock — run_main_tip_sweep only touches worktree_base /
+        get_main_sha / module-level _run, all present on a real instance)."""
+        git_ops = GitOps(self._make_config(tmp_path).git, tmp_path)
+        git_ops.get_main_sha = AsyncMock(return_value=self.MAIN_SHA)  # type: ignore[method-assign]
+        git_ops.worktree_base.mkdir(parents=True, exist_ok=True)
+        return git_ops
 
     def test_env_transient_first_pass_returns_none(self, tmp_path: Path):
         """First-pass env_transient -> None (infra sentinel); cleanup still runs."""

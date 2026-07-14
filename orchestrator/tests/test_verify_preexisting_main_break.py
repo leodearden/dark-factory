@@ -16,9 +16,10 @@ from __future__ import annotations
 import asyncio
 import subprocess
 from pathlib import Path
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import AsyncMock, patch
 
 from orchestrator.config import GitConfig, OrchestratorConfig
+from orchestrator.git_ops import GitOps
 from orchestrator.verify import VerifyResult
 
 # ---------------------------------------------------------------------------
@@ -97,13 +98,12 @@ class TestVerifyFailureIsPreexistingOnMain:
         module_configs: list = []
         task_files = ['src/foo.tsx']
 
-        # Mock git_ops: get_main_sha returns a SHA; worktree_base is a real Path
-        # so the helper builds a valid probe path under it (env-parity invariant).
-        mock_git_ops = MagicMock()
-        mock_git_ops.get_main_sha = AsyncMock(return_value=MAIN_SHA)
-        worktree_base = tmp_path / '.worktrees'
-        worktree_base.mkdir(parents=True, exist_ok=True)
-        mock_git_ops.worktree_base = worktree_base
+        # Real GitOps (behavior-preserving swap from MagicMock — the helper
+        # only touches get_main_sha/worktree_base/module-level _run, all
+        # present on a real instance) with get_main_sha patched.
+        mock_git_ops = GitOps(config.git, config.project_root)
+        mock_git_ops.get_main_sha = AsyncMock(return_value=MAIN_SHA)  # type: ignore[method-assign]
+        mock_git_ops.worktree_base.mkdir(parents=True, exist_ok=True)
 
         # run_scoped_verification on main -> same failure
         async def _fake_verify(*args, **kwargs) -> VerifyResult:
@@ -149,11 +149,9 @@ class TestVerifyFailureIsPreexistingFalseCases:
         worktree = tmp_path / 'task-wt'
         worktree.mkdir()
 
-        mock_git_ops = MagicMock()
-        mock_git_ops.get_main_sha = AsyncMock(return_value=MAIN_SHA)
-        worktree_base = tmp_path / '.worktrees'
-        worktree_base.mkdir(parents=True, exist_ok=True)
-        mock_git_ops.worktree_base = worktree_base
+        mock_git_ops = GitOps(config.git, config.project_root)
+        mock_git_ops.get_main_sha = AsyncMock(return_value=MAIN_SHA)  # type: ignore[method-assign]
+        mock_git_ops.worktree_base.mkdir(parents=True, exist_ok=True)
 
         async def _fake_verify(*args, **kwargs) -> VerifyResult:
             return main_result
@@ -207,11 +205,9 @@ class TestVerifyFailureIsPreexistingLifecycle:
         config = _make_config(tmp_path)
         worktree = tmp_path / 'task-wt'
         worktree.mkdir()
-        mock_git_ops = MagicMock()
-        mock_git_ops.get_main_sha = AsyncMock(return_value=MAIN_SHA)
-        worktree_base = tmp_path / '.worktrees'
-        worktree_base.mkdir(parents=True, exist_ok=True)
-        mock_git_ops.worktree_base = worktree_base
+        mock_git_ops = GitOps(config.git, config.project_root)
+        mock_git_ops.get_main_sha = AsyncMock(return_value=MAIN_SHA)  # type: ignore[method-assign]
+        mock_git_ops.worktree_base.mkdir(parents=True, exist_ok=True)
 
         run_calls: list[list[str]] = []
 
@@ -254,11 +250,9 @@ class TestVerifyFailureIsPreexistingLifecycle:
         config = _make_config(tmp_path)
         worktree = tmp_path / 'task-wt'
         worktree.mkdir()
-        mock_git_ops = MagicMock()
-        mock_git_ops.get_main_sha = AsyncMock(return_value=MAIN_SHA)
-        worktree_base = tmp_path / '.worktrees'
-        worktree_base.mkdir(parents=True, exist_ok=True)
-        mock_git_ops.worktree_base = worktree_base
+        mock_git_ops = GitOps(config.git, config.project_root)
+        mock_git_ops.get_main_sha = AsyncMock(return_value=MAIN_SHA)  # type: ignore[method-assign]
+        mock_git_ops.worktree_base.mkdir(parents=True, exist_ok=True)
 
         run_calls: list[list[str]] = []
 
@@ -315,13 +309,11 @@ class TestVerifyFailureProbeWorktreePlacement:
         worktree = tmp_path / 'task-wt'
         worktree.mkdir()
 
-        # worktree_base must be a real Path (not auto-MagicMock) so is_relative_to() works.
-        worktree_base = config.project_root / '.worktrees'
-        worktree_base.mkdir(parents=True, exist_ok=True)
-
-        mock_git_ops = MagicMock()
-        mock_git_ops.get_main_sha = AsyncMock(return_value=MAIN_SHA)
-        mock_git_ops.worktree_base = worktree_base  # real Path — pins the placement invariant
+        # Real GitOps so git_ops.worktree_base is the actual resolved value
+        # (not a manually-built parallel path) — pins the placement invariant.
+        mock_git_ops = GitOps(config.git, config.project_root)
+        mock_git_ops.get_main_sha = AsyncMock(return_value=MAIN_SHA)  # type: ignore[method-assign]
+        mock_git_ops.worktree_base.mkdir(parents=True, exist_ok=True)
 
         probe_paths: list[str] = []
 
@@ -352,9 +344,9 @@ class TestVerifyFailureProbeWorktreePlacement:
         # mkdtemp path (old behaviour: /tmp/df-mainprobe-xxx/probe) cannot reach
         # project_root via upward traversal, so inherited TS/compile breaks surface
         # a different signature ('Cannot find module') and the guard silently never fires.
-        assert probe_path.parent == worktree_base, (
+        assert probe_path.parent == mock_git_ops.worktree_base, (
             f'Probe path {probe_path!r} must be a direct child of '
-            f'worktree_base={worktree_base} (not a sub-directory of some other dir). '
+            f'worktree_base={mock_git_ops.worktree_base} (not a sub-directory of some other dir). '
             f'Actual parent: {probe_path.parent}'
         )
         assert probe_path.name.startswith('_mainprobe-'), (
