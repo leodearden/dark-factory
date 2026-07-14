@@ -41,6 +41,7 @@ __all__ = [
     "IllegalTransition",
     "RequeueKind",
     "StewardBudgetExhausted",
+    "classify_failure",
     "StewardInterrupted",
     "StewardOutcome",
     "StewardReescalatedL1",
@@ -160,6 +161,240 @@ class BlockDisposition:
     counts_against_requeue_cap: bool
     reason_prefix: str
     block_class: BlockClass
+
+
+# The fallback disposition classify_failure returns for any exception with no
+# explicit _DISPOSITION_TABLE row (including every genuinely-unrecognized
+# exception type) — mirrors the pre-W9-ε ladder's broad `except Exception`
+# tail (workflow.py:2395: `_mark_blocked(f'Workflow error: {e}')`, no
+# category/escalate_to_human passed, i.e. escalate_to_human=False).
+_DEFAULT_BLOCK = BlockDisposition(
+    category=FailureCategory.NONE,
+    escalate_to_human=False,
+    requeue_kind=RequeueKind.BLOCK,
+    counts_against_requeue_cap=True,
+    reason_prefix='Workflow error',
+    block_class=BlockClass.AGENT_FAILURE,
+)
+
+# The disposition for an infra-class OSError (ENOSPC/EDQUOT/EROFS/EIO/EMFILE/
+# ENFILE), matching the pre-W9-ε ladder's `except OSError as e: if
+# _is_infra_oserror(e): ...` branch (workflow.py:2359: category='infra_issue',
+# escalate_to_human=True). A non-infra OSError (e.g. EACCES/ENOENT) is
+# INDISTINGUISHABLE from a generic failure in the old ladder — it fell
+# through to the same `except Exception` tail — so classify_failure returns
+# _DEFAULT_BLOCK for it (see below), not a dedicated row.
+_INFRA_OSERROR_BLOCK = BlockDisposition(
+    category=FailureCategory.NONE,
+    escalate_to_human=True,
+    requeue_kind=RequeueKind.BLOCK,
+    counts_against_requeue_cap=True,
+    reason_prefix='Verify infra OSError',
+    block_class=BlockClass.AGENT_FAILURE,
+)
+
+# Module-level cache for _disposition_table(), populated on first call.
+_disposition_table_cache: dict[type[BaseException], BlockDisposition] | None = None
+
+
+def _disposition_table() -> dict[type[BaseException], BlockDisposition]:
+    """Build (once) and return the exception-type -> BlockDisposition table.
+
+    Every row's exception type is imported LAZILY, inside this function —
+    mirroring ``unblock_types.classify_block_reason``'s precedent — so
+    ``workflow_types`` stays importable by lightweight consumers (e.g.
+    ``steward.py``, which only wants the ``Steward*`` outcome dataclasses)
+    without pulling in ``orchestrator.git_ops``/``orchestrator.verify``'s
+    heavier transitive dependency graph merely by importing this module.
+    The built dict is cached at module level after the first call.
+
+    Deliberately does NOT contain a row for bare ``Exception``/
+    ``BaseException`` — see :func:`_lookup_disposition`'s docstring: a
+    generic base-class row would make BD-2's completeness check
+    (a synthetic new exception type with no row must resolve to ``None``)
+    meaningless, since every exception would then MRO-match it.
+    """
+    global _disposition_table_cache
+    if _disposition_table_cache is not None:
+        return _disposition_table_cache
+
+    from shared.cli_invoke import AllAccountsCappedException
+    from shared.usage_gate import IllegalTransitionError, SessionBudgetExhausted
+
+    from orchestrator.git_ops import (
+        InteractiveWorktreeLimitError,
+        MergeVerifyLeaseHeld,
+        WarmLaneDiskPressure,
+        WarmLanePoolExhausted,
+        WarmLanePoolHardDown,
+        WarmLaneRequeue,
+        WorktreeConflictError,
+        WorktreeMissing,
+    )
+    from orchestrator.verify import VerifyInfraError
+
+    _disposition_table_cache = {
+        # ── Cap/budget (BD-1: also consulted by the 3 satellite cap sites) ──
+        # Cap/agent failures map through W4's InvocationOutcome.CapHit /
+        # AgentFailureKind.UNKNOWN seam conceptually — classify_failure's
+        # AllAccountsCappedException/generic rows are this table's local
+        # projection of that same "cap hit" / "unclassified agent failure"
+        # distinction onto a BlockDisposition.
+        AllAccountsCappedException: BlockDisposition(
+            category=FailureCategory.NONE,
+            escalate_to_human=False,
+            requeue_kind=RequeueKind.BLOCK,
+            counts_against_requeue_cap=True,
+            reason_prefix='All accounts capped',
+            block_class=BlockClass.AGENT_FAILURE,
+        ),
+        SessionBudgetExhausted: BlockDisposition(
+            category=FailureCategory.NONE,
+            escalate_to_human=False,
+            requeue_kind=RequeueKind.BLOCK,
+            counts_against_requeue_cap=True,
+            reason_prefix='Session budget exhausted',
+            block_class=BlockClass.AGENT_FAILURE,
+        ),
+        # ── Warm-lane requeue family ─────────────────────────────────────
+        # counts_against_requeue_cap is declared ONCE per subclass here —
+        # the single source of truth replacing the buried NOTE at
+        # workflow.py ~2278-2300 (EXHAUSTED is genuine backpressure and
+        # counts; DISK_PRESSURE/HARD_DOWN are transient infra and do not).
+        # The WarmLaneRequeue base row exists for BD-2 completeness (it is
+        # itself one of git_ops.py's exported types) — MRO resolution means
+        # a real subclass instance always matches its OWN row first.
+        WarmLaneRequeue: BlockDisposition(
+            category=FailureCategory.NONE,
+            escalate_to_human=False,
+            requeue_kind=RequeueKind.REQUEUE,
+            counts_against_requeue_cap=True,
+            reason_prefix='warm_lane_requeue',
+            block_class=BlockClass.AGENT_FAILURE,
+        ),
+        WarmLanePoolExhausted: BlockDisposition(
+            category=FailureCategory.NONE,
+            escalate_to_human=False,
+            requeue_kind=RequeueKind.REQUEUE,
+            counts_against_requeue_cap=True,
+            reason_prefix='warm_lane_pool_exhausted',
+            block_class=BlockClass.AGENT_FAILURE,
+        ),
+        WarmLaneDiskPressure: BlockDisposition(
+            category=FailureCategory.NONE,
+            escalate_to_human=False,
+            requeue_kind=RequeueKind.REQUEUE,
+            counts_against_requeue_cap=False,
+            reason_prefix='warm_lane_disk_pressure (transient infra)',
+            block_class=BlockClass.AGENT_FAILURE,
+        ),
+        WarmLanePoolHardDown: BlockDisposition(
+            category=FailureCategory.NONE,
+            escalate_to_human=False,
+            requeue_kind=RequeueKind.REQUEUE,
+            counts_against_requeue_cap=False,
+            reason_prefix='warm_lane_pool_hard_down',
+            block_class=BlockClass.AGENT_FAILURE,
+        ),
+        # ── Verify-infra / worktree-conflict (escalate straight to human) ──
+        VerifyInfraError: BlockDisposition(
+            category=FailureCategory.NONE,
+            escalate_to_human=True,
+            requeue_kind=RequeueKind.BLOCK,
+            counts_against_requeue_cap=True,
+            reason_prefix='Verify infra failure',
+            block_class=BlockClass.AGENT_FAILURE,
+        ),
+        WorktreeConflictError: BlockDisposition(
+            category=FailureCategory.NONE,
+            escalate_to_human=True,
+            requeue_kind=RequeueKind.BLOCK,
+            counts_against_requeue_cap=True,
+            reason_prefix='WIP-save aborted: unresolved conflict in worktree',
+            block_class=BlockClass.AGENT_FAILURE,
+        ),
+        # ── BD-2 completeness rows: exported by the 4 covered modules, but
+        # not (today) caught by name anywhere in _drive()'s ladder ─────────
+        WorktreeMissing: BlockDisposition(
+            category=FailureCategory.NONE,
+            escalate_to_human=True,
+            requeue_kind=RequeueKind.BLOCK,
+            counts_against_requeue_cap=True,
+            reason_prefix='Worktree missing',
+            block_class=BlockClass.AGENT_FAILURE,
+        ),
+        InteractiveWorktreeLimitError: BlockDisposition(
+            category=FailureCategory.NONE,
+            escalate_to_human=False,
+            requeue_kind=RequeueKind.REQUEUE,
+            counts_against_requeue_cap=True,
+            reason_prefix='interactive_worktree_limit_reached',
+            block_class=BlockClass.AGENT_FAILURE,
+        ),
+        MergeVerifyLeaseHeld: BlockDisposition(
+            category=FailureCategory.NONE,
+            escalate_to_human=False,
+            requeue_kind=RequeueKind.REQUEUE,
+            counts_against_requeue_cap=False,
+            reason_prefix='merge_verify_lease_held',
+            block_class=BlockClass.AGENT_FAILURE,
+        ),
+        IllegalTransitionError: BlockDisposition(
+            category=FailureCategory.NONE,
+            escalate_to_human=True,
+            requeue_kind=RequeueKind.BLOCK,
+            counts_against_requeue_cap=True,
+            reason_prefix='Illegal usage-gate transition',
+            block_class=BlockClass.AGENT_FAILURE,
+        ),
+    }
+    return _disposition_table_cache
+
+
+def _lookup_disposition(exc_type: type[BaseException]) -> BlockDisposition | None:
+    """Return the explicit table row for *exc_type*, or ``None`` if absent.
+
+    Walks ``exc_type.__mro__`` so a subclass with no row of its own (there
+    are none among today's rows, but a future one is possible) inherits its
+    nearest ancestor's disposition. Returns ``None`` — rather than a
+    default — when no ancestor (up to but excluding ``Exception``/
+    ``BaseException``, which are never table keys) matches: this is what
+    makes BD-2's completeness check meaningful. ``classify_failure`` is the
+    TOTAL wrapper that turns a ``None`` into :data:`_DEFAULT_BLOCK`.
+    """
+    table = _disposition_table()
+    for klass in exc_type.__mro__:
+        if klass in table:
+            return table[klass]
+    return None
+
+
+def classify_failure(exc: BaseException) -> BlockDisposition:
+    """Classify *exc* into a :class:`BlockDisposition` — the W9-ε TABLE.
+
+    Total: every exception maps to exactly one disposition. Replaces
+    ``TaskWorkflow._drive()``'s exception-type-keyed except-clause ladder
+    (workflow.py:2175-2397) and, per BD-1, is the single classifier the
+    four independent ``AllAccountsCappedException`` catch sites (workflow,
+    steward, review_checkpoint, dry_run_unblock) all consult.
+
+    ``OSError`` is disambiguated by errno (via ``verify._is_infra_oserror``)
+    rather than by a table row, since two ``OSError`` instances of the SAME
+    type can carry different errnos: an infra-class errno (ENOSPC/EDQUOT/
+    EROFS/EIO/EMFILE/ENFILE) escalates to a human; any other OSError
+    (including ``WorktreeMissing``, a ``FileNotFoundError``/``OSError``
+    subclass that DOES also carry its own explicit table row for BD-2) is
+    indistinguishable from a generic failure in the pre-W9-ε ladder and
+    falls through to :data:`_DEFAULT_BLOCK` here too — mirroring
+    workflow.py:2371's `# Non-infra OSError — treat the same as the broad
+    except below` comment exactly.
+    """
+    if isinstance(exc, OSError):
+        from orchestrator.verify import _is_infra_oserror
+        if _is_infra_oserror(exc):
+            return _INFRA_OSERROR_BLOCK
+        return _DEFAULT_BLOCK
+    return _lookup_disposition(type(exc)) or _DEFAULT_BLOCK
 
 
 @dataclass(frozen=True)

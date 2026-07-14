@@ -115,3 +115,132 @@ class TestBlockDispositionShape:
         from orchestrator.workflow import BlockDisposition as ShimBlockDisposition
         from orchestrator.workflow_types import BlockDisposition
         assert ShimBlockDisposition is BlockDisposition
+
+
+# ---------------------------------------------------------------------------
+# step-03: classify_failure(exc) -> BlockDisposition known-row value tests
+# ---------------------------------------------------------------------------
+
+
+class TestClassifyFailureKnownRows:
+    """One assertion group per exception the pre-W9-ε ladder hand-classified.
+
+    Every row's ``.category`` is FailureCategory.NONE — none of these are
+    verify-check failures (see W9-ε's design decisions).
+    """
+
+    def test_all_accounts_capped_blocks_non_escalating_agent_failure(self):
+        from shared.cli_invoke import AllAccountsCappedException
+
+        from orchestrator.unblock_types import BlockClass
+        from orchestrator.verify_categories import FailureCategory
+        from orchestrator.workflow_types import RequeueKind, classify_failure
+        exc = AllAccountsCappedException(retries=5, elapsed_secs=120.5, label='Task 7 [impl]')
+        disp = classify_failure(exc)
+        assert disp.requeue_kind is RequeueKind.BLOCK
+        assert disp.escalate_to_human is False  # steward path — not an immediate L1
+        assert disp.block_class is BlockClass.AGENT_FAILURE
+        assert disp.reason_prefix.startswith('All accounts capped')
+        assert disp.category is FailureCategory.NONE
+
+    def test_session_budget_exhausted_blocks_non_escalating(self):
+        from shared.usage_gate import SessionBudgetExhausted
+
+        from orchestrator.verify_categories import FailureCategory
+        from orchestrator.workflow_types import RequeueKind, classify_failure
+        disp = classify_failure(SessionBudgetExhausted(cumulative_cost=42.0))
+        assert disp.requeue_kind is RequeueKind.BLOCK
+        assert disp.escalate_to_human is False
+        assert disp.category is FailureCategory.NONE
+
+    def test_warm_lane_pool_exhausted_requeues_and_counts_against_cap(self):
+        from orchestrator.git_ops import WarmLanePoolExhausted
+        from orchestrator.verify_categories import FailureCategory
+        from orchestrator.workflow_types import RequeueKind, classify_failure
+        disp = classify_failure(WarmLanePoolExhausted('all lanes assigned'))
+        assert disp.requeue_kind is RequeueKind.REQUEUE
+        assert disp.counts_against_requeue_cap is True
+        assert disp.category is FailureCategory.NONE
+
+    def test_warm_lane_disk_pressure_requeues_without_counting_against_cap(self):
+        from orchestrator.git_ops import WarmLaneDiskPressure
+        from orchestrator.verify_categories import FailureCategory
+        from orchestrator.workflow_types import RequeueKind, classify_failure
+        disp = classify_failure(WarmLaneDiskPressure('seed exited 75'))
+        assert disp.requeue_kind is RequeueKind.REQUEUE
+        assert disp.counts_against_requeue_cap is False
+        assert disp.category is FailureCategory.NONE
+
+    def test_warm_lane_pool_hard_down_requeues_without_counting_against_cap(self):
+        from orchestrator.git_ops import WarmLanePoolHardDown
+        from orchestrator.verify_categories import FailureCategory
+        from orchestrator.workflow_types import RequeueKind, classify_failure
+        disp = classify_failure(WarmLanePoolHardDown('warm base absent'))
+        assert disp.requeue_kind is RequeueKind.REQUEUE
+        assert disp.counts_against_requeue_cap is False
+        assert disp.category is FailureCategory.NONE
+
+    def test_verify_infra_error_blocks_and_escalates(self):
+        from orchestrator.verify import VerifyInfraError
+        from orchestrator.verify_categories import FailureCategory
+        from orchestrator.workflow_types import RequeueKind, classify_failure
+        disp = classify_failure(VerifyInfraError(phase='verify', errno=28))
+        assert disp.requeue_kind is RequeueKind.BLOCK
+        assert disp.escalate_to_human is True
+        assert disp.category is FailureCategory.NONE
+
+    def test_infra_oserror_blocks_and_escalates(self):
+        import errno as errno_mod
+
+        from orchestrator.verify_categories import FailureCategory
+        from orchestrator.workflow_types import RequeueKind, classify_failure
+        exc = OSError(errno_mod.ENOSPC, 'No space left on device')
+        disp = classify_failure(exc)
+        assert disp.requeue_kind is RequeueKind.BLOCK
+        assert disp.escalate_to_human is True
+        assert disp.category is FailureCategory.NONE
+
+    def test_non_infra_oserror_blocks_without_escalating(self):
+        import errno as errno_mod
+
+        from orchestrator.verify_categories import FailureCategory
+        from orchestrator.workflow_types import RequeueKind, classify_failure
+        exc = OSError(errno_mod.EACCES, 'Permission denied')
+        disp = classify_failure(exc)
+        assert disp.requeue_kind is RequeueKind.BLOCK
+        assert disp.escalate_to_human is False
+        assert disp.category is FailureCategory.NONE
+
+    def test_worktree_conflict_error_blocks_and_escalates(self):
+        from pathlib import Path
+
+        from orchestrator.git_ops import WorktreeConflictError
+        from orchestrator.verify_categories import FailureCategory
+        from orchestrator.workflow_types import RequeueKind, classify_failure
+        exc = WorktreeConflictError(Path('/tmp/wt'), ['a.py'])
+        disp = classify_failure(exc)
+        assert disp.requeue_kind is RequeueKind.BLOCK
+        assert disp.escalate_to_human is True
+        assert disp.category is FailureCategory.NONE
+
+    def test_bare_exception_blocks_non_escalating_agent_failure(self):
+        from orchestrator.unblock_types import BlockClass
+        from orchestrator.verify_categories import FailureCategory
+        from orchestrator.workflow_types import RequeueKind, classify_failure
+        disp = classify_failure(Exception('boom'))
+        assert disp.requeue_kind is RequeueKind.BLOCK
+        assert disp.escalate_to_human is False
+        assert disp.block_class is BlockClass.AGENT_FAILURE
+        assert disp.reason_prefix == 'Workflow error'
+        assert disp.category is FailureCategory.NONE
+
+    def test_classify_failure_is_total_for_an_unrecognized_exception(self):
+        # Sanity: classify_failure never raises — an exception type with no
+        # explicit row still resolves to SOME disposition (the default).
+        from orchestrator.workflow_types import classify_failure
+
+        class _SomeUnrelatedError(Exception):
+            pass
+
+        disp = classify_failure(_SomeUnrelatedError('surprise'))
+        assert disp is not None
