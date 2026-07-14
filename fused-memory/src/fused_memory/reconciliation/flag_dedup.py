@@ -874,9 +874,13 @@ async def _existing_suppression_coverage(
     True iff an existing active row covering *tid* is a blanket/wildcard row
     (``flag_type == ''``); ``scoped_families`` is the set of
     :func:`canonical_flag_type_family` keys already covered by existing
-    scoped rows for *tid*. A row covers *tid* by EXACT string match
-    (``row.task_id == tid``) -- composite-row decomposition is added in
-    :func:`write_suppression_record`'s caller (task 2503 step-8).
+    scoped rows for *tid*. A row covers *tid* iff ``tid == row.task_id``
+    (exact match, catching an exact-composite duplicate) OR ``tid`` is one of
+    ``row.task_id``'s components per :func:`_decompose_suppression_task_id`
+    (task 2503 step-8; reuses task 2454's read-time decomposition) -- so a
+    single-id write is recognized as covered by a pre-existing composite
+    cross-project row (e.g. ``'2405,540,544'``). Coverage across multiple
+    covering rows is aggregated (union): wildcard OR'd, families unioned.
 
     Returns ``(False, set())`` -- no coverage -- when *ledger* is None.
 
@@ -889,7 +893,7 @@ async def _existing_suppression_coverage(
     wildcard = False
     families: set[str] = set()
     for row in rows:
-        if row.task_id != tid:
+        if tid != row.task_id and tid not in _decompose_suppression_task_id(row.task_id):
             continue
         if not row.flag_type:
             wildcard = True
