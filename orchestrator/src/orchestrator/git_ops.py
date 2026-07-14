@@ -232,6 +232,41 @@ PERSISTENT_MERGE_WORKTREE_NAME: str = '_merge-verify'
 # independently defaulted copy of the same value, not env-overridable here).
 _MERGE_VERIFY_FLOCK_WAIT_SECS: float = 10.0
 
+# Bounded-wait timeout (seconds) for GitOps._seed_warm_lane()'s outer
+# <lane_dir>.lock flock -x (task 2599 amendment). Seeding runs on the
+# latency-sensitive warm-lane acquisition hot path; a plain unbounded
+# blocking flock -x would stall it indefinitely against a live-but-wedged
+# holder (thin's rm -rf, GC reclaim, or another seed's cp --reflink) since
+# flock only auto-releases a lock on holder *death*, never on a
+# stuck-but-live process. All legitimate holders are bounded operations, so
+# 30s gives generous headroom over normal (even slow-disk) durations while
+# still turning a wedged holder into a diagnosable, bounded failure instead
+# of a silent, unbounded one. A plain module constant, no config knob and no
+# env override — mirrors _MERGE_VERIFY_FLOCK_WAIT_SECS's own
+# independently-defaulted, non-overridable copy above, and keeps this fix
+# inside git_ops.py rather than reaching into config.py's green/red
+# reload-tier surface for what is a narrow, self-contained safety margin.
+#
+# Declared `int` (task 2599 amendment), not `float`: the value is passed to
+# the `flock(1)` CLI as `str(_SEED_WARM_LANE_LOCK_WAIT_SECS)` for `-w`, and
+# an int stringifies to an unambiguous whole-second literal ("30") rather
+# than a fractional one ("30.0"). Fractional `-w` parses fine on current
+# util-linux, but this is the only place in git_ops.py that hands a
+# CLI-parsed wait value to `flock` itself (`_MERGE_VERIFY_FLOCK_WAIT_SECS`
+# is only ever passed to an in-process helper, never a CLI arg) — no reason
+# to lean on fractional-timeout CLI parsing for what is a whole-second value.
+_SEED_WARM_LANE_LOCK_WAIT_SECS: int = 30
+
+# flock's --conflict-exit-code (-E) for _SEED_WARM_LANE_LOCK_WAIT_SECS above.
+# Deliberately mirrors timeout(1)'s well-known 124 "command timed out"
+# convention so the sentinel is self-documenting in logs, and is chosen
+# distinct from every other rc _seed_warm_lane's docstring documents (0
+# success, 75 disk-pressure, 127 absent-script/exception sentinel; any other
+# value is a generic script fault). A genuine seed-warm-lane.sh exit code of
+# 124 would be misattributed to a lock-wait timeout, but no script
+# convention in this codebase uses 124 for anything else.
+_SEED_WARM_LANE_LOCK_TIMEOUT_RC: int = 124
+
 # Fixed name for the SECOND persistent warm worktree (task 1952, PRD δ /
 # §5 C5), dedicated to the offline-deep lane worker (β2).  Lives at
 # <worktree_base>/_offline-deep.  Deliberately NOT prefixed `_merge-`, so it
@@ -2263,29 +2298,80 @@ class GitOps:
         The script lives in the LANE's own scripts dir (the lane's checked-out
         tree provides it, consistent with the debug-port script pattern).
 
-        **Does NOT take ``<lane_dir>.lock``**: the only flock this method (or
-        the ``seed-warm-lane.sh`` it invokes) acquires is the *shared*
-        per-gen-dir lock above, scoped to protecting the shared CoW base
-        during copy — never the lane's own lock file. See
-        :meth:`_run_thin_warm_lane`'s "Lane-lock coupling gap" docstring
-        note for why that matters (a concurrent release-thin does not
-        actually contend with a re-acquire on ``<lane_dir>.lock``).
+        **Takes ``<lane_dir>.lock`` exclusively (task 2599)**: the seed
+        subprocess is wrapped in an OUTER blocking exclusive
+        ``flock -x <lane_dir>.lock`` spanning its full duration — nesting
+        outside the INNER *shared* per-gen-dir lock above in the symlink
+        branch (outer exclusive lane lock, inner shared gen lock; both held
+        for the script's whole lifetime and auto-released on exit, including
+        on holder crash). ``flock`` consumes its own leading args, so the
+        script itself still only ever sees ``base_target lane_dir mode`` as
+        its argv. This gives :meth:`_run_thin_warm_lane`'s non-blocking T3
+        ``flock -n`` a real counterparty: a concurrent release-thin and a
+        re-acquire's seed can no longer both proceed against the same
+        ``target/`` at once — see that method's "Lane-lock coupling gap"
+        docstring note for the full race analysis (now closed).
+
+        **Bounded wait, not unbounded (task 2599 amendment)**: seeding runs
+        on the latency-sensitive warm-lane acquisition hot path, so the
+        outer lock is acquired with ``-w _SEED_WARM_LANE_LOCK_WAIT_SECS``
+        and ``-E _SEED_WARM_LANE_LOCK_TIMEOUT_RC`` rather than a plain
+        unbounded ``flock -x`` — ``flock`` only auto-releases a lock on
+        holder *death*, never on a stuck-but-live process, so an unbounded
+        wait could stall lane acquisition (and therefore task dispatch)
+        indefinitely against a live-but-wedged holder (thin's ``rm -rf``, GC
+        reclaim, or another seed). ``-E`` gives the timeout its own exit
+        code, mirroring ``timeout(1)``'s well-known 124 "command timed out"
+        convention, so it is logged as a distinct, diagnosable condition
+        rather than folded into the generic non-zero-fault warning below.
+        This is deliberately fail-CLOSED, not fail-open: unlike
+        :meth:`merge_verify_lease`'s contended-flock fallback (that flock is
+        a secondary/observational lease over a primary enforced elsewhere,
+        so proceeding without it is safe), ``<lane_dir>.lock`` IS the
+        primary mutual-exclusion mechanism this task establishes —
+        proceeding without it on timeout would silently reopen the exact
+        race this task closes. No retry is added either: every existing
+        caller already treats any non-zero rc as a fault (cold fallback /
+        release-and-retry / escalate — see the callsites below), so a
+        timeout is handled identically to any other seed fault, and
+        stacking an in-method retry on top of the bounded wait would only
+        extend the hot-path stall this timeout exists to bound.
 
         Returns:
             0   — script ran and exited 0 (seed succeeded, lane is warm).
             75  — script exited 75 (EX_TEMPFAIL, disk-pressure discriminant).
+            124 — outer <lane_dir>.lock wait timed out after
+                  _SEED_WARM_LANE_LOCK_WAIT_SECS — a live-but-wedged lock
+                  holder; the script itself never ran (task 2599 amendment).
             1..N — script exited with any other non-zero code (generic fault).
             127 — script absent (command-not-found sentinel).
             127 — any unexpected exception (non-zero sentinel, never raises).
 
         Callers must use ``rc == 0`` for success and may inspect the exact
-        code to discriminate disk-pressure (75) from generic fault (other non-zero).
+        code to discriminate disk-pressure (75) or a lock-wait timeout (124,
+        see ``_SEED_WARM_LANE_LOCK_TIMEOUT_RC``) from a generic fault (any
+        other non-zero).
         """
         try:
             script = lane_dir / 'scripts' / 'seed-warm-lane.sh'
             if not script.exists():
                 logger.debug('_seed_warm_lane: seed script absent at %s', script)
                 return 127  # command-not-found sentinel
+            # task 2599: outer exclusive lane lock spans the ENTIRE seed
+            # subprocess below (both branches), giving _run_thin_warm_lane's
+            # T3 flock -n a real counterparty — see the "Takes <lane_dir>.lock
+            # exclusively" docstring note above. Bounded via -w/-E (task 2599
+            # amendment) — see the "Bounded wait, not unbounded" docstring
+            # note — so a live-but-wedged holder fails closed with a
+            # distinct, diagnosable rc instead of stalling this hot path
+            # forever.
+            lane_lock = lane_dir.with_name(lane_dir.name + '.lock')
+            lane_lock_flock = [
+                'flock', '-x',
+                '-w', str(_SEED_WARM_LANE_LOCK_WAIT_SECS),
+                '-E', str(_SEED_WARM_LANE_LOCK_TIMEOUT_RC),
+                str(lane_lock),
+            ]
             base_path = self.warm_lane_base_target_path
             if base_path.is_symlink():
                 # D8: resolve relative-sibling symlink (target -> .gen.N) to the
@@ -2309,12 +2395,24 @@ class GitOps:
                         'this indicates a reify/DF gen-dir protocol mismatch',
                         lock_path,
                     )
-                cmd = ['flock', '-s', str(lock_path), str(script), base_target, str(lane_dir), mode]
+                cmd = [
+                    *lane_lock_flock,
+                    'flock', '-s', str(lock_path),
+                    str(script), base_target, str(lane_dir), mode,
+                ]
             else:
                 base_target = str(base_path)
-                cmd = [str(script), base_target, str(lane_dir), mode]
+                cmd = [*lane_lock_flock, str(script), base_target, str(lane_dir), mode]
             rc, _, err = await _run(cmd, cwd=lane_dir)
-            if rc != 0:
+            if rc == _SEED_WARM_LANE_LOCK_TIMEOUT_RC:
+                logger.warning(
+                    '_seed_warm_lane: timed out after %.0fs waiting for '
+                    '%s — a concurrent holder (thin rm -rf / GC reclaim / '
+                    'another seed) is still live; failing closed rather '
+                    'than risk a torn target/ (rc=%d)',
+                    _SEED_WARM_LANE_LOCK_WAIT_SECS, lane_lock, rc,
+                )
+            elif rc != 0:
                 logger.warning(
                     '_seed_warm_lane: script exited %d for %s (stderr=%r)',
                     rc, lane_dir, err,
@@ -2643,34 +2741,36 @@ class GitOps:
         unit test that exercises this against a real held flock (not just a
         scripted exit code).
 
-        **Lane-lock coupling gap (task 2442 review — CONFIRMED, not just
-        theoretical)**: the mutual exclusion above additionally requires the
-        OTHER party in a concurrent re-acquire — reify's
+        **Lane-lock coupling gap (task 2442 review — CLOSED by task 2599)**:
+        the mutual exclusion above additionally requires the OTHER party in
+        a concurrent re-acquire — reify's
         ``<lane_dir>/scripts/seed-warm-lane.sh``, invoked by
         :meth:`_seed_warm_lane` — to ALSO take ``<lane_dir>.lock`` before
-        writing into ``target/``. As of this writing it does not:
-        ``seed-warm-lane.sh`` takes only a *shared* flock on the separate
-        per-gen-dir lock file for the duration of its ``cp --reflink`` from
-        the shared CoW base (mirrored on the DF side by
-        :meth:`_seed_warm_lane`'s own gen-dir flock, above) — it contains no
-        ``<lane_dir>.lock`` reference at all. DF's own
-        :class:`WarmLanePool` does not fill the gap either: its ASSIGNED/FREE
-        bookkeeping is purely in-memory, guarded by a single ``asyncio.Lock``
-        (see its class docstring) that serializes the fast state-dict flip
-        only — NOT the slow subprocess calls either side makes. This
-        method's ``rm -rf`` and :meth:`_seed_warm_lane`'s ``cp --reflink``
-        both run as real OS subprocesses that can genuinely overlap in
-        wall-clock time across an ``await``, even within a single
-        orchestrator process. So today, a concurrent re-acquire of a
-        just-released lane does NOT contend on ``<lane_dir>.lock`` — thin's
-        ``flock -n`` is uncontested and proceeds, meaning the rc=75
-        benign-skip path is reachable only when something ELSE (another
-        thin or GC invocation) holds the lock, not when a genuine re-acquire
-        is racing this call. ``TestSeedWarmLaneDoesNotTakeLaneLock`` in
-        ``test_git_ops.py`` pins this current behavior down against a real
-        held flock. Teaching either side to take ``<lane_dir>.lock`` for
-        real is a locking-design change out of scope for task 2442 (η) —
-        flagged as a follow-up rather than fixed here.
+        writing into ``target/``. It now does: :meth:`_seed_warm_lane` wraps
+        that script in an outer blocking exclusive ``flock -x
+        <lane_dir>.lock`` spanning its full subprocess duration (task 2599),
+        bounded rather than unbounded (task 2599 amendment — see that
+        method's "Bounded wait, not unbounded" docstring note), nested
+        outside its own gen-dir flock (mirrored on the DF side,
+        above). So a genuine concurrent re-acquire's seed DOES contend with
+        this method's ``rm -rf`` on the same lock file — the rc=75
+        benign-skip path below is now reachable on a real re-acquire race,
+        not only when something ELSE (another thin or GC invocation) holds
+        the lock. DF's own :class:`WarmLanePool` still does not itself
+        provide this — its ASSIGNED/FREE bookkeeping is purely in-memory,
+        guarded by a single ``asyncio.Lock`` (see its class docstring) that
+        serializes the fast state-dict flip only, NOT the slow subprocess
+        calls either side makes — but that no longer matters: the
+        ``<lane_dir>.lock`` file itself is now the shared mutual-exclusion
+        primitive between this method's ``rm -rf`` and
+        :meth:`_seed_warm_lane`'s ``cp --reflink``, both real OS subprocesses
+        that would otherwise be free to genuinely overlap in wall-clock time
+        across an ``await``. ``TestSeedWarmLaneTakesLaneLock`` in
+        ``test_git_ops.py`` pins :meth:`_seed_warm_lane`'s new blocking
+        behavior against an externally-held lock, and
+        ``TestSeedAndThinMutualExclusion`` pins the end-to-end mutual
+        exclusion between this method and :meth:`_seed_warm_lane` racing
+        each other on the SAME lock file.
 
         Exit-code taxonomy (per the reify δ contract):
             0   — thinned (``target/`` removed).
@@ -4099,9 +4199,13 @@ class GitOps:
            is True, invoke :meth:`_run_thin_warm_lane` — an eager free-first
            reclaim of the lane's ``target/`` via reify δ's
            ``scripts/thin-warm-lane.sh``, run strictly AFTER the ASSIGNED→FREE
-           flip.  The script holds the lane's own flock (T3), so a concurrent
-           re-acquire of this just-freed lane makes it exit 75 (benign skip) —
-           never thinned while ASSIGNED, by construction (inv.10).  Only
+           flip.  The script holds the lane's own flock (T3), and (task 2599)
+           :meth:`_seed_warm_lane` now holds that SAME ``<lane_dir>.lock``
+           exclusively for its own subprocess duration, so a concurrent
+           re-acquire of this just-freed lane genuinely contends and makes
+           this call exit 75 (benign skip) — never thinned while ASSIGNED,
+           by construction (inv.10) and now actually enforced DF-side rather
+           than delegated to an un-honored cross-repo contract.  Only
            ``target/`` is ever removed (T1); invoked WITHOUT ``--reseed`` — the
            next :meth:`acquire_warm_lane` always re-seeds from the current
            base regardless (D10), so net warmth is unchanged and only the

@@ -1,6 +1,7 @@
 """Tests for git operations — worktree lifecycle."""
 
 import asyncio
+import contextlib
 import fcntl
 import json
 import logging
@@ -9684,34 +9685,41 @@ class TestRunThinWarmLaneFlockContention:
 
 
 # ---------------------------------------------------------------------------
-# Task 2442 amend (round 2) — pin that _seed_warm_lane does NOT take
-# <lane_dir>.lock (review: git_ops.py:2570 — the "never thinned while
-# ASSIGNED" safety argument holds only if the re-acquire side ALSO honors
-# the lane-lock contract; this proves the current DF Python layer provides
-# no such defense, so the coupling is auditable rather than assumed)
+# Task 2599 — pin that _seed_warm_lane NOW takes <lane_dir>.lock, closing
+# the coupling gap flagged by the task 2442 review (git_ops.py:2570): the
+# "never thinned while ASSIGNED" safety argument for release-thin's rc=75
+# benign-skip path holds only if the re-acquire side ALSO honors the
+# lane-lock contract. _seed_warm_lane now does, via an outer blocking
+# exclusive flock -x <lane_dir>.lock spanning the whole seed subprocess.
 # ---------------------------------------------------------------------------
 
 
 @pytest.mark.asyncio
-class TestSeedWarmLaneDoesNotTakeLaneLock:
-    """Pins the lane-lock coupling gap flagged by the task 2442 code review.
+class TestSeedWarmLaneTakesLaneLock:
+    """Pins the lane-lock coupling gap CLOSED (task 2599).
 
     ``_run_thin_warm_lane``'s rc=75 benign-skip protection (see its
     "Lane-lock coupling gap" docstring note) only actually serializes a
     concurrent re-acquire against release-thin if the re-acquire side ALSO
-    takes ``<lane_dir>.lock``. ``_seed_warm_lane`` (the re-acquire side's
-    CoW-seed step) does not: it only takes a *shared* flock on the separate
-    per-gen-dir lock file, scoped to protecting the shared CoW base during
-    copy. This test proves that concretely — a real, externally-held
-    ``<lane_dir>.lock`` does not block or influence ``_seed_warm_lane``'s
-    own progress at all — so nobody mistakes ``_run_thin_warm_lane``'s
-    "Flock contract (pinned)" note for DF-side enforcement it does not
-    provide. If this test ever starts failing, ``_seed_warm_lane``'s
-    locking model changed and the coupling-gap docstring note on both
-    methods must be revisited (the gap may be closed).
+    takes ``<lane_dir>.lock``. Previously ``_seed_warm_lane`` (the
+    re-acquire side's CoW-seed step) did not — it took only a *shared*
+    flock on the separate per-gen-dir lock file, scoped to protecting the
+    shared CoW base during copy (see the now-replaced
+    ``test_seed_proceeds_even_when_lane_lock_is_held``, formerly in
+    ``TestSeedWarmLaneDoesNotTakeLaneLock``). It now does: the seed
+    subprocess is wrapped in an outer blocking exclusive
+    ``flock -x <lane_dir>.lock`` for its full duration, giving thin's
+    non-blocking ``flock -n`` a real counterparty. This test proves that
+    concretely — a real, externally-held ``<lane_dir>.lock`` now BLOCKS
+    ``_seed_warm_lane``'s progress until released, rather than being
+    ignored — so ``_run_thin_warm_lane``'s "Flock contract" note is now
+    backed by genuine DF-side enforcement on both sides of the race. If
+    this test ever starts failing, ``_seed_warm_lane``'s locking model
+    changed and the coupling-gap docstring note on both methods must be
+    revisited (the gap may have reopened).
     """
 
-    async def test_seed_proceeds_even_when_lane_lock_is_held(
+    async def test_seed_blocks_until_lane_lock_released(
         self, git_ops: GitOps, git_repo: Path,
     ):
         lane = git_repo / '_lane-0'
@@ -9729,24 +9737,309 @@ class TestSeedWarmLaneDoesNotTakeLaneLock:
         # script contends on (see TestRunThinWarmLaneFlockContention above).
         lock_path = Path(f'{lane}.lock')
         lock_fd = os.open(str(lock_path), os.O_RDWR | os.O_CREAT, 0o644)
-        try:
-            fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        lock_held = True
 
-            rc = await git_ops._seed_warm_lane(lane, '--fresh-checkout')
+        task = asyncio.create_task(git_ops._seed_warm_lane(lane, '--fresh-checkout'))
+        try:
+            await asyncio.sleep(0.3)
+
+            assert not task.done(), (
+                '_seed_warm_lane must block on the outer flock -x '
+                '<lane_dir>.lock while a concurrent release-thin holds it'
+            )
+            assert not marker.exists(), (
+                'seed-warm-lane.sh must not have run yet — _seed_warm_lane '
+                'is still waiting to acquire <lane_dir>.lock'
+            )
+
+            fcntl.flock(lock_fd, fcntl.LOCK_UN)
+            os.close(lock_fd)
+            lock_held = False
+
+            rc = await asyncio.wait_for(task, 10)
 
             assert rc == 0, (
-                f'_seed_warm_lane must succeed regardless of <lane_dir>.lock '
-                f'contention (it never checks that lock), got rc={rc!r}'
+                f'_seed_warm_lane must succeed once the lane lock is '
+                f'released, got rc={rc!r}'
             )
             assert marker.exists(), (
-                "seed-warm-lane.sh ran and wrote into the lane despite "
-                "<lane_dir>.lock being held by another process — proving "
-                "DF's Python layer provides no lane-lock defense of its "
-                "own; the entire \"never thinned while ASSIGNED\" argument "
-                "is delegated to a cross-repo contract this file cannot "
-                "verify (see _run_thin_warm_lane's \"Lane-lock coupling "
-                "gap\" note)"
+                'seed-warm-lane.sh must have run and written the marker '
+                'once _seed_warm_lane acquired <lane_dir>.lock'
+            )
+        finally:
+            if not task.done():
+                task.cancel()
+            if lock_held:
+                fcntl.flock(lock_fd, fcntl.LOCK_UN)
+                os.close(lock_fd)
+
+    # -----------------------------------------------------------------
+    # Amendment (code review of task 2599): the test above only exercises
+    # the non-symlink `else` branch of _seed_warm_lane, since git_repo /
+    # git_config leave warm_lane_base_target_path as a plain directory. Per
+    # _seed_warm_lane's own D8 docstring, the base is normally a
+    # reify-created SYMLINK to a gen dir, making the symlink branch — which
+    # builds a nested `flock -x <lane_dir>.lock flock -s <gen_dir>.lock
+    # script ...` command — the production-realistic path. A regression
+    # that dropped or reordered the outer lane-lock flock in that nested
+    # form would go undetected by the plain-branch test alone. This variant
+    # closes that gap by pointing warm_lane_base_target_path at a real
+    # target -> .gen.0 symlink (mirrors _make_gendir_base in
+    # test_warm_base_coherence.py) and re-running the same block/release
+    # proof against the resulting nested command.
+    # -----------------------------------------------------------------
+
+    async def test_seed_blocks_until_lane_lock_released_symlink_branch(
+        self, git_config: GitConfig, git_repo: Path,
+    ):
+        base_dir = git_repo / 'bases'
+        base_dir.mkdir()
+        gen_dir = base_dir / '.gen.0'
+        gen_dir.mkdir()
+        (gen_dir / 'sentinel').write_text('gen-dir-content\n')
+        target_symlink = base_dir / 'target'
+        # Relative sibling, matches reify's: ln -sfn .gen.N target
+        target_symlink.symlink_to('.gen.0')
+        # Reader-refcount GC lock file, pre-created by reify alongside the
+        # gen dir (mirrors _make_gendir_base in test_warm_base_coherence.py).
+        (base_dir / '.gen.0.lock').touch()
+
+        config = git_config.model_copy(
+            update={'warm_lane_base_target_dir': str(target_symlink)},
+        )
+        git_ops = GitOps(config, git_repo)
+
+        lane = git_repo / '_lane-1'
+        scripts_dir = lane / 'scripts'
+        scripts_dir.mkdir(parents=True)
+        marker = lane / 'seeded.marker'
+        args_marker = lane / 'seed_args.txt'
+        script = scripts_dir / 'seed-warm-lane.sh'
+        script.write_text(
+            '#!/usr/bin/env bash\n'
+            'set -euo pipefail\n'
+            f'echo "$1" > {args_marker}\n'
+            f'echo seeded > {marker}\n'
+            'exit 0\n'
+        )
+        script.chmod(0o755)
+
+        lock_path = Path(f'{lane}.lock')
+        lock_fd = os.open(str(lock_path), os.O_RDWR | os.O_CREAT, 0o644)
+        fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        lock_held = True
+
+        task = asyncio.create_task(git_ops._seed_warm_lane(lane, '--fresh-checkout'))
+        try:
+            await asyncio.sleep(0.3)
+
+            assert not task.done(), (
+                'symlink branch: _seed_warm_lane must block on the outer '
+                'flock -x <lane_dir>.lock — nested ahead of the inner '
+                'flock -s <gen_dir>.lock — while a concurrent release-thin '
+                'holds it'
+            )
+            assert not marker.exists(), (
+                'seed-warm-lane.sh must not have run yet — _seed_warm_lane '
+                'is still waiting to acquire <lane_dir>.lock'
+            )
+
+            fcntl.flock(lock_fd, fcntl.LOCK_UN)
+            os.close(lock_fd)
+            lock_held = False
+
+            rc = await asyncio.wait_for(task, 10)
+
+            assert rc == 0, (
+                f'_seed_warm_lane must succeed once the lane lock is '
+                f'released, got rc={rc!r}'
+            )
+            assert marker.exists(), (
+                'seed-warm-lane.sh must have run and written the marker '
+                'once _seed_warm_lane acquired <lane_dir>.lock'
+            )
+            assert args_marker.read_text().strip() == str(gen_dir), (
+                'sanity check: the script must have received the RESOLVED '
+                'gen dir as $1, confirming this exercised the symlink '
+                'branch (outer lane lock nested around the inner gen lock), '
+                'not the plain-dir branch'
+            )
+        finally:
+            if not task.done():
+                task.cancel()
+            if lock_held:
+                fcntl.flock(lock_fd, fcntl.LOCK_UN)
+                os.close(lock_fd)
+
+
+# ---------------------------------------------------------------------------
+# Task 2599 amendment — the bounded-wait timeout branch (rc=124) added by
+# _seed_warm_lane's "Bounded wait, not unbounded" docstring note is not
+# exercised by TestSeedWarmLaneTakesLaneLock above: both of its tests
+# release the externally-held lock after ~0.3s, well inside the real 30s
+# bound, so they only ever prove the block-then-succeed path. This closes
+# that gap by monkeypatching the wait down to a small value and holding the
+# lock past it, forcing the timeout branch itself.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestSeedWarmLaneLockTimeout:
+    """Pins the bounded-wait timeout path (task 2599 amendment).
+
+    ``_seed_warm_lane``'s outer ``<lane_dir>.lock`` flock -x is acquired
+    with ``-w _SEED_WARM_LANE_LOCK_WAIT_SECS -E _SEED_WARM_LANE_LOCK_TIMEOUT_RC``
+    (see its "Bounded wait, not unbounded" docstring note), not a plain
+    unbounded wait, so a live-but-wedged holder must fail closed with
+    rc=124 once the bound elapses rather than stalling the
+    latency-sensitive acquire path forever. A regression that dropped the
+    ``-w``/``-E`` args (reverting to an unbounded ``flock -x``) or
+    mishandled the 124 rc would pass every other lane-lock test in this
+    file and only be caught here.
+    """
+
+    async def test_lock_held_past_bound_returns_124_and_skips_script(
+        self, git_ops: GitOps, git_repo: Path, monkeypatch, caplog,
+    ):
+        from orchestrator import git_ops as git_ops_mod
+
+        # Shrink the bound from the real 30s so the test doesn't have to
+        # wait that long — _SEED_WARM_LANE_LOCK_WAIT_SECS is a plain module
+        # constant with no env override (by design — see its docstring), so
+        # monkeypatching the module attribute is the only way to shorten it.
+        monkeypatch.setattr(git_ops_mod, '_SEED_WARM_LANE_LOCK_WAIT_SECS', 0.5)
+
+        lane = git_repo / '_lane-0'
+        scripts_dir = lane / 'scripts'
+        scripts_dir.mkdir(parents=True)
+        marker = lane / 'seeded.marker'
+        script = scripts_dir / 'seed-warm-lane.sh'
+        script.write_text(
+            f'#!/usr/bin/env bash\nset -euo pipefail\necho seeded > {marker}\nexit 0\n'
+        )
+        script.chmod(0o755)
+
+        # Hold <lane_dir>.lock from the test process for LONGER than the
+        # monkeypatched 0.5s bound, so the outer flock -w must genuinely
+        # time out rather than eventually acquire it.
+        lock_path = Path(f'{lane}.lock')
+        lock_fd = os.open(str(lock_path), os.O_RDWR | os.O_CREAT, 0o644)
+        fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        try:
+            with caplog.at_level(logging.WARNING, logger='orchestrator.git_ops'):
+                rc = await asyncio.wait_for(
+                    git_ops._seed_warm_lane(lane, '--fresh-checkout'), 10,
+                )
+
+            assert rc == 124, (
+                'a lane lock held past the bounded wait must surface as '
+                'rc=124 (_SEED_WARM_LANE_LOCK_TIMEOUT_RC) — a regression '
+                'that dropped the -w/-E args (reverting to an unbounded '
+                'flock -x) would instead hang until the '
+                'asyncio.wait_for(10) bound fires this assertion'
+            )
+            assert not marker.exists(), (
+                'seed-warm-lane.sh must never have run — the outer '
+                'flock -x timed out before the script was even spawned'
+            )
+            timeout_warnings = [
+                r.getMessage() for r in caplog.records
+                if r.levelno >= logging.WARNING and 'timed out' in r.getMessage()
+            ]
+            assert timeout_warnings, (
+                'a lock-wait timeout must log its own fail-closed WARNING, '
+                'distinct from the generic non-zero-rc warning branch'
             )
         finally:
             fcntl.flock(lock_fd, fcntl.LOCK_UN)
             os.close(lock_fd)
+
+
+# ---------------------------------------------------------------------------
+# Task 2599 (step-3) — end-to-end guard: _seed_warm_lane's new <lane_dir>.lock
+# and _run_thin_warm_lane's real script both agree on the SAME inode, so a
+# genuine concurrent seed really does make a racing thin exit 75 (benign
+# skip) — not just each side's lock behavior proven in isolation above.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestSeedAndThinMutualExclusion:
+    """End-to-end: a live ``_seed_warm_lane`` holding ``<lane_dir>.lock``
+    makes a concurrent ``_run_thin_warm_lane``'s real ``flock -n`` gate exit
+    75.
+
+    ``TestSeedWarmLaneTakesLaneLock`` proves ``_seed_warm_lane`` blocks
+    against an externally-held lock; ``TestRunThinWarmLaneFlockContention``
+    proves ``_run_thin_warm_lane``'s real script surfaces rc=75 against an
+    externally-held lock. Neither, alone, proves the two sides actually
+    contend with EACH OTHER on the same file. This test drives both real
+    code paths at once — a genuine ``_seed_warm_lane`` in flight, and a
+    genuine ``_run_thin_warm_lane`` racing it — closing that last gap.
+    """
+
+    async def test_seed_holding_lane_lock_makes_concurrent_thin_skip(
+        self, git_ops: GitOps, git_repo: Path,
+    ):
+        lane = git_repo / '_lane-0'
+        scripts_dir = lane / 'scripts'
+        scripts_dir.mkdir(parents=True)
+        seed_started = lane / 'seed_started'
+        seed_release = lane / 'seed_release'
+        seed_script = scripts_dir / 'seed-warm-lane.sh'
+        seed_script.write_text(
+            '#!/usr/bin/env bash\n'
+            'set -euo pipefail\n'
+            f'touch {seed_started}\n'
+            f'while [ ! -e {seed_release} ]; do\n'
+            '    sleep 0.02\n'
+            'done\n'
+            'exit 0\n'
+        )
+        seed_script.chmod(0o755)
+
+        # Real-T3 thin stub — the SAME stub TestRunThinWarmLaneFlockContention
+        # uses — so this exercises the genuine flock -n gate, not a scripted rc.
+        thin_scripts_dir = git_repo / 'scripts'
+        thin_scripts_dir.mkdir(parents=True, exist_ok=True)
+        _write_thin_warm_lane_flock_stub(thin_scripts_dir)
+
+        seed_task = asyncio.create_task(
+            git_ops._seed_warm_lane(lane, '--fresh-checkout')
+        )
+        try:
+            async def _wait_for_seed_started():
+                while not seed_started.exists():
+                    await asyncio.sleep(0.01)
+
+            try:
+                await asyncio.wait_for(_wait_for_seed_started(), 10)
+            except TimeoutError as exc:
+                raise AssertionError(
+                    'seed-warm-lane.sh stub never started — _seed_warm_lane '
+                    'did not acquire <lane_dir>.lock and run the script'
+                ) from exc
+
+            # seed_started existing proves _seed_warm_lane has acquired the
+            # outer flock -x <lane_dir>.lock and is now blocking on release.
+            thin_rc = await git_ops._run_thin_warm_lane(lane)
+
+            assert thin_rc == 75, (
+                'a concurrent _run_thin_warm_lane must exit 75 (benign skip) '
+                'while _seed_warm_lane genuinely holds <lane_dir>.lock — the '
+                'two sides must contend on the SAME lock file'
+            )
+
+            seed_release.touch()
+
+            seed_rc = await asyncio.wait_for(seed_task, 10)
+            assert seed_rc == 0, (
+                f'_seed_warm_lane must complete successfully once released, '
+                f'got rc={seed_rc!r}'
+            )
+        finally:
+            seed_release.touch()  # idempotent unblock in case of failure above
+            if not seed_task.done():
+                with contextlib.suppress(Exception):
+                    await asyncio.wait_for(seed_task, 10)
