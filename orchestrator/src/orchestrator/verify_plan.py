@@ -389,6 +389,14 @@ def _derive_fallback_runs(
     does not depend on subproject rescoping, so ``plan`` remains a reliable
     record of *why* a decision was made, but not always of *where*/*how* it
     ran for a subproject-shaped fallback diff.
+
+    This caveat describes THIS function's raw return value only. Its caller
+    in :func:`run_scoped_verification` reconciles this gap before attaching
+    anything to ``VerifyResult.plan``: it folds ``_build_fallback_config``'s
+    already-executed ``ModuleConfig`` back onto this decision via
+    :func:`_executed_fallback_plan`, so the record a consumer of
+    ``VerifyResult.plan`` actually sees reflects *where*/*how* it ran too —
+    see :func:`derive_verify_plan`'s own "Fidelity" docstring paragraph.
     """
     py_files = [f for f in existing_files if f.endswith('.py')]
     if not py_files:
@@ -568,23 +576,25 @@ def derive_verify_plan(
     ``'__fallback__'`` module is derived from *config*'s global commands via
     :func:`_derive_fallback_runs`.
 
-    Fidelity: for the module-config branch, this plan is no longer just a
-    decision record (task κ, verify-scope-inversion-prd.md) — the caller
-    (:func:`run_scoped_verification`) derives it once and EXECUTES it
-    directly (see :func:`_executed_module_configs_from_plan`), so the
-    attached ``VerifyResult.plan`` faithfully records what ran on that path.
-    The fallback branch (*module_configs* empty) remains a decision record,
-    not an execution trace: it is independently derived from
-    *existing_files* / *config*, not read back from what
-    ``_build_fallback_config`` actually executes, so one known gap can still
-    make the returned :class:`VerifyPlan` diverge from what ran there — the
-    fallback branch does NOT model the subproject / mixed-root+subproject
+    Fidelity: this plan is no longer just a decision record on either branch
+    (task κ, verify-scope-inversion-prd.md) — by the time it reaches
+    ``VerifyResult.plan``, both faithfully record what ran. For the
+    module-config branch, the caller (:func:`run_scoped_verification`)
+    derives this plan once and EXECUTES it directly (see
+    :func:`_executed_module_configs_from_plan`). For the fallback branch
+    (*module_configs* empty), THIS function's raw return value is still just
+    an idealized D1/D2 decision record against the flat *existing_files*
+    list — it does NOT model the subproject / mixed-root+subproject
     rescoping that ``_build_fallback_config`` applies (see
-    :func:`_derive_fallback_runs`'s docstring) — a diff landing in a real
-    subproject executes ``cd <sub> && ...`` while the plan still records a
-    flat ``'__fallback__'`` run. Callers that need a faithful record of what
-    ran on the fallback path, not just why, should treat the attached
-    ``VerifyResult.plan`` accordingly.
+    :func:`_derive_fallback_runs`'s "Fidelity caveat" docstring paragraph for
+    exactly what it omits) — but the caller folds
+    ``_build_fallback_config``'s already-executed ``ModuleConfig`` back onto
+    this plan via :func:`_executed_fallback_plan` before attaching it to
+    ``VerifyResult.plan``, so the ATTACHED record reflects the actual
+    subproject/rescoped command that ran, not the idealized flat
+    ``'__fallback__'`` decision alone. A caller consuming THIS function's
+    fallback-branch return value directly, bypassing that reconciliation,
+    still gets only the decision, not the execution trace.
     """
     if not _has_source_files(existing_files):
         return VerifyPlan(

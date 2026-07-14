@@ -2058,16 +2058,19 @@ class VerifyResult:
     # without reconstructing it. None when no plan was derived (default /
     # back-compat / _trivial_pass and other non-planned results).
     #
-    # Fidelity: on the module-config path (task κ), `plan` IS the plan that
-    # drove execution — derive_verify_plan is derived once and executed
-    # directly (see _executed_module_configs_from_plan) — so it faithfully
-    # records what ran. On the fallback (no-module_configs) path, `plan`
-    # remains an independently-derived decision record (why a scope was
-    # chosen), not yet a trace of exactly what executed — see
-    # derive_verify_plan's docstring ("Fidelity" paragraph) and the
-    # "Fidelity note" comment at this field's fallback call site in
-    # run_scoped_verification for the known gap (subproject/mixed-subproject
-    # rescoping).
+    # Fidelity: `plan` IS the plan that drove execution on BOTH branches
+    # (task κ, verify-scope-inversion-prd.md). On the module-config path,
+    # derive_verify_plan is derived once and executed directly (see
+    # _executed_module_configs_from_plan), so it faithfully records what
+    # ran. On the fallback (no-module_configs) path, the same decision is
+    # derived once and then reconciled against _build_fallback_config's
+    # already-executed ModuleConfig via _executed_fallback_plan (see
+    # _safe_derive_verify_plan_dict and its call site below), so the
+    # attached record reflects the actual subproject/mixed-subproject
+    # rescoping and OPAQUE-chain first-clause scoping that ran, not the
+    # idealized flat '__fallback__' decision alone — see
+    # derive_verify_plan's docstring ("Fidelity" paragraph) for what its raw,
+    # unreconciled return value alone still omits.
     plan: dict | None = None
     # Wall-clock verify cost.  For a single-module run: max(test, lint, type)
     # when the three commands ran concurrently (asyncio.gather), or their sum
