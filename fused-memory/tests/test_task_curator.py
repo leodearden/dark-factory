@@ -5796,3 +5796,55 @@ class TestCuratorPromptSplit:
             assert resolved.text == compose_prompt(spec.contract, malicious)
             assert resolved.text.startswith(spec.contract)
 
+
+# ----------------------------------------------------------------------
+# Prompt-loader wiring — single-call path (task 2494 step-3/step-4)
+# ----------------------------------------------------------------------
+
+
+class TestCuratorPromptLoaderWiringSingle:
+    """RED until TaskCurator accepts a ``prompt_store`` kwarg and ``_call_llm``
+    resolves ``CURATOR_SINGLE_SPEC`` through it instead of the static
+    ``_SYSTEM_PROMPT`` constant.
+    """
+
+    @pytest.mark.asyncio
+    async def test_call_llm_resolves_via_loader_unpinned_then_pinned(self, tmp_path):
+        config = _make_config()
+        store = PromptArtifactStore(tmp_path)
+        curator = TaskCurator(config=config, taskmaster=None, prompt_store=store)
+
+        pool_sizes = {'anchor': 0, 'module': 0, 'embedding': 0, 'dependency': 0}
+        result = AgentResult(
+            success=True, output='',
+            structured_output={'action': 'create', 'justification': 'x'},
+        )
+        mock = AsyncMock(return_value=result)
+
+        # Nothing pinned yet: the loader must fall back to the in-code baseline.
+        with patch('fused_memory.middleware.task_curator.invoke_with_cap_retry', new=mock):
+            await curator._call_llm(
+                CandidateTask(title='T'), pool=[], pool_sizes=pool_sizes,
+                start=0.0, project_id='p', project_root='/x',
+            )
+        assert mock.await_args.kwargs['system_prompt'] == CURATOR_SINGLE_SPEC.in_code_constant
+
+        # Pin a heuristics override for this exact (prompt_id, model, harness) key.
+        heuristics = 'PINNED: prefer combining aggressively when in doubt.'
+        provenance = ArtifactProvenance(
+            **_prompt_artifact_provenance_kwargs(harness_version=_CURATOR_PROMPT_HARNESS_VERSION)
+        )
+        store.pin(
+            'curator_single', config.curator.model, _CURATOR_PROMPT_HARNESS_VERSION,
+            heuristics=heuristics, provenance=provenance,
+        )
+
+        with patch('fused_memory.middleware.task_curator.invoke_with_cap_retry', new=mock):
+            await curator._call_llm(
+                CandidateTask(title='T'), pool=[], pool_sizes=pool_sizes,
+                start=0.0, project_id='p', project_root='/x',
+            )
+        assert mock.await_args.kwargs['system_prompt'] == compose_prompt(
+            CURATOR_SINGLE_SPEC.contract, heuristics,
+        )
+
