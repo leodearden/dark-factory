@@ -208,3 +208,150 @@ class TestRunnerScriptKind:
 
         assert called, 'the injected runner must actually be invoked'
         assert result is DeliveredCheckResult.ERRORED
+
+
+# ---------------------------------------------------------------------------
+# TestDepsSatisfiedDeliveredGate (task 2580 — step-5 RED / step-6 GREEN)
+# ---------------------------------------------------------------------------
+
+
+class TestDepsSatisfiedDeliveredGate:
+    """Unit tests for the ``delivered_check_cache`` boolean gate added to
+    ``Scheduler._deps_satisfied``.  Mirrors ``TestDepsSatisfiedExternalGate``
+    (test_scheduler.py): the gate is PURE (no side effects, no escalation
+    calls).  It is opt-in — passing delivered_check_cache=None (the
+    default) reproduces byte-identical legacy behaviour, and it is only
+    consulted for a TERMINAL local dep whose ``tasks_by_id`` record carries
+    a truthy ``metadata.delivered_checks``.
+    """
+
+    @pytest.fixture
+    def scheduler(self) -> Scheduler:
+        config = OrchestratorConfig(max_per_module=1)
+        scheduler = Scheduler(config)
+        scheduler.finish_startup()
+        return scheduler
+
+    _CHECKS = [{'name': 'cap-one', 'kind': 'grep', 'pattern': 'foo', 'expect': 'present'}]
+
+    def _dependent(self, dep_id: str = '20') -> dict:
+        return {
+            'id': '10',
+            'status': 'pending',
+            'dependencies': [{'id': dep_id}],
+            'metadata': {},
+        }
+
+    def _dep(self, dep_id: str = '20', status: str = 'done', with_checks: bool = True) -> dict:
+        metadata = {'delivered_checks': self._CHECKS} if with_checks else {}
+        return {'id': dep_id, 'status': status, 'dependencies': [], 'metadata': metadata}
+
+    # --- delivered_check_cache unset (default None) → byte-identical -------
+
+    def test_default_none_byte_identical_done_dep_with_checks(self, scheduler: Scheduler):
+        """Cache unset (default None): a done dep with checks is satisfied
+        purely off status, exactly like legacy behaviour — the arm never
+        even looks at metadata.delivered_checks."""
+        task = self._dependent()
+        dep = self._dep(status='done')
+        status_map = {'20': 'done'}
+        tasks_by_id = {'20': dep}
+        assert scheduler._deps_satisfied(task, status_map, tasks_by_id) is True
+
+    # --- row 3 (predicate): done dep, cache True → satisfied ---------------
+
+    def test_done_dep_checks_cached_true_satisfied(self, scheduler: Scheduler):
+        task = self._dependent()
+        dep = self._dep(status='done')
+        status_map = {'20': 'done'}
+        tasks_by_id = {'20': dep}
+        assert (
+            scheduler._deps_satisfied(
+                task, status_map, tasks_by_id, delivered_check_cache={'20': True}
+            )
+            is True
+        )
+
+    # --- row 4 (predicate): done dep, cache False → NOT satisfied ----------
+
+    def test_done_dep_checks_cached_false_not_satisfied(self, scheduler: Scheduler):
+        task = self._dependent()
+        dep = self._dep(status='done')
+        status_map = {'20': 'done'}
+        tasks_by_id = {'20': dep}
+        assert (
+            scheduler._deps_satisfied(
+                task, status_map, tasks_by_id, delivered_check_cache={'20': False}
+            )
+            is False
+        )
+
+    # --- row 7 (predicate): dep absent from cache → NOT satisfied ----------
+
+    def test_done_dep_checks_absent_from_cache_not_satisfied(self, scheduler: Scheduler):
+        """A dep carrying checks but absent from the cache (errored /
+        over-budget / not yet evaluated) is NOT satisfied — fail-safe wait."""
+        task = self._dependent()
+        dep = self._dep(status='done')
+        status_map = {'20': 'done'}
+        tasks_by_id = {'20': dep}
+        assert (
+            scheduler._deps_satisfied(task, status_map, tasks_by_id, delivered_check_cache={})
+            is False
+        )
+
+    # --- row 10 (predicate half): cancelled dep with checks — trusts main --
+
+    def test_cancelled_dep_checks_cached_false_not_satisfied(self, scheduler: Scheduler):
+        """A cancelled dep still carrying checks is gated exactly like a
+        done one — the predicate trusts main, not the status label."""
+        task = self._dependent()
+        dep = self._dep(status='cancelled')
+        status_map = {'20': 'cancelled'}
+        tasks_by_id = {'20': dep}
+        assert (
+            scheduler._deps_satisfied(
+                task, status_map, tasks_by_id, delivered_check_cache={'20': False}
+            )
+            is False
+        )
+
+    def test_cancelled_dep_checks_cached_true_satisfied(self, scheduler: Scheduler):
+        task = self._dependent()
+        dep = self._dep(status='cancelled')
+        status_map = {'20': 'cancelled'}
+        tasks_by_id = {'20': dep}
+        assert (
+            scheduler._deps_satisfied(
+                task, status_map, tasks_by_id, delivered_check_cache={'20': True}
+            )
+            is True
+        )
+
+    # --- dep without delivered_checks metadata: never consulted ------------
+
+    def test_done_dep_without_checks_not_consulted(self, scheduler: Scheduler):
+        task = self._dependent()
+        dep = self._dep(status='done', with_checks=False)
+        status_map = {'20': 'done'}
+        tasks_by_id = {'20': dep}
+        # Cache is non-empty but doesn't even mention '20' — since the dep
+        # carries no delivered_checks metadata it must never be consulted.
+        assert (
+            scheduler._deps_satisfied(
+                task, status_map, tasks_by_id, delivered_check_cache={'other': False}
+            )
+            is True
+        )
+
+    # --- tasks_by_id=None → arm disabled (byte-identical) -------------------
+
+    def test_tasks_by_id_none_arm_disabled(self, scheduler: Scheduler):
+        task = self._dependent()
+        status_map = {'20': 'done'}
+        assert (
+            scheduler._deps_satisfied(
+                task, status_map, None, delivered_check_cache={'20': False}
+            )
+            is True
+        )
