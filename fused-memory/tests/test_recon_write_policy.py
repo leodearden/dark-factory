@@ -145,11 +145,15 @@ class TestCheckGate1Terminal:
         assert verdict.error_type != 'ReconTerminalWriteRejected'
 
     def test_terminal_rejection_on_done_populates_corrective_path(self):
+        """Bound to the source-of-truth TERMINAL_CORRECTIVE_PATH constant
+        (rather than a repeated literal) so an accidental change to its
+        value is caught here. The sibling cancelled-task test below keeps
+        one explicit literal pin to lock the on-the-wire value."""
         verdict = _check('update_task', live_status='done')
-        assert verdict.corrective_path == 'set_task_status_done_provenance_repair'
+        assert verdict.corrective_path == recon_write_policy.TERMINAL_CORRECTIVE_PATH
         assert (
             verdict.to_error_dict()['corrective_path']
-            == 'set_task_status_done_provenance_repair'
+            == recon_write_policy.TERMINAL_CORRECTIVE_PATH
         )
 
     def test_terminal_rejection_on_cancelled_populates_corrective_path(self):
