@@ -120,6 +120,7 @@ class TestBackgroundServiceStart:
         first_task = svc._task
         svc.start()
 
+        assert first_task is not None
         assert svc._task is first_task
 
         blocker.set()
@@ -138,6 +139,7 @@ class TestBackgroundServiceStart:
 
         svc.start()
         first_task = svc._task
+        assert first_task is not None
         first_task.cancel()
         with contextlib.suppress(asyncio.CancelledError):
             await first_task

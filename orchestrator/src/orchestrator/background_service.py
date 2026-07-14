@@ -9,8 +9,10 @@ becomes structurally impossible.
 
 from __future__ import annotations
 
+import asyncio
 import logging
-from dataclasses import dataclass
+from collections.abc import Awaitable, Callable
+from dataclasses import dataclass, field
 
 logger = logging.getLogger(__name__)
 
@@ -38,3 +40,39 @@ class BackoffPolicy:
     def delay_for(self, attempt: int) -> float:
         del attempt  # constant policy: same delay regardless of attempt
         return self.delay_secs
+
+
+@dataclass
+class BackgroundService:
+    """A named, periodic, sleep-first background loop with a bounded stop.
+
+    PRD §5.3: the uniform seam for the seven harness sweeps that share the
+    identical ``while True: sleep(interval); await pass(); ...`` shape
+    (hoisted verbatim from ``_no_landings_breaker_loop`` /
+    ``_warm_lane_gc_loop`` — see harness.py). ``start()``/``stop()`` are
+    idempotent; ``stop_timeout_secs`` is read by ``LifecycleRegistry.stop_all``
+    to bound how long a wedging service may delay shutdown (LR-2).
+    """
+
+    name: str
+    pass_fn: Callable[[], Awaitable[None]]
+    interval_secs: float
+    backoff: BackoffPolicy
+    stop_timeout_secs: float
+    max_failure_logs: int
+    _task: asyncio.Task | None = field(default=None, init=False, repr=False)
+    _consecutive_failures: int = field(default=0, init=False, repr=False)
+
+    def start(self) -> None:
+        """Start the loop task, deduping against an already-live task."""
+        if self._task is not None and not self._task.done():
+            return
+        self._task = asyncio.create_task(self._loop(), name=self.name)
+
+    async def _loop(self) -> None:
+        """Run the pass once.
+
+        Stub sufficient for start() idempotency (step-3): the canonical
+        sleep-first / exception-bounded loop body lands in step-6.
+        """
+        await self.pass_fn()
