@@ -5543,6 +5543,16 @@ class TestPruneOrphans:
 # _CURATOR_HEURISTICS change later. It serves as the parity oracle: every
 # stripped non-empty line here must still appear somewhere in
 # CURATOR_SINGLE_SPEC.in_code_constant (see TestCuratorPromptSplit).
+#
+# This is a one-time refactor safety net scoped to task 2494's split, not a
+# living contract test — its only unique coverage over the structure/
+# partition tests below is "no instruction line was dropped" during THIS
+# refactor. Once the split has landed and stabilized, delete this constant,
+# _PRE_REFACTOR_BATCH_SYSTEM_PROMPT below, and the two superset tests that
+# consume them (test_single_in_code_constant_is_superset_of_pre_refactor_prompt
+# / test_batch_in_code_constant_is_superset_of_pre_refactor_batch_prompt) —
+# see task 2605 (filed for that cleanup). Do not extend this snapshot to
+# track later prompt edits.
 _PRE_REFACTOR_SYSTEM_PROMPT = """\
 You are the task curator for the dark-factory orchestrator. For each candidate \
 task a reviewer or agent wants to create, you decide ONE of three actions:
@@ -5745,8 +5755,19 @@ class TestCuratorPromptSplit:
             assert landmark not in heuristics, f'{landmark!r} leaked into heuristics'
 
     # -- (c) parity: content-preservation vs the frozen pre-refactor prompts --
+    #
+    # NOTE — these two tests assert a stripped-nonempty-LINE-SET superset only.
+    # That proves no instruction line was dropped by the split; it deliberately
+    # does NOT assert (and cannot detect) section order, so it is blind to
+    # compose_prompt()'s CONTRACT-then-HEURISTICS reordering and the "---"
+    # separator it injects (see the module header comment above _CURATOR_CONTRACT
+    # for what actually changed). It also cannot catch a line moving between
+    # contract and heuristics as long as it still appears somewhere in the
+    # composed text — that partition is covered separately by the (b) structure
+    # tests above, which pin each landmark to its correct side of the split.
 
     def test_single_in_code_constant_is_superset_of_pre_refactor_prompt(self):
+        """Content-preservation only: no assertion on order, dedup, or separators."""
         pre_lines = {
             line.strip() for line in _PRE_REFACTOR_SYSTEM_PROMPT.splitlines() if line.strip()
         }
@@ -5759,6 +5780,7 @@ class TestCuratorPromptSplit:
         assert not missing, f'instructions dropped by the split: {missing}'
 
     def test_batch_in_code_constant_is_superset_of_pre_refactor_batch_prompt(self):
+        """Content-preservation only: no assertion on order, dedup, or separators."""
         pre_lines = {
             line.strip()
             for line in _PRE_REFACTOR_BATCH_SYSTEM_PROMPT.splitlines()
