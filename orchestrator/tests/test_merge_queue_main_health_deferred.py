@@ -36,9 +36,11 @@ from orchestrator.event_store import EventStore
 from orchestrator.merge_queue import (
     MAIN_HEALTH_RED_REASON_PREFIX,
     MergeOutcome,
+    OutcomeKind,
     RealMergeItem,
     SpeculativeMergeWorker,
     _build_main_health_outcome,
+    _emit_merge_attempt,
     _main_health_fingerprint,
     _MainHealthProbeHandles,
     _run_deferred_main_health_probe,
@@ -243,6 +245,170 @@ class TestNoneHandlesSpawnsNothing:
             f'main_health_probe_handles=None must spawn nothing; '
             f'asyncio.create_task called {create_task_spy.call_count} time(s)'
         )
+
+
+# ---------------------------------------------------------------------------
+# Task 2565 step-5 (RED): _spawn_main_health_probe must forward
+# origin_is_local into the spawned _run_deferred_main_health_probe
+# coroutine, defaulting to True (local) when the caller omits it — so a
+# future _run_post_merge_verify caller's HOST-AFFINITY signal actually
+# reaches the probe. Fails today: origin_is_local is an unknown kwarg of
+# _spawn_main_health_probe (TypeError).
+# ---------------------------------------------------------------------------
+
+
+class TestSpawnForwardsOriginIsLocal:
+    """_spawn_main_health_probe must forward its origin_is_local kwarg into
+    the spawned _run_deferred_main_health_probe coroutine (task 2565)."""
+
+    def test_forwards_explicit_origin_is_local_false(
+        self, tmp_path: Path,
+    ) -> None:
+        config = _make_config(tmp_path, escalate_preexisting=True)
+        git_ops = _make_git_ops(tmp_path)
+        req = _make_req('42', tmp_path / 'task-wt', config)
+        (tmp_path / 'task-wt').mkdir()
+
+        spy = AsyncMock(return_value=None)
+
+        async def _run() -> None:
+            handles = _MainHealthProbeHandles(background_tasks=set())
+            with patch(
+                'orchestrator.merge_queue._run_deferred_main_health_probe',
+                new=spy,
+            ):
+                _spawn_main_health_probe(
+                    handles, git_ops, req, COMPILE_ERROR_RESULT,
+                    origin_is_local=False,
+                )
+                pending = set(handles.background_tasks)
+                for t in pending:
+                    await t
+
+        asyncio.run(_run())
+
+        assert spy.call_count == 1
+        kwargs = spy.call_args.kwargs
+        assert kwargs.get('origin_is_local') is False, f'kwargs={kwargs}'
+
+    def test_defaults_to_origin_is_local_true_when_omitted(
+        self, tmp_path: Path,
+    ) -> None:
+        config = _make_config(tmp_path, escalate_preexisting=True)
+        git_ops = _make_git_ops(tmp_path)
+        req = _make_req('42', tmp_path / 'task-wt', config)
+        (tmp_path / 'task-wt').mkdir()
+
+        spy = AsyncMock(return_value=None)
+
+        async def _run() -> None:
+            handles = _MainHealthProbeHandles(background_tasks=set())
+            with patch(
+                'orchestrator.merge_queue._run_deferred_main_health_probe',
+                new=spy,
+            ):
+                _spawn_main_health_probe(
+                    handles, git_ops, req, COMPILE_ERROR_RESULT,
+                )
+                pending = set(handles.background_tasks)
+                for t in pending:
+                    await t
+
+        asyncio.run(_run())
+
+        assert spy.call_count == 1
+        kwargs = spy.call_args.kwargs
+        assert kwargs.get('origin_is_local') is True, f'kwargs={kwargs}'
+
+
+# ---------------------------------------------------------------------------
+# Task 2565 step-7 (RED): _run_post_merge_verify must derive origin_is_local
+# from the `runner` it receives and forward it into _spawn_main_health_probe
+# on the DEFERRED path — a REMOTE runner (is_local=False) means
+# origin_is_local=False; runner=None (local) means origin_is_local=True.
+# Fails today: the call site passes no origin_is_local kwarg.
+# ---------------------------------------------------------------------------
+
+
+class TestRunPostMergeVerifyDerivesOriginIsLocal:
+    """_run_post_merge_verify must derive origin_is_local from `runner` and
+    forward it into _spawn_main_health_probe on the DEFERRED path (task 2565)."""
+
+    def test_remote_runner_derives_origin_is_local_false(
+        self, tmp_path: Path,
+    ) -> None:
+        config = _make_config(tmp_path, escalate_preexisting=True)
+        git_ops = _make_git_ops(tmp_path)
+        merge_wt = tmp_path / 'merge-wt'
+        merge_wt.mkdir()
+        req = _make_req('42', tmp_path / 'task-wt', config)
+        (tmp_path / 'task-wt').mkdir()
+
+        # MagicMock(is_local=False) is a REMOTE runner double.  `.name` is
+        # set post-construction (not via the `name=` constructor kwarg,
+        # which Mock reserves for its own repr) so VerifyRunnerPool's
+        # eligible_remote() quarantine-membership check works.
+        remote_runner = MagicMock(is_local=False)
+        remote_runner.name = 'laptop'
+        remote_runner.run_merge_verify = AsyncMock(return_value=COMPILE_ERROR_RESULT)
+
+        spy = MagicMock(return_value=False)
+
+        async def _run() -> None:
+            handles = _MainHealthProbeHandles(background_tasks=set())
+            with patch('orchestrator.merge_queue._spawn_main_health_probe', new=spy):
+                await _run_post_merge_verify(
+                    git_ops, req, merge_wt,
+                    timeouts={},
+                    enospc_retries={},
+                    max_timeouts=3,
+                    max_enospc=1,
+                    main_health_probe_handles=handles,
+                    runner=remote_runner,
+                )
+
+        asyncio.run(_run())
+
+        assert spy.call_count == 1
+        kwargs = spy.call_args.kwargs
+        assert kwargs.get('origin_is_local') is False, f'kwargs={kwargs}'
+
+    def test_none_runner_derives_origin_is_local_true(
+        self, tmp_path: Path,
+    ) -> None:
+        config = _make_config(tmp_path, escalate_preexisting=True)
+        git_ops = _make_git_ops(tmp_path)
+        merge_wt = tmp_path / 'merge-wt'
+        merge_wt.mkdir()
+        req = _make_req('42', tmp_path / 'task-wt', config)
+        (tmp_path / 'task-wt').mkdir()
+
+        spy = MagicMock(return_value=False)
+
+        async def _run() -> None:
+            handles = _MainHealthProbeHandles(background_tasks=set())
+            with (
+                patch(
+                    'orchestrator.merge_queue.run_scoped_verification',
+                    new=AsyncMock(return_value=COMPILE_ERROR_RESULT),
+                ),
+                patch('orchestrator.merge_queue._spawn_main_health_probe', new=spy),
+            ):
+                await _run_post_merge_verify(
+                    git_ops, req, merge_wt,
+                    timeouts={},
+                    enospc_retries={},
+                    max_timeouts=3,
+                    max_enospc=1,
+                    main_health_probe_handles=handles,
+                    runner=None,
+                )
+
+        asyncio.run(_run())
+
+        assert spy.call_count == 1
+        kwargs = spy.call_args.kwargs
+        assert kwargs.get('origin_is_local') is True, f'kwargs={kwargs}'
 
 
 # ---------------------------------------------------------------------------
@@ -1135,4 +1301,230 @@ class TestDeferredProbeRoutesToAutoHeal:
         assert escalation_queue.get_pending() == [], (
             'A stale-main probe verdict must file no escalation and must '
             'not invoke auto_heal'
+        )
+
+
+# ---------------------------------------------------------------------------
+# Task 2565 step-1 (RED): _emit_merge_attempt origin_host/probe_host —
+# direct-emit unit test, mirroring test_merge_attempt_disposition.py's
+# independent proof of the `disposition` opt-in payload key. Proves the
+# HOST-AFFINITY placement decision (task 2565) is RECORDED in the
+# main_health_red merge-attempt telemetry as its own unit, independent of
+# the probe-chain threading proven by the steps below. Fails today with an
+# unexpected-keyword-argument TypeError — origin_host/probe_host are not
+# yet params of _emit_merge_attempt.
+# ---------------------------------------------------------------------------
+
+
+class TestEmitMergeAttemptOriginProbeHost:
+    """Unit tests for the optional origin_host/probe_host kwargs of
+    _emit_merge_attempt (task 2565)."""
+
+    def test_origin_and_probe_host_persisted_when_provided(self) -> None:
+        store = MagicMock(spec=EventStore)
+
+        _emit_merge_attempt(
+            store, 'T1', OutcomeKind.main_health_red,
+            origin_host='remote', probe_host='local',
+        )
+
+        assert store.emit.call_count == 1
+        data = store.emit.call_args.kwargs['data']
+        assert data['origin_host'] == 'remote', f'data={data}'
+        assert data['probe_host'] == 'local', f'data={data}'
+        assert data['outcome'] == OutcomeKind.main_health_red, f'data={data}'
+
+    def test_origin_and_probe_host_absent_when_not_supplied(self) -> None:
+        store = MagicMock(spec=EventStore)
+
+        _emit_merge_attempt(store, 'T2', OutcomeKind.main_health_red)
+
+        assert store.emit.call_count == 1
+        data = store.emit.call_args.kwargs['data']
+        assert 'origin_host' not in data, f'data={data}'
+        assert 'probe_host' not in data, f'data={data}'
+
+
+# ---------------------------------------------------------------------------
+# Task 2565 step-3 (RED): origin_is_local threading through
+# _run_deferred_main_health_probe. On a confirmed still-fresh break, the
+# HOST-AFFINITY placement decision must be RECORDED (origin_host/probe_host)
+# in the main_health_red signal; negative/stale/raising probes must still
+# emit no main_health_red event at all, regardless of origin_is_local.
+# Fails today: origin_is_local is an unknown kwarg of
+# _run_deferred_main_health_probe (TypeError) for every case below.
+# ---------------------------------------------------------------------------
+
+
+class TestDeferredProbeOriginHostTelemetry:
+    """origin_is_local must be recorded as origin_host/probe_host on the
+    main_health_red signal (task 2565) — proven independently of
+    TestEmitMergeAttemptOriginProbeHost's direct-emit unit, this time
+    through the real probe-chain threading."""
+
+    def test_confirmed_break_remote_origin_records_remote_local(
+        self, tmp_path: Path,
+    ) -> None:
+        config = _make_config(tmp_path, escalate_preexisting=True)
+        git_ops = _make_git_ops(tmp_path)  # get_main_sha AsyncMock -> MAIN_SHA
+        req = _make_req('99', tmp_path / 'task-wt', config)
+        (tmp_path / 'task-wt').mkdir()
+
+        event_store = MagicMock(spec=EventStore)
+        escalation_queue = EscalationQueue(tmp_path / 'escalations')
+
+        async def _run() -> None:
+            with patch(
+                'orchestrator.merge_queue.verify_failure_is_preexisting_on_main',
+                new=AsyncMock(return_value=(True, MAIN_SHA)),
+            ):
+                await _run_deferred_main_health_probe(
+                    git_ops, req, COMPILE_ERROR_RESULT,
+                    escalation_queue=escalation_queue, event_store=event_store,
+                    origin_is_local=False,
+                )
+
+        asyncio.run(_run())
+
+        calls = event_store.emit.call_args_list
+        main_health_calls = [
+            c for c in calls
+            if c.kwargs.get('data', {}).get('outcome') == 'main_health_red'
+        ]
+        assert len(main_health_calls) == 1, (
+            f'Expected exactly one main_health_red event; got {calls}'
+        )
+        data = main_health_calls[0].kwargs['data']
+        assert data.get('origin_host') == 'remote', f'data={data}'
+        assert data.get('probe_host') == 'local', f'data={data}'
+
+    def test_confirmed_break_local_origin_records_local_local(
+        self, tmp_path: Path,
+    ) -> None:
+        config = _make_config(tmp_path, escalate_preexisting=True)
+        git_ops = _make_git_ops(tmp_path)  # get_main_sha AsyncMock -> MAIN_SHA
+        req = _make_req('99', tmp_path / 'task-wt', config)
+        (tmp_path / 'task-wt').mkdir()
+
+        event_store = MagicMock(spec=EventStore)
+        escalation_queue = EscalationQueue(tmp_path / 'escalations')
+
+        async def _run() -> None:
+            with patch(
+                'orchestrator.merge_queue.verify_failure_is_preexisting_on_main',
+                new=AsyncMock(return_value=(True, MAIN_SHA)),
+            ):
+                await _run_deferred_main_health_probe(
+                    git_ops, req, COMPILE_ERROR_RESULT,
+                    escalation_queue=escalation_queue, event_store=event_store,
+                    origin_is_local=True,
+                )
+
+        asyncio.run(_run())
+
+        calls = event_store.emit.call_args_list
+        main_health_calls = [
+            c for c in calls
+            if c.kwargs.get('data', {}).get('outcome') == 'main_health_red'
+        ]
+        assert len(main_health_calls) == 1, (
+            f'Expected exactly one main_health_red event; got {calls}'
+        )
+        data = main_health_calls[0].kwargs['data']
+        assert data.get('origin_host') == 'local', f'data={data}'
+        assert data.get('probe_host') == 'local', f'data={data}'
+
+    @pytest.mark.parametrize('origin_is_local', [True, False])
+    def test_negative_probe_emits_no_main_health_event(
+        self, tmp_path: Path, origin_is_local: bool,
+    ) -> None:
+        config = _make_config(tmp_path, escalate_preexisting=True)
+        git_ops = _make_git_ops(tmp_path)
+        req = _make_req('99', tmp_path / 'task-wt', config)
+        (tmp_path / 'task-wt').mkdir()
+        event_store = MagicMock(spec=EventStore)
+        escalation_queue = EscalationQueue(tmp_path / 'escalations')
+
+        async def _run() -> None:
+            with patch(
+                'orchestrator.merge_queue.verify_failure_is_preexisting_on_main',
+                new=AsyncMock(return_value=(False, '')),
+            ):
+                await _run_deferred_main_health_probe(
+                    git_ops, req, COMPILE_ERROR_RESULT,
+                    escalation_queue=escalation_queue, event_store=event_store,
+                    origin_is_local=origin_is_local,
+                )
+
+        asyncio.run(_run())
+        calls = event_store.emit.call_args_list
+        main_health_calls = [
+            c for c in calls
+            if c.kwargs.get('data', {}).get('outcome') == 'main_health_red'
+        ]
+        assert main_health_calls == [], (
+            f'A negative probe must emit no main_health_red event; got {calls}'
+        )
+
+    def test_raising_probe_emits_no_main_health_event(
+        self, tmp_path: Path,
+    ) -> None:
+        config = _make_config(tmp_path, escalate_preexisting=True)
+        git_ops = _make_git_ops(tmp_path)
+        req = _make_req('99', tmp_path / 'task-wt', config)
+        (tmp_path / 'task-wt').mkdir()
+        event_store = MagicMock(spec=EventStore)
+        escalation_queue = EscalationQueue(tmp_path / 'escalations')
+
+        async def _run() -> None:
+            with patch(
+                'orchestrator.merge_queue.verify_failure_is_preexisting_on_main',
+                new=AsyncMock(side_effect=RuntimeError('boom')),
+            ):
+                await _run_deferred_main_health_probe(
+                    git_ops, req, COMPILE_ERROR_RESULT,
+                    escalation_queue=escalation_queue, event_store=event_store,
+                    origin_is_local=False,
+                )
+
+        asyncio.run(_run())  # must not raise
+        calls = event_store.emit.call_args_list
+        main_health_calls = [
+            c for c in calls
+            if c.kwargs.get('data', {}).get('outcome') == 'main_health_red'
+        ]
+        assert main_health_calls == [], (
+            f'A raising probe must emit no main_health_red event; got {calls}'
+        )
+
+    def test_stale_main_emits_no_main_health_event(
+        self, tmp_path: Path,
+    ) -> None:
+        config = _make_config(tmp_path, escalate_preexisting=True)
+        git_ops = _make_git_ops(tmp_path)  # get_main_sha AsyncMock -> MAIN_SHA
+        req = _make_req('99', tmp_path / 'task-wt', config)
+        (tmp_path / 'task-wt').mkdir()
+        event_store = MagicMock(spec=EventStore)
+        escalation_queue = EscalationQueue(tmp_path / 'escalations')
+
+        async def _run() -> None:
+            with patch(
+                'orchestrator.merge_queue.verify_failure_is_preexisting_on_main',
+                new=AsyncMock(return_value=(True, STALE_PROBE_SHA)),
+            ):
+                await _run_deferred_main_health_probe(
+                    git_ops, req, COMPILE_ERROR_RESULT,
+                    escalation_queue=escalation_queue, event_store=event_store,
+                    origin_is_local=False,
+                )
+
+        asyncio.run(_run())
+        calls = event_store.emit.call_args_list
+        main_health_calls = [
+            c for c in calls
+            if c.kwargs.get('data', {}).get('outcome') == 'main_health_red'
+        ]
+        assert main_health_calls == [], (
+            f'A stale-main probe verdict must emit no main_health_red event; '
+            f'got {calls}'
         )

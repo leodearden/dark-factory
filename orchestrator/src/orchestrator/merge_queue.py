@@ -1209,8 +1209,32 @@ async def _run_deferred_main_health_probe(
     escalation_queue: Any = None,
     event_store: EventStore | None = None,
     auto_heal: Callable[[MergeOutcome, MergeRequest], Awaitable[None]] | None = None,
+    origin_is_local: bool = True,
 ) -> None:
     """Off-critical-path main-health classification (task 2564).
+
+    LEASE-SAFETY & HOST-AFFINITY (task 2565): this probe is a leaseless,
+    local-only detective classifier.  It verifies via the local
+    ``_mainprobe-`` ephemeral worktree and ``run_scoped_verification`` —
+    never :class:`~orchestrator.verify_runner.HostAllocator`,
+    :class:`~orchestrator.verify_runner.RemoteRunner`, or
+    :class:`~orchestrator.verify_runner.HostLease` — so it never acquires
+    or holds a merge host slot.  *origin_is_local* RECORDS, but does not
+    STEER, where the triggering post-merge verify ran (derived by the
+    caller from the ``runner`` :func:`_run_post_merge_verify` received:
+    ``None``/local-lease is local, ``RemoteRunner.is_local=False`` is
+    remote — defaults to ``True`` so any caller not yet threading this
+    value is treated as local); the probe itself ALWAYS runs locally
+    regardless of *origin_is_local*.  Remote-affinity (probing on the
+    failing verify's origin host) is deliberately rejected: the probe's
+    verdict drives a queue-halting born-at-L2 escalation and a "fix main"
+    auto-heal, a correctness-critical global decision that must answer "is
+    main broken on the trust anchor?" — reproducing a host-specific
+    toolchain/env/flock/disk quirk from a remote host onto that same host's
+    main would falsely conclude main is red, and would re-introduce the
+    remote-lease / orphaned-remote-build hazards task 1757's
+    ``_abort_remote_verify`` teardown exists to avoid.  See
+    :func:`verify_failure_is_preexisting_on_main` for the full contract.
 
     Spawned by :func:`_spawn_main_health_probe` as a DETACHED task with no
     awaiter, so every externally-visible effect must come from what this
@@ -1256,8 +1280,13 @@ async def _run_deferred_main_health_probe(
     On a confirmed, still-fresh pre-existing break: builds the outcome via
     :func:`_build_main_health_outcome` and emits the ``main_health_red``
     merge-attempt signal (task 2564 step-22: BEFORE the branch below, so the
-    signal fires whichever branch is taken).  Then, if *auto_heal* is
-    supplied, routes the outcome to it (``await auto_heal(outcome, req)``)
+    signal fires whichever branch is taken), recording *origin_is_local* as
+    the ``origin_host``/``probe_host`` telemetry pair (task 2565 —
+    ``probe_host`` is always ``'local'``; see the LEASE-SAFETY &
+    HOST-AFFINITY note above) so the deliberate local-only placement
+    decision is OBSERVABLE even when the triggering verify ran remote.
+    Then, if *auto_heal* is supplied, routes the outcome to it
+    (``await auto_heal(outcome, req)``)
     INSTEAD of filing an escalation directly — the callback owns filing
     (see :func:`SpeculativeMergeWorker._auto_heal_main_health_deferred`,
     which files the halt-owner escalation itself).  Otherwise (the default,
@@ -1304,7 +1333,11 @@ async def _run_deferred_main_health_probe(
         return
 
     outcome = _build_main_health_outcome(verify, probe_sha)
-    _emit_merge_attempt(event_store, req.task_id, OutcomeKind.main_health_red)
+    _emit_merge_attempt(
+        event_store, req.task_id, OutcomeKind.main_health_red,
+        origin_host='local' if origin_is_local else 'remote',
+        probe_host='local',
+    )
     if auto_heal is not None:
         await auto_heal(outcome, req)
     else:
@@ -1390,9 +1423,17 @@ def _spawn_main_health_probe(
     *,
     escalation_queue: Any = None,
     event_store: EventStore | None = None,
+    origin_is_local: bool = True,
 ) -> bool:
     """Fire-and-forget: spawn the deferred (off-critical-path) main-health
     classification for a post-merge-verify failure.
+
+    *origin_is_local* (task 2565) is forwarded unchanged into the spawned
+    :func:`_run_deferred_main_health_probe` coroutine — it only RECORDS
+    where the triggering post-merge verify ran (for the ``origin_host``/
+    ``probe_host`` telemetry pair); the probe itself always classifies
+    locally regardless of this value.  Defaults to ``True`` (local) so
+    every caller not yet threading the signal is treated as local.
 
     None-safe: no-ops when *handles* is ``None`` (mirrors
     :func:`_spawn_merge_verify_dry_run`'s ``handles is None`` guard) — every
@@ -1462,6 +1503,7 @@ def _spawn_main_health_probe(
                 git_ops, req, verify,
                 escalation_queue=escalation_queue, event_store=event_store,
                 auto_heal=handles.auto_heal,
+                origin_is_local=origin_is_local,
             ),
             name=task_name,
         )
@@ -1882,9 +1924,20 @@ async def _run_post_merge_verify(
         # subsequently-confirmed pre-existing main break would leave this
         # task's blocked outcome misattributing the break to the task
         # itself with no signal that a reclassification is in flight.
+        #
+        # HOST-AFFINITY (task 2565): record — but do not steer by — where
+        # the triggering post-merge verify ran.  `runner` is None for a
+        # local lease and a RemoteRunner (is_local=False) for a remote
+        # lease; getattr's True default covers any future runner-like
+        # object that omits is_local.  The probe itself always classifies
+        # locally (it is leaseless and never remote-affine — see
+        # verify_failure_is_preexisting_on_main); this only makes the
+        # placement decision observable in the main_health_red telemetry.
+        origin_is_local = runner is None or getattr(runner, 'is_local', True)
         probe_pending = _spawn_main_health_probe(
             main_health_probe_handles, git_ops, req, verify,
             escalation_queue=escalation_queue, event_store=event_store,
+            origin_is_local=origin_is_local,
         )
         if probe_pending:
             reason = f'{reason}\n\n[{MAIN_HEALTH_PROBE_PENDING_NOTE}]'
@@ -2258,6 +2311,8 @@ def _emit_merge_attempt(
     train_id: str | None = None,
     member_task_ids: list[str] | None = None,
     disposition: MergeFailureDisposition | None = None,
+    origin_host: Literal['local', 'remote'] | None = None,
+    probe_host: Literal['local', 'remote'] | None = None,
 ) -> None:
     """Emit a ``merge_attempt`` event for the given outcome.
 
@@ -2286,6 +2341,18 @@ def _emit_merge_attempt(
     added — existing callers' payloads stay byte-identical. Production
     call sites are threaded by task 2383 β; this parameter's mechanism is
     proven independently by a direct-emit unit test.
+
+    *origin_host* / *probe_host* are the optional HOST-AFFINITY placement
+    record for a ``main_health_red`` outcome (task 2565): ``origin_host`` is
+    ``'local'``/``'remote'`` depending on which host ran the failing
+    post-merge verify that triggered the main-health probe; ``probe_host``
+    is always ``'local'`` — the probe itself never runs remote-affine (see
+    :func:`verify_failure_is_preexisting_on_main`'s LEASE-SAFETY &
+    HOST-AFFINITY contract). Recording both makes the deliberate local-only
+    placement decision OBSERVABLE in telemetry even when the triggering
+    verify ran remote. When omitted (the default; every non-main-health-red
+    call site), neither key is added — existing callers' payloads stay
+    byte-identical.
     """
     if event_store is not None:
         data: dict = {'outcome': outcome}
@@ -2297,6 +2364,10 @@ def _emit_merge_attempt(
             data['member_task_ids'] = member_task_ids
         if disposition is not None:
             data['disposition'] = disposition.value
+        if origin_host is not None:
+            data['origin_host'] = origin_host
+        if probe_host is not None:
+            data['probe_host'] = probe_host
         event_store.emit(
             EventType.merge_attempt, task_id=task_id, phase='merge',
             data=data, duration_ms=duration_ms,
