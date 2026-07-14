@@ -610,5 +610,82 @@ def run_nightly(
     )
 
 
+def _parse_date(value: str) -> date:
+    return date.fromisoformat(value)
+
+
+def main(argv: Sequence[str] | None = None) -> int:
+    """CLI entrypoint -- what the systemd ``legibility-trickle@.service``
+    ``ExecStart`` and an operator both invoke.
+
+    ``run`` -- run one nightly trickle pass. Exactly one of ``--config``
+    (a direct path to a project's ``legibility.yaml``) or ``--project-id``
+    (resolved via :func:`resolve_config_path`) is expected to identify the
+    project; both are simply forwarded to :func:`run_nightly`, which
+    already prefers ``config_path`` over ``project_id`` when both are
+    given -- so ``--config`` takes precedence for free, no extra logic
+    here. ``--projects-root``/``--date`` default to ``None``, letting
+    :func:`run_nightly`'s own defaults (``~/.claude/projects`` / yesterday
+    UTC) apply. ``--dry-run`` is accepted for forward operator visibility
+    but not yet wired to any behavior change. Returns
+    :attr:`NightlyResult.exit_code`.
+
+    ``resolve-config <project_id>`` -- print the resolved
+    ``legibility.yaml`` path (via :func:`resolve_config_path`) and return
+    0, or print an error to stderr and return 1 if no project matches --
+    this is what ``install-trickle-timer.sh`` shells out to.
+    """
+    parser = argparse.ArgumentParser(
+        prog='nightly.py', description='Legibility nightly trickle pipeline (PRD task ε).',
+    )
+    subparsers = parser.add_subparsers(dest='command', required=True)
+
+    run_parser = subparsers.add_parser('run', help='Run one nightly trickle pass.')
+    run_parser.add_argument('--config', default=None, help="Path to the project's legibility.yaml.")
+    run_parser.add_argument(
+        '--project-id', default=None, help='Project id, resolved via resolve-config.',
+    )
+    run_parser.add_argument(
+        '--projects-root', default=None,
+        help='Root dir of encoded session transcripts (default: ~/.claude/projects).',
+    )
+    run_parser.add_argument(
+        '--date', default=None, type=_parse_date,
+        help='Target date YYYY-MM-DD (default: yesterday UTC).',
+    )
+    run_parser.add_argument(
+        '--dry-run', action='store_true',
+        help='Accepted for forward compatibility; not yet wired to any behavior change.',
+    )
+
+    resolve_parser = subparsers.add_parser(
+        'resolve-config', help="Print a project's resolved legibility.yaml path.",
+    )
+    resolve_parser.add_argument('project_id')
+
+    args = parser.parse_args(argv)
+
+    if args.command == 'resolve-config':
+        try:
+            path = resolve_config_path(args.project_id)
+        except FileNotFoundError as exc:
+            print(str(exc), file=sys.stderr)
+            return 1
+        print(str(path))
+        return 0
+
+    # args.command == 'run'
+    if not args.config and not args.project_id:
+        parser.error('run requires --config or --project-id')
+
+    result = run_nightly(
+        config_path=args.config,
+        project_id=args.project_id,
+        projects_root=args.projects_root,
+        target_date=args.date,
+    )
+    return result.exit_code
+
+
 if __name__ == '__main__':
-    raise SystemExit(0)
+    raise SystemExit(main(sys.argv[1:]))
