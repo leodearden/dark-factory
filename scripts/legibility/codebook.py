@@ -17,7 +17,6 @@ import os
 import re
 import sys
 
-import jsonschema
 import yaml
 
 # ---------------------------------------------------------------------------
@@ -180,13 +179,69 @@ CODING_RECORD_SCHEMA = {
 }
 
 
-def _schema_errors(instance: dict, schema: dict) -> list[str]:
-    validator = jsonschema.Draft202012Validator(schema)
-    errors = []
-    for err in sorted(validator.iter_errors(instance), key=str):
-        location = "/".join(str(p) for p in err.absolute_path) or "<root>"
-        errors.append(f"{location}: {err.message}")
+def _type_matches(value, type_spec) -> bool:
+    """Check `value` against a JSON-Schema `type` keyword (a string, or a
+    list of strings meaning "any of"). Supports exactly the primitive types
+    this module's schemas use."""
+    types = type_spec if isinstance(type_spec, list) else [type_spec]
+    checks = {
+        "object": lambda v: isinstance(v, dict),
+        "array": lambda v: isinstance(v, list),
+        "string": lambda v: isinstance(v, str),
+        "null": lambda v: v is None,
+    }
+    return any(checks[t](value) for t in types if t in checks)
+
+
+def _validate_node(instance, schema: dict, path: list[str]) -> list[str]:
+    """Minimal recursive validator for the small JSON-Schema subset this
+    module's schemas use (type/properties/required/items/enum/const).
+
+    Not a general-purpose JSON-Schema implementation: the `jsonschema` PyPI
+    package is NOT available in this module's actual verify environment
+    (`scripts/tests/` runs via `uv run --project shared`, and
+    shared/pyproject.toml does not declare jsonschema — it's only a
+    transitive dependency of other subprojects, e.g. fused-memory). This
+    hand-rolled walker replaces it without adding a new dependency, over the
+    same declarative schema dicts (V2_SCHEMA, CODING_RECORD_SCHEMA, etc.).
+    Unknown/extra properties are permitted (open-world), matching plain
+    JSON-Schema's default `additionalProperties` behavior.
+    """
+    loc = "/".join(path) or "<root>"
+    errors: list[str] = []
+
+    if "const" in schema:
+        if instance != schema["const"]:
+            errors.append(f"{loc}: {instance!r} does not equal {schema['const']!r}")
+        return errors
+
+    if "enum" in schema:
+        if instance not in schema["enum"]:
+            errors.append(f"{loc}: {instance!r} is not one of {schema['enum']!r}")
+        return errors
+
+    schema_type = schema.get("type")
+    if schema_type is not None and not _type_matches(instance, schema_type):
+        errors.append(f"{loc}: {instance!r} is not of type {schema_type!r}")
+        return errors
+
+    if "properties" in schema and isinstance(instance, dict):
+        for required in schema.get("required", []):
+            if required not in instance:
+                errors.append(f"{loc}: {required!r} is a required property")
+        for prop, subschema in schema["properties"].items():
+            if prop in instance:
+                errors.extend(_validate_node(instance[prop], subschema, path + [prop]))
+
+    if "items" in schema and isinstance(instance, list):
+        for i, item in enumerate(instance):
+            errors.extend(_validate_node(item, schema["items"], path + [str(i)]))
+
     return errors
+
+
+def _schema_errors(instance: dict, schema: dict) -> list[str]:
+    return _validate_node(instance, schema, [])
 
 
 def validate(codebook: dict) -> list[str]:
