@@ -1023,3 +1023,54 @@ class TestBuildDigestBoundary:
         # matching tool_result, so iter_error_neighborhoods (the only
         # detector that ever echoes a tool_use input) never touches it.
         assert 'FAIL:' not in digest
+
+
+# ---------------------------------------------------------------------------
+# main — thin argparse CLI over build_digest, mirroring
+# analyze_speculation_depth.py's TestMainCLI (capsys end-to-end smoke tests).
+# ---------------------------------------------------------------------------
+
+class TestMainCLI:
+    def test_main_prints_digest_to_stdout_and_returns_zero(self, tmp_path, capsys):
+        path = _write_jsonl(tmp_path, _boundary_records())
+
+        ret = mod.main([str(path)])
+
+        captured = capsys.readouterr()
+        assert ret == 0
+        assert captured.out.startswith('---\n')
+        assert '## User Corrections' in captured.out
+        # print() appends exactly one trailing newline beyond the digest
+        # itself -- strip it before checking the digest's own soft cap.
+        assert len(captured.out.rstrip('\n').encode('utf-8')) <= 15360
+
+    def test_agent_class_flag_overrides_frontmatter_class(self, tmp_path, capsys):
+        path = _write_jsonl(tmp_path, _boundary_records())
+
+        ret = mod.main([str(path), '--agent-class', 'recon'])
+
+        captured = capsys.readouterr()
+        assert ret == 0
+        frontmatter_yaml, _ = _split_frontmatter(captured.out)
+        assert yaml.safe_load(frontmatter_yaml)['agent_class'] == 'recon'
+
+    def test_out_flag_writes_digest_to_file_instead_of_stdout(self, tmp_path, capsys):
+        path = _write_jsonl(tmp_path, _boundary_records())
+        out_path = tmp_path / 'digest.md'
+
+        ret = mod.main([str(path), '--out', str(out_path)])
+
+        captured = capsys.readouterr()
+        assert ret == 0
+        assert captured.out == ''  # --out redirects the digest away from stdout
+        assert out_path.read_text(encoding='utf-8') == mod.build_digest(path)
+
+    def test_nonexistent_path_returns_nonzero_and_writes_stderr(self, tmp_path, capsys):
+        missing = tmp_path / 'does-not-exist.jsonl'
+
+        ret = mod.main([str(missing)])
+
+        captured = capsys.readouterr()
+        assert ret != 0
+        assert captured.out == ''
+        assert str(missing) in captured.err
