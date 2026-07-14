@@ -257,11 +257,22 @@ def _git_commit_docs_only(
     immediately without retrying. On success, resolves the new commit sha
     via a follow-up ``git rev-parse HEAD`` (through the same *runner*).
     Returns ``ok=False`` (never raises) after the final failed attempt.
+
+    A path git has never seen before (e.g. a freshly onboarded project's
+    first-ever ``codebook.dump()``) makes ``--only`` fail outright with
+    "pathspec ... did not match any file(s) known to git" -- git refuses
+    to commit an unknown path this way even though it exists on disk. On
+    that specific error (and only that one, and only once), this runs a
+    scoped ``git add -- <paths>`` and retries the commit -- ``--only``
+    still disregards any OTHER staged path per its own semantics, so this
+    can't smuggle in unrelated changes; it only makes *paths* itself
+    eligible to be named.
     """
     run = runner if runner is not None else subprocess.run
     str_paths = [str(p) for p in paths]
 
     stderr = ''
+    added = False
     for attempt in range(1, retries + 1):
         result = run(
             ['git', '-C', str(repo), 'commit', '--only', *str_paths, '-m', message],
@@ -276,6 +287,17 @@ def _git_commit_docs_only(
             return GitCommitResult(ok=True, sha=sha, stderr='', attempts=attempt)
 
         stderr = result.stderr or ''
+
+        if not added and 'did not match any file' in stderr.lower():
+            added = True
+            run(
+                ['git', '-C', str(repo), 'add', '--', *str_paths],
+                capture_output=True, text=True,
+            )
+            if attempt < retries:
+                continue
+            return GitCommitResult(ok=False, sha=None, stderr=stderr, attempts=attempt)
+
         is_lock_error = any(
             pattern in stderr.lower() for pattern in _LOCK_ERROR_PATTERNS
         )
@@ -532,7 +554,22 @@ def run_nightly(
         )
 
     codebook_path = Path(cfg.project_root) / _CODEBOOK_RELPATH
-    cb = codebook.load(codebook_path)
+    try:
+        cb = codebook.load(codebook_path)
+    except FileNotFoundError:
+        # First-ever nightly run for a project onboarded without a
+        # pre-seeded codebook: start from an empty v2 document rather than
+        # letting a bare FileNotFoundError escape -- this module's
+        # contract is a clean fail-loud escalation or a graceful default,
+        # never an uncaught traceback. codebook.dump() below (and
+        # _git_commit_docs_only's own never-tracked-path handling) takes
+        # it from there once/if this run's coding actually applies
+        # something.
+        logger.info(
+            'legibility trickle: no codebook at %s yet, starting from an empty v2 document',
+            codebook_path,
+        )
+        cb = {'version': 2, 'entries': [], 'candidates': []}
 
     run = coder.code_digests(
         digests, cb, project=cfg.project_id, model=cfg.models.trickle, invoke=invoke,
@@ -559,13 +596,28 @@ def run_nightly(
 
     validation_errors = codebook.validate(cb)
     if validation_errors:
-        logger.warning(
-            'legibility trickle: merged codebook failed validation, not dumped: %s',
-            '; '.join(validation_errors),
+        # A merge that leaves the codebook failing its own validator is
+        # exceptional on par with the other decision-8 triggers (extractor
+        # crash / coder storm / commit failure): silently discarding real
+        # coding work behind a green exit_code=0 would mask every night's
+        # sightings from here on. Fail loud instead -- codebook_path is
+        # left untouched (dump/commit are both skipped).
+        summary = (
+            f'legibility trickle merged codebook failed validation '
+            f'({len(validation_errors)} error(s))'
+        )
+        detail = '; '.join(validation_errors)
+        escalated = post_escalation(cfg, summary, detail, poster=poster)
+        return NightlyResult(
+            exit_code=1,
+            applied=applied,
+            coder_status=run.status,
+            escalated=escalated,
+            reason=summary,
         )
 
     commit_made = False
-    if applied > 0 and not validation_errors:
+    if applied > 0:
         codebook.dump(cb, codebook_path)
         if _git_status_changed(cfg.project_root, _CODEBOOK_RELPATH):
             message = f'legibility: nightly trickle sightings for {target_date.isoformat()}'
@@ -589,11 +641,12 @@ def run_nightly(
 
     if not commit_made:
         # Covers every case that reaches here without committing: an
-        # empty/dedup-only coding run (applied == 0), a merged-but-invalid
-        # codebook (validation_errors, dump skipped), or a merge that
+        # empty/dedup-only coding run (applied == 0), or a merge that
         # applied but produced a byte-identical dump (git status
-        # unchanged) -- all genuine no-change nights, never conflated with
-        # a coding failure (PRD §6.7).
+        # unchanged) -- both genuine no-change nights, never conflated
+        # with a coding failure (PRD §6.7). A merged-but-invalid codebook
+        # is NOT a no-change night -- it fails loud above instead, before
+        # reaching here.
         logger.info(
             'legibility trickle: no-change night: nothing committed (applied=%d)', applied,
         )
