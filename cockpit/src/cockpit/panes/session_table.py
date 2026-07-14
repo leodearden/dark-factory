@@ -215,12 +215,22 @@ class SessionTable(DataTable):
         row_key = self.coordinate_to_cell_key(self.cursor_coordinate).row_key
         return row_key.value
 
-    def replace_rows(self, records: list[SessionRecord], now: datetime) -> None:
-        """Rebuild rows from *records* (already ordered), preserving the cursor by slug.
+    def replace_rows(
+        self,
+        records: list[SessionRecord],
+        now: datetime,
+        *,
+        all_records: list[SessionRecord] | None = None,
+    ) -> None:
+        """Rebuild VISIBLE rows from *records* (already ordered), preserving the cursor by slug.
 
-        *records* is the FULL record set (ordered) -- outstanding-children
-        counts are computed against it, not a filtered subset.
+        Outstanding-children counts are computed against *all_records* when
+        given (the full scanned set), falling back to *records* otherwise --
+        so a filtered/capped visible subset never undercounts a visible
+        parent's non-terminal children just because those children
+        themselves are hidden from view.
         """
+        counting_set = all_records if all_records is not None else records
         previous_slug = self.highlighted_slug()
         self.clear()
         for record in records:
@@ -229,7 +239,7 @@ class SessionTable(DataTable):
                 format_title(record),
                 format_age(record.start_ts, now),
                 record.project,
-                str(count_outstanding_children(record.session_slug, records)),
+                str(count_outstanding_children(record.session_slug, counting_set)),
                 key=record.session_slug,
             )
         if not self.row_count:
