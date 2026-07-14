@@ -25,6 +25,8 @@ from pydantic_settings import (
     SettingsConfigDict,
 )
 
+from orchestrator.routing import DEFAULT_ALLOWED_MODELS
+
 logger = logging.getLogger(__name__)
 
 
@@ -266,6 +268,20 @@ class BackendsConfig(BaseModel):
     module_tagger: str = Field(default='claude')
     deep_reviewer: str = Field(default='claude')
     judge: str = Field(default='claude')
+
+
+class RoutingConfig(BaseModel):
+    """Model allowlist (task beta, plans/adaptive-model-routing-prd.md).
+
+    ``allowed_models`` is the fail-fast admission list enforced by
+    ``OrchestratorConfig._validate_models_in_allowlist`` against every
+    claude-backend role's configured model string (``models.<role>`` and
+    ``unblock_auto.model``). Defaults from ``routing.DEFAULT_ALLOWED_MODELS``
+    — the PRD-named "allowlist home" — so this schema and its default stay
+    single-sourced.
+    """
+
+    allowed_models: list[str] = Field(default_factory=lambda: list(DEFAULT_ALLOWED_MODELS))
 
 
 class UnblockAutoConfig(BaseModel):
@@ -2397,6 +2413,9 @@ class OrchestratorConfig(BaseSettings):
     timeouts: TimeoutsConfig = Field(default_factory=TimeoutsConfig)
     backends: BackendsConfig = Field(default_factory=BackendsConfig)
 
+    # Model allowlist + fail-fast validation (task beta).
+    routing: RoutingConfig = Field(default_factory=RoutingConfig)
+
     # Verification commands
     test_command: str = Field(default='pytest')
     lint_command: str = Field(default='ruff check')
@@ -2659,6 +2678,44 @@ class OrchestratorConfig(BaseSettings):
             )
         return self
 
+    @model_validator(mode='after')
+    def _validate_models_in_allowlist(self) -> 'OrchestratorConfig':
+        """Fail-fast: every claude-backend role's configured model string must
+        be in routing.allowed_models (task beta,
+        plans/adaptive-model-routing-prd.md).
+
+        Scoped to roles whose backend is 'claude' — a codex/gemini backend
+        model string is owned by the harness-backend PRD (explicitly out of
+        scope here), so it is never checked against this claude-centric
+        allowlist. Mirrors _validate_steward_timeout_invariant's
+        ValueError-naming-the-field idiom so a bad model string fails load
+        with a structured, field-named error.
+        """
+        allowed = self.routing.allowed_models
+        for role in type(self.models).model_fields:
+            # Defensive default (not `getattr(self.backends, role)` bare):
+            # ModelsConfig and BackendsConfig share the same role names today,
+            # but a future asymmetric field addition should skip validation
+            # for the unmatched role rather than raise a raw AttributeError
+            # that bypasses pydantic's ValidationError wrapping.
+            if getattr(self.backends, role, 'claude') != 'claude':
+                continue
+            model = getattr(self.models, role)
+            if model not in allowed:
+                raise ValueError(
+                    f'models.{role} = {model!r} is not in routing.allowed_models '
+                    f'{allowed!r}. Add it to routing.allowed_models, or choose an '
+                    f'already-allowed model for models.{role}.'
+                )
+        if self.unblock_auto.backend == 'claude' and self.unblock_auto.model not in allowed:
+            raise ValueError(
+                f'unblock_auto.model = {self.unblock_auto.model!r} is not in '
+                f'routing.allowed_models {allowed!r}. Add it to '
+                f'routing.allowed_models, or choose an already-allowed model for '
+                f'unblock_auto.model.'
+            )
+        return self
+
     @property
     def effective_verify_env(self) -> dict[str, str]:
         """Merge sccache.env_overrides() with verify_env; verify_env wins on conflict.
@@ -2876,6 +2933,15 @@ RELOADABLE_FIELDS: frozenset[str] = frozenset().union(
     # fairness/starvation_watchdog submodel-group pattern: every threshold
     # is green-tier hot-reloadable.
     _submodel_leaf_paths('psi_admission', PsiAdmissionConfig),
+    # Model allowlist (task beta, plans/adaptive-model-routing-prd.md):
+    # green-tier hot-reloadable. apply_reload()'s existing post-apply
+    # model_validate re-check already enforces
+    # _validate_models_in_allowlist as a hybrid invariant, so a tightened
+    # allowlist (or a typo'd models.<role>) that conflicts with the live
+    # config's models/unblock_auto leaves fails closed with a
+    # {reloaded: False, error: 'hybrid-invariant: ...'} + rollback — no
+    # new reload code needed.
+    _submodel_leaf_paths('routing', RoutingConfig),
     {
         # Steward grace
         'steward_completion_timeout',

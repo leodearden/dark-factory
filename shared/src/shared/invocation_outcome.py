@@ -37,6 +37,7 @@ __all__ = [
     'NearCap',
     'AuthFailed',
     'CliLocalError',
+    'ModelNotFound',
     'ZeroOutputWedge',
     'Failure',
     'classify_invocation',
@@ -83,6 +84,20 @@ class CliLocalError(InvocationOutcome):
     """A local CLI/usage error occurred that must never be treated as a cap hit."""
 
     marker: str
+
+
+@dataclass(frozen=True)
+class ModelNotFound(InvocationOutcome):
+    """The requested model string does not exist / is not available to this
+    account (task beta, plans/adaptive-model-routing-prd.md).
+
+    TERMINAL: a model-not-found result is zero-cost, near-instant, and
+    <=1 turn — it must never be treated as a usage-cap signal (that
+    misclassification is what previously drove whole-pool failover churn in
+    ``invoke_with_cap_retry``; see ``shared.cli_invoke``).
+    """
+
+    reason: str
 
 
 @dataclass(frozen=True)
@@ -253,6 +268,15 @@ NON_CAP_CLI_ERROR_MARKERS = [
     'permission denied',
 ]
 
+# Substrings (case-insensitive) indicating the requested model does not
+# exist / is not available (task beta, plans/adaptive-model-routing-prd.md).
+# Checked as a fallback when no structured api_error_status==404 is present
+# — e.g. a body-only error where the CLI didn't surface a status code.
+MODEL_NOT_FOUND_MARKERS = [
+    'not_found_error',
+    'model not found',
+]
+
 # Patterns that indicate a usage cap has been hit (from Claude Code CLI
 # output). Copied from usage_gate.py:48 (CAP_HIT_PREFIXES).
 CAP_HIT_PREFIXES = [
@@ -316,9 +340,10 @@ def classify_invocation(
     """Classify a CLI agent invocation result into an ``InvocationOutcome``.
 
     Total and pure: every ``AgentResult`` maps to exactly one variant, in
-    precedence order AuthFailed > OK > CliLocalError > CapHit/NearCap >
-    ZeroOutputWedge > Failure. Reads only ``result`` (and ``backend`` /
-    ``strict_confirm``) — no I/O, no gate mutation.
+    precedence order AuthFailed > ModelNotFound (404) > OK > ModelNotFound
+    (marker) > CliLocalError > CapHit/NearCap > ZeroOutputWedge > Failure.
+    Reads only ``result`` (and ``backend`` / ``strict_confirm``) — no I/O,
+    no gate mutation.
     """
     # AuthFailed — narrow to {401, 403}. 429 is deliberately EXCLUDED: it
     # carries a real cap-message body ("You're out of extra usage · resets
@@ -330,6 +355,20 @@ def classify_invocation(
 
     combined = f'{result.stderr or ""}\n{result.output or ""}'
     combined_lower = combined.lower()
+
+    # ModelNotFound (structured, status-based) — a 404 is never a successful
+    # invocation, so keying on the structured status code here carries no
+    # false-positive risk, exactly like AuthFailed's placement above. Must
+    # sit ABOVE the `if result.success` short-circuit for the same reason.
+    # TERMINAL: a model-not-found result is zero-cost / near-instant /
+    # <=1 turn — classifying it here (rather than falling through to
+    # Failure(unclassified)) is what lets invoke_with_cap_retry stop it
+    # before the heuristic cap safety-net mislabels it a CapHit and cycles
+    # every account in the pool.
+    if result.api_error_status == 404:
+        detail = combined.strip().splitlines()[0] if combined.strip() else ''
+        reason = 'HTTP 404 model-not-found' + (f': {detail}' if detail else '')
+        return ModelNotFound(reason=reason)
 
     # OK — a successful invocation short-circuits every remaining
     # string-based heuristic below: CLI-local-error markers, cap/near-cap
@@ -347,6 +386,17 @@ def classify_invocation(
     # risk against incidental output.
     if result.success:
         return OK()
+
+    # ModelNotFound (fuzzy, marker-based) — a fallback for a body-only
+    # model-not-found error with no structured api_error_status==404.
+    # Placed BELOW the OK short-circuit (so a successful run that merely
+    # *quotes* a marker substring, e.g. discussing an error format, stays
+    # OK) and ABOVE CliLocalError/cap/wedge (so a real failed
+    # model-not-found is caught before the heuristic cap safety-net can
+    # mislabel the zero-cost/instant result a CapHit).
+    for marker in MODEL_NOT_FOUND_MARKERS:
+        if marker in combined_lower:
+            return ModelNotFound(reason=f'model-not-found marker {marker!r} in output')
 
     # CliLocalError — placed ABOVE cap detection. This precedence position IS
     # the reify-3604 structural fix: a local CLI/usage error (e.g. a
