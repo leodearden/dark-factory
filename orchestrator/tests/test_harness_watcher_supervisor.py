@@ -1965,9 +1965,19 @@ class TestWatcherSupervisorRunWiring:
         h._start_watcher_supervisor.assert_called_once()
 
     @pytest.mark.asyncio
-    async def test_start_watcher_supervisor_after_dismiss_stale(self, tmp_path: Path) -> None:
-        """Startup block: _start_watcher_supervisor appears AFTER _dismiss_stale_escalations
-        in the shared parent's mock_calls (chronological call order)."""
+    async def test_start_watcher_supervisor_before_dismiss_stale(self, tmp_path: Path) -> None:
+        """Startup block: _start_watcher_supervisor appears BEFORE _dismiss_stale_escalations
+        in the shared parent's mock_calls (chronological call order).
+
+        Task 2241 (W10-η) collapsed the eleven scattered ``_start_*`` calls into
+        one ``await self._lifecycle.start_all()`` at the escalation-server
+        position; the recovery block (``_dismiss_stale_escalations`` first)
+        runs immediately after ``start_all()`` returns. Since
+        watcher-supervisor is registered (and thus started) as part of that
+        single ladder, its start now precedes the recovery block — the
+        deliberate, documented ordering delta from the pre-migration code
+        (plan.json design decision: 'Collapse the startup ritual...').
+        """
         h, parent = _make_run_wired_harness(tmp_path)
         with pytest.raises(RuntimeError):
             await h.run(prd_path=None)
@@ -1987,17 +1997,28 @@ class TestWatcherSupervisorRunWiring:
         assert start_idx >= 0, (
             f'_start_watcher_supervisor not found in mock_calls: {call_strs}'
         )
-        assert start_idx > dismiss_idx, (
-            f'_start_watcher_supervisor (idx={start_idx}) must appear AFTER '
+        assert start_idx < dismiss_idx, (
+            f'_start_watcher_supervisor (idx={start_idx}) must appear BEFORE '
             f'_dismiss_stale_escalations (idx={dismiss_idx}); calls: {call_strs}'
         )
 
     @pytest.mark.asyncio
-    async def test_stop_watcher_supervisor_awaited_after_stop_terminal(
+    async def test_stop_watcher_supervisor_awaited_before_mcp_stop(
         self, tmp_path: Path
     ) -> None:
-        """Shutdown finally block: _stop_watcher_supervisor is awaited and appears
-        AFTER _stop_terminal_status_watcher in the shared parent's mock_calls."""
+        """Shutdown finally block: _stop_watcher_supervisor is awaited as part of
+        the LifecycleRegistry.stop_all() ladder, which completes BEFORE mcp.stop().
+
+        Task 2241 (W10-η) collapsed the finally-ladder's eleven individual
+        ``_stop_*`` calls (including ``_stop_terminal_status_watcher``, now
+        deleted — terminal-status-watcher is a BackgroundService with no
+        harness-level stop method to observe) into one
+        ``await self._lifecycle.stop_all()``. watcher-supervisor's relative
+        stop position among the other ten services is covered structurally by
+        the registration-order test (test_harness_lifecycle_registry.py, LR-3);
+        this test instead guards that watcher-supervisor's stop is genuinely
+        wired into the pre-mcp-stop shutdown path, not skipped.
+        """
         h, parent = _make_run_wired_harness(tmp_path)
         with pytest.raises(RuntimeError):
             await h.run(prd_path=None)
@@ -2007,23 +2028,22 @@ class TestWatcherSupervisorRunWiring:
 
         call_strs = [str(c) for c in parent.mock_calls]
 
-        stop_terminal_idx = next(
-            (i for i, s in enumerate(call_strs) if '_stop_terminal_status_watcher' in s), -1
-        )
         stop_watcher_idx = next(
             (i for i, s in enumerate(call_strs) if '_stop_watcher_supervisor' in s), -1
         )
-
-        assert stop_terminal_idx >= 0, (
-            f'_stop_terminal_status_watcher not found in mock_calls: {call_strs}'
+        mcp_stop_idx = next(
+            (i for i, s in enumerate(call_strs) if 'mcp_stop' in s), -1
         )
+
         assert stop_watcher_idx >= 0, (
             f'_stop_watcher_supervisor not found in mock_calls: {call_strs}'
         )
-        assert stop_watcher_idx > stop_terminal_idx, (
-            f'_stop_watcher_supervisor (idx={stop_watcher_idx}) must appear after '
-            f'_stop_terminal_status_watcher (idx={stop_terminal_idx}); '
-            f'calls: {call_strs}'
+        assert mcp_stop_idx >= 0, (
+            f'mcp_stop not found in mock_calls: {call_strs}'
+        )
+        assert stop_watcher_idx < mcp_stop_idx, (
+            f'_stop_watcher_supervisor (idx={stop_watcher_idx}) must appear before '
+            f'mcp_stop (idx={mcp_stop_idx}); calls: {call_strs}'
         )
 
 

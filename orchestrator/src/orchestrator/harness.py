@@ -30,7 +30,6 @@ from orchestrator.artifacts import TaskArtifacts
 from orchestrator.background_service import (
     BackgroundService,
     BackoffPolicy,
-    DEFAULT_BACKOFF_SECS,
     LifecycleRegistry,
     ManagedService,
 )
@@ -1005,7 +1004,7 @@ class Harness:
         # Escalation-watcher-auto subprocess supervisor (task 1326).
         # Keeps a fresh escalation-watcher-auto agent alive via invoke_with_cap_retry
         # across multi-day AFK windows with rotation, exponential backoff, and a
-        # crashloop→pause_scheduler guard.  Mirrors _terminal_status_watcher_task.
+        # crashloop→pause_scheduler guard.
         self._watcher_supervisor_task: asyncio.Task | None = None
         # Monotonic timestamps of unclean watcher exits; used by the crashloop guard
         # to count failures within watcher_crashloop_window_secs.
@@ -1177,6 +1176,147 @@ class Harness:
         self._ewa_value: float = 0.0
         self._last_digest_window_end_iso: str = ''
 
+    def _build_lifecycle_registry(self) -> None:
+        """Build ``self._lifecycle`` in the canonical eleven-service order.
+
+        Idempotent — a no-op once ``self._lifecycle`` is already set, so a
+        test may pre-build (and monkeypatch) the registry before driving
+        ``run()`` without ``run()``'s own call clobbering it (task 2241,
+        W10-η — PRD §5.3 LR-1/2/3).
+
+        Registration order (also the ``stop_all()`` REVERSE order — LR-2):
+        escalation-server, merge-worker, offline-lane, orphan-l0-reaper,
+        terminal-status-watcher, watcher-supervisor, stranded-reconcile,
+        main-tip-sweep, no-landings-breaker, deterministic-recon-sweep,
+        warm-lane-gc. escalation-server and merge-worker start first so the
+        recovery block (which runs immediately after ``start_all()``
+        returns) can depend on both being live. The seven sweeps are
+        conditionally registered on their own ``config.X_enabled`` gate —
+        ``BackgroundService`` itself has no ``enabled`` field (PRD §5.3
+        shape); a disabled sweep is simply absent from the registry.
+        """
+        if self._lifecycle is not None:
+            return
+        registry = LifecycleRegistry()
+        sweep_backoff = BackoffPolicy(_BG_LOOP_FAILURE_BACKOFF_SECS)
+
+        registry.register(ManagedService(
+            name='escalation-server',
+            start_fn=self._start_escalation_server,
+            stop_fn=self._stop_escalation_server,
+            stop_timeout_secs=_LIFECYCLE_SERVICE_STOP_TIMEOUT_SECS,
+        ))
+        registry.register(ManagedService(
+            name='merge-worker',
+            start_fn=self._start_merge_worker,
+            stop_fn=self._stop_merge_worker,
+            stop_timeout_secs=_LIFECYCLE_SERVICE_STOP_TIMEOUT_SECS,
+        ))
+        registry.register(ManagedService(
+            name='offline-lane',
+            start_fn=self._start_offline_lane,
+            stop_fn=self._stop_offline_lane,
+            stop_timeout_secs=_LIFECYCLE_SERVICE_STOP_TIMEOUT_SECS,
+        ))
+        if self.config.orphan_l0_reaper_enabled:
+            registry.register(BackgroundService(
+                name='orphan-l0-reaper',
+                pass_fn=self._run_orphan_l0_reaper_pass,
+                interval_secs=self.config.orphan_l0_check_interval_secs,
+                backoff=sweep_backoff,
+                stop_timeout_secs=_LIFECYCLE_SWEEP_STOP_TIMEOUT_SECS,
+                max_failure_logs=_BG_LOOP_MAX_FAILURE_LOGS,
+            ))
+        if self.config.terminal_status_watcher_enabled:
+            registry.register(BackgroundService(
+                name='terminal-status-watcher',
+                pass_fn=self._run_terminal_status_watcher_pass,
+                interval_secs=self.config.terminal_status_poll_interval_secs,
+                backoff=sweep_backoff,
+                stop_timeout_secs=_LIFECYCLE_SWEEP_STOP_TIMEOUT_SECS,
+                max_failure_logs=_BG_LOOP_MAX_FAILURE_LOGS,
+            ))
+        registry.register(ManagedService(
+            name='watcher-supervisor',
+            start_fn=self._start_watcher_supervisor,
+            stop_fn=self._stop_watcher_supervisor,
+            stop_timeout_secs=_LIFECYCLE_SERVICE_STOP_TIMEOUT_SECS,
+        ))
+        if self.config.stranded_reconcile_enabled:
+            registry.register(BackgroundService(
+                name='stranded-reconcile',
+                pass_fn=self._run_stranded_reconcile_pass,
+                interval_secs=self.config.stranded_reconcile_interval_secs,
+                backoff=sweep_backoff,
+                stop_timeout_secs=_LIFECYCLE_SWEEP_STOP_TIMEOUT_SECS,
+                max_failure_logs=_BG_LOOP_MAX_FAILURE_LOGS,
+            ))
+        if self.config.main_tip_sweep_enabled:
+            registry.register(BackgroundService(
+                name='main-tip-sweep',
+                pass_fn=self._run_main_tip_sweep,
+                interval_secs=self.config.main_tip_sweep_interval_secs,
+                backoff=sweep_backoff,
+                stop_timeout_secs=_LIFECYCLE_SWEEP_STOP_TIMEOUT_SECS,
+                max_failure_logs=_BG_LOOP_MAX_FAILURE_LOGS,
+            ))
+        if self.config.no_landings_breaker_enabled:
+            registry.register(BackgroundService(
+                name='no-landings-breaker',
+                pass_fn=self._run_no_landings_breaker_pass,
+                interval_secs=self.config.no_landings_breaker_interval_secs,
+                backoff=sweep_backoff,
+                stop_timeout_secs=_LIFECYCLE_SWEEP_STOP_TIMEOUT_SECS,
+                max_failure_logs=_BG_LOOP_MAX_FAILURE_LOGS,
+            ))
+        if self.config.deterministic_recon_sweep_enabled:
+            registry.register(BackgroundService(
+                name='deterministic-recon-sweep',
+                pass_fn=self._run_deterministic_recon_sweep,
+                interval_secs=self.config.deterministic_recon_sweep_interval_secs,
+                backoff=sweep_backoff,
+                stop_timeout_secs=_LIFECYCLE_SWEEP_STOP_TIMEOUT_SECS,
+                max_failure_logs=_BG_LOOP_MAX_FAILURE_LOGS,
+            ))
+        if self.config.warm_lane_gc_enabled:
+            registry.register(BackgroundService(
+                name='warm-lane-gc',
+                pass_fn=self._run_warm_lane_gc_pass,
+                interval_secs=self.config.warm_lane_gc_interval_secs,
+                backoff=sweep_backoff,
+                stop_timeout_secs=_LIFECYCLE_SWEEP_STOP_TIMEOUT_SECS,
+                max_failure_logs=_BG_LOOP_MAX_FAILURE_LOGS,
+            ))
+        self._lifecycle = registry
+
+    async def _run_orphan_l0_reaper_pass(self) -> None:
+        """Async ``pass_fn`` wrapper for the (synchronous) orphan-L0 pass.
+
+        ``_reap_orphan_l0_escalations`` is sync; ``BackgroundService``
+        requires an ``Awaitable[None]`` pass_fn (task 2241, W10-η).
+        """
+        self._reap_orphan_l0_escalations()
+
+    async def _run_terminal_status_watcher_pass(self) -> None:
+        """Async ``pass_fn`` wrapper discarding the terminal-scan cancelled count.
+
+        ``_scan_for_terminal_active_tasks`` returns ``int`` (the cancelled
+        count — asserted directly by its own dedicated tests); ``BackgroundService``
+        requires an ``Awaitable[None]`` pass_fn (task 2241, W10-η).
+        """
+        await self._scan_for_terminal_active_tasks()
+
+    async def _run_stranded_reconcile_pass(self) -> None:
+        """Async ``pass_fn`` wrapper folding the two-call stranded pass.
+
+        Hoisted verbatim from the deleted ``_stranded_reconcile_loop`` body
+        (task 2241, W10-η): the mid-run stranded-in-progress reconcile
+        followed by the periodic terminal-lane sweep (Diff 7 layer-A
+        backstop).
+        """
+        await self._reconcile_stranded_in_progress(mid_run=True)
+        await self._reconcile_terminal_lanes()
+
     async def run(
         self,
         prd_path: Path | None = None,
@@ -1274,16 +1414,18 @@ class Harness:
             logger.info('Starting fused-memory HTTP server...')
             await self.mcp.start()
 
-            # 1b. Start escalation server
-            await self._start_escalation_server()
-
-            # 1b2. Start merge worker
-            await self._start_merge_worker()
-
-            # 1b3. Start the singleton offline-deep lane worker (task 1953,
-            # β2) — enable-gated (offline_lane_enabled AND
-            # persistent_offline_deep_worktree); a clean no-op otherwise.
-            await self._start_offline_lane()
+            # 1b. Start every background-loop/service lifecycle in one
+            # ordered ladder (task 2241, W10-η — PRD §5.3 LR-1/2/3):
+            # escalation-server, merge-worker, offline-lane, then the seven
+            # sleep-first sweeps. escalation-server + merge-worker start
+            # first (canonical order), so the recovery block immediately
+            # below — which depends on both being live — is unaffected by
+            # collapsing the eleven scattered _start_* calls into this one
+            # seam. _build_lifecycle_registry() is idempotent: a test may
+            # have already pre-built (and monkeypatched) self._lifecycle.
+            self._build_lifecycle_registry()
+            assert self._lifecycle is not None
+            await self._lifecycle.start_all()
 
             # 1c. Dismiss stale escalations from prior runs (non-fatal)
             try:
@@ -1353,52 +1495,6 @@ class Harness:
             # has_open_l1 dedups against a prior run's surviving L1, so the
             # operator sees one persistent L1 across the restart loop.
             self._file_restored_pause_escalation()
-
-            # 1c1. Start orphan L0 reaper (non-fatal) — catches escalations
-            # whose task_id has no active workflow/steward (e.g. reviewer
-            # emits against a synthetic task_id, or a workflow crashed
-            # before its steward could claim them).
-            self._start_orphan_l0_reaper()
-
-            # 1c1b. Start terminal-status watcher (non-fatal) — cancels
-            # active workflows whose task has been marked terminal
-            # out-of-band (e.g. by a human via /unblock).  Without this,
-            # the workflow churns through its merge/steward retry loop
-            # for tens of minutes after the human has finished the task.
-            self._start_terminal_status_watcher()
-
-            # 1c1c1. Start escalation-watcher-auto supervisor (task 1326,
-            # AFK hardening) — keeps a fresh autonomous L1-watcher subprocess
-            # alive across multi-day AFK windows.  Depends on L1 persistence
-            # (task 1321: _dismiss_stale_escalations above preserves L1 queue).
-            self._start_watcher_supervisor()
-
-            # 1c1c. Start periodic stranded-in-progress reconcile (Fix 4).
-            # Catches tasks stranded by transient backend failures during a
-            # long run so they don't accumulate until the next restart.
-            self._start_stranded_reconcile()
-
-            # 1c1d. Start periodic main-tip integrity sweep (task 1832).
-            # Catches test-suite drift that scoped per-merge verify misses.
-            self._start_main_tip_sweep()
-
-            # 1c1e. Start no-landings circuit-breaker (task θ/1893).
-            # Halts dispatch when landing-rate==0 AND disk is shrinking.
-            self._start_no_landings_breaker()
-
-            # 1c1e1. Start periodic deterministic-strand reconciliation sweep
-            # (task 2074). Recovers deterministic gate/deploy tasks stranded
-            # BLOCKED by a past occurrence (task 2059) and re-validates
-            # already-open deterministic-deploy escalations against live
-            # systemd unit state. Defensive/non-blocking; does not touch
-            # DeterministicRunner's own new-strand hardening (task 2066).
-            self._start_deterministic_recon_sweep()
-
-            # 1c1f. Start warm-lane auto-GC cadence loop (task 1926).
-            # Periodically invokes _run_warm_lane_gc_reclaim() to bound FREE
-            # _lane-*/_spec-* target/ re-accretion independent of acquire
-            # traffic.  Defaults on (warm_lane_gc_enabled=True).
-            self._start_warm_lane_gc()
 
             # 1c1g. Unconditional interactive-worktree (_iact-*) crash-safety
             # sweep (task δ/2012). Runs once at every boot regardless of
@@ -1774,50 +1870,17 @@ class Harness:
                     await self.cost_store.close()
                 except Exception as e:
                     logger.warning(f'cost_store.close() failed: {e}')
-            try:
-                await self._stop_merge_worker()
-            except Exception as e:
-                logger.warning(f'_stop_merge_worker() failed: {e}')
-            try:
-                await self._stop_offline_lane()
-            except Exception as e:
-                logger.warning(f'_stop_offline_lane() failed: {e}')
-            try:
-                await self._stop_orphan_l0_reaper()
-            except Exception as e:
-                logger.warning(f'_stop_orphan_l0_reaper() failed: {e}')
-            try:
-                await self._stop_terminal_status_watcher()
-            except Exception as e:
-                logger.warning(f'_stop_terminal_status_watcher() failed: {e}')
-            try:
-                await self._stop_watcher_supervisor()
-            except Exception as e:
-                logger.warning(f'_stop_watcher_supervisor() failed: {e}')
-            try:
-                await self._stop_stranded_reconcile()
-            except Exception as e:
-                logger.warning(f'_stop_stranded_reconcile() failed: {e}')
-            try:
-                await self._stop_main_tip_sweep()
-            except Exception as e:
-                logger.warning(f'_stop_main_tip_sweep() failed: {e}')
-            try:
-                await self._stop_deterministic_recon_sweep()
-            except Exception as e:
-                logger.warning(f'_stop_deterministic_recon_sweep() failed: {e}')
-            try:
-                await self._stop_no_landings_breaker()
-            except Exception as e:
-                logger.warning(f'_stop_no_landings_breaker() failed: {e}')
-            try:
-                await self._stop_warm_lane_gc()
-            except Exception as e:
-                logger.warning(f'_stop_warm_lane_gc() failed: {e}')
-            try:
-                await self._stop_escalation_server()
-            except Exception as e:
-                logger.warning(f'_stop_escalation_server() failed: {e}')
+            # Stop every registered background-loop/service lifecycle in one
+            # bounded, reverse-registration-order ladder (task 2241, W10-η —
+            # PRD §5.3 LR-1/2/3). LifecycleRegistry.stop_all() already
+            # bounds each service's stop() in asyncio.wait_for and catches +
+            # logs both timeouts and plain exceptions internally, so one
+            # wedging or failing service can never abort the ladder or hang
+            # shutdown — the structural elimination of the shutdown-hang
+            # class this module exists to fix. self._lifecycle may be None
+            # if run() raised before startup ever built it.
+            if self._lifecycle is not None:
+                await self._lifecycle.stop_all()
             try:
                 await self.mcp.stop()
             except Exception as e:
@@ -3101,7 +3164,7 @@ Output JSON matching the schema. Every task must appear in the output.
 
         Wired into:
         - startup (after ``_reap_orphan_worktrees``, before first ``acquire_next``)
-        - ``_stranded_reconcile_loop`` (after ``_reconcile_stranded_in_progress``)
+        - ``_run_stranded_reconcile_pass`` (after ``_reconcile_stranded_in_progress``)
 
         Reuses ``stranded_reconcile_interval_secs``; no new config knob.
         """
@@ -4857,71 +4920,6 @@ Output JSON matching the schema. Every task must appear in the output.
             self._resolve_no_landings_info_escalation(trip)
 
     # ------------------------------------------------------------------
-    # No-landings circuit-breaker: lifecycle (task θ/1893)
-    # ------------------------------------------------------------------
-
-    def _start_no_landings_breaker(self) -> None:
-        """Start the periodic no-landings circuit-breaker loop.
-
-        Mirrors ``_start_main_tip_sweep``: gate on config kill-switch, dedup
-        on a live task, then create the asyncio.Task.
-        """
-        if not self.config.no_landings_breaker_enabled:
-            return
-        if (
-            self._no_landings_breaker_task is not None
-            and not self._no_landings_breaker_task.done()
-        ):
-            return
-        self._no_landings_breaker_task = asyncio.create_task(
-            self._no_landings_breaker_loop(),
-            name='no-landings-breaker',
-        )
-        logger.info(
-            'No-landings circuit-breaker started (interval=%.0fs)',
-            self.config.no_landings_breaker_interval_secs,
-        )
-
-    async def _stop_no_landings_breaker(self) -> None:
-        """Cancel the no-landings circuit-breaker loop.
-
-        Mirrors ``_stop_main_tip_sweep``: cancel + suppress + None.
-        """
-        if self._no_landings_breaker_task is not None:
-            self._no_landings_breaker_task.cancel()
-            with contextlib.suppress(asyncio.CancelledError, Exception):
-                await self._no_landings_breaker_task
-            self._no_landings_breaker_task = None
-            logger.info('No-landings circuit-breaker stopped')
-
-    async def _no_landings_breaker_loop(self) -> None:
-        """Wake periodically and run the no-landings breaker pass.
-
-        Mirrors ``_main_tip_sweep_loop``: sleep first, then run the pass;
-        re-raise CancelledError, swallow-and-log other exceptions so a
-        transient pass failure does not kill the loop. Failure logging is
-        bounded (task 1907): a one-line ``logger.error`` summary — NOT
-        ``logger.exception``, whose O(frame-count) traceback formatting on a
-        pathological traceback can exceed the per-test 60s timeout and kill the
-        xdist worker — plus a fixed backoff so an immediately-failing pass can
-        never tight-spin.
-        """
-        interval = self.config.no_landings_breaker_interval_secs
-        while True:
-            try:
-                await asyncio.sleep(interval)
-                await self._run_no_landings_breaker_pass()
-            except asyncio.CancelledError:
-                raise
-            except Exception as exc:
-                logger.error(
-                    'No-landings circuit-breaker pass failed: %s: %s',
-                    type(exc).__name__,
-                    exc,
-                )
-                await asyncio.sleep(_BG_LOOP_FAILURE_BACKOFF_SECS)
-
-    # ------------------------------------------------------------------
     # Warm-lane auto-GC cadence loop — task 1926
     # ------------------------------------------------------------------
 
@@ -4945,7 +4943,8 @@ Output JSON matching the schema. Every task must appear in the output.
         added for it; it rides this existing tick.  That delegate is itself
         fail-soft, so it cannot break this pass's never-raise contract.
 
-        Called by ``_warm_lane_gc_loop()`` on every interval tick.
+        Registered as a ``BackgroundService`` pass_fn (task 2241, W10-η) —
+        called on every interval tick.
         """
         rc = await self.git_ops._run_warm_lane_gc_reclaim()
         if rc == 0:
@@ -4955,69 +4954,6 @@ Output JSON matching the schema. Every task must appear in the output.
         else:
             logger.warning('Warm-lane GC reclaim pass: non-zero rc=%d', rc)
         await self._run_interactive_worktree_reaper_pass()
-
-    def _start_warm_lane_gc(self) -> None:
-        """Start the periodic warm-lane GC reclaim cadence loop.
-
-        Mirrors ``_start_no_landings_breaker``: gate on config kill-switch,
-        dedup on a live task, then create the asyncio.Task.  Defaults to
-        enabled (warm_lane_gc_enabled=True) so the loop fires automatically
-        with no operator action — contrast warm_lane_disk_guard (opt-in,
-        defaults False).
-        """
-        if not self.config.warm_lane_gc_enabled:
-            return
-        if (
-            self._warm_lane_gc_task is not None
-            and not self._warm_lane_gc_task.done()
-        ):
-            return
-        self._warm_lane_gc_task = asyncio.create_task(
-            self._warm_lane_gc_loop(),
-            name='warm-lane-gc',
-        )
-        logger.info(
-            'Warm-lane GC cadence loop started (interval=%.0fs)',
-            self.config.warm_lane_gc_interval_secs,
-        )
-
-    async def _stop_warm_lane_gc(self) -> None:
-        """Cancel the warm-lane GC cadence loop.
-
-        Mirrors ``_stop_no_landings_breaker``: cancel + suppress + None.
-        """
-        if self._warm_lane_gc_task is not None:
-            self._warm_lane_gc_task.cancel()
-            with contextlib.suppress(asyncio.CancelledError, Exception):
-                await self._warm_lane_gc_task
-            self._warm_lane_gc_task = None
-            logger.info('Warm-lane GC cadence loop stopped')
-
-    async def _warm_lane_gc_loop(self) -> None:
-        """Wake periodically and run the warm-lane GC reclaim pass.
-
-        Mirrors ``_no_landings_breaker_loop``: sleep first, then run the pass;
-        re-raise CancelledError, swallow-and-log other exceptions so a
-        transient pass failure does not kill the loop.  Failure logging is
-        bounded: a one-line ``logger.error`` summary — NOT ``logger.exception``
-        (whose O(frame-count) traceback formatting can exceed per-test timeouts
-        and kill the xdist worker) — plus a fixed backoff so an
-        immediately-failing pass can never tight-spin.
-        """
-        interval = self.config.warm_lane_gc_interval_secs
-        while True:
-            try:
-                await asyncio.sleep(interval)
-                await self._run_warm_lane_gc_pass()
-            except asyncio.CancelledError:
-                raise
-            except Exception as exc:
-                logger.error(
-                    'Warm-lane GC reclaim pass failed: %s: %s',
-                    type(exc).__name__,
-                    exc,
-                )
-                await asyncio.sleep(_BG_LOOP_FAILURE_BACKOFF_SECS)
 
     # ------------------------------------------------------------------
     # Interactive-worktree (_iact-*) crash-safety reaper — task δ/2012
@@ -5040,8 +4976,8 @@ Output JSON matching the schema. Every task must appear in the output.
         one worktree was reaped. When none were reaped, logs at DEBUG
         instead, to avoid noise on the ~144 ticks/day cadence. Failure
         logging is a bounded one-line ``logger.error`` summary — NOT
-        ``logger.exception`` — matching ``_warm_lane_gc_loop``'s rationale
-        (unbounded traceback formatting can exceed per-test timeouts).
+        ``logger.exception`` — matching ``BackgroundService``'s bounded-log
+        rationale (unbounded traceback formatting can exceed per-test timeouts).
 
         Called by ``_run_warm_lane_gc_pass()`` on every cadence tick, and
         once unconditionally at ``run()`` startup for crash recovery.
@@ -7536,53 +7472,6 @@ Output JSON matching the schema. Every task must appear in the output.
             self._escalation_task = None
             logger.info('Escalation server stopped')
 
-    def _start_orphan_l0_reaper(self) -> None:
-        """Start the orphan L0 reaper as a background asyncio task.
-
-        The reaper periodically scans pending level-0 escalations; any whose
-        ``task_id`` has no active workflow (not in ``_escalation_events``)
-        and whose age exceeds ``orphan_l0_timeout_secs`` is promoted to
-        level 1 so the escalation-watcher can pick it up.  Without this,
-        orphan L0s (e.g. emitted by the deep reviewer, or left behind by a
-        crashed workflow) sit pending until the next orchestrator restart
-        auto-dismisses them unread.
-        """
-        if not self.config.orphan_l0_reaper_enabled:
-            return
-        if self._escalation_queue is None:
-            return
-        if self._orphan_reaper_task is not None and not self._orphan_reaper_task.done():
-            return
-        self._orphan_reaper_task = asyncio.create_task(
-            self._orphan_l0_reaper_loop(), name='orphan-l0-reaper',
-        )
-        logger.info(
-            'Orphan L0 reaper started (timeout=%.0fs, interval=%.0fs)',
-            self.config.orphan_l0_timeout_secs,
-            self.config.orphan_l0_check_interval_secs,
-        )
-
-    async def _stop_orphan_l0_reaper(self) -> None:
-        """Cancel the orphan L0 reaper loop."""
-        if self._orphan_reaper_task is not None:
-            self._orphan_reaper_task.cancel()
-            with contextlib.suppress(asyncio.CancelledError, Exception):
-                await self._orphan_reaper_task
-            self._orphan_reaper_task = None
-            logger.info('Orphan L0 reaper stopped')
-
-    async def _orphan_l0_reaper_loop(self) -> None:
-        """Wake periodically and promote orphan L0 escalations to L1."""
-        interval = self.config.orphan_l0_check_interval_secs
-        while True:
-            try:
-                await asyncio.sleep(interval)
-                self._reap_orphan_l0_escalations()
-            except asyncio.CancelledError:
-                raise
-            except Exception:
-                logger.exception('Orphan L0 reaper pass failed')
-
     def _reap_orphan_l0_escalations(self) -> int:
         """Single pass: promote any overdue orphan L0 to L1.  Returns count.
 
@@ -7733,55 +7622,6 @@ Output JSON matching the schema. Every task must appear in the output.
         return True
 
     # ------------------------------------------------------------------
-    # Terminal-status watcher (zombie-escalation fix Step 5)
-    # ------------------------------------------------------------------
-
-    def _start_terminal_status_watcher(self) -> None:
-        """Start a background poll that cancels workflows whose tasks have
-        gone terminal out-of-band (e.g. a human marking a task ``done``).
-
-        Polling avoids cross-process subscription to fused-memory's event bus.
-        At expected interval (~30 s) the poll cost is one ``get_statuses``
-        round-trip per active set, which is ~30 ms for a warm fused-memory.
-        """
-        if not self.config.terminal_status_watcher_enabled:
-            return
-        if (
-            self._terminal_status_watcher_task is not None
-            and not self._terminal_status_watcher_task.done()
-        ):
-            return
-        self._terminal_status_watcher_task = asyncio.create_task(
-            self._terminal_status_watcher_loop(),
-            name='terminal-status-watcher',
-        )
-        logger.info(
-            'Terminal-status watcher started (interval=%.0fs)',
-            self.config.terminal_status_poll_interval_secs,
-        )
-
-    async def _stop_terminal_status_watcher(self) -> None:
-        """Cancel the terminal-status watcher loop."""
-        if self._terminal_status_watcher_task is not None:
-            self._terminal_status_watcher_task.cancel()
-            with contextlib.suppress(asyncio.CancelledError, Exception):
-                await self._terminal_status_watcher_task
-            self._terminal_status_watcher_task = None
-            logger.info('Terminal-status watcher stopped')
-
-    async def _terminal_status_watcher_loop(self) -> None:
-        """Wake periodically and cancel workflows whose task is now terminal."""
-        interval = self.config.terminal_status_poll_interval_secs
-        while True:
-            try:
-                await asyncio.sleep(interval)
-                await self._scan_for_terminal_active_tasks()
-            except asyncio.CancelledError:
-                raise
-            except Exception:
-                logger.exception('Terminal-status watcher pass failed')
-
-    # ------------------------------------------------------------------
     # Escalation-watcher-auto subprocess supervisor (task 1326)
     # ------------------------------------------------------------------
 
@@ -7790,7 +7630,6 @@ Output JSON matching the schema. Every task must appear in the output.
 
         No-op when config.watcher_supervisor_enabled is False.
         Idempotent: does nothing if the task is already alive.
-        Mirrors _start_terminal_status_watcher.
         """
         if not self.config.watcher_supervisor_enabled:
             # Supervisor permanently disabled — file an outage L2 so the
@@ -7824,7 +7663,7 @@ Output JSON matching the schema. Every task must appear in the output.
         )
 
     async def _stop_watcher_supervisor(self) -> None:
-        """Cancel the watcher supervisor loop. Mirrors _stop_terminal_status_watcher."""
+        """Cancel the watcher supervisor loop."""
         if self._watcher_supervisor_task is not None:
             self._watcher_supervisor_task.cancel()
             with contextlib.suppress(asyncio.CancelledError, Exception):
@@ -8216,123 +8055,6 @@ Output JSON matching the schema. Every task must appear in the output.
 
         return cancelled
 
-    # ------------------------------------------------------------------
-    # Stranded-in-progress periodic sweep (Fix 4)
-    # ------------------------------------------------------------------
-
-    def _start_stranded_reconcile(self) -> None:
-        """Start the periodic stranded-in-progress sweep.
-
-        Mirrors the terminal-status watcher: a long-lived asyncio.Task
-        wakes every ``stranded_reconcile_interval_secs`` and re-runs
-        ``_reconcile_stranded_in_progress(mid_run=True)``.  The mid_run
-        filter skips tasks the scheduler is actively dispatching, so the
-        sweep can't race a healthy workflow.
-        """
-        if not self.config.stranded_reconcile_enabled:
-            return
-        if (
-            self._stranded_reconcile_task is not None
-            and not self._stranded_reconcile_task.done()
-        ):
-            return
-        self._stranded_reconcile_task = asyncio.create_task(
-            self._stranded_reconcile_loop(),
-            name='stranded-reconcile',
-        )
-        logger.info(
-            'Stranded-in-progress reconcile started (interval=%.0fs)',
-            self.config.stranded_reconcile_interval_secs,
-        )
-
-    async def _stop_stranded_reconcile(self) -> None:
-        """Cancel the stranded-in-progress sweep loop."""
-        if self._stranded_reconcile_task is not None:
-            self._stranded_reconcile_task.cancel()
-            with contextlib.suppress(asyncio.CancelledError, Exception):
-                await self._stranded_reconcile_task
-            self._stranded_reconcile_task = None
-            logger.info('Stranded-in-progress reconcile stopped')
-
-    async def _stranded_reconcile_loop(self) -> None:
-        """Wake periodically and run the mid-run stranded sweep."""
-        interval = self.config.stranded_reconcile_interval_secs
-        while True:
-            try:
-                await asyncio.sleep(interval)
-                await self._reconcile_stranded_in_progress(mid_run=True)
-                # Diff 7: periodic terminal-lane sweep (layer A backstop).
-                await self._reconcile_terminal_lanes()
-            except asyncio.CancelledError:
-                raise
-            except Exception:
-                logger.exception('Stranded-in-progress reconcile pass failed')
-
-    def _start_main_tip_sweep(self) -> None:
-        """Start the periodic main-tip integrity sweep.
-
-        Mirrors _start_stranded_reconcile: a long-lived asyncio.Task wakes every
-        ``main_tip_sweep_interval_secs``, resolves the current main SHA, and runs
-        a FULL unscoped verification in a throwaway detached worktree.  The sweep
-        is completely off the serial merge lane — per-merge latency is untouched.
-        """
-        if not self.config.main_tip_sweep_enabled:
-            return
-        if (
-            self._main_tip_sweep_task is not None
-            and not self._main_tip_sweep_task.done()
-        ):
-            return
-        self._main_tip_sweep_task = asyncio.create_task(
-            self._main_tip_sweep_loop(),
-            name='main-tip-sweep',
-        )
-        logger.info(
-            'Main-tip integrity sweep started (interval=%.0fs)',
-            self.config.main_tip_sweep_interval_secs,
-        )
-
-    async def _stop_main_tip_sweep(self) -> None:
-        """Cancel the main-tip integrity sweep loop."""
-        if self._main_tip_sweep_task is not None:
-            self._main_tip_sweep_task.cancel()
-            with contextlib.suppress(asyncio.CancelledError, Exception):
-                await self._main_tip_sweep_task
-            self._main_tip_sweep_task = None
-            logger.info('Main-tip integrity sweep stopped')
-
-    async def _main_tip_sweep_loop(self) -> None:
-        """Wake periodically and run the main-tip sweep pass.
-
-        Failure handling is deliberately bounded (task 1907): a failed pass is
-        logged as a one-line summary (exc type + message) — NOT via
-        ``logger.exception``, whose full traceback formatting is O(frame-count)
-        and on a pathological traceback (deep recursion / long ``__context__``
-        chain) can exceed the per-test 60s timeout, killing the xdist worker.
-        Every iteration also sleeps at least ``interval`` even on the failure
-        path, so a pass that fails *immediately* (e.g. mocked git_ops in unit
-        tests) can never tight-spin and starve the event loop.
-        """
-        interval = self.config.main_tip_sweep_interval_secs
-        while True:
-            try:
-                await asyncio.sleep(interval)
-                await self._run_main_tip_sweep()
-            except asyncio.CancelledError:
-                raise
-            except Exception as exc:
-                # Bounded, traceback-free summary — see docstring.
-                logger.error(
-                    'Main-tip integrity sweep pass failed: %s: %s',
-                    type(exc).__name__,
-                    exc,
-                )
-                # Backoff guarantee: a fixed, always-numeric quiescent gap so
-                # the loop cannot spin even if the failure surfaced before the
-                # loop's own ``asyncio.sleep`` (e.g. a non-numeric interval).
-                # CancelledError propagates out of this sleep to stop the loop.
-                await asyncio.sleep(_BG_LOOP_FAILURE_BACKOFF_SECS)
-
     async def _run_main_tip_sweep(self) -> None:
         """Single testable pass of the main-tip integrity sweep.
 
@@ -8343,8 +8065,9 @@ Output JSON matching the schema. Every task must appear in the output.
         SHA dedup (``_last_swept_main_sha``) skips the expensive full verify
         when main has not advanced — N merges within one interval cost one sweep.
         When ``_escalation_queue`` is None the drift is logged but not submitted.
-        See ``_start_main_tip_sweep`` / ``_main_tip_sweep_loop`` for the periodic
-        invocation context.
+        Registered as a ``BackgroundService`` pass_fn (task 2241, W10-η) —
+        see ``Harness._build_lifecycle_registry`` for the periodic invocation
+        context.
 
         On a PASS (task 2114), also self-heals: calls
         ``_close_superseded_main_sweep_escalations`` with the just-verified
@@ -8893,69 +8616,6 @@ Output JSON matching the schema. Every task must appear in the output.
                     'for escalation %s: %s: %s',
                     esc.id, type(exc).__name__, exc,
                 )
-
-    def _start_deterministic_recon_sweep(self) -> None:
-        """Start the periodic deterministic-strand reconciliation sweep.
-
-        Mirrors _start_main_tip_sweep: a long-lived asyncio.Task wakes every
-        ``deterministic_recon_sweep_interval_secs`` and runs
-        ``_run_deterministic_recon_sweep`` — recovering absent-escalation
-        strands (task 2059 shape) and re-validating open deterministic-deploy
-        escalations against live systemd unit state.
-        """
-        if not self.config.deterministic_recon_sweep_enabled:
-            return
-        if (
-            self._deterministic_recon_sweep_task is not None
-            and not self._deterministic_recon_sweep_task.done()
-        ):
-            return
-        self._deterministic_recon_sweep_task = asyncio.create_task(
-            self._deterministic_recon_sweep_loop(),
-            name='deterministic-recon-sweep',
-        )
-        logger.info(
-            'Deterministic-strand reconciliation sweep started (interval=%.0fs)',
-            self.config.deterministic_recon_sweep_interval_secs,
-        )
-
-    async def _stop_deterministic_recon_sweep(self) -> None:
-        """Cancel the deterministic-strand reconciliation sweep loop."""
-        if self._deterministic_recon_sweep_task is not None:
-            self._deterministic_recon_sweep_task.cancel()
-            with contextlib.suppress(asyncio.CancelledError, Exception):
-                await self._deterministic_recon_sweep_task
-            self._deterministic_recon_sweep_task = None
-            logger.info('Deterministic-strand reconciliation sweep stopped')
-
-    async def _deterministic_recon_sweep_loop(self) -> None:
-        """Wake periodically and run the deterministic-recon-sweep pass.
-
-        Failure handling mirrors _main_tip_sweep_loop (task 1907): a failed
-        pass is logged as a one-line summary (exc type + message) — NOT via
-        ``logger.exception`` — and every iteration sleeps at least
-        ``_BG_LOOP_FAILURE_BACKOFF_SECS`` on the failure path so a pass that
-        fails immediately can never tight-spin and starve the event loop.
-        """
-        interval = self.config.deterministic_recon_sweep_interval_secs
-        while True:
-            try:
-                await asyncio.sleep(interval)
-                await self._run_deterministic_recon_sweep()
-            except asyncio.CancelledError:
-                raise
-            except Exception as exc:
-                # Bounded, traceback-free summary — see docstring.
-                logger.error(
-                    'Deterministic-strand reconciliation sweep pass failed: %s: %s',
-                    type(exc).__name__,
-                    exc,
-                )
-                # Backoff guarantee: a fixed, always-numeric quiescent gap so
-                # the loop cannot spin even if the failure surfaced before the
-                # loop's own ``asyncio.sleep``. CancelledError propagates out
-                # of this sleep to stop the loop.
-                await asyncio.sleep(_BG_LOOP_FAILURE_BACKOFF_SECS)
 
     def _on_escalation(self, escalation) -> None:
         """Callback when any escalation is submitted — wake the waiting workflow/steward."""

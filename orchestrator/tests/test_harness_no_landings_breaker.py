@@ -336,67 +336,6 @@ class TestHarnessNoLandingsResume:
 
 
 # ---------------------------------------------------------------------------
-# step-13: lifecycle (start/stop/kill-switch/dedup)
-# ---------------------------------------------------------------------------
-
-
-class TestHarnessNoLandingsLifecycle:
-    """_start/_stop_no_landings_breaker lifecycle mirrors main-tip-sweep.
-
-    RED until step-14 GREEN adds the lifecycle methods.
-    """
-
-    @pytest.mark.asyncio
-    async def test_start_creates_task_when_enabled(self, tmp_path: Path) -> None:
-        """_start_no_landings_breaker() creates a live asyncio.Task when flag=True."""
-        harness, _rs = _make_harness(tmp_path)
-        harness.config.no_landings_breaker_enabled = True
-        harness._start_no_landings_breaker()
-        assert harness._no_landings_breaker_task is not None
-        assert not harness._no_landings_breaker_task.done()
-        # Cleanup
-        await harness._stop_no_landings_breaker()
-
-    @pytest.mark.asyncio
-    async def test_start_noop_when_disabled(self, tmp_path: Path) -> None:
-        """_start_no_landings_breaker() is a no-op when flag=False."""
-        harness, _rs = _make_harness(tmp_path)
-        harness.config.no_landings_breaker_enabled = False
-        harness._start_no_landings_breaker()
-        assert harness._no_landings_breaker_task is None
-
-    @pytest.mark.asyncio
-    async def test_start_dedup_no_duplicate_task(self, tmp_path: Path) -> None:
-        """Calling _start_no_landings_breaker() twice does not spawn a duplicate."""
-        harness, _rs = _make_harness(tmp_path)
-        harness.config.no_landings_breaker_enabled = True
-        harness._start_no_landings_breaker()
-        task1 = harness._no_landings_breaker_task
-        harness._start_no_landings_breaker()  # second call
-        task2 = harness._no_landings_breaker_task
-        assert task1 is task2, 'second start should not spawn a new task'
-        await harness._stop_no_landings_breaker()
-
-    @pytest.mark.asyncio
-    async def test_stop_cancels_and_clears_task(self, tmp_path: Path) -> None:
-        """_stop_no_landings_breaker() cancels the task and sets the field to None."""
-        harness, _rs = _make_harness(tmp_path)
-        harness.config.no_landings_breaker_enabled = True
-        harness._start_no_landings_breaker()
-        assert harness._no_landings_breaker_task is not None
-        await harness._stop_no_landings_breaker()
-        assert harness._no_landings_breaker_task is None
-
-    @pytest.mark.asyncio
-    async def test_stop_when_no_task_is_noop(self, tmp_path: Path) -> None:
-        """_stop_no_landings_breaker() is a no-op when the task was never started."""
-        harness, _rs = _make_harness(tmp_path)
-        # Should not raise
-        await harness._stop_no_landings_breaker()
-        assert harness._no_landings_breaker_task is None
-
-
-# ---------------------------------------------------------------------------
 # task/1918 step-05: config wiring
 # ---------------------------------------------------------------------------
 
