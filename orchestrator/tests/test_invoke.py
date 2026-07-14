@@ -438,11 +438,12 @@ class TestSandboxCallerPropagatesTimedOut:
 
 @pytest.mark.asyncio
 class TestPricesThreadedToParser:
-    """`prices` must reach _parse_codex_output from both _invoke_codex directly
-    and via invoke_agent(backend='codex') (task 2459).
+    """`prices` must reach both _parse_codex_output and _parse_gemini_output,
+    from the backend-specific _invoke_* function directly and via
+    invoke_agent(backend=...) (task 2459).
 
-    Uses a deliberately non-seed rate (100.0/100.0) so a passing cost proves
-    the passed-in map — not the packaged default_price_table() — was used.
+    Uses a deliberately non-seed rate so a passing cost proves the passed-in
+    map — not the packaged default_price_table() — was used.
     """
 
     async def test_invoke_codex_forwards_prices_to_parser(self, tmp_path):
@@ -475,6 +476,37 @@ class TestPricesThreadedToParser:
                 prices={'o4-mini': {'input_per_1m': 100.0, 'output_per_1m': 100.0}},
             )
         assert agent.cost_usd == pytest.approx((10 * 100.0 + 5 * 100.0) / 1_000_000)
+
+    async def test_invoke_gemini_forwards_prices_to_parser(self, tmp_path):
+        """_invoke_gemini(prices=...) reaches _parse_gemini_output's cost calc."""
+        gemini_result = _SubprocessResult(
+            stdout=_GEMINI_VALID_JSON_STDOUT, stderr='', returncode=0, duration_ms=100,
+        )
+        with patch('orchestrator.agents.invoke._run_subprocess_local',
+                   new_callable=AsyncMock, return_value=gemini_result):
+            agent = await _invoke_gemini(
+                prompt='hello', system_prompt='sys', cwd=tmp_path,
+                model='gemini-3-flash', max_budget_usd=1.0,
+                mcp_config=None, sandbox_modules=None, effort=None,
+                timeout_seconds=30.0,
+                prices={'gemini-3-flash': {'input_per_1m': 50.0, 'output_per_1m': 50.0}},
+            )
+        assert agent.cost_usd == pytest.approx((10 * 50.0 + 5 * 50.0) / 1_000_000)
+
+    async def test_invoke_agent_forwards_prices_to_invoke_gemini(self, tmp_path):
+        """invoke_agent(backend='gemini', prices=...) forwards through to _invoke_gemini."""
+        gemini_result = _SubprocessResult(
+            stdout=_GEMINI_VALID_JSON_STDOUT, stderr='', returncode=0, duration_ms=100,
+        )
+        with patch('orchestrator.agents.invoke._run_subprocess_local',
+                   new_callable=AsyncMock, return_value=gemini_result):
+            agent = await invoke_agent(
+                prompt='hello', system_prompt='sys', cwd=tmp_path,
+                backend='gemini', model='gemini-3-flash', max_budget_usd=1.0,
+                sandbox_modules=None, effort=None, timeout_seconds=30.0,
+                prices={'gemini-3-flash': {'input_per_1m': 50.0, 'output_per_1m': 50.0}},
+            )
+        assert agent.cost_usd == pytest.approx((10 * 50.0 + 5 * 50.0) / 1_000_000)
 
 
 @pytest.mark.asyncio
