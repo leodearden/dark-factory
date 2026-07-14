@@ -21,9 +21,12 @@ projection instead of maintaining an independent copy.
 
 from __future__ import annotations
 
+import asyncio
+import contextlib
 import enum
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
-from typing import Literal
+from typing import Literal, TypeVar
 
 from shared.task_statuses import TaskStatus
 from shared.task_transitions import (
@@ -38,6 +41,7 @@ from orchestrator.verify_categories import FailureCategory
 __all__ = [
     "STATE_TO_STATUS",
     "BlockDisposition",
+    "CancellationScope",
     "IllegalTransition",
     "RequeueKind",
     "StewardBudgetExhausted",
@@ -53,6 +57,8 @@ __all__ = [
     "WorkflowState",
     "WorkflowStateMachine",
 ]
+
+_T = TypeVar('_T')
 
 
 class WorkflowState(enum.Enum):
@@ -683,3 +689,74 @@ class WorkflowCancelled(Exception):
     """
 
     kind: Literal['hard', 'soft']
+
+
+# The ordered, kind-aware terminal-cleanup list a CancellationScope runs on
+# every exit from `supervise` (normal return, soft-cancel, or hard-cancel).
+# `kind` is None for a normal (non-cancelled) exit.
+OnTerminalEntry = tuple[str, Callable[[Literal['hard', 'soft'] | None], Awaitable[None]]]
+
+
+class CancellationScope:
+    """Supervises a workflow body coroutine and turns either a hard
+    ``task.cancel()`` or the soft *cancel_event* firing into ONE typed
+    :class:`WorkflowCancelled`, running an ordered ``on_terminal`` cleanup
+    list exactly once on every exit (CX-1, PRD §8.2, this task's design
+    decisions).
+
+    Soft-cancel is DETECTED by racing *cancel_event* against the body task
+    via ``asyncio.wait`` — never injected as a ``CancelledError`` into the
+    body — so it can never be silently swallowed by an inner
+    ``except asyncio.CancelledError`` / ``contextlib.suppress`` block
+    somewhere inside the body (``_drive()`` and its callees have several).
+    Hard-cancel is the outer ``await`` (this coroutine's own await point)
+    being cancelled, or the body itself spontaneously raising
+    ``CancelledError`` (a shutdown-race teardown) — both typed ``'hard'``.
+    """
+
+    def __init__(
+        self,
+        cancel_event: asyncio.Event,
+        on_terminal: list[OnTerminalEntry],
+    ) -> None:
+        self._cancel_event = cancel_event
+        self._on_terminal = on_terminal
+
+    async def supervise(self, body_coro: Awaitable[_T]) -> _T:
+        """Run *body_coro* under supervision; return its result, or raise
+        :class:`WorkflowCancelled` on hard/soft cancellation.
+
+        The resolved cancellation *kind* (``None`` on a normal exit) is
+        always passed to every ``on_terminal`` entry, in order, exactly
+        once — via the ``finally`` below, so it runs on every exit path.
+        """
+        body = asyncio.ensure_future(body_coro)
+        waiter = asyncio.create_task(self._cancel_event.wait())
+        kind: Literal['hard', 'soft'] | None = None
+        try:
+            done, _pending = await asyncio.wait(
+                {body, waiter}, return_when=asyncio.FIRST_COMPLETED,
+            )
+            if body in done:
+                exc = body.exception()
+                if exc is not None:
+                    raise exc
+                return body.result()
+            # waiter resolved first (event fired) and body is still
+            # pending — a genuine soft-cancel, not a same-window race
+            # (the `body in done` branch above already wins any race
+            # where both resolved in the same asyncio.wait() window).
+            kind = 'soft'
+            raise WorkflowCancelled('soft')
+        finally:
+            for t in (waiter, body):
+                if not t.done():
+                    t.cancel()
+                    with contextlib.suppress(asyncio.CancelledError):
+                        await t
+            await self._run_on_terminal(kind)
+
+    async def _run_on_terminal(self, kind: Literal['hard', 'soft'] | None) -> None:
+        """Run every ``on_terminal`` entry, in order, passing *kind*."""
+        for _name, fn in self._on_terminal:
+            await fn(kind)
