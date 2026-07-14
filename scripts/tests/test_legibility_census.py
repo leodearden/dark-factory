@@ -412,3 +412,67 @@ def test_preflight_headroom_invocation_error_defers_fail_safe():
     result = mod.preflight_headroom(raising_invoke, model="sonnet")
     assert result.ok is False
     assert result.reason
+
+
+# ---------------------------------------------------------------------------
+# step-9: RED — build_task_payloads() curator-path submit_task payloads
+# ---------------------------------------------------------------------------
+
+def _verified_cluster(**overrides):
+    cluster = {
+        "title": "Silent no-op subagent contract",
+        "summary": "Agents were given contracts their runtime could not honor.",
+        "evidence": ["quote from a transcript"],
+        "severity": "high",
+        "sightings": [
+            {"origin_phase": "implement", "manifested_phase": "verify", "session": "sess-1"},
+        ],
+    }
+    cluster.update(overrides)
+    return cluster
+
+
+def test_build_task_payloads_one_payload_per_cluster_curator_path():
+    clusters = [_verified_cluster(title="Cluster A"), _verified_cluster(title="Cluster B")]
+    payloads = mod.build_task_payloads(
+        clusters, project_root="/home/leo/src/some-project", project_id="some_project",
+    )
+
+    assert len(payloads) == 2
+    for payload in payloads:
+        assert payload.get("task_kind", "normal") == "normal"
+        assert "planning_mode" not in payload, "curator dedup path -- never planning_mode"
+        assert payload["project_root"] == "/home/leo/src/some-project"
+        assert payload["title"]
+        assert payload["description"]
+
+
+def test_build_task_payloads_title_and_description_sourced_from_cluster():
+    cluster = _verified_cluster(
+        title="A specific novel cause", summary="A precise factual summary of what happened.",
+    )
+    payloads = mod.build_task_payloads([cluster], project_root="/root", project_id="proj")
+    assert "A specific novel cause" in payloads[0]["title"]
+    assert "A precise factual summary of what happened." in payloads[0]["description"]
+
+
+def test_build_task_payloads_description_has_no_prose_routing_intent():
+    clusters = [_verified_cluster()]
+    payloads = mod.build_task_payloads(clusters, project_root="/root", project_id="proj")
+    description = payloads[0]["description"].lower()
+    for banned_phrase in ("file this into", "route to", "planning_mode"):
+        assert banned_phrase not in description
+
+
+def test_build_task_payloads_harness_rooted_cause_can_target_dark_factory():
+    clusters = [
+        _verified_cluster(
+            title="Orchestrator confusion",
+            target_project_root="/home/leo/src/dark-factory",
+            target_project_id="dark_factory",
+        )
+    ]
+    payloads = mod.build_task_payloads(
+        clusters, project_root="/home/leo/src/hosted-project", project_id="hosted_project",
+    )
+    assert payloads[0]["project_root"] == "/home/leo/src/dark-factory"
