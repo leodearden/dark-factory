@@ -308,21 +308,6 @@ You MUST call `submit_triage` exactly once, as your final action.
 """
 
 
-def parse_triage_result(result) -> dict | None:
-    """Extract structured triage output from an AgentResult.
-
-    Returns the parsed dict on success, None on failure.
-    """
-    if result.structured_output and isinstance(result.structured_output, dict):
-        required = {'accepted', 'skipped', 'proposed_task_groups'}
-        if required <= result.structured_output.keys():
-            return result.structured_output
-        logger.warning('Triage result missing required keys: %s', required - result.structured_output.keys())
-    else:
-        logger.warning('Triage agent returned no structured output (success=%s)', result.success)
-    return None
-
-
 def extract_triage_verdict(envelope: dict | None) -> dict | None:
     """Unwrap and validate a verdict-tools envelope's triage payload.
 
@@ -331,9 +316,8 @@ def extract_triage_verdict(envelope: dict | None) -> dict | None:
     ``{role, schema_version, session_id, emitted_at, verdict: {...}}``.
     Returns the inner ``verdict`` dict on success, or None on any failure
     (no envelope, non-dict envelope, missing/non-dict ``verdict``, or a
-    verdict dict missing one of the required keys) — mirroring
-    :func:`parse_triage_result`'s fail-safe contract so the caller can fall
-    back to inline triage.
+    verdict dict missing one of the required keys) — a fail-safe contract
+    so the caller can fall back to inline triage.
     """
     if not isinstance(envelope, dict):
         logger.warning('Triage verdict envelope missing or not a dict (got %r)', type(envelope).__name__)

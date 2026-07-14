@@ -2,15 +2,12 @@
 
 from __future__ import annotations
 
-from unittest.mock import MagicMock
-
 import pytest
 
 from orchestrator.agents.triage import (
     _combine_suggestion_hashes,
     build_triage_prompt,
     format_pretriaged_detail,
-    parse_triage_result,
     sha256_16,
     suggestion_hash,
 )
@@ -73,45 +70,6 @@ class TestBuildTriagePrompt:
         assert 'accepted' in prompt
         assert 'skipped' in prompt
         assert 'proposed_task_groups' in prompt
-
-
-# ---------------------------------------------------------------------------
-# parse_triage_result
-# ---------------------------------------------------------------------------
-
-class TestParseTriageResult:
-    def test_valid_structured_output(self):
-        result = MagicMock()
-        result.structured_output = {
-            'accepted': [{'index': 0, 'suggestion': 'x', 'reason': 'y',
-                          'files': ['a.py'], 'proposed_task_title': 'Fix x'}],
-            'skipped': [{'index': 1, 'suggestion': 'z', 'reason': 'n/a'}],
-            'proposed_task_groups': [{'title': 'Fix x', 'description': 'do it',
-                                      'accepted_indices': [0]}],
-        }
-        result.success = True
-        parsed = parse_triage_result(result)
-        assert parsed is not None
-        assert len(parsed['accepted']) == 1
-        assert len(parsed['skipped']) == 1
-
-    def test_returns_none_on_missing_keys(self):
-        result = MagicMock()
-        result.structured_output = {'accepted': []}
-        result.success = True
-        assert parse_triage_result(result) is None
-
-    def test_returns_none_on_no_structured_output(self):
-        result = MagicMock()
-        result.structured_output = None
-        result.success = False
-        assert parse_triage_result(result) is None
-
-    def test_returns_none_on_non_dict(self):
-        result = MagicMock()
-        result.structured_output = 'not a dict'
-        result.success = True
-        assert parse_triage_result(result) is None
 
 
 # ---------------------------------------------------------------------------
