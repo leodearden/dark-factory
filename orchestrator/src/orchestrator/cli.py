@@ -341,6 +341,53 @@ def status(config_path: Path | None):
     asyncio.run(_show())
 
 
+@main.command('probe-models')
+@click.option('--config', 'config_path', type=click.Path(exists=True, path_type=Path),
+              default=None,
+              help='Path to orchestrator config YAML (REQUIRED unless ORCH_CONFIG_PATH '
+                   'is set). Selects the target project — sets project_root and '
+                   'fused_memory.project_id.')
+@click.option('--models', 'models_csv', default=None,
+              help='Comma-separated model list to probe, overriding the default '
+                   '(config.routing.allowed_models plus the fable candidate model).')
+@click.option('--output', 'output_path', type=click.Path(path_type=Path),
+              default=None,
+              help='Where to write the rendered probe artifact YAML (default: '
+                   'routing.DEFAULT_PROBE_ARTIFACT_PATH, i.e. config/model-availability.yaml).')
+def probe_models(config_path: Path | None, models_csv: str | None, output_path: Path | None):
+    """Probe every configured pool account x candidate model for availability
+    and write the rendered status artifact (default config/model-availability.yaml).
+
+    The probed model set defaults to config.routing.allowed_models plus the
+    fable candidate model (see routing.probe_models); pass --models to
+    override with an explicit comma-separated list.
+    """
+    from datetime import UTC, datetime
+
+    from orchestrator import routing
+
+    try:
+        config = load_config(config_path)
+    except ConfigRequiredError as e:
+        click.echo(f'Error: {e}', err=True)
+        sys.exit(1)
+
+    models = [m.strip() for m in models_csv.split(',')] if models_csv else None
+
+    report = asyncio.run(routing.probe_models(
+        config.usage_cap.accounts, config.routing.allowed_models, models=models,
+    ))
+
+    generated_at = datetime.now(UTC).isoformat()
+    artifact = routing.render_probe_artifact(report, generated_at)
+
+    out_path = output_path or Path(routing.DEFAULT_PROBE_ARTIFACT_PATH)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    out_path.write_text(artifact)
+
+    click.echo(f'Wrote model availability artifact to {out_path}')
+
+
 @main.command('verify-merge')
 @click.option('--sha', required=True, help='Merge commit SHA to verify (must be present in the local repo)')
 @click.option('--spec', 'spec_json', required=True, help='MergeVerifySpec as a JSON string (from RemoteRunner dispatch)')
