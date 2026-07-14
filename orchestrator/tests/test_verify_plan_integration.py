@@ -921,3 +921,151 @@ class TestB3GateProposalRouting:
             investigated_at='',
         )
         assert BlockRecord.from_dict(record.to_dict()) == record
+
+
+# ── step-19/20: Scenario 12 — ephemeral_worktree no-prune across both probes
+#               (E1/E2); Boundary-test sketch row 12 ────────────────────────
+
+_MAIN_TIP_SHA = 'c' * 40
+
+
+def _make_fake_git_ops_run(add_rcs: list[int], calls: list[list[str]]):
+    """Fake ``orchestrator.git_ops._run`` recording every argv into *calls*.
+
+    Ported from test_ephemeral_worktree.py's ``_make_fake_run``. ``git
+    worktree add`` return codes are consumed in order from *add_rcs* (the
+    last entry repeats once exhausted). A successful add mkdirs the
+    ``--detach`` target, mirroring what real ``git worktree add`` does, so
+    the CM's unconditional ``shutil.rmtree`` has something real on disk to
+    remove. Every other command (e.g. ``git worktree remove``) always
+    succeeds.
+    """
+    state = {'add_calls': 0}
+
+    async def _fake_run(cmd, **kwargs):
+        calls.append(list(cmd))
+        if 'worktree' in cmd and 'add' in cmd:
+            idx = state['add_calls']
+            rc = add_rcs[idx] if idx < len(add_rcs) else add_rcs[-1]
+            state['add_calls'] += 1
+            if rc == 0:
+                detach_idx = cmd.index('--detach')
+                Path(cmd[detach_idx + 1]).mkdir(parents=True, exist_ok=True)
+            return (rc, '', '' if rc == 0 else 'lock contention')
+        return (0, '', '')
+
+    return _fake_run
+
+
+_MAIN_TIP_PASSING_RESULT = VerifyResult(
+    passed=True, test_output='', lint_output='', type_output='',
+    summary='all checks passed',
+)
+
+
+class TestEphemeralWorktreeNoPrune:
+    """Scenario 12 — GOLDEN: both main-tip probes
+
+    (verify_failure_is_preexisting_on_main, run_main_tip_sweep) build their
+    throwaway worktree via the REAL GitOps.ephemeral_worktree CM and NEVER
+    issue a broad ``git worktree prune`` (DD5/E1 — the incident-prevention
+    invariant this task exists to add), and both WorktreeKind prefixes are
+    E2-registered in PROTECTED_PREFIXES.
+
+    REAL: GitOps over the module's real git_repo fixture; the CM's own
+    add/remove/cleanup control flow.
+    FAKED (boundary only): orchestrator.git_ops._run (an argv-recording fake
+    standing in for the ssh/subprocess boundary) and the inner verifies
+    (run_scoped_verification / run_full_verification -> a passing
+    VerifyResult; the preexisting-on-main probe's failing_result carries a
+    category/cause_hint UNIQUE to this test so its key can never collide
+    with another test's entry in the process-wide, TTL-cached
+    verify._PROBE_CACHE).
+
+    RED until step-20 imports verify_failure_is_preexisting_on_main +
+    run_main_tip_sweep from orchestrator.verify and WorktreeKind +
+    PROTECTED_PREFIXES from orchestrator.git_ops.
+    """
+
+    def test_verify_failure_is_preexisting_on_main_routes_through_cm_no_prune(
+        self, tmp_path, config, git_ops,
+    ):
+        git_ops.get_main_sha = AsyncMock(return_value=_MAIN_TIP_SHA)
+        git_ops.worktree_base.mkdir(parents=True, exist_ok=True)
+        worktree = tmp_path / 'task-wt'
+        worktree.mkdir()
+
+        failing_result = VerifyResult(
+            passed=False, test_output='', lint_output='', type_output='',
+            summary='iota_scenario12_mainprobe_signal',
+            cause_hint='task iota scenario 12 ephemeral_worktree routing signal (mainprobe)',
+            category='task_iota_scenario12_mainprobe',
+        )
+
+        calls: list = []
+        with (
+            patch.object(
+                verify, 'run_scoped_verification',
+                new=AsyncMock(return_value=_MAIN_TIP_PASSING_RESULT),
+            ),
+            patch('orchestrator.git_ops._run', side_effect=_make_fake_git_ops_run([0], calls)),
+            patch.object(
+                git_ops, 'ephemeral_worktree', wraps=git_ops.ephemeral_worktree,
+            ) as spied_cm,
+        ):
+            asyncio.run(
+                verify_failure_is_preexisting_on_main(
+                    worktree, config, [], ['src/foo.tsx'], failing_result, git_ops,
+                )
+            )
+
+        assert spied_cm.call_count >= 1, (
+            'expected verify_failure_is_preexisting_on_main to build its probe '
+            'worktree via git_ops.ephemeral_worktree(); got 0 calls'
+        )
+        assert not any(
+            'worktree' in c and 'prune' in c for c in calls
+        ), f'probe must NEVER issue a prune argv (DD5/E1); got calls={calls}'
+        assert any(
+            'worktree' in c and 'remove' in c and '--force' in c for c in calls
+        ), f'expected a scoped "git worktree remove --force" argv; got calls={calls}'
+
+    def test_run_main_tip_sweep_routes_through_cm_no_prune(self, config, git_ops):
+        git_ops.get_main_sha = AsyncMock(return_value=_MAIN_TIP_SHA)
+        git_ops.worktree_base.mkdir(parents=True, exist_ok=True)
+
+        calls: list = []
+
+        async def _fake_full_verify(project_root, cfg, **kwargs):
+            return _MAIN_TIP_PASSING_RESULT
+
+        with (
+            patch.object(verify, 'run_full_verification', side_effect=_fake_full_verify),
+            patch('orchestrator.git_ops._run', side_effect=_make_fake_git_ops_run([0], calls)),
+            patch.object(
+                git_ops, 'ephemeral_worktree', wraps=git_ops.ephemeral_worktree,
+            ) as spied_cm,
+        ):
+            result = asyncio.run(run_main_tip_sweep(config, git_ops))
+
+        assert result is not None, f'expected a (sha, VerifyResult) tuple, got {result!r}'
+        assert spied_cm.call_count >= 1, (
+            'expected run_main_tip_sweep to build its sweep worktree via '
+            'git_ops.ephemeral_worktree(); got 0 calls'
+        )
+        assert not any(
+            'worktree' in c and 'prune' in c for c in calls
+        ), f'probe must NEVER issue a prune argv (DD5/E1); got calls={calls}'
+        assert any(
+            'worktree' in c and 'remove' in c and '--force' in c for c in calls
+        ), f'expected a scoped "git worktree remove --force" argv; got calls={calls}'
+
+    def test_both_worktree_kind_prefixes_are_e2_registered(self):
+        assert WorktreeKind.MAIN_PROBE.value in PROTECTED_PREFIXES, (
+            f'expected MAIN_PROBE prefix in PROTECTED_PREFIXES; got keys='
+            f'{list(PROTECTED_PREFIXES)!r}'
+        )
+        assert WorktreeKind.MAIN_SWEEP.value in PROTECTED_PREFIXES, (
+            f'expected MAIN_SWEEP prefix in PROTECTED_PREFIXES; got keys='
+            f'{list(PROTECTED_PREFIXES)!r}'
+        )
