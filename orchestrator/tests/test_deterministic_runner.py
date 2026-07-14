@@ -3601,6 +3601,61 @@ class TestCrashWindowReverify:
         assert pending[0].summary == 'Deploy state unknown after crash: orchestrator-reify.service'
         script_runner.assert_not_awaited()
 
+    async def test_ran_phase_no_baseline_crash_window_does_not_reinspect(
+        self, tmp_path: Path,
+    ):
+        """Test-coverage gap (task 2618 review): the re-verify gate has THREE
+        conjuncts — deploy_state is not None, phase == RAN, AND
+        verify_baseline is not None. test_no_baseline_crash_window_does_not_
+        reinspect above exercises the first conjunct (no deploy_state at
+        all, pre-ζ shape); this exercises the third conjunct in isolation: a
+        genuine ζ RAN-phase strand (deploy_state IS present, phase IS 'ran')
+        that never persisted a verify_baseline (the DS-3 enrichment is
+        best-effort and can be skipped, e.g. the orchestrator crashed before
+        the pre-deploy baseline inspect completed). Must fall through to the
+        generic crash-window escalation unchanged, with no re-inspect and no
+        phantom-done — pins the `verify_baseline is not None` short-circuit
+        so a regression that dropped it (reverting to the classifier's
+        near-constant-'healthy' no-baseline liveness fallback for an
+        always-on unit — the exact scenario finding-4.0's D3 guard exists
+        for) would be caught here too."""
+        from orchestrator.deterministic_runner import DeterministicRunner
+        from orchestrator.workflow import WorkflowOutcome
+
+        task = _deploy_task(
+            task_id='905',
+            before_done_ran_at='2026-06-23T10:00:00+00:00',
+            phase='ran',
+        )
+        assignment = _make_assignment(task)
+        queue = EscalationQueue(tmp_path)
+        scheduler = _mock_scheduler(task)
+
+        # A live inspect that WOULD classify 'healthy' if the re-verify gate
+        # were wrongly triggered — proves the assertions below are non-vacuous.
+        unit_inspector = AsyncMock(return_value=_FRESH_UNIT_STATE)
+        script_runner = AsyncMock(return_value=(0, 'ok'))
+
+        runner = DeterministicRunner(
+            scheduler=scheduler,
+            escalation_queue=queue,
+            unit_inspector=unit_inspector,
+            script_runner=script_runner,
+        )
+        outcome = await runner.run(assignment)
+
+        assert outcome == WorkflowOutcome.BLOCKED
+        unit_inspector.assert_not_awaited()
+        pending = queue.get_by_task('905', status='pending')
+        assert len(pending) == 1, (
+            f'no-baseline RAN-phase crash-window must escalate exactly once, got {len(pending)}'
+        )
+        assert pending[0].category == 'infra_issue'
+        assert pending[0].summary == 'Deploy state unknown after crash: orchestrator-reify.service'
+        done_calls = [c for c in scheduler.set_task_status.call_args_list if c.args[1] == 'done']
+        assert not done_calls, 'a no-baseline RAN-phase strand must never phantom-done'
+        script_runner.assert_not_awaited()
+
     async def test_escalated_phase_with_deleted_escalations_does_not_reinspect(
         self, tmp_path: Path,
     ):
