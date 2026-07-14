@@ -60,8 +60,6 @@ from orchestrator.event_store import EventStore, EventType
 from orchestrator.git_ops import (
     GitOps,
     TrainMembership,
-    WarmLanePoolExhausted,
-    WarmLanePoolHardDown,
     WarmLaneRequeue,
     WorktreeConflictError,
     _run,
@@ -2233,52 +2231,33 @@ class TaskWorkflow:
             )
 
         except WarmLaneRequeue as e:
-            # Discriminate the subclass for the block-reason annotation so the
-            # requeue is traceable in metrics / steward review.
-            # WarmLanePoolExhausted → backpressure (all lanes ASSIGNED).
-            # WarmLaneDiskPressure  → transient infra (seed exited 75 EX_TEMPFAIL).
-            # FAULT (RuntimeError) is deliberately NOT caught here — it falls through
-            # to the broad except below → _mark_blocked → BLOCKED + L1.
+            # W9-ε: block_reason is now single-sourced from
+            # classify_failure(e) -> BlockDisposition instead of this
+            # clause's own inline isinstance(e, WarmLanePoolHardDown)/
+            # ...Exhausted/... triage — MRO resolution means a real subclass
+            # instance always matches its OWN _DISPOSITION_TABLE row first
+            # (e.g. WarmLanePoolHardDown before the WarmLaneRequeue base
+            # row), so this reproduces the old per-subclass strings exactly.
+            # FAULT (RuntimeError) is deliberately NOT caught here — it falls
+            # through to the broad except below → _mark_blocked → BLOCKED + L1.
             #
-            # NOTE (Suggestion 2 / follow-up; extended for WarmLanePoolHardDown
-            # by reviewer_comprehensive resource_efficiency, task 2061 amendment
-            # pass): WarmLanePoolExhausted, WarmLaneDiskPressure, AND
-            # WarmLanePoolHardDown requeues all return WorkflowOutcome.REQUEUED
-            # here, which the harness counts against the per-task requeue_cap
-            # equally.  This is intentional for EXHAUSTED (genuine backpressure)
-            # but is undesirable for DISK_PRESSURE and HARD_DOWN (both transient
-            # infra): a persistent condition will tight-loop, burning the retry
-            # budget with no backoff.  HARD_DOWN's exposure is bounded relative
-            # to DISK_PRESSURE's, though: the scheduler's proactive per-tick
-            # watchdog (Scheduler._apply_warm_base_hard_down_watchdog) halts ALL
-            # new dispatch host-wide the moment it observes ABSENT, so once
-            # engaged a requeued task simply waits parked instead of being
-            # redispatched into the same failure — only a task that races ahead
-            # of the watchdog on the very first tick spends one requeue before
-            # the halt engages.  The block_reason discriminant is already set so
-            # a future scheduler change can special-case both
-            # 'warm_lane_disk_pressure (transient infra)' and
-            # 'warm_lane_pool_hard_down' to exclude these requeues from the cap
-            # (analogous to the HTTP-5xx transient exclusion in
-            # is_transient_api_requeue).  Touching scheduler.py's requeue-cap
-            # classifier for this is out of scope for this task; tracking as a
-            # follow-up is acceptable per reviewer_comprehensive.
-            #
-            # WarmLanePoolHardDown (task 2061) — the warm base is absent, a
-            # HOST-SCOPED pool condition (one base serves every lane).  Checked
-            # FIRST since one dispatched task hitting this is symptomatic of a
-            # host-wide condition the scheduler's warm-base hard-down watchdog
-            # is the primary defense for; this requeue is defense-in-depth for
-            # any task already in flight when the base vanished.
-            if isinstance(e, WarmLanePoolHardDown):
-                block_reason = 'warm_lane_pool_hard_down'
-            elif isinstance(e, WarmLanePoolExhausted):
-                block_reason = 'warm_lane_pool_exhausted'
-            else:  # WarmLaneDiskPressure
-                block_reason = 'warm_lane_disk_pressure (transient infra)'
+            # counts_against_requeue_cap is DECLARED once per warm-lane
+            # subclass in the table (EXHAUSTED=True — genuine backpressure;
+            # DISK_PRESSURE/HARD_DOWN=False — transient infra) — the single
+            # source of truth replacing the buried NOTE formerly here (see
+            # workflow_types._disposition_table()'s warm-lane rows for the
+            # full rationale). This clause still unconditionally returns
+            # REQUEUED for every WarmLaneRequeue subclass — routing that
+            # policy into the scheduler's transient requeue-cap bucket
+            # (record_requeue → is_transient_api_requeue) remains a tracked
+            # follow-up outside this task's module scope (scheduler.py /
+            # harness.py), so counts_against_requeue_cap is surfaced in the
+            # log below for observability only, not yet consumed.
+            disp = classify_failure(e)
+            block_reason = disp.reason_prefix
             logger.info(
-                'Task %s: warm-lane requeue (%s): %s',
-                self.task_id, block_reason, e,
+                'Task %s: warm-lane requeue (%s, counts_against_requeue_cap=%s): %s',
+                self.task_id, block_reason, disp.counts_against_requeue_cap, e,
             )
             # TerminalReport.phase is machine.state — this path never calls
             # _enter_phase, so it is the pre-existing working phase (PLAN,
