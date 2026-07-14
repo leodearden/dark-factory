@@ -1861,6 +1861,15 @@ class DeterministicRunner:
                 # reboot, so a post-reboot re-verify conservatively falls
                 # through to 'unconfirmed' (safe — never phantom-done; a
                 # reboot strand still resolves via a human, as today).
+                # reverify_note, when set, records that a live re-verify was
+                # attempted and came back non-healthy — enriches the
+                # escalation detail below so the operator sees the runner
+                # already re-checked (distinct from the no-baseline case,
+                # which never attempts a re-verify and keeps the original
+                # generic detail).  The summary is deliberately left
+                # untouched in both cases — it is the dedup/reblock_guard
+                # signature and must stay stable.
+                reverify_note: str | None = None
                 if deploy_state is not None and deploy_state.verify_baseline is not None:
                     inspect_fn = self._unit_inspector or self._default_inspect_unit
                     fresh_state = await inspect_fn(target_unit)
@@ -1884,6 +1893,12 @@ class DeterministicRunner:
                         'escalation',
                         task_id, verdict, fresh_state,
                     )
+                    reverify_note = (
+                        f'A live re-verify was attempted against the persisted '
+                        f'verify_baseline and came back {verdict!r} (observed '
+                        f'unit state: {fresh_state}) — not confirmed fresh enough '
+                        f'to recover automatically.'
+                    )
 
                 # Re-escalate instead of phantom-completing; the deploy is NOT
                 # re-run (I1 once-only) — a human must verify the unit state.
@@ -1893,7 +1908,7 @@ class DeterministicRunner:
                     'instead of phantom-done',
                     task_id,
                 )
-                crash_detail = '\n'.join([
+                crash_detail_lines = [
                     description,
                     f'Target unit: {target_unit}',
                     'before_done_ran_at is stamped but the deploy recorded neither a '
@@ -1901,11 +1916,13 @@ class DeterministicRunner:
                     'escalation — the orchestrator crashed mid-deploy between '
                     'stamping and completing.  The deploy is NOT re-run (I1 '
                     'once-only); a human must inspect the unit and resolve.',
-                ])
+                ]
+                if reverify_note is not None:
+                    crash_detail_lines.append(reverify_note)
                 return await self._file_infra_issue_and_block(
                     task_id,
                     summary=f'Deploy state unknown after crash: {target_unit}',
-                    detail=crash_detail,
+                    detail='\n'.join(crash_detail_lines),
                     metadata=metadata,
                 )
 
