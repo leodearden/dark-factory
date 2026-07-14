@@ -302,3 +302,69 @@ def test_mine_to_saturation_exhausts_source_that_never_saturates():
     assert len(result.batch_stats) == 3
     assert all(s.dup_rate == pytest.approx(0.0) for s in result.batch_stats)
     assert len(result.records) == 12
+
+
+# ---------------------------------------------------------------------------
+# step-5: RED — compute_matrix() / render_matrix() origin x manifestation
+# ---------------------------------------------------------------------------
+
+def test_compute_matrix_tallies_origin_manifestation_pairs():
+    sightings = [
+        {"origin_phase": "implement", "manifested_phase": "merge"},
+        {"origin_phase": "implement", "manifested_phase": "merge"},
+        {"origin_phase": "implement", "manifested_phase": "verify"},
+        {"origin_phase": "review", "manifested_phase": "merge"},
+    ]
+    matrix = mod.compute_matrix(sightings)
+    assert matrix["implement"]["merge"] == 2
+    assert matrix["implement"]["verify"] == 1
+    assert matrix["review"]["merge"] == 1
+    assert "unknown" not in matrix, "no unknown sighting present -> no unknown bucket"
+
+
+def test_compute_matrix_unknown_origin_or_manifested_lands_in_explicit_unknown_bucket():
+    sightings = [
+        {"origin_phase": "unknown", "manifested_phase": "merge"},
+        {"origin_phase": "implement", "manifested_phase": "unknown"},
+        {"origin_phase": None, "manifested_phase": None},  # absent entirely -> unknown/unknown
+    ]
+    matrix = mod.compute_matrix(sightings)
+    assert matrix["unknown"]["merge"] == 1
+    assert matrix["implement"]["unknown"] == 1
+    assert matrix["unknown"]["unknown"] == 1
+    # never inferred to a concrete phase -- the only rows are the ones actually seen
+    assert set(matrix.keys()) == {"unknown", "implement"}
+
+
+def test_compute_matrix_empty_sightings_is_empty_matrix():
+    assert mod.compute_matrix([]) == {}
+
+
+def test_render_matrix_deterministic_table_with_unknown_row_col_when_present():
+    sightings = [
+        {"origin_phase": "implement", "manifested_phase": "merge"},
+        {"origin_phase": "implement", "manifested_phase": "merge"},
+        {"origin_phase": "unknown", "manifested_phase": "merge"},
+    ]
+    matrix = mod.compute_matrix(sightings)
+    rendered = mod.render_matrix(matrix)
+
+    lines = rendered.rstrip("\n").split("\n")
+    assert lines[0] == "| origin \\ manifested | merge |"
+    assert lines[1] == "| --- | --- |"
+    assert lines[2] == "| implement | 2 |"
+    assert lines[3] == "| unknown | 1 |"
+    assert len(lines) == 4
+    # deterministic: same input renders byte-identical output every time
+    assert rendered == mod.render_matrix(mod.compute_matrix(sightings))
+
+
+def test_render_matrix_omits_unknown_when_no_unknown_sightings():
+    sightings = [{"origin_phase": "implement", "manifested_phase": "merge"}]
+    matrix = mod.compute_matrix(sightings)
+    rendered = mod.render_matrix(matrix)
+    assert "unknown" not in rendered
+
+
+def test_render_matrix_empty_matrix_is_deterministic_placeholder():
+    assert mod.render_matrix({}) == "_No sightings recorded._\n"
