@@ -175,6 +175,44 @@ class TestToggleHistory:
                 table.get_row('dead-1')
             assert table.row_count == 1
 
+    @pytest.mark.timeout(10)
+    async def test_toggle_persists_across_a_poll_tick(self, tmp_path):
+        """_rebuild_session_table reads self._show_history fresh on every
+        _apply_scan (both the synchronous refresh_registry path and the
+        threaded poll path route through it) -- so toggling history on and
+        then having a scan pick up a disk change must not silently revert
+        to the filtered default view. A regression that reset the flag, or
+        that hard-coded the filtered view inside _apply_scan, would only be
+        caught by a test with an intervening scan -- pressing 'h' and
+        asserting immediately (as above) is not enough."""
+        from cockpit.app import CockpitApp
+        from cockpit.panes.session_table import SessionTable
+
+        live = _make_record(session_slug='live-1', status=sr.Status.RUNNING)
+        dead = _make_record(session_slug='dead-1', status=sr.Status.EXITED)
+        for r in (live, dead):
+            sr.write_record(r, root=tmp_path)
+
+        app = CockpitApp(fleet_root=tmp_path, poll_interval=0.05)
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            table = app.query_one(SessionTable)
+
+            await pilot.press('h')
+            await pilot.pause()
+
+            assert table.get_row('dead-1')
+            assert table.row_count == 2
+
+            live2 = _make_record(session_slug='live-2', status=sr.Status.RUNNING)
+            sr.write_record(live2, root=tmp_path)
+            app.refresh_registry()
+            await pilot.pause()
+
+            assert table.get_row('dead-1')
+            assert table.get_row('live-2')
+            assert table.row_count == 3
+
 
 class TestPollRefresh:
     @pytest.mark.timeout(10)
