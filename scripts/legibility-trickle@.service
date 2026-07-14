@@ -1,0 +1,20 @@
+[Unit]
+Description=Legibility nightly trickle for %i (confusion-reduction PRD task epsilon)
+Documentation=file:///home/leo/src/dark-factory/plans/confusion-reduction-prd.md
+
+[Service]
+Type=oneshot
+# All generic legibility CODE lives in the dark-factory checkout (PRD §5);
+# only the target project varies, via the %i instance name.
+WorkingDirectory=/home/leo/src/dark-factory
+# Belt-and-suspenders: nightly.py self-bootstraps scripts/ onto sys.path when
+# run directly (mirrors sampling.py/census_trigger.py's `if __name__ ==
+# "__main__"` guard), but PYTHONPATH is set explicitly too so `from legibility
+# import ...` resolves even if that self-bootstrap ever changes.
+Environment=PYTHONPATH=/home/leo/src/dark-factory/scripts
+ExecStart=/home/leo/.local/bin/uv run --frozen --project shared python scripts/legibility/nightly.py run --project-id %i
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=timers.target

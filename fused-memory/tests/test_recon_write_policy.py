@@ -77,6 +77,27 @@ class TestVerdict:
         assert error_dict['op'] == 'update_task'
         assert error_dict['live_status'] == 'done'
 
+    def test_ok_verdict_corrective_path_defaults_empty(self):
+        verdict = recon_write_policy.Verdict(outcome='ok')
+        assert verdict.corrective_path == ''
+        assert verdict.to_error_dict() == {}
+
+    def test_rejection_verdict_corrective_path_surfaces_in_error_dict(self):
+        verdict = recon_write_policy.Verdict(
+            outcome='rejection',
+            op='update_task',
+            task_id='1',
+            agent_id='recon-stage-x',
+            error_type='ReconTerminalWriteRejected',
+            reason='task is done',
+            live_status='done',
+            corrective_path='set_task_status_done_provenance_repair',
+        )
+        assert (
+            verdict.to_error_dict()['corrective_path']
+            == 'set_task_status_done_provenance_repair'
+        )
+
 
 # ---------------------------------------------------------------------------
 # check() helper
@@ -122,6 +143,59 @@ class TestCheckGate1Terminal:
         task must never surface ReconTerminalWriteRejected."""
         verdict = _check('set_task_status', target_status='pending', live_status='done')
         assert verdict.error_type != 'ReconTerminalWriteRejected'
+
+    def test_terminal_rejection_on_done_populates_corrective_path(self):
+        """Bound to the source-of-truth TERMINAL_CORRECTIVE_PATH constant
+        (rather than a repeated literal) so an accidental change to its
+        value is caught here. The sibling cancelled-task test below keeps
+        one explicit literal pin to lock the on-the-wire value."""
+        verdict = _check('update_task', live_status='done')
+        assert verdict.corrective_path == recon_write_policy.TERMINAL_CORRECTIVE_PATH
+        assert (
+            verdict.to_error_dict()['corrective_path']
+            == recon_write_policy.TERMINAL_CORRECTIVE_PATH
+        )
+
+    def test_terminal_rejection_on_cancelled_populates_corrective_path(self):
+        verdict = _check('update_task', live_status='cancelled')
+        assert verdict.corrective_path == 'set_task_status_done_provenance_repair'
+        assert (
+            verdict.to_error_dict()['corrective_path']
+            == 'set_task_status_done_provenance_repair'
+        )
+
+    def test_other_gate_rejections_leave_corrective_path_empty(self, monkeypatch):
+        """Scoping: corrective_path is a Gate-1-only redirect to the
+        same-status done_provenance repair seam. Neither a Gate-2
+        live-workflow rejection nor a Gate-3 stale-snapshot rejection is
+        served by that seam, so both must leave corrective_path == ''."""
+        monkeypatch.setattr(
+            recon_write_policy, 'is_workflow_live_for_task', lambda *a, **k: True,
+        )
+        gate2_verdict = _check('set_task_status', live_status='in-progress')
+        assert gate2_verdict.error_type == 'ReconLiveWorkflowWriteRejected'
+        assert gate2_verdict.corrective_path == ''
+
+        gate3_verdict = _check(
+            'update_task', live_status='in-progress', snapshot_token='pending',
+        )
+        assert gate3_verdict.error_type == 'ReconStaleSnapshotRejected'
+        assert gate3_verdict.corrective_path == ''
+
+    def test_terminal_hint_routes_to_set_task_status_done_provenance_repair(self):
+        """The Gate 1 hint must route metadata/done_provenance corrections
+        to the sanctioned same-status set_task_status(..., 'done',
+        done_provenance=...) repair seam. Asserted on positive semantic
+        substrings only, to avoid a brittle wording pin — a fixed negative
+        phrase pin (e.g. asserting some reopen-flavored phrase is absent)
+        would be fragile against legitimate future rewording and is not
+        needed: the old misleading hint this replaces ("route through
+        set_task_status with a reopen_reason") never mentioned
+        done_provenance at all, so the 'done_provenance' substring check
+        alone already fails against a regression back to it."""
+        hint = _check('update_task', live_status='done').hint
+        assert 'set_task_status' in hint
+        assert 'done_provenance' in hint
 
 
 # ---------------------------------------------------------------------------
@@ -207,6 +281,42 @@ class TestCheckGate3StaleSnapshot:
             'update_task', live_status='done', snapshot_token='pending',
         )
         assert verdict.error_type == 'ReconTerminalWriteRejected'
+
+
+# ---------------------------------------------------------------------------
+# Regression pin: the sanctioned same-status repair seam the new
+# corrective_path/hint redirect to is NOT itself recon-gated
+# ---------------------------------------------------------------------------
+
+
+class TestCorrectivePathSeamIsReachable:
+    def test_set_task_status_done_provenance_repair_on_done_task_is_not_gated(
+        self, monkeypatch,
+    ):
+        """Locks the invariant the Gate 1 redirect depends on: a recon-stage
+        set_task_status(task_id, 'done', ...) call against an already-done
+        task — the same-status done_provenance repair transition
+        (task_interceptor._repair_done_provenance_same_status, task 2401)
+        that corrective_path/hint now advertise — is not itself blocked by
+        this gate. Gate 1 is update_task-only (doesn't fire here); Gate 2
+        forces orchestrator_live False for a done task in the real
+        detector, mirrored here by monkeypatching it to False; Gate 3 never
+        fires because set_task_status always passes snapshot_token=None.
+        Guards against a future Gate-2 tightening silently breaking the
+        advertised corrective seam."""
+        monkeypatch.setattr(
+            recon_write_policy, 'is_workflow_live_for_task', lambda *a, **k: False,
+        )
+
+        verdict = _check(
+            'set_task_status',
+            target_status='done',
+            live_status='done',
+            snapshot_token=None,
+        )
+
+        assert verdict.is_rejection is False
+        assert verdict.corrective_path == ''
 
 
 # ---------------------------------------------------------------------------

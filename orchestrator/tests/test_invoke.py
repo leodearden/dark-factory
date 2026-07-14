@@ -5,6 +5,8 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import json
+import logging
+from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -17,6 +19,7 @@ from orchestrator.agents.invoke import (
     _invoke_claude_with_sandbox,
     _invoke_codex,
     _invoke_gemini,
+    _invoke_pi,
     _parse_codex_output,
     _parse_gemini_output,
     _run_subprocess_local,
@@ -434,6 +437,487 @@ class TestSandboxCallerPropagatesTimedOut:
                 effort=None, timeout_seconds=30.0,
             )
         assert agent.timed_out is True
+
+
+@pytest.mark.asyncio
+class TestPricesThreadedToParser:
+    """`prices` must reach both _parse_codex_output and _parse_gemini_output,
+    from the backend-specific _invoke_* function directly and via
+    invoke_agent(backend=...) (task 2459).
+
+    Uses a deliberately non-seed rate so a passing cost proves the passed-in
+    map — not the packaged default_price_table() — was used.
+    """
+
+    async def test_invoke_codex_forwards_prices_to_parser(self, tmp_path):
+        """_invoke_codex(prices=...) reaches _parse_codex_output's cost calc."""
+        codex_result = _SubprocessResult(
+            stdout=_CODEX_VALID_JSONL_STDOUT, stderr='', returncode=0, duration_ms=100,
+        )
+        with patch('orchestrator.agents.invoke._run_subprocess_local',
+                   new_callable=AsyncMock, return_value=codex_result):
+            agent = await _invoke_codex(
+                prompt='hello', system_prompt='sys', cwd=tmp_path,
+                model='o4-mini', max_budget_usd=1.0,
+                mcp_config=None, sandbox_modules=None, effort=None,
+                timeout_seconds=30.0,
+                prices={'o4-mini': {'input_per_1m': 100.0, 'output_per_1m': 100.0}},
+            )
+        assert agent.cost_usd == pytest.approx((10 * 100.0 + 5 * 100.0) / 1_000_000)
+
+    async def test_invoke_agent_forwards_prices_to_invoke_codex(self, tmp_path):
+        """invoke_agent(backend='codex', prices=...) forwards through to _invoke_codex."""
+        codex_result = _SubprocessResult(
+            stdout=_CODEX_VALID_JSONL_STDOUT, stderr='', returncode=0, duration_ms=100,
+        )
+        with patch('orchestrator.agents.invoke._run_subprocess_local',
+                   new_callable=AsyncMock, return_value=codex_result):
+            agent = await invoke_agent(
+                prompt='hello', system_prompt='sys', cwd=tmp_path,
+                backend='codex', model='o4-mini', max_budget_usd=1.0,
+                sandbox_modules=None, effort=None, timeout_seconds=30.0,
+                prices={'o4-mini': {'input_per_1m': 100.0, 'output_per_1m': 100.0}},
+            )
+        assert agent.cost_usd == pytest.approx((10 * 100.0 + 5 * 100.0) / 1_000_000)
+
+    async def test_invoke_gemini_forwards_prices_to_parser(self, tmp_path):
+        """_invoke_gemini(prices=...) reaches _parse_gemini_output's cost calc."""
+        gemini_result = _SubprocessResult(
+            stdout=_GEMINI_VALID_JSON_STDOUT, stderr='', returncode=0, duration_ms=100,
+        )
+        with patch('orchestrator.agents.invoke._run_subprocess_local',
+                   new_callable=AsyncMock, return_value=gemini_result):
+            agent = await _invoke_gemini(
+                prompt='hello', system_prompt='sys', cwd=tmp_path,
+                model='gemini-3-flash', max_budget_usd=1.0,
+                mcp_config=None, sandbox_modules=None, effort=None,
+                timeout_seconds=30.0,
+                prices={'gemini-3-flash': {'input_per_1m': 50.0, 'output_per_1m': 50.0}},
+            )
+        assert agent.cost_usd == pytest.approx((10 * 50.0 + 5 * 50.0) / 1_000_000)
+
+    async def test_invoke_agent_forwards_prices_to_invoke_gemini(self, tmp_path):
+        """invoke_agent(backend='gemini', prices=...) forwards through to _invoke_gemini."""
+        gemini_result = _SubprocessResult(
+            stdout=_GEMINI_VALID_JSON_STDOUT, stderr='', returncode=0, duration_ms=100,
+        )
+        with patch('orchestrator.agents.invoke._run_subprocess_local',
+                   new_callable=AsyncMock, return_value=gemini_result):
+            agent = await invoke_agent(
+                prompt='hello', system_prompt='sys', cwd=tmp_path,
+                backend='gemini', model='gemini-3-flash', max_budget_usd=1.0,
+                sandbox_modules=None, effort=None, timeout_seconds=30.0,
+                prices={'gemini-3-flash': {'input_per_1m': 50.0, 'output_per_1m': 50.0}},
+            )
+        assert agent.cost_usd == pytest.approx((10 * 50.0 + 5 * 50.0) / 1_000_000)
+
+
+_PI_VALID_JSONL_STDOUT = '\n'.join(json.dumps(e) for e in [
+    {'type': 'session', 'id': 'sess-invoke-1'},
+    {'type': 'turn_end', 'message': {
+        'role': 'assistant', 'stopReason': 'stop',
+        'usage': {'input': 100, 'output': 20, 'totalTokens': 120, 'cost': {'total': 0.0011}},
+        'content': [{'type': 'text', 'text': 'done'}],
+    }},
+    {'type': 'agent_end', 'messages': [{
+        'role': 'assistant', 'stopReason': 'stop',
+        'usage': {'input': 100, 'output': 20, 'totalTokens': 120, 'cost': {'total': 0.0011}},
+        'content': [{'type': 'text', 'text': 'done'}],
+    }], 'willRetry': False},
+])
+
+
+@pytest.mark.asyncio
+class TestInvokePiCore:
+    """`_invoke_pi` core invocation (deliverable #2): builds the spike-template
+    argv, runs it via the UNCHANGED `_run_subprocess_local`, and parses the
+    result via `_parse_pi_output`."""
+
+    async def test_returns_parsed_success_result(self, tmp_path):
+        pi_result = _SubprocessResult(
+            stdout=_PI_VALID_JSONL_STDOUT, stderr='', returncode=0, duration_ms=100,
+        )
+        with patch('orchestrator.agents.invoke._run_subprocess_local',
+                   new_callable=AsyncMock, return_value=pi_result):
+            agent = await _invoke_pi(
+                'hello', 'sys', cwd=tmp_path, model='anthropic/claude-haiku-4-5',
+                max_budget_usd=1.0,
+                allowed_tools=['Bash', 'mcp__fused-memory__add_memory'],
+                disallowed_tools=None, mcp_config=None, sandbox_modules=None,
+                effort=None, oauth_token=None, resume_session_id=None,
+                session_id=None, timeout_seconds=30.0, prices=None,
+            )
+        assert agent.success is True
+        assert agent.cost_usd > 0.0
+        assert agent.session_id == 'sess-invoke-1'
+        assert agent.turns > 0
+
+    async def test_argv_matches_spike_template(self, tmp_path):
+        pi_result = _SubprocessResult(
+            stdout=_PI_VALID_JSONL_STDOUT, stderr='', returncode=0, duration_ms=100,
+        )
+        with patch('orchestrator.agents.invoke._run_subprocess_local',
+                   new_callable=AsyncMock, return_value=pi_result) as mock_run:
+            await _invoke_pi(
+                'hello', 'sys', cwd=tmp_path, model='anthropic/claude-haiku-4-5',
+                max_budget_usd=1.0,
+                allowed_tools=['Bash', 'mcp__fused-memory__add_memory'],
+                disallowed_tools=None, mcp_config=None, sandbox_modules=None,
+                effort=None, oauth_token=None, resume_session_id=None,
+                session_id=None, timeout_seconds=30.0, prices=None,
+            )
+        cmd = mock_run.call_args.args[0]
+        assert cmd[0] == 'pi'
+        for token in ('--mode', 'json', '-p', '--model', 'anthropic/claude-haiku-4-5',
+                      '--session-dir', '--system-prompt'):
+            assert token in cmd, f'{token!r} missing from argv: {cmd!r}'
+        tools_csv = cmd[cmd.index('--tools') + 1]
+        assert set(tools_csv.split(',')) == {'bash', 'fused_memory_add_memory'}
+
+    async def test_timed_out_propagates(self, tmp_path):
+        timed_result = _SubprocessResult(
+            stdout='', stderr='timeout', returncode=1, duration_ms=100, timed_out=True,
+        )
+        with patch('orchestrator.agents.invoke._run_subprocess_local',
+                   new_callable=AsyncMock, return_value=timed_result):
+            agent = await _invoke_pi(
+                'hello', 'sys', cwd=tmp_path, model='anthropic/claude-haiku-4-5',
+                max_budget_usd=1.0, allowed_tools=None, disallowed_tools=None,
+                mcp_config=None, sandbox_modules=None, effort=None,
+                oauth_token=None, resume_session_id=None, session_id=None,
+                timeout_seconds=30.0, prices=None,
+            )
+        assert agent.timed_out is True
+
+    async def test_mcp_config_written_via_write_pi_mcp_config(self, tmp_path):
+        """When mcp_config is a dict, _write_pi_mcp_config is invoked (patched
+        here) so the on-disk config carries directTools — see the dedicated
+        TestWritePiMcpConfig unit tests for the file CONTENT shape."""
+        pi_result = _SubprocessResult(
+            stdout=_PI_VALID_JSONL_STDOUT, stderr='', returncode=0, duration_ms=100,
+        )
+        mcp_cfg = {'mcpServers': {'fused-memory': {'command': 'x', 'args': []}}}
+        with (
+            patch('orchestrator.agents.invoke._run_subprocess_local',
+                  new_callable=AsyncMock, return_value=pi_result),
+            patch('orchestrator.agents.invoke._write_pi_mcp_config') as mock_write,
+        ):
+            await _invoke_pi(
+                'hello', 'sys', cwd=tmp_path, model='anthropic/claude-haiku-4-5',
+                max_budget_usd=1.0, allowed_tools=None, disallowed_tools=None,
+                mcp_config=mcp_cfg, sandbox_modules=None, effort=None,
+                oauth_token=None, resume_session_id=None, session_id=None,
+                timeout_seconds=30.0, prices=None,
+            )
+        mock_write.assert_called_once()
+        assert mcp_cfg in mock_write.call_args.args
+
+    async def test_system_prompt_passed_as_file_reference(self, tmp_path):
+        """The system prompt is written to a git-excluded file under
+        --session-dir and passed as `--system-prompt @<path>` rather than
+        embedded on argv — pi's `--system-prompt <text-or-@file>` form
+        documents the @file syntax (spike template,
+        plans/pi-spike-findings.md:201). Architect/deep-reviewer system
+        prompts can be large enough that embedding them (plus a large user
+        prompt) on argv risks exceeding the OS ARG_MAX and failing exec()
+        with E2BIG."""
+        pi_result = _SubprocessResult(
+            stdout=_PI_VALID_JSONL_STDOUT, stderr='', returncode=0, duration_ms=100,
+        )
+        big_system_prompt = 'you are an architect. ' * 50
+        captured: dict = {}
+
+        async def fake_run(cmd, cwd, env, backend, model, max_budget_usd, timeout_seconds):
+            captured['value'] = cmd[cmd.index('--system-prompt') + 1]
+            captured['path'] = Path(captured['value'].removeprefix('@'))
+            captured['content_during_call'] = captured['path'].read_text()
+            return pi_result
+
+        with patch('orchestrator.agents.invoke._run_subprocess_local', side_effect=fake_run):
+            await _invoke_pi(
+                'hello', big_system_prompt, cwd=tmp_path, model='anthropic/claude-haiku-4-5',
+                max_budget_usd=1.0, allowed_tools=None, disallowed_tools=None,
+                mcp_config=None, sandbox_modules=None, effort=None,
+                oauth_token=None, resume_session_id=None, session_id=None,
+                timeout_seconds=30.0, prices=None,
+            )
+
+        assert captured['value'].startswith('@'), captured['value']
+        assert big_system_prompt not in captured['value']
+        assert captured['content_during_call'] == big_system_prompt
+        # Cleaned up afterwards (mirrors codex's AGENTS.md temp-file cleanup).
+        assert not captured['path'].exists()
+
+
+@pytest.mark.asyncio
+class TestInvokePiMcpConfigBackupRestore:
+    """The robustness-critical `.mcp.json` backup/restore in `_invoke_pi`:
+    placement into cwd, backing up a pre-existing repo-committed
+    `.mcp.json`, and restoring it in `finally`. Exercised with the REAL
+    (unpatched) `_write_pi_mcp_config`, unlike TestInvokePiCore's
+    mcp-config test, which patches it out and so never touches disk."""
+
+    async def test_preexisting_mcp_json_is_backed_up_and_restored(self, tmp_path):
+        original_content = '{"mcpServers": {"committed-server": {"command": "y"}}}'
+        mcp_json_path = tmp_path / '.mcp.json'
+        mcp_json_path.write_text(original_content)
+
+        pi_result = _SubprocessResult(
+            stdout=_PI_VALID_JSONL_STDOUT, stderr='', returncode=0, duration_ms=100,
+        )
+        captured: dict = {}
+
+        async def fake_run(cmd, cwd, env, backend, model, max_budget_usd, timeout_seconds):
+            # While _invoke_pi is "running" (subprocess in flight), the
+            # repo's own .mcp.json has been swapped out for pi's config.
+            captured['content_during_call'] = mcp_json_path.read_text()
+            return pi_result
+
+        mcp_cfg = {'mcpServers': {'fused-memory': {'command': 'x', 'args': []}}}
+        with patch('orchestrator.agents.invoke._run_subprocess_local', side_effect=fake_run):
+            await _invoke_pi(
+                'hello', 'sys', cwd=tmp_path, model='anthropic/claude-haiku-4-5',
+                max_budget_usd=1.0, allowed_tools=None, disallowed_tools=None,
+                mcp_config=mcp_cfg, sandbox_modules=None, effort=None,
+                oauth_token=None, resume_session_id=None, session_id=None,
+                timeout_seconds=30.0, prices=None,
+            )
+
+        written_during_call = json.loads(captured['content_during_call'])
+        assert written_during_call['mcpServers']['fused-memory']['directTools'] is True
+        # The original, pre-existing committed config is restored afterward.
+        assert mcp_json_path.read_text() == original_content
+        # No leftover backup file.
+        assert not (tmp_path / '.mcp.json.pi-invoke-backup').exists()
+
+    async def test_no_preexisting_mcp_json_leaves_none_behind(self, tmp_path):
+        mcp_json_path = tmp_path / '.mcp.json'
+        assert not mcp_json_path.exists()
+
+        pi_result = _SubprocessResult(
+            stdout=_PI_VALID_JSONL_STDOUT, stderr='', returncode=0, duration_ms=100,
+        )
+        mcp_cfg = {'mcpServers': {'fused-memory': {'command': 'x', 'args': []}}}
+        with patch('orchestrator.agents.invoke._run_subprocess_local',
+                   new_callable=AsyncMock, return_value=pi_result):
+            await _invoke_pi(
+                'hello', 'sys', cwd=tmp_path, model='anthropic/claude-haiku-4-5',
+                max_budget_usd=1.0, allowed_tools=None, disallowed_tools=None,
+                mcp_config=mcp_cfg, sandbox_modules=None, effort=None,
+                oauth_token=None, resume_session_id=None, session_id=None,
+                timeout_seconds=30.0, prices=None,
+            )
+
+        assert not mcp_json_path.exists()
+        assert not (tmp_path / '.mcp.json.pi-invoke-backup').exists()
+
+
+@pytest.mark.asyncio
+class TestInvokePiMcpCacheWarmWarning:
+    """`_invoke_pi` warns when direct-tool MCP names are requested for
+    servers whose pi-mcp-adapter metadata cache (spike Q3 CRITICAL
+    GOTCHA — see _write_pi_mcp_config's docstring) hasn't been warmed
+    yet, so the silent proxy-`mcp`-tool fallback is observable instead of
+    surfacing later as mysterious missing-tool behavior."""
+
+    async def test_warns_when_cache_file_absent(self, tmp_path, caplog):
+        pi_result = _SubprocessResult(
+            stdout=_PI_VALID_JSONL_STDOUT, stderr='', returncode=0, duration_ms=100,
+        )
+        missing_cache = tmp_path / 'not-warmed' / 'mcp-cache.json'
+        mcp_cfg = {'mcpServers': {'fused-memory': {'command': 'x', 'args': []}}}
+        with (
+            patch('orchestrator.agents.invoke._run_subprocess_local',
+                  new_callable=AsyncMock, return_value=pi_result),
+            patch('orchestrator.agents.invoke._pi_mcp_cache_path', return_value=missing_cache),
+            caplog.at_level(logging.WARNING),
+        ):
+            await _invoke_pi(
+                'hello', 'sys', cwd=tmp_path, model='anthropic/claude-haiku-4-5',
+                max_budget_usd=1.0, allowed_tools=None, disallowed_tools=None,
+                mcp_config=mcp_cfg, sandbox_modules=None, effort=None,
+                oauth_token=None, resume_session_id=None, session_id=None,
+                timeout_seconds=30.0, prices=None,
+            )
+        warnings = [r for r in caplog.records if r.levelno >= logging.WARNING]
+        assert any(
+            'fused-memory' in r.getMessage() and 'cache' in r.getMessage().lower()
+            for r in warnings
+        ), [r.getMessage() for r in warnings]
+
+    async def test_no_warning_when_cache_file_present(self, tmp_path, caplog):
+        pi_result = _SubprocessResult(
+            stdout=_PI_VALID_JSONL_STDOUT, stderr='', returncode=0, duration_ms=100,
+        )
+        warmed_cache = tmp_path / 'warmed' / 'mcp-cache.json'
+        warmed_cache.parent.mkdir()
+        warmed_cache.write_text('{}')
+        mcp_cfg = {'mcpServers': {'fused-memory': {'command': 'x', 'args': []}}}
+        with (
+            patch('orchestrator.agents.invoke._run_subprocess_local',
+                  new_callable=AsyncMock, return_value=pi_result),
+            patch('orchestrator.agents.invoke._pi_mcp_cache_path', return_value=warmed_cache),
+            caplog.at_level(logging.WARNING),
+        ):
+            await _invoke_pi(
+                'hello', 'sys', cwd=tmp_path, model='anthropic/claude-haiku-4-5',
+                max_budget_usd=1.0, allowed_tools=None, disallowed_tools=None,
+                mcp_config=mcp_cfg, sandbox_modules=None, effort=None,
+                oauth_token=None, resume_session_id=None, session_id=None,
+                timeout_seconds=30.0, prices=None,
+            )
+        warnings = [r for r in caplog.records if 'direct-tools cache' in r.getMessage()]
+        assert not warnings
+
+
+@pytest.mark.asyncio
+class TestInvokePiFlags:
+    """`_invoke_pi` flag construction beyond the core template (deliverable
+    #3): --thinking (effort), ANTHROPIC_OAUTH_TOKEN env, --session/
+    --session-id, --exclude-tools (disallowed_tools), --no-context-files,
+    and the no-silent-cap warning when a spec is unmappable (wildcard)."""
+
+    async def _invoke(self, tmp_path, **overrides):
+        """Invoke _invoke_pi with sensible defaults, patched _run_subprocess_local,
+        returning the mock so callers can inspect argv/env via call_args."""
+        pi_result = _SubprocessResult(
+            stdout=_PI_VALID_JSONL_STDOUT, stderr='', returncode=0, duration_ms=100,
+        )
+        kwargs: dict = dict(
+            prompt='hello', system_prompt='sys', cwd=tmp_path,
+            model='anthropic/claude-haiku-4-5', max_budget_usd=1.0,
+            allowed_tools=None, disallowed_tools=None, mcp_config=None,
+            sandbox_modules=None, effort=None, oauth_token=None,
+            resume_session_id=None, session_id=None, timeout_seconds=30.0,
+            prices=None,
+        )
+        kwargs.update(overrides)
+        prompt = kwargs.pop('prompt')
+        system_prompt = kwargs.pop('system_prompt')
+        with patch('orchestrator.agents.invoke._run_subprocess_local',
+                   new_callable=AsyncMock, return_value=pi_result) as mock_run:
+            await _invoke_pi(prompt, system_prompt, **kwargs)
+        return mock_run
+
+    async def test_effort_maps_to_thinking_flag(self, tmp_path):
+        mock_run = await self._invoke(tmp_path, effort='high')
+        cmd = mock_run.call_args.args[0]
+        assert '--thinking' in cmd
+        assert cmd[cmd.index('--thinking') + 1] == 'high'
+
+    async def test_no_effort_omits_thinking_flag(self, tmp_path):
+        mock_run = await self._invoke(tmp_path, effort=None)
+        cmd = mock_run.call_args.args[0]
+        assert '--thinking' not in cmd
+
+    async def test_oauth_token_sets_anthropic_oauth_token_env(self, tmp_path):
+        mock_run = await self._invoke(tmp_path, oauth_token='tok')
+        env = mock_run.call_args.args[2]
+        assert env.get('ANTHROPIC_OAUTH_TOKEN') == 'tok'
+
+    async def test_oauth_token_strips_lingering_anthropic_api_key(self, tmp_path, monkeypatch):
+        """A lingering ANTHROPIC_API_KEY must not shadow the OAuth token pi
+        is being asked to use — otherwise the multi-account OAuth failover
+        oauth_token exists for is silently defeated (mirrors
+        _invoke_claude_with_sandbox's credential-precedence guard)."""
+        monkeypatch.setenv('ANTHROPIC_API_KEY', 'sk-should-not-leak')
+        mock_run = await self._invoke(tmp_path, oauth_token='tok')
+        env = mock_run.call_args.args[2]
+        assert env.get('ANTHROPIC_OAUTH_TOKEN') == 'tok'
+        assert 'ANTHROPIC_API_KEY' not in env
+
+    async def test_no_oauth_token_leaves_anthropic_api_key_untouched(self, tmp_path, monkeypatch):
+        """Without oauth_token, a directly-configured ANTHROPIC_API_KEY
+        (pi's non-OAuth Anthropic auth path) must keep working — the strip
+        is scoped to the OAuth-token case, not unconditional."""
+        monkeypatch.setenv('ANTHROPIC_API_KEY', 'sk-direct-key')
+        mock_run = await self._invoke(tmp_path, oauth_token=None)
+        env = mock_run.call_args.args[2]
+        assert env.get('ANTHROPIC_API_KEY') == 'sk-direct-key'
+        assert 'ANTHROPIC_OAUTH_TOKEN' not in env
+
+    async def test_resume_session_id_uses_session_flag(self, tmp_path):
+        mock_run = await self._invoke(tmp_path, resume_session_id='r1')
+        cmd = mock_run.call_args.args[0]
+        assert '--session' in cmd
+        assert cmd[cmd.index('--session') + 1] == 'r1'
+        assert '--session-id' not in cmd
+
+    async def test_session_id_without_resume_uses_session_id_flag(self, tmp_path):
+        mock_run = await self._invoke(tmp_path, session_id='s1')
+        cmd = mock_run.call_args.args[0]
+        assert '--session-id' in cmd
+        assert cmd[cmd.index('--session-id') + 1] == 's1'
+
+    async def test_disallowed_tools_maps_to_exclude_tools_flag(self, tmp_path):
+        mock_run = await self._invoke(
+            tmp_path, disallowed_tools=['mcp__fused-memory__set_task_status'],
+        )
+        cmd = mock_run.call_args.args[0]
+        assert '--exclude-tools' in cmd
+        csv = cmd[cmd.index('--exclude-tools') + 1]
+        assert 'fused_memory_set_task_status' in csv.split(',')
+
+    async def test_argv_contains_no_context_files(self, tmp_path):
+        mock_run = await self._invoke(tmp_path)
+        cmd = mock_run.call_args.args[0]
+        assert '--no-context-files' in cmd
+
+    async def test_wildcard_spec_is_dropped_and_logged(self, tmp_path, caplog):
+        with caplog.at_level(logging.WARNING):
+            mock_run = await self._invoke(
+                tmp_path, allowed_tools=['mcp__jcodemunch__*', 'Read'],
+            )
+        cmd = mock_run.call_args.args[0]
+        tools_csv = cmd[cmd.index('--tools') + 1]
+        assert 'read' in tools_csv.split(',')
+        assert 'jcodemunch' not in tools_csv
+        warning_records = [r for r in caplog.records if r.levelno >= logging.WARNING]
+        assert any('mcp__jcodemunch__*' in r.getMessage() for r in warning_records), (
+            f'expected a WARNING naming the dropped spec; got: {[r.getMessage() for r in warning_records]}'
+        )
+
+
+@pytest.mark.asyncio
+class TestInvokeAgentPiDispatch:
+    """invoke_agent(backend='pi', ...) dispatches to _invoke_pi, forwarding
+    the backend-relevant fields (deliverable #5); the Unknown-backend guard
+    is unchanged."""
+
+    async def test_dispatches_to_invoke_pi_with_forwarded_kwargs(self, tmp_path):
+        sentinel = AgentResult(success=True, output='ok')
+        prices = {'x': {'input_per_1m': 1.0, 'output_per_1m': 1.0}}
+        mcp_cfg = {'mcpServers': {}}
+        with patch(
+            'orchestrator.agents.invoke._invoke_pi',
+            new_callable=AsyncMock, return_value=sentinel,
+        ) as mock_invoke_pi:
+            result = await invoke_agent(
+                prompt='p', system_prompt='s', cwd=tmp_path,
+                backend='pi', model='anthropic/claude-haiku-4-5',
+                allowed_tools=['Bash'], disallowed_tools=None,
+                mcp_config=mcp_cfg, oauth_token='tok', session_id='sid',
+                prices=prices, timeout_seconds=30.0,
+            )
+
+        assert result is sentinel
+        mock_invoke_pi.assert_awaited_once()
+        kwargs = mock_invoke_pi.call_args.kwargs
+        assert kwargs.get('allowed_tools') == ['Bash']
+        assert kwargs.get('mcp_config') is mcp_cfg
+        assert kwargs.get('oauth_token') == 'tok'
+        assert kwargs.get('session_id') == 'sid'
+        assert kwargs.get('prices') is prices
+        assert kwargs.get('model') == 'anthropic/claude-haiku-4-5'
+        assert kwargs.get('system_prompt') == 's'
+        assert kwargs.get('cwd') == tmp_path
+
+    async def test_unknown_backend_still_raises_value_error(self, tmp_path):
+        with pytest.raises(ValueError):
+            await invoke_agent(
+                prompt='p', system_prompt='s', cwd=tmp_path,
+                backend='totally-unknown',
+            )
 
 
 @pytest.mark.asyncio

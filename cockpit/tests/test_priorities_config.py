@@ -299,3 +299,80 @@ class TestEnsurePrioritiesFile:
         assert any('priorities' in msg.lower() for msg in warnings), (
             f'Expected a WARNING mentioning "priorities"; got: {warnings}'
         )
+
+
+class TestSavePriorities:
+    def test_round_trips_custom_weights(self, tmp_path):
+        """save_priorities must be the exact inverse of load_priorities/_priorities_from_dict:
+        a non-default Priorities written out and read back must compare equal."""
+        from cockpit.priority import (
+            AgeCurve,
+            Defaults,
+            ManualBoostConfig,
+            Priorities,
+            load_priorities,
+            save_priorities,
+        )
+
+        custom = Priorities(
+            severity_weights={'critical': 9.0, 'high': 4.0, 'medium': 2.0, 'low': 1.0},
+            category_weights={'bug': 4.0},
+            project_weights={'df': 9.0},
+            defaults=Defaults(severity=1.1, category=0.6, project=0.2),
+            age_curve=AgeCurve(max_bonus=3.3, saturation_seconds=123.0),
+            manual_boost=ManualBoostConfig(weight=2.0, min=-7, max=7),
+        )
+        target = tmp_path / 'nested' / 'priorities.yaml'
+
+        save_priorities(custom, target)
+
+        assert target.exists()
+        assert load_priorities(target) == custom
+
+    def test_write_failure_is_fail_soft_and_warns(self, tmp_path, caplog):
+        """An unwritable target must fail soft: logged WARNING, never an exception.
+
+        Mirrors TestEnsurePrioritiesFile's own write-failure test -- forced
+        here by making the target's parent a *file* rather than a directory,
+        so mkdir(parents=True) raises OSError.
+        """
+        from cockpit.priority import Priorities, save_priorities
+
+        blocker = tmp_path / 'blocker'
+        blocker.write_text('not a directory')
+        target = blocker / 'priorities.yaml'
+
+        with caplog.at_level(logging.WARNING):
+            save_priorities(Priorities.default(), target)
+
+        assert not target.exists()
+        warnings = [r.message for r in caplog.records if r.levelno == logging.WARNING]
+        assert any('priorities' in msg.lower() for msg in warnings), (
+            f'Expected a WARNING mentioning "priorities"; got: {warnings}'
+        )
+
+    def test_non_os_error_during_write_is_fail_soft_and_warns(self, tmp_path, caplog, monkeypatch):
+        """save_priorities' fail-soft guarantee isn't limited to OSError.
+
+        Forces a non-OSError fault (e.g. an unexpected yaml.safe_dump
+        error) mid-write; this must still be logged and swallowed, never
+        raised -- the cockpit's 'a view must never be a dependency'
+        guarantee (PRD §2) doesn't carve out an exception type.
+        """
+        from cockpit import priority
+        from cockpit.priority import Priorities, save_priorities
+
+        def _boom(*args, **kwargs):
+            raise TypeError('boom')
+
+        monkeypatch.setattr(priority.yaml, 'safe_dump', _boom)
+        target = tmp_path / 'priorities.yaml'
+
+        with caplog.at_level(logging.WARNING):
+            save_priorities(Priorities.default(), target)
+
+        assert not target.exists()
+        warnings = [r.message for r in caplog.records if r.levelno == logging.WARNING]
+        assert any('priorities' in msg.lower() for msg in warnings), (
+            f'Expected a WARNING mentioning "priorities"; got: {warnings}'
+        )

@@ -1,9 +1,9 @@
 """System prompt for Stage 1: Memory Consolidator."""
 
 from fused_memory.reconciliation.prompts import (
-    _RECON_REPORT_TOOL_GUIDANCE,
     _STAGE1_GRAPHITI_QUEUED_GUIDANCE,
     _STAGE1_PROJECT_ID_GUIDELINE,
+    get_recon_report_tool_guidance,
 )
 from fused_memory.reconciliation.recon_self_model import (
     render_marker_lifecycle_section,
@@ -79,7 +79,7 @@ weaken the guidance above — still prefer `update_edge`/`refresh_entity_summary
 - {_STAGE1_PROJECT_ID_GUIDELINE}
 - **Report channel — recon_report MCP tools (PRD γ §9)**: For each inconsistency or finding \
 (including cross-project scope mismatches flagged to Stage 2): \
-{_RECON_REPORT_TOOL_GUIDANCE}
+{get_recon_report_tool_guidance()}
 
 ## UUID Resolution Discipline
 Before calling `delete_memory` for any Graphiti edge or Mem0 vector entry, follow this \

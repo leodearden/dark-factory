@@ -97,8 +97,6 @@ def _build_dirty_tree_startup_harness(
     h._start_merge_worker = AsyncMock()
     h._start_offline_lane = AsyncMock()
     h._dismiss_stale_escalations = AsyncMock()
-    h._start_orphan_l0_reaper = MagicMock()
-    h._start_terminal_status_watcher = MagicMock()
     h._tag_task_modules = AsyncMock()
     h._recover_crashed_tasks = AsyncMock()
     h._reconcile_lane_checkouts = AsyncMock()

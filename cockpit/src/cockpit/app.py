@@ -38,6 +38,9 @@ from orchestrator.session_registry import (
     set_manual_boost,
     update_decision_state,
 )
+from orchestrator.session_registry import (
+    fleet_root as resolve_fleet_root,
+)
 from textual import work
 from textual.app import App, ComposeResult
 from textual.binding import Binding
@@ -56,9 +59,10 @@ from cockpit.panes.decision_queue import (
 )
 from cockpit.panes.detail_pane import DetailPane
 from cockpit.panes.session_table import SessionTable, filter_live_sessions, order_sessions
-from cockpit.panes.spawn_bar import SpawnScreen, build_spawn_argv
+from cockpit.panes.spawn_bar import SpawnScreen, build_spawn_argv, default_skip_perms
 from cockpit.panes.spawn_tree import SpawnTreeScreen
-from cockpit.priority import Priorities, load_priorities
+from cockpit.panes.weight_editor import WeightEditorScreen, known_projects
+from cockpit.priority import Priorities, load_priorities, save_priorities
 from cockpit.registry_reader import (
     SessionScanner,
     SessionScannerProtocol,
@@ -161,6 +165,7 @@ class CockpitApp(App):
         Binding('n', 'new_session', 'New session', show=False),
         Binding('t', 'toggle_tree', 'Spawn tree', show=False),
         Binding('h', 'toggle_history', 'Toggle history', show=False),
+        Binding('w', 'edit_weights', 'Edit weights', show=False),
         # All ten digits are bound, but a digit's SCORE effect saturates
         # once it exceeds the active Priorities.manual_boost.max (default 5
         # -- see priority.py's score(), which clamps manual_boost into
@@ -200,12 +205,33 @@ class CockpitApp(App):
         }
         self._spawn_runner = spawn_runner if spawn_runner is not None else _default_spawn_runner
         self._spawn_script = spawn_script if spawn_script is not None else _default_spawn_script()
-        self._priorities = priorities if priorities is not None else load_priorities()
+        self._priorities_path = resolve_fleet_root(self.fleet_root) / 'priorities.yaml'
+        # Logged at DEBUG (not WARNING -- this is routine, not a fault) so a
+        # deployment that sets $CLAUDE_FLEET_ROOT can confirm which
+        # priorities.yaml this session is reading/writing: the path is
+        # fleet_root-relative (see TestPrioritiesPathResolution), which
+        # diverges from a fixed ~/.claude/fleet default whenever
+        # fleet_root/$CLAUDE_FLEET_ROOT points elsewhere.
+        _log.debug('CockpitApp: priorities path resolved to %s', self._priorities_path)
+        self._priorities = (
+            priorities if priorities is not None else load_priorities(self._priorities_path)
+        )
         self._records: list[SessionRecord] = []
         self._decisions: list[DecisionRecord] = []
         self._snapshot: dict[str, tuple] = {}
         self._decisions_snapshot: dict[str, tuple] = {}
         self._has_scanned = False
+        # Monotonic scan-sequence guard (esc-2517-1, task 2606): _scan_seq is
+        # the next-to-issue sequence number (see _next_scan_seq), bumped once
+        # per scan INITIATED -- by refresh_registry or _poll_registry, both
+        # always on the main thread. _applied_scan_seq is the high-water
+        # mark of the newest sequence _apply_scan has actually applied. A
+        # scan whose seq is older than that mark read the registry before a
+        # fresher scan already landed, and _apply_scan drops it rather than
+        # letting it regress the view. Like _scan_in_flight below, both are
+        # only ever mutated on the main thread, so neither needs a lock.
+        self._scan_seq = 0
+        self._applied_scan_seq = 0
         # Drop-tick backpressure for the threaded poll path (see
         # _poll_registry/_scan_registry_worker): True while a scan launched
         # by _poll_registry is still running. Only ever read/written on the
@@ -253,6 +279,20 @@ class CockpitApp(App):
     def on_unmount(self) -> None:
         self._persist_ui_config()
 
+    def _next_scan_seq(self) -> int:
+        """Issue the next monotonic scan sequence number. MAIN-THREAD-ONLY.
+
+        self._scan_seq += 1 is a non-atomic read-modify-write; only
+        refresh_registry and _poll_registry call this, and both always run
+        on the main thread (mirrors the _scan_in_flight discipline -- see
+        __init__), so no lock is needed. The returned value must travel WITH
+        its scan as an explicit parameter through to _apply_scan, never via
+        a shared mutable attribute -- the whole point of the guard is that a
+        still in-flight, older scan carries its own older sequence.
+        """
+        self._scan_seq += 1
+        return self._scan_seq
+
     def refresh_registry(self) -> None:
         """Scan the registry and rebuild the SessionTable/DecisionQueue, synchronously.
 
@@ -263,8 +303,14 @@ class CockpitApp(App):
         instead, which runs the scan on a background thread (see
         _scan_registry_worker) so a slow scan never blocks the event loop
         (C10 tour F1, esc-2303-1).
+
+        Issues this scan's sequence number via _next_scan_seq() before
+        scanning, so _apply_scan's stale-scan guard (esc-2517-1) can tell
+        this scan apart from any other in-flight one.
         """
-        self._apply_scan(*self._scan_registry())
+        seq = self._next_scan_seq()
+        records, decisions = self._scan_registry()
+        self._apply_scan(records, decisions, seq)
 
     def _scan_registry(self) -> tuple[list[SessionRecord], list[DecisionRecord]]:
         """I/O half of a refresh: scan disk for the current records/decisions.
@@ -278,7 +324,7 @@ class CockpitApp(App):
         return records, decisions
 
     def _apply_scan(
-        self, records: list[SessionRecord], decisions: list[DecisionRecord]
+        self, records: list[SessionRecord], decisions: list[DecisionRecord], seq: int
     ) -> None:
         """UI half of a refresh: rebuild the SessionTable/DecisionQueue only when something changed.
 
@@ -298,9 +344,36 @@ class CockpitApp(App):
         Bails out immediately if the app is no longer running, and no-ops
         (rather than raising) if a widget lookup still finds the DOM
         already torn down -- the threaded hand-off's shutdown-race hazard.
+
+        Also guards against a stale threaded-poll result landing after a
+        fresher scan already applied (esc-2517-1, task 2606): *seq* is the
+        monotonic sequence number the caller obtained from _next_scan_seq()
+        at scan-initiation time (see refresh_registry/_poll_registry). Any
+        seq strictly older than self._applied_scan_seq (the high-water mark
+        of the newest scan already applied) is dropped before the snapshot
+        diff even runs, so an in-flight background scan that read the
+        registry before a fresher one landed can never regress the view.
+        self._applied_scan_seq advances even on a no-op (snapshot-unchanged)
+        apply, so a later stale result is still correctly dropped.
+
+        Note: seq order tracks scan-*initiation* order, not measured
+        read-completion order -- it is a proxy for freshness, not a direct
+        stamp of it. In principle a scan issued earlier (lower seq) could
+        finish its off-thread registry read later than one issued after it,
+        and this guard would drop that earlier-issued-but-actually-fresher
+        result. That window cannot open today: _scan_in_flight (see
+        _poll_registry) admits only one in-flight poll worker at a time, so
+        poll-issued scans can never race each other, and refresh_registry
+        only ever runs synchronously at on_mount, before the poll timer is
+        registered. The guard's correctness therefore rests on that
+        backpressure serialization keeping initiation order equal to
+        landing order, not on seq tracking true read recency.
         """
         if not self.is_running:
             return
+        if seq < self._applied_scan_seq:
+            return
+        self._applied_scan_seq = seq
         new_snapshot = build_snapshot(records)
         new_decisions_snapshot = _decisions_snapshot(decisions)
         if (
@@ -356,14 +429,19 @@ class CockpitApp(App):
         clears the flag -- via call_from_thread, also on the main thread --
         even when the scan raises, so one bad tick never wedges every
         later poll.
+
+        Also issues this poll's scan sequence number via _next_scan_seq()
+        (main-thread-only, like the flag check above) and hands it to the
+        worker, so a stale hand-off can be dropped once it lands -- see
+        _apply_scan's stale-scan guard (esc-2517-1).
         """
         if self._scan_in_flight:
             return
         self._scan_in_flight = True
-        self._scan_registry_worker()
+        self._scan_registry_worker(self._next_scan_seq())
 
     @work(thread=True, group='registry-scan', exit_on_error=False)
-    def _scan_registry_worker(self) -> None:
+    def _scan_registry_worker(self, seq: int) -> None:
         """Threaded poll worker: run the scan off-thread, marshal the UI update back.
 
         Runs _scan_registry() (pure I/O, no widget access) on a background
@@ -375,6 +453,13 @@ class CockpitApp(App):
         fully shut down by the time this (possibly slow) scan finishes --
         see its docstring.
 
+        *seq* is the scan sequence number _poll_registry obtained from
+        _next_scan_seq() (main-thread-only) before launching this worker --
+        carried through unchanged on the background thread and forwarded to
+        _apply_scan via the call_from_thread hand-off, so _apply_scan can
+        tell a stale result apart from a fresher one once it lands
+        (esc-2517-1).
+
         exit_on_error=False: a scan that raises (e.g. a transient disk
         error) must only fail this one tick, never take down the whole app
         -- Textual's default would treat an unhandled worker exception as
@@ -384,7 +469,7 @@ class CockpitApp(App):
         """
         try:
             records, decisions = self._scan_registry()
-            self._call_from_thread_fail_soft(self._apply_scan, records, decisions)
+            self._call_from_thread_fail_soft(self._apply_scan, records, decisions, seq)
         finally:
             self._call_from_thread_fail_soft(self._clear_scan_in_flight)
 
@@ -705,13 +790,24 @@ class CockpitApp(App):
 
         Seeds the picker's project-root field from known_project_roots over
         the most recently scanned session records (self._records) -- a
-        picker source, not a queue filter. Submitting the screen calls back
-        into spawn_session, this task's leaf signal; the screen itself never
+        picker source, not a queue filter. Also seeds the picker's
+        skip-perms toggle from default_skip_perms() (F9 fix, task 2518):
+        the operator's env-configured bypass-perms default, so a
+        cockpit-spawned session in an AFK window inherits bypass-perms
+        instead of hardcoding it off and blocking on an unanswered
+        permission prompt. Submitting the screen calls back into
+        spawn_session, this task's leaf signal; the screen itself never
         builds argv or launches a process.
         """
-        self.push_screen(SpawnScreen(known_project_roots(self._records), self.spawn_session))
+        self.push_screen(
+            SpawnScreen(
+                known_project_roots(self._records),
+                self.spawn_session,
+                default_skip_perms=default_skip_perms(),
+            )
+        )
 
-    def spawn_session(self, project_root: str, role: str, prompt: str) -> None:
+    def spawn_session(self, project_root: str, role: str, prompt: str, skip_perms: bool = False) -> None:
         """Spawn a new Claude session (PRD §9 C5b spawn bar) -- the `n` action's leaf signal.
 
         Builds spawn-claude.sh's exact positional argv (build_spawn_argv)
@@ -720,18 +816,62 @@ class CockpitApp(App):
         segment a not-yet-spawned session doesn't have), and the prompt --
         then hands it to the injected spawn_runner (default:
         _default_spawn_runner, a fail-soft subprocess.Popen wrapper).
-        Fail-soft (PRD §2): with no resolvable spawn_script (no injected
-        path, no $CLAUDE_SPAWN_SCRIPT, and the repo-relative default not
-        found), this simply no-ops -- a view/action is never a hard
-        dependency, never an exception.
+        *skip_perms* threads straight through to build_spawn_argv, which
+        renders it into spawn-claude.sh's positional
+        --dangerously-skip-permissions contract (arg #2, 'true'/'false');
+        it defaults to False so callers that omit it keep today's
+        behavior. Fail-soft (PRD §2): with no resolvable spawn_script (no
+        injected path, no $CLAUDE_SPAWN_SCRIPT, and the repo-relative
+        default not found), this simply no-ops -- a view/action is never a
+        hard dependency, never an exception.
         """
         script = self._spawn_script
         if script is None:
             _log.warning('spawn_session: no spawn_script resolved, dropping spawn request')
             return
         title = f'{role}:{Path(project_root).name}'
-        argv = build_spawn_argv(script, project_root, title, prompt)
+        argv = build_spawn_argv(script, project_root, title, prompt, skip_perms=skip_perms)
         self._spawn_runner(argv)
+
+    def action_edit_weights(self) -> None:
+        """'w' -- push the in-cockpit priority weight editor (PRD §9 C9b).
+
+        Seeds the screen with a snapshot of self._priorities (the current
+        weights, mutated only via apply_priorities/the injected callback --
+        never in place) and the known project names -- the sorted union of
+        self._records'/self._decisions' own .project plus
+        self._priorities.project_weights' existing keys (known_projects),
+        so an already-weighted project is always offered even with no live
+        session/decision right now. Submitting the screen calls back into
+        apply_priorities, this task's leaf signal; the screen itself never
+        persists priorities.yaml or rebuilds the queue.
+        """
+        self.push_screen(
+            WeightEditorScreen(
+                self._priorities,
+                known_projects(self._records, self._decisions, self._priorities.project_weights),
+                self.apply_priorities,
+            )
+        )
+
+    def apply_priorities(self, new_priorities: Priorities) -> None:
+        """Apply an edited Priorities snapshot (PRD §9 C9b weight editor) -- this task's leaf signal.
+
+        Swaps self._priorities to *new_priorities*, persists it to
+        self._priorities_path via C3's save_priorities (fail-soft -- see
+        save_priorities's own docstring: a write fault is logged and
+        swallowed, never raised), then calls _rebuild_queue() immediately
+        so the DecisionQueue re-scores and re-renders against the new
+        weights right now -- exactly like a boost/drop/defer keypress,
+        never waiting for the next poll tick. The caller (eventually
+        WeightEditorScreen, via action_edit_weights) builds *new_priorities*
+        itself from the pure merge_weight_edits helper; this method never
+        parses raw edits and never touches priorities.yaml except through
+        save_priorities.
+        """
+        self._priorities = new_priorities
+        save_priorities(new_priorities, self._priorities_path)
+        self._rebuild_queue()
 
     def action_toggle_tree(self) -> None:
         """'t' -- open the spawn-tree modal (Fleet Cockpit C9a, PRD §9).

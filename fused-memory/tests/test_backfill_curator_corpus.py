@@ -693,12 +693,13 @@ class TestPruneDriver:
         with TestRunBackfill()._run_backfill_context() as (mock_curator, mock_tm_cls):
             mock_curator.prune_orphans = AsyncMock(return_value=mock_prune_result)
             mock_tm_instance = AsyncMock()
+            mock_tm_instance.list_tags = AsyncMock(return_value=['master'])
             mock_tm_instance.get_tasks = AsyncMock(return_value=canned_task_tree)
             mock_tm_cls.return_value = mock_tm_instance
 
             await run_prune(config_path=None, project_root=project_root)
 
-        mock_tm_instance.get_tasks.assert_called_once_with(project_root)
+        mock_tm_instance.get_tasks.assert_called_once_with(project_root, tag='master')
 
         mock_curator.prune_orphans.assert_called_once()
         call_args = mock_curator.prune_orphans.call_args
@@ -727,7 +728,122 @@ class TestPruneDriver:
         with TestRunBackfill()._run_backfill_context() as (mock_curator, mock_tm_cls):
             mock_curator.prune_orphans = AsyncMock()
             mock_tm_instance = AsyncMock()
+            mock_tm_instance.list_tags = AsyncMock(return_value=['master'])
             mock_tm_instance.get_tasks = AsyncMock(side_effect=RuntimeError('db read failed'))
+            mock_tm_cls.return_value = mock_tm_instance
+
+            report = await run_prune(config_path=None, project_root=project_root)
+
+        mock_curator.prune_orphans.assert_not_called()
+        assert report.skipped is True
+        assert report.reason == 'read_failed'
+
+    @pytest.mark.asyncio
+    async def test_run_prune_aggregates_live_ids_across_all_tags(self):
+        """run_prune() enumerates every tag via list_tags() and unions
+        get_tasks(project_root, tag=t) across ALL of them before diffing
+        against the corpus — a task filed under a non-default tag must not
+        be false-pruned just because the snapshot only ever looked at
+        'master' (task 2603)."""
+        from fused_memory.maintenance.backfill_curator_corpus import run_prune
+        from fused_memory.middleware.task_curator import PruneResult
+
+        project_root = '/fake/project'
+        project_id = 'project'
+
+        tag_trees = {
+            'master': {
+                'tasks': [
+                    {'id': '1', 'title': 'Task A', 'description': 'Desc A', 'status': 'done'},
+                    {'id': '2', 'title': 'Task B', 'description': 'Desc B', 'status': 'pending'},
+                ],
+            },
+            'feature-x': {
+                'tasks': [
+                    {'id': '2.1', 'title': 'Task C', 'description': 'Desc C', 'status': 'pending'},
+                    {'id': '9', 'title': 'Task D', 'description': 'Desc D', 'status': 'done'},
+                ],
+            },
+        }
+
+        async def _get_tasks_side_effect(_project_root, tag=None):
+            return tag_trees[tag or 'master']
+
+        mock_prune_result = PruneResult(pruned=0, live=4)
+
+        with TestRunBackfill()._run_backfill_context() as (mock_curator, mock_tm_cls):
+            mock_curator.prune_orphans = AsyncMock(return_value=mock_prune_result)
+            mock_tm_instance = AsyncMock()
+            mock_tm_instance.list_tags = AsyncMock(return_value=['master', 'feature-x'])
+            mock_tm_instance.get_tasks = AsyncMock(side_effect=_get_tasks_side_effect)
+            mock_tm_cls.return_value = mock_tm_instance
+
+            await run_prune(config_path=None, project_root=project_root)
+
+        mock_tm_instance.list_tags.assert_called_once_with(project_root)
+
+        mock_curator.prune_orphans.assert_called_once()
+        call_args = mock_curator.prune_orphans.call_args
+        passed_project_id = (
+            call_args.args[0] if call_args.args else call_args.kwargs.get('project_id')
+        )
+        passed_live_ids = (
+            call_args.args[1]
+            if len(call_args.args) > 1
+            else call_args.kwargs.get('live_task_ids')
+        )
+
+        assert passed_project_id == project_id
+        assert set(passed_live_ids) == {'1', '2', '2.1', '9'}
+
+    @pytest.mark.asyncio
+    async def test_run_prune_skips_when_list_tags_fails(self):
+        """A list_tags() failure must skip the whole sweep — get_tasks is
+        wired to a valid tree so ONLY the list_tags failure can be
+        responsible for the skip (task 2603)."""
+        from fused_memory.maintenance.backfill_curator_corpus import run_prune
+
+        project_root = '/fake/project'
+        canned_task_tree = {
+            'tasks': [{'id': '1', 'title': 'Task A', 'description': 'Desc A', 'status': 'done'}],
+        }
+
+        with TestRunBackfill()._run_backfill_context() as (mock_curator, mock_tm_cls):
+            mock_curator.prune_orphans = AsyncMock()
+            mock_tm_instance = AsyncMock()
+            mock_tm_instance.list_tags = AsyncMock(side_effect=RuntimeError('list_tags failed'))
+            mock_tm_instance.get_tasks = AsyncMock(return_value=canned_task_tree)
+            mock_tm_cls.return_value = mock_tm_instance
+
+            report = await run_prune(config_path=None, project_root=project_root)
+
+        mock_curator.prune_orphans.assert_not_called()
+        assert report.skipped is True
+        assert report.reason == 'read_failed'
+
+    @pytest.mark.asyncio
+    async def test_run_prune_skips_when_any_tag_read_fails(self):
+        """list_tags() succeeds but a single tag's get_tasks() raises — the
+        sweep must skip entirely rather than prune against only the tags it
+        managed to read; a partial snapshot must never prune (task 2603)."""
+        from fused_memory.maintenance.backfill_curator_corpus import run_prune
+
+        project_root = '/fake/project'
+        canned_master_tree = {
+            'tasks': [{'id': '1', 'title': 'Task A', 'description': 'Desc A', 'status': 'done'}],
+        }
+
+        async def _get_tasks_side_effect(_project_root, tag=None):
+            effective_tag = tag or 'master'
+            if effective_tag == 'master':
+                return canned_master_tree
+            raise RuntimeError(f'read failed for tag {effective_tag!r}')
+
+        with TestRunBackfill()._run_backfill_context() as (mock_curator, mock_tm_cls):
+            mock_curator.prune_orphans = AsyncMock()
+            mock_tm_instance = AsyncMock()
+            mock_tm_instance.list_tags = AsyncMock(return_value=['master', 'feature-x'])
+            mock_tm_instance.get_tasks = AsyncMock(side_effect=_get_tasks_side_effect)
             mock_tm_cls.return_value = mock_tm_instance
 
             report = await run_prune(config_path=None, project_root=project_root)

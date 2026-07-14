@@ -17,11 +17,13 @@ from orchestrator.config import (
     ModelsConfig,
     ModuleConfig,
     OrchestratorConfig,
+    PriceEntry,
     SccacheConfig,
     TimeoutsConfig,
     _deep_merge,
     _discover_module_configs,
     apply_reload,
+    default_price_table,
     diff_config,
     load_config,
 )
@@ -2226,3 +2228,91 @@ class TestProgressExtensionConfig:
 
         assert defaults['max_progress_resume_iterations'] == 20
         assert config.max_progress_resume_iterations == defaults['max_progress_resume_iterations']
+
+
+class TestPriceEntry:
+    """PriceEntry is a validated submodel: input_per_1m/output_per_1m, both >= 0."""
+
+    def test_constructs_and_exposes_rates(self):
+        entry = PriceEntry(input_per_1m=1.10, output_per_1m=4.40)
+        assert entry.input_per_1m == 1.10
+        assert entry.output_per_1m == 4.40
+
+    def test_negative_rate_rejected(self):
+        with pytest.raises(ValidationError):
+            PriceEntry(input_per_1m=-1, output_per_1m=1)
+
+
+class TestOrchestratorConfigPrices:
+    """OrchestratorConfig.prices is seeded from the packaged defaults.yaml
+    `prices:` block (task 2459; migrated off invoke.py's former hardcoded
+    _MODEL_COSTS).
+    """
+
+    _SEED_KEYS = {'gpt-5.4', 'o4-mini', 'gemini-3.1-pro-preview', 'gemini-3-flash'}
+
+    def test_prices_seeded_with_expected_rates(self, monkeypatch, tmp_path):
+        monkeypatch.chdir(tmp_path)
+        monkeypatch.setenv('ORCH_CONFIG_PATH', '')
+        config = OrchestratorConfig()
+        assert set(config.prices) == self._SEED_KEYS
+        assert config.prices['gpt-5.4'].input_per_1m == 2.50
+        assert config.prices['gpt-5.4'].output_per_1m == 10.00
+        assert config.prices['o4-mini'].input_per_1m == 1.10
+        assert config.prices['o4-mini'].output_per_1m == 4.40
+        assert config.prices['gemini-3.1-pro-preview'].input_per_1m == 1.25
+        assert config.prices['gemini-3.1-pro-preview'].output_per_1m == 5.00
+        assert config.prices['gemini-3-flash'].input_per_1m == 0.075
+        assert config.prices['gemini-3-flash'].output_per_1m == 0.30
+
+    def test_default_price_table_returns_plain_dict_seeds(self):
+        table = default_price_table()
+        assert set(table) == self._SEED_KEYS
+        assert table['o4-mini'] == {'input_per_1m': 1.10, 'output_per_1m': 4.40}
+
+    def test_default_price_table_matches_defaults_yaml(self):
+        """config.py's `_DEFAULT_PRICES` constant and defaults.yaml's
+        `prices:` block are two hand-maintained copies of the same seed
+        table (task 2459 amendment) — nothing else enforces they agree, so
+        assert equality directly to catch future drift.
+        """
+        assert default_price_table() == _load_package_defaults()['prices']
+
+
+class TestPricesReloadDisposition:
+    """`prices` is a green-tier hot-reloadable dict-valued top-level leaf,
+    mirroring the existing `verify_env` precedent in RELOADABLE_FIELDS.
+    """
+
+    def test_prices_is_reloadable(self):
+        assert 'prices' in RELOADABLE_FIELDS
+
+    def test_price_edit_lands_in_applied_candidates_not_restart_required(
+        self, monkeypatch, tmp_path
+    ):
+        monkeypatch.chdir(tmp_path)
+        monkeypatch.setenv('ORCH_CONFIG_PATH', '')
+        live = OrchestratorConfig(
+            prices={'o4-mini': PriceEntry(input_per_1m=1.10, output_per_1m=4.40)}
+        )
+        fresh = OrchestratorConfig(
+            prices={'o4-mini': PriceEntry(input_per_1m=9.99, output_per_1m=4.40)}
+        )
+        diff = diff_config(live, fresh)
+        assert 'prices' in diff.applied_candidates
+        assert 'prices' not in diff.restart_required
+
+    def test_apply_reload_applies_in_place(self, monkeypatch, tmp_path):
+        monkeypatch.chdir(tmp_path)
+        monkeypatch.setenv('ORCH_CONFIG_PATH', '')
+        live = OrchestratorConfig(
+            prices={'o4-mini': PriceEntry(input_per_1m=1.10, output_per_1m=4.40)}
+        )
+        fresh = OrchestratorConfig(
+            prices={'o4-mini': PriceEntry(input_per_1m=9.99, output_per_1m=4.40)}
+        )
+        report = apply_reload(live, fresh)
+        assert report['reloaded'] is True
+        assert 'prices' in report['applied']
+        assert 'prices' not in report['restart_required']
+        assert live.prices['o4-mini'].input_per_1m == 9.99

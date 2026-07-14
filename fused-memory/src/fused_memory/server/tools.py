@@ -49,6 +49,12 @@ from fused_memory.reconciliation.task_filter import (
     is_mixed_temporal_framing,
 )
 from fused_memory.server.manifest_stamping import stamp_capability_manifests
+from fused_memory.server.near_duplicate_guard import (
+    build_near_duplicate_block,
+    find_near_duplicate_memory,
+    resolve_near_dup_guard_enabled,
+    resolve_near_dup_threshold,
+)
 from fused_memory.server.tool_errors import mcp_tool_errors
 from fused_memory.services.memory_service import MemoryService
 from fused_memory.utils.validation import (
@@ -357,6 +363,11 @@ Conventions:
 - Always include project_id on every call (scopes data isolation).
 - Include agent_id for attribution (e.g. "claude-interactive", "claude-task-7").
 - Prefer add_memory over add_episode for discrete, pre-distilled facts (lower cost: 0-3 vs 5-15 LLM calls).
+- Before writing a procedural_knowledge memory, search first for an existing entry on the same
+  workflow/gotcha and update or skip instead of writing a near-duplicate. add_memory enforces this
+  at write time: a procedural_knowledge write that matches an existing entry at high similarity is
+  soft-blocked (error_type=ProceduralKnowledgeNearDuplicateWriteRejected); override with
+  metadata={'allow_near_duplicate': True} only when the content is genuinely distinct.
 - Tasks may carry memory_hints in metadata — structured pointers (search queries + entity names)
   that help future agents prefetch relevant context. Execute hint queries via search, look up
   hint entities via get_entity.
@@ -866,6 +877,20 @@ def create_mcp_server(
         """Add a classified memory directly. Skips the extraction pipeline.
         Use when the agent has already identified a specific, discrete memory.
 
+        Before writing a procedural_knowledge memory, search first for an
+        existing entry covering the same workflow/gotcha and update or skip
+        instead of writing a near-duplicate. procedural_knowledge writes are
+        soft-blocked at write time when they match an existing entry at high
+        similarity (error_type=ProceduralKnowledgeNearDuplicateWriteRejected);
+        override with metadata={'allow_near_duplicate': True} only when the
+        content is genuinely distinct. The guard only covers writes with an
+        explicit category='procedural_knowledge' (a category=None write that
+        auto-classifies to procedural_knowledge is not covered) and exempts
+        recon-stage-* agents (Stage-1 consolidation writes a merged/canonical
+        entry that is expected to closely resemble the duplicates it
+        replaces, with no ordering guarantee that those duplicates are
+        deleted first).
+
         Args:
             content: The memory itself (a fact, preference, procedure, etc.)
             project_id: Project scope (required)
@@ -874,7 +899,11 @@ def create_mcp_server(
                       If omitted, the system classifies automatically.
             agent_id: Which agent is writing (optional, auto-derived from MCP context)
             session_id: Session context (optional, auto-derived from MCP context)
-            metadata: Arbitrary key-value pairs (optional)
+            metadata: Arbitrary key-value pairs (optional). For procedural_knowledge,
+                      set {'allow_near_duplicate': True} to bypass the near-duplicate
+                      write guard when the content is genuinely distinct. This flag is
+                      write-time-only and is stripped before persistence — it is never
+                      stored on the resulting memory.
             dual_write: Force write to both stores (default: false)
         """
         agent_id, session_id = _resolve_identity(agent_id, session_id, ctx)
@@ -934,7 +963,58 @@ def create_mcp_server(
                     'conflicting_task_ids': sorted(conflicting_task_ids),
                     'hint': _CONFLICTING_TASK_STATUS_HINT,
                 }
+        allow_near_duplicate = (
+            isinstance(metadata, dict) and metadata.get('allow_near_duplicate') is True
+        )
+        is_recon_stage_agent = isinstance(agent_id, str) and agent_id.startswith('recon-stage-')
+        if (
+            category == 'procedural_knowledge'
+            and not allow_near_duplicate
+            and not is_recon_stage_agent
+            and resolve_near_dup_guard_enabled(memory_service)
+        ):
+            near_dup_threshold = resolve_near_dup_threshold(memory_service)
+            try:
+                # NOTE: this is an extra semantic search round-trip (embedding +
+                # vector query) on every explicit category='procedural_knowledge'
+                # write -- a deliberate cost to prevent duplicates landing. If
+                # procedural_knowledge write volume ever makes this matter,
+                # procedural_knowledge_near_dup_guard_enabled=False (see
+                # ReconciliationConfig) is the existing escape hatch.
+                near_dup_results = await memory_service.search(
+                    query=content,
+                    project_id=project_id,
+                    categories=['procedural_knowledge'],
+                    stores=['mem0'],
+                    limit=5,
+                )
+            except (TypeError, AttributeError, NameError):
+                # These indicate a wiring/programming bug (e.g. a future
+                # memory_service.search signature change renaming the
+                # stores/categories kwargs) rather than a transient backend
+                # failure -- re-raise so it surfaces loudly via the
+                # @mcp_tool_errors() wrapper (full traceback + a structured
+                # error response) instead of being silently absorbed into
+                # fail-open, which would quietly disable the guard in
+                # production behind nothing but a WARNING log.
+                raise
+            except Exception:
+                # Fail-open: a transient pre-check search failure/timeout must
+                # never block a write. Degrade to the pre-existing behavior.
+                logger.warning(
+                    'near-duplicate pre-check search failed; failing open', exc_info=True
+                )
+                near_dup_results = []
+            near_dup_match = find_near_duplicate_memory(near_dup_results, near_dup_threshold)
+            if near_dup_match is not None:
+                return build_near_duplicate_block(
+                    agent_id, content, near_dup_match, near_dup_threshold
+                )
         causation_id, source, cleaned_meta = _extract_causation(metadata, agent_id)
+        if isinstance(cleaned_meta, dict):
+            # allow_near_duplicate is a write-time-only control flag for the
+            # guard above; it must never be persisted into stored metadata.
+            cleaned_meta.pop('allow_near_duplicate', None)
         result = await memory_service.add_memory(
             content=content,
             category=category,
@@ -1543,9 +1623,10 @@ def create_mcp_server(
     @mcp.tool()
     @mcp_tool_errors()
     async def delete_memory(
-        memory_id: str,
         store: str,
         project_id: str,
+        memory_id: str | None = None,
+        id: str | None = None,
         agent_id: str | None = None,
         session_id: str | None = None,
         metadata: dict | None = None,
@@ -1561,10 +1642,17 @@ def create_mcp_server(
         includes its id (edge UUID for Graphiti, memory UUID for Mem0) and
         source_store.
 
+        Accepts either *memory_id* (canonical) or *id* (alias matching the key
+        search results and this tool's own response return). Exactly one must
+        be provided; supplying both with conflicting values is an error.
+
         Args:
-            memory_id: The memory ID (from search results)
             store: "graphiti" or "mem0" (from search results)
             project_id: Project scope (required)
+            memory_id: The memory ID (from search results)
+            id: Alias for memory_id, matching the `id` key returned by search
+                results and by this tool's own response (optional when
+                memory_id is provided)
             agent_id: Which agent is deleting (optional, auto-derived from MCP context)
             session_id: Session context (optional, auto-derived from MCP context)
             metadata: Optional key-value pairs (may contain _causation_id for recon)
@@ -1577,6 +1665,20 @@ def create_mcp_server(
             return err
         if err := _known_project_gate(project_id):
             return err
+        if memory_id is not None and id is not None and memory_id != id:
+            return {
+                'error': (
+                    f'Conflicting memory_id {memory_id!r} and id {id!r}; '
+                    'provide only one.'
+                ),
+                'error_type': 'ValidationError',
+            }
+        resolved_id = memory_id if memory_id is not None else id
+        if resolved_id is None:
+            return {
+                'error': 'memory_id (or alias id) is required',
+                'error_type': 'ValidationError',
+            }
         if store not in _VALID_STORES:
             return {
                 'error': (f'Invalid store {store!r}. Must be one of {sorted(_VALID_STORES)}.'),
@@ -1584,7 +1686,7 @@ def create_mcp_server(
             }
         causation_id, source, _ = _extract_causation(metadata, agent_id)
         return await memory_service.delete_memory(
-            memory_id=memory_id,
+            memory_id=resolved_id,
             store=store,
             project_id=project_id,
             agent_id=agent_id,
@@ -1743,6 +1845,7 @@ def create_mcp_server(
         project_id: str,
         entity_uuid: str | None = None,
         entity_name: str | None = None,
+        name: str | None = None,
         agent_id: str | None = None,
         session_id: str | None = None,
         metadata: dict | None = None,
@@ -1759,6 +1862,11 @@ def create_mcp_server(
         When both are supplied, entity_uuid takes precedence. At least one must
         be provided.
 
+        entity_name also accepts *name* as an alias (matching the key used by
+        get_entity and returned by this tool's own response). Exactly one of
+        entity_name/name should be used; supplying both with conflicting
+        values is an error.
+
         The summary is rebuilt by deduplicating the facts of all currently-valid
         RELATES_TO edges — no LLM call is made.
 
@@ -1768,6 +1876,9 @@ def create_mcp_server(
                 entity_name is provided)
             entity_name: Exact name of the Entity node to resolve and refresh
                 (optional when entity_uuid is provided)
+            name: Alias for entity_name, matching the `name` key used by
+                get_entity and returned by this tool's own response (optional
+                when entity_name or entity_uuid is provided)
             agent_id: Which agent is calling (optional, auto-derived from MCP context)
             session_id: Session context (optional, auto-derived from MCP context)
             metadata: Optional key-value pairs (may contain _causation_id for recon)
@@ -1778,7 +1889,16 @@ def create_mcp_server(
             return err
         if err := validate_project_id(project_id):
             return err
-        if not entity_uuid and not entity_name:
+        if entity_name is not None and name is not None and entity_name != name:
+            return {
+                'error': (
+                    f'Conflicting entity_name {entity_name!r} and name {name!r}; '
+                    'provide only one.'
+                ),
+                'error_type': 'ValidationError',
+            }
+        resolved_name = entity_name if entity_name is not None else name
+        if not entity_uuid and not resolved_name:
             return {
                 'error': 'Either entity_uuid or entity_name must be provided',
                 'error_type': 'ValidationError',
@@ -1786,7 +1906,7 @@ def create_mcp_server(
         causation_id, source, _ = _extract_causation(metadata, agent_id)
         return await memory_service.refresh_entity_summary(
             entity_uuid=entity_uuid or None,
-            entity_name=entity_name or None,
+            entity_name=resolved_name or None,
             project_id=project_id,
             agent_id=agent_id,
             session_id=session_id,

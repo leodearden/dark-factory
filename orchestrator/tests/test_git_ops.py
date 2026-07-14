@@ -4217,6 +4217,81 @@ class TestRunWorktreeMissing:
         assert not isinstance(exc.value, WorktreeMissing)
 
 
+@pytest.mark.asyncio
+class TestRunCancellationReapsChild:
+    """``_run`` kills+reaps the spawned child on cancellation (task 2608).
+
+    Regression coverage for the orphan-process leak: a caller wrapping
+    ``_run`` in ``asyncio.wait_for(..., timeout=...)`` (as
+    delivered_checks.py's ``_run_script_check`` does for script-kind
+    delivered checks) cancels the ``await proc.communicate()`` inside
+    ``_run`` on timeout. Before the fix, the spawned child kept running as
+    an orphan with its stdout/stderr pipes open, leaking a process + FDs on
+    every scheduler sweep for a persistently-hung script.
+    """
+
+    async def test_timeout_kills_and_reaps_hung_child(self, tmp_path: Path) -> None:
+        pid_file = tmp_path / 'child.pid'
+        # A child that records its own pid then sleeps far longer than the
+        # wait_for timeout below — simulates a persistently-hung script.
+        script = (
+            'import os, time, sys\n'
+            f"open({str(pid_file)!r}, 'w').write(str(os.getpid()))\n"
+            'time.sleep(60)\n'
+        )
+        with pytest.raises(asyncio.TimeoutError):
+            await asyncio.wait_for(
+                _run(['python3', '-c', script]), timeout=1.0
+            )
+
+        # Wait for the child to have written its pid (should be near-instant).
+        for _ in range(50):
+            if pid_file.exists():
+                break
+            await asyncio.sleep(0.1)
+        assert pid_file.exists(), 'child never started'
+        child_pid = int(pid_file.read_text())
+
+        # The cancelled _run must have killed + reaped the child by now — no
+        # zombie, no orphan still sleeping.
+        for _ in range(50):
+            try:
+                os.kill(child_pid, 0)
+            except ProcessLookupError:
+                break
+            await asyncio.sleep(0.1)
+        else:
+            pytest.fail(f'child pid {child_pid} was not reaped after cancellation')
+
+    async def test_cancelled_error_kills_and_reaps_child(self, tmp_path: Path) -> None:
+        pid_file = tmp_path / 'child.pid'
+        script = (
+            'import os, time\n'
+            f"open({str(pid_file)!r}, 'w').write(str(os.getpid()))\n"
+            'time.sleep(60)\n'
+        )
+        task = asyncio.ensure_future(_run(['python3', '-c', script]))
+        for _ in range(50):
+            if pid_file.exists():
+                break
+            await asyncio.sleep(0.1)
+        assert pid_file.exists(), 'child never started'
+        child_pid = int(pid_file.read_text())
+
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+        for _ in range(50):
+            try:
+                os.kill(child_pid, 0)
+            except ProcessLookupError:
+                break
+            await asyncio.sleep(0.1)
+        else:
+            pytest.fail(f'child pid {child_pid} was not reaped after cancellation')
+
+
 def _write_stored_title(worktree: Path, title: str) -> None:
     """Write a ``.task/metadata.json`` carrying ``title`` into *worktree*."""
     task_dir = worktree / '.task'

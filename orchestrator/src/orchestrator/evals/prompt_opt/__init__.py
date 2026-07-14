@@ -19,6 +19,17 @@ from orchestrator.evals.prompt_opt.canary import (
     load_window_rows,
     run_canary,
 )
+from orchestrator.evals.prompt_opt.curator_corpus import (
+    AuditReport,
+    CuratorCorpusManifest,
+    CuratorReplayItem,
+    audit_curator_corpus,
+    build_curator_corpus,
+    propose_curator_label_frontier,
+    read_curator_decisions,
+    select_spot_check_subset,
+)
+from orchestrator.evals.prompt_opt.curator_scorer import CuratorActionScorer
 from orchestrator.evals.prompt_opt.engine import LoopResult, run_optimization_loop
 from orchestrator.evals.prompt_opt.optimizer import propose_heuristics_edit
 from orchestrator.evals.prompt_opt.scorer import ProposeFn, RolloutFn, ScoredItem, Scorer
@@ -33,9 +44,13 @@ from orchestrator.evals.prompt_opt.variance import (
 
 __all__ = [
     'AcceptanceRecord',
+    'AuditReport',
     'CanaryThresholds',
     'CanaryVerdict',
     'CorpusSplit',
+    'CuratorActionScorer',
+    'CuratorCorpusManifest',
+    'CuratorReplayItem',
     'LoopResult',
     'MetricComparison',
     'ProposeFn',
@@ -43,15 +58,20 @@ __all__ = [
     'ScoredItem',
     'Scorer',
     'WindowMetrics',
+    'audit_curator_corpus',
+    'build_curator_corpus',
     'compare_windows',
     'compute_window_metrics',
     'evaluate_acceptance',
     'load_window_rows',
     'measure_repeatability_band',
     'paired_delta',
+    'propose_curator_label_frontier',
     'propose_heuristics_edit',
+    'read_curator_decisions',
     'run_canary',
     'run_optimization_loop',
+    'select_spot_check_subset',
     'split_corpus',
     'textual_lr',
 ]

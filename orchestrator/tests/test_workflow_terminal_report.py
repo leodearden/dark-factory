@@ -15,25 +15,28 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 
 # Cross-module reuse — conftest.py injects orchestrator/tests onto sys.path
-# (see test_repend_state_machine.py for the same precedent).
+# (see test_repend_state_machine.py for the same precedent). These factories
+# live in _workflow_helpers.py (task 2610), not test_workflow_e2e.py's
+# private namespace.
 #
 # ``_derive_meta_root_like_production`` is imported (not just the plain
-# helpers) because it is an autouse fixture in test_workflow_e2e.py — autouse
-# only auto-applies within a module where pytest can SEE the fixture, and a
-# plain `from test_workflow_e2e import AgentStub, ...` does not pull that in.
-# Without it, AgentStub's legacy-only TaskArtifacts writes (_architect/
-# _implementer) are invisible to the workflow's relocated meta_root, so
-# get_pending_steps() never observes completion and any full-execute-loop
-# test (e.g. the clean-DONE case below) spuriously blocks with "Execution
-# iterations exhausted" instead of reaching DONE.
-from test_harness_warm_lane_wiring import _build_harness, _init_git_repo
-from test_workflow_e2e import (
+# helpers) because it is an autouse fixture — autouse only auto-applies
+# within a module where pytest can SEE the fixture, and a plain
+# `from _workflow_helpers import AgentStub, ...` that omits its name does
+# not pull that in. Without it, AgentStub's legacy-only TaskArtifacts writes
+# (_architect/_implementer) are invisible to the workflow's relocated
+# meta_root, so get_pending_steps() never observes completion and any
+# full-execute-loop test (e.g. the clean-DONE case below) spuriously blocks
+# with "Execution iterations exhausted" instead of reaching DONE.
+from _workflow_helpers import (
     AgentStub,
+    _build_harness,
     _build_workflow,
     _derive_meta_root_like_production,  # noqa: F401  autouse fixture, see above
+    _init_git_repo,
     _init_repo,
+    _make_warmlane_workflow,
 )
-from test_workflow_warm_lane_requeue import _make_workflow as _make_warmlane_workflow
 
 from orchestrator.config import GitConfig, OrchestratorConfig
 from orchestrator.git_ops import GitOps

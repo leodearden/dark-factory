@@ -471,3 +471,146 @@ class TestVerifyAdmissionSlotsDirDefault:
 
         assert config.verify_admission_slots_dir != old_host_global
         assert config.verify_admission_slots_dir.startswith(f'{old_host_global}-')
+
+
+class TestBackgroundRoleWiring:
+    """task 2391 (PRD T3) characterization: the main-tip sweep stamps
+    role='background' (verify.run_main_tip_sweep -> run_full_verification ->
+    run_verification). This is a regression guard pinning the END-TO-END
+    effect of that stamp — NOT a new production behavior. Both the slot
+    acquire and the nice-19/ionice-idle wrap are already implemented by T1
+    (``shared.verify_admission.nice_prefix``/``acquire_task_slot``) and T2
+    (``verify._admission_slot``/``_resolve_nice_prefix``); this test only
+    confirms 'background' rides them correctly once stamped.
+    """
+
+    @pytest.mark.real_verify_admission
+    @pytest.mark.asyncio
+    async def test_background_role_acquires_slot_and_applies_nice_19_tier(self, tmp_path):
+        events: list = []
+
+        @contextlib.contextmanager
+        def fake_acquire(role, *, slots_dir, n, wait=True):
+            events.append(('acquire', role, slots_dir, n, wait))
+            yield True
+
+        captured_cmds: list[str] = []
+
+        async def spy_run_cmd(cmd, cwd, timeout, env=None, log_path=None, **kwargs):
+            captured_cmds.append(cmd)
+            events.append(f'run:{_leg_for_cmd(cmd)}')
+            return 0, '', False
+
+        slots_dir = tmp_path / 'slots'
+        config = OrchestratorConfig(
+            verify_admission_slots_dir=str(slots_dir),
+            verify_admission_task_slots=1,
+        )
+        worktree = tmp_path / 'wt'
+        worktree.mkdir()
+
+        with patch('orchestrator.verify.acquire_task_slot', side_effect=fake_acquire) as mock_acquire, \
+                patch('orchestrator.verify._run_cmd', side_effect=spy_run_cmd):
+            await run_verification(
+                worktree=worktree,
+                config=config,
+                module_config=_module_config(),
+                role='background',
+                attempt_id=None,
+            )
+
+        mock_acquire.assert_called_once_with('background', slots_dir=slots_dir, n=1, wait=True)
+        assert events[0] == ('acquire', 'background', slots_dir, 1, True), (
+            f'Expected the background role to acquire a slot before the test leg runs; '
+            f'got events={events!r}'
+        )
+        assert captured_cmds[0] == 'nice -n 19 ionice -c3 /bin/bash -c ' + shlex.quote(_TEST_CMD), (
+            f'Expected the test leg to be wrapped with the background nice-19/ionice-idle '
+            f'tier; got {captured_cmds[0]!r}'
+        )
+        assert captured_cmds[1] == _LINT_CMD, 'lint leg must not be niced'
+        assert captured_cmds[2] == _TYPE_CMD, 'type leg must not be niced'
+
+
+class TestEnvRecoveryRetryAdmission:
+    """task 2391 (PRD §9 tactical) characterization: the env-recovery retry
+    (run_verification's single forced-serial re-run of the test command on an
+    'env_transient' first pass) re-acquires its own admission slot rather
+    than double-holding the first pass's.
+
+    Each ``_run_or_skip_timed`` call opens and closes its OWN
+    ``async with _admission_slot(role, config)`` (verify.py:3013); because the
+    first pass's test-leg call has already exited that async-with by the time
+    the retry's call begins (sequential awaits, not overlapping), the retry's
+    acquire is guaranteed to start only after the first pass's release. This
+    is a regression guard on that guarantee — GREEN with no production
+    change.
+    """
+
+    @pytest.mark.real_verify_admission
+    @pytest.mark.asyncio
+    async def test_env_recovery_retry_reacquires_without_double_holding(self, tmp_path):
+        events: list = []
+
+        @contextlib.contextmanager
+        def fake_acquire(role, *, slots_dir, n, wait=True):
+            events.append(('acquire', role))
+            try:
+                yield True
+            finally:
+                events.append(('release', role))
+
+        call_index = 0
+
+        async def spy_run_cmd(cmd, cwd, timeout, env=None, log_path=None, **kwargs):
+            nonlocal call_index
+            call_index += 1
+            events.append(f'run:{call_index}')
+            if call_index == 1:
+                # First test-leg call: an env_transient-classifying failure
+                # (vanished xdist plugin — matches _ENV_TRANSIENT_PATTERNS).
+                return 1, "ModuleNotFoundError: No module named 'xdist'", False
+            # lint (#2), type (#3), and the env-recovery retry's test leg
+            # (#4) all succeed.
+            return 0, '', False
+
+        slots_dir = tmp_path / 'slots'
+        config = OrchestratorConfig(
+            verify_admission_slots_dir=str(slots_dir),
+            verify_admission_task_slots=1,
+        )
+        worktree = tmp_path / 'wt'
+        worktree.mkdir()
+
+        with patch('orchestrator.verify.acquire_task_slot', side_effect=fake_acquire) as mock_acquire, \
+                patch('orchestrator.verify._run_cmd', side_effect=spy_run_cmd):
+            result = await run_verification(
+                worktree=worktree,
+                config=config,
+                module_config=_module_config(),
+                role='task',
+                attempt_id=None,
+            )
+
+        # The env-recovery retry cleared the transient -> overall pass.
+        assert result.passed is True, (
+            f'Expected the env-recovery retry to clear the transient and pass; '
+            f'got passed={result.passed!r}, category={result.category!r}'
+        )
+
+        assert mock_acquire.call_count == 2, (
+            f'Expected exactly 2 acquisitions (first pass test leg + '
+            f'env-recovery retry test leg); got {mock_acquire.call_count}. '
+            f'lint/type never acquire (admission gates label==\'test\' only).'
+        )
+
+        acquire_release_events = [e for e in events if isinstance(e, tuple)]
+        assert acquire_release_events == [
+            ('acquire', 'task'), ('release', 'task'),
+            ('acquire', 'task'), ('release', 'task'),
+        ], (
+            f'Expected 2 strictly-nested acquire/release pairs (every acquire '
+            f'followed by its own release before the next acquire — max '
+            f'concurrent depth 1), each with role=\'task\'; got '
+            f'{acquire_release_events!r}'
+        )

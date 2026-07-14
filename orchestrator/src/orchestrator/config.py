@@ -256,7 +256,7 @@ class TimeoutsConfig(BaseModel):
 
 
 class BackendsConfig(BaseModel):
-    """Backend CLI selection per agent role. Values: 'claude', 'codex', 'gemini'."""
+    """Backend CLI selection per agent role. Values: 'claude', 'codex', 'gemini', 'pi'."""
 
     architect: str = Field(default='claude')
     implementer: str = Field(default='claude')
@@ -535,6 +535,34 @@ class PsiAdmissionConfig(BaseModel):
         description=(
             'DA-D3 anti-deadlock floor: the gate never holds when fewer than '
             'this many tasks are in flight on this orchestrator. Must be >= 1.'
+        ),
+    )
+
+
+class DeliveredChecksConfig(BaseModel):
+    """Delivered-check dep-gate sweep configuration (capability-delivered-
+    checks PRD, plans/capability-delivered-checks-prd.md).
+
+    The scheduler's per-tick sweep (``Scheduler._compute_delivered_check_cache``)
+    evaluates every distinct terminal local dep that carries
+    ``metadata.delivered_checks`` against the committed ``main`` tree.
+    ``max_checks_per_tick`` bounds how many uncached (dep, main_sha) checks
+    that sweep evaluates in a single tick — a worst-case fan-out guard so a
+    burst of newly-terminal deps can't stall tick latency; checks deferred by
+    the budget stay uncached and are retried (fail-safe wait) next tick.
+
+    Task 2580 (delta) owns only this one leaf. Task 2583 (epsilon) extends
+    this sub-model with the grace-streak escalation knobs (enabled,
+    grace_cycles, check_timeout_secs).
+    """
+
+    max_checks_per_tick: int = Field(
+        default=50,
+        ge=1,
+        description=(
+            'Maximum number of uncached (dep_task_id, main_sha) delivered-checks '
+            'evaluated per scheduler tick. Must be >= 1. Checks deferred by this '
+            'budget remain uncached and are retried next tick (fail-safe wait).'
         ),
     )
 
@@ -1503,6 +1531,38 @@ def _discover_module_configs(project_root: Path) -> dict[str, ModuleConfig]:
     return configs
 
 
+_DEFAULT_PRICES: dict[str, dict[str, float]] = {
+    # Per-model USD cost per 1M tokens, for backends without native cost
+    # reporting (codex, gemini). Migrated from the former invoke.py
+    # `_MODEL_COSTS` constant (task 2459). defaults.yaml's `prices:` block is
+    # the operator-editable seed source; this constant is the safety-net
+    # default for OrchestratorConfig.prices and backs default_price_table(),
+    # which orchestrator.agents.invoke's cost estimator falls back to when no
+    # config is threaded in. Kept in lockstep with defaults.yaml's `prices:`
+    # block by test_config.py's test_default_price_table_matches_defaults_yaml.
+    'gpt-5.4': {'input_per_1m': 2.50, 'output_per_1m': 10.00},
+    'o4-mini': {'input_per_1m': 1.10, 'output_per_1m': 4.40},
+    'gemini-3.1-pro-preview': {'input_per_1m': 1.25, 'output_per_1m': 5.00},
+    'gemini-3-flash': {'input_per_1m': 0.075, 'output_per_1m': 0.30},
+}
+
+
+class PriceEntry(BaseModel):
+    """Per-model USD price, in dollars per 1M tokens.
+
+    Used by cost estimation for backends without native cost reporting
+    (codex, gemini) — see orchestrator.agents.invoke._estimate_cost.
+    """
+
+    input_per_1m: float = Field(ge=0, description='USD per 1M input tokens.')
+    output_per_1m: float = Field(ge=0, description='USD per 1M output tokens.')
+
+
+def default_price_table() -> dict[str, dict[str, float]]:
+    """Return a fresh copy of the packaged default per-model price seeds."""
+    return {model: dict(rates) for model, rates in _DEFAULT_PRICES.items()}
+
+
 # --- Top-level ---
 
 
@@ -1818,6 +1878,29 @@ class OrchestratorConfig(BaseSettings):
     # ``cargo --workspace`` → ``cargo -p <crate>`` for the touched crates.
     # Post-merge verify always runs workspace-wide regardless.
     scope_cargo: bool = Field(default=True)
+
+    # Per-model USD/1M-token prices for backends without native cost
+    # reporting (codex, gemini). Seeded from defaults.yaml's `prices:` block
+    # (task 2459; migrated off invoke.py's former hardcoded _MODEL_COSTS).
+    # Green-tier hot-reloadable (see RELOADABLE_FIELDS): a `prices` edit is
+    # picked up by reload_config like any other green-tier field.
+    #
+    # NOT YET WIRED: as of task 2459, no production invoke_agent() call site
+    # (cli.py, workflow.py, steward.py, evals/*) passes prices=config.prices,
+    # so orchestrator.agents.invoke._estimate_cost() always resolves the
+    # packaged default_price_table() regardless of what is configured here.
+    # Editing (or reloading) this field has no observable effect on cost
+    # estimation until that follow-up wiring lands — tracked as T1/T3/T4 in
+    # plans/harness-backend-reconnect-pi-prd.md; this task (T-price) delivers
+    # only the shared substrate.
+    prices: dict[str, PriceEntry] = Field(
+        default_factory=lambda: {k: PriceEntry(**v) for k, v in _DEFAULT_PRICES.items()},
+        description=(
+            'Per-model USD/1M token prices for backends without native cost '
+            'reporting (codex, gemini). NOT YET consulted by any production '
+            'invoke_agent() call site as of task 2459 — see field comment.'
+        ),
+    )
 
     # ── Merge-verify scoping & fan-out bounds (storm guard) ──────────────
     # When True, post-merge verify bypasses per-subproject scoping/fan-out and
@@ -2450,6 +2533,10 @@ class OrchestratorConfig(BaseSettings):
     # in orchestrator.yaml yields the DA-D7 enabled-by-default instance.
     psi_admission: PsiAdmissionConfig = Field(default_factory=PsiAdmissionConfig)
 
+    # Delivered-check dep-gate sweep budget (task 2580, capability-delivered-
+    # checks PRD delta). Task 2583 (epsilon) extends this sub-model further.
+    delivered_checks: DeliveredChecksConfig = Field(default_factory=DeliveredChecksConfig)
+
     # Value/h scheduler scoring (P2/P3 — age boost, CPM weighting).
     age_alpha: float = Field(
         default=10.0,
@@ -2970,6 +3057,12 @@ RELOADABLE_FIELDS: frozenset[str] = frozenset().union(
         'review.full_review_min_tasks',
         # Verify env (fresh config's value already carries the sccache fold)
         'verify_env',
+        # Per-model USD/1M-token price table (task 2459) — green-tier like
+        # verify_env above. NOTE: not yet consulted by any production
+        # invoke_agent() call site (see OrchestratorConfig.prices docstring);
+        # registered now so no second reload-tier migration is needed once
+        # T1/T3/T4 wire it in.
+        'prices',
         # Offline-lane tunables (leaf fields on the existing `git` submodel —
         # leaf-mutation only per I3)
         'git.offline_lane_test_threads',
@@ -2988,6 +3081,10 @@ RELOADABLE_FIELDS: frozenset[str] = frozenset().union(
         # read fresh per run_scoped_verification call, so a live reload
         # lowers the merge fan-out without a restart.
         'merge_verify_max_concurrent_modules',
+        # Delivered-check dep-gate sweep budget (task 2580, capability-
+        # delivered-checks PRD delta) — scheduler tuning, same tier as
+        # fairness.skip_threshold / starvation_watchdog.*.
+        'delivered_checks.max_checks_per_tick',
     },
 )
 

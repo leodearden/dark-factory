@@ -143,9 +143,10 @@ class TestBackfillDepStatusPhase:
 
 class TestPolicySelectionPrepPhases:
     """Isolation tests for the Policy/selection-prep phases (external_dep_policy,
-    stamp_milestone, override_snapshot_gc, reserve_now, override_diff,
-    build_candidates, starvation) — each calls its ``_phase_*`` method directly
-    against a hand-built ``TickContext``, no full-tick orchestration."""
+    delivered_check_gate, stamp_milestone, override_snapshot_gc, reserve_now,
+    override_diff, build_candidates, starvation) — each calls its ``_phase_*``
+    method directly against a hand-built ``TickContext``, no full-tick
+    orchestration."""
 
     @pytest.mark.asyncio
     async def test_phase_external_dep_policy_runs_gate_exactly_once(
@@ -165,6 +166,41 @@ class TestPolicySelectionPrepPhases:
         scheduler.get_external_statuses.assert_awaited_once()
         assert ctx.external_cache == {'other:5': 'done'}
         assert ctx.external_resolver_failed is False
+        assert result is _CONTINUE
+
+    @pytest.mark.asyncio
+    async def test_phase_delivered_check_gate_runs_sweep_once_and_writes_ctx(
+        self, scheduler: Scheduler
+    ):
+        """Mirrors ``test_phase_external_dep_policy_runs_gate_exactly_once``:
+        the phase runs the delivered-check sweep exactly once and threads its
+        result onto ``ctx.delivered_check_cache`` (task 2580 step-15/16)."""
+        task = {'id': 'T', 'status': 'pending', 'dependencies': [{'id': '20'}]}
+        ctx = TickContext(tasks=[task], status_map={'T': 'pending'}, tasks_by_id={'T': task})
+        scheduler._compute_delivered_check_cache = AsyncMock(return_value={'20': True})
+
+        result = await scheduler._phase_delivered_check_gate(ctx)
+
+        scheduler._compute_delivered_check_cache.assert_awaited_once()
+        assert ctx.delivered_check_cache == {'20': True}
+        assert result is _CONTINUE
+
+    @pytest.mark.asyncio
+    async def test_phase_delivered_check_gate_degrades_to_empty_cache_on_raise(
+        self, scheduler: Scheduler
+    ):
+        """A sweep failure must fail-safe to an empty cache — never abort the
+        tick — mirroring ``_phase_external_dep_policy``'s try/except around
+        ``_apply_external_dep_policy``."""
+        task = {'id': 'T', 'status': 'pending', 'dependencies': [{'id': '20'}]}
+        ctx = TickContext(tasks=[task], status_map={'T': 'pending'}, tasks_by_id={'T': task})
+        scheduler._compute_delivered_check_cache = AsyncMock(
+            side_effect=RuntimeError('boom')
+        )
+
+        result = await scheduler._phase_delivered_check_gate(ctx)
+
+        assert ctx.delivered_check_cache == {}
         assert result is _CONTINUE
 
     @pytest.mark.asyncio
@@ -610,6 +646,15 @@ class TestTickPhaseOrderLiteral:
         assert order.index('cooldown_gc') < order.index('select_scored')
         # (3) external-dep policy runs exactly once per tick.
         assert order.count('external_dep_policy') == 1
+        # (4) delivered-check gate (task 2580) runs exactly once per tick,
+        # immediately after external_dep_policy and before either
+        # candidate-dispatch loop consumes its cache.
+        assert order.count('delivered_check_gate') == 1
+        assert (
+            order.index('delivered_check_gate') == order.index('external_dep_policy') + 1
+        )
+        assert order.index('delivered_check_gate') < order.index('build_candidates')
+        assert order.index('delivered_check_gate') < order.index('select_pins')
 
         # Every label genuinely drives dispatch — it maps to a real
         # coroutine method on Scheduler, not just a decorative string.

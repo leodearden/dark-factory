@@ -208,3 +208,63 @@ class TestReviewCheckpointParseFailure:
             f'No unparseable-output WARNING expected for well-formed output; '
             f'got: {parse_warnings}'
         )
+
+
+@pytest.mark.asyncio
+class TestReviewCheckpointVerifyRole:
+    """Regression guard (task 2391 / T3): review-checkpoint acquires as task-role.
+
+    T3 stamps role='background' on the main-tip sweep's run_full_verification
+    calls only (verify.run_main_tip_sweep — see test_verify_main_tip_sweep.py).
+    review_checkpoint.py is intentionally untouched by that change: its Phase 1
+    call omits the role kwarg entirely, so run_full_verification's 'task'
+    default applies. This pins that behavior so a future edit can't silently
+    start stamping 'background' (or any other non-default role) onto the
+    review-checkpoint fan-out.
+    """
+
+    async def test_run_focused_verify_call_omits_role_kwarg(self, monkeypatch):
+        """run_focused()'s run_full_verification call must verify at 'task' priority.
+
+        Asserts the *effective* role (kwarg present-and-'task', or absent so
+        run_full_verification's 'task' default applies) rather than the
+        kwarg's mere absence — a behavior-preserving refactor that starts
+        passing the equivalent ``role='task'`` explicitly should still pass
+        this test, while a real regression to ``role='background'`` (or any
+        other non-task role) must still fail it.
+
+        Reuses the AllAccountsCappedException short-circuit (see
+        test_run_review_handles_all_accounts_capped above) to reach the Phase 1
+        verify call with minimal mocking — the cap exception fires immediately
+        after Phase 1 completes, so this doesn't need to touch _save_report or
+        the agent-output parse path.
+        """
+        checkpoint = _make_checkpoint()
+
+        cap_exc = AllAccountsCappedException(
+            retries=4, elapsed_secs=300.0, label='Review checkpoint [x]'
+        )
+
+        mock_run_full_verification = AsyncMock(return_value=_PHASE1_RESULT)
+
+        monkeypatch.setattr(
+            'orchestrator.review_checkpoint.invoke_with_cap_retry',
+            AsyncMock(side_effect=cap_exc),
+        )
+        monkeypatch.setattr(
+            'orchestrator.review_checkpoint.run_full_verification',
+            mock_run_full_verification,
+        )
+
+        report = await checkpoint.run_focused()
+
+        assert isinstance(report, ReviewReport)
+        mock_run_full_verification.assert_awaited_once()
+        assert mock_run_full_verification.await_args is not None
+        call_kwargs = mock_run_full_verification.await_args.kwargs
+        assert call_kwargs.get('role', 'task') == 'task', (
+            'review-checkpoint must verify at task priority — expected the '
+            "effective role to be 'task' (whether via an absent kwarg, relying "
+            "on run_full_verification's default, or an explicit role='task'); "
+            f"got kwargs={call_kwargs!r}"
+        )

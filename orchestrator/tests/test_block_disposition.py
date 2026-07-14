@@ -35,9 +35,11 @@ import pytest
 # Cross-module reuse — conftest.py injects orchestrator/tests onto sys.path
 # (see test_workflow_terminal_report.py for the same precedent). ``_derive_
 # meta_root_like_production`` is imported (not just the plain helpers)
-# because it is an autouse fixture in test_workflow_e2e.py — autouse only
-# auto-applies within a module where pytest can SEE the fixture.
-from test_workflow_e2e import (
+# because it is an autouse fixture — autouse only auto-applies within a
+# module where pytest can SEE the fixture. These factories live in
+# _workflow_helpers.py (task 2610), not test_workflow_e2e.py's private
+# namespace.
+from _workflow_helpers import (
     AgentStub,
     _build_workflow,
     _derive_meta_root_like_production,  # noqa: F401  autouse fixture, see above

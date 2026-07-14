@@ -2699,7 +2699,7 @@ def _resolve_verify_env(
     config: OrchestratorConfig,
     module_config: ModuleConfig | None,
     *,
-    role: Literal['merge', 'task'] = 'task',
+    role: Literal['merge', 'task', 'background'] = 'task',
 ) -> dict[str, str]:
     """Return the effective env injected into verify commands.
 
@@ -2921,7 +2921,7 @@ async def run_verification(
     attempt_id: int | None = None,
     task_id: str | None = None,
     archive_root: Path | None = None,
-    role: Literal['merge', 'task'] = 'task',
+    role: Literal['merge', 'task', 'background'] = 'task',
 ) -> VerifyResult:
     """Run test suite, linter, and type checker. Return structured result.
 
@@ -3440,12 +3440,21 @@ async def run_full_verification(
     config: OrchestratorConfig,
     *,
     force_rediscover: bool = False,
+    role: Literal['merge', 'task', 'background'] = 'task',
 ) -> VerifyResult:
     """Run verification for ALL subprojects against the project root.
 
     Unlike run_scoped_verification, this runs full (unscoped) test suites
     for every subproject that has an orchestrator.yaml. Used by review
     checkpoints to check integration health across the whole codebase.
+
+    *role* is threaded to every internal :func:`run_verification` call
+    (both the per-subproject fan-out and the no-subproject global-fallback
+    branch).  Defaults to ``'task'``, which keeps the primary production
+    caller ``review_checkpoint.py`` (and every other existing caller)
+    byte-identical.  ``run_main_tip_sweep`` passes ``role='background'`` so
+    the sweep's fan-out acquires the background admission slot and the
+    nice-19/ionice-idle tier instead.
 
     Discovery reuse: ``config._module_configs`` uses a sentinel of ``None`` to
     mean "discovery never ran".  When it holds any dict (including ``{}``,
@@ -3480,14 +3489,14 @@ async def run_full_verification(
         module_configs = _discover_module_configs(project_root)
     if not module_configs:
         logger.info('Full verification: no subproject configs — using global')
-        return await run_verification(project_root, config)
+        return await run_verification(project_root, config, role=role)
 
     logger.info(
         'Full verification: running %d subprojects in parallel',
         len(module_configs),
     )
     results = await asyncio.gather(
-        *(run_verification(project_root, config, mc) for mc in module_configs.values())
+        *(run_verification(project_root, config, mc, role=role) for mc in module_configs.values())
     )
     return _aggregate_results(list(results))
 
@@ -3949,9 +3958,7 @@ async def verify_failure_is_preexisting_on_main(
     (``prune_stale_merge_worktrees``, targeting ``_merge-*`` only) never
     reclaims the probe mid-run.
     """
-    import uuid
-
-    from orchestrator.git_ops import _run
+    from orchestrator.git_ops import EphemeralWorktreeError, WorktreeKind
 
     # Lazy-import normalisation helper from workflow to avoid the
     # verify<->workflow import cycle (workflow imports verify at module level).
@@ -3964,15 +3971,6 @@ async def verify_failure_is_preexisting_on_main(
         except Exception:
             return (hint or '').strip().lower()
 
-    # tmp_path: probe worktree path under git_ops.worktree_base.
-    # Using worktree_base/<name> (not /tmp) ensures the same upward directory
-    # traversal as task worktrees for node_modules / repo-root dependencies.
-    # The '_mainprobe-' prefix keeps it distinct from '_merge-*' so the disk-
-    # pressure prune (prune_stale_merge_worktrees) never reclaims it mid-run.
-    # git worktree add CREATES tmp_path; we must NOT pre-create it or git will
-    # reject an already-present directory on strict versions.
-    tmp_path: Path | None = None
-    worktree_added: bool = False
     try:
         # Resolve the current main SHA.
         try:
@@ -3996,88 +3994,49 @@ async def verify_failure_is_preexisting_on_main(
                 )
                 return _cached, (main_sha if _cached else '')
 
-        # Create the probe worktree path under worktree_base so upward directory
-        # traversal resolves node_modules / repo-root installs identically to
-        # task worktrees.  git worktree add CREATES the path, so we must NOT
-        # pre-create it (strict git rejects pre-existing directories).
-        base: Path = git_ops.worktree_base  # type: ignore[union-attr]
-        base.mkdir(parents=True, exist_ok=True)
-        tmp_path = base / f'_mainprobe-{uuid.uuid4().hex[:8]}'
-
-        # Retry worktree add on transient git lock contention (serialised metadata
-        # writes mean concurrent sibling probes can hit LOCK_MAX).
-        _MAX_ADD_RETRIES = 3
-        rc, _, err = 1, '', 'not attempted'
-        for _attempt in range(_MAX_ADD_RETRIES):
-            rc, _, err = await _run(
-                ['git', 'worktree', 'add', '--detach', str(tmp_path), main_sha],
-                cwd=config.project_root,
-            )
-            if rc == 0:
-                worktree_added = True
-                break
-            if _attempt < _MAX_ADD_RETRIES - 1:
-                await asyncio.sleep(0.5 * (_attempt + 1))
-        if not worktree_added:
-            logger.warning(
-                'verify_failure_is_preexisting_on_main: worktree add failed after %d retries '
-                '(rc=%d): %s — contagion guard disabled for this attempt',
-                _MAX_ADD_RETRIES, rc, err,
-            )
-            return False, ''
-
-        # Probe main with the same scoped commands, no retries.
-        try:
-            main_result = await run_scoped_verification(
-                tmp_path, config, module_configs,
-                task_files=task_files,
-                max_retries=0,
-                role='task',
-            )
-        except Exception:
-            logger.debug(
-                'verify_failure_is_preexisting_on_main: probe verify raised', exc_info=True,
-            )
-            return False, ''
-
-        if main_result.passed:
-            # Main is clean — the break is task-own.
-            _PROBE_CACHE[_cache_key] = (time.monotonic(), False)
-            return False, ''
-
-        # Compare (category, normalised cause_hint).
-        branch_sig = (failing_result.category or '', _norm_hint)
-        main_sig = (main_result.category or '', _normalize(main_result.cause_hint))
-        is_preexisting = branch_sig == main_sig
-        _PROBE_CACHE[_cache_key] = (time.monotonic(), is_preexisting)
-        return is_preexisting, (main_sha if is_preexisting else '')
-
-    except Exception:
-        logger.debug('verify_failure_is_preexisting_on_main: unexpected error', exc_info=True)
-        return False, ''
-    finally:
-        # Scoped cleanup: remove only this specific probe worktree.
-        # INTENTIONALLY NO 'git worktree prune' here (DD5 guarantee): a broad prune
-        # would deregister ANY concurrently-active sibling probe (other tasks running
-        # verify_failure_is_preexisting_on_main in parallel), causing their git
-        # worktree add to succeed but probe path to vanish mid-verify.  Scoped
-        # 'git worktree remove --force <tmp_path>' deregisters ONLY this probe.
-        if worktree_added and tmp_path is not None:
+        # Probe worktree lifecycle (mint under worktree_base with the
+        # '_mainprobe-' band, retry-on-lock-contention add, GUARANTEED scoped
+        # cleanup on exit — never a broad 'git worktree prune', DD5) is owned
+        # by GitOps.ephemeral_worktree; see its docstring for the full
+        # contract.
+        async with git_ops.ephemeral_worktree(  # type: ignore[union-attr]
+            WorktreeKind.MAIN_PROBE, main_sha,
+        ) as tmp_path:
+            # Probe main with the same scoped commands, no retries.
             try:
-                await _run(
-                    ['git', 'worktree', 'remove', '--force', str(tmp_path)],
-                    cwd=config.project_root,
+                main_result = await run_scoped_verification(
+                    tmp_path, config, module_configs,
+                    task_files=task_files,
+                    max_retries=0,
+                    role='task',
                 )
             except Exception:
                 logger.debug(
-                    'verify_failure_is_preexisting_on_main: worktree remove failed',
-                    exc_info=True,
+                    'verify_failure_is_preexisting_on_main: probe verify raised', exc_info=True,
                 )
-        if tmp_path is not None:
-            with contextlib.suppress(Exception):
-                # Belt-and-suspenders: rmtree the probe dir in case git worktree
-                # remove left an empty skeleton, or the worktree add never ran.
-                shutil.rmtree(tmp_path, ignore_errors=True)
+                return False, ''
+
+            if main_result.passed:
+                # Main is clean — the break is task-own.
+                _PROBE_CACHE[_cache_key] = (time.monotonic(), False)
+                return False, ''
+
+            # Compare (category, normalised cause_hint).
+            branch_sig = (failing_result.category or '', _norm_hint)
+            main_sig = (main_result.category or '', _normalize(main_result.cause_hint))
+            is_preexisting = branch_sig == main_sig
+            _PROBE_CACHE[_cache_key] = (time.monotonic(), is_preexisting)
+            return is_preexisting, (main_sha if is_preexisting else '')
+
+    except EphemeralWorktreeError as e:
+        logger.warning(
+            'verify_failure_is_preexisting_on_main: %s — contagion guard '
+            'disabled for this attempt', e,
+        )
+        return False, ''
+    except Exception:
+        logger.debug('verify_failure_is_preexisting_on_main: unexpected error', exc_info=True)
+        return False, ''
 
 
 async def run_main_tip_sweep(
@@ -4142,12 +4101,11 @@ async def run_main_tip_sweep(
     guarantee: a broad prune would deregister concurrently-active sibling
     probe/merge worktrees).
     """
-    import uuid  # noqa: PLC0415, I001
-    from orchestrator.git_ops import _run  # noqa: PLC0415 — lazy, mirrors verify_failure_is_preexisting_on_main
+    from orchestrator.git_ops import (  # noqa: PLC0415 — lazy, mirrors verify_failure_is_preexisting_on_main
+        EphemeralWorktreeError,
+        WorktreeKind,
+    )
 
-    # git worktree add CREATES tmp_path; do NOT pre-create or strict git rejects it.
-    tmp_path: Path | None = None
-    worktree_added: bool = False
     try:
         # Resolve the current main SHA unless the caller pre-resolved it.
         # Accepting a pre-resolved value eliminates a redundant git rev-parse
@@ -4162,125 +4120,140 @@ async def run_main_tip_sweep(
         if not main_sha:
             return None
 
-        # Build the sweep worktree path under worktree_base.  The '_mainsweep-'
-        # prefix is distinct from '_merge-' and '_mainprobe-' so the disk-pressure
-        # prune (prune_stale_merge_worktrees, targeting '_merge-*' only) never
-        # reclaims the probe mid-run.  Same env-parity reasoning as mainprobe.
-        base: Path = git_ops.worktree_base  # type: ignore[union-attr]
-        base.mkdir(parents=True, exist_ok=True)
-        tmp_path = base / f'_mainsweep-{uuid.uuid4().hex[:8]}'
+        # Sweep worktree lifecycle (mint under worktree_base with the
+        # '_mainsweep-' band, retry-on-lock-contention add, GUARANTEED scoped
+        # cleanup on exit — never a broad 'git worktree prune', DD5) is owned
+        # by GitOps.ephemeral_worktree; see its docstring for the full
+        # contract.
+        async with git_ops.ephemeral_worktree(  # type: ignore[union-attr]
+            WorktreeKind.MAIN_SWEEP, main_sha,
+        ) as tmp_path:
+            def _enoent_on_self(r: 'VerifyResult') -> bool:
+                """SECONDARY backstop (task 2507): True iff *r* is a
+                not-passed result whose cause_hint names an ENOENT ('No
+                such file or directory' / '[Errno 2]') referencing THIS
+                sweep's own tmp_path — i.e. the worktree vanished mid-run.
 
-        # Retry worktree add on transient git lock contention (serialised metadata
-        # writes mean concurrent sibling probes can hit LOCK_MAX).
-        _MAX_ADD_RETRIES = 3
-        rc, _, err = 1, '', 'not attempted'
-        for _attempt in range(_MAX_ADD_RETRIES):
-            rc, _, err = await _run(
-                ['git', 'worktree', 'add', '--detach', str(tmp_path), main_sha],
-                cwd=config.project_root,  # type: ignore[union-attr]
-            )
-            if rc == 0:
-                worktree_added = True
-                break
-            if _attempt < _MAX_ADD_RETRIES - 1:
-                await asyncio.sleep(0.5 * (_attempt + 1))
-        if not worktree_added:
-            logger.warning(
-                'run_main_tip_sweep: worktree add failed after %d retries '
-                '(rc=%d): %s — sweep skipped for this tick',
-                _MAX_ADD_RETRIES, rc, err,
-            )
-            return None
+                Narrowly scoped to this sweep's own path — deliberately
+                NOT a blanket 'unknown_test_failure' addition to
+                INFRA_TRANSIENT_CATEGORIES, which would silently swallow
+                genuine main-tip drift under that broad category. This is
+                defense-in-depth behind the PRIMARY fix (
+                GitOps.ephemeral_worktree's flock-liveness guard, which
+                stops the warm-lane-GC race that used to cause exactly
+                this ENOENT); it backstops residual worktree-vanish causes
+                (disk fault, a manual ``rm``) after the flock closes the
+                GC race.
+                """
+                if r.passed or not r.cause_hint:
+                    return False
+                hint_lower = r.cause_hint.lower()
+                return (
+                    ('no such file or directory' in hint_lower or '[errno 2]' in hint_lower)
+                    and str(tmp_path) in r.cause_hint
+                )
 
-        # Run full (unscoped) verification — all discovered subprojects, no scope filter.
-        result = await run_full_verification(tmp_path, config)  # type: ignore[arg-type]
+            # Run full (unscoped) verification — all discovered subprojects, no scope filter.
+            # role='background' (lowest nice tier — task 2391/PRD T3): the sweep is a
+            # background asyncio.Task with no dispatch/merge/deploy path awaiting it, so
+            # its fan-out should never contend with real task/merge lane verifies.
+            result = await run_full_verification(tmp_path, config, role='background')  # type: ignore[arg-type]
 
-        # pytest INTERNALERROR means the test infrastructure itself crashed (e.g. an
-        # xdist worker was killed by os._exit).  env_transient means a concurrent
-        # `uv sync` elsewhere transiently mutated the shared venv mid-run (vanished
-        # xdist/pip).  Both are infra failures, not drift — return the None sentinel
-        # so the harness retries next tick and files no false-positive drift L1.
-        # The finally block's worktree cleanup still runs.
-        if result.category in INFRA_TRANSIENT_CATEGORIES:
-            logger.warning(
-                'run_main_tip_sweep: %s in first-pass sweep — '
-                'treating as infra crash, not drift (retrying next tick); '
-                'cause_hint=%r',
-                'pytest INTERNALERROR' if result.category == 'pytest_internalerror'
-                else 'environmental shared-venv transient (env_transient)',
-                result.cause_hint,
-            )
-            return None
-
-        if not result.passed:
-            # First pass failed (not an INTERNALERROR).  Re-run once in the same
-            # pinned worktree to distinguish a transient load-sensitive flake from
-            # deterministic drift.  A second worktree add is NOT needed — the
-            # worktree is already pinned at main_sha, so re-running is idempotent.
-            # NOTE: worktree state (temp files, partially-written DBs, caches) from
-            # the first run is NOT reset before the retry — this is intentional (fast
-            # heuristic, not hermetic isolation; see docstring for tradeoff discussion).
-            _sha_prefix = main_sha[:12] if main_sha else '?'
-            logger.warning(
-                'run_main_tip_sweep: first-pass verification failed at %s '
-                '(category=%r, cause_hint=%r) — retrying once in the same '
-                'worktree to distinguish transient flake from deterministic drift',
-                _sha_prefix, result.category, result.cause_hint,
-            )
-            retry = await run_full_verification(tmp_path, config)  # type: ignore[arg-type]
-
-            if retry.category in INFRA_TRANSIENT_CATEGORIES:
+            # pytest INTERNALERROR means the test infrastructure itself crashed (e.g. an
+            # xdist worker was killed by os._exit).  env_transient means a concurrent
+            # `uv sync` elsewhere transiently mutated the shared venv mid-run (vanished
+            # xdist/pip).  Both are infra failures, not drift — return the None sentinel
+            # so the harness retries next tick and files no false-positive drift L1.
+            # The CM's guaranteed cleanup still runs on the way out.
+            if result.category in INFRA_TRANSIENT_CATEGORIES:
                 logger.warning(
-                    'run_main_tip_sweep: retry at %s hit %s — '
+                    'run_main_tip_sweep: %s in first-pass sweep — '
                     'treating as infra crash, not drift (retrying next tick); '
                     'cause_hint=%r',
-                    _sha_prefix,
-                    'pytest INTERNALERROR' if retry.category == 'pytest_internalerror'
-                    else 'an environmental shared-venv transient (env_transient)',
-                    retry.cause_hint,
+                    'pytest INTERNALERROR' if result.category == 'pytest_internalerror'
+                    else 'environmental shared-venv transient (env_transient)',
+                    result.cause_hint,
                 )
                 return None
 
-            if retry.passed:
+            if _enoent_on_self(result):
                 logger.warning(
-                    'run_main_tip_sweep: first-pass failure at %s did NOT '
-                    'reproduce on retry (first-pass category=%r, '
-                    'cause_hint=%r) — treating as transient flake and '
-                    'suppressing drift escalation. '
-                    'NOTE: retry-on-flake MAY MASK a real intermittent '
-                    'regression introduced by a recent merge.',
+                    'run_main_tip_sweep: sweep worktree %s vanished mid-run '
+                    '(cause_hint=%r) — treating as infra transient, not '
+                    'drift (retrying next tick)',
+                    tmp_path, result.cause_hint,
+                )
+                return None
+
+            if not result.passed:
+                # First pass failed (not an INTERNALERROR).  Re-run once in the same
+                # pinned worktree to distinguish a transient load-sensitive flake from
+                # deterministic drift.  A second worktree add is NOT needed — the
+                # worktree is already pinned at main_sha, so re-running is idempotent.
+                # NOTE: worktree state (temp files, partially-written DBs, caches) from
+                # the first run is NOT reset before the retry — this is intentional (fast
+                # heuristic, not hermetic isolation; see docstring for tradeoff discussion).
+                _sha_prefix = main_sha[:12] if main_sha else '?'
+                logger.warning(
+                    'run_main_tip_sweep: first-pass verification failed at %s '
+                    '(category=%r, cause_hint=%r) — retrying once in the same '
+                    'worktree to distinguish transient flake from deterministic drift',
                     _sha_prefix, result.category, result.cause_hint,
                 )
-                # Append to the in-process audit registry so suppressed flakes
-                # remain observable beyond the log stream (tests can inspect
-                # verify._suppressed_flake_records; operators can too via the
-                # live object graph).
-                _suppressed_flake_records.append({
-                    'sha': main_sha,
-                    'first_pass_category': result.category,
-                    'first_pass_cause_hint': result.cause_hint,
-                })
+                retry = await run_full_verification(tmp_path, config, role='background')  # type: ignore[arg-type]
 
-            # Return the retry result: passing (flake suppressed) or failing
-            # (deterministic drift — harness files L1 escalation as usual).
-            return (main_sha, retry)
+                if retry.category in INFRA_TRANSIENT_CATEGORIES:
+                    logger.warning(
+                        'run_main_tip_sweep: retry at %s hit %s — '
+                        'treating as infra crash, not drift (retrying next tick); '
+                        'cause_hint=%r',
+                        _sha_prefix,
+                        'pytest INTERNALERROR' if retry.category == 'pytest_internalerror'
+                        else 'an environmental shared-venv transient (env_transient)',
+                        retry.cause_hint,
+                    )
+                    return None
 
-        return (main_sha, result)
+                if _enoent_on_self(retry):
+                    logger.warning(
+                        'run_main_tip_sweep: sweep worktree %s vanished '
+                        'mid-run on retry (cause_hint=%r) — treating as '
+                        'infra transient, not drift (retrying next tick)',
+                        tmp_path, retry.cause_hint,
+                    )
+                    return None
 
+                if retry.passed:
+                    logger.warning(
+                        'run_main_tip_sweep: first-pass failure at %s did NOT '
+                        'reproduce on retry (first-pass category=%r, '
+                        'cause_hint=%r) — treating as transient flake and '
+                        'suppressing drift escalation. '
+                        'NOTE: retry-on-flake MAY MASK a real intermittent '
+                        'regression introduced by a recent merge.',
+                        _sha_prefix, result.category, result.cause_hint,
+                    )
+                    # Append to the in-process audit registry so suppressed flakes
+                    # remain observable beyond the log stream (tests can inspect
+                    # verify._suppressed_flake_records; operators can too via the
+                    # live object graph).
+                    _suppressed_flake_records.append({
+                        'sha': main_sha,
+                        'first_pass_category': result.category,
+                        'first_pass_cause_hint': result.cause_hint,
+                    })
+
+                # Return the retry result: passing (flake suppressed) or failing
+                # (deterministic drift — harness files L1 escalation as usual).
+                return (main_sha, retry)
+
+            return (main_sha, result)
+
+    except EphemeralWorktreeError as e:
+        logger.warning(
+            'run_main_tip_sweep: %s — sweep skipped for this tick', e,
+        )
+        return None
     except Exception:
         logger.debug('run_main_tip_sweep: unexpected error', exc_info=True)
         return None
-    finally:
-        # Scoped cleanup: remove only this specific sweep worktree.
-        # INTENTIONALLY NO 'git worktree prune' (DD5 guarantee).
-        if worktree_added and tmp_path is not None:
-            try:
-                await _run(
-                    ['git', 'worktree', 'remove', '--force', str(tmp_path)],
-                    cwd=config.project_root,  # type: ignore[union-attr]
-                )
-            except Exception:
-                logger.debug('run_main_tip_sweep: worktree remove failed', exc_info=True)
-        if tmp_path is not None:
-            with contextlib.suppress(Exception):
-                shutil.rmtree(tmp_path, ignore_errors=True)

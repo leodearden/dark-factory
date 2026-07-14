@@ -405,6 +405,26 @@ mcp__escalation__promote_to_l2(
 
 The task is blocked. The `/unblock-auto` hook runs dry-run proposals at block time — use the latest proposal as L2 evidence but **do NOT execute it**.
 
+**Check for a merge-skew disposition first.** Merge-gate failures carry a closed
+`disposition` — `main_red` | `integration_skew` | `branch_bug` | `indeterminate`
+(`plans/merge-skew-attribution-prd.md`, task β) — surfaced in the task's block
+reason (a trailing `integration_skew: port landed commit(s) <sha...> touching
+<files> — do not hunt your own diff` suffix) and in `merge_status.failure_diagnostic`
+(`disposition`/`implicated_commits`/`overlap_files`/`failing_tests`). It rides the
+same `task_failure`/`wip_conflict` category — it is not a distinct escalation
+category. If `disposition == "integration_skew"`:
+- Carry the `failure_diagnostic` (implicated commits + overlap files) verbatim into
+  the L2 `evidence` and reference it in `options` — the correct fix is porting the
+  named landed commit(s) into the branch, not "investigate and fix manually" the
+  branch's own diff.
+- **Never treat it as a flake and never let it feed flake statistics/auto-filing**
+  (reify 5142 / DF 2358's flaky ledger filters on this label) — a skew failure has a
+  deterministic, name-able cause even though a naive retry-after-rebase would make
+  it pass.
+- `main_red` continues through the existing preexisting-main-break / "bad merge on
+  main" path above; `branch_bug` and `indeterminate` are handled exactly as before
+  (no disposition-specific change).
+
 1. Fetch the current proposal (if any):
    ```python
    task = mcp__fused-memory__get_task(id=<task_id>, project_root=<project_root>)

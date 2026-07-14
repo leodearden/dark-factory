@@ -5970,6 +5970,102 @@ class TestRunFullVerificationReuse:
         )
 
 
+class TestRunFullVerificationRole:
+    """run_full_verification threads its `role` param to every run_verification call.
+
+    Task 2391 (PRD T3): the main-tip sweep needs role='background' threaded
+    down to each subproject verify (and the no-subproject global fallback) so
+    it acquires the background admission slot and nice-19/ionice-idle tier.
+    The default must stay 'task' so every other existing caller (e.g.
+    review-checkpoint) is unaffected.
+    """
+
+    def _make_passing_result(self) -> VerifyResult:
+        return VerifyResult(
+            passed=True,
+            test_output='',
+            lint_output='',
+            type_output='',
+            summary='ok',
+        )
+
+    @pytest.mark.asyncio
+    async def test_threads_background_role_to_each_subproject(self, tmp_path: Path):
+        """role='background' passed to run_full_verification reaches every
+        per-subproject run_verification call.
+
+        RED today: run_full_verification has no `role` parameter, so passing
+        role='background' raises TypeError.
+        """
+        config = OrchestratorConfig(project_root=tmp_path)
+        config._module_configs = {
+            'dashboard': ModuleConfig(prefix='dashboard', test_command='echo dash'),
+            'api': ModuleConfig(prefix='api', test_command='echo api'),
+        }
+
+        passing = self._make_passing_result()
+        mock_run_verification = AsyncMock(return_value=passing)
+        with patch('orchestrator.verify.run_verification', new=mock_run_verification):
+            await run_full_verification(tmp_path, config, role='background')
+
+        assert mock_run_verification.call_count == 2, (
+            f'Expected run_verification to be called once per subproject (2); '
+            f'called {mock_run_verification.call_count} time(s)'
+        )
+        for one_call in mock_run_verification.call_args_list:
+            assert one_call.kwargs.get('role') == 'background', (
+                f"Expected every subproject run_verification call to receive "
+                f"role='background'; got kwargs={one_call.kwargs!r}"
+            )
+
+    @pytest.mark.asyncio
+    async def test_default_role_is_task_for_each_subproject(self, tmp_path: Path):
+        """Omitting `role` defaults to 'task' — preserves existing callers
+        (e.g. review-checkpoint) byte-identically.
+
+        RED today: run_full_verification passes no `role` kwarg at all to
+        run_verification, so `.kwargs.get('role')` is None, not 'task'.
+        """
+        config = OrchestratorConfig(project_root=tmp_path)
+        config._module_configs = {
+            'dashboard': ModuleConfig(prefix='dashboard', test_command='echo dash'),
+        }
+
+        passing = self._make_passing_result()
+        mock_run_verification = AsyncMock(return_value=passing)
+        with patch('orchestrator.verify.run_verification', new=mock_run_verification):
+            await run_full_verification(tmp_path, config)
+
+        assert mock_run_verification.call_count == 1
+        one_call = mock_run_verification.call_args_list[0]
+        assert one_call.kwargs.get('role') == 'task', (
+            f"Expected the default role to be 'task'; got kwargs={one_call.kwargs!r}"
+        )
+
+    @pytest.mark.asyncio
+    async def test_threads_role_on_no_subproject_global_fallback(self, tmp_path: Path):
+        """When there are no subproject configs, the global-fallback
+        run_verification call must still receive the threaded role.
+
+        RED today: the global-fallback branch calls
+        `run_verification(project_root, config)` with no role kwarg.
+        """
+        config = OrchestratorConfig(project_root=tmp_path)
+        config._module_configs = {}  # discovered-empty → global fallback branch
+
+        passing = self._make_passing_result()
+        mock_run_verification = AsyncMock(return_value=passing)
+        with patch('orchestrator.verify.run_verification', new=mock_run_verification):
+            await run_full_verification(tmp_path, config, role='background')
+
+        assert mock_run_verification.call_count == 1
+        one_call = mock_run_verification.call_args_list[0]
+        assert one_call.kwargs.get('role') == 'background', (
+            f"Expected the global-fallback call to receive role='background'; "
+            f"got kwargs={one_call.kwargs!r}"
+        )
+
+
 class TestRunScopedVerificationForceWorkspace:
     """run_scoped_verification: force_workspace=True bypasses all scoping.
 

@@ -246,6 +246,20 @@ class EventType(StrEnum):
     # data keys: {cause, ticks, detail}.
     external_dep_gate_held = 'external_dep_gate_held'
 
+    # Delivered-check dep-gate held — emitted when a pending task's done/
+    # cancelled local dep carries metadata.delivered_checks and its
+    # per-(dep_task_id, main_sha) cache entry is NOT True (either the check
+    # ran-and-FAILED, or it is absent — errored/over-budget/not-yet-run).
+    # Unlike external_dep_gate_held, this fires on EVERY held tick (no
+    # threshold gate) — task 2580 (delta) has no grace_cycles config yet;
+    # task 2583 (epsilon) layers threshold-gated escalation on top with its
+    # own counter. Pure dashboard visibility (capability-delivered-checks
+    # PRD, plans/capability-delivered-checks-prd.md, task delta).
+    # data keys: {ticks, detail}.
+    #   detail: dict naming the failed check (name/dep_id/main_sha/kind) or
+    #           None when _note_delivered_hold was called without one.
+    delivered_check_gate_held = 'delivered_check_gate_held'
+
     # Dispatch-admission gate deferred a HEAVY (normal-kind) candidate this
     # tick because host PSI pressure is saturated (config.psi_admission) and
     # this orchestrator's own in-flight count (len(Scheduler._dispatched)) is

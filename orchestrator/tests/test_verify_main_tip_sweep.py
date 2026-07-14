@@ -7,7 +7,7 @@ detached worktree pinned at the current main SHA.  Returns (main_sha,
 VerifyResult) on success, or None on any infrastructure failure (fail-safe).
 
 Mirrors the mock strategy of test_verify_preexisting_main_break.py:
-  - MagicMock git_ops with get_main_sha (AsyncMock) and worktree_base
+  - Real GitOps with get_main_sha patched (AsyncMock) and worktree_base
   - monkeypatch orchestrator.git_ops._run to simulate worktree add/remove
   - monkeypatch orchestrator.verify.run_full_verification (AsyncMock)
 
@@ -21,15 +21,22 @@ Test coverage:
            test_run_main_tip_sweep_both_passes_fail_is_drift
            test_run_main_tip_sweep_passes_first_time_no_retry
            test_run_main_tip_sweep_internalerror_on_retry_returns_none
+  task 2507 step-5 (SECONDARY backstop): TestRunMainTipSweepEnoentOwnWorktree
+           — an ENOENT result whose cause_hint names THIS sweep's own
+           tmp_path maps to the None sentinel (retry-next-tick, no drift),
+           covered independently at BOTH the first-pass and the retry call
+           site; a CONTROL test pins narrowness — an ENOENT naming a
+           DIFFERENT path is still real drift and passes through unchanged.
 """
 
 from __future__ import annotations
 
 import asyncio
 from pathlib import Path
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import AsyncMock, patch
 
 from orchestrator.config import GitConfig, OrchestratorConfig
+from orchestrator.git_ops import GitOps
 from orchestrator.verify import VerifyResult
 
 # ---------------------------------------------------------------------------
@@ -83,14 +90,21 @@ def _make_config(tmp_path: Path) -> OrchestratorConfig:
     )
 
 
-def _make_git_ops(tmp_path: Path, main_sha: str = MAIN_SHA) -> MagicMock:
-    """Build a minimal MagicMock git_ops."""
-    mock = MagicMock()
-    mock.get_main_sha = AsyncMock(return_value=main_sha)
-    worktree_base = tmp_path / '.worktrees'
-    worktree_base.mkdir(parents=True, exist_ok=True)
-    mock.worktree_base = worktree_base
-    return mock
+def _make_git_ops(tmp_path: Path, main_sha: str = MAIN_SHA) -> GitOps:
+    """Build a real GitOps with get_main_sha patched.
+
+    Behavior-preserving swap from a MagicMock: run_main_tip_sweep only
+    touches git_ops.worktree_base, git_ops.get_main_sha(), and the
+    module-level orchestrator.git_ops._run (patched separately by each
+    test) — all present and correct on a real GitOps instance. A real
+    instance is required once the probe consumes
+    GitOps.ephemeral_worktree(), which a plain MagicMock cannot satisfy
+    as an async context manager.
+    """
+    git_ops = GitOps(_make_config(tmp_path).git, tmp_path)
+    git_ops.get_main_sha = AsyncMock(return_value=main_sha)  # type: ignore[method-assign]
+    git_ops.worktree_base.mkdir(parents=True, exist_ok=True)
+    return git_ops
 
 
 # ---------------------------------------------------------------------------
@@ -482,3 +496,329 @@ class TestRunMainTipSweepRetryOnFlake:
             'git worktree remove --force must run even when retry returns '
             'pytest_internalerror (cleanup-in-finally guarantee)'
         )
+
+
+class TestRunMainTipSweepRoleStamp:
+    """task 2391 (PRD T3): run_main_tip_sweep stamps role='background' on
+    both the first-pass and flake-retry run_full_verification calls.
+
+    RED today: run_main_tip_sweep calls run_full_verification(tmp_path,
+    config) with no role kwarg at either call site.
+    """
+
+    def test_run_main_tip_sweep_stamps_background_role_on_both_calls(
+        self, tmp_path: Path
+    ) -> None:
+        """Both the first-pass and the flake-retry call must receive
+        role='background'.
+
+        Uses the FAILING -> PASSING side_effect (mirrors
+        TestRunMainTipSweepRetryOnFlake) to exercise both call sites in one
+        sweep invocation.
+        """
+        from orchestrator import verify as verify_module
+
+        config = _make_config(tmp_path)
+        git_ops = _make_git_ops(tmp_path)
+
+        async def _fake_run(cmd, **kwargs):
+            return (0, '', '')
+
+        rfv = AsyncMock(side_effect=[FAILING_RESULT, PASSING_RESULT])
+
+        with (
+            patch('orchestrator.git_ops._run', side_effect=_fake_run),
+            patch.object(verify_module, 'run_full_verification', rfv),
+        ):
+            result = asyncio.run(
+                verify_module.run_main_tip_sweep(config, git_ops)
+            )
+
+        assert result is not None, 'Expected (sha, VerifyResult), got None'
+        swept_sha, vr = result
+        assert swept_sha == MAIN_SHA
+        assert vr.passed is True
+
+        assert rfv.call_count == 2, (
+            f'Expected exactly 2 calls to run_full_verification '
+            f'(first-pass + flake-retry), got {rfv.call_count}'
+        )
+        for call_index, one_call in enumerate(rfv.call_args_list):
+            assert one_call.kwargs.get('role') == 'background', (
+                f'Expected call #{call_index} to run_full_verification to receive '
+                f"role='background'; got kwargs={one_call.kwargs!r}"
+            )
+
+    def test_run_main_tip_sweep_role_propagates_through_real_run_full_verification(
+        self, tmp_path: Path
+    ) -> None:
+        """Thin end-to-end seam: role propagates across BOTH hops.
+
+        The other tests here (and TestRunFullVerificationRole in
+        test_verify.py) each mock one hop of the chain
+        ``run_main_tip_sweep -> run_full_verification -> run_verification`` —
+        that's reasonable seam-based coverage, but no single test lets both
+        hops run for real together. This test mocks only the innermost
+        function (``run_verification``) and lets the REAL
+        ``run_full_verification`` run in between, confirming the
+        ``role='background'`` stamp actually threads all the way down rather
+        than merely being asserted at each seam independently.
+
+        The sweep's worktree path is never created on disk (``git worktree
+        add`` is faked via ``orchestrator.git_ops._run``), so the real
+        ``run_full_verification``'s discovery walk
+        (``_discover_module_configs``) silently finds zero subprojects on the
+        nonexistent path (``os.walk`` on a missing dir yields nothing) and
+        takes the no-subproject global-fallback branch — exercising the same
+        single ``run_verification`` call the production sweep hits on a
+        monorepo with no ``orchestrator.yaml`` subprojects.
+        """
+        from orchestrator import verify as verify_module
+
+        config = _make_config(tmp_path)
+        git_ops = _make_git_ops(tmp_path)
+
+        async def _fake_run(cmd, **kwargs):
+            return (0, '', '')
+
+        run_verification_calls: list = []
+
+        async def _fake_run_verification(project_root, cfg, module_config=None, **kwargs):
+            run_verification_calls.append(kwargs)
+            return PASSING_RESULT
+
+        with (
+            patch('orchestrator.git_ops._run', side_effect=_fake_run),
+            patch.object(verify_module, 'run_verification', side_effect=_fake_run_verification),
+        ):
+            result = asyncio.run(
+                verify_module.run_main_tip_sweep(config, git_ops)
+            )
+
+        assert result is not None, 'Expected (sha, VerifyResult), got None'
+        swept_sha, vr = result
+        assert swept_sha == MAIN_SHA
+        assert vr.passed is True
+
+        assert len(run_verification_calls) == 1, (
+            f'Expected exactly 1 run_verification call — PASSING_RESULT on '
+            f'the first pass needs no flake-retry — got '
+            f'{len(run_verification_calls)}'
+        )
+        assert run_verification_calls[0].get('role') == 'background', (
+            "Expected the real run_full_verification to thread role='background' "
+            f'down to run_verification; got kwargs={run_verification_calls[0]!r}'
+        )
+
+
+# ---------------------------------------------------------------------------
+# task 2507 step-5: SECONDARY backstop — ENOENT naming this sweep's OWN
+# tmp_path maps to the None sentinel instead of drift passthrough
+# ---------------------------------------------------------------------------
+
+
+class TestRunMainTipSweepEnoentOwnWorktree:
+    """task 2507 step-5: narrow defense-in-depth behind the PRIMARY
+    flock-liveness fix (GitOps.ephemeral_worktree, steps 1-4). If the
+    sweep's own worktree still vanishes mid-run for some OTHER reason
+    (disk fault, a manual ``rm``, anything not closed by the flock), the
+    resulting ENOENT must not masquerade as real main-tip drift.
+
+    Deliberately narrow: matches ONLY an ENOENT whose cause_hint names
+    THIS sweep's own minted tmp_path — NOT a blanket addition of
+    'unknown_test_failure' to INFRA_TRANSIENT_CATEGORIES, which would
+    silently swallow genuine drift under that (broad, real-failure)
+    category.
+
+    RED today: run_main_tip_sweep returns ``(sha, result)`` for any
+    non-infra-category failure regardless of ENOENT/own-path — there is
+    no such backstop yet.
+    """
+
+    def test_enoent_naming_own_tmp_path_returns_none(self, tmp_path: Path) -> None:
+        """An ENOENT cause_hint naming this sweep's own tmp_path is treated
+        as an infra transient (worktree vanished mid-run) — return None
+        (retry-next-tick, no drift escalation) — and cleanup still runs."""
+        from orchestrator import verify as verify_module
+
+        config = _make_config(tmp_path)
+        git_ops = _make_git_ops(tmp_path)
+
+        run_calls: list = []
+        captured: dict[str, str] = {}
+
+        async def _fake_run(cmd, **kwargs):
+            run_calls.append(cmd)
+            if 'worktree' in cmd and 'add' in cmd:
+                detach_idx = cmd.index('--detach')
+                captured['tmp_path'] = cmd[detach_idx + 1]
+            return (0, '', '')
+
+        async def _fake_full_verify(*args, **kwargs):
+            return VerifyResult(
+                passed=False,
+                test_output='',
+                lint_output='',
+                type_output='',
+                summary='unknown_test_failure',
+                cause_hint=(
+                    f"[Errno 2] No such file or directory: "
+                    f"'{captured['tmp_path']}' | further traceback noise"
+                ),
+                category='unknown_test_failure',
+            )
+
+        with (
+            patch('orchestrator.git_ops._run', side_effect=_fake_run),
+            patch.object(verify_module, 'run_full_verification', side_effect=_fake_full_verify),
+        ):
+            result = asyncio.run(
+                verify_module.run_main_tip_sweep(config, git_ops)
+            )
+
+        assert result is None, (
+            f'Expected None (own-worktree ENOENT backstop) when the ENOENT '
+            f"cause_hint names this sweep's own tmp_path, got {result!r}"
+        )
+        assert captured.get('tmp_path'), 'expected the fake add to have captured a tmp_path'
+
+        # Cleanup must still run even though we return None early.
+        remove_calls = [c for c in run_calls if 'worktree' in c and 'remove' in c]
+        assert remove_calls, (
+            'git worktree remove --force must still run even when the '
+            'own-worktree ENOENT backstop returns None (cleanup-in-finally guarantee)'
+        )
+
+    def test_enoent_naming_own_tmp_path_on_retry_returns_none(
+        self, tmp_path: Path,
+    ) -> None:
+        """Same backstop, but exercised on the RETRY call site
+        (verify.py:4217's ``_enoent_on_self(retry)``), not the first-pass
+        call site (verify.py:4179's ``_enoent_on_self(result)``) the sibling
+        test above covers.
+
+        The first-pass result is an ORDINARY (non-ENOENT) failure, so it
+        triggers the existing retry-on-flake path without ever tripping the
+        first-pass ENOENT check; only the retry result is an ENOENT naming
+        this sweep's own tmp_path. Without this test, a regression that
+        dropped or broke the retry-path branch specifically would ship
+        green, since the first-pass test short-circuits (returns None)
+        before any retry runs.
+        """
+        from orchestrator import verify as verify_module
+
+        config = _make_config(tmp_path)
+        git_ops = _make_git_ops(tmp_path)
+
+        run_calls: list = []
+        captured: dict[str, str] = {}
+
+        async def _fake_run(cmd, **kwargs):
+            run_calls.append(cmd)
+            if 'worktree' in cmd and 'add' in cmd:
+                detach_idx = cmd.index('--detach')
+                captured['tmp_path'] = cmd[detach_idx + 1]
+            return (0, '', '')
+
+        call_count = 0
+
+        async def _fake_full_verify(*args, **kwargs):
+            nonlocal call_count
+            call_count += 1
+            if call_count == 1:
+                # Ordinary (non-ENOENT) first-pass failure: not in
+                # INFRA_TRANSIENT_CATEGORIES and _enoent_on_self(result) is
+                # False, so run_main_tip_sweep proceeds to the retry.
+                return FAILING_RESULT
+            return VerifyResult(
+                passed=False,
+                test_output='',
+                lint_output='',
+                type_output='',
+                summary='unknown_test_failure',
+                cause_hint=(
+                    f"[Errno 2] No such file or directory: "
+                    f"'{captured['tmp_path']}' | further traceback noise"
+                ),
+                category='unknown_test_failure',
+            )
+
+        with (
+            patch('orchestrator.git_ops._run', side_effect=_fake_run),
+            patch.object(verify_module, 'run_full_verification', side_effect=_fake_full_verify),
+        ):
+            result = asyncio.run(
+                verify_module.run_main_tip_sweep(config, git_ops)
+            )
+
+        assert result is None, (
+            f'Expected None (own-worktree ENOENT backstop on the RETRY path) '
+            f"when the retry's ENOENT cause_hint names this sweep's own "
+            f'tmp_path, got {result!r}'
+        )
+        assert call_count == 2, (
+            f'Expected exactly 2 calls to run_full_verification (first-pass '
+            f'+ retry) — this test is only meaningful if it actually '
+            f'reaches the retry-path branch, got {call_count}'
+        )
+        assert captured.get('tmp_path'), 'expected the fake add to have captured a tmp_path'
+
+        # Cleanup must still run even though we return None early.
+        remove_calls = [c for c in run_calls if 'worktree' in c and 'remove' in c]
+        assert remove_calls, (
+            'git worktree remove --force must still run even when the '
+            'retry-path own-worktree ENOENT backstop returns None '
+            '(cleanup-in-finally guarantee)'
+        )
+
+    def test_enoent_naming_different_path_is_still_drift_passthrough(
+        self, tmp_path: Path,
+    ) -> None:
+        """CONTROL (narrowness): an ENOENT result naming a DIFFERENT path —
+        NOT this sweep's own tmp_path — is real drift and must still pass
+        through as (main_sha, failing_result), not get swallowed."""
+        from orchestrator import verify as verify_module
+
+        config = _make_config(tmp_path)
+        git_ops = _make_git_ops(tmp_path)
+
+        run_calls: list = []
+        other_path = tmp_path / 'some' / 'unrelated' / 'path'
+
+        async def _fake_run(cmd, **kwargs):
+            run_calls.append(cmd)
+            return (0, '', '')
+
+        enoent_elsewhere = VerifyResult(
+            passed=False,
+            test_output='',
+            lint_output='',
+            type_output='',
+            summary='unknown_test_failure',
+            cause_hint=f"[Errno 2] No such file or directory: '{other_path}'",
+            category='unknown_test_failure',
+        )
+
+        async def _fake_full_verify(*args, **kwargs):
+            return enoent_elsewhere
+
+        with (
+            patch('orchestrator.git_ops._run', side_effect=_fake_run),
+            patch.object(verify_module, 'run_full_verification', side_effect=_fake_full_verify),
+        ):
+            result = asyncio.run(
+                verify_module.run_main_tip_sweep(config, git_ops)
+            )
+
+        assert result is not None, (
+            'Expected (sha, VerifyResult) drift-passthrough for an ENOENT '
+            'naming a DIFFERENT path, got None'
+        )
+        swept_sha, vr = result
+        assert swept_sha == MAIN_SHA
+        assert vr.passed is False
+        assert vr.category == 'unknown_test_failure'
+        assert vr.cause_hint == enoent_elsewhere.cause_hint
+
+        remove_calls = [c for c in run_calls if 'worktree' in c and 'remove' in c]
+        assert remove_calls, 'git worktree remove should run even on drift passthrough'
