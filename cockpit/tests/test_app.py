@@ -1371,11 +1371,11 @@ class TestWeightEditor:
         """compose()->_submit() for a CATEGORY Input, symmetric with the
         project-Input coverage above (test_submit_reads_edited_input_into_new_priorities).
 
-        Unlike project_edits (only included when changed from its seeded
-        value), _submit() reads EVERY category Input unconditionally, so
-        this also pins that untouched category values round-trip through
-        str(value)->float(raw) unchanged while the edited one takes the
-        new value.
+        category_edits uses the same value-vs-seeded skip as project_edits
+        (see WeightEditorScreen._submit), so this also pins that an
+        untouched category Input is skipped -- merge_weight_edits' base
+        copy already carries its value forward unchanged -- while the
+        edited one takes the new value.
         """
         from textual.widgets import Input
 

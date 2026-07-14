@@ -140,9 +140,9 @@ class WeightEditorScreen(ModalScreen[None]):
     screen -- add it to priorities.yaml directly to expose it.
 
     Submitting (the button, or Enter in any Input) reads every
-    Input's current value into category_edits/project_edits -- a project
-    edit is only included when it differs from that Input's seeded value,
-    so accepting the defaults without touching a field never materializes
+    Input's current value into category_edits/project_edits -- an edit is
+    only included when it differs from that Input's seeded value, so
+    accepting the defaults without touching any field never materializes
     an explicit priorities.yaml entry for it -- builds a new Priorities via
     the pure merge_weight_edits, dismisses, then calls the injected
     *on_submit* with that new Priorities -- this widget never persists to
@@ -222,10 +222,15 @@ class WeightEditorScreen(ModalScreen[None]):
         test_submit_keeps_prior_value_for_a_rejected_category_edit in
         test_app.py for the pinned current behavior.
         """
-        category_edits = {
-            name: self.query_one(f'#cat-{index}', Input).value
-            for index, name in enumerate(self._priorities.category_weights)
-        }
+        category_edits: dict[str, str] = {}
+        for index, name in enumerate(self._priorities.category_weights):
+            raw = self.query_one(f'#cat-{index}', Input).value
+            seeded = self._priorities.category_weights[name]
+            value = _parse_weight(raw)
+            if value is None or value == seeded:
+                continue
+            category_edits[name] = raw
+
         project_edits: dict[str, str] = {}
         for index, name in enumerate(self._project_names):
             raw = self.query_one(f'#proj-{index}', Input).value
