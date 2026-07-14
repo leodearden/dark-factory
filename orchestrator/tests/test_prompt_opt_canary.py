@@ -77,3 +77,48 @@ class TestComputeWindowMetrics:
         assert result.requeue_rate == pytest.approx(1 / 3)
         assert result.mean_review_cycles == pytest.approx(3.0)
         assert result.mean_verify_attempts == pytest.approx(2.0)
+
+    def test_zero_done_rows_no_zero_division_error(self) -> None:
+        """A window with rows but NO 'done' rows must not raise
+        ZeroDivisionError: cost_per_done_task is incomparable (None) and the
+        done-averaged metrics fall back to 0.0 rather than dividing by
+        n_done == 0."""
+        rows = [
+            {
+                'outcome': 'failed', 'cost_usd': 1.0, 'steward_cost_usd': 0.5,
+                'review_cycles': 3, 'verify_attempts': 2,
+            },
+            {
+                'outcome': 'requeued', 'cost_usd': 2.0, 'steward_cost_usd': 0.0,
+                'review_cycles': 1, 'verify_attempts': 1,
+            },
+        ]
+        result = compute_window_metrics(rows)
+        assert result.n_rows == 2
+        assert result.n_done == 0
+        assert result.cost_per_done_task is None
+        assert result.mean_review_cycles == 0.0
+        assert result.mean_verify_attempts == 0.0
+
+    def test_empty_window_returns_zeroed_metrics(self) -> None:
+        """An empty window (rows == []) must not raise ZeroDivisionError on
+        requeue_rate (n_rows == 0)."""
+        result = compute_window_metrics([])
+        assert result.n_rows == 0
+        assert result.n_done == 0
+        assert result.requeue_rate == 0.0
+        assert result.cost_per_done_task is None
+
+    def test_all_requeued_window_requeue_rate_is_one(self) -> None:
+        rows = [
+            {
+                'outcome': 'requeued', 'cost_usd': 1.0, 'steward_cost_usd': 0.0,
+                'review_cycles': 0, 'verify_attempts': 0,
+            },
+            {
+                'outcome': 'requeued', 'cost_usd': 2.0, 'steward_cost_usd': 0.0,
+                'review_cycles': 0, 'verify_attempts': 0,
+            },
+        ]
+        result = compute_window_metrics(rows)
+        assert result.requeue_rate == pytest.approx(1.0)
