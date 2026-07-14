@@ -8497,9 +8497,16 @@ Output JSON matching the schema. Every task must appear in the output.
         ``self._recon_unit_inspector`` (falling back to the module-level
         ``_recon_inspect_unit`` default) and classifies the result via
         ``_deterministic_deploy_health_verdict`` — see that function's
-        docstring for the important CAVEAT: 'healthy' is a liveness signal,
-        not proof that *this* deploy is what brought the unit up, and for an
-        always-on service unit it is near-constant 'healthy'.
+        docstring for the important CAVEAT: without a persisted baseline,
+        'healthy' is a liveness signal, not proof that *this* deploy is what
+        brought the unit up, and for an always-on service unit it is
+        near-constant 'healthy'.
+
+        ζ/task 2240 (DS-3): also reads ``metadata['deploy_state'].verify_baseline``
+        (via ``DeployState.from_metadata``, ``None`` when absent — e.g. a
+        legacy pre-ζ deploy) and threads it through to the verdict fn,
+        upgrading the check to real freshness whenever a baseline was
+        persisted.
         """
         before_done = (metadata or {}).get('before_done')
         target_unit = before_done.get('target_unit') if isinstance(before_done, dict) else None
@@ -8507,7 +8514,9 @@ Output JSON matching the schema. Every task must appear in the output.
             return 'unconfirmed'
         inspect_fn = self._recon_unit_inspector or _recon_inspect_unit
         result = await inspect_fn(target_unit)
-        return _deterministic_deploy_health_verdict(result)
+        state = DeployState.from_metadata(metadata or {})
+        verify_baseline = state.verify_baseline if state is not None else None
+        return _deterministic_deploy_health_verdict(result, verify_baseline=verify_baseline)
 
     async def _recover_stranded_deterministic_task(
         self, tid: str, task: dict, metadata: dict,
