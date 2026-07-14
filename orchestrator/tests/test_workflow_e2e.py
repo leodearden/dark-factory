@@ -16,10 +16,17 @@ from unittest.mock import AsyncMock
 
 import pytest
 from _workflow_helpers import (
+    PLAN,
+    AgentStub,
     FakeBriefing,
     FakeMcp,
     FakeScheduler,
+    _build_workflow,
+    _build_workflow_with_escalation,
+    _derive_meta_root_like_production,  # noqa: F401  autouse fixture, see its docstring
+    _init_repo,
     _make_resolving_steward,
+    _make_review,
     _make_status_setting_steward,
 )
 from escalation.queue import EscalationQueue
@@ -47,42 +54,6 @@ from orchestrator.workflow import (
 # ---------------------------------------------------------------------------
 # Fixtures
 # ---------------------------------------------------------------------------
-
-
-@pytest.fixture(autouse=True)
-def _derive_meta_root_like_production(monkeypatch):
-    """Mirror ε1 (task 2258) meta_root derivation in the agent-side doubles.
-
-    In production the workflow's ``self.artifacts`` is constructed with the
-    derived sibling ``.task-meta/<name>`` root
-    (``TaskArtifacts(worktree, _meta_root_for_worktree(worktree))``) and the
-    real ``plan_tools.py`` MCP writer is launched with the *same* ``--meta-root``
-    — so every reader/writer for a worktree resolves through one consistent
-    ``meta_root``.
-
-    These e2e doubles (``AgentStub._architect`` / ``_implementer`` and ~50
-    other call sites) bypass the real ``plan_tools.py`` subprocess and emulate
-    agent-side writes by hand-constructing ``TaskArtifacts(worktree)`` with no
-    ``meta_root`` (legacy-only, ``root == worktree/'.task'``). After the
-    workflow's migrate-on-write methods (``stamp_plan_provenance``/``lock_plan``)
-    establish the NEW copy, those legacy-only doubles write step status only to
-    the legacy copy — invisible to the workflow's relocated ``self.artifacts``
-    — so ``get_pending_steps()`` never observes completion and the task blocks
-    with "Execution iterations exhausted".
-
-    Rather than thread the derived root through every call site, patch the
-    constructor to default ``meta_root`` to the same sibling root production
-    derives whenever it is omitted. Explicit ``meta_root`` args (the workflow's
-    own and ``plan_tools.py``'s) are untouched.
-    """
-    orig_init = TaskArtifacts.__init__
-
-    def _init(self, worktree, meta_root=None):
-        if meta_root is None:
-            meta_root = TaskArtifacts.meta_root_for(worktree.parent, worktree.name)
-        orig_init(self, worktree, meta_root)
-
-    monkeypatch.setattr(TaskArtifacts, '__init__', _init)
 
 
 @pytest.fixture(autouse=True)
@@ -179,19 +150,6 @@ def git_repo(tmp_path: Path) -> Path:
     repo.mkdir()
     asyncio.run(_init_repo(repo))
     return repo
-
-
-async def _init_repo(repo: Path):
-    await _run(['git', 'init', '-b', 'main'], cwd=repo)
-    await _run(['git', 'config', 'user.email', 'test@test.com'], cwd=repo)
-    await _run(['git', 'config', 'user.name', 'Test'], cwd=repo)
-    # Seed with a simple Python file so the repo isn't empty
-    (repo / 'lib.py').write_text('def greet(name: str) -> str:\n    return f"Hello, {name}"\n')
-    (repo / 'test_lib.py').write_text(
-        'from lib import greet\n\ndef test_greet():\n    assert greet("world") == "Hello, world"\n'
-    )
-    await _run(['git', 'add', '-A'], cwd=repo)
-    await _run(['git', 'commit', '-m', 'Initial commit'], cwd=repo)
 
 
 @pytest.fixture
