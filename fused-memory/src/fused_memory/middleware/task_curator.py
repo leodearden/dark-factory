@@ -2735,22 +2735,22 @@ def _parse_decision_dict(
         # after a TRANSIENT get_task failure, see _fetch_entry_for_neighbor).
         # Placed before the combine_eligible check below so it is authoritative
         # even if an unknown entry were ever wrongly marked combine_eligible=True.
-        if action in ('drop', 'combine') and target_id:
-            target_entry = next(e for e in pool if e.task_id == target_id)
-            if target_entry.status == 'unknown':
-                return CuratorDecision(
-                    action='create',
-                    justification=(
-                        f'unknown-status-target: {target_id} status=unknown, '
-                        f'create-safe (RC3)'
-                    ),
-                    pool_sizes=pool_sizes,
-                    latency_ms=latency_ms,
-                    cost_usd=cost_usd,
-                )
+        # Resolved once here (guaranteed present after the valid_ids check above)
+        # and reused by the combine_eligible check that follows.
+        target_entry = next((e for e in pool if e.task_id == target_id), None) if target_id else None
+        if target_entry is not None and target_entry.status == 'unknown':
+            return CuratorDecision(
+                action='create',
+                justification=(
+                    f'unknown-status-target: {target_id} status=unknown, '
+                    f'create-safe (RC3)'
+                ),
+                pool_sizes=pool_sizes,
+                latency_ms=latency_ms,
+                cost_usd=cost_usd,
+            )
         # combine-only tasks must also be combine_eligible (pending status).
-        if action == 'combine' and target_id:
-            target_entry = next(e for e in pool if e.task_id == target_id)
+        if action == 'combine' and target_entry is not None:
             if not target_entry.combine_eligible:
                 return CuratorDecision(
                     action='create',
