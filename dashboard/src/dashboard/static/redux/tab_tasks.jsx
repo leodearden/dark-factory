@@ -104,9 +104,17 @@ function TaskGraphEdges({ containerRef, nodeRefs, tasks, selectedId, neighborhoo
   );
 }
 
-function TaskGraph({ tasks, selectedId, onSelect, onEnterFocus }) {
+// nodeRefs/renderEdges are optional escape hatches for the grouped PRD-box
+// view (task 2530): when a shared nodeRefs map is supplied, this instance
+// registers its nodes into it instead of a private one, and renderEdges=false
+// skips this instance's own TaskGraphEdges overlay entirely — used when a
+// single hoisted overlay (spanning multiple TaskGraph instances) draws edges
+// instead. Neither prop is passed by the ungrouped call site (ProjectTaskGraph),
+// so that path's behavior is unchanged: its own private nodeRefs, own overlay.
+function TaskGraph({ tasks, selectedId, onSelect, onEnterFocus, nodeRefs: externalNodeRefs, renderEdges = true }) {
   const containerRef = uR_T(null);
-  const nodeRefs = uR_T({});
+  const ownNodeRefs = uR_T({});
+  const nodeRefs = externalNodeRefs || ownNodeRefs;
 
   // Partition into weakly-connected components + singletons, then order each
   // component's tiers via barycenter/transpose (STATUS_ORDER baked in as the
@@ -154,8 +162,10 @@ function TaskGraph({ tasks, selectedId, onSelect, onEnterFocus }) {
 
   return (
     <div className="taskgraph" ref={containerRef}>
-      <TaskGraphEdges containerRef={containerRef} nodeRefs={nodeRefs} tasks={tasks}
-                      selectedId={selectedId} neighborhood={neighborhood} />
+      {renderEdges && (
+        <TaskGraphEdges containerRef={containerRef} nodeRefs={nodeRefs} tasks={tasks}
+                        selectedId={selectedId} neighborhood={neighborhood} />
+      )}
       {blocks.map((block, bi) => (
         <div key={bi} className="component-block">
           {block.map((row, ri) => (
@@ -205,16 +215,32 @@ function ProjectTaskGraph({ filtered, selectedId, focusMode, focusAnchorId, onSe
 }
 
 // Per-project "group by PRD" render: buckets the project's filtered tasks
-// into PRD boxes (groupTasksByPrd) and lays out each box's induced subgraph
-// via the existing per-box TaskGraph machinery (which itself calls
-// computeTiers/partitionComponents/orderRows). Kept as its own component
-// (not an inline computation inside the projects.map() callback below) for
-// the same Rules-of-Hooks reason as ProjectTaskGraph above — one consistent
-// useMemo per mounted project instance.
+// into PRD boxes (groupTasksByPrd), orders the boxes via orderPrdGroups (a
+// PRD consuming another PRD's tasks renders below it; "no PRD" trails), and
+// lays out each box's induced subgraph via the existing per-box TaskGraph
+// machinery (which itself calls computeTiers/partitionComponents/orderRows).
+// Kept as its own component (not an inline computation inside the
+// projects.map() callback below) for the same Rules-of-Hooks reason as
+// ProjectTaskGraph above — one consistent useMemo per mounted project instance.
+//
+// Cross-box dependency edges: a SINGLE TaskGraphEdges overlay is hoisted here
+// (spanning every box) instead of each TaskGraph instance rendering its own —
+// it resolves endpoint positions purely from getBoundingClientRect() over a
+// nodeRefs map, so one overlay covering all boxes draws intra-box AND
+// cross-box edges with no edge-router change. It's fed the project's full
+// filtered task list (not just one box's) so it can see cross-box dep edges.
+// Each per-box TaskGraph is told renderEdges={false} (skip its own overlay)
+// and handed the SAME shared nodeRefs map (via the nodeRefs prop) so its
+// nodes register into the map the hoisted overlay reads from.
 function ProjectPrdGroups({ filtered, selectedId, onSelect, onEnterFocus }) {
-  const groups = uM_T(() => groupTasksByPrd(filtered), [filtered]);
+  const containerRef = uR_T(null);
+  const nodeRefs = uR_T({});
+  const groups = uM_T(() => orderPrdGroups(groupTasksByPrd(filtered), computeTiers), [filtered]);
+  const neighborhood = uM_T(() => computeNeighborhood(filtered, selectedId), [filtered, selectedId]);
   return (
-    <div className="prd-groups">
+    <div className="prd-groups" ref={containerRef}>
+      <TaskGraphEdges containerRef={containerRef} nodeRefs={nodeRefs} tasks={filtered}
+                      selectedId={selectedId} neighborhood={neighborhood} />
       {groups.map(g => (
         <div key={g.noPrd ? '__no_prd__' : g.prd} className="prd-box">
           <div className="prd-box-head">
@@ -223,7 +249,8 @@ function ProjectPrdGroups({ filtered, selectedId, onSelect, onEnterFocus }) {
             </span>
           </div>
           <div className="prd-box-body">
-            <TaskGraph tasks={g.tasks} selectedId={selectedId} onSelect={onSelect} onEnterFocus={onEnterFocus} />
+            <TaskGraph tasks={g.tasks} selectedId={selectedId} onSelect={onSelect} onEnterFocus={onEnterFocus}
+                       nodeRefs={nodeRefs} renderEdges={false} />
           </div>
         </div>
       ))}
