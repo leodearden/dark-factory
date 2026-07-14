@@ -563,3 +563,71 @@ class TestDecoyFailSuppressionContract:
         hits = mod.iter_not_found(records)
 
         assert [h['pattern'] for h in hits] == ['does not exist']
+
+
+# ---------------------------------------------------------------------------
+# signal_counts / score_signals — the 5-key frontmatter tally (Sec 7.2) and
+# the documented weighted-sum score (user turns are gold: PRD Sec 5).
+# ---------------------------------------------------------------------------
+
+class TestSignalCountsAndScore:
+    def test_signal_counts_returns_exact_five_key_dict_for_mixed_fixture(self):
+        records = [
+            _assistant(_tool_use('Bash', {'command': 'false'}, id='tu-1')),
+            _tool_result('tu-1', 'Exit code 1', is_error=True),
+            _assistant(_text('My mistake, let me redo this.')),
+            _tool_result('tu-2', 'command not found', is_error=False),
+            _tool_result('tu-3', 'BLOCKED: real block', is_error=False),
+            _user_text('[Request interrupted by user for tool use]'),
+        ]
+
+        counts = mod.signal_counts(records)
+
+        assert counts == {
+            'tool_error': 1,
+            'self_correct': 1,
+            'not_found': 1,
+            'df_guard': 1,
+            'interrupt': 1,
+        }
+
+    def test_signal_counts_reports_zero_for_absent_classes(self):
+        records = [_user_text('a perfectly normal turn, no confusion here')]
+
+        counts = mod.signal_counts(records)
+
+        assert counts == {
+            'tool_error': 0,
+            'self_correct': 0,
+            'not_found': 0,
+            'df_guard': 0,
+            'interrupt': 0,
+        }
+
+    def test_score_signals_is_monotonic_when_adding_a_signal(self):
+        zero = {
+            'tool_error': 0, 'self_correct': 0, 'not_found': 0,
+            'df_guard': 0, 'interrupt': 0,
+        }
+        base_score = mod.score_signals(zero, n_user_turns=0)
+
+        for key in zero:
+            bumped = dict(zero)
+            bumped[key] += 1
+            assert mod.score_signals(bumped, n_user_turns=0) > base_score
+
+        assert mod.score_signals(zero, n_user_turns=1) > base_score
+
+    def test_score_signals_weights_user_turns_highest(self):
+        zero = {
+            'tool_error': 0, 'self_correct': 0, 'not_found': 0,
+            'df_guard': 0, 'interrupt': 0,
+        }
+        one_user_turn_score = mod.score_signals(zero, n_user_turns=1)
+
+        # A single user correction (gold) outweighs a single occurrence of
+        # any one OTHER individual signal class.
+        for key in zero:
+            single_signal = dict(zero)
+            single_signal[key] = 1
+            assert one_user_turn_score > mod.score_signals(single_signal, n_user_turns=0)
