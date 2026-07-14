@@ -969,3 +969,93 @@ class TestTargetedCorrection:
         )
 
         assert report['targeted_correction_ids'] == []
+
+
+# ===========================================================================
+# Tests: backlog_verdict
+# ===========================================================================
+
+class TestBacklogVerdict:
+    """Tests for the pure function backlog_verdict(after_total_source, max_backlog)
+    (task 2596). Mirrors scripts/check_merge_flakiness.sh's exit-code-only
+    predicate contract (0=holds, 1=violated) so the sweep is directly usable
+    as a task_kind='deterministic' before_done.script predicate
+    (--apply --check --max-backlog N; the orchestrator reads the exit code
+    only).
+    """
+
+    @pytest.mark.parametrize('after_total_source,max_backlog', [
+        (0, 0),
+        (5, 10),
+        (10, 10),
+    ])
+    def test_at_or_under_max_backlog_returns_0(self, after_total_source, max_backlog):
+        """Residual backlog at or below the ceiling holds → 0."""
+        assert _mod.backlog_verdict(after_total_source, max_backlog) == 0
+
+    @pytest.mark.parametrize('after_total_source,max_backlog', [
+        (11, 10),
+        (1, 0),
+        (100, 43),
+    ])
+    def test_over_max_backlog_returns_1(self, after_total_source, max_backlog):
+        """Residual backlog above the ceiling is violated → 1."""
+        assert _mod.backlog_verdict(after_total_source, max_backlog) == 1
+
+
+# ===========================================================================
+# Tests: _build_parser (task 2596 CLI surface)
+# ===========================================================================
+
+class TestBuildParser:
+    """Tests for _build_parser() — argparse factored out of main() so the
+    new CLI surface (--max-age-days, --delete-ids, --check, --max-backlog,
+    --terminal-drain) is testable without any live I/O (mirrors
+    check_merge_flakiness.sh's exit-code-only contract; see main()'s
+    docstring for how these flags are consumed).
+    """
+
+    def test_defaults(self):
+        """With no CLI args, every new flag has a sane, backwards-compatible
+        default and every pre-existing flag is unaffected."""
+        parser = _mod._build_parser()
+        args = parser.parse_args([])
+        assert args.apply is False
+        assert args.project_id == 'dark_factory'
+        assert args.limit == 1000
+        assert args.max_age_days == 14
+        assert args.delete_ids == []
+        assert args.check is False
+        assert args.max_backlog == 0
+        assert args.terminal_drain is False
+
+    def test_max_age_days_override(self):
+        """--max-age-days accepts an int override."""
+        parser = _mod._build_parser()
+        args = parser.parse_args(['--max-age-days', '30'])
+        assert args.max_age_days == 30
+
+    def test_delete_ids_comma_split(self):
+        """--delete-ids splits a comma-joined string into a list of ids."""
+        parser = _mod._build_parser()
+        args = parser.parse_args(['--delete-ids', 'eb92453f,a07972e7'])
+        assert args.delete_ids == ['eb92453f', 'a07972e7']
+
+    def test_delete_ids_strips_whitespace_around_components(self):
+        """--delete-ids tolerates whitespace around comma-separated ids."""
+        parser = _mod._build_parser()
+        args = parser.parse_args(['--delete-ids', 'eb92453f, a07972e7 '])
+        assert args.delete_ids == ['eb92453f', 'a07972e7']
+
+    def test_check_and_max_backlog(self):
+        """--check is a boolean flag; --max-backlog accepts an int."""
+        parser = _mod._build_parser()
+        args = parser.parse_args(['--check', '--max-backlog', '5'])
+        assert args.check is True
+        assert args.max_backlog == 5
+
+    def test_terminal_drain_flag(self):
+        """--terminal-drain is a boolean flag, defaulting to False."""
+        parser = _mod._build_parser()
+        args = parser.parse_args(['--terminal-drain'])
+        assert args.terminal_drain is True
