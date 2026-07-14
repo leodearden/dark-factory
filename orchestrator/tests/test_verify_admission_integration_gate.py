@@ -58,7 +58,9 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import os
 import shlex
+import signal
 import subprocess
 import sys
 import threading
@@ -696,3 +698,89 @@ class TestUntimedWaitNoRequeue:
         )
         assert waiter_result.passed
         assert not waiter_result.timed_out
+
+
+# ---------------------------------------------------------------------------
+# Scenario 5 — SELF-HEAL
+# ---------------------------------------------------------------------------
+
+
+class TestSelfHeal:
+    """PRD Boundary-test sketch scenario 5: a SIGKILLed slot holder's flock
+    is freed immediately by the kernel on process death — no canary/daemon
+    involved (T1's C-daemonless self-heal). A task-role verify blocked
+    waiting (untimed) for the sole slot proceeds as soon as the holder dies.
+    """
+
+    @pytest.mark.real_verify_admission
+    @pytest.mark.asyncio
+    async def test_task_verify_proceeds_after_holder_is_sigkilled(self, tmp_path):
+        slots_dir = tmp_path / 'slots'
+        # mkdir'd up front: the real subprocess holder must os.open a slot
+        # file inside it before run_verification ever starts (T1 never
+        # creates slots_dir itself; _admission_slot's own mkdir would race
+        # the holder otherwise).
+        slots_dir.mkdir()
+        config = OrchestratorConfig(
+            verify_admission_slots_dir=str(slots_dir),
+            verify_admission_task_slots=1,
+        )
+        worktree = tmp_path / 'wt-task'
+        worktree.mkdir()
+        marker = tmp_path / 'ready.marker'
+        slot_path = slots_dir / 'slot-1'
+
+        holder: subprocess.Popen | None = _spawn_slot_holder(slot_path, marker)
+        try:
+            assert _wait_for_marker(marker), 'holder never signaled readiness'
+
+            spy = _RunCmdSpy()
+            # REAL acquire_task_slot (not mocked) — only _run_cmd is patched,
+            # so the block-then-self-heal is proven against T1's actual
+            # flock semaphore, not a stand-in.
+            with patch('orchestrator.verify._run_cmd', new=spy):
+                task_verify = asyncio.create_task(
+                    run_verification(
+                        worktree=worktree,
+                        config=config,
+                        module_config=_module_config(),
+                        role='task',
+                        attempt_id=None,
+                    )
+                )
+
+                # Bounded poll proving the verify is genuinely blocked on the
+                # held slot (T1's untimed acquire wait) — its test leg never
+                # reaches _run_cmd while the real holder lives.
+                blocked_deadline = time.monotonic() + 1.0
+                while time.monotonic() < blocked_deadline:
+                    assert not task_verify.done(), (
+                        'task verify completed while the sole slot was '
+                        'still held by the real subprocess holder'
+                    )
+                    assert len(spy.calls) == 0, (
+                        f'expected no leg to run while the slot is held; '
+                        f'got {spy.calls!r}'
+                    )
+                    await asyncio.sleep(0.05)
+
+                os.kill(holder.pid, signal.SIGKILL)
+                holder.wait(timeout=5)
+                holder = None
+
+                result = await asyncio.wait_for(task_verify, timeout=10.0)
+
+            assert result.passed, (
+                f'expected the task verify to proceed once the kernel freed '
+                f"the SIGKILLed holder's flock; got passed={result.passed!r}"
+            )
+            assert not result.timed_out
+            test_calls = [c for c in spy.calls if c['leg'] == 'test']
+            assert len(test_calls) == 1, (
+                f'expected exactly one test-leg call after self-heal; got '
+                f'{test_calls!r}'
+            )
+        finally:
+            if holder is not None:
+                holder.kill()
+                holder.wait(timeout=5)
