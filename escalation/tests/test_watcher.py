@@ -811,3 +811,26 @@ class TestLevelFilter:
             level=1,
         )
         assert self._run_watcher(tmp_path, esc) is True
+
+
+class TestExcludeFile:
+    """_read_exclude_file(path) -> frozenset[str]; fail-open on missing/None."""
+
+    def test_read_exclude_file_helper(self, tmp_path):
+        from escalation.watcher import _read_exclude_file
+
+        # (a) None path and a nonexistent path both -> empty frozenset (fail-open)
+        assert _read_exclude_file(None) == frozenset()
+        assert _read_exclude_file(tmp_path / 'does-not-exist') == frozenset()
+
+        # (b) blank lines and #-comments skipped, whitespace stripped, .json
+        # suffix normalized the same way --exclude-id is (watcher.py:154-156)
+        exclude_file = tmp_path / 'excludes.txt'
+        exclude_file.write_text(
+            'esc-1-1\n'
+            'esc-2-1.json\n'
+            '\n'
+            '# a comment\n'
+            '  esc-3-1  \n'
+        )
+        assert _read_exclude_file(exclude_file) == frozenset({'esc-1-1', 'esc-2-1', 'esc-3-1'})
