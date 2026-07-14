@@ -16,12 +16,18 @@ that "frozen-None trap".
 from __future__ import annotations
 
 from datetime import timedelta
-from unittest.mock import MagicMock, patch
+from unittest.mock import ANY, AsyncMock, MagicMock, patch
 
 import pytest
 
 from orchestrator.harness import Harness
-from orchestrator.task_ground_truth import TaskGroundTruth
+from orchestrator.task_ground_truth import (
+    BranchState,
+    BranchStateKind,
+    RecoveryAction,
+    TaskGroundTruth,
+    TruthReport,
+)
 
 # ---------------------------------------------------------------------------
 # Harness fixture (Pattern A — mirrors test_reconcile_stranded.py's `harness`
@@ -94,3 +100,108 @@ class TestGetGroundTruthWiring:
         second = harness._get_ground_truth()
 
         assert first is second
+
+
+# ---------------------------------------------------------------------------
+# task 2243 (W10-θ2) step-17 — delegation + registration parity.
+#
+# (a) Delegation: the migrated sweep must route its ENTIRE mark-done
+#     decision through _get_ground_truth().recovery_for(tid) — it must never
+#     independently re-derive branch state via git_ops.is_ancestor /
+#     git_ops.find_merge_marker itself.  Proven here with a STUBBED resolver
+#     (unlike test_reconcile_stranded.py's G1/G2, which drive the REAL
+#     resolver against a bound MergeProvenance journal row / git fallback):
+#     even when the resolver reports MARK_DONE_WITH_PROVENANCE on an
+#     on-main/journal-hit shape, the sweep code path itself never touches
+#     git_ops.is_ancestor/find_merge_marker directly — this is a structural
+#     delegation pin, independent of the real resolver's own journal-first
+#     short-circuit (which is what G1/G2 pin instead).
+# ---------------------------------------------------------------------------
+
+
+class TestReconcileSweepDelegatesToGroundTruth:
+    @pytest.mark.asyncio
+    async def test_mark_done_dispatch_never_awaits_git_archaeology_directly(
+        self, harness: Harness,
+    ):
+        tid = '9101'
+        sha = 'c3' * 20
+        harness._escalation_queue = MagicMock(name='live_escalation_queue')
+
+        harness.scheduler.get_statuses = AsyncMock(  # type: ignore[attr-defined]
+            return_value=({tid: 'in-progress'}, None),
+        )
+        harness.scheduler.get_task = AsyncMock(  # type: ignore[attr-defined]
+            return_value={'status': 'in-progress', 'metadata': {}},
+        )
+        harness.scheduler.mark_done = AsyncMock()  # type: ignore[attr-defined]
+
+        # Never configured with a return value that would let the sweep
+        # "accidentally" produce the right answer by calling these itself —
+        # any await against either proves a direct (non-delegated) call.
+        harness.git_ops.is_ancestor = AsyncMock()  # type: ignore[attr-defined]
+        harness.git_ops.find_merge_marker = AsyncMock()  # type: ignore[attr-defined]
+        harness.git_ops.warm_lane_ref_is_degenerate = AsyncMock(  # type: ignore[attr-defined]
+            return_value=False,
+        )
+
+        report = TruthReport(
+            db_status='in-progress',
+            live_claimant=None,
+            branch_state=BranchState(BranchStateKind.ON_MAIN, sha),
+            worktree_present=False,
+            open_escalations=[],
+            deploy_phase=None,
+        )
+        fake_resolver = MagicMock(name='fake_ground_truth')
+        fake_resolver.recovery_for = AsyncMock(
+            return_value=(report, RecoveryAction.MARK_DONE_WITH_PROVENANCE),
+        )
+        harness._get_ground_truth = MagicMock(return_value=fake_resolver)  # type: ignore[method-assign]
+
+        await harness._reconcile_stranded_in_progress()
+
+        fake_resolver.recovery_for.assert_awaited_once_with(tid)
+        harness.scheduler.mark_done.assert_awaited_once_with(  # type: ignore[attr-defined]
+            tid, kind='found_on_main', sha=sha, note=ANY,
+        )
+        harness.git_ops.is_ancestor.assert_not_awaited()  # type: ignore[attr-defined]
+        harness.git_ops.find_merge_marker.assert_not_awaited()  # type: ignore[attr-defined]
+
+
+# ---------------------------------------------------------------------------
+# task 2243 (W10-θ2) step-17(b) — LifecycleRegistry registration parity.
+#
+# η (task 2241) already registers the three loop sweeps this task migrates
+# ('stranded-reconcile', 'main-tip-sweep', 'deterministic-recon-sweep') as
+# BackgroundServices in _build_lifecycle_registry (harness.py, commit
+# d4c714d900) — test_harness_lifecycle_registry.py's
+# test_all_eleven_enabled_matches_canonical_order already covers the full
+# eleven-name canonical order as part of η's own suite.  This is θ2's own
+# narrower confirmation, scoped to just the three sweeps this task's
+# migration concerns (the analysis's "confirm LifecycleRegistry (η)
+# registration" — a parity assertion, not new registration).
+# ---------------------------------------------------------------------------
+
+
+class TestLifecycleRegistryReconcileSweepsRegistered:
+    def test_three_migrated_sweeps_registered_in_lifecycle_registry(
+        self, mock_orch_config,
+    ):
+        mock_orch_config.stranded_reconcile_enabled = True
+        mock_orch_config.main_tip_sweep_enabled = True
+        mock_orch_config.deterministic_recon_sweep_enabled = True
+        mock_orch_config.deterministic_recon_sweep_interval_secs = 900.0
+
+        with patch('orchestrator.harness.McpLifecycle'), \
+             patch('orchestrator.harness.Scheduler'), \
+             patch('orchestrator.harness.BriefingAssembler'):
+            h = Harness(mock_orch_config)
+
+        h._build_lifecycle_registry()
+
+        assert h._lifecycle is not None
+        names = {s.name for s in h._lifecycle.services}
+        assert {
+            'stranded-reconcile', 'main-tip-sweep', 'deterministic-recon-sweep',
+        } <= names
