@@ -44,6 +44,7 @@ from __future__ import annotations
 
 import copy
 import json
+import logging
 import os
 import sys
 import tempfile
@@ -65,6 +66,8 @@ import config  # noqa: E402
 import digest  # noqa: E402
 import inventory  # noqa: E402
 from legibility import census_trigger  # noqa: E402
+
+logger = logging.getLogger("legibility.census")
 
 
 # ---------------------------------------------------------------------------
@@ -551,3 +554,73 @@ def render_report(
     lines.append("")
 
     return "\n".join(lines)
+
+
+# ---------------------------------------------------------------------------
+# run_census — full orchestration: preflight -> mine -> verify -> synthesize
+# -> matrix -> codebook update -> file tasks -> report -> advance state
+# ---------------------------------------------------------------------------
+
+@dataclass
+class CensusOutcome:
+    """Outcome of ``run_census``. ``status`` is ``"deferred"`` (headroom
+    preflight failed -- no further work was done) or ``"done"`` (the full
+    pipeline ran to completion)."""
+
+    status: str
+    reason: str | None = None
+    report_path: str | None = None
+    filed_task_ids: list[str] = field(default_factory=list)
+    stop_reason: str | None = None
+
+
+def run_census(
+    *,
+    batch_source,
+    invoke,
+    verify_fn,
+    synthesize_fn,
+    submit_fn,
+    escalate_fn,
+    status_fetcher,
+    commit,
+    codebook_dict: dict,
+    config,
+    project_root: str,
+    project_id: str,
+    codebook_path,
+    census_state_path,
+    report_path,
+    date: str,
+    force: bool = False,
+) -> CensusOutcome:
+    """Run one periodic legibility census end to end.
+
+    Every LLM / MCP / git side effect is one of the seam parameters above
+    -- this function performs no I/O and calls no model except through
+    them. *config* is a ``config.LegibilityConfig`` (``config.census.
+    saturation`` drives the mining stop condition; ``config.models.*``
+    drives the ratified static model routing).
+
+    Order: ``preflight_headroom`` first (PRD decision 5 -- one tiny probe,
+    Haiku-tier per ``config.models.trickle``). A failed probe DEFERS the
+    whole census: files one INFO escalation via *escalate_fn* naming the
+    deferral, logs loudly, and returns immediately -- no batch is pulled
+    from *batch_source*, no ``submit_fn``/``codebook.dump``/
+    ``advance_census_state`` call happens. Otherwise falls through to the
+    mine -> verify -> synthesize -> matrix -> codebook-update -> file-
+    tasks -> report -> advance-state happy path.
+    """
+    headroom = preflight_headroom(invoke, model=config.models.trickle)
+    if not headroom.ok:
+        reason = headroom.reason or "headroom preflight failed"
+        logger.warning("census deferred: %s", reason)
+        escalate_fn(
+            category="infra_issue",
+            severity="info",
+            summary=f"legibility census deferred: {reason}",
+            detail=reason,
+        )
+        return CensusOutcome(status="deferred", reason=reason)
+
+    raise NotImplementedError("run_census happy path is implemented in step-20")
