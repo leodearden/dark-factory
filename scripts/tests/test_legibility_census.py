@@ -565,6 +565,82 @@ def test_build_task_payloads_harness_rooted_cause_can_target_dark_factory():
 
 
 # ---------------------------------------------------------------------------
+# amend: _novel_clusters() dedup-by-title + titleless-candidate skip.
+# codebook.apply_coding_record groups new candidates BY TITLE (codebook.py:
+# 494), so verification must operate on the same set of resolvable titles --
+# a second cluster for an already-seen title can never resolve to a second
+# "pending" candidate id in _find_pending_candidate_id, wasting a Sonnet
+# verify call and diverging the matrix from the codebook
+# (reviewer_comprehensive finding #3).
+# ---------------------------------------------------------------------------
+
+def _novel_record(session, *, candidates):
+    return {"session": session, "matches": [], "candidates": candidates}
+
+
+def test_novel_clusters_deduplicates_candidates_sharing_a_title():
+    records = [
+        _novel_record(
+            "sess-1",
+            candidates=[
+                {
+                    "title": "Silent no-op subagent contract",
+                    "cause": "first sighting",
+                    "origin_phase": "implement",
+                    "manifested_phase": "verify",
+                }
+            ],
+        ),
+        _novel_record(
+            "sess-2",
+            candidates=[
+                {
+                    "title": "Silent no-op subagent contract",
+                    "cause": "second sighting, same title",
+                    "origin_phase": "implement",
+                    "manifested_phase": "verify",
+                }
+            ],
+        ),
+    ]
+
+    clusters = mod._novel_clusters(records)
+
+    assert len(clusters) == 1, (
+        "a second candidate sharing an already-seen title must not spend a "
+        "second verify slot -- apply_coding_record would collapse it into "
+        "the same pending codebook candidate as the first"
+    )
+    assert clusters[0]["title"] == "Silent no-op subagent contract"
+    assert clusters[0]["sightings"][0]["session"] == "sess-1", "first occurrence wins"
+
+
+def test_novel_clusters_skips_titleless_candidates():
+    records = [
+        _novel_record("sess-1", candidates=[{"title": "", "cause": "empty title"}]),
+        _novel_record("sess-2", candidates=[{"cause": "title key entirely absent"}]),
+    ]
+
+    clusters = mod._novel_clusters(records)
+
+    assert clusters == [], (
+        "apply_coding_record requires a title to key its merge on -- a "
+        "titleless candidate must be skipped, mirroring that requirement"
+    )
+
+
+def test_novel_clusters_distinct_titles_each_get_their_own_cluster():
+    records = [
+        _novel_record("sess-1", candidates=[{"title": "Cause A"}]),
+        _novel_record("sess-2", candidates=[{"title": "Cause B"}]),
+    ]
+
+    clusters = mod._novel_clusters(records)
+
+    assert {c["title"] for c in clusters} == {"Cause A", "Cause B"}
+
+
+# ---------------------------------------------------------------------------
 # step-11: RED — promote_candidate() / reject_candidate() / retire_entry()
 # in-place codebook lifecycle transforms (never-delete, PRD decision 3)
 # ---------------------------------------------------------------------------

@@ -591,23 +591,43 @@ def render_report(
 # ---------------------------------------------------------------------------
 
 def _novel_clusters(records: list[dict]) -> list[dict]:
-    """Build one verification cluster per candidate carried by a
-    non-duplicate mining record (``is_duplicate`` False -- a candidate is
-    itself the novelty signal, so every candidate on a novel record becomes
-    its own cluster). Each cluster is shaped to satisfy both
+    """Build one verification cluster per DISTINCT candidate title carried
+    by a non-duplicate mining record (``is_duplicate`` False -- a candidate
+    is itself the novelty signal, so every candidate on a novel record
+    becomes its own cluster). Each cluster is shaped to satisfy both
     ``compute_matrix`` (a ``sightings`` list, each carrying
     ``origin_phase``/``manifested_phase``) and ``build_task_payloads``
     (``title``/``summary``/``evidence``/``sightings``) without needing to
     re-consult the source record. Duplicate records (zero candidates)
     contribute nothing here -- they still flow into the codebook merge via
-    their ``matches``, just not into verification."""
+    their ``matches``, just not into verification.
+
+    Two defensive skips keep verification aligned with what
+    ``codebook.apply_coding_record`` will actually do with these same
+    records at merge time (mirrors its own title-keyed grouping,
+    codebook.py:494):
+
+    - A candidate with no title (or an empty one) is SKIPPED -- a title is
+      the merge's sole grouping key, so a titleless candidate has nothing
+      to resolve a promoted/rejected verdict back to.
+    - A title already seen earlier in *records* is also SKIPPED
+      (first-occurrence wins) -- ``apply_coding_record`` collapses every
+      new candidate sharing a title into the SAME pending codebook
+      candidate, so a second cluster for that title would spend a
+      redundant verify_fn call on a candidate id that can never be found
+      "pending" a second time (``_find_pending_candidate_id`` would return
+      None for it, silently dropping its promote/reject)."""
+    seen_titles: set[str] = set()
     clusters = []
     for record in records:
         if is_duplicate(record):
             continue
         session = record.get("session")
         for candidate in record.get("candidates") or []:
-            title = candidate.get("title") or "Untitled confusion cluster"
+            title = candidate.get("title")
+            if not title or title in seen_titles:
+                continue
+            seen_titles.add(title)
             origin_phase = candidate.get("origin_phase") or "unknown"
             manifested_phase = candidate.get("manifested_phase") or "unknown"
             evidence_quote = candidate.get("evidence_quote")
