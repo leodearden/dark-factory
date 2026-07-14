@@ -39,6 +39,7 @@ and apply to this module automatically — nothing to import or opt into here.
 
 from __future__ import annotations
 
+import logging
 from pathlib import Path
 from unittest.mock import AsyncMock, patch
 
@@ -52,7 +53,7 @@ from test_verify_plan import (  # noqa: F401 — reused by this module's byte-id
 from orchestrator import verify, verify_plan
 from orchestrator.config import ModuleConfig, OrchestratorConfig
 from orchestrator.verify import run_scoped_verification
-from orchestrator.verify_cmd import ToolKind, render
+from orchestrator.verify_cmd import ToolKind, VerifyCmd, render
 
 # ---------------------------------------------------------------------------
 # GOLDEN diff shapes (task κ corpus) — see module docstring for provenance.
@@ -90,6 +91,46 @@ FALLBACK_SUBPROJECT_DIFF: list[str] = ['cockpit/tests/test_c3.py']
 # branch (scoped commands only) — never the whole-repo global fan-out chain,
 # the wall-clock-costly path this task must not regress into.
 UNREGISTERED_PATH_DIFF: list[str] = ['tests/scripts/test_deploy.py']
+
+# Mixed root+subproject (task 2368): a root-level conftest.py alongside the
+# cockpit subproject test file above — mirrors
+# TestBuildFallbackConfigSubprojectScoped
+# .test_mixed_root_conftest_plus_subproject_scopes_to_subproject_and_root_owning_tests
+# (test_verify.py). File order matches that test exactly.
+MIXED_ROOT_SUBPROJECT_DIFF: list[str] = [*FALLBACK_SUBPROJECT_DIFF, 'conftest.py']
+
+# The real dark_factory root-level fleet chain (orchestrator/config.yaml) —
+# reused verbatim from TestBuildFallbackConfigSubprojectScoped (test_verify.py)
+# so the step-7 subproject-rescoping goldens below (d)/(e) exercise the SAME
+# realistic multi-clause commands tasks 2344/2355/2368 were fixed against.
+# _FLEET_TYPE_COMMAND is itself already a multi-clause OPAQUE chain (no
+# 'pytest'/'cargo' token — see verify_cmd._parse_chain), so (d)/(e) already
+# exercise _scope_to_keyword's OPAQUE first-clause scoping for TYPE, ahead of
+# any subproject rescoping. _FLEET_LINT_COMMAND, in contrast, is a SINGLE
+# ruff-check clause — well-formed/never-OPAQUE even parsed whole — so a
+# second, genuinely multi-clause OPAQUE lint variant
+# (_FLEET_LINT_COMMAND_OPAQUE) is defined separately below for golden (f).
+_FLEET_TEST_COMMAND: str = (
+    'cd shared && uv run pytest tests/ && cd ../escalation && uv run pytest tests/ '
+    '&& cd ../orchestrator && uv run pytest tests/ && cd ../fused-memory && uv run pytest tests/ '
+    '&& cd ../dashboard && uv run pytest tests/'
+)
+_FLEET_LINT_COMMAND: str = 'uv run ruff check shared escalation fused-memory orchestrator dashboard'
+_FLEET_TYPE_COMMAND: str = (
+    'cd fused-memory && npx pyright && cd ../orchestrator && npx pyright '
+    '&& cd ../dashboard && npx pyright'
+)
+
+# The real dark_factory lint_command verbatim (orchestrator/config.yaml) — a
+# genuine multi-clause OPAQUE chain (unlike _FLEET_LINT_COMMAND above). Reused
+# from TestBuildFallbackConfigWithNonDefaultCommands
+# .test_fallback_lint_reprojects_repo_root_file_to_ruff_bearing_context
+# (test_verify.py) for the OPAQUE-fleet-chain golden (f) below.
+_FLEET_LINT_COMMAND_OPAQUE: str = (
+    'uv run ruff check shared escalation fused-memory orchestrator dashboard '
+    '&& python3 fused-memory/scripts/check_bare_magicmock_config.py '
+    'shared/tests escalation/tests fused-memory/tests orchestrator/tests dashboard/tests'
+)
 
 
 # ---------------------------------------------------------------------------
@@ -469,3 +510,373 @@ class TestDeleteTheTwinInvariant:
             f'on the module-config path — no independent re-classification by a '
             f'second (hand-mirrored) decision tree: calls={calls!r}'
         )
+
+
+# ---------------------------------------------------------------------------
+# step-7: fallback-path plan authority + byte-identical goldens
+# ---------------------------------------------------------------------------
+
+
+def _make_cockpit_worktree(tmp_path: Path) -> None:
+    """Write cockpit/pyproject.toml so ``_single_subproject_prefix`` recognises it."""
+    cockpit = tmp_path / 'cockpit'
+    cockpit.mkdir(parents=True, exist_ok=True)
+    (cockpit / 'pyproject.toml').write_text('[project]\nname = "cockpit"\n')
+
+
+def _plan_run(plan: dict, reason_prefix: str) -> dict:
+    """The single ``PlannedRun`` dict in *plan*['runs'] whose reason starts with *reason_prefix*."""
+    matches = [r for r in plan['runs'] if r['reason'].startswith(reason_prefix)]
+    assert len(matches) == 1, f'expected exactly one {reason_prefix!r} run in {plan!r}'
+    return matches[0]
+
+
+def _render_plan_cmd(cmd_dict: dict) -> str:
+    """Render a ``PlannedRun.to_dict()['cmd']`` payload back to a shell string.
+
+    Reconstructs a ``VerifyCmd`` from the plain-dict form ``VerifyResult.plan``
+    carries, so a golden can assert the plan's recorded command renders to the
+    same string that was actually executed — independent of whether the
+    executed plan represents it as a raw pass-through or a fully structured
+    ``VerifyCmd``.
+    """
+    return render(VerifyCmd(
+        tool=ToolKind(cmd_dict['tool']),
+        uv_project=cmd_dict['uv_project'],
+        cwd_rel=cmd_dict['cwd_rel'],
+        base_flags=tuple(cmd_dict['base_flags']),
+        targets=tuple(cmd_dict['targets']),
+        env=dict(cmd_dict['env']),
+        wrappers=tuple(cmd_dict['wrappers']),
+        raw=cmd_dict['raw'],
+    ))
+
+
+def _assert_plan_run_matches_executed(
+    plan: dict, reason_prefix: str, executed_cmd: str | None, executed_prefix: str,
+) -> None:
+    """Assert *plan*'s *reason_prefix* run faithfully records what was executed.
+
+    A1 for the fallback path: ``VerifyResult.plan`` must be the EXECUTED plan
+    — ``module_prefix`` plus a rendered ``cmd`` matching the ACTUAL
+    subproject/rescoped command that ran — not an independently re-derived
+    diagnostic mirror that ignores subproject/OPAQUE-chain rescoping.
+    """
+    run = _plan_run(plan, reason_prefix)
+    assert run['module_prefix'] == executed_prefix, (
+        f'{reason_prefix!r} run recorded module_prefix={run["module_prefix"]!r}, '
+        f'expected the EXECUTED prefix {executed_prefix!r}'
+    )
+    if executed_cmd is None:
+        assert run['cmd'] is None, (
+            f'{reason_prefix!r} run recorded a cmd but nothing executed: {run["cmd"]!r}'
+        )
+    else:
+        assert run['cmd'] is not None, (
+            f'{reason_prefix!r} run recorded no cmd, but {executed_cmd!r} executed'
+        )
+        rendered = _render_plan_cmd(run['cmd'])
+        assert rendered == executed_cmd, (
+            f'{reason_prefix!r} plan cmd renders to {rendered!r}, '
+            f'expected the EXECUTED command {executed_cmd!r}'
+        )
+
+
+class TestFallbackPlanAuthorityGoldens:
+    """A1 + byte-identical goldens for the fallback (no-``module_configs``) branch.
+
+    Mirrors ``TestModuleConfigScopeGoldens`` (module-config path) but for
+    ``run_scoped_verification``'s OTHER scoping branch: ``derive_verify_plan``'s
+    fallback branch (``_derive_fallback_runs``) is a pure, subproject-blind
+    D1/D2 decision record, while ``_build_fallback_config`` (today, still
+    independently invoked) additionally applies filesystem-dependent
+    RENDERING — subproject cd-scoping (task 2344), mixed root+subproject
+    scoping (task 2368), TYPE/LINT uv-context rescoping (task 2355), and
+    OPAQUE fleet-chain first-clause scoping (``_scope_to_keyword``) — that the
+    fallback plan does not model at all.
+
+    (a)/(b)/(c) below involve no subproject/OPAQUE-chain shape and are
+    already GREEN today (regression pins); (d)/(e)/(f) pin the actual gap
+    and are RED until step-8 makes ``VerifyResult.plan`` the EXECUTED plan
+    on this branch too.
+    """
+
+    @pytest.mark.asyncio
+    async def test_fallback_conftest_uses_parent_directory(self, tmp_path: Path):
+        """(a) ROOT_CONFTEST_DIFF (task-1077) -> test_command == 'pytest <parent-dir>'.
+
+        Already GREEN today: no subproject/OPAQUE-chain shape is involved, so
+        the diagnostic plan and the executed command already agree.
+        """
+        conftest_path = ROOT_CONFTEST_DIFF[0]
+        full = tmp_path / conftest_path
+        full.parent.mkdir(parents=True, exist_ok=True)
+        full.write_text('# root\n')
+
+        config = OrchestratorConfig(project_root=tmp_path, test_command='pytest')
+
+        mock_run_verification = _run_verification_spy()
+        with patch.object(verify, 'run_verification', new=mock_run_verification):
+            result = await run_scoped_verification(
+                tmp_path, config, [], task_files=[conftest_path],
+            )
+
+        assert result.passed
+        executed = _executed_module_configs(mock_run_verification)
+        assert len(executed) == 1
+        assert executed[0].test_command == 'pytest orchestrator/tests', (
+            f'expected the conftest parent-dir target, got {executed[0].test_command!r}'
+        )
+        assert result.plan is not None
+        _assert_plan_run_matches_executed(
+            result.plan, 'pytest:', executed[0].test_command, executed[0].prefix,
+        )
+
+    @pytest.mark.asyncio
+    async def test_fallback_root_conftest_maps_to_dot(self, tmp_path: Path):
+        """(a) A root-level conftest.py -> test_command == 'pytest .', never 'pytest conftest.py'.
+
+        Already GREEN today (see class docstring).
+        """
+        (tmp_path / 'conftest.py').write_text('# root conftest\n')
+
+        config = OrchestratorConfig(project_root=tmp_path, test_command='pytest')
+
+        mock_run_verification = _run_verification_spy()
+        with patch.object(verify, 'run_verification', new=mock_run_verification):
+            result = await run_scoped_verification(
+                tmp_path, config, [], task_files=['conftest.py'],
+            )
+
+        assert result.passed
+        executed = _executed_module_configs(mock_run_verification)
+        assert len(executed) == 1
+        assert executed[0].test_command == 'pytest .'
+        assert result.plan is not None
+        _assert_plan_run_matches_executed(
+            result.plan, 'pytest:', executed[0].test_command, executed[0].prefix,
+        )
+
+    @pytest.mark.asyncio
+    async def test_bare_pytest_data_module_skips_with_warning(
+        self, tmp_path: Path, caplog: pytest.LogCaptureFixture,
+    ):
+        """(b) DATA_MODULE_DIFF on bare pytest -> test_command is None + task-1852 WARNING.
+
+        Already GREEN today (see class docstring).
+        """
+        data_path = DATA_MODULE_DIFF[0]
+        full = tmp_path / data_path
+        full.parent.mkdir(parents=True, exist_ok=True)
+        full.write_text('ALLOWLIST = set()\n')
+
+        config = OrchestratorConfig(project_root=tmp_path, test_command='pytest')
+
+        mock_run_verification = _run_verification_spy()
+        with (
+            patch.object(verify, 'run_verification', new=mock_run_verification),
+            caplog.at_level(logging.WARNING, logger='orchestrator.verify'),
+        ):
+            result = await run_scoped_verification(
+                tmp_path, config, [], task_files=[data_path],
+            )
+
+        assert result.passed
+        executed = _executed_module_configs(mock_run_verification)
+        assert len(executed) == 1
+        assert executed[0].test_command is None
+        assert any(
+            'test-tree data module' in r.getMessage() and r.levelno >= logging.WARNING
+            for r in caplog.records
+        ), f'expected the task-1852 WARNING; got: {[r.getMessage() for r in caplog.records]}'
+        assert result.plan is not None
+        _assert_plan_run_matches_executed(
+            result.plan, 'pytest:', executed[0].test_command, executed[0].prefix,
+        )
+
+    @pytest.mark.asyncio
+    async def test_structural_file_widens_pyright_unscoped(self, tmp_path: Path):
+        """(c) STRUCTURAL_FILE_DIFF -> unscoped pyright end-to-end (the D2 gap
+        _build_fallback_config closes). Mirrors
+        TestRunScopedVerificationPlan.test_fallback_path_closes_d2_gap_end_to_end
+        (test_verify.py), which this golden must not regress.
+
+        Already GREEN today (see class docstring).
+        """
+        struct_path = STRUCTURAL_FILE_DIFF[0]
+        full = tmp_path / struct_path
+        full.parent.mkdir(parents=True, exist_ok=True)
+        full.write_text(STRUCTURAL_FILE_CONTENT)
+
+        config = OrchestratorConfig(
+            project_root=tmp_path,
+            test_command='pytest', lint_command='ruff check', type_check_command='pyright',
+        )
+
+        mock_run_verification = _run_verification_spy()
+        with patch.object(verify, 'run_verification', new=mock_run_verification):
+            result = await run_scoped_verification(
+                tmp_path, config, [], task_files=[struct_path],
+            )
+
+        assert result.passed
+        executed = _executed_module_configs(mock_run_verification)
+        assert len(executed) == 1
+        assert struct_path not in (executed[0].type_check_command or ''), (
+            f'structural file must trigger the unscoped type check: '
+            f'{executed[0].type_check_command!r}'
+        )
+        assert result.plan is not None
+        _assert_plan_run_matches_executed(
+            result.plan, 'pyright:', executed[0].type_check_command, executed[0].prefix,
+        )
+
+    @pytest.mark.asyncio
+    async def test_single_subproject_diff_scopes_to_cockpit(self, tmp_path: Path):
+        """(d) FALLBACK_SUBPROJECT_DIFF (cockpit-shaped, tasks 2344/2355) -> TEST scoped
+        to cockpit alone, TYPE/LINT rescoped into cockpit's own uv context.
+
+        RED today: the fallback plan (_derive_fallback_runs) does not model
+        subproject rescoping at all — it records the fleet chain running
+        verbatim (TEST) / unscoped (LINT/TYPE) against the flat file list,
+        while execution actually narrows everything to cockpit alone.
+        """
+        _make_cockpit_worktree(tmp_path)
+        test_path = FALLBACK_SUBPROJECT_DIFF[0]
+        full = tmp_path / test_path
+        full.parent.mkdir(parents=True, exist_ok=True)
+        full.write_text('def test_x():\n    pass\n')
+
+        config = OrchestratorConfig(
+            project_root=tmp_path,
+            test_command=_FLEET_TEST_COMMAND,
+            lint_command=_FLEET_LINT_COMMAND,
+            type_check_command=_FLEET_TYPE_COMMAND,
+        )
+
+        mock_run_verification = _run_verification_spy()
+        with patch.object(verify, 'run_verification', new=mock_run_verification):
+            result = await run_scoped_verification(
+                tmp_path, config, [], task_files=FALLBACK_SUBPROJECT_DIFF,
+            )
+
+        assert result.passed
+        executed = _executed_module_configs(mock_run_verification)
+        assert len(executed) == 1
+        assert executed[0].prefix == 'cockpit'
+        assert executed[0].test_command == 'cd cockpit && uv run pytest tests/test_c3.py'
+        assert executed[0].lint_command == (
+            'uv run --project cockpit ruff check cockpit/tests/test_c3.py'
+        )
+        assert executed[0].type_check_command == (
+            'uv run --project cockpit npx pyright cockpit/tests/test_c3.py'
+        )
+        # False-block guard: no OTHER fleet subproject leaks into the scoped commands.
+        for other in ('shared', 'escalation', 'fused-memory', 'dashboard'):
+            assert other not in executed[0].test_command
+            assert other not in executed[0].type_check_command
+
+        assert result.plan is not None
+        for prefix, cmd in (
+            ('pytest:', executed[0].test_command),
+            ('lint:', executed[0].lint_command),
+            ('pyright:', executed[0].type_check_command),
+        ):
+            _assert_plan_run_matches_executed(result.plan, prefix, cmd, executed[0].prefix)
+
+    @pytest.mark.asyncio
+    async def test_mixed_root_and_subproject_scopes_narrowly(self, tmp_path: Path):
+        """(e) MIXED_ROOT_SUBPROJECT_DIFF (task 2368) -> TEST scoped to cockpit's own
+        tests plus the root-owning tests/scripts/ suite, never the fleet chain.
+
+        RED today: the fallback plan does not model mixed root+subproject
+        rescoping either — same gap as (d), different shape.
+        """
+        _make_cockpit_worktree(tmp_path)
+        for f in MIXED_ROOT_SUBPROJECT_DIFF:
+            full = tmp_path / f
+            full.parent.mkdir(parents=True, exist_ok=True)
+            full.write_text('def test_x():\n    pass\n' if 'test_' in f else '# conftest\n')
+
+        config = OrchestratorConfig(
+            project_root=tmp_path,
+            test_command=_FLEET_TEST_COMMAND,
+            lint_command=_FLEET_LINT_COMMAND,
+            type_check_command=_FLEET_TYPE_COMMAND,
+        )
+
+        mock_run_verification = _run_verification_spy()
+        with patch.object(verify, 'run_verification', new=mock_run_verification):
+            result = await run_scoped_verification(
+                tmp_path, config, [], task_files=MIXED_ROOT_SUBPROJECT_DIFF,
+            )
+
+        assert result.passed
+        executed = _executed_module_configs(mock_run_verification)
+        assert len(executed) == 1
+        assert executed[0].prefix == 'cockpit'
+        assert executed[0].test_command == (
+            'cd cockpit && uv run pytest tests/test_c3.py '
+            '&& cd .. && uv run --project shared pytest tests/scripts/'
+        )
+        for other in ('escalation', 'fused-memory', 'dashboard'):
+            assert f'cd ../{other}' not in executed[0].test_command
+
+        assert result.plan is not None
+        for prefix, cmd in (
+            ('pytest:', executed[0].test_command),
+            ('lint:', executed[0].lint_command),
+            ('pyright:', executed[0].type_check_command),
+        ):
+            _assert_plan_run_matches_executed(result.plan, prefix, cmd, executed[0].prefix)
+
+    @pytest.mark.asyncio
+    async def test_opaque_fleet_chain_lint_type_scoped_to_first_clause(self, tmp_path: Path):
+        """(f) UNREGISTERED_PATH_DIFF against the REAL OPAQUE fleet lint/type chains ->
+        LINT/TYPE scope to their first clause (``_scope_to_keyword``, dropping the
+        rest); the OPAQUE TEST chain runs verbatim (P1).
+
+        RED today for LINT/TYPE: the fallback plan records the WHOLE
+        untouched multi-clause chain (parses OPAQUE at the full-string
+        level), while execution truncates-then-parses the first clause only,
+        producing a completely different, file-scoped string. TEST is
+        already GREEN today — P1 means neither layer scopes it.
+        """
+        test_path = UNREGISTERED_PATH_DIFF[0]
+        full = tmp_path / test_path
+        full.parent.mkdir(parents=True, exist_ok=True)
+        full.write_text('def test_x():\n    pass\n')
+
+        config = OrchestratorConfig(
+            project_root=tmp_path,
+            test_command=_FLEET_TEST_COMMAND,
+            lint_command=_FLEET_LINT_COMMAND_OPAQUE,
+            type_check_command=_FLEET_TYPE_COMMAND,
+        )
+
+        mock_run_verification = _run_verification_spy()
+        with patch.object(verify, 'run_verification', new=mock_run_verification):
+            result = await run_scoped_verification(
+                tmp_path, config, [], task_files=UNREGISTERED_PATH_DIFF,
+            )
+
+        assert result.passed
+        executed = _executed_module_configs(mock_run_verification)
+        assert len(executed) == 1
+        assert executed[0].prefix == '__fallback__'
+        # P1: the OPAQUE fleet TEST chain is never scoped/mutated — verbatim.
+        assert executed[0].test_command == _FLEET_TEST_COMMAND
+        # LINT/TYPE scope to the first clause, dropping the rest of the chain.
+        assert executed[0].lint_command == f'uv run --project shared ruff check {test_path}'
+        assert 'check_bare_magicmock_config' not in executed[0].lint_command
+        assert executed[0].type_check_command == f'npx pyright {test_path}'
+        assert 'orchestrator' not in executed[0].type_check_command
+        assert 'dashboard' not in executed[0].type_check_command
+
+        assert result.plan is not None
+        for prefix, cmd in (
+            ('pytest:', executed[0].test_command),
+            ('lint:', executed[0].lint_command),
+            ('pyright:', executed[0].type_check_command),
+        ):
+            _assert_plan_run_matches_executed(result.plan, prefix, cmd, executed[0].prefix)
