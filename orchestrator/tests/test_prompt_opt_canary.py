@@ -16,6 +16,7 @@ from pathlib import Path
 
 import pytest
 from click.testing import CliRunner
+from shared.prompt_artifact import ArtifactProvenance, PromptArtifactStore
 
 from orchestrator.evals.prompt_opt.__main__ import cli
 from orchestrator.evals.prompt_opt.canary import (
@@ -31,7 +32,6 @@ from orchestrator.evals.prompt_opt.canary import (
     run_canary,
 )
 from orchestrator.run_store import _SCHEMA
-from shared.prompt_artifact import ArtifactProvenance, PromptArtifactStore
 
 
 def _explicit_thresholds(**overrides: object) -> CanaryThresholds:
