@@ -14,6 +14,7 @@ import contextlib
 import logging
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
+from typing import Any
 
 logger = logging.getLogger(__name__)
 
@@ -117,3 +118,36 @@ class BackgroundService:
             with contextlib.suppress(asyncio.CancelledError, Exception):
                 await self._task
             self._task = None
+
+
+class LifecycleRegistry:
+    """Ordered registry of lifecycle services with a bounded start/stop ladder.
+
+    PRD §5.3 (LR-3): ``register(svc)`` appends in declared order and
+    ``start_all()`` awaits each service's ``start()`` in that same order.
+    ``stop_all()`` (step-12) walks the REVERSE of registration order,
+    bounding each ``stop()`` so one wedging service can never hang shutdown
+    (LR-2 / S1).
+
+    Services are duck-typed (the eventual ``LifecycleService`` Protocol —
+    name, async start(), async stop(), stop_timeout_secs — lands in
+    step-14); both ``BackgroundService`` and the step-14 ``ManagedService``
+    adapter satisfy this shape.
+    """
+
+    def __init__(self) -> None:
+        self._services: list[Any] = []
+
+    @property
+    def services(self) -> list[Any]:
+        """The registered services, in declared (start) order."""
+        return list(self._services)
+
+    def register(self, service: Any) -> None:
+        """Append ``service`` to the registry, in declared order."""
+        self._services.append(service)
+
+    async def start_all(self) -> None:
+        """Await each registered service's start(), in registration order."""
+        for service in self._services:
+            await service.start()
