@@ -16,7 +16,58 @@ rather than ever shelling out to a real `claude` process.
 """
 from __future__ import annotations
 
+import json
+
+import pytest
+
 import coder as mod
+import digest as digest_mod
+
+# ---------------------------------------------------------------------------
+# Shared fixture helpers — synthetic transcript -> real digest text, mirrors
+# test_legibility_digest.py's helper shapes (own copies, per this repo's
+# convention of each test file owning its scaffolding, e.g. test_codebook.py's
+# _minimal_v2()).
+# ---------------------------------------------------------------------------
+
+_SESSION_ID = "cafe1234-0000-4000-8000-000000000000"
+_CWD = "/home/leo/src/dark-factory"
+_TIMESTAMP = "2026-07-14T06:02:29.796Z"
+
+
+def _user_text(s, *, cwd=_CWD, session_id=_SESSION_ID, timestamp=_TIMESTAMP):
+    """Build a synthetic genuine (non-meta, non-sidechain) human user turn
+    carrying real-transcript-shaped top-level cwd/sessionId/timestamp
+    fields (observed on every non-queue-operation record in a real Claude
+    Code transcript)."""
+    return {
+        "type": "user",
+        "message": {"role": "user", "content": s},
+        "isSidechain": False,
+        "isMeta": False,
+        "cwd": cwd,
+        "sessionId": session_id,
+        "timestamp": timestamp,
+    }
+
+
+def _write_jsonl(tmp_path, records, name="transcript.jsonl"):
+    path = tmp_path / name
+    with path.open("w", encoding="utf-8") as f:
+        for r in records:
+            f.write(json.dumps(r))
+            f.write("\n")
+    return path
+
+
+def _build_digest_text(tmp_path, *, session_id=_SESSION_ID, agent_class="interactive", name="transcript.jsonl"):
+    """Build a real digest string via digest.build_digest on a minimal
+    synthetic single-user-turn transcript — session/date/agent_class in
+    the resulting frontmatter are deterministic from the inputs given
+    here."""
+    records = [_user_text("Please fix this, it is wrong.", session_id=session_id)]
+    path = _write_jsonl(tmp_path, records, name=name)
+    return digest_mod.build_digest(path, agent_class_override=agent_class)
 
 
 # ---------------------------------------------------------------------------
@@ -102,3 +153,28 @@ def test_build_codebook_index_empty_entries_yields_empty_or_header_only():
     codebook = {"version": 2, "entries": [], "candidates": []}
     index = mod.build_codebook_index(codebook)
     assert index.strip() == ""
+
+
+# ---------------------------------------------------------------------------
+# step-3: RED — parse_frontmatter() digest frontmatter -> meta dict
+# ---------------------------------------------------------------------------
+
+def test_parse_frontmatter_returns_session_date_agent_class(tmp_path):
+    digest_text = _build_digest_text(tmp_path, agent_class="orchestrated-task")
+
+    meta = mod.parse_frontmatter(digest_text)
+
+    assert meta["session"] == _SESSION_ID
+    assert meta["date"] == "2026-07-14"
+    assert meta["agent_class"] == "orchestrated-task"
+
+
+def test_parse_frontmatter_raises_on_missing_delimiters():
+    with pytest.raises(mod.CoderParseError):
+        mod.parse_frontmatter("no frontmatter here, just prose")
+
+
+def test_parse_frontmatter_raises_on_non_mapping_block():
+    malformed = "---\n- just\n- a\n- list\n---\nbody\n"
+    with pytest.raises(mod.CoderParseError):
+        mod.parse_frontmatter(malformed)
