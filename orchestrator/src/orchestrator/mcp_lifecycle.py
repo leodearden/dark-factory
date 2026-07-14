@@ -67,6 +67,81 @@ def apply_mcp_startup_env(
 _PLAN_TOOLS_FAST_START_FLAGS: tuple[str, ...] = ('--no-sync', '--frozen')
 
 
+def _stdio_mcp_server(
+    module_path: str,
+    orch_project_dir: Path,
+    worktree: Path,
+    python_executable: str | None = None,
+    meta_root: Path | None = None,
+    extra_args: tuple[str, ...] = (),
+) -> dict:
+    """Shared launch-dict factory for stdio MCP servers (task 2482 amendment).
+
+    :func:`plan_tools_mcp_server` and :func:`verdict_tools_mcp_server` both
+    delegate here — they differ only by *module_path* and an optional
+    *extra_args* tail (verdict-tools' ``('--verdict-role', role)``), so the
+    no-uv hot path vs. ``uv --no-sync --frozen`` fallback branch and the
+    ``meta_root`` passthrough now live in exactly one place instead of two
+    near-identical copies.
+
+    **No-uv hot path (production, task 1776):** when *python_executable* is
+    supplied, launches *module_path* directly via that interpreter with no
+    ``uv`` involved at all, eliminating the ``uv``-internal futex contention
+    that caused 0-turn ``error_empty_output`` failures under concurrent load
+    (reify esc-4415-240, esc-4437-123).
+
+    **uv fallback (task 1775):** when *python_executable* is ``None``
+    (default), returns the ``uv run --project <orch> --no-sync --frozen
+    python -m <module_path> ...`` form using
+    :data:`_PLAN_TOOLS_FAST_START_FLAGS` — a stdio fast-start convention
+    shared by every server launched this way, not plan-tools-specific.
+
+    Args:
+        module_path: Python module to launch via ``-m`` (e.g.
+            ``'orchestrator.mcp.plan_tools'``).
+        orch_project_dir: Path to the orchestrator package root (used for
+            ``--project`` in the uv fallback path).
+        worktree: Path to the agent's worktree (bound as ``--worktree``).
+        python_executable: Full path to the Python interpreter to use for the
+            direct-interpreter no-uv hot path.  When ``None``, falls back to
+            the ``uv run --no-sync --frozen`` form.
+        meta_root: Optional `.task-meta` root (see
+            ``TaskArtifacts.meta_root_for``) passed through as
+            ``--meta-root``.  When ``None`` (default), no ``--meta-root``
+            flag is emitted and args are byte-identical to before this
+            parameter existed.
+        extra_args: Additional tokens appended after the ``--worktree``/
+            ``--meta-root`` args (e.g. verdict-tools' ``--verdict-role``
+            pair).  Empty by default — exactly plan-tools' shape.
+
+    Returns:
+        Claude Code MCP server config dict with ``command`` and ``args``.
+    """
+    meta_root_args = ['--meta-root', str(meta_root)] if meta_root is not None else []
+    if python_executable:
+        # Direct-interpreter no-uv hot path: eliminates the uv futex wedge.
+        return {
+            'command': python_executable,
+            'args': [
+                '-m', module_path, '--worktree', str(worktree),
+                *meta_root_args,
+                *extra_args,
+            ],
+        }
+    # uv fallback: backward-compatible form with fast-start flags (task 1775).
+    return {
+        'command': 'uv',
+        'args': [
+            'run', '--project', str(orch_project_dir),
+            *_PLAN_TOOLS_FAST_START_FLAGS,
+            'python', '-m', module_path,
+            '--worktree', str(worktree),
+            *meta_root_args,
+            *extra_args,
+        ],
+    }
+
+
 def plan_tools_mcp_server(
     orch_project_dir: Path,
     worktree: Path,
@@ -104,6 +179,12 @@ def plan_tools_mcp_server(
     Task 1771's ``MCP_TIMEOUT`` backstop (``apply_mcp_startup_env``) is
     retained as defense-in-depth for both paths.
 
+    Implementation note (task 2482 amendment): delegates to the shared
+    ``_stdio_mcp_server`` helper — also used by ``verdict_tools_mcp_server``
+    — so this docstring's behavioral contract is unchanged, but the launch
+    -dict branch logic itself now lives in one place instead of two
+    near-identical copies.
+
     Args:
         orch_project_dir: Path to the orchestrator package root (used for
             ``--project`` in the uv fallback path).
@@ -122,27 +203,75 @@ def plan_tools_mcp_server(
     Returns:
         Claude Code MCP server config dict with ``command`` and ``args``.
     """
-    meta_root_args = ['--meta-root', str(meta_root)] if meta_root is not None else []
-    if python_executable:
-        # Direct-interpreter no-uv hot path: eliminates the uv futex wedge.
-        return {
-            'command': python_executable,
-            'args': [
-                '-m', 'orchestrator.mcp.plan_tools', '--worktree', str(worktree),
-                *meta_root_args,
-            ],
-        }
-    # uv fallback: backward-compatible form with fast-start flags (task 1775).
-    return {
-        'command': 'uv',
-        'args': [
-            'run', '--project', str(orch_project_dir),
-            *_PLAN_TOOLS_FAST_START_FLAGS,
-            'python', '-m', 'orchestrator.mcp.plan_tools',
-            '--worktree', str(worktree),
-            *meta_root_args,
-        ],
-    }
+    return _stdio_mcp_server(
+        'orchestrator.mcp.plan_tools', orch_project_dir, worktree,
+        python_executable=python_executable, meta_root=meta_root,
+    )
+
+
+def verdict_tools_mcp_server(
+    orch_project_dir: Path,
+    worktree: Path,
+    role: str,
+    python_executable: str | None = None,
+    meta_root: Path | None = None,
+) -> dict:
+    """Return a stdio MCP server config dict for the verdict-tools server.
+
+    Launch target is α's ``orchestrator.mcp.verdict_tools`` CLI (task 2481):
+    ``<interpreter> -m orchestrator.mcp.verdict_tools --worktree <wt>
+    [--meta-root <mr>] --verdict-role <role>``. *role* is the
+    ``--verdict-role`` value — the authoritative selector for both which
+    single tool the server registers (judge/merger/reviewer-name, see
+    ``verdict_tools.create_server``) and the ``verdicts/<role>.json``
+    filename it writes to (never an agent-supplied field).
+
+    Delegates to the shared :func:`_stdio_mcp_server` helper (task 2482
+    amendment) — same direct-interpreter no-uv hot path vs. ``uv --no-sync
+    --frozen`` fallback branch, same ``meta_root`` passthrough as
+    :func:`plan_tools_mcp_server`, differing only by module path and the
+    added ``('--verdict-role', role)`` extra-args tail.
+
+    No ``env`` is set on the returned dict: ``MCP_TIMEOUT`` is injected
+    process-wide for every claude subprocess by ``apply_mcp_startup_env``
+    (invoke.py), inherited by all stdio MCP servers it spawns — the same
+    reasoning that already applies to ``plan_tools_mcp_server``.
+
+    No ``--session-id`` is threaded through here (nor by
+    ``_inject_verdict_tools_mcp`` in workflow.py): α made ``--session-id``
+    optional (default ``''``), and task 2482's plan (design_decisions #4)
+    deliberately defers passing it — PRD open-question 3 accepts an empty
+    ``session_id`` provenance field on written verdicts for v1 (eval-revival
+    can correlate a verdict by ``emitted_at`` + task id instead). This is an
+    intentional scope boundary, not a wiring gap: no code reads
+    ``verdicts/<role>.json`` yet, so the blank field has no consumer-visible
+    effect today. A future consumer task can add a ``session_id`` parameter
+    here and pass it through ``_inject_verdict_tools_mcp`` alongside its
+    parse-site change.
+
+    Args:
+        orch_project_dir: Path to the orchestrator package root (used for
+            ``--project`` in the uv fallback path).
+        worktree: Path to the agent's worktree (bound as ``--worktree``).
+        role: The ``--verdict-role`` value (e.g. ``'judge'``, ``'merger'``,
+            or a reviewer-panel name like ``'reviewer_comprehensive'``).
+        python_executable: Full path to the Python interpreter to use for the
+            direct-interpreter no-uv hot path.  When ``None``, falls back to
+            the ``uv run --no-sync --frozen`` form.
+        meta_root: Optional `.task-meta` root (see
+            ``TaskArtifacts.meta_root_for``) to pass through as
+            ``--meta-root``, so the agent-side verdict-tools server targets
+            the same relocated artifacts root as the orchestrator. When
+            ``None`` (default), no ``--meta-root`` flag is emitted.
+
+    Returns:
+        Claude Code MCP server config dict with ``command`` and ``args``.
+    """
+    return _stdio_mcp_server(
+        'orchestrator.mcp.verdict_tools', orch_project_dir, worktree,
+        python_executable=python_executable, meta_root=meta_root,
+        extra_args=('--verdict-role', role),
+    )
 
 
 # ---------------------------------------------------------------------------

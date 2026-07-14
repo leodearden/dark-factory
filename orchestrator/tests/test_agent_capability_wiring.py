@@ -171,10 +171,10 @@ class TestShippedRoleCapabilityDeclarations:
         'architect': (frozenset({'orchestrator', 'plan_tools'}), False),
         'implementer': (frozenset({'orchestrator', 'plan_tools'}), True),
         'debugger': (frozenset({'orchestrator', 'plan_tools'}), True),
-        'merger': (frozenset({'orchestrator'}), False),
-        'judge': (frozenset({'orchestrator'}), False),
+        'merger': (frozenset({'orchestrator', 'verdict_tools'}), False),
+        'judge': (frozenset({'orchestrator', 'verdict_tools'}), False),
         'simple_task': (frozenset({'orchestrator', 'plan_tools'}), False),
-        'reviewer_comprehensive': (frozenset(), False),
+        'reviewer_comprehensive': (frozenset({'verdict_tools'}), False),
         'steward': (frozenset({'orchestrator'}), False),
         'deep_reviewer': (frozenset({'orchestrator'}), False),
     }
@@ -211,6 +211,21 @@ class TestShippedRoleCapabilityDeclarations:
 
         assert sandboxed_names == {'implementer', 'debugger'}
 
+    @pytest.mark.parametrize(
+        'role_name', ['reviewer_comprehensive', 'judge', 'merger'],
+    )
+    def test_role_grants_a_verdict_tools_tool(self, role_name):
+        """reviewer/judge/merger each get a mcp__verdict-tools__* grant in
+        allowed_tools (PRD task β — verdict-tools stdio server wiring,
+        task 2482)."""
+        from orchestrator.agents.roles import ROLES  # noqa: PLC0415
+
+        role = ROLES[role_name]
+        assert any(t.startswith('mcp__verdict-tools__') for t in role.allowed_tools), (
+            f'{role_name!r} allowed_tools has no mcp__verdict-tools__* entry: '
+            f'{role.allowed_tools!r}'
+        )
+
 
 class TestInverseCapabilityInvariant:
     """Every ROLES entry that allows a family's tool prefix must declare
@@ -244,6 +259,21 @@ class TestInverseCapabilityInvariant:
                     f'{name!r} allows fused-memory/escalation tools but does '
                     f"not declare 'orchestrator' in mcp_families (reify "
                     f'esc-4943-54 class)'
+                )
+
+    def test_every_role_allowing_verdict_tools_declares_verdict_tools_family(self):
+        """PRD task β (task 2482): the same inverse invariant, extended to the
+        new verdict_tools family."""
+        from orchestrator.agents.roles import ROLES  # noqa: PLC0415
+
+        for name, role in ROLES.items():
+            allows_verdict_tools = any(
+                t.startswith('mcp__verdict-tools__') for t in role.allowed_tools
+            )
+            if allows_verdict_tools:
+                assert 'verdict_tools' in role.mcp_families, (
+                    f'{name!r} allows verdict-tools tools but does not declare '
+                    f"'verdict_tools' in mcp_families (reify esc-4943-54 class)"
                 )
 
 
@@ -307,12 +337,15 @@ def task_assignment() -> TaskAssignment:
     )
 
 
-async def _invoke_probe(role, config, git_ops, task_assignment):
+async def _invoke_probe(role, config, git_ops, task_assignment, mcp=None):
     """Build a TaskWorkflow, patch invoke_with_cap_retry, invoke workflow._invoke(role, ...).
 
     Returns (call_kwargs, workflow) — the kwargs invoke_with_cap_retry was
     awaited with, and the workflow instance (so callers can assert against
-    workflow.modules).
+    workflow.modules). ``mcp`` defaults to a bare ``FakeMcp()`` (empty
+    mcpServers); callers may pass a fake that pre-populates a server (e.g.
+    ``_FakeMcpWithFusedMemory``) to distinguish "server added alongside an
+    existing one" from "server is the only one".
     """
     wt_info = await git_ops.create_worktree(task_assignment.task_id)
     cwd = wt_info.path
@@ -325,7 +358,7 @@ async def _invoke_probe(role, config, git_ops, task_assignment):
         git_ops=git_ops,
         scheduler=FakeScheduler(),  # type: ignore[arg-type]
         briefing=FakeBriefing(),  # type: ignore[arg-type]
-        mcp=FakeMcp(),
+        mcp=mcp if mcp is not None else FakeMcp(),
     )
     workflow.artifacts = None
 
@@ -339,6 +372,18 @@ async def _invoke_probe(role, config, git_ops, task_assignment):
     assert mock_cap_retry.await_count == 1, 'invoke_with_cap_retry must be called once'
     assert mock_cap_retry.await_args is not None, 'await_args must be set after one await'
     return mock_cap_retry.await_args.kwargs, workflow
+
+
+class _FakeMcpWithFusedMemory(FakeMcp):
+    """FakeMcp variant that pre-populates an orchestrator-assembled server.
+
+    Lets a test distinguish "verdict-tools added ALONGSIDE an existing
+    orchestrator server" from "verdict-tools happens to be the only server
+    because FakeMcp.mcp_config_json is normally empty".
+    """
+
+    def mcp_config_json(self, escalation_url: str | None = None) -> dict:
+        return {'mcpServers': {'fused-memory': {'type': 'http', 'url': 'http://x/mcp'}}}
 
 
 @pytest.mark.asyncio
@@ -436,4 +481,81 @@ class TestInvokeDerivesGatingFromRole:
         assert 'plan-tools' not in servers, (
             f"Expected no 'plan-tools' server wired (role.mcp_families=frozenset()) "
             f'but found one in mcp_config={mcp_config!r}.'
+        )
+        assert 'verdict-tools' not in servers, (
+            f"Expected no 'verdict-tools' server wired (role.mcp_families=frozenset()) "
+            f'but found one in mcp_config={mcp_config!r}.'
+        )
+
+    async def test_verdict_tools_family_wires_verdict_tools_server_regardless_of_name(
+        self, config, git_ops, task_assignment,
+    ):
+        """probe_verdict: name is none of the shipped verdict-emitting roles,
+        but declares mcp_families={'verdict_tools'} (PRD task β, task 2482)."""
+        from orchestrator.agents.roles import AgentRole  # noqa: PLC0415
+
+        role = AgentRole(
+            name='probe_verdict', system_prompt='x', allowed_tools=[],
+            mcp_families=frozenset({'verdict_tools'}),
+        )
+        call_kwargs, _workflow = await _invoke_probe(role, config, git_ops, task_assignment)
+
+        mcp_config = call_kwargs.get('mcp_config')
+        servers = (mcp_config or {}).get('mcpServers', {})
+        assert 'verdict-tools' in servers, (
+            "Expected mcp_config['mcpServers'] to contain 'verdict-tools' "
+            f"(role.mcp_families={{'verdict_tools'}}) but got {mcp_config!r}. _invoke "
+            "must gate the verdict-tools injection off 'verdict_tools' in "
+            'role.mcp_families.'
+        )
+
+    async def test_reviewer_gets_verdict_server_via_skeleton_despite_no_orchestrator_family(
+        self, config, git_ops, task_assignment,
+    ):
+        """MARQUEE: REVIEWER_COMPREHENSIVE declares no 'orchestrator' family
+        (mcp_config starts as None), so the verdict-tools gate's None->
+        skeleton path is what makes the server reachable at all — proving a
+        role outside every other MCP gate is still reachable by verdict-tools
+        (PRD task β, task 2482)."""
+        from orchestrator.agents.roles import REVIEWER_COMPREHENSIVE  # noqa: PLC0415
+
+        call_kwargs, _workflow = await _invoke_probe(
+            REVIEWER_COMPREHENSIVE, config, git_ops, task_assignment,
+        )
+
+        mcp_config = call_kwargs.get('mcp_config')
+        assert mcp_config is not None, (
+            'Expected REVIEWER_COMPREHENSIVE (no orchestrator family) to still get '
+            'an assembled mcp_config via the verdict-tools skeleton path, got '
+            f'{mcp_config!r}.'
+        )
+        servers = mcp_config.get('mcpServers', {})
+        assert 'verdict-tools' in servers, (
+            f"Expected 'verdict-tools' in mcpServers, got {list(servers)!r}."
+        )
+        assert 'fused-memory' not in servers, (
+            "Expected no 'fused-memory' server (REVIEWER_COMPREHENSIVE declares "
+            f"no 'orchestrator' family) but found one in mcpServers={list(servers)!r}."
+        )
+
+    async def test_merger_gets_verdict_server_alongside_orchestrator(
+        self, config, git_ops, task_assignment,
+    ):
+        """MERGER already declares 'orchestrator' (for jcodemunch); the
+        verdict-tools gate must ADD its server alongside the
+        orchestrator-assembled ones, not replace them (PRD task β, task 2482)."""
+        from orchestrator.agents.roles import MERGER  # noqa: PLC0415
+
+        call_kwargs, _workflow = await _invoke_probe(
+            MERGER, config, git_ops, task_assignment, mcp=_FakeMcpWithFusedMemory(),
+        )
+
+        mcp_config = call_kwargs.get('mcp_config')
+        servers = (mcp_config or {}).get('mcpServers', {})
+        assert 'fused-memory' in servers, (
+            'Expected the pre-existing orchestrator-assembled fused-memory server '
+            f'preserved, got {list(servers)!r}.'
+        )
+        assert 'verdict-tools' in servers, (
+            f"Expected 'verdict-tools' added alongside it, got {list(servers)!r}."
         )

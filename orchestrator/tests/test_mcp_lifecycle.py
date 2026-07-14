@@ -15,6 +15,11 @@ override, home fallback, and not-under-project-root (task 2439 step-1/step-2).
 TestManagedSpawnEnvInjection — McpLifecycle.start()'s managed-spawn branch
 injects QUEUE_DATA_DIR/RECONCILIATION_DATA_DIR out-of-tree, honoring an
 operator-preset override (task 2439 step-3/step-4).
+
+TestVerdictToolsLaunchFastStart/DirectInterpreter/MetaRoot —
+verdict_tools_mcp_server() launch-dict factory, modeled on
+plan_tools_mcp_server (task 2482, PRD mcp-verdict-servers-prd.md task β,
+step-1/step-2).
 """
 
 from __future__ import annotations
@@ -27,7 +32,7 @@ import pytest
 from _orch_helpers import pydantic_spec
 
 from orchestrator.config import OrchestratorConfig
-from orchestrator.mcp_lifecycle import plan_tools_mcp_server
+from orchestrator.mcp_lifecycle import plan_tools_mcp_server, verdict_tools_mcp_server
 
 # ---------------------------------------------------------------------------
 # Step-1/Step-2: apply_mcp_startup_env + MCP_STARTUP_TIMEOUT_MS
@@ -426,6 +431,159 @@ class TestPlanToolsLaunchMetaRoot:
         cfg = plan_tools_mcp_server(
             orch_project_dir=Path('/orch'),
             worktree=Path('/wt'),
+            python_executable='/venv/bin/python',
+        )
+        assert '--meta-root' not in cfg['args']
+
+
+# ---------------------------------------------------------------------------
+# Step-1/Step-2 (task 2482, PRD mcp-verdict-servers-prd.md task β):
+# verdict_tools_mcp_server()
+# ---------------------------------------------------------------------------
+
+
+class TestVerdictToolsLaunchFastStart:
+    """verdict_tools_mcp_server() uv-fallback path — mirrors
+    TestPlanToolsLaunchFastStart, targeting orchestrator.mcp.verdict_tools
+    and adding '--verdict-role'."""
+
+    @pytest.fixture
+    def cfg(self):
+        return verdict_tools_mcp_server(
+            orch_project_dir=Path('/orch'), worktree=Path('/wt'), role='judge',
+        )
+
+    def test_command_is_uv(self, cfg):
+        """verdict_tools_mcp_server() returns command == 'uv'."""
+        assert cfg['command'] == 'uv'
+
+    def test_args_contain_fast_start_flags(self, cfg):
+        """args contains both --no-sync AND --frozen (shared _PLAN_TOOLS_FAST_START_FLAGS)."""
+        args = cfg['args']
+        assert '--no-sync' in args, f"Expected '--no-sync' in args, got {args}"
+        assert '--frozen' in args, f"Expected '--frozen' in args, got {args}"
+
+    def test_args_contain_project_then_orch_dir(self, cfg):
+        """args contains '--project' immediately followed by '/orch'."""
+        args = cfg['args']
+        idx = args.index('--project')
+        assert args[idx + 1] == '/orch'
+
+    def test_args_contain_module_path_sequence(self, cfg):
+        """args contains the sequence 'python', '-m', 'orchestrator.mcp.verdict_tools'."""
+        args = cfg['args']
+        python_idx = args.index('python')
+        assert args[python_idx + 1] == '-m'
+        assert args[python_idx + 2] == 'orchestrator.mcp.verdict_tools'
+
+    def test_args_contain_worktree_then_path(self, cfg):
+        """args contains '--worktree' immediately followed by '/wt'."""
+        args = cfg['args']
+        wt_idx = args.index('--worktree')
+        assert args[wt_idx + 1] == '/wt'
+
+    def test_args_contain_verdict_role_then_role(self, cfg):
+        """args contains '--verdict-role' immediately followed by the role."""
+        args = cfg['args']
+        idx = args.index('--verdict-role')
+        assert args[idx + 1] == 'judge'
+
+
+class TestVerdictToolsLaunchDirectInterpreter:
+    """verdict_tools_mcp_server(python_executable=...) uses the direct-interpreter
+    no-uv hot path — mirrors TestPlanToolsLaunchDirectInterpreter (task 2482)."""
+
+    @pytest.fixture
+    def cfg(self):
+        return verdict_tools_mcp_server(
+            orch_project_dir=Path('/orch'),
+            worktree=Path('/wt'),
+            role='judge',
+            python_executable='/venv/bin/python',
+        )
+
+    def test_command_is_python_executable(self, cfg):
+        """command IS the supplied interpreter, not 'uv'."""
+        assert cfg['command'] == '/venv/bin/python'
+
+    def test_args_exact_module_invocation_sequence(self, cfg):
+        """args equals the exact module/worktree/verdict-role sequence, no --meta-root."""
+        assert cfg['args'] == [
+            '-m', 'orchestrator.mcp.verdict_tools',
+            '--worktree', '/wt',
+            '--verdict-role', 'judge',
+        ]
+
+    def test_no_uv_tokens_anywhere_in_full_command(self, cfg):
+        """None of {'uv', 'run', '--no-sync', '--frozen', '--project'} appear
+        in [command] + args (locks no-uv hot path against regression)."""
+        full = [cfg['command'], *cfg['args']]
+        forbidden = {'uv', 'run', '--no-sync', '--frozen', '--project'}
+        found = forbidden & set(full)
+        assert not found, (
+            f"uv tokens {found!r} must not appear in direct-interpreter command: {full}"
+        )
+
+    def test_empty_string_python_executable_falls_back_to_uv(self):
+        """python_executable='' is falsy → falls back to the uv path (command == 'uv')."""
+        cfg = verdict_tools_mcp_server(
+            orch_project_dir=Path('/orch'),
+            worktree=Path('/wt'),
+            role='judge',
+            python_executable='',
+        )
+        assert cfg['command'] == 'uv', (
+            "Empty string python_executable must fall back to uv path, "
+            f"not launch with command={cfg['command']!r}"
+        )
+
+
+class TestVerdictToolsLaunchMetaRoot:
+    """verdict_tools_mcp_server(meta_root=...) appends '--meta-root <path>' to
+    args for BOTH the uv-fallback and direct-interpreter forms; omitting
+    meta_root (the default) leaves args byte-identical to the no-meta-root
+    exact-match tests above (mirrors TestPlanToolsLaunchMetaRoot)."""
+
+    def test_uv_fallback_contains_meta_root_flag(self):
+        """uv-fallback form: '--meta-root' immediately followed by the path."""
+        cfg = verdict_tools_mcp_server(
+            orch_project_dir=Path('/orch'),
+            worktree=Path('/wt'),
+            role='judge',
+            meta_root=Path('/base/.task-meta/wt'),
+        )
+        args = cfg['args']
+        idx = args.index('--meta-root')
+        assert args[idx + 1] == '/base/.task-meta/wt'
+
+    def test_direct_interpreter_contains_meta_root_flag(self):
+        """direct-interpreter form: '--meta-root' immediately followed by the path."""
+        cfg = verdict_tools_mcp_server(
+            orch_project_dir=Path('/orch'),
+            worktree=Path('/wt'),
+            role='judge',
+            python_executable='/venv/bin/python',
+            meta_root=Path('/base/.task-meta/wt'),
+        )
+        args = cfg['args']
+        idx = args.index('--meta-root')
+        assert args[idx + 1] == '/base/.task-meta/wt'
+
+    def test_uv_fallback_omits_meta_root_flag_by_default(self):
+        """Regression guard: meta_root omitted (None) → no '--meta-root' token
+        anywhere in args."""
+        cfg = verdict_tools_mcp_server(
+            orch_project_dir=Path('/orch'), worktree=Path('/wt'), role='judge',
+        )
+        assert '--meta-root' not in cfg['args']
+
+    def test_direct_interpreter_omits_meta_root_flag_by_default(self):
+        """Regression guard: meta_root omitted (None) → no '--meta-root' token
+        anywhere in args for the direct-interpreter form either."""
+        cfg = verdict_tools_mcp_server(
+            orch_project_dir=Path('/orch'),
+            worktree=Path('/wt'),
+            role='judge',
             python_executable='/venv/bin/python',
         )
         assert '--meta-root' not in cfg['args']

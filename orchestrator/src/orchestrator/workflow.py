@@ -67,7 +67,7 @@ from orchestrator.git_ops import (
     is_wip_safety_commit,
 )
 from orchestrator.landed_outbox import LandedRow, MergeProvenance
-from orchestrator.mcp_lifecycle import plan_tools_mcp_server
+from orchestrator.mcp_lifecycle import plan_tools_mcp_server, verdict_tools_mcp_server
 from orchestrator.module_charter import sanitize_files_for_persist
 from orchestrator.scheduler import (
     SetTaskStatusRejected,
@@ -172,6 +172,48 @@ def _inject_plan_tools_mcp(mcp_config: dict | None, cwd: Path) -> dict:
         mcp_config = {'mcpServers': {}}
     mcp_config.setdefault('mcpServers', {})['plan-tools'] = plan_tools_mcp_server(
         _ORCH_PROJECT_DIR, cwd, python_executable=sys.executable,
+        meta_root=_meta_root_for_worktree(cwd),
+    )
+    return mcp_config
+
+
+def _inject_verdict_tools_mcp(mcp_config: dict | None, cwd: Path, role: AgentRole) -> dict:
+    """Inject the verdict-tools stdio MCP server entry into *mcp_config*.
+
+    Creates a minimal ``{'mcpServers': {}}`` skeleton when *mcp_config* is
+    ``None`` — the same None-skeleton path ``_inject_plan_tools_mcp`` uses.
+    This is what lets the reviewer (which declares NO ``'orchestrator'``
+    family, so its ``mcp_config`` would otherwise stay ``None``) still
+    acquire the verdict-tools server: the family check that gates this
+    injector (PRD task β's spawn-site gate) is independent of the
+    ``'orchestrator'`` gate, so a role with only ``'verdict_tools'`` in
+    ``mcp_families`` gets a config built from scratch here.
+
+    ``role.name`` is passed as ``--verdict-role`` — the authoritative
+    selector for both the single tool the verdict-tools server registers
+    (judge/merger/reviewer-name, see ``verdict_tools.create_server``) and the
+    ``verdicts/<role>.json`` filename it writes (α's I-AUTHORITATIVE-PATH
+    invariant: never an agent-supplied field). This mirrors the existing
+    review-key convention (``write_review(role.name)`` elsewhere in this
+    file), so ``verdicts/reviewer_comprehensive.json`` mirrors
+    ``reviews/reviewer_comprehensive.json``.
+
+    Modeled on ``_inject_plan_tools_mcp``: same direct-interpreter no-uv hot
+    path (``python_executable=sys.executable``) and the same
+    ``meta_root=_meta_root_for_worktree(cwd)`` passthrough so the agent-side
+    verdict-tools server targets the identical relocated `.task-meta` root
+    the orchestrator's own ``TaskArtifacts`` instance reads from.
+
+    Deliberately passes no ``--session-id`` to ``verdict_tools_mcp_server``,
+    even though the active session id is available here at the ``_invoke``
+    spawn site — see that function's docstring (task 2482 design_decisions
+    #4) for why this is an intentional v1 scope boundary rather than an
+    oversight.
+    """
+    if not mcp_config:
+        mcp_config = {'mcpServers': {}}
+    mcp_config.setdefault('mcpServers', {})['verdict-tools'] = verdict_tools_mcp_server(
+        _ORCH_PROJECT_DIR, cwd, role.name, python_executable=sys.executable,
         meta_root=_meta_root_for_worktree(cwd),
     )
     return mcp_config
@@ -7507,6 +7549,15 @@ Update the plan to address the blocking issues. You may add new steps to the `st
         # avoid cold-resolve stalls under load (reify esc-4415-240/esc-4437-123).
         if 'plan_tools' in role.mcp_families and cwd:
             mcp_config = _inject_plan_tools_mcp(mcp_config, cwd)
+
+        # Verdict-tools stdio MCP server — reviewer/judge/merger submit a
+        # constrained verdict artifact (PRD task β, task 2482). Gated on
+        # role.mcp_families exactly like plan-tools above; the per-invocation
+        # --verdict-role is role.name. _inject_verdict_tools_mcp skeletons a
+        # config when None, so the reviewer (no 'orchestrator' family) still
+        # acquires it.
+        if 'verdict_tools' in role.mcp_families and cwd:
+            mcp_config = _inject_verdict_tools_mcp(mcp_config, cwd, role)
 
         # Session-resume lifecycle: if the harness recovered a sidecar that
         # matches the role we're about to invoke, resume the prior session
