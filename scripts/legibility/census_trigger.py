@@ -35,9 +35,11 @@ standalone CLI; task ε injects the real MCP-backed fetcher.
 """
 from __future__ import annotations
 
+import json
 import logging
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 
 logger = logging.getLogger("legibility.census_trigger")
 
@@ -198,3 +200,56 @@ def evaluate(
     fire = triggered and not floor_blocks
 
     return Decision(fire=fire, reasons=reasons)
+
+
+# ---------------------------------------------------------------------------
+# load_census_state — §7.5 census-state.json reader (three-valued)
+# ---------------------------------------------------------------------------
+
+def load_census_state(path: str | Path) -> tuple[str, dict | None]:
+    """Read `docs/legibility/census-state.json` (§7.5, extended with the
+    optional `last_census_done_count` baseline documented in this module's
+    docstring). Three-valued result distinguishing "never censused" from
+    "fail safe":
+
+    - path does not exist -> `("missing", None)`, no warning logged. A
+      project that has never run a census is a normal, expected state, not
+      a degradation.
+    - unreadable / invalid JSON / non-dict top level / unparseable
+      `last_census_at` -> `("malformed", None)` + exactly one WARNING.
+      Callers must fail SAFE (never fire) rather than guess a timestamp.
+    - otherwise -> `("ok", data)`.
+    """
+    path = Path(path)
+    if not path.exists():
+        return "missing", None
+
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+    except (OSError, json.JSONDecodeError) as exc:
+        logger.warning("census state at %s is malformed: %s", path, exc)
+        return "malformed", None
+
+    if not isinstance(data, dict):
+        logger.warning(
+            "census state at %s is malformed: expected a JSON object, got %s",
+            path,
+            type(data).__name__,
+        )
+        return "malformed", None
+
+    last_census_at = data.get("last_census_at")
+    if last_census_at is not None:
+        try:
+            datetime.fromisoformat(last_census_at)
+        except (TypeError, ValueError) as exc:
+            logger.warning(
+                "census state at %s is malformed: unparseable last_census_at %r: %s",
+                path,
+                last_census_at,
+                exc,
+            )
+            return "malformed", None
+
+    return "ok", data
