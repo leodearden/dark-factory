@@ -10,9 +10,18 @@ logic only.
 
 from __future__ import annotations
 
+import types
+from unittest.mock import AsyncMock
+
 from fused_memory.models.enums import MemoryCategory, SourceStore
 from fused_memory.models.memory import MemoryResult
-from fused_memory.server.near_duplicate_guard import find_near_duplicate_memory
+from fused_memory.server.near_duplicate_guard import (
+    _DEFAULT_NEAR_DUP_GUARD_ENABLED,
+    _DEFAULT_NEAR_DUP_THRESHOLD,
+    find_near_duplicate_memory,
+    resolve_near_dup_guard_enabled,
+    resolve_near_dup_threshold,
+)
 
 
 def _result(
@@ -89,3 +98,63 @@ class TestFindNearDuplicateMemory:
         match = find_near_duplicate_memory(results, 0.92)
         assert match is not None
         assert match.id == 'm2'
+
+
+def _memory_service_with_reconciliation(**fields) -> types.SimpleNamespace:
+    return types.SimpleNamespace(
+        config=types.SimpleNamespace(reconciliation=types.SimpleNamespace(**fields))
+    )
+
+
+class TestResolveNearDupThreshold:
+    """Defensive config resolver: real float from config, else module default."""
+
+    def test_returns_config_value_when_present_and_valid(self):
+        memory_service = _memory_service_with_reconciliation(
+            procedural_knowledge_near_dup_threshold=0.80
+        )
+        assert resolve_near_dup_threshold(memory_service) == 0.80
+
+    def test_falls_back_to_default_when_config_attr_missing(self):
+        memory_service = types.SimpleNamespace()
+        assert resolve_near_dup_threshold(memory_service) == _DEFAULT_NEAR_DUP_THRESHOLD
+
+    def test_falls_back_to_default_when_reconciliation_is_none(self):
+        memory_service = types.SimpleNamespace(config=types.SimpleNamespace(reconciliation=None))
+        assert resolve_near_dup_threshold(memory_service) == _DEFAULT_NEAR_DUP_THRESHOLD
+
+    def test_falls_back_to_default_when_value_is_non_numeric(self):
+        # An unspecced AsyncMock's attribute chain yields Mock instances, not
+        # floats — the resolver must not propagate one as a threshold.
+        memory_service = AsyncMock()
+        assert resolve_near_dup_threshold(memory_service) == _DEFAULT_NEAR_DUP_THRESHOLD
+
+    def test_falls_back_to_default_when_value_is_bool(self):
+        memory_service = _memory_service_with_reconciliation(
+            procedural_knowledge_near_dup_threshold=True
+        )
+        assert resolve_near_dup_threshold(memory_service) == _DEFAULT_NEAR_DUP_THRESHOLD
+
+
+class TestResolveNearDupGuardEnabled:
+    """Defensive config resolver: real bool from config, else module default."""
+
+    def test_returns_config_value_when_present_and_valid(self):
+        memory_service = _memory_service_with_reconciliation(
+            procedural_knowledge_near_dup_guard_enabled=False
+        )
+        assert resolve_near_dup_guard_enabled(memory_service) is False
+
+    def test_falls_back_to_default_when_config_attr_missing(self):
+        memory_service = types.SimpleNamespace()
+        assert resolve_near_dup_guard_enabled(memory_service) == _DEFAULT_NEAR_DUP_GUARD_ENABLED
+
+    def test_falls_back_to_default_when_reconciliation_is_none(self):
+        memory_service = types.SimpleNamespace(config=types.SimpleNamespace(reconciliation=None))
+        assert resolve_near_dup_guard_enabled(memory_service) == _DEFAULT_NEAR_DUP_GUARD_ENABLED
+
+    def test_falls_back_to_default_when_value_is_non_bool(self):
+        # An unspecced AsyncMock's attribute chain yields Mock instances, not
+        # bools — the resolver must not propagate one as the enable flag.
+        memory_service = AsyncMock()
+        assert resolve_near_dup_guard_enabled(memory_service) == _DEFAULT_NEAR_DUP_GUARD_ENABLED

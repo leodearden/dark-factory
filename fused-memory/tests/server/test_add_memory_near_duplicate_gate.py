@@ -7,6 +7,7 @@ server._tool_manager.call_tool('add_memory', {...}).
 
 from __future__ import annotations
 
+import types
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
@@ -31,6 +32,18 @@ def _near_duplicate_result(
         category=category,
         source_store=SourceStore.mem0,
         relevance_score=score,
+    )
+
+
+def _configure_reconciliation(mock_service: AsyncMock, **fields) -> None:
+    """Stand in for memory_service.config.reconciliation with a plain namespace.
+
+    A plain types.SimpleNamespace (rather than more AsyncMock/MagicMock
+    attribute chaining) means the resolver sees real bool/float values for
+    exactly the fields under test.
+    """
+    mock_service.config = types.SimpleNamespace(
+        reconciliation=types.SimpleNamespace(**fields)
     )
 
 
@@ -217,3 +230,95 @@ class TestAddMemoryNearDuplicateGate:
             f'Empty search results must not block the write; got: {result!r}'
         )
         mock_service.add_memory.assert_called_once()
+
+
+class TestAddMemoryNearDuplicateGateConfig:
+    """The guard's enable flag and threshold are read from config at call time."""
+
+    @pytest.mark.asyncio
+    async def test_guard_disabled_via_config_allows_write(self):
+        """procedural_knowledge_near_dup_guard_enabled=False skips the guard entirely."""
+        mock_service = AsyncMock()
+        _configure_reconciliation(
+            mock_service,
+            procedural_knowledge_near_dup_guard_enabled=False,
+            procedural_knowledge_near_dup_threshold=0.92,
+        )
+        mock_service.search.return_value = [_near_duplicate_result(id_='m1', score=0.97)]
+        _configure_pass_through_add_memory(mock_service)
+        server = create_mcp_server(mock_service)
+
+        result = await server._tool_manager.call_tool(
+            'add_memory',
+            {
+                'content': _CONTENT,
+                'category': 'procedural_knowledge',
+                'agent_id': 'claude-interactive',
+                'project_id': _PROJECT_ID,
+            },
+        )
+
+        assert result.get('error') != 'procedural_knowledge_near_duplicate_write_blocked', (
+            f'Guard must be skipped when disabled via config; got: {result!r}'
+        )
+        mock_service.add_memory.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_configured_threshold_above_match_score_allows_write(self):
+        """A configured threshold above the top match score allows the write.
+
+        Default threshold (0.92) would block a 0.97 match, so this only
+        passes if the configured 0.99 threshold is actually being read.
+        """
+        mock_service = AsyncMock()
+        _configure_reconciliation(
+            mock_service,
+            procedural_knowledge_near_dup_guard_enabled=True,
+            procedural_knowledge_near_dup_threshold=0.99,
+        )
+        mock_service.search.return_value = [_near_duplicate_result(id_='m1', score=0.97)]
+        _configure_pass_through_add_memory(mock_service)
+        server = create_mcp_server(mock_service)
+
+        result = await server._tool_manager.call_tool(
+            'add_memory',
+            {
+                'content': _CONTENT,
+                'category': 'procedural_knowledge',
+                'agent_id': 'claude-interactive',
+                'project_id': _PROJECT_ID,
+            },
+        )
+
+        assert result.get('error') != 'procedural_knowledge_near_duplicate_write_blocked', (
+            f'Configured threshold above the match score must allow the write; got: {result!r}'
+        )
+        mock_service.add_memory.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_configured_threshold_below_match_score_blocks_write(self):
+        """Guard enabled with an explicit threshold still blocks a qualifying match."""
+        mock_service = AsyncMock()
+        _configure_reconciliation(
+            mock_service,
+            procedural_knowledge_near_dup_guard_enabled=True,
+            procedural_knowledge_near_dup_threshold=0.90,
+        )
+        mock_service.search.return_value = [_near_duplicate_result(id_='m1', score=0.95)]
+        server = create_mcp_server(mock_service)
+
+        result = await server._tool_manager.call_tool(
+            'add_memory',
+            {
+                'content': _CONTENT,
+                'category': 'procedural_knowledge',
+                'agent_id': 'claude-interactive',
+                'project_id': _PROJECT_ID,
+            },
+        )
+
+        assert result.get('error') == 'procedural_knowledge_near_duplicate_write_blocked', (
+            f'Expected near-duplicate block, got: {result!r}'
+        )
+        assert result.get('threshold') == 0.90, f'Expected configured threshold echoed, got: {result!r}'
+        mock_service.add_memory.assert_not_called()
