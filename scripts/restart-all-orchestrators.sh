@@ -206,7 +206,11 @@ drain_gate() {
     #   heartbeating -- e.g. crashed mid-merge) is NOT held for the rest of
     #   that busy grace: it drops into the same bounded drain_await_fresh
     #   handling as the top-level stale/absent case, since a dead unit
-    #   isn't actually merging.
+    #   isn't actually merging.  If it resumes busy afterward, deferral
+    #   keeps counting from when the unit FIRST went busy, not from that
+    #   resumption -- the force-fire deadline is anchored once, so a
+    #   busy<->stale/absent oscillation can't defer the forced restart
+    #   indefinitely.
     local unit="$1"
     local verdict start_secs elapsed
     verdict="$(drain_await_fresh "$unit")"
@@ -243,10 +247,14 @@ drain_gate() {
                 echo "resuming restart of ${unit}: drained"
                 return 0
             elif [[ "$verdict" == "busy" ]]; then
-                # Alive and merging again -- resume deferring with a fresh
-                # busy grace window.
+                # Alive and merging again -- resume deferring.  start_secs
+                # is intentionally NOT reset here: the force-fire deadline
+                # is anchored once, from when this unit first went busy, so
+                # a busy<->stale/absent oscillation can't keep deferring
+                # the forced restart indefinitely (the elapsed check at the
+                # top of the loop measures total wall-clock since draining
+                # began, not since the most recent busy transition).
                 echo "deferring restart of ${unit}: mid-merge (grace $((FORCE_FIRE_AFTER_SECS / 60))m)"
-                start_secs=$SECONDS
             else
                 echo "proceeding with restart of ${unit}: heartbeat ${verdict} after ${DRAIN_UNKNOWN_GRACE_SECS}s grace"
                 return 0
