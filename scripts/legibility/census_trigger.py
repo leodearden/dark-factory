@@ -37,6 +37,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -351,3 +352,102 @@ def load_census_config(project_root: str | Path) -> CensusConfig:
         return CensusConfig()
 
     return CensusConfig.from_mapping(census_block)
+
+
+# ---------------------------------------------------------------------------
+# compute_tasks_landed + default_status_fetcher — fail-safe done-count delta
+# ---------------------------------------------------------------------------
+
+class StatusFetchUnavailable(Exception):
+    """Raised by a status_fetcher (in particular `default_status_fetcher`'s
+    returned callable) when the get_statuses done-count cannot be obtained
+    for any reason -- missing dependency, no network, a non-2xx response, a
+    malformed payload. A dedicated exception (rather than letting an
+    arbitrary one propagate) lets `compute_tasks_landed` -- and any other
+    caller -- catch fetch failures deterministically."""
+
+
+def compute_tasks_landed(*, state: dict | None, status_fetcher) -> int | None:
+    """Fail-SAFE "tasks done since last census" delta for condition (b).
+
+    Returns `None` (never fires condition (b)) plus exactly one WARNING
+    when: `status_fetcher` is `None`; `state` has no `last_census_done_count`
+    baseline (§7.5 extended read contract, see module docstring); or calling
+    `status_fetcher` raises for any reason. Otherwise counts `"done"` values
+    in the fetcher's wrapped `{"statuses": {id: status}}` envelope (matching
+    get_statuses' real shape -- fused-memory/src/fused_memory/server/tools.py:2665)
+    and returns `current_done - baseline`.
+    """
+    baseline = (state or {}).get("last_census_done_count")
+    if baseline is None:
+        logger.warning(
+            "tasks-landed: no last_census_done_count baseline in census state "
+            "-- condition (b) fails safe (no fire)"
+        )
+        return None
+
+    if status_fetcher is None:
+        logger.warning(
+            "tasks-landed: no status_fetcher configured -- condition (b) fails safe (no fire)"
+        )
+        return None
+
+    try:
+        payload = status_fetcher()
+    except Exception as exc:  # noqa: BLE001 - any fetch failure must fail safe
+        logger.warning("tasks-landed: status_fetcher failed: %s", exc)
+        return None
+
+    statuses = payload.get("statuses") or {} if isinstance(payload, dict) else {}
+    current_done = sum(1 for status in statuses.values() if status == "done")
+    return current_done - baseline
+
+
+_FUSED_MEMORY_URL_ENV_VAR = "FUSED_MEMORY_MCP_URL"
+_DEFAULT_FUSED_MEMORY_URL = "http://localhost:8002"  # dashboard.config.DEFAULT_FUSED_MEMORY_URLS[0]
+
+
+def default_status_fetcher(project_root: str | Path):
+    """Return a zero-arg best-effort get_statuses caller for the standalone
+    `evaluate` CLI (task ε injects the real MCP-backed fetcher for the
+    nightly trickle instead -- see module docstring). Reads the fused-memory
+    MCP endpoint from the `FUSED_MEMORY_MCP_URL` env var, defaulting to
+    `http://localhost:8002`. `httpx` is imported lazily since it is not a
+    scripts/ dependency (see module docstring); that ImportError, along with
+    any network/HTTP/parse failure, is wrapped as `StatusFetchUnavailable`
+    so callers can catch fetch failures deterministically rather than a bare
+    Exception.
+    """
+    project_root_str = str(project_root)
+    url = os.environ.get(_FUSED_MEMORY_URL_ENV_VAR, _DEFAULT_FUSED_MEMORY_URL)
+
+    def _fetch() -> dict:
+        try:
+            import httpx
+        except ImportError as exc:
+            raise StatusFetchUnavailable("httpx is not installed") from exc
+
+        try:
+            response = httpx.post(
+                f"{url}/mcp",
+                json={
+                    "jsonrpc": "2.0",
+                    "id": 1,
+                    "method": "tools/call",
+                    "params": {
+                        "name": "get_statuses",
+                        "arguments": {"project_root": project_root_str},
+                    },
+                },
+                timeout=10.0,
+            )
+            response.raise_for_status()
+            return response.json()
+        except StatusFetchUnavailable:
+            raise
+        except Exception as exc:  # noqa: BLE001 - any failure must fail safe
+            raise StatusFetchUnavailable(
+                f"get_statuses unreachable at {url}: {exc}"
+            ) from exc
+
+    return _fetch
