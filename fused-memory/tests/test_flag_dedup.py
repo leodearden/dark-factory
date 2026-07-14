@@ -2158,6 +2158,54 @@ class TestWriteSuppressionRecordPreWriteCheck:
         assert kwargs['metadata']['flag_types'] == ['b']
         assert result.memory_ids == ['mirror-id']
 
+    # -----------------------------------------------------------------
+    # Composite-existing-row decomposition (task 2503 step-7/step-8)
+    # -----------------------------------------------------------------
+
+    @pytest.mark.asyncio
+    async def test_composite_wildcard_row_covers_single_id_blanket_write(
+        self, ledger_memory_service
+    ):
+        """(d) A COMPOSITE blanket/wildcard row (task_id='2405,540,544')
+        covers a subsequent single-id blanket write for one of its
+        components -- no new row for the single id, mirror not called."""
+        from fused_memory.reconciliation.flag_dedup import write_suppression_record
+
+        await _seed_suppression(ledger_memory_service.recon_ledger, 'p', '2405,540,544', '')
+
+        result = await write_suppression_record(ledger_memory_service, project_id='p', task_id=544)
+
+        rows = await ledger_memory_service.recon_ledger.list_suppressions('p')
+        assert len(rows) == 1
+        assert rows[0].task_id == '2405,540,544'
+
+        ledger_memory_service.add_memory.assert_not_called()
+        assert result == AddMemoryResponse(memory_ids=[])
+
+    @pytest.mark.asyncio
+    async def test_composite_scoped_row_covers_single_id_family_variant_write(
+        self, ledger_memory_service
+    ):
+        """(e) A COMPOSITE scoped row (task_id='2405,544',
+        flag_type='missing_deliverable') covers a subsequent single-id write
+        for a FAMILY VARIANT of that flag_type for one of its components."""
+        from fused_memory.reconciliation.flag_dedup import write_suppression_record
+
+        await _seed_suppression(
+            ledger_memory_service.recon_ledger, 'p', '2405,544', 'missing_deliverable'
+        )
+
+        result = await write_suppression_record(
+            ledger_memory_service, project_id='p', task_id=544, flag_types=['deliverable_missing']
+        )
+
+        rows = await ledger_memory_service.recon_ledger.list_suppressions('p')
+        assert len(rows) == 1
+        assert rows[0].task_id == '2405,544'
+
+        ledger_memory_service.add_memory.assert_not_called()
+        assert result == AddMemoryResponse(memory_ids=[])
+
 
 def test_write_suppression_record_importable_from_canonical_path():
     """Smoke test: write_suppression_record is importable from the path stage1.py advertises.
