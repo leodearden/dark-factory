@@ -32,11 +32,14 @@ from shared.task_transitions import (
     outcome_allows_status,  # noqa: F401  re-export for W9-γ
 )
 
+from orchestrator.unblock_types import BlockClass
 from orchestrator.verify_categories import FailureCategory
 
 __all__ = [
     "STATE_TO_STATUS",
+    "BlockDisposition",
     "IllegalTransition",
+    "RequeueKind",
     "StewardBudgetExhausted",
     "StewardInterrupted",
     "StewardOutcome",
@@ -110,6 +113,53 @@ class TerminalReport:
     detail: str
     category: FailureCategory | None
     blocked_from_phase: WorkflowState | None = None
+
+
+class RequeueKind(enum.Enum):
+    """The outcome-kind a classified failure resolves to in ``_drive()``.
+
+    The 3 values ``classify_failure`` (below) maps every ladder exception
+    onto, replacing the exception-type-keyed except-clause dispatch with a
+    disposition-table lookup: REQUEUE (WarmLaneRequeue and its subclasses),
+    BLOCK (everything else in the ladder — cap/budget/verify-infra/OSError/
+    worktree-conflict/generic), and CANCEL (reserved for future use; the
+    SetTaskStatusRejected/TerminalExitRejection cancel/terminal-exit clause
+    is NOT table-driven — see W9-ε's design decisions — so no ladder
+    exception maps here today).
+    """
+
+    REQUEUE = 'requeue'
+    BLOCK = 'block'
+    CANCEL = 'cancel'
+
+
+@dataclass(frozen=True)
+class BlockDisposition:
+    """The disposition ``classify_failure`` resolves a failure exception to.
+
+    A single, table-driven replacement for the hand-written per-exception
+    decisions that used to live inline in ``TaskWorkflow._drive()``'s
+    exception ladder (escalate_to_human, block-vs-requeue, requeue-cap
+    accounting, and the dry-run ``BlockClass``) — and, per BD-1, the same
+    disposition metadata the four independent ``AllAccountsCappedException``
+    catch sites (workflow.py/steward.py/review_checkpoint.py/
+    dry_run_unblock.py) now consult instead of hand-writing their own.
+
+    ``category`` is the ``verify_classify.classify_failure`` 12-value
+    output domain (:class:`FailureCategory`) — a DISTINCT concept from the
+    escalation-taxonomy string (``'infra_issue'``/``'wip_conflict'``/
+    ``'task_failure'``) ``_mark_blocked`` separately accepts as its
+    ``category=`` parameter. Every ladder exception is a non-verify-check
+    failure, so this is always :attr:`FailureCategory.NONE` today — see
+    this task's design decisions.
+    """
+
+    category: FailureCategory
+    escalate_to_human: bool
+    requeue_kind: RequeueKind
+    counts_against_requeue_cap: bool
+    reason_prefix: str
+    block_class: BlockClass
 
 
 @dataclass(frozen=True)

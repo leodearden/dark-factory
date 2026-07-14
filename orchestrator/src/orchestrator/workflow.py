@@ -93,7 +93,9 @@ from orchestrator.verify import (
 )
 from orchestrator.verify_categories import PREEXISTING_BREAK_SKIP_CATEGORIES, FailureCategory
 from orchestrator.workflow_types import (  # noqa: F401  re-export shim
+    BlockDisposition,
     IllegalTransition,
+    RequeueKind,
     StewardBudgetExhausted,
     StewardInterrupted,
     StewardOutcome,
