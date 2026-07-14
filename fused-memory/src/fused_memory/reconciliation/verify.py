@@ -45,7 +45,6 @@ class CodebaseVerifier:
         claim: str,
         context: str = '',
         scope_hints: list[str] | None = None,
-        project_id: str = '',
     ) -> VerificationResult:
         """Verify a factual claim against the codebase."""
         codebase_root = self.codebase_root
