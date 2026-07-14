@@ -2203,6 +2203,116 @@ class TestMergeRequestDedup:
 
 
 # ---------------------------------------------------------------------------
+# TestMergeRequestWorkflowVerifyEmission — step-1/3 (2411): verified_green
+# ---------------------------------------------------------------------------
+# merge_request(verified_green=True) emits EventType.workflow_verify so the
+# merge-skew classifier's I5 branch-green fact (merge_disposition.
+# _branch_pre_merge_verify_green, keyed by task_id, reads only data['passed'])
+# can source from non-orchestrator submission pathways (/merge-queue,
+# /unblock, /do) — mirroring the orchestrator's own emission at
+# workflow.py:1724-1733 (task 2381 alpha / 2383 beta).
+
+
+async def _call_merge_cancel(server, **kwargs: Any) -> dict[str, Any]:
+    """Invoke the merge_cancel MCP tool directly."""
+    tool = await server.get_tool('merge_cancel')
+    return await tool.fn(**kwargs)
+
+
+@pytest.mark.asyncio
+class TestMergeRequestWorkflowVerifyEmission:
+    """merge_request(verified_green=True) emits a workflow_verify row."""
+
+    def _make_orch_config(self, tmp_path: Path):
+        """Create a minimal OrchestratorConfig without a git remote."""
+        from orchestrator.config import OrchestratorConfig  # type: ignore[reportMissingImports]
+        return OrchestratorConfig(project_root=tmp_path)
+
+    async def test_verified_green_emits_workflow_verify(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """A fresh dispatch with verified_green=True emits EXACTLY ONE
+        workflow_verify row shaped like the orchestrator's own emission:
+        task_id-keyed, data['passed'] is True, data['branch'] the full
+        queued ref, data['base_sha'] the best-effort dispatch-time merge base.
+
+        RED (pre step-2): merge_request has no verified_green parameter, so
+        this call raises TypeError; even once accepted, no row is emitted.
+        """
+        import asyncio
+        from unittest.mock import AsyncMock
+
+        import orchestrator.merge_queue as orchestrator_merge_queue  # type: ignore[reportMissingImports]
+
+        tip = 't' * 40
+        sentinel_base_sha = 's' * 40
+        monkeypatch.setattr(
+            orchestrator_merge_queue,
+            '_resolve_dispatch_time_merge_base',
+            AsyncMock(return_value=sentinel_base_sha),
+        )
+
+        stub_git = types.SimpleNamespace(
+            resolve_branch_sha=AsyncMock(
+                side_effect=lambda b: tip if b == 'task/777' else None
+            ),
+            # False so the already_merged fast-path is NOT taken — the
+            # request must reach the fresh-dispatch/coalesce path below.
+            is_ancestor=AsyncMock(return_value=False),
+            find_inflight_merge_worktree=AsyncMock(return_value=None),
+        )
+        stub_harness = types.SimpleNamespace(
+            git_ops=stub_git, _merge_worker=None, _terminal_retention=None,
+        )
+        esc_queue = EscalationQueue(tmp_path / 'esc')
+        orch_config = self._make_orch_config(tmp_path / 'repo')
+        event_store = EventStore(tmp_path / 'runs.db', 'run-wf-verify')
+
+        server = create_server(
+            esc_queue,
+            harness=stub_harness,
+            orch_config=orch_config,
+            event_store=event_store,
+            merge_queue=asyncio.Queue(),
+        )
+
+        result = await _call_merge_request(
+            server,
+            task_id='777',
+            branch='777',
+            worktree=str(tmp_path / 'wt'),
+            description='',
+            verified_green=True,
+            wait_secs=0,
+        )
+
+        try:
+            rows = event_store.fetch_events_by_type(EventType.workflow_verify)
+            assert len(rows) == 1, (
+                f'Expected exactly one workflow_verify row, got: {rows}'
+            )
+            row = rows[0]
+            assert row['task_id'] == '777', f'Expected task_id 777, got: {row}'
+            assert row['data']['passed'] is True, (
+                f"Expected data['passed'] is True, got: {row}"
+            )
+            assert row['data']['branch'] == 'task/777', (
+                f"Expected data['branch']=='task/777', got: {row}"
+            )
+            assert row['data']['base_sha'] == sentinel_base_sha, (
+                f"Expected data['base_sha']=={sentinel_base_sha!r}, got: {row}"
+            )
+        finally:
+            # Fresh dispatch with no worker draining the queue leaves the
+            # waiter future pending — cancel it via merge_cancel (mirrors the
+            # never_future.cancel() cleanup in TestMergeRequestDedup).
+            assert result.get('status') == 'queued', (
+                f'Expected status queued, got: {result}'
+            )
+            await _call_merge_cancel(server, request_id=result['request_id'])
+
+
+# ---------------------------------------------------------------------------
 # TestGetMergeQueue — live merge-queue snapshot via get_merge_queue MCP tool
 # ---------------------------------------------------------------------------
 
