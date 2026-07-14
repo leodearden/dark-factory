@@ -164,7 +164,22 @@ logger = logging.getLogger(__name__)
 
 
 class _SuppressionMetadata(TypedDict):
-    """Producer-side contract: ``task_id`` is pinned to ``int``.
+    """Producer-side contract: ``task_id`` is pinned to ``str`` (task 2454).
+
+    A str-typed ``task_id`` makes the Mem0 mirror queryable via
+    ``count_memories_by_metadata(filters={'task_id': '<str>'})`` — an
+    int-typed value would false-negative against a string filter. String
+    also matches the ``recon_ledger`` table (``task_id`` column is TEXT)
+    and the established 2405-thread precedent.
+
+    This per-id queryability claim holds for SINGLE-id records only. For a
+    composite comma-joined ``task_id`` (e.g. ``'2405,540,544'``), the mirror
+    stores the full joined string as ``metadata.task_id``, so a
+    per-component query (``filters={'task_id': '544'}``) does NOT match it —
+    only an exact-composite-string query does. Per-component matching for a
+    composite record is provided solely by the ``recon_ledger`` read path
+    (``filter_suppressed``, via :func:`_decompose_suppression_task_id`), not
+    by the Mem0 mirror.
 
     Reader (``filter_suppressed``) tolerates and str-coerces both ``int``
     and ``str`` task_ids for backward compat with legacy hand-authored
@@ -179,7 +194,7 @@ class _SuppressionMetadata(TypedDict):
     """
 
     kind: Literal['stage1_flag_suppression']
-    task_id: int
+    task_id: str
     flag_types: NotRequired[list[str]]
 
 
@@ -196,6 +211,26 @@ class SuppressionPayload(TypedDict):
     metadata: _SuppressionMetadata
 
 
+def _decompose_suppression_task_id(tid: str) -> list[str]:
+    """Split a ``stage1_flag_suppression`` ledger row's ``task_id`` into its
+    component id string(s) (task 2454).
+
+    A single-id row (e.g. ``'42'``) decomposes to a one-element list
+    (``['42']``). A composite comma-joined row (e.g. ``'2405,540,544'``, a
+    signature spanning multiple projects) decomposes to one entry per id,
+    each stripped of surrounding whitespace. Falsy/empty input (or input
+    that decomposes to only blank components, e.g. ``','``) returns ``[]``.
+
+    Only the SUPPRESSION row's task_id is ever decomposed by this helper --
+    a flag's own task_id is never split (see :func:`filter_suppressed`).
+
+    Pure, sync, no I/O.
+    """
+    if not tid:
+        return []
+    return [p.strip() for p in tid.split(',') if p.strip()]
+
+
 async def filter_suppressed(
     memory_service: Any,
     project_id: str,
@@ -209,13 +244,24 @@ async def filter_suppressed(
     ``task_id -> (wildcard | flag_types)`` map from the returned rows'
     ``task_id``/``flag_type`` columns:
 
+    - A row's ``task_id`` is DECOMPOSED into its component id(s) via
+      :func:`_decompose_suppression_task_id` before indexing (task 2454): a
+      single-id row (e.g. ``'42'``) decomposes to one component, while a
+      composite comma-joined row (e.g. ``'2405,540,544'``, mixing ids across
+      projects) decomposes to one entry per id -- so a single-component flag
+      lookup (e.g. ``task_id=544``) matches even though the ledger row is a
+      composite. Read-time decomposition (rather than write-time fan-out)
+      also matches any pre-existing/opaque composite row. Only the
+      SUPPRESSION row's task_id is decomposed -- the flag-side task_id
+      (below) is never split.
     - A row with ``flag_type == ''`` is a WILDCARD -- it blanket-suppresses
-      every flag_type for that task_id.
+      every flag_type for each of its component task_id(s).
     - A row with a non-empty ``flag_type`` is SCOPED -- it suppresses only
-      that (task_id, flag_type) pair.
-    - When both a scoped and a wildcard row exist for the same task_id
-      (in either row order), the wildcard wins -- union semantics, since a
-      blanket suppression cannot be narrowed by a more specific record.
+      that (component task_id, flag_type) pair.
+    - When both a scoped and a wildcard row (or component) exist for the
+      same task_id (in either row order), the wildcard wins -- union
+      semantics, since a blanket suppression cannot be narrowed by a more
+      specific record.
 
     A flag is dropped iff its ``task_id`` has a wildcard entry, or has a
     scoped entry whose set contains the flag's (str-coerced) ``flag_type``.
@@ -224,9 +270,10 @@ async def filter_suppressed(
     remaining flags are returned unchanged so they can proceed through the
     signature-dedup loop.
 
-    Rows with ``task_id == ''`` are skipped when building the map (a
-    degenerate/malformed suppression with no task target) -- this mirrors
-    the old producer-side guard that rejected a missing/empty ``task_id``.
+    Rows with ``task_id == ''`` (or which decompose to no components) are
+    skipped when building the map (a degenerate/malformed suppression with
+    no task target) -- this mirrors the old producer-side guard that
+    rejected a missing/empty ``task_id``.
 
     Conservative pass-through (zero I/O beyond the attribute check itself):
     when *flags* is empty, or ``memory_service.recon_ledger`` is unset/
@@ -264,27 +311,29 @@ async def filter_suppressed(
         return flags
 
     # task_id (str) -> None (wildcard/blanket) | set[str] (scoped flag_types
-    # allowlist).  See docstring for wildcard-wins union semantics.
+    # allowlist).  See docstring for wildcard-wins union semantics.  Each
+    # row's task_id is decomposed into its component id(s) (task 2454) so a
+    # composite comma-joined row indexes every component.
     suppressed: dict[str, set[str] | None] = {}
     for row in rows:
-        tid_str = row.task_id
-        if not tid_str:
+        if not row.task_id:
             continue  # degenerate row with no task target; can never match a kept flag
 
-        if tid_str in suppressed and suppressed[tid_str] is None:
-            continue  # already wildcard for this task_id; cannot be narrowed further
+        for tid_str in _decompose_suppression_task_id(row.task_id):
+            if tid_str in suppressed and suppressed[tid_str] is None:
+                continue  # already wildcard for this task_id; cannot be narrowed further
 
-        if not row.flag_type:
-            # Wildcard/blanket row -> overrides any scoped entry accumulated
-            # so far for this task_id (union semantics: wildcard wins).
-            suppressed[tid_str] = None
-            continue
+            if not row.flag_type:
+                # Wildcard/blanket row -> overrides any scoped entry accumulated
+                # so far for this task_id (union semantics: wildcard wins).
+                suppressed[tid_str] = None
+                continue
 
-        scoped = suppressed.get(tid_str)
-        if not isinstance(scoped, set):
-            scoped = set()
-            suppressed[tid_str] = scoped
-        scoped.add(row.flag_type)
+            scoped = suppressed.get(tid_str)
+            if not isinstance(scoped, set):
+                scoped = set()
+                suppressed[tid_str] = scoped
+            scoped.add(row.flag_type)
 
     def _keep(f: dict[str, Any]) -> bool:
         flag_tid = f.get('task_id')
@@ -679,8 +728,21 @@ def build_suppression_payload(
     Returns a :class:`SuppressionPayload` with ``content``, ``category``, and
     ``metadata`` fields matching the canonical schema documented in the
     ``## Flag Suppression Check`` section of ``STAGE1_SYSTEM_PROMPT``.
-    ``task_id`` is coerced to ``int`` so the producer always pins the integer
-    type regardless of how the caller obtained the id.
+    ``task_id`` accepts either a single numeric id (``int`` or numeric
+    ``str``) OR a comma-joined composite of numeric ids (e.g.
+    ``'2405,540,544'``, mixing ids across projects) — both are canonicalized
+    to a ``str`` (task 2454) so the producer always pins a string type
+    regardless of how the caller obtained the id.  A composite's components
+    are stripped of surrounding whitespace (``'2405, 540'`` canonicalizes to
+    ``'2405,540'``). String canonicalization keeps the Mem0 mirror queryable
+    via ``count_memories_by_metadata`` with an exact string filter — for a
+    SINGLE-id ``task_id`` this means per-id queryability
+    (``filters={'task_id': '544'}``). For a composite ``task_id`` the mirror
+    stores the full joined string, so only an exact-composite-string query
+    matches it; a per-component query does not. Per-component matching for a
+    composite record is provided solely by the ``recon_ledger`` read path
+    (:func:`filter_suppressed`, via :func:`_decompose_suppression_task_id`),
+    not by the Mem0 mirror.
 
     ``project_id`` is intentionally absent — it is a write-time concern that
     must be passed separately to ``memory_service.add_memory``, keeping this
@@ -697,17 +759,27 @@ def build_suppression_payload(
 
     Canonical schema (Mem0, observations_and_summaries category):
       - ``metadata.kind = "stage1_flag_suppression"``
-      - ``metadata.task_id = <N>`` (int — coerced by this function)
+      - ``metadata.task_id = "<N>"`` or ``"<N>,<N>,..."`` (str — canonicalized
+        by this function)
       - ``metadata.flag_types = [<str>, ...]`` (optional; sorted-unique)
       - ``content = "STAGE 1 FLAG SUPPRESSION task_id=<N>"``
     """
     try:
-        tid = int(task_id)
+        tid = str(int(task_id))
     except (TypeError, ValueError) as e:
-        raise ValueError(
-            f'build_suppression_payload: task_id must be an int or numeric '
-            f'string, got {task_id!r}'
-        ) from e
+        # Composite fallback: a comma-joined list of numeric ids (e.g. a
+        # cross-project signature like '2405,540,544'). Mirrors the
+        # numeric/comma-joined validation convention in
+        # _is_valid_marker_task_id. Only reached when the single-id int()
+        # fast-path above fails.
+        components = [c.strip() for c in task_id.split(',')] if isinstance(task_id, str) else []
+        if len(components) >= 2 and all(c.isdigit() for c in components):
+            tid = ','.join(components)
+        else:
+            raise ValueError(
+                f'build_suppression_payload: task_id must be an int or numeric '
+                f'string, got {task_id!r}'
+            ) from e
     metadata: _SuppressionMetadata = {
         'kind': 'stage1_flag_suppression',
         'task_id': tid,
@@ -732,8 +804,8 @@ async def write_suppression_record(
     """Upsert a ``stage1_flag_suppression`` record to the ledger for *task_id*.
 
     Builds the canonical payload via :func:`build_suppression_payload` (which
-    coerces *task_id* to ``int``, validates it, and pins ``metadata.kind``/
-    ``content``) then upserts one ``recon_ledger`` row per entry in
+    validates *task_id* is numeric and canonicalizes it to ``str``, and pins
+    ``metadata.kind``/``content``) then upserts one ``recon_ledger`` row per entry in
     ``(flag_types or [''])`` to ``memory_service.recon_ledger`` — ``''`` is
     the blanket/wildcard ``flag_type`` (suppresses every flag_type for
     *task_id*); a non-empty ``flag_types`` list upserts one SCOPED row per
@@ -769,7 +841,7 @@ async def write_suppression_record(
 
     Canonical schema (Mem0 mirror, observations_and_summaries category):
       - ``metadata.kind = "stage1_flag_suppression"``
-      - ``metadata.task_id = <N>`` (int — coerced by build_suppression_payload)
+      - ``metadata.task_id = "<N>"`` (str — canonicalized by build_suppression_payload)
       - ``metadata.flag_types = [<str>, ...]`` (optional; sorted-unique)
       - ``content = "STAGE 1 FLAG SUPPRESSION task_id=<N>"``
 

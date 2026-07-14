@@ -956,6 +956,166 @@ class TestFilterSuppressed:
 
 
 # ---------------------------------------------------------------------------
+# RED (task 2454 step-5): filter_suppressed must DECOMPOSE a composite
+# comma-joined suppression row's task_id so a single-component flag lookup
+# matches. Today the whole row.task_id string is one opaque map key, so a
+# lookup on any single component (e.g. flag task_id=544 against a row
+# task_id='2405,540,544') never matches.
+# ---------------------------------------------------------------------------
+
+
+class TestFilterSuppressedComposite:
+    """filter_suppressed decomposes a composite/comma-joined suppression
+    row's task_id, indexing EACH component into the suppressed map (per
+    plan.json design decision: read-time decomposition, not write-time
+    fan-out) — so a single-component flag lookup matches any component of a
+    pre-existing or newly-written composite row."""
+
+    @pytest.mark.asyncio
+    async def test_two_id_composite_drops_both_components_keeps_unrelated(
+        self, ledger_memory_service
+    ):
+        """(a) A 2-id blanket composite row drops flags for BOTH components,
+        keeping an unrelated task_id."""
+        from fused_memory.reconciliation.flag_dedup import filter_suppressed
+
+        await _seed_suppression(ledger_memory_service.recon_ledger, 'p', '2405,544', '')
+
+        flags = [
+            {'task_id': 2405, 'flag_type': 'missing_deliverable'},
+            {'task_id': 544, 'flag_type': 'stale_metadata'},
+            {'task_id': 99, 'flag_type': 'missing_deliverable'},
+        ]
+        result = await filter_suppressed(ledger_memory_service, 'p', flags)
+        assert result == [{'task_id': 99, 'flag_type': 'missing_deliverable'}]
+
+    @pytest.mark.asyncio
+    async def test_three_id_composite_drops_each_component(self, ledger_memory_service):
+        """(b) A 3-id blanket composite row drops each of its 3 components."""
+        from fused_memory.reconciliation.flag_dedup import filter_suppressed
+
+        await _seed_suppression(ledger_memory_service.recon_ledger, 'p', '2405,2417,2425', '')
+
+        flags = [
+            {'task_id': 2405, 'flag_type': 'x'},
+            {'task_id': 2417, 'flag_type': 'y'},
+            {'task_id': 2425, 'flag_type': 'z'},
+            {'task_id': 99, 'flag_type': 'x'},
+        ]
+        result = await filter_suppressed(ledger_memory_service, 'p', flags)
+        assert result == [{'task_id': 99, 'flag_type': 'x'}]
+
+    @pytest.mark.asyncio
+    async def test_cross_project_mixed_composite_drops_each_component(
+        self, ledger_memory_service
+    ):
+        """(c) A cross-project mixed composite ('2405,540,544', a
+        dark_factory id mixed with autopilot_video ids) drops flags matching
+        any of its components, including the one a single-project flag-side
+        lookup cares about (544)."""
+        from fused_memory.reconciliation.flag_dedup import filter_suppressed
+
+        await _seed_suppression(ledger_memory_service.recon_ledger, 'p', '2405,540,544', '')
+
+        flags = [
+            {'task_id': 544, 'flag_type': 'missing_deliverable'},
+            {'task_id': 540, 'flag_type': 'missing_deliverable'},
+            {'task_id': 2405, 'flag_type': 'missing_deliverable'},
+            {'task_id': 99, 'flag_type': 'missing_deliverable'},
+        ]
+        result = await filter_suppressed(ledger_memory_service, 'p', flags)
+        assert result == [{'task_id': 99, 'flag_type': 'missing_deliverable'}]
+
+    @pytest.mark.asyncio
+    async def test_int_vs_str_flag_parity_on_composite_component(
+        self, ledger_memory_service
+    ):
+        """(d) A flag's task_id may be int or str; both must match the same
+        composite component (544) of row task_id='2405,540,544'."""
+        from fused_memory.reconciliation.flag_dedup import filter_suppressed
+
+        await _seed_suppression(ledger_memory_service.recon_ledger, 'p', '2405,540,544', '')
+
+        flags = [
+            {'task_id': 544, 'flag_type': 'a'},
+            {'task_id': '544', 'flag_type': 'b'},
+        ]
+        result = await filter_suppressed(ledger_memory_service, 'p', flags)
+        assert result == []
+
+    @pytest.mark.asyncio
+    async def test_scoped_composite_row_drops_only_matching_flag_type(
+        self, ledger_memory_service
+    ):
+        """(e) A SCOPED composite row drops only that flag_type for a
+        component, keeping a different flag_type for the same component."""
+        from fused_memory.reconciliation.flag_dedup import filter_suppressed
+
+        await _seed_suppression(
+            ledger_memory_service.recon_ledger, 'p', '2405,544', 'human_review_required_deferred'
+        )
+
+        suppressed_flag = {'task_id': 544, 'flag_type': 'human_review_required_deferred'}
+        surviving_flag = {'task_id': 544, 'flag_type': 'live_workflow_recurrence_counter_needed'}
+        result = await filter_suppressed(
+            ledger_memory_service, 'p', [suppressed_flag, surviving_flag]
+        )
+        assert result == [surviving_flag]
+
+    @pytest.mark.asyncio
+    async def test_end_to_end_write_suppression_record_composite_then_filter(
+        self, ledger_memory_service
+    ):
+        """End-to-end: write_suppression_record persists a composite id;
+        filter_suppressed then drops a flag matching one of its components."""
+        from fused_memory.reconciliation.flag_dedup import (
+            filter_suppressed,
+            write_suppression_record,
+        )
+
+        await write_suppression_record(
+            ledger_memory_service, project_id='p', task_id='2405,540,544'
+        )
+
+        flags = [
+            {'task_id': 544, 'flag_type': 'missing_deliverable'},
+            {'task_id': 99, 'flag_type': 'missing_deliverable'},
+        ]
+        result = await filter_suppressed(ledger_memory_service, 'p', flags)
+        assert result == [{'task_id': 99, 'flag_type': 'missing_deliverable'}]
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        'degenerate_task_id',
+        [
+            pytest.param(',', id='single-comma'),
+            pytest.param(', ,', id='blank-components'),
+        ],
+    )
+    async def test_degenerate_composite_row_decomposes_to_no_components_is_skipped(
+        self, ledger_memory_service, degenerate_task_id
+    ):
+        """A row whose task_id decomposes to NO components (e.g. ',' or
+        ', ,') is truthy -- it passes the ``if not row.task_id`` guard at
+        flag_dedup.py:310 -- but must still be skipped when building the
+        suppressed map, since _decompose_suppression_task_id returns [] for
+        it and contributes no entries. All input flags must pass through
+        unchanged; this pins the guard's interaction with the
+        empty-decomposition branch, which the well-formed 2-/3-id composite
+        tests above never exercise."""
+        from fused_memory.reconciliation.flag_dedup import filter_suppressed
+
+        await _seed_suppression(ledger_memory_service.recon_ledger, 'p', degenerate_task_id, '')
+
+        flags = [
+            {'task_id': 452, 'flag_type': 'missing_deliverable'},
+            {'task_id': 99, 'flag_type': 'stale_metadata'},
+        ]
+        result = await filter_suppressed(ledger_memory_service, 'p', flags)
+        assert result == flags
+
+
+# ---------------------------------------------------------------------------
 # task-1186 step-5 — integration: dedup_flags calls filter_suppressed FIRST
 # ---------------------------------------------------------------------------
 
@@ -1106,19 +1266,19 @@ class TestBuildSuppressionPayload:
     _CANONICAL = {
         'content': 'STAGE 1 FLAG SUPPRESSION task_id=42',
         'category': 'observations_and_summaries',
-        'metadata': {'kind': 'stage1_flag_suppression', 'task_id': 42},
+        'metadata': {'kind': 'stage1_flag_suppression', 'task_id': '42'},
     }
 
     def test_full_payload_for_int_task_id(self):
         """Full payload dict equals the canonical schema literal for int input.
 
         Implicitly asserts: content, category, metadata.kind, metadata.task_id
-        (int), and absence of project_id (not in canonical schema).
+        (str — task 2454), and absence of project_id (not in canonical schema).
         """
         assert build_suppression_payload(42) == self._CANONICAL
 
     def test_coerces_str_task_id_to_int(self):
-        """str task_id is coerced to int; resulting payload equals canonical schema."""
+        """str task_id is validated numeric then canonicalized to str; resulting payload equals canonical schema."""
         assert build_suppression_payload('42') == self._CANONICAL
 
     def test_invalid_task_id_raises_descriptive_value_error(self):
@@ -1166,17 +1326,17 @@ class TestBuildSuppressionPayloadFlagTypes:
         assert result == {
             'content': 'STAGE 1 FLAG SUPPRESSION task_id=42',
             'category': 'observations_and_summaries',
-            'metadata': {'kind': 'stage1_flag_suppression', 'task_id': 42},
+            'metadata': {'kind': 'stage1_flag_suppression', 'task_id': '42'},
         }
         assert 'flag_types' not in result['metadata']
 
     def test_scoped_call_includes_flag_types_in_metadata(self):
-        """(b) Non-empty flag_types produces metadata.task_id (int-coerced) AND
+        """(b) Non-empty flag_types produces metadata.task_id (str-canonicalized) AND
         metadata.flag_types (list[str]); content is still the canonical
         non-empty 'STAGE 1 FLAG SUPPRESSION task_id=452...' string."""
         result = build_suppression_payload(452, flag_types=['human_review_required_deferred'])
-        assert result['metadata']['task_id'] == 452
-        assert isinstance(result['metadata']['task_id'], int)
+        assert result['metadata']['task_id'] == '452'
+        assert isinstance(result['metadata']['task_id'], str)
         # .get() (not ['flag_types']) — the key is NotRequired in _SuppressionMetadata,
         # so a direct subscript trips pyright's reportTypedDictNotRequiredAccess.
         assert result['metadata'].get('flag_types') == ['human_review_required_deferred']
@@ -1197,6 +1357,134 @@ class TestBuildSuppressionPayloadFlagTypes:
         """(d) flag_types=[] or None yields the legacy no-flag_types shape."""
         result = build_suppression_payload(452, flag_types=flag_types)
         assert 'flag_types' not in result['metadata']
+
+
+# ---------------------------------------------------------------------------
+# RED (task 2454 step-1): metadata.task_id must be STRING-typed, not int.
+#
+# build_suppression_payload currently coerces task_id to int (and
+# _SuppressionMetadata.task_id is pinned to int), so the Mem0 mirror written
+# by write_suppression_record carries an INTEGER metadata.task_id. An
+# external count_memories_by_metadata(filters={'task_id': '544'}) (string)
+# false-negatives against that int-typed record. This class pins the fixed
+# contract: metadata.task_id is a str, identically for int and str input.
+# ---------------------------------------------------------------------------
+
+
+class TestSuppressionTaskIdStringType:
+    """build_suppression_payload / write_suppression_record must produce a
+    STRING-typed metadata.task_id, identically for int and str input
+    (int-vs-string write parity)."""
+
+    def test_int_input_produces_str_task_id(self):
+        """build_suppression_payload(544) yields a str-typed metadata.task_id == '544'."""
+        result = build_suppression_payload(544)
+        assert result['metadata']['task_id'] == '544'
+        assert isinstance(result['metadata']['task_id'], str)
+
+    def test_str_input_produces_str_task_id(self):
+        """build_suppression_payload('544') yields the identical str-typed task_id."""
+        result = build_suppression_payload('544')
+        assert result['metadata']['task_id'] == '544'
+        assert isinstance(result['metadata']['task_id'], str)
+
+    def test_content_string_unchanged_for_int_and_str_input(self):
+        """content renders identically for int and str input — the str flip
+        must not change the human-readable content string."""
+        assert (
+            build_suppression_payload(544)['content']
+            == 'STAGE 1 FLAG SUPPRESSION task_id=544'
+        )
+        assert (
+            build_suppression_payload('544')['content']
+            == 'STAGE 1 FLAG SUPPRESSION task_id=544'
+        )
+
+    @pytest.mark.asyncio
+    async def test_producer_mirror_metadata_task_id_is_str(self, ledger_memory_service):
+        """write_suppression_record's add_memory mirror kwargs carry a
+        str-typed metadata.task_id for int task_id input (producer-path
+        parity) -- closes the count_memories_by_metadata false-negative gap."""
+        from fused_memory.reconciliation.flag_dedup import write_suppression_record
+
+        await write_suppression_record(ledger_memory_service, project_id='p', task_id=42)
+
+        kwargs = ledger_memory_service.add_memory.call_args.kwargs
+        assert kwargs['metadata']['task_id'] == '42'
+        assert isinstance(kwargs['metadata']['task_id'], str)
+
+
+# ---------------------------------------------------------------------------
+# RED (task 2454 step-3): build_suppression_payload / write_suppression_record
+# must ACCEPT a composite comma-joined numeric task_id (e.g. a mixed
+# cross-project signature like '2405,540,544'), canonicalizing to a single
+# stripped, comma-joined string -- while still rejecting genuinely-invalid
+# input with the existing descriptive, chained-cause ValueError.
+# ---------------------------------------------------------------------------
+
+
+class TestBuildSuppressionPayloadComposite:
+    """build_suppression_payload / write_suppression_record accept a
+    comma-joined composite task_id (a single ledger row spanning multiple
+    numeric ids), so the read side can later decompose it per-component."""
+
+    def test_composite_task_id_preserved_as_str(self):
+        """A 3-component composite id canonicalizes to itself (str)."""
+        result = build_suppression_payload('2405,540,544')
+        assert result['metadata']['task_id'] == '2405,540,544'
+        assert isinstance(result['metadata']['task_id'], str)
+
+    def test_composite_task_id_content_string(self):
+        """content renders the full composite id."""
+        result = build_suppression_payload('2405,540,544')
+        assert result['content'] == 'STAGE 1 FLAG SUPPRESSION task_id=2405,540,544'
+
+    def test_composite_task_id_whitespace_canonicalizes(self):
+        """A whitespace-padded composite id ('2405, 540') canonicalizes to
+        the stripped, comma-joined form ('2405,540') -- no embedded spaces
+        survive into metadata.task_id or content."""
+        result = build_suppression_payload('2405, 540')
+        assert result['metadata']['task_id'] == '2405,540'
+        assert result['content'] == 'STAGE 1 FLAG SUPPRESSION task_id=2405,540'
+
+    @pytest.mark.asyncio
+    async def test_write_suppression_record_persists_composite_blanket_row(
+        self, ledger_memory_service
+    ):
+        """write_suppression_record can persist a composite id end-to-end:
+        exactly one blanket ledger row with task_id == '2405,544'."""
+        from fused_memory.reconciliation.flag_dedup import write_suppression_record
+
+        await write_suppression_record(
+            ledger_memory_service, project_id='p', task_id='2405,544'
+        )
+
+        rows = await ledger_memory_service.recon_ledger.list_suppressions('p')
+        assert len(rows) == 1
+        assert rows[0].task_id == '2405,544'
+        assert rows[0].flag_type == ''
+
+    @pytest.mark.parametrize('bad_value', ['abc', '2405,abc'])
+    def test_invalid_input_raises_descriptive_chained_value_error(self, bad_value):
+        """A bare non-numeric string AND a composite with a non-numeric
+        component both still raise a descriptive, chained-cause ValueError
+        (unchanged contract from TestBuildSuppressionPayload)."""
+        with pytest.raises(ValueError) as exc_info:
+            build_suppression_payload(bad_value)
+
+        error_message = str(exc_info.value)
+        assert 'build_suppression_payload' in error_message, (
+            f"Expected 'build_suppression_payload' in error message but got: {error_message!r}"
+        )
+        assert bad_value in error_message, (
+            f'Expected bad value {bad_value!r} in error message but got: {error_message!r}'
+        )
+        assert exc_info.value.__cause__ is not None, (
+            'Expected __cause__ to be set (from e chaining) but it was None'
+        )
+        assert isinstance(exc_info.value.__cause__, (ValueError, TypeError)), (
+            f'Expected __cause__ to be ValueError or TypeError but got: {type(exc_info.value.__cause__)}'
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -1333,7 +1621,7 @@ async def test_suppression_record_round_trips_via_producer():
 
     Canonical schema (four-line contract):
       1. metadata.kind == 'stage1_flag_suppression'
-      2. metadata.task_id == 42 (int)
+      2. metadata.task_id == '42' (str)
       3. content == 'STAGE 1 FLAG SUPPRESSION task_id=42'
       4. category == 'observations_and_summaries'
 
@@ -1367,8 +1655,8 @@ async def test_suppression_record_round_trips_via_producer():
         f'metadata.kind mismatch: {results[0].metadata}'
     )
 
-    # (6) task_id is stored as int by the producer
-    assert results[0].metadata['task_id'] == raw_task_id, (
+    # (6) task_id is stored as str by the producer (task 2454)
+    assert results[0].metadata['task_id'] == str(raw_task_id), (
         f'metadata.task_id mismatch: {results[0].metadata["task_id"]!r}'
     )
 
@@ -1483,7 +1771,7 @@ class TestWriteSuppressionRecord:
         ledger_memory_service.add_memory.assert_called_once_with(
             content='STAGE 1 FLAG SUPPRESSION task_id=42',
             category='observations_and_summaries',
-            metadata={'kind': 'stage1_flag_suppression', 'task_id': 42},
+            metadata={'kind': 'stage1_flag_suppression', 'task_id': '42'},
             project_id='autopilot_video',
             causation_id=None,
             _source='stage1_flag_suppression',
@@ -1504,15 +1792,15 @@ class TestWriteSuppressionRecord:
 
     @pytest.mark.asyncio
     async def test_coerces_str_task_id(self, ledger_memory_service):
-        """passing task_id='42' produces mirror metadata.task_id == 42 (int)
-        and a ledger row keyed by the same coerced task_id."""
+        """passing task_id='42' produces mirror metadata.task_id == '42' (str)
+        and a ledger row keyed by the same canonicalized task_id."""
         from fused_memory.reconciliation.flag_dedup import write_suppression_record
 
         await write_suppression_record(ledger_memory_service, project_id='p', task_id='42')
 
         kwargs = ledger_memory_service.add_memory.call_args.kwargs
-        assert kwargs['metadata']['task_id'] == 42
-        assert isinstance(kwargs['metadata']['task_id'], int)
+        assert kwargs['metadata']['task_id'] == '42'
+        assert isinstance(kwargs['metadata']['task_id'], str)
 
         rows = await ledger_memory_service.recon_ledger.list_suppressions('p')
         assert rows[0].task_id == '42'
@@ -1532,7 +1820,7 @@ class TestWriteSuppressionRecord:
         kwargs = ledger_memory_service.add_memory.call_args.kwargs
         assert kwargs['metadata']['flag_types'] == ['human_review_required_deferred']
         assert kwargs['metadata']['kind'] == 'stage1_flag_suppression'
-        assert kwargs['metadata']['task_id'] == 452
+        assert kwargs['metadata']['task_id'] == '452'
 
     @pytest.mark.asyncio
     async def test_omitting_flag_types_produces_legacy_mirror_metadata(

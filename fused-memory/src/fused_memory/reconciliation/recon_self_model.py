@@ -299,7 +299,7 @@ def render_suppression_schema_section() -> str:
         'Canonical suppression record schema (Mem0, observations_and_summaries '
         "category) — the producer's contract read by the Stage 1 post-processor:\n"
         '  - `metadata.kind = "stage1_flag_suppression"`\n'
-        '  - `metadata.task_id = <N>` (int)\n'
+        '  - `metadata.task_id = <N>` (str)\n'
         '  - `metadata.flag_types = [<str>, ...]` (OPTIONAL scoping allowlist)\n'
         '  - content: `"STAGE 1 FLAG SUPPRESSION task_id=<N>"`\n\n'
         'Scoped vs. legacy/blanket suppression: a record WITH a non-empty '
