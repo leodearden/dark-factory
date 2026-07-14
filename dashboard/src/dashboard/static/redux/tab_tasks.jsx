@@ -5,6 +5,7 @@ const { PALETTE: CP_T } = window.DF_CHARTS;
 const DF_T = window.DF_DATA;
 const { useState: uS_T, useEffect: uE_T, useRef: uR_T, useLayoutEffect: uLE_T, useMemo: uM_T } = React;
 const { computeTiers, partitionComponents, orderRows, computeNeighborhood, focusSubset } = window.DF_GRAPH_LAYOUT;
+const { prdTitle, aggregatePrdStatus, summarizePrdMembers, groupTasksByPrd, orderPrdGroups } = window.DF_PRD_GROUPING;
 
 // Persisted-state hook (same shape as elsewhere)
 function tasksPersistedState(key, def) {
@@ -203,6 +204,33 @@ function ProjectTaskGraph({ filtered, selectedId, focusMode, focusAnchorId, onSe
   return <TaskGraph tasks={graphTasks} selectedId={selectedId} onSelect={onSelect} onEnterFocus={onEnterFocus} />;
 }
 
+// Per-project "group by PRD" render: buckets the project's filtered tasks
+// into PRD boxes (groupTasksByPrd) and lays out each box's induced subgraph
+// via the existing per-box TaskGraph machinery (which itself calls
+// computeTiers/partitionComponents/orderRows). Kept as its own component
+// (not an inline computation inside the projects.map() callback below) for
+// the same Rules-of-Hooks reason as ProjectTaskGraph above — one consistent
+// useMemo per mounted project instance.
+function ProjectPrdGroups({ filtered, selectedId, onSelect, onEnterFocus }) {
+  const groups = uM_T(() => groupTasksByPrd(filtered), [filtered]);
+  return (
+    <div className="prd-groups">
+      {groups.map(g => (
+        <div key={g.noPrd ? '__no_prd__' : g.prd} className="prd-box">
+          <div className="prd-box-head">
+            <span className="prd-box-title" title={g.noPrd ? undefined : g.prd}>
+              {g.noPrd ? 'No PRD' : prdTitle(g.prd)}
+            </span>
+          </div>
+          <div className="prd-box-body">
+            <TaskGraph tasks={g.tasks} selectedId={selectedId} onSelect={onSelect} onEnterFocus={onEnterFocus} />
+          </div>
+        </div>
+      ))}
+    </div>
+  );
+}
+
 function fmtAge(t) {
   if (t.status === 'done')             return t.completed ? window.DF_SHELL.timeago(t.completed) : '—';
   if (t.status === 'pending')          return 'unstarted';
@@ -361,6 +389,12 @@ function TasksTab({ projectFilter, search }) {
   const [openMap, setOpenMap] = tasksPersistedState('df.tasksOpen', {});
   const toggle = (id) => setOpenMap(m => ({ ...m, [id]: !m[id] }));
 
+  // Per-project "group by PRD" view toggle, persisted (same per-project-id
+  // map shape as openMap). Key absent/'flat' -> today's ungrouped view;
+  // 'prd' -> the grouped-by-PRD view.
+  const [groupByPrdMap, setGroupByPrdMap] = tasksPersistedState('df.tasksGroupByPrd', {});
+  const setGroupByPrd = (id, v) => setGroupByPrdMap(m => ({ ...m, [id]: v }));
+
   // Selected task (single, across all projects)
   const [selectedId, setSelectedId] = uS_T(null);
 
@@ -476,6 +510,7 @@ function TasksTab({ projectFilter, search }) {
                 : (_fallbackDone >= 50 ? '50+' : _fallbackDone),
             };
             const isOpen = openMap[p.id] !== false; // default-open
+            const groupByPrd = groupByPrdMap[p.id] === 'prd';
             const summary = (
               <>
                 <span className="pip"><span className="pip-dot" style={{ background: CP_T.accent }}></span>{counts.active} active</span>
@@ -484,11 +519,22 @@ function TasksTab({ projectFilter, search }) {
                 <span className="mono" style={{ color: 'var(--fg-3)', fontSize: 10 }}>{filtered.length}/{counts.total} shown</span>
               </>
             );
+            const summaryRight = (
+              <span onClick={(e) => e.stopPropagation()}>
+                <SEG_T options={[{ value: 'flat', label: 'list' }, { value: 'prd', label: 'by PRD' }]}
+                       value={groupByPrd ? 'prd' : 'flat'}
+                       onChange={(v) => setGroupByPrd(p.id, v)} />
+              </span>
+            );
 
             return (
-              <PG_T key={p.id} id={p.id} label={p.id} open={isOpen} onToggle={() => toggle(p.id)} summary={summary}>
-                <ProjectTaskGraph filtered={filtered} selectedId={selectedId} focusMode={focusMode}
-                                  focusAnchorId={focusAnchorId} onSelect={setSelectedId} onEnterFocus={enterFocus} />
+              <PG_T key={p.id} id={p.id} label={p.id} open={isOpen} onToggle={() => toggle(p.id)}
+                    summary={summary} summaryRight={summaryRight}>
+                {groupByPrd
+                  ? <ProjectPrdGroups filtered={filtered} selectedId={selectedId}
+                                      onSelect={setSelectedId} onEnterFocus={enterFocus} />
+                  : <ProjectTaskGraph filtered={filtered} selectedId={selectedId} focusMode={focusMode}
+                                      focusAnchorId={focusAnchorId} onSelect={setSelectedId} onEnterFocus={enterFocus} />}
               </PG_T>
             );
           })}
