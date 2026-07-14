@@ -48,6 +48,7 @@ from fused_memory.reconciliation.task_filter import (
     is_count_snapshot,
     is_mixed_temporal_framing,
 )
+from fused_memory.server.manifest_stamping import stamp_capability_manifests
 from fused_memory.server.tool_errors import mcp_tool_errors
 from fused_memory.services.memory_service import MemoryService
 from fused_memory.utils.validation import (
@@ -3430,6 +3431,25 @@ def create_mcp_server(
             # so a task whose flip failed merely becomes findable early; it
             # is never reported with an incorrect status.
             await task_interceptor.index_committed_tasks(list(tasks_data), project_root)
+            # Best-effort/never-raising (PRD γ, task 2578) — stamps real
+            # task_ids + copies MECHANICAL delivered_checks for any batch
+            # task carrying prd_path/prd_task_label metadata. Reuses the
+            # already-fetched tasks_data (no extra reads). Only attaches the
+            # report key when a sidecar actually exists on disk, so a batch
+            # with no capability-manifest involvement gets a byte-identical
+            # legacy response. agent_id is intentionally omitted: unlike most
+            # write tools in this module, commit_planning takes no
+            # agent_id/ctx parameter of its own — the set_task_status call
+            # above this one is likewise un-attributed — so passing None
+            # here is parity with that call, not a missed wiring.
+            manifest_report = await stamp_capability_manifests(
+                project_root=project_root,
+                ids=ids,
+                tasks_data=list(tasks_data),
+                task_interceptor=task_interceptor,
+            )
+            if manifest_report is not None and isinstance(result, dict):
+                result['manifest_stamping'] = manifest_report
         return result
 
     @mcp.tool()
