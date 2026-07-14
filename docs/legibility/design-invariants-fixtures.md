@@ -244,3 +244,24 @@ ALLOWED_EVENT_TYPES = ["task.created", "task.done", "task.blocked", "escalation.
 ```
 
 ## Rehearsal verdict table
+
+Walked 2026-07-14 against `skills/prd/references/gates.md` §"G7 — Design
+invariants pass" and `skills/review/references/phase2-architecture.md`
+"Step 5.5: Design-invariants audit", both as landed on `main`.
+
+| Fixture ID | Shape | Invariant | Expected slug | Verdict (as-landed text yields) | Match |
+|---|---|---|---|---|---|
+| `INV-1-PRD` | PRD | INV-1 contracts-machine-checked | `contracts-machine-checked` | G7's trigger-shape list fires on "a contract in prose" / "a tool without a declared filter/envelope convention": the row states the routing rule lives only in the plan row and a runbook → `flag: contracts-machine-checked` | Y |
+| `INV-1-CODE` | CODE | INV-1 contracts-machine-checked | `contracts-machine-checked` | Step 5.5's audit applies INV-1's checkable question ("does a new tool/agent surface declare its envelope where callers see it, or is it discovered by failure?") to the undeclared `metadata.get("priority_boost")` special-case → `invariant_findings` entry with `invariant="contracts-machine-checked"` | Y |
+| `INV-2-PRD` | PRD | INV-2 structured-facts-at-failure | `structured-facts-at-failure` | G7's trigger-shape list fires on "a log-scrape of emitter-known facts": the escalation handler regexes a printed line instead of receiving structured data → `flag: structured-facts-at-failure` | Y |
+| `INV-2-CODE` | CODE | INV-2 structured-facts-at-failure | `structured-facts-at-failure` | Step 5.5's audit applies INV-2's checkable question ("must any consumer parse logs/prose to recover a fact the emitter knew?") to `handle_failure`'s regex over `run_step`'s known values → `invariant_findings` entry with `invariant="structured-facts-at-failure"` | Y |
+| `INV-3-PRD` | PRD | INV-3 corroborate-before-acting | `corroborate-before-acting` | G7's trigger-shape list fires on "action on snapshot state without corroboration": the sweep deletes off a cached snapshot read with no live re-check → `flag: corroborate-before-acting` | Y |
+| `INV-3-CODE` | CODE | INV-3 corroborate-before-acting | `corroborate-before-acting` | Step 5.5's audit applies INV-3's checkable question ("does this feature act on state that could have changed since read? where exactly is the re-check?") to `remove_task` firing straight off `snapshot.cached_rows` → `invariant_findings` entry with `invariant="corroborate-before-acting"` | Y |
+| `INV-4-PRD` | PRD | INV-4 storm-escape-required | `storm-escape-required` | G7's trigger-shape list fires on "adds a detector/suppressor/fallback without a storm escape" — this fixture is the PRD brief's own exemplar → `flag: storm-escape-required` | Y |
+| `INV-4-CODE` | CODE | INV-4 storm-escape-required | `storm-escape-required` | Step 5.5's audit applies INV-4's checkable question ("if this feature's fallback fires 100× in an hour, who hears about it, and via what counter?") to `_suppressed_count` incrementing with no threshold check → `invariant_findings` entry with `invariant="storm-escape-required"` | Y |
+| `INV-5-PRD` | PRD | INV-5 no-lockstep-duplication | `no-lockstep-duplication` | G7's trigger-shape list fires on "duplicated lock-step logic": the row hand-copies `ALLOWED_EVENT_TYPES` instead of importing the canonical list → `flag: no-lockstep-duplication` | Y |
+| `INV-5-CODE` | CODE | INV-5 no-lockstep-duplication | `no-lockstep-duplication` | Step 5.5's audit applies INV-5's checkable question ("does this feature copy logic, constants, or prompt text that must stay in agreement with another site?") to `webhooks/src/webhooks/validator.py`'s hand-copied list → `invariant_findings` entry with `invariant="no-lockstep-duplication"` | Y |
+
+**Result: 10/10 match.** Every seeded violation flags with the correct
+slug under the as-landed G7 and Step 5.5 text — acceptance met, no
+rehearsal miss.
