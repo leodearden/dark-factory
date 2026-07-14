@@ -18,10 +18,12 @@ Task β of the confusion-reduction PRD (plans/confusion-reduction-prd.md
 """
 from __future__ import annotations
 
+import argparse
 import json
+import sys
 from collections.abc import Iterator, Sequence
 from dataclasses import dataclass
-from datetime import date
+from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -129,3 +131,127 @@ class SessionRecord:
     cwd: str
     date: date
     size_bytes: int
+
+
+def _first_timestamp_date(path: Path) -> date | None:
+    """Return the UTC date of the first valid ISO-8601 ``timestamp`` line in *path*.
+
+    Returns None when the file is unreadable, has no timestamp line, or
+    every timestamp line is unparseable — callers fall back to file mtime.
+    """
+    try:
+        for record in _iter_json_lines(path):
+            ts = record.get('timestamp')
+            if not isinstance(ts, str) or not ts:
+                continue
+            try:
+                parsed = datetime.fromisoformat(ts)
+            except ValueError:
+                continue
+            if parsed.tzinfo is None:
+                parsed = parsed.replace(tzinfo=UTC)
+            return parsed.astimezone(UTC).date()
+    except OSError:
+        return None
+    return None
+
+
+def enumerate_sessions(
+    projects_root: Path | str,
+    cwd_prefixes: Sequence[str],
+    target_date: date,
+) -> list[SessionRecord]:
+    """Enumerate every session transcript for *target_date* across all matching encoded dirs.
+
+    Aggregates across every directory :func:`iter_project_dirs` yields
+    (never assumes one dir per project — a project's agents span many
+    encodings). For each ``*.jsonl`` file: skip non-existent/unreadable/
+    empty files, confirm membership via the session's real ``cwd``
+    (:func:`session_cwd` + :func:`is_member`), derive the session's UTC
+    date from its first timestamp line (falling back to file mtime when no
+    timestamp is present), and keep only sessions matching *target_date*.
+    """
+    root = Path(projects_root)
+    records: list[SessionRecord] = []
+    for project_dir in iter_project_dirs(root, cwd_prefixes):
+        for session_path in sorted(project_dir.glob('*.jsonl')):
+            try:
+                size_bytes = session_path.stat().st_size
+            except OSError:
+                continue
+            if size_bytes == 0:
+                continue
+
+            cwd = session_cwd(session_path)
+            if cwd is None or not is_member(cwd, cwd_prefixes):
+                continue
+
+            session_date = _first_timestamp_date(session_path)
+            if session_date is None:
+                try:
+                    session_date = datetime.fromtimestamp(
+                        session_path.stat().st_mtime, tz=UTC
+                    ).date()
+                except OSError:
+                    continue
+            if session_date != target_date:
+                continue
+
+            records.append(
+                SessionRecord(
+                    path=session_path,
+                    encoded_dir=project_dir.name,
+                    cwd=cwd,
+                    date=session_date,
+                    size_bytes=size_bytes,
+                )
+            )
+    return records
+
+
+def main(argv: Sequence[str]) -> int:
+    """Thin standalone CLI: list sessions matching cwd_prefixes for a UTC date.
+
+    A debug/inspection entry point for inventory.py alone — the full
+    inventory->score->sample pipeline's CLI acceptance surface is
+    ``sampling.main`` (task 2573 step-18).
+    """
+    parser = argparse.ArgumentParser(
+        description="List legibility sessions matching cwd_prefixes for a given UTC date."
+    )
+    parser.add_argument(
+        '--projects-root',
+        default=str(Path.home() / '.claude' / 'projects'),
+        help='Root of the ~/.claude/projects tree (default: %(default)s)',
+    )
+    parser.add_argument(
+        '--cwd-prefix',
+        dest='cwd_prefixes',
+        action='append',
+        required=True,
+        help='A cwd prefix to match (repeatable).',
+    )
+    parser.add_argument(
+        '--date',
+        default=None,
+        help='UTC date to filter sessions to, YYYY-MM-DD (default: yesterday UTC).',
+    )
+    args = parser.parse_args(argv)
+
+    target_date = (
+        date.fromisoformat(args.date)
+        if args.date
+        else (datetime.now(UTC) - timedelta(days=1)).date()
+    )
+    records = enumerate_sessions(args.projects_root, args.cwd_prefixes, target_date)
+    for record in records:
+        print(
+            f'{record.path}\t{record.encoded_dir}\t{record.cwd}\t'
+            f'{record.date}\t{record.size_bytes}'
+        )
+    return 0
+
+
+if __name__ == '__main__':
+    sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+    sys.exit(main(sys.argv[1:]))
