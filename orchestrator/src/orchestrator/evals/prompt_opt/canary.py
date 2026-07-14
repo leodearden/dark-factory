@@ -148,6 +148,14 @@ def load_window_rows(
     durability pragmas needed, mirroring
     ``reviewer_trial.__main__._fetch_titles`` /
     ``reviewer_trial.mining.mine_fn_candidates``.
+
+    The numeric columns are declared with a schema ``DEFAULT``, but that
+    only applies when a column is *omitted* from an ``INSERT`` — a row can
+    still carry an explicit ``NULL``, and ``run_store.get_task_cost``
+    defensively coerces for exactly this reason (``float(cost_usd or
+    0.0)``). Mirror that idiom here so a ``NULL`` row degrades to ``0``
+    instead of poisoning `compute_window_metrics`'s arithmetic with
+    ``None`` (``None + None`` / ``sum([..., None])`` raise ``TypeError``).
     """
     conn = sqlite3.connect(str(db_path))
     try:
@@ -162,10 +170,10 @@ def load_window_rows(
         return [
             Row(
                 outcome=outcome,
-                cost_usd=cost_usd,
-                steward_cost_usd=steward_cost_usd,
-                review_cycles=review_cycles,
-                verify_attempts=verify_attempts,
+                cost_usd=cost_usd or 0.0,
+                steward_cost_usd=steward_cost_usd or 0.0,
+                review_cycles=review_cycles or 0,
+                verify_attempts=verify_attempts or 0,
             )
             for outcome, cost_usd, steward_cost_usd, review_cycles, verify_attempts in cursor.fetchall()
         ]
@@ -177,8 +185,11 @@ def load_window_rows(
 class CanaryThresholds:
     """Per-metric regression thresholds: a relative tolerance (fraction
     above baseline before flagging a regression) plus an absolute floor
-    (used instead of the relative ratio when a metric's baseline == 0, to
-    avoid dividing by zero on a tiny/zero baseline).
+    that lower-bounds the effective threshold (``max(baseline * (1 +
+    rel_tol), abs_floor)``) — this covers both a zero baseline (the
+    relative term is 0, so the floor alone decides) and a small-but-nonzero
+    baseline, where a bare relative ratio would otherwise carve out a
+    tighter-than-intended threshold and flag noise as a regression.
 
     ``min_samples`` guards against a thin window producing a false
     pass/regress verdict: when either window's ``n_rows`` is below
@@ -212,9 +223,10 @@ class MetricComparison:
     ``delta_abs``/``delta_rel``/``threshold`` are ``None`` and
     ``regressed`` is ``False`` — absence of evidence is not evidence of
     regression. Otherwise ``threshold`` is the absolute cutoff ``post`` was
-    compared against (``baseline * (1 + rel_tol)``, or the metric's
-    ``abs_floor`` when ``baseline == 0``), so ``regressed`` is always
-    exactly ``post > threshold``.
+    compared against (``max(baseline * (1 + rel_tol), abs_floor)`` — the
+    floor lower-bounds the relative term rather than only substituting for
+    it at ``baseline == 0``), so ``regressed`` is always exactly ``post >
+    threshold``.
     """
 
     metric: str
@@ -237,6 +249,17 @@ class CanaryVerdict:
     inspectable) ``comparisons``/``regressed_metrics`` show: a thin window
     must not produce a false pass/regress. ``baseline_n``/``post_n`` carry
     each window's row count through for display/logging.
+
+    That row-count guard does NOT also require done rows: a window can
+    clear ``min_samples`` on total rows while carrying zero ``outcome ==
+    'done'`` rows, in which case ``cost_per_done_task`` is incomparable and
+    ``mean_review_cycles``/``mean_verify_attempts`` fall back to ``0.0``
+    (see `WindowMetrics`/`compute_window_metrics`) — the comparison quietly
+    reduces to ``requeue_rate`` alone rather than tripping
+    ``'insufficient_data'``. ``baseline_n_done``/``post_n_done`` expose each
+    window's done-row count so a caller (the CLI prints a NOTE) can detect
+    and flag that reduced-signal case explicitly instead of it passing
+    silently.
     """
 
     verdict: str
@@ -244,15 +267,21 @@ class CanaryVerdict:
     regressed_metrics: list[str]
     baseline_n: int
     post_n: int
+    baseline_n_done: int
+    post_n_done: int
 
 
 def _compare_metric(
     metric: str, baseline: float | None, post: float | None, rel_tol: float, abs_floor: float,
 ) -> MetricComparison:
     """Compare one metric's baseline/post values under the "higher =
-    regression" rule, applying the absolute-floor branch when
-    ``baseline == 0`` and treating either side being ``None`` as
-    incomparable (never regressed)."""
+    regression" rule. ``abs_floor`` lower-bounds the threshold (``max(
+    baseline * (1 + rel_tol), abs_floor)``) rather than only substituting
+    for it when ``baseline == 0`` — a small-but-nonzero baseline would
+    otherwise carve out a threshold tighter than the documented floor and
+    flag ordinary noise as a regression. ``delta_rel`` stays ``None`` only
+    when ``baseline == 0`` (no relative ratio is defined there). Either
+    side being ``None`` is incomparable (never regressed)."""
     if baseline is None or post is None:
         return MetricComparison(
             metric=metric, baseline=baseline, post=post,
@@ -260,12 +289,8 @@ def _compare_metric(
         )
 
     delta_abs = post - baseline
-    if baseline == 0:
-        threshold = abs_floor
-        delta_rel = None
-    else:
-        threshold = baseline * (1 + rel_tol)
-        delta_rel = delta_abs / baseline
+    delta_rel = None if baseline == 0 else delta_abs / baseline
+    threshold = max(baseline * (1 + rel_tol), abs_floor)
 
     return MetricComparison(
         metric=metric, baseline=baseline, post=post,
@@ -317,6 +342,8 @@ def compare_windows(
         regressed_metrics=regressed_metrics,
         baseline_n=baseline.n_rows,
         post_n=post.n_rows,
+        baseline_n_done=baseline.n_done,
+        post_n_done=post.n_done,
     )
 
 
@@ -343,13 +370,27 @@ def run_canary(
     function needing its own notion of the current time — it is a pure
     function of *deploy_at_iso*/*baseline_days*/*post_days* and whatever
     rows already exist in *db_path*.
+
+    All three window boundaries are derived from a single
+    ``datetime.fromisoformat(deploy_at_iso)`` parse and then re-serialized
+    with the same ``.isoformat()`` call — including the shared
+    baseline/post boundary at *deploy_at* itself. `load_window_rows`
+    compares boundaries against ``completed_at`` lexicographically, so
+    passing the raw, un-normalized *deploy_at_iso* through for that middle
+    boundary (while the start/end boundaries go through
+    ``datetime`` arithmetic + ``.isoformat()``) would let a caller-supplied
+    string in a different but equally-valid ISO-8601 form (e.g. a ``Z``
+    suffix, no offset, or a different microsecond precision than
+    ``datetime.isoformat()`` emits) sort inconsistently with the other two
+    boundaries and silently mis-place rows exactly at the deploy instant.
     """
     deploy_at = datetime.fromisoformat(deploy_at_iso)
+    deploy_at_iso_normalized = deploy_at.isoformat()
     baseline_start_iso = (deploy_at - timedelta(days=baseline_days)).isoformat()
     post_end_iso = (deploy_at + timedelta(days=post_days)).isoformat()
 
-    baseline_rows = load_window_rows(db_path, baseline_start_iso, deploy_at_iso, project_id)
-    post_rows = load_window_rows(db_path, deploy_at_iso, post_end_iso, project_id)
+    baseline_rows = load_window_rows(db_path, baseline_start_iso, deploy_at_iso_normalized, project_id)
+    post_rows = load_window_rows(db_path, deploy_at_iso_normalized, post_end_iso, project_id)
 
     baseline_metrics = compute_window_metrics(baseline_rows)
     post_metrics = compute_window_metrics(post_rows)
