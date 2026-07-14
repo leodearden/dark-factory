@@ -15,6 +15,10 @@ Test coverage:
   step-07/09: run()-level BLOCK / REQUEUE outcome-kind tests
   step-11: _mark_blocked disposition-sourced BlockRecord / TerminalReport.category
   step-13: BD-1 four-cap-site-identity test (boundary row 10)
+
+step-09 note: the ``counts_against_requeue_cap`` policy per warm-lane
+subclass (EXHAUSTED=True, DISK_PRESSURE/HARD_DOWN=False) is already pinned
+by step-03's ``TestClassifyFailureKnownRows`` rows above — not repeated here.
 """
 
 from __future__ import annotations
@@ -470,3 +474,119 @@ class TestRunLevelBlockOutcomeKind:
         assert report.outcome == WorkflowOutcome.BLOCKED
         assert report.category is FailureCategory.NONE
         assert mark_blocked_spy.await_args.kwargs.get('escalate_to_human', False) is False
+
+
+# ---------------------------------------------------------------------------
+# step-09: run()-level REQUEUE outcome-kind tests. The WarmLaneRequeue
+# except-clause's block_reason must be SINGLE-SOURCED from
+# classify_failure(e).reason_prefix, not _drive()'s own independent inline
+# isinstance triage.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestRunLevelRequeueOutcomeKindSingleSourced:
+    """Patches ``classify_failure`` to return a disposition carrying a
+    distinctive ``reason_prefix`` and asserts ``run()``'s REQUEUED
+    ``TerminalReport.reason`` reflects it.
+
+    The un-patched table rows already carry the SAME literal strings
+    ``_drive()``'s pre-W9-ε inline ``isinstance`` triage hard-codes
+    ('warm_lane_pool_exhausted' / 'warm_lane_disk_pressure (transient
+    infra)' / 'warm_lane_pool_hard_down' — see workflow_types._disposition_
+    table), so a plain value-equality assertion against those strings would
+    pass whether or not the clause actually consults the table — it would
+    prove nothing. Patching ``classify_failure`` to return a SENTINEL value
+    the pre-refactor triage cannot possibly produce is what makes "single-
+    sourced from the table" an observable, falsifiable behavior.
+
+    RED today: the ``except WarmLaneRequeue`` clause never calls
+    ``classify_failure`` — it derives ``block_reason`` from its own
+    ``isinstance(e, WarmLanePoolHardDown)/...Exhausted/...`` chain — so
+    patching it has no effect and ``report.reason`` stays the hard-coded
+    literal, not the sentinel. Turns GREEN in step-10.
+    """
+
+    async def _run_forcing_warm_lane_exc(
+        self, tmp_path: Path, monkeypatch, exc: Exception, patched_disposition,
+    ):
+        from test_workflow_warm_lane_requeue import _make_workflow
+
+        wf = _make_workflow(tmp_path=tmp_path)
+        wf.git_ops.create_worktree = AsyncMock(side_effect=exc)
+        mark_blocked = AsyncMock(return_value=WorkflowOutcome.BLOCKED)
+        wf._mark_blocked = mark_blocked  # type: ignore[method-assign]
+        monkeypatch.setattr(
+            'orchestrator.workflow.classify_failure',
+            lambda _e: patched_disposition,
+        )
+
+        report = await wf.run()
+        mark_blocked.assert_not_awaited()
+        return report
+
+    async def test_pool_exhausted_reason_is_single_sourced_from_table(
+        self, tmp_path: Path, monkeypatch,
+    ):
+        from orchestrator.git_ops import WarmLanePoolExhausted
+        from orchestrator.unblock_types import BlockClass
+        from orchestrator.workflow_types import BlockDisposition, RequeueKind
+
+        sentinel = BlockDisposition(
+            category=FailureCategory.NONE,
+            escalate_to_human=False,
+            requeue_kind=RequeueKind.REQUEUE,
+            counts_against_requeue_cap=True,
+            reason_prefix='SENTINEL_pool_exhausted',
+            block_class=BlockClass.AGENT_FAILURE,
+        )
+        report = await self._run_forcing_warm_lane_exc(
+            tmp_path, monkeypatch,
+            WarmLanePoolExhausted('all lanes assigned'), sentinel,
+        )
+        assert report.outcome == WorkflowOutcome.REQUEUED
+        assert report.reason == 'SENTINEL_pool_exhausted'
+
+    async def test_disk_pressure_reason_is_single_sourced_from_table(
+        self, tmp_path: Path, monkeypatch,
+    ):
+        from orchestrator.git_ops import WarmLaneDiskPressure
+        from orchestrator.unblock_types import BlockClass
+        from orchestrator.workflow_types import BlockDisposition, RequeueKind
+
+        sentinel = BlockDisposition(
+            category=FailureCategory.NONE,
+            escalate_to_human=False,
+            requeue_kind=RequeueKind.REQUEUE,
+            counts_against_requeue_cap=False,
+            reason_prefix='SENTINEL_disk_pressure',
+            block_class=BlockClass.AGENT_FAILURE,
+        )
+        report = await self._run_forcing_warm_lane_exc(
+            tmp_path, monkeypatch,
+            WarmLaneDiskPressure('seed exited 75'), sentinel,
+        )
+        assert report.outcome == WorkflowOutcome.REQUEUED
+        assert report.reason == 'SENTINEL_disk_pressure'
+
+    async def test_pool_hard_down_reason_is_single_sourced_from_table(
+        self, tmp_path: Path, monkeypatch,
+    ):
+        from orchestrator.git_ops import WarmLanePoolHardDown
+        from orchestrator.unblock_types import BlockClass
+        from orchestrator.workflow_types import BlockDisposition, RequeueKind
+
+        sentinel = BlockDisposition(
+            category=FailureCategory.NONE,
+            escalate_to_human=False,
+            requeue_kind=RequeueKind.REQUEUE,
+            counts_against_requeue_cap=False,
+            reason_prefix='SENTINEL_hard_down',
+            block_class=BlockClass.AGENT_FAILURE,
+        )
+        report = await self._run_forcing_warm_lane_exc(
+            tmp_path, monkeypatch,
+            WarmLanePoolHardDown('warm base absent'), sentinel,
+        )
+        assert report.outcome == WorkflowOutcome.REQUEUED
+        assert report.reason == 'SENTINEL_hard_down'
