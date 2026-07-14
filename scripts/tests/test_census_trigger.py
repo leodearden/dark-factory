@@ -542,3 +542,58 @@ def test_decide_for_project_row6_malformed_state_no_fire_one_warning(tmp_path, c
 
     assert decision.fire is False
     assert sum(1 for r in caplog.records if r.levelno == logging.WARNING) == 1
+
+
+# ---------------------------------------------------------------------------
+# step-19: RED — CLI `evaluate` subcommand (always exits 0, fail-safe)
+# ---------------------------------------------------------------------------
+
+def test_cli_evaluate_dark_factory_like_project_prints_no_fire_and_exits_0(tmp_path, capsys):
+    # Mirrors the live dark_factory codebook today: candidates: [], no
+    # dated sightings, no census-state.json.
+    _write_codebook(tmp_path)
+
+    exit_code = ct.main(["evaluate", "--project-root", str(tmp_path)])
+
+    captured = capsys.readouterr()
+    assert exit_code == 0
+    assert "DECISION: NO-FIRE" in captured.out
+    assert len(captured.out.strip().splitlines()) > 1  # decision line + >=1 reason line
+
+
+def test_cli_evaluate_fire_inducing_fixture_prints_fire_and_exits_0(tmp_path, capsys):
+    twelve_days_ago = (datetime.now(timezone.utc) - timedelta(days=12)).strftime("%Y-%m-%d")
+    _write_codebook(
+        tmp_path,
+        entries=[
+            {
+                "id": "entry-a",
+                "title": "t",
+                "severity": "low",
+                "status": "open",
+                "origin_phase": "unknown",
+                "manifested_phase": "unknown",
+                "sightings": [_sighting(twelve_days_ago)],
+            }
+        ],
+    )
+
+    exit_code = ct.main(["evaluate", "--project-root", str(tmp_path)])
+
+    captured = capsys.readouterr()
+    assert exit_code == 0
+    assert "DECISION: FIRE" in captured.out
+    assert "max-interval" in captured.out
+
+
+def test_cli_evaluate_malformed_state_never_crashes_and_exits_0(tmp_path, capsys):
+    _write_codebook(tmp_path)
+    legibility_dir = tmp_path / "docs" / "legibility"
+    legibility_dir.mkdir(parents=True, exist_ok=True)
+    (legibility_dir / "census-state.json").write_text("not json{", encoding="utf-8")
+
+    exit_code = ct.main(["evaluate", "--project-root", str(tmp_path)])
+
+    captured = capsys.readouterr()
+    assert exit_code == 0
+    assert "DECISION:" in captured.out
