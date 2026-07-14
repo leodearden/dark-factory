@@ -9774,6 +9774,104 @@ class TestSeedWarmLaneTakesLaneLock:
                 fcntl.flock(lock_fd, fcntl.LOCK_UN)
                 os.close(lock_fd)
 
+    # -----------------------------------------------------------------
+    # Amendment (code review of task 2599): the test above only exercises
+    # the non-symlink `else` branch of _seed_warm_lane, since git_repo /
+    # git_config leave warm_lane_base_target_path as a plain directory. Per
+    # _seed_warm_lane's own D8 docstring, the base is normally a
+    # reify-created SYMLINK to a gen dir, making the symlink branch — which
+    # builds a nested `flock -x <lane_dir>.lock flock -s <gen_dir>.lock
+    # script ...` command — the production-realistic path. A regression
+    # that dropped or reordered the outer lane-lock flock in that nested
+    # form would go undetected by the plain-branch test alone. This variant
+    # closes that gap by pointing warm_lane_base_target_path at a real
+    # target -> .gen.0 symlink (mirrors _make_gendir_base in
+    # test_warm_base_coherence.py) and re-running the same block/release
+    # proof against the resulting nested command.
+    # -----------------------------------------------------------------
+
+    async def test_seed_blocks_until_lane_lock_released_symlink_branch(
+        self, git_config: GitConfig, git_repo: Path,
+    ):
+        base_dir = git_repo / 'bases'
+        base_dir.mkdir()
+        gen_dir = base_dir / '.gen.0'
+        gen_dir.mkdir()
+        (gen_dir / 'sentinel').write_text('gen-dir-content\n')
+        target_symlink = base_dir / 'target'
+        # Relative sibling, matches reify's: ln -sfn .gen.N target
+        target_symlink.symlink_to('.gen.0')
+        # Reader-refcount GC lock file, pre-created by reify alongside the
+        # gen dir (mirrors _make_gendir_base in test_warm_base_coherence.py).
+        (base_dir / '.gen.0.lock').touch()
+
+        config = git_config.model_copy(
+            update={'warm_lane_base_target_dir': str(target_symlink)},
+        )
+        git_ops = GitOps(config, git_repo)
+
+        lane = git_repo / '_lane-1'
+        scripts_dir = lane / 'scripts'
+        scripts_dir.mkdir(parents=True)
+        marker = lane / 'seeded.marker'
+        args_marker = lane / 'seed_args.txt'
+        script = scripts_dir / 'seed-warm-lane.sh'
+        script.write_text(
+            '#!/usr/bin/env bash\n'
+            'set -euo pipefail\n'
+            f'echo "$1" > {args_marker}\n'
+            f'echo seeded > {marker}\n'
+            'exit 0\n'
+        )
+        script.chmod(0o755)
+
+        lock_path = Path(f'{lane}.lock')
+        lock_fd = os.open(str(lock_path), os.O_RDWR | os.O_CREAT, 0o644)
+        fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        lock_held = True
+
+        task = asyncio.create_task(git_ops._seed_warm_lane(lane, '--fresh-checkout'))
+        try:
+            await asyncio.sleep(0.3)
+
+            assert not task.done(), (
+                'symlink branch: _seed_warm_lane must block on the outer '
+                'flock -x <lane_dir>.lock — nested ahead of the inner '
+                'flock -s <gen_dir>.lock — while a concurrent release-thin '
+                'holds it'
+            )
+            assert not marker.exists(), (
+                'seed-warm-lane.sh must not have run yet — _seed_warm_lane '
+                'is still waiting to acquire <lane_dir>.lock'
+            )
+
+            fcntl.flock(lock_fd, fcntl.LOCK_UN)
+            os.close(lock_fd)
+            lock_held = False
+
+            rc = await asyncio.wait_for(task, 10)
+
+            assert rc == 0, (
+                f'_seed_warm_lane must succeed once the lane lock is '
+                f'released, got rc={rc!r}'
+            )
+            assert marker.exists(), (
+                'seed-warm-lane.sh must have run and written the marker '
+                'once _seed_warm_lane acquired <lane_dir>.lock'
+            )
+            assert args_marker.read_text().strip() == str(gen_dir), (
+                'sanity check: the script must have received the RESOLVED '
+                'gen dir as $1, confirming this exercised the symlink '
+                'branch (outer lane lock nested around the inner gen lock), '
+                'not the plain-dir branch'
+            )
+        finally:
+            if not task.done():
+                task.cancel()
+            if lock_held:
+                fcntl.flock(lock_fd, fcntl.LOCK_UN)
+                os.close(lock_fd)
+
 
 # ---------------------------------------------------------------------------
 # Task 2599 (step-3) — end-to-end guard: _seed_warm_lane's new <lane_dir>.lock
