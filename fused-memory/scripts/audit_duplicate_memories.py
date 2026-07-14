@@ -196,7 +196,9 @@ def build_sweep_plan(memories: list[dict], threshold: float = 0.85) -> dict[str,
     groups = find_near_duplicate_memory_groups(candidates, threshold=threshold)
 
     near_duplicate_groups: list[dict[str, Any]] = []
-    delete_candidates: list[str] = []
+    # Mem0/Qdrant point ids can be int or str (ExtendedPointId), so this is
+    # not narrowed to list[str].
+    delete_candidates: list[Any] = []
 
     for group in groups:
         survivor, losers = pick_survivor(group)
@@ -212,3 +214,67 @@ def build_sweep_plan(memories: list[dict], threshold: float = 0.85) -> dict[str,
         'near_duplicate_groups': near_duplicate_groups,
         'delete_candidates': delete_candidates,
     }
+
+
+# ---------------------------------------------------------------------------
+# I/O layer: fetch (thin, mock-tested)
+# ---------------------------------------------------------------------------
+
+# Payload keys tried in order when extracting a Mem0 memory's text content
+# from its scroll_by_metadata() 'metadata' payload dict. Mirrors the Mem0
+# content-key convention documented in prune_recon_cycle_summaries.py
+# (payload key 'data') and memory_service.py's MemoryResult.content (payload
+# key 'memory') -- 'content' is included as a defensive third fallback.
+_CONTENT_KEYS: tuple[str, ...] = ('memory', 'data', 'content')
+
+
+async def fetch_procedural_memories(
+    memory: Any,
+    project_id: str,
+    scan_limit: int = 5000,
+) -> list[dict[str, Any]]:
+    """Enumerate a project's ``procedural_knowledge`` memories from Mem0.
+
+    Calls ``memory.mem0.scroll_by_metadata(scope, {'category':
+    'procedural_knowledge'}, limit=scan_limit)`` and normalises each raw
+    record (``{'id', 'created_at', 'metadata'}``) into ``{'id', 'content',
+    'created_at', 'metadata'}``. Content is extracted from the payload by
+    trying ``_CONTENT_KEYS`` in order, falling back to ``''`` when no key
+    yields a usable value — a record with no extractable content therefore
+    normalises to ``content=''``, which never clusters and is never deleted
+    (safe degradation).
+
+    Args:
+        memory: Live (or mock) MemoryService instance.
+        project_id: Project scope to scan.
+        scan_limit: Maximum number of points to enumerate (passed through to
+            ``scroll_by_metadata``).
+
+    Returns:
+        Normalised memory dicts; ``[]`` for an empty/timed-out scan.
+    """
+    from fused_memory.models.scope import Scope  # noqa: PLC0415
+
+    scope = Scope(project_id=project_id)
+    raw_records = await memory.mem0.scroll_by_metadata(
+        scope, {'category': 'procedural_knowledge'}, limit=scan_limit,
+    )
+    if not raw_records:
+        return []
+
+    normalized: list[dict[str, Any]] = []
+    for record in raw_records:
+        payload = record.get('metadata') or {}
+        content = ''
+        for key in _CONTENT_KEYS:
+            value = payload.get(key)
+            if isinstance(value, str) and value:
+                content = value
+                break
+        normalized.append({
+            'id': record.get('id'),
+            'content': content,
+            'created_at': record.get('created_at'),
+            'metadata': payload,
+        })
+    return normalized
