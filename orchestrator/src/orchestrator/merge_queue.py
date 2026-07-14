@@ -11896,15 +11896,19 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                             duration_ms=_elapsed_ms(item.started_monotonic),
                         )
                         await self._release_or_cleanup(merge_wt, spec_warm=_vr_spec_warm)
-                        if not req.result.done():
-                            req.result.set_result(MergeOutcome(
-                                'blocked',
-                                reason=(
-                                    f'Gate retry limit exhausted after '
-                                    f'{self.MAX_CAS_RETRIES} attempts for task '
-                                    f'{req.task_id}'
-                                ),
-                            ))
+                        # task 2604: route through the unified terminal
+                        # chokepoint so _retire_item fires — a raw
+                        # req.result.set_result() here left the registry entry
+                        # non-terminal in _live_items forever (ghost entry seen
+                        # by _finalizing_head_entry()/snapshot()).
+                        self._resolve_or_drop_abandoned(req, MergeOutcome(
+                            'blocked',
+                            reason=(
+                                f'Gate retry limit exhausted after '
+                                f'{self.MAX_CAS_RETRIES} attempts for task '
+                                f'{req.task_id}'
+                            ),
+                        ))
                         return False
 
                     # I3 (task 1990): replace-only rebuild — dataclasses.replace
@@ -11949,8 +11953,11 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                         cas_retries=self._cas_retries,
                         advanced_sha=adv_outcome.advanced_sha,
                     )
-                    if not req.result.done():
-                        req.result.set_result(outcome)
+                    # task 2604: route through the unified terminal chokepoint
+                    # so _retire_item fires (mirrors the 'advanced' and
+                    # FAIL/skip branches) — a raw set_result() left the registry
+                    # entry non-terminal in _live_items forever.
+                    self._resolve_or_drop_abandoned(req, outcome)
                     return False
 
                 # result == 'cas_failed' — transient, retry with limit
@@ -11967,14 +11974,16 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                     )
                     _emit_merge_attempt(self._event_store, req.task_id, OutcomeKind.cas_exhausted, attempt=total, duration_ms=_elapsed_ms(item.started_monotonic))
                     await self._release_or_cleanup(merge_wt, spec_warm=_vr_spec_warm)
-                    if not req.result.done():
-                        req.result.set_result(MergeOutcome(
-                            'blocked',
-                            reason=(
-                                f'CAS retry limit exhausted after '
-                                f'{self.MAX_CAS_RETRIES} attempts for task {req.task_id}'
-                            ),
-                        ))
+                    # task 2604: route through the unified terminal chokepoint
+                    # so _retire_item fires — a raw set_result() left the
+                    # registry entry non-terminal in _live_items forever.
+                    self._resolve_or_drop_abandoned(req, MergeOutcome(
+                        'blocked',
+                        reason=(
+                            f'CAS retry limit exhausted after '
+                            f'{self.MAX_CAS_RETRIES} attempts for task {req.task_id}'
+                        ),
+                    ))
                     return False
 
                 # Update base_sha to current main for retry.
