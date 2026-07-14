@@ -1791,39 +1791,45 @@ class TaskCurator:
             )
             return PruneResult(skipped=True, reason='empty_live_snapshot')
 
-        client = await self._get_qdrant()
-        collection = self._collection_name(project_id)
-        if not await client.collection_exists(collection):
-            return PruneResult(live=len(live))
+        try:
+            client = await self._get_qdrant()
+            collection = self._collection_name(project_id)
+            if not await client.collection_exists(collection):
+                return PruneResult(live=len(live))
 
-        corpus_ids: list[str] = []
-        offset = None
-        while True:
-            records, offset = await client.scroll(
-                collection_name=collection,
-                limit=256,
-                offset=offset,
-                with_payload=False,
-                with_vectors=False,
+            corpus_ids: list[str] = []
+            offset = None
+            while True:
+                records, offset = await client.scroll(
+                    collection_name=collection,
+                    limit=256,
+                    offset=offset,
+                    with_payload=False,
+                    with_vectors=False,
+                )
+                corpus_ids.extend(str(r.id) for r in records)
+                if offset is None:
+                    break
+
+            live_point_ids = {self._point_id(project_id, tid) for tid in live}
+            orphans = [pid for pid in corpus_ids if pid not in live_point_ids]
+
+            if orphans:
+                from qdrant_client.models import PointIdsList
+
+                await client.delete(
+                    collection_name=collection,
+                    points_selector=PointIdsList(points=orphans),
+                )
+
+            return PruneResult(
+                pruned=len(orphans), corpus_scanned=len(corpus_ids), live=len(live),
             )
-            corpus_ids.extend(str(r.id) for r in records)
-            if offset is None:
-                break
-
-        live_point_ids = {self._point_id(project_id, tid) for tid in live}
-        orphans = [pid for pid in corpus_ids if pid not in live_point_ids]
-
-        if orphans:
-            from qdrant_client.models import PointIdsList
-
-            await client.delete(
-                collection_name=collection,
-                points_selector=PointIdsList(points=orphans),
+        except Exception:
+            logger.warning(
+                'task_curator: prune_orphans failed for %s', project_id, exc_info=True,
             )
-
-        return PruneResult(
-            pruned=len(orphans), corpus_scanned=len(corpus_ids), live=len(live),
-        )
+            return PruneResult(skipped=True, reason='error', live=len(live))
 
     async def close(self) -> None:
         if self._qdrant_client is not None:
