@@ -12,6 +12,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import hashlib
+import inspect
 import logging
 import re
 import uuid
@@ -1475,3 +1476,28 @@ def create_recon_report_server(state: ReconReportState):  # -> FastMCP
         )
 
     return mcp
+
+
+def get_recon_report_tool_signatures() -> dict[str, inspect.Signature]:
+    """Return ``{tool_name: signature}`` for every tool on a throwaway recon_report server.
+
+    Builds a state-backed server via :func:`create_recon_report_server` and reads
+    each registered tool's call signature (task-2559). This is the single place
+    that reaches into FastMCP's tool-manager internals
+    (``mcp._tool_manager._tools[name].fn``) on behalf of tool-guidance generation
+    (see ``reconciliation/prompts/__init__.py``'s ``render_recon_report_tool_guidance``)
+    — centralizing that coupling here means a FastMCP version bump that changes
+    this shape needs a fix in only one place, and callers get an actionable
+    RuntimeError instead of a bare AttributeError deep inside prompt generation.
+    """
+    state = ReconReportState(ttl_seconds=300, clock=lambda: 0.0)
+    mcp = create_recon_report_server(state)
+    try:
+        tools = mcp._tool_manager._tools
+        return {name: inspect.signature(tool.fn) for name, tool in tools.items()}
+    except AttributeError as exc:
+        raise RuntimeError(
+            "FastMCP's tool-manager internals (_tool_manager._tools[name].fn) have "
+            'changed shape; get_recon_report_tool_signatures() needs updating for '
+            'this FastMCP version.'
+        ) from exc
