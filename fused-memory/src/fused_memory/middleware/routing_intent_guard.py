@@ -70,7 +70,9 @@ __all__ = [
 # (the default) — see routing_intent_enforced().
 _TRUTHY_ENV_VALUES: frozenset[str] = frozenset({'1', 'true', 'yes', 'on'})
 
-_EXEMPT_EXECUTION_CLASSES: frozenset[str] = frozenset(EXECUTION_CLASSES) - {'code_tdd'}
+_EXEMPT_EXECUTION_CLASSES: frozenset[str] = frozenset(
+    c for c in EXECUTION_CLASSES if c != 'code_tdd'
+)
 
 # Code-change signal words that unconditionally suppress a routing-intent
 # finding, regardless of which field(s) a marker matched in — mirrors
