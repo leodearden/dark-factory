@@ -56,6 +56,7 @@ escalation, not a patch to α-θ (see plan.json design_decisions).
 from __future__ import annotations
 
 import asyncio
+import json
 import shlex
 import subprocess
 from pathlib import Path
@@ -83,6 +84,12 @@ from orchestrator.verify_cmd import (
     render,
     scope_to,
     strip_cwd,
+)
+from orchestrator.verify_plan import (
+    PlannedRun,
+    ScopeKind,
+    VerifyPlan,
+    derive_verify_plan,
 )
 
 # ── Repo seeding (ported from test_merge_queue_two_layer_integration.py) ──────
@@ -294,6 +301,38 @@ class TestVerifyCmdRoundTrip:
 # a target (pytest >= 9 exits 1 "no tests ran" on a bare conftest target).
 # Reconstructed verbatim from test_verify_plan.py's own golden fixture.
 ROOT_CONFTEST_DIFF: list[str] = ['orchestrator/tests/conftest.py']
+
+# Canned file contents for the dict-backed fake worktree_reader below (ported
+# from test_verify_plan.py). Seeded with STRUCTURAL_DIFF's Protocol-bearing
+# content once scenario 5 introduces it; every other path — including this
+# scenario's ROOT_CONFTEST_DIFF file — reads back as None, which
+# classify_file must treat as "not detected", never an error.
+_FAKE_FILE_CONTENTS: dict[str, str] = {}
+
+
+def fake_worktree_reader(path: str) -> str | None:
+    """Dict-backed stand-in for real file I/O (``Callable[[str], str | None]``).
+
+    Keeps derive_verify_plan pure and unit-testable without touching a real
+    filesystem: returns canned content for paths seeded into
+    _FAKE_FILE_CONTENTS, else None.
+    """
+    return _FAKE_FILE_CONTENTS.get(path)
+
+
+def _run_for(plan: VerifyPlan, prefix: str, tool_word: str) -> PlannedRun | None:
+    """Find *prefix*'s PlannedRun whose reason names *tool_word* (e.g. ``'pytest:'``).
+
+    Tool identity is recoverable from ``cmd.tool`` for a non-SKIPPED run, but a
+    SKIPPED slot carries ``cmd=None`` (D3's "explicit reasoned skip, never a
+    dropped command") — so ``derive_verify_plan`` always prefixes each
+    per-tool ``PlannedRun.reason`` with its tool name, keeping the reason the
+    tool-identity signal of last resort.
+    """
+    return next(
+        (r for r in plan.runs if r.module_prefix == prefix and r.reason.startswith(tool_word)),
+        None,
+    )
 
 
 class TestPlanGoldenConftest:
