@@ -1358,11 +1358,19 @@ class Scheduler:
         self._streak_hold = StreakCounter()
         self._streak_resolver_degraded = StreakCounter()
         self._streak_starvation = StreakCounter()
+        # Delivered-check dep-gate hold-visibility streak (task 2580, delta
+        # of the capability-delivered-checks PRD). Dedicated counter — kept
+        # separate from _streak_hold (the external-dep gate's own hold
+        # streak) so the two gates' visibility never collide/reset each
+        # other. Bumped by _note_delivered_hold on every tick a dependent is
+        # withheld by a cached-False (ran-and-FAILED) delivered check.
+        self._streak_delivered_hold = StreakCounter()
         self._streak_registry = StreakRegistry()
         self._streak_registry.register('external_unresolved', self._streak_external_unresolved)
         self._streak_registry.register('local_backfill', self._streak_local_backfill)
         self._streak_registry.register('hold', self._streak_hold)
         self._streak_registry.register('resolver_degraded', self._streak_resolver_degraded)
+        self._streak_registry.register('delivered_hold', self._streak_delivered_hold)
         self._streak_registry.register(
             'starvation', self._streak_starvation, on_gc=self._starvation_gc_resolve
         )
@@ -2311,6 +2319,44 @@ class Scheduler:
                     task_id=task_id,
                     data={'cause': cause, 'ticks': streak, 'detail': detail},
                 )
+
+    def _note_delivered_hold(
+        self,
+        task_id: str,
+        *,
+        detail: dict | None = None,
+    ) -> None:
+        """Bump the delivered-check hold-streak for ``task_id`` and emit a
+        hold-visibility event.
+
+        Called once per tick a dependent is withheld because a done/
+        cancelled local dep's ``metadata.delivered_checks`` cache entry is
+        cached ``False`` (ran-and-FAILED — never for errored/absent
+        withholds, which are a pure fail-safe wait with no visibility
+        spam). Unlike :meth:`_note_external_hold`, this has NO threshold
+        gate: task 2580 (delta) has no ``grace_cycles`` config yet, so
+        every held tick both bumps ``_streak_delivered_hold`` and emits
+        ``EventType.delivered_check_gate_held`` with the running streak
+        count — task 2583 (epsilon) layers threshold-gated escalation on
+        top with its own counter, consuming ``detail`` from this event.
+
+        ``detail`` should name the failed check (name/dep_id/main_sha/kind)
+        so epsilon's escalation payload can identify exactly what failed.
+        """
+        streak = self._streak_delivered_hold.bump(task_id)
+        logger.warning(
+            'Task %s: delivered-check gate has held dispatch for %d consecutive '
+            'ticks (detail=%r)',
+            task_id,
+            streak,
+            detail,
+        )
+        if self.event_store is not None:
+            self.event_store.emit(
+                EventType.delivered_check_gate_held,
+                task_id=task_id,
+                data={'ticks': streak, 'detail': detail},
+            )
 
     async def _apply_external_dep_policy(
         self,
