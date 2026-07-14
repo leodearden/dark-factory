@@ -156,8 +156,23 @@ def load_window_rows(
     0.0)``). Mirror that idiom here so a ``NULL`` row degrades to ``0``
     instead of poisoning `compute_window_metrics`'s arithmetic with
     ``None`` (``None + None`` / ``sum([..., None])`` raise ``TypeError``).
+
+    Opened strictly read-only via a ``mode=ro`` SQLite URI — the same
+    ``Path.resolve().as_uri() + '?mode=ro'`` + ``uri=True`` idiom
+    ``fused_memory.mcp_tools.scheduler_state.read_scheduler_events`` uses
+    for this same ``runs.db``. A plain ``sqlite3.connect(str(db_path))``
+    would silently CREATE an empty database file when *db_path* doesn't
+    exist — masking a misconfigured ``--runs-db``/``PROMPT_OPT_RUNS_DB``
+    path (a caller that bypasses the CLI's own ``is_file()`` pre-check) as
+    an innocuous empty-window result instead of failing loud — and would
+    take a write-capable handle against a live ``runs.db`` a separate
+    orchestrator process is actively writing. ``mode=ro`` makes a missing
+    file raise ``sqlite3.OperationalError`` instead, and resolving the
+    path before building the URI keeps symlink components from producing
+    an encoding mismatch.
     """
-    conn = sqlite3.connect(str(db_path))
+    uri = f'{Path(db_path).resolve().as_uri()}?mode=ro'
+    conn = sqlite3.connect(uri, uri=True)
     try:
         cursor = conn.execute(
             """
@@ -255,11 +270,15 @@ class CanaryVerdict:
     'done'`` rows, in which case ``cost_per_done_task`` is incomparable and
     ``mean_review_cycles``/``mean_verify_attempts`` fall back to ``0.0``
     (see `WindowMetrics`/`compute_window_metrics`) — the comparison quietly
-    reduces to ``requeue_rate`` alone rather than tripping
-    ``'insufficient_data'``. ``baseline_n_done``/``post_n_done`` expose each
-    window's done-row count so a caller (the CLI prints a NOTE) can detect
-    and flag that reduced-signal case explicitly instead of it passing
-    silently.
+    reduces to ``requeue_rate`` alone. When ``baseline_n_done > 0`` (the
+    project was completing tasks before the deploy) and ``post_n_done ==
+    0`` (it completed NONE after), ``verdict`` is forced to ``'regress'``
+    regardless of ``regressed_metrics`` — the worst-case deploy outcome
+    (shipped and completed nothing) must not be read as a clean 'pass' by
+    an exit-code-driven caller just because the thin remaining signal
+    (``requeue_rate``) happened to stay under threshold. ``baseline_n_done``
+    /``post_n_done`` still expose each window's done-row count so a caller
+    (the CLI also prints a NOTE) can see exactly why.
     """
 
     verdict: str
@@ -306,10 +325,25 @@ def compare_windows(
     emit a :class:`CanaryVerdict`.
 
     Comparisons are always computed (so the numbers stay inspectable even
-    when the verdict is inconclusive), but if either window has fewer than
-    ``thresholds.min_samples`` rows the verdict is forced to
-    ``'insufficient_data'`` — a thin post-deploy window (or a thin rolling
-    baseline) must not be trusted to call a pass or a regression.
+    when the verdict is inconclusive), but the verdict itself can be
+    overridden by two guards, checked in order:
+
+    1. If either window has fewer than ``thresholds.min_samples`` rows,
+       ``verdict`` is forced to ``'insufficient_data'`` — a thin
+       post-deploy window (or a thin rolling baseline) must not be
+       trusted to call a pass or a regression.
+    2. Otherwise, if ``baseline.n_done > 0`` but ``post.n_done == 0``,
+       ``verdict`` is forced to ``'regress'`` — the post window cleared
+       ``min_samples`` on total rows yet completed NOTHING, which the
+       per-metric comparisons alone could otherwise under-report as
+       'pass' (``cost_per_done_task`` incomparable, the cycle/attempt
+       means fall back to ``0.0``, leaving only ``requeue_rate`` in
+       play). A deploy that used to complete work and now completes none
+       of it is the worst-case outcome this canary guards against, so it
+       must never read as a clean pass.
+
+    Otherwise ``verdict`` is ``'regress'`` when ``regressed_metrics`` is
+    non-empty, ``'pass'`` when empty.
     """
     comparisons = [
         _compare_metric(
@@ -333,6 +367,12 @@ def compare_windows(
 
     if baseline.n_rows < thresholds.min_samples or post.n_rows < thresholds.min_samples:
         verdict = 'insufficient_data'
+    elif baseline.n_done > 0 and post.n_done == 0:
+        # The post window cleared min_samples on total rows but completed
+        # NOTHING -- the worst-case deploy outcome. Forced regardless of
+        # regressed_metrics (round-2 review finding #1): see the
+        # compare_windows/CanaryVerdict docstrings.
+        verdict = 'regress'
     else:
         verdict = 'regress' if regressed_metrics else 'pass'
 
