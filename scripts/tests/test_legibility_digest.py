@@ -897,3 +897,65 @@ class TestRenderDigest:
         meta = yaml.safe_load(frontmatter_yaml)
 
         assert meta['size_bytes'] == len(digest.encode('utf-8'))
+
+
+# ---------------------------------------------------------------------------
+# render_digest — 15KB soft-cap priority truncation. Over max_bytes, the
+# LOWEST-priority non-empty section is trimmed/dropped first (ascending
+# SECTION_PRIORITY), with gold (user_corrections) surviving longest — PRD
+# Sec 7.2 "truncate lowest-signal sections last".
+# ---------------------------------------------------------------------------
+
+def _oversized_not_found_records(n=600):
+    """One gold user-correction plus *n* not-found hits -- enough bytes to
+    exceed the default 15360-byte soft cap on its own."""
+    records = [_with_session_meta(_user_text('This approach is wrong, please redo it properly.'))]
+    for i in range(n):
+        records.append(_with_session_meta(
+            _tool_result(f'tu-nf-{i}', f'bash: cmd{i}: command not found', is_error=False)
+        ))
+    return records
+
+
+def _gold_plus_retry_heavy_records():
+    """One gold user-correction, a few not-found hits, and MANY retry-loop
+    groups (lowest priority) -- oversized enough that dropping retry_loops
+    alone comfortably satisfies a tight max_bytes, without needing to touch
+    not_found or the gold section."""
+    records = [_with_session_meta(_user_text('This is wrong, please fix it.'))]
+    for i in range(3):
+        records.append(_with_session_meta(_tool_result(f'tu-nf-{i}', 'command not found', is_error=False)))
+    for g in range(60):
+        for r in range(3):
+            records.append(_with_session_meta(_assistant(_tool_use(
+                'Bash', {'command': f'pytest-group-{g}'}, id=f'tu-loop-{g}-{r}',
+            ))))
+    return records
+
+
+class TestRenderDigestTruncation:
+    def test_default_cap_is_respected_and_gold_survives(self):
+        digest = mod.render_digest(_oversized_not_found_records(), agent_class='interactive')
+
+        assert len(digest.encode('utf-8')) <= 15360
+        assert '## User Corrections' in digest
+        # truncation genuinely trimmed the low-signal section, not a no-op
+        assert digest.count('command not found') < 600
+
+    def test_max_bytes_override_is_honored(self):
+        digest = mod.render_digest(
+            _oversized_not_found_records(), agent_class='interactive', max_bytes=2048,
+        )
+
+        assert len(digest.encode('utf-8')) <= 2048
+        assert '## User Corrections' in digest
+
+    def test_lowest_priority_section_dropped_before_higher_priority(self):
+        digest = mod.render_digest(
+            _gold_plus_retry_heavy_records(), agent_class='interactive', max_bytes=2048,
+        )
+
+        assert len(digest.encode('utf-8')) <= 2048
+        assert '## User Corrections' in digest
+        assert '## Not Found' in digest
+        assert '## Retry Loops' not in digest
