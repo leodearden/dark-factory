@@ -1638,6 +1638,31 @@ async def test_remove_tasks_evicts_curator_vectors(interceptor, taskmaster):
 
 
 @pytest.mark.asyncio
+async def test_remove_tasks_succeeds_when_eviction_raises(interceptor, taskmaster):
+    """A curator eviction error must not fail the removal itself."""
+    taskmaster.remove_tasks = AsyncMock(
+        return_value={
+            'successful': 1,
+            'failed': 0,
+            'removed_ids': ['9'],
+            'message': 'ok',
+        }
+    )
+    mock_curator = AsyncMock()
+    mock_curator.evict_task = AsyncMock(side_effect=RuntimeError('boom'))
+    interceptor._get_curator = AsyncMock(return_value=mock_curator)
+
+    result = await interceptor.remove_tasks(['9'], '/project')
+
+    assert result == {
+        'successful': 1,
+        'failed': 0,
+        'removed_ids': ['9'],
+        'message': 'ok',
+    }
+
+
+@pytest.mark.asyncio
 async def test_dependency_operations_emit_events(interceptor, event_buffer):
     await interceptor.add_dependency('2', '1', '/project')
     await interceptor.remove_dependency('2', '1', '/project')
