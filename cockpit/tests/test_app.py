@@ -1543,6 +1543,56 @@ class TestWeightEditor:
         assert len(received) == 1
         assert received[0].project_weights == {}
 
+    @pytest.mark.timeout(10)
+    async def test_duplicate_project_names_are_deduped_without_clobbering(self, tmp_path):
+        """WeightEditorScreen is constructed directly with an arbitrary
+        Sequence[str] of project names -- known_projects() (the production
+        caller) always returns an already-deduped sorted union, but the
+        screen itself must not depend on that. compose() enumerates
+        self._project_names to assign each row's id/seed, and _submit()
+        re-enumerates it into a NAME-keyed project_edits dict, so before
+        __init__ deduped defensively, a duplicate name would have rendered
+        two indistinguishable rows and then let the later-index row's read
+        silently clobber the earlier one's entry in that dict. This pins
+        both halves: only ONE row per distinct name exists after dedup, and
+        editing it reaches on_submit intact.
+        """
+        from textual.widgets import Input
+
+        from cockpit.app import CockpitApp
+        from cockpit.panes.weight_editor import WeightEditorScreen
+        from cockpit.priority import Priorities
+
+        received: list[Priorities] = []
+        base = Priorities.default()
+
+        app = CockpitApp(fleet_root=tmp_path, poll_interval=0.05)
+        async with app.run_test() as pilot:
+            await pilot.pause()
+
+            screen = WeightEditorScreen(base, ['alpha', 'alpha', 'beta'], received.append)
+            await app.push_screen(screen)
+            await pilot.pause()
+
+            assert isinstance(app.screen, WeightEditorScreen)
+
+            # Deduped (order-preserving) to ['alpha', 'beta'] -> exactly two
+            # project rows exist; a 'proj-2' would only exist if the
+            # duplicate 'alpha' had NOT been collapsed.
+            assert screen.query_one('#proj-0', Input).placeholder == 'alpha'
+            assert screen.query_one('#proj-1', Input).placeholder == 'beta'
+            assert len(screen.query('#proj-2')) == 0
+
+            beta_input = screen.query_one('#proj-1', Input)
+            beta_input.value = '7.0'
+            await pilot.pause()
+
+            await pilot.click('#weight-submit')
+            await pilot.pause()
+
+        assert len(received) == 1
+        assert received[0].project_weights == {'beta': 7.0}
+
 
 class TestSpawnBar:
     @pytest.mark.timeout(10)

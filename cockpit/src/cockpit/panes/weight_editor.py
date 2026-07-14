@@ -123,7 +123,14 @@ class WeightEditorScreen(ModalScreen[None]):
     invariant (PRD §2). compose() and _submit() enumerate the same
     sequences (self._priorities.category_weights / self._project_names) in
     the same order, so the index correspondence is stable within one screen
-    instance.
+    instance. self._project_names is additionally deduped in __init__
+    (order-preserving): _submit()'s project_edits dict is keyed by NAME, not
+    index, so a duplicate project name would otherwise render two
+    indistinguishable rows and let the later-index row's read silently
+    clobber the earlier one's entry. known_projects() (the production
+    caller) already returns a deduped sorted union, so this only guards a
+    directly-constructed screen -- e.g. in tests, or a future caller --
+    against passing a non-deduped Sequence.
 
     Category rows are, deliberately, NOT symmetric with project rows: a
     project row is seeded from known_projects, a union of
@@ -179,7 +186,14 @@ class WeightEditorScreen(ModalScreen[None]):
     ) -> None:
         super().__init__(*args, **kwargs)
         self._priorities = priorities
-        self._project_names = list(project_names)
+        # dict.fromkeys dedupes while preserving first-seen order. Defensive:
+        # known_projects() (the production caller) always returns an
+        # already-deduped sorted union, but this screen accepts an arbitrary
+        # Sequence[str] directly (and is constructed with raw, possibly
+        # non-deduped, lists in tests) -- see the class docstring's
+        # "self._project_names is additionally deduped" note for why a
+        # duplicate would otherwise corrupt _submit()'s name-keyed edits.
+        self._project_names = list(dict.fromkeys(project_names))
         self._on_submit = on_submit
 
     def compose(self) -> ComposeResult:
