@@ -196,6 +196,8 @@ Any capability resolving to a FAIL value **blocks** queueing until resolved by o
 
 **Output contract.** Emit the manifest as a committed artifact **beside the PRD** — one block per leaf: `task-label → [(capability → evidence)…]`. Committing it lets a downstream verifier (and the dispatch-time architect) **diff intent against substrate** instead of re-deriving the check. **[overlay]** names the manifest-path convention and the project's evidence commands (grep targets, the empty-value sentinel, the grammar-fixture command, the floor references).
 
+Alongside the `.md` manifest, also emit its **machine-readable YAML sidecar twin** — path strictly derived from the PRD path (`<prd-stem>.capability-manifest.yaml`, never overlay-named, so a downstream stamper can locate it from `metadata.prd_path` alone), schema per `plans/capability-delivered-checks-prd.md` §Contract, validated by `shared/src/shared/capability_manifest.py`. Each capability may bind an optional `delivered_check` — a `kind: grep` (pattern-anchored ERE, `expect: present|absent`) or `kind: script` check, **never** `file:line`; capabilities not mechanically expressible get `kind: manual`, recorded but excluded from the dispatch gate. Authoring rules and the committed exemplar: `decompose-mode.md` Step 2.5.
+
 ---
 
 ## META — "is this PRD good?"
@@ -235,6 +237,6 @@ Walk in this rough order; iterate freely as discussion surfaces new mechanisms:
 2. **G2 walk** — enumerate every task, classify leaf/intermediate, attach `user_observable_signal` / `consumer_ref`.
 3. **G6 re-check** — validate each leaf signal's premise. Escalate before filing if one can't be substantiated (cheaper than an implementer discovering it against a RED test).
 4. **G7 walk** — load `docs/legibility/design-invariants.md`, walk every task in the batch (not only leaves) against each invariant's checkable question; resolve or record waivers (`G7 waiver: <slug> — <rationale>` in the PRD row + `metadata.g7_waivers` on the filed task). An unresolved, unwaived hit blocks the batch.
-5. **Capability manifest** — build the per-leaf manifest (capability→producer, DAG-direction, field-population, grammar-fixture, numeric-floor) and **commit it beside the PRD**; any FAIL binding blocks the batch until resolved.
+5. **Capability manifest** — build the per-leaf manifest (capability→producer, DAG-direction, field-population, grammar-fixture, numeric-floor) and **commit it beside the PRD**, together with its YAML sidecar twin (see *Output contract* above); any FAIL binding blocks the batch until resolved.
 6. **G5 informational** — note B vs B+H; if B+H, verify the integration-gate task exists and points at the boundary-test sketch.
 7. File the batch (see `decompose-mode.md`).
