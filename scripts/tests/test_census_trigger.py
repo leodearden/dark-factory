@@ -11,7 +11,11 @@ test_codebook.py.
 """
 from __future__ import annotations
 
+import json
+import logging
 from datetime import datetime, timedelta, timezone
+
+import pytest
 
 from legibility import census_trigger as ct
 
@@ -198,3 +202,65 @@ def test_evaluate_floor_exempt_when_never_censused():
         config=ct.CensusConfig(),
     )
     assert decision.fire is True
+
+
+# ---------------------------------------------------------------------------
+# step-11: RED — load_census_state() three-valued (ok/missing/malformed)
+# ---------------------------------------------------------------------------
+
+def test_load_census_state_missing_file_is_missing_with_no_warning(tmp_path, caplog):
+    path = tmp_path / "census-state.json"
+
+    with caplog.at_level(logging.WARNING):
+        status, data = ct.load_census_state(path)
+
+    assert status == "missing"
+    assert data is None
+    assert not any(r.levelno == logging.WARNING for r in caplog.records)
+
+
+@pytest.mark.parametrize(
+    "content",
+    [
+        "not json{",
+        "null",
+        "[]",
+        '{"last_census_at": "not-a-date"}',
+    ],
+    ids=["invalid-json", "json-null", "non-dict-list", "unparseable-last-census-at"],
+)
+def test_load_census_state_malformed_variants_are_malformed_with_one_warning(
+    tmp_path, caplog, content
+):
+    path = tmp_path / "census-state.json"
+    path.write_text(content, encoding="utf-8")
+
+    with caplog.at_level(logging.WARNING):
+        status, data = ct.load_census_state(path)
+
+    assert status == "malformed"
+    assert data is None
+    assert sum(1 for r in caplog.records if r.levelno == logging.WARNING) == 1
+
+
+def test_load_census_state_valid_file_is_ok_with_no_warning(tmp_path, caplog):
+    path = tmp_path / "census-state.json"
+    path.write_text(
+        json.dumps(
+            {
+                "last_census_at": "2026-07-01T00:00:00+00:00",
+                "last_census_report": "plans/confusion-census-2026-07-01.md",
+                "last_census_done_count": 500,
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    with caplog.at_level(logging.WARNING):
+        status, data = ct.load_census_state(path)
+
+    assert status == "ok"
+    assert data["last_census_at"] == "2026-07-01T00:00:00+00:00"
+    assert data["last_census_report"] == "plans/confusion-census-2026-07-01.md"
+    assert data["last_census_done_count"] == 500
+    assert not any(r.levelno == logging.WARNING for r in caplog.records)
