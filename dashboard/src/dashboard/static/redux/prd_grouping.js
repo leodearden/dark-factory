@@ -154,11 +154,19 @@ function orderPrdGroups(groups, computeTiers) {
   return noPrdGroup ? [...ordered, noPrdGroup] : ordered;
 }
 
-const API = { prdTitle, aggregatePrdStatus, summarizePrdMembers, groupTasksByPrd, orderPrdGroups };
+// Named PRD_GROUPING_API (not the graph_layout.js boilerplate's plain `API`):
+// both files are loaded as separate classic (non-module) <script> tags on the
+// same page (index.html), and top-level `const` bindings in classic scripts
+// share one global lexical scope across ALL of them — a second top-level
+// `const API` here would collide with graph_layout.js's, throwing
+// "Identifier 'API' has already been declared" and aborting this entire
+// script (verified in a real browser), silently leaving window.DF_PRD_GROUPING
+// undefined and breaking tab_tasks.jsx's top-level destructure of it.
+const PRD_GROUPING_API = { prdTitle, aggregatePrdStatus, summarizePrdMembers, groupTasksByPrd, orderPrdGroups };
 
 if (typeof module !== 'undefined' && module.exports) {
-  module.exports = API;
+  module.exports = PRD_GROUPING_API;
 }
 if (typeof window !== 'undefined') {
-  window.DF_PRD_GROUPING = API;
+  window.DF_PRD_GROUPING = PRD_GROUPING_API;
 }

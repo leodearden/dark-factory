@@ -50,6 +50,10 @@ function TaskGraphEdges({ containerRef, nodeRefs, tasks, selectedId, neighborhoo
           if (!visible.has(d.id)) continue;
           const parentEl = nodeRefs.current[d.id];
           if (!parentEl) continue;
+          // Both endpoints resolved to the same DOM node — e.g. two tasks in
+          // the same collapsed PRD box, both proxied to their shared header
+          // (see PrdBox below). A same-point curve isn't a meaningful edge.
+          if (parentEl === childEl) continue;
           const pb = parentEl.getBoundingClientRect();
           const cBox = childEl.getBoundingClientRect();
           const x1 = pb.left - cb.left + pb.width / 2;
@@ -81,9 +85,30 @@ function TaskGraphEdges({ containerRef, nodeRefs, tasks, selectedId, neighborhoo
     }
     recompute();
     const ro = new ResizeObserver(recompute);
-    if (containerRef.current) ro.observe(containerRef.current);
+    let raf = null;
+    if (containerRef.current) {
+      ro.observe(containerRef.current);
+    } else {
+      // First mount only: containerRef is owned by an ANCESTOR of this
+      // component in every caller (the single ungrouped TaskGraph's own
+      // wrapper div, or the multi-box grouped view's hoisted wrapper) —
+      // React attaches refs bottom-up during commit, so a still-mounting
+      // ancestor's own ref can be null at the exact moment THIS layout
+      // effect body runs, even though the whole commit (every ref in the
+      // tree) finishes before the browser's next paint. Deferring one
+      // frame reliably sees it populated without touching the fast path
+      // above, which every later (already-populated) run still takes.
+      raf = requestAnimationFrame(() => {
+        recompute();
+        if (containerRef.current) ro.observe(containerRef.current);
+      });
+    }
     window.addEventListener('resize', recompute);
-    return () => { ro.disconnect(); window.removeEventListener('resize', recompute); };
+    return () => {
+      if (raf != null) cancelAnimationFrame(raf);
+      ro.disconnect();
+      window.removeEventListener('resize', recompute);
+    };
   }, [signature]);
 
   return (
@@ -235,8 +260,30 @@ function ProjectTaskGraph({ filtered, selectedId, focusMode, focusAnchorId, onSe
 function ProjectPrdGroups({ filtered, allProjectTasks, selectedId, onSelect, onEnterFocus }) {
   const containerRef = uR_T(null);
   const nodeRefs = uR_T({});
-  const groups = uM_T(() => orderPrdGroups(groupTasksByPrd(filtered), computeTiers), [filtered]);
-  const neighborhood = uM_T(() => computeNeighborhood(filtered, selectedId), [filtered, selectedId]);
+
+  // Content signatures so the pricier work below (bucketing + PRD-level
+  // mini-DAG tiering, and the full-member summaries) only reruns when
+  // something it actually reads changes. `filtered`/`allProjectTasks` are
+  // fresh array instances on every TasksTab render — including the app-wide
+  // 1s clock tick (app.jsx's `setInterval(() => setNow(...), 1000)`, unrelated
+  // to data polling) — which would defeat a plain reference-keyed useMemo
+  // every tick (same reasoning as TaskGraphEdges' own `signature` memo
+  // above). Unlike that one, this signature must cover every field
+  // TaskGraph/renderNode displays for a grouped task (not just id/status/
+  // deps), since a stale cache here would freeze those fields' displayed
+  // values across ticks — keep it in sync with renderNode if it starts
+  // reading more of a task.
+  const filteredSig = uM_T(() => filtered.map(t =>
+    `${t.id}:${t.status}:${t.prd || ''}:${t.title}:${t.started}:${t.completed || ''}:` +
+    `${t.train ? `${t.train.id}/${t.train.order}` : ''}:` +
+    `${(t.deps || []).map(d => d.id + (d.done ? '1' : '0')).join(',')}`
+  ).join('|'), [filtered]);
+  // fullMembersByPrd (below) only feeds aggregatePrdStatus/summarizePrdMembers,
+  // which look at nothing but id/status/prd — a narrower, cheaper signature.
+  const allSig = uM_T(() => allProjectTasks.map(t => `${t.id}:${t.status}:${t.prd || ''}`).join('|'), [allProjectTasks]);
+
+  const groups = uM_T(() => orderPrdGroups(groupTasksByPrd(filtered), computeTiers), [filteredSig]);
+  const neighborhood = uM_T(() => computeNeighborhood(filtered, selectedId), [filteredSig, selectedId]);
 
   // "n/m done", the outline/pip aggregate status, and the stacked status bar
   // all read from each PRD's FULL member set (every task with that prd,
@@ -248,7 +295,7 @@ function ProjectPrdGroups({ filtered, allProjectTasks, selectedId, onSelect, onE
     const m = new Map();
     for (const g of groupTasksByPrd(allProjectTasks)) m.set(g.noPrd ? null : g.prd, g.tasks);
     return m;
-  }, [allProjectTasks]);
+  }, [allSig]);
 
   return (
     <div className="prd-groups" ref={containerRef}>
@@ -287,6 +334,44 @@ function PrdBox({ group: g, fullMembers, selectedId, onSelect, onEnterFocus, nod
   // React on the box's first mount.
   const [collapsed, setCollapsed] = uS_T(agg === 'done');
   const title = g.noPrd ? 'No PRD' : prdTitle(g.prd);
+  const headRef = uR_T(null);
+
+  // Collapsing unmounts this box's TaskGraph, which deletes its tasks'
+  // entries from the shared nodeRefs map (each node's own ref callback fires
+  // with el=null). The hoisted TaskGraphEdges overlay above silently skips
+  // any edge whose endpoint ref is missing — so without this, a cross-box
+  // dependency edge into or out of a collapsed box's tasks would vanish
+  // entirely. Since all-done PRDs collapse by default, that would routinely
+  // hide real upstream/downstream relationships on first paint. Fix: while
+  // collapsed, proxy every member task id to the (always-mounted) header
+  // element instead, so those edges anchor to the box's title bar rather
+  // than disappearing (TaskGraphEdges' parentEl===childEl guard drops the
+  // degenerate case where both ends of an edge land in the same collapsed
+  // box).
+  //
+  // useLayoutEffect (not useEffect) so this box's own cleanup/setup pair is
+  // ordered deterministically around this box's own node mounts/unmounts:
+  // React finishes ref attachment/detachment for the WHOLE tree before ANY
+  // layout effect runs, so this effect only ever sees the post-unmount
+  // (collapsing) or post-mount (expanding — where the guarded cleanup below
+  // is a no-op, since the entry no longer points at the header) state, never
+  // a half-updated one. On first paint of an already-collapsed box, the
+  // hoisted TaskGraphEdges' own first recompute (an earlier sibling's layout
+  // effect) can still run before this effect does; its ResizeObserver fires
+  // once more right after for any newly-observed element even with no size
+  // change, which recomputes again by which point this proxy is in place.
+  uLE_T(() => {
+    if (!collapsed) return;
+    const el = headRef.current;
+    if (!el) return;
+    const ids = g.tasks.map(t => t.id);
+    for (const id of ids) nodeRefs.current[id] = el;
+    return () => {
+      for (const id of ids) {
+        if (nodeRefs.current[id] === el) delete nodeRefs.current[id];
+      }
+    };
+  }, [collapsed, g.tasks, nodeRefs]);
 
   // Stacked bar segments: only the four buckets the plan calls out
   // (done/in-progress/blocked/pending). Cancelled (and any other status)
@@ -302,7 +387,7 @@ function PrdBox({ group: g, fullMembers, selectedId, onSelect, onEnterFocus, nod
 
   return (
     <div className={`prd-box s-${agg}`}>
-      <div className="prd-box-head" data-open={collapsed ? 'false' : 'true'} onClick={() => setCollapsed(c => !c)}>
+      <div className="prd-box-head" ref={headRef} data-open={collapsed ? 'false' : 'true'} onClick={() => setCollapsed(c => !c)}>
         <span className="twirl">
           <svg width="10" height="10" viewBox="0 0 10 10" fill="none">
             <path d="M3.5 2L6.5 5L3.5 8" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round"/>
