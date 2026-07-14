@@ -534,6 +534,69 @@ table { border-collapse: collapse; width: 100%; }
 .taskgraph .singleton-strip .strip-label { font-size: 10px; color: var(--fg-3); font-family: var(--mono); text-transform: uppercase; letter-spacing: 0.1em; margin-bottom: 6px; }
 .taskgraph .singleton-strip .row { gap: 6px; margin-bottom: 0; }
 
+/* ── Tasks tab: "group by PRD" boxes (task 2530) ──
+   The hoisted cross-box edges overlay (step-14) is a direct child of
+   .prd-groups rather than of a .taskgraph, so it needs its own positioned
+   container + absolute-overlay rule mirroring ".taskgraph svg.edges" above;
+   nodes rendered inside each box still get that rule for free because each
+   box's body is its own nested .taskgraph (TaskGraph with renderEdges=false). */
+.prd-groups { position: relative; display: flex; flex-direction: column; gap: 14px; }
+.prd-groups > svg.edges { position: absolute; inset: 0; pointer-events: none; width: 100%; height: 100%; }
+
+.prd-box {
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  background: var(--bg-1);
+  overflow: hidden;
+}
+.prd-box-head {
+  display: flex; align-items: center; gap: 8px;
+  padding: 8px 10px;
+  cursor: pointer; user-select: none;
+  border-bottom: 1px solid var(--line);
+  transition: background .12s;
+}
+.prd-box-head:hover { background: var(--bg-2); }
+.prd-box-head .twirl {
+  width: 14px; height: 14px; flex: none;
+  display: inline-flex; align-items: center; justify-content: center;
+  color: var(--fg-3);
+  transition: transform .15s ease;
+}
+.prd-box-head[data-open="true"] .twirl { transform: rotate(90deg); color: var(--fg-1); }
+.prd-box-head .status-pip { width: 7px; height: 7px; border-radius: 50%; flex: none; background: var(--fg-3); }
+.prd-box-title {
+  flex: 1 1 auto; min-width: 0;
+  font-weight: 600; font-size: 12px; color: var(--fg-1);
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.prd-box-count { flex: none; font-family: var(--mono); font-size: 10px; color: var(--fg-3); }
+
+/* Thin stacked status bar: one segment per summarizePrdMembers() bucket,
+   width set inline (data-driven) by the JSX; color comes from the class. */
+.prd-bar { height: 4px; background: var(--bg-2); display: flex; overflow: hidden; }
+.prd-bar-seg { display: block; height: 100%; }
+.prd-bar-seg.s-done        { background: var(--ok); }
+.prd-bar-seg.s-in-progress { background: var(--accent); }
+.prd-bar-seg.s-blocked     { background: var(--bad); }
+.prd-bar-seg.s-pending     { background: var(--warn); }
+
+.prd-box-body { padding-top: 2px; } /* the nested .taskgraph supplies its own 12px padding */
+
+/* Status-colored outline + pip, driven by aggregatePrdStatus() via a
+   status class on the box — mirrors the .taskgraph .node.s-* idiom:
+   blocked->bad, in-progress->accent, pending->warn, done->ok, cancelled->fg-3. */
+.prd-box.s-blocked     { border-color: oklch(0.68 0.18 25  / 0.5); }
+.prd-box.s-in-progress { border-color: oklch(0.72 0.14 230 / 0.5); }
+.prd-box.s-pending      { border-color: oklch(0.80 0.14 80  / 0.5); }
+.prd-box.s-done         { border-color: oklch(0.74 0.14 155 / 0.35); opacity: 0.85; }
+.prd-box.s-cancelled    { border-color: var(--line); opacity: 0.6; }
+.prd-box.s-blocked      .status-pip { background: var(--bad); box-shadow: 0 0 4px oklch(0.68 0.18 25 / 0.5); }
+.prd-box.s-in-progress  .status-pip { background: var(--accent); box-shadow: 0 0 4px oklch(0.72 0.14 230 / 0.6); }
+.prd-box.s-pending      .status-pip { background: var(--warn); }
+.prd-box.s-done         .status-pip { background: var(--ok); }
+.prd-box.s-cancelled    .status-pip { background: var(--fg-3); }
+
 /* Focus mode affordance: chip in the filter bar naming the active focus
    target, and the panel-head "focus" button that enters it (sized/colored
    to match the existing inline "clear" button treatment exactly). */
