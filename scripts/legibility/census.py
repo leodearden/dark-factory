@@ -43,7 +43,10 @@ and ``codebook.assert_no_deletion()`` confirm the write is safe.
 from __future__ import annotations
 
 import copy
+import json
+import os
 import sys
+import tempfile
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -439,3 +442,48 @@ def retire_entry(cb: dict, entry_id: str) -> dict:
 
     codebook.assert_no_deletion(cb, result)
     return result
+
+
+# ---------------------------------------------------------------------------
+# advance_census_state — §7.5 census-state.json sole writer (zeta/2579
+# MUST-persist contract: last_census_done_count is ALWAYS present)
+# ---------------------------------------------------------------------------
+
+def advance_census_state(
+    path, *, now_iso: str, report_path: str, done_count: int,
+) -> None:
+    """Write the §7.5 census-state dict to *path*, atomically.
+
+    Always writes exactly ``{"last_census_at": now_iso,
+    "last_census_report": report_path, "last_census_done_count":
+    done_count}`` -- ``last_census_done_count`` is NEVER conditionally
+    omitted, even when ``done_count == 0`` (falsy but a real baseline).
+    zeta's ``census_trigger.compute_tasks_landed()`` returns ``None`` --
+    and its condition (b) permanently fails safe -- whenever that key is
+    absent (census_trigger.py:410-416), and this module is
+    census-state.json's SOLE writer, so this is the one place that
+    baseline can ever be supplied.
+
+    Uses the same ``tempfile.mkstemp`` + ``os.replace`` atomic-write
+    pattern as ``codebook.dump`` (temp file in the same directory as
+    *path*, then an atomic rename): a crash or kill mid-write can never
+    leave a partial state file for the next ``load_census_state`` to trip
+    over, and a pre-existing state file is fully replaced, never merged.
+    """
+    state = {
+        "last_census_at": now_iso,
+        "last_census_report": report_path,
+        "last_census_done_count": done_count,
+    }
+    directory = os.path.dirname(os.fspath(path)) or "."
+    fd, tmp_file = tempfile.mkstemp(prefix=".census-state-", suffix=".tmp", dir=directory)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            json.dump(state, f)
+        os.replace(tmp_file, path)
+    except BaseException:
+        try:
+            os.remove(tmp_file)
+        except OSError:
+            pass
+        raise
