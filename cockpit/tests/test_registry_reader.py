@@ -107,6 +107,11 @@ class TestSessionScanner:
         result = scanner.scan()
 
         expected = scan_sessions(tmp_path)
+        # Both iterate sorted(base.iterdir()), so scan() must mirror
+        # scan_sessions()'s ORDER, not just its content -- a dict comparison
+        # alone is order-insensitive and would miss a regression that
+        # reordered scan()'s output (e.g. iterating an unsorted dict).
+        assert [r.session_slug for r in result] == [r.session_slug for r in expected]
         assert {r.session_slug: r for r in result} == {r.session_slug: r for r in expected}
 
     def test_scan_reflects_slug_added_since_last_scan(self, tmp_path):
@@ -206,6 +211,34 @@ class TestScanChangeShortCircuit:
         second = scanner.scan()
         assert len(second) == 1
         assert second[0].status == sr.Status.IDLE
+
+    def test_same_mtime_different_size_rewrite_is_not_masked_by_cache(self, tmp_path):
+        """The cache is keyed on (st_mtime_ns, st_size), not st_mtime_ns
+        alone: a rewrite that coincidentally lands on the exact same mtime
+        (plausible on filesystems whose real mtime resolution is coarser
+        than the nanoseconds st_mtime_ns reports) must still be detected
+        when it also changes the record's serialized length, rather than
+        being masked as a false cache hit.
+        """
+        from cockpit.registry_reader import SessionScanner
+
+        record = _make_record(session_slug='a-1', status=sr.Status.RUNNING)
+        sr.write_record(record, root=tmp_path)
+        path = sr.record_path_for_slug('a-1', root=tmp_path)
+        os.utime(path, ns=(self._FIXED_NS, self._FIXED_NS))
+
+        scanner = SessionScanner(root=tmp_path)
+        first = scanner.scan()
+        assert first[0].status == sr.Status.RUNNING
+
+        # 'running' (7 chars) -> 'awaiting-input' (14 chars) changes
+        # record.json's byte length; re-pin the mtime back to the exact
+        # value the cache already holds to force the adversarial collision.
+        sr.update_status('a-1', root=tmp_path, status=sr.Status.AWAITING_INPUT)
+        os.utime(path, ns=(self._FIXED_NS, self._FIXED_NS))
+
+        second = scanner.scan()
+        assert second[0].status == sr.Status.AWAITING_INPUT
 
     def test_removed_slug_leaves_no_stale_entry_for_a_different_record_at_same_slug(
         self, tmp_path
