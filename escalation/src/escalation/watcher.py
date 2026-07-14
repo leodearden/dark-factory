@@ -105,14 +105,25 @@ def _initial_scan(
     return best
 
 
+def _normalize_esc_id(esc_id: str) -> str:
+    """Strip a trailing `.json` suffix, if present, from an esc-id.
+
+    Shared by the static `--exclude-id` normalization in main() and by
+    `_read_exclude_file` below, so both accept an id with or without the
+    `.json` suffix identically and the rule can't drift between the two.
+    """
+    return esc_id[:-5] if esc_id.endswith('.json') else esc_id
+
+
 def _read_exclude_file(path: Path | None) -> frozenset[str]:
     """Read a newline-delimited esc-id exclude list, tolerating blank lines
-    and `#`-comments, and normalizing a trailing `.json` suffix like
-    `--exclude-id` does (watcher.py's static exclude normalization).
+    and `#`-comments, and normalizing a trailing `.json` suffix via
+    `_normalize_esc_id` (shared with `--exclude-id`'s static-exclude
+    normalization).
 
-    Fails open (returns an empty frozenset) when path is None or the file
-    is missing/unreadable — a transient miss is retried on the next poll
-    rather than treated as a fatal error.
+    Fails open (returns an empty frozenset) when path is None or the file is
+    missing, unreadable, or undecodable as text — a transient miss is
+    retried on the next poll rather than treated as a fatal error.
 
     Re-read in full on every poll, so a caller appending a new id mid-run
     should do so as a single short-line append (e.g. `echo esc-id >> file`),
@@ -125,7 +136,7 @@ def _read_exclude_file(path: Path | None) -> frozenset[str]:
 
     try:
         text = path.read_text()
-    except OSError:
+    except (OSError, UnicodeDecodeError):
         return frozenset()
 
     ids: set[str] = set()
@@ -133,7 +144,7 @@ def _read_exclude_file(path: Path | None) -> frozenset[str]:
         stripped = line.strip()
         if not stripped or stripped.startswith('#'):
             continue
-        ids.add(stripped[:-5] if stripped.endswith('.json') else stripped)
+        ids.add(_normalize_esc_id(stripped))
     return frozenset(ids)
 
 
@@ -207,9 +218,7 @@ def main() -> None:
     queue_dir = Path(args.queue_dir)
     queue_dir.mkdir(parents=True, exist_ok=True)
 
-    static_exclude = frozenset(
-        e[:-5] if e.endswith('.json') else e for e in (args.exclude_id or [])
-    )
+    static_exclude = frozenset(_normalize_esc_id(e) for e in (args.exclude_id or []))
     exclude_file_path = Path(args.exclude_file) if args.exclude_file else None
 
     def current_excludes() -> frozenset[str]:
