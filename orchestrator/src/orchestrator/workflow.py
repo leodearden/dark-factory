@@ -7544,6 +7544,15 @@ Update the plan to address the blocking issues. You may add new steps to the `st
         if 'plan_tools' in role.mcp_families and cwd:
             mcp_config = _inject_plan_tools_mcp(mcp_config, cwd)
 
+        # Verdict-tools stdio MCP server — reviewer/judge/merger submit a
+        # constrained verdict artifact (PRD task β, task 2482). Gated on
+        # role.mcp_families exactly like plan-tools above; the per-invocation
+        # --verdict-role is role.name. _inject_verdict_tools_mcp skeletons a
+        # config when None, so the reviewer (no 'orchestrator' family) still
+        # acquires it.
+        if 'verdict_tools' in role.mcp_families and cwd:
+            mcp_config = _inject_verdict_tools_mcp(mcp_config, cwd, role)
+
         # Session-resume lifecycle: if the harness recovered a sidecar that
         # matches the role we're about to invoke, resume the prior session
         # by passing resume_session_id to invoke_with_cap_retry.  Otherwise,
