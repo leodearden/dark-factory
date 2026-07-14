@@ -8,6 +8,7 @@ test_legibility_config.py's module docstring for the import mechanics).
 from __future__ import annotations
 
 import json
+import textwrap
 from datetime import date as dt_date
 from pathlib import Path
 
@@ -411,3 +412,89 @@ class TestStratifiedSampleBoundary:
     def test_per_stratum_counts_accounting(self):
         result = mod.stratified_sample(self._build_records(), self._config())
         assert result.per_stratum_counts == {'recon': 2, 'watcher': 1, 'interactive': 2}
+
+
+class TestRenderManifest:
+    def test_emits_one_json_object_per_line(self):
+        records = [
+            _scored('sess-a', 'recon', mod.SignalCounts(tool_error=5), 'text', 1000),
+            _scored('sess-b', 'watcher', mod.SignalCounts(tool_error=3), 'text', 2000),
+        ]
+        lines = mod.render_manifest(records).splitlines()
+        assert len(lines) == 2
+        parsed = [json.loads(line) for line in lines]
+        assert parsed[0] == {
+            'session': str(records[0].path), 'stratum': 'recon', 'score': 5, 'size': 1000,
+        }
+        assert parsed[1] == {
+            'session': str(records[1].path), 'stratum': 'watcher', 'score': 3, 'size': 2000,
+        }
+
+    def test_empty_selection_yields_empty_string(self):
+        assert mod.render_manifest([]) == ''
+
+
+def _write_full_session(dir_path, session_id, cwd, timestamp, first_turn_text, include_tool_error=False):
+    dir_path.mkdir(parents=True, exist_ok=True)
+    lines = [
+        {
+            'type': 'user', 'isSidechain': False, 'isMeta': False, 'cwd': cwd, 'timestamp': timestamp,
+            'message': {'content': first_turn_text},
+        },
+    ]
+    if include_tool_error:
+        lines.append({
+            'type': 'user', 'cwd': cwd, 'timestamp': timestamp,
+            'message': {
+                'content': [
+                    {'type': 'tool_result', 'tool_use_id': 't1', 'is_error': True, 'content': 'boom'},
+                ]
+            },
+        })
+    path = dir_path / f'{session_id}.jsonl'
+    path.write_text('\n'.join(json.dumps(line) for line in lines) + '\n')
+    return path
+
+
+class TestMainCLI:
+    """main(argv) wires load_config -> enumerate_sessions -> score_signals ->
+    classify_agent_class -> stratified_sample -> render_manifest end-to-end
+    against a tmp config + tmp projects_root (never live ~/.claude)."""
+
+    def test_main_prints_manifest_and_summary_and_returns_zero(self, tmp_path, capsys):
+        projects_root = tmp_path / 'projects'
+        main_dir = projects_root / '-home-leo-src-dark-factory'
+        _write_full_session(
+            main_dir, 'sess-1', MAIN_CWD, '2026-07-13T09:00:00.000Z',
+            'Please help with X', include_tool_error=True,
+        )
+        _write_full_session(
+            main_dir, 'sess-2', MAIN_CWD, '2026-07-13T10:00:00.000Z',
+            'Please help with Y', include_tool_error=True,
+        )
+
+        config_path = tmp_path / 'legibility.yaml'
+        config_path.write_text(textwrap.dedent(f"""\
+            project_id: dark_factory
+            project_root: /home/leo/src/dark-factory
+            escalation_port: 8103
+            cwd_prefixes: [{MAIN_CWD}]
+            budgets: {{max_daily_digest_bytes: 300000}}
+            sampling: {{top_fraction: 0.12, per_stratum_min: 2}}
+            """))
+
+        ret = mod.main([
+            '--config', str(config_path),
+            '--projects-root', str(projects_root),
+            '--date', '2026-07-13',
+        ])
+
+        captured = capsys.readouterr()
+        assert ret == 0
+
+        manifest_lines = [line for line in captured.out.splitlines() if line.strip()]
+        parsed = [json.loads(line) for line in manifest_lines]
+        assert {Path(p['session']).stem for p in parsed} == {'sess-1', 'sess-2'}
+
+        assert 'zero-signal' in captured.err.lower()
+        assert 'bytes used' in captured.err.lower()
