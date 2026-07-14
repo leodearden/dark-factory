@@ -108,7 +108,11 @@ def build_curator_corpus_cmd(db_path: Path, n: int, seed: int, spot_check_size: 
     adjudication_log.jsonl under *out*'s directory. Prints an
     audit_curator_corpus PASS/FAIL summary and exits non-zero on FAIL.
     """
-    from .curator_corpus import audit_curator_corpus, build_curator_corpus, propose_curator_label_frontier
+    from .curator_corpus import (
+        audit_curator_corpus,
+        build_curator_corpus,
+        propose_curator_label_frontier,
+    )
 
     async def _run() -> int:
         if not db_path.is_file():
