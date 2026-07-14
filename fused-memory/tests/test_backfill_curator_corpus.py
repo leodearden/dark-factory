@@ -693,12 +693,13 @@ class TestPruneDriver:
         with TestRunBackfill()._run_backfill_context() as (mock_curator, mock_tm_cls):
             mock_curator.prune_orphans = AsyncMock(return_value=mock_prune_result)
             mock_tm_instance = AsyncMock()
+            mock_tm_instance.list_tags = AsyncMock(return_value=['master'])
             mock_tm_instance.get_tasks = AsyncMock(return_value=canned_task_tree)
             mock_tm_cls.return_value = mock_tm_instance
 
             await run_prune(config_path=None, project_root=project_root)
 
-        mock_tm_instance.get_tasks.assert_called_once_with(project_root)
+        mock_tm_instance.get_tasks.assert_called_once_with(project_root, tag='master')
 
         mock_curator.prune_orphans.assert_called_once()
         call_args = mock_curator.prune_orphans.call_args
@@ -727,6 +728,7 @@ class TestPruneDriver:
         with TestRunBackfill()._run_backfill_context() as (mock_curator, mock_tm_cls):
             mock_curator.prune_orphans = AsyncMock()
             mock_tm_instance = AsyncMock()
+            mock_tm_instance.list_tags = AsyncMock(return_value=['master'])
             mock_tm_instance.get_tasks = AsyncMock(side_effect=RuntimeError('db read failed'))
             mock_tm_cls.return_value = mock_tm_instance
 

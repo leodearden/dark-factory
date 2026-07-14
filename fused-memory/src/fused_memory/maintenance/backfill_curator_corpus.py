@@ -126,16 +126,17 @@ class BackfillManager:
         the explicit reconciliation-sweep backstop to Layer A's witness-eviction
         in TaskInterceptor.remove_tasks — it also cleans any pre-existing strays.
 
-        CAUTION — tag scope: ``get_tasks(project_root)`` below is called
-        with no ``tag``, so it defaults to ``DEFAULT_TAG`` (the SQLite
-        backend's own default) and only ever sees that one tag's tasks. The
-        curator corpus, however, is populated for every tag a task is ever
-        filed under (see ``TaskCurator.prune_orphans``'s docstring). If any
-        task was ever recorded under a non-default tag, its corpus vector is
-        invisible to this snapshot and will be pruned as a false orphan.
-        This is a known gap — tracked for follow-up, not fixed here — because
-        closing it needs a way to enumerate/aggregate all tags, which the
-        task backend does not currently expose.
+        Cross-tag aggregation (task 2603): the curator corpus is populated
+        for every tag a task is ever filed under (see
+        ``TaskCurator.prune_orphans``'s docstring), but ``get_tasks`` only
+        ever reads one tag at a time (``DEFAULT_TAG`` unless told otherwise).
+        To build a KNOWN-COMPLETE live snapshot, this enumerates every tag
+        via ``list_tags`` and unions ``get_tasks(project_root, tag=t)``
+        across all of them. If ``list_tags`` OR any single tag's
+        ``get_tasks`` call raises, the WHOLE sweep is skipped (fail-safe,
+        same as the prior single-read try/except) — pruning against a
+        partial cross-tag snapshot would false-orphan the unread tags'
+        vectors, which is the exact bug this aggregation exists to close.
 
         Args:
             project_root: Absolute path to the project root (used to derive project_id
@@ -148,10 +149,19 @@ class BackfillManager:
 
         logger.info('backfill_curator_corpus: fetching task tree for prune sweep %s', project_root)
         try:
-            tasks_result = await self.taskmaster.get_tasks(project_root)
+            tags = await self.taskmaster.list_tags(project_root)
+            live_ids: set[str] = set()
+            for tag in tags:
+                tasks_result = await self.taskmaster.get_tasks(project_root, tag=tag)
+                flat_tasks = flatten_task_tree(tasks_result)
+                live_ids.update(
+                    str(t.get('id'))
+                    for t in flat_tasks
+                    if t.get('id') is not None and str(t.get('id'))
+                )
         except Exception:
             logger.warning(
-                'prune: get_tasks failed — skipping prune (fail-safe)', exc_info=True,
+                'prune: list_tags/get_tasks failed — skipping prune (fail-safe)', exc_info=True,
             )
             return PruneReport(
                 project_root=project_root,
@@ -159,10 +169,6 @@ class BackfillManager:
                 skipped=True,
                 reason='read_failed',
             )
-        flat_tasks = flatten_task_tree(tasks_result)
-        live_ids = {
-            str(t.get('id')) for t in flat_tasks if t.get('id') is not None and str(t.get('id'))
-        }
 
         result: PruneResult = await self.curator.prune_orphans(project_id, live_ids)
 
