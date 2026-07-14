@@ -469,6 +469,30 @@ concurrent failing merge to the steward would cause an ~85 min-per-task
 livelock for every task whose verify runs against a red main."""
 
 
+MAIN_HEALTH_PROBE_PENDING_NOTE = (
+    'provisional: an off-critical-path main-health probe is still checking '
+    'whether this failure pre-exists on bare main (task 2564); if '
+    'confirmed, this task is not at fault and main is being healed '
+    'separately'
+)
+"""Appended, in brackets, to the provisional task-fault
+``MergeOutcome.reason`` that :func:`_run_post_merge_verify` returns in
+DEFERRED mode (``main_health_probe_handles`` is not ``None``) whenever
+:func:`_spawn_main_health_probe` reports a probe is actually in flight for
+this failure.
+
+Lets a steward/human reading the surviving reason string distinguish
+"still being classified off-path" from a confirmed task fault — the
+SYNCHRONOUS path (``main_health_probe_handles`` is ``None``) never appends
+this note because :func:`_classify_main_health_red` has, by construction,
+already definitively ruled out a pre-existing break by the time the
+task-fault reason is built.  Not appended when the deferred probe itself
+would be skipped (feature disabled / timed-out verify / a
+:data:`PREEXISTING_BREAK_SKIP_CATEGORIES` category) since those cases are
+confirmed task faults in both modes — see
+:func:`_spawn_main_health_probe`'s return value."""
+
+
 # ---------------------------------------------------------------------------
 # Auto-heal eligibility gate
 # ---------------------------------------------------------------------------
@@ -1089,6 +1113,18 @@ async def _run_deferred_main_health_probe(
     genuinely-still-broken main will simply be re-probed and re-surfaced by
     the next failing merge.
 
+    This re-check is best-effort, not atomic (task 2564 amendment,
+    reviewer_comprehensive finding 2): a narrow TOCTOU window remains
+    between the ``get_main_sha()`` equality check above passing and the
+    escalation actually being filed below — or, when *auto_heal* is wired,
+    between that check and whatever further awaits the ``auto_heal``
+    callback performs — during which main could advance again.  Left
+    unguarded deliberately: the fingerprint-keyed ``submit_or_dedupe`` fold
+    (see :func:`_file_main_health_escalation`) makes a single
+    just-superseded escalation harmless — it collapses into any existing
+    parent and the parent resolves once the real fix lands — so closing
+    this window is not worth the added complexity.
+
     On a confirmed, still-fresh pre-existing break: builds the outcome via
     :func:`_build_main_health_outcome` and emits the ``main_health_red``
     merge-attempt signal (task 2564 step-22: BEFORE the branch below, so the
@@ -1226,7 +1262,7 @@ def _spawn_main_health_probe(
     *,
     escalation_queue: Any = None,
     event_store: EventStore | None = None,
-) -> None:
+) -> bool:
     """Fire-and-forget: spawn the deferred (off-critical-path) main-health
     classification for a post-merge-verify failure.
 
@@ -1259,15 +1295,28 @@ def _spawn_main_health_probe(
     :class:`SpeculativeMergeWorker`'s existing ``self._background_tasks``
     shutdown drain cancels it deterministically on stop — no new drain code
     is needed.
+
+    Returns ``True`` when, as a result of this call, a main-health probe is
+    (or remains) in flight for *req.task_id* — *handles* were provided, none
+    of the three cheap guards above skipped classification, and either a new
+    probe task was just spawned or one was already running (in-flight
+    dedup).  Returns ``False`` when no probe is in flight: *handles* is
+    ``None``, a guard skipped classification, or spawning itself raised.
+    Task 2564 amendment (reviewer_comprehensive finding 1): the caller
+    (:func:`_run_post_merge_verify`) uses this to decide whether the
+    provisional task-fault outcome should carry
+    :data:`MAIN_HEALTH_PROBE_PENDING_NOTE` — a caller cannot otherwise tell
+    "classification skipped, confirmed task fault" apart from "classification
+    deferred, verdict pending" from the reason string alone.
     """
     if handles is None:
-        return
+        return False
     if not req.config.escalate_preexisting_main_break:
-        return
+        return False
     if verify.timed_out:
-        return
+        return False
     if (verify.category or '') in PREEXISTING_BREAK_SKIP_CATEGORIES:
-        return
+        return False
     task_name = f'main-health-probe-{req.task_id}'
     if any(
         t.get_name() == task_name and not t.done()
@@ -1278,7 +1327,7 @@ def _spawn_main_health_probe(
             'duplicate spawn',
             req.task_id,
         )
-        return
+        return True
     try:
         task = asyncio.create_task(
             _run_deferred_main_health_probe(
@@ -1295,6 +1344,8 @@ def _spawn_main_health_probe(
             'Task %s: failed to spawn main-health probe: %s',
             req.task_id, exc,
         )
+        return False
+    return True
 
 
 async def _run_post_merge_verify(
@@ -1653,10 +1704,24 @@ async def _run_post_merge_verify(
         # DEFERRED mode: spawn the off-critical-path main-health
         # classification now that the provisional outcome is fully built.
         # None-safe no-op in SYNCHRONOUS mode (handles is None).
-        _spawn_main_health_probe(
+        #
+        # The return value tells us whether a probe is actually in flight —
+        # as opposed to a cheap guard having already confirmed this really
+        # is a plain task fault in both modes (see
+        # _spawn_main_health_probe's docstring).  Task 2564 amendment
+        # (reviewer_comprehensive finding 1): only in the former case do we
+        # annotate the provisional reason as pending reclassification, so a
+        # steward/human reading it can tell "still being classified
+        # off-path" apart from a confirmed fault — without this, a
+        # subsequently-confirmed pre-existing main break would leave this
+        # task's blocked outcome misattributing the break to the task
+        # itself with no signal that a reclassification is in flight.
+        probe_pending = _spawn_main_health_probe(
             main_health_probe_handles, git_ops, req, verify,
             escalation_queue=escalation_queue, event_store=event_store,
         )
+        if probe_pending:
+            reason = f'{reason}\n\n[{MAIN_HEALTH_PROBE_PENDING_NOTE}]'
         return MergeOutcome(
             'blocked', reason=reason,
             failure_category=verify.category,
