@@ -323,7 +323,37 @@ function countCrossings(rows, edges) {
   return total;
 }
 
-const API = { computeTiers, partitionComponents, orderRows, countCrossings };
+// ── Compute the ancestors+descendants neighborhood of a selected task ──
+// Verbatim port of tab_tasks.jsx's inline `neighborhood` memo (TaskGraph):
+// returns null when nothing is selected; otherwise a Set starting with
+// selectedId, extended with its transitive ancestors (walking deps upward,
+// only following ids present in `tasks`) and transitive descendants
+// (scanning for tasks whose deps include the current id). Single tested
+// source of truth reused by both the selection highlight and focusSubset.
+function computeNeighborhood(tasks, selectedId) {
+  if (!selectedId) return null;
+  const set = new Set([selectedId]);
+  const byId = new Map(tasks.map(t => [t.id, t]));
+  // ancestors
+  const stackUp = [selectedId];
+  while (stackUp.length) {
+    const cur = stackUp.pop();
+    const t = byId.get(cur);
+    if (!t) continue;
+    for (const d of (t.deps || [])) if (byId.has(d.id) && !set.has(d.id)) { set.add(d.id); stackUp.push(d.id); }
+  }
+  // descendants
+  const stackDown = [selectedId];
+  while (stackDown.length) {
+    const cur = stackDown.pop();
+    for (const t of tasks) {
+      if ((t.deps || []).some(d => d.id === cur) && !set.has(t.id)) { set.add(t.id); stackDown.push(t.id); }
+    }
+  }
+  return set;
+}
+
+const API = { computeTiers, partitionComponents, orderRows, countCrossings, computeNeighborhood };
 
 if (typeof module !== 'undefined' && module.exports) {
   module.exports = API;
