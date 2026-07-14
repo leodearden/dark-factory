@@ -37,8 +37,20 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass
+from datetime import datetime, timedelta, timezone
 
 logger = logging.getLogger("legibility.census_trigger")
+
+
+def _as_utc(value: datetime | None) -> datetime | None:
+    """Normalize a datetime to timezone-aware UTC. A naive datetime (e.g.
+    parsed from a bare `YYYY-MM-DD` codebook date) is assumed to already be
+    UTC. `None` passes through unchanged."""
+    if value is None:
+        return None
+    if value.tzinfo is None:
+        return value.replace(tzinfo=timezone.utc)
+    return value.astimezone(timezone.utc)
 
 
 # ---------------------------------------------------------------------------
@@ -83,3 +95,56 @@ class CensusConfig:
             ),
             floor_days=mapping.get("floor_days", defaults.floor_days),
         )
+
+
+# ---------------------------------------------------------------------------
+# Decision + evaluate() — pure §8.5 decision core (no I/O)
+# ---------------------------------------------------------------------------
+
+@dataclass(frozen=True)
+class Decision:
+    """The census-trigger verdict: whether to fire, plus one human-readable
+    reason line per evaluated condition (and the floor), for logging /
+    CLI display."""
+
+    fire: bool
+    reasons: list[str]
+
+
+def evaluate(
+    *,
+    now: datetime,
+    last_census_at: datetime | None,
+    never_censused: bool,
+    tasks_landed: int | None,
+    candidate_first_seens: list[datetime],
+    config: CensusConfig,
+) -> Decision:
+    """Pure decision core for the §6/§8.5 fire logic. Fires at the earliest
+    of condition (a) max_interval_days, (b) tasks_landed_min_days +
+    tasks_landed_threshold, (c) novelty_spike — currently only (a) is
+    implemented; (b)/(c)/the hard floor are added by later steps. No I/O:
+    all inputs are plain values so the full §8.5 matrix is testable without
+    a filesystem or a live get_statuses call.
+    """
+    now_utc = _as_utc(now)
+    last_utc = _as_utc(last_census_at)
+    days_since = (
+        (now_utc - last_utc).total_seconds() / 86400.0 if last_utc is not None else None
+    )
+
+    reasons: list[str] = []
+
+    cond_a = days_since is not None and days_since >= config.max_interval_days
+    if days_since is not None:
+        reasons.append(
+            "max-interval: {:.1f}d since last census (threshold {}d){}".format(
+                days_since, config.max_interval_days, " -> FIRE" if cond_a else ""
+            )
+        )
+    else:
+        reasons.append("max-interval: no last-census anchor available -> N/A")
+
+    fire = cond_a
+
+    return Decision(fire=fire, reasons=reasons)
