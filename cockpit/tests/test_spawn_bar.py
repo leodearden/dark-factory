@@ -108,3 +108,54 @@ class TestBuildSpawnArgv:
         assert isinstance(argv, list)
         assert all(isinstance(part, str) for part in argv)
         assert len(argv) == 5
+
+
+class TestDefaultSkipPerms:
+    def test_unset_env_defaults_to_false(self, monkeypatch):
+        from cockpit.panes.spawn_bar import default_skip_perms
+
+        monkeypatch.delenv('CLAUDE_SPAWN_SKIP_PERMS', raising=False)
+
+        assert default_skip_perms() is False
+
+    def test_env_true_resolves_to_true(self, monkeypatch):
+        from cockpit.panes.spawn_bar import default_skip_perms
+
+        monkeypatch.setenv('CLAUDE_SPAWN_SKIP_PERMS', 'true')
+
+        assert default_skip_perms() is True
+
+    def test_env_false_resolves_to_false(self, monkeypatch):
+        from cockpit.panes.spawn_bar import default_skip_perms
+
+        monkeypatch.setenv('CLAUDE_SPAWN_SKIP_PERMS', 'false')
+
+        assert default_skip_perms() is False
+
+    def test_env_1_resolves_to_true(self, monkeypatch):
+        from cockpit.panes.spawn_bar import default_skip_perms
+
+        monkeypatch.setenv('CLAUDE_SPAWN_SKIP_PERMS', '1')
+
+        assert default_skip_perms() is True
+
+    def test_env_0_resolves_to_false(self, monkeypatch):
+        from cockpit.panes.spawn_bar import default_skip_perms
+
+        monkeypatch.setenv('CLAUDE_SPAWN_SKIP_PERMS', '0')
+
+        assert default_skip_perms() is False
+
+    def test_env_value_is_case_and_whitespace_insensitive(self, monkeypatch):
+        from cockpit.panes.spawn_bar import default_skip_perms
+
+        monkeypatch.setenv('CLAUDE_SPAWN_SKIP_PERMS', '  TRUE  ')
+
+        assert default_skip_perms() is True
+
+    def test_env_yes_resolves_to_true(self, monkeypatch):
+        from cockpit.panes.spawn_bar import default_skip_perms
+
+        monkeypatch.setenv('CLAUDE_SPAWN_SKIP_PERMS', 'yes')
+
+        assert default_skip_perms() is True
