@@ -32,7 +32,7 @@ from pathlib import Path
 import pytest
 
 from orchestrator.config import GitConfig
-from orchestrator.git_ops import BranchResetError, GitOps, _run
+from orchestrator.git_ops import BranchResetError, GitOps, WorktreeInfo, _run
 
 # ---------------------------------------------------------------------------
 # Fixtures — copied from test_git_ops.py's git_repo/git_config/git_ops trio
@@ -213,3 +213,106 @@ class TestRebasePreservingTaskCommitsGuard:
 
         assert result is True
         assert await _commits_over_main(wt) == 0
+
+
+# ---------------------------------------------------------------------------
+# step-3: the two git_ops requeue reuse sites route THROUGH the guard.
+#
+# Warm-lane helpers copied from test_git_ops.py (`_seed_default_warm_base`
+# at :43, `_add_warm_lane_scripts` at :6636) so this file can drive
+# `_reuse_warm_lane` without importing test-internal helpers from another
+# test module.
+# ---------------------------------------------------------------------------
+
+
+def _seed_default_warm_base(repo: Path) -> None:
+    """Pre-create the DEFAULT derived warm-lane base (task 2061) so the
+    acquire_warm_lane pre-acquire base-health gate sees WarmBaseHealth.OK."""
+    default_base = repo / '.worktrees' / '_merge-verify' / 'target'
+    default_base.mkdir(parents=True, exist_ok=True)
+    (default_base / '.keep').write_text('warm base sentinel\n')
+    (repo / '.worktrees' / '.pool-root').touch()
+
+
+async def _add_warm_lane_scripts(repo: Path, port: int = 39411) -> None:
+    """Commit stub seed-warm-lane.sh + setup-worktree-debug-port.sh into repo."""
+    scripts_dir = repo / 'scripts'
+    scripts_dir.mkdir(parents=True, exist_ok=True)
+    seed_script = scripts_dir / 'seed-warm-lane.sh'
+    seed_script.write_text(
+        '#!/usr/bin/env bash\nmkdir -p "$2/target"\necho "seeded" > "$2/target/seeded.bin"\n'
+    )
+    seed_script.chmod(0o755)
+    debug_script = scripts_dir / 'setup-worktree-debug-port.sh'
+    debug_script.write_text(f'#!/usr/bin/env bash\necho {port}\n')
+    debug_script.chmod(0o755)
+    await _run(['git', 'add', '-A'], cwd=repo)
+    await _run(['git', 'commit', '-m', 'add warm-lane scripts'], cwd=repo)
+
+
+@pytest.mark.asyncio
+class TestRequeueReuseSitesRouteThroughGuard:
+    """The cold-requeue (``create_worktree``) and live-requeue
+    (``_reuse_warm_lane``) reuse paths must route through
+    ``rebase_preserving_task_commits`` so a wipe raises BranchResetError
+    and preserves the branch's commit instead of silently losing it.
+
+    RED today (step-3): both sites still call the unguarded
+    ``rebase_onto_main`` directly (rewired to the guard in step-4).
+    """
+
+    async def test_create_worktree_reuse_raises_on_wipe(
+        self, git_ops: GitOps, git_repo: Path, monkeypatch,
+    ):
+        """A second create_worktree() call (the cold-requeue reuse block)
+        that would zero the branch must raise BranchResetError and leave
+        the branch's commit intact."""
+        wt_info = await git_ops.create_worktree('requeue-wipe')
+        wt = wt_info.path
+        await _commit_unique_work(wt)
+        assert await _commits_over_main(wt) == 1
+
+        monkeypatch.setattr(git_ops, 'rebase_onto_main', _wipe_via_reset)
+
+        with pytest.raises(BranchResetError):
+            await git_ops.create_worktree('requeue-wipe')
+
+        assert await _commits_over_main(wt) == 1, (
+            'branch commit must survive the cold-requeue reuse rebase'
+        )
+
+    async def test_reuse_warm_lane_raises_on_wipe(
+        self, git_repo: Path, monkeypatch,
+    ):
+        """_reuse_warm_lane (the live-requeue reuse path) that would zero
+        the branch must raise BranchResetError and preserve the commit."""
+        _seed_default_warm_base(git_repo)
+        await _add_warm_lane_scripts(git_repo)
+        _, start_ref_raw, _ = await _run(['git', 'rev-parse', 'HEAD'], cwd=git_repo)
+        start_ref = start_ref_raw.strip()
+
+        warm_config = GitConfig(
+            main_branch='main',
+            branch_prefix='task/',
+            remote='origin',
+            worktree_dir='.worktrees',
+            push_after_advance=False,
+            warm_lane_pool=True,
+        )
+        warm_git_ops = GitOps(warm_config, git_repo, warm_lane_pool_size=1)
+
+        info = await warm_git_ops.acquire_warm_lane('WR', start_ref)
+        assert isinstance(info, WorktreeInfo), f'Acquire failed: {info!r}'
+        lane = info.path
+
+        await _commit_unique_work(lane, filename='wr_feature.txt')
+        assert await _commits_over_main(lane) == 1
+
+        monkeypatch.setattr(warm_git_ops, 'rebase_onto_main', _wipe_via_reset)
+
+        with pytest.raises(BranchResetError):
+            await warm_git_ops._reuse_warm_lane(lane, 'task/WR')
+
+        assert await _commits_over_main(lane) == 1, (
+            'branch commit must survive the live-requeue (warm-lane) reuse rebase'
+        )
