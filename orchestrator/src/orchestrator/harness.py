@@ -103,17 +103,10 @@ except ImportError:
 
 logger = logging.getLogger(__name__)
 
-# After this many consecutive set_task_status rejections for the same task in
-# the stranded-in-progress / blocked sweep, escalate to L1 instead of looping.
-# A genuine persistent failure (server-side validation contradicts a
-# branch-on-main observation) is L1-worthy; transient PID-liveness or
-# branch-resolution races should clear well before this threshold fires.
-MAX_RECONCILE_FAILURES: int = 5
-
 # Maximum number of same-signature blocked→pending re-pends allowed before the
-# 4th flip is withheld and a born-at-L2 human escalation is filed.
-# Mirrors MAX_RECONCILE_FAILURES shape — a module constant so the value stays
-# inside the declared module scope without touching config.py / defaults.yaml.
+# 4th flip is withheld and a born-at-L2 human escalation is filed.  A module
+# constant so the value stays inside the declared module scope without
+# touching config.py / defaults.yaml.
 _REBLOCK_GUARD_THRESHOLD: int = 3
 
 # Fixed sentinel task_id for the dirty-project-root-at-startup born-at-L2
@@ -1065,9 +1058,6 @@ class Harness:
         # volume's total capacity (making disk-recovery auto-resume unreachable).
         self._no_landings_floor_capacity_warned: bool = False
 
-        # Per-task consecutive-failure counter for the reconcile sweep —
-        # cleared on any successful mark_done, used to gate L1 escalation.
-        self._reconcile_failure_counts: dict[str, int] = {}
         # Wall-clock of the most recent _workflow_cancel_events.set() call,
         # keyed by task_id.  R3-race-guard window — the sweep skips a task
         # whose workflow was cancelled within the last grace period, since
@@ -3385,30 +3375,28 @@ Output JSON matching the schema. Every task must appear in the output.
                     tid, status, mid_run=mid_run,
                 )
             except SetTaskStatusRejected as exc:
-                # Persistence layer refused our write — count strikes; on
-                # threshold, escalate to L1.  Honest log so future operators
-                # can see *why* the task is still stranded instead of the
-                # old "marked done" misnomer.  Other (unexpected) exception
-                # types intentionally propagate so bugs in the sweep surface
-                # rather than being silently skipped.
-                count = self._reconcile_failure_counts.get(tid, 0) + 1
-                self._reconcile_failure_counts[tid] = count
+                # Persistence layer refused our write — escalate directly
+                # (task 2243, W10-θ2 step-14: the per-tid strike counter and
+                # its MAX_RECONCILE_FAILURES threshold gate are retired; a
+                # persistent rejection is now surfaced loudly on the sweep
+                # it occurs, not tallied toward a threshold first).  Honest
+                # log so future operators can see *why* the task is still
+                # stranded instead of the old "marked done" misnomer.
+                # Other (unexpected) exception types intentionally propagate
+                # so bugs in the sweep surface rather than being silently
+                # skipped.
                 logger.error(
-                    '%s: failed to mark task %s done — %s: %s '
-                    '(consecutive failures=%d/%d)',
+                    '%s: failed to mark task %s done — %s: %s',
                     log_prefix, tid, exc.error_code, exc.raw,
-                    count, MAX_RECONCILE_FAILURES,
                 )
-                if count >= MAX_RECONCILE_FAILURES and self._escalation_queue:
-                    self._escalate_reconcile_failure(tid, exc, count)
+                if self._escalation_queue:
+                    self._escalate_reconcile_failure(tid, exc)
                 continue
 
             if outcome == 'marked_done':
                 marked_done += 1
-                self._reconcile_failure_counts.pop(tid, None)
             elif outcome == 'reverted':
                 reverted += 1
-                self._reconcile_failure_counts.pop(tid, None)
 
         if reverted or marked_done:
             logger.info(
@@ -4018,14 +4006,15 @@ Output JSON matching the schema. Every task must appear in the output.
         self,
         tid: str,
         exc: SetTaskStatusRejected,
-        count: int,
     ) -> None:
-        """Submit an L1 escalation for persistent reconcile failure.
+        """Submit an L1 escalation for a persistent reconcile failure.
 
-        Fired when the same task has rejected ``mark_done`` MAX_RECONCILE_FAILURES
-        consecutive sweeps in a row — i.e. the persistence layer
-        contradicts a branch-on-main observation persistently enough that
-        steward-mediated retry can't unstick it.
+        Fired directly on every ``mark_done`` rejection the reconcile sweep
+        observes for *tid* (task 2243, W10-θ2 step-14 — the per-tid strike
+        counter and its ``MAX_RECONCILE_FAILURES`` threshold gate are
+        retired): the persistence layer contradicts a branch-on-main
+        observation, which is L1-worthy on its own without waiting for a
+        run of consecutive sweeps to confirm it.
         """
         if not self._escalation_queue:
             return
@@ -4037,13 +4026,10 @@ Output JSON matching the schema. Every task must appear in the output.
             agent_role='harness-reconcile',
             severity='blocking',
             category='reconcile_persistent_rejection',
-            summary=(
-                f'Reconcile sweep failed to mark task {tid} done '
-                f'{count}x consecutively'
-            )[:200],
+            summary=f'Reconcile sweep failed to mark task {tid} done'[:200],
             detail=(
-                f'set_task_status(done) rejected by fused-memory after '
-                f'{count} consecutive sweeps for task {tid}.\n\n'
+                f'set_task_status(done) rejected by fused-memory for task '
+                f'{tid}.\n\n'
                 f'error_code: {exc.error_code}\n'
                 f'raw: {exc.raw}\n\n'
                 f'The branch was observed on main (or a merge marker was '
@@ -4055,10 +4041,6 @@ Output JSON matching the schema. Every task must appear in the output.
             suggested_action='investigate_persistence_layer_rejection',
         )
         self._escalation_queue.submit(esc)
-        # Reset counter so we don't re-escalate every sweep — operator
-        # action will resolve and the next true rejection (if any) starts
-        # a fresh strike count.
-        self._reconcile_failure_counts.pop(tid, None)
 
     # Synthetic task_id for scheduler-pause escalations.  Filename-safe for
     # EscalationQueue.make_id (yields esc-__scheduler__-N); never a real task,
