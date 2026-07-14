@@ -416,3 +416,65 @@ class TestParsePiStreamError:
         agent_result = _parse_pi_output(result, 'anthropic/claude-haiku-4-5')
         assert agent_result.success is False
         assert agent_result.subtype == 'error'
+
+
+class TestParsePiCostFallback:
+    """`_parse_pi_output` falls back to the config price table
+    (`_estimate_cost`, task 2459) ONLY when pi's native per-message
+    `usage.cost.total` is absent or zero — the exotic custom-provider/
+    base-url case the spike calls out (Q2). When native cost IS present
+    and non-zero, it wins and the price table is not consulted."""
+
+    def _build_stdout(self, *, cost_total: float | None) -> str:
+        usage = {'input': 400, 'output': 200, 'totalTokens': 600}
+        if cost_total is not None:
+            usage['cost'] = {'total': cost_total}
+        message = {
+            'role': 'assistant',
+            'stopReason': 'stop',
+            'usage': usage,
+            'content': [{'type': 'text', 'text': 'done'}],
+        }
+        events = [
+            {'type': 'session', 'id': 'sess-fallback'},
+            {'type': 'turn_end', 'message': message},
+            {'type': 'agent_end', 'messages': [message], 'willRetry': False},
+            {'type': 'agent_settled'},
+        ]
+        return '\n'.join(json.dumps(e) for e in events)
+
+    def test_no_native_cost_falls_back_to_price_table(self):
+        """No `cost` sub-object at all on the assistant usage -> the config
+        price table (_estimate_cost) is consulted, using a deliberately
+        non-seed rate to prove it's not a coincidental match."""
+        payload = self._build_stdout(cost_total=None)
+        result = _make_subprocess_result(stdout=payload, returncode=0)
+        agent_result = _parse_pi_output(
+            result, 'o4-mini',
+            prices={'o4-mini': {'input_per_1m': 100.0, 'output_per_1m': 100.0}},
+        )
+        assert agent_result.success is True
+        assert agent_result.cost_usd == pytest.approx((400 * 100.0 + 200 * 100.0) / 1_000_000)
+
+    def test_zero_native_cost_falls_back_to_price_table(self):
+        """`cost.total`==0.0 (present but zero) is treated the same as
+        absent -> the price table fallback still applies."""
+        payload = self._build_stdout(cost_total=0.0)
+        result = _make_subprocess_result(stdout=payload, returncode=0)
+        agent_result = _parse_pi_output(
+            result, 'o4-mini',
+            prices={'o4-mini': {'input_per_1m': 100.0, 'output_per_1m': 100.0}},
+        )
+        assert agent_result.cost_usd == pytest.approx((400 * 100.0 + 200 * 100.0) / 1_000_000)
+
+    def test_nonzero_native_cost_wins_over_price_table(self):
+        """`cost.total` present and >0 -> the native value is used verbatim;
+        the price table (a deliberately different, non-matching rate) is
+        NOT consulted."""
+        payload = self._build_stdout(cost_total=0.01234)
+        result = _make_subprocess_result(stdout=payload, returncode=0)
+        agent_result = _parse_pi_output(
+            result, 'o4-mini',
+            prices={'o4-mini': {'input_per_1m': 100.0, 'output_per_1m': 100.0}},
+        )
+        assert agent_result.cost_usd == pytest.approx(0.01234)
