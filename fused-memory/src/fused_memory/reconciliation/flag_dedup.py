@@ -1536,15 +1536,21 @@ def confirm_task_absent(get_task_result: object) -> bool:
     Recognises the not-found signal produced by the SQLite task backend /
     get_task MCP wrapper: a dict where **both** of the following hold:
 
-    * ``error_type == 'TaskmasterError'`` — tightens the match to the
-      structured backend error class rather than relying on a phrase alone.
+    * ``error_type`` is ``'TaskmasterError'`` or ``'TaskNotFoundError'`` —
+      tightens the match to the structured backend error class(es) rather
+      than relying on a phrase alone. ``TaskNotFoundError`` is the more
+      specific ``TaskmasterError`` subclass that ``get_task`` raises on a
+      definitive zero-row absence (task-2521); ``TaskmasterError`` itself is
+      kept for backward compatibility with any caller still surfacing the
+      base type (e.g. an older MCP wrapper).
     * The ``error`` string contains 'No tasks found for ID(s)' (case-insensitive).
 
     Requiring the structured ``error_type`` reduces the risk of misclassifying
     an unrelated backend message that happens to embed the not-found phrase,
     while still matching the MCP-wrapper ``{error, error_type}`` dict and the
     normalised ``{'error': str(exc), 'error_type': type(exc).__name__}`` dict
-    produced by filter_false_absence_flags for raised TaskmasterErrors.
+    produced by filter_false_absence_flags for raised TaskmasterErrors (base
+    or the TaskNotFoundError subclass).
 
     All other inputs — a valid task record, a generic/inconclusive error, None,
     an empty dict, or a non-dict value — return False (fail-closed).  The
@@ -1558,8 +1564,9 @@ def confirm_task_absent(get_task_result: object) -> bool:
 
     Returns:
         True if and only if the result is a dict whose ``error_type`` is
-        ``'TaskmasterError'`` and whose ``error`` string contains the canonical
-        not-found phrase.  False in all other cases.
+        ``'TaskmasterError'`` or ``'TaskNotFoundError'`` and whose ``error``
+        string contains the canonical not-found phrase.  False in all other
+        cases.
     """
     if not isinstance(get_task_result, dict):
         return False
@@ -1567,7 +1574,7 @@ def confirm_task_absent(get_task_result: object) -> bool:
     if not isinstance(error, str):
         return False
     error_type = get_task_result.get('error_type', '')
-    return error_type == 'TaskmasterError' and _NOT_FOUND_PHRASE in error.lower()
+    return error_type in {'TaskmasterError', 'TaskNotFoundError'} and _NOT_FOUND_PHRASE in error.lower()
 
 
 # --------------------------------------------------------------------------- #
