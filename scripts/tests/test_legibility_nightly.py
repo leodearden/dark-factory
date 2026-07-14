@@ -13,6 +13,7 @@ the commit path is genuinely exercised without risking main.
 from __future__ import annotations
 
 import json
+import subprocess
 from datetime import date
 from pathlib import Path
 
@@ -179,6 +180,129 @@ def test_build_digests_isolates_extractor_crash(tmp_path):
     session_name, reason = extractor_failures[0]
     assert session_name == session_path.name
     assert 'boom' in reason
+
+
+# ---------------------------------------------------------------------------
+# step-7/8: git helpers (_git_status_changed, _git_commit_docs_only) --
+# against a REAL tmp `git init` repo, plus a fake-runner ref-lock retry test.
+# ---------------------------------------------------------------------------
+
+_CODEBOOK_RELPATH = Path('docs') / 'legibility' / 'confusion-codebook.yaml'
+
+
+def _init_repo(tmp_path: Path) -> Path:
+    repo = tmp_path / 'repo'
+    repo.mkdir()
+    subprocess.run(['git', 'init', '-q', '-b', 'main'], cwd=repo, check=True)
+    subprocess.run(['git', 'config', 'user.email', 'test@example.com'], cwd=repo, check=True)
+    subprocess.run(['git', 'config', 'user.name', 'Test'], cwd=repo, check=True)
+    docs = repo / 'docs' / 'legibility'
+    docs.mkdir(parents=True)
+    (docs / 'confusion-codebook.yaml').write_text('version: 2\nentries: []\n', encoding='utf-8')
+    subprocess.run(['git', 'add', '.'], cwd=repo, check=True)
+    subprocess.run(['git', 'commit', '-q', '-m', 'initial'], cwd=repo, check=True)
+    return repo
+
+
+def test_git_status_changed_detects_dirty_codebook(tmp_path):
+    repo = _init_repo(tmp_path)
+
+    assert nightly._git_status_changed(repo, _CODEBOOK_RELPATH) is False
+
+    (repo / _CODEBOOK_RELPATH).write_text(
+        'version: 2\nentries: []\ncandidates: []\n', encoding='utf-8',
+    )
+
+    assert nightly._git_status_changed(repo, _CODEBOOK_RELPATH) is True
+
+
+def test_git_commit_docs_only_commits_only_that_path(tmp_path):
+    repo = _init_repo(tmp_path)
+    (repo / _CODEBOOK_RELPATH).write_text(
+        'version: 2\nentries: []\ncandidates: []\n', encoding='utf-8',
+    )
+    (repo / 'scratch.txt').write_text('unrelated wip\n', encoding='utf-8')
+
+    result = nightly._git_commit_docs_only(repo, [_CODEBOOK_RELPATH], 'legibility: nightly sightings')
+
+    assert result.ok is True
+    assert result.sha
+
+    status = subprocess.run(
+        ['git', 'status', '--porcelain'], cwd=repo, check=True, capture_output=True, text=True,
+    ).stdout
+    assert 'scratch.txt' in status
+    assert 'confusion-codebook.yaml' not in status
+
+    shown = subprocess.run(
+        ['git', 'show', '--stat', '--format=', 'HEAD'],
+        cwd=repo, check=True, capture_output=True, text=True,
+    ).stdout
+    assert 'confusion-codebook.yaml' in shown
+    assert 'scratch.txt' not in shown
+
+
+def test_git_commit_docs_only_noop_returns_not_ok(tmp_path):
+    repo = _init_repo(tmp_path)
+
+    result = nightly._git_commit_docs_only(repo, [_CODEBOOK_RELPATH], 'legibility: no-op')
+
+    assert result.ok is False
+
+
+def test_git_commit_docs_only_retries_on_ref_lock_then_succeeds(tmp_path):
+    calls = {'commit_attempts': 0}
+
+    def fake_runner(args, **kwargs):
+        if 'commit' in args:
+            calls['commit_attempts'] += 1
+            if calls['commit_attempts'] < 3:
+                return subprocess.CompletedProcess(args, 1, stdout='', stderr='fatal: cannot lock ref ...')
+            return subprocess.CompletedProcess(args, 0, stdout='', stderr='')
+        if 'rev-parse' in args:
+            return subprocess.CompletedProcess(args, 0, stdout='deadbeef\n', stderr='')
+        raise AssertionError(f'unexpected git invocation: {args}')
+
+    result = nightly._git_commit_docs_only(
+        tmp_path, [_CODEBOOK_RELPATH], 'msg', runner=fake_runner, retries=5, backoff=0,
+    )
+
+    assert result.ok is True
+    assert result.sha == 'deadbeef'
+    assert calls['commit_attempts'] == 3
+
+
+def test_git_commit_docs_only_gives_up_on_persistent_lock_error(tmp_path):
+    def fake_runner(args, **kwargs):
+        if 'commit' in args:
+            return subprocess.CompletedProcess(args, 1, stdout='', stderr='fatal: cannot lock ref ...')
+        raise AssertionError(f'unexpected git invocation: {args}')
+
+    result = nightly._git_commit_docs_only(
+        tmp_path, [_CODEBOOK_RELPATH], 'msg', runner=fake_runner, retries=3, backoff=0,
+    )
+
+    assert result.ok is False
+
+
+def test_git_commit_docs_only_never_invokes_stash(tmp_path, monkeypatch):
+    calls = []
+    real_run = subprocess.run
+
+    def spy_run(args, **kwargs):
+        calls.append(args)
+        return real_run(args, **kwargs)
+
+    monkeypatch.setattr(nightly.subprocess, 'run', spy_run)
+
+    repo = _init_repo(tmp_path)
+    (repo / _CODEBOOK_RELPATH).write_text(
+        'version: 2\nentries: []\ncandidates: []\n', encoding='utf-8',
+    )
+
+    nightly._git_commit_docs_only(repo, [_CODEBOOK_RELPATH], 'msg')
+
+    assert not any('stash' in call for call in calls)
 
 
 # ---------------------------------------------------------------------------
