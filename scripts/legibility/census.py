@@ -561,6 +561,61 @@ def render_report(
 # -> matrix -> codebook update -> file tasks -> report -> advance state
 # ---------------------------------------------------------------------------
 
+def _novel_clusters(records: list[dict]) -> list[dict]:
+    """Build one verification cluster per candidate carried by a
+    non-duplicate mining record (``is_duplicate`` False -- a candidate is
+    itself the novelty signal, so every candidate on a novel record becomes
+    its own cluster). Each cluster is shaped to satisfy both
+    ``compute_matrix`` (a ``sightings`` list, each carrying
+    ``origin_phase``/``manifested_phase``) and ``build_task_payloads``
+    (``title``/``summary``/``evidence``/``sightings``) without needing to
+    re-consult the source record. Duplicate records (zero candidates)
+    contribute nothing here -- they still flow into the codebook merge via
+    their ``matches``, just not into verification."""
+    clusters = []
+    for record in records:
+        if is_duplicate(record):
+            continue
+        session = record.get("session")
+        for candidate in record.get("candidates") or []:
+            title = candidate.get("title") or "Untitled confusion cluster"
+            origin_phase = candidate.get("origin_phase") or "unknown"
+            manifested_phase = candidate.get("manifested_phase") or "unknown"
+            evidence_quote = candidate.get("evidence_quote")
+            clusters.append(
+                {
+                    "title": title,
+                    "summary": candidate.get("cause") or title,
+                    "cause": candidate.get("cause"),
+                    "area": candidate.get("area"),
+                    "origin_phase": origin_phase,
+                    "manifested_phase": manifested_phase,
+                    "evidence": [evidence_quote] if evidence_quote else [],
+                    "sightings": [
+                        {
+                            "session": session,
+                            "origin_phase": origin_phase,
+                            "manifested_phase": manifested_phase,
+                        }
+                    ],
+                }
+            )
+    return clusters
+
+
+def _find_pending_candidate_id(cb: dict, title: str | None) -> str | None:
+    """Locate a still-``pending`` candidate in *cb* by *title* -- the same
+    key ``codebook.apply_coding_record`` groups new candidates by, so a
+    verified/rejected cluster (built pre-merge from a raw mining record) can
+    be resolved to the REAL candidate id the merge just assigned it. Returns
+    ``None`` if no such pending candidate exists (defensive -- should not
+    happen for a title that came from this run's own mining records)."""
+    for candidate in cb.get("candidates") or []:
+        if candidate.get("title") == title and candidate.get("disposition") == "pending":
+            return candidate.get("id")
+    return None
+
+
 @dataclass
 class CensusOutcome:
     """Outcome of ``run_census``. ``status`` is ``"deferred"`` (headroom
@@ -608,8 +663,20 @@ def run_census(
     deferral, logs loudly, and returns immediately -- no batch is pulled
     from *batch_source*, no ``submit_fn``/``codebook.dump``/
     ``advance_census_state`` call happens. Otherwise falls through to the
-    mine -> verify -> synthesize -> matrix -> codebook-update -> file-
-    tasks -> report -> advance-state happy path.
+    happy path: ``mine_to_saturation`` (Sonnet miners, ``census_miner``) ->
+    split records into duplicates vs novel clusters -> ``verify_fn``
+    (Sonnet, ``census_verify``, asserts observations vs current main, never
+    diagnoses -- lesson guards-assert-unverified-diagnoses) ->
+    ``synthesize_fn`` (Fable, ``census_synthesis`` -- clustering/prose ONLY
+    here) -> ``compute_matrix``/``render_matrix`` over verified sightings ->
+    merge every mining record via ``codebook.apply_coding_record`` -> apply
+    ``promote_candidate``/``reject_candidate`` for verified/rejected
+    clusters (resolved to the merge's real candidate ids by title) and
+    ``retire_entry`` for any entry ids *verify_fn* reports fixed ->
+    ``codebook.validate`` + ``codebook.dump`` -> ``build_task_payloads`` +
+    *submit_fn* per payload -> ``render_report`` -> write the report to
+    *report_path* -> ``advance_census_state`` (done-count from
+    *status_fetcher*) -> best-effort *commit* of report + codebook + state.
     """
     headroom = preflight_headroom(invoke, model=config.models.trickle)
     if not headroom.ok:
@@ -623,4 +690,98 @@ def run_census(
         )
         return CensusOutcome(status="deferred", reason=reason)
 
-    raise NotImplementedError("run_census happy path is implemented in step-20")
+    mining_result = mine_to_saturation(
+        batch_source,
+        codebook_dict,
+        project=project_id,
+        model=config.models.census_miner,
+        config=config.census.saturation,
+        invoke=invoke,
+    )
+
+    novel_clusters = _novel_clusters(mining_result.records)
+    verify_result = verify_fn(novel_clusters, model=config.models.census_verify) or {}
+    verified = verify_result.get("verified") or []
+    rejected = verify_result.get("rejected") or []
+    fixed_entry_ids = verify_result.get("fixed") or []
+
+    synthesis_md = synthesize_fn(verified, model=config.models.census_synthesis)
+
+    verified_sightings = [s for cluster in verified for s in (cluster.get("sightings") or [])]
+    matrix_md = render_matrix(compute_matrix(verified_sightings))
+
+    updated_codebook = codebook_dict
+    for record in mining_result.records:
+        updated_codebook, _stats = codebook.apply_coding_record(updated_codebook, record)
+
+    for cluster in verified:
+        cand_id = _find_pending_candidate_id(updated_codebook, cluster.get("title"))
+        if cand_id is None:
+            continue
+        entry_fields = {
+            "id": f"entry-{cand_id}",
+            "title": cluster.get("title"),
+            "severity": cluster.get("severity") or "medium",
+            "status": "open",
+            "origin_phase": cluster.get("origin_phase") or "unknown",
+            "manifested_phase": cluster.get("manifested_phase") or "unknown",
+        }
+        updated_codebook = promote_candidate(updated_codebook, cand_id, entry_fields)
+
+    for cluster in rejected:
+        cand_id = _find_pending_candidate_id(updated_codebook, cluster.get("title"))
+        if cand_id is not None:
+            updated_codebook = reject_candidate(updated_codebook, cand_id)
+
+    for entry_id in fixed_entry_ids:
+        updated_codebook = retire_entry(updated_codebook, entry_id)
+
+    validation_errors = codebook.validate(updated_codebook)
+    if validation_errors:
+        raise RuntimeError(
+            f"census: codebook merge produced an invalid codebook: {validation_errors}"
+        )
+    codebook.dump(updated_codebook, codebook_path)
+
+    task_payloads = build_task_payloads(verified, project_root=project_root, project_id=project_id)
+    filed_task_ids = [submit_fn(**payload).get("id") for payload in task_payloads]
+
+    cost_note = (
+        f"invoke calls: {config.models.census_miner} miner="
+        f"{sum(s.total for s in mining_result.batch_stats)}, "
+        f"{config.models.census_verify} verify=1, "
+        f"{config.models.census_synthesis} synthesis=1, "
+        f"{config.models.trickle} headroom-probe=1"
+    )
+    report_md = render_report(
+        date=date,
+        project_id=project_id,
+        force=force,
+        matrix_md=matrix_md,
+        mining_result=mining_result,
+        synthesis_md=synthesis_md,
+        filed_task_ids=filed_task_ids,
+        cost_note=cost_note,
+    )
+    Path(report_path).write_text(report_md, encoding="utf-8")
+
+    status = status_fetcher()
+    done_count = sum(1 for v in (status.get("statuses") or {}).values() if v == "done")
+    advance_census_state(
+        census_state_path, now_iso=date, report_path=str(report_path), done_count=done_count,
+    )
+
+    try:
+        commit(
+            paths=[str(report_path), str(codebook_path), str(census_state_path)],
+            message=f"legibility census {date}",
+        )
+    except Exception as exc:  # noqa: BLE001 - best-effort, never fails the census
+        logger.warning("census: best-effort commit failed: %s", exc)
+
+    return CensusOutcome(
+        status="done",
+        report_path=str(report_path),
+        filed_task_ids=filed_task_ids,
+        stop_reason=mining_result.stop_reason,
+    )
