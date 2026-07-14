@@ -131,6 +131,16 @@ def _read_exclude_file(path: Path | None) -> frozenset[str]:
     return frozenset(ids)
 
 
+def _snapshot_pending_ids(queue_dir: Path) -> frozenset[str]:
+    """Return the set of esc-ids (filename stems) present in queue_dir right now.
+
+    Used by --baseline to freeze a launch-time exclusion snapshot so a
+    watcher run only fires on items filed AFTER it started, instead of
+    hand-listing every already-pending id via --exclude-id.
+    """
+    return frozenset(p.stem for p in queue_dir.glob('esc-*.json'))
+
+
 def _send_ntfy(url: str, escalation: Escalation) -> None:
     """POST an escalation as a push notification to an ntfy.sh endpoint."""
     is_urgent = escalation.severity in (BORN_AT_L2_SEVERITIES | {'blocking'})
@@ -179,6 +189,13 @@ def main() -> None:
             'poll; repeated ids skip initial scan AND event loop'
         ),
     )
+    parser.add_argument(
+        '--baseline', action='store_true',
+        help=(
+            'snapshot pending esc-ids at launch; fire only on items NOT in '
+            'that snapshot, instead of hand-listing every already-pending id'
+        ),
+    )
     args = parser.parse_args()
 
     queue_dir = Path(args.queue_dir)
@@ -190,12 +207,16 @@ def main() -> None:
     exclude_file_path = Path(args.exclude_file) if args.exclude_file else None
 
     def current_excludes() -> frozenset[str]:
-        return static_exclude | _read_exclude_file(exclude_file_path)
+        return static_exclude | baseline_ids | _read_exclude_file(exclude_file_path)
 
     # ARM inotify first so no events are missed between scan and watch.
     inotify = INotify()
     watch_flags = flags.CREATE | flags.MOVED_TO
     inotify.add_watch(str(queue_dir), watch_flags)
+
+    # Baseline is frozen ONCE here (right after arming inotify, before the
+    # initial scan) -- unlike --exclude-file, it is never re-read.
+    baseline_ids = _snapshot_pending_ids(queue_dir) if args.baseline else frozenset()
 
     # Initial scan: emit any already-pending escalation and exit immediately.
     match = _initial_scan(queue_dir, args.task_id, args.level, current_excludes())
