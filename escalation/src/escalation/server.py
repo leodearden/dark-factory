@@ -1071,8 +1071,11 @@ def create_server(
         # too.  verified_green is a caller-supplied vouch — only the caller
         # (which just ran the verification) can know it happened; the server
         # cannot infer it.  base_sha is best-effort/informational only (the
-        # classifier ignores it); event_store None-safety is added in step-4.
-        if verified_green:
+        # classifier ignores it).  event_store is None for a standalone
+        # server (no orchestrator wired) — guarded so this degrades to no
+        # attribution instead of raising (fail-open, mirrors the git-error
+        # None-degrade inside _resolve_dispatch_time_merge_base).
+        if verified_green and event_store is not None:
             from orchestrator.event_store import (  # type: ignore[reportMissingImports]
                 EventType,
             )
