@@ -54,6 +54,40 @@ Acceptance: every fixture flags with the correct slug — all 10 rows `Y`.
 
 ## INV-1 `contracts-machine-checked`
 
+### PRD-leaf-shaped (`INV-1-PRD`)
+
+> Add a `priority_boost` fast path: the scheduler's dispatch loop
+> special-cases `metadata.priority_boost == true` to jump a task to the
+> front of the queue. No schema field, no `submit_task` validation — the
+> convention is documented only in this decomposition-plan row and in the
+> on-call runbook.
+
+**Expected disposition**: `flag: contracts-machine-checked`
+
+**Redesign that clears it**: Declare `priority_boost` as a first-class,
+validated `submit_task` parameter (`ValidationError`+hint guard at the
+submit boundary, per the INV-1 house pattern), persisted to `metadata` and
+checked at dispatch — not a bare dict-get special-case buried in the
+dispatch loop.
+
+### Code-snippet-shaped (`INV-1-CODE`)
+
+```python
+def dispatch_next(tasks):
+    for t in tasks:
+        # priority_boost: agreed informally with the on-call team,
+        # not declared anywhere in the task schema
+        if t.metadata.get("priority_boost"):
+            return t
+    return tasks[0] if tasks else None
+```
+
+**Expected `invariant_findings` entry**:
+
+```json
+{"invariant": "contracts-machine-checked", "file": "orchestrator/src/orchestrator/priority_router.py", "line": 5, "issue": "priority_boost routing contract lives only in a dispatcher-internal special-case and prose comment, not a declared/validated schema field", "severity": "high"}
+```
+
 ## INV-2 `structured-facts-at-failure`
 
 ## INV-3 `corroborate-before-acting`
