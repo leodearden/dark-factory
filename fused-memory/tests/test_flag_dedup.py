@@ -14,8 +14,28 @@ import pytest_asyncio
 
 from fused_memory.backends.task_backend_errors import TaskmasterError
 from fused_memory.models.memory import AddMemoryResponse
+from fused_memory.reconciliation import flag_dedup
 from fused_memory.reconciliation.flag_dedup import build_suppression_payload
 from fused_memory.reconciliation.recon_ledger import ReconLedgerRecord, ReconLedgerStore
+
+
+@pytest.fixture(autouse=True)
+def _reset_flag_type_family_collision_warning_cache():
+    """Reset filter_suppressed's process-lifetime family-collision warning
+    memo (task 2503 amendment, reviewer_comprehensive robustness_log_noise)
+    before AND after every test in this module.
+
+    The cache is deliberately process-lifetime (not per-call) so a
+    persistent benign collision does not flood production logs every
+    reconciliation cycle -- see _WARNED_FLAG_TYPE_FAMILY_COLLISIONS. Without
+    this autouse reset, whichever test happens to run first for a given
+    (project_id, task_id, family) key would "use up" the one-time WARNING
+    and silently make a later test's assertion order-dependent.
+    """
+    flag_dedup._WARNED_FLAG_TYPE_FAMILY_COLLISIONS.clear()
+    yield
+    flag_dedup._WARNED_FLAG_TYPE_FAMILY_COLLISIONS.clear()
+
 
 # ---------------------------------------------------------------------------
 # compute_flag_signature tests (step-1)
@@ -2186,6 +2206,36 @@ class TestWriteSuppressionRecordPreWriteCheck:
 
         ledger_memory_service.add_memory.assert_not_called()
         assert result == AddMemoryResponse(memory_ids=[])
+
+    @pytest.mark.asyncio
+    async def test_scoped_only_coverage_does_not_skip_blanket_write(
+        self, ledger_memory_service
+    ):
+        """(i) The inverse of (b): a pre-existing SCOPED-only row must NOT
+        cover a subsequent BLANKET write for the same task_id -- only an
+        existing WILDCARD row can cover a blanket write
+        (``_is_covered('')`` is False whenever ``wildcard_covered`` is
+        False). A blanket suppression is strictly broader than any scoped
+        row, so it must always proceed and widen coverage rather than being
+        silently skipped (task 2503 amendment, reviewer_comprehensive
+        test_coverage)."""
+        from fused_memory.reconciliation.flag_dedup import write_suppression_record
+
+        await _seed_suppression(
+            ledger_memory_service.recon_ledger, 'p', '9', 'missing_deliverable'
+        )
+
+        result = await write_suppression_record(ledger_memory_service, project_id='p', task_id=9)
+
+        rows = await ledger_memory_service.recon_ledger.list_suppressions('p')
+        assert {row.flag_type for row in rows} == {'missing_deliverable', ''}
+        assert len(rows) == 2
+
+        ledger_memory_service.add_memory.assert_called_once()
+        kwargs = ledger_memory_service.add_memory.call_args.kwargs
+        assert kwargs['metadata']['task_id'] == '9'
+        assert 'flag_types' not in kwargs['metadata']
+        assert result.memory_ids == ['mirror-id']
 
     @pytest.mark.asyncio
     async def test_partial_subset_writes_only_uncovered_flag_types(self, ledger_memory_service):
