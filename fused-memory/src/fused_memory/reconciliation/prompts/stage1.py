@@ -506,10 +506,12 @@ When the item you are flagging is this kind of one-time completed/bookkeeping wo
 that is NOT destined for Stage 2 task planning, set `flag_for_stage2=false` \
 explicitly on that flagged item, and also note the completed work in your per-cycle \
 summary. The code post-processor (`flag_dedup.dedup_flags`) treats an explicit \
-`flag_for_stage2=false` as a completion marker: it emits the `stage1_flag_marker` \
-and then immediately self-deletes it — and any priors for the same \
+`flag_for_stage2=false` as a completion signal: it persists no recurring marker \
+for this item, and it reaps any prior `recon_ledger` row for the same \
 (task_id, flag_type) signature — within the SAME cycle, so it never orphans \
-awaiting a recurrence that will never come.
+awaiting a recurrence that will never come. This is a code-managed ledger \
+operation (task 2406): you do not write a `stage1_flag_marker` memory \
+yourself — `add_memory` is not a valid path for it.
 
 **Do NOT set `flag_for_stage2=false` on a recurring finding** — one that may \
 resurface in a future cycle and needs the deduplicator's cross-cycle marker to \
