@@ -17,6 +17,7 @@ mechanics).
 from __future__ import annotations
 
 import json
+from datetime import date as dt_date
 from pathlib import Path
 
 from legibility import inventory as mod
@@ -127,3 +128,74 @@ class TestSessionCwd:
 
     def test_returns_none_for_unreadable_path(self, tmp_path):
         assert mod.session_cwd(tmp_path / 'does-not-exist.jsonl') is None
+
+
+class TestEnumerateSessions:
+    """enumerate_sessions aggregates across every matching encoded dir
+    (never one-dir-per-project), filters by first-timestamp UTC date,
+    stamps real size_bytes, and skips non-.jsonl / empty / fully-malformed
+    files without raising."""
+
+    TARGET_DATE = dt_date(2026, 7, 13)
+
+    def _build_tree(self, tmp_path: Path) -> Path:
+        projects_root = tmp_path / 'projects'
+        main_dir = projects_root / '-home-leo-src-dark-factory'
+        worktree_dir = projects_root / '-home-leo-src-dark-factory--worktrees-2573'
+        main_dir.mkdir(parents=True)
+        worktree_dir.mkdir(parents=True)
+
+        # Target-date session in the main dir.
+        _write_session(main_dir, 'main-target', MAIN_CWD, timestamp='2026-07-13T09:00:00.000Z')
+        # Different-date session in the main dir — must be excluded.
+        _write_session(
+            main_dir, 'main-other-date', MAIN_CWD, timestamp='2026-07-12T09:00:00.000Z'
+        )
+        # Target-date session in the worktree dir — proves aggregation
+        # across multiple encoded dirs, not just the main one.
+        _write_session(
+            worktree_dir, 'worktree-target', WORKTREE_CWD, timestamp='2026-07-13T11:00:00.000Z'
+        )
+
+        # A non-.jsonl file: excluded by the *.jsonl glob itself.
+        (main_dir / 'notes.txt').write_text('not a transcript')
+        # An empty .jsonl file: must be skipped, not raise.
+        (main_dir / 'empty.jsonl').write_text('')
+        # A fully-malformed .jsonl file (no valid JSON line at all, so no
+        # cwd/timestamp is derivable): must be skipped, not raise.
+        (main_dir / 'garbage.jsonl').write_text('not json\n{{{broken\n')
+
+        return projects_root
+
+    def test_returns_only_target_date_sessions(self, tmp_path):
+        projects_root = self._build_tree(tmp_path)
+        records = mod.enumerate_sessions(projects_root, [MAIN_CWD], self.TARGET_DATE)
+        assert {r.path.stem for r in records} == {'main-target', 'worktree-target'}
+
+    def test_aggregates_across_multiple_encoded_dirs(self, tmp_path):
+        projects_root = self._build_tree(tmp_path)
+        records = mod.enumerate_sessions(projects_root, [MAIN_CWD], self.TARGET_DATE)
+        assert {r.encoded_dir for r in records} == {
+            '-home-leo-src-dark-factory',
+            '-home-leo-src-dark-factory--worktrees-2573',
+        }
+
+    def test_size_bytes_matches_real_file_size(self, tmp_path):
+        projects_root = self._build_tree(tmp_path)
+        records = mod.enumerate_sessions(projects_root, [MAIN_CWD], self.TARGET_DATE)
+        assert records  # sanity: the fixture does produce records
+        for record in records:
+            assert record.size_bytes == record.path.stat().st_size
+
+    def test_excludes_different_date_session(self, tmp_path):
+        projects_root = self._build_tree(tmp_path)
+        records = mod.enumerate_sessions(projects_root, [MAIN_CWD], self.TARGET_DATE)
+        assert 'main-other-date' not in {r.path.stem for r in records}
+
+    def test_skips_non_jsonl_empty_and_malformed_without_raising(self, tmp_path):
+        projects_root = self._build_tree(tmp_path)
+        records = mod.enumerate_sessions(projects_root, [MAIN_CWD], self.TARGET_DATE)
+        names = {r.path.stem for r in records}
+        assert 'notes' not in names
+        assert 'empty' not in names
+        assert 'garbage' not in names
