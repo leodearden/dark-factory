@@ -77,8 +77,17 @@ def _deploy_task(
     before_done_verified_pid: int | None = None,
     before_done_scheduled_at: dict | None = None,
     description: str = 'Cross-unit deploy of the reify worker',
+    phase: str | None = None,
+    verify_baseline: dict | None = None,
 ) -> dict:
-    """Build a deterministic deploy task dict (before_done set, always_escalates=False)."""
+    """Build a deterministic deploy task dict (before_done set, always_escalates=False).
+
+    ``phase`` (+ optional ``verify_baseline``), when given, seeds a ζ
+    ``metadata['deploy_state']`` slice (``{'phase': phase}``, merging in
+    ``verify_baseline`` when provided). Omitting ``phase`` (the default)
+    keeps the pre-ζ stamp-only shape — no ``deploy_state`` key at all — so
+    existing backward-compat parity tests are unaffected.
+    """
     before_done: dict = {
         'script': script,
         'args': args if args is not None else [],
@@ -100,6 +109,11 @@ def _deploy_task(
         metadata['before_done_verified_pid'] = before_done_verified_pid
     if before_done_scheduled_at is not None:
         metadata['before_done_scheduled_at'] = before_done_scheduled_at
+    if phase is not None:
+        deploy_state: dict = {'phase': phase}
+        if verify_baseline is not None:
+            deploy_state['verify_baseline'] = verify_baseline
+        metadata['deploy_state'] = deploy_state
     return {
         'id': task_id,
         'title': 'Deploy orchestrator-reify',

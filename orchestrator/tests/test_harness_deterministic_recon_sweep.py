@@ -230,9 +230,19 @@ class TestReconInspectUnit:
 # ---------------------------------------------------------------------------
 
 
-def _strand_metadata(**overrides) -> dict:
-    """Canonical stranded-deterministic-shape metadata (task 2059 EVIDENCE)."""
-    base = {
+def _strand_metadata(
+    phase: str | None = None, verify_baseline: dict | None = None, **overrides
+) -> dict:
+    """Canonical stranded-deterministic-shape metadata (task 2059 EVIDENCE).
+
+    ``phase`` (+ optional ``verify_baseline``), when given, seeds a ζ
+    ``metadata['deploy_state']`` slice (``{'phase': phase}``, merging in
+    ``verify_baseline`` when provided) — the phase-bearing shape used by the
+    phase-based strand classifier tests. Omitting ``phase`` (the default)
+    keeps the pre-ζ stamp-only shape — no ``deploy_state`` key at all — so
+    existing backward-compat parity tests can still build stamp-only tasks.
+    """
+    base: dict = {
         'task_kind': 'deterministic',
         'before_done': {'target_unit': 'fused-memory.service'},
         'before_done_ran_at': '2026-07-01T00:00:00+00:00',
@@ -240,6 +250,11 @@ def _strand_metadata(**overrides) -> dict:
         'gate_escalated_at': None,
         'done_provenance': None,
     }
+    if phase is not None:
+        deploy_state: dict = {'phase': phase}
+        if verify_baseline is not None:
+            deploy_state['verify_baseline'] = verify_baseline
+        base['deploy_state'] = deploy_state
     base.update(overrides)
     return base
 
