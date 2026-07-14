@@ -3,10 +3,13 @@
 from __future__ import annotations
 
 import json
+import logging
 
+import pytest
 from shared.cli_invoke import _SubprocessResult
 
 from orchestrator.agents.invoke import _parse_codex_output, _parse_gemini_output
+from orchestrator.config import PriceEntry
 
 
 def _make_subprocess_result(
@@ -120,3 +123,97 @@ class TestParseCodexValidUsage:
         # o4-mini: input=1.10/1M, output=4.40/1M
         # cost = (200 * 1.10 + 100 * 4.40) / 1_000_000 = 0.00066
         assert agent_result.cost_usd > 0.0
+
+
+class TestParseCodexOutputConfigPrices:
+    """`_parse_codex_output` sources rates from a passed-in config-shaped
+    prices map (task 2459) rather than a hardcoded module-level table.
+    """
+
+    def test_plain_dict_prices_map_used_for_cost(self):
+        events = [
+            {'type': 'thread.started', 'thread_id': 'tid-cfg-1'},
+            {'type': 'item.completed', 'item': {'type': 'agent_message', 'text': 'done'}},
+            {'type': 'turn.completed', 'usage': {'input_tokens': 200, 'output_tokens': 100}},
+        ]
+        payload = '\n'.join(json.dumps(e) for e in events)
+        result = _make_subprocess_result(stdout=payload)
+        agent_result = _parse_codex_output(
+            result, 'o4-mini',
+            prices={'o4-mini': {'input_per_1m': 1.10, 'output_per_1m': 4.40}},
+        )
+        assert agent_result.cost_usd == pytest.approx((200 * 1.10 + 100 * 4.40) / 1_000_000)
+
+    def test_price_entry_valued_prices_map_used_for_cost(self):
+        """A `config.prices`-shaped map (PriceEntry values) is directly consumable,
+        yielding the identical cost as the equivalent plain-dict map."""
+        events = [
+            {'type': 'thread.started', 'thread_id': 'tid-cfg-2'},
+            {'type': 'item.completed', 'item': {'type': 'agent_message', 'text': 'done'}},
+            {'type': 'turn.completed', 'usage': {'input_tokens': 200, 'output_tokens': 100}},
+        ]
+        payload = '\n'.join(json.dumps(e) for e in events)
+        result = _make_subprocess_result(stdout=payload)
+        agent_result = _parse_codex_output(
+            result, 'o4-mini',
+            prices={'o4-mini': PriceEntry(input_per_1m=1.10, output_per_1m=4.40)},
+        )
+        assert agent_result.cost_usd == pytest.approx((200 * 1.10 + 100 * 4.40) / 1_000_000)
+
+    def test_none_prices_resolves_to_packaged_seed_table_without_warning(self, caplog):
+        """The unthreaded (prices=None) path resolves to the packaged seed
+        table — o4-mini is seeded, so no fallback warning is logged."""
+        events = [
+            {'type': 'thread.started', 'thread_id': 'tid-cfg-3'},
+            {'type': 'item.completed', 'item': {'type': 'agent_message', 'text': 'done'}},
+            {'type': 'turn.completed', 'usage': {'input_tokens': 200, 'output_tokens': 100}},
+        ]
+        payload = '\n'.join(json.dumps(e) for e in events)
+        result = _make_subprocess_result(stdout=payload)
+        with caplog.at_level(logging.WARNING):
+            agent_result = _parse_codex_output(result, 'o4-mini')
+        assert agent_result.cost_usd == pytest.approx((200 * 1.10 + 100 * 4.40) / 1_000_000)
+        assert 'o4-mini' not in caplog.text
+
+
+class TestParseGeminiOutputConfigPrices:
+    """`_parse_gemini_output` sources rates from a passed-in config-shaped
+    prices map (task 2459) rather than a hardcoded module-level table.
+    """
+
+    def test_plain_dict_prices_map_used_for_cost(self):
+        payload = json.dumps({
+            'response': 'hello',
+            'stats': {'input_tokens': 100, 'output_tokens': 50},
+        })
+        result = _make_subprocess_result(stdout=payload)
+        agent_result = _parse_gemini_output(
+            result, 'gemini-3-flash',
+            prices={'gemini-3-flash': {'input_per_1m': 0.075, 'output_per_1m': 0.30}},
+        )
+        assert agent_result.cost_usd == pytest.approx((100 * 0.075 + 50 * 0.30) / 1_000_000)
+
+
+class TestParseCodexOutputUnknownModelFallback:
+    """An un-listed model must never silently fall back — it logs a WARNING
+    and uses the single defined `_FALLBACK_PRICE` (task 2459)."""
+
+    def test_unknown_model_logs_warning_and_uses_fallback_price(self, caplog):
+        events = [
+            {'type': 'thread.started', 'thread_id': 'tid-fallback-1'},
+            {'type': 'item.completed', 'item': {'type': 'agent_message', 'text': 'done'}},
+            {'type': 'turn.completed', 'usage': {'input_tokens': 200, 'output_tokens': 100}},
+        ]
+        payload = '\n'.join(json.dumps(e) for e in events)
+        result = _make_subprocess_result(stdout=payload)
+        with caplog.at_level(logging.WARNING):
+            agent_result = _parse_codex_output(
+                result, 'totally-unknown-model',
+                prices={'o4-mini': {'input_per_1m': 1.10, 'output_per_1m': 4.40}},
+            )
+        warning_records = [r for r in caplog.records if r.levelno >= logging.WARNING]
+        assert any('totally-unknown-model' in r.getMessage() for r in warning_records), (
+            f'expected a WARNING mentioning the unknown model; got: {[r.getMessage() for r in warning_records]}'
+        )
+        # _FALLBACK_PRICE: input=2.0/1M, output=8.0/1M
+        assert agent_result.cost_usd == pytest.approx((200 * 2.0 + 100 * 8.0) / 1_000_000)

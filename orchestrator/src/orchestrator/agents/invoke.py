@@ -38,15 +38,53 @@ from orchestrator.mcp_lifecycle import apply_mcp_startup_env
 
 logger = logging.getLogger(__name__)
 
-# Approximate cost per million tokens by model (for backends without native cost reporting)
-_MODEL_COSTS: dict[str, dict[str, float]] = {
-    # OpenAI models: {input_per_1m, output_per_1m}
-    'gpt-5.4': {'input': 2.50, 'output': 10.00},
-    'o4-mini': {'input': 1.10, 'output': 4.40},
-    # Google models
-    'gemini-3.1-pro-preview': {'input': 1.25, 'output': 5.00},
-    'gemini-3-flash': {'input': 0.075, 'output': 0.30},
-}
+# Fallback USD/1M-token rate used ONLY when a model has no configured price
+# (neither in a threaded-in prices map nor the packaged default_price_table()).
+# Unifies the two former silent per-backend fallbacks (codex 2.0/8.0, gemini
+# 1.0/4.0) into one DEFINED, logged rate — see _estimate_cost.
+_FALLBACK_PRICE: dict[str, float] = {'input_per_1m': 2.0, 'output_per_1m': 8.0}
+
+
+def _rate(entry: Any, key: str) -> float:
+    """Read *key* off a price *entry*, which may be a PriceEntry (attribute)
+    or a plain dict (item) — so both ``config.prices`` values and plain
+    dicts (e.g. _FALLBACK_PRICE, test fixtures) work through the same
+    accessor. Uses hasattr (not a getattr default) so a legitimate 0.0 rate
+    is read correctly rather than masked by a fallback default.
+    """
+    return getattr(entry, key) if hasattr(entry, key) else entry[key]
+
+
+def _estimate_cost(
+    model: str,
+    input_tokens: int,
+    output_tokens: int,
+    prices: dict[str, Any] | None = None,
+) -> float:
+    """Estimate USD cost for *model* from token counts (backends without
+    native cost reporting: codex, gemini).
+
+    *prices*, when provided, is a config-shaped map (e.g. ``config.prices``,
+    or a plain dict of dicts) consulted first. When None, resolves to the
+    packaged ``default_price_table()`` (lazy import — this low-level module
+    does not depend on orchestrator.config at module-load time). A model
+    absent from the resolved table falls back to _FALLBACK_PRICE.
+    """
+    if prices is None:
+        from orchestrator.config import default_price_table
+        prices = default_price_table()
+    entry = prices.get(model)
+    if entry is None:
+        logger.warning(
+            'No configured price for model %r; falling back to $%.2f/1M input, '
+            '$%.2f/1M output (add it to config.prices to silence)',
+            model, _FALLBACK_PRICE['input_per_1m'], _FALLBACK_PRICE['output_per_1m'],
+        )
+        entry = _FALLBACK_PRICE
+    return (
+        input_tokens * _rate(entry, 'input_per_1m')
+        + output_tokens * _rate(entry, 'output_per_1m')
+    ) / 1_000_000
 
 
 async def invoke_agent(
@@ -56,6 +94,7 @@ async def invoke_agent(
     model: str = 'opus',
     max_turns: int = 50,
     max_budget_usd: float = 5.0,
+    prices: dict[str, Any] | None = None,
     allowed_tools: list[str] | None = None,
     disallowed_tools: list[str] | None = None,
     mcp_config: dict | None = None,
@@ -87,6 +126,9 @@ async def invoke_agent(
     *working_idle_secs* / *absolute_cap_secs*, when BOTH set (claude backend
     only), extend the working-regime watchdog past *timeout_seconds* while
     the transcript keeps advancing. Default ``None`` for both → no extension.
+    *prices*, when set (codex/gemini backends only — claude reports native
+    cost), is forwarded to the parser's cost estimator in place of the
+    packaged default price table; see ``_estimate_cost``.
     """
     if backend == 'claude':
         return await _invoke_claude_with_sandbox(
@@ -110,14 +152,14 @@ async def invoke_agent(
             prompt=prompt, system_prompt=system_prompt, cwd=cwd, model=model,
             max_budget_usd=max_budget_usd, mcp_config=mcp_config,
             sandbox_modules=sandbox_modules, effort=effort,
-            timeout_seconds=timeout_seconds,
+            timeout_seconds=timeout_seconds, prices=prices,
         )
     elif backend == 'gemini':
         return await _invoke_gemini(
             prompt=prompt, system_prompt=system_prompt, cwd=cwd, model=model,
             max_budget_usd=max_budget_usd, mcp_config=mcp_config,
             sandbox_modules=sandbox_modules, effort=effort,
-            timeout_seconds=timeout_seconds,
+            timeout_seconds=timeout_seconds, prices=prices,
         )
     else:
         raise ValueError(f'Unknown backend: {backend!r}')
@@ -248,6 +290,7 @@ async def _invoke_codex(
     sandbox_modules: list[str] | None,
     effort: str | None,
     timeout_seconds: float | None = None,
+    prices: dict[str, Any] | None = None,
 ) -> AgentResult:
     """Invoke OpenAI Codex CLI."""
     temp_files: list[Path] = []
@@ -281,20 +324,26 @@ async def _invoke_codex(
         env = dict(os.environ)
 
         result = await _run_subprocess_local(cmd, cwd, env, 'codex', model, max_budget_usd, timeout_seconds)
-        return _parse_codex_output(result, model)
+        return _parse_codex_output(result, model, prices)
 
     finally:
         for f in temp_files:
             f.unlink(missing_ok=True)
 
 
-def _parse_codex_output(result: _SubprocessResult, model: str) -> AgentResult:
+def _parse_codex_output(
+    result: _SubprocessResult,
+    model: str,
+    prices: dict[str, Any] | None = None,
+) -> AgentResult:
     """Parse Codex JSONL output into AgentResult.
 
     Codex outputs multiple JSON lines (JSONL): thread.started, messages,
     thread.completed, etc. We find the completion event for results.
 
     timed_out is propagated directly from result.timed_out on every return path.
+    *prices*, when provided, is forwarded to _estimate_cost (see there for the
+    resolution order when None).
     """
     if not result.stdout.strip():
         return AgentResult(
@@ -372,8 +421,7 @@ def _parse_codex_output(result: _SubprocessResult, model: str) -> AgentResult:
     output_text = '\n'.join(output_parts) if output_parts else result.stdout[:2000]
 
     # Estimate cost from token counts
-    rates = _MODEL_COSTS.get(model, {'input': 2.0, 'output': 8.0})
-    cost = (total_input_tokens * rates['input'] + total_output_tokens * rates['output']) / 1_000_000
+    cost = _estimate_cost(model, total_input_tokens, total_output_tokens, prices)
 
     return AgentResult(
         success=result.returncode == 0 and not is_error,
@@ -422,6 +470,7 @@ async def _invoke_gemini(
     sandbox_modules: list[str] | None,
     effort: str | None,
     timeout_seconds: float | None = None,
+    prices: dict[str, Any] | None = None,
 ) -> AgentResult:
     """Invoke Google Gemini CLI."""
     temp_files: list[Path] = []
@@ -447,17 +496,23 @@ async def _invoke_gemini(
         env = dict(os.environ)
 
         result = await _run_subprocess_local(cmd, cwd, env, 'gemini', model, max_budget_usd, timeout_seconds)
-        return _parse_gemini_output(result, model)
+        return _parse_gemini_output(result, model, prices)
 
     finally:
         for f in temp_files:
             f.unlink(missing_ok=True)
 
 
-def _parse_gemini_output(result: _SubprocessResult, model: str) -> AgentResult:
+def _parse_gemini_output(
+    result: _SubprocessResult,
+    model: str,
+    prices: dict[str, Any] | None = None,
+) -> AgentResult:
     """Parse Gemini JSON output into AgentResult.
 
     timed_out is propagated directly from result.timed_out on every return path.
+    *prices*, when provided, is forwarded to _estimate_cost (see there for the
+    resolution order when None).
     """
     if not result.stdout.strip():
         return AgentResult(
@@ -485,8 +540,7 @@ def _parse_gemini_output(result: _SubprocessResult, model: str) -> AgentResult:
     input_tokens = stats.get('input_tokens') or 0
     output_tokens = stats.get('output_tokens') or 0
 
-    rates = _MODEL_COSTS.get(model, {'input': 1.0, 'output': 4.0})
-    cost = (input_tokens * rates['input'] + output_tokens * rates['output']) / 1_000_000
+    cost = _estimate_cost(model, input_tokens, output_tokens, prices)
 
     return AgentResult(
         success=result.returncode == 0,
