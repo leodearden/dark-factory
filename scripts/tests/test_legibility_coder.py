@@ -17,12 +17,16 @@ rather than ever shelling out to a real `claude` process.
 from __future__ import annotations
 
 import json
+from pathlib import Path
 
 import pytest
 
 import codebook as codebook_mod
 import coder as mod
 import digest as digest_mod
+
+_REPO_ROOT = Path(__file__).resolve().parents[2]
+_LIVE_CODEBOOK_PATH = _REPO_ROOT / "docs" / "legibility" / "confusion-codebook.yaml"
 
 # ---------------------------------------------------------------------------
 # Shared fixture helpers — synthetic transcript -> real digest text, mirrors
@@ -239,3 +243,60 @@ def test_parse_coder_output_top_level_array_raises():
 def test_parse_coder_output_top_level_scalar_raises():
     with pytest.raises(mod.CoderParseError):
         mod.parse_coder_output('"just a string"')
+
+
+# ---------------------------------------------------------------------------
+# step-9: RED — code_digest() happy path, against the real live codebook
+# ---------------------------------------------------------------------------
+
+def test_code_digest_happy_path_success(tmp_path):
+    digest_text = _build_digest_text(tmp_path, agent_class="orchestrated-task")
+    live_codebook = codebook_mod.load(_LIVE_CODEBOOK_PATH)
+    meta = mod.parse_frontmatter(digest_text)
+
+    captured = {}
+    judgment = {
+        "matches": [
+            {
+                "entry_id": "one-shot-subagent-contract",
+                "origin_phase": "implement",
+                "manifested_phase": "verify",
+                "invariant_violated": None,
+                "note": "matched on silent no-op subagent contract",
+            }
+        ],
+        "candidates": [
+            {
+                "title": "novel confusion shape",
+                "cause": "something new observed in this session",
+                "area": "orchestrator",
+                "origin_phase": "unknown",
+                "manifested_phase": "unknown",
+                "evidence_quote": "quote from the digest",
+            }
+        ],
+    }
+
+    def fake_invoke(prompt, model):
+        captured["prompt"] = prompt
+        captured["model"] = model
+        return json.dumps(judgment)
+
+    result = mod.code_digest(
+        digest_text, live_codebook, project="dark_factory", model="haiku",
+        invoke=fake_invoke,
+    )
+
+    assert result.ok is True
+    assert result.record["session"] == meta["session"]
+    assert result.record["date"] == meta["date"]
+    assert result.record["agent_class"] == meta["agent_class"]
+    assert result.record["project"] == "dark_factory"
+    assert result.record["matches"] == judgment["matches"]
+    assert result.record["candidates"] == judgment["candidates"]
+    assert codebook_mod.validate_coding_record(result.record) == []
+
+    assert captured["model"] == "haiku"
+    assert digest_text in captured["prompt"]
+    index = mod.build_codebook_index(live_codebook)
+    assert index in captured["prompt"]
