@@ -463,12 +463,13 @@ def test_graph_layout_js_loads_before_tab_tasks(index_html_body: str) -> None:
 
 
 def test_redux_cache_buster_bumped(index_html_body: str) -> None:
-    """All /static/redux/*?v= cache-busters must share a single version >= 27,
+    """All /static/redux/*?v= cache-busters must share a single version >= 28,
     and graph_layout.js must be among the versioned assets.
 
     Mirrors the existing single-shared-version guards in test_tab_escalations.py,
-    test_tab_scheduler.py, and test_scheduler_page.py, raising the floor to 27 to
-    prove the uniform bump landed alongside the new graph_layout.js script tag.
+    test_tab_scheduler.py, and test_scheduler_page.py, raising the floor to 28 to
+    prove the uniform bump landed alongside task 2529's focus-mode changes to
+    graph_layout.js, tab_tasks.jsx, and styles.css.
     """
     versions = set(re.findall(r'/static/redux/[^"?]+\?v=(\d+)', index_html_body))
     assert len(versions) == 1, (
@@ -476,9 +477,9 @@ def test_redux_cache_buster_bumped(index_html_body: str) -> None:
         'bump all of them uniformly to the same value.'
     )
     v = int(next(iter(versions)))
-    assert v >= 27, (
-        f'index.html cache-buster version is {v}, expected >= 27 (proves the '
-        'uniform bump from 26 alongside the new graph_layout.js script tag).'
+    assert v >= 28, (
+        f'index.html cache-buster version is {v}, expected >= 28 (proves the '
+        'uniform bump from 27 alongside task 2529\'s focus-mode changes).'
     )
     assert re.search(r'/static/redux/graph_layout\.js\?v=\d+', index_html_body), (
         'graph_layout.js is not present among the versioned /static/redux/* '

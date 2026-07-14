@@ -14,7 +14,7 @@ import { createRequire } from 'node:module';
 
 import layout from '../../src/dashboard/static/redux/graph_layout.js';
 
-const { computeTiers, partitionComponents, orderRows, countCrossings } = layout;
+const { computeTiers, partitionComponents, orderRows, countCrossings, computeNeighborhood, focusSubset } = layout;
 
 const MODULE_SPECIFIER = '../../src/dashboard/static/redux/graph_layout.js';
 const EXPECTED_FUNCTION_NAMES = [
@@ -22,6 +22,8 @@ const EXPECTED_FUNCTION_NAMES = [
   'partitionComponents',
   'orderRows',
   'countCrossings',
+  'computeNeighborhood',
+  'focusSubset',
 ];
 
 // Builds a minimal task fixture matching the dep edge shape the dashboard
@@ -581,4 +583,85 @@ test('orderRows: deterministic across repeated calls on identical input', () => 
   );
   assert.deepEqual(first, second);
   assert.equal(JSON.stringify(first), JSON.stringify(second));
+});
+
+// ---------------------------------------------------------------------------
+// computeNeighborhood — verbatim port of tab_tasks.jsx's inline `neighborhood`
+// memo (TaskGraph, ~lines 122-143): the selected task plus its transitive
+// ancestors (walking deps upward) and transitive descendants (scanning
+// dependents downward). Single tested source of truth reused by both the
+// existing selection highlight and the new focus filter (focusSubset).
+// ---------------------------------------------------------------------------
+
+test('computeNeighborhood: returns null when selectedId is null or absent', () => {
+  const tasks = [mkTask('A'), mkTask('B', ['A'])];
+  assert.equal(computeNeighborhood(tasks, null), null);
+  assert.equal(computeNeighborhood(tasks, undefined), null);
+  assert.equal(computeNeighborhood(tasks), null);
+});
+
+test('computeNeighborhood: isolated selected node yields a Set containing only itself', () => {
+  const tasks = [mkTask('A'), mkTask('B'), mkTask('C')];
+  const nb = computeNeighborhood(tasks, 'A');
+  assert.deepEqual([...nb].sort(), ['A']);
+});
+
+test('computeNeighborhood: linear chain focused mid-node includes all transitive ancestors and descendants', () => {
+  const tasks = [mkTask('A'), mkTask('B', ['A']), mkTask('C', ['B']), mkTask('D', ['C'])];
+  const nb = computeNeighborhood(tasks, 'B');
+  assert.deepEqual([...nb].sort(), ['A', 'B', 'C', 'D']);
+});
+
+test('computeNeighborhood: diamond focused on a mid-tier node excludes its co-parent', () => {
+  // A; B dep A; C dep A; D dep B,C. Focused on B: ancestors={A}, descendants={D}
+  // (reached via B->D), but C (a sibling/co-parent of D via a different edge)
+  // is NOT an ancestor or descendant of B, so it must be excluded — this pins
+  // "strictly ancestors+descendants of the selected node", not the whole
+  // weakly-connected component.
+  const tasks = [mkTask('A'), mkTask('B', ['A']), mkTask('C', ['A']), mkTask('D', ['B', 'C'])];
+  const nb = computeNeighborhood(tasks, 'B');
+  assert.deepEqual([...nb].sort(), ['A', 'B', 'D']);
+});
+
+test('computeNeighborhood: a dep id outside the input list is ignored (no throw, not added)', () => {
+  const tasks = [mkTask('A', ['OUTSIDE_OF_LIST']), mkTask('B', ['A'])];
+  assert.doesNotThrow(() => computeNeighborhood(tasks, 'A'));
+  const nb = computeNeighborhood(tasks, 'A');
+  assert.deepEqual([...nb].sort(), ['A', 'B']);
+  assert.ok(!nb.has('OUTSIDE_OF_LIST'));
+});
+
+// ---------------------------------------------------------------------------
+// focusSubset — the tasks array filtered down to computeNeighborhood's
+// members (input order preserved), or the input unchanged when selectedId is
+// null. Encodes the focus-mode user signal ("graph containing exactly its
+// ancestors+descendants") as the exact array TaskGraph is fed.
+// ---------------------------------------------------------------------------
+
+test('focusSubset: selectedId null returns the input array unchanged (full-view passthrough)', () => {
+  const tasks = [mkTask('A'), mkTask('B', ['A'])];
+  assert.equal(focusSubset(tasks, null), tasks);
+  assert.equal(focusSubset(tasks, undefined), tasks);
+  assert.equal(focusSubset(tasks), tasks);
+});
+
+test('focusSubset: two disjoint chains focused on a mid-node returns only its own chain, in input order', () => {
+  const tasks = [mkTask('A'), mkTask('B', ['A']), mkTask('C', ['B']), mkTask('X'), mkTask('Y', ['X'])];
+  const result = focusSubset(tasks, 'B');
+  assert.deepEqual(idsOf(result), ['A', 'B', 'C']);
+});
+
+test('focusSubset: diamond focused on a mid-tier node excludes its co-parent, preserving input order', () => {
+  const tasks = [mkTask('A'), mkTask('B', ['A']), mkTask('C', ['A']), mkTask('D', ['B', 'C'])];
+  const result = focusSubset(tasks, 'B');
+  assert.deepEqual(idsOf(result), ['A', 'B', 'D']);
+});
+
+test('focusSubset: result preserves input order and contains only tasks present in `tasks`', () => {
+  const tasks = [mkTask('X'), mkTask('A'), mkTask('B', ['A']), mkTask('Y', ['X'])];
+  const result = focusSubset(tasks, 'A');
+  assert.deepEqual(idsOf(result), ['A', 'B']);
+  const resultIds = new Set(idsOf(result));
+  const taskIds = new Set(idsOf(tasks));
+  for (const id of resultIds) assert.ok(taskIds.has(id), `${id} in result should be present in the input tasks`);
 });

@@ -323,7 +323,49 @@ function countCrossings(rows, edges) {
   return total;
 }
 
-const API = { computeTiers, partitionComponents, orderRows, countCrossings };
+// ── Compute the ancestors+descendants neighborhood of a selected task ──
+// Verbatim port of tab_tasks.jsx's inline `neighborhood` memo (TaskGraph):
+// returns null when nothing is selected; otherwise a Set starting with
+// selectedId, extended with its transitive ancestors (walking deps upward,
+// only following ids present in `tasks`) and transitive descendants
+// (scanning for tasks whose deps include the current id). Single tested
+// source of truth reused by both the selection highlight and focusSubset.
+function computeNeighborhood(tasks, selectedId) {
+  if (!selectedId) return null;
+  const set = new Set([selectedId]);
+  const byId = new Map(tasks.map(t => [t.id, t]));
+  // ancestors
+  const stackUp = [selectedId];
+  while (stackUp.length) {
+    const cur = stackUp.pop();
+    const t = byId.get(cur);
+    if (!t) continue;
+    for (const d of (t.deps || [])) if (byId.has(d.id) && !set.has(d.id)) { set.add(d.id); stackUp.push(d.id); }
+  }
+  // descendants
+  const stackDown = [selectedId];
+  while (stackDown.length) {
+    const cur = stackDown.pop();
+    for (const t of tasks) {
+      if ((t.deps || []).some(d => d.id === cur) && !set.has(t.id)) { set.add(t.id); stackDown.push(t.id); }
+    }
+  }
+  return set;
+}
+
+// ── Filter a task list down to the selected task's neighborhood ──
+// Returns `tasks` unchanged when nothing is selected (full-view passthrough);
+// otherwise the subset of `tasks` whose id is a member of
+// computeNeighborhood(tasks, selectedId), preserving input order. This is the
+// exact array TaskGraph is fed in focus mode — tiers/ordering recompute over
+// it unchanged.
+function focusSubset(tasks, selectedId) {
+  if (!selectedId) return tasks;
+  const nb = computeNeighborhood(tasks, selectedId);
+  return tasks.filter(t => nb.has(t.id));
+}
+
+const API = { computeTiers, partitionComponents, orderRows, countCrossings, computeNeighborhood, focusSubset };
 
 if (typeof module !== 'undefined' && module.exports) {
   module.exports = API;
