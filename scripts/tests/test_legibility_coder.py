@@ -201,3 +201,41 @@ def test_build_prompt_embeds_phase_enum_including_unknown():
     for phase in codebook_mod.PHASES:
         assert phase in prompt
     assert "unknown" in prompt
+
+
+# ---------------------------------------------------------------------------
+# step-7: RED — parse_coder_output() raw LLM stdout -> judgment dict
+# ---------------------------------------------------------------------------
+
+def test_parse_coder_output_clean_json_object():
+    raw = '{"matches": [], "candidates": []}'
+    assert mod.parse_coder_output(raw) == {"matches": [], "candidates": []}
+
+
+def test_parse_coder_output_json_fenced_block():
+    raw = '```json\n{"matches": [], "candidates": []}\n```'
+    assert mod.parse_coder_output(raw) == {"matches": [], "candidates": []}
+
+
+def test_parse_coder_output_json_embedded_in_prose():
+    raw = (
+        "Sure, here is my judgment:\n"
+        '{"matches": [], "candidates": []}\n'
+        "Let me know if you need anything else."
+    )
+    assert mod.parse_coder_output(raw) == {"matches": [], "candidates": []}
+
+
+def test_parse_coder_output_pure_garbage_raises():
+    with pytest.raises(mod.CoderParseError):
+        mod.parse_coder_output("I cannot help with that request, sorry.")
+
+
+def test_parse_coder_output_top_level_array_raises():
+    with pytest.raises(mod.CoderParseError):
+        mod.parse_coder_output('[{"entry_id": "x"}]')
+
+
+def test_parse_coder_output_top_level_scalar_raises():
+    with pytest.raises(mod.CoderParseError):
+        mod.parse_coder_output('"just a string"')
