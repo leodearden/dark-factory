@@ -66,16 +66,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 from test_dry_run_unblock import _make_agent_result, _RecordingScheduler
 
-from orchestrator import (
-    b3_gate,
-    merge_queue,
-    unblock_types,
-    verify,
-    verify_categories,
-    verify_classify,
-    verify_cmd,
-    verify_plan,
-)
+from orchestrator import verify
 from orchestrator.b3_gate import ABORT, FRESH, POST_MERGE_RED_MAIN_REASON_PREFIX, check_proposal
 from orchestrator.config import GitConfig, ModuleConfig, OrchestratorConfig
 from orchestrator.git_ops import PROTECTED_PREFIXES, GitOps, WorktreeKind, _run
@@ -96,7 +87,6 @@ from orchestrator.verify_categories import CATEGORY_POLICY, FailureCategory, _va
 from orchestrator.verify_classify import classify_failure
 from orchestrator.verify_cmd import (
     ToolKind,
-    VerifyCmd,
     parse_config_command,
     render,
     scope_to,
