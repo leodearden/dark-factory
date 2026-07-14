@@ -348,25 +348,39 @@ class TestVerifyCmdRoundTrip:
 # task-1077 (git-verified fix commits d7504d432d + cb7277926d): conftest.py
 # must trigger the full unscoped suite, never be passed directly to pytest as
 # a target (pytest >= 9 exits 1 "no tests ran" on a bare conftest target).
-# Reconstructed verbatim from test_verify_plan.py's own golden fixture.
+# Reconstructed verbatim from test_verify_plan.py's own golden fixture (kept
+# as a local copy rather than a direct import, to avoid a second tight
+# cross-file dependency alongside the test_dry_run_unblock import above) —
+# test_golden_diffs_match_test_verify_plan_source() near the end of the
+# plan-golden section below guards this copy (and DATA_MODULE_DIFF/
+# STRUCTURAL_DIFF) against silently drifting from that source.
 ROOT_CONFTEST_DIFF: list[str] = ['orchestrator/tests/conftest.py']
 
-# Canned file contents for the dict-backed fake worktree_reader below (ported
-# from test_verify_plan.py). Seeded with STRUCTURAL_DIFF's Protocol-bearing
-# content once scenario 5 introduces it; every other path — including this
-# scenario's ROOT_CONFTEST_DIFF file — reads back as None, which
-# classify_file must treat as "not detected", never an error.
-_FAKE_FILE_CONTENTS: dict[str, str] = {}
 
-
-def fake_worktree_reader(path: str) -> str | None:
-    """Dict-backed stand-in for real file I/O (``Callable[[str], str | None]``).
+def _make_fake_worktree_reader(contents: dict[str, str] | None = None):
+    """Build a ``Callable[[str], str | None]`` stand-in for real file I/O.
 
     Keeps derive_verify_plan pure and unit-testable without touching a real
-    filesystem: returns canned content for paths seeded into
-    _FAKE_FILE_CONTENTS, else None.
+    filesystem: returns canned content for paths seeded into *contents*,
+    else None. *contents* is copied into a closure-local dict rather than
+    read from a shared module-level mutable global, so each scenario's
+    canned file contents are isolated by construction — a future scenario
+    that seeds a different value for an overlapping path can never observe,
+    or be observed by, another scenario's reader.
     """
-    return _FAKE_FILE_CONTENTS.get(path)
+    seeded = dict(contents) if contents else {}
+
+    def _reader(path: str) -> str | None:
+        return seeded.get(path)
+
+    return _reader
+
+
+# Scenarios 3+4 need no canned content: every path they touch (this
+# scenario's ROOT_CONFTEST_DIFF file, scenario 4's DATA_MODULE_DIFF file
+# below) must read back as None, which classify_file treats as "not
+# detected", never an error.
+fake_worktree_reader = _make_fake_worktree_reader()
 
 
 def _run_for(plan: VerifyPlan, prefix: str, tool_word: str) -> PlannedRun | None:
@@ -466,9 +480,13 @@ class TestPlanGoldenDataModule:
 STRUCTURAL_DIFF: list[str] = ['orchestrator/src/orchestrator/interfaces.py']
 
 # STRUCTURAL is only detected when a type_check_command is configured (so
-# content is actually read); seed the canned Protocol-bearing content this
-# scenario needs into the shared fake-reader backing dict.
-_FAKE_FILE_CONTENTS[STRUCTURAL_DIFF[0]] = 'class Foo(Protocol):\n    def m(self) -> None: ...\n'
+# content is actually read); this scenario gets its OWN reader, seeded only
+# with STRUCTURAL_DIFF[0]'s Protocol-bearing content — isolated by
+# construction from the scenario-3/4 reader above (and from any future
+# scenario), not merely by convention.
+_structural_worktree_reader = _make_fake_worktree_reader(
+    {STRUCTURAL_DIFF[0]: 'class Foo(Protocol):\n    def m(self) -> None: ...\n'}
+)
 
 
 class TestPlanGoldenStructural:
@@ -479,9 +497,10 @@ class TestPlanGoldenStructural:
     in BOTH the module-config path and the fallback path (the latent gap
     _build_fallback_config never closed).
 
-    RED until step-8 seeds _FAKE_FILE_CONTENTS with STRUCTURAL_DIFF[0]'s
-    Protocol-bearing content — STRUCTURAL is only detected when content is
-    read, and fake_worktree_reader returns None for any unseeded path.
+    RED until step-8 builds this class's own reader (_structural_worktree_reader)
+    seeded with STRUCTURAL_DIFF[0]'s Protocol-bearing content — STRUCTURAL is
+    only detected when content is read, and an unseeded path always reads
+    back None.
     """
 
     def test_structural_file_full_suites_pyright_module_path(self):
@@ -492,7 +511,7 @@ class TestPlanGoldenStructural:
                 'uv run --project orchestrator --directory orchestrator pyright src/ tests/'
             ),
         )
-        plan = derive_verify_plan(STRUCTURAL_DIFF, [mc], None, fake_worktree_reader)
+        plan = derive_verify_plan(STRUCTURAL_DIFF, [mc], None, _structural_worktree_reader)
 
         pyright_run = _run_for(plan, 'orchestrator', 'pyright:')
         assert pyright_run is not None
@@ -507,7 +526,7 @@ class TestPlanGoldenStructural:
 
     def test_structural_file_full_suites_pyright_fallback_path(self):
         config = OrchestratorConfig(project_root=Path('/fake'), test_command='pytest')
-        plan = derive_verify_plan(STRUCTURAL_DIFF, [], config, fake_worktree_reader)
+        plan = derive_verify_plan(STRUCTURAL_DIFF, [], config, _structural_worktree_reader)
 
         pyright_run = _run_for(plan, '__fallback__', 'pyright:')
         assert pyright_run is not None
