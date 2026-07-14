@@ -291,6 +291,43 @@ def apply_coding_record(codebook: dict, record: dict) -> tuple[dict, dict]:
         sightings.append(_build_sighting(match, session=session, date=date, project=project))
         stats["matched"] += 1
 
+    candidates = result.setdefault("candidates", [])
+    date_prefix = f"cand-{date.replace('-', '')}-"
+
+    for candidate_payload in record.get("candidates", []) or []:
+        title = candidate_payload.get("title")
+        same_title = [c for c in candidates if c.get("title") == title]
+
+        already_seen = any(
+            session in {s.get("session") for s in c.get("sightings", [])}
+            for c in same_title
+        )
+        if already_seen:
+            continue
+
+        sighting = _build_sighting(candidate_payload, session=session, date=date, project=project)
+        pending_match = next(
+            (c for c in same_title if c.get("disposition") == "pending"), None
+        )
+        if pending_match is not None:
+            pending_match.setdefault("sightings", []).append(sighting)
+        else:
+            n = 1 + sum(
+                1 for c in candidates if str(c.get("id", "")).startswith(date_prefix)
+            )
+            candidates.append(
+                {
+                    "id": f"{date_prefix}{n}",
+                    "title": title,
+                    "cause": candidate_payload.get("cause"),
+                    "area": candidate_payload.get("area"),
+                    "first_seen": date,
+                    "disposition": "pending",
+                    "sightings": [sighting],
+                }
+            )
+        stats["candidates_applied"] += 1
+
     return result, stats
 
 
