@@ -3523,6 +3523,24 @@ Output JSON matching the schema. Every task must appear in the output.
         ):
             action = RecoveryAction.MARK_DONE_WITH_PROVENANCE
 
+        # θ1's _RECOVERY table only maps GONE_NO_MARKER to RE_FILE_ESCALATION
+        # for a stranded 'blocked' task — it carries no row for
+        # EXISTS_OFF_MAIN (branch ref still present, just never merged).
+        # Pre-migration, the sweep's blocked-escalation backstop fired on ANY
+        # 'blocked' task reaching this point on NO on-main evidence,
+        # regardless of which of the two no-evidence branch shapes it was
+        # in. Second thin sweep-side upgrade — same pattern as the R4
+        # MARK_DONE upgrade above — rather than a change to θ1's reviewed
+        # table (design decision, task 2243; esc-2243-5).
+        if (
+            action == RecoveryAction.LEAVE
+            and status == 'blocked'
+            and report.live_claimant is None
+            and not report.open_escalations
+            and report.branch_state.kind == BranchStateKind.EXISTS_OFF_MAIN
+        ):
+            action = RecoveryAction.RE_FILE_ESCALATION
+
         if action == RecoveryAction.MARK_DONE_WITH_PROVENANCE:
             # Degenerate-branch refinement (task 2243, W10-θ2; RESOLVER GAP
             # design decision): θ1's _RECOVERY table has no degenerate-branch
@@ -3587,8 +3605,8 @@ Output JSON matching the schema. Every task must appear in the output.
         # observed evidence.
         if status == 'blocked':
             # Fix #1b — defense-in-depth backstop for the stranded-blocked gap.
-            # A task left 'blocked' with NO open escalation AND no active
-            # workflow is an orphaned recovery: its blocking escalation was
+            # A task left 'blocked' with NO open escalation AND no live
+            # claimant is an orphaned recovery: its blocking escalation was
             # resolved directly with no live workflow to re-pend it (3576,
             # 2026-05-29).  blocked→pending recovery is owned exclusively by
             # the active-workflow resume path and the L2-cascade / direct-resolve
@@ -3597,63 +3615,37 @@ Output JSON matching the schema. Every task must appear in the output.
             #
             # We RE-FILE a single L1 — we NEVER change status.  Re-filing (not
             # re-pending) cannot yank a deliberate release_workflow blocked-park:
-            # a parked /unblock task either still has an open L1 (→ skipped by
-            # the pending-escalation check) or, if a human resolved its L1 and
+            # a parked /unblock task either still has an open L1 (→ recovery_for
+            # classifies LEAVE, no re-file) or, if a human resolved its L1 and
             # is mid-merge, the re-filed L1 is harmless noise they dismiss.
             # Fix #1a then performs the actual re-pend when this L1 is resolved.
-            #
-            # Self-dedupes: once filed, the pending-escalation check below
-            # suppresses re-filing on the next cycle until it is resolved.
             #
             # Category: 'stranded_blocked' (PRD-3 task ε, 2026-06-04).
             # The escalation-watcher (task θ) auto-resolves stranded_blocked
             # L1s with action='resume', triggering this exact Fix #1a path:
             # _on_escalation_resolved → _cascade_unblock_member →
-            # blocked→pending re-pend.  This replaces the prior 'task_failure'
-            # category, which routed to the human-triage watcher instead of the
-            # auto-resume watcher.
-            #
-            # RE-FILE-NEVER-FLIP discipline is PRESERVED: we still only file
-            # the L1 and let resolution drive the status change.  The /unblock
-            # blocked-park protection (pending-escalation check above) is also
-            # preserved — an open L1 of any category prevents re-filing.
+            # blocked→pending re-pend.
             #
             # task_kind == 'deterministic' tasks are excluded here (task 2074
             # amendment) and delegated exclusively to
             # _recover_stranded_deterministic_task via the deterministic-recon
-            # sweep.  Rationale: this generic backstop and that sweep write to
-            # the SAME queue and dedup on the SAME get_by_task(tid,
-            # status='pending') check, so whichever fires first wins — and the
-            # escalation-watcher-auto's `stranded_blocked` routing
-            # (skills/escalation-watcher-auto/SKILL.md) auto-resumes ANY
-            # category='stranded_blocked' L1 once its predicate holds,
-            # regardless of the filer's suggested_action or role.  If this
-            # generic reaper won the race for a deterministic-deploy task
-            # whose target unit is actually down, it would file
-            # stranded_blocked/manual_intervention — which still gets
-            # auto-resumed the same as a health-verified 'resume', silently
-            # bypassing the live-systemd-health check that is the entire
-            # point of the task-2074 sweep.  Excluding deterministic tasks
-            # here means only the health-aware sweep ever files their first
-            # escalation, so an unhealthy unit correctly gets
-            # infra_issue/manual_intervention instead.
+            # sweep — that sweep's live-systemd-health check is the reason
+            # deterministic-deploy recovery is routed through it instead of
+            # this generic reaper.
             #
-            # The active-workflow guards below (`tid not in
-            # self._escalation_events`, `not self._workflow_cancel_recent`)
-            # are intentionally NOT reimplemented in the deterministic sweep:
-            # task_kind='deterministic' tasks never enter the LLM/workflow
-            # pipeline (no worktree, no branch, no agent — see
-            # DeterministicRunner), so their tid can never appear in
-            # `_escalation_events` or `_workflow_cancel_at`.  Both guards
-            # would be vacuously true for every deterministic task, so
-            # omitting them from the sweep is a no-op simplification, not a
-            # missing safety check.
+            # Dispatch + dedup (task 2243, W10-θ2): action ==
+            # RE_FILE_ESCALATION (recovery_for's row g) already means no live
+            # claimant (is_actively_held / db claimant / plan.lock) and no
+            # escalation open at any level — both folded by the resolver in
+            # place of the old in-sweep _escalation_events /
+            # workflow_cancel_recent / get_by_task guards.  Once filed, the
+            # next sweep sees the new pending escalation in
+            # report.open_escalations and recovery_for classifies LEAVE —
+            # self-dedup without a separate check here.
             if (
-                self.config.stranded_blocked_escalate_enabled
+                action == RecoveryAction.RE_FILE_ESCALATION
+                and self.config.stranded_blocked_escalate_enabled
                 and self._escalation_queue is not None
-                and tid not in self._escalation_events       # no active workflow
-                and not self.scheduler.workflow_cancel_recent(tid)  # not a recent cancel/park
-                and not self._escalation_queue.get_by_task(tid, status='pending')
                 and metadata.get('task_kind') != 'deterministic'
             ):
                 from escalation.models import Escalation

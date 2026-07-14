@@ -2512,6 +2512,10 @@ async def test_stranded_blocked_refiles_single_l1_without_status_change(
     harness._escalation_queue = EscalationQueue(tmp_path / 'esc')
     harness.config.stranded_blocked_escalate_enabled = True
     # is_ancestor=False, find_merge_marker=None (fixture defaults) → no on-main.
+    # recovery_for's db_status (task 2243, W10-θ2) is sourced from get_task(),
+    # which the fixture derives from get_statuses() — set explicitly since this
+    # test calls _reconcile_one_stranded directly, bypassing get_statuses().
+    harness.scheduler.get_statuses.return_value = ({'601': 'blocked'}, None)  # type: ignore[attr-defined]
 
     result = await harness._reconcile_one_stranded('601', 'blocked', mid_run=False)
 
@@ -2532,6 +2536,7 @@ async def test_stranded_blocked_second_sweep_does_not_duplicate(
     (the pending-escalation check self-dedupes)."""
     harness._escalation_queue = EscalationQueue(tmp_path / 'esc')
     harness.config.stranded_blocked_escalate_enabled = True
+    harness.scheduler.get_statuses.return_value = ({'601': 'blocked'}, None)  # type: ignore[attr-defined]
 
     await harness._reconcile_one_stranded('601', 'blocked', mid_run=False)
     assert len(_pending(harness._escalation_queue, '601')) == 1
@@ -2551,6 +2556,7 @@ async def test_stranded_blocked_skips_when_escalation_already_open(
     """An already-open escalation (any level) suppresses the re-file."""
     harness._escalation_queue = EscalationQueue(tmp_path / 'esc')
     harness.config.stranded_blocked_escalate_enabled = True
+    harness.scheduler.get_statuses.return_value = ({'601': 'blocked'}, None)  # type: ignore[attr-defined]
     harness._escalation_queue.submit(Escalation(
         id=harness._escalation_queue.make_id('601'),
         task_id='601', agent_role='steward', severity='blocking',
@@ -2572,7 +2578,15 @@ async def test_stranded_blocked_skips_when_active_workflow(
     — the backstop must not re-file."""
     harness._escalation_queue = EscalationQueue(tmp_path / 'esc')
     harness.config.stranded_blocked_escalate_enabled = True
+    harness.scheduler.get_statuses.return_value = ({'601': 'blocked'}, None)  # type: ignore[attr-defined]
     harness._escalation_events['601'] = asyncio.Event()
+    # Production dispatch ordering (task 2243, W10-θ2 design decision):
+    # acquire_next() adds the tid to scheduler._dispatched before
+    # _register_escalation_event runs, so is_actively_held is already True
+    # whenever _escalation_events holds an entry — mirror that here, since
+    # recovery_for's live_claimant (via is_actively_held) is now the signal
+    # that suppresses re-filing, not _escalation_events membership directly.
+    harness.scheduler._dispatched.add('601')  # type: ignore[attr-defined]
 
     await harness._reconcile_one_stranded('601', 'blocked', mid_run=False)
 
@@ -2587,6 +2601,7 @@ async def test_stranded_blocked_skips_when_recently_cancelled(
     must not be re-filed — the human is mid-handling."""
     harness._escalation_queue = EscalationQueue(tmp_path / 'esc')
     harness.config.stranded_blocked_escalate_enabled = True
+    harness.scheduler.get_statuses.return_value = ({'601': 'blocked'}, None)  # type: ignore[attr-defined]
     harness._workflow_cancel_at['601'] = _time.monotonic()
 
     await harness._reconcile_one_stranded('601', 'blocked', mid_run=False)
@@ -2601,6 +2616,7 @@ async def test_stranded_blocked_skips_when_flag_disabled(
     """Config flag off → no re-file (clean disable)."""
     harness._escalation_queue = EscalationQueue(tmp_path / 'esc')
     harness.config.stranded_blocked_escalate_enabled = False
+    harness.scheduler.get_statuses.return_value = ({'601': 'blocked'}, None)  # type: ignore[attr-defined]
 
     await harness._reconcile_one_stranded('601', 'blocked', mid_run=False)
 
@@ -2612,6 +2628,7 @@ async def test_stranded_blocked_skips_when_no_queue(harness: Harness):
     """No escalation queue wired → no crash, no action."""
     harness._escalation_queue = None
     harness.config.stranded_blocked_escalate_enabled = True
+    harness.scheduler.get_statuses.return_value = ({'601': 'blocked'}, None)  # type: ignore[attr-defined]
 
     result = await harness._reconcile_one_stranded('601', 'blocked', mid_run=False)
 
