@@ -445,3 +445,97 @@ class TestLifecycleRegistryStartAll:
         await registry.start_all()
 
         assert calls == ['slow:start-done', 'fast:start-done']
+
+
+class TestLifecycleRegistryStopAll:
+    """step-11: LifecycleRegistry.stop_all() (S1 / LR-2 — hang-class
+    elimination). Every async test here is itself bound in
+    ``asyncio.wait_for`` so a regression that reintroduces the hang class
+    fails the test instead of wedging the suite."""
+
+    @pytest.mark.asyncio
+    async def test_stop_all_calls_stop_in_strict_reverse_order(self) -> None:
+        from orchestrator.background_service import LifecycleRegistry
+
+        calls: list[str] = []
+        registry = LifecycleRegistry()
+        for name in ['a', 'b', 'c']:
+            registry.register(_RecordingService(name, calls))
+
+        await asyncio.wait_for(registry.stop_all(), timeout=5)
+
+        assert calls == ['c:stop', 'b:stop', 'a:stop']
+
+    @pytest.mark.asyncio
+    async def test_stop_all_abandons_wedging_service_and_completes_ladder(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """A service whose stop() never returns is abandoned after its own
+        stop_timeout_secs with a WARNING, and stop_all() still proceeds to
+        stop every OTHER service in reverse order — this is the structural
+        elimination of the shutdown-hang class (S1)."""
+        from orchestrator.background_service import LifecycleRegistry
+
+        calls: list[str] = []
+        registry = LifecycleRegistry()
+
+        class _WedgingService:
+            name = 'wedge'
+            stop_timeout_secs = 0.05
+
+            async def start(self) -> None:
+                pass
+
+            async def stop(self) -> None:
+                await asyncio.Event().wait()  # never set: wedges forever
+
+        registry.register(_RecordingService('a', calls))
+        registry.register(_WedgingService())
+        registry.register(_RecordingService('c', calls))
+
+        with caplog.at_level(logging.WARNING, logger='orchestrator.background_service'):
+            await asyncio.wait_for(registry.stop_all(), timeout=5)
+
+        # Reverse order c, wedge, a — wedge is abandoned but a is still reached.
+        assert calls == ['c:stop', 'a:stop']
+
+        warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
+        assert len(warnings) == 1
+        assert 'wedge' in warnings[0].message
+        assert 'did not stop' in warnings[0].message
+
+    @pytest.mark.asyncio
+    async def test_stop_all_catches_stop_exception_and_continues_ladder(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """A service whose stop() raises a plain Exception is caught+logged
+        (WARNING) rather than propagating, so one failure cannot abort the
+        ladder."""
+        from orchestrator.background_service import LifecycleRegistry
+
+        calls: list[str] = []
+        registry = LifecycleRegistry()
+
+        class _RaisingService:
+            name = 'raiser'
+            stop_timeout_secs = 1.0
+
+            async def start(self) -> None:
+                pass
+
+            async def stop(self) -> None:
+                raise RuntimeError('stop boom')
+
+        registry.register(_RecordingService('a', calls))
+        registry.register(_RaisingService())
+        registry.register(_RecordingService('c', calls))
+
+        with caplog.at_level(logging.WARNING, logger='orchestrator.background_service'):
+            await asyncio.wait_for(registry.stop_all(), timeout=5)
+
+        assert calls == ['c:stop', 'a:stop']
+
+        warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
+        assert len(warnings) == 1
+        assert 'raiser' in warnings[0].message
+        assert 'stop() failed' in warnings[0].message
