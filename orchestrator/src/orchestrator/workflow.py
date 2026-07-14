@@ -2154,15 +2154,24 @@ class TaskWorkflow:
                             'Steward re-escalated to human',
                             skip_escalation=True,
                         )
-                    # If branch is already on main (e.g. steward merged
-                    # during resolution), skip re-implementation — proceed
-                    # to MERGE which will detect already_merged.
+                    # If branch is already on main AND has genuine prior
+                    # implementation work (e.g. steward merged during
+                    # resolution), skip re-implementation — proceed to
+                    # MERGE which will detect already_merged. A raw
+                    # is_ancestor check alone is NOT enough: an empty
+                    # branch's tip IS main's HEAD, so is_ancestor trivially
+                    # passes and would wrongly skip resume, leaving the
+                    # branch un-implemented (task 2504). wt_head is passed
+                    # for the SHA-primary has-work signal — this path holds
+                    # a reliable post-execution HEAD, so an empty branch
+                    # correctly resolves has_work=False and resume proceeds.
                     _, wt_head_raw, _ = await _run(
                         ['git', 'rev-parse', 'HEAD'], cwd=self.worktree,
                     )
+                    wt_head = wt_head_raw.strip()
                     esc_main_sha = await self.git_ops.get_main_sha()
-                    if await self.git_ops.is_ancestor(
-                        wt_head_raw.strip(), esc_main_sha,
+                    if await self._branch_work_landed_on_main(
+                        wt_head, esc_main_sha, wt_head=wt_head,
                     ):
                         logger.info(
                             'Task %s: branch already on main after '
