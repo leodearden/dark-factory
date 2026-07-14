@@ -25,6 +25,7 @@ from orchestrator.evals.prompt_opt.canary import (
     compare_windows,
     compute_window_metrics,
     load_window_rows,
+    run_canary,
 )
 from orchestrator.run_store import _SCHEMA
 
@@ -425,3 +426,100 @@ class TestInsufficientDataGuard:
         )
         verdict = compare_windows(baseline, post, thresholds)
         assert verdict.verdict == 'regress'
+
+
+class TestRunCanary:
+    """End-to-end: run_canary derives both windows from deploy_at/
+    baseline_days/post_days, loads them from a synthetic runs.db,
+    aggregates each into WindowMetrics, and compares them — without the
+    caller ever touching load_window_rows/compute_window_metrics/
+    compare_windows directly."""
+
+    def _clean_rows(self, task_prefix: str, dates: list[str]) -> list[dict]:
+        """5 uniform 'done' rows: cost_usd=1.0, steward_cost_usd=0.0,
+        review_cycles=1, verify_attempts=1 — the "steady" fixture shape
+        both scenarios' baseline windows share."""
+        return [
+            {
+                'task_id': f'{task_prefix}-{i}', 'project_id': 'dark_factory', 'outcome': 'done',
+                'cost_usd': 1.0, 'steward_cost_usd': 0.0, 'review_cycles': 1, 'verify_attempts': 1,
+                'completed_at': date,
+            }
+            for i, date in enumerate(dates)
+        ]
+
+    def test_regress_scenario_flags_regressed_metrics(self, tmp_path: Path) -> None:
+        """Baseline window (5 clean rows) vs a post window of 4 identical
+        rows + 1 sharply more expensive requeued row:
+
+        - cost_per_done_task: baseline (1.0*5)/5=1.0; post
+          (1+1+1+1+21)/4=6.25 — well past baseline*(1+0.2)=1.2 -> regressed.
+        - requeue_rate: baseline 0/5=0.0; post 1/5=0.2 — past the
+          abs_floor (0.05) baseline==0 branch -> regressed.
+        - mean_review_cycles / mean_verify_attempts: the 4 done post rows
+          match the baseline's done rows exactly (1.0 each) -> NOT
+          regressed, proving a partial regression doesn't flag every
+          metric.
+        """
+        db_path = tmp_path / 'runs.db'
+        _make_runs_db(db_path, [
+            *self._clean_rows('b', [
+                '2026-06-09T00:00:00+00:00', '2026-06-10T00:00:00+00:00',
+                '2026-06-11T00:00:00+00:00', '2026-06-12T00:00:00+00:00',
+                '2026-06-13T00:00:00+00:00',
+            ]),
+            *self._clean_rows('p', [
+                '2026-06-15T00:00:00+00:00', '2026-06-16T00:00:00+00:00',
+                '2026-06-17T00:00:00+00:00', '2026-06-18T00:00:00+00:00',
+            ]),
+            {
+                'task_id': 'p-requeued', 'project_id': 'dark_factory', 'outcome': 'requeued',
+                'cost_usd': 21.0, 'steward_cost_usd': 0.0, 'review_cycles': 0, 'verify_attempts': 0,
+                'completed_at': '2026-06-19T00:00:00+00:00',
+            },
+        ])
+
+        verdict = run_canary(
+            db_path, '2026-06-15T00:00:00+00:00',
+            baseline_days=7, post_days=7, project_id='dark_factory',
+            thresholds=_explicit_thresholds(min_samples=5),
+        )
+
+        assert isinstance(verdict, CanaryVerdict)
+        assert verdict.baseline_n == 5
+        assert verdict.post_n == 5
+        assert verdict.verdict == 'regress'
+        assert 'cost_per_done_task' in verdict.regressed_metrics
+        assert 'requeue_rate' in verdict.regressed_metrics
+        assert 'mean_review_cycles' not in verdict.regressed_metrics
+        assert 'mean_verify_attempts' not in verdict.regressed_metrics
+
+    def test_steady_scenario_returns_pass(self, tmp_path: Path) -> None:
+        """Baseline and post windows both carry the same steady shape (post
+        cost_usd nudged to 1.05, +5% -- within the 20% relative
+        tolerance) -> no metric regresses."""
+        db_path = tmp_path / 'runs.db'
+        baseline_rows = self._clean_rows('b', [
+            '2026-06-09T00:00:00+00:00', '2026-06-10T00:00:00+00:00',
+            '2026-06-11T00:00:00+00:00', '2026-06-12T00:00:00+00:00',
+            '2026-06-13T00:00:00+00:00',
+        ])
+        post_rows = self._clean_rows('p', [
+            '2026-06-15T00:00:00+00:00', '2026-06-16T00:00:00+00:00',
+            '2026-06-17T00:00:00+00:00', '2026-06-18T00:00:00+00:00',
+            '2026-06-19T00:00:00+00:00',
+        ])
+        for row in post_rows:
+            row['cost_usd'] = 1.05
+        _make_runs_db(db_path, [*baseline_rows, *post_rows])
+
+        verdict = run_canary(
+            db_path, '2026-06-15T00:00:00+00:00',
+            baseline_days=7, post_days=7, project_id='dark_factory',
+            thresholds=_explicit_thresholds(min_samples=5),
+        )
+
+        assert verdict.baseline_n == 5
+        assert verdict.post_n == 5
+        assert verdict.verdict == 'pass'
+        assert verdict.regressed_metrics == []
