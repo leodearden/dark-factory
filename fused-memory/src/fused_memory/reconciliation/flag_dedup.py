@@ -231,6 +231,57 @@ def _decompose_suppression_task_id(tid: str) -> list[str]:
     return [p.strip() for p in tid.split(',') if p.strip()]
 
 
+#: Splits on runs of non-alphanumeric characters for flag_type family
+#: tokenization (task 2503) -- underscore, hyphen, and whitespace are all
+#: treated as separators, mirroring the tokenization style of the module's
+#: existing normalization helpers (see :func:`_significant_terms`).
+#:
+#: A DEDICATED constant rather than a reused splitter: although structurally
+#: identical to the never-tracked-systemic-pattern feature's _TERM_SPLIT_RE,
+#: coupling the suppression-family key to that unrelated splitter would let a
+#: future edit to _TERM_SPLIT_RE silently alter suppression matching. The
+#: module already keeps per-feature regex constants dedicated (_CONTENT_FP_RE,
+#: _COUNT_GROUP_RE, _INCORRECT_WORD_RE, _TERM_SPLIT_RE); this follows the same
+#: convention.
+_FLAG_TYPE_TOKEN_SPLIT_RE: re.Pattern[str] = re.compile(r'[^a-z0-9]+')
+
+
+def canonical_flag_type_family(flag_type: str) -> str:
+    """Return a canonical "family" key for *flag_type* (task 2503).
+
+    Collapses four normalization axes onto one deterministic key so a
+    reworded/reordered flag_type for the SAME underlying finding is
+    recognized as a match by :func:`filter_suppressed` and
+    ``write_suppression_record``'s pre-write coverage check: case
+    (``'Missing_Deliverable'``), separator (``'-'``/``'_'``/``' '``),
+    whitespace, and word-order (``'deliverable_missing'`` ==
+    ``'missing_deliverable'``).
+
+    Algorithm: casefold *flag_type*, split on runs of non-alphanumeric
+    characters (:data:`_FLAG_TYPE_TOKEN_SPLIT_RE`), drop empty tokens, then
+    join ``sorted(set(tokens))`` with ``'_'``. Empty/whitespace/
+    all-separator input (or input that yields zero tokens) returns ``''``.
+
+    Deliberately does NOT stem, synonym-map, or tolerate an added/removed
+    word -- only case/separator/whitespace/word-order variants collapse to
+    the same family. Wider tolerance would risk false-positive
+    over-suppression: the scoped-suppression PRD documents a
+    genuinely-recurring finding (``live_workflow_recurrence_counter_needed``)
+    hidden for 6+ cycles by an over-broad suppression record.
+    Under-suppression here only costs one extra companion record, which the
+    pre-write coverage check still catches for reorder/case/separator
+    variants of an already-covered flag_type.
+
+    Idempotent: the output is already lowercase, separator-free, and
+    ``'_'``-joined in sorted order, so re-applying this function to its own
+    output is a no-op.
+
+    Pure, sync, no I/O.
+    """
+    tokens = _FLAG_TYPE_TOKEN_SPLIT_RE.split(flag_type.casefold())
+    return '_'.join(sorted({t for t in tokens if t}))
+
+
 async def filter_suppressed(
     memory_service: Any,
     project_id: str,
