@@ -153,3 +153,48 @@ def test_evaluate_condition_c_four_but_one_outside_window_counts_as_three_no_fir
         candidate_first_seens=["2026-07-14", "2026-07-13", "2026-07-12", "2026-07-11"]
     )
     assert decision.fire is False
+
+
+# ---------------------------------------------------------------------------
+# step-9: RED — hard floor (blocks a/b/c) + never-censused exemption
+# ---------------------------------------------------------------------------
+
+_SPIKE_4_IN_72H = ["2026-07-14", "2026-07-14", "2026-07-13", "2026-07-12"]
+
+
+def test_evaluate_floor_blocks_spike_when_censused():
+    decision = ct.evaluate(
+        now=NOW,
+        last_census_at=NOW - timedelta(days=4),
+        never_censused=False,
+        tasks_landed=None,
+        candidate_first_seens=[datetime.fromisoformat(s) for s in _SPIKE_4_IN_72H],
+        config=ct.CensusConfig(),
+    )
+    assert decision.fire is False
+    assert any("floor" in r for r in decision.reasons)
+
+
+def test_evaluate_floor_blocks_tasks_landed_and_spike_when_censused():
+    decision = ct.evaluate(
+        now=NOW,
+        last_census_at=NOW - timedelta(days=4),
+        never_censused=False,
+        tasks_landed=999,
+        candidate_first_seens=[datetime.fromisoformat(s) for s in _SPIKE_4_IN_72H],
+        config=ct.CensusConfig(),
+    )
+    assert decision.fire is False
+    assert any("floor" in r for r in decision.reasons)
+
+
+def test_evaluate_floor_exempt_when_never_censused():
+    decision = ct.evaluate(
+        now=NOW,
+        last_census_at=NOW - timedelta(days=2),
+        never_censused=True,
+        tasks_landed=None,
+        candidate_first_seens=[datetime.fromisoformat(s) for s in _SPIKE_4_IN_72H],
+        config=ct.CensusConfig(),
+    )
+    assert decision.fire is True
