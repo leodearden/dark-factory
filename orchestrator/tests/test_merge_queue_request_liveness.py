@@ -966,6 +966,93 @@ class TestDeadInflightVerifyAborts:
         with contextlib.suppress(BaseException):
             await verify_future
 
+    async def test_remote_lease_with_runner_missing_dispatch_in_flight_attr_is_not_progress_aborted(
+        self,
+        git_ops: GitOps,
+        config: OrchestratorConfig,
+    ) -> None:
+        """task 2566 reviewer finding (test-coverage, merge_queue.py:11139):
+        pins the `getattr(lease.runner, 'dispatch_in_flight', True)`
+        fail-safe DEFAULT, which no other test here exercises. Every other
+        remote test sets `fake_remote.dispatch_in_flight` explicitly on a
+        MagicMock — but MagicMock auto-vivifies any attribute on first
+        access, so even reading an unset `fake_remote.dispatch_in_flight`
+        never actually falls through to getattr's third-positional-arg
+        default; it returns the mock's freshly auto-created (truthy) child
+        attribute instead.
+
+        This test uses a plain stub runner class that genuinely has no
+        `dispatch_in_flight` attribute (AttributeError on direct access), so
+        getattr's default is the only thing that can make the no-progress
+        clock keep resetting. Mirrors
+        test_remote_lease_with_live_dispatch_is_not_progress_aborted above:
+        the runner must be treated as "dispatch live" and never
+        progress-aborted.
+        """
+        from orchestrator.merge_queue import SpeculativeMergeWorker
+        from orchestrator.verify_runner import HostLease
+
+        never_release = asyncio.Event()
+        gate_entered = asyncio.Event()
+
+        class _RemoteRunnerMissingDispatchInFlight:
+            """No `dispatch_in_flight` attribute at all — unlike MagicMock,
+            reading it raises AttributeError, so getattr(..., True) in
+            merge_queue's trigger 3 genuinely falls through to its default.
+            """
+
+            name = 'remote-host'
+            is_local = False
+
+            async def run_merge_verify(self, *args: object, **kwargs: object) -> MagicMock:
+                gate_entered.set()
+                await never_release.wait()
+                return _pass_result()  # pragma: no cover — never reached in this test
+
+            async def cancel_verify(self) -> int:
+                return 0
+
+        stub_runner = _RemoteRunnerMissingDispatchInFlight()
+        assert not hasattr(stub_runner, 'dispatch_in_flight'), (
+            'sanity: this stub must genuinely lack the attribute for the '
+            'getattr(..., True) fail-safe default to be exercised'
+        )
+
+        req, item = await _make_merged_item(
+            git_ops, config, 'remote-no-attr-a', 'rna.py', 'x=1\n',
+        )
+        q: asyncio.Queue[MergeRequest] = asyncio.Queue()
+        worker = SpeculativeMergeWorker(git_ops, q)
+        worker._register_owned_merge_worktree(item.merge_wt)
+
+        worker.VERIFY_ABANDON_POLL_SECS = 0.02
+        worker.INFLIGHT_VERIFY_PROGRESS_PROBE_SECS = 0.02
+        worker.INFLIGHT_VERIFY_PROGRESS_BUDGET_SECS = 0.2
+
+        lease = HostLease(name='remote-host', runner=stub_runner, is_local=False)
+
+        verify_future = asyncio.ensure_future(worker._run_inflight_verify(item, lease))
+        await asyncio.wait_for(gate_entered.wait(), timeout=15.0)
+
+        # Wall-clock comfortably exceeds the (tiny) budget several times over
+        # — a lease whose progress signal read False would already have been
+        # progress-aborted by now.
+        await asyncio.sleep(worker.INFLIGHT_VERIFY_PROGRESS_BUDGET_SECS * 5)
+
+        assert not verify_future.done(), (
+            'a REMOTE runner exposing no dispatch_in_flight attribute must '
+            'fail safe to "dispatch live" (getattr default True) and never '
+            'be progress-aborted'
+        )
+        assert q.empty(), (
+            'a runner missing dispatch_in_flight must not be re-dispatched '
+            'by the progress budget'
+        )
+
+        verify_future.cancel()
+        with contextlib.suppress(BaseException):
+            await verify_future
+
 
 # ---------------------------------------------------------------------------
 # task 2420 step-7 RED / step-8 GREEN: busy-loop cap converts a repeated dead
