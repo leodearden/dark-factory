@@ -264,6 +264,21 @@ def build_triage_prompt(suggestions: list[dict], task: dict) -> str:
 
 Classify each suggestion as ACCEPT or SKIP, then group accepted items into
 logical follow-up task groups. Read the code at referenced locations as needed.
+
+When you are finished, submit your verdict by calling the `submit_triage`
+tool with three parameters:
+- `accepted`: list of accepted suggestion objects, each with `index`
+  (zero-based index into the original suggestion list), `suggestion` (brief
+  description), `reason` (why it has merit), `files` (affected file paths),
+  and `proposed_task_title` (concise follow-up task title).
+- `skipped`: list of skipped suggestion objects, each with `index`,
+  `suggestion`, and `reason` (why it is meritless).
+- `proposed_task_groups`: list of task group objects, each with `title`,
+  `description` (what needs to be done, with file paths and specifics), and
+  `accepted_indices` (indices into the `accepted` array for the suggestions
+  belonging to this group).
+
+You MUST call `submit_triage` exactly once, as your final action.
 """
 
 
