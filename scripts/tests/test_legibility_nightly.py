@@ -143,6 +143,45 @@ def test_select_scored_records_excludes_out_of_scope_sessions(tmp_path):
 
 
 # ---------------------------------------------------------------------------
+# step-5/6: build_digests
+# ---------------------------------------------------------------------------
+
+def test_build_digests_happy_path(tmp_path):
+    work_cwd = str(tmp_path / 'work')
+    cfg = load_config(_write_config(tmp_path, project_id='proj_a', cwd_prefixes=[work_cwd]))
+    projects_root = tmp_path / 'projects'
+    session_path = projects_root / _encode_cwd(work_cwd) / 'session-1.jsonl'
+    _write_transcript(session_path, cwd=work_cwd, timestamp='2026-07-13T10:00:00Z')
+    selected = nightly.select_scored_records(cfg, projects_root, date(2026, 7, 13))
+
+    digests, extractor_failures = nightly.build_digests(selected)
+
+    assert extractor_failures == []
+    assert len(digests) == 1
+    assert digests[0].startswith('---\n')
+
+
+def test_build_digests_isolates_extractor_crash(tmp_path):
+    work_cwd = str(tmp_path / 'work')
+    cfg = load_config(_write_config(tmp_path, project_id='proj_a', cwd_prefixes=[work_cwd]))
+    projects_root = tmp_path / 'projects'
+    session_path = projects_root / _encode_cwd(work_cwd) / 'session-1.jsonl'
+    _write_transcript(session_path, cwd=work_cwd, timestamp='2026-07-13T10:00:00Z')
+    selected = nightly.select_scored_records(cfg, projects_root, date(2026, 7, 13))
+
+    def _crashing_build(path, *, agent_class_override=None, max_bytes=15360):
+        raise ValueError('boom: corrupt transcript')
+
+    digests, extractor_failures = nightly.build_digests(selected, build=_crashing_build)
+
+    assert digests == []
+    assert len(extractor_failures) == 1
+    session_name, reason = extractor_failures[0]
+    assert session_name == session_path.name
+    assert 'boom' in reason
+
+
+# ---------------------------------------------------------------------------
 # step-1/2: resolve_config_path
 # ---------------------------------------------------------------------------
 
