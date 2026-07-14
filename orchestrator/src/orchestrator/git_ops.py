@@ -246,7 +246,16 @@ _MERGE_VERIFY_FLOCK_WAIT_SECS: float = 10.0
 # independently-defaulted, non-overridable copy above, and keeps this fix
 # inside git_ops.py rather than reaching into config.py's green/red
 # reload-tier surface for what is a narrow, self-contained safety margin.
-_SEED_WARM_LANE_LOCK_WAIT_SECS: float = 30.0
+#
+# Declared `int` (task 2599 amendment), not `float`: the value is passed to
+# the `flock(1)` CLI as `str(_SEED_WARM_LANE_LOCK_WAIT_SECS)` for `-w`, and
+# an int stringifies to an unambiguous whole-second literal ("30") rather
+# than a fractional one ("30.0"). Fractional `-w` parses fine on current
+# util-linux, but this is the only place in git_ops.py that hands a
+# CLI-parsed wait value to `flock` itself (`_MERGE_VERIFY_FLOCK_WAIT_SECS`
+# is only ever passed to an in-process helper, never a CLI arg) — no reason
+# to lean on fractional-timeout CLI parsing for what is a whole-second value.
+_SEED_WARM_LANE_LOCK_WAIT_SECS: int = 30
 
 # flock's --conflict-exit-code (-E) for _SEED_WARM_LANE_LOCK_WAIT_SECS above.
 # Deliberately mirrors timeout(1)'s well-known 124 "command timed out"
