@@ -301,3 +301,72 @@ def preflight_headroom(invoke, *, model: str) -> HeadroomResult:
             )
 
     return HeadroomResult(ok=True, reason=None)
+
+
+# ---------------------------------------------------------------------------
+# build_task_payloads — verified clusters -> curator-path submit_task
+# kwargs (PRD decision 9: normal task_kind, never planning_mode; PRD
+# decision 4: a harness-rooted cluster may target dark_factory)
+# ---------------------------------------------------------------------------
+
+def _cluster_description(cluster: dict, *, project_id: str) -> str:
+    """Factual cluster summary + evidence -- no prose routing intent
+    (lesson `prose-routing-intent`: routing is expressed structurally, via
+    payload fields, never as English directives embedded in the text)."""
+    lines = [
+        cluster.get("summary")
+        or cluster.get("title")
+        or "Confusion cluster observed by the periodic legibility census."
+    ]
+
+    evidence = cluster.get("evidence") or []
+    if evidence:
+        lines.append("")
+        lines.append("Evidence:")
+        lines.extend(f"- {quote}" for quote in evidence)
+
+    sightings = cluster.get("sightings") or []
+    if sightings:
+        lines.append("")
+        lines.append(f"Observed in {len(sightings)} sighting(s) (project: {project_id}).")
+
+    return "\n".join(lines)
+
+
+def build_task_payloads(clusters, *, project_root: str, project_id: str) -> list[dict]:
+    """Map each verified cluster to one curator-path ``submit_task`` kwarg
+    dict. ``task_kind`` is always ``"normal"``; ``planning_mode`` is
+    deliberately OMITTED (defaults False at the submit_task layer) --
+    curator dedup against already-filed remediation is the point (PRD
+    decision 9), and ``planning_mode`` is exactly the curator-bypassing
+    path that would defeat it.
+
+    A cluster observed in a hosted project whose root cause is
+    harness-rooted may carry ``target_project_root``/``target_project_id``
+    overrides to file into dark_factory instead of the census's own
+    project (PRD decision 4, same fused-memory, different project_root);
+    absent those, the payload targets the census's own *project_root*/
+    *project_id*.
+
+    Pure function -- returns payloads only; the actual ``submit_fn`` call
+    happens in ``run_census``.
+    """
+    payloads = []
+    for cluster in clusters:
+        title = cluster.get("title") or "Untitled confusion cluster"
+        target_project_root = cluster.get("target_project_root", project_root)
+        target_project_id = cluster.get("target_project_id", project_id)
+        payloads.append(
+            {
+                "project_root": target_project_root,
+                "title": f"[legibility census] {title}",
+                "description": _cluster_description(cluster, project_id=target_project_id),
+                "task_kind": "normal",
+                "priority": cluster.get("priority", "medium"),
+                "metadata": {
+                    "source": "legibility_census",
+                    "origin_project_id": project_id,
+                },
+            }
+        )
+    return payloads
