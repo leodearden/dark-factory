@@ -15,11 +15,14 @@ from pathlib import Path
 from _curator_replay_fixtures import make_synthetic_tickets_db
 
 from orchestrator.evals.prompt_opt.curator_corpus import (
+    CuratorCorpusManifest,
+    CuratorReplayItem,
     RecordedDecision,
     read_curator_decisions,
     recover_recorded_action,
     select_spot_check_subset,
 )
+from orchestrator.evals.reviewer_trial.mining import assign_split
 
 
 def _decision(ticket_id: str, action: str) -> RecordedDecision:
@@ -225,3 +228,122 @@ class TestSelectSpotCheckSubset:
         # it does not guarantee per-action representation.
         assert set(subset) <= {d.ticket_id for d in decisions}
         assert len(subset) <= len(decisions)
+
+
+def _make_item(
+    ticket_id: str = 't1',
+    gold_action: str = 'create',
+    split: str | None = None,
+) -> CuratorReplayItem:
+    return CuratorReplayItem(
+        ticket_id=ticket_id,
+        candidate={'title': f'Candidate {ticket_id}'},
+        recorded_action='create',
+        recorded_target_fingerprint=None,
+        recorded_target_id=None,
+        gold_action=gold_action,
+        gold_target_fingerprint=None,
+        gold_target_id=None,
+        split=split,
+        provenance={'kind': 'test'},
+    )
+
+
+class TestCuratorReplayItem:
+    def test_holds_candidate_recorded_and_gold_fields(self) -> None:
+        item = CuratorReplayItem(
+            ticket_id='t1',
+            candidate={'title': 'Add the widget'},
+            recorded_action='combine',
+            recorded_target_fingerprint='Old title',
+            recorded_target_id='task-1',
+            gold_action='create',
+            gold_target_fingerprint=None,
+            gold_target_id=None,
+            split='train',
+            provenance={'source_db': '/tmp/tickets.db'},
+        )
+        assert item.ticket_id == 't1'
+        assert item.candidate == {'title': 'Add the widget'}
+        assert item.recorded_action == 'combine'
+        assert item.recorded_target_fingerprint == 'Old title'
+        assert item.recorded_target_id == 'task-1'
+        assert item.gold_action == 'create'
+        assert item.split == 'train'
+        assert item.provenance == {'source_db': '/tmp/tickets.db'}
+
+    def test_split_and_provenance_default(self) -> None:
+        item = CuratorReplayItem(
+            ticket_id='t1', candidate={}, recorded_action='create',
+            recorded_target_fingerprint=None, recorded_target_id=None,
+            gold_action='create', gold_target_fingerprint=None, gold_target_id=None,
+        )
+        assert item.split is None
+        assert item.provenance == {}
+
+
+class TestCuratorCorpusManifestSaveLoad:
+    def test_save_and_load_round_trips_items_losslessly(self, tmp_path: Path) -> None:
+        items = [
+            _make_item('t1', gold_action='create', split='train'),
+            _make_item('t2', gold_action='drop', split='test'),
+        ]
+        manifest = CuratorCorpusManifest(items=items, split_seed=42)
+        manifest_path = tmp_path / 'manifest.json'
+
+        manifest.save(manifest_path)
+        loaded = CuratorCorpusManifest.load(manifest_path)
+
+        assert loaded.split_seed == 42
+        assert len(loaded.items) == 2
+        loaded_by_id = {item.ticket_id: item for item in loaded.items}
+        assert loaded_by_id['t1'].gold_action == 'create'
+        assert loaded_by_id['t1'].split == 'train'
+        assert loaded_by_id['t2'].gold_action == 'drop'
+        assert loaded_by_id['t2'].split == 'test'
+        assert loaded_by_id['t1'].candidate == {'title': 'Candidate t1'}
+        assert loaded_by_id['t1'].provenance == {'kind': 'test'}
+
+    def test_save_writes_manifest_and_per_item_annotation_files(self, tmp_path: Path) -> None:
+        manifest = CuratorCorpusManifest(items=[_make_item('t1', split='train')])
+        manifest_path = tmp_path / 'manifest.json'
+
+        manifest.save(manifest_path)
+
+        assert manifest_path.exists()
+        assert (tmp_path / 'annotations' / 't1.json').exists()
+
+    def test_get_item_returns_none_when_missing(self) -> None:
+        manifest = CuratorCorpusManifest(items=[_make_item('t1')])
+        assert manifest.get_item('t1') is not None
+        assert manifest.get_item('nonexistent') is None
+
+
+class TestCuratorItemSplitAssignment:
+    """Split assignment reuses reviewer_trial.mining.assign_split (stable
+    per-id hash) -- deterministic, and disjoint/exhaustive across items."""
+
+    def test_split_assignment_is_deterministic_for_a_fixed_seed(self) -> None:
+        ticket_ids = [f'tkt_{i}' for i in range(30)]
+        first = assign_split(ticket_ids, seed='2496-test-seed')
+        second = assign_split(ticket_ids, seed='2496-test-seed')
+        assert first == second
+
+    def test_split_assignment_partitions_items_disjointly_and_exhaustively(self) -> None:
+        ticket_ids = [f'tkt_{i}' for i in range(30)]
+        assignment = assign_split(ticket_ids, seed='2496-test-seed')
+        items = [_make_item(tid, split=assignment[tid]) for tid in ticket_ids]
+
+        manifest = CuratorCorpusManifest(items=items, split_seed=None)
+        by_split: dict[str, set[str]] = {'train': set(), 'selection': set(), 'test': set()}
+        for item in manifest.items:
+            assert item.split in by_split
+            by_split[item.split].add(item.ticket_id)
+
+        # exhaustive: every id appears in exactly one split
+        all_assigned = by_split['train'] | by_split['selection'] | by_split['test']
+        assert all_assigned == set(ticket_ids)
+        # disjoint: no id appears in more than one split
+        assert not (by_split['train'] & by_split['selection'])
+        assert not (by_split['train'] & by_split['test'])
+        assert not (by_split['selection'] & by_split['test'])
