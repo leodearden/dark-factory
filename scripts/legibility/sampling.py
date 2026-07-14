@@ -13,8 +13,9 @@ CLI acceptance surface.
 
 Task β of the confusion-reduction PRD (plans/confusion-reduction-prd.md
 §5.2, contract §7.4). Self-contained — does not import task α's
-``digest.py`` (owns its own transcript-line iteration and signal-scoring
-primitives rather than reaching into another task's module).
+``digest.py``; owns its own signal-scoring primitives, reusing only the
+low-level JSONL-line iterator (:func:`legibility.inventory._iter_json_lines`)
+from its own sibling module rather than duplicating it.
 """
 from __future__ import annotations
 
@@ -27,7 +28,7 @@ from dataclasses import dataclass
 from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 from typing import Any
-from collections.abc import Iterator, Sequence
+from collections.abc import Sequence
 
 # Self-bootstrap for standalone `python scripts/legibility/sampling.py` runs
 # — must run BEFORE the `legibility.*` imports below, since a direct script
@@ -37,27 +38,16 @@ if __name__ == '__main__':
     sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from legibility.config import LegibilityConfig, load_config  # noqa: E402
-from legibility.inventory import SessionRecord, enumerate_sessions  # noqa: E402
+from legibility.inventory import (  # noqa: E402
+    SessionRecord,
+    _iter_json_lines,
+    enumerate_sessions,
+)
 
-
-def _iter_json_lines(path: Path) -> Iterator[dict[str, Any]]:
-    """Yield parsed dict records from a JSONL file, skipping blank/malformed lines.
-
-    A transcript is written fire-and-forget and can have a truncated or
-    corrupt trailing line, which must not abort the whole read. Raises
-    ``OSError`` if *path* cannot be opened at all (caller's concern).
-    """
-    with open(path, encoding='utf-8') as f:
-        for line in f:
-            line = line.strip()
-            if not line:
-                continue
-            try:
-                record = json.loads(line)
-            except json.JSONDecodeError:
-                continue
-            if isinstance(record, dict):
-                yield record
+# _iter_json_lines lives in legibility.inventory — this module reuses that
+# single fire-and-forget-transcript-read implementation rather than keeping
+# its own byte-for-byte copy (a future fix to the graceful-degrade contract
+# then only needs to land in one place).
 
 
 # ---------------------------------------------------------------------------
