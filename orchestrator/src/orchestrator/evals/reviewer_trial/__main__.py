@@ -799,7 +799,7 @@ def mine(
         click.echo(f'Mined {state["added"]}/{total} new diffs this run (frontier cost: ${state["cost"]:.2f}).')
         click.echo(f'Corpus: {len(manifest.diffs)} diffs total.')
 
-        report = audit_corpus(manifest, log, min_diffs=50)
+        report = audit_corpus(manifest, log, min_diffs=min_diffs)
         click.echo()
         click.echo(click.style(f'Corpus Audit: {report.diff_count} diffs', bold=True))
         for key, message in _AUDIT_CHECKS:
