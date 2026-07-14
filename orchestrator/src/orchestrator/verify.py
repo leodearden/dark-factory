@@ -1975,7 +1975,12 @@ class VerifyAttempt:
         )
 
     def _by_label(self, label: str) -> CheckRun:
-        return next(c for c in self.checks if c.label == label)
+        found = next((c for c in self.checks if c.label == label), None)
+        if found is None:
+            raise KeyError(
+                f'no check labeled {label!r} in {[c.label for c in self.checks]}'
+            )
+        return found
 
     @property
     def test(self) -> CheckRun:

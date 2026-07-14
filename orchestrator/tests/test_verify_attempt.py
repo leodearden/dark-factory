@@ -17,6 +17,8 @@ Test coverage:
 
 from __future__ import annotations
 
+import pytest
+
 
 class TestCheckRun:
     """step-1: CheckRun exposes its 7 fields, a .skipped() constructor, and
@@ -185,6 +187,35 @@ class TestVerifyAttempt:
 
         attempt = VerifyAttempt(checks=[_run('lint', rc=1, timed_out=True)])
         assert attempt.pure_timeout_failure is True
+
+    def test_two_timed_out_legs_is_a_pure_timeout_failure(self):
+        """(e) Two of three checks time out (test AND type), lint clean ->
+        still a pure timeout, and the derived `timed_out_names` list (built
+        by run_verification as `[c.label for c in attempt.checks if
+        c.timed_out]`) preserves `checks` order rather than e.g. sorting or
+        dropping duplicates."""
+        from orchestrator.verify import VerifyAttempt  # noqa: PLC0415
+
+        attempt = VerifyAttempt(checks=[
+            _run('test', rc=1, timed_out=True),
+            _run('lint', rc=0),
+            _run('type', rc=1, timed_out=True),
+        ])
+        assert attempt.passed is False
+        assert attempt.any_timed_out is True
+        assert attempt.pure_timeout_failure is True
+        assert [c.label for c in attempt.checks if c.timed_out] == ['test', 'type']
+
+    def test_by_label_raises_keyerror_for_missing_label(self):
+        """A VerifyAttempt built without a 'test' check (a mislabeled/partial
+        construction a future caller could make) must fail loudly on
+        `.test` rather than raising a bare StopIteration from the
+        underlying `next()` call."""
+        from orchestrator.verify import VerifyAttempt  # noqa: PLC0415
+
+        attempt = VerifyAttempt(checks=[_run('lint', rc=0)])
+        with pytest.raises(KeyError, match="no check labeled 'test'"):
+            _ = attempt.test
 
     def test_label_accessors_return_matching_check(self):
         """.test/.lint/.type return the CheckRun with the matching label —
