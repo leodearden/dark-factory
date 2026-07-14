@@ -28,8 +28,21 @@ Phase γ adds the **before_done blocking cross-unit deploy** path
        write) → drive to ``done``.
      * an escalation was filed and resolved → human acted (act-then-ask) →
        drive to ``done``, no re-run.
-     * neither → crash mid-deploy before any terminal decision → re-escalate
-       (infra_issue, blocked); never phantom-done, never re-run (I1).
+     * neither → crash mid-deploy before any terminal decision.  Task 2618:
+       if a PERSISTED ``deploy_state.verify_baseline`` is available, RE-RUN
+       the read-only verify inspect against ``target_unit`` and re-classify
+       via ``_deterministic_deploy_health_verdict`` (the same classifier the
+       harness recon-sweep uses) — a positive ``'healthy'`` verdict means the
+       deploy actually succeeded but crashed inside
+       ``_writeback_deploy_success`` before ``before_done_verified_at`` could
+       be stamped (task 2584's shape), so it drives straight to ``done`` via
+       ``_writeback_deploy_success`` instead of re-escalating.  Any other
+       verdict (including no persisted baseline at all) falls through to
+       re-escalate (infra_issue, blocked); never phantom-done, never re-run
+       (I1).  Auto-recovery is best-effort across an ORCHESTRATOR restart
+       only — ``verify_baseline``'s monotonic clock resets on a MACHINE
+       reboot, so a post-reboot re-verify conservatively yields
+       ``'unconfirmed'`` and still escalates to a human.
 
 2. **before_done execution** (γ: ``before_done`` is not None):
    **Stop-instruction guard** (task 2509, reconciliation finding 0aac21b4):
@@ -221,7 +234,10 @@ from orchestrator.proc_supervision import (
     RestartPlan,
 )
 from orchestrator.stop_instruction import detect_stop_instruction
-from orchestrator.systemd_inspect import inspect_systemd_unit
+from orchestrator.systemd_inspect import (
+    _deterministic_deploy_health_verdict,
+    inspect_systemd_unit,
+)
 from orchestrator.workflow import WorkflowOutcome
 
 if TYPE_CHECKING:
@@ -1825,6 +1841,50 @@ class DeterministicRunner:
                     return WorkflowOutcome.DONE
 
                 # (c) Crash window: stamped but never verified and never escalated.
+                # Task 2618: before re-escalating, if a persisted freshness
+                # baseline is available, RE-RUN the read-only verify inspect and
+                # reuse the SAME health classifier the harness recon-sweep
+                # already applies to a stranded deploy
+                # (_deterministic_deploy_health_verdict) — this recovers a
+                # deploy that actually succeeded but crashed inside
+                # _writeback_deploy_success before before_done_verified_at could
+                # be stamped (task 2584/esc-2584-*: an infinite reblock loop on
+                # every orchestrator restart). Gated on a PERSISTED
+                # verify_baseline (not merely deploy_state/phase presence) —
+                # without one, the classifier's no-baseline fallback is a
+                # near-constant 'healthy' liveness check for an always-on unit,
+                # which would phantom-done and regress finding-4.0's D3 guard
+                # (see this module's design-decision history / task 2618
+                # plan). This also scopes auto-recovery to be best-effort
+                # across an ORCHESTRATOR restart only: verify_baseline's
+                # monotonic clock is CLOCK_MONOTONIC and resets on a MACHINE
+                # reboot, so a post-reboot re-verify conservatively falls
+                # through to 'unconfirmed' (safe — never phantom-done; a
+                # reboot strand still resolves via a human, as today).
+                if deploy_state is not None and deploy_state.verify_baseline is not None:
+                    inspect_fn = self._unit_inspector or self._default_inspect_unit
+                    fresh_state = await inspect_fn(target_unit)
+                    verdict = _deterministic_deploy_health_verdict(
+                        fresh_state, verify_baseline=deploy_state.verify_baseline,
+                    )
+                    if verdict == 'healthy':
+                        logger.info(
+                            'DeterministicRunner: task %s crash-window re-verify '
+                            'against persisted baseline came back healthy — '
+                            'recovering to done without re-running the deploy '
+                            '(I1): %s',
+                            task_id, target_unit,
+                        )
+                        return await self._writeback_deploy_success(
+                            task_id, metadata, fresh_state, target_unit, description,
+                        )
+                    logger.warning(
+                        'DeterministicRunner: task %s crash-window re-verify came '
+                        'back %s (state=%s) — falling through to the crash-window '
+                        'escalation',
+                        task_id, verdict, fresh_state,
+                    )
+
                 # Re-escalate instead of phantom-completing; the deploy is NOT
                 # re-run (I1 once-only) — a human must verify the unit state.
                 logger.warning(
