@@ -1495,7 +1495,17 @@ def parse_spawn_identity(
 
 
 def _run_launching(env: Mapping[str, str]) -> str:
-    """Build + write a LAUNCHING record from CLAUDE_SPAWN_* env; return its dir."""
+    """Build + write a LAUNCHING record from CLAUDE_SPAWN_* env; return its dir.
+
+    Also opportunistically drives the liveness sweep
+    (``mark_orphaned_sessions_exited``): ``reap_stale_records``/this sweep
+    have no periodic production driver of their own (CLI-only), so every
+    spawn is what drains prior orphaned (unclean-death) records to
+    ``exited`` -- the backlog is bounded by spawn rate and self-limits as it
+    drains. Wrapped in a fail-soft guard: a sweep fault must never raise
+    here and must never write to stdout, or it would corrupt the printed
+    record dir spawn-claude.sh captures into ``SESSION_RECORD_DIR``.
+    """
     title = env.get('CLAUDE_SPAWN_TITLE', '') or ''
     prompt = env.get('CLAUDE_SPAWN_PROMPT', '') or ''
     cwd = env.get('CLAUDE_SPAWN_CWD') or os.getcwd()
@@ -1522,6 +1532,8 @@ def _run_launching(env: Mapping[str, str]) -> str:
         transcript_path=transcript_path_for_cwd(cwd),
     )
     write_record(record)
+    with contextlib.suppress(Exception):
+        mark_orphaned_sessions_exited()
     return str(record_dir)
 
 
@@ -1566,6 +1578,16 @@ def _run_set_display(
 
 
 def _run_reap() -> list[ReapedSessionRecord]:
+    """Run the canonical ``reap`` verb: mark orphans exited, THEN delete stale dirs.
+
+    Mark-then-delete keeps `reap` complete: a record the liveness sweep
+    would mark exited this same pass must not simultaneously be eligible
+    for stale_pid deletion (marking bumps its mtime, so it lands back
+    within reap_stale_records' NON_TERMINAL_HEARTBEAT_TTL heartbeat grace) --
+    it only becomes reapable later, once it ages past TERMINAL_TTL as any
+    other terminal record does.
+    """
+    mark_orphaned_sessions_exited()
     return reap_stale_records()
 
 
