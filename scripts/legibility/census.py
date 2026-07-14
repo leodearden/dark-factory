@@ -487,3 +487,67 @@ def advance_census_state(
         except OSError:
             pass
         raise
+
+
+# ---------------------------------------------------------------------------
+# render_report — dated plans/confusion-census-<date>.md markdown assembly
+# ---------------------------------------------------------------------------
+
+def render_report(
+    *,
+    date: str,
+    project_id: str,
+    force: bool,
+    matrix_md: str,
+    mining_result: MiningResult,
+    synthesis_md: str,
+    filed_task_ids: list[str],
+    cost_note: str,
+) -> str:
+    """Assemble the dated census report as markdown, purely from the
+    pieces passed in -- no clock, no model call, no I/O. *date* and every
+    piece of LLM-produced prose (*synthesis_md*, *matrix_md*) are inputs,
+    so the same inputs always render byte-identical output.
+    """
+    lines = [f"# confusion census {date}", "", f"Project: {project_id}"]
+
+    if force:
+        lines.append("")
+        lines.append("_--force: operator-initiated run._")
+
+    lines.append("")
+    lines.append("## Saturation")
+    lines.append("")
+    lines.append(f"- batches: {len(mining_result.batch_stats)}")
+    lines.append(f"- stop reason: {mining_result.stop_reason}")
+    for stats in mining_result.batch_stats:
+        lines.append(
+            f"  - batch {stats.index}: dup_rate={stats.dup_rate:.2f} "
+            f"(total={stats.total}, succeeded={stats.succeeded}, failed={stats.failed}, "
+            f"saturated={stats.saturated})"
+        )
+
+    lines.append("")
+    lines.append("## Origin x Manifestation Matrix")
+    lines.append("")
+    lines.append(matrix_md)
+
+    lines.append("## Synthesis")
+    lines.append("")
+    lines.append(synthesis_md)
+
+    lines.append("")
+    lines.append("## Filed Tasks")
+    lines.append("")
+    if filed_task_ids:
+        lines.extend(f"- {task_id}" for task_id in filed_task_ids)
+    else:
+        lines.append("_none filed._")
+
+    lines.append("")
+    lines.append("## Cost")
+    lines.append("")
+    lines.append(cost_note)
+    lines.append("")
+
+    return "\n".join(lines)
