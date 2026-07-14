@@ -56,7 +56,7 @@ from cockpit.panes.decision_queue import (
 )
 from cockpit.panes.detail_pane import DetailPane
 from cockpit.panes.session_table import SessionTable, filter_live_sessions, order_sessions
-from cockpit.panes.spawn_bar import SpawnScreen, build_spawn_argv
+from cockpit.panes.spawn_bar import SpawnScreen, build_spawn_argv, default_skip_perms
 from cockpit.panes.spawn_tree import SpawnTreeScreen
 from cockpit.priority import Priorities, load_priorities
 from cockpit.registry_reader import (
@@ -705,11 +705,22 @@ class CockpitApp(App):
 
         Seeds the picker's project-root field from known_project_roots over
         the most recently scanned session records (self._records) -- a
-        picker source, not a queue filter. Submitting the screen calls back
-        into spawn_session, this task's leaf signal; the screen itself never
+        picker source, not a queue filter. Also seeds the picker's
+        skip-perms toggle from default_skip_perms() (F9 fix, task 2518):
+        the operator's env-configured bypass-perms default, so a
+        cockpit-spawned session in an AFK window inherits bypass-perms
+        instead of hardcoding it off and blocking on an unanswered
+        permission prompt. Submitting the screen calls back into
+        spawn_session, this task's leaf signal; the screen itself never
         builds argv or launches a process.
         """
-        self.push_screen(SpawnScreen(known_project_roots(self._records), self.spawn_session))
+        self.push_screen(
+            SpawnScreen(
+                known_project_roots(self._records),
+                self.spawn_session,
+                default_skip_perms=default_skip_perms(),
+            )
+        )
 
     def spawn_session(self, project_root: str, role: str, prompt: str, skip_perms: bool = False) -> None:
         """Spawn a new Claude session (PRD §9 C5b spawn bar) -- the `n` action's leaf signal.
