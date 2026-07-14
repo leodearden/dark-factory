@@ -79,3 +79,46 @@ async def test_fake_briefing_smoke() -> None:
     resume_prompt = await briefing.build_resume_prompt({}, {}, 'the summary', 'the resolution')
     assert isinstance(resume_prompt, str) and resume_prompt, 'resume prompt must be non-empty'
     assert 'the resolution' in resume_prompt, 'resume prompt must include the resolution'
+
+
+# ---------------------------------------------------------------------------
+# Group A: merge-provenance factories (_Fixture, _make, _bind_landed_row)
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture(autouse=True)
+def _reset_merge_provenance():
+    """MergeProvenance._outbox is a process-global — never leak a bound outbox."""
+    from orchestrator.landed_outbox import MergeProvenance  # noqa: PLC0415
+
+    MergeProvenance._outbox = None
+    yield
+    MergeProvenance._outbox = None
+
+
+def test_merge_provenance_factories_smoke(tmp_path) -> None:
+    """_make builds a real TaskWorkflow+TaskArtifacts fixture; _bind_landed_row is lookup-able."""
+    from orchestrator.artifacts import TaskArtifacts  # noqa: PLC0415
+    from orchestrator.landed_outbox import MergeProvenance  # noqa: PLC0415
+    from orchestrator.workflow import TaskWorkflow  # noqa: PLC0415
+    from _workflow_helpers import _Fixture, _bind_landed_row, _make  # noqa: PLC0415
+
+    fixture = _make(worktree=tmp_path / 'wt', project_root=tmp_path / 'pr')
+    assert isinstance(fixture, _Fixture)
+    assert isinstance(fixture.wf, TaskWorkflow)
+    assert isinstance(fixture.artifacts, TaskArtifacts)
+
+    _bind_landed_row(tmp_path, task_id='7', advanced_sha='deadbeef')
+    row = MergeProvenance.lookup('7')
+    assert row is not None
+    assert row.advanced_sha == 'deadbeef'
+
+
+def test_merge_provenance_factories_identity() -> None:
+    """Anti-duplication guard: the producer re-exports the SAME objects as the shared module."""
+    import test_workflow_merge_provenance as mp  # noqa: PLC0415
+    from _workflow_helpers import _Fixture, _bind_landed_row, _make  # noqa: PLC0415
+
+    assert mp._make is _make
+    assert mp._bind_landed_row is _bind_landed_row
+    assert mp._Fixture is _Fixture
