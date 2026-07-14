@@ -11,7 +11,11 @@ test_codebook.py.
 """
 from __future__ import annotations
 
+from datetime import datetime, timedelta, timezone
+
 from legibility import census_trigger as ct
+
+NOW = datetime(2026, 7, 14, 12, 0, 0, tzinfo=timezone.utc)
 
 
 # ---------------------------------------------------------------------------
@@ -47,3 +51,37 @@ def test_census_config_from_mapping_none_returns_defaults():
 
 def test_census_config_from_mapping_empty_dict_returns_defaults():
     assert ct.CensusConfig.from_mapping({}) == ct.CensusConfig()
+
+
+# ---------------------------------------------------------------------------
+# step-3: RED — evaluate() condition (a): max_interval_days
+# ---------------------------------------------------------------------------
+
+def _evaluate_a(*, last_census_at, tasks_landed=None, candidate_first_seens=None, config=None):
+    """Helper fixing the args condition (a)'s tests hold constant: has
+    censused, no spike, caller-controlled tasks_landed/config."""
+    return ct.evaluate(
+        now=NOW,
+        last_census_at=last_census_at,
+        never_censused=False,
+        tasks_landed=tasks_landed,
+        candidate_first_seens=candidate_first_seens or [],
+        config=config or ct.CensusConfig(),
+    )
+
+
+def test_evaluate_condition_a_day_9_no_fire():
+    decision = _evaluate_a(last_census_at=NOW - timedelta(days=9))
+    assert decision.fire is False
+
+
+def test_evaluate_condition_a_day_10_fires():
+    decision = _evaluate_a(last_census_at=NOW - timedelta(days=10))
+    assert decision.fire is True
+    assert any("max-interval" in r for r in decision.reasons)
+
+
+def test_evaluate_condition_a_day_12_fires():
+    decision = _evaluate_a(last_census_at=NOW - timedelta(days=12))
+    assert decision.fire is True
+    assert any("max-interval" in r for r in decision.reasons)
