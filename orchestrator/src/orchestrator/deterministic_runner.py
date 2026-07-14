@@ -624,6 +624,8 @@ class DeterministicRunner:
         task_id: str,
         summary: str,
         detail: str,
+        *,
+        metadata: dict | None = None,
     ) -> WorkflowOutcome:
         """File a born-at-L2 infra_issue escalation and set the task to blocked.
 
@@ -643,6 +645,13 @@ class DeterministicRunner:
         must not propagate — doing so would defeat this method's "always
         returns BLOCKED, never a raw exception" contract in exactly the
         scenario it exists to cover.
+
+        ``metadata``, when passed by a DEPLOY-path caller (``before_done``
+        set — every ``run()``-internal call site qualifies; ``_run_predicate``
+        never passes it), best-effort advances ``deploy_state.phase`` to
+        ``ESCALATED`` too (ζ DS-1) — same tolerate-a-severed-connection
+        posture as the trailing blocked-status write below, since the
+        escalation above is already durable regardless.
 
         Returns:
             WorkflowOutcome.BLOCKED
@@ -674,6 +683,17 @@ class DeterministicRunner:
                 'DeterministicRunner: filed L2 infra_issue escalation %s for task %s',
                 esc.id, task_id,
             )
+
+        if metadata is not None and metadata.get('before_done') is not None:
+            try:
+                await self._advance_deploy_phase(task_id, metadata, DeployPhase.ESCALATED)
+            except Exception as exc:
+                logger.warning(
+                    'DeterministicRunner: task %s deploy_state phase-escalated '
+                    'advance failed (%s: %s) — the infra_issue escalation above '
+                    'is already durable regardless',
+                    task_id, type(exc).__name__, exc,
+                )
 
         try:
             await self.scheduler.set_task_status(task_id, 'blocked')
@@ -828,25 +848,29 @@ class DeterministicRunner:
             esc.id, task_id, old, new,
         )
 
-    async def _advance_deploy_phase(
+    def _compute_deploy_phase_advance(
         self,
         task_id: str,
         metadata: dict,
         new_phase: DeployPhase,
         *,
-        evidence: dict | None = None,
         verify_baseline: VerifyBaseline | dict | None = None,
     ) -> DeployState:
-        """DS-1/DS-2: atomically advance ``metadata.deploy_state.phase`` + evidence.
+        """DS-2: enforce the transition and build the advanced ``DeployState``.
 
-        Reads the CURRENT phase from *metadata* (the in-memory dict threaded
-        through ``run()``), enforces the transition (DS-2: files a loud
-        escalation then raises on an illegal edge via
-        ``_deploy_transition_escalation_sink``), then persists
-        ``{**new DeployState.to_metadata(), **evidence}`` in ONE
-        ``update_task(metadata_mode='merge')`` call, and refreshes
-        ``metadata['deploy_state']`` in place so a LATER call within the SAME
-        ``run()`` invocation observes the just-written phase as ``old``.
+        Pure computation, no I/O — reads the CURRENT phase from *metadata*
+        (the in-memory dict threaded through ``run()``), enforces the
+        transition (files a loud escalation then raises on an illegal edge
+        via ``_deploy_transition_escalation_sink``), and returns the new
+        ``DeployState`` with the OLD ``ran_at``/``verified_at``/
+        ``escalated_at``/``verify_baseline`` evidence carried forward.
+
+        Shared by ``_advance_deploy_phase`` (the single-write path) and
+        ``_writeback_deploy_success`` (which folds the resulting
+        ``to_metadata()`` into its own retry-loop write rather than issuing a
+        second ``update_task`` call — the retry loop needs the RAW boolean
+        ``update_task`` return to detect a transient failure, which
+        ``_advance_deploy_phase`` does not expose).
 
         ``verify_baseline``, when omitted, carries forward whatever baseline
         was already recorded — a phase advance must never drop previously
@@ -865,12 +889,34 @@ class DeterministicRunner:
             verify_baseline if verify_baseline is not None
             else (old_state.verify_baseline if old_state is not None else None)
         )
-        new_state = DeployState(
+        return DeployState(
             phase=new_phase,
             verify_baseline=carried_baseline,
             ran_at=old_state.ran_at if old_state is not None else None,
             verified_at=old_state.verified_at if old_state is not None else None,
             escalated_at=old_state.escalated_at if old_state is not None else None,
+        )
+
+    async def _advance_deploy_phase(
+        self,
+        task_id: str,
+        metadata: dict,
+        new_phase: DeployPhase,
+        *,
+        evidence: dict | None = None,
+        verify_baseline: VerifyBaseline | dict | None = None,
+    ) -> DeployState:
+        """DS-1/DS-2: atomically advance ``metadata.deploy_state.phase`` + evidence.
+
+        Persists ``{**new DeployState.to_metadata(), **evidence}`` in ONE
+        ``update_task(metadata_mode='merge')`` call, and refreshes
+        ``metadata['deploy_state']`` in place so a LATER call within the SAME
+        ``run()`` invocation observes the just-written phase as ``old``. See
+        ``_compute_deploy_phase_advance`` for the transition-enforcement +
+        state-construction logic this wraps.
+        """
+        new_state = self._compute_deploy_phase_advance(
+            task_id, metadata, new_phase, verify_baseline=verify_baseline,
         )
         payload = {**new_state.to_metadata(), **(evidence or {})}
         await self.scheduler.update_task(task_id, payload, metadata_mode='merge')
@@ -923,6 +969,7 @@ class DeterministicRunner:
     async def _writeback_deploy_success(
         self,
         task_id: str,
+        metadata: dict,
         new_state: dict,
         target_unit: str,
         description: str,
@@ -945,6 +992,15 @@ class DeterministicRunner:
         re-running the deploy script (I1 once-only — this helper only
         persists an already-completed deploy's outcome).
 
+        ζ DS-1: the verified-stamp write also atomically carries
+        ``deploy_state.phase=='verified'`` — folded into the SAME write
+        computed ONCE up front (the pre-write phase does not change across
+        retries within this call), so the shared retry budget stays exactly
+        two writes.  The done-write below intentionally does NOT also advance
+        phase to ``done`` — ``verified -> done`` is a real DS-2-legal edge,
+        but leaving the PERSISTED phase at ``verified`` avoids a third write
+        (verified already proves success; done tasks are never swept).
+
         On budget exhaustion (fused-memory never recovers in-window), files a
         durable local ``infra_issue`` escalation (disk-backed, connection-
         independent) and returns BLOCKED — so the task is never silently
@@ -959,6 +1015,11 @@ class DeterministicRunner:
         pid = new_state.get('MainPID', 0)
         active_enter_timestamp = new_state.get('ActiveEnterTimestamp', '')
 
+        verified_deploy_state = self._compute_deploy_phase_advance(
+            task_id, metadata, DeployPhase.VERIFIED,
+        )
+        deploy_state_payload = verified_deploy_state.to_metadata()
+
         stamped = False
         for attempt in range(self._writeback_max_attempts):
             if not stamped:
@@ -967,9 +1028,12 @@ class DeterministicRunner:
                     {
                         'before_done_verified_at': verified_iso,
                         'before_done_verified_pid': pid,
+                        **deploy_state_payload,
                     },
                     metadata_mode='merge',
                 ))
+                if stamped:
+                    metadata['deploy_state'] = deploy_state_payload['deploy_state']
                 if not stamped:
                     logger.warning(
                         'DeterministicRunner: task %s verified-stamp writeback failed '
@@ -1060,6 +1124,7 @@ class DeterministicRunner:
             task_id,
             summary=f'Deploy verify/writeback stranded (connection severed): {target_unit}',
             detail=detail,
+            metadata=metadata,
         )
 
     async def _file_milestone_gate_and_block(
@@ -1638,6 +1703,7 @@ class DeterministicRunner:
                     task_id,
                     summary=f'Deploy state unknown after crash: {target_unit}',
                     detail=crash_detail,
+                    metadata=metadata,
                 )
 
             # ── Stop-instruction guard (task 2509) ───────────────────────────
@@ -1730,6 +1796,7 @@ class DeterministicRunner:
                         task_id,
                         summary=f'Self-restart completion failed: {target_unit}',
                         detail=completion_detail,
+                        metadata=metadata,
                     )
 
                 try:
@@ -1756,6 +1823,7 @@ class DeterministicRunner:
                         task_id,
                         summary=f'Self-restart scheduling failed: {target_unit}',
                         detail=detail,
+                        metadata=metadata,
                     )
 
                 try:
@@ -1849,6 +1917,7 @@ class DeterministicRunner:
                         task_id,
                         summary=f'Baseline inspect failed before deploy: {target_unit}',
                         detail=baseline_detail,
+                        metadata=metadata,
                     )
 
                 # ζ DS-3: persist the trustworthy baseline into deploy_state as a
@@ -1978,6 +2047,7 @@ class DeterministicRunner:
                         task_id,
                         summary=f'Deploy run+verify exceeded outer guard: {target_unit}',
                         detail=timeout_detail,
+                        metadata=metadata,
                     )
                 except Exception as exc:
                     error_detail = '\n'.join([
@@ -1990,6 +2060,7 @@ class DeterministicRunner:
                         task_id,
                         summary=f'Deploy run_fn failed (unexpected error): {target_unit}',
                         detail=error_detail,
+                        metadata=metadata,
                     )
 
                 if outcome.disposition == RestartDisposition.RESTART_FAILED:
@@ -2003,6 +2074,7 @@ class DeterministicRunner:
                         task_id,
                         summary=f'Deploy failed: {target_unit}',
                         detail=deploy_detail,
+                        metadata=metadata,
                     )
 
                 if outcome.disposition == RestartDisposition.VERIFY_FAILED:
@@ -2016,6 +2088,7 @@ class DeterministicRunner:
                         task_id,
                         summary=f'Deploy verify failed: {target_unit}',
                         detail=verify_detail,
+                        metadata=metadata,
                     )
 
                 if outcome.disposition != RestartDisposition.DEPLOYED_AND_VERIFIED:
@@ -2034,6 +2107,7 @@ class DeterministicRunner:
                         task_id,
                         summary=f'Deploy refused unexpectedly: {target_unit}',
                         detail=refused_detail,
+                        metadata=metadata,
                     )
 
                 new_state = captured.get('new_state', {})
@@ -2045,7 +2119,7 @@ class DeterministicRunner:
                     # backing that connection) — delegate to the connection-resilient
                     # writeback helper rather than a single unguarded write pair.
                     return await self._writeback_deploy_success(
-                        task_id, new_state, target_unit, description,
+                        task_id, metadata, new_state, target_unit, description,
                     )
 
                 # always_escalates=True with before_done (cross-unit act-then-ask):
