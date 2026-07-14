@@ -239,6 +239,39 @@ class TestRowSelectionDetail:
             assert 'esc-99' in detail.rendered_text
 
 
+class TestReplaceRowsChildrenCountAgainstFullSet:
+    @pytest.mark.timeout(10)
+    async def test_children_counted_against_all_records_not_visible_subset(self, tmp_path):
+        """replace_rows' all_records param counts outstanding children against
+        the FULL scanned set, not just the (possibly filtered) visible
+        `records` -- so a visible parent's non-terminal child is never
+        undercounted just because the child itself is hidden from view."""
+        from cockpit.app import CockpitApp
+        from cockpit.panes.session_table import SessionTable
+
+        parent = _make_record(session_slug='parent-1', parent_session_id=None)
+        running_child = _make_record(
+            session_slug='child-running',
+            parent_session_id='parent-1',
+            status=sr.Status.RUNNING,
+        )
+
+        app = CockpitApp(fleet_root=tmp_path, poll_interval=0.05)
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            table = app.query_one(SessionTable)
+
+            table.replace_rows(
+                [parent],
+                datetime.fromisoformat('2026-07-07T00:00:00+00:00'),
+                all_records=[parent, running_child],
+            )
+            await pilot.pause()
+
+            assert table.row_count == 1
+            assert table.get_row('parent-1')[4] == '1'
+
+
 class TestWriteDiscipline:
     @pytest.mark.timeout(10)
     async def test_cockpit_writes_only_its_own_ui_config(self, tmp_path):
