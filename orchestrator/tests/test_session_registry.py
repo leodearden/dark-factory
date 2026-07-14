@@ -1483,6 +1483,115 @@ def test_main_launching_fail_soft_when_launcher_pid_not_numeric(
 
 
 # ---------------------------------------------------------------------------
+# Task 2511 step-7: driving the liveness sweep from `launching`/`reap`
+# ---------------------------------------------------------------------------
+
+
+def test_main_launching_drains_prior_orphan_via_sweep(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    # A stale orphan O (non-terminal, dead pid, aged past the heartbeat TTL)
+    # pre-exists in the same sessions dir BEFORE this spawn's own `launching`
+    # write -- every spawn should opportunistically drain prior orphans.
+    orphan = _make_record(session_slug='orphan-o', status=sr.Status.RUNNING, launcher_pid=_DEAD_PID)
+    sr.write_record(orphan, root=tmp_path)
+    _set_mtime(
+        sr.record_path_for_slug('orphan-o', root=tmp_path),
+        datetime.now(UTC),
+        sr.NON_TERMINAL_HEARTBEAT_TTL + timedelta(minutes=1),
+    )
+
+    _set_env(monkeypatch, _launching_env(tmp_path))
+
+    rc = sr.main(['launching'])
+
+    assert rc == 0
+    slug = sr.build_session_slug('unblock', 'df', '2085', 4242)
+    expected_dir = sr.record_path_for_slug(slug, root=tmp_path).parent
+    # (i) the NEW launching record's dir is printed unchanged.
+    assert capsys.readouterr().out.strip() == str(expected_dir)
+    assert sr.read_record(slug, root=tmp_path).status == sr.Status.LAUNCHING
+
+    # (ii) the pre-existing orphan is now marked exited.
+    orphan_reloaded = sr.read_record('orphan-o', root=tmp_path)
+    assert orphan_reloaded.status == sr.Status.EXITED
+    assert orphan_reloaded.exit_code == sr.ORPHAN_EXIT_CODE
+
+
+def test_main_launching_fail_soft_when_sweep_raises(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    _set_env(monkeypatch, _launching_env(tmp_path))
+
+    calls: list[None] = []
+
+    def _boom(*_args: object, **_kwargs: object) -> list[sr.SessionRecord]:
+        calls.append(None)
+        raise OSError('sweep on fire')
+
+    monkeypatch.setattr(sr, 'mark_orphaned_sessions_exited', _boom)
+
+    rc = sr.main(['launching'])
+
+    assert rc == 0
+    assert calls  # the sweep really was invoked (and really did raise)
+    slug = sr.build_session_slug('unblock', 'df', '2085', 4242)
+    expected_dir = sr.record_path_for_slug(slug, root=tmp_path).parent
+    # The sweep fault is swallowed INSIDE _run_launching -- the printed dir
+    # (what spawn-claude.sh captures into SESSION_RECORD_DIR) stays exactly
+    # the new record's dir, never corrupted or suppressed by the fault.
+    assert capsys.readouterr().out.strip() == str(expected_dir)
+    assert sr.read_record(slug, root=tmp_path).status == sr.Status.LAUNCHING
+
+
+def test_main_reap_marks_then_deletes(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv('CLAUDE_FLEET_ROOT', str(tmp_path))
+
+    # A fresh stale orphan: non-terminal, dead pid, past the heartbeat TTL --
+    # this pass must MARK it exited (its mtime is bumped by the mark, so it
+    # is not also independently terminal_ttl-stale in this SAME pass).
+    fresh_orphan = _make_record(
+        session_slug='fresh-orphan', status=sr.Status.RUNNING, launcher_pid=_DEAD_PID
+    )
+    sr.write_record(fresh_orphan, root=tmp_path)
+    _set_mtime(
+        sr.record_path_for_slug('fresh-orphan', root=tmp_path),
+        datetime.now(UTC),
+        sr.NON_TERMINAL_HEARTBEAT_TTL + timedelta(minutes=1),
+    )
+
+    # A separately-aged terminal record, well past TERMINAL_TTL -- this pass
+    # must DELETE it (reason='terminal_ttl'), unchanged from today.
+    old_terminal = _make_record(
+        session_slug='old-terminal', status=sr.Status.EXITED, exit_code=0, launcher_pid=os.getpid()
+    )
+    sr.write_record(old_terminal, root=tmp_path)
+    _set_mtime(
+        sr.record_path_for_slug('old-terminal', root=tmp_path),
+        datetime.now(UTC),
+        sr.TERMINAL_TTL + timedelta(hours=1),
+    )
+
+    rc = sr.main(['reap'])
+
+    assert rc == 0
+    fresh_dir = sr.record_path_for_slug('fresh-orphan', root=tmp_path).parent
+    assert fresh_dir.is_dir()  # marked, NOT deleted, this pass
+    fresh_reloaded = sr.read_record('fresh-orphan', root=tmp_path)
+    assert fresh_reloaded.status == sr.Status.EXITED
+    assert fresh_reloaded.exit_code == sr.ORPHAN_EXIT_CODE
+
+    assert not sr.record_path_for_slug('old-terminal', root=tmp_path).parent.exists()
+
+
+# ---------------------------------------------------------------------------
 # Step-10: role leases (Attention Rail T7)
 # ---------------------------------------------------------------------------
 
