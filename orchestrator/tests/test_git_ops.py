@@ -2596,7 +2596,7 @@ class TestWorkingTreeSync:
         1. CAS failure → stash pop conflicts → pop_conflict_no_advance returned.
         2. Second advance_main call (no mocks, no dirty WIP) must NOT return
            'stash_failed' or 'unmerged_state' — it must succeed normally.
-        This proves _safe_stash_pop_with_recovery fully cleans the tree.
+        This proves _safe_restore_park_with_recovery fully cleans the tree.
         """
         # Setup: create a merge commit
         wt = await git_ops.create_worktree('cascade-regr')
@@ -3368,13 +3368,61 @@ class TestMergeParkRef:
         )
         assert stash_list.strip() == ''
 
+    async def test_park_wip_update_ref_race_raises_contention(
+        self, git_ops: GitOps,
+    ):
+        """The atomic create-only update-ref backstop raises when it loses a race.
+
+        Distinct from test_park_wip_stale_ref_raises_and_does_not_overwrite
+        above (which exercises the rev-parse pre-check guard): here the
+        rev-parse pre-check reports MERGE_PARK_REF absent, but the
+        create-only ``update-ref MERGE_PARK_REF <sha> 0…0`` still fails —
+        simulating the ref appearing in the TOCTOU window between the two
+        calls. This pins the belt-and-braces backstop itself, not just the
+        primary guard.
+        """
+        (git_ops.project_root / 'README.md').write_text('# WIP racing update-ref\n')
+
+        original_run = _run
+
+        async def mock_run(cmd, cwd=None):
+            if cmd[:5] == ['git', 'rev-parse', '--verify', '--quiet', MERGE_PARK_REF]:
+                return (1, '', '')
+            if (
+                cmd[:2] == ['git', 'update-ref']
+                and len(cmd) == 5
+                and cmd[2] == MERGE_PARK_REF
+                and cmd[4] == '0' * 40
+            ):
+                return (128, '', "fatal: cannot lock ref 'refs/dark-factory/merge-park'")
+            return await original_run(cmd, cwd=cwd)
+
+        with (
+            patch('orchestrator.git_ops._run', side_effect=mock_run),
+            pytest.raises(MergeParkContentionError, match='appeared concurrently'),
+        ):
+            await git_ops._park_wip_on_private_ref('lbl')
+
+        # The failed create-only update-ref must not leave a ref behind.
+        rc, _, _ = await _run(
+            ['git', 'rev-parse', '--verify', '--quiet', MERGE_PARK_REF],
+            cwd=git_ops.project_root,
+        )
+        assert rc != 0, 'ref must not exist after a failed create-only update-ref'
+
+        # The shared stash stack must still be untouched.
+        _, stash_list, _ = await _run(
+            ['git', 'stash', 'list'], cwd=git_ops.project_root,
+        )
+        assert stash_list.strip() == ''
+
 
 @pytest.mark.asyncio
 class TestSafeStashPopWithRecovery:
-    """Tests for the _safe_stash_pop_with_recovery helper."""
+    """Tests for the _safe_restore_park_with_recovery helper."""
 
     async def test_safe_stash_pop_success_returns_ok(self, git_ops: GitOps):
-        """_safe_stash_pop_with_recovery returns (True, None) on a clean apply.
+        """_safe_restore_park_with_recovery returns (True, None) on a clean apply.
 
         Dirty file content is restored, MERGE_PARK_REF is deleted, the shared
         stash list stays empty, and no recovery branch is created.
@@ -3391,7 +3439,7 @@ class TestSafeStashPopWithRecovery:
         assert rc == 0, 'expected MERGE_PARK_REF to resolve after park'
 
         # Call the helper — no conflict exists, should succeed
-        ok, recovery = await git_ops._safe_stash_pop_with_recovery('label-1')
+        ok, recovery = await git_ops._safe_restore_park_with_recovery('label-1')
 
         assert ok is True
         assert recovery is None
@@ -3419,7 +3467,7 @@ class TestSafeStashPopWithRecovery:
     async def test_safe_stash_pop_conflict_creates_recovery_branch(
         self, git_ops: GitOps,
     ):
-        """_safe_stash_pop_with_recovery returns (False, branch) and cleans up on conflict.
+        """_safe_restore_park_with_recovery returns (False, branch) and cleans up on conflict.
 
         The recovery branch points at the parked commit's tree, MERGE_PARK_REF
         is deleted, the shared stash list stays empty, and project_root has no
@@ -3448,7 +3496,7 @@ class TestSafeStashPopWithRecovery:
         )
 
         # Call the helper — git stash apply will conflict (real git conflict)
-        ok, recovery = await git_ops._safe_stash_pop_with_recovery('label-2')
+        ok, recovery = await git_ops._safe_restore_park_with_recovery('label-2')
 
         assert ok is False
         assert recovery is not None
