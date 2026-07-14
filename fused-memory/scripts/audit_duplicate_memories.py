@@ -47,6 +47,8 @@ from __future__ import annotations
 
 import difflib
 import logging
+from datetime import datetime
+from typing import Any
 
 logger = logging.getLogger('audit_duplicate_memories')
 
@@ -125,3 +127,53 @@ def find_near_duplicate_memory_groups(
 
     result = [g for g in groups.values() if len(g) >= 2]
     return _sort_groups_deterministically(result)
+
+
+def _created_at_sort_key(created_at: Any) -> tuple[int, float]:
+    """Sort key placing parseable ``created_at`` oldest-first, unparseable last.
+
+    Returns ``(0, timestamp)`` for a parseable ISO datetime string (so the
+    oldest instant sorts first), or ``(1, 0.0)`` for ``None``/unparseable
+    values — always after every parseable entry, so a record with no usable
+    timestamp is never mistakenly picked as "the oldest".
+    """
+    if not isinstance(created_at, str) or not created_at:
+        return (1, 0.0)
+    try:
+        return (0, datetime.fromisoformat(created_at).timestamp())
+    except (ValueError, TypeError):
+        return (1, 0.0)
+
+
+def pick_survivor(group: list[dict]) -> tuple[dict, list[dict]]:
+    """Pick the survivor from a near-duplicate memory group.
+
+    Survivor selection (in order):
+      1. A member explicitly flagged canonical (``metadata.get('canonical')``
+         truthy) wins, regardless of age.
+      2. Otherwise, the oldest member by ``created_at`` (ISO string) wins.
+         Records with a missing/unparseable ``created_at`` sort last (see
+         ``_created_at_sort_key``) so they are never chosen as "oldest"
+         unless every member in the group lacks a usable timestamp.
+      3. Ties (equal or absent ``created_at``) are broken by the lowest
+         ``str(id)``.
+
+    Raises ``ValueError`` for groups with < 2 memories.
+
+    Returns ``(survivor, losers)`` with ``losers`` = all non-survivor members.
+    """
+    if len(group) < 2:
+        raise ValueError(f'pick_survivor requires a group of >= 2 memories, got {len(group)}')
+
+    def _sort_key(m: dict) -> tuple[bool, int, float, str]:
+        canonical = bool((m.get('metadata') or {}).get('canonical'))
+        bucket, ts = _created_at_sort_key(m.get('created_at'))
+        # `not canonical` so canonical=True sorts first (False < True);
+        # bucket/ts ascending so the oldest parseable timestamp sorts first;
+        # id ascending so the lowest id wins remaining ties.
+        return (not canonical, bucket, ts, str(m.get('id', '')))
+
+    ordered = sorted(group, key=_sort_key)
+    survivor = ordered[0]
+    losers = [m for m in group if m is not survivor]
+    return survivor, losers
