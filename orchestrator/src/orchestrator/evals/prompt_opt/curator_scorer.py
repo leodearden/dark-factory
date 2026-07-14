@@ -7,6 +7,10 @@ call -- a low-variance "hard signal", contrasted with the reviewer's noisy
 haiku matcher (D-5). Reads `gold_*` fields off *item* and the predicted
 fields off *rollout* -- both dict-keyed OR attribute-shaped, since the T6
 engine's injected `rollout_fn` return shape isn't fixed by this module.
+
+Conformance to the T6 `run_optimization_loop` engine seam -- driven purely
+on the executor model, no fake Scorer stand-in -- is proven hermetically by
+test_prompt_opt_curator_scorer.py::TestCuratorActionScorerEngineConformance.
 """
 
 from __future__ import annotations
