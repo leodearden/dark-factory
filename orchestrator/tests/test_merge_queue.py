@@ -7613,6 +7613,68 @@ class TestEnqueueMergeRequest:
         assert rows[0][0] is None  # superseded_by NULL
         assert rows[0][1] == 1    # generation present
 
+    @pytest.mark.asyncio
+    async def test_on_finalized_propagates_reason(
+        self, tmp_path: Path, config: OrchestratorConfig,
+    ) -> None:
+        """Resolving a future with MergeOutcome(reason=...) causes _on_finalized
+        to record reason in both the retention ring and the merge_finalized
+        event data.  A non-failure outcome with reason='' (the MergeOutcome
+        default) normalizes to reason=None in both places — closing the
+        durable-tier reason parity gap for FAILURES only, not newly surfacing
+        an empty string on every terminal outcome.
+        """
+        from orchestrator.merge_queue import enqueue_merge_request
+
+        queue: asyncio.Queue[MergeRequest] = asyncio.Queue()
+        db_path = tmp_path / 'runs_reason.db'
+        event_store = EventStore(db_path, 'run-reason-test')
+        retention = TerminalOutcomeRetention()
+
+        wt_blocked = tmp_path / 'wt-blocked'
+        wt_blocked.mkdir()
+        blocked_req = _make_request('blocked-task', 'task/blocked-task', wt_blocked, config)
+
+        await enqueue_merge_request(queue, blocked_req, event_store, retention=retention)
+        blocked_req.result.set_result(
+            MergeOutcome(status='blocked', reason='verify failed: gui_tsc')
+        )
+        await asyncio.sleep(0)  # yield so the callback runs
+
+        # --- in-memory ring: reason must be present ---------------------------
+        stored_blocked = retention.get(blocked_req.request_id)
+        assert stored_blocked is not None
+        assert stored_blocked.reason == 'verify failed: gui_tsc'
+
+        wt_done = tmp_path / 'wt-done'
+        wt_done.mkdir()
+        done_req = _make_request('done-task', 'task/done-task', wt_done, config)
+
+        await enqueue_merge_request(queue, done_req, event_store, retention=retention)
+        done_req.result.set_result(
+            MergeOutcome(status='done', merge_sha='sha-done', reason='')
+        )
+        await asyncio.sleep(0)
+
+        # --- in-memory ring: empty reason normalizes to None -------------------
+        stored_done = retention.get(done_req.request_id)
+        assert stored_done is not None
+        assert stored_done.reason is None
+
+        # --- durable event: data dict must include reason (blocked) / None (done)
+        conn = sqlite3.connect(str(db_path))
+        rows = conn.execute(
+            "SELECT "
+            "json_extract(data, '$.request_id') AS request_id, "
+            "json_extract(data, '$.reason') AS reason "
+            "FROM events WHERE event_type = 'merge_finalized'"
+        ).fetchall()
+        conn.close()
+
+        rows_by_request_id = {row[0]: row[1] for row in rows}
+        assert rows_by_request_id[blocked_req.request_id] == 'verify failed: gui_tsc'
+        assert rows_by_request_id[done_req.request_id] is None
+
 
 # ---------------------------------------------------------------------------
 # TestMergeRequestIdentity — step-3 RED / step-4 GREEN
