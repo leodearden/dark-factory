@@ -2230,6 +2230,134 @@ class TestCrossProjectRoutingTaxonomyGuard:
         assert item['task_id'] is None
         assert item['cited_tasks'] == []
 
+    @pytest.mark.asyncio
+    async def test_cross_project_routing_with_cited_tasks_is_unchanged(self):
+        """(B) A cross_project_routing finding WITH a cite_task anchor keeps its
+        category/flag_type — the routing-check evidence is present, so no
+        downgrade fires. Mirrors
+        test_recon_cross_cycle_dedup_citations.py::test_cross_project_finding_carries_cited_tasks,
+        co-located here with the guard it pins."""
+        state = self._build_state()
+        run_id = 'r2453-with-anchor'
+
+        state.start_report(run_id, 'task_knowledge_sync', 'dark_factory')
+        r = state.add_finding(
+            run_id=run_id,
+            severity='moderate',
+            category='cross_project_routing',
+            description='Work belongs to reify/3803 — orphaned edge needs cleanup',
+            suggested_action='Route to reify project for manual resolution',
+            actionable=False,
+            task_id=None,
+            flag_type='cross_project',
+        )
+        assert 'error' not in r, f'add_finding failed: {r}'
+        finding_id = r['finding_id']
+
+        cite_result = await state.cite_task(
+            run_id=run_id, finding_id=finding_id, project_id='reify', task_id='3803'
+        )
+        assert 'error' not in cite_result, f'cite_task failed: {cite_result}'
+
+        assembled = state.get_assembled_report(run_id, 'task_knowledge_sync')
+        assert assembled is not None
+        items = assembled['flagged_items']
+        assert len(items) == 1, f'Expected 1 finding, got {len(items)}'
+        item = items[0]
+
+        assert item['category'] == 'cross_project_routing', (
+            f'category must NOT be downgraded when a cited_tasks anchor is present; '
+            f'got {item["category"]!r}'
+        )
+        assert item['flag_type'] == 'cross_project', (
+            f'flag_type must NOT be downgraded when a cited_tasks anchor is present; '
+            f'got {item["flag_type"]!r}'
+        )
+        assert len(item['cited_tasks']) == 1, (
+            f'Expected 1 cited_task, got {item["cited_tasks"]!r}'
+        )
+
+    @pytest.mark.asyncio
+    async def test_guard_is_category_scoped_other_categories_unaffected(self):
+        """(C) The guard fires ONLY on category=='cross_project_routing'. A
+        memory_stale finding (real task_id, no citations) and a null-null
+        systemic_pattern finding both read back with category/flag_type
+        UNCHANGED, proving the guard is category-scoped rather than a
+        blanket empty-cited_tasks rule."""
+        state = self._build_state()
+        run_id = 'r2453-scoped'
+
+        state.start_report(run_id, 'task_knowledge_sync', 'dark_factory')
+
+        r_stale = state.add_finding(
+            run_id=run_id,
+            severity='moderate',
+            category='memory_stale',
+            description='Memory entry is stale',
+            suggested_action='Refresh the memory entry',
+            actionable=True,
+            task_id='42',
+            flag_type='orphaned_knowledge',
+        )
+        assert 'error' not in r_stale, f'add_finding failed: {r_stale}'
+
+        r_systemic = state.add_finding(
+            run_id=run_id,
+            severity='low',
+            category='systemic_pattern',
+            description='Recurring pattern observed across the run',
+            suggested_action='Investigate the recurrence',
+            actionable=False,
+            task_id=None,
+            flag_type=None,
+        )
+        assert 'error' not in r_systemic, f'add_finding failed: {r_systemic}'
+
+        assembled = state.get_assembled_report(run_id, 'task_knowledge_sync')
+        assert assembled is not None
+        items = {item['finding_id']: item for item in assembled['flagged_items']}
+        assert len(items) == 2, f'Expected 2 findings, got {len(items)}'
+
+        stale_item = items[r_stale['finding_id']]
+        assert stale_item['category'] == 'memory_stale'
+        assert stale_item['flag_type'] == 'orphaned_knowledge'
+        assert stale_item['cited_tasks'] == []
+
+        systemic_item = items[r_systemic['finding_id']]
+        assert systemic_item['category'] == 'systemic_pattern'
+        assert systemic_item['flag_type'] is None
+        assert systemic_item['cited_tasks'] == []
+
+    @pytest.mark.asyncio
+    async def test_downgrade_is_idempotent_across_repeated_reads(self):
+        """Repeated get_assembled_report calls yield the identical downgraded
+        category/flag_type — the guard mutates only the returned projection,
+        never the stored _Finding, so re-reads cannot compound or drift."""
+        state = self._build_state()
+        run_id = 'r2453-idempotent'
+
+        state.start_report(run_id, 'task_knowledge_sync', 'dark_factory')
+        r = state.add_finding(
+            run_id=run_id,
+            severity='moderate',
+            category='cross_project_routing',
+            description='informational cross-project note',
+            suggested_action='FYI only, no routing check performed',
+            actionable=False,
+            task_id=None,
+            flag_type='cross_project',
+        )
+        assert 'error' not in r, f'add_finding failed: {r}'
+
+        first = state.get_assembled_report(run_id, 'task_knowledge_sync')
+        second = state.get_assembled_report(run_id, 'task_knowledge_sync')
+        assert first is not None and second is not None
+
+        first_item = first['flagged_items'][0]
+        second_item = second['flagged_items'][0]
+        assert first_item['category'] == second_item['category'] == 'other'
+        assert first_item['flag_type'] == second_item['flag_type'] == 'cross_project_info'
+
 
 # ---------------------------------------------------------------------------
 # task-1966 step-8: get_findings_for_run — RED until step-9 adds the method
