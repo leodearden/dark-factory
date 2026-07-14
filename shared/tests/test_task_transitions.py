@@ -170,22 +170,31 @@ class TestIsLegalTransitionCore:
         assert is_legal_transition(TaskStatus.PENDING, TaskStatus.MERGE_DEFERRED, ActorClass.HUMAN) is False
 
     @pytest.mark.parametrize(
-        'actor', [ActorClass.HUMAN, ActorClass.ORCHESTRATOR, ActorClass.DETERMINISTIC]
+        'actor',
+        [ActorClass.HUMAN, ActorClass.ORCHESTRATOR, ActorClass.DETERMINISTIC, ActorClass.RECONCILIATION],
     )
     def test_pending_to_done_legal(self, actor):
         # recon found_on_main / operator direct-complete of a never-dispatched
         # task (task 2614) — the pending-origin sibling of the existing
-        # (in-progress, done) completion pair.
+        # (in-progress, done) completion pair. RECONCILIATION is included
+        # (not just the safe-open actors) because recon found_on_main is the
+        # actor actually cited above, and the RECONCILIATION restriction
+        # (task-1655) only strips in-progress-origin pairs — this
+        # pending-origin pair is unaffected and stays in its safe-open subset.
         assert is_legal_transition(TaskStatus.PENDING, TaskStatus.DONE, actor) is True
 
     @pytest.mark.parametrize(
-        'actor', [ActorClass.HUMAN, ActorClass.ORCHESTRATOR, ActorClass.DETERMINISTIC]
+        'actor',
+        [ActorClass.HUMAN, ActorClass.ORCHESTRATOR, ActorClass.DETERMINISTIC, ActorClass.RECONCILIATION],
     )
     def test_pending_to_blocked_legal(self, actor):
         # Deterministic pure-gate born-at-L2 path (deterministic_runner.py:
         # 755/853, set_task_status(task_id, 'blocked') while still pending,
         # never flipping to in-progress) and human manual-block of a pending
-        # task (task 2614).
+        # task (task 2614). RECONCILIATION is included too: the actor
+        # restriction only strips in-progress-origin pairs (task-1655), so
+        # this pending-origin pair is unaffected and stays in RECONCILIATION's
+        # safe-open subset.
         assert is_legal_transition(TaskStatus.PENDING, TaskStatus.BLOCKED, actor) is True
 
 
@@ -205,7 +214,7 @@ _CORE_UNION_PAIRS = [
     (
         TaskStatus.PENDING,
         TaskStatus.DONE,
-        'completion: recon found_on_main / operator direct-complete of a never-dispatched task',
+        'completion: recon found_on_main; operator direct-complete is an out-of-band manual write, no enumerated call site',
     ),
     # park
     (TaskStatus.IN_PROGRESS, TaskStatus.MERGE_DEFERRED, 'park: workflow.py:867/896'),
@@ -233,7 +242,8 @@ _CORE_UNION_PAIRS = [
     (
         TaskStatus.PENDING,
         TaskStatus.BLOCKED,
-        'block: deterministic pure-gate born-at-L2 deterministic_runner.py:755/853; human block of a pending task',
+        'block: deterministic pure-gate born-at-L2 deterministic_runner.py:755/853; '
+        'human block of a pending task is an out-of-band manual write, no enumerated call site',
     ),
     # cancel
     (TaskStatus.IN_PROGRESS, TaskStatus.CANCELLED, 'cancel: abandon harness.py:8417'),
