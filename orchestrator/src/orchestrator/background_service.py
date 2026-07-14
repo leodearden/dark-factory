@@ -163,12 +163,21 @@ class ManagedService:
     """
 
     name: str
-    start_fn: Callable[[], Awaitable[None]]
+    start_fn: Callable[[], Awaitable[None] | None]
     stop_fn: Callable[[], Awaitable[None]]
     stop_timeout_secs: float
 
     async def start(self) -> None:
-        await self.start_fn()
+        """Delegate to ``start_fn``, awaiting it only if it is awaitable.
+
+        Mirrors ``LifecycleRegistry.start_all``'s tolerance: most wrapped
+        ``_start_*`` methods are ``async def``, but at least one (harness's
+        watcher-supervisor) is plain sync — its internal gate logic never
+        awaits anything, so there is nothing to await.
+        """
+        result = self.start_fn()
+        if inspect.isawaitable(result):
+            await result
 
     async def stop(self) -> None:
         await self.stop_fn()
