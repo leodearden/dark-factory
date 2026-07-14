@@ -73,6 +73,7 @@ import sys
 from datetime import UTC, datetime
 from typing import Any
 
+from fused_memory.maintenance.project_selection import select_projects
 from fused_memory.maintenance.rehome_scope_tag import (
     CGL_ETA_REHOME_KIND,
     apply_scope_tag,
@@ -211,41 +212,6 @@ def build_tag_report(
         'possibly_truncated': bool(sorted_truncated),
         'truncated_projects': sorted_truncated,
     }
-
-
-# ---------------------------------------------------------------------------
-# Pure helper: project selection
-# ---------------------------------------------------------------------------
-
-def select_projects(
-    known_map: dict[str, str],
-    project_id_filter: str | None,
-) -> list[str]:
-    """Return the sorted list of project_ids to process.
-
-    Mirrors ``prune_recon_cycle_summaries.select_projects``.
-
-    Parameters
-    ----------
-    known_map:
-        ``{project_id: project_root}`` from ``build_known_projects_map``.
-    project_id_filter:
-        When given, restrict to this single project_id. Raises ValueError
-        with the list of known ids if the filter is not recognised.
-
-    Returns
-    -------
-    Sorted list of project_ids.
-    """
-    if project_id_filter is None:
-        return sorted(known_map.keys())
-    if project_id_filter not in known_map:
-        known_ids = sorted(known_map.keys())
-        raise ValueError(
-            f'Unknown project_id {project_id_filter!r}. '
-            f'Known project ids: {known_ids}'
-        )
-    return [project_id_filter]
 
 
 # ---------------------------------------------------------------------------
