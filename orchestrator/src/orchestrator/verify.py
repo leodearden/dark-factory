@@ -3697,16 +3697,32 @@ def _worktree_reader(
     return _read
 
 
-# Maps a VerifyCmd's tool identity to the ModuleConfig attribute it renders
-# into. Used by _executed_module_configs_from_plan to recover which of
-# test_command/lint_command/type_check_command a PlannedRun belongs to, from
-# its cmd.tool — a SKIPPED run's cmd is None and needs no attribution, since
-# the corresponding ModuleConfig field is simply left unset (None) there.
-_MC_ATTR_BY_TOOL: dict[ToolKind, str] = {
-    ToolKind.PYTEST: 'test_command',
-    ToolKind.RUFF: 'lint_command',
-    ToolKind.PYRIGHT: 'type_check_command',
-}
+# Maps a PlannedRun's reason-string tool prefix to the ModuleConfig attribute
+# it renders into. Used by _executed_module_configs_from_plan to recover
+# which of test_command/lint_command/type_check_command a PlannedRun belongs
+# to. Keyed off `reason` (verify_plan._derive_module_runs's docstring: "Each
+# per-tool run's reason is prefixed with the tool name ... so a caller can
+# recover tool identity even for a SKIPPED slot") rather than `run.cmd.tool`,
+# because an OPAQUE-parsed command — an unrecognised head, e.g. a synthetic
+# test-fixture command or dark_factory's real multi-clause fleet lint/type
+# `&&`-chains (config.yaml) — always resolves to the SAME `ToolKind.OPAQUE`
+# regardless of which slot produced it, so `cmd.tool` alone cannot tell an
+# OPAQUE lint command apart from an OPAQUE test command. A SKIPPED run's cmd
+# is None and needs no attribution, since the corresponding ModuleConfig
+# field is simply left unset (None) there.
+_MC_ATTR_BY_REASON_PREFIX: tuple[tuple[str, str], ...] = (
+    ('lint:', 'lint_command'),
+    ('pyright:', 'type_check_command'),
+    ('pytest:', 'test_command'),
+)
+
+
+def _mc_attr_for_run(run: verify_plan.PlannedRun) -> str:
+    """Resolve which ModuleConfig attribute *run* renders into, from its reason prefix."""
+    for prefix, attr in _MC_ATTR_BY_REASON_PREFIX:
+        if run.reason.startswith(prefix):
+            return attr
+    raise ValueError(f'PlannedRun.reason has no recognised tool prefix: {run.reason!r}')
 
 
 def _executed_module_configs_from_plan(
@@ -3775,7 +3791,7 @@ def _executed_module_configs_from_plan(
         for run in runs:
             if run.cmd is None:
                 continue  # SKIPPED slot — the matching field stays unset (None) below
-            attr = _MC_ATTR_BY_TOOL[run.cmd.tool]
+            attr = _mc_attr_for_run(run)
             commands[attr] = (
                 getattr(mc, attr)
                 if run.scope_kind is verify_plan.ScopeKind.FULL_SUITE
