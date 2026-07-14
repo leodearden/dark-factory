@@ -18,6 +18,7 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 from _orch_helpers import pydantic_spec
+from _workflow_helpers import _make_warmlane_workflow as _make_workflow
 
 from orchestrator.config import OrchestratorConfig
 from orchestrator.git_ops import (
@@ -25,8 +26,6 @@ from orchestrator.git_ops import (
     WarmLanePoolExhausted,
 )
 from orchestrator.workflow import TaskWorkflow, WorkflowOutcome
-from _workflow_helpers import _make_warmlane_workflow as _make_workflow
-
 
 # ---------------------------------------------------------------------------
 # WarmLanePoolExhausted → REQUEUED

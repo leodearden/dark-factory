@@ -45,10 +45,6 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 from _orch_helpers import pydantic_spec
-from _workflow_helpers import FakeBriefing, FakeMcp, FakeScheduler
-from escalation.models import Escalation
-from shared.task_statuses import TaskStatus
-from shared.task_transitions import ActorClass, is_legal_transition, outcome_allows_status
 
 # Cross-module reuse — conftest.py injects orchestrator/tests onto sys.path
 # (see test_workflow_terminal_report.py for the same precedent). ``_make``
@@ -67,6 +63,9 @@ from shared.task_transitions import ActorClass, is_legal_transition, outcome_all
 # reaches DONE (rows 5-6).
 from _workflow_helpers import (
     AgentStub,
+    FakeBriefing,
+    FakeMcp,
+    FakeScheduler,
     _bind_landed_row,
     _build_harness,
     _build_workflow,
@@ -76,6 +75,9 @@ from _workflow_helpers import (
     _make,
     _make_warmlane_workflow,
 )
+from escalation.models import Escalation
+from shared.task_statuses import TaskStatus
+from shared.task_transitions import ActorClass, is_legal_transition, outcome_allows_status
 
 from orchestrator.agents.invoke import AgentResult
 from orchestrator.agents.roles import _FAMILY_TOOL_PREFIXES, ROLES, AgentRole
