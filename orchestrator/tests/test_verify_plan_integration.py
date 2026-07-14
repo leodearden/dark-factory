@@ -78,6 +78,7 @@ from orchestrator import (
 from orchestrator.config import GitConfig, ModuleConfig, OrchestratorConfig
 from orchestrator.git_ops import GitOps, _run
 from orchestrator.merge_queue import MergeRequest
+from orchestrator.verify import CheckRun, VerifyAttempt
 from orchestrator.verify_categories import CATEGORY_POLICY, FailureCategory, _validate_exhaustive
 from orchestrator.verify_classify import classify_failure
 from orchestrator.verify_cmd import (
@@ -573,6 +574,23 @@ class TestCategoryExhaustiveness:
 
 # ── step-13/14: Scenario 8 — CheckRun/VerifyAttempt timeout consistency (the
 #               verify.py:2735-2744 drift); Boundary-test sketch row 8 ───────
+
+
+def _check_run(
+    label, rc=0, timed_out=False, cmd='cmd', output='', started_at='ts', duration_secs=1.0,
+):
+    """Build a CheckRun with sane defaults, overriding only what a case cares about.
+
+    Ported from test_verify_attempt.py's ``_run`` builder, renamed
+    ``_check_run`` here — this module already imports
+    ``orchestrator.git_ops._run`` (the real subprocess runner
+    ``_setup_repo`` uses for the real-git-repo fixtures), and a same-named
+    module-level def would silently shadow it for every later caller.
+    """
+    return CheckRun(
+        label=label, cmd=cmd, rc=rc, output=output, timed_out=timed_out,
+        started_at=started_at, duration_secs=duration_secs,
+    )
 
 
 class TestCheckRunTimeoutConsistency:
