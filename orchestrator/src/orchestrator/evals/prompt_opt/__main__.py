@@ -250,7 +250,17 @@ def canary(
             'post-deploy data and re-run.'
         )
     elif verdict.verdict == 'regress':
-        click.echo(f'  Regressed metrics: {", ".join(verdict.regressed_metrics)}')
+        if verdict.regressed_metrics:
+            click.echo(f'  Regressed metrics: {", ".join(verdict.regressed_metrics)}')
+        else:
+            # Forced regress with no individual metric over threshold --
+            # the baseline-had-done/post-has-none rule (see the NOTE
+            # printed above and compare_windows's docstring).
+            click.echo(
+                '  Regressed: post window completed ZERO tasks despite the '
+                'baseline completing work -- forced regress even though no '
+                'individual metric crossed its threshold (see NOTE above).'
+            )
         if prompt_id and executor_model and harness_version:
             click.echo(
                 f'  ACTION: PromptArtifactStore(...).unpin({prompt_id!r}, {executor_model!r}, '

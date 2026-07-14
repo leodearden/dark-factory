@@ -884,3 +884,13 @@ class TestCanaryCLI:
         assert 'NOTE' in result.output, f'Missing zero-done NOTE.\nOutput:\n{result.output}'
         assert 'post' in result.output
         assert 'REGRESS' in result.output.upper()
+        # regressed_metrics is empty here (no individual metric crossed its
+        # threshold -- the verdict was forced by the zero-done-rows rule),
+        # so the bare "Regressed metrics: " line from a per-metric listing
+        # would print nothing after the colon. The CLI must fall back to an
+        # explicit reason instead of that blank, uninformative line.
+        assert 'Regressed metrics: \n' not in result.output, (
+            f'Blank regressed-metrics line -- must explain the forced-regress '
+            f'reason instead.\nOutput:\n{result.output}'
+        )
+        assert 'ZERO' in result.output and 'tasks' in result.output.lower()
