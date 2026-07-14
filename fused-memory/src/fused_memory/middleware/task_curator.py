@@ -1779,6 +1779,18 @@ class TaskCurator:
         deterministic point-id scheme record_task/backfill_corpus use to
         write points (_point_id), then diffing against the actual corpus
         point ids — robust to payload drift, no reliance on payload task_id.
+
+        CAUTION — tag scope: the corpus is keyed by ``project_id`` alone
+        (``_point_id``/``_collection_name`` take no ``tag``), and
+        ``record_task``/``index_committed_tasks`` record a task's vector
+        regardless of which tag it was filed under. ``live_task_ids`` MUST
+        therefore already aggregate every tag the corpus could contain a
+        vector for — if it only reflects a single tag's tasks, tasks filed
+        under any other tag will look orphaned and be deleted here. As of
+        this writing the only caller (``BackfillManager.prune``) reads a
+        single tag (``get_tasks`` defaults to ``DEFAULT_TAG``), which is a
+        known gap tracked for follow-up rather than fixed in this method —
+        see the matching note on ``BackfillManager.prune``.
         """
         live = {str(t) for t in live_task_ids}
         if not live:

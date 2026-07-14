@@ -126,6 +126,17 @@ class BackfillManager:
         the explicit reconciliation-sweep backstop to Layer A's witness-eviction
         in TaskInterceptor.remove_tasks — it also cleans any pre-existing strays.
 
+        CAUTION — tag scope: ``get_tasks(project_root)`` below is called
+        with no ``tag``, so it defaults to ``DEFAULT_TAG`` (the SQLite
+        backend's own default) and only ever sees that one tag's tasks. The
+        curator corpus, however, is populated for every tag a task is ever
+        filed under (see ``TaskCurator.prune_orphans``'s docstring). If any
+        task was ever recorded under a non-default tag, its corpus vector is
+        invisible to this snapshot and will be pruned as a false orphan.
+        This is a known gap — tracked for follow-up, not fixed here — because
+        closing it needs a way to enumerate/aggregate all tags, which the
+        task backend does not currently expose.
+
         Args:
             project_root: Absolute path to the project root (used to derive project_id
                           and to call get_tasks).
