@@ -937,6 +937,107 @@ def reap_stale_records(
     return reaped
 
 
+ORPHAN_EXIT_CODE: int = -1
+"""Synthetic exit code stamped by ``mark_orphaned_sessions_exited`` when a
+non-terminal session's ``launcher_pid`` is provably dead but no real exit
+code was ever recorded -- ``finish()`` never ran (SIGKILL, force-closed
+terminal, crash, reboot). Distinct from every real/sentinel code
+spawn-claude.sh can record (0-125 claude exit codes; 126/127/129/143/144
+spawn-claude.sh sentinels) and from ``None`` (no exit_code recorded yet), so
+a downstream consumer can tell an orphan-reaped record from a cleanly-exited
+one."""
+
+
+def mark_orphaned_sessions_exited(
+    root: Path | str | None = None,
+    *,
+    now: datetime | None = None,
+) -> list[SessionRecord]:
+    """Sweep ``<root>/sessions/*/`` and mark provably-orphaned records EXITED.
+
+    This is the liveness sweep that fixes the F2 staleness backlog: record
+    CONVERGENCE (session_hooks' CLAUDE_SPAWN_SESSION_ID adoption) only
+    advances CLEANLY-exiting spawned sessions through their hook-driven
+    launching -> running -> idle/awaiting-input -> exited lifecycle. The
+    backlog is overwhelmingly UNCLEAN deaths (SIGKILL, a force-closed
+    terminal, a crash, a reboot) where spawn-claude.sh's own ``finish()``
+    never runs, so ``exited`` is never written -- only this sweep ever marks
+    those records terminal.
+
+    Mirrors ``reap_stale_records``'s ``stale_pid`` predicate EXACTLY --
+    status is non-terminal (not in TERMINAL_STATUSES), ``launcher_pid`` is
+    dead (``_pid_alive``), and age (record.json's mtime vs *now*) exceeds
+    ``NON_TERMINAL_HEARTBEAT_TTL`` -- the same false-positive guard that
+    rule already trusts: a genuinely-live session (including a
+    detached/tmux one) keeps bumping its record's mtime via its own hooks,
+    so it is never swept regardless of how long it has been non-terminal.
+
+    Unlike ``reap_stale_records``, this does NOT delete anything -- it marks
+    a matching record EXITED (via ``update_status``, exit_code=
+    ``ORPHAN_EXIT_CODE``), preserving every other field, and leaves its
+    directory in place. ``reap_stale_records``'s existing ``terminal_ttl``
+    rule reclaims it later, unchanged. An already-terminal record is left
+    fully untouched (idempotent -- never re-stamped with the sentinel), and
+    a record whose body is missing or corrupt is skipped here -- that is
+    ``reap_stale_records``'s own ``'corrupt'`` rule's concern, not this
+    sweep's.
+
+    A per-record try/except means one bad record (a corrupt body, a
+    concurrent-reap race vanishing the file mid-sweep, an unwritable
+    record) never aborts the sweep -- it is logged and skipped, exactly
+    like ``reap_stale_records``'s own fault handling.
+
+    *now* is injectable for deterministic tests; defaults to the real UTC
+    clock. Returns the list of records this call marked (their post-mark,
+    now-EXITED state).
+    """
+    if now is None:
+        now = datetime.now(UTC)
+    base = sessions_dir(root)
+    marked: list[SessionRecord] = []
+    if not base.is_dir():
+        return marked
+
+    for slug_dir in sorted(base.iterdir()):
+        if not slug_dir.is_dir():
+            continue
+        slug = slug_dir.name
+
+        try:
+            record = read_record(slug, root=root)
+        except (FileNotFoundError, CorruptSessionRecord):
+            continue  # missing/corrupt body -- reap_stale_records' 'corrupt' rule's job
+        if record.status in TERMINAL_STATUSES:
+            continue  # already terminal -- idempotent, never re-stamped
+        if _pid_alive(record.launcher_pid):
+            continue  # a live launcher_pid is never swept, regardless of age
+
+        record_path = slug_dir / 'record.json'
+        try:
+            mtime = record_path.stat().st_mtime
+        except OSError:
+            continue  # vanished mid-sweep (e.g. concurrent reap) -- skip it
+        age = now - datetime.fromtimestamp(mtime, tz=UTC)
+        if age <= NON_TERMINAL_HEARTBEAT_TTL:
+            continue  # heartbeat grace -- not stale enough yet
+
+        try:
+            marked_record = update_status(
+                slug, root=root, status=Status.EXITED, exit_code=ORPHAN_EXIT_CODE
+            )
+        except (FileNotFoundError, CorruptSessionRecord, OSError):
+            # A single unmarkable record (a concurrent-reap race, an
+            # unwritable record) must not abort the sweep -- log and move on
+            # to the next candidate.
+            logger.error(
+                'mark_orphaned_sessions_exited: failed to mark %s', slug, exc_info=True
+            )
+            continue
+        marked.append(marked_record)
+
+    return marked
+
+
 # ---------------------------------------------------------------------------
 # Role leases: single-owner-per-role (Attention Rail T7; PRD T7 §4.1-4.2, §6 G5)
 # ---------------------------------------------------------------------------
