@@ -569,3 +569,60 @@ class TestCategoryExhaustiveness:
     def test_real_shipped_table_satisfies_its_own_guard(self):
         """Complement: the landed table already satisfies F1 at import time."""
         _validate_exhaustive(FailureCategory, CATEGORY_POLICY)
+
+
+# ── step-13/14: Scenario 8 — CheckRun/VerifyAttempt timeout consistency (the
+#               verify.py:2735-2744 drift); Boundary-test sketch row 8 ───────
+
+
+class TestCheckRunTimeoutConsistency:
+    """Scenario 8 — GOLDEN: the result's `timed_out` flag (any_timed_out +
+
+    pure_timeout_failure) and classify_failure's own INFRA_TIMEOUT category
+    are single-sourced from the same CheckRun.timed_out via VerifyAttempt, so
+    the two can never drift apart (the verify.py:2735-2744 hazard this task's
+    ε makes structurally impossible). Mirrors the env-recovery rebuild at
+    verify.py:3207-3208 (``attempt = VerifyAttempt([new_test, attempt.lint,
+    attempt.type]); timed_out = (not attempt.passed) and
+    attempt.pure_timeout_failure``).
+
+    RED until step-14 imports CheckRun/VerifyAttempt from orchestrator.verify
+    and ports a CheckRun-builder helper from test_verify_attempt.py (named
+    ``_check_run`` here, NOT that module's bare ``_run`` — this file already
+    imports ``orchestrator.git_ops._run`` for the real-git-repo fixtures'
+    ``_setup_repo``, and a same-named module-level def would silently shadow
+    it for every later caller).
+    """
+
+    def test_timed_out_test_leg_drives_both_channels_into_agreement(self):
+        attempt = VerifyAttempt([
+            _check_run('test', rc=1, timed_out=True),
+            _check_run('lint', rc=0),
+            _check_run('type', rc=0),
+        ])
+        assert attempt.any_timed_out is True
+        assert attempt.pure_timeout_failure is True
+
+        result_timed_out = (not attempt.passed) and attempt.pure_timeout_failure
+        assert result_timed_out is True
+
+        category = classify_failure(
+            ToolKind.PYTEST, attempt.test.rc, attempt.test.output, attempt.test.timed_out,
+        )
+        assert category == FailureCategory.INFRA_TIMEOUT
+
+        # The invariant: category==INFRA_TIMEOUT requires attempt.test.timed_out
+        # (classify_failure's timed_out guard wins before any output pattern
+        # is even consulted), which forces any_timed_out, which forces
+        # result_timed_out — both channels read the SAME CheckRun.timed_out,
+        # so the category can never flip to infra_timeout while the result
+        # stays timed_out=False (the 2735-2744 drift is structurally
+        # impossible here).
+        assert attempt.test.timed_out is True
+
+    def test_poison_case_real_failure_alongside_timeout_is_not_pure(self):
+        attempt = VerifyAttempt([
+            _check_run('test', rc=1, timed_out=False),
+            _check_run('type', rc=1, timed_out=True),
+        ])
+        assert attempt.pure_timeout_failure is False
