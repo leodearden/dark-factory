@@ -190,11 +190,19 @@ class TestBackgroundServiceLoop:
     @pytest.mark.asyncio
     async def test_pass_runs_after_interval_sleep_each_iteration(self) -> None:
         """Sleep-first: each iteration sleeps BEFORE running the pass."""
+        # Captured BEFORE patching: the patch target below resolves to the
+        # shared ``asyncio`` module object (background_service does a plain
+        # ``import asyncio`), so patching ``.sleep`` on it mutates
+        # ``asyncio.sleep`` process-wide for the ``with`` block's duration.
+        # ``fake_sleep`` must yield via THIS captured reference, not a fresh
+        # ``asyncio.sleep`` lookup, or it would recurse into itself.
+        real_sleep = asyncio.sleep
         order: list[str] = []
         done_event = asyncio.Event()
 
         async def fake_sleep(_delay: float) -> None:
             order.append('sleep')
+            await real_sleep(0)
 
         async def pass_fn() -> None:
             order.append('pass')

@@ -70,9 +70,33 @@ class BackgroundService:
         self._task = asyncio.create_task(self._loop(), name=self.name)
 
     async def _loop(self) -> None:
-        """Run the pass once.
+        """Wake periodically and run the pass.
 
-        Stub sufficient for start() idempotency (step-3): the canonical
-        sleep-first / exception-bounded loop body lands in step-6.
+        Sleep-first (hoisted verbatim from ``_no_landings_breaker_loop`` /
+        ``_warm_lane_gc_loop`` — see harness.py): ``CancelledError`` re-raises
+        so the loop task ends promptly on cancellation; a plain ``Exception``
+        is bounded-logged (task 1907 shape: a one-line ``logger.error`` —
+        NEVER ``logger.exception``, whose O(frame-count) traceback formatting
+        on a pathological traceback can exceed a per-test timeout) capped at
+        ``max_failure_logs`` CONSECUTIVE records, then backs off via
+        ``self.backoff`` so a pass that fails immediately can never
+        tight-spin. A successful pass resets the consecutive-failure counter
+        so a later failure streak logs again.
         """
-        await self.pass_fn()
+        while True:
+            try:
+                await asyncio.sleep(self.interval_secs)
+                await self.pass_fn()
+                self._consecutive_failures = 0
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                if self._consecutive_failures < self.max_failure_logs:
+                    logger.error(
+                        '%s pass failed: %s: %s',
+                        self.name,
+                        type(exc).__name__,
+                        exc,
+                    )
+                self._consecutive_failures += 1
+                await asyncio.sleep(self.backoff.delay_for(self._consecutive_failures))
