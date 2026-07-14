@@ -570,7 +570,22 @@ def run_nightly(
         if _git_status_changed(cfg.project_root, _CODEBOOK_RELPATH):
             message = f'legibility: nightly trickle sightings for {target_date.isoformat()}'
             commit_result = commit_fn(cfg.project_root, [_CODEBOOK_RELPATH], message)
-            commit_made = bool(commit_result.ok)
+            if not commit_result.ok:
+                # The dump already landed in the working tree; only the
+                # commit itself failed (e.g. a persistent ref-lock after
+                # exhausted retries). Fail loud (decision 8) -- the
+                # escalation + non-zero exit is the signal; the uncommitted
+                # dump is left in place rather than reverted.
+                summary = 'legibility trickle codebook commit failed'
+                escalated = post_escalation(cfg, summary, commit_result.stderr, poster=poster)
+                return NightlyResult(
+                    exit_code=1,
+                    applied=applied,
+                    coder_status=run.status,
+                    escalated=escalated,
+                    reason=summary,
+                )
+            commit_made = True
 
     census_line, census_fire = evaluate_census_step(cfg, now=now, status_fetcher=status_fetcher)
 
