@@ -23,7 +23,16 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-__all__ = ['Row', 'WindowMetrics', 'compute_window_metrics', 'load_window_rows']
+__all__ = [
+    'CanaryThresholds',
+    'CanaryVerdict',
+    'MetricComparison',
+    'Row',
+    'WindowMetrics',
+    'compare_windows',
+    'compute_window_metrics',
+    'load_window_rows',
+]
 
 
 def _field(row: Any, name: str) -> Any:
@@ -157,3 +166,129 @@ def load_window_rows(
         ]
     finally:
         conn.close()
+
+
+@dataclass(frozen=True)
+class CanaryThresholds:
+    """Per-metric regression thresholds: a relative tolerance (fraction
+    above baseline before flagging a regression) plus an absolute floor
+    (used instead of the relative ratio when a metric's baseline == 0, to
+    avoid dividing by zero on a tiny/zero baseline).
+
+    The defaults below are PRD §9 calibration STARTING points — to be
+    tuned against real ``runs.db`` baseline variance once collected. They
+    are NOT asserted as numeric guarantees anywhere in this module's test
+    suite, which always passes explicit thresholds instead.
+    """
+
+    cost_per_done_task_rel_tol: float = 0.2
+    cost_per_done_task_abs_floor: float = 1.0
+    requeue_rate_rel_tol: float = 0.2
+    requeue_rate_abs_floor: float = 0.05
+    mean_review_cycles_rel_tol: float = 0.2
+    mean_review_cycles_abs_floor: float = 1.0
+    mean_verify_attempts_rel_tol: float = 0.2
+    mean_verify_attempts_abs_floor: float = 1.0
+
+
+@dataclass(frozen=True)
+class MetricComparison:
+    """One metric's baseline-vs-post comparison.
+
+    ``baseline``/``post`` pass through whatever :class:`WindowMetrics` held
+    (``cost_per_done_task`` may be ``None`` when a window has no done
+    rows). When either is ``None`` the metric is incomparable:
+    ``delta_abs``/``delta_rel``/``threshold`` are ``None`` and
+    ``regressed`` is ``False`` — absence of evidence is not evidence of
+    regression. Otherwise ``threshold`` is the absolute cutoff ``post`` was
+    compared against (``baseline * (1 + rel_tol)``, or the metric's
+    ``abs_floor`` when ``baseline == 0``), so ``regressed`` is always
+    exactly ``post > threshold``.
+    """
+
+    metric: str
+    baseline: float | None
+    post: float | None
+    delta_abs: float | None
+    delta_rel: float | None
+    threshold: float | None
+    regressed: bool
+
+
+@dataclass(frozen=True)
+class CanaryVerdict:
+    """The overall pass/regress verdict from :func:`compare_windows`.
+
+    ``verdict`` is ``'regress'`` when ``regressed_metrics`` is non-empty,
+    else ``'pass'``. (A third value, ``'insufficient_data'``, is added by
+    the insufficient-data guard.) ``baseline_n``/``post_n`` carry each
+    window's row count through for display/logging.
+    """
+
+    verdict: str
+    comparisons: list[MetricComparison]
+    regressed_metrics: list[str]
+    baseline_n: int
+    post_n: int
+
+
+def _compare_metric(
+    metric: str, baseline: float | None, post: float | None, rel_tol: float, abs_floor: float,
+) -> MetricComparison:
+    """Compare one metric's baseline/post values under the "higher =
+    regression" rule, applying the absolute-floor branch when
+    ``baseline == 0`` and treating either side being ``None`` as
+    incomparable (never regressed)."""
+    if baseline is None or post is None:
+        return MetricComparison(
+            metric=metric, baseline=baseline, post=post,
+            delta_abs=None, delta_rel=None, threshold=None, regressed=False,
+        )
+
+    delta_abs = post - baseline
+    if baseline == 0:
+        threshold = abs_floor
+        delta_rel = None
+    else:
+        threshold = baseline * (1 + rel_tol)
+        delta_rel = delta_abs / baseline
+
+    return MetricComparison(
+        metric=metric, baseline=baseline, post=post,
+        delta_abs=delta_abs, delta_rel=delta_rel, threshold=threshold,
+        regressed=post > threshold,
+    )
+
+
+def compare_windows(
+    baseline: WindowMetrics, post: WindowMetrics, thresholds: CanaryThresholds,
+) -> CanaryVerdict:
+    """Compare *baseline* against *post* across all four T8/D-7 metrics and
+    emit a :class:`CanaryVerdict`."""
+    comparisons = [
+        _compare_metric(
+            'cost_per_done_task', baseline.cost_per_done_task, post.cost_per_done_task,
+            thresholds.cost_per_done_task_rel_tol, thresholds.cost_per_done_task_abs_floor,
+        ),
+        _compare_metric(
+            'requeue_rate', baseline.requeue_rate, post.requeue_rate,
+            thresholds.requeue_rate_rel_tol, thresholds.requeue_rate_abs_floor,
+        ),
+        _compare_metric(
+            'mean_review_cycles', baseline.mean_review_cycles, post.mean_review_cycles,
+            thresholds.mean_review_cycles_rel_tol, thresholds.mean_review_cycles_abs_floor,
+        ),
+        _compare_metric(
+            'mean_verify_attempts', baseline.mean_verify_attempts, post.mean_verify_attempts,
+            thresholds.mean_verify_attempts_rel_tol, thresholds.mean_verify_attempts_abs_floor,
+        ),
+    ]
+    regressed_metrics = [c.metric for c in comparisons if c.regressed]
+
+    return CanaryVerdict(
+        verdict='regress' if regressed_metrics else 'pass',
+        comparisons=comparisons,
+        regressed_metrics=regressed_metrics,
+        baseline_n=baseline.n_rows,
+        post_n=post.n_rows,
+    )
