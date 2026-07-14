@@ -173,11 +173,27 @@ def harness(tmp_path: Path, mock_orch_config):
         return_value='deadbeef' + 'a' * 32,
     )
 
-    # Default: get_task returns None (no branch_base_sha metadata) so Guard 3
-    # falls through and existing is_ancestor tests keep their prior semantics.
-    # Individual tests may override with AsyncMock(return_value={'metadata': {...}})
-    # to exercise the Guard 3 branch-advanced check.
-    h.scheduler.get_task = AsyncMock(return_value=None)
+    # Default: get_task synthesizes {'status': ..., 'metadata': {}} from
+    # whatever get_statuses() is currently configured to return for that tid
+    # (task 2243, W10-θ2: TaskGroundTruth.derive_truth's db_status is sourced
+    # from get_task(tid)['status'] — a DIFFERENT accessor than the per-tid
+    # `status` string the sweep loop itself reads from get_statuses(). In
+    # production both reflect the same row; the fixture keeps them
+    # consistent by construction here rather than requiring every test to
+    # duplicate the status in two places). Falls back to None (no row) when
+    # get_statuses' return_value isn't a plain (dict, err) tuple or has no
+    # entry for tid — matching the old unconditional-None default for any
+    # test that doesn't care. Individual tests that need branch_base_sha (or
+    # any other task-row shape) override get_task explicitly and are
+    # responsible for including a matching 'status' key themselves.
+    def _default_get_task(tid: str) -> dict | None:
+        try:
+            statuses, _err = h.scheduler.get_statuses.return_value
+        except (TypeError, ValueError):
+            return None
+        status = statuses.get(tid) if isinstance(statuses, dict) else None
+        return None if status is None else {'status': status, 'metadata': {}}
+    h.scheduler.get_task = AsyncMock(side_effect=_default_get_task)
 
     # Default: warm_lane_ref_is_degenerate returns False (task 2112 angle B) so
     # the metadata-independent fallback never fires for existing tests and the
@@ -984,11 +1000,11 @@ class TestReconcileStrandedInProgress:
                 'note': 'reconcile: branch already on main when stranded in-progress',
             },
         )
-        # The found_on_main SHA now comes from the citation-commit grep
-        # rather than the bare branch tip (gated by the post-fix Guard 2).
-        harness.git_ops.find_task_citation_commit.assert_awaited_once_with(  # type: ignore[attr-defined]
-            '50', pattern_template=None,
-        )
+        # The citation-guard (find_task_citation_commit) is retired (task
+        # 2243, W10-θ2 step-4) — the sha now comes from the resolver's
+        # branch-state resolution (git_ops.resolve_branch_sha), not a
+        # citation grep.
+        harness.git_ops.find_task_citation_commit.assert_not_awaited()  # type: ignore[attr-defined]
 
         # cleanup_worktree must NOT have been called
         harness.git_ops.cleanup_worktree.assert_not_called()  # type: ignore[attr-defined]
@@ -1037,63 +1053,13 @@ class TestReconcileStrandedInProgress:
         harness.scheduler.mark_done.assert_not_called()  # type: ignore[attr-defined]
         harness.scheduler.set_task_status.assert_not_called()  # type: ignore[attr-defined]
 
-    async def test_already_merged_skipped_when_main_lacks_task_citation(
-        self, harness: Harness
-    ):
-        """is_ancestor=True but no commit on main cites the task id →
-        reconciler must NOT flip to done.
-
-        Defends the same reify-3399 false-positive shape against tasks without
-        an L1 escalation: a zero-commit branch tip still sits on a main
-        ancestor, but if no commit on main mentions ``task/50`` (or matches the
-        citation pattern), there is no positive evidence of merge and the task
-        must stay in its current status.
-        """
-        harness.git_ops.is_ancestor = AsyncMock(return_value=True)  # type: ignore[attr-defined]
-        harness.git_ops.find_task_citation_commit = AsyncMock(  # type: ignore[attr-defined]
-            return_value=None,
-        )
-        harness.scheduler.get_statuses.return_value = (  # type: ignore[attr-defined]
-            {'50': 'blocked'}, None
-        )
-
-        await harness._reconcile_stranded_in_progress()
-
-        harness.git_ops.is_ancestor.assert_awaited_once_with('task/50', 'main')  # type: ignore[attr-defined]
-        harness.scheduler.mark_done.assert_not_called()  # type: ignore[attr-defined]
-        harness.scheduler.set_task_status.assert_not_called()  # type: ignore[attr-defined]
-
-    async def test_already_merged_uses_citation_commit_when_available(
-        self, harness: Harness
-    ):
-        """is_ancestor=True and a commit on main cites the task id →
-        ``done_provenance.commit`` records the citation SHA, NOT the bare
-        branch tip from ``resolve_branch_sha``.
-
-        The matched commit is stronger evidence than ``is_ancestor`` alone:
-        the citation tells us exactly *which* commit lands the task, so the
-        provenance row points at that commit rather than at the (possibly
-        post-merge) branch ref.
-        """
-        citation_sha = 'cafefeed' + 'b' * 32
-        harness.git_ops.is_ancestor = AsyncMock(return_value=True)  # type: ignore[attr-defined]
-        harness.git_ops.find_task_citation_commit = AsyncMock(  # type: ignore[attr-defined]
-            return_value=citation_sha,
-        )
-        harness.scheduler.get_statuses.return_value = (  # type: ignore[attr-defined]
-            {'50': 'in-progress'}, None
-        )
-
-        await harness._reconcile_stranded_in_progress()
-
-        # mark_done was called with the citation SHA, not the branch-tip SHA.
-        harness.scheduler.mark_done.assert_awaited_once()  # type: ignore[attr-defined]
-        kwargs = harness.scheduler.mark_done.call_args.kwargs  # type: ignore[attr-defined]
-        assert kwargs['sha'] == citation_sha, (
-            f"mark_done must record the citation SHA "
-            f"({citation_sha!r}), got {kwargs['sha']!r}"
-        )
-        assert kwargs['kind'] == 'found_on_main'
+    # test_already_merged_skipped_when_main_lacks_task_citation and
+    # test_already_merged_uses_citation_commit_when_available were removed
+    # (task 2243, W10-θ2 step-4): both asserted the citation-guard's
+    # SHA-preference/skip behaviour (find_task_citation_commit), which
+    # step-4's plan explicitly retires in favour of TaskGroundTruth's
+    # coarser ON_MAIN/GONE_WITH_MERGE_MARKER classification — see the
+    # design decision recorded on task 2243's plan and esc-2243-4.
 
     async def test_already_merged_drops_recovered_plan_and_cleans_worktree(
         self, harness: Harness
@@ -1211,100 +1177,50 @@ class TestReconcileStrandedInProgress:
     # Guard 3 structurally rejects zero-commit branches sitting on main.
     # ------------------------------------------------------------------
 
+    @pytest.mark.xfail(
+        reason=(
+            'task 2243 W10-θ2: the degenerate-branch refinement (tip == '
+            'branch_base_sha must NOT mark-done) is deferred to plan '
+            'step-7/8 — TaskGroundTruth (θ1) has no degenerate check, and '
+            "the interim MARK_DONE decision doesn't consult metadata "
+            'at all yet. My.blocked+on-main refinement (step-4) also does '
+            "not yet guard degeneracy — step-8 must cover both."
+        ),
+        strict=True,
+    )
     async def test_already_merged_skipped_when_branch_never_advanced(
         self, harness: Harness
     ):
         """Guard 3: branch tip == branch_base_sha → never advanced; veto flip.
 
-        Guards 1+2 would both pass (no open L1, citation grep hits), but the
-        branch base equals the current tip, proving no commits were ever pushed
-        on this incarnation.  The reconciler must NOT flip to done.
+        The branch base equals the current tip, proving no commits were ever
+        pushed on this incarnation.  The reconciler must NOT flip to done.
         """
         branch_tip = 'deadbeef' + 'a' * 32
         harness.git_ops.is_ancestor = AsyncMock(return_value=True)
-        harness.git_ops.find_task_citation_commit = AsyncMock(
-            return_value='cafefeed' + 'b' * 32
-        )
         # Branch tip equals base → branch never advanced past creation point
         harness.git_ops.resolve_branch_sha = AsyncMock(return_value=branch_tip)
         harness.scheduler.get_task = AsyncMock(
-            return_value={'id': '50', 'metadata': {'branch_base_sha': branch_tip}}
+            return_value={'id': '50', 'status': 'blocked', 'metadata': {'branch_base_sha': branch_tip}}
         )
         harness.scheduler.get_statuses.return_value = ({'50': 'blocked'}, None)  # type: ignore[attr-defined]
 
         await harness._reconcile_stranded_in_progress()
 
-        # Guard 3 must veto even though Guards 1+2 passed
+        # Guard 3 must veto
         harness.scheduler.mark_done.assert_not_called()  # type: ignore[attr-defined]
         harness.scheduler.set_task_status.assert_not_called()  # type: ignore[attr-defined]
 
-    async def test_already_merged_flips_when_branch_advanced(
-        self, harness: Harness
-    ):
-        """Guard 3 positive case: branch tip != branch_base_sha → flip proceeds.
-
-        branch_base_sha records the creation-point; the current tip has advanced
-        (commits were pushed), so Guard 3 must NOT block the flip.
-        """
-        branch_tip = 'deadbeef' + 'a' * 32
-        branch_base = 'aaaa' * 10  # different SHA → branch advanced
-        citation_sha = 'cafefeed' + 'b' * 32
-        harness.git_ops.is_ancestor = AsyncMock(return_value=True)
-        harness.git_ops.find_task_citation_commit = AsyncMock(return_value=citation_sha)
-        harness.git_ops.resolve_branch_sha = AsyncMock(return_value=branch_tip)
-        harness.scheduler.get_task = AsyncMock(
-            return_value={'id': '50', 'metadata': {'branch_base_sha': branch_base}}
-        )
-        harness.scheduler.get_statuses.return_value = ({'50': 'blocked'}, None)  # type: ignore[attr-defined]
-
-        await harness._reconcile_stranded_in_progress()
-
-        # Branch advanced past base → Guard 3 must NOT block; flip to done
-        harness.scheduler.set_task_status.assert_awaited_once_with(  # type: ignore[attr-defined]
-            '50', 'done',
-            done_provenance={
-                'kind': 'found_on_main',
-                'commit': citation_sha,
-                'note': 'reconcile: branch on main while task was blocked (out-of-band merge)',
-            },
-        )
-
-    async def test_already_merged_falls_through_when_branch_base_sha_missing_or_malformed(
-        self, harness: Harness
-    ):
-        """Guard 3 backward-compat: missing/malformed branch_base_sha → fall through.
-
-        Tasks created before branch_base_sha was introduced (or whose metadata
-        write failed) must still be flipped to done by Guards 1+2 alone.
-        Both the missing-key case and the malformed-value case are covered.
-        """
-        citation_sha = 'cafefeed' + 'b' * 32
-        harness.git_ops.is_ancestor = AsyncMock(return_value=True)
-        harness.git_ops.find_task_citation_commit = AsyncMock(return_value=citation_sha)
-        harness.git_ops.resolve_branch_sha = AsyncMock(return_value='deadbeef' + 'a' * 32)
-        harness.scheduler.get_statuses.return_value = ({'50': 'blocked'}, None)  # type: ignore[attr-defined]
-
-        for metadata_value in [
-            {},                              # missing key
-            {'branch_base_sha': 'short'},    # malformed — not 40 hex chars
-        ]:
-            harness.scheduler.get_task = AsyncMock(
-                return_value={'id': '50', 'metadata': metadata_value}
-            )
-            harness.scheduler.set_task_status.reset_mock()  # type: ignore[attr-defined]
-            harness.scheduler.mark_done.reset_mock()  # type: ignore[attr-defined]
-
-            await harness._reconcile_stranded_in_progress()
-
-            # Guard 3 must short-circuit and defer to Guards 1+2
-            harness.scheduler.set_task_status.assert_awaited_once_with(  # type: ignore[attr-defined]
-                '50', 'done',
-                done_provenance={
-                    'kind': 'found_on_main',
-                    'commit': citation_sha,
-                    'note': 'reconcile: branch on main while task was blocked (out-of-band merge)',
-                },
-            )
+    # test_already_merged_flips_when_branch_advanced and
+    # test_already_merged_falls_through_when_branch_base_sha_missing_or_malformed
+    # were removed (task 2243, W10-θ2 step-4): both asserted the retired
+    # citation-guard's SHA-preference behaviour (done_provenance.commit ==
+    # the find_task_citation_commit result rather than the branch tip) —
+    # see the design decision on task 2243's plan and esc-2243-4. The
+    # "Guard 3 does not spuriously veto a non-degenerate branch" property
+    # they also covered is subsumed by
+    # test_already_merged_branch_marked_done_with_provenance (an
+    # already-merged, non-degenerate branch flips to done).
 
     # ------------------------------------------------------------------
     # Degenerate-branch IN-PROGRESS recovery (#1823 follow-up / task-2992).
@@ -1317,12 +1233,11 @@ class TestReconcileStrandedInProgress:
     async def test_degenerate_in_progress_no_citation_reverted(
         self, harness: Harness
     ):
-        """Guard 2 path (the task-2992 strand): in-progress on a degenerate
-        provisioning branch (tip == branch_base_sha), no commit cites the task,
-        no live claimant → reverted to pending; NOT marked done."""
+        """The task-2992 strand: in-progress on a degenerate provisioning
+        branch (tip == branch_base_sha), no live claimant → reverted to
+        pending; NOT marked done."""
         branch_tip = 'deadbeef' + 'a' * 32
         harness.git_ops.is_ancestor = AsyncMock(return_value=True)  # type: ignore[attr-defined]
-        harness.git_ops.find_task_citation_commit = AsyncMock(return_value=None)  # type: ignore[attr-defined]
         harness.git_ops.resolve_branch_sha = AsyncMock(return_value=branch_tip)  # type: ignore[attr-defined]
         harness.scheduler.get_task = AsyncMock(  # type: ignore[attr-defined]
             return_value={'id': '50', 'metadata': {'branch_base_sha': branch_tip}}
@@ -1334,8 +1249,6 @@ class TestReconcileStrandedInProgress:
 
         harness.scheduler.set_task_status.assert_awaited_once_with('50', 'pending')  # type: ignore[attr-defined]
         harness.scheduler.mark_done.assert_not_called()  # type: ignore[attr-defined]
-        # Citation-missing escalation must NOT accrue — the task is recovered.
-        assert '50' not in harness._reconcile_skip_counts
 
     async def test_degenerate_in_progress_no_citation_stale_lock_reverted(
         self, harness: Harness, monkeypatch
@@ -1389,13 +1302,21 @@ class TestReconcileStrandedInProgress:
         harness.scheduler.set_task_status.assert_awaited_once_with('50', 'pending')  # type: ignore[attr-defined]
         harness.scheduler.mark_done.assert_not_called()  # type: ignore[attr-defined]
 
+    @pytest.mark.xfail(
+        reason=(
+            'task 2243 W10-θ2 step-4: the blocked+on-main R4 refinement '
+            'does not yet guard degeneracy (deferred to step-7/8 alongside '
+            "TaskGroundTruth's own degenerate gap — see "
+            'test_already_merged_skipped_when_branch_never_advanced).'
+        ),
+        strict=True,
+    )
     async def test_degenerate_blocked_not_reverted(self, harness: Harness):
         """Blocked discipline regression: a degenerate branch on a BLOCKED task is
         left intact — never blocked→pending, never marked done.  Pins the revert
         to in-progress only (the in-progress-vs-blocked branch in both guards)."""
         branch_tip = 'deadbeef' + 'a' * 32
         harness.git_ops.is_ancestor = AsyncMock(return_value=True)  # type: ignore[attr-defined]
-        harness.git_ops.find_task_citation_commit = AsyncMock(return_value=None)  # type: ignore[attr-defined]
         harness.git_ops.resolve_branch_sha = AsyncMock(return_value=branch_tip)  # type: ignore[attr-defined]
         harness.scheduler.get_task = AsyncMock(  # type: ignore[attr-defined]
             return_value={'id': '50', 'metadata': {'branch_base_sha': branch_tip}}
@@ -1587,173 +1508,17 @@ class TestReconcileStrandedInProgress:
     # rejected; a marker from this incarnation must flip the task.
     # ------------------------------------------------------------------
 
-    @pytest.mark.parametrize(
-        'status',
-        [
-            pytest.param('in-progress', id='in-progress'),
-            pytest.param('blocked', id='blocked'),
-        ],
-    )
-    async def test_marker_skipped_when_marker_predates_branch_base_sha_parametrized(
-        self, harness: Harness, status: str,
-    ):
-        """Stale-marker veto is status-agnostic: predates branch_base_sha → must NOT flip.
+    # test_marker_skipped_when_marker_predates_branch_base_sha_parametrized,
+    # test_marker_accepted_when_marker_postdates_branch_base_sha_parametrized,
+    # test_marker_falls_through_when_branch_base_sha_missing, and
+    # test_stale_marker_veto_leaves_inprogress_without_lock_revert were
+    # removed (task 2243, W10-θ2 step-4): all four asserted the retired
+    # stale-marker/prior-incarnation veto (is_ancestor(marker_sha,
+    # branch_base_sha)) that lived inside the now-deleted inline
+    # find_merge_marker archaeology block — TaskGroundTruth's
+    # GONE_WITH_MERGE_MARKER resolution carries no equivalent check. See the
+    # design decision on task 2243's plan and esc-2243-4.
 
-        The veto at harness.py:1312-1321 fires on the second is_ancestor call's
-        result (True = marker is ancestor of base = stale = prior incarnation) and
-        short-circuits with `return None` BEFORE the status-aware note construction
-        at harness.py:1323-1327 runs.  The blocked-flavor message
-        'reconcile: merge marker found on main while task was blocked' (and the
-        in-progress fixed message) must NOT fire for vetoed markers.
-        """
-        marker_sha = 'cafebabe' + 'd' * 32
-        branch_base = 'beef0000' + '9' * 32
-        tid = '80'
-        # First is_ancestor: branch check → False (skip is_ancestor fast-path)
-        # Second is_ancestor: stale-marker check → True (marker predates base)
-        harness.git_ops.is_ancestor = AsyncMock(side_effect=[False, True])
-        harness.git_ops.find_merge_marker = AsyncMock(return_value=marker_sha)
-        harness.scheduler.get_task = AsyncMock(
-            return_value={'id': tid, 'metadata': {'branch_base_sha': branch_base}}
-        )
-        harness.scheduler.get_statuses.return_value = ({tid: status}, None)  # type: ignore[attr-defined]
-
-        await harness._reconcile_stranded_in_progress()
-
-        # Stale marker from prior incarnation — must NOT flip to done regardless of status
-        harness.scheduler.mark_done.assert_not_called()  # type: ignore[attr-defined]
-        harness.scheduler.set_task_status.assert_not_called()  # type: ignore[attr-defined]
-
-    @pytest.mark.parametrize(
-        'status,expected_note',
-        [
-            pytest.param(
-                'in-progress',
-                'reconcile: branch deleted but merge marker found on main',
-                id='in-progress',
-            ),
-            pytest.param(
-                'blocked',
-                'reconcile: merge marker found on main while task was blocked',
-                id='blocked',
-            ),
-        ],
-    )
-    async def test_marker_accepted_when_marker_postdates_branch_base_sha_parametrized(
-        self, harness: Harness, status: str, expected_note: str,
-    ):
-        """Stale-marker accept path: marker postdates base → flip to done with status-aware note.
-
-        Exercises the status-aware note conditional at harness.py:1323-1327:
-          - status == 'blocked' → 'reconcile: merge marker found on main while task was blocked'
-          - any other status (here 'in-progress') → 'reconcile: branch deleted but merge marker found on main'
-
-        The expected_note for the blocked arm is the verbatim f-string output and is
-        pinned to catch regressions in the conditional.  The in-progress arm pins
-        the fixed else-branch string.
-        """
-        marker_sha = 'cafebabe' + 'd' * 32
-        branch_base = 'beef0000' + '9' * 32
-        tid = '81'
-        # First is_ancestor: branch check → False (skip is_ancestor fast-path)
-        # Second is_ancestor: stale-marker check → False (marker postdates base)
-        harness.git_ops.is_ancestor = AsyncMock(side_effect=[False, False])
-        harness.git_ops.find_merge_marker = AsyncMock(return_value=marker_sha)
-        harness.scheduler.get_task = AsyncMock(
-            return_value={'id': tid, 'metadata': {'branch_base_sha': branch_base}}
-        )
-        harness.scheduler.get_statuses.return_value = ({tid: status}, None)  # type: ignore[attr-defined]
-
-        await harness._reconcile_stranded_in_progress()
-
-        # Marker is from this incarnation — must flip to done with the status-appropriate note
-        harness.scheduler.set_task_status.assert_awaited_once_with(  # type: ignore[attr-defined]
-            tid, 'done',
-            done_provenance={
-                'kind': 'found_on_main',
-                'commit': marker_sha,
-                'note': expected_note,
-            },
-        )
-
-    async def test_marker_falls_through_when_branch_base_sha_missing(
-        self, harness: Harness
-    ):
-        """Stale-marker backward-compat: missing branch_base_sha → accept marker.
-
-        Tasks created before branch_base_sha was introduced must still be
-        flipped to done by the existing marker guard.  The new stale-marker
-        check must short-circuit on missing metadata and NOT run a bogus
-        is_ancestor call against None.
-        """
-        marker_sha = 'cafebabe' + 'd' * 32
-        # is_ancestor: first call → False (branch check); must NOT be called again
-        is_ancestor_mock = AsyncMock(return_value=False)
-        harness.git_ops.is_ancestor = is_ancestor_mock
-        harness.git_ops.find_merge_marker = AsyncMock(return_value=marker_sha)
-        # No branch_base_sha in metadata
-        harness.scheduler.get_task = AsyncMock(
-            return_value={'id': '82', 'metadata': {}}
-        )
-        harness.scheduler.get_statuses.return_value = ({'82': 'in-progress'}, None)  # type: ignore[attr-defined]
-
-        await harness._reconcile_stranded_in_progress()
-
-        # Existing marker-flip must happen
-        harness.scheduler.set_task_status.assert_awaited_once_with(  # type: ignore[attr-defined]
-            '82', 'done',
-            done_provenance={
-                'kind': 'found_on_main',
-                'commit': marker_sha,
-                'note': 'reconcile: branch deleted but merge marker found on main',
-            },
-        )
-
-        # is_ancestor must only have been called once (branch check), NOT for
-        # the stale-marker check (no valid SHA to compare against)
-        assert is_ancestor_mock.await_count == 1, (
-            'is_ancestor must not be called for stale-marker check when '
-            'branch_base_sha is missing'
-        )
-
-    async def test_stale_marker_veto_leaves_inprogress_without_lock_revert(
-        self, harness: Harness, tmp_path: Path
-    ):
-        """Stale-marker veto returns None early — lock-state revert path skipped.
-
-        When status='in-progress', branch is gone, and the stale-marker check
-        rejects the marker (it predates branch_base_sha), the reconciler must
-        return None immediately.  The lock-state classification path that would
-        normally revert a task with no lock to 'pending' must NOT fire — it is
-        only reached when there is no on-main evidence at all.
-
-        Pinning this behaviour is intentional (see reviewer suggestion #4): the
-        task will be re-evaluated on the next sweep with the same stale-marker
-        rejection; the no-lock revert is a separate concern for tasks that have
-        no evidence either way.
-        """
-        tid = '83'
-        marker_sha = 'deadc0de' + 'f' * 32
-        branch_base = 'babe0000' + '9' * 32
-        # is_ancestor: first call (branch check) → False; second call
-        # (stale-marker check) → True (marker predates branch creation)
-        harness.git_ops.is_ancestor = AsyncMock(side_effect=[False, True])  # type: ignore[attr-defined]
-        harness.git_ops.find_merge_marker = AsyncMock(return_value=marker_sha)  # type: ignore[attr-defined]
-        harness.scheduler.get_task = AsyncMock(
-            return_value={'id': tid, 'metadata': {'branch_base_sha': branch_base}}
-        )
-        harness.scheduler.get_statuses.return_value = ({tid: 'in-progress'}, None)  # type: ignore[attr-defined]
-
-        # No worktree directory → if the revert path fired it would call
-        # set_task_status(tid, 'pending') for the no-lock orphan case.
-
-        changed = await harness._reconcile_stranded_in_progress()
-
-        # Stale-marker veto returns None early → changed == 0, no status
-        # mutation of any kind.
-        assert changed == 0
-        harness.scheduler.mark_done.assert_not_called()  # type: ignore[attr-defined]
-        harness.scheduler.set_task_status.assert_not_called()  # type: ignore[attr-defined]
 
     async def test_find_merge_marker_not_invoked_when_is_ancestor_true(
         self, harness: Harness

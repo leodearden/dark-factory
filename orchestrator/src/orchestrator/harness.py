@@ -71,7 +71,7 @@ from orchestrator.systemd_inspect import (
     _deterministic_deploy_health_verdict,
     inspect_systemd_unit,
 )
-from orchestrator.task_ground_truth import RecoveryAction, TaskGroundTruth
+from orchestrator.task_ground_truth import BranchStateKind, RecoveryAction, TaskGroundTruth
 from orchestrator.task_status import (
     ACTIVE_TASK_STATUSES,
     TERMINAL_STATUSES,
@@ -1068,12 +1068,6 @@ class Harness:
         # Per-task consecutive-failure counter for the reconcile sweep —
         # cleared on any successful mark_done, used to gate L1 escalation.
         self._reconcile_failure_counts: dict[str, int] = {}
-        # Per-task consecutive-citation-miss counter for the reconcile sweep —
-        # incremented when the is_ancestor fast-path is short-circuited by a
-        # missing task-id citation on main; reset on any successful flip or
-        # genuine skip (e.g. open L1).  Used to escalate to L1 when the
-        # reconciler refuses to auto-flip a task indefinitely.
-        self._reconcile_skip_counts: dict[str, int] = {}
         # Wall-clock of the most recent _workflow_cancel_events.set() call,
         # keyed by task_id.  R3-race-guard window — the sweep skips a task
         # whose workflow was cancelled within the last grace period, since
@@ -3480,266 +3474,64 @@ Output JSON matching the schema. Every task must appear in the output.
 
         branch = f'{self.git_ops.config.branch_prefix}{tid}'
 
-        # Fetch task metadata once for both fast-paths (is_ancestor + find_merge_marker).
+        # Fetch task metadata once for the downstream blocked/revert paths
+        # below (unrelated to the mark-done decision, which now derives its
+        # own task row internally via TaskGroundTruth.derive_truth — a second,
+        # accepted fetch until a later step folds this one away too).
         # Scheduler.get_task normalises metadata at the boundary
         # (scheduler.py:_normalize_task_metadata), so task['metadata'] is always a
         # dict whenever task is not None.  `or {}` collapses any residual None value
         # (e.g. a manually-constructed task dict that bypasses normalisation); the
         # load-bearing guard against task itself being absent is `if task else {}`.
-        # The unconditional fetch is the deliberate trade-off: one MCP call per
-        # stranded task even when neither fast-path fires (e.g. lock-state revert),
-        # in exchange for a single source of truth for `metadata` shared by both
-        # fast-paths (eliminating the duplicated per-branch get_task pattern).
         task = await self.scheduler.get_task(tid)
         metadata = (task.get('metadata') or {}) if task else {}
 
-        # Already-on-main fast-path (is_ancestor == True).
-        # NB: is_ancestor is degenerate for zero-commit branches whose tip
-        # equals the main HEAD at branch-create time.  Two guards reject
-        # the false-positive shape before we flip the row to done.
-        if await self.git_ops.is_ancestor(branch, self.git_ops.config.main_branch):
-            # Guard 1 — open L1 escalation for this task.  An L1 escalation
-            # is the deliberate human-handoff signal (e.g. workflow ran
-            # _mark_blocked(escalate_to_human=True) when the task was
-            # declared unactionable); the reconciler must not second-guess
-            # the disposition, even if the branch tip happens to sit on a
-            # main ancestor.  Skip counter is intentionally NOT incremented
-            # here — the L1 escalation that triggered the skip already
-            # exists, so double-escalating would spam.
-            if (
-                self._escalation_queue is not None
-                and self._escalation_queue.has_open_l1(tid)
-            ):
-                logger.info(
-                    'Reconcile: task %s on main but has open L1 escalation; '
-                    'leaving status=%s (open L1 vetoes auto-flip)',
-                    tid, status,
+        # Ground-truth mark-done decision (task 2243, W10-θ2): recovery_for
+        # composes derive_truth (journal-first branch-state resolution, TG-1)
+        # with the _RECOVERY classification table (TG-2), retiring the inline
+        # is_ancestor/find_task_citation_commit/find_merge_marker archaeology
+        # (including the citation-guard and stale-marker/prior-incarnation
+        # checks) that used to live here.
+        report, action = await self._get_ground_truth().recovery_for(tid)
+
+        # θ1's _RECOVERY table only maps ON_MAIN/GONE_WITH_MERGE_MARKER to
+        # MARK_DONE for TaskStatus.IN_PROGRESS — it carries no row for a
+        # stranded 'blocked' task on the same evidence.  The pre-migration
+        # sweep marks 'blocked' done here too (R4 — see the
+        # _RECONCILE_SWEEP_STATUSES comment above: "out-of-band-merged
+        # blocked tasks... get marked done"): a human `git merge`-ing a
+        # blocked task's branch out-of-band must still self-heal to done.
+        # This is a thin sweep-side upgrade — mirroring the
+        # already-established degenerate-branch refinement pattern
+        # (_branch_is_degenerate below) — rather than a change to θ1's
+        # reviewed table (design decision, task 2243; esc-2243-4).
+        if (
+            action == RecoveryAction.LEAVE
+            and status == 'blocked'
+            and report.live_claimant is None
+            and not report.open_escalations
+            and report.branch_state.kind in (
+                BranchStateKind.ON_MAIN, BranchStateKind.GONE_WITH_MERGE_MARKER,
+            )
+        ):
+            action = RecoveryAction.MARK_DONE_WITH_PROVENANCE
+
+        if action == RecoveryAction.MARK_DONE_WITH_PROVENANCE:
+            on_main = report.branch_state.kind == BranchStateKind.ON_MAIN
+            if status == 'blocked':
+                note = (
+                    'reconcile: branch on main while task was blocked (out-of-band merge)'
+                    if on_main
+                    else 'reconcile: merge marker found on main while task was blocked'
                 )
-                return None
-
-            # Guard 2 — positive citation evidence on main.  We require a
-            # commit on main whose subject cites the task id; this rejects
-            # the zero-commit-branch shape where is_ancestor returns True
-            # trivially but no commit actually lands the task's work.
-            # Resolve BEFORE cleanup_worktree (which runs `git branch -D`
-            # and would invalidate a post-cleanup grep against the branch).
-            citation_sha = await self.git_ops.find_task_citation_commit(
-                tid,
-                pattern_template=self.git_ops.config.commit_citation_pattern,
-            )
-            if citation_sha is None:
-                # -------------------------------------------------------
-                # #1823 degenerate-provisioning-branch guard.
-                #
-                # Guard 3 (below) recognises the degenerate shape on the
-                # citation-HIT path but is unreachable here — this Guard-2
-                # block bails before Guard 3 ever runs.  Each bail
-                # increments the skip counter, so after MAX_RECONCILE_FAILURES
-                # sweeps the reconciler incorrectly escalates
-                # reconcile_citation_missing for a branch that is simply
-                # provisioning-only (no work ever pushed).
-                # Repro: esc-4598-6 cluster (tasks in-progress, tip ==
-                # branch_base_sha, zero commits).
-                # _branch_is_degenerate implements the precise degeneracy
-                # test (tip == branch_base_sha, NOT rev-list==0 — see its
-                # docstring) and is shared with Guard 3 below.
-                if await self._branch_is_degenerate(branch, metadata):
-                    # A degenerate branch (tip == branch_base_sha) carries ZERO
-                    # task work, so is_ancestor==True is a false "already on
-                    # main" signal — nothing landed.  #1823 added this guard to
-                    # suppress a spurious reconcile_citation_missing escalation
-                    # for provisioning-only branches, but `return None` here
-                    # ALSO stranded any in-progress task whose agent died after
-                    # provisioning but before its first commit (the task-2992
-                    # incident: agent killed mid-execute by a restart, no
-                    # commit, branch base still on main → trapped here forever,
-                    # neither reverted nor escalated).  Recover it: an
-                    # in-progress incarnation with no live claimant is reverted
-                    # to pending so the scheduler re-dispatches it.  'blocked'
-                    # keeps the leave-alone behaviour (blocked discipline: never
-                    # blocked→pending; only →done on positive evidence, which a
-                    # degenerate branch is not).
-                    self._reconcile_skip_counts.pop(tid, None)
-                    if status == 'in-progress':
-                        logger.info(
-                            'Reconcile: task %s branch is degenerate (zero '
-                            'commits beyond main; tip == branch_base_sha %s); '
-                            'reverting stranded in-progress to pending '
-                            '(provisioning-only branch, no work landed)',
-                            tid, metadata.get('branch_base_sha'),
-                        )
-                        return await self._revert_in_progress_if_no_live_claimant(
-                            tid, mid_run=mid_run, metadata=metadata, status=status,
-                        )
-                    logger.info(
-                        'Reconcile: task %s branch is degenerate '
-                        '(zero commits beyond main; tip == branch_base_sha %s); '
-                        'skipping citation-missing escalation '
-                        '(provisioning-only branch, status=%s)',
-                        tid, metadata.get('branch_base_sha'), status,
-                    )
-                    return None
-                # -------------------------------------------------------
-
-                # Task 2112 / angle B — metadata-independent degenerate-ref
-                # classifier fallback. _branch_is_degenerate (above) only
-                # fires when metadata['branch_base_sha'] is present and a
-                # valid 40-hex SHA; a task fault-killed before its metadata
-                # write leaves branch_base_sha absent/malformed, so the
-                # metadata check returns False even though the ref is
-                # actually degenerate (parked on a foreign merge commit,
-                # zero unique commits over main). Repro: esc-4388-46 /
-                # esc-4875-7. warm_lane_ref_is_degenerate wraps reify's
-                # metadata-independent classifier (count==0 over main AND
-                # tip does not cite this task) that catches that gap. It is
-                # fail-soft (False on any doubt — absent script, live/
-                # advanced/landed/absent classification, or exception), so
-                # this fallback can only ever suppress a spurious escalation
-                # when the primitive is CERTAIN the ref is degenerate; any
-                # uncertainty falls through to the existing skip-count path
-                # below, unchanged.
-                # Cost note: this spawns one subprocess per sweep for every
-                # task that reaches here. The metadata fast-path above
-                # (_branch_is_degenerate) already resolves the common case
-                # without a subprocess, so this branch is only exercised for
-                # the exceptional absent/malformed-branch_base_sha case and
-                # is expected to be low-volume; no within-sweep memoization
-                # is applied.
-                if await self.git_ops.warm_lane_ref_is_degenerate(tid):
-                    self._reconcile_skip_counts.pop(tid, None)
-                    if status == 'in-progress':
-                        logger.info(
-                            'Reconcile: task %s branch is degenerate per '
-                            'warm-lane-degenerate-ref-check.sh (metadata '
-                            'branch_base_sha absent/malformed); reverting '
-                            'stranded in-progress to pending (provisioning-only '
-                            'branch, no work landed)',
-                            tid,
-                        )
-                        return await self._revert_in_progress_if_no_live_claimant(
-                            tid, mid_run=mid_run, metadata=metadata, status=status,
-                        )
-                    logger.info(
-                        'Reconcile: task %s branch is degenerate per '
-                        'warm-lane-degenerate-ref-check.sh (metadata '
-                        'branch_base_sha absent/malformed); skipping '
-                        'citation-missing escalation (status=%s)',
-                        tid, status,
-                    )
-                    return None
-
-                count = self._reconcile_skip_counts.get(tid, 0) + 1
-                self._reconcile_skip_counts[tid] = count
-                logger.info(
-                    'Reconcile: task %s branch on main but no commit '
-                    'cites task/%s; leaving status=%s '
-                    '(consecutive citation misses=%d/%d)',
-                    tid, tid, status, count, MAX_RECONCILE_FAILURES,
+            else:
+                note = (
+                    'reconcile: branch already on main when stranded in-progress'
+                    if on_main
+                    else 'reconcile: branch deleted but merge marker found on main'
                 )
-                if (
-                    count >= MAX_RECONCILE_FAILURES
-                    and self._escalation_queue is not None
-                ):
-                    self._escalate_reconcile_skip(tid, status, count)
-                return None
-
-            # Guard 3 — branch-advanced structural check (#1226).
-            # Guards 1 (open L1) and 2 (citation grep) are content
-            # heuristics.  This guard is structural: it rejects the
-            # false-positive shape where a zero-commit branch sits on a
-            # main ancestor (is_ancestor returns True trivially) even
-            # though no real implementation work was pushed.
-            # _branch_is_degenerate encapsulates the tip==branch_base_sha
-            # check (missing / malformed base SHA → returns False →
-            # fall through to flip, preserving backward compat).
-            if await self._branch_is_degenerate(branch, metadata):
-                # Citation found but the branch is degenerate (tip ==
-                # branch_base_sha): the on-main citation belongs to a PRIOR
-                # incarnation under this task id — the current incarnation
-                # produced no commits.  Same recovery as the Guard-2 degenerate
-                # path: revert a live-claimant-less in-progress incarnation to
-                # pending; leave 'blocked' intact (blocked discipline).
-                if status == 'in-progress':
-                    self._reconcile_skip_counts.pop(tid, None)
-                    logger.info(
-                        'Reconcile: task %s branch tip == branch_base_sha (%s); '
-                        'branch never advanced past creation — reverting '
-                        'stranded in-progress to pending (on-main citation '
-                        'belongs to a prior incarnation)',
-                        tid, metadata.get('branch_base_sha'),
-                    )
-                    return await self._revert_in_progress_if_no_live_claimant(
-                        tid, mid_run=mid_run, metadata=metadata, status=status,
-                    )
-                logger.info(
-                    'Reconcile: task %s branch tip == branch_base_sha (%s); '
-                    'branch never advanced past creation — vetoing auto-flip '
-                    '(status=%s)',
-                    tid, metadata.get('branch_base_sha'), status,
-                )
-                return None
-
-            # All guards passed — clear the skip counter and flip.
-            self._reconcile_skip_counts.pop(tid, None)
-            note = (
-                f'reconcile: branch on main while task was {status} '
-                f'(out-of-band merge)'
-                if status == 'blocked'
-                else 'reconcile: branch already on main when stranded in-progress'
-            )
-            await self._mark_in_progress_done(
-                tid, citation_sha, note, 'branch-already-on-main',
-            )
-            return 'marked_done'
-
-        # Branch-deleted fast-path (find_merge_marker).
-        # is_ancestor returned False, but the branch may simply not exist
-        # any more (cleanup_worktree ran after advance_main but before
-        # set_task_status).
-        # Note: find_merge_marker already gates on branch-existence
-        # (git_ops.py:774) — it returns None when the branch ref is still
-        # live.  The stale-marker check below therefore only fires when the
-        # branch is gone and a commit on main mentions the task id in its
-        # merge message.
-        marker_sha = await self.git_ops.find_merge_marker(branch)
-        if marker_sha:
-            # Stale-marker check — re-opened-branch / prior-incarnation guard.
-            # A task can be re-queued (branch deleted + re-created) after a
-            # prior incarnation was merged.  In that case, the prior merge's
-            # commit lands on main with the same task id, and find_merge_marker
-            # would return its SHA — triggering a spurious done flip for the
-            # current incarnation.
-            #
-            # Reject the marker if it is an ancestor of branch_base_sha (i.e.
-            # it pre-dates the current incarnation's creation point).
-            # `find_merge_marker`'s branch-existence gate handles the orthogonal
-            # case where the branch ref still exists (returns None there);
-            # this check handles the case where the branch is gone but the
-            # stale marker from a *prior* incarnation under the same task id
-            # is already on main.
-            #
-            # Missing/malformed branch_base_sha → fall through (backward compat
-            # for tasks created before this guard was deployed).
-            branch_base_sha = metadata.get('branch_base_sha')
-            if _is_valid_sha_40(branch_base_sha) and await self.git_ops.is_ancestor(
-                marker_sha, branch_base_sha
-            ):
-                logger.info(
-                    'Reconcile: task %s stale marker %s is ancestor of '
-                    'branch_base_sha %s — belongs to a prior incarnation; '
-                    'vetoing auto-flip',
-                    tid, marker_sha, branch_base_sha,
-                )
-                return None
-
-            note = (
-                f'reconcile: merge marker found on main while task was {status}'
-                if status == 'blocked'
-                else 'reconcile: branch deleted but merge marker found on main'
-            )
-            await self._mark_in_progress_done(
-                tid, marker_sha, note, 'branch-deleted-marker-found',
-            )
+            reason = 'branch-already-on-main' if on_main else 'branch-deleted-marker-found'
+            await self._mark_in_progress_done(tid, report.branch_state.sha, note, reason)
             return 'marked_done'
 
         # No on-main evidence.  For 'blocked' tasks, leave the row alone —
@@ -5477,58 +5269,6 @@ Output JSON matching the schema. Every task must appear in the output.
                 ),
             )
         self._escalation_queue.submit(esc)
-
-    def _escalate_reconcile_skip(
-        self,
-        tid: str,
-        status: str,
-        count: int,
-    ) -> None:
-        """Submit an L1 escalation for persistent citation-miss skips.
-
-        Mirror of ``_escalate_reconcile_failure`` for the case where
-        ``find_task_citation_commit`` keeps returning None despite a stable
-        ``is_ancestor==True`` observation — i.e. the branch sits on main
-        but nothing on main cites the task, so the reconciler refuses to
-        auto-flip the row.  After ``MAX_RECONCILE_FAILURES`` consecutive
-        skips, escalate so a human can resolve manually.
-        """
-        if not self._escalation_queue:
-            return
-        from escalation.models import Escalation
-
-        esc = Escalation(
-            id=self._escalation_queue.make_id(tid),
-            task_id=tid,
-            agent_role='harness-reconcile',
-            severity='blocking',
-            category='reconcile_citation_missing',
-            summary=(
-                f'Reconciler refuses to auto-flip task {tid}: branch on '
-                f'main but no commit cites the task ({count}x consecutive)'
-            )[:200],
-            detail=(
-                f'reconciler refuses to auto-flip task {tid}: branch on '
-                f'main but no commit cites the task. Status: {status}. '
-                f'Resolve manually.\n\n'
-                f'Consecutive citation misses: {count} / '
-                f'{MAX_RECONCILE_FAILURES}.\n\n'
-                f'The is_ancestor check returns True for task/{tid}, but '
-                f'no commit on main matches the configured citation '
-                f'pattern (GitConfig.commit_citation_pattern, or the '
-                f'built-in default if unset).  Either the merge happened '
-                f'with a non-conventional commit subject, or the branch '
-                f'tip is degenerate (zero-commit branch sitting on a main '
-                f'ancestor).  Inspect the branch and main history; mark '
-                f'the task done manually if the work landed under a '
-                f'non-matching subject, or leave it in its current status '
-                f'and resolve this escalation to silence the sweep.'
-            ),
-            suggested_action='investigate_citation_missing',
-            level=1,
-        )
-        self._escalation_queue.submit(esc)
-        self._reconcile_skip_counts.pop(tid, None)
 
     async def _run_slot(
         self, assignment, sem: asyncio.Semaphore
