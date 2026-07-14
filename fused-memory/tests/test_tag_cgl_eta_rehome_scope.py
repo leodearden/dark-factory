@@ -6,10 +6,14 @@ test_prune_recon_cycle_summaries.py.
 """
 from __future__ import annotations
 
+import argparse
 import importlib.util
 import sys
 import types
 from pathlib import Path
+from unittest.mock import AsyncMock, MagicMock
+
+import pytest
 
 SCRIPT_PATH = Path(__file__).parent.parent / 'scripts' / 'tag_cgl_eta_rehome_scope.py'
 
@@ -199,3 +203,76 @@ class TestBuildTagReport:
         assert report['projects'] == {}
         assert report['changes'] == []
         assert report['totals']['scanned'] == 0
+
+
+# ===========================================================================
+# Tests: run (async, end-to-end live shell)
+# ===========================================================================
+
+class TestRun:
+    """Async end-to-end tests for run(args, *, memory, known_projects_map).
+
+    Mirrors test_prune_recon_cycle_summaries.TestRun's mock-memory harness.
+    """
+
+    def _fixture_records(self) -> list[dict]:
+        """One taggable + one already-tagged + one no-src_project record."""
+        return [
+            _rehome_record('m-taggable'),
+            _rehome_record(
+                'm-already-tagged',
+                data='[reify:task 948] Stage 2 should re-escalate task 948.',
+            ),
+            _rehome_record('m-no-src-project', src_project=None),
+        ]
+
+    def _make_memory(self, records: list[dict] | None = None) -> MagicMock:
+        """Mock memory whose mem0 backend exposes the scroll+count+update contract.
+
+        ``scroll_by_metadata`` is assumed to already return only the
+        server-side-filtered {'kind': CGL_ETA_REHOME_KIND} records (mirrors
+        the real Qdrant payload-filtered scroll).
+        """
+        memory = MagicMock()
+        mem0 = MagicMock()
+        all_records = records if records is not None else []
+        mem0.scroll_by_metadata = AsyncMock(return_value=all_records)
+        mem0.count_by_metadata = AsyncMock(return_value=len(all_records))
+        mem0.update = AsyncMock(return_value={'message': 'Memory updated successfully!'})
+        memory.mem0 = mem0
+        return memory
+
+    def _args(self, apply=False, project_id=None, scan_limit=10000) -> argparse.Namespace:
+        return argparse.Namespace(
+            apply=apply,
+            project_id=project_id,
+            scan_limit=scan_limit,
+        )
+
+    def _known_map(self, pid='dark_factory') -> dict:
+        return {pid: '/some/path'}
+
+    @pytest.mark.asyncio
+    async def test_dry_run_no_updates_and_report_shape(self):
+        """Dry-run performs NO update calls; scroll_by_metadata is called
+        with the CGL-eta rehome filter; report classifies the fixture
+        correctly: 1 taggable, 2 skipped (already-tagged + no-src_project)."""
+        memory = self._make_memory(self._fixture_records())
+        args = self._args(apply=False, project_id='dark_factory', scan_limit=10000)
+
+        report = await _mod.run(args, memory=memory, known_projects_map=self._known_map())
+
+        memory.mem0.update.assert_not_awaited()
+        assert report['dry_run'] is True
+
+        memory.mem0.scroll_by_metadata.assert_awaited_once()
+        call = memory.mem0.scroll_by_metadata.call_args
+        assert call.args[0].project_id == 'dark_factory'
+        assert call.args[1] == {'kind': _mod.CGL_ETA_REHOME_KIND}
+        assert call.kwargs.get('limit') == 10000
+
+        dark_factory = report['projects']['dark_factory']
+        assert dark_factory['scanned'] == 3
+        assert dark_factory['taggable'] == 1
+        assert dark_factory['tagged'] == 0
+        assert dark_factory['skipped'] == 2
