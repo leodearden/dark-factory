@@ -39,15 +39,20 @@ and apply to this module automatically — nothing to import or opt into here.
 
 from __future__ import annotations
 
-from unittest.mock import AsyncMock
+from pathlib import Path
+from unittest.mock import AsyncMock, patch
 
-from test_verify import _canned_passing_result
+import pytest
+from test_verify import _canned_passing_result, _real_worktree_reader
 from test_verify_plan import (  # noqa: F401 — reused by this module's byte-identical goldens (steps 3/7/9)
     DATA_MODULE_DIFF,
     ROOT_CONFTEST_DIFF,
 )
 
-from orchestrator.config import ModuleConfig
+from orchestrator import verify, verify_plan
+from orchestrator.config import ModuleConfig, OrchestratorConfig
+from orchestrator.verify import run_scoped_verification
+from orchestrator.verify_cmd import ToolKind, render
 
 # ---------------------------------------------------------------------------
 # GOLDEN diff shapes (task κ corpus) — see module docstring for provenance.
@@ -141,3 +146,87 @@ def _run_cmd_spy() -> tuple[list[str], object]:
         return 0, '', False
 
     return calls, fake_run_cmd
+
+
+# ---------------------------------------------------------------------------
+# step-1 / step-2: A1 plan-authority spy (module-config path)
+# ---------------------------------------------------------------------------
+
+
+class TestModuleConfigPlanAuthority:
+    """A1: the module-config branch is DRIVEN BY the plan, not scope_module_config.
+
+    RED today: run_scoped_verification's module-config branch derives
+    derive_verify_plan(...) only for the diagnostic VerifyResult.plan record
+    (_safe_derive_verify_plan_dict) — the ModuleConfig(s) actually handed to
+    run_verification are still built by the hand-mirrored scope_module_config
+    decision tree. GREEN once step-2 rewires execution through a
+    plan→ModuleConfig bridge instead, so scope_module_config is no longer
+    consulted at all.
+    """
+
+    @pytest.mark.asyncio
+    async def test_executed_commands_are_driven_by_the_plan(self, tmp_path: Path):
+        """A touched test file + a plain source file under one registered module."""
+        (tmp_path / 'mymod' / 'tests').mkdir(parents=True)
+        (tmp_path / 'mymod' / 'tests' / 'test_thing.py').write_text('def test_thing(): pass\n')
+        (tmp_path / 'mymod' / 'helpers.py').write_text('def helper():\n    return 1\n')
+
+        config = OrchestratorConfig(project_root=tmp_path)
+        module_configs = [
+            ModuleConfig(
+                prefix='mymod',
+                test_command='uv run --directory mymod pytest tests/',
+                lint_command='uv run --directory mymod ruff check .',
+                type_check_command='uv run --directory mymod pyright',
+            ),
+        ]
+        task_files = ['mymod/tests/test_thing.py', 'mymod/helpers.py']
+        existing_files = [f for f in task_files if (tmp_path / f).exists()]
+
+        mock_run_verification = _run_verification_spy()
+        with (
+            patch.object(verify, 'run_verification', new=mock_run_verification),
+            patch.object(
+                verify, 'scope_module_config', wraps=verify.scope_module_config,
+            ) as spy_scope_module_config,
+        ):
+            result = await run_scoped_verification(
+                tmp_path, config, module_configs, task_files=task_files,
+            )
+
+        # The plan-authoritative execution never consults the hand-mirrored
+        # scope_module_config decision tree — that IS the inversion (task κ).
+        # Fails today: scope_module_config is still what builds the executed
+        # ModuleConfig.
+        spy_scope_module_config.assert_not_called()
+
+        expected_plan = verify_plan.derive_verify_plan(
+            existing_files, module_configs, config, _real_worktree_reader(tmp_path),
+        )
+
+        executed = _executed_module_configs(mock_run_verification)
+        # No module executed that the plan didn't include.
+        assert {mc.prefix for mc in executed} == {
+            run.module_prefix for run in expected_plan.runs
+        }
+        assert len(executed) == 1
+        executed_mc = executed[0]
+
+        by_tool = {run.cmd.tool: run for run in expected_plan.runs if run.cmd is not None}
+
+        pytest_run = by_tool[ToolKind.PYTEST]
+        assert pytest_run.scope_kind is verify_plan.ScopeKind.FILE_SCOPED
+        assert executed_mc.test_command == render(pytest_run.cmd)
+
+        ruff_run = by_tool[ToolKind.RUFF]
+        assert ruff_run.scope_kind is verify_plan.ScopeKind.FILE_SCOPED
+        assert executed_mc.lint_command == render(ruff_run.cmd)
+
+        pyright_run = by_tool[ToolKind.PYRIGHT]
+        assert pyright_run.scope_kind is verify_plan.ScopeKind.FILE_SCOPED
+        assert executed_mc.type_check_command == render(pyright_run.cmd)
+
+        # VerifyResult.plan is the plan that DROVE execution above, not an
+        # independently re-derived diagnostic mirror.
+        assert result.plan == expected_plan.to_dict()
