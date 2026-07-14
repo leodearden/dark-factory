@@ -34,10 +34,12 @@ from orchestrator.session_registry import (
     DecisionRecord,
     DecisionState,
     SessionRecord,
-    fleet_root as resolve_fleet_root,
     list_decisions,
     set_manual_boost,
     update_decision_state,
+)
+from orchestrator.session_registry import (
+    fleet_root as resolve_fleet_root,
 )
 from textual import work
 from textual.app import App, ComposeResult
