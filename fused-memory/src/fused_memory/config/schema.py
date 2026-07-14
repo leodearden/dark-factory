@@ -671,6 +671,28 @@ class ReconciliationConfig(BaseModel):
         description='TTL after complete() before reaper sweeps the entry (PRD §9.4)',
     )
 
+    # Write-time near-duplicate guard for procedural_knowledge add_memory writes (task 2467).
+    # Moves dedup from reactive Stage-1 consolidation to write time: a high-similarity match
+    # against an existing procedural_knowledge Mem0 entry soft-blocks the write instead of
+    # letting the duplicate land and consuming another cleanup cycle.
+    procedural_knowledge_near_dup_guard_enabled: bool = Field(
+        default=True,
+        description=(
+            'Enable the add_memory write-time near-duplicate guard for '
+            'category=procedural_knowledge. Hot-reloadable green-tier knob.'
+        ),
+    )
+    procedural_knowledge_near_dup_threshold: float = Field(
+        default=0.92,
+        ge=0.0,
+        le=1.0,
+        description=(
+            'Minimum relevance_score (cosine similarity) against an existing '
+            'procedural_knowledge Mem0 entry that soft-blocks an add_memory write. '
+            'Default 0.92 mirrors Mem0\'s own cited ~0.92 cosine dedup threshold.'
+        ),
+    )
+
 
 class TicketJanitorConfig(BaseModel):
     """Background sweep that surfaces failed tickets to the orchestrator.
