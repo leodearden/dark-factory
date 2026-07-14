@@ -21,6 +21,7 @@ are written fire-and-forget and can have a truncated/corrupt trailing line.
 from __future__ import annotations
 
 import json
+from pathlib import Path
 from typing import Any
 
 
@@ -589,3 +590,214 @@ def render_frontmatter(meta: dict[str, Any]) -> str:
         lines.append(f'  {key}: {counts[key]}')
     lines.append('---')
     return '\n'.join(lines) + '\n'
+
+
+def _first_present(records: list[dict[str, Any]], key: str) -> Any:
+    """Return the first truthy top-level *key* value across *records*.
+
+    Real transcripts carry ``cwd``/``sessionId``/``timestamp`` on every
+    non-queue-operation record (confirmed against a live
+    ``~/.claude/projects/<enc>/*.jsonl`` file); scanning for the first
+    record that has the field makes this robust to a leading
+    queue-operation/last-prompt record that lacks it.
+    """
+    for record in records:
+        value = record.get(key)
+        if value:
+            return value
+    return None
+
+
+def _derive_session(records: list[dict[str, Any]]) -> str:
+    return _first_present(records, 'sessionId') or 'unknown'
+
+
+def _derive_cwd(records: list[dict[str, Any]]) -> str:
+    return _first_present(records, 'cwd') or 'unknown'
+
+
+def _derive_date(records: list[dict[str, Any]]) -> str:
+    """Return just the ISO date component of the first record timestamp."""
+    timestamp = _first_present(records, 'timestamp')
+    if not isinstance(timestamp, str) or not timestamp:
+        return 'unknown'
+    return timestamp.split('T', 1)[0]
+
+
+def _encode_cwd(cwd: str) -> str:
+    """Mirror Claude Code's own ``~/.claude/projects/<enc>`` encoding.
+
+    Both '/' and '.' map to '-' (same rule as
+    orchestrator/src/orchestrator/session_registry.py:transcript_path_for_cwd,
+    reused here as the fallback when the real transcript path isn't
+    available to read the ground-truth encoded dir name off disk).
+    """
+    return cwd.replace('/', '-').replace('.', '-')
+
+
+def _derive_encoded_dir(records: list[dict[str, Any]], cwd: str, path: Any) -> str:
+    """Prefer the real transcript file's parent dir name (ground truth);
+    fall back to mirror-encoding the derived *cwd* when no *path* is given
+    or *cwd* itself could not be derived."""
+    if path is not None:
+        parent_name = Path(path).parent.name
+        if parent_name:
+            return parent_name
+    if cwd == 'unknown':
+        return 'unknown'
+    return _encode_cwd(cwd)
+
+
+SECTION_HEADINGS: dict[str, str] = {
+    'user_corrections': 'User Corrections',
+    'error_neighborhoods': 'Error Neighborhoods',
+    'self_corrections': 'Self-Corrections',
+    'retry_loops': 'Retry Loops',
+    'not_found': 'Not Found',
+    'df_guard': 'Guard Trips',
+    'interrupt': 'Interrupts',
+}
+"""Markdown '## ' heading text per digest section. The first four are the
+PRD Sec 7.2 primary sections (verbatim prose order: user turns, error
+neighborhoods, self-corrections, retry loops); the last three are the
+secondary scalar signals, included only when present (PRD decomposition
+Sec 11 alpha observable: "frontmatter + the four signal-class sections")."""
+
+SECTION_PRIORITY: tuple[str, ...] = (
+    'retry_loops', 'not_found', 'error_neighborhoods', 'df_guard', 'interrupt',
+    'self_corrections', 'user_corrections',
+)
+"""Section keys in ASCENDING signal priority -- index 0 is dropped/trimmed
+FIRST under the 15KB soft cap, the last entry ('user_corrections', gold)
+is trimmed LAST (PRD Sec 7.2: "truncate lowest-signal sections last"; PRD
+Sec 5: user corrections are gold). Digest bodies render in the REVERSE of
+this order (gold first). Ranking mirrors SIGNAL_WEIGHTS magnitude
+(self_correct 3.0 > df_guard/interrupt 2.0 > tool_error/not_found 1.0),
+with retry_loops lowest since it carries no SIGNAL_WEIGHTS entry at all
+(it is a structural section, not one of the 5 scored signal classes)."""
+
+
+def _render_user_corrections(items: list[dict[str, Any]]) -> list[str]:
+    return [f"- (turn {item['index']}) {item['text']}" for item in items]
+
+
+def _render_error_neighborhoods(items: list[dict[str, Any]]) -> list[str]:
+    lines = []
+    for item in items:
+        tool = item['attempt_tool'] or 'unknown'
+        summary = item['attempt_input_summary'] or ''
+        lines.append(
+            f"- (turn {item['index']}) {tool}({summary}) -> {item['error_content']}"
+        )
+    return lines
+
+
+def _render_self_corrections(items: list[dict[str, Any]]) -> list[str]:
+    return [
+        f"- (turn {item['index']}) [{item['pattern']}] {item['context']}"
+        for item in items
+    ]
+
+
+def _render_retry_loops(items: list[dict[str, Any]]) -> list[str]:
+    return [
+        f"- {item['tool']} x{item['count']}: {item['signature']}" for item in items
+    ]
+
+
+def _render_scalar_signal(items: list[dict[str, Any]]) -> list[str]:
+    return [f"- (turn {item['index']}) {item['pattern']}" for item in items]
+
+
+_SECTION_RENDERERS: dict[str, Any] = {
+    'user_corrections': (iter_user_turns, _render_user_corrections),
+    'error_neighborhoods': (iter_error_neighborhoods, _render_error_neighborhoods),
+    'self_corrections': (iter_self_corrections, _render_self_corrections),
+    'retry_loops': (find_retry_loops, _render_retry_loops),
+    'not_found': (iter_not_found, _render_scalar_signal),
+    'df_guard': (iter_df_guards, _render_scalar_signal),
+    'interrupt': (iter_interrupts, _render_scalar_signal),
+}
+"""(detector, item-renderer) pair per section key, keyed identically to
+SECTION_HEADINGS/SECTION_PRIORITY."""
+
+
+def _build_sections(records: list[dict[str, Any]]) -> dict[str, list[str]]:
+    """Run every detector once and render its hits to markdown bullet
+    lines, keyed by section key. A section with zero hits maps to an empty
+    list -- render_digest skips emitting a heading for it."""
+    sections = {}
+    for key, (detector, renderer) in _SECTION_RENDERERS.items():
+        sections[key] = renderer(detector(records))
+    return sections
+
+
+def _render_body(sections: dict[str, list[str]]) -> str:
+    """Render non-empty sections, gold (user_corrections) first, retry_loops
+    last -- the REVERSE of the ascending-priority SECTION_PRIORITY order."""
+    blocks = []
+    for key in reversed(SECTION_PRIORITY):
+        lines = sections.get(key) or []
+        if not lines:
+            continue
+        blocks.append('## ' + SECTION_HEADINGS[key] + '\n' + '\n'.join(lines))
+    return '\n\n'.join(blocks)
+
+
+def _resolve_size_bytes(meta: dict[str, Any], body: str) -> str:
+    """Render *meta* (sans a final size_bytes) + *body*, resolving
+    ``size_bytes`` to the FINAL digest's own UTF-8 byte length via a short
+    fixed point.
+
+    size_bytes is self-referential -- embedding the correct value can
+    change the digest's own length -- so an initial guess (0) is rendered,
+    measured, and re-rendered. Only the field's digit-count can change
+    between passes (everything else is fixed), so this converges within a
+    couple of iterations for any realistic digest; the loop bound is a
+    defensive cap, not a claim that more iterations are ever needed.
+    """
+    meta = dict(meta)
+    meta['size_bytes'] = 0
+    digest = render_frontmatter(meta) + '\n' + body
+    for _ in range(4):
+        size = len(digest.encode('utf-8'))
+        if size == meta['size_bytes']:
+            return digest
+        meta['size_bytes'] = size
+        digest = render_frontmatter(meta) + '\n' + body
+    return digest
+
+
+def render_digest(
+    records: list[dict[str, Any]],
+    *,
+    agent_class: str,
+    path: Any = None,
+    max_bytes: int = 15360,
+) -> str:
+    """Render the full markdown digest: frontmatter + one section per
+    non-empty signal class (PRD Sec 7.2).
+
+    *agent_class* is the caller's already-resolved class (typically
+    :func:`classify_agent_class`'s result) -- render_digest never
+    classifies on its own. *path*, when given, sources ``encoded_dir``
+    from the transcript file's real parent dir name; otherwise it falls
+    back to mirror-encoding the derived ``cwd`` (see
+    :func:`_derive_encoded_dir`). *max_bytes* is accepted here for the
+    soft-cap priority truncation (applied on top of the fixed-point
+    render below).
+    """
+    cwd = _derive_cwd(records)
+    meta = {
+        'session': _derive_session(records),
+        'cwd': cwd,
+        'encoded_dir': _derive_encoded_dir(records, cwd, path),
+        'agent_class': agent_class,
+        'date': _derive_date(records),
+        'score': score_signals(signal_counts(records), len(iter_user_turns(records))),
+        'signal_counts': signal_counts(records),
+    }
+
+    sections = _build_sections(records)
+    body = _render_body(sections)
+    return _resolve_size_bytes(meta, body)
