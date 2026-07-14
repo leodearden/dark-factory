@@ -32,7 +32,12 @@ from typing import TYPE_CHECKING
 from fused_memory.backends.sqlite_task_backend import SqliteTaskBackend
 from fused_memory.config.schema import TaskmasterConfig
 from fused_memory.maintenance._utils import maintenance_service
-from fused_memory.middleware.task_curator import BackfillResult, TaskCurator, flatten_task_tree
+from fused_memory.middleware.task_curator import (
+    BackfillResult,
+    PruneResult,
+    TaskCurator,
+    flatten_task_tree,
+)
 from fused_memory.models.scope import resolve_project_id
 
 if TYPE_CHECKING:
@@ -51,6 +56,18 @@ class BackfillReport:
     upserted: int = 0
     skipped: int = 0
     errors: int = 0
+
+
+@dataclass
+class PruneReport:
+    """Aggregate report from a prune run."""
+
+    project_root: str
+    project_id: str
+    live_tasks: int = 0
+    pruned: int = 0
+    skipped: bool = False
+    reason: str = ''
 
 
 class BackfillManager:
@@ -100,6 +117,45 @@ class BackfillManager:
             report.upserted, report.skipped, report.errors,
         )
         return report
+
+    async def prune(self, project_root: str) -> PruneReport:
+        """Fetch the full task tree and prune corpus vectors orphaned by task removal.
+
+        Reads the KNOWN-COMPLETE live task snapshot via ``get_tasks`` and diffs
+        it against the corpus (curator corpus RC1 — task 2520, Layer C). This is
+        the explicit reconciliation-sweep backstop to Layer A's witness-eviction
+        in TaskInterceptor.remove_tasks — it also cleans any pre-existing strays.
+
+        Args:
+            project_root: Absolute path to the project root (used to derive project_id
+                          and to call get_tasks).
+
+        Returns:
+            PruneReport with live-task count and prune outcome.
+        """
+        project_id = resolve_project_id(project_root)
+
+        logger.info('backfill_curator_corpus: fetching task tree for prune sweep %s', project_root)
+        tasks_result = await self.taskmaster.get_tasks(project_root)
+        flat_tasks = flatten_task_tree(tasks_result)
+        live_ids = {
+            str(t.get('id')) for t in flat_tasks if t.get('id') is not None and str(t.get('id'))
+        }
+
+        result: PruneResult = await self.curator.prune_orphans(project_id, live_ids)
+
+        logger.info(
+            'backfill_curator_corpus: prune complete — pruned=%d live=%d skipped=%s',
+            result.pruned, len(live_ids), result.skipped,
+        )
+        return PruneReport(
+            project_root=project_root,
+            project_id=project_id,
+            live_tasks=len(live_ids),
+            pruned=result.pruned,
+            skipped=result.skipped,
+            reason=result.reason,
+        )
 
 
 async def run_backfill(
