@@ -131,3 +131,35 @@ if [ "$CHECK" -eq 1 ]; then
     echo "watcher-rearm.sh: would watch queue-dir=$QUEUE_DIR level=$LEVEL timeout=$TIMEOUT exclude-file=$EXCLUDE_FILE"
     exit 0
 fi
+
+# Interpreter prefix: WATCHER_REARM_PYTHON overrides the default `uv run`
+# invocation (tests inject sys.executable to drive the real module without
+# uv). Deliberately unquoted below so a multi-word override word-splits
+# into separate argv entries, same as the default.
+WATCHER_CMD=${WATCHER_REARM_PYTHON:-uv run --project "$DARK_FACTORY_ROOT/escalation" python}
+
+WATCHER_ARGS=(-m escalation.watcher --queue-dir "$QUEUE_DIR" --level "$LEVEL" --timeout "$TIMEOUT")
+[ -n "$NTFY_URL" ] && WATCHER_ARGS+=(--ntfy-url "$NTFY_URL")
+[ -n "$TASK_ID" ] && WATCHER_ARGS+=(--task-id "$TASK_ID")
+[ "$BASELINE" -eq 1 ] && WATCHER_ARGS+=(--baseline)
+
+# shellcheck disable=SC2086
+$WATCHER_CMD "${WATCHER_ARGS[@]}"
+rc=$?
+
+case "$rc" in
+    0)
+        echo "WATCHER_REARM_OUTCOME: FIRED exit=0" >&2
+        ;;
+    124)
+        echo "WATCHER_REARM_OUTCOME: CEILING exit=124" >&2
+        ;;
+    137|143|144)
+        echo "WATCHER_REARM_OUTCOME: KILLED exit=$rc" >&2
+        ;;
+    *)
+        echo "WATCHER_REARM_OUTCOME: ERROR exit=$rc" >&2
+        ;;
+esac
+
+exit "$rc"
