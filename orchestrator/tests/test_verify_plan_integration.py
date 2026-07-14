@@ -59,6 +59,7 @@ import asyncio
 import json
 import shlex
 import subprocess
+from enum import StrEnum
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -532,3 +533,39 @@ class TestClassifierToolIsolation:
             'error: could not compile `my-crate` (lib) due to previous error\n'
         )
         assert classify_failure(tool, 1, output, False) == FailureCategory.UNKNOWN_TEST_FAILURE
+
+
+# ── step-11/12: Scenario 7 — category exhaustiveness (F1); Boundary-test
+#               sketch row 7 ─────────────────────────────────────────────────
+
+
+class TestCategoryExhaustiveness:
+    """Scenario 7 — GOLDEN F1: CATEGORY_POLICY must carry exactly one row per
+
+    FailureCategory member, driven via the EXTRACTED _validate_exhaustive
+    guard (mirrors test_verify_categories.py's TestValidateExhaustive) rather
+    than an importlib.reload+monkeypatch harness — no such harness exists in
+    the repo, and the guard IS the real import-time assert's own logic
+    factored out into reusable, unit-testable form.
+
+    RED until step-12 imports _validate_exhaustive/CATEGORY_POLICY from
+    orchestrator.verify_categories (FailureCategory is already imported).
+    """
+
+    def _make_synth(self):
+        class _Synth(StrEnum):
+            A = 'a'
+            B = 'b'
+
+        any_row = next(iter(CATEGORY_POLICY.values()))
+        return _Synth, any_row
+
+    def test_missing_member_raises_and_names_it(self):
+        """A synthetic member with no policy row fires the F1 guard, naming it."""
+        _Synth, any_row = self._make_synth()
+        with pytest.raises(AssertionError, match='B'):
+            _validate_exhaustive(_Synth, {_Synth.A: any_row})
+
+    def test_real_shipped_table_satisfies_its_own_guard(self):
+        """Complement: the landed table already satisfies F1 at import time."""
+        _validate_exhaustive(FailureCategory, CATEGORY_POLICY)
