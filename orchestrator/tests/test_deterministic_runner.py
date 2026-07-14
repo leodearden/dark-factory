@@ -3423,6 +3423,103 @@ class TestBeforeDoneCrashWindow:
         assert blocked_calls, 'crash-window must leave the task blocked'
 
 
+@pytest.mark.asyncio
+class TestCrashWindowReverify:
+    """Task 2618: before re-firing 'Deploy state unknown after crash', re-run
+    the read-only verify inspect against a PERSISTED verify_baseline and reuse
+    the recon-sweep's own health classifier (_deterministic_deploy_health_verdict)
+    — a deploy that actually succeeded but crashed inside
+    _writeback_deploy_success before before_done_verified_at could be stamped
+    (task 2584's shape) must recover to done instead of re-escalating forever
+    on every orchestrator restart.
+    """
+
+    async def test_crash_window_reverify_persistent_baseline_drives_to_done(
+        self, tmp_path: Path,
+    ):
+        """A persistent-PID baseline + a fresher live inspect => healthy => done."""
+        from orchestrator.deterministic_runner import DeterministicRunner
+        from orchestrator.workflow import WorkflowOutcome
+
+        task = _deploy_task(
+            task_id='900',
+            before_done_ran_at='2026-06-23T10:00:00+00:00',
+            phase='ran',
+            verify_baseline={'main_pid': 100, 'active_enter_timestamp_monotonic': 1_000_000},
+        )
+        assignment = _make_assignment(task)
+        queue = EscalationQueue(tmp_path)  # empty — no prior escalation
+        scheduler = _mock_scheduler(task)
+
+        unit_inspector = AsyncMock(return_value=_FRESH_UNIT_STATE)
+        script_runner = AsyncMock(return_value=(0, 'ok'))
+
+        runner = DeterministicRunner(
+            scheduler=scheduler,
+            escalation_queue=queue,
+            unit_inspector=unit_inspector,
+            script_runner=script_runner,
+        )
+        outcome = await runner.run(assignment)
+
+        assert outcome == WorkflowOutcome.DONE
+        done_calls = [c for c in scheduler.set_task_status.call_args_list if c.args[1] == 'done']
+        assert len(done_calls) == 1, 'a healthy re-verify must drive to done exactly once'
+        provenance = done_calls[0].kwargs.get('done_provenance', {})
+        assert provenance.get('kind') == 'deterministic-deploy'
+        assert not queue.get_by_task('900', status='pending'), (
+            'a healthy re-verify must NOT file a crash-window infra_issue escalation'
+        )
+        script_runner.assert_not_awaited()
+
+    async def test_crash_window_reverify_empty_baseline_timer_drives_to_done(
+        self, tmp_path: Path,
+    ):
+        """Task 2584's exact shape: an empty (.timer) baseline + a settled,
+        advanced live inspect => healthy via _empty_baseline_fresh => done."""
+        from orchestrator.deterministic_runner import DeterministicRunner
+        from orchestrator.workflow import WorkflowOutcome
+
+        task = _deploy_task(
+            task_id='901',
+            before_done_ran_at='2026-06-23T10:00:00+00:00',
+            phase='ran',
+            verify_baseline={'main_pid': 0, 'active_enter_timestamp_monotonic': 1_000_000},
+        )
+        assignment = _make_assignment(task)
+        queue = EscalationQueue(tmp_path)
+        scheduler = _mock_scheduler(task)
+
+        fresh_timer_state = {
+            'MainPID': 0,
+            'ActiveState': 'active',
+            'ActiveEnterTimestamp': 'Mon 2026-06-23 10:01:00 UTC',
+            'ActiveEnterTimestampMonotonic': 2_000_000,
+        }
+        unit_inspector = AsyncMock(return_value=fresh_timer_state)
+        script_runner = AsyncMock(return_value=(0, 'ok'))
+
+        runner = DeterministicRunner(
+            scheduler=scheduler,
+            escalation_queue=queue,
+            unit_inspector=unit_inspector,
+            script_runner=script_runner,
+        )
+        outcome = await runner.run(assignment)
+
+        assert outcome == WorkflowOutcome.DONE
+        done_calls = [c for c in scheduler.set_task_status.call_args_list if c.args[1] == 'done']
+        assert len(done_calls) == 1, (
+            'a healthy empty-baseline re-verify must drive to done exactly once'
+        )
+        provenance = done_calls[0].kwargs.get('done_provenance', {})
+        assert provenance.get('kind') == 'deterministic-deploy'
+        assert not queue.get_by_task('901', status='pending'), (
+            'a healthy re-verify must NOT file a crash-window infra_issue escalation'
+        )
+        script_runner.assert_not_awaited()
+
+
 # ---------------------------------------------------------------------------
 # Task 2120: escalation-aliasing phantom-done guard.
 #
