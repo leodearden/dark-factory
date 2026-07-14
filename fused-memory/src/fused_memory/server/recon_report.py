@@ -1272,7 +1272,11 @@ class ReconReportState:
             and not finding.cited_tasks
             and finding_entry.stage != 'memory_consolidator'
         )
-        cited_task_key = _cited_task_key(project_id, task_id) if project_fold_eligible else None
+        # Always compute the concrete key (pure, side-effect-free) so its
+        # static type stays non-Optional for the dict lookup/assignment below
+        # — mirrors _purge_finding's primary_key/derived_sig convention.
+        # Its *use* is still gated on project_fold_eligible.
+        cited_task_key = _cited_task_key(project_id, task_id)
         project_existing_id = (
             self._run_cited_task_index.get(run_id, {}).get(cited_task_key)
             if project_fold_eligible
@@ -1288,19 +1292,27 @@ class ReconReportState:
                 or c_cited_task_id in _split_task_id_parts(finding.task_id)
             )
         )
-        derived_sig = (c_cited_task_id, finding.flag_type) if entity_fold_eligible else None
+        # Same rationale as cited_task_key above: compute unconditionally,
+        # gate the use on entity_fold_eligible.
+        derived_sig = (c_cited_task_id, finding.flag_type)
         entity_existing_id = (
             self._run_sig_index.get(run_id, {}).get(derived_sig)
             if entity_fold_eligible
             else None
         )
 
-        project_hit = project_existing_id is not None and project_existing_id != finding.finding_id
-        entity_hit = entity_existing_id is not None and entity_existing_id != finding.finding_id
-        if project_hit or entity_hit:
-            existing_id = project_existing_id if project_hit else entity_existing_id
+        # Sequential (not project_hit/entity_hit booleans + a re-derived
+        # existing_id) so pyright narrows each *_existing_id to `str` from
+        # its own `is not None` check at the call site — see cited_task_key
+        # comment above for why the naive boolean-flag version doesn't
+        # narrow. Semantics are unchanged: project fold takes priority when
+        # both would hit, purge runs exactly once, either way.
+        if project_existing_id is not None and project_existing_id != finding.finding_id:
             self._purge_finding(run_id, finding_entry, finding)
-            return _duplicate_finding_error(existing_id)
+            return _duplicate_finding_error(project_existing_id)
+        if entity_existing_id is not None and entity_existing_id != finding.finding_id:
+            self._purge_finding(run_id, finding_entry, finding)
+            return _duplicate_finding_error(entity_existing_id)
 
         if project_fold_eligible:
             self._run_cited_task_index.setdefault(run_id, {})[cited_task_key] = finding.finding_id
