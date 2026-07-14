@@ -49,6 +49,15 @@ Before filing, build the **capability manifest** (`gates.md` → *Capability Man
 
 Commit the manifest beside the PRD (the overlay names the path; generic default `<prd-path-without-ext>.capability-manifest.md`). This is the artifact a dispatch-time architect or downstream verifier diffs against substrate — the point is to pay the substrate check **once, here**, not once per task at dispatch. The empty-value sentinel, the production-entry-path grep targets, and the floor references are **[overlay]**-supplied; in generic mode, bind by hand against the codebase.
 
+**Also emit the machine-readable YAML sidecar twin**, alongside the `.md` manifest, at the **strictly derived** path `re.sub(r'\.md$', '', prd_path) + '.capability-manifest.yaml'` — never a hand-named or overlay-supplied path, unlike the `.md` twin (PRD §Resolved design decisions #2; the existing `.md` manifests drifted from their PRD's filename — e.g. `cross-project-task-deps.capability-manifest.md` vs `…-task-deps-prd.md` — so the sidecar convention is mechanical instead, letting a downstream stamper locate it from `metadata.prd_path` alone). Schema + validating loader: `shared/src/shared/capability_manifest.py` (`CapabilityManifestDoc`); full field reference at `plans/capability-delivered-checks-prd.md` §Contract. Imitate the committed exemplar, `plans/capability-delivered-checks-prd.capability-manifest.yaml`.
+
+For each capability, optionally bind a `delivered_check` — the dispatch-time-checkable twin of the authoring-time evidence binding above:
+- **Pattern-anchored, never `file:line`.** A check is either `kind: grep` (an ERE run via `git grep -E`, with `pattern` + `expect: present|absent` + optional `paths`) or `kind: script` (a short repo-relative committed script, must exist & be executable, exit 0 = delivered, bounded `timeout_secs`). Never bind a check to `file:line` — line anchors go stale the moment the file changes again.
+- **`expect: absent`** is how a rejection-style capability (G6 branch 4) is expressed mechanically — the check passes when the asserted diagnostic/pattern does **not** appear.
+- **`kind: manual`** for capabilities that aren't mechanically expressible — field-population judgments, rejection-mechanism nuances a fixture already covers qualitatively. Record it in the sidecar (with a `reason`), but it is **excluded from the dispatch gate**: only mechanical (`grep`/`script`) checks get copied into a producer task's `metadata.delivered_checks`.
+
+The sidecar's `task_id` fields stay `null` (Greek labels only) until it is stamped — see the post-`commit_planning` step after Step 5.
+
 ### Step 3 — File tasks (ALWAYS planning_mode=True; synchronous, curator-bypassing)
 
 PRD-decomposition batches are the canonical use case for `planning_mode=True`. **Every task in the batch is filed with `planning_mode=True`, no exceptions.** This lands them as `deferred` so the scheduler picks nothing up before the wiring is complete and the batch is flipped together in Step 5.
