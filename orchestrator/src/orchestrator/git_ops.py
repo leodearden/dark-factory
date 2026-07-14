@@ -818,14 +818,10 @@ async def _run(cmd: list[str], cwd: Path | None = None) -> tuple[int, str, str]:
         # exited. Best-effort kill + reap it so it doesn't leak as an orphan
         # process with dangling stdout/stderr pipes, then propagate the
         # original exception unchanged.
-        try:
-            proc.kill()
-        except ProcessLookupError:
-            pass  # already exited
-        try:
-            await proc.wait()
-        except BaseException:
-            pass  # reap is best-effort; never let it mask the original error
+        with contextlib.suppress(ProcessLookupError):
+            proc.kill()  # already exited
+        with contextlib.suppress(BaseException):
+            await proc.wait()  # reap is best-effort; never let it mask the original error
         raise
     return proc.returncode if proc.returncode is not None else 1, stdout.decode().strip(), stderr.decode().strip()
 
