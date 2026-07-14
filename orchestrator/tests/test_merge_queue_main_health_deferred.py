@@ -87,6 +87,20 @@ SKIP_CATEGORY_RESULT = VerifyResult(
     timed_out=False,
 )
 
+# A category NOT in AUTO_HEAL_MECHANICAL_CATEGORIES (is_auto_heal_eligible
+# returns False) — isolates the non-mechanical auto-heal guard (step-19/20)
+# from the mechanical-but-capped / mechanical-but-already-halted guards,
+# which reuse COMPILE_ERROR_RESULT.
+TEST_FAILURE_RESULT = VerifyResult(
+    passed=False,
+    test_output='FAILED test_foo',
+    lint_output='',
+    type_output='',
+    summary='pytest failed',
+    cause_hint='TestFoo.test_bar',
+    category='test_failure',
+)
+
 
 # ---------------------------------------------------------------------------
 # Step-5 (RED): _spawn_main_health_probe guard parity with
@@ -709,3 +723,147 @@ class TestAutoHealMainHealthDeferredHappyPath:
             f'Fix task must carry main_health_escalation_id=={esc_id!r}; got '
             f'{metadata!r}'
         )
+
+
+# ---------------------------------------------------------------------------
+# Step-19 (RED): worker-side auto-heal GUARD BRANCHES.
+#
+# The step-18 happy-path-only _auto_heal_main_health_deferred unconditionally
+# records an attempt, halts the 'normal' lane, and spawns a fix task for
+# EVERY outcome — it does not yet mirror TaskWorkflow._auto_heal_main_health's
+# (d) non-mechanical, (e) attempt-cap, and (idempotency) already-halted guard
+# branches.  Each sub-test below pins one guard's RED bar until step-20 adds
+# it; _spawn_main_health_fix_task is replaced with an AsyncMock so a
+# regression that still spawns is caught even if the fire-and-forget task
+# would otherwise race the assertions.
+# ---------------------------------------------------------------------------
+
+
+class TestAutoHealMainHealthDeferredGuards:
+    """Mirrors test_merge_queue_auto_heal.py's non-mechanical / attempt-cap /
+    idempotency branch tests, driven against a real SpeculativeMergeWorker."""
+
+    def _make_worker(
+        self, tmp_path: Path, *, escalation_queue: EscalationQueue | None,
+    ) -> SpeculativeMergeWorker:
+        git_ops = _make_git_ops(tmp_path)
+        return SpeculativeMergeWorker(
+            git_ops, asyncio.Queue(),
+            escalation_queue=escalation_queue, mcp=MagicMock(),
+        )
+
+    def test_non_mechanical_escalates_without_halt_or_spawn(
+        self, tmp_path: Path,
+    ) -> None:
+        config = _make_config(tmp_path, escalate_preexisting=True)
+        req = _make_req('99', tmp_path / 'task-wt', config)
+        (tmp_path / 'task-wt').mkdir()
+        escalation_queue = EscalationQueue(tmp_path / 'escalations')
+        worker = self._make_worker(tmp_path, escalation_queue=escalation_queue)
+        worker._spawn_main_health_fix_task = AsyncMock()  # type: ignore[method-assign]
+
+        outcome = _build_main_health_outcome(TEST_FAILURE_RESULT, MAIN_SHA)
+
+        asyncio.run(worker._auto_heal_main_health_deferred(outcome, req))
+
+        assert worker.is_lane_halted('normal') is False, (
+            'Non-mechanical failure must NOT halt the normal lane'
+        )
+        worker._spawn_main_health_fix_task.assert_not_awaited()
+        pending = escalation_queue.get_pending()
+        assert len(pending) == 1, (
+            f'Expected exactly one preexisting_main_break escalation to be '
+            f'filed; got {pending}'
+        )
+        assert pending[0].category == 'preexisting_main_break', (
+            f'Expected category=preexisting_main_break; got '
+            f'{pending[0].category!r}'
+        )
+
+    def test_attempt_cap_hard_escalates_without_halt_or_spawn(
+        self, tmp_path: Path,
+    ) -> None:
+        from orchestrator.merge_queue import MAIN_HEALTH_AUTO_HEAL_MAX_ATTEMPTS
+
+        config = _make_config(tmp_path, escalate_preexisting=True)
+        req = _make_req('99', tmp_path / 'task-wt', config)
+        (tmp_path / 'task-wt').mkdir()
+        escalation_queue = EscalationQueue(tmp_path / 'escalations')
+        worker = self._make_worker(tmp_path, escalation_queue=escalation_queue)
+        worker._spawn_main_health_fix_task = AsyncMock()  # type: ignore[method-assign]
+
+        outcome = _build_main_health_outcome(COMPILE_ERROR_RESULT, MAIN_SHA)
+        sig = RetryLedger.compute_merge_outcome_signature(
+            'compile_error', outcome.failure_cause_hint, outcome.reason,
+        )
+        for _ in range(MAIN_HEALTH_AUTO_HEAL_MAX_ATTEMPTS):
+            worker.auto_heal_registry.record_attempt(sig)
+        assert worker.is_lane_halted('normal') is False, (
+            'Precondition: the lane must be un-halted for the attempt-cap '
+            'branch to apply (an already-halted lane is the idempotency '
+            'branch, tested separately below)'
+        )
+
+        asyncio.run(worker._auto_heal_main_health_deferred(outcome, req))
+
+        assert worker.is_lane_halted('normal') is False, (
+            'Attempt-cap (genuine re-break) must NOT halt the normal lane'
+        )
+        worker._spawn_main_health_fix_task.assert_not_awaited()
+        pending = escalation_queue.get_pending()
+        assert len(pending) == 1, (
+            f'Expected exactly one preexisting_main_break escalation to be '
+            f'filed; got {pending}'
+        )
+
+    def test_already_halted_no_second_attempt_or_spawn(
+        self, tmp_path: Path,
+    ) -> None:
+        config = _make_config(tmp_path, escalate_preexisting=True)
+        req = _make_req('99', tmp_path / 'task-wt', config)
+        (tmp_path / 'task-wt').mkdir()
+        escalation_queue = EscalationQueue(tmp_path / 'escalations')
+        worker = self._make_worker(tmp_path, escalation_queue=escalation_queue)
+        worker._spawn_main_health_fix_task = AsyncMock()  # type: ignore[method-assign]
+
+        outcome = _build_main_health_outcome(COMPILE_ERROR_RESULT, MAIN_SHA)
+        sig = RetryLedger.compute_merge_outcome_signature(
+            'compile_error', outcome.failure_cause_hint, outcome.reason,
+        )
+
+        # Simulates a concurrent auto-heal already in flight — halted
+        # directly (not via a prior _auto_heal_main_health_deferred call),
+        # mirroring test_merge_queue_auto_heal.py's TestAutoHealIdempotency.
+        worker.halt_lane('normal', 'x')
+
+        asyncio.run(worker._auto_heal_main_health_deferred(outcome, req))
+
+        worker._spawn_main_health_fix_task.assert_not_awaited()
+        assert worker.auto_heal_registry.attempts(sig) == 0, (
+            f'The idempotency branch must NOT record a second attempt; got '
+            f'{worker.auto_heal_registry.attempts(sig)}'
+        )
+        pending = escalation_queue.get_pending()
+        assert len(pending) == 1, (
+            f'Expected the idempotency branch to still file/fold exactly one '
+            f'pending escalation; got {pending}'
+        )
+
+    def test_no_escalation_queue_escalates_only_without_raising_or_halting(
+        self, tmp_path: Path,
+    ) -> None:
+        config = _make_config(tmp_path, escalate_preexisting=True)
+        req = _make_req('99', tmp_path / 'task-wt', config)
+        (tmp_path / 'task-wt').mkdir()
+        worker = self._make_worker(tmp_path, escalation_queue=None)
+        worker._spawn_main_health_fix_task = AsyncMock()  # type: ignore[method-assign]
+
+        outcome = _build_main_health_outcome(COMPILE_ERROR_RESULT, MAIN_SHA)
+
+        # Must not raise despite escalation_queue=None.
+        asyncio.run(worker._auto_heal_main_health_deferred(outcome, req))
+
+        assert worker.is_lane_halted('normal') is False, (
+            'escalation_queue=None must route to escalate-only and never halt'
+        )
+        worker._spawn_main_health_fix_task.assert_not_awaited()
