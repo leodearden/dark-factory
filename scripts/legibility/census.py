@@ -369,6 +369,35 @@ def _cluster_description(cluster: dict, *, project_id: str) -> str:
     return "\n".join(lines)
 
 
+def _resolve_target_project(
+    cluster: dict, *, project_root: str, project_id: str, title: str,
+) -> tuple[str, str]:
+    """Resolve one cluster's target project_root/project_id, honoring the
+    ``target_project_root``/``target_project_id`` override pair (PRD
+    decision 4) as ALL-OR-NOTHING: the two name the SAME project and must
+    move together, so a cluster carrying only one of the two (a malformed
+    override -- e.g. a verify_fn/synthesis bug) can never mix an override
+    root with the census's own id, or vice versa, and file into the wrong
+    registry. A partial pair is logged and IGNORED entirely, falling back
+    to the census's own *project_root*/*project_id* -- the same fail-safe
+    default as no override at all (reviewer_comprehensive finding #2)."""
+    has_root_override = "target_project_root" in cluster
+    has_id_override = "target_project_id" in cluster
+    if has_root_override != has_id_override:
+        logger.warning(
+            "census: cluster %r supplies only one of "
+            "target_project_root/target_project_id (must move together, "
+            "PRD decision 4) -- ignoring the partial override and filing "
+            "into this census's own project %r instead",
+            title, project_id,
+        )
+        return project_root, project_id
+    return (
+        cluster.get("target_project_root", project_root),
+        cluster.get("target_project_id", project_id),
+    )
+
+
 def build_task_payloads(clusters, *, project_root: str, project_id: str) -> list[dict]:
     """Map each verified cluster to one curator-path ``submit_task`` kwarg
     dict. ``task_kind`` is always ``"normal"``; ``planning_mode`` is
@@ -382,7 +411,8 @@ def build_task_payloads(clusters, *, project_root: str, project_id: str) -> list
     overrides to file into dark_factory instead of the census's own
     project (PRD decision 4, same fused-memory, different project_root);
     absent those, the payload targets the census's own *project_root*/
-    *project_id*.
+    *project_id*. The two overrides move together -- see
+    ``_resolve_target_project``.
 
     Pure function -- returns payloads only; the actual ``submit_fn`` call
     happens in ``run_census``.
@@ -390,8 +420,9 @@ def build_task_payloads(clusters, *, project_root: str, project_id: str) -> list
     payloads = []
     for cluster in clusters:
         title = cluster.get("title") or "Untitled confusion cluster"
-        target_project_root = cluster.get("target_project_root", project_root)
-        target_project_id = cluster.get("target_project_id", project_id)
+        target_project_root, target_project_id = _resolve_target_project(
+            cluster, project_root=project_root, project_id=project_id, title=title,
+        )
         payloads.append(
             {
                 "project_root": target_project_root,

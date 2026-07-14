@@ -565,6 +565,37 @@ def test_build_task_payloads_harness_rooted_cause_can_target_dark_factory():
 
 
 # ---------------------------------------------------------------------------
+# amend round 2: target_project_root/target_project_id move together, never
+# independently (reviewer_comprehensive finding #2).
+# ---------------------------------------------------------------------------
+
+def test_build_task_payloads_partial_target_override_falls_back_to_own_project():
+    only_root = [
+        _verified_cluster(
+            title="Only root override", target_project_root="/home/leo/src/dark-factory",
+        )
+    ]
+    payloads = mod.build_task_payloads(
+        only_root, project_root="/home/leo/src/hosted-project", project_id="hosted_project",
+    )
+    assert payloads[0]["project_root"] == "/home/leo/src/hosted-project", (
+        "a lone target_project_root override must be ignored, never mixed with the "
+        "census's own project_id"
+    )
+    assert "hosted_project" in payloads[0]["description"]
+
+    only_id = [_verified_cluster(title="Only id override", target_project_id="dark_factory")]
+    payloads = mod.build_task_payloads(
+        only_id, project_root="/home/leo/src/hosted-project", project_id="hosted_project",
+    )
+    assert payloads[0]["project_root"] == "/home/leo/src/hosted-project", (
+        "a lone target_project_id override must be ignored, never mixed with the "
+        "census's own project_root"
+    )
+    assert "hosted_project" in payloads[0]["description"]
+
+
+# ---------------------------------------------------------------------------
 # amend: _novel_clusters() dedup-by-title + titleless-candidate skip.
 # codebook.apply_coding_record groups new candidates BY TITLE (codebook.py:
 # 494), so verification must operate on the same set of resolvable titles --
