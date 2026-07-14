@@ -194,6 +194,7 @@ from typing import TYPE_CHECKING
 from shared.task_metadata import DoneProvenance
 
 from orchestrator import systemd_inspect
+from orchestrator.deploy_state import DeployPhase, DeployState, VerifyBaseline, enforce_transition
 from orchestrator.proc_supervision import (
     EscalationSpec,
     FreshPidVerify,
@@ -788,6 +789,136 @@ class DeterministicRunner:
                 task_id, type(exc).__name__, exc,
             )
         return WorkflowOutcome.BLOCKED
+
+    def _deploy_transition_escalation_sink(
+        self, task_id: str, old: DeployPhase, new: DeployPhase,
+    ) -> None:
+        """DS-2 sink: file a born-at-L2 escalation for an illegal deploy-phase edge.
+
+        Wired into every ``_advance_deploy_phase`` call via
+        ``enforce_transition``'s ``escalation_sink`` — files BEFORE
+        ``enforce_transition`` raises ``IllegalDeployTransition``, so an
+        illegal edge is never silently swallowed (D2).  Mirrors the other
+        escalation-filing helpers' construction (sentinel role keeps level=2
+        past the server downgrade gate) but is unconditional — no dedup
+        guard — since an illegal transition is itself a bug signal that must
+        never be suppressed by an unrelated pending escalation.
+        """
+        from escalation.models import Escalation
+
+        esc = Escalation(
+            id=self.escalation_queue.make_id(task_id),
+            task_id=task_id,
+            agent_role=DETERMINISTIC_AGENT_ROLE,
+            severity='critical',
+            category='illegal_deploy_transition',
+            summary=f'Illegal deploy-phase transition {old} -> {new}'[:200],
+            detail=(
+                f'DeterministicRunner attempted an illegal deploy-phase '
+                f'transition {old!r} -> {new!r} for task {task_id}. This '
+                'indicates a runner bug or corrupted deploy_state metadata — '
+                'investigate before resuming.'
+            ),
+            level=2,
+        )
+        self.escalation_queue.submit(esc)
+        logger.error(
+            'DeterministicRunner: filed L2 illegal_deploy_transition escalation '
+            '%s for task %s (%s -> %s)',
+            esc.id, task_id, old, new,
+        )
+
+    async def _advance_deploy_phase(
+        self,
+        task_id: str,
+        metadata: dict,
+        new_phase: DeployPhase,
+        *,
+        evidence: dict | None = None,
+        verify_baseline: VerifyBaseline | dict | None = None,
+    ) -> DeployState:
+        """DS-1/DS-2: atomically advance ``metadata.deploy_state.phase`` + evidence.
+
+        Reads the CURRENT phase from *metadata* (the in-memory dict threaded
+        through ``run()``), enforces the transition (DS-2: files a loud
+        escalation then raises on an illegal edge via
+        ``_deploy_transition_escalation_sink``), then persists
+        ``{**new DeployState.to_metadata(), **evidence}`` in ONE
+        ``update_task(metadata_mode='merge')`` call, and refreshes
+        ``metadata['deploy_state']`` in place so a LATER call within the SAME
+        ``run()`` invocation observes the just-written phase as ``old``.
+
+        ``verify_baseline``, when omitted, carries forward whatever baseline
+        was already recorded — a phase advance must never drop previously
+        persisted DS-3 evidence.
+        """
+        old_state = DeployState.from_metadata(metadata)
+        old_phase = old_state.phase if old_state is not None else None
+        enforce_transition(
+            old_phase, new_phase, task_id=task_id,
+            escalation_sink=self._deploy_transition_escalation_sink,
+        )
+
+        if verify_baseline is not None and not isinstance(verify_baseline, VerifyBaseline):
+            verify_baseline = VerifyBaseline(**verify_baseline)
+        carried_baseline = (
+            verify_baseline if verify_baseline is not None
+            else (old_state.verify_baseline if old_state is not None else None)
+        )
+        new_state = DeployState(
+            phase=new_phase,
+            verify_baseline=carried_baseline,
+            ran_at=old_state.ran_at if old_state is not None else None,
+            verified_at=old_state.verified_at if old_state is not None else None,
+            escalated_at=old_state.escalated_at if old_state is not None else None,
+        )
+        payload = {**new_state.to_metadata(), **(evidence or {})}
+        await self.scheduler.update_task(task_id, payload, metadata_mode='merge')
+        metadata['deploy_state'] = new_state.to_metadata()['deploy_state']
+        return new_state
+
+    async def _enrich_deploy_state_baseline(
+        self, task_id: str, metadata: dict, baseline: dict,
+    ) -> None:
+        """DS-3: persist ``verify_baseline`` WITHOUT a phase transition.
+
+        Bypasses ``enforce_transition`` entirely — this is a same-phase
+        enrichment (advancing RAN -> RAN would hit the pinned-illegal
+        self-loop edge). Best-effort: this is a freshness UPGRADE, never a
+        new failure mode — a crash (or a still-severed connection) before
+        this write lands leaves ``phase==RAN`` with no baseline, which the
+        strand detector still correctly classifies as a RAN-strand and the
+        freshness verdict's no-baseline fallback still handles (see ζ design
+        decision on verify_baseline persistence timing).
+        """
+        old_state = DeployState.from_metadata(metadata)
+        if old_state is None:
+            # Defensive: the shared before_done_ran_at/phase=ran write always
+            # precedes baseline capture — nothing to enrich onto if absent.
+            return
+        verify_baseline = VerifyBaseline(
+            active_enter_timestamp_monotonic=baseline.get('ActiveEnterTimestampMonotonic', 0),
+            main_pid=baseline.get('MainPID', 0),
+        )
+        new_state = DeployState(
+            phase=old_state.phase,
+            verify_baseline=verify_baseline,
+            ran_at=old_state.ran_at,
+            verified_at=old_state.verified_at,
+            escalated_at=old_state.escalated_at,
+        )
+        try:
+            await self.scheduler.update_task(
+                task_id, new_state.to_metadata(), metadata_mode='merge',
+            )
+            metadata['deploy_state'] = new_state.to_metadata()['deploy_state']
+        except Exception as exc:
+            logger.warning(
+                'DeterministicRunner: task %s verify_baseline enrichment failed '
+                '(%s: %s) — freshness will fall back to liveness-only; not a new '
+                'failure mode (phase==ran is still correctly detected as a strand)',
+                task_id, type(exc).__name__, exc,
+            )
 
     async def _writeback_deploy_success(
         self,
@@ -1534,12 +1665,13 @@ class DeterministicRunner:
             # Stamp before_done_ran_at FIRST (crash-safe I1: stamp-before-run means a
             # crash mid-deploy leaves the stamp set → re-dispatch does NOT re-run).
             # This stamp is SHARED for both self-target and cross-unit paths so I1
-            # holds for both (ε design decision 5).
+            # holds for both (ε design decision 5). ζ: this is also the initial
+            # deploy_state.phase write (None -> RAN), atomically merged in the
+            # SAME update_task call (DS-1).
             now_iso = datetime.now(UTC).isoformat()
-            await self.scheduler.update_task(
-                task_id,
-                {'before_done_ran_at': now_iso},
-                metadata_mode='merge',
+            await self._advance_deploy_phase(
+                task_id, metadata, DeployPhase.RAN,
+                evidence={'before_done_ran_at': now_iso},
             )
 
             # ── ε: self-target detection ─────────────────────────────────────
@@ -1706,6 +1838,12 @@ class DeterministicRunner:
                         summary=f'Baseline inspect failed before deploy: {target_unit}',
                         detail=baseline_detail,
                     )
+
+                # ζ DS-3: persist the trustworthy baseline into deploy_state as a
+                # same-phase enrichment (phase stays RAN — see
+                # _enrich_deploy_state_baseline). Best-effort; never blocks the
+                # deploy itself.
+                await self._enrich_deploy_state_baseline(task_id, metadata, baseline)
 
                 # Run the deploy script + fresh-PID verify by delegating to
                 # proc_supervision.RestartPlan.execute() (task 2238/δ, RP-2/
