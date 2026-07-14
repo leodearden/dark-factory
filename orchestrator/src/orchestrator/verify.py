@@ -1930,6 +1930,71 @@ class CheckRun:
 
 
 @dataclass
+class VerifyAttempt:
+    """The CheckRun results (test/lint/type) for one full verification attempt.
+
+    Introduced (task 2133) so ``run_verification`` carries ONE object
+    through its retry loop instead of 15 parallel scalar locals
+    (``{test,lint,type}_{rc,out,timed_out,started_at,duration}``), and so
+    ``passed``/``any_timed_out``/``pure_timeout_failure`` are each computed
+    exactly ONCE. Previously this 6-clause formula was hand-duplicated at
+    two call sites — the first-pass retry loop and the env-recovery branch
+    (task 2048 added the second copy) — which is the exact drift surface
+    that once let a recovery run's wall-clock timeout leave a stale
+    ``timed_out=False`` while ``category`` flipped to ``infra_timeout``.
+    With a single property definition read from every call site, first-pass
+    and env-recovery are now structurally incapable of disagreeing.
+    """
+
+    checks: list[CheckRun]
+
+    @property
+    def passed(self) -> bool:
+        return all(c.rc == 0 for c in self.checks)
+
+    @property
+    def any_timed_out(self) -> bool:
+        return any(c.timed_out for c in self.checks)
+
+    @property
+    def pure_timeout_failure(self) -> bool:
+        """True when the attempt failed and every failing check is a timeout.
+
+        The generic (list-over-``checks``) form of the two hand-duplicated
+        formulas this task collapses: ``not passed`` rules out a clean
+        pass, ``any_timed_out`` requires at least one check to have hit the
+        wall clock, and the trailing ``all(...)`` requires every OTHER
+        failing check to also be a timeout — so a genuine non-timeout
+        failure (e.g. a real lint error) alongside a timeout is never
+        misclassified as a pure, retryable timeout.
+        """
+        return (
+            not self.passed
+            and self.any_timed_out
+            and all(c.rc == 0 or c.timed_out for c in self.checks)
+        )
+
+    def _by_label(self, label: str) -> CheckRun:
+        return next(c for c in self.checks if c.label == label)
+
+    @property
+    def test(self) -> CheckRun:
+        return self._by_label('test')
+
+    @property
+    def lint(self) -> CheckRun:
+        return self._by_label('lint')
+
+    @property
+    def type(self) -> CheckRun:
+        # Shadows the `type` builtin, but this project's ruff config selects
+        # ["E", "F", "UP", "B", "SIM", "I"] — flake8-builtins ("A") is not
+        # enabled — so this is lint-safe; matches the CheckRun.label vocabulary
+        # ('test'/'lint'/'type') used throughout verify.py.
+        return self._by_label('type')
+
+
+@dataclass
 class VerifyResult:
     passed: bool
     test_output: str
