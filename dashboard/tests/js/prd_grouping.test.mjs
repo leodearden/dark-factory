@@ -17,12 +17,13 @@ import { createRequire } from 'node:module';
 
 import grouping from '../../src/dashboard/static/redux/prd_grouping.js';
 
-const { prdTitle, aggregatePrdStatus } = grouping;
+const { prdTitle, aggregatePrdStatus, summarizePrdMembers } = grouping;
 
 const MODULE_SPECIFIER = '../../src/dashboard/static/redux/prd_grouping.js';
 const EXPECTED_FUNCTION_NAMES = [
   'prdTitle',
   'aggregatePrdStatus',
+  'summarizePrdMembers',
 ];
 
 // Builds a minimal task fixture — only the fields prd_grouping.js's
@@ -146,4 +147,33 @@ test('aggregatePrdStatus: done+cancelled (not ALL done) falls through to cancell
 
 test('aggregatePrdStatus: all cancelled yields cancelled', () => {
   assert.equal(aggregatePrdStatus(tasksWithStatuses(['cancelled'])), 'cancelled');
+});
+
+// ---------------------------------------------------------------------------
+// summarizePrdMembers — per-bucket counts over ALL given members: done,
+// inProgress ('in-progress' or 'merge-deferred'), blocked, pending ('pending'
+// or 'deferred'), total. Feeds both the "n/m done" count (done/total) and the
+// stacked-bar segment sizes.
+// ---------------------------------------------------------------------------
+
+test('summarizePrdMembers: mixed fixture yields exact per-bucket counts, total counts every member', () => {
+  const tasks = tasksWithStatuses([
+    'done', 'done', 'blocked', 'in-progress', 'merge-deferred', 'pending', 'deferred', 'cancelled',
+  ]);
+  assert.deepEqual(summarizePrdMembers(tasks), {
+    done: 2,
+    inProgress: 2,
+    blocked: 1,
+    pending: 2,
+    total: 8,
+  });
+});
+
+test('summarizePrdMembers: total always equals tasks.length, including cancelled/deferred members', () => {
+  const tasks = tasksWithStatuses(['cancelled', 'cancelled', 'deferred']);
+  assert.equal(summarizePrdMembers(tasks).total, 3);
+});
+
+test('summarizePrdMembers: empty input yields all-zero counts', () => {
+  assert.deepEqual(summarizePrdMembers([]), { done: 0, inProgress: 0, blocked: 0, pending: 0, total: 0 });
 });
