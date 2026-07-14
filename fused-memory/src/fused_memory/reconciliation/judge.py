@@ -267,7 +267,12 @@ Review this run and provide your verdict as JSON.
         # _parse_claude_output maps empty stdout → success=False / subtype
         # 'error_empty_output'.  Treat that as a benign empty string rather
         # than an error so callers remain consistent with the prior subprocess
-        # implementation that returned '' on exit-0 + empty stdout.
+        # implementation that returned '' on exit-0 + empty stdout.  This
+        # benign contract depends on _parse_verdict special-casing empty
+        # text (see its early-return below) rather than routing it through
+        # the loud severity=serious parse-failure path — otherwise a quiet,
+        # successful CLI run would be indistinguishable from a systemic
+        # judge/CLI outage and could halt the project.
         if not result.success and result.subtype == 'error_empty_output':
             return ''
 
@@ -278,6 +283,29 @@ Review this run and provide your verdict as JSON.
 
     def _parse_verdict(self, response_text: str, run_id: str) -> JudgeVerdict:
         """Parse judge response into JudgeVerdict."""
+        if not response_text.strip():
+            # Empty output is a documented benign case, NOT a parse failure:
+            # _call_judge_cli returns '' for exit-0/empty-stdout CLI runs
+            # (legacy "empty stdout = valid empty verdict" semantics — see
+            # the comment there) and the anthropic branch returns '' when
+            # the response has no text blocks. Neither indicates a systemic
+            # judge/CLI outage, so it must not be conflated with the loud
+            # severity=serious path below (reserved for genuinely
+            # unparseable non-empty responses) — doing so would turn a
+            # quiet, successful run into a project halt when
+            # halt_on_judge_serious=True. Stay at severity=minor, matching
+            # the non-halting behavior this replaced for the empty case.
+            return JudgeVerdict(
+                run_id=run_id,
+                reviewed_at=datetime.now(UTC),
+                severity=VerdictSeverity.minor,
+                findings=[{
+                    'issue': 'Judge returned empty output',
+                    'severity': 'minor',
+                    'recommendation': 'Manual review recommended',
+                }],
+                action_taken=VerdictAction.none,
+            )
         try:
             # Extract JSON from response (might be wrapped in markdown)
             text = response_text.strip()

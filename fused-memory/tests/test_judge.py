@@ -120,6 +120,28 @@ def test_parse_verdict_unparseable_response_is_loud_not_fabricated(mock_journal)
     assert 'Judge response could not be parsed' in verdict.findings[0].get('issue', '')
 
 
+@pytest.mark.parametrize('empty_text', ['', '   ', '\n\t '])
+def test_parse_verdict_empty_response_stays_benign_not_serious(mock_journal, empty_text):
+    """Empty (or whitespace-only) judge output must NOT be treated as a loud
+    parse failure.
+
+    _call_judge_cli returns '' for two documented benign cases: exit-0/
+    empty-stdout CLI runs (legacy 'empty stdout = valid empty verdict'
+    semantics) and the anthropic branch when the response has no text
+    blocks. json.loads('') raises JSONDecodeError just like genuinely
+    malformed text, so without an explicit short-circuit this benign,
+    successful case would be indistinguishable from a systemic judge/CLI
+    outage and incorrectly escalate to severity=serious (which halts the
+    project when halt_on_judge_serious=True). It must stay non-halting.
+    """
+    judge = Judge(config=_make_judge_config(), journal=mock_journal)
+
+    verdict = judge._parse_verdict(empty_text, 'run-empty')
+
+    assert verdict.severity == VerdictSeverity.minor
+    assert verdict.action_taken == VerdictAction.none
+
+
 # --- Judge._call_llm anthropic branch tests ---
 
 
@@ -558,6 +580,46 @@ async def test_review_run_unparseable_response_no_halt_when_disabled(mock_journa
     assert verdict.severity == VerdictSeverity.serious
     assert verdict.action_taken == VerdictAction.none
     assert not judge.is_halted('test-project-parse-no-halt')
+    mock_journal.set_halt.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_review_run_empty_response_does_not_halt_even_when_enabled(mock_journal):
+    """An empty judge response must NOT halt the project, even with
+    halt_on_judge_serious=True.
+
+    Unlike a genuinely unparseable response (tested above), empty output is
+    a documented benign case (see Judge._call_judge_cli's 'empty stdout =
+    valid empty verdict' comment and _parse_verdict's empty-text
+    short-circuit) — it must stay severity=minor and non-halting instead of
+    being conflated with the loud severity=serious parse-failure path.
+    """
+    from fused_memory.models.reconciliation import ReconciliationRun, RunStatus, RunType
+
+    config = _make_judge_config(halt_on_judge_serious=True)
+    judge = Judge(config=config, journal=mock_journal)
+
+    now = datetime.now(UTC)
+    run = ReconciliationRun(
+        id='run-empty-no-halt',
+        project_id='test-project-empty-no-halt',
+        run_type=RunType.full,
+        trigger_reason='buffer_size:3',
+        started_at=now,
+        events_processed=3,
+        status=RunStatus.completed,
+        stage_reports={},
+    )
+    mock_journal.get_run = AsyncMock(return_value=run)
+    mock_journal.get_run_actions_combined = AsyncMock(return_value=[])
+
+    with patch.object(judge, '_call_llm', AsyncMock(return_value='')):
+        verdict = await judge.review_run('run-empty-no-halt')
+
+    assert verdict is not None
+    assert verdict.severity == VerdictSeverity.minor
+    assert verdict.action_taken == VerdictAction.none
+    assert not judge.is_halted('test-project-empty-no-halt')
     mock_journal.set_halt.assert_not_called()
 
 
