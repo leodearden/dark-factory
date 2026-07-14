@@ -17,12 +17,30 @@ import { createRequire } from 'node:module';
 
 import grouping from '../../src/dashboard/static/redux/prd_grouping.js';
 
-const { prdTitle } = grouping;
+const { prdTitle, aggregatePrdStatus } = grouping;
 
 const MODULE_SPECIFIER = '../../src/dashboard/static/redux/prd_grouping.js';
 const EXPECTED_FUNCTION_NAMES = [
   'prdTitle',
+  'aggregatePrdStatus',
 ];
+
+// Builds a minimal task fixture — only the fields prd_grouping.js's
+// functions actually read (id, status, prd, deps). Mirrors
+// graph_layout.test.mjs's mkTask helper, extended with an optional `prd`.
+function mkTask(id, { deps = [], status, prd } = {}) {
+  return {
+    id,
+    ...(status !== undefined ? { status } : {}),
+    ...(prd !== undefined ? { prd } : {}),
+    deps: deps.map(depId => ({ id: depId })),
+  };
+}
+
+// Convenience for status-precedence tests that don't care about id/deps/prd.
+function tasksWithStatuses(statuses) {
+  return statuses.map((status, i) => mkTask(`t${i}`, { status }));
+}
 
 test('default-imported module exposes the PRD-grouping functions', () => {
   for (const name of EXPECTED_FUNCTION_NAMES) {
@@ -91,4 +109,41 @@ test('prdTitle: strips a plain trailing ".md" suffix when there is no directory 
 
 test('prdTitle: returns a bare string with no separators or suffix unchanged', () => {
   assert.equal(prdTitle('plain'), 'plain');
+});
+
+// ---------------------------------------------------------------------------
+// aggregatePrdStatus — precedence ladder: any-blocked > any-(in-progress or
+// merge-deferred) > any-(pending or deferred) > all-done > cancelled.
+// ---------------------------------------------------------------------------
+
+test('aggregatePrdStatus: any blocked wins over everything else', () => {
+  assert.equal(aggregatePrdStatus(tasksWithStatuses(['blocked', 'done'])), 'blocked');
+});
+
+test('aggregatePrdStatus: any in-progress (no blocked) wins over pending/done', () => {
+  assert.equal(aggregatePrdStatus(tasksWithStatuses(['in-progress', 'pending'])), 'in-progress');
+});
+
+test('aggregatePrdStatus: merge-deferred counts as in-progress', () => {
+  assert.equal(aggregatePrdStatus(tasksWithStatuses(['merge-deferred', 'done'])), 'in-progress');
+});
+
+test('aggregatePrdStatus: any pending (no blocked/in-progress) wins over done', () => {
+  assert.equal(aggregatePrdStatus(tasksWithStatuses(['pending', 'done'])), 'pending');
+});
+
+test('aggregatePrdStatus: deferred counts as pending', () => {
+  assert.equal(aggregatePrdStatus(tasksWithStatuses(['deferred', 'done'])), 'pending');
+});
+
+test('aggregatePrdStatus: all done (no blocked/active/pending) yields done', () => {
+  assert.equal(aggregatePrdStatus(tasksWithStatuses(['done', 'done'])), 'done');
+});
+
+test('aggregatePrdStatus: done+cancelled (not ALL done) falls through to cancelled', () => {
+  assert.equal(aggregatePrdStatus(tasksWithStatuses(['done', 'cancelled'])), 'cancelled');
+});
+
+test('aggregatePrdStatus: all cancelled yields cancelled', () => {
+  assert.equal(aggregatePrdStatus(tasksWithStatuses(['cancelled'])), 'cancelled');
 });
