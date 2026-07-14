@@ -642,6 +642,16 @@ def _parse_pi_output(
 ) -> AgentResult:
     """Parse pi's `--mode json` JSONL stream into AgentResult.
 
+    Line-parses each JSONL event (skipping blank/unparseable lines, like
+    _parse_codex_output). ``session_id`` comes from the first `session`
+    event's `id`. Prefers the single `agent_end` event's `messages` list
+    (spike-recommended, authoritative); falls back to accumulating over
+    `turn_end` events when no `agent_end` was seen. `turns` counts
+    `turn_end` events. `message_update`/`tool_execution_update` (streaming
+    deltas) are ignored. cost_usd/token totals sum pi's NATIVE per-message
+    `usage` over assistant-role messages. output = the joined
+    content[type=="text"].text of the *terminal* (last) assistant message.
+
     timed_out/duration_ms are propagated from *result* unchanged, exactly
     like _parse_codex_output / _parse_gemini_output.
     """
@@ -653,7 +663,81 @@ def _parse_pi_output(
             stderr=result.stderr,
             timed_out=result.timed_out,
         )
-    raise NotImplementedError  # fleshed out in a subsequent TDD step
+
+    events = []
+    for line in result.stdout.strip().split('\n'):
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            events.append(json.loads(line))
+        except json.JSONDecodeError:
+            continue
+
+    session_id = ''
+    turns = 0
+    agent_end_messages: list[Any] | None = None
+    turn_end_messages: list[Any] = []
+
+    for event in events:
+        event_type = event.get('type', '')
+
+        if event_type == 'session':
+            session_id = event.get('id', session_id)
+
+        elif event_type == 'turn_end':
+            turns += 1
+            message = event.get('message')
+            if isinstance(message, dict):
+                turn_end_messages.append(message)
+
+        elif event_type == 'agent_end':
+            messages = event.get('messages')
+            if isinstance(messages, list):
+                agent_end_messages = messages
+
+        # message_update / tool_execution_update (streaming deltas) and any
+        # other event types are intentionally ignored.
+
+    source_messages = agent_end_messages if agent_end_messages is not None else turn_end_messages
+    assistant_messages = [
+        m for m in source_messages
+        if isinstance(m, dict) and m.get('role') == 'assistant'
+    ]
+
+    total_input_tokens = 0
+    total_output_tokens = 0
+    native_cost = 0.0
+    for message in assistant_messages:
+        usage = message.get('usage') or {}
+        total_input_tokens += usage.get('input') or 0
+        total_output_tokens += usage.get('output') or 0
+        cost = usage.get('cost') or {}
+        native_cost += cost.get('total') or 0.0
+
+    terminal = assistant_messages[-1] if assistant_messages else None
+    if terminal is not None:
+        content = terminal.get('content') or []
+        output_text = '\n'.join(
+            part.get('text', '') for part in content
+            if isinstance(part, dict) and part.get('type') == 'text'
+        )
+    else:
+        output_text = ''
+
+    return AgentResult(
+        success=True,
+        output=output_text,
+        cost_usd=native_cost,
+        duration_ms=result.duration_ms,
+        turns=turns,
+        session_id=session_id,
+        subtype='success',
+        stderr=result.stderr,
+        timed_out=result.timed_out,
+        input_tokens=total_input_tokens,
+        output_tokens=total_output_tokens,
+    )
 
 
 # ---------------------------------------------------------------------------
