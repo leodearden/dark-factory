@@ -253,7 +253,13 @@ class TestGlobalCap:
         # REAL acquire_task_slot (not mocked) — only _run_cmd is patched, so
         # this exercises T1's actual flock semaphore + T2's off-loop wiring,
         # generalizing the wiring test's 2-verify serialize test to M>=3.
-        with patch('orchestrator.verify._run_cmd', side_effect=spy):
+        # `new=spy` (not `side_effect=spy`): AsyncMock only awaits a
+        # side_effect it recognizes via asyncio.iscoroutinefunction, which is
+        # False for a callable *instance* like `spy` (only true functions/
+        # bound methods qualify) — side_effect=spy would return spy(...)'s
+        # coroutine object un-awaited. `new=spy` substitutes the callable
+        # directly, so `await _run_cmd(...)` awaits spy.__call__ itself.
+        with patch('orchestrator.verify._run_cmd', new=spy):
             results = await asyncio.gather(*(
                 run_verification(
                     worktree=worktree,
