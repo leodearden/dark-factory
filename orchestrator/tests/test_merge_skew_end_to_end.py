@@ -388,7 +388,6 @@ class TestFirstAttemptSkewMergeAttemptDisposition:
             verify_task=asyncio.ensure_future(worker._run_inflight_verify(item, lease)),
             merge_wt=None,
             was_speculative=False,
-            phase='verifying',
         )
         p1, p2 = _patched_verify_seams()
         with p1, p2:
