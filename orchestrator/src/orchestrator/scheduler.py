@@ -2913,6 +2913,7 @@ class Scheduler:
         *,
         external_status_cache: dict[str, str] | None = None,
         external_resolver_failed: bool = False,
+        delivered_check_cache: dict[str, bool] | None = None,
     ) -> bool:
         """Return True if every dependency of *task* is in a terminal status.
 
@@ -2946,10 +2947,23 @@ class Scheduler:
         *external_resolver_failed* is ``True``, all external deps are treated as
         not satisfied regardless of the cache (fail-safe wait).
 
-        Defaulting both new parameters to ``None``/``False`` makes the legacy
-        3-arg call from ``_park_gc`` and all existing tests byte-identical.
-        Side effects (escalation, counter increments) MUST NOT live here — this
-        method is a pure predicate called from multiple sites.
+        **Delivered-check gate (capability-delivered-checks PRD, task delta):**
+        when *delivered_check_cache* is not ``None`` AND *tasks_by_id* is
+        supplied, each TERMINAL (done/cancelled) local dep whose record in
+        *tasks_by_id* carries a truthy ``metadata.delivered_checks`` must
+        also resolve to exactly ``True`` in *delivered_check_cache* (keyed by
+        dep task id) to count as satisfied — this applies to a ``cancelled``
+        dep just as much as a ``done`` one, since the check trusts the state
+        of ``main``, not the status label.  A dep absent from the cache
+        (errored, over budget, or not yet evaluated this tick) is NOT
+        satisfied (fail-safe wait).  A dep whose record carries no
+        ``metadata.delivered_checks`` is never consulted — byte-identical.
+
+        Defaulting all three new parameters to ``None``/``False`` makes the
+        legacy 3-arg call from ``_park_gc`` and all existing tests
+        byte-identical. Side effects (escalation, counter increments) MUST
+        NOT live here — this method is a pure predicate called from
+        multiple sites.
 
         Handles three dependency formats:
           - dict with 'id' key: ``{'id': 1}`` or ``{'id': '1'}``
@@ -3025,6 +3039,34 @@ class Scheduler:
                         task_id,
                         ext_dep,
                         ext_status,
+                    )
+                    return False
+
+        # Delivered-check gate (capability-delivered-checks PRD, task delta).
+        # Only active when the cache is supplied (not None) AND tasks_by_id
+        # is available to look up each dep's metadata — defaults reproduce
+        # byte-identical legacy behaviour.  Only a TERMINAL local dep that
+        # itself carries a truthy metadata.delivered_checks is consulted; a
+        # dep without the metadata is never looked up in the cache.
+        if delivered_check_cache is not None and tasks_by_id is not None:
+            for d in deps:
+                dep_id = str(d.get('id', d) if isinstance(d, dict) else d)
+                dep_status = status_map.get(dep_id, 'unknown')
+                if dep_status not in TERMINAL_STATUSES:
+                    continue
+                dep_task = tasks_by_id.get(dep_id)
+                if dep_task is None:
+                    continue
+                dep_checks = (dep_task.get('metadata') or {}).get('delivered_checks')
+                if not dep_checks:
+                    continue
+                if delivered_check_cache.get(dep_id) is not True:
+                    logger.debug(
+                        'Task %s blocked: dep %s delivered_checks not confirmed on '
+                        'main (cache=%r)',
+                        task_id,
+                        dep_id,
+                        delivered_check_cache.get(dep_id),
                     )
                     return False
         return True
