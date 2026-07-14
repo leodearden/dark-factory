@@ -875,12 +875,21 @@ class ReconReportState:
         copies of the four cited_* lists).
 
         Unlike :meth:`get_assembled_report`, this method does **NOT** apply
-        Fix-1 read-time echo suppression (task-1654).  It is intentionally a
+        Fix-1 read-time echo suppression (task-1654), nor the task-2453
+        cross_project_routing taxonomy guard
+        (:func:`_apply_cross_project_routing_guard`).  It is intentionally a
         raw, run-scoped read: task-1966 uses it as an independent "recon_report
         channel" for Stage 2 to poll for ``systemic_pattern`` findings, so that
         channel stays genuinely independent of the primary (Mem0 flagged-items)
         channel even when the latter is suppressed by a ``stage1_flag_suppression``
-        record.
+        record.  Skipping the task-2453 guard here is deliberate, not an
+        oversight: this channel is filtered to ``category == 'systemic_pattern'``
+        at the poll site (task_knowledge_sync.py), so a ``cross_project_routing``
+        finding never flows through it regardless of citation state — applying
+        the guard here would be cosmetic and would muddy this method's raw,
+        no-suppression contract.  A caller reading ``cross_project_routing``
+        findings through this channel should use :meth:`get_assembled_report`
+        instead if it needs the guarded/downgraded taxonomy.
 
         Returns ``[]`` for an unknown ``run_id`` (never raises).
         """
