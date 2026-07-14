@@ -20,7 +20,10 @@ are written fire-and-forget and can have a truncated/corrupt trailing line.
 """
 from __future__ import annotations
 
+import argparse
 import json
+import sys
+from collections.abc import Sequence
 from pathlib import Path
 from typing import Any
 
@@ -848,3 +851,56 @@ def build_digest(
     records = load_transcript(path)
     agent_class = classify_agent_class(records, override=agent_class_override)
     return render_digest(records, agent_class=agent_class, path=path, max_bytes=max_bytes)
+
+
+def main(argv: Sequence[str]) -> int:
+    """CLI entry point: build a digest for a single transcript file.
+
+    Prints the rendered digest to stdout and returns 0, unless ``--out``
+    is given, in which case the digest is written to that file instead
+    (nothing is printed to stdout). A transcript path that does not exist
+    is reported to stderr with a non-zero return, rather than letting the
+    underlying ``open()`` raise -- this is the only handled error case;
+    everything else (e.g. an unreadable/permission-denied file) surfaces
+    as an uncaught exception, matching the tool's `scripts/` siblings.
+    """
+    parser = argparse.ArgumentParser(
+        description=(
+            'Turn a Claude Code session transcript JSONL file into a '
+            '5-15KB markdown confusion digest with YAML frontmatter.'
+        )
+    )
+    parser.add_argument('transcript', help='Path to a Claude Code session transcript JSONL file')
+    parser.add_argument(
+        '--agent-class', dest='agent_class', default=None,
+        help="Override alpha's best-effort agent_class classification",
+    )
+    parser.add_argument(
+        '--max-bytes', type=int, default=15360,
+        help='Soft byte cap for the rendered digest (default: %(default)s)',
+    )
+    parser.add_argument(
+        '--out', default=None,
+        help='Write the digest to this file instead of printing it to stdout',
+    )
+    args = parser.parse_args(argv)
+
+    transcript_path = Path(args.transcript)
+    if not transcript_path.exists():
+        print(f'digest: transcript not found: {transcript_path}', file=sys.stderr)
+        return 1
+
+    digest = build_digest(
+        transcript_path, agent_class_override=args.agent_class, max_bytes=args.max_bytes,
+    )
+
+    if args.out:
+        Path(args.out).write_text(digest, encoding='utf-8')
+    else:
+        print(digest)
+
+    return 0
+
+
+if __name__ == '__main__':
+    raise SystemExit(main(sys.argv[1:]))
