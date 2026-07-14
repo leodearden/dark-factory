@@ -962,6 +962,7 @@ async def invoke_with_cap_retry(
                     AuthFailed,
                     CapHit,
                     CliLocalError,
+                    ModelNotFound,
                     ZeroOutputWedge,
                     classify_invocation,
                 )
@@ -996,6 +997,28 @@ async def invoke_with_cap_retry(
                         f'(HTTP {result.api_error_status}) — failing over',
                     )
                     continue
+
+                # Model-not-found is TERMINAL: the requested model doesn't exist /
+                # isn't available to any account, so cross-account failover can
+                # only repeat the same zero-cost, near-instant failure on every
+                # other account.  Without this branch, the result falls through to
+                # the heuristic cap-hit safety net below (zero-cost/near-instant/
+                # ≤1-turn) which misclassifies it as a cap hit — cycling the
+                # entire pool through compounding cooldowns until
+                # AllAccountsCappedException fires (the "TRANSIENT → whole-pool
+                # churn" bug this branch exists to prevent).  slot.confirm settles
+                # the slot as a normal (zero-cost) completion — no account is
+                # marked capped/auth_failed — and the failed result is returned to
+                # the caller directly for genuine terminal handling.
+                if isinstance(outcome, ModelNotFound):
+                    logger.warning(
+                        f'{label}: model not found/available on account '
+                        f'{account_name} ({outcome.reason}) — terminal, no '
+                        f'cross-account failover',
+                    )
+                    if not unattributed_cap:
+                        slot.confirm(result.cost_usd)
+                    break
 
                 # Wedge guard: a full-timeout CLI call (timed_out=True with zero
                 # turns and zero cost) means the subprocess never executed any
