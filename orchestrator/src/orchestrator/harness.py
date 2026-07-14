@@ -33,6 +33,7 @@ from orchestrator.config import (
     apply_reload,
     load_config,
 )
+from orchestrator.deploy_state import DeployPhase, DeployState
 from orchestrator.deterministic_runner import DeterministicRunner
 from orchestrator.event_store import EventStore, EventType
 from orchestrator.fleet_heartbeat import build_heartbeat_payload, resolve_fleet_dir, write_heartbeat
