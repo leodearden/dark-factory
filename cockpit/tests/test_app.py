@@ -2536,3 +2536,34 @@ class TestStaleScanSequenceGuard:
             app._apply_scan(newer, [], 101)
             await pilot.pause()
             assert table.row_count == 3
+
+    @pytest.mark.timeout(10)
+    async def test_scan_registry_worker_forwards_its_seq_to_apply_scan(self, tmp_path, monkeypatch):
+        """The seam test above proves _apply_scan's own drop/keep logic given
+        hand-picked seqs, but never exercises the real
+        _scan_registry_worker -> _call_from_thread_fail_soft(_apply_scan)
+        hand-off that carries *seq* across the thread boundary in
+        production. Patches _apply_scan with a spy and drives the worker
+        directly, closing that gap: proves the sequence number
+        _next_scan_seq() issues before launching the worker is the exact
+        same value that reaches _apply_scan on the far side of the
+        call_from_thread hand-off -- i.e. that the plumbing forwards seq
+        unchanged, not just that the seam's guard behaves given some seq.
+        """
+        from cockpit.app import CockpitApp
+
+        app = CockpitApp(fleet_root=tmp_path, poll_interval=60)
+        async with app.run_test() as pilot:
+            await pilot.pause()  # on_mount's synchronous initial scan
+
+            recorded_seqs = []
+            monkeypatch.setattr(
+                app, '_apply_scan', lambda records, decisions, seq: recorded_seqs.append(seq)
+            )
+
+            issued = app._next_scan_seq()
+            worker = app._scan_registry_worker(issued)
+            await worker.wait()
+            await pilot.pause()
+
+            assert recorded_seqs == [issued]
