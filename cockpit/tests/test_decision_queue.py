@@ -334,6 +334,36 @@ class TestFormatCopyPayload:
         assert 'None' not in payload
         assert '(none)' in payload
 
+    def test_long_question_is_capped_for_clipboard_safety(self):
+        """Some terminals silently DROP (rather than truncate) an
+        over-long OSC 52 clipboard write, so an unbounded question could
+        otherwise land on the clipboard as nothing at all with no
+        operator-visible feedback (task 2517 amendment: reviewer_comprehensive
+        robustness suggestion)."""
+        from cockpit.panes.decision_queue import _COPY_QUESTION_MAX_CHARS, format_copy_payload
+
+        long_question = 'x' * (_COPY_QUESTION_MAX_CHARS + 500)
+        item = _make_queue_item(question=long_question)
+
+        payload = format_copy_payload(item)
+
+        assert long_question not in payload
+        assert payload.count('x') <= _COPY_QUESTION_MAX_CHARS
+        assert '…' in payload
+
+    def test_short_question_is_unaffected_by_the_clipboard_cap(self):
+        """A realistic short question passes through untouched -- the cap
+        is purely defensive against pathological input, not a general
+        truncation of every question."""
+        from cockpit.panes.decision_queue import format_copy_payload
+
+        item = _make_queue_item(question='Which port do we bind?')
+
+        payload = format_copy_payload(item)
+
+        assert 'question: Which port do we bind?' in payload
+        assert '…' not in payload
+
 
 class TestOrderQueue:
     def test_includes_only_open_decisions_and_awaiting_sessions(self):

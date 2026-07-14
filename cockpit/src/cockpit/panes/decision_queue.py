@@ -196,6 +196,27 @@ class QueueItem:
 
 _ID_PLACEHOLDER = '(none)'
 
+# Some terminals silently DROP an over-long OSC 52 clipboard write rather
+# than truncating it (App.copy_to_clipboard's caller in app.py), so an
+# unbounded question could otherwise land on the clipboard as nothing at
+# all with no operator-visible feedback (task 2517 amendment). Sized
+# generously above any realistic question length and comfortably under the
+# payload limits reported by common terminals.
+_COPY_QUESTION_MAX_CHARS = 4000
+
+
+def _cap_for_clipboard(text: str, limit: int = _COPY_QUESTION_MAX_CHARS) -> str:
+    """Truncate *text* to at most *limit* characters, marking the cut with an ellipsis.
+
+    A no-op for text already at or under *limit* -- the overwhelmingly
+    common case for a real question. Purely defensive: this bounds the
+    clipboard payload size, it does not detect or target any particular
+    terminal's actual OSC 52 limit.
+    """
+    if len(text) <= limit:
+        return text
+    return text[: limit - 1].rstrip() + '…'
+
 
 def format_copy_payload(item: QueueItem) -> str:
     """Render *item* as a labeled multi-line clipboard payload (the copy
@@ -207,16 +228,20 @@ def format_copy_payload(item: QueueItem) -> str:
     escalation_id degrades to a placeholder, never the literal string
     'None'. The trailing id line is derived from item.kind/item.key --
     'decision_id: <id>' for a decision, or 'session: <slug>' for a
-    session (slug = item.key after its 'session:' prefix).
+    session (slug = item.key after its 'session:' prefix). The question
+    line is defensively capped (_cap_for_clipboard) so a pathologically
+    long question can't silently vanish from the clipboard on a terminal
+    that drops rather than truncates an over-long OSC 52 payload.
     """
     if item.kind == 'session':
         slug = item.key.split(':', 1)[1] if ':' in item.key else item.key
         id_line = f'session: {slug}'
     else:
         id_line = f'decision_id: {item.decision_id}'
+    question = _cap_for_clipboard(item.question or _QUESTION_PLACEHOLDER)
     return '\n'.join(
         [
-            f'question: {item.question or _QUESTION_PLACEHOLDER}',
+            f'question: {question}',
             f'project: {item.project}',
             f'task_id: {item.task_id or _ID_PLACEHOLDER}',
             f'escalation_id: {item.escalation_id or _ID_PLACEHOLDER}',
