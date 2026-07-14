@@ -579,6 +579,35 @@ class TestNoteDeliveredHold:
         assert scheduler._streak_delivered_hold.value('A') == 2
         assert scheduler._streak_delivered_hold.value('B') == 1
 
+    def test_first_call_warns_then_subsequent_calls_log_at_debug(
+        self, scheduler: Scheduler, caplog
+    ):
+        """reviewer_comprehensive amendment: the event fires on EVERY held
+        tick (see test_repeated_calls_increment_streak_and_emit_every_tick
+        above — unaffected by this change), but the WARNING *log* line is
+        bounded to the first tick of a hold episode. Without this, a
+        steady-state hold (a failing check that stays failed until a fix
+        lands on main) would WARNING-log once per tick forever."""
+        import logging
+
+        with caplog.at_level(logging.WARNING, logger='orchestrator.scheduler'):
+            scheduler._note_delivered_hold('T', detail={'name': 'cap-one'})
+            after_first = len(caplog.records)
+            scheduler._note_delivered_hold('T', detail={'name': 'cap-one'})
+            scheduler._note_delivered_hold('T', detail={'name': 'cap-one'})
+
+        assert after_first == 1, (
+            f'expected exactly one WARNING on the first held tick; got '
+            f'{[r.getMessage() for r in caplog.records[:after_first]]!r}'
+        )
+        assert len(caplog.records) == 1, (
+            'subsequent held ticks must NOT log at WARNING (steady-state '
+            f'log spam); got {[r.getMessage() for r in caplog.records]!r}'
+        )
+        # The event, unlike the log, is unaffected — still fires every tick.
+        assert scheduler._streak_delivered_hold.value('T') == 3
+        assert len(self._held_events(scheduler)) == 3
+
 
 # ---------------------------------------------------------------------------
 # TestComputeDeliveredCheckCache (task 2580 — step-13 RED / step-14 GREEN)
@@ -859,6 +888,93 @@ class TestComputeDeliveredCheckCache:
             assert data['data']['detail'] == {
                 'name': 'cap-one', 'dep_id': '20', 'main_sha': 'sha1', 'kind': 'grep',
             }
+
+    # --- (i) cached-False detail replays the check that ACTUALLY failed ----
+
+    @pytest.mark.asyncio
+    async def test_cached_false_detail_names_actual_failed_check_not_first(
+        self, scheduler: Scheduler, monkeypatch
+    ):
+        """reviewer_comprehensive amendment: a dep with TWO checks where the
+        FIRST DELIVERS and the SECOND FAILS must have its cached-False hold
+        detail name the check that actually failed (cap-b) — never the
+        dep's first ``delivered_checks`` entry (cap-a, which passed) — on
+        BOTH the uncached (first) sweep and a cache-hit (second) sweep at
+        the same main SHA. Guards against reconstructing the detail from
+        ``checks[0]``, which would misname a passing check as the failure.
+        """
+        scheduler._resolve_main_sha, _sha_calls = self._fake_sha('sha1')
+        fake_runner, calls = self._fake_runner({
+            'cap-a': DeliveredCheckResult.DELIVERED,
+            'cap-b': DeliveredCheckResult.FAILED,
+        })
+        monkeypatch.setattr('orchestrator.scheduler.run_delivered_check', fake_runner)
+        task = self._dependent()
+        dep = self._dep(checks=self._TWO_CHECKS)  # [cap-a, cap-b] — cap-a is checks[0]
+        status_map = {'20': 'done'}
+        tasks_by_id = {'20': dep, '10': task}
+
+        first = await scheduler._compute_delivered_check_cache([task], status_map, tasks_by_id)
+        second = await scheduler._compute_delivered_check_cache([task], status_map, tasks_by_id)
+
+        assert first == {'20': False}
+        assert second == {'20': False}
+        assert calls == ['cap-a', 'cap-b'], 'both checks ran, but only on the uncached sweep'
+        held = self._held_events(scheduler)
+        assert len(held) == 2
+        expected_detail = {'name': 'cap-b', 'dep_id': '20', 'main_sha': 'sha1', 'kind': 'grep'}
+        for _evt, data in held:
+            assert data['data']['detail'] == expected_detail, (
+                f"must name the check that actually FAILED (cap-b), not checks[0] "
+                f"(cap-a, which passed); got {data['data']['detail']!r}"
+            )
+
+    # --- (j) persistently-ERRORED dep: bounded diagnostic, never backed off -
+
+    @pytest.mark.asyncio
+    async def test_errored_dep_logs_bounded_diagnostic_and_never_backs_off(
+        self, scheduler: Scheduler, monkeypatch, caplog
+    ):
+        """reviewer_comprehensive amendment: a dep whose check stays
+        ERRORED across many consecutive sweeps must not be COMPLETELY
+        silent (liveness) — but the diagnostic WARNING log is bounded (not
+        per-tick), and the runner is NEVER backed off: it must keep
+        re-invoking on every single sweep so a fix landing on main
+        self-heals immediately (row 7 — see
+        ``test_row7_runner_errored_withheld_then_dispatches_once_healthy``
+        in ``TestAcquireNextDeliveredGate``, which relies on exactly this).
+        """
+        import logging
+
+        scheduler._resolve_main_sha, _sha_calls = self._fake_sha('sha1')
+        fake_runner, calls = self._fake_runner({'cap-one': DeliveredCheckResult.ERRORED})
+        monkeypatch.setattr('orchestrator.scheduler.run_delivered_check', fake_runner)
+        task = self._dependent()
+        dep = self._dep()
+        status_map = {'20': 'done'}
+        tasks_by_id = {'20': dep, '10': task}
+
+        with caplog.at_level(logging.WARNING, logger='orchestrator.scheduler'):
+            for _ in range(19):
+                await scheduler._compute_delivered_check_cache([task], status_map, tasks_by_id)
+            assert not caplog.records, (
+                'must not WARNING-log before the bounded threshold is reached; '
+                f'got {[r.getMessage() for r in caplog.records]!r}'
+            )
+            await scheduler._compute_delivered_check_cache([task], status_map, tasks_by_id)
+
+        assert calls == ['cap-one'] * 20, (
+            f'no backoff: the runner must re-invoke on EVERY sweep even past '
+            f'the log threshold; got {len(calls)} invocations'
+        )
+        assert any(r.levelno >= logging.WARNING for r in caplog.records), (
+            f'expected a bounded diagnostic WARNING by the 20th consecutive '
+            f'ERRORED sweep; got records={caplog.records!r}'
+        )
+        # Row 7's dispatch-gate contract is untouched by the diagnostic log:
+        # still no hold event / no _streak_delivered_hold bump for errored.
+        assert self._held_events(scheduler) == []
+        assert scheduler._streak_delivered_hold.value('10') == 0
 
 
 # ---------------------------------------------------------------------------

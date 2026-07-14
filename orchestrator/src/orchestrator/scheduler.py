@@ -62,6 +62,15 @@ _TRANSIENT_BACKOFF_BASE: float = 1.5
 # journald while the per-tick dispatch_deferred event still fires every tick.
 _DISPATCH_DEFERRED_LOG_SECS: float = 180.0
 
+# Delivered-check gate (task 2580, reviewer_comprehensive amendment): bounds
+# the WARNING-level diagnostic log for a dep whose check(s) stay ERRORED
+# (git/script error, malformed descriptor) across many consecutive sweeps.
+# Mirrors _DISPATCH_DEFERRED_LOG_SECS's split above — the *log* line is
+# bounded/rate-limited, never the underlying behavior: the runner still
+# re-evaluates an ERRORED dep on EVERY sweep (no backoff), so a fix landing
+# on main is picked up the very next tick (row 7 self-heal).
+_DELIVERED_CHECK_ERROR_LOG_THRESHOLD: int = 20
+
 # Sentinel distinguishing "caller omitted this claimant kwarg" (default,
 # leave the wire argument absent) from "caller explicitly passed None"
 # (clear) on Scheduler.set_task_claimant (task 2188, PRD
@@ -1381,6 +1390,28 @@ class Scheduler:
         # The main SHA the cache above was last pruned/keyed against. None
         # before the first sweep that finds at least one checked dep.
         self._delivered_check_sha: str | None = None
+        # Parallel to _delivered_check_cache, keyed identically
+        # (dep_task_id, main_sha), but ONLY populated for cached-False
+        # (ran-and-FAILED) entries: the {name, dep_id, main_sha, kind} of
+        # the check that actually failed (reviewer_comprehensive amendment).
+        # A cache-hit on a False entry replays this stored detail instead of
+        # reconstructing from the dep's first delivered_checks entry, which
+        # would misname a later check as the failure when an earlier one in
+        # the same dep passed. Pruned in lockstep with _delivered_check_cache
+        # on SHA advance.
+        self._delivered_check_fail_detail: dict[tuple[str, str], dict] = {}
+        # Per-dep_task_id count of CONSECUTIVE sweeps where at least one of
+        # its checks resolved ERRORED (and none FAILED) — i.e. the dep was
+        # left uncached this sweep (reviewer_comprehensive amendment).
+        # Diagnostic-only: bounds the WARNING log at
+        # _DELIVERED_CHECK_ERROR_LOG_THRESHOLD so a persistently-misconfigured
+        # check (bad regex/path, missing/non-executable script) is
+        # observable in logs even though row 7 deliberately withholds the
+        # delivered_check_gate_held EVENT/streak for errored (that stays a
+        # pure fail-safe wait — no dispatch-gate visibility spam). Popped
+        # once the dep resolves definitively (DELIVERED/FAILED cached) so a
+        # later, unrelated error episode starts its own count from zero.
+        self._delivered_check_error_streak: dict[str, int] = {}
         self._streak_registry = StreakRegistry()
         self._streak_registry.register('external_unresolved', self._streak_external_unresolved)
         self._streak_registry.register('local_backfill', self._streak_local_backfill)
@@ -2349,18 +2380,30 @@ class Scheduler:
         cancelled local dep's ``metadata.delivered_checks`` cache entry is
         cached ``False`` (ran-and-FAILED — never for errored/absent
         withholds, which are a pure fail-safe wait with no visibility
-        spam). Unlike :meth:`_note_external_hold`, this has NO threshold
-        gate: task 2580 (delta) has no ``grace_cycles`` config yet, so
-        every held tick both bumps ``_streak_delivered_hold`` and emits
-        ``EventType.delivered_check_gate_held`` with the running streak
-        count — task 2583 (epsilon) layers threshold-gated escalation on
-        top with its own counter, consuming ``detail`` from this event.
+        spam). Unlike :meth:`_note_external_hold`, the EVENT has NO
+        threshold gate: task 2580 (delta) has no ``grace_cycles`` config
+        yet, so every held tick both bumps ``_streak_delivered_hold`` and
+        emits ``EventType.delivered_check_gate_held`` with the running
+        streak count — task 2583 (epsilon) layers threshold-gated
+        escalation on top with its own counter, consuming ``detail`` from
+        this event.
 
         ``detail`` should name the failed check (name/dep_id/main_sha/kind)
         so epsilon's escalation payload can identify exactly what failed.
+
+        The WARNING *log* line, unlike the event, IS bounded
+        (reviewer_comprehensive amendment): a steady-state hold (a failing
+        check that stays failing until a fix lands on main) would otherwise
+        log one WARNING per tick indefinitely.  Only the first tick of a
+        hold episode (``streak == 1``) logs at WARNING; every subsequent
+        held tick logs the identical message at DEBUG instead — mirrors the
+        module's ``_streak_milestone_malformed`` "warn once" precedent.
+        Durable per-tick visibility (for epsilon and for dashboards) still
+        comes from the event, which is unaffected by this log-level split.
         """
         streak = self._streak_delivered_hold.bump(task_id)
-        logger.warning(
+        log = logger.warning if streak == 1 else logger.debug
+        log(
             'Task %s: delivered-check gate has held dispatch for %d consecutive '
             'ticks (detail=%r)',
             task_id,
@@ -2664,7 +2707,26 @@ class Scheduler:
         ``True`` has its hold streak cleared. A dependent with a dep that's
         absent from the projection this tick (errored / over-budget / not
         yet evaluated) is left untouched — pure fail-safe wait, no
-        visibility spam (mirrors row 7's "no streak bump" semantics).
+        visibility spam (mirrors row 7's "no streak bump" semantics). The
+        identity of the failed check for a cached-False dep is replayed from
+        ``self._delivered_check_fail_detail`` (keyed identically to
+        ``self._delivered_check_cache``) rather than reconstructed, so a
+        multi-check dep's hold detail always names the check that actually
+        failed, not just the dep's first ``delivered_checks`` entry.
+
+        A dep left uncached because at least one check ERRORED (and none
+        FAILED) bumps a separate, diagnostic-only
+        ``self._delivered_check_error_streak[dep_id]`` counter and logs at
+        WARNING once ``_DELIVERED_CHECK_ERROR_LOG_THRESHOLD`` consecutive
+        sweeps are reached (DEBUG below that / after) — reviewer_comprehensive
+        amendment: a persistently-misconfigured check (bad regex/path,
+        missing/non-executable script) would otherwise be silently stuck
+        forever with zero operator-facing signal. This counter/log is
+        SEPARATE from ``_streak_delivered_hold`` /
+        ``delivered_check_gate_held`` — row 7's "no hold event, no streak
+        bump" dispatch-gate contract for errored is unchanged. The runner is
+        NOT backed off while ERRORED: every sweep re-evaluates an uncached
+        dep's checks so a fix landing on main self-heals the very next tick.
 
         Side-effecting (mutates ``self._delivered_check_cache``, bumps/
         clears ``self._streak_delivered_hold``) — like
@@ -2704,35 +2766,40 @@ class Scheduler:
             stale_keys = [k for k in self._delivered_check_cache if k[1] != main_sha]
             for key in stale_keys:
                 del self._delivered_check_cache[key]
+                self._delivered_check_fail_detail.pop(key, None)
             self._delivered_check_sha = main_sha
 
         budget = self.config.delivered_checks.max_checks_per_tick
         used = 0
         projection: dict[str, bool] = {}
-        fail_detail_by_dep: dict[str, dict] = {}
+        # Value is `dict | None`: the cache-hit replay path (below) can find
+        # no persisted detail for a cache entry predating this amendment
+        # (or any other defensive gap) and falls back to None — the
+        # hold-visibility loop and _note_delivered_hold both already accept
+        # detail=None.
+        fail_detail_by_dep: dict[str, dict | None] = {}
 
         for dep_id, dep_task in checked_deps.items():
             cache_key = (dep_id, main_sha)
             if cache_key in self._delivered_check_cache:
                 cached = self._delivered_check_cache[cache_key]
                 projection[dep_id] = cached
+                # Cached (True or False) means this dep resolved definitively
+                # on a prior sweep at this SHA — it can no longer be in the
+                # ERRORED-uncached state, so its diagnostic error streak (if
+                # any, e.g. from an earlier episode before a fix landed) is
+                # stale.
+                self._delivered_check_error_streak.pop(dep_id, None)
                 if cached is False:
                     # Steady state: this dep already FAILED on a prior tick
                     # at this same SHA and was served straight from cache —
-                    # no checks re-ran, so there's no fresh (check, result)
-                    # to name. Reconstruct a best-effort detail from the
-                    # dep's FIRST delivered_checks entry (matching the
-                    # uncached-FAILED branch's shape below) so the hold
-                    # event stays meaningful on every held tick, not just
-                    # the first.
-                    checks = (dep_task.get('metadata') or {}).get('delivered_checks') or []
-                    first_check = checks[0] if checks else {}
-                    fail_detail_by_dep[dep_id] = {
-                        'name': first_check.get('name'),
-                        'dep_id': dep_id,
-                        'main_sha': main_sha,
-                        'kind': first_check.get('kind'),
-                    }
+                    # no checks re-ran this sweep. Replay the check that
+                    # actually failed from the persisted parallel cache
+                    # (stored alongside the uncached-FAILED branch below)
+                    # rather than reconstructing from the dep's first
+                    # delivered_checks entry, which would misname a LATER
+                    # check as the failure when an earlier one passed.
+                    fail_detail_by_dep[dep_id] = self._delivered_check_fail_detail.get(cache_key)
                 continue
 
             checks = (dep_task.get('metadata') or {}).get('delivered_checks') or []
@@ -2759,6 +2826,7 @@ class Scheduler:
             if all(r is DeliveredCheckResult.DELIVERED for _c, r in results):
                 self._delivered_check_cache[cache_key] = True
                 projection[dep_id] = True
+                self._delivered_check_error_streak.pop(dep_id, None)
                 continue
 
             failed = next(
@@ -2768,14 +2836,45 @@ class Scheduler:
                 failed_check, _r = failed
                 self._delivered_check_cache[cache_key] = False
                 projection[dep_id] = False
-                fail_detail_by_dep[dep_id] = {
+                detail = {
                     'name': failed_check.get('name'),
                     'dep_id': dep_id,
                     'main_sha': main_sha,
                     'kind': failed_check.get('kind'),
                 }
+                fail_detail_by_dep[dep_id] = detail
+                # Persist alongside the bool so a later cache-hit sweep can
+                # replay the check that actually failed (see the cache-hit
+                # branch above) instead of guessing.
+                self._delivered_check_fail_detail[cache_key] = detail
+                self._delivered_check_error_streak.pop(dep_id, None)
+                continue
+
             # else: at least one ERRORED and none FAILED — leave uncached
-            # (fail-safe wait; every check for this dep retries next tick).
+            # (fail-safe wait; every check for this dep retries next tick;
+            # no backoff — see the module docstring note above). NOT a
+            # _note_delivered_hold / _streak_delivered_hold event (row 7's
+            # dispatch-gate contract), but bump a separate diagnostic-only
+            # streak so a PERSISTENTLY errored check (as opposed to a
+            # transient git/script blip) still surfaces in the logs.
+            error_streak = self._delivered_check_error_streak.get(dep_id, 0) + 1
+            self._delivered_check_error_streak[dep_id] = error_streak
+            errored_names = [
+                c.get('name') for c, r in results if r is DeliveredCheckResult.ERRORED
+            ]
+            error_log = (
+                logger.warning
+                if error_streak == _DELIVERED_CHECK_ERROR_LOG_THRESHOLD
+                else logger.debug
+            )
+            error_log(
+                'Delivered-check dep %s: at least one check has ERRORED for '
+                '%d consecutive sweep(s) (checks=%r) — left uncached '
+                '(fail-safe wait; no dispatch-gate event/streak per row 7). '
+                'This may indicate a misconfigured check (bad regex/path, '
+                'or a missing/non-executable script).',
+                dep_id, error_streak, errored_names,
+            )
 
         # Hold-visibility: per dependent, decided from THIS tick's projection.
         for task_id, dep_ids in deps_by_dependent.items():
