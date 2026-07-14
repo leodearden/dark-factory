@@ -176,6 +176,51 @@ class TestDeterministicDeployHealthVerdict:
         baseline = {'active_enter_timestamp_monotonic': 100, 'main_pid': 999}
         assert _deterministic_deploy_health_verdict(result, verify_baseline=baseline) == 'unconfirmed'
 
+    # --- task 2611 (esc-2584-1): empty-baseline (install-fresh oneshot/timer)
+    # freshness — a .timer unit / Type=oneshot service never reports a live
+    # MainPID, even once genuinely active, so an EMPTY baseline (main_pid=0)
+    # must not be gated by the unconditional pid>0 check above. -------------
+
+    def test_healthy_with_empty_baseline_when_monotonic_advanced(self) -> None:
+        result = {
+            'MainPID': 0, 'ActiveState': 'active',
+            'ActiveEnterTimestampMonotonic': 500,
+        }
+        baseline = {'active_enter_timestamp_monotonic': 0, 'main_pid': 0}
+        assert _deterministic_deploy_health_verdict(result, verify_baseline=baseline) == 'healthy'
+
+    def test_healthy_with_empty_baseline_accepts_verifybaseline_instance(self) -> None:
+        """VerifyBaseline-instance variant of the mapping case above — locks
+        both the mapping and the dataclass main_pid-reading paths."""
+        result = {
+            'MainPID': 0, 'ActiveState': 'active',
+            'ActiveEnterTimestampMonotonic': 500,
+        }
+        baseline = VerifyBaseline(active_enter_timestamp_monotonic=0, main_pid=0)
+        assert _deterministic_deploy_health_verdict(result, verify_baseline=baseline) == 'healthy'
+
+    def test_unconfirmed_with_empty_baseline_when_activated_then_failed(self) -> None:
+        """An activated-then-FAILED oneshot (monotonic advanced, but
+        ActiveState ended up 'failed') must not be reported healthy —
+        the only new hole the empty-baseline branch must close."""
+        result = {
+            'MainPID': 0, 'ActiveState': 'failed',
+            'ActiveEnterTimestampMonotonic': 500,
+        }
+        baseline = {'active_enter_timestamp_monotonic': 0, 'main_pid': 0}
+        assert _deterministic_deploy_health_verdict(result, verify_baseline=baseline) == 'unconfirmed'
+
+    def test_unconfirmed_with_empty_baseline_when_no_activation(self) -> None:
+        """No activation at all (monotonic unchanged from the empty
+        baseline) must still be unconfirmed — an empty baseline is not a
+        free pass."""
+        result = {
+            'MainPID': 0, 'ActiveState': 'inactive',
+            'ActiveEnterTimestampMonotonic': 0,
+        }
+        baseline = {'active_enter_timestamp_monotonic': 0, 'main_pid': 0}
+        assert _deterministic_deploy_health_verdict(result, verify_baseline=baseline) == 'unconfirmed'
+
     def test_no_baseline_preserves_liveness_only_verdict(self) -> None:
         """verify_baseline=None (explicit) is identical to omitting it — the
         exact pre-existing liveness-only branch (backward compat)."""
