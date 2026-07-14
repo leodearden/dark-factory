@@ -276,3 +276,60 @@ class TestRun:
         assert dark_factory['taggable'] == 1
         assert dark_factory['tagged'] == 0
         assert dark_factory['skipped'] == 2
+
+    @pytest.mark.asyncio
+    async def test_apply_updates_only_taggable_record_with_preserved_metadata(self):
+        """--apply calls memory.mem0.update exactly once -- for the single
+        'tag' record in the fixture -- passing (id, tagged_content, scope)
+        positionally and the record's FULL original metadata payload as the
+        metadata= kwarg, so provenance (src_project/kind/...) survives
+        mem0's payload-overwriting _update_memory. The 'skip:already_tagged'
+        and 'skip:no_src_project' fixture records must trigger no update at
+        all -- proven here by the single-call assertion covering the whole
+        fixture, not just the taggable record."""
+        records = self._fixture_records()
+        memory = self._make_memory(records)
+        args = self._args(apply=True, project_id='dark_factory', scan_limit=10000)
+
+        report = await _mod.run(args, memory=memory, known_projects_map=self._known_map())
+
+        memory.mem0.update.assert_awaited_once()
+        call = memory.mem0.update.call_args
+        assert call.args[0] == 'm-taggable'
+        assert call.args[1] == (
+            '[reify:task 948] Stage 2 should re-escalate task 948 after remediation.'
+        )
+        assert call.args[2].project_id == 'dark_factory'
+
+        taggable_record = next(r for r in records if r['id'] == 'm-taggable')
+        assert call.kwargs.get('metadata') == taggable_record['metadata']
+        assert call.kwargs['metadata']['src_project'] == 'reify'
+        assert call.kwargs['metadata']['kind'] == _mod.CGL_ETA_REHOME_KIND
+
+        assert report['dry_run'] is False
+        tag_change = next(c for c in report['changes'] if c['id'] == 'm-taggable')
+        assert tag_change['applied'] is True
+        assert report['projects']['dark_factory']['tagged'] == 1
+
+    @pytest.mark.asyncio
+    async def test_apply_is_idempotent_on_rerun(self):
+        """Feeding scroll_by_metadata records whose data already carries the
+        scope tag (as if --apply had just run) back into run() with
+        apply=True again must result in ZERO update calls -- the tag is
+        already present, so classify_rehome_record marks every record
+        skip:already_tagged and the apply loop has nothing to do."""
+        already_tagged_records = [
+            _rehome_record(
+                'm-taggable',
+                data='[reify:task 948] Stage 2 should re-escalate task 948 after remediation.',
+            ),
+        ]
+        memory = self._make_memory(already_tagged_records)
+        args = self._args(apply=True, project_id='dark_factory', scan_limit=10000)
+
+        report = await _mod.run(args, memory=memory, known_projects_map=self._known_map())
+
+        memory.mem0.update.assert_not_awaited()
+        assert report['dry_run'] is False
+        assert report['totals']['taggable'] == 0
+        assert report['totals']['tagged'] == 0
