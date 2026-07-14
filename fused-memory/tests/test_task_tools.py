@@ -2333,3 +2333,95 @@ async def test_commit_planning_stamps_manifest_and_copies_delivered_checks(
     reloaded = yaml.safe_load(sidecar_path.read_text(encoding='utf-8'))
     by_label = {t['label']: t['task_id'] for t in reloaded['tasks']}
     assert by_label == {'alpha': int(alpha_id), 'beta': int(beta_id)}
+
+
+@pytest.mark.asyncio
+async def test_commit_planning_legacy_response_byte_identical_without_prd_metadata(
+    mcp_server_with_tasks, task_interceptor,
+):
+    """Boundary row 2: a pending commit whose tasks carry no prd_path/
+    prd_task_label metadata (no capability-manifest involvement at all)
+    leaves the response byte-identical to legacy — no manifest_stamping
+    key — while set_task_status still runs normally."""
+    task_interceptor.get_task = AsyncMock(
+        return_value={'id': '7', 'metadata': {'files': ['src/main.py']}},
+    )
+    task_interceptor.set_task_status = AsyncMock(
+        return_value={'success': True, 'results': []},
+    )
+
+    result = await mcp_server_with_tasks._tool_manager.call_tool(
+        'commit_planning',
+        {'project_root': '/project', 'task_ids': '7'},
+    )
+
+    assert result == {'success': True, 'results': []}
+    assert 'manifest_stamping' not in result
+    task_interceptor.set_task_status.assert_called_once()
+
+
+@pytest.mark.asyncio
+async def test_commit_planning_malformed_sidecar_flip_proceeds_fail_soft(
+    real_task_stack, tmp_path,
+):
+    """Boundary row 9: a malformed capability-manifest sidecar (fails the
+    shared α-loader's validation — here a grep check missing `expect`)
+    never strands the commit_planning status flip. The flip PROCEEDS to
+    pending, the manifest_stamping report carries a non-empty errors list,
+    and no metadata.delivered_checks is written."""
+    plans_dir = tmp_path / 'plans'
+    plans_dir.mkdir()
+    sidecar_path = plans_dir / 'bad-prd.capability-manifest.yaml'
+    sidecar_path.write_text(
+        """\
+prd: plans/bad-prd.md
+schema_version: 1
+tasks:
+  - label: gamma
+    task_id: null
+    title: Broken task
+    capabilities:
+      - name: broken_check
+        binding: 'grep for something'
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: 'something'
+""",
+        encoding='utf-8',
+    )
+
+    server, _interceptor = real_task_stack
+    root = str(tmp_path)
+
+    submit_gamma = await server._tool_manager.call_tool(
+        'submit_task',
+        {
+            'project_root': root,
+            'title': 'Producer gamma',
+            'planning_mode': True,
+            'metadata': {
+                'files': ['src/gamma.py'],
+                'prd_path': 'plans/bad-prd.md',
+                'prd_task_label': 'gamma',
+            },
+        },
+    )
+    assert submit_gamma['status'] == 'deferred', f'got {submit_gamma!r}'
+    gamma_id = submit_gamma['task_id']
+
+    result = await server._tool_manager.call_tool(
+        'commit_planning',
+        {'project_root': root, 'task_ids': gamma_id},
+    )
+
+    assert result['manifest_stamping']['path'] == 'plans/bad-prd.capability-manifest.yaml'
+    assert result['manifest_stamping']['stamped'] == []
+    assert len(result['manifest_stamping']['errors']) == 1
+
+    gamma_task = await server._tool_manager.call_tool(
+        'get_task', {'id': gamma_id, 'project_root': root},
+    )
+    # The flip PROCEEDED despite the malformed sidecar.
+    assert gamma_task['status'] == 'pending'
+    assert 'delivered_checks' not in gamma_task['metadata']
