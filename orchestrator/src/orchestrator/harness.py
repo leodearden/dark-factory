@@ -3541,6 +3541,18 @@ Output JSON matching the schema. Every task must appear in the output.
             await self._mark_in_progress_done(tid, report.branch_state.sha, note, reason)
             return 'marked_done'
 
+        # Ground-truth revert decision (task 2243, W10-θ2): the _RECOVERY
+        # table maps a stranded in-progress task with no live claimant and no
+        # on-main landing evidence (branch EXISTS_OFF_MAIN or GONE_NO_MARKER)
+        # straight to REVERT_TO_PENDING — retiring the inline branch-state
+        # derivation this dispatch used to require. The applier itself still
+        # owns the actual plan.lock/worktree liveness classification (kept
+        # per the design decision — see _revert_in_progress_if_no_live_claimant).
+        if action == RecoveryAction.REVERT_TO_PENDING:
+            return await self._revert_in_progress_if_no_live_claimant(
+                tid, mid_run=mid_run, metadata=metadata, status=status,
+            )
+
         # No on-main evidence.  For 'blocked' tasks, leave the row alone —
         # blocked is a deliberate state and we only flip it to done on
         # observed evidence.
