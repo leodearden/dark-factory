@@ -179,6 +179,10 @@ function TaskGraph({ tasks, selectedId, onSelect }) {
         <div key={bi} className="component-block">
           {block.map((row, ri) => (
             <div key={ri} className="row">
+              {/* Defensive fallback only: orderRows buckets every component member into
+                  tiers 0..maxTier with no gaps (tier = 1 + max(in-component deps' tier)),
+                  so a row shouldn't be empty here in practice. Kept in case that
+                  invariant is ever violated by a future graph_layout.js change. */}
               {row.length === 0 ? <div className="empty-tier">—</div> : row.map(renderNode)}
             </div>
           ))}

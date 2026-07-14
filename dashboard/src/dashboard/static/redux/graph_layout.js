@@ -11,19 +11,14 @@
 // Both export paths are guarded so this file has no effect outside the
 // environment it's actually running in.
 //
-// Staging note: this module is intentionally NOT wired into TaskGraph yet.
-// tab_tasks.jsx still uses its own inline computeTiers (tab_tasks.jsx:19-38)
-// and inline within-tier status sort (tab_tasks.jsx:137) — duplicated here
-// on purpose, see the computeTiers/STATUS_ORDER comments below — and no
-// `<script src="/static/redux/graph_layout.js">` tag has been added to
-// index.html. A follow-up task owns switching TaskGraph over to
-// window.DF_GRAPH_LAYOUT (computeTiers/partitionComponents/orderRows) and
-// deleting the inline duplicates once it does; until then, this module's
-// only consumer is its own node --test suite.
+// This is the live layout source for TaskGraph: index.html loads this file
+// (classic script, before the Babel JSX tags) so `window.DF_GRAPH_LAYOUT` is
+// defined before tab_tasks.jsx executes its top-level
+// `const { computeTiers, partitionComponents, orderRows } = window.DF_GRAPH_LAYOUT;`
+// destructure. tab_tasks.jsx has no inline copy of any of these functions —
+// this module is their sole implementation.
 
 // ── Compute dep tiers for a task list (Kahn's algorithm style; tier = max(deps' tier)+1) ──
-// Verbatim copy of tab_tasks.jsx:19-38 (TaskGraph's computeTiers). Kept in
-// sync intentionally by duplication — see graph_layout.js module header.
 function computeTiers(tasks) {
   const byId = new Map(tasks.map(t => [t.id, t]));
   const tiers = new Map(); // id -> tier
@@ -107,7 +102,7 @@ function partitionComponents(tasks) {
 }
 
 // Status-priority order for orderRows' initial per-tier permutation (module
-// constant, copied from tab_tasks.jsx:137's current within-tier sort).
+// constant; the sole implementation of TaskGraph's within-tier status sort).
 const STATUS_ORDER = {
   blocked: 0,
   'in-progress': 1,
