@@ -55,6 +55,8 @@ from enum import Enum
 from pathlib import Path
 from typing import Any, Literal, NamedTuple, TypedDict
 
+from shared.branch_names import canonical_queued_branch_name  # noqa: F401
+
 from orchestrator.artifacts import TaskArtifacts
 from orchestrator.config import TASK_META_DIRNAME, GitConfig
 from orchestrator.lane_lifecycle import (
@@ -867,25 +869,6 @@ def _merge_subject(branch: str, main_branch: str) -> str:
     use the new format.
     """
     return f'Merge {branch} into {main_branch}'
-
-
-def canonical_queued_branch_name(branch: str, branch_prefix: str) -> str:
-    """Return *branch* with *branch_prefix* prepended, unless already present.
-
-    Shared pure-string shape-normalizer: "prepend ``branch_prefix`` unless
-    ``branch`` already starts with it".  This is the deterministic-NAME
-    sibling of :meth:`GitOps.resolve_queued_branch_ref` — that method does
-    git I/O and returns ``None`` when no ref resolves, which is unusable at
-    call sites that need a full-ref name even when the ref is absent (e.g. a
-    drop-log message, or a marker search over a deleted branch).  Use this
-    helper there instead.
-
-    Single source of truth consumed by ``recover_pending_merges``
-    (merge_queue_store.py) and merge_status's git-authority tier
-    (escalation/server.py) so the "is this branch name already prefixed?"
-    rule is not duplicated with divergent fidelity across sites.
-    """
-    return branch if branch.startswith(branch_prefix) else f'{branch_prefix}{branch}'
 
 
 # Sentinel range used to represent files that are fully deleted or renamed.

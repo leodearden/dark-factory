@@ -20,7 +20,9 @@ from enum import StrEnum
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Literal, TypeAlias, assert_never
 
-from orchestrator.git_ops import MergeResult, canonical_queued_branch_name
+from shared.branch_names import canonical_queued_branch_name
+
+from orchestrator.git_ops import MergeResult
 from orchestrator.merge_disposition import MergeFailureDisposition
 from orchestrator.verify import VerifyResult
 
@@ -161,6 +163,8 @@ class TerminalOutcomeRecord:
     """request_id of the gen-(n+1) request that supersedes this one (α1/γ2 provenance)."""
     generation: int = field(default=1, kw_only=True)
     """Generation of the merge request that produced this record (γ2 provenance)."""
+    reason: str | None = field(default=None, kw_only=True)
+    """MergeOutcome.reason for failure outcomes (empty string normalized to None)."""
 
 
 class TerminalOutcomeRetention:
@@ -618,7 +622,7 @@ class QueuedBranch:
     (parse-don't-validate, ``plans/merge-queue-reliability-prd.md`` DD7) —
     construct instances through it rather than the dataclass constructor
     directly. It delegates the actual prefix-prepend rule to
-    :func:`orchestrator.git_ops.canonical_queued_branch_name`, the existing
+    :func:`shared.branch_names.canonical_queued_branch_name`, the existing
     single source of truth for that rule, so the two never diverge. Git
     refs should always be built from ``.full_name``; task/branch
     bookkeeping keys should use ``.bare_id``.
@@ -691,7 +695,7 @@ class QueuedBranch:
         *raw* may arrive bare (``'4778'``) or already prefixed
         (``'task/4778'``); both parse to the same value. ``full_name`` is
         computed by delegating to
-        :func:`orchestrator.git_ops.canonical_queued_branch_name` — the
+        :func:`shared.branch_names.canonical_queued_branch_name` — the
         existing single source of truth for the prepend-unless-present rule
         — rather than reimplementing it here; ``bare_id`` is then stripped
         from it the same way the ``merge_queue_store.py`` journal

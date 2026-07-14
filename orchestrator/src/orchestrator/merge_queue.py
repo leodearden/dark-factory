@@ -2677,6 +2677,7 @@ async def enqueue_merge_request(
     def _on_finalized(fut: asyncio.Future) -> None:  # noqa: ANN001
         # --- derive terminal state -------------------------------------------
         superseded_by: str | None = None
+        reason: str | None = None
         try:
             if fut.cancelled():
                 state: str = 'abandoned'
@@ -2689,6 +2690,7 @@ async def enqueue_merge_request(
                 state = outcome.status
                 merge_sha = outcome.merge_sha
                 superseded_by = outcome.superseded_by
+                reason = outcome.reason or None
         except Exception:  # noqa: BLE001
             logger.warning(
                 'enqueue_merge_request: _on_finalized could not derive terminal '
@@ -2709,6 +2711,7 @@ async def enqueue_merge_request(
                     merge_sha=merge_sha,
                     superseded_by=superseded_by,
                     generation=req.generation,
+                    reason=reason,
                 ))
             except Exception:  # noqa: BLE001
                 logger.warning(
@@ -2731,6 +2734,7 @@ async def enqueue_merge_request(
                         'merge_sha': merge_sha,
                         'superseded_by': superseded_by,
                         'generation': req.generation,
+                        'reason': reason,
                     },
                 )
             except Exception:  # noqa: BLE001

@@ -2130,6 +2130,77 @@ class TestMergeRequestDedup:
         # Cleanup
         never_future.cancel()
 
+    async def test_already_merged_fast_path_dedups_prefixed_branch(
+        self, tmp_path: Path
+    ) -> None:
+        """merge_request already_merged fast-path resolves the SAME ref for a
+        bare and a pre-prefixed branch — regression guard for the
+        double-prefix bug (PRD I4 fast-path used to build the full ref via a
+        raw f-string concat with no startswith guard, so an already-prefixed
+        branch like 'task/123' became 'task/task/123' and missed the
+        git_ops lookup, falling through to a normal enqueue instead of the
+        already_merged short-circuit).
+        """
+        from unittest.mock import AsyncMock
+
+        tip = 't' * 40
+        resolve_branch_sha = AsyncMock(
+            side_effect=lambda b: tip if b == 'task/123' else None
+        )
+        is_ancestor = AsyncMock(return_value=True)
+        stub_git = types.SimpleNamespace(
+            resolve_branch_sha=resolve_branch_sha,
+            is_ancestor=is_ancestor,
+            # Only exercised today (RED) when the double-prefix bug causes the
+            # pre-prefixed call to miss the fast-path and fall through to the
+            # coalesce/enqueue disk-scan; stubbed so that fallthrough resolves
+            # cleanly to 'queued' (a clean assertion mismatch) instead of an
+            # unrelated AttributeError.
+            find_inflight_merge_worktree=AsyncMock(return_value=None),
+        )
+        stub_harness = types.SimpleNamespace(
+            git_ops=stub_git, _merge_worker=None, _terminal_retention=None
+        )
+        esc_queue = EscalationQueue(tmp_path / 'esc')
+        orch_config = self._make_orch_config(tmp_path / 'repo')
+
+        server = create_server(
+            esc_queue,
+            harness=stub_harness,
+            orch_config=orch_config,
+            merge_queue=asyncio.Queue(),
+        )
+
+        bare_result = await _call_merge_request(
+            server,
+            task_id='123',
+            branch='123',
+            worktree=str(tmp_path / 'wt-bare'),
+            description='',
+        )
+        prefixed_result = await _call_merge_request(
+            server,
+            task_id='123',
+            branch='task/123',
+            worktree=str(tmp_path / 'wt-prefixed'),
+            description='',
+        )
+
+        assert bare_result.get('status') == 'already_merged', (
+            f'Expected status already_merged for bare branch, got: {bare_result}'
+        )
+        assert bare_result.get('commit') == tip
+        assert prefixed_result.get('status') == 'already_merged', (
+            f'Expected status already_merged for pre-prefixed branch, got: {prefixed_result}'
+        )
+        assert prefixed_result.get('commit') == tip
+
+        called_with = [call.args[0] for call in resolve_branch_sha.call_args_list]
+        assert called_with == ['task/123', 'task/123'], (
+            "Expected both calls to resolve the same ref 'task/123' "
+            f"(never a double-prefixed 'task/task/123'), got: {called_with}"
+        )
+
 
 # ---------------------------------------------------------------------------
 # TestGetMergeQueue — live merge-queue snapshot via get_merge_queue MCP tool
@@ -3562,6 +3633,81 @@ class TestMergeStatus:
 
         assert result.get('state') == 'conflict', (
             f'Expected conflict from event-store fallback, got: {result}'
+        )
+
+    # ── step-7 (2554): failure reason surfaces through both durable tiers ────
+
+    async def test_reason_surfaces_through_both_durable_tiers(
+        self, tmp_path: Path,
+    ) -> None:
+        """A terminal 'blocked' outcome's failure reason surfaces via merge_status.
+
+        (i) Ring survivor: a TerminalOutcomeRecord carrying reason= is served
+            directly from the retention ring (Tier 2).
+        (ii) Post-restart event-store: an empty ring + a merge_finalized event
+            carrying reason= in its data dict is served from the event-store
+            tier (Tier 3) — simulating a restart that dropped the ring.
+
+        RED: _OPTIONAL_TERMINAL_META_FIELDS omits 'reason' and the durable
+        resp builder has no reason plumbing, so resp['reason'] is absent in
+        both cases (the event-store tier additionally relies on step-6's
+        latest_merge_finalized row already carrying 'reason').
+        """
+        REASON = 'verify failed: gui_tsc'
+
+        # (i) Ring survivor
+        ring = TerminalOutcomeRetention()
+        ring.record(TerminalOutcomeRecord(
+            request_id='mr-reason-ring',
+            task_id='r1',
+            branch='r1',
+            state='blocked',
+            reason=REASON,
+        ))
+        esc_queue = EscalationQueue(tmp_path / 'esc')
+        stub_harness = types.SimpleNamespace(_merge_worker=None, _terminal_retention=ring)
+        server = create_server(esc_queue, harness=stub_harness)
+
+        result_ring = await _call_merge_status(server, request_id='mr-reason-ring')
+
+        assert result_ring.get('state') == 'blocked', (
+            f'Expected state=blocked from ring, got: {result_ring}'
+        )
+        assert result_ring.get('outcome') == 'blocked', (
+            f'Expected outcome=blocked from ring, got: {result_ring}'
+        )
+        assert result_ring.get('reason') == REASON, (
+            f'Expected reason={REASON!r} surfaced from ring tier, got: {result_ring}'
+        )
+
+        # (ii) Post-restart event-store: empty ring, same reason via event data.
+        event_store = EventStore(tmp_path / 'runs.db', 'run-reason-ev')
+        event_store.emit(
+            EventType.merge_finalized,
+            task_id='r2',
+            data={
+                'request_id': 'mr-reason-ev',
+                'branch': 'r2',
+                'state': 'blocked',
+                'reason': REASON,
+            },
+        )
+        empty_ring = TerminalOutcomeRetention()
+        esc_queue2 = EscalationQueue(tmp_path / 'esc2')
+        stub_harness2 = types.SimpleNamespace(
+            _merge_worker=None, _terminal_retention=empty_ring
+        )
+        server2 = create_server(
+            esc_queue2, harness=stub_harness2, event_store=event_store
+        )
+
+        result_ev = await _call_merge_status(server2, request_id='mr-reason-ev')
+
+        assert result_ev.get('state') == 'blocked', (
+            f'Expected state=blocked from event store, got: {result_ev}'
+        )
+        assert result_ev.get('reason') == REASON, (
+            f'Expected reason={REASON!r} surfaced from event-store tier, got: {result_ev}'
         )
 
     # ── step-9 (1749): ring tier branch/task_id/alias lookup ─────────────────
