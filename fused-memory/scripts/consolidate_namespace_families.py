@@ -374,36 +374,56 @@ async def merge_graph_family(
     recreating it exactly once. If the call raises, its ``exc.partial_result``
     (always attached by ``recreate_subgraph_relationships`` -- see that
     function's docstring) is recovered so a partial tally is never discarded
-    in favor of an all-zero default.
+    in favor of an all-zero default. A raise ALSO records the exception in
+    ``phase_b_error``, which Phase C below checks FIRST, before any per-uuid
+    reasoning: a SYSTEMIC failure (a per-spec gather ``ro_query``, or a lost
+    falkor-client acquisition mid-batch -- the two failure modes
+    ``recreate_subgraph_relationships`` documents as raising rather than
+    isolating onto ``blocked``) means the recovered ``partial_result.blocked``
+    names only the items that failed in ISOLATION before the abort -- it says
+    nothing about the specs the batch never reached, whose edges/mentions now
+    exist ONLY in source. Treating that recovered partial as a definitive
+    per-uuid block-list would therefore delete sources the batch never
+    actually confirmed recreating; ``phase_b_error`` instead withholds the
+    WHOLE batch unconditionally (see Phase C).
 
     Phase C: DETACH DELETE every entity's (``delete_source_node``) and every
-    episode's (``delete_source_episode``) source copy -- WITHHELD for any
-    uuid that failed Phase A, or named in Phase B's
+    episode's (``delete_source_episode``) source copy. When Phase B raised a
+    SYSTEMIC error (``phase_b_error is not None``), EVERY entity and episode
+    in the batch is withheld UNCONDITIONALLY -- see the Phase B paragraph
+    above for why a recovered ``partial_result.blocked`` cannot be trusted as
+    a definitive per-uuid list in that case. Otherwise, a source is withheld
+    for any uuid that failed Phase A, or named in Phase B's
     ``SubgraphEdgeResult.blocked`` (an entity via ``node_uuids``, which are
     always entity uuids even for a blocked MENTIONS item -- see that
     dataclass's docstring). BOTH an episode's AND an entity's deletion is
     ADDITIONALLY withheld whenever ANY MENTIONS link incident to it was not
-    confirmed recreated, closing three create-before-delete gaps the base
-    entity/episode Phase-A-failure guarantee does not cover by itself:
-    (1) a Phase-B blocked mention names its episode via the blocked item's
+    confirmed recreated, closing three more create-before-delete gaps the
+    base entity/episode Phase-A-failure guarantee (and the ``phase_b_error``
+    whole-batch gate above) do not cover by themselves: (1) a Phase-B
+    blocked mention names its episode via the blocked item's
     ``episode_uuid`` key; (2) an entity whose Phase-A create FAILED is
     dropped from Phase B's batch entirely, so a mention ONTO it is never
     even read/recreated there -- caught by a guarded sibling
     MENTIONS-topology probe (``MATCH (ep:Episodic)-[:MENTIONS]->(n:Entity
     {uuid: $uuid})``, run only when there are both episodes to withhold and
-    Phase-A entity failures to check); and (3) the mirror image (reviewer
-    follow-up) -- an episode whose Phase-A create FAILED correctly stays
-    behind in sibling (withheld via ``episode_create_failed``), but any
-    entity it MENTIONS is unaffected by THAT failure: the entity's OWN
-    Phase-A create succeeded, so Phase B's MENTIONS CREATE still runs,
-    MATCHes the never-created-in-target episode, finds nothing, and
-    silently counts the link in ``mentions_skipped`` (a WARNING+skip, not a
-    raise, so it never reaches ``blocked`` either) -- caught by the
-    reverse-direction guarded probe (``MATCH (ep:Episodic {uuid:
-    $uuid})-[:MENTIONS]->(n:Entity) RETURN n.uuid``, run only when there are
-    both entities to withhold and Phase-A episode failures to check). In
-    every case, deleting a source whose edge/mention was never successfully
-    recreated elsewhere would destroy the only remaining copy.
+    Phase-A entity failures to check, AND Phase B did not itself abort
+    systemically -- every source is already withheld in that case, and
+    issuing more reads against a backend that just failed systemically is
+    pointless/risky); and (3) the mirror image (reviewer follow-up) -- an
+    episode whose Phase-A create FAILED correctly stays behind in sibling
+    (withheld via ``episode_create_failed``), but any entity it MENTIONS is
+    unaffected by THAT failure: the entity's OWN Phase-A create succeeded,
+    so Phase B's MENTIONS CREATE still runs, MATCHes the
+    never-created-in-target episode, finds nothing, and silently counts the
+    link in ``mentions_skipped`` (a WARNING+skip, not a raise, so it never
+    reaches ``blocked`` either) -- caught by the reverse-direction guarded
+    probe (``MATCH (ep:Episodic {uuid: $uuid})-[:MENTIONS]->(n:Entity)
+    RETURN n.uuid``, run only when there are both entities to withhold and
+    Phase-A episode failures to check, likewise short-circuited on a
+    systemic Phase-B abort). In every case, deleting a source whose
+    edge/mention was never successfully recreated elsewhere would destroy
+    the only remaining copy.
 
     Returns:
         A summary dict: ``nodes_moved``, ``episodes_moved``,
@@ -443,10 +463,12 @@ async def merge_graph_family(
         for row in entity_rows if row['uuid'] not in create_failed
     ]
     edge_result = SubgraphEdgeResult()
+    phase_b_error: Exception | None = None
     if entity_specs:
         try:
             edge_result = await recreate_subgraph_relationships(graphiti, entity_specs)
         except Exception as exc:
+            phase_b_error = exc
             partial_result = getattr(exc, 'partial_result', None)
             if partial_result is not None:
                 edge_result = partial_result
@@ -489,7 +511,7 @@ async def merge_graph_family(
     # when there is both an episode that COULD be withheld and a Phase-A
     # entity failure to check MENTIONS against, so the common (no episodes,
     # or no Phase-A failures) path issues no extra read.
-    if episode_rows and create_failed:
+    if phase_b_error is None and episode_rows and create_failed:
         for failed_uuid in create_failed:
             topology_result = await graphiti._graph_for(sibling).ro_query(
                 'MATCH (ep:Episodic)-[:MENTIONS]->(n:Entity {uuid: $uuid}) RETURN ep.uuid',
@@ -513,7 +535,7 @@ async def merge_graph_family(
     # an entity that COULD be withheld and a Phase-A episode failure to
     # check MENTIONS against, so the common (no entities, or no Phase-A
     # episode failures) path issues no extra read.
-    if entity_rows and episode_create_failed:
+    if phase_b_error is None and entity_rows and episode_create_failed:
         for failed_episode_uuid in episode_create_failed:
             topology_result = await graphiti._graph_for(sibling).ro_query(
                 'MATCH (ep:Episodic {uuid: $uuid})-[:MENTIONS]->(n:Entity) RETURN n.uuid',
@@ -527,7 +549,7 @@ async def merge_graph_family(
     nodes_blocked = 0
     for row in entity_rows:
         uuid = row['uuid']
-        if uuid in create_failed or uuid in blocked_node_uuids:
+        if phase_b_error is not None or uuid in create_failed or uuid in blocked_node_uuids:
             nodes_blocked += 1
             continue
         await delete_source_node(graphiti, uuid, sibling)
@@ -537,7 +559,11 @@ async def merge_graph_family(
     episodes_blocked = 0
     for row in episode_rows:
         uuid = row['uuid']
-        if uuid in episode_create_failed or uuid in blocked_episode_uuids:
+        if (
+            phase_b_error is not None
+            or uuid in episode_create_failed
+            or uuid in blocked_episode_uuids
+        ):
             episodes_blocked += 1
             continue
         await delete_source_episode(graphiti, uuid, sibling)
