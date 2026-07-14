@@ -559,7 +559,14 @@ class TestClusterActionsB4B5:
                 None,
             )
         )
-        harness.scheduler.get_task = AsyncMock(return_value=None)
+        # task 2243, W10-θ2: recovery_for's db_status is sourced from
+        # get_task() (TaskGroundTruth.derive_truth), independently of the
+        # status get_statuses() reports to the sweep loop. All three tids
+        # here are 'blocked', so get_task must reflect that — a bare None
+        # (pre-migration "don't care" stub) makes db_status='' and the
+        # RE_FILE_ESCALATION table row (g) never match, silently defaulting
+        # every task here to LEAVE and starving the ctrl_id positive control.
+        harness.scheduler.get_task = AsyncMock(return_value={'status': 'blocked', 'metadata': {}})
 
         for _ in range(2):
             harness.scheduler.set_task_status = AsyncMock()
@@ -622,7 +629,13 @@ class TestClusterActionsB4B5:
         harness.git_ops.find_merge_marker = AsyncMock(return_value=None)
         harness.scheduler._dispatched = set()
         harness.scheduler.lock_table = mock_lock_table()
-        harness.scheduler.get_task = AsyncMock(return_value=None)
+        # task 2243, W10-θ2: only the 'blocked' ctrl_id sibling reaches
+        # _reconcile_one_stranded ('cancelled' is filtered out of
+        # _RECONCILE_SWEEP_STATUSES before get_task is ever consulted for
+        # task_id), so get_task must reflect 'blocked' for recovery_for's
+        # db_status to match the RE_FILE_ESCALATION table row (g) — see the
+        # b4 test above for the full rationale.
+        harness.scheduler.get_task = AsyncMock(return_value={'status': 'blocked', 'metadata': {}})
         harness.scheduler.set_task_status = AsyncMock()
 
         # Positive control: a 'blocked' sibling that the sweep DOES file for,
@@ -968,7 +981,10 @@ class TestStrandedSweepB10B15:
         harness.git_ops.find_merge_marker = AsyncMock(return_value=None)
         harness.scheduler._dispatched = set()
         harness.scheduler.lock_table = mock_lock_table()
-        harness.scheduler.get_task = AsyncMock(return_value=None)
+        # task 2243, W10-θ2: recovery_for's db_status comes from get_task(),
+        # not get_statuses() — must reflect 'blocked' for the RE_FILE_ESCALATION
+        # table row (g) to match (see the b4 test above for full rationale).
+        harness.scheduler.get_task = AsyncMock(return_value={'status': 'blocked', 'metadata': {}})
         harness.scheduler.get_statuses = AsyncMock(
             return_value=({task_id: 'blocked'}, None)
         )

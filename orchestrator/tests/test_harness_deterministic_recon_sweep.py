@@ -956,7 +956,12 @@ class TestGenericStrandedBlockedReaperSkipsDeterministic:
         only — an ordinary blocked task is unaffected and still gets the
         generic backstop escalation."""
         h = _make_stranded_reaper_harness(tmp_path)
-        h.scheduler.get_task = AsyncMock(return_value={'metadata': {}})  # type: ignore[attr-defined]
+        # task 2243, W10-θ2: recovery_for's db_status comes from this same
+        # get_task() mock (TaskGroundTruth.derive_truth) — it must reflect
+        # 'blocked' for the RE_FILE_ESCALATION table row (g) to match; a
+        # status-less dict makes db_status='' and the resolver defaults to
+        # LEAVE, starving this test's positive-control escalation.
+        h.scheduler.get_task = AsyncMock(return_value={'status': 'blocked', 'metadata': {}})  # type: ignore[attr-defined]
 
         result = await h._reconcile_one_stranded('tid-normal', 'blocked', mid_run=False)
 
