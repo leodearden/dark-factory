@@ -32,6 +32,17 @@ def _reset_merge_provenance():
     MergeProvenance._outbox = None
 
 
+def _bind_landed_row(tmp_path: Path, *, task_id: str, advanced_sha: str) -> None:
+    """Bind a real LandedOutbox (via MergeProvenance.bind) holding a row for
+    *task_id* (mirrors test_task_ground_truth.py's identically-named helper)."""
+    outbox = LandedOutbox(tmp_path / 'landed.json')
+    outbox.record(LandedRow(
+        task_id=task_id, branch_tip_sha='branchtip', advanced_sha=advanced_sha,
+        landed_at=1.0,
+    ))
+    MergeProvenance.bind(outbox)
+
+
 # ---------------------------------------------------------------------------
 # _pid_alive helper tests
 # ---------------------------------------------------------------------------
@@ -176,6 +187,83 @@ def harness(tmp_path: Path, mock_orch_config):
     h.git_ops.warm_lane_ref_is_degenerate = AsyncMock(return_value=False)
 
     return h
+
+
+# ---------------------------------------------------------------------------
+# task 2243 (W10-θ2) step-3 — the G1+G2 MARK_DONE signal.
+#
+# _reconcile_one_stranded delegates the mark-done decision to
+# TaskGroundTruth.recovery_for (θ1, task_ground_truth.py), which resolves
+# branch state JOURNAL-FIRST (MergeProvenance.lookup) ahead of git
+# archaeology (TG-1). G1 pins the journal-hit path (no git I/O at all). G2
+# pins the journal-MISS path, which falls back to the exact same
+# is_ancestor -> resolve_branch_sha -> find_merge_marker sequence the
+# pre-migration sweep already ran, so it recovers identically — this is a
+# parity/regression pin (it already holds against the pre-migration code
+# too), not a novel-behavior RED case like G1.
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+class TestReconcileOneStrandedGroundTruthMarkDone:
+    async def test_g1_journal_hit_marks_done_without_consulting_merge_marker(
+        self, harness: Harness, tmp_path: Path,
+    ):
+        """A stranded in-progress task with a MergeProvenance journal row on
+        main recovers to done via the journal SHA in ONE derive_truth ->
+        _RECOVERY step — the resolver never falls back to git archaeology
+        (TG-1: journal-first)."""
+        tid = '9001'
+        advanced_sha = 'a1' * 20  # distinct sentinel — never emitted by the git-archaeology mocks
+        _bind_landed_row(tmp_path, task_id=tid, advanced_sha=advanced_sha)
+
+        harness.scheduler.get_statuses.return_value = ({tid: 'in-progress'}, None)  # type: ignore[attr-defined]
+        harness.scheduler.get_task = AsyncMock(  # type: ignore[attr-defined]
+            return_value={'status': 'in-progress', 'metadata': {}},
+        )
+
+        await harness._reconcile_stranded_in_progress()
+
+        harness.scheduler.set_task_status.assert_awaited_once_with(  # type: ignore[attr-defined]
+            tid, 'done',
+            done_provenance={
+                'kind': 'found_on_main',
+                'commit': advanced_sha,
+                'note': ANY,
+            },
+        )
+        # Journal-first: neither git primitive is ever consulted on a hit.
+        harness.git_ops.find_merge_marker.assert_not_awaited()  # type: ignore[attr-defined]
+        harness.git_ops.is_ancestor.assert_not_awaited()  # type: ignore[attr-defined]
+
+    async def test_g2_journal_miss_falls_back_to_merge_marker(
+        self, harness: Harness,
+    ):
+        """No MergeProvenance journal row (journal miss) — the resolver's
+        git fallback finds a merge marker and recovers identically: done,
+        with the marker SHA as the provenance commit."""
+        tid = '9002'
+        marker_sha = 'b2' * 20
+        harness.scheduler.get_statuses.return_value = ({tid: 'in-progress'}, None)  # type: ignore[attr-defined]
+        harness.scheduler.get_task = AsyncMock(  # type: ignore[attr-defined]
+            return_value={'status': 'in-progress', 'metadata': {}},
+        )
+        # is_ancestor False (fixture default) -> branch ref gone -> marker hit.
+        harness.git_ops.resolve_branch_sha = AsyncMock(return_value=None)  # type: ignore[attr-defined]
+        harness.git_ops.find_merge_marker = AsyncMock(return_value=marker_sha)  # type: ignore[attr-defined]
+
+        await harness._reconcile_stranded_in_progress()
+
+        harness.scheduler.set_task_status.assert_awaited_once_with(  # type: ignore[attr-defined]
+            tid, 'done',
+            done_provenance={
+                'kind': 'found_on_main',
+                'commit': marker_sha,
+                'note': ANY,
+            },
+        )
+        harness.git_ops.is_ancestor.assert_awaited_once_with(  # type: ignore[attr-defined]
+            f'task/{tid}', 'main',
+        )
 
 
 # ---------------------------------------------------------------------------
