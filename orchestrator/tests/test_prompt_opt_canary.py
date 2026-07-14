@@ -11,9 +11,65 @@ verdict against documented thresholds.
 
 from __future__ import annotations
 
+import sqlite3
+from pathlib import Path
+
 import pytest
 
-from orchestrator.evals.prompt_opt.canary import WindowMetrics, compute_window_metrics
+from orchestrator.evals.prompt_opt.canary import (
+    Row,
+    WindowMetrics,
+    compute_window_metrics,
+    load_window_rows,
+)
+from orchestrator.run_store import _SCHEMA
+
+
+def _make_runs_db(path: Path, rows: list[dict]) -> None:
+    """Create a synthetic runs.db — the EXACT ``runs`` + ``task_results``
+    schema from :data:`orchestrator.run_store._SCHEMA` (imported, not
+    hand-copied, so this fixture can never drift from the real schema) —
+    and insert *rows* into ``task_results``.
+
+    Each row dict requires ``task_id``, ``project_id``, ``outcome``, and
+    ``completed_at``. Optional (default ``0``/``0.0``): ``run_id``
+    (default ``'run-test'``), ``cost_usd``, ``steward_cost_usd``,
+    ``review_cycles``, ``verify_attempts``.
+    """
+    conn = sqlite3.connect(str(path))
+    try:
+        conn.executescript(_SCHEMA)
+        seen_runs: set[str] = set()
+        for row in rows:
+            run_id = row.get('run_id', 'run-test')
+            if run_id not in seen_runs:
+                conn.execute(
+                    'INSERT INTO runs (run_id, project_id, started_at) VALUES (?, ?, ?)',
+                    (run_id, row['project_id'], '2026-01-01T00:00:00+00:00'),
+                )
+                seen_runs.add(run_id)
+            conn.execute(
+                """
+                INSERT INTO task_results
+                    (run_id, task_id, project_id, outcome, cost_usd,
+                     steward_cost_usd, review_cycles, verify_attempts, completed_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    run_id,
+                    row['task_id'],
+                    row['project_id'],
+                    row['outcome'],
+                    row.get('cost_usd', 0.0),
+                    row.get('steward_cost_usd', 0.0),
+                    row.get('review_cycles', 0),
+                    row.get('verify_attempts', 0),
+                    row['completed_at'],
+                ),
+            )
+        conn.commit()
+    finally:
+        conn.close()
 
 
 class TestComputeWindowMetrics:
@@ -122,3 +178,80 @@ class TestComputeWindowMetrics:
         ]
         result = compute_window_metrics(rows)
         assert result.requeue_rate == pytest.approx(1.0)
+
+
+class TestLoadWindowRows:
+    def test_filters_by_completed_at_range_and_project_id(self, tmp_path: Path) -> None:
+        """Half-open ``[start_iso, end_iso)`` range, AND project_id match.
+
+        Five synthetic rows: one before the window (excluded), one exactly
+        AT the start boundary (included — the range is start-inclusive),
+        one inside (included), one exactly AT the end boundary (excluded —
+        the range is end-exclusive), and one inside the time range but for
+        a different project (excluded).
+        """
+        db_path = tmp_path / 'runs.db'
+        _make_runs_db(db_path, [
+            {
+                'task_id': 't-before', 'project_id': 'dark_factory', 'outcome': 'done',
+                'cost_usd': 1.0, 'steward_cost_usd': 0.1, 'review_cycles': 1, 'verify_attempts': 1,
+                'completed_at': '2026-06-01T00:00:00+00:00',
+            },
+            {
+                'task_id': 't-at-start', 'project_id': 'dark_factory', 'outcome': 'done',
+                'cost_usd': 2.0, 'steward_cost_usd': 0.2, 'review_cycles': 2, 'verify_attempts': 3,
+                'completed_at': '2026-06-10T00:00:00+00:00',
+            },
+            {
+                'task_id': 't-inside', 'project_id': 'dark_factory', 'outcome': 'requeued',
+                'cost_usd': 3.0, 'steward_cost_usd': 0.3, 'review_cycles': 4, 'verify_attempts': 5,
+                'completed_at': '2026-06-20T00:00:00+00:00',
+            },
+            {
+                'task_id': 't-at-end', 'project_id': 'dark_factory', 'outcome': 'done',
+                'cost_usd': 4.0, 'steward_cost_usd': 0.4, 'review_cycles': 6, 'verify_attempts': 7,
+                'completed_at': '2026-06-25T00:00:00+00:00',
+            },
+            {
+                'task_id': 't-wrong-project', 'project_id': 'other_project', 'outcome': 'done',
+                'cost_usd': 5.0, 'steward_cost_usd': 0.5, 'review_cycles': 8, 'verify_attempts': 9,
+                'completed_at': '2026-06-15T00:00:00+00:00',
+            },
+        ])
+
+        rows = load_window_rows(
+            db_path, '2026-06-10T00:00:00+00:00', '2026-06-25T00:00:00+00:00', 'dark_factory',
+        )
+
+        costs = {row.cost_usd for row in rows}
+        assert costs == {2.0, 3.0}
+
+    def test_returned_rows_carry_compute_window_metrics_columns(self, tmp_path: Path) -> None:
+        """load_window_rows's Row must plug directly into compute_window_metrics
+        (outcome, cost_usd, steward_cost_usd, review_cycles, verify_attempts)."""
+        db_path = tmp_path / 'runs.db'
+        _make_runs_db(db_path, [
+            {
+                'task_id': 't-1', 'project_id': 'dark_factory', 'outcome': 'requeued',
+                'cost_usd': 1.5, 'steward_cost_usd': 0.25, 'review_cycles': 2, 'verify_attempts': 3,
+                'completed_at': '2026-06-15T00:00:00+00:00',
+            },
+        ])
+
+        rows = load_window_rows(
+            db_path, '2026-06-10T00:00:00+00:00', '2026-06-25T00:00:00+00:00', 'dark_factory',
+        )
+
+        assert len(rows) == 1
+        row = rows[0]
+        assert isinstance(row, Row)
+        assert row.outcome == 'requeued'
+        assert row.cost_usd == pytest.approx(1.5)
+        assert row.steward_cost_usd == pytest.approx(0.25)
+        assert row.review_cycles == 2
+        assert row.verify_attempts == 3
+
+        # And it plugs straight into compute_window_metrics unchanged.
+        metrics = compute_window_metrics(rows)
+        assert metrics.n_rows == 1
+        assert metrics.requeue_rate == pytest.approx(1.0)
