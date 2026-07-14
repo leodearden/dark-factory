@@ -974,7 +974,7 @@ class TestMergeGraphFamily:
             blocked=[{'kind': 'edge', 'uuid': 'edge-1', 'reason': 'boom', 'node_uuids': ['entity-1']}],
         )
         abort_exc = RuntimeError('phase b systemic failure')
-        abort_exc.partial_result = partial_result
+        abort_exc.partial_result = partial_result  # type: ignore[attr-defined]
         mocks = self._patch_primitives(monkeypatch, recreate_side_effect=abort_exc)
         entity_rows = [{'uuid': 'entity-1', 'name': 'A'}, {'uuid': 'entity-2', 'name': 'B'}]
         episode_rows = [{'uuid': 'episode-1'}]
