@@ -4180,8 +4180,14 @@ async def verify_failure_is_preexisting_on_main(
         # cleanup on exit — never a broad 'git worktree prune', DD5) is owned
         # by GitOps.ephemeral_worktree; see its docstring for the full
         # contract.
+        #
+        # warm_seed=True (task 2567): CoW-seeds the probe's target/ from the
+        # shared warm-lane base (reusing GitOps._seed_warm_lane) so the probe
+        # starts from a pre-built main and verifies in the warm timeout tier
+        # instead of a cold ~30-45min recompile. Fails soft to cold when no
+        # warm base exists — see ephemeral_worktree's warm_seed docstring.
         async with git_ops.ephemeral_worktree(  # type: ignore[union-attr]
-            WorktreeKind.MAIN_PROBE, main_sha,
+            WorktreeKind.MAIN_PROBE, main_sha, warm_seed=True,
         ) as tmp_path:
             # Probe main with the same scoped commands, no retries.
             try:
