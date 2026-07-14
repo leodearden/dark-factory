@@ -10,9 +10,12 @@ append-only, never-delete.
 """
 from __future__ import annotations
 
+import argparse
 import copy
+import json
 import os
 import re
+import sys
 
 import jsonschema
 import yaml
@@ -484,3 +487,98 @@ def migrate_v1_to_v2(codebook: dict) -> dict:
     result.setdefault("candidates", [])
 
     return result
+
+
+# ---------------------------------------------------------------------------
+# main(argv) — CLI: validate / migrate / apply. Fail-loud: every subcommand
+# returns 0 iff its operation succeeded and the resulting file (if any) is
+# schema-valid; errors go to stderr.
+# ---------------------------------------------------------------------------
+
+def _cmd_validate(args: argparse.Namespace) -> int:
+    codebook = load(args.path)
+    errors = validate(codebook)
+    for error in errors:
+        print(error, file=sys.stderr)
+    return 0 if not errors else 1
+
+
+def _cmd_migrate(args: argparse.Namespace) -> int:
+    codebook = load(args.path)
+    migrated = migrate_v1_to_v2(codebook)
+    errors = validate(migrated)
+    if errors:
+        for error in errors:
+            print(error, file=sys.stderr)
+        return 1
+    dump(migrated, args.path)
+    return 0
+
+
+def _cmd_apply(args: argparse.Namespace) -> int:
+    codebook = load(args.codebook)
+    totals = {
+        "matched": 0,
+        "skipped_unknown_entry": 0,
+        "candidates_applied": 0,
+        "record_invalid": 0,
+    }
+
+    with open(args.records, "r", encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            record = json.loads(line)
+            codebook, stats = apply_coding_record(codebook, record)
+            totals["matched"] += stats["matched"]
+            totals["skipped_unknown_entry"] += stats["skipped_unknown_entry"]
+            totals["candidates_applied"] += stats["candidates_applied"]
+            totals["record_invalid"] += int(stats["record_invalid"])
+
+    errors = validate(codebook)
+    if errors:
+        for error in errors:
+            print(error, file=sys.stderr)
+        return 1
+
+    dump(codebook, args.codebook)
+    print(
+        "applied: matched={matched} candidates_applied={candidates_applied} "
+        "skipped_unknown_entry={skipped_unknown_entry} "
+        "record_invalid={record_invalid}".format(**totals)
+    )
+    return 0
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(
+        prog="codebook",
+        description="confusion-codebook v2 schema validator, v1->v2 migrator, "
+        "and deterministic sole-writer coding-record merger.",
+    )
+    subparsers = parser.add_subparsers(dest="command", required=True)
+
+    validate_parser = subparsers.add_parser("validate", help="validate a v2 codebook file")
+    validate_parser.add_argument("path")
+    validate_parser.set_defaults(func=_cmd_validate)
+
+    migrate_parser = subparsers.add_parser(
+        "migrate", help="migrate a v1 codebook file to v2, in place"
+    )
+    migrate_parser.add_argument("path")
+    migrate_parser.set_defaults(func=_cmd_migrate)
+
+    apply_parser = subparsers.add_parser(
+        "apply", help="apply a JSONL file of §7.3 coding records to a codebook file"
+    )
+    apply_parser.add_argument("codebook")
+    apply_parser.add_argument("records")
+    apply_parser.set_defaults(func=_cmd_apply)
+
+    args = parser.parse_args(argv)
+    return args.func(args)
+
+
+if __name__ == "__main__":
+    sys.exit(main())
