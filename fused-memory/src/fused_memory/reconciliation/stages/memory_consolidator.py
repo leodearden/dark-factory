@@ -834,7 +834,7 @@ This is a focused remediation run. Address ONLY the specific findings listed abo
 3. Do NOT perform general consolidation — only fix the listed findings.
 4. Report each finding's resolution status in your structured report.
 
-{_STAGE1_PROJECT_ID_GUIDELINE.format(project_id=self.project_id)}
+{_STAGE1_PROJECT_ID_GUIDELINE.format(project_id=self.project_id)}{self._build_project_root_directive()}
 """
 
 
