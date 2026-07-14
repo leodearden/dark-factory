@@ -1021,6 +1021,22 @@ class TestRefreshEntitySummaryMcpTool:
         assert parsed.get('error_type') == 'ValidationError'
         mock_service.refresh_entity_summary.assert_not_awaited()
 
+    @pytest.mark.asyncio
+    async def test_equal_entity_name_and_name_delegates_with_entity_name(self, mcp_server, mock_service):
+        """Supplying both entity_name and name with the SAME value is valid, not a conflict.
+
+        The docstring's 'Exactly one of entity_name/name should be used;
+        supplying both with conflicting values is an error' only rejects
+        disagreement — matching values should resolve and delegate normally.
+        """
+        await mcp_server._tool_manager.call_tool(
+            'refresh_entity_summary',
+            {'entity_name': 'Alice', 'name': 'Alice', 'project_id': 'dark_factory'},
+        )
+        mock_service.refresh_entity_summary.assert_awaited_once()
+        call_kwargs = mock_service.refresh_entity_summary.call_args[1]
+        assert call_kwargs.get('entity_name') == 'Alice'
+
 
 # ---------------------------------------------------------------------------
 # step-7 (task-309): FUSED_MEMORY_INSTRUCTIONS and tool docstring

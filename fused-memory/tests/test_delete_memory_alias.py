@@ -93,3 +93,21 @@ class TestDeleteMemoryIdAlias:
         assert 'error' in parsed
         assert parsed.get('error_type') == 'ValidationError'
         mock_service.delete_memory.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_equal_id_and_memory_id_delegates_with_memory_id(
+        self, mcp_server, mock_service
+    ):
+        """Supplying both id and memory_id with the SAME value is valid, not a conflict.
+
+        The docstring's 'Exactly one must be provided; supplying both with
+        conflicting values is an error' only rejects disagreement — matching
+        values should resolve and delegate normally rather than error out.
+        """
+        await mcp_server._tool_manager.call_tool(
+            'delete_memory',
+            {'id': 'm1', 'memory_id': 'm1', 'store': 'mem0', 'project_id': 'dark_factory'},
+        )
+        mock_service.delete_memory.assert_awaited_once()
+        call_kwargs = mock_service.delete_memory.call_args[1]
+        assert call_kwargs.get('memory_id') == 'm1'
