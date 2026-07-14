@@ -136,7 +136,18 @@ class BackfillManager:
         project_id = resolve_project_id(project_root)
 
         logger.info('backfill_curator_corpus: fetching task tree for prune sweep %s', project_root)
-        tasks_result = await self.taskmaster.get_tasks(project_root)
+        try:
+            tasks_result = await self.taskmaster.get_tasks(project_root)
+        except Exception:
+            logger.warning(
+                'prune: get_tasks failed — skipping prune (fail-safe)', exc_info=True,
+            )
+            return PruneReport(
+                project_root=project_root,
+                project_id=project_id,
+                skipped=True,
+                reason='read_failed',
+            )
         flat_tasks = flatten_task_tree(tasks_result)
         live_ids = {
             str(t.get('id')) for t in flat_tasks if t.get('id') is not None and str(t.get('id'))
