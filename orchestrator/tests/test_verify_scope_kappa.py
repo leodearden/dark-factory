@@ -1110,3 +1110,108 @@ class TestNonScopingBranchesPreserved:
                 f'{executed[0].type_check_command!r}'
             )
         assert result.plan is not None
+
+
+# ---------------------------------------------------------------------------
+# step-11/step-12: VerifyResult.plan folds execution-time module skips
+# ---------------------------------------------------------------------------
+
+
+class TestExecutedPlanRecordsModuleSkips:
+    """A1, multi-module shape (module-config branch): ``VerifyResult.plan``
+    is the plan that actually drove the gathered ``run_verification`` calls
+    for a run spanning SEVERAL registered modules, not a re-derivation that
+    could diverge from execution — and a registered module skipped at
+    execution time (no files under its prefix, so it is dropped from
+    ``scoped`` by :func:`verify._executed_module_configs_from_plan`) is
+    recorded as an explicit ``SKIPPED`` ``PlannedRun`` with a reason, never
+    silently absent from the record.
+    """
+
+    @pytest.mark.asyncio
+    async def test_untouched_module_skip_is_recorded_with_reason(self, tmp_path: Path):
+        """Two registered modules, only one touched -> the untouched one is
+        dropped from execution but still appears in result.plan as an
+        explicit SKIPPED run (reason: 'no files under prefix')."""
+        (tmp_path / 'mymod' / 'tests').mkdir(parents=True)
+        (tmp_path / 'mymod' / 'tests' / 'test_thing.py').write_text('def test_thing(): pass\n')
+        (tmp_path / 'othermod').mkdir(parents=True)
+
+        config = OrchestratorConfig(project_root=tmp_path)
+        module_configs = [
+            ModuleConfig(prefix='mymod', test_command='uv run --directory mymod pytest tests/'),
+            ModuleConfig(prefix='othermod', test_command='uv run --directory othermod pytest tests/'),
+        ]
+
+        mock_run_verification = _run_verification_spy()
+        with patch.object(verify, 'run_verification', new=mock_run_verification):
+            result = await run_scoped_verification(
+                tmp_path, config, module_configs,
+                task_files=['mymod/tests/test_thing.py'],
+            )
+
+        assert result.passed
+        # Only the touched module actually ran — othermod is dropped from
+        # execution entirely (verify._executed_module_configs_from_plan's
+        # "no files under prefix" collapse).
+        executed = _executed_module_configs(mock_run_verification)
+        assert [mc.prefix for mc in executed] == ['mymod']
+
+        assert result.plan is not None
+        othermod_runs = [r for r in result.plan['runs'] if r['module_prefix'] == 'othermod']
+        assert len(othermod_runs) == 1, (
+            f'the untouched, dropped-from-execution module must still appear '
+            f'exactly once in the record, as a single explicit skip: '
+            f'{result.plan["runs"]!r}'
+        )
+        assert othermod_runs[0]['scope_kind'] == 'skipped'
+        assert othermod_runs[0]['cmd'] is None
+        assert othermod_runs[0]['reason'], 'a skip must carry a non-empty reason, never a silent drop'
+
+    @pytest.mark.asyncio
+    async def test_plan_equals_the_plan_that_drove_every_executed_module(self, tmp_path: Path):
+        """Multi-module run, BOTH modules touched with DIFFERENT shapes (one
+        FULL_SUITE via conftest, one FILE_SCOPED) -> every pytest PlannedRun
+        in result.plan matches the corresponding executed ModuleConfig's
+        test_command exactly — the attached plan is the plan that actually
+        drove the gathered run_verification calls, not an independent
+        re-derivation that happens to agree only by coincidence.
+        """
+        (tmp_path / 'alpha' / 'tests').mkdir(parents=True)
+        (tmp_path / 'alpha' / 'tests' / 'conftest.py').write_text('# conftest\n')
+        (tmp_path / 'beta' / 'tests').mkdir(parents=True)
+        (tmp_path / 'beta' / 'tests' / 'test_thing.py').write_text('def test_thing(): pass\n')
+
+        config = OrchestratorConfig(project_root=tmp_path)
+        module_configs = [
+            ModuleConfig(prefix='alpha', test_command='uv run --directory alpha pytest tests/'),
+            ModuleConfig(prefix='beta', test_command='uv run --directory beta pytest tests/'),
+        ]
+        task_files = ['alpha/tests/conftest.py', 'beta/tests/test_thing.py']
+
+        mock_run_verification = _run_verification_spy()
+        with patch.object(verify, 'run_verification', new=mock_run_verification):
+            result = await run_scoped_verification(
+                tmp_path, config, module_configs, task_files=task_files,
+            )
+
+        assert result.passed
+        executed = _executed_module_configs(mock_run_verification)
+        executed_by_prefix = {mc.prefix: mc for mc in executed}
+        assert set(executed_by_prefix) == {'alpha', 'beta'}
+
+        assert result.plan is not None
+        pytest_runs = [r for r in result.plan['runs'] if r['reason'].startswith('pytest:')]
+        assert {r['module_prefix'] for r in pytest_runs} == {'alpha', 'beta'}
+        for run in pytest_runs:
+            executed_mc = executed_by_prefix[run['module_prefix']]
+            assert run['cmd'] is not None, f'both modules touched a file; nothing should be skipped: {run!r}'
+            if run['scope_kind'] == 'full_suite':
+                # FULL_SUITE (alpha's conftest) keeps the ORIGINAL mc's
+                # verbatim command — never render(run['cmd']), which would
+                # normalize e.g. `--directory` to a `cd` prefix.
+                original = next(mc for mc in module_configs if mc.prefix == run['module_prefix'])
+                assert executed_mc.test_command == original.test_command
+            else:
+                assert run['scope_kind'] == 'file_scoped'
+                assert executed_mc.test_command == _render_plan_cmd(run['cmd'])

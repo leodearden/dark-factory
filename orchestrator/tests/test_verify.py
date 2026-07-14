@@ -32,7 +32,7 @@ from orchestrator.verify import (
     run_verification,
 )
 from orchestrator.verify_classify import classify_failure
-from orchestrator.verify_cmd import ToolKind
+from orchestrator.verify_cmd import ToolKind, render
 
 
 class TestKillCgroupScope:
@@ -7100,7 +7100,12 @@ class TestRunScopedVerificationPlan:
     async def test_plan_matches_derive_verify_plan_for_file_scoped_module(
         self, tmp_path: Path,
     ):
-        """result.plan == derive_verify_plan(...).to_dict() for a representative file-scoped run."""
+        """result.plan IS the EXECUTED plan (A1, task κ) for a representative
+        file-scoped run — not an independently re-derived diagnostic mirror
+        that merely happens to agree with a second derive_verify_plan(...)
+        call. Every run's recorded command is cross-checked directly against
+        the ModuleConfig run_verification was actually awaited with.
+        """
         (tmp_path / 'mymod' / 'tests').mkdir(parents=True)
         touched = tmp_path / 'mymod' / 'tests' / 'test_thing.py'
         touched.write_text('def test_thing(): pass\n')
@@ -7117,19 +7122,42 @@ class TestRunScopedVerificationPlan:
         task_files = ['mymod/tests/test_thing.py']
         existing_files = [f for f in task_files if (tmp_path / f).exists()]
 
-        with patch.object(verify, 'run_verification', new=AsyncMock(return_value=_canned_passing_result())):
+        mock_run_verification = AsyncMock(return_value=_canned_passing_result())
+        with patch.object(verify, 'run_verification', new=mock_run_verification):
             result = await run_scoped_verification(
                 tmp_path, config, module_configs, task_files=task_files,
             )
 
         expected_plan = verify_plan.derive_verify_plan(
             existing_files, module_configs, config, _real_worktree_reader(tmp_path),
-        ).to_dict()
-        assert result.plan == expected_plan
+        )
+        assert result.plan == expected_plan.to_dict()
         assert result.plan is not None
         # Sanity: this really is the "representative file-scoped" shape the
         # step description asks for, not an accidental SKIPPED/TRIVIAL plan.
         assert any(r['scope_kind'] == 'file_scoped' for r in result.plan['runs'])
+
+        # A1 (task κ, step-11): result.plan is the plan that actually DROVE
+        # execution, not a diagnostic mirror that merely happens to agree
+        # with the independent re-derivation above. Cross-check directly
+        # against the ModuleConfig run_verification was actually awaited
+        # with, rather than trusting a second, separately-computed value.
+        assert mock_run_verification.await_count == 1
+        assert mock_run_verification.await_args is not None
+        executed_mc = mock_run_verification.await_args.args[2]
+        by_tool = {run.cmd.tool: run for run in expected_plan.runs if run.cmd is not None}
+
+        pytest_run = by_tool[ToolKind.PYTEST]
+        assert pytest_run.cmd is not None
+        assert executed_mc.test_command == render(pytest_run.cmd)
+
+        ruff_run = by_tool[ToolKind.RUFF]
+        assert ruff_run.cmd is not None
+        assert executed_mc.lint_command == render(ruff_run.cmd)
+
+        pyright_run = by_tool[ToolKind.PYRIGHT]
+        assert pyright_run.cmd is not None
+        assert executed_mc.type_check_command == render(pyright_run.cmd)
 
     @pytest.mark.asyncio
     async def test_plan_is_logged_per_invocation(self, tmp_path: Path, caplog):
