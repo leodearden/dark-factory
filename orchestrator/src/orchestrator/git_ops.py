@@ -2660,34 +2660,34 @@ class GitOps:
         unit test that exercises this against a real held flock (not just a
         scripted exit code).
 
-        **Lane-lock coupling gap (task 2442 review — CONFIRMED, not just
-        theoretical)**: the mutual exclusion above additionally requires the
-        OTHER party in a concurrent re-acquire — reify's
+        **Lane-lock coupling gap (task 2442 review — CLOSED by task 2599)**:
+        the mutual exclusion above additionally requires the OTHER party in
+        a concurrent re-acquire — reify's
         ``<lane_dir>/scripts/seed-warm-lane.sh``, invoked by
         :meth:`_seed_warm_lane` — to ALSO take ``<lane_dir>.lock`` before
-        writing into ``target/``. As of this writing it does not:
-        ``seed-warm-lane.sh`` takes only a *shared* flock on the separate
-        per-gen-dir lock file for the duration of its ``cp --reflink`` from
-        the shared CoW base (mirrored on the DF side by
-        :meth:`_seed_warm_lane`'s own gen-dir flock, above) — it contains no
-        ``<lane_dir>.lock`` reference at all. DF's own
-        :class:`WarmLanePool` does not fill the gap either: its ASSIGNED/FREE
-        bookkeeping is purely in-memory, guarded by a single ``asyncio.Lock``
-        (see its class docstring) that serializes the fast state-dict flip
-        only — NOT the slow subprocess calls either side makes. This
-        method's ``rm -rf`` and :meth:`_seed_warm_lane`'s ``cp --reflink``
-        both run as real OS subprocesses that can genuinely overlap in
-        wall-clock time across an ``await``, even within a single
-        orchestrator process. So today, a concurrent re-acquire of a
-        just-released lane does NOT contend on ``<lane_dir>.lock`` — thin's
-        ``flock -n`` is uncontested and proceeds, meaning the rc=75
-        benign-skip path is reachable only when something ELSE (another
-        thin or GC invocation) holds the lock, not when a genuine re-acquire
-        is racing this call. ``TestSeedWarmLaneDoesNotTakeLaneLock`` in
-        ``test_git_ops.py`` pins this current behavior down against a real
-        held flock. Teaching either side to take ``<lane_dir>.lock`` for
-        real is a locking-design change out of scope for task 2442 (η) —
-        flagged as a follow-up rather than fixed here.
+        writing into ``target/``. It now does: :meth:`_seed_warm_lane` wraps
+        that script in an outer blocking exclusive ``flock -x
+        <lane_dir>.lock`` spanning its full subprocess duration (task 2599),
+        nested outside its own gen-dir flock (mirrored on the DF side,
+        above). So a genuine concurrent re-acquire's seed DOES contend with
+        this method's ``rm -rf`` on the same lock file — the rc=75
+        benign-skip path below is now reachable on a real re-acquire race,
+        not only when something ELSE (another thin or GC invocation) holds
+        the lock. DF's own :class:`WarmLanePool` still does not itself
+        provide this — its ASSIGNED/FREE bookkeeping is purely in-memory,
+        guarded by a single ``asyncio.Lock`` (see its class docstring) that
+        serializes the fast state-dict flip only, NOT the slow subprocess
+        calls either side makes — but that no longer matters: the
+        ``<lane_dir>.lock`` file itself is now the shared mutual-exclusion
+        primitive between this method's ``rm -rf`` and
+        :meth:`_seed_warm_lane`'s ``cp --reflink``, both real OS subprocesses
+        that would otherwise be free to genuinely overlap in wall-clock time
+        across an ``await``. ``TestSeedWarmLaneTakesLaneLock`` in
+        ``test_git_ops.py`` pins :meth:`_seed_warm_lane`'s new blocking
+        behavior against an externally-held lock, and
+        ``TestSeedAndThinMutualExclusion`` pins the end-to-end mutual
+        exclusion between this method and :meth:`_seed_warm_lane` racing
+        each other on the SAME lock file.
 
         Exit-code taxonomy (per the reify δ contract):
             0   — thinned (``target/`` removed).
@@ -4116,9 +4116,13 @@ class GitOps:
            is True, invoke :meth:`_run_thin_warm_lane` — an eager free-first
            reclaim of the lane's ``target/`` via reify δ's
            ``scripts/thin-warm-lane.sh``, run strictly AFTER the ASSIGNED→FREE
-           flip.  The script holds the lane's own flock (T3), so a concurrent
-           re-acquire of this just-freed lane makes it exit 75 (benign skip) —
-           never thinned while ASSIGNED, by construction (inv.10).  Only
+           flip.  The script holds the lane's own flock (T3), and (task 2599)
+           :meth:`_seed_warm_lane` now holds that SAME ``<lane_dir>.lock``
+           exclusively for its own subprocess duration, so a concurrent
+           re-acquire of this just-freed lane genuinely contends and makes
+           this call exit 75 (benign skip) — never thinned while ASSIGNED,
+           by construction (inv.10) and now actually enforced DF-side rather
+           than delegated to an un-honored cross-repo contract.  Only
            ``target/`` is ever removed (T1); invoked WITHOUT ``--reseed`` — the
            next :meth:`acquire_warm_lane` always re-seeds from the current
            base regardless (D10), so net warmth is unchanged and only the
