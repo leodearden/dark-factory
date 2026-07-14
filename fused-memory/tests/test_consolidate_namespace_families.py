@@ -622,17 +622,25 @@ class TestMergeGraphFamily:
         create_node_side_effect=None,
         create_episode_side_effect=None,
         recreate_result=None,
+        recreate_side_effect=None,
         delete_node_side_effect=None,
         delete_episode_side_effect=None,
     ):
         """Patch every three-phase primitive merge_graph_family drives (all
         five are new module-level names this task adds to the script's
         import block -- absent until step-8 lands, hence raising=False),
-        returning the mocks for call-order/argument assertions."""
+        returning the mocks for call-order/argument assertions.
+
+        *recreate_side_effect*, when given (typically an exception
+        instance), makes recreate_subgraph_relationships RAISE instead of
+        returning *recreate_result* -- simulating a SYSTEMIC Phase-B abort,
+        as opposed to a per-item isolated failure (expressed instead via a
+        *recreate_result* carrying a non-empty ``blocked`` list)."""
         create_node_mock = AsyncMock(side_effect=create_node_side_effect)
         create_episode_mock = AsyncMock(side_effect=create_episode_side_effect)
         recreate_mock = AsyncMock(
             return_value=recreate_result if recreate_result is not None else SubgraphEdgeResult(),
+            side_effect=recreate_side_effect,
         )
         delete_node_mock = AsyncMock(side_effect=delete_node_side_effect)
         delete_episode_mock = AsyncMock(side_effect=delete_episode_side_effect)
@@ -945,6 +953,72 @@ class TestMergeGraphFamily:
         graphiti._graph_for.assert_any_call('know-live')
         graph_mock.ro_query.assert_awaited()
         graph_mock.query.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_phase_b_systemic_abort_withholds_all_source_deletions(self, monkeypatch):
+        """A SYSTEMIC (batch-level) Phase-B abort -- recreate_subgraph_
+        relationships RAISES instead of isolating the failure onto
+        SubgraphEdgeResult.blocked -- must withhold the WHOLE batch's source
+        deletions, not just the uuids named in the recovered
+        exc.partial_result.blocked: partial_result.blocked only names items
+        that failed in isolation BEFORE the abort -- it never names the
+        edges/mentions the batch never reached, which now exist only in
+        source. Regression for the reviewer's data-loss-create-before-delete
+        finding: today only entity-1 (named in partial_result.blocked) is
+        withheld, so entity-2 and episode-1 -- neither ever confirmed
+        recreated -- get deleted anyway, nodes_blocked/episodes_blocked
+        under-count, and the family would stay MERGE.
+        """
+        partial_result = SubgraphEdgeResult(
+            edges_recreated=1,
+            blocked=[{'kind': 'edge', 'uuid': 'edge-1', 'reason': 'boom', 'node_uuids': ['entity-1']}],
+        )
+        abort_exc = RuntimeError('phase b systemic failure')
+        abort_exc.partial_result = partial_result
+        mocks = self._patch_primitives(monkeypatch, recreate_side_effect=abort_exc)
+        entity_rows = [{'uuid': 'entity-1', 'name': 'A'}, {'uuid': 'entity-2', 'name': 'B'}]
+        episode_rows = [{'uuid': 'episode-1'}]
+
+        summary = await _mod.merge_graph_family(
+            MagicMock(), 'know-live', 'know_live', entity_rows, episode_rows,
+        )
+
+        assert mocks['delete_node'].await_count == 0
+        assert mocks['delete_episode'].await_count == 0
+        assert summary['nodes_blocked'] == 2
+        assert summary['episodes_blocked'] == 1
+        assert summary['nodes_moved'] == 0
+        assert summary['episodes_moved'] == 0
+        # The partial tally is still surfaced, not discarded.
+        assert summary['edges_recreated'] == 1
+        assert summary['blocked'] == partial_result.blocked
+
+    @pytest.mark.asyncio
+    async def test_phase_b_systemic_abort_without_partial_result_withholds_all_source_deletions(
+        self, monkeypatch,
+    ):
+        """The defensive branch: an abort exception with NO partial_result
+        attribute (getattr -> None) leaves edge_result zeroed -- but must
+        STILL withhold every source deletion. The absence of a usable
+        partial tally is not evidence that nothing needs blocking; it is
+        the worst case (we know NOTHING about what Phase B did or didn't
+        reach), so every source is withheld.
+        """
+        abort_exc = RuntimeError('phase b systemic failure, no partial result attached')
+        mocks = self._patch_primitives(monkeypatch, recreate_side_effect=abort_exc)
+        entity_rows = [{'uuid': 'entity-1', 'name': 'A'}, {'uuid': 'entity-2', 'name': 'B'}]
+        episode_rows = [{'uuid': 'episode-1'}]
+
+        summary = await _mod.merge_graph_family(
+            MagicMock(), 'know-live', 'know_live', entity_rows, episode_rows,
+        )
+
+        assert mocks['delete_node'].await_count == 0
+        assert mocks['delete_episode'].await_count == 0
+        assert summary['nodes_blocked'] == 2
+        assert summary['episodes_blocked'] == 1
+        assert summary['edges_recreated'] == 0
+        assert summary['blocked'] == []
 
     @pytest.mark.asyncio
     async def test_summary_tallies_and_surfaces_dropped_and_blocked(self, monkeypatch):
@@ -1419,6 +1493,7 @@ def _run_args(apply: bool = False, **overrides):
 def _patch_merge_primitives(
     monkeypatch, *,
     recreate_result=None,
+    recreate_side_effect=None,
     create_node_side_effect=None,
     create_episode_side_effect=None,
     delete_node_side_effect=None,
@@ -1433,11 +1508,16 @@ def _patch_merge_primitives(
     own barrier ordering -- is already covered by test_cross_graph_move.py
     and this module's TestMergeGraphFamily; these run()-level tests exercise
     run()'s OWN per-sibling enumeration/dispatch/disposition-folding logic
-    instead, so the primitives themselves are patched away here."""
+    instead, so the primitives themselves are patched away here.
+
+    *recreate_side_effect*, when given (typically an exception instance),
+    makes recreate_subgraph_relationships RAISE (a SYSTEMIC Phase-B abort)
+    instead of returning *recreate_result*."""
     create_node_mock = AsyncMock(side_effect=create_node_side_effect)
     create_episode_mock = AsyncMock(side_effect=create_episode_side_effect)
     recreate_mock = AsyncMock(
         return_value=recreate_result if recreate_result is not None else SubgraphEdgeResult(),
+        side_effect=recreate_side_effect,
     )
     delete_node_mock = AsyncMock(side_effect=delete_node_side_effect)
     delete_episode_mock = AsyncMock(side_effect=delete_episode_side_effect)
@@ -1831,6 +1911,41 @@ class TestRunApply:
         assert know_live_item['nodes_blocked'] == 1
         assert know_live_item['disposition'] == 'UNRESOLVED'
         assert _mod.has_unresolved(report) is True
+
+    @pytest.mark.asyncio
+    async def test_apply_family_phase_b_systemic_abort_downgrades_to_unresolved_and_withholds_deletion(
+        self, monkeypatch,
+    ):
+        """A SYSTEMIC Phase-B abort (recreate_subgraph_relationships raises)
+        must withhold the WHOLE batch's source deletions -- not just the
+        uuids a recovered partial_result.blocked happens to name -- so the
+        know-live family stays UNRESOLVED (non-zero --apply exit) and the
+        emptied sibling's junk-key GRAPH.DELETE stays guarded off (residual
+        count>0). RED today: merge_graph_family only recovers
+        partial_result and falls through to Phase C, so uuid-1 gets
+        deleted, nodes_blocked stays 0, the family stays MERGE, and
+        --apply exits 0 (silent data loss)."""
+        abort_exc = RuntimeError('phase b systemic failure')
+        mocks = _patch_merge_primitives(monkeypatch, recreate_side_effect=abort_exc)
+        graphiti = _make_run_graphiti_mock(
+            entity_rows_by_key={'know-live': [['uuid-1', 'Node A']]},
+            total_count_by_key={'know-live': 1},  # residual: source deletion withheld
+        )
+        qdrant_client = _make_run_qdrant_mock()
+        memory_service = _make_run_memory_service(graphiti, qdrant_client)
+
+        report = await _mod.run(_run_args(apply=True), memory_service, limit=1000)
+
+        mocks['delete_node'].assert_not_called()
+        mocks['delete_episode'].assert_not_called()
+
+        graph_by_sibling = {item['sibling']: item for item in report['graph_family_merges']}
+        assert graph_by_sibling['know-live']['disposition'] == 'UNRESOLVED'
+        assert _mod.has_unresolved(report) is True
+
+        junk_by_key = {item['key']: item for item in report['junk_key_deletions']}
+        assert junk_by_key['know-live']['disposition'] == 'UNRESOLVED'
+        graphiti._graphs_by_key['know-live'].delete.assert_not_called()
 
     @pytest.mark.asyncio
     async def test_apply_upserts_with_canonical_user_id_and_deletes_source_collection(self, monkeypatch):
