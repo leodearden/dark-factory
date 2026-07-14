@@ -832,3 +832,19 @@ def render_digest(
 
     sections = _build_sections(records)
     return _truncate_sections(meta, sections, max_bytes)
+
+
+def build_digest(
+    path: Any, *, agent_class_override: str | None = None, max_bytes: int = 15360,
+) -> str:
+    """Orchestrate the full pipeline for a single transcript file: parse,
+    classify, render. This is the headline entry point (PRD Sec 8.1
+    boundary test, producer side) -- what beta/delta and :func:`main` call.
+
+    *agent_class_override*, when given, is passed straight through to
+    :func:`classify_agent_class` (e.g. beta's already-authoritative class);
+    otherwise alpha's best-effort marker heuristics decide.
+    """
+    records = load_transcript(path)
+    agent_class = classify_agent_class(records, override=agent_class_override)
+    return render_digest(records, agent_class=agent_class, path=path, max_bytes=max_bytes)
