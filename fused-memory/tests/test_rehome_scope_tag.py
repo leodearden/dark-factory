@@ -8,7 +8,6 @@ disambiguated inline in its content, not just in metadata.
 from __future__ import annotations
 
 from fused_memory.maintenance.rehome_scope_tag import (
-    CGL_ETA_REHOME_KIND,
     apply_scope_tag,
     scope_tag_for,
 )
@@ -62,8 +61,3 @@ class TestApplyScopeTag:
         metadata = {'src_entity': 'task 948'}
         content = 'Stage 2 should re-escalate task 948 after remediation.'
         assert apply_scope_tag(content, metadata) == content
-
-
-class TestCglEtaRehomeKindConstant:
-    def test_value(self):
-        assert CGL_ETA_REHOME_KIND == 'cgl_eta_cross_target_rehome'
