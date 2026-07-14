@@ -258,8 +258,10 @@ async def _shape_one_project(
     # see Contract: task-row prd field in plans/dashboard-taskgraph-legibility-prd.md.
     live_prds = {row['prd'] for row in active if row.get('prd')}
 
-    # Bounded terminal buckets: iterate over (status, cap) pairs so done stays
-    # byte-identical and cancelled gets the same treatment.
+    # Bounded terminal buckets: iterate over (status, cap) pairs. Rows within
+    # the top-N cap keep the original done/cancelled shape; done/cancelled
+    # members of a still-live PRD are additionally emitted beyond the cap
+    # (with populated deps) per the live-PRD terminal-member exemption above.
     for _bkt_status, _bkt_cap in (
         ('done', max_done_per_project),
         ('cancelled', max_cancelled_per_project),
