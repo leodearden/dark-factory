@@ -32,15 +32,11 @@ def harness(tmp_path: Path, mock_orch_config) -> Harness:
     # background task is spawned inside a unit test.  Mirrors the _neutralise
     # idiom in test_harness_park_stop.py.
     h._start_merge_worker = AsyncMock()
-    # Likewise neutralise the periodic main-tip sweep (added in task 1832);
-    # otherwise run() spawns a real asyncio.Task that sleeps 1800s and leaks
-    # past the unit test, hanging/crashing the worker.
-    h._start_main_tip_sweep = MagicMock()
-    # Same for the no-landings circuit-breaker (added later in task θ/1893):
-    # its loop body is a no-op when _merge_worker is None, so under a
-    # non-suspending fake asyncio.sleep it tight-spins and wedges the event
-    # loop until the 60s per-test timeout kills the worker (task 1907).
-    h._start_no_landings_breaker = MagicMock()
+    # The periodic main-tip sweep (task 1832) and no-landings circuit-breaker
+    # (task θ/1893) loops are neutralised at the config level — mock_orch_config
+    # sets main_tip_sweep_enabled/no_landings_breaker_enabled to False, so
+    # _build_lifecycle_registry() never registers their BackgroundService and
+    # run() spawns no real asyncio.Task for either (task 2241, W10-η).
 
     return h
 

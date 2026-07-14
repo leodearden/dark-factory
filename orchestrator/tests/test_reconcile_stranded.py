@@ -2121,6 +2121,14 @@ async def test_harness_run_invokes_reconcile_before_scheduler_loop(
     config.no_landings_breaker_enabled = False
     config.no_landings_breaker_window_samples = 30
     config.no_landings_breaker_disk_free_floor_bytes = 50 * 1024 * 1024 * 1024
+    # Sweeps not under test here (task 2241, W10-η): disabled at the config
+    # gate so _build_lifecycle_registry() never registers their
+    # BackgroundService — this config is a bare spec_set MagicMock, so an
+    # unset interval would be a MagicMock and crash asyncio.sleep().
+    config.orphan_l0_reaper_enabled = False
+    config.terminal_status_watcher_enabled = False
+    config.stranded_reconcile_enabled = False
+    config.main_tip_sweep_enabled = False
 
     with patch('orchestrator.harness.McpLifecycle') as mock_mcp_cls, \
          patch('orchestrator.harness.Scheduler'), \
@@ -2140,10 +2148,6 @@ async def test_harness_run_invokes_reconcile_before_scheduler_loop(
     h._start_escalation_server = AsyncMock()
     h._start_merge_worker = AsyncMock()
     h._dismiss_stale_escalations = AsyncMock()
-    h._start_orphan_l0_reaper = MagicMock()
-    h._start_terminal_status_watcher = MagicMock()
-    h._start_stranded_reconcile = MagicMock()
-    h._start_main_tip_sweep = MagicMock()
     h._tag_task_modules = AsyncMock()
 
     # Provide one pending task so the "no pending tasks" check passes.

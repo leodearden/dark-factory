@@ -568,7 +568,6 @@ def _make_main_tip_harness(*, main_sha: str) -> Harness:
     h._escalation_queue = MagicMock()
     h._escalation_queue.make_id = MagicMock(return_value='esc-sweep-1')
     h._escalation_queue.has_open_l1 = MagicMock(return_value=False)
-    h._main_tip_sweep_task = None
     # Distinct from main_sha so the SHA-dedup gate does not short-circuit
     # before verify.run_main_tip_sweep is even called.
     h._last_swept_main_sha = 'stale-' + main_sha[:6]

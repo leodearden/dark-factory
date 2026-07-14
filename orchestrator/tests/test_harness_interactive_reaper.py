@@ -215,19 +215,26 @@ def _neutralise_heavy_startup(harness: Harness) -> None:
     harness.usage_gate = None
     harness.review_checkpoint = None
 
-    harness._start_escalation_server = AsyncMock()
-    harness._start_merge_worker = AsyncMock()
+    # Build the real registry, then neuter start_all/stop_all so no
+    # BackgroundService/ManagedService lifecycle actually spins up (task
+    # 2241/W10-η). The old per-service _start_*/_stop_* mocking pattern no
+    # longer has any effect: the seven sweeps' _start_* names are deleted
+    # outright, and _build_lifecycle_registry() is idempotent, so
+    # pre-building here and stubbing just these two methods is the
+    # sanctioned seam (mirrors test_harness_lifecycle_registry.py's
+    # _make_run_wired_harness). Without this, real BackgroundService loop
+    # tasks — including the real warm-lane-gc pass, which itself calls
+    # _run_interactive_worktree_reaper_pass — spin up and race the
+    # fake_sleep patch in _drive_empty_until_idle_run below, double-firing
+    # the mock this suite asserts is called exactly once.
+    harness._build_lifecycle_registry()
+    assert harness._lifecycle is not None
+    harness._lifecycle.start_all = AsyncMock()
+    harness._lifecycle.stop_all = AsyncMock()
+
     harness._dismiss_stale_escalations = AsyncMock()
     harness._rehydrate_merge_halt = MagicMock()
     harness._file_restored_pause_escalation = MagicMock()
-    harness._start_orphan_l0_reaper = MagicMock()
-    harness._start_terminal_status_watcher = MagicMock()
-    harness._start_watcher_supervisor = MagicMock()
-    harness._start_stranded_reconcile = MagicMock()
-    harness._start_main_tip_sweep = MagicMock()
-    harness._start_no_landings_breaker = MagicMock()  # task 1918 loop
-    harness._start_warm_lane_gc = MagicMock()  # task 1926 loop — neutralised
-    harness._start_deterministic_recon_sweep = MagicMock()  # task 2074 loop — neutralised
     harness._tag_task_modules = AsyncMock()
     harness._recover_crashed_tasks = AsyncMock()
     harness._reconcile_stranded_in_progress = AsyncMock(return_value=0)

@@ -23,7 +23,6 @@ This file covers:
 
 from __future__ import annotations
 
-import asyncio
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -81,7 +80,6 @@ def _make_sweep_harness(*, main_sha: str = MAIN_SHA) -> Harness:
     h._escalation_queue = MagicMock()
     h._escalation_queue.make_id = MagicMock(return_value='esc-sweep-1')
     h._escalation_queue.has_open_l1 = MagicMock(return_value=False)
-    h._main_tip_sweep_task = None
     h._last_swept_main_sha = None
     return h
 
@@ -208,137 +206,3 @@ class TestRunMainTipSweepHarness:
             f'got {h._last_swept_main_sha!r}'
         )
 
-
-# ---------------------------------------------------------------------------
-# step-11: start/stop lifecycle wiring
-# ---------------------------------------------------------------------------
-
-
-def _make_lifecycle_harness(*, enabled: bool = True) -> Harness:
-    """Build a minimal Harness for lifecycle tests (no real project_root needed)."""
-    h = Harness.__new__(Harness)
-    _init_harness_state_for_test(h)
-    config = OrchestratorConfig()
-    config = config.model_copy(update={'main_tip_sweep_enabled': enabled})
-    h.config = config
-    h._main_tip_sweep_task = None
-    h._last_swept_main_sha = None
-    return h
-
-
-class TestMainTipSweepLifecycle:
-    """step-11: _start/_stop_main_tip_sweep lifecycle wiring."""
-
-    def test_start_main_tip_sweep_creates_task(self) -> None:
-        """When main_tip_sweep_enabled=True, _start_main_tip_sweep creates an asyncio.Task
-        named 'main-tip-sweep' and stores it in h._main_tip_sweep_task."""
-        h = _make_lifecycle_harness(enabled=True)
-        mock_task = MagicMock(spec=asyncio.Task)
-        mock_task.done.return_value = False
-        mock_task.get_name.return_value = 'main-tip-sweep'
-
-        def _create_task(coro, *, name=None):
-            coro.close()
-            return mock_task
-
-        with patch('orchestrator.harness.asyncio.create_task', side_effect=_create_task) as mock_ct:
-            h._start_main_tip_sweep()
-
-        assert h._main_tip_sweep_task is mock_task
-        _, kwargs = mock_ct.call_args
-        assert kwargs.get('name') == 'main-tip-sweep', (
-            f'Expected task name main-tip-sweep, got {kwargs.get("name")!r}'
-        )
-
-    def test_start_main_tip_sweep_disabled(self) -> None:
-        """When main_tip_sweep_enabled=False, _start_main_tip_sweep is a no-op."""
-        h = _make_lifecycle_harness(enabled=False)
-        with patch('orchestrator.harness.asyncio.create_task') as mock_ct:
-            h._start_main_tip_sweep()
-            mock_ct.assert_not_called()
-        assert h._main_tip_sweep_task is None
-
-    @pytest.mark.asyncio
-    async def test_stop_main_tip_sweep_cancels(self) -> None:
-        """After _start_main_tip_sweep, _stop_main_tip_sweep cancels the task
-        and resets h._main_tip_sweep_task to None."""
-        h = _make_lifecycle_harness(enabled=True)
-        mock_task = MagicMock(spec=asyncio.Task)
-        mock_task.done.return_value = False
-
-        def _create_task(coro, *, name=None):
-            coro.close()
-            return mock_task
-
-        with patch('orchestrator.harness.asyncio.create_task', side_effect=_create_task):
-            h._start_main_tip_sweep()
-
-        assert h._main_tip_sweep_task is mock_task
-
-        # Make the mock task behave like a cancelled task on await
-        mock_task.cancel.return_value = True
-
-        async def _await_cancelled():
-            raise asyncio.CancelledError()
-
-        mock_task.__await__ = lambda self: _await_cancelled().__await__()
-
-        await h._stop_main_tip_sweep()
-
-        mock_task.cancel.assert_called_once()
-        assert h._main_tip_sweep_task is None
-
-
-# ---------------------------------------------------------------------------
-# task 1907: _main_tip_sweep_loop failure handling — bounded logging + backoff
-# (regression: a failed pass must NOT logger.exception the full traceback, and
-# an immediately-failing pass must NOT tight-spin and starve the event loop —
-# the worker-kill → 60s-timeout → os._exit → suite-hang chain root cause.)
-# ---------------------------------------------------------------------------
-
-
-class TestMainTipSweepLoopFailureHandling:
-    """task 1907: the sweep loop logs a bounded summary and backs off on failure."""
-
-    @pytest.mark.asyncio
-    async def test_loop_failure_is_bounded_and_backs_off_not_spin(self) -> None:
-        """A pass that fails immediately must back off (no tight-spin) and log a
-        bounded summary via logger.error — NOT logger.exception (whose O(frames)
-        traceback formatting on a pathological traceback caused the worker kill).
-        """
-        h = _make_lifecycle_harness(enabled=True)
-        # Interval 0 so the top-of-loop sleep returns immediately: without the
-        # backoff guarantee, a failing pass would spin without yielding.
-        h.config = h.config.model_copy(update={'main_tip_sweep_interval_secs': 0.0})
-
-        calls = {'n': 0}
-
-        async def _failing_pass() -> None:
-            calls['n'] += 1
-            raise RuntimeError('sweep boom')
-
-        h._run_main_tip_sweep = _failing_pass  # type: ignore[method-assign]
-
-        sleeps: list[float] = []
-        real_sleep = asyncio.sleep
-
-        async def _tracking_sleep(delay: float, *a, **k):
-            sleeps.append(delay)
-            # Stop the loop after a couple of failing iterations so the test
-            # terminates deterministically without relying on wall-clock.
-            if calls['n'] >= 2:
-                raise asyncio.CancelledError()
-            return await real_sleep(0)
-
-        with patch('orchestrator.harness.asyncio.sleep', side_effect=_tracking_sleep), \
-                patch('orchestrator.harness.logger') as mock_logger, \
-                pytest.raises(asyncio.CancelledError):
-            await h._main_tip_sweep_loop()
-
-        # logger.exception must NOT be used (pathological-traceback footgun).
-        mock_logger.exception.assert_not_called()
-        # A bounded one-line summary is logged via logger.error per failure.
-        assert mock_logger.error.call_count >= 1, 'expected bounded logger.error summary'
-        # The backoff sleep (60.0s) was requested after a failure — proving the
-        # loop yields a real quiescent gap instead of tight-spinning.
-        assert 60.0 in sleeps, f'expected a 60s backoff sleep, got {sleeps!r}'
