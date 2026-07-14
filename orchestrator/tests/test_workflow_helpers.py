@@ -122,3 +122,26 @@ def test_merge_provenance_factories_identity() -> None:
     assert mp._make is _make
     assert mp._bind_landed_row is _bind_landed_row
     assert mp._Fixture is _Fixture
+
+
+# ---------------------------------------------------------------------------
+# Group B: warm-lane workflow factory (_make_warmlane_workflow)
+# ---------------------------------------------------------------------------
+
+
+def test_warmlane_workflow_factory_smoke(tmp_path) -> None:
+    """_make_warmlane_workflow builds a TaskWorkflow with worktree deliberately unset."""
+    from orchestrator.workflow import TaskWorkflow  # noqa: PLC0415
+    from _workflow_helpers import _make_warmlane_workflow  # noqa: PLC0415
+
+    wf = _make_warmlane_workflow(tmp_path=tmp_path)
+    assert isinstance(wf, TaskWorkflow)
+    assert wf.worktree is None
+
+
+def test_warmlane_workflow_factory_identity() -> None:
+    """Anti-duplication guard: the producer re-imports the SAME object under its old local name."""
+    import test_workflow_warm_lane_requeue as wr  # noqa: PLC0415
+    from _workflow_helpers import _make_warmlane_workflow  # noqa: PLC0415
+
+    assert wr._make_workflow is _make_warmlane_workflow
