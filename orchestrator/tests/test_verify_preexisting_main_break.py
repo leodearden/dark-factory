@@ -564,11 +564,15 @@ class TestVerifyFailureProbeWarmSeed:
             )
 
         assert 'worktree' in captured, 'expected run_scoped_verification to have been called'
-        assert verify_module._is_verify_cold(captured['worktree'], None) is False, (
+        captured_worktree = captured['worktree']
+        assert isinstance(captured_worktree, Path)
+        assert verify_module._is_verify_cold(captured_worktree, None) is False, (
             'expected the probe worktree (no .task/ dir) to resolve WARM in '
             '_is_verify_cold — a future edit must not flip this to cold'
         )
-        assert captured['kwargs'].get('is_merge_verify') is not True, (
+        captured_kwargs = captured['kwargs']
+        assert isinstance(captured_kwargs, dict)
+        assert captured_kwargs.get('is_merge_verify') is not True, (
             'expected the probe to NOT force is_merge_verify=True (that would '
             'push it onto the cold verify-timeout tier)'
         )
