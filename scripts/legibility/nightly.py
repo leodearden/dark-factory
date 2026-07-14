@@ -33,7 +33,7 @@ from pathlib import Path
 if __name__ == '__main__':
     sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from legibility import inventory, sampling  # noqa: E402
+from legibility import digest, inventory, sampling  # noqa: E402
 from legibility.config import LegibilityConfig, load_config  # noqa: E402
 
 # ---------------------------------------------------------------------------
@@ -139,6 +139,47 @@ def select_digest_sessions(
     ``sampling.stratified_sample``."""
     scored = select_scored_records(cfg, projects_root, target_date)
     return sampling.stratified_sample(scored, cfg).selected
+
+
+# ---------------------------------------------------------------------------
+# build_digests — render one digest per selected session, isolating crashes
+# ---------------------------------------------------------------------------
+
+DEFAULT_MAX_DIGEST_BYTES = 15360
+
+
+def build_digests(
+    selected: Sequence[sampling.ScoredRecord],
+    *,
+    max_bytes: int = DEFAULT_MAX_DIGEST_BYTES,
+    build=digest.build_digest,
+) -> tuple[list[str], list[tuple[str, str]]]:
+    """Render one confusion digest per *selected* record via *build*
+    (default :func:`legibility.digest.build_digest`), passing beta's already
+    -authoritative ``rec.stratum`` as ``agent_class_override`` -- alpha never
+    re-guesses when the caller already knows.
+
+    Any exception raised by *build* for a given record is isolated: it is
+    captured as ``(session_basename, reason)`` in the returned
+    ``extractor_failures`` list rather than propagated or fabricated into a
+    placeholder digest, so a driving caller (:func:`run_nightly`) can treat
+    a non-empty ``extractor_failures`` as the extractor-crash fail-loud
+    trigger (PRD decision 8).
+    """
+    digests: list[str] = []
+    extractor_failures: list[tuple[str, str]] = []
+
+    for record in selected:
+        try:
+            rendered = build(
+                record.path, agent_class_override=record.stratum, max_bytes=max_bytes,
+            )
+        except Exception as exc:  # noqa: BLE001 - isolate, never propagate/fabricate
+            extractor_failures.append((record.path.name, str(exc)))
+            continue
+        digests.append(rendered)
+
+    return digests, extractor_failures
 
 
 if __name__ == '__main__':
