@@ -295,15 +295,24 @@ Review this run and provide your verdict as JSON.
                 action_taken=VerdictAction.none,
             )
         except (json.JSONDecodeError, IndexError, KeyError) as e:
-            logger.warning(f'Failed to parse judge response: {e}')
+            logger.error(f'Failed to parse judge response: {e}')
+            # severity=serious is deliberate: it routes through the existing
+            # halt path (review_run() halts on config.halt_on_judge_serious;
+            # _check_error_trends treats 'serious' as non-ok) so a systemic
+            # judge/CLI outage surfaces loudly instead of hiding behind a
+            # fabricated fail-soft 'minor' verdict.
             return JudgeVerdict(
                 run_id=run_id,
                 reviewed_at=datetime.now(UTC),
-                severity=VerdictSeverity.minor,
+                severity=VerdictSeverity.serious,
                 findings=[{
-                    'issue': 'Judge response could not be parsed',
-                    'severity': 'minor',
-                    'recommendation': 'Manual review recommended',
+                    'issue': f'Judge response could not be parsed: {e}',
+                    'severity': 'serious',
+                    'recommendation': (
+                        'This verdict was not a real review — the judge output was '
+                        'unparseable. Investigate the judge LLM/CLI output before '
+                        'trusting subsequent verdicts.'
+                    ),
                 }],
                 action_taken=VerdictAction.none,
             )
