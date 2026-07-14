@@ -20,6 +20,7 @@ import pytest
 SCRIPT = Path(__file__).parent.parent / "deploy" / "flip-reify-gate-exclude-heavy.sh"
 CONFIG_FILE = "orchestrator.yaml"
 KNOB = "REIFY_GATE_EXCLUDE_HEAVY"
+KNOB_RUN_ALL = "REIFY_RUN_ALL_EXCLUDE_HOST_INFRA"
 
 
 # ---------------------------------------------------------------------------
@@ -45,8 +46,8 @@ def _fixture_config(state):
 
     knob_line = {
         "unflipped": "",
-        "flipped": f'  {KNOB}: "1"\n',
-        "flipped_zero": f'  {KNOB}: "0"\n',
+        "flipped": f'  {KNOB_RUN_ALL}: "1"\n  {KNOB}: "1"\n',
+        "flipped_zero": f'  {KNOB_RUN_ALL}: "0"\n  {KNOB}: "0"\n',
     }[state]
 
     return (
@@ -70,9 +71,13 @@ def _make_fake_reify_repo(tmp_path, *, state="unflipped", failing_precommit=Fals
 
     state:
       "unflipped"     - no REIFY_GATE_EXCLUDE_HEAVY key present (default).
-      "flipped"       - REIFY_GATE_EXCLUDE_HEAVY: "1" already present.
-      "flipped_zero"  - REIFY_GATE_EXCLUDE_HEAVY: "0" already present (a
-                         stray/stale value apply must normalize to "1").
+      "flipped"       - both REIFY_GATE_EXCLUDE_HEAVY: "1" and
+                         REIFY_RUN_ALL_EXCLUDE_HOST_INFRA: "1" already
+                         present (is_flipped() requires every knob).
+      "flipped_zero"  - both REIFY_GATE_EXCLUDE_HEAVY: "0" and
+                         REIFY_RUN_ALL_EXCLUDE_HOST_INFRA: "0" already
+                         present (stray/stale values apply must
+                         normalize to "1", independently per knob).
       "no_verify_env" - no top-level verify_env: anchor at all (malformed
                          config); apply must fail loudly rather than
                          silently no-op.
@@ -143,9 +148,11 @@ def _head_files(repo):
 # ---------------------------------------------------------------------------
 
 def test_apply_inserts_knob_and_commits(tmp_path):
-    """Default (no-arg) apply mode inserts the knob as the first child of
-    verify_env:, preserves the surrounding comments/children, commits the
-    change in the reify repo, and exits 0."""
+    """Default (no-arg) apply mode inserts BOTH consolidated knobs as the
+    first two children of verify_env: (last-applied knob lands first: GATE
+    is applied first, then RUN_ALL is inserted ahead of it), preserves the
+    surrounding comments/children, commits the change in the reify repo,
+    and exits 0."""
     repo = _make_fake_reify_repo(tmp_path)
     before_commits = _commit_count(repo)
 
@@ -158,12 +165,25 @@ def test_apply_inserts_knob_and_commits(tmp_path):
 
     lines = _read_config(repo).splitlines()
     verify_env_idx = lines.index("verify_env:")
-    assert lines[verify_env_idx + 1] == f'  {KNOB}: "1"', (
-        f"Expected the knob as the first child right after verify_env:; "
+    assert lines[verify_env_idx + 1] == f'  {KNOB_RUN_ALL}: "1"', (
+        f"Expected {KNOB_RUN_ALL} as the first child right after "
+        f"verify_env: (last-applied knob lands first); "
+        f"got: {lines[verify_env_idx:verify_env_idx + 3]!r}"
+    )
+    assert lines[verify_env_idx + 2] == f'  {KNOB}: "1"', (
+        f"Expected {KNOB} as the second child right after verify_env:; "
         f"got: {lines[verify_env_idx:verify_env_idx + 3]!r}"
     )
 
     config_text = _read_config(repo)
+    assert config_text.count(KNOB_RUN_ALL) == 1, (
+        f"Expected exactly one occurrence of {KNOB_RUN_ALL}; got "
+        f"{config_text.count(KNOB_RUN_ALL)}\nconfig:\n{config_text}"
+    )
+    assert config_text.count(KNOB) == 1, (
+        f"Expected exactly one occurrence of {KNOB}; got "
+        f"{config_text.count(KNOB)}\nconfig:\n{config_text}"
+    )
     assert "RUSTC_WRAPPER: sccache" in config_text, "pre-existing child dropped"
     assert "CARGO_INCREMENTAL is required alongside sccache" in config_text, (
         "pre-existing comment dropped"
@@ -207,6 +227,10 @@ def test_apply_twice_is_idempotent_no_second_commit(tmp_path):
         f"Expected exactly one occurrence of {KNOB}; got {config_text.count(KNOB)}\n"
         f"config:\n{config_text}"
     )
+    assert config_text.count(KNOB_RUN_ALL) == 1, (
+        f"Expected exactly one occurrence of {KNOB_RUN_ALL}; got "
+        f"{config_text.count(KNOB_RUN_ALL)}\nconfig:\n{config_text}"
+    )
     commits_after_second = _commit_count(repo)
     assert commits_after_second == commits_after_first, (
         f"Expected no new commit on the second (already-flipped) run; "
@@ -215,8 +239,11 @@ def test_apply_twice_is_idempotent_no_second_commit(tmp_path):
 
 
 def test_apply_normalizes_stray_zero_value_to_single_key(tmp_path):
-    """A pre-existing REIFY_GATE_EXCLUDE_HEAVY: "0" is normalized to "1"
-    with no duplicate key."""
+    """A pre-existing "0" value is normalized to "1" with no duplicate
+    key, for BOTH REIFY_GATE_EXCLUDE_HEAVY and
+    REIFY_RUN_ALL_EXCLUDE_HOST_INFRA -- each knob is normalized by its
+    own apply_knob pass, so both must be covered rather than just the
+    GATE knob."""
     repo = _make_fake_reify_repo(tmp_path, state="flipped_zero")
 
     result = _run_script(repo)
@@ -226,14 +253,18 @@ def test_apply_normalizes_stray_zero_value_to_single_key(tmp_path):
         f"stdout={result.stdout!r} stderr={result.stderr!r}"
     )
     config_text = _read_config(repo)
-    assert config_text.count(KNOB) == 1, (
-        f"Expected exactly one occurrence of {KNOB} after normalization; "
-        f"got {config_text.count(KNOB)}\nconfig:\n{config_text}"
-    )
-    assert f'{KNOB}: "1"' in config_text, (
-        f"Expected the stray \"0\" value normalized to \"1\"; config:\n{config_text}"
-    )
-    assert f'{KNOB}: "0"' not in config_text
+    for knob in (KNOB, KNOB_RUN_ALL):
+        assert config_text.count(knob) == 1, (
+            f"Expected exactly one occurrence of {knob} after normalization; "
+            f"got {config_text.count(knob)}\nconfig:\n{config_text}"
+        )
+        assert f'{knob}: "1"' in config_text, (
+            f"Expected the stray \"0\" value for {knob} normalized to \"1\"; "
+            f"config:\n{config_text}"
+        )
+        assert f'{knob}: "0"' not in config_text, (
+            f"Expected no stray \"0\" value remaining for {knob}; config:\n{config_text}"
+        )
 
 
 # ---------------------------------------------------------------------------
