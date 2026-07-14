@@ -34,6 +34,12 @@ from fused_memory.middleware.lock_charter_guard import (
     lock_charter_error,
 )
 from fused_memory.middleware.premise_lint_guard import premise_lint_error
+from fused_memory.middleware.routing_intent_guard import (
+    routing_intent_enforced,
+    routing_intent_finding,
+    routing_intent_reject,
+    routing_intent_warning,
+)
 from fused_memory.middleware.task_interceptor import (
     TERMINAL_STATUSES,
     _is_ticket_id,
@@ -3289,7 +3295,26 @@ def create_mcp_server(
         if _premise_err is not None:
             return _premise_err
 
-        return await task_interceptor.submit_task(
+        # Routing-intent lint (task 2563) — declaration-only: a
+        # task_kind='normal' submission whose text DECLARES a different
+        # execution path (e.g. "DO NOT IMPLEMENT", "no-code", "deterministic;
+        # no worktree") is flagged (default) or, when
+        # routing_intent_enforced() is True, hard-rejected. Placed here —
+        # after premise-lint, before the single task_interceptor.submit_task
+        # call below — so ONE placement covers both the curator path and the
+        # planning_mode path (their branch split happens INSIDE
+        # task_interceptor.submit_task). Never coerces task_kind or
+        # execution_class — see routing_intent_guard.py's module docstring.
+        _routing_finding = routing_intent_finding(
+            title, description, details, task_kind=task_kind, metadata=metadata,
+        )
+        _routing_warning: dict[str, Any] | None = None
+        if _routing_finding is not None:
+            if routing_intent_enforced():
+                return routing_intent_reject(_routing_finding)
+            _routing_warning = routing_intent_warning(_routing_finding)
+
+        result = await task_interceptor.submit_task(
             project_root=project_root,
             prompt=prompt,
             title=title,
@@ -3303,6 +3328,9 @@ def create_mcp_server(
             routing_override_reason=routing_override_reason,
             agent_id=agent_id,
         )
+        if _routing_warning is not None and isinstance(result, dict):
+            result.update(_routing_warning)
+        return result
 
     @mcp.tool()
     @mcp_tool_errors()

@@ -1,6 +1,7 @@
 """Tests for the submit_task and resolve_ticket MCP tool registrations."""
 
 import json
+import logging
 import os
 from unittest.mock import AsyncMock
 
@@ -307,3 +308,107 @@ async def test_cancel_ticket_mcp_tool_delegates_to_interceptor(mcp_server, task_
     assert result == {'status': 'cancelled', 'ticket_id': 'tkt_X'}, (
         f'Expected cancelled dict, got: {result!r}'
     )
+
+
+# ------------------------------------------------------------------
+# routing-intent lint guard — MCP-boundary integration (task 2563)
+#
+# The unit-level detection/payload/flag matrix for routing_intent_finding /
+# routing_intent_reject / routing_intent_warning / routing_intent_enforced
+# lives in test_routing_intent_guard.py; these tests assert the guard is
+# WIRED into the submit_task tool boundary, covering both the curator path
+# and the planning_mode path (a single guard placement before the one
+# task_interceptor.submit_task call covers both — see
+# routing_intent_guard.py's module docstring). RED: the guard is not yet
+# wired into tools.py.
+# ------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_routing_intent_warn_mode_flags_and_still_submits(
+    mcp_server, task_interceptor, monkeypatch, caplog,
+):
+    """WARN mode (FUSED_ROUTING_INTENT_ENFORCE unset) + a marker-bearing
+    task_kind='normal' submission -> result carries 'routing_intent_warning',
+    the interceptor is still called (submission proceeds unblocked), and a
+    'routing_intent_lint.flagged' WARNING is logged (the census line)."""
+    monkeypatch.delenv('FUSED_ROUTING_INTENT_ENFORCE', raising=False)
+    with caplog.at_level(logging.WARNING):
+        result = await mcp_server._tool_manager.call_tool(
+            'submit_task',
+            {
+                'project_root': '/project',
+                'title': 'DO NOT IMPLEMENT this; escalate to a human instead of implementing.',
+                'task_kind': 'normal',
+            },
+        )
+    assert 'routing_intent_warning' in result, f'Expected warning payload, got: {result!r}'
+    task_interceptor.submit_task.assert_called_once()
+    assert any('routing_intent_lint.flagged' in rec.message for rec in caplog.records), (
+        f'Expected a routing_intent_lint.flagged census WARNING, got records: {caplog.records!r}'
+    )
+
+
+@pytest.mark.asyncio
+async def test_routing_intent_passing_mention_not_flagged(mcp_server, task_interceptor, monkeypatch):
+    """A genuine code task whose prose merely mentions routing-adjacent
+    terminology in passing (task-2408 shape) -> no 'routing_intent_warning',
+    interceptor called normally (no false positive at the wiring level)."""
+    monkeypatch.delenv('FUSED_ROUTING_INTENT_ENFORCE', raising=False)
+    result = await mcp_server._tool_manager.call_tool(
+        'submit_task',
+        {
+            'project_root': '/project',
+            'title': 'Refactor the deterministic pure-gate helper',
+            'description': 'Implement the fix in X.',
+            'task_kind': 'normal',
+        },
+    )
+    assert 'routing_intent_warning' not in result
+    task_interceptor.submit_task.assert_called_once()
+
+
+@pytest.mark.asyncio
+async def test_routing_intent_reject_mode_blocks_submission(mcp_server, task_interceptor, monkeypatch):
+    """REJECT mode (FUSED_ROUTING_INTENT_ENFORCE=1) + a marker-bearing
+    task_kind='normal' submission -> ValidationError, interceptor never
+    reached."""
+    monkeypatch.setenv('FUSED_ROUTING_INTENT_ENFORCE', '1')
+    result = await mcp_server._tool_manager.call_tool(
+        'submit_task',
+        {
+            'project_root': '/project',
+            'title': 'DO NOT IMPLEMENT this; escalate to a human instead of implementing.',
+            'task_kind': 'normal',
+        },
+    )
+    assert result.get('error_type') == 'ValidationError', f'Expected ValidationError, got: {result!r}'
+    task_interceptor.submit_task.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_routing_intent_warning_merged_into_planning_mode_result(
+    mcp_server, task_interceptor, monkeypatch,
+):
+    """planning_mode=True + a marker-bearing submission in WARN mode ->
+    'routing_intent_warning' is merged into the planning_mode result dict,
+    proving the guard placement covers the planning_mode path (which
+    bypasses the curator-side guards 1898/2225/2085) via the same single
+    wiring point used for the curator path."""
+    monkeypatch.delenv('FUSED_ROUTING_INTENT_ENFORCE', raising=False)
+    task_interceptor.submit_task = AsyncMock(
+        return_value={'task_id': '5', 'status': 'deferred', 'planning_mode': True}
+    )
+    result = await mcp_server._tool_manager.call_tool(
+        'submit_task',
+        {
+            'project_root': '/project',
+            'title': 'DO NOT IMPLEMENT this; escalate to a human instead of implementing.',
+            'task_kind': 'normal',
+            'planning_mode': True,
+        },
+    )
+    assert result.get('task_id') == '5'
+    assert result.get('status') == 'deferred'
+    assert result.get('planning_mode') is True
+    assert 'routing_intent_warning' in result, f'Expected warning payload, got: {result!r}'

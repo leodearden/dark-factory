@@ -54,6 +54,8 @@ See `references/author-mode.md`.
 
 Read a committed PRD, re-walk gates, then file the whole task batch via fused-memory `submit_task` with **`planning_mode=True` on every task, no exceptions** (synchronous, curator-bypassing; lands them as `deferred`, returns `task_id` directly). After filing, wire **all** dependencies, then flip the **entire batch** `deferred` → `pending` in a single bulk `commit_planning` call — fused-memory persists the flip directly; there's no separate git-commit step.
 
+`planning_mode` bypasses the curator-side routing guards, so **every filed leaf must self-declare its execution path** (`task_kind`, plus `metadata.execution_class` for genuinely non-code leaves) — a `task_kind="normal"` leaf whose own text declares a different path (e.g. "DO NOT IMPLEMENT", "no-code", "deterministic; no worktree") is flagged by the `submit_task` routing-intent lint. See `references/decompose-mode.md` Step 3.
+
 See `references/decompose-mode.md`.
 
 ## Gates
