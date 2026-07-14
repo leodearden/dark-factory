@@ -43,6 +43,7 @@ find_near_duplicate_memory_groups = _mod.find_near_duplicate_memory_groups
 pick_survivor = _mod.pick_survivor
 build_sweep_plan = _mod.build_sweep_plan
 fetch_procedural_memories = _mod.fetch_procedural_memories
+apply_deletions = _mod.apply_deletions
 
 
 # ---------------------------------------------------------------------------
@@ -483,3 +484,76 @@ class TestFetchProceduralMemoriesEmptyScan:
         result = await fetch_procedural_memories(memory, 'dark_factory', scan_limit=100)
 
         assert result == []
+
+
+# ===========================================================================
+# Step-9: apply_deletions
+# ===========================================================================
+
+@pytest.mark.asyncio
+class TestApplyDeletionsDryRun:
+    """dry_run=True performs no delete_memory calls and returns zero counts."""
+
+    async def test_dry_run_no_calls_zero_counts(self):
+        from unittest.mock import AsyncMock, MagicMock  # noqa: PLC0415
+
+        memory = MagicMock()
+        memory.delete_memory = AsyncMock(return_value={'status': 'deleted'})
+        plan = {'delete_candidates': ['m1', 'm2']}
+
+        result = await apply_deletions(memory, 'dark_factory', plan, dry_run=True)
+
+        memory.delete_memory.assert_not_awaited()
+        assert result == {'deleted': 0, 'delete_errors': 0}
+
+
+@pytest.mark.asyncio
+class TestApplyDeletionsApply:
+    """dry_run=False deletes each candidate once with the expected kwargs."""
+
+    async def test_delete_memory_called_once_per_candidate(self):
+        from unittest.mock import AsyncMock, MagicMock  # noqa: PLC0415
+
+        memory = MagicMock()
+        memory.delete_memory = AsyncMock(return_value={'status': 'deleted'})
+        plan = {'delete_candidates': ['m1', 'm2', 'm3']}
+
+        result = await apply_deletions(memory, 'dark_factory', plan, dry_run=False)
+
+        assert memory.delete_memory.await_count == 3
+        assert result == {'deleted': 3, 'delete_errors': 0}
+
+    async def test_delete_memory_called_with_expected_kwargs(self):
+        from unittest.mock import AsyncMock, MagicMock  # noqa: PLC0415
+
+        memory = MagicMock()
+        memory.delete_memory = AsyncMock(return_value={'status': 'deleted'})
+        plan = {'delete_candidates': ['m1']}
+
+        await apply_deletions(memory, 'dark_factory', plan, dry_run=False)
+
+        memory.delete_memory.assert_awaited_once_with(
+            'm1', store='mem0', project_id='dark_factory',
+        )
+
+
+@pytest.mark.asyncio
+class TestApplyDeletionsPartialFailure:
+    """A raising delete_memory call does not abort the remaining deletes."""
+
+    async def test_partial_failure_counted_others_proceed(self):
+        from unittest.mock import AsyncMock, MagicMock  # noqa: PLC0415
+
+        async def _side_effect(memory_id, **kwargs):
+            if memory_id == 'bad':
+                raise RuntimeError('Qdrant error')
+            return {'status': 'deleted'}
+
+        memory = MagicMock()
+        memory.delete_memory = AsyncMock(side_effect=_side_effect)
+        plan = {'delete_candidates': ['good1', 'bad', 'good2']}
+
+        result = await apply_deletions(memory, 'dark_factory', plan, dry_run=False)
+
+        assert memory.delete_memory.await_count == 3
+        assert result == {'deleted': 2, 'delete_errors': 1}
