@@ -31,6 +31,7 @@ from shared.config_dir import TaskConfigDir
 from orchestrator.agents.invoke import invoke_agent  # noqa: E402
 from orchestrator.agents.skill_prompt import load_skill_system_prompt
 from orchestrator.unblock_types import BlockClass, BlockRecord, classify_block_reason
+from orchestrator.workflow_types import BlockDisposition, classify_failure
 
 logger = logging.getLogger(__name__)
 
@@ -359,11 +360,26 @@ async def run_dry_run_unblock(
             # A retryable infra wedge, not a substantive investigation
             # conclusion — must NOT surface as 'investigation_failed' (that
             # shape is terminal for the B3 low-risk auto-unblock path).
+            # BD-1: disp is the SAME classify_failure(cap_exc) table
+            # workflow.py/steward.py/review_checkpoint.py all consult for an
+            # AllAccountsCappedException, single-sourcing the log text and
+            # the entry's proposal_text/block_class.
+            disp = classify_failure(cap_exc)
             logger.warning(
-                'dry_run_unblock: all accounts capped for task %s: %s',
-                task_id, cap_exc,
+                'dry_run_unblock: %s for task %s: %s',
+                disp.reason_prefix.lower(), task_id, cap_exc,
             )
-            entry = _cap_exhausted_entry(reason=reason, exc=cap_exc)
+            entry = _cap_exhausted_entry(reason=reason, exc=cap_exc, disp=disp)
+            # This entry's block_class reflects THIS cap-hit, not the
+            # ORIGINAL task's block disposition (the outer `block_class`
+            # param, threaded from _mark_blocked) — no investigation of the
+            # original blocking reason ever ran, so inheriting that outer
+            # disposition here would misrepresent an uninvestigated cap
+            # wedge as e.g. POST_MERGE_RED_MAIN. Rebinding the local
+            # `block_class` means the single-point stamping below (`resolved_
+            # class = block_class if block_class is not None else ...`)
+            # picks up disp.block_class naturally.
+            block_class = disp.block_class
             result = None
 
         preserve_config_dir = result is not None and is_zero_output_timeout(result)
@@ -595,7 +611,9 @@ def _build_entry(result: Any, *, reason: str, budget_usd: float) -> dict[str, An
     }
 
 
-def _cap_exhausted_entry(*, reason: str, exc: AllAccountsCappedException) -> dict[str, Any]:
+def _cap_exhausted_entry(
+    *, reason: str, exc: AllAccountsCappedException, disp: BlockDisposition,
+) -> dict[str, Any]:
     """Build the retryable infra_failure entry for a cap-exhausted investigation.
 
     AllAccountsCappedException means invoke_with_cap_retry exceeded the
@@ -603,13 +621,20 @@ def _cap_exhausted_entry(*, reason: str, exc: AllAccountsCappedException) -> dic
     AgentResult was ever produced, so this reuses the None-safe
     ``_failure_diagnostics(None)`` shape rather than the AgentResult-derived
     one, matching the task-2020 infra_failure entry shape.
+
+    *disp* (BD-1) is ``classify_failure(exc)`` — the SAME disposition-table
+    lookup workflow.py/steward.py/review_checkpoint.py all consult for an
+    ``AllAccountsCappedException``, single-sourcing ``proposal_text``'s
+    leading phrase (the caller separately rebinds the outer ``block_class``
+    from ``disp.block_class`` too — see ``run_dry_run_unblock``'s except
+    clause).
     """
     now = _now_iso()
     return {
         'status': 'infra_failure',
         'proposal_text': (
             f'Infra wedge (retryable, not a human-review conclusion): '
-            f'all accounts capped after {exc.retries} retries '
+            f'{disp.reason_prefix.lower()} after {exc.retries} retries '
             f'({exc.elapsed_secs:.1f}s elapsed)'
         ),
         'risk_label': _HUMAN_REVIEW_REQUIRED,
