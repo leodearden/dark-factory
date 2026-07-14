@@ -48,6 +48,7 @@ __all__ = [
     "StewardResolved",
     "StewardTerminalDecision",
     "TerminalReport",
+    "WorkflowCancelled",
     "WorkflowOutcome",
     "WorkflowState",
     "WorkflowStateMachine",
@@ -666,3 +667,19 @@ class WorkflowStateMachine:
         transition.
         """
         self._state = to
+
+
+@dataclass(frozen=True)
+class WorkflowCancelled(Exception):
+    """The ONE typed cancellation signal (CX-1, PRD §8.1).
+
+    Raised by :class:`CancellationScope` and caught at EXACTLY ONE place —
+    ``TaskWorkflow.run()`` — regardless of whether the cancellation
+    originated from the harness's hard ``task.cancel()`` (``kind='hard'``)
+    or from the workflow's own soft ``_cancel_event`` (``kind='soft'``).
+    Replaces the ``sys.exc_info()`` B1 sniff (workflow.py) and the harness's
+    B2 ``synthetic_cancel`` dual-guard — a two-file "both must fire" comment
+    contract — with one exception type carrying the distinction as data.
+    """
+
+    kind: Literal['hard', 'soft']
