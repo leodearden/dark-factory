@@ -41,6 +41,7 @@ from __future__ import annotations
 
 import logging
 from pathlib import Path
+from typing import Literal
 from unittest.mock import AsyncMock, patch
 
 import pytest
@@ -905,7 +906,7 @@ class TestNonScopingBranchesPreserved:
     @pytest.mark.asyncio
     @pytest.mark.parametrize('role', ['task', 'merge'])
     async def test_docs_only_module_configs_branch_trivially_passes(
-        self, tmp_path: Path, role: str,
+        self, tmp_path: Path, role: Literal['task', 'merge'],
     ):
         """(a) .md-only diff, module_configs branch -> TRIVIAL, zero
         run_verification calls, at BOTH role='task' and role='merge' (no
@@ -935,7 +936,7 @@ class TestNonScopingBranchesPreserved:
     @pytest.mark.asyncio
     @pytest.mark.parametrize('role', ['task', 'merge'])
     async def test_docs_only_no_module_configs_branch_trivially_passes(
-        self, tmp_path: Path, role: str,
+        self, tmp_path: Path, role: Literal['task', 'merge'],
     ):
         """(a) .md-only diff, no-module_configs branch — the mirror of the
         module_configs short-circuit above (verify.py's "Mirror the same
