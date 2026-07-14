@@ -69,7 +69,7 @@ Each gate has a calibrated response level. See `references/gates.md` for what ea
 | **G5** | High-stakes / architecturally-complex PRDs use approach **B + H** (contracts + two-way boundary tests) rather than bare B | **prompt with heuristic** |
 | **G6** | Every signal asserting a number/exactness/end-to-end capability/rejection has its premise validated — achievable, true, producible from the task's own dependency set, and rejection-mechanism-backed | **block** |
 | **G7** | Every task passes the five design invariants (docs/legibility/design-invariants.md); a hit blocks queueing until redesigned or waived with recorded rationale | **block** (decompose; advisory walk in author mode) |
-| **Manifest** | Per-leaf capability→evidence bindings committed beside the PRD (mechanizes G3+G6: anti-orphan/wired, anti-inversion, field-population, grammar-fixture, numeric-floor); any FAIL binding blocks queueing | **block** (decompose) |
+| **Manifest** | Per-leaf capability→evidence bindings committed beside the PRD, plus a machine-readable YAML sidecar twin carrying optional `delivered_check` bindings (mechanizes G3+G6: anti-orphan/wired, anti-inversion, field-population, grammar-fixture, numeric-floor); any FAIL binding blocks queueing | **block** (decompose) |
 | **META** | The "yes" question above | **block** at PRD save |
 
 - `block` — the phase cannot complete until the gap is resolved.
@@ -85,7 +85,7 @@ Each gate has a calibrated response level. See `references/gates.md` for what ea
 **Decompose mode:**
 - A batch of tasks filed via `submit_task` with `planning_mode=True` (always). Each carries metadata fields `user_observable_signal`, `consumer_ref`, and a substrate-confirmed flag (e.g. `grammar_confirmed`).
 - All declared dependencies (intra-batch and out-of-batch, including cross-PRD) wired via `add_dependency` while the batch is still `deferred`.
-- A committed **capability manifest** beside the PRD binding each leaf signal's asserted capabilities to evidence (mechanizing G3+G6); any FAIL binding blocks the batch until resolved.
+- A committed **capability manifest** beside the PRD binding each leaf signal's asserted capabilities to evidence (mechanizing G3+G6) — plus its machine-readable **YAML sidecar twin** (`<prd-stem>.capability-manifest.yaml`) carrying the same bindings' optional `delivered_check`s. Any FAIL binding blocks the batch until resolved. `commit_planning` stamps real task ids into the sidecar and copies its mechanical checks into producer `metadata.delivered_checks`; the session commits the stamped sidecar in the same turn (`decompose-mode.md` Step 5.5).
 - The whole batch flipped `deferred` → `pending` together in a single bulk `commit_planning` call — never one-at-a-time.
 - The orchestrator does **not** currently read the `user_observable_signal` / `consumer_ref` / substrate-confirmed metadata fields; they are substrate for a future tracking-infra session. Surface this in the hand-back.
 
