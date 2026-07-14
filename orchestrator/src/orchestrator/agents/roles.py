@@ -2,6 +2,23 @@
 
 import textwrap
 from dataclasses import dataclass, field
+from typing import Literal
+
+# Maps each MCP-family name to the allowed_tools prefixes that "belong" to
+# it.  Used by AgentRole.__post_init__ (below) to enforce that wiring a tool
+# family is a property OF THE ROLE, not a decision made elsewhere by
+# name-string membership (W9-η, reify esc-4943-54: simple_task's allowed_tools
+# referenced fused-memory/escalation/plan-tools tools, but the _invoke()-level
+# gate tuples forgot to list it, so its sessions were told to call tools that
+# did not exist and the Lever-C fast-path silently always fell through to the
+# architect).  jcodemunch tools intentionally have no prefix entry here — they
+# ride inside the 'orchestrator' MCP config but are not themselves a trigger
+# for requiring a family (a role may use jcodemunch alone with no family
+# declared, e.g. reviewer_comprehensive).
+_FAMILY_TOOL_PREFIXES: dict[str, tuple[str, ...]] = {
+    'orchestrator': ('mcp__fused-memory__', 'mcp__escalation__'),
+    'plan_tools': ('mcp__plan-tools__',),
+}
 
 
 @dataclass
@@ -13,6 +30,61 @@ class AgentRole:
     default_model: str = 'opus'
     default_budget: float = 5.0
     default_max_turns: int = 50
+    # Which MCP server families are WIRED for this role's sessions (a lower
+    # bound relative to allowed_tools — see __post_init__).  Consumed by
+    # workflow.py's _invoke() to decide whether to attach the
+    # orchestrator-assembled MCP config and/or the per-worktree plan-tools
+    # stdio server, replacing the old _MCP_CONFIG_ROLES / _PLAN_TOOLS_ROLES
+    # name-string tuples.
+    mcp_families: frozenset[Literal['orchestrator', 'plan_tools']] = frozenset()
+    # Whether this role's sessions run inside the module sandbox. Replaces
+    # the old `role.name in ('implementer', 'debugger')` check in _invoke().
+    sandboxed: bool = False
+
+    def __post_init__(self) -> None:
+        """Import-time capability assertion (W9-η, reify esc-4943-54 class).
+
+        One-way only: if allowed_tools references a tool belonging to a
+        family, that family MUST be declared in mcp_families, or the role's
+        sessions would be instructed (via system_prompt/allowed_tools) to
+        call tools that are never actually wired in by _invoke(). The
+        reverse is fine — a role may declare a family with no matching tool
+        (e.g. judge declares 'orchestrator' purely to get an MCP config for
+        its jcodemunch tools, with no fused-memory/escalation tool in its
+        allowed_tools).
+
+        Also guards the mcp_families Literal against drifting out of sync
+        with _FAMILY_TOOL_PREFIXES: a family with no prefix-mapping entry
+        would make the loop below silently skip validation for it,
+        reopening this same drift class for the new family.
+        """
+        unknown_families = self.mcp_families - _FAMILY_TOOL_PREFIXES.keys()
+        if unknown_families:
+            raise ValueError(
+                f'AgentRole {self.name!r} declares mcp_families='
+                f'{unknown_families!r} with no matching entry in '
+                f'_FAMILY_TOOL_PREFIXES (known families: '
+                f'{sorted(_FAMILY_TOOL_PREFIXES)!r}). Every family usable in '
+                'mcp_families must have a tool-prefix mapping, or this '
+                'capability assertion silently stops validating that family '
+                '(reopening the SIMPLE_TASK-fallthrough regression class, '
+                'reify esc-4943-54, for it).'
+            )
+        for family, prefixes in _FAMILY_TOOL_PREFIXES.items():
+            if family in self.mcp_families:
+                continue
+            offending = [t for t in self.allowed_tools if t.startswith(prefixes)]
+            if offending:
+                raise ValueError(
+                    f'AgentRole {self.name!r} allows tool(s) {offending!r} which '
+                    f"require the {family!r} MCP family to be wired, but "
+                    f"{family!r} is not in mcp_families={self.mcp_families!r}. "
+                    'A role whose allowed_tools reference an MCP tool family '
+                    'must also declare that family, or its sessions are told '
+                    'to call tools that do not exist in the session (the '
+                    'SIMPLE_TASK-fallthrough regression class, reify '
+                    'esc-4943-54).'
+                )
 
 
 # --- Read-only tools for analysis roles ---
@@ -243,6 +315,7 @@ Then stop.  The orchestrator files a level-1 design_concern escalation; the auto
     default_model='opus',
     default_budget=5.0,
     default_max_turns=50,
+    mcp_families=frozenset({'orchestrator', 'plan_tools'}),
 )
 
 
@@ -313,6 +386,8 @@ expansion rather than trying to work around the restriction.
     default_model='opus',
     default_budget=10.0,
     default_max_turns=80,
+    mcp_families=frozenset({'orchestrator', 'plan_tools'}),
+    sandboxed=True,
 )
 
 
@@ -373,6 +448,8 @@ expansion rather than trying to work around the restriction.
     default_model='opus',
     default_budget=5.0,
     default_max_turns=50,
+    mcp_families=frozenset({'orchestrator', 'plan_tools'}),
+    sandboxed=True,
 )
 
 
@@ -523,6 +600,10 @@ You MUST output ONLY valid JSON matching the schema provided by the
     default_model='sonnet',
     default_budget=0.50,
     default_max_turns=15,
+    # No fused-memory/escalation tool in allowed_tools — 'orchestrator' is
+    # declared purely so _invoke() attaches an MCP config for the
+    # jcodemunch tools above (one-way lower bound, see __post_init__).
+    mcp_families=frozenset({'orchestrator'}),
 )
 
 
@@ -592,6 +673,7 @@ git add -- . ':!.task'
     default_model='opus',
     default_budget=5.0,
     default_max_turns=50,
+    mcp_families=frozenset({'orchestrator'}),
 )
 
 
@@ -953,6 +1035,11 @@ for this kind too (post-3092 phantom-done hardening, 2026-05-09).
     default_model='opus',
     default_budget=5.0,
     default_max_turns=100,
+    # Runs in its own dispatcher (TaskSteward), not through _invoke(), but
+    # the import-time assertion checks ALL roles — steward genuinely
+    # references fused-memory/escalation tools above, so it must declare
+    # 'orchestrator' too.
+    mcp_families=frozenset({'orchestrator'}),
 )
 
 
@@ -1075,6 +1162,10 @@ Use the `escalate_info` MCP tool for findings that need human judgment:
     default_model='opus',
     default_budget=15.0,
     default_max_turns=100,
+    # Runs in its own dispatcher (ReviewCheckpoint), not through _invoke(),
+    # but the import-time assertion checks ALL roles — deep_reviewer
+    # genuinely references fused-memory/escalation tools above.
+    mcp_families=frozenset({'orchestrator'}),
 )
 
 
@@ -1168,6 +1259,11 @@ the simple path — stop and let the architect take over.
     default_model='sonnet',
     default_budget=1.50,
     default_max_turns=30,
+    # Both families (reify esc-4943-54): simple_task's prompt embeds the
+    # escalation/memory instructions AND requires a plan-tools-registered
+    # plan (_run_simple_task's success contract). Without 'plan_tools' here
+    # the Lever-C fast-path always fell through to the architect.
+    mcp_families=frozenset({'orchestrator', 'plan_tools'}),
 )
 
 
