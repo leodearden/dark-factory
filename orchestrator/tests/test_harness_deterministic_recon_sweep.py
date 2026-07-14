@@ -41,6 +41,18 @@ Amendment pass (post-review) additionally covers:
     generic stranded-blocked reaper (_reconcile_one_stranded) now excludes
     task_kind=='deterministic' tasks, delegating them exclusively to this
     sweep so the health check is never bypassed by the generic backstop.
+
+ζ/task 2240 (DS-3 freshness verdict) additionally covers:
+  - TestRevalidateDeployHealth: Harness._revalidate_deterministic_deploy_health
+    reads ``deploy_state.verify_baseline`` and threads it through to
+    ``_deterministic_deploy_health_verdict`` — see test_systemd_inspect.py
+    for the canonical verdict-function coverage of the freshness branch
+    itself (live monotonic advanced past baseline AND MainPID>0).
+  - TestRunDeterministicReconSweep (D1 composition): a FULL sweep pass —
+    Source A's real ``_recover_stranded_deterministic_task``, not mocked
+    out — over a ``deploy_state.phase=='ran'`` strand with a persisted
+    baseline, proving the freshness verdict (not phantom-done) drives the
+    recovery escalation's category end-to-end.
 """
 
 from __future__ import annotations
