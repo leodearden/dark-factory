@@ -17,12 +17,31 @@ from pathlib import Path
 import pytest
 
 from orchestrator.evals.prompt_opt.canary import (
+    CanaryThresholds,
+    CanaryVerdict,
+    MetricComparison,
     Row,
     WindowMetrics,
+    compare_windows,
     compute_window_metrics,
     load_window_rows,
 )
 from orchestrator.run_store import _SCHEMA
+
+
+def _explicit_thresholds() -> CanaryThresholds:
+    """Shared EXPLICIT thresholds for compare_windows tests.
+
+    Never the module's documented defaults — the PRD §9 calibration
+    starting points are not something a deterministic unit test should
+    assert against (see plan design decision on explicit thresholds).
+    """
+    return CanaryThresholds(
+        cost_per_done_task_rel_tol=0.2, cost_per_done_task_abs_floor=1.0,
+        requeue_rate_rel_tol=0.2, requeue_rate_abs_floor=0.05,
+        mean_review_cycles_rel_tol=0.2, mean_review_cycles_abs_floor=1.0,
+        mean_verify_attempts_rel_tol=0.2, mean_verify_attempts_abs_floor=1.0,
+    )
 
 
 def _make_runs_db(path: Path, rows: list[dict]) -> None:
@@ -255,3 +274,104 @@ class TestLoadWindowRows:
         metrics = compute_window_metrics(rows)
         assert metrics.n_rows == 1
         assert metrics.requeue_rate == pytest.approx(1.0)
+
+
+class TestCompareWindows:
+    def test_pass_when_all_metrics_within_tolerance(self) -> None:
+        baseline = WindowMetrics(
+            n_rows=10, n_done=10, cost_per_done_task=10.0, requeue_rate=0.1,
+            mean_review_cycles=2.0, mean_verify_attempts=1.5,
+        )
+        post = WindowMetrics(
+            n_rows=10, n_done=10, cost_per_done_task=11.0, requeue_rate=0.11,
+            mean_review_cycles=2.1, mean_verify_attempts=1.55,
+        )
+        verdict = compare_windows(baseline, post, _explicit_thresholds())
+        assert isinstance(verdict, CanaryVerdict)
+        assert verdict.verdict == 'pass'
+        assert verdict.regressed_metrics == []
+        assert len(verdict.comparisons) == 4
+        assert all(isinstance(c, MetricComparison) for c in verdict.comparisons)
+
+    def test_regress_when_one_metric_exceeds_relative_tolerance(self) -> None:
+        """cost_per_done_task alone jumps well past baseline*(1+tol) (10 *
+        1.2 == 12.0); the other three metrics stay within tolerance."""
+        baseline = WindowMetrics(
+            n_rows=10, n_done=10, cost_per_done_task=10.0, requeue_rate=0.1,
+            mean_review_cycles=2.0, mean_verify_attempts=1.5,
+        )
+        post = WindowMetrics(
+            n_rows=10, n_done=10, cost_per_done_task=15.0, requeue_rate=0.11,
+            mean_review_cycles=2.1, mean_verify_attempts=1.55,
+        )
+        verdict = compare_windows(baseline, post, _explicit_thresholds())
+        assert verdict.verdict == 'regress'
+        assert verdict.regressed_metrics == ['cost_per_done_task']
+
+    def test_zero_baseline_uses_absolute_floor(self) -> None:
+        """requeue_rate baseline == 0.0 must not divide by zero: the
+        absolute-floor branch flags post (0.1) exceeding
+        requeue_rate_abs_floor (0.05) directly, without a relative ratio."""
+        baseline = WindowMetrics(
+            n_rows=10, n_done=10, cost_per_done_task=10.0, requeue_rate=0.0,
+            mean_review_cycles=2.0, mean_verify_attempts=1.5,
+        )
+        post = WindowMetrics(
+            n_rows=10, n_done=10, cost_per_done_task=10.0, requeue_rate=0.1,
+            mean_review_cycles=2.0, mean_verify_attempts=1.5,
+        )
+        verdict = compare_windows(baseline, post, _explicit_thresholds())
+        assert verdict.verdict == 'regress'
+        assert verdict.regressed_metrics == ['requeue_rate']
+
+    def test_metric_comparison_carries_all_fields(self) -> None:
+        """Hand-computed: baseline=10.0, post=15.0 -> delta_abs=5.0,
+        delta_rel=0.5 (5/10), threshold=12.0 (10 * (1+0.2))."""
+        baseline = WindowMetrics(
+            n_rows=10, n_done=10, cost_per_done_task=10.0, requeue_rate=0.1,
+            mean_review_cycles=2.0, mean_verify_attempts=1.5,
+        )
+        post = WindowMetrics(
+            n_rows=10, n_done=10, cost_per_done_task=15.0, requeue_rate=0.11,
+            mean_review_cycles=2.1, mean_verify_attempts=1.55,
+        )
+        verdict = compare_windows(baseline, post, _explicit_thresholds())
+        cost_comparison = next(c for c in verdict.comparisons if c.metric == 'cost_per_done_task')
+        assert cost_comparison.baseline == pytest.approx(10.0)
+        assert cost_comparison.post == pytest.approx(15.0)
+        assert cost_comparison.delta_abs == pytest.approx(5.0)
+        assert cost_comparison.delta_rel == pytest.approx(0.5)
+        assert cost_comparison.threshold == pytest.approx(12.0)
+        assert cost_comparison.regressed is True
+
+    def test_baseline_n_and_post_n_carry_window_sizes(self) -> None:
+        baseline = WindowMetrics(
+            n_rows=7, n_done=5, cost_per_done_task=10.0, requeue_rate=0.1,
+            mean_review_cycles=2.0, mean_verify_attempts=1.5,
+        )
+        post = WindowMetrics(
+            n_rows=9, n_done=8, cost_per_done_task=11.0, requeue_rate=0.11,
+            mean_review_cycles=2.1, mean_verify_attempts=1.55,
+        )
+        verdict = compare_windows(baseline, post, _explicit_thresholds())
+        assert verdict.baseline_n == 7
+        assert verdict.post_n == 9
+
+    def test_cost_per_done_task_none_is_incomparable_not_regressed(self) -> None:
+        """A baseline with zero done rows has cost_per_done_task is None --
+        compare_windows must treat that metric as incomparable (never
+        regressed) rather than raising on the None, while still comparing
+        the other three metrics normally."""
+        baseline = WindowMetrics(
+            n_rows=5, n_done=0, cost_per_done_task=None, requeue_rate=0.0,
+            mean_review_cycles=0.0, mean_verify_attempts=0.0,
+        )
+        post = WindowMetrics(
+            n_rows=5, n_done=3, cost_per_done_task=8.0, requeue_rate=0.0,
+            mean_review_cycles=1.0, mean_verify_attempts=1.0,
+        )
+        verdict = compare_windows(baseline, post, _explicit_thresholds())
+        cost_comparison = next(c for c in verdict.comparisons if c.metric == 'cost_per_done_task')
+        assert cost_comparison.regressed is False
+        assert 'cost_per_done_task' not in verdict.regressed_metrics
+        assert verdict.verdict == 'pass'
